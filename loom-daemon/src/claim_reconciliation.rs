@@ -45,6 +45,43 @@
 //! [`decide`] then falls through to the age rule, never treating a failed
 //! join as proof of death.
 //!
+//! ## PR-side claim labels (Issue #4367)
+//!
+//! `loom:reviewing` (Judge) and `loom:treating` (Doctor) are claim
+//! *overlays* on an open PR — they coexist with the PR's underlying state
+//! label (`loom:review-requested` / `loom:changes-requested` / `loom:pr`)
+//! while work is in progress, and like `loom:building` they can be left
+//! behind forever when their holder dies. [`decide_pr`] / [`plan_pr`] mirror
+//! [`decide`] / [`plan`]'s pure-function shape and the same union-probe join
+//! priority (journal, then checkpoint→run-registry), with two deliberate
+//! differences driven by the weaker evidence available on the PR side:
+//!
+//! - **The join is heuristic, not authoritative.** A PR has no `loom:building`
+//!   issue number of its own — [`parse_issue_from_branch`] recovers one only
+//!   when `headRefName` matches `feature/issue-<N>` (the convention
+//!   `worktree.sh` establishes); any other branch name has no evidence to
+//!   join, and [`decide_pr`] falls straight through to the age rule below.
+//! - **The age gate applies unconditionally**, even to a dead joined pid —
+//!   unlike [`decide`]'s `DeadPid`/`DeadRunRegistry` branches, which reclaim
+//!   immediately with no grace period. Because the branch-name join can be
+//!   wrong (a Doctor may hold a PR whose sweep record belongs to a different
+//!   phase, or the branch may simply not follow the convention), a dead pid
+//!   alone is not treated as proof here — [`decide_pr`] only reclaims once
+//!   the PR's `updatedAt` is also stale (per-label threshold,
+//!   [`resolve_stale_reviewing_minutes`] / [`resolve_stale_treating_minutes`]).
+//!   A **live** joined pid still short-circuits to `Keep` unconditionally,
+//!   exactly like the issue side — that evidence is trustworthy either way.
+//!   A missing/unparseable `updatedAt` fails safe to `Keep`, same rationale
+//!   as the issue side's total-absence-of-evidence case.
+//!
+//! Reclaiming removes only the stale claim label (the state label restores
+//! discoverability by itself); as a safety net, if the PR is then left
+//! carrying none of `loom:review-requested`/`loom:changes-requested`/`loom:pr`,
+//! [`forge::reclaim_pr`] adds `loom:review-requested` so a fresh Judge pass
+//! picks it back up. This pass runs from the same [`run_reconciliation_pass`]
+//! entry point as the issue-side sweep, under the same
+//! [`reconciliation_enabled`] kill switch — no separate wiring needed.
+//!
 //! ## Periodic pass (Issue #4348)
 //!
 //! [`run_reconciliation_pass`] is the single entry point both the
@@ -165,6 +202,52 @@ pub fn resolve_stale_hours() -> f64 {
         .and_then(|s| s.parse::<f64>().ok())
         .filter(|v| *v > 0.0)
         .unwrap_or(DEFAULT_STALE_BUILDING_HOURS)
+}
+
+/// Env var overriding the `loom:reviewing` staleness threshold, in minutes
+/// (Issue #4367). Deliberately the SAME name `.claude/commands/loom/judge.md`
+/// already established for its own "Stale `loom:reviewing` Claim Check" — the
+/// agent-side fast path and this always-on daemon backstop share one
+/// convention rather than drifting into two knobs for the same concept.
+pub const STALE_REVIEWING_MINUTES_ENV: &str = "LOOM_STALE_REVIEWING_MINUTES";
+
+/// Default `loom:reviewing` staleness threshold: 30 minutes, matching
+/// judge.md's default exactly.
+pub const DEFAULT_STALE_REVIEWING_MINUTES: f64 = 30.0;
+
+/// Env var overriding the `loom:treating` staleness threshold, in minutes
+/// (Issue #4367).
+pub const STALE_TREATING_MINUTES_ENV: &str = "LOOM_STALE_TREATING_MINUTES";
+
+/// Default `loom:treating` staleness threshold: 60 minutes — a Doctor's fix
+/// cycle (re-run tests, iterate on feedback) legitimately runs longer than a
+/// single Judge review pass.
+pub const DEFAULT_STALE_TREATING_MINUTES: f64 = 60.0;
+
+/// Resolve the `loom:reviewing` staleness threshold (minutes) from
+/// [`STALE_REVIEWING_MINUTES_ENV`], falling back to
+/// [`DEFAULT_STALE_REVIEWING_MINUTES`] for an absent, unparseable, or
+/// non-positive value.
+#[must_use]
+pub fn resolve_stale_reviewing_minutes() -> f64 {
+    std::env::var(STALE_REVIEWING_MINUTES_ENV)
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|v| *v > 0.0)
+        .unwrap_or(DEFAULT_STALE_REVIEWING_MINUTES)
+}
+
+/// Resolve the `loom:treating` staleness threshold (minutes) from
+/// [`STALE_TREATING_MINUTES_ENV`], falling back to
+/// [`DEFAULT_STALE_TREATING_MINUTES`] for an absent, unparseable, or
+/// non-positive value.
+#[must_use]
+pub fn resolve_stale_treating_minutes() -> f64 {
+    std::env::var(STALE_TREATING_MINUTES_ENV)
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|v| *v > 0.0)
+        .unwrap_or(DEFAULT_STALE_TREATING_MINUTES)
 }
 
 /// A `loom:building` issue reported by the forge, trimmed to the fields the
@@ -288,6 +371,190 @@ pub fn plan(
 }
 
 // ============================================================================
+// PR-side claim labels: loom:reviewing / loom:treating (Issue #4367)
+// ============================================================================
+
+/// Which PR-side claim overlay a [`decide_pr`] call is reconciling — drives
+/// the forge label name and (via [`resolve_stale_reviewing_minutes`] /
+/// [`resolve_stale_treating_minutes`]) which staleness threshold applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrClaimKind {
+    /// Judge's working label.
+    Reviewing,
+    /// Doctor's working label.
+    Treating,
+}
+
+impl PrClaimKind {
+    /// The forge label name for this claim kind.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Reviewing => "loom:reviewing",
+            Self::Treating => "loom:treating",
+        }
+    }
+
+    /// The resolved staleness threshold (minutes) for this claim kind.
+    #[must_use]
+    pub fn stale_minutes(self) -> f64 {
+        match self {
+            Self::Reviewing => resolve_stale_reviewing_minutes(),
+            Self::Treating => resolve_stale_treating_minutes(),
+        }
+    }
+}
+
+/// An open PR carrying a `loom:reviewing`/`loom:treating` claim label,
+/// trimmed to the fields the reconciliation decision needs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClaimedPr {
+    pub number: u32,
+    /// Parsed `updatedAt` timestamp, when available.
+    pub updated_at: Option<DateTime<Utc>>,
+    /// The PR's head branch name, when available — the only join key to an
+    /// issue number this pass has (see [`parse_issue_from_branch`]).
+    pub head_ref_name: Option<String>,
+}
+
+/// Why a PR-side claim is being reclaimed. Mirrors [`ReclaimReason`] but with
+/// a minutes-scale age (PR-side thresholds are minutes, not hours) and no
+/// "no record" variant of its own — an unjoined PR that ages out is reported
+/// as [`Self::Aged`], the same variant a joined-but-dead pid falls into once
+/// it also ages out (see [`decide_pr`]'s unconditional age gate).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PrReclaimReason {
+    /// The journal recorded a PID for this PR's joined issue and it is no
+    /// longer alive, AND the PR has also aged past the staleness threshold.
+    DeadPid { pid: u32 },
+    /// The checkpoint→run-registry join resolved a pid for this PR's joined
+    /// issue and it is no longer alive, AND the PR has also aged past the
+    /// staleness threshold.
+    DeadRunRegistry { pid: u32 },
+    /// No live-pid evidence was available at all (no join, or a join that
+    /// resolved to nothing), and the PR has aged past the staleness
+    /// threshold.
+    Aged { age_minutes: f64 },
+}
+
+/// The reconciliation decision for one PR-side claim.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PrReconcileAction {
+    /// No liveness concern — leave the claim label alone.
+    Keep,
+    /// Remove the claim label (see [`forge::reclaim_pr`] for the safety-net
+    /// state-label backfill).
+    Reclaim(PrReclaimReason),
+}
+
+/// Recover the `loom:building` issue number a PR's head branch encodes, when
+/// it follows the `feature/issue-<N>` convention `worktree.sh` establishes.
+/// `None` for any other branch shape — the caller then has no join key at
+/// all and [`decide_pr`] falls straight through to the age rule.
+#[must_use]
+pub fn parse_issue_from_branch(head_ref_name: &str) -> Option<u32> {
+    head_ref_name
+        .strip_prefix("feature/issue-")?
+        .parse::<u32>()
+        .ok()
+}
+
+/// Pure decision function for one PR-side claim label — no I/O, fully
+/// unit-testable. See the module docs' "PR-side claim labels" section for the
+/// decision rule; in short, it mirrors [`decide`]'s union-probe join priority
+/// (journal, then checkpoint→run-registry) but — unlike the issue side —
+/// applies the age gate **unconditionally**, even to a dead joined pid,
+/// because the branch-name join here is heuristic rather than authoritative.
+///
+/// `run_registry_pid` is the caller's join result, consulted only when
+/// `journal_entry` is absent, exactly like [`decide`].
+#[must_use]
+pub fn decide_pr(
+    pr: &ClaimedPr,
+    journal_entry: Option<&JournalEntry>,
+    run_registry_pid: Option<u32>,
+    is_alive: &dyn Fn(u32) -> bool,
+    stale_minutes: f64,
+    now: DateTime<Utc>,
+) -> PrReconcileAction {
+    // A live joined pid is trustworthy evidence either way -- short-circuit
+    // to Keep unconditionally, exactly like the issue side.
+    let dead_pid_reason = if let Some(entry) = journal_entry {
+        if is_alive(entry.pid) {
+            return PrReconcileAction::Keep;
+        }
+        Some(PrReclaimReason::DeadPid { pid: entry.pid })
+    } else if let Some(pid) = run_registry_pid {
+        if is_alive(pid) {
+            return PrReconcileAction::Keep;
+        }
+        Some(PrReclaimReason::DeadRunRegistry { pid })
+    } else {
+        None
+    };
+
+    // Age gate applies unconditionally from here on -- whether the evidence
+    // was a dead joined pid, or no join at all (non-joinable branch / no
+    // journal / no run-registry entry). A dead pid alone is never sufficient
+    // proof here: the PR->issue join is heuristic, so only *aged* absence (or
+    // aged dead-pid evidence) triggers a reclaim.
+    match pr.updated_at {
+        Some(updated) => {
+            let age_minutes = (now - updated).num_seconds() as f64 / 60.0;
+            if age_minutes >= stale_minutes {
+                PrReconcileAction::Reclaim(
+                    dead_pid_reason.unwrap_or(PrReclaimReason::Aged { age_minutes }),
+                )
+            } else {
+                PrReconcileAction::Keep
+            }
+        }
+        // No age evidence at all: fail safe, never reclaim.
+        None => PrReconcileAction::Keep,
+    }
+}
+
+/// Plan PR-side reconciliation decisions for every `pr` in `prs`, given an
+/// already-loaded `journal`. Performs no I/O of its own — `run_registry_pid_for`
+/// is the caller's injected checkpoint→run-registry lookup, called only for a
+/// PR whose branch joins to an issue number with no journal entry, mirroring
+/// [`plan`]'s own priority order.
+#[must_use]
+pub fn plan_pr(
+    repo: &str,
+    prs: &[ClaimedPr],
+    journal: &SweepJournal,
+    run_registry_pid_for: &dyn Fn(u32) -> Option<u32>,
+    is_alive: &dyn Fn(u32) -> bool,
+    stale_minutes: f64,
+    now: DateTime<Utc>,
+) -> Vec<(u32, PrReconcileAction)> {
+    prs.iter()
+        .map(|pr| {
+            let issue_number = pr
+                .head_ref_name
+                .as_deref()
+                .and_then(parse_issue_from_branch);
+            let (entry, run_registry_pid) = match issue_number {
+                Some(n) => {
+                    let entry = sweep_journal::find(journal, repo, n);
+                    let run_registry_pid = if entry.is_none() {
+                        run_registry_pid_for(n)
+                    } else {
+                        None
+                    };
+                    (entry, run_registry_pid)
+                }
+                // No join key at all: no journal entry, no run-registry
+                // lookup -- decide_pr falls straight through to the age rule.
+                None => (None, None),
+            };
+            (pr.number, decide_pr(pr, entry, run_registry_pid, is_alive, stale_minutes, now))
+        })
+        .collect()
+}
+
+// ============================================================================
 // Checkpoint -> run-registry join (Issue #4348)
 // ============================================================================
 
@@ -367,10 +634,15 @@ pub fn run_reconciliation_pass(fallback_root: &Path) {
     let gh_bin = std::path::PathBuf::from("gh");
     let mut total_checked = 0usize;
     let mut total_reclaimed = 0usize;
+    let mut total_pr_checked = 0usize;
+    let mut total_pr_reclaimed = 0usize;
     for root in &roots {
         let (checked, reclaimed) = forge::reconcile_workspace(&gh_bin, root);
         total_checked += checked;
         total_reclaimed += reclaimed;
+        let (pr_checked, pr_reclaimed) = forge::reconcile_pr_claims(&gh_bin, root);
+        total_pr_checked += pr_checked;
+        total_pr_reclaimed += pr_reclaimed;
     }
     if total_reclaimed > 0 {
         log::info!(
@@ -382,6 +654,20 @@ pub fn run_reconciliation_pass(fallback_root: &Path) {
         log::debug!(
             "claim_reconciliation: pass checked {total_checked} loom:building issue(s) across \
              {} workspace(s), nothing to reclaim",
+            roots.len()
+        );
+    }
+    if total_pr_reclaimed > 0 {
+        log::info!(
+            "claim_reconciliation: PR-side pass checked {total_pr_checked} claim(s) \
+             (loom:reviewing/loom:treating) across {} workspace(s), reclaimed \
+             {total_pr_reclaimed} stale claim(s) (#4367)",
+            roots.len()
+        );
+    } else {
+        log::debug!(
+            "claim_reconciliation: PR-side pass checked {total_pr_checked} claim(s) \
+             (loom:reviewing/loom:treating) across {} workspace(s), nothing to reclaim",
             roots.len()
         );
     }
@@ -434,8 +720,8 @@ pub fn spawn_periodic_reconciliation_task(
 /// best-effort `Command` wrapper.
 pub mod forge {
     use super::{
-        plan, resolve_stale_hours, BuildingIssue, ReclaimReason, ReconcileAction,
-        MAX_ISSUES_PER_WORKSPACE,
+        plan, plan_pr, resolve_stale_hours, BuildingIssue, ClaimedPr, PrClaimKind, PrReclaimReason,
+        PrReconcileAction, ReclaimReason, ReconcileAction, MAX_ISSUES_PER_WORKSPACE,
     };
     use crate::sweep_journal;
     use anyhow::{anyhow, Context, Result};
@@ -623,6 +909,260 @@ pub mod forge {
         }
 
         (checked, reclaimed)
+    }
+
+    // ------------------------------------------------------------------
+    // PR-side claim labels: loom:reviewing / loom:treating (Issue #4367)
+    // ------------------------------------------------------------------
+
+    #[derive(Debug, Deserialize)]
+    struct GhClaimedPr {
+        number: u32,
+        #[serde(rename = "updatedAt", default)]
+        updated_at: Option<String>,
+        #[serde(rename = "headRefName", default)]
+        head_ref_name: Option<String>,
+    }
+
+    fn list_prs_with_label(gh_bin: &Path, root: &Path, label: &str) -> Result<Vec<ClaimedPr>> {
+        let mut cmd = Command::new(gh_bin);
+        cmd.arg("pr")
+            .arg("list")
+            .arg("--state")
+            .arg("open")
+            .arg("--label")
+            .arg(label)
+            .arg("--limit")
+            .arg(MAX_ISSUES_PER_WORKSPACE.to_string())
+            .arg("--json")
+            .arg("number,updatedAt,headRefName");
+        cmd.current_dir(root);
+        if let Ok(repo) = std::env::var("LOOM_REPO") {
+            cmd.arg("--repo").arg(repo);
+        }
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let out = cmd
+            .output()
+            .with_context(|| format!("failed to invoke {}", gh_bin.display()))?;
+        if !out.status.success() {
+            return Err(anyhow!(
+                "gh pr list --label {label} failed in {}: {}",
+                root.display(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        let rows: Vec<GhClaimedPr> =
+            serde_json::from_slice(&out.stdout).context("parse gh pr list JSON")?;
+        Ok(rows
+            .into_iter()
+            .map(|r| ClaimedPr {
+                number: r.number,
+                updated_at: r
+                    .updated_at
+                    .as_deref()
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .map(|dt| dt.with_timezone(&chrono::Utc)),
+                head_ref_name: r.head_ref_name,
+            })
+            .collect())
+    }
+
+    /// The PR's currently-applied state labels (a best-effort subset of
+    /// `--json labels`, used only to decide whether [`reclaim_pr`]'s safety
+    /// net needs to fire). A `gh` failure here degrades to an empty list —
+    /// see [`reclaim_pr`]'s call site for why that is the safe direction:
+    /// it makes the safety net fire (adds `loom:review-requested`) rather
+    /// than silently leaving a PR with no state label at all.
+    fn pr_label_names(gh_bin: &Path, root: &Path, pr_number: u32) -> Result<Vec<String>> {
+        #[derive(Debug, Deserialize)]
+        struct GhLabel {
+            name: String,
+        }
+        #[derive(Debug, Deserialize)]
+        struct GhPrLabels {
+            labels: Vec<GhLabel>,
+        }
+        let mut cmd = Command::new(gh_bin);
+        cmd.arg("pr")
+            .arg("view")
+            .arg(pr_number.to_string())
+            .arg("--json")
+            .arg("labels");
+        cmd.current_dir(root);
+        if let Ok(repo) = std::env::var("LOOM_REPO") {
+            cmd.arg("--repo").arg(repo);
+        }
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let out = cmd
+            .output()
+            .with_context(|| format!("failed to invoke {}", gh_bin.display()))?;
+        if !out.status.success() {
+            return Err(anyhow!(
+                "gh pr view {pr_number} --json labels failed in {}: {}",
+                root.display(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        let parsed: GhPrLabels =
+            serde_json::from_slice(&out.stdout).context("parse gh pr view labels JSON")?;
+        Ok(parsed.labels.into_iter().map(|l| l.name).collect())
+    }
+
+    fn add_label(gh_bin: &Path, root: &Path, pr_number: u32, label: &str) -> Result<()> {
+        let mut cmd = Command::new(gh_bin);
+        cmd.arg("pr")
+            .arg("edit")
+            .arg(pr_number.to_string())
+            .arg("--add-label")
+            .arg(label);
+        cmd.current_dir(root);
+        if let Ok(repo) = std::env::var("LOOM_REPO") {
+            cmd.arg("--repo").arg(repo);
+        }
+        cmd.stdout(Stdio::null()).stderr(Stdio::piped());
+        let out = cmd
+            .output()
+            .with_context(|| format!("failed to invoke {}", gh_bin.display()))?;
+        if !out.status.success() {
+            return Err(anyhow!(
+                "gh pr edit --add-label {label} failed for #{pr_number} in {}: {}",
+                root.display(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Reclaim one stale PR-side claim: remove `claim_label`, then — as a
+    /// safety net — add `loom:review-requested` if the PR is left with none
+    /// of the three state labels (`loom:review-requested`,
+    /// `loom:changes-requested`, `loom:pr`). The safety-net check is
+    /// best-effort: a failure to read the PR's current labels defaults to
+    /// treating it as unlabeled (adds `loom:review-requested`) rather than
+    /// leaving a PR that might genuinely have no state label undiscoverable.
+    fn reclaim_pr(gh_bin: &Path, root: &Path, pr_number: u32, claim_label: &str) -> Result<()> {
+        let mut cmd = Command::new(gh_bin);
+        cmd.arg("pr")
+            .arg("edit")
+            .arg(pr_number.to_string())
+            .arg("--remove-label")
+            .arg(claim_label);
+        cmd.current_dir(root);
+        if let Ok(repo) = std::env::var("LOOM_REPO") {
+            cmd.arg("--repo").arg(repo);
+        }
+        cmd.stdout(Stdio::null()).stderr(Stdio::piped());
+        let out = cmd
+            .output()
+            .with_context(|| format!("failed to invoke {}", gh_bin.display()))?;
+        if !out.status.success() {
+            return Err(anyhow!(
+                "gh pr edit --remove-label {claim_label} failed for #{pr_number} in {}: {}",
+                root.display(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+
+        const STATE_LABELS: [&str; 3] =
+            ["loom:review-requested", "loom:changes-requested", "loom:pr"];
+        let current_labels = pr_label_names(gh_bin, root, pr_number).unwrap_or_default();
+        let has_state_label = current_labels
+            .iter()
+            .any(|l| STATE_LABELS.contains(&l.as_str()));
+        if !has_state_label {
+            if let Err(e) = add_label(gh_bin, root, pr_number, "loom:review-requested") {
+                log::warn!(
+                    "claim_reconciliation: reclaimed {claim_label} from PR #{pr_number} in {} \
+                     but failed to backfill loom:review-requested: {e}",
+                    root.display()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Reconcile stale `loom:reviewing`/`loom:treating` claims for one
+    /// registered workspace `root` (Issue #4367), using the same machine-level
+    /// journal + checkpoint→run-registry join as [`reconcile_workspace`]. Best
+    /// effort and bounded exactly like the issue-side pass: any `gh` failure
+    /// for one claim label is logged at `warn` and that label's sweep
+    /// contributes `(0, 0)` rather than propagating an error.
+    ///
+    /// Returns `(checked, reclaimed)` summed across both claim labels.
+    pub fn reconcile_pr_claims(gh_bin: &Path, root: &Path) -> (usize, usize) {
+        let repo = root.display().to_string();
+
+        let journal_path = match sweep_journal::default_journal_path() {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!(
+                    "claim_reconciliation: cannot resolve journal path for PR-side pass: {e}"
+                );
+                return (0, 0);
+            }
+        };
+        let journal = sweep_journal::load(&journal_path);
+        let run_registry_pid_for = |issue: u32| super::resolve_run_registry_pid(root, issue);
+        let now = chrono::Utc::now();
+
+        let mut total_checked = 0usize;
+        let mut total_reclaimed = 0usize;
+
+        for kind in [PrClaimKind::Reviewing, PrClaimKind::Treating] {
+            let label = kind.label();
+            let prs = match list_prs_with_label(gh_bin, root, label) {
+                Ok(v) => v,
+                Err(e) => {
+                    log::warn!("claim_reconciliation: {}: {e}", root.display());
+                    continue;
+                }
+            };
+            if prs.is_empty() {
+                continue;
+            }
+
+            let stale_minutes = kind.stale_minutes();
+            let decisions = plan_pr(
+                &repo,
+                &prs,
+                &journal,
+                &run_registry_pid_for,
+                &crate::sweep_registry::is_pid_alive,
+                stale_minutes,
+                now,
+            );
+            total_checked += decisions.len();
+
+            for (pr_number, action) in decisions {
+                let PrReconcileAction::Reclaim(reason) = action else {
+                    continue;
+                };
+                match reclaim_pr(gh_bin, root, pr_number, label) {
+                    Ok(()) => {
+                        total_reclaimed += 1;
+                        let last_known_pid = match reason {
+                            PrReclaimReason::DeadPid { pid }
+                            | PrReclaimReason::DeadRunRegistry { pid } => Some(pid),
+                            PrReclaimReason::Aged { .. } => None,
+                        };
+                        log::warn!(
+                            "claim_reconciliation: removed stale {label} from PR #{pr_number} \
+                             in {} ({reason:?}, last_known_pid={last_known_pid:?}) (#4367)",
+                            root.display(),
+                        );
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "claim_reconciliation: failed to reclaim {label} from PR #{pr_number} \
+                             in {}: {e}",
+                            root.display()
+                        );
+                    }
+                }
+            }
+        }
+
+        (total_checked, total_reclaimed)
     }
 }
 
@@ -1230,5 +1770,364 @@ exit 0
         );
 
         std::env::remove_var(sweep_journal::JOURNAL_PATH_ENV);
+    }
+
+    // ------------------------------------------------------------------
+    // PR-side claim labels: decide_pr / plan_pr (Issue #4367)
+    // ------------------------------------------------------------------
+
+    fn claimed_pr(
+        number: u32,
+        updated_at: Option<DateTime<Utc>>,
+        head_ref_name: Option<&str>,
+    ) -> ClaimedPr {
+        ClaimedPr {
+            number,
+            updated_at,
+            head_ref_name: head_ref_name.map(ToString::to_string),
+        }
+    }
+
+    #[test]
+    fn decide_pr_keeps_when_fresh_and_no_join() {
+        // fresh-kept: no journal entry, no run-registry pid, and the PR was
+        // updated recently -- well within the staleness window.
+        let now = Utc::now();
+        let fresh = now - Duration::minutes(1);
+        let pr = claimed_pr(100, Some(fresh), None);
+        let action = decide_pr(&pr, None, None, &|_| true, 30.0, now);
+        assert_eq!(action, PrReconcileAction::Keep);
+    }
+
+    #[test]
+    fn decide_pr_reclaims_when_stale_and_no_join() {
+        // stale-reclaimed: no journal entry, no run-registry pid, and the PR
+        // has aged well past the staleness threshold.
+        let now = Utc::now();
+        let old = now - Duration::minutes(60);
+        let pr = claimed_pr(101, Some(old), None);
+        let action = decide_pr(&pr, None, None, &|_| true, 30.0, now);
+        match action {
+            PrReconcileAction::Reclaim(PrReclaimReason::Aged { age_minutes }) => {
+                assert!(age_minutes >= 30.0);
+            }
+            other => panic!("expected Aged reclaim, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decide_pr_keeps_when_journal_pid_alive_even_if_stale() {
+        // live-pid-kept: a live joined pid short-circuits to Keep
+        // unconditionally, regardless of how stale the label is.
+        let now = Utc::now();
+        let old = now - Duration::minutes(120);
+        let entry = journal_entry("/repo/a", 42, 111);
+        let pr = claimed_pr(102, Some(old), Some("feature/issue-42"));
+        let action = decide_pr(&pr, Some(&entry), None, &|_| true, 30.0, now);
+        assert_eq!(action, PrReconcileAction::Keep);
+    }
+
+    #[test]
+    fn decide_pr_keeps_when_journal_pid_dead_but_fresh() {
+        // dead-pid-but-fresh-kept: the age gate applies unconditionally, even
+        // to a dead joined pid -- a fresh label is kept regardless.
+        let now = Utc::now();
+        let fresh = now - Duration::minutes(1);
+        let entry = journal_entry("/repo/a", 42, 111);
+        let pr = claimed_pr(103, Some(fresh), Some("feature/issue-42"));
+        let action = decide_pr(&pr, Some(&entry), None, &|_| false, 30.0, now);
+        assert_eq!(action, PrReconcileAction::Keep);
+    }
+
+    #[test]
+    fn decide_pr_reclaims_when_journal_pid_dead_and_stale() {
+        // A dead joined pid AND an aged label together -- reclaims, carrying
+        // the DeadPid reason through (not a generic Aged).
+        let now = Utc::now();
+        let old = now - Duration::minutes(45);
+        let entry = journal_entry("/repo/a", 42, 111);
+        let pr = claimed_pr(104, Some(old), Some("feature/issue-42"));
+        let action = decide_pr(&pr, Some(&entry), None, &|_| false, 30.0, now);
+        assert_eq!(action, PrReconcileAction::Reclaim(PrReclaimReason::DeadPid { pid: 111 }));
+    }
+
+    #[test]
+    fn decide_pr_keeps_when_no_updated_at() {
+        // no-updatedAt-kept: missing/unparseable `updatedAt` fails safe to
+        // Keep, even with no join evidence at all.
+        let now = Utc::now();
+        let pr = claimed_pr(105, None, None);
+        let action = decide_pr(&pr, None, None, &|_| true, 30.0, now);
+        assert_eq!(action, PrReconcileAction::Keep, "fail-safe: no updatedAt => Keep");
+    }
+
+    #[test]
+    fn decide_pr_falls_through_to_age_rule_on_non_joinable_branch() {
+        // non-joinable-branch: a head ref that doesn't match
+        // `feature/issue-<N>` has no join key at all -- decide_pr still
+        // reaches the age rule and reclaims once stale.
+        let now = Utc::now();
+        let old = now - Duration::minutes(90);
+        let pr = claimed_pr(106, Some(old), Some("some-other-branch-name"));
+        let action = decide_pr(&pr, None, None, &|_| true, 30.0, now);
+        match action {
+            PrReconcileAction::Reclaim(PrReclaimReason::Aged { .. }) => {}
+            other => panic!("expected Aged reclaim, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decide_pr_reclaims_when_run_registry_pid_dead_and_stale() {
+        let now = Utc::now();
+        let old = now - Duration::minutes(90);
+        let pr = claimed_pr(107, Some(old), Some("feature/issue-42"));
+        let action = decide_pr(&pr, None, Some(999), &|_| false, 30.0, now);
+        assert_eq!(
+            action,
+            PrReconcileAction::Reclaim(PrReclaimReason::DeadRunRegistry { pid: 999 })
+        );
+    }
+
+    #[test]
+    fn decide_pr_journal_entry_takes_priority_over_run_registry_pid() {
+        let now = Utc::now();
+        let entry = journal_entry("/repo/a", 42, 111);
+        let pr = claimed_pr(108, None, Some("feature/issue-42"));
+        let action = decide_pr(&pr, Some(&entry), Some(999), &|pid| pid == 111, 30.0, now);
+        assert_eq!(action, PrReconcileAction::Keep);
+    }
+
+    #[test]
+    fn parse_issue_from_branch_matches_convention() {
+        assert_eq!(parse_issue_from_branch("feature/issue-42"), Some(42));
+        assert_eq!(parse_issue_from_branch("feature/issue-4367"), Some(4367));
+    }
+
+    #[test]
+    fn parse_issue_from_branch_rejects_non_matching_shapes() {
+        assert_eq!(parse_issue_from_branch("main"), None);
+        assert_eq!(parse_issue_from_branch("fix/something"), None);
+        assert_eq!(parse_issue_from_branch("feature/issue-"), None);
+        assert_eq!(parse_issue_from_branch("feature/issue-abc"), None);
+    }
+
+    #[test]
+    fn plan_pr_joins_branch_to_journal_entry() {
+        let now = Utc::now();
+        let mut journal = SweepJournal::default();
+        journal.entries.push(journal_entry("/repo/a", 42, 111)); // will be dead
+
+        let prs = vec![
+            claimed_pr(200, Some(now - Duration::minutes(45)), Some("feature/issue-42")),
+            claimed_pr(201, Some(now - Duration::minutes(1)), None),
+        ];
+
+        let decisions = plan_pr("/repo/a", &prs, &journal, &|_| None, &|_| false, 30.0, now);
+
+        assert_eq!(
+            decisions[0],
+            (200, PrReconcileAction::Reclaim(PrReclaimReason::DeadPid { pid: 111 }))
+        );
+        assert_eq!(decisions[1], (201, PrReconcileAction::Keep));
+    }
+
+    #[test]
+    fn plan_pr_consults_run_registry_only_when_journal_entry_absent() {
+        let now = Utc::now();
+        let journal = SweepJournal::default();
+
+        let prs = vec![
+            claimed_pr(300, Some(now - Duration::minutes(60)), Some("feature/issue-1")),
+            claimed_pr(301, Some(now - Duration::minutes(1)), Some("feature/issue-2")),
+        ];
+
+        let run_registry_pid_for = |issue_num: u32| -> Option<u32> {
+            match issue_num {
+                1 => Some(555),
+                2 => Some(777),
+                _ => None,
+            }
+        };
+        let is_alive = |pid: u32| pid == 777;
+
+        let decisions =
+            plan_pr("/repo/a", &prs, &journal, &run_registry_pid_for, &is_alive, 30.0, now);
+
+        assert_eq!(
+            decisions[0],
+            (300, PrReconcileAction::Reclaim(PrReclaimReason::DeadRunRegistry { pid: 555 }))
+        );
+        assert_eq!(decisions[1], (301, PrReconcileAction::Keep));
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_stale_reviewing_minutes_defaults_and_overrides() {
+        std::env::remove_var(STALE_REVIEWING_MINUTES_ENV);
+        assert!(
+            (resolve_stale_reviewing_minutes() - DEFAULT_STALE_REVIEWING_MINUTES).abs()
+                < f64::EPSILON
+        );
+
+        std::env::set_var(STALE_REVIEWING_MINUTES_ENV, "15");
+        assert!((resolve_stale_reviewing_minutes() - 15.0).abs() < f64::EPSILON);
+
+        std::env::set_var(STALE_REVIEWING_MINUTES_ENV, "0");
+        assert!(
+            (resolve_stale_reviewing_minutes() - DEFAULT_STALE_REVIEWING_MINUTES).abs()
+                < f64::EPSILON
+        );
+        std::env::set_var(STALE_REVIEWING_MINUTES_ENV, "garbage");
+        assert!(
+            (resolve_stale_reviewing_minutes() - DEFAULT_STALE_REVIEWING_MINUTES).abs()
+                < f64::EPSILON
+        );
+
+        std::env::remove_var(STALE_REVIEWING_MINUTES_ENV);
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_stale_treating_minutes_defaults_and_overrides() {
+        std::env::remove_var(STALE_TREATING_MINUTES_ENV);
+        assert!(
+            (resolve_stale_treating_minutes() - DEFAULT_STALE_TREATING_MINUTES).abs()
+                < f64::EPSILON
+        );
+
+        std::env::set_var(STALE_TREATING_MINUTES_ENV, "90");
+        assert!((resolve_stale_treating_minutes() - 90.0).abs() < f64::EPSILON);
+
+        std::env::remove_var(STALE_TREATING_MINUTES_ENV);
+    }
+
+    // ------------------------------------------------------------------
+    // Integration: forge::reconcile_pr_claims (Issue #4367)
+    // ------------------------------------------------------------------
+
+    /// Write a fake `gh` script (tests only) that logs every invocation to
+    /// `gh_log`, reports exactly one PR carrying the requested claim label
+    /// for `pr list`, and reports `extra_labels` (plus nothing else) for
+    /// `pr view --json labels` -- letting a test control whether the
+    /// safety-net `loom:review-requested` backfill should fire.
+    fn write_fake_gh_pr(
+        dir: &std::path::Path,
+        gh_log: &std::path::Path,
+        pr_number: u32,
+        updated_at: &str,
+        head_ref_name: &str,
+        extra_labels: &[&str],
+    ) -> std::path::PathBuf {
+        let fake_gh = dir.join("fake-gh-pr.sh");
+        let labels_json = extra_labels
+            .iter()
+            .map(|l| format!(r#"{{"name":"{l}"}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let script = format!(
+            r#"#!/usr/bin/env bash
+printf '%s\n' "$*" >> "{log}"
+if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
+  echo '[{{"number":{pr_number},"updatedAt":"{updated_at}","headRefName":"{head_ref_name}"}}]'
+  exit 0
+fi
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  echo '{{"labels":[{labels_json}]}}'
+  exit 0
+fi
+exit 0
+"#,
+            log = gh_log.display(),
+        );
+        std::fs::write(&fake_gh, &script).unwrap();
+        #[cfg(unix)]
+        {
+            let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&fake_gh, perms).unwrap();
+        }
+        fake_gh
+    }
+
+    #[test]
+    #[serial]
+    fn reconcile_pr_claims_reclaims_stale_reviewing_and_backfills_state_label() {
+        let dir = tempdir().unwrap();
+        let repo_root = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+
+        let journal_path = dir.path().join("sweeps.json");
+        std::env::set_var(sweep_journal::JOURNAL_PATH_ENV, &journal_path);
+        std::env::set_var(STALE_REVIEWING_MINUTES_ENV, "30");
+        std::env::set_var(STALE_TREATING_MINUTES_ENV, "60");
+
+        // No journal entry, no checkpoint -- non-joinable branch, well past
+        // the 30-minute threshold, and no state label at all.
+        let gh_log = dir.path().join("gh-invocations.log");
+        let old = (Utc::now() - Duration::minutes(90)).to_rfc3339();
+        let fake_gh = write_fake_gh_pr(dir.path(), &gh_log, 500, &old, "some-random-branch", &[]);
+
+        let (checked, reclaimed) = forge::reconcile_pr_claims(&fake_gh, &repo_root);
+
+        // Only `loom:reviewing` is queried with results here (the fake `gh`
+        // returns the same single PR for every `pr list` call, so both the
+        // reviewing and treating passes see it) -- assert on the label-flip
+        // evidence instead of the exact checked count to avoid overfitting
+        // to that fixture quirk.
+        assert!(checked >= 1);
+        assert!(reclaimed >= 1);
+
+        let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            gh_calls.contains("pr edit 500 --remove-label loom:reviewing"),
+            "expected loom:reviewing to be removed from #500; got: {gh_calls:?}"
+        );
+        assert!(
+            gh_calls.contains("pr edit 500 --add-label loom:review-requested"),
+            "expected the safety net to add loom:review-requested to #500; got: {gh_calls:?}"
+        );
+
+        std::env::remove_var(sweep_journal::JOURNAL_PATH_ENV);
+        std::env::remove_var(STALE_REVIEWING_MINUTES_ENV);
+        std::env::remove_var(STALE_TREATING_MINUTES_ENV);
+    }
+
+    #[test]
+    #[serial]
+    fn reconcile_pr_claims_keeps_fresh_pr() {
+        let dir = tempdir().unwrap();
+        let repo_root = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+
+        let journal_path = dir.path().join("sweeps.json");
+        std::env::set_var(sweep_journal::JOURNAL_PATH_ENV, &journal_path);
+        std::env::set_var(STALE_REVIEWING_MINUTES_ENV, "30");
+        std::env::set_var(STALE_TREATING_MINUTES_ENV, "60");
+
+        let gh_log = dir.path().join("gh-invocations.log");
+        let fresh = Utc::now().to_rfc3339();
+        let fake_gh = write_fake_gh_pr(
+            dir.path(),
+            &gh_log,
+            501,
+            &fresh,
+            "some-random-branch",
+            &["loom:review-requested"],
+        );
+
+        let (_checked, reclaimed) = forge::reconcile_pr_claims(&fake_gh, &repo_root);
+
+        assert_eq!(reclaimed, 0, "a fresh PR-side claim must never be reclaimed");
+
+        let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            !gh_calls.contains("--remove-label loom:reviewing")
+                && !gh_calls.contains("--remove-label loom:treating"),
+            "no claim label should have been removed; got: {gh_calls:?}"
+        );
+
+        std::env::remove_var(sweep_journal::JOURNAL_PATH_ENV);
+        std::env::remove_var(STALE_REVIEWING_MINUTES_ENV);
+        std::env::remove_var(STALE_TREATING_MINUTES_ENV);
     }
 }

@@ -1028,6 +1028,41 @@ if [[ -n "$PRUNE_OUTPUT" ]]; then
     fi
 fi
 
+# ─── Git identity hygiene check (#4369) ─────────────────────────────────────
+# Worktrees share the parent repo's local git config, so a corrupted local
+# user.email/user.name (stacked values, or a value with a glued-on shell
+# command like "...github.comecho" — Tauri-era residue, see
+# check-git-identity.sh's header) poisons every worktree created from this
+# repo, including this one. Hard-fail on the corruption pattern (it would
+# otherwise ship a garbled commit author silently — see PR #4303); warn (but
+# proceed) on a plain multi-value that doesn't match the corruption pattern,
+# since a pre-existing-but-unambiguous local config shouldn't strand a sweep.
+GIT_IDENTITY_CHECK="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/check-git-identity.sh"
+if [[ -x "$GIT_IDENTITY_CHECK" ]]; then
+    # Note: in --json mode fd 1 is already redirected to stderr (see the
+    # stdout-purity block above), so this plain `echo`/print output lands on
+    # stderr in both modes — only the explicit `>&3` JSON document below
+    # reaches the caller's stdout.
+    # `if VAR=$(cmd); then` (rather than a bare assignment) so a non-zero exit
+    # from the check does not trip `set -e` before we can inspect $? below.
+    if GIT_IDENTITY_OUTPUT=$("$GIT_IDENTITY_CHECK" 2>&1); then
+        GIT_IDENTITY_RC=0
+    else
+        GIT_IDENTITY_RC=$?
+    fi
+    if [[ "$GIT_IDENTITY_RC" -eq 3 ]]; then
+        print_error "Corrupted local git identity detected — refusing to create a worktree."
+        echo "$GIT_IDENTITY_OUTPUT"
+        if [[ "$JSON_OUTPUT" == "true" ]]; then
+            echo '{"success": false, "error": "corrupted-git-identity", "issueNumber": '"$ISSUE_NUMBER"'}' >&3
+        fi
+        exit 1
+    elif [[ "$GIT_IDENTITY_RC" -eq 1 ]]; then
+        print_warning "Stacked local git identity values detected (non-fatal — see details below)."
+        echo "$GIT_IDENTITY_OUTPUT"
+    fi
+fi
+
 # Resolve the repo's default branch once (cwd is now the main workspace, so
 # git symbolic-ref sees refs/remotes/origin/HEAD). Hard-fail rather than proceed
 # with an empty/wrong branch — an empty `origin/` refspec is worse than the

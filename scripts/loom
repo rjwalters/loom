@@ -335,6 +335,36 @@ loom_cmd_sweep() {
     exec claude -p "/loom:sweep $*" --dangerously-skip-permissions
 }
 
+# `migrate` takes a historical file-copy Loom install in the CURRENT repo to the
+# machine-level daemon model in one idempotent pass (Epic #3835 Phase 6, #4254).
+# It delegates to scripts/install/migrate-consumer.sh in the machine checkout,
+# passing the resolved repo root so the migration operates on the operator's repo
+# no matter which subdirectory `loom migrate` was invoked from.
+loom_cmd_migrate() {
+    local resolved checkout target
+    resolved="$(loom_resolve_checkout_scripts)" || exit 1
+    checkout="$(sed -n '1p' <<<"$resolved")"
+    if [[ -f "$checkout/scripts/install/migrate-consumer.sh" ]]; then
+        target="$checkout/scripts/install/migrate-consumer.sh"
+    elif [[ -f "$checkout/.loom/scripts/install/migrate-consumer.sh" ]]; then
+        target="$checkout/.loom/scripts/install/migrate-consumer.sh"
+    else
+        _err "migrate-consumer.sh not found under the machine checkout: $checkout"
+        exit 1
+    fi
+    # --help is reachable without a repo context.
+    if loom_has_flag "--help" "$@" || loom_has_flag "-h" "$@"; then
+        exec bash "$target" --help
+    fi
+    loom_detect_context
+    if [[ -z "$LOOM_CTX_ROOT" ]]; then
+        _err "'migrate' must run inside a Loom consumer repo (no .loom/ found from $PWD)."
+        exit 1
+    fi
+    export LOOM_MACHINE_CHECKOUT="$checkout"
+    exec bash "$target" "$LOOM_CTX_ROOT" "$@"
+}
+
 # `status` is read-only and AC7 requires it to produce correct, distinguishable
 # output from a consumer repo, a git worktree, and a non-repo directory. So on a
 # pool-manager collision it does NOT error — it prints machine-level status and a
@@ -409,6 +439,8 @@ COMMANDS:
     restart   Restart the machine-level loom-daemon (drain-and-roll; falls back to stop+start)
     status    Show machine-level + current-repo status (read-only)
     sweep     Dispatch /loom:sweep <issue> for the current repo
+    migrate   Migrate a historical file-copy install in the current repo to the
+              machine-level daemon model (--dry-run for a plan; Epic #3835 Phase 6)
     update    Thin delegate to loom-daemon-update.sh (no rebuild logic of its own)
     help      Show this help
     version   Show dispatcher version
@@ -434,6 +466,7 @@ main() {
         restart)             loom_cmd_restart "$@" ;;
         status)              loom_cmd_status "$@" ;;
         sweep)               loom_cmd_sweep "$@" ;;
+        migrate)             loom_cmd_migrate "$@" ;;
         update)              loom_cmd_update "$@" ;;
         help|--help|-h)      loom_print_help ;;
         version|--version|-v) echo "loom dispatcher v${DISPATCHER_VERSION} (machine-level)" ;;

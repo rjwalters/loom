@@ -7,9 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-07-29
+
+### Summary
+
+Minor release consolidating the machine-level daemon into a self-sufficient fleet node: the role runner gains judge coverage and **idle-edge-triggered runs**, the work finder gains admission ramping and host-distress protection, a first **fleet surface** (`loom-daemon fleet status`, worker registration) lands, and epic #4081 Phase 3 retires the Python observability/clean/forge CLIs in favor of native `loom-daemon` subcommands. 84 feat/fix commits on the daemon alone (206 total since 0.15.0).
+
+### Added
+
+- **Idle-edge-triggered role runs** (`autonomous.roleRunner.onIdle`, #4364) — champion fires immediately on a root's idle transition (0 in-flight + nothing dispatched this tick), with per-(root,role) 60s debounce and a shared in-progress guard cleared on every exit path; composes with (never replaces) the interval loops. Gated per root; the silent-gate diagnosability follow-up is #4377.
+- **Fleet surface** (#4342) — `loom-daemon fleet status` (per-host state, in-flight, cap, safehoused presence) and `fleet add-worker <ssh-host>`; groundwork for the drain + teardown epic (#4340).
+- **Host-distress circuit breaker** (#4235, #4316) and **registry-based dispatch target resolution** (#4299, #4322) in the `DispatchSweep` handler.
+- **`loom-daemon update-gitignore`** (#4280) — standalone convergence of the loom-managed `.gitignore` block from the single-sourced `EPHEMERAL_PATTERNS` set, invoked by `resync-installed.sh`.
+- **Safehouse connection state surfaced in `loom-daemon status`** (#4345, #4362); **systemd `--user` service support** in the daemon start wrapper (#4268).
+
 ### Changed
 
 - **Forge/merge family ported to native `loom-daemon forge`** (#4273, epic #4081 Phase 3, family 3) — the `loom-forge` (`loom_tools.forge_cli`) and `loom-auto-merge` (`loom_tools.auto_merge`) Python CLIs are replaced by a native `loom-daemon forge <issue|pr|auth|auto-merge>` subcommand group. On GitHub the read/auth surface is a byte-identical passthrough to `gh` and `auto-merge` enables auto-merge via the `enablePullRequestAutoMerge` GraphQL mutation (no working-tree checkout); on Gitea the subcommand declines (exit 3) so the caller's existing shell path (`merge-pr.sh`'s `forge_auto_merge`, or the `gh` read fallback) carries it. `merge-pr.sh` / `check-duplicate.sh` / `check-shutdown.sh` / `cleanup-branches.sh` keep their names, flags, and graceful `gh`-fallback contract (no `loom-daemon` on PATH ⇒ scripts still work). Forge config resolves from the canonical repo root (`git rev-parse --git-common-dir`), never a worktree CWD; the #4061 env-precedence + Gitea hard-fail semantics are preserved and unit-tested. The shared `loom_tools/common/{forge,github,gitea,cached_forge}.py` client stack is retained (still imported by backlog/clean/daemon_cleanup/daemon_diagnostic/forge_snapshot/orphan_recovery/stuck_detection).
+- **Native ports, epic #4081 Phase 3** — token pool CLI (`loom-daemon tokens`, #4082/#4108, native probe #4080), worktree clean/orphan-recovery family (`loom-daemon clean`/`cleanup`, #4272, #4301), and Rust-native epic-conformance invariants replacing the Python-shelling tests (#4310, #4320). Ranking-file and status pool-dir resolution anchored to the daemon's own resolved pool (#4292, #4318, #4363).
+
+### Fixed
+
+- **Status client resilience** (#4279) — poisoned sweep-registry locks recovered via `PoisonError::into_inner`, `DaemonStatus` build panics caught and answered, and dropped status connections retried — including read-phase `ECONNRESET`/`BrokenPipe`/`UnexpectedEof` classification so the Linux RST path retries like the macOS clean-EOF path.
+- **SIGKILL'd detached sweeps recovered** via periodic claim reconciliation (#4348, #4374); **MCP-preflight candidate fallback + role-runner missing-root hygiene and log dedup** (#4349, #4376).
+- **Guard scope for `git stash pop/drop/clear` narrowed to ask-tier in the main checkout** (#4281, #4306) after a test-merge nearly destroyed preserved operator state.
+
+### Removed
+
+- **Python observability CLIs retired** (#4304) — `loom-status`, `loom-usage`, `loom-clean`, and siblings are replaced by native `loom-daemon` subcommands; externally installed shims (e.g. homebrew) import deleted modules and need reinstall or removal (#4384 tracks the distribution channel).
 
 ## [0.15.0] - 2026-07-24
 

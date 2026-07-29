@@ -87,6 +87,47 @@ assert_eq "FAKE_DAEMON WF=[] HG=[]" "$out" "--from-config leaves both env vars u
 out=$( ( cd "$WORKDIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE LOOM_DAEMON_BIN="$FAKE_BIN" bash "$START_SCRIPT" --no-work-finder --foreground 2>/dev/null ) | grep '^FAKE_DAEMON' )
 assert_eq "FAKE_DAEMON WF=[0] HG=[0]" "$out" "--no-work-finder forces finder off"
 
+# ---------- --from-config composition (#4353) ----------
+# --from-config used to be a strict either/or: it never looked at
+# --work-finder/--health-gate at all, so pairing it with an explicit flag
+# silently dropped the flag. It must now COMPOSE: the named loop is forced,
+# the other loop is left unset for config to drive.
+
+# 7a. --from-config --work-finder forces the finder ON, leaves the gate unset
+#     for config to drive.
+out=$( ( cd "$WORKDIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE LOOM_DAEMON_BIN="$FAKE_BIN" bash "$START_SCRIPT" --from-config --work-finder --foreground 2>/dev/null ) | grep '^FAKE_DAEMON' )
+assert_eq "FAKE_DAEMON WF=[1] HG=[]" "$out" "--from-config --work-finder forces finder ON, gate stays config-driven (#4353)"
+
+# 7b. --from-config --no-work-finder forces the finder OFF, gate stays unset.
+out=$( ( cd "$WORKDIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE LOOM_DAEMON_BIN="$FAKE_BIN" bash "$START_SCRIPT" --from-config --no-work-finder --foreground 2>/dev/null ) | grep '^FAKE_DAEMON' )
+assert_eq "FAKE_DAEMON WF=[0] HG=[]" "$out" "--from-config --no-work-finder forces finder OFF, gate stays config-driven (#4353)"
+
+# 7c. --from-config --health-gate forces the gate ON, finder stays unset.
+out=$( ( cd "$WORKDIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE LOOM_DAEMON_BIN="$FAKE_BIN" bash "$START_SCRIPT" --from-config --health-gate --foreground 2>/dev/null ) | grep '^FAKE_DAEMON' )
+assert_eq "FAKE_DAEMON WF=[] HG=[1]" "$out" "--from-config --health-gate forces gate ON, finder stays config-driven (#4353)"
+
+# 7d. --from-config --no-health-gate forces the gate OFF, finder stays unset.
+out=$( ( cd "$WORKDIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE LOOM_DAEMON_BIN="$FAKE_BIN" bash "$START_SCRIPT" --from-config --no-health-gate --foreground 2>/dev/null ) | grep '^FAKE_DAEMON' )
+assert_eq "FAKE_DAEMON WF=[] HG=[0]" "$out" "--from-config --no-health-gate forces gate OFF, finder stays config-driven (#4353)"
+
+# 7e. A pre-exported env var still wins over the forced flag under
+#     --from-config (env > CLI flag, same precedence as the non-config path).
+out=$( ( cd "$WORKDIR" && env -u LOOM_MAIN_HEALTH_GATE LOOM_WORK_FINDER=1 LOOM_DAEMON_BIN="$FAKE_BIN" bash "$START_SCRIPT" --from-config --no-work-finder --foreground 2>/dev/null ) | grep '^FAKE_DAEMON' )
+assert_eq "FAKE_DAEMON WF=[1] HG=[]" "$out" "pre-exported LOOM_WORK_FINDER=1 wins over --from-config --no-work-finder (#4353)"
+
+# 7f. The startup banner names the forced loop and never prints the
+#     "env not forced" wording when something WAS forced.
+banner_out=$( ( cd "$WORKDIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE LOOM_DAEMON_BIN="$FAKE_BIN" bash "$START_SCRIPT" --from-config --work-finder --foreground 2>&1 ) )
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$banner_out" | grep -q 'forced: work_finder=1' && ! echo "$banner_out" | grep -q 'env not forced'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} startup banner names the forced loop, never prints 'env not forced' when something was forced (#4353)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} startup banner names the forced loop, never prints 'env not forced' when something was forced (#4353)"
+    echo "  output: $banner_out"
+fi
+
 # 8. --help mentions the FLAGS-OFF default and the opt-in flags.
 help_out=$(bash "$START_SCRIPT" --help 2>/dev/null)
 TESTS_RUN=$((TESTS_RUN + 1))

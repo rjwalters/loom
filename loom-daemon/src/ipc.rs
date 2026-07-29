@@ -1245,6 +1245,12 @@ pub fn build_daemon_status(
             // without `workspace remove`) so `status` — not just the
             // work-finder log — points the operator at it.
             root_missing: !root.is_dir(),
+            // Load-aware deferral + tier label (#4259).
+            health_gate_deferred: health_states.is_deferred(root),
+            health_gate_deferred_reason: health_states.deferred_summary(root),
+            health_gate_verdict_tier: health_states
+                .gate_last_tier(root)
+                .map(|t| t.label().to_string()),
         });
         in_flight.extend(live);
         unregistered_locked.extend(locked_unregistered.into_iter().map(|(issue, owner_pid)| {
@@ -1364,6 +1370,12 @@ pub fn build_daemon_status(
         main_health_gate_not_evaluated_reason: health_states.unevaluated_summary(fallback_root),
         main_health_gate_enabled: Some(crate::main_health_gate::effective_enabled(fallback_root)),
         main_health_gate_verdict_at: health_states.last_verdict_at(fallback_root),
+        // Load-aware deferral + tier label (#4259).
+        main_health_gate_deferred: health_states.is_deferred(fallback_root),
+        main_health_gate_deferred_reason: health_states.deferred_summary(fallback_root),
+        main_health_gate_verdict_tier: health_states
+            .gate_last_tier(fallback_root)
+            .map(|t| t.label().to_string()),
         capacity,
         per_repo,
         // Resolved once at daemon startup (#4005), threaded in read-only —
@@ -4502,6 +4514,9 @@ exit 0
             main_health_gate_not_evaluated_reason: None,
             main_health_gate_enabled: Some(true),
             main_health_gate_verdict_at: Some(chrono::Utc::now()),
+            main_health_gate_deferred: false,
+            main_health_gate_deferred_reason: None,
+            main_health_gate_verdict_tier: Some("full".to_string()),
             capacity: crate::types::CapacityReport {
                 ranking_present: true,
                 total_accounts: 4,
@@ -4521,6 +4536,9 @@ exit 0
                 health_gate_enabled: Some(true),
                 health_gate_verdict_at: Some(chrono::Utc::now()),
                 root_missing: false,
+                health_gate_deferred: false,
+                health_gate_deferred_reason: None,
+                health_gate_verdict_tier: Some("full".to_string()),
             }],
             credential_preflight: Some(test_credential_preflight()),
             draining: false,

@@ -997,6 +997,34 @@ pub struct DaemonStatusReport {
     /// conservative choice for data an older daemon never populated).
     #[serde(default)]
     pub main_health_gate_verdict_at: Option<DateTime<Utc>>,
+    /// Whether the gate's most recent tick for the daemon's primary workspace
+    /// DEFERRED for host load (#4259) — a bounded, load-aware scheduling
+    /// decision distinct from both `main_health_gate_halted` (verified-red) and
+    /// `main_health_gate_not_evaluated` (the gate could not run this tick). A
+    /// deferred tick leaves any prior halt flag untouched and is NOT evidence
+    /// about `main`; it exists so a host that is permanently at the dispatch cap
+    /// reports `deferred (load …)` instead of burning the full timeout to report
+    /// a `not evaluated (timeout …)`. `#[serde(default)]` keeps pre-#4259 wire
+    /// data compatible.
+    #[serde(default)]
+    pub main_health_gate_deferred: bool,
+    /// A short `load …` summary of *why* the gate is deferring (#4259) — e.g.
+    /// `"load 1.05/core for 14m — fast tier runs at the 30m bound"` — or `None`
+    /// when the most recent tick was not a deferral. Rendered distinctly from
+    /// the UNEVALUATED `not_evaluated_reason` so an operator can tell "the host
+    /// is too busy to run the gate right now" from "the gate ran and could not
+    /// produce a verdict". `#[serde(default)]` keeps pre-#4259 wire data
+    /// compatible.
+    #[serde(default)]
+    pub main_health_gate_deferred_reason: Option<String>,
+    /// The tier (`"full"` / `"fast"`) of the most recent completed verdict for
+    /// the daemon's primary workspace (#4259), or `None` before the first. The
+    /// fast tier runs only a compile+smoke subset, so a fast-tier Green is NOT
+    /// equivalent to a full-suite Green — this label keeps the two
+    /// distinguishable on the status surface. `#[serde(default)]` keeps
+    /// pre-#4259 wire data compatible.
+    #[serde(default)]
+    pub main_health_gate_verdict_tier: Option<String>,
     /// Token-capacity backpressure snapshot (#3902): account health derived from
     /// the rotation ranking (`.loom/tokens/.ranking`) and whether the token axis
     /// is the binding constraint on the dynamic cap. `#[serde(default)]` keeps
@@ -1255,6 +1283,25 @@ pub struct RepoStatus {
     /// absent field parses as `false`, i.e. "not known to be missing").
     #[serde(default)]
     pub root_missing: bool,
+    /// Whether this repo's most recent gate tick DEFERRED for host load (#4259)
+    /// — a bounded, load-aware scheduling decision distinct from both
+    /// `health_gate_halted` (verified-red) and `health_gate_not_evaluated`
+    /// (the gate could not run). A deferred tick leaves the halt flag untouched
+    /// and is NOT evidence about `main`. `#[serde(default)]` keeps pre-#4259
+    /// wire data compatible.
+    #[serde(default)]
+    pub health_gate_deferred: bool,
+    /// A short `load …` summary of this repo's current load-deferral (#4259),
+    /// or `None` when not deferring. See
+    /// [`DaemonStatusReport::main_health_gate_deferred_reason`].
+    #[serde(default)]
+    pub health_gate_deferred_reason: Option<String>,
+    /// The tier (`"full"` / `"fast"`) of this repo's most recent completed
+    /// verdict (#4259), or `None` before the first — so a fast-tier Green is
+    /// never mistaken for a full-suite Green. See
+    /// [`DaemonStatusReport::main_health_gate_verdict_tier`].
+    #[serde(default)]
+    pub health_gate_verdict_tier: Option<String>,
 }
 
 /// One active insta-crash quarantine (Issue #4215), as surfaced by
@@ -1820,6 +1867,9 @@ mod tests {
             health_gate_enabled: Some(true),
             health_gate_verdict_at: None,
             root_missing,
+            health_gate_deferred: false,
+            health_gate_deferred_reason: None,
+            health_gate_verdict_tier: None,
         }
     }
 

@@ -21,9 +21,19 @@ this PR for the Tier B (vector embeddings) work.
 
 **Storage**: a SQLite database at ``.loom/search-index/index.db``
 (repo-local, gitignored). Ranking is SQLite FTS5 + BM25 — stdlib ``sqlite3``
-only, zero new dependencies. Tier B (pluggable embeddings) is designed in via
-the :class:`Embedder` protocol and the ``embeddings`` table, but not
-implemented in v1.
+only, zero new dependencies.
+
+**Tier B (#4370, follow-up to #4339)**: a pluggable vector-embeddings layer
+gated by its own opt-in, ``search.embeddings.provider`` in
+``.loom/config.json`` (env override ``LOOM_SEARCH_EMBEDDINGS_PROVIDER``),
+default ``"none"``. When ``"none"`` this module never imports
+:mod:`loom_tools.embedders` and ranking is exactly the Tier A BM25 path
+above. When ``"local"``, a small local ONNX model (via the optional
+``fastembed`` package, behind the ``loom-tools[search]`` extra — see
+:mod:`loom_tools.embedders`) populates the ``embeddings`` table
+incrementally (piggybacking on the same watermark as the FTS documents) and
+:func:`query_index` fuses BM25 + cosine-similarity rankings via reciprocal
+rank fusion. A remote-API provider is out of scope for #4370.
 
 **Enablement**: ``search.enabled`` in ``.loom/config.json`` (read via the
 canonical :mod:`loom_tools.common.config_resolver`), with env override
@@ -42,9 +52,11 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import re
 import sqlite3
+import struct
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -58,6 +70,15 @@ logger = logging.getLogger(__name__)
 
 #: Env var overriding ``search.enabled`` in ``.loom/config.json``.
 SEARCH_ENABLED_ENV = "LOOM_SEARCH_ENABLED"
+
+#: Env var overriding ``search.embeddings.provider`` in ``.loom/config.json``.
+EMBEDDINGS_PROVIDER_ENV = "LOOM_SEARCH_EMBEDDINGS_PROVIDER"
+
+#: Default Tier B provider — no embeddings, pure BM25 ranking.
+DEFAULT_EMBEDDINGS_PROVIDER = "none"
+
+#: ``k`` constant in the reciprocal rank fusion formula ``1 / (k + rank)``.
+RRF_K = 60
 
 #: Repo-relative directory the SQLite index lives under. Must stay gitignored
 #: (see ``.gitignore``) — a misconfigured/un-ignored destination refuses to
@@ -150,6 +171,28 @@ def is_search_enabled(repo_root: Path) -> bool:
         return env_bool(SEARCH_ENABLED_ENV, default=False)
     effective = resolve_effective_config(repo_root)
     return bool(get_path(effective, "search.enabled", False))
+
+
+def resolve_embeddings_provider(repo_root: Path) -> str:
+    """Resolve ``search.embeddings.provider`` for ``repo_root``.
+
+    Precedence: env (:data:`EMBEDDINGS_PROVIDER_ENV`) > ``search.embeddings.provider``
+    in the resolved config tree > default (:data:`DEFAULT_EMBEDDINGS_PROVIDER`,
+    ``"none"``), mirroring :func:`is_search_enabled`'s env > config > default
+    convention. This is a **separate** opt-in from ``search.enabled`` — a
+    non-``"none"`` provider with ``search.enabled`` false is still fully off,
+    since every caller of this function only runs once Tier A is enabled
+    (:func:`build_index` and :func:`query_index`'s CLI entry point both gate
+    on :func:`is_search_enabled` first).
+    """
+    if EMBEDDINGS_PROVIDER_ENV in os.environ:
+        value = os.environ[EMBEDDINGS_PROVIDER_ENV].strip().lower()
+        return value or DEFAULT_EMBEDDINGS_PROVIDER
+    effective = resolve_effective_config(repo_root)
+    value = get_path(effective, "search.embeddings.provider", DEFAULT_EMBEDDINGS_PROVIDER)
+    if not isinstance(value, str) or not value.strip():
+        return DEFAULT_EMBEDDINGS_PROVIDER
+    return value.strip().lower()
 
 
 # --------------------------------------------------------------------------
@@ -298,9 +341,16 @@ def _sweep_log_paths(repo_root: Path) -> list[Path]:
     return sorted(logs_dir.glob("sweep-issue-*.log"))
 
 
-def index_sweep_logs(conn: sqlite3.Connection, repo_root: Path) -> int:
-    """Ingest sweep-log tails. Returns the count of newly indexed/changed rows."""
-    new_count = 0
+def index_sweep_logs(conn: sqlite3.Connection, repo_root: Path) -> list[dict[str, str]]:
+    """Ingest sweep-log tails.
+
+    Returns the newly indexed/changed documents (empty dicts for unchanged
+    ones are skipped) — the same watermark gate :func:`_upsert_document`
+    already applies, reused here so Tier B embedding computation only ever
+    runs against genuinely new/changed content (never a no-op re-embed of
+    unchanged documents).
+    """
+    changed: list[dict[str, str]] = []
     for log_path in _sweep_log_paths(repo_root):
         match = _SWEEP_LOG_RE.search(log_path.name)
         if not match:
@@ -314,18 +364,21 @@ def index_sweep_logs(conn: sqlite3.Connection, repo_root: Path) -> int:
         tail = _read_log_tail(log_path)
         if not tail.strip():
             continue
-        changed = _upsert_document(
+        title = f"Sweep issue #{issue}"
+        is_changed = _upsert_document(
             conn,
             source_type="sweep",
             source_id=issue,
             watermark=watermark,
-            title=f"Sweep issue #{issue}",
+            title=title,
             body=tail,
             link=str(log_path),
         )
-        if changed:
-            new_count += 1
-    return new_count
+        if is_changed:
+            changed.append(
+                {"source_type": "sweep", "source_id": issue, "title": title, "body": tail, "link": str(log_path)}
+            )
+    return changed
 
 
 # --------------------------------------------------------------------------
@@ -372,10 +425,10 @@ def _run_gh_pr_list(repo_root: Path, limit: int = PR_FETCH_LIMIT) -> list[dict[s
     return data if isinstance(data, list) else []
 
 
-def index_prs(conn: sqlite3.Connection, repo_root: Path) -> int:
-    """Ingest merged PR titles/bodies. Returns count of newly indexed/changed rows."""
+def index_prs(conn: sqlite3.Connection, repo_root: Path) -> list[dict[str, str]]:
+    """Ingest merged PR titles/bodies. Returns the newly indexed/changed documents."""
     prs = _run_gh_pr_list(repo_root)
-    new_count = 0
+    changed: list[dict[str, str]] = []
     for pr in prs:
         number = pr.get("number")
         if number is None:
@@ -384,7 +437,7 @@ def index_prs(conn: sqlite3.Connection, repo_root: Path) -> int:
         title = pr.get("title") or ""
         body = pr.get("body") or ""
         link = pr.get("url") or ""
-        changed = _upsert_document(
+        is_changed = _upsert_document(
             conn,
             source_type="pr",
             source_id=str(number),
@@ -393,9 +446,73 @@ def index_prs(conn: sqlite3.Connection, repo_root: Path) -> int:
             body=body,
             link=link,
         )
-        if changed:
-            new_count += 1
-    return new_count
+        if is_changed:
+            changed.append({"source_type": "pr", "source_id": str(number), "title": title, "body": body, "link": link})
+    return changed
+
+
+# --------------------------------------------------------------------------
+# Tier B: embeddings (#4370, follow-up to #4339)
+# --------------------------------------------------------------------------
+
+
+def _pack_vector(vector: list[float]) -> bytes:
+    """Serialize a vector as little-endian float32, matching the ``vector BLOB`` column."""
+    return struct.pack(f"<{len(vector)}f", *vector)
+
+
+def _unpack_vector(blob: bytes) -> list[float] | None:
+    """Deserialize a little-endian float32 vector, or ``None`` for a corrupt/short blob."""
+    if not blob or len(blob) % 4 != 0:
+        logger.warning(
+            "Skipping embeddings row with corrupt/short vector blob (%d bytes)",
+            len(blob) if blob else 0,
+        )
+        return None
+    count = len(blob) // 4
+    try:
+        return list(struct.unpack(f"<{count}f", blob))
+    except struct.error:
+        logger.warning("Skipping embeddings row with unparsable vector blob")
+        return None
+
+
+def _embed_changed_documents(
+    conn: sqlite3.Connection,
+    provider: str,
+    changed: list[dict[str, str]],
+) -> None:
+    """Populate ``embeddings`` for newly indexed/changed documents (watermark-gated).
+
+    Only ever called with the subset of documents :func:`index_sweep_logs` /
+    :func:`index_prs` report as new/changed this run — unchanged documents
+    are never re-embedded. Raises :class:`loom_tools.embedders.MissingEmbeddingDependencyError`
+    (hard error, naming the ``loom-tools[search]`` install hint) when
+    ``provider`` is configured but its dependency is not importable; this is
+    intentionally NOT caught here — index-time failures should be loud.
+    """
+    if not changed:
+        return
+
+    from loom_tools.embedders import create_embedder
+
+    embedder = create_embedder(provider)
+    if embedder is None:  # provider == "none"; defensive, callers already gate on this
+        return
+
+    model = getattr(embedder, "model_name", provider)
+    for doc in changed:
+        text = f"{doc['title']}\n\n{doc['body']}".strip()
+        vector = embedder.embed(text)
+        conn.execute(
+            """
+            INSERT INTO embeddings (source_type, source_id, model, vector)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(source_type, source_id, model)
+            DO UPDATE SET vector = excluded.vector
+            """,
+            (doc["source_type"], doc["source_id"], model, _pack_vector(vector)),
+        )
 
 
 # --------------------------------------------------------------------------
@@ -408,7 +525,10 @@ def build_index(repo_root: Path) -> dict[str, int]:
 
     A no-op (returns zero counts, creates nothing) when search is disabled.
     Otherwise creates ``.loom/search-index/index.db`` if absent, and ingests
-    sweep-log tails plus merged PRs, skipping unchanged items.
+    sweep-log tails plus merged PRs, skipping unchanged items. When
+    ``search.embeddings.provider`` (Tier B, #4370) resolves to something
+    other than ``"none"``, also populates ``embeddings`` for the
+    newly-indexed/changed documents from this run.
     """
     if not is_search_enabled(repo_root):
         return {"sweeps": 0, "prs": 0}
@@ -418,12 +538,17 @@ def build_index(repo_root: Path) -> dict[str, int]:
 
     conn = _connect(index_db_path(repo_root))
     try:
-        sweeps = index_sweep_logs(conn, repo_root)
-        prs = index_prs(conn, repo_root)
+        changed_sweeps = index_sweep_logs(conn, repo_root)
+        changed_prs = index_prs(conn, repo_root)
         conn.commit()
+
+        provider = resolve_embeddings_provider(repo_root)
+        if provider != "none":
+            _embed_changed_documents(conn, provider, changed_sweeps + changed_prs)
+            conn.commit()
     finally:
         conn.close()
-    return {"sweeps": sweeps, "prs": prs}
+    return {"sweeps": len(changed_sweeps), "prs": len(changed_prs)}
 
 
 # --------------------------------------------------------------------------
@@ -447,8 +572,148 @@ def _build_fts_query(query: str) -> str:
     return escaped_phrase
 
 
+def _rank_bm25_rows(rows: list[tuple], query: str) -> list[SearchResult]:
+    """Sort raw ``bm25(documents)`` rows, exact-phrase hits first (unchanged Tier A logic)."""
+    query_lower = query.strip().lower()
+    scored = []
+    for source_type, source_id, title, body, link, rank in rows:
+        summary_line = next((line.strip() for line in body.splitlines() if line.strip()), "")
+        exact_phrase = bool(query_lower) and (
+            query_lower in title.lower() or query_lower in body.lower()
+        )
+        scored.append((not exact_phrase, rank, SearchResult(
+            source_type=source_type,
+            source_id=source_id,
+            title=title,
+            summary=summary_line,
+            link=link,
+            rank=rank,
+        )))
+    scored.sort(key=lambda r: (r[0], r[1]))
+    return [r[2] for r in scored]
+
+
+def _fetch_embeddings(conn: sqlite3.Connection, model: str) -> list[tuple[str, str, list[float]]]:
+    """Load and deserialize all stored vectors for ``model``, skipping corrupt blobs."""
+    rows = conn.execute(
+        "SELECT source_type, source_id, vector FROM embeddings WHERE model = ?", (model,)
+    ).fetchall()
+    out: list[tuple[str, str, list[float]]] = []
+    for source_type, source_id, blob in rows:
+        vector = _unpack_vector(blob)
+        if vector is not None:
+            out.append((source_type, source_id, vector))
+    return out
+
+
+def _cosine_similarity(a: list[float], b: list[float]) -> float:
+    """Cosine similarity; ``0.0`` for empty/mismatched-dimension/zero-norm vectors (no div-by-zero)."""
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(x * x for x in b))
+    if norm_a == 0.0 or norm_b == 0.0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+def _cosine_rank(
+    embedded_docs: list[tuple[str, str, list[float]]],
+    query_vector: list[float],
+    *,
+    limit: int,
+) -> list[tuple[str, str]]:
+    """Rank ``embedded_docs`` by cosine similarity to ``query_vector``, descending."""
+    scored = [
+        (_cosine_similarity(query_vector, vector), source_type, source_id)
+        for source_type, source_id, vector in embedded_docs
+    ]
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return [(source_type, source_id) for _, source_type, source_id in scored[:limit]]
+
+
+def _reciprocal_rank_fusion(
+    *rankings: list[tuple[str, str]], k: int = RRF_K
+) -> dict[tuple[str, str], float]:
+    """Combine one or more ranked key lists via reciprocal rank fusion (``score = Σ 1/(k+rank)``)."""
+    scores: dict[tuple[str, str], float] = {}
+    for ranking in rankings:
+        for rank, key in enumerate(ranking, start=1):
+            scores[key] = scores.get(key, 0.0) + 1.0 / (k + rank)
+    return scores
+
+
+def _fuse_with_embeddings(
+    conn: sqlite3.Connection,
+    provider: str,
+    query: str,
+    bm25_results: list[SearchResult],
+    candidate_limit: int,
+) -> list[SearchResult] | None:
+    """Fuse ``bm25_results`` with a Tier B vector-similarity ranking via RRF.
+
+    Returns ``None`` to signal "degrade to the unmodified BM25 ranking" — a
+    missing optional dependency (loud stderr warning, per spec), an
+    embedding failure, or simply no embeddings stored yet for this model
+    (nothing to fuse). Never raises: query-time Tier B failures are always
+    non-fatal.
+    """
+    from loom_tools.embedders import MissingEmbeddingDependencyError, create_embedder
+
+    try:
+        embedder = create_embedder(provider)
+    except MissingEmbeddingDependencyError as exc:
+        print(f"[loom-search] {exc} Falling back to BM25-only ranking.", file=sys.stderr)
+        return None
+    if embedder is None:  # provider == "none"; caller already gates on this
+        return None
+
+    model = getattr(embedder, "model_name", provider)
+    embedded_docs = _fetch_embeddings(conn, model)
+    if not embedded_docs:
+        return None  # nothing to fuse yet; BM25 order stands unchanged
+
+    try:
+        query_vector = embedder.embed(query)
+    except Exception as exc:  # noqa: BLE001 - any provider-specific failure degrades, never raises
+        print(f"[loom-search] embedding the query failed ({exc}). Falling back to BM25-only ranking.", file=sys.stderr)
+        return None
+
+    cosine_keys = _cosine_rank(embedded_docs, query_vector, limit=candidate_limit)
+    bm25_keys = [(r.source_type, r.source_id) for r in bm25_results]
+    scores = _reciprocal_rank_fusion(bm25_keys, cosine_keys)
+
+    known = {(r.source_type, r.source_id): r for r in bm25_results}
+    for source_type, source_id in cosine_keys:
+        key = (source_type, source_id)
+        if key in known:
+            continue
+        row = conn.execute(
+            "SELECT title, body, link FROM documents WHERE source_type = ? AND source_id = ? LIMIT 1",
+            key,
+        ).fetchone()
+        if row is None:
+            continue
+        title, body, link = row
+        summary_line = next((line.strip() for line in body.splitlines() if line.strip()), "")
+        known[key] = SearchResult(
+            source_type=source_type, source_id=source_id, title=title, summary=summary_line, link=link, rank=0.0
+        )
+
+    ordered = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+    return [known[key] for key, _ in ordered if key in known]
+
+
 def query_index(repo_root: Path, query: str, top_k: int = 10) -> list[SearchResult]:
-    """Run a BM25-ranked FTS5 query over the index. Empty list if no index/hits."""
+    """Run a ranked FTS5 query over the index. Empty list if no index/hits.
+
+    Tier A (``search.embeddings.provider`` resolves to ``"none"``, the
+    default): pure BM25 ranking — behavior is byte-identical to before #4370.
+    Tier B (provider != ``"none"``): fuses BM25 with vector-similarity
+    ranking via reciprocal rank fusion, degrading back to pure BM25 whenever
+    Tier B has nothing to contribute (see :func:`_fuse_with_embeddings`).
+    """
     db_path = index_db_path(repo_root)
     if not db_path.exists():
         return []
@@ -456,6 +721,7 @@ def query_index(repo_root: Path, query: str, top_k: int = 10) -> list[SearchResu
     conn = sqlite3.connect(str(db_path))
     try:
         conn.executescript(_SCHEMA)  # idempotent; guards a partial/corrupt DB
+        candidate_limit = max(top_k * 4, top_k)
         try:
             rows = conn.execute(
                 """
@@ -465,31 +731,21 @@ def query_index(repo_root: Path, query: str, top_k: int = 10) -> list[SearchResu
                 ORDER BY rank
                 LIMIT ?
                 """,
-                (_build_fts_query(query), max(top_k * 4, top_k)),
+                (_build_fts_query(query), candidate_limit),
             ).fetchall()
         except sqlite3.OperationalError:
-            return []
+            rows = []
+
+        bm25_results = _rank_bm25_rows(rows, query)
+
+        provider = resolve_embeddings_provider(repo_root)
+        if provider == "none":
+            return bm25_results[:top_k]
+
+        fused = _fuse_with_embeddings(conn, provider, query, bm25_results, candidate_limit)
+        return (fused if fused is not None else bm25_results)[:top_k]
     finally:
         conn.close()
-
-    query_lower = query.strip().lower()
-    results = []
-    for source_type, source_id, title, body, link, rank in rows:
-        summary_line = next((line.strip() for line in body.splitlines() if line.strip()), "")
-        exact_phrase = bool(query_lower) and (
-            query_lower in title.lower() or query_lower in body.lower()
-        )
-        results.append((not exact_phrase, rank, SearchResult(
-            source_type=source_type,
-            source_id=source_id,
-            title=title,
-            summary=summary_line,
-            link=link,
-            rank=rank,
-        )))
-
-    results.sort(key=lambda r: (r[0], r[1]))
-    return [r[2] for r in results[:top_k]]
 
 
 # --------------------------------------------------------------------------

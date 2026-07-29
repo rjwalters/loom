@@ -70,6 +70,13 @@ loom-tokens = "loom_tools.tokens.cli:main"
 loom-resolve-model = "loom_tools.model_tiers:main"
 loom-search = "loom_tools.semantic_search:main"
 
+[project.optional-dependencies]
+# Tier B pluggable vector-embeddings for loom-search (#4370, follow-up to
+# #4339). Never a default/required dependency — only pulled in when a host
+# opts into `search.embeddings.provider=local`. See
+# defaults/docs/semantic-search.md and loom_tools/embedders.py.
+search = ["fastembed>=0.3"]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 

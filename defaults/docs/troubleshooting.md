@@ -113,6 +113,59 @@ git worktree remove .loom/worktrees/issue-42 --force
 git worktree prune
 ```
 
+### Corrupted local git identity (`...github.comecho`, "cannot overwrite multiple values") (#4369)
+
+**Symptom**: `git config user.email <value>` fails with `error: cannot
+overwrite multiple values`, or a commit/merge ships with a garbled author
+email like `loom-reviewer@users.noreply.github.comecho`.
+
+**Root cause**: a now-deleted Tauri-era code path once pushed two shell lines
+into an agent's terminal to set a per-role git identity — `git config
+user.email "<email>"` immediately followed by an `echo "✓ Git identity
+configured..."` line. A lost newline between the two glued the `echo`
+token onto the email, corrupting it, and because `git config user.email
+<v>` *replaces* rather than appends, repeated writes/`--add` improvisation
+could also stack multiple values for the same key. That code was removed in
+`d61acab0` (#3353) — **nothing on `main` writes `user.email`/`user.name`
+anymore** — but the corrupted/stacked values persist as residue in any
+checkout that predates the removal, and worktrees inherit them from the
+parent repo's shared `.git/config`.
+
+**Detect it**:
+
+```bash
+./.loom/scripts/check-git-identity.sh
+```
+
+This reads LOCAL (repo + per-worktree) scope only — never your global
+identity — so a normal setup with no repo-local override never
+false-positives. It exits `0` when clean, `1` (warning) when it finds
+plain stacked values with no corruption, and `3` (hard fail) when it finds
+the glued-token corruption pattern. `./.loom/scripts/worktree.sh` runs this
+check automatically at worktree creation: it hard-fails on the corruption
+pattern (a garbled commit author would otherwise ship silently — see PR
+#4303) and warns-but-proceeds on a plain multi-value.
+
+**Fix it** — preferred, falls back to your global identity (Loom no longer
+sets a per-role local identity, so the local values are pure residue):
+
+```bash
+git config --unset-all user.email && git config --unset-all user.name
+```
+
+**Alternative** — keep one specific value (e.g. no global identity is
+configured on this host):
+
+```bash
+git config --replace-all user.email <value-to-keep>
+git config --replace-all user.name  <value-to-keep>
+```
+
+After either fix, re-run `./.loom/scripts/check-git-identity.sh` to confirm
+it now reports clean, and verify a new commit picks up the intended author
+with `git commit --allow-empty -m test && git log -1 --format='%an <%ae>'`
+(then drop the test commit).
+
 ### Labels out of sync
 
 ```bash
@@ -129,7 +182,7 @@ Run the sync script — or create the one label directly — to reconcile:
 ```bash
 gh label list --search operator                      # empty => not provisioned
 gh label create "loom:operator-only" --color F97316 \
-  --description "Requires human action outside automation (credentials, infra, hardware); sweep/shepherd skip"
+  --description "Requires human action or ruling outside automation (creds, infra, hardware); sweep/shepherd skip"
 ```
 
 **GitHub caps label descriptions at 100 characters.** A `labels.yml` entry with a
@@ -143,8 +196,10 @@ These two status labels look similar but mean different things to the automation
 - **`loom:blocked`** — work is *automatable* but currently waiting on a dependency
   (another issue, an unmerged PR, missing context). The intent is "unblock it, then
   a Builder can proceed."
-- **`loom:operator-only`** — work requires a *human to act outside automation
-  entirely* (rotating credentials, infra changes, hardware access, manual deploys).
+- **`loom:operator-only`** — work requires a *human to act or rule outside
+  automation entirely* (rotating credentials, infra changes, hardware access,
+  manual deploys — or an owner-gated decision: an issue the code owner filed as a
+  TODO on owner-tracked code, where the design direction is the owner's call).
   Sweep/shepherd skip these in pre-flight rather than attempting them; a human must
   do the work off-automation before the issue can proceed.
 

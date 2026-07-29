@@ -329,6 +329,52 @@ pub fn load_per_core() -> Option<f64> {
 }
 
 // ============================================================================
+// Host saturation — shared "is the host loaded?" predicate (#4259)
+// ============================================================================
+//
+// The build-gate's load-aware deferral (`main_health_gate::run_gate_tick`) and
+// any future load-aware dispatch agree on one definition of "saturated" by
+// funneling through these pure helpers, rather than each re-deriving a ratio.
+// Deliberately load-average-based (not the measured idle fraction): the gate
+// deferral must work from the very first tick, before the idle-fraction memo
+// ([`refresh_cpu_util_cache`]) has been warmed by a work-finder loop, and a
+// missing load reading is a hard fail-safe signal (run the gate, never defer).
+
+/// Default 1-minute-load-average-per-logical-CPU ratio at or above which the
+/// host is considered *saturated* for build-gate deferral (#4259). A ratio of
+/// `1.0` means "as many runnable/uninterruptible threads as logical cores"; the
+/// gate defers a notch below that (`0.9`) so it does not pile its own multi-core
+/// `cargo` build onto an already-full host. Tunable via config/env — the load
+/// average overstates consumption on macOS (see the module note on #4031), so an
+/// operator may raise it.
+///
+/// This is deliberately distinct from — and well below — the host-distress
+/// circuit breaker's [`crate::host_breaker::DEFAULT_HOST_BREAKER_LOAD_PER_CORE`]
+/// (`2.5`): the two thresholds measure the **same** normalized ratio
+/// ([`load_per_core_from`]) but encode different policies. `0.9` is "the host is
+/// full enough that the gate should wait a cycle rather than add its own build",
+/// a low-cost *scheduling* deferral; `2.5` is "the host is in genuine distress,
+/// stop dispatching new sweeps entirely", a protective *trip*. The gate defer
+/// point sits below the breaker trip on purpose so the gate backs off long
+/// before the host reaches distress — this ordering is intentional, not drift.
+pub const DEFAULT_GATE_LOAD_THRESHOLD: f64 = 0.9;
+
+/// Whether the host is saturated at `threshold`, given an optional load reading
+/// (#4259). Pure — the decision function. Built on the shared
+/// [`load_per_core_from`] ratio (#4316) so the gate and the host-distress
+/// circuit breaker agree on one definition of load-per-core. `None` load (or a
+/// zero CPU count) ⇒ `None` here: the caller must fail safe (run the gate, never
+/// defer) on absent evidence, never treat a missing reading as "loaded".
+///
+/// The gate (`main_health_gate::run_gate_tick`) samples [`read_loadavg_1m`] /
+/// [`logical_cpu_count`] once per tick and passes them here, reusing the same
+/// reading for the ratio it logs, so there is no separate live-probe wrapper.
+#[must_use]
+pub fn is_host_saturated(loadavg_1m: Option<f64>, ncpu: usize, threshold: f64) -> Option<bool> {
+    load_per_core_from(loadavg_1m, ncpu).map(|lpc| lpc >= threshold)
+}
+
+// ============================================================================
 // CPU utilization — measured idle fraction (#4031), OS-specific read, pure parse
 // ============================================================================
 
@@ -953,6 +999,29 @@ mod tests {
     // `resolve_utilization_target` / `resolve_est_cores_per_sweep` trust the
     // `Option<f64>` they are handed is already filtered, exactly like
     // `resolve_per_token_concurrency` trusts `WorkFinderConfig`.
+
+    // ------------------------------------------------------------------
+    // host saturation (#4259) — pure predicate
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn is_host_saturated_thresholds_on_load_per_core() {
+        // 28-core host, threshold 0.9: load 30 (1.07/core) is saturated.
+        assert_eq!(is_host_saturated(Some(30.0), 28, 0.9), Some(true));
+        // load 14 (0.5/core) is not.
+        assert_eq!(is_host_saturated(Some(14.0), 28, 0.9), Some(false));
+        // Exactly at the threshold counts as saturated (>=).
+        assert_eq!(is_host_saturated(Some(25.2), 28, 0.9), Some(true));
+    }
+
+    #[test]
+    fn is_host_saturated_missing_load_is_none_fail_safe() {
+        // No load reading ⇒ None (the caller runs the gate, never defers).
+        assert_eq!(is_host_saturated(None, 28, 0.9), None);
+        // A zero CPU count is likewise absent evidence (shared
+        // `load_per_core_from` guard) ⇒ None, so the caller still fails safe.
+        assert_eq!(is_host_saturated(Some(3.0), 0, 0.9), None);
+    }
 
     // ------------------------------------------------------------------
     // logical_cpu_count — smoke test

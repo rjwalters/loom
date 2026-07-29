@@ -1087,7 +1087,7 @@ The reaper (`sweep_registry::spawn_reaper_task`) ticks every 30 seconds
 4. Garbage-collects terminal entries older than the retention window
    (default 1 hour).
 
-## Stale-claim reconciliation & the sweep journal (#3953, fixed #3975)
+## Stale-claim reconciliation & the sweep journal (#3953, fixed #3975, extended to PR-side claims #4367)
 
 Two independent surfaces reclaim abandoned `loom:building` claims when the
 sweep that owned them has died, using the same evidence source and the same
@@ -1095,7 +1095,8 @@ decision rule:
 
 | Surface | Where | When it runs |
 |---------|-------|---------------|
-| Rust startup reconciliation | `claim_reconciliation::forge::reconcile_workspace` (called from `main.rs` at daemon startup, guarded by `LOOM_STALE_CLAIM_RECONCILE`, default on) | Once, on every daemon start, across every `effective_roots()` workspace |
+| Rust issue-side reconciliation (`loom:building`) | `claim_reconciliation::forge::reconcile_workspace` (guarded by `LOOM_STALE_CLAIM_RECONCILE`, default on) | At daemon startup AND every `LOOM_CLAIM_RECONCILE_INTERVAL_SECS` (default 600s) thereafter, via `run_reconciliation_pass` (#4348), across every `effective_roots()` workspace |
+| Rust PR-side reconciliation (`loom:reviewing` / `loom:treating`, #4367) | `claim_reconciliation::forge::reconcile_pr_claims`, called from the same `run_reconciliation_pass` entry point (same `LOOM_STALE_CLAIM_RECONCILE` gate — no separate wiring) | Same cadence as the issue-side pass: at startup and every `LOOM_CLAIM_RECONCILE_INTERVAL_SECS`, across every `effective_roots()` workspace |
 | `loom-recover-orphans` (native, issue #4272) | `worktree_ops::orphan_recovery::check_untracked_building` | On demand (operator/cron invocation of `loom-recover-orphans [--recover]`) |
 
 Both read the same machine-level **sweep journal** (`~/.loom/sweeps.json`,
@@ -1168,6 +1169,54 @@ deliberate event, while the Python tool can be invoked ad hoc (including
 immediately after a claim is made, before its journal entry has even been
 written) — the short grace period is defense-in-depth against a race the
 once-per-restart Rust pass is much less exposed to.
+
+### PR-side claim labels: `loom:reviewing` / `loom:treating` (#4367)
+
+`loom:reviewing` (Judge) and `loom:treating` (Doctor) are claim *overlays* —
+they coexist with the PR's underlying state label
+(`loom:review-requested` / `loom:changes-requested` / `loom:pr`) while work
+is in progress. Like `loom:building`, they can be left behind forever when
+their holder dies (observed on PR #4303: a `loom:treating` label ~5h stale
+from a Doctor killed on another host). `claim_reconciliation::forge::reconcile_pr_claims`
+extends the same pass to cover both, running from the same
+`run_reconciliation_pass` entry point (startup + periodic, same
+`LOOM_STALE_CLAIM_RECONCILE` gate — no `main.rs` change needed).
+
+The pure decision function, `decide_pr`, mirrors `decide`'s union-probe join
+priority (journal entry, then checkpoint→run-registry) but with two
+deliberate divergences from the issue-side rule, both driven by the PR side's
+weaker evidence:
+
+- **The join is heuristic, not authoritative.** A PR has no `loom:building`
+  issue number of its own — the issue number is recovered only when the PR's
+  `headRefName` matches the `feature/issue-<N>` convention `worktree.sh`
+  establishes (`parse_issue_from_branch`). Any other branch shape has no join
+  key at all and falls straight through to the age rule below.
+- **The age gate applies unconditionally — even to a dead joined pid.**
+  Unlike `decide()`'s `DeadPid`/`DeadRunRegistry` branches (immediate,
+  unconditional reclaim), a dead pid alone is never sufficient proof on the
+  PR side: the branch-name join can be wrong (a Doctor may hold a PR whose
+  sweep record belongs to a different phase), so `decide_pr` only reclaims
+  once the PR's `updatedAt` has *also* aged past the per-label threshold. A
+  **live** joined pid still short-circuits to `Keep` unconditionally — that
+  evidence is trustworthy either way. A missing/unparseable `updatedAt`
+  fails safe to `Keep`, same rationale as the issue side's total-absence
+  case.
+
+Thresholds are minutes-scale, not hours, and env-overridable:
+
+| Claim label | Env var | Default |
+|-------------|---------|---------|
+| `loom:reviewing` | `LOOM_STALE_REVIEWING_MINUTES` | 30 — the SAME env var `.claude/commands/loom/judge.md`'s "Stale `loom:reviewing` Claim Check" already established, so the agent-side fast path and this always-on daemon backstop share one convention |
+| `loom:treating` | `LOOM_STALE_TREATING_MINUTES` | 60 — a Doctor's fix cycle legitimately runs longer than a single Judge review pass |
+
+Reclaiming removes only the stale claim label — the PR's state label (still
+present in the normal case) restores discoverability by itself. As a safety
+net, if the PR is left carrying none of `loom:review-requested` /
+`loom:changes-requested` / `loom:pr` after the claim label is removed,
+`forge::reclaim_pr` adds `loom:review-requested` so a fresh Judge pass picks
+it back up. Log lines mirror the issue-side format, e.g. `claim_reconciliation:
+removed stale loom:reviewing from PR #N in <root> (DeadPid { pid: … }, …)`.
 
 ## Stacked-PR dependency — #3729 (v1), #3747 (v2 item 1)
 
@@ -2569,6 +2618,11 @@ process:
 # Enable strictly per .loom/config.json → autonomous (no env forcing):
 ./.loom/scripts/cli/loom-daemon-start.sh --from-config
 
+# --from-config COMPOSES with an explicit flag (#4353): the named loop is
+# forced, the other is left for config to drive:
+./.loom/scripts/cli/loom-daemon-start.sh --from-config --work-finder      # force finder ON, gate config-driven
+./.loom/scripts/cli/loom-daemon-start.sh --from-config --no-health-gate   # force gate OFF, finder config-driven
+
 # Explicit-off / foreground variants:
 ./.loom/scripts/cli/loom-daemon-start.sh --no-work-finder   # force finder off (explicit; same as default)
 ./.loom/scripts/cli/loom-daemon-start.sh --no-health-gate   # force gate off (explicit; same as default)
@@ -2584,9 +2638,13 @@ process:
   and `LOOM_MAIN_HEALTH_GATE=0`, so a plain start is a **reliability daemon** that
   does **not** auto-dispatch sweeps — consistent with the ecosystem-wide opt-in /
   default-off contract. An already-exported env var always wins; `--work-finder`
-  / `--health-gate` force the respective loop on; `--from-config` leaves both
-  unset so `.loom/config.json → autonomous` drives (precedence env > config >
-  default),
+  / `--health-gate` force the respective loop on; `--from-config` alone leaves
+  both unset so `.loom/config.json → autonomous` drives (precedence env >
+  config > default). **`--from-config` composes with an explicit flag rather
+  than ignoring it (#4353)**: `--from-config --work-finder` (or
+  `--no-work-finder`/`--health-gate`/`--no-health-gate`) still FORCES that one
+  var while leaving the other loop unset for config to drive — a
+  pre-exported env var still wins over the forced flag,
 - locates the `loom-daemon` binary (`LOOM_DAEMON_BIN` → `PATH` → `target/{release,debug}`),
 - runs the **advisory** host-sleep check (`check-host-sleep.sh`, #3350) — never blocks the start,
 - **on macOS, backgrounds the daemon as a launchd LaunchAgent** in the resolved
@@ -2719,7 +2777,8 @@ service's exit code affects the next scheduled run.
 | Marker | Reality | Watchdog |
 |--------|---------|----------|
 | present | daemon alive, heartbeat fresh | silent (OK) |
-| present | daemon alive, heartbeat **stale** | **report** — daemon may be wedged |
+| present | daemon alive, heartbeat **stale**, written this boot (younger than the process) | **report** — daemon may be wedged |
+| present | daemon alive, heartbeat **older than the process itself** (#4368: a previous-boot/enablement leftover) | silent (liveness-only; not evidence about the current process) |
 | present | daemon alive, no heartbeat file | silent (liveness-only; heartbeat disabled or not yet written) |
 | present | daemon **not loaded/alive** | **report** — the #4011 outage |
 | **absent** | **nothing running** | silent — deliberate stop, no false page |
@@ -2807,7 +2866,27 @@ disagree, and reports one of four states with a distinct exit code:
 | `not-expected` | marker absent (deliberate stop, or never started) | `1` | suggest `loom-daemon-start.sh` |
 | `expected-but-dead` | marker present, no live process — the #4011 divergence | `3` | suggest `loom-daemon-start.sh`; points at `daemon-watchdog.log` |
 | `alive-starting` | marker present, process alive, IPC failed, **process age ≤ startup-grace window** — a normal `bootout`/`bootstrap` restart whose socket has not bound yet (#4213) | `4` | **none** — reports "still starting, not a fault"; NO stop/start remediation |
-| `alive-but-unresponsive` | marker present, process alive, IPC failed, process **older** than the grace window (or age undeterminable) | `4` | does **not** suggest a start (singleton guard refuses); prints the live pid; heartbeat freshness qualifies fresh ⇒ IPC/socket fault, stale ⇒ likely wedged |
+| `alive-but-unresponsive` | marker present, process alive, IPC failed, process **older** than the grace window (or age undeterminable) | `4` | does **not** suggest a start (singleton guard refuses); prints the live pid; heartbeat freshness qualifies fresh ⇒ IPC/socket fault, stale ⇒ likely wedged, **prior-boot** ⇒ not evidence about the current process |
+
+The heartbeat freshness qualifier on `alive-but-unresponsive` also gates the
+"do NOT run `loom-daemon-start.sh` … stop && start" remediation (#4368): it is
+only printed for a **current-boot `stale`** verdict — heartbeat age exceeds
+the staleness threshold *and* is younger than the process's own age, i.e. the
+evidence actually points at a wedge. `fresh` / `unknown` / **`prior-boot`**
+print inspect-first guidance (`ps -p <pid> -o pid,etime,command`, `loom-daemon
+status --json`) instead of the imperative restart, since none of those three
+qualifiers indicate a fault. `prior-boot` fires when the heartbeat file's mtime
+is strictly older than the live process's own start time (`heartbeat_age_secs
+> process_age_secs`) — necessarily a leftover from a previous boot or a
+previous enablement of the opt-in heartbeat loop, checked *before* the
+staleness threshold (even a heartbeat that would otherwise look "fresh" by age
+alone is not current-boot evidence if it predates the process). Equal ages are
+deliberately **not** `prior-boot` (current-boot evidence, falls through to the
+ordinary threshold check); an undeterminable process age makes **no**
+prior-boot claim and degrades to the pre-#4368 fresh/stale verdicts.
+`loom-daemon-watchdog.sh` §3 mirrors the same mtime-vs-process-start
+comparison (via `ps -o etime= -p <pid>`) before its own stale WARN, so `status`
+and the watchdog log can never contradict each other on this qualifier either.
 
 The startup-grace window defaults to `90s` (sized above the observed ~40–60s
 socket-bind latency after a `launchctl bootout`/`bootstrap` cycle) and is
