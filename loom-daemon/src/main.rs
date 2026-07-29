@@ -265,13 +265,16 @@ enum Commands {
     },
 
     /// Start a minimal read-only HTTP status-snapshot listener (Issue #4391,
-    /// dashboard phase 1 of #4329). A single `GET /api/status` endpoint
-    /// serializes the same `DaemonStatusReport` `loom-daemon status --json`
-    /// already aggregates — fetched live over the *existing* Unix socket (the
-    /// same `DaemonStatus` IPC request `status` sends), so the aggregation
-    /// logic in `ipc::build_daemon_status` runs exactly once and is never
-    /// duplicated here. No new persistent store, no mutation, no SSE/HTML
-    /// (those are later phases #4392-#4394).
+    /// dashboard phases 1-2 of #4329). `GET /api/status` (#4391) serializes the
+    /// same `DaemonStatusReport` `loom-daemon status --json` already
+    /// aggregates — fetched live over the *existing* Unix socket (the same
+    /// `DaemonStatus` IPC request `status` sends), so the aggregation logic in
+    /// `ipc::build_daemon_status` runs exactly once and is never duplicated
+    /// here. `GET /api/events` (#4392) tails the daemon's event bus as
+    /// `text/event-stream`, bridged from the same socket's existing
+    /// `SubscribeEvents` request over the frozen `sweep.*` topics. Both are
+    /// read-only: no new persistent store, no mutation, no publish, no HTML
+    /// page yet (that is phase #4393, docs #4394).
     ///
     /// Off by default: nothing listens until this subcommand is explicitly
     /// run — a running daemon started without `serve` never opens this port.
@@ -3313,7 +3316,8 @@ async fn handle_serve_command(port: u16, bind: &str, allow_non_loopback: bool) -
         .map_err(|e| anyhow!("failed to bind {addr}:{port}: {e}"))?;
     let local_addr = listener.local_addr()?;
     println!(
-        "loom-daemon serve: listening on http://{local_addr}/api/status (proxying {})",
+        "loom-daemon serve: listening on http://{local_addr}/api/status and \
+         http://{local_addr}/api/events (proxying {})",
         socket_path.display()
     );
 
