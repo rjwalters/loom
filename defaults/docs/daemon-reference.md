@@ -652,15 +652,22 @@ guess. `token_pool_dir` is `null` only when talking to a pre-#4292 daemon binary
 machine mode, else `find_repo_root()`), so the daemon's primary workspace is never
 an incidental cwd when started that way. A **hand-rolled** unit that omits
 `WorkingDirectory=` starts with whatever cwd the service manager happens to use
-(often `~`) as the primary workspace instead. Since the per-repo pool for that
-workspace is `<cwd>/.loom/tokens/`, an operator who then bootstraps the
-machine-level pool via plain `loom-tokens bootstrap` from an **arbitrary**
-directory (not `~`, not a real repo checkout) will *not* populate the location the
-daemon resolves to by default. Always provision with `loom-tokens bootstrap
+(often `~`) as the primary workspace instead — as of #4292 (trip-wires 1 & 3,
+completing this issue) that no longer needs a `WorkingDirectory=` override to
+find its pool: dispatch-capacity accounting, `loom-daemon status`, and
+`tokens check --ranking`'s default `--workspace` all now ask whether that
+seeded primary workspace is itself a *recognized* Loom workspace (registry
+membership, reusing the #4299 check) before applying the per-repo/shared
+`#3938` precedence — and when it is not (the bare-`$HOME` case), they anchor
+straight to the shared machine-level pool instead of a per-repo(`$HOME`) path
+that can coincidentally collide with the shared *default* and mask wherever
+the pool was actually bootstrapped. The operational contract is unchanged:
+always provision a machine-level daemon's pool with `loom-tokens bootstrap
 --shared` (or `import-from-monitor --shared`) — which always targets
-`~/.loom/tokens/` regardless of cwd — so the daemon's default (cwd-anchored,
-falling back to shared) and the provisioning step agree, whether or not the unit
-that starts the daemon sets `WorkingDirectory=`.
+`~/.loom/tokens/` regardless of cwd — so the daemon's anchoring and the
+provisioning step agree, whether or not the unit that starts the daemon sets
+`WorkingDirectory=`. Full precedence chain: `.loom/docs/token-pool.md` →
+"Full anchoring precedence, and machine-level daemon startup (#4292)".
 
 ## Per-repo status breakdown + per-repo main-health gate (#3930 — phase d)
 

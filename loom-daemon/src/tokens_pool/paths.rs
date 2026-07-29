@@ -95,6 +95,56 @@ pub fn resolve_tokens_dir(workspace: &Path) -> PathBuf {
     repo_dir
 }
 
+/// Registry-aware variant of [`resolve_tokens_dir`] for a caller whose nominal
+/// workspace root is `candidate` but may not itself be a recognized Loom
+/// workspace (issue #4292, trip-wires 1 & 3).
+///
+/// A machine-level daemon (#3835/#3926) started under systemd with a bare,
+/// unconfigured cwd (e.g. `$HOME`) — or any CLI invocation that lets
+/// `--workspace` default to `.` from such a cwd — resolves `candidate` to a
+/// directory that is not actually a repo checkout. Feeding that straight into
+/// [`resolve_tokens_dir`] is worse than merely "no tokens": because the
+/// **default** shared pool is *also* `~/.loom/tokens` (see
+/// [`shared_tokens_dir`]), `candidate == $HOME` makes the per-repo and shared
+/// probes coincidentally check the *same* empty directory, silently masking
+/// wherever the pool was actually bootstrapped (e.g. a per-repo pool at the
+/// daemon's real, differently-located checkout).
+///
+/// This reuses the exact "is `candidate` a recognized Loom workspace"
+/// question #4299 already answers for CLI `--workspace` defaulting
+/// ([`crate::workspace_registry::resolve_client_workspace_default`]) rather
+/// than a second, parallel detection path:
+///
+/// - **Registry empty** (no `loom-daemon workspace add` ever run — the
+///   pre-#3926 single-workspace deployment style): trust `candidate`
+///   unconditionally, i.e. byte-for-byte [`resolve_tokens_dir`]. A
+///   repo-local install with no machine-level registry is never affected by
+///   this function.
+/// - **`candidate` falls under (or exactly at) a registered workspace root**:
+///   resolve against that root's own [`resolve_tokens_dir`] precedence
+///   (per-repo first, else shared) — unchanged behavior, just anchored at the
+///   more precise registered root rather than a possibly-nested `candidate`.
+/// - **`candidate` matches no registered root**: `candidate` is not a real
+///   Loom workspace at all (the machine-level-daemon-at-`$HOME` case this
+///   function exists to fix) — skip the per-repo probe entirely and resolve
+///   straight to [`shared_tokens_dir`]. Falls back to
+///   `resolve_tokens_dir(candidate)` only when the shared pool is itself
+///   disabled (`LOOM_SHARED_TOKENS_DIR=""`), so that opt-out still disables
+///   every anchoring surface, not just the original per-repo/shared fallback.
+#[must_use]
+pub fn resolve_tokens_dir_anchored(
+    candidate: &Path,
+    registry: &crate::workspace_registry::WorkspaceRegistry,
+) -> PathBuf {
+    if registry.workspaces.is_empty() {
+        return resolve_tokens_dir(candidate);
+    }
+    match crate::workspace_registry::resolve_client_workspace_default(candidate, registry) {
+        Some(root) => resolve_tokens_dir(&root),
+        None => shared_tokens_dir().unwrap_or_else(|| resolve_tokens_dir(candidate)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,6 +233,112 @@ mod tests {
     fn shared_dir_honors_explicit_path() {
         std::env::set_var(SHARED_TOKENS_DIR_ENV, "/tmp/loom-shared-xyz");
         assert_eq!(shared_tokens_dir(), Some(PathBuf::from("/tmp/loom-shared-xyz")));
+        std::env::remove_var(SHARED_TOKENS_DIR_ENV);
+    }
+
+    // =====================================================================
+    // resolve_tokens_dir_anchored (issue #4292, trip-wires 1 & 3)
+    // =====================================================================
+
+    use crate::workspace_registry::{normalize_path, Workspace, WorkspaceRegistry};
+
+    /// Build a test registry the same way `WorkspaceRegistry::add` would:
+    /// entries store the **normalized/canonicalized** root
+    /// ([`normalize_path`]), which is what `resolve_client_workspace_default`
+    /// assumes when comparing against an already-normalized query path (a
+    /// raw, un-canonicalized `tempdir().path()` can otherwise mismatch a
+    /// symlink-resolved query, e.g. macOS `/var/folders` -> `/private/var/folders`).
+    fn registry_with(roots: &[&Path]) -> WorkspaceRegistry {
+        WorkspaceRegistry {
+            version: 1,
+            workspaces: roots
+                .iter()
+                .map(|r| Workspace {
+                    root: normalize_path(r),
+                    priority: 100,
+                    config_overrides: None,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn anchored_empty_registry_trusts_candidate_unchanged() {
+        std::env::set_var(SHARED_TOKENS_DIR_ENV, "");
+        let repo = tempfile::tempdir().unwrap();
+        write_pool(&per_repo_tokens_dir(repo.path()), &["a.token"]);
+        let registry = WorkspaceRegistry::default();
+        assert_eq!(
+            resolve_tokens_dir_anchored(repo.path(), &registry),
+            per_repo_tokens_dir(repo.path())
+        );
+        std::env::remove_var(SHARED_TOKENS_DIR_ENV);
+    }
+
+    #[test]
+    #[serial]
+    fn anchored_registered_candidate_uses_its_own_per_repo_shared_precedence() {
+        std::env::set_var(SHARED_TOKENS_DIR_ENV, "");
+        let repo = tempfile::tempdir().unwrap();
+        write_pool(&per_repo_tokens_dir(repo.path()), &["a.token"]);
+        let registry = registry_with(&[repo.path()]);
+        // The resolved root is the registry's *normalized* copy of `repo.path()`
+        // (e.g. macOS `/var/folders` -> `/private/var/folders`) — same
+        // underlying directory, different string form.
+        let canonical_repo = crate::workspace_registry::normalize_path(repo.path());
+        assert_eq!(
+            resolve_tokens_dir_anchored(repo.path(), &registry),
+            per_repo_tokens_dir(&canonical_repo)
+        );
+        std::env::remove_var(SHARED_TOKENS_DIR_ENV);
+    }
+
+    #[test]
+    #[serial]
+    fn anchored_unregistered_candidate_skips_straight_to_shared() {
+        let repo = tempfile::tempdir().unwrap(); // registered, unrelated
+        let candidate = tempfile::tempdir().unwrap(); // NOT registered (e.g. $HOME)
+        let shared = tempfile::tempdir().unwrap();
+        write_pool(shared.path(), &["s.token"]);
+        // Even if `candidate` coincidentally has its own (empty) `.loom/tokens`
+        // dir, it must never be probed once it's known not to be a workspace.
+        std::env::set_var(SHARED_TOKENS_DIR_ENV, shared.path().to_str().unwrap());
+        let registry = registry_with(&[repo.path()]);
+        assert_eq!(resolve_tokens_dir_anchored(candidate.path(), &registry), shared.path());
+        std::env::remove_var(SHARED_TOKENS_DIR_ENV);
+    }
+
+    #[test]
+    #[serial]
+    fn anchored_unregistered_candidate_falls_back_to_candidate_when_shared_disabled() {
+        let repo = tempfile::tempdir().unwrap();
+        let candidate = tempfile::tempdir().unwrap();
+        std::env::set_var(SHARED_TOKENS_DIR_ENV, ""); // opt-out
+        let registry = registry_with(&[repo.path()]);
+        assert_eq!(
+            resolve_tokens_dir_anchored(candidate.path(), &registry),
+            per_repo_tokens_dir(candidate.path())
+        );
+        std::env::remove_var(SHARED_TOKENS_DIR_ENV);
+    }
+
+    #[test]
+    #[serial]
+    fn anchored_candidate_under_registered_root_resolves_at_the_root() {
+        std::env::set_var(SHARED_TOKENS_DIR_ENV, "");
+        let repo = tempfile::tempdir().unwrap();
+        write_pool(&per_repo_tokens_dir(repo.path()), &["a.token"]);
+        let nested = repo.path().join("subdir");
+        std::fs::create_dir_all(&nested).unwrap();
+        let registry = registry_with(&[repo.path()]);
+        let canonical_repo = crate::workspace_registry::normalize_path(repo.path());
+        // `candidate` is a subdirectory of the registered root, not the root
+        // itself — resolution should still land on the registered root's pool.
+        assert_eq!(
+            resolve_tokens_dir_anchored(&nested, &registry),
+            per_repo_tokens_dir(&canonical_repo)
+        );
         std::env::remove_var(SHARED_TOKENS_DIR_ENV);
     }
 }

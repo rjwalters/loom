@@ -339,6 +339,71 @@ that used to derive it from the source tree the running binary was compiled
 from) — a consumer repo with no loom checkout now selects a token successfully
 with zero manual configuration and no Python package to locate at all.
 
+### Full anchoring precedence, and machine-level daemon startup (#4292)
+
+Everything above resolves the pool for a caller whose **workspace root is
+already known** to be a real repo checkout (an explicit `--workspace`, a
+worktree's own root, or a per-request-resolved dispatch target). A
+machine-level daemon (#3835/#3926) is different: at startup its own primary
+workspace is seeded from `LOOM_WORKSPACE` or, absent that, its **own process
+cwd** — and under `systemd` with no `WorkingDirectory=` override that cwd
+defaults to `$HOME`, which is not a repo checkout at all.
+
+Feeding a non-workspace cwd straight into the `#3938` per-repo/shared fallback
+is worse than "no tokens": the **default** shared pool is *also*
+`~/.loom/tokens`, so `workspace_root == $HOME` makes the per-repo and shared
+probes coincidentally check the exact same (usually empty) directory — masking
+wherever the pool was actually bootstrapped (e.g. a per-repo pool at the
+daemon's real, differently-located checkout) behind a plausible-looking but
+wrong "no tokens found" warning.
+
+The full precedence, in order, for every consumer (`loom-daemon status`, the
+daemon's own dispatch-capacity accounting, `tokens check --ranking`'s
+default-`--workspace` case, and the daemon's autonomous ranking-refresh loop):
+
+1. **Explicit `--workspace <path>`** (a CLI flag naming a real, possibly
+   unregistered, repo) — always wins outright, resolved via the per-repo/shared
+   precedence above. Never redirected, so pointing at a specific repo is never
+   silently overridden.
+2. **Default (`--workspace` omitted / `.` / the daemon's own seeded cwd) and
+   the candidate root falls under a registered workspace** — either because
+   `loom-daemon workspace add` was never run at all (an empty registry trusts
+   the candidate unconditionally, preserving `#3938`'s byte-for-byte
+   single-workspace behavior for every repo-local install), or because the
+   candidate matches a registered root — resolved via the same per-repo/shared
+   precedence, anchored at the registered root when the candidate is a
+   subdirectory of it.
+3. **Default and the candidate matches no registered workspace** — the
+   machine-level-daemon-at-`$HOME` case — skips the per-repo probe entirely and
+   resolves straight to the shared machine-level pool (`~/.loom/tokens`,
+   override `LOOM_SHARED_TOKENS_DIR`). Falls back to per-repo(candidate) only
+   when the shared pool is itself disabled (`LOOM_SHARED_TOKENS_DIR=""`).
+
+**Operational contract**: for step 3 to actually find tokens, a machine-level
+daemon's pool must be bootstrapped at the shared location —
+`loom-tokens bootstrap --shared` (or `import-from-monitor --shared`) — rather
+than per-repo at whatever directory happens to be the daemon's own checkout.
+Registering the daemon's own checkout as a workspace
+(`loom-daemon workspace add <checkout>`) is the alternative: that makes step 2
+apply instead, so a per-repo pool bootstrapped there (without `--shared`) is
+found too.
+
+**No `WorkingDirectory=` needed**: with the pool bootstrapped per the
+contract above, a `systemd`-managed daemon started with the unit's default
+`$HOME` cwd (or any other non-workspace directory) now finds its token pool —
+and reports accurate dispatch capacity — without an operator having to
+discover and set an explicit `WorkingDirectory=` override (`.loom/docs/daemon-reference.md`
+covers `#4268`/`#4319`/`#4321`, which already set `WorkingDirectory=` as
+first-class in *generated* systemd units; this section is for bare/unmanaged
+daemon startups and ad hoc CLI invocations from arbitrary cwds — the generated
+units already cover the managed case).
+
+Implementation: [`resolve_tokens_dir_anchored()`](../../loom-daemon/src/tokens_pool/paths.rs)
+delegates step 2/3's "is this candidate a recognized Loom workspace" question
+to the same registry-membership check `#4299` established for CLI
+`--workspace` defaulting (`workspace_registry::resolve_client_workspace_default`)
+rather than a second, parallel detection path.
+
 ## Hard-fail on missing pool
 
 `spawn-claude.sh` exits `78` (`EX_CONFIG`) with a message instructing the user to
