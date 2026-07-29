@@ -91,6 +91,22 @@ log_hasi() { grep -qi "$1" "$WDLOG" 2>/dev/null; }
 # substitution pipe (which would otherwise block the caller for the full sleep).
 sleeper() { sleep 60 >/dev/null 2>&1 & echo $!; }
 
+# A `ps` stub that always reports a fixed `-o etime=` value (used by the
+# prior-boot heartbeat tests, #4368) — deterministic regardless of how long
+# the real sleeper process has actually been alive by the time the watchdog
+# runs. Prints the stub directory; add it to the FRONT of PATH via
+# `run_watchdog PATH="$(make_ps_stub ...):$PATH"`.
+make_ps_stub() { # <etime-value, e.g. "02:00:00">
+    local dir
+    dir="$(mktemp -d)"
+    cat > "$dir/ps" <<EOF
+#!/usr/bin/env bash
+echo "$1"
+EOF
+    chmod +x "$dir/ps"
+    echo "$dir"
+}
+
 # ===================================================================
 # 1. Marker ABSENT ⇒ no daemon expected ⇒ silent OK (exit 0).
 # ===================================================================
@@ -138,18 +154,55 @@ kill "$live_pid" 2>/dev/null || true
 assert_rc 0 "$RC" "alive + fresh heartbeat: exits 0"
 
 # ===================================================================
-# 3. Intent present, daemon ALIVE, heartbeat STALE ⇒ DIVERGENCE (wedged).
+# 3. Intent present, daemon ALIVE, heartbeat STALE (but written THIS boot,
+#    i.e. younger than the process itself) ⇒ DIVERGENCE (wedged).
+#    A `ps` stub pins the process age to 7200s — comfortably older than the
+#    3600s-old heartbeat — so this exercises the genuine current-boot-stale
+#    verdict deterministically, never the #4368 prior-boot path (which a
+#    freshly-spawned real sleeper pid would otherwise always hit, since its
+#    real age is far younger than any meaningfully back-dated heartbeat).
 # ===================================================================
+PS_STUB3="$(make_ps_stub "02:00:00")"
 live_pid=$(sleeper)
 echo "$live_pid" > "$WORKDIR/pidB"
 write_marker "$WORKDIR/pidB" 60
 printf 'old\n' > "$HEARTBEAT"
 back_date_file "$HEARTBEAT" 3600   # 1h old, well past the 300s default threshold
 : > "$WDLOG"
-run_watchdog
+run_watchdog PATH="$PS_STUB3:$PATH"
 kill "$live_pid" 2>/dev/null || true
-assert_rc 1 "$RC" "alive + STALE heartbeat: exits 1 (divergence)"
+assert_rc 1 "$RC" "alive + STALE heartbeat (current boot): exits 1 (divergence)"
 if log_has STALE; then pass "alive + stale heartbeat: reports it as wedged/stale"; else fail "alive + stale heartbeat: no STALE report"; fi
+rm -rf "$PS_STUB3"
+
+# ===================================================================
+# 3b. Intent present, daemon ALIVE, heartbeat OLDER than the process itself
+#     ⇒ liveness-only OK, NEVER a DIVERGENCE/STALE report (#4368). A `ps`
+#     stub pins the process age to 5s while the heartbeat is 3600s old —
+#     exactly the shape of the reported incident (a migrated/leftover
+#     heartbeat file from a previous boot outliving a fresh restart).
+# ===================================================================
+PS_STUB3B="$(make_ps_stub "00:00:05")"
+live_pid=$(sleeper)
+echo "$live_pid" > "$WORKDIR/pidB2"
+write_marker "$WORKDIR/pidB2" 60
+printf 'old\n' > "$HEARTBEAT"
+back_date_file "$HEARTBEAT" 3600
+: > "$WDLOG"
+run_watchdog PATH="$PS_STUB3B:$PATH"
+kill "$live_pid" 2>/dev/null || true
+assert_rc 0 "$RC" "alive + heartbeat older than process (prior boot): exits 0, not flagged as wedged"
+if log_hasi "previous boot"; then
+    pass "prior-boot heartbeat: reports it as a previous-boot file, not a wedge"
+else
+    fail "prior-boot heartbeat: missing the previous-boot report"
+fi
+if log_has DIVERGENCE; then
+    fail "prior-boot heartbeat: must NOT be reported as a DIVERGENCE"
+else
+    pass "prior-boot heartbeat: not reported as a DIVERGENCE"
+fi
+rm -rf "$PS_STUB3B"
 
 # ===================================================================
 # 4. Intent present, daemon DEAD ⇒ DIVERGENCE (expected but not running).
@@ -196,17 +249,21 @@ kill "$live_pid" 2>/dev/null || true
 assert_rc 0 "$RC" "heartbeat 120s old < 300s threshold: not flagged (no flapping)"
 
 # ===================================================================
-# 7. LOOM_DAEMON_HEARTBEAT_STALE_SECS override is honored.
+# 7. LOOM_DAEMON_HEARTBEAT_STALE_SECS override is honored. A `ps` stub pins
+#    the process age well past the 10s heartbeat age so this exercises the
+#    current-boot-stale verdict, not the #4368 prior-boot path.
 # ===================================================================
+PS_STUB7="$(make_ps_stub "00:01:00")"
 live_pid=$(sleeper)
 echo "$live_pid" > "$WORKDIR/pidF"
 write_marker "$WORKDIR/pidF" 60
 printf 'x\n' > "$HEARTBEAT"
 back_date_file "$HEARTBEAT" 10
 : > "$WDLOG"
-run_watchdog LOOM_DAEMON_HEARTBEAT_STALE_SECS=5
+run_watchdog PATH="$PS_STUB7:$PATH" LOOM_DAEMON_HEARTBEAT_STALE_SECS=5
 kill "$live_pid" 2>/dev/null || true
 assert_rc 1 "$RC" "STALE_SECS override: 10s-old heartbeat with 5s threshold is flagged"
+rm -rf "$PS_STUB7"
 
 # ===================================================================
 # 8. launchd path via a stubbed launchctl reporting the job is NOT loaded ⇒

@@ -31,7 +31,10 @@
 //!    than the grace window (or its age is undeterminable) →
 //!    [`InstallState::AliveButUnresponsive`], qualified by heartbeat
 //!    freshness: fresh ⇒ likely an IPC/socket-layer fault, stale ⇒ likely a
-//!    wedged daemon.
+//!    wedged daemon, **prior-boot** (#4368) ⇒ the heartbeat file predates
+//!    this process's own start time and is therefore NOT evidence about the
+//!    current process (treated like `Unknown` for advice purposes — the
+//!    caller must not print the stop/start remediation for it).
 //!
 //! The startup-grace discriminator is **process age alone** (via
 //! `ps -o etime= -p <pid>`), never socket-file presence: the `Err` arm has
@@ -133,11 +136,17 @@ impl InstallState {
 /// sharpens "alive but not answering" into "likely an IPC fault" (fresh) vs
 /// "likely wedged" (stale). `Unknown` is a degradation (no heartbeat file,
 /// unreadable mtime, or heartbeat loop disabled) — never a false report.
+/// `PriorBoot` (#4368) is a distinct degradation: the heartbeat file's mtime
+/// predates the live process's own start time, so it is necessarily left
+/// over from a previous boot (or a previous enablement of the opt-in
+/// heartbeat loop) and carries NO evidence about the current process —
+/// never rendered as `Stale`/wedged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HeartbeatFreshness {
     Fresh,
     Stale,
     Unknown,
+    PriorBoot,
 }
 
 impl HeartbeatFreshness {
@@ -147,6 +156,7 @@ impl HeartbeatFreshness {
             HeartbeatFreshness::Fresh => "fresh",
             HeartbeatFreshness::Stale => "stale",
             HeartbeatFreshness::Unknown => "unknown",
+            HeartbeatFreshness::PriorBoot => "prior-boot",
         }
     }
 }
@@ -547,13 +557,37 @@ fn heartbeat_age_secs(path: &Path) -> Option<u64> {
 /// Classify heartbeat freshness against the staleness threshold — mirrors
 /// the watchdog's degrade-don't-false-report rules: an absent file or an
 /// unreadable mtime both yield `Unknown`, never a false `Stale`.
+///
+/// `process_age_secs` (#4368) is the live process's own age, when known. A
+/// heartbeat file strictly older than the process's own start time predates
+/// this boot and is classified `PriorBoot` — checked *before* the staleness
+/// threshold, since even a heartbeat that would otherwise look "fresh" by
+/// age alone is not current-boot evidence if it is older than the process
+/// itself (e.g. a very recent restart with a leftover heartbeat file from
+/// seconds before it). Equal ages are deliberately NOT `PriorBoot` — a
+/// heartbeat written in the same instant as process start is still
+/// current-boot evidence, so it falls through to the ordinary threshold
+/// check. `None` (unparseable `ps` age) makes no prior-boot claim and
+/// degrades to the pre-#4368 Stale/Fresh verdicts, per the module's
+/// degrade-don't-false-report rule.
 fn check_heartbeat(
     heartbeat_file: &Path,
     stale_threshold_secs: u64,
+    process_age_secs: Option<u64>,
 ) -> (HeartbeatFreshness, Option<u64>) {
     match heartbeat_age_secs(heartbeat_file) {
-        Some(age) if age > stale_threshold_secs => (HeartbeatFreshness::Stale, Some(age)),
-        Some(age) => (HeartbeatFreshness::Fresh, Some(age)),
+        Some(age) => {
+            if let Some(proc_age) = process_age_secs {
+                if age > proc_age {
+                    return (HeartbeatFreshness::PriorBoot, Some(age));
+                }
+            }
+            if age > stale_threshold_secs {
+                (HeartbeatFreshness::Stale, Some(age))
+            } else {
+                (HeartbeatFreshness::Fresh, Some(age))
+            }
+        }
         None => (HeartbeatFreshness::Unknown, None),
     }
 }
@@ -570,9 +604,27 @@ fn resolve_stale_threshold(interval_secs: u64, env_override: Option<u64>) -> u64
 
 /// Pure(ish) classification given an already-resolved loom dir, marker path,
 /// and env overrides — split out from [`probe`] so tests can drive it against
-/// tempdir fixtures without touching real env vars or `~/.loom`.
+/// tempdir fixtures without touching real env vars or `~/.loom`. Always uses
+/// the real [`process_age_secs`] (`ps`-backed) lookup; see
+/// [`classify_with_process_age_fn`] for the injectable variant tests use to
+/// pin a deterministic process age.
 #[must_use]
 pub fn classify(loom_dir: &Path, marker_path: &Path, env: &EnvOverrides) -> InstallStateReport {
+    classify_with_process_age_fn(loom_dir, marker_path, env, process_age_secs)
+}
+
+/// [`classify`]'s implementation, parameterized over the process-age lookup.
+/// Production code always goes through [`classify`] (which passes the real
+/// `ps`-backed [`process_age_secs`]); tests use this directly with a fixed
+/// closure so heartbeat-vs-process-age comparisons (#4368) are deterministic
+/// — the test binary's own real uptime, shared across every unit test
+/// running in this one process, is not a value any single test can control.
+fn classify_with_process_age_fn(
+    loom_dir: &Path,
+    marker_path: &Path,
+    env: &EnvOverrides,
+    process_age_fn: impl Fn(u32) -> Option<u64>,
+) -> InstallStateReport {
     let watchdog_log_path = loom_dir.join("logs").join("daemon-watchdog.log");
 
     let contents = match std::fs::read_to_string(marker_path) {
@@ -613,7 +665,7 @@ pub fn classify(loom_dir: &Path, marker_path: &Path, env: &EnvOverrides) -> Inst
     // from the prior run may still exist during startup). An undeterminable
     // age makes no grace claim and falls through to the fault/wedged verdict.
     let grace_threshold = resolve_startup_grace(env.startup_grace_secs_override);
-    let process_age = liveness.pid.and_then(process_age_secs);
+    let process_age = liveness.pid.and_then(process_age_fn);
     if let Some(age) = process_age {
         if age <= grace_threshold {
             return InstallStateReport {
@@ -633,7 +685,7 @@ pub fn classify(loom_dir: &Path, marker_path: &Path, env: &EnvOverrides) -> Inst
 
     let stale_threshold =
         resolve_stale_threshold(fields.heartbeat_interval_secs, env.heartbeat_stale_secs_override);
-    let (freshness, age) = check_heartbeat(&fields.heartbeat_file, stale_threshold);
+    let (freshness, age) = check_heartbeat(&fields.heartbeat_file, stale_threshold, process_age);
 
     InstallStateReport {
         state: InstallState::AliveButUnresponsive,
@@ -773,7 +825,13 @@ mod tests {
                 heartbeat.display()
             ),
         );
-        let report = classify(dir.path(), &marker, &no_env_overrides());
+        // Pin a large synthetic process age (#4368) so this test's intent —
+        // "a fresh heartbeat classifies as Fresh" — cannot be perturbed by
+        // the test binary's own real (and much smaller, at least early in a
+        // run) uptime being compared against the 5s heartbeat age.
+        let report = classify_with_process_age_fn(dir.path(), &marker, &no_env_overrides(), |_| {
+            Some(1_000_000)
+        });
         assert_eq!(report.state, InstallState::AliveButUnresponsive);
         assert_eq!(report.heartbeat_freshness, Some(HeartbeatFreshness::Fresh));
         assert_eq!(report.heartbeat_stale_threshold_secs, Some(300));
@@ -792,7 +850,14 @@ mod tests {
                 heartbeat.display()
             ),
         );
-        let report = classify(dir.path(), &marker, &no_env_overrides());
+        // Pin a synthetic process age comfortably larger than the 1000s
+        // heartbeat age (#4368) — without this, the real (tiny) test-binary
+        // uptime would make this heartbeat look older than the process and
+        // misclassify as PriorBoot instead of exercising the Stale verdict
+        // this test targets.
+        let report = classify_with_process_age_fn(dir.path(), &marker, &no_env_overrides(), |_| {
+            Some(1_000_000)
+        });
         assert_eq!(report.state, InstallState::AliveButUnresponsive);
         assert_eq!(report.heartbeat_freshness, Some(HeartbeatFreshness::Stale));
     }
@@ -812,7 +877,9 @@ mod tests {
         );
         let mut env = no_env_overrides();
         env.heartbeat_stale_secs_override = Some(10);
-        let report = classify(dir.path(), &marker, &env);
+        // See the #4368 note above — pin process age so the 20s heartbeat
+        // age is never mistaken for a prior-boot file.
+        let report = classify_with_process_age_fn(dir.path(), &marker, &env, |_| Some(1_000_000));
         assert_eq!(report.heartbeat_freshness, Some(HeartbeatFreshness::Stale));
         assert_eq!(report.heartbeat_stale_threshold_secs, Some(10));
     }
@@ -933,6 +1000,110 @@ mod tests {
     }
 
     #[test]
+    fn heartbeat_freshness_as_str_matches_taxonomy() {
+        assert_eq!(HeartbeatFreshness::Fresh.as_str(), "fresh");
+        assert_eq!(HeartbeatFreshness::Stale.as_str(), "stale");
+        assert_eq!(HeartbeatFreshness::Unknown.as_str(), "unknown");
+        assert_eq!(HeartbeatFreshness::PriorBoot.as_str(), "prior-boot");
+    }
+
+    // ===================================================================
+    // Prior-boot heartbeat detection (#4368)
+    // ===================================================================
+
+    #[test]
+    fn check_heartbeat_prior_boot_when_older_than_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let heartbeat = write_heartbeat(dir.path(), Duration::from_secs(1000));
+        let (freshness, age) = check_heartbeat(&heartbeat, 300, Some(10));
+        assert_eq!(freshness, HeartbeatFreshness::PriorBoot);
+        assert_eq!(age, Some(1000));
+    }
+
+    #[test]
+    fn check_heartbeat_current_boot_stale_when_younger_than_process() {
+        // Heartbeat is well past the staleness threshold, but it is younger
+        // than the process itself — this IS current-boot evidence, so the
+        // real-wedge verdict (Stale) must be preserved, never PriorBoot.
+        let dir = tempfile::tempdir().unwrap();
+        let heartbeat = write_heartbeat(dir.path(), Duration::from_secs(1000));
+        let (freshness, age) = check_heartbeat(&heartbeat, 300, Some(5000));
+        assert_eq!(freshness, HeartbeatFreshness::Stale);
+        assert_eq!(age, Some(1000));
+    }
+
+    #[test]
+    fn check_heartbeat_no_prior_boot_claim_when_process_age_unknown() {
+        // Unparseable `ps` age (`None`) must never manufacture a prior-boot
+        // claim — degrade to the pre-#4368 Stale/Fresh verdicts instead.
+        let dir = tempfile::tempdir().unwrap();
+        let heartbeat = write_heartbeat(dir.path(), Duration::from_secs(1000));
+        let (freshness, age) = check_heartbeat(&heartbeat, 300, None);
+        assert_eq!(freshness, HeartbeatFreshness::Stale);
+        assert_eq!(age, Some(1000));
+    }
+
+    #[test]
+    fn check_heartbeat_boundary_equal_ages_is_not_prior_boot() {
+        // A heartbeat exactly as old as the process itself is deliberately
+        // NOT prior-boot (a strictly-older file is) — it is current-boot
+        // evidence and falls through to the ordinary threshold check.
+        let dir = tempfile::tempdir().unwrap();
+        let heartbeat = write_heartbeat(dir.path(), Duration::from_secs(500));
+        let (freshness, age) = check_heartbeat(&heartbeat, 300, Some(500));
+        assert_eq!(freshness, HeartbeatFreshness::Stale);
+        assert_eq!(age, Some(500));
+    }
+
+    #[test]
+    fn heartbeat_older_than_process_start_is_prior_boot_end_to_end() {
+        // End-to-end wiring proof (via classify_with_process_age_fn, so the
+        // injected process age is deterministic): a heartbeat file from
+        // 83814s ago — the exact age observed in the #4368 incident — with a
+        // young (9s) process must classify PriorBoot, never Stale, and must
+        // NOT be mistaken for the startup-grace path either (grace defaults
+        // to 0 in `no_env_overrides`, so the 9s process falls through to the
+        // AliveButUnresponsive branch as intended).
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = write_pid_file(dir.path(), std::process::id());
+        let heartbeat = write_heartbeat(dir.path(), Duration::from_secs(83_814));
+        let marker = write_marker(
+            dir.path(),
+            &format!(
+                "pid_file={}\nheartbeat_file={}\nheartbeat_interval_secs=60\nuse_launchd=false\n",
+                pid_file.display(),
+                heartbeat.display()
+            ),
+        );
+        let report =
+            classify_with_process_age_fn(dir.path(), &marker, &no_env_overrides(), |_| Some(9));
+        assert_eq!(report.state, InstallState::AliveButUnresponsive);
+        assert_eq!(report.heartbeat_freshness, Some(HeartbeatFreshness::PriorBoot));
+        assert_eq!(report.heartbeat_age_secs, Some(83_814));
+        assert_eq!(report.process_age_secs, Some(9));
+    }
+
+    #[test]
+    fn stale_heartbeat_with_unknown_process_age_makes_no_prior_boot_claim_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = write_pid_file(dir.path(), std::process::id());
+        let heartbeat = write_heartbeat(dir.path(), Duration::from_secs(1000));
+        let marker = write_marker(
+            dir.path(),
+            &format!(
+                "pid_file={}\nheartbeat_file={}\nheartbeat_interval_secs=60\nuse_launchd=false\n",
+                pid_file.display(),
+                heartbeat.display()
+            ),
+        );
+        let report =
+            classify_with_process_age_fn(dir.path(), &marker, &no_env_overrides(), |_| None);
+        assert_eq!(report.state, InstallState::AliveButUnresponsive);
+        assert_eq!(report.heartbeat_freshness, Some(HeartbeatFreshness::Stale));
+        assert!(report.process_age_secs.is_none());
+    }
+
+    #[test]
     fn alive_starting_reuses_alive_but_unresponsive_exit_code() {
         assert_eq!(InstallState::AliveStarting.exit_code(), EXIT_ALIVE_BUT_UNRESPONSIVE);
         assert_eq!(InstallState::AliveStarting.exit_code(), 4);
@@ -1010,7 +1181,11 @@ mod tests {
         );
         let mut env = no_env_overrides();
         env.startup_grace_secs_override = Some(0);
-        let report = classify(dir.path(), &marker, &env);
+        // Pin a synthetic process age (#4368, see the note on
+        // `alive_with_stale_heartbeat_is_stale`) comfortably larger than the
+        // 5s heartbeat age so the fresh-heartbeat verdict this test targets
+        // is not perturbed by prior-boot detection.
+        let report = classify_with_process_age_fn(dir.path(), &marker, &env, |_| Some(1_000_000));
         assert_eq!(report.state, InstallState::AliveButUnresponsive);
         assert_eq!(report.heartbeat_freshness, Some(HeartbeatFreshness::Fresh));
         // The grace threshold used is still surfaced for JSON consumers.
