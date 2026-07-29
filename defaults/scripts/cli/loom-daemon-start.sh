@@ -310,6 +310,24 @@ extract_plist_path_value() {
 # still forwarded verbatim so the launchd job sees EXACTLY the autonomy flags
 # and auth this invocation resolved -- never wider, never narrower (#3972 AC:
 # "preserves the current flag semantics").
+#
+# Reconciling this STATIC forwarding with the #4430 MINTED GitHub App token
+# path (deliberate, not an oversight): `LOOM_GITHUB_APP_ID` /
+# `LOOM_GITHUB_APP_KEY_PATH` already match the `LOOM_[A-Za-z0-9_]*` pattern
+# above, so they ride along into the plist exactly like any other LOOM_* flag
+# -- but note that's a non-secret app id and a *path* to the private key, never
+# the key material itself (which stays on disk wherever the operator put it,
+# read only by openssl at mint time). Any GH_TOKEN forwarded here is this
+# invocation's snapshot at RENDER time; the daemon's own #4430 preflight/
+# refresh loop calls `std::env::set_var("GH_TOKEN", …)` on its OWN process
+# environment once a fresh installation token is minted, which the plist's
+# static value cannot see or fight (it only seeds the daemon's env at
+# process start, same as it always did) -- every `gh`/`git` child spawned
+# AFTER that point inherits the live, minted value, not the stale plist one.
+# If minting ever fails (revoked/unreadable key, network hiccup), the daemon
+# falls back to whatever GH_TOKEN this static forwarding already provided --
+# so leaving GH_TOKEN forwarding in place is exactly the right fallback
+# layer, not a footgun to remove.
 render_launchd_plist() {
     local label="$1" bin="$2" workdir="$3" log_path="$4"
     local plist_path_value="$PLIST_PATH_VALUE"
@@ -381,7 +399,11 @@ render_launchd_plist() {
 #     (#4172, $PLIST_PATH_VALUE), not the invoking shell's PATH; every already-
 #     exported LOOM_* / GH_TOKEN / GITEA_TOKEN / FORGE_TOKEN var is forwarded
 #     verbatim so the service sees EXACTLY the autonomy flags + auth this
-#     invocation resolved -- never wider, never narrower.
+#     invocation resolved -- never wider, never narrower. See
+#     render_launchd_plist's #4430 reconciliation note above -- this static
+#     forwarding and the daemon's own minted-GitHub-App-token refresh loop
+#     are complementary (static = render-time seed/fallback, minted = live
+#     process-env override), never in conflict.
 render_systemd_unit() {
     local bin="$1" workdir="$2" log_path="$3"
     local unit_path_value="$PLIST_PATH_VALUE"
