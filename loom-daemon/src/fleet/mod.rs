@@ -45,6 +45,7 @@
 //! deliberately minimal; the siblings can extend it.
 
 pub mod add_worker;
+pub mod status;
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -486,8 +487,10 @@ pub struct VerifyResult {
     pub summary: String,
 }
 
-/// One bootstrapped worker's inventory record. Kept deliberately minimal — the
-/// sibling `fleet status`/`fleet drain` commands (#4342/#4343) can extend it.
+/// One bootstrapped worker's inventory record. Kept deliberately minimal at
+/// #4341 — the sibling `fleet status`/`fleet drain` commands (#4342/#4343)
+/// extend it below with `#[serde(default)]`/`Option` fields so an
+/// already-written `~/.loom/fleet.json` from an older binary keeps parsing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerRecord {
     /// The SSH alias/host used to reach the worker (the canonical key — two
@@ -499,11 +502,37 @@ pub struct WorkerRecord {
     /// The dispatch priority the workspaces were registered at.
     #[serde(default = "crate::workspace_registry::default_priority")]
     pub priority: u32,
-    /// RFC3339 timestamp of the most recent successful bootstrap.
+    /// RFC3339 timestamp of the most recent successful bootstrap. Doubles as
+    /// the roster's "added date" (#4342's operator scope-clarification).
     pub bootstrapped_at: String,
     /// Result of the last `verify` step, if one ran.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_verify: Option<VerifyResult>,
+    /// Cloud provider instance id (e.g. an EC2 instance id), when known. Part
+    /// of the canonical-registry field list from #4342's operator
+    /// scope-clarification — replaces the per-repo `.env` instance pins
+    /// (`REPO_REMOTE_INSTANCE_ID`) as the source of truth. Absent on records
+    /// written by a pre-#4342 binary or a manually-added worker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_instance_id: Option<String>,
+    /// The host's tailnet device name (e.g. `loom-worker-1`), when the worker
+    /// is on a tailnet. Rendered alongside `ssh_host` in `fleet status`'s
+    /// human table (#4342).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tailnet_name: Option<String>,
+    /// Who/what added this worker to the registry (operator handle, or an
+    /// automation identifier), when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub added_by: Option<String>,
+    /// Registry-level lifecycle state. `None`/absent means active (the
+    /// overwhelmingly common case, including every record written before this
+    /// field existed) — only the literal `"draining"` (written by `fleet
+    /// drain`'s first phase, #4343) changes rendering, and it must never be
+    /// mistaken for a parse error. Modeled as a bare `String` (not an enum) so
+    /// an unrecognized future state still round-trips instead of failing to
+    /// deserialize.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
 }
 
 /// The machine-level set of bootstrapped workers, persisted at
@@ -898,6 +927,10 @@ mod tests {
             priority: 50,
             bootstrapped_at: "2026-07-28T00:00:00Z".to_string(),
             last_verify: None,
+            provider_instance_id: None,
+            tailnet_name: None,
+            added_by: None,
+            state: None,
         }
     }
 
@@ -991,5 +1024,35 @@ mod tests {
         assert_eq!(reg.workers.len(), 1);
         assert_eq!(reg.workers[0].priority, crate::workspace_registry::DEFAULT_WORKSPACE_PRIORITY);
         assert!(reg.workers[0].repos.is_empty());
+        // #4342's extended fields must also be absent-tolerant on a
+        // pre-#4342 record.
+        assert!(reg.workers[0].provider_instance_id.is_none());
+        assert!(reg.workers[0].tailnet_name.is_none());
+        assert!(reg.workers[0].added_by.is_none());
+        assert!(reg.workers[0].state.is_none());
+    }
+
+    #[test]
+    fn registry_parses_4342_extended_fields_and_draining_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fleet.json");
+        std::fs::write(
+            &path,
+            r#"{ "version": 1, "workers": [ {
+                "ssh_host": "repo-remote-anvil",
+                "bootstrapped_at": "2026-07-29T00:00:00Z",
+                "provider_instance_id": "i-0f35973f28ed5d97f",
+                "tailnet_name": "loom-worker-1",
+                "added_by": "operator",
+                "state": "draining"
+            } ] }"#,
+        )
+        .unwrap();
+        let reg = FleetRegistry::load(&path).unwrap();
+        let w = &reg.workers[0];
+        assert_eq!(w.provider_instance_id.as_deref(), Some("i-0f35973f28ed5d97f"));
+        assert_eq!(w.tailnet_name.as_deref(), Some("loom-worker-1"));
+        assert_eq!(w.added_by.as_deref(), Some("operator"));
+        assert_eq!(w.state.as_deref(), Some("draining"));
     }
 }

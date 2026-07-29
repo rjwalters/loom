@@ -388,6 +388,21 @@ enum FleetAction {
         #[arg(long)]
         dry_run: bool,
     },
+
+    /// Aggregate sweep/token/health state across every fleet host, side by
+    /// side, including the local host (issue #4342). Reads the fleet registry
+    /// #4341 writes, collects the local host's own status in-process (over
+    /// the daemon's Unix socket — never `ssh localhost`), and fans out to
+    /// every remote worker's `loom-daemon status --json` concurrently, each
+    /// bounded by a per-host timeout so one hung host cannot stall the report.
+    /// Distinct, loud per-host states (`UP` / `DAEMON DOWN` / `UNREACHABLE` /
+    /// `PARSE ERROR` / `DRAINING`) — silence never reads as idle. Exits
+    /// non-zero unless every roster host is `UP`.
+    Status {
+        /// Emit machine-readable JSON instead of the human-readable table.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Sub-actions for `loom-daemon watch` (Issue #3971).
@@ -763,6 +778,13 @@ async fn main() -> Result<()> {
                 force_after_timeout,
                 abort_drain,
             } => handle_restart_command(drain, timeout, force_after_timeout, abort_drain).await,
+            // `fleet status` collects the local host's own status over the
+            // daemon's Unix socket (issue #4342), so — unlike `fleet
+            // add-worker`, which is pure ssh/filesystem and stays on the sync
+            // `handle_cli_command` path — it needs the async runtime too.
+            Commands::Fleet {
+                action: FleetAction::Status { json },
+            } => handle_fleet_status_command(json).await,
             other => handle_cli_command(other),
         };
     }
@@ -2922,6 +2944,70 @@ fn print_status_unreachable_json(
     Ok(())
 }
 
+/// Handle `loom-daemon fleet status` (#4342, epic #4340): collect the local
+/// host's own status in-process, fan out to every registered fleet worker
+/// concurrently, merge, render, and exit non-zero unless every roster host is
+/// `UP`. Thin clap→module wiring: the merge/render/exit-code logic lives in
+/// [`loom_daemon::fleet::status`]; only the local-host collection (which needs
+/// this binary's own socket/install-state machinery) lives here.
+async fn handle_fleet_status_command(json: bool) -> Result<()> {
+    use loom_daemon::fleet::status::{collect_fleet_report, SshStatusSource};
+    use loom_daemon::fleet::FleetRegistry;
+
+    let registry = FleetRegistry::load_default()?;
+    let local = collect_local_fleet_report().await;
+    let source: Arc<dyn loom_daemon::fleet::status::HostStatusSource> =
+        Arc::new(SshStatusSource::new());
+    let timeout = Duration::from_secs(loom_daemon::fleet::status::DEFAULT_TIMEOUT_SECS);
+    let report = collect_fleet_report(source, registry, local, timeout).await;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print!("{}", report.render_human());
+    }
+    std::process::exit(report.exit_code());
+}
+
+/// Collect the local host's own [`loom_daemon::fleet::status::HostReport`] —
+/// in-process, over the daemon's Unix socket (never `ssh localhost`, per
+/// #4342's implementation guidance). Reuses the exact same
+/// [`build_status_json_value`] payload shape `loom-daemon status --json`
+/// emits, so the local row's fields line up with every remote host's
+/// self-reported `status --json` (#4069's unreachable-daemon classification is
+/// reused for the down case too).
+async fn collect_local_fleet_report() -> loom_daemon::fleet::status::HostReport {
+    use loom_daemon::fleet::status::HostReport;
+
+    let socket_path = match resolve_socket_path() {
+        Ok(path) => path,
+        Err(e) => {
+            return HostReport::local_down(format!("could not resolve daemon socket path: {e}"))
+        }
+    };
+
+    match query_daemon_status(&socket_path).await {
+        Ok(daemon_report) => {
+            let token_usage = collect_token_usage(daemon_report.token_pool_dir.as_deref());
+            let update = self_update::check();
+            let value =
+                build_status_json_value(&daemon_report, token_usage.as_ref(), &update, None);
+            HostReport::local_up(value)
+        }
+        Err(e) => {
+            // Reuse the #4069 install-state classification so the local row's
+            // "why is it down" detail matches what `loom-daemon status --json`
+            // itself would report for this same daemon.
+            let install_state = daemon_install_state::probe();
+            let detail = match install_state {
+                Some(r) => format!("{} ({e})", r.state.as_str()),
+                None => format!("daemon unreachable: {e}"),
+            };
+            HostReport::local_down(detail)
+        }
+    }
+}
+
 /// Emit the unreachable-daemon human-readable error, state-aware (Issue
 /// #4069). Remediation advice differs per state: `NotExpected` /
 /// `ExpectedButDead` suggest a start; `AliveStarting` (#4213) reports a normal
@@ -3150,15 +3236,21 @@ fn resolve_capacity(
     }
 }
 
-/// Emit the combined status (daemon report + per-token usage) as JSON.
-fn print_status_json(
+/// Build the combined status payload (daemon report + per-token usage) as a
+/// [`serde_json::Value`] — the shared value builder behind both `loom-daemon
+/// status --json` ([`print_status_json`]) and each fleet host's own
+/// self-reported status, including the local host's row collected in-process
+/// by `fleet status` (#4342, [`collect_local_fleet_report`]) — keeping the two
+/// call sites' JSON shape identical by construction rather than by
+/// convention.
+fn build_status_json_value(
     report: &DaemonStatusReport,
     token_usage: Option<&serde_json::Value>,
     update: &self_update::SelfUpdateStatus,
     pipeline: Option<&[loom_daemon::pipeline_snapshot::RepoPipelineSnapshot]>,
-) -> Result<()> {
+) -> serde_json::Value {
     let rc = resolve_capacity(report, token_usage);
-    let combined = serde_json::json!({
+    serde_json::json!({
         "in_flight_count": report.in_flight.len(),
         "in_flight": report.in_flight,
         // Live-locked-but-unregistered sweeps (#4214): a live `owner_pid` lock
@@ -3313,7 +3405,17 @@ fn print_status_json(
             "socket": s.socket,
             "room": s.room,
         })),
-    });
+    })
+}
+
+/// Emit the combined status (daemon report + per-token usage) as JSON.
+fn print_status_json(
+    report: &DaemonStatusReport,
+    token_usage: Option<&serde_json::Value>,
+    update: &self_update::SelfUpdateStatus,
+    pipeline: Option<&[loom_daemon::pipeline_snapshot::RepoPipelineSnapshot]>,
+) -> Result<()> {
+    let combined = build_status_json_value(report, token_usage, update, pipeline);
     println!("{}", serde_json::to_string_pretty(&combined)?);
     Ok(())
 }
@@ -4171,6 +4273,12 @@ fn handle_fleet_command(action: FleetAction) -> Result<()> {
                 idle_shutdown_minutes,
             };
             add_worker::run(&config)
+        }
+        FleetAction::Status { .. } => {
+            // Routed directly in `main()` (it needs the async runtime for the
+            // local host's in-process socket round-trip), never dispatched
+            // through this sync handler.
+            unreachable!("Fleet Status is handled in main() before handle_cli_command")
         }
     }
 }
