@@ -1192,6 +1192,10 @@ pub fn build_daemon_status(
             // `.loom/config.json`), never the CLI client's environment (#4012).
             health_gate_enabled: Some(crate::main_health_gate::effective_enabled(root)),
             health_gate_verdict_at: health_states.last_verdict_at(root),
+            // Issue #4326: surface a dangling registry entry (root deleted
+            // without `workspace remove`) so `status` — not just the
+            // work-finder log — points the operator at it.
+            root_missing: !root.is_dir(),
         });
         in_flight.extend(live);
         unregistered_locked.extend(locked_unregistered.into_iter().map(|(issue, owner_pid)| {
@@ -4432,6 +4436,7 @@ exit 0
                 health_gate_not_evaluated_reason: None,
                 health_gate_enabled: Some(true),
                 health_gate_verdict_at: Some(chrono::Utc::now()),
+                root_missing: false,
             }],
             credential_preflight: Some(test_credential_preflight()),
             draining: false,
@@ -5039,6 +5044,63 @@ exit 0
         assert_eq!(b.health_gate_enabled, Some(false));
         assert_eq!(a.health_gate_verdict_at, None);
         assert_eq!(b.health_gate_verdict_at, None);
+
+        std::env::remove_var(REGISTRY_PATH_ENV);
+    }
+
+    /// Issue #4326: a registry entry whose root directory has been deleted
+    /// (without a matching `workspace remove`) is flagged `root_missing: true`
+    /// in `build_daemon_status`'s per-repo breakdown, while a sibling whose
+    /// directory still exists is unaffected — this is the daemon-side half of
+    /// the missing-root hygiene backstop (the work-finder's per-tick skip is
+    /// covered separately in `work_finder::tests`).
+    #[test]
+    #[serial_test::serial]
+    fn test_build_daemon_status_flags_missing_root() {
+        use crate::main_health_gate::WorkspaceHealthStates;
+        use crate::workspace_registry::{normalize_path, WorkspaceRegistry, REGISTRY_PATH_ENV};
+
+        let (sr_a, dir_a, _rec_a) = setup_sweep_registry_in_tempdir();
+        let root_a = dir_a.path().to_path_buf();
+        // A second root that exists at registration time, then gets removed
+        // from disk — exactly the dangling-entry shape from #4326 (a scratch
+        // dir was deleted without `loom-daemon workspace remove`).
+        let dangling_dir = tempfile::tempdir().unwrap();
+        let root_dangling = dangling_dir.path().to_path_buf();
+        let canon_dangling = normalize_path(&root_dangling);
+
+        let reg_path = dir_a.path().join("workspaces.json");
+        let mut reg = WorkspaceRegistry::default();
+        reg.add(&root_a, None).unwrap();
+        reg.add(&root_dangling, None).unwrap();
+        reg.save(&reg_path).unwrap();
+        std::env::set_var(REGISTRY_PATH_ENV, &reg_path);
+
+        // Delete the second root's directory after registration — the entry
+        // itself stays registered (warn-and-skip, never auto-remove).
+        drop(dangling_dir);
+        assert!(!canon_dangling.exists(), "precondition: dangling root is gone");
+
+        let canon_a = normalize_path(&root_a);
+        let pool = Arc::new(WorkspacePool::new(Arc::new(EventBus::new()), test_runtime_handle()));
+        pool.seed(canon_a.clone(), sr_a.clone());
+
+        let health = WorkspaceHealthStates::new();
+        let report = build_daemon_status(&pool, &health, &root_a, &test_credential_preflight());
+
+        assert_eq!(report.per_repo.len(), 2);
+        let a = report
+            .per_repo
+            .iter()
+            .find(|r| r.root == canon_a)
+            .expect("repo A present");
+        let dangling = report
+            .per_repo
+            .iter()
+            .find(|r| r.root == canon_dangling)
+            .expect("dangling entry still present in the registry");
+        assert!(!a.root_missing, "repo A's directory still exists");
+        assert!(dangling.root_missing, "the deleted root is flagged missing");
 
         std::env::remove_var(REGISTRY_PATH_ENV);
     }

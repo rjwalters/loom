@@ -1181,6 +1181,17 @@ pub struct RepoStatus {
     /// keeps pre-#4012 wire data compatible.
     #[serde(default)]
     pub health_gate_verdict_at: Option<DateTime<Utc>>,
+    /// Whether `root` no longer exists on disk (Issue #4326) — e.g. a leaked
+    /// or stale registry entry (a scratch dir that was deleted without
+    /// `loom-daemon workspace remove`). The work-finder warns-and-skips a
+    /// missing root rather than dispatching into it, but never auto-removes
+    /// the registration (a root can be transiently absent, e.g. an unmounted
+    /// volume), so this flag is `status`'s visible backstop: an operator
+    /// seeing `true` here should run `workspace remove <root>` once confirmed
+    /// permanent. `#[serde(default)]` keeps pre-#4326 wire data compatible (an
+    /// absent field parses as `false`, i.e. "not known to be missing").
+    #[serde(default)]
+    pub root_missing: bool,
 }
 
 /// One active insta-crash quarantine (Issue #4215), as surfaced by
@@ -1682,5 +1693,50 @@ mod tests {
         assert!(round.contains("\"repo\":\"/repos/beta\""));
         let back: SweepInfo = serde_json::from_str(&round).unwrap();
         assert_eq!(back.repo.as_deref(), Some("/repos/beta"));
+    }
+
+    // ---- Issue #4326: RepoStatus `root_missing` is additive/backward-compatible ----
+
+    fn sample_repo_status(root_missing: bool) -> RepoStatus {
+        RepoStatus {
+            root: PathBuf::from("/repos/gamma"),
+            priority: 100,
+            in_flight_count: 0,
+            health_gate_halted: false,
+            quarantined_issues: vec![],
+            health_gate_not_evaluated: false,
+            health_gate_not_evaluated_reason: None,
+            health_gate_enabled: Some(true),
+            health_gate_verdict_at: None,
+            root_missing,
+        }
+    }
+
+    #[test]
+    fn repo_status_root_missing_round_trips_through_serde() {
+        let status = sample_repo_status(true);
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(json.contains("\"root_missing\":true"));
+        let back: RepoStatus = serde_json::from_str(&json).unwrap();
+        assert!(back.root_missing);
+    }
+
+    #[test]
+    fn repo_status_root_missing_defaults_to_false_for_pre_4326_wire_data() {
+        // A payload emitted before #4326 has no `root_missing` key; it must
+        // still parse — old daemons stay wire-compatible with a newer CLI,
+        // and the field defaults to "not known to be missing" rather than
+        // failing to deserialize.
+        let json = r#"{
+            "root":"/repos/delta",
+            "priority":100,
+            "in_flight_count":0,
+            "health_gate_halted":false,
+            "quarantined_issues":[],
+            "health_gate_not_evaluated":false,
+            "health_gate_enabled":true
+        }"#;
+        let status: RepoStatus = serde_json::from_str(json).unwrap();
+        assert!(!status.root_missing);
     }
 }

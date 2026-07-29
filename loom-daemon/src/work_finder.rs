@@ -1563,6 +1563,10 @@ pub fn spawn_multi_work_finder_task(
         // Axis-visibility state (#4234) — see the single-workspace loop above
         // for the full rationale.
         let mut was_max_concurrent: Option<usize> = None;
+        // Missing-root hygiene (#4326): tracks which registered roots are
+        // currently missing so `filter_missing_roots` logs a warning once per
+        // transition rather than once per tick.
+        let mut missing_roots_warned: HashSet<PathBuf> = HashSet::new();
         loop {
             ticker.tick().await;
 
@@ -1600,6 +1604,12 @@ pub fn spawn_multi_work_finder_task(
                 WorkspaceRegistry::default()
             });
             let roots = registry.effective_roots(&fallback_root);
+            // Skip registered roots whose directory no longer exists on disk
+            // (#4326 — e.g. a leaked/stale registry entry) so a dangling entry
+            // cannot occupy top dispatch priority or burn the tick. This is
+            // warn-and-skip, never auto-remove: the entry stays registered
+            // (`loom-daemon status` flags it, `workspace remove` clears it).
+            let roots = filter_missing_roots(roots, &mut missing_roots_warned);
 
             // Per-repo priority tiers (#3946), parallel to `pairs`: lower = higher
             // priority. The empty-registry cwd fallback resolves to the default.
@@ -1734,6 +1744,52 @@ pub fn spawn_multi_work_finder_task(
             }
         }
     })
+}
+
+/// Filter a resolved root list down to directories that still exist on disk
+/// (Issue #4326), warning once per missing/recovered transition rather than
+/// every tick.
+///
+/// Deliberately **not** folded into
+/// [`WorkspaceRegistry::effective_roots`](crate::workspace_registry::WorkspaceRegistry::effective_roots)
+/// — that helper's empty-registry branch falls back to the daemon's cwd, and
+/// dropping missing roots *inside* it would make an all-roots-missing
+/// registry indistinguishable from an empty one, silently redirecting
+/// dispatch into the daemon's own cwd. Filtering here instead means an
+/// all-missing registry yields zero roots for this tick — no dispatch, no
+/// cwd fallback — while the dangling entries stay registered so
+/// `loom-daemon status` can flag them and an operator can `workspace remove`
+/// them. This is warn-and-skip, **never auto-remove**: a root can be
+/// transiently absent (an unmounted network volume, an in-progress restore),
+/// and auto-deregistering would destroy operator state on a transient
+/// condition.
+///
+/// `warned` carries the set of roots currently known-missing across ticks so
+/// a long-dangling entry logs once on first-seen-missing (not once per tick),
+/// and — if it later reappears and then disappears again — re-warns instead
+/// of staying silent forever.
+fn filter_missing_roots(roots: Vec<PathBuf>, warned: &mut HashSet<PathBuf>) -> Vec<PathBuf> {
+    let mut existing = Vec::with_capacity(roots.len());
+    let mut still_missing: HashSet<PathBuf> = HashSet::new();
+    for root in roots {
+        if root.is_dir() {
+            existing.push(root);
+        } else {
+            if !warned.contains(&root) {
+                log::warn!(
+                    "work_finder: registered workspace root {} does not exist on disk; \
+                     skipping it for this tick (entry stays registered — run \
+                     `loom-daemon workspace remove {}` to deregister it if this is \
+                     permanent, or `loom-daemon status` to confirm)",
+                    root.display(),
+                    root.display()
+                );
+            }
+            still_missing.insert(root);
+        }
+    }
+    *warned = still_missing;
+    existing
 }
 
 /// Emit the add-capacity advisory / recovery on a token-pressure **state
@@ -4145,5 +4201,82 @@ exit 0
             vec![10],
             "sibling root with no gate in flight is unaffected"
         );
+    }
+
+    // ===================================================================
+    // Missing-root hygiene (Issue #4326)
+    // ===================================================================
+
+    #[test]
+    fn test_filter_missing_roots_skips_only_the_missing_one() {
+        // A registry with one existing and one missing root dispatches only
+        // into the existing root — the missing one is dropped, not the whole
+        // tick.
+        let tmp = tempfile::tempdir().unwrap();
+        let existing = tmp.path().to_path_buf();
+        let missing = tmp.path().join("does-not-exist");
+        let mut warned = HashSet::new();
+
+        let filtered = filter_missing_roots(vec![existing.clone(), missing.clone()], &mut warned);
+
+        assert_eq!(filtered, vec![existing], "only the existing root survives");
+        assert!(warned.contains(&missing), "the missing root is tracked as warned");
+    }
+
+    #[test]
+    fn test_filter_missing_roots_all_missing_does_not_fall_back_to_cwd() {
+        // The all-missing case must yield an EMPTY root list, never a silent
+        // fallback to the daemon's cwd (that fallback is
+        // `effective_roots`'s exclusive, empty-*registry* behavior — a
+        // non-empty registry whose entries all happen to be missing on disk
+        // is a distinct case and must not reuse it).
+        let tmp = tempfile::tempdir().unwrap();
+        let missing_a = tmp.path().join("gone-a");
+        let missing_b = tmp.path().join("gone-b");
+        let mut warned = HashSet::new();
+
+        let filtered = filter_missing_roots(vec![missing_a, missing_b], &mut warned);
+
+        assert!(filtered.is_empty(), "an all-missing registry yields zero roots, not cwd");
+        assert_eq!(warned.len(), 2);
+    }
+
+    #[test]
+    fn test_filter_missing_roots_warns_once_then_recovers() {
+        // The `warned` set only ever tracks roots missing on the *current*
+        // call — a caller that re-checks each tick (as the work-finder loop
+        // does) naturally re-warns if a root disappears again after
+        // recovering, and stays silent tick-over-tick while it remains
+        // missing (the loop only logs for roots newly inserted into
+        // `warned`, exercised by the loop itself, not this pure-function
+        // test — this test just verifies the recovery bookkeeping).
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("flaky");
+        let mut warned = HashSet::new();
+
+        // First call: missing.
+        let filtered = filter_missing_roots(vec![root.clone()], &mut warned);
+        assert!(filtered.is_empty());
+        assert!(warned.contains(&root));
+
+        // Root reappears (e.g. a remounted volume).
+        std::fs::create_dir_all(&root).unwrap();
+        let filtered = filter_missing_roots(vec![root.clone()], &mut warned);
+        assert_eq!(filtered, vec![root.clone()]);
+        assert!(warned.is_empty(), "a recovered root is no longer tracked as missing");
+
+        // Root disappears again — should be treated as newly-missing (i.e.
+        // would re-warn), not silently skipped as "already known".
+        std::fs::remove_dir_all(&root).unwrap();
+        let filtered = filter_missing_roots(vec![root.clone()], &mut warned);
+        assert!(filtered.is_empty());
+        assert!(warned.contains(&root));
+    }
+
+    #[test]
+    fn test_filter_missing_roots_empty_input_returns_empty() {
+        let mut warned = HashSet::new();
+        assert!(filter_missing_roots(vec![], &mut warned).is_empty());
+        assert!(warned.is_empty());
     }
 }
