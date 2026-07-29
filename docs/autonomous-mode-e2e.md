@@ -35,6 +35,33 @@ crons — but the label-transition wait in Step 5 is a scripted assertion so the
   (`.github/workflows/loom-*.yml`), or you run Curator / Judge / Champion
   manually per step (the playbook shows the manual triggers).
 
+### Codex operator launch posture
+
+When the operator drives a full Builder-through-Merge lifecycle from an
+**interactive Codex parent session**, start that session with:
+
+```bash
+codex --dangerously-bypass-approvals-and-sandbox
+```
+
+> **Warning:** this disables both Codex approval prompts and the Codex sandbox.
+> Use it only where the operator accepts that trust boundary for Loom's network,
+> git, worktree, daemon-socket, and process operations.
+
+For non-mutating Curator or Judge investigation only, use:
+
+```bash
+codex --sandbox read-only --ask-for-approval never
+```
+
+That read-only session cannot claim or relabel issues, modify worktrees, create
+PRs, or merge. Restart Codex with the full-lifecycle posture before performing
+those operations. These launch flags apply only to the interactive parent
+session, not to Codex workers dispatched by `loom-daemon`. Daemon worker policy
+is tracked separately in [#4478](https://github.com/rjwalters/loom/issues/4478);
+the [Codex guardrail-parity document](../defaults/docs/guardrail-parity-codex.md)
+describes the runtime trust boundary in detail.
+
 ## Step 1 — Enable autonomous mode in config
 
 Add the `autonomous` block to `.loom/config.json` (see
