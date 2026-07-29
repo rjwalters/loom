@@ -166,6 +166,7 @@ if [[ -n "$pr_branches" ]]; then
         if [[ -f "$SCRIPT_DIR/lib/default-branch.sh" ]]; then
             # shellcheck source=lib/default-branch.sh
             source "$SCRIPT_DIR/lib/default-branch.sh"
+            # shellcheck disable=SC2034  # read inside the evaluated _maybe_delete_local_branch body
             DEFAULT_BRANCH_NAME="$(cd "$REPO_ROOT" && loom_default_branch 2>/dev/null || true)"
         fi
 
