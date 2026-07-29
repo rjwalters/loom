@@ -355,6 +355,22 @@ enum Commands {
         verbose: bool,
     },
 
+    /// Forge-agnostic issue/PR/auto-merge operations — the native Rust port of
+    /// the `loom-forge` (`loom_tools.forge_cli`) and `loom-auto-merge`
+    /// (`loom_tools.auto_merge`) Python CLIs (epic #4081 Phase 3, family 3).
+    ///
+    /// GitHub is native: `issue`/`pr`/`auth` are a byte-identical passthrough
+    /// to `gh`, and `auto-merge` enables auto-merge via the
+    /// `enablePullRequestAutoMerge` GraphQL mutation (no working-tree
+    /// checkout). Gitea declines with exit code 3 so the caller's shell path
+    /// (`merge-pr.sh`'s `forge_auto_merge`, or the `gh` read fallback) carries
+    /// it. Forge config resolves from the canonical repo root (never a
+    /// worktree CWD); see `forge_cmd.rs` for the full #4061 semantics.
+    Forge {
+        #[command(subcommand)]
+        action: ForgeAction,
+    },
+
     /// Validate role configuration completeness
     Validate {
         /// Workspace directory containing .loom/config.json
@@ -567,6 +583,70 @@ enum QuarantineAction {
         /// the default differs).
         #[arg(long, value_name = "PATH")]
         workspace_root: Option<String>,
+    },
+}
+
+/// Sub-actions for `loom-daemon forge`.
+///
+/// The `issue`/`pr`/`auth` variants capture their trailing args verbatim and
+/// (on GitHub) exec `gh <entity> <args…>`, so the surface stays byte-identical
+/// to the `FORGE=gh` shell fallback the four scripts already understand.
+#[derive(Subcommand)]
+enum ForgeAction {
+    /// `forge issue <args…>` — e.g. `issue view 42 --json labels --jq
+    /// '.labels[].name'`. GitHub: exec `gh issue <args…>`.
+    Issue {
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            value_name = "ARGS"
+        )]
+        args: Vec<String>,
+    },
+    /// `forge pr <args…>` — e.g. `pr list --state=merged --limit 20 --json
+    /// number,title,body`. GitHub: exec `gh pr <args…>`.
+    Pr {
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            value_name = "ARGS"
+        )]
+        args: Vec<String>,
+    },
+    /// `forge auth <args…>` — e.g. `auth status`. GitHub: exec `gh auth
+    /// <args…>`.
+    Auth {
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            value_name = "ARGS"
+        )]
+        args: Vec<String>,
+    },
+    /// `forge auto-merge <pr> [--method M]` — enable auto-merge for a PR
+    /// (formerly `loom-auto-merge`). GitHub: `enablePullRequestAutoMerge`
+    /// GraphQL mutation. Gitea: declines (exit 3) → shell `forge_auto_merge`.
+    /// `--poll-interval` / `--timeout` are accepted for CLI compatibility and
+    /// ignored on GitHub (the server queues the merge).
+    #[command(name = "auto-merge")]
+    AutoMerge {
+        /// Pull request number.
+        #[arg(value_name = "PR")]
+        pr_number: u32,
+
+        /// Merge method (squash | merge | rebase). Default squash.
+        #[arg(long, default_value = "squash")]
+        method: String,
+
+        /// Seconds between CI polls (Gitea shell path only). Accepted for
+        /// compatibility; unused on the GitHub native path.
+        #[arg(long, value_name = "SECONDS")]
+        poll_interval: Option<u64>,
+
+        /// Max seconds to wait for CI (Gitea shell path only). Accepted for
+        /// compatibility; unused on the GitHub native path.
+        #[arg(long, value_name = "SECONDS")]
+        timeout: Option<u64>,
     },
 }
 
@@ -2034,6 +2114,7 @@ fn handle_cli_command(command: Commands) -> Result<()> {
             json,
             verbose,
         } => handle_recover_orphans_command(&workspace, recover, json, verbose),
+        Commands::Forge { action } => handle_forge_command(action),
         Commands::Status { .. } => {
             // Routed directly in `main()` (it needs the async runtime for the
             // socket round-trip), never dispatched through this sync handler.
@@ -4713,6 +4794,26 @@ fn print_monitor_import(result: &loom_daemon::tokens_pool::monitor_db::MonitorIm
     if !result.pruned.is_empty() {
         println!("Pruned ({}): {}", result.pruned.len(), result.pruned.join(", "));
     }
+}
+
+/// Handle `loom-daemon forge <issue|pr|auth|auto-merge>` (epic #4081 Phase 3,
+/// family 3 — the native port of `loom-forge` / `loom-auto-merge`). Handlers
+/// exec `gh` / exit the process directly, so this only returns `Err` when a
+/// child process cannot be spawned. See `loom-daemon/src/forge_cmd.rs`.
+fn handle_forge_command(action: ForgeAction) -> Result<()> {
+    use loom_daemon::forge_cmd::{dispatch, ForgeCmd};
+    let cmd = match action {
+        ForgeAction::Issue { args } => ForgeCmd::Issue(args),
+        ForgeAction::Pr { args } => ForgeCmd::Pr(args),
+        ForgeAction::Auth { args } => ForgeCmd::Auth(args),
+        ForgeAction::AutoMerge {
+            pr_number, method, ..
+        } => ForgeCmd::AutoMerge {
+            pr: pr_number,
+            method,
+        },
+    };
+    dispatch(cmd)
 }
 
 /// Handle `loom-daemon tokens <select|pin|unpin|unblock|mark-bad>` (Issue

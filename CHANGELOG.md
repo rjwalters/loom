@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Forge/merge family ported to native `loom-daemon forge`** (#4273, epic #4081 Phase 3, family 3) — the `loom-forge` (`loom_tools.forge_cli`) and `loom-auto-merge` (`loom_tools.auto_merge`) Python CLIs are replaced by a native `loom-daemon forge <issue|pr|auth|auto-merge>` subcommand group. On GitHub the read/auth surface is a byte-identical passthrough to `gh` and `auto-merge` enables auto-merge via the `enablePullRequestAutoMerge` GraphQL mutation (no working-tree checkout); on Gitea the subcommand declines (exit 3) so the caller's existing shell path (`merge-pr.sh`'s `forge_auto_merge`, or the `gh` read fallback) carries it. `merge-pr.sh` / `check-duplicate.sh` / `check-shutdown.sh` / `cleanup-branches.sh` keep their names, flags, and graceful `gh`-fallback contract (no `loom-daemon` on PATH ⇒ scripts still work). Forge config resolves from the canonical repo root (`git rev-parse --git-common-dir`), never a worktree CWD; the #4061 env-precedence + Gitea hard-fail semantics are preserved and unit-tested. The shared `loom_tools/common/{forge,github,gitea,cached_forge}.py` client stack is retained (still imported by backlog/clean/daemon_cleanup/daemon_diagnostic/forge_snapshot/orphan_recovery/stuck_detection).
+
 ## [0.15.0] - 2026-07-24
 
 ### Summary
