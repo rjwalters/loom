@@ -9,6 +9,7 @@ use loom_daemon::epic_supervisor;
 use loom_daemon::event_bus::EventBus;
 use loom_daemon::health_monitor;
 use loom_daemon::host_breaker;
+use loom_daemon::idle_exit;
 use loom_daemon::ipc::IpcServer;
 use loom_daemon::main_health_gate;
 use loom_daemon::metrics_collector;
@@ -2049,6 +2050,32 @@ async fn main() -> Result<()> {
         log::debug!(
             "auto_update: disabled (set LOOM_AUTO_UPDATE=1 or autonomous.autoUpdate.enabled=true to opt in)"
         );
+        None
+    };
+
+    // Independent, opt-in idle exit (#4467). The daemon only exits; the host
+    // guard retains sole authority to power off.
+    let idle_exit_config = idle_exit::read_config(&sweep_workspace);
+    let _idle_exit_handle = if idle_exit::resolve_enabled(&idle_exit_config) {
+        let minutes = idle_exit::resolve_minutes(&idle_exit_config);
+        let starvation = idle_exit::resolve_starvation(&idle_exit_config);
+        if loom_daemon::ipc::detect_supervisor().as_deref() == Some("launchd") {
+            log::warn!(
+                "idle_exit: ENABLED under launchd; KeepAlive:SuccessfulExit relaunches exit(0), \
+                 so idle exit is meaningful only under on-failure-style supervision"
+            );
+        }
+        log::info!("idle_exit: enabled (idle_minutes={minutes}, on_token_starvation={starvation})");
+        Some(idle_exit::spawn_task(
+            idle_exit_config,
+            sweep_workspace.clone(),
+            workspace_pool.clone(),
+            role_in_progress.clone(),
+            event_bus.clone(),
+            socket_path.clone(),
+        ))
+    } else {
+        log::debug!("idle_exit: disabled (opt in with autonomous.idleExit.enabled=true)");
         None
     };
 

@@ -852,6 +852,28 @@ pub fn event_to_envelope(event: &Event) -> Option<Envelope> {
                 meta: None,
             })
         }
+        Event::DaemonIdleExit {
+            trigger,
+            idle_minutes,
+            in_flight_sweeps,
+            active_role_runs,
+            healthy_tokens,
+            total_tokens,
+            message,
+        } => Some(Envelope {
+            to: "*".to_owned(),
+            kind: "handoff".to_owned(),
+            task_id: Some("daemon-idle-exit".to_owned()),
+            body: message.clone(),
+            meta: Some(serde_json::json!({
+                "trigger": trigger,
+                "idle_minutes": idle_minutes,
+                "in_flight_sweeps": in_flight_sweeps,
+                "active_role_runs": active_role_runs,
+                "healthy_tokens": healthy_tokens,
+                "total_tokens": total_tokens,
+            })),
+        }),
         // SweepGlobalCompleted (no issue number — SweepExited covers it),
         // SweepGlobalDispatch(PrSet), EpicAction, CapacityAdvisory, TopicLag,
         // Generic: not narrated in phase 1.
