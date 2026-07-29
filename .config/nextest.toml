@@ -1,0 +1,58 @@
+# cargo-nextest configuration (issue #4385)
+#
+# Why nextest at all: the daemon suite mutates process-global environment
+# variables in ~700 places across ~37 modules. `serial_test`'s `#[serial]`
+# only serializes *marked* tests against each other — an unmarked test that
+# calls `Command::spawn` still runs concurrently with a marked env mutator,
+# and `spawn` reads the process environ non-atomically. That race produced
+# real CI flakes (see #4385). nextest runs **one process per test**, so one
+# test's env mutation is invisible to every other test by construction; the
+# whole failure class dies, including tests nobody remembers to mark.
+#
+# See `loom-daemon/src/lib.rs` (crate docs, "Test conventions") for the
+# author-facing version of this contract.
+
+[profile.default]
+# Surface slow tests early rather than letting them silently pad CI wall time.
+# Only *terminate* well past any plausible honest runtime.
+slow-timeout = { period = "60s", terminal-after = 6 }
+# Retries are deliberately 0: this change exists to remove flakes, not to
+# paper over them. A red run should stay red.
+retries = 0
+failure-output = "immediate-final"
+status-level = "fail"
+
+# --- Serialized test groups -------------------------------------------------
+#
+# Process isolation supersedes `#[serial]` for anything protecting *process*
+# state (env vars, cwd, process-local statics). It does NOT help for state
+# shared *between* processes. The daemon suite has exactly one such resource:
+# the dedicated tmux server on the `-L loom` socket.
+#
+# `loom-daemon/tests/common/mod.rs::cleanup_all_loom_sessions()` kills **every**
+# `loom-*` session on that server, and all three integration binaries below call
+# it from their `setup()` — so any two of them running concurrently would tear
+# down each other's sessions. Under plain `cargo test` this was safe only
+# because cargo runs test binaries one at a time; nextest does not, so the
+# serialization has to be declared here instead.
+#
+# These binaries also each shell out to `cargo build --bin loom-daemon` from
+# `TestDaemon::start()`; serializing them keeps that off the critical path too.
+[test-groups]
+tmux-server = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'binary(integration_basic) or binary(integration_security) or binary(integration_factory_reset)'
+test-group = 'tmux-server'
+# Booting a real daemon (including a debug `cargo build`) is slow by nature.
+slow-timeout = { period = "120s", terminal-after = 5 }
+
+# --- CI profile -------------------------------------------------------------
+#
+# Inherits every setting above from `default`, including the `tmux-server`
+# overrides (nextest merges a profile's overrides with the default profile's).
+# CI wants the full failure list rather than a fail-fast bail-out.
+[profile.ci]
+fail-fast = false
+failure-output = "immediate-final"
+final-status-level = "fail"
