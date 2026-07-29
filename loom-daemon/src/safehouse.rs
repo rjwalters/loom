@@ -2382,6 +2382,21 @@ mod tests {
         };
         let env = event_to_envelope(&resume_failed).unwrap();
         assert!(env.body.contains("still stranded"), "got: {}", env.body);
+
+        let idle_exit = Event::DaemonIdleExit {
+            trigger: "token_starvation".to_owned(),
+            idle_minutes: 60,
+            in_flight_sweeps: 0,
+            active_role_runs: 1,
+            healthy_tokens: 0,
+            total_tokens: 8,
+            message: "idle for 60m — exiting for host idle-shutdown".to_owned(),
+        };
+        let env = event_to_envelope(&idle_exit).unwrap();
+        assert_eq!(env.kind, "handoff");
+        assert_eq!(env.task_id.as_deref(), Some("daemon-idle-exit"));
+        assert!(env.body.contains("host idle-shutdown"));
+        assert_eq!(env.meta.unwrap()["trigger"], "token_starvation");
     }
 
     #[test]

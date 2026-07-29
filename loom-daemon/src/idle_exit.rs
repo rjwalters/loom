@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::event_bus::EventBus;
-use crate::role_runner::{active_run_count, InProgressGuard};
+use crate::role_runner::{active_run_count, role_run_start_generation, InProgressGuard};
 use crate::types::Event;
 use crate::workspace_pool::WorkspacePool;
 
@@ -210,6 +210,7 @@ pub fn spawn_task(
             Instant::now(),
         );
         let mut events = bus.subscribe(["sweep.global.dispatch", "sweep.global.completed"]);
+        let mut role_generation = role_run_start_generation();
         let mut interval = tokio::time::interval(Duration::from_secs(15));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -217,6 +218,11 @@ pub fn spawn_task(
             let mut lifecycle_activity = false;
             while events.try_recv().is_ok() {
                 lifecycle_activity = true;
+            }
+            let current_role_generation = role_run_start_generation();
+            if current_role_generation != role_generation {
+                lifecycle_activity = true;
+                role_generation = current_role_generation;
             }
             let in_flight = crate::ipc::count_in_flight_sweeps(&pool, &root);
             let active_roles = active_run_count(&roles);
@@ -311,6 +317,21 @@ mod tests {
             tracker.observe(idle(), start + Duration::from_secs(119)),
             Some(IdleExitTrigger::Idle)
         );
+    }
+
+    #[test]
+    fn role_start_generation_captures_short_completed_run() {
+        let before = role_run_start_generation();
+        let roles = crate::role_runner::new_in_progress_guard();
+        {
+            let _run = crate::role_runner::RoleRunGuard::try_acquire(
+                roles,
+                PathBuf::from("/tmp/idle-exit-role-test"),
+                "champion",
+            )
+            .unwrap();
+        }
+        assert!(role_run_start_generation() > before);
     }
 
     #[test]
