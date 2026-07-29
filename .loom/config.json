@@ -4,7 +4,7 @@
   "autonomous": {
     "roleRunner": {
       "enabled": true,
-      "roles": ["curator", "champion"]
+      "roles": ["curator", "champion", "judge"]
     },
     "collisionDetection": {
       "enabled": true

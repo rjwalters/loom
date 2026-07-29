@@ -1377,6 +1377,31 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         repo: Option<String>,
     },
+    /// `sweep.issue.{N}.resume_dispatched` — reaper-driven resume (Issue
+    /// #4256). A crashed sweep's issue had an open linked PR plus a
+    /// Builder-or-later checkpoint, so the reaper re-dispatched the SAME
+    /// issue with the #4123 open-PR guard bypassed for that one resume — the
+    /// checkpoint-resume machinery (#3373) then picks back up at the correct
+    /// phase (typically Judge) instead of redoing the Builder. This is the
+    /// one dispatch path that proceeds despite an open PR; every other
+    /// dispatch caller still refuses via `OpenPrDispatchError`, so #4123's
+    /// anti-duplicate property is unchanged.
+    SweepResumeDispatched {
+        issue: u32,
+        /// The open linked PR the resume targets.
+        pr: u32,
+        /// The checkpoint phase the crashed sweep last recorded.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        checkpoint_phase: Option<String>,
+        /// Whether the resume dispatch itself succeeded (spawned a child).
+        /// `false` means the reaper attempted recovery but the dispatch call
+        /// failed (e.g. a spawn error) — still emitted so the attempt is
+        /// visible on the event bus even when the retry itself fails.
+        dispatched: bool,
+        /// Owning managed-workspace root (Issue #3929). See [`Self::SweepPhase`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repo: Option<String>,
+    },
     /// `sweep.global.dispatch` — daemon dispatched a new sweep.
     SweepGlobalDispatch {
         sweep_id: SweepId,
@@ -1454,6 +1479,7 @@ impl Event {
     /// | `SweepBlocker {issue, ..}` | `sweep.issue.{issue}.blocker` |
     /// | `SweepExited {issue, ..}` | `sweep.issue.{issue}.exited` |
     /// | `SweepCrashed {issue, ..}` | `sweep.issue.{issue}.crashed` |
+    /// | `SweepResumeDispatched {issue, ..}` | `sweep.issue.{issue}.resume_dispatched` |
     /// | `SweepGlobalDispatch {..}` | `sweep.global.dispatch` |
     /// | `SweepGlobalCompleted {..}` | `sweep.global.completed` |
     /// | `EpicAction {epic, action, ..}` | `epic.issue.{epic}.{action}` |
@@ -1474,6 +1500,9 @@ impl Event {
             Self::SweepBlocker { issue, .. } => format!("sweep.issue.{issue}.blocker"),
             Self::SweepExited { issue, .. } => format!("sweep.issue.{issue}.exited"),
             Self::SweepCrashed { issue, .. } => format!("sweep.issue.{issue}.crashed"),
+            Self::SweepResumeDispatched { issue, .. } => {
+                format!("sweep.issue.{issue}.resume_dispatched")
+            }
             Self::SweepGlobalDispatch { .. } => "sweep.global.dispatch".to_string(),
             Self::SweepGlobalCompleted { .. } => "sweep.global.completed".to_string(),
             Self::EpicAction { epic, action, .. } => {
@@ -1502,6 +1531,7 @@ impl Event {
             | Self::SweepBlocker { repo, .. }
             | Self::SweepExited { repo, .. }
             | Self::SweepCrashed { repo, .. }
+            | Self::SweepResumeDispatched { repo, .. }
             | Self::SweepGlobalDispatch { repo, .. } => repo,
             _ => return,
         };
