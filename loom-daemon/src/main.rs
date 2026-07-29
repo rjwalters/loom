@@ -16,6 +16,7 @@ use loom_daemon::quarantine_reconciliation;
 use loom_daemon::role_runner;
 use loom_daemon::role_validation;
 use loom_daemon::self_update;
+use loom_daemon::serve;
 use loom_daemon::sweep_registry::{self, SweepRegistry, SweepRegistryConfig};
 use loom_daemon::terminal::TerminalManager;
 use loom_daemon::token_ranking_refresh;
@@ -209,6 +210,43 @@ enum Commands {
         /// dispatch; pass `--force` to dispatch anyway.
         #[arg(long)]
         force: bool,
+    },
+
+    /// Start a minimal read-only HTTP status-snapshot listener (Issue #4391,
+    /// dashboard phase 1 of #4329). A single `GET /api/status` endpoint
+    /// serializes the same `DaemonStatusReport` `loom-daemon status --json`
+    /// already aggregates — fetched live over the *existing* Unix socket (the
+    /// same `DaemonStatus` IPC request `status` sends), so the aggregation
+    /// logic in `ipc::build_daemon_status` runs exactly once and is never
+    /// duplicated here. No new persistent store, no mutation, no SSE/HTML
+    /// (those are later phases #4392-#4394).
+    ///
+    /// Off by default: nothing listens until this subcommand is explicitly
+    /// run — a running daemon started without `serve` never opens this port.
+    /// Binds `127.0.0.1` by default; a non-loopback `--bind` (e.g. a tailnet
+    /// interface address, for the multi-host fleet's cross-host visibility)
+    /// additionally requires `--allow-non-loopback` — the address alone is
+    /// never enough, and a wildcard bind (`0.0.0.0`/`::`) is refused even
+    /// with both flags, so this can never become publicly reachable. Every
+    /// response carries this host's identity (`hostname`) so a later phase's
+    /// client-side aggregator (#4393) can label sources without any
+    /// server-side fan-out in this phase.
+    Serve {
+        /// TCP port for the HTTP listener.
+        #[arg(long, default_value_t = serve::DEFAULT_PORT)]
+        port: u16,
+
+        /// Interface address to bind. Defaults to loopback-only (127.0.0.1).
+        /// A non-loopback address additionally requires
+        /// `--allow-non-loopback`; a wildcard address (0.0.0.0 / ::) is
+        /// refused unconditionally.
+        #[arg(long, default_value = "127.0.0.1")]
+        bind: String,
+
+        /// Explicit opt-in required to bind any non-loopback address (e.g. a
+        /// tailnet interface). Never permits a wildcard bind even when set.
+        #[arg(long)]
+        allow_non_loopback: bool,
     },
 
     /// Manage durable operator watches on issue/PR terminal state (Issue #3971).
@@ -956,6 +994,14 @@ async fn main() -> Result<()> {
             // `watch` connects to the running daemon over its Unix socket to
             // register/list/remove durable watches (Issue #3971).
             Commands::Watch { action } => handle_watch_command(action).await,
+            // `serve` binds a local HTTP listener and, per request, connects to
+            // the running daemon over its Unix socket for a fresh `DaemonStatus`
+            // snapshot (Issue #4391), so it needs the async runtime.
+            Commands::Serve {
+                port,
+                bind,
+                allow_non_loopback,
+            } => handle_serve_command(port, &bind, allow_non_loopback).await,
             // `restart` connects to the running daemon over its Unix socket to
             // trigger the supervised restart primitive (Issue #4054), or a
             // scheduled drain-and-restart (Issue #4090).
@@ -2140,6 +2186,12 @@ fn handle_cli_command(command: Commands) -> Result<()> {
             // socket round-trip), never dispatched through this sync handler.
             unreachable!("Restart is handled in main() before handle_cli_command")
         }
+        Commands::Serve { .. } => {
+            // Routed directly in `main()` (it needs the async runtime for the
+            // HTTP listener + socket round-trips), never dispatched through
+            // this sync handler.
+            unreachable!("Serve is handled in main() before handle_cli_command")
+        }
         Commands::Init {
             workspace,
             defaults,
@@ -3073,6 +3125,33 @@ fn collect_token_usage(tokens_dir: Option<&Path>) -> Option<serde_json::Value> {
     };
     let report = check::run_check(&tokens_dir, &opts, &CurlTransport);
     Some(report.to_json())
+}
+
+/// Handle the `serve` subcommand (Issue #4391, dashboard phase 1 of #4329):
+/// validate the requested bind address against the non-negotiable security
+/// posture (loopback by default; non-loopback requires the explicit
+/// `--allow-non-loopback` opt-in; a wildcard bind is refused unconditionally
+/// — see [`serve::validate_bind`]), bind the TCP listener, and hand off to
+/// [`serve::run`] for the accept loop. Each request re-fetches a fresh
+/// snapshot over the daemon's existing Unix socket — this function never
+/// touches daemon state directly.
+async fn handle_serve_command(port: u16, bind: &str, allow_non_loopback: bool) -> Result<()> {
+    let addr: std::net::IpAddr = bind
+        .parse()
+        .map_err(|e| anyhow!("invalid --bind address {bind:?}: {e}"))?;
+    serve::validate_bind(addr, allow_non_loopback).map_err(|e| anyhow!(e))?;
+
+    let socket_path = resolve_socket_path()?;
+    let listener = tokio::net::TcpListener::bind((addr, port))
+        .await
+        .map_err(|e| anyhow!("failed to bind {addr}:{port}: {e}"))?;
+    let local_addr = listener.local_addr()?;
+    println!(
+        "loom-daemon serve: listening on http://{local_addr}/api/status (proxying {})",
+        socket_path.display()
+    );
+
+    serve::run(listener, socket_path).await
 }
 
 /// Handle the `status` subcommand — render the running daemon's autonomous-mode
