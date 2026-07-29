@@ -1005,6 +1005,16 @@ where
                 );
                 continue;
             }
+            // Shared GitHub rate limit exhausted (#4429): a role session
+            // spawned now would burn a token slot just to fail its own gh
+            // calls against the same wall — skip until the window resets.
+            if crate::rate_limit_breaker::global_is_suppressed() {
+                log::debug!(
+                    "role_runner: {} tick skipped — rate-limit cooldown (#4429)",
+                    spec.name
+                );
+                continue;
+            }
             let name = spec.name;
             let prompt = spec.prompt;
             // Shared in-progress guard (#4364): skip this interval tick if an
@@ -1104,6 +1114,16 @@ pub fn spawn_multi_role_task(
             if drain.load(std::sync::atomic::Ordering::Relaxed) {
                 log::debug!(
                     "role_runner: {} multi-workspace tick skipped — drain in progress",
+                    spec.name
+                );
+                continue;
+            }
+            // Shared GitHub rate limit exhausted (#4429): a role session
+            // spawned now would burn a token slot just to fail its own gh
+            // calls against the same wall — skip until the window resets.
+            if crate::rate_limit_breaker::global_is_suppressed() {
+                log::debug!(
+                    "role_runner: {} multi-workspace tick skipped — rate-limit cooldown (#4429)",
                     spec.name
                 );
                 continue;

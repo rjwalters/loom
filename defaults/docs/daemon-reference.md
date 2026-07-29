@@ -1977,6 +1977,10 @@ concurrency ceiling 5" and share it with the team:
       "sustainTicks": 3,
       "cooldownSecs": 300
     },
+    "rateLimitBreaker": {
+      "enabled": true,
+      "fallbackCooldownSecs": 900
+    },
     "mainHealthGate": {
       "enabled": true
     },
@@ -2030,6 +2034,8 @@ exactly like `main_health_gate::read_build_gate_config`.
 | `autonomous.hostBreaker.loadPerCoreTrip` | `LOOM_HOST_BREAKER_LOAD_PER_CORE` | `2.5` | Load-per-core at/over which a tick counts toward tripping. `<= 0`/invalid → default |
 | `autonomous.hostBreaker.sustainTicks` | `LOOM_HOST_BREAKER_SUSTAIN_TICKS` | `3` | Consecutive over-threshold work-finder ticks required to trip (a single spike never trips). Zero/invalid → default |
 | `autonomous.hostBreaker.cooldownSecs` | `LOOM_HOST_BREAKER_COOLDOWN_SECS` | `300` | Cool-down window held after distress subsides before dispatch resumes. Zero/invalid → default |
+| `autonomous.rateLimitBreaker.enabled` | `LOOM_RATE_LIMIT_BREAKER` | `true` | GitHub rate-limit circuit breaker on/off (#4429). A safety backstop — **defaults on**. Env truthy enables, any other value disables; wins over config. See [GitHub rate-limit circuit breaker](#github-rate-limit-circuit-breaker-4429) below |
+| `autonomous.rateLimitBreaker.fallbackCooldownSecs` | `LOOM_RATE_LIMIT_BREAKER_FALLBACK_COOLDOWN_SECS` | `900` | Cooldown length when the `gh api rate_limit` reset probe fails. Zero/invalid → default; every computed cooldown is clamped to `[60, 3600]`s |
 | `autonomous.perTokenConcurrency` | `LOOM_PER_TOKEN_CONCURRENCY` | `2` | Concurrent sweeps **per healthy token** in the cap (#3947). Zero/invalid → default; clamped to a floor of 1 |
 | `autonomous.cpuUtilizationTarget` | `LOOM_CPU_UTILIZATION_TARGET` | `0.75` | Fraction of logical CPUs the CPU headroom term is willing to dedicate to sweep work (#3978, config surface #4032). Outside `(0, 1]` or wrong JSON type → default; single-root, resolved once at startup (not per-workspace) |
 | `autonomous.estCoresPerSweep` | `LOOM_EST_CORES_PER_SWEEP` | `2.0` | Estimated CPU cores one concurrent sweep consumes while building/testing (#3978, config surface #4032). `<= 0` or wrong JSON type → default; integer JSON (`2`) and float JSON (`2.0`) both accepted; single-root, resolved once at startup |
@@ -2290,6 +2296,36 @@ quarantine). To disable it entirely, set `LOOM_HOST_BREAKER=0` or
 minimal, per #4235): macOS-only trip signals (`.ips` crash reports, `syspolicyd`
 CPU-ratio amplification, daemon self-restart detection) and durable trip/release
 telemetry (coordinate with #4137 rather than building a parallel store).
+
+### GitHub rate-limit circuit breaker (#4429)
+
+The host breaker above protects the **host**; this breaker protects the
+**shared forge API budget**. Every fleet host authenticates as the same
+identity, so the REST/GraphQL rate limits are one fixed pool — and when it
+exhausted on 2026-07-29, every polling loop on every host kept firing its full
+per-tick call pattern for ~25 minutes (all failing), while role sessions were
+spawned straight into the same wall.
+
+The machine is simpler than the host breaker's — **Closed ⇄ Cooldown**, no
+sustain counter, because a rate-limit rejection is unambiguous:
+
+- Any gh polling failure whose stderr carries a rate-limit signature
+  (GraphQL primary, REST 403, secondary-limit phrasings) **trips** the
+  breaker. On trip, one `gh api rate_limit` probe — an endpoint that does
+  *not* count against the quota — learns the real reset epoch; the cooldown
+  runs to the latest exhausted resource's reset, clamped to `[60s, 3600s]`,
+  falling back to `fallbackCooldownSecs` when the probe fails.
+- While cooling, the work-finder, claim/quarantine reconciliation, epic
+  supervisor, and role-runner ticks **skip entirely** — zero gh calls, zero
+  doomed role spawns. Running sweeps are never touched.
+- The breaker **releases itself** on the first tick past the reset. Edges are
+  logged once each way and published as `daemon.rate_limit_breaker.state`
+  events; `loom-daemon status` shows the phase, the tripping loop, the resume
+  deadline, and the last-probed budget.
+
+To disable it entirely, set `LOOM_RATE_LIMIT_BREAKER=0` or
+`autonomous.rateLimitBreaker.enabled = false` (the pre-#4429
+hammer-through-exhaustion behavior).
 
 ### Cross-host dispatch-collision baseline (#4085, Phase 0 of #4028)
 

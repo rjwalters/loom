@@ -628,6 +628,16 @@ pub fn run_reconciliation_pass(fallback_root: &Path) {
         log::info!("claim_reconciliation: pass disabled ({RECONCILE_ENABLED_ENV}=0)");
         return;
     }
+    // Shared GitHub rate limit exhausted (#4429): every workspace's listing
+    // would fail (and a rate-limited pass is indistinguishable from "nothing
+    // to reclaim" in the return values), so skip the whole pass — the next
+    // interval tick retries after the window resets.
+    if crate::rate_limit_breaker::global_is_suppressed() {
+        log::info!(
+            "claim_reconciliation: pass skipped — shared GitHub API rate limit exhausted (#4429)"
+        );
+        return;
+    }
     let workspace_registry =
         crate::workspace_registry::WorkspaceRegistry::load_default().unwrap_or_default();
     let roots = workspace_registry.effective_roots(fallback_root);
@@ -822,6 +832,10 @@ pub mod forge {
             Ok(v) => v,
             Err(e) => {
                 log::warn!("claim_reconciliation: {}: {e}", root.display());
+                crate::rate_limit_breaker::global_observe_failure(
+                    &e.to_string(),
+                    "claim_reconciliation",
+                );
                 return (0, 0);
             }
         };
@@ -1114,6 +1128,10 @@ pub mod forge {
                 Ok(v) => v,
                 Err(e) => {
                     log::warn!("claim_reconciliation: {}: {e}", root.display());
+                    crate::rate_limit_breaker::global_observe_failure(
+                        &e.to_string(),
+                        "claim_reconciliation",
+                    );
                     continue;
                 }
             };
