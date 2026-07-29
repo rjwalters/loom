@@ -660,6 +660,46 @@ The discriminator is deliberately narrow so a genuinely failing build still halt
 **any other non-zero exit is trusted as VERIFIED_RED** — `cargo test`'s 101 for a
 failing test still halts dispatch.
 
+### Dirty-tree ignore classes (#3950, #4332)
+
+`dirty-tree` only fires on **non-ignorable** local changes — `is_ignorable_dirt`
+(`loom-daemon/src/main_health_gate.rs`) excludes several known-safe classes before
+deciding the workspace needs a `Skip`:
+
+| Class | What it covers |
+|-------|-----------------|
+| Loom-owned transient paths (#3778/#3950) | `.loom/sweep-checkpoint/`, `.loom/tokens/`, `.loom/logs/`, `.loom/worktrees/`, … — the daemon's own runtime bookkeeping |
+| Regenerable lockfiles (#3950) | `package-lock.json`, `Cargo.lock`, `pnpm-lock.yaml`, `yarn.lock`, `uv.lock` (matched by basename anywhere in the tree) |
+| Re-stamped install manifest (#4239, #4332) | `.loom/install-metadata.json` exactly — generated + re-stamped by every `resync-installed.sh` run, no `defaults/` source to byte-match against |
+| Installed-surface byte-match (#4332) | `.loom/hooks/`, `.loom/scripts/`, `.loom/roles/`, `.loom/docs/`, `.loom/bin/`, `.claude/commands/loom/` — ignorable **iff** the dirty file's content byte-matches its tracked `defaults/` counterpart in the same worktree (loom-repo-scoped; a consumer repo has no local `defaults/` tree, so this class never applies there) |
+
+The installed-surface class exists because this repo dogfoods its own install:
+`resync-installed.sh` (`.loom/docs/troubleshooting.md` → *Overnight / long-running
+orchestration*) refreshes the tracked `.loom/…` / `.claude/commands/loom/` copies
+from `defaults/…` whenever they drift, and that refresh itself leaves the tree
+dirty until committed. Without this class, every resync produced tracked-file dirt
+the gate could not distinguish from an operator hand-edit, so it skipped every
+cycle as `dirty-tree` — a permanently blinded gate, not a one-off. Byte-matching
+against `defaults/` is the safety property: an operator hand-edit to an installed
+copy cannot byte-match content it was never copied from, so it still reports
+`dirty-tree` as before; only provable resync output is ignored. A `defaults/…`
+SOURCE-side edit is never in this class's domain either way (only the *installed*
+copy maps to its source, not the reverse), so editing `defaults/docs/x.md`
+directly and then resyncing still correctly skips the gate on that edit.
+
+`resync-installed.sh` also prints the exact `git add … && git commit` command in
+its summary when a run leaves the tree dirty with nothing but this kind of resync
+output — worth running so the dirt doesn't linger indefinitely (ignorable ≠
+committed; the gate proceeds either way, but an uncommitted resync is still a
+correctness gap in the repo's history).
+
+`defaults/scripts/check-main-clean.sh` (the sweep-lifecycle backstop for builder
+contamination on `main`, #2802/#3513) deliberately does **not** adopt this
+byte-match class — see the divergence note in its header and in
+`INSTALLED_SURFACE_PREFIXES`'s doc comment. That script protects a different
+property (a builder wrote into the main worktree by mistake) where a byte-match
+could mask a real, if rare, contamination bug.
+
 ### Forge-CI corroboration of a local red
 
 A local run can also fail *because of the host it runs on*: on the incident host

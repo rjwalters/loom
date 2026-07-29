@@ -1607,14 +1607,75 @@ const BUILD_ARTIFACT_LOCKFILE_BASENAMES: &[&str] = &[
     "uv.lock",
 ];
 
-/// Whether `path` (a repo-relative path from `git status --porcelain`) is
-/// ignorable dirt for the gate's dirty-tree check — either a Loom-owned
-/// transient path ([`LOOM_OWNED_PREFIXES`]) or a common regenerable lockfile
-/// ([`BUILD_ARTIFACT_LOCKFILE_BASENAMES`]). Ignorable dirt is dirt a hard
-/// reset to `origin/main` safely discards (it is either untracked Loom
-/// runtime state or a tracked file whose content the reset will overwrite
-/// anyway) — never a reason to skip the sync step.
-fn is_ignorable_dirt(path: &str) -> bool {
+/// The daemon's own re-stamped install-manifest (#4239): rewritten by every
+/// `resync-installed.sh` run and has no `defaults/` source counterpart (it is
+/// generated, not copied), so it cannot be classified by the byte-match rule
+/// below — it is ignorable by exact path instead. A hard reset merely reverts
+/// its stamps, which the next resync rewrites anyway.
+const INSTALL_METADATA_PATH: &str = ".loom/install-metadata.json";
+
+/// Installed↔source surface mapping (#4332) for the loom repo's own
+/// dogfooded install: each installed prefix's tracked, edited-upstream
+/// counterpart lives under `defaults/`. Mirrors the exact surface table
+/// `resync-installed.sh` walks (`defaults/scripts/resync-installed.sh`,
+/// search `widened pure-copy surfaces`) — **not** a uniform prefix rewrite:
+/// `.loom/bin/` and `.claude/commands/loom/` map into
+/// `defaults/.loom/bin/` and `defaults/.claude/commands/loom/`
+/// respectively, while the others map straight into `defaults/<name>/`.
+/// Only meaningful in a repo that carries a local `defaults/` tree (the loom
+/// repo itself); a consumer install has no `defaults/` dir so the byte-match
+/// lookup below always misses and classification is unchanged (#4332 is
+/// loom-repo-scoped by construction).
+///
+/// This class is intentionally **not** mirrored into
+/// `defaults/scripts/check-main-clean.sh`'s `LOOM_OWNED_PREFIXES` — see the
+/// divergence note in that script's header (#4332). That script protects a
+/// different property (catching a *builder* writing into the main worktree
+/// by mistake, not classifying resync output for the dispatch gate), so a
+/// byte-match there could mask real contamination instead of only ignoring
+/// safe, known-regenerable dirt.
+const INSTALLED_SURFACE_PREFIXES: &[(&str, &str)] = &[
+    (".loom/hooks/", "defaults/hooks/"),
+    (".loom/scripts/", "defaults/scripts/"),
+    (".loom/roles/", "defaults/roles/"),
+    (".loom/docs/", "defaults/docs/"),
+    (".loom/bin/", "defaults/.loom/bin/"),
+    (".claude/commands/loom/", "defaults/.claude/commands/loom/"),
+];
+
+/// If `path` falls under one of [`INSTALLED_SURFACE_PREFIXES`], return its
+/// `defaults/`-relative source counterpart path. `defaults/` source paths
+/// themselves are deliberately **not** in the mapping's domain — this only
+/// ever maps *installed* copies to their source, never the reverse, so a
+/// dirty `defaults/docs/x.md` (an operator editing the source directly)
+/// never matches here and stays non-ignorable.
+fn installed_surface_defaults_counterpart(path: &str) -> Option<String> {
+    INSTALLED_SURFACE_PREFIXES
+        .iter()
+        .find_map(|(installed, defaults)| {
+            path.strip_prefix(installed)
+                .map(|rest| format!("{defaults}{rest}"))
+        })
+}
+
+/// Whether `path` (a repo-relative path from `git status --porcelain`, rooted
+/// at `repo_root`) is ignorable dirt for the gate's dirty-tree check:
+///
+/// - a Loom-owned transient path ([`LOOM_OWNED_PREFIXES`]),
+/// - a common regenerable lockfile ([`BUILD_ARTIFACT_LOCKFILE_BASENAMES`]),
+/// - the re-stamped install manifest ([`INSTALL_METADATA_PATH`]), or
+/// - an installed-surface path (#4332,
+///   [`installed_surface_defaults_counterpart`]) whose content byte-matches
+///   its `defaults/` source counterpart — i.e. provably `resync-installed.sh`
+///   output, not an operator hand-edit (a hand-edit cannot byte-match the
+///   source it was never copied from).
+///
+/// Ignorable dirt is dirt a hard reset to `origin/main` safely discards (it
+/// is either untracked Loom runtime state or a tracked file whose content the
+/// reset will overwrite anyway, or — for the byte-match class — content
+/// identical to what's already committed under `defaults/`) — never a reason
+/// to skip the sync step.
+fn is_ignorable_dirt(path: &str, repo_root: &Path) -> bool {
     let loom_owned = LOOM_OWNED_PREFIXES.iter().any(|prefix| {
         if prefix.ends_with('/') {
             path.starts_with(prefix)
@@ -1626,15 +1687,30 @@ fn is_ignorable_dirt(path: &str) -> bool {
         return true;
     }
     let basename = path.rsplit('/').next().unwrap_or(path);
-    BUILD_ARTIFACT_LOCKFILE_BASENAMES.contains(&basename)
+    if BUILD_ARTIFACT_LOCKFILE_BASENAMES.contains(&basename) {
+        return true;
+    }
+    if path == INSTALL_METADATA_PATH {
+        return true;
+    }
+    if let Some(counterpart) = installed_surface_defaults_counterpart(path) {
+        if let (Ok(dirty_bytes), Ok(source_bytes)) =
+            (std::fs::read(repo_root.join(path)), std::fs::read(repo_root.join(&counterpart)))
+        {
+            return dirty_bytes == source_bytes;
+        }
+    }
+    false
 }
 
 /// Parse `git status --porcelain` v1 `output` and return the lines that are
 /// **not** ignorable dirt ([`is_ignorable_dirt`]) — the lines that must still
 /// be treated as "the workspace is dirty" for the gate's sync-before-run
 /// check. Rename lines (`R  old -> new`) are keyed on the new path. Empty
-/// lines are dropped.
-fn non_ignorable_dirt(output: &str) -> Vec<&str> {
+/// lines are dropped. `repo_root` backs the installed-surface byte-match
+/// check (#4332), which reads both the dirty path and its `defaults/`
+/// counterpart off disk.
+fn non_ignorable_dirt<'a>(output: &'a str, repo_root: &Path) -> Vec<&'a str> {
     output
         .lines()
         .filter(|line| !line.is_empty())
@@ -1642,7 +1718,7 @@ fn non_ignorable_dirt(output: &str) -> Vec<&str> {
             let path = line.get(3..).unwrap_or("");
             let path = path.rsplit(" -> ").next().unwrap_or(path);
             let path = path.trim_matches('"');
-            !is_ignorable_dirt(path)
+            !is_ignorable_dirt(path, repo_root)
         })
         .collect()
 }
@@ -1788,7 +1864,7 @@ pub fn prepare_workspace_to_origin_main(repo_root: &Path) -> PrepOutcome {
     // discards, not operator edits worth protecting.
     match git_status_porcelain(repo_root) {
         Ok(out) => {
-            let unexpected = non_ignorable_dirt(&out);
+            let unexpected = non_ignorable_dirt(&out, repo_root);
             if !unexpected.is_empty() {
                 // Name the exact `git status --porcelain` lines, and the root
                 // they were read from, so the claim is checkable against
@@ -3983,44 +4059,147 @@ mod tests {
 
     #[test]
     fn test_is_ignorable_dirt_loom_owned_prefixes() {
-        assert!(is_ignorable_dirt(".loom/logs/sweep-issue-1.log"));
-        assert!(is_ignorable_dirt(".loom/worktrees/issue-42/foo.rs"));
-        assert!(is_ignorable_dirt(".loom/tokens/agent-1.token"));
-        assert!(is_ignorable_dirt(".loom/sweep-checkpoint/issue-1.json"));
-        assert!(is_ignorable_dirt(".loom/accounts.env"));
-        assert!(is_ignorable_dirt(".loom-managed"));
+        let repo_root = tempfile::tempdir().unwrap();
+        let repo_root = repo_root.path();
+        assert!(is_ignorable_dirt(".loom/logs/sweep-issue-1.log", repo_root));
+        assert!(is_ignorable_dirt(".loom/worktrees/issue-42/foo.rs", repo_root));
+        assert!(is_ignorable_dirt(".loom/tokens/agent-1.token", repo_root));
+        assert!(is_ignorable_dirt(".loom/sweep-checkpoint/issue-1.json", repo_root));
+        assert!(is_ignorable_dirt(".loom/accounts.env", repo_root));
+        assert!(is_ignorable_dirt(".loom-managed", repo_root));
     }
 
     #[test]
     fn test_is_ignorable_dirt_lockfile_basenames() {
-        assert!(is_ignorable_dirt("mcp-loom/package-lock.json"));
-        assert!(is_ignorable_dirt("package-lock.json"));
-        assert!(is_ignorable_dirt("some/nested/dir/Cargo.lock"));
-        assert!(is_ignorable_dirt("pnpm-lock.yaml"));
+        let repo_root = tempfile::tempdir().unwrap();
+        let repo_root = repo_root.path();
+        assert!(is_ignorable_dirt("mcp-loom/package-lock.json", repo_root));
+        assert!(is_ignorable_dirt("package-lock.json", repo_root));
+        assert!(is_ignorable_dirt("some/nested/dir/Cargo.lock", repo_root));
+        assert!(is_ignorable_dirt("pnpm-lock.yaml", repo_root));
     }
 
     #[test]
     fn test_is_ignorable_dirt_rejects_unknown_paths() {
+        let repo_root = tempfile::tempdir().unwrap();
+        let repo_root = repo_root.path();
         // A genuine operator edit outside both lists must never be ignored.
-        assert!(!is_ignorable_dirt("src/main.rs"));
-        assert!(!is_ignorable_dirt("scratch.tmp"));
+        assert!(!is_ignorable_dirt("src/main.rs", repo_root));
+        assert!(!is_ignorable_dirt("scratch.tmp", repo_root));
         // A path that merely starts with ".loom" but isn't one of the listed
         // transient subtrees (e.g. a hypothetical ".loom/config.json" edit)
         // must NOT be ignored — only the explicitly listed prefixes count.
-        assert!(!is_ignorable_dirt(".loom/config.json"));
+        assert!(!is_ignorable_dirt(".loom/config.json", repo_root));
     }
 
     #[test]
     fn test_non_ignorable_dirt_filters_porcelain_lines() {
+        let repo_root = tempfile::tempdir().unwrap();
         let status = "?? .loom/logs/foo.log\n M mcp-loom/package-lock.json\n M src/main.rs\n";
-        let remaining = non_ignorable_dirt(status);
+        let remaining = non_ignorable_dirt(status, repo_root.path());
         assert_eq!(remaining, vec![" M src/main.rs"]);
     }
 
     #[test]
     fn test_non_ignorable_dirt_empty_when_all_ignorable() {
+        let repo_root = tempfile::tempdir().unwrap();
         let status = "?? .loom/logs/foo.log\n M package-lock.json\n";
-        assert!(non_ignorable_dirt(status).is_empty());
+        assert!(non_ignorable_dirt(status, repo_root.path()).is_empty());
+    }
+
+    // ===================================================================
+    // Installed-surface byte-match class (#4332) — a dirty installed-surface
+    // path (`.loom/hooks/`, `.loom/scripts/`, `.loom/roles/`, `.loom/docs/`,
+    // `.loom/bin/`, `.claude/commands/loom/`) is ignorable IFF its
+    // `defaults/` counterpart exists and byte-matches: provably
+    // `resync-installed.sh` output, never an operator hand-edit.
+    // ===================================================================
+
+    /// Write `content` to `repo_root`-relative `rel`, creating parent dirs.
+    fn write_rel(repo_root: &Path, rel: &str, content: &str) {
+        let path = repo_root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
+
+    #[test]
+    fn test_is_ignorable_dirt_installed_surface_byte_match() {
+        let repo = tempfile::tempdir().unwrap();
+        let repo_root = repo.path();
+        write_rel(repo_root, "defaults/docs/foo.md", "resynced content\n");
+        write_rel(repo_root, ".loom/docs/foo.md", "resynced content\n");
+        assert!(
+            is_ignorable_dirt(".loom/docs/foo.md", repo_root),
+            "byte-identical installed copy of a tracked defaults/ source is provably resync output"
+        );
+    }
+
+    /// AC4 pin: an installed-surface path whose content DIFFERS from its
+    /// `defaults/` counterpart is a genuine operator edit (or an
+    /// out-of-sync tree) and must never be ignored.
+    #[test]
+    fn test_is_ignorable_dirt_installed_surface_content_mismatch_stays_non_ignorable() {
+        let repo = tempfile::tempdir().unwrap();
+        let repo_root = repo.path();
+        write_rel(repo_root, "defaults/docs/foo.md", "source content\n");
+        write_rel(repo_root, ".loom/docs/foo.md", "operator edit\n");
+        assert!(
+            !is_ignorable_dirt(".loom/docs/foo.md", repo_root),
+            "content that diverges from defaults/ must not be assumed to be resync output"
+        );
+    }
+
+    #[test]
+    fn test_is_ignorable_dirt_install_metadata_exact_path() {
+        let repo = tempfile::tempdir().unwrap();
+        let repo_root = repo.path();
+        // No defaults/ counterpart needed — install-metadata.json is
+        // generated + re-stamped, not copied.
+        assert!(is_ignorable_dirt(".loom/install-metadata.json", repo_root));
+    }
+
+    /// Consumer-repo no-op: a repo with no local `defaults/` dir at all
+    /// cannot resolve the installed-surface mapping, so classification of an
+    /// installed-surface path is unchanged (non-ignorable) — this fix is
+    /// loom-repo-scoped by construction.
+    #[test]
+    fn test_is_ignorable_dirt_no_defaults_dir_leaves_classification_unchanged() {
+        let repo = tempfile::tempdir().unwrap();
+        let repo_root = repo.path();
+        write_rel(repo_root, ".loom/docs/foo.md", "some content\n");
+        // Deliberately no defaults/docs/foo.md.
+        assert!(!is_ignorable_dirt(".loom/docs/foo.md", repo_root));
+    }
+
+    /// Safety property: a `defaults/` SOURCE-side edit must remain
+    /// non-ignorable even when the installed copy it produced still
+    /// byte-matches — the installed-surface mapping only ever maps installed
+    /// paths to their source, never the reverse, so an operator editing
+    /// `defaults/docs/x.md` directly and then running resync still shows the
+    /// gate a real, unignorable change (the `defaults/` file itself).
+    #[test]
+    fn test_is_ignorable_dirt_defaults_source_edit_stays_non_ignorable() {
+        let repo = tempfile::tempdir().unwrap();
+        let repo_root = repo.path();
+        write_rel(repo_root, "defaults/docs/x.md", "operator's new content\n");
+        write_rel(repo_root, ".loom/docs/x.md", "operator's new content\n");
+        assert!(
+            !is_ignorable_dirt("defaults/docs/x.md", repo_root),
+            "the defaults/ source file itself is never in the installed-surface mapping's domain"
+        );
+    }
+
+    /// Edge case: an UNTRACKED installed file (e.g. a brand-new doc synced by
+    /// resync but not yet `git add`-ed) that byte-matches a tracked
+    /// `defaults/` counterpart is ignorable the same as a modified one.
+    #[test]
+    fn test_non_ignorable_dirt_untracked_installed_surface_byte_match() {
+        let repo = tempfile::tempdir().unwrap();
+        let repo_root = repo.path();
+        write_rel(repo_root, "defaults/docs/new.md", "new doc\n");
+        write_rel(repo_root, ".loom/docs/new.md", "new doc\n");
+        let status = "?? .loom/docs/new.md\n";
+        assert!(non_ignorable_dirt(status, repo_root).is_empty());
     }
 
     /// AC1(a): a workspace with ONLY Loom-owned transient paths dirty must NOT
@@ -4097,6 +4276,66 @@ mod tests {
             outcome,
             PrepOutcome::Ready,
             "a lone modified lockfile must not block the gate, got {outcome:?}"
+        );
+    }
+
+    /// AC (#4332): after a `resync-installed.sh`-shaped change — a tracked
+    /// installed-surface file rewritten to byte-match its `defaults/`
+    /// source, with no other edits — the gate must proceed to `Ready`
+    /// instead of `Skip { class: DirtyTree, .. }`.
+    #[test]
+    fn test_prepare_ignores_resync_shaped_installed_surface_dirt() {
+        let (_origin, clone) = make_origin_and_clone();
+        std::fs::create_dir_all(clone.path().join("defaults/docs")).unwrap();
+        std::fs::create_dir_all(clone.path().join(".loom/docs")).unwrap();
+        std::fs::write(clone.path().join("defaults/docs/foo.md"), "old content\n").unwrap();
+        std::fs::write(clone.path().join(".loom/docs/foo.md"), "old content\n").unwrap();
+        Command::new("git")
+            .args(["add", "defaults/docs/foo.md", ".loom/docs/foo.md"])
+            .current_dir(clone.path())
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "seed installed surface"])
+            .current_dir(clone.path())
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["push", "origin", "main"])
+            .current_dir(clone.path())
+            .status()
+            .unwrap();
+
+        // Simulate a resync: the source under `defaults/` changed upstream
+        // (already committed) and the installed copy is refreshed to match —
+        // exactly what `resync-installed.sh` does, and exactly the dirt this
+        // issue is about.
+        std::fs::write(clone.path().join("defaults/docs/foo.md"), "new content\n").unwrap();
+        Command::new("git")
+            .args(["add", "defaults/docs/foo.md"])
+            .current_dir(clone.path())
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "update defaults/docs/foo.md"])
+            .current_dir(clone.path())
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["push", "origin", "main"])
+            .current_dir(clone.path())
+            .status()
+            .unwrap();
+        // The installed copy is now stale relative to the freshly-committed
+        // source — resync rewrites it to match, leaving it dirty (tracked,
+        // modified) but byte-identical to `defaults/docs/foo.md`.
+        std::fs::write(clone.path().join(".loom/docs/foo.md"), "new content\n").unwrap();
+
+        let outcome = prepare_workspace_to_origin_main(clone.path());
+        assert_eq!(
+            outcome,
+            PrepOutcome::Ready,
+            "resync-shaped installed-surface dirt (byte-identical to its defaults/ source) must not block the gate, got {outcome:?}"
         );
     }
 
