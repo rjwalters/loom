@@ -731,6 +731,12 @@ impl Drop for RoleRunGuard {
 pub struct IdleTrigger {
     prev_idle: HashMap<PathBuf, bool>,
     last_fired: HashMap<(PathBuf, &'static str), Instant>,
+    /// Roots for which a "disabled but onIdle configured" warning has
+    /// already been emitted (#4377) — the idle-path equivalent of the
+    /// interval loop's `missing_roots_warned` (#4326) dedup. Cleared for a
+    /// root the moment its role runner resolves enabled again, so a later
+    /// re-disable warns once more rather than staying silent forever.
+    disabled_warned: HashSet<PathBuf>,
 }
 
 impl IdleTrigger {
@@ -764,6 +770,14 @@ impl IdleTrigger {
     pub fn record_fired(&mut self, root: &Path, role: &'static str, now: Instant) {
         self.last_fired.insert((root.to_path_buf(), role), now);
     }
+
+    /// Whether a "disabled but onIdle configured" warning has already been
+    /// recorded for `root` (#4377) — test-observable dedup state; also the
+    /// hook a status/diagnostic surface could use without re-deriving it.
+    #[must_use]
+    pub fn disabled_warned(&self, root: &Path) -> bool {
+        self.disabled_warned.contains(root)
+    }
 }
 
 /// Decide which on-idle roles should fire for `root` right now, given this
@@ -776,7 +790,13 @@ impl IdleTrigger {
 ///    a tick that ends up not firing).
 /// 2. Bail on no edge, or on an active scheduled drain (#4090).
 /// 3. Bail when the role runner is disabled for this root
-///    ([`resolve_enabled`], precedence env > config > default).
+///    ([`resolve_enabled`], precedence env > config > default) — this is the
+///    **per-root** gate (#4377): it is resolved from `root`'s own
+///    `.loom/config.json`, independent of the daemon workspace's own master
+///    switch, which only decides whether the loops start at all. When
+///    `onIdle` roles are configured for `root` but the gate is off, this is
+///    the silent-no-op the issue exists to fix — see
+///    [`warn_if_idle_configured_but_disabled`].
 /// 4. Per configured on-idle role ([`resolve_on_idle_roles`]): skip if inside
 ///    the debounce window, or if an interval / idle run already holds the
 ///    in-progress guard; else record the fire and acquire the guard.
@@ -806,8 +826,12 @@ pub fn plan_idle_runs(
         return Vec::new();
     }
     if !resolve_enabled(config) {
+        warn_if_idle_configured_but_disabled(trigger, root, config);
         return Vec::new();
     }
+    // The root is enabled again — clear any stale disabled-warning so a
+    // later disable re-warns instead of staying silent forever (#4377).
+    trigger.disabled_warned.remove(root);
     let mut out = Vec::new();
     for spec in resolve_on_idle_roles(config) {
         if !trigger.debounce_ok(root, spec.name, now) {
@@ -833,6 +857,47 @@ pub fn plan_idle_runs(
         out.push((spec, guard));
     }
     out
+}
+
+/// Emit a warn-once-per-root line (#4377) when an idle edge fires for `root`
+/// while `onIdle` roles are configured there but the role runner is disabled
+/// for that root (`resolve_enabled` false). Before this the idle path bailed
+/// with **no log at any level** — every neighboring bail (drain, debounce,
+/// in-progress guard) already logs at `debug!`, so this was the fully-silent
+/// gap: a registered workspace with `onIdle` set but no
+/// `autonomous.roleRunner.enabled: true` in its own `.loom/config.json` got
+/// zero ticks and zero diagnostics.
+///
+/// A root with **no** `onIdle` roles configured stays silent here — disabled
+/// is that root's normal, unconfigured state, not a misconfiguration worth
+/// flagging on every idle edge. Dedup state lives on [`IdleTrigger`] (see
+/// [`IdleTrigger::disabled_warned`]) and is cleared the moment the root
+/// resolves enabled again ([`plan_idle_runs`]), so a later re-disable warns
+/// once more rather than staying silent forever.
+fn warn_if_idle_configured_but_disabled(
+    trigger: &mut IdleTrigger,
+    root: &Path,
+    config: &RoleRunnerConfig,
+) {
+    let on_idle = resolve_on_idle_roles(config);
+    if on_idle.is_empty() {
+        return;
+    }
+    if !trigger.disabled_warned.insert(root.to_path_buf()) {
+        return; // already warned for this root; stay quiet until it re-enables
+    }
+    log::warn!(
+        "role_runner: idle edge fired for {} with onIdle roles {:?} configured, but the role \
+         runner is disabled for this root (autonomous.roleRunner.enabled is false or absent in \
+         {}'s own .loom/config.json) — these roles will never fire here until \
+         autonomous.roleRunner.enabled=true is set in that root's own config; enablement is \
+         resolved per registered root, not inherited from the daemon workspace's master switch \
+         (#4377). This is a one-time warning for this root — see `loom-daemon status` for the \
+         current per-root state.",
+        root.display(),
+        on_idle.iter().map(|r| r.name).collect::<Vec<_>>(),
+        root.display(),
+    );
 }
 
 /// Observe `root`'s post-tick idle state and, on the idle edge, fire-and-forget
@@ -884,6 +949,18 @@ pub fn observe_and_fire_idle(
             }
         });
     }
+}
+
+/// Whether the interval loop ([`spawn_multi_role_task`]) should log a `WARN`
+/// (vs. a quieter, already-warned `DEBUG`) for `root` being disabled on this
+/// tick (#4377): `true` the first time `root` is newly inserted into
+/// `warned`, `false` on every subsequent tick until the caller removes it
+/// (which it does once `root` resolves enabled again). Pulled out as a pure
+/// function — mirroring [`classify_root_tick_log`] — so the warn-once dedup
+/// is unit-testable without a running loop or captured log output.
+#[must_use]
+fn should_warn_disabled_root(warned: &mut HashSet<PathBuf>, root: &Path) -> bool {
+    warned.insert(root.to_path_buf())
 }
 
 // ============================================================================
@@ -1009,6 +1086,14 @@ pub fn spawn_multi_role_task(
         // Per-root failing state (#4349), so a persistently failing tick logs
         // only on the fail edge and on recovery, not every tick.
         let mut failing_roots: HashMap<PathBuf, bool> = HashMap::new();
+        // Disabled-root warn-once state (#4377): the per-tick disabled-skip
+        // below is otherwise only a `debug!` — invisible at the default `info`
+        // level, so a registered root left disabled gets zero diagnostics.
+        // Same warn-once-then-dedup shape as `missing_roots_warned`, but
+        // without `filter_missing_roots`'s reset-every-tick semantics: an
+        // entry here is cleared only when its root resolves enabled again
+        // (see below), so re-disabling re-warns instead of staying silent.
+        let mut disabled_roots_warned: HashSet<PathBuf> = HashSet::new();
         loop {
             ticker.tick().await;
 
@@ -1041,14 +1126,40 @@ pub fn spawn_multi_role_task(
             for root in roots {
                 let config = read_role_runner_config(&root);
                 if !resolve_enabled(&config) {
-                    log::debug!(
-                        "role_runner: {} disabled for {} (autonomous.roleRunner.enabled=false or \
-                         LOOM_ROLE_RUNNER unset-falsy) — skipping",
-                        spec.name,
-                        root.display()
-                    );
+                    // Per-root gate (#4377): `enabled` is resolved from this
+                    // root's own `.loom/config.json`, independent of the
+                    // daemon workspace's master switch (which only decided
+                    // whether this loop started at all). First sighting warns
+                    // at `info`-visible `warn!`; repeats downgrade to
+                    // `debug!` so a persistently-disabled root does not spam
+                    // the log every tick forever.
+                    if should_warn_disabled_root(&mut disabled_roots_warned, &root) {
+                        log::warn!(
+                            "role_runner: {} disabled for {} — autonomous.roleRunner.enabled is \
+                             false or absent in that root's own .loom/config.json (enablement is \
+                             resolved per registered root, not inherited from the daemon \
+                             workspace's master switch, #4377); this root will receive zero {} \
+                             ticks until autonomous.roleRunner.enabled=true is set there (see \
+                             `loom-daemon status` for the current per-root state; further \
+                             identical skips for this root are logged at DEBUG until it \
+                             re-enables)",
+                            spec.name,
+                            root.display(),
+                            spec.name
+                        );
+                    } else {
+                        log::debug!(
+                            "role_runner: {} disabled for {} (autonomous.roleRunner.enabled=false \
+                             or LOOM_ROLE_RUNNER unset-falsy) — skipping (already warned above)",
+                            spec.name,
+                            root.display()
+                        );
+                    }
                     continue;
                 }
+                // The root resolved enabled again — clear any stale
+                // disabled-warning so a later disable re-warns (#4377).
+                disabled_roots_warned.remove(&root);
                 if !resolve_roles(&config).iter().any(|r| r.name == spec.name) {
                     log::debug!(
                         "role_runner: {} not in autonomous.roleRunner.roles for {} — skipping",
@@ -2124,6 +2235,183 @@ mod tests {
         assert!(plan_idle_runs(&mut t, &set, root, &cfg, false, false, now).is_empty());
         // Edge present, but role runner disabled => no fire.
         assert!(plan_idle_runs(&mut t, &set, root, &cfg, true, false, now).is_empty());
+        // #4377: onIdle is configured for this root, so the disabled-suppression
+        // must be observable, not silent.
+        assert!(t.disabled_warned(root), "onIdle configured + disabled must record a warning");
+    }
+
+    // ===================================================================
+    // #4377 — idle-path disabled-suppression is visible, not silent
+    // ===================================================================
+
+    #[test]
+    #[serial]
+    fn test_plan_idle_runs_disabled_without_on_idle_does_not_warn() {
+        // A root with no `onIdle` roles configured is disabled in its normal,
+        // unconfigured state — not a misconfiguration, so no warning.
+        std::env::remove_var(ROLE_RUNNER_ENABLE_ENV);
+        let mut t = IdleTrigger::new();
+        let set = new_in_progress_guard();
+        let root = Path::new("/tmp/loom-plan-no-onidle");
+        let cfg = RoleRunnerConfig {
+            enabled: Some(false),
+            roles: None,
+            interval_secs: None,
+            on_idle: None,
+        };
+        let now = Instant::now();
+        assert!(plan_idle_runs(&mut t, &set, root, &cfg, false, false, now).is_empty());
+        assert!(plan_idle_runs(&mut t, &set, root, &cfg, true, false, now).is_empty());
+        assert!(
+            !t.disabled_warned(root),
+            "no onIdle configured => disabled is normal, must not warn"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_plan_idle_runs_disabled_warning_dedupes_across_repeated_edges() {
+        std::env::remove_var(ROLE_RUNNER_ENABLE_ENV);
+        let mut t = IdleTrigger::new();
+        let set = new_in_progress_guard();
+        let root = Path::new("/tmp/loom-plan-dedupe");
+        let cfg = on_idle_config(Some(false), vec!["champion"]);
+        let t0 = Instant::now();
+        assert!(plan_idle_runs(&mut t, &set, root, &cfg, false, false, t0).is_empty());
+        // First edge: disabled, onIdle configured => warns.
+        assert!(plan_idle_runs(&mut t, &set, root, &cfg, true, false, t0).is_empty());
+        assert!(t.disabled_warned(root));
+        // Flap busy -> idle again: still disabled; the warning stays deduped
+        // (no observable way to detect a re-warn other than the state not
+        // regressing — the log line itself is the thing that must not repeat).
+        assert!(plan_idle_runs(
+            &mut t,
+            &set,
+            root,
+            &cfg,
+            false,
+            false,
+            t0 + Duration::from_secs(5)
+        )
+        .is_empty());
+        assert!(plan_idle_runs(
+            &mut t,
+            &set,
+            root,
+            &cfg,
+            true,
+            false,
+            t0 + Duration::from_secs(10)
+        )
+        .is_empty());
+        assert!(t.disabled_warned(root), "still deduped on the second edge");
+    }
+
+    #[test]
+    #[serial]
+    fn test_plan_idle_runs_disabled_warning_clears_once_enabled() {
+        std::env::remove_var(ROLE_RUNNER_ENABLE_ENV);
+        let mut t = IdleTrigger::new();
+        let set = new_in_progress_guard();
+        let root = Path::new("/tmp/loom-plan-clears");
+        let disabled_cfg = on_idle_config(Some(false), vec!["champion"]);
+        let enabled_cfg = on_idle_config(Some(true), vec!["champion"]);
+        let t0 = Instant::now();
+        assert!(plan_idle_runs(&mut t, &set, root, &disabled_cfg, false, false, t0).is_empty());
+        assert!(plan_idle_runs(&mut t, &set, root, &disabled_cfg, true, false, t0).is_empty());
+        assert!(t.disabled_warned(root));
+
+        // Root flips to enabled (hot-apply) well outside the debounce window.
+        assert!(plan_idle_runs(
+            &mut t,
+            &set,
+            root,
+            &enabled_cfg,
+            false,
+            false,
+            t0 + Duration::from_secs(70)
+        )
+        .is_empty());
+        let fire = plan_idle_runs(
+            &mut t,
+            &set,
+            root,
+            &enabled_cfg,
+            true,
+            false,
+            t0 + Duration::from_secs(80),
+        );
+        assert_eq!(fire.len(), 1, "enabled root must fire normally");
+        assert!(
+            !t.disabled_warned(root),
+            "warned flag must clear once the root resolves enabled"
+        );
+    }
+
+    /// Cross-config case (#4377 curated AC): a target root has `onIdle` set
+    /// but its own per-root `enabled` is absent (resolves `false`) —
+    /// independent of whatever the daemon's own workspace's master switch is
+    /// set to (the master switch only decides whether these loops start at
+    /// all, never a target root's own gate). `observe_and_fire_idle` is the
+    /// real entry point the work-finder loop calls, reading the root's own
+    /// on-disk config each tick — exercised here end-to-end rather than via
+    /// the already-parsed `RoleRunnerConfig` the other tests use.
+    #[test]
+    #[serial]
+    fn test_observe_and_fire_idle_cross_config_disabled_target_root_warns_and_suppresses() {
+        std::env::remove_var(ROLE_RUNNER_ENABLE_ENV);
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(tmp.path(), r#"{"autonomous": {"roleRunner": {"onIdle": ["champion"]}}}"#);
+        let mut trigger = IdleTrigger::new();
+        let in_progress = new_in_progress_guard();
+
+        observe_and_fire_idle(&mut trigger, &in_progress, tmp.path(), true, false); // boot idle: no edge
+        observe_and_fire_idle(&mut trigger, &in_progress, tmp.path(), false, false); // go busy: no edge
+        observe_and_fire_idle(&mut trigger, &in_progress, tmp.path(), true, false); // busy -> idle edge
+
+        assert!(
+            trigger.disabled_warned(tmp.path()),
+            "idle edge on a disabled-but-onIdle-configured root must record the warning"
+        );
+        assert!(
+            in_progress.lock().unwrap().is_empty(),
+            "a disabled root must never acquire/fire a run"
+        );
+
+        // A second flap must stay deduped — no panic, no re-fire, warned state
+        // holds (this is the "second edge does not re-warn" acceptance case).
+        observe_and_fire_idle(&mut trigger, &in_progress, tmp.path(), false, false);
+        observe_and_fire_idle(&mut trigger, &in_progress, tmp.path(), true, false);
+        assert!(trigger.disabled_warned(tmp.path()));
+        assert!(in_progress.lock().unwrap().is_empty());
+    }
+
+    // ===================================================================
+    // #4377 — interval-path disabled-root warn-once dedup
+    // ===================================================================
+
+    #[test]
+    fn test_should_warn_disabled_root_warns_once_then_dedupes_until_reenable() {
+        let mut warned: HashSet<PathBuf> = HashSet::new();
+        let root = PathBuf::from("/tmp/loom-interval-disabled-root");
+        assert!(
+            should_warn_disabled_root(&mut warned, &root),
+            "first sighting of a disabled root must warn"
+        );
+        assert!(
+            !should_warn_disabled_root(&mut warned, &root),
+            "repeat sighting must be deduped (downgraded to DEBUG by the caller)"
+        );
+        assert!(
+            !should_warn_disabled_root(&mut warned, &root),
+            "stays deduped across further ticks"
+        );
+        // Caller clears the entry once the root resolves enabled again.
+        warned.remove(&root);
+        assert!(
+            should_warn_disabled_root(&mut warned, &root),
+            "a re-disable after a re-enable must warn again"
+        );
     }
 
     #[test]

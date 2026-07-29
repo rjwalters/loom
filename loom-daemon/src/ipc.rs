@@ -1227,6 +1227,22 @@ pub fn build_daemon_status(
             // that is dispatching nothing is explained.
             (live, sr.quarantined_issues_sorted(), sr.unregistered_locked_issues())
         };
+        // Per-root role-runner enablement (#4377): resolved from this root's
+        // OWN `.loom/config.json`, never the daemon workspace's — the whole
+        // point of this status surface is that the two can legitimately
+        // differ (a registered workspace can be role-runner-disabled while
+        // the daemon's own workspace is enabled, or vice versa).
+        let role_runner_config = crate::role_runner::read_role_runner_config(root);
+        let role_runner_enabled = crate::role_runner::resolve_enabled(&role_runner_config);
+        let role_runner_roles = crate::role_runner::resolve_roles(&role_runner_config)
+            .iter()
+            .map(|spec| spec.name.to_string())
+            .collect();
+        let role_runner_on_idle_roles =
+            crate::role_runner::resolve_on_idle_roles(&role_runner_config)
+                .iter()
+                .map(|spec| spec.name.to_string())
+                .collect();
         per_repo.push(crate::types::RepoStatus {
             root: root.clone(),
             priority: workspace_registry.priority_of(root),
@@ -1245,6 +1261,15 @@ pub fn build_daemon_status(
             // without `workspace remove`) so `status` — not just the
             // work-finder log — points the operator at it.
             root_missing: !root.is_dir(),
+            // Load-aware deferral + tier label (#4259).
+            health_gate_deferred: health_states.is_deferred(root),
+            health_gate_deferred_reason: health_states.deferred_summary(root),
+            health_gate_verdict_tier: health_states
+                .gate_last_tier(root)
+                .map(|t| t.label().to_string()),
+            role_runner_enabled,
+            role_runner_roles,
+            role_runner_on_idle_roles,
         });
         in_flight.extend(live);
         unregistered_locked.extend(locked_unregistered.into_iter().map(|(issue, owner_pid)| {
@@ -1364,6 +1389,12 @@ pub fn build_daemon_status(
         main_health_gate_not_evaluated_reason: health_states.unevaluated_summary(fallback_root),
         main_health_gate_enabled: Some(crate::main_health_gate::effective_enabled(fallback_root)),
         main_health_gate_verdict_at: health_states.last_verdict_at(fallback_root),
+        // Load-aware deferral + tier label (#4259).
+        main_health_gate_deferred: health_states.is_deferred(fallback_root),
+        main_health_gate_deferred_reason: health_states.deferred_summary(fallback_root),
+        main_health_gate_verdict_tier: health_states
+            .gate_last_tier(fallback_root)
+            .map(|t| t.label().to_string()),
         capacity,
         per_repo,
         // Resolved once at daemon startup (#4005), threaded in read-only —
@@ -4502,6 +4533,9 @@ exit 0
             main_health_gate_not_evaluated_reason: None,
             main_health_gate_enabled: Some(true),
             main_health_gate_verdict_at: Some(chrono::Utc::now()),
+            main_health_gate_deferred: false,
+            main_health_gate_deferred_reason: None,
+            main_health_gate_verdict_tier: Some("full".to_string()),
             capacity: crate::types::CapacityReport {
                 ranking_present: true,
                 total_accounts: 4,
@@ -4521,6 +4555,12 @@ exit 0
                 health_gate_enabled: Some(true),
                 health_gate_verdict_at: Some(chrono::Utc::now()),
                 root_missing: false,
+                health_gate_deferred: false,
+                health_gate_deferred_reason: None,
+                health_gate_verdict_tier: Some("full".to_string()),
+                role_runner_enabled: true,
+                role_runner_roles: vec!["champion".to_string()],
+                role_runner_on_idle_roles: vec![],
             }],
             credential_preflight: Some(test_credential_preflight()),
             draining: false,

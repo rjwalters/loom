@@ -84,6 +84,34 @@ fi
 
 cd "$(git rev-parse --show-toplevel)"
 
+# Tiered gate mode (#4259). LOOM_BUILD_GATE_TIER selects the stage set:
+#
+#   - unset / "full" (the DEFAULT): the full three-stage suite below. CI parity,
+#     manual invocations, and the per-builder post-builder quality gate are all
+#     byte-for-byte unchanged when the variable is absent.
+#   - "fast": a cheap, bounded compile+smoke subset. The daemon's main-health
+#     gate selects this tier (by setting LOOM_BUILD_GATE_TIER=fast) when the host
+#     is saturated past the max-defer bound and the full suite would otherwise
+#     time out under concurrent-sweep contention (the #4020/#4084 recurrence).
+#
+# A fast-tier GREEN is NOT equivalent to a full-suite GREEN: it verifies only the
+# compile/startup breakage class (#3647 step-8 — a `cargo build --workspace` catch)
+# plus a Python import smoke, NOT the Rust unit tests, the pytest suite, or the
+# installer suite. See .loom/docs/build-gate.md "Tiered gate (#4259)".
+_gate_tier="${LOOM_BUILD_GATE_TIER:-full}"
+if [[ "${_gate_tier}" == "fast" ]]; then
+  echo "[build-gate] FAST tier (compile + smoke only — NOT a full-suite verdict, #4259)"
+  echo "[build-gate] cargo build --workspace --lib --bins (compile check — catches #3647 step-8-class breakage)"
+  cargo build --workspace --lib --bins
+  echo "[build-gate] python import smoke (loom_tools importable)"
+  (
+    cd loom-tools
+    uv run python -c "import loom_tools"
+  )
+  echo "[build-gate] fast tier passed (compile + import smoke)"
+  exit 0
+fi
+
 echo "[build-gate] cargo test --lib --bins (workspace unit tests; host-dependent integration targets are CI-only, #3985)"
 cargo test --workspace --lib --bins
 
