@@ -34,7 +34,32 @@ trap cleanup EXIT
 # ~/.loom/workspaces.json with paths that vanish on cleanup.
 FAKE_HOME="$TEST_DIR/home"
 mkdir -p "$FAKE_HOME"
-run_migrate() { HOME="$FAKE_HOME" bash "$MIGRATE" "$@"; }
+
+# A fake `claude` on PATH so the user-scope MCP verification (#4386) is hermetic
+# and deterministic: it never touches the real `claude mcp` registry. It records
+# add/remove into a state file under HOME and reports registration via `mcp get`.
+FAKE_BIN="$TEST_DIR/bin"
+mkdir -p "$FAKE_BIN"
+cat > "$FAKE_BIN/claude" <<'SH'
+#!/usr/bin/env bash
+# fake claude for migrate tests: simulate `claude mcp {get,add,remove}` at user scope.
+state="$HOME/.claude-mcp-loom"   # holds the registered entry path, if any
+case "${1:-} ${2:-}" in
+  "mcp get")
+    # `claude mcp get loom` — succeed (printing the entry) only once registered.
+    [[ -s "$state" ]] || exit 1
+    printf 'loom: node %s\n' "$(cat "$state")"; exit 0 ;;
+  "mcp add")
+    # args: mcp add --scope user loom -- node <entry>
+    printf '%s\n' "${*: -1}" > "$state"; exit 0 ;;
+  "mcp remove")
+    : > "$state"; exit 0 ;;
+esac
+exit 0
+SH
+chmod +x "$FAKE_BIN/claude"
+
+run_migrate() { PATH="$FAKE_BIN:$PATH" HOME="$FAKE_HOME" bash "$MIGRATE" "$@"; }
 
 # Build a fixture repo with a committed 0.12-style install.
 #   - manifest lists current-impl files, deprecated tombstones, a shim, and a
@@ -116,6 +141,25 @@ JSON
   echo 'log line'  > "$repo/.loom/logs/sweep.log"
   echo 'token'     > "$repo/.loom/tokens/acct.env"
   echo 'ckpt'      > "$repo/.loom/sweep-checkpoint/issue-1.json"
+
+  # A historical repo-scoped .mcp.json whose `loom` entry points into a long-dead
+  # worktree bundle (#4386 spawn-outage signature) alongside a per-repo safehouse
+  # server that must survive the strip. Untracked (generated artifact).
+  cat > "$repo/.mcp.json" <<JSON
+{
+  "mcpServers": {
+    "loom": {
+      "command": "node",
+      "args": [ "$repo/.loom/worktrees/issue-4188/mcp-loom/dist/index.js" ]
+    },
+    "safehouse": {
+      "command": "safehoused-client",
+      "args": [],
+      "env": { "SAFEHOUSED_SOCKET": "/tmp/sh.sock" }
+    }
+  }
+}
+JSON
 }
 
 echo "======================================"
@@ -195,6 +239,25 @@ if command -v jq >/dev/null 2>&1; then
   jq -e '.sweep.maxParallel == 3' "$A/.loom-project/project.json" >/dev/null 2>&1 \
      && pass "project.json keeps non-modelAliases sweep keys" \
      || fail "project.json dropped sweep.maxParallel"
+  # Host-local worktree.root must NOT land in the tracked, shared project.json
+  # (Judge blocker: it would propagate one operator's scratch-disk path to the
+  # team). It belongs in the gitignored .loom-local/local.json tier instead.
+  if jq -e 'has("worktree")' "$A/.loom-project/project.json" >/dev/null 2>&1; then
+    fail "project.json still contains worktree.root (host-local key leaked to tracked tier)"
+  else
+    pass "project.json excludes host-local worktree.root"
+  fi
+  if [[ -f "$A/.loom-local/local.json" ]] \
+     && jq -e '.worktree.root == "/mnt/scratch"' "$A/.loom-local/local.json" >/dev/null 2>&1; then
+    pass "worktree.root routed to .loom-local/local.json"
+  else
+    fail "worktree.root not written to .loom-local/local.json"
+  fi
+  # .loom-local/ must be gitignored (per-host tier), never tracked.
+  [[ -z "$(git -C "$A" ls-files -- .loom-local/local.json)" ]] \
+    && pass ".loom-local/local.json stays untracked" || fail ".loom-local/local.json was tracked"
+  grep -qF "/.loom-local/" "$A/.gitignore" \
+    && pass ".gitignore covers /.loom-local/" || fail ".gitignore missing /.loom-local/"
 else
   warn "jq unavailable — skipping project.json content assertions"
 fi
@@ -271,6 +334,25 @@ else
     && pass "workspace registration cleanly skipped (no daemon)" \
     || fail "missing-daemon path not handled"
 fi
+
+# 3l. stale repo-scoped `loom` .mcp.json entry stripped, safehouse preserved (#4386).
+if command -v jq >/dev/null 2>&1; then
+  if [[ -f "$A/.mcp.json" ]] \
+     && ! jq -e '.mcpServers.loom' "$A/.mcp.json" >/dev/null 2>&1 \
+     && jq -e '.mcpServers.safehouse' "$A/.mcp.json" >/dev/null 2>&1; then
+    pass "stale repo-scoped loom .mcp.json entry stripped, safehouse kept"
+  else
+    fail "repo-scoped loom .mcp.json entry not stripped (or safehouse lost)"
+  fi
+  grep -q "#4386 spawn-outage signature" "$TEST_DIR/apply.out" \
+    && pass "dead-worktree .mcp.json entry surfaced (#4386 note)" \
+    || fail "#4386 dead-worktree note not surfaced"
+fi
+
+# 3m. user-scope `loom` MCP registration added when absent (via the fake claude).
+grep -q "registered.*user-scope loom MCP\|user-scope loom MCP.*->" "$TEST_DIR/apply.out" \
+  && pass "user-scope loom MCP registration added" \
+  || fail "user-scope loom MCP registration not reported"
 echo ""
 
 # ==========================================================================
@@ -285,6 +367,9 @@ after="$(git -C "$A" status --porcelain)"
 [[ "$before" == "$after" ]] && pass "second apply is a no-op (clean tree)" || { fail "second apply mutated the tree"; git -C "$A" status --porcelain; }
 grep -q "already present" "$TEST_DIR/apply2.out" \
   && pass "second run reports project.json already present" || warn "no 'already present' note on rerun"
+grep -q "user-scope loom MCP.*already registered" "$TEST_DIR/apply2.out" \
+  && pass "second run reports user-scope loom MCP already registered" \
+  || warn "no 'already registered' MCP note on rerun"
 echo ""
 
 # ==========================================================================

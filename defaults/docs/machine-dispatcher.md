@@ -440,7 +440,14 @@ boundary no matter where it is invoked. What one pass does:
    — **excluding `sweep.modelAliases`**. That key's Rust/Python resolvers diverge;
    migrating it would freeze the divergence into every consumer repo, so it is
    left in the (lower-precedence, on-disk) legacy tier and reported as excluded.
-   An existing `project.json` is left untouched (idempotency).
+   **Host-local keys** (`worktree.root` — a per-host scratch-disk path) are routed
+   to the **gitignored** `.loom-local/local.json` (the resolver's `LOCAL_CONFIG_REL`
+   tier), *not* the tracked, shared `project.json`: since this same pass
+   `git rm --cached`s the legacy config, `project.json` becomes the highest tier
+   every fresh clone / CI run picks up, so a stray `worktree.root` there would
+   silently propagate one operator's filesystem layout to the whole team. An
+   existing `project.json` is left untouched (idempotency); an existing
+   `local.json` override is preserved (only a missing `worktree.root` is filled in).
 3. **Untrack the committed implementation** per the manifest — `git rm --cached`
    (files stay on disk, just leave the index) + a gitignore block single-sourced
    with `install-loom.sh --local`. Only the machine-served namespaces (`/.loom/`,
@@ -458,7 +465,20 @@ boundary no matter where it is invoked. What one pass does:
    `.loom/sweep-checkpoint/`, `.loom/tokens/`) and the `loom.sh` / `.loom/bin/loom`
    shims are never touched, so `./loom.sh` and the per-repo pool manager keep
    working.
-6. **Register** the repo via `loom-daemon workspace add … --priority N` (skipped
+6. **Repair the MCP wiring** (#4386). A historical repo can carry a repo-scoped
+   `.mcp.json` whose `loom` server entry points into a long-dead worktree bundle
+   (e.g. `.loom/worktrees/issue-N/mcp-loom/dist/index.js`). Because Claude Code MCP
+   precedence is **local > project > user**, that repo-scoped entry silently
+   *shadows* the machine-level user-scope server — and when its path is a dead
+   worktree it kills every daemon-dispatched child at the claude-wrapper MCP
+   pre-flight (a fleet-wide spawn outage with no surfaced error). Migration strips
+   any repo-scoped `loom` entry from `.mcp.json` (deleting the file if `loom` was
+   its only server; other servers such as `safehouse` are kept — matching
+   `setup-mcp.sh`'s #4230 migration), then **verifies the user-scope `loom`
+   registration** exists and points at the machine checkout's
+   `mcp-loom/dist/index.js`, `claude mcp add --scope user`-ing it if absent or
+   mis-pointed (skipped with a clear note when the `claude` CLI is not on PATH).
+7. **Register** the repo via `loom-daemon workspace add … --priority N` (skipped
    with a clear note when `loom-daemon` is not on PATH), **re-stamp**
    `.loom/install-metadata.json` (`loom_version`, `loom_commit`,
    `migrated_to_machine_model`, `install_model`), and **refresh** the CLAUDE.md

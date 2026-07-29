@@ -220,14 +220,24 @@ mc_read_manifest() {
 
 # ── config extraction (scope guard 1: exclude sweep.modelAliases) ─────────────
 
-# mc_extract_config <repo> <dry_run> — write tracked .loom-project/project.json
-# from legacy .loom/config.json minus sweep.modelAliases. Idempotent: an existing
-# project.json is left untouched.
+# mc_extract_config <repo> <dry_run> — split legacy .loom/config.json into the two
+# resolver tiers the daemon model uses (config_resolver.rs):
+#   - tracked .loom-project/project.json  (PROJECT_CONFIG_REL — shared team policy)
+#       minus sweep.modelAliases (scope guard 1) AND minus host-local keys.
+#   - gitignored .loom-local/local.json   (LOCAL_CONFIG_REL — per-host override)
+#       carries the host-local keys (worktree.root — a per-host scratch-disk path).
+# Routing host-local keys OUT of the tracked tier is load-bearing: since this same
+# pass `git rm --cached`s the legacy .loom/config.json, project.json becomes the
+# highest tier every fresh clone / CI run picks up — copying worktree.root there
+# would silently propagate one operator's filesystem layout to the whole team.
+# Idempotent: an existing project.json short-circuits (leaves both tiers untouched).
 mc_extract_config() {
     local repo="$1" dry_run="$2"
     local legacy="$repo/.loom/config.json"
     local project_dir="$repo/.loom-project"
     local project="$project_dir/project.json"
+    local local_dir="$repo/.loom-local"
+    local localcfg="$local_dir/local.json"
 
     if [[ -f "$project" ]]; then
         mc_report skipped ".loom-project/project.json" "already present"
@@ -242,33 +252,68 @@ mc_extract_config() {
         return 1
     fi
 
-    # Surface host-local-looking keys the operator may prefer in .loom-local/.
-    local wr
+    # Host-local-looking keys routed to the gitignored .loom-local/local.json tier
+    # instead of the tracked, shared project.json. worktree.root is the only one
+    # detected today; add more jq paths here as they are identified.
+    local wr have_local=0
     wr="$(jq -r '.worktree.root // empty' "$legacy" 2>/dev/null || true)"
     if [[ -n "$wr" ]]; then
-        mc_report surfaced ".loom/config.json" "worktree.root=$wr is host-local; kept on disk (legacy tier) and copied to project.json"
+        have_local=1
+        mc_report surfaced ".loom/config.json" "worktree.root=$wr is host-local → .loom-local/local.json (NOT the tracked project.json)"
     fi
     if jq -e '.sweep.modelAliases' "$legacy" >/dev/null 2>&1; then
         mc_report surfaced "sweep.modelAliases" "EXCLUDED from project.json (Rust/Python resolver divergence — scope guard 1)"
     fi
 
     if [[ "$dry_run" == "1" ]]; then
-        mc_report "would create" ".loom-project/project.json" "from .loom/config.json minus sweep.modelAliases"
+        mc_report "would create" ".loom-project/project.json" "from .loom/config.json minus sweep.modelAliases + host-local keys"
+        [[ "$have_local" == "1" ]] \
+            && mc_report "would create" ".loom-local/local.json" "host-local worktree.root=$wr (gitignored, per-host tier)"
         return 0
     fi
 
+    # Host-local tier first. Never clobber an existing local override; only fill in
+    # a missing worktree.root so a re-run converges without losing operator edits.
+    if [[ "$have_local" == "1" ]]; then
+        mkdir -p "$local_dir" || { mc_err "could not create $local_dir"; return 1; }
+        if [[ -f "$localcfg" ]]; then
+            local tmpl
+            tmpl="$(mktemp)" || return 1
+            if jq --arg r "$wr" \
+                 '.worktree = (.worktree // {})
+                  | (if (.worktree.root // "") == "" then .worktree.root = $r else . end)' \
+                 "$localcfg" > "$tmpl" 2>/dev/null; then
+                mv "$tmpl" "$localcfg"
+                mc_report updated ".loom-local/local.json" "host-local worktree.root ensured (existing override kept)"
+            else
+                rm -f "$tmpl"
+                mc_warn "could not update $localcfg — leaving it as-is"
+            fi
+        else
+            if jq -n --arg r "$wr" '{worktree: {root: $r}}' > "$localcfg" 2>/dev/null; then
+                mc_report created ".loom-local/local.json" "host-local worktree.root=$wr (gitignored)"
+            else
+                mc_err "failed to write $localcfg"; return 1
+            fi
+        fi
+        # Deliberately NOT git-added: .loom-local/ is gitignored (per-host tier).
+    fi
+
     mkdir -p "$project_dir" || { mc_err "could not create $project_dir"; return 1; }
-    # del(.sweep.modelAliases); prune an emptied sweep object so migrated config
-    # is clean.
+    # Strip sweep.modelAliases (scope guard 1) and the host-local worktree.root
+    # (routed to local.json above); prune emptied sweep/worktree objects so the
+    # migrated project config is clean.
     if ! jq 'del(.sweep.modelAliases)
-             | if (has("sweep") and (.sweep | length) == 0) then del(.sweep) else . end' \
+             | del(.worktree.root)
+             | if (has("sweep") and (.sweep | length) == 0) then del(.sweep) else . end
+             | if (has("worktree") and (.worktree | length) == 0) then del(.worktree) else . end' \
              "$legacy" > "$project" 2>/dev/null; then
         mc_err "failed to extract config from $legacy"
         rm -f "$project"
         return 1
     fi
     git -C "$repo" add -- .loom-project/project.json 2>/dev/null || true
-    mc_report created ".loom-project/project.json" "from .loom/config.json minus sweep.modelAliases"
+    mc_report created ".loom-project/project.json" "from .loom/config.json minus sweep.modelAliases + host-local keys"
     return 0
 }
 
@@ -532,6 +577,119 @@ mc_update_claude_md() {
     git -C "$repo" add -- CLAUDE.md 2>/dev/null || true
 }
 
+# ── MCP registration cleanup (#4386, surfaced on #4254 2026-07-29) ────────────
+# A historical install can carry a repo-scoped .mcp.json whose `loom` server entry
+# points into a long-dead worktree bundle (e.g.
+# .loom/worktrees/issue-N/mcp-loom/dist/index.js). Under the machine-level model
+# the `loom` server is registered ONCE at USER scope; Claude Code MCP precedence is
+# local > project > user, so a lingering repo-scoped `loom` entry SILENTLY outranks
+# (shadows) the user-scope server — and when its path is a dead worktree it kills
+# every daemon-dispatched child at the claude-wrapper MCP pre-flight (a fleet-wide
+# spawn outage with no surfaced error). This step therefore:
+#   1. strips any repo-scoped `loom` entry from .mcp.json (deleting the file if
+#      `loom` was its only server; other servers such as `safehouse` are kept),
+#      matching setup-mcp.sh's #4230 migration;
+#   2. verifies the user-scope `loom` registration exists and points at the machine
+#      checkout's mcp-loom/dist/index.js, (re)adding it if absent or mis-pointed.
+
+# mc_strip_mcp_loom_entry <file> — remove the `loom` server from an .mcp.json in
+# place. Prints one token: skip | noop | stripped | removed-file.
+mc_strip_mcp_loom_entry() {
+    local file="$1"
+    [[ -f "$file" ]] || { echo skip; return 0; }
+    command -v python3 >/dev/null 2>&1 || { echo skip; return 0; }
+    python3 - "$file" <<'PYEOF'
+import json, os, sys
+path = sys.argv[1]
+try:
+    with open(path) as f:
+        cfg = json.load(f)
+except Exception:
+    print("skip"); sys.exit(0)
+servers = cfg.get("mcpServers", {})
+if "loom" not in servers:
+    print("noop"); sys.exit(0)
+del servers["loom"]
+cfg["mcpServers"] = servers
+if not servers:
+    os.remove(path)
+    print("removed-file")
+else:
+    with open(path, "w") as f:
+        json.dump(cfg, f, indent=2)
+        f.write("\n")
+    print("stripped")
+PYEOF
+}
+
+mc_fix_mcp() {
+    local repo="$1" dry_run="$2"
+    local mcp="$repo/.mcp.json"
+
+    # 1. Strip a shadowing repo-scoped `loom` entry from .mcp.json.
+    if [[ -f "$mcp" ]] && command -v jq >/dev/null 2>&1; then
+        local has_loom
+        has_loom="$(jq -r 'if (.mcpServers.loom) then "yes" else "no" end' "$mcp" 2>/dev/null || echo no)"
+        if [[ "$has_loom" == "yes" ]]; then
+            local stale note
+            stale="$(jq -r '[.mcpServers.loom.args[]? | select(type=="string")]
+                            | map(select(endswith("index.js")))[0] // empty' "$mcp" 2>/dev/null || true)"
+            note="repo-scoped loom entry shadows the user-scope server (#4230)"
+            if [[ -n "$stale" && ! -e "$stale" ]]; then
+                note="repo-scoped loom entry points at a missing bundle ($stale) — #4386 spawn-outage signature"
+            fi
+            local was_tracked
+            was_tracked="$(git -C "$repo" ls-files -- .mcp.json 2>/dev/null)"
+            if [[ "$dry_run" == "1" ]]; then
+                mc_report "would remove" ".mcp.json" "$note"
+            else
+                local res
+                res="$(mc_strip_mcp_loom_entry "$mcp")"
+                case "$res" in
+                    removed-file) mc_report removed ".mcp.json" "$note (was loom-only; file deleted)" ;;
+                    stripped)     mc_report updated ".mcp.json" "$note (stripped; other servers kept)" ;;
+                    *)            : ;;
+                esac
+                # Stage the change only when the file was already tracked; never
+                # newly-track a repo-scoped .mcp.json (it is a per-repo artifact).
+                [[ -n "$was_tracked" ]] && git -C "$repo" add -- .mcp.json 2>/dev/null || true
+            fi
+        fi
+    fi
+
+    # 2. Verify / (re)add the user-scope `loom` MCP registration.
+    local loom_root entry
+    loom_root="$(mc_resolve_loom_root 2>/dev/null || true)"
+    entry="${LOOM_HOME:-$HOME/.local/share/loom}/mcp-loom/dist/index.js"
+    if [[ ! -f "$entry" && -n "$loom_root" && -f "$loom_root/mcp-loom/dist/index.js" ]]; then
+        entry="$loom_root/mcp-loom/dist/index.js"
+    fi
+    if ! command -v claude >/dev/null 2>&1; then
+        mc_warn "claude CLI not on PATH — cannot verify the user-scope 'loom' MCP registration."
+        mc_warn "  register later (one time, per machine): claude mcp add --scope user loom -- node \"$entry\""
+        return 0
+    fi
+    # `claude mcp get` reports across scopes; treat a hit that already references
+    # the expected bundle as good and skip. Otherwise (absent or mis-pointed)
+    # (re)register at user scope, idempotently (remove-then-add like install-loom.sh).
+    local cur
+    if cur="$(claude mcp get loom 2>/dev/null)" && printf '%s' "$cur" | grep -qF "$entry"; then
+        mc_report skipped "user-scope loom MCP" "already registered → $entry"
+        return 0
+    fi
+    if [[ "$dry_run" == "1" ]]; then
+        mc_report "would register" "user-scope loom MCP" "claude mcp add --scope user loom -- node $entry"
+        return 0
+    fi
+    claude mcp remove --scope user loom >/dev/null 2>&1 || true
+    if claude mcp add --scope user loom -- node "$entry" >/dev/null 2>&1; then
+        mc_report registered "user-scope loom MCP" "-> $entry"
+    else
+        mc_warn "failed to register the user-scope 'loom' MCP server; register manually:"
+        mc_warn "  claude mcp add --scope user loom -- node \"$entry\""
+    fi
+}
+
 # ── orchestration ─────────────────────────────────────────────────────────────
 mc_usage() {
     cat <<EOF
@@ -605,6 +763,7 @@ mc_main() {
     mc_extract_config    "$repo" "$dry_run"
     mc_untrack_manifest  "$repo" "$dry_run"
     mc_apply_gitignore   "$repo" "$dry_run"
+    mc_fix_mcp           "$repo" "$dry_run"
     mc_restamp_metadata  "$repo" "$dry_run"
     mc_update_claude_md  "$repo" "$dry_run"
     mc_register_workspace "$repo" "$priority" "$dry_run"
