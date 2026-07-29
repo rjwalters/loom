@@ -1098,6 +1098,39 @@ pub struct DaemonStatusReport {
     /// heap alloc on an already-rare, human-latency status round-trip).
     #[serde(default)]
     pub host_breaker: Option<Box<HostBreakerStatus>>,
+    /// Live safehouse fleet-comms connection state (Issue #4345): distinguishes
+    /// `not_configured` (no `safehouse` block / disabled) from `unreachable`
+    /// (enabled, socket resolved, but the daemon's own connection attempt
+    /// failed/dropped) from `connected` (room joined) — before this the three
+    /// looked identical to an operator (silence). Rendered from
+    /// [`crate::safehouse::SafehouseState`] via
+    /// [`crate::workspace_pool::WorkspacePool::safehouse_status`]. `None` only
+    /// for a pre-#4345 wire payload from an older daemon binary that never
+    /// computed one. `#[serde(default)]` keeps that wire data compatible.
+    #[serde(default)]
+    pub safehouse: Option<SafehouseStatus>,
+}
+
+/// Live safehouse connection status for `loom-daemon status` (Issue #4345).
+/// See [`DaemonStatusReport::safehouse`] and `.loom/docs/safehouse.md`
+/// "New-host onboarding" for the operator story.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SafehouseStatus {
+    /// One of `"not_configured"`, `"unreachable"`, `"connected"`.
+    pub state: String,
+    /// The resolved socket path the daemon last tried/uses, when known.
+    /// `None` for `"not_configured"` (including the "enabled but no socket
+    /// resolves at all" sub-case, which also reports as `"not_configured"` —
+    /// there is nothing to name a path against).
+    #[serde(default)]
+    pub socket: Option<PathBuf>,
+    /// The configured room name, present only when `state == "connected"`.
+    /// `None` even when connected if no `safehouse.room` was configured
+    /// (valid only when safehoused joined exactly one room, resolved
+    /// server-side — this client is never told the resolved name in that
+    /// case).
+    #[serde(default)]
+    pub room: Option<String>,
 }
 
 /// Host-distress circuit-breaker snapshot for `loom-daemon status` (Issue

@@ -221,6 +221,116 @@ fn env_nonempty(key: &str) -> Option<String> {
 }
 
 // ============================================================================
+// Connection state (issue #4345 — new-host onboarding visibility)
+// ============================================================================
+//
+// Before #4345, `safehouse.enabled` false/absent, enabled-but-unreachable, and
+// enabled-and-connected all looked identical to an operator: silence. The
+// narration sink and peer-claim coordination task both already know their own
+// live connection state; this cell is how that knowledge reaches
+// `loom-daemon status` without a second, status-time connection attempt (a
+// CLI-side probe can't know "room joined" the way the daemon's own live
+// connection can).
+
+/// Live safehouse connection state, shared between the narration sink
+/// ([`run_sink`]) and the peer-claim coordination task ([`run_coordination`])
+/// via a [`SharedSafehouseState`] cell — the same "shared `Arc<Mutex<..>>`
+/// updated by the task that owns the connection" shape [`PeerClaimView`]
+/// already uses. Both tasks connect to the same `safehoused` peer off the same
+/// resolved config, so in steady state they agree; a transient disagreement
+/// (one connection drops, the other has not yet) resolves to whichever task
+/// transitions last, which self-heals on the next reconnect attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum SafehouseState {
+    /// `safehouse.enabled` is false/absent (the byte-for-byte no-op path), or
+    /// enabled with no socket resolving at all. No connection has ever been
+    /// attempted for this transition.
+    #[default]
+    NotConfigured,
+    /// Enabled with a socket resolved, but the most recent connect attempt
+    /// failed, refused, or dropped. `socket` carries the path that was tried.
+    Unreachable { socket: PathBuf },
+    /// The most recent connect attempt completed the `hello` handshake
+    /// successfully. `room` is the configured room name — `None` when
+    /// [`SafehouseConfig::room`] is unset, which is only valid when safehoused
+    /// joined exactly one room (resolved server-side; this client is never
+    /// told the resolved name in that case).
+    Connected {
+        socket: PathBuf,
+        room: Option<String>,
+    },
+}
+
+impl SafehouseState {
+    /// Render into the wire [`crate::types::SafehouseStatus`] shape consumed by
+    /// `DaemonStatusReport` (#4345).
+    #[must_use]
+    pub fn to_status(&self) -> crate::types::SafehouseStatus {
+        match self {
+            Self::NotConfigured => crate::types::SafehouseStatus {
+                state: "not_configured".to_owned(),
+                socket: None,
+                room: None,
+            },
+            Self::Unreachable { socket } => crate::types::SafehouseStatus {
+                state: "unreachable".to_owned(),
+                socket: Some(socket.clone()),
+                room: None,
+            },
+            Self::Connected { socket, room } => crate::types::SafehouseStatus {
+                state: "connected".to_owned(),
+                socket: Some(socket.clone()),
+                room: room.clone(),
+            },
+        }
+    }
+}
+
+/// A shared, `Arc`-wrapped connection-state cell, injected into
+/// [`spawn_sink`]/[`spawn_peer_coordination`] (and their `run_*` loops) so
+/// [`WorkspacePool`](crate::workspace_pool::WorkspacePool) can hold one cell
+/// per daemon and read it back for `loom-daemon status` without a second
+/// connection. Mirrors [`PeerClaimView`]'s `Arc<Mutex<..>>` injection shape.
+pub type SharedSafehouseState = Arc<Mutex<SafehouseState>>;
+
+/// Construct a fresh cell defaulted to [`SafehouseState::NotConfigured`] — the
+/// correct starting value for a daemon that has not yet called
+/// [`spawn_sink`]/[`spawn_peer_coordination`] for this cell.
+#[must_use]
+pub fn new_shared_state() -> SharedSafehouseState {
+    Arc::new(Mutex::new(SafehouseState::default()))
+}
+
+/// Overwrite `cell` with `state`. Recovers a poisoned mutex (a panic on some
+/// other thread while holding the lock must never permanently blind `status`
+/// to connection state) rather than propagating the poison.
+fn set_state(cell: &SharedSafehouseState, state: SafehouseState) {
+    match cell.lock() {
+        Ok(mut guard) => *guard = state,
+        Err(poisoned) => *poisoned.into_inner() = state,
+    }
+}
+
+/// Snapshot the current connection state out of `cell`.
+#[must_use]
+pub fn snapshot_state(cell: &SharedSafehouseState) -> SafehouseState {
+    match cell.lock() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
+
+/// Set `cell` to [`SafehouseState::NotConfigured`] (#4345). Exposed (unlike
+/// [`set_state`]) for `workspace_pool.rs`'s disabled-config fast path in
+/// `start_peer_coordination`, which returns before ever calling
+/// [`spawn_peer_coordination`] — the one caller outside this module that needs
+/// to report a transition directly rather than through a `spawn_*`/`run_*`
+/// entry point.
+pub fn set_not_configured(cell: &SharedSafehouseState) {
+    set_state(cell, SafehouseState::NotConfigured);
+}
+
+// ============================================================================
 // Envelope
 // ============================================================================
 
@@ -641,15 +751,20 @@ impl SafehouseClient {
 
 /// Spawn the narration sink on `runtime` when enabled. Returns the task handle,
 /// or `None` (a byte-for-byte no-op: no bus subscription, no socket) when
-/// disabled or when no socket path can be resolved.
+/// disabled or when no socket path can be resolved. `state` (#4345) is updated
+/// with the resolved config-only state immediately (before any connection
+/// attempt) and further updated by [`run_sink`] as connect/disconnect
+/// transitions happen — see [`SafehouseState`].
 #[must_use]
 pub fn spawn_sink(
     config: SafehouseConfig,
     bus: &EventBus,
     runtime: &tokio::runtime::Handle,
+    state: SharedSafehouseState,
 ) -> Option<tokio::task::JoinHandle<()>> {
     if !config.enabled {
         // Disabled ⇒ do not even subscribe. No syscalls, no behavior change.
+        set_state(&state, SafehouseState::NotConfigured);
         return None;
     }
     let Some(socket) = resolve_socket(&config) else {
@@ -657,6 +772,10 @@ pub fn spawn_sink(
             "safehouse: enabled but no socket path resolved \
              (set safehouse.socket, $LOOM_SAFEHOUSE_SOCKET, or $SAFEHOUSED_SOCKET) — narration off"
         );
+        // No socket ⇒ nothing to report as "unreachable at <path>"; the
+        // degradation contract's "not configured" bucket also covers this
+        // (AC: "not configured (no safehouse block / disabled)").
+        set_state(&state, SafehouseState::NotConfigured);
         return None;
     };
     log::info!(
@@ -667,7 +786,8 @@ pub fn spawn_sink(
     // Empty topic set ⇒ receive every event; we filter in `event_to_envelope`.
     let subscription = bus.subscribe(Vec::<String>::new());
     Some(runtime.spawn(async move {
-        run_sink(config, socket, subscription, DEFAULT_MIN_BACKOFF, DEFAULT_MAX_BACKOFF).await;
+        run_sink(config, socket, subscription, DEFAULT_MIN_BACKOFF, DEFAULT_MAX_BACKOFF, state)
+            .await;
     }))
 }
 
@@ -737,7 +857,19 @@ async fn run_sink(
     mut subscription: crate::event_bus::Subscription,
     min_backoff: Duration,
     max_backoff: Duration,
+    state: SharedSafehouseState,
 ) {
+    // Report "configured, not yet connected" immediately — the sink connects
+    // lazily on the first narrated event (below), so without this a daemon
+    // that starts before any sweep activity would keep reading whatever the
+    // cell held before this task existed (#4345 edge case: "daemon starts
+    // before safehoused").
+    set_state(
+        &state,
+        SafehouseState::Unreachable {
+            socket: socket.clone(),
+        },
+    );
     let mut client: Option<SafehouseClient> = None;
     // Next instant a reconnect may be attempted, and the current backoff.
     let mut next_attempt = Instant::now();
@@ -792,6 +924,13 @@ async fn run_sink(
                     client = Some(connected);
                     backoff = min_backoff;
                     warned = false;
+                    set_state(
+                        &state,
+                        SafehouseState::Connected {
+                            socket: socket.clone(),
+                            room: config.room.clone(),
+                        },
+                    );
                 }
                 Err(err) => {
                     if !warned {
@@ -802,6 +941,12 @@ async fn run_sink(
                         );
                         warned = true;
                     }
+                    set_state(
+                        &state,
+                        SafehouseState::Unreachable {
+                            socket: socket.clone(),
+                        },
+                    );
                     next_attempt = Instant::now() + backoff;
                     backoff = (backoff * 2).min(max_backoff);
                     continue;
@@ -815,6 +960,12 @@ async fn run_sink(
                     "safehouse: narration send failed ({err:#}); will reconnect, sweep unaffected"
                 );
                 client = None;
+                set_state(
+                    &state,
+                    SafehouseState::Unreachable {
+                        socket: socket.clone(),
+                    },
+                );
                 next_attempt = Instant::now() + backoff;
                 backoff = (backoff * 2).min(max_backoff);
                 warned = true;
@@ -905,14 +1056,23 @@ pub fn claim_ad_to_envelope(ad: &ClaimAd) -> Envelope {
 /// drains the socket continuously via `select!`, so an idle daemon that emits no
 /// narration still observes peer claims promptly (the narration sink's
 /// `read_reply` only drains while it is emitting).
+///
+/// `state` (#4345) is updated with the resolved config-only state immediately
+/// (before any connection attempt) and further updated by [`run_coordination`]
+/// as connect/disconnect transitions happen — see [`SafehouseState`]. This
+/// task connects **eagerly** (unlike the narration sink's lazy first-event
+/// connect), so it is usually the first to observe a fresh daemon's true
+/// connection state.
 #[must_use]
 pub fn spawn_peer_coordination(
     config: SafehouseConfig,
     sink: Arc<dyn InboundEventSink>,
     outbound: tokio::sync::mpsc::Receiver<ClaimAd>,
     runtime: &tokio::runtime::Handle,
+    state: SharedSafehouseState,
 ) -> Option<tokio::task::JoinHandle<()>> {
     if !config.enabled {
+        set_state(&state, SafehouseState::NotConfigured);
         return None; // disabled ⇒ no socket, no task, no syscalls
     }
     let Some(socket) = resolve_socket(&config) else {
@@ -921,6 +1081,9 @@ pub fn spawn_peer_coordination(
              (set safehouse.socket, $LOOM_SAFEHOUSE_SOCKET, or $SAFEHOUSED_SOCKET) — \
              soft-claim coordination off"
         );
+        // See spawn_sink's identical fallback: no socket resolved groups under
+        // "not configured", the AC's bucket for "nothing to even try".
+        set_state(&state, SafehouseState::NotConfigured);
         return None;
     };
     log::info!(
@@ -929,8 +1092,16 @@ pub fn spawn_peer_coordination(
         socket.display()
     );
     Some(runtime.spawn(async move {
-        run_coordination(config, socket, sink, outbound, DEFAULT_MIN_BACKOFF, DEFAULT_MAX_BACKOFF)
-            .await;
+        run_coordination(
+            config,
+            socket,
+            sink,
+            outbound,
+            DEFAULT_MIN_BACKOFF,
+            DEFAULT_MAX_BACKOFF,
+            state,
+        )
+        .await;
     }))
 }
 
@@ -945,10 +1116,17 @@ async fn run_coordination(
     mut outbound: tokio::sync::mpsc::Receiver<ClaimAd>,
     min_backoff: Duration,
     max_backoff: Duration,
+    state: SharedSafehouseState,
 ) {
     let mut backoff = min_backoff;
     let mut warned = false;
     loop {
+        set_state(
+            &state,
+            SafehouseState::Unreachable {
+                socket: socket.clone(),
+            },
+        );
         let client = match SafehouseClient::connect(&socket, &config.persona, config.room.clone())
             .await
         {
@@ -958,6 +1136,13 @@ async fn run_coordination(
                 }
                 backoff = min_backoff;
                 warned = false;
+                set_state(
+                    &state,
+                    SafehouseState::Connected {
+                        socket: socket.clone(),
+                        room: config.room.clone(),
+                    },
+                );
                 client
             }
             Err(err) => {
@@ -1070,6 +1255,64 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::sync::{Arc, Mutex};
     use tokio::net::UnixListener;
+
+    // ---- connection-state cell + wire rendering (#4345) ----
+
+    #[test]
+    fn new_shared_state_defaults_to_not_configured() {
+        let state = new_shared_state();
+        assert_eq!(snapshot_state(&state), SafehouseState::NotConfigured);
+    }
+
+    #[test]
+    fn set_not_configured_overwrites_any_prior_state() {
+        let state = new_shared_state();
+        set_state(
+            &state,
+            SafehouseState::Connected {
+                socket: PathBuf::from("/tmp/x.sock"),
+                room: None,
+            },
+        );
+        set_not_configured(&state);
+        assert_eq!(snapshot_state(&state), SafehouseState::NotConfigured);
+    }
+
+    #[test]
+    fn state_to_status_maps_all_three_states() {
+        let not_configured = SafehouseState::NotConfigured.to_status();
+        assert_eq!(not_configured.state, "not_configured");
+        assert!(not_configured.socket.is_none());
+        assert!(not_configured.room.is_none());
+
+        let unreachable = SafehouseState::Unreachable {
+            socket: PathBuf::from("/tmp/x.sock"),
+        }
+        .to_status();
+        assert_eq!(unreachable.state, "unreachable");
+        assert_eq!(unreachable.socket, Some(PathBuf::from("/tmp/x.sock")));
+        assert!(unreachable.room.is_none());
+
+        let connected = SafehouseState::Connected {
+            socket: PathBuf::from("/tmp/x.sock"),
+            room: Some("fleet".to_owned()),
+        }
+        .to_status();
+        assert_eq!(connected.state, "connected");
+        assert_eq!(connected.socket, Some(PathBuf::from("/tmp/x.sock")));
+        assert_eq!(connected.room.as_deref(), Some("fleet"));
+
+        // A connected state with no configured room (safehoused resolved the
+        // sole joined room server-side) still reports "connected" — `room`
+        // just stays `None` rather than inventing a name.
+        let connected_no_room = SafehouseState::Connected {
+            socket: PathBuf::from("/tmp/x.sock"),
+            room: None,
+        }
+        .to_status();
+        assert_eq!(connected_no_room.state, "connected");
+        assert!(connected_no_room.room.is_none());
+    }
 
     // ---- config resolution (config > default, no env) ----
 
@@ -1527,6 +1770,7 @@ mod tests {
             subscription,
             Duration::from_millis(20),
             Duration::from_millis(80),
+            new_shared_state(),
         ));
 
         bus.publish(Event::SweepGlobalDispatch {
@@ -1635,14 +1879,18 @@ mod tests {
     async fn disabled_config_does_not_subscribe() {
         let bus = EventBus::new();
         assert_eq!(bus.receiver_count(), 0);
+        let state = new_shared_state();
         let handle = spawn_sink(
             SafehouseConfig::default(), // disabled
             &bus,
             &tokio::runtime::Handle::current(),
+            state.clone(),
         );
         assert!(handle.is_none(), "disabled ⇒ no sink task");
         // The load-bearing no-op assertion: no subscription was created.
         assert_eq!(bus.receiver_count(), 0, "disabled ⇒ no bus subscription");
+        // #4345: disabled must report as "not configured", never silence.
+        assert_eq!(snapshot_state(&state), SafehouseState::NotConfigured);
     }
 
     #[tokio::test]
@@ -1654,6 +1902,7 @@ mod tests {
         let bus = Arc::new(EventBus::new());
         let subscription = bus.subscribe(Vec::<String>::new());
 
+        let state = new_shared_state();
         let sink = tokio::spawn(run_sink(
             SafehouseConfig {
                 enabled: true,
@@ -1664,6 +1913,7 @@ mod tests {
             subscription,
             Duration::from_millis(50),
             Duration::from_millis(200),
+            state.clone(),
         ));
 
         // Publish a burst; the sink must consume them all without wedging.
@@ -1677,6 +1927,14 @@ mod tests {
         }
         // Give the sink a moment to drain, then drop the bus to close the sub.
         tokio::time::sleep(Duration::from_millis(100)).await;
+        // #4345: an absent peer must report "unreachable" (with the resolved
+        // socket path), never silence and never a stale "not configured".
+        match snapshot_state(&state) {
+            SafehouseState::Unreachable { socket } => {
+                assert_eq!(socket, PathBuf::from("/nonexistent/safehoused.sock"));
+            }
+            other => panic!("expected Unreachable, got {other:?}"),
+        }
         drop(bus);
         // The sink must exit cleanly once the bus closes (it never blocked).
         tokio::time::timeout(Duration::from_secs(2), sink)
@@ -1696,6 +1954,7 @@ mod tests {
 
         let bus = Arc::new(EventBus::new());
         let subscription = bus.subscribe(Vec::<String>::new());
+        let state = new_shared_state();
         let sink = tokio::spawn(run_sink(
             SafehouseConfig {
                 enabled: true,
@@ -1706,6 +1965,7 @@ mod tests {
             subscription,
             Duration::from_millis(20),
             Duration::from_millis(80),
+            state.clone(),
         ));
 
         // First event: delivered over listener1.
@@ -1749,6 +2009,12 @@ mod tests {
             .expect("sink must reconnect and deliver to the second server")
             .unwrap();
         assert!(!second.is_empty(), "a narration must land post-reconnect");
+        // #4345: the reconnect must be visible as Connected again, not stuck
+        // reporting the mid-outage Unreachable value.
+        match snapshot_state(&state) {
+            SafehouseState::Connected { socket: s, .. } => assert_eq!(s, socket),
+            other => panic!("expected Connected after reconnect, got {other:?}"),
+        }
 
         sink_done.await.unwrap();
         let _ = tokio::time::timeout(Duration::from_secs(2), sink).await;
@@ -1783,13 +2049,17 @@ mod tests {
         let view = Arc::new(Mutex::new(PeerClaimView::new("me".into(), Duration::from_secs(1))));
         let sink: Arc<dyn InboundEventSink> = Arc::new(PeerClaimSink::new(view));
         let (_tx, rx) = tokio::sync::mpsc::channel::<ClaimAd>(1);
+        let state = new_shared_state();
         let handle = spawn_peer_coordination(
             SafehouseConfig::default(), // disabled
             sink,
             rx,
             &tokio::runtime::Handle::current(),
+            state.clone(),
         );
         assert!(handle.is_none(), "disabled ⇒ no coordination task");
+        // #4345: disabled must report as "not configured".
+        assert_eq!(snapshot_state(&state), SafehouseState::NotConfigured);
     }
 
     #[tokio::test]
@@ -1829,6 +2099,7 @@ mod tests {
         let sink: Arc<dyn InboundEventSink> = Arc::new(PeerClaimSink::new(view.clone()));
         let (_tx, rx) = tokio::sync::mpsc::channel::<ClaimAd>(8); // held → task stays alive; never send (idle)
 
+        let state = new_shared_state();
         let task = tokio::spawn(run_coordination(
             SafehouseConfig {
                 enabled: true,
@@ -1840,6 +2111,7 @@ mod tests {
             rx,
             Duration::from_millis(20),
             Duration::from_millis(80),
+            state.clone(),
         ));
 
         // Poll the view for the claim (bounded condition-poll, not a fixed
@@ -1857,6 +2129,11 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(seen, "an idle daemon must still observe the inbound peer claim (Gap 1a)");
+        // #4345: a live, idle coordination connection must report Connected.
+        match snapshot_state(&state) {
+            SafehouseState::Connected { socket: s, .. } => assert_eq!(s, socket),
+            other => panic!("expected Connected, got {other:?}"),
+        }
         server.await.unwrap();
         task.abort();
     }
@@ -1870,6 +2147,7 @@ mod tests {
         let view = Arc::new(Mutex::new(PeerClaimView::new("me".into(), Duration::from_secs(1))));
         let sink: Arc<dyn InboundEventSink> = Arc::new(PeerClaimSink::new(view));
         let (tx, rx) = tokio::sync::mpsc::channel::<ClaimAd>(4);
+        let state = new_shared_state();
 
         let task = tokio::spawn(run_coordination(
             SafehouseConfig {
@@ -1877,11 +2155,12 @@ mod tests {
                 socket: Some(socket.clone()),
                 ..SafehouseConfig::default()
             },
-            socket,
+            socket.clone(),
             sink,
             rx,
             Duration::from_millis(10),
             Duration::from_millis(30),
+            state.clone(),
         ));
 
         // Drop the only sender: the connect-fail drain loop must observe
@@ -1891,5 +2170,11 @@ mod tests {
             .await
             .expect("coordination task must terminate after its senders drop")
             .unwrap();
+        // #4345: a socket that never accepts must report Unreachable, never a
+        // stale "not configured" (the config here IS enabled).
+        match snapshot_state(&state) {
+            SafehouseState::Unreachable { socket: s } => assert_eq!(s, socket),
+            other => panic!("expected Unreachable, got {other:?}"),
+        }
     }
 }

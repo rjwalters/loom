@@ -106,6 +106,12 @@ pub struct WorkspacePool {
     /// [`start_peer_coordination`](Self::start_peer_coordination); injected into
     /// every registry [`get_or_provision`](Self::get_or_provision) builds.
     peer_coord: Mutex<Option<PeerCoordination>>,
+    /// The daemon-wide live safehouse connection-state cell (Issue #4345),
+    /// updated by both [`start_safehouse_narration`](Self::start_safehouse_narration)'s
+    /// sink and [`start_peer_coordination`](Self::start_peer_coordination)'s
+    /// coordination task. Read back by [`safehouse_status`](Self::safehouse_status)
+    /// for `loom-daemon status` — see `crate::safehouse::SafehouseState`.
+    safehouse_state: safehouse::SharedSafehouseState,
 }
 
 impl WorkspacePool {
@@ -118,6 +124,7 @@ impl WorkspacePool {
             runtime,
             inner: Mutex::new(HashMap::new()),
             peer_coord: Mutex::new(None),
+            safehouse_state: safehouse::new_shared_state(),
         }
     }
 
@@ -132,7 +139,21 @@ impl WorkspacePool {
     /// failure. The handle is detached (daemon-lifetime).
     pub fn start_safehouse_narration(&self, repo_root: &Path) {
         let config = crate::safehouse::resolve_config(repo_root);
-        let _ = crate::safehouse::spawn_sink(config, &self.event_bus, &self.runtime);
+        let _ = crate::safehouse::spawn_sink(
+            config,
+            &self.event_bus,
+            &self.runtime,
+            self.safehouse_state.clone(),
+        );
+    }
+
+    /// Snapshot the live safehouse connection state (Issue #4345) for
+    /// `loom-daemon status`: `not_configured` / `unreachable` / `connected`,
+    /// replacing the pre-#4345 silence all three states shared. See
+    /// `.loom/docs/safehouse.md` "New-host onboarding".
+    #[must_use]
+    pub fn safehouse_status(&self) -> crate::types::SafehouseStatus {
+        safehouse::snapshot_state(&self.safehouse_state).to_status()
     }
 
     /// Start the daemon-wide safehouse **peer-claim coordination** (Issue #4028)
@@ -149,6 +170,10 @@ impl WorkspacePool {
     pub fn start_peer_coordination(&self, repo_root: &Path) {
         let config = safehouse::resolve_config(repo_root);
         if !config.enabled {
+            // Mirrors spawn_sink's own disabled handling — set here too since
+            // this early return means spawn_peer_coordination (which would
+            // otherwise set it) is never reached (#4345).
+            safehouse::set_not_configured(&self.safehouse_state);
             return; // disabled ⇒ no coordination, byte-for-byte no-op
         }
         let mut slot = self
@@ -162,7 +187,13 @@ impl WorkspacePool {
         let view = Arc::new(Mutex::new(PeerClaimView::new(host_identity(), ttl)));
         let (tx, rx) = tokio::sync::mpsc::channel::<ClaimAd>(safehouse::PEER_CLAIM_CHANNEL_CAP);
         let sink: Arc<dyn InboundEventSink> = Arc::new(PeerClaimSink::new(view.clone()));
-        let task = safehouse::spawn_peer_coordination(config, sink, rx, &self.runtime);
+        let task = safehouse::spawn_peer_coordination(
+            config,
+            sink,
+            rx,
+            &self.runtime,
+            self.safehouse_state.clone(),
+        );
         if task.is_none() {
             // Enabled but no socket resolved: leave coordination unestablished so
             // registries stay in the no-op path (the outbound sender would have
@@ -465,6 +496,79 @@ mod tests {
         let pool = pool();
         assert!(pool.is_empty());
         assert_eq!(pool.len(), 0);
+    }
+
+    // ---- safehouse connection-state wiring (#4345) ----
+
+    #[tokio::test]
+    async fn safehouse_status_defaults_to_not_configured_before_any_start_call() {
+        let pool = pool();
+        assert_eq!(pool.safehouse_status().state, "not_configured");
+    }
+
+    #[tokio::test]
+    async fn start_safehouse_narration_surfaces_unreachable_for_enabled_unresolved_socket() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let socket = dir.path().join("nope.sock"); // never bound
+        write_config(
+            &root,
+            &format!(
+                r#"{{"safehouse": {{"enabled": true, "socket": {:?}}}}}"#,
+                socket.display().to_string()
+            ),
+        );
+        let pool = pool();
+
+        pool.start_safehouse_narration(&root);
+        // The sink reports "configured, not yet connected" immediately on
+        // spawn (before any connect attempt) — poll briefly rather than
+        // assuming the spawned task has already run once.
+        let mut status = pool.safehouse_status();
+        for _ in 0..50 {
+            if status.state != "not_configured" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            status = pool.safehouse_status();
+        }
+        assert_eq!(status.state, "unreachable");
+        assert_eq!(status.socket, Some(socket));
+    }
+
+    #[tokio::test]
+    async fn start_peer_coordination_disabled_reports_not_configured_even_after_prior_state() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let socket = dir.path().join("nope.sock");
+        write_config(
+            &root,
+            &format!(
+                r#"{{"safehouse": {{"enabled": true, "socket": {:?}}}}}"#,
+                socket.display().to_string()
+            ),
+        );
+        let pool = pool();
+
+        // Drive the cell to a non-default state first via the narration sink.
+        pool.start_safehouse_narration(&root);
+        let mut status = pool.safehouse_status();
+        for _ in 0..50 {
+            if status.state != "not_configured" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            status = pool.safehouse_status();
+        }
+        assert_eq!(status.state, "unreachable", "precondition: cell must be non-default");
+
+        // Now disable and re-resolve via the peer-coordination entry point's
+        // own disabled fast path (which returns before ever calling
+        // spawn_peer_coordination — the code path #4345 had to patch
+        // explicitly).
+        write_config(&root, r#"{"safehouse": {"enabled": false}}"#);
+        pool.start_peer_coordination(&root);
+        assert_eq!(pool.safehouse_status().state, "not_configured");
     }
 
     #[tokio::test]

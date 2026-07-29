@@ -92,6 +92,108 @@ personas (`loom_builder_42`) are blocked upstream until safehoused grows prefix
 support and are tracked in #3999 — do not attempt to register personas at
 dispatch time; there is no such path.
 
+## Connection status: not configured / unreachable / connected (#4345)
+
+Before #4345, `safehouse.enabled` false/absent, enabled-but-unreachable, and
+enabled-and-connected all looked identical to an operator — silence. Two
+surfaces now report the live state:
+
+- **`loom-daemon status`** (and `status --json`) prints a `Safehouse:` line
+  (a `safehouse` object in JSON) with one of three states, self-reported by
+  the daemon's own live connection — never a second, status-time connection
+  attempt (a CLI-side probe could not know "room joined" the way the daemon's
+  own connection can):
+  - `not configured` — no `safehouse` block, `enabled: false`/absent, or
+    enabled with no socket path resolving at all (nothing to even try). No
+    connection has been attempted.
+  - `configured, unreachable` — enabled, a socket path resolved, but the most
+    recent connect attempt failed, was refused, or dropped. The resolved
+    socket path is included.
+  - `connected` — the most recent connect attempt completed the `hello`
+    handshake. The configured room name is included when one was configured
+    (`safehouse.room` unset is valid only when safehoused joined exactly one
+    room, resolved server-side — the daemon is never told that resolved name,
+    so the line omits it rather than guessing).
+- **`loom-daemon-start.sh`** prints a cheaper, **static**, pre-connect check at
+  start time (`ok`/`warn` colored, one line): it runs *before* the daemon
+  connects, so it can only distinguish "not configured" from "configured" —
+  proving "connected" needs the daemon's own live socket, which is what
+  `loom-daemon status` is for. Concretely: no `safehouse` block/disabled ⇒
+  `not configured`; enabled with no socket resolving ⇒ `configured,
+  unreachable`; enabled with a socket path that exists as a socket on disk ⇒
+  `configured (socket present)`; enabled with a socket path that does not
+  exist yet ⇒ `configured, unreachable` (the path is included either way).
+
+Implementation: `loom-daemon/src/safehouse.rs`'s `SafehouseState` is a shared
+`Arc<Mutex<..>>` cell (the same injection shape [`PeerClaimView`] already
+uses) updated by both the narration sink ([`run_sink`]) and the peer-claim
+coordination task ([`run_coordination`]) on every connect/disconnect
+transition; `workspace_pool.rs`'s `WorkspacePool` owns one cell per daemon and
+`ipc.rs`'s `build_daemon_status` reads it into a new optional
+`DaemonStatusReport.safehouse` field (`#[serde(default)]`, so an older
+daemon's wire payload — missing the field entirely — still parses).
+`loom-daemon-start.sh`'s static check reuses the same env>config>default
+resolvers `lib/mcp-config.sh` already defines for the safehouse-mcp worker
+injection (phase 2, below) rather than re-deriving them.
+
+## New-host onboarding (#4345)
+
+The manual path from a fresh interactive host (no `safehoused`, no
+`safehouse` config block anywhere) to `loom-daemon status` reading
+`connected`. **An automated service-wrapper + install-step path is tracked as
+a follow-up (#4359)** — this section is the documented fallback until that
+lands, and stays valid afterward as the manual/debug path.
+
+1. **Bot account + credentials.** Provision (or reuse) a Matrix account for
+   the `loom_daemon` persona in the target safehouse deployment — this is an
+   operator-side step in the external `rjwalters/safehouse` repo/deployment,
+   not something this repo automates. Note the account's credentials and the
+   room the fleet uses.
+2. **Build/install `safehoused`.** Build from the `rjwalters/safehouse`
+   checkout per that repo's own instructions. Confirm the `personas` allowlist
+   in its config includes `loom_daemon` (or whichever persona you assign this
+   host, per "Operator setup" above) — the allowlist is boot-time and
+   restart-only, no hot reload.
+3. **Run `safehoused`.** Until #4359 ships a supervised service wrapper
+   (launchd LaunchAgent / `systemd --user`, mirroring
+   `loom-daemon-start.sh`'s own pattern), start it manually or under your own
+   supervisor of choice — `nohup safehoused &`, a personal launchd plist, a
+   tmux pane, etc. Note the socket path it binds (safehoused's own config
+   controls this).
+4. **Socket env or config.** Either export `SAFEHOUSED_SOCKET=<path>` (the
+   convention safehoused's own clients read) machine-wide, or set
+   `safehouse.socket` explicitly in this host's `.loom/config.json` — see
+   [Socket resolution](#configuration) above for the full precedence.
+5. **Enable the `safehouse` config block** in `.loom/config.json` (per
+   workspace, since it lives in the per-repo config tier) or export
+   `LOOM_SAFEHOUSE_ENABLED=1` machine-wide:
+   ```jsonc
+   "safehouse": {
+     "enabled": true,
+     "socket": null,      // omit to rely on $SAFEHOUSED_SOCKET
+     "room": null,         // omit only if safehoused joined exactly one room
+     "persona": "loom_daemon"
+   }
+   ```
+6. **Start/restart `loom-daemon`** (`loom-daemon-start.sh`). Its startup
+   banner prints the static `Safehouse:` line described above — confirm it
+   reads `configured (socket present ...)`, not `not configured` or
+   `configured, unreachable`, before moving on.
+7. **Verify with `loom-daemon status`.** Give it a few seconds for the
+   narration sink / peer-coordination task to complete their first connect
+   (the sink connects lazily on the first narrated bus event; the
+   peer-coordination task connects eagerly at daemon startup, so it is
+   usually first to show `connected`). Confirm the `Safehouse:` line reads
+   `connected` with the expected room, then run a sweep and confirm the room
+   shows the `loom-daemon → everyone · task` dispatch line.
+
+If the line sticks at `configured, unreachable`: confirm `safehoused` is
+actually running and bound to the exact path `loom-daemon status` reports,
+that the persona is in safehoused's allowlist (a rejected `hello` also
+degrades to `unreachable` — check the daemon log for `safehoused rejected
+persona`), and that the daemon process can reach the socket path (permissions,
+same-host, no stale socket file from a crashed prior run).
+
 ## What gets narrated
 
 The sink maps the **existing frozen event taxonomy** (`event_bus.rs`,
@@ -183,6 +285,20 @@ network, unauthenticated, timeout) degrades to narrating the dispatch line
 - `loom-daemon/src/workspace_pool.rs` — `start_safehouse_narration()` and
   `start_peer_coordination()` subscribe/attach the shared `Arc<EventBus>` /
   `PeerClaimView` and spawn on the daemon runtime; both no-ops when disabled.
+  Also (#4345) owns the `SharedSafehouseState` cell and exposes
+  `safehouse_status()` for `ipc::build_daemon_status`.
+- `loom-daemon/src/types.rs` — `DaemonStatusReport.safehouse` /
+  `SafehouseStatus` (#4345), the wire shape for the connection-state line.
+- `loom-daemon/src/ipc.rs` / `loom-daemon/src/main.rs` — (#4345)
+  `build_daemon_status` reads the pool's `safehouse_status()`; `main.rs`
+  renders the `Safehouse:` human line and the `safehouse` JSON object.
+- `defaults/scripts/cli/loom-daemon-start.sh` — (#4345) the static
+  pre-connect `Safehouse:` line, via `lib/mcp-config.sh`'s existing
+  `loom_mcp_safehouse_enabled`/`loom_mcp_safehouse_socket` resolvers.
+- Tests: `safehouse.rs`'s `mod tests` (state-cell + wire-rendering cases),
+  `workspace_pool.rs`'s `mod tests` (pool wiring), `ipc.rs`'s
+  `test_build_daemon_status_reports_halt_and_in_flight` (report field),
+  `defaults/scripts/tests/test-loom-daemon-start.sh` (start-wrapper line).
 
 ## Peer-claim coordination: cross-host soft claim (#4028)
 

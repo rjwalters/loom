@@ -1389,6 +1389,11 @@ pub fn build_daemon_status(
         host_breaker: crate::host_breaker::global_snapshot()
             .map(crate::host_breaker::BreakerSnapshot::into_status)
             .map(Box::new),
+        // Live safehouse connection state (#4345) — the pool's shared cell is
+        // updated by the narration sink / peer-coordination tasks
+        // `start_safehouse_narration`/`start_peer_coordination` spawn, and
+        // read back here on every status call (no second connection).
+        safehouse: Some(workspace_pool.safehouse_status()),
     }
 }
 
@@ -4522,6 +4527,11 @@ exit 0
             auto_update_terminal_reason: None,
             auto_update_note: Some("within settle window".to_string()),
             host_breaker: None,
+            safehouse: Some(crate::types::SafehouseStatus {
+                state: "connected".to_string(),
+                socket: Some(std::path::PathBuf::from("/tmp/safehoused.sock")),
+                room: Some("fleet".to_string()),
+            }),
         };
         let resp = Response::DaemonStatus(Box::new(report));
         let json = serde_json::to_string(&resp).expect("serialize response");
@@ -4865,6 +4875,15 @@ exit 0
         // The tempdir has no `.loom/tokens/`, so the pool + dynamic cap are 0.
         assert_eq!(report.token_pool_size, 0);
         assert_eq!(report.dynamic_cap, 0);
+        // #4345: a pool that never called start_safehouse_narration /
+        // start_peer_coordination still reports a live safehouse state — the
+        // cell's own default, not a missing/`None` field.
+        let safehouse = report
+            .safehouse
+            .as_ref()
+            .expect("safehouse status always present");
+        assert_eq!(safehouse.state, "not_configured");
+        assert!(safehouse.socket.is_none());
         // Per-repo breakdown: exactly one entry for the single workspace.
         assert_eq!(report.per_repo.len(), 1);
         assert_eq!(report.per_repo[0].root, root);

@@ -3305,6 +3305,14 @@ fn print_status_json(
             "sustain_ticks": h.sustain_ticks,
             "cooldown_secs": h.cooldown_secs,
         })),
+        // Live safehouse fleet-comms connection state (#4345) — `null` only
+        // from a pre-#4345 daemon binary that never computed one. `state` is
+        // one of "not_configured" / "unreachable" / "connected".
+        "safehouse": report.safehouse.as_ref().map(|s| serde_json::json!({
+            "state": s.state,
+            "socket": s.socket,
+            "room": s.room,
+        })),
     });
     println!("{}", serde_json::to_string_pretty(&combined)?);
     Ok(())
@@ -3667,6 +3675,33 @@ fn print_status_human(
         Some(c) => println!("Forge credential: DEGRADED — {}", c.message),
         None => {
             println!("Forge credential: unknown (older daemon binary — restart to pick up #4005)")
+        }
+    }
+
+    // Live safehouse fleet-comms connection state (#4345): before this,
+    // "not configured", "configured but unreachable", and "connected" all
+    // looked identical — silence. See `.loom/docs/safehouse.md`.
+    match &report.safehouse {
+        Some(s) if s.state == "connected" => {
+            println!(
+                "Safehouse:     connected (room: {}, socket: {})",
+                s.room.as_deref().unwrap_or("(default — sole joined room)"),
+                s.socket
+                    .as_ref()
+                    .map_or_else(|| "?".to_string(), |p| p.display().to_string())
+            );
+        }
+        Some(s) if s.state == "unreachable" => {
+            println!(
+                "Safehouse:     configured, unreachable (socket: {})",
+                s.socket
+                    .as_ref()
+                    .map_or_else(|| "unresolved".to_string(), |p| p.display().to_string())
+            );
+        }
+        Some(_) => println!("Safehouse:     not configured"),
+        None => {
+            println!("Safehouse:     unknown (older daemon binary — restart to pick up #4345)")
         }
     }
 
@@ -5676,6 +5711,7 @@ mod status_client_tests {
             auto_update_terminal_reason: None,
             auto_update_note: None,
             host_breaker: None,
+            safehouse: None,
         }
     }
 
