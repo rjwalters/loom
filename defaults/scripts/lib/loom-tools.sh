@@ -8,7 +8,7 @@
 #
 # Usage:
 #   source "$(dirname "${BASH_SOURCE[0]}")/lib/loom-tools.sh"
-#   run_loom_tool "agent-spawn" "agent_spawn" "$@"
+#   run_loom_tool "claim" "claim" "$@"
 
 # Find the repository root from the script location
 _find_repo_root() {
@@ -72,8 +72,8 @@ find_loom_tools() {
 
 # Run a loom-tools command with proper fallback chain
 # Arguments:
-#   $1 - CLI command name (e.g., "agent-spawn" for loom-agent-spawn)
-#   $2 - Python module name (e.g., "agent_spawn" for loom_tools.agent_spawn)
+#   $1 - CLI command name (e.g., "claim" for loom-claim)
+#   $2 - Python module name (e.g., "claim" for loom_tools.claim)
 #   $@ - Arguments to pass to the command
 #
 # Priority:

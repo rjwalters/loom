@@ -376,6 +376,103 @@ enum Commands {
         action: TokensAction,
     },
 
+    /// Standalone CLI surface over `terminal.rs`'s per-agent
+    /// `CLAUDE_CONFIG_DIR` isolation (issue #4415, epic #4081 Phase 3 family
+    /// 4): create/remove/validate an agent's isolated config directory, and
+    /// pre-seed the folder-trust modal for a spawn target. Exists so the
+    /// manual-mode spawn path reuses the same logic
+    /// `TerminalManager::create_terminal`/`destroy_terminal` already use
+    /// internally, rather than a second (Python) reimplementation. Purely
+    /// file-based; does not require a running daemon.
+    ClaudeConfig {
+        #[command(subcommand)]
+        action: ClaudeConfigAction,
+    },
+
+    /// Native port of `loom-agent-spawn` (issue #4415, epic #4081 Phase 3
+    /// family 4): spawn a Claude Code agent in a tmux session on the shared
+    /// `loom` socket. Backs `defaults/scripts/agent-spawn.sh`; flags, exit
+    /// codes (0 success / 1 error), and the `--json` payload mirror the
+    /// retired Python CLI. Does not require a running daemon.
+    AgentSpawn {
+        /// Role name (builder, judge, curator, ...).
+        #[arg(long)]
+        role: Option<String>,
+
+        /// Session identifier (tmux session becomes `loom-<name>`).
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Arguments appended to the role slash command.
+        #[arg(long, default_value = "")]
+        args: String,
+
+        /// Path to a git worktree the agent should run in.
+        #[arg(long)]
+        worktree: Option<String>,
+
+        /// Mark the session ephemeral (for `agent-destroy.sh` cleanup).
+        #[arg(long = "on-demand")]
+        on_demand: bool,
+
+        /// Force a new session even if one exists (kills stuck sessions).
+        #[arg(long)]
+        fresh: bool,
+
+        /// Block until the agent completes.
+        #[arg(long)]
+        wait: bool,
+
+        /// Timeout in seconds for `--wait`.
+        #[arg(long, default_value_t = 3600)]
+        timeout: u64,
+
+        /// Emit the spawn result as JSON on stdout.
+        #[arg(long)]
+        json: bool,
+
+        /// Check whether a session exists (exit 0 if yes, 1 if no).
+        #[arg(long, value_name = "NAME")]
+        check: Option<String>,
+
+        /// List all active loom-agent tmux sessions.
+        #[arg(long)]
+        list: bool,
+    },
+
+    /// Native port of `loom-agent-wait` (issue #4415, epic #4081 Phase 3
+    /// family 4): block until a tmux Claude agent finishes. Backs
+    /// `defaults/scripts/agent-wait.sh`; exit codes are unchanged
+    /// (0 completed / 1 timeout / 2 not found or error). Does not require a
+    /// running daemon.
+    AgentWait {
+        /// Agent session name (without the `loom-` prefix).
+        #[arg(value_name = "NAME")]
+        name: String,
+
+        /// Maximum time to wait, in seconds. `0` performs a single
+        /// non-blocking check.
+        #[arg(long, default_value_t = 3600)]
+        timeout: u64,
+
+        /// Seconds between polls.
+        #[arg(long = "poll-interval", default_value_t = 5)]
+        poll_interval: u64,
+
+        /// Minimum session age before idle-prompt detection activates.
+        /// `--min-idle-elapsed` is a deprecated alias.
+        #[arg(
+            long = "min-session-age",
+            alias = "min-idle-elapsed",
+            default_value_t = 10
+        )]
+        min_session_age: u64,
+
+        /// Emit the wait result as JSON on stdout.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Native port of `loom-clean` (Issue #4272, epic #4081 Phase 3 family 2):
     /// worktree/branch/tmux/agent-config cleanup, `--deep` build-artifact
     /// removal, `--safe` merged-PR-only mode, and `--daemon` crash recovery.
@@ -1019,6 +1116,67 @@ enum TokensAction {
         /// Emit a JSON status instead of a human message.
         #[arg(long)]
         json: bool,
+    },
+}
+
+/// Sub-actions for `loom-daemon claude-config` (issue #4415).
+#[derive(Subcommand)]
+enum ClaudeConfigAction {
+    /// Create (or refresh) an isolated `CLAUDE_CONFIG_DIR` for `name`.
+    /// Prints the resulting config dir path on success.
+    Setup {
+        /// Agent/session name (e.g. "builder-1").
+        #[arg(value_name = "NAME")]
+        name: String,
+
+        /// Repo root the config dir is created under
+        /// (`<workspace>/.loom/claude-config/<name>`).
+        #[arg(long, value_name = "PATH", default_value = ".")]
+        workspace: String,
+
+        /// Emit `{"config_dir": "..."}` instead of the bare path.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Remove one agent's config directory. Exits 0 whether or not it
+    /// existed (non-fatal-if-missing).
+    Cleanup {
+        #[arg(value_name = "NAME")]
+        name: String,
+
+        #[arg(long, value_name = "PATH", default_value = ".")]
+        workspace: String,
+
+        /// Emit `{"removed": bool}` instead of a human message.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Validate that an agent's config directory is present and healthy.
+    /// Exits 0 when healthy, 1 when missing/corrupted (never spawns a
+    /// process to check — see issue #2909).
+    Validate {
+        #[arg(value_name = "NAME")]
+        name: String,
+
+        #[arg(long, value_name = "PATH", default_value = ".")]
+        workspace: String,
+
+        /// Emit `{"healthy": bool}` instead of a human message.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Pre-seed the folder-trust modal for a non-interactive spawn target
+    /// (issue #4334) so the role command isn't delivered as keystrokes into
+    /// the "Is this a project you trust?" dialog. Idempotent no-op if
+    /// already trusted. Gated by `LOOM_AUTO_TRUST` (default enabled).
+    Trust {
+        /// Exact spawn target directory to mark trusted (the worktree path
+        /// when spawning into a worktree, not just the repo root).
+        #[arg(long, value_name = "PATH")]
+        project_dir: String,
     },
 }
 
@@ -2363,6 +2521,57 @@ fn handle_cli_command(command: Commands) -> Result<()> {
         Commands::Workspace { action } => handle_workspace_command(action),
         Commands::Fleet { action } => handle_fleet_command(action),
         Commands::Tokens { action } => handle_tokens_command(action),
+        Commands::ClaudeConfig { action } => handle_claude_config_command(action),
+        Commands::AgentSpawn {
+            role,
+            name,
+            args,
+            worktree,
+            on_demand,
+            fresh,
+            wait,
+            timeout,
+            json,
+            check,
+            list,
+        } => {
+            use loom_daemon::agent_session::spawn::{self, SpawnOptions};
+            let opts = SpawnOptions {
+                role: role.unwrap_or_default(),
+                name: name.unwrap_or_default(),
+                args,
+                worktree: worktree.unwrap_or_default(),
+                on_demand,
+                fresh,
+                do_wait: wait,
+                wait_timeout: timeout,
+                json_output: json,
+                check_name: check.unwrap_or_default(),
+                do_list: list,
+                ..Default::default()
+            }
+            .with_process_env();
+            let cwd = std::env::current_dir()?;
+            std::process::exit(spawn::run(&loom_daemon::agent_session::SystemEnv, &opts, &cwd));
+        }
+        Commands::AgentWait {
+            name,
+            timeout,
+            poll_interval,
+            min_session_age,
+            json,
+        } => {
+            use loom_daemon::agent_session::wait::{self, WaitOptions};
+            let opts = WaitOptions {
+                name,
+                timeout,
+                poll_interval,
+                min_session_age,
+                json_output: json,
+            };
+            let cwd = std::env::current_dir()?;
+            std::process::exit(wait::run(&loom_daemon::agent_session::SystemEnv, &opts, &cwd));
+        }
         Commands::UpdateGitignore { workspace } => handle_update_gitignore_command(&workspace),
         Commands::Clean {
             workspace,
@@ -5511,6 +5720,94 @@ fn resolve_tokens_workspace(workspace: &str) -> Result<PathBuf> {
         std::env::current_dir().map_err(Into::into)
     } else {
         Ok(std::env::current_dir()?.join(p))
+    }
+}
+
+/// `loom-daemon claude-config` handler (issue #4415).
+fn handle_claude_config_command(action: ClaudeConfigAction) -> Result<()> {
+    use loom_daemon::terminal::{
+        claude_config_cleanup, claude_config_setup, claude_config_trust, claude_config_validate,
+    };
+
+    match action {
+        ClaudeConfigAction::Setup {
+            name,
+            workspace,
+            json,
+        } => {
+            let repo_root = resolve_tokens_workspace(&workspace)?;
+            match claude_config_setup(&name, &repo_root) {
+                Some(config_dir) => {
+                    if json {
+                        let mut obj = serde_json::Map::new();
+                        obj.insert(
+                            "config_dir".to_string(),
+                            serde_json::Value::String(config_dir.display().to_string()),
+                        );
+                        println!("{}", serde_json::Value::Object(obj));
+                    } else {
+                        println!("{}", config_dir.display());
+                    }
+                    Ok(())
+                }
+                None => {
+                    eprintln!("error: failed to set up config dir for '{name}'");
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        ClaudeConfigAction::Cleanup {
+            name,
+            workspace,
+            json,
+        } => {
+            let repo_root = resolve_tokens_workspace(&workspace)?;
+            let removed = claude_config_cleanup(&name, &repo_root);
+            if json {
+                let mut obj = serde_json::Map::new();
+                obj.insert("removed".to_string(), serde_json::Value::Bool(removed));
+                println!("{}", serde_json::Value::Object(obj));
+            } else if removed {
+                println!("Removed config dir for '{name}'");
+            } else {
+                println!("No config dir found for '{name}' (nothing to remove)");
+            }
+            Ok(())
+        }
+
+        ClaudeConfigAction::Validate {
+            name,
+            workspace,
+            json,
+        } => {
+            let repo_root = resolve_tokens_workspace(&workspace)?;
+            let healthy = claude_config_validate(&name, &repo_root);
+            if json {
+                let mut obj = serde_json::Map::new();
+                obj.insert("healthy".to_string(), serde_json::Value::Bool(healthy));
+                println!("{}", serde_json::Value::Object(obj));
+            }
+            if healthy {
+                Ok(())
+            } else {
+                if !json {
+                    eprintln!("config dir for '{name}' is missing or unhealthy");
+                }
+                std::process::exit(1);
+            }
+        }
+
+        ClaudeConfigAction::Trust { project_dir } => {
+            let p = Path::new(&project_dir);
+            let project_path = if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                std::env::current_dir()?.join(p)
+            };
+            claude_config_trust(&project_path);
+            Ok(())
+        }
     }
 }
 

@@ -19,9 +19,10 @@
 #     .loom/docs/build-gate.md.
 #   - loom-tools pytest runs via `uv run` so the package is importable from
 #     the project venv; scoped to exclude the live-network e2e suite
-#     (tests/integration) and the known slow real-time bypass-poll integration
-#     test file (already stubbed in-tree, but excluded here to keep the gate
-#     fast and stable).
+#     (tests/integration). The second exclusion that used to sit here (the slow
+#     real-time bypass-poll integration file) went away with #4415, which
+#     deleted agent_spawn.py and its tests in favour of native
+#     `loom-daemon agent-spawn`.
 #   - bash scripts/test-installer.sh runs the 131-case installer suite.
 #   - mcp-loom (TypeScript) is intentionally EXCLUDED: it needs npm install/ci
 #     in a fresh worktree (no guaranteed warm node_modules), which adds
@@ -115,12 +116,16 @@ fi
 echo "[build-gate] cargo test --lib --bins (workspace unit tests; host-dependent integration targets are CI-only, #3985)"
 cargo test --workspace --lib --bins
 
-echo "[build-gate] loom-tools pytest (scoped, excludes network e2e + known slow poll test)"
+echo "[build-gate] loom-tools pytest (scoped, excludes network e2e)"
 (
   cd loom-tools
+  # The `--ignore=tests/tokens/test_agent_spawn_integration.py` line that used
+  # to sit here (a slow real-time token-injection test) was dropped in epic
+  # #4081 Phase 3 family 4 (#4415): agent_spawn.py and that test were deleted
+  # when spawning went native. Equivalent coverage now runs in
+  # `cargo test -p loom-daemon` (agent_session::spawn).
   uv run pytest tests/ -q \
-    --ignore=tests/integration \
-    --ignore=tests/tokens/test_agent_spawn_integration.py
+    --ignore=tests/integration
 )
 
 echo "[build-gate] bash installer suite"
