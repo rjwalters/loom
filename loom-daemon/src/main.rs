@@ -1963,21 +1963,85 @@ fn resolve_socket_path() -> Result<PathBuf> {
     Ok(resolve_loom_dir()?.join("loom-daemon.sock"))
 }
 
+/// How a single [`query_daemon_status_once`] attempt failed (#4279), so the
+/// caller retries ONLY the transient "daemon dropped the connection before
+/// replying" case — never a clean "socket absent" or a slow-daemon timeout.
+enum StatusAttemptError {
+    /// Connect phase failed — socket absent, connection refused, or the connect
+    /// itself timed out. A reconnect cannot help (the daemon is simply not
+    /// listening), so this is never retried: fast-fail preserves the operator's
+    /// "is the daemon running?" latency.
+    Connect(anyhow::Error),
+    /// The daemon accepted the connection but dropped it before writing a full
+    /// response line — either a clean pre-response EOF or, on Linux, a RST that
+    /// surfaces as a `ConnectionReset`/`BrokenPipe`/`UnexpectedEof` read/write
+    /// error (see [`classify_roundtrip_error`]). This is the transient
+    /// contention failure #4279 retries exactly once — under concurrent-sweep
+    /// load a per-connection task can briefly drop a `status` connection that
+    /// the very next one answers.
+    DroppedBeforeReply(anyhow::Error),
+    /// The round-trip failed for a non-transient reason: it timed out against a
+    /// slow-but-live daemon (honor the single 5s budget rather than doubling it)
+    /// or the response frame was malformed / an explicit daemon error. Retrying
+    /// would not change the outcome, so it is not retried.
+    Roundtrip(anyhow::Error),
+}
+
+impl StatusAttemptError {
+    /// Unwrap to the underlying diagnostic surfaced to the operator.
+    fn into_inner(self) -> anyhow::Error {
+        match self {
+            Self::Connect(e) | Self::DroppedBeforeReply(e) | Self::Roundtrip(e) => e,
+        }
+    }
+}
+
 /// Connect to the running daemon over its Unix socket, send a single
 /// `DaemonStatus` request, and return the parsed report (Issue #3891).
 ///
 /// Both the connect and the round-trip are individually bounded so an
-/// unresponsive/wedged daemon cannot hang the CLI. Errors when the daemon is
-/// unreachable (socket absent / not listening) or the response is malformed.
+/// unresponsive/wedged daemon cannot hang the CLI. A single bounded reconnect
+/// retry (#4279) absorbs a transient dropped connection — a daemon under
+/// concurrent-sweep load can accept then close a `status` connection with zero
+/// bytes written, which the client would otherwise surface as a bare EOF that a
+/// stdout-capturing monitor misreads as an empty status. A clean "socket absent"
+/// or a slow-daemon timeout is deliberately NOT retried. Errors (after the one
+/// retry, where applicable) when the daemon is unreachable or the response is
+/// malformed.
 async fn query_daemon_status(socket_path: &Path) -> Result<DaemonStatusReport> {
     const TIMEOUT: Duration = Duration::from_secs(5);
 
-    let stream = tokio::time::timeout(TIMEOUT, UnixStream::connect(socket_path))
+    match query_daemon_status_once(socket_path, TIMEOUT).await {
+        Ok(report) => Ok(report),
+        Err(StatusAttemptError::DroppedBeforeReply(_first)) => {
+            // One bounded reconnect retry — the transient case only.
+            query_daemon_status_once(socket_path, TIMEOUT)
+                .await
+                .map_err(StatusAttemptError::into_inner)
+        }
+        Err(other) => Err(other.into_inner()),
+    }
+}
+
+/// A single connect + `DaemonStatus` round-trip attempt, classifying any failure
+/// so [`query_daemon_status`] can decide whether to retry (#4279).
+async fn query_daemon_status_once(
+    socket_path: &Path,
+    timeout: Duration,
+) -> std::result::Result<DaemonStatusReport, StatusAttemptError> {
+    let stream = tokio::time::timeout(timeout, UnixStream::connect(socket_path))
         .await
-        .map_err(|_| anyhow!("connect timed out after {}s", TIMEOUT.as_secs()))?
-        .map_err(|e| anyhow!("connect failed: {e}"))?;
+        .map_err(|_| {
+            StatusAttemptError::Connect(anyhow!("connect timed out after {}s", timeout.as_secs()))
+        })?
+        .map_err(|e| StatusAttemptError::Connect(anyhow!("connect failed: {e}")))?;
     let (reader, mut writer) = stream.into_split();
 
+    // The round-trip yields `Ok(None)` on a clean pre-response EOF (the retryable
+    // drop), `Ok(Some(report))` on success, and `Err(_)` for either a
+    // malformed/error frame OR a pre-response read/write I/O error (e.g. the
+    // Linux RST drop) — the timeout wrapper below routes each `Err(_)` through
+    // `classify_roundtrip_error` to decide whether it is the retryable drop.
     let roundtrip = async move {
         let request_json = serde_json::to_string(&Request::DaemonStatus)?;
         writer.write_all(request_json.as_bytes()).await?;
@@ -1985,24 +2049,63 @@ async fn query_daemon_status(socket_path: &Path) -> Result<DaemonStatusReport> {
         writer.flush().await?;
 
         let mut lines = BufReader::new(reader).lines();
-        let line = lines
-            .next_line()
-            .await?
-            .ok_or_else(|| anyhow!("daemon closed the connection without responding"))?;
-        let response: Response = serde_json::from_str(&line)?;
-        match response {
-            // `Response::DaemonStatus` is boxed (issue #4292); unbox here so
-            // this function's `Result<DaemonStatusReport>` signature (and its
-            // one caller's field accesses) stays unchanged.
-            Response::DaemonStatus(report) => Ok(*report),
-            Response::Error { message } => Err(anyhow!("daemon error: {message}")),
-            other => Err(anyhow!("unexpected response: {other:?}")),
+        match lines.next_line().await? {
+            None => Ok(None),
+            Some(line) => {
+                let response: Response = serde_json::from_str(&line)?;
+                match response {
+                    // `Response::DaemonStatus` is boxed (issue #4292); unbox
+                    // here so the retry-aware `Result<Option<DaemonStatusReport>>`
+                    // signature (and its callers' field accesses) stays unchanged.
+                    Response::DaemonStatus(report) => Ok(Some(*report)),
+                    Response::Error { message } => Err(anyhow!("daemon error: {message}")),
+                    other => Err(anyhow!("unexpected response: {other:?}")),
+                }
+            }
         }
     };
 
-    tokio::time::timeout(TIMEOUT, roundtrip)
-        .await
-        .map_err(|_| anyhow!("status round-trip timed out after {}s", TIMEOUT.as_secs()))?
+    match tokio::time::timeout(timeout, roundtrip).await {
+        Err(_elapsed) => Err(StatusAttemptError::Roundtrip(anyhow!(
+            "status round-trip timed out after {}s",
+            timeout.as_secs()
+        ))),
+        Ok(Err(e)) => Err(classify_roundtrip_error(e)),
+        Ok(Ok(None)) => Err(StatusAttemptError::DroppedBeforeReply(anyhow!(
+            "daemon closed the connection without responding"
+        ))),
+        Ok(Ok(Some(report))) => Ok(report),
+    }
+}
+
+/// Classify a round-trip `Err` from [`query_daemon_status_once`]'s I/O closure as
+/// retryable or not (#4279). A read/write I/O error that fires before a full
+/// response line arrived is the SAME transient drop as a clean pre-response EOF:
+/// on Linux a peer that closes the socket with unread request bytes still queued
+/// in its kernel receive buffer replies with RST, so the client's read surfaces
+/// `ConnectionReset` (os error 104) instead of the clean EOF macOS reports — both
+/// mean "the daemon dropped us before replying". `ConnectionReset`, `BrokenPipe`,
+/// and `UnexpectedEof` are therefore reclassified as the retryable
+/// [`StatusAttemptError::DroppedBeforeReply`] (reusing the same friendly
+/// diagnostic as the EOF path so the operator message is platform-independent).
+/// Malformed-JSON responses and explicit `Response::Error` replies are NOT
+/// `io::Error`s, so they stay non-retryable [`StatusAttemptError::Roundtrip`].
+fn classify_roundtrip_error(e: anyhow::Error) -> StatusAttemptError {
+    let dropped_before_reply = e.downcast_ref::<std::io::Error>().is_some_and(|io_err| {
+        matches!(
+            io_err.kind(),
+            std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::UnexpectedEof
+        )
+    });
+    if dropped_before_reply {
+        StatusAttemptError::DroppedBeforeReply(anyhow!(
+            "daemon closed the connection without responding"
+        ))
+    } else {
+        StatusAttemptError::Roundtrip(e)
+    }
 }
 
 /// Handle the `quarantine` subcommand (Issue #3939). Connects to the running
@@ -5358,5 +5461,171 @@ mod dispatch_tests {
         let halted = classify(Some(true), true, false, None, None);
         assert_eq!(gate_status_short_label(&halted), "HALTED");
         assert!(format_gate_status(&halted).starts_with("HALTED"));
+    }
+}
+
+#[cfg(test)]
+mod status_client_tests {
+    //! Tests for the `loom-daemon status` IPC client (Issue #4279): the silent
+    //! empty-output failure mode. A daemon under concurrent-sweep load could
+    //! accept a `status` connection and drop it with zero bytes written; the
+    //! client surfaced that as a bare EOF. These tests lock in the two
+    //! invariants: (1) an EOF (accept-then-close) yields a non-zero-worthy
+    //! `Err` with a diagnostic — never an empty success — and (2) a single
+    //! reconnect retry absorbs a transient first-connection drop.
+    use super::query_daemon_status;
+    use chrono::Utc;
+    use loom_daemon::types::{
+        CapacityReport, CredentialPreflightReport, DaemonStatusReport, Response,
+    };
+    use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixListener;
+
+    /// A fully-populated report the fake daemon can serialize back to the client
+    /// on a successful round-trip. Every field is compiler-checked, so a schema
+    /// change surfaces here rather than as a silently-skewed wire payload.
+    fn sample_report() -> DaemonStatusReport {
+        DaemonStatusReport {
+            in_flight: vec![],
+            unregistered_locked: vec![],
+            token_pool_size: 4,
+            token_pool_dir: Some(std::path::PathBuf::from("/repo/a/.loom/tokens")),
+            disk_headroom: 10,
+            cpu_headroom: 6,
+            logical_cpus: 8,
+            loadavg_1m: Some(1.25),
+            cpu_idle_fraction: Some(0.90),
+            capacity_bound: false,
+            configured_max: 5,
+            per_token_concurrency: 2,
+            dynamic_cap: 3,
+            main_health_gate_halted: false,
+            main_health_gate_not_evaluated: false,
+            main_health_gate_not_evaluated_reason: None,
+            main_health_gate_enabled: Some(true),
+            main_health_gate_verdict_at: Some(Utc::now()),
+            capacity: CapacityReport {
+                ranking_present: true,
+                total_accounts: 4,
+                healthy_accounts: 3,
+                exhausted_accounts: 1,
+                token_axis_limit: 3,
+                token_bound: true,
+            },
+            per_repo: vec![],
+            credential_preflight: Some(CredentialPreflightReport {
+                ok: true,
+                mechanism: "test-fixture".to_string(),
+                fingerprint: None,
+                message: "test fixture — not a real preflight".to_string(),
+                checked_at: Utc::now(),
+            }),
+            draining: false,
+            drain_deadline: None,
+            drain_note: None,
+            auto_update_enabled: false,
+            auto_update_last_check: None,
+            auto_update_last_roll: None,
+            auto_update_consecutive_failures: 0,
+            auto_update_backoff_secs: None,
+            auto_update_terminal_reason: None,
+            auto_update_note: None,
+            host_breaker: None,
+        }
+    }
+
+    /// The core #4279 invariant: a daemon that accepts the connection and closes
+    /// it before writing any response byte (the silent-EOF failure mode) must
+    /// surface an `Err` with a diagnostic — never an empty "successful" report.
+    /// The client retries once, so the fake server drops BOTH connections.
+    #[tokio::test]
+    async fn status_eof_yields_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind");
+
+        // Accept and immediately drop every connection (the initial attempt plus
+        // the one bounded reconnect retry).
+        let server = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+
+        let started = std::time::Instant::now();
+        let result = query_daemon_status(&socket_path).await;
+        let elapsed = started.elapsed();
+
+        assert!(result.is_err(), "accept-then-close must be an error, not an empty success");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("closed the connection without responding"),
+            "error should name the dropped connection, got: {msg}"
+        );
+        // Both attempts hit an immediate EOF, so this returns promptly — the
+        // reconnect retry never stretches into the 5s round-trip budget.
+        assert!(elapsed < Duration::from_secs(2), "EOF path took too long: {elapsed:?}");
+
+        server.abort();
+    }
+
+    /// The single-reconnect acceptance criterion: the daemon drops the first
+    /// `status` connection (transient contention) but answers the second. The
+    /// client's one bounded retry must absorb the drop and return the report.
+    #[tokio::test]
+    async fn status_retry_succeeds_after_transient_drop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind");
+
+        let server = tokio::spawn(async move {
+            // First connection: accept and drop without replying.
+            let (first, _) = listener.accept().await.expect("accept #1");
+            drop(first);
+
+            // Second connection: read the request line, then reply with a valid
+            // DaemonStatus frame.
+            let (stream, _) = listener.accept().await.expect("accept #2");
+            let (reader, mut writer) = stream.into_split();
+            let mut lines = BufReader::new(reader).lines();
+            let _ = lines
+                .next_line()
+                .await
+                .expect("read")
+                .expect("request line");
+            let json = serde_json::to_string(&Response::DaemonStatus(Box::new(sample_report())))
+                .expect("serialize response");
+            writer.write_all(json.as_bytes()).await.expect("write");
+            writer.write_all(b"\n").await.expect("newline");
+            writer.flush().await.expect("flush");
+        });
+
+        let result = query_daemon_status(&socket_path).await;
+        match result {
+            Ok(report) => assert_eq!(report.token_pool_size, 4),
+            Err(e) => panic!("retry should have absorbed the first-connection drop, got: {e}"),
+        }
+
+        server.await.expect("server task");
+    }
+
+    /// A missing socket (no daemon listening at all) must fail fast WITHOUT a
+    /// reconnect retry — a clean "socket absent" is not the transient case, so
+    /// retrying would only fail twice for no benefit.
+    #[tokio::test]
+    async fn status_absent_socket_errors_fast() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("nonexistent.sock");
+
+        let started = std::time::Instant::now();
+        let result = query_daemon_status(&socket_path).await;
+        let elapsed = started.elapsed();
+
+        assert!(result.is_err(), "expected a connect error for an absent socket");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "absent-socket path took too long: {elapsed:?}"
+        );
     }
 }
