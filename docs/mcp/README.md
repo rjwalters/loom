@@ -93,12 +93,15 @@ The unified `mcp-loom` package provides all Loom MCP tools in a single server. T
 
 ### Installation
 
-MCP servers are automatically available when you clone the Loom repository. They're configured in `.mcp.json` and `.claude/settings.json`.
+Since #4230, the `loom` MCP server is registered **once per machine at user
+scope**, not per-repo. `scripts/install-loom.sh` does this at install time
+(idempotently), and `loom update` refreshes the registration afterward — no
+per-repo `.mcp.json` is needed or generated.
 
 **Verify Installation**:
 ```bash
-# Check MCP configuration
-cat .mcp.json
+# Check the user-scope registration
+claude mcp list --scope user
 
 # Verify unified package exists
 ls mcp-loom/
@@ -106,27 +109,21 @@ ls mcp-loom/
 
 ### Configuration
 
-The unified MCP server is configured in `.mcp.json`:
-
-```json
-{
-  "mcpServers": {
-    "loom": {
-      "command": "node",
-      "args": ["mcp-loom/dist/index.js"],
-      "env": {
-        "LOOM_WORKSPACE": "/Users/you/GitHub/loom"
-      }
-    }
-  }
-}
-```
-
-Or generate the configuration automatically:
+Registration is a one-time, machine-level `claude mcp add`:
 
 ```bash
-./scripts/setup-mcp.sh
+claude mcp add --scope user loom -- node ~/.local/share/loom/mcp-loom/dist/index.js
 ```
+
+A single user-scoped instance serves every repo: mcp-loom resolves the
+**invoking** repo from its process CWD (`LOOM_WORKSPACE` env override, then a
+walk up from `process.cwd()` to a `.loom/`/`.git` root). See
+[`defaults/docs/machine-dispatcher.md`](../../defaults/docs/machine-dispatcher.md)
+for the full registration model and why per-repo `.mcp.json` generation was
+demoted (project-scope entries outrank and silently shadow the user-scope
+server). `scripts/setup-mcp.sh` is now only a bundle-rebuild/legacy-migration
+tool, with a safehouse-only residual role emitting a per-repo `.mcp.json`
+containing just the `safehouse` server.
 
 ### Building MCP Server
 

@@ -250,8 +250,9 @@ Configuration lives in `.loom/config.json` (committed for team sharing): a
   `cloudCli`, `reversibleGh`, `rmScope`, `forceScope`, `readOnlyFastPath`,
   `decisionLog`, `worktreeIsolation`, `stashScope`, each with an `LOOM_*` env
   override) let a repo opt out. Catalog: [`defaults/docs/guard-hooks.md`](defaults/docs/guard-hooks.md).
-- **MCP hooks** — the unified `mcp-loom` server; run `./scripts/setup-mcp.sh` to
-  generate `.mcp.json`. See the mcp-loom README.
+- **MCP hooks** — the unified `mcp-loom` server is registered once per machine at
+  user scope (`scripts/install-loom.sh`, refreshed by `loom update`); `setup-mcp.sh`
+  is demoted to a bundle-rebuild/legacy-migration tool. See the mcp-loom README.
 
 ### Multi-Account Token Pool (operating summary)
 

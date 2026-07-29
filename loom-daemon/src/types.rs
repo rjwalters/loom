@@ -426,10 +426,27 @@ pub enum Request {
     ///
     /// On an unsupervised host the daemon refuses immediately (before pausing
     /// dispatch) with `DaemonDrain { accepted: false, .. }`, mirroring
-    /// [`Request::RestartDaemon`]'s refusal contract.
+    /// [`Request::RestartDaemon`]'s refusal contract — **unless** `then_exit`
+    /// is set (see below), in which case the supervisor requirement does not
+    /// apply at all.
+    ///
+    /// - `then_exit` (Issue #4343, `fleet drain`'s teardown use case):
+    ///   `false` (the #4090 default) preserves the original restart-when-drained
+    ///   behavior byte-for-byte. `true` changes the terminal action from
+    ///   "exit [`crate::ipc::EXIT_RESTART`] for a supervised relaunch" to "exit
+    ///   [`crate::ipc::EXIT_SHUTDOWN`] and **stay down**" — the daemon must not
+    ///   pick up new dispatch on a host about to be powered off, so a relaunch
+    ///   would defeat the whole point of draining before teardown. Because a
+    ///   `then_exit` drain deliberately does **not** want a relaunch, the
+    ///   supervisor-detection refusal gate is skipped entirely for it (there is
+    ///   nothing to prove supervision *for*). `#[serde(default)]` keeps
+    ///   pre-#4343 wire data (`{"type":"DrainAndRestartDaemon","payload":{...}}`
+    ///   with no `then_exit` key) parsing as `false` — the original behavior.
     DrainAndRestartDaemon {
         timeout_secs: Option<u64>,
         force_after_timeout: bool,
+        #[serde(default)]
+        then_exit: bool,
     },
     /// Abort an in-progress drain (Issue #4090): clear the drain flag so new
     /// dispatch resumes, and stop the drain-supervisor task so no later restart
@@ -601,11 +618,17 @@ pub enum Response {
     /// `in_flight` is the cross-root non-terminal sweep count at request time,
     /// so the operator immediately sees how much work the drain must wait for.
     /// `message` is a human-readable explanation for operator output.
+    /// `then_exit` (Issue #4343) echoes back the request's `then_exit`: `true`
+    /// means the daemon will exit and stay down once drained (never relaunch),
+    /// rather than restart. `#[serde(default)]` keeps pre-#4343 wire data
+    /// parsing (as `false`).
     DaemonDrain {
         accepted: bool,
         supervisor: Option<String>,
         in_flight: usize,
         message: String,
+        #[serde(default)]
+        then_exit: bool,
     },
     // ========================================================================
     // Workspace Registry Responses (Issue #3926 — phase 1 of #3835)
