@@ -24,6 +24,37 @@
 
 set -uo pipefail
 
+# Production-binary checksum guard (#4381 incident): 2026-07-29 ~06:03Z, the
+# REAL machine-level `~/.local/bin/loom-daemon` was overwritten with a fake,
+# infinitely-looping test-fixture stub for ~9 hours (an operator `status` poll
+# hung; a crash at any point would have had launchd relaunch the stub). Root
+# cause: three tests below (37/39/43, the ff-sync/staleness-detection cases)
+# deliberately invoke loom-daemon-update.sh with NEITHER LOOM_DAEMON_BIN NOR a
+# stubbed scripts/install/provision-daemon.sh, so the update script's
+# provision_machine_daemon() call fell through to its real, un-sandboxed
+# default destination (`${LOOM_DAEMON_BIN_DIR:-$HOME/.local/bin}`) — the
+# operator's own real $HOME. The LOOM_DAEMON_BIN_DIR export below (threaded to
+# every sub-invocation) is the actual fix; THIS checksum snapshot is the
+# regression backstop that fails the suite outright if any current or future
+# test call site regresses into writing the real production binary, even if
+# the sandboxing above is bypassed or a new call site is added without it.
+# Recorded before ANYTHING else runs, using the checksum tool most likely
+# present (sha256sum on Linux, shasum on macOS); skipped (empty) only when
+# neither is on PATH or no binary exists yet at that path (nothing to compare
+# against — a fresh-machine first run).
+_PROD_DAEMON_BIN="$HOME/.local/bin/loom-daemon"
+_prod_daemon_checksum() {
+    [[ -e "$_PROD_DAEMON_BIN" ]] || { echo "<absent>"; return 0; }
+    if command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$_PROD_DAEMON_BIN" 2>/dev/null | awk '{print $1}'
+    elif command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$_PROD_DAEMON_BIN" 2>/dev/null | awk '{print $1}'
+    else
+        echo "<no-checksum-tool>"
+    fi
+}
+_PROD_DAEMON_CHECKSUM_BEFORE="$(_prod_daemon_checksum)"
+
 # Force the legacy nohup path everywhere in this suite (#3972): the restart
 # flow below exercises the REAL loom-daemon-start.sh / loom-daemon-stop.sh
 # (not a mock), and this test must NEVER touch the real machine's
@@ -419,6 +450,20 @@ BASE_WORKDIR="$(mktemp -d)"
 # sub-invocation (each cd'd into its own W* dir) inherits them.
 export LOOM_AUTONOMY_MARKER="$BASE_WORKDIR/autonomy-desired"
 export LOOM_WATCHDOG_LABEL="${LOOM_LAUNCHD_LABEL}-watchdog"
+
+# Machine-level provisioning sandbox (#4381 incident — see the checksum-guard
+# comment near the top of this file for the full writeup). loom-daemon-update.sh
+# resolves its machine-level install destination as
+# `${LOOM_DAEMON_BIN_DIR:-$HOME/.local/bin}` whenever LOOM_DAEMON_BIN is unset.
+# Most tests below pin LOOM_DAEMON_BIN explicitly (so this is inert for them),
+# but the ff-sync/staleness-detection tests (37/39/43) deliberately exercise the
+# no-LOOM_DAEMON_BIN path, and until this fix that meant an UNSANDBOXED
+# provision_machine_daemon() call landed on the operator's real
+# ~/.local/bin/loom-daemon. Exporting this suite-wide closes the hole for every
+# current call site AND any future one that forgets to set LOOM_DAEMON_BIN —
+# belt-and-braces with the checksum guard at both the top and bottom of this
+# file, which would otherwise be the only thing catching a regression.
+export LOOM_DAEMON_BIN_DIR="$BASE_WORKDIR/machine-level-bin-sandbox"
 
 # Suite-level decoy (#4078): a process whose argv ends in `/loom-daemon`, which
 # the stop script's label-blind `pgrep -f '(^|/)loom-daemon$'` fallback would
@@ -2140,6 +2185,26 @@ else
     TESTS_FAILED=$((TESTS_FAILED + 1))
     echo -e "${RED}✗${NC} no launchctl invocation named a com.rjwalters.* label"
     echo "  launchctl invocations: $(cat "$SANDBOX_LOG_DIR/launchctl-invocations.log" 2>/dev/null)"
+fi
+
+# ============================================================
+# 44. Production-binary checksum guard (#4381 incident): the REAL
+#     ~/.local/bin/loom-daemon must be byte-for-byte unchanged after the whole
+#     suite runs. This is the direct regression test for the 2026-07-29
+#     incident (a test fixture stub overwrote the production binary for ~9
+#     hours) — it fails LOUDLY if the LOOM_DAEMON_BIN_DIR sandbox above is ever
+#     bypassed, removed, or a new call site is added that skips it.
+# ============================================================
+_PROD_DAEMON_CHECKSUM_AFTER="$(_prod_daemon_checksum)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ "$_PROD_DAEMON_CHECKSUM_BEFORE" == "$_PROD_DAEMON_CHECKSUM_AFTER" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} real ${_PROD_DAEMON_BIN} is byte-identical before/after the suite (#4381 regression guard)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} real ${_PROD_DAEMON_BIN} CHANGED during this test run (#4381 regression!)"
+    echo "  before: $_PROD_DAEMON_CHECKSUM_BEFORE"
+    echo "  after:  $_PROD_DAEMON_CHECKSUM_AFTER"
 fi
 
 # ---------- summary ----------
