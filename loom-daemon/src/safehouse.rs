@@ -562,6 +562,7 @@ pub fn event_to_envelope(event: &Event) -> Option<Envelope> {
             issue,
             exit_code,
             duration_sec,
+            death_class: _,
             repo,
         } => {
             let prefix = repo_issue_prefix(repo.as_deref(), *issue);
@@ -585,6 +586,7 @@ pub fn event_to_envelope(event: &Event) -> Option<Envelope> {
             issue,
             checkpoint_phase,
             classification: _,
+            death_class: _,
             repo,
         } => {
             let phase = checkpoint_phase.as_deref().unwrap_or("unknown");
@@ -1584,6 +1586,7 @@ mod tests {
             issue: 42,
             exit_code: Some(0),
             duration_sec: 12,
+            death_class: None,
             repo: Some("/repos/vibesql".to_owned()),
         };
         let env = event_to_envelope(&exited).unwrap();
@@ -1595,6 +1598,7 @@ mod tests {
             issue: 42,
             exit_code: Some(78),
             duration_sec: 24,
+            death_class: None,
             repo: Some("/repos/vibesql".to_owned()),
         };
         let env = event_to_envelope(&exited_failed).unwrap();
@@ -1604,6 +1608,7 @@ mod tests {
             issue: 42,
             checkpoint_phase: Some("judge".to_owned()),
             classification: None,
+            death_class: None,
             repo: Some("/repos/vibesql".to_owned()),
         };
         let env = event_to_envelope(&crashed).unwrap();
