@@ -343,6 +343,17 @@ git -C "<WORKTREE_ABS>" status        # your changes should appear HERE
 ./.loom/scripts/check-main-clean.sh   # exits 3 if you contaminated main (#3513)
 ```
 
+**If it exits 3, clean up ALL-OR-NOTHING — never file by file (#4380).** Do not
+walk the offending paths with `git checkout -- <path>` / `rm <path>`; a
+half-restored main checkout is worse than either extreme. Re-run the check with
+`--quarantine` to move every offending path (tracked *and* untracked) into a
+stash rescue ref in one operation, then replay that diff inside your worktree:
+
+```bash
+./.loom/scripts/check-main-clean.sh --quarantine --label "issue=<N>"   # exit 4 ⇒ quarantined
+git -C "<MAIN_ROOT>" stash show -p stash@{0}                           # nothing was discarded
+```
+
 **If your working directory does NOT contain `.loom/worktrees/issue-`:**
 1. **STOP** - do not write any code
 2. Create the worktree: `./.loom/scripts/worktree.sh <issue-number>`
