@@ -293,8 +293,9 @@ Configuration lives in `.loom/config.json` (committed for team sharing): a
   unattended runs: [`.loom/docs/health-monitoring.md`](.loom/docs/health-monitoring.md);
   opt-in `UserPromptSubmit` context injection + transcript archival:
   [`.loom/docs/advanced-hooks.md`](.loom/docs/advanced-hooks.md).
-- **MCP hooks** — the unified `mcp-loom` server; run `./scripts/setup-mcp.sh` to
-  generate `.mcp.json`.
+- **MCP hooks** — the unified `mcp-loom` server is registered once per machine at
+  user scope (`scripts/install-loom.sh`, refreshed by `loom update`); `setup-mcp.sh`
+  is demoted to a bundle-rebuild/legacy-migration tool.
 
 ### Multi-Account Token Pool
 
