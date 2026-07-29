@@ -676,6 +676,12 @@ pub fn new_in_progress_guard() -> InProgressGuard {
     Arc::new(Mutex::new(HashSet::new()))
 }
 
+/// Number of role invocations active across all managed workspaces.
+#[must_use]
+pub fn active_run_count(set: &InProgressGuard) -> usize {
+    set.lock().unwrap_or_else(PoisonError::into_inner).len()
+}
+
 /// RAII guard: [`try_acquire`](Self::try_acquire) inserts `(root, role)` into
 /// the shared [`InProgressGuard`]; [`Drop`] removes it.
 ///
