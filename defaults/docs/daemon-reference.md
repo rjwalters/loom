@@ -604,6 +604,18 @@ on the registry entry as `drain_phase`):
 `remove-from-roster` (last — an interrupted drain stays visible, never
 silently gone).
 
+**What `wait-remote-exit` counts as "exited"**: the normal end state of a
+`then_exit` drain is **host up, daemon gone**, in which the remote
+`loom-daemon status --json` still answers — with the #4069 unreachable payload
+(`{"error": "could not reach loom-daemon at …", "install_state": …}` on stdout,
+non-zero exit). That payload, and an SSH-level failure (host itself gone), both
+mean "exited". Only a *live* status payload reporting `drain.draining: false`
+means the remote refused the drain and is still dispatching — the fail-loud
+exit-`2` case. A transient SSH blip mid-wait is indistinguishable from "host
+gone" and reads as a successful exit; the following phases are
+orchestrator-side and a still-running remote daemon shows up in the next
+`fleet status`.
+
 **Exit codes**: `0` fully verified (safe to power off); `1` a phase failed
 outright (SSH/launch failure, remote refusal — re-run to retry, resuming from
 the persisted phase); `2` the remote drain timed out **without**
