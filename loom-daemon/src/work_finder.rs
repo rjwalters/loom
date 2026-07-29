@@ -1971,30 +1971,10 @@ pub mod forge {
     use super::{WorkDispatcher, WorkItem, WorkSource};
     use crate::sweep_registry::SweepRegistry;
     use crate::types::{SweepKind, SweepState};
-    use anyhow::{anyhow, Context, Result};
-    use serde::Deserialize;
+    use anyhow::{anyhow, Result};
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
-    use std::process::{Command, Stdio};
     use std::sync::{Arc, Mutex};
-
-    /// Minimal `gh issue list --json number,labels,createdAt` row.
-    #[derive(Debug, Deserialize)]
-    struct GhIssue {
-        number: u32,
-        #[serde(default)]
-        labels: Vec<GhLabel>,
-        /// Issue creation timestamp for age ordering (#3946). `#[serde(default)]`
-        /// tolerates older `gh` output that omits it (the item then sorts by
-        /// number as its age proxy).
-        #[serde(rename = "createdAt", default)]
-        created_at: Option<String>,
-    }
-
-    #[derive(Debug, Deserialize)]
-    struct GhLabel {
-        name: String,
-    }
 
     /// A forge-backed [`WorkSource`] that lists open `loom:issue` items via
     /// `gh`. Mirrors [`crate::epic_supervisor::forge::GhEpicSource`].
@@ -2052,44 +2032,21 @@ pub mod forge {
 
     impl WorkSource for GhWorkSource {
         fn list_ready_issues(&mut self) -> Result<Vec<WorkItem>> {
-            let mut cmd = Command::new(&self.gh_bin);
-            cmd.arg("issue")
-                .arg("list")
-                .arg("--label")
-                .arg("loom:issue")
-                .arg("--state")
-                .arg("open")
-                .arg("--limit")
-                .arg("200")
-                .arg("--json")
-                .arg("number,labels,createdAt");
-            if let Some(ref repo) = self.repo {
-                cmd.arg("--repo").arg(repo);
-            }
-            if let Some(ref cwd) = self.cwd {
-                cmd.current_dir(cwd);
-            }
-            cmd.stderr(Stdio::piped());
-            let out = cmd
-                .output()
-                .with_context(|| format!("failed to invoke {}", self.gh_bin.display()))?;
-            if !out.status.success() {
-                return Err(anyhow!(
-                    "gh issue list --label loom:issue failed: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                ));
-            }
-            let rows: Vec<GhIssue> =
-                serde_json::from_slice(&out.stdout).context("parse gh issue list JSON")?;
+            // ETag-cached REST listing (#4428): a poll where nothing changed
+            // costs zero rate limit (304), replacing the per-tick GraphQL
+            // `gh issue list`. REST issue listings include PRs, so filter the
+            // `pull_request`-marked rows to keep the pre-#4428 issue-only set.
+            let rows = crate::forge_listing::list_issues_cached(
+                &self.gh_bin,
+                self.cwd.as_deref(),
+                self.repo.as_deref(),
+                "loom:issue",
+                "open",
+            )?;
             Ok(rows
                 .into_iter()
-                .map(|r| {
-                    WorkItem::with_created_at(
-                        r.number,
-                        r.labels.into_iter().map(|l| l.name).collect(),
-                        r.created_at,
-                    )
-                })
+                .filter(|r| !r.is_pull_request)
+                .map(|r| WorkItem::with_created_at(r.number, r.labels, r.created_at))
                 .collect())
         }
     }

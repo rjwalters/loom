@@ -1848,11 +1848,36 @@ fn glob_match_chars(pattern: &str, text: &str) -> bool {
 /// [`CommandGateRunner::run_gate`] — [`spawn_multi_main_health_gate_task`]
 /// runs it inside `spawn_blocking`, and it is directly unit-testable without
 /// a tokio runtime.
+///
+/// Always uses the real [`crate::cpu_headroom::read_loadavg_1m`] load probe;
+/// see [`run_gate_tick_with_load_fn`] for the injectable variant tests use to
+/// pin a deterministic (unsaturated, or saturated) host load (#4441).
 #[must_use]
 pub fn run_gate_tick(
     state: &MainHealthState,
     config: &BuildGateConfig,
     repo_root: &Path,
+) -> Option<GateOutcome> {
+    run_gate_tick_with_load_fn(state, config, repo_root, crate::cpu_headroom::read_loadavg_1m)
+}
+
+/// [`run_gate_tick`]'s implementation, parameterized over the 1-minute load
+/// average lookup. Production code always goes through [`run_gate_tick`]
+/// (which passes the real `/proc`-backed [`crate::cpu_headroom::read_loadavg_1m`]);
+/// tests use this directly with a fixed closure so the tier/defer decision is
+/// deterministic — the real host's live load average, shared across every
+/// unit test running in this one process, is not a value any single test can
+/// control, and pinning it via `LOOM_BUILD_GATE_LOAD_THRESHOLD` instead would
+/// widen the suite-wide env-mutation race tracked in #4385.
+///
+/// `pub(crate)` (no production caller outside [`run_gate_tick`], mirroring
+/// #4406's `classify_with_process_age_fn`).
+#[must_use]
+pub(crate) fn run_gate_tick_with_load_fn(
+    state: &MainHealthState,
+    config: &BuildGateConfig,
+    repo_root: &Path,
+    read_load: impl Fn() -> Option<f64>,
 ) -> Option<GateOutcome> {
     if state.gate_backoff_active(Instant::now()) {
         log::debug!(
@@ -1887,7 +1912,7 @@ pub fn run_gate_tick(
     let threshold = resolve_gate_load_threshold(repo_root);
     let max_defer = resolve_gate_max_defer(repo_root);
     let ncpu = crate::cpu_headroom::logical_cpu_count();
-    let loadavg = crate::cpu_headroom::read_loadavg_1m();
+    let loadavg = read_load();
     let saturated = crate::cpu_headroom::is_host_saturated(loadavg, ncpu, threshold);
     let tier = match decide_gate_tier(saturated, state.defer_streak_elapsed(), max_defer) {
         GateTierDecision::Defer => {
@@ -3805,7 +3830,7 @@ mod tests {
         };
         let state = MainHealthState::new();
 
-        let first = run_gate_tick(&state, &cfg, clone.path());
+        let first = run_gate_tick_with_load_fn(&state, &cfg, clone.path(), || Some(0.0));
         assert!(matches!(first, Some(GateOutcome::Green { .. })));
         // `run_gate_tick` alone does not apply the outcome (the caller does,
         // via `apply_gate_outcome`) -- so no verdict is stamped by the tick
@@ -3817,7 +3842,7 @@ mod tests {
 
         // Second tick: unchanged SHA -> skip. No outcome to apply, so the
         // verdict time must be untouched.
-        let second = run_gate_tick(&state, &cfg, clone.path());
+        let second = run_gate_tick_with_load_fn(&state, &cfg, clone.path(), || Some(0.0));
         assert_eq!(second, None, "unchanged origin/main must skip the second tick");
         assert_eq!(
             state.last_verdict_at(),
@@ -5245,7 +5270,7 @@ mod tests {
         };
         let state = MainHealthState::new();
 
-        let first = run_gate_tick(&state, &cfg, clone.path());
+        let first = run_gate_tick_with_load_fn(&state, &cfg, clone.path(), || Some(0.0));
         assert!(
             matches!(first, Some(GateOutcome::Green { .. })),
             "first tick must run and be green"
@@ -5256,7 +5281,7 @@ mod tests {
             .count();
         assert_eq!(invocations_after_first, 1, "the command must have run exactly once");
 
-        let second = run_gate_tick(&state, &cfg, clone.path());
+        let second = run_gate_tick_with_load_fn(&state, &cfg, clone.path(), || Some(0.0));
         assert_eq!(
             second, None,
             "unchanged origin/main must skip the second tick entirely (no outcome to apply)"
@@ -5284,7 +5309,7 @@ mod tests {
         let state = MainHealthState::new();
 
         assert!(matches!(
-            run_gate_tick(&state, &cfg, clone.path()),
+            run_gate_tick_with_load_fn(&state, &cfg, clone.path(), || Some(0.0)),
             Some(GateOutcome::Green { .. })
         ));
         assert_eq!(
@@ -5298,7 +5323,7 @@ mod tests {
         // main moves — the next tick must run again.
         advance_origin_main(origin.path());
         assert!(matches!(
-            run_gate_tick(&state, &cfg, clone.path()),
+            run_gate_tick_with_load_fn(&state, &cfg, clone.path(), || Some(0.0)),
             Some(GateOutcome::Green { .. })
         ));
         assert_eq!(
@@ -5323,7 +5348,7 @@ mod tests {
         };
         let state = MainHealthState::new();
 
-        let first = run_gate_tick(&state, &cfg, clone.path());
+        let first = run_gate_tick_with_load_fn(&state, &cfg, clone.path(), || Some(0.0));
         assert!(
             matches!(first, Some(GateOutcome::Unevaluated { .. })),
             "a timeout must be UNEVALUATED, got {first:?}"
@@ -5338,7 +5363,7 @@ mod tests {
 
         // Immediately retrying (well within the backoff window derived from
         // the 200ms timeout) must be skipped — no second spawn.
-        let second = run_gate_tick(&state, &cfg, clone.path());
+        let second = run_gate_tick_with_load_fn(&state, &cfg, clone.path(), || Some(0.0));
         assert_eq!(
             second, None,
             "an indeterminate run must trigger backoff, not an immediate retry"
@@ -5351,6 +5376,40 @@ mod tests {
             1,
             "no second gate command must be spawned while backing off"
         );
+    }
+
+    #[test]
+    fn test_run_gate_tick_defers_when_host_is_saturated() {
+        // The #4259 defer path (#4441 regression coverage): a saturated host
+        // must defer the first tick entirely -- no command spawn, no SHA
+        // memo, no indeterminate backoff, and no verdict. Pinning an
+        // absurdly high load average makes `is_host_saturated` report
+        // `Some(true)` regardless of the real host's CPU count or ambient
+        // `LOOM_BUILD_GATE_LOAD_THRESHOLD`.
+        let (_origin, clone) = make_origin_and_clone();
+        let marker = tempfile::tempdir().unwrap();
+        let marker_file = marker.path().join("invocations.txt");
+        let cfg = BuildGateConfig {
+            command: format!("echo run >> {}", marker_file.display()),
+            timeout: Duration::from_secs(30),
+            ..Default::default()
+        };
+        let state = MainHealthState::new();
+
+        let first = run_gate_tick_with_load_fn(&state, &cfg, clone.path(), || Some(1e9));
+        assert_eq!(
+            first, None,
+            "a saturated host must defer the first tick rather than running the gate command"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&marker_file)
+                .unwrap_or_default()
+                .lines()
+                .count(),
+            0,
+            "no gate command must spawn while deferring"
+        );
+        assert_eq!(state.last_verdict_at(), None, "a deferral is not a verdict");
     }
 
     // ===================================================================
