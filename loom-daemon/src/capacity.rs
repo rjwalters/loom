@@ -157,29 +157,44 @@ impl RankingSnapshot {
 /// files, so callers that have their own resolved directory (or want to probe
 /// a specific one directly, e.g. in tests) can bypass re-resolution.
 ///
-/// The file is the pipe-delimited `name|status` format written by
-/// `loom-tokens check --ranking` (one account per line). Returns `None` when the
-/// file is absent, unreadable, or contains no parseable rows — the signal that
-/// no probe data exists, in which case callers fall back to the raw token-pool
-/// size (byte-for-byte the pre-#3902 behavior). Blank lines and malformed rows
-/// (no `|`) are skipped; a row's status is parsed via [`AccountHealth::parse`].
+/// The file is the pipe-delimited `name|status|5h_util` format written by
+/// `loom-tokens check --ranking` (one account per line, issue #4195), where the
+/// status is the **second** field and the trailing 5h-utilization field is
+/// optional (legacy `name|status` lines omit it). Returns `None` when the file
+/// is absent, unreadable, or contains no parseable rows — the signal that no
+/// probe data exists, in which case callers fall back to the raw token-pool size
+/// (byte-for-byte the pre-#3902 behavior). Blank lines, `#` comments, and
+/// malformed rows (no `|`, so no status field) are skipped; a row's status is
+/// parsed via [`AccountHealth::parse`].
+///
+/// Parsing goes through [`crate::tokens_pool::select::parse_ranking_line`] — the
+/// **same** triple parser the spawn-time selector uses — so this reader and the
+/// selector can never de-sync on the field layout (the #4243/#4344 drift, where
+/// this function took the *last* field as the status and mis-read every 3-field
+/// row's `5h_util` — e.g. `agent3-2amlogic|available|0.09` → `"0.09"` →
+/// [`AccountHealth::Unknown`] — pinning the token axis at 0 on a fully healthy
+/// pool). A malformed no-`|` row is still skipped here (rather than counted with
+/// an empty/unknown status) so an unparseable ranking is treated as absent, not
+/// as a genuine 0-healthy snapshot.
 #[must_use]
 pub fn read_ranking_at(pool_dir: &Path) -> Option<RankingSnapshot> {
     let ranking_path = pool_dir.join(".ranking");
     let contents = std::fs::read_to_string(&ranking_path).ok()?;
     let mut snap = RankingSnapshot::default();
     for line in contents.lines() {
-        let line = line.trim();
-        if line.is_empty() {
+        // A row must carry a `|` (a status field). A no-`|` row is genuinely
+        // malformed and is skipped, not counted as an empty-status account —
+        // preserving the "unparseable ranking ⇒ absent, not 0-healthy"
+        // fallback (see the module doc + `read_ranking_malformed_*` tests).
+        if !line.contains('|') {
             continue;
         }
-        // `name|status` — the status is the last pipe-delimited field so a name
-        // containing a stray pipe (there are none in practice) still parses.
-        let Some((_name, status)) = line.rsplit_once('|') else {
+        let Some((_name, status, _util_5h)) = crate::tokens_pool::select::parse_ranking_line(line)
+        else {
             continue;
         };
         snap.total += 1;
-        match AccountHealth::parse(status) {
+        match AccountHealth::parse(&status) {
             AccountHealth::Available => snap.available += 1,
             AccountHealth::Exhausted => snap.exhausted += 1,
             AccountHealth::RateLimited => snap.rate_limited += 1,
@@ -607,6 +622,155 @@ mod tests {
         assert_eq!(snap.total, 2, "the pipe-less row is skipped");
         assert_eq!(snap.available, 1);
         assert_eq!(snap.exhausted, 1);
+    }
+
+    #[test]
+    fn read_ranking_at_parses_three_field_format() {
+        // #4243/#4344 primary bug: writers emit `name|status|5h_util` whenever
+        // 5h utilization is known (which on the live host is always). The
+        // status is the SECOND field — the reader must NOT take the trailing
+        // util as the status. This is the exact live-host layout from the
+        // #4344 incident: 7 three-field rows, 6 available.
+        let tmp = tempfile::tempdir().unwrap();
+        write_ranking_at(
+            tmp.path(),
+            "agent3-2amlogic|available|0.09\n\
+             robb-2amlogic|available|0.18\n\
+             rjwalters-gmail|available|0.22\n\
+             agent2-2amlogic|available|0.31\n\
+             agent4-2amlogic|available|0.05\n\
+             agent5-2amlogic|available|0.44\n\
+             old-account|exhausted|0.00\n",
+        );
+        let snap = read_ranking_at(tmp.path()).unwrap();
+        assert_eq!(snap.total, 7);
+        assert_eq!(snap.available, 6, "3-field rows: the status is the SECOND field, not the last");
+        assert_eq!(snap.exhausted, 1);
+        assert_eq!(
+            snap.unknown, 0,
+            "the 5h_util field must never be parsed as a status word (the #4243 drift)"
+        );
+    }
+
+    #[test]
+    fn read_ranking_at_curator_fixture_three_field() {
+        // The exact fixture the judge required to pass:
+        //   total=3, available=2, exhausted=1.
+        let tmp = tempfile::tempdir().unwrap();
+        write_ranking_at(
+            tmp.path(),
+            "agent3-2amlogic|available|0.09\n\
+             robb-2amlogic|available|0.18\n\
+             rjwalters-gmail|exhausted|0.00\n",
+        );
+        let snap = read_ranking_at(tmp.path()).unwrap();
+        assert_eq!(snap.total, 3);
+        assert_eq!(snap.available, 2);
+        assert_eq!(snap.exhausted, 1);
+    }
+
+    #[test]
+    fn read_ranking_at_mixed_two_and_three_field() {
+        // A file mixing legacy 2-field lines and new 3-field lines — the state
+        // during a rolling format migration — must parse both correctly.
+        let tmp = tempfile::tempdir().unwrap();
+        write_ranking_at(
+            tmp.path(),
+            "legacy-a|available\n\
+             new-b|available|0.12\n\
+             legacy-c|exhausted\n\
+             new-d|blocked|0.00\n\
+             new-e|rate_limited|0.88\n",
+        );
+        let snap = read_ranking_at(tmp.path()).unwrap();
+        assert_eq!(snap.total, 5);
+        assert_eq!(snap.available, 2);
+        assert_eq!(snap.exhausted, 1);
+        assert_eq!(snap.blocked, 1);
+        assert_eq!(snap.rate_limited, 1);
+        assert_eq!(snap.unknown, 0);
+    }
+
+    #[test]
+    fn read_ranking_at_comment_lines_are_skipped() {
+        // `#` comments (stripped by the shared selector parser) are not rows.
+        let tmp = tempfile::tempdir().unwrap();
+        write_ranking_at(
+            tmp.path(),
+            "# probed 2026-07-29\na|available|0.10\nb|exhausted # near ceiling\n",
+        );
+        let snap = read_ranking_at(tmp.path()).unwrap();
+        assert_eq!(snap.total, 2, "the leading comment line is not a row");
+        assert_eq!(snap.available, 1);
+        assert_eq!(snap.exhausted, 1);
+    }
+
+    #[test]
+    fn ranking_format_drift_conformance_writer_reader_selector_agree() {
+        // Format-drift guard (#4344 AC 3): the single test that would have
+        // caught #4243's partial migration. It binds THREE parties to the same
+        // fixture lines and fails if any one drifts:
+        //   (1) the WRITER — `tokens_pool::check::ranking_line` (what is
+        //       actually written to `.ranking`),
+        //   (2) capacity's READER — `read_ranking_at` (this module),
+        //   (3) the spawn-time SELECTOR's parser —
+        //       `tokens_pool::select::parse_ranking_line`.
+        // If a future format change moves the status field, at least one of
+        // these assertions breaks, so no reader can silently miss the
+        // migration again.
+        use crate::tokens_pool::check::ranking_line;
+        use crate::tokens_pool::select::parse_ranking_line;
+
+        // (name, status, util) fixtures spanning every health class plus the
+        // optional / absent util field.
+        let accounts: [(&str, &str, Option<f64>); 5] = [
+            ("agent3-2amlogic", "available", Some(0.09)),
+            ("robb-2amlogic", "available", None), // legacy 2-field line
+            ("rjwalters-gmail", "exhausted", Some(0.00)),
+            ("agent2", "rate_limited", Some(0.88)),
+            ("agent4", "blocked", None),
+        ];
+
+        // Render the file exactly as the writer would.
+        let body: String = accounts
+            .iter()
+            .map(|(name, status, util)| ranking_line(name, status, *util) + "\n")
+            .collect();
+
+        // (2) vs (3): the selector's parser must recover the same name/status
+        // the writer put in, from the writer's own output.
+        for ((name, status, util), line) in accounts.iter().zip(body.lines()) {
+            let (pname, pstatus, putil) =
+                parse_ranking_line(line).expect("writer output must be parseable by the selector");
+            assert_eq!(&pname, name);
+            assert_eq!(
+                &pstatus, status,
+                "selector parser must recover the writer's status field, not the util"
+            );
+            match util {
+                Some(u) => {
+                    let p = putil.expect("a 3-field line must yield a util");
+                    assert_eq!(format!("{p:.2}"), format!("{u:.2}"));
+                }
+                None => assert_eq!(putil, None, "a 2-field line must yield no util"),
+            }
+        }
+
+        // (1) → (2): capacity's reader must classify that same file into the
+        // writer's intended statuses — 2 available, 1 exhausted, 1
+        // rate_limited, 1 blocked, and crucially 0 unknown.
+        let tmp = tempfile::tempdir().unwrap();
+        write_ranking_at(tmp.path(), &body);
+        let snap = read_ranking_at(tmp.path()).unwrap();
+        assert_eq!(snap.total, 5);
+        assert_eq!(snap.available, 2);
+        assert_eq!(snap.exhausted, 1);
+        assert_eq!(snap.rate_limited, 1);
+        assert_eq!(snap.blocked, 1);
+        assert_eq!(
+            snap.unknown, 0,
+            "no writer-produced line may parse to Unknown — that is the #4243 drift signature"
+        );
     }
 
     // ------------------------------------------------------------------
