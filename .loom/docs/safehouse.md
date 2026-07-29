@@ -136,13 +136,13 @@ daemon's wire payload — missing the field entirely — still parses).
 resolvers `lib/mcp-config.sh` already defines for the safehouse-mcp worker
 injection (phase 2, below) rather than re-deriving them.
 
-## New-host onboarding (#4345)
+## New-host onboarding (#4345, #4346)
 
-The manual path from a fresh interactive host (no `safehoused`, no
-`safehouse` config block anywhere) to `loom-daemon status` reading
-`connected`. **An automated service-wrapper + install-step path is tracked as
-a follow-up (#4359)** — this section is the documented fallback until that
-lands, and stays valid afterward as the manual/debug path.
+The path from a fresh interactive host (no `safehoused`, no `safehouse` config
+block anywhere) to `loom-daemon status` reading `connected`. Step 3 registers
+`safehoused` as a **supervised service** (launchd LaunchAgent on macOS,
+`systemd --user` on Linux) via `safehoused-service.sh` (#4346); running it by
+hand is still documented as the debug fallback.
 
 1. **Bot account + credentials.** Provision (or reuse) a Matrix account for
    the `loom_daemon` persona in the target safehouse deployment — this is an
@@ -154,12 +154,26 @@ lands, and stays valid afterward as the manual/debug path.
    in its config includes `loom_daemon` (or whichever persona you assign this
    host, per "Operator setup" above) — the allowlist is boot-time and
    restart-only, no hot reload.
-3. **Run `safehoused`.** Until #4359 ships a supervised service wrapper
-   (launchd LaunchAgent / `systemd --user`, mirroring
-   `loom-daemon-start.sh`'s own pattern), start it manually or under your own
-   supervisor of choice — `nohup safehoused &`, a personal launchd plist, a
-   tmux pane, etc. Note the socket path it binds (safehoused's own config
-   controls this).
+3. **Register `safehoused` as a supervised service.** Use
+   [`safehoused-service.sh`](#supervised-service-wrapper-safehoused-servicesh-4346) —
+   it renders and installs a launchd LaunchAgent (macOS) or `systemd --user`
+   unit (Linux) that starts `safehoused` at login and keeps it up
+   (`KeepAlive`/`Restart=always`, so it survives a crash or reboot), mirroring
+   `loom-daemon-start.sh`'s own supervised-service pattern:
+   ```bash
+   # Preview the service definition first (no side effects):
+   ./.loom/scripts/cli/safehoused-service.sh --print-plist   # macOS
+   ./.loom/scripts/cli/safehoused-service.sh --print-unit    # Linux
+   # Then install + start (point --bin at your built safehoused; the socket is
+   # resolved from the same safehouse.socket / $SAFEHOUSED_SOCKET chain the
+   # daemon uses, or pass --socket explicitly):
+   ./.loom/scripts/cli/safehoused-service.sh install --bin "$(command -v safehoused)"
+   ```
+   On a headless Linux host, run `loginctl enable-linger "$USER"` once so the
+   `systemd --user` unit survives a reboot. **Fallback (debug only):** start it
+   by hand under any supervisor — `nohup safehoused &`, a tmux pane, a personal
+   plist. Either way, note the socket path safehoused binds (its own config
+   controls this) for the next step.
 4. **Socket env or config.** Either export `SAFEHOUSED_SOCKET=<path>` (the
    convention safehoused's own clients read) machine-wide, or set
    `safehouse.socket` explicitly in this host's `.loom/config.json` — see
@@ -193,6 +207,49 @@ that the persona is in safehoused's allowlist (a rejected `hello` also
 degrades to `unreachable` — check the daemon log for `safehoused rejected
 persona`), and that the daemon process can reach the socket path (permissions,
 same-host, no stale socket file from a crashed prior run).
+
+### Supervised service wrapper: `safehoused-service.sh` (#4346)
+
+`defaults/scripts/cli/safehoused-service.sh` (installed as
+`.loom/scripts/cli/safehoused-service.sh`) registers `safehoused` as a
+supervised service so it starts at login and comes back after a crash or
+reboot — the interactive-host counterpart to the cloud-host provisioning path
+(#3998). It mirrors `loom-daemon-start.sh`'s supervised-service pattern
+(launchd LaunchAgent on macOS / `systemd --user` on Linux) including the
+`--print-plist` / `--print-unit` preview modes.
+
+| Command | Effect |
+|---|---|
+| `--print-plist` / `--print-unit` | Print the launchd plist / systemd unit that *would* be installed, no side effects (any platform). |
+| `install` | Render + install + enable + start the service. |
+| `uninstall` | Stop + disable + remove the service definition. |
+| `status` | Report whether the supervised service is loaded / running. |
+
+Parameters (precedence **flag > env > config > default**): `--bin`
+(`SAFEHOUSED_BIN`, else `command -v safehoused`); `--exec "<argv>"`
+(`SAFEHOUSED_EXEC`) for a full ExecStart override when safehoused needs flags;
+`--socket` (else the shared `safehouse.socket` → `$LOOM_SAFEHOUSE_SOCKET` →
+`$SAFEHOUSED_SOCKET` chain the daemon resolves); `--config`
+(`SAFEHOUSED_CONFIG`); `--log` (default `~/.loom/logs/safehoused.log`);
+`--label` / `--unit` for the launchd label / systemd unit name.
+
+**Supervision policy differs from `loom-daemon`'s on purpose.** `loom-daemon`
+uses `KeepAlive:{SuccessfulExit:true}` / `Restart=on-success` because it has a
+clean-exit restart *primitive* (exit 0 == intentional relaunch, the
+`RestartDaemon` path). `safehoused` has no such primitive — it is a persistent
+connection daemon that should simply stay up — so the wrapper renders
+`KeepAlive=true` (launchd) / `Restart=always` + `RestartSec=5` (systemd).
+
+**Ownership decision (recorded here per #4346's acceptance criteria):** this
+wrapper is deliberately **safehoused-agnostic** and lives in *this* repo, while
+the **authoritative** service definition (safehoused's real argv, config
+schema, and key-backup / steady-state teardown semantics) is owned by the
+external `rjwalters/safehouse` repo. loom does not vendor safehoused's binary
+invocation — that would rot the moment the external repo changes it — so the
+wrapper only supervises an operator-supplied binary and bakes a minimal,
+non-secret environment (`SAFEHOUSED_SOCKET` / `SAFEHOUSED_CONFIG` when
+provided; never a forwarded token). If the safehouse repo ships its own service
+files, point the runbook at those and treat this generator as the fallback.
 
 ## What gets narrated
 
