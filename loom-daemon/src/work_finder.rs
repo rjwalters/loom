@@ -847,6 +847,10 @@ pub fn tick_multi_with_admission_cap<S: WorkSource, D: WorkDispatcher>(
                 // workspaces are still polled and dispatched this same tick.
                 report.errors += 1;
                 log::warn!("work_finder: listing ready issues for workspace #{idx} failed: {e}");
+                // A rate-limit failure trips the global breaker (#4429) so the
+                // NEXT tick skips its gh fan-out entirely; this tick still
+                // isolates per-workspace as before.
+                crate::rate_limit_breaker::global_observe_failure(&e.to_string(), "work_finder");
                 continue;
             }
         };
@@ -1363,8 +1367,36 @@ where
         // line: the healthy count can change while the cap does not (another
         // axis binds), and vice versa.
         let mut was_healthy_tokens: Option<usize> = None;
+        // Rate-limit skip state (#4429): log the pause/resume edges once, not
+        // every skipped tick — same dedup discipline as `was_halted`.
+        let mut was_rate_limited = false;
         loop {
             ticker.tick().await;
+            // GitHub rate-limit circuit breaker (#4429): when the shared API
+            // budget is exhausted the candidate list is a doomed gh call, so
+            // skip the entire tick body until the probed reset epoch passes.
+            // See the multi-workspace loop for the full rationale.
+            if let Some(rl) = crate::rate_limit_breaker::global() {
+                let now = chrono::Utc::now();
+                if let Some(transition) = rl.observe_tick(now) {
+                    log::info!("rate_limit_breaker: {}", transition.reason);
+                    crate::rate_limit_breaker::emit_transition_event(&event_bus, &transition);
+                }
+                if rl.is_suppressed(now) {
+                    if was_rate_limited {
+                        log::debug!("work_finder: tick skipped — rate-limit cooldown active");
+                    } else {
+                        log::info!(
+                            "work_finder: tick skipped — shared GitHub API rate limit \
+                             exhausted; forge polling paused until the window resets \
+                             (#4429; further skips logged at DEBUG)"
+                        );
+                    }
+                    was_rate_limited = true;
+                    continue;
+                }
+                was_rate_limited = false;
+            }
             // Reactive main-health backstop (Phase C, #3812): skip all dispatch
             // while the gate reports a red `main`. Also (#4084) hold dispatch
             // while a gate *run* is in flight, so a fresh sweep build is not
@@ -1500,6 +1532,12 @@ where
                 }
                 Err(e) => {
                     log::warn!("work_finder: tick failed to list ready issues: {e}");
+                    // A rate-limit failure trips the global breaker (#4429) so
+                    // the next tick skips its gh polling entirely.
+                    crate::rate_limit_breaker::global_observe_failure(
+                        &e.to_string(),
+                        "work_finder",
+                    );
                 }
             }
         }
@@ -1595,8 +1633,37 @@ pub fn spawn_multi_work_finder_task(
         // role. Boot state is "already idle" so an empty-queue startup never
         // fires.
         let mut idle_trigger = crate::role_runner::IdleTrigger::new();
+        let mut was_rate_limited = false;
         loop {
             ticker.tick().await;
+
+            // GitHub rate-limit circuit breaker (#4429): when the shared API
+            // budget is exhausted every workspace's candidate list is a doomed
+            // gh call, so skip the ENTIRE tick body — no listing, no dispatch,
+            // no idle-edge role firing (a spawned role would hit the same
+            // wall). The breaker lazily releases itself once the probed reset
+            // epoch passes; the edge is logged once each way, never per-tick.
+            if let Some(rl) = crate::rate_limit_breaker::global() {
+                let now = chrono::Utc::now();
+                if let Some(transition) = rl.observe_tick(now) {
+                    log::info!("rate_limit_breaker: {}", transition.reason);
+                    crate::rate_limit_breaker::emit_transition_event(&event_bus, &transition);
+                }
+                if rl.is_suppressed(now) {
+                    if was_rate_limited {
+                        log::debug!("work_finder: tick skipped — rate-limit cooldown active");
+                    } else {
+                        log::info!(
+                            "work_finder: tick skipped — shared GitHub API rate limit \
+                             exhausted; forge polling paused until the window resets \
+                             (#4429; further skips logged at DEBUG)"
+                        );
+                    }
+                    was_rate_limited = true;
+                    continue;
+                }
+                was_rate_limited = false;
+            }
 
             // Resolve the current set of workspaces fresh each tick so registry
             // edits (add / remove / set-priority) are hot-applied. Loaded before

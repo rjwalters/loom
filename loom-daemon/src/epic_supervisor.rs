@@ -808,6 +808,12 @@ pub async fn tick_multi<S: EpicSource, D: EpicDispatcher>(
                 // and counted, the other workspaces still tick this same round.
                 agg.errors += 1;
                 log::warn!("epic_supervisor: a workspace tick failed to list epics: {e}");
+                // A rate-limit failure trips the global breaker (#4429) so the
+                // next round skips its gh polling entirely.
+                crate::rate_limit_breaker::global_observe_failure(
+                    &e.to_string(),
+                    "epic_supervisor",
+                );
             }
         }
     }
@@ -970,6 +976,12 @@ where
             };
             log::info!("epic_supervisor: loop started (interval={}s)", interval.as_secs());
             while !shutdown_thread.load(Ordering::Relaxed) {
+                // Shared GitHub rate limit exhausted (#4429): skip the round.
+                if crate::rate_limit_breaker::global_is_suppressed() {
+                    log::debug!("epic_supervisor: round skipped — rate-limit cooldown (#4429)");
+                    sleep_interruptible(interval, &shutdown_thread);
+                    continue;
+                }
                 match rt.block_on(supervisor.tick()) {
                     Ok(report) => {
                         if report.roles_dispatched > 0
@@ -989,6 +1001,10 @@ where
                     }
                     Err(e) => {
                         log::warn!("epic_supervisor: tick failed to list epics: {e}");
+                        crate::rate_limit_breaker::global_observe_failure(
+                            &e.to_string(),
+                            "epic_supervisor",
+                        );
                     }
                 }
                 sleep_interruptible(interval, &shutdown_thread);
@@ -1139,6 +1155,14 @@ pub fn spawn_multi_supervisor_thread(
                     }
                 }
 
+                // Shared GitHub rate limit exhausted (#4429): every
+                // supervisor's epic listing is a doomed gh call — skip the
+                // round and re-check after the interval.
+                if crate::rate_limit_breaker::global_is_suppressed() {
+                    log::debug!("epic_supervisor: round skipped — rate-limit cooldown (#4429)");
+                    sleep_interruptible(interval, &shutdown_thread);
+                    continue;
+                }
                 let report = rt.block_on(tick_multi(&mut supervisors));
                 if report.roles_dispatched > 0 || report.sweeps_dispatched > 0 || report.errors > 0
                 {

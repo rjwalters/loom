@@ -13,6 +13,7 @@ use loom_daemon::ipc::IpcServer;
 use loom_daemon::main_health_gate;
 use loom_daemon::metrics_collector;
 use loom_daemon::quarantine_reconciliation;
+use loom_daemon::rate_limit_breaker;
 use loom_daemon::role_runner;
 use loom_daemon::role_validation;
 use loom_daemon::self_update;
@@ -1269,6 +1270,24 @@ async fn main() -> Result<()> {
         cwd: sweep_workspace.clone(),
     };
     let credential_preflight = credential_preflight::run(&credential_preflight_probe);
+
+    // GitHub rate-limit circuit breaker (#4429). Registered here — before the
+    // startup reconciliation passes just below — because *every* gh-polling
+    // consumer (reconciliation, work-finder, epic supervisor, role runner)
+    // starts after this point and consults the global handle. Unlike the host
+    // breaker (registered inside the work-finder branch, which is its sole
+    // sampler), rate-limit failures can be observed by any of those loops, so
+    // the breaker exists whether or not the work-finder is enabled.
+    let rate_limit_config = rate_limit_breaker::resolve_config_for(&sweep_workspace);
+    rate_limit_breaker::register_global(std::sync::Arc::new(
+        rate_limit_breaker::SharedRateLimitBreaker::new(rate_limit_config),
+    ));
+    log::info!(
+        "rate_limit_breaker: enabled={} (fallback_cooldown_secs={}) — forge polling pauses \
+         until the API window resets when the shared rate limit is exhausted (#4429)",
+        rate_limit_config.enabled,
+        rate_limit_config.fallback_cooldown_secs,
+    );
 
     // Stale-`loom:building`-claim reconciliation across every managed
     // workspace (Issue #3953). `sweep.reconstruct()` above only recovers
@@ -3905,6 +3924,18 @@ fn build_status_json_value(
             "sustain_ticks": h.sustain_ticks,
             "cooldown_secs": h.cooldown_secs,
         })),
+        "rate_limit_breaker": report.rate_limit_breaker.as_ref().map(|r| serde_json::json!({
+            "enabled": r.enabled,
+            "phase": r.phase,
+            "suppressed": r.suppressed,
+            "source": r.source,
+            "tripped_at": r.tripped_at,
+            "cooldown_until": r.cooldown_until,
+            "trips_total": r.trips_total,
+            "core_remaining": r.core_remaining,
+            "graphql_remaining": r.graphql_remaining,
+            "budget_probed_at": r.budget_probed_at,
+        })),
         // Live safehouse fleet-comms connection state (#4345) — `null` only
         // from a pre-#4345 daemon binary that never computed one. `state` is
         // one of "not_configured" / "unreachable" / "connected".
@@ -4499,6 +4530,42 @@ fn print_status_human(
                 );
             }
             other => println!("Host breaker: {other}"),
+        }
+    }
+
+    // GitHub rate-limit circuit breaker (#4429): one line while Closed, a
+    // fuller block while cooling (the operator's first question is "when does
+    // polling resume").
+    if let Some(rl) = &report.rate_limit_breaker {
+        if !rl.enabled {
+            println!("GitHub rate limit: breaker disabled");
+        } else if rl.suppressed {
+            let releases = rl.cooldown_until.map_or_else(
+                || "unknown".to_string(),
+                |r| {
+                    let secs = (r - Utc::now()).num_seconds();
+                    if secs >= 0 {
+                        format!("in {secs}s ({r})")
+                    } else {
+                        format!("overdue by {}s ({r})", -secs)
+                    }
+                },
+            );
+            let source = rl.source.as_deref().unwrap_or("unknown");
+            println!(
+                "GitHub rate limit: COOLDOWN — forge polling paused (tripped by {source}), \
+                 resumes {releases}"
+            );
+            if let (Some(core), Some(gql)) = (rl.core_remaining, rl.graphql_remaining) {
+                println!("  last probed budget: core {core} remaining, graphql {gql} remaining");
+            }
+        } else if rl.trips_total > 0 {
+            println!(
+                "GitHub rate limit: OK (breaker closed; {} trip(s) this daemon lifetime)",
+                rl.trips_total
+            );
+        } else {
+            println!("GitHub rate limit: OK (breaker closed)");
         }
     }
 
@@ -7205,6 +7272,7 @@ mod status_client_tests {
             auto_update_terminal_reason: None,
             auto_update_note: None,
             host_breaker: None,
+            rate_limit_breaker: None,
             safehouse: None,
         }
     }
