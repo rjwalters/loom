@@ -407,7 +407,16 @@ fn merge_config_file(
 ///   corresponding `base` value wholesale.
 /// - Keys present only in `base` (new template keys) are retained.
 /// - Keys present only in `overlay` (unknown consumer keys) are preserved.
-fn deep_merge_existing_wins(base: &mut Value, overlay: &Value) {
+///
+/// `pub(crate)` (not just `fn`, issue #4390): [`crate::calibrate`] reuses this
+/// same generic "overlay wins, base's untouched keys survive, recurse into
+/// objects" merge for its `--write` path, with the roles inverted from this
+/// module's own usage — there `overlay` is the existing consumer config
+/// (wins over the shipped template); in calibrate `overlay` is the new
+/// recommended knob values (wins over whatever `.loom/config.json` already
+/// has at those two leaf paths). See `calibrate::merge_workfinder_values`'s
+/// doc comment for the full rationale.
+pub(crate) fn deep_merge_existing_wins(base: &mut Value, overlay: &Value) {
     match (base, overlay) {
         (Value::Object(base_map), Value::Object(overlay_map)) => {
             for (key, overlay_val) in overlay_map {
