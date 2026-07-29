@@ -1422,6 +1422,16 @@ pub fn build_daemon_status(
     // occupancy reaches it. Below the cap the limiter is work availability, not
     // any resource term — so gate the token-bound diagnosis on real occupancy.
     let capacity_bound = in_flight.len() >= dynamic_cap;
+    // Claude-wrapper pre-flight-death tripwire (#4386), read from the
+    // fallback/default workspace's own registry — mirrors the top-level
+    // `main_health_gate_*` fields' fallback-root scoping above/below.
+    let (preflight_advisory_active, preflight_advisory_message) = {
+        let registry = workspace_pool.get_or_provision(fallback_root);
+        let sr = registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        sr.preflight_advisory()
+    };
     let capacity = crate::types::CapacityReport {
         ranking_present: ranking.is_some(),
         total_accounts: ranking.as_ref().map_or(token_pool_size, |r| r.total),
@@ -1444,6 +1454,8 @@ pub fn build_daemon_status(
         loadavg_1m,
         cpu_idle_fraction,
         capacity_bound,
+        preflight_advisory_active,
+        preflight_advisory_message,
         configured_max,
         per_token_concurrency,
         dynamic_cap,
@@ -4595,6 +4607,8 @@ exit 0
             loadavg_1m: Some(1.25),
             cpu_idle_fraction: Some(0.90),
             capacity_bound: false,
+            preflight_advisory_active: false,
+            preflight_advisory_message: None,
             configured_max: 5,
             per_token_concurrency: 2,
             dynamic_cap: 3,

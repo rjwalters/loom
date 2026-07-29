@@ -56,9 +56,22 @@ fi
 
 body="$(gh issue view "$ISSUE" -R "$REPO" --json body -q .body 2>/dev/null || true)"
 tier="$(printf '%s' "$body" | grep -o 'loom:complexity=[a-z]*' | head -1 | cut -d= -f2)"
+# Two distinct fall-through cases (#4448): an absent marker is the expected
+# default for issues curated before the marker existed (or before it became
+# mandatory) and stays a quiet info line; an out-of-vocabulary value (a
+# curator paraphrasing the closed enum — `trivial`/`large`/`moderate` etc.)
+# is a drift bug worth naming so it shows up in logs, not just silently
+# routed to routine. Both still resolve to `routine` — no behavior change.
 case "$tier" in
   mechanical|routine|complex) ;;
-  *) echo "$REPO#$ISSUE: no valid complexity marker -> routine" >&2; tier="routine" ;;
+  "")
+    echo "$REPO#$ISSUE: no complexity marker -> routine" >&2
+    tier="routine"
+    ;;
+  *)
+    echo "$REPO#$ISSUE: invalid complexity tier '$tier' -> routine" >&2
+    tier="routine"
+    ;;
 esac
 
 # --tier mode returns "" + exit 3 when the runtime/tier has no mapping.

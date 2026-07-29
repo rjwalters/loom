@@ -25,7 +25,7 @@ pub mod clean;
 mod gh;
 mod liveness;
 pub mod logs;
-mod naming;
+pub(crate) mod naming;
 pub mod orphan_recovery;
 pub mod repo;
 mod safety;
