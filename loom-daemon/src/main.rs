@@ -27,7 +27,7 @@ use loom_daemon::workspace_pool::WorkspacePool;
 use loom_daemon::worktree_ops::{aggressive, clean};
 use loom_daemon::{extract_configured_terminal_ids, rotate_log_file};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use std::fs;
@@ -272,6 +272,11 @@ enum Commands {
     /// immediately and waits for every in-flight sweep to finish before
     /// restarting — no sweep killed, no orphan left behind. `--abort-drain`
     /// cancels an in-progress drain and resumes normal dispatch.
+    ///
+    /// With `--drain --then-exit` (Issue #4343 — `fleet drain`'s teardown use
+    /// case) the daemon stops (and stays stopped — exits without a supervised
+    /// relaunch) instead of restarting once drained, so it cannot pick up new
+    /// dispatch on a host that is about to be powered off.
     Restart {
         /// Finish all in-flight sweeps before restarting, instead of restarting
         /// immediately (#4090). New dispatch is paused for the duration.
@@ -289,6 +294,13 @@ enum Commands {
         /// Abort an in-progress drain and resume normal dispatch (no restart).
         #[arg(long)]
         abort_drain: bool,
+        /// With `--drain`, stop (and stay down) instead of restarting once
+        /// drained (Issue #4343). Requires `--drain`; the daemon does not
+        /// require a recognized supervisor for this variant (there is
+        /// nothing to prove supervision for — a `then-exit` drain never
+        /// wants a relaunch).
+        #[arg(long)]
+        then_exit: bool,
     },
 
     /// Manage the multi-account OAuth token pool at `.loom/tokens/` (Issue
@@ -539,6 +551,41 @@ enum FleetAction {
     /// non-zero unless every roster host is `UP`.
     Status {
         /// Emit machine-readable JSON instead of the human-readable table.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Retire a worker without losing in-flight work, forge claims, or (when
+    /// wired) E2E room keys (issue #4343). SSH orchestration over the existing
+    /// `restart --drain` primitive (#4090), plus the teardown-specific deltas:
+    /// a drain-then-*exit* remote invocation (never restart into new dispatch
+    /// on a box about to be powered off), an immediate targeted `loom:building`
+    /// claim reset via `gh` (not SSH — the forge is global), a safehoused
+    /// key-backup flush check (a documented stub pending #3998 — see
+    /// `loom_daemon::fleet::drain`'s module doc), workspace deregistration, and
+    /// finally removing the worker from the fleet registry. Idempotent +
+    /// resumable: an interrupted drain re-runs from its last completed phase.
+    /// Never calls a cloud CLI itself — prints the exact `repo:remote --down`
+    /// teardown command instead (epic #4340's boundary).
+    Drain {
+        /// SSH alias/host to drain (must already be in the fleet registry;
+        /// draining a host not in the registry is a clean no-op).
+        #[arg(value_name = "SSH_HOST")]
+        ssh_host: String,
+
+        /// Max seconds the remote daemon waits for in-flight sweeps to drain.
+        #[arg(long, value_name = "SECS", default_value_t = loom_daemon::fleet::drain::DEFAULT_DRAIN_TIMEOUT_SECS)]
+        timeout: u64,
+
+        /// On remote drain timeout, force-cancel stragglers
+        /// (SIGTERM→grace→SIGKILL) and proceed anyway. Without this, a
+        /// timeout refuses and the remote daemon stays running (fail-safe) —
+        /// this command then also refuses to proceed past waiting for it to
+        /// exit.
+        #[arg(long)]
+        force_after_timeout: bool,
+
+        /// Emit machine-readable JSON instead of the human-readable report.
         #[arg(long)]
         json: bool,
     },
@@ -1010,7 +1057,11 @@ async fn main() -> Result<()> {
                 timeout,
                 force_after_timeout,
                 abort_drain,
-            } => handle_restart_command(drain, timeout, force_after_timeout, abort_drain).await,
+                then_exit,
+            } => {
+                handle_restart_command(drain, timeout, force_after_timeout, abort_drain, then_exit)
+                    .await
+            }
             // `fleet status` collects the local host's own status over the
             // daemon's Unix socket (issue #4342), so — unlike `fleet
             // add-worker`, which is pure ssh/filesystem and stays on the sync
@@ -2661,8 +2712,14 @@ async fn handle_restart_command(
     timeout: Option<u64>,
     force_after_timeout: bool,
     abort_drain: bool,
+    then_exit: bool,
 ) -> Result<()> {
     let socket_path = resolve_socket_path()?;
+
+    if then_exit && !drain {
+        eprintln!("--then-exit requires --drain (there is nothing to drain-then-exit without it)");
+        std::process::exit(1);
+    }
 
     // Drain-mode variants (Issue #4090) speak `DrainAndRestartDaemon` /
     // `AbortDrain` and expect a `DaemonDrain` reply; the plain restart keeps its
@@ -2677,14 +2734,23 @@ async fn handle_restart_command(
         .await;
     }
     if drain {
+        let (accepted_prefix, refused_prefix) = if then_exit {
+            (
+                "loom-daemon drain-then-exit scheduled (will stop, not restart, once drained)",
+                "loom-daemon did NOT drain",
+            )
+        } else {
+            ("loom-daemon drain scheduled", "loom-daemon did NOT drain")
+        };
         return handle_drain_reply(
             &socket_path,
             &Request::DrainAndRestartDaemon {
                 timeout_secs: timeout,
                 force_after_timeout,
+                then_exit,
             },
-            "loom-daemon drain scheduled",
-            "loom-daemon did NOT drain",
+            accepted_prefix,
+            refused_prefix,
         )
         .await;
     }
@@ -2741,12 +2807,15 @@ async fn handle_drain_reply(
             supervisor,
             in_flight,
             message,
+            then_exit,
         }) => {
             if accepted {
-                println!(
-                    "{accepted_prefix} (supervisor: {}, {in_flight} in-flight).",
-                    supervisor.as_deref().unwrap_or("unknown")
-                );
+                let sup_note = if then_exit {
+                    "then-exit — no relaunch".to_string()
+                } else {
+                    supervisor.as_deref().unwrap_or("unknown").to_string()
+                };
+                println!("{accepted_prefix} (supervisor: {sup_note}, {in_flight} in-flight).");
                 println!("{message}");
                 Ok(())
             } else {
@@ -4759,6 +4828,7 @@ fn print_agent_effectiveness(agent: &activity::AgentEffectiveness) {
 /// lives in [`loom_daemon::fleet`].
 fn handle_fleet_command(action: FleetAction) -> Result<()> {
     use loom_daemon::fleet::add_worker::{self, AddWorkerConfig};
+    use loom_daemon::fleet::drain::{self, DrainConfig};
 
     match action {
         FleetAction::AddWorker {
@@ -4790,6 +4860,43 @@ fn handle_fleet_command(action: FleetAction) -> Result<()> {
             // local host's in-process socket round-trip), never dispatched
             // through this sync handler.
             unreachable!("Fleet Status is handled in main() before handle_cli_command")
+        }
+        FleetAction::Drain {
+            ssh_host,
+            timeout,
+            force_after_timeout,
+            json,
+        } => {
+            // Resolved once, from the operator's own cwd (mirrors
+            // `WorkspacePool::start_safehouse_narration`'s
+            // `safehouse::resolve_config(repo_root)` call shape) — see
+            // `fleet::drain::flush_safehouse`'s doc comment for why this is a
+            // documented stub, not a real flush, pending #3998.
+            let cwd = std::env::current_dir().context("resolving cwd for safehouse config")?;
+            let safehouse_enabled = loom_daemon::safehouse::resolve_config(&cwd).enabled;
+
+            let poll_interval = Duration::from_secs(drain::DEFAULT_POLL_INTERVAL_SECS);
+            let max_polls = ((timeout / drain::DEFAULT_POLL_INTERVAL_SECS.max(1)) + 12) as u32;
+            let config = DrainConfig {
+                ssh_host,
+                timeout_secs: timeout,
+                force_after_timeout,
+                poll_interval,
+                max_polls,
+                safehouse_enabled,
+                json,
+            };
+            let report = drain::run(&config)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", report.render_human());
+            }
+            let code = report.exit_code();
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
         }
     }
 }

@@ -1,0 +1,1467 @@
+//! `fleet drain <ssh-host>` — retire a worker without losing in-flight work,
+//! forge claims, or (when wired) E2E room keys (issue #4343, epic #4340).
+//!
+//! # Not a new drain engine — SSH orchestration over an existing primitive
+//!
+//! Steps 1–2 of the body ("stop new dispatch", "let in-flight sweeps finish or
+//! checkpoint, bounded wait, then cancel") already exist on the remote daemon:
+//! `loom-daemon restart --drain` (#4090) stops admitting new work immediately
+//! and waits bounded for in-flight sweeps, refusing (fail-safe) or
+//! force-cancelling at the deadline. This module's job is the SSH fanout over
+//! that primitive plus the deltas teardown needs:
+//!
+//! 1. **Drain-then-*exit*, not drain-then-restart.** `restart --drain` ends by
+//!    *restarting* the daemon (exit [`crate::ipc::EXIT_RESTART`] under a
+//!    supervisor, which relaunches it) — correct for #4090's roll use case,
+//!    wrong for teardown: a relaunched daemon could pick up new dispatch
+//!    before the box powers off, defeating the whole point of draining.
+//!    `restart --drain --then-exit` (the CLI flag this issue adds) speaks the
+//!    same `DrainAndRestartDaemon` request with `then_exit: true`, and the
+//!    remote daemon exits `EXIT_SHUTDOWN` (143, no supervisor relaunch)
+//!    instead once drained.
+//! 2. **Immediate, targeted claim reset.** The startup-only
+//!    `claim_reconciliation` pass is too late for a drain — this module
+//!    captures the in-flight issue numbers from the worker's `status --json`
+//!    *before* triggering the remote drain, then (after the remote daemon has
+//!    exited) flips any of them still `loom:building` back to `loom:issue`
+//!    via `gh` **from the orchestrator, not over SSH** — the forge is global,
+//!    so no remote access is needed for this step.
+//! 3. **Safehoused flush verification is a documented stub (#3998).** See
+//!    [`flush_safehouse`]'s doc comment.
+//!
+//! # Phase state machine (idempotent + resumable, body step 6)
+//!
+//! [`DrainPhase`] is a fixed, ordered sequence. Each phase's completion is
+//! persisted onto the worker's [`super::WorkerRecord`] (`state: "draining"`
+//! written **first**, for crash-safety — an interrupted drain must leave the
+//! host visible in `fleet status`, not silently gone; the roster entry is
+//! removed **last**, only once every earlier phase — including the safehouse
+//! flush — has resolved). A re-run reads `drain_phase` and resumes after the
+//! last completed one; every phase is individually idempotent (re-marking a
+//! draining host draining, re-flipping an already-reset label, re-removing an
+//! already-removed workspace are all no-ops).
+//!
+//! # Exit codes
+//!
+//! - `0` — fully verified drain: zero stranded claims, host deregistered,
+//!   safe to power off.
+//! - `1` — a phase failed outright (SSH/launch failure, remote refusal,
+//!   unparseable output). The phase marker is preserved; re-run to retry.
+//! - `2` — the remote drain timed out **without** `--force-after-timeout`
+//!   (fail-safe refusal) — the remote daemon is still running and was never
+//!   told to exit.
+//! - `3` — every phase completed, but the safehouse flush could not be
+//!   verified (see [`flush_safehouse`]) — teardown is **not** certified safe
+//!   for room-key continuity even though the roster entry was removed.
+
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+use super::{default_fleet_registry_path, CommandRunner, FleetRegistry, WorkerRecord};
+use crate::fleet::add_worker::SshRunner;
+
+/// Default bound on how long the remote drain waits for in-flight sweeps
+/// (mirrors [`crate::ipc::DEFAULT_DRAIN_TIMEOUT_SECS`] — kept as an
+/// independent constant so this module never has to depend on `ipc`'s tokio
+/// runtime types).
+pub const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 1800;
+
+/// Default interval between polls of the remote host while waiting for it to
+/// exit after a drain was triggered.
+pub const DEFAULT_POLL_INTERVAL_SECS: u64 = 5;
+
+/// Grace added on top of `timeout_secs` before the orchestrator gives up
+/// waiting for the remote daemon to exit (the remote daemon's own supervisor
+/// enforces `timeout_secs`; this buffer absorbs SSH round-trip + poll-interval
+/// slack rather than racing it).
+const WAIT_EXIT_GRACE_SECS: u64 = 60;
+
+// ===========================================================================
+// Phase model
+// ===========================================================================
+
+/// One ordered phase of `fleet drain`. Persisted on [`WorkerRecord::drain_phase`]
+/// as [`DrainPhase::name`] after it completes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DrainPhase {
+    /// Mark the roster entry `state: "draining"` (first, for crash-safety).
+    MarkDraining,
+    /// Capture the worker's in-flight `loom:building` issue numbers before
+    /// triggering the remote drain.
+    CaptureClaims,
+    /// Trigger the remote `restart --drain --then-exit`.
+    TriggerRemoteDrain,
+    /// Poll until the remote daemon has exited (or the wait deadline passes).
+    WaitRemoteExit,
+    /// Reset any captured claim still `loom:building` back to `loom:issue`.
+    ResetClaims,
+    /// Verify (or, absent a seam, honestly not-verify) the safehoused
+    /// key-backup flush.
+    FlushSafehouse,
+    /// Deregister the worker's workspaces on the (now-stopped) remote host's
+    /// registry — best-effort, since the remote daemon has already exited.
+    DeregisterWorkspace,
+    /// Remove the worker from the local fleet registry (last).
+    RemoveFromRoster,
+}
+
+impl DrainPhase {
+    /// The full ordered sequence.
+    const ALL: [DrainPhase; 8] = [
+        DrainPhase::MarkDraining,
+        DrainPhase::CaptureClaims,
+        DrainPhase::TriggerRemoteDrain,
+        DrainPhase::WaitRemoteExit,
+        DrainPhase::ResetClaims,
+        DrainPhase::FlushSafehouse,
+        DrainPhase::DeregisterWorkspace,
+        DrainPhase::RemoveFromRoster,
+    ];
+
+    /// Stable machine name, persisted on the registry record.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            DrainPhase::MarkDraining => "mark-draining",
+            DrainPhase::CaptureClaims => "capture-claims",
+            DrainPhase::TriggerRemoteDrain => "trigger-remote-drain",
+            DrainPhase::WaitRemoteExit => "wait-remote-exit",
+            DrainPhase::ResetClaims => "reset-claims",
+            DrainPhase::FlushSafehouse => "flush-safehouse",
+            DrainPhase::DeregisterWorkspace => "deregister-workspace",
+            DrainPhase::RemoveFromRoster => "remove-from-roster",
+        }
+    }
+
+    /// Parse a persisted phase name back (`None` for an unrecognized/absent
+    /// value — treated as "start from the beginning", never a hard error, so
+    /// a registry written by a future binary still resumes safely).
+    #[must_use]
+    fn parse(name: Option<&str>) -> Option<DrainPhase> {
+        DrainPhase::ALL.into_iter().find(|p| Some(p.name()) == name)
+    }
+
+    /// The phase immediately after `self`, or `None` if `self` is the last.
+    #[must_use]
+    fn next(self) -> Option<DrainPhase> {
+        let idx = DrainPhase::ALL.iter().position(|p| *p == self)?;
+        DrainPhase::ALL.get(idx + 1).copied()
+    }
+
+    /// The first phase to run, given the last-*completed* phase recorded on
+    /// the registry (`None` ⇒ nothing completed yet ⇒ start at the first).
+    #[must_use]
+    fn resume_from(last_completed: Option<&str>) -> DrainPhase {
+        match DrainPhase::parse(last_completed) {
+            Some(p) => p.next().unwrap_or(DrainPhase::RemoveFromRoster),
+            None => DrainPhase::ALL[0],
+        }
+    }
+}
+
+/// A captured `loom:building` claim, persisted so a crash between capture and
+/// reset never loses the list (mirrors [`super::VerifyResult`]'s
+/// persist-immediately shape).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapturedClaim {
+    /// The issue number that was `loom:building` on this host at capture
+    /// time.
+    pub issue: u32,
+    /// The forge repo slug (`owner/name`) the issue belongs to.
+    pub repo: String,
+}
+
+// ===========================================================================
+// Config + outcome
+// ===========================================================================
+
+/// Operator inputs for one `fleet drain` invocation.
+#[derive(Debug, Clone)]
+pub struct DrainConfig {
+    /// SSH alias/host to drain.
+    pub ssh_host: String,
+    /// Bound on how long the remote drain waits for in-flight sweeps.
+    pub timeout_secs: u64,
+    /// On remote timeout, force-cancel stragglers (SIGTERM→grace→SIGKILL) and
+    /// exit anyway. Without this, a timeout refuses and the remote daemon
+    /// stays running (fail-safe) — this orchestrator then also refuses to
+    /// proceed past `wait-remote-exit`.
+    pub force_after_timeout: bool,
+    /// Interval between polls while waiting for the remote daemon to exit.
+    pub poll_interval: Duration,
+    /// Hard cap on wait-remote-exit polls (a defensive bound independent of
+    /// wall-clock, primarily so a test with a zero `poll_interval` cannot
+    /// spin forever against an exhausted mock). Production callers should
+    /// size this from `timeout_secs`/`poll_interval`; [`run`] does so.
+    pub max_polls: u32,
+    /// Whether `safehouse.enabled` resolved `true` for this invocation (via
+    /// [`crate::safehouse::resolve_config`]) — threaded in as a plain `bool`
+    /// so phase execution stays a pure function or drives off a mocked
+    /// runner in tests, with no config-file I/O of its own.
+    pub safehouse_enabled: bool,
+    /// Emit machine-readable JSON instead of the human-readable report.
+    pub json: bool,
+}
+
+/// Machine-readable per-phase outcome, mirroring [`super::StepStatus`]'s
+/// shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "status")]
+pub enum PhaseOutcome {
+    /// Already completed on a prior run — skipped this run (resumability).
+    AlreadyDone,
+    /// Applied successfully this run.
+    Changed,
+    /// Deliberately skipped (e.g. safehouse disabled) with a reason.
+    Skipped { reason: String },
+    /// Completed, but with a caveat that prevents a clean "safe to power off"
+    /// verdict (the unverified-safehoush-flush case).
+    Unverified { reason: String },
+    /// Failed; the phase marker is NOT advanced past this phase.
+    Failed { reason: String },
+}
+
+impl PhaseOutcome {
+    #[must_use]
+    fn is_failure(&self) -> bool {
+        matches!(self, PhaseOutcome::Failed { .. })
+    }
+}
+
+/// One phase's report.
+#[derive(Debug, Clone, Serialize)]
+pub struct PhaseReport {
+    pub phase: &'static str,
+    pub outcome: PhaseOutcome,
+}
+
+/// The full drain report: every phase executed this run, plus the terminal
+/// verdict.
+#[derive(Debug, Clone, Serialize)]
+pub struct DrainReport {
+    pub host: String,
+    pub phases: Vec<PhaseReport>,
+    /// `true` only when every phase completed cleanly (no `Failed`,
+    /// `Unverified`, or unresolved timeout) — the "safe to power off" gate.
+    pub safe_to_power_off: bool,
+    /// A human-readable diagnostic when `safe_to_power_off` is `false`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caveat: Option<String>,
+    /// The exact `repo:remote` teardown command to hand back to the operator
+    /// (loom never calls a cloud CLI itself — epic #4340's boundary). Present
+    /// once the drain has progressed far enough to be teardown-eligible
+    /// (i.e. every phase through `deregister-workspace` completed or was
+    /// skipped/already-done).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub teardown_command: Option<String>,
+}
+
+impl DrainReport {
+    /// Exit code policy (module doc): `0` fully verified, `1` generic
+    /// failure, `2` fail-safe timeout refusal, `3` unverified safehouse
+    /// flush.
+    #[must_use]
+    pub fn exit_code(&self) -> i32 {
+        if self.safe_to_power_off {
+            return 0;
+        }
+        if self
+            .phases
+            .iter()
+            .any(|p| matches!(p.outcome, PhaseOutcome::Unverified { .. }))
+        {
+            return 3;
+        }
+        if self.phases.iter().any(|p| {
+            p.phase == DrainPhase::WaitRemoteExit.name()
+                && matches!(&p.outcome, PhaseOutcome::Failed { reason } if reason.contains("timed out"))
+        }) {
+            return 2;
+        }
+        1
+    }
+
+    #[must_use]
+    pub fn render_human(&self) -> String {
+        let mut out = String::new();
+        out.push_str(&format!("fleet drain report for {}:\n", self.host));
+        if self.phases.is_empty() {
+            out.push_str(
+                "  host not found in the fleet registry — nothing to do (already drained/\n  \
+                 removed, or never added; see `fleet status` for the current roster).\n",
+            );
+            return out;
+        }
+        for p in &self.phases {
+            let (mark, detail) = match &p.outcome {
+                PhaseOutcome::AlreadyDone => ("=", None),
+                PhaseOutcome::Changed => ("+", None),
+                PhaseOutcome::Skipped { reason } => ("-", Some(reason.clone())),
+                PhaseOutcome::Unverified { reason } => ("!", Some(reason.clone())),
+                PhaseOutcome::Failed { reason } => ("x", Some(reason.clone())),
+            };
+            out.push_str(&format!("  {mark} [{}]", p.phase));
+            if let Some(d) = detail {
+                out.push_str(&format!(" — {d}"));
+            }
+            out.push('\n');
+        }
+        if self.safe_to_power_off {
+            out.push_str("\nDRAIN COMPLETE — safe to power off.\n");
+        } else if let Some(caveat) = &self.caveat {
+            out.push_str(&format!("\nDRAIN NOT VERIFIED SAFE: {caveat}\n"));
+        } else {
+            out.push_str("\nDRAIN INCOMPLETE.\n");
+        }
+        if let Some(cmd) = &self.teardown_command {
+            out.push_str(&format!(
+                "\nTeardown is repo:remote's job — loom never calls a cloud CLI itself. Run:\n  {cmd}\n"
+            ));
+        }
+        out
+    }
+}
+
+// ===========================================================================
+// Claim reset seam (the `gh` / mock seam)
+// ===========================================================================
+
+/// The seam between the reset-claims phase and the forge: check whether an
+/// issue still carries `loom:building`, and if so flip it back to
+/// `loom:issue` with an explanatory comment. Mirrors
+/// [`super::CommandRunner`]'s "real ssh vs scripted mock" shape.
+pub trait ClaimResetter {
+    /// Reset `issue` in `repo` if it still holds `loom:building`. Returns
+    /// `Ok(true)` when the claim was actually flipped, `Ok(false)` when the
+    /// issue no longer held it (a no-op — the sweep finished normally between
+    /// capture and reset). `Err` only on a genuine `gh` failure.
+    fn reset_claim(&self, repo: &str, issue: u32, host: &str) -> Result<bool>;
+}
+
+/// The production [`ClaimResetter`]: `gh issue view` to check the current
+/// label set, then `gh issue edit` + `gh issue comment` to flip it — run
+/// **locally** (never over SSH; the forge is global).
+pub struct GhClaimResetter;
+
+impl ClaimResetter for GhClaimResetter {
+    fn reset_claim(&self, repo: &str, issue: u32, host: &str) -> Result<bool> {
+        let view = Command::new("gh")
+            .args([
+                "issue",
+                "view",
+                &issue.to_string(),
+                "--repo",
+                repo,
+                "--json",
+                "labels",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .with_context(|| format!("gh issue view #{issue} in {repo}"))?;
+        if !view.status.success() {
+            anyhow::bail!(
+                "gh issue view #{issue} in {repo} failed: {}",
+                String::from_utf8_lossy(&view.stderr).trim()
+            );
+        }
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&view.stdout).context("parsing gh issue view --json labels")?;
+        let has_building = parsed["labels"]
+            .as_array()
+            .is_some_and(|labels| labels.iter().any(|l| l["name"] == "loom:building"));
+        if !has_building {
+            return Ok(false);
+        }
+
+        let edit = Command::new("gh")
+            .args([
+                "issue",
+                "edit",
+                &issue.to_string(),
+                "--repo",
+                repo,
+                "--remove-label",
+                "loom:building",
+                "--add-label",
+                "loom:issue",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .with_context(|| format!("gh issue edit #{issue} in {repo}"))?;
+        if !edit.status.success() {
+            anyhow::bail!(
+                "gh issue edit #{issue} in {repo} failed: {}",
+                String::from_utf8_lossy(&edit.stderr).trim()
+            );
+        }
+
+        // Best-effort comment — never fails the reset itself (mirrors the
+        // rest of Loom's "a forge comment is advisory" posture).
+        let _ = Command::new("gh")
+            .args([
+                "issue",
+                "comment",
+                &issue.to_string(),
+                "--repo",
+                repo,
+                "--body",
+                &format!(
+                    "🔧 **fleet drain**: host `{host}` was drained/retired while this issue was \
+                     claimed; `loom:building` reset to `loom:issue` so it is not stranded (see \
+                     epic #4340, #4343)."
+                ),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .output();
+
+        Ok(true)
+    }
+}
+
+// ===========================================================================
+// Remote status parsing
+// ===========================================================================
+
+/// Whether a remote `status --json` payload reports the daemon still
+/// draining (`draining: true`) — used by `wait-remote-exit` to distinguish
+/// "still waiting" from "drain was refused and dispatch resumed".
+#[must_use]
+fn parse_still_draining(stdout: &str) -> Option<bool> {
+    let value = serde_json::from_str::<serde_json::Value>(stdout).ok()?;
+    value.get("draining").and_then(serde_json::Value::as_bool)
+}
+
+/// Best-effort mapping from a captured in-flight sweep's workspace-root path
+/// (`SweepInfo.repo`) to one of the worker's registered forge slugs, by
+/// comparing the root's final path segment to each slug's clone-directory
+/// name (`owner/name` -> `name`, the same convention `fleet add-worker` uses).
+/// Falls back to the worker's first registered repo when the mapping is
+/// ambiguous (absent `repo` field, or no matching segment) — a host with
+/// exactly one registered repo (the overwhelmingly common case) is always
+/// unambiguous.
+#[must_use]
+fn resolve_repo_for_sweep(
+    sweep_repo_root: Option<&str>,
+    worker_repos: &[String],
+) -> Option<String> {
+    if worker_repos.is_empty() {
+        return None;
+    }
+    if worker_repos.len() == 1 {
+        return Some(worker_repos[0].clone());
+    }
+    if let Some(root) = sweep_repo_root {
+        let leaf = root.rsplit('/').next().unwrap_or(root);
+        for repo in worker_repos {
+            if repo.rsplit('/').next() == Some(leaf) {
+                return Some(repo.clone());
+            }
+        }
+    }
+    // Ambiguous — best-effort fallback, documented in the module doc.
+    Some(worker_repos[0].clone())
+}
+
+/// Parse `(issue, repo)` pairs directly from a remote `status --json` payload
+/// (used by `capture-claims`). Leniently parsed as a raw [`serde_json::Value`]
+/// (mirrors [`super::status::classify_status_output`]'s lenient posture — an
+/// older/newer remote binary's reduced/extended field set must never fail this
+/// parse, only genuinely non-JSON output does). `SweepKind` serializes as
+/// `{"type":"Issue","value":<n>}` / `{"type":"PrSet","value":[..]}` — a
+/// `PrSet` sweep contributes every member issue (Mode C sweeps are rare and
+/// reserved for future phases, but a drain must not silently drop them if one
+/// is ever in flight). Also carries `SweepInfo.repo` (the workspace-root
+/// string), when present, into [`resolve_repo_for_sweep`].
+#[must_use]
+fn parse_captured_claims(stdout: &str, worker_repos: &[String]) -> Vec<CapturedClaim> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(stdout) else {
+        return Vec::new();
+    };
+    let Some(in_flight) = value.get("in_flight").and_then(serde_json::Value::as_array) else {
+        return Vec::new();
+    };
+    let mut claims = Vec::new();
+    for sweep in in_flight {
+        let sweep_repo_root = sweep.get("repo").and_then(serde_json::Value::as_str);
+        let Some(repo) = resolve_repo_for_sweep(sweep_repo_root, worker_repos) else {
+            continue;
+        };
+        let kind = &sweep["kind"];
+        match kind["type"].as_str() {
+            Some("Issue") => {
+                if let Some(n) = kind["value"].as_u64() {
+                    claims.push(CapturedClaim {
+                        issue: n as u32,
+                        repo: repo.clone(),
+                    });
+                }
+            }
+            Some("PrSet") => {
+                if let Some(arr) = kind["value"].as_array() {
+                    for v in arr {
+                        if let Some(n) = v.as_u64() {
+                            claims.push(CapturedClaim {
+                                issue: n as u32,
+                                repo: repo.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    claims
+}
+
+// ===========================================================================
+// Phase execution (pure-ish: driven entirely off the two seams + the record)
+// ===========================================================================
+
+/// Derive the `%h`-relative workspace path `fleet add-worker` clones a repo
+/// slug into (mirrors `add_worker::workspace_rel`, reimplemented here rather
+/// than widening that module's visibility for a one-line helper).
+#[must_use]
+fn workspace_path_for_repo(repo: &str) -> String {
+    let name = repo.rsplit('/').next().unwrap_or(repo);
+    format!("$HOME/loom-workspaces/{name}")
+}
+
+/// Execute every phase from [`DrainPhase::resume_from`] onward against
+/// `record`, using `runner` for every remote (SSH) action and `claims` for
+/// the local forge claim reset. Mutates `record` in place (phase marker,
+/// captured claims) and calls `persist` after **each** phase so a crash mid-run
+/// never loses more than the phase in progress. Returns the ordered
+/// [`PhaseReport`]s for this run and whether the record should be removed
+/// from the registry (only `true` once `RemoveFromRoster` itself completes).
+pub fn execute_drain(
+    runner: &dyn CommandRunner,
+    claims: &dyn ClaimResetter,
+    record: &mut WorkerRecord,
+    config: &DrainConfig,
+    mut persist: impl FnMut(&WorkerRecord) -> Result<()>,
+) -> Result<(Vec<PhaseReport>, bool)> {
+    let start = DrainPhase::resume_from(record.drain_phase.as_deref());
+    let mut reports = Vec::new();
+    let mut remove_from_roster = false;
+
+    // Every phase strictly before `start` is implicitly AlreadyDone (resumed
+    // past it on a prior run) — reported for a complete, honest checklist.
+    for p in DrainPhase::ALL {
+        if p < start {
+            reports.push(PhaseReport {
+                phase: p.name(),
+                outcome: PhaseOutcome::AlreadyDone,
+            });
+        }
+    }
+
+    let mut phase = Some(start);
+    while let Some(p) = phase {
+        let outcome = run_phase(p, runner, claims, record, config);
+        let failed = outcome.is_failure();
+        let is_remove = p == DrainPhase::RemoveFromRoster && !failed;
+        reports.push(PhaseReport {
+            phase: p.name(),
+            outcome,
+        });
+
+        if failed {
+            // Do NOT advance drain_phase past a failed phase — the marker
+            // (already persisted by the previous successful phase) is the
+            // resume point.
+            break;
+        }
+
+        if is_remove {
+            remove_from_roster = true;
+            // The record is about to be deleted from the registry by the
+            // caller — nothing left to persist onto it.
+        } else {
+            record.drain_phase = Some(p.name().to_string());
+            persist(record)?;
+        }
+
+        phase = p.next();
+    }
+
+    Ok((reports, remove_from_roster))
+}
+
+fn run_phase(
+    phase: DrainPhase,
+    runner: &dyn CommandRunner,
+    claims: &dyn ClaimResetter,
+    record: &mut WorkerRecord,
+    config: &DrainConfig,
+) -> PhaseOutcome {
+    match phase {
+        DrainPhase::MarkDraining => {
+            record.state = Some("draining".to_string());
+            PhaseOutcome::Changed
+        }
+
+        DrainPhase::CaptureClaims => match runner.run("loom-daemon status --json", None) {
+            Ok(out) if out.ok() => {
+                let captured = parse_captured_claims(&out.stdout, &record.repos);
+                record.drain_captured = captured;
+                PhaseOutcome::Changed
+            }
+            Ok(out) => PhaseOutcome::Failed {
+                reason: format!(
+                    "remote `status --json` exited {}: {}",
+                    out.code,
+                    tail(&out.stderr)
+                ),
+            },
+            Err(e) => PhaseOutcome::Failed {
+                reason: format!("could not reach {}: {e}", config.ssh_host),
+            },
+        },
+
+        DrainPhase::TriggerRemoteDrain => {
+            let mut shell = format!(
+                "loom-daemon restart --drain --then-exit --timeout {}",
+                config.timeout_secs
+            );
+            if config.force_after_timeout {
+                shell.push_str(" --force-after-timeout");
+            }
+            match runner.run(&shell, None) {
+                Ok(out) if out.ok() => PhaseOutcome::Changed,
+                Ok(out) => PhaseOutcome::Failed {
+                    reason: format!(
+                        "remote drain trigger refused (exit {}): {}",
+                        out.code,
+                        tail(&out.stderr)
+                    ),
+                },
+                Err(e) => PhaseOutcome::Failed {
+                    reason: format!("could not reach {}: {e}", config.ssh_host),
+                },
+            }
+        }
+
+        DrainPhase::WaitRemoteExit => wait_remote_exit(runner, config),
+
+        DrainPhase::ResetClaims => {
+            let mut failures = Vec::new();
+            let mut reset_count = 0usize;
+            for claim in &record.drain_captured {
+                match claims.reset_claim(&claim.repo, claim.issue, &config.ssh_host) {
+                    Ok(true) => reset_count += 1,
+                    Ok(false) => {}
+                    Err(e) => failures.push(format!("#{} in {}: {e}", claim.issue, claim.repo)),
+                }
+            }
+            if failures.is_empty() {
+                PhaseOutcome::Changed
+            } else {
+                PhaseOutcome::Failed {
+                    reason: format!(
+                        "{} claim(s) reset before failure; could not reset: {}",
+                        reset_count,
+                        failures.join("; ")
+                    ),
+                }
+            }
+        }
+
+        DrainPhase::FlushSafehouse => flush_safehouse(config),
+
+        DrainPhase::DeregisterWorkspace => {
+            let mut failures = Vec::new();
+            for repo in &record.repos {
+                let shell =
+                    format!("loom-daemon workspace remove \"{}\"", workspace_path_for_repo(repo));
+                match runner.run(&shell, None) {
+                    // The remote daemon has already exited by this phase — a
+                    // connection failure here is *expected*, not an error:
+                    // `workspace remove` is a filesystem-registry edit that
+                    // works whether or not the daemon is running, but we
+                    // cannot SSH-execute it once the host itself is about to
+                    // be torn down. Best-effort: log and move on.
+                    Ok(out) if out.ok() => {}
+                    Ok(_) | Err(_) => {
+                        failures.push(repo.clone());
+                    }
+                }
+            }
+            if failures.is_empty() {
+                PhaseOutcome::Changed
+            } else {
+                // Best-effort, never blocks teardown: the host is being
+                // retired anyway, so a stale workspace-registry entry on a
+                // box about to be powered off is cosmetic, not a correctness
+                // issue. Recorded as Skipped (not Failed) so it never blocks
+                // the roster-removal phase.
+                PhaseOutcome::Skipped {
+                    reason: format!(
+                        "could not deregister workspace(s) on {} (host likely already \
+                         unreachable post-drain, which is expected): {}",
+                        config.ssh_host,
+                        failures.join(", ")
+                    ),
+                }
+            }
+        }
+
+        DrainPhase::RemoveFromRoster => PhaseOutcome::Changed,
+    }
+}
+
+/// `wait-remote-exit`: poll `loom-daemon status --json` on the target until
+/// either (a) the connection itself fails — interpreted as "the remote
+/// daemon has exited", the expected outcome of a `then_exit` drain, i.e.
+/// success — or (b) the payload parses and reports `draining: false` while
+/// still reachable — the remote daemon refused the drain (timed out without
+/// `--force-after-timeout`) and is still running; fail loudly rather than
+/// silently declaring success — or (c) [`DrainConfig::max_polls`] is
+/// exhausted, a defensive bound independent of wall-clock so a test double
+/// can never spin forever.
+fn wait_remote_exit(runner: &dyn CommandRunner, config: &DrainConfig) -> PhaseOutcome {
+    let deadline = Instant::now() + Duration::from_secs(config.timeout_secs + WAIT_EXIT_GRACE_SECS);
+    for attempt in 0..config.max_polls.max(1) {
+        match runner.run("loom-daemon status --json", None) {
+            Err(_) => return PhaseOutcome::Changed, // unreachable ⇒ exited ⇒ success
+            Ok(out) if !out.ok() && out.stdout.trim().is_empty() => {
+                return PhaseOutcome::Changed; // connection refused ⇒ exited
+            }
+            Ok(out) => match parse_still_draining(&out.stdout) {
+                Some(true) | None => { /* still going (or payload not yet legible) — keep polling */
+                }
+                Some(false) => {
+                    return PhaseOutcome::Failed {
+                        reason: format!(
+                            "remote drain timed out and was refused (no --force-after-timeout, or \
+                             the daemon aborted it) — {} is still up and dispatching. Re-run \
+                             `fleet drain --force-after-timeout`, or investigate the stragglers.",
+                            config.ssh_host
+                        ),
+                    };
+                }
+            },
+        }
+        if Instant::now() >= deadline || attempt + 1 >= config.max_polls {
+            break;
+        }
+        if !config.poll_interval.is_zero() {
+            std::thread::sleep(config.poll_interval);
+        }
+    }
+    PhaseOutcome::Failed {
+        reason: format!(
+            "timed out after {}s waiting for {} to exit post-drain (still reachable)",
+            config.timeout_secs + WAIT_EXIT_GRACE_SECS,
+            config.ssh_host
+        ),
+    }
+}
+
+/// Safehoused key-backup flush verification (body step 3 / AC 2) — **a
+/// documented stub, not a re-implementation of #3998's teardown fragment.**
+///
+/// #3998 (the safehoused provisioning/teardown fragment) is open, and
+/// `loom-daemon/src/safehouse.rs` exposes only the narration-sink and
+/// peer-claim-coordination client seams — there is no invocable
+/// `wait_for_steady_state`-equivalent reachable from this (synchronous, CLI)
+/// call path. Rather than block every drain on #3998 (steps 1, 2, 4, 5, 6 are
+/// explicitly unblocked per the issue's dependency table) or fabricate a check
+/// that cannot actually verify anything, this phase degrades honestly:
+///
+/// - `safehouse.enabled == false` (the default): [`PhaseOutcome::Skipped`] —
+///   no room keys are in play on this host, so "safe to power off" is
+///   accurate.
+/// - `safehouse.enabled == true`: [`PhaseOutcome::Unverified`] — the drain
+///   still completes (workspace deregistration + roster removal proceed;
+///   loom never *refuses* to retire a box over this), but the final verdict
+///   explicitly withholds "safe to power off" (AC 2: "never print safe to
+///   power off when the key-backup check did not pass") and exits non-zero
+///   (`3`) so an operator/monitor treats it as a flag, not a clean success.
+///
+/// TODO(#3998): once a concrete flush/steady-state-check seam lands in
+/// `safehouse.rs`, replace this stub with a real SSH-invoked check (or a
+/// direct call if the daemon exposes one), and this phase's `Unverified`
+/// branch becomes reachable only on an *actual* verification failure.
+#[must_use]
+fn flush_safehouse(config: &DrainConfig) -> PhaseOutcome {
+    if !config.safehouse_enabled {
+        return PhaseOutcome::Skipped {
+            reason: "safehouse.enabled is false — no room keys in play on this host".to_string(),
+        };
+    }
+    PhaseOutcome::Unverified {
+        reason: "safehouse.enabled is true, but no invocable key-backup steady-state check \
+                 exists in this repo yet (#3998 is open) — cannot verify the flush before this \
+                 host is torn down. Teardown proceeds (workspace/roster cleanup complete), but is \
+                 NOT certified safe for room-key continuity."
+            .to_string(),
+    }
+}
+
+fn tail(s: &str) -> String {
+    s.lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+// ===========================================================================
+// Top-level `run` (real I/O: registry load/save, SSH, `gh`)
+// ===========================================================================
+
+/// `loom-daemon fleet drain <ssh-host>` entry point. Loads the fleet registry,
+/// resolves the resume point, executes every remaining phase over a real
+/// [`SshRunner`] / [`GhClaimResetter`], persisting after each phase, and
+/// prints the report.
+///
+/// A host absent from the registry is a clean no-op (exit 0): either it was
+/// never added, or a prior `fleet drain` already completed and removed it —
+/// both cases mean "nothing to do", not an error (Test Plan edge case:
+/// "drain re-run on an already-drained host").
+pub fn run(config: &DrainConfig) -> Result<DrainReport> {
+    let path = default_fleet_registry_path()?;
+    let registry = FleetRegistry::load(&path)?;
+
+    let Some(idx) = registry
+        .workers
+        .iter()
+        .position(|w| w.ssh_host == config.ssh_host)
+    else {
+        return Ok(DrainReport {
+            host: config.ssh_host.clone(),
+            phases: Vec::new(),
+            safe_to_power_off: true,
+            caveat: None,
+            teardown_command: None,
+        });
+    };
+
+    let mut record = registry.workers[idx].clone();
+    let runner = SshRunner::new(&config.ssh_host);
+    let claims = GhClaimResetter;
+
+    let registry_path = path.clone();
+    let (reports, removed) = execute_drain(&runner, &claims, &mut record, config, |rec| {
+        let mut reg = FleetRegistry::load(&registry_path)?;
+        reg.upsert(rec.clone());
+        reg.save(&registry_path)
+    })?;
+
+    if removed {
+        let mut reg = FleetRegistry::load(&path)?;
+        reg.workers.retain(|w| w.ssh_host != config.ssh_host);
+        reg.save(&path)?;
+    } else {
+        // Persist the final (possibly-failed) state too, so a failed run's
+        // `drain_captured`/`drain_phase` are on disk for the next resume even
+        // if the last phase's own `persist` call inside `execute_drain` was
+        // never reached (a failure never calls it, by design).
+        let mut reg = FleetRegistry::load(&path)?;
+        reg.upsert(record.clone());
+        reg.save(&path)?;
+    }
+
+    Ok(build_report(config, reports))
+}
+
+/// Turn a phase-execution run into the final [`DrainReport`] verdict.
+#[must_use]
+fn build_report(config: &DrainConfig, phases: Vec<PhaseReport>) -> DrainReport {
+    let any_failed = phases.iter().any(|p| p.outcome.is_failure());
+    let any_unverified = phases
+        .iter()
+        .any(|p| matches!(p.outcome, PhaseOutcome::Unverified { .. }));
+    let removed = phases
+        .iter()
+        .any(|p| p.phase == DrainPhase::RemoveFromRoster.name() && !p.outcome.is_failure());
+
+    let safe_to_power_off = removed && !any_failed && !any_unverified;
+
+    let caveat = if any_unverified {
+        phases.iter().find_map(|p| match &p.outcome {
+            PhaseOutcome::Unverified { reason } => Some(reason.clone()),
+            _ => None,
+        })
+    } else if any_failed {
+        phases.iter().find_map(|p| match &p.outcome {
+            PhaseOutcome::Failed { reason } => Some(format!("{}: {reason}", p.phase)),
+            _ => None,
+        })
+    } else {
+        None
+    };
+
+    let teardown_command = if removed
+        || (!any_failed
+            && phases
+                .iter()
+                .any(|p| p.phase == DrainPhase::DeregisterWorkspace.name()))
+    {
+        Some(format!("repo:remote --down {}", config.ssh_host))
+    } else {
+        None
+    };
+
+    DrainReport {
+        host: config.ssh_host.clone(),
+        phases,
+        safe_to_power_off,
+        caveat,
+        teardown_command,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::super::CommandOutput;
+    use super::*;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    // ---- Mocks -------------------------------------------------------
+
+    /// Ordered-queue mock runner (mirrors `add_worker`'s `MockRunner`): each
+    /// `run` pops the next canned response, recording the shell it was asked
+    /// to run.
+    struct MockRunner {
+        responses: RefCell<Vec<Result<CommandOutput, String>>>,
+        calls: RefCell<Vec<String>>,
+    }
+
+    impl MockRunner {
+        fn new(responses: Vec<Result<CommandOutput, String>>) -> Self {
+            Self {
+                responses: RefCell::new(responses),
+                calls: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl CommandRunner for MockRunner {
+        fn run(&self, shell: &str, _stdin: Option<&str>) -> Result<CommandOutput> {
+            self.calls.borrow_mut().push(shell.to_string());
+            let mut r = self.responses.borrow_mut();
+            if r.is_empty() {
+                return Ok(ok_status(false));
+            }
+            match r.remove(0) {
+                Ok(out) => Ok(out),
+                Err(e) => Err(anyhow::anyhow!(e)),
+            }
+        }
+    }
+
+    fn ok_status(draining: bool) -> CommandOutput {
+        CommandOutput {
+            code: 0,
+            stdout: format!(r#"{{"in_flight": [], "draining": {draining}}}"#),
+            stderr: String::new(),
+        }
+    }
+
+    fn ok_with_in_flight(issues: &[u32], draining: bool) -> CommandOutput {
+        let sweeps: Vec<String> = issues
+            .iter()
+            .map(|n| format!(r#"{{"kind": {{"type": "Issue", "value": {n}}}, "repo": null}}"#))
+            .collect();
+        CommandOutput {
+            code: 0,
+            stdout: format!(r#"{{"in_flight": [{}], "draining": {draining}}}"#, sweeps.join(",")),
+            stderr: String::new(),
+        }
+    }
+
+    fn refused() -> CommandOutput {
+        CommandOutput {
+            code: 1,
+            stdout: String::new(),
+            stderr: "refusing to drain: no supervisor detected".to_string(),
+        }
+    }
+
+    /// Records every reset call; `outcomes` scripts the per-`(issue)` result.
+    struct MockClaimResetter {
+        outcomes: Mutex<HashMap<u32, Result<bool, String>>>,
+        calls: Mutex<Vec<(String, u32, String)>>,
+    }
+
+    impl MockClaimResetter {
+        fn new(outcomes: HashMap<u32, Result<bool, String>>) -> Self {
+            Self {
+                outcomes: Mutex::new(outcomes),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ClaimResetter for MockClaimResetter {
+        fn reset_claim(&self, repo: &str, issue: u32, host: &str) -> Result<bool> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((repo.to_string(), issue, host.to_string()));
+            match self.outcomes.lock().unwrap().remove(&issue) {
+                Some(Ok(b)) => Ok(b),
+                Some(Err(e)) => Err(anyhow::anyhow!(e)),
+                None => Ok(false),
+            }
+        }
+    }
+
+    fn worker(host: &str) -> WorkerRecord {
+        WorkerRecord {
+            ssh_host: host.to_string(),
+            repos: vec!["rjwalters/anvil".to_string()],
+            priority: 100,
+            bootstrapped_at: "2026-07-29T00:00:00Z".to_string(),
+            last_verify: None,
+            provider_instance_id: None,
+            tailnet_name: None,
+            added_by: None,
+            state: None,
+            drain_phase: None,
+            drain_captured: Vec::new(),
+        }
+    }
+
+    fn base_config(host: &str) -> DrainConfig {
+        DrainConfig {
+            ssh_host: host.to_string(),
+            timeout_secs: 60,
+            force_after_timeout: false,
+            poll_interval: Duration::from_millis(0),
+            max_polls: 3,
+            safehouse_enabled: false,
+            json: false,
+        }
+    }
+
+    // ---- DrainPhase ----------------------------------------------------
+
+    #[test]
+    fn resume_from_none_starts_at_first_phase() {
+        assert_eq!(DrainPhase::resume_from(None), DrainPhase::MarkDraining);
+    }
+
+    #[test]
+    fn resume_from_last_completed_starts_at_next() {
+        assert_eq!(DrainPhase::resume_from(Some("mark-draining")), DrainPhase::CaptureClaims);
+        assert_eq!(
+            DrainPhase::resume_from(Some("flush-safehouse")),
+            DrainPhase::DeregisterWorkspace
+        );
+    }
+
+    #[test]
+    fn resume_from_unrecognized_starts_over_rather_than_erroring() {
+        assert_eq!(DrainPhase::resume_from(Some("some-future-phase")), DrainPhase::MarkDraining);
+    }
+
+    #[test]
+    fn resume_from_final_phase_stays_at_final() {
+        assert_eq!(
+            DrainPhase::resume_from(Some("remove-from-roster")),
+            DrainPhase::RemoveFromRoster
+        );
+    }
+
+    // ---- parse helpers ---------------------------------------------------
+
+    #[test]
+    fn parse_captured_claims_reads_issue_and_prset_kinds() {
+        let json = r#"{"in_flight": [
+            {"kind": {"type": "Issue", "value": 42}},
+            {"kind": {"type": "PrSet", "value": [7, 9]}}
+        ]}"#;
+        let repos = vec!["rjwalters/anvil".to_string()];
+        let mut got: Vec<u32> = parse_captured_claims(json, &repos)
+            .into_iter()
+            .map(|c| c.issue)
+            .collect();
+        got.sort_unstable();
+        assert_eq!(got, vec![7, 9, 42]);
+    }
+
+    #[test]
+    fn parse_captured_claims_tolerates_garbage() {
+        let repos = vec!["rjwalters/anvil".to_string()];
+        assert!(parse_captured_claims("not json", &repos).is_empty());
+        assert!(parse_captured_claims(r#"{"no_in_flight_key": true}"#, &repos).is_empty());
+    }
+
+    #[test]
+    fn parse_still_draining_reads_bool_field() {
+        assert_eq!(parse_still_draining(r#"{"draining": true}"#), Some(true));
+        assert_eq!(parse_still_draining(r#"{"draining": false}"#), Some(false));
+        assert_eq!(parse_still_draining(r#"{"other": 1}"#), None);
+        assert_eq!(parse_still_draining("garbage"), None);
+    }
+
+    #[test]
+    fn resolve_repo_for_sweep_unambiguous_with_one_repo() {
+        let repos = vec!["rjwalters/anvil".to_string()];
+        assert_eq!(resolve_repo_for_sweep(None, &repos), Some("rjwalters/anvil".to_string()));
+    }
+
+    #[test]
+    fn resolve_repo_for_sweep_matches_leaf_segment_with_multiple_repos() {
+        let repos = vec!["rjwalters/anvil".to_string(), "rjwalters/loom".to_string()];
+        assert_eq!(
+            resolve_repo_for_sweep(Some("/home/w/loom-workspaces/loom"), &repos),
+            Some("rjwalters/loom".to_string())
+        );
+        assert_eq!(
+            resolve_repo_for_sweep(Some("/home/w/loom-workspaces/anvil"), &repos),
+            Some("rjwalters/anvil".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_repo_for_sweep_falls_back_to_first_when_ambiguous() {
+        let repos = vec!["rjwalters/anvil".to_string(), "rjwalters/loom".to_string()];
+        assert_eq!(resolve_repo_for_sweep(None, &repos), Some("rjwalters/anvil".to_string()));
+    }
+
+    // ---- full happy-path phase sequence -----------------------------------
+
+    #[test]
+    fn happy_path_drains_captures_resets_and_removes_from_roster() {
+        let runner = MockRunner::new(vec![
+            Ok(ok_with_in_flight(&[42], true)), // capture-claims
+            Ok(CommandOutput {
+                code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            }), // trigger
+            Err("connection refused".to_string()), // wait-remote-exit: unreachable == exited
+            Ok(CommandOutput {
+                code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            }), // deregister-workspace
+        ]);
+        let mut outcomes = HashMap::new();
+        outcomes.insert(42, Ok(true));
+        let claims = MockClaimResetter::new(outcomes);
+
+        let mut record = worker("worker-1");
+        let config = base_config("worker-1");
+        let mut saved = Vec::new();
+        let (reports, removed) = execute_drain(&runner, &claims, &mut record, &config, |rec| {
+            saved.push(rec.clone());
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(removed, "the record should be marked for roster removal");
+        assert!(!reports.iter().any(|r| r.outcome.is_failure()), "reports: {reports:?}");
+        assert_eq!(reports.len(), DrainPhase::ALL.len());
+        // MarkDraining persisted first.
+        assert_eq!(saved[0].state.as_deref(), Some("draining"));
+        // The captured claim was reset.
+        assert_eq!(claims.calls.lock().unwrap().len(), 1);
+        assert_eq!(
+            claims.calls.lock().unwrap()[0],
+            ("rjwalters/anvil".to_string(), 42, "worker-1".to_string())
+        );
+
+        let report = build_report(&config, reports);
+        assert!(report.safe_to_power_off);
+        assert!(report.teardown_command.unwrap().contains("worker-1"));
+    }
+
+    // ---- resumability ------------------------------------------------
+
+    #[test]
+    fn rerun_after_interruption_resumes_at_recorded_phase() {
+        // Simulate a prior run that got through `trigger-remote-drain`.
+        let mut record = worker("worker-1");
+        record.state = Some("draining".to_string());
+        record.drain_phase = Some(DrainPhase::TriggerRemoteDrain.name().to_string());
+        record.drain_captured = vec![CapturedClaim {
+            issue: 42,
+            repo: "rjwalters/anvil".to_string(),
+        }];
+
+        let runner = MockRunner::new(vec![
+            Err("connection refused".to_string()), // wait-remote-exit
+            Ok(CommandOutput {
+                code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            }), // deregister
+        ]);
+        let mut outcomes = HashMap::new();
+        outcomes.insert(42, Ok(true));
+        let claims = MockClaimResetter::new(outcomes);
+        let config = base_config("worker-1");
+
+        let (reports, removed) =
+            execute_drain(&runner, &claims, &mut record, &config, |_| Ok(())).unwrap();
+
+        assert!(removed);
+        // The first two phases must be reported AlreadyDone, not re-run —
+        // and critically the mock never received a `capture-claims`/`trigger`
+        // call (only 2 responses were scripted and both were consumed by
+        // wait-remote-exit + deregister-workspace).
+        assert_eq!(reports[0].phase, DrainPhase::MarkDraining.name());
+        assert_eq!(reports[0].outcome, PhaseOutcome::AlreadyDone);
+        assert_eq!(reports[1].phase, DrainPhase::CaptureClaims.name());
+        assert_eq!(reports[1].outcome, PhaseOutcome::AlreadyDone);
+        assert_eq!(reports[2].phase, DrainPhase::TriggerRemoteDrain.name());
+        assert_eq!(reports[2].outcome, PhaseOutcome::AlreadyDone);
+        assert_eq!(runner.calls.borrow().len(), 2);
+    }
+
+    #[test]
+    fn rerun_on_already_drained_host_is_a_clean_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry_path = dir.path().join("fleet.json");
+        std::env::set_var(super::super::FLEET_REGISTRY_PATH_ENV, &registry_path);
+        // No worker registered at all.
+        let config = base_config("gone-host");
+        let report = run(&config).unwrap();
+        std::env::remove_var(super::super::FLEET_REGISTRY_PATH_ENV);
+
+        assert!(report.phases.is_empty());
+        assert!(report.safe_to_power_off);
+    }
+
+    // ---- fail-safe timeout without --force-after-timeout -----------------
+
+    #[test]
+    fn timeout_without_force_refuses_and_leaves_daemon_running() {
+        let runner = MockRunner::new(vec![
+            Ok(ok_with_in_flight(&[], true)), // capture-claims
+            Ok(CommandOutput {
+                code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            }), // trigger accepted
+            Ok(ok_status(false)), // wait-remote-exit: still reachable, draining=false ⇒ refused
+        ]);
+        let claims = MockClaimResetter::new(HashMap::new());
+        let mut record = worker("worker-1");
+        let config = base_config("worker-1");
+
+        let (reports, removed) =
+            execute_drain(&runner, &claims, &mut record, &config, |_| Ok(())).unwrap();
+
+        assert!(!removed, "a refused drain must not remove the roster entry");
+        let wait_report = reports
+            .iter()
+            .find(|r| r.phase == DrainPhase::WaitRemoteExit.name())
+            .unwrap();
+        assert!(wait_report.outcome.is_failure());
+        // Halts — reset-claims / flush / deregister / remove never run.
+        assert_eq!(reports.len(), 4);
+
+        let report = build_report(&config, reports);
+        assert!(!report.safe_to_power_off);
+        assert_eq!(report.exit_code(), 2);
+        assert!(report.teardown_command.is_none());
+    }
+
+    #[test]
+    fn trigger_remote_drain_refusal_halts_before_wait_and_leaves_roster_intact() {
+        let runner = MockRunner::new(vec![
+            Ok(ok_with_in_flight(&[], true)), // capture-claims
+            Ok(refused()),                    // trigger-remote-drain: remote refuses
+        ]);
+        let claims = MockClaimResetter::new(HashMap::new());
+        let mut record = worker("worker-1");
+        let config = base_config("worker-1");
+
+        let (reports, removed) =
+            execute_drain(&runner, &claims, &mut record, &config, |_| Ok(())).unwrap();
+
+        assert!(!removed);
+        let trigger_report = reports
+            .iter()
+            .find(|r| r.phase == DrainPhase::TriggerRemoteDrain.name())
+            .unwrap();
+        assert!(trigger_report.outcome.is_failure());
+        // wait-remote-exit and everything after never runs.
+        assert_eq!(reports.len(), 3);
+        assert_eq!(build_report(&config, reports).exit_code(), 1);
+    }
+
+    // ---- force-cancel resets every captured claim -------------------------
+
+    #[test]
+    fn timeout_with_force_completes_and_resets_every_captured_claim() {
+        let mut config = base_config("worker-1");
+        config.force_after_timeout = true;
+
+        let runner = MockRunner::new(vec![
+            Ok(ok_with_in_flight(&[10, 11], true)), // capture-claims: two in-flight
+            Ok(CommandOutput {
+                code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            }), // trigger (forced)
+            Err("connection refused".to_string()),  // wait-remote-exit: exited after force-cancel
+            Ok(CommandOutput {
+                code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            }), // deregister
+        ]);
+        let mut outcomes = HashMap::new();
+        outcomes.insert(10, Ok(true));
+        outcomes.insert(11, Ok(true));
+        let claims = MockClaimResetter::new(outcomes);
+        let mut record = worker("worker-1");
+
+        let (reports, removed) =
+            execute_drain(&runner, &claims, &mut record, &config, |_| Ok(())).unwrap();
+
+        assert!(removed);
+        assert!(!reports.iter().any(|r| r.outcome.is_failure()));
+        let mut reset_issues: Vec<u32> = claims
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, i, _)| *i)
+            .collect();
+        reset_issues.sort_unstable();
+        assert_eq!(reset_issues, vec![10, 11]);
+    }
+
+    // ---- claim already resolved between capture and reset -----------------
+
+    #[test]
+    fn reset_claims_no_ops_an_issue_that_already_left_building() {
+        let runner = MockRunner::new(vec![
+            Ok(ok_with_in_flight(&[42], true)),
+            Ok(CommandOutput {
+                code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            }),
+            Err("connection refused".to_string()),
+            Ok(CommandOutput {
+                code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            }),
+        ]);
+        // Issue 42 finished normally in the meantime — resetter reports false.
+        let mut outcomes = HashMap::new();
+        outcomes.insert(42, Ok(false));
+        let claims = MockClaimResetter::new(outcomes);
+        let mut record = worker("worker-1");
+        let config = base_config("worker-1");
+
+        let (reports, removed) =
+            execute_drain(&runner, &claims, &mut record, &config, |_| Ok(())).unwrap();
+        assert!(removed);
+        assert!(!reports.iter().any(|r| r.outcome.is_failure()));
+        assert_eq!(claims.calls.lock().unwrap().len(), 1);
+    }
+
+    // ---- unverified safehouse flush → non-zero, no "safe to power off" ---
+
+    #[test]
+    fn unverified_safehouse_flush_yields_nonzero_exit_and_no_safe_line() {
+        let mut config = base_config("worker-1");
+        config.safehouse_enabled = true;
+
+        let runner = MockRunner::new(vec![
+            Ok(ok_with_in_flight(&[], true)),
+            Ok(CommandOutput {
+                code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            }),
+            Err("connection refused".to_string()),
+            Ok(CommandOutput {
+                code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            }),
+        ]);
+        let claims = MockClaimResetter::new(HashMap::new());
+        let mut record = worker("worker-1");
+
+        let (reports, removed) =
+            execute_drain(&runner, &claims, &mut record, &config, |_| Ok(())).unwrap();
+        // Not blocked — deregistration/roster-removal still proceed.
+        assert!(removed);
+
+        let report = build_report(&config, reports);
+        assert!(!report.safe_to_power_off);
+        assert_eq!(report.exit_code(), 3);
+        let rendered = report.render_human();
+        assert!(!rendered.contains("safe to power off."), "rendered: {rendered}");
+        assert!(rendered.contains("DRAIN NOT VERIFIED SAFE"));
+    }
+
+    #[test]
+    fn safehouse_disabled_is_skipped_and_stays_safe() {
+        let config = base_config("worker-1"); // safehouse_enabled: false
+        let outcome = flush_safehouse(&config);
+        assert!(matches!(outcome, PhaseOutcome::Skipped { .. }));
+    }
+
+    // ---- roster entry removed only in the final phase ---------------------
+
+    #[test]
+    fn roster_entry_removed_only_after_every_other_phase_completes() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry_path = dir.path().join("fleet.json");
+        std::env::set_var(super::super::FLEET_REGISTRY_PATH_ENV, &registry_path);
+
+        let mut registry = FleetRegistry::default();
+        registry.upsert(worker("worker-1"));
+        registry.save(&registry_path).unwrap();
+
+        // Directly exercise `execute_drain` + a `run`-shaped persist, then
+        // simulate the same removal `run` performs, to prove ordering
+        // without needing a live ssh binary.
+        let runner = MockRunner::new(vec![
+            Ok(ok_with_in_flight(&[], true)),
+            Ok(CommandOutput {
+                code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            }),
+            Err("connection refused".to_string()),
+            Ok(CommandOutput {
+                code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            }),
+        ]);
+        let claims = MockClaimResetter::new(HashMap::new());
+        let mut record = registry.get("worker-1").unwrap().clone();
+        let config = base_config("worker-1");
+
+        let mut still_present_before_final = true;
+        let (reports, removed) = execute_drain(&runner, &claims, &mut record, &config, |rec| {
+            let mut reg = FleetRegistry::load(&registry_path)?;
+            // Every intermediate persist must still find the entry present.
+            still_present_before_final = reg.get(&rec.ssh_host).is_some();
+            reg.upsert(rec.clone());
+            reg.save(&registry_path)
+        })
+        .unwrap();
+
+        assert!(still_present_before_final);
+        assert!(removed);
+        assert!(!reports.iter().any(|r| r.outcome.is_failure()));
+
+        std::env::remove_var(super::super::FLEET_REGISTRY_PATH_ENV);
+    }
+}

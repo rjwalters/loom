@@ -450,12 +450,16 @@ impl DrainTrigger for IpcDrainTrigger {
         // not drain by the deadline the roll is refused and dispatch resumes,
         // never killing a sweep.
         let _guard = self.handle.enter();
+        // `then_exit=false`: this is the #4090 roll trigger — the daemon must
+        // restart (relaunch into the freshly-rebuilt binary), never stop for
+        // good. `then_exit: true` is `fleet drain`'s (#4343) teardown-only path.
         let resp = crate::ipc::handle_drain_request(
             &self.drain,
             &self.workspace_pool,
             &self.fallback_root,
             &self.event_bus,
             None,
+            false,
             false,
         );
         matches!(resp, crate::types::Response::DaemonDrain { accepted: true, .. })
