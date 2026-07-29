@@ -27,7 +27,9 @@
       "*.py",
       "*.sh"
     ],
-    "timeoutSeconds": 1200
+    "timeoutSeconds": 1200,
+    "loadThreshold": 0.9,
+    "maxDeferSeconds": 1800
   },
   "terminals": [
     {

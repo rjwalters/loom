@@ -161,6 +161,7 @@ detect_daemon_liveness() {
     liveness_detail=""
     job_loaded=false
     launchd_service=""
+    live_pid=""
     if [[ "$USE_LAUNCHD" == "true" ]] && command -v launchctl >/dev/null 2>&1; then
         # Resolve the domain (gui/<uid> ↦ user/<uid>, #4130) the same way the
         # start did, so a headless daemon in user/<uid> is probed correctly.
@@ -171,6 +172,7 @@ detect_daemon_liveness() {
         if [[ -n "$launchd_pid" ]] && kill -0 "$launchd_pid" 2>/dev/null; then
             daemon_alive=true
             liveness_detail="launchd job $launchd_service alive (pid $launchd_pid)"
+            live_pid="$launchd_pid"
         elif [[ "$launchd_print_rc" -eq 0 ]]; then
             job_loaded=true
             liveness_detail="launchd job $launchd_service is LOADED but NOT running (no live pid)"
@@ -184,6 +186,7 @@ detect_daemon_liveness() {
             if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
                 daemon_alive=true
                 liveness_detail="pid $pid (from $PID_FILE) alive"
+                live_pid="$pid"
             else
                 liveness_detail="pid file $PID_FILE present but pid not alive"
             fi
@@ -191,6 +194,44 @@ detect_daemon_liveness() {
             liveness_detail="no live pid file at ${PID_FILE:-<none>}"
         fi
     fi
+}
+
+# Parse a `ps -o etime=` duration ([[dd-]hh:]mm:ss) into whole seconds —
+# mirrors the Rust probe's `parse_etime` exactly (`daemon_install_state.rs`,
+# #4368) so the two never disagree on a process's age. Any unexpected shape
+# or non-numeric field fails (exit 1, nothing echoed) — the caller treats an
+# unparseable age as *unknown* and makes no prior-boot claim, never a false
+# one either way.
+parse_etime_secs() {
+    local raw days rest hours minutes seconds parts
+    raw="$(printf '%s' "${1:-}" | tr -d '[:space:]')"
+    [[ -z "$raw" ]] && return 1
+    days=0
+    rest="$raw"
+    if [[ "$raw" == *-* ]]; then
+        days="${raw%%-*}"
+        rest="${raw#*-}"
+        [[ "$days" =~ ^[0-9]+$ ]] || return 1
+    fi
+    IFS=':' read -r -a parts <<< "$rest"
+    case "${#parts[@]}" in
+        1) hours=0; minutes=0; seconds="${parts[0]}" ;;
+        2) hours=0; minutes="${parts[0]}"; seconds="${parts[1]}" ;;
+        3) hours="${parts[0]}"; minutes="${parts[1]}"; seconds="${parts[2]}" ;;
+        *) return 1 ;;
+    esac
+    [[ "$hours" =~ ^[0-9]+$ && "$minutes" =~ ^[0-9]+$ && "$seconds" =~ ^[0-9]+$ ]] || return 1
+    echo $(( days * 86400 + hours * 3600 + minutes * 60 + seconds ))
+}
+
+# Live process age in seconds via `ps -o etime= -p <pid>`, degrading to
+# nothing (no output, non-zero return) on any failure — the caller must never
+# turn an unknown age into a false prior-boot claim (#4368).
+process_age_secs() {
+    local pid="$1" etime
+    [[ -n "$pid" ]] || return 1
+    etime="$(ps -o etime= -p "$pid" 2>/dev/null)" || return 1
+    parse_etime_secs "$etime"
 }
 
 # ---------- 1. intent: is a daemon expected at all? ----------
@@ -337,6 +378,21 @@ if [[ -f "$HEARTBEAT_FILE" ]]; then
     if [[ "$mtime" =~ ^[0-9]+$ ]]; then
         now="$(date -u +%s)"
         age=$(( now - mtime ))
+        # Prior-boot detection (#4368): if this heartbeat file predates the
+        # live process's own start time, it is not evidence about the current
+        # process at all — necessarily left over from a previous boot (or a
+        # previous enablement of the opt-in heartbeat loop). Checked BEFORE
+        # the staleness threshold below, mirroring the Rust probe's
+        # `check_heartbeat` exactly (`daemon_install_state.rs`) so `status`
+        # and this watchdog can never contradict each other. Only claim this
+        # when the process age is actually known; an unparseable `ps` age
+        # degrades to the ordinary Stale/Fresh checks below rather than a
+        # false claim either way.
+        proc_age="$(process_age_secs "$live_pid" 2>/dev/null)" || proc_age=""
+        if [[ -n "$proc_age" ]] && (( age > proc_age )); then
+            report OK "daemon alive (${liveness_detail}); heartbeat ${HEARTBEAT_FILE} is from a PREVIOUS boot (${age}s old; this process is only ${proc_age}s old) — not evidence about the current process. Liveness-only OK; re-check after the process is well past startup if you still suspect a wedge."
+            exit 0
+        fi
         if (( age > STALE_SECS )); then
             report DIVERGENCE \
                 "Daemon process is alive (${liveness_detail}) but its heartbeat ${HEARTBEAT_FILE} is STALE (${age}s old > ${STALE_SECS}s threshold) — the daemon may be wedged. Inspect with 'loom-daemon status'; consider ./.loom/scripts/cli/loom-daemon-stop.sh && ...start.sh."

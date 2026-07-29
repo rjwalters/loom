@@ -2761,7 +2761,8 @@ service's exit code affects the next scheduled run.
 | Marker | Reality | Watchdog |
 |--------|---------|----------|
 | present | daemon alive, heartbeat fresh | silent (OK) |
-| present | daemon alive, heartbeat **stale** | **report** — daemon may be wedged |
+| present | daemon alive, heartbeat **stale**, written this boot (younger than the process) | **report** — daemon may be wedged |
+| present | daemon alive, heartbeat **older than the process itself** (#4368: a previous-boot/enablement leftover) | silent (liveness-only; not evidence about the current process) |
 | present | daemon alive, no heartbeat file | silent (liveness-only; heartbeat disabled or not yet written) |
 | present | daemon **not loaded/alive** | **report** — the #4011 outage |
 | **absent** | **nothing running** | silent — deliberate stop, no false page |
@@ -2849,7 +2850,27 @@ disagree, and reports one of four states with a distinct exit code:
 | `not-expected` | marker absent (deliberate stop, or never started) | `1` | suggest `loom-daemon-start.sh` |
 | `expected-but-dead` | marker present, no live process — the #4011 divergence | `3` | suggest `loom-daemon-start.sh`; points at `daemon-watchdog.log` |
 | `alive-starting` | marker present, process alive, IPC failed, **process age ≤ startup-grace window** — a normal `bootout`/`bootstrap` restart whose socket has not bound yet (#4213) | `4` | **none** — reports "still starting, not a fault"; NO stop/start remediation |
-| `alive-but-unresponsive` | marker present, process alive, IPC failed, process **older** than the grace window (or age undeterminable) | `4` | does **not** suggest a start (singleton guard refuses); prints the live pid; heartbeat freshness qualifies fresh ⇒ IPC/socket fault, stale ⇒ likely wedged |
+| `alive-but-unresponsive` | marker present, process alive, IPC failed, process **older** than the grace window (or age undeterminable) | `4` | does **not** suggest a start (singleton guard refuses); prints the live pid; heartbeat freshness qualifies fresh ⇒ IPC/socket fault, stale ⇒ likely wedged, **prior-boot** ⇒ not evidence about the current process |
+
+The heartbeat freshness qualifier on `alive-but-unresponsive` also gates the
+"do NOT run `loom-daemon-start.sh` … stop && start" remediation (#4368): it is
+only printed for a **current-boot `stale`** verdict — heartbeat age exceeds
+the staleness threshold *and* is younger than the process's own age, i.e. the
+evidence actually points at a wedge. `fresh` / `unknown` / **`prior-boot`**
+print inspect-first guidance (`ps -p <pid> -o pid,etime,command`, `loom-daemon
+status --json`) instead of the imperative restart, since none of those three
+qualifiers indicate a fault. `prior-boot` fires when the heartbeat file's mtime
+is strictly older than the live process's own start time (`heartbeat_age_secs
+> process_age_secs`) — necessarily a leftover from a previous boot or a
+previous enablement of the opt-in heartbeat loop, checked *before* the
+staleness threshold (even a heartbeat that would otherwise look "fresh" by age
+alone is not current-boot evidence if it predates the process). Equal ages are
+deliberately **not** `prior-boot` (current-boot evidence, falls through to the
+ordinary threshold check); an undeterminable process age makes **no**
+prior-boot claim and degrades to the pre-#4368 fresh/stale verdicts.
+`loom-daemon-watchdog.sh` §3 mirrors the same mtime-vs-process-start
+comparison (via `ps -o etime= -p <pid>`) before its own stale WARN, so `status`
+and the watchdog log can never contradict each other on this qualifier either.
 
 The startup-grace window defaults to `90s` (sized above the observed ~40–60s
 socket-bind latency after a `launchctl bootout`/`bootstrap` cycle) and is
