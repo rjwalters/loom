@@ -1895,10 +1895,13 @@ enum StatusAttemptError {
     /// listening), so this is never retried: fast-fail preserves the operator's
     /// "is the daemon running?" latency.
     Connect(anyhow::Error),
-    /// The daemon accepted the connection but closed it before writing any
-    /// response byte (EOF). This is the transient contention failure #4279
-    /// retries exactly once — under concurrent-sweep load a per-connection task
-    /// can briefly drop a `status` connection that the very next one answers.
+    /// The daemon accepted the connection but dropped it before writing a full
+    /// response line — either a clean pre-response EOF or, on Linux, a RST that
+    /// surfaces as a `ConnectionReset`/`BrokenPipe`/`UnexpectedEof` read/write
+    /// error (see [`classify_roundtrip_error`]). This is the transient
+    /// contention failure #4279 retries exactly once — under concurrent-sweep
+    /// load a per-connection task can briefly drop a `status` connection that
+    /// the very next one answers.
     DroppedBeforeReply(anyhow::Error),
     /// The round-trip failed for a non-transient reason: it timed out against a
     /// slow-but-live daemon (honor the single 5s budget rather than doubling it)
@@ -1958,8 +1961,10 @@ async fn query_daemon_status_once(
     let (reader, mut writer) = stream.into_split();
 
     // The round-trip yields `Ok(None)` on a clean pre-response EOF (the retryable
-    // drop), `Ok(Some(report))` on success, and `Err(_)` for a malformed/error
-    // frame — kept distinct so the timeout wrapper below can classify each.
+    // drop), `Ok(Some(report))` on success, and `Err(_)` for either a
+    // malformed/error frame OR a pre-response read/write I/O error (e.g. the
+    // Linux RST drop) — the timeout wrapper below routes each `Err(_)` through
+    // `classify_roundtrip_error` to decide whether it is the retryable drop.
     let roundtrip = async move {
         let request_json = serde_json::to_string(&Request::DaemonStatus)?;
         writer.write_all(request_json.as_bytes()).await?;
@@ -1985,11 +1990,41 @@ async fn query_daemon_status_once(
             "status round-trip timed out after {}s",
             timeout.as_secs()
         ))),
-        Ok(Err(e)) => Err(StatusAttemptError::Roundtrip(e)),
+        Ok(Err(e)) => Err(classify_roundtrip_error(e)),
         Ok(Ok(None)) => Err(StatusAttemptError::DroppedBeforeReply(anyhow!(
             "daemon closed the connection without responding"
         ))),
         Ok(Ok(Some(report))) => Ok(report),
+    }
+}
+
+/// Classify a round-trip `Err` from [`query_daemon_status_once`]'s I/O closure as
+/// retryable or not (#4279). A read/write I/O error that fires before a full
+/// response line arrived is the SAME transient drop as a clean pre-response EOF:
+/// on Linux a peer that closes the socket with unread request bytes still queued
+/// in its kernel receive buffer replies with RST, so the client's read surfaces
+/// `ConnectionReset` (os error 104) instead of the clean EOF macOS reports — both
+/// mean "the daemon dropped us before replying". `ConnectionReset`, `BrokenPipe`,
+/// and `UnexpectedEof` are therefore reclassified as the retryable
+/// [`StatusAttemptError::DroppedBeforeReply`] (reusing the same friendly
+/// diagnostic as the EOF path so the operator message is platform-independent).
+/// Malformed-JSON responses and explicit `Response::Error` replies are NOT
+/// `io::Error`s, so they stay non-retryable [`StatusAttemptError::Roundtrip`].
+fn classify_roundtrip_error(e: anyhow::Error) -> StatusAttemptError {
+    let dropped_before_reply = e.downcast_ref::<std::io::Error>().is_some_and(|io_err| {
+        matches!(
+            io_err.kind(),
+            std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::UnexpectedEof
+        )
+    });
+    if dropped_before_reply {
+        StatusAttemptError::DroppedBeforeReply(anyhow!(
+            "daemon closed the connection without responding"
+        ))
+    } else {
+        StatusAttemptError::Roundtrip(e)
     }
 }
 
