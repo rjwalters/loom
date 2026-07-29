@@ -182,6 +182,32 @@ SHIM_EOF
   fi
 }
 
+# _pmd_is_real_binary <path>
+#
+# Issue #4397 (deferred from #4381's incident review, PR #4396): a `file(1)`-based
+# sanity check that <path> is an actual compiled executable (Mach-O on Darwin,
+# ELF on Linux) rather than a shell script, text file, or other non-binary
+# masquerading as the daemon. Matches on the `Mach-O` / `ELF` substrings that
+# `file -b` emits for every architecture/variant this repo ships for (universal
+# binaries, PIE executables, shared objects, etc. all still contain one of
+# those two tokens); a shell script instead reports "... script text
+# executable" and a plain text file reports "ASCII text" — neither matches.
+#
+# Soft-passes (returns 0) when `file` itself is unavailable, rather than
+# blocking an install on a missing diagnostic tool that has nothing to do with
+# the binary's actual validity — the pre-existing `-x` executable-bit check in
+# the caller is still enforced regardless.
+_pmd_is_real_binary() {
+  local path="$1"
+  command -v file >/dev/null 2>&1 || return 0
+  local desc
+  desc="$(file -b "$path" 2>/dev/null)"
+  case "$desc" in
+    *Mach-O*|*ELF*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # provision_machine_daemon <src_bin> [dest_dir]
 #
 # Installs <src_bin> to <dest_dir>/loom-daemon (default: LOOM_DAEMON_BIN_DIR,
@@ -206,6 +232,26 @@ provision_machine_daemon() {
 
   if [[ -z "$src_bin" || ! -x "$src_bin" ]]; then
     _pmd_warn "built binary not found at '${src_bin:-<unset>}'; skipping machine-level install"
+    return 1
+  fi
+
+  # Binary-format sanity gate (#4397, deferred from #4381's incident review):
+  # refuse to install anything that isn't a real compiled binary to the
+  # machine-level daemon path. #4396 sandboxed + checksum-guarded the TEST
+  # SUITE's own fixtures from ever touching the real destination; this gate
+  # protects every CALLER of this function (the installer, self-update, any
+  # future script) so a shell script, text file, or other non-binary can never
+  # be installed as `loom-daemon`, regardless of caller. LOOM_PROVISION_ALLOW_SCRIPT=1
+  # is an explicit, auditable test-only bypass — set suite-wide by
+  # tests/install/test-provision-daemon.sh and
+  # defaults/scripts/tests/test-loom-daemon-update.sh (whose fixture "daemon"
+  # stand-ins are bash scripts standing in for the real compiled binary);
+  # production callers (scripts/install-loom.sh,
+  # defaults/scripts/cli/loom-daemon-update.sh) never set it.
+  if [[ -z "${LOOM_PROVISION_ALLOW_SCRIPT:-}" ]] && ! _pmd_is_real_binary "$src_bin"; then
+    _pmd_warn "refusing to install '$src_bin': not a compiled binary (Mach-O/ELF executable expected)"
+    _pmd_warn "  file(1) reports: $(file -b "$src_bin" 2>/dev/null || echo '<file unavailable>')"
+    _pmd_warn "  if this is a deliberate test fixture standing in for the real daemon binary, set LOOM_PROVISION_ALLOW_SCRIPT=1"
     return 1
   fi
 

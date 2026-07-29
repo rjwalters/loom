@@ -66,6 +66,11 @@ loom-clean --deep --force  # Non-interactive deep clean
 loom-clean --deep --dry-run  # Preview deep clean
 ```
 
+`loom-clean` is a thin shim for `loom-daemon clean` and needs a `loom-daemon`
+binary built at or after commit `dba33666` (PR #4301) — see [fail on a stale
+binary](#loom-clean--loom-cleanup--loom-recover-orphans-fail-on-a-stale-binary-4384)
+if it errors out instead of running.
+
 **What loom-clean does**:
 - Removes worktrees for closed GitHub issues (prompts per worktree in interactive mode)
 - Deletes local feature branches for closed issues
@@ -112,6 +117,53 @@ git worktree remove .loom/worktrees/issue-42 --force
 # Prune orphaned worktrees
 git worktree prune
 ```
+
+### `loom-clean` / `loom-cleanup` / `loom-recover-orphans` fail on a stale binary (#4384)
+
+**Symptom**: one of the three commands below fails outright instead of doing
+anything — either with a `No module named loom_tools.clean` traceback (an
+old pip-installed console script), or with an explicit `ERROR clean.sh: … does
+not support the 'clean' subcommand (stale build)` from the wrapper.
+
+**Root cause**: all three are now thin front-ends for native `loom-daemon`
+subcommands (#4272 / PR #4301, commit `dba33666`):
+
+| Command / wrapper | Native subcommand |
+|---|---|
+| `loom-clean`, `./.loom/scripts/clean.sh` | `loom-daemon clean` |
+| `./.loom/scripts/cleanup.sh` | `loom-daemon cleanup logs` |
+| `loom-recover-orphans`, `./.loom/scripts/recover-orphaned-shepherds.sh` | `loom-daemon recover-orphans` |
+
+The same commit deleted the Python implementations (`loom_tools/clean.py`,
+`cleanup.py`, `orphan_recovery.py`) and their console-script entry points, so
+**there is no fallback**: a `loom-daemon` binary built before `dba33666` leaves
+no working path at all. The wrappers capability-probe the binary and now fail
+loudly with the remedy rather than degrading into a traceback.
+
+**Check whether your binary is the problem**:
+
+```bash
+loom-daemon --version          # note the commit
+loom-daemon clean --help       # "error: unrecognized subcommand 'clean'" => stale
+```
+
+**Remedy — rebuild or update `loom-daemon`, then retry**:
+
+```bash
+cargo build --release -p loom-daemon        # source checkout
+./.loom/scripts/cli/loom-daemon-update.sh   # installed host (self-update)
+```
+
+Use `loom-daemon clean --force` / `loom-daemon recover-orphans --recover`
+directly in the meantime — the native subcommands take the same flags.
+
+**If a stale pip-era shim is shadowing the current one**: the installer writes
+`loom-clean` / `loom-recover-orphans` shims next to the provisioned
+`loom-daemon` (usually `~/.local/bin`). A pre-#4301 pip/homebrew install can
+leave `from loom_tools.clean import main` shims earlier on `PATH` that will
+never work again. Confirm with `command -v loom-clean` and remove them (e.g.
+`pip uninstall loom-tools`, or delete the stale shim) so the daemon-backed one
+resolves.
 
 ### Corrupted local git identity (`...github.comecho`, "cannot overwrite multiple values") (#4369)
 
@@ -284,6 +336,11 @@ loom-recover-orphans --recover
 # JSON output for automation
 loom-recover-orphans --json
 ```
+
+`loom-recover-orphans` is a thin shim for `loom-daemon recover-orphans` — if it
+fails with `No module named loom_tools.orphan_recovery` or a "stale build"
+error, see [`loom-clean` / `loom-cleanup` / `loom-recover-orphans` fail on a
+stale binary](#loom-clean--loom-cleanup--loom-recover-orphans-fail-on-a-stale-binary-4384).
 
 **What it does**:
 - Finds issues with `loom:building` label that have been stuck

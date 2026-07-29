@@ -45,7 +45,11 @@ loom-claim = "loom_tools.claim:main"
 # loom-cleanup removed in epic #4081 Phase 3 family 2 (#4272) — ported to
 # native `loom-daemon cleanup logs` (loom-tools/src/loom_tools/cleanup.py deleted)
 # loom-cleanup = "loom_tools.cleanup:main"
-loom-agent-metrics = "loom_tools.agent_metrics:main"
+# loom-agent-metrics removed in epic #4081 phase 3 (#4274) — agent_metrics.py
+# deleted; ported to native `loom-daemon stats <command>` (summary/effectiveness/
+# costs/velocity, incl. --period and --by-model parity); agent-metrics.sh
+# repointed.
+# loom-agent-metrics = "loom_tools.agent_metrics:main"
 loom-validate-phase = "loom_tools.validate_phase:main"
 loom-agent-spawn = "loom_tools.agent_spawn:main"
 # loom-health-monitor removed in epic #4081 phase 3 (#4274) — health_monitor.py
