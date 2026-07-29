@@ -15,7 +15,6 @@ from typing import Any, TypeVar
 
 from loom_tools.common.paths import LoomPaths
 from loom_tools.models.health import AlertsFile, HealthMetrics
-from loom_tools.models.spawn_loop_state import SpawnLoopState
 
 
 # Type variable for generic default handling
@@ -132,23 +131,6 @@ def write_json_file(
         except OSError:
             pass
         raise
-
-
-def read_spawn_loop_state(repo_root: pathlib.Path) -> SpawnLoopState:
-    """Load ``.loom/spawn-loop-state.json`` into a :class:`SpawnLoopState`.
-
-    Returns a :class:`SpawnLoopState` with ``present=False`` when the file
-    is missing.
-    """
-    paths = LoomPaths(repo_root)
-    if not paths.spawn_loop_state_file.exists():
-        return SpawnLoopState.absent()
-    data = read_json_file(paths.spawn_loop_state_file)
-    if not isinstance(data, dict):
-        # File exists but malformed — still mark as present so the caller
-        # knows the spawn loop is at least configured; just return empty.
-        return SpawnLoopState(present=True)
-    return SpawnLoopState.from_dict(data)
 
 
 def read_health_metrics(repo_root: pathlib.Path) -> HealthMetrics:
