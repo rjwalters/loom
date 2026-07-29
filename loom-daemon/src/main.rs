@@ -1991,7 +1991,10 @@ async fn query_daemon_status(socket_path: &Path) -> Result<DaemonStatusReport> {
             .ok_or_else(|| anyhow!("daemon closed the connection without responding"))?;
         let response: Response = serde_json::from_str(&line)?;
         match response {
-            Response::DaemonStatus(report) => Ok(report),
+            // `Response::DaemonStatus` is boxed (issue #4292); unbox here so
+            // this function's `Result<DaemonStatusReport>` signature (and its
+            // one caller's field accesses) stays unchanged.
+            Response::DaemonStatus(report) => Ok(*report),
             Response::Error { message } => Err(anyhow!("daemon error: {message}")),
             other => Err(anyhow!("unexpected response: {other:?}")),
         }
@@ -2570,15 +2573,30 @@ async fn handle_dispatch_command(
 /// the probe code is already linked into this binary, so there is no reason
 /// to pay a subprocess round-trip the way the historical `loom-tokens` /
 /// `python3 -m` two-tier shell-out did. Best-effort — never panics, never
-/// propagates an error, and returns `None` when the workspace can't be
-/// resolved so the status view still renders without the usage table.
-fn collect_token_usage() -> Option<serde_json::Value> {
+/// propagates an error.
+///
+/// `tokens_dir` is the pool directory to probe — pass the daemon's own
+/// [`DaemonStatusReport::token_pool_dir`] (issue #4292), not a directory
+/// re-resolved from this *client* process's own cwd. Before #4292 this probed
+/// `resolve_tokens_workspace(".")` independently, so `loom-daemon status` run
+/// from a directory other than the daemon's own workspace could report a
+/// stale/false (e.g. 0/0 healthy) token picture even though the *daemon*
+/// itself had a perfectly healthy pool — the CLI and the daemon disagreed on
+/// which pool "the" pool was. Falling back to `None` only when the daemon
+/// report predates #4292 keeps the pre-existing cwd-based behavior for that
+/// one legacy case (an old daemon binary talking to a newer CLI).
+fn collect_token_usage(tokens_dir: Option<&Path>) -> Option<serde_json::Value> {
     use loom_daemon::tokens_pool::check::{
         self, CheckOptions, CurlTransport, DEFAULT_PROBE_MODEL, DEFAULT_PROBE_PROMPT,
     };
 
-    let ws = resolve_tokens_workspace(".").ok()?;
-    let tokens_dir = loom_daemon::tokens_pool::paths::resolve_tokens_dir(&ws);
+    let tokens_dir = match tokens_dir {
+        Some(dir) => dir.to_path_buf(),
+        None => {
+            let ws = resolve_tokens_workspace(".").ok()?;
+            loom_daemon::tokens_pool::paths::resolve_tokens_dir(&ws)
+        }
+    };
 
     let opts = CheckOptions {
         source: check::resolve_source(None),
@@ -2628,8 +2646,10 @@ async fn handle_status_command(json: bool, pipeline: bool) -> Result<()> {
     };
 
     // Per-token usage is a slow per-account network probe the daemon deliberately
-    // does NOT perform inside the IPC handler; collect it client-side here.
-    let token_usage = collect_token_usage();
+    // does NOT perform inside the IPC handler; collect it client-side here —
+    // but against the SAME pool directory the daemon itself resolved (#4292),
+    // not one independently re-derived from this CLI invocation's own cwd.
+    let token_usage = collect_token_usage(report.token_pool_dir.as_deref());
 
     // Self-update staleness (#3968): purely local, read-only — compares the
     // commit baked into THIS `loom-daemon status` binary against the source
@@ -2947,6 +2967,12 @@ fn print_status_json(
         "capacity_bound": report.capacity_bound,
         "dynamic_cap": {
             "token_pool_size": report.token_pool_size,
+            // The directory the daemon resolved for the pool above (#4292) —
+            // `null` only from a pre-#4292 daemon binary that never computed
+            // one. Lets an operator confirm at a glance which of the
+            // per-repo/shared pools is actually in effect, independent of
+            // whatever cwd `loom-daemon status` itself was run from.
+            "token_pool_dir": report.token_pool_dir,
             "disk_headroom": report.disk_headroom,
             // CPU headroom term (#3978; measured-idle signal #4031) — see the
             // field docs on `DaemonStatusReport::cpu_headroom` for the pre-#3978
@@ -3316,6 +3342,14 @@ fn print_status_human(
 
     // Token-capacity backpressure section (#3902, source-unified in #3936).
     println!("\nToken capacity:");
+    // Name the resolved pool directory (#4292) — the same one the per-token
+    // usage table below was probed against — so a mismatch between "where I
+    // ran this command from" and "where the daemon's pool actually lives" is
+    // visible instead of silent. `None` only from a pre-#4292 daemon binary.
+    match &report.token_pool_dir {
+        Some(dir) => println!("  pool: {}", dir.display()),
+        None => println!("  pool: (unknown — daemon predates #4292)"),
+    }
     // "Currently binding" vs "smallest ceiling" (#4031): the dynamic cap is the
     // minimum of several ceilings, but a ceiling only *binds* once in-flight
     // occupancy reaches it. Below the cap the limiter is work availability, not
@@ -4001,8 +4035,58 @@ fn resolve_tokens_workspace(workspace: &str) -> Result<PathBuf> {
     let p = Path::new(workspace);
     if p.is_absolute() {
         Ok(p.to_path_buf())
+    } else if p == Path::new(".") {
+        // The common case (every `--workspace` flag defaults to `"."`): return
+        // the cwd itself rather than `cwd.join(".")`, which `PathBuf::join`
+        // does not normalize away — it appends a literal trailing `Component::
+        // CurDir`, producing paths like `/home/ubuntu/./.loom/tokens` in
+        // "no tokens found" warnings (issue #4292). Functionally identical
+        // either way; this just keeps resolved/printed paths readable.
+        std::env::current_dir().map_err(Into::into)
     } else {
         Ok(std::env::current_dir()?.join(p))
+    }
+}
+
+#[cfg(test)]
+mod resolve_tokens_workspace_tests {
+    //! Tests for [`resolve_tokens_workspace`] (issue #4292). No test here
+    //! `chdir`s the process (unsafe to do in a parallel test binary) — the
+    //! `"."` case is instead verified against a live `current_dir()` read,
+    //! and the absolute-path case needs no cwd at all.
+    use super::resolve_tokens_workspace;
+    use std::path::Path;
+
+    #[test]
+    fn absolute_workspace_is_returned_unchanged() {
+        let resolved = resolve_tokens_workspace("/some/repo").expect("resolve");
+        assert_eq!(resolved, Path::new("/some/repo"));
+    }
+
+    /// The clap default value for every `--workspace` flag is exactly `"."`.
+    /// Resolving it must equal the cwd itself — no literal trailing `.`
+    /// component (the #4292 cosmetic bug: `cwd.join(".")` produces
+    /// `<cwd>/.`, which then reads as `<cwd>/./.loom/tokens` in "no tokens
+    /// found" warnings).
+    #[test]
+    fn dot_workspace_resolves_to_bare_cwd() {
+        let resolved = resolve_tokens_workspace(".").expect("resolve");
+        let cwd = std::env::current_dir().expect("current_dir");
+        assert_eq!(resolved, cwd);
+        assert!(
+            !resolved.to_string_lossy().contains("/./"),
+            "resolved path must not carry a literal './' component: {}",
+            resolved.display()
+        );
+    }
+
+    #[test]
+    fn other_relative_workspace_is_joined_to_cwd() {
+        let resolved = resolve_tokens_workspace("some/relative/repo").expect("resolve");
+        let expected = std::env::current_dir()
+            .expect("current_dir")
+            .join("some/relative/repo");
+        assert_eq!(resolved, expected);
     }
 }
 

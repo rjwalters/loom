@@ -511,6 +511,45 @@ instead; without `--force` a rolled token is reported as drift and left alone,
 and the command exits `2`. See "Importing live tokens from claude-monitor" in
 the root `CLAUDE.md` for the full behavior.
 
+### `status` reports the resolved pool directory, not a cwd-derived guess (#4292)
+
+Every surface that reads or writes the token pool — `loom-daemon status`, `tokens
+select` / `check` / `pin` / `unpin` / `unblock` / `mark-bad`, and the daemon's own
+token-ranking self-refresh loop (`autonomous.tokenRankingRefresh`, above) —
+resolves through the **same** precedence (env override `LOOM_SHARED_TOKENS_DIR`
+disables/redirects the shared fallback; otherwise per-repo
+`<workspace>/.loom/tokens/` wins when it holds `*.token` files, else the shared
+`~/.loom/tokens/`). Before #4292, `loom-daemon status` computed its per-token usage
+table **client-side** from the invoking process's own `cwd`
+(`resolve_tokens_workspace(".")`), independently of the pool directory the
+*daemon* itself resolved for `token_pool_size` / the dynamic-cap accounting.
+Running `status` from a different repo checkout than the daemon's own primary
+workspace could therefore report a false token picture (e.g. `0/0 healthy`) even
+though the daemon's own pool was perfectly healthy.
+
+The `DaemonStatusReport` now carries `token_pool_dir` — the exact directory the
+daemon resolved server-side — and `status` prints it (`pool: <dir>` in the human
+view, `dynamic_cap.token_pool_dir` in `--json`) and probes per-token usage against
+*that* directory instead of re-deriving one from the CLI's own cwd. The net effect:
+**`loom-daemon status` reports the same token picture no matter which directory it
+is run from** — it always describes the daemon's actual pool, never a client-side
+guess. `token_pool_dir` is `null` only when talking to a pre-#4292 daemon binary.
+
+**systemd note.** `loom-daemon-start.sh`'s generated unit (#4260/#4268) always sets
+`WorkingDirectory=` to a real resolved repo root (`LOOM_MACHINE_CHECKOUT` in
+machine mode, else `find_repo_root()`), so the daemon's primary workspace is never
+an incidental cwd when started that way. A **hand-rolled** unit that omits
+`WorkingDirectory=` starts with whatever cwd the service manager happens to use
+(often `~`) as the primary workspace instead. Since the per-repo pool for that
+workspace is `<cwd>/.loom/tokens/`, an operator who then bootstraps the
+machine-level pool via plain `loom-tokens bootstrap` from an **arbitrary**
+directory (not `~`, not a real repo checkout) will *not* populate the location the
+daemon resolves to by default. Always provision with `loom-tokens bootstrap
+--shared` (or `import-from-monitor --shared`) — which always targets
+`~/.loom/tokens/` regardless of cwd — so the daemon's default (cwd-anchored,
+falling back to shared) and the provisioning step agree, whether or not the unit
+that starts the daemon sets `WorkingDirectory=`.
+
 ## Per-repo status breakdown + per-repo main-health gate (#3930 — phase d)
 
 Phase d is the final phase of the multi-repo daemon (#3926/#3835). Phases b/c

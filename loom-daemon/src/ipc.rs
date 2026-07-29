@@ -864,7 +864,7 @@ async fn handle_client(
                 &credential_preflight,
                 &drain_state,
             );
-            let response = Response::DaemonStatus(report);
+            let response = Response::DaemonStatus(Box::new(report));
             let response_json = serde_json::to_string(&response)?;
             writer.write_all(response_json.as_bytes()).await?;
             writer.write_all(b"\n").await?;
@@ -1222,6 +1222,11 @@ pub fn build_daemon_status(
     // `workspace_root`, i.e. `fallback_root`).
     let workspace_root = fallback_root;
     let token_pool_size = crate::tokens::token_pool_size(workspace_root);
+    // Same precedence as `token_pool_size` (per-repo first, else the #3938
+    // shared machine-level pool), exposed on the report (#4292) so a client
+    // reading `status` from any cwd sees exactly which directory the daemon
+    // used rather than silently re-resolving a possibly-different one.
+    let token_pool_dir = Some(crate::tokens_pool::paths::resolve_tokens_dir(workspace_root));
     let disk_headroom = crate::disk_headroom::disk_headroom_limit(workspace_root);
     // Hoisted above the CPU snapshot (#4032) so the resolved
     // `cpuUtilizationTarget` / `estCoresPerSweep` knobs can feed it — this read
@@ -1286,6 +1291,7 @@ pub fn build_daemon_status(
         in_flight,
         unregistered_locked,
         token_pool_size,
+        token_pool_dir,
         disk_headroom,
         cpu_headroom,
         logical_cpus,
@@ -4404,6 +4410,7 @@ exit 0
             in_flight: vec![],
             unregistered_locked: vec![],
             token_pool_size: 4,
+            token_pool_dir: Some(std::path::PathBuf::from("/repo/a/.loom/tokens")),
             disk_headroom: 10,
             cpu_headroom: 6,
             logical_cpus: 8,
@@ -4451,12 +4458,16 @@ exit 0
             auto_update_note: Some("within settle window".to_string()),
             host_breaker: None,
         };
-        let resp = Response::DaemonStatus(report);
+        let resp = Response::DaemonStatus(Box::new(report));
         let json = serde_json::to_string(&resp).expect("serialize response");
         let back: Response = serde_json::from_str(&json).expect("deserialize response");
         match back {
             Response::DaemonStatus(r) => {
                 assert_eq!(r.token_pool_size, 4);
+                assert_eq!(
+                    r.token_pool_dir,
+                    Some(std::path::PathBuf::from("/repo/a/.loom/tokens"))
+                );
                 assert_eq!(r.disk_headroom, 10);
                 assert_eq!(r.cpu_headroom, 6);
                 assert_eq!(r.logical_cpus, 8);
