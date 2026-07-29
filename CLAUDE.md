@@ -303,7 +303,8 @@ map, downstream-consumer guidance —
   [build-gate](.loom/docs/build-gate.md) ·
   [forge-auth](.loom/docs/forge-authentication.md) /
   [github-auth](.loom/docs/github-authentication.md) ·
-  [safehouse](.loom/docs/safehouse.md)
+  [safehouse](.loom/docs/safehouse.md) ·
+  [blame-issue](.loom/docs/blame-issue.md)
 
 ---
 
