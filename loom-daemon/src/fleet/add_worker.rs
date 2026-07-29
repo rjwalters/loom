@@ -416,6 +416,8 @@ pub fn run(config: &AddWorkerConfig) -> Result<()> {
             tailnet_name: None,
             added_by: None,
             state: None,
+            drain_phase: None,
+            drain_captured: Vec::new(),
         };
         let path = default_fleet_registry_path()?;
         let mut registry = FleetRegistry::load(&path)?;

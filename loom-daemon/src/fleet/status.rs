@@ -698,6 +698,8 @@ mod tests {
             tailnet_name: Some("loom-worker-1".to_string()),
             added_by: None,
             state: None,
+            drain_phase: None,
+            drain_captured: Vec::new(),
         }
     }
 

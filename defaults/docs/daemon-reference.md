@@ -562,6 +562,70 @@ format was needed.
   a consumed interface (the #4329 dashboard's multi-host phase reads it over
   the tailnet).
 
+### `fleet drain <ssh-host> [--timeout N] [--force-after-timeout] [--json]` (#4343)
+
+Retires a worker without losing in-flight work, forge claims, or (when a real
+flush seam lands — see below) E2E room keys — the SSH-orchestration layer over
+the drain engine that already exists (`restart --drain`, #4090; `SweepRegistry::
+cancel`'s SIGTERM→grace→SIGKILL), plus the three deltas teardown needs:
+
+1. **Drain-then-*exit*, not drain-then-restart.** `restart --drain --then-exit`
+   (this issue's addition to `Restart`/`DrainAndRestartDaemon`) tells the remote
+   daemon to end the process and **stay down** (`EXIT_SHUTDOWN`, no supervisor
+   relaunch) instead of restarting once drained — a relaunched daemon could pick
+   up new dispatch before the box powers off, defeating the whole point of
+   draining. Because a `then-exit` drain never wants a relaunch, the
+   supervisor-detection refusal gate (`restart --drain`'s AC5) does not apply to
+   it.
+2. **Immediate, targeted claim reset.** The startup-only `claim_reconciliation`
+   pass is too late for a drain (the anvil#758 pilot evidence: a crashed VM
+   sweep stranded `loom:building` for the full staleness window). `fleet drain`
+   captures the worker's in-flight issue numbers (`status --json`) *before*
+   triggering the remote drain, then — once the remote daemon has exited —
+   flips any of them still `loom:building` back to `loom:issue` via `gh`,
+   **locally, never over SSH** (the forge is global). An issue that finished
+   normally in the meantime (no longer `loom:building`) is left alone.
+3. **Safehoused flush verification is a documented stub pending #3998.** No
+   invocable key-backup steady-state check exists in this repo yet (only the
+   narration-sink/peer-claim client seams in `safehouse.rs`) — rather than block
+   every drain on #3998, this phase degrades honestly: `safehouse.enabled ==
+   false` skips cleanly (no room keys in play); `safehouse.enabled == true`
+   still lets the drain complete (workspace/roster cleanup proceed — loom never
+   *refuses* to retire a box over this) but withholds "safe to power off" and
+   exits `3`. TODO(#3998): replace the stub with a real check once a seam lands.
+
+**Phase state machine** (`loom-daemon/src/fleet/drain.rs`), idempotent +
+resumable (an interrupted drain re-runs from its last completed phase, persisted
+on the registry entry as `drain_phase`):
+
+`mark-draining` (roster `state: "draining"`, first — crash-safety) →
+`capture-claims` → `trigger-remote-drain` → `wait-remote-exit` →
+`reset-claims` → `flush-safehouse` → `deregister-workspace` →
+`remove-from-roster` (last — an interrupted drain stays visible, never
+silently gone).
+
+**What `wait-remote-exit` counts as "exited"**: the normal end state of a
+`then_exit` drain is **host up, daemon gone**, in which the remote
+`loom-daemon status --json` still answers — with the #4069 unreachable payload
+(`{"error": "could not reach loom-daemon at …", "install_state": …}` on stdout,
+non-zero exit). That payload, and an SSH-level failure (host itself gone), both
+mean "exited". Only a *live* status payload reporting `drain.draining: false`
+means the remote refused the drain and is still dispatching — the fail-loud
+exit-`2` case. A transient SSH blip mid-wait is indistinguishable from "host
+gone" and reads as a successful exit; the following phases are
+orchestrator-side and a still-running remote daemon shows up in the next
+`fleet status`.
+
+**Exit codes**: `0` fully verified (safe to power off); `1` a phase failed
+outright (SSH/launch failure, remote refusal — re-run to retry, resuming from
+the persisted phase); `2` the remote drain timed out **without**
+`--force-after-timeout` (fail-safe refusal, remote daemon still up); `3` every
+phase completed but the safehoused flush is unverified (#3998).
+
+**Boundary (epic #4340)**: loom never calls a cloud CLI. The final report
+prints the exact `repo:remote --down <ssh-host>` teardown command for the
+operator to run — this command hands the box back, it does not execute it.
+
 ## Token pool provisioning for managed repos (#3938)
 
 The multi-workspace work finder measures the token pool **once per tick from the

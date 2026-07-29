@@ -45,6 +45,7 @@
 //! deliberately minimal; the siblings can extend it.
 
 pub mod add_worker;
+pub mod drain;
 pub mod status;
 
 use anyhow::{anyhow, Context, Result};
@@ -533,6 +534,22 @@ pub struct WorkerRecord {
     /// deserialize.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<String>,
+    /// The most recently *completed* `fleet drain` phase (#4343), a stable
+    /// machine name (see [`drain::DrainPhase::name`]). `None` means no drain
+    /// has ever started (or the record predates #4343). This is the
+    /// resumability marker (body step 6): a re-run reads it and skips every
+    /// phase up to and including this one, so an interrupted drain (crash,
+    /// killed SSH, operator Ctrl-C) picks up where it left off rather than
+    /// re-running already-applied phases.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drain_phase: Option<String>,
+    /// The `loom:building` claims captured by drain's `capture-claims` phase,
+    /// before the remote daemon is told to drain — persisted immediately so a
+    /// crash between capture and the later `reset-claims` phase does not lose
+    /// the list (the exact stranding window the epic's pilot evidence, anvil
+    /// #758, cites). Empty on a record with no drain in progress.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub drain_captured: Vec<drain::CapturedClaim>,
 }
 
 /// The machine-level set of bootstrapped workers, persisted at
@@ -931,6 +948,8 @@ mod tests {
             tailnet_name: None,
             added_by: None,
             state: None,
+            drain_phase: None,
+            drain_captured: Vec::new(),
         }
     }
 
