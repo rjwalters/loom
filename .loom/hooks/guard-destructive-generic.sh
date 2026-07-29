@@ -1888,6 +1888,95 @@ normalize_abs_path() {
     fi
 }
 
+# =============================================================================
+# expand_leading_tilde() — shell-accurate tilde expansion for write targets
+# (#4382, same fix family as the quote-aware `>` scanning of #4245/#4289).
+#
+# extract_write_targets() (below) is a plain-whitespace/quote-aware TOKENIZER,
+# not a shell evaluator — it never performs word expansions (tilde, variable,
+# glob, ...). A raw token like `~/.local/bin/x` was therefore resolved as a
+# REPO-RELATIVE path (cwd-prefixed) even though the real shell would expand it
+# to "$HOME/.local/bin/x" before `cp`/`mv`/`tee`/`sed -i`/redirection ever see
+# it — producing a false-positive worktree-confinement deny on a write that
+# actually lands far outside the repo (#4382).
+#
+# This performs ONLY the narrow, unambiguous piece of shell word-expansion
+# tilde-expansion applies to: an UNQUOTED, UNESCAPED tilde as the FIRST
+# character of the token, i.e. exactly the shell-eligible positions:
+#   ~/rest        -> "$HOME/rest"
+#   ~             -> "$HOME"
+#   ~user/rest    -> "<user's home>/rest"   (only if that user resolves)
+#   ~user         -> "<user's home>"
+#
+# Because qsplit() (the shared tokenizer, #3755) copies a quoted span
+# VERBATIM including its quote characters, and leaves a literal backslash
+# untouched, a token whose raw text does not start with a bare `~` was NOT
+# eligible for shell tilde-expansion and MUST stay untouched here:
+#   '~/x'   -> starts with a quote char, shell never expands it (stays literal)
+#   \~/x    -> starts with a literal backslash, shell never expands it either
+#   foo~/x  -> tilde is not the leading character -- not an expansion position
+# Any of these three cases falls through unchanged (echoed back as-is), which
+# preserves the existing (correct) repo-relative/deny behavior for them.
+#
+# `~user` lookup uses getent (Linux) / dscl (macOS) with the username passed
+# as a plain CLI argument (never eval'd/interpolated into a shell string) so a
+# hostile username token cannot inject a command. If the user cannot be
+# resolved on this host, the token is returned UNCHANGED (falls back to the
+# existing repo-relative treatment) -- consistent with this file's fail-open
+# contract: uncertainty here biases toward the (safe) deny path, never toward
+# a silent new allow.
+# =============================================================================
+expand_leading_tilde() {
+    local tok="$1"
+    # shellcheck disable=SC2088 # intentional: these `~`-prefixed case
+    # patterns are literal PATTERN matches against an unexpanded leading
+    # tilde in $tok (the whole point of this function), not an attempt at
+    # shell tilde expansion.
+    case "$tok" in
+        '~')
+            [[ -n "$HOME" ]] && { printf '%s' "$HOME"; return; }
+            printf '%s' "$tok"
+            return
+            ;;
+        '~/'*)
+            if [[ -n "$HOME" ]]; then
+                printf '%s' "$HOME/${tok#\~/}"
+            else
+                printf '%s' "$tok"
+            fi
+            return
+            ;;
+        '~'*)
+            local rest="${tok#\~}"
+            local user="${rest%%/*}"
+            local remainder=""
+            if [[ "$rest" == */* ]]; then
+                remainder="/${rest#*/}"
+            fi
+            if [[ -n "$user" ]]; then
+                local home=""
+                if command -v getent >/dev/null 2>&1; then
+                    home=$(getent passwd "$user" 2>/dev/null | cut -d: -f6)
+                elif command -v dscl >/dev/null 2>&1; then
+                    home=$(dscl . -read "/Users/$user" NFSHomeDirectory 2>/dev/null | awk '{print $2}')
+                fi
+                if [[ -n "$home" ]]; then
+                    printf '%s' "${home}${remainder}"
+                    return
+                fi
+            fi
+            # Unresolvable ~user (unknown user / no lookup tool available):
+            # leave untouched -- falls back to repo-relative resolution.
+            printf '%s' "$tok"
+            return
+            ;;
+        *)
+            printf '%s' "$tok"
+            return
+            ;;
+    esac
+}
+
 # Cheap pre-check keeps awk off the hot path for the ~99% of commands that have
 # no recursive/force rm at all.
 if echo "$COMMAND" | grep -qE 'rm[[:space:]]+-[a-zA-Z]*[rf]'; then
@@ -2060,6 +2149,15 @@ if worktree_isolation_guard_enabled && \
     WRITE_TARGETS=$(extract_write_targets "$COMMAND_ASK_SCAN" "$CWD" | head -20)
     while IFS=$'\037' read -r _wcwd _wtarget; do
         [[ -z "$_wtarget" ]] && continue
+
+        # Shell-accurate tilde expansion (#4382): an unquoted/unescaped
+        # leading `~/` or `~user/` in the raw token is what the real shell
+        # would expand BEFORE cp/mv/tee/sed -i/redirection ever see it, so
+        # expand it here before the relative-path resolution below runs.
+        # Quoted ('~/x') / escaped (\~/x) tildes are left untouched (see
+        # expand_leading_tilde()'s doc comment) — no change to their
+        # existing repo-relative treatment.
+        _wtarget=$(expand_leading_tilde "$_wtarget")
 
         # Resolve to absolute; a relative target with no resolvable cwd is
         # ambiguous — skip it (allow on uncertainty, never deny on it).
