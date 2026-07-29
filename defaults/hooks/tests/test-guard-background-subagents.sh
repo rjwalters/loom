@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
-# Test suite for defaults/hooks/guard-background-subagents.sh (issue #4257)
+# Test suite for defaults/hooks/guard-background-subagents.sh (issues #4257, #4389)
 #
 # Usage: ./defaults/hooks/tests/test-guard-background-subagents.sh
 #
-# Covers the Stop-hook mechanical backstop for the #3822/#4257 hazard: an
+# Covers the Stop-hook mechanical backstop for the #3822/#4257/#4389 hazard: an
 # orchestrator ending its turn in headless `claude -p` mode kills every
-# still-running background Task subagent. This hook scans the transcript
-# JSONL for `Task` tool_use entries with no matching tool_result and blocks
-# the stop (once) when it finds any.
+# still-running background Task subagent AND every outstanding background
+# Bash task (`run_in_background: true`). This hook scans the transcript
+# JSONL for (1) `Task` tool_use entries with no matching tool_result, and
+# (2) background-Bash tool_use entries with no matching `<task-notification>`
+# completion event, and blocks the stop (once) when it finds either.
 #
 #   - unresolved Task tool_use (no matching tool_result) -> block
 #   - all Task tool_use entries resolved -> allow (silent)
@@ -16,6 +18,11 @@
 #     an unresolved Task still in the transcript
 #   - missing / unreadable transcript_path -> allow (fail-open)
 #   - unparseable transcript content -> allow (fail-open)
+#   - outstanding background Bash task (dispatch + immediate ack only, no
+#     later task-notification echoing the tool-use-id) -> block (#4389)
+#   - completed background Bash task (task-notification observed) -> allow
+#   - outstanding background Bash task + stop_hook_active=true -> allow
+#     (loop guard applies identically)
 #   - guards.backgroundSubagents / LOOM_GUARD_BACKGROUND_SUBAGENTS toggle
 #     (env beats config; config beats default-on)
 #   - jq absent -> allow (fail-open)
@@ -65,6 +72,16 @@ TASK_USE_UNRESOLVED='{"type":"assistant","message":{"role":"assistant","content"
 TASK_USE_RESOLVED='{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_02","name":"Task","input":{}}]}}'
 TASK_RESULT_02='{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_02","content":"done"}]}}'
 NON_TASK_USE='{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_03","name":"Bash","input":{}}]}}'
+
+# Background Bash (issue #4389 — the #4257 recurrence via run_in_background)
+# fixtures. A background dispatch gets an IMMEDIATE tool_result ack (NOT
+# completion) at dispatch time; the real completion arrives later as a
+# <task-notification> whose <tool-use-id> echoes the dispatch id.
+BG_USE_UNRESOLVED='{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_bg01","name":"Bash","input":{"command":"sleep 100","run_in_background":true}}]}}'
+BG_ACK_UNRESOLVED='{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_bg01","content":"Command running in background with ID: bgtest01. Output is being written to: /tmp/bgtest01.output. You will be notified when it completes."}]}}'
+BG_USE_RESOLVED='{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_bg02","name":"Bash","input":{"command":"sleep 1","run_in_background":true}}]}}'
+BG_ACK_RESOLVED='{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_bg02","content":"Command running in background with ID: bgtest02. Output is being written to: /tmp/bgtest02.output. You will be notified when it completes."}]}}'
+BG_NOTIFICATION_RESOLVED='{"type":"user","message":{"role":"user","content":"<task-notification>\n<task-id>bgtest02</task-id>\n<tool-use-id>toolu_bg02</tool-use-id>\n<output-file>/tmp/bgtest02.output</output-file>\n<status>completed</status>\n<summary>Background command completed (exit code 0)</summary>\n</task-notification>"}}'
 
 # Build stdin JSON. Args: <transcript_path> <stop_hook_active>
 make_input() {
@@ -150,6 +167,40 @@ if [[ "$code" == "0" && -z "$output" ]]; then
     pass "(g) empty transcript_path -> allow"
 else
     fail "(g) empty transcript_path -> allow (got exit=$code output=$output)"
+fi
+
+# --- background Bash (run_in_background) detection (issue #4389) -----------
+
+# (h) outstanding background Bash task (dispatch + immediate ack only, no
+# later task-notification) -> block once. Structural-verification case from
+# the issue: a synthetic transcript with an outstanding background Bash task
+# fed to the hook via a Stop payload must produce {"decision":"block"}.
+T5="$TMPROOT/transcript-bg-outstanding.jsonl"
+write_transcript "$T5" "$BG_USE_UNRESOLVED" "$BG_ACK_UNRESOLVED"
+result=$(run_hook "$T5" false)
+assert_block "(h) outstanding background Bash task -> block" "$result"
+
+# (i) completed background Bash task (dispatch + ack + later task-notification
+# echoing the dispatch tool-use-id) -> allow (silent)
+T6="$TMPROOT/transcript-bg-completed.jsonl"
+write_transcript "$T6" "$BG_USE_RESOLVED" "$BG_ACK_RESOLVED" "$BG_NOTIFICATION_RESOLVED"
+result=$(run_hook "$T6" false)
+assert_allow "(i) completed background Bash task -> allow" "$result"
+
+# (j) outstanding background Bash task + stop_hook_active=true -> allow
+# unconditionally (loop guard applies identically to the bg-Bash detector)
+result=$(run_hook "$T5" true)
+assert_allow "(j) outstanding background Bash task + stop_hook_active=true -> allow (loop guard)" "$result"
+
+# (k) block reason for an outstanding background Bash task mentions the
+# run_in_background hazard (not just the Task-subagent wording)
+raw_bg=$(run_hook "$T5" false)
+out_bg="${raw_bg#*|}"
+reason_bg=$(echo "$out_bg" | jq -r '.reason // empty' 2>/dev/null || true)
+if [[ "$reason_bg" == *"background Bash"* && "$reason_bg" == *"#4389"* ]]; then
+    pass "(k) block reason explains the background-Bash hazard"
+else
+    fail "(k) block reason explains the background-Bash hazard (got: $reason_bg)"
 fi
 
 # --- block reason mentions the #3822/#4257 hazard ---------------------------
