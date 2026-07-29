@@ -1029,7 +1029,7 @@ decision rule:
 | Surface | Where | When it runs |
 |---------|-------|---------------|
 | Rust startup reconciliation | `claim_reconciliation::forge::reconcile_workspace` (called from `main.rs` at daemon startup, guarded by `LOOM_STALE_CLAIM_RECONCILE`, default on) | Once, on every daemon start, across every `effective_roots()` workspace |
-| Python `loom-recover-orphans` | `loom_tools.orphan_recovery.check_untracked_building` | On demand (operator/cron invocation of `loom-recover-orphans [--recover]`) |
+| `loom-recover-orphans` (native, issue #4272) | `worktree_ops::orphan_recovery::check_untracked_building` | On demand (operator/cron invocation of `loom-recover-orphans [--recover]`) |
 
 Both read the same machine-level **sweep journal** (`~/.loom/sweeps.json`,
 override `LOOM_SWEEPS_JOURNAL_PATH`, written by `sweep_journal::record_sweep`

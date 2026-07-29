@@ -25,13 +25,14 @@ import pytest
 # All Python CLI commands that loom-tools should expose
 # Phase 3.2 (#3399): removed loom-shepherd (phase 3.3), loom-daemon-loop (daemon.py deleted)
 # Phase 3 family 1 (#4271): removed loom-agent-monitor (agent_monitor.py deleted, zero references)
+# Issue #4272 (epic #4081 Phase 3 family 2): removed loom-clean, loom-cleanup,
+# loom-worktree, loom-recover-orphans (ported to native `loom-daemon clean` /
+# `cleanup logs` / `recover-orphans`, or — for loom-worktree — deleted outright
+# as dead argparse-over-bash glue).
 EXPECTED_CLI_COMMANDS = [
     "loom-daemon-diagnostic",
     "loom-stuck-detection",
     "loom-claim",
-    "loom-clean",
-    "loom-worktree",
-    "loom-cleanup",
 ]
 
 # Wrapper scripts that should route to Python implementations
