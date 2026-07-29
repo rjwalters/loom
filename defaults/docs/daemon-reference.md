@@ -2327,6 +2327,15 @@ To disable it entirely, set `LOOM_RATE_LIMIT_BREAKER=0` or
 `autonomous.rateLimitBreaker.enabled = false` (the pre-#4429
 hammer-through-exhaustion behavior).
 
+**Steady-state consumption** is attacked separately (#4428): the hot polls
+(work-finder `loom:issue`, claim reconciliation `loom:building`, epic
+supervisor `loom:epic`/`loom:epic-phase`) go through an ETag-cached REST
+listing (`forge_listing`) instead of GraphQL `gh issue list` — a poll where
+nothing changed answers `304 Not Modified`, which costs **zero** rate limit.
+The cache is in-memory, per (workspace, query), for the daemon's lifetime; a
+restart re-fetches each listing once. PR-side claim listings stay on
+`gh pr list` (they need `headRefName`, which REST issue rows do not carry).
+
 ### Cross-host dispatch-collision baseline (#4085, Phase 0 of #4028)
 
 When two `loom-daemon` hosts share one repo backlog, both can dispatch the same
