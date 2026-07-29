@@ -2297,6 +2297,36 @@ minimal, per #4235): macOS-only trip signals (`.ips` crash reports, `syspolicyd`
 CPU-ratio amplification, daemon self-restart detection) and durable trip/release
 telemetry (coordinate with #4137 rather than building a parallel store).
 
+### GitHub rate-limit circuit breaker (#4429)
+
+The host breaker above protects the **host**; this breaker protects the
+**shared forge API budget**. Every fleet host authenticates as the same
+identity, so the REST/GraphQL rate limits are one fixed pool — and when it
+exhausted on 2026-07-29, every polling loop on every host kept firing its full
+per-tick call pattern for ~25 minutes (all failing), while role sessions were
+spawned straight into the same wall.
+
+The machine is simpler than the host breaker's — **Closed ⇄ Cooldown**, no
+sustain counter, because a rate-limit rejection is unambiguous:
+
+- Any gh polling failure whose stderr carries a rate-limit signature
+  (GraphQL primary, REST 403, secondary-limit phrasings) **trips** the
+  breaker. On trip, one `gh api rate_limit` probe — an endpoint that does
+  *not* count against the quota — learns the real reset epoch; the cooldown
+  runs to the latest exhausted resource's reset, clamped to `[60s, 3600s]`,
+  falling back to `fallbackCooldownSecs` when the probe fails.
+- While cooling, the work-finder, claim/quarantine reconciliation, epic
+  supervisor, and role-runner ticks **skip entirely** — zero gh calls, zero
+  doomed role spawns. Running sweeps are never touched.
+- The breaker **releases itself** on the first tick past the reset. Edges are
+  logged once each way and published as `daemon.rate_limit_breaker.state`
+  events; `loom-daemon status` shows the phase, the tripping loop, the resume
+  deadline, and the last-probed budget.
+
+To disable it entirely, set `LOOM_RATE_LIMIT_BREAKER=0` or
+`autonomous.rateLimitBreaker.enabled = false` (the pre-#4429
+hammer-through-exhaustion behavior).
+
 ### Cross-host dispatch-collision baseline (#4085, Phase 0 of #4028)
 
 When two `loom-daemon` hosts share one repo backlog, both can dispatch the same
