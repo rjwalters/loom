@@ -86,7 +86,8 @@ pub use resource_usage::{detect_provider, parse_resource_usage, ModelPricing, Re
 // These types are used for the `loom stats` CLI commands
 #[allow(unused_imports)]
 pub use stats::{
-    AgentEffectiveness, CostPerIssue, DailyVelocity, StatsQueries, StatsSummary, WeeklyVelocity,
+    AgentEffectiveness, CostPerIssue, CostRow, DailyVelocity, EffectivenessRow, StatsQueries,
+    StatsSummary, SummaryMetrics, VelocityRow, WeeklyVelocity,
 };
 
 // Re-export tuning types and functions (Issue #1074)

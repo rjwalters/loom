@@ -99,8 +99,21 @@ enum Commands {
         workspace: String,
     },
 
-    /// Display agent effectiveness and activity metrics
+    /// Display agent effectiveness and activity metrics.
+    ///
+    /// With no positional `command`, prints the original interactive
+    /// dashboard (unchanged, backward compatible). With an explicit
+    /// `command` (`summary`/`effectiveness`/`costs`/`velocity`) this is the
+    /// native port of `loom_tools.agent_metrics` (epic #4081 Phase 3 family
+    /// 4, issue #4274) — the CLI contract `agent-metrics.sh` and
+    /// `mcp__loom__get_agent_metrics` invoke, including `--period` and
+    /// `--by-model` (#3482).
     Stats {
+        /// Metrics command: summary, effectiveness, costs, velocity. Omit for
+        /// the original interactive dashboard.
+        #[arg(value_name = "COMMAND")]
+        command: Option<String>,
+
         /// Filter by agent role (builder, judge, curator, etc.)
         #[arg(long)]
         role: Option<String>,
@@ -109,9 +122,20 @@ enum Commands {
         #[arg(long)]
         issue: Option<i32>,
 
-        /// Show weekly trends instead of daily
+        /// Show weekly trends instead of daily (dashboard mode only; use the
+        /// `velocity` command for the agent-metrics-parity table).
         #[arg(long)]
         weekly: bool,
+
+        /// Time period for `command` mode: today, week, month, all (default: week).
+        #[arg(long)]
+        period: Option<String>,
+
+        /// Add a per-model dimension to `effectiveness`/`costs` output
+        /// (`command` mode only); NULL/absent model values render as
+        /// `default` (#3482).
+        #[arg(long)]
+        by_model: bool,
 
         /// Output format: table (default), json
         #[arg(long, default_value = "table")]
@@ -2117,11 +2141,27 @@ fn handle_cli_command(command: Commands) -> Result<()> {
             verbose,
         } => handle_validate_command(&workspace, &format, strict, verbose),
         Commands::Stats {
+            command,
             role,
             issue,
             weekly,
+            period,
+            by_model,
             format,
-        } => handle_stats_command(role.as_deref(), issue, weekly, &format),
+        } => {
+            if let Some(cmd) = command {
+                handle_agent_metrics_command(
+                    &cmd,
+                    role.as_deref(),
+                    issue,
+                    period.as_deref().unwrap_or("week"),
+                    by_model,
+                    &format,
+                )
+            } else {
+                handle_stats_command(role.as_deref(), issue, weekly, &format)
+            }
+        }
         Commands::Workspace { action } => handle_workspace_command(action),
         Commands::Fleet { action } => handle_fleet_command(action),
         Commands::Tokens { action } => handle_tokens_command(action),
@@ -4747,6 +4787,228 @@ fn print_agent_effectiveness(agent: &activity::AgentEffectiveness) {
     println!("  Average Cost:       ${:.4}", agent.avg_cost);
     println!("  Average Duration:   {:.1}s", agent.avg_duration_sec);
     println!();
+}
+
+/// Valid `agent-metrics` subcommands (mirrors `loom_tools.agent_metrics`'s
+/// argparse `choices`).
+const AGENT_METRICS_COMMANDS: &[&str] = &["summary", "effectiveness", "costs", "velocity"];
+/// Valid `--period` values.
+const AGENT_METRICS_PERIODS: &[&str] = &["today", "week", "month", "all"];
+/// Valid `--role` values (mirrors `loom_tools.agent_metrics._VALID_ROLES`).
+const AGENT_METRICS_ROLES: &[&str] = &[
+    "builder",
+    "judge",
+    "curator",
+    "architect",
+    "hermit",
+    "doctor",
+    "guide",
+    "champion",
+    "shepherd",
+];
+
+/// Handle `loom-daemon stats <command>` — the native port of
+/// `loom_tools.agent_metrics` (epic #4081 Phase 3 family 4, issue #4274).
+/// `command` is one of `summary`/`effectiveness`/`costs`/`velocity`, the CLI
+/// contract `agent-metrics.sh` forwards to (and, transitively,
+/// `mcp__loom__get_agent_metrics`). Exits nonzero on validation failure or a
+/// missing activity database, matching the retired Python CLI's exit codes.
+#[allow(clippy::too_many_lines)]
+fn handle_agent_metrics_command(
+    command: &str,
+    role: Option<&str>,
+    issue: Option<i32>,
+    period: &str,
+    by_model: bool,
+    format: &str,
+) -> Result<()> {
+    if !AGENT_METRICS_COMMANDS.contains(&command) {
+        eprintln!(
+            "Invalid command: {command} (expected one of: {})",
+            AGENT_METRICS_COMMANDS.join(", ")
+        );
+        std::process::exit(1);
+    }
+
+    if let Some(r) = role {
+        if !AGENT_METRICS_ROLES.contains(&r) {
+            eprintln!("Invalid role: {r}");
+            std::process::exit(1);
+        }
+    }
+
+    if !AGENT_METRICS_PERIODS.contains(&period) {
+        eprintln!(
+            "Invalid period: {period} (expected one of: {})",
+            AGENT_METRICS_PERIODS.join(", ")
+        );
+        std::process::exit(1);
+    }
+
+    let is_json = format == "json";
+
+    let db_path = std::env::var_os("LOOM_ACTIVITY_DB")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            dirs::home_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join(".loom")
+                .join("activity.db")
+        });
+
+    if !db_path.is_file() {
+        if is_json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "error": "Activity database not available",
+                    "db_path": db_path.display().to_string(),
+                })
+            );
+        } else {
+            println!(
+                "Error: activity database not found at {}. Set LOOM_ACTIVITY_DB or enable agent activity tracking.",
+                db_path.display()
+            );
+        }
+        std::process::exit(1);
+    }
+
+    let db = ActivityDb::new(db_path)?;
+
+    match command {
+        "summary" => {
+            let metrics = db.get_summary_metrics(role, period)?;
+            if is_json {
+                println!("{}", serde_json::to_string_pretty(&metrics)?);
+            } else {
+                let tokens_k = metrics.total_tokens / 1000;
+                println!("\nAgent Performance Summary ({period})");
+                println!("{:-<40}", "");
+                println!("  Total Prompts:   {}", metrics.total_prompts);
+                println!("  Total Tokens:    {tokens_k}K");
+                println!("  Total Cost:      ${:.4}", metrics.total_cost);
+                println!("  Issues Worked:   {}", metrics.issues_count);
+                println!("  PRs Created:     {}", metrics.prs_count);
+                println!("  Success Rate:    {:.1}%", metrics.success_rate);
+                println!();
+            }
+        }
+        "effectiveness" => {
+            let rows = db.get_effectiveness_rows(role, period, by_model)?;
+            if is_json {
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+            } else {
+                println!("\nAgent Effectiveness by Role ({period})");
+                if by_model {
+                    println!(
+                        "{:<12} {:<22} {:>10} {:>10} {:>10} {:>10} {:>10}",
+                        "Role", "Model", "Prompts", "Success", "Rate", "Avg Cost", "Avg Time"
+                    );
+                } else {
+                    println!(
+                        "{:<12} {:>10} {:>10} {:>10} {:>10} {:>10}",
+                        "Role", "Prompts", "Success", "Rate", "Avg Cost", "Avg Time"
+                    );
+                }
+                for r in &rows {
+                    let rate_str = format!("{:.1}%", r.success_rate);
+                    let cost_str = format!("${:.4}", r.avg_cost);
+                    let time_str = format!("{:.1}s", r.avg_duration_sec);
+                    if by_model {
+                        println!(
+                            "{:<12} {:<22} {:>10} {:>10} {:>10} {:>10} {:>10}",
+                            r.role,
+                            r.model.as_deref().unwrap_or("default"),
+                            r.total_prompts,
+                            r.successful_prompts,
+                            rate_str,
+                            cost_str,
+                            time_str
+                        );
+                    } else {
+                        println!(
+                            "{:<12} {:>10} {:>10} {:>10} {:>10} {:>10}",
+                            r.role,
+                            r.total_prompts,
+                            r.successful_prompts,
+                            rate_str,
+                            cost_str,
+                            time_str
+                        );
+                    }
+                }
+                if rows.is_empty() {
+                    println!("No data found");
+                }
+                println!();
+            }
+        }
+        "costs" => {
+            let rows = db.get_cost_rows(issue, by_model)?;
+            if is_json {
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+            } else {
+                println!("\nCost Breakdown by Issue");
+                if by_model {
+                    println!(
+                        "{:<8} {:<22} {:>10} {:>12} {:>12}",
+                        "Issue", "Model", "Prompts", "Cost", "Tokens"
+                    );
+                } else {
+                    println!("{:<8} {:>10} {:>12} {:>12}", "Issue", "Prompts", "Cost", "Tokens");
+                }
+                for r in &rows {
+                    let cost_str = format!("${:.4}", r.total_cost);
+                    if by_model {
+                        println!(
+                            "#{:<7} {:<22} {:>10} {:>12} {:>12}",
+                            r.issue_number,
+                            r.model.as_deref().unwrap_or("default"),
+                            r.prompt_count,
+                            cost_str,
+                            r.total_tokens
+                        );
+                    } else {
+                        println!(
+                            "#{:<7} {:>10} {:>12} {:>12}",
+                            r.issue_number, r.prompt_count, cost_str, r.total_tokens
+                        );
+                    }
+                }
+                if rows.is_empty() {
+                    println!("No data found");
+                }
+                println!();
+            }
+        }
+        "velocity" => {
+            let rows = db.get_velocity_rows()?;
+            if is_json {
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+            } else {
+                println!("\nDevelopment Velocity (Last 8 Weeks)");
+                println!(
+                    "{:<10} {:>10} {:>10} {:>10} {:>10}",
+                    "Week", "Prompts", "Issues", "PRs", "Cost"
+                );
+                for r in &rows {
+                    println!(
+                        "{:<10} {:>10} {:>10} {:>10} {:>10}",
+                        r.week,
+                        r.prompts,
+                        r.issues,
+                        r.prs_merged,
+                        format!("${:.2}", r.cost)
+                    );
+                }
+                println!();
+            }
+        }
+        _ => unreachable!("validated above"),
+    }
+
+    Ok(())
 }
 
 /// Handle the `workspace` subcommand — mutate/inspect the machine-level
