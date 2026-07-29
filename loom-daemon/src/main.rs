@@ -1,5 +1,6 @@
 use loom_daemon::activity::{self, ActivityDb, StatsQueries};
 use loom_daemon::auto_update;
+use loom_daemon::autonomy_marker;
 use loom_daemon::claim_reconciliation;
 use loom_daemon::credential_preflight;
 use loom_daemon::daemon_heartbeat;
@@ -1314,10 +1315,13 @@ async fn main() -> Result<()> {
     // config-disableable side effect, so a detector keyed to it would silently
     // stop working when that loop is turned off.
     let heartbeat_config = daemon_heartbeat::read_heartbeat_config(&sweep_workspace);
+    // Resolved once here so the healing marker below (#4331) and the running
+    // heartbeat loop agree on the cadence the watchdog derives its staleness
+    // threshold from — even if the loop itself is disabled.
+    let heartbeat_interval = daemon_heartbeat::resolve_interval(&heartbeat_config);
     let _heartbeat_handle = if daemon_heartbeat::resolve_enabled(&heartbeat_config) {
-        let interval = daemon_heartbeat::resolve_interval(&heartbeat_config);
-        log::info!("daemon_heartbeat: enabled (interval={}s)", interval.as_secs());
-        daemon_heartbeat::spawn_heartbeat_task(interval)
+        log::info!("daemon_heartbeat: enabled (interval={}s)", heartbeat_interval.as_secs());
+        daemon_heartbeat::spawn_heartbeat_task(heartbeat_interval)
     } else {
         log::debug!(
             "daemon_heartbeat: disabled (set LOOM_DAEMON_HEARTBEAT=1 or \
@@ -1325,6 +1329,42 @@ async fn main() -> Result<()> {
         );
         None
     };
+
+    // Startup autonomy-desired marker healing (Issue #4331). The marker is the
+    // durable "a daemon is EXPECTED on this host" signal the watchdog + status
+    // key off (#4011). `loom-daemon restart` (#4054), the in-daemon self-update
+    // loop, and a bare launchd/systemd relaunch all bring up a fresh daemon
+    // WITHOUT re-running the start script's `write_intent_marker` — so an ABSENT
+    // marker was never healed, leaving a supervised daemon running with crash
+    // protection silently disarmed. This single startup choke point covers all
+    // three paths: if the daemon is supervised and the marker is absent, re-write
+    // it. An unsupervised (`--foreground`/nohup/debug) run never writes one — it
+    // must not arm the host-side pager for a process nothing will relaunch.
+    match autonomy_marker::heal_on_startup(heartbeat_interval.as_secs()) {
+        Some(autonomy_marker::HealOutcome::Healed(path)) => log::warn!(
+            "autonomy_marker: HEALED an absent autonomy-desired marker at {} — a supervised \
+             daemon was running with crash protection disarmed (restart-primitive / self-update / \
+             bare relaunch never re-writes it). The watchdog and `loom-daemon status` now see this \
+             daemon as EXPECTED again (#4331).",
+            path.display()
+        ),
+        Some(autonomy_marker::HealOutcome::AlreadyPresent) => {
+            log::debug!("autonomy_marker: marker already present — no healing needed (#4331)")
+        }
+        Some(autonomy_marker::HealOutcome::UnsupervisedSkip) => log::debug!(
+            "autonomy_marker: unsupervised run (no LOOM_DAEMON_SUPERVISOR) — deliberately NOT \
+             writing an autonomy-desired marker (#4331)"
+        ),
+        Some(autonomy_marker::HealOutcome::WriteFailed { path, error }) => log::warn!(
+            "autonomy_marker: failed to heal the autonomy-desired marker at {} (logged, never \
+             fatal; the daemon keeps running): {error} (#4331)",
+            path.display()
+        ),
+        None => log::warn!(
+            "autonomy_marker: could not resolve a loom dir (no LOOM_SOCKET_PATH / home) — \
+             skipping marker healing for this run (#4331)"
+        ),
+    }
 
     // Autonomous periodic support-role runner (Issue #4015): dispatches the
     // standalone support roles (Champion, Curator, Judge, Auditor, Guide)

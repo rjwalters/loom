@@ -69,9 +69,16 @@ back_date_file() { # <file> <seconds_ago>
 
 # Run the watchdog on the pid-file path (LOOM_DAEMON_LAUNCHD=0). Extra env
 # assignments may be passed as KEY=VAL positional args. Sets global RC.
+#
+# LOOM_SOCKET_PATH is pinned into the tempdir so the resolved <loom_dir> is
+# $WORKDIR — this matters for the marker-ABSENT reality probe (#4331), whose
+# default pid file is `<loom_dir>/.daemon.pid`: without this the probe would look
+# at the operator's real ~/.loom/.daemon.pid and a live host daemon could break
+# the "nothing alive" cases.
 run_watchdog() {
     : > "$OUT"
     env "$@" LOOM_AUTONOMY_MARKER="$MARKER" LOOM_WATCHDOG_LOG="$WDLOG" \
+        LOOM_SOCKET_PATH="$WORKDIR/loom-daemon.sock" \
         LOOM_DAEMON_LAUNCHD=0 bash "$WATCHDOG" > "$OUT" 2>&1
     RC=$?
 }
@@ -87,10 +94,36 @@ sleeper() { sleep 60 >/dev/null 2>&1 & echo $!; }
 # ===================================================================
 # 1. Marker ABSENT ⇒ no daemon expected ⇒ silent OK (exit 0).
 # ===================================================================
-rm -f "$MARKER" "$HEARTBEAT" "$WDLOG"
+rm -f "$MARKER" "$HEARTBEAT" "$WDLOG" "$WORKDIR/.daemon.pid"
 run_watchdog
-assert_rc 0 "$RC" "marker absent: exits 0 (no daemon expected)"
-if log_has DIVERGENCE; then fail "marker absent: unexpected DIVERGENCE"; else pass "marker absent: no DIVERGENCE reported"; fi
+assert_rc 0 "$RC" "marker absent + nothing alive: exits 0 (no daemon expected)"
+if log_has DIVERGENCE || log_hasi "mismatch"; then fail "marker absent + nothing alive: unexpected report"; else pass "marker absent + nothing alive: no DIVERGENCE/MISMATCH reported"; fi
+
+# ===================================================================
+# 1b. Marker ABSENT but a daemon IS running ⇒ STATE MISMATCH (#4331): crash
+#     protection is disarmed, so the watchdog WARNs loudly + exits 1 instead of
+#     the old silent `[OK] nothing to check`. Reproduces the observed bug — a
+#     daemon rolled via the restart primitive / self-update, neither of which
+#     re-writes the marker. Liveness is probed via the default pid file
+#     (<loom_dir>/.daemon.pid) on the LOOM_DAEMON_LAUNCHD=0 path.
+# ===================================================================
+rm -f "$MARKER" "$HEARTBEAT" "$WDLOG"
+live_pid=$(sleeper)
+echo "$live_pid" > "$WORKDIR/.daemon.pid"
+run_watchdog
+kill "$live_pid" 2>/dev/null || true
+assert_rc 1 "$RC" "marker absent + daemon alive: exits 1 (state mismatch, crash protection disarmed)"
+if log_hasi "mismatch"; then
+    pass "marker absent + daemon alive: WARN reports the state mismatch"
+else
+    fail "marker absent + daemon alive: missing the state-mismatch WARN"
+fi
+if log_has DIVERGENCE; then
+    fail "marker absent + daemon alive: should be a WARN, not a DIVERGENCE"
+else
+    pass "marker absent + daemon alive: reported as WARN, not DIVERGENCE"
+fi
+rm -f "$WORKDIR/.daemon.pid"
 
 # ===================================================================
 # 2. Intent present, daemon ALIVE, heartbeat FRESH ⇒ silent OK.
