@@ -1143,6 +1143,12 @@ async fn main() -> Result<()> {
     let drain_state = Arc::new(loom_daemon::ipc::DrainState::new());
     let drain_flag = drain_state.flag();
 
+    // Shared role-runner in-progress guard (#4364): one set, cloned into both
+    // the work-finder's idle-edge path and every interval role loop, so an
+    // interval run and an idle-triggered run never overlap for the same
+    // (root, role). In-process shared state only — no event-bus topic.
+    let role_in_progress = role_runner::new_in_progress_guard();
+
     // Epic supervisor loop (Issue #3872 — Phase 4 of epic #3842). Opt-in via
     // `LOOM_EPIC_SUPERVISOR`. The loop drives every open `loom:epic` issue
     // through its fork-join lifecycle by dispatching the enabled role each tick.
@@ -1294,11 +1300,31 @@ async fn main() -> Result<()> {
             suppress_dispatch_during_gate,
             event_bus.clone(),
             drain_flag.clone(),
+            role_in_progress.clone(),
         ))
     } else {
         log::debug!("work_finder: disabled (set LOOM_WORK_FINDER=1 to enable)");
         None
     };
+
+    // Idle-edge role triggering (#4364) is inert without the work-finder loop:
+    // the work finder is the sole source of the per-root idle signal, so an
+    // `autonomous.roleRunner.onIdle` set with no work finder enabled can never
+    // fire. Warn once at startup so a misconfiguration surfaces in the log
+    // rather than silently doing nothing. (The interval cadence still runs.)
+    if !work_finder::resolve_enabled(&work_finder_config)
+        && !role_runner::resolve_on_idle_roles(&role_runner::read_role_runner_config(
+            &sweep_workspace,
+        ))
+        .is_empty()
+    {
+        log::warn!(
+            "role_runner: autonomous.roleRunner.onIdle is set but the work finder is disabled — \
+             idle-edge triggering has no idle signal to observe and will never fire (enable the \
+             work finder with LOOM_WORK_FINDER=1 or autonomous.workFinder.enabled=true). The \
+             interval cadence is unaffected."
+        );
+    }
 
     // Reactive main-health backstop loop (Issue #3812 — Phase C of epic #3809).
     // Opt-in via `LOOM_MAIN_HEALTH_GATE` AND a `buildGate` block in
@@ -1470,6 +1496,7 @@ async fn main() -> Result<()> {
                     sweep_workspace.clone(),
                     interval,
                     drain_flag.clone(),
+                    role_in_progress.clone(),
                 )
             })
             .collect();
