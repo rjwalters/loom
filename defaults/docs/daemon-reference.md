@@ -450,6 +450,73 @@ untouched; only the in-memory tracking + reaper + watchdog go away, so the sweep
 finishes normally but its terminal state becomes unobservable via IPC after the
 deregister — an accepted consequence of an explicit operator `workspace remove`.
 
+## Fleet — operator-triggered multi-host worker fanout (`fleet`, #4340)
+
+The `fleet` subcommand family is the operator-triggered path for running loom
+across several hosts (epic #4340; architecture Option A — **federated daemons**,
+one full `loom-daemon` per host, coordination stays label-based through the
+forge, no new wire protocol). The **boundary decision** puts the fanout brain in
+`loom-daemon` (`loom-daemon/src/fleet/`): when to expand, what a worker is,
+dispatch/drain/teardown, fleet status. Generic VM provisioning stays in
+`repo:remote` (rjwalters/repo) — the seam `fleet` consumes is "a reachable Ubuntu
+box + an SSH alias", never a cloud CLI. v1 is operator-triggered, **not**
+auto-elastic (no queue-depth/cost-cap triggers — deferred until the manual
+command has mileage).
+
+### `fleet add-worker <ssh-host> --repo <owner/name> [--repo …]` (#4341)
+
+Takes a reachable, already-provisioned host to "daemon running, workspace
+registered, tokens ranked, dispatch verified" in one **idempotent** command over
+`ssh <ssh-host>`. The bootstrap is modeled as an ordered **plan** of named steps,
+each with a `check` (is it already done?) → `apply` → `verify` shape — Rust owns
+the plan/ordering/checklist; the per-phase shell is rendered in
+`fleet/add_worker.rs` (heredoc templates) and executed over a `CommandRunner`
+(the production `SshRunner`, or a mocked runner in tests). The steps encode the
+#3979 Phase-2 pilot's verified hand bootstrap:
+
+1. **base-deps** — build-essential, pkg-config, libssl-dev, **libsqlite3-dev**
+   (safehouse#38), git, gh, rustup.
+2. **machine-layout** — clone loom → `~/.local/share/loom`, `cargo build -p
+   loom-daemon --release`, install to `~/.local/bin` (Linux skips codesign).
+3. **claude-code** — install the Claude Code CLI.
+4. **forge-auth** — `gh auth login --with-token` with the operator's
+   fine-grained PAT fed over **ssh stdin** (never a command line).
+5. **token-accounts / token-pool / token-ranking** — install `accounts.env`
+   (0600, over stdin), `loom-daemon tokens bootstrap --shared`, then `tokens
+   check --ranking`. The **full** account pool ships (per #3979 — no pinned
+   subsets).
+6. **workspace-clone** — `gh repo clone` each `--repo` + `loom-daemon init`
+   (installs the `/loom:sweep` command, #4027).
+7. **workspace-register** — `loom-daemon workspace add` each repo at `--priority`.
+8. **daemon-unit** — a systemd `--user` unit (`Restart=on-failure`,
+   `loginctl enable-linger`). `WorkingDirectory=` is pinned to a workspace clone
+   as the **#4292** token-pool-cwd workaround — the rendered unit carries a
+   `#4292` marker so it is removed when that lands.
+9. **idle-shutdown** (optional, `--idle-shutdown-minutes N`) — a cron guard that
+   powers the host off after N idle minutes, skipping while claude / loom-daemon
+   are working.
+10. **safehouse** (optional, `--safehouse`) — **skip-with-notice** until #3998
+    (the safehoused provisioning fragment) lands.
+11. **verify** — `loom-daemon status` sane from the workspace cwd, ranking
+    fresh, workspace registered.
+
+Steps landed since the pilot are **deliberately absent**: no Python `loom_tools`
+/ `pip --break-system-packages` (native token selection landed #4228), no
+single-repo daemon-cwd pin for dispatch (registry-resolved dispatch landed #4299
+/ PR #4322).
+
+**Secrets** (`--pat-file`, `--accounts-env`) are read locally at **preflight**
+(a missing/empty file fails before any remote action) and travel to the worker
+only over ssh stdin — never a command line, never a logged rendered script. A
+supplied secret is `StepStdin { secret: true }`, redacted in dry-run output and
+`Debug`.
+
+`--dry-run` prints the full ordered plan without contacting the host. On a
+successful run each worker is recorded (dedup on the SSH alias) in a machine-level
+**fleet registry** at `~/.loom/fleet.json` (`LOOM_FLEET_PATH` override) — the
+inventory the siblings `fleet status` (#4342) and `fleet drain` (#4343) will
+enumerate. A re-run is idempotent: each step's `check` reports it `unchanged`.
+
 ## Token pool provisioning for managed repos (#3938)
 
 The multi-workspace work finder measures the token pool **once per tick from the

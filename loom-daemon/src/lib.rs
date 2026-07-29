@@ -24,6 +24,7 @@ pub mod epic_state;
 pub mod epic_supervisor;
 pub mod errors;
 pub mod event_bus;
+pub mod fleet;
 pub mod forge_parser;
 pub mod git_parser;
 pub mod git_utils;

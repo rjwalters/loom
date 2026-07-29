@@ -146,6 +146,18 @@ enum Commands {
         action: WorkspaceAction,
     },
 
+    /// Operator-triggered multi-host worker fanout (epic #4340). `fleet
+    /// add-worker <ssh-host> --repo <repo>` takes a reachable, already-provisioned
+    /// Ubuntu host to "daemon running, workspace registered, tokens ranked,
+    /// dispatch verified" in one idempotent command, over ssh. Generic VM
+    /// provisioning stays in `repo:remote` — this consumes a reachable box + an
+    /// SSH alias, it never wrangles a cloud CLI. The bootstrap is an ordered,
+    /// idempotent plan; `--dry-run` prints it without touching the host.
+    Fleet {
+        #[command(subcommand)]
+        action: FleetAction,
+    },
+
     /// Manage insta-crash quarantines (Issue #3939): the in-memory pauses the
     /// daemon applies to issues whose sweeps insta-crash repeatedly. Connects to
     /// the running daemon over its Unix socket, since the quarantine state lives
@@ -317,6 +329,63 @@ enum WorkspaceAction {
         /// Emit machine-readable JSON instead of the human-readable table.
         #[arg(long)]
         json: bool,
+    },
+}
+
+/// Sub-actions for `loom-daemon fleet` (epic #4340).
+#[derive(Subcommand)]
+enum FleetAction {
+    /// Bootstrap a provisioned host into a working loom worker (issue #4341).
+    /// Runs an ordered, idempotent plan over `ssh <ssh-host>`: base deps, the
+    /// machine-level loom-daemon build, Claude Code, forge auth, the full token
+    /// pool, workspace clone + registration, a systemd --user daemon unit, an
+    /// optional idle-shutdown guard, and a verify step. Secrets (PAT,
+    /// accounts.env) travel only over ssh stdin, never a command line.
+    AddWorker {
+        /// SSH alias/host to reach the worker (from `repo:remote` or operator
+        /// supplied).
+        #[arg(value_name = "SSH_HOST")]
+        ssh_host: String,
+
+        /// Workspace repo(s) to clone + register on the worker (`owner/name`).
+        /// Repeat for several repos. At least one is required.
+        #[arg(long, value_name = "OWNER/NAME", required = true)]
+        repo: Vec<String>,
+
+        /// Cross-repo dispatch priority the workspaces are registered at (#3946;
+        /// lower = higher priority). Defaults to 100.
+        #[arg(long, value_name = "N", default_value_t = loom_daemon::workspace_registry::DEFAULT_WORKSPACE_PRIORITY)]
+        priority: u32,
+
+        /// Local path to the operator's fine-grained forge PAT (Contents+Issues+PRs
+        /// on the target repos). Read locally at preflight; transferred to the
+        /// worker only via ssh stdin. Omit to skip forge auth (skip-with-notice).
+        #[arg(long, value_name = "PATH")]
+        pat_file: Option<String>,
+
+        /// Local path to the operator's `accounts.env` (the full token pool).
+        /// Read locally at preflight; transferred to the worker only via ssh
+        /// stdin. Omit to skip token-pool provisioning (skip-with-notice).
+        #[arg(long, value_name = "PATH")]
+        accounts_env: Option<String>,
+
+        /// Upstream Loom repo URL cloned to the worker's machine-level layout.
+        #[arg(long, value_name = "URL", default_value = loom_daemon::fleet::add_worker::DEFAULT_LOOM_REPO_URL)]
+        loom_repo: String,
+
+        /// Wire safehouse fleet-comms on the worker. Config-gated: skip-with-notice
+        /// until #3998 (the safehoused provisioning fragment) lands.
+        #[arg(long)]
+        safehouse: bool,
+
+        /// Install an idle-shutdown cron guard that powers the host off after
+        /// this many idle minutes (skipping while claude / loom-daemon work).
+        #[arg(long, value_name = "MINUTES")]
+        idle_shutdown_minutes: Option<u32>,
+
+        /// Print the ordered plan without contacting the host.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -1750,6 +1819,7 @@ fn handle_cli_command(command: Commands) -> Result<()> {
             format,
         } => handle_stats_command(role.as_deref(), issue, weekly, &format),
         Commands::Workspace { action } => handle_workspace_command(action),
+        Commands::Fleet { action } => handle_fleet_command(action),
         Commands::Tokens { action } => handle_tokens_command(action),
         Commands::UpdateGitignore { workspace } => handle_update_gitignore_command(&workspace),
         Commands::Status { .. } => {
@@ -3996,6 +4066,40 @@ fn print_agent_effectiveness(agent: &activity::AgentEffectiveness) {
 /// This runs whether or not the daemon is up; a running daemon re-reads the
 /// same file on its next tick (hot-apply), and its `RegisterWorkspace` /
 /// `DeregisterWorkspace` / `ListWorkspaces` IPC handlers touch the same file.
+/// Handle `loom-daemon fleet …` (epic #4340). Thin clap→module wiring: all
+/// bootstrap logic (the step planner/executor, shell templates, fleet registry)
+/// lives in [`loom_daemon::fleet`].
+fn handle_fleet_command(action: FleetAction) -> Result<()> {
+    use loom_daemon::fleet::add_worker::{self, AddWorkerConfig};
+
+    match action {
+        FleetAction::AddWorker {
+            ssh_host,
+            repo,
+            priority,
+            pat_file,
+            accounts_env,
+            loom_repo,
+            safehouse,
+            idle_shutdown_minutes,
+            dry_run,
+        } => {
+            let config = AddWorkerConfig {
+                ssh_host,
+                repos: repo,
+                priority,
+                dry_run,
+                loom_repo_url: loom_repo,
+                pat_file: pat_file.map(PathBuf::from),
+                accounts_env_file: accounts_env.map(PathBuf::from),
+                safehouse_enabled: safehouse,
+                idle_shutdown_minutes,
+            };
+            add_worker::run(&config)
+        }
+    }
+}
+
 fn handle_workspace_command(action: WorkspaceAction) -> Result<()> {
     use loom_daemon::workspace_registry::{AddOutcome, WorkspaceRegistry};
 
