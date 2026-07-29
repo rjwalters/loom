@@ -3766,6 +3766,10 @@ impl SweepRegistry {
                 issue: *issue,
                 exit_code: None,
                 duration_sec,
+                // #4366: an operator/reaper-initiated cancel is not the
+                // no-progress-exit-0 failure signature (there's no exit code
+                // at all) — never count a cancel toward quarantine.
+                no_progress: false,
                 repo: None, // stamped by emit_event (#3929)
             });
         }
@@ -4090,10 +4094,35 @@ impl SweepRegistry {
                                     at: now,
                                 };
                             }
+                            // No-progress backstop (#4366): a headless child
+                            // that ends its turn parked on a monitored
+                            // background task (e.g. "cache download is
+                            // running... I'll pick this back up") exits 0 with
+                            // NO checkpoint and NO forward lifecycle progress
+                            // whatsoever. That shape is indistinguishable from
+                            // the legitimate #3823b self-skip / no-work exit
+                            // by exit code alone, so it must be conjunctive:
+                            // clean exit AND no open linked PR (excludes the
+                            // #4123 open-PR self-skip) AND the issue is still
+                            // open (excludes a legitimate curator
+                            // close-as-not-planned / already-done self-skip).
+                            // Gated on `!skip_label_flip` like every other
+                            // real-forge probe in this branch (the resume-path
+                            // open-PR check above, `restore_label_to_ready`) —
+                            // test fixtures without `gh` credentials never pay
+                            // for a forge round trip, and this path stays a
+                            // pure no-op with `no_progress` defaulting to
+                            // `false` (byte-identical to pre-#4366 behavior)
+                            // whenever label-flipping itself is disabled.
+                            let no_progress = !self.config.skip_label_flip
+                                && exit_code == Some(0)
+                                && self.first_open_linked_pr(issue).is_none()
+                                && self.issue_is_closed(issue) != Some(true);
                             events_to_emit.push(Event::SweepExited {
                                 issue,
                                 exit_code,
                                 duration_sec,
+                                no_progress,
                                 repo: None, // stamped by emit_event (#3929)
                             });
                             events_to_emit.push(Event::SweepGlobalCompleted {
@@ -4111,9 +4140,25 @@ impl SweepRegistry {
                             let insta_crash = duration_sec
                                 < self.quarantine_config.insta_crash_secs
                                 && exit_code != Some(0);
+                            // #4366: a separate predicate arm from the
+                            // insta-crash window/exit-code check above — a
+                            // clean exit 0 with zero lifecycle progress
+                            // (`no_progress`) is ALSO a failed attempt, just a
+                            // different failure shape (parked-on-monitor
+                            // rather than a fast crash). Without this, such
+                            // exits fell through to `insta_crash == false`,
+                            // which *resets* the tally via
+                            // `record_terminal_outcome`, so a repeatedly
+                            // parking sweep never quarantines and churns the
+                            // dispatch queue forever. Does not touch the
+                            // insta-crash window or its `exit_code !=
+                            // Some(0)` condition above — this ORs in the new
+                            // verdict as a second, independent reason to
+                            // count the attempt as failed.
+                            let counted_failure = insta_crash || no_progress;
                             // #4122: re-attribute account-exhaustion deaths to
                             // the spawn account instead of the issue.
-                            self.record_insta_crash_outcome(&sweep_id, issue, insta_crash);
+                            self.record_insta_crash_outcome(&sweep_id, issue, counted_failure);
                         }
                         // Block-the-subtree (issue #3729, v1 item 4): if this
                         // parent ended in `loom:blocked` and stacked children
@@ -6350,6 +6395,231 @@ exit 0
             "expected an Exited{{code: Some(0)}} terminal state; got: {:?}",
             info.state
         );
+    }
+
+    // ------------------------------------------------------------------------
+    // No-progress backstop (Issue #4366)
+    // ------------------------------------------------------------------------
+
+    /// Build a registry whose fake `gh` answers `issue view` with `issue_state`
+    /// (`"OPEN"` or `"CLOSED"`) and `api graphql` (the open-linked-PR probe)
+    /// with `graphql_stdout` (one PR number per line, empty for "no open PR").
+    /// Unlike [`open_pr_guard_registry`] (which hardcodes `OPEN`), this lets
+    /// #4366's no-progress tests exercise the issue-closed exemption too.
+    fn no_progress_test_registry(
+        ws: &Path,
+        issue_state: &str,
+        graphql_stdout: &str,
+        skip_label_flip: bool,
+    ) -> SweepRegistry {
+        let fake_gh = ws.join("fake-gh-no-progress.sh");
+        let script = format!(
+            "#!/usr/bin/env bash\n\
+             if [[ \"$1\" == \"issue\" && \"$2\" == \"view\" ]]; then\n\
+             printf '%s\\n' \"{state}\"\n\
+             exit 0\n\
+             fi\n\
+             if [[ \"$1\" == \"api\" && \"$2\" == \"graphql\" ]]; then\n\
+             printf '%s\\n' \"{gql}\"\n\
+             exit 0\n\
+             fi\n\
+             if [[ \"$1\" == \"repo\" && \"$2\" == \"view\" ]]; then\n\
+             printf 'rjwalters/loom\\n'\n\
+             exit 0\n\
+             fi\n\
+             exit 0\n",
+            state = issue_state,
+            gql = graphql_stdout,
+        );
+        std::fs::write(&fake_gh, &script).unwrap();
+        let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_gh, perms).unwrap();
+        if let Ok(f) = std::fs::File::open(&fake_gh) {
+            let _ = f.sync_all();
+        }
+
+        let scripts_dir = ws.join(".loom").join("scripts");
+        std::fs::create_dir_all(&scripts_dir).unwrap();
+        let spawn = scripts_dir.join("spawn-claude.sh");
+        std::fs::write(&spawn, "#!/usr/bin/env bash\necho spawned\nexit 0\n").unwrap();
+        let mut sperms = std::fs::metadata(&spawn).unwrap().permissions();
+        sperms.set_mode(0o755);
+        std::fs::set_permissions(&spawn, sperms).unwrap();
+        if let Ok(f) = std::fs::File::open(&spawn) {
+            let _ = f.sync_all();
+        }
+
+        let mut config = SweepRegistryConfig::new(ws.to_path_buf());
+        config.spawn_bin = Some(spawn);
+        config.gh_bin = Some(fake_gh);
+        config.skip_label_flip = skip_label_flip;
+        config.journal_path = Some(ws.join("test-sweeps-journal.json"));
+        SweepRegistry::new(config)
+    }
+
+    /// Insert a `Running` entry backed by a REAL, retained clean-exit child
+    /// (mirrors [`reaper_real_clean_exit_does_not_count_as_insta_crash`]) so
+    /// `poll_liveness` reports `exit_code == Some(0)` rather than the
+    /// no-handle fallback's `None` — required to exercise the `exit_code ==
+    /// Some(0)` leg of the #4366 no-progress predicate.
+    fn insert_clean_exit_running(registry: &mut SweepRegistry, issue: u32, seq: u32) -> String {
+        let child = Command::new("true")
+            .spawn()
+            .expect("spawn `true` fixture child");
+        let pid = child.id();
+        std::thread::sleep(Duration::from_millis(50));
+        let sweep_id = format!("sweep-issue-{issue}-no-progress-{seq}");
+        registry.entries.insert(
+            sweep_id.clone(),
+            SweepInfo {
+                sweep_id: sweep_id.clone(),
+                kind: SweepKind::Issue(issue),
+                pid,
+                token_name: "unknown".into(),
+                log_path: registry.compute_log_path(issue),
+                idempotency_key: None,
+                started_at: Utc::now(),
+                state: SweepState::Running,
+                latest_phase: None,
+                pr_number: None,
+                model: None,
+                effort: None,
+                depends_on: None,
+                repo: None,
+            },
+        );
+        registry.children.insert(sweep_id.clone(), child);
+        sweep_id
+    }
+
+    /// AC: exit 0 + no checkpoint + no open linked PR + issue open → counted
+    /// as a failed attempt, and 3 consecutive occurrences quarantine exactly
+    /// like 3 consecutive insta-crashes would — the whole point of the
+    /// backstop is that this failure shape must NOT be exempt from the tally
+    /// just because the exit code was 0.
+    #[test]
+    fn reaper_counts_no_progress_clean_exit_and_quarantines_at_threshold() {
+        let dir = tempdir().unwrap();
+        let mut registry = no_progress_test_registry(dir.path(), "OPEN", "", false);
+        assert_eq!(registry.quarantine_config().threshold, 3);
+
+        for seq in 0..3 {
+            insert_clean_exit_running(&mut registry, 43_660, seq);
+            let changed = registry.reap_once();
+            assert!(changed >= 1, "reap_once should observe the dead fixture child");
+        }
+
+        assert_eq!(
+            registry.insta_crash_count(43_660),
+            3,
+            "3 consecutive no-progress clean exits must accrue exactly like insta-crashes"
+        );
+        assert!(
+            registry.is_quarantined(43_660),
+            "3rd consecutive no-progress exit must quarantine the issue"
+        );
+    }
+
+    /// AC: exit 0 with an open linked PR is NOT counted — the #4123 open-PR
+    /// dispatch-guard self-skip is a legitimate zero-progress-this-run
+    /// outcome, not a parked-on-monitor failure.
+    #[test]
+    fn reaper_open_linked_pr_exempts_clean_exit_from_no_progress() {
+        let dir = tempdir().unwrap();
+        let mut registry = no_progress_test_registry(dir.path(), "OPEN", "4400", false);
+
+        insert_clean_exit_running(&mut registry, 43_661, 0);
+        registry.reap_once();
+
+        assert_eq!(
+            registry.insta_crash_count(43_661),
+            0,
+            "a clean exit with an open linked PR must not count toward quarantine"
+        );
+        assert!(!registry.is_quarantined(43_661));
+    }
+
+    /// AC: exit 0 with the issue already closed is NOT counted — a legitimate
+    /// curator close-as-not-planned (or already-done) self-skip is a valid
+    /// zero-PR, zero-checkpoint outcome.
+    #[test]
+    fn reaper_closed_issue_exempts_clean_exit_from_no_progress() {
+        let dir = tempdir().unwrap();
+        let mut registry = no_progress_test_registry(dir.path(), "CLOSED", "", false);
+
+        insert_clean_exit_running(&mut registry, 43_662, 0);
+        registry.reap_once();
+
+        assert_eq!(
+            registry.insta_crash_count(43_662),
+            0,
+            "a clean exit on an already-closed issue must not count toward quarantine"
+        );
+        assert!(!registry.is_quarantined(43_662));
+    }
+
+    /// AC: `skip_label_flip` disables the whole no-progress probe (no `gh`
+    /// call at all, matching every other real-forge probe in this branch) —
+    /// a clean exit under `skip_label_flip` never counts, regardless of what
+    /// the (unconsulted) forge state would have been. Uses the plain
+    /// `fixture_registry` (no `gh_bin` configured at all) so a regression
+    /// that removed the gate would fail loudly (an unconfigured `gh` binary
+    /// erroring out, not silently answering "no PR / open issue").
+    #[test]
+    fn reaper_no_progress_probe_is_noop_under_skip_label_flip() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+        assert!(registry.config.skip_label_flip, "fixture_registry sets skip_label_flip = true");
+
+        let sweep_id = insert_clean_exit_running(&mut registry, 43_663, 0);
+        registry.reap_once();
+
+        assert_eq!(
+            registry.insta_crash_count(43_663),
+            0,
+            "skip_label_flip must disable the no-progress probe entirely"
+        );
+        assert!(!registry.is_quarantined(43_663));
+        let info = registry.get(&sweep_id).unwrap();
+        assert!(matches!(info.state, SweepState::Exited { code: Some(0), .. }));
+    }
+
+    /// AC: the `SweepExited` event carries `no_progress: true` for the
+    /// failure shape and `no_progress: false` for the exempted shapes, so
+    /// operators (and #4137 durable telemetry) can distinguish the failure
+    /// class without re-deriving it from `exit_code` + `duration_sec` alone.
+    #[tokio::test]
+    async fn reaper_sweep_exited_event_carries_no_progress_classification() {
+        use crate::event_bus::EventBus;
+
+        let dir = tempdir().unwrap();
+        let mut registry = no_progress_test_registry(dir.path(), "OPEN", "", false);
+        let bus = Arc::new(EventBus::new());
+        registry.set_event_bus(bus.clone());
+        let mut sub = bus.subscribe::<[&str; 0], &str>([]);
+
+        insert_clean_exit_running(&mut registry, 43_664, 0);
+        registry.reap_once();
+
+        let mut saw_no_progress_true = false;
+        for _ in 0..4 {
+            let Ok(ev) = tokio::time::timeout(Duration::from_secs(5), sub.recv()).await else {
+                break;
+            };
+            if let Event::SweepExited {
+                issue, no_progress, ..
+            } = ev.unwrap()
+            {
+                assert_eq!(issue, 43_664);
+                assert!(
+                    no_progress,
+                    "expected no_progress=true for a parked-on-monitor clean exit"
+                );
+                saw_no_progress_true = true;
+            }
+        }
+        assert!(saw_no_progress_true, "expected a sweep.issue.43664.exited event");
     }
 
     /// Issue #3943: `spawn_child` pins

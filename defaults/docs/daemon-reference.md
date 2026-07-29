@@ -105,7 +105,7 @@ issue** — the v0.10.0 set is intentionally frozen.
 |-------|-----------|---------|
 | `sweep.issue.{N}.phase`   | Sweep child via `publish_event` | `{phase, pr_number?, repo?}` |
 | `sweep.issue.{N}.blocker` | Sweep child                     | `{reason, label_added, repo?}` |
-| `sweep.issue.{N}.exited`  | Daemon reaper (or `cancel_sweep`) | `{exit_code, duration_sec, repo?}` |
+| `sweep.issue.{N}.exited`  | Daemon reaper (or `cancel_sweep`) | `{exit_code, duration_sec, no_progress, repo?}` |
 | `sweep.issue.{N}.crashed` | Daemon reaper                   | `{checkpoint_phase, repo?}` |
 | `sweep.issue.{N}.resume_dispatched` | Daemon reaper (#4256) | `{pr, checkpoint_phase?, dispatched, repo?}` |
 | `sweep.global.dispatch`   | Daemon                          | `{sweep_id, kind}` |
@@ -149,6 +149,22 @@ field. The daemon stamps `repo` centrally when it emits each event; a sweep
 child that already knows its repo (via `publish_event`) may supply it and will
 not be overwritten. `sweep.global.*` events are unchanged — they already carry a
 unique `sweep_id`.
+
+`sweep.issue.{N}.exited` gained an additive **`no_progress`** boolean field in
+**#4366**. It classifies a checkpoint-less clean exit (`exit_code == Some(0)`)
+as a genuine no-lifecycle-progress death (`true`) vs. an ordinary/benign exit
+(`false`) — `true` requires ALL of: clean exit, no open PR linked to the issue,
+and the issue still open. The reaper counts a `true` verdict toward the
+insta-crash quarantine tally (via the same `record_terminal_outcome` path the
+#3939 insta-crash arm uses) instead of resetting it, closing the gap where a
+headless sweep that ends its turn parked on a monitored background task (e.g.
+"cache download is running in the background... I'll pick this back up") exits
+0 with zero checkpoint/PR progress and previously reset the tally forever,
+letting the dispatch queue churn on it indefinitely. `#[serde(default)]` keeps
+pre-#4366 wire data compatible (deserializes to `false`, matching prior
+behavior). Gated on `!skip_label_flip` like the reaper's other real-forge
+probes — under `skip_label_flip` the field is always `false` and no `gh` call
+is made.
 
 In addition, the bus internally emits:
 

@@ -1393,12 +1393,28 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         repo: Option<String>,
     },
-    /// `sweep.issue.{N}.exited` — reaper detected clean exit.
+    /// `sweep.issue.{N}.exited` — reaper detected clean exit (no checkpoint).
     SweepExited {
         issue: u32,
         #[serde(skip_serializing_if = "Option::is_none")]
         exit_code: Option<i32>,
         duration_sec: i64,
+        /// Issue #4366: classifies this checkpoint-less exit as a genuine
+        /// no-lifecycle-progress death (`true`) vs an ordinary/benign exit
+        /// (`false`) — e.g. a legitimate self-skip / already-done no-work
+        /// exit, or a clean exit that produced an open linked PR or a closed
+        /// issue. `true` requires ALL of: `exit_code == Some(0)`, no open
+        /// linked PR, and the issue still open — the reaper counts a `true`
+        /// verdict toward the insta-crash quarantine tally instead of
+        /// resetting it, so a headless child that repeatedly parks on a
+        /// monitored background task and exits 0 (the observed "cache
+        /// download is running in the background... I'll pick this back up"
+        /// signature) can no longer churn the dispatch queue forever without
+        /// ever being counted as a failure. `#[serde(default)]` keeps
+        /// pre-#4366 wire data compatible (defaults to `false`, the prior
+        /// behavior).
+        #[serde(default)]
+        no_progress: bool,
         /// Owning managed-workspace root (Issue #3929). See [`Self::SweepPhase`].
         #[serde(default, skip_serializing_if = "Option::is_none")]
         repo: Option<String>,
@@ -1679,6 +1695,7 @@ mod tests {
             issue: 7,
             exit_code: Some(0),
             duration_sec: 5,
+            no_progress: false,
             repo: None,
         };
         assert_eq!(exited.topic(), "sweep.issue.7.exited");
@@ -1740,6 +1757,7 @@ mod tests {
             issue: 1,
             exit_code: None,
             duration_sec: 0,
+            no_progress: false,
             repo: None,
         };
         ev.set_repo_if_absent("/repos/x");

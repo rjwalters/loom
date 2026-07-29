@@ -562,11 +562,19 @@ pub fn event_to_envelope(event: &Event) -> Option<Envelope> {
             issue,
             exit_code,
             duration_sec,
+            no_progress,
             repo,
         } => {
             let prefix = repo_issue_prefix(repo.as_deref(), *issue);
             let dur = format_narrated_duration(*duration_sec);
             let body = match exit_code {
+                // #4366: a clean exit with zero lifecycle progress (parked on
+                // a monitored background task) narrates distinctly from an
+                // ordinary benign self-skip so operators can see the failure
+                // class at a glance.
+                Some(0) if *no_progress => {
+                    format!("{prefix} · no progress ⚠ · exit 0, no checkpoint/PR · {dur}")
+                }
                 Some(0) => format!("{prefix} · done ✓ · {dur}"),
                 Some(code) => format!(
                     "{prefix} · failed ✗ · exit {code}{} · {dur}",
@@ -1584,6 +1592,7 @@ mod tests {
             issue: 42,
             exit_code: Some(0),
             duration_sec: 12,
+            no_progress: false,
             repo: Some("/repos/vibesql".to_owned()),
         };
         let env = event_to_envelope(&exited).unwrap();
@@ -1595,10 +1604,25 @@ mod tests {
             issue: 42,
             exit_code: Some(78),
             duration_sec: 24,
+            no_progress: false,
             repo: Some("/repos/vibesql".to_owned()),
         };
         let env = event_to_envelope(&exited_failed).unwrap();
         assert_eq!(env.body, "vibesql#42 · failed ✗ · exit 78 (EX_CONFIG: token pool) · 24s");
+
+        // #4366: a clean exit 0 classified as no-progress (parked on a
+        // monitored background task) narrates distinctly from an ordinary
+        // benign self-skip.
+        let exited_no_progress = Event::SweepExited {
+            issue: 42,
+            exit_code: Some(0),
+            duration_sec: 90,
+            no_progress: true,
+            repo: Some("/repos/vibesql".to_owned()),
+        };
+        let env = event_to_envelope(&exited_no_progress).unwrap();
+        assert_eq!(env.kind, "ack");
+        assert_eq!(env.body, "vibesql#42 · no progress ⚠ · exit 0, no checkpoint/PR · 1m30s");
 
         let crashed = Event::SweepCrashed {
             issue: 42,
