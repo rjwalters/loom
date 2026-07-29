@@ -625,6 +625,8 @@ mod tests {
             loadavg_1m: None,
             cpu_idle_fraction: None,
             capacity_bound: false,
+            preflight_advisory_active: false,
+            preflight_advisory_message: None,
             configured_max: 0,
             per_token_concurrency: 1,
             dynamic_cap: 0,
@@ -921,12 +923,14 @@ mod tests {
                 issue: 4392,
                 exit_code: Some(0),
                 duration_sec: 12,
+                death_class: None,
                 repo: None,
             },
             Event::SweepCrashed {
                 issue: 4392,
                 checkpoint_phase: Some("judge".to_string()),
                 classification: None,
+                death_class: None,
                 repo: None,
             },
             Event::SweepGlobalDispatch {
