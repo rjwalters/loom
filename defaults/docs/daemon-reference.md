@@ -2553,6 +2553,11 @@ process:
 # Enable strictly per .loom/config.json → autonomous (no env forcing):
 ./.loom/scripts/cli/loom-daemon-start.sh --from-config
 
+# --from-config COMPOSES with an explicit flag (#4353): the named loop is
+# forced, the other is left for config to drive:
+./.loom/scripts/cli/loom-daemon-start.sh --from-config --work-finder      # force finder ON, gate config-driven
+./.loom/scripts/cli/loom-daemon-start.sh --from-config --no-health-gate   # force gate OFF, finder config-driven
+
 # Explicit-off / foreground variants:
 ./.loom/scripts/cli/loom-daemon-start.sh --no-work-finder   # force finder off (explicit; same as default)
 ./.loom/scripts/cli/loom-daemon-start.sh --no-health-gate   # force gate off (explicit; same as default)
@@ -2568,9 +2573,13 @@ process:
   and `LOOM_MAIN_HEALTH_GATE=0`, so a plain start is a **reliability daemon** that
   does **not** auto-dispatch sweeps — consistent with the ecosystem-wide opt-in /
   default-off contract. An already-exported env var always wins; `--work-finder`
-  / `--health-gate` force the respective loop on; `--from-config` leaves both
-  unset so `.loom/config.json → autonomous` drives (precedence env > config >
-  default),
+  / `--health-gate` force the respective loop on; `--from-config` alone leaves
+  both unset so `.loom/config.json → autonomous` drives (precedence env >
+  config > default). **`--from-config` composes with an explicit flag rather
+  than ignoring it (#4353)**: `--from-config --work-finder` (or
+  `--no-work-finder`/`--health-gate`/`--no-health-gate`) still FORCES that one
+  var while leaving the other loop unset for config to drive — a
+  pre-exported env var still wins over the forced flag,
 - locates the `loom-daemon` binary (`LOOM_DAEMON_BIN` → `PATH` → `target/{release,debug}`),
 - runs the **advisory** host-sleep check (`check-host-sleep.sh`, #3350) — never blocks the start,
 - **on macOS, backgrounds the daemon as a launchd LaunchAgent** in the resolved
