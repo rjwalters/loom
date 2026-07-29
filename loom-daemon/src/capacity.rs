@@ -12,10 +12,13 @@
 //!
 //! 1. **Slow down** — [`token_axis_limit`] backs the token axis off from the
 //!    raw pool size toward the count of *healthy* (`available`) accounts, read
-//!    from the rotation ranking file (`.loom/tokens/.ranking`). When every
-//!    account is exhausted the limit drops to 0 and the finder defers (never
-//!    hammers an exhausted account). A single healthy account is the throughput
-//!    floor, never a halt (operator refinement on #3902).
+//!    from the rotation ranking file (`.ranking`, resolved via
+//!    [`read_ranking`] to whichever pool directory — per-repo or shared
+//!    machine-level (#3938) — actually holds the tokens, kept in lock-step
+//!    with the writer since #4344). When every account is exhausted the limit
+//!    drops to 0 and the finder defers (never hammers an exhausted account). A
+//!    single healthy account is the throughput floor, never a halt (operator
+//!    refinement on #3902).
 //! 2. **Alert** — [`assess_pressure`] derives whether the token axis is the
 //!    binding constraint *and* work is queued behind it, and
 //!    [`CapacityAdvisory::message`] builds an operator advisory naming the
@@ -34,11 +37,14 @@
 //! # Why the ranking file (not a network probe)
 //!
 //! The daemon never performs the slow per-account rate-limit probe itself — that
-//! is `loom-tokens check`'s job, run out-of-band (cron / `probe-tokens.sh`),
-//! which writes the discrete status into `.loom/tokens/.ranking` (the
-//! format-of-record the spawn-time selector already consumes). Reading that file
-//! keeps this module a fast, non-blocking, filesystem-only read that matches the
-//! footing of [`crate::tokens::token_pool_size`] and
+//! is `loom-tokens check`'s job, run out-of-band (cron / `probe-tokens.sh` /
+//! the #4080 self-refresh), which writes the discrete status into
+//! `<resolved-pool-dir>/.ranking` (the format-of-record the spawn-time
+//! selector already consumes). [`read_ranking`] resolves the **same**
+//! directory the writer targets (#3938 per-repo-then-shared precedence,
+//! #4344) so the reader and writer can never diverge onto different files.
+//! Reading that file keeps this module a fast, non-blocking, filesystem-only
+//! read that matches the footing of [`crate::tokens::token_pool_size`] and
 //! [`crate::disk_headroom::disk_headroom_limit`].
 //!
 //! # Near-ceiling granularity
@@ -142,31 +148,53 @@ impl RankingSnapshot {
     }
 }
 
-/// Parse the rotation ranking file at `{workspace_root}/.loom/tokens/.ranking`.
+/// Parse the rotation ranking file directly at `{pool_dir}/.ranking`.
 ///
-/// The file is the pipe-delimited `name|status` format written by
-/// `loom-tokens check --ranking` (one account per line). Returns `None` when the
-/// file is absent, unreadable, or contains no parseable rows — the signal that
-/// no probe data exists, in which case callers fall back to the raw token-pool
-/// size (byte-for-byte the pre-#3902 behavior). Blank lines and malformed rows
-/// (no `|`) are skipped; a row's status is parsed via [`AccountHealth::parse`].
+/// This is the resolved-dir-aware core of [`read_ranking`] (issue #4344):
+/// `pool_dir` is already resolved (e.g. via
+/// [`crate::tokens_pool::paths::resolve_tokens_dir`]) to whichever pool —
+/// per-repo or shared machine-level (#3938) — actually holds the `*.token`
+/// files, so callers that have their own resolved directory (or want to probe
+/// a specific one directly, e.g. in tests) can bypass re-resolution.
+///
+/// The file is the pipe-delimited `name|status|5h_util` format written by
+/// `loom-tokens check --ranking` (one account per line, issue #4195), where the
+/// status is the **second** field and the trailing 5h-utilization field is
+/// optional (legacy `name|status` lines omit it). Returns `None` when the file
+/// is absent, unreadable, or contains no parseable rows — the signal that no
+/// probe data exists, in which case callers fall back to the raw token-pool size
+/// (byte-for-byte the pre-#3902 behavior). Blank lines, `#` comments, and
+/// malformed rows (no `|`, so no status field) are skipped; a row's status is
+/// parsed via [`AccountHealth::parse`].
+///
+/// Parsing goes through [`crate::tokens_pool::select::parse_ranking_line`] — the
+/// **same** triple parser the spawn-time selector uses — so this reader and the
+/// selector can never de-sync on the field layout (the #4243/#4344 drift, where
+/// this function took the *last* field as the status and mis-read every 3-field
+/// row's `5h_util` — e.g. `agent3-2amlogic|available|0.09` → `"0.09"` →
+/// [`AccountHealth::Unknown`] — pinning the token axis at 0 on a fully healthy
+/// pool). A malformed no-`|` row is still skipped here (rather than counted with
+/// an empty/unknown status) so an unparseable ranking is treated as absent, not
+/// as a genuine 0-healthy snapshot.
 #[must_use]
-pub fn read_ranking(workspace_root: &Path) -> Option<RankingSnapshot> {
-    let ranking_path = workspace_root.join(".loom").join("tokens").join(".ranking");
+pub fn read_ranking_at(pool_dir: &Path) -> Option<RankingSnapshot> {
+    let ranking_path = pool_dir.join(".ranking");
     let contents = std::fs::read_to_string(&ranking_path).ok()?;
     let mut snap = RankingSnapshot::default();
     for line in contents.lines() {
-        let line = line.trim();
-        if line.is_empty() {
+        // A row must carry a `|` (a status field). A no-`|` row is genuinely
+        // malformed and is skipped, not counted as an empty-status account —
+        // preserving the "unparseable ranking ⇒ absent, not 0-healthy"
+        // fallback (see the module doc + `read_ranking_malformed_*` tests).
+        if !line.contains('|') {
             continue;
         }
-        // `name|status` — the status is the last pipe-delimited field so a name
-        // containing a stray pipe (there are none in practice) still parses.
-        let Some((_name, status)) = line.rsplit_once('|') else {
+        let Some((_name, status, _util_5h)) = crate::tokens_pool::select::parse_ranking_line(line)
+        else {
             continue;
         };
         snap.total += 1;
-        match AccountHealth::parse(status) {
+        match AccountHealth::parse(&status) {
             AccountHealth::Available => snap.available += 1,
             AccountHealth::Exhausted => snap.exhausted += 1,
             AccountHealth::RateLimited => snap.rate_limited += 1,
@@ -179,6 +207,32 @@ pub fn read_ranking(workspace_root: &Path) -> Option<RankingSnapshot> {
     } else {
         Some(snap)
     }
+}
+
+/// Parse the rotation ranking file for `workspace_root`, resolving the
+/// effective pool directory the **same way** [`crate::tokens::token_pool_size`]
+/// and [`crate::tokens_pool::paths::resolve_tokens_dir`] do: the per-repo pool
+/// (`{workspace_root}/.loom/tokens/`) when it holds `*.token` files, else the
+/// shared machine-level pool (`~/.loom/tokens`, override
+/// `LOOM_SHARED_TOKENS_DIR`, issue #3938), else the per-repo path unchanged.
+///
+/// # Why this matters (issue #4344)
+///
+/// Before this fix, this function hardcoded the per-repo path regardless of
+/// where the pool (and the ranking the writer refreshes) actually lived. On a
+/// host where the pool resolves to the shared machine-level directory (the
+/// per-repo dir has no `*.token` files), every ranking refresh — manual or the
+/// #4080 self-refresh — landed in the shared `.ranking`, while this reader kept
+/// consulting a stale, orphaned per-repo `.ranking` left over from a prior
+/// storm. If that orphaned file had 0 `available` rows, the token axis was
+/// pinned at 0 **forever** — re-read every tick, always from the wrong file,
+/// surviving even a daemon restart (the orphaned file itself never changes).
+/// Resolving the same directory the writer targets closes that gap; the
+/// fallback semantics (absent/unparseable ranking anywhere ⇒ `None`, callers
+/// fall back to the raw pool size) are unchanged.
+#[must_use]
+pub fn read_ranking(workspace_root: &Path) -> Option<RankingSnapshot> {
+    read_ranking_at(&crate::tokens_pool::paths::resolve_tokens_dir(workspace_root))
 }
 
 // ============================================================================
@@ -479,13 +533,31 @@ pub fn format_minutes(mins: u64) -> String {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::tokens_pool::paths::SHARED_TOKENS_DIR_ENV;
+    use serial_test::serial;
     use std::fs;
     use std::path::Path;
 
+    /// Write a `.ranking` file directly into `pool_dir` (no `.loom/tokens`
+    /// nesting) — the fixture for [`read_ranking_at`], which is
+    /// resolution-agnostic.
+    fn write_ranking_at(pool_dir: &Path, body: &str) {
+        fs::create_dir_all(pool_dir).unwrap();
+        fs::write(pool_dir.join(".ranking"), body).unwrap();
+    }
+
+    /// Write a `.ranking` file at the legacy per-repo location
+    /// (`{workspace}/.loom/tokens/.ranking`) — the fixture for [`read_ranking`]
+    /// resolution tests.
     fn write_ranking(workspace: &Path, body: &str) {
-        let dir = workspace.join(".loom").join("tokens");
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join(".ranking"), body).unwrap();
+        write_ranking_at(&workspace.join(".loom").join("tokens"), body);
+    }
+
+    /// Write a `.token` file into `dir` so [`crate::tokens_pool::paths::
+    /// resolve_tokens_dir`] treats it as a populated pool.
+    fn write_token_file(dir: &Path, name: &str) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join(name), "sk-ant-oat01-fake").unwrap();
     }
 
     // ------------------------------------------------------------------
@@ -509,30 +581,30 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // read_ranking
+    // read_ranking_at (pure parsing — no directory resolution, no env)
     // ------------------------------------------------------------------
 
     #[test]
-    fn read_ranking_missing_is_none() {
+    fn read_ranking_at_missing_is_none() {
         let tmp = tempfile::tempdir().unwrap();
-        assert_eq!(read_ranking(tmp.path()), None);
+        assert_eq!(read_ranking_at(tmp.path()), None);
     }
 
     #[test]
-    fn read_ranking_empty_is_none() {
+    fn read_ranking_at_empty_is_none() {
         let tmp = tempfile::tempdir().unwrap();
-        write_ranking(tmp.path(), "\n  \n");
-        assert_eq!(read_ranking(tmp.path()), None);
+        write_ranking_at(tmp.path(), "\n  \n");
+        assert_eq!(read_ranking_at(tmp.path()), None);
     }
 
     #[test]
-    fn read_ranking_counts_statuses() {
+    fn read_ranking_at_counts_statuses() {
         let tmp = tempfile::tempdir().unwrap();
-        write_ranking(
+        write_ranking_at(
             tmp.path(),
             "a|available\nb|available\nc|exhausted\nd|rate_limited\ne|blocked\nf|weird\n",
         );
-        let snap = read_ranking(tmp.path()).unwrap();
+        let snap = read_ranking_at(tmp.path()).unwrap();
         assert_eq!(snap.total, 6);
         assert_eq!(snap.available, 2);
         assert_eq!(snap.exhausted, 1);
@@ -543,13 +615,313 @@ mod tests {
     }
 
     #[test]
-    fn read_ranking_skips_malformed_rows() {
+    fn read_ranking_at_skips_malformed_rows() {
         let tmp = tempfile::tempdir().unwrap();
-        write_ranking(tmp.path(), "a|available\nno-pipe-here\n\nb|exhausted\n");
-        let snap = read_ranking(tmp.path()).unwrap();
+        write_ranking_at(tmp.path(), "a|available\nno-pipe-here\n\nb|exhausted\n");
+        let snap = read_ranking_at(tmp.path()).unwrap();
         assert_eq!(snap.total, 2, "the pipe-less row is skipped");
         assert_eq!(snap.available, 1);
         assert_eq!(snap.exhausted, 1);
+    }
+
+    #[test]
+    fn read_ranking_at_parses_three_field_format() {
+        // #4243/#4344 primary bug: writers emit `name|status|5h_util` whenever
+        // 5h utilization is known (which on the live host is always). The
+        // status is the SECOND field — the reader must NOT take the trailing
+        // util as the status. This is the exact live-host layout from the
+        // #4344 incident: 7 three-field rows, 6 available.
+        let tmp = tempfile::tempdir().unwrap();
+        write_ranking_at(
+            tmp.path(),
+            "agent3-2amlogic|available|0.09\n\
+             robb-2amlogic|available|0.18\n\
+             rjwalters-gmail|available|0.22\n\
+             agent2-2amlogic|available|0.31\n\
+             agent4-2amlogic|available|0.05\n\
+             agent5-2amlogic|available|0.44\n\
+             old-account|exhausted|0.00\n",
+        );
+        let snap = read_ranking_at(tmp.path()).unwrap();
+        assert_eq!(snap.total, 7);
+        assert_eq!(snap.available, 6, "3-field rows: the status is the SECOND field, not the last");
+        assert_eq!(snap.exhausted, 1);
+        assert_eq!(
+            snap.unknown, 0,
+            "the 5h_util field must never be parsed as a status word (the #4243 drift)"
+        );
+    }
+
+    #[test]
+    fn read_ranking_at_curator_fixture_three_field() {
+        // The exact fixture the judge required to pass:
+        //   total=3, available=2, exhausted=1.
+        let tmp = tempfile::tempdir().unwrap();
+        write_ranking_at(
+            tmp.path(),
+            "agent3-2amlogic|available|0.09\n\
+             robb-2amlogic|available|0.18\n\
+             rjwalters-gmail|exhausted|0.00\n",
+        );
+        let snap = read_ranking_at(tmp.path()).unwrap();
+        assert_eq!(snap.total, 3);
+        assert_eq!(snap.available, 2);
+        assert_eq!(snap.exhausted, 1);
+    }
+
+    #[test]
+    fn read_ranking_at_mixed_two_and_three_field() {
+        // A file mixing legacy 2-field lines and new 3-field lines — the state
+        // during a rolling format migration — must parse both correctly.
+        let tmp = tempfile::tempdir().unwrap();
+        write_ranking_at(
+            tmp.path(),
+            "legacy-a|available\n\
+             new-b|available|0.12\n\
+             legacy-c|exhausted\n\
+             new-d|blocked|0.00\n\
+             new-e|rate_limited|0.88\n",
+        );
+        let snap = read_ranking_at(tmp.path()).unwrap();
+        assert_eq!(snap.total, 5);
+        assert_eq!(snap.available, 2);
+        assert_eq!(snap.exhausted, 1);
+        assert_eq!(snap.blocked, 1);
+        assert_eq!(snap.rate_limited, 1);
+        assert_eq!(snap.unknown, 0);
+    }
+
+    #[test]
+    fn read_ranking_at_comment_lines_are_skipped() {
+        // `#` comments (stripped by the shared selector parser) are not rows.
+        let tmp = tempfile::tempdir().unwrap();
+        write_ranking_at(
+            tmp.path(),
+            "# probed 2026-07-29\na|available|0.10\nb|exhausted # near ceiling\n",
+        );
+        let snap = read_ranking_at(tmp.path()).unwrap();
+        assert_eq!(snap.total, 2, "the leading comment line is not a row");
+        assert_eq!(snap.available, 1);
+        assert_eq!(snap.exhausted, 1);
+    }
+
+    #[test]
+    fn ranking_format_drift_conformance_writer_reader_selector_agree() {
+        // Format-drift guard (#4344 AC 3): the single test that would have
+        // caught #4243's partial migration. It binds THREE parties to the same
+        // fixture lines and fails if any one drifts:
+        //   (1) the WRITER — `tokens_pool::check::ranking_line` (what is
+        //       actually written to `.ranking`),
+        //   (2) capacity's READER — `read_ranking_at` (this module),
+        //   (3) the spawn-time SELECTOR's parser —
+        //       `tokens_pool::select::parse_ranking_line`.
+        // If a future format change moves the status field, at least one of
+        // these assertions breaks, so no reader can silently miss the
+        // migration again.
+        use crate::tokens_pool::check::ranking_line;
+        use crate::tokens_pool::select::parse_ranking_line;
+
+        // (name, status, util) fixtures spanning every health class plus the
+        // optional / absent util field.
+        let accounts: [(&str, &str, Option<f64>); 5] = [
+            ("agent3-2amlogic", "available", Some(0.09)),
+            ("robb-2amlogic", "available", None), // legacy 2-field line
+            ("rjwalters-gmail", "exhausted", Some(0.00)),
+            ("agent2", "rate_limited", Some(0.88)),
+            ("agent4", "blocked", None),
+        ];
+
+        // Render the file exactly as the writer would.
+        let body: String = accounts
+            .iter()
+            .map(|(name, status, util)| ranking_line(name, status, *util) + "\n")
+            .collect();
+
+        // (2) vs (3): the selector's parser must recover the same name/status
+        // the writer put in, from the writer's own output.
+        for ((name, status, util), line) in accounts.iter().zip(body.lines()) {
+            let (pname, pstatus, putil) =
+                parse_ranking_line(line).expect("writer output must be parseable by the selector");
+            assert_eq!(&pname, name);
+            assert_eq!(
+                &pstatus, status,
+                "selector parser must recover the writer's status field, not the util"
+            );
+            match util {
+                Some(u) => {
+                    let p = putil.expect("a 3-field line must yield a util");
+                    assert_eq!(format!("{p:.2}"), format!("{u:.2}"));
+                }
+                None => assert_eq!(putil, None, "a 2-field line must yield no util"),
+            }
+        }
+
+        // (1) → (2): capacity's reader must classify that same file into the
+        // writer's intended statuses — 2 available, 1 exhausted, 1
+        // rate_limited, 1 blocked, and crucially 0 unknown.
+        let tmp = tempfile::tempdir().unwrap();
+        write_ranking_at(tmp.path(), &body);
+        let snap = read_ranking_at(tmp.path()).unwrap();
+        assert_eq!(snap.total, 5);
+        assert_eq!(snap.available, 2);
+        assert_eq!(snap.exhausted, 1);
+        assert_eq!(snap.rate_limited, 1);
+        assert_eq!(snap.blocked, 1);
+        assert_eq!(
+            snap.unknown, 0,
+            "no writer-produced line may parse to Unknown — that is the #4243 drift signature"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // read_ranking (resolved-dir-aware) — issue #4344
+    //
+    // These tests exercise directory *resolution*, which reads
+    // `LOOM_SHARED_TOKENS_DIR` (a process-global env var). Serialized against
+    // every other `#[serial]` test in the crate (unkeyed group, matching
+    // `tokens_pool::paths`' own tests) and always pinned to an explicit value
+    // — never left ambient — so a real `~/.loom/tokens` on the host running
+    // the test suite can never leak in.
+    // ------------------------------------------------------------------
+
+    #[test]
+    #[serial]
+    fn read_ranking_per_repo_pool_unchanged() {
+        // Per-repo tokens + per-repo ranking: resolution must still pick the
+        // per-repo pool, matching pre-#4344 behavior byte-for-byte.
+        std::env::set_var(SHARED_TOKENS_DIR_ENV, "");
+        let repo = tempfile::tempdir().unwrap();
+        write_token_file(&repo.path().join(".loom").join("tokens"), "a.token");
+        write_ranking(repo.path(), "a|available\nb|exhausted\n");
+
+        let snap = read_ranking(repo.path()).unwrap();
+        assert_eq!(snap.total, 2);
+        assert_eq!(snap.available, 1);
+        std::env::remove_var(SHARED_TOKENS_DIR_ENV);
+    }
+
+    #[test]
+    #[serial]
+    fn read_ranking_resolves_shared_pool_over_stale_per_repo_ranking() {
+        // The exact #4344 regression fixture: a shared-pool layout (per-repo
+        // dir has NO `*.token` files, so it never wins resolution) with a
+        // stale, orphaned per-repo `.ranking` reporting 0 healthy, and a
+        // fresh shared `.ranking` reporting N healthy. Reading via the
+        // per-repo path alone (pre-#4344) would return the stale 0-healthy
+        // snapshot forever; resolution must instead follow the pool the
+        // refresher actually writes to.
+        let repo = tempfile::tempdir().unwrap();
+        let shared = tempfile::tempdir().unwrap();
+        write_token_file(shared.path(), "s.token");
+        write_ranking_at(shared.path(), "s1|available\ns2|available\ns3|available\n");
+        // Orphaned per-repo ranking: 0 healthy, would starve dispatch forever
+        // if it were the one actually consulted.
+        write_ranking(repo.path(), "orphan|exhausted\n");
+        std::env::set_var(SHARED_TOKENS_DIR_ENV, shared.path().to_str().unwrap());
+
+        let snap = read_ranking(repo.path()).unwrap();
+        assert_eq!(
+            snap.available, 3,
+            "must read the shared pool's fresh ranking, not the stale per-repo one"
+        );
+        assert_eq!(snap.total, 3);
+        assert_eq!(token_axis_limit(repo.path(), 3), 3);
+        std::env::remove_var(SHARED_TOKENS_DIR_ENV);
+    }
+
+    #[test]
+    #[serial]
+    fn dispatch_resumes_after_ranking_refresh_without_restart() {
+        // Filed AC 4 (regression test), sharpened by the curator analysis:
+        // simulates the exact incident timeline — the daemon "starts" (first
+        // tick) with a 0-healthy ranking present, then the ranking file is
+        // refreshed to N-healthy minutes later (no daemon restart in
+        // between). Each `token_axis_limit` call below stands in for one
+        // work-finder tick — there is no in-memory cache to invalidate, so
+        // the very next tick after the refresh must observe the new count.
+        std::env::set_var(SHARED_TOKENS_DIR_ENV, "");
+        let repo = tempfile::tempdir().unwrap();
+        let per_repo = repo.path().join(".loom").join("tokens");
+        write_token_file(&per_repo, "a.token");
+        write_token_file(&per_repo, "b.token");
+        write_token_file(&per_repo, "c.token");
+
+        // "Startup" tick: a storm-era ranking present with 0 healthy accounts.
+        write_ranking_at(&per_repo, "a|exhausted\nb|exhausted\nc|blocked\n");
+        assert_eq!(
+            token_axis_limit(repo.path(), 3),
+            0,
+            "tick 1 (at 'startup'): dispatch correctly sees 0 healthy — matches the incident's \
+             initial wedge"
+        );
+
+        // Minutes later, the ranking is refreshed to 2 healthy — no restart,
+        // just an on-disk file change (mirrors a manual `loom-tokens check
+        // --ranking` or the #4080 self-refresh).
+        write_ranking_at(&per_repo, "a|available\nb|available\nc|exhausted\n");
+        assert_eq!(
+            token_axis_limit(repo.path(), 3),
+            2,
+            "tick 2 (next tick after the refresh): dispatch resumes at the new healthy count \
+             within one tick, with no restart"
+        );
+        std::env::remove_var(SHARED_TOKENS_DIR_ENV);
+    }
+
+    #[test]
+    #[serial]
+    fn read_ranking_absent_everywhere_falls_back_to_none() {
+        // Neither pool holds `*.token` files nor a `.ranking` — resolution
+        // lands on the per-repo path (resolve_tokens_dir's own fallback), and
+        // no ranking exists there either. Preserves the absent-ranking
+        // fallback policy: callers see `None` and fall back to raw pool size.
+        std::env::set_var(SHARED_TOKENS_DIR_ENV, "");
+        let repo = tempfile::tempdir().unwrap();
+        assert_eq!(read_ranking(repo.path()), None);
+        assert_eq!(
+            token_axis_limit(repo.path(), 5),
+            5,
+            "no ranking ⇒ raw pool size (pre-#3902 fallback)"
+        );
+        std::env::remove_var(SHARED_TOKENS_DIR_ENV);
+    }
+
+    #[test]
+    #[serial]
+    fn read_ranking_both_pools_have_ranking_per_repo_wins() {
+        // Both the per-repo and shared pools hold token files (and a
+        // ranking); resolution must prefer the per-repo pool, matching
+        // `resolve_tokens_dir`'s precedence.
+        let repo = tempfile::tempdir().unwrap();
+        let shared = tempfile::tempdir().unwrap();
+        let per_repo = repo.path().join(".loom").join("tokens");
+        write_token_file(&per_repo, "a.token");
+        write_ranking_at(&per_repo, "a|available\n");
+        write_token_file(shared.path(), "s.token");
+        write_ranking_at(shared.path(), "s1|available\ns2|available\ns3|available\n");
+        std::env::set_var(SHARED_TOKENS_DIR_ENV, shared.path().to_str().unwrap());
+
+        let snap = read_ranking(repo.path()).unwrap();
+        assert_eq!(
+            snap.total, 1,
+            "per-repo pool wins when it has tokens, even if shared also has some"
+        );
+        assert_eq!(snap.available, 1);
+        std::env::remove_var(SHARED_TOKENS_DIR_ENV);
+    }
+
+    #[test]
+    #[serial]
+    fn read_ranking_malformed_ranking_is_absent_not_zero() {
+        // A ranking file with no parseable rows is treated as absent (`None`)
+        // rather than a genuine 0-healthy snapshot, so token_axis_limit falls
+        // back to the raw pool size instead of wrongly pinning to 0.
+        std::env::set_var(SHARED_TOKENS_DIR_ENV, "");
+        let repo = tempfile::tempdir().unwrap();
+        write_ranking(repo.path(), "\n  \nno-pipe-here\n");
+        assert_eq!(read_ranking(repo.path()), None);
+        assert_eq!(token_axis_limit(repo.path(), 4), 4);
+        std::env::remove_var(SHARED_TOKENS_DIR_ENV);
     }
 
     // ------------------------------------------------------------------
@@ -557,25 +929,41 @@ mod tests {
     // ------------------------------------------------------------------
 
     #[test]
+    #[serial]
     fn token_axis_limit_uses_available_when_ranking_present() {
+        std::env::set_var(SHARED_TOKENS_DIR_ENV, "");
         let tmp = tempfile::tempdir().unwrap();
-        write_ranking(tmp.path(), "a|available\nb|available\nc|exhausted\n");
+        let per_repo = tmp.path().join(".loom").join("tokens");
+        write_token_file(&per_repo, "a.token");
+        write_token_file(&per_repo, "b.token");
+        write_token_file(&per_repo, "c.token");
+        write_ranking_at(&per_repo, "a|available\nb|available\nc|exhausted\n");
         // 3 token files present, but only 2 available → limit 2.
         assert_eq!(token_axis_limit(tmp.path(), 3), 2);
+        std::env::remove_var(SHARED_TOKENS_DIR_ENV);
     }
 
     #[test]
+    #[serial]
     fn token_axis_limit_falls_back_to_pool_when_no_ranking() {
+        std::env::set_var(SHARED_TOKENS_DIR_ENV, "");
         let tmp = tempfile::tempdir().unwrap();
         // No ranking file → fall back to raw pool size (pre-#3902 behavior).
         assert_eq!(token_axis_limit(tmp.path(), 5), 5);
+        std::env::remove_var(SHARED_TOKENS_DIR_ENV);
     }
 
     #[test]
+    #[serial]
     fn token_axis_limit_zero_when_all_exhausted() {
+        std::env::set_var(SHARED_TOKENS_DIR_ENV, "");
         let tmp = tempfile::tempdir().unwrap();
-        write_ranking(tmp.path(), "a|exhausted\nb|blocked\n");
+        let per_repo = tmp.path().join(".loom").join("tokens");
+        write_token_file(&per_repo, "a.token");
+        write_token_file(&per_repo, "b.token");
+        write_ranking_at(&per_repo, "a|exhausted\nb|blocked\n");
         assert_eq!(token_axis_limit(tmp.path(), 2), 0, "never dispatch to exhausted");
+        std::env::remove_var(SHARED_TOKENS_DIR_ENV);
     }
 
     // ------------------------------------------------------------------

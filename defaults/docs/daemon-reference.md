@@ -1383,7 +1383,7 @@ daemon restart:
 
 | Input | Source | Bound it enforces |
 |-------|--------|-------------------|
-| **healthy-token count** | `available` accounts in `{workspace}/.loom/tokens/.ranking` (`capacity::token_axis_limit`), falling back to the `*.token` count (`tokens::token_pool_size`) when no ranking exists | the count of accounts safe to dispatch to — never dispatch to an exhausted/blocked one (#3902) |
+| **healthy-token count** | `available` accounts in `.ranking` in the pool directory `tokens_pool::paths::resolve_tokens_dir` resolves for the workspace — per-repo `{workspace}/.loom/tokens/` when it holds `*.token` files, else the shared machine-level pool (#3938) (`capacity::read_ranking` / `token_axis_limit`, unified with the writer in #4344 — pre-#4344 this hardcoded the per-repo path even on a shared-pool host, which could pin the dispatch cap at 0 against an orphaned per-repo `.ranking` indefinitely), falling back to the `*.token` count (`tokens::token_pool_size`) when no ranking exists | the count of accounts safe to dispatch to — never dispatch to an exhausted/blocked one (#3902) |
 | **per-token concurrency** | `LOOM_PER_TOKEN_CONCURRENCY` / `autonomous.perTokenConcurrency`, default **2** (#3947) | how many concurrent sweeps to allow **per healthy account**. A plan limit is a utilization-window token bucket, not a session count, so one healthy account can run several concurrent sessions. Before #3947 the implicit factor was `1` (one sweep per account), which collapsed the whole fleet to cap 1 when 6/7 accounts were at their weekly ceiling even though the single healthy account had ample session-window headroom |
 | **disk headroom** | `floor(free_gb / LOOM_PER_WORKTREE_GB)` on the worktree-root volume (`disk_headroom::disk_headroom_limit`, a Rust port of `disk-headroom.sh` that shells to `df -Pk`) | never provision more worktrees than the scratch volume can hold |
 | **cpu headroom** (#3978, measured-idle signal #4031) | `max(1, floor((logical_cpus × LOOM_CPU_UTILIZATION_TARGET − consumed_cores) / LOOM_EST_CORES_PER_SWEEP))`, where `consumed_cores = logical_cpus × (1 − idle_fraction)` from the measured idle fraction (loadavg fallback) (`cpu_headroom::cpu_headroom_limit`) | never start more concurrent sweeps than the host's CPU headroom can currently absorb |
@@ -1581,6 +1581,30 @@ diagnosis line; at or above the cap it names the binding term as before. The
 `= min(…)` breakdown line is untouched — those genuinely are ceilings. The JSON
 status carries the same `capacity_bound` boolean so scripted consumers aren't
 misled at low occupancy either.
+
+**Honest headline when the daemon's own read disagrees with a fresh probe
+(#4344).** `resolve_capacity` prefers a fresh client-side `loom-tokens check
+--json` probe over the daemon's own ranking read when one succeeds — useful for
+showing current numbers, but that probe's cap is **not** what the running
+daemon actually used to gate dispatch this tick. The pretty-printed `Dynamic
+concurrency cap:` headline and the `= min(healthy N × per-token M …)`
+breakdown always name the daemon's own numbers (`report.dynamic_cap` /
+`report.capacity.token_axis_limit`) — the probe's cap is shown only as a
+labeled secondary `fresh probe suggests: …` line when it differs. The
+`capacity_bound` gate above is likewise computed against the daemon's own cap,
+not the probe's, so "not capacity-bound" can never print while the daemon's
+real (lower) cap is already saturated. When the daemon's own ranking read
+shows **0 healthy accounts** while the probe (or raw pool) disagrees — the
+#4344 incident: dispatch pinned at a token term of `0 × per-token = 0` for
+~40 minutes because the ranking directory it read had diverged from the one
+`loom-tokens check --ranking` / the #4080 self-refresher actually wrote — the
+status view promotes this from the old small-print `note: daemon dispatch cap
+still uses a stale .ranking (...)` line to a headline `⚠ DISPATCH IS
+TOKEN-STARVED: …` line and suppresses "the limiter is work availability"
+underneath it, since the real limiter is unambiguously the token term. The
+root fix for the divergence itself is unifying which `.ranking` file
+[`capacity::read_ranking`] consults — see the healthy-token-count row of the
+input table above.
 
 **Session-limit fault handling (#3947).** Stacking can occasionally trip a
 **concurrent-session-limit** fault on a token (the account is healthy but cannot

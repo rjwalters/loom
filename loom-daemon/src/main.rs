@@ -3851,17 +3851,36 @@ fn print_status_human(
     let rc = resolve_capacity(report, token_usage);
 
     let factor = report.per_token_concurrency.max(1);
-    println!("\nDynamic concurrency cap: {}", rc.effective_cap);
+    // #4344: `rc` prefers a fresh client-side probe when one succeeded, which
+    // can legitimately show a *different* (usually fresher) number than what
+    // the running daemon actually used for its own dispatch decision this
+    // tick. `report.dynamic_cap` / `report.capacity.token_axis_limit` are that
+    // daemon-side truth — the number dispatch decisions are actually gated
+    // on — so the headline always names the daemon's own cap; the probe's
+    // number is shown as a labeled secondary line only when it disagrees.
+    let dispatch_cap = report.dynamic_cap;
+    let dispatch_token_axis = report.capacity.token_axis_limit;
+    println!("\nDynamic concurrency cap: {dispatch_cap}  (the number dispatch uses)");
     println!(
         "  = min(healthy {} × per-token {} = {}, disk headroom {}, cpu headroom {}, \
          configured max {})",
-        rc.token_axis_limit,
+        dispatch_token_axis,
         factor,
-        rc.token_axis_limit.saturating_mul(factor),
+        dispatch_token_axis.saturating_mul(factor),
         report.disk_headroom,
         report.cpu_headroom,
         report.configured_max
     );
+    if rc.source == "probe" && rc.effective_cap != dispatch_cap {
+        println!(
+            "  fresh probe suggests: {} (healthy {} × per-token {} = {}) — not yet reflected in \
+             dispatch; if this persists, refresh with `loom-tokens check --ranking`.",
+            rc.effective_cap,
+            rc.token_axis_limit,
+            factor,
+            rc.token_axis_limit.saturating_mul(factor)
+        );
+    }
     // CPU headroom detail (#3978 AC4; measured-idle signal #4031). The signal
     // chain is measured idle → loadavg → static capacity, so the line names
     // which signal actually fed the term. `logical_cpus == 0` means an older
@@ -3908,7 +3927,22 @@ fn print_status_human(
     // minimum of several ceilings, but a ceiling only *binds* once in-flight
     // occupancy reaches it. Below the cap the limiter is work availability, not
     // any resource term — so the token-bound diagnosis below is gated on this.
-    let capacity_bound = report.in_flight.len() >= rc.effective_cap;
+    // #4344: this must be checked against the daemon's *actual* dispatch cap
+    // (`dispatch_cap`), not `rc.effective_cap` — the latter is recomputed from
+    // a fresh client-side probe when one succeeds and can disagree with what
+    // the daemon itself used, which previously let "not capacity-bound" print
+    // even while the daemon's real (lower) cap was already saturated.
+    let capacity_bound = report.in_flight.len() >= dispatch_cap;
+    // #4344: the daemon's own dispatch decision reads 0 healthy accounts while
+    // a fresher probe (or the raw pool) shows real capacity — the exact
+    // wedge this issue exists for. When this holds, promote the diagnosis to
+    // the headline and suppress the misleading "limiter is work availability"
+    // line below (the limiter is unmistakably the token term: `0 × per-token
+    // = 0`).
+    let dispatch_starved_but_disagrees = report.capacity.ranking_present
+        && report.capacity.healthy_accounts == 0
+        && rc.ranking_present
+        && rc.healthy > 0;
     if rc.ranking_present {
         let src = if rc.source == "probe" {
             "live probe: loom-tokens check --json"
@@ -3919,45 +3953,71 @@ fn print_status_human(
             "  {}/{} accounts healthy, {} exhausted/near-ceiling ({src})",
             rc.healthy, rc.total, rc.exhausted
         );
-        // When a fresh probe disagrees with the daemon's ranking-based cap, the
-        // ranking is stale — the daemon may still be dispatching against the old
-        // (higher) count. Surface it so the operator re-probes (#3936).
-        if rc.source == "probe"
+        if dispatch_starved_but_disagrees {
+            // Headline promotion (#4344, was a small-print "note" pre-fix):
+            // the daemon's own dispatch decision is starved at 0 healthy
+            // accounts while the number above disagrees — dispatch will not
+            // resume until the ranking the daemon actually reads is fresh.
+            let pool_display = report
+                .token_pool_dir
+                .as_ref()
+                .map_or_else(|| "(unknown pool dir)".to_string(), |d| d.display().to_string());
+            println!(
+                "  \u{26a0} DISPATCH IS TOKEN-STARVED: the daemon's own ranking read shows \
+                 0/{} healthy (dispatch cap {dispatch_cap}), disagreeing with the {} healthy \
+                 shown above from {pool_display}. The token term is the limiter — refresh the \
+                 ranking with `loom-tokens check --ranking` (or wait for the next self-refresh).",
+                report.capacity.total_accounts, rc.healthy,
+            );
+        } else if rc.source == "probe"
             && report.capacity.ranking_present
             && report.capacity.healthy_accounts != rc.healthy
         {
+            // Non-zero disagreement (the daemon still has *some* healthy
+            // accounts, just a different count than the fresh probe) stays a
+            // small-print note — dispatch is not silently starved here, just
+            // running on slightly stale data.
             println!(
                 "  note: daemon dispatch cap still uses a stale .ranking ({} healthy); \
                  refresh it with `loom-tokens check --ranking`.",
                 report.capacity.healthy_accounts
             );
         }
-        if !capacity_bound {
-            // In-flight is below the cap: nothing is binding. Naming tokens (or
-            // any resource) as "the bottleneck" here is the #4031 defect — at,
-            // say, 1 in-flight against a cap of 7 the limiter is simply how much
-            // ready work exists. Suppress the token-bound diagnosis.
-            println!(
-                "  not capacity-bound ({} in flight, cap {} — the limiter is work availability, \
-                 not tokens/disk/CPU)",
-                report.in_flight.len(),
-                rc.effective_cap
-            );
-        } else if rc.token_bound {
-            if rc.healthy == 0 {
+        // #4344: when the daemon's own dispatch decision is unambiguously
+        // token-starved (see above), never print "the limiter is work
+        // availability" — the headline diagnosis already named the real
+        // limiter, and running the generic capacity_bound/token_bound chain
+        // underneath it would contradict it (e.g. `capacity_bound` is
+        // trivially true against a dispatch cap of 0).
+        if !dispatch_starved_but_disagrees {
+            if !capacity_bound {
+                // In-flight is below the cap: nothing is binding. Naming tokens
+                // (or any resource) as "the bottleneck" here is the #4031
+                // defect — at, say, 1 in-flight against a cap of 7 the limiter
+                // is simply how much ready work exists. Suppress the
+                // token-bound diagnosis.
                 println!(
-                    "  token-bound: NO healthy accounts — new dispatch deferred until capacity \
-                     returns. Add accounts (~/.claude-monitor/accounts.env + `loom-tokens \
-                     bootstrap`) or buy API credits, then `loom-tokens check --ranking`."
+                    "  not capacity-bound ({} in flight, cap {dispatch_cap} — the limiter is \
+                     work availability, not tokens/disk/CPU)",
+                    report.in_flight.len(),
                 );
+            } else if rc.token_bound {
+                if rc.healthy == 0 {
+                    println!(
+                        "  token-bound: NO healthy accounts — new dispatch deferred until \
+                         capacity returns. Add accounts (~/.claude-monitor/accounts.env + \
+                         `loom-tokens bootstrap`) or buy API credits, then `loom-tokens check \
+                         --ranking`."
+                    );
+                } else {
+                    println!(
+                        "  token-bound: tokens are the binding constraint on throughput. Add \
+                         accounts or API credits to dispatch more concurrently."
+                    );
+                }
             } else {
-                println!(
-                    "  token-bound: tokens are the binding constraint on throughput. Add accounts \
-                     or API credits to dispatch more concurrently."
-                );
+                println!("  not token-bound (tokens are not the current bottleneck)");
             }
-        } else {
-            println!("  not token-bound (tokens are not the current bottleneck)");
         }
     } else {
         println!(
@@ -3967,10 +4027,9 @@ fn print_status_human(
         );
         if !capacity_bound {
             println!(
-                "  not capacity-bound ({} in flight, cap {} — the limiter is work availability, \
-                 not tokens/disk/CPU)",
+                "  not capacity-bound ({} in flight, cap {dispatch_cap} — the limiter is work \
+                 availability, not tokens/disk/CPU)",
                 report.in_flight.len(),
-                rc.effective_cap
             );
         }
     }

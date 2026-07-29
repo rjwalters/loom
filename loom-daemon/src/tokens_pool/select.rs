@@ -140,7 +140,38 @@ fn parse_util(field: &str) -> Option<f64> {
     field.parse::<f64>().ok()
 }
 
-/// Yield `(name, status, util_5h)` triples from the ranking file. Format:
+/// Parse a single `.ranking` line into a `(name, status, util_5h)` triple.
+///
+/// This is the **shared** triple parser for the `name|status|5h_util` format
+/// (issue #4195): `status` is the *second* pipe-delimited field and the third
+/// (5h utilization) is optional, so a legacy `name|status` line yields
+/// `util_5h = None` (backward compatible). `#` comments are stripped; a
+/// blank/comment-only line, or one whose name is empty, yields `None`.
+///
+/// Both the selector ([`read_ranking`]) and the daemon's capacity reader
+/// ([`crate::capacity::read_ranking_at`]) consume the ranking through this one
+/// function so the two readers can never de-sync on field positions again —
+/// the #4243/#4344 drift where capacity treated the *last* field as the status
+/// and mis-read every 3-field row's `5h_util` as the status word. A
+/// format-drift conformance test (`capacity::tests`) pins them together.
+#[must_use]
+pub(crate) fn parse_ranking_line(line: &str) -> Option<(String, String, Option<f64>)> {
+    let stripped = strip_comment(line);
+    if stripped.is_empty() {
+        return None;
+    }
+    let mut parts = stripped.splitn(3, '|');
+    let name = parts.next().unwrap_or("").trim().to_string();
+    let status = parts.next().unwrap_or("").trim().to_string();
+    let util = parts.next().and_then(parse_util);
+    if name.is_empty() {
+        return None;
+    }
+    Some((name, status, util))
+}
+
+/// Yield `(name, status, util_5h)` triples from the ranking file, one per
+/// parseable line via the shared [`parse_ranking_line`] parser. Format:
 /// `name|status|5h_util` per line (issue #4195); the third field is optional,
 /// so a legacy `name|status` line yields `util_5h = None` (backward
 /// compatible). Malformed/empty lines are skipped; `status` defaults to `""`.
@@ -148,21 +179,7 @@ fn read_ranking(ranking_file: &Path) -> Vec<(String, String, Option<f64>)> {
     let Ok(text) = std::fs::read_to_string(ranking_file) else {
         return Vec::new();
     };
-    let mut out = Vec::new();
-    for raw in text.lines() {
-        let stripped = strip_comment(raw);
-        if stripped.is_empty() {
-            continue;
-        }
-        let mut parts = stripped.splitn(3, '|');
-        let name = parts.next().unwrap_or("").trim().to_string();
-        let status = parts.next().unwrap_or("").trim().to_string();
-        let util = parts.next().and_then(parse_util);
-        if !name.is_empty() {
-            out.push((name, status, util));
-        }
-    }
-    out
+    text.lines().filter_map(parse_ranking_line).collect()
 }
 
 fn read_allowlist_lines(allowlist_file: &Path) -> Vec<String> {

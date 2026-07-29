@@ -1355,6 +1355,14 @@ where
         // move (e.g. the token axis jumping from a batch of account resets)
         // without a steady-state stream of identical lines every interval.
         let mut was_max_concurrent: Option<usize> = None;
+        // Healthy-account transition state (#4344): log the count of healthy
+        // (`available`) token accounts once when it *changes* tick-to-tick —
+        // never every tick — so an operator sees the token axis move (a batch
+        // of accounts resetting from `exhausted`, or the whole pool going
+        // token-starved) without a steady-state stream. Distinct from the cap
+        // line: the healthy count can change while the cap does not (another
+        // axis binds), and vice versa.
+        let mut was_healthy_tokens: Option<usize> = None;
         loop {
             ticker.tick().await;
             // Reactive main-health backstop (Phase C, #3812): skip all dispatch
@@ -1383,6 +1391,7 @@ where
             let pool_size = token_pool_size(&workspace_root);
             let ranking = capacity::read_ranking(&workspace_root);
             let token_limit = ranking.as_ref().map_or(pool_size, |r| r.available);
+            log_healthy_token_transition(&mut was_healthy_tokens, token_limit, ranking.as_ref());
             let disk = disk_headroom_limit(&workspace_root);
             // CPU headroom (#3978; measured-idle signal #4031): the term the
             // pre-#3978 formula lacked. `cpu_headroom_limit()` refreshes the
@@ -1564,6 +1573,9 @@ pub fn spawn_multi_work_finder_task(
         // Axis-visibility state (#4234) — see the single-workspace loop above
         // for the full rationale.
         let mut was_max_concurrent: Option<usize> = None;
+        // Healthy-account transition state (#4344) — see the single-workspace
+        // loop above for the full rationale.
+        let mut was_healthy_tokens: Option<usize> = None;
         // Missing-root hygiene (#4326): tracks which registered roots are
         // currently missing so `filter_missing_roots` logs a warning once per
         // transition rather than once per tick.
@@ -1582,6 +1594,7 @@ pub fn spawn_multi_work_finder_task(
             let pool_size = token_pool_size(&fallback_root);
             let ranking = capacity::read_ranking(&fallback_root);
             let token_limit = ranking.as_ref().map_or(pool_size, |r| r.available);
+            log_healthy_token_transition(&mut was_healthy_tokens, token_limit, ranking.as_ref());
             let disk = disk_headroom_limit(&fallback_root);
             // CPU headroom (#3978; measured-idle signal #4031) — also a
             // machine-level resource, probed once per tick and shared across
@@ -1771,6 +1784,43 @@ pub fn spawn_multi_work_finder_task(
             }
         }
     })
+}
+
+/// Log the count of healthy (`available`) token accounts once, on a **state
+/// change** — never every tick (#4344 AC).
+///
+/// `prev` is the last logged healthy count (carried across ticks); it is
+/// updated in place. The very first observation seeds `prev` silently (no
+/// startup line); every subsequent change logs a single `info!` edge naming the
+/// old → new healthy count and the ranking total, so an operator can see the
+/// token axis move — an account batch resetting, or the pool going
+/// token-starved (`… -> 0 …`) — without a steady-state stream. Mirrors the
+/// state-change-dedup discipline the cap line (`was_max_concurrent`) and the
+/// capacity advisory (`was_pressured`) already use.
+fn log_healthy_token_transition(
+    prev: &mut Option<usize>,
+    healthy: usize,
+    ranking: Option<&capacity::RankingSnapshot>,
+) {
+    if *prev == Some(healthy) {
+        return;
+    }
+    if let Some(old) = *prev {
+        let total = ranking
+            .map_or_else(|| "n/a (no ranking; raw pool)".to_string(), |r| r.total.to_string());
+        if healthy == 0 {
+            log::warn!(
+                "work_finder: healthy token accounts {old} -> 0 (of {total}) — dispatch is \
+                 token-starved until an account resets or is added (`loom-tokens check --ranking`)"
+            );
+        } else {
+            log::info!(
+                "work_finder: healthy token accounts {old} -> {healthy} (of {total}) — \
+                 dynamic-cap token axis follows"
+            );
+        }
+    }
+    *prev = Some(healthy);
 }
 
 /// Emit the add-capacity advisory / recovery on a token-pressure **state
@@ -2083,6 +2133,48 @@ pub use forge::{GhWorkSource, RegistryDispatcher};
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    // ===================================================================
+    // Healthy-account transition tracking (#4344)
+    // ===================================================================
+
+    fn snap(total: usize, available: usize) -> capacity::RankingSnapshot {
+        capacity::RankingSnapshot {
+            total,
+            available,
+            exhausted: total - available,
+            ..capacity::RankingSnapshot::default()
+        }
+    }
+
+    #[test]
+    fn healthy_token_transition_dedups_by_state() {
+        // The tracker only advances `prev` when the healthy count changes —
+        // repeated identical ticks are no-ops (the once-per-transition contract
+        // the AC requires). We assert on the carried state, since the log line
+        // itself is a side effect.
+        let mut prev: Option<usize> = None;
+
+        // First observation seeds silently.
+        log_healthy_token_transition(&mut prev, 6, Some(&snap(7, 6)));
+        assert_eq!(prev, Some(6));
+
+        // Stable ticks: no change.
+        log_healthy_token_transition(&mut prev, 6, Some(&snap(7, 6)));
+        assert_eq!(prev, Some(6));
+
+        // Drop to token-starved (0 healthy) — a transition.
+        log_healthy_token_transition(&mut prev, 0, Some(&snap(7, 0)));
+        assert_eq!(prev, Some(0));
+
+        // Recovery to a new count — another transition.
+        log_healthy_token_transition(&mut prev, 4, Some(&snap(7, 4)));
+        assert_eq!(prev, Some(4));
+
+        // No-ranking fallback path (raw pool size) still tracks the count.
+        log_healthy_token_transition(&mut prev, 3, None);
+        assert_eq!(prev, Some(3));
+    }
 
     // ===================================================================
     // Mock source + dispatcher
