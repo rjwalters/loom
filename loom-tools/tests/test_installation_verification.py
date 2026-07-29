@@ -30,8 +30,6 @@ import pytest
 # `cleanup logs` / `recover-orphans`, or — for loom-worktree — deleted outright
 # as dead argparse-over-bash glue).
 EXPECTED_CLI_COMMANDS = [
-    "loom-daemon-diagnostic",
-    "loom-stuck-detection",
     "loom-claim",
 ]
 
@@ -162,16 +160,23 @@ class TestWrapperScriptRouting:
             or 'run_loom_tool "cleanup"' in content
         ), "cleanup.sh doesn't delegate to loom-cleanup"
 
-    def test_cli_wrapper_health_routes_to_python(
+    def test_cli_wrapper_health_routes_to_native_daemon(
         self, defaults_dir: pathlib.Path
     ) -> None:
-        """The 'loom' CLI wrapper should route health to Python."""
+        """The 'loom' CLI wrapper should route `health` to native loom-daemon.
+
+        The former Python ``loom-daemon-diagnostic`` was removed in epic #4081
+        phase 3 (#4274); `loom health` now execs ``loom-daemon status``.
+        """
         cli_wrapper = defaults_dir / ".loom" / "bin" / "loom"
         assert cli_wrapper.exists(), "loom CLI wrapper not found"
 
         content = cli_wrapper.read_text()
-        assert "loom-daemon-diagnostic" in content, (
-            "loom CLI doesn't reference loom-daemon-diagnostic"
+        assert "loom-daemon" in content and "status" in content, (
+            "loom CLI health verb doesn't route to native loom-daemon status"
+        )
+        assert "loom-daemon-diagnostic" not in content, (
+            "loom CLI still references the removed loom-daemon-diagnostic"
         )
 
 class TestInstallationFileStructure:

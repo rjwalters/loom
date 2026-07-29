@@ -22,13 +22,6 @@ from loom_tools.models.health import (
     MetricEntry,
     PipelineHealthMetric,
 )
-from loom_tools.models.stuck import (
-    StuckDetection,
-    StuckHistory,
-    StuckHistoryEntry,
-    StuckMetrics,
-    StuckThresholds,
-)
 
 FIXTURES = pathlib.Path(__file__).parent / "fixtures"
 
@@ -99,72 +92,3 @@ class TestAlertsFile:
         af2 = AlertsFile.from_dict(out)
         assert len(af2.alerts) == len(af.alerts)
         assert af2.alerts[0].id == af.alerts[0].id
-
-
-# -- Stuck Detection -------------------------------------------------------
-
-
-class TestStuckHistory:
-    @pytest.fixture()
-    def raw(self) -> dict:
-        return _load("stuck-history.json")
-
-    def test_from_dict(self, raw: dict) -> None:
-        sh = StuckHistory.from_dict(raw)
-        assert sh.created_at == "2026-01-24T18:21:48Z"
-        assert len(sh.entries) == 2
-
-    def test_entry_detection(self, raw: dict) -> None:
-        sh = StuckHistory.from_dict(raw)
-        entry = sh.entries[0]
-        det = entry.detection
-        assert det.agent_id == "shepherd-1"
-        assert det.issue == 1075
-        assert det.stuck is True
-        assert det.severity == "elevated"
-        assert det.suggested_intervention == "clarify"
-        assert "no_progress:759s" in det.indicators
-
-    def test_stuck_metrics(self, raw: dict) -> None:
-        sh = StuckHistory.from_dict(raw)
-        metrics = sh.entries[0].detection.metrics
-        assert metrics.idle_seconds == 759
-        assert metrics.error_count == 59
-
-    def test_stuck_thresholds(self, raw: dict) -> None:
-        sh = StuckHistory.from_dict(raw)
-        t = sh.entries[0].detection.thresholds
-        assert t.idle == 600
-        assert t.working == 1800
-        assert t.error_spike == 5
-
-    def test_round_trip(self, raw: dict) -> None:
-        sh = StuckHistory.from_dict(raw)
-        out = sh.to_dict()
-        sh2 = StuckHistory.from_dict(out)
-        assert len(sh2.entries) == len(sh.entries)
-        assert sh2.entries[0].detection.agent_id == sh.entries[0].detection.agent_id
-
-
-class TestStuckDetection:
-    def test_to_dict_includes_none_issue(self) -> None:
-        """Issue field is always present, even when None, for bash compatibility."""
-        det = StuckDetection(agent_id="s-1", status="idle", stuck=False)
-        d = det.to_dict()
-        assert "issue" in d
-        assert d["issue"] is None
-
-    def test_to_dict_includes_issue(self) -> None:
-        det = StuckDetection(agent_id="s-1", issue=42, status="working", stuck=True)
-        d = det.to_dict()
-        assert d["issue"] == 42
-
-
-class TestStuckThresholds:
-    def test_defaults(self) -> None:
-        t = StuckThresholds()
-        assert t.idle == 600
-        assert t.working == 1800
-        assert t.loop == 3
-        assert t.error_spike == 5
-        assert t.heartbeat_stale == 120
