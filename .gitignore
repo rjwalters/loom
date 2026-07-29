@@ -29,35 +29,36 @@ Thumbs.db
 # Logs
 *.log
 
+# >>> loom-managed (do not edit) >>>
 # Loom runtime state (don't commit these)
 .loom-in-use
 .loom-checkpoint
 .loom-managed
-.loom-test-failure-context.json
 .loom/.daemon.pid
-.loom/.daemon.flags
 .loom/.daemon.log
 .loom/daemon.sock
-.loom/daemon-state.json
 .loom/daemon-loop.pid
 .loom/daemon-metrics.json
 .loom/loom-source-path
-.loom/[0-9][0-9]-daemon-state.json
-.loom/stuck-history.json
-.loom/alerts.json
+.loom/spawn-loop-state.json
+.loom/spawn-loop.pid
+.loom/stop-spawn-loop
 .loom/issue-failures.json
-.loom/health-metrics.json
 .loom/interventions/
 .loom/worktrees/
+.loom/worktrees-local/
 .loom/state.json
 .loom/mcp-command.json
 .loom/activity.db
 .loom/claims/
+.loom/locks/
 .loom/signals/
 .loom/status/
-.loom/progress/
 .loom/retry-state/
 .loom/exit-codes/
+.loom/sweep-checkpoint/
+.loom/sweep-run/
+.loom/stats/
 .loom/diagnostics/
 .loom/guide-docs-state.json
 .loom/metrics_state.json
@@ -67,19 +68,24 @@ Thumbs.db
 .loom/usage-cache.json
 .loom/claude-config/
 .loom/tokens/
+.loom/accounts.env
+.loom/CANARY
+.loom/*.log
+.loom/*.sock
+.loom/logs/
+# <<< loom-managed <<<
+.loom-test-failure-context.json
+.loom/.daemon.flags
+.loom/daemon-state.json
+.loom/[0-9][0-9]-daemon-state.json
+.loom/stuck-history.json
+.loom/alerts.json
+.loom/health-metrics.json
+.loom/progress/
 # Local, opt-in semantic search index (#4339) — repo-local SQLite DB. Never
 # committed; runtime code also refuses to write here if this entry is ever
 # removed (see loom_tools.semantic_search.guard_index_dest_not_tracked).
 .loom/search-index/
-.loom/accounts.env
-.loom/sweep-checkpoint/
-.loom/sweep-run/
-.loom/stats/
-.loom/CANARY
-.loom/spawn-loop.pid
-.loom/spawn-loop-state.json
-.loom/stop-spawn-loop
-.loom/locks/
 
 # Loom workspace config (DO commit for team sharing)
 # - config.json: Persistent terminal configurations (roles, themes, intervals)
@@ -134,6 +140,3 @@ Thumbs.db
 
 # Skill routing local overrides (untracked, user-specific)
 .loom/config/skill-routes.local.json
-.loom/*.log
-.loom/*.sock
-.loom/logs/
