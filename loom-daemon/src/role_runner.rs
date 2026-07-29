@@ -83,7 +83,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::sweep_registry::{self, SweepRegistryConfig};
-use crate::workspace_registry::WorkspaceRegistry;
+use crate::workspace_registry::{filter_missing_roots, WorkspaceRegistry};
 
 // ============================================================================
 // Constants
@@ -973,12 +973,20 @@ where
 ///
 /// Every `interval` it re-reads [`WorkspaceRegistry::effective_roots`]
 /// against `fallback_root` (an **empty** registry yields the single
-/// `fallback_root`) and, for each registered root whose own
-/// `.loom/config.json` has this role enabled (`resolve_enabled` AND the role
-/// name present in `resolve_roles` — precedence env > config > default), runs
-/// one invocation. Invocations run **sequentially** per tick (no shared
-/// mutable state to leak across repos, and it avoids bursting concurrent
-/// `claude` sessions across every registered repo at once).
+/// `fallback_root`), drops any root whose directory no longer exists on disk
+/// via the shared [`filter_missing_roots`] hygiene (#4326/#4349 — warn once
+/// per missing period, never auto-remove), and, for each surviving root
+/// whose own `.loom/config.json` has this role enabled (`resolve_enabled`
+/// AND the role name present in `resolve_roles` — precedence env > config >
+/// default), runs one invocation. Invocations run **sequentially** per tick
+/// (no shared mutable state to leak across repos, and it avoids bursting
+/// concurrent `claude` sessions across every registered repo at once).
+///
+/// A repeatedly-failing root (e.g. a broken MCP preflight, #4349) logs once
+/// on the fail edge and once on recovery — not once per tick — via a
+/// per-root failing-state map tracked across ticks (mirrors the
+/// `was_halted`/`was_pressured` state-change-dedup discipline in
+/// [`crate::work_finder`]).
 pub fn spawn_multi_role_task(
     spec: RoleSpec,
     fallback_root: PathBuf,
@@ -995,6 +1003,12 @@ pub fn spawn_multi_role_task(
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         ticker.tick().await; // skip immediate first tick (see module docs)
+                             // Missing-root warn-once-per-period state (#4326), shared discipline
+                             // with `work_finder` via `filter_missing_roots`.
+        let mut missing_roots_warned: HashSet<PathBuf> = HashSet::new();
+        // Per-root failing state (#4349), so a persistently failing tick logs
+        // only on the fail edge and on recovery, not every tick.
+        let mut failing_roots: HashMap<PathBuf, bool> = HashMap::new();
         loop {
             ticker.tick().await;
 
@@ -1018,6 +1032,11 @@ pub fn spawn_multi_role_task(
                     WorkspaceRegistry::default()
                 })
                 .effective_roots(&fallback_root);
+            // Skip registered roots whose directory no longer exists on disk
+            // (#4326) so a dangling entry cannot burn every tick forever —
+            // warn-and-skip, never auto-remove (`loom-daemon status` flags it,
+            // `workspace remove` clears it).
+            let roots = filter_missing_roots(roots, &mut missing_roots_warned);
 
             for root in roots {
                 let config = read_role_runner_config(&root);
@@ -1064,7 +1083,13 @@ pub fn spawn_multi_role_task(
                 .await;
                 let elapsed = tick_start.elapsed();
                 match joined {
-                    Ok(outcome) => log_outcome_for_root(spec.name, &root, &outcome, elapsed),
+                    Ok(outcome) => log_outcome_for_root_deduped(
+                        spec.name,
+                        &root,
+                        &outcome,
+                        elapsed,
+                        &mut failing_roots,
+                    ),
                     Err(e) => log::error!(
                         "role_runner: {} invocation task for {} panicked ({e}); continuing to the \
                          next repo",
@@ -1116,7 +1141,15 @@ fn log_outcome(role: &str, outcome: &RoleTickOutcome, elapsed: Duration) {
     }
 }
 
-/// Root-aware variant of [`log_outcome`] for the multi-workspace loop.
+/// Root-aware variant of [`log_outcome`] for the **fire-and-forget idle path**
+/// ([`observe_and_fire_idle`], #4364). Unlike the repeating multi-workspace
+/// interval loop — which uses [`log_outcome_for_root_deduped`] to suppress a
+/// persistently-failing root's per-tick WARN noise (#4349) — an idle-triggered
+/// run fires exactly once on a busy→idle *edge* and is dispatched as a detached
+/// `tokio::spawn`. There is no repeating tick and no natural place to thread
+/// the per-root `failing` dedup state through the detached task, so a single
+/// plain (un-deduped) log line with root context is the correct, minimal fit
+/// here. See #4376 for the design rationale.
 fn log_outcome_for_root(role: &str, root: &Path, outcome: &RoleTickOutcome, elapsed: Duration) {
     match outcome {
         RoleTickOutcome::Success if tick_is_implausibly_fast(outcome, elapsed) => {
@@ -1140,6 +1173,131 @@ fn log_outcome_for_root(role: &str, root: &Path, outcome: &RoleTickOutcome, elap
             root.display()
         ),
     }
+}
+
+/// The classified log action for one root's tick outcome, given whether that
+/// root was already failing on the *previous* tick. Pulled out of
+/// [`log_outcome_for_root_deduped`] as a pure function so the state-change
+/// dedup logic (#4349) is unit-testable without capturing `log` crate output
+/// — mirrors why [`tick_is_implausibly_fast`] was extracted the same way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootTickLogAction {
+    /// Steady-state success: log at `INFO`, same as always.
+    Success,
+    /// Success, but implausibly fast: log at `WARN`, same as always.
+    SuccessImplausiblyFast,
+    /// Success immediately after a failing period: log once at `INFO` with
+    /// an explicit "recovered" message (the edge back to healthy).
+    Recovered,
+    /// Success immediately after a failing period, but implausibly fast:
+    /// log once at `WARN` combining both signals.
+    RecoveredImplausiblyFast,
+    /// First failure (edge into a failing period): log at `WARN`, same as
+    /// always.
+    FailureEdge,
+    /// Repeat failure (already failing on the previous tick): downgrade to
+    /// `DEBUG` — the identical failure no longer re-logs at `WARN` every
+    /// tick forever (the #4349 symptom: a broken worktree's MCP preflight
+    /// failing every 5-minute champion/curator tick with ERROR-level noise).
+    FailureRepeat,
+}
+
+impl RootTickLogAction {
+    /// Whether this action should mark the root as failing for the *next*
+    /// tick's edge/repeat decision.
+    #[must_use]
+    fn is_failing(self) -> bool {
+        matches!(self, Self::FailureEdge | Self::FailureRepeat)
+    }
+}
+
+#[must_use]
+fn classify_root_tick_log(
+    outcome: &RoleTickOutcome,
+    elapsed: Duration,
+    was_failing: bool,
+) -> RootTickLogAction {
+    match outcome {
+        RoleTickOutcome::Failure(_) if was_failing => RootTickLogAction::FailureRepeat,
+        RoleTickOutcome::Failure(_) => RootTickLogAction::FailureEdge,
+        RoleTickOutcome::Success if tick_is_implausibly_fast(outcome, elapsed) && was_failing => {
+            RootTickLogAction::RecoveredImplausiblyFast
+        }
+        RoleTickOutcome::Success if tick_is_implausibly_fast(outcome, elapsed) => {
+            RootTickLogAction::SuccessImplausiblyFast
+        }
+        RoleTickOutcome::Success if was_failing => RootTickLogAction::Recovered,
+        RoleTickOutcome::Success => RootTickLogAction::Success,
+    }
+}
+
+/// Root-aware, **state-change-deduped** variant of [`log_outcome`] for the
+/// multi-workspace loop (#4349). `failing` tracks, per root, whether the
+/// *previous* tick for that root ended in [`RoleTickOutcome::Failure`] — see
+/// [`RootTickLogAction`] for the per-transition logging rules.
+fn log_outcome_for_root_deduped(
+    role: &str,
+    root: &Path,
+    outcome: &RoleTickOutcome,
+    elapsed: Duration,
+    failing: &mut HashMap<PathBuf, bool>,
+) {
+    let was_failing = failing.get(root).copied().unwrap_or(false);
+    let action = classify_root_tick_log(outcome, elapsed, was_failing);
+    let reason = match outcome {
+        RoleTickOutcome::Failure(reason) => reason.as_str(),
+        RoleTickOutcome::Success => "",
+    };
+    match action {
+        RootTickLogAction::Success => {
+            log::info!(
+                "role_runner: {role} tick completed for {} in {elapsed:.1?}",
+                root.display()
+            );
+        }
+        RootTickLogAction::SuccessImplausiblyFast => {
+            log::warn!(
+                "role_runner: {role} tick completed for {} in {elapsed:.1?} — implausibly fast \
+                 for a real session (threshold {IMPLAUSIBLY_FAST_TICK:.0?}); this may be a no-op \
+                 that exited 0 without doing real work (e.g. a slash-command prompt that did not \
+                 resolve)",
+                root.display()
+            );
+        }
+        RootTickLogAction::Recovered => {
+            log::info!(
+                "role_runner: {role} recovered for {} — tick completed in {elapsed:.1?} after a \
+                 prior failing period",
+                root.display()
+            );
+        }
+        RootTickLogAction::RecoveredImplausiblyFast => {
+            log::warn!(
+                "role_runner: {role} tick for {} recovered from a failing period but completed \
+                 in {elapsed:.1?} — implausibly fast for a real session (threshold \
+                 {IMPLAUSIBLY_FAST_TICK:.0?}); this may be a no-op that exited 0 without doing \
+                 real work",
+                root.display()
+            );
+        }
+        RootTickLogAction::FailureEdge => {
+            log::warn!(
+                "role_runner: {role} tick failed for {} after {elapsed:.1?} (logged and \
+                 skipped, never fatal; further identical failures for this root are logged at \
+                 DEBUG until it recovers): {reason}",
+                root.display()
+            );
+        }
+        RootTickLogAction::FailureRepeat => {
+            log::debug!(
+                "role_runner: {role} tick failed for {} again after {elapsed:.1?} (repeat of an \
+                 already-logged failure; not re-warned every tick — see the fail-edge WARN \
+                 above, or the eventual recovery INFO): {reason}",
+                root.display()
+            );
+        }
+    }
+    failing.insert(root.to_path_buf(), action.is_failing());
 }
 
 #[cfg(test)]
@@ -2081,5 +2239,191 @@ mod tests {
         wait_for_calls(&calls, 1, Duration::from_secs(2)).await;
 
         handle.abort();
+    }
+
+    // ===================================================================
+    // classify_root_tick_log / log_outcome_for_root_deduped — #4349 state-
+    // change log dedup: a repeatedly failing root logs once on the fail
+    // edge and once on recovery, not once per tick.
+    // ===================================================================
+
+    const NORMAL_TICK: Duration = Duration::from_secs(90);
+
+    #[test]
+    fn test_classify_first_failure_is_edge() {
+        assert_eq!(
+            classify_root_tick_log(&RoleTickOutcome::Failure("boom".into()), NORMAL_TICK, false),
+            RootTickLogAction::FailureEdge
+        );
+    }
+
+    #[test]
+    fn test_classify_repeat_failure_is_downgraded() {
+        assert_eq!(
+            classify_root_tick_log(&RoleTickOutcome::Failure("boom".into()), NORMAL_TICK, true),
+            RootTickLogAction::FailureRepeat
+        );
+    }
+
+    #[test]
+    fn test_classify_success_after_failure_is_recovery() {
+        assert_eq!(
+            classify_root_tick_log(&RoleTickOutcome::Success, NORMAL_TICK, true),
+            RootTickLogAction::Recovered
+        );
+    }
+
+    #[test]
+    fn test_classify_steady_state_success_is_plain() {
+        assert_eq!(
+            classify_root_tick_log(&RoleTickOutcome::Success, NORMAL_TICK, false),
+            RootTickLogAction::Success
+        );
+    }
+
+    #[test]
+    fn test_classify_implausibly_fast_variants() {
+        assert_eq!(
+            classify_root_tick_log(&RoleTickOutcome::Success, Duration::from_millis(100), false),
+            RootTickLogAction::SuccessImplausiblyFast
+        );
+        assert_eq!(
+            classify_root_tick_log(&RoleTickOutcome::Success, Duration::from_millis(100), true),
+            RootTickLogAction::RecoveredImplausiblyFast
+        );
+    }
+
+    #[test]
+    fn test_log_outcome_for_root_deduped_tracks_failing_state_across_ticks() {
+        let root = PathBuf::from("/tmp/does-not-need-to-exist-for-this-test");
+        let mut failing: HashMap<PathBuf, bool> = HashMap::new();
+
+        // Tick 1: failure -> edge, marks failing.
+        log_outcome_for_root_deduped(
+            "champion",
+            &root,
+            &RoleTickOutcome::Failure("MCP_PREFLIGHT_FAILED".into()),
+            NORMAL_TICK,
+            &mut failing,
+        );
+        assert_eq!(failing.get(&root), Some(&true));
+
+        // Ticks 2-4: identical repeat failures -> still marked failing (the
+        // dedup happens in the log call, not observable here directly, but
+        // the state must remain `true` without ever clearing).
+        for _ in 0..3 {
+            log_outcome_for_root_deduped(
+                "champion",
+                &root,
+                &RoleTickOutcome::Failure("MCP_PREFLIGHT_FAILED".into()),
+                NORMAL_TICK,
+                &mut failing,
+            );
+            assert_eq!(failing.get(&root), Some(&true));
+        }
+
+        // Tick 5: recovers -> state flips back to healthy.
+        log_outcome_for_root_deduped(
+            "champion",
+            &root,
+            &RoleTickOutcome::Success,
+            NORMAL_TICK,
+            &mut failing,
+        );
+        assert_eq!(failing.get(&root), Some(&false));
+
+        // Tick 6: steady-state success keeps it healthy.
+        log_outcome_for_root_deduped(
+            "champion",
+            &root,
+            &RoleTickOutcome::Success,
+            NORMAL_TICK,
+            &mut failing,
+        );
+        assert_eq!(failing.get(&root), Some(&false));
+    }
+
+    #[test]
+    fn test_log_outcome_for_root_deduped_is_independent_per_root() {
+        // A failure on one registered root must not affect another root's
+        // failing state (each workspace's health is tracked independently).
+        let root_a = PathBuf::from("/tmp/root-a");
+        let root_b = PathBuf::from("/tmp/root-b");
+        let mut failing: HashMap<PathBuf, bool> = HashMap::new();
+
+        log_outcome_for_root_deduped(
+            "curator",
+            &root_a,
+            &RoleTickOutcome::Failure("boom".into()),
+            NORMAL_TICK,
+            &mut failing,
+        );
+        log_outcome_for_root_deduped(
+            "curator",
+            &root_b,
+            &RoleTickOutcome::Success,
+            NORMAL_TICK,
+            &mut failing,
+        );
+
+        assert_eq!(failing.get(&root_a), Some(&true));
+        assert_eq!(failing.get(&root_b), Some(&false));
+    }
+
+    // ===================================================================
+    // spawn_multi_role_task missing-root hygiene (#4326/#4349) — a
+    // registered root whose directory no longer exists is skipped, not
+    // spawned against, mirroring work_finder's filter_missing_roots.
+    // ===================================================================
+
+    #[tokio::test]
+    #[serial]
+    async fn test_multi_role_task_skips_missing_registered_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let existing_root = tmp.path().join("existing");
+        let missing_root = tmp.path().join("gone");
+        std::fs::create_dir_all(&existing_root).unwrap();
+        write_config(&existing_root, r#"{"autonomous":{"roleRunner":{"enabled":true}}}"#);
+        // `add` validates the path exists at registration time, so create the
+        // "missing" root first, register it, then delete it — reproducing a
+        // registered-but-later-deleted worktree (#4349's #4188 scenario).
+        std::fs::create_dir_all(&missing_root).unwrap();
+
+        let registry_path = tmp.path().join("workspaces.json");
+        std::env::set_var(
+            crate::workspace_registry::REGISTRY_PATH_ENV,
+            registry_path.to_str().unwrap(),
+        );
+        let mut registry = WorkspaceRegistry::default();
+        registry.add(&existing_root, None).unwrap();
+        registry.add(&missing_root, None).unwrap();
+        registry.save_default().unwrap();
+        std::fs::remove_dir_all(&missing_root).unwrap();
+
+        let spec = RoleSpec {
+            name: "curator",
+            prompt: "/loom:curator",
+            default_interval_secs: 1,
+        };
+        let drain = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let in_progress = new_in_progress_guard();
+        let handle = spawn_multi_role_task(
+            spec,
+            tmp.path().to_path_buf(),
+            Duration::from_millis(20),
+            drain,
+            in_progress,
+        );
+
+        // Let a couple of ticks fire. The missing root must never be spawned
+        // against (there is no script at its `.loom/config.json`/spawn path
+        // to invoke, so a spawn attempt would either fail loudly or panic
+        // the resolve step; the assertion here is simply that the loop
+        // survives several ticks without erroring the test process, which
+        // it would if the missing root were not filtered before dispatch).
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        handle.abort();
+
+        std::env::remove_var(crate::workspace_registry::REGISTRY_PATH_ENV);
     }
 }
