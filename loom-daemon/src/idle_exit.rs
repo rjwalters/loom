@@ -259,6 +259,9 @@ pub fn spawn_task(
                 message: message.clone(),
             });
             log::info!("idle_exit: {message}");
+            // Give asynchronous narration sinks a bounded chance to forward the
+            // already-published fleet announcement before process termination.
+            tokio::time::sleep(Duration::from_millis(250)).await;
             let _ = tokio::fs::remove_file(&socket).await;
             std::process::exit(0);
         }
@@ -294,6 +297,20 @@ mod tests {
         let mut running = idle();
         running.in_flight = 1;
         assert_eq!(tracker.observe(running, start + Duration::from_secs(120)), None);
+    }
+
+    #[test]
+    fn active_role_resets_ordinary_idle_clock() {
+        let start = Instant::now();
+        let mut tracker = IdleTracker::new(Duration::from_secs(60), false, start);
+        let mut role = idle();
+        role.active_roles = 1;
+        assert_eq!(tracker.observe(role, start + Duration::from_secs(59)), None);
+        assert_eq!(tracker.observe(idle(), start + Duration::from_secs(118)), None);
+        assert_eq!(
+            tracker.observe(idle(), start + Duration::from_secs(119)),
+            Some(IdleExitTrigger::Idle)
+        );
     }
 
     #[test]
@@ -347,5 +364,13 @@ mod tests {
         write_marker(&path, &marker).unwrap();
         let parsed: IdleExitMarker = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
         assert_eq!(parsed, marker);
+    }
+
+    #[test]
+    fn absent_config_is_disabled_with_documented_defaults() {
+        let config = IdleExitConfig::default();
+        assert_eq!(config.enabled, None);
+        assert_eq!(config.idle_minutes.unwrap_or(DEFAULT_IDLE_MINUTES), 60);
+        assert!(config.on_token_starvation.unwrap_or(true));
     }
 }
