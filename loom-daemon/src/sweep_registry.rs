@@ -1035,10 +1035,30 @@ fn classify_account_exhaustion(log_tail: &str) -> Option<&'static str> {
         .map(|(label, _)| *label)
 }
 
+/// The `self-kill:background-wait` signature regex (Issue #4389, a recurrence
+/// of #4257): matches final assistant/log text that promises to be notified
+/// about — or to check back on — outstanding background work, e.g. "I'll
+/// wait for the background rebuild to complete and check back" or "will be
+/// notified when the background task completes". That is the exact self-kill
+/// pattern this issue targets: in headless `claude -p` mode there is no
+/// "later" — ending the turn kills the process and every still-running
+/// background child with it, so a death whose log tail reads like this is a
+/// process-design self-kill, not a crash. Matched case-insensitively.
+fn background_wait_signature() -> &'static Regex {
+    static SIG: OnceLock<Regex> = OnceLock::new();
+    SIG.get_or_init(|| {
+        Regex::new(r"(?i)background.*(notify|complete|check|pick up)")
+            .expect("valid static background-wait regex")
+    })
+}
+
 /// Best-effort crash classification for the `sweep.issue.{N}.crashed` payload
-/// (Issue #4255). Derives a short, stable label from the dead sweep's log tail
-/// plus its exit code so a subscriber (#4137 telemetry) can attribute WHY the
-/// sweep died rather than re-parsing free-form logs.
+/// (Issue #4255, extended by #4389). Derives a short, stable label from the
+/// dead sweep's log tail plus its exit code so a subscriber (#4137
+/// telemetry) can attribute WHY the sweep died rather than re-parsing
+/// free-form logs. The caller only invokes this when a checkpoint exists for
+/// the dead sweep (i.e. it made mid-lifecycle progress before dying) — see
+/// the `checkpoint.exists()` guard around this function's call site.
 ///
 /// Precedence, most-specific first:
 /// 1. `account-exhausted:<signature>` — the account hit a usage/weekly/session
@@ -1047,7 +1067,14 @@ fn classify_account_exhaustion(log_tail: &str) -> Option<&'static str> {
 /// 2. `execution-error` — the CLI printed the bare `Execution error` string
 ///    (the chronic transient-death mode this issue targets; the wrapper now
 ///    retries it, so reaching the reaper means retries were exhausted).
-/// 3. `exit-<code>` — any other non-zero exit whose log yields no known
+/// 3. `self-kill:background-wait` (#4389) — the log tail reads like the
+///    orchestrator ended its turn believing outstanding background work
+///    (a Task subagent or a `run_in_background` Bash task) would notify it
+///    later. Checked regardless of exit code: this self-kill mode often
+///    exits *clean* (0) or with no captured code — the orchestrator believed
+///    it was finishing normally — which is exactly why it fell through to
+///    `None` (unclassified) before this signature existed.
+/// 4. `exit-<code>` — any other non-zero exit whose log yields no known
 ///    signature. `None` when the exit was clean/unknown with no signature, so
 ///    the field is omitted from the wire form rather than carrying noise.
 fn classify_crash(log_tail: &str, exit_code: Option<i32>) -> Option<String> {
@@ -1059,6 +1086,12 @@ fn classify_crash(log_tail: &str, exit_code: Option<i32>) -> Option<String> {
     // so a death that survived the wrapper's retry loop is still labeled.
     if log_tail.to_ascii_lowercase().contains("execution error") {
         return Some("execution-error".to_string());
+    }
+    // #4389: a background-wait self-kill often exits clean/uncaptured, so this
+    // must be checked BEFORE the exit_code match below (which would otherwise
+    // silently fall through to `None` for exactly that case).
+    if background_wait_signature().is_match(log_tail) {
+        return Some("self-kill:background-wait".to_string());
     }
     match exit_code {
         Some(0) | None => None,
@@ -6202,6 +6235,60 @@ exit 0
         // A clean/unknown exit with no signature carries no classification.
         assert_eq!(classify_crash("", Some(0)), None);
         assert_eq!(classify_crash("nothing notable", None), None);
+    }
+
+    /// Issue #4389 (a recurrence of #4257): `classify_crash` gains a
+    /// `self-kill:background-wait` signature for a dead sweep whose log tail
+    /// reads like the orchestrator ended its turn believing outstanding
+    /// background work would notify it later.
+    #[test]
+    fn classify_crash_labels_background_wait_self_kill() {
+        // Match: promises to be notified when a background task completes,
+        // with a clean exit code — exactly the case that fell through to
+        // `None` before this signature existed (#4389's root cause).
+        assert_eq!(
+            classify_crash(
+                "I'll wait for the background rebuild to notify me when it completes.",
+                Some(0),
+            )
+            .as_deref(),
+            Some("self-kill:background-wait")
+        );
+        // Match: also fires with no captured exit code at all.
+        assert_eq!(
+            classify_crash(
+                "I'll wait for the background task and check back once it's done.",
+                None
+            )
+            .as_deref(),
+            Some("self-kill:background-wait")
+        );
+        // Non-match: "background" appears but not paired with a
+        // notify/complete/check/pick-up promise anywhere after it.
+        assert_eq!(
+            classify_crash("running the rebuild in the background for speed", Some(0)),
+            None
+        );
+        // Non-match: a notify/complete/check word with no "background" in the
+        // same tail — not this signature at all.
+        assert_eq!(classify_crash("the build will complete shortly", Some(0)), None);
+        // Precedence: account exhaustion still wins over the background-wait
+        // signature even when both are present in the tail.
+        assert_eq!(
+            classify_crash(
+                "hit your weekly limit — try again later\nI'll check the background task after that.",
+                Some(1),
+            )
+            .as_deref(),
+            Some("account-exhausted:rate-limited")
+        );
+        // Precedence: the literal `Execution error` signature still wins over
+        // the background-wait signature.
+        assert_eq!(
+            classify_crash("Execution error\nI'll check on the background task later.", Some(1),)
+                .as_deref(),
+            Some("execution-error")
+        );
     }
 
     /// Issue #3823 (Option A): `spawn_child` exports the claim-ownership
