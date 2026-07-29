@@ -336,6 +336,33 @@ echo "Test 17: 'restart' is documented in help output"
 help_out=$(LOOM_HOME="$CHK" bash "$DISPATCHER" help 2>&1)
 assert_contains "$help_out" "restart" "'loom help' documents the restart verb"
 
+echo "Test 18: 'migrate' verb routing (Epic #3835 Phase 6, #4254)"
+# The real checkout ships scripts/install/migrate-consumer.sh; stub it into the
+# fake checkout so the dispatcher's target resolution finds it.
+mkdir -p "$CHK/scripts/install"
+cat > "$CHK/scripts/install/migrate-consumer.sh" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "--help" ]]; then echo "MIGRATE_HELP"; exit 0; fi
+echo "MIGRATE args=[$*] machine_checkout=[${LOOM_MACHINE_CHECKOUT:-}]"
+EOF
+chmod +x "$CHK/scripts/install/migrate-consumer.sh"
+
+assert_contains "$help_out" "migrate" "'loom help' documents the migrate verb"
+
+# --help is reachable from a non-repo directory (no .loom/ context needed).
+migrate_help=$(cd "$(mktemp -d)" && LOOM_HOME="$CHK" bash "$DISPATCHER" migrate --help 2>&1)
+assert_contains "$migrate_help" "MIGRATE_HELP" "'loom migrate --help' delegates without a repo context"
+
+# Outside a Loom repo, 'migrate' refuses with a clear message.
+migrate_norepo=$(cd "$(mktemp -d)" && LOOM_HOME="$CHK" bash "$DISPATCHER" migrate 2>&1 || true)
+assert_contains "$migrate_norepo" "must run inside a Loom consumer repo" "'loom migrate' refuses outside a repo"
+
+# Inside a consumer repo, 'migrate' delegates with the repo root + machine checkout.
+MIGREPO="$(make_consumer_repo)"
+migrate_run=$(cd "$MIGREPO" && LOOM_HOME="$CHK" bash "$DISPATCHER" migrate --dry-run 2>&1 || true)
+assert_contains "$migrate_run" "MIGRATE args=" "'loom migrate' delegates to migrate-consumer.sh"
+assert_contains "$migrate_run" "machine_checkout=[$CHK]" "'loom migrate' hands off LOOM_MACHINE_CHECKOUT"
+
 echo ""
 echo "======================================"
 echo "test-loom-dispatcher.sh: $TESTS_PASSED/$TESTS_RUN passed, $TESTS_FAILED failed"
