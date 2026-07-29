@@ -2,6 +2,4 @@
 
 __version__ = "0.1.0"
 
-from loom_tools.agent_monitor import AgentMonitor, monitor_agent
-
-__all__ = ["AgentMonitor", "monitor_agent", "__version__"]
+__all__ = ["__version__"]

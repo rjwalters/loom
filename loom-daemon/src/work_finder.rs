@@ -1363,8 +1363,20 @@ where
             // dispatched into the same root the gate's own build is competing
             // with for cores — the `suppress_dispatch_during_gate` knob (default
             // on) gates this so the pre-#4084 behavior is exactly recoverable.
+            // Host-distress circuit breaker (#4235): sample load-per-core, fold
+            // it into the breaker, and consult it as a second dispatch
+            // suppressor alongside the main-health halt flag and the gate
+            // in-flight hold. See the multi-workspace loop for the full
+            // rationale; when no breaker is registered these are no-ops.
+            if let Some(breaker) = crate::host_breaker::global() {
+                let load_per_core = crate::cpu_headroom::load_per_core();
+                if let Some(transition) = breaker.observe(load_per_core, chrono::Utc::now()) {
+                    crate::host_breaker::emit_transition_event(&event_bus, &transition);
+                }
+            }
             let halted = health_state.is_halted()
-                || (suppress_dispatch_during_gate && health_state.is_gate_in_flight());
+                || (suppress_dispatch_during_gate && health_state.is_gate_in_flight())
+                || crate::host_breaker::global_is_suppressed();
             // Recompute the dynamic cap from live inputs every tick (Phase B),
             // now with token-capacity backpressure (#3902): the token axis is the
             // count of *healthy* accounts from the ranking, not the flat pool.
@@ -1551,6 +1563,10 @@ pub fn spawn_multi_work_finder_task(
         // Axis-visibility state (#4234) — see the single-workspace loop above
         // for the full rationale.
         let mut was_max_concurrent: Option<usize> = None;
+        // Missing-root hygiene (#4326): tracks which registered roots are
+        // currently missing so `filter_missing_roots` logs a warning once per
+        // transition rather than once per tick.
+        let mut missing_roots_warned: HashSet<PathBuf> = HashSet::new();
         loop {
             ticker.tick().await;
 
@@ -1588,6 +1604,12 @@ pub fn spawn_multi_work_finder_task(
                 WorkspaceRegistry::default()
             });
             let roots = registry.effective_roots(&fallback_root);
+            // Skip registered roots whose directory no longer exists on disk
+            // (#4326 — e.g. a leaked/stale registry entry) so a dangling entry
+            // cannot occupy top dispatch priority or burn the tick. This is
+            // warn-and-skip, never auto-remove: the entry stays registered
+            // (`loom-daemon status` flags it, `workspace remove` clears it).
+            let roots = filter_missing_roots(roots, &mut missing_roots_warned);
 
             // Per-repo priority tiers (#3946), parallel to `pairs`: lower = higher
             // priority. The empty-registry cwd fallback resolves to the default.
@@ -1607,12 +1629,30 @@ pub fn spawn_multi_work_finder_task(
             // regardless of gate state, and a gate in flight holds its own root
             // regardless of drain state.
             let draining = drain.load(std::sync::atomic::Ordering::Relaxed);
-            let halted = dispatch_held_per_root_with_drain(
+            // Host-distress circuit breaker (#4235): sample the current
+            // load-per-core and fold it into the breaker's state machine. A
+            // tripped/cooling breaker is a *daemon-global* dispatch suppressor
+            // (like the scheduled drain) — it holds new dispatch in EVERY repo
+            // while running work drains — so it is OR'd onto every root's hold
+            // below. The load sample uses the fast, non-sleeping loadavg read (no
+            // `iostat`), safe to call inline. When no breaker is registered the
+            // helpers are no-ops returning `false` (zero behavior change).
+            if let Some(breaker) = crate::host_breaker::global() {
+                let load_per_core = crate::cpu_headroom::load_per_core();
+                if let Some(transition) = breaker.observe(load_per_core, chrono::Utc::now()) {
+                    crate::host_breaker::emit_transition_event(&event_bus, &transition);
+                }
+            }
+            let breaker_suppressed = crate::host_breaker::global_is_suppressed();
+            let halted: Vec<bool> = dispatch_held_per_root_with_drain(
                 &health_states,
                 &roots,
                 suppress_dispatch_during_gate,
                 draining,
-            );
+            )
+            .into_iter()
+            .map(|h| h || breaker_suppressed)
+            .collect();
             let any_halted = halted.iter().any(|&h| h);
 
             let mut pairs: Vec<(GhWorkSource, RegistryDispatcher)> = roots
@@ -1704,6 +1744,52 @@ pub fn spawn_multi_work_finder_task(
             }
         }
     })
+}
+
+/// Filter a resolved root list down to directories that still exist on disk
+/// (Issue #4326), warning once per missing/recovered transition rather than
+/// every tick.
+///
+/// Deliberately **not** folded into
+/// [`WorkspaceRegistry::effective_roots`](crate::workspace_registry::WorkspaceRegistry::effective_roots)
+/// — that helper's empty-registry branch falls back to the daemon's cwd, and
+/// dropping missing roots *inside* it would make an all-roots-missing
+/// registry indistinguishable from an empty one, silently redirecting
+/// dispatch into the daemon's own cwd. Filtering here instead means an
+/// all-missing registry yields zero roots for this tick — no dispatch, no
+/// cwd fallback — while the dangling entries stay registered so
+/// `loom-daemon status` can flag them and an operator can `workspace remove`
+/// them. This is warn-and-skip, **never auto-remove**: a root can be
+/// transiently absent (an unmounted network volume, an in-progress restore),
+/// and auto-deregistering would destroy operator state on a transient
+/// condition.
+///
+/// `warned` carries the set of roots currently known-missing across ticks so
+/// a long-dangling entry logs once on first-seen-missing (not once per tick),
+/// and — if it later reappears and then disappears again — re-warns instead
+/// of staying silent forever.
+fn filter_missing_roots(roots: Vec<PathBuf>, warned: &mut HashSet<PathBuf>) -> Vec<PathBuf> {
+    let mut existing = Vec::with_capacity(roots.len());
+    let mut still_missing: HashSet<PathBuf> = HashSet::new();
+    for root in roots {
+        if root.is_dir() {
+            existing.push(root);
+        } else {
+            if !warned.contains(&root) {
+                log::warn!(
+                    "work_finder: registered workspace root {} does not exist on disk; \
+                     skipping it for this tick (entry stays registered — run \
+                     `loom-daemon workspace remove {}` to deregister it if this is \
+                     permanent, or `loom-daemon status` to confirm)",
+                    root.display(),
+                    root.display()
+                );
+            }
+            still_missing.insert(root);
+        }
+    }
+    *warned = still_missing;
+    existing
 }
 
 /// Emit the add-capacity advisory / recovery on a token-pressure **state
@@ -2631,6 +2717,85 @@ exit 0
         assert_eq!(report.dispatched, 0, "zero dispatch while halted");
         assert_eq!(report.deferred_capacity, 0);
         assert!(disp.dispatched.is_empty(), "no sweeps started while halted");
+    }
+
+    #[test]
+    fn test_tripped_host_breaker_suppresses_tick_without_aborting_running_work() {
+        // The host-distress circuit breaker (#4235) is consulted at the tick
+        // choke point by folding its `is_suppressed()` into the same `halted`
+        // bool the main-health gate uses. This proves the two load-bearing
+        // properties end-to-end: a *tripped* breaker dispatches ZERO new sweeps,
+        // and the running (in-flight) sweeps are left untouched — drain, don't
+        // abort.
+        use crate::host_breaker::{BreakerPhase, HostBreakerConfig, SharedHostBreaker};
+        let now = chrono::Utc::now();
+        let breaker = SharedHostBreaker::new(HostBreakerConfig {
+            enabled: true,
+            load_per_core_threshold: 2.5,
+            sustain_ticks: 3,
+            cooldown_secs: 300,
+        });
+        // Not yet tripped: the breaker does not suppress, so a tick dispatches.
+        assert!(!breaker.is_suppressed());
+
+        // Three sustained over-threshold samples trip it to Open.
+        breaker.observe(Some(4.0), now);
+        breaker.observe(Some(4.0), now);
+        breaker.observe(Some(4.0), now);
+        assert_eq!(breaker.snapshot().phase, BreakerPhase::Open);
+        assert!(breaker.is_suppressed(), "tripped breaker suppresses dispatch");
+
+        // Feed the breaker's suppression into the tick's `halted` input, exactly
+        // as the work-finder loop does.
+        let mut source = FakeSource::once((1..=5).map(issue).collect());
+        let mut disp = RecordingDispatcher {
+            in_flight: HashSet::from([100, 101]),
+            ..Default::default()
+        };
+        let halted = breaker.is_suppressed();
+        let report = tick(&mut source, &mut disp, 10, halted).unwrap();
+
+        assert!(report.halted, "a tripped breaker halts the tick");
+        assert_eq!(report.seen, 5, "backlog is still observed");
+        assert_eq!(report.dispatched, 0, "zero new dispatch while the breaker is open");
+        assert!(disp.dispatched.is_empty(), "no new sweeps started");
+        // Drain, don't abort: the two running sweeps are untouched.
+        assert_eq!(disp.in_flight, HashSet::from([100, 101]));
+    }
+
+    #[test]
+    fn test_host_breaker_cooldown_release_resumes_dispatch() {
+        // After the breaker cools down and releases, the tick resumes dispatch —
+        // the "cool-down release" half of the Test Plan, driven through the same
+        // `halted`-composition path the loop uses.
+        use crate::host_breaker::{BreakerPhase, HostBreakerConfig, SharedHostBreaker};
+        let t0 = chrono::Utc::now();
+        let breaker = SharedHostBreaker::new(HostBreakerConfig {
+            enabled: true,
+            load_per_core_threshold: 2.5,
+            sustain_ticks: 3,
+            cooldown_secs: 300,
+        });
+        // Trip → Open.
+        for _ in 0..3 {
+            breaker.observe(Some(4.0), t0);
+        }
+        assert!(breaker.is_suppressed());
+        // Load drops → CoolDown (still suppressed).
+        breaker.observe(Some(0.1), t0 + chrono::Duration::seconds(10));
+        assert_eq!(breaker.snapshot().phase, BreakerPhase::CoolDown);
+        assert!(breaker.is_suppressed(), "cool-down still suppresses");
+        // Cool-down elapses with acceptable load → Closed, dispatch resumes.
+        breaker.observe(Some(0.1), t0 + chrono::Duration::seconds(400));
+        assert_eq!(breaker.snapshot().phase, BreakerPhase::Closed);
+        assert!(!breaker.is_suppressed());
+
+        let mut source = FakeSource::once((1..=3).map(issue).collect());
+        let mut disp = RecordingDispatcher::default();
+        let report = tick(&mut source, &mut disp, 10, breaker.is_suppressed()).unwrap();
+        assert!(!report.halted);
+        assert_eq!(report.dispatched, 3, "dispatch resumes once the breaker releases");
+        assert_eq!(disp.dispatched, vec![1, 2, 3]);
     }
 
     #[test]
@@ -4036,5 +4201,82 @@ exit 0
             vec![10],
             "sibling root with no gate in flight is unaffected"
         );
+    }
+
+    // ===================================================================
+    // Missing-root hygiene (Issue #4326)
+    // ===================================================================
+
+    #[test]
+    fn test_filter_missing_roots_skips_only_the_missing_one() {
+        // A registry with one existing and one missing root dispatches only
+        // into the existing root — the missing one is dropped, not the whole
+        // tick.
+        let tmp = tempfile::tempdir().unwrap();
+        let existing = tmp.path().to_path_buf();
+        let missing = tmp.path().join("does-not-exist");
+        let mut warned = HashSet::new();
+
+        let filtered = filter_missing_roots(vec![existing.clone(), missing.clone()], &mut warned);
+
+        assert_eq!(filtered, vec![existing], "only the existing root survives");
+        assert!(warned.contains(&missing), "the missing root is tracked as warned");
+    }
+
+    #[test]
+    fn test_filter_missing_roots_all_missing_does_not_fall_back_to_cwd() {
+        // The all-missing case must yield an EMPTY root list, never a silent
+        // fallback to the daemon's cwd (that fallback is
+        // `effective_roots`'s exclusive, empty-*registry* behavior — a
+        // non-empty registry whose entries all happen to be missing on disk
+        // is a distinct case and must not reuse it).
+        let tmp = tempfile::tempdir().unwrap();
+        let missing_a = tmp.path().join("gone-a");
+        let missing_b = tmp.path().join("gone-b");
+        let mut warned = HashSet::new();
+
+        let filtered = filter_missing_roots(vec![missing_a, missing_b], &mut warned);
+
+        assert!(filtered.is_empty(), "an all-missing registry yields zero roots, not cwd");
+        assert_eq!(warned.len(), 2);
+    }
+
+    #[test]
+    fn test_filter_missing_roots_warns_once_then_recovers() {
+        // The `warned` set only ever tracks roots missing on the *current*
+        // call — a caller that re-checks each tick (as the work-finder loop
+        // does) naturally re-warns if a root disappears again after
+        // recovering, and stays silent tick-over-tick while it remains
+        // missing (the loop only logs for roots newly inserted into
+        // `warned`, exercised by the loop itself, not this pure-function
+        // test — this test just verifies the recovery bookkeeping).
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("flaky");
+        let mut warned = HashSet::new();
+
+        // First call: missing.
+        let filtered = filter_missing_roots(vec![root.clone()], &mut warned);
+        assert!(filtered.is_empty());
+        assert!(warned.contains(&root));
+
+        // Root reappears (e.g. a remounted volume).
+        std::fs::create_dir_all(&root).unwrap();
+        let filtered = filter_missing_roots(vec![root.clone()], &mut warned);
+        assert_eq!(filtered, vec![root.clone()]);
+        assert!(warned.is_empty(), "a recovered root is no longer tracked as missing");
+
+        // Root disappears again — should be treated as newly-missing (i.e.
+        // would re-warn), not silently skipped as "already known".
+        std::fs::remove_dir_all(&root).unwrap();
+        let filtered = filter_missing_roots(vec![root.clone()], &mut warned);
+        assert!(filtered.is_empty());
+        assert!(warned.contains(&root));
+    }
+
+    #[test]
+    fn test_filter_missing_roots_empty_input_returns_empty() {
+        let mut warned = HashSet::new();
+        assert!(filter_missing_roots(vec![], &mut warned).is_empty());
+        assert!(warned.is_empty());
     }
 }

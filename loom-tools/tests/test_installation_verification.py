@@ -24,8 +24,8 @@ import pytest
 
 # All Python CLI commands that loom-tools should expose
 # Phase 3.2 (#3399): removed loom-shepherd (phase 3.3), loom-daemon-loop (daemon.py deleted)
+# Phase 3 family 1 (#4271): removed loom-agent-monitor (agent_monitor.py deleted, zero references)
 EXPECTED_CLI_COMMANDS = [
-    "loom-agent-monitor",
     "loom-daemon-diagnostic",
     "loom-stuck-detection",
     "loom-claim",

@@ -212,10 +212,11 @@ fi
 # rev-parse subprocess below), on purpose — the structural test never needs the
 # repo root. Only the toggle/extra-list config read needs a config file, and it
 # is resolved LAZILY (only after structural admission already passed) by walking
-# up from CWD to the nearest .loom/config.json WITHOUT forking git
-# (fastpath_config_file). So a fast-pathed command pays: 1 bash-builtin test +
-# (only if eligible) 1 stat-walk + 1 jq read — never the git rev-parse, never a
-# deny/ask array, never a log write.
+# up from CWD to the nearest Loom config root WITHOUT forking git
+# (fastpath_config_root). So a fast-pathed command pays: 1 bash-builtin test +
+# (only if eligible) 1 stat-walk + up to 2 bounded jq reads (project tier, then
+# legacy tier only if the key is absent from project) — never the git
+# rev-parse, never a deny/ask array, never a log write.
 #
 # Toggle: guards.readOnlyFastPath (default true) / LOOM_GUARD_READONLY_FASTPATH
 # env (0/false/no disables, 1/true/yes forces on; env wins). Optional
@@ -223,40 +224,57 @@ fi
 # commands (each entry is a full-generality bypass for that command word).
 # =============================================================================
 
-# CARVE-OUT (#4063): the three fast-path readers below — fastpath_config_file,
-# fastpath_enabled, fastpath_extra_admits — are deliberately NOT migrated to the
-# shared config-resolver.sh (loom_config_get / loom_resolve_config) that the
-# cold-path toggles use. This is intentional and preserves issue #3687's fork
-# budget:
+# CARVE-OUT (#4063, UPDATED for Epic #3835 Phase 5, #4262): the fast-path
+# config readers below — fastpath_config_root, _fastpath_tiered_get,
+# _fastpath_tiered_get_array, fastpath_enabled, fastpath_extra_admits — are
+# deliberately NOT migrated to the shared config-resolver.sh (loom_config_get /
+# loom_resolve_config) that the cold-path toggles use. This is intentional and
+# preserves issue #3687's fork budget:
 #   * This block can `exit 0` (silent allow) BEFORE REPO_ROOT is resolved — the
 #     `git -C "$CWD" rev-parse --show-toplevel` fork lives strictly below the
 #     fast-path dispatch. loom_resolve_config REQUIRES a repo_root as its first
 #     argument, so routing these through it would force hoisting that git
 #     rev-parse above the fast-path exit, directly regressing #3687 (which
 #     removed it from the pre-admission path).
-#   * fastpath_config_file is a fork-free bash-builtin upward directory walk;
-#     fastpath_enabled / fastpath_extra_admits each cost exactly one CACHED jq.
-#     loom_config_get is uncached and forks jq once per existing tier file plus a
-#     merge (~3 forks today, more as Epic #3835 lands upper tiers) on EVERY call —
-#     a 3x+ regression on a hook that fires before every Bash tool call. Caching
-#     the merge (Option B) still needs a repo_root, and teaching the resolver a
-#     fork-free upward-walk root discovery (Option C) would break the documented
-#     three-language (Rust/Python/Bash) conformance-fixture contract in
-#     config-resolver.sh's header. So the fast path keeps its direct single-jq
-#     read of the nearest .loom/config.json. See #4063 for the full analysis.
+#   * fastpath_config_root is a fork-free bash-builtin upward directory walk
+#     (now stat-ing for EITHER `.loom-project/project.json` or
+#     `.loom/config.json`, so a `.loom-project/`-only repo is still found);
+#     fastpath_enabled / fastpath_extra_admits each cost AT MOST two CACHED,
+#     file-scoped jq reads (project tier, then legacy tier ONLY when the key
+#     is absent from the project tier — #4262's Epic #3835 `.loom-project/`
+#     tier reaching this toggle without forking the full merge).
+#     loom_resolve_config is uncached and soft-reads every tier file plus a
+#     merge (4+ forks today) on EVERY call — a 4x+ regression on a hook that
+#     fires before every Bash tool call. Caching the merge (Option B) still
+#     needs a repo_root, and teaching the resolver a fork-free upward-walk
+#     root discovery (Option C) would break the documented three-language
+#     (Rust/Python/Bash) conformance-fixture contract in config-resolver.sh's
+#     header. So the fast path keeps its direct, bounded (<=2 fork) reads
+#     instead. See #4063 for the original analysis and #4262 for the tier
+#     widening.
 #
-# Locate the nearest .loom/config.json by walking up from CWD, fork-free (no
-# git rev-parse). Cached. Best-effort: empty when none is found.
-_FASTPATH_CFG_FILE=""
-_FASTPATH_CFG_FILE_DONE=""
-fastpath_config_file() {
-    if [[ -z "$_FASTPATH_CFG_FILE_DONE" ]]; then
-        _FASTPATH_CFG_FILE_DONE=1
+# Locate the nearest Loom config ROOT by walking up from CWD, fork-free (no
+# git rev-parse) — a directory holding EITHER the tracked project tier
+# (.loom-project/project.json, Epic #3835) OR the legacy tier
+# (.loom/config.json). Cached. Best-effort: empty when neither is found.
+#
+# Epic #3835 Phase 5 (#4262): previously this walked looking for
+# .loom/config.json alone. Widening the stat to "either tier file" keeps the
+# walk itself fork-free (bash-builtin [[ -f ]] tests only) while letting the
+# two readers below (fastpath_enabled / fastpath_extra_admits) consult
+# .loom-project/project.json — see the CARVE-OUT comment above for why this
+# stays a direct, bounded-fork jq read instead of routing through
+# loom_resolve_config().
+_FASTPATH_CFG_ROOT=""
+_FASTPATH_CFG_ROOT_DONE=""
+fastpath_config_root() {
+    if [[ -z "$_FASTPATH_CFG_ROOT_DONE" ]]; then
+        _FASTPATH_CFG_ROOT_DONE=1
         local d="$CWD"
         if [[ -n "$d" && "$d" == /* ]]; then
             while :; do
-                if [[ -f "$d/.loom/config.json" ]]; then
-                    _FASTPATH_CFG_FILE="$d/.loom/config.json"
+                if [[ -f "$d/.loom-project/project.json" || -f "$d/.loom/config.json" ]]; then
+                    _FASTPATH_CFG_ROOT="$d"
                     break
                 fi
                 [[ "$d" == "/" ]] && break
@@ -266,7 +284,69 @@ fastpath_config_file() {
             done
         fi
     fi
-    printf '%s' "$_FASTPATH_CFG_FILE"
+    printf '%s' "$_FASTPATH_CFG_ROOT"
+}
+
+# Read a dotted-path boolean-ish scalar from the tiered fast-path config: try
+# the tracked project tier first (.loom-project/project.json), falling back to
+# the legacy tier (.loom/config.json) ONLY when the key is absent from the
+# project tier — this mirrors the resolver's whole-value tier precedence (a
+# higher tier that sets the key wins outright, it is not merged with a lower
+# tier). At most two jq forks, both file-scoped (no directory-file soft-read
+# fan-out, no merge) — the bounded-fork budget this CARVE-OUT preserves.
+# Echoes the resolved value, or empty when the key is absent from both tiers.
+_fastpath_tiered_get() {
+    local dotted="$1" root cfg value
+    root=$(fastpath_config_root)
+    [[ -n "$root" ]] || { printf ''; return 0; }
+
+    cfg="$root/.loom-project/project.json"
+    if [[ -f "$cfg" ]]; then
+        value=$(jq -r --arg p "$dotted" '
+            ($p | split(".")) as $path
+            | try getpath($path) catch null
+            | if . == null then empty else . end
+        ' "$cfg" 2>/dev/null) || value=""
+        [[ -n "$value" ]] && { printf '%s' "$value"; return 0; }
+    fi
+
+    cfg="$root/.loom/config.json"
+    if [[ -f "$cfg" ]]; then
+        value=$(jq -r --arg p "$dotted" '
+            ($p | split(".")) as $path
+            | try getpath($path) catch null
+            | if . == null then empty else . end
+        ' "$cfg" 2>/dev/null) || value=""
+        [[ -n "$value" ]] && { printf '%s' "$value"; return 0; }
+    fi
+
+    printf ''
+}
+
+# Same tier precedence as _fastpath_tiered_get, but for an array-valued key:
+# echoes the elements of guards.<name> one per line, from whichever tier's
+# file HAS the key first (project, else legacy) — an array value at a tier is
+# a whole-value override, never merged element-wise with a lower tier (this
+# matches the resolver's jq `*` deep-merge semantics for non-object values).
+# Echoes nothing when the key is absent from both tiers.
+_fastpath_tiered_get_array() {
+    local dotted="$1" root cfg has
+    root=$(fastpath_config_root)
+    [[ -n "$root" ]] || return 0
+
+    cfg="$root/.loom-project/project.json"
+    if [[ -f "$cfg" ]]; then
+        has=$(jq -r --arg p "$dotted" '($p | split(".")) as $path | try (getpath($path) != null) catch false' "$cfg" 2>/dev/null) || has=false
+        if [[ "$has" == "true" ]]; then
+            jq -r --arg p "$dotted" '($p | split(".")) as $path | getpath($path) | (. // [])[]' "$cfg" 2>/dev/null
+            return 0
+        fi
+    fi
+
+    cfg="$root/.loom/config.json"
+    if [[ -f "$cfg" ]]; then
+        jq -r --arg p "$dotted" '($p | split(".")) as $path | try (getpath($path) // []) catch [] | .[]' "$cfg" 2>/dev/null
+    fi
 }
 
 # Resolve the fast-path toggle (config + env), cached. Default true. Only ever
@@ -275,14 +355,11 @@ fastpath_config_file() {
 _FASTPATH_ENABLED_CACHE=""
 fastpath_enabled() {
     if [[ -z "$_FASTPATH_ENABLED_CACHE" ]]; then
-        local enabled=true cfg
-        cfg=$(fastpath_config_file)
-        if [[ -n "$cfg" ]]; then
-            # Only an explicit `false` disables; a missing key or malformed JSON
-            # (jq non-zero, caught by ||) stays ON — mirrors sql_guard_enabled().
-            enabled=$(jq -r 'if .guards.readOnlyFastPath == false then "false" else "true" end' "$cfg" 2>/dev/null) || enabled=true
-            [[ -n "$enabled" ]] || enabled=true
-        fi
+        local enabled=true raw
+        # Only an explicit `false` disables; an absent key on both tiers, or
+        # malformed JSON, stays ON — mirrors sql_guard_enabled().
+        raw=$(_fastpath_tiered_get "guards.readOnlyFastPath")
+        [[ "$raw" == "false" ]] && enabled=false
         # Env override wins over config.
         case "${LOOM_GUARD_READONLY_FASTPATH:-}" in
             0|false|no)  enabled=false ;;
@@ -380,11 +457,7 @@ fastpath_extra_admits() {
     local first="${t[0]}"
     if [[ -z "$_FASTPATH_EXTRA_DONE" ]]; then
         _FASTPATH_EXTRA_DONE=1
-        local cfg
-        cfg=$(fastpath_config_file)
-        if [[ -n "$cfg" ]]; then
-            _FASTPATH_EXTRA_CACHE=$(jq -r '(.guards.readOnlyFastPathExtra // []) | .[]' "$cfg" 2>/dev/null) || _FASTPATH_EXTRA_CACHE=""
-        fi
+        _FASTPATH_EXTRA_CACHE=$(_fastpath_tiered_get_array "guards.readOnlyFastPathExtra" 2>/dev/null) || _FASTPATH_EXTRA_CACHE=""
     fi
     [[ -n "$_FASTPATH_EXTRA_CACHE" ]] || return 1
     local w
@@ -980,6 +1053,81 @@ function qsplit(s,   out, n, i, c, j, qc, ci, inner, SQ, DQ) {
 }
 '
 
+# =============================================================================
+# QUOTE-AWARE REDIRECTION MASKING (#4245)
+#
+# extract_write_targets() (below) recognizes `>`/`>>` redirection by splitting
+# a qsplit()-segmented command on whitespace and pattern-matching each token —
+# but that whitespace split is NOT quote-aware, so a `>` that is DATA inside a
+# quoted argument (e.g. `gh issue create --body "... env > config > default
+# ..."`) can land in its own whitespace-bounded "token" and be misread as a
+# real redirection operator, manufacturing a phantom write target and denying
+# a command that writes nothing to the filesystem (#4245; same failure class
+# as the #3755 qsplit()/#3679 strip_literal_text() quoting fixes above).
+#
+# mask_gt() walks the string tracking quote state (single-quoted,
+# double-quoted, unquoted) and replaces every `>` found INSIDE a quoted span
+# with SOH (0x01, a character that can never appear in a shell command and so
+# can never itself be mis-split into a phantom target). It otherwise returns
+# the input UNCHANGED byte-for-byte (same length, same whitespace positions),
+# so a caller can split both the original and the masked string on whitespace
+# and get IDENTICAL token boundaries — the masked tokens are used only to
+# DECIDE whether a token is a real (unquoted) redirection operator; the
+# ORIGINAL tokens are still used to extract the actual target text.
+#
+# Deliberately does NOT model backslash-escaped quotes -- same simplification
+# qsplit() (above) and strip_literal_text() already accept for this file's
+# other quote-tracking scans, and for good reason beyond just consistency: the
+# input mask_gt() actually receives (COMMAND_ASK_SCAN, see extract_write_targets()
+# below) has typically already been through strip_literal_text()'s OWN
+# escape-blind redaction, which can shift a quote's effective position (e.g. an
+# escaped `\"` inside a redacted --body value loses its backslash, since the
+# redaction's own quote-matching stops at the first bare `"` it finds). Layering
+# a stricter, escape-AWARE scan on top of that already-escape-blind text would
+# only desynchronize the two passes' quote parity -- worse, in the wrong
+# direction (masking too little). Matching qsplit()'s exact toggle-on-every-
+# quote-char behavior keeps both passes' parity in agreement. Same accepted
+# risk direction as qsplit(): pathological unbalanced-quote input could in
+# theory shift parity and mis-mask a genuine unquoted `>`, but that is the same
+# best-effort risk this file already accepts for `;|&` segmentation -- never a
+# NEW risk introduced here. An unterminated quote (no matching close before
+# end-of-string) just runs to the end of the string in that quote state --
+# never crashes, never mis-indexes.
+# =============================================================================
+_MASKGT_AWK='
+function mask_gt(s,   out, n, i, c, mode, SQ, DQ, MASK) {
+    SQ = sprintf("%c", 39)    # single quote
+    DQ = sprintf("%c", 34)    # double quote
+    MASK = sprintf("%c", 1)   # SOH -- placeholder for a quoted ">" (never a real char)
+    out = ""
+    n = length(s)
+    i = 1
+    mode = 0   # 0 = unquoted, 1 = single-quoted, 2 = double-quoted
+    while (i <= n) {
+        c = substr(s, i, 1)
+        if (mode == 0) {
+            if (c == SQ) { mode = 1; out = out c; i++; continue }
+            if (c == DQ) { mode = 2; out = out c; i++; continue }
+            out = out c
+            i++
+            continue
+        }
+        if (mode == 1) {
+            # Single-quoted: only the matching quote ends the span.
+            if (c == SQ) { mode = 0; out = out c; i++; continue }
+            out = out (c == ">" ? MASK : c)
+            i++
+            continue
+        }
+        # mode == 2 (double-quoted): only the matching quote ends the span.
+        if (c == DQ) { mode = 0; out = out c; i++; continue }
+        out = out (c == ">" ? MASK : c)
+        i++
+    }
+    return out
+}
+'
+
 # Parse force-op segments out of a command, emitting one TAB-separated
 # "<cpath>\t<target>" line per genuine git force-push / hard-reset. Portable awk
 # only (mirrors extract_rm_targets / lifecycle_or_cloud_reason segment parsing):
@@ -1543,18 +1691,25 @@ extract_rm_targets() {
 #
 # NOT a full shell parser: like parse_force_ops / extract_rm_targets, splitting
 # a segment into tokens is plain whitespace splitting (not quote-aware), so a
-# quoted argument containing a literal space can be mis-split. The caller
-# feeds this the ASK-tier working copy (COMMAND_ASK_SCAN — comment-stripped
-# AND literal-text-redacted, i.e. --body/-m/--title/--notes/--comment values
-# are replaced with same-length placeholder text) specifically so a `>` that
-# merely appears INSIDE such a quoted value (e.g. `git commit -m "a > b"`)
-# cannot manufacture a phantom target. Any remaining false positive from an
-# unredacted quote resolves to, at worst, an extra deny on a target that isn't
-# really a write (safe direction) or a missed target (also safe — the fail-
-# open contract this file uses everywhere: ambiguity never widens a deny).
+# quoted argument containing a literal space can be mis-split. The `>`/`>>`
+# redirection scan below is the one exception: it is quote-aware (#4245) via
+# mask_gt() — a `>` inside a quoted argument (e.g. `gh issue create --body
+# "... env > config > default ..."`) is never treated as a redirection
+# operator, regardless of whether the caller's literal-text redaction (next
+# paragraph) already removed it. The caller ALSO feeds this the ASK-tier
+# working copy (COMMAND_ASK_SCAN — comment-stripped AND literal-text-redacted,
+# i.e. --body/-m/--title/--notes/--comment values are replaced with
+# same-length placeholder text) as a second, independent narrowing so a `>`
+# that merely appears INSIDE such a quoted value (e.g. `git commit -m "a > b"`)
+# cannot manufacture a phantom target even in the (non-`>`) tee/sed/cp/mv
+# target-extraction paths below, which stay plain-whitespace-split. Any
+# remaining false positive resolves to, at worst, an extra deny on a target
+# that isn't really a write (safe direction) or a missed target (also safe —
+# the fail-open contract this file uses everywhere: ambiguity never widens a
+# deny).
 # =============================================================================
 extract_write_targets() {
-    printf '%s' "$1" | awk -v startcwd="$2" "$_QSPLIT_AWK"'
+    printf '%s' "$1" | awk -v startcwd="$2" "$_QSPLIT_AWK""$_MASKGT_AWK"'
     BEGIN {
         SEP = sprintf("%c", 31)
         curcwd = startcwd
@@ -1571,6 +1726,15 @@ extract_write_targets() {
 
             m = split(seg, toks, /[ \t]+/)
             if (m < 1) continue
+
+            # Quote-aware parallel tokenization (#4245): mseg is byte-for-byte
+            # identical to seg except a `>` inside a quoted span is replaced
+            # with an SOH placeholder, so whitespace splitting yields the SAME
+            # token boundaries (mm == m always) but mtoks[] can be tested for
+            # a REAL (unquoted) redirection operator without ever matching a
+            # `>` that was only quoted data.
+            mseg = mask_gt(seg)
+            mm = split(mseg, mtoks, /[ \t]+/)
 
             if (toks[1] == "cd") {
                 if (m >= 2 && toks[2] != "" && toks[2] != "-") {
@@ -1617,21 +1781,25 @@ extract_write_targets() {
             # >/>>  redirection — token-boundary detection only (never a
             # mid-token char scan), so scanning stays anchored to whitespace
             # boundaries rather than manufacturing a target out of a `>`
-            # sitting inside an already-multi-char token.
+            # sitting inside an already-multi-char token. The MATCH test reads
+            # mtoks[] (quote-masked, #4245) so a `>` that is only quoted DATA
+            # can never match as an operator; the actual target text is still
+            # read from the ORIGINAL toks[] (unmasked) once a real operator is
+            # confirmed.
             for (j = 1; j <= m; j++) {
-                t = toks[j]
-                if (t == "") continue
-                if (t ~ /^[0-9]*>>?$/) {
+                mt = mtoks[j]
+                if (mt == "") continue
+                if (mt ~ /^[0-9]*>>?$/) {
                     # Bare operator token. Dup-to-fd (`> &1`) is recognized by
                     # the NEXT token starting with `&` and excluded.
-                    if (j + 1 <= m && toks[j+1] != "" && toks[j+1] !~ /^&/) {
+                    if (j + 1 <= m && toks[j+1] != "" && mtoks[j+1] !~ /^&/) {
                         print curcwd SEP toks[j+1]
                     }
                     continue
                 }
-                if (t ~ /^[0-9]*>>?[^ \t&]/) {
+                if (mt ~ /^[0-9]*>>?[^ \t&]/) {
                     # Attached form (`>file`, `2>file`, `>>file`).
-                    op = t
+                    op = toks[j]
                     sub(/^[0-9]*>>?/, "", op)
                     if (op != "") print curcwd SEP op
                 }
@@ -1887,7 +2055,7 @@ if worktree_isolation_guard_enabled && \
             _WT_WRITE_BASE_DONE=1
         fi
         if _any_managed_worktree_exists "$_WT_WRITE_BASE"; then
-            deny "BLOCKED: Bash-tool write to '${_wabs}' resolves to the main repository checkout ('${_WT_MAIN_ROOT}'), but a Loom-managed worktree exists for this session. This is a worktree-isolation bypass via Bash redirection/tee/sed -i/cp/mv — do NOT retry the write through Bash. cd into your issue worktree (.loom/worktrees/issue-<N>) and write there instead. (#4178)" "worktree-write-confinement"
+            deny "BLOCKED: Bash-tool write to '${_wabs}' resolves to the main repository checkout ('${_WT_MAIN_ROOT}'), but a Loom-managed worktree exists elsewhere in this repository (this check cannot verify it belongs to the acting session — see #4245). This is a worktree-isolation bypass via Bash redirection/tee/sed -i/cp/mv — do NOT retry the write through Bash. cd into your issue worktree (.loom/worktrees/issue-<N>) and write there instead. (#4178)" "worktree-write-confinement"
         fi
     done <<< "$WRITE_TARGETS"
 fi

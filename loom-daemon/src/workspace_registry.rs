@@ -156,6 +156,37 @@ fn looks_like_workspace(root: &Path) -> bool {
     root.join(".git").exists() || root.join(".loom").exists()
 }
 
+/// Resolve the **client-side** `--workspace` default for the `loom-daemon
+/// dispatch` CLI (Issue #4299): if `cwd` falls under (or exactly at) a
+/// registered workspace root, return that root so `dispatch` run from inside a
+/// registered repo targets it — fixing the observed case where the client's
+/// own cwd made no difference to dispatch (the daemon cannot see the CLI's
+/// cwd, so this must be resolved client-side, before the request is built).
+///
+/// Pure and side-effect-free: takes the already-loaded `registry` and an
+/// already-resolved `cwd` rather than performing I/O itself, so it is
+/// unit-testable without touching the filesystem or environment. Returns
+/// `None` when `cwd` is not under any registered root — the daemon's own
+/// [`WorkspaceRegistry::resolve_dispatch_root`] then applies for the
+/// explicit-param-absent case.
+///
+/// When more than one registered root would match (nested workspaces), the
+/// **longest** (most specific) matching root wins.
+#[must_use]
+pub fn resolve_client_workspace_default(
+    cwd: &Path,
+    registry: &WorkspaceRegistry,
+) -> Option<PathBuf> {
+    let cwd = normalize_path(cwd);
+    registry
+        .workspaces
+        .iter()
+        .map(|w| &w.root)
+        .filter(|root| cwd.starts_with(root.as_path()))
+        .max_by_key(|root| root.as_os_str().len())
+        .cloned()
+}
+
 impl WorkspaceRegistry {
     /// Load the registry from `path`. A missing file yields an empty registry
     /// (the common first-run case). A present-but-unparseable file is an error
@@ -325,6 +356,82 @@ impl WorkspaceRegistry {
             self.roots()
         }
     }
+
+    /// Resolve the default target workspace for an **explicit-param-absent**
+    /// `DispatchSweep` request (Issue #4299) — deterministic local resolution
+    /// from registry state, never a forge probe (issue numbers are per-repo, so
+    /// "which repo owns issue N" is ill-defined without an explicit target).
+    ///
+    /// `seeded_default` is the daemon's seeded default workspace (its own cwd
+    /// at startup, or `LOOM_WORKSPACE`) — **not required to be pre-normalized**;
+    /// this normalizes it internally before comparing against registry entries
+    /// (which are always stored normalized).
+    ///
+    /// Deliberately returns [`DispatchRootResolution::SeededDefault`] as a
+    /// distinct marker rather than the seeded path itself: the daemon's real
+    /// default registry is keyed in the [`crate::workspace_pool::WorkspacePool`]
+    /// by the caller's own (possibly-unnormalized) `sweep_workspace` value, so a
+    /// caller that re-derives "is this the default?" via path *equality*
+    /// against a freshly-normalized copy can silently mismatch on a symlinked
+    /// tempdir/mount and re-provision a **second, distinct** registry instance
+    /// for the same logical directory — orphaning the real default's reaper,
+    /// journal, and in-memory dedup state. Returning a marker instead makes
+    /// "use the literal seeded default registry" structurally unambiguous.
+    ///
+    /// Precedence, in order:
+    /// 1. Registry **empty** -> the seeded default (byte-for-byte pre-registry
+    ///    behavior — mirrors [`effective_roots`](Self::effective_roots)).
+    /// 2. Seeded default **is registered** -> the seeded default. Back-compat is
+    ///    load-bearing here: existing multi-workspace hosts run the daemon from
+    ///    a registered workspace, and any other outcome would break every bare
+    ///    `loom-daemon dispatch <N>` on them.
+    /// 3. Seeded default **not registered**, exactly **one** registered
+    ///    workspace -> that workspace (the single-registration Linux-worker
+    ///    case this issue exists to fix).
+    /// 4. Seeded default **not registered**, **multiple** registered
+    ///    workspaces -> [`DispatchRootResolution::Ambiguous`], never a silent
+    ///    cwd fallback.
+    #[must_use]
+    pub fn resolve_dispatch_root(&self, seeded_default: &Path) -> DispatchRootResolution {
+        if self.workspaces.is_empty() {
+            return DispatchRootResolution::SeededDefault;
+        }
+
+        let normalized_default = normalize_path(seeded_default);
+        if self.contains(&normalized_default) {
+            return DispatchRootResolution::SeededDefault;
+        }
+
+        let roots = self.roots();
+        if roots.len() == 1 {
+            return DispatchRootResolution::Registered(
+                roots.into_iter().next().unwrap_or(normalized_default),
+            );
+        }
+
+        DispatchRootResolution::Ambiguous { registered: roots }
+    }
+}
+
+/// Outcome of [`WorkspaceRegistry::resolve_dispatch_root`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DispatchRootResolution {
+    /// Use the daemon's own seeded default registry as-is — either the
+    /// registry is empty (pre-registry back-compat) or the seeded default is
+    /// itself a registered workspace. The caller must dispatch through its
+    /// existing default registry instance, never re-provision one.
+    SeededDefault,
+    /// Use this other, specific registered workspace root (provisioned via the
+    /// workspace pool).
+    Registered(PathBuf),
+    /// The daemon's seeded default isn't registered and more than one
+    /// workspace is registered — no safe default; the caller must ask for an
+    /// explicit `--workspace`/`workspace_root`. Carries the full registered set
+    /// so the caller can list it in the error.
+    Ambiguous {
+        /// The currently-registered workspace roots, in registry order.
+        registered: Vec<PathBuf>,
+    },
 }
 
 #[cfg(test)]
@@ -653,5 +760,144 @@ mod tests {
             reg.workspaces[0].priority, DEFAULT_WORKSPACE_PRIORITY,
             "an entry with no `priority` parses as the default (backward compat)"
         );
+    }
+
+    // ===================================================================
+    // Dispatch-path workspace resolution (#4299)
+    // ===================================================================
+
+    #[test]
+    fn resolve_dispatch_root_empty_registry_uses_seeded_default() {
+        let reg = WorkspaceRegistry::default();
+        let seeded = PathBuf::from("/some/cwd/wherever");
+        assert_eq!(
+            reg.resolve_dispatch_root(&seeded),
+            DispatchRootResolution::SeededDefault,
+            "empty registry preserves byte-for-byte pre-registry (cwd) behavior"
+        );
+    }
+
+    #[test]
+    fn resolve_dispatch_root_seeded_default_registered_wins() {
+        let dir = tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+
+        let mut reg = WorkspaceRegistry::default();
+        reg.add(&a, None).unwrap();
+        reg.add(&b, None).unwrap();
+
+        assert_eq!(
+            reg.resolve_dispatch_root(&a),
+            DispatchRootResolution::SeededDefault,
+            "existing multi-workspace hosts (daemon cwd == a registered root) keep the \
+             same default with no new flags"
+        );
+    }
+
+    #[test]
+    fn resolve_dispatch_root_single_unregistered_seed_targets_the_registration() {
+        // The Linux worker-host shape this issue exists to fix: daemon cwd is
+        // the machine checkout (unregistered), exactly one workspace (anvil) is
+        // registered.
+        let dir = tempdir().unwrap();
+        let machine_checkout = dir.path().join("machine-checkout");
+        let anvil = dir.path().join("anvil");
+        std::fs::create_dir_all(&machine_checkout).unwrap();
+        std::fs::create_dir_all(&anvil).unwrap();
+
+        let mut reg = WorkspaceRegistry::default();
+        reg.add(&anvil, None).unwrap();
+
+        let canonical_anvil = std::fs::canonicalize(&anvil).unwrap();
+        assert_eq!(
+            reg.resolve_dispatch_root(&machine_checkout),
+            DispatchRootResolution::Registered(canonical_anvil)
+        );
+    }
+
+    #[test]
+    fn resolve_dispatch_root_multiple_unregistered_seed_is_ambiguous() {
+        let dir = tempdir().unwrap();
+        let machine_checkout = dir.path().join("machine-checkout");
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        std::fs::create_dir_all(&machine_checkout).unwrap();
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+
+        let mut reg = WorkspaceRegistry::default();
+        reg.add(&a, None).unwrap();
+        reg.add(&b, None).unwrap();
+
+        match reg.resolve_dispatch_root(&machine_checkout) {
+            DispatchRootResolution::Ambiguous { registered } => {
+                assert_eq!(registered.len(), 2, "ambiguity error names every registered root");
+                assert!(registered.contains(&std::fs::canonicalize(&a).unwrap()));
+                assert!(registered.contains(&std::fs::canonicalize(&b).unwrap()));
+            }
+            other => panic!("expected Ambiguous, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_client_workspace_default_matches_cwd_under_root() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let nested = repo.join("subdir");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let mut reg = WorkspaceRegistry::default();
+        reg.add(&repo, None).unwrap();
+
+        let canonical_repo = std::fs::canonicalize(&repo).unwrap();
+        assert_eq!(
+            resolve_client_workspace_default(&repo, &reg),
+            Some(canonical_repo.clone()),
+            "cwd exactly at the registered root matches"
+        );
+        assert_eq!(
+            resolve_client_workspace_default(&nested, &reg),
+            Some(canonical_repo),
+            "cwd nested under the registered root matches"
+        );
+    }
+
+    #[test]
+    fn resolve_client_workspace_default_no_match_outside_any_root() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+
+        let mut reg = WorkspaceRegistry::default();
+        reg.add(&repo, None).unwrap();
+
+        assert_eq!(resolve_client_workspace_default(&elsewhere, &reg), None);
+    }
+
+    #[test]
+    fn resolve_client_workspace_default_empty_registry_is_none() {
+        let reg = WorkspaceRegistry::default();
+        let dir = tempdir().unwrap();
+        assert_eq!(resolve_client_workspace_default(dir.path(), &reg), None);
+    }
+
+    #[test]
+    fn resolve_client_workspace_default_prefers_most_specific_nested_match() {
+        let dir = tempdir().unwrap();
+        let outer = dir.path().join("outer");
+        let inner = outer.join("inner");
+        std::fs::create_dir_all(&inner).unwrap();
+
+        let mut reg = WorkspaceRegistry::default();
+        reg.add(&outer, None).unwrap();
+        reg.add(&inner, None).unwrap();
+
+        let canonical_inner = std::fs::canonicalize(&inner).unwrap();
+        assert_eq!(resolve_client_workspace_default(&inner, &reg), Some(canonical_inner));
     }
 }

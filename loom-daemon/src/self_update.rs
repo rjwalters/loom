@@ -1,4 +1,4 @@
-//! Self-update staleness detection surfaced through `loom-daemon --status`
+//! Self-update staleness detection surfaced through `loom-daemon status`
 //! (Issue #3968).
 //!
 //! Context: the 2026-07-25/26 canary rollout proved the self-repair loop
@@ -10,7 +10,7 @@
 //!
 //! This module is the READ-ONLY half of the fix: it answers "does the source
 //! checkout this binary was compiled from have newer commits than the commit
-//! baked into this binary at build time?" so `--status` can print an
+//! baked into this binary at build time?" so `loom-daemon status` can print an
 //! "update available" hint. It never shells out to `cargo build`, never
 //! provisions, and never restarts anything — it requires no operator opt-in
 //! flag because it is inherently side-effect-free (at most one `git
@@ -38,7 +38,7 @@ pub const BUILT_COMMIT: &str = env!("LOOM_DAEMON_GIT_COMMIT");
 /// as that checkout is still present on the same machine.
 const BUILD_MANIFEST_DIR: &str = env!("CARGO_MANIFEST_DIR");
 
-/// The self-update status `loom-daemon --status` surfaces.
+/// The self-update status `loom-daemon status` surfaces.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelfUpdateStatus {
     /// The commit this running binary was built from (`"unknown"` if the
@@ -134,7 +134,7 @@ pub fn source_tree_clean() -> Option<bool> {
 
 /// Compute the current self-update status. Read-only: at most one `git
 /// rev-parse` subprocess, no writes, no network calls. Cheap enough to call
-/// on every `--status` invocation.
+/// on every `loom-daemon status` invocation.
 #[must_use]
 pub fn check() -> SelfUpdateStatus {
     let source_commit = source_head_commit();

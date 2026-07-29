@@ -349,6 +349,7 @@ async function dispatchSweep(args: {
   effort?: string;
   depends_on?: number;
   workspace_root?: string;
+  force?: boolean;
 }): Promise<{ success: true; result: DispatchResponse["payload"] } | { success: false; error: string }> {
   try {
     const response = (await sendDaemonRequest({
@@ -373,6 +374,12 @@ async function dispatchSweep(args: {
         // default) dispatches into the daemon's default workspace, exactly as
         // before; a value routes the sweep into that managed repo's registry.
         workspace_root: args.workspace_root ?? null,
+        // Issue #4317: operator override for the host-distress circuit
+        // breaker (#4235/#4316). Unlike the other optional params above, the
+        // Rust-side field is a bare `bool` (not `Option<bool>`) — sending
+        // `null` here would fail serde deserialization on every dispatch, so
+        // this MUST default to `false`, never `null`/omitted.
+        force: args.force ?? false,
       },
     }, Math.max(DISPATCH_TIMEOUT_MS, resolveDaemonIpcTimeoutMs()))) as DaemonResponse;
 
@@ -711,6 +718,18 @@ export const sweepTools: Tool[] = [
             "repo's working tree / sweep registry — required to address a " +
             "managed repo other than the default when two repos share issue " +
             "numbers.",
+        },
+        force: {
+          type: "boolean",
+          description:
+            "Optional operator override for the host-distress circuit " +
+            "breaker (issue #4235). A tripped breaker represents sustained, " +
+            "already-observed host distress, so it hard-blocks an explicit " +
+            "dispatch_sweep by default. Set to `true` to say \"I know the " +
+            "host is distressed, dispatch anyway\" and bypass that block. " +
+            "Omit (or pass `false`) to preserve the default refuse-when-" +
+            "tripped behavior — mirrors the CLI's `loom-daemon dispatch <N> " +
+            "--force`.",
         },
       },
       required: ["kind"],
@@ -1116,6 +1135,9 @@ export async function handleSweepTool(
         args.depends_on > 0
           ? (args.depends_on as number)
           : undefined;
+      // Issue #4317: defensive extraction — only a literal boolean `true`
+      // forwards as `true` (e.g. the string `"true"` or `1` must NOT).
+      const force = args?.force === true;
 
       const result = await dispatchSweep({
         kind: normalized,
@@ -1124,6 +1146,7 @@ export async function handleSweepTool(
         effort,
         depends_on: dependsOn,
         workspace_root: extractWorkspaceRoot(args),
+        force,
       });
       if (!result.success) {
         return [

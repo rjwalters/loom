@@ -51,6 +51,23 @@ MAIN_ROOT="$(cd "$(git rev-parse --git-common-dir 2>/dev/null)/.." 2>/dev/null &
 MAIN_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." 2>/dev/null && pwd 2>/dev/null || echo ".")"
 HOOK_ERROR_LOG="${MAIN_ROOT}/.loom/logs/hook-errors.log"
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd 2>/dev/null || echo ".")"
+
+# Shared config-tier resolver (#4063 / Epic #3835 Phase 5, #4262). Source
+# defaults/scripts/lib/config-resolver.sh so the two reads below (the
+# guards.worktreeIsolation toggle and worktree.root) honor the full tier chain
+# — including .loom-project/project.json — instead of a direct single-file jq
+# read against legacy .loom/config.json only. At runtime SCRIPT_DIR is
+# .loom/hooks/ (project-level wiring) or defaults/hooks/ (machine-level
+# wiring, #4262); in both layouts .loom/scripts (a symlink to
+# defaults/scripts) or defaults/scripts sits alongside, so ../scripts/lib
+# resolves. Best-effort: a missing/unsourceable lib leaves loom_resolve_config
+# undefined and the readers below fall back to their documented defaults.
+if [[ -f "$SCRIPT_DIR/../scripts/lib/config-resolver.sh" ]]; then
+    # shellcheck source=/dev/null
+    source "$SCRIPT_DIR/../scripts/lib/config-resolver.sh" 2>/dev/null || true
+fi
+
 log_hook_error() {
     mkdir -p "$(dirname "$HOOK_ERROR_LOG")" 2>/dev/null || true
     echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] [guard-worktree-paths] $1" >> "$HOOK_ERROR_LOG" 2>/dev/null || true
@@ -64,39 +81,52 @@ trap 'log_hook_error "Unexpected error on line ${LINENO}: ${BASH_COMMAND:-unknow
 #
 # Default ON. Resolution order (highest precedence first):
 #   1. LOOM_GUARD_WORKTREE_ISOLATION env var (0/false/no disables, 1/true/yes forces on)
-#   2. .loom/config.json  ->  guards.worktreeIsolation  (default true when absent)
+#   2. Tiered config (Epic #3835) -> guards.worktreeIsolation, honoring
+#      .loom-project/project.json over legacy .loom/config.json (default true
+#      when absent from every tier)
 #   3. Default: true (guard on)
 #
 # The config read is best-effort: any parse failure falls through to
 # guard-ON and never trips the ERR trap or produces a non-zero exit.
 #
-# CARVE-OUT (#4241, same class as #4063): this read is deliberately NOT routed
-# through the shared config-resolver.sh (loom_config_get / loom_resolve_config)
-# that the cold-path guards.* toggles in guard-destructive-generic.sh use.
-# worktree_isolation_guard_enabled() is called UNCONDITIONALLY as the very
-# first thing this hook does, on EVERY Edit/Write PreToolUse -- there is no
-# cheaper structural pre-check upstream of it (unlike
+# CARVE-OUT (#4241, same class as #4063), UPDATED for Epic #3835 Phase 5
+# (#4262): worktree_isolation_guard_enabled() is called UNCONDITIONALLY as the
+# very first thing this hook does, on EVERY Edit/Write PreToolUse -- there is
+# no cheaper structural pre-check upstream of it (unlike
 # guard-destructive-generic.sh's cold-path toggles, which only read config
 # lazily after a specific pattern has already matched). loom_resolve_config
-# soft-reads all four tier files plus a merge (up to 5 jq forks) on every
-# call; this direct single-jq read of the nearest .loom/config.json costs
-# exactly one. Fanning that out to 5x on the single hottest guard invocation
-# in the whole system is the #3687 fork-budget regression this repo has
-# already decided against once (see guard-destructive-generic.sh's own
-# CARVE-OUT for the read-only fast path). If Epic #3835's `.loom-project/`
-# tier needs to reach this toggle, prefer caching a repo-scoped
-# loom_resolve_config() result once per process (mirroring
-# guard-destructive-generic.sh's per-invocation caches) rather than paying
-# the full resolve on every Edit/Write.
+# soft-reads all tier files plus a merge on every call, so calling it directly
+# from BOTH readers below would double the fork cost. Instead,
+# resolved_config() (below) calls loom_resolve_config() at most ONCE per
+# invocation and caches the merged JSON string; both readers then run one
+# cheap in-memory `jq` filter against that cached string (no extra file I/O).
+# This is exactly the mitigation this carve-out originally called for --
+# "prefer caching a repo-scoped loom_resolve_config() result once per
+# process" -- so `.loom-project/project.json` (and every other tier) now
+# reaches both toggles without re-forking the merge per reader.
 # =============================================================================
+_WORKTREE_GUARD_CONFIG_CACHE=""
+_WORKTREE_GUARD_CONFIG_DONE=""
+resolved_config() {
+    if [[ -z "$_WORKTREE_GUARD_CONFIG_DONE" ]]; then
+        _WORKTREE_GUARD_CONFIG_DONE=1
+        if [[ -n "$MAIN_ROOT" ]] && command -v loom_resolve_config &>/dev/null; then
+            _WORKTREE_GUARD_CONFIG_CACHE=$(loom_resolve_config "$MAIN_ROOT" 2>/dev/null) || _WORKTREE_GUARD_CONFIG_CACHE='{}'
+        fi
+        [[ -n "$_WORKTREE_GUARD_CONFIG_CACHE" ]] || _WORKTREE_GUARD_CONFIG_CACHE='{}'
+    fi
+    printf '%s' "$_WORKTREE_GUARD_CONFIG_CACHE"
+}
+
 worktree_isolation_guard_enabled() {
     local enabled=true
-    if [[ -n "$MAIN_ROOT" && -f "$MAIN_ROOT/.loom/config.json" ]] && command -v jq &>/dev/null; then
+    if command -v jq &>/dev/null; then
         # jq // is alternative-on-null, not default-on-missing, so use
         # if/then/else to treat only an explicit `false` as disabled (a
         # missing guards.worktreeIsolation key stays on).
-        enabled=$(jq -r 'if .guards.worktreeIsolation == false then "false" else "true" end' "$MAIN_ROOT/.loom/config.json" 2>/dev/null) || enabled=true
-        [[ -n "$enabled" ]] || enabled=true
+        local raw
+        raw=$(resolved_config | jq -r 'if .guards.worktreeIsolation == false then "false" else "true" end' 2>/dev/null) || raw=true
+        [[ -n "$raw" ]] && enabled="$raw"
     fi
     case "${LOOM_GUARD_WORKTREE_ISOLATION:-}" in
         0|false|no)  enabled=false ;;
@@ -144,27 +174,26 @@ walk_up_for_sentinel() {
 # as a small inline duplicate rather than sourcing the library, so this
 # guard's fail-open contract does not depend on another script's behavior.
 #
-# CARVE-OUT (#4241, same class as #4063): the `worktree.root` read below is
-# deliberately NOT routed through config-resolver.sh either, for a different
-# reason than the toggle above -- this function is only reached on the rare
-# deny-candidate path (target resolves inside the main checkout and outside
-# every worktree, see path_derived_allow() above), so fork cost is not the
-# concern here. The concern is the SAME self-containment rationale already
-# documented on this function: sourcing config-resolver.sh would make this
-# guard's fail-open contract depend on that library's own behavior (and
-# transitively on jq's `*` deep-merge across up to four tier files) instead
-# of one direct, independently-auditable jq read. If/when a repo actually
-# populates `.loom-project/project.json` -> worktree.root (Epic #3835 Phase
-# 6+), migrate this read (and worktree-root.sh's own resolution) together so
-# the two stay in lockstep -- not this hook alone.
+# UPDATED for Epic #3835 Phase 5 (#4262): this function is only reached on the
+# rare deny-candidate path (target resolves inside the main checkout and
+# outside every worktree, see path_derived_allow() above), so per-call fork
+# cost was never the concern here -- the original CARVE-OUT (#4241) instead
+# worried about this guard's fail-open contract depending on
+# config-resolver.sh's own behavior. That concern is addressed the same way
+# as the toggle above: resolved_config() calls loom_resolve_config() (if
+# sourced) at most once per invocation and soft-fails to '{}' on any error,
+# so a resolver failure still degrades to the pre-#4262 "no config, fall back
+# to the default" behavior rather than propagating an error. This lets
+# `.loom-project/project.json -> worktree.root` (Epic #3835) reach this guard
+# without a second, independent read path to keep in lockstep.
 resolve_worktree_base() {
     if [[ -n "${LOOM_WORKTREE_ROOT:-}" && "${LOOM_WORKTREE_ROOT}" == /* ]]; then
         printf '%s' "${LOOM_WORKTREE_ROOT%/}/$(basename "$MAIN_ROOT")"
         return 0
     fi
-    if [[ -n "$MAIN_ROOT" && -f "$MAIN_ROOT/.loom/config.json" ]] && command -v jq &>/dev/null; then
+    if [[ -n "$MAIN_ROOT" ]] && command -v jq &>/dev/null; then
         local cfg_root
-        cfg_root=$(jq -r '.worktree.root? // empty' "$MAIN_ROOT/.loom/config.json" 2>/dev/null) || cfg_root=""
+        cfg_root=$(resolved_config | jq -r '.worktree.root? // empty' 2>/dev/null) || cfg_root=""
         if [[ -n "$cfg_root" && "$cfg_root" == /* ]]; then
             printf '%s' "${cfg_root%/}/$(basename "$MAIN_ROOT")"
             return 0
@@ -288,4 +317,4 @@ if path_derived_allow "$NORM_PATH"; then
     exit 0
 fi
 
-emit_deny "BLOCKED: Edit/Write path '${NORM_PATH}' resolves to the main repository checkout ('${MAIN_ROOT}'), but a Loom-managed worktree exists for this session. Builders must write inside their issue worktree (.loom/worktrees/issue-<N>), never the main checkout. Do NOT retry this write via Bash redirection/tee/sed -i/cp/mv -- that is also confined (guard-destructive-generic.sh, #4178) and denied for the same reason. cd into your issue worktree and write there instead. (#4007)"
+emit_deny "BLOCKED: Edit/Write path '${NORM_PATH}' resolves to the main repository checkout ('${MAIN_ROOT}'), but a Loom-managed worktree exists elsewhere in this repository (this check cannot verify it belongs to the acting session — see #4245). Builders must write inside their issue worktree (.loom/worktrees/issue-<N>), never the main checkout. Do NOT retry this write via Bash redirection/tee/sed -i/cp/mv -- that is also confined (guard-destructive-generic.sh, #4178) and denied for the same reason. cd into your issue worktree and write there instead. (#4007)"

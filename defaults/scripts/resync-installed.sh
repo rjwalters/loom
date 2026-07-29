@@ -26,9 +26,25 @@
 #   .loom/bin/              <- defaults/.loom/bin/        (recursive; live consumer CLI)
 #   .claude/commands/loom/  <- defaults/.claude/commands/loom/ (recursive)
 #
+# It also applies one targeted field edit outside the pure-copy model (#4285):
+# a root package.json whose "name" is exactly "loom-workspace" (the Loom
+# installer's workspace-scaffolding stub, `defaults/package.json`) has its
+# decoy "version" field deleted in place if present — this is a `jq
+# 'del(.version)'` field edit, NOT a whole-file resync, so a consumer's
+# customized "scripts" block in the stub is preserved. A consumer's OWN
+# package.json (any other "name") is never touched.
+#
 # On a successful non-dry-run it also re-stamps loom_version, loom_commit, and a
 # last_resync date into .loom/install-metadata.json (requires jq or python3;
 # skipped with a warning if neither is present — the file sync still succeeds).
+#
+# It also refreshes the marker-delimited Loom-managed `.gitignore` block via the
+# daemon's `update-gitignore` subcommand (#4280) — the ephemeral-pattern list is
+# single-sourced in loom-daemon, so existing installs converge on newly-ignored
+# runtime paths (e.g. .loom/sweep-checkpoint/, .loom/worktrees-local/) at resync
+# time. A missing daemon binary is a loud warning, not a silent skip. Any path
+# still untracked-and-unignored under .loom/ afterward is reported as an audit
+# warning so the pattern list can be extended.
 #
 # EXPLICITLY OUT OF SCOPE (never touched by resync — updated by other mechanisms):
 #   .loom/config.json       - operator-owned; needs merge-semantics design
@@ -40,10 +56,11 @@
 #   install-metadata.json's install_date + installed_files - owned by the installer
 #
 # Local-override convention: list a relative path (e.g. `hooks/guard-destructive.sh`,
-# `scripts/foo.sh`, `roles/custom-role.md`, `docs/notes.md`, `bin/loom`, or
-# `commands/loom/mine.md`) — one per line — in `.loom/resync-ignore` to pin an
-# intentional per-repo customization. Matching files are reported as `skipped`
-# and never overwritten. Blank lines and `#` comments are ignored.
+# `scripts/foo.sh`, `roles/custom-role.md`, `docs/notes.md`, `bin/loom`,
+# `commands/loom/mine.md`, or `package.json` to pin the #4285 stub version edit)
+# — one per line — in `.loom/resync-ignore` to pin an intentional per-repo
+# customization. Matching files are reported as `skipped` and never overwritten.
+# Blank lines and `#` comments are ignored.
 #
 # Usage:
 #   ./.loom/scripts/resync-installed.sh            # sync; report what changed
@@ -94,7 +111,7 @@ for arg in "$@"; do
         --dry-run|-n) DRY_RUN=1 ;;
         --quiet|-q)   QUIET=1 ;;
         --help|-h)
-            sed -n '2,61p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '2,69p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
         *)
@@ -378,6 +395,63 @@ if [[ -d "$REPO_ROOT/.claude/commands/loom" ]]; then
     resync_tree "$DEFAULTS_DIR/.claude/commands/loom" "$REPO_ROOT/.claude/commands/loom" "commands/loom" ".claude/commands/loom"
 fi
 
+# ---------- targeted field edit: loom-workspace package.json version (#4285) ----------
+#
+# defaults/package.json ships without a "version" field — the field was a decoy
+# for version-detection tooling (npm-shape probes, /loom:bump) that mistook the
+# installer's workspace stub for a real project version source. Consumers who
+# installed the OLD stub (with "version": "1.0.0") still carry it on disk. A
+# whole-file resync (like the surfaces above) would clobber the consumer's
+# customized "scripts" block (check:ci, test, lint, ...), so this does a
+# targeted field deletion instead: strip ".version" from the root package.json
+# ONLY when ".name" is exactly "loom-workspace" and a "version" field is
+# present. A consumer's own package.json (any other name) is left untouched.
+resync_workspace_stub_version() {
+    local pj="$REPO_ROOT/package.json"
+    [[ -f "$pj" ]] || return 0
+
+    if is_ignored "package.json"; then
+        note "  ${YELLOW}skipped${NC}   package.json ${YELLOW}(pinned in .loom/resync-ignore)${NC}"
+        N_SKIPPED=$((N_SKIPPED + 1))
+        return 0
+    fi
+
+    if ! command -v jq >/dev/null 2>&1; then
+        warn "Skipped package.json version-stub check (need jq). Surface sync still applied."
+        return 0
+    fi
+
+    local name
+    name="$(jq -r '.name // empty' "$pj" 2>/dev/null)"
+    [[ "$name" == "loom-workspace" ]] || return 0
+
+    local has_version
+    has_version="$(jq -r 'has("version")' "$pj" 2>/dev/null)"
+    if [[ "$has_version" != "true" ]]; then
+        note "  ${GREEN}unchanged${NC} package.json (no decoy version field)"
+        N_UNCHANGED=$((N_UNCHANGED + 1))
+        return 0
+    fi
+
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        printf '%b\n' "  ${BOLD}would update${NC} package.json (remove decoy \"version\" field, #4285)"
+        N_UPDATED=$((N_UPDATED + 1))
+        return 0
+    fi
+
+    local tmp="${pj}.tmp.$$"
+    if jq 'del(.version)' "$pj" > "$tmp" 2>/dev/null && [[ -s "$tmp" ]]; then
+        mv "$tmp" "$pj"
+        printf '%b\n' "  ${GREEN}updated${NC}   package.json (removed decoy \"version\" field, #4285)"
+        N_UPDATED=$((N_UPDATED + 1))
+    else
+        rm -f "$tmp"
+        err "failed to update package.json (jq del(.version))"
+    fi
+}
+
+resync_workspace_stub_version
+
 # ---------- re-stamp install-metadata.json (#4239, non-dry-run only) ----------
 #
 # Refresh loom_version + loom_commit (from the resolved source tree) and record a
@@ -440,6 +514,82 @@ PY
 if [[ "$DRY_RUN" -ne 1 ]]; then
     restamp_metadata
 fi
+
+# ---------- refresh the Loom-managed .gitignore block (#4280) ----------
+#
+# The marker-delimited managed block in the consumer's .gitignore is written by
+# `loom-daemon init` at install time and was NEVER refreshed by resync — so a
+# repo installed by a stale binary (or before a pattern was added) keeps ignoring
+# the old set forever, leaving newer runtime dirs (e.g. .loom/sweep-checkpoint/,
+# .loom/worktrees-local/) untracked-and-unignored. The ephemeral-pattern list is
+# single-sourced in the daemon (EPHEMERAL_PATTERNS), so we invoke the daemon's
+# `update-gitignore` subcommand rather than duplicating the list in shell. A
+# missing/too-old binary is a LOUD stderr warning, never a silent skip.
+
+refresh_gitignore_block() {
+    local locate_lib bin
+    locate_lib="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/locate-daemon-bin.sh"
+    if [[ ! -f "$locate_lib" ]]; then
+        warn ".gitignore refresh skipped: locate-daemon-bin.sh not found next to resync-installed.sh."
+        warn "  Newer runtime paths may stay untracked-and-unignored until the next full install."
+        return 0
+    fi
+    # shellcheck source=lib/locate-daemon-bin.sh
+    # shellcheck disable=SC1091
+    source "$locate_lib"
+    # Prefer a binary in the source checkout (matches the version being synced);
+    # the resolver falls back to $LOOM_DAEMON_BIN / `loom-daemon` on PATH.
+    bin="$(loom_locate_daemon_bin "$SOURCE_ROOT")"
+    if [[ -z "$bin" ]]; then
+        warn "Could not refresh the Loom-managed .gitignore block: no loom-daemon binary resolved"
+        warn "  (\$LOOM_DAEMON_BIN -> 'loom-daemon' on PATH -> build-output under $SOURCE_ROOT)."
+        warn "  Newer runtime paths (e.g. .loom/sweep-checkpoint/, .loom/worktrees-local/) may stay untracked-and-unignored."
+        return 0
+    fi
+    # `update-gitignore` has no dedicated --dry-run; on a dry run we only probe
+    # that the subcommand exists (never writing), so the preview neither mutates
+    # nor claims a refresh a pre-#4280 binary cannot perform.
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        if "$bin" update-gitignore --help >/dev/null 2>&1; then
+            note "  ${BOLD}would refresh${NC} .gitignore (loom-managed block, via $bin)"
+        else
+            warn ".gitignore refresh unavailable: '$bin' has no 'update-gitignore' subcommand (rebuild the daemon)."
+        fi
+        return 0
+    fi
+    if "$bin" update-gitignore "$REPO_ROOT" >/dev/null 2>&1; then
+        note "  ${GREEN}refreshed${NC} .gitignore (loom-managed block, via $bin)"
+    else
+        warn ".gitignore refresh failed: '$bin update-gitignore' errored"
+        warn "  (a pre-#4280 daemon lacks this subcommand — rebuild loom-daemon)."
+    fi
+}
+refresh_gitignore_block
+
+# ---------- audit: untracked-and-unignored paths under .loom/ (#4280) ----------
+#
+# After the block refresh, anything STILL surfacing as untracked-and-unignored
+# under .loom/ is a Loom-owned runtime path the pattern list does not yet cover
+# (an enumerated list always trails reality). Surface it as a warning so it can
+# be added to EPHEMERAL_PATTERNS, instead of silently dirtying the consumer's
+# `git status` (or being swept into a commit by `git add -A`). `git status
+# --porcelain` already excludes ignored files, so every `??` entry here is by
+# definition untracked-and-unignored; tracked install-owned files never appear.
+
+audit_untracked_loom_paths() {
+    [[ -d "$REPO_ROOT/.loom" ]] || return 0
+    local out
+    out="$(git -C "$REPO_ROOT" status --porcelain -- .loom/ 2>/dev/null | sed -n 's/^?? //p')"
+    [[ -z "$out" ]] && return 0
+    warn "Untracked-and-unignored path(s) under .loom/ (not covered by the managed .gitignore block):"
+    local p
+    while IFS= read -r p; do
+        [[ -z "$p" ]] && continue
+        printf '%b\n' "${YELLOW}    $p${NC}" >&2
+    done <<< "$out"
+    warn "If these are Loom runtime state, add them to EPHEMERAL_PATTERNS (loom-daemon/src/init/post_init.rs)."
+}
+audit_untracked_loom_paths
 
 # ---------- summary ----------
 

@@ -7,6 +7,7 @@ use loom_daemon::daemon_install_state::{self, InstallStateReport};
 use loom_daemon::epic_supervisor;
 use loom_daemon::event_bus::EventBus;
 use loom_daemon::health_monitor;
+use loom_daemon::host_breaker;
 use loom_daemon::ipc::IpcServer;
 use loom_daemon::main_health_gate;
 use loom_daemon::metrics_collector;
@@ -78,6 +79,21 @@ enum Commands {
         /// Print what would be done without making changes
         #[arg(long)]
         dry_run: bool,
+    },
+
+    /// Rewrite only the marker-delimited Loom-managed `.gitignore` block in a
+    /// workspace, converging it on the current `EPHEMERAL_PATTERNS` set without
+    /// running a full `init` (Issue #4280). This is the standalone entry point
+    /// `defaults/scripts/resync-installed.sh` invokes so existing consumer
+    /// installs pick up newly-ignored runtime paths (e.g. `.loom/sweep-checkpoint/`,
+    /// `.loom/worktrees-local/`) at resync time — the pattern list stays
+    /// single-sourced in the daemon, never copied into shell. Idempotent: a
+    /// workspace already carrying the current block is a byte-for-byte no-op.
+    UpdateGitignore {
+        /// Target workspace directory (the repo root whose `.gitignore` to
+        /// refresh). Defaults to the current directory.
+        #[arg(value_name = "PATH", default_value = ".")]
+        workspace: String,
     },
 
     /// Display agent effectiveness and activity metrics
@@ -173,6 +189,12 @@ enum Commands {
         /// branch.
         #[arg(long, value_name = "P")]
         depends_on: Option<u32>,
+
+        /// Override the host-distress circuit breaker (Issue #4235). By default a
+        /// *tripped* breaker (sustained host distress) refuses an explicit
+        /// dispatch; pass `--force` to dispatch anyway.
+        #[arg(long)]
+        force: bool,
     },
 
     /// Manage durable operator watches on issue/PR terminal state (Issue #3971).
@@ -657,7 +679,8 @@ async fn main() -> Result<()> {
                 model,
                 effort,
                 depends_on,
-            } => handle_dispatch_command(issue, workspace, model, effort, depends_on).await,
+                force,
+            } => handle_dispatch_command(issue, workspace, model, effort, depends_on, force).await,
             // `watch` connects to the running daemon over its Unix socket to
             // register/list/remove durable watches (Issue #3971).
             Commands::Watch { action } => handle_watch_command(action).await,
@@ -774,6 +797,14 @@ async fn main() -> Result<()> {
     // recovery on restart relies on lock dirs + sweep checkpoints + the
     // forge (labels). The reaper task polls live PIDs on a configurable
     // interval (`LOOM_SWEEP_REAPER_INTERVAL_SECS`, default 30s).
+    //
+    // `sweep_workspace` seeds the *default* registry only. As of #4299, an
+    // explicit-`workspace_root`-absent `DispatchSweep`/`dispatch_sweep`
+    // request no longer blindly trusts this cwd-derived value as its target:
+    // `ipc::resolve_dispatch_registry` consults the on-disk workspace
+    // registry first and only falls back to this default when the registry
+    // is empty or this root is itself registered. See that function's doc
+    // comment for the full precedence.
     let sweep_workspace = workspace_from_env
         .as_ref()
         .map(std::path::PathBuf::from)
@@ -1147,6 +1178,26 @@ async fn main() -> Result<()> {
         // config as the gate's master switch (env > config > default(on)).
         let suppress_dispatch_during_gate = main_health_gate::resolve_suppress_dispatch_during_gate(
             &main_health_gate::read_autonomous_gate_config(&sweep_workspace),
+        );
+        // Host-distress circuit breaker (#4235): resolve its config once at
+        // startup (env > config > default, default-ON) from the daemon's primary
+        // workspace and register the process-global handle. The work-finder loop
+        // (spawned just below) samples load-per-core into it each tick and
+        // consults it as a second dispatch suppressor; `loom-daemon status` and
+        // the `dispatch_sweep` IPC handler read it via the same global. Registered
+        // only when the work-finder is enabled, since the loop is the breaker's
+        // sole sampler — a daemon with no work-finder never trips it (and its
+        // dispatch_sweep sees a Closed/absent breaker: zero behavior change).
+        let host_breaker_config = host_breaker::resolve_config_for(&sweep_workspace);
+        host_breaker::register_global(std::sync::Arc::new(host_breaker::SharedHostBreaker::new(
+            host_breaker_config,
+        )));
+        log::info!(
+            "host_breaker: enabled={} (load_per_core_trip={:.2}, sustain_ticks={}, cooldown_secs={})",
+            host_breaker_config.enabled,
+            host_breaker_config.load_per_core_threshold,
+            host_breaker_config.sustain_ticks,
+            host_breaker_config.cooldown_secs,
         );
         log::info!(
             "work_finder: enabled (multi-workspace, interval={}s, configured_max={configured_max}, \
@@ -1658,6 +1709,31 @@ mod resolve_paths_tests {
 }
 
 /// Handle CLI commands (init, stats, validate modes)
+/// Handle `loom-daemon update-gitignore [PATH]` (Issue #4280).
+///
+/// Rewrites only the marker-delimited Loom-managed `.gitignore` block, converging
+/// it on the current `EPHEMERAL_PATTERNS` set. This is the standalone refresh
+/// entry point `resync-installed.sh` calls so existing consumer installs pick up
+/// newly-ignored runtime paths without a full `init`. Idempotent: a workspace
+/// already carrying the current block is a byte-for-byte no-op.
+fn handle_update_gitignore_command(workspace: &str) -> Result<()> {
+    let workspace_path = std::path::Path::new(workspace);
+    let absolute_workspace = if workspace_path.is_absolute() {
+        workspace_path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(workspace_path)
+    };
+
+    loom_daemon::init::update_gitignore(&absolute_workspace)
+        .map_err(|e| anyhow!("Failed to update .gitignore: {e}"))?;
+
+    println!(
+        "Refreshed the Loom-managed .gitignore block in {}",
+        absolute_workspace.display()
+    );
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 fn handle_cli_command(command: Commands) -> Result<()> {
     match command {
@@ -1675,6 +1751,7 @@ fn handle_cli_command(command: Commands) -> Result<()> {
         } => handle_stats_command(role.as_deref(), issue, weekly, &format),
         Commands::Workspace { action } => handle_workspace_command(action),
         Commands::Tokens { action } => handle_tokens_command(action),
+        Commands::UpdateGitignore { workspace } => handle_update_gitignore_command(&workspace),
         Commands::Status { .. } => {
             // Routed directly in `main()` (it needs the async runtime for the
             // socket round-trip), never dispatched through this sync handler.
@@ -2469,6 +2546,7 @@ fn build_dispatch_request(
     model: Option<String>,
     effort: Option<String>,
     depends_on: Option<u32>,
+    force: bool,
 ) -> Request {
     Request::DispatchSweep {
         kind: SweepKind::Issue(issue),
@@ -2479,7 +2557,37 @@ fn build_dispatch_request(
         effort,
         depends_on,
         workspace_root: workspace,
+        // Host-distress circuit-breaker override (#4235): default false, so a
+        // tripped breaker refuses the dispatch unless the operator passes --force.
+        force,
     }
+}
+
+/// Resolve the `dispatch` subcommand's effective `--workspace` (Issue #4299):
+/// an explicit `--workspace` always wins; when absent, defaults it from the
+/// CLI process's own `cwd` if `cwd` falls under a registered workspace root —
+/// the daemon cannot see the client's cwd, so if that resolution is going to
+/// happen at all it must happen client-side, before the `DispatchSweep`
+/// request is built. This is what fixes `loom-daemon dispatch <N>` run from
+/// inside a registered repo previously making no difference. A `cwd` outside
+/// every registered root (or an empty registry) leaves the result `None`, and
+/// the daemon's own registry-based resolution (`ipc::resolve_dispatch_registry`)
+/// then applies.
+///
+/// Pure and side-effect-free — takes the already-resolved `cwd` and
+/// already-loaded `registry` rather than performing I/O itself, so it is
+/// unit-testable without touching the real filesystem/env; `cwd`/`registry`
+/// are resolved once by [`handle_dispatch_command`] via `std::env::current_dir()`
+/// / `WorkspaceRegistry::load_default()`.
+fn resolve_cli_dispatch_workspace(
+    explicit: Option<String>,
+    cwd: &Path,
+    registry: &loom_daemon::workspace_registry::WorkspaceRegistry,
+) -> Option<String> {
+    explicit.or_else(|| {
+        loom_daemon::workspace_registry::resolve_client_workspace_default(cwd, registry)
+            .map(|root| root.to_string_lossy().into_owned())
+    })
 }
 
 /// Handle the `dispatch` subcommand (Issue #3952). Connects to the running
@@ -2487,15 +2595,24 @@ fn build_dispatch_request(
 /// request the MCP `dispatch_sweep` tool uses — but with a bounded client-side
 /// ack timeout so a wedged daemon can never hang the CLI (the #3945 failure
 /// mode). On success prints the sweep id + per-sweep log path and exits 0.
+///
+/// See [`resolve_cli_dispatch_workspace`] for the `--workspace` default logic
+/// applied here (Issue #4299).
 async fn handle_dispatch_command(
     issue: u32,
     workspace: Option<String>,
     model: Option<String>,
     effort: Option<String>,
     depends_on: Option<u32>,
+    force: bool,
 ) -> Result<()> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let registry =
+        loom_daemon::workspace_registry::WorkspaceRegistry::load_default().unwrap_or_default();
+    let workspace = resolve_cli_dispatch_workspace(workspace, &cwd, &registry);
+
     let socket_path = resolve_socket_path()?;
-    let request = build_dispatch_request(issue, workspace, model, effort, depends_on);
+    let request = build_dispatch_request(issue, workspace, model, effort, depends_on, force);
     let ack_timeout = resolve_dispatch_ack_timeout();
 
     match query_daemon_bounded(&socket_path, &request, ack_timeout).await {
@@ -2618,7 +2735,7 @@ async fn handle_status_command(json: bool, pipeline: bool) -> Result<()> {
     let token_usage = collect_token_usage();
 
     // Self-update staleness (#3968): purely local, read-only — compares the
-    // commit baked into THIS `loom-daemon --status` binary against the source
+    // commit baked into THIS `loom-daemon status` binary against the source
     // checkout's current HEAD, when that checkout is still on this machine.
     // Advisory only; never triggers a rebuild or restart (see
     // `.loom/scripts/cli/loom-daemon-update.sh` for the opt-in update flow).
@@ -3036,6 +3153,22 @@ fn print_status_json(
             "terminal_reason": report.auto_update_terminal_reason,
             "note": report.auto_update_note,
         },
+        // Host-distress circuit breaker (#4235) — `null` when no breaker is
+        // registered (work-finder off / breaker disabled). Otherwise the current
+        // phase (closed/open/cooldown), why it tripped, and the cool-down
+        // release time so a scripted consumer sees a paused-dispatch host.
+        "host_breaker": report.host_breaker.as_ref().map(|h| serde_json::json!({
+            "enabled": h.enabled,
+            "phase": h.phase,
+            "suppressed": h.suppressed,
+            "reason": h.reason,
+            "tripped_at": h.tripped_at,
+            "releases_at": h.releases_at,
+            "last_load_per_core": h.last_load_per_core,
+            "load_per_core_threshold": h.load_per_core_threshold,
+            "sustain_ticks": h.sustain_ticks,
+            "cooldown_secs": h.cooldown_secs,
+        })),
     });
     println!("{}", serde_json::to_string_pretty(&combined)?);
     Ok(())
@@ -3414,6 +3547,55 @@ fn print_status_human(
         println!("Drain: not draining (last: {note})");
     }
 
+    // Host-distress circuit breaker (#4235): surface the phase, why it tripped,
+    // and when the cool-down releases so an operator sees a paused-dispatch host
+    // and can tell it apart from a main-health halt or a drain. A Closed breaker
+    // prints a one-line "OK" with its configured thresholds; an absent breaker
+    // (work-finder off / disabled) prints nothing.
+    if let Some(hb) = &report.host_breaker {
+        let load = hb
+            .last_load_per_core
+            .map_or_else(|| "n/a".to_string(), |l| format!("{l:.2}"));
+        match hb.phase.as_str() {
+            "closed" => {
+                if hb.enabled {
+                    println!(
+                        "Host breaker: OK (closed; load/core {load}, trip ≥ {:.2} for {} tick(s), cooldown {}s)",
+                        hb.load_per_core_threshold, hb.sustain_ticks, hb.cooldown_secs
+                    );
+                } else {
+                    println!("Host breaker: disabled");
+                }
+            }
+            "open" => {
+                println!(
+                    "Host breaker: OPEN — new dispatch paused, running work draining ({})",
+                    hb.reason.as_deref().unwrap_or("sustained host distress")
+                );
+                if let Some(t) = hb.tripped_at {
+                    println!("  tripped at: {t}");
+                }
+            }
+            "cooldown" => {
+                let releases = hb.releases_at.map_or_else(
+                    || "unknown".to_string(),
+                    |r| {
+                        let secs = (r - Utc::now()).num_seconds();
+                        if secs >= 0 {
+                            format!("in {secs}s ({r})")
+                        } else {
+                            format!("overdue by {}s ({r})", -secs)
+                        }
+                    },
+                );
+                println!(
+                    "Host breaker: COOLING DOWN — dispatch paused, releases {releases} (load/core {load})"
+                );
+            }
+            other => println!("Host breaker: {other}"),
+        }
+    }
+
     // Per-repo breakdown across every registered managed workspace (#3930). In
     // the common single-workspace case this is one line for the daemon's own
     // workspace; with `loom-daemon workspace add <path>` it lists every managed
@@ -3439,12 +3621,29 @@ fn print_status_human(
             );
             let gate = gate_status_short_label(&verdict);
             println!(
-                "  {:>4}  {:>9}  {:<13}  {}",
+                "  {:>4}  {:>9}  {:<13}  {}{}",
                 r.priority,
                 r.in_flight_count,
                 gate,
-                r.root.display()
+                r.root.display(),
+                if r.root_missing {
+                    "  [MISSING ROOT]"
+                } else {
+                    ""
+                }
             );
+            // Issue #4326: a dangling registry entry (root deleted without
+            // `workspace remove`) — the work-finder already warns-and-skips
+            // it on dispatch; this is the operator-facing pointer to clean it
+            // up (or, if the root is only transiently unavailable, e.g. an
+            // unmounted volume, to leave it registered).
+            if r.root_missing {
+                println!(
+                    "        root does not exist on disk — dispatch is skipped; \
+                     run `loom-daemon workspace remove {}` if this is permanent",
+                    r.root.display()
+                );
+            }
             // Name the failure class behind a not-evaluated repo (#3974 AC2) so
             // the operator can tell "dirty tree" from "cargo not on PATH".
             if let Some(reason) = &r.health_gate_not_evaluated_reason {
@@ -4663,8 +4862,8 @@ mod dispatch_tests {
     //! deliberately-unresponsive socket (the #3945 wedge must never hang).
     use super::{
         build_dispatch_request, classify_gate_verdict, format_gate_status, gate_status_short_label,
-        query_daemon_bounded, resolve_dispatch_ack_timeout, GateVerdict, DAEMON_IPC_TIMEOUT_ENV,
-        DISPATCH_ACK_TIMEOUT,
+        query_daemon_bounded, resolve_cli_dispatch_workspace, resolve_dispatch_ack_timeout,
+        GateVerdict, DAEMON_IPC_TIMEOUT_ENV, DISPATCH_ACK_TIMEOUT,
     };
     use chrono::{DateTime, Utc};
     use loom_daemon::types::{Request, Response, SweepKind};
@@ -4683,6 +4882,7 @@ mod dispatch_tests {
             Some("sonnet".to_string()),
             Some("high".to_string()),
             Some(3945),
+            true,
         );
         match request {
             Request::DispatchSweep {
@@ -4692,6 +4892,7 @@ mod dispatch_tests {
                 effort,
                 depends_on,
                 workspace_root,
+                force,
             } => {
                 assert_eq!(kind, SweepKind::Issue(3952));
                 assert_eq!(idempotency_key, None);
@@ -4699,6 +4900,7 @@ mod dispatch_tests {
                 assert_eq!(effort.as_deref(), Some("high"));
                 assert_eq!(depends_on, Some(3945));
                 assert_eq!(workspace_root.as_deref(), Some("/some/repo"));
+                assert!(force, "--force must plumb through to the request");
             }
             other => panic!("expected DispatchSweep, got {other:?}"),
         }
@@ -4708,7 +4910,7 @@ mod dispatch_tests {
     /// every override `None`, so the daemon applies its own defaults.
     #[test]
     fn build_dispatch_request_defaults_are_none() {
-        let request = build_dispatch_request(42, None, None, None, None);
+        let request = build_dispatch_request(42, None, None, None, None, false);
         match request {
             Request::DispatchSweep {
                 kind,
@@ -4716,6 +4918,7 @@ mod dispatch_tests {
                 effort,
                 depends_on,
                 workspace_root,
+                force,
                 ..
             } => {
                 assert_eq!(kind, SweepKind::Issue(42));
@@ -4723,9 +4926,51 @@ mod dispatch_tests {
                 assert!(effort.is_none());
                 assert!(depends_on.is_none());
                 assert!(workspace_root.is_none());
+                assert!(!force, "force defaults to false");
             }
             other => panic!("expected DispatchSweep, got {other:?}"),
         }
+    }
+
+    // ===== `resolve_cli_dispatch_workspace` (Issue #4299) =====
+
+    /// An explicit `--workspace` always wins, regardless of cwd/registry state.
+    #[test]
+    fn resolve_cli_dispatch_workspace_explicit_always_wins() {
+        let registry = loom_daemon::workspace_registry::WorkspaceRegistry::default();
+        let resolved = resolve_cli_dispatch_workspace(
+            Some("/explicit/repo".to_string()),
+            std::path::Path::new("/somewhere/else"),
+            &registry,
+        );
+        assert_eq!(resolved.as_deref(), Some("/explicit/repo"));
+    }
+
+    /// Issue #4299's core CLI fix: running `loom-daemon dispatch <N>` from
+    /// inside a registered repo (no `--workspace` flag) must default
+    /// `workspace_root` to that repo's root.
+    #[test]
+    fn resolve_cli_dispatch_workspace_defaults_from_cwd_inside_registered_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+
+        let mut registry = loom_daemon::workspace_registry::WorkspaceRegistry::default();
+        registry.add(&repo, None).unwrap();
+
+        let canonical_repo = std::fs::canonicalize(&repo).unwrap();
+        let resolved = resolve_cli_dispatch_workspace(None, &repo, &registry);
+        assert_eq!(resolved, Some(canonical_repo.to_string_lossy().into_owned()));
+    }
+
+    /// A cwd outside every registered root (or an empty registry) leaves the
+    /// result `None` — the daemon's own registry-based resolution applies.
+    #[test]
+    fn resolve_cli_dispatch_workspace_none_when_cwd_unregistered() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = loom_daemon::workspace_registry::WorkspaceRegistry::default();
+        let resolved = resolve_cli_dispatch_workspace(None, dir.path(), &registry);
+        assert_eq!(resolved, None);
     }
 
     /// A fake daemon that accepts one connection, verifies the received request
@@ -4780,6 +5025,7 @@ mod dispatch_tests {
             Some("sonnet".to_string()),
             Some("high".to_string()),
             Some(3945),
+            false,
         );
         let response = query_daemon_bounded(&socket_path, &request, Duration::from_secs(5))
             .await
@@ -4819,7 +5065,7 @@ mod dispatch_tests {
             tokio::time::sleep(Duration::from_secs(30)).await;
         });
 
-        let request = build_dispatch_request(3952, None, None, None, None);
+        let request = build_dispatch_request(3952, None, None, None, None, false);
         let started = std::time::Instant::now();
         let result = query_daemon_bounded(&socket_path, &request, Duration::from_millis(200)).await;
         let elapsed = started.elapsed();
@@ -4840,7 +5086,7 @@ mod dispatch_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let socket_path = dir.path().join("nonexistent.sock");
 
-        let request = build_dispatch_request(3952, None, None, None, None);
+        let request = build_dispatch_request(3952, None, None, None, None, false);
         let result = query_daemon_bounded(&socket_path, &request, Duration::from_millis(500)).await;
 
         assert!(result.is_err(), "expected a connect error, got {result:?}");
@@ -4886,7 +5132,7 @@ mod dispatch_tests {
             writer.flush().await.expect("flush");
         });
 
-        let request = build_dispatch_request(3952, None, None, None, None);
+        let request = build_dispatch_request(3952, None, None, None, None, false);
         let started = std::time::Instant::now();
         // Use the CLI's real default budget — the exact value a plain
         // `loom-daemon dispatch` resolves to with no env override.
@@ -5200,6 +5446,7 @@ mod status_client_tests {
             auto_update_backoff_secs: None,
             auto_update_terminal_reason: None,
             auto_update_note: None,
+            host_breaker: None,
         }
     }
 

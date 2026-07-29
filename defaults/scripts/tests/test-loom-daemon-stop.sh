@@ -51,6 +51,14 @@ assert_eq() {
 # loaded job on the host machine, regardless of platform.
 FAKE_LABEL="$(launchd_sandbox_new_label)"
 
+# Scratch systemd unit (#4268), the systemd analog of FAKE_LABEL: exported so
+# EVERY stop invocation below (not just the new systemd-tier cases) resolves a
+# guaranteed-nonexistent unit. On a Darwin runner `systemctl` is absent so the
+# systemd tier is never taken; on a real systemd Linux host this ensures the
+# existing cases probe a scratch unit (is-active/is-enabled false → fall through
+# to the pid tier) and can NEVER disable the operator's real loom-daemon.service.
+export LOOM_SYSTEMD_UNIT="loom-daemon-test-$$.service"
+
 WORKDIR="$(mktemp -d)"
 
 # Suite-level safety guard (#4078): a decoy process whose argv ends in
@@ -333,6 +341,133 @@ if echo "$help_out2" | grep -q 'restarting' && echo "$help_out2" | grep -qi 'aut
 else
     TESTS_FAILED=$((TESTS_FAILED + 1))
     echo -e "${RED}✗${NC} --help documents --restarting and the autonomy-desired marker"
+fi
+
+# ---------- systemd --user ownership tier (#4268) ----------
+# The Linux mirror of the launchd bootout tier. Detection uses the test-only
+# LOOM_SYSTEMD_FORCE=1 seam plus a stub `systemctl` on PATH (mirroring the stub
+# launchctl above). The stub models unit state via a `down` marker file so the
+# post-disable is-active re-check flips to inactive.
+SD_BIN="$WORKDIR/sd-bin"; mkdir -p "$SD_BIN"
+SD_STATE="$WORKDIR/sd-state"; mkdir -p "$SD_STATE"
+SD_LOG="$WORKDIR/sd-stop.log"
+make_sd_stop_stub() {
+    : > "$SD_LOG"
+    rm -f "$SD_STATE/down"
+    cat > "$SD_BIN/systemctl" <<EOF
+#!/usr/bin/env bash
+echo "\$*" >> "$SD_LOG"
+if [[ "\${1:-}" == "--user" ]]; then shift; fi
+DOWN="$SD_STATE/down"
+case "\${1:-}" in
+  is-active)  [[ -f "\$DOWN" ]] && exit 3; exit 0 ;;   # exit 3 = inactive
+  is-enabled) [[ -f "\$DOWN" ]] && exit 1; exit 0 ;;
+  disable)    touch "\$DOWN"; exit 0 ;;                 # disable --now => now inactive
+  *) exit 0 ;;
+esac
+EOF
+    chmod +x "$SD_BIN/systemctl"
+}
+
+# SD1. Forced systemd tier: an active unit is stopped + DISABLED (disable --now),
+#      the stop exits 0, and the autonomy-desired marker is cleared.
+make_sd_stop_stub
+mkdir -p "$WORKDIR/.loom"
+printf 'started_at=x\n' > "$WORKDIR/.loom/autonomy-desired"
+( cd "$WORKDIR" && PATH="$SD_BIN:$PATH" LOOM_SYSTEMD_FORCE=1 \
+    LOOM_LAUNCHD_LABEL="$FAKE_LABEL" LOOM_AUTONOMY_MARKER="$WORKDIR/.loom/autonomy-desired" \
+    bash "$STOP_SCRIPT" >/dev/null 2>&1 )
+sd_rc=$?
+assert_eq "0" "$sd_rc" "systemd tier: stop of an active unit exits 0"
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q -- "--user disable --now $LOOM_SYSTEMD_UNIT" "$SD_LOG"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} systemd tier: runs 'systemctl --user disable --now <unit>' (stop + disable so reboot cannot resurrect)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} systemd tier: runs 'systemctl --user disable --now <unit>'"
+    echo "  systemctl calls: $(cat "$SD_LOG")"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ ! -f "$WORKDIR/.loom/autonomy-desired" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} systemd tier: operator stop clears the autonomy-desired marker"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} systemd tier: operator stop clears the autonomy-desired marker"
+fi
+# SD1b (#4260 sub-issue D): the same operator stop also tears down the
+# watchdog timer + service pair, symmetric with the launchd bootout tier.
+# Naming mirrors loom-daemon-start.sh's resolve_systemd_watchdog_unit():
+# <daemon unit>-watchdog(.timer|.service).
+SD_WD_UNIT="${LOOM_SYSTEMD_UNIT%.service}-watchdog"
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q -- "--user disable --now ${SD_WD_UNIT}.timer" "$SD_LOG" \
+    && grep -q -- "--user disable --now ${SD_WD_UNIT}.service" "$SD_LOG"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} systemd tier: operator stop disables the watchdog timer + service"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} systemd tier: operator stop disables the watchdog timer + service"
+    echo "  systemctl calls: $(cat "$SD_LOG")"
+fi
+
+# SD2. Post-disable verification: if the unit is STILL active after disable --now
+#      (a disable that did not stick — the inverted-#4011 silent-success hole),
+#      the stop exits non-zero instead of reporting success.
+: > "$SD_LOG"
+cat > "$SD_BIN/systemctl" <<EOF
+#!/usr/bin/env bash
+echo "\$*" >> "$SD_LOG"
+if [[ "\${1:-}" == "--user" ]]; then shift; fi
+case "\${1:-}" in
+  is-active)  exit 0 ;;   # ALWAYS active — disable did not stick
+  is-enabled) exit 0 ;;
+  disable)    exit 0 ;;
+  *) exit 0 ;;
+esac
+EOF
+chmod +x "$SD_BIN/systemctl"
+stuck_out=$( cd "$WORKDIR" && PATH="$SD_BIN:$PATH" LOOM_SYSTEMD_FORCE=1 \
+    LOOM_LAUNCHD_LABEL="$FAKE_LABEL" bash "$STOP_SCRIPT" 2>&1 )
+stuck_rc=$?
+assert_eq "1" "$stuck_rc" "systemd tier: unit still active after disable --now → stop exits non-zero"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$stuck_out" | grep -qi 'still active'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} systemd tier: reports the still-active unit instead of success"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} systemd tier: reports the still-active unit instead of success"
+fi
+
+# SD3. Symmetry (#4078 analog): LOOM_DAEMON_SYSTEMD=0 disables ALL systemd
+#      interaction, so NO systemctl call is made even with the stub on PATH and
+#      detection forced — the stop routes to the pid/nohup tier.
+make_sd_stop_stub
+( cd "$WORKDIR" && PATH="$SD_BIN:$PATH" LOOM_SYSTEMD_FORCE=1 LOOM_DAEMON_SYSTEMD=0 \
+    LOOM_LAUNCHD_LABEL="$FAKE_LABEL" bash "$STOP_SCRIPT" >/dev/null 2>&1 )
+sym_rc=$?
+assert_eq "0" "$sym_rc" "LOOM_DAEMON_SYSTEMD=0: stop exits 0 (pid/nohup tier)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ ! -s "$SD_LOG" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} LOOM_DAEMON_SYSTEMD=0: stop performs no systemctl call at all (symmetric with --no-systemd)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} LOOM_DAEMON_SYSTEMD=0: stop performs no systemctl call at all"
+    echo "  systemctl calls: $(cat "$SD_LOG")"
+fi
+
+# SD4. --help documents the systemd disable counterpart + the LOOM_DAEMON_SYSTEMD
+#      escape hatch.
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$help_out" | grep -qi 'systemd' && echo "$help_out" | grep -q 'LOOM_DAEMON_SYSTEMD'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} --help documents the systemd disable counterpart + LOOM_DAEMON_SYSTEMD"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} --help documents the systemd disable counterpart + LOOM_DAEMON_SYSTEMD"
 fi
 
 # ---------- machine mode (Epic #3835 Phase 3b, #4229) ----------

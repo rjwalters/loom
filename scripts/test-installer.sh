@@ -155,6 +155,45 @@ ROOT_CLAUDE_EOF
     fi
   fi
 
+  # Inject the LEGACY project-level Loom hook entries into the simulated
+  # .claude/settings.json. As of Epic #3835 Phase 5 (#4262) a fresh install no
+  # longer wires project-level hooks (they execute machine-level via user-scope
+  # ~/.claude/settings.json, and defaults/.claude/settings.json dropped its
+  # `hooks` block), so the copy above yields a hook-less settings file. This
+  # simulator, however, stands in for an ALREADY-installed / transition repo —
+  # the shape Phase 5 explicitly preserves (existing project entries are NOT
+  # removed until Phase 6 / #4254) and the shape the uninstall + project-hook
+  # tests below validate. Re-add the historical `${CLAUDE_PROJECT_DIR}`-prefixed
+  # entries so those tests keep exercising the legacy layout.
+  if [[ -f "$target/.claude/settings.json" ]] && command -v jq >/dev/null 2>&1; then
+    _sim_tmp="$(mktemp)"
+    if jq '
+      .hooks = {
+        "PreToolUse": [
+          { "matcher": "Bash", "hooks": [
+            { "type": "command", "command": "${CLAUDE_PROJECT_DIR}/.loom/hooks/guard-destructive.sh" },
+            { "type": "command", "command": "${CLAUDE_PROJECT_DIR}/.loom/hooks/guard-loom-workflow.sh" }
+          ] }
+        ],
+        "UserPromptSubmit": [
+          { "matcher": "", "hooks": [
+            { "type": "command", "command": "${CLAUDE_PROJECT_DIR}/.loom/hooks/skill-router.sh" },
+            { "type": "command", "command": "${CLAUDE_PROJECT_DIR}/.loom/hooks/methodology-inject.sh" }
+          ] }
+        ],
+        "Stop": [
+          { "hooks": [
+            { "type": "command", "command": "${CLAUDE_PROJECT_DIR}/.loom/hooks/guard-background-subagents.sh" }
+          ] }
+        ]
+      }
+    ' "$target/.claude/settings.json" > "$_sim_tmp" 2>/dev/null; then
+      mv "$_sim_tmp" "$target/.claude/settings.json"
+    else
+      rm -f "$_sim_tmp"
+    fi
+  fi
+
   # Copy .github directory (labels.yml)
   if [[ -d "$DEFAULTS_DIR/.github" ]]; then
     mkdir -p "$target/.github"
@@ -3022,6 +3061,38 @@ if [[ -f "$LOOM_ROOT/scripts/install/provision-skills.sh" ]]; then
   pass "scripts/install/provision-skills.sh present"
 else
   fail "scripts/install/provision-skills.sh missing"
+fi
+echo ""
+
+# ==========================================================================
+# User-scope guard-hook wiring (Epic #3835 Phase 5, #4262)
+# ==========================================================================
+# Its own unit suite lives at defaults/scripts/tests/test-provision-hooks.sh
+# (missing/empty/populated settings merge, idempotence incl. #4200 requoted
+# dedup, operator-hook/permissions preservation, invalid-JSON soft-fail, pre-
+# mutation backup, the fail-open workspace-gated wrapper, and the checkout-only
+# deprovision). Fold its result into the installer suite so it runs in CI + the
+# build gate rather than dev-only.
+echo "Test: user-scope guard-hook provisioning suite (test-provision-hooks.sh)"
+HOOKS_TEST="$DEFAULTS_DIR/scripts/tests/test-provision-hooks.sh"
+if [[ -f "$HOOKS_TEST" ]]; then
+  set +e
+  HOOKS_TEST_OUT=$(bash "$HOOKS_TEST" 2>&1)
+  HOOKS_TEST_RC=$?
+  set -e
+  if [[ $HOOKS_TEST_RC -eq 0 ]]; then
+    pass "test-provision-hooks.sh: all cases passed"
+  else
+    fail "test-provision-hooks.sh failed (rc=$HOOKS_TEST_RC)"
+    echo "$HOOKS_TEST_OUT" | tail -20
+  fi
+else
+  fail "test-provision-hooks.sh not found at $HOOKS_TEST"
+fi
+if [[ -f "$LOOM_ROOT/scripts/install/provision-hooks.sh" ]]; then
+  pass "scripts/install/provision-hooks.sh present"
+else
+  fail "scripts/install/provision-hooks.sh missing"
 fi
 echo ""
 

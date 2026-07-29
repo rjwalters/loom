@@ -111,6 +111,31 @@ check "no guard → empty output" "" "$OUT"
 check "no guard → exit 0" "0" "$RC"
 rm -rf "$REPO"
 
+
+# --- Case 5: machine-level layout (Epic #3835 Phase 5, #4262) --------------
+# When the dispatcher runs from a checkout (SCRIPT_DIR does NOT sit at
+# <repo>/.loom/hooks), the SCRIPT_DIR-relative "../../" resolution would point
+# outside the consuming repo entirely. The user-scope command wrapper
+# resolves the repo root itself and passes it via LOOM_PROJECT_ROOT — confirm
+# the dispatcher prefers that over its SCRIPT_DIR-relative fallback.
+echo "Case 5: LOOM_PROJECT_ROOT env fallback resolves canonical guard from a checkout-shaped SCRIPT_DIR"
+CHECKOUT="$(mktemp -d)"
+mkdir -p "$CHECKOUT/defaults/hooks"
+cp "$DISPATCHER_SRC" "$CHECKOUT/defaults/hooks/guard-destructive.sh"
+cp "$GENERIC_SRC" "$CHECKOUT/defaults/hooks/guard-destructive-generic.sh"
+chmod +x "$CHECKOUT/defaults/hooks/"*.sh
+REPO="$(mktemp -d)"
+mkdir -p "$REPO/.claude/skills/repo/hooks"
+MARK="repo#""29"
+printf '#!/usr/bin/env bash\n# fixed per %s\necho CANON-RAN\nexit 0\n' "$MARK" \
+  > "$REPO/.claude/skills/repo/hooks/guard-destructive.sh"
+chmod +x "$REPO/.claude/skills/repo/hooks/guard-destructive.sh"
+OUT="$(printf '{"tool_input":{"command":"%s"},"cwd":"%s"}\n' "$DANGER" "$REPO" \
+  | LOOM_PROJECT_ROOT="$REPO" bash "$CHECKOUT/defaults/hooks/guard-destructive.sh" 2>/dev/null)"
+check "canonical guard resolved via LOOM_PROJECT_ROOT (checkout-shaped SCRIPT_DIR)" "CANON-RAN" \
+  "$(printf '%s' "$OUT" | grep -o 'CANON-RAN' | head -1)"
+rm -rf "$CHECKOUT" "$REPO"
+
 echo ""
 echo "========================================="
 echo -e "Results: ${PASS} passed, ${FAIL} failed"

@@ -36,6 +36,28 @@ pub const LOOM_HOOK_PREFIX: &str = "${CLAUDE_PROJECT_DIR}/.loom/hooks/";
 #[allow(dead_code)]
 pub const LEGACY_LOOM_HOOK_PREFIX: &str = ".loom/hooks/";
 
+/// Substring marker identifying Loom's **machine-level** hook command form
+/// (Epic #3835 Phase 5, #4262). Where [`LOOM_HOOK_PREFIX`] and
+/// [`LEGACY_LOOM_HOOK_PREFIX`] are project-relative paths that start the
+/// command, the machine-level form is a `bash -c '...'` wrapper (provisioned
+/// into the *user-scope* `~/.claude/settings.json` by
+/// `scripts/install/provision-hooks.sh`, not written by this scaffolding
+/// module) that resolves and execs a hook script from the shared machine
+/// checkout, e.g.:
+///
+/// ```text
+/// bash -c 'R=$(...) || exit 0; ...; H="${LOOM_HOME:-$HOME/.local/share/loom}/defaults/hooks/guard-destructive.sh"; [ -x "$H" ] && exec "$H" || exit 0'
+/// ```
+///
+/// The interesting path segment (`/defaults/hooks/`) appears mid-string, not
+/// at the start, so recognition uses substring containment rather than
+/// `starts_with`. Project-level `.claude/settings.json` never contains this
+/// form today (it is user-scope only), but [`is_loom_hook_command`] still
+/// recognizes it so a future merge/removal pass over project-level settings
+/// (or a hand-copied entry) is not silently treated as a foreign hook.
+#[allow(dead_code)]
+pub const MACHINE_HOOK_MARKER: &str = "/defaults/hooks/";
+
 /// Normalize a hook command string for semantic-duplicate comparison.
 ///
 /// Loom-generated hook commands are a single `${CLAUDE_PROJECT_DIR}`-prefixed
@@ -68,7 +90,9 @@ fn normalize_hook_command(cmd: &str) -> String {
 #[allow(dead_code)]
 fn is_loom_hook_command(cmd: &str) -> bool {
     let normalized = normalize_hook_command(cmd);
-    normalized.starts_with(LOOM_HOOK_PREFIX) || normalized.starts_with(LEGACY_LOOM_HOOK_PREFIX)
+    normalized.starts_with(LOOM_HOOK_PREFIX)
+        || normalized.starts_with(LEGACY_LOOM_HOOK_PREFIX)
+        || normalized.contains(MACHINE_HOOK_MARKER)
 }
 
 /// Loom section markers for CLAUDE.md content preservation
@@ -2348,6 +2372,75 @@ WARNING: Never run `lake build` inside Docker - causes memory corruption.
             hooks_arr.len(),
             1,
             "Quoted-form Loom hook should be removed, got: {hooks_arr:?}"
+        );
+        assert_eq!(hooks_arr[0]["command"], ".claude/hooks/custom-guard.sh");
+    }
+
+    #[test]
+    fn test_remove_loom_hooks_removes_machine_level_form() {
+        // Epic #3835 Phase 5 (#4262): the machine-level `bash -c '...'`
+        // wrapper command (provisioned at user-scope, but exercised here
+        // against a project-level settings.json to prove recognition is not
+        // scope-specific) must be recognized and removed alongside the
+        // legacy/current project-relative prefixes.
+        let mut settings: serde_json::Value = serde_json::from_str(
+            r#"{
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [
+                        {"type": "command", "command": "bash -c 'H=\"${LOOM_HOME:-$HOME/.local/share/loom}/defaults/hooks/guard-destructive.sh\"; [ -x \"$H\" ] && exec \"$H\" || exit 0'"},
+                        {"type": "command", "command": ".claude/hooks/custom-guard.sh"}
+                    ]
+                }]
+            }
+        }"#,
+        )
+        .unwrap();
+
+        remove_loom_hooks(&mut settings);
+
+        let bash_hooks = &settings["hooks"]["PreToolUse"][0]["hooks"];
+        let hooks_arr = bash_hooks.as_array().unwrap();
+        assert_eq!(
+            hooks_arr.len(),
+            1,
+            "machine-level hook command should be removed, got: {hooks_arr:?}"
+        );
+        assert_eq!(hooks_arr[0]["command"], ".claude/hooks/custom-guard.sh");
+    }
+
+    #[test]
+    fn test_is_loom_hook_command_recognizes_all_three_forms() {
+        // Exercised indirectly through remove_loom_hooks above (the function
+        // itself is private); this test locks in the three recognized
+        // command shapes side-by-side so a future edit to the marker/prefix
+        // constants can't silently narrow recognition.
+        let mut settings: serde_json::Value = serde_json::from_str(
+            r#"{
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [
+                        {"type": "command", "command": "${CLAUDE_PROJECT_DIR}/.loom/hooks/guard-destructive.sh"},
+                        {"type": "command", "command": ".loom/hooks/guard-destructive.sh"},
+                        {"type": "command", "command": "bash -c 'H=\"${LOOM_HOME:-$HOME/.local/share/loom}/defaults/hooks/guard-loom-workflow.sh\"; [ -x \"$H\" ] && exec \"$H\" || exit 0'"},
+                        {"type": "command", "command": ".claude/hooks/custom-guard.sh"}
+                    ]
+                }]
+            }
+        }"#,
+        )
+        .unwrap();
+
+        remove_loom_hooks(&mut settings);
+
+        let bash_hooks = &settings["hooks"]["PreToolUse"][0]["hooks"];
+        let hooks_arr = bash_hooks.as_array().unwrap();
+        assert_eq!(
+            hooks_arr.len(),
+            1,
+            "only the non-Loom custom guard should remain, got: {hooks_arr:?}"
         );
         assert_eq!(hooks_arr[0]["command"], ".claude/hooks/custom-guard.sh");
     }

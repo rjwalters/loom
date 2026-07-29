@@ -195,11 +195,37 @@ Inputs:
   field is `#[serde(default)]` on the wire, so pre-#3729 clients remain
   compatible.
 - `workspace_root` (optional, issue #3929) — target managed-workspace root.
-  When omitted, the sweep is dispatched into the daemon's **default** workspace
-  (byte-for-byte unchanged). When set to a registered repo root, the daemon
-  resolves that repo's sweep registry via the `WorkspacePool` and dispatches into
-  its working tree — the way to dispatch into a managed repo other than the
-  default when two repos share issue numbers. `#[serde(default)]` on the wire.
+  When set to a registered repo root, the daemon resolves that repo's sweep
+  registry via the `WorkspacePool` and dispatches into its working tree — the
+  way to dispatch into a managed repo other than the default when two repos
+  share issue numbers. `#[serde(default)]` on the wire.
+
+  **When omitted (issue #4299):** the daemon no longer blindly targets its own
+  seeded default (cwd at startup / `LOOM_WORKSPACE`) — it consults the
+  on-disk `~/.loom/workspaces.json` registry (`WorkspaceRegistry::resolve_dispatch_root`,
+  `workspace_registry.rs`) in this order:
+  1. **Registry empty** -> the seeded default (byte-for-byte pre-#4299 / pre-registry
+     behavior).
+  2. **Seeded default is itself registered** -> the seeded default. This is the
+     back-compat floor: every existing multi-workspace host runs the daemon
+     from a registered repo, so a bare dispatch with no `workspace_root` keeps
+     working with no new flags.
+  3. **Seeded default is NOT registered, exactly one workspace is registered**
+     -> that workspace. This is the case a single-repo worker host (daemon cwd
+     = the machine checkout, one product repo registered) needs: the sole
+     registration is the only sane target.
+  4. **Seeded default is NOT registered, multiple workspaces are registered**
+     -> a structured `CONFIG_WORKSPACE_AMBIGUOUS` error naming every
+     registered root. Issue numbers are per-repo, so guessing which repo
+     "owns" issue N by probing the forge is ill-defined — an explicit
+     `workspace_root`/`--workspace` is required instead. Never a silent cwd
+     fallback.
+
+  This resolution applies to the **dispatch path only**. `list_sweeps`,
+  `get_sweep_status`, and quarantine requests keep their unconditional
+  default-registry fallback for an absent `workspace_root` — read-path default
+  behavior is unchanged (a deliberate scope limit; see the #4299 issue for the
+  follow-up if that also needs to change).
 
 #### `loom-daemon dispatch <issue>` — operator CLI (Issue #3952)
 
@@ -224,6 +250,15 @@ loom-daemon dispatch 3952 --depends-on 3945        # stacked-PR child (#3729)
 | `--model <M>` | `model` | omit to let the daemon resolve `autonomous.model` / the shipped default (#3944) |
 | `--effort <E>` | `effort` | reasoning-effort override (#3716) |
 | `--depends-on <P>` | `depends_on` | single parent issue; child branches off `feature/issue-<P>` (#3729) |
+
+**`--workspace` client-side cwd default (issue #4299).** When `--workspace` is
+omitted, the CLI itself (not the daemon — it cannot see the client's cwd)
+checks whether its own working directory falls under a registered workspace
+root and, if so, populates `workspace_root` with that root before sending the
+request (`resolve_cli_dispatch_workspace` in `main.rs`). This is what makes
+`cd ~/GitHub/anvil && loom-daemon dispatch 758` target anvil even when the
+daemon's own seeded default points elsewhere. A cwd outside every registered
+root leaves `--workspace` unset, and the daemon-side resolution above applies.
 
 **Bounded ack timeout (never hangs).** The CLI waits at most **30s** for the
 daemon to ack the dispatch, then exits **nonzero** with a clear
@@ -1548,6 +1583,12 @@ concurrency ceiling 5" and share it with the team:
         "instaCrashSecs": 60
       }
     },
+    "hostBreaker": {
+      "enabled": true,
+      "loadPerCoreTrip": 2.5,
+      "sustainTicks": 3,
+      "cooldownSecs": 300
+    },
     "mainHealthGate": {
       "enabled": true
     },
@@ -1596,6 +1637,10 @@ exactly like `main_health_gate::read_build_gate_config`.
 | `autonomous.workFinder.quarantine.threshold` | `LOOM_WORK_FINDER_QUARANTINE_THRESHOLD` | `3` | Consecutive insta-crashes before an issue is quarantined. Zero/invalid → default |
 | `autonomous.workFinder.quarantine.ttlSecs` | `LOOM_WORK_FINDER_QUARANTINE_TTL_SECS` | `3600` | How long a quarantine entry persists before auto-release. Zero/invalid → default |
 | `autonomous.workFinder.quarantine.instaCrashSecs` | `LOOM_WORK_FINDER_QUARANTINE_INSTA_CRASH_SECS` | `60` | Checkpoint-less death within this window of dispatch counts as an insta-crash. Zero/invalid → default |
+| `autonomous.hostBreaker.enabled` | `LOOM_HOST_BREAKER` | `true` | Host-distress circuit breaker on/off (#4235). A safety backstop — **defaults on**. Env truthy (`1`/`true`/`yes`/`on`) enables, any other value disables; wins over config. See [Host-distress circuit breaker](#host-distress-circuit-breaker-4235) below |
+| `autonomous.hostBreaker.loadPerCoreTrip` | `LOOM_HOST_BREAKER_LOAD_PER_CORE` | `2.5` | Load-per-core at/over which a tick counts toward tripping. `<= 0`/invalid → default |
+| `autonomous.hostBreaker.sustainTicks` | `LOOM_HOST_BREAKER_SUSTAIN_TICKS` | `3` | Consecutive over-threshold work-finder ticks required to trip (a single spike never trips). Zero/invalid → default |
+| `autonomous.hostBreaker.cooldownSecs` | `LOOM_HOST_BREAKER_COOLDOWN_SECS` | `300` | Cool-down window held after distress subsides before dispatch resumes. Zero/invalid → default |
 | `autonomous.perTokenConcurrency` | `LOOM_PER_TOKEN_CONCURRENCY` | `2` | Concurrent sweeps **per healthy token** in the cap (#3947). Zero/invalid → default; clamped to a floor of 1 |
 | `autonomous.cpuUtilizationTarget` | `LOOM_CPU_UTILIZATION_TARGET` | `0.75` | Fraction of logical CPUs the CPU headroom term is willing to dedicate to sweep work (#3978, config surface #4032). Outside `(0, 1]` or wrong JSON type → default; single-root, resolved once at startup (not per-workspace) |
 | `autonomous.estCoresPerSweep` | `LOOM_EST_CORES_PER_SWEEP` | `2.0` | Estimated CPU cores one concurrent sweep consumes while building/testing (#3978, config surface #4032). `<= 0` or wrong JSON type → default; integer JSON (`2`) and float JSON (`2.0`) both accepted; single-root, resolved once at startup |
@@ -1786,6 +1831,75 @@ candidate is dropped **before** the global slot-fill pass, so a workspace whose
 only candidates are quarantined never reserves a shared dispatch slot — healthy
 sibling work in other repos gets it instead. Defaults **on**; disable with
 `LOOM_WORK_FINDER_QUARANTINE=0` or `autonomous.workFinder.quarantine.enabled = false`.
+
+### Host-distress circuit breaker (#4235)
+
+The insta-crash quarantine above protects the shared **queue** from one broken
+issue; the host circuit breaker protects the **host itself** from a sustained
+overload. It was added after the 2026-07-27→28 meltdown (#4231): a 6-way sweep
+fan-out drove load to 118 on 28 cores, the window server was watchdog-killed five
+times, and the daemon itself crashed — and then a *second* wave re-spiked the host
+two hours later because nothing remembered the first incident. The point-in-time
+admission checks (CPU headroom #3978, the per-tick load-admission ramp cap #4234)
+each make a *fresh* decision every tick, so the instant load dipped they
+re-admitted a full wave.
+
+The breaker is the **stateful** layer those checks lack. It samples
+**load-per-core** (`loadavg_1m / logical_cpus`) once per work-finder tick and runs
+a three-phase state machine:
+
+- **Closed** (normal) → **Open** once load-per-core has been at/over
+  `loadPerCoreTrip` for `sustainTicks` *consecutive* ticks. A single spike resets
+  the counter, so a transient burst never trips.
+- **Open** (tripped) — new dispatch is **suppressed** in every repo while running
+  sweeps **drain untouched** (the breaker never kills a running sweep). Stays Open
+  while the host is still hot.
+- **CoolDown** — once load drops back below the threshold, dispatch stays
+  suppressed for a further `cooldownSecs` so a transient dip can't re-admit a full
+  wave (exactly the #4231 01:41 re-spike). A re-spike over the threshold during
+  cool-down sends it straight back to Open; otherwise the cool-down elapses and it
+  returns to Closed.
+
+The breaker's suppression composes with the existing dispatch suppressors at the
+same choke point — it is OR'd onto the main-health-gate halt and the scheduled
+drain, and works alongside (never bypassing) the `maxAdmissionsPerTick` ramp cap.
+
+**Default-ON rationale.** Unlike the work-finder loop itself (opt-in,
+default-off), the breaker **defaults on** — the same call the insta-crash
+quarantine made. It only ever acts under genuinely severe *sustained* load, it
+never aborts running work, and it is only ever *sampled* from inside the
+work-finder loop, so a daemon that never enables the work-finder sees zero
+behavior change. A backstop that defaulted off would not have prevented #4231's
+second wave, which is the whole point.
+
+**Explicit `dispatch_sweep` is hard-blocked by default (with a `force`
+override).** This differs deliberately from the sibling headroom advisory (#4234),
+which only *advises* an explicit dispatch that would exceed the point-in-time
+dynamic cap and never blocks it. A *tripped* breaker represents **sustained,
+already-observed** distress — a materially stronger signal than a single-tick
+headroom reading — so `dispatch_sweep` (CLI `loom-daemon dispatch <N>` / the
+`mcp__loom__dispatch_sweep` tool) is **refused** while the breaker is Open or
+CoolDown. An operator who knows the host is distressed and wants to dispatch anyway
+passes `--force` (CLI) / `force: true` (IPC / `mcp__loom__dispatch_sweep`).
+
+**Observability.** The breaker is surfaced three ways: a log line on every phase
+change; a state-change-deduped `daemon.host_breaker.state` event-bus event
+(payload: `transition`, `state`, `reason`, `tripped_at`, `releases_at`); and
+`loom-daemon status`, which prints `Host breaker: OK/OPEN/COOLING DOWN` with the
+reason, the tripped-at time, and the cool-down release time (also in
+`--json → host_breaker`).
+
+**Clearing it manually.** The breaker auto-clears when the cool-down elapses on a
+recovered host — no operator action is needed in the normal case. To clear it
+sooner, either resolve the load (it releases on the next below-threshold tick plus
+the cool-down) or restart the daemon (the state is in-memory, like the
+quarantine). To disable it entirely, set `LOOM_HOST_BREAKER=0` or
+`autonomous.hostBreaker.enabled = false`.
+
+**Follow-ups deliberately deferred** (kept out of the first version to stay
+minimal, per #4235): macOS-only trip signals (`.ips` crash reports, `syspolicyd`
+CPU-ratio amplification, daemon self-restart detection) and durable trip/release
+telemetry (coordinate with #4137 rather than building a parallel store).
 
 ### Cross-host dispatch-collision baseline (#4085, Phase 0 of #4028)
 
@@ -2197,8 +2311,12 @@ process:
 - **on macOS, backgrounds the daemon as a launchd LaunchAgent** in the resolved
   per-user domain (`gui/<uid>` with an active GUI login, else the SSH-reachable
   `user/<uid>` background domain — #4130) instead of a plain `nohup … &` (#3972 —
-  see "macOS session-bootstrap hazard" below); on Linux it stays a plain nohup
-  background job with no reboot/crash supervision (deferred to #4260),
+  see "macOS session-bootstrap hazard" below); **on a systemd Linux host,
+  installs + enables a `systemd --user` service** (#4268 — see "systemd user unit
+  (Linux)" below) that mirrors the launchd supervision contract
+  (`Restart=on-success`, disable-on-stop, `LOOM_DAEMON_SUPERVISOR=systemd`); on a
+  non-systemd Linux host (or with `--no-systemd` / `LOOM_DAEMON_SYSTEMD=0`) it
+  stays a plain nohup background job,
 - backgrounds the daemon and writes a PID file at `.loom/.daemon.pid` (gitignored)
   — or, in **machine mode** (dispatcher-driven, `LOOM_MACHINE_CHECKOUT` set,
   #4229), at `$HOME/.loom/.daemon.pid` so the same machine-wide launchd
@@ -2212,7 +2330,11 @@ process:
 `loom-daemon-stop.sh` sends **SIGTERM** (not just Ctrl-C/SIGINT — the daemon now
 handles both, #3813), waits `LOOM_DAEMON_STOP_GRACE_SECS` (default 10s), then
 escalates to SIGKILL. On macOS it additionally `launchctl bootout`s the
-LaunchAgent job definition once the process is confirmed dead (see below).
+LaunchAgent job definition once the process is confirmed dead (see below). On a
+systemd Linux host it detects the `systemd --user` ownership
+(`systemctl --user is-active`/`is-enabled`) and instead stops + **disables** the
+unit (`systemctl --user disable --now`), so a subsequent reboot does not
+resurrect it (#4268 — see "systemd user unit (Linux)" below).
 
 **Shutdown decision — sweeps survive, they are not drained.** A clean daemon stop
 removes the Unix socket and exits, but **does not cancel in-flight `/loom:sweep`
@@ -2274,29 +2396,42 @@ loop is not reusable as the reporter). It has three cooperating parts:
    off. Default-on (read-only, no dispatch side effect); opt out with
    `LOOM_DAEMON_HEARTBEAT=0` / `autonomous.heartbeat.enabled=false`.
 
-3. **Host-side watchdog** (`loom-daemon-watchdog.sh`), the payload of a **second
-   launchd job** (`<daemon-label>-watchdog`) that `loom-daemon-start.sh`
-   provisions on macOS with a `StartInterval` cadence (default 300s). Each run
-   compares intent (marker present?) against reality (daemon loaded + alive?
-   heartbeat fresh?) and, on divergence, appends a loud line to
-   `<loom_dir>/logs/daemon-watchdog.log` and stderr (which launchd captures).
+3. **Host-side watchdog** (`loom-daemon-watchdog.sh`), the payload of a
+   **second, separate scheduled job** from the daemon job/unit itself, that
+   `loom-daemon-start.sh` provisions on a recurring cadence (default 300s):
+   - **Darwin**: a second **launchd job** (`<daemon-label>-watchdog`) on a
+     `StartInterval` cadence.
+   - **systemd Linux** (#4260 sub-issue D): a `Type=oneshot`
+     `<daemon-unit>-watchdog.service` driven by a paired
+     `<daemon-unit>-watchdog.timer` (`OnUnitActiveSec` + `OnBootSec`,
+     `Persistent=false`), `enable --now`'d on the **timer** (mirroring
+     `loom-daemon.service` itself — #4268).
+
+   Each run compares intent (marker present?) against reality (daemon loaded +
+   alive? heartbeat fresh?) and, on divergence, appends a loud line to
+   `<loom_dir>/logs/daemon-watchdog.log` and stderr (which launchd/systemd both
+   capture into the same log via the rendered job/unit's stdout/stderr redirect).
 
 | File | Env override | Config key | Default |
 |------|--------------|-----------|---------|
 | heartbeat cadence | `LOOM_DAEMON_HEARTBEAT_INTERVAL_SECS` | `autonomous.heartbeat.intervalSecs` | `60` |
 | heartbeat on/off | `LOOM_DAEMON_HEARTBEAT` | `autonomous.heartbeat.enabled` | `true` (on) |
-| watchdog interval | `LOOM_WATCHDOG_INTERVAL_SECS` | — | `300` |
+| watchdog interval | `LOOM_WATCHDOG_INTERVAL_SECS` | — | `300` (launchd `StartInterval` / systemd `OnUnitActiveSec`+`OnBootSec`) |
+| watchdog job/unit basename override | `LOOM_WATCHDOG_LABEL` | — | `<daemon label/unit>-watchdog` |
 | staleness threshold | `LOOM_DAEMON_HEARTBEAT_STALE_SECS` | — | `max(5 × cadence, 300)` |
 
-**Why `StartInterval`, not a resident process or `KeepAlive`.** The reporter must
-itself be supervised, but a long-lived resident watchdog just moves the
-who-watches-the-watchdog problem up a level (it too can crash and stay dead). A
-`StartInterval` job owns no long-lived process: launchd re-runs it every interval
-regardless of how the last run exited, so it structurally cannot
-crash-and-stay-dead. `KeepAlive` is deliberately **not** set — it would busy-loop
-a short-lived job. The watchdog exit code (`0` healthy / no daemon expected, `1`
-divergence) is for testability + a human running it by hand; a `StartInterval`
-job's exit code does not affect relaunch.
+**Why an interval timer, not a resident process or `KeepAlive`/`Restart=`.** The
+reporter must itself be supervised, but a long-lived resident watchdog just moves
+the who-watches-the-watchdog problem up a level (it too can crash and stay dead).
+Both scheduling mechanisms own **no long-lived process**: launchd re-runs a
+`StartInterval` job every interval regardless of how the last run exited, and
+systemd's `.timer` re-fires its paired `Type=oneshot` service the same way — so
+neither can crash-and-stay-dead. `KeepAlive`/`Restart=` are deliberately **not**
+set on the watchdog job/service — that would busy-loop a short-lived job/oneshot
+service instead of driving it off a fixed interval clock. The watchdog exit code
+(`0` healthy / no daemon expected, `1` divergence) is for testability + a human
+running it by hand; neither a `StartInterval` job's nor a timer-fired oneshot
+service's exit code affects the next scheduled run.
 
 **Decision matrix** (marker present ⇒ a daemon is expected):
 
@@ -2317,10 +2452,12 @@ disarms the detector — the exact bug class #4011 fixes — so it is an explici
 signal, never an inference. The subsequent start re-writes the marker and
 re-provisions the watchdog.
 
-**Platform + isolation.** The scheduled watchdog is a launchd job, so on Linux /
-the `--no-launchd` nohup path there is no host-side checker provisioned — the
-marker + heartbeat are still written, and `loom-daemon-watchdog.sh` can be run by
-hand or wired to a cron / systemd timer to consume them. `<loom_dir>` is the
+**Platform + isolation.** Darwin and systemd Linux hosts both get a provisioned,
+scheduled watchdog (see the two bullets above). Only the **nohup fallback tier**
+— a non-systemd Linux host, or an explicit `--no-launchd`/`--no-systemd` /
+`LOOM_DAEMON_LAUNCHD=0`/`LOOM_DAEMON_SYSTEMD=0` escape hatch — has no host-side
+checker provisioned: the marker + heartbeat are still written, and
+`loom-daemon-watchdog.sh` can be run by hand or wired to cron. `<loom_dir>` is the
 parent of `LOOM_SOCKET_PATH` (else `~/.loom`), so pointing `LOOM_SOCKET_PATH` at a
 tempdir isolates the marker + heartbeat there too — which is how the lifecycle
 tests avoid ever touching the operator's real `~/.loom`. A forge-side reporting
@@ -2500,14 +2637,69 @@ without an Aqua session, not regressions introduced here.
   XML this invocation would install and exits — no `launchctl` call, no file
   write to `~/Library/LaunchAgents`. Useful for auditing exactly what
   environment/flags a given invocation would forward.
-- **Linux**: unaffected — `nohup` stays the mechanism, since a systemd user
-  session doesn't tie process identity to the spawning shell the way macOS's
-  Mach bootstrap does. Operators who want equivalent extra hardening on Linux
-  (e.g. surviving a `systemd --user` session teardown in an unusual setup) can
-  optionally wrap the start in `systemd-run --user --scope
-  ./.loom/scripts/cli/loom-daemon-start.sh` — not required for the documented
-  failure mode, since it doesn't reproduce on Linux, but available as a
-  belt-and-suspenders option.
+- **Linux**: on a systemd host the daemon is supervised as a `systemd --user`
+  service (#4268), not a bare `nohup` — see "systemd user unit (Linux)" directly
+  below. On a non-systemd host (or with `--no-systemd` / `LOOM_DAEMON_SYSTEMD=0`)
+  `nohup` remains the mechanism, which is safe on Linux because a background
+  process's identity is not tied to the spawning shell the way macOS's Mach
+  bootstrap is (so the #3972 failure mode does not reproduce there — the systemd
+  path is about reboot survival + supervised restart, not that incident).
+
+### systemd user unit (Linux, #4268)
+
+On a systemd Linux host, `loom-daemon-start.sh` installs a `systemd --user`
+service and `systemctl --user enable --now`s it, the Linux mirror of the launchd
+LaunchAgent path above (sub-issue B of #4260). This replaces the pre-#4268 bare
+`nohup … &`, which had no reboot survival, no supervised restart, and no
+disable-on-stop. The contract mirrors launchd point-for-point:
+
+| launchd (Darwin) | systemd `--user` (Linux) |
+|---|---|
+| `RunAtLoad=true` + `launchctl enable` (#3972) | `[Install] WantedBy=default.target` + `systemctl --user enable` |
+| `KeepAlive:{SuccessfulExit:true}` — relaunch only on a clean exit `0` (#4054) | `Restart=on-success` — relaunch only on a clean exit `0` (exact analog; a crash / operator SIGTERM/SIGINT exits non-zero and stays down) |
+| `launchctl bootout` on operator stop | `systemctl --user disable --now <unit>` |
+| plist `EnvironmentVariables` (`LOOM_DAEMON_SUPERVISOR=launchd`, forwarded `LOOM_*`/tokens, deterministic PATH #4172) | `Environment=` lines (`LOOM_DAEMON_SUPERVISOR=systemd`, same forwarded env + PATH) |
+| `WorkingDirectory` = checkout in machine mode (#4229), else repo root | `WorkingDirectory=` — same resolution |
+| `--no-launchd` / `LOOM_DAEMON_LAUNCHD=0` escape hatch (#4078) | `--no-systemd` / `LOOM_DAEMON_SYSTEMD=0` escape hatch |
+| `--print-plist` inspection (no side effects) | `--print-unit` inspection (no side effects) |
+
+- **Unit location & name**: `~/.config/systemd/user/loom-daemon.service` (override
+  the name with `LOOM_SYSTEMD_UNIT`). Regenerated and `daemon-reload`ed on every
+  start, so a later invocation's flags/env always win over a stale unit. Written
+  `0600` when it carries a forwarded `GH_TOKEN`/`GITEA_TOKEN`/`FORGE_TOKEN`.
+- **`LOOM_DAEMON_SUPERVISOR=systemd`** is baked into the unit so the daemon can
+  prove it is supervised before it exits for a supervised restart — recognized
+  daemon-side by `detect_supervisor()` (PR #4298 / #4267). It is hardcoded into the
+  rendered unit (never harvested from the caller's env), so it is present on every
+  supervised start and absent from the nohup path.
+- **Reboot survival requires lingering.** A `systemd --user` manager only runs
+  while the user has a session; the service comes back after a reboot (or an SSH
+  logout) **only** when the user has lingering enabled. Run **`loginctl
+  enable-linger "$USER"`** once on a headless / SSH-only host. Without it the unit
+  is still installed + supervised for the life of the login session, but does not
+  survive a reboot; `loom-daemon-start.sh` prints this reminder on every systemd
+  start.
+- **User-manager reachability fallback.** If `systemctl` is present but the
+  per-user manager is unreachable — a bare SSH login with no lingering and no
+  active user session, so `XDG_RUNTIME_DIR` is unset / `systemctl --user
+  is-system-running` reports `offline` — the start script warns clearly (with the
+  `enable-linger` remedy) and falls back to the nohup path, rather than failing
+  with a cryptic `Failed to connect to bus` error. Detection lives in
+  `is_linux_systemd()` / `systemd_user_manager_reachable()`
+  (`defaults/scripts/lib/systemd-user.sh`, the Linux counterpart to
+  `lib/launchd-domain.sh`, shared by start + stop).
+- **Stop disables the unit.** `loom-daemon-stop.sh` detects the `systemd --user`
+  ownership and runs `systemctl --user disable --now`, then re-verifies the unit is
+  inactive and exits non-zero if it is not (the systemd analog of the launchd
+  bootout-did-not-stick check). `LOOM_DAEMON_SYSTEMD=0` disables all systemd
+  interaction symmetrically, so a `--no-systemd` (nohup) start gets a stop that
+  never touches the user manager.
+- **Crash relaunch is out of scope.** `Restart=on-success` deliberately does
+  **not** relaunch a crashed daemon (a non-zero exit) — that is watchdog territory.
+  On a systemd host it is delivered by the `<unit>-watchdog.timer` +
+  `Type=oneshot` `.service` pair (#4260 sub-issue D, "Autonomy-loss watchdog +
+  heartbeat" above), mirroring the macOS `StartInterval` autonomy-loss watchdog
+  (#4011) — the watchdog *reports* divergence, it does not restart the daemon.
 
 ### macOS TCC hygiene under launchd (#3980)
 
@@ -2799,8 +2991,8 @@ successful-looking run can no longer install a stale binary:
   non-zero** (`5` for a destination mismatch) instead of the pre-#4053 soft
   warn that left the exit code at `0`.
 
-**Read-only "update available" surface (`loom-daemon --status`)**: separately
-from the update script, `loom-daemon --status` / `--status --json` now prints
+**Read-only "update available" surface (`loom-daemon status`)**: separately
+from the update script, `loom-daemon status` / `loom-daemon status --json` now prints
 a purely local, read-only self-update line — the same built-commit-vs-source-HEAD
 comparison, computed in-process (`self_update::check()`) with at most one `git
 rev-parse` subprocess and zero network calls. It never triggers a rebuild or
@@ -2864,7 +3056,7 @@ Each tick (surfaced in `loom-daemon status` — human and `--json` — as
 6. **Backoff + terminal state** — a retryable build failure (script exit `1`,
    spawn/timeout) backs off exponentially (60s → … → 3600s ceiling); a
    commit-identity / build-verification mismatch (#4053 exit `4`/`5`) is
-   **terminal** — surfaced in `--status`, not retried until the source commit
+   **terminal** — surfaced in `loom-daemon status`, not retried until the source commit
    advances. A successful roll resets the counter.
 
 ### End-to-end acceptance playbook

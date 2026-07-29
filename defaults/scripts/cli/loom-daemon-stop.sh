@@ -18,6 +18,16 @@
 #   the reaper reconciles their state on the next start. To actively cancel a
 #   sweep, use `mcp__loom__cancel_sweep` against a running daemon before stopping.
 #
+# Linux systemd --user counterpart (#4268): when loom-daemon-start.sh installed
+# the daemon as a `systemd --user` service, this script detects that ownership
+# (`systemctl --user is-active`/`is-enabled <unit>`) and stops + DISABLES the unit
+# (`systemctl --user disable --now <unit>`) instead of a raw pid kill — the systemd
+# analog of the launchd bootout below. Disabling is what keeps a subsequent reboot
+# from resurrecting the daemon (the unit sets [Install] WantedBy=default.target).
+# The escape hatch LOOM_DAEMON_SYSTEMD=0 disables ALL systemd interaction
+# symmetrically with loom-daemon-start.sh --no-systemd (#4078 analog), falling back
+# to the pid-file/nohup tier.
+#
 # macOS launchd counterpart (#3972): when loom-daemon-start.sh loaded the
 # daemon as a launchd LaunchAgent (in the resolve_launchd_domain() domain —
 # gui/<uid> or user/<uid>, #4130), this script ALSO unloads the launchd
@@ -43,8 +53,11 @@
 #
 # Autonomy-desired marker (#4011): a normal operator stop is INTENT to stop, so
 # it removes the durable `autonomy-desired` marker loom-daemon-start.sh wrote and
-# boots out the watchdog LaunchAgent — after that the watchdog correctly stays
-# silent (no daemon is expected). But the internal stop that
+# tears down the watchdog scheduler — the launchd LaunchAgent on Darwin
+# (`launchctl bootout`), or the `<unit>-watchdog.timer` + `.service` pair on a
+# systemd Linux host (`systemctl --user disable --now`, #4260 sub-issue D) —
+# after that the watchdog correctly stays silent (no daemon is expected). But
+# the internal stop that
 # loom-daemon-update.sh performs is NOT operator intent to stop; it is a restart,
 # so update.sh passes --restarting (or LOOM_DAEMON_STOP_KEEP_INTENT=1) and this
 # script PRESERVES the marker + watchdog. Inferring restart-vs-stop would be
@@ -70,6 +83,11 @@
 #                                 A start done with --no-launchd / LOOM_DAEMON_LAUNCHD=0
 #                                 must get a stop that never reads or mutates the
 #                                 machine-global launchd domain (issue #4078).
+#   LOOM_DAEMON_SYSTEMD           Linux only: 0/false/no disables ALL systemd interaction
+#                                 (is-active/is-enabled lookup + disable --now),
+#                                 symmetric with loom-daemon-start.sh --no-systemd (#4268).
+#   LOOM_SYSTEMD_UNIT             Linux only: the systemd --user unit to stop + disable
+#                                 (default loom-daemon.service); must match the start's.
 #   LOOM_MACHINE_CHECKOUT         Machine mode (Epic #3835 Phase 3b, #4229): set
 #                                 by the `scripts/loom` dispatcher before it execs
 #                                 this script. When set, the pid file is read from
@@ -161,10 +179,11 @@ SOCKET_PATH="${LOOM_SOCKET_PATH:-$HOME/.loom/loom-daemon.sock}"
 LOOM_DIR="$(dirname "$SOCKET_PATH")"
 INTENT_MARKER="${LOOM_AUTONOMY_MARKER:-$LOOM_DIR/autonomy-desired}"
 
-# Remove the operator-intent marker and bump out the watchdog LaunchAgent. Only
-# called on an operator-initiated stop (NOT a --restarting update.sh stop). After
-# this the watchdog sees no marker and correctly stays silent — no false page on
-# a deliberate stop. Best-effort; failures never change the stop's exit status.
+# Remove the operator-intent marker and tear down the watchdog LaunchAgent /
+# systemd timer+service. Only called on an operator-initiated stop (NOT a
+# --restarting update.sh stop). After this the watchdog sees no marker and
+# correctly stays silent — no false page on a deliberate stop. Best-effort;
+# failures never change the stop's exit status.
 teardown_autonomy_intent() {
     rm -f "$INTENT_MARKER" 2>/dev/null || true
     local wd_label wd_service
@@ -177,6 +196,19 @@ teardown_autonomy_intent() {
             launchctl bootout "$wd_service" >/dev/null 2>&1 || true
         fi
     fi
+    # systemd --user watchdog timer+service teardown (#4260 sub-issue D),
+    # symmetric with the launchd bootout above. $IS_LINUX_SYSTEMD is resolved
+    # below (before any call to this function); mirrors loom-daemon-start.sh's
+    # resolve_systemd_watchdog_unit() naming (<daemon unit>-watchdog, same
+    # LOOM_WATCHDOG_LABEL override) so stop always targets the SAME unit pair
+    # start provisioned.
+    if [[ "$IS_LINUX_SYSTEMD" == "true" ]] && command -v systemctl >/dev/null 2>&1; then
+        local sd_daemon_unit sd_wd_unit
+        sd_daemon_unit="$(resolve_systemd_unit)"
+        sd_wd_unit="${LOOM_WATCHDOG_LABEL:-${sd_daemon_unit%.service}-watchdog}"
+        systemctl --user disable --now "${sd_wd_unit}.timer" >/dev/null 2>&1 || true
+        systemctl --user disable --now "${sd_wd_unit}.service" >/dev/null 2>&1 || true
+    fi
 }
 
 # ---------- launchd plumbing (macOS, #3972) ----------
@@ -186,6 +218,12 @@ _LOOM_LAUNCHD_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" 2>/dev/null 
 if [[ -r "$_LOOM_LAUNCHD_LIB_DIR/launchd-domain.sh" ]]; then
     # shellcheck source=../lib/launchd-domain.sh
     source "$_LOOM_LAUNCHD_LIB_DIR/launchd-domain.sh"
+fi
+# systemd --user resolver (#4268) — is_linux_systemd / resolve_systemd_unit,
+# shared with loom-daemon-start.sh so stop agrees on the unit the start installed.
+if [[ -r "$_LOOM_LAUNCHD_LIB_DIR/systemd-user.sh" ]]; then
+    # shellcheck source=../lib/systemd-user.sh
+    source "$_LOOM_LAUNCHD_LIB_DIR/systemd-user.sh"
 fi
 
 IS_DARWIN=false
@@ -235,6 +273,49 @@ launchd_bootout_if_loaded() {
         launchctl bootout "$LAUNCHD_SERVICE" >/dev/null 2>&1 || true
     fi
 }
+
+# ---------- systemd --user ownership tier (Linux, #4268) ----------
+# When the daemon was started as a `systemd --user` service, stop + DISABLE the
+# unit rather than raw-killing the pid: disabling is what keeps a reboot from
+# resurrecting it (the unit sets WantedBy=default.target). This is the systemd
+# analog of the launchd bootout tier. Honors LOOM_DAEMON_SYSTEMD=0 symmetrically
+# with loom-daemon-start.sh --no-systemd (#4078 analog): a start done with
+# --no-systemd was a plain nohup job, so the stop must never reach into the
+# systemd user manager to look it up. When systemd is off, absent, or the unit
+# is not this daemon's, fall through to the pid-file/nohup tier below.
+IS_LINUX_SYSTEMD=false
+if ! [[ "${LOOM_DAEMON_SYSTEMD:-}" =~ ^(0|false|no)$ ]] \
+    && declare -f is_linux_systemd >/dev/null 2>&1 && is_linux_systemd; then
+    IS_LINUX_SYSTEMD=true
+fi
+if [[ "$IS_LINUX_SYSTEMD" == "true" ]]; then
+    SYSTEMD_UNIT="$(resolve_systemd_unit)"
+    # Only adopt the systemd tier when a unit under THIS name is actually loaded
+    # (active or enabled) — otherwise a --no-systemd / nohup start (or a stale
+    # scratch unit) should route to the pid-file tier, not a no-op disable.
+    if systemctl --user is-active --quiet "$SYSTEMD_UNIT" 2>/dev/null \
+        || systemctl --user is-enabled --quiet "$SYSTEMD_UNIT" 2>/dev/null; then
+        echo "Stopping loom-daemon via systemd (systemctl --user disable --now $SYSTEMD_UNIT)..."
+        systemctl --user disable --now "$SYSTEMD_UNIT" >/dev/null 2>&1 || true
+        # Verify the unit is actually down — a disable --now that did not stop the
+        # service is the systemd analog of a bootout that did not stick (the
+        # inverted-#4011 silent-success hole): fail loudly instead of reporting success.
+        if systemctl --user is-active --quiet "$SYSTEMD_UNIT" 2>/dev/null; then
+            err "loom-daemon is still active under systemd ($SYSTEMD_UNIT) after disable --now."
+            err "Retry the stop, or disable manually: systemctl --user disable --now $SYSTEMD_UNIT"
+            exit 1
+        fi
+        rm -f "$PID_FILE"
+        if [[ "$KEEP_INTENT" != "true" ]]; then
+            teardown_autonomy_intent
+            ok "loom-daemon stopped + disabled (systemd unit $SYSTEMD_UNIT). Autonomy-desired marker cleared."
+        else
+            ok "loom-daemon stopped + disabled (systemd unit $SYSTEMD_UNIT). Autonomy-desired marker preserved (restart in progress)."
+        fi
+        echo "In-flight sweeps (if any) were left running by design; the next start reconciles them."
+        exit 0
+    fi
+fi
 
 # Resolve the target pid: prefer the PID file, else a launchd lookup (Darwin),
 # else best-effort pgrep.

@@ -1239,6 +1239,10 @@ pub fn build_daemon_status(
             // `.loom/config.json`), never the CLI client's environment (#4012).
             health_gate_enabled: Some(crate::main_health_gate::effective_enabled(root)),
             health_gate_verdict_at: health_states.last_verdict_at(root),
+            // Issue #4326: surface a dangling registry entry (root deleted
+            // without `workspace remove`) so `status` — not just the
+            // work-finder log — points the operator at it.
+            root_missing: !root.is_dir(),
         });
         in_flight.extend(live);
         unregistered_locked.extend(locked_unregistered.into_iter().map(|(issue, owner_pid)| {
@@ -1370,6 +1374,13 @@ pub fn build_daemon_status(
         auto_update_backoff_secs: au.backoff_secs,
         auto_update_terminal_reason: au.terminal_reason,
         auto_update_note: au.note,
+        // Host-distress circuit breaker (#4235) — read from the process-global
+        // handle the work-finder loop registers/updates each tick, mirroring the
+        // auto-update global-snapshot pattern above. `None` (no breaker
+        // registered — work-finder off or breaker disabled) reads as "inactive".
+        host_breaker: crate::host_breaker::global_snapshot()
+            .map(crate::host_breaker::BreakerSnapshot::into_status)
+            .map(Box::new),
     }
 }
 
@@ -1417,6 +1428,73 @@ fn resolve_registry(
             workspace_pool.get_or_provision(&normalized)
         }
         _ => default.clone(),
+    }
+}
+
+/// Resolve which per-repo [`SweepRegistry`] a `DispatchSweep` request targets
+/// (Issue #4299). Unlike [`resolve_registry`] (used by every read path —
+/// `ListSweeps`, `GetSweepStatus`, quarantine requests — which keeps its
+/// unconditional cwd-registry fallback; changing those defaults is out of
+/// scope here), the **dispatch** path never silently trusts the daemon's own
+/// cwd for the explicit-param-absent case. It consults the on-disk
+/// [`WorkspaceRegistry`] instead:
+///
+/// - `workspace_root` `Some(non-empty)` -> unchanged: normalize and
+///   provision/return that repo's registry (explicit param always wins).
+/// - `workspace_root` `None`/empty -> [`WorkspaceRegistry::resolve_dispatch_root`]
+///   against the seeded default (`default`'s own `workspace_root`) decides:
+///   empty registry or seeded-default-is-registered both resolve back to
+///   `default` (byte-for-byte pre-#4299 behavior); a single non-cwd
+///   registration provisions that workspace; multiple non-cwd registrations
+///   with no seeded-default match returns a structured ambiguity error naming
+///   every registered root instead of guessing.
+///
+/// A `WorkspaceRegistry::load_default()` failure (e.g. a corrupt registry
+/// file) degrades to the empty-registry behavior (seeded default) rather than
+/// blocking dispatch entirely — mirroring the existing `unwrap_or_default()`
+/// precedent used elsewhere for registry reads (`main.rs`'s `workspace list`
+/// handlers).
+/// Returns `Err(Response::StructuredError(..))` (rather than a bare
+/// `DaemonError`) so the caller can propagate it directly as the arm's
+/// response. `Response` is the same "big enum" every other IPC handler
+/// returns directly (never via `Result`), so `clippy::result_large_err` fires
+/// here purely because of the `Result` wrapper — allowed rather than boxed to
+/// match the rest of this file's `Response`-as-return-value convention.
+#[allow(clippy::result_large_err)]
+fn resolve_dispatch_registry(
+    default: &Arc<Mutex<SweepRegistry>>,
+    workspace_pool: &Arc<WorkspacePool>,
+    workspace_root: Option<&str>,
+) -> Result<Arc<Mutex<SweepRegistry>>, Response> {
+    if let Some(root) = workspace_root {
+        if !root.trim().is_empty() {
+            let normalized = crate::workspace_registry::normalize_path(Path::new(root));
+            return Ok(workspace_pool.get_or_provision(&normalized));
+        }
+    }
+
+    let seeded_default = {
+        let sr = default.lock().expect("Sweep registry mutex poisoned");
+        sr.config().workspace_root.clone()
+    };
+    let registry = WorkspaceRegistry::load_default().unwrap_or_default();
+
+    match registry.resolve_dispatch_root(&seeded_default) {
+        // `SeededDefault` is a deliberate marker, not a path to re-derive and
+        // compare — see `resolve_dispatch_root`'s doc comment: reusing the
+        // literal `default` `Arc` (rather than re-provisioning via the pool
+        // from a normalized copy of `seeded_default`) is what guarantees this
+        // always resolves to the *same* registry instance `main` seeded the
+        // pool with, even when `seeded_default` contains an unresolved
+        // symlink component (e.g. a `/var` -> `/private/var` tempdir on
+        // macOS) that would otherwise make a path-equality check miss.
+        crate::workspace_registry::DispatchRootResolution::SeededDefault => Ok(default.clone()),
+        crate::workspace_registry::DispatchRootResolution::Registered(root) => {
+            Ok(workspace_pool.get_or_provision(&root))
+        }
+        crate::workspace_registry::DispatchRootResolution::Ambiguous { registered } => {
+            Err(Response::StructuredError(DaemonError::workspace_ambiguous(&registered)))
+        }
     }
 }
 
@@ -2205,9 +2283,58 @@ fn handle_request(
             effort,
             depends_on,
             workspace_root,
+            force,
         } => {
-            let target =
-                resolve_registry(sweep_registry, workspace_pool, workspace_root.as_deref());
+            // Host-distress circuit breaker (#4235): a *tripped* breaker
+            // represents SUSTAINED, already-observed host distress across
+            // multiple ticks — a materially stronger signal than the
+            // point-in-time headroom advisory below (which by #4234's deliberate
+            // design only *advises*, never blocks). Because the breaker's signal
+            // is stronger and stateful, it **hard-blocks** an explicit
+            // `dispatch_sweep` by default; an operator who truly wants to
+            // dispatch into a distressed host passes `force: true` to override.
+            // This is the one-sentence reconciliation the issue asks for: the
+            // breaker blocks where the headroom check advises *because* it fires
+            // only on proven, sustained distress, not a single-tick reading.
+            if !force {
+                if let Some(snap) = crate::host_breaker::global_snapshot() {
+                    if snap.suppressed {
+                        let releases = snap.releases_at.map_or_else(
+                            || " (host still hot — cool-down not yet started)".to_string(),
+                            |r| format!(" (cool-down releases at {r})"),
+                        );
+                        log::warn!(
+                            "dispatch_sweep: refused {kind:?} — host circuit breaker is {} \
+                             ({}){releases}; running work drains, new dispatch paused. \
+                             Re-run with force to override.",
+                            snap.phase.as_str(),
+                            snap.reason.as_deref().unwrap_or("sustained host distress"),
+                        );
+                        return Response::Error {
+                            message: format!(
+                                "dispatch_sweep refused: host circuit breaker is {} ({}).{releases} \
+                                 Running work is draining and new dispatch is paused (#4235). \
+                                 Re-run with force to override.",
+                                snap.phase.as_str(),
+                                snap.reason.as_deref().unwrap_or("sustained host distress"),
+                            ),
+                        };
+                    }
+                }
+            }
+            // Dispatch-only resolution (Issue #4299): consults the workspace
+            // registry for the explicit-param-absent case instead of always
+            // trusting the daemon's own cwd. See `resolve_dispatch_registry`'s
+            // doc comment for the full precedence and why this differs from
+            // `resolve_registry` (used by the read paths below).
+            let target = match resolve_dispatch_registry(
+                sweep_registry,
+                workspace_pool,
+                workspace_root.as_deref(),
+            ) {
+                Ok(target) => target,
+                Err(response) => return response,
+            };
             let mut sr = target
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -3117,6 +3244,10 @@ exit 0
     fn test_dispatch_sweep_still_dispatches_under_synthetic_low_headroom() {
         let (tm, db, _, bus) = setup_test_context();
         let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+        // Absent `workspace_root` now consults the on-disk workspace registry
+        // (#4299) — pin it to an empty temp registry so this test's outcome
+        // never depends on the host's real `~/.loom/workspaces.json`.
+        let _registry_guard = seed_temp_registry(&[]);
 
         std::env::set_var(crate::work_finder::WORK_FINDER_MAX_CONCURRENT_ENV, "1");
 
@@ -3129,6 +3260,7 @@ exit 0
                     effort: None,
                     depends_on: None,
                     workspace_root: None,
+                    force: false,
                 },
                 &tm,
                 &db,
@@ -3212,6 +3344,7 @@ exit 0
                 effort: None,
                 depends_on: None,
                 workspace_root: Some(dir_b.path().to_string_lossy().into_owned()),
+                force: false,
             },
             &tm,
             &db,
@@ -3302,11 +3435,243 @@ exit 0
         );
     }
 
+    // ===== Dispatch-path workspace resolution (#4299) =====
+
+    /// Registers `path` as the sole workspace at a temp registry file (via
+    /// [`crate::workspace_registry::REGISTRY_PATH_ENV`]) and returns a guard
+    /// that clears the env var on drop, so `WorkspaceRegistry::load_default()`
+    /// inside `resolve_dispatch_registry` never touches the real
+    /// `~/.loom/workspaces.json`.
+    struct RegistryEnvGuard {
+        _dir: tempfile::TempDir,
+    }
+    impl Drop for RegistryEnvGuard {
+        fn drop(&mut self) {
+            std::env::remove_var(crate::workspace_registry::REGISTRY_PATH_ENV);
+        }
+    }
+    fn seed_temp_registry(roots: &[&Path]) -> RegistryEnvGuard {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("workspaces.json");
+        std::env::set_var(crate::workspace_registry::REGISTRY_PATH_ENV, &path);
+        let mut registry = WorkspaceRegistry::default();
+        for root in roots {
+            registry.add(root, None).unwrap();
+        }
+        registry.save(&path).unwrap();
+        RegistryEnvGuard { _dir: dir }
+    }
+
+    /// Issue #4299 — the Linux worker-host shape this issue exists to fix:
+    /// exactly one workspace is registered and it is NOT the daemon's seeded
+    /// default (its cwd). An absent `workspace_root` on `DispatchSweep` must
+    /// still target the single registration, not the unregistered default.
+    #[test]
+    #[serial_test::serial]
+    fn test_dispatch_sweep_absent_workspace_root_targets_single_registration() {
+        let (tm, db, _, bus) = setup_test_context();
+        let (sr_default, dir_a, _rec_a) = setup_sweep_registry_in_tempdir();
+        let (sr_b, dir_b, _rec_b) = setup_sweep_registry_in_tempdir();
+        let root_a = crate::workspace_registry::normalize_path(dir_a.path());
+        let root_b = crate::workspace_registry::normalize_path(dir_b.path());
+
+        let pool = Arc::new(WorkspacePool::new(Arc::new(EventBus::new()), test_runtime_handle()));
+        pool.seed(root_a, sr_default.clone());
+        pool.seed(root_b.clone(), sr_b.clone());
+
+        // Registry names ONLY repo B — repo A (the seeded default) is
+        // unregistered, mirroring a machine-checkout daemon cwd with one
+        // registered product repo.
+        let _guard = seed_temp_registry(&[dir_b.path()]);
+
+        let dispatched = handle_request(
+            Request::DispatchSweep {
+                kind: SweepKind::Issue(4299),
+                idempotency_key: None,
+                model: None,
+                effort: None,
+                depends_on: None,
+                workspace_root: None,
+                force: false,
+            },
+            &tm,
+            &db,
+            &sr_default,
+            &bus,
+            &pool,
+        );
+        assert!(
+            matches!(dispatched, Response::SweepDispatched { .. }),
+            "expected SweepDispatched, got: {dispatched:?}"
+        );
+
+        // Repo B's registry sees the dispatched sweep...
+        let listed_b = handle_request(
+            Request::ListSweeps {
+                state_filter: None,
+                workspace_root: Some(dir_b.path().to_string_lossy().into_owned()),
+            },
+            &tm,
+            &db,
+            &sr_default,
+            &bus,
+            &pool,
+        );
+        match listed_b {
+            Response::SweepList { sweeps } => {
+                assert_eq!(
+                    sweeps.len(),
+                    1,
+                    "the single registered workspace must receive the sweep"
+                )
+            }
+            other => panic!("Expected SweepList, got: {other:?}"),
+        }
+
+        // ...and the unregistered default (repo A / daemon cwd) does NOT.
+        let listed_default = handle_request(
+            Request::ListSweeps {
+                state_filter: None,
+                workspace_root: None,
+            },
+            &tm,
+            &db,
+            &sr_default,
+            &bus,
+            &pool,
+        );
+        match listed_default {
+            Response::SweepList { sweeps } => assert!(
+                sweeps.is_empty(),
+                "the daemon's own (unregistered) cwd must NOT receive the sweep"
+            ),
+            other => panic!("Expected SweepList, got: {other:?}"),
+        }
+    }
+
+    /// Issue #4299 — with multiple registered workspaces and a seeded default
+    /// that is itself unregistered, an absent `workspace_root` must return a
+    /// structured ambiguity error naming every registered root, never a silent
+    /// cwd fallback.
+    #[test]
+    #[serial_test::serial]
+    fn test_dispatch_sweep_ambiguous_registry_errors_without_explicit_param() {
+        let (tm, db, _, bus) = setup_test_context();
+        let (sr_default, dir_a, _rec_a) = setup_sweep_registry_in_tempdir();
+        let (sr_b, dir_b, _rec_b) = setup_sweep_registry_in_tempdir();
+        let (sr_c, dir_c, _rec_c) = setup_sweep_registry_in_tempdir();
+        let root_a = crate::workspace_registry::normalize_path(dir_a.path());
+        let root_b = crate::workspace_registry::normalize_path(dir_b.path());
+        let root_c = crate::workspace_registry::normalize_path(dir_c.path());
+
+        let pool = Arc::new(WorkspacePool::new(Arc::new(EventBus::new()), test_runtime_handle()));
+        pool.seed(root_a, sr_default.clone());
+        pool.seed(root_b.clone(), sr_b.clone());
+        pool.seed(root_c.clone(), sr_c.clone());
+
+        let _guard = seed_temp_registry(&[dir_b.path(), dir_c.path()]);
+
+        let dispatched = handle_request(
+            Request::DispatchSweep {
+                kind: SweepKind::Issue(4299),
+                idempotency_key: None,
+                model: None,
+                effort: None,
+                depends_on: None,
+                workspace_root: None,
+                force: false,
+            },
+            &tm,
+            &db,
+            &sr_default,
+            &bus,
+            &pool,
+        );
+        match dispatched {
+            Response::StructuredError(err) => {
+                assert_eq!(err.code.0, crate::errors::ErrorCode::CONFIG_WORKSPACE_AMBIGUOUS);
+                assert!(
+                    err.message.contains(&root_b.display().to_string())
+                        && err.message.contains(&root_c.display().to_string()),
+                    "ambiguity error must name every registered root, got: {}",
+                    err.message
+                );
+            }
+            other => panic!("Expected StructuredError, got: {other:?}"),
+        }
+    }
+
+    /// Issue #4299 — the #4027 wedge-loop guard must evaluate the *resolved*
+    /// workspace (the single registration), not the daemon's own unregistered
+    /// cwd: the error names repo B's root, not repo A's.
+    #[test]
+    #[serial_test::serial]
+    fn test_dispatch_sweep_wedge_guard_names_resolved_workspace_not_cwd() {
+        let (tm, db, _, bus) = setup_test_context();
+        let dir_a = tempdir().unwrap();
+        let dir_b = tempdir().unwrap();
+        // Neither workspace has `.claude/commands/loom/sweep.md`, and
+        // `skip_label_flip` is left at its default `false` so the #4027 guard
+        // is actually evaluated (unlike `setup_sweep_registry_in_tempdir`,
+        // which sets `skip_label_flip = true` for its other fixtures).
+        let sr_default = Arc::new(Mutex::new(SweepRegistry::new(SweepRegistryConfig::new(
+            dir_a.path().to_path_buf(),
+        ))));
+        let sr_b = Arc::new(Mutex::new(SweepRegistry::new(SweepRegistryConfig::new(
+            dir_b.path().to_path_buf(),
+        ))));
+        let root_a = crate::workspace_registry::normalize_path(dir_a.path());
+        let root_b = crate::workspace_registry::normalize_path(dir_b.path());
+
+        let pool = Arc::new(WorkspacePool::new(Arc::new(EventBus::new()), test_runtime_handle()));
+        pool.seed(root_a.clone(), sr_default.clone());
+        pool.seed(root_b.clone(), sr_b.clone());
+
+        let _guard = seed_temp_registry(&[dir_b.path()]);
+
+        let dispatched = handle_request(
+            Request::DispatchSweep {
+                kind: SweepKind::Issue(4299),
+                idempotency_key: None,
+                model: None,
+                effort: None,
+                depends_on: None,
+                workspace_root: None,
+                force: false,
+            },
+            &tm,
+            &db,
+            &sr_default,
+            &bus,
+            &pool,
+        );
+        match dispatched {
+            Response::Error { message } => {
+                // The guard message embeds `SweepRegistryConfig::workspace_root`
+                // verbatim, which here is the *raw* tempdir path each `sr_*` was
+                // constructed with (not the canonicalized `root_a`/`root_b` used
+                // as the pool's dedup key) — assert against that raw form.
+                assert!(
+                    message.contains(&dir_b.path().display().to_string()),
+                    "wedge-guard error must name the resolved workspace (repo B), got: {message}"
+                );
+                assert!(
+                    !message.contains(&dir_a.path().display().to_string()),
+                    "wedge-guard error must NOT name the daemon's own unregistered cwd, got: {message}"
+                );
+            }
+            other => panic!("Expected Error (wedge-guard refusal), got: {other:?}"),
+        }
+    }
+
     #[test]
     #[serial_test::serial]
     fn test_handle_request_dispatch_sweep_happy_path() {
         let (tm, db, _, bus) = setup_test_context();
         let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+        // #4299: pin the registry to empty so `workspace_root: None` resolution
+        // is deterministic regardless of the host's real registry.
+        let _registry_guard = seed_temp_registry(&[]);
 
         let response = handle_request(
             Request::DispatchSweep {
@@ -3316,6 +3681,7 @@ exit 0
                 effort: None,
                 depends_on: None,
                 workspace_root: None,
+                force: false,
             },
             &tm,
             &db,
@@ -3385,6 +3751,9 @@ exit 0
     fn test_handle_request_dispatch_sweep_exports_claim_ownership_marker() {
         let (tm, db, _, bus) = setup_test_context();
         let (sr, _dir, record_log) = setup_sweep_registry_in_tempdir();
+        // #4299: pin the registry to empty so `workspace_root: None` resolution
+        // is deterministic regardless of the host's real registry.
+        let _registry_guard = seed_temp_registry(&[]);
 
         let response = handle_request(
             Request::DispatchSweep {
@@ -3394,6 +3763,7 @@ exit 0
                 effort: None,
                 depends_on: None,
                 workspace_root: None,
+                force: false,
             },
             &tm,
             &db,
@@ -3434,9 +3804,13 @@ exit 0
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_handle_request_dispatch_sweep_rejects_prset_in_phase_a() {
         let (tm, db, _, bus) = setup_test_context();
         let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+        // #4299: pin the registry to empty so `workspace_root: None` resolution
+        // is deterministic regardless of the host's real registry.
+        let _registry_guard = seed_temp_registry(&[]);
 
         let response = handle_request(
             Request::DispatchSweep {
@@ -3446,6 +3820,7 @@ exit 0
                 effort: None,
                 depends_on: None,
                 workspace_root: None,
+                force: false,
             },
             &tm,
             &db,
@@ -3481,6 +3856,7 @@ exit 0
                 effort,
                 depends_on: _,
                 workspace_root: _,
+                force: _,
             } => {
                 assert!(matches!(kind, SweepKind::Issue(42)));
                 assert!(idempotency_key.is_none());
@@ -3500,6 +3876,7 @@ exit 0
             effort: None,
             depends_on: None,
             workspace_root: None,
+            force: false,
         };
         let json = serde_json::to_string(&request).expect("serialize");
         let back: Request = serde_json::from_str(&json).expect("deserialize");
@@ -3511,6 +3888,7 @@ exit 0
                 effort,
                 depends_on: _,
                 workspace_root: _,
+                force: _,
             } => {
                 assert!(matches!(kind, SweepKind::Issue(7)));
                 assert_eq!(idempotency_key.as_deref(), Some("key-B"));
@@ -3530,6 +3908,7 @@ exit 0
             effort: None,
             depends_on: None,
             workspace_root: None,
+            force: false,
         };
         let json = serde_json::to_string(&request).expect("serialize");
         let back: Request = serde_json::from_str(&json).expect("deserialize");
@@ -3566,6 +3945,7 @@ exit 0
             effort: Some("xhigh".to_string()),
             depends_on: None,
             workspace_root: None,
+            force: false,
         };
         let json = serde_json::to_string(&request).expect("serialize");
         let back: Request = serde_json::from_str(&json).expect("deserialize");
@@ -3587,6 +3967,7 @@ exit 0
             effort: Some(String::new()),
             depends_on: None,
             workspace_root: None,
+            force: false,
         };
         let json = serde_json::to_string(&request).expect("serialize");
         let back: Request = serde_json::from_str(&json).expect("deserialize");
@@ -3626,6 +4007,7 @@ exit 0
             effort: None,
             depends_on: Some(3726),
             workspace_root: None,
+            force: false,
         };
         let json = serde_json::to_string(&request).expect("serialize");
         let back: Request = serde_json::from_str(&json).expect("deserialize");
@@ -3960,6 +4342,9 @@ exit 0
     fn test_handle_request_get_sweep_status_returns_existing() {
         let (tm, db, _, bus) = setup_test_context();
         let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+        // #4299: pin the registry to empty so `workspace_root: None` resolution
+        // is deterministic regardless of the host's real registry.
+        let _registry_guard = seed_temp_registry(&[]);
 
         // Dispatch a sweep to get a real entry in the registry.
         let dispatched = handle_request(
@@ -3970,6 +4355,7 @@ exit 0
                 effort: None,
                 depends_on: None,
                 workspace_root: None,
+                force: false,
             },
             &tm,
             &db,
@@ -4113,6 +4499,7 @@ exit 0
                 health_gate_not_evaluated_reason: None,
                 health_gate_enabled: Some(true),
                 health_gate_verdict_at: Some(chrono::Utc::now()),
+                root_missing: false,
             }],
             credential_preflight: Some(test_credential_preflight()),
             draining: false,
@@ -4125,6 +4512,7 @@ exit 0
             auto_update_backoff_secs: Some(120),
             auto_update_terminal_reason: None,
             auto_update_note: Some("within settle window".to_string()),
+            host_breaker: None,
         };
         let resp = Response::DaemonStatus(report);
         let json = serde_json::to_string(&resp).expect("serialize response");
@@ -4769,6 +5157,63 @@ exit 0
         assert_eq!(b.health_gate_enabled, Some(false));
         assert_eq!(a.health_gate_verdict_at, None);
         assert_eq!(b.health_gate_verdict_at, None);
+
+        std::env::remove_var(REGISTRY_PATH_ENV);
+    }
+
+    /// Issue #4326: a registry entry whose root directory has been deleted
+    /// (without a matching `workspace remove`) is flagged `root_missing: true`
+    /// in `build_daemon_status`'s per-repo breakdown, while a sibling whose
+    /// directory still exists is unaffected — this is the daemon-side half of
+    /// the missing-root hygiene backstop (the work-finder's per-tick skip is
+    /// covered separately in `work_finder::tests`).
+    #[test]
+    #[serial_test::serial]
+    fn test_build_daemon_status_flags_missing_root() {
+        use crate::main_health_gate::WorkspaceHealthStates;
+        use crate::workspace_registry::{normalize_path, WorkspaceRegistry, REGISTRY_PATH_ENV};
+
+        let (sr_a, dir_a, _rec_a) = setup_sweep_registry_in_tempdir();
+        let root_a = dir_a.path().to_path_buf();
+        // A second root that exists at registration time, then gets removed
+        // from disk — exactly the dangling-entry shape from #4326 (a scratch
+        // dir was deleted without `loom-daemon workspace remove`).
+        let dangling_dir = tempfile::tempdir().unwrap();
+        let root_dangling = dangling_dir.path().to_path_buf();
+        let canon_dangling = normalize_path(&root_dangling);
+
+        let reg_path = dir_a.path().join("workspaces.json");
+        let mut reg = WorkspaceRegistry::default();
+        reg.add(&root_a, None).unwrap();
+        reg.add(&root_dangling, None).unwrap();
+        reg.save(&reg_path).unwrap();
+        std::env::set_var(REGISTRY_PATH_ENV, &reg_path);
+
+        // Delete the second root's directory after registration — the entry
+        // itself stays registered (warn-and-skip, never auto-remove).
+        drop(dangling_dir);
+        assert!(!canon_dangling.exists(), "precondition: dangling root is gone");
+
+        let canon_a = normalize_path(&root_a);
+        let pool = Arc::new(WorkspacePool::new(Arc::new(EventBus::new()), test_runtime_handle()));
+        pool.seed(canon_a.clone(), sr_a.clone());
+
+        let health = WorkspaceHealthStates::new();
+        let report = build_daemon_status(&pool, &health, &root_a, &test_credential_preflight());
+
+        assert_eq!(report.per_repo.len(), 2);
+        let a = report
+            .per_repo
+            .iter()
+            .find(|r| r.root == canon_a)
+            .expect("repo A present");
+        let dangling = report
+            .per_repo
+            .iter()
+            .find(|r| r.root == canon_dangling)
+            .expect("dangling entry still present in the registry");
+        assert!(!a.root_missing, "repo A's directory still exists");
+        assert!(dangling.root_missing, "the deleted root is flagged missing");
 
         std::env::remove_var(REGISTRY_PATH_ENV);
     }

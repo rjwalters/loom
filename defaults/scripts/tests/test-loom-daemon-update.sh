@@ -106,6 +106,11 @@ new_fixture() {
     # them in the throwaway tree — else a launchd-mode restart path would find no
     # resolve_launchd_domain. Mirrors the real defaults/scripts/lib layout.
     cp "$CLI_DIR/../lib/launchd-domain.sh" "$root/.loom/scripts/lib/launchd-domain.sh"
+    # Same for lib/systemd-user.sh (#4268): the fixture start script's systemd
+    # --user path (invoked via perform_systemd_relaunch's call to $START_SCRIPT,
+    # #4260 sub-issue C) sources it relative to ITS OWN location, so it must exist
+    # alongside the fixture copy too, not just in the real repo tree.
+    cp "$CLI_DIR/../lib/systemd-user.sh" "$root/.loom/scripts/lib/systemd-user.sh"
     cp "$LOOM_REPO_ROOT/scripts/install/provision-daemon.sh" "$root/scripts/install/provision-daemon.sh"
     cat > "$root/loom-daemon/Cargo.toml" <<'EOF'
 [package]
@@ -160,16 +165,73 @@ EOF
 # simulating a launchd-managed loom-daemon for the #4042 ownership-detection
 # tests. Paired with a fake `uname`->Darwin so the update script's Darwin-gated
 # launchd path fires deterministically on any host.
+#
+# Optional $3/$4 (#4232): when a <post_restart_marker> file path is given,
+# `print` reports pid 4242 until that file EXISTS, at which point it reports
+# <post_restart_pid> instead — simulating "launchd relaunched the job onto a
+# new (real, live) pid the instant the restart request was accepted". Tests
+# that don't pass $3/$4 keep the old static-4242-forever behavior (they never
+# exercise the #4232 pid-verification poll).
 write_fake_launchd_loaded_bin() {
-    local bin_dir="$1" log="$2"
+    local bin_dir="$1" log="$2" post_restart_marker="${3:-}" post_restart_pid="${4:-}"
     mkdir -p "$bin_dir"
     : > "$log"
     cat > "$bin_dir/launchctl" <<EOF
 #!/usr/bin/env bash
 echo "\$*" >> "${log}"
 case "\${1:-}" in
-  print) echo "	pid = 4242" ; exit 0 ;;
+  print)
+    if [[ -n "${post_restart_marker}" && -e "${post_restart_marker}" ]]; then
+      echo "	pid = ${post_restart_pid}"
+    else
+      echo "	pid = 4242"
+    fi
+    exit 0 ;;
   *)     exit 0 ;;
+esac
+EOF
+    chmod +x "$bin_dir/launchctl"
+    cat > "$bin_dir/uname" <<'EOF'
+#!/usr/bin/env bash
+echo "Darwin"
+EOF
+    chmod +x "$bin_dir/uname"
+}
+
+# Writes a fake `launchctl` at $1 for the #4232 restart-VERIFICATION tests: the
+# reported pid lives in a state file ($3) rather than being hardcoded, so a
+# test can hold it "stuck" on the pre-restart pid to simulate launchd failing
+# to relaunch on its own. `print` reports whatever pid (if any) is currently in
+# the state file plus a "last exit status" line (diagnostic breadcrumb,
+# #4232). `kickstart` is recorded VERBATIM to $2 (so a test can assert it was
+# never invoked with `-k`) and, only when $4 (<kickstart_new_pid>) is given,
+# overwrites the state file with it — simulating a kickstart-triggered
+# relaunch; when $4 is omitted, `kickstart` is a no-op (a kickstart that also
+# fails to bring the job up).
+write_fake_launchd_pid_bin() {
+    local bin_dir="$1" log="$2" state_file="$3" kickstart_new_pid="${4:-}"
+    mkdir -p "$bin_dir"
+    : > "$log"
+    cat > "$bin_dir/launchctl" <<EOF
+#!/usr/bin/env bash
+echo "\$*" >> "${log}"
+case "\${1:-}" in
+  print)
+    pid="\$(cat "${state_file}" 2>/dev/null)"
+    if [[ -n "\$pid" ]]; then
+      echo "	state = running"
+      echo "	pid = \$pid"
+    else
+      echo "	state = not running"
+    fi
+    echo "	last exit status = 0"
+    exit 0 ;;
+  kickstart)
+    if [[ -n "${kickstart_new_pid}" ]]; then
+      echo "${kickstart_new_pid}" > "${state_file}"
+    fi
+    exit 0 ;;
+  *) exit 0 ;;
 esac
 EOF
     chmod +x "$bin_dir/launchctl"
@@ -228,6 +290,63 @@ write_fixture_plist_pre4077() {
     <string>${homedir}/daemon.log</string>
 </dict>
 </plist>
+EOF
+}
+
+# Writes a stub `systemctl` at $1/systemctl that logs invocations to $2 and
+# reports an ACTIVE unit with MainPID $3 — the systemd analog of
+# write_fake_launchd_loaded_bin, used with the LOOM_SYSTEMD_FORCE=1 test seam
+# (lib/systemd-user.sh) since this suite runs on Darwin runners. Structurally
+# unable to touch a real systemd --user manager.
+write_fake_systemd_active_bin() {
+    local bin_dir="$1" log="$2" mainpid="$3"
+    mkdir -p "$bin_dir"
+    : > "$log"
+    cat > "$bin_dir/systemctl" <<EOF
+#!/usr/bin/env bash
+echo "\$*" >> "${log}"
+if [[ "\${1:-}" == "--user" ]]; then shift; fi
+case "\${1:-}" in
+  is-active)  exit 0 ;;
+  is-enabled) exit 0 ;;
+  show)       echo "${mainpid}" ;;
+  *)          exit 0 ;;
+esac
+EOF
+    chmod +x "$bin_dir/systemctl"
+}
+
+# Writes a stale, PRE-#4267 systemd --user unit at $1 (the exact state that
+# causes the refused-restart exit-6 fallback): NO Restart=on-success, NO
+# LOOM_DAEMON_SUPERVISOR key, four autonomy Environment= lines, and a SENTINEL
+# PATH. The re-render on the --relaunch path must (a) install Restart=on-success
+# + LOOM_DAEMON_SUPERVISOR=systemd, (b) carry all four autonomy keys through
+# unchanged, and (c) NOT round-trip the sentinel PATH (start.sh rebuilds PATH).
+# Args: <unit_path> <bin>.
+write_fixture_unit_pre4267() {
+    local unit_path="$1" bin="$2"
+    mkdir -p "$(dirname "$unit_path")"
+    cat > "$unit_path" <<EOF
+[Unit]
+Description=Loom autonomous daemon (loom-daemon)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/tmp
+ExecStart=${bin}
+Environment=PATH=/opt/sentinel-oldpath-4267/bin:/usr/bin:/bin
+Environment=HOME=/tmp
+Environment=LOOM_WORK_FINDER=1
+Environment=LOOM_MAIN_HEALTH_GATE=1
+Environment=LOOM_WORK_FINDER_MAX_CONCURRENT=10
+Environment=LOOM_PER_TOKEN_CONCURRENCY=5
+StandardOutput=append:/tmp/daemon.log
+StandardError=append:/tmp/daemon.log
+
+[Install]
+WantedBy=default.target
 EOF
 }
 
@@ -799,11 +918,13 @@ else
 fi
 
 # ============================================================
-# 15. Launchd ownership + restart (#4042): a launchd-managed daemon (stub
+# 15. Launchd ownership + restart (#4042/#4232): a launchd-managed daemon (stub
 #     launchctl reports a LOADED job + pid) with NO .loom/.daemon.pid file ->
 #     the updater plans/executes a RESTART (not "was not running"), drives it
 #     through the `restart` subcommand (stub records the invocation), does NOT
-#     consult .daemon.flags, and exits 0.
+#     consult .daemon.flags, and exits 0. The stub relaunches onto a NEW, real,
+#     live pid the instant the restart is accepted (#4232 case (a): relaunch
+#     observed -> success, no kickstart fallback ever invoked).
 # ============================================================
 W15="$BASE_WORKDIR/w15"
 new_fixture "$W15"
@@ -819,13 +940,18 @@ write_fake_daemon_restart "$NEW_FAKE15" "$HEAD15" "$RESTART_MARKER15" 0
 # A .daemon.flags that MUST NOT be consulted in launchd mode (would otherwise
 # add --work-finder to a stop+start path).
 echo "--work-finder" > "$W15/.loom/.daemon.flags"
+# A real, live process standing in for "the relaunched job's new pid" — the
+# #4232 poll requires a live pid (kill -0), not just a differing number.
+sleep 60 >/dev/null 2>&1 &
+RELAUNCHED_PID15=$!
 LD_BIN15="$W15/launchd-bin"
-write_fake_launchd_loaded_bin "$LD_BIN15" "$W15/launchctl.log"
+write_fake_launchd_loaded_bin "$LD_BIN15" "$W15/launchctl.log" "$RESTART_MARKER15" "$RELAUNCHED_PID15"
 
 out15=$( cd "$W15" && PATH="$LD_BIN15:$TEST_PATH" LOOM_DAEMON_LAUNCHD=1 \
     LOOM_DAEMON_BIN="$INSTALLED15" NEW_FAKE_BIN_SRC="$NEW_FAKE15" \
     bash "$UPDATE_SCRIPT" 2>&1 )
 rc15=$?
+kill "$RELAUNCHED_PID15" 2>/dev/null || true
 assert_eq "0" "$rc15" "launchd-managed update (no pid file) exits 0"
 TESTS_RUN=$((TESTS_RUN + 1))
 if [[ -s "$RESTART_MARKER15" ]]; then
@@ -844,6 +970,24 @@ if echo "$out15" | grep -qi 'not running'; then
 else
     TESTS_PASSED=$((TESTS_PASSED + 1))
     echo -e "${GREEN}✓${NC} launchd-loaded job is NOT mistaken for 'was not running'"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q "^${RELAUNCHED_PID15}$\|new pid ${RELAUNCHED_PID15}" <<< "$out15" || echo "$out15" | grep -q "new pid ${RELAUNCHED_PID15}"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} success message reports the VERIFIED new pid (#4232)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} success message reports the VERIFIED new pid (#4232)"
+    echo "  output: $out15"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q '^kickstart ' "$W15/launchctl.log" 2>/dev/null; then
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} relaunch observed immediately -> kickstart fallback is NEVER invoked (#4232 case a)"
+    echo "  launchctl.log: $(cat "$W15/launchctl.log" 2>/dev/null)"
+else
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} relaunch observed immediately -> kickstart fallback is NEVER invoked (#4232 case a)"
 fi
 TESTS_RUN=$((TESTS_RUN + 1))
 if echo "$out15" | grep -qi 'FLAGS-OFF'; then
@@ -1217,6 +1361,486 @@ if echo "$out_dev" | grep -qi "Not in a Loom workspace"; then
 else
     TESTS_FAILED=$((TESTS_FAILED + 1))
     echo -e "${RED}✗${NC} dev-mode fallback unchanged: reports 'Not in a Loom workspace'"
+fi
+
+# ============================================================
+# 26. Systemd ownership + restart (#4260 sub-issue C, mirrors test 15): a
+#     systemd-managed daemon (stub systemctl reports an ACTIVE unit + MainPID)
+#     with NO .loom/.daemon.pid file -> the updater plans/executes a RESTART
+#     (not "was not running"), drives it through the `restart` subcommand
+#     (stub records the invocation), does NOT consult .daemon.flags, and exits
+#     0. Forced via the LOOM_SYSTEMD_FORCE=1 test seam (lib/systemd-user.sh)
+#     since this suite runs on Darwin; LOOM_DAEMON_LAUNCHD=0 is already the
+#     suite-wide default so launchd never competes for this tier.
+# ============================================================
+W26="$BASE_WORKDIR/w26"
+new_fixture "$W26"
+HEAD26="$(cd "$W26" && git rev-parse --short HEAD)"
+INSTALLED26="$W26/installed/loom-daemon"
+mkdir -p "$W26/installed"
+RESTART_MARKER26="$W26/restart-invoked"
+write_fake_daemon_restart "$INSTALLED26" "deadbee" "$RESTART_MARKER26" 0
+NEW_FAKE26="$W26/new-fake-daemon"
+write_fake_daemon_restart "$NEW_FAKE26" "$HEAD26" "$RESTART_MARKER26" 0
+# A .daemon.flags that MUST NOT be consulted in systemd mode (would otherwise
+# add --work-finder to a stop+start path).
+echo "--work-finder" > "$W26/.loom/.daemon.flags"
+SD_BIN26="$W26/systemd-bin"
+SD_LOG26="$W26/systemctl.log"
+write_fake_systemd_active_bin "$SD_BIN26" "$SD_LOG26" "4242"
+
+out26=$( cd "$W26" && PATH="$SD_BIN26:$TEST_PATH" LOOM_SYSTEMD_FORCE=1 \
+    LOOM_SYSTEMD_UNIT="loom-daemon-test-sd26.service" \
+    LOOM_DAEMON_BIN="$INSTALLED26" NEW_FAKE_BIN_SRC="$NEW_FAKE26" \
+    bash "$UPDATE_SCRIPT" 2>&1 )
+rc26=$?
+assert_eq "0" "$rc26" "systemd-managed update (no pid file) exits 0"
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ -s "$RESTART_MARKER26" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} systemd restart driven through the 'restart' subcommand (not stop+start)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} systemd restart driven through the 'restart' subcommand (not stop+start)"
+    echo "  output: $out26"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out26" | grep -qi 'not running'; then
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} systemd-loaded unit is NOT mistaken for 'was not running'"
+    echo "  output: $out26"
+else
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} systemd-loaded unit is NOT mistaken for 'was not running'"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out26" | grep -qi 'FLAGS-OFF'; then
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} no 'restarting FLAGS-OFF' warning fires for a systemd restart"
+    echo "  output: $out26"
+else
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} no 'restarting FLAGS-OFF' warning fires for a systemd restart"
+fi
+
+# ============================================================
+# 27. Systemd restart REFUSED (mirrors test 16): a systemd unit is active but
+#     the running (old) binary rejects the restart request (pre-#4267 binary /
+#     dead socket). Without --relaunch the updater must exit NON-ZERO (6) and
+#     print the systemd fallback: names --relaunch (NOT a bare `systemctl
+#     --user stop`, which tears down the cgroup and kills in-flight sweeps),
+#     and prefers a graceful `kill -TERM`.
+# ============================================================
+W27="$BASE_WORKDIR/w27"
+new_fixture "$W27"
+HEAD27="$(cd "$W27" && git rev-parse --short HEAD)"
+INSTALLED27="$W27/installed/loom-daemon"
+mkdir -p "$W27/installed"
+RESTART_MARKER27="$W27/restart-invoked"
+write_fake_daemon_restart "$INSTALLED27" "deadbee" "$RESTART_MARKER27" 1
+NEW_FAKE27="$W27/new-fake-daemon"
+write_fake_daemon_restart "$NEW_FAKE27" "$HEAD27" "$RESTART_MARKER27" 1
+SD_BIN27="$W27/systemd-bin"
+SD_LOG27="$W27/systemctl.log"
+write_fake_systemd_active_bin "$SD_BIN27" "$SD_LOG27" "4242"
+
+out27=$( cd "$W27" && PATH="$SD_BIN27:$TEST_PATH" LOOM_SYSTEMD_FORCE=1 \
+    LOOM_SYSTEMD_UNIT="loom-daemon-test-sd27.service" \
+    LOOM_DAEMON_BIN="$INSTALLED27" NEW_FAKE_BIN_SRC="$NEW_FAKE27" \
+    bash "$UPDATE_SCRIPT" 2>&1 )
+rc27=$?
+assert_eq "6" "$rc27" "systemd restart refused -> exit 6 (never a silent half-update)"
+# Names --relaunch as the fix and NEVER recommends a bare `systemctl --user
+# restart`/`enable` by hand as a shortcut (that would skip the re-render and
+# refuse identically forever, the systemd analog of the #4118 bootstrap bug) —
+# the ONLY manual systemctl-adjacent mention allowed is the "do NOT ... stop"
+# warning itself.
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out27" | grep -q -- '--relaunch' \
+    && ! echo "$out27" | grep -qi 'systemctl --user restart' \
+    && ! echo "$out27" | grep -qi 'systemctl --user enable'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} refused restart names --relaunch, never a bare manual systemctl restart/enable"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} refused restart names --relaunch, never a bare manual systemctl restart/enable"
+    echo "  output: $out27"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out27" | grep -qi 'cgroup' && echo "$out27" | grep -qi 'sweep' \
+    && echo "$out27" | grep -q 'kill -TERM'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} refused restart warns stop tears down the cgroup + kills in-flight sweeps, prefers kill -TERM"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} refused restart warns stop tears down the cgroup + kills in-flight sweeps, prefers kill -TERM"
+    echo "  output: $out27"
+fi
+
+# ============================================================
+# 28. --check names systemd (with unit) as the owning manager when a unit is
+#     active (mirrors test 17a).
+# ============================================================
+W28="$BASE_WORKDIR/w28"
+new_fixture "$W28"
+INSTALLED28="$W28/installed/loom-daemon"
+mkdir -p "$W28/installed"
+write_fake_daemon "$INSTALLED28" "deadbee" "$W28/marker"
+SD_BIN28="$W28/systemd-bin"
+SD_LOG28="$W28/systemctl.log"
+write_fake_systemd_active_bin "$SD_BIN28" "$SD_LOG28" "4242"
+check_sd_out=$( cd "$W28" && PATH="$SD_BIN28:$TEST_PATH" LOOM_SYSTEMD_FORCE=1 \
+    LOOM_SYSTEMD_UNIT="loom-daemon-test-sd28.service" LOOM_DAEMON_BIN="$INSTALLED28" \
+    bash "$UPDATE_SCRIPT" --check 2>&1 )
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$check_sd_out" | grep -qi 'manager: systemd' && echo "$check_sd_out" | grep -q 'loom-daemon-test-sd28.service'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} --check names systemd (with unit) as the owning manager"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} --check names systemd (with unit) as the owning manager"
+    echo "  output: $check_sd_out"
+fi
+
+# ============================================================
+# 29. --dry-run in systemd mode reports the systemd restart plan and makes no
+#     writes (no rebuild, no restart invocation) (mirrors test 18).
+# ============================================================
+W29="$BASE_WORKDIR/w29"
+new_fixture "$W29"
+INSTALLED29="$W29/installed/loom-daemon"
+mkdir -p "$W29/installed"
+RESTART_MARKER29="$W29/restart-invoked"
+write_fake_daemon_restart "$INSTALLED29" "deadbee" "$RESTART_MARKER29" 0
+SD_BIN29="$W29/systemd-bin"
+SD_LOG29="$W29/systemctl.log"
+write_fake_systemd_active_bin "$SD_BIN29" "$SD_LOG29" "4242"
+dry29_out=$( cd "$W29" && PATH="$SD_BIN29:$TEST_PATH" LOOM_SYSTEMD_FORCE=1 \
+    LOOM_SYSTEMD_UNIT="loom-daemon-test-sd29.service" LOOM_DAEMON_BIN="$INSTALLED29" \
+    bash "$UPDATE_SCRIPT" --dry-run 2>&1 )
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$dry29_out" | grep -qi 'systemd-managed' && echo "$dry29_out" | grep -qi 'restart' \
+    && [[ ! -s "$RESTART_MARKER29" ]] && [[ ! -e "$W29/loom-daemon/target/release/loom-daemon" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} --dry-run reports the systemd restart plan and makes no writes"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} --dry-run reports the systemd restart plan and makes no writes"
+    echo "  output: $dry29_out"
+fi
+
+# ============================================================
+# 30. LOOM_DAEMON_SYSTEMD=0 skips all systemd tiers even with the unit detected
+#     as active (LOOM_SYSTEMD_FORCE=1 + stub systemctl on PATH): the daemon is
+#     treated as NOT systemd-managed, so with no pid file it is "not running"
+#     (no restart attempted). Guards the --no-systemd symmetry contract (#4260
+#     sub-issue C AC3, mirrors test 19).
+# ============================================================
+W30="$BASE_WORKDIR/w30"
+new_fixture "$W30"
+HEAD30="$(cd "$W30" && git rev-parse --short HEAD)"
+INSTALLED30="$W30/installed/loom-daemon"
+mkdir -p "$W30/installed"
+RESTART_MARKER30="$W30/restart-invoked"
+write_fake_daemon_restart "$INSTALLED30" "deadbee" "$RESTART_MARKER30" 0
+NEW_FAKE30="$W30/new-fake-daemon"
+write_fake_daemon_restart "$NEW_FAKE30" "$HEAD30" "$RESTART_MARKER30" 0
+SD_BIN30="$W30/systemd-bin"
+SD_LOG30="$W30/systemctl.log"
+write_fake_systemd_active_bin "$SD_BIN30" "$SD_LOG30" "4242"
+out30=$( cd "$W30" && PATH="$SD_BIN30:$TEST_PATH" LOOM_SYSTEMD_FORCE=1 LOOM_DAEMON_SYSTEMD=0 \
+    LOOM_SYSTEMD_UNIT="loom-daemon-test-sd30.service" \
+    LOOM_DAEMON_BIN="$INSTALLED30" NEW_FAKE_BIN_SRC="$NEW_FAKE30" \
+    bash "$UPDATE_SCRIPT" 2>&1 )
+rc30=$?
+assert_eq "0" "$rc30" "LOOM_DAEMON_SYSTEMD=0 update exits 0 (rebuild+provision, no systemd)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out30" | grep -qi 'not running' && [[ ! -s "$RESTART_MARKER30" ]] && [[ ! -s "$SD_LOG30" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} LOOM_DAEMON_SYSTEMD=0 skips systemd tiers (no restart driven, zero systemctl calls)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} LOOM_DAEMON_SYSTEMD=0 skips systemd tiers (no restart driven, zero systemctl calls)"
+    echo "  output: $out30"
+    echo "  systemctl calls: $(cat "$SD_LOG30" 2>/dev/null)"
+fi
+
+# ============================================================
+# 31. --relaunch re-renders the unit with the SUPERVISED keys (mirrors test
+#     21): after a refused restart, `--relaunch` re-renders via
+#     loom-daemon-start.sh, installing Restart=on-success +
+#     LOOM_DAEMON_SUPERVISOR=systemd into the unit — the two keys the stale
+#     pre-#4267 fixture unit LACKS, so a passing assertion proves the
+#     re-render actually happened (not a leftover). HOME is sandboxed so
+#     resolve_systemd_unit_path() resolves inside the test tree.
+# ============================================================
+W31="$BASE_WORKDIR/w31"
+new_fixture "$W31"
+INSTALLED31="$W31/installed/loom-daemon"
+mkdir -p "$W31/installed"
+RESTART_MARKER31="$W31/restart-invoked"
+# Running (old) + fresh binaries both REFUSE restart (pre-#4267) -> exit-6 path.
+write_fake_daemon_restart "$INSTALLED31" "deadbee" "$RESTART_MARKER31" 1
+NEW_FAKE31="$W31/new-fake-daemon"
+HEAD31="$(cd "$W31" && git rev-parse --short HEAD)"
+write_fake_daemon_restart "$NEW_FAKE31" "$HEAD31" "$RESTART_MARKER31" 1
+UNIT31="loom-daemon-test-sd31.service"
+SD_BIN31="$W31/systemd-bin"
+SD_LOG31="$W31/systemctl.log"
+write_fake_systemd_active_bin "$SD_BIN31" "$SD_LOG31" "4242"
+HOME31="$W31/home"
+UNIT_PATH31="$HOME31/.config/systemd/user/${UNIT31}"
+write_fixture_unit_pre4267 "$UNIT_PATH31" "$INSTALLED31"
+( cd "$W31" && PATH="$SD_BIN31:$TEST_PATH" HOME="$HOME31" LOOM_SYSTEMD_FORCE=1 \
+    LOOM_SYSTEMD_UNIT="$UNIT31" \
+    LOOM_DAEMON_BIN="$INSTALLED31" NEW_FAKE_BIN_SRC="$NEW_FAKE31" \
+    bash "$UPDATE_SCRIPT" --relaunch >/dev/null 2>&1 )
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q 'LOOM_DAEMON_SUPERVISOR=systemd' "$UNIT_PATH31" 2>/dev/null \
+    && grep -qx 'Restart=on-success' "$UNIT_PATH31" 2>/dev/null; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} --relaunch re-renders the unit with Restart=on-success + LOOM_DAEMON_SUPERVISOR=systemd"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} --relaunch re-renders the unit with Restart=on-success + LOOM_DAEMON_SUPERVISOR=systemd"
+    echo "  unit: $(cat "$UNIT_PATH31" 2>/dev/null)"
+fi
+
+# ============================================================
+# 32. --relaunch PRESERVES the live unit's autonomy env across the re-render
+#     (mirrors test 22): the four autonomy keys carry through byte-for-byte,
+#     and the stale sentinel PATH is NOT round-tripped (start.sh rebuilds
+#     PATH).
+# ============================================================
+W32="$BASE_WORKDIR/w32"
+new_fixture "$W32"
+INSTALLED32="$W32/installed/loom-daemon"
+mkdir -p "$W32/installed"
+RESTART_MARKER32="$W32/restart-invoked"
+write_fake_daemon_restart "$INSTALLED32" "deadbee" "$RESTART_MARKER32" 1
+NEW_FAKE32="$W32/new-fake-daemon"
+HEAD32="$(cd "$W32" && git rev-parse --short HEAD)"
+write_fake_daemon_restart "$NEW_FAKE32" "$HEAD32" "$RESTART_MARKER32" 1
+UNIT32="loom-daemon-test-sd32.service"
+SD_BIN32="$W32/systemd-bin"
+SD_LOG32="$W32/systemctl.log"
+write_fake_systemd_active_bin "$SD_BIN32" "$SD_LOG32" "4242"
+HOME32="$W32/home"
+UNIT_PATH32="$HOME32/.config/systemd/user/${UNIT32}"
+write_fixture_unit_pre4267 "$UNIT_PATH32" "$INSTALLED32"
+( cd "$W32" && PATH="$SD_BIN32:$TEST_PATH" HOME="$HOME32" LOOM_SYSTEMD_FORCE=1 \
+    LOOM_SYSTEMD_UNIT="$UNIT32" \
+    LOOM_DAEMON_BIN="$INSTALLED32" NEW_FAKE_BIN_SRC="$NEW_FAKE32" \
+    bash "$UPDATE_SCRIPT" --relaunch >/dev/null 2>&1 )
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -qx 'Environment=LOOM_WORK_FINDER=1' "$UNIT_PATH32" 2>/dev/null \
+    && grep -qx 'Environment=LOOM_MAIN_HEALTH_GATE=1' "$UNIT_PATH32" 2>/dev/null \
+    && grep -qx 'Environment=LOOM_WORK_FINDER_MAX_CONCURRENT=10' "$UNIT_PATH32" 2>/dev/null \
+    && grep -qx 'Environment=LOOM_PER_TOKEN_CONCURRENCY=5' "$UNIT_PATH32" 2>/dev/null \
+    && ! grep -q 'sentinel-oldpath-4267' "$UNIT_PATH32" 2>/dev/null; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} --relaunch preserves all 4 autonomy env keys and does NOT round-trip the stale PATH"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} --relaunch preserves all 4 autonomy env keys and does NOT round-trip the stale PATH"
+    echo "  unit: $(cat "$UNIT_PATH32" 2>/dev/null)"
+fi
+
+# ============================================================
+# 33. --no-restart on a systemd host does NOT print a bare 'systemctl --user
+#     stop' of the active unit: it names the --relaunch re-render path and
+#     warns that stop kills in-flight sweeps (mirrors test 23).
+# ============================================================
+W33="$BASE_WORKDIR/w33"
+new_fixture "$W33"
+INSTALLED33="$W33/installed/loom-daemon"
+mkdir -p "$W33/installed"
+RESTART_MARKER33="$W33/restart-invoked"
+write_fake_daemon_restart "$INSTALLED33" "deadbee" "$RESTART_MARKER33" 0
+NEW_FAKE33="$W33/new-fake-daemon"
+HEAD33="$(cd "$W33" && git rev-parse --short HEAD)"
+write_fake_daemon_restart "$NEW_FAKE33" "$HEAD33" "$RESTART_MARKER33" 0
+SD_BIN33="$W33/systemd-bin"
+SD_LOG33="$W33/systemctl.log"
+write_fake_systemd_active_bin "$SD_BIN33" "$SD_LOG33" "4242"
+out33=$( cd "$W33" && PATH="$SD_BIN33:$TEST_PATH" LOOM_SYSTEMD_FORCE=1 \
+    LOOM_SYSTEMD_UNIT="loom-daemon-test-sd33.service" \
+    LOOM_DAEMON_BIN="$INSTALLED33" NEW_FAKE_BIN_SRC="$NEW_FAKE33" \
+    bash "$UPDATE_SCRIPT" --no-restart 2>&1 )
+rc33=$?
+assert_eq "0" "$rc33" "--no-restart on a systemd host exits 0"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out33" | grep -q -- '--relaunch' \
+    && ! echo "$out33" | grep -qi 'systemctl --user restart' \
+    && ! echo "$out33" | grep -qi 'systemctl --user enable' \
+    && echo "$out33" | grep -qi 'cgroup' && echo "$out33" | grep -qi 'sweep'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} --no-restart names --relaunch, no bare manual systemctl restart/enable, warns cgroup teardown kills sweeps"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} --no-restart names --relaunch, no bare manual systemctl restart/enable, warns cgroup teardown kills sweeps"
+    echo "  output: $out33"
+fi
+
+# ============================================================
+# 34. --relaunch with the live unit file ABSENT fails loudly (names the
+#     missing path) and refuses to relaunch — it must NEVER silently render
+#     FLAGS-OFF defaults (the #4011 class this whole line of work closes). No
+#     unit is written (mirrors test 24).
+# ============================================================
+W34="$BASE_WORKDIR/w34"
+new_fixture "$W34"
+INSTALLED34="$W34/installed/loom-daemon"
+mkdir -p "$W34/installed"
+RESTART_MARKER34="$W34/restart-invoked"
+write_fake_daemon_restart "$INSTALLED34" "deadbee" "$RESTART_MARKER34" 1
+NEW_FAKE34="$W34/new-fake-daemon"
+HEAD34="$(cd "$W34" && git rev-parse --short HEAD)"
+write_fake_daemon_restart "$NEW_FAKE34" "$HEAD34" "$RESTART_MARKER34" 1
+UNIT34="loom-daemon-test-sd34.service"
+SD_BIN34="$W34/systemd-bin"
+SD_LOG34="$W34/systemctl.log"
+write_fake_systemd_active_bin "$SD_BIN34" "$SD_LOG34" "4242"
+HOME34="$W34/home"
+mkdir -p "$HOME34/.config/systemd/user"   # dir exists, unit deliberately absent
+UNIT_PATH34="$HOME34/.config/systemd/user/${UNIT34}"
+out34=$( cd "$W34" && PATH="$SD_BIN34:$TEST_PATH" HOME="$HOME34" LOOM_SYSTEMD_FORCE=1 \
+    LOOM_SYSTEMD_UNIT="$UNIT34" \
+    LOOM_DAEMON_BIN="$INSTALLED34" NEW_FAKE_BIN_SRC="$NEW_FAKE34" \
+    bash "$UPDATE_SCRIPT" --relaunch 2>&1 )
+rc34=$?
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ "$rc34" -ne 0 ]] && echo "$out34" | grep -qi 'not found' \
+    && echo "$out34" | grep -qF "$UNIT_PATH34" && [[ ! -e "$UNIT_PATH34" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} --relaunch with an absent unit fails loudly (names the path) and renders nothing"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} --relaunch with an absent unit fails loudly (names the path) and renders nothing"
+    echo "  rc=$rc34 unit-exists=$([[ -e "$UNIT_PATH34" ]] && echo yes || echo no)"
+    echo "  output: $out34"
+fi
+
+# ============================================================
+# 35. Restart ack'd but launchd never relaunches -> kickstart fallback DOES
+#     relaunch it (#4232 case (b)): the restart request is accepted (exit 0)
+#     but the reported pid never moves off the pre-restart pid on its own;
+#     the updater falls back to a PLAIN 'launchctl kickstart' (never -k),
+#     which (per the stub) IS what finally moves the pid — success, with a
+#     remediation note in the output. Poll windows are shrunk via env so the
+#     test runs fast without changing the production defaults.
+# ============================================================
+W35="$BASE_WORKDIR/w35"
+new_fixture "$W35"
+INSTALLED35="$W35/installed/loom-daemon"
+mkdir -p "$W35/installed"
+RESTART_MARKER35="$W35/restart-invoked"
+write_fake_daemon_restart "$INSTALLED35" "deadbee" "$RESTART_MARKER35" 0
+NEW_FAKE35="$W35/new-fake-daemon"
+HEAD35="$(cd "$W35" && git rev-parse --short HEAD)"
+write_fake_daemon_restart "$NEW_FAKE35" "$HEAD35" "$RESTART_MARKER35" 0
+
+sleep 60 >/dev/null 2>&1 &
+OLD_PID26=$!
+sleep 60 >/dev/null 2>&1 &
+KICKSTART_PID35=$!
+STATE35="$W35/launchd-pid-state"
+echo "$OLD_PID26" > "$STATE35"
+LD_BIN35="$W35/launchd-bin"
+write_fake_launchd_pid_bin "$LD_BIN35" "$W35/launchctl.log" "$STATE35" "$KICKSTART_PID35"
+
+out35=$( cd "$W35" && PATH="$LD_BIN35:$TEST_PATH" LOOM_DAEMON_LAUNCHD=1 \
+    LOOM_DAEMON_BIN="$INSTALLED35" NEW_FAKE_BIN_SRC="$NEW_FAKE35" \
+    LOOM_DAEMON_RESTART_POLL_SECS=1 LOOM_DAEMON_RESTART_POLL_INTERVAL=0.2 \
+    LOOM_DAEMON_RESTART_KICKSTART_POLL_SECS=3 \
+    bash "$UPDATE_SCRIPT" 2>&1 )
+rc26=$?
+kill "$OLD_PID26" "$KICKSTART_PID35" 2>/dev/null || true
+assert_eq "0" "$rc26" "no spontaneous relaunch -> kickstart fallback relaunches it -> exit 0 (#4232 case b)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out35" | grep -qi 'kickstart' && echo "$out35" | grep -qi 'remediation'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} success output names the kickstart fallback + a remediation note"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} success output names the kickstart fallback + a remediation note"
+    echo "  output: $out35"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -qE '^kickstart [^ ]+$' "$W35/launchctl.log" 2>/dev/null; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} kickstart is invoked PLAIN — never with -k"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} kickstart is invoked PLAIN — never with -k"
+    echo "  launchctl.log: $(cat "$W35/launchctl.log" 2>/dev/null)"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q -- '-k' "$W35/launchctl.log" 2>/dev/null; then
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} kickstart is NEVER invoked with -k (would risk killing a daemon that relaunched during the race window)"
+    echo "  launchctl.log: $(cat "$W35/launchctl.log" 2>/dev/null)"
+else
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} kickstart is NEVER invoked with -k (would risk killing a daemon that relaunched during the race window)"
+fi
+
+# ============================================================
+# 36. Restart ack'd, launchd never relaunches, AND the kickstart fallback also
+#     never brings it up -> exit NON-ZERO (7), loudly, rather than a silent
+#     half-update success (#4232 case (c)).
+# ============================================================
+W36="$BASE_WORKDIR/w36"
+new_fixture "$W36"
+INSTALLED36="$W36/installed/loom-daemon"
+mkdir -p "$W36/installed"
+RESTART_MARKER36="$W36/restart-invoked"
+write_fake_daemon_restart "$INSTALLED36" "deadbee" "$RESTART_MARKER36" 0
+NEW_FAKE36="$W36/new-fake-daemon"
+HEAD36="$(cd "$W36" && git rev-parse --short HEAD)"
+write_fake_daemon_restart "$NEW_FAKE36" "$HEAD36" "$RESTART_MARKER36" 0
+
+sleep 60 >/dev/null 2>&1 &
+OLD_PID27=$!
+STATE36="$W36/launchd-pid-state"
+echo "$OLD_PID27" > "$STATE36"
+LD_BIN36="$W36/launchd-bin"
+# No kickstart_new_pid given -> kickstart is a no-op; the pid never moves.
+write_fake_launchd_pid_bin "$LD_BIN36" "$W36/launchctl.log" "$STATE36"
+
+out36=$( cd "$W36" && PATH="$LD_BIN36:$TEST_PATH" LOOM_DAEMON_LAUNCHD=1 \
+    LOOM_DAEMON_BIN="$INSTALLED36" NEW_FAKE_BIN_SRC="$NEW_FAKE36" \
+    LOOM_DAEMON_RESTART_POLL_SECS=1 LOOM_DAEMON_RESTART_POLL_INTERVAL=0.2 \
+    LOOM_DAEMON_RESTART_KICKSTART_POLL_SECS=1 \
+    bash "$UPDATE_SCRIPT" 2>&1 )
+rc27=$?
+kill "$OLD_PID27" 2>/dev/null || true
+assert_eq "7" "$rc27" "no relaunch even after kickstart -> exit 7 (never a silent half-update, #4232 case c)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out36" | grep -qi 'FAILED' && echo "$out36" | grep -qi 'kickstart'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} failure output loudly reports the exhausted kickstart fallback"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} failure output loudly reports the exhausted kickstart fallback"
+    echo "  output: $out36"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out36" | grep -qi 'last exit status'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} failure output includes launchctl print diagnostics (state/last exit status)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} failure output includes launchctl print diagnostics (state/last exit status)"
+    echo "  output: $out36"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q -- '-k' "$W36/launchctl.log" 2>/dev/null; then
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} exhausted kickstart fallback was still never invoked with -k"
+else
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} exhausted kickstart fallback was still never invoked with -k"
 fi
 
 # ============================================================

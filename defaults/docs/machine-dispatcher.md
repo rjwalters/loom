@@ -240,17 +240,80 @@ launchd-managed) or refused (not currently running, or a pre-#4077 binary), it
 falls back to a plain stop-then-start via the same checkout-resolved
 lifecycle-script delegates.
 
-### Supervision (reboot/crash) — macOS done, Linux deferred
+### Sweep dispatch on a multi-repo worker host (#4299)
+
+The lifecycle hand-off above (`LOOM_MACHINE_CHECKOUT`) governs `start`/`stop`/
+`update`/`restart` — it does **not** apply to `loom-daemon dispatch <issue>` or
+the MCP `dispatch_sweep` tool, which target a **repo's working tree**, not the
+machine checkout. A worker host provisioned with the machine-level layout
+(checkout at `~/.local/share/loom`, one or more product repos registered via
+`loom-daemon workspace add`) used to require restarting the daemon with an
+explicit `WorkingDirectory=<repo>` override — collapsing the machine-level
+daemon back into a single-repo daemon — because `dispatch`/`dispatch_sweep`
+resolved an absent `--workspace`/`workspace_root` from the daemon's own cwd
+instead of the workspace registry. This is fixed: dispatch now consults
+`~/.loom/workspaces.json` for the explicit-param-absent case, so a daemon
+started with cwd = the machine checkout and exactly one registered workspace
+dispatches into that workspace with no `WorkingDirectory` override needed. See
+[`daemon-reference.md`](daemon-reference.md) → `dispatch_sweep` for the full
+resolution precedence.
+
+### Testing against a scratch registry (`LOOM_WORKSPACES_PATH`, #4326)
+
+`~/.loom/workspaces.json` is a **machine-level, cross-repo, cross-session**
+file — never scope a test or an ad-hoc verification step at it directly. Both
+the `loom-daemon workspace add|remove|list|set-priority` CLI and the daemon
+itself honor `LOOM_WORKSPACES_PATH` (`loom-daemon/src/workspace_registry.rs`)
+as a redirect: when set, every registry read/write for that process goes to
+the given file instead of the real one. This is the sanctioned seam for
+**any** code that needs to exercise registry behavior — every registry unit
+test in `loom-daemon/src/workspace_registry.rs` already uses a tempdir this
+way, and it is the correct tool for a builder/auditor session manually
+verifying `workspace add`/`status`/priority behavior too:
+
+```bash
+LOOM_WORKSPACES_PATH=/tmp/scratch-workspaces.json loom-daemon workspace add /tmp/some-dir --priority 3
+LOOM_WORKSPACES_PATH=/tmp/scratch-workspaces.json loom-daemon workspace list
+```
+
+Skipping this and calling the real CLI directly leaves stray entries in the
+operator's actual registry. Issue #4326 is the incident that motivated this
+note: an agent session's ad-hoc registry verification (during a migration/
+registry-adjacent sweep) registered `/private/tmp/mig-test` against the real
+file, the scratch directory was later deleted, and the dangling entry sat at
+explicit dispatch priority `3` — ahead of every real managed repo — for most
+of a day, until `loom-daemon workspace remove /private/tmp/mig-test` cleared
+it manually. Two structural backstops now exist for the residual case (an
+operator or agent forgetting the env var, or a directory going missing after
+correct registration): a `PreToolUse` guard hook asks for confirmation before
+a real-registry-mutating `workspace` command runs without
+`LOOM_WORKSPACES_PATH` in play (`guards.workspaceRegistry`, see
+[`guard-hooks.md`](guard-hooks.md) → "Workspace Registry Guard"), and both
+`loom-daemon status` and the autonomous work-finder flag/skip a registered
+root whose directory no longer exists on disk (warn-and-skip, never
+auto-remove — a root can be transiently absent, e.g. an unmounted volume).
+
+### Supervision (reboot/crash) — macOS via launchd, Linux via systemd `--user`
 
 Reboot/crash supervision itself (as opposed to the workdir/pid-file relocation
-above) is already implemented and documented for macOS via launchd —
-`RunAtLoad` (#3972), `KeepAlive:{SuccessfulExit:true}` restart-only relaunch
-(#4054), and a `StartInterval` autonomy-loss watchdog (#4011), all resolved
-through the `gui/<uid>` ↦ `user/<uid>` domain fallback (#4130). See
-[`daemon-reference.md`](daemon-reference.md) → Operability for the full
-writeup. **Linux has no equivalent** — the non-Darwin path is a plain `nohup …
-&` with no reboot/crash recovery and no watchdog. This is tracked as a named
-follow-up, #4260, rather than designed inline here.
+above) is implemented for macOS via launchd — `RunAtLoad` (#3972),
+`KeepAlive:{SuccessfulExit:true}` restart-only relaunch (#4054), and a
+`StartInterval` autonomy-loss watchdog (#4011), all resolved through the
+`gui/<uid>` ↦ `user/<uid>` domain fallback (#4130).
+
+On a **systemd Linux host** the same reboot survival + supervised-restart contract
+is provided by a `systemd --user` service (#4268, sub-issue B of #4260): `loom
+start` installs `~/.config/systemd/user/loom-daemon.service` and `systemctl --user
+enable --now`s it (`Restart=on-success` == the launchd restart-only relaunch;
+`WantedBy=default.target` == `RunAtLoad`), and `loom stop` runs `systemctl --user
+disable --now` so a reboot does not resurrect it. **Reboot survival on a
+headless / SSH-only host requires lingering** — run `loginctl enable-linger
+"$USER"` once. A non-systemd host (or `--no-systemd` / `LOOM_DAEMON_SYSTEMD=0`)
+falls back to the plain `nohup` path. See [`daemon-reference.md`](daemon-reference.md)
+→ Operability → "systemd user unit (Linux)" for the full writeup. Crash relaunch
+(as opposed to restart-on-success) and a systemd-side autonomy-loss watchdog
+remain follow-ups (sub-issue D of #4260), mirroring the still-launchd-only #4011
+watchdog.
 
 ## User-scope skills + agents (Epic #3835 Phase 4, #4261)
 
@@ -311,6 +374,38 @@ provisioning does not try to force user scope to win.
 > requires those trees present. That cutover lands with Phase 6's
 > `git rm --cached` migration, not here.
 
+## User-scope guard hooks (Epic #3835 Phase 5, #4262)
+
+The `PreToolUse` / `UserPromptSubmit` / `Stop` guard **hooks** also resolve from
+the machine-level checkout, provisioned by `scripts/install/provision-hooks.sh`
+(sibling of `provision-skills.sh`). Rather than a symlink, this performs a jq-based
+**idempotent merge** into the operator's user-scope `~/.claude/settings.json`:
+create-if-missing, back up before the first write, dedupe by the machine-level
+marker substring `defaults/hooks/<name>` (survives Claude Code requoting — the
+#4200 lesson), preserve every non-Loom entry, and soft-fail (no write) on invalid
+existing JSON.
+
+Each wired command is a **fail-open, self-gating** wrapper (full behavior in
+`defaults/docs/guard-hooks.md` → "Machine-Level Execution"): it no-ops outside a
+Loom workspace, defers to a still-present per-repo `.loom/hooks/<name>` copy
+(transition precedence — the project copy wins until Phase 6 / #4254 strips it, so
+guards never double-fire), and otherwise exec's the machine-checkout hook with the
+resolved repo root passed via `LOOM_PROJECT_ROOT`. `$HOME` / `$LOOM_HOME` expand
+per-user at hook-invocation time, so one wired command is correct for every
+operator. Daemon-spawned workers inherit the wiring via the `~/.claude/settings.json`
+copy each worker's isolated `CLAUDE_CONFIG_DIR` receives.
+
+`loom-daemon init`'s `.claude/settings.json` merge (`scaffolding.rs`) recognizes
+this machine-level command form (`MACHINE_HOOK_MARKER`) alongside the legacy /
+project-relative prefixes, so a reinstall never duplicates and an uninstall never
+orphans an entry that lands in a project-level settings file.
+
+> **Scope boundary (Phase 5 vs Phase 6).** This phase ships the machine-level hook
+> *execution* + user-scope wiring, and stops **copying** `defaults/hooks/*.sh` into
+> a fresh install's `.loom/hooks/`. It does **not** remove existing per-repo copies
+> or their project-level settings entries — that is Phase 6's `git rm --cached`
+> migration, which this replacement unblocks.
+
 ## Uninstall semantics
 
 A per-repo `uninstall-loom.sh` removes only the per-repo `./.loom/bin/loom` pool
@@ -325,3 +420,12 @@ does not remove them (that would break `/loom:*` for every other consumer repo).
 A machine-level teardown removes them via `deprovision_loom_skills` in
 `scripts/install/provision-skills.sh`, which deletes a link only when it points
 into the machine checkout and never touches an operator's real files.
+
+The user-scope **hook** entries follow the identical rule: they are one shared set
+resolved by every repo, so a per-repo uninstall does not strip them (that would
+disable the destructive-command / worktree guards for every other consumer repo). A
+machine-level teardown removes them via `deprovision_loom_hooks` in
+`scripts/install/provision-hooks.sh`, which removes only entries carrying the
+`/defaults/hooks/` marker and never touches an operator's own hooks. The per-repo
+**project-level** `.claude/settings.json` Loom hook entries, by contrast, *are*
+stripped by `uninstall-loom.sh`'s jq smart-removal on that file.

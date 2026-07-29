@@ -209,6 +209,14 @@ source "$LOOM_ROOT/scripts/install/provision-dispatcher.sh"
 # shellcheck source=scripts/install/provision-skills.sh
 source "$LOOM_ROOT/scripts/install/provision-skills.sh"
 
+# User-scope guard-hook wiring (Epic #3835 Phase 5, #4262). Sibling of
+# provision-skills.sh; wires the Loom PreToolUse/UserPromptSubmit/Stop guard
+# hooks into ~/.claude/settings.json so they execute from the machine checkout
+# instead of a per-repo .loom/hooks/ copy that drifts stale. Own file so the
+# test suite can exercise it standalone.
+# shellcheck source=scripts/install/provision-hooks.sh
+source "$LOOM_ROOT/scripts/install/provision-hooks.sh"
+
 # Dogfood command-dir linker (issue #3682) — extracted so the test suite can
 # exercise the scoped-symlink logic without running the full installer.
 # shellcheck source=scripts/install/dogfood-commands.sh
@@ -1108,6 +1116,18 @@ info "Provisioning user-scope loom skills + agents..."
 provision_loom_skills "${PROVISIONED_LOOM_CHECKOUT:-}" || \
   warning "User-scope loom skills/agents not fully provisioned; /loom:* skills still resolve from any per-repo copy."
 
+# Provision user-scope guard hooks (Epic #3835 Phase 5, #4262). Wires the Loom
+# guard hooks into ~/.claude/settings.json so they execute from the machine
+# checkout — a freshly-installed consumer repo needs NO per-repo .loom/hooks/
+# copy. Each wired command self-gates: it no-ops outside a Loom workspace and
+# defers to any still-present per-repo .loom/hooks/ copy (Phase 6 / #4254 strips
+# those; until then the project copy wins, so guards run exactly once). Additive
+# and best-effort — an operator's non-Loom hook entries are preserved and a soft
+# failure is logged but never aborts the install.
+info "Provisioning user-scope loom guard hooks..."
+provision_loom_hooks || \
+  warning "User-scope loom guard hooks not fully provisioned; guards still fire from any per-repo .loom/hooks/ copy + project-level settings entry."
+
 # Run loom-daemon init in the worktree
 cd "$TARGET_PATH/$WORKTREE_PATH"
 
@@ -1205,44 +1225,21 @@ git config core.hooksPath .githooks
 success "Set core.hooksPath to .githooks"
 echo ""
 
-# Copy hooks to target (settings.json references .loom/hooks/guard-destructive.sh,
-# a dispatcher that defers to the canonical Repo Skills guard when present — #4041)
-info "Installing hooks..."
-# Detect the canonical Repo Skills generic guard carrying the rjwalters/repo#29
-# fix. When present, Loom's vendored generic guard (guard-destructive-generic.sh)
-# is NOT installed and any stale copy is removed — the guard-destructive.sh
-# dispatcher defers to the canonical guard at runtime. Same marker probe the
-# dispatcher uses, so install-time and runtime always agree. (#4041)
-CANONICAL_GUARD_PRESENT=false
-if [[ -r ".claude/skills/repo/hooks/guard-destructive.sh" ]] && \
-   grep -q 'repo#29' ".claude/skills/repo/hooks/guard-destructive.sh" 2>/dev/null; then
-  CANONICAL_GUARD_PRESENT=true
-fi
-if [[ -d "$LOOM_ROOT/defaults/hooks" ]]; then
-  mkdir -p .loom/hooks
-  for hook_file in "$LOOM_ROOT/defaults/hooks/"*.sh; do
-    [[ -f "$hook_file" ]] || continue
-    hook_name=$(basename "$hook_file")
-    if [[ "$hook_name" == "guard-destructive-generic.sh" ]] && [[ "$CANONICAL_GUARD_PRESENT" == "true" ]]; then
-      if [[ -f ".loom/hooks/$hook_name" ]]; then
-        rm -f ".loom/hooks/$hook_name"
-        info "Canonical Repo Skills guard present — removed stale vendored $hook_name (dispatcher defers to canonical)"
-      else
-        info "Canonical Repo Skills guard present — skipping vendored $hook_name (dispatcher defers to canonical)"
-      fi
-      continue
-    fi
-    if [[ -f ".loom/hooks/$hook_name" ]] && [[ "$FORCE_OVERWRITE" != "true" ]] && [[ "$CLEAN_FIRST" != "true" ]]; then
-      info "Skipping existing hook: $hook_name (use --force to overwrite)"
-    else
-      cp "$hook_file" ".loom/hooks/$hook_name"
-      chmod +x ".loom/hooks/$hook_name"
-      success "Installed hook: $hook_name"
-    fi
-  done
-else
-  warning "No hooks directory found in defaults"
-fi
+# Hook SCRIPTS are no longer copied into the consumer's .loom/hooks/ (Epic #3835
+# Phase 5, #4262). They now execute from the machine-level checkout via the
+# user-scope ~/.claude/settings.json wiring provisioned above
+# (provision_loom_hooks), so a freshly-installed consumer repo carries no
+# hook-script copies and they can never drift stale. Hook POLICY (guards.*,
+# buildGate) is read from the tracked .loom-project/ project config through the
+# tiered resolver — it does NOT live alongside the scripts.
+#
+# Existing per-repo .loom/hooks/ copies on an ALREADY-installed repo are left
+# untouched here: removing them is Phase 6 (#4254) migration territory, and the
+# user-scope wrapper defers to a present copy so guards do not double-fire during
+# the transition. The #4041 canonical-Repo-Skills-guard preference logic lives in
+# the guard-destructive.sh dispatcher (path-relative; it moves with the script),
+# so no install-time canonical-guard probe is needed anymore.
+info "Hooks execute from the machine checkout (user-scope wiring) — not copied per-repo (#4262)"
 echo ""
 
 # Copy default config files (skill-routes.json template, etc.)
@@ -1666,8 +1663,9 @@ EXPECTED_FILES=(
   ".loom/scripts/lib/loom-tools.sh"
   ".loom/scripts/lib/forge-helpers.sh"
   ".loom/scripts/lib/pipe-pane-cmd.sh"
-  ".loom/hooks/guard-destructive.sh"
-  ".loom/hooks/skill-router.sh"
+  # NOTE (#4262): .loom/hooks/*.sh are intentionally NOT expected — hook scripts
+  # execute from the machine checkout via user-scope settings wiring, so a fresh
+  # install carries no per-repo hook copies.
   "CLAUDE.md"
   ".github/labels.yml"
   ".claude/commands/loom"

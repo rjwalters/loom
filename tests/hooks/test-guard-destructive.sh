@@ -19,6 +19,15 @@
 
 set -euo pipefail
 
+# Hermetic baseline: ambient guard-behavior overrides must not leak into tests
+# (#4325). Tests that exercise env-driven behavior deliberately inject their
+# vars explicitly per invocation (run_guard_env / assert_ask_env / assert_allow_env),
+# or via run_guard_in_worktree, so they are unaffected by this unset.
+unset LOOM_FORCE_SCOPE LOOM_DEFAULT_BRANCH LOOM_GUARD_SQL LOOM_GUARD_CLOUD \
+      LOOM_GUARD_REVERSIBLE_GH LOOM_RM_SCOPE LOOM_GUARD_READONLY_FASTPATH \
+      LOOM_GUARD_WORKTREE_ISOLATION LOOM_WORKTREE_PATH LOOM_WORKTREE_ROOT \
+      LOOM_GUARD_DECISION_LOG LOOM_GUARD_DECISION_LOG_FILE
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 GUARD="$REPO_ROOT/defaults/hooks/guard-destructive-generic.sh"
@@ -1799,6 +1808,44 @@ for _fp_dir in "$FASTPATH_OFF_REPO" "$FASTPATH_EXTRA_REPO"; do
     [[ -n "$_fp_dir" && "$_fp_dir" != "/" && -d "$_fp_dir/.loom" ]] && rm -rf "$_fp_dir"
 done
 
+# --- Tiered config (Epic #3835 Phase 5, #4262): .loom-project/project.json --
+# Create a throwaway git repo whose .loom-project/project.json (the tracked
+# tier) holds the given JSON, optionally alongside a legacy .loom/config.json
+# to exercise tier precedence. Echoes the repo path.
+make_project_tier_repo() {
+    local project_json="$1" legacy_json="${2:-}"
+    local dir
+    dir=$(mktemp -d 2>/dev/null)
+    git -C "$dir" init -q >/dev/null 2>&1
+    mkdir -p "$dir/.loom-project"
+    printf '%s' "$project_json" > "$dir/.loom-project/project.json"
+    if [[ -n "$legacy_json" ]]; then
+        mkdir -p "$dir/.loom"
+        printf '%s' "$legacy_json" > "$dir/.loom/config.json"
+    fi
+    echo "$dir"
+}
+
+if [[ "$_FP_AMBIENT_ON" == "1" ]]; then
+    PROJECT_TIER_REPO=$(make_project_tier_repo '{"guards":{"readOnlyFastPath":false}}')
+    assert_deny "Fast path tiered config: .loom-project/project.json readOnlyFastPath=false disables fast path" \
+        "grep '$_FP_DDL' schema.sql" "$PROJECT_TIER_REPO"
+
+    # Project tier (higher precedence) overrides a conflicting legacy tier.
+    OVERRIDE_REPO=$(make_project_tier_repo '{"guards":{"readOnlyFastPath":false}}' '{"guards":{"readOnlyFastPath":true}}')
+    assert_deny "Fast path tiered config: project tier overrides conflicting legacy tier (project wins)" \
+        "grep '$_FP_DDL' schema.sql" "$OVERRIDE_REPO"
+
+    # readOnlyFastPathExtra also resolves from the project tier.
+    PROJECT_EXTRA_REPO=$(make_project_tier_repo '{"guards":{"readOnlyFastPathExtra":["psql"]}}')
+    assert_allow "Fast path tiered config: readOnlyFastPathExtra from .loom-project admits 'psql'" \
+        "psql -c '$_FP_DDL'" "$PROJECT_EXTRA_REPO"
+
+    for _fp_dir in "$PROJECT_TIER_REPO" "$OVERRIDE_REPO" "$PROJECT_EXTRA_REPO"; do
+        [[ -n "$_fp_dir" && "$_fp_dir" != "/" && -d "$_fp_dir/.loom-project" ]] && rm -rf "$_fp_dir"
+    done
+fi
+
 echo ""
 
 # =========================================================================
@@ -2198,6 +2245,31 @@ assert_allow "write-confinement: '>' inside a quoted -m value is not a target" \
 # fd-dup (2>&1) is not a file write and must not manufacture a phantom target.
 assert_allow "write-confinement: fd-dup 2>&1 is not treated as a file write" \
     "echo x 2>&1 | tee /tmp/loom-test-$$-log" "$WT_REPO"
+
+# -------------------------------------------------------------------------
+# Quote-aware `>` masking (#4245) -- mask_gt() in extract_write_targets().
+#
+# A `>` that is only DATA inside a quoted --body/--title/... value (e.g. prose
+# describing the env > config > default precedence order) must never be
+# misread as a shell redirection operator, no matter how many such quoted `>`
+# characters the value contains. This is the exact false positive reported in
+# #4245: `gh issue create --body "... env > config > default ..."` was denied
+# as a "worktree-isolation bypass" even though `gh issue create` writes
+# nothing to the filesystem.
+assert_allow "write-confinement (#4245): gh issue create --body with a quoted '>' allows" \
+    "gh issue create --title \"Test\" --label \"loom:triage\" --body \"a > b\"" "$WT_REPO"
+assert_allow "write-confinement (#4245): multiple quoted '>' in one --body value allows" \
+    "gh issue create --title \"Test\" --body \"... following the env > config > default precedence ...\"" "$WT_REPO"
+assert_allow "write-confinement (#4245): quoted '>' inside a single-quoted value allows" \
+    "echo 'a > b'" "$WT_REPO"
+
+# Regression: a quote-aware mask must only NARROW detection, never widen it --
+# a REAL (unquoted) redirection into the main checkout must still deny even
+# when the same command also contains a quoted `>` elsewhere.
+assert_deny "write-confinement (#4245): quoted '>' alongside a real unquoted '>' still denies" \
+    "echo \"a > b\" > $WT_REPO/defaults/hooks/f.sh" "$WT_REPO"
+assert_deny "write-confinement (#4245): bare '>' redirection still denies (regression)" \
+    "echo x > $WT_REPO/defaults/hooks/g.sh" "$WT_REPO"
 
 # -------------------------------------------------------------------------
 # Regression (#4210): CWD is the builder's own LINKED worktree, and the write
