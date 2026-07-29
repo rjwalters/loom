@@ -1053,6 +1053,81 @@ function qsplit(s,   out, n, i, c, j, qc, ci, inner, SQ, DQ) {
 }
 '
 
+# =============================================================================
+# QUOTE-AWARE REDIRECTION MASKING (#4245)
+#
+# extract_write_targets() (below) recognizes `>`/`>>` redirection by splitting
+# a qsplit()-segmented command on whitespace and pattern-matching each token —
+# but that whitespace split is NOT quote-aware, so a `>` that is DATA inside a
+# quoted argument (e.g. `gh issue create --body "... env > config > default
+# ..."`) can land in its own whitespace-bounded "token" and be misread as a
+# real redirection operator, manufacturing a phantom write target and denying
+# a command that writes nothing to the filesystem (#4245; same failure class
+# as the #3755 qsplit()/#3679 strip_literal_text() quoting fixes above).
+#
+# mask_gt() walks the string tracking quote state (single-quoted,
+# double-quoted, unquoted) and replaces every `>` found INSIDE a quoted span
+# with SOH (0x01, a character that can never appear in a shell command and so
+# can never itself be mis-split into a phantom target). It otherwise returns
+# the input UNCHANGED byte-for-byte (same length, same whitespace positions),
+# so a caller can split both the original and the masked string on whitespace
+# and get IDENTICAL token boundaries — the masked tokens are used only to
+# DECIDE whether a token is a real (unquoted) redirection operator; the
+# ORIGINAL tokens are still used to extract the actual target text.
+#
+# Deliberately does NOT model backslash-escaped quotes -- same simplification
+# qsplit() (above) and strip_literal_text() already accept for this file's
+# other quote-tracking scans, and for good reason beyond just consistency: the
+# input mask_gt() actually receives (COMMAND_ASK_SCAN, see extract_write_targets()
+# below) has typically already been through strip_literal_text()'s OWN
+# escape-blind redaction, which can shift a quote's effective position (e.g. an
+# escaped `\"` inside a redacted --body value loses its backslash, since the
+# redaction's own quote-matching stops at the first bare `"` it finds). Layering
+# a stricter, escape-AWARE scan on top of that already-escape-blind text would
+# only desynchronize the two passes' quote parity -- worse, in the wrong
+# direction (masking too little). Matching qsplit()'s exact toggle-on-every-
+# quote-char behavior keeps both passes' parity in agreement. Same accepted
+# risk direction as qsplit(): pathological unbalanced-quote input could in
+# theory shift parity and mis-mask a genuine unquoted `>`, but that is the same
+# best-effort risk this file already accepts for `;|&` segmentation -- never a
+# NEW risk introduced here. An unterminated quote (no matching close before
+# end-of-string) just runs to the end of the string in that quote state --
+# never crashes, never mis-indexes.
+# =============================================================================
+_MASKGT_AWK='
+function mask_gt(s,   out, n, i, c, mode, SQ, DQ, MASK) {
+    SQ = sprintf("%c", 39)    # single quote
+    DQ = sprintf("%c", 34)    # double quote
+    MASK = sprintf("%c", 1)   # SOH -- placeholder for a quoted ">" (never a real char)
+    out = ""
+    n = length(s)
+    i = 1
+    mode = 0   # 0 = unquoted, 1 = single-quoted, 2 = double-quoted
+    while (i <= n) {
+        c = substr(s, i, 1)
+        if (mode == 0) {
+            if (c == SQ) { mode = 1; out = out c; i++; continue }
+            if (c == DQ) { mode = 2; out = out c; i++; continue }
+            out = out c
+            i++
+            continue
+        }
+        if (mode == 1) {
+            # Single-quoted: only the matching quote ends the span.
+            if (c == SQ) { mode = 0; out = out c; i++; continue }
+            out = out (c == ">" ? MASK : c)
+            i++
+            continue
+        }
+        # mode == 2 (double-quoted): only the matching quote ends the span.
+        if (c == DQ) { mode = 0; out = out c; i++; continue }
+        out = out (c == ">" ? MASK : c)
+        i++
+    }
+    return out
+}
+'
+
 # Parse force-op segments out of a command, emitting one TAB-separated
 # "<cpath>\t<target>" line per genuine git force-push / hard-reset. Portable awk
 # only (mirrors extract_rm_targets / lifecycle_or_cloud_reason segment parsing):
@@ -1616,18 +1691,25 @@ extract_rm_targets() {
 #
 # NOT a full shell parser: like parse_force_ops / extract_rm_targets, splitting
 # a segment into tokens is plain whitespace splitting (not quote-aware), so a
-# quoted argument containing a literal space can be mis-split. The caller
-# feeds this the ASK-tier working copy (COMMAND_ASK_SCAN — comment-stripped
-# AND literal-text-redacted, i.e. --body/-m/--title/--notes/--comment values
-# are replaced with same-length placeholder text) specifically so a `>` that
-# merely appears INSIDE such a quoted value (e.g. `git commit -m "a > b"`)
-# cannot manufacture a phantom target. Any remaining false positive from an
-# unredacted quote resolves to, at worst, an extra deny on a target that isn't
-# really a write (safe direction) or a missed target (also safe — the fail-
-# open contract this file uses everywhere: ambiguity never widens a deny).
+# quoted argument containing a literal space can be mis-split. The `>`/`>>`
+# redirection scan below is the one exception: it is quote-aware (#4245) via
+# mask_gt() — a `>` inside a quoted argument (e.g. `gh issue create --body
+# "... env > config > default ..."`) is never treated as a redirection
+# operator, regardless of whether the caller's literal-text redaction (next
+# paragraph) already removed it. The caller ALSO feeds this the ASK-tier
+# working copy (COMMAND_ASK_SCAN — comment-stripped AND literal-text-redacted,
+# i.e. --body/-m/--title/--notes/--comment values are replaced with
+# same-length placeholder text) as a second, independent narrowing so a `>`
+# that merely appears INSIDE such a quoted value (e.g. `git commit -m "a > b"`)
+# cannot manufacture a phantom target even in the (non-`>`) tee/sed/cp/mv
+# target-extraction paths below, which stay plain-whitespace-split. Any
+# remaining false positive resolves to, at worst, an extra deny on a target
+# that isn't really a write (safe direction) or a missed target (also safe —
+# the fail-open contract this file uses everywhere: ambiguity never widens a
+# deny).
 # =============================================================================
 extract_write_targets() {
-    printf '%s' "$1" | awk -v startcwd="$2" "$_QSPLIT_AWK"'
+    printf '%s' "$1" | awk -v startcwd="$2" "$_QSPLIT_AWK""$_MASKGT_AWK"'
     BEGIN {
         SEP = sprintf("%c", 31)
         curcwd = startcwd
@@ -1644,6 +1726,15 @@ extract_write_targets() {
 
             m = split(seg, toks, /[ \t]+/)
             if (m < 1) continue
+
+            # Quote-aware parallel tokenization (#4245): mseg is byte-for-byte
+            # identical to seg except a `>` inside a quoted span is replaced
+            # with an SOH placeholder, so whitespace splitting yields the SAME
+            # token boundaries (mm == m always) but mtoks[] can be tested for
+            # a REAL (unquoted) redirection operator without ever matching a
+            # `>` that was only quoted data.
+            mseg = mask_gt(seg)
+            mm = split(mseg, mtoks, /[ \t]+/)
 
             if (toks[1] == "cd") {
                 if (m >= 2 && toks[2] != "" && toks[2] != "-") {
@@ -1690,21 +1781,25 @@ extract_write_targets() {
             # >/>>  redirection — token-boundary detection only (never a
             # mid-token char scan), so scanning stays anchored to whitespace
             # boundaries rather than manufacturing a target out of a `>`
-            # sitting inside an already-multi-char token.
+            # sitting inside an already-multi-char token. The MATCH test reads
+            # mtoks[] (quote-masked, #4245) so a `>` that is only quoted DATA
+            # can never match as an operator; the actual target text is still
+            # read from the ORIGINAL toks[] (unmasked) once a real operator is
+            # confirmed.
             for (j = 1; j <= m; j++) {
-                t = toks[j]
-                if (t == "") continue
-                if (t ~ /^[0-9]*>>?$/) {
+                mt = mtoks[j]
+                if (mt == "") continue
+                if (mt ~ /^[0-9]*>>?$/) {
                     # Bare operator token. Dup-to-fd (`> &1`) is recognized by
                     # the NEXT token starting with `&` and excluded.
-                    if (j + 1 <= m && toks[j+1] != "" && toks[j+1] !~ /^&/) {
+                    if (j + 1 <= m && toks[j+1] != "" && mtoks[j+1] !~ /^&/) {
                         print curcwd SEP toks[j+1]
                     }
                     continue
                 }
-                if (t ~ /^[0-9]*>>?[^ \t&]/) {
+                if (mt ~ /^[0-9]*>>?[^ \t&]/) {
                     # Attached form (`>file`, `2>file`, `>>file`).
-                    op = t
+                    op = toks[j]
                     sub(/^[0-9]*>>?/, "", op)
                     if (op != "") print curcwd SEP op
                 }
@@ -1960,7 +2055,7 @@ if worktree_isolation_guard_enabled && \
             _WT_WRITE_BASE_DONE=1
         fi
         if _any_managed_worktree_exists "$_WT_WRITE_BASE"; then
-            deny "BLOCKED: Bash-tool write to '${_wabs}' resolves to the main repository checkout ('${_WT_MAIN_ROOT}'), but a Loom-managed worktree exists for this session. This is a worktree-isolation bypass via Bash redirection/tee/sed -i/cp/mv — do NOT retry the write through Bash. cd into your issue worktree (.loom/worktrees/issue-<N>) and write there instead. (#4178)" "worktree-write-confinement"
+            deny "BLOCKED: Bash-tool write to '${_wabs}' resolves to the main repository checkout ('${_WT_MAIN_ROOT}'), but a Loom-managed worktree exists elsewhere in this repository (this check cannot verify it belongs to the acting session — see #4245). This is a worktree-isolation bypass via Bash redirection/tee/sed -i/cp/mv — do NOT retry the write through Bash. cd into your issue worktree (.loom/worktrees/issue-<N>) and write there instead. (#4178)" "worktree-write-confinement"
         fi
     done <<< "$WRITE_TARGETS"
 fi
