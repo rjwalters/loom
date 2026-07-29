@@ -739,44 +739,20 @@ pub mod forge {
     use std::path::Path;
     use std::process::{Command, Stdio};
 
-    #[derive(Debug, Deserialize)]
-    struct GhBuildingIssue {
-        number: u32,
-        #[serde(rename = "updatedAt", default)]
-        updated_at: Option<String>,
-    }
-
     fn list_building_issues(gh_bin: &Path, root: &Path) -> Result<Vec<BuildingIssue>> {
-        let mut cmd = Command::new(gh_bin);
-        cmd.arg("issue")
-            .arg("list")
-            .arg("--label")
-            .arg("loom:building")
-            .arg("--state")
-            .arg("open")
-            .arg("--limit")
-            .arg(MAX_ISSUES_PER_WORKSPACE.to_string())
-            .arg("--json")
-            .arg("number,updatedAt");
-        cmd.current_dir(root);
-        if let Ok(repo) = std::env::var("LOOM_REPO") {
-            cmd.arg("--repo").arg(repo);
-        }
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let out = cmd
-            .output()
-            .with_context(|| format!("failed to invoke {}", gh_bin.display()))?;
-        if !out.status.success() {
-            return Err(anyhow!(
-                "gh issue list --label loom:building failed in {}: {}",
-                root.display(),
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
-        }
-        let rows: Vec<GhBuildingIssue> =
-            serde_json::from_slice(&out.stdout).context("parse gh issue list JSON")?;
+        // ETag-cached REST listing (#4428): an unchanged claim set costs zero
+        // rate limit (304). `LOOM_REPO` precedence is handled inside; the
+        // `pull_request` filter keeps the pre-#4428 issue-only semantics.
+        let rows = crate::forge_listing::list_issues_cached(
+            gh_bin,
+            Some(root),
+            None,
+            "loom:building",
+            "open",
+        )?;
         Ok(rows
             .into_iter()
+            .filter(|r| !r.is_pull_request)
             .map(|r| BuildingIssue {
                 number: r.number,
                 updated_at: r
@@ -1597,31 +1573,13 @@ mod tests {
         journal.entries.push(journal_entry(&repo_str, 99, 0));
         sweep_journal::save(&journal_path, &journal).unwrap();
 
-        // Fake `gh`: `issue list` reports one loom:building issue labeled
-        // *just now* -- fresh enough that the NoRecordStale (age-based) path
-        // would say Keep. Only the DeadPid evidence should trigger a reclaim.
+        // Fake `gh`: the REST listing (#4428) reports one loom:building issue
+        // labeled *just now* -- fresh enough that the NoRecordStale
+        // (age-based) path would say Keep. Only the DeadPid evidence should
+        // trigger a reclaim.
         let gh_log = dir.path().join("gh-invocations.log");
-        let fake_gh = dir.path().join("fake-gh.sh");
         let now = Utc::now().to_rfc3339();
-        let script = format!(
-            r#"#!/usr/bin/env bash
-printf '%s\n' "$*" >> "{log}"
-if [ "$1" = "issue" ] && [ "$2" = "list" ]; then
-  echo '[{{"number":99,"updatedAt":"{now}"}}]'
-  exit 0
-fi
-exit 0
-"#,
-            log = gh_log.display(),
-            now = now,
-        );
-        std::fs::write(&fake_gh, &script).unwrap();
-        #[cfg(unix)]
-        {
-            let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&fake_gh, perms).unwrap();
-        }
+        let fake_gh = write_fake_gh(dir.path(), &gh_log, 99, &now);
 
         let (checked, reclaimed) = forge::reconcile_workspace(&fake_gh, &repo_root);
 
@@ -1653,10 +1611,13 @@ exit 0
     // ------------------------------------------------------------------
 
     /// Write a fake `gh` script (tests only) that logs every invocation to
-    /// `gh_log` and, for `issue list`, reports exactly one `loom:building`
-    /// issue (`issue_number`, `updated_at`). Every other subcommand (e.g.
-    /// `issue edit`) just logs and exits 0 -- a test asserts on `gh_log`'s
-    /// contents to see whether a reclaim was actually attempted.
+    /// `gh_log` and, for the ETag-cached REST listing (`gh api …/issues?…`,
+    /// #4428), reports exactly one `loom:building` issue (`issue_number`,
+    /// `updated_at`) as an `--include`-style HTTP response with **no ETag**
+    /// (so the process-global cache never carries state across tests). Every
+    /// other subcommand (e.g. `issue edit`) just logs and exits 0 -- a test
+    /// asserts on `gh_log`'s contents to see whether a reclaim was actually
+    /// attempted.
     fn write_fake_gh(
         dir: &std::path::Path,
         gh_log: &std::path::Path,
@@ -1667,8 +1628,9 @@ exit 0
         let script = format!(
             r#"#!/usr/bin/env bash
 printf '%s\n' "$*" >> "{log}"
-if [ "$1" = "issue" ] && [ "$2" = "list" ]; then
-  echo '[{{"number":{issue_number},"updatedAt":"{updated_at}"}}]'
+if [ "$1" = "api" ]; then
+  printf 'HTTP/2.0 200 OK\r\n\r\n'
+  echo '[{{"number":{issue_number},"state":"open","labels":[{{"name":"loom:building"}}],"updated_at":"{updated_at}"}}]'
   exit 0
 fi
 exit 0

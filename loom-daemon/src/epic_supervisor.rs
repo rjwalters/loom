@@ -1304,34 +1304,30 @@ pub mod forge {
         }
 
         fn gh_json(&self, label: &str, state: &str) -> Result<Vec<GhIssue>> {
-            let mut cmd = Command::new(&self.gh_bin);
-            cmd.arg("issue")
-                .arg("list")
-                .arg("--label")
-                .arg(label)
-                .arg("--state")
-                .arg(state)
-                .arg("--limit")
-                .arg("200")
-                .arg("--json")
-                .arg("number,body,state,labels");
-            if let Some(ref repo) = self.repo {
-                cmd.arg("--repo").arg(repo);
-            }
-            if let Some(ref cwd) = self.cwd {
-                cmd.current_dir(cwd);
-            }
-            cmd.stderr(Stdio::piped());
-            let out = cmd
-                .output()
-                .with_context(|| format!("failed to invoke {}", self.gh_bin.display()))?;
-            if !out.status.success() {
-                return Err(anyhow!(
-                    "gh issue list --label {label} failed: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                ));
-            }
-            serde_json::from_slice(&out.stdout).context("parse gh issue list JSON")
+            // ETag-cached REST listing (#4428): unchanged epic sets cost zero
+            // rate limit (304). REST reports state lowercase (`"open"` vs
+            // GraphQL's `"OPEN"`) — `EpicSnapshot::is_open` compares
+            // case-insensitively, so both forms are safe. The `pull_request`
+            // filter keeps the pre-#4428 issue-only semantics.
+            let rows = crate::forge_listing::list_issues_cached(
+                &self.gh_bin,
+                self.cwd.as_deref(),
+                self.repo.as_deref(),
+                label,
+                state,
+            )?;
+            Ok(rows
+                .into_iter()
+                .filter(|r| !r.is_pull_request)
+                .map(|r| GhIssue {
+                    number: r.number,
+                    // REST `body` is nullable; the GraphQL-era parse defaulted
+                    // an absent body to empty, so keep that semantics.
+                    body: r.body.unwrap_or_default(),
+                    state: r.state,
+                    labels: r.labels.into_iter().map(|name| GhLabel { name }).collect(),
+                })
+                .collect())
         }
     }
 
