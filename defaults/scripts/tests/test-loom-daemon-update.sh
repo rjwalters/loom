@@ -120,6 +120,44 @@ EOF
     ( cd "$root" && git init -q && git -c user.email=test@test -c user.name=test commit -q --allow-empty -m init )
 }
 
+# new_fixture_with_origin <root> <bare_dir> (#4330) — builds on new_fixture(),
+# adding a local BARE repo as `origin` so the ff-first sync path (which
+# resolves the default branch via refs/remotes/origin/HEAD, then fetches and
+# compares against origin/<branch>) has a real remote to talk to — entirely
+# offline (a plain filesystem path, no network). Forces the branch name to
+# `main` (deterministic regardless of the test host's init.defaultBranch) and
+# sets refs/remotes/origin/HEAD via `git remote set-head origin -a` so
+# loom_default_branch() resolves it the same way a real clone would.
+new_fixture_with_origin() {
+    local root="$1" bare="$2"
+    new_fixture "$root"
+    ( cd "$root" && git branch -q -M main )
+    git init -q --bare "$bare"
+    ( cd "$root" && git remote add origin "$bare" && git push -q origin HEAD:refs/heads/main )
+    git -C "$bare" symbolic-ref HEAD refs/heads/main
+    ( cd "$root" && git remote set-head origin -a >/dev/null 2>&1 )
+}
+
+# push_extra_commits_to_origin <bare_dir> <n> — advances the bare `origin`
+# repo `n` commits ahead of whatever a fixture repo's `main` currently is, by
+# cloning it into a throwaway dir, committing there, and pushing back. Echoes
+# the new origin tip's short commit on stdout. The fixture repo passed to
+# new_fixture_with_origin is left untouched (still behind by exactly <n>).
+push_extra_commits_to_origin() {
+    local bare="$1" n="$2" tmpclone
+    tmpclone="$(mktemp -d)"
+    git clone -q "$bare" "$tmpclone"
+    local i
+    for i in $(seq 1 "$n"); do
+        ( cd "$tmpclone" && git -c user.email=test@test -c user.name=test commit -q --allow-empty -m "extra ${i}" )
+    done
+    ( cd "$tmpclone" && git push -q origin HEAD:refs/heads/main )
+    local tip
+    tip="$(cd "$tmpclone" && git rev-parse --short HEAD)"
+    rm -rf "$tmpclone"
+    echo "$tip"
+}
+
 # Writes a fake daemon binary at $1 that reports commit $2 on --version and,
 # on a normal run, appends its inherited LOOM_WORK_FINDER / LOOM_MAIN_HEALTH_GATE
 # to marker file $3 before looping forever (so it stays alive for kill -0).
@@ -1841,6 +1879,242 @@ if grep -q -- '-k' "$W36/launchctl.log" 2>/dev/null; then
 else
     TESTS_PASSED=$((TESTS_PASSED + 1))
     echo -e "${GREEN}✓${NC} exhausted kickstart fallback was still never invoked with -k"
+fi
+
+# ============================================================
+# 37. ff-first default (#4330): local main is behind origin/main with a
+#     CLEAN tree -> the ff-merge applies, and the rebuild below builds the
+#     freshly-synced (post-merge) HEAD, not the stale pre-merge one.
+# ============================================================
+W37="$BASE_WORKDIR/w37"
+BARE37="$BASE_WORKDIR/w37-origin.git"
+new_fixture_with_origin "$W37" "$BARE37"
+ORIGIN_TIP37="$(push_extra_commits_to_origin "$BARE37" 2)"
+NEW_FAKE37="$W37/new-fake-daemon"
+write_fake_daemon "$NEW_FAKE37" "$ORIGIN_TIP37" "$W37/new-marker"
+out37=$( cd "$W37" && PATH="$TEST_PATH" NEW_FAKE_BIN_SRC="$NEW_FAKE37" \
+    bash "$UPDATE_SCRIPT" 2>&1 )
+rc37=$?
+assert_eq "0" "$rc37" "ff-first: behind origin + clean tree -> update succeeds (ff-merge applied)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out37" | grep -qi 'Fast-forwarded'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} ff-first: reports the fast-forward sync"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} ff-first: reports the fast-forward sync"
+    echo "  output: $out37"
+fi
+HEAD_AFTER37="$(cd "$W37" && git rev-parse --short HEAD)"
+assert_eq "$ORIGIN_TIP37" "$HEAD_AFTER37" "ff-first: local HEAD now equals origin tip after the sync"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out37" | grep -qi "Build verification: freshly-built binary embeds source HEAD commit (${ORIGIN_TIP37})"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} ff-first: the rebuild is verified against the POST-merge HEAD, not the stale pre-merge one"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} ff-first: the rebuild is verified against the POST-merge HEAD, not the stale pre-merge one"
+    echo "  output: $out37"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out37" | grep -qE "Installed: ${ORIGIN_TIP37} \(matches origin/main\)"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} final installed line states the built commit AND that it matches origin/main (AC4)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} final installed line states the built commit AND that it matches origin/main (AC4)"
+    echo "  output: $out37"
+fi
+
+# ============================================================
+# 38. ff-first default: local main is behind origin/main AND has a DIVERGED
+#     local commit -> the ff-merge cannot apply -> abort exit 1, no merge, no
+#     build, working tree untouched. Never guesses or hard-resets.
+# ============================================================
+W38="$BASE_WORKDIR/w38"
+BARE38="$BASE_WORKDIR/w38-origin.git"
+new_fixture_with_origin "$W38" "$BARE38"
+push_extra_commits_to_origin "$BARE38" 2 >/dev/null
+# Diverge: a local commit that is NOT on origin (so the merge is not a plain
+# fast-forward — `git merge --ff-only` must refuse).
+( cd "$W38" && git -c user.email=test@test -c user.name=test commit -q --allow-empty -m "local diverged commit" )
+HEAD_BEFORE38="$(cd "$W38" && git rev-parse --short HEAD)"
+out38=$( cd "$W38" && PATH="$TEST_PATH" bash "$UPDATE_SCRIPT" 2>&1 )
+rc38=$?
+assert_eq "1" "$rc38" "ff-first: diverged local commit -> abort exit 1 (never guess or hard-reset)"
+HEAD_AFTER38="$(cd "$W38" && git rev-parse --short HEAD)"
+assert_eq "$HEAD_BEFORE38" "$HEAD_AFTER38" "ff-first: diverged case leaves local HEAD completely untouched"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out38" | grep -qi 'Refusing to guess or hard-reset'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} ff-first: diverged case reports the abort rationale"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} ff-first: diverged case reports the abort rationale"
+    echo "  output: $out38"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ -e "$W38/loom-daemon/target/release/loom-daemon" ]]; then
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} ff-first: diverged case performs no build"
+else
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} ff-first: diverged case performs no build"
+fi
+
+# ============================================================
+# 39. --allow-stale restores the pre-#4330 build-what's-here behavior: the
+#     ff-merge is skipped entirely, the current (stale) checkout is built,
+#     and the behind-origin advisory warning is still printed.
+# ============================================================
+W39="$BASE_WORKDIR/w39"
+BARE39="$BASE_WORKDIR/w39-origin.git"
+new_fixture_with_origin "$W39" "$BARE39"
+push_extra_commits_to_origin "$BARE39" 3 >/dev/null
+HEAD_BEFORE39="$(cd "$W39" && git rev-parse --short HEAD)"
+NEW_FAKE39="$W39/new-fake-daemon"
+write_fake_daemon "$NEW_FAKE39" "$HEAD_BEFORE39" "$W39/new-marker"
+out39=$( cd "$W39" && PATH="$TEST_PATH" NEW_FAKE_BIN_SRC="$NEW_FAKE39" \
+    bash "$UPDATE_SCRIPT" --allow-stale 2>&1 )
+rc39=$?
+assert_eq "0" "$rc39" "--allow-stale: builds the current (stale) checkout, exits 0"
+HEAD_AFTER39="$(cd "$W39" && git rev-parse --short HEAD)"
+assert_eq "$HEAD_BEFORE39" "$HEAD_AFTER39" "--allow-stale: local HEAD is never merged/advanced"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out39" | grep -qi 'behind origin/main.*--allow-stale'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} --allow-stale: the behind-origin advisory warning is still printed"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} --allow-stale: the behind-origin advisory warning is still printed"
+    echo "  output: $out39"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out39" | grep -qE "Installed: ${HEAD_BEFORE39} \(origin/main is at .* does NOT match"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} --allow-stale: final installed line reports the built commit does NOT match origin/main (AC4)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} --allow-stale: final installed line reports the built commit does NOT match origin/main (AC4)"
+    echo "  output: $out39"
+fi
+
+# ============================================================
+# 40. --check / --dry-run stay read-only even when behind origin: no fetch
+#     result may write to the tree — HEAD is unchanged after either mode, and
+#     --check reports the behind-origin status informationally while
+#     --dry-run's printed plan mentions the ff-sync.
+# ============================================================
+W40="$BASE_WORKDIR/w40"
+BARE40="$BASE_WORKDIR/w40-origin.git"
+new_fixture_with_origin "$W40" "$BARE40"
+push_extra_commits_to_origin "$BARE40" 1 >/dev/null
+HEAD_BEFORE40="$(cd "$W40" && git rev-parse --short HEAD)"
+out40_check=$( cd "$W40" && PATH="$TEST_PATH" bash "$UPDATE_SCRIPT" --check 2>&1 )
+HEAD_AFTER40_CHECK="$(cd "$W40" && git rev-parse --short HEAD)"
+assert_eq "$HEAD_BEFORE40" "$HEAD_AFTER40_CHECK" "--check while behind origin: HEAD unchanged (no writes contract holds)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out40_check" | grep -qi 'behind origin/main'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} --check reports the behind-origin status informationally"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} --check reports the behind-origin status informationally"
+    echo "  output: $out40_check"
+fi
+out40_dry=$( cd "$W40" && PATH="$TEST_PATH" bash "$UPDATE_SCRIPT" --dry-run 2>&1 )
+HEAD_AFTER40_DRY="$(cd "$W40" && git rev-parse --short HEAD)"
+assert_eq "$HEAD_BEFORE40" "$HEAD_AFTER40_DRY" "--dry-run while behind origin: HEAD unchanged (no writes contract holds)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out40_dry" | grep -qi 'fast-forward.*origin/main'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} --dry-run's printed plan mentions the ff-sync"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} --dry-run's printed plan mentions the ff-sync"
+    echo "  output: $out40_dry"
+fi
+
+# ============================================================
+# 41. HEAD on a non-default branch while behind origin -> abort, naming
+#     --allow-stale (an operator deliberately elsewhere — e.g. bisecting — is
+#     exactly the --allow-stale use case, never a guess-which-branch merge).
+# ============================================================
+W41="$BASE_WORKDIR/w41"
+BARE41="$BASE_WORKDIR/w41-origin.git"
+new_fixture_with_origin "$W41" "$BARE41"
+push_extra_commits_to_origin "$BARE41" 1 >/dev/null
+( cd "$W41" && git checkout -q -b feature-branch )
+HEAD_BEFORE41="$(cd "$W41" && git rev-parse --short HEAD)"
+out41=$( cd "$W41" && PATH="$TEST_PATH" bash "$UPDATE_SCRIPT" 2>&1 )
+rc41=$?
+assert_eq "1" "$rc41" "non-default branch while behind -> abort exit 1"
+HEAD_AFTER41="$(cd "$W41" && git rev-parse --short HEAD)"
+assert_eq "$HEAD_BEFORE41" "$HEAD_AFTER41" "non-default branch while behind: HEAD untouched"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out41" | grep -q -- '--allow-stale'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} abort message names --allow-stale as the deliberate escape hatch"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} abort message names --allow-stale as the deliberate escape hatch"
+    echo "  output: $out41"
+fi
+
+# ============================================================
+# 42. Fetch failure (origin unreachable) must NOT make the script
+#     network-dependent: warn and proceed with local HEAD as-is, exactly like
+#     today's behavior — never abort, never hang past the bounded fetch.
+# ============================================================
+W42="$BASE_WORKDIR/w42"
+BARE42="$BASE_WORKDIR/w42-origin.git"
+new_fixture_with_origin "$W42" "$BARE42"
+# refs/remotes/origin/HEAD is now cached locally (set by new_fixture_with_origin
+# above), so loom_default_branch() can still name "main" via its offline,
+# no-network tier even though the URL below makes the ACTUAL fetch fail —
+# isolating "fetch failed" from "branch unresolvable" (test 43 covers the latter).
+( cd "$W42" && git remote set-url origin "$BASE_WORKDIR/does-not-exist-w42.git" )
+HEAD42="$(cd "$W42" && git rev-parse --short HEAD)"
+INSTALLED42="$W42/installed/loom-daemon"
+mkdir -p "$W42/installed"
+write_fake_daemon "$INSTALLED42" "$HEAD42" "$W42/old-marker"
+out42=$( cd "$W42" && PATH="$TEST_PATH" LOOM_DAEMON_BIN="$INSTALLED42" \
+    bash "$UPDATE_SCRIPT" --check 2>&1 )
+rc42=$?
+assert_eq "0" "$rc42" "fetch failure: proceeds as today (installed already matches local HEAD) -> exit 0"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out42" | grep -qi 'could not reach origin'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} fetch failure surfaces a warning instead of aborting"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} fetch failure surfaces a warning instead of aborting"
+    echo "  output: $out42"
+fi
+
+# ============================================================
+# 43. Signaling "unknown currency" honestly: a fixture with NO origin remote
+#     at all (loom_default_branch cannot resolve a default branch) still
+#     completes normally, and the final installed line says so explicitly
+#     rather than silently omitting the currency claim.
+# ============================================================
+W43="$BASE_WORKDIR/w43"
+new_fixture "$W43"
+HEAD43="$(cd "$W43" && git rev-parse --short HEAD)"
+NEW_FAKE43="$W43/new-fake-daemon"
+write_fake_daemon "$NEW_FAKE43" "$HEAD43" "$W43/new-marker"
+out43=$( cd "$W43" && PATH="$TEST_PATH" NEW_FAKE_BIN_SRC="$NEW_FAKE43" \
+    bash "$UPDATE_SCRIPT" 2>&1 )
+rc43=$?
+assert_eq "0" "$rc43" "no origin remote at all: update still succeeds"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out43" | grep -qi 'currency vs origin/<default-branch> unknown'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} final installed line honestly reports unknown currency when origin is unresolvable"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} final installed line honestly reports unknown currency when origin is unresolvable"
+    echo "  output: $out43"
 fi
 
 # ============================================================
