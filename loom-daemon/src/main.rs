@@ -3323,6 +3323,17 @@ fn print_status_unreachable_human(
                             r.heartbeat_stale_threshold_secs.unwrap_or_default()
                         );
                     }
+                    Some(daemon_install_state::HeartbeatFreshness::PriorBoot) => {
+                        eprintln!(
+                            "Heartbeat file is from a PREVIOUS boot ({}s old; this process is \
+                             only {}s old) — it is not evidence about the current process. (A \
+                             daemon that wedged before writing its first heartbeat this boot \
+                             would look identical — re-check after the process is well past \
+                             startup if you still suspect a wedge.)",
+                            r.heartbeat_age_secs.unwrap_or_default(),
+                            r.process_age_secs.unwrap_or_default()
+                        );
+                    }
                     _ => {
                         eprintln!(
                             "Heartbeat status unknown (no heartbeat file, or disabled) — \
@@ -3331,18 +3342,41 @@ fn print_status_unreachable_human(
                     }
                 }
                 eprintln!();
-                if let Some(pid) = r.pid {
-                    eprintln!("Do NOT run loom-daemon-start.sh — the singleton guard will refuse");
-                    eprintln!(
-                        "while pid {pid} is alive. Inspect it directly, or restart explicitly:"
-                    );
+                // Advice gating (#4368): the imperative stop/start remediation
+                // is only warranted for a *current-boot* Stale verdict — the
+                // one case where the evidence actually points at a wedge.
+                // Fresh/Unknown/PriorBoot get inspect-first guidance instead,
+                // so an operator is never steered into restarting a daemon
+                // that is merely mid-fault-diagnosis or missing heartbeat
+                // evidence, not actually wedged.
+                if r.heartbeat_freshness == Some(daemon_install_state::HeartbeatFreshness::Stale) {
+                    if let Some(pid) = r.pid {
+                        eprintln!(
+                            "Do NOT run loom-daemon-start.sh — the singleton guard will refuse"
+                        );
+                        eprintln!(
+                            "while pid {pid} is alive. Inspect it directly, or restart explicitly:"
+                        );
+                    } else {
+                        eprintln!(
+                            "Do NOT run loom-daemon-start.sh — the singleton guard will refuse"
+                        );
+                        eprintln!(
+                            "while the daemon is alive. Inspect it directly, or restart explicitly:"
+                        );
+                    }
+                    eprintln!("  ./.loom/scripts/cli/loom-daemon-stop.sh && ./.loom/scripts/cli/loom-daemon-start.sh");
                 } else {
-                    eprintln!("Do NOT run loom-daemon-start.sh — the singleton guard will refuse");
-                    eprintln!(
-                        "while the daemon is alive. Inspect it directly, or restart explicitly:"
-                    );
+                    eprintln!("Inspect before acting — this evidence does not indicate a wedge:");
+                    if let Some(pid) = r.pid {
+                        eprintln!(
+                            "  ps -p {pid} -o pid,etime,command   # confirm what it is actually doing"
+                        );
+                    }
+                    eprintln!("  loom-daemon status --json           # machine-readable detail");
+                    eprintln!("If it is still unresponsive after inspecting, restart explicitly:");
+                    eprintln!("  ./.loom/scripts/cli/loom-daemon-stop.sh && ./.loom/scripts/cli/loom-daemon-start.sh");
                 }
-                eprintln!("  ./.loom/scripts/cli/loom-daemon-stop.sh && ./.loom/scripts/cli/loom-daemon-start.sh");
             }
         },
     }
