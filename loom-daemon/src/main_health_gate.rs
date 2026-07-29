@@ -1891,8 +1891,7 @@ pub fn run_gate_tick(
     let saturated = crate::cpu_headroom::is_host_saturated(loadavg, ncpu, threshold);
     let tier = match decide_gate_tier(saturated, state.defer_streak_elapsed(), max_defer) {
         GateTierDecision::Defer => {
-            let ratio =
-                crate::cpu_headroom::load_per_core_from(loadavg, ncpu).unwrap_or(0.0);
+            let ratio = crate::cpu_headroom::load_per_core_from(loadavg, ncpu).unwrap_or(0.0);
             if state.record_gate_deferred(ratio, max_defer) {
                 log::info!(
                     "main_health_gate: {} DEFERRING gate run — host saturated (load {ratio:.2}/core ≥ {threshold:.2}); \
