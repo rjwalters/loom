@@ -234,7 +234,7 @@ Run the sync script — or create the one label directly — to reconcile:
 ```bash
 gh label list --search operator                      # empty => not provisioned
 gh label create "loom:operator-only" --color F97316 \
-  --description "Requires human action or ruling outside automation (creds, infra, hardware); sweep/shepherd skip"
+  --description "Requires human action or ruling outside automation (creds, infra, hardware); sweep skips"
 ```
 
 **GitHub caps label descriptions at 100 characters.** A `labels.yml` entry with a
@@ -252,7 +252,7 @@ These two status labels look similar but mean different things to the automation
   automation entirely* (rotating credentials, infra changes, hardware access,
   manual deploys — or an owner-gated decision: an issue the code owner filed as a
   TODO on owner-tracked code, where the design direction is the owner's call).
-  Sweep/shepherd skip these in pre-flight rather than attempting them; a human must
+  Sweep skips these in pre-flight rather than attempting them; a human must
   do the work off-automation before the issue can proceed.
 
 Reaching for `loom:blocked` when you mean `loom:operator-only` conflates "waiting on

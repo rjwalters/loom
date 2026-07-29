@@ -38,7 +38,7 @@
 
 # Role-Specific Workflow Labels
 - name: loom:building
-  description: "Builder is implementing this issue. Applied by: Builder/Shepherd only (claim label)."
+  description: "Builder is implementing this issue. Applied by: Builder only (claim label)."
   color: "F59E0B"  # amber-500 - matches other in-progress states
 
 - name: loom:curating
@@ -108,17 +108,17 @@
   color: "DC2626"  # red-600
 
 - name: loom:abort
-  description: Signal to abort shepherd for this issue (returns to loom:issue)
+  description: Signal to abort the sweep for this issue (returns to loom:issue)
   color: "F97316"  # orange-500 - warning/signal color
 
 # loom:operator-only vs loom:blocked: operator-only = a human must act or rule
 # OUTSIDE automation (credentials, infra, hardware, or an owner-gated decision
-# on owner-tracked code) and sweep/shepherd skip it entirely;
+# on owner-tracked code) and sweep skips it entirely;
 # blocked = waiting on a dependency but otherwise automatable. Keep the
 # description at/under GitHub's 100-char label-description limit so sync-labels.sh
 # can create it (a longer description fails with HTTP 422 and the label never syncs).
 - name: loom:operator-only
-  description: "Requires human action or ruling outside automation (creds, infra, hardware); sweep/shepherd skip"
+  description: "Requires human action or ruling outside automation (creds, infra, hardware); sweep skips"
   color: "F97316"  # orange-500 - operator-action signal (matches loom:abort)
 
 # Epic Labels

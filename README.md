@@ -56,7 +56,8 @@ For continuous multi-account batches, run the `loom-daemon` (Tier 2) and enqueue
                               │
 ┌─────────────────────────────────────────────────────────────────┐
 │                    Workers (Tier 0)                             │
-│  /builder, /judge, /curator, /doctor - Execute single tasks     │
+│  /loom:builder, /loom:judge, /loom:curator, /loom:doctor        │
+│  - Execute single tasks                                         │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -149,7 +150,7 @@ stateDiagram-v2
 ## Features
 
 **Autonomous Orchestration**
-- Signal-based shepherd IPC for deterministic, reliable execution
+- Rust `loom-daemon` DispatchSweep IPC for deterministic, reliable execution
 - Stuck agent detection with automatic kill-and-retry recovery
 - Rate limit resilience with exponential backoff
 - Activity-based completion detection
@@ -260,10 +261,10 @@ Each dispatched sweep runs in its own detached process and picks its own OAuth t
 Run worker agents directly (no daemon required):
 
 ```bash
-/builder 42        # Implement issue 42
-/judge 123         # Review PR #123
-/curator 42        # Enhance issue with technical details
-/doctor 123        # Fix PR feedback or conflicts
+/loom:builder 42        # Implement issue 42
+/loom:judge 123         # Review PR #123
+/loom:curator 42        # Enhance issue with technical details
+/loom:doctor 123        # Fix PR feedback or conflicts
 ```
 
 ### Worktree Workflow
