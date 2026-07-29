@@ -284,6 +284,11 @@ impl WorkspacePool {
         // workspace so the reaper quarantines a repeatedly-insta-crashing issue
         // instead of letting it be re-dispatched every tick.
         registry.set_quarantine_config(sweep_registry::resolve_quarantine_config(root));
+        // Claude-wrapper pre-flight-death workspace tripwire (#4386): resolve
+        // env > config > default for this workspace, mirroring the
+        // insta-crash quarantine config above.
+        registry
+            .set_preflight_tripwire_config(sweep_registry::resolve_preflight_tripwire_config(root));
         // Cross-host collision detection (#4085): resolve env > config >
         // default(off) so a shared-backlog deployment measures the baseline
         // duplicate-dispatch rate. Detection only — never changes dispatch.
