@@ -553,6 +553,82 @@ assert_contains "$OUT" "#3550" "(o) Real historical duplicate pair (#3550/#3551)
 assert_contains "$OUT" "(similarity: 26%)" "(o) Real historical duplicate pair scores the expected 26% true-Jaccard"
 
 echo ""
+echo "Testing check-duplicate.sh self-match exclusion via --issue (issue #4662)..."
+
+# check-duplicate.sh never excluded the issue being curated from its own
+# similarity candidate pool: the curator workflow fetches the existing
+# issue's own title/body and passes them in, so the issue is in the
+# open-issues pool it's being checked against and matches itself at ~100%,
+# forcing a guaranteed false DUPLICATE_FOUND on every curation pass of an
+# already-filed issue. Threading the --issue number into the three
+# similarity-search functions and skipping that number in each candidate
+# loop fixes it; passing NO --issue (pre-filing checks, where the issue
+# doesn't exist yet) must remain byte-for-byte unchanged.
+
+# (aa) Candidate pool contains only the probed issue itself (same number,
+# identical title/body) -- the exact self-noise from #4662. With --issue <n>
+# passed, the self-candidate is excluded from the pool entirely (not just
+# scored below threshold): with nothing left to scan, the search reports "no
+# duplicates", not a self-match.
+reset_state
+cat > "$STUB_DIR/issues-open.json" <<'EOF'
+[{"number": 4659, "title": "check-duplicate.sh: REST fallback still dies", "body": "REST fallback dies under load"}]
+EOF
+run_cds --issue 4659 --title "check-duplicate.sh: REST fallback still dies" --body "REST fallback dies under load"
+assert_eq "0" "$RC" "(aa) Self-only candidate pool + --issue <n> -> exit 0, no self-match false positive"
+assert_not_contains "$OUT" "DUPLICATE_FOUND" "(aa) Self-match excluded, no DUPLICATE_FOUND"
+
+# (aa2) Same fixture WITHOUT --issue -> the self-match still surfaces. This is
+# the documented pre-existing behavior for pre-filing checks (Architect/Hermit/
+# Auditor calls, which never pass --issue because the issue doesn't exist yet)
+# -- there is no self number to exclude, so nothing changes for them.
+run_cds --title "check-duplicate.sh: REST fallback still dies" --body "REST fallback dies under load"
+assert_eq "1" "$RC" "(aa2) Same fixture without --issue -> self-match still surfaces (no self number to exclude)"
+assert_contains "$OUT" "DUPLICATE_FOUND" "(aa2) Without --issue, the match is reported (unchanged pre-existing behavior)"
+assert_contains "$OUT" "#4659" "(aa2) Without --issue, the (self) match is listed"
+
+# (ab) Self-candidate PLUS a genuinely different candidate in the same pool:
+# exclusion removes only the self entry -- a real duplicate elsewhere in the
+# pool is still found and reported.
+reset_state
+cat > "$STUB_DIR/issues-open.json" <<'EOF'
+[
+  {"number": 4659, "title": "Alpha Bravo Charlie Delta", "body": ""},
+  {"number": 4700, "title": "Alpha Bravo Charlie Delta", "body": ""}
+]
+EOF
+run_cds --issue 4659 --threshold 50 --title "Alpha Bravo Charlie Delta"
+assert_eq "1" "$RC" "(ab) Self plus a genuine duplicate candidate -> genuine duplicate still found"
+assert_contains "$OUT" "#4700: Alpha Bravo Charlie Delta (similarity: 100%)" "(ab) Genuine (non-self) duplicate reported"
+assert_not_contains "$OUT" "#4659:" "(ab) Self-candidate excluded from the match list"
+
+# (ac) Self-exclusion also threads through the closed-issues pool
+# (--include-merged-prs): a probed issue that shows up in the closed-issues
+# pool (e.g. it was briefly closed/reopened) must not match itself there.
+reset_state
+echo "[]" > "$STUB_DIR/issues-open.json"
+cat > "$STUB_DIR/issues-closed.json" <<'EOF'
+[{"number": 4659, "title": "Alpha Bravo Charlie Delta", "body": ""}]
+EOF
+run_cds --include-merged-prs --issue 4659 --threshold 50 --title "Alpha Bravo Charlie Delta"
+assert_eq "0" "$RC" "(ac) Self-match in the closed-issues pool excluded via --issue -> exit 0"
+assert_not_contains "$OUT" "DUPLICATE_FOUND" "(ac) No DUPLICATE_FOUND from the closed-issues self-match"
+
+# (ad) Self-exclusion threads through the merged-PRs pool identically. GitHub
+# issue/PR numbers share one sequence, so a genuine self-match can't occur
+# here in production -- this is a defensive-consistency check that the same
+# skip parameter doesn't misbehave (e.g. off-by-one, wrong variable) if a
+# candidate ever carries the probed issue's number.
+reset_state
+echo "[]" > "$STUB_DIR/issues-open.json"
+cat > "$STUB_DIR/prs-merged.json" <<'EOF'
+[{"number": 4659, "title": "Alpha Bravo Charlie Delta", "body": ""}]
+EOF
+run_cds --include-merged-prs --issue 4659 --threshold 50 --title "Alpha Bravo Charlie Delta"
+assert_eq "0" "$RC" "(ad) Self-numbered candidate in the merged-PRs pool excluded via --issue -> exit 0"
+assert_not_contains "$OUT" "DUPLICATE_FOUND" "(ad) No DUPLICATE_FOUND from the merged-PRs self-numbered match"
+
+echo ""
 echo "Testing check-duplicate.sh REST fallback on GraphQL rate limit (issue #4526)..."
 
 # (p) Open-issues GraphQL rate-limited -> REST fallback succeeds and is used.

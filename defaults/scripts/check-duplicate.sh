@@ -339,6 +339,7 @@ search_similar_issues() {
     local title="$1"
     local body="${2:-}"
     local threshold="${3:-18}"
+    local self_issue="${4:-}"
 
     # Extract keywords from new issue
     local new_keywords
@@ -388,6 +389,14 @@ search_similar_issues() {
 
         # Skip if no number
         [[ -z "$num" || "$num" == "null" ]] && continue
+
+        # Skip the issue being curated/probed itself (#4662): it is always
+        # in the open-issues pool it's being checked against, and always
+        # scores ~100% similarity against its own title/body -- a guaranteed
+        # false DUPLICATE_FOUND on every curation pass of an existing issue.
+        # No-op when --issue was not given (self_issue empty).
+        [[ -n "$self_issue" && "$num" == "$self_issue" ]] && continue
+
         scanned=$((scanned + 1))
 
         # Extract keywords from existing issue
@@ -435,6 +444,7 @@ search_merged_prs() {
     local title="$1"
     local body="${2:-}"
     local threshold="${3:-18}"
+    local self_issue="${4:-}"
 
     # Extract keywords from new issue
     local new_keywords
@@ -480,6 +490,12 @@ search_merged_prs() {
 
         # Skip if no number
         [[ -z "$num" || "$num" == "null" ]] && continue
+
+        # Skip the probed issue's own linked PR, once merged (#4662) -- same
+        # self-match false positive as search_similar_issues(), reached via a
+        # different pool. No-op when --issue was not given.
+        [[ -n "$self_issue" && "$num" == "$self_issue" ]] && continue
+
         scanned=$((scanned + 1))
 
         # Extract keywords from existing PR
@@ -520,6 +536,7 @@ search_closed_issues() {
     local title="$1"
     local body="${2:-}"
     local threshold="${3:-18}"
+    local self_issue="${4:-}"
 
     # Extract keywords from new issue
     local new_keywords
@@ -565,6 +582,13 @@ search_closed_issues() {
 
         # Skip if no number
         [[ -z "$num" || "$num" == "null" ]] && continue
+
+        # Skip the probed issue itself, in case it (or a stale cache of it)
+        # shows up in the recently-closed pool (#4662) -- same self-match
+        # false positive as search_similar_issues(). No-op when --issue was
+        # not given.
+        [[ -n "$self_issue" && "$num" == "$self_issue" ]] && continue
+
         scanned=$((scanned + 1))
 
         # Extract keywords from existing issue
@@ -783,7 +807,7 @@ main() {
     # Search for similar issues
     local result
     local exit_code=0
-    result=$(search_similar_issues "$title" "$body" "$threshold") || exit_code=$?
+    result=$(search_similar_issues "$title" "$body" "$threshold" "$issue") || exit_code=$?
     if [[ $exit_code -eq 1 ]]; then
         duplicate_found=true
     elif [[ $exit_code -eq 2 ]]; then
@@ -796,8 +820,8 @@ main() {
     if $include_merged_prs; then
         local merged_exit_code=0
         local closed_exit_code=0
-        merged_result=$(search_merged_prs "$title" "$body" "$threshold") || merged_exit_code=$?
-        closed_result=$(search_closed_issues "$title" "$body" "$threshold") || closed_exit_code=$?
+        merged_result=$(search_merged_prs "$title" "$body" "$threshold" "$issue") || merged_exit_code=$?
+        closed_result=$(search_closed_issues "$title" "$body" "$threshold" "$issue") || closed_exit_code=$?
 
         # #4526: a GraphQL rate-limit that ALSO fails via REST means this
         # pool genuinely could not be checked. Record it; the final verdict
