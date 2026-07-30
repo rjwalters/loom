@@ -11,9 +11,24 @@
 #
 # Usage:
 #   .loom/scripts/sync-labels.sh [WORKTREE_PATH]
+#   .loom/scripts/sync-labels.sh --repo OWNER/NAME [--dry-run] [WORKTREE_PATH]
 #
 #   WORKTREE_PATH  Directory containing .github/labels.yml and a git remote.
 #                  Defaults to the current directory.
+#
+# --repo OWNER/NAME (#4498) retargets the sync at an arbitrary GitHub repo
+# while still reading labels.yml from WORKTREE_PATH. Because every GitHub label
+# operation here is a `gh label` API call, no local checkout of the target repo
+# is needed — so one workspace can bring a whole fleet of repos online:
+#
+#   for r in owner/klayout-tools owner/gf180-ldo owner/sky130-bandgap; do
+#     .loom/scripts/sync-labels.sh --repo "$r"
+#   done
+#
+# --repo bypasses forge detection entirely (the target is named, not inferred
+# from a git remote) and is GitHub-only. Pair it with --dry-run first: --repo
+# makes the default-label deletions land on a repo you are not standing in, so
+# a typo'd NWO is worth previewing.
 #
 # This is the installed-tree counterpart of the source-only
 # scripts/install/sync-labels.sh. It is self-contained apart from the
@@ -26,36 +41,99 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage: sync-labels.sh [WORKTREE_PATH]
+       sync-labels.sh --repo OWNER/NAME [--dry-run] [WORKTREE_PATH]
 
 Sync Loom workflow labels from .github/labels.yml onto the forge (GitHub or
 Gitea). Creates missing labels, updates existing ones to match labels.yml,
 and removes GitHub's default labels.
 
 Arguments:
-  WORKTREE_PATH   Directory containing .github/labels.yml (default: .)
+  WORKTREE_PATH     Directory containing .github/labels.yml (default: .)
 
 Options:
-  -h, --help      Show this help and exit.
+      --repo OWNER/NAME
+                    Sync onto this GitHub repo instead of the one detected from
+                    WORKTREE_PATH's git remote. labels.yml is still read from
+                    WORKTREE_PATH, so no checkout of the target is needed.
+                    GitHub-only (uses the gh CLI).
+      --dry-run     Print the label operations that would run and exit without
+                    calling the forge. Recommended before a --repo run.
+  -h, --help        Show this help and exit.
 EOF
 }
 
 WORKTREE_PATH="."
-case "${1:-}" in
-  -h|--help)
-    usage
-    exit 0
-    ;;
-  -*)
-    echo "Unknown option: $1" >&2
+REPO_OVERRIDE=""
+DRY_RUN=0
+POSITIONAL_SEEN=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --repo)
+      if [[ $# -lt 2 || -z "$2" ]]; then
+        echo "Option --repo requires an OWNER/NAME argument" >&2
+        usage >&2
+        exit 2
+      fi
+      REPO_OVERRIDE="$2"
+      shift 2
+      ;;
+    --repo=*)
+      REPO_OVERRIDE="${1#--repo=}"
+      if [[ -z "$REPO_OVERRIDE" ]]; then
+        echo "Option --repo requires an OWNER/NAME argument" >&2
+        usage >&2
+        exit 2
+      fi
+      shift
+      ;;
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    --)
+      shift
+      ;;
+    -*)
+      echo "Unknown option: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+    *)
+      if [[ "$POSITIONAL_SEEN" -eq 1 ]]; then
+        echo "Unexpected extra argument: $1" >&2
+        usage >&2
+        exit 2
+      fi
+      WORKTREE_PATH="$1"
+      POSITIONAL_SEEN=1
+      shift
+      ;;
+  esac
+done
+
+# Validate --repo eagerly: an NWO typo would otherwise be discovered only after
+# the first default-label deletion had already been attempted somewhere.
+if [[ -n "$REPO_OVERRIDE" ]]; then
+  if [[ ! "$REPO_OVERRIDE" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]]; then
+    echo "Invalid --repo value: '$REPO_OVERRIDE' (expected OWNER/NAME)" >&2
     usage >&2
     exit 2
-    ;;
-  "")
-    ;;
-  *)
-    WORKTREE_PATH="$1"
-    ;;
-esac
+  fi
+  # --repo names a GitHub repo and drives it purely through `gh label`; there is
+  # no equivalent "point at an arbitrary remote" path for the Gitea helpers
+  # (they need a resolved base URL + token for that host), so fail loudly rather
+  # than silently syncing GitHub while the operator expects Gitea.
+  if [[ "$(printf '%s' "${LOOM_FORGE_TYPE:-}" | tr '[:upper:]' '[:lower:]')" == "gitea" ]]; then
+    echo "--repo is GitHub-only, but LOOM_FORGE_TYPE=gitea is set" >&2
+    echo "Run sync-labels.sh from a checkout of the Gitea repo instead." >&2
+    exit 2
+  fi
+fi
 
 # Source the shipped forge-agnostic helper library. Provides forge_detect,
 # forge_get_repo_nwo, forge_split_nwo, and gitea_api.
@@ -89,18 +167,33 @@ warning() {
 
 cd "$WORKTREE_PATH"
 
-# Detect forge type (github/gitea) from env, config, or git remote.
-forge_detect
+if [[ -n "$REPO_OVERRIDE" ]]; then
+  # Explicit target: skip forge_detect / forge_get_repo_nwo entirely. Both of
+  # those read the *current directory's* git remote, which is precisely what
+  # --repo exists to avoid needing — WORKTREE_PATH supplies labels.yml, the
+  # flag supplies the target, and no checkout of the target is required.
+  FORGE_TYPE="github"
+  REPO="$REPO_OVERRIDE"
+  if [[ "$DRY_RUN" -eq 0 ]] && ! command -v gh >/dev/null 2>&1; then
+    error "--repo requires the gh CLI, which was not found on PATH"
+  fi
+else
+  # Detect forge type (github/gitea) from env, config, or git remote.
+  forge_detect
 
-# Resolve the target repository NWO (owner/repo).
-REPO="$(forge_get_repo_nwo || true)"
-if [[ -z "$REPO" ]]; then
-  error "Could not determine repository from git remote"
+  # Resolve the target repository NWO (owner/repo).
+  REPO="$(forge_get_repo_nwo || true)"
+  if [[ -z "$REPO" ]]; then
+    error "Could not determine repository from git remote"
+  fi
 fi
 # Populate FORGE_OWNER / FORGE_REPO for the Gitea API paths.
 forge_split_nwo "$REPO"
 
 info "Target repository: $REPO (${FORGE_TYPE})"
+if [[ "$DRY_RUN" -eq 1 ]]; then
+  info "Dry run: no labels will be created, updated, or deleted."
+fi
 
 LABELS_FILE=".github/labels.yml"
 
@@ -240,7 +333,9 @@ DEFAULT_LABELS=(
 
 info "Removing default labels..."
 for label in "${DEFAULT_LABELS[@]}"; do
-  if [[ "$FORGE_TYPE" == "github" ]]; then
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    info "[dry-run] would delete default label: $label"
+  elif [[ "$FORGE_TYPE" == "github" ]]; then
     github_delete_label "$label"
   elif [[ "$FORGE_TYPE" == "gitea" ]]; then
     gitea_delete_label "$label"
@@ -269,7 +364,13 @@ while IFS= read -u 3 -r line; do
       color="${BASH_REMATCH[1]}"
     fi
 
-    if [[ "$FORGE_TYPE" == "github" ]]; then
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+      # Deliberately forge-free: a dry run must be answerable offline (it is the
+      # preview an operator runs before pointing --repo at a repo they are not
+      # standing in), so it reports intent from labels.yml alone and never asks
+      # the forge which labels already exist.
+      info "[dry-run] would create or update label: $name (color=$color)"
+    elif [[ "$FORGE_TYPE" == "github" ]]; then
       github_sync_label "$name" "$description" "$color"
     elif [[ "$FORGE_TYPE" == "gitea" ]]; then
       gitea_sync_label "$name" "$description" "$color"
@@ -280,7 +381,11 @@ while IFS= read -u 3 -r line; do
 done 3< "$LABELS_FILE"
 
 if [ "$label_count" -gt 0 ]; then
-  success "Synced $label_count labels"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    success "Dry run complete: $label_count labels would be synced to $REPO"
+  else
+    success "Synced $label_count labels"
+  fi
 else
   warning "No labels found in $LABELS_FILE"
 fi

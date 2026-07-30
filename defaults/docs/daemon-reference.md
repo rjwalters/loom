@@ -2796,6 +2796,139 @@ logged only at `debug!` (invisible at the default `info` level), and the
   "N of M registered workspaces are inert" state is diagnosable without
   reading every root's config file by hand.
 
+#### Bringing a new repo online (runbook, #4498)
+
+`loom-daemon workspace add` registers a repo for *dispatch*. It does **not** give
+that repo a **queue** — no role runner means no Curator, Judge, Champion, Auditor,
+or Guide runs there, so nothing ever reaches `loom:issue` and dispatch has nothing
+to pick up. A newly-registered root therefore shows `ROLES off` in
+`loom-daemon status` and sits inert indefinitely, looking registered-and-healthy.
+The steps below are what turns a registered root into a *self-feeding* one.
+
+**1. Choose a config surface.** `autonomous.roleRunner.enabled` is read from the
+root's own **effective** config, which `config_resolver::resolve_effective_config`
+(`loom-daemon/src/config_resolver.rs:143-153`) deep-merges from four tiers,
+lowest → highest priority:
+
+| # | Tier | Path | Tracked? |
+|---|------|------|----------|
+| 1 | machine-level defaults | `~/.local/share/loom/config/defaults.json` (override: `LOOM_CONFIG_DEFAULTS_FILE`; set it empty to disable the tier) | no — outside every checkout |
+| 2 | legacy per-repo | `<root>/.loom/config.json` | yes |
+| 3 | project | `<root>/.loom-project/project.json` | yes (Epic #3835 Phase 6) |
+| 4 | host-local | `<root>/.loom-local/local.json` | no (git-ignored) |
+
+Two valid ways to flip a root on, with very different blast radii:
+
+- **Machine-level (tier 1)** — one edit per *host* turns on **every** registered
+  root that does not set `roleRunner.enabled` itself. This is the right lever for
+  a fleet of repos you own that should all behave the same way. Because it is the
+  lowest-priority tier, any repo that wants to opt back out can simply set
+  `enabled: false` in its own config and win.
+- **Per-repo (tier 2/3/4)** — one edit per *repo*, in that repo's own checkout.
+  Use this when a root needs a different `roles`/`onIdle` set than the host
+  default, or when the repo's maintainers should see the setting in review.
+
+Either way the JSON block is the same shape as the example above:
+
+```json
+{
+  "autonomous": {
+    "roleRunner": {
+      "enabled": true,
+      "roles": ["champion", "curator", "judge", "auditor", "guide"],
+      "intervalSecs": 300,
+      "onIdle": ["champion"]
+    }
+  }
+}
+```
+
+Remember `onIdle` is **inert unless the work finder is enabled** for that root,
+and that `LOOM_ROLE_RUNNER` (env) outranks all four config tiers.
+
+**2. Sync the repo's labels.** The whole coordination protocol is label-based, so
+a repo with no `loom:*` labels cannot hold a queue — a Curator that tries to apply
+`loom:curated` just fails. Since every GitHub label operation is a `gh label` API
+call, this needs **no checkout of the target repo**: run
+`sync-labels.sh --repo OWNER/NAME` from a workspace that already has an
+authoritative `.github/labels.yml` (labels.yml is read locally; only the target
+moves). Preview first — `--repo` points the default-label *deletions* at a repo
+you are not standing in, so a typo'd NWO is worth catching:
+
+```bash
+# From a checkout whose .github/labels.yml is the source of truth (e.g. loom):
+for r in OWNER/klayout-tools \
+         OWNER/gf180-bandgap OWNER/gf180-ldo OWNER/gf180-temp-por \
+         OWNER/gf180-pll OWNER/gf180-sar-adc OWNER/gf180-trng \
+         OWNER/sky130-bandgap; do
+  ./.loom/scripts/sync-labels.sh --repo "$r" --dry-run   # preview
+done
+# ...then re-run without --dry-run to apply.
+```
+
+`--dry-run` is deliberately forge-free (it reports intent from labels.yml alone
+and makes zero `gh` calls), so it also validates the parse and the NWO offline.
+`--repo` is GitHub-only — for a Gitea root, run `sync-labels.sh` from a checkout
+of that repo so the Gitea helpers can resolve a base URL and token.
+
+**3. Refresh a stale install.** A root installed before the machine-level daemon
+model carries a committed file-copy of `.loom/` that **shadows** the machine
+checkout and drifts stale — including the role prompts the role runner invokes.
+Run `loom migrate --dry-run` then `loom migrate` in that root (see
+`defaults/docs/machine-dispatcher.md` → `loom migrate`); for a still-file-copy
+install that is not being migrated yet, `./.loom/scripts/resync-installed.sh`
+refreshes the copies in place.
+
+A repo on the **v0.15 multi-repo canary vintage** predates a cluster of
+multi-repo fixes. Rule these out before blaming a new symptom on config — several
+of them present exactly as "registered, enabled, and still nothing happens":
+
+| Issue | Symptom if the install predates the fix |
+|-------|------------------------------------------|
+| #3936 | `loom-daemon status`'s token-capacity summary contradicts its own per-token table |
+| #3937 | sweep-registry label flips run `gh issue edit` unscoped — cross-repo claims fail, yet dispatch proceeds *unclaimed* |
+| #3938 | dispatched sweeps die in ~2s: no `.loom/tokens/` pool outside the primary workspace (fixed by the shared machine-level pool — see "Token pool provisioning for managed repos" above; bootstrap it once per host) |
+| #3939 | no backoff/quarantine for insta-crashing dispatches — the same few issues are re-dispatched every tick, starving the rest of the queue |
+
+**4. Verify.** In order, because each step's failure looks like the next one's:
+
+1. `loom-daemon status` — the new root appears in "Managed repos" with
+   `ROLES on`. Still `off` means the config edit did not land in a tier that root
+   actually reads (tier 1 is per-*host*: check `LOOM_CONFIG_DEFAULTS_FILE` is not
+   set to something else, and that the daemon process's `$HOME` is the one you
+   edited). A restart is not required — each role task re-reads the registry and
+   per-root config every tick.
+2. Within one Auditor/Curator interval (default 300s), expect **≥1 issue labeled
+   `loom:triage`** in that repo — the Auditor files what it finds, the Curator
+   enriches it. An empty queue after two intervals with `ROLES on` means the role
+   invocation itself is failing; role failures are never fatal and are logged +
+   skipped, so read the daemon log rather than waiting.
+3. Then, and only then, expect dispatch: `loom:issue` → a sweep → a PR.
+
+> **Caveat (#4501).** A dispatched child that dies immediately — e.g. on a
+> `Fable 5 limit` classified as non-retryable, where dispatch inherited the
+> interactive model default instead of pinning a work model — is
+> indistinguishable at the forge from "the role runner is still off": both look
+> like a repo with no activity. Confirm step 1's `ROLES on` and step 2's
+> `loom:triage` issue *before* concluding anything about dispatch, and treat an
+> insta-dying child as #4501 rather than a config problem.
+
+**Which steps an agent cannot do for you.** Steps 1, 3, and 4 are operator steps,
+run by hand on **each daemon host** — repeat them per host, since tier 1 is
+per-machine and a multi-host fleet has one copy of it per machine:
+
+- **Step 1 (config edit)** and **step 3 (install refresh)** are host-local
+  filesystem writes: a file in the operator's home directory, or another repo's
+  own checkout. Neither is reachable from a Builder worktree — the
+  worktree-isolation guard confines Edit/Write to the current worktree, and the
+  machine-level defaults file lives outside every git checkout entirely.
+- **Step 4 (verification)** needs `loom-daemon status` against the *running*
+  daemon on that host, plus a real Auditor/Curator cycle to elapse. An agent can
+  read the forge state but cannot observe another host's daemon.
+- **Step 2 (label sync)** is the exception: `--repo` makes it pure forge API, so
+  it runs from any checkout with `gh` auth for the targets — one loop covers the
+  whole target set at once.
+
 ### Durable operator watches (#3971)
 
 **Problem it fixes.** An operator armed a 4-hour background poll watching two
