@@ -290,6 +290,17 @@ pub enum SafehouseState {
         socket: PathBuf,
         room: Option<String>,
     },
+    /// The `hello` handshake succeeded, but the most recent `send` was rejected
+    /// at the protocol layer (`ok:false`) — the socket is reachable and the
+    /// connection is healthy, only the send was refused (#4464). The canonical
+    /// case is a multi-room safehoused with [`SafehouseConfig::room`] unset,
+    /// whose `send` returns `'room' required: N rooms joined`. Distinct from
+    /// [`Unreachable`](Self::Unreachable) so `loom-daemon status` points the
+    /// operator at `safehouse.room` rather than at the socket/persona. `reason`
+    /// carries the raw safehoused `error` string. **Sticky**: a reconnect whose
+    /// `hello` succeeds does not clear it; only a `send` that is accepted
+    /// returns the state to [`Connected`](Self::Connected).
+    SendRejected { socket: PathBuf, reason: String },
 }
 
 impl SafehouseState {
@@ -302,16 +313,25 @@ impl SafehouseState {
                 state: "not_configured".to_owned(),
                 socket: None,
                 room: None,
+                reason: None,
             },
             Self::Unreachable { socket } => crate::types::SafehouseStatus {
                 state: "unreachable".to_owned(),
                 socket: Some(socket.clone()),
                 room: None,
+                reason: None,
             },
             Self::Connected { socket, room } => crate::types::SafehouseStatus {
                 state: "connected".to_owned(),
                 socket: Some(socket.clone()),
                 room: room.clone(),
+                reason: None,
+            },
+            Self::SendRejected { socket, reason } => crate::types::SafehouseStatus {
+                state: "send_rejected".to_owned(),
+                socket: Some(socket.clone()),
+                room: None,
+                reason: Some(reason.clone()),
             },
         }
     }
@@ -1098,6 +1118,35 @@ async fn completion_for_exit(
 // Client
 // ============================================================================
 
+/// Why a [`SafehouseClient::send`] failed — split so the sink can tell a
+/// **protocol rejection** (the connection is healthy; retrying identically will
+/// be rejected identically) apart from a **transport failure** (the connection
+/// is gone; reconnect) without string-matching an untyped `anyhow` chain
+/// (#4464).
+#[derive(Debug)]
+pub enum SendError {
+    /// safehoused accepted the request over the wire but refused it at the
+    /// protocol layer (`ok:false`). `reason` is the raw `error` string — the
+    /// canonical case is `'room' required: N rooms joined` on a multi-room host
+    /// with [`SafehouseConfig::room`] unset. The connection stays usable.
+    Rejected { reason: String },
+    /// A transport-level failure (write/read I/O, closed connection, or a reply
+    /// `id` desync) — the connection is unusable and the caller should
+    /// reconnect.
+    Transport(anyhow::Error),
+}
+
+impl std::fmt::Display for SendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rejected { reason } => write!(f, "safehoused rejected send: {reason}"),
+            Self::Transport(err) => write!(f, "{err:#}"),
+        }
+    }
+}
+
+impl std::error::Error for SendError {}
+
 /// A blocking-free async envelope-v1 client over one `AF_UNIX` connection.
 pub struct SafehouseClient {
     reader: BufReader<OwnedReadHalf>,
@@ -1138,24 +1187,32 @@ impl SafehouseClient {
 
     /// Serialize and send one narration envelope, then read + `id`-match the
     /// reply (skipping any interleaved push line).
-    pub async fn send(&mut self, env: &Envelope) -> Result<()> {
+    pub async fn send(&mut self, env: &Envelope) -> std::result::Result<(), SendError> {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
-        let req = build_send_request(env, id, self.room.as_deref())?;
-        self.write_line(&req).await?;
-        let reply = self.read_reply().await?;
+        // A malformed envelope is a transport-class caller bug (the connection
+        // is fine) but is not a server rejection either; surface it as
+        // Transport so the sink logs it rather than treating it as sticky.
+        let req =
+            build_send_request(env, id, self.room.as_deref()).map_err(SendError::Transport)?;
+        self.write_line(&req).await.map_err(SendError::Transport)?;
+        let reply = self.read_reply().await.map_err(SendError::Transport)?;
         if !reply.get("ok").and_then(Value::as_bool).unwrap_or(false) {
-            let err = reply
+            let reason = reply
                 .get("error")
                 .and_then(Value::as_str)
-                .unwrap_or("unknown error");
-            bail!("safehoused rejected send: {err}");
+                .unwrap_or("unknown error")
+                .to_owned();
+            return Err(SendError::Rejected { reason });
         }
         // Replies echo the request id (handle_conn stamps it). A mismatch means
-        // the stream desynced — treat it as a hard error so the sink reconnects.
+        // the stream desynced — treat it as a transport error so the sink
+        // reconnects.
         if let Some(reply_id) = reply.get("id").and_then(Value::as_u64) {
             if reply_id != id {
-                bail!("safehoused reply id {reply_id} != request id {id} (stream desync)");
+                return Err(SendError::Transport(anyhow::anyhow!(
+                    "safehoused reply id {reply_id} != request id {id} (stream desync)"
+                )));
             }
         }
         Ok(())
@@ -1338,6 +1395,11 @@ async fn run_sink(
     let mut backoff = min_backoff;
     // Suppress duplicate outage warnings — one warn per outage, not per event.
     let mut warned = false;
+    // Sticky protocol-rejection state (#4464): `Some(reason)` once a `send` is
+    // rejected at the protocol layer (e.g. `'room' required`). Survives
+    // reconnects (a fresh `hello` does not clear it) and is only cleared by a
+    // `send` that is actually accepted. Also dedups the rejection WARN.
+    let mut send_rejected: Option<String> = None;
     // Short-TTL cache for the dispatch-line title lookup (issue #4201).
     let mut title_cache: HashMap<(String, u32), (String, Instant)> = HashMap::new();
     // Forge `owner/repo` slugs, and the (workspace, issue) pairs already
@@ -1424,11 +1486,21 @@ async fn run_sink(
                     client = Some(connected);
                     backoff = min_backoff;
                     warned = false;
+                    // Stickiness (#4464): a successful `hello` does not clear a
+                    // prior send-rejection — only an accepted `send` does — so
+                    // a reconnect after a transport blip preserves the
+                    // `send_rejected` diagnosis rather than flashing "connected".
                     set_state(
                         &state,
-                        SafehouseState::Connected {
-                            socket: socket.clone(),
-                            room: config.room.clone(),
+                        match &send_rejected {
+                            Some(reason) => SafehouseState::SendRejected {
+                                socket: socket.clone(),
+                                reason: reason.clone(),
+                            },
+                            None => SafehouseState::Connected {
+                                socket: socket.clone(),
+                                room: config.room.clone(),
+                            },
                         },
                     );
                 }
@@ -1455,8 +1527,8 @@ async fn run_sink(
         }
 
         // Send this event's envelopes in order, stopping at the first failure
-        // (the connection is gone; the rest would fail identically).
-        let mut send_failure: Option<anyhow::Error> = None;
+        // (the connection is gone or every send would be rejected identically).
+        let mut send_failure: Option<SendError> = None;
         if let Some(connected) = client.as_mut() {
             for envelope in &outbox {
                 if let Err(err) = connected.send(envelope).await {
@@ -1465,20 +1537,67 @@ async fn run_sink(
                 }
             }
         }
-        if let Some(err) = send_failure {
-            log::warn!(
-                "safehouse: narration send failed ({err:#}); will reconnect, sweep unaffected"
-            );
-            client = None;
-            set_state(
-                &state,
-                SafehouseState::Unreachable {
-                    socket: socket.clone(),
-                },
-            );
-            next_attempt = Instant::now() + backoff;
-            backoff = (backoff * 2).min(max_backoff);
-            warned = true;
+        match send_failure {
+            // An accepted send clears any prior sticky rejection (#4464): the
+            // config was fixed (e.g. `safehouse.room` set + daemon restarted) —
+            // return the status to "connected".
+            None => {
+                if send_rejected.take().is_some() {
+                    log::info!("safehouse: narration accepted again; resuming");
+                    set_state(
+                        &state,
+                        SafehouseState::Connected {
+                            socket: socket.clone(),
+                            room: config.room.clone(),
+                        },
+                    );
+                }
+            }
+            // Protocol rejection (#4464): the connection is healthy, so keep it
+            // — retrying would be rejected identically until the operator fixes
+            // config. Sticky: report "connected, sends rejected: <reason>" and
+            // name the fix when the reason is a missing room. Dropped narration
+            // is never retried (module contract), so we simply move on.
+            Some(SendError::Rejected { reason }) => {
+                if send_rejected.as_deref() != Some(reason.as_str()) {
+                    if reason.contains("'room' required") {
+                        log::warn!(
+                            "safehouse: narration rejected — set safehouse.room — \
+                             safehoused rejected send: {reason}; sweep unaffected"
+                        );
+                    } else {
+                        log::warn!(
+                            "safehouse: narration rejected (safehoused rejected send: \
+                             {reason}); sweep unaffected"
+                        );
+                    }
+                }
+                send_rejected = Some(reason.clone());
+                set_state(
+                    &state,
+                    SafehouseState::SendRejected {
+                        socket: socket.clone(),
+                        reason,
+                    },
+                );
+            }
+            // Transport failure: the connection is gone — drop it and reconnect
+            // with backoff, exactly as before.
+            Some(SendError::Transport(err)) => {
+                log::warn!(
+                    "safehouse: narration send failed ({err:#}); will reconnect, sweep unaffected"
+                );
+                client = None;
+                set_state(
+                    &state,
+                    SafehouseState::Unreachable {
+                        socket: socket.clone(),
+                    },
+                );
+                next_attempt = Instant::now() + backoff;
+                backoff = (backoff * 2).min(max_backoff);
+                warned = true;
+            }
         }
     }
 }
@@ -1681,6 +1800,10 @@ async fn run_coordination(
 
         let (reader, mut writer, mut next_id, room) = client.into_parts();
         let mut lines = reader.lines();
+        // Per-connection dedup for the claim-ad rejection WARN (#4464): one WARN
+        // per outage, reset on each fresh connection — mirrors the sink's
+        // `send_rejected` discipline.
+        let mut ad_rejected = false;
         let reconnect = loop {
             tokio::select! {
                 line = lines.next_line() => {
@@ -1695,9 +1818,41 @@ async fn run_coordination(
                             };
                             if value.get("event").is_some() {
                                 sink.on_event(&value);
+                            } else if value.get("id").is_some()
+                                && !value.get("ok").and_then(Value::as_bool).unwrap_or(true)
+                            {
+                                // A rejected reply (has `id`, no `event`,
+                                // `ok:false`) to one of our own claim ads
+                                // (#4464). On a multi-room host with
+                                // `safehouse.room` unset these are rejected
+                                // server-side with no other signal, silently
+                                // disabling peer-claim dedup (#4028/#4431). WARN
+                                // once per outage and name the fix when it is a
+                                // missing room; dispatch is unaffected.
+                                if !ad_rejected {
+                                    let reason = value
+                                        .get("error")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("unknown error");
+                                    if reason.contains("'room' required") {
+                                        log::warn!(
+                                            "safehouse: peer claim-ad rejected — set \
+                                             safehouse.room — safehoused rejected send: \
+                                             {reason}; peer-claim dedup disabled, dispatch \
+                                             unaffected"
+                                        );
+                                    } else {
+                                        log::warn!(
+                                            "safehouse: peer claim-ad rejected (safehoused \
+                                             rejected send: {reason}); peer-claim dedup \
+                                             disabled, dispatch unaffected"
+                                        );
+                                    }
+                                    ad_rejected = true;
+                                }
                             }
-                            // A reply echo (has `id`, no `event`) to one of our
-                            // own sends: nothing to do, drop it.
+                            // An accepted reply echo (has `id`, `ok:true`) to
+                            // one of our own sends: nothing to do, drop it.
                         }
                         Ok(None) => break true,          // peer closed → reconnect
                         Err(e) => {
@@ -1822,6 +1977,19 @@ mod tests {
         .to_status();
         assert_eq!(connected_no_room.state, "connected");
         assert!(connected_no_room.room.is_none());
+
+        // #4464: the send-rejected state renders a socket + reason, no room,
+        // and a distinct wire string so `loom-daemon status` can say
+        // "connected, sends rejected: <reason>" rather than "unreachable".
+        let send_rejected = SafehouseState::SendRejected {
+            socket: PathBuf::from("/tmp/x.sock"),
+            reason: "'room' required: 3 rooms joined".to_owned(),
+        }
+        .to_status();
+        assert_eq!(send_rejected.state, "send_rejected");
+        assert_eq!(send_rejected.socket, Some(PathBuf::from("/tmp/x.sock")));
+        assert!(send_rejected.room.is_none());
+        assert_eq!(send_rejected.reason.as_deref(), Some("'room' required: 3 rooms joined"));
     }
 
     // ---- config resolution (config > default, no env) ----
@@ -2968,6 +3136,327 @@ mod tests {
         assert_eq!(received[0]["v"], json!(1));
         assert_eq!(received[0]["task_id"], json!("42"));
         assert!(received[0].get("from").is_none());
+    }
+
+    /// #4464: a protocol rejection (`ok:false`) is surfaced as the typed
+    /// [`SendError::Rejected`] carrying safehoused's raw reason — the sink can
+    /// tell it from a transport failure without string-matching an untyped
+    /// error chain.
+    #[tokio::test]
+    async fn send_rejection_is_typed_and_names_the_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("safehoused.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read_half, mut write_half) = stream.into_split();
+            let mut lines = BufReader::new(read_half).lines();
+            // hello → ok
+            let _ = lines.next_line().await.unwrap().unwrap();
+            write_half
+                .write_all(b"{\"ok\":true,\"id\":0}\n")
+                .await
+                .unwrap();
+            // send → rejected with the canonical multi-room reason
+            let req: Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            let id = req["id"].clone();
+            write_half
+                .write_all(
+                    format!(
+                        "{{\"ok\":false,\"error\":\"'room' required: 3 rooms joined\",\"id\":{id}}}\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            // Hold the connection open so the client observes the reply (a
+            // rejection, not an EOF), which is the whole point of the split.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        let mut client = SafehouseClient::connect(&socket, "loom_daemon", None)
+            .await
+            .unwrap();
+        let err = client
+            .send(&Envelope {
+                to: "*".to_owned(),
+                kind: "task".to_owned(),
+                task_id: Some("42".to_owned()),
+                body: "issue #42 → builder".to_owned(),
+                meta: None,
+            })
+            .await
+            .expect_err("a rejected send must be an error");
+        match err {
+            SendError::Rejected { reason } => {
+                assert!(
+                    reason.contains("'room' required"),
+                    "reason must carry safehoused's raw error, got: {reason}"
+                );
+            }
+            SendError::Transport(e) => panic!("expected Rejected, got Transport: {e:#}"),
+        }
+        server.abort();
+    }
+
+    /// #4464: a transport-level failure (peer closes mid-send) is surfaced as
+    /// [`SendError::Transport`], NOT `Rejected` — the sink must reconnect
+    /// rather than stick on a rejection diagnosis.
+    #[tokio::test]
+    async fn send_transport_failure_is_typed_transport() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("safehoused.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read_half, mut write_half) = stream.into_split();
+            let mut lines = BufReader::new(read_half).lines();
+            // hello → ok, then drop the connection: the send's reply read hits EOF.
+            let _ = lines.next_line().await.unwrap().unwrap();
+            write_half
+                .write_all(b"{\"ok\":true,\"id\":0}\n")
+                .await
+                .unwrap();
+            drop(write_half);
+            drop(lines);
+        });
+
+        let mut client = SafehouseClient::connect(&socket, "loom_daemon", None)
+            .await
+            .unwrap();
+        // The server has (or will imminently) close the connection after the
+        // hello; the send's reply read then hits EOF.
+        server.await.unwrap();
+        let err = client
+            .send(&Envelope {
+                to: "*".to_owned(),
+                kind: "task".to_owned(),
+                task_id: Some("42".to_owned()),
+                body: "body".to_owned(),
+                meta: None,
+            })
+            .await
+            .expect_err("a closed connection must fail the send");
+        assert!(
+            matches!(err, SendError::Transport(_)),
+            "a closed connection is a transport failure, got: {err:?}"
+        );
+    }
+
+    /// #4464: the sink reports `send_rejected` (with the reason) rather than
+    /// `unreachable` when safehoused rejects the send, and clears back to
+    /// `connected` once a send is accepted (config fixed + daemon restarted).
+    #[tokio::test]
+    async fn sink_send_rejection_reports_send_rejected_then_clears_on_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("safehoused.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+
+        // hello → ok; send 1 → rejected; send 2 → accepted.
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read_half, mut write_half) = stream.into_split();
+            let mut lines = BufReader::new(read_half).lines();
+            let _ = lines.next_line().await.unwrap().unwrap(); // hello
+            write_half
+                .write_all(b"{\"ok\":true,\"id\":0}\n")
+                .await
+                .unwrap();
+            // send 1 → reject
+            let r1: Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            let id1 = r1["id"].clone();
+            write_half
+                .write_all(
+                    format!(
+                        "{{\"ok\":false,\"error\":\"'room' required: 3 rooms joined\",\"id\":{id1}}}\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            // send 2 → accept (the operator set safehouse.room + restarted, in
+            // effect — here we just accept to exercise the clear-on-success arm)
+            let r2: Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            let id2 = r2["id"].clone();
+            write_half
+                .write_all(format!("{{\"ok\":true,\"event_id\":\"$e\",\"id\":{id2}}}\n").as_bytes())
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        });
+
+        let bus = Arc::new(EventBus::new());
+        let subscription = bus.subscribe(Vec::<String>::new());
+        let state = new_shared_state();
+        let sink = tokio::spawn(run_sink(
+            SafehouseConfig {
+                enabled: true,
+                socket: Some(socket.clone()),
+                ..SafehouseConfig::default()
+            },
+            socket.clone(),
+            subscription,
+            Duration::from_millis(50),
+            Duration::from_millis(200),
+            state.clone(),
+        ));
+
+        // Event 1 → rejected → send_rejected (with reason), NOT unreachable.
+        let _ = bus.publish(Event::SweepPhase {
+            issue: 1,
+            phase: "builder".to_owned(),
+            pr_number: None,
+            repo: None,
+        });
+        let s = wait_for_state(&state, |s| matches!(s, SafehouseState::SendRejected { .. })).await;
+        match s {
+            SafehouseState::SendRejected { socket: sk, reason } => {
+                assert_eq!(sk, socket);
+                assert!(reason.contains("'room' required"), "reason: {reason}");
+            }
+            other => panic!("expected SendRejected, got {other:?}"),
+        }
+
+        // Event 2 → accepted → clears back to connected.
+        let _ = bus.publish(Event::SweepPhase {
+            issue: 2,
+            phase: "builder".to_owned(),
+            pr_number: None,
+            repo: None,
+        });
+        let s = wait_for_state(&state, |s| matches!(s, SafehouseState::Connected { .. })).await;
+        assert!(matches!(s, SafehouseState::Connected { .. }), "got {s:?}");
+
+        drop(bus);
+        let _ = tokio::time::timeout(Duration::from_secs(2), sink).await;
+        server.abort();
+    }
+
+    /// #4464: the send-rejected diagnosis is sticky across a reconnect — a
+    /// fresh `hello` after a transport blip must NOT flash "connected"; only an
+    /// accepted send clears it.
+    #[tokio::test]
+    async fn sink_send_rejected_survives_reconnect() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("safehoused.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+
+        let server = tokio::spawn(async move {
+            // Connection 1: hello ok, reject send 1, then close (transport drop).
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read_half, mut write_half) = stream.into_split();
+            let mut lines = BufReader::new(read_half).lines();
+            let _ = lines.next_line().await.unwrap().unwrap(); // hello
+            write_half
+                .write_all(b"{\"ok\":true,\"id\":0}\n")
+                .await
+                .unwrap();
+            let r1: Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            let id1 = r1["id"].clone();
+            write_half
+                .write_all(
+                    format!(
+                        "{{\"ok\":false,\"error\":\"'room' required: 3 rooms joined\",\"id\":{id1}}}\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            drop(write_half);
+            drop(lines);
+
+            // Connection 2: hello ok, then stall before replying to the send so
+            // the sink's state is observable at "just reconnected, no send
+            // accepted yet" — it must be SendRejected, not Connected.
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read_half, mut write_half) = stream.into_split();
+            let mut lines = BufReader::new(read_half).lines();
+            let _ = lines.next_line().await.unwrap().unwrap(); // hello
+            write_half
+                .write_all(b"{\"ok\":true,\"id\":0}\n")
+                .await
+                .unwrap();
+            let _ = lines.next_line().await.unwrap().unwrap(); // send (read, do not reply yet)
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        });
+
+        let bus = Arc::new(EventBus::new());
+        let subscription = bus.subscribe(Vec::<String>::new());
+        let state = new_shared_state();
+        let sink = tokio::spawn(run_sink(
+            SafehouseConfig {
+                enabled: true,
+                socket: Some(socket.clone()),
+                ..SafehouseConfig::default()
+            },
+            socket.clone(),
+            subscription,
+            Duration::from_millis(30),
+            Duration::from_millis(60),
+            state.clone(),
+        ));
+
+        // Event 1 → conn1 rejects → SendRejected.
+        let _ = bus.publish(Event::SweepPhase {
+            issue: 1,
+            phase: "builder".to_owned(),
+            pr_number: None,
+            repo: None,
+        });
+        wait_for_state(&state, |s| matches!(s, SafehouseState::SendRejected { .. })).await;
+
+        // Event 2 → send on the now-closed conn1 fails (transport) → Unreachable.
+        let _ = bus.publish(Event::SweepPhase {
+            issue: 2,
+            phase: "builder".to_owned(),
+            pr_number: None,
+            repo: None,
+        });
+        wait_for_state(&state, |s| matches!(s, SafehouseState::Unreachable { .. })).await;
+
+        // Event 3 → reconnect (conn2 hello ok); the send stalls server-side so
+        // the state settles at the reconnect value. Stickiness ⇒ SendRejected.
+        tokio::time::sleep(Duration::from_millis(80)).await; // clear the backoff window
+        let _ = bus.publish(Event::SweepPhase {
+            issue: 3,
+            phase: "builder".to_owned(),
+            pr_number: None,
+            repo: None,
+        });
+        let s = wait_for_state(&state, |s| matches!(s, SafehouseState::SendRejected { .. })).await;
+        assert!(
+            matches!(s, SafehouseState::SendRejected { .. }),
+            "a reconnect whose hello succeeds must NOT clear the send-rejected \
+             diagnosis, got {s:?}"
+        );
+
+        drop(bus);
+        let _ = tokio::time::timeout(Duration::from_secs(2), sink).await;
+        server.abort();
+    }
+
+    /// Poll `state` until `pred` holds (or panic after ~1s) — test helper for
+    /// the lazily-connecting sink whose transitions are not synchronous with
+    /// `bus.publish`.
+    async fn wait_for_state(
+        state: &SharedSafehouseState,
+        pred: impl Fn(&SafehouseState) -> bool,
+    ) -> SafehouseState {
+        for _ in 0..100 {
+            let s = snapshot_state(state);
+            if pred(&s) {
+                return s;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let s = snapshot_state(state);
+        panic!("state never satisfied predicate; last = {s:?}");
     }
 
     #[tokio::test]

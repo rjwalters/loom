@@ -509,6 +509,17 @@ print_safehouse_status() {
     fi
     if [[ -S "$socket" ]]; then
         ok "Safehouse:     configured (socket present at $socket) -- see 'loom-daemon status' for live connection state"
+        # #4464: omitting safehouse.room is only valid when safehoused joined
+        # exactly ONE room; on a multi-room host it makes safehoused reject
+        # every send ('room' required) -- which silently kills narration and
+        # peer-claim dedup, and 'loom-daemon status' will show
+        # "connected, sends rejected: ...". Surface the caveat statically here.
+        local room
+        room=$(loom_config_get "$REPO_ROOT" "safehouse.room" "" 2>/dev/null || true)
+        if [[ -z "$room" ]]; then
+            echo "               note: safehouse.room is unset -- valid only if safehoused joined exactly one room;" \
+                 "a multi-room host needs an explicit safehouse.room or every send is rejected"
+        fi
     else
         warn "Safehouse:     configured, unreachable (socket $socket does not exist -- is safehoused running?)"
     fi
