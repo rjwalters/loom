@@ -119,6 +119,17 @@ pub trait CodexCommandRunner {
 pub struct ProcessCodexRunner;
 
 impl ProcessCodexRunner {
+    fn classify_status(success: bool, text: &str) -> &'static str {
+        let text = text.to_ascii_lowercase();
+        if text.contains("not logged in") {
+            "not logged in"
+        } else if success && text.contains("logged in") {
+            "logged in"
+        } else {
+            "Codex login status failed"
+        }
+    }
+
     fn bounded_status(profile: &Path) -> Result<RunnerOutput> {
         let mut child = match Command::new("codex")
             .args(["login", "status"])
@@ -155,14 +166,8 @@ impl ProcessCodexRunner {
                             .read_to_end(&mut bytes)?;
                     }
                 }
-                let text = String::from_utf8_lossy(&bytes).to_ascii_lowercase();
-                let summary = if status.success() && text.contains("logged in") {
-                    "logged in"
-                } else if text.contains("not logged in") {
-                    "not logged in"
-                } else {
-                    "Codex login status failed"
-                };
+                let summary =
+                    Self::classify_status(status.success(), &String::from_utf8_lossy(&bytes));
                 return Ok(RunnerOutput {
                     success: status.success(),
                     unavailable: false,
@@ -303,7 +308,11 @@ impl<R: CodexCommandRunner> AccountLifecycle<R> {
             let _ = fs::remove_dir(&profile);
         }
         result?;
-        register_codex_account(&self.workspace, name, name, true)?;
+        if let Err(error) = register_codex_account(&self.workspace, name, name, true) {
+            fs::remove_dir_all(&profile)
+                .context("account registry update failed and imported profile rollback failed")?;
+            return Err(error.context("account registry update failed; imported profile removed"));
+        }
         self.status_without_probe(name)
     }
 
@@ -366,11 +375,37 @@ impl<R: CodexCommandRunner> AccountLifecycle<R> {
         let recovery_reference = format!("{name}-{stamp}-{}", now.subsec_nanos());
         validate_name(&recovery_reference)?;
         let destination = quarantine.join(&recovery_reference);
+        let recovery_file = account.credential_reference.join("recovery.json");
+        if !purge {
+            let metadata = serde_json::json!({
+                "version": 1,
+                "provider": "codex",
+                "name": name,
+                "retired_at_unix": stamp,
+                "original_reference": name,
+            });
+            let mut file =
+                private_file(&recovery_file).context("failed to create recovery metadata")?;
+            let metadata_result = (|| -> Result<()> {
+                serde_json::to_writer_pretty(&mut file, &metadata)?;
+                file.write_all(b"\n")?;
+                file.sync_all()?;
+                Ok(())
+            })();
+            if metadata_result.is_err() {
+                let _ = fs::remove_file(&recovery_file);
+            }
+            metadata_result.context("failed to prepare recovery metadata")?;
+        }
         fs::rename(&account.credential_reference, &destination)
             .context("failed to quarantine profile atomically")?;
         if let Err(error) = unregister_codex_account(&self.workspace, name) {
             fs::rename(&destination, &account.credential_reference)
                 .context("account registry update failed and profile rollback also failed")?;
+            if !purge {
+                fs::remove_file(&recovery_file)
+                    .context("account registry update failed and metadata rollback also failed")?;
+            }
             return Err(error.context("account registry update failed; profile was restored"));
         }
         if purge {
@@ -386,16 +421,6 @@ impl<R: CodexCommandRunner> AccountLifecycle<R> {
                 recovery_reference: None,
             });
         }
-        let metadata = serde_json::json!({
-            "version": 1,
-            "provider": "codex",
-            "name": name,
-            "retired_at_unix": stamp,
-            "original_reference": name,
-        });
-        let mut file = private_file(&destination.join("recovery.json"))?;
-        serde_json::to_writer_pretty(&mut file, &metadata)?;
-        file.write_all(b"\n")?;
         Ok(RemovalOutcome {
             provider: AccountProvider::Codex,
             name: name.into(),
@@ -857,6 +882,27 @@ mod tests {
 
     #[test]
     #[serial]
+    fn import_registry_failure_removes_committed_profile_without_secret_leak() {
+        let (workspace, root) = setup();
+        let source = root.path().join("source");
+        fs::write(&source, "recognizable-fake-secret").unwrap();
+        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", root.path());
+        let service = AccountLifecycle::new(workspace.path(), FakeRunner::default()).unwrap();
+        let lock = per_repo_accounts_file(workspace.path()).with_extension("json.lock");
+        fs::create_dir_all(lock.parent().unwrap()).unwrap();
+        fs::create_dir(&lock).unwrap();
+
+        let error = service.import("alice", &source).unwrap_err().to_string();
+        fs::remove_dir(&lock).unwrap();
+        assert!(error.contains("registry"));
+        assert!(!root.path().join("alice").exists());
+        assert!(service.list(false).unwrap().is_empty());
+        assert!(!error.contains("recognizable-fake-secret"));
+        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
+    }
+
+    #[test]
+    #[serial]
     fn registry_failure_rolls_quarantine_and_purge_back_to_live_profile() {
         let (workspace, root) = setup();
         let source_dir = tempfile::tempdir().unwrap();
@@ -895,6 +941,62 @@ mod tests {
         assert!(service.find("alice").is_ok());
         assert!(!error.contains("recognizable-fake-secret"));
         std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
+    }
+
+    #[test]
+    #[serial]
+    fn recovery_metadata_collision_leaves_live_profile_and_registry_unchanged() {
+        let (workspace, root) = setup();
+        let source = root.path().join("source");
+        fs::write(&source, "recognizable-fake-secret").unwrap();
+        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", root.path());
+        let service = AccountLifecycle::new(workspace.path(), FakeRunner::default()).unwrap();
+        service.import("alice", &source).unwrap();
+        let recovery = root.path().join("alice/recovery.json");
+        fs::write(&recovery, "recognizable-existing-metadata").unwrap();
+
+        let error = service.remove("alice", false).unwrap_err().to_string();
+        assert!(root.path().join("alice").join(AUTH_FILE).exists());
+        assert!(service.find("alice").is_ok());
+        assert_eq!(fs::read_to_string(recovery).unwrap(), "recognizable-existing-metadata");
+        assert!(!error.contains("recognizable-fake-secret"));
+        assert!(!error.contains("recognizable-existing-metadata"));
+        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn bounded_status_real_process_does_not_misclassify_not_logged_in() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let bin = fixture.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        let codex = bin.join("codex");
+        fs::write(&codex, "#!/bin/sh\nprintf 'Not logged in\\n'\nexit 0\n").unwrap();
+        fs::set_permissions(&codex, fs::Permissions::from_mode(0o700)).unwrap();
+        let old_path = std::env::var_os("PATH");
+        let joined = std::env::join_paths(
+            std::iter::once(bin).chain(
+                old_path
+                    .as_deref()
+                    .map(std::env::split_paths)
+                    .into_iter()
+                    .flatten(),
+            ),
+        )
+        .unwrap();
+        std::env::set_var("PATH", joined);
+        let output = ProcessCodexRunner::bounded_status(fixture.path()).unwrap();
+        if let Some(path) = old_path {
+            std::env::set_var("PATH", path);
+        } else {
+            std::env::remove_var("PATH");
+        }
+
+        assert!(output.success);
+        assert_eq!(output.summary, "not logged in");
     }
 
     #[test]
