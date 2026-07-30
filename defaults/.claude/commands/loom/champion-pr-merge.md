@@ -12,6 +12,61 @@ The Champion acts as the final step in the PR pipeline, merging PRs that have pa
 
 ---
 
+## Verdict-State Janitor (run FIRST, before the 6 safety criteria)
+
+**Every `loom:pr` PR must pass this janitor step before any of the 6 safety
+criteria below are evaluated.** It is a fail-safe against a real race
+(#4570, PR #4560 incident, 2026-07-30): two Judges reviewing the same PR
+concurrently can leave it carrying **both** `loom:pr` and
+`loom:changes-requested` simultaneously — an off-graph state the label
+lifecycle never intends to produce (see the mutual-exclusion invariant
+documented in `.github/labels.yml`). Judge's and Doctor's Verdict-Time CAS
+Recheck (`judge.md` / `doctor.md`) prevent this at write time going forward,
+but this janitor is the mechanized fail-safe for any instance that still
+slips through (a pre-existing contradictory state from before this fix
+shipped, a manual label edit, or a bug elsewhere) — mechanizing exactly the
+manual correction the incident required a human-in-the-loop Judge to perform.
+
+**Verification / resolution command** (run once per candidate `loom:pr` PR,
+before Step 1 of the 6 criteria below):
+
+```bash
+PR_NUMBER=<number>
+LABELS=$(gh pr view "$PR_NUMBER" --json labels --jq '[.labels[].name] | join(",")')
+
+if echo "$LABELS" | grep -qw "loom:changes-requested"; then
+  JANITOR_MARKER="<!-- champion:verdict-janitor-notice -->"
+  # Idempotency guard — mirrors the stale-PR notice pattern below: only
+  # comment + relabel once per contradictory episode, so a 10-minute cron
+  # tick doesn't re-post while the contradiction is being resolved.
+  if gh pr view "$PR_NUMBER" --json comments --jq '.comments[].body' | grep -qF "$JANITOR_MARKER"; then
+    echo "Verdict-janitor notice already posted for #$PR_NUMBER — skipping (still not eligible to merge)"
+  else
+    gh pr comment "$PR_NUMBER" --body "$JANITOR_MARKER
+**Champion: Verdict-State Janitor**
+
+This PR carries both \`loom:pr\` and \`loom:changes-requested\` simultaneously — a contradictory verdict state that should never coexist (see the mutual-exclusion invariant in \`.github/labels.yml\`). This usually means two Judges reviewed the PR concurrently and their verdicts raced.
+
+Resolving fail-safe: \`loom:changes-requested\` wins. Removing \`loom:pr\` so this PR is not auto-merged. Doctor will address the outstanding rejection; re-request Judge review once addressed.
+
+---
+*Automated by Champion role*"
+    gh pr edit "$PR_NUMBER" --remove-label "loom:pr"
+    echo "Resolved contradictory verdict state on #$PR_NUMBER (loom:pr removed) — skipping merge"
+  fi
+  # Skip this PR entirely for this pass — do not proceed to the 6 safety
+  # criteria and do not merge. In a batch loop: `continue`. In a single-PR
+  # invocation: exit without merging.
+fi
+```
+
+**Never merge a PR that failed this janitor check in the same pass** — even
+though the janitor just removed `loom:pr`, a fresh Judge pass on the
+corrected state (which re-adds `loom:pr` if it approves) is what makes the PR
+eligible again, not this loop continuing on to the 6 criteria below.
+
+---
+
 ## Safety Criteria
 
 For each `loom:pr` PR, verify ALL 6 safety criteria. If ANY criterion fails, do NOT merge.
@@ -27,6 +82,16 @@ LABELS=$(gh pr view <number> --json labels --jq '.labels[].name' | tr '\n' ' ')
 # Check for loom:pr label
 if ! echo "$LABELS" | grep -q "loom:pr"; then
   echo "FAIL: Missing loom:pr label"
+  exit 1
+fi
+
+# Check for a contradictory loom:changes-requested alongside loom:pr. The
+# Verdict-State Janitor above should already have resolved this before
+# criterion evaluation ever runs, but this check is defense-in-depth: if a
+# PR somehow reaches here still carrying both labels, fail closed rather
+# than silently auto-merging over an open Judge rejection (#4570).
+if echo "$LABELS" | grep -q "loom:changes-requested"; then
+  echo "FAIL: loom:changes-requested present alongside loom:pr (contradictory verdict state)"
   exit 1
 fi
 

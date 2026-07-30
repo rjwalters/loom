@@ -382,7 +382,7 @@ gh pr edit 588 --remove-label "loom:treating" --add-label "loom:review-requested
      ```
      This discovers open child PRs stacked on your branch and rebases any that went stale onto your new tip (safe children auto-rebase + force-with-lease; children whose issue is still `loom:building` get a deferred-reconciliation comment instead). It is a no-op when there are no stacked children. This is **best-effort** — a failure here (rebase conflict, non-GitHub forge) never fails your own Doctor work; carry on to step 10. Preview first with `--dry-run` if unsure.
 10. **Verify CI remotely**: Run `gh pr checks <number>` after push to confirm all checks pass
-11. **Signal completion and unclaim**:
+11. **Signal completion and unclaim** (run the Verdict-Time CAS Recheck — see below — immediately before this write; abort/stand down instead if it finds your claim lost or the PR already moved):
     - Remove `loom:changes-requested` and `loom:treating` labels
     - Add `loom:review-requested` label (green badge)
     - Comment to notify reviewer that feedback is addressed
@@ -498,12 +498,47 @@ Do **not** add `loom:review-requested` when standing down — the Doctor who
 actually pushed owns that transition. Leave the PR's state labels alone and
 exit; your only label action is removing your own claim.
 
+### Verdict-Time CAS Recheck (Step 11 — immediately before the completion label write)
+
+The Pre-Push Head-SHA Recheck above catches a concurrent **code** race. It
+does not catch a concurrent **label** race: while you were fixing and
+pushing, another actor may already have changed the PR's label state — a
+Judge reclaimed `loom:treating` as stale and is now reviewing it fresh, or
+another Doctor already completed the same fix and wrote
+`loom:review-requested`. GitHub's label API has no compare-and-swap, so
+nothing stops your completion write from landing on top of that in-flight
+state (the Judge-side analog of this raced in the PR #4560 incident,
+2026-07-30 — see `judge.md`'s "Verdict-Time CAS Recheck" and the
+mutual-exclusion invariant in `.github/labels.yml`).
+
+**Immediately before Step 11's completion write** (`loom:changes-requested` +
+`loom:treating` → `loom:review-requested`), re-read the PR's current labels:
+
+```bash
+N=<pr-number>
+CURRENT_LABELS=$(gh pr view $N --json labels --jq '[.labels[].name] | join(",")')
+```
+
+| Condition | Verdict | Action |
+|-----------|---------|--------|
+| `loom:treating` is still present (your claim intact), and neither `loom:review-requested` nor `loom:pr` is already present | **Safe** | Proceed with the completion write as planned. |
+| `loom:treating` was removed or replaced (e.g. reclaimed as stale by another Doctor, or a Judge/Champion touched the PR while you worked) | **Claim lost** | **ABORT.** Do not write the completion label — use the "Standing down" flow above (comment, remove only your own claim if still present, exit). |
+| `loom:review-requested` or `loom:pr` is already present | **Raced** | **ABORT.** Another Doctor already completed this fix, or the PR moved forward without you. Do not write a duplicate or contradictory label — comment and stand down instead. |
+| The `gh pr view` call fails or returns empty | **Unknown — fail safe** | Do NOT write the completion label. Retry the recheck once; if it still fails, abort and note the API failure rather than guessing. |
+
+This is the same technique as the Pre-Push Head-SHA Recheck, applied to the
+**label** state instead of the code state — re-run immediately before the
+write that actually matters, not just at claim time.
+
 **Pre-completion checklist** (verify before signaling completion):
 - [ ] All CI checks pass (verified via `gh pr checks <number>`)
 - [ ] I ran the stale `loom:treating` claim check before claiming (skipped the PR
       on a fresh claim; reclaimed only on a stale one)
 - [ ] I re-compared the PR's `headRefOid` against `CLAIM_HEAD_SHA` immediately
       before pushing, and on a mismatch re-verified the blocker (or stood down)
+- [ ] I re-read the PR's labels immediately before the completion write (Verdict-Time
+      CAS Recheck above), and aborted/stood down on a lost claim or a raced verdict
+      label instead of writing over it
 - [ ] My commit(s) address the specific feedback quoted from the Judge's review
 - [ ] If any comment I posted came from a scratch file, I used `--body-file
       <path>` (or `gh api -F body=@<path>`) — NEVER `--body @<path>` (see the
@@ -819,6 +854,12 @@ if [ -n "$CURRENT_HEAD_SHA" ] && [ "$CURRENT_HEAD_SHA" != "$CLAIM_HEAD_SHA" ]; t
 fi
 
 git push
+
+# Verdict-Time CAS Recheck — re-read labels one more time before the
+# completion write (see "Verdict-Time CAS Recheck" above); abort/stand down
+# instead of writing if loom:treating is gone or loom:review-requested/loom:pr
+# already appeared.
+CURRENT_LABELS=$(gh pr view 42 --json labels --jq '[.labels[].name] | join(",")')
 
 # Signal completion and unclaim (amber → green, remove in-progress)
 gh pr edit 42 --remove-label "loom:changes-requested" --remove-label "loom:treating" --add-label "loom:review-requested"
