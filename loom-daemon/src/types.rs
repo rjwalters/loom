@@ -1527,7 +1527,7 @@ pub struct CredentialPreflightReport {
     /// (e.g. `"keyring"`, `"oauth_token"`) reported by `gh auth status`;
     /// `"github-app"` when a GitHub App installation token was minted and
     /// exported as `GH_TOKEN` (#4430 — see
-    /// [`crate::credential_preflight::resolve_with_github_app`]).
+    /// [`crate::credential_preflight::run_with_github_app`]).
     /// `"none"` when nothing resolved; `"unknown"` when the probe itself
     /// failed to run. NEVER a token value.
     pub mechanism: String,

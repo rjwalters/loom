@@ -315,7 +315,17 @@ _github_app_api_get_installation() {
   http_code=$(echo "$resp" | tail -1)
   body=$(echo "$resp" | sed '$d')
   if [[ "$http_code" -ge 200 && "$http_code" -lt 300 ]]; then
-    echo "$body" | jq -r '.id'
+    # Validate before echoing: a 2xx body missing `.id` yields the literal
+    # string "null", which is non-empty and would poison the per-owner cache
+    # persistently (#4456). Installation ids are numeric -- reject anything
+    # else at the source so the caller never caches a bad value.
+    local id
+    id=$(echo "$body" | jq -r '.id')
+    if [[ ! "$id" =~ ^[0-9]+$ ]]; then
+      _GH_APP_LAST_ERROR="GitHub App installation response for ${nwo} did not include a numeric installation id (HTTP ${http_code})"
+      return 1
+    fi
+    printf '%s' "$id"
     return 0
   fi
   _GH_APP_LAST_ERROR="could not resolve the GitHub App installation for ${nwo} (HTTP ${http_code} -- is the app installed on this repo/org?)"
@@ -366,7 +376,11 @@ github_app_get_token() {
 
   local installation_id
   installation_id=$(cat "$(_github_app_installation_cache_path "$owner")" 2>/dev/null || echo "")
-  if [[ -z "$installation_id" ]]; then
+  # Treat a missing OR non-numeric cache value as a miss (#4456): a
+  # pre-poisoned cache file holding the literal "null" (or any non-numeric
+  # junk from an older build) is non-empty, so a bare `-z` test would keep
+  # reusing it forever. Re-resolving self-heals such hosts.
+  if [[ ! "$installation_id" =~ ^[0-9]+$ ]]; then
     installation_id=$(_github_app_api_get_installation "$nwo") || return 1
     printf '%s' "$installation_id" > "$(_github_app_installation_cache_path "$owner")"
   fi
