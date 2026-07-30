@@ -665,9 +665,27 @@ This is a **detect → fix** pair:
 `scripts/setup-mcp.sh`), and the metadata `install_date` + `installed_files`
 fields (installer-owned).
 
+**Run it from the main checkout only (#4563).** The installed `.loom/` is always
+resolved against the **primary** worktree (via `git rev-parse --git-common-dir`),
+so a resync launched from a linked worktree — an issue/PR worktree under
+`.loom/worktrees/` — writes to the **main checkout**, not to the worktree you are
+standing in. That is exactly how a wave-2 Builder contaminated `main` mid-sweep on
+2026-07-30 (four installed paths written into `main` and quarantined by
+`check-main-clean.sh`). The script therefore **refuses to run** (exit `1`,
+including under `--dry-run`) when its own `git rev-parse --show-toplevel` differs
+from the resolved main-checkout root. Landing a `defaults/` change does **not**
+require you to resync: installed-copy propagation is the periodic
+`chore: resync installed Loom surfaces` commit's job, made from the main checkout
+after the change merges. An operator who really does mean "rewrite the main
+checkout's installed copies from this worktree" can pass `--allow-worktree` (or
+export `LOOM_RESYNC_ALLOW_WORKTREE=1`); it then proceeds with a warning naming the
+main-checkout target. Running from the main checkout — including any subdirectory
+of it — is unaffected.
+
 The intended flow is **"freshness warning says you're stale → run resync"**:
 
 ```bash
+cd <main checkout>                              # NOT .loom/worktrees/issue-N (#4563)
 git merge --ff-only origin/main                 # bring defaults/ current
 ./.loom/scripts/resync-installed.sh --dry-run   # preview what would change (exits 2 on drift)
 ./.loom/scripts/resync-installed.sh             # apply

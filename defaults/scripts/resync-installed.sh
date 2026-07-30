@@ -76,6 +76,20 @@
 #     residual emission role
 #   install-metadata.json's install_date + installed_files - owned by the installer
 #
+# WORKTREE RESTRICTION (#4563): the installed .loom/ is ALWAYS resolved against
+# the PRIMARY worktree (via `git rev-parse --git-common-dir`), so running this
+# from a linked worktree — an issue/PR worktree under .loom/worktrees/ — writes
+# to the MAIN checkout, not to the worktree you are standing in. A Builder that
+# does so contaminates main mid-sweep (the 2026-07-30 incident: four installed
+# paths written into main from a wave-2 builder's worktree and quarantined by
+# check-main-clean.sh). The script therefore REFUSES to run when its own
+# `--show-toplevel` differs from the resolved main-checkout root, and exits 1.
+# Installed-copy propagation is the periodic resync commit's job: land the
+# defaults/ change, then resync from the main checkout. An operator who really
+# does mean "write the main checkout's installed copies from here" can pass
+# --allow-worktree (or export LOOM_RESYNC_ALLOW_WORKTREE=1). Running from the
+# main checkout itself — including any subdirectory of it — is unaffected.
+#
 # Local-override convention: list a relative path (e.g. `hooks/guard-destructive.sh`,
 # `scripts/foo.sh`, `roles/custom-role.md`, `docs/notes.md`, `bin/loom`,
 # `commands/loom/mine.md`, or `package.json` to pin the #4285 stub version edit)
@@ -87,11 +101,21 @@
 #   ./.loom/scripts/resync-installed.sh            # sync; report what changed
 #   ./.loom/scripts/resync-installed.sh --dry-run  # preview only; make no changes
 #   ./.loom/scripts/resync-installed.sh --quiet    # only report updated/skipped
+#   ./.loom/scripts/resync-installed.sh --allow-worktree
+#                                                  # permit running from a linked
+#                                                  # worktree (still writes the MAIN
+#                                                  # checkout's installed copies)
 #   ./.loom/scripts/resync-installed.sh --help     # show usage
+#
+# Environment:
+#   LOOM_RESYNC_ALLOW_WORKTREE=1  - same as --allow-worktree (for non-interactive
+#                                   callers), matching the LOOM_ALLOW_* override
+#                                   convention used elsewhere in .loom/scripts.
 #
 # Exit codes:
 #   0 - Success. Sync applied (or already in sync); or --dry-run found no drift.
-#   1 - Error (not in a git repo, or the source tree could not be located).
+#   1 - Error (not in a git repo, the source tree could not be located, or
+#       invoked from a linked worktree without --allow-worktree).
 #   2 - --dry-run only: drift detected (one or more files WOULD be updated).
 #       Lets callers (e.g. the #3770 warning) use --dry-run as a cheap check.
 #
@@ -119,6 +143,9 @@ fi
 
 DRY_RUN=0
 QUIET=0
+# #4563: refuse to run from a linked worktree unless explicitly overridden.
+ALLOW_WORKTREE=0
+[[ "${LOOM_RESYNC_ALLOW_WORKTREE:-}" == "1" ]] && ALLOW_WORKTREE=1
 
 err()  { printf '%b\n' "${RED}ERROR: $*${NC}" >&2; }
 warn() { printf '%b\n' "${YELLOW}WARN: $*${NC}" >&2; }
@@ -129,10 +156,17 @@ note() { [[ "$QUIET" -eq 1 ]] || printf '%b\n' "$*"; }
 
 for arg in "$@"; do
     case "$arg" in
-        --dry-run|-n) DRY_RUN=1 ;;
-        --quiet|-q)   QUIET=1 ;;
+        --dry-run|-n)     DRY_RUN=1 ;;
+        --quiet|-q)       QUIET=1 ;;
+        --allow-worktree) ALLOW_WORKTREE=1 ;;
         --help|-h)
-            sed -n '2,69p' "$0" | sed 's/^# \{0,1\}//'
+            # Print the whole leading comment block (line 2 through the last
+            # consecutive `#` line). Derived, not a hard-coded line range — the
+            # previous `sed -n '2,69p'` silently truncated the Usage/Exit-codes
+            # sections as the header grew past it.
+            awk 'NR==1 { next }
+                 /^#/  { sub(/^# ?/, ""); print; next }
+                 { exit }' "$0"
             exit 0
             ;;
         *)
@@ -165,6 +199,51 @@ fi
 if [[ -z "$REPO_ROOT" || ! -d "$REPO_ROOT/.loom" ]]; then
     err "Could not resolve the installed repo root (no .loom/ found)."
     exit 1
+fi
+
+# ---------- refuse to run from a linked worktree (#4563) ----------
+#
+# The resolution above is the whole point of the refusal: from an issue/PR
+# worktree it hands back the MAIN checkout, so every write below lands in main
+# rather than in the worktree the caller is standing in. That is a
+# worktree-isolation escape a Builder cannot see (nothing in its own `git
+# status` changes) — it surfaces only as contamination of main.
+#
+# Detection is generic: compare this invocation's own worktree top against the
+# resolved main-checkout root. No path pattern is hard-coded, so a repo that
+# relocates its worktree root (worktree.root / lib/worktree-root.sh) is covered
+# too. Both sides are normalized to physical absolute paths first, because
+# `git rev-parse --git-common-dir` returns a RELATIVE path (e.g. "../../.git")
+# from a subdirectory of the main checkout — a raw string compare there would
+# refuse a perfectly legitimate run.
+
+abs_path() {
+    local p="$1"
+    [[ -d "$p" ]] || { printf '%s' "$p"; return 0; }
+    (cd "$p" 2>/dev/null && pwd -P) || printf '%s' "$p"
+}
+
+WORKTREE_TOP="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+if [[ -n "$WORKTREE_TOP" && "$(abs_path "$WORKTREE_TOP")" != "$(abs_path "$REPO_ROOT")" ]]; then
+    if [[ "$ALLOW_WORKTREE" -eq 1 ]]; then
+        warn "Running from a linked worktree ($WORKTREE_TOP) — writes target the MAIN checkout at $REPO_ROOT (--allow-worktree)."
+    else
+        err "Refusing to run: invoked from a linked git worktree."
+        err "  this worktree : $WORKTREE_TOP"
+        err "  would write to: $REPO_ROOT  (the MAIN checkout — NOT this worktree)"
+        printf '\n' >&2
+        err "The installed .loom/ surfaces are always resolved against the primary"
+        err "worktree, so a resync from here silently modifies the main checkout and"
+        err "contaminates it mid-sweep (#4563)."
+        printf '\n' >&2
+        err "Installed-copy propagation is the periodic resync commit's job: commit your"
+        err "defaults/ change, get it merged, then run this from the main checkout:"
+        err "  cd $REPO_ROOT && ./.loom/scripts/resync-installed.sh"
+        printf '\n' >&2
+        err "If you genuinely intend to rewrite the MAIN checkout's installed copies from"
+        err "here, re-run with --allow-worktree (or LOOM_RESYNC_ALLOW_WORKTREE=1)."
+        exit 1
+    fi
 fi
 
 # ---------- resolve the defaults/ source tree ----------
