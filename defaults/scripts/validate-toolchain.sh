@@ -35,11 +35,14 @@ CRITICAL_COMMANDS=(
     "loom-recover-orphans"
 )
 
-# Optional commands - degraded functionality without these
-OPTIONAL_COMMANDS=(
-    "loom-agent-wait"
-    "loom-agent-spawn"
-)
+# Optional commands - degraded functionality without these.
+# Currently empty: `loom-agent-wait` / `loom-agent-spawn` were the last two
+# entries and were removed in epic #4081 Phase 3 family 4 (#4415) when
+# agent_wait.py / agent_spawn.py were ported to native `loom-daemon
+# agent-wait` / `agent-spawn`. The array is kept (rather than deleted) so the
+# tiering stays in place for future optional console scripts; every loop over
+# it is length-guarded because bash 3.2 + `set -u` errors on "${EMPTY[@]}".
+OPTIONAL_COMMANDS=()
 
 # Colors for output
 RED='\033[0;31m'
@@ -68,8 +71,8 @@ CRITICAL COMMANDS (required):
     loom-recover-orphans  - Recover orphaned tasks after a sweep crash
 
 OPTIONAL COMMANDS (degraded without):
-    loom-agent-wait       - Wait for agent completion
-    loom-agent-spawn      - Spawn agent sessions
+    (none) - loom-agent-wait / loom-agent-spawn are now native
+             `loom-daemon agent-wait` / `agent-spawn` subcommands (#4415)
 
 INSTALLATION:
     If commands are missing, install loom-tools:
@@ -135,14 +138,13 @@ command_exists() {
 
     # Third try: check if a Python module can be invoked. Only for commands
     # whose Python implementation still exists — `loom-cleanup` and
-    # `loom-recover-orphans` had theirs deleted in issue #4272 (native-only
+    # `loom-recover-orphans` had theirs deleted in issue #4272, and
+    # `loom-agent-wait` / `loom-agent-spawn` in issue #4415 (all native-only
     # now), so they are intentionally absent from this map: the first two
-    # tiers above are their only paths to "found".
-    # Map command names to module paths
+    # tiers above are their only paths to "found". The map is empty today; it
+    # is kept as the extension point for any future Python-backed command.
     local module_name
     case "$cmd" in
-        loom-agent-wait) module_name="loom_tools.agent_wait" ;;
-        loom-agent-spawn) module_name="loom_tools.agent_spawn" ;;
         *) return 1 ;;
     esac
 
@@ -196,8 +198,10 @@ main() {
         fi
     done
 
-    # Validate optional commands (unless quick mode)
-    if [[ "$QUICK_MODE" != "true" ]]; then
+    # Validate optional commands (unless quick mode).
+    # The length guard is required: OPTIONAL_COMMANDS is currently empty
+    # (#4415) and bash 3.2 under `set -u` treats "${EMPTY[@]}" as unbound.
+    if [[ "$QUICK_MODE" != "true" && ${#OPTIONAL_COMMANDS[@]} -gt 0 ]]; then
         for cmd in "${OPTIONAL_COMMANDS[@]}"; do
             if command_exists "$cmd"; then
                 optional_found+=("$cmd")

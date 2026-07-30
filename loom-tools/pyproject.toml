@@ -16,7 +16,10 @@ dependencies = [
 [project.scripts]
 # loom-shepherd removed in Phase 3.3 (#3400) — shepherd brain deleted
 # loom-shepherd = "loom_tools.shepherd.cli:main"
-loom-agent-wait = "loom_tools.agent_wait:main"
+# loom-agent-wait removed in epic #4081 Phase 3 family 4 (#4415) — agent_wait.py
+# deleted; ported to native `loom-daemon agent-wait` (same flags, `--json` shape,
+# and 0/1/2 exit-code contract); agent-wait.sh repointed.
+# loom-agent-wait = "loom_tools.agent_wait:main"
 # loom-daemon-diagnostic removed in epic #4081 phase 3 (#4274) — daemon_diagnostic.py
 # deleted; the native `loom-daemon status` reports daemon/registry health.
 # loom-daemon-loop removed in Phase 3.2 (#3399) — daemon.py (V1) deleted
@@ -51,7 +54,13 @@ loom-claim = "loom_tools.claim:main"
 # repointed.
 # loom-agent-metrics = "loom_tools.agent_metrics:main"
 loom-validate-phase = "loom_tools.validate_phase:main"
-loom-agent-spawn = "loom_tools.agent_spawn:main"
+# loom-agent-spawn removed in epic #4081 Phase 3 family 4 (#4415) — agent_spawn.py
+# deleted; ported to native `loom-daemon agent-spawn` (tmux lifecycle, OAuth
+# injection via the native token pool, CLAUDE_CONFIG_DIR isolation reusing
+# terminal.rs's `claude_config`, bypass-modal auto-accept, stuck detection);
+# agent-spawn.sh repointed. `common/tmux_session.py` and `common/claude_config.py`
+# were deleted with it (no other consumers).
+# loom-agent-spawn = "loom_tools.agent_spawn:main"
 # loom-health-monitor removed in epic #4081 phase 3 (#4274) — health_monitor.py
 # deleted (safe no-op since v0.11.0); native surface is loom-daemon/src/health_monitor.rs
 # + `loom-daemon status`.
