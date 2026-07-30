@@ -621,6 +621,26 @@ mod tests {
     }
 
     #[test]
+    fn read_ranking_at_counts_never_used_account_as_healthy() {
+        // Regression test for issue #4645: the monitor writer used to emit a
+        // malformed `name|` row (empty status) for a manifest account with no
+        // usage history (e.g. freshly bootstrapped/never-used). The fixed
+        // writer (`tokens_pool::monitor::build_monitor_accounts`) now emits
+        // `name|available` for such accounts, so the daemon's healthy count
+        // must include them rather than silently dropping the row as
+        // malformed (a no-`|` row) or counting it unhealthy.
+        let tmp = tempfile::tempdir().unwrap();
+        write_ranking_at(tmp.path(), "agent4-2amlogic|exhausted|0.18\nagent6-2amlogic|available\n");
+        let snap = read_ranking_at(tmp.path()).unwrap();
+        assert_eq!(snap.total, 2);
+        assert_eq!(
+            snap.available, 1,
+            "the never-used account's `available` row must count healthy"
+        );
+        assert_eq!(snap.exhausted, 1);
+    }
+
+    #[test]
     fn read_ranking_at_parses_three_field_format() {
         // #4243/#4344 primary bug: writers emit `name|status|5h_util` whenever
         // 5h utilization is known (which on the live host is always). The

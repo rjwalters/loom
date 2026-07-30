@@ -240,14 +240,20 @@ pub fn build_monitor_accounts(
         }
     }
 
-    // Represent manifest accounts the monitor did not mention (unknown status,
-    // sorts last) so the selector still sees them.
+    // Represent manifest accounts the monitor did not mention (no usage rows
+    // yet — e.g. freshly bootstrapped/never-used accounts) as `available` so
+    // they are dispatchable: the table display, the written `.ranking` row,
+    // and the daemon's healthy-count reader all agree on this single status
+    // (issue #4645 — the empty-status writer bug that made fresh capacity
+    // dispatch-invisible). Their unknown utilization sorts them after
+    // known-utilization `available` accounts via `UTIL_SENTINEL`, but they
+    // still rank ahead of `rate_limited`/`exhausted` accounts.
     for (_, name) in &email_to_name {
         if !matched.contains(name) {
             matched.push(name.clone());
             accounts.push(MonitorAccount {
                 name: name.clone(),
-                status: String::new(),
+                status: "available".to_string(),
                 util_7d: None,
                 util_5h: None,
             });
@@ -323,17 +329,15 @@ pub fn run_monitor_check(
 ) -> Option<ProbeReport> {
     let accounts = build_monitor_accounts(tokens_dir, None, None)?;
 
-    // The in-memory report uses "available" for an empty status; the WRITER
-    // uses the raw status (empty stays empty) — matches check._run_monitor_check.
+    // Single source of truth: `build_monitor_accounts` already normalizes
+    // monitor-unmentioned accounts to `available` (issue #4645), so the
+    // in-memory report (used for the CLI table) and the `.ranking` writer
+    // below both serialize the exact same status — they cannot disagree.
     let results: Vec<AccountResult> = accounts
         .iter()
         .map(|a| AccountResult {
             name: a.name.clone(),
-            status: if a.status.is_empty() {
-                "available".to_string()
-            } else {
-                a.status.clone()
-            },
+            status: a.status.clone(),
             s5h_utilization: a.util_5h,
             s7d_utilization: a.util_7d,
             s7d_reset: None,
@@ -454,9 +458,11 @@ mod tests {
             ]),
         );
         let accounts = build_monitor_accounts(&tokens_dir, Some(&monitor_dir), Some(now)).unwrap();
-        // acct-z (unmentioned, empty status -> rank 99) sorts last.
+        // acct-z (unmentioned) is normalized to "available" (issue #4645) but
+        // its unknown utilization sorts it after acct-a's known 0.50 within
+        // the same `available` rank bucket.
         assert_eq!(accounts.last().unwrap().name, "acct-z");
-        assert_eq!(accounts.last().unwrap().status, "");
+        assert_eq!(accounts.last().unwrap().status, "available");
     }
 
     #[test]
@@ -505,7 +511,11 @@ mod tests {
     }
 
     #[test]
-    fn format_ranking_lines_manifest_only_has_empty_status() {
+    fn format_ranking_lines_passes_through_whatever_status_it_is_given() {
+        // `format_ranking_lines` is a pure formatter — it does not normalize an
+        // empty status. `build_monitor_accounts` is the seam responsible for
+        // never handing it one (issue #4645); this test documents the
+        // formatter's own (unopinionated) behavior in isolation.
         let accounts = vec![MonitorAccount {
             name: "acct-z".into(),
             status: String::new(),
@@ -537,7 +547,13 @@ mod tests {
     }
 
     #[test]
-    fn run_monitor_check_writes_raw_status_but_report_defaults_available() {
+    fn run_monitor_check_writes_available_for_unmentioned_manifest_account() {
+        // Regression test for issue #4645: a manifest account the monitor DB
+        // never mentions (e.g. freshly bootstrapped/never-used) must serialize
+        // as a parseable `name|available` row — never a malformed `name|` row
+        // — and the in-memory report (CLI table) must agree with what gets
+        // written, since both come from the same `build_monitor_accounts`
+        // output.
         let tmp = tempfile::tempdir().unwrap();
         let tokens_dir = tmp.path().join("tokens");
         let monitor_dir = tmp.path().join("monitor");
@@ -556,14 +572,21 @@ mod tests {
         std::env::remove_var(CLAUDE_MONITOR_DIR_VAR);
 
         let report = report.unwrap();
-        // In-memory report: acct-z's empty status becomes "available".
+        // In-memory report (table display): acct-z is "available".
         let z = report.accounts.iter().find(|a| a.name == "acct-z").unwrap();
         assert_eq!(z.status, "available");
 
-        // Written .ranking: acct-z keeps its RAW empty status.
+        // Written .ranking: acct-z is ALSO "available" — a parseable row, not
+        // a `name|` malformed one. Table and writer agree (single source).
         let ranking = fs::read_to_string(tokens_dir.join(".ranking")).unwrap();
-        assert!(ranking.contains("acct-z|\n"));
+        assert!(!ranking.contains("acct-z|\n"), "malformed empty-status row must not be written");
+        assert!(ranking.contains("acct-z|available\n"));
         assert!(ranking.contains("acct-a|available\n"));
+
+        // Capacity's healthy-count reader must count the never-used account.
+        let snap = crate::capacity::read_ranking_at(&tokens_dir).unwrap();
+        assert_eq!(snap.total, 2);
+        assert_eq!(snap.available, 2);
     }
 
     #[test]
