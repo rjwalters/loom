@@ -380,6 +380,22 @@ set -e
 assert_eq "78" "$noval_rc" "-p with no value exits 78 (EX_CONFIG)"
 assert_contains "requires a value" "$noval_out" "-p with no value says so"
 
+set +e
+noval_model_out="$(env LOOM_SWEEP_NICE=0 LOOM_CODEX_NO_EXEC=1 LOOM_SPAWN_NO_EXPORT=1 \
+    bash "$SPAWN_CODEX" -p x -m 2>&1)"
+noval_model_rc=$?
+set -e
+assert_eq "78" "$noval_model_rc" "-m with no value exits 78 (EX_CONFIG)"
+assert_contains "requires a value" "$noval_model_out" "-m with no value says so"
+
+set +e
+noval_sandbox_out="$(env LOOM_SWEEP_NICE=0 LOOM_CODEX_NO_EXEC=1 LOOM_SPAWN_NO_EXPORT=1 \
+    bash "$SPAWN_CODEX" -p x -s 2>&1)"
+noval_sandbox_rc=$?
+set -e
+assert_eq "78" "$noval_sandbox_rc" "-s with no value exits 78 (EX_CONFIG)"
+assert_contains "requires a value" "$noval_sandbox_out" "-s with no value says so"
+
 # ============================================================
 # Section 6: CODEX_HOME profile selection (auth)
 # ============================================================
