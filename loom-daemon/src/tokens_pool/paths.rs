@@ -45,7 +45,26 @@ pub fn per_repo_tokens_dir(workspace: &Path) -> PathBuf {
 /// Resolution precedence (highest first):
 ///   1. `LOOM_SHARED_TOKENS_DIR` env var — non-empty names the dir (`~`
 ///      expanded); explicitly empty disables the shared fallback.
-///   2. Default: `~/.loom/tokens`.
+///   2. Default: `~/.loom/tokens` — **except under `cfg(test)`** (see below).
+///
+/// # Why the default is refused under `cfg(test)` (issue #4657)
+///
+/// `LOOM_SHARED_TOKENS_DIR` is a process-global env var, and every `#[test]`
+/// in this crate's `src/` links into one multi-threaded test binary. Several
+/// modules (`tokens.rs`, `ipc.rs`, `capacity.rs`, `tokens_pool/bad_tokens.rs`,
+/// this module) `set_var`/`remove_var` it — `#[serial]` only serializes
+/// serial-tagged tests against *each other*, so a transient window always
+/// exists where a concurrent, non-serial (or differently-keyed) test observes
+/// the var absent. In that window this function used to silently fall back to
+/// the *real* `~/.loom/tokens`, and a test workspace with no per-repo pool
+/// (e.g. `mark_bad`'s dir-missing test) would resolve straight to the
+/// operator's live machine-level pool and write test fixtures into it
+/// (confirmed: `agent-1`/`agent-10` fixture lines observed in a live
+/// `~/.loom/tokens/.bad_tokens`). Per-test `set_var("")` guards cannot close
+/// this class — the race is in *other* tests' windows, not this one's own
+/// call. Refusing the default under `cfg(test)` closes it structurally: tests
+/// that want to exercise the real fallback behavior must opt in explicitly via
+/// `LOOM_SHARED_TOKENS_DIR=<tmp path>`, same as they already do today.
 #[must_use]
 pub fn shared_tokens_dir() -> Option<PathBuf> {
     match std::env::var(SHARED_TOKENS_DIR_ENV) {
@@ -57,6 +76,9 @@ pub fn shared_tokens_dir() -> Option<PathBuf> {
                 Some(expand_tilde(trimmed))
             }
         }
+        #[cfg(test)]
+        Err(_) => None,
+        #[cfg(not(test))]
         Err(_) => dirs::home_dir().map(|h| h.join(".loom").join("tokens")),
     }
 }
@@ -250,6 +272,49 @@ mod tests {
         std::env::set_var(SHARED_TOKENS_DIR_ENV, "/tmp/loom-shared-xyz");
         assert_eq!(shared_tokens_dir(), Some(PathBuf::from("/tmp/loom-shared-xyz")));
         std::env::remove_var(SHARED_TOKENS_DIR_ENV);
+    }
+
+    /// Regression test for #4657: a populated, `HOME`-overridden fake
+    /// `~/.loom/tokens` (mimicking a real operator machine's live pool) must
+    /// be byte-identical before and after exercising `shared_tokens_dir()`
+    /// and `mark_bad()` with `LOOM_SHARED_TOKENS_DIR` unset — the exact
+    /// combination (unset env var + real-looking home pool) that used to
+    /// silently fall back to the default `~/.loom/tokens` and let test
+    /// fixtures leak into it.
+    #[test]
+    #[serial]
+    fn shared_tokens_dir_never_touches_a_populated_fake_home_under_test() {
+        let fake_home = tempfile::tempdir().unwrap();
+        let fake_shared_pool = fake_home.path().join(".loom").join("tokens");
+        write_pool(&fake_shared_pool, &["real-account.token"]);
+        let bad_tokens_file = fake_shared_pool.join(".bad_tokens");
+        fs::write(&bad_tokens_file, "2026-01-01T00:00:00Z real-account auth\n").unwrap();
+        let before = fs::read(&bad_tokens_file).unwrap();
+
+        let prev_home = std::env::var_os("HOME");
+        std::env::remove_var(SHARED_TOKENS_DIR_ENV);
+        std::env::set_var("HOME", fake_home.path());
+
+        // The env var is unset — under `cfg(test)` this must NOT fall back to
+        // `~/.loom/tokens` (fake or real), unlike production behavior.
+        assert_eq!(shared_tokens_dir(), None);
+
+        // A workspace with no per-repo pool must fail closed (dir missing)
+        // rather than silently resolving to the fake home's shared pool.
+        let workspace = tempfile::tempdir().unwrap();
+        let err = crate::tokens_pool::bad_tokens::mark_bad(workspace.path(), "agent-1", "x");
+        assert!(err.is_err(), "mark_bad must fail closed, not fall back to a live pool");
+
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+
+        let after = fs::read(&bad_tokens_file).unwrap();
+        assert_eq!(
+            before, after,
+            "the fake ~/.loom/tokens/.bad_tokens must be byte-identical before/after"
+        );
     }
 
     // =====================================================================

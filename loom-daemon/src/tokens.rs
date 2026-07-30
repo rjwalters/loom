@@ -42,6 +42,15 @@ const SHARED_TOKENS_DIR_ENV: &str = "LOOM_SHARED_TOKENS_DIR";
 /// Kept in lock-step with the Python resolver (`loom_tools.tokens.paths.
 /// shared_tokens_dir`) so the daemon's concurrency accounting and the
 /// spawn-time selector agree on where the shared pool lives.
+///
+/// Under `cfg(test)` the "unset -> `~/.loom/tokens`" default is refused (see
+/// the twin resolver's doc comment at
+/// [`crate::tokens_pool::paths::shared_tokens_dir`] for the full rationale,
+/// issue #4657): this function reads the same process-global
+/// `LOOM_SHARED_TOKENS_DIR` env var that module's tests (and `ipc.rs`,
+/// `capacity.rs`, `tokens_pool/bad_tokens.rs`) mutate in the same
+/// multi-threaded test binary, so it is equally exposed to the transient
+/// unset window that leaked test fixtures into the real pool.
 #[must_use]
 fn shared_tokens_dir() -> Option<PathBuf> {
     match std::env::var(SHARED_TOKENS_DIR_ENV) {
@@ -53,6 +62,9 @@ fn shared_tokens_dir() -> Option<PathBuf> {
                 Some(PathBuf::from(trimmed))
             }
         }
+        #[cfg(test)]
+        Err(_) => None,
+        #[cfg(not(test))]
         Err(_) => dirs::home_dir().map(|h| h.join(".loom").join("tokens")),
     }
 }
