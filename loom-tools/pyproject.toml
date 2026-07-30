@@ -2,97 +2,56 @@
 requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
 
+# ---------------------------------------------------------------------------
+# `loom-search` carve-out (epic #4081 Phase 4, #4557)
+#
+# The Python `loom-tools` package was retired in epic #4081 Phase 4: everything
+# it used to provide is now native in the Rust `loom-daemon` binary (tokens,
+# clean, forge, claim, checkpoint, agent-spawn/agent-wait, status/stats,
+# resolve-model, validate-phase, …) or in `defaults/scripts/*.sh`.
+#
+# ONE module was carved out of that deletion: `loom_tools.semantic_search`
+# (console script `loom-search`), which backs the opt-in, off-by-default
+# semantic-search feature documented in `defaults/docs/semantic-search.md`. It
+# has no native Rust port, and no epic #4081 phase ever decided whether to port
+# or retire it — so it survives here, unchanged, until that product decision is
+# made. See `docs/adr/0013-loom-tools-python-retirement.md`.
+#
+# Nothing on the core Loom daemon path imports this package. A fresh machine
+# provision needs no Python at all; installing this package is only required to
+# use `loom-search`.
+#
+# The three surviving `loom_tools/common/` modules (`config.py`,
+# `config_resolver.py`, `repo.py`) are here solely because
+# `semantic_search.py` imports them. `config_resolver.py` additionally remains
+# one of the three implementations bound by the #4039 cross-language
+# conformance fixture (`tests/fixtures/config_resolver/`, also consumed by
+# `loom-daemon/src/config_resolver.rs` and
+# `defaults/scripts/tests/test-config-resolver.sh`) — do not delete that
+# fixture tree with this package.
+# ---------------------------------------------------------------------------
+
 [project]
 name = "loom-tools"
 version = "0.1.0"
-description = "Shared Python utilities for Loom orchestration scripts"
+description = "loom-search: opt-in local semantic search over Loom sweep summaries and PR history"
 requires-python = ">=3.10"
 license = "MIT"
-dependencies = [
-    "rich>=13.0",
-    "requests>=2.28",
-]
+# Zero runtime dependencies: `semantic_search.py` is stdlib-only (sqlite3 FTS5
+# + subprocess `gh`). The former `rich`/`requests` dependencies belonged to the
+# modules retired in epic #4081.
+dependencies = []
 
 [project.scripts]
-# loom-shepherd removed in Phase 3.3 (#3400) — shepherd brain deleted
-# loom-shepherd = "loom_tools.shepherd.cli:main"
-# loom-agent-wait removed in epic #4081 Phase 3 family 4 (#4415) — agent_wait.py
-# deleted; ported to native `loom-daemon agent-wait` (same flags, `--json` shape,
-# and 0/1/2 exit-code contract); agent-wait.sh repointed.
-# loom-agent-wait = "loom_tools.agent_wait:main"
-# loom-daemon-diagnostic removed in epic #4081 phase 3 (#4274) — daemon_diagnostic.py
-# deleted; the native `loom-daemon status` reports daemon/registry health.
-# loom-daemon-loop removed in Phase 3.2 (#3399) — daemon.py (V1) deleted
-# loom-daemon-loop = "loom_tools.daemon:main"
-# loom-stuck-detection removed in epic #4081 phase 3 (#4274) — stuck_detection.py
-# deleted (safe no-op since v0.11.0); native surface is `loom-daemon status` + the
-# sweep registry (mcp__loom__list_sweeps).
-# loom-claim ported to `loom-daemon claim` (epic #4081 phase 3 family 5, #4275);
-# claim.py deleted. The `loom-claim` NAME survives as a PATH shim installed next
-# to the daemon binary by scripts/install/provision-daemon.sh, so
-# builder-worktree.md's `loom-claim claim <issue> <agent-id>` calls (and their
-# `command -v loom-claim` guard) keep working with zero pip installs.
-# loom-clean removed in epic #4081 Phase 3 family 2 (#4272) — ported to
-# native `loom-daemon clean` (loom-tools/src/loom_tools/clean.py deleted)
-# loom-clean = "loom_tools.clean:main"
-# loom-milestone removed in Phase 3.3 (#3400) — milestones.py deleted with shepherd brain
-# loom-worktree removed in epic #4081 Phase 3 family 2 (#4272) — pure
-# argparse-over-bash glue with zero execution-path callers; deleted outright
-# (worktree.py never delegated to from defaults/scripts/worktree.sh)
-# loom-worktree = "loom_tools.worktree:main"
-# loom-recover-orphans removed in epic #4081 Phase 3 family 2 (#4272) —
-# ported to native `loom-daemon recover-orphans`
-# (loom-tools/src/loom_tools/orphan_recovery.py deleted)
-# loom-recover-orphans = "loom_tools.orphan_recovery:main"
-# loom-validate-state removed in Phase 3.2 (#3399) — validate_state.py deleted
-# loom-validate-state = "loom_tools.validate_state:main"
-# loom-status removed in epic #4081 phase 3 (#4274) — status.py deleted; the
-# `loom status` verb execs the native bash defaults/scripts/cli/loom-status.sh, and
-# `loom-daemon status [--json|--pipeline]` is the native pipeline/health surface.
-# loom-cleanup removed in epic #4081 Phase 3 family 2 (#4272) — ported to
-# native `loom-daemon cleanup logs` (loom-tools/src/loom_tools/cleanup.py deleted)
-# loom-cleanup = "loom_tools.cleanup:main"
-# loom-agent-metrics removed in epic #4081 phase 3 (#4274) — agent_metrics.py
-# deleted; ported to native `loom-daemon stats <command>` (summary/effectiveness/
-# costs/velocity, incl. --period and --by-model parity); agent-metrics.sh
-# repointed.
-# loom-agent-metrics = "loom_tools.agent_metrics:main"
-# loom-validate-phase ported to `loom-daemon validate-phase` (#4275);
-# validate_phase.py deleted. `defaults/scripts/validate-phase.sh` repointed.
-# loom-agent-spawn removed in epic #4081 Phase 3 family 4 (#4415) — agent_spawn.py
-# deleted; ported to native `loom-daemon agent-spawn` (tmux lifecycle, OAuth
-# injection via the native token pool, CLAUDE_CONFIG_DIR isolation reusing
-# terminal.rs's `claude_config`, bypass-modal auto-accept, stuck detection);
-# agent-spawn.sh repointed. `common/tmux_session.py` and `common/claude_config.py`
-# were deleted with it (no other consumers).
-# loom-agent-spawn = "loom_tools.agent_spawn:main"
-# loom-health-monitor removed in epic #4081 phase 3 (#4274) — health_monitor.py
-# deleted (safe no-op since v0.11.0); native surface is loom-daemon/src/health_monitor.rs
-# + `loom-daemon status`.
-# loom-snapshot removed in Phase 3.2 (#3399) — snapshot.py (daemon brain) deleted.
-# forge_snapshot.py removed in epic #4081 phase 3 (#4274); pipeline data is native
-# via loom-daemon/src/pipeline_snapshot.rs (`loom-daemon status --pipeline`).
-# loom-checkpoint ported to `loom-daemon checkpoint` (epic #4081 phase 3 family
-# 5, #4275); checkpoints.py deleted. `defaults/scripts/checkpoint.sh` repointed.
-# loom-daemon removed in Phase 3.2 (#3399) — daemon_v2/ brain deleted
-# loom-daemon = "loom_tools.daemon_v2.cli:main"
-# loom-test-failure-analysis removed in Phase 3.2 (#3399) — test_failure_analysis.py retiring
-# loom-test-failure-analysis = "loom_tools.test_failure_analysis:main"
-# loom-usage ported to `loom-daemon usage` (#4275); common/usage.py deleted.
-# `defaults/scripts/check-usage.sh` repointed.
-# loom-backlog removed in #4275 — backlog.py had no shell caller, no console-script
-# consumer and no test file, only historical doc references, so it was deleted
-# rather than ported.
-# loom-forge / loom-auto-merge ported to the native `loom-daemon forge`
-# subcommand group (epic #4081 Phase 3, family 3). The shared client stack in
-# loom_tools/common/{forge,github,gitea,cached_forge}.py is preserved — it still
-# backs backlog/clean/daemon_cleanup/daemon_diagnostic/forge_snapshot/
-# orphan_recovery/stuck_detection.
-loom-tokens = "loom_tools.tokens.cli:main"
-# loom-resolve-model ported to `loom-daemon resolve-model` (#4275);
-# model_tiers.py deleted. `defaults/scripts/resolve-model.sh` +
-# `resolve-tier-model.sh` repointed. The surviving alias-normalization
-# implementation is loom-daemon/src/sweep_registry.rs::read_model_aliases.
+# `loom-search` is the ONLY surviving console script. Every other entry point
+# this package used to ship was ported to the native `loom-daemon` binary or
+# deleted outright over epic #4081 Phases 1-3; the full removed-entry-point map
+# lives in `docs/adr/0013-loom-tools-python-retirement.md` (and, for the
+# pre-#4081 shepherd/daemon removals, ADR-0009 +
+# `docs/migration/v0.10.0-shepherd-deprecation.md`).
+#
+# In particular `loom-tokens` is gone: use `loom-daemon tokens <subcommand>`
+# (bootstrap / check / unblock / …).
 loom-search = "loom_tools.semantic_search:main"
 
 [project.optional-dependencies]
@@ -108,9 +67,7 @@ where = ["src"]
 [dependency-groups]
 dev = [
     "pytest>=9.0",
-    "pytest-asyncio>=0.24",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-asyncio_mode = "auto"

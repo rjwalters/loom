@@ -691,6 +691,13 @@ EOF
 assert_allow "Allow gh pr comment with quoted prose containing @mention" \
     'gh pr comment 123 --body "cc @reviewer please take another look"'
 
+# Regression (#4577): an @mention immediately after the opening quote (no
+# leading word) is not path-shaped and must not be caught by
+# GH_COMMENT_BODY_AT_PATTERN — this exact shape is doctor.md's own
+# documented "Can't Understand Feedback" example.
+assert_allow "Allow gh pr comment with leading @mention (no leading word before @)" \
+    'gh pr comment 123 --body "@reviewer Could you clarify what you mean by X?"'
+
 assert_allow "Allow gh pr comment --body-file (distinct flag, actually reads the file)" \
     "gh pr comment 123 --body-file /tmp/review.md"
 

@@ -5,6 +5,44 @@ merged-PR history. Filed as the codecast-evaluation borrow-list item 2
 (`docs/research/codecast-evaluation.md`, Question 4) — issue #4339. Tier B
 (pluggable local vector embeddings) is a follow-up, #4370.
 
+> **`loom-search` is the last Python in Loom.** Epic #4081 Phase 4 (#4557)
+> retired the `loom-tools` Python package: the orchestration layer is the native
+> Rust `loom-daemon` binary plus bash, and **a fresh machine provision installs
+> no Python at all**. `loom-search` was deliberately carved out of that deletion
+> rather than removed silently — it has no native port, and no epic phase ever
+> decided whether to port or retire it. Consequences:
+>
+> - `loom-tools/` still exists, but now contains only `semantic_search.py`,
+>   `embedders.py`, and the three `loom_tools/common/` helpers they import.
+> - Using this feature requires **one opt-in Python install step** (below).
+>   Nothing else in Loom does.
+> - Whether to port `loom-search` to Rust or retire the feature is an open
+>   product decision tracked in its own follow-up issue; see
+>   [ADR-0013](../../docs/adr/0013-loom-tools-python-retirement.md).
+
+## Install
+
+`loom-search` is not installed by `loom install` / `loom update`. Install it
+explicitly, from the Loom checkout:
+
+```bash
+cd loom-tools
+
+# Tier A only (BM25 ranking via SQLite FTS5) — zero third-party dependencies.
+pip install -e .
+
+# Tier B as well (optional local vector embeddings via fastembed).
+pip install -e '.[search]'
+```
+
+Both forms put a `loom-search` executable on `PATH`. Requires Python >= 3.10.
+
+> Do **not** run `pip install -e` from inside an issue worktree — a
+> `PreToolUse` guard blocks it, because editable installs clobber the global
+> `.pth` for parallel builders (#2495) and leave frozen console scripts on PATH
+> that shadow later installs (incident #4079, the very failure that motivated
+> epic #4081). Install from the main checkout.
+
 ## Why
 
 Loom has no memory across past sweeps: `.loom/logs/sweep-issue-*.log` and
@@ -94,7 +132,7 @@ precedence as `search.enabled`:
 | Provider | Behavior |
 |---|---|
 | `"none"` (default) | No embeddings. Ranking is exactly the Tier A BM25 path — byte-identical to before #4370. |
-| `"local"` | A small local ONNX model via the optional [`fastembed`](https://github.com/qdrant/fastembed) package, gated behind the `loom-tools[search]` extra (`pip install 'loom-tools[search]'`). CPU-only; never a default/required dependency. |
+| `"local"` | A small local ONNX model via the optional [`fastembed`](https://github.com/qdrant/fastembed) package, gated behind the `search` extra (`cd loom-tools && pip install -e '.[search]'` — see [Install](#install)). CPU-only; never a default/required dependency. |
 
 A remote-API provider is **explicitly out of scope** for #4370 — file a
 follow-up `loom:triage` issue if one is needed.

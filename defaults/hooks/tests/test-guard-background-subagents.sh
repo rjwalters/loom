@@ -94,6 +94,18 @@ BG_ACK_RESOLVED='{"type":"user","message":{"role":"user","content":[{"type":"too
 BG_NOTIFICATION_QUEUEOP='{"type":"queue-operation","operation":"enqueue","content":"<task-notification>\n<task-id>bgtest02</task-id>\n<tool-use-id>toolu_bg02</tool-use-id>\n<output-file>/tmp/bgtest02.output</output-file>\n<status>completed</status>\n<summary>Background command completed (exit code 0)</summary>\n</task-notification>"}'
 BG_NOTIFICATION_ATTACHMENT='{"type":"attachment","attachment":{"type":"queued_command","commandMode":"task-notification","prompt":"<task-notification>\n<task-id>bgtest02</task-id>\n<tool-use-id>toolu_bg02</tool-use-id>\n<output-file>/tmp/bgtest02.output</output-file>\n<status>completed</status>\n<summary>Background command completed (exit code 0)</summary>\n</task-notification>"}}'
 
+# Armed Monitor / ScheduleWakeup (issue #4462 — the transport-failure backoff
+# strand) fixtures. Arming a Monitor returns an IMMEDIATE tool_result ack
+# ("timer armed") that is NOT the fire event; the real fire arrives later as a
+# <task-notification> whose <tool-use-id> echoes the dispatch id — the same
+# resolution shape as a background Bash task.
+MON_USE_UNRESOLVED='{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_mon01","name":"Monitor","input":{"command":"sleep 90 && echo backoff-complete"}}]}}'
+MON_ACK_UNRESOLVED='{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_mon01","content":"Monitor armed. You will be notified when it fires."}]}}'
+MON_USE_RESOLVED='{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_mon02","name":"Monitor","input":{"command":"sleep 1 && echo done"}}]}}'
+MON_NOTIFICATION_QUEUEOP='{"type":"queue-operation","operation":"enqueue","content":"<task-notification>\n<task-id>montest02</task-id>\n<tool-use-id>toolu_mon02</tool-use-id>\n<status>fired</status>\n<summary>Monitor condition met</summary>\n</task-notification>"}'
+# ScheduleWakeup is the sibling tool name the same detector must also catch.
+WAKE_USE_UNRESOLVED='{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_wake01","name":"ScheduleWakeup","input":{"seconds":90}}]}}'
+
 # Build stdin JSON. Args: <transcript_path> <stop_hook_active>
 make_input() {
     local transcript="$1" active="${2:-false}"
@@ -237,6 +249,47 @@ if [[ "$reason_bg" == *"background Bash"* && "$reason_bg" == *"#4389"* ]]; then
     pass "(k) block reason explains the background-Bash hazard"
 else
     fail "(k) block reason explains the background-Bash hazard (got: $reason_bg)"
+fi
+
+# --- armed Monitor / ScheduleWakeup detection (issue #4462) -----------------
+
+# (l) armed-but-unfired Monitor (dispatch + immediate ack only, no later
+# task-notification) -> block once. This is the exact #4462 transport-failure
+# strand: a Monitor {command: "sleep 90 && …"} armed and then the turn ended.
+T7="$TMPROOT/transcript-monitor-armed.jsonl"
+write_transcript "$T7" "$MON_USE_UNRESOLVED" "$MON_ACK_UNRESOLVED"
+result=$(run_hook "$T7" false)
+assert_block "(l) armed-but-unfired Monitor -> block" "$result"
+
+# (m) fired Monitor (task-notification echoing the dispatch tool-use-id) ->
+# allow. The fire event resolves the armed timer exactly like a bg-Bash
+# completion notification.
+T8="$TMPROOT/transcript-monitor-fired.jsonl"
+write_transcript "$T8" "$MON_USE_RESOLVED" "$MON_NOTIFICATION_QUEUEOP"
+result=$(run_hook "$T8" false)
+assert_allow "(m) fired Monitor (task-notification) -> allow" "$result"
+
+# (n) armed ScheduleWakeup (sibling tool name, no fire event) -> block. The
+# same detector must catch both tool names.
+T9="$TMPROOT/transcript-wakeup-armed.jsonl"
+write_transcript "$T9" "$WAKE_USE_UNRESOLVED"
+result=$(run_hook "$T9" false)
+assert_block "(n) armed ScheduleWakeup -> block" "$result"
+
+# (o) armed Monitor + stop_hook_active=true -> allow unconditionally (loop
+# guard applies identically to the Monitor detector)
+result=$(run_hook "$T7" true)
+assert_allow "(o) armed Monitor + stop_hook_active=true -> allow (loop guard)" "$result"
+
+# (p) block reason for an armed Monitor mentions the #4462 transport-backoff
+# hazard (not just the Task-subagent / background-Bash wording)
+raw_mon=$(run_hook "$T7" false)
+out_mon="${raw_mon#*|}"
+reason_mon=$(echo "$out_mon" | jq -r '.reason // empty' 2>/dev/null || true)
+if [[ "$reason_mon" == *"Monitor"* && "$reason_mon" == *"#4462"* ]]; then
+    pass "(p) block reason explains the armed-Monitor #4462 hazard"
+else
+    fail "(p) block reason explains the armed-Monitor #4462 hazard (got: $reason_mon)"
 fi
 
 # --- block reason mentions the #3822/#4257 hazard ---------------------------

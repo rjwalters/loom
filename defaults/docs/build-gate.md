@@ -113,7 +113,8 @@ The gate is **opt-in**. Repos with no `buildGate` block in `.loom/config.json` s
 
 Loom's own `.loom/config.json` points `buildGate.command` at a committed
 wrapper script rather than a single-language one-liner, because this repo is
-polyglot (Rust + Python + bash) and no single build tool covers it:
+polyglot (Rust + bash, plus an opt-in Python carve-out) and no single build tool
+covers it:
 
 ```json
 {
@@ -128,20 +129,28 @@ polyglot (Rust + Python + bash) and no single build tool covers it:
 
 The wrapper lives at [`defaults/scripts/build-gate.sh`](../scripts/build-gate.sh)
 (the installer-template source of truth; `.loom/scripts/build-gate.sh` resolves
-to it via the `.loom/scripts -> ../defaults/scripts` symlink). It runs three
+to it via the `.loom/scripts -> ../defaults/scripts` symlink). It runs these
 stages in order under `set -euo pipefail`, aborting on the first non-zero exit:
 
 1. `cargo test --workspace --lib --bins` — the Rust crates' **unit tests**
    (`loom-daemon`, `loom-api`). The integration test **targets** under
    `loom-daemon/tests/` are deliberately excluded here — see "Local gate vs.
    CI" below.
-2. `uv run pytest tests/ -q` in `loom-tools/`, scoped with
-   `--ignore=tests/integration` (live-network/credentials e2e). `uv run` is
-   used so `loom_tools` is importable from the project venv. (A second
-   `--ignore` for `tests/tokens/test_agent_spawn_integration.py` — a slow
-   real-time modal-poll file — was dropped in #4415 when `agent_spawn.py` went
-   native; its coverage now lives in `cargo test -p loom-daemon`.)
-3. `bash scripts/test-installer.sh` — the 131-case bash installer suite.
+2. `bash scripts/test-installer.sh` — the 131-case bash installer suite.
+3. **Best-effort only:** `python3 -m pytest tests/ -q` in `loom-tools/` with
+   `PYTHONPATH=src`, covering the opt-in
+   [`loom-search`](semantic-search.md) carve-out. **Skipped** — with a printed
+   note, not a failure — unless the host already has a `python3` that can
+   `import pytest`; it never runs `pip install` or materializes a `uv` venv.
+   Opt out explicitly with `LOOM_BUILD_GATE_SKIP_SEARCH=1`.
+
+**The gate no longer requires a Python toolchain (epic #4081 Phase 4, #4557).**
+Stage 2 used to be `cd loom-tools && uv run pytest tests/ -q
+--ignore=tests/integration` over the whole `loom_tools` package. That package was
+retired — everything it did is native in `loom-daemon` now — so that stage would
+fail against a deleted path. Only the `loom-search` module survived the deletion,
+and it is off the core daemon path, so its coverage moved to the non-blocking
+stage 3 above. See [ADR-0013](../../docs/adr/0013-loom-tools-python-retirement.md).
 
 **`mcp-loom` (TypeScript) is intentionally excluded** from the gate: it needs
 `npm install`/`npm ci` in a fresh worktree (no guaranteed warm `node_modules`),
@@ -300,17 +309,25 @@ stage set the wrapper runs:
 
 | Tier | `LOOM_BUILD_GATE_TIER` | Stages | Cost |
 |------|------------------------|--------|------|
-| **full** (DEFAULT) | unset / `full` | `cargo test --lib --bins` + pytest + installer suite | minutes, cold |
-| **fast** | `fast` | `cargo build --workspace --lib --bins` (compile) + a `loom_tools` import smoke | a few minutes cold, no test execution |
+| **full** (DEFAULT) | unset / `full` | `cargo test --lib --bins` + installer suite (+ best-effort `loom-search` pytest) | minutes, cold |
+| **fast** | `fast` | `cargo build --workspace --lib --bins` (compile) + a `loom-daemon --version` startup smoke | a few minutes cold, no test execution |
 
 The default is unchanged when the variable is absent, so **CI parity, manual
 invocations, and the per-builder post-builder gate all behave exactly as
 before**. The fast tier verifies the compile/startup breakage class (#3647
-step-8 — a `cargo build --workspace` catch) plus that the Python package still
-imports.
+step-8 — a `cargo build --workspace` catch) plus that the binary it just built
+actually starts.
+
+The fast tier's smoke step was `cd loom-tools && uv run python -c "import
+loom_tools"` until epic #4081 Phase 4 (#4557) retired the Python package; it is
+now `cargo run --package loom-daemon --bin loom-daemon -- --version`, which
+catches the same "compiles but won't start" class (a panic in a static
+initializer, a broken clap command tree, a missing dynamic dependency) with no
+Python involved. `--version` touches no repo state, no forge, and no daemon
+socket.
 
 > **A fast-tier GREEN is NOT equivalent to a full-suite GREEN.** It does **not**
-> run the Rust unit tests, the pytest suite, or the installer suite. `loom-daemon
+> run the Rust unit tests or the installer suite. `loom-daemon
 > status` labels a fast-tier verdict (`clear(fast)` / `… [fast tier — compile+smoke
 > only, NOT a full-suite green]`) precisely so the two are never confused.
 

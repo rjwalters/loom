@@ -372,8 +372,8 @@ pub fn advice(m: &HostMeasurements) -> String {
         },
         BindingTerm::Token => format!(
             "the token axis binds ({} healthy account(s) × per-token {} = {}) — raising \
-             maxConcurrent changes nothing; add accounts (`loom-tokens bootstrap`) or refresh the \
-             ranking (`loom-tokens check --ranking`).",
+             maxConcurrent changes nothing; add accounts (`loom-daemon tokens bootstrap`) or refresh \
+             the ranking (`loom-daemon tokens check --ranking`).",
             m.token_axis_limit,
             m.configured_per_token_concurrency.max(1),
             m.token_axis_effective()
@@ -450,8 +450,8 @@ pub fn report_human(m: &HostMeasurements) -> String {
         ));
     } else {
         out.push_str(&format!(
-            "  token pool:     no ranking — using raw pool size {} (run `loom-tokens check \
-             --ranking` for a healthy-account count)\n",
+            "  token pool:     no ranking — using raw pool size {} (run `loom-daemon tokens \
+             check --ranking` for a healthy-account count)\n",
             m.token_axis_limit
         ));
     }
@@ -662,7 +662,7 @@ mod tests {
 
     #[test]
     fn advice_points_at_tokens_or_disk_when_those_bind() {
-        assert!(advice(&token_bound_host()).contains("loom-tokens bootstrap"));
+        assert!(advice(&token_bound_host()).contains("loom-daemon tokens bootstrap"));
         assert!(advice(&disk_bound_host()).contains("LOOM_PER_WORKTREE_GB"));
         // Neither should tell the operator to raise maxConcurrent — it would do
         // nothing.

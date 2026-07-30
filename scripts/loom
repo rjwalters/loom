@@ -273,6 +273,80 @@ loom_cmd_update() {
     exec "$target" "$@"
 }
 
+# loom_restart_harvest_live_env <scripts_dir> — before loom_cmd_restart's
+# bare-exec fallback re-renders the plist/unit via start_target, harvest and
+# re-export the LIVE installed launchd plist's / systemd unit's LOOM_*/token
+# env (#4581). Mirrors the harvest-and-preserve pattern
+# loom-daemon-update.sh's perform_relaunch / perform_systemd_relaunch
+# (#4118/#4126) already apply on its equivalent refused-restart path — shared
+# via lib/daemon-env-harvest.sh (harvest_plist_env / harvest_unit_env) so both
+# call sites stay byte-for-byte identical instead of drifting.
+#
+# Without this, the fallback's bare `exec` inherited only whatever LOOM_* vars
+# happened to be exported in the INVOKING shell — a fresh terminal, a
+# different SSH session, or any wrapper that doesn't re-source the operator's
+# profile silently narrowed a rich plist down to FLAGS-OFF defaults (the
+# #4522/#4579 incident this closes).
+#
+# Best-effort by design when there is nothing to harvest: a daemon that has
+# never been installed under launchd/systemd yet (first-ever start), or one
+# running the legacy pid-file/nohup path, has no live plist/unit file — in
+# that case the invoking shell's env is legitimately the only source, exactly
+# as before, so this is a silent no-op. It is a HARD abort (exit 6) only when
+# a plist/unit file DOES exist but cannot be read back — proceeding then would
+# silently narrow a real, live autonomy config (the #4011 class), the exact
+# failure this issue closes.
+loom_restart_harvest_live_env() {
+    local scripts_dir="$1"
+    local harvest_lib="$scripts_dir/lib/daemon-env-harvest.sh"
+    if [[ ! -r "$harvest_lib" ]]; then
+        _warn "daemon-env-harvest.sh not found under $scripts_dir/lib — skipping live-env harvest (this checkout may predate #4581)."
+        return 0
+    fi
+    # shellcheck source=/dev/null
+    source "$harvest_lib"
+
+    local count=0 harvested k
+    if [[ "$(uname -s 2>/dev/null)" == "Darwin" ]]; then
+        local label plist
+        label="${LOOM_LAUNCHD_LABEL:-com.rjwalters.loom-daemon}"
+        plist="$HOME/Library/LaunchAgents/${label}.plist"
+        if [[ -f "$plist" ]]; then
+            if ! harvested="$(harvest_plist_env "$plist")"; then
+                _err "Refusing to fall back to a bare restart: could not read the live plist's EnvironmentVariables at $plist."
+                _err "Falling back now would silently narrow the autonomy flags to FLAGS-OFF defaults (#4011) — aborting."
+                exit 6
+            fi
+            local v64
+            while IFS=$'\t' read -r k v64; do
+                [[ -z "$k" ]] && continue
+                export "$k=$(printf '%s' "$v64" | base64 --decode)"
+                count=$((count + 1))
+            done <<< "$harvested"
+        fi
+    else
+        local unit unit_path
+        unit="${LOOM_SYSTEMD_UNIT:-loom-daemon.service}"
+        unit_path="$HOME/.config/systemd/user/${unit}"
+        if [[ -f "$unit_path" ]]; then
+            if ! harvested="$(harvest_unit_env "$unit_path")"; then
+                _err "Refusing to fall back to a bare restart: could not read the live unit's Environment= values at $unit_path."
+                _err "Falling back now would silently narrow the autonomy flags to FLAGS-OFF defaults (#4011) — aborting."
+                exit 6
+            fi
+            local v
+            while IFS=$'\t' read -r k v; do
+                [[ -z "$k" ]] && continue
+                export "$k=$v"
+                count=$((count + 1))
+            done <<< "$harvested"
+        fi
+    fi
+    if [[ "$count" -gt 0 ]]; then
+        echo "loom: preserved ${count} LOOM_*/token env var(s) from the live installed plist/unit across the restart fallback (#4581)."
+    fi
+}
+
 # `restart` (Gap 3, #4229): the filed scope lists start|stop|status|restart, but
 # only the first three shipped in #4157/#4208. Thin delegate mirroring
 # start/stop — same collision guard (the per-repo pool manager has no
@@ -280,7 +354,10 @@ loom_cmd_update() {
 # preferring drain-and-roll semantics: try the daemon's own supervised restart
 # IPC first (`loom-daemon restart`, #4077 — never tears down in-flight sweep
 # children, unlike a bootout), falling back to a plain stop-then-start when the
-# daemon isn't launchd-managed (or isn't running at all yet).
+# daemon isn't launchd-managed (or isn't running at all yet). The fallback
+# harvests+re-exports the live installed plist's/unit's LOOM_*/token env
+# before re-rendering (#4581, loom_restart_harvest_live_env above) instead of
+# relying on whatever the invoking shell happens to have exported.
 loom_cmd_restart() {
     loom_detect_context
     loom_collision_guard restart "$@"
@@ -312,6 +389,12 @@ loom_cmd_restart() {
         _err "loom-daemon-stop.sh failed — not starting a new binary on top of a possibly-still-running old one."
         exit 1
     fi
+    # Harvest-and-preserve (#4581): re-export the live installed plist's/unit's
+    # LOOM_*/token env BEFORE the bare exec below, so start_target's re-render
+    # does not silently narrow to whatever LOOM_* vars this shell happens to
+    # have exported. No-op when nothing is installed yet; aborts (exit 6) if a
+    # plist/unit exists but cannot be read back.
+    loom_restart_harvest_live_env "$scripts_dir"
     # `${arr[@]+…}` guard: see loom_exec_checkout_script above.
     exec "$start_target" ${passthrough[@]+"${passthrough[@]}"}
 }

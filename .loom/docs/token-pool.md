@@ -69,13 +69,13 @@ ACCOUNT_KEY_1=sk-ant-oat01-...
 ACCOUNT_TOKEN_FILE_1=user1.token
 ```
 
-Run `loom-tokens bootstrap` to materialize the pool:
+Run `loom-daemon tokens bootstrap` to materialize the pool:
 
 ```bash
-loom-tokens bootstrap            # Idempotent — only writes new/missing tokens.
-loom-tokens bootstrap --dry-run  # Preview + print the effective merged account set.
-loom-tokens bootstrap --force    # Overwrite on-disk tokens that have drifted from source.
-loom-tokens bootstrap --shared   # Provision the shared machine-level pool at ~/.loom/tokens
+loom-daemon tokens bootstrap            # Idempotent — only writes new/missing tokens.
+loom-daemon tokens bootstrap --dry-run  # Preview + print the effective merged account set.
+loom-daemon tokens bootstrap --force    # Overwrite on-disk tokens that have drifted from source.
+loom-daemon tokens bootstrap --shared   # Provision the shared machine-level pool at ~/.loom/tokens
 ```
 
 Each account becomes `.loom/tokens/<file>.token` (mode `0600`). An `index.json`
@@ -106,7 +106,7 @@ consulted only when an operator opts in via `LOOM_ACCOUNTS_ENV=<path>`
 (conventionally `~/.loom/accounts.env`) or `--home-env <path>`. This retires the
 default *location*, not the *capability*.
 
-`loom-tokens bootstrap` reads the available sources and **merges them by account
+`loom-daemon tokens bootstrap` reads the available sources and **merges them by account
 email** (`ACCOUNT_EMAIL`), with the higher-precedence source winning:
 
 - An email present **only in a lower-precedence source** is inherited into the pool.
@@ -115,7 +115,7 @@ email** (`ACCOUNT_EMAIL`), with the higher-precedence source winning:
   rotate a key or repoint the token file).
 
 To *exclude* an inherited account from one repo, pin the subset you want with
-`loom-tokens pin` — the merge only ever adds/overrides, never subtracts. The
+`loom-daemon tokens pin` — the merge only ever adds/overrides, never subtracts. The
 effective merged set (and where each account came from) is printed by `bootstrap`
 and `bootstrap --dry-run`. A repo with only a legacy `.env` and no other source
 behaves exactly as before.
@@ -131,7 +131,7 @@ accounts are re-authenticated. The two drift, and the drift is silent and total:
 401 {"type":"authentication_error","message":"OAuth access token has been revoked."}
 ```
 
-When that happens to every account at once, `loom-tokens check` reports all
+When that happens to every account at once, `loom-daemon tokens check` reports all
 accounts `blocked`, the daemon's dynamic concurrency cap collapses to
 `min(healthy 0 × per-token N, …) = 0`, and dispatch stops entirely. Crucially
 **`bootstrap --force` does not fix it** — it faithfully rewrites the same revoked
@@ -145,16 +145,16 @@ instead of by hand-comparing fingerprints. The check is read-only, warns but nev
 auto-switches sources, and is silent when no `usage.db` is present or it is
 unreadable; it prints emails and 8-char fingerprints only, never secret material.
 
-`loom-tokens import-from-monitor` reads the live store directly and is **the
+`loom-daemon tokens import-from-monitor` reads the live store directly and is **the
 standard way to populate a new host's pool** (it replaces hand-copying a pool
 between machines):
 
 ```bash
-loom-tokens import-from-monitor                  # into <repo>/.loom/tokens
-loom-tokens import-from-monitor --shared         # into the machine-level pool (#3938)
-loom-tokens import-from-monitor --force          # apply ROLLED tokens (see below)
-loom-tokens import-from-monitor --dry-run        # preview
-loom-tokens import-from-monitor --prune          # drop accounts the monitor no longer reports
+loom-daemon tokens import-from-monitor                  # into <repo>/.loom/tokens
+loom-daemon tokens import-from-monitor --shared         # into the machine-level pool (#3938)
+loom-daemon tokens import-from-monitor --force          # apply ROLLED tokens (see below)
+loom-daemon tokens import-from-monitor --dry-run        # preview
+loom-daemon tokens import-from-monitor --prune          # drop accounts the monitor no longer reports
 ```
 
 **`--force` is what applies a token roll.** Every rolled token legitimately
@@ -165,7 +165,7 @@ The command exits `2` when drift was found and not applied, so a script can dete
 recovered capacity:
 
 ```bash
-loom-tokens import-from-monitor --force && loom-tokens check --ranking
+loom-daemon tokens import-from-monitor --force && loom-daemon tokens check --ranking
 ```
 
 Behavior notes:
@@ -174,7 +174,7 @@ Behavior notes:
   claude-monitor; Loom never writes or migrates it.
 - Only `is_active = 1` rows are imported; `expires_at` is **not** used as a filter
   (observed rows carry stale timestamps while still authenticating — health comes
-  from `loom-tokens check`).
+  from `loom-daemon tokens check`).
 - Token filenames use the same derivation as `bootstrap` (`robb@2amlogic.com` →
   `robb-2amlogic.token`), so an account keeps one identity across both paths and
   re-importing overwrites in place.
@@ -185,20 +185,20 @@ Behavior notes:
   `.failure_counts`, `.allowlist`) is never touched.
 - The importer takes **claude-monitor as authoritative for pool membership**, so
   it imports every active account — including any that `accounts.env` omitted. Use
-  `loom-tokens pin` to restrict which accounts the selector may actually pick.
+  `loom-daemon tokens pin` to restrict which accounts the selector may actually pick.
 - Absent claude-monitor, an absent `usage.db`, or an older schema without
   `oauth_credentials` all exit `1` with a message naming the path tried.
 
 ## Account health probe + ranking
 
-Once bootstrapped, `loom-tokens check` probes each account for current rate-limit
+Once bootstrapped, `loom-daemon tokens check` probes each account for current rate-limit
 headers and (optionally) writes a JSON ranking that the spawn-time selector can
 consume:
 
 ```bash
-loom-tokens check                  # Probe + print human table
-loom-tokens check --ranking        # Probe + write .loom/tokens/.ranking atomically
-loom-tokens check --json           # Emit full JSON report to stdout
+loom-daemon tokens check                  # Probe + print human table
+loom-daemon tokens check --ranking        # Probe + write .loom/tokens/.ranking atomically
+loom-daemon tokens check --json           # Emit full JSON report to stdout
 loom-daemon tokens check --json    # Native Rust equivalent (issue #4108)
 ./.loom/scripts/probe-tokens.sh    # Cron-friendly wrapper for periodic invocation
 ```
@@ -208,11 +208,18 @@ It resolves a `loom-daemon` binary (`$LOOM_DAEMON_BIN` → `loom-daemon` on PATH
 build-output-relative candidates under the repo), capability-probes it with
 `tokens check --help` to detect a stale pre-#4108 binary, and `exec`s `tokens
 check "$@"` on success — the flags and exit codes above are unchanged either
-way. It falls back to `loom-tokens` on PATH (with a stderr warning) only when
-the resolved daemon binary predates the `tokens` subcommand, and exits `1` with
-an actionable message (naming `loom-daemon-start.sh` / `cargo build`) when
-neither is available. The historical `python3 -m loom_tools.tokens.cli`
-fallback tier has been removed entirely.
+way.
+
+**It has no fallback tier at all** (epic #4081 Phase 4, #4557). Both historical
+fallbacks are gone: the bare `python3 -m loom_tools.tokens.cli` tier went in
+#4080, and the `loom-tokens`-console-script-on-PATH tier went when #4557 deleted
+the Python package that shipped it. A `loom-tokens` still on PATH after that
+deletion is by definition a stale editable-install leftover (the #4079 shadowing
+incident), so dispatching to it would run frozen, months-old token logic against
+the live pool. When no capable daemon binary resolves, `probe-tokens.sh` exits
+`1` with an actionable message naming `loom-daemon-update.sh` /
+`loom-daemon-start.sh` / `cargo build` — a loud failure, never a silent
+degradation.
 
 The probe sends a minimal `POST /v1/messages` request (1 input, 1 output token)
 and parses rate-limit response headers. The header parser matches by **suffix**
@@ -270,9 +277,9 @@ token hits its weekly limit.
    The claude-monitor, repo-local, and (opt-in) home sources are **merged by
    email**, with the higher-precedence source overriding/adding. Keep any
    home-level master `0600` and outside any repo.
-2. Run `loom-tokens bootstrap` to materialize the merged set into per-account
+2. Run `loom-daemon tokens bootstrap` to materialize the merged set into per-account
    `.token` files in `.loom/tokens/` (mode 0600, parent dir 0700). See issues
-   #3234, #3695. **If claude-monitor runs on this host, prefer `loom-tokens
+   #3234, #3695. **If claude-monitor runs on this host, prefer `loom-daemon tokens
    import-from-monitor`** — it reads claude-monitor's live credential store instead
    of the `accounts.env` snapshot, so a new host needs no account file of its own
    and a token roll is picked up automatically (add `--force` to apply rolled
@@ -369,7 +376,7 @@ into — which has no pool of its own — spawn against the shared pool instead 
 hard-failing with `EX_CONFIG`. Crucially, the pool **state** files (`.bad_tokens`,
 `.failure_counts`, `.ranking`, `.allowlist`) are read/written in whichever pool was
 selected, so state is **never forked per repo** (token-capacity backpressure sees
-one truth). Provision the shared pool once per machine with `loom-tokens bootstrap
+one truth). Provision the shared pool once per machine with `loom-daemon tokens bootstrap
 --shared`. See [daemon-reference.md → Token pool provisioning for managed
 repos](daemon-reference.md#token-pool-provisioning-for-managed-repos-3938).
 
@@ -427,7 +434,7 @@ default-`--workspace` case, and the daemon's autonomous ranking-refresh loop):
 
 **Operational contract**: for step 3 to actually find tokens, a machine-level
 daemon's pool must be bootstrapped at the shared location —
-`loom-tokens bootstrap --shared` (or `import-from-monitor --shared`) — rather
+`loom-daemon tokens bootstrap --shared` (or `import-from-monitor --shared`) — rather
 than per-repo at whatever directory happens to be the daemon's own checkout.
 Registering the daemon's own checkout as a workspace
 (`loom-daemon workspace add <checkout>`) is the alternative: that makes step 2
@@ -453,27 +460,27 @@ rather than a second, parallel detection path.
 ## Hard-fail on missing pool
 
 `spawn-claude.sh` exits `78` (`EX_CONFIG`) with a message instructing the user to
-run `loom-tokens bootstrap` (or `loom-tokens bootstrap --shared` for the
+run `loom-daemon tokens bootstrap` (or `loom-daemon tokens bootstrap --shared` for the
 machine-level pool) when **neither** the per-repo nor the shared pool has usable
 tokens (absent, empty, or all bad). It does **not** silently fall back to
 keychain — that path belongs in `loom-daemon` (#3236), and only when token
 rotation has not been configured at all.
 
-## Operator CLI (`loom-tokens pin/unpin/unblock`)
+## Operator CLI (`loom-daemon tokens pin/unpin/unblock`)
 
 Operators can restrict the rotation pool to a subset of accounts (an "allowlist")
 and manually un-blacklist accounts marked bad. Auto-recovery prevents pin-induced
 lockouts.
 
 ```bash
-loom-tokens pin agent-3 agent-7   # Set allowlist to exactly these
-loom-tokens pin add agent-2       # Append (idempotent)
-loom-tokens pin remove agent-3    # Remove
-loom-tokens pin status            # Show current allowlist
-loom-tokens unpin                 # Delete allowlist (back to full pool)
+loom-daemon tokens pin agent-3 agent-7   # Set allowlist to exactly these
+loom-daemon tokens pin add agent-2       # Append (idempotent)
+loom-daemon tokens pin remove agent-3    # Remove
+loom-daemon tokens pin status            # Show current allowlist
+loom-daemon tokens unpin                 # Delete allowlist (back to full pool)
 
-loom-tokens unblock agent-1              # Drop agent-1's AUTH entries only
-loom-tokens unblock agent-1 --all-reasons  # Also drop its exhausted/rate-limited entries
+loom-daemon tokens unblock agent-1              # Drop agent-1's AUTH entries only
+loom-daemon tokens unblock agent-1 --all-reasons  # Also drop its exhausted/rate-limited entries
 ```
 
 **Validation**: `pin` accepts only exact bootstrapped account names —
@@ -490,7 +497,7 @@ still-blocked accounts and exits `3`**. Re-run with `--all-reasons` to drop them
 or wait for the cooldown to expire them automatically.
 
 **Reason-aware bad-token TTL**: bad-tokens entries whose reason is `auth` (401 /
-OAuth / expired / blocked) persist until `loom-tokens unblock`. Non-auth
+OAuth / expired / blocked) persist until `loom-daemon tokens unblock`. Non-auth
 ("exhausted"/"rate-limited") entries stop blocking selection once they age past
 the exhaustion cooldown (`LOOM_TOKEN_EXHAUSTION_COOLDOWN_SECS`, default 21600s =
 6h) — enforced at selection time in **both** the Rust daemon and the live Python

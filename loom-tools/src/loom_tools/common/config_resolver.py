@@ -7,13 +7,19 @@ for the full design (schema, precedence table, and how this composes with
 the existing **env > config > default** rule used by e.g. the ``autonomous``
 block).
 
-**This module is additive only.** No existing call site (e.g.
-``loom_tools.common.paths._read_config_worktree_root``) is migrated onto it
-in this PR. A follow-up issue migrates call sites one at a time.
-
 Mirrors ``loom-daemon/src/config_resolver.rs`` and
 ``defaults/scripts/lib/config-resolver.sh`` key-for-key so the three
-resolvers agree on one fixture tree (cross-language conformance test).
+resolvers agree on one fixture tree (cross-language conformance test,
+``tests/fixtures/config_resolver/``).
+
+**Surviving module (epic #4081 Phase 4, #4557).** The rest of the Python
+``loom-tools`` package was retired; this module stays because
+:mod:`loom_tools.semantic_search` (the carved-out ``loom-search`` feature)
+reads ``search.*`` through it, and because it is one of the three
+implementations bound by the #4039 conformance fixture. The soft-fail JSON
+read it used to borrow from ``loom_tools.common.state.read_json_file`` is
+now inlined below (:func:`_soft_read_json_object`) — ``common/state.py`` went
+native with the rest of the package.
 
 Example::
 
@@ -29,6 +35,7 @@ Example::
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from typing import Any
@@ -84,9 +91,12 @@ def _soft_read_json_object(path: Path) -> dict[str, Any]:
 
     A missing file, an unreadable file, malformed JSON, or a non-object
     top-level value all resolve to an empty dict (``{}``) — that tier
-    simply contributes nothing to the merge. Never a hard error, mirroring
-    the soft-fail contract already used by
-    ``loom_tools.common.paths._read_config_worktree_root``.
+    simply contributes nothing to the merge. Never a hard error.
+
+    This was ``loom_tools.common.state.read_json_file`` until epic #4081
+    Phase 4 (#4557) retired ``common/state.py`` along with the rest of the
+    package; the semantics are unchanged (both the Rust and Bash resolvers
+    soft-fail identically, which the shared conformance fixture pins).
 
     Args:
         path: Path to the candidate JSON file.
@@ -94,13 +104,16 @@ def _soft_read_json_object(path: Path) -> dict[str, Any]:
     Returns:
         The parsed object, or ``{}`` on any failure.
     """
-    # Imported lazily to avoid a module-level import cycle
-    # (common.state has no dependency on config_resolver, but keeping the
-    # import lazy here matches the existing convention in
-    # common.paths._read_config_worktree_root).
-    from loom_tools.common.state import read_json_file
-
-    data = read_json_file(path, default={})
+    try:
+        text = path.read_text()
+    except (FileNotFoundError, OSError):
+        return {}
+    if not text or not text.strip():
+        return {}
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return {}
     return data if isinstance(data, dict) else {}
 
 

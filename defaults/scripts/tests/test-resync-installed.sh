@@ -18,8 +18,9 @@
 #   (l) symlinked install target -> skipped, not clobbered
 #   (m) recorded loom_source gone -> clear error, exit 1
 #   (n) metadata re-stamp -> loom_version/loom_commit/last_resync present after apply
-# Canonical-guard-defer (#4041, #4403):
-#   (o) canonical guard + git-TRACKED vendored guard -> preserved, WARN, tree clean
+# Canonical-guard-defer (#4041, #4403, #4566):
+#   (o) canonical guard + git-TRACKED vendored guard -> preserved, tree clean, and
+#       reported as an informational note (NOT a WARN) that --quiet suppresses
 #   (p) canonical guard + UNTRACKED vendored guard   -> removed (unchanged behavior)
 # Worktree-isolation refusal (#4563):
 #   (q) invoked from a linked worktree -> non-zero exit, NOTHING written to main
@@ -628,15 +629,40 @@ if [[ -f "$REPO/.loom/hooks/guard-destructive-generic.sh" ]]; then
 else
     fail "(#4403) git-tracked hooks/guard-destructive-generic.sh was removed"
 fi
-if grep -qi "WARN.*git-tracked" <<<"$OUT"; then
-    pass "(#4403) a WARN is printed explaining the tracked file was preserved"
+if grep -q "git-tracked vendored fallback kept" <<<"$OUT"; then
+    pass "(#4403) the preserved tracked file is reported explicitly"
 else
-    fail "(#4403) no WARN printed for the preserved tracked file"
+    fail "(#4403) no report explaining the preserved tracked file"
+fi
+# #4566: a committed vendored guard is a deliberate, documented posture, so this
+# is the expected steady state on EVERY run — it must not be reported at
+# alarm level (a WARN here reprinted forever with no way to acknowledge it).
+# (Scoped to this message: an unrelated WARN, e.g. the #4280 missing-daemon
+# .gitignore notice, can legitimately appear in the same run.)
+if grep -qEi "WARN.*(git-tracked|guard-destructive-generic)" <<<"$OUT"; then
+    fail "(#4566) tracked vendored guard must not produce a WARN (got: $(grep -Ei "WARN.*(git-tracked|guard-destructive-generic)" <<<"$OUT" | head -1))"
+else
+    pass "(#4566) no WARN for the deliberately-tracked vendored guard"
 fi
 if [[ -z "$(cd "$REPO" && git status --porcelain -- .loom/hooks/guard-destructive-generic.sh 2>&1)" ]]; then
     pass "(#4403) tracked guard file stays non-dirty (no local mods/deletions) after the run"
 else
     fail "(#4403) tracked guard file is dirty after the run"
+fi
+# #4566: routed through note(), so --quiet suppresses it entirely while the
+# file is still preserved (behavior unchanged, only the reporting is quieter).
+OUT_Q="$(cd "$REPO" && bash "$SCRIPT" --quiet 2>&1)"
+RC=$?
+if [[ $RC -eq 0 ]]; then pass "(#4566) --quiet rerun exits 0"; else fail "(#4566) --quiet rerun exits 0 (got $RC)"; fi
+if grep -q "git-tracked vendored fallback kept" <<<"$OUT_Q"; then
+    fail "(#4566) --quiet still printed the tracked-guard message (not routed through note())"
+else
+    pass "(#4566) --quiet suppresses the tracked-guard message"
+fi
+if [[ -f "$REPO/.loom/hooks/guard-destructive-generic.sh" ]]; then
+    pass "(#4566) --quiet rerun still preserves the git-tracked vendored guard"
+else
+    fail "(#4566) --quiet rerun removed the git-tracked vendored guard"
 fi
 
 # --- (#4403) canonical-guard-defer: untracked target keeps existing behavior -

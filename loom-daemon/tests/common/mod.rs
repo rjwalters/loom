@@ -63,6 +63,15 @@ impl TestDaemon {
     pub async fn start() -> Result<Self> {
         let temp_dir = TempDir::new().context("Failed to create temp directory")?;
         let socket_path = temp_dir.path().join("daemon.sock");
+        // Isolated registry file (mirrors `integration_drain_then_exit.rs`): an
+        // empty/scratch `LOOM_WORKSPACES_PATH` guarantees `effective_roots()`
+        // reduces to the single seeded default (`LOOM_WORKSPACE`, set below)
+        // rather than silently picking up whatever repos are registered in
+        // this *host's* real `~/.loom/workspaces.json`.
+        let workspaces_path = temp_dir.path().join("workspaces.json");
+        // Absolute (required — `worktree_root()` rejects a relative override
+        // and falls back to the default) and inside the `TempDir`.
+        let worktree_root = temp_dir.path().join("worktrees");
 
         let mut process = Command::new(daemon_bin())
             .env("LOOM_SOCKET_PATH", &socket_path)
@@ -70,6 +79,38 @@ impl TestDaemon {
             // Disable restore_from_tmux() to prevent cross-test-binary contamination
             // via the shared tmux server. Each test manages its own terminals.
             .env("LOOM_NO_RESTORE", "1")
+            // Fail-closed autonomy toggles (#4573): without these, a spawned
+            // test daemon inherits this repo's real `.loom/config.json`
+            // (`autonomous.roleRunner.enabled: true`) and can dispatch real
+            // `/loom:sweep` sessions — burning API/GitHub rate-limit quota in
+            // what is meant to be an inert integration-test daemon. Each of
+            // these env vars *wins outright* over config in the daemon's own
+            // env > config > default precedence (`resolve_enabled` in
+            // `role_runner.rs` / `work_finder.rs` / `epic_supervisor.rs`), so
+            // setting them here is authoritative regardless of what any
+            // repo's committed config says.
+            .env("LOOM_ROLE_RUNNER", "0")
+            .env("LOOM_WORK_FINDER", "0")
+            .env("LOOM_EPIC_SUPERVISOR", "0")
+            // Repoint the daemon's own workspace root at this test's throwaway
+            // `TempDir` (#4573) instead of letting it inherit the real repo
+            // checkout via `LOOM_WORKSPACE`/cwd.
+            .env("LOOM_WORKSPACE", temp_dir.path())
+            .env("LOOM_WORKSPACES_PATH", &workspaces_path)
+            // …and pin the worktree base directory too (#4573). This is NOT
+            // redundant with `LOOM_WORKSPACE`: `worktree_root()` reads
+            // `LOOM_WORKTREE_ROOT` as its *highest-priority* source
+            // (`worktree_root.rs`), ahead of both `worktree.root` in config
+            // and the `${repo_root}/.loom/worktrees` default. A spawned child
+            // inherits the parent's environment, so on a host that sets
+            // `LOOM_WORKTREE_ROOT` (the documented external-scratch-volume
+            // setup) an unpinned test daemon would resolve worktrees onto that
+            // real volume — outside its `TempDir` — even with `LOOM_WORKSPACE`
+            // confined. Setting it explicitly makes confinement independent of
+            // the invoking environment. Note the daemon namespaces an
+            // *override* by repo basename, so the effective root is
+            // `<temp>/worktrees/<temp-basename>` — still inside the `TempDir`.
+            .env("LOOM_WORKTREE_ROOT", &worktree_root)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -101,6 +142,26 @@ impl TestDaemon {
     /// Get the socket path for connecting clients
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
+    }
+
+    /// The throwaway `TempDir` this daemon was pinned to via `LOOM_WORKSPACE`
+    /// (#4573) — the workspace root the daemon must resolve to, never the
+    /// real repo checkout.
+    #[allow(dead_code)]
+    pub fn workspace_path(&self) -> &Path {
+        self._temp_dir.path()
+    }
+
+    /// PID of the spawned daemon child, or `None` once it has been reaped.
+    ///
+    /// Exposed so the #4573 confinement regression test can read the child's
+    /// *actual* environment (`/proc/<pid>/environ` on Linux) rather than
+    /// trusting that this module's `.env()` calls are still present — the only
+    /// way to verify pass-through for `LOOM_WORKTREE_ROOT`, which the daemon
+    /// consumes internally and never reports over IPC.
+    #[allow(dead_code)]
+    pub fn pid(&self) -> Option<u32> {
+        self.process.as_ref().map(std::process::Child::id)
     }
 }
 

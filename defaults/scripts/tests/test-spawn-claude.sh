@@ -19,8 +19,8 @@ REPO_ROOT="$(cd "$DEFAULTS_DIR/.." && pwd)"
 # Pin it explicitly into every spawn-claude.sh / claude-wrapper.sh invocation
 # below via LOOM_DAEMON_BIN so the assertions exercise THIS checkout's daemon,
 # never any host-level install / canary loom-daemon the dev environment may
-# have on PATH (mirrors the pre-existing LOOM_PACKAGE_PATH-pinning rationale
-# this file used for the Python selector).
+# have on PATH (this file used to pin the Python selector's package path for the
+# same reason, before #4557 deleted the Python package).
 DAEMON_BIN=""
 for _candidate in \
     "$REPO_ROOT/target/release/loom-daemon" \
@@ -68,6 +68,22 @@ assert_contains() {
         TESTS_FAILED=$((TESTS_FAILED + 1))
         echo -e "  ${RED}FAIL${NC}: $msg"
         echo "    Expected substring: '$needle'"
+        echo "    In: '$haystack'"
+    fi
+}
+
+assert_not_contains() {
+    local needle="$1"
+    local haystack="$2"
+    local msg="$3"
+    TESTS_RUN=$((TESTS_RUN + 1))
+    if [[ "$haystack" != *"$needle"* ]]; then
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+        echo -e "  ${GREEN}PASS${NC}: $msg"
+    else
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+        echo -e "  ${RED}FAIL${NC}: $msg"
+        echo "    Forbidden substring present: '$needle'"
         echo "    In: '$haystack'"
     fi
 }
@@ -492,8 +508,13 @@ output=$(LOOM_WORKSPACE="$EMPTY_WS" LOOM_SHARED_TOKENS_DIR="" \
     LOOM_DAEMON_BIN="$DAEMON_BIN" PATH="$STUB_DIR:$PATH" \
     "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" 2>&1 || true)
 exit_code=$?
-assert_contains "loom-tokens bootstrap" "$output" \
-    "empty pool error mentions 'loom-tokens bootstrap'"
+# The recovery advice names the NATIVE `loom-daemon tokens bootstrap` (epic
+# #4081 Phase 4, #4557 — the Python `loom-tokens` console script it used to name
+# no longer exists, so advising it would be dead-end advice).
+assert_contains "tokens bootstrap" "$output" \
+    "empty pool error mentions '<loom-daemon> tokens bootstrap'"
+assert_not_contains "loom-tokens bootstrap" "$output" \
+    "empty pool error does NOT advise the retired loom-tokens binary (#4557)"
 rm -rf "$EMPTY_WS"
 
 # Test that spawn-claude.sh exits 78 on missing tokens (shared fallback off).
@@ -520,7 +541,7 @@ assert_contains "OAuth account 'shared-acct'" "$output" \
     "spawn-claude logs the shared-pool account (#3938)"
 # State must land in the shared pool, never forked into the consumer repo.
 # Uses the native `loom-daemon tokens mark-bad` CLI (issue #4228) instead of
-# the historical inline `loom_tools.tokens.bad_tokens.mark_bad` python call.
+# the historical inline `mark_bad` Python call (that package is gone as of #4557).
 LOOM_SHARED_TOKENS_DIR="$SHARED_POOL" "$DAEMON_BIN" tokens mark-bad shared-acct \
     --reason test --workspace "$CONSUMER_WS" >/dev/null 2>&1 || true
 if [[ -f "$SHARED_POOL/.bad_tokens" && ! -f "$CONSUMER_WS/.loom/tokens/.bad_tokens" ]]; then

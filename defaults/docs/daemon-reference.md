@@ -678,7 +678,7 @@ its `current_dir` set to **its own** repo root, and `spawn-claude.sh` resolves t
 token pool from that repo. A freshly-installed **consumer repo has no
 `.loom/tokens/` of its own** — only the primary workspace was bootstrapped — so
 every cross-repo dispatch used to hard-fail instantly with `EX_CONFIG`
-("Run `loom-tokens bootstrap` …"), burning a dispatch slot per tick on children
+("Run `loom-daemon tokens bootstrap` …"), burning a dispatch slot per tick on children
 that died in ~2s.
 
 **Fix — a shared machine-level pool with a per-repo fallback.** Token selection
@@ -706,25 +706,25 @@ spawn path can actually pick.
 # Preferred on a host running claude-monitor — reads the live credential store
 # (~/.claude-monitor/usage.db -> oauth_credentials, opened mode=ro), so no
 # accounts.env is needed on this machine at all:
-loom-tokens import-from-monitor --shared   # writes ~/.loom/tokens (override LOOM_SHARED_TOKENS_DIR)
-loom-tokens check --ranking                # ranks the effective pool (shared when no per-repo pool)
+loom-daemon tokens import-from-monitor --shared   # writes ~/.loom/tokens (override LOOM_SHARED_TOKENS_DIR)
+loom-daemon tokens check --ranking                # ranks the effective pool (shared when no per-repo pool)
 
 # Without claude-monitor — materialize from the accounts.env snapshot instead:
-loom-tokens bootstrap --shared      # writes ~/.loom/tokens (override LOOM_SHARED_TOKENS_DIR)
-loom-tokens check --ranking         # ranks the effective pool (shared when no per-repo pool)
+loom-daemon tokens bootstrap --shared      # writes ~/.loom/tokens (override LOOM_SHARED_TOKENS_DIR)
+loom-daemon tokens check --ranking         # ranks the effective pool (shared when no per-repo pool)
 ```
 
 Every consumer repo the daemon dispatches into then falls back to that one pool —
-no per-repo `loom-tokens bootstrap` required. A repo that *wants* its own isolated
-pool can still `loom-tokens bootstrap` locally; the per-repo pool always wins.
+no per-repo `loom-daemon tokens bootstrap` required. A repo that *wants* its own isolated
+pool can still `loom-daemon tokens bootstrap` locally; the per-repo pool always wins.
 Selection sources (`~/.claude-monitor/accounts.env`, repo-local `.env`) are
 unchanged for `bootstrap` — `--shared` only redirects the *destination* of the
 materialized pool. `import-from-monitor` bypasses `accounts.env` entirely and
-takes claude-monitor as authoritative for pool membership (use `loom-tokens pin`
+takes claude-monitor as authoritative for pool membership (use `loom-daemon tokens pin`
 to restrict which accounts the selector may pick). If accounts later go
 `blocked` on revoked tokens, `bootstrap --force` cannot recover — the
 `accounts.env` snapshot is itself what went stale — run
-`loom-tokens import-from-monitor --force && loom-tokens check --ranking`
+`loom-daemon tokens import-from-monitor --force && loom-daemon tokens check --ranking`
 instead; without `--force` a rolled token is reported as drift and left alone,
 and the command exits `2`. See "Importing live tokens from claude-monitor" in
 the root `CLAUDE.md` for the full behavior.
@@ -768,7 +768,7 @@ membership, reusing the #4299 check) before applying the per-repo/shared
 straight to the shared machine-level pool instead of a per-repo(`$HOME`) path
 that can coincidentally collide with the shared *default* and mask wherever
 the pool was actually bootstrapped. The operational contract is unchanged:
-always provision a machine-level daemon's pool with `loom-tokens bootstrap
+always provision a machine-level daemon's pool with `loom-daemon tokens bootstrap
 --shared` (or `import-from-monitor --shared`) — which always targets
 `~/.loom/tokens/` regardless of cwd — so the daemon's anchoring and the
 provisioning step agree, whether or not the unit that starts the daemon sets
@@ -1943,7 +1943,7 @@ status carries the same `capacity_bound` boolean so scripted consumers aren't
 misled at low occupancy either.
 
 **Honest headline when the daemon's own read disagrees with a fresh probe
-(#4344).** `resolve_capacity` prefers a fresh client-side `loom-tokens check
+(#4344).** `resolve_capacity` prefers a fresh client-side `loom-daemon tokens check
 --json` probe over the daemon's own ranking read when one succeeds — useful for
 showing current numbers, but that probe's cap is **not** what the running
 daemon actually used to gate dispatch this tick. The pretty-printed `Dynamic
@@ -1957,7 +1957,7 @@ real (lower) cap is already saturated. When the daemon's own ranking read
 shows **0 healthy accounts** while the probe (or raw pool) disagrees — the
 #4344 incident: dispatch pinned at a token term of `0 × per-token = 0` for
 ~40 minutes because the ranking directory it read had diverged from the one
-`loom-tokens check --ranking` / the #4080 self-refresher actually wrote — the
+`loom-daemon tokens check --ranking` / the #4080 self-refresher actually wrote — the
 status view promotes this from the old small-print `note: daemon dispatch cap
 still uses a stale .ranking (...)` line to a headline `⚠ DISPATCH IS
 TOKEN-STARVED: …` line and suppresses "the limiter is work availability"
@@ -2098,12 +2098,12 @@ alert, recover — all automatic and non-blocking:
    (≤ disk and ≤ ceiling) and work is queued behind it, the finder is
    *token-bound*. On the **state change** into that state it emits an
    add-capacity advisory naming concrete levers — add accounts to
-   `~/.claude-monitor/accounts.env` + `loom-tokens bootstrap`, or buy API
-   credits, then re-probe with `loom-tokens check --ranking` — with the current
+   `~/.claude-monitor/accounts.env` + `loom-daemon tokens bootstrap`, or buy API
+   credits, then re-probe with `loom-daemon tokens check --ranking` — with the current
    numbers (queued count, healthy/total accounts, exhausted count, estimated
    drain time at current capacity). If accounts are `blocked` on revoked tokens,
    `bootstrap --force` cannot recover — the advisory also names
-   `loom-tokens import-from-monitor --force && loom-tokens check --ranking` as
+   `loom-daemon tokens import-from-monitor --force && loom-daemon tokens check --ranking` as
    the recovery lever for that case. The advisory surfaces on **three**
    channels: the daemon log (`warn`), the `daemon.capacity.advisory` event-bus
    topic, and the `capacity` section of `loom-daemon status`. It is
@@ -2118,7 +2118,7 @@ The `estimated_drain_minutes` figure is a coarse `ceil(queued / healthy) ×
 NOMINAL_SWEEP_MINUTES` (30 min nominal) aid, not a precise SLA — the daemon does
 not track live per-sweep durations here. Near-ceiling granularity is limited to
 the `.ranking` discrete status word (`exhausted` is already ≥ 0.95 utilization);
-a finer sub-exhausted (≥ 0.90) bucket would read the richer `loom-tokens check
+a finer sub-exhausted (≥ 0.90) bucket would read the richer `loom-daemon tokens check
 --json` utilization and is a tracked follow-up. Even rotation/staggering of
 dispatches across the available account set (so 5h/7d windows reset in a
 staggered pattern) lives in the spawn-time selector (native `loom-daemon tokens
@@ -2920,7 +2920,7 @@ ranking regardless of which refresher is running:
 
 - **A refresher running on a `<10`-min cadence** — the daemon's built-in loop
   (default 10 minutes, comfortably inside the freshness window) or an operator
-  cron. One-shot before a run: `loom-tokens check --ranking`.
+  cron. One-shot before a run: `loom-daemon tokens check --ranking`.
 
 - **Stale-ranking fail-safe (selector-side, #3894).** Even without a fresh
   probe, a stale-but-present `.ranking` is no longer discarded. The selector
@@ -2977,7 +2977,7 @@ knob for a repo that wants it off (e.g. no tokens bootstrapped at all):
 **Never fatal, never double-writes unsafely.** A probe failure (network hiccup,
 `gh`/`python3` missing, every account exhausted, no tokens bootstrapped at all)
 is logged and skipped — it never panics the loop or the daemon. Because
-`loom-tokens check --ranking` writes `.ranking` atomically (temp file +
+`loom-daemon tokens check --ranking` writes `.ranking` atomically (temp file +
 rename), an operator's cron running the identical script concurrently is
 harmless: the two refreshers can race to *schedule* a write but never to a
 *torn* file, so keeping an existing cron alongside the daemon costs nothing but

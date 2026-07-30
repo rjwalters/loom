@@ -1472,7 +1472,7 @@ pub fn resolve_dynamic_max_concurrent(
 /// headroom, configured_max)` via [`resolve_dynamic_max_concurrent`] — from
 /// live inputs read fresh under `workspace_root`, then runs one [`tick`] with
 /// it. The cap is **not** captured once at startup, so a pool that
-/// grows/shrinks (`loom-tokens bootstrap`), a scratch volume that fills/frees,
+/// grows/shrinks (`loom-daemon tokens bootstrap`), a scratch volume that fills/frees,
 /// or a draining backlog are all honored without a daemon restart.
 /// `configured_max` is the per-machine admission knob
 /// (`LOOM_WORK_FINDER_MAX_CONCURRENT`).
@@ -2064,7 +2064,7 @@ fn log_healthy_token_transition(
         if healthy == 0 {
             log::warn!(
                 "work_finder: healthy token accounts {old} -> 0 (of {total}) — dispatch is \
-                 token-starved until an account resets or is added (`loom-tokens check --ranking`)"
+                 token-starved until an account resets or is added (`loom-daemon tokens check --ranking`)"
             );
         } else {
             log::info!(
@@ -4508,7 +4508,7 @@ exit 0
                 assert!(pressured);
                 assert_eq!(queued, 12);
                 assert_eq!(healthy_accounts, 1);
-                assert!(message.contains("loom-tokens bootstrap"));
+                assert!(message.contains("loom-daemon tokens bootstrap"));
             }
             other => panic!("expected CapacityAdvisory, got {other:?}"),
         }
