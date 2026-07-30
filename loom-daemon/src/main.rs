@@ -3601,7 +3601,8 @@ async fn handle_quarantine_command(action: QuarantineAction) -> Result<()> {
                         // quarantine — so "not quarantined" is not the same as
                         // "nothing happened".
                         println!(
-                            "Issue #{issue} was not quarantined — nothing to clear (no-op).                              Any dispatch-backoff window (#4485) for it was released."
+                            "Issue #{issue} was not quarantined — nothing to clear (no-op). \
+                             Any dispatch-backoff window (#4485) for it was released."
                         );
                     }
                     Ok(())
