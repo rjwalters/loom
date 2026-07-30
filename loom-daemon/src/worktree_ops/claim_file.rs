@@ -1,14 +1,12 @@
-//! Read-only port of `loom_tools.claim.has_valid_claim`.
+//! The claim-liveness predicate over `.loom/claims/issue-<N>.lock/claim.json`
+//! — originally the read-only half of `loom_tools.claim` ported by #4272.
 //!
-//! `loom_tools/claim.py` itself **stays in Python** (family 5, issue #4275
-//! territory — it is not part of this port). `orphan_recovery.py` only ever
-//! calls one read-only function from it, `has_valid_claim`, to avoid
-//! recovering an issue that a CLI-driven sweep still holds a valid file-based
-//! claim on. This module reimplements just that check against the same
-//! on-disk format (`.loom/claims/issue-<N>.lock/claim.json`) so the Rust
-//! `recover-orphans` port has parity without a second claim-*writer* (there
-//! is none here — `claim`/`extend`/`release`/`claim_issue` remain exclusively
-//! in `loom_tools/claim.py` until #4275 ports them).
+//! Issue #4275 (family 5) ported the *writer* half too, as
+//! [`crate::script_helpers::claim`]. Rather than fork a second parser for the
+//! same on-disk format, that CLI reuses this module's expiry/abandonment
+//! primitives (re-exported from [`crate::worktree_ops`] as `claim_is_expired` /
+//! `claim_is_abandoned`), so `recover-orphans`' notion of a live claim and what
+//! `loom-claim` writes cannot drift apart.
 
 use std::path::Path;
 
@@ -62,13 +60,22 @@ pub fn has_valid_claim(repo_root: &Path, issue_number: u32) -> bool {
 }
 
 /// Lexicographic ISO-8601 `%Y-%m-%dT%H:%M:%SZ` comparison against "now",
-/// exactly like the Python original (`current_iso > expiration_iso`).
-fn is_expired(expires_at: &str) -> bool {
+/// exactly like the Python original (`current_iso > expiration_iso`). The fixed
+/// width and literal `Z` are what make the string comparison sound, which is
+/// why every writer stamps timestamps through
+/// [`crate::script_helpers::now_iso`].
+#[must_use]
+pub fn is_expired(expires_at: &str) -> bool {
     let now = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     now.as_str() > expires_at
 }
 
-fn is_abandoned(claimed_at: &str) -> bool {
+/// Whether `claimed_at` is older than [`NO_PROGRESS_FILE_THRESHOLD_SECS`] — a
+/// claim whose owner's heartbeat has gone stale even though its TTL has not
+/// lapsed. Unparseable input is treated as NOT abandoned (fail-safe: absent
+/// evidence never orphans a claim, per #3651).
+#[must_use]
+pub fn is_abandoned(claimed_at: &str) -> bool {
     // `%Y-%m-%dT%H:%M:%SZ` carries no UTC-offset item (`Z` is a literal, not
     // `%z`), so this must be parsed as a naive datetime and then assumed UTC
     // — `DateTime::parse_from_str` requires an offset item and would (silently,

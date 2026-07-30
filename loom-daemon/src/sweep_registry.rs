@@ -296,27 +296,40 @@ const DEFAULT_TIER_ALIASES: &[(&str, &str)] = &[("opus", "claude-opus-5")];
 /// an individual alias while inheriting the rest from the legacy tier — and is
 /// asserted explicitly by `read_model_aliases_merges_across_tiers`.
 ///
-/// **Cross-language divergence (#4059, Finding 2):** blank keys are dropped
-/// here (`key.is_empty()` guard below), but the Python mirror in
-/// `model_tiers._config_overrides` KEEPS blank keys — it only guards blank
-/// *values*. This is a PRE-EXISTING, known-and-harmless divergence: a blank key
-/// can never match a lookup and [`resolve_model_alias`] returns early on an
-/// empty input model. It is intentionally left as-is here (the Python side is
-/// owned by #4060); do NOT normalize Rust to Python's laxer behavior. Both sides
-/// drop blank values.
+/// **Single implementation (#4060 / #4275, epic #4081 family 5):** this used to
+/// be one half of a hand-synced Python/Rust twin pair
+/// (`model_tiers._config_overrides`), and the twins had already drifted —
+/// Python kept blank alias keys, this side dropped them (#4059, Finding 2).
+/// `loom_tools/model_tiers.py` was deleted in #4275 and
+/// `crate::script_helpers::model_tiers` now calls straight into this function
+/// (via [`model_aliases_from_config`]), so the Rust semantics below — blank
+/// keys AND blank values dropped, cross-tier `deep_merge` union — are the only
+/// surviving definition. The `resolve-model.sh` / `resolve-tier-model.sh` /
+/// `sweep-experiment.sh` entry points and the daemon dispatch path therefore
+/// cannot disagree by construction.
 #[must_use]
 pub fn read_model_aliases(repo_root: &Path) -> BTreeMap<String, String> {
+    model_aliases_from_config(&crate::config_resolver::resolve_effective_config(repo_root))
+}
+
+/// The `sweep.modelAliases` extraction, applied to an **already-resolved**
+/// config value.
+///
+/// Split out of [`read_model_aliases`] (#4275) so the `resolve-model.sh`
+/// `--config <path>` explicit bypass — which reads exactly one file and skips
+/// all config tiering — shares the same normalization rather than growing a
+/// second copy. Soft-fails to an empty map on any error (absent key, non-object
+/// value); blank keys and blank values are dropped.
+#[must_use]
+pub fn model_aliases_from_config(config: &serde_json::Value) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
-    let config = crate::config_resolver::resolve_effective_config(repo_root);
-    let Some(aliases) = crate::config_resolver::get_path(&config, "sweep.modelAliases")
+    let Some(aliases) = crate::config_resolver::get_path(config, "sweep.modelAliases")
         .and_then(serde_json::Value::as_object)
     else {
         return out;
     };
     for (key, val) in aliases {
         let key = key.trim().to_lowercase();
-        // #4059 Finding 2: blank keys dropped here; Python keeps them. Left as a
-        // known-and-harmless divergence — see the function doc comment above.
         if key.is_empty() {
             continue;
         }
@@ -327,6 +340,18 @@ pub fn read_model_aliases(repo_root: &Path) -> BTreeMap<String, String> {
     out
 }
 
+/// The effective logical-tier → ID map: shipped [`DEFAULT_TIER_ALIASES`]
+/// overlaid with the config's `sweep.modelAliases` overrides.
+#[must_use]
+pub fn effective_tier_aliases(config: &serde_json::Value) -> BTreeMap<String, String> {
+    let mut out: BTreeMap<String, String> = DEFAULT_TIER_ALIASES
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+        .collect();
+    out.extend(model_aliases_from_config(config));
+    out
+}
+
 /// Issue #3982: resolve a logical model tier/alias to the concrete model ID to
 /// dispatch, applying the shipped [`DEFAULT_TIER_ALIASES`] map overlaid with the
 /// per-repo `sweep.modelAliases` override. Preserves any `@effort` suffix
@@ -334,6 +359,19 @@ pub fn read_model_aliases(repo_root: &Path) -> BTreeMap<String, String> {
 /// (`claude-sonnet-4-6`) pass through unchanged.
 #[must_use]
 pub fn resolve_model_alias(repo_root: &Path, model: &str) -> String {
+    resolve_model_alias_from_config(
+        &crate::config_resolver::resolve_effective_config(repo_root),
+        model,
+    )
+}
+
+/// [`resolve_model_alias`] against an already-resolved config value.
+///
+/// This is the one alias-resolution implementation in the tree (#4275); both
+/// the daemon dispatch path and the `resolve-model.sh` CLI reach the wire
+/// through it.
+#[must_use]
+pub fn resolve_model_alias_from_config(config: &serde_json::Value, model: &str) -> String {
     if model.is_empty() {
         return String::new();
     }
@@ -342,7 +380,7 @@ pub fn resolve_model_alias(repo_root: &Path, model: &str) -> String {
         None => (model, None),
     };
     let key = base.trim().to_lowercase();
-    let overrides = read_model_aliases(repo_root);
+    let overrides = model_aliases_from_config(config);
     let resolved = overrides
         .get(&key)
         .map(String::as_str)
