@@ -10880,6 +10880,7 @@ exit 0
                 kind: kind.clone(),
                 pid: 2_147_483_640,
                 token_name: "unknown".into(),
+                runtime: "unknown".into(),
                 log_path: registry.compute_log_path(8801),
                 idempotency_key: None,
                 started_at,
@@ -13728,6 +13729,7 @@ exit 0\n";
                 kind: SweepKind::Issue(9256),
                 pid: std::process::id(), // alive
                 token_name: "unknown".into(),
+                runtime: "unknown".into(),
                 log_path: reg.compute_log_path(9256),
                 idempotency_key: None,
                 started_at: Utc::now(),
