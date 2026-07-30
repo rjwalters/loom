@@ -3852,10 +3852,17 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_run_gate_tick_skip_path_does_not_stamp_last_verdict_at() {
         // The #3984 SHA-memo skip path (unchanged `origin/main`) proves
         // nothing new -- the Curator's explicit design decision is that only
         // the real Green/Red run stamps the verdict time, never the skip.
+        //
+        // #4615: isolate the machine-wide build slot to a per-test tempdir so
+        // this test never contends with a live daemon's real build slot.
+        let slot_dir = tempfile::tempdir().unwrap();
+        std::env::set_var(crate::build_slot::BUILD_SLOT_DIR_ENV, slot_dir.path());
+
         let (_origin, clone) = make_origin_and_clone();
         let marker = tempfile::tempdir().unwrap();
         let marker_file = marker.path().join("invocations.txt");
@@ -3885,6 +3892,8 @@ mod tests {
             after_first,
             "a skipped tick must never refresh the verdict timestamp"
         );
+
+        std::env::remove_var(crate::build_slot::BUILD_SLOT_DIR_ENV);
     }
 
     #[test]
@@ -5293,9 +5302,16 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_run_gate_tick_skips_second_run_for_unchanged_sha() {
         // The core #3984 regression: with `origin/main` unchanged between two
         // ticks, the second tick must NOT spawn the gate command again.
+        //
+        // #4615: isolate the machine-wide build slot to a per-test tempdir so
+        // this test never contends with a live daemon's real build slot.
+        let slot_dir = tempfile::tempdir().unwrap();
+        std::env::set_var(crate::build_slot::BUILD_SLOT_DIR_ENV, slot_dir.path());
+
         let (_origin, clone) = make_origin_and_clone();
         let marker = tempfile::tempdir().unwrap();
         let marker_file = marker.path().join("invocations.txt");
@@ -5330,10 +5346,18 @@ mod tests {
             invocations_after_second, 1,
             "no second gate command must be spawned for an unchanged SHA"
         );
+
+        std::env::remove_var(crate::build_slot::BUILD_SLOT_DIR_ENV);
     }
 
     #[test]
+    #[serial]
     fn test_run_gate_tick_runs_again_after_main_advances() {
+        // #4615: isolate the machine-wide build slot to a per-test tempdir so
+        // this test never contends with a live daemon's real build slot.
+        let slot_dir = tempfile::tempdir().unwrap();
+        std::env::set_var(crate::build_slot::BUILD_SLOT_DIR_ENV, slot_dir.path());
+
         let (origin, clone) = make_origin_and_clone();
         let marker = tempfile::tempdir().unwrap();
         let marker_file = marker.path().join("invocations.txt");
@@ -5370,10 +5394,18 @@ mod tests {
             2,
             "a real change to origin/main must trigger another run"
         );
+
+        std::env::remove_var(crate::build_slot::BUILD_SLOT_DIR_ENV);
     }
 
     #[test]
+    #[serial]
     fn test_run_gate_tick_skips_while_backing_off_after_timeout() {
+        // #4615: isolate the machine-wide build slot to a per-test tempdir so
+        // this test never contends with a live daemon's real build slot.
+        let slot_dir = tempfile::tempdir().unwrap();
+        std::env::set_var(crate::build_slot::BUILD_SLOT_DIR_ENV, slot_dir.path());
+
         let (_origin, clone) = make_origin_and_clone();
         let marker = tempfile::tempdir().unwrap();
         let marker_file = marker.path().join("invocations.txt");
@@ -5412,9 +5444,12 @@ mod tests {
             1,
             "no second gate command must be spawned while backing off"
         );
+
+        std::env::remove_var(crate::build_slot::BUILD_SLOT_DIR_ENV);
     }
 
     #[test]
+    #[serial]
     fn test_run_gate_tick_defers_when_host_is_saturated() {
         // The #4259 defer path (#4441 regression coverage): a saturated host
         // must defer the first tick entirely -- no command spawn, no SHA
@@ -5422,6 +5457,12 @@ mod tests {
         // absurdly high load average makes `is_host_saturated` report
         // `Some(true)` regardless of the real host's CPU count or ambient
         // `LOOM_BUILD_GATE_LOAD_THRESHOLD`.
+        //
+        // #4615: isolate the machine-wide build slot to a per-test tempdir so
+        // this test never contends with a live daemon's real build slot.
+        let slot_dir = tempfile::tempdir().unwrap();
+        std::env::set_var(crate::build_slot::BUILD_SLOT_DIR_ENV, slot_dir.path());
+
         let (_origin, clone) = make_origin_and_clone();
         let marker = tempfile::tempdir().unwrap();
         let marker_file = marker.path().join("invocations.txt");
@@ -5446,6 +5487,8 @@ mod tests {
             "no gate command must spawn while deferring"
         );
         assert_eq!(state.last_verdict_at(), None, "a deferral is not a verdict");
+
+        std::env::remove_var(crate::build_slot::BUILD_SLOT_DIR_ENV);
     }
 
     // ===================================================================
