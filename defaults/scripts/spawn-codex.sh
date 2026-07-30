@@ -17,8 +17,9 @@
 #
 # Trust boundary: `defaults/docs/guardrail-parity-codex.md` is the required
 # guardrail-parity document for this adapter (contract point 6). Read it before
-# promoting Codex beyond tier-2 — Codex has NO PreToolUse-hook equivalent, so
-# Loom's guard hooks do not fire for a Codex worker at all.
+# promoting Codex beyond tier-2 — Codex 0.146.0 DOES expose a `hooks.json`
+# `pre_tool_use` event, but Loom does not wire into it yet (see gap 1 in that
+# doc), so Loom's guard hooks do not fire for a Codex worker today.
 #
 # ---------------------------------------------------------------------------
 # Minimum supported Codex CLI version: 0.146.0
@@ -325,15 +326,14 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         -m|--model)
-            HAS_MODEL_ARG=true
-            PASSTHROUGH_ARGS+=("$1")
-            if [[ $# -ge 2 ]]; then
-                EXPLICIT_MODEL="$2"
-                PASSTHROUGH_ARGS+=("$2")
-                shift 2
-            else
-                shift
+            if [[ $# -lt 2 ]]; then
+                log_error "$1 requires a value"
+                exit 78  # EX_CONFIG
             fi
+            HAS_MODEL_ARG=true
+            EXPLICIT_MODEL="$2"
+            PASSTHROUGH_ARGS+=("$1" "$2")
+            shift 2
             ;;
         -m=*)
             HAS_MODEL_ARG=true
@@ -348,15 +348,14 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         -s|--sandbox)
-            HAS_SANDBOX_ARG=true
-            PASSTHROUGH_ARGS+=("$1")
-            if [[ $# -ge 2 ]]; then
-                EXPLICIT_SANDBOX="$2"
-                PASSTHROUGH_ARGS+=("$2")
-                shift 2
-            else
-                shift
+            if [[ $# -lt 2 ]]; then
+                log_error "$1 requires a value"
+                exit 78  # EX_CONFIG
             fi
+            HAS_SANDBOX_ARG=true
+            EXPLICIT_SANDBOX="$2"
+            PASSTHROUGH_ARGS+=("$1" "$2")
+            shift 2
             ;;
         -s=*)
             HAS_SANDBOX_ARG=true
