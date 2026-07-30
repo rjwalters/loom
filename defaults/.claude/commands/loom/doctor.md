@@ -74,6 +74,39 @@ fi
 
 Both worktree paths get a `.loom-managed` sentinel and are auto-cleaned by `merge-pr.sh` on merge.
 
+## ⚠️ `--body @path` Does NOT Expand — It Posts the Literal String
+
+**If a comment you're posting (fix summary, clarifying question, conflict-only
+marker) lives in a scratch/scratchpad file, do not pass it as `--body @path`.**
+Unlike some shells' `@file` conventions, `gh pr comment --body @path` and `gh
+issue comment --body @path` do **not** read the file — they post the literal
+text `@path` as the comment. A real incident (PR #4457) lost an entire
+Judge changes-requested review this way, forcing the Doctor to reconstruct
+the blocker from secondary sources.
+
+```
+❌ POSTS THE LITERAL STRING "@path" — NOT THE FILE CONTENTS
+   gh pr comment 42 --body @/tmp/summary.md
+   gh pr comment 42 --body "@/tmp/summary.md"
+
+✅ USE ONE OF THESE INSTEAD
+   gh pr comment 42 --body "$(cat <<'EOF'
+   ... comment prose ...
+   EOF
+   )"
+   gh pr comment 42 --body-file /tmp/summary.md
+   gh api repos/{owner}/{repo}/issues/42/comments -F body=@/tmp/summary.md
+```
+
+Prefer the inline heredoc pattern (used throughout this file, e.g. the
+conflict-only marker below) when the body is short/dynamic; use
+`-F/--body-file <path>` when the body genuinely lives in a file — it is the
+one flag on `gh pr comment`/`gh issue comment` that actually reads file
+contents (`gh api ... -F body=@path` also works). **Never** pass the file
+path as the value of `--body`/`-b` with an `@` prefix — that flag takes
+literal text only. **After posting, re-fetch the comment** (`gh pr view
+<number> --comments`) to confirm it renders your prose, not a path string.
+
 ## CRITICAL: Scope Discipline
 
 **Only modify files that contain the failing test or the code under test. Do not refactor or improve code outside the scope of the failure you are fixing.**
@@ -334,6 +367,17 @@ gh pr edit 588 --remove-label "loom:treating" --add-label "loom:review-requested
     - Remove `loom:changes-requested` and `loom:treating` labels
     - Add `loom:review-requested` label (green badge)
     - Comment to notify reviewer that feedback is addressed
+
+**Pre-completion checklist** (verify before signaling completion):
+- [ ] All CI checks pass (verified via `gh pr checks <number>`)
+- [ ] My commit(s) address the specific feedback quoted from the Judge's review
+- [ ] If any comment I posted came from a scratch file, I used `--body-file
+      <path>` (or `gh api -F body=@<path>`) — NEVER `--body @<path>` (see the
+      `--body @path` anti-pattern warning above)
+- [ ] I re-fetched the posted comment (`gh pr view <number> --comments`) to
+      verify it renders my actual prose, not a literal path string
+- [ ] I ran the label transition (`loom:changes-requested`/`loom:treating` →
+      `loom:review-requested`) and the notifying comment together
 
 ## CI Assessment (First Step)
 
