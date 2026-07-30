@@ -3162,6 +3162,11 @@ loop is not reusable as the reporter). It has three cooperating parts:
 | watchdog interval | `LOOM_WATCHDOG_INTERVAL_SECS` | — | `300` (launchd `StartInterval` / systemd `OnUnitActiveSec`+`OnBootSec`) |
 | watchdog job/unit basename override | `LOOM_WATCHDOG_LABEL` | — | `<daemon label/unit>-watchdog` |
 | staleness threshold | `LOOM_DAEMON_HEARTBEAT_STALE_SECS` | — | `max(5 × cadence, 300)` |
+| IPC probe on/off (#4398) | `LOOM_WATCHDOG_IPC_PROBE` | — | on |
+| IPC probe budget (#4398) | `LOOM_WATCHDOG_STATUS_PROBE_TIMEOUT_SECS` | — | `15` |
+| IPC probe argv (#4398) | `LOOM_WATCHDOG_IPC_PROBE_ARGS` | — | `quarantine list` |
+| confirmed-hang threshold (#4398) | `LOOM_WATCHDOG_IPC_PROBE_FAIL_THRESHOLD` | — | `3` consecutive ticks |
+| IPC probe startup grace (#4398) | `LOOM_WATCHDOG_IPC_PROBE_GRACE_SECS` | — | `LOOM_DAEMON_STARTUP_GRACE_SECS`, else `90` |
 
 **Why an interval timer, not a resident process or `KeepAlive`/`Restart=`.** The
 reporter must itself be supervised, but a long-lived resident watchdog just moves
@@ -3180,7 +3185,8 @@ service's exit code affects the next scheduled run.
 
 | Marker | Reality | Watchdog |
 |--------|---------|----------|
-| present | daemon alive, heartbeat fresh | silent (OK) |
+| present | daemon alive, heartbeat fresh, IPC round-trip OK | silent (OK) |
+| present | daemon alive, heartbeat fresh, **IPC round-trip fails** (#4398) | **report** — 1 tick: "not yet confirmed"; N consecutive: **IPC UNRESPONSIVE (CONFIRMED)** |
 | present | daemon alive, heartbeat **stale**, written this boot (younger than the process) | **report** — daemon may be wedged |
 | present | daemon alive, heartbeat **older than the process itself** (#4368: a previous-boot/enablement leftover) | silent (liveness-only; not evidence about the current process) |
 | present | daemon alive, no heartbeat file | silent (liveness-only; heartbeat disabled or not yet written) |
@@ -3188,7 +3194,53 @@ service's exit code affects the next scheduled run.
 | **absent** | **nothing running** | silent — deliberate stop, no false page |
 | **absent** | **daemon IS running** | **report (WARN)** — state mismatch, crash protection disarmed (#4331) |
 
-The last row is the #4331 fix. Before it, a missing marker short-circuited to a
+**In-band hang detection (#4398).** Rows 1–2 above are the #4398 addition. Both
+pre-existing checks are *out-of-band*: neither ever talks to the daemon over the
+socket it serves work on, and two incidents proved that is not enough. In #4381
+the installed binary was replaced by a stub that answered `--version` and then
+hung forever — a pid-alive check passes against that indefinitely. On 2026-07-29
+the production daemon (pid 1484) was alive **and writing a fresh heartbeat**
+while every `loom-daemon status` round-trip hung: the heartbeat writer
+(`daemon_heartbeat::spawn_heartbeat_task`) and the IPC accept loop are
+independent `tokio::spawn`ed tasks on a multi-threaded runtime, so one keeps
+ticking while the other is wedged. After liveness is confirmed the watchdog now
+also runs a **bounded in-band round-trip** through the resolved `loom-daemon`
+CLI, with these properties:
+
+- **Bounded twice.** The CLI bounds its own connect + round-trip (5s each,
+  `query_daemon_bounded`); the watchdog additionally wraps the invocation in a
+  hard external budget (default 15s), so even a CLI that never returns at all
+  cannot hang the tick. macOS ships no `timeout(1)`, so the no-`timeout` path is
+  a real built-in bounded runner, not a degrade-to-unbounded.
+- **`quarantine list`, not `status --json`.** `status --json` looks like the
+  obvious probe but, *after* a successful round-trip, it also runs a per-account
+  token-pool network check plus a self-update check — measured at **15.3s against
+  a healthy daemon**, which would make the probe budget itself the
+  false-positive generator. `quarantine list` is a pure IPC round-trip with no
+  post-reply work (~5ms). Override with `LOOM_WATCHDOG_IPC_PROBE_ARGS`.
+- **Debounced, pid-keyed.** One failed round-trip can be transient contention
+  (#4279). A single failure is reported loudly but only **N consecutive**
+  failures (default 3), tallied in `<loom_dir>/.watchdog-probe-fail-count` and
+  **keyed to the live pid** so a relaunched daemon never inherits its
+  predecessor's streak, are called a confirmed hang. A successful probe clears
+  the streak.
+- **Startup-grace aware.** A probe against a process younger than the grace
+  window (default 90s, the same `daemon_install_state::DEFAULT_STARTUP_GRACE_SECS`
+  `status` uses) is skipped outright and never counts toward the tally — the
+  post-relaunch socket-bind window is not a wedge.
+- **Gracefully degrading.** No resolvable `loom-daemon` binary, a build whose CLI
+  does not know the probe subcommand, or a daemon-side *application* error (which
+  proves IPC works) all skip the probe rather than invent a divergence. The probe
+  never becomes a new hard dependency that pages on its own absence.
+- **Report-only, deliberately.** Unlike #4232's narrow auto-`kickstart`, there is
+  no provably-safe unattended remediation for a wedged-but-alive process — the
+  only real fix is killing it, which would equally kill a daemon merely under
+  heavy legitimate load. A confirmed hang escalates to a maximally actionable
+  DIVERGENCE report (distinct `IPC UNRESPONSIVE (CONFIRMED)` text, explicit
+  recovery commands, exit `1`) and stops there. Auto-kill remediation, if ever
+  wanted, needs its own narrow provably-safe gate.
+
+The last no-marker row is the #4331 fix. Before it, a missing marker short-circuited to a
 bare `[OK] … nothing to check` **without probing reality at all** — so a
 supervised daemon running with its marker gone (see "Marker ownership" below) was
 reported healthy while the watchdog would in fact never revive it. The no-marker
