@@ -2751,21 +2751,27 @@ impl SweepRegistry {
             ));
         }
 
-        // 2.5 Closed-issue guard (Issue #4088). All three watchdogs
-        //     (startup #3887, mid-build-death #3895, review-stall #3910)
-        //     re-dispatch through this method, and `gh issue edit` succeeds on a
-        //     closed issue, so nothing else stops a watchdog false-positive from
-        //     re-claiming an issue whose PR already merged. Placing the guard
-        //     here — before the lock/label flip — covers all three call sites
-        //     with one check. Best-effort and fail-open: a forge lookup error
-        //     returns `None` and dispatch proceeds, so a `gh` outage can never
-        //     wedge the daemon. Skipped when label flips are disabled (test
-        //     fixtures without `gh` credentials).
-        if !self.config.skip_label_flip && self.issue_is_closed(issue_number) == Some(true) {
+        // 2.5 Closed-issue guard (Issue #4088, widened in #4504). All three
+        //     watchdogs (startup #3887, mid-build-death #3895, review-stall
+        //     #3910) re-dispatch through this method, and `gh issue edit`
+        //     succeeds on a closed issue, so nothing else stops a watchdog
+        //     false-positive from re-claiming an issue whose PR already merged.
+        //     Placing the guard here — before the lock/label flip — covers all
+        //     three call sites with one check. #4504 widened the probe from a
+        //     `state == "CLOSED"` string match to a REST payload that also
+        //     reports PR-ness, so a dispatch number that resolves to a pull
+        //     request (open, closed, or merged — issues and PRs share one number
+        //     namespace) is refused too instead of slipping through the fail-open
+        //     arm. Best-effort and fail-open: a forge lookup error returns `None`
+        //     and dispatch proceeds, so a `gh` outage can never wedge the daemon.
+        //     Skipped when label flips are disabled (test fixtures without `gh`
+        //     credentials).
+        if !self.config.skip_label_flip && self.issue_is_closed_or_pr(issue_number) == Some(true) {
             return Err(anyhow!(
-                "refusing to dispatch issue #{issue_number}: it is closed on the forge \
-                 (#4088 closed-issue guard). A watchdog re-dispatch must not re-claim a \
-                 closed/merged issue."
+                "refusing to dispatch issue #{issue_number}: it is closed on the forge, or the \
+                 number resolves to a pull request rather than an open issue (#4088/#4504 \
+                 closed-issue guard). A watchdog re-dispatch must not re-claim a closed/merged \
+                 issue or a PR number."
             ));
         }
 
@@ -2787,7 +2793,7 @@ impl SweepRegistry {
         //     Judge/Champion/Doctor path's job, not the issue work-finder's.
         //     Best-effort and fail-open: any forge error/timeout/unparseable
         //     output returns `None` and dispatch proceeds, so a `gh` outage (or
-        //     a Gitea workspace — this is GitHub-only, like `issue_is_closed`)
+        //     a Gitea workspace — this is GitHub-only, like `issue_is_closed_or_pr`)
         //     can never wedge the daemon. Skipped when label flips are disabled
         //     (test fixtures without `gh` credentials), mirroring 2.5.
         //
@@ -3309,44 +3315,79 @@ impl SweepRegistry {
     // Forge label flip
     // ------------------------------------------------------------------------
 
-    /// Best-effort probe of whether an issue is closed on the forge (Issue
-    /// #4088). Returns `Some(true)` when closed, `Some(false)` when open, and
-    /// `None` on any error (missing/failed/timed-out `gh`, unparseable output).
+    /// Best-effort probe of whether a dispatch number is **terminal or not an
+    /// issue at all** (Issues #4088, #4504). Returns `Some(true)` when the number
+    /// must not be dispatched (a closed issue, or a pull request in ANY state),
+    /// `Some(false)` when it is a verifiably open issue, and `None` on any error
+    /// (missing/failed/timed-out `gh`, unresolvable repo, unparseable output).
     ///
     /// Callers MUST treat `None` as **fail-open** — a forge outage or a wedged
     /// `gh` must never wedge dispatch. The call is bounded by [`reap_gh_timeout`]
     /// exactly like the label flips so it cannot block the dispatch path.
-    fn issue_is_closed(&self, issue: u32) -> Option<bool> {
+    ///
+    /// **Why REST and not `gh issue view --json state` (#4504).** Issues and PRs
+    /// share one number namespace, and `gh issue view` resolves a PR number
+    /// happily — as a GraphQL `PullRequest` node, whose `state` is a *three*-value
+    /// enum (`OPEN`/`CLOSED`/`MERGED`) rather than an issue's two. The original
+    /// #4088 probe matched only `"CLOSED"`, so a merged PR's `"MERGED"` fell into
+    /// the `_ => None` fail-open arm — indistinguishable from a `gh` outage — and
+    /// dispatch proceeded against already-merged work. Widening the state match to
+    /// include `"MERGED"` is *not* sufficient: an **open** PR reports `"OPEN"`,
+    /// byte-identical to an open issue, so no state string can separate the two.
+    /// The REST payload (`repos/{owner}/{repo}/issues/{N}`) carries a
+    /// `pull_request` key present **if and only if** the number is a PR,
+    /// regardless of its open/closed/merged state — a structural discriminator
+    /// instead of an ever-expanding state-string set. REST is also a separate
+    /// rate-limit bucket from GraphQL, matching the #4444 park-label probe.
+    ///
+    /// The `--jq` collapses both facts into one JSON object
+    /// (`{"state":"open","is_pr":false}`); anything that does not parse into that
+    /// shape is a genuine lookup failure and returns `None`. `MERGED` is accepted
+    /// as terminal alongside `CLOSED` as belt-and-suspenders — REST reports a
+    /// merged PR as `state: "closed"`, but an Issue-shaped node reporting `MERGED`
+    /// must never fall through to the fail-open arm again.
+    fn issue_is_closed_or_pr(&self, issue: u32) -> Option<bool> {
+        // `gh api` cannot infer the repo from the working directory; this helper
+        // prefers the process-global LOOM_REPO override and falls back to
+        // `gh repo view` in the workspace root, so the override keeps working
+        // exactly as it did with `gh issue view --repo`. Returns `None` (fail
+        // open) when the repo cannot be resolved.
+        let (owner, repo) = self.resolve_owner_repo()?;
         let gh = self
             .config
             .gh_bin
             .clone()
             .unwrap_or_else(|| PathBuf::from("gh"));
         let mut cmd = Command::new(&gh);
-        cmd.arg("issue")
-            .arg("view")
-            .arg(issue.to_string())
-            .arg("--json")
-            .arg("state")
+        cmd.arg("api")
+            .arg(format!("repos/{owner}/{repo}/issues/{issue}"))
             .arg("--jq")
-            .arg(".state");
-        // Resolve the issue against this registry's own workspace, matching the
-        // label-flip helpers (#3937). LOOM_REPO still overrides when set.
+            .arg("{state, is_pr: (.pull_request != null)}");
+        // Resolve against this registry's own workspace, matching the label-flip
+        // helpers and the other dispatch-path probes (#3937).
         cmd.current_dir(&self.config.workspace_root);
-        if let Ok(repo) = std::env::var("LOOM_REPO") {
-            cmd.arg("--repo").arg(repo);
-        }
         let output = output_with_timeout(cmd, reap_gh_timeout()).ok()??;
         if !output.status.success() {
             return None;
         }
-        match String::from_utf8_lossy(&output.stdout)
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).ok()?;
+        // A PR is terminal for dispatch purposes in EVERY state — an open PR is
+        // still not an issue anyone can build.
+        if parsed.get("is_pr")?.as_bool()? {
+            return Some(true);
+        }
+        match parsed
+            .get("state")?
+            .as_str()?
             .trim()
             .to_ascii_uppercase()
             .as_str()
         {
-            "CLOSED" => Some(true),
+            "CLOSED" | "MERGED" => Some(true),
             "OPEN" => Some(false),
+            // Reserved for genuine lookup failures only: an unrecognized state
+            // string is an unparseable answer, not a verdict.
             _ => None,
         }
     }
@@ -3359,7 +3400,7 @@ impl SweepRegistry {
     /// unresolvable repo, unparseable output).
     ///
     /// Callers MUST treat `None` as **fail-open** — a forge outage or a wedged
-    /// `gh` must never wedge dispatch. This mirrors [`issue_is_closed`]'s `None`
+    /// `gh` must never wedge dispatch. This mirrors [`issue_is_closed_or_pr`]'s `None`
     /// contract and is bounded by [`reap_gh_timeout`] exactly like the label
     /// flips so it cannot block the dispatch path.
     ///
@@ -3400,7 +3441,7 @@ impl SweepRegistry {
                  | select(.state == \"OPEN\") | .number",
             );
         // Resolve against this registry's own workspace, matching the label-flip
-        // helpers and `issue_is_closed` (#3937).
+        // helpers and `issue_is_closed_or_pr` (#3937).
         cmd.current_dir(&self.config.workspace_root);
         let output = output_with_timeout(cmd, reap_gh_timeout()).ok()??;
         if !output.status.success() {
@@ -3419,7 +3460,7 @@ impl SweepRegistry {
     /// timed-out `gh`, unresolvable repo, unparseable output).
     ///
     /// Callers MUST treat `None` as **fail-open**, matching
-    /// [`issue_is_closed`](Self::issue_is_closed) and
+    /// [`issue_is_closed_or_pr`](Self::issue_is_closed_or_pr) and
     /// [`first_open_linked_pr`](Self::first_open_linked_pr): a forge outage or a
     /// wedged `gh` must never wedge dispatch. Bounded by [`reap_gh_timeout`] like
     /// every other dispatch-path `gh` call (#3973).
@@ -5227,7 +5268,7 @@ impl SweepRegistry {
                             let no_progress = !self.config.skip_label_flip
                                 && exit_code == Some(0)
                                 && self.first_open_linked_pr(issue).is_none()
-                                && self.issue_is_closed(issue) == Some(false);
+                                && self.issue_is_closed_or_pr(issue) == Some(false);
                             // Insta-crash quarantine (#3939): a checkpoint-less
                             // death inside the insta-crash window that did NOT
                             // exit cleanly (exit_code != 0, or an unknown
@@ -7877,11 +7918,13 @@ exit 0
     // No-progress backstop (Issue #4366)
     // ------------------------------------------------------------------------
 
-    /// Build a registry whose fake `gh` answers `issue view` with `issue_state`
-    /// (`"OPEN"` or `"CLOSED"`) and `api graphql` (the open-linked-PR probe)
-    /// with `graphql_stdout` (one PR number per line, empty for "no open PR").
-    /// Unlike [`open_pr_guard_registry`] (which hardcodes `OPEN`), this lets
-    /// #4366's no-progress tests exercise the issue-closed exemption too.
+    /// Build a registry whose fake `gh` answers the issue-state probe
+    /// (`api repos/<owner>/<repo>/issues/<n>`, #4504) with `issue_state`
+    /// (`"OPEN"` or `"CLOSED"`, always as a NON-PR node) and `api graphql` (the
+    /// open-linked-PR probe) with `graphql_stdout` (one PR number per line,
+    /// empty for "no open PR"). Unlike [`open_pr_guard_registry`] (which
+    /// hardcodes an open issue), this lets #4366's no-progress tests exercise
+    /// the issue-closed exemption too.
     fn no_progress_test_registry(
         ws: &Path,
         issue_state: &str,
@@ -7891,8 +7934,8 @@ exit 0
         let fake_gh = ws.join("fake-gh-no-progress.sh");
         let script = format!(
             "#!/usr/bin/env bash\n\
-             if [[ \"$1\" == \"issue\" && \"$2\" == \"view\" ]]; then\n\
-             printf '%s\\n' \"{state}\"\n\
+             if [[ \"$1\" == \"api\" && \"$2\" == repos/* ]]; then\n\
+             printf '%s\\n' '{state}'\n\
              exit 0\n\
              fi\n\
              if [[ \"$1\" == \"api\" && \"$2\" == \"graphql\" ]]; then\n\
@@ -7904,7 +7947,7 @@ exit 0
              exit 0\n\
              fi\n\
              exit 0\n",
-            state = issue_state,
+            state = state_probe_json(issue_state, false),
             gql = graphql_stdout,
         );
         std::fs::write(&fake_gh, &script).unwrap();
@@ -8037,7 +8080,7 @@ exit 0
     }
 
     /// AC (PR #4408 judge feedback): the no-progress predicate must FAIL OPEN
-    /// when the forge probes themselves fail. [`Self::issue_is_closed`] returns
+    /// when the forge probes themselves fail. [`Self::issue_is_closed_or_pr`] returns
     /// `None` on a missing/failed/timed-out/unparseable `gh` answer and its
     /// contract says callers MUST treat that as "don't punish" — the original
     /// `!= Some(true)` spelling was *satisfied* by `None`, so a rate-limited or
@@ -8048,7 +8091,7 @@ exit 0
     ///
     /// The fixture answers `issue view` with an unparseable `"WEDGED"` state
     /// (the same shape a truncated/garbled `gh` response has), which makes
-    /// `issue_is_closed` return `None`. Three consecutive clean exits under
+    /// `issue_is_closed_or_pr` return `None`. Three consecutive clean exits under
     /// that condition — enough to trip the quarantine threshold if any of them
     /// counted — must leave the tally at 0 and the issue un-quarantined.
     #[test]
@@ -14020,29 +14063,45 @@ exit 0\n";
         std::env::remove_var(STARTUP_PROOF_GRACE_ENV);
     }
 
-    // --- closed-issue dispatch guard (Issue #4088, AC6) ---
+    // --- closed-issue dispatch guard (Issue #4088, AC6; widened by #4504) ---
 
-    /// Install a fake `gh` that reports a fixed `issue view` state and records
-    /// every invocation, returning `(registry, gh_log)`. `spawn-claude.sh` is a
-    /// benign echo-and-exit so a dispatch that passes the guard still spawns.
+    /// Render the post-`--jq` payload of the #4504 issue-state probe
+    /// (`gh api repos/{owner}/{repo}/issues/{N} --jq '{state, is_pr: …}'`).
+    /// `is_pr` is REST's structural PR discriminator — present for a pull request
+    /// number in ANY state (open, closed, or merged) and absent for an issue.
+    fn state_probe_json(state: &str, is_pr: bool) -> String {
+        format!("{{\"state\":\"{state}\",\"is_pr\":{is_pr}}}")
+    }
+
+    /// Install a fake `gh` that answers the #4504 issue-state probe
+    /// (`api repos/<owner>/<repo>/issues/<n>`) with a fixed payload and records
+    /// every invocation, returning `(registry, gh_log)`. `repo view` resolves the
+    /// owner/repo (the probe rides `gh api`, which cannot infer it from the
+    /// working directory) so the fixture works with or without `LOOM_REPO` set.
+    /// `spawn-claude.sh` is a benign echo-and-exit so a dispatch that passes the
+    /// guard still spawns.
     fn closed_guard_registry(
         ws: &Path,
-        view_stdout: &str,
-        view_exit: i32,
+        probe_stdout: &str,
+        probe_exit: i32,
     ) -> (SweepRegistry, PathBuf) {
         let gh_log = ws.join("gh-invocations.log");
         let fake_gh = ws.join("fake-gh.sh");
         let script = format!(
             "#!/usr/bin/env bash\n\
              printf '%s\\n' \"$*\" >> \"{log}\"\n\
-             if [[ \"$1\" == \"issue\" && \"$2\" == \"view\" ]]; then\n\
-             printf '%s\\n' \"{state}\"\n\
+             if [[ \"$1\" == \"api\" && \"$2\" == repos/* ]]; then\n\
+             printf '%s\\n' '{state}'\n\
              exit {exit}\n\
+             fi\n\
+             if [[ \"$1\" == \"repo\" && \"$2\" == \"view\" ]]; then\n\
+             printf 'rjwalters/loom\\n'\n\
+             exit 0\n\
              fi\n\
              exit 0\n",
             log = gh_log.display(),
-            state = view_stdout,
-            exit = view_exit,
+            state = probe_stdout,
+            exit = probe_exit,
         );
         std::fs::write(&fake_gh, &script).unwrap();
         let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
@@ -14084,7 +14143,7 @@ exit 0\n";
         let tmp = tempdir().unwrap();
         let ws = tmp.path();
         std::env::remove_var("LOOM_REPO");
-        let (mut reg, gh_log) = closed_guard_registry(ws, "CLOSED", 0);
+        let (mut reg, gh_log) = closed_guard_registry(ws, &state_probe_json("closed", false), 0);
 
         let err = reg
             .dispatch(&SweepKind::Issue(4078), None, None, None, None)
@@ -14095,13 +14154,109 @@ exit 0\n";
         );
 
         let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
-        assert!(calls.contains("issue view 4078"), "the guard probed issue state");
+        assert!(
+            calls.contains("api repos/rjwalters/loom/issues/4078"),
+            "the guard probed issue state over REST; got: {calls:?}"
+        );
         assert!(
             !calls.contains("issue edit"),
             "no label flip on a refused dispatch; got: {calls:?}"
         );
         // No lock was acquired and no entry recorded.
         assert!(running_issue_sweep_id(&reg, 4078).is_none());
+    }
+
+    /// #4504 case (b): a dispatch number that resolves to a **merged** pull
+    /// request is refused. REST reports a merged PR as `state: "closed"` with a
+    /// `pull_request` key, so this case is caught by BOTH legs of the guard —
+    /// the point is that it can no longer reach the `_ => None` fail-open arm the
+    /// way `gh issue view`'s GraphQL `MERGED` state did.
+    #[test]
+    #[serial]
+    fn dispatch_refuses_merged_pr_number_without_flipping_labels() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::remove_var("LOOM_REPO");
+        let (mut reg, gh_log) = closed_guard_registry(ws, &state_probe_json("closed", true), 0);
+
+        let err = reg
+            .dispatch(&SweepKind::Issue(4501), None, None, None, None)
+            .expect_err("a merged PR number must be refused");
+        assert!(
+            err.to_string().contains("pull request"),
+            "error names the PR-number case; got: {err}"
+        );
+
+        let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            calls.contains("api repos/rjwalters/loom/issues/4501"),
+            "the guard probed the number over REST; got: {calls:?}"
+        );
+        assert!(
+            !calls.contains("issue edit"),
+            "no label flip on a refused dispatch; got: {calls:?}"
+        );
+        assert!(running_issue_sweep_id(&reg, 4501).is_none(), "no lock, no entry");
+    }
+
+    /// #4504 case (c), the load-bearing one: a dispatch number that resolves to
+    /// an **open** pull request is refused too. Its `state` is `"open"` — byte
+    /// identical to an open issue's — so only the structural `pull_request`
+    /// discriminator can catch it. A fix that merely appended `"MERGED"` to the
+    /// old state-string match would dispatch this happily.
+    #[test]
+    #[serial]
+    fn dispatch_refuses_open_pr_number_without_flipping_labels() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::remove_var("LOOM_REPO");
+        let (mut reg, gh_log) = closed_guard_registry(ws, &state_probe_json("open", true), 0);
+
+        let err = reg
+            .dispatch(&SweepKind::Issue(4502), None, None, None, None)
+            .expect_err("an open PR number must be refused");
+        assert!(
+            err.to_string().contains("pull request"),
+            "error names the PR-number case; got: {err}"
+        );
+
+        let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            calls.contains("api repos/rjwalters/loom/issues/4502"),
+            "the guard probed the number over REST; got: {calls:?}"
+        );
+        assert!(
+            !calls.contains("issue edit"),
+            "no label flip on a refused dispatch; got: {calls:?}"
+        );
+        assert!(running_issue_sweep_id(&reg, 4502).is_none(), "no lock, no entry");
+    }
+
+    /// #4504 belt-and-suspenders: an Issue-shaped node that reports `MERGED` is
+    /// terminal exactly like `CLOSED` — it must never fall through to the
+    /// fail-open arm (the original #4088 bug).
+    #[test]
+    #[serial]
+    fn dispatch_refuses_merged_state_on_issue_shaped_node() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::remove_var("LOOM_REPO");
+        let (mut reg, gh_log) = closed_guard_registry(ws, &state_probe_json("MERGED", false), 0);
+
+        let err = reg
+            .dispatch(&SweepKind::Issue(4505), None, None, None, None)
+            .expect_err("a MERGED state must be refused like CLOSED");
+        assert!(
+            err.to_string().contains("closed"),
+            "error explains the closed-issue guard; got: {err}"
+        );
+
+        let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            !calls.contains("issue edit"),
+            "no label flip on a refused dispatch; got: {calls:?}"
+        );
+        assert!(running_issue_sweep_id(&reg, 4505).is_none(), "no lock, no entry");
     }
 
     /// AC6 fail-open: a forge lookup error (non-zero `gh`) must NOT wedge
@@ -14112,7 +14267,7 @@ exit 0\n";
         let tmp = tempdir().unwrap();
         let ws = tmp.path();
         std::env::remove_var("LOOM_REPO");
-        // `issue view` exits non-zero ⇒ state unknown ⇒ fail open.
+        // The state probe exits non-zero ⇒ state unknown ⇒ fail open.
         let (mut reg, gh_log) = closed_guard_registry(ws, "", 1);
 
         let out = reg
@@ -14121,7 +14276,10 @@ exit 0\n";
         assert!(wait_until_dead(out.pid, FIXTURE_CHILD_WAIT_MS));
 
         let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
-        assert!(calls.contains("issue view 4079"), "the guard probed issue state");
+        assert!(
+            calls.contains("api repos/rjwalters/loom/issues/4079"),
+            "the guard probed issue state; got: {calls:?}"
+        );
         assert!(
             calls.contains("issue edit 4079"),
             "dispatch proceeded to the label flip after failing open; got: {calls:?}"
@@ -14132,14 +14290,42 @@ exit 0\n";
         }
     }
 
+    /// AC6 fail-open (unparseable): a `gh` that exits 0 but emits output the
+    /// probe cannot parse into `{state, is_pr}` is a genuine lookup failure, not
+    /// a verdict — dispatch must proceed.
+    #[test]
+    #[serial]
+    fn dispatch_fails_open_when_issue_state_output_is_unparseable() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::remove_var("LOOM_REPO");
+        let (mut reg, gh_log) = closed_guard_registry(ws, "not json at all", 0);
+
+        let out = reg
+            .dispatch(&SweepKind::Issue(4080), None, None, None, None)
+            .expect("an unparseable probe answer must not wedge dispatch (fail-open)");
+        assert!(wait_until_dead(out.pid, FIXTURE_CHILD_WAIT_MS));
+
+        let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            calls.contains("issue edit 4080"),
+            "dispatch proceeded to the label flip after failing open; got: {calls:?}"
+        );
+
+        if let Some(id) = running_issue_sweep_id(&reg, 4080) {
+            let _ = reg.cancel(&id, Duration::from_secs(2));
+        }
+    }
+
     // --- open-PR dispatch guard (Issue #4123) ---
 
-    /// Install a fake `gh` for the open-PR guard: `issue view` always reports
-    /// `OPEN` (so the 2.5 closed-issue guard passes and the 2.6 open-PR guard is
-    /// reached), `api graphql` prints `graphql_stdout` (the post-`--jq` open-PR
-    /// numbers, one per line) and exits `graphql_exit`, and `repo view` resolves
-    /// the owner/repo. Every invocation is logged. `spawn-claude.sh` is a benign
-    /// echo-and-exit so a dispatch that passes the guard still spawns.
+    /// Install a fake `gh` for the open-PR guard: the #4504 issue-state probe
+    /// (`api repos/<owner>/<repo>/issues/<n>`) always reports an **open,
+    /// non-PR** node (so the 2.5 closed-issue guard passes and the 2.6 open-PR
+    /// guard is reached), `api graphql` prints `graphql_stdout` (the post-`--jq`
+    /// open-PR numbers, one per line) and exits `graphql_exit`, and `repo view`
+    /// resolves the owner/repo. Every invocation is logged. `spawn-claude.sh` is
+    /// a benign echo-and-exit so a dispatch that passes the guard still spawns.
     fn open_pr_guard_registry(
         ws: &Path,
         graphql_stdout: &str,
@@ -14151,8 +14337,8 @@ exit 0\n";
         let script = format!(
             "#!/usr/bin/env bash\n\
              printf '%s\\n' \"$*\" >> \"{log}\"\n\
-             if [[ \"$1\" == \"issue\" && \"$2\" == \"view\" ]]; then\n\
-             printf 'OPEN\\n'\n\
+             if [[ \"$1\" == \"api\" && \"$2\" == repos/* ]]; then\n\
+             printf '%s\\n' '{state}'\n\
              exit 0\n\
              fi\n\
              if [[ \"$1\" == \"api\" && \"$2\" == \"graphql\" ]]; then\n\
@@ -14165,6 +14351,7 @@ exit 0\n";
              fi\n\
              exit 0\n",
             log = gh_log.display(),
+            state = state_probe_json("open", false),
             gql = graphql_stdout,
             exit = graphql_exit,
         );
@@ -14317,7 +14504,7 @@ exit 0\n";
         let tmp = tempdir().unwrap();
         let ws = tmp.path();
         std::env::remove_var("LOOM_REPO");
-        let (mut reg, gh_log) = closed_guard_registry(ws, "CLOSED", 0);
+        let (mut reg, gh_log) = closed_guard_registry(ws, &state_probe_json("closed", false), 0);
 
         let err = reg
             .dispatch(&SweepKind::Issue(4200), None, None, None, None)
@@ -14337,15 +14524,18 @@ exit 0\n";
 
     /// Install a fake `gh` for the park-label guard (step 2.7):
     ///
-    /// - `issue view --json state` reports `OPEN` (so the 2.5 closed-issue guard
-    ///   passes) and `issue view --json labels` reports whether `loom:blocked` is
-    ///   present (so the reap path's `issue_has_blocked_label` — still used by
+    /// - `issue view --json labels` reports whether `loom:blocked` is present (so
+    ///   the reap path's `issue_has_blocked_label` — still used by
     ///   `restore_label_to_ready` — behaves faithfully);
     /// - `api graphql` prints `graphql_pr` (the post-`--jq` open linked PR
     ///   number, empty for none) so the 2.6 open-PR guard can be steered;
-    /// - `api repos/<owner>/<repo>/issues/<n>` prints `rest_labels`
-    ///   (whitespace-separated label names, one per output line) and exits
-    ///   `rest_exit` — the REST probe the new guard consults;
+    /// - `api repos/<owner>/<repo>/issues/<n> --jq '{state, is_pr: …}'` reports an
+    ///   open, non-PR node so the 2.5 closed-issue guard (#4088/#4504) passes —
+    ///   it now rides the same REST endpoint as the park probe, discriminated by
+    ///   the `--jq` expression;
+    /// - `api repos/<owner>/<repo>/issues/<n> --jq .labels[].name` prints
+    ///   `rest_labels` (whitespace-separated label names, one per output line) and
+    ///   exits `rest_exit` — the REST probe the park guard consults;
     /// - `repo view` resolves the owner/repo.
     ///
     /// Every invocation is logged so a test can assert which probes ran.
@@ -14363,12 +14553,15 @@ exit 0\n";
             "#!/usr/bin/env bash\n\
              printf '%s\\n' \"$*\" >> \"{log}\"\n\
              if [[ \"$1\" == \"issue\" && \"$2\" == \"view\" ]]; then\n\
-             if [[ \"$*\" == *labels* ]]; then printf '%s\\n' \"{blocked}\"; \
-             else printf 'OPEN\\n'; fi\n\
+             printf '%s\\n' \"{blocked}\"\n\
              exit 0\n\
              fi\n\
              if [[ \"$1\" == \"api\" && \"$2\" == \"graphql\" ]]; then\n\
              printf '%s\\n' \"{gql}\"\n\
+             exit 0\n\
+             fi\n\
+             if [[ \"$1\" == \"api\" && \"$2\" == repos/* && \"$*\" == *is_pr* ]]; then\n\
+             printf '%s\\n' '{state}'\n\
              exit 0\n\
              fi\n\
              if [[ \"$1\" == \"api\" && \"$2\" == repos/* ]]; then\n\
@@ -14383,6 +14576,7 @@ exit 0\n";
             log = gh_log.display(),
             blocked = blocked,
             gql = graphql_pr,
+            state = state_probe_json("open", false),
             labels = rest_labels,
             rest_exit = rest_exit,
         );
@@ -14438,7 +14632,7 @@ exit 0\n";
 
         let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
         assert!(
-            calls.contains("api repos/rjwalters/loom/issues/4444"),
+            calls.contains("api repos/rjwalters/loom/issues/4444 --jq .labels[].name"),
             "the guard must probe labels over REST, not GraphQL; got: {calls:?}"
         );
         assert!(
@@ -14489,7 +14683,7 @@ exit 0\n";
 
         let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
         assert!(
-            calls.contains("api repos/rjwalters/loom/issues/4446"),
+            calls.contains("api repos/rjwalters/loom/issues/4446 --jq .labels[].name"),
             "the guard still probed; it just did not refuse; got: {calls:?}"
         );
         assert!(
@@ -14522,7 +14716,7 @@ exit 0\n";
 
         let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
         assert!(
-            calls.contains("api repos/rjwalters/loom/issues/4447"),
+            calls.contains("api repos/rjwalters/loom/issues/4447 --jq .labels[].name"),
             "the guard attempted the REST probe; got: {calls:?}"
         );
         assert!(
@@ -14582,8 +14776,8 @@ exit 0\n";
         );
         let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
         assert!(
-            !calls.contains("api repos/"),
-            "the 2.7 REST probe must not run once 2.6 refuses; got: {calls:?}"
+            !calls.contains(".labels[].name"),
+            "the 2.7 REST label probe must not run once 2.6 refuses; got: {calls:?}"
         );
         std::env::remove_var("LOOM_REPO");
     }
@@ -14649,13 +14843,13 @@ exit 0\n";
         );
         let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
         assert!(
-            calls.contains("api repos/rjwalters/loom/issues/4366"),
+            calls.contains("api repos/rjwalters/loom/issues/4366 --jq .labels[].name"),
             "the resume dispatch went through the central 2.7 REST probe; got: {calls:?}"
         );
         assert_eq!(
             calls
                 .lines()
-                .filter(|l| l.contains("api repos/rjwalters/loom/issues/4366"))
+                .filter(|l| l.contains("api repos/rjwalters/loom/issues/4366 --jq .labels[].name"))
                 .count(),
             1,
             "exactly ONE park-label probe per resume dispatch (deduped with the old \
@@ -15214,7 +15408,7 @@ exit 0\n";
         let tmp = tempdir().unwrap();
         let ws = tmp.path();
         std::env::remove_var("LOOM_REPO");
-        let (mut reg, gh_log) = closed_guard_registry(ws, "OPEN", 0);
+        let (mut reg, gh_log) = closed_guard_registry(ws, &state_probe_json("open", false), 0);
         // `closed_guard_registry` installs the marker by default (so its own
         // AC6 tests reach the closed-issue guard under test there) — remove
         // it here to simulate the #4027 wedge scenario.
@@ -15259,7 +15453,7 @@ exit 0\n";
         let tmp = tempdir().unwrap();
         let ws = tmp.path();
         std::env::remove_var("LOOM_REPO");
-        let (mut reg, gh_log) = closed_guard_registry(ws, "OPEN", 0);
+        let (mut reg, gh_log) = closed_guard_registry(ws, &state_probe_json("open", false), 0);
 
         let out = reg
             .dispatch(&SweepKind::Issue(4223), None, None, None, None)
