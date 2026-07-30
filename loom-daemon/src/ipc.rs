@@ -12,7 +12,7 @@ use crate::workspace_pool::WorkspacePool;
 use crate::workspace_registry::WorkspaceRegistry;
 use anyhow::Result;
 use chrono::Utc;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1883,6 +1883,55 @@ fn dispatch_would_meet_or_exceed_headroom(h: &DispatchHeadroom) -> bool {
 /// or falsely flip repo B's advisory.
 static DISPATCH_HEADROOM_STATE: Mutex<BTreeMap<PathBuf, bool>> = Mutex::new(BTreeMap::new());
 
+// ============================================================================
+// Per-terminal input correlation (Issue #4554)
+// ============================================================================
+// `Request::SendInput` and `Request::GetTerminalOutput` are separate IPC round
+// trips for the same agent turn: `SendInput` records the `agent_inputs` row and
+// returns its id, but the forge-event (`prompt_github`) and resource-usage
+// (`resource_usage`) rows recorded from the *output* of that turn are written
+// by a later, independent `GetTerminalOutput` call that has no direct handle
+// on that id. Before this fix both writes hardcoded `input_id: None`, so the
+// `resource_usage -> agent_inputs -> prompt_github` join backing
+// `get_cost_by_issue`/`get_cost_by_pr` could never match in production (#4554).
+//
+// This process-global map tracks the most recently recorded `agent_inputs.id`
+// per terminal so `GetTerminalOutput` can look it up and correlate its writes
+// to the input that (most likely) produced the output being parsed. It is a
+// best-effort correlation, not a strict transactional link: concurrent input on
+// the same terminal between the `SendInput` and the next `GetTerminalOutput`
+// poll would attribute cost to the wrong turn, but every turn still lands on
+// *some* real input row for that terminal (and thus its issue/PR), which is a
+// strict improvement over the always-`None` status quo. Entries are
+// intentionally never evicted on `DestroyTerminal` — a stale mapping is
+// harmless (worst case: one extra analytics write correlates to an older input
+// row for a terminal that no longer exists).
+static LAST_INPUT_ID_BY_TERMINAL: std::sync::LazyLock<Mutex<HashMap<String, i64>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Record `input_id` as the most recent `agent_inputs` row for `terminal_id`.
+/// `0` is the "recording failed" sentinel used by `Request::SendInput` (see
+/// below) and is never a real row id, so it is not recorded.
+fn record_last_input_id(terminal_id: &str, input_id: i64) {
+    if input_id == 0 {
+        return;
+    }
+    LAST_INPUT_ID_BY_TERMINAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(terminal_id.to_string(), input_id);
+}
+
+/// Look up the most recently recorded `agent_inputs.id` for `terminal_id`, if
+/// any turn has been recorded for it yet.
+fn last_input_id_for_terminal(terminal_id: &str) -> Option<i64> {
+    LAST_INPUT_ID_BY_TERMINAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(terminal_id)
+        .copied()
+}
+
 /// Build the advisory/recovery message for a `dispatch_sweep` headroom
 /// transition. Split out from [`emit_dispatch_headroom_advisory_on_change`] so
 /// the message text itself is unit-testable without the global dedup state.
@@ -2061,6 +2110,13 @@ fn handle_request(
                 0
             };
 
+            // Track this input as the terminal's most recent turn so a later
+            // `GetTerminalOutput` call can correlate its forge-event / resource-
+            // usage writes back to it (#4554). Recorded unconditionally (even if
+            // `tm.send_input` below fails) since the `agent_inputs` row itself was
+            // already written above regardless of delivery outcome.
+            record_last_input_id(&id, input_id);
+
             // Send input to terminal
             match tm.send_input(&id, &data) {
                 Ok(()) => Response::InputSent {
@@ -2097,9 +2153,15 @@ fn handle_request(
                             output_str.clone()
                         };
 
+                        // Correlate this output batch with the most recently recorded
+                        // input for this terminal (#4554) — `SendInput` and
+                        // `GetTerminalOutput` are separate IPC round trips for the
+                        // same turn, and this is the only link between them.
+                        let correlated_input_id = last_input_id_for_terminal(&id);
+
                         let output_record = AgentOutput {
                             id: None,
-                            input_id: None, // Could link to last input if tracked
+                            input_id: correlated_input_id,
                             terminal_id: id.clone(),
                             timestamp: Utc::now(),
                             content: Some(output_str.clone()),
@@ -2118,7 +2180,8 @@ fn handle_request(
                             let forge_host = "github.com";
                             let forge_events = parse_forge_events(&output_str, forge_host);
                             for parsed_event in forge_events {
-                                let prompt_event = parsed_event.to_prompt_forge_event(None);
+                                let prompt_event =
+                                    parsed_event.to_prompt_forge_event(correlated_input_id);
                                 if let Err(e) = db.record_prompt_forge_event(&prompt_event) {
                                     log::warn!("Failed to record forge event: {e}");
                                 } else {
@@ -2132,7 +2195,11 @@ fn handle_request(
                             }
 
                             // Parse terminal output for resource usage (token counts, costs)
-                            match db.record_resource_usage_from_output(None, &output_str, None) {
+                            match db.record_resource_usage_from_output(
+                                correlated_input_id,
+                                &output_str,
+                                None,
+                            ) {
                                 Ok(Some(usage_id)) => {
                                     log::debug!(
                                         "Recorded resource usage (id: {usage_id}) from terminal output"
@@ -3348,6 +3415,91 @@ mod tests {
             }
             other => panic!("Expected GitChangesCaptured, got: {other:?}"),
         }
+    }
+
+    // ===== SendInput / GetTerminalOutput input correlation (Issue #4554) =====
+
+    /// End-to-end proof that a `SendInput` turn's `agent_inputs.id` is threaded
+    /// through to the `resource_usage` and `prompt_github` rows written by the
+    /// following `GetTerminalOutput` call, so `get_cost_by_issue` — which joins
+    /// `resource_usage -> agent_inputs -> prompt_github` on `input_id` — returns
+    /// a non-empty result for the turn's issue. Before the #4554 fix, both
+    /// writes hardcoded `input_id: None` and this join could never match in
+    /// production.
+    #[test]
+    fn test_send_input_then_get_terminal_output_correlates_cost_by_issue() {
+        let (tm, db, sr, bus) = setup_test_context();
+        let terminal_id = format!("ipc-test-4554-{}", std::process::id());
+
+        // Seed the terminal's output file directly: `get_terminal_output` reads
+        // from `/tmp/loom-<id>.out` unconditionally, regardless of whether `id`
+        // is a live, registered terminal (see `TerminalManager::get_terminal_output`),
+        // so this test doesn't need a real tmux-backed terminal.
+        let output_path = format!("/tmp/loom-{terminal_id}.out");
+        let output_body = "Creating pull request...\n\
+             https://github.com/rjwalters/loom/issues/4554\n\
+             Tokens: 1,234 in / 567 out\n\
+             Model: claude-3-5-sonnet\n";
+        std::fs::write(&output_path, output_body).unwrap();
+
+        // Cleanup guard so a failing assertion below still removes the fixture
+        // file rather than leaking it into later test runs.
+        struct CleanupGuard(String);
+        impl Drop for CleanupGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _cleanup = CleanupGuard(output_path.clone());
+
+        // `SendInput` records the `agent_inputs` row and, via the #4554 fix,
+        // tracks its id for this terminal. `id` isn't a real, registered
+        // terminal, so delivery itself fails — that's fine: the DB write and
+        // the correlation tracking both happen unconditionally before delivery
+        // is attempted (mirrors production, where the two are also decoupled).
+        let send_response = handle_request(
+            Request::SendInput {
+                id: terminal_id.clone(),
+                data: "some command".to_string(),
+            },
+            &tm,
+            &db,
+            &sr,
+            &bus,
+            &test_pool(),
+        );
+        assert!(
+            matches!(send_response, Response::StructuredError(_)),
+            "expected delivery to fail for an unregistered terminal id, got: {send_response:?}"
+        );
+
+        // `GetTerminalOutput` reads the seeded file and, with the fix,
+        // correlates its forge-event/resource-usage writes to the input
+        // recorded above instead of writing `input_id: None`.
+        let output_response = handle_request(
+            Request::GetTerminalOutput {
+                id: terminal_id.clone(),
+                start_byte: None,
+            },
+            &tm,
+            &db,
+            &sr,
+            &bus,
+            &test_pool(),
+        );
+        assert!(
+            matches!(output_response, Response::TerminalOutput { .. }),
+            "expected TerminalOutput, got: {output_response:?}"
+        );
+
+        let cost = db.lock().unwrap().get_cost_by_issue(Some(4554)).unwrap();
+        assert!(
+            !cost.is_empty(),
+            "expected a non-empty cost-by-issue rollup for issue #4554 after a recorded turn \
+             (the resource_usage -> agent_inputs -> prompt_github join must match)"
+        );
+        assert_eq!(cost[0].issue_number, 4554);
+        assert!(cost[0].total_cost > 0.0);
     }
 
     // ===== get_git_branch tests =====
