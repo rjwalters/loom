@@ -256,6 +256,34 @@ pub fn resolve_stale_hours() -> f64 {
         .unwrap_or(DEFAULT_STALE_BUILDING_HOURS)
 }
 
+/// Env var overriding the [`ReclaimReason::ExitedNoProgress`] fast-reclaim
+/// grace period, in minutes (Issue #4616).
+pub const NO_PROGRESS_GRACE_MINUTES_ENV: &str = "LOOM_NO_PROGRESS_GRACE_MINUTES";
+
+/// Default [`ReclaimReason::ExitedNoProgress`] fast-reclaim grace period: 10
+/// minutes. A checkpoint stalled at `curator-done` with no run-registry pid
+/// and no open PR is ambiguous between two shapes that look identical the
+/// instant a new sweep resumes: a genuinely-orphaned sweep (#4462, stranded
+/// ~35 minutes) and a legitimately-resumed Builder retry whose fresh run has
+/// not yet linked back to the checkpoint or opened a PR (#4616). Ten minutes
+/// comfortably covers normal Builder dispatch startup latency while staying
+/// far shorter than [`DEFAULT_STALE_BUILDING_HOURS`], so the #4462 fast-reclaim
+/// benefit is preserved for the genuinely-orphaned case.
+pub const DEFAULT_NO_PROGRESS_GRACE_MINUTES: f64 = 10.0;
+
+/// Resolve the `ExitedNoProgress` grace period (minutes) from
+/// [`NO_PROGRESS_GRACE_MINUTES_ENV`], falling back to
+/// [`DEFAULT_NO_PROGRESS_GRACE_MINUTES`] for an absent, unparseable, or
+/// non-positive value.
+#[must_use]
+pub fn resolve_no_progress_grace_minutes() -> f64 {
+    std::env::var(NO_PROGRESS_GRACE_MINUTES_ENV)
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|v| *v > 0.0)
+        .unwrap_or(DEFAULT_NO_PROGRESS_GRACE_MINUTES)
+}
+
 /// Env var overriding the `loom:reviewing` staleness threshold, in minutes
 /// (Issue #4367). Deliberately the SAME name `.claude/commands/loom/judge.md`
 /// already established for its own "Stale `loom:reviewing` Claim Check" — the
@@ -329,13 +357,21 @@ pub enum ReclaimReason {
     /// run-registry entry was cleaned up at process exit), BUT a checkpoint
     /// records that the sweep ran and made **no progress toward a PR** — it is
     /// still at the pre-Builder `curator-done` phase with no open linked PR
-    /// (Issue #4462). This is the exit-0/no-progress orphan the age gate would
-    /// otherwise sit on for hours: the sweep provably ran (a checkpoint
-    /// exists), provably stopped (its run-registry entry is gone — that file is
-    /// only removed by `sweep-run-registry.sh cleanup` at sweep end), and
-    /// produced nothing. Reclaimed fast, ahead of the age gate, so an
-    /// in-session sweep that ended its turn on a transport-failure backoff
-    /// (the #4462 incident) does not strand its claim.
+    /// (Issue #4462), AND the checkpoint's own `timestamp` is older than the
+    /// [`resolve_no_progress_grace_minutes`] grace period (Issue #4616). This
+    /// is the exit-0/no-progress orphan the age gate would otherwise sit on
+    /// for hours: the sweep provably ran (a checkpoint exists), provably
+    /// stopped (its run-registry entry is gone — that file is only removed by
+    /// `sweep-run-registry.sh cleanup` at sweep end), and produced nothing.
+    /// Reclaimed fast, ahead of the age gate, so an in-session sweep that
+    /// ended its turn on a transport-failure backoff (the #4462 incident) does
+    /// not strand its claim. The grace period exists because the identical
+    /// checkpoint/no-pid/no-PR shape is also, for a few minutes, what a
+    /// **legitimately-resumed Builder retry** looks like: the checkpoint's
+    /// `task_id` is only rewritten when Builder completes, not when a resumed
+    /// attempt starts, so a fresh run can be genuinely in-flight under a new,
+    /// unlinked run-registry entry while this evidence still reads as "no
+    /// progress" (Issue #4616).
     ExitedNoProgress,
     /// No journal record exists, and the issue's `loom:building` label has
     /// been present longer than the staleness threshold.
@@ -360,21 +396,39 @@ pub enum ReconcileAction {
 /// `journal_entry` is also present is harmless: the journal always takes
 /// priority (it is the more authoritative, daemon-owned evidence source).
 ///
-/// `no_progress` (Issue #4462) is the caller's exit-0/no-progress evidence,
-/// consulted only when BOTH `journal_entry` and `run_registry_pid` are absent
-/// (i.e. there is no live/dead pid to reason about). When `true`, a checkpoint
-/// exists showing the sweep ran but stalled at the pre-Builder `curator-done`
-/// phase with no open linked PR and no live process — an orphan the age gate
-/// would otherwise sit on for hours. It fires ahead of the age gate but STRICTLY
-/// AFTER the journal/run-registry checks: a live pid (journal or run-registry)
-/// always wins, so a running sweep is never reclaimed even if `no_progress` is
-/// mistakenly `true`.
+/// The exit-0/no-progress evidence [`decide`] consults for its
+/// [`ReclaimReason::ExitedNoProgress`] fast reclaim — the stalled
+/// checkpoint's own `timestamp`, so the grace period below can be judged
+/// against when the sweep last touched the checkpoint, not the (potentially
+/// much older, unrelated) `loom:building` label age (Issue #4616).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoProgressEvidence {
+    /// The stalled checkpoint's own `timestamp` field.
+    pub checkpoint_timestamp: DateTime<Utc>,
+}
+
+/// `no_progress` (Issue #4462, refined by #4616) is the caller's
+/// exit-0/no-progress evidence, consulted only when BOTH `journal_entry` and
+/// `run_registry_pid` are absent (i.e. there is no live/dead pid to reason
+/// about). When `Some`, a checkpoint exists showing the sweep ran but stalled
+/// at the pre-Builder `curator-done` phase with no open linked PR and no live
+/// process. This is fired ahead of the (hours-scale) age gate but only once
+/// the checkpoint's own age has cleared `no_progress_grace_minutes` — within
+/// the grace window the identical evidence shape is also what a
+/// legitimately-just-resumed Builder retry looks like (its fresh run has not
+/// yet linked back to the checkpoint or opened a PR), so `decide` `Keep`s
+/// instead of reclaiming (Issue #4616). Checked STRICTLY AFTER the
+/// journal/run-registry checks: a live pid (journal or run-registry) always
+/// wins, so a running sweep is never reclaimed even if `no_progress` is
+/// mistakenly `Some`.
 #[must_use]
+#[allow(clippy::too_many_arguments)] // pure decision seam: each arg is a distinct injected evidence source
 pub fn decide(
     issue: &BuildingIssue,
     journal_entry: Option<&JournalEntry>,
     run_registry_pid: Option<u32>,
-    no_progress: bool,
+    no_progress: Option<NoProgressEvidence>,
+    no_progress_grace_minutes: f64,
     is_alive: &dyn Fn(u32) -> bool,
     stale_hours: f64,
     now: DateTime<Utc>,
@@ -397,10 +451,23 @@ pub fn decide(
 
     // No live/dead pid evidence at all. Before the slow age gate, a sweep that
     // provably ran (a checkpoint exists) and provably stopped (its run-registry
-    // entry is gone) at the pre-Builder phase with no PR is orphaned NOW —
-    // reclaim without the age grace (Issue #4462).
-    if no_progress {
-        return ReconcileAction::Reclaim(ReclaimReason::ExitedNoProgress);
+    // entry is gone) at the pre-Builder phase with no PR is a NO-PROGRESS
+    // candidate (Issue #4462) — but only past its own grace period does that
+    // become proof of an orphan rather than a just-resumed retry (Issue
+    // #4616).
+    if let Some(evidence) = no_progress {
+        let age_minutes = (now - evidence.checkpoint_timestamp).num_seconds() as f64 / 60.0;
+        if age_minutes >= no_progress_grace_minutes {
+            return ReconcileAction::Reclaim(ReclaimReason::ExitedNoProgress);
+        }
+        // Within the grace window: this is the legitimately-just-resumed-
+        // Builder shape (Issue #4616), not (yet) proof of an orphaned sweep.
+        // Deliberately Keep rather than falling through to the age rule below
+        // — that rule reasons about `issue.updated_at`, which can predate
+        // this fresh checkpoint by hours (it is only bumped by forge activity,
+        // not by a resumed sweep touching its own checkpoint file), and would
+        // wrongly reclaim a genuinely in-flight resumed Builder run.
+        return ReconcileAction::Keep;
     }
 
     match issue.updated_at {
@@ -431,11 +498,14 @@ pub fn decide(
 /// unconditional, immediate reclaim -- see [`forge::reconcile_workspace`]
 /// for the caller that got this wrong before #3975.
 ///
-/// `no_progress_for` (Issue #4462) is the caller's injected exit-0/no-progress
-/// lookup, called only for an issue with no journal entry AND no run-registry
-/// pid — the same priority ordering [`decide`] enforces, so the (potentially
-/// gh-querying) lookup never runs when a live/dead pid already decides the
-/// issue.
+/// `no_progress_for` (Issue #4462, refined by #4616) is the caller's injected
+/// exit-0/no-progress lookup, called only for an issue with no journal entry
+/// AND no run-registry pid — the same priority ordering [`decide`] enforces,
+/// so the (potentially gh-querying) lookup never runs when a live/dead pid
+/// already decides the issue. It returns the stalled checkpoint's own
+/// `timestamp` (as [`NoProgressEvidence`]) when the no-progress shape holds,
+/// `None` otherwise; [`decide`] then gates the fast reclaim on that
+/// timestamp's age against `no_progress_grace_minutes`.
 #[must_use]
 #[allow(clippy::too_many_arguments)] // pure decision seam: each arg is a distinct injected evidence source
 pub fn plan(
@@ -443,7 +513,8 @@ pub fn plan(
     issues: &[BuildingIssue],
     journal: &SweepJournal,
     run_registry_pid_for: &dyn Fn(u32) -> Option<u32>,
-    no_progress_for: &dyn Fn(u32) -> bool,
+    no_progress_for: &dyn Fn(u32) -> Option<NoProgressEvidence>,
+    no_progress_grace_minutes: f64,
     is_alive: &dyn Fn(u32) -> bool,
     stale_hours: f64,
     now: DateTime<Utc>,
@@ -459,11 +530,23 @@ pub fn plan(
             };
             // Mirror decide()'s priority: only consult the no-progress evidence
             // when there is no live/dead pid to reason about at all.
-            let no_progress =
-                entry.is_none() && run_registry_pid.is_none() && no_progress_for(issue.number);
+            let no_progress = if entry.is_none() && run_registry_pid.is_none() {
+                no_progress_for(issue.number)
+            } else {
+                None
+            };
             (
                 issue.number,
-                decide(issue, entry, run_registry_pid, no_progress, is_alive, stale_hours, now),
+                decide(
+                    issue,
+                    entry,
+                    run_registry_pid,
+                    no_progress,
+                    no_progress_grace_minutes,
+                    is_alive,
+                    stale_hours,
+                    now,
+                ),
             )
         })
         .collect()
@@ -705,6 +788,28 @@ fn read_checkpoint_phase(root: &Path, issue: u32) -> Option<String> {
 /// concern, not this fast path's.
 const NO_PROGRESS_PHASE: &str = "curator-done";
 
+/// Best-effort extraction of the `timestamp` a `/loom:sweep` checkpoint
+/// recorded for `issue`, from `<root>/.loom/sweep-checkpoint/issue-<issue>.json`
+/// (schema owned by `defaults/scripts/sweep-checkpoint.sh`, an ISO 8601 UTC
+/// string). `None` on a missing/unreadable/malformed file, a missing/
+/// non-string `timestamp` key, or a value that fails to parse as RFC 3339 —
+/// the exit-0/no-progress grace period (Issue #4616) treats any such failure
+/// as "cannot confirm the checkpoint's age" and falls through to the
+/// (unconditionally slower) age rule, never a spurious fast reclaim.
+#[must_use]
+fn read_checkpoint_timestamp(root: &Path, issue: u32) -> Option<DateTime<Utc>> {
+    let path = root
+        .join(".loom")
+        .join("sweep-checkpoint")
+        .join(format!("issue-{issue}.json"));
+    let s = std::fs::read_to_string(path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&s).ok()?;
+    let ts = v.get("timestamp").and_then(serde_json::Value::as_str)?;
+    DateTime::parse_from_rfc3339(ts)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
 /// Best-effort extraction of the liveness `pid` an in-session `/loom:sweep`
 /// registered for `task_id`, from `<root>/.loom/sweep-run/<task_id>.json`
 /// (schema owned by `defaults/scripts/sweep-run-registry.sh new`). `None` on
@@ -861,8 +966,9 @@ pub fn spawn_periodic_reconciliation_task(
 /// best-effort `Command` wrapper.
 pub mod forge {
     use super::{
-        plan, plan_pr, resolve_stale_hours, BuildingIssue, ClaimedPr, PrClaimKind, PrReclaimReason,
-        PrReconcileAction, ReclaimReason, ReconcileAction, MAX_ISSUES_PER_WORKSPACE,
+        plan, plan_pr, resolve_no_progress_grace_minutes, resolve_stale_hours, BuildingIssue,
+        ClaimedPr, NoProgressEvidence, PrClaimKind, PrReclaimReason, PrReconcileAction,
+        ReclaimReason, ReconcileAction, MAX_ISSUES_PER_WORKSPACE,
     };
     use crate::sweep_journal;
     use anyhow::{anyhow, Context, Result};
@@ -1009,21 +1115,36 @@ pub mod forge {
         let journal = sweep_journal::load(&journal_path);
 
         let stale_hours = resolve_stale_hours();
+        let no_progress_grace_minutes = resolve_no_progress_grace_minutes();
         let now = chrono::Utc::now();
         // Issue #4348: checkpoint->run-registry join, only ever consulted by
         // `plan()` for an issue with no journal entry.
         let run_registry_pid_for = |issue: u32| super::resolve_run_registry_pid(root, issue);
-        // Issue #4462: exit-0/no-progress evidence, consulted by `plan()` only
-        // for an issue with no journal entry AND no run-registry pid (see
-        // `plan`'s ordering). A checkpoint stalled at the pre-Builder
-        // `curator-done` phase with no open linked PR is an orphaned sweep that
-        // ended without producing anything -- reclaim ahead of the age gate.
-        // Ordered cheap-check-first: the phase read is a local file, so the
-        // (gh-querying) open-PR check runs only for a genuinely no-progress
-        // checkpoint. Fails safe: any inability to confirm -> false -> age gate.
-        let no_progress_for = |issue: u32| {
-            super::read_checkpoint_phase(root, issue).as_deref() == Some(super::NO_PROGRESS_PHASE)
-                && first_open_linked_pr(gh_bin, root, issue) == Some(false)
+        // Issue #4462 (refined by #4616): exit-0/no-progress evidence,
+        // consulted by `plan()` only for an issue with no journal entry AND no
+        // run-registry pid (see `plan`'s ordering). A checkpoint stalled at
+        // the pre-Builder `curator-done` phase with no open linked PR is a
+        // no-progress candidate -- `decide` gates the actual reclaim on the
+        // checkpoint's own timestamp clearing `no_progress_grace_minutes`, so
+        // a legitimately-just-resumed Builder retry (same evidence shape for
+        // the first few minutes) is not misfired on. Ordered cheap-check-first:
+        // the phase read is a local file, so the (gh-querying) open-PR check
+        // runs only for a genuinely no-progress checkpoint. Fails safe: any
+        // inability to confirm -> None -> age gate.
+        let no_progress_for = |issue: u32| -> Option<NoProgressEvidence> {
+            if super::read_checkpoint_phase(root, issue).as_deref()
+                != Some(super::NO_PROGRESS_PHASE)
+            {
+                return None;
+            }
+            if first_open_linked_pr(gh_bin, root, issue) != Some(false) {
+                return None;
+            }
+            super::read_checkpoint_timestamp(root, issue).map(|checkpoint_timestamp| {
+                NoProgressEvidence {
+                    checkpoint_timestamp,
+                }
+            })
         };
         let decisions = plan(
             &repo,
@@ -1031,6 +1152,7 @@ pub mod forge {
             &journal,
             &run_registry_pid_for,
             &no_progress_for,
+            no_progress_grace_minutes,
             &crate::sweep_registry::is_pid_alive,
             stale_hours,
             now,
@@ -1367,7 +1489,7 @@ mod tests {
     fn decide_keeps_when_journal_entry_pid_alive() {
         let now = Utc::now();
         let entry = journal_entry("/repo/a", 42, 111);
-        let action = decide(&issue(42, None), Some(&entry), None, false, &|_| true, 4.0, now);
+        let action = decide(&issue(42, None), Some(&entry), None, None, 10.0, &|_| true, 4.0, now);
         assert_eq!(action, ReconcileAction::Keep);
     }
 
@@ -1375,7 +1497,7 @@ mod tests {
     fn decide_reclaims_when_journal_entry_pid_dead() {
         let now = Utc::now();
         let entry = journal_entry("/repo/a", 42, 111);
-        let action = decide(&issue(42, None), Some(&entry), None, false, &|_| false, 4.0, now);
+        let action = decide(&issue(42, None), Some(&entry), None, None, 10.0, &|_| false, 4.0, now);
         assert_eq!(action, ReconcileAction::Reclaim(ReclaimReason::DeadPid { pid: 111 }));
     }
 
@@ -1383,7 +1505,7 @@ mod tests {
     fn decide_keeps_when_no_record_and_within_grace() {
         let now = Utc::now();
         let recent = now - Duration::hours(1);
-        let action = decide(&issue(42, Some(recent)), None, None, false, &|_| true, 4.0, now);
+        let action = decide(&issue(42, Some(recent)), None, None, None, 10.0, &|_| true, 4.0, now);
         assert_eq!(action, ReconcileAction::Keep);
     }
 
@@ -1391,7 +1513,7 @@ mod tests {
     fn decide_reclaims_when_no_record_and_past_stale_threshold() {
         let now = Utc::now();
         let old = now - Duration::hours(5);
-        let action = decide(&issue(42, Some(old)), None, None, false, &|_| true, 4.0, now);
+        let action = decide(&issue(42, Some(old)), None, None, None, 10.0, &|_| true, 4.0, now);
         match action {
             ReconcileAction::Reclaim(ReclaimReason::NoRecordStale { age_hours }) => {
                 assert!(age_hours >= 4.0);
@@ -1405,14 +1527,14 @@ mod tests {
         let now = Utc::now();
         // Just under the threshold: still within grace.
         let almost = now - Duration::minutes(239); // 3h59m < 4h
-        let action = decide(&issue(42, Some(almost)), None, None, false, &|_| true, 4.0, now);
+        let action = decide(&issue(42, Some(almost)), None, None, None, 10.0, &|_| true, 4.0, now);
         assert_eq!(action, ReconcileAction::Keep);
     }
 
     #[test]
     fn decide_keeps_when_no_record_and_no_age_evidence() {
         let now = Utc::now();
-        let action = decide(&issue(42, None), None, None, false, &|_| true, 4.0, now);
+        let action = decide(&issue(42, None), None, None, None, 10.0, &|_| true, 4.0, now);
         assert_eq!(action, ReconcileAction::Keep, "fail-safe: no evidence => Keep");
     }
 
@@ -1423,7 +1545,7 @@ mod tests {
         let now = Utc::now();
         let entry = journal_entry("/repo/a", 42, 111);
         let fresh_issue = issue(42, Some(now - Duration::minutes(1)));
-        let action = decide(&fresh_issue, Some(&entry), None, false, &|_| false, 4.0, now);
+        let action = decide(&fresh_issue, Some(&entry), None, None, 10.0, &|_| false, 4.0, now);
         assert_eq!(action, ReconcileAction::Reclaim(ReclaimReason::DeadPid { pid: 111 }));
     }
 
@@ -1434,7 +1556,8 @@ mod tests {
     #[test]
     fn decide_keeps_when_run_registry_pid_alive_and_no_journal_entry() {
         let now = Utc::now();
-        let action = decide(&issue(42, None), None, Some(222), false, &|pid| pid == 222, 4.0, now);
+        let action =
+            decide(&issue(42, None), None, Some(222), None, 10.0, &|pid| pid == 222, 4.0, now);
         assert_eq!(action, ReconcileAction::Keep);
     }
 
@@ -1445,7 +1568,7 @@ mod tests {
         // period, but the run-registry evidence is provable and immediate,
         // no age grace, exactly like the journal's DeadPid branch.
         let fresh_issue = issue(42, Some(now - Duration::minutes(1)));
-        let action = decide(&fresh_issue, None, Some(999), false, &|_| false, 4.0, now);
+        let action = decide(&fresh_issue, None, Some(999), None, 10.0, &|_| false, 4.0, now);
         assert_eq!(action, ReconcileAction::Reclaim(ReclaimReason::DeadRunRegistry { pid: 999 }));
     }
 
@@ -1455,8 +1578,16 @@ mod tests {
         // decides, and the run-registry pid is never even consulted.
         let now = Utc::now();
         let entry = journal_entry("/repo/a", 42, 111);
-        let action =
-            decide(&issue(42, None), Some(&entry), Some(999), false, &|pid| pid == 111, 4.0, now);
+        let action = decide(
+            &issue(42, None),
+            Some(&entry),
+            Some(999),
+            None,
+            10.0,
+            &|pid| pid == 111,
+            4.0,
+            now,
+        );
         assert_eq!(action, ReconcileAction::Keep);
     }
 
@@ -1464,7 +1595,7 @@ mod tests {
     fn decide_falls_back_to_age_rule_when_run_registry_pid_absent() {
         let now = Utc::now();
         let old = now - Duration::hours(5);
-        let action = decide(&issue(42, Some(old)), None, None, false, &|_| true, 4.0, now);
+        let action = decide(&issue(42, Some(old)), None, None, None, 10.0, &|_| true, 4.0, now);
         match action {
             ReconcileAction::Reclaim(ReclaimReason::NoRecordStale { .. }) => {}
             other => panic!("expected NoRecordStale reclaim, got {other:?}"),
@@ -1480,39 +1611,98 @@ mod tests {
         // No journal entry, no run-registry pid (the in-session sweep's entry
         // was cleaned up at exit), a FRESH label (well within the age grace),
         // but the caller's no-progress evidence is set: a checkpoint stalled at
-        // curator-done with no open PR. This is the #4462 orphan the age gate
+        // curator-done with no open PR, and its own timestamp is well past the
+        // no-progress grace period. This is the #4462 orphan the age gate
         // would otherwise sit on for hours -- reclaim NOW.
         let now = Utc::now();
         let fresh_issue = issue(42, Some(now - Duration::minutes(1)));
-        let action = decide(&fresh_issue, None, None, true, &|_| true, 4.0, now);
+        let stale_checkpoint = NoProgressEvidence {
+            checkpoint_timestamp: now - Duration::minutes(35),
+        };
+        let action =
+            decide(&fresh_issue, None, None, Some(stale_checkpoint), 10.0, &|_| true, 4.0, now);
         assert_eq!(action, ReconcileAction::Reclaim(ReclaimReason::ExitedNoProgress));
+    }
+
+    /// Issue #4616: the exact race a resumed Builder retry produces —
+    /// checkpoint at `curator-done`, no PR yet, no journal entry, and the
+    /// checkpoint→run-registry join resolves to `None` (the ORIGINAL run's
+    /// registry entry was already pruned) — must NOT be reclaimed while the
+    /// checkpoint's own timestamp is still within the grace window. This is
+    /// indistinguishable, by this evidence alone, from a brand-new resumed
+    /// Builder run that has not yet linked back to the checkpoint or opened a
+    /// PR.
+    #[test]
+    fn decide_keeps_exited_no_progress_within_grace_window() {
+        let now = Utc::now();
+        // The `loom:building` label itself may be old (from the ORIGINAL
+        // claim, long before this resumed attempt) -- deliberately outside
+        // the age-rule's own grace, so a Keep here can only be explained by
+        // the no-progress grace window, not a fall-through to the age rule.
+        let old_label_issue = issue(42, Some(now - Duration::hours(5)));
+        let fresh_checkpoint = NoProgressEvidence {
+            checkpoint_timestamp: now - Duration::minutes(2),
+        };
+        let action =
+            decide(&old_label_issue, None, None, Some(fresh_checkpoint), 10.0, &|_| true, 4.0, now);
+        assert_eq!(
+            action,
+            ReconcileAction::Keep,
+            "a checkpoint within the no-progress grace window must Keep, not Reclaim or fall \
+             through to the (stale) age rule"
+        );
     }
 
     #[test]
     fn decide_no_progress_never_overrides_a_live_journal_pid() {
-        // A live journal pid is authoritative: even with no_progress=true the
-        // running sweep must be kept. Ordering guarantee -- a spurious
-        // no_progress can never reclaim a live sweep.
+        // A live journal pid is authoritative: even with no-progress evidence
+        // past its grace period, the running sweep must be kept. Ordering
+        // guarantee -- spurious no-progress evidence can never reclaim a live
+        // sweep.
         let now = Utc::now();
         let entry = journal_entry("/repo/a", 42, 111);
-        let action = decide(&issue(42, None), Some(&entry), None, true, &|_| true, 4.0, now);
+        let stale_checkpoint = NoProgressEvidence {
+            checkpoint_timestamp: now - Duration::minutes(35),
+        };
+        let action = decide(
+            &issue(42, None),
+            Some(&entry),
+            None,
+            Some(stale_checkpoint),
+            10.0,
+            &|_| true,
+            4.0,
+            now,
+        );
         assert_eq!(action, ReconcileAction::Keep);
     }
 
     #[test]
     fn decide_no_progress_never_overrides_a_live_run_registry_pid() {
         let now = Utc::now();
-        let action = decide(&issue(42, None), None, Some(222), true, &|pid| pid == 222, 4.0, now);
+        let stale_checkpoint = NoProgressEvidence {
+            checkpoint_timestamp: now - Duration::minutes(35),
+        };
+        let action = decide(
+            &issue(42, None),
+            None,
+            Some(222),
+            Some(stale_checkpoint),
+            10.0,
+            &|pid| pid == 222,
+            4.0,
+            now,
+        );
         assert_eq!(action, ReconcileAction::Keep);
     }
 
     #[test]
-    fn decide_no_progress_false_still_falls_through_to_age_gate() {
-        // no_progress=false must not disturb the existing age-rule behavior:
+    fn decide_no_progress_none_still_falls_through_to_age_gate() {
+        // no_progress=None must not disturb the existing age-rule behavior:
         // a fresh label with no evidence is still Kept.
         let now = Utc::now();
         let fresh_issue = issue(42, Some(now - Duration::minutes(1)));
-        let action = decide(&fresh_issue, None, None, false, &|_| true, 4.0, now);
+        let action = decide(&fresh_issue, None, None, None, 10.0, &|_| true, 4.0, now);
         assert_eq!(action, ReconcileAction::Keep);
     }
 
@@ -1520,9 +1710,9 @@ mod tests {
     fn plan_consults_no_progress_only_when_no_pid_evidence() {
         // #1 has a live journal pid; #2 has a dead run-registry pid; #3 has
         // neither. The no_progress closure records which issues it was asked
-        // about and returns true for all -- it must be consulted for #3 ONLY
-        // (mirroring decide()'s priority), and #1/#2 must be decided by their
-        // pid evidence, never ExitedNoProgress.
+        // about and returns stale evidence for all -- it must be consulted
+        // for #3 ONLY (mirroring decide()'s priority), and #1/#2 must be
+        // decided by their pid evidence, never ExitedNoProgress.
         use std::cell::RefCell;
         let now = Utc::now();
         let mut journal = SweepJournal::default();
@@ -1541,7 +1731,9 @@ mod tests {
         let asked: RefCell<Vec<u32>> = RefCell::new(Vec::new());
         let no_progress_for = |n: u32| {
             asked.borrow_mut().push(n);
-            true
+            Some(NoProgressEvidence {
+                checkpoint_timestamp: now - Duration::minutes(35),
+            })
         };
         let is_alive = |pid: u32| pid == 111;
         let decisions = plan(
@@ -1550,6 +1742,7 @@ mod tests {
             &journal,
             &run_registry_pid_for,
             &no_progress_for,
+            10.0,
             &is_alive,
             4.0,
             now,
@@ -1580,8 +1773,17 @@ mod tests {
             issue(3, Some(now - Duration::hours(10))),
         ];
 
-        let decisions =
-            plan("/repo/a", &issues, &journal, &|_| None, &|_| false, &|pid| pid == 222, 4.0, now);
+        let decisions = plan(
+            "/repo/a",
+            &issues,
+            &journal,
+            &|_| None,
+            &|_| None,
+            10.0,
+            &|pid| pid == 222,
+            4.0,
+            now,
+        );
 
         assert_eq!(decisions.len(), 3);
         assert_eq!(
@@ -1604,7 +1806,7 @@ mod tests {
 
         let issues = vec![issue(42, Some(now - Duration::hours(10)))];
         let decisions =
-            plan("/repo/a", &issues, &journal, &|_| None, &|_| false, &|_| true, 4.0, now);
+            plan("/repo/a", &issues, &journal, &|_| None, &|_| None, 10.0, &|_| true, 4.0, now);
 
         // No entry under "/repo/a" -> falls through to the age check, which
         // is stale here, so it reclaims (not "Keep" from the other repo's
@@ -1642,7 +1844,8 @@ mod tests {
             &issues,
             &journal,
             &run_registry_pid_for,
-            &|_| false,
+            &|_| None,
+            10.0,
             &is_alive,
             4.0,
             now,
@@ -1688,6 +1891,33 @@ mod tests {
         assert!((resolve_stale_hours() - DEFAULT_STALE_BUILDING_HOURS).abs() < f64::EPSILON);
 
         std::env::remove_var(STALE_HOURS_ENV);
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_no_progress_grace_minutes_defaults_and_overrides() {
+        std::env::remove_var(NO_PROGRESS_GRACE_MINUTES_ENV);
+        assert!(
+            (resolve_no_progress_grace_minutes() - DEFAULT_NO_PROGRESS_GRACE_MINUTES).abs()
+                < f64::EPSILON
+        );
+
+        std::env::set_var(NO_PROGRESS_GRACE_MINUTES_ENV, "3.5");
+        assert!((resolve_no_progress_grace_minutes() - 3.5).abs() < f64::EPSILON);
+
+        // Non-positive / unparseable falls back to the default.
+        std::env::set_var(NO_PROGRESS_GRACE_MINUTES_ENV, "0");
+        assert!(
+            (resolve_no_progress_grace_minutes() - DEFAULT_NO_PROGRESS_GRACE_MINUTES).abs()
+                < f64::EPSILON
+        );
+        std::env::set_var(NO_PROGRESS_GRACE_MINUTES_ENV, "garbage");
+        assert!(
+            (resolve_no_progress_grace_minutes() - DEFAULT_NO_PROGRESS_GRACE_MINUTES).abs()
+                < f64::EPSILON
+        );
+
+        std::env::remove_var(NO_PROGRESS_GRACE_MINUTES_ENV);
     }
 
     // ------------------------------------------------------------------
@@ -1858,14 +2088,29 @@ mod tests {
     /// Seed a checkpoint recording an arbitrary `phase` (and no run-registry
     /// join by default -- callers add one separately if needed). Used by the
     /// Issue #4462 exit-0/no-progress tests, which need a `curator-done`
-    /// checkpoint with NO surviving run-registry entry.
+    /// checkpoint with NO surviving run-registry entry. The checkpoint
+    /// `timestamp` is a fixed date far in the past, well outside any
+    /// no-progress grace window, so this helper's checkpoints already read as
+    /// "stale enough to reclaim" by construction.
     fn seed_checkpoint_phase(root: &std::path::Path, issue: u32, phase: &str) {
+        seed_checkpoint_phase_with_timestamp(root, issue, phase, "2026-01-01T00:00:00Z");
+    }
+
+    /// Like [`seed_checkpoint_phase`], but with an explicit `timestamp` —
+    /// needed by the Issue #4616 grace-window tests, which must control
+    /// whether the checkpoint reads as "just resumed" or "aged past grace".
+    fn seed_checkpoint_phase_with_timestamp(
+        root: &std::path::Path,
+        issue: u32,
+        phase: &str,
+        timestamp: &str,
+    ) {
         let dir = root.join(".loom").join("sweep-checkpoint");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join(format!("issue-{issue}.json")),
             format!(
-                r#"{{"phase":"{phase}","task_id":"sweep-{issue}","timestamp":"2026-01-01T00:00:00Z","pr_number":null}}"#
+                r#"{{"phase":"{phase}","task_id":"sweep-{issue}","timestamp":"{timestamp}","pr_number":null}}"#
             ),
         )
         .unwrap();
@@ -2179,6 +2424,57 @@ exit 0
         assert!(
             gh_calls.contains("issue edit 80 --remove-label loom:building --add-label loom:issue"),
             "expected reclaim to flip labels for #80; got: {gh_calls:?}"
+        );
+
+        std::env::remove_var(sweep_journal::JOURNAL_PATH_ENV);
+    }
+
+    /// The Issue #4616 regression, end to end: a resumed Builder retry looks
+    /// byte-for-byte identical to the #4462 orphan (checkpoint at
+    /// `curator-done`, no run-registry join, no open PR) for the first few
+    /// minutes after it resumes — the checkpoint's `task_id` is only rewritten
+    /// on Builder *completion*, not on resume, so the join legitimately
+    /// resolves to nothing. `reconcile_workspace` must NOT reclaim while the
+    /// checkpoint's own timestamp is still within the no-progress grace
+    /// window, even though the `loom:building` label itself may be old (from
+    /// the ORIGINAL, now-superseded claim).
+    #[test]
+    #[serial]
+    fn reconcile_workspace_keeps_exited_no_progress_within_grace_window() {
+        let dir = tempdir().unwrap();
+        let repo_root = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+
+        let journal_path = dir.path().join("sweeps.json");
+        std::env::set_var(sweep_journal::JOURNAL_PATH_ENV, &journal_path);
+
+        // Checkpoint stalled at curator-done, no run-registry join, but its
+        // own timestamp is only 2 minutes old -- well within the default
+        // 10-minute grace period (a fresh resume, not a proven orphan).
+        let fresh_timestamp = Utc::now() - chrono::Duration::minutes(2);
+        seed_checkpoint_phase_with_timestamp(
+            &repo_root,
+            83,
+            "curator-done",
+            &fresh_timestamp.to_rfc3339(),
+        );
+
+        // The `loom:building` label itself is OLD (the original claim, long
+        // before this resumed attempt) -- deliberately outside the age rule's
+        // own grace, so a Keep here can only be explained by the no-progress
+        // grace window, not a fall-through to a still-fresh label.
+        let gh_log = dir.path().join("gh-invocations.log");
+        let old_label = (Utc::now() - chrono::Duration::hours(5)).to_rfc3339();
+        let fake_gh = write_fake_gh(dir.path(), &gh_log, 83, &old_label);
+
+        let (checked, reclaimed) = forge::reconcile_workspace(&fake_gh, &repo_root);
+
+        assert_eq!(checked, 1);
+        assert_eq!(
+            reclaimed, 0,
+            "a curator-done checkpoint whose OWN timestamp is within the no-progress grace \
+             window must be kept -- it is indistinguishable from a legitimately-resumed \
+             Builder retry (#4616)"
         );
 
         std::env::remove_var(sweep_journal::JOURNAL_PATH_ENV);
