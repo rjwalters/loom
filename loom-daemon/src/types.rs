@@ -1203,7 +1203,10 @@ pub struct DaemonStatusReport {
 /// "New-host onboarding" for the operator story.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SafehouseStatus {
-    /// One of `"not_configured"`, `"unreachable"`, `"connected"`.
+    /// One of `"not_configured"`, `"unreachable"`, `"connected"`,
+    /// `"send_rejected"` (#4464: handshake succeeds but every `send` is
+    /// rejected at the protocol layer, e.g. `'room' required` on a multi-room
+    /// host with `safehouse.room` unset).
     pub state: String,
     /// The resolved socket path the daemon last tried/uses, when known.
     /// `None` for `"not_configured"` (including the "enabled but no socket
@@ -1218,6 +1221,12 @@ pub struct SafehouseStatus {
     /// case).
     #[serde(default)]
     pub room: Option<String>,
+    /// The rejection reason, present only when `state == "send_rejected"`
+    /// (#4464) — the raw `error` string safehoused returned for the rejected
+    /// `send` (e.g. `'room' required: 3 rooms joined`). `#[serde(default)]`
+    /// keeps pre-#4464 wire payloads (which never carried it) compatible.
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 /// Host-distress circuit-breaker snapshot for `loom-daemon status` (Issue
@@ -1840,6 +1849,87 @@ impl Event {
             *slot = Some(repo.to_string());
         }
     }
+
+    /// Build the bus event for a child-published `PublishEvent { topic, payload }`
+    /// request (Issue #4466).
+    ///
+    /// The two **child-published** sweep topics — `sweep.issue.{N}.phase` and
+    /// `sweep.issue.{N}.blocker` — are upgraded to their typed [`Event`]
+    /// variants ([`Event::SweepPhase`] / [`Event::SweepBlocker`]) when the topic
+    /// parses and the payload matches the documented schema
+    /// (`defaults/.claude/commands/loom/sweep.md`). This is what lets the
+    /// narration sink ([`crate::safehouse::event_to_envelope`]) emit the
+    /// documented `task` / `handoff` room lines — a raw [`Event::Generic`] is
+    /// never narrated, so before this upgrade the child's phase/blocker lines
+    /// silently never reached the room.
+    ///
+    /// Publish is **fire-and-forget advisory**: an unknown topic, a
+    /// non-integer issue segment, or a payload that does not match the
+    /// documented schema is never rejected — it falls through to
+    /// [`Event::Generic`] with the topic + payload passed through **unchanged**
+    /// (byte-for-byte the pre-#4466 behavior for everything except the two
+    /// documented topics). Unknown fields in an otherwise-valid payload are
+    /// ignored for forward-compatibility.
+    #[must_use]
+    pub fn from_published(topic: String, payload: serde_json::Value) -> Self {
+        match Self::try_typed_child_event(&topic, &payload) {
+            Some(event) => event,
+            None => Self::Generic { topic, payload },
+        }
+    }
+
+    /// Attempt to parse a child-published `topic` + `payload` into a typed
+    /// sweep event. Returns `None` (→ caller keeps it [`Event::Generic`]) for
+    /// any topic outside the two documented child-published topics, or for a
+    /// payload that does not match the documented schema. See
+    /// [`Self::from_published`].
+    fn try_typed_child_event(topic: &str, payload: &serde_json::Value) -> Option<Self> {
+        // Segment-aligned parse of `sweep.issue.{N}.{kind}` — exactly four
+        // segments, matching the bus's segment-aligned prefix routing (so
+        // `sweep.issuetype.foo` is NOT mistaken for a sweep-issue topic).
+        let segments: Vec<&str> = topic.split('.').collect();
+        if segments.len() != 4 || segments[0] != "sweep" || segments[1] != "issue" {
+            return None;
+        }
+        let issue: u32 = segments[2].parse().ok()?;
+
+        match segments[3] {
+            "phase" => {
+                #[derive(Deserialize)]
+                struct PhasePayload {
+                    phase: String,
+                    #[serde(default)]
+                    pr_number: Option<i32>,
+                    #[serde(default)]
+                    repo: Option<String>,
+                }
+                let p: PhasePayload = serde_json::from_value(payload.clone()).ok()?;
+                Some(Self::SweepPhase {
+                    issue,
+                    phase: p.phase,
+                    pr_number: p.pr_number,
+                    repo: p.repo,
+                })
+            }
+            "blocker" => {
+                #[derive(Deserialize)]
+                struct BlockerPayload {
+                    reason: String,
+                    label_added: String,
+                    #[serde(default)]
+                    repo: Option<String>,
+                }
+                let p: BlockerPayload = serde_json::from_value(payload.clone()).ok()?;
+                Some(Self::SweepBlocker {
+                    issue,
+                    reason: p.reason,
+                    label_added: p.label_added,
+                    repo: p.repo,
+                })
+            }
+            _ => None,
+        }
+    }
 }
 
 /// The four action classes the epic supervisor emits on the event bus, one per
@@ -1991,6 +2081,139 @@ mod tests {
                 assert!(pr_number.is_none());
             }
             other => panic!("expected SweepPhase, got {other:?}"),
+        }
+    }
+
+    // ---- Issue #4466: child-published topics upgrade to typed variants ----
+
+    #[test]
+    fn from_published_upgrades_phase_topic() {
+        let ev = Event::from_published(
+            "sweep.issue.123.phase".to_string(),
+            serde_json::json!({"phase": "builder", "pr_number": 42, "repo": "/work/loom"}),
+        );
+        match ev {
+            Event::SweepPhase {
+                issue,
+                phase,
+                pr_number,
+                repo,
+            } => {
+                assert_eq!(issue, 123);
+                assert_eq!(phase, "builder");
+                assert_eq!(pr_number, Some(42));
+                assert_eq!(repo.as_deref(), Some("/work/loom"));
+            }
+            other => panic!("expected SweepPhase, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_published_upgrades_phase_topic_minimal_payload() {
+        // Only the required `phase` field — optionals default to None.
+        let ev = Event::from_published(
+            "sweep.issue.7.phase".to_string(),
+            serde_json::json!({"phase": "curator"}),
+        );
+        match ev {
+            Event::SweepPhase {
+                issue,
+                phase,
+                pr_number,
+                repo,
+            } => {
+                assert_eq!(issue, 7);
+                assert_eq!(phase, "curator");
+                assert!(pr_number.is_none());
+                assert!(repo.is_none());
+            }
+            other => panic!("expected SweepPhase, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_published_upgrades_blocker_topic() {
+        let ev = Event::from_published(
+            "sweep.issue.456.blocker".to_string(),
+            serde_json::json!({"reason": "needs human", "label_added": "loom:blocked"}),
+        );
+        match ev {
+            Event::SweepBlocker {
+                issue,
+                reason,
+                label_added,
+                repo,
+            } => {
+                assert_eq!(issue, 456);
+                assert_eq!(reason, "needs human");
+                assert_eq!(label_added, "loom:blocked");
+                assert!(repo.is_none());
+            }
+            other => panic!("expected SweepBlocker, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_published_keeps_generic_for_unknown_and_malformed() {
+        // Malformed payload (missing required field), unknown sub-topic,
+        // non-integer issue, and unrelated topics all stay Generic with the
+        // payload passed through unchanged.
+        let cases: &[(&str, serde_json::Value)] = &[
+            ("sweep.issue.1.phase", serde_json::json!({"pr_number": 5})),
+            ("sweep.issue.1.blocker", serde_json::json!({"reason": "x"})),
+            ("sweep.issue.1.other", serde_json::json!({"phase": "builder"})),
+            ("sweep.issue.abc.phase", serde_json::json!({"phase": "builder"})),
+            ("sweep.issuetype.foo", serde_json::json!({"phase": "builder"})),
+            ("custom.topic", serde_json::json!({"k": "v"})),
+        ];
+        for (topic, payload) in cases {
+            let ev = Event::from_published((*topic).to_string(), payload.clone());
+            match ev {
+                Event::Generic {
+                    topic: got_topic,
+                    payload: got_payload,
+                } => {
+                    assert_eq!(&got_topic, topic);
+                    assert_eq!(&got_payload, payload, "payload unchanged for {topic}");
+                }
+                other => panic!("expected Generic for {topic}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn from_published_phase_rejects_wrong_typed_pr_number() {
+        // A non-integer `pr_number` is a malformed payload → stays Generic.
+        let ev = Event::from_published(
+            "sweep.issue.1.phase".to_string(),
+            serde_json::json!({"phase": "builder", "pr_number": "not-an-int"}),
+        );
+        assert!(matches!(ev, Event::Generic { .. }));
+    }
+
+    #[test]
+    fn set_repo_if_absent_stamps_upgraded_child_events() {
+        // Issue #4466: an upgraded child-published event with no `repo` in its
+        // payload is stampable via the same `set_repo_if_absent` path the
+        // daemon uses for its own sweep events.
+        let mut phase = Event::from_published(
+            "sweep.issue.9.phase".to_string(),
+            serde_json::json!({"phase": "judge"}),
+        );
+        phase.set_repo_if_absent("/repos/stamped");
+        match &phase {
+            Event::SweepPhase { repo, .. } => assert_eq!(repo.as_deref(), Some("/repos/stamped")),
+            other => panic!("expected SweepPhase, got {other:?}"),
+        }
+
+        let mut blocker = Event::from_published(
+            "sweep.issue.9.blocker".to_string(),
+            serde_json::json!({"reason": "x", "label_added": "loom:blocked"}),
+        );
+        blocker.set_repo_if_absent("/repos/stamped");
+        match &blocker {
+            Event::SweepBlocker { repo, .. } => assert_eq!(repo.as_deref(), Some("/repos/stamped")),
+            other => panic!("expected SweepBlocker, got {other:?}"),
         }
     }
 

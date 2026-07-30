@@ -56,6 +56,7 @@ use crate::peer_claims::{self, ClaimAd, PeerClaimView};
 use crate::quarantine_reconciliation;
 use crate::sweep_journal;
 use crate::tokens_pool::bad_tokens;
+use crate::tokens_pool::{self, AccountId, AccountProvider, TerminalClassification};
 use crate::types::{Event, SweepId, SweepInfo, SweepKind, SweepOutcome, SweepState};
 
 use anyhow::{anyhow, Context, Result};
@@ -390,6 +391,56 @@ const TOKEN_NAME_LOG_MARKER: &str = "using OAuth account '";
 const ACCOUNT_LOG_MARKER: &str = "# LOOM_ACCOUNT name=";
 const RUNTIME_LOG_MARKER: &str = "# LOOM_RUNTIME_RESOLVED runtime=";
 const CLI_START_MARKER: &str = "# LOOM_CLI_START";
+const TERMINAL_RESULT_MARKER: &str = "# LOOM_TERMINAL_RESULT ";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TerminalResult {
+    provider: AccountProvider,
+    account: String,
+    category: TerminalClassification,
+    exit_code: i32,
+}
+
+/// Parse the adapter's strict v1 record from only the current dispatch region.
+/// Unknown fields, duplicate records, malformed identities, and unknown
+/// categories all fail closed: no account health is mutated.
+fn parse_terminal_result_after(contents: &str, header_anchor: &str) -> Option<TerminalResult> {
+    let region = &contents[contents.rfind(header_anchor)?..];
+    let records: Vec<_> = region
+        .lines()
+        .filter(|line| line.starts_with(TERMINAL_RESULT_MARKER))
+        .collect();
+    if records.len() != 1 {
+        return None;
+    }
+    let fields: HashMap<_, _> = records[0][TERMINAL_RESULT_MARKER.len()..]
+        .split_ascii_whitespace()
+        .filter_map(|field| field.split_once('='))
+        .collect();
+    if fields.len() != 5 || fields.get("v") != Some(&"1") {
+        return None;
+    }
+    let provider = match *fields.get("provider")? {
+        "claude" => AccountProvider::Claude,
+        "codex" => AccountProvider::Codex,
+        _ => return None,
+    };
+    let account = fields.get("account")?.to_string();
+    if account == UNKNOWN_TOKEN_NAME
+        || account.is_empty()
+        || !account
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        return None;
+    }
+    Some(TerminalResult {
+        provider,
+        account,
+        category: fields.get("category")?.parse().ok()?,
+        exit_code: fields.get("exit_code")?.parse().ok()?,
+    })
+}
 
 /// Issue #3802: how long `spawn_child` polls the per-sweep log for the
 /// `TOKEN_NAME_LOG_MARKER` line before giving up and recording
@@ -1515,6 +1566,19 @@ impl SweepRegistryConfig {
             .join("sweep.md")
             .exists()
     }
+}
+
+/// Outcome of an ownership-checked lock release (Issue #4463).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockReleaseOutcome {
+    /// The lock dir was removed — either its `owner.json` `sweep_id` matched
+    /// the releasing sweep, or the owner was unreadable (fail-open), or no lock
+    /// existed (idempotent no-op).
+    Released,
+    /// A *different* sweep owns the lock (a newer sweep re-acquired the claim
+    /// after the releasing one died). The lock was left intact; the caller MUST
+    /// NOT restore the label or re-dispatch.
+    Superseded,
 }
 
 /// On-disk owner metadata written inside the lock dir. Schema mirrors
@@ -2746,6 +2810,12 @@ impl SweepRegistry {
     }
 
     /// Release the lock dir for an issue (idempotent).
+    ///
+    /// UNCONDITIONAL: removes `.loom/locks/issue-<N>` regardless of which sweep
+    /// owns it. Prefer [`release_lock_owned`](Self::release_lock_owned) from any
+    /// reaper / cancel / re-dispatch path so a newer sweep's live claim is not
+    /// clobbered (Issue #4463) — this remains for callers that intentionally
+    /// want an owner-blind removal.
     pub fn release_lock(&self, issue: u32) -> Result<()> {
         let lock = self.config.locks_dir().join(format!("issue-{issue}"));
         if lock.exists() {
@@ -2753,6 +2823,71 @@ impl SweepRegistry {
                 .with_context(|| format!("failed to remove lock dir {}", lock.display()))?;
         }
         Ok(())
+    }
+
+    /// Ownership-checked lock release (Issue #4463).
+    ///
+    /// Removes `.loom/locks/issue-<N>` **only when** its `owner.json`
+    /// `sweep_id` matches `sweep_id` — the sweep being reaped / cancelled /
+    /// re-dispatched. When a *different* sweep owns the lock (a newer sweep
+    /// re-acquired the claim after this one died — the double-dispatch incident
+    /// this guards against), the lock is left intact and
+    /// [`LockReleaseOutcome::Superseded`] is returned so the caller skips any
+    /// label restore and any re-dispatch: the newer sweep is the live owner and
+    /// runs its own lifecycle.
+    ///
+    /// FAIL-OPEN: a missing / unreadable / corrupt / unparseable `owner.json`
+    /// falls back to the legacy unconditional removal — the release only refuses
+    /// on a *positively-read, conflicting* owner, so a garbage lock file can
+    /// never wedge an issue permanently. A non-existent lock dir is a no-op
+    /// ([`LockReleaseOutcome::Released`], idempotent).
+    #[must_use]
+    pub fn release_lock_owned(&self, issue: u32, sweep_id: &str) -> LockReleaseOutcome {
+        let lock = self.config.locks_dir().join(format!("issue-{issue}"));
+        if !lock.exists() {
+            return LockReleaseOutcome::Released;
+        }
+        if self.lock_owned_by_other(issue, sweep_id) {
+            return LockReleaseOutcome::Superseded;
+        }
+        if let Err(e) = std::fs::remove_dir_all(&lock) {
+            log::warn!("release_lock: failed to remove lock dir {}: {e}", lock.display());
+        }
+        LockReleaseOutcome::Released
+    }
+
+    /// Read-only ownership probe (Issue #4463): `true` iff the issue lock's
+    /// `owner.json` records a `sweep_id` *different* from `sweep_id` — i.e. a
+    /// newer sweep re-acquired the claim after the querying sweep died. Unlike
+    /// [`release_lock_owned`](Self::release_lock_owned) this never mutates the
+    /// filesystem, so a caller can gate destructive work (worktree cleanup,
+    /// re-dispatch) on it without prematurely freeing the lock.
+    ///
+    /// FAIL-OPEN: a missing lock dir, or an unreadable / unparseable
+    /// `owner.json`, resolves to `false` (not-conflicting) so a garbage owner
+    /// file can never wedge an issue.
+    fn lock_owned_by_other(&self, issue: u32, sweep_id: &str) -> bool {
+        let owner_path = self
+            .config
+            .locks_dir()
+            .join(format!("issue-{issue}"))
+            .join("owner.json");
+        // Only report a conflict on a POSITIVELY-read differing owner.
+        match std::fs::read_to_string(&owner_path) {
+            Ok(contents) => match serde_json::from_str::<LockOwner>(&contents) {
+                Ok(owner) if owner.sweep_id != sweep_id => {
+                    log::info!(
+                        "release_lock: issue #{issue} lock is owned by sweep {} \
+                         (sweep {sweep_id} was superseded) — leaving the lock intact and \
+                         skipping any re-dispatch (#4463)",
+                        owner.sweep_id
+                    );
+                    true
+                }
+                _ => false,
+            },
+            Err(_) => false,
+        }
     }
 
     /// Best-effort removal of this registry's sweep-journal entry for
@@ -3137,6 +3272,44 @@ impl SweepRegistry {
             return;
         }
         self.record_terminal_outcome(issue, insta_crash);
+    }
+
+    /// Persist provider health before any reaper retry/failover decision.
+    fn apply_provider_health_feedback(&self, sweep_id: &SweepId, exit_code: Option<i32>) {
+        let Some(info) = self.entries.get(sweep_id) else {
+            return;
+        };
+        if info.runtime != "codex" || info.token_name == UNKNOWN_TOKEN_NAME {
+            return;
+        }
+        let Ok(contents) = std::fs::read_to_string(&info.log_path) else {
+            return;
+        };
+        let anchor = format!("sweep_id={sweep_id}");
+        let Some(result) = parse_terminal_result_after(&contents, &anchor) else {
+            return;
+        };
+        if result.provider != AccountProvider::Codex
+            || result.account != info.token_name
+            || exit_code.is_some_and(|code| code != result.exit_code)
+        {
+            log::warn!("sweep_registry: ignored mismatched Codex terminal feedback for {sweep_id}");
+            return;
+        }
+        let id = AccountId {
+            provider: result.provider,
+            name: result.account,
+        };
+        if let Err(error) = tokens_pool::record_terminal(
+            &self.config.workspace_root,
+            &id,
+            result.category,
+            "spawn-codex:v1",
+        ) {
+            log::warn!(
+                "sweep_registry: failed to persist Codex terminal feedback for {sweep_id}: {error}"
+            );
+        }
     }
 
     /// Classify whether an insta-crash death was caused by account exhaustion
@@ -4226,7 +4399,12 @@ impl SweepRegistry {
             };
         }
         if let SweepKind::Issue(issue) = kind {
-            let _ = self.release_lock(*issue);
+            // Ownership-checked release (#4463): if a newer sweep re-acquired
+            // this issue's lock after the sweep being cancelled died, leave its
+            // live lock intact and skip the label restore below — the newer
+            // sweep owns the claim and runs its own lifecycle.
+            let superseded =
+                self.release_lock_owned(*issue, sweep_id) == LockReleaseOutcome::Superseded;
             // Best-effort tidy-up of the machine-level liveness journal
             // (#3953) — this cancelled sweep no longer exists.
             self.journal_remove_best_effort(*issue);
@@ -4240,7 +4418,9 @@ impl SweepRegistry {
             // produced no PR, so we never yank the label out from under an
             // in-flight PR's issue. Gated on `!skip_label_flip`, mirroring the
             // reaper path. `SweepKind::PrSet` cancels never reach here.
-            if !self.config.skip_label_flip && !produced_pr {
+            // #4463: a superseded release means a newer sweep now holds the
+            // claim — never restore the label out from under it.
+            if !self.config.skip_label_flip && !produced_pr && !superseded {
                 let _ = self.restore_label_to_ready(*issue);
             }
             self.emit_event(Event::SweepExited {
@@ -4340,6 +4520,9 @@ impl SweepRegistry {
             // handle fall back to the `kill(pid, 0)` probe.
             let (is_dead, exit_code) = self.poll_liveness(&sweep_id, pid);
             if is_dead {
+                // #4493: account health must be updated before any bounded
+                // re-dispatch path below asks the selector for another profile.
+                self.apply_provider_health_feedback(&sweep_id, exit_code);
                 {
                     changes += 1;
                     let issue = match &kind {
@@ -4350,7 +4533,15 @@ impl SweepRegistry {
                     let duration_sec = (now - started_at).num_seconds();
                     // Release lock and decide between Exited vs Crashed.
                     if let Some(issue) = issue {
-                        let _ = self.release_lock(issue);
+                        // Ownership-checked release (#4463): a reaper tick (in
+                        // this daemon or any other instance sharing the
+                        // workspace) must never delete a lock that a *newer*
+                        // live sweep re-acquired after this dead one. When the
+                        // lock is `Superseded`, skip the label restore AND the
+                        // resume/re-dispatch below — the dead sweep is not
+                        // crashed-needing-recovery, it is superseded.
+                        let superseded = self.release_lock_owned(issue, &sweep_id)
+                            == LockReleaseOutcome::Superseded;
                         // Best-effort tidy-up of the machine-level liveness
                         // journal (#3953): the reaper just confirmed this
                         // PID is dead, so drop its entry now rather than
@@ -4363,7 +4554,9 @@ impl SweepRegistry {
                             .checkpoint_dir()
                             .join(format!("issue-{issue}.json"));
                         if checkpoint.exists() {
-                            if !self.config.skip_label_flip {
+                            // #4463: never restore the label when a newer sweep
+                            // owns the lock — it is actively building.
+                            if !self.config.skip_label_flip && !superseded {
                                 let _ = self.restore_label_to_ready(issue);
                             }
                             let checkpoint_phase = read_checkpoint_phase(&checkpoint);
@@ -4499,6 +4692,7 @@ impl SweepRegistry {
                             // just deliberately left without `loom:issue`
                             // because it carries `loom:blocked`.
                             if !self.config.skip_label_flip
+                                && !superseded
                                 && resume_phase_check
                                     .as_deref()
                                     .is_some_and(|p| RESUMABLE_CHECKPOINT_PHASES.contains(&p))
@@ -4606,7 +4800,9 @@ impl SweepRegistry {
                                 .get(&sweep_id)
                                 .and_then(|info| info.pr_number)
                                 .is_some();
-                            if !self.config.skip_label_flip && !produced_pr {
+                            // #4463: skip the restore when a newer sweep owns
+                            // the lock (superseded) — it holds the live claim.
+                            if !self.config.skip_label_flip && !produced_pr && !superseded {
                                 let _ = self.restore_label_to_ready(issue);
                             }
                             if let Some(info) = self.entries.get_mut(&sweep_id) {
@@ -5282,6 +5478,22 @@ impl SweepRegistry {
                         }
                         continue;
                     }
+                    // #4463: before we clean the worktree or re-dispatch,
+                    // confirm the dead sweep still owns the issue lock. If a
+                    // newer sweep re-acquired it (cross-instance double
+                    // dispatch), its worktree and lock are live — cleaning the
+                    // worktree here would clobber its uncommitted work, exactly
+                    // the incident this guards against. Leave everything intact
+                    // and skip the re-dispatch.
+                    if self.lock_owned_by_other(issue, &sweep_id) {
+                        log::info!(
+                            "midbuild-watchdog: issue #{issue} lock now owned by a newer sweep \
+                             (superseding dead {sweep_id}) — not cleaning the worktree and not \
+                             re-dispatching (#4463)."
+                        );
+                        continue;
+                    }
+
                     // A transient defer may have logged a give-up earlier; clear
                     // it so a later genuine give-up still logs once.
                     self.midbuild_gaveup.remove(&issue);
@@ -5313,8 +5525,11 @@ impl SweepRegistry {
                     }
                     // Defensive: the reaper releases the lock on death, but a
                     // reconstructed entry may not have — ensure it's free so the
-                    // re-dispatch can re-acquire cleanly.
-                    let _ = self.release_lock(issue);
+                    // re-dispatch can re-acquire cleanly. Ownership-checked
+                    // (#4463): if a newer sweep raced in and re-acquired since
+                    // the probe above, leave its lock intact — the dispatch
+                    // below then fails cleanly on the lock collision.
+                    let _ = self.release_lock_owned(issue, &sweep_id);
 
                     match self.dispatch(
                         &SweepKind::Issue(issue),
@@ -10516,6 +10731,187 @@ exit 0
         assert!(!lock.exists(), "stale daemon lock should be removed");
     }
 
+    // --- ownership-checked lock release (Issue #4463) ---
+
+    /// Core invariant: `release_lock_owned` must NOT delete a lock whose
+    /// `owner.json` records a DIFFERENT `sweep_id` — a newer sweep re-acquired
+    /// the claim after the releasing (older) sweep died. The lock survives and
+    /// `Superseded` is returned so the caller skips any re-dispatch. This is the
+    /// exact double-dispatch mechanism from the incident: reaping an old dead
+    /// sweep must never free a live sweep's claim.
+    #[test]
+    fn release_lock_owned_preserves_lock_owned_by_different_sweep() {
+        let dir = tempdir().unwrap();
+        let (registry, _record_log) = fixture_registry(dir.path());
+
+        // Newer sweep B owns the lock; older sweep A tries to release it.
+        let lock = write_lock_owner(&registry, 4463, "sweep-issue-4463-newer", std::process::id());
+
+        let outcome = registry.release_lock_owned(4463, "sweep-issue-4463-older-dead");
+        assert_eq!(outcome, LockReleaseOutcome::Superseded);
+        assert!(
+            lock.exists(),
+            "the newer sweep's live lock must survive an older sweep's release"
+        );
+        let owner: LockOwner =
+            serde_json::from_str(&std::fs::read_to_string(lock.join("owner.json")).unwrap())
+                .unwrap();
+        assert_eq!(owner.sweep_id, "sweep-issue-4463-newer", "owner.json must be left untouched");
+    }
+
+    /// A sweep releasing its OWN lock (matching `sweep_id`) removes it —
+    /// unchanged from the legacy unconditional release for the common case.
+    #[test]
+    fn release_lock_owned_removes_matching_owner() {
+        let dir = tempdir().unwrap();
+        let (registry, _record_log) = fixture_registry(dir.path());
+
+        let lock = write_lock_owner(&registry, 4464, "sweep-issue-4464-mine", std::process::id());
+
+        let outcome = registry.release_lock_owned(4464, "sweep-issue-4464-mine");
+        assert_eq!(outcome, LockReleaseOutcome::Released);
+        assert!(!lock.exists(), "a sweep must be able to release its own lock");
+    }
+
+    /// FAIL-OPEN: a corrupt / unparseable `owner.json` falls back to the legacy
+    /// unconditional removal — a garbage lock file must never wedge an issue.
+    #[test]
+    fn release_lock_owned_fails_open_on_corrupt_owner() {
+        let dir = tempdir().unwrap();
+        let (registry, _record_log) = fixture_registry(dir.path());
+
+        let locks = registry.config.locks_dir();
+        std::fs::create_dir_all(&locks).unwrap();
+        let lock = locks.join("issue-4465");
+        std::fs::create_dir_all(&lock).unwrap();
+        std::fs::write(lock.join("owner.json"), b"{ this is not valid json").unwrap();
+
+        let outcome = registry.release_lock_owned(4465, "sweep-issue-4465-whoever");
+        assert_eq!(outcome, LockReleaseOutcome::Released);
+        assert!(!lock.exists(), "a corrupt owner.json must not wedge the lock (fail-open)");
+    }
+
+    /// FAIL-OPEN: a lock dir with a MISSING `owner.json` releases too (legacy
+    /// spawn-loop locks predating the owner record, or a partially-written one).
+    #[test]
+    fn release_lock_owned_fails_open_on_missing_owner_json() {
+        let dir = tempdir().unwrap();
+        let (registry, _record_log) = fixture_registry(dir.path());
+
+        let locks = registry.config.locks_dir();
+        std::fs::create_dir_all(&locks).unwrap();
+        let lock = locks.join("issue-4466");
+        std::fs::create_dir_all(&lock).unwrap();
+        // No owner.json written.
+
+        let outcome = registry.release_lock_owned(4466, "sweep-issue-4466-whoever");
+        assert_eq!(outcome, LockReleaseOutcome::Released);
+        assert!(!lock.exists(), "a lock with no owner.json must release (fail-open)");
+    }
+
+    /// A non-existent lock is an idempotent no-op (`Released`), never a spurious
+    /// `Superseded`.
+    #[test]
+    fn release_lock_owned_noop_when_no_lock() {
+        let dir = tempdir().unwrap();
+        let (registry, _record_log) = fixture_registry(dir.path());
+        let outcome = registry.release_lock_owned(4467, "sweep-issue-4467-none");
+        assert_eq!(outcome, LockReleaseOutcome::Released);
+    }
+
+    /// Regression (Test Plan item 2, retained guard): two dispatch requests for
+    /// the same issue racing in one tick produce exactly ONE sweep — the second
+    /// `acquire_lock` collides on the atomic mkdir claim and is refused. Already
+    /// passes today; kept so the cross-instance mutual-exclusion property does
+    /// not silently regress.
+    #[test]
+    fn second_same_issue_dispatch_collides_on_lock() {
+        let dir = tempdir().unwrap();
+        let (registry, _record_log) = fixture_registry(dir.path());
+
+        registry
+            .acquire_lock(4468, "sweep-issue-4468-first")
+            .unwrap();
+        let err = registry
+            .acquire_lock(4468, "sweep-issue-4468-second")
+            .expect_err("a second same-issue claim must collide on the lock");
+        assert!(
+            err.to_string().contains("lock collision"),
+            "the second dispatch must be refused with a lock collision; got: {err}"
+        );
+    }
+
+    /// Regression (Test Plan item 3): `finish_cancel` on a stale entry whose
+    /// issue lock is owned by a NEWER live sweep must leave that lock intact AND
+    /// must not restore the label out from under the newer sweep.
+    #[test]
+    fn cancel_preserves_lock_and_skips_restore_when_superseded() {
+        let dir = tempdir().unwrap();
+        let gh_log = dir.path().join("gh-invocations.log");
+        let fake_gh = dir.path().join("fake-gh.sh");
+        let script = format!(
+            "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"{}\"\nexit 0\n",
+            gh_log.display()
+        );
+        std::fs::write(&fake_gh, &script).unwrap();
+        let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_gh, perms).unwrap();
+        if let Ok(f) = std::fs::File::open(&fake_gh) {
+            let _ = f.sync_all();
+        }
+
+        let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
+        config.gh_bin = Some(fake_gh);
+        config.skip_label_flip = false; // real restore path enabled but must NOT fire
+        let mut registry = SweepRegistry::new(config);
+
+        // A newer live sweep owns the lock.
+        let lock = write_lock_owner(&registry, 8801, "sweep-issue-8801-newer", std::process::id());
+
+        // The OLDER sweep being cancelled.
+        let kind = SweepKind::Issue(8801);
+        let started_at = Utc::now();
+        let sweep_id = "sweep-issue-8801-older".to_string();
+        registry.entries.insert(
+            sweep_id.clone(),
+            SweepInfo {
+                sweep_id: sweep_id.clone(),
+                kind: kind.clone(),
+                pid: 2_147_483_640,
+                token_name: "unknown".into(),
+                runtime: "unknown".into(),
+                log_path: registry.compute_log_path(8801),
+                idempotency_key: None,
+                started_at,
+                state: SweepState::Running,
+                latest_phase: None,
+                pr_number: None,
+                model: None,
+                effort: None,
+                depends_on: None,
+                repo: None,
+            },
+        );
+
+        let outcome = registry.finish_cancel(&sweep_id, 2_147_483_640, &kind, started_at, true);
+        assert!(outcome.was_running);
+
+        // The newer sweep's lock survives untouched.
+        assert!(lock.exists(), "cancelling an older sweep must not free the newer sweep's lock");
+        let owner: LockOwner =
+            serde_json::from_str(&std::fs::read_to_string(lock.join("owner.json")).unwrap())
+                .unwrap();
+        assert_eq!(owner.sweep_id, "sweep-issue-8801-newer");
+
+        // The label must NOT be restored — the newer sweep still holds the claim.
+        let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            !gh_calls.contains("--remove-label loom:building"),
+            "a superseded cancel must not restore loom:building -> loom:issue; got: {gh_calls:?}"
+        );
+    }
+
     /// Issue #4173: adoption recovers the real OAuth account from the surviving
     /// per-sweep log (the `using OAuth account '<name>'` line anchored to the
     /// lock's `sweep_id`), so `status` shows the account, not `unknown`.
@@ -10674,6 +11070,40 @@ exit 0
 
         let pr = generate_sweep_id(&SweepKind::PrSet(vec![10, 20]));
         assert!(pr.starts_with("sweep-prs-10-20-"));
+    }
+
+    #[test]
+    fn terminal_result_parser_is_anchored_strict_and_provider_aware() {
+        let log = "\
+sweep_id=old
+# LOOM_TERMINAL_RESULT v=1 provider=codex account=stale category=TOKEN_EXPIRED exit_code=1
+sweep_id=current
+# LOOM_TERMINAL_RESULT v=1 provider=codex account=profile-a category=TOKEN_EXHAUSTED exit_code=42
+";
+        assert_eq!(
+            parse_terminal_result_after(log, "sweep_id=current"),
+            Some(TerminalResult {
+                provider: AccountProvider::Codex,
+                account: "profile-a".into(),
+                category: TerminalClassification::TokenExhausted,
+                exit_code: 42,
+            })
+        );
+        assert!(parse_terminal_result_after(
+            "sweep_id=current\n# LOOM_TERMINAL_RESULT v=9 provider=codex account=a category=SUCCESS exit_code=0",
+            "sweep_id=current"
+        )
+        .is_none());
+        assert!(parse_terminal_result_after(
+            "sweep_id=current\n# LOOM_TERMINAL_RESULT v=1 provider=codex account=unknown category=SUCCESS exit_code=0",
+            "sweep_id=current"
+        )
+        .is_none());
+        assert!(parse_terminal_result_after(
+            "sweep_id=current\n# LOOM_TERMINAL_RESULT v=1 provider=codex account=a category=BOGUS exit_code=1",
+            "sweep_id=current"
+        )
+        .is_none());
     }
 
     #[test]
@@ -13139,6 +13569,30 @@ exit 0\n";
 
     // --- reaper-driven resume (Issue #4256) ---
 
+    /// Write a `.loom/locks/issue-<N>/owner.json` for `issue` claimed by
+    /// `sweep_id` with `owner_pid` (Issue #4463 test fixture). Returns the lock
+    /// dir path so callers can assert on its survival.
+    fn write_lock_owner(
+        reg: &SweepRegistry,
+        issue: u32,
+        sweep_id: &str,
+        owner_pid: u32,
+    ) -> PathBuf {
+        let locks = reg.config.locks_dir();
+        std::fs::create_dir_all(&locks).unwrap();
+        let lock = locks.join(format!("issue-{issue}"));
+        std::fs::create_dir_all(&lock).unwrap();
+        let owner = LockOwner {
+            issue,
+            owner_pid,
+            acquired_at: Utc::now().to_rfc3339(),
+            sweep_id: sweep_id.to_string(),
+        };
+        std::fs::write(lock.join("owner.json"), serde_json::to_string_pretty(&owner).unwrap())
+            .unwrap();
+        lock
+    }
+
     /// Write a `sweep-checkpoint.sh`-style checkpoint file for `issue` with
     /// `phase`, matching the on-disk shape `read_checkpoint_phase` parses.
     fn write_checkpoint(reg: &SweepRegistry, issue: u32, phase: &str) {
@@ -13246,6 +13700,90 @@ exit 0\n";
             calls.contains("issue edit 4256") && calls.contains("loom:building"),
             "the resume dispatch must flip the label like an ordinary dispatch; got: {calls:?}"
         );
+        std::env::remove_var("LOOM_REPO");
+    }
+
+    /// Core regression (Issue #4463, Test Plan item 1): reaping an OLD dead
+    /// sweep for issue N while a NEWER live sweep owns N's lock must (a) leave
+    /// the lock intact and (b) fire NO resume dispatch — even though the
+    /// checkpoint phase (`builder-done`) and an open linked PR would otherwise
+    /// make this exactly the resume-eligible case. Without the ownership gate,
+    /// the reaper would delete the live sweep's lock and re-dispatch a second
+    /// sweep into the same worktree (the 43s-apart double-dispatch incident).
+    #[test]
+    #[serial]
+    fn reap_dead_sweep_preserves_newer_sweep_lock_and_skips_resume() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::set_var("LOOM_REPO", "rjwalters/loom");
+        // graphql returns a PR ⇒ `first_open_linked_pr` WOULD report one, so the
+        // ONLY thing that can prevent a resume dispatch is the #4463 gate.
+        let (mut reg, gh_log) = open_pr_guard_registry(ws, "9300", 0, false);
+
+        // A newer, still-live sweep B owns the issue lock (our own PID ⇒ alive).
+        let lock = write_lock_owner(&reg, 9256, "sweep-issue-9256-newer", std::process::id());
+        reg.entries.insert(
+            "sweep-issue-9256-newer".to_string(),
+            SweepInfo {
+                sweep_id: "sweep-issue-9256-newer".to_string(),
+                kind: SweepKind::Issue(9256),
+                pid: std::process::id(), // alive
+                token_name: "unknown".into(),
+                runtime: "unknown".into(),
+                log_path: reg.compute_log_path(9256),
+                idempotency_key: None,
+                started_at: Utc::now(),
+                state: SweepState::Running,
+                latest_phase: None,
+                pr_number: None,
+                model: None,
+                effort: None,
+                depends_on: None,
+                repo: None,
+            },
+        );
+
+        // A resume-eligible checkpoint + the OLD dead sweep A that lost the lock.
+        write_checkpoint(&reg, 9256, "builder-done");
+        insert_dead_running_entry(&mut reg, 9256, "sweep-issue-9256-dead");
+
+        let before = reg.entries.len();
+        reg.reap_once();
+
+        // (a) The live sweep's lock is intact and still owned by sweep B.
+        assert!(
+            lock.exists(),
+            "a newer live sweep's lock must survive reaping the old dead sweep"
+        );
+        let owner: LockOwner =
+            serde_json::from_str(&std::fs::read_to_string(lock.join("owner.json")).unwrap())
+                .unwrap();
+        assert_eq!(owner.sweep_id, "sweep-issue-9256-newer");
+
+        // (b) No resume: the superseded gate short-circuits BEFORE the open-PR
+        // probe and BEFORE any label flip, and creates no fresh entry.
+        let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            !calls.contains("api graphql"),
+            "a superseded reap must not probe for a resume PR; got: {calls:?}"
+        );
+        assert!(
+            !calls.contains("issue edit"),
+            "a superseded reap must not flip or restore any label; got: {calls:?}"
+        );
+        assert_eq!(
+            reg.entries.len(),
+            before,
+            "no new sweep entry may be dispatched on a superseded reap"
+        );
+
+        // Exactly one live sweep remains (sweep B); sweep A is terminal.
+        assert!(matches!(
+            reg.get("sweep-issue-9256-dead").unwrap().state,
+            SweepState::Crashed { .. }
+        ));
+        assert!(matches!(reg.get("sweep-issue-9256-newer").unwrap().state, SweepState::Running));
+
         std::env::remove_var("LOOM_REPO");
     }
 

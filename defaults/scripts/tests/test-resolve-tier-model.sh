@@ -72,6 +72,7 @@ FAKE_BIN="$WORKDIR/bin"
 mkdir -p "$FAKE_BIN"
 cat > "$FAKE_BIN/gh" <<'FAKEGH'
 #!/usr/bin/env bash
+# GraphQL path: gh issue view <issue> -R <repo> --json body -q .body
 if [[ "$1" == "issue" && "$2" == "view" ]]; then
     issue="$3"
     case "$issue" in
@@ -90,9 +91,23 @@ More text." ;;
 <!-- loom:complexity=complex -->
 <!-- loom:complexity=mechanical -->
 " ;;
+        9005) exit 1 ;;   # GraphQL quota exhausted -> forces REST fallback (#4472)
+        9006) exit 1 ;;   # GraphQL fails ...
         *) echo "" ;;
     esac
     exit 0
+fi
+# REST fallback path: gh api repos/<repo>/issues/<issue> --jq .body (#4472)
+if [[ "$1" == "api" ]]; then
+    issue="${2##*/}"
+    case "$issue" in
+        9005) echo "Recovered via REST.
+
+<!-- loom:complexity=complex -->
+" ; exit 0 ;;
+        9006) exit 1 ;;   # ... and REST fails too -> falls through to routine
+        *) exit 1 ;;
+    esac
 fi
 exit 1
 FAKEGH
@@ -163,6 +178,23 @@ assert_contains "3" "$rc" "absent-marker case exits 3 (no tierModels configured)
 rc=0
 run_resolve 9003 >/dev/null 2>&1 || rc=$?
 assert_contains "3" "$rc" "invalid-marker case exits 3 (no tierModels configured)"
+
+# -------- Test 7: GraphQL failure falls back to REST body (#4472) --------
+# When `gh issue view` (GraphQL) fails under quota exhaustion, the resolver must
+# fall back to the REST body rather than silently defaulting to routine. Issue
+# 9005's GraphQL fetch fails and REST returns a valid `complex` marker.
+echo "Test 7: GraphQL failure falls back to REST-fetched body"
+err="$(run_resolve 9005 2>&1 1>/dev/null)"
+assert_contains "tier=complex" "$err" "REST-fallback body's tier (complex) is resolved, not routine"
+assert_not_contains "could not fetch" "$err" "successful REST fallback emits no fetch-error message"
+
+# -------- Test 8: both fetches fail -> routine, with a diagnostic (#4472) --------
+# When GraphQL and REST both fail, the non-blocking resolver still degrades to
+# routine (unchanged, non-breaking) but says so, so the degradation is visible.
+echo "Test 8: total fetch failure degrades to routine with a diagnostic"
+err="$(run_resolve 9006 2>&1 1>/dev/null)"
+assert_contains "could not fetch body" "$err" "total fetch failure logs a fetch-error diagnostic"
+assert_contains "-> routine" "$err" "total fetch failure still degrades to routine"
 
 # -------- Summary --------
 echo ""

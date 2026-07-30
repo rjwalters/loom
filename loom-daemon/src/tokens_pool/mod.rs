@@ -61,11 +61,13 @@
 //! the conformance suite under `loom-tools/tests/tokens/test_rust_conformance.py`
 //! diffs fixture pools driven through both CLIs.
 
+pub mod account_registry;
 pub mod allowlist;
 pub mod bad_tokens;
 pub mod bootstrap;
 pub mod check;
 pub mod failure_counts;
+pub mod health;
 pub mod locking;
 pub mod monitor;
 pub mod monitor_db;
@@ -74,6 +76,14 @@ pub mod rng;
 pub mod rotation;
 pub mod select;
 
+pub use account_registry::{
+    account_inventory, select_account, AccountBinding, AccountDescriptor, AccountId,
+    AccountProvider, CredentialKind, InventoryProvenance, SelectedAccount,
+};
+pub use health::{
+    account_health, clear_reauth, provider_capacity_at, record_terminal, select_healthy_at,
+    AccountHealth, HealthReason, NoHealthyAccountError, ProviderCapacity, TerminalClassification,
+};
 pub use select::{EmptyTokenPoolError, SelectedToken, EX_CONFIG};
 
 /// Auto-unpin pre-flight (issue #4228, epic #4081 Phase 2): if the operator

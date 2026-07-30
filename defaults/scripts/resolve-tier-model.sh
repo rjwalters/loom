@@ -54,7 +54,21 @@ if [[ -z "$REPO" ]]; then
 fi
 [[ -n "$REPO" ]] || { echo "could not determine repo; pass it explicitly or set LOOM_REPO" >&2; exit 2; }
 
-body="$(gh issue view "$ISSUE" -R "$REPO" --json body -q .body 2>/dev/null || true)"
+# Fetch the issue body with a GraphQL->REST fallback (#4472). `gh issue view` is
+# a GraphQL call; under quota exhaustion (routine at fleet scale, epic #4432) it
+# fails and a swallowed failure parses as an empty tier -> `routine`, silently
+# disabling cost/speed routing. REST draws on a separate quota, so try it before
+# giving up. If BOTH fail we still fall through to `routine` (a non-breaking
+# default for this non-blocking resolver — unlike require-complexity-marker.sh
+# this script never blocks curation) but say so, so the degradation shows in logs.
+if body="$(gh issue view "$ISSUE" -R "$REPO" --json body -q .body 2>/dev/null)"; then
+  :
+elif body="$(gh api "repos/$REPO/issues/$ISSUE" --jq .body 2>/dev/null)"; then
+  :
+else
+  echo "$REPO#$ISSUE: could not fetch body (GraphQL+REST failed — likely API quota) -> routine" >&2
+  body=""
+fi
 tier="$(printf '%s' "$body" | grep -o 'loom:complexity=[a-z]*' | head -1 | cut -d= -f2)"
 # Two distinct fall-through cases (#4448): an absent marker is the expected
 # default for issues curated before the marker existed (or before it became
