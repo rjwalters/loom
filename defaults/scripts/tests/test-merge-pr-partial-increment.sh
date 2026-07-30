@@ -19,8 +19,17 @@
 # _reset_one_partial_issue) — while explicitly NOT reverting a close it cannot
 # attribute to this PR (a deliberate close in the same window).
 #
+# #4595 extends that guard to a third source: the PR's COMMIT MESSAGES. merge-pr.sh
+# squash-merges without overriding the commit message, so GitHub composes the
+# squash message from the PR's commits and honors a `close #N` there even when the
+# PR body only says `Part of #N`. The guard unions a paginated REST read of
+# `pulls/<N>/commits` into its close-reference set, names the commit message as
+# the source in its warning (the operator remedy is amend/reword, not a body
+# edit), and degrades to today's warn-only behavior when that fetch fails.
+#
 # Strategy: the functions under test (_partial_increment_refs,
-# _body_closing_refs, _check_partial_increment_close_conflict,
+# _closing_refs_stdin, _body_closing_refs, _closing_ref_snippets,
+# _pr_commit_messages, _check_partial_increment_close_conflict,
 # _reset_one_partial_issue, _reset_partial_increment_labels) depend only on
 # globals (PR_JSON, REPO_NWO, PR_NUMBER, FORGE_TYPE, GH,
 # PARTIAL_CONFLICT_ISSUES, PARTIAL_OPEN_BEFORE_MERGE) and the `gh` CLI. We
@@ -122,7 +131,8 @@ awk '
   capture { print }
 ' "$MERGE_PR_SRC" > "$FUNCS_FILE"
 
-for _fn in _partial_increment_refs _body_closing_refs \
+for _fn in _partial_increment_refs _closing_refs_stdin _body_closing_refs \
+           _closing_ref_snippets _pr_commit_messages \
            _check_partial_increment_close_conflict _reset_one_partial_issue \
            _reset_partial_increment_labels; do
     if ! grep -q "^${_fn}() {" "$FUNCS_FILE"; then
@@ -138,15 +148,44 @@ STUB_DIR="$(mktemp -d)"
 cat > "$STUB_DIR/gh" <<'STUB'
 #!/usr/bin/env bash
 # Stub gh for test-merge-pr-partial-increment.sh.
-#   gh api repos/OWNER/REPO/issues/N   -> cat $STUB_DIR/issue-N.json (or {})
-#   gh issue edit N ...                -> record to $STUB_DIR/gh-calls.log
-#   gh issue comment N ...             -> record to $STUB_DIR/gh-calls.log
+#   gh api repos/OWNER/REPO/issues/N        -> cat $STUB_DIR/issue-N.json (or {})
+#   gh api repos/OWNER/REPO/pulls/N/commits -> cat $STUB_DIR/pr-commits.json (or [])
+#        (exits 1 when LOOM_TEST_COMMITS_FAIL=1, simulating a fetch failure)
+#   gh issue edit N ...                     -> record to $STUB_DIR/gh-calls.log
+#   gh issue comment N ...                  -> record to $STUB_DIR/gh-calls.log
 STUB_DIR_FROM_ENV="${LOOM_TEST_STUB_DIR:?stub gh: LOOM_TEST_STUB_DIR not set}"
 LOG="$STUB_DIR_FROM_ENV/gh-calls.log"
 
 if [[ "$1" == "api" ]]; then
-  # Last arg is the api path: repos/owner/repo/issues/N
-  path="${!#}"
+  # Scan argv for the api path rather than assuming it is the last argument:
+  # flags such as --paginate / --jq '<program>' may follow it (#4595).
+  shift
+  path=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      # Flags that take a value: drop the flag AND its argument.
+      --jq|-q|--field|-f|--raw-field|-F|--header|-H|--method|-X|--input)
+        shift
+        [[ $# -gt 0 ]] && shift
+        continue
+        ;;
+      -*) shift; continue ;;
+      *) path="$1"; break ;;
+    esac
+  done
+
+  case "$path" in
+    */pulls/*/commits)
+      if [[ "${LOOM_TEST_COMMITS_FAIL:-}" == "1" ]]; then
+        echo "stub gh: simulated commits fetch failure" >&2
+        exit 1
+      fi
+      canned="$STUB_DIR_FROM_ENV/pr-commits.json"
+      if [[ -f "$canned" ]]; then cat "$canned"; else echo '[]'; fi
+      exit 0
+      ;;
+  esac
+
   num="${path##*/}"
   canned="$STUB_DIR_FROM_ENV/issue-$num.json"
   if [[ -f "$canned" ]]; then cat "$canned"; else echo '{}'; fi
@@ -199,13 +238,31 @@ cat > "$STUB_DIR/issue-321.json" <<'EOF'
 {"state":"open","pull_request":{"url":"x"},"labels":[{"name":"loom:building"}]}
 EOF
 
+# Canned `pulls/<N>/commits` payload: one JSON commit object per message given.
+# Written in the GitHub REST shape the script reads (.[].commit.message).
+set_commits() {
+  local first=1 m
+  {
+    printf '['
+    for m in "$@"; do
+      [[ $first -eq 1 ]] || printf ','
+      first=0
+      printf '{"sha":"deadbeef","commit":{"message":%s}}' "$(printf '%s' "$m" | jq -Rs .)"
+    done
+    printf ']'
+  } > "$STUB_DIR/pr-commits.json"
+}
+
 # Clearing the two #4569 globals here keeps every pre-existing case below running
-# against the same "no conflict recorded" state it was written for.
+# against the same "no conflict recorded" state it was written for; resetting the
+# commits fixture to empty does the same for the #4595 commit-message signal.
 reset_log() {
   : > "$STUB_DIR/gh-calls.log"
   PARTIAL_OPEN_BEFORE_MERGE=""
   PARTIAL_CONFLICT_ISSUES=""
   FORGE_CLOSE_TARGETS=""
+  set_commits
+  unset LOOM_TEST_COMMITS_FAIL
 }
 read_log()  { cat "$STUB_DIR/gh-calls.log" 2>/dev/null || true; }
 
@@ -409,6 +466,135 @@ assert_not_contains "$dryrun_err" "will reopen #123" \
 DRY_RUN=false
 
 echo ""
+echo "Testing the commit-message closing-keyword signal (#4595)..."
+
+# T21: the #4595 shape — PR body is CLEAN (`Contributes to #123` only), but a
+# commit message carries `close #123`. This repo squash-merges without overriding
+# the commit message, so GitHub composes the squash message from the commits and
+# honors that keyword: it must be recorded as a conflict.
+reset_log
+set_commits "feat: implement the slice
+
+close #123"
+PR_JSON='{"body":"Implements a slice.\n\nContributes to #123"}'
+run_capturing_stderr _check_partial_increment_close_conflict
+commit_err="$(read_stderr)"
+assert_eq "123" "$PARTIAL_CONFLICT_ISSUES" \
+  "Clean body + commit message 'close #123' -> conflict recorded (commit-message signal)"
+assert_eq "123" "$PARTIAL_OPEN_BEFORE_MERGE" \
+  "Commit-message conflict -> #123 also recorded as open before the merge"
+assert_contains "$commit_err" "closing keyword in a commit message of this PR" \
+  "Commit-message conflict -> warning names the commit message as the source"
+assert_contains "$commit_err" "close #123" \
+  "Commit-message conflict -> warning quotes the offending commit-message phrase"
+assert_contains "$commit_err" "reword the offending commit message" \
+  "Commit-message conflict -> remedy is amend/reword, not editing the PR body"
+assert_not_contains "$commit_err" "its body ALSO carries" \
+  "Commit-message conflict -> does NOT blame the (clean) PR body"
+
+# T22: commits fetch FAILS (e.g. REST error) -> empty signal, conservative
+# behavior: still tracked as open-before-merge, but no conflict, so the
+# post-merge pass warns instead of reopening. Never blocks the merge.
+reset_log
+export LOOM_TEST_COMMITS_FAIL=1
+PR_JSON='{"body":"Implements a slice.\n\nContributes to #123"}'
+run_capturing_stderr _check_partial_increment_close_conflict
+assert_eq "" "$PARTIAL_CONFLICT_ISSUES" \
+  "Commits fetch failure -> degrades to an empty signal (no conflict recorded)"
+assert_eq "123" "$PARTIAL_OPEN_BEFORE_MERGE" \
+  "Commits fetch failure -> #123 still tracked as open before the merge"
+unset LOOM_TEST_COMMITS_FAIL
+
+# T22b: fetch failure is survivable — the guard still returns 0 (best-effort,
+# never fails or blocks the merge).
+reset_log
+export LOOM_TEST_COMMITS_FAIL=1
+PR_JSON='{"body":"Contributes to #123"}'
+guard_rc=0
+_check_partial_increment_close_conflict 2>/dev/null || guard_rc=$?
+assert_eq "0" "$guard_rc" "Commits fetch failure -> guard still exits 0 (never blocks the merge)"
+unset LOOM_TEST_COMMITS_FAIL
+
+# T23: clean body AND clean commits -> no conflict at all.
+reset_log
+set_commits "feat: implement the slice" "docs: note the follow-up work"
+PR_JSON='{"body":"Implements a slice.\n\nContributes to #123"}'
+_check_partial_increment_close_conflict 2>/dev/null
+assert_eq "" "$PARTIAL_CONFLICT_ISSUES" \
+  "Clean body + clean commits -> no conflict recorded"
+assert_eq "123" "$PARTIAL_OPEN_BEFORE_MERGE" \
+  "Clean body + clean commits -> #123 recorded as open before the merge"
+
+# T24: multi-commit PR where only a MIDDLE commit carries the keyword — all
+# commit messages must be aggregated, not just the first or last.
+reset_log
+set_commits "feat: part one" "fixup: resolves #123 while here" "chore: part three"
+PR_JSON='{"body":"Part of #123"}'
+run_capturing_stderr _check_partial_increment_close_conflict
+mid_err="$(read_stderr)"
+assert_eq "123" "$PARTIAL_CONFLICT_ISSUES" \
+  "Middle commit's 'resolves #123' -> conflict recorded (all commit messages aggregated)"
+assert_contains "$mid_err" "resolves #123" \
+  "Middle-commit conflict -> warning quotes the offending phrase"
+
+# T25: 'close issue #123' in a commit message is NOT a closing reference (same
+# word-adjacency rule the body regex enforces).
+reset_log
+set_commits "chore: follow-up will close issue #123 later"
+PR_JSON='{"body":"Part of #123"}'
+_check_partial_increment_close_conflict 2>/dev/null
+assert_eq "" "$PARTIAL_CONFLICT_ISSUES" \
+  "Commit 'close issue #123' -> not a closing reference, no conflict"
+
+# T26: a commit closing a DIFFERENT issue than the partial ref -> ignored.
+reset_log
+set_commits "fix: closes #888"
+PR_JSON='{"body":"Part of #123"}'
+_check_partial_increment_close_conflict 2>/dev/null
+assert_eq "" "$PARTIAL_CONFLICT_ISSUES" \
+  "Commit 'closes #888' + Part of #123 -> no conflict (different issues)"
+
+# T27: end-to-end — the commit-message conflict recorded pre-merge drives the
+# post-merge reopen. #456 is open when the guard runs and closed when the reset
+# pass runs (the fixture is swapped mid-test to simulate the merge's auto-close).
+reset_log
+set_commits "feat: slice
+
+close #456"
+PR_JSON='{"body":"Implements a slice.\n\nContributes to #456"}'
+_check_partial_increment_close_conflict 2>/dev/null
+assert_eq "456" "$PARTIAL_CONFLICT_ISSUES" \
+  "End-to-end: commit-message conflict on #456 recorded pre-merge"
+: > "$STUB_DIR/gh-calls.log"
+cat > "$STUB_DIR/issue-456.json" <<'EOF'
+{"state":"closed","labels":[{"name":"loom:building"}]}
+EOF
+run_capturing_stderr _reset_partial_increment_labels
+e2e_log="$(read_log)"
+assert_contains "$e2e_log" "issue reopen 456 --repo owner/repo" \
+  "End-to-end: #456 auto-closed by the commit-message keyword is reopened post-merge"
+assert_contains "$e2e_log" "issue edit 456 --repo owner/repo --remove-label loom:building --add-label loom:issue" \
+  "End-to-end: reopened #456 falls through to the loom:building -> loom:issue swap"
+# Restore the shared fixture for any later case.
+cat > "$STUB_DIR/issue-456.json" <<'EOF'
+{"state":"open","labels":[{"name":"loom:building"}]}
+EOF
+
+# T28: the commit fetch must not happen at all when the PR has no partial-
+# increment reference (zero extra API calls on the common path). A failing
+# commits endpoint would be reached only if the guard fetched it.
+reset_log
+export LOOM_TEST_COMMITS_FAIL=1
+PR_JSON='{"body":"All done.\n\nCloses #123"}'
+run_capturing_stderr _check_partial_increment_close_conflict
+nofetch_err="$(read_stderr)"
+assert_eq "" "$PARTIAL_OPEN_BEFORE_MERGE" \
+  "No partial-increment ref -> guard returns before any commit fetch"
+assert_not_contains "$nofetch_err" "simulated commits fetch failure" \
+  "No partial-increment ref -> commits endpoint is never called"
+unset LOOM_TEST_COMMITS_FAIL
+
+echo ""
 echo "Testing the post-merge premature-close revert..."
 
 # T18: conflicted + closed after the merge -> reopen, comment, THEN the normal
@@ -471,6 +657,10 @@ assert_contains "$src" 'gh issue reopen "$issue_num"' \
   "merge-pr.sh reverts a premature auto-close with gh issue reopen"
 assert_contains "$src" 'close[sd]?|fix(e[sd])?|resolve[sd]?' \
   "merge-pr.sh matches the canonical GitHub closing-keyword set"
+assert_contains "$src" 'repos/$REPO_NWO/pulls/$PR_NUMBER/commits' \
+  "merge-pr.sh reads the PR's commit messages for closing keywords (#4595)"
+assert_contains "$src" '--paginate' \
+  "merge-pr.sh paginates the commits fetch (>30-commit PRs are not truncated)"
 
 # --- Summary ---
 echo ""

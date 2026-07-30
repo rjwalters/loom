@@ -431,7 +431,8 @@ Or, if you have already verified/reconciled them, re-run with --allow-stacked-ch
 _check_no_open_stacked_children
 
 # ---------------------------------------------------------------------------
-# Partial-increment closing-keyword conflict detection (#4569).
+# Partial-increment closing-keyword conflict detection (#4569, extended by
+# #4595 to cover commit messages).
 #
 # ROOT CAUSE (established from the rjwalters/censusapi#5 -> censusapi#2 incident,
 # NOT from the branch-name theory the report floated):
@@ -454,6 +455,15 @@ _check_no_open_stacked_children
 #       keyword), so the close did not come from the commit message either;
 #     - the `closed` event has `commit_id: null` with the merger as actor at the
 #       merge instant — the signature of a PR-body closing-reference close.
+#
+# SECOND SOURCE (#4595): the same parser also runs over the SQUASH COMMIT
+#   MESSAGE. forge_merge_pr() squash-merges with no commit_title/commit_message
+#   override, so GitHub composes that message from the PR's own commit messages —
+#   a stray `close #N` in any commit message closes #N on merge even when the PR
+#   body only ever says `Part of #N`. That close is fully attributable (the
+#   `closed` event carries the merge `commit_id`), it is just invisible to both
+#   the body regex and `closingIssuesReferences`, so the commit messages are
+#   consulted as a third signal below.
 #
 # Fix shape: DETECT (here, pre-merge, with a loud actionable warning) plus
 # SELF-HEAL (post-merge reopen in _reset_one_partial_issue below). Prevention by
@@ -480,21 +490,51 @@ _partial_increment_refs() {
       | sort -un; } || true
 }
 
-# Issue numbers referenced with a GitHub CLOSING keyword anywhere in the text,
-# one per line, deduped. The regex is deliberately the same one
+# Issue numbers referenced with a GitHub CLOSING keyword anywhere in the text
+# read from stdin, one per line, deduped. The regex is deliberately the same one
 # forge_pr_close_targets() uses on its Gitea branch (the canonical keyword set,
 # with `\b` guarding against substring traps like `Discloses #N`).
 #
-# Why a body regex and not only the authoritative GraphQL
+# Why a text regex and not only the authoritative GraphQL
 # `closingIssuesReferences`: that field is GraphQL-only, and the incident this
 # guard exists for happened while GraphQL quota was exhausted (the PR was even
 # created via raw REST for that reason). A quota-free text signal is the one that
 # still works in exactly the conditions where this bug bites.
-_body_closing_refs() {
-  { printf '%s\n' "$1" \
-      | grep -oiE '\b(close[sd]?|fix(e[sd])?|resolve[sd]?)\b[[:space:]]+#[0-9]+' \
+_closing_refs_stdin() {
+  { grep -oiE '\b(close[sd]?|fix(e[sd])?|resolve[sd]?)\b[[:space:]]+#[0-9]+' \
       | grep -oE '[0-9]+' \
       | sort -un; } || true
+}
+
+# Same, for text passed as $1 (the PR body, historically the only source).
+_body_closing_refs() {
+  { printf '%s\n' "$1" | _closing_refs_stdin; } || true
+}
+
+# The literal offending snippets ("close #N", "Fixes #N", …) that reference
+# issue $2 with a closing keyword inside the text $1, rendered for a warning as
+# `snippet", "snippet`. Empty when the text carries no such reference — which is
+# how the caller tells WHICH source (body vs. commit messages) is at fault.
+_closing_ref_snippets() {
+  { printf '%s\n' "$1" \
+      | grep -oiE "\\b(close[sd]?|fix(e[sd])?|resolve[sd]?)\\b[[:space:]]+#$2\\b" \
+      | sort -u | tr '\n' '|' | sed 's/|$//; s/|/", "/g'; } || true
+}
+
+# Every commit message of this PR, concatenated (#4595). merge-pr.sh squash-
+# merges without overriding the commit message (forge_merge_pr passes no
+# commit_title/commit_message), so GitHub composes the squash message from these
+# commits — a `close #N` in any of them is a real closing reference that neither
+# the PR body regex nor `closingIssuesReferences` reveals.
+#
+# REST (not GraphQL), so it survives the same quota exhaustion the body regex
+# exists for, and `--paginate` so a >30-commit PR is not silently truncated.
+# Plain `gh api` (not $GH) for freshness, `--jq` deliberately avoided in favor of
+# a jq pipe (jq is already a hard dependency). Best-effort: any failure yields an
+# empty string, which degrades to the pre-#4595 behavior (no attribution).
+_pr_commit_messages() {
+  { gh api "repos/$REPO_NWO/pulls/$PR_NUMBER/commits" --paginate 2>/dev/null \
+      | jq -r '.[].commit.message' 2>/dev/null; } || true
 }
 
 # Membership tests over the space-separated globals above.
@@ -520,14 +560,21 @@ _check_partial_increment_close_conflict() {
   partial_refs="$(_partial_increment_refs "$pr_body")"
   [[ -n "$partial_refs" ]] || return 0
 
-  # Closing references GitHub will honor on merge: the body's own closing
-  # keywords (quota-free) UNION GitHub's authoritative closingIssuesReferences
-  # (best-effort — empty under GraphQL quota exhaustion, but when it does answer
-  # it also surfaces a Development-sidebar link that no body text reveals).
-  local body_close_refs graphql_close_refs close_refs
+  # Closing references GitHub will honor on merge, from three unioned signals:
+  #   1. the body's own closing keywords (quota-free regex);
+  #   2. this PR's COMMIT MESSAGES (#4595) — quota-free REST, and the source of
+  #      the squash commit message this script does not override;
+  #   3. GitHub's authoritative closingIssuesReferences (best-effort — empty
+  #      under GraphQL quota exhaustion, but when it does answer it also
+  #      surfaces a Development-sidebar link that no text reveals).
+  # The commit fetch happens only past the partial_refs early-return above, so
+  # the common (non-partial-increment) path costs zero extra API calls.
+  local body_close_refs commit_messages commit_close_refs graphql_close_refs close_refs
   body_close_refs="$(_body_closing_refs "$pr_body")"
+  commit_messages="$(_pr_commit_messages)"
+  commit_close_refs="$(printf '%s\n' "$commit_messages" | _closing_refs_stdin)"
   graphql_close_refs="$(forge_pr_close_targets "$PR_NUMBER" "$GH" 2>/dev/null || true)"
-  close_refs="$(printf '%s\n%s\n' "$body_close_refs" "$graphql_close_refs" \
+  close_refs="$(printf '%s\n%s\n%s\n' "$body_close_refs" "$commit_close_refs" "$graphql_close_refs" \
     | grep -E '^[0-9]+$' | sort -un || true)"
 
   local issue_num issue_json
@@ -553,15 +600,25 @@ _check_partial_increment_close_conflict() {
     fi
     PARTIAL_CONFLICT_ISSUES="${PARTIAL_CONFLICT_ISSUES:+$PARTIAL_CONFLICT_ISSUES }$issue_num"
 
-    local offending dr=""
+    local body_offending commit_offending dr=""
     # Match _check_no_open_stacked_children's dry-run contract: report the
     # would-be outcome without claiming a merge is happening.
     [[ "${DRY_RUN:-false}" == "true" ]] && dr="[dry-run] "
-    offending="$(printf '%s\n' "$pr_body" \
-      | grep -oiE "\\b(close[sd]?|fix(e[sd])?|resolve[sd]?)\\b[[:space:]]+#$issue_num\\b" \
-      | sort -u | tr '\n' '|' | sed 's/|$//; s/|/", "/g' || true)"
-    warning "${dr}Partial-increment conflict (#4569): PR #$PR_NUMBER declares a NON-closing \`Part of\`/\`Contributes to\` reference to #$issue_num, but its body ALSO carries a closing reference to #$issue_num${offending:+ (\"$offending\")} — GitHub honors a closing keyword ANYWHERE in the body, so merging this PR WILL close #$issue_num against the declared intent."
-    warning "  ${dr}merge-pr.sh would reopen #$issue_num immediately after the merge. To avoid the close/reopen flicker entirely, edit the PR body so no closing keyword is immediately followed by \`#$issue_num\` (e.g. write \`close the issue\` or \`close issue #$issue_num\` instead of \`close #$issue_num\`), then re-run this merge."
+    body_offending="$(_closing_ref_snippets "$pr_body" "$issue_num")"
+    commit_offending="$(_closing_ref_snippets "$commit_messages" "$issue_num")"
+
+    # Name the source, because the operator remedy differs per source: edit the
+    # PR body, reword/amend a commit, or unlink a Development-sidebar reference.
+    if [[ -n "$body_offending" ]]; then
+      warning "${dr}Partial-increment conflict (#4569): PR #$PR_NUMBER declares a NON-closing \`Part of\`/\`Contributes to\` reference to #$issue_num, but its body ALSO carries a closing reference to #$issue_num (\"$body_offending\") — GitHub honors a closing keyword ANYWHERE in the body, so merging this PR WILL close #$issue_num against the declared intent."
+      warning "  ${dr}merge-pr.sh would reopen #$issue_num immediately after the merge. To avoid the close/reopen flicker entirely, edit the PR body so no closing keyword is immediately followed by \`#$issue_num\` (e.g. write \`close the issue\` or \`close issue #$issue_num\` instead of \`close #$issue_num\`), then re-run this merge."
+    elif [[ -n "$commit_offending" ]]; then
+      warning "${dr}Partial-increment conflict (#4595): PR #$PR_NUMBER declares a NON-closing \`Part of\`/\`Contributes to\` reference to #$issue_num, but a closing keyword in a commit message of this PR references #$issue_num (\"$commit_offending\") — this merge squashes without overriding the commit message, so GitHub composes the squash message from these commits and merging WILL close #$issue_num against the declared intent."
+      warning "  ${dr}merge-pr.sh would reopen #$issue_num immediately after the merge. To avoid the close/reopen flicker entirely, reword the offending commit message (\`git commit --amend\` / \`git rebase -i\` + force-push) so no closing keyword is immediately followed by \`#$issue_num\`, then re-run this merge."
+    else
+      warning "${dr}Partial-increment conflict (#4569): PR #$PR_NUMBER declares a NON-closing \`Part of\`/\`Contributes to\` reference to #$issue_num, but GitHub reports #$issue_num as a closing target of this PR (no closing keyword found in the body or commit messages — most likely a Development-sidebar link), so merging this PR WILL close #$issue_num against the declared intent."
+      warning "  ${dr}merge-pr.sh would reopen #$issue_num immediately after the merge. To avoid the close/reopen flicker entirely, unlink #$issue_num from this PR's Development sidebar, then re-run this merge."
+    fi
   done <<< "$partial_refs"
 
   return 0
@@ -666,7 +723,7 @@ _reset_one_partial_issue() {
     local ts comment reopen_note=""
     ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     [[ "$reopened" == "true" ]] && reopen_note="
-- **Reopened** this issue (GitHub had auto-closed it from a stray closing keyword in PR #$PR_NUMBER's body — see #4569)"
+- **Reopened** this issue (GitHub had auto-closed it from a stray closing keyword in PR #$PR_NUMBER's body or one of its commit messages — see #4569)"
     comment="## Partial Increment Merged
 
 PR #$PR_NUMBER merged with a non-closing \`Part of\` / \`Contributes to\` reference, so this issue remains **open** for further work.
@@ -694,13 +751,13 @@ _post_premature_close_comment() {
   ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   comment="## Premature Auto-Close Reverted
 
-PR #$PR_NUMBER referenced this issue with a **non-closing** \`Part of\` / \`Contributes to\` keyword — a declared partial increment, so this issue was meant to stay **open** after the merge. GitHub closed it anyway, because a **closing keyword** (\`close\`/\`fix\`/\`resolve\` and their tense variants) appeared somewhere else in the PR body immediately followed by \`#$issue_num\`.
+PR #$PR_NUMBER referenced this issue with a **non-closing** \`Part of\` / \`Contributes to\` keyword — a declared partial increment, so this issue was meant to stay **open** after the merge. GitHub closed it anyway, because a **closing keyword** (\`close\`/\`fix\`/\`resolve\` and their tense variants) immediately followed by \`#$issue_num\` appeared elsewhere in the PR — in the body, or in one of the PR's commit messages (this merge squashes without overriding the commit message, so GitHub composes the squash message from those commits).
 
-GitHub honors a closing keyword **anywhere** in a PR body — not only in a line-leading trailer — so prose like \"…then close #$issue_num\" in a follow-up checklist creates a real closing link that overrides the intended \`Contributes to #$issue_num\`.
+GitHub honors a closing keyword **anywhere** in a PR body or squash commit message — not only in a line-leading trailer — so prose like \"…then close #$issue_num\" in a follow-up checklist, or a stray \`close #$issue_num\` in a commit message, creates a real closing link that overrides the intended \`Contributes to #$issue_num\`.
 
 **Action taken**: reopened this issue.
 
-**To avoid this**: never put a closing keyword immediately before \`#$issue_num\` anywhere in a partial-increment PR body. Write \`close the issue\` or \`close issue #$issue_num\` instead of \`close #$issue_num\`.
+**To avoid this**: never put a closing keyword immediately before \`#$issue_num\` anywhere in a partial-increment PR's body **or commit messages**. Write \`close the issue\` or \`close issue #$issue_num\` instead of \`close #$issue_num\`.
 
 ---
 *Reopened by merge-pr.sh (#4569) at $ts*"
