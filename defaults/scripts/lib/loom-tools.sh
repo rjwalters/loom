@@ -8,7 +8,14 @@
 #
 # Usage:
 #   source "$(dirname "${BASH_SOURCE[0]}")/lib/loom-tools.sh"
-#   run_loom_tool "claim" "claim" "$@"
+#   run_loom_tool "tokens" "tokens.cli" "$@"
+#
+# NOTE (#4275): the six script-helper entry points that used to call
+# run_loom_tool (strip-ansi.sh, resolve-model.sh, check-usage.sh, checkpoint.sh,
+# sweep-experiment.sh, validate-phase.sh) are now thin stubs over native
+# `loom-daemon` subcommands and source lib/script-helper.sh instead. This library
+# remains for the loom-tools commands that are still Python (`loom-tokens`,
+# `loom-search`); prefer lib/script-helper.sh for anything the daemon owns.
 
 # Find the repository root from the script location
 _find_repo_root() {
@@ -72,8 +79,8 @@ find_loom_tools() {
 
 # Run a loom-tools command with proper fallback chain
 # Arguments:
-#   $1 - CLI command name (e.g., "claim" for loom-claim)
-#   $2 - Python module name (e.g., "claim" for loom_tools.claim)
+#   $1 - CLI command name (e.g., "tokens" for loom-tokens)
+#   $2 - Python module name (e.g., "tokens.cli" for loom_tools.tokens.cli)
 #   $@ - Arguments to pass to the command
 #
 # Priority:

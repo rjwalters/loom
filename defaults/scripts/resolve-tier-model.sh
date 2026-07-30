@@ -18,8 +18,9 @@
 #      `balanced`; env override LOOM_SWEEP_OPTIMIZATION, issue #4238 Phase B).
 #      Either way the resolved logical tier is passed through resolve-model.sh
 #      (logical tier -> current-generation ID). All three steps live in
-#      loom_tools.model_tiers (--tier mode), so they are covered by
-#      test_model_tiers.py rather than duplicated here in inline python.
+#      loom-daemon/src/script_helpers/model_tiers.rs (--tier mode), so they are
+#      covered by its Rust unit tests rather than duplicated here in inline
+#      python.
 #   3. No entry from either source (or a mapping that would resolve to `fable`)
 #      => print nothing, exit 3, so the caller falls through to its normal
 #      precedence chain (the tier-3 role default) instead of guessing a model.
@@ -34,8 +35,6 @@ RUNTIME="${2:-claude}"
 [[ -n "$ISSUE" ]] || { echo "usage: resolve-tier-model.sh <issue> [runtime] [repo]" >&2; exit 2; }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=/dev/null
-source "$SCRIPT_DIR/lib/loom-tools.sh"
 
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || { echo "not a git repo" >&2; exit 2; }
 CONFIG="$ROOT/.loom/config.json"
@@ -89,7 +88,7 @@ case "$tier" in
 esac
 
 # --tier mode returns "" + exit 3 when the runtime/tier has no mapping.
-if model="$(run_loom_tool "resolve-model" "model_tiers" \
+if model="$("$SCRIPT_DIR/resolve-model.sh" \
               --tier "$tier" --runtime "$RUNTIME" --config "$CONFIG" 2>/dev/null)" \
    && [[ -n "$model" ]]; then
   echo "resolve-tier-model: repo=$REPO issue=$ISSUE runtime=$RUNTIME tier=$tier model=$model" >&2

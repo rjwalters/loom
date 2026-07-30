@@ -114,7 +114,8 @@ model-cost experiment all keep naming *logical* tiers; each adapter owns the
 single indirection from logical tier to its own concrete IDs.
 
 **Reference implementation:** `defaults/scripts/resolve-model.sh` (a thin stub
-delegating to `loom_tools.model_tiers`). It is the single indirection point that
+delegating to `loom-daemon resolve-model`, implemented in
+`loom-daemon/src/script_helpers/model_tiers.rs`). It is the single indirection point that
 resolves a logical alias to the concrete ID *before* dispatch. It exists because
 a bare alias is not always current on the wire — the CLI's own `opus` alias
 still resolves to a previous-generation model, so the shipped map pins the stale
@@ -145,8 +146,9 @@ effort maps to a config override (`-c model_reasoning_effort=<v>`) because
 model, `mechanical`/`routine`/`complex`) is exactly this per-runtime table. It is
 resolved **entirely orchestrator-side** — the `/loom:sweep` skill runs
 `./.loom/scripts/resolve-tier-model.sh <issue> <runtime>`, which delegates the
-config lookup to `loom_tools.model_tiers` (`resolve_tier_model`, `--tier` mode)
-and then the alias→ID step to `resolve-model.sh`. **The Rust daemon does not
+config lookup to `loom-daemon resolve-model --tier` (`resolve_tier_model` in
+`loom-daemon/src/script_helpers/model_tiers.rs`) and then the alias→ID step to
+`resolve-model.sh`. **The Rust daemon does not
 participate**: it never reads the complexity marker — it dispatches with an
 explicit/inherited `--model` and forwards nothing else — so there is no daemon
 counterpart to keep in lockstep for the tier map, and its `sweep.modelAliases`
@@ -159,8 +161,9 @@ map layers cleanly on top of whichever single-source resolver wins.
 `cost`/`speed`/`balanced` policy switch that selects a preset over the tier map
 above (see `model-selection.md` "Optimization profile switch") is, for the same
 reason, **also orchestrator-side only**: `resolve_optimization_profile` /
-`optimization_preset` live in `loom_tools.model_tiers` alongside
-`resolve_tier_model`, reached through the same `resolve-tier-model.sh` call —
+`optimization_preset` live in `loom-daemon/src/script_helpers/model_tiers.rs`
+alongside `resolve_tier_model`, reached through the same `resolve-tier-model.sh`
+call —
 there is no separate dispatch path to keep in lockstep. It does not touch
 `sweep_registry.rs` for the same reason the tier map does not: the Rust daemon's
 `resolve_dispatch_model` only ever resolves `sweep.modelAliases` for its own

@@ -29,9 +29,26 @@ import pytest
 # loom-worktree, loom-recover-orphans (ported to native `loom-daemon clean` /
 # `cleanup logs` / `recover-orphans`, or — for loom-worktree — deleted outright
 # as dead argparse-over-bash glue).
+# Issue #4275 (epic #4081 Phase 3 family 5): removed loom-claim,
+# loom-validate-phase, loom-checkpoint, loom-usage, loom-resolve-model (ported to
+# `loom-daemon claim` / `validate-phase` / `checkpoint` / `usage` /
+# `resolve-model`) and loom-backlog (deleted outright — no caller). `loom-claim`
+# survives only as a PATH shim over the daemon subcommand, installed by
+# scripts/install/provision-daemon.sh, so it is deliberately NOT a
+# [project.scripts] entry any more and is asserted below instead.
 EXPECTED_CLI_COMMANDS = [
-    "loom-claim",
+    "loom-tokens",
 ]
+
+# Names that must keep resolving on PATH even though their Python console-script
+# entry points are gone, because agent-facing docs invoke them by name. Each is
+# provisioned as a thin `exec loom-daemon <subcommand>` shim next to the daemon
+# binary (see `_pmd_install_shim` in scripts/install/provision-daemon.sh).
+DAEMON_SHIM_COMMANDS = {
+    "loom-clean": "clean",
+    "loom-recover-orphans": "recover-orphans",
+    "loom-claim": "claim",
+}
 
 # Wrapper scripts that should route to Python implementations
 # Phase 3.3 (#3400): loom-shepherd.sh deleted with shepherd brain
@@ -338,6 +355,37 @@ class TestPyprojectConfiguration:
         for cmd in EXPECTED_CLI_COMMANDS:
             assert cmd in scripts, (
                 f"CLI command '{cmd}' not declared in pyproject.toml [project.scripts]"
+            )
+
+    def test_retired_commands_are_not_redeclared(self, pyproject: dict) -> None:
+        """Ported CLIs must not linger in [project.scripts].
+
+        Re-adding one would resurrect a second implementation of a surface the
+        daemon now owns — exactly the drift epic #4081 exists to remove.
+        """
+        scripts = pyproject.get("project", {}).get("scripts", {})
+        for cmd in (
+            "loom-claim",
+            "loom-validate-phase",
+            "loom-checkpoint",
+            "loom-usage",
+            "loom-backlog",
+            "loom-resolve-model",
+        ):
+            assert cmd not in scripts, (
+                f"'{cmd}' was ported to a native loom-daemon subcommand in #4275 "
+                "and must not be re-declared as a Python console script"
+            )
+
+    def test_daemon_shims_are_provisioned(self, repo_root: pathlib.Path) -> None:
+        """Every agent-facing retired command name must get a PATH shim."""
+        provision = repo_root / "scripts" / "install" / "provision-daemon.sh"
+        assert provision.exists(), "provision-daemon.sh not found"
+        content = provision.read_text()
+        for name, subcommand in DAEMON_SHIM_COMMANDS.items():
+            assert f'_pmd_install_shim "{name}" "{subcommand}"' in content, (
+                f"{name} -> `loom-daemon {subcommand}` shim is not provisioned; "
+                "docs that invoke it by name would silently degrade"
             )
 
     def test_entry_points_have_valid_modules(self, pyproject: dict) -> None:
