@@ -772,7 +772,7 @@ A pool exists if **either** of these is true (logical OR, both checked):
 Both checks are cheap, local, and side-effect-free. The configured-pool count mirrors `bootstrap.py`'s source precedence but does **not** dedupe by email — a raw sum of `ACCOUNT_KEY_*` lines is an accepted approximation for this boolean `>= 2` gate (worst case a single account declared in two sources double-counts at the `== 1` vs `== 2` boundary, a false-positive toward daemon use that still requires `PROBE_DAEMON` to also be true):
 
 ```bash
-TOKEN_FILE_COUNT=$(ls .loom/tokens/*.token 2>/dev/null | wc -l | tr -d ' ')
+TOKEN_FILE_COUNT=$(find .loom/tokens -maxdepth 1 -name '*.token' 2>/dev/null | wc -l | tr -d ' ')
 
 # Repo-local (mirrors bootstrap.py: .loom/accounts.env if present, else legacy .env)
 # NOTE: `grep -c` prints `0` AND exits non-zero on an existing-but-empty file, so a
