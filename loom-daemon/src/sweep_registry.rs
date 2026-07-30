@@ -3751,6 +3751,96 @@ impl SweepRegistry {
         }
     }
 
+    /// Take **exclusive ownership** of issue `N`'s claim lock before the
+    /// mid-build watchdog does anything destructive to its worktree
+    /// (Issue #4564).
+    ///
+    /// #4463 gated the watchdog's `clean_worktree` on the read-only
+    /// [`lock_owned_by_other`](Self::lock_owned_by_other) probe. That narrowed
+    /// but did not close a probe→clean TOCTOU: the lock could be free at probe
+    /// time and be acquired by a cross-instance sweep microseconds later, and
+    /// the watchdog would then `git reset --hard` a worktree a *newly live*
+    /// sweep had just claimed — the #4449 data-loss shape all over again.
+    /// Holding the lock across the clean removes the window: a peer that races
+    /// in can no longer acquire the claim at all, and a peer that got there
+    /// first is detected here so the clean is skipped entirely.
+    ///
+    /// Returns the watchdog's own `sweep_id` — the lock's new owner, to be
+    /// handed to [`release_lock_owned`](Self::release_lock_owned) once the
+    /// clean is done — or `None` when the claim belongs to someone else. On
+    /// `None` the caller MUST touch nothing and MUST NOT consume the issue's
+    /// single recovery retry (the claim may be free again on a later tick).
+    ///
+    /// Two paths, neither of which ever leaves the lock momentarily free
+    /// (which would itself re-open the race it is closing):
+    ///
+    /// - **No lock dir** — [`acquire_lock`](Self::acquire_lock)'s POSIX-atomic
+    ///   `mkdir`, the same primitive [`dispatch`](Self::dispatch) uses, so a
+    ///   racing peer loses the `mkdir` and exactly one of the two proceeds.
+    /// - **Lock dir present** — refuse when `owner.json` positively names a
+    ///   *different* sweep; otherwise (the dead sweep's own stale lock, or a
+    ///   fail-open unreadable/corrupt owner) take it over **in place** by
+    ///   rewriting `owner.json`. The directory is deliberately never removed
+    ///   and re-created: a release→re-acquire pair would expose exactly the
+    ///   `mkdir`-sized window this method exists to eliminate.
+    ///
+    /// FAIL-CLOSED on the takeover write: if `owner.json` cannot be rewritten
+    /// we do not own the lock, so we return `None` rather than clean a
+    /// worktree we cannot fence.
+    fn claim_lock_for_midbuild(&self, issue: u32, dead_sweep_id: &str) -> Option<String> {
+        let watchdog_sweep_id = format!("midbuild-watchdog-{dead_sweep_id}");
+        let lock = self.config.locks_dir().join(format!("issue-{issue}"));
+
+        if !lock.exists() {
+            return match self.acquire_lock(issue, &watchdog_sweep_id) {
+                Ok(()) => Some(watchdog_sweep_id),
+                Err(e) => {
+                    log::info!(
+                        "midbuild-watchdog: issue #{issue} claim lock was acquired by another \
+                         sweep while recovering dead {dead_sweep_id} — not cleaning the worktree \
+                         and not re-dispatching ({e}) (#4564)."
+                    );
+                    None
+                }
+            };
+        }
+
+        // The lock dir exists. Only a POSITIVELY-read differing owner refuses
+        // (fail-open, as #4463 established) — anything else is the dead sweep's
+        // own leftover claim, which this watchdog is entitled to take over.
+        if self.lock_owned_by_other(issue, dead_sweep_id) {
+            log::info!(
+                "midbuild-watchdog: issue #{issue} lock now owned by a newer sweep \
+                 (superseding dead {dead_sweep_id}) — not cleaning the worktree and not \
+                 re-dispatching (#4463)."
+            );
+            return None;
+        }
+
+        let owner = LockOwner {
+            issue,
+            owner_pid: std::process::id(),
+            acquired_at: Utc::now().to_rfc3339(),
+            sweep_id: watchdog_sweep_id.clone(),
+        };
+        let takeover = serde_json::to_string_pretty(&owner)
+            .context("serialize midbuild-watchdog lock owner")
+            .and_then(|json| {
+                std::fs::write(lock.join("owner.json"), json).context("write lock owner.json")
+            });
+        match takeover {
+            Ok(()) => Some(watchdog_sweep_id),
+            Err(e) => {
+                log::warn!(
+                    "midbuild-watchdog: could not take over issue #{issue}'s stale claim lock at \
+                     {} ({e}) — refusing to clean the worktree without holding the lock (#4564).",
+                    lock.display()
+                );
+                None
+            }
+        }
+    }
+
     /// Best-effort removal of this registry's sweep-journal entry for
     /// `issue` (Issue #3953). Never load-bearing — a missed removal is pruned
     /// the next time anything touches the journal — so failures are logged
@@ -6542,6 +6632,14 @@ impl SweepRegistry {
     ///
     /// [`worktree_in_use`]: SweepRegistry::worktree_in_use
     ///
+    /// **Lock-held clean (Issue #4564)**: the destructive arm runs while this
+    /// watchdog *owns* the issue's claim lock
+    /// ([`claim_lock_for_midbuild`]), not merely after a read-only ownership
+    /// probe. A claim it cannot win means a peer sweep is live: the worktree is
+    /// left alone and the single recovery retry is not consumed.
+    ///
+    /// [`claim_lock_for_midbuild`]: SweepRegistry::claim_lock_for_midbuild
+    ///
     /// No new event topics are introduced (the taxonomy is frozen): the
     /// re-dispatch reuses `sweep.global.dispatch` from [`dispatch`], and a
     /// bounded give-up / a pool-exhausted defer surface on the existing frozen
@@ -6646,21 +6744,22 @@ impl SweepRegistry {
                         }
                         continue;
                     }
-                    // #4463: before we clean the worktree or re-dispatch,
-                    // confirm the dead sweep still owns the issue lock. If a
-                    // newer sweep re-acquired it (cross-instance double
-                    // dispatch), its worktree and lock are live — cleaning the
-                    // worktree here would clobber its uncommitted work, exactly
-                    // the incident this guards against. Leave everything intact
-                    // and skip the re-dispatch.
-                    if self.lock_owned_by_other(issue, &sweep_id) {
-                        log::info!(
-                            "midbuild-watchdog: issue #{issue} lock now owned by a newer sweep \
-                             (superseding dead {sweep_id}) — not cleaning the worktree and not \
-                             re-dispatching (#4463)."
-                        );
+                    // #4463/#4564: before we clean the worktree or re-dispatch,
+                    // take EXCLUSIVE ownership of the issue lock. If a newer
+                    // sweep holds it (cross-instance double dispatch), its
+                    // worktree and lock are live — cleaning the worktree here
+                    // would clobber its uncommitted work, exactly the incident
+                    // this guards against, so leave everything intact and skip
+                    // the re-dispatch. #4463 only *probed* the lock read-only,
+                    // which left a probe→clean TOCTOU: acquiring it instead
+                    // (#4564) fences the clean below against a peer that would
+                    // otherwise race into that window. A failed claim must NOT
+                    // consume the single recovery retry, so this runs before
+                    // the `midbuild_retried` latch.
+                    let Some(watchdog_lock_id) = self.claim_lock_for_midbuild(issue, &sweep_id)
+                    else {
                         continue;
-                    }
+                    };
 
                     // A transient defer may have logged a give-up earlier; clear
                     // it so a later genuine give-up still logs once.
@@ -6691,20 +6790,26 @@ impl SweepRegistry {
                     self.clear_dispatch_backoff(issue);
 
                     // Discard the dirty working tree so the resumed sweep starts
-                    // clean (commits, if any, are preserved).
+                    // clean (commits, if any, are preserved). Safe to do
+                    // destructively: the watchdog holds the issue lock for the
+                    // whole of this window (#4564), so no peer sweep can have
+                    // claimed this worktree since the check above.
                     if let Err(e) = self.clean_worktree(issue) {
                         log::warn!(
                             "midbuild-watchdog: failed to clean worktree for issue #{issue} \
                              (continuing re-dispatch anyway): {e}"
                         );
                     }
-                    // Defensive: the reaper releases the lock on death, but a
-                    // reconstructed entry may not have — ensure it's free so the
-                    // re-dispatch can re-acquire cleanly. Ownership-checked
-                    // (#4463): if a newer sweep raced in and re-acquired since
-                    // the probe above, leave its lock intact — the dispatch
-                    // below then fails cleanly on the lock collision.
-                    let _ = self.release_lock_owned(issue, &sweep_id);
+                    // Hand the claim to the re-dispatch: release the lock the
+                    // watchdog acquired above so `dispatch` can re-acquire it
+                    // atomically under its own fresh sweep id. Ownership-checked
+                    // (#4463) against the WATCHDOG's id, so the release can only
+                    // ever remove the watchdog's own claim. This also covers the
+                    // defensive case the pre-#4564 code handled here: a
+                    // reconstructed entry whose lock the reaper never released
+                    // was taken over in place by `claim_lock_for_midbuild`, so
+                    // it is released here rather than left to wedge dispatch.
+                    let _ = self.release_lock_owned(issue, &watchdog_lock_id);
 
                     match self.dispatch(
                         &SweepKind::Issue(issue),
@@ -14499,6 +14604,144 @@ exit 0\n";
         );
         assert_eq!(reg.midbuild_watchdog_once(), 1, "a stale lock does not block recovery");
         assert!(!ws.join(".loom/worktrees/issue-6104/dirty.txt").exists());
+    }
+
+    // --- #4564: the clean runs while the watchdog OWNS the issue lock --------
+
+    #[test]
+    fn midbuild_refuses_to_clean_worktree_when_a_peer_owns_the_issue_lock() {
+        // A cross-instance sweep holds issue #6106's claim lock. Its owner PID
+        // is deliberately DEAD so the #4449 live-use veto contributes nothing
+        // (`worktree_in_use` ignores dead owners) — the ONLY thing that can stop
+        // the destructive arm here is the ownership check in
+        // `claim_lock_for_midbuild`. This is the shape the pre-#4564 read-only
+        // probe could lose to: a peer holding the claim while the watchdog
+        // `git reset --hard`s the worktree it just claimed.
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let (mut reg, _rec) = fixture_registry(ws);
+
+        make_dirty_git_worktree(ws, 6106);
+        insert_terminal_issue(&mut reg, "sweep-issue-6106-dead", 6106, None);
+        let lock = write_lock_owner(&reg, 6106, "sweep-issue-6106-peer", 2_147_483_640);
+
+        assert!(
+            reg.worktree_in_use(6106).is_empty(),
+            "precondition: a dead owner PID is not live-use evidence, so only the \
+             lock-ownership check can refuse here"
+        );
+
+        assert_eq!(reg.midbuild_watchdog_once(), 0, "a peer-owned claim blocks the recovery");
+        assert!(
+            ws.join(".loom/worktrees/issue-6106/dirty.txt").exists(),
+            "the peer's uncommitted work MUST survive (#4564)"
+        );
+        assert!(
+            !reg.midbuild_retried.contains(&6106),
+            "a refusal must NOT consume the single recovery retry"
+        );
+
+        // The peer's lock is left exactly as it was — the watchdog neither
+        // released it nor took it over.
+        let owner: LockOwner =
+            serde_json::from_str(&std::fs::read_to_string(lock.join("owner.json")).unwrap())
+                .unwrap();
+        assert_eq!(owner.sweep_id, "sweep-issue-6106-peer", "the peer's claim is untouched");
+    }
+
+    #[test]
+    fn midbuild_claim_holds_the_issue_lock_across_the_clean() {
+        // The structural fix for the probe→clean TOCTOU (#4564): the watchdog no
+        // longer merely *reads* the lock before cleaning, it *holds* it. This
+        // exercises `claim_lock_for_midbuild` directly, because once the claim
+        // and the clean are one operation there is no longer an in-between
+        // moment a test could inject a peer into — the invariant to pin down is
+        // "while the watchdog holds the claim, a peer cannot acquire it".
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let (reg, _rec) = fixture_registry(ws);
+
+        // 1. Free lock ⇒ claimed via the POSIX-atomic `mkdir` path.
+        let held = reg
+            .claim_lock_for_midbuild(6107, "sweep-issue-6107-dead")
+            .expect("a free claim lock is acquired");
+        assert_eq!(held, "midbuild-watchdog-sweep-issue-6107-dead");
+
+        // 2. THE POINT: a peer racing in during the clean window now loses.
+        //    Before #4564 the probe had already returned "free" and the peer's
+        //    `acquire_lock` would have succeeded, handing it a live claim on a
+        //    worktree the watchdog was about to reset.
+        assert!(
+            reg.acquire_lock(6107, "sweep-issue-6107-peer").is_err(),
+            "a peer cannot acquire the claim while the watchdog holds it (#4564)"
+        );
+
+        // 3. The claim is released under the WATCHDOG's id so `dispatch` can
+        //    re-acquire it under its own fresh sweep id.
+        assert_eq!(reg.release_lock_owned(6107, &held), LockReleaseOutcome::Released);
+        assert!(reg.acquire_lock(6107, "sweep-issue-6107-peer").is_ok(), "released ⇒ acquirable");
+
+        // 4. A claim already held by a DIFFERENT sweep is refused outright.
+        assert!(
+            reg.claim_lock_for_midbuild(6107, "sweep-issue-6107-dead")
+                .is_none(),
+            "a peer-owned claim is never taken over"
+        );
+
+        // 5. The dead sweep's OWN stale claim is taken over IN PLACE (the dir is
+        //    never freed and re-created, which would re-open the very window
+        //    being closed) — and remains un-acquirable by a peer throughout.
+        write_lock_owner(&reg, 6108, "sweep-issue-6108-dead", 2_147_483_640);
+        let held = reg
+            .claim_lock_for_midbuild(6108, "sweep-issue-6108-dead")
+            .expect("the dead sweep's own stale claim is taken over");
+        assert_eq!(held, "midbuild-watchdog-sweep-issue-6108-dead");
+        let owner: LockOwner = serde_json::from_str(
+            &std::fs::read_to_string(reg.config.locks_dir().join("issue-6108/owner.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(owner.sweep_id, held, "owner.json now records the watchdog as the holder");
+        assert_eq!(owner.owner_pid, std::process::id(), "…with a live owner PID");
+        assert!(
+            reg.acquire_lock(6108, "sweep-issue-6108-peer").is_err(),
+            "the takeover never leaves the lock momentarily free"
+        );
+    }
+
+    #[test]
+    fn midbuild_releases_its_own_claim_before_re_dispatching() {
+        // The watchdog's claim must be handed off, not leaked: a lock left
+        // behind would fail the re-dispatch on a collision AND (owned by the
+        // live daemon PID) wedge every later tick behind the #4449 live-claim
+        // veto. Start from the dead sweep's own stale lock so the takeover path
+        // — not the plain `mkdir` path — is the one exercised.
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let (mut reg, _rec) = fixture_registry(ws);
+
+        make_dirty_git_worktree(ws, 6109);
+        insert_terminal_issue(&mut reg, "sweep-issue-6109-dead", 6109, None);
+        write_lock_owner(&reg, 6109, "sweep-issue-6109-dead", 2_147_483_640);
+
+        assert_eq!(reg.midbuild_watchdog_once(), 1, "recovery proceeds and re-dispatches");
+        assert!(!ws.join(".loom/worktrees/issue-6109/dirty.txt").exists(), "worktree cleaned");
+
+        // The lock now belongs to the freshly dispatched sweep — proof the
+        // watchdog released its own claim before dispatching (`dispatch` would
+        // otherwise have failed on the lock collision).
+        let owner: LockOwner = serde_json::from_str(
+            &std::fs::read_to_string(reg.config.locks_dir().join("issue-6109/owner.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            owner.sweep_id.starts_with("sweep-issue-6109-"),
+            "the re-dispatched sweep owns the claim, got {}",
+            owner.sweep_id
+        );
+        assert!(
+            !owner.sweep_id.starts_with("midbuild-watchdog-"),
+            "the watchdog's transient claim must not be left behind"
+        );
     }
 
     #[test]
