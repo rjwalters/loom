@@ -54,8 +54,14 @@ impl ModelPricing {
     /// `claude-sonnet-6`) prices correctly with no code change (#3981). The
     /// legacy `claude-3-5-sonnet` / `claude-3-opus` / `claude-3-haiku` IDs
     /// predate the `-<generation>-` naming scheme and are matched explicitly.
-    /// Mirrors `loom_tools.sweep_experiment.model_pricing` in Python — keep
-    /// both in sync.
+    /// This used to be one half of a hand-synced Python/Rust mirror pair with
+    /// `loom_tools.sweep_experiment.model_pricing`. Issue #4275 (epic #4081
+    /// Phase 3 family 5) deleted that Python module, and its native replacement
+    /// — [`crate::script_helpers::sweep_experiment::model_pricing`] — carries
+    /// the same rate card for the experiment harvest. Both live in Rust now, so
+    /// there is no cross-language sync obligation left; if a rate changes,
+    /// update both Rust sites (their tests assert the fable-priced-as-opus and
+    /// unknown-priced-as-sonnet rules independently).
     pub fn for_model(model: &str) -> Self {
         // Normalize model name for matching
         let model_lower = model.to_lowercase();

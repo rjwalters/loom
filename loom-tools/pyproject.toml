@@ -27,7 +27,11 @@ dependencies = [
 # loom-stuck-detection removed in epic #4081 phase 3 (#4274) — stuck_detection.py
 # deleted (safe no-op since v0.11.0); native surface is `loom-daemon status` + the
 # sweep registry (mcp__loom__list_sweeps).
-loom-claim = "loom_tools.claim:main"
+# loom-claim ported to `loom-daemon claim` (epic #4081 phase 3 family 5, #4275);
+# claim.py deleted. The `loom-claim` NAME survives as a PATH shim installed next
+# to the daemon binary by scripts/install/provision-daemon.sh, so
+# builder-worktree.md's `loom-claim claim <issue> <agent-id>` calls (and their
+# `command -v loom-claim` guard) keep working with zero pip installs.
 # loom-clean removed in epic #4081 Phase 3 family 2 (#4272) — ported to
 # native `loom-daemon clean` (loom-tools/src/loom_tools/clean.py deleted)
 # loom-clean = "loom_tools.clean:main"
@@ -53,7 +57,8 @@ loom-claim = "loom_tools.claim:main"
 # costs/velocity, incl. --period and --by-model parity); agent-metrics.sh
 # repointed.
 # loom-agent-metrics = "loom_tools.agent_metrics:main"
-loom-validate-phase = "loom_tools.validate_phase:main"
+# loom-validate-phase ported to `loom-daemon validate-phase` (#4275);
+# validate_phase.py deleted. `defaults/scripts/validate-phase.sh` repointed.
 # loom-agent-spawn removed in epic #4081 Phase 3 family 4 (#4415) — agent_spawn.py
 # deleted; ported to native `loom-daemon agent-spawn` (tmux lifecycle, OAuth
 # injection via the native token pool, CLAUDE_CONFIG_DIR isolation reusing
@@ -67,20 +72,27 @@ loom-validate-phase = "loom_tools.validate_phase:main"
 # loom-snapshot removed in Phase 3.2 (#3399) — snapshot.py (daemon brain) deleted.
 # forge_snapshot.py removed in epic #4081 phase 3 (#4274); pipeline data is native
 # via loom-daemon/src/pipeline_snapshot.rs (`loom-daemon status --pipeline`).
-loom-checkpoint = "loom_tools.checkpoints:main"
+# loom-checkpoint ported to `loom-daemon checkpoint` (epic #4081 phase 3 family
+# 5, #4275); checkpoints.py deleted. `defaults/scripts/checkpoint.sh` repointed.
 # loom-daemon removed in Phase 3.2 (#3399) — daemon_v2/ brain deleted
 # loom-daemon = "loom_tools.daemon_v2.cli:main"
 # loom-test-failure-analysis removed in Phase 3.2 (#3399) — test_failure_analysis.py retiring
 # loom-test-failure-analysis = "loom_tools.test_failure_analysis:main"
-loom-usage = "loom_tools.common.usage:main"
-loom-backlog = "loom_tools.backlog:main"
+# loom-usage ported to `loom-daemon usage` (#4275); common/usage.py deleted.
+# `defaults/scripts/check-usage.sh` repointed.
+# loom-backlog removed in #4275 — backlog.py had no shell caller, no console-script
+# consumer and no test file, only historical doc references, so it was deleted
+# rather than ported.
 # loom-forge / loom-auto-merge ported to the native `loom-daemon forge`
 # subcommand group (epic #4081 Phase 3, family 3). The shared client stack in
 # loom_tools/common/{forge,github,gitea,cached_forge}.py is preserved — it still
 # backs backlog/clean/daemon_cleanup/daemon_diagnostic/forge_snapshot/
 # orphan_recovery/stuck_detection.
 loom-tokens = "loom_tools.tokens.cli:main"
-loom-resolve-model = "loom_tools.model_tiers:main"
+# loom-resolve-model ported to `loom-daemon resolve-model` (#4275);
+# model_tiers.py deleted. `defaults/scripts/resolve-model.sh` +
+# `resolve-tier-model.sh` repointed. The surviving alias-normalization
+# implementation is loom-daemon/src/sweep_registry.rs::read_model_aliases.
 loom-search = "loom_tools.semantic_search:main"
 
 [project.optional-dependencies]
