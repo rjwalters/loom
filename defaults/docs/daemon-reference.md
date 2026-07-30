@@ -594,6 +594,31 @@ cancel`'s SIGTERM→grace→SIGKILL), plus the three deltas teardown needs:
    draining. Because a `then-exit` drain never wants a relaunch, the
    supervisor-detection refusal gate (`restart --drain`'s AC5) does not apply to
    it.
+
+   **`then_exit` is escalated one-way, and the ack reports reality (#4521).**
+   A drain request that lands while a drain is *already* in progress is
+   idempotent — it never stacks a supervisor and never moves the active
+   deadline — but `then_exit` is not simply ignored: `--then-exit` **escalates**
+   an in-progress relaunch-drain (e.g. the auto-update roll, which drains with
+   `then_exit=false`) to stay-down, and the already-running supervisor observes
+   the change because it re-reads the terminal action from the drain descriptor
+   on every poll. The reverse never happens: a plain `--drain` against an active
+   teardown drain does **not** downgrade it back to a relaunch. Escalation was
+   chosen over "refuse and tell the operator to `--abort-drain` + re-issue"
+   because that two-command path races the very window it exists for — the roll
+   can complete between the abort and the re-issue and relaunch the daemon on a
+   host that is about to be powered off. When a roll is escalated this way, the
+   daemon logs that the rebuilt binary will not be picked up until it is started
+   again.
+
+   Consequently the `DaemonDrain` reply's `then_exit` reports the **active**
+   drain's terminal action, never an echo of the request, and
+   `loom-daemon restart` renders "will stop" vs "will RESTART" from the reply.
+   When the reply disagrees with what was asked, the CLI prints a loud warning —
+   this is also the version-skew detector: a daemon older than `--then-exit`
+   support silently drops the unknown wire field and replies `then_exit: false`,
+   so `--drain --then-exit` against a stale incumbent now says so instead of
+   promising a teardown that never happens (roll the daemon, then re-issue).
 2. **Immediate, targeted claim reset.** The startup-only `claim_reconciliation`
    pass is too late for a drain (the anvil#758 pilot evidence: a crashed VM
    sweep stranded `loom:building` for the full staleness window). `fleet drain`

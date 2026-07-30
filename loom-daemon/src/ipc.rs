@@ -201,7 +201,18 @@ pub enum DrainBegin {
     /// A drain was already in progress; the request is an idempotent ack and no
     /// second supervisor should be spawned (the deadline/generation are
     /// unchanged).
-    AlreadyDraining,
+    AlreadyDraining {
+        /// The **active** drain's actual terminal action after this request was
+        /// applied — `true` ⇒ it will exit and stay down, `false` ⇒ it will exit
+        /// for a supervised relaunch. Never a blind echo of the request
+        /// (Issue #4521): the caller must render its ack from this, or it will
+        /// promise a teardown that never happens.
+        active_then_exit: bool,
+        /// `true` when this request *escalated* an in-progress relaunch-drain to
+        /// stay-down (the one-way `then_exit` transition — see
+        /// [`DrainState::begin`]).
+        escalated: bool,
+    },
 }
 
 impl Default for DrainState {
@@ -250,10 +261,30 @@ impl DrainState {
 
     /// Start a drain, or ack an already-running one (idempotent — a second drain
     /// request while DRAINING neither stacks a supervisor nor moves the
-    /// deadline). Sets the drain flag on a fresh start. `then_exit` is ignored
-    /// on the already-draining path (the in-progress drain's terminal action is
-    /// unchanged by a later idempotent ack — mirrors `force_after_timeout` and
-    /// the deadline both staying fixed too).
+    /// deadline). Sets the drain flag on a fresh start.
+    ///
+    /// **`then_exit` on the already-draining path (Issue #4521 — design
+    /// decision).** `timeout`/`force_after_timeout` stay pinned to the active
+    /// drain (a later idempotent ack must not move a deadline someone is already
+    /// waiting on), but `then_exit` is **escalated one-way**:
+    /// `relaunch → stay-down`, never the reverse.
+    ///
+    /// Rationale: the two options were (a) refuse the escalation and tell the
+    /// operator to `--abort-drain` and re-issue, or (b) escalate in place. (a)
+    /// is racy in exactly the case that matters — an operator tearing a host
+    /// down while an auto-update roll-drain (`then_exit=false`,
+    /// `auto_update.rs`) is in flight would have to abort and re-issue, and the
+    /// roll can complete *between* those two commands, relaunching the daemon on
+    /// a host that is about to be powered off. (b) is monotonic and safe: exiting
+    /// and staying down is strictly the more conservative terminal action, and
+    /// the operator's teardown intent is honored on the first command. The
+    /// reverse direction is deliberately **not** applied — a roll trigger
+    /// arriving during an operator teardown drain must never silently downgrade
+    /// the teardown into a relaunch.
+    ///
+    /// The escalation is observed by the already-running supervisor because it
+    /// re-reads `then_exit` from this descriptor at its terminal tick rather
+    /// than using a value captured at spawn (see [`run_drain_supervisor`]).
     pub fn begin(
         &self,
         timeout: Duration,
@@ -262,7 +293,19 @@ impl DrainState {
     ) -> DrainBegin {
         let mut inner = self.inner.lock().expect("Drain mutex poisoned");
         if inner.active {
-            return DrainBegin::AlreadyDraining;
+            let escalated = then_exit && !inner.then_exit;
+            if escalated {
+                inner.then_exit = true;
+                inner.note = Some(
+                    "in-progress drain escalated to then-exit — will stop and stay down \
+                     (was: exit for a supervised relaunch)"
+                        .to_string(),
+                );
+            }
+            return DrainBegin::AlreadyDraining {
+                active_then_exit: inner.then_exit,
+                escalated,
+            };
         }
         let deadline = Utc::now()
             + chrono::Duration::from_std(timeout).unwrap_or_else(|_| chrono::Duration::seconds(0));
@@ -483,7 +526,6 @@ pub fn handle_drain_request(
                     bus_task,
                     generation,
                     DRAIN_POLL_INTERVAL,
-                    then_exit,
                 )
                 .await;
             });
@@ -527,16 +569,107 @@ pub fn handle_drain_request(
                 then_exit,
             }
         }
-        DrainBegin::AlreadyDraining => Response::DaemonDrain {
-            accepted: true,
-            supervisor,
-            in_flight,
-            message: format!(
-                "already draining (idempotent): {in_flight} in-flight sweep(s); the existing \
-                 deadline is unchanged. Use `loom-daemon restart --abort-drain` to cancel."
-            ),
-            then_exit,
-        },
+        // Issue #4521: the ack must describe the **active** drain's terminal
+        // action, never the requested one. Echoing the request here is what let
+        // an operator's `--drain --then-exit` be acked as "will stop" while an
+        // in-progress relaunch-drain (an auto-update roll) exited 0 and launchd
+        // brought the daemon straight back up.
+        DrainBegin::AlreadyDraining {
+            active_then_exit,
+            escalated,
+        } => {
+            let _ = event_bus.publish_generic(
+                "daemon.drain.already_draining",
+                serde_json::json!({
+                    "in_flight": in_flight,
+                    "requested_then_exit": then_exit,
+                    "active_then_exit": active_then_exit,
+                    "escalated": escalated,
+                }),
+            );
+            if escalated {
+                log::warn!(
+                    "drain escalated to then-exit (Issue #4521): an in-progress relaunch-drain \
+                     (e.g. an auto-update roll) will now exit {EXIT_SHUTDOWN} and stay down \
+                     instead of relaunching"
+                );
+            }
+            let message = if escalated {
+                format!(
+                    "already draining (idempotent) — ESCALATED to then-exit: the in-progress \
+                     drain was a relaunch drain (e.g. an auto-update roll) and will now STOP \
+                     and stay down when drained, NOT relaunch. {in_flight} in-flight sweep(s); \
+                     the existing deadline is unchanged. If a relaunch was wanted after all, \
+                     `loom-daemon restart --abort-drain` and re-issue without --then-exit."
+                )
+            } else if active_then_exit && !then_exit {
+                format!(
+                    "already draining (idempotent): the in-progress drain is a then-exit \
+                     teardown — it will STOP and stay down when drained, NOT relaunch, so this \
+                     restart-when-drained request will not be honored (then-exit is never \
+                     downgraded). {in_flight} in-flight sweep(s); the existing deadline is \
+                     unchanged. Use `loom-daemon restart --abort-drain` to cancel."
+                )
+            } else if active_then_exit {
+                format!(
+                    "already draining (idempotent): the in-progress drain will STOP and stay \
+                     down when drained (then-exit). {in_flight} in-flight sweep(s); the existing \
+                     deadline is unchanged. Use `loom-daemon restart --abort-drain` to cancel."
+                )
+            } else {
+                format!(
+                    "already draining (idempotent): the in-progress drain will RESTART when \
+                     drained. {in_flight} in-flight sweep(s); the existing deadline is \
+                     unchanged. Use `loom-daemon restart --abort-drain` to cancel."
+                )
+            };
+            Response::DaemonDrain {
+                accepted: true,
+                supervisor,
+                in_flight,
+                message,
+                then_exit: active_then_exit,
+            }
+        }
+    }
+}
+
+/// The exit code a terminal drain tick must use (Issue #4521).
+///
+/// Load-bearing and deliberately extracted as a pure function so the contract is
+/// unit-testable without spawning a process: a **then-exit** drain must exit
+/// [`EXIT_SHUTDOWN`] (143, non-zero) so a `KeepAlive:{SuccessfulExit:true}`
+/// launchd job stays down — exiting [`EXIT_RESTART`] (0) there is precisely the
+/// "drained, then relaunched anyway" failure. A relaunch drain exits
+/// [`EXIT_RESTART`] so the supervisor brings it straight back.
+#[must_use]
+pub fn drain_exit_code(then_exit: bool) -> i32 {
+    if then_exit {
+        EXIT_SHUTDOWN
+    } else {
+        EXIT_RESTART
+    }
+}
+
+/// The operator-facing log line emitted when a drain completes with zero
+/// in-flight sweeps (Issue #4090, pinned by Issue #4521).
+///
+/// The two terminal actions **must** produce visibly different lines — a host
+/// log has to say which one fired without the reader guessing. Extracted as a
+/// pure function so that distinctness is a test assertion rather than a
+/// convention. `supervisor` is only interpolated on the relaunch line.
+#[must_use]
+pub fn drain_complete_log_line(then_exit: bool, supervisor: &str) -> String {
+    if then_exit {
+        format!(
+            "drain complete — 0 in-flight sweeps; exiting {EXIT_SHUTDOWN} and staying down \
+             (then_exit — Issue #4343 teardown). No sweep was killed; no orphan left behind."
+        )
+    } else {
+        format!(
+            "drain complete — 0 in-flight sweeps; exiting {EXIT_RESTART} for a \
+             {supervisor}-supervised relaunch. No sweep was killed; no orphan left behind."
+        )
     }
 }
 
@@ -544,6 +677,12 @@ pub fn handle_drain_request(
 /// and owns the eventual `std::process::exit(EXIT_RESTART)`; on a fail-safe
 /// timeout it clears the drain flag and stays up. Stops without exiting if it
 /// has been superseded (a new drain) or aborted (generation moved on).
+///
+/// The terminal action (`then_exit`) is **re-read from [`DrainState`] on every
+/// tick** rather than captured at spawn (Issue #4521): an in-progress
+/// relaunch-drain can be escalated to stay-down by a later
+/// `--drain --then-exit` request, and a supervisor holding a stale `false` would
+/// exit `0` and be relaunched by the supervisor anyway.
 async fn run_drain_supervisor(
     drain: Arc<DrainState>,
     workspace_pool: Arc<WorkspacePool>,
@@ -551,7 +690,6 @@ async fn run_drain_supervisor(
     event_bus: Arc<EventBus>,
     my_generation: u64,
     poll_interval: Duration,
-    then_exit: bool,
 ) {
     loop {
         // Superseded / aborted: a newer drain or an abort bumped the generation,
@@ -568,10 +706,13 @@ async fn run_drain_supervisor(
         }
 
         let in_flight = count_in_flight_sweeps(&workspace_pool, &fallback_root);
-        let (past_deadline, force) = {
+        // One consistent read of the live descriptor per tick. `then_exit` comes
+        // from here — not from a spawn-time argument — so a mid-drain escalation
+        // (relaunch → stay-down, Issue #4521) is honored by this supervisor.
+        let (past_deadline, force, then_exit) = {
             let snap = drain.snapshot();
             let past = snap.deadline.is_some_and(|d| Utc::now() >= d);
-            (past, snap.force_after_timeout)
+            (past, snap.force_after_timeout, snap.then_exit)
         };
 
         match evaluate_drain_tick(in_flight, past_deadline, force) {
@@ -584,23 +725,16 @@ async fn run_drain_supervisor(
                     serde_json::json!({ "in_flight": 0, "then_exit": then_exit }),
                 );
                 if then_exit {
-                    log::warn!(
-                        "drain complete — 0 in-flight sweeps; exiting {EXIT_SHUTDOWN} and staying \
-                         down (then_exit — Issue #4343 teardown). No sweep was killed; no orphan \
-                         left behind."
-                    );
-                    std::process::exit(EXIT_SHUTDOWN);
+                    log::warn!("{}", drain_complete_log_line(true, ""));
+                    std::process::exit(drain_exit_code(true));
                 }
                 // This path only runs after `handle_drain_request` proved
                 // supervision, so `detect_supervisor()` should still be `Some`
                 // here; fall back to a generic label rather than hardcoding
                 // launchd if the environment somehow changed underneath us.
                 let sup = detect_supervisor().unwrap_or_else(|| "supervisor".to_string());
-                log::warn!(
-                    "drain complete — 0 in-flight sweeps; exiting {EXIT_RESTART} for a \
-                     {sup}-supervised relaunch. No sweep was killed; no orphan left behind."
-                );
-                std::process::exit(EXIT_RESTART);
+                log::warn!("{}", drain_complete_log_line(false, &sup));
+                std::process::exit(drain_exit_code(false));
             }
             DrainTick::TimedOutRefuse => {
                 let note = format!(
@@ -632,13 +766,13 @@ async fn run_drain_supervisor(
                          cancelled {cancelled} sweep(s); exiting {EXIT_SHUTDOWN} and staying down \
                          (then_exit — Issue #4343 teardown)"
                     );
-                    std::process::exit(EXIT_SHUTDOWN);
+                    std::process::exit(drain_exit_code(true));
                 }
                 log::warn!(
                     "drain timed out with {in_flight} in-flight; --force-after-timeout cancelled \
                      {cancelled} sweep(s); exiting {EXIT_RESTART} for a supervised relaunch"
                 );
-                std::process::exit(EXIT_RESTART);
+                std::process::exit(drain_exit_code(false));
             }
         }
     }
@@ -5858,7 +5992,13 @@ exit 0
         // A second begin while already draining is idempotent: same generation,
         // same deadline, flag still set (AC edge: second drain does not stack).
         match drain.begin(Duration::from_secs(9999), true, false) {
-            DrainBegin::AlreadyDraining => {}
+            DrainBegin::AlreadyDraining {
+                active_then_exit,
+                escalated,
+            } => {
+                assert!(!active_then_exit, "active drain is still a relaunch drain");
+                assert!(!escalated, "a then_exit=false request escalates nothing");
+            }
             other => panic!("expected AlreadyDraining, got {other:?}"),
         }
         assert_eq!(drain.generation(), gen1, "idempotent begin does not bump gen");
@@ -5884,6 +6024,133 @@ exit 0
         assert!(!drain.is_draining());
         assert_eq!(drain.snapshot().note.as_deref(), Some("timed out"));
         assert!(drain.generation() > gen_before);
+    }
+
+    /// Issue #4521 AC1 — `then_exit` on the already-draining path is escalated
+    /// **one way** (relaunch → stay-down) and the outcome reported back is the
+    /// ACTIVE drain's terminal action, never a blind echo of the request.
+    #[test]
+    fn test_drain_then_exit_escalates_one_way() {
+        // A relaunch-drain is in flight (this is the auto-update roll's shape:
+        // `then_exit=false`).
+        let drain = DrainState::new();
+        let deadline = match drain.begin(Duration::from_secs(120), false, false) {
+            DrainBegin::Started { deadline, .. } => deadline,
+            other => panic!("expected Started, got {other:?}"),
+        };
+        assert!(!drain.snapshot().then_exit);
+
+        // An operator teardown request lands mid-roll: it must NOT be silently
+        // ignored (the #4521 defect) — the active drain escalates to stay-down.
+        match drain.begin(Duration::from_secs(9999), true, true) {
+            DrainBegin::AlreadyDraining {
+                active_then_exit,
+                escalated,
+            } => {
+                assert!(active_then_exit, "the active drain now stays down");
+                assert!(escalated, "the escalation must be reported to the caller");
+            }
+            other => panic!("expected AlreadyDraining, got {other:?}"),
+        }
+        assert!(
+            drain.snapshot().then_exit,
+            "the escalation must be visible to the already-running supervisor, \
+             which re-reads the descriptor"
+        );
+        // Everything else about the active drain is still pinned.
+        assert_eq!(drain.snapshot().deadline, Some(deadline));
+        assert!(!drain.snapshot().force_after_timeout);
+
+        // Escalating again is a no-op that still reports the truth.
+        match drain.begin(Duration::from_secs(1), false, true) {
+            DrainBegin::AlreadyDraining {
+                active_then_exit,
+                escalated,
+            } => {
+                assert!(active_then_exit);
+                assert!(!escalated, "already stay-down — nothing to escalate");
+            }
+            other => panic!("expected AlreadyDraining, got {other:?}"),
+        }
+
+        // A relaunch request against an active teardown drain must NOT downgrade
+        // it: the reply still says "will stay down".
+        match drain.begin(Duration::from_secs(1), false, false) {
+            DrainBegin::AlreadyDraining {
+                active_then_exit,
+                escalated,
+            } => {
+                assert!(active_then_exit, "then-exit is never downgraded");
+                assert!(!escalated);
+            }
+            other => panic!("expected AlreadyDraining, got {other:?}"),
+        }
+        assert!(drain.snapshot().then_exit);
+
+        // After an abort, a fresh drain starts from the requested terminal
+        // action again (the escalation does not leak across drains).
+        assert!(drain.abort());
+        match drain.begin(Duration::from_secs(30), false, false) {
+            DrainBegin::Started { .. } => {}
+            other => panic!("expected Started, got {other:?}"),
+        }
+        assert!(!drain.snapshot().then_exit, "a fresh drain honors its own then_exit");
+    }
+
+    /// Issue #4521 AC3 — the drain-completion exit-code contract: a then-exit
+    /// drain must exit `EXIT_SHUTDOWN` (143, **non-zero**) so a launchd job with
+    /// `KeepAlive:{SuccessfulExit:true}` stays down; a relaunch drain exits
+    /// `EXIT_RESTART` (0) so it comes straight back. Exiting 0 on the then-exit
+    /// path is the "drained, then relaunched anyway" failure.
+    #[test]
+    fn test_drain_exit_code_selection() {
+        assert_eq!(drain_exit_code(true), EXIT_SHUTDOWN);
+        assert_eq!(drain_exit_code(true), 143);
+        assert_ne!(drain_exit_code(true), 0, "then-exit must never exit 0");
+        assert_eq!(drain_exit_code(false), EXIT_RESTART);
+        assert_eq!(drain_exit_code(false), 0);
+    }
+
+    /// Issue #4521 AC3 — the supervisor's branch selection follows the LIVE
+    /// descriptor, not a value captured when it was spawned. This is what makes
+    /// a mid-drain escalation effective: the supervisor re-reads `then_exit`
+    /// from `DrainState` on each tick (see `run_drain_supervisor`), so the same
+    /// read modeled here flips 0 → 143 after an escalation.
+    #[test]
+    fn test_supervisor_branch_follows_live_then_exit() {
+        let drain = DrainState::new();
+        let _ = drain.begin(Duration::from_secs(120), false, false);
+
+        // Tick 1 (pre-escalation): zero in-flight ⇒ Complete ⇒ relaunch exit.
+        assert_eq!(evaluate_drain_tick(0, false, false), DrainTick::Complete);
+        assert_eq!(drain_exit_code(drain.snapshot().then_exit), EXIT_RESTART);
+
+        // An operator teardown request escalates the drain in place.
+        let _ = drain.begin(Duration::from_secs(120), false, true);
+
+        // Tick 2 (post-escalation, same supervisor): the very same read now
+        // selects the stay-down exit.
+        assert_eq!(evaluate_drain_tick(0, false, false), DrainTick::Complete);
+        assert_eq!(drain_exit_code(drain.snapshot().then_exit), EXIT_SHUTDOWN);
+
+        // The forced-timeout terminal branch reads the same field.
+        assert_eq!(evaluate_drain_tick(2, true, true), DrainTick::TimedOutForce);
+        assert_eq!(drain_exit_code(drain.snapshot().then_exit), EXIT_SHUTDOWN);
+    }
+
+    /// Issue #4521 AC4 (regression pin) — the two drain-complete log lines stay
+    /// **distinct**, so a host log tells an operator which terminal action fired
+    /// without guessing. Asserted against the exact bodies
+    /// `run_drain_supervisor`'s `DrainTick::Complete` arm emits.
+    #[test]
+    fn test_drain_complete_log_lines_remain_distinct() {
+        let then_exit_line = drain_complete_log_line(true, "launchd");
+        let relaunch_line = drain_complete_log_line(false, "launchd");
+        assert_ne!(then_exit_line, relaunch_line);
+        assert!(then_exit_line.contains("staying down"));
+        assert!(then_exit_line.contains("143"));
+        assert!(relaunch_line.contains("supervised relaunch"));
+        assert!(!relaunch_line.contains("staying down"));
     }
 
     /// AC5 (immediate unsupervised refusal): with no supervisor, a drain request
@@ -5921,6 +6188,81 @@ exit 0
         assert!(!drain.is_draining(), "refused drain must NOT pause dispatch");
         assert_eq!(drain.generation(), 0, "refused drain must not bump generation");
 
+        std::env::remove_var(crate::workspace_registry::REGISTRY_PATH_ENV);
+    }
+
+    /// Issue #4521 AC1 — the `AlreadyDraining` ack reports the ACTIVE drain's
+    /// terminal action, not the requested one.
+    ///
+    /// The pre-fix behavior echoed the request: an operator's
+    /// `--drain --then-exit` landing on an in-progress auto-update roll-drain
+    /// was acked `then_exit: true` ("will stop") while the daemon exited 0 and
+    /// launchd relaunched it — the exact incident shape.
+    ///
+    /// No supervisor task is spawned on this path (only `DrainBegin::Started`
+    /// spawns one), so the drain state is primed with `DrainState::begin`
+    /// directly and the process is never at risk of the supervisor's `exit`.
+    #[test]
+    #[serial_test::serial]
+    fn test_already_draining_ack_reports_active_terminal_action() {
+        let (sr, dir, _rec) = setup_sweep_registry_in_tempdir();
+        let root = dir.path().to_path_buf();
+        let empty_reg = dir.path().join("no-such-workspaces.json");
+        std::env::set_var(crate::workspace_registry::REGISTRY_PATH_ENV, &empty_reg);
+        let pool = Arc::new(WorkspacePool::new(Arc::new(EventBus::new()), test_runtime_handle()));
+        pool.seed(root.clone(), sr);
+        let bus = Arc::new(EventBus::new());
+
+        // An auto-update roll-drain is already in flight (`then_exit=false`).
+        let drain = Arc::new(DrainState::new());
+        let _ = drain.begin(Duration::from_secs(600), false, false);
+
+        // Operator teardown request during that window. `then_exit=true` skips
+        // the supervisor gate, so no `LOOM_DAEMON_SUPERVISOR` is needed.
+        let resp = handle_drain_request(&drain, &pool, &root, &bus, Some(60), false, true);
+        match resp {
+            Response::DaemonDrain {
+                accepted,
+                then_exit,
+                ref message,
+                ..
+            } => {
+                assert!(accepted);
+                assert!(
+                    then_exit,
+                    "the ack must report the ACTIVE drain's terminal action (escalated to \
+                     stay-down), not a blind echo"
+                );
+                assert!(message.contains("ESCALATED"), "message was: {message}");
+            }
+            other => panic!("expected DaemonDrain, got {other:?}"),
+        }
+        assert!(drain.snapshot().then_exit, "the active drain now stays down");
+
+        // The reverse: a plain relaunch drain request against the now-teardown
+        // drain must be acked with `then_exit: true` — it is NOT downgraded, and
+        // the ack must not promise a restart that will never happen.
+        std::env::set_var("LOOM_DAEMON_SUPERVISOR", "launchd");
+        let resp = handle_drain_request(&drain, &pool, &root, &bus, Some(60), false, false);
+        match resp {
+            Response::DaemonDrain {
+                accepted,
+                then_exit,
+                ref message,
+                ..
+            } => {
+                assert!(accepted);
+                assert!(then_exit, "then-exit is never downgraded");
+                assert!(
+                    message.contains("not be honored") || message.contains("NOT relaunch"),
+                    "message was: {message}"
+                );
+            }
+            other => panic!("expected DaemonDrain, got {other:?}"),
+        }
+        assert!(drain.snapshot().then_exit);
+
+        std::env::remove_var("LOOM_DAEMON_SUPERVISOR");
         std::env::remove_var(crate::workspace_registry::REGISTRY_PATH_ENV);
     }
 

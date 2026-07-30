@@ -442,6 +442,13 @@ pub enum Request {
     ///   nothing to prove supervision *for*). `#[serde(default)]` keeps
     ///   pre-#4343 wire data (`{"type":"DrainAndRestartDaemon","payload":{...}}`
     ///   with no `then_exit` key) parsing as `false` — the original behavior.
+    ///
+    ///   When a drain is **already in progress**, `timeout_secs` and
+    ///   `force_after_timeout` are ignored (the active deadline is pinned) but
+    ///   `then_exit: true` **escalates** the active drain one-way from relaunch
+    ///   to stay-down (Issue #4521); `then_exit: false` never downgrades an
+    ///   active teardown drain. The reply's `then_exit` reports what the active
+    ///   drain will actually do — see [`Response::DaemonDrain`].
     DrainAndRestartDaemon {
         timeout_secs: Option<u64>,
         force_after_timeout: bool,
@@ -618,10 +625,21 @@ pub enum Response {
     /// `in_flight` is the cross-root non-terminal sweep count at request time,
     /// so the operator immediately sees how much work the drain must wait for.
     /// `message` is a human-readable explanation for operator output.
-    /// `then_exit` (Issue #4343) echoes back the request's `then_exit`: `true`
-    /// means the daemon will exit and stay down once drained (never relaunch),
-    /// rather than restart. `#[serde(default)]` keeps pre-#4343 wire data
-    /// parsing (as `false`).
+    /// `then_exit` (Issue #4343) reports the **active** drain's terminal action:
+    /// `true` means the daemon will exit and stay down once drained (never
+    /// relaunch), `false` means it will exit for a supervised relaunch.
+    ///
+    /// It is **not** an echo of the request (Issue #4521). On the
+    /// already-draining path the requested value may differ from the active
+    /// drain's: a `then_exit: true` request escalates an in-progress
+    /// relaunch-drain one-way to stay-down (so the reply is `true`), while a
+    /// `then_exit: false` request against an active teardown drain is *not*
+    /// honored (the reply stays `true`). Clients MUST render "will stop" vs
+    /// "will restart" from this field, never from their own request — a client
+    /// that renders from the request promises a teardown the daemon never
+    /// performs. `#[serde(default)]` keeps pre-#4343 wire data parsing (as
+    /// `false`), which is also how a new client detects version skew against an
+    /// old daemon that silently dropped the request's `then_exit`.
     DaemonDrain {
         accepted: bool,
         supervisor: Option<String>,
