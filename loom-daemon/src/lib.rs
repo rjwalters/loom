@@ -167,6 +167,7 @@ pub mod idle_exit;
 pub mod init;
 pub mod ipc;
 pub mod issue_creation_mutex;
+pub mod live_claim;
 pub mod main_health_gate;
 pub mod metrics_collector;
 pub mod peer_claims;

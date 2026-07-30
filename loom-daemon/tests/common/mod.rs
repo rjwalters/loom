@@ -49,6 +49,40 @@ pub fn daemon_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_loom-daemon"))
 }
 
+/// Confine a to-be-spawned `loom-daemon` to `fixture` for every piece of
+/// **machine-level** state it would otherwise share with the operator's real
+/// daemon (Issue #4556).
+///
+/// Without this, a test daemon inherits the test process's cwd (the crate root)
+/// *and* the real `~/.loom/` files, so it starts up pointed at the operator's
+/// actual managed repositories:
+///
+/// | State | Real location | Consequence of sharing it |
+/// |---|---|---|
+/// | Managed-workspace registry | `~/.loom/workspaces.json` | the startup claim-reconciliation pass and every autonomous tick run against **real repos and real GitHub issues** |
+/// | Sweep liveness journal | `~/.loom/sweeps.json` | a test daemon prunes/rewrites records describing the real daemon's live sweeps |
+/// | Watch registry + results log | `~/.loom/watches.json` | test watches leak into the real daemon's watch set |
+/// | Default sweep workspace | cwd | claim locks and worktree paths resolve inside the real checkout |
+///
+/// This is the confirmed mechanism behind the three #4275 dispatches that had
+/// no entry in the production daemon's log: a debug `loom-daemon` spawned by
+/// the test suite, sharing the real workspace registry, re-dispatching an issue
+/// the production daemon was already sweeping. Isolation **by construction** —
+/// an empty fixture registry lists no managed workspaces, so a test daemon has
+/// nothing to reconcile or dispatch against no matter what it is asked to do.
+///
+/// Each path points at a *non-existent* file inside `fixture`; every loader
+/// treats a missing file as empty state and creates it on first write, so no
+/// pre-seeding is required.
+#[allow(dead_code)]
+pub fn isolate_daemon_state(cmd: &mut Command, fixture: &Path) {
+    cmd.current_dir(fixture)
+        .env("LOOM_WORKSPACES_PATH", fixture.join("workspaces.json"))
+        .env("LOOM_SWEEPS_JOURNAL_PATH", fixture.join("sweeps.json"))
+        .env("LOOM_WATCHES_PATH", fixture.join("watches.json"))
+        .env("LOOM_WATCH_RESULTS_LOG", fixture.join("watch-results.log"));
+}
+
 /// Test daemon instance that cleans up on drop
 #[allow(dead_code)]
 pub struct TestDaemon {
@@ -73,8 +107,8 @@ impl TestDaemon {
         // and falls back to the default) and inside the `TempDir`.
         let worktree_root = temp_dir.path().join("worktrees");
 
-        let mut process = Command::new(daemon_bin())
-            .env("LOOM_SOCKET_PATH", &socket_path)
+        let mut cmd = Command::new(daemon_bin());
+        cmd.env("LOOM_SOCKET_PATH", &socket_path)
             .env("RUST_LOG", "debug")
             // Disable restore_from_tmux() to prevent cross-test-binary contamination
             // via the shared tmux server. Each test manages its own terminals.
@@ -110,7 +144,15 @@ impl TestDaemon {
             // the invoking environment. Note the daemon namespaces an
             // *override* by repo basename, so the effective root is
             // `<temp>/worktrees/<temp-basename>` — still inside the `TempDir`.
-            .env("LOOM_WORKTREE_ROOT", &worktree_root)
+            .env("LOOM_WORKTREE_ROOT", &worktree_root);
+        // #4556: confine every *remaining* machine-level file (sweep journal,
+        // watch registry, watch-results log) and the cwd-derived default
+        // workspace to this fixture too, so a test daemon can never reconcile,
+        // dispatch against, or rewrite liveness state for the operator's real
+        // repositories. Complements the #4573 vars set above (which already
+        // pin the workspace registry and worktree root).
+        isolate_daemon_state(&mut cmd, temp_dir.path());
+        let mut process = cmd
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()

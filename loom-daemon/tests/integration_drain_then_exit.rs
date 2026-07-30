@@ -16,7 +16,7 @@
 
 mod common;
 
-use common::{daemon_bin, TestClient};
+use common::{daemon_bin, isolate_daemon_state, TestClient};
 use serial_test::serial;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -53,15 +53,17 @@ async fn test_drain_then_exit_exits_143_and_stays_down() {
     // An empty workspace registry + a scratch workspace root guarantee the
     // cross-root in-flight count is 0, so the drain reaches its terminal tick
     // immediately instead of waiting on this host's real sweeps.
-    let workspaces_json = temp_dir.path().join("workspaces.json");
     let workspace_root = temp_dir.path().join("workspace");
     std::fs::create_dir_all(&workspace_root).expect("create workspace root");
 
+    let mut cmd = Command::new(daemon_bin());
+    // Shared #4556 confinement (empty fixture workspace registry, fixture sweep
+    // journal / watch files, fixture cwd) — the generalized form of the
+    // isolation this test has always needed.
+    isolate_daemon_state(&mut cmd, temp_dir.path());
     let mut child = ChildGuard(
-        Command::new(daemon_bin())
-            .current_dir(&workspace_root)
+        cmd.current_dir(&workspace_root)
             .env("LOOM_SOCKET_PATH", &socket_path)
-            .env("LOOM_WORKSPACES_PATH", &workspaces_json)
             // Pinned, not merely inherited: this test may run on a host that is
             // itself running Loom, where an inherited `LOOM_WORKSPACE` makes the
             // scratch daemon count that repo's REAL in-flight sweeps and the
