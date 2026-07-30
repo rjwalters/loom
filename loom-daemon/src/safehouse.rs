@@ -2449,6 +2449,40 @@ mod tests {
         assert!(event_to_envelope(&Event::TopicLag { skipped: 3 }).is_none());
     }
 
+    #[test]
+    fn narrates_child_published_phase_and_blocker_after_typed_upgrade() {
+        // Issue #4466: a child-published `sweep.issue.{N}.*` event arrives via
+        // `PublishEvent`; before the typed-upgrade fix it became `Event::Generic`
+        // and `event_to_envelope` returned `None` (silently dropped). Drive the
+        // exact `PublishEvent` construction (`Event::from_published`) end to end
+        // and assert the documented room lines now appear.
+        let phase = Event::from_published(
+            "sweep.issue.42.phase".to_owned(),
+            json!({"phase": "builder", "pr_number": 99, "repo": "/repos/vibesql"}),
+        );
+        let env = event_to_envelope(&phase).expect("phase must narrate (was dropped as Generic)");
+        assert_eq!(env.kind, "task");
+        assert_eq!(env.task_id.as_deref(), Some("vibesql_42"));
+        assert!(env.body.starts_with("vibesql#42 · builder"));
+        assert!(env.body.contains("PR #99 open"));
+
+        let blocker = Event::from_published(
+            "sweep.issue.42.blocker".to_owned(),
+            json!({"reason": "missing dep", "label_added": "loom:blocked", "repo": "/repos/vibesql"}),
+        );
+        let env =
+            event_to_envelope(&blocker).expect("blocker must narrate (was dropped as Generic)");
+        assert_eq!(env.kind, "handoff");
+        assert_eq!(env.body, "vibesql#42 · BLOCKED — missing dep");
+
+        // A malformed child payload still falls through to Generic and stays
+        // un-narrated (publish is fire-and-forget advisory — never rejected).
+        let malformed =
+            Event::from_published("sweep.issue.42.phase".to_owned(), json!({"pr_number": 1}));
+        assert!(matches!(malformed, Event::Generic { .. }));
+        assert!(event_to_envelope(&malformed).is_none());
+    }
+
     // ---- dispatch-title fetch (issue #4201, sink-side gh lookup) ----
 
     /// Write an executable fake `gh` script at `dir/fake-gh.sh` that logs its
