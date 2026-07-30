@@ -88,7 +88,7 @@ Claude-specific internals):
 | **Prompt delivery** | `-p "…"` / `--prompt` is passed through to `claude -p`. | Deliver the prompt to the runtime's own headless/print-mode flag. |
 | **Model tier env** | `LOOM_MODEL` → `claude --model <v>` unless an explicit `--model` is already present (explicit arg wins). See [model mapping](#2-model-mapping). | Map the logical model tier to the runtime's own model-selection flag with the same precedence. |
 | **Effort tier env** | `LOOM_EFFORT` → `claude --effort <v>` unless an explicit `--effort` is present. This is a **session-default** effort; the in-session Task tool exposes no per-rung effort knob. | Map to the runtime's reasoning-effort knob if it has one; otherwise omit (no error). |
-| **Missing-pool failure** | Exits **78** (`EX_CONFIG`) when neither token pool exists / all tokens are bad, with a message pointing at `loom-tokens bootstrap`. It never silently falls back to keychain. | Fail with a distinct, non-generic exit code on a missing/exhausted credential source rather than silently degrading. |
+| **Missing-pool failure** | Exits **78** (`EX_CONFIG`) when neither token pool exists / all tokens are bad, with a message pointing at `loom-daemon tokens bootstrap`. It never silently falls back to keychain. | Fail with a distinct, non-generic exit code on a missing/exhausted credential source rather than silently degrading. |
 | **Runtime-missing failure** | Exits `127` when the `claude` CLI is not on `PATH`. | Fail cleanly when the runtime binary is absent. |
 | **Observability** | Emits exactly one structured `spawn-claude: model=<v>` line (and an effort line when resolved) to stderr on every spawn, changing no behavior. | Emit an equivalent single structured line so log scrapers can attribute the dispatch. |
 
@@ -96,9 +96,11 @@ The daemon dispatch path (`loom-daemon`'s `spawn_child`) sets
 `LOOM_SWEEP_CLAIM_OWNED` and per-sweep log redirection around this script; an
 adapter's spawn entry point is invoked the same way, so it must tolerate that
 env var being present (Claude's script logs `LOOM_SWEEP_CLAIM_OWNED` on every
-spawn for dispatch diagnosability). `LOOM_PACKAGE_PATH` forwarding — the
-bridge that let a dispatched `spawn-claude.sh` locate the Python `loom_tools`
-package — was retired end-to-end in #4228 once token selection went native.
+spawn for dispatch diagnosability). **An adapter has no Python bridge to
+implement:** `LOOM_PACKAGE_PATH` forwarding — the mechanism that let a
+dispatched `spawn-claude.sh` locate a Python package — was retired end-to-end in
+#4228 once token selection went native, and the package itself was deleted in
+epic #4081 Phase 4 (#4557). Nothing on the spawn path reads or sets it.
 
 The runtime-neutral **dispatch seam** that realizes this contract point today —
 `spawn-worker.sh` plus the `runtimes` config block — is specified in
@@ -611,9 +613,10 @@ unknown to known did not weaken this guard for other names.)
 - No capability-matrix enforcement in the dispatcher
   ([contract point 7](#7-capability-declaration) is a separate issue) — the seam
   only routes; it does not validate a runtime's feature set.
-- `spawn-claude.sh`, `claude-wrapper.sh`, the Rust `loom-daemon`, and the Python
-  `loom-tools` callers are unchanged; migrating callers onto `spawn-worker.sh`
-  is a follow-up once the seam has soaked.
+- `spawn-claude.sh`, `claude-wrapper.sh`, and the Rust `loom-daemon` callers are
+  unchanged; migrating callers onto `spawn-worker.sh` is a follow-up once the
+  seam has soaked. (The Python `loom-tools` callers this list used to name no
+  longer exist — epic #4081 Phase 4, #4557.)
 
 ## Fork mapping table
 

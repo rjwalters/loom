@@ -1333,7 +1333,9 @@ enum TokensAction {
     /// opt-in only: read solely when `$LOOM_ACCOUNTS_ENV` (or `--home-env`)
     /// points at it. `ACCOUNT_TOKEN_FILE_N` is optional — auto-derived from
     /// `ACCOUNT_EMAIL_N` when omitted. Native Rust port of the historical Python
-    /// `loom-tokens bootstrap` CLI (issue #4105, epic #4081).
+    /// `loom-tokens bootstrap` CLI (issue #4105, epic #4081). That Python CLI no
+    /// longer exists — the package was deleted in Phase 4 (#4557) — so this name
+    /// is a historical reference, not runnable advice.
     Bootstrap {
         /// Repo root (plain path, default `.` — no upward `.git` walk). The
         /// pool is written to `<workspace>/.loom/tokens` unless `--shared`.
@@ -2559,7 +2561,7 @@ async fn main() -> Result<()> {
     // Autonomous token-ranking refresh loop (Issue #3969): the daemon itself
     // periodically re-probes each registered repo's token pool and rewrites
     // `.loom/tokens/.ranking` (atomically — same script an operator's cron used
-    // to run by hand: `probe-tokens.sh --ranking` / `loom-tokens check
+    // to run by hand: `probe-tokens.sh --ranking` / `loom-daemon tokens check
     // --ranking`), so token selection's ranking tier stays fresh without a
     // standing manual/cron step. Unlike the work-finder and main-health-gate
     // loops above, this is **default-ON** — it only ever reads rate-limit
@@ -2570,7 +2572,7 @@ async fn main() -> Result<()> {
     // precedence env > config > default (env:
     // `LOOM_TOKEN_RANKING_REFRESH` / `LOOM_TOKEN_RANKING_REFRESH_INTERVAL_SECS`).
     // An operator cron running the identical script concurrently is harmless —
-    // the underlying `loom-tokens check --ranking` write is atomic, so the two
+    // the underlying `loom-daemon tokens check --ranking` write is atomic, so the two
     // refreshers can race to schedule a write but never to a torn file.
     let token_ranking_refresh_config =
         token_ranking_refresh::read_token_ranking_refresh_config(&sweep_workspace);
@@ -4811,7 +4813,7 @@ fn print_status_unreachable_human(
 /// never contradict each other (issue #3936).
 ///
 /// Preference order:
-/// 1. **fresh probe** — when a client-side `loom-tokens check --json` succeeded
+/// 1. **fresh probe** — when a client-side `loom-daemon tokens check --json` succeeded
 ///    (the *same* data that renders the per-token table), the health counts are
 ///    derived from it via [`loom_daemon::capacity::summarize_probe`], applying
 ///    the near-ceiling threshold uniformly. This is the accurate *current*
@@ -5445,7 +5447,7 @@ fn print_status_human(
     if rc.source == "probe" && rc.effective_cap != dispatch_cap {
         println!(
             "  fresh probe suggests: {} (healthy {} × per-token {} = {}) — not yet reflected in \
-             dispatch; if this persists, refresh with `loom-tokens check --ranking`.",
+             dispatch; if this persists, refresh with `loom-daemon tokens check --ranking`.",
             rc.effective_cap,
             rc.token_axis_limit,
             factor,
@@ -5512,7 +5514,7 @@ fn print_status_human(
         && rc.healthy > 0;
     if rc.ranking_present {
         let src = if rc.source == "probe" {
-            "live probe: loom-tokens check --json"
+            "live probe: loom-daemon tokens check --json"
         } else {
             "from .loom/tokens/.ranking"
         };
@@ -5533,7 +5535,7 @@ fn print_status_human(
                 "  \u{26a0} DISPATCH IS TOKEN-STARVED: the daemon's own ranking read shows \
                  0/{} healthy (dispatch cap {dispatch_cap}), disagreeing with the {} healthy \
                  shown above from {pool_display}. The token term is the limiter — refresh the \
-                 ranking with `loom-tokens check --ranking` (or wait for the next self-refresh).",
+                 ranking with `loom-daemon tokens check --ranking` (or wait for the next self-refresh).",
                 report.capacity.total_accounts, rc.healthy,
             );
         } else if rc.source == "probe"
@@ -5546,7 +5548,7 @@ fn print_status_human(
             // running on slightly stale data.
             println!(
                 "  note: daemon dispatch cap still uses a stale .ranking ({} healthy); \
-                 refresh it with `loom-tokens check --ranking`.",
+                 refresh it with `loom-daemon tokens check --ranking`.",
                 report.capacity.healthy_accounts
             );
         }
@@ -5583,7 +5585,7 @@ fn print_status_human(
                     println!(
                         "  token-bound: NO healthy accounts — new dispatch deferred until \
                          capacity returns. Add accounts (~/.claude-monitor/accounts.env + \
-                         `loom-tokens bootstrap`) or buy API credits, then `loom-tokens check \
+                         `loom-daemon tokens bootstrap`) or buy API credits, then `loom-daemon tokens check \
                          --ranking`."
                     );
                 } else {
@@ -5598,7 +5600,7 @@ fn print_status_human(
         }
     } else {
         println!(
-            "  (no ranking — run `loom-tokens check --ranking`; token pool size {} used as the \
+            "  (no ranking — run `loom-daemon tokens check --ranking`; token pool size {} used as the \
              health basis)",
             report.token_pool_size
         );
@@ -5973,7 +5975,7 @@ fn print_status_human(
     match token_usage {
         Some(value) => print_token_usage_table(value),
         None => println!(
-            "  (unavailable — `loom-tokens check --json` failed or the token pool is not bootstrapped)"
+            "  (unavailable — `loom-daemon tokens check --json` failed or the token pool is not bootstrapped)"
         ),
     }
 
@@ -6017,7 +6019,7 @@ fn print_status_human(
     println!();
 }
 
-/// Render the `loom-tokens check --json` report (`{ "accounts": [ { name,
+/// Render the `loom-daemon tokens check --json` report (`{ "accounts": [ { name,
 /// status, 5h_utilization, 7d_utilization, 7d_reset } ] }`) as a small table.
 /// Falls back to pretty-printed JSON if the shape is unexpected.
 fn print_token_usage_table(value: &serde_json::Value) {
@@ -7698,7 +7700,7 @@ fn handle_pin_action(action: PinAction, ws: &Path) -> Result<()> {
             }
             if all_accounts.is_empty() {
                 println!();
-                eprintln!("No .token files found. Run `loom-tokens bootstrap` first.");
+                eprintln!("No .token files found. Run `loom-daemon tokens bootstrap` first.");
             } else {
                 println!();
                 println!("Available accounts ({}):", all_accounts.len());

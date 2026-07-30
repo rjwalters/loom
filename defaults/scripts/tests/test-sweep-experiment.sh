@@ -3,8 +3,9 @@
 # instrumentation (issue #3725).
 #
 # The sweep skill shells out to `sweep-experiment.sh`, a thin stub that execs
-# `loom-daemon sweep-experiment` (issue #4275 ported the implementation from
-# `loom_tools.sweep_experiment` to native Rust). These tests drive that exact
+# `loom-daemon sweep-experiment` (issue #4275 ported the implementation from the
+# former Python `sweep_experiment` module to native Rust; the Python package was
+# deleted outright in #4557). These tests drive that exact
 # subcommand, resolving the binary the same way `lib/script-helper.sh` does, so
 # they exercise the real dispatch surface rather than a stand-in. The stub file
 # itself is covered by `bash -n` + `shellcheck` in CI.

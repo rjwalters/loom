@@ -2175,6 +2175,113 @@ else
 fi
 
 # ============================================================
+# 45-48. Stale `loom-*` entry-point advisory (#4079 hardening, epic #4081
+#     Phase 4 / #4557). The update script scans PATH for `loom-*` executables
+#     that do not resolve to the loom-daemon binary it resolved, and warns.
+#
+#     Fixture PATH holds, in one directory:
+#       - loom-daemon           : the resolved binary itself (never flagged)
+#       - loom-clean            : a legit auto-generated shim exec'ing the
+#                                 sibling loom-daemon (never flagged)
+#       - loom-search           : the allowlisted Python carve-out console
+#                                 script (never flagged)
+#       - loom-tokens           : a STALE pip console script (MUST be flagged)
+#       - loom-agent-spawn      : a second stale pip console script (flagged)
+#
+#     LOOM_SKIP_STALE_ENTRY_POINT_CHECK=1 must silence all of it, and the
+#     advisory must never change the exit code.
+# ============================================================
+W45="$BASE_WORKDIR/w45"
+new_fixture "$W45"
+HEAD45="$(cd "$W45" && git rev-parse --short HEAD)"
+STALE_BIN_DIR="$W45/stale-bin"
+mkdir -p "$STALE_BIN_DIR"
+
+# The resolved daemon binary, on PATH.
+write_fake_daemon "$STALE_BIN_DIR/loom-daemon" "$HEAD45" "$W45/marker45"
+
+# A legitimate auto-generated PATH shim (provision-daemon.sh's template).
+cat > "$STALE_BIN_DIR/loom-clean" <<'SHIM'
+#!/usr/bin/env bash
+# Auto-generated PATH shim (issue #4272) — do not edit by hand.
+exec "$(dirname "$0")/loom-daemon" clean "$@"
+SHIM
+chmod +x "$STALE_BIN_DIR/loom-clean"
+
+# The allowlisted loom-search carve-out (a Python console script — allowlisted
+# by NAME precisely because it is not a daemon entry point).
+cat > "$STALE_BIN_DIR/loom-search" <<'SEARCH'
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+import sys
+sys.exit(0)
+SEARCH
+chmod +x "$STALE_BIN_DIR/loom-search"
+
+# Two stale pip console scripts of the #4079 shape.
+for _stale in loom-tokens loom-agent-spawn; do
+    cat > "$STALE_BIN_DIR/$_stale" <<'STALEPY'
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+import sys
+sys.exit(0)
+STALEPY
+    chmod +x "$STALE_BIN_DIR/$_stale"
+done
+
+out45=$( cd "$W45" && PATH="$STALE_BIN_DIR:$TEST_PATH" \
+    LOOM_DAEMON_BIN="$STALE_BIN_DIR/loom-daemon" \
+    bash "$UPDATE_SCRIPT" --check 2>&1; echo "EXIT=$?" )
+rc45=$(echo "$out45" | grep -o 'EXIT=[0-9]*' | cut -d= -f2)
+
+# 45. The two stale console scripts are named.
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out45" | grep -q "Stale 'loom-\*' entry points found on PATH" \
+   && echo "$out45" | grep -q "$STALE_BIN_DIR/loom-tokens" \
+   && echo "$out45" | grep -q "$STALE_BIN_DIR/loom-agent-spawn"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} stale loom-* PATH entry points are warned about by path (#4079/#4557)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} stale loom-* PATH entry points are warned about by path (#4079/#4557)"
+    echo "  output: $out45"
+fi
+
+# 46. The legit shim, the resolved binary, and the allowlisted carve-out are NOT
+#     flagged (a false positive here would train operators to ignore the check).
+TESTS_RUN=$((TESTS_RUN + 1))
+_stale_block="$(echo "$out45" | sed -n "/Stale 'loom-\*' entry points/,/Suppress this check/p")"
+if ! echo "$_stale_block" | grep -q 'loom-clean' \
+   && ! echo "$_stale_block" | grep -q 'loom-search' \
+   && ! echo "$_stale_block" | grep -qE '(^|/)loom-daemon —'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} current shims, the resolved binary, and loom-search are not flagged as stale"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} current shims, the resolved binary, and loom-search are not flagged as stale"
+    echo "  stale block: $_stale_block"
+fi
+
+# 47. The advisory does NOT change the exit code (--check with a matching commit
+#     is still a clean exit 0).
+assert_eq "0" "$rc45" "the stale-entry-point advisory never changes the exit code"
+
+# 48. LOOM_SKIP_STALE_ENTRY_POINT_CHECK=1 silences it entirely.
+out48=$( cd "$W45" && PATH="$STALE_BIN_DIR:$TEST_PATH" \
+    LOOM_DAEMON_BIN="$STALE_BIN_DIR/loom-daemon" \
+    LOOM_SKIP_STALE_ENTRY_POINT_CHECK=1 \
+    bash "$UPDATE_SCRIPT" --check 2>&1 )
+TESTS_RUN=$((TESTS_RUN + 1))
+if ! echo "$out48" | grep -q "Stale 'loom-\*' entry points"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} LOOM_SKIP_STALE_ENTRY_POINT_CHECK=1 suppresses the advisory"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} LOOM_SKIP_STALE_ENTRY_POINT_CHECK=1 suppresses the advisory"
+    echo "  output: $out48"
+fi
+
+# ============================================================
 # 25. Launchd-sandbox guards (#4078): the whole suite exercises the REAL
 #     start/stop scripts, so prove it never reached the operator's live daemon.
 #     (a) The suite-level decoy loom-daemon is still alive — no by-name kill

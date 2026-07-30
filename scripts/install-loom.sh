@@ -835,23 +835,21 @@ else
   MISSING_DEPS+=("cargo")
 fi
 
-# Check for Python 3.10+ (needed for loom-tools)
-PYTHON_FOUND=false
-for py in python3.12 python3.11 python3.10 python3; do
-  if command -v "$py" &>/dev/null; then
-    version=$("$py" --version 2>&1 | grep -oE '[0-9]+\.[0-9]+' | head -1)
-    major=$(echo "$version" | cut -d. -f1)
-    minor=$(echo "$version" | cut -d. -f2)
-    if [[ "$major" -ge 3 ]] && [[ "$minor" -ge 10 ]]; then
-      success "python: $("$py" --version 2>&1)"
-      PYTHON_FOUND=true
-      break
-    fi
-  fi
-done
-if [[ "$PYTHON_FOUND" != "true" ]]; then
-  MISSING_DEPS+=("python3.10+")
-fi
+# NO PYTHON PREREQUISITE (epic #4081 Phase 4, #4557).
+#
+# A "Check for Python 3.10+ (needed for loom-tools)" block used to sit here and
+# push `python3.10+` into MISSING_DEPS, which made a missing Python a HARD
+# install failure ("Cannot proceed without required dependencies"). The Python
+# `loom-tools` package it gated was retired: Loom's orchestration layer is the
+# native `loom-daemon` binary plus bash, and a fresh machine provision installs
+# no Python at all.
+#
+# The one surviving Python module — the opt-in, off-by-default `loom-search`
+# carve-out — is deliberately NOT installed here and is NOT a prerequisite. It
+# is installed by hand, only by hosts that want it:
+#   cd <loom-checkout>/loom-tools && pip install -e .        # or -e '.[search]'
+# See defaults/docs/semantic-search.md and
+# docs/adr/0013-loom-tools-python-retirement.md.
 
 echo ""
 
@@ -871,9 +869,8 @@ if [[ ${#MISSING_DEPS[@]} -gt 0 ]]; then
       cargo)
         echo "  • Rust/Cargo: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
         ;;
-      python3.10+)
-        echo "  • Python 3.10+: brew install python@3.12 (or https://python.org/)"
-        ;;
+      # No `python3.10+` arm: Python stopped being a prerequisite in epic #4081
+      # Phase 4 (#4557) — nothing this installer provisions needs it.
     esac
   done
   echo ""
@@ -1266,24 +1263,23 @@ else
 fi
 echo ""
 
-# Set up Python tools (loom-tools package)
-# This creates a virtual environment in loom-tools/.venv and installs loom-tokens, loom-search, etc.
-info "Setting up Python tools..."
-if [[ -x "$LOOM_ROOT/scripts/install/setup-python-tools.sh" ]]; then
-  if "$LOOM_ROOT/scripts/install/setup-python-tools.sh" --loom-root "$LOOM_ROOT"; then
-    success "Python tools installed"
-  else
-    warning "Python tools setup failed (non-fatal for installation)"
-    info "Run manually: $LOOM_ROOT/scripts/install/setup-python-tools.sh --loom-root $LOOM_ROOT"
-    info "Without Python tools, loom-tokens and some scripts will not work."
-  fi
-else
-  warning "Python setup script not found"
-  info "Python tools (loom-tokens, loom-search) may not be available."
-fi
+# NO PYTHON SETUP STEP (epic #4081 Phase 4, #4557).
+#
+# A "Setting up Python tools..." step used to run
+# `scripts/install/setup-python-tools.sh`, which created `loom-tools/.venv` and
+# `pip install -e`'d the Python package, verifying the result with a
+# `loom-tokens` console-script sentinel. Both the script and the package are
+# gone: everything they provided is a native `loom-daemon` subcommand, and the
+# sentinel would now never appear (so every fresh install would print a
+# permanent "Python tools setup failed" warning).
+#
+# The one surviving Python module (`loom-search`) is opt-in and installed by
+# hand — see defaults/docs/semantic-search.md. Installing it here would be
+# exactly the editable-install-with-frozen-console-scripts hazard that motivated
+# this epic (#4079).
 
 # Store Loom source repository path for wrapper scripts
-# This enables scripts in the target repo to find loom-tools in the source repo
+# (agent-metrics.sh and friends resolve the Loom source checkout through it)
 info "Recording Loom source path..."
 echo "$LOOM_ROOT" > .loom/loom-source-path
 # Also write to target repo root — the worktree copy is gitignored and will be

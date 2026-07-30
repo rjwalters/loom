@@ -156,7 +156,7 @@ pub fn write_allowlist(workspace: &Path, names: &[String]) -> Result<Vec<String>
     let dir = tokens_dir(workspace);
     if !dir.is_dir() {
         return Err(AllowlistError::Io(format!(
-            "Tokens dir does not exist: {}. Run `loom-tokens bootstrap` first.",
+            "Tokens dir does not exist: {}. Run `loom-daemon tokens bootstrap` first.",
             dir.display()
         )));
     }
@@ -183,7 +183,7 @@ pub fn add_to_allowlist(
     let dir = tokens_dir(workspace);
     if !dir.is_dir() {
         return Err(AllowlistError::Io(format!(
-            "Tokens dir does not exist: {}. Run `loom-tokens bootstrap` first.",
+            "Tokens dir does not exist: {}. Run `loom-daemon tokens bootstrap` first.",
             dir.display()
         )));
     }
@@ -221,7 +221,7 @@ pub fn remove_from_allowlist(
     let dir = tokens_dir(workspace);
     if !dir.is_dir() {
         return Err(AllowlistError::Io(format!(
-            "Tokens dir does not exist: {}. Run `loom-tokens bootstrap` first.",
+            "Tokens dir does not exist: {}. Run `loom-daemon tokens bootstrap` first.",
             dir.display()
         )));
     }

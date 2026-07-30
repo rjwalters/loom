@@ -228,7 +228,7 @@ _classify_error_claude() {
 #                             429, and mis-classifying a quota fault as an auth
 #                             fault is the expensive direction — TOKEN_EXPIRED
 #                             marks an account bad with reason `auth` (persists
-#                             until a manual `loom-tokens unblock`), whereas
+#                             until a manual `loom-daemon tokens unblock`), whereas
 #                             TOKEN_EXHAUSTED uses reason `exhausted` (TTL-
 #                             expires on its own). Quota wording is also the
 #                             more specific signal, so letting it win is both

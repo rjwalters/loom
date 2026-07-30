@@ -25,7 +25,13 @@ logger = logging.getLogger(__name__)
 DEFAULT_LOCAL_MODEL = "BAAI/bge-small-en-v1.5"
 
 #: Shared install hint surfaced in every missing-dependency error/warning.
-INSTALL_HINT = "pip install 'loom-tools[search]'"
+#:
+#: An EDITABLE, PATH-relative install: ``loom-tools`` is not published to PyPI,
+#: and epic #4081 Phase 4 (#4557) reduced it to the ``loom-search`` carve-out
+#: living inside the Loom checkout, so the only way to install it is from that
+#: directory. Run this from the repo root (NOT from inside an issue worktree — a
+#: guard hook blocks editable installs there; see defaults/docs/guard-hooks.md).
+INSTALL_HINT = "pip install -e 'loom-tools[search]'"
 
 #: Valid values for ``search.embeddings.provider``.
 VALID_PROVIDERS = frozenset({"none", "local"})

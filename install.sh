@@ -234,8 +234,11 @@ prepare_loom_metadata_env() {
 #   - .loom/loom-source-path        (port of scripts/install-loom.sh:1067-1074)
 #   - .loom/install-metadata.json   (port of scripts/install-loom.sh:1261-1270)
 #
-# See issue #3502. Note: setup-python-tools.sh is intentionally NOT invoked
-# from --quick — Python tooling is out of scope for the fast install path.
+# See issue #3502. (This used to note that `--quick` deliberately skipped
+# `setup-python-tools.sh`; there is no Python setup step on ANY install path as
+# of epic #4081 Phase 4, #4557 — that script and the package it installed are
+# both deleted, so `--quick` and the full installer are now identical in this
+# respect.)
 finalize_quick_install() {
   local loom_root="$1"
   local target="$2"
@@ -257,7 +260,7 @@ finalize_quick_install() {
   fi
 
   # 2. Record Loom source path (consumed by agent-metrics.sh and other
-  # wrapper scripts to locate loom-tools/ in the source checkout).
+  # wrapper scripts to locate the Loom source checkout).
   echo "$loom_root" > "$target/.loom/loom-source-path"
   success "Recorded Loom source path"
 
