@@ -6,6 +6,52 @@ the full reference for provisioning, importing, health-probing, selecting, and
 operating the token pool. `CLAUDE.md` carries only the operating summary and
 points here.
 
+## Provider-aware account inventory
+
+The legacy `.loom/tokens` pool remains Loom's Claude compatibility backend:
+its files, selection order, state formats, `SelectedToken` API, and
+`loom-daemon tokens ...` commands are unchanged.
+
+Provider-aware callers identify accounts by `(provider, name)`, so
+`claude/alice` and `codex/alice` are separate identities. Claude inventory
+continues to prefer a repo-local `.loom/tokens` pool and otherwise falls back
+to `LOOM_SHARED_TOKENS_DIR` (default `~/.loom/tokens`).
+
+Codex inventory uses named directories below `LOOM_CODEX_PROFILE_ROOT`
+(default `~/.loom/codex-profiles`). With no repo metadata, each direct child
+directory is an enabled shared profile. A repository may restrict or rename
+eligible profiles with `.loom/accounts.json`:
+
+```json
+{
+  "version": 1,
+  "accounts": [
+    {
+      "provider": "codex",
+      "name": "build",
+      "credential_kind": "codex_home",
+      "credential_reference": "team-primary",
+      "enabled": true
+    }
+  ]
+}
+```
+
+This file is metadata only. `credential_reference` is one logical directory
+name, never an absolute or relative path, and resolves only beneath the
+machine profile root. Loom rejects traversal, separators, symlink escapes,
+non-directory targets, and a profile root located inside the repository.
+Codex owns `<profile>/auth.json` and may refresh it in place; Loom's registry
+does not open, parse, copy, serialize, or log that file. Operators should keep
+profile directories `0700` and `auth.json` `0600`.
+
+Selected accounts expose the non-secret observability identity
+`LOOM_ACCOUNT_PROVIDER` and `LOOM_ACCOUNT_NAME`. Claude selections also retain
+`LOOM_TOKEN_NAME`; Codex selections bind `CODEX_HOME` and never expose an
+equivalent credential variable. Raw provider capacity counts enabled inventory
+candidates only. Quota health, cooldown, ranking, and failover are layered on
+later and do not alter this inventory contract.
+
 > **Secrets**: `~/.claude-monitor/accounts.env`, the opt-in `~/.loom/accounts.env`,
 > and the repo-local `.loom/accounts.env` all hold raw OAuth keys. The repo-local
 > file and `.loom/tokens/` are gitignored (installer- and `loom-daemon init`–managed);
