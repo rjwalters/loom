@@ -99,7 +99,9 @@ use crate::capacity::{self, CapacityAdvisory};
 use crate::disk_headroom::disk_headroom_limit;
 use crate::event_bus::EventBus;
 use crate::main_health_gate::{MainHealthState, WorkspaceHealthStates};
-use crate::sweep_registry::{DispatchBackoffError, OpenPrDispatchError, ParkedIssueDispatchError};
+use crate::sweep_registry::{
+    DispatchBackoffError, LiveClaimDispatchError, OpenPrDispatchError, ParkedIssueDispatchError,
+};
 use crate::tokens::{token_pool_size, token_pool_size_at_dir};
 use crate::types::Event;
 use crate::workspace_pool::WorkspacePool;
@@ -733,6 +735,18 @@ pub fn tick_with_admission_cap(
                     // tick start (the window can be armed mid-tick by a reap).
                     report.skipped_backoff += 1;
                     log::info!("work_finder: skipping issue #{} — {e}", item.number);
+                } else if e.downcast_ref::<LiveClaimDispatchError>().is_some() {
+                    // Live-claim guard refusal (#4556): a sweep process for this
+                    // issue is confirmed still running, so this candidate is
+                    // genuinely in flight — `in_flight()` just could not see it
+                    // (a reverted label, a released lock, or another daemon
+                    // instance on this host). Counted as an in-flight skip rather
+                    // than an error, but logged at WARN: reaching here means one
+                    // of those weaker signals lied, which is the #4275
+                    // duplicate-dispatch storm signature and worth an operator's
+                    // attention.
+                    report.skipped_in_flight += 1;
+                    log::warn!("work_finder: skipping issue #{} — {e}", item.number);
                 } else {
                     report.errors += 1;
                     log::warn!("work_finder: dispatch for issue #{} failed: {e}", item.number);
@@ -1065,6 +1079,11 @@ pub fn tick_multi_with_admission_cap<S: WorkSource, D: WorkDispatcher>(
                     // `tick` for the rationale. A skip, not a failure.
                     report.skipped_backoff += 1;
                     log::info!("work_finder: skipping issue #{} — {e}", cand.number);
+                } else if e.downcast_ref::<LiveClaimDispatchError>().is_some() {
+                    // Live-claim guard refusal (#4556) — see the single-workspace
+                    // `tick` for the rationale. An in-flight skip, not a failure.
+                    report.skipped_in_flight += 1;
+                    log::warn!("work_finder: skipping issue #{} — {e}", cand.number);
                 } else {
                     report.errors += 1;
                     log::warn!("work_finder: dispatch for issue #{} failed: {e}", cand.number);
@@ -2454,6 +2473,13 @@ mod tests {
         collisions: u64,
         /// Issue numbers a peer host has soft-claimed over safehouse (#4028).
         peer_claimed: HashSet<u32>,
+        /// Issue numbers whose dispatch should be refused by the live-claim
+        /// guard (#4556) — the dispatcher returns the typed
+        /// [`LiveClaimDispatchError`], as `SweepRegistry::dispatch` step 2.9 does
+        /// when a sweep process for the issue is confirmed still running while
+        /// `in_flight()` cannot see it (a reverted label, a released lock, or a
+        /// second daemon instance on the same host).
+        live_claim_issues: HashSet<u32>,
     }
 
     impl WorkDispatcher for RecordingDispatcher {
@@ -2492,6 +2518,15 @@ mod tests {
                 return Err(ParkedIssueDispatchError {
                     issue,
                     label: "loom:blocked".to_string(),
+                }
+                .into());
+            }
+            if self.live_claim_issues.contains(&issue) {
+                // Mirror the production `SweepRegistry::dispatch` live-claim
+                // guard: refuse with the typed, downcast-matchable error (#4556).
+                return Err(LiveClaimDispatchError {
+                    issue,
+                    evidence: crate::live_claim::LiveClaimEvidence::SweepProcess { pid: 4242 },
                 }
                 .into());
             }
@@ -2828,6 +2863,28 @@ exit 0
 
         assert_eq!(report.skipped_backoff, 1, "#7's refusal is a backoff skip");
         assert_eq!(report.errors, 0, "a backoff refusal is never a dispatch error");
+        assert_eq!(report.dispatched, 1);
+        assert_eq!(disp.dispatched, vec![8]);
+    }
+
+    #[test]
+    fn test_tick_attributes_live_claim_refusal_to_skipped_in_flight() {
+        // #4556: `in_flight()` is scoped to ONE daemon process and is seeded from
+        // labels/locks that a false-dead verdict may already have cleared — so an
+        // issue whose sweep is genuinely still running can reach the dispatch
+        // call. The registry's step-2.9 guard refuses it with the typed
+        // `LiveClaimDispatchError`. That is an in-flight skip (the issue really
+        // IS in flight), never a dispatch error, and it must not consume the
+        // healthy candidate's slot.
+        let mut source = FakeSource::once(vec![issue(4275), issue(8)]);
+        let mut disp = RecordingDispatcher {
+            live_claim_issues: HashSet::from([4275]),
+            ..Default::default()
+        };
+        let report = tick(&mut source, &mut disp, 10, false).unwrap();
+
+        assert_eq!(report.skipped_in_flight, 1, "#4275's refusal is an in-flight skip");
+        assert_eq!(report.errors, 0, "a live-claim refusal is never a dispatch error");
         assert_eq!(report.dispatched, 1);
         assert_eq!(disp.dispatched, vec![8]);
     }

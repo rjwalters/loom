@@ -4543,6 +4543,59 @@ releases it explicitly. On daemon startup, `SweepRegistry::reconstruct`
 admits live-lock owners back into the registry and drops stale locks
 whose owner PID is dead.
 
+### Live-claim guard (#4556)
+
+Lock *existence* is not the same question as "is a sweep for this issue
+running right now?", and every re-dispatch path answers the first while
+needing the second. Issue #4275 was dispatched **seven times in 77
+minutes** onto one shared worktree because each path first convinced
+itself the sweep was dead — the claim reconciler on a dead-looking
+recorded PID, the mid-build watchdog on a terminal registry entry, the
+review-stall watchdog on a silent log — and *released the lock or
+reverted the label before dispatching*, so the existence check had
+nothing left to collide with. Three further dispatches came from a
+second `loom-daemon` on the same host, which shared neither the first
+daemon's memory nor its `.loom/locks/`.
+
+`live_claim::probe` answers the stronger question, read-only, with three
+short-circuiting evidence legs — a live `.loom/locks/issue-<N>/owner.json`
+owner, a live record in the machine-level `~/.loom/sweeps.json` journal
+(matched across related repo roots, so a daemon running out of a nested
+worktree and one running out of the parent checkout see each other), and
+a `/proc` scan for a live `/loom:sweep <N>` process whose cwd is inside
+the workspace. It gates four places:
+
+| Site | Refusal |
+|---|---|
+| `SweepRegistry::dispatch` (step 2.9) | `LiveClaimDispatchError`, before any lock, label write, or forge call — covers all six dispatch routes, including both watchdogs |
+| `midbuild_watchdog_once` | refuses **up front**, because that path `git reset --hard`s the shared worktree and burns its single retry *before* it calls `dispatch` |
+| `release_lock_owned` | `LockReleaseOutcome::HolderAlive` — the caller's dead-sweep verdict was wrong, so the lock stays and the label restore / re-dispatch are skipped |
+| `claim_reconciliation` | vetoes a `Reclaim`, so `loom:building` is not reverted out from under a working sweep |
+
+In `midbuild_watchdog_once` the probe **must** stay ahead of
+`claim_lock_for_midbuild` (#4564/#4602). That call takes the issue lock
+over *in place*, rewriting `owner.json` to the daemon's own PID and a
+`midbuild-watchdog-…` sweep id, and it does so precisely in the
+false-dead case this guard exists to catch. Probing afterwards would
+read the watchdog's own record instead of the live sweep's (silencing
+leg 1), and the refusal path returns without releasing, so the live
+sweep's claim record would stay clobbered and its own `release_lock_owned`
+would then read `Superseded` and skip its label restore.
+`midbuild_live_claim_probe_runs_before_the_lock_takeover` pins the order
+by byte-comparing `owner.json` across a refused tick.
+
+Fail-open throughout: a missing/corrupt `owner.json`, an unreadable
+journal, a zombie PID, or a recorded PID whose argv does not name this
+issue's sweep (a recycled PID) all resolve to "no evidence", so a stale
+file can never wedge an issue. Every refusal logs at `WARN`; the
+work-finder counts a refusal as an in-flight skip, not an error.
+
+Integration tests spawn the daemon with its machine-level state confined
+to a fixture (`isolate_daemon_state`: `LOOM_WORKSPACES_PATH`,
+`LOOM_SWEEPS_JOURNAL_PATH`, `LOOM_WATCHES_PATH`, `LOOM_WATCH_RESULTS_LOG`,
+plus the cwd), so a test daemon has no managed workspace to reconcile or
+dispatch against.
+
 ## What this page does NOT describe
 
 The legacy schema and tuning advice that historically lived here — the

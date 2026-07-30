@@ -498,6 +498,37 @@ pub fn decide(
     }
 }
 
+/// Live-claim veto (Issue #4556) — downgrade a computed `Reclaim` to `Keep`
+/// when the issue still has a **confirmed-live** sweep claim behind it.
+///
+/// [`decide`]'s liveness evidence is a single recorded PID (the journal entry,
+/// or the checkpoint→run-registry join). That PID is the sweep *leader* the
+/// daemon spawned, so a leader that has exited — or a journal entry that was
+/// never written, or was pruned — makes a still-working sweep look dead. On
+/// #4275 that misfire is on the record: at `03:08:15.992Z` this pass reclaimed
+/// `loom:building -> loom:issue` on `DeadPid { pid: 2781227 }` while sweep
+/// processes for the issue were still alive, re-exposing it to the work-finder
+/// and seeding a re-dispatch 37 seconds later.
+///
+/// The veto consults evidence a dead-leader PID cannot invalidate — a live
+/// claim-lock owner, a live machine-level journal record from this repo *or a
+/// nested worktree daemon*, or a live `/loom:sweep <N>` process rooted in the
+/// workspace ([`crate::live_claim::probe`]).
+///
+/// Applies to **every** [`ReclaimReason`], not just the dead-PID ones: a live
+/// sweep means the claim is legitimate no matter which rule proposed dropping
+/// it. Pure and total — the caller supplies the (impure) probe result.
+#[must_use]
+pub fn apply_live_claim_veto(
+    action: ReconcileAction,
+    live_claim: Option<&crate::live_claim::LiveClaimEvidence>,
+) -> ReconcileAction {
+    match (action, live_claim) {
+        (ReconcileAction::Reclaim(_), Some(_)) => ReconcileAction::Keep,
+        (action, _) => action,
+    }
+}
+
 /// Plan reconciliation decisions for every `issue` in `issues`, given an
 /// already-loaded `journal`. Performs no I/O of its own — `run_registry_pid_for`
 /// is the caller's injected checkpoint→run-registry lookup (production passes
@@ -1014,9 +1045,10 @@ pub fn spawn_periodic_reconciliation_task(
 /// best-effort `Command` wrapper.
 pub mod forge {
     use super::{
-        plan, plan_pr, resolve_no_progress_grace_minutes, resolve_stale_hours, BuildingIssue,
-        ClaimedPr, NoProgressEvidence, PrClaimKind, PrReclaimReason, PrReconcileAction,
-        ReclaimReason, ReconcileAction, MAX_ISSUES_PER_WORKSPACE,
+        apply_live_claim_veto, plan, plan_pr, resolve_no_progress_grace_minutes,
+        resolve_stale_hours, BuildingIssue, ClaimedPr, NoProgressEvidence, PrClaimKind,
+        PrReclaimReason, PrReconcileAction, ReclaimReason, ReconcileAction,
+        MAX_ISSUES_PER_WORKSPACE,
     };
     use crate::sweep_journal;
     use anyhow::{anyhow, Context, Result};
@@ -1213,6 +1245,30 @@ pub mod forge {
             let ReconcileAction::Reclaim(reason) = action else {
                 continue;
             };
+            // #4556 live-claim veto: a dead *recorded* pid is not proof the sweep
+            // is gone. Probe for a confirmed-live claim (live lock owner / live
+            // machine-level journal record / live `/loom:sweep <N>` process) and
+            // leave the label alone if one exists — reverting `loom:building` out
+            // from under a working sweep is what re-exposed #4275 to the
+            // work-finder and started its seven-dispatch storm. Probed only on a
+            // Reclaim decision, so a healthy pass pays nothing.
+            //
+            // Judge note (#4605): pass this pass's already-resolved
+            // `journal_path` rather than `None`. `None` would make the probe's
+            // leg 2 re-resolve the process-global default, which silently
+            // diverges from — and could disagree with — the very journal
+            // `plan()` decided against whenever a workspace overrides the path.
+            let live_claim =
+                crate::live_claim::probe(root, Some(journal_path.as_path()), issue_number);
+            if matches!(apply_live_claim_veto(action, live_claim.as_ref()), ReconcileAction::Keep) {
+                log::warn!(
+                    "claim_reconciliation: NOT reclaiming #{issue_number} in {} despite \
+                     {reason:?} — the issue still has {} (#4556 live-claim veto)",
+                    root.display(),
+                    live_claim.map_or_else(|| "a live claim".to_string(), |e| e.to_string()),
+                );
+                continue;
+            }
             match reclaim(gh_bin, root, issue_number) {
                 Ok(()) => {
                     reclaimed += 1;
@@ -1595,6 +1651,57 @@ mod tests {
         let entry = journal_entry("/repo/a", 42, 111);
         let action = decide(&issue(42, None), Some(&entry), None, None, 10.0, &|_| false, 4.0, now);
         assert_eq!(action, ReconcileAction::Reclaim(ReclaimReason::DeadPid { pid: 111 }));
+    }
+
+    // --- #4556 live-claim veto ---
+
+    fn live_lock_evidence() -> crate::live_claim::LiveClaimEvidence {
+        crate::live_claim::LiveClaimEvidence::ClaimLock {
+            pid: 111,
+            sweep_id: "sweep-issue-4275-live".to_string(),
+        }
+    }
+
+    #[test]
+    fn live_claim_veto_downgrades_a_dead_pid_reclaim_to_keep() {
+        // The confirmed #4275 misfire: `DeadPid { pid: 2781227 }` reverted
+        // loom:building -> loom:issue at 03:08:15Z while the sweep was alive.
+        let action = ReconcileAction::Reclaim(ReclaimReason::DeadPid { pid: 2_781_227 });
+        assert_eq!(
+            apply_live_claim_veto(action, Some(&live_lock_evidence())),
+            ReconcileAction::Keep
+        );
+    }
+
+    #[test]
+    fn live_claim_veto_applies_to_every_reclaim_reason() {
+        // A live sweep means the claim is legitimate regardless of which rule
+        // proposed dropping it.
+        for reason in [
+            ReclaimReason::DeadPid { pid: 1 },
+            ReclaimReason::DeadRunRegistry { pid: 1 },
+            ReclaimReason::NoRecordStale { age_hours: 99.0 },
+        ] {
+            assert_eq!(
+                apply_live_claim_veto(
+                    ReconcileAction::Reclaim(reason),
+                    Some(&live_lock_evidence())
+                ),
+                ReconcileAction::Keep,
+                "{reason:?} must be vetoed by a live claim"
+            );
+        }
+    }
+
+    #[test]
+    fn live_claim_veto_is_a_no_op_without_live_evidence() {
+        let action = ReconcileAction::Reclaim(ReclaimReason::DeadPid { pid: 1 });
+        assert_eq!(apply_live_claim_veto(action, None), action, "no evidence => unchanged");
+        assert_eq!(
+            apply_live_claim_veto(ReconcileAction::Keep, Some(&live_lock_evidence())),
+            ReconcileAction::Keep,
+            "Keep is never escalated"
+        );
     }
 
     #[test]

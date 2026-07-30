@@ -10,7 +10,7 @@
 
 mod common;
 
-use common::{cleanup_test_sessions, daemon_bin, TestClient, TestDaemon};
+use common::{cleanup_test_sessions, daemon_bin, isolate_daemon_state, TestClient, TestDaemon};
 use serial_test::serial;
 use std::io::BufRead;
 use std::os::unix::fs::FileTypeExt;
@@ -68,6 +68,13 @@ const REFUSAL_MARKER: &str = "refusing to start";
 /// inert and the main reason these tests were load-sensitive (#4531).
 fn daemon_command(socket_path: &Path, workspace: &Path) -> Command {
     let mut cmd = Command::new(daemon_bin());
+    // The refusal path is reached before any workspace work, but a daemon that
+    // does NOT refuse (the failure these tests detect) would otherwise come up
+    // pointed at the operator's real machine-level state — sweep journal, watch
+    // registry, cwd-derived default workspace — so confine all of it to the
+    // per-test fixture first (#4556). Complements the #4573 vars below, which
+    // pin the workspace registry and worktree root.
+    isolate_daemon_state(&mut cmd, workspace);
     cmd.env("LOOM_SOCKET_PATH", socket_path)
         .env("RUST_LOG", "debug")
         .env("LOOM_NO_RESTORE", "1")
