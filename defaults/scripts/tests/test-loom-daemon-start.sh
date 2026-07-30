@@ -760,6 +760,259 @@ else
 fi
 rm -rf "$SH4_HOME"
 
+# ---------- dropped-env-key detection on re-render (#4522) ----------
+# Root cause under test: render_launchd_plist / render_systemd_unit render the
+# EnvironmentVariables dict / Environment= lines strictly from whatever THIS
+# invocation has exported -- so a re-render from a context missing the
+# operator's exports (a watchdog, a bare re-run, another tool shelling out to
+# this script) used to silently replace a richer installed plist/unit with a
+# narrower one (every LOOM_SAFEHOUSE_* key + LOOM_WORK_FINDER gone, no trace).
+# warn_dropped_env_keys() now diffs the KEY sets (not values) between the
+# installed file and the freshly-rendered replacement and warns before the
+# overwrite happens.
+
+# ---------- launchd (plist) path -- exercised read-only via --print-plist,
+# same technique as the #4172 PATH-drift tests above (the real launchd
+# install branch is Darwin-gated with no test-force seam, matching every
+# other launchd install test in this suite/repo).
+DEK_HOME="$(mktemp -d)"
+mkdir -p "$DEK_HOME/Library/LaunchAgents"
+DEK_LABEL="com.rjwalters.loom-daemon-dek-test"
+DEK_LIVE_PLIST="$DEK_HOME/Library/LaunchAgents/${DEK_LABEL}.plist"
+
+# DEK1. First-ever install (no existing plist) must NOT warn.
+dek1_out=$( env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE -u LOOM_SAFEHOUSE_ENABLED \
+    HOME="$DEK_HOME" LOOM_LAUNCHD_LABEL="$DEK_LABEL" LOOM_DAEMON_BIN="$FAKE_BIN" \
+    bash "$START_SCRIPT" --print-plist 2>&1 >/dev/null )
+TESTS_RUN=$((TESTS_RUN + 1))
+if ! echo "$dek1_out" | grep -qi 'drops.*env key'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} dropped-env-key (plist): first-ever install (no existing plist) never warns (#4522)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} dropped-env-key (plist): first-ever install (no existing plist) never warns"
+    echo "  output: $dek1_out"
+fi
+
+# Install the "rich" plist (LOOM_SAFEHOUSE_ENABLED + LOOM_WORK_FINDER present).
+env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE HOME="$DEK_HOME" LOOM_LAUNCHD_LABEL="$DEK_LABEL" \
+    LOOM_SAFEHOUSE_ENABLED=1 LOOM_WORK_FINDER=1 LOOM_DAEMON_BIN="$FAKE_BIN" \
+    bash "$START_SCRIPT" --print-plist > "$DEK_LIVE_PLIST" 2>/dev/null
+
+# DEK2. Re-rendering with LOOM_SAFEHOUSE_ENABLED no longer exported warns and
+#       names the dropped key, with the LOOM_SAFEHOUSE_* migration hint.
+dek2_out=$( env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE -u LOOM_SAFEHOUSE_ENABLED \
+    HOME="$DEK_HOME" LOOM_LAUNCHD_LABEL="$DEK_LABEL" LOOM_DAEMON_BIN="$FAKE_BIN" \
+    bash "$START_SCRIPT" --print-plist 2>&1 >/dev/null )
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$dek2_out" | grep -qi 'drops 1 env key' && echo "$dek2_out" | grep -q 'LOOM_SAFEHOUSE_ENABLED'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} dropped-env-key (plist): re-render missing an exported key warns and names it (#4522)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} dropped-env-key (plist): re-render missing an exported key warns and names it"
+    echo "  output: $dek2_out"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$dek2_out" | grep -q 'safehouse.*block.*--from-config'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} dropped-env-key (plist): LOOM_SAFEHOUSE_* drop prints the config-tier migration hint (#4353)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} dropped-env-key (plist): LOOM_SAFEHOUSE_* drop prints the config-tier migration hint"
+    echo "  output: $dek2_out"
+fi
+
+# DEK3. Re-rendering with the SAME (or a superset of) keys does not warn.
+dek3_out=$( env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE HOME="$DEK_HOME" LOOM_LAUNCHD_LABEL="$DEK_LABEL" \
+    LOOM_SAFEHOUSE_ENABLED=1 LOOM_WORK_FINDER=1 LOOM_DAEMON_PATH_EXTRA=/extra/bin LOOM_DAEMON_BIN="$FAKE_BIN" \
+    bash "$START_SCRIPT" --print-plist 2>&1 >/dev/null )
+TESTS_RUN=$((TESTS_RUN + 1))
+if ! echo "$dek3_out" | grep -qi 'drops.*env key'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} dropped-env-key (plist): re-render with the same/superset keys never warns (#4522)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} dropped-env-key (plist): re-render with the same/superset keys never warns"
+    echo "  output: $dek3_out"
+fi
+
+# DEK4. --force-env suppresses the warning for an intentional narrowing.
+dek4_out=$( env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE -u LOOM_SAFEHOUSE_ENABLED \
+    HOME="$DEK_HOME" LOOM_LAUNCHD_LABEL="$DEK_LABEL" LOOM_DAEMON_BIN="$FAKE_BIN" \
+    bash "$START_SCRIPT" --print-plist --force-env 2>&1 >/dev/null )
+TESTS_RUN=$((TESTS_RUN + 1))
+if ! echo "$dek4_out" | grep -qi 'drops.*env key'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} dropped-env-key (plist): --force-env suppresses the warning (#4522)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} dropped-env-key (plist): --force-env suppresses the warning"
+    echo "  output: $dek4_out"
+fi
+rm -rf "$DEK_HOME"
+
+# ---------- systemd (unit) path -- exercised through the REAL install site
+# (mv over $SYSTEMD_UNIT_PATH), reusing the LOOM_SYSTEMD_FORCE + stub
+# systemctl seam already established above (S1-S5) so this covers the actual
+# overwrite code path, not just a read-only render.
+DEK_SD_BIN="$WORKDIR/dek-sd-bin"; mkdir -p "$DEK_SD_BIN"
+DEK_SD_LOG="$WORKDIR/dek-sd.log"; : > "$DEK_SD_LOG"
+cat > "$DEK_SD_BIN/systemctl" <<EOF
+#!/usr/bin/env bash
+echo "\$*" >> "$DEK_SD_LOG"
+if [[ "\${1:-}" == "--user" ]]; then shift; fi
+case "\${1:-}" in
+  show) echo "\$\$" ;;
+  *)    exit 0 ;;
+esac
+EOF
+chmod +x "$DEK_SD_BIN/systemctl"
+DEK_SD_UNIT="loom-daemon-dek-test-$$.service"
+DEK_SD_HOME="$(mktemp -d)"; mkdir -p "$DEK_SD_HOME/.loom/logs"
+DEK_SD_UNIT_PATH="$DEK_SD_HOME/.config/systemd/user/$DEK_SD_UNIT"
+
+# DEK5. First-ever install (no existing unit) must NOT warn.
+dek5_out=$( cd "$WORKDIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE -u LOOM_SAFEHOUSE_ENABLED \
+    PATH="$DEK_SD_BIN:$PATH" HOME="$DEK_SD_HOME" \
+    LOOM_SYSTEMD_FORCE=1 LOOM_SYSTEMD_UNIT="$DEK_SD_UNIT" \
+    LOOM_DAEMON_BIN="$FAKE_BIN" \
+    LOOM_SOCKET_PATH="$DEK_SD_HOME/.loom/loom-daemon.sock" \
+    LOOM_AUTONOMY_MARKER="$DEK_SD_HOME/.loom/autonomy-desired" \
+    bash "$START_SCRIPT" --no-launchd 2>&1 )
+TESTS_RUN=$((TESTS_RUN + 1))
+if ! echo "$dek5_out" | grep -qi 'drops.*env key'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} dropped-env-key (systemd): first-ever install (no existing unit) never warns (#4522)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} dropped-env-key (systemd): first-ever install (no existing unit) never warns"
+    echo "  output: $dek5_out"
+fi
+if [[ -f "$DEK_SD_HOME/.loom/.daemon.pid" ]]; then
+    kill "$(cat "$DEK_SD_HOME/.loom/.daemon.pid" 2>/dev/null)" 2>/dev/null || true
+    rm -f "$DEK_SD_HOME/.loom/.daemon.pid"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ -f "$DEK_SD_UNIT_PATH" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} dropped-env-key (systemd): first-ever install still writes the unit file"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} dropped-env-key (systemd): first-ever install still writes the unit file"
+fi
+
+# DEK6. Re-render with fewer keys (LOOM_SAFEHOUSE_ENABLED dropped from the
+#       invoking env) warns and names the dropped key, before the unit is
+#       overwritten. Re-run with the rich env first so the installed unit
+#       actually carries the key.
+: > "$DEK_SD_LOG"
+sleep 30 & DEK_SD_PID1=$!
+( cd "$WORKDIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
+    PATH="$DEK_SD_BIN:$PATH" HOME="$DEK_SD_HOME" \
+    LOOM_SYSTEMD_FORCE=1 LOOM_SYSTEMD_UNIT="$DEK_SD_UNIT" \
+    LOOM_SAFEHOUSE_ENABLED=1 LOOM_WORK_FINDER=1 \
+    LOOM_DAEMON_BIN="$FAKE_BIN" \
+    LOOM_SOCKET_PATH="$DEK_SD_HOME/.loom/loom-daemon.sock" \
+    LOOM_AUTONOMY_MARKER="$DEK_SD_HOME/.loom/autonomy-desired" \
+    bash "$START_SCRIPT" --no-launchd >/dev/null 2>&1 )
+kill "$DEK_SD_PID1" 2>/dev/null || true
+if [[ -f "$DEK_SD_HOME/.loom/.daemon.pid" ]]; then
+    kill "$(cat "$DEK_SD_HOME/.loom/.daemon.pid" 2>/dev/null)" 2>/dev/null || true
+    rm -f "$DEK_SD_HOME/.loom/.daemon.pid"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ -f "$DEK_SD_UNIT_PATH" ]] && grep -q 'LOOM_SAFEHOUSE_ENABLED' "$DEK_SD_UNIT_PATH"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} dropped-env-key (systemd): fixture install carries LOOM_SAFEHOUSE_ENABLED (setup for DEK6b)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} dropped-env-key (systemd): fixture install carries LOOM_SAFEHOUSE_ENABLED"
+    cat "$DEK_SD_UNIT_PATH" 2>/dev/null | sed 's/^/    /'
+fi
+
+sleep 30 & DEK_SD_PID2=$!
+dek6_out=$( cd "$WORKDIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE -u LOOM_SAFEHOUSE_ENABLED \
+    PATH="$DEK_SD_BIN:$PATH" HOME="$DEK_SD_HOME" \
+    LOOM_SYSTEMD_FORCE=1 LOOM_SYSTEMD_UNIT="$DEK_SD_UNIT" \
+    LOOM_DAEMON_BIN="$FAKE_BIN" \
+    LOOM_SOCKET_PATH="$DEK_SD_HOME/.loom/loom-daemon.sock" \
+    LOOM_AUTONOMY_MARKER="$DEK_SD_HOME/.loom/autonomy-desired" \
+    bash "$START_SCRIPT" --no-launchd 2>&1 )
+kill "$DEK_SD_PID2" 2>/dev/null || true
+if [[ -f "$DEK_SD_HOME/.loom/.daemon.pid" ]]; then
+    kill "$(cat "$DEK_SD_HOME/.loom/.daemon.pid" 2>/dev/null)" 2>/dev/null || true
+    rm -f "$DEK_SD_HOME/.loom/.daemon.pid"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$dek6_out" | grep -qi 'drops 1 env key' && echo "$dek6_out" | grep -q 'LOOM_SAFEHOUSE_ENABLED' \
+    && echo "$dek6_out" | grep -q 'safehouse.*block.*--from-config'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} dropped-env-key (systemd): real re-render missing a key warns, names it, and prints the migration hint (#4522)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} dropped-env-key (systemd): real re-render missing a key warns, names it, and prints the migration hint"
+    echo "  output: $dek6_out"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ -f "$DEK_SD_UNIT_PATH" ]] && ! grep -q 'LOOM_SAFEHOUSE_ENABLED' "$DEK_SD_UNIT_PATH"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} dropped-env-key (systemd): the WARNED narrowing still actually installs (warn, don't block)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} dropped-env-key (systemd): the WARNED narrowing still actually installs"
+fi
+
+# DEK7. --force-env suppresses the warning on the real install path too.
+sleep 30 & DEK_SD_PID3=$!
+( cd "$WORKDIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
+    PATH="$DEK_SD_BIN:$PATH" HOME="$DEK_SD_HOME" \
+    LOOM_SYSTEMD_FORCE=1 LOOM_SYSTEMD_UNIT="$DEK_SD_UNIT" \
+    LOOM_SAFEHOUSE_ENABLED=1 LOOM_WORK_FINDER=1 \
+    LOOM_DAEMON_BIN="$FAKE_BIN" \
+    LOOM_SOCKET_PATH="$DEK_SD_HOME/.loom/loom-daemon.sock" \
+    LOOM_AUTONOMY_MARKER="$DEK_SD_HOME/.loom/autonomy-desired" \
+    bash "$START_SCRIPT" --no-launchd >/dev/null 2>&1 )
+kill "$DEK_SD_PID3" 2>/dev/null || true
+if [[ -f "$DEK_SD_HOME/.loom/.daemon.pid" ]]; then
+    kill "$(cat "$DEK_SD_HOME/.loom/.daemon.pid" 2>/dev/null)" 2>/dev/null || true
+    rm -f "$DEK_SD_HOME/.loom/.daemon.pid"
+fi
+sleep 30 & DEK_SD_PID4=$!
+dek7_out=$( cd "$WORKDIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE -u LOOM_SAFEHOUSE_ENABLED \
+    PATH="$DEK_SD_BIN:$PATH" HOME="$DEK_SD_HOME" \
+    LOOM_SYSTEMD_FORCE=1 LOOM_SYSTEMD_UNIT="$DEK_SD_UNIT" \
+    LOOM_DAEMON_BIN="$FAKE_BIN" \
+    LOOM_SOCKET_PATH="$DEK_SD_HOME/.loom/loom-daemon.sock" \
+    LOOM_AUTONOMY_MARKER="$DEK_SD_HOME/.loom/autonomy-desired" \
+    bash "$START_SCRIPT" --no-launchd --force-env 2>&1 )
+kill "$DEK_SD_PID4" 2>/dev/null || true
+if [[ -f "$DEK_SD_HOME/.loom/.daemon.pid" ]]; then
+    kill "$(cat "$DEK_SD_HOME/.loom/.daemon.pid" 2>/dev/null)" 2>/dev/null || true
+    rm -f "$DEK_SD_HOME/.loom/.daemon.pid"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if ! echo "$dek7_out" | grep -qi 'drops.*env key'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} dropped-env-key (systemd): --force-env suppresses the warning on the real install path (#4522)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} dropped-env-key (systemd): --force-env suppresses the warning on the real install path"
+    echo "  output: $dek7_out"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$dek7_out" | grep -q -- '--force-env'; then
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} dropped-env-key (systemd): --force-env is excluded from the persisted .daemon.flags file"
+elif [[ -f "$DEK_SD_HOME/.loom/.daemon.flags" ]] && grep -q -- '--force-env' "$DEK_SD_HOME/.loom/.daemon.flags"; then
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} dropped-env-key (systemd): --force-env is excluded from the persisted .daemon.flags file"
+else
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} dropped-env-key (systemd): --force-env is excluded from the persisted .daemon.flags file"
+fi
+rm -rf "$DEK_SD_HOME"
+
 # ---------- summary ----------
 echo
 echo "Ran $TESTS_RUN tests: $TESTS_PASSED passed, $TESTS_FAILED failed"
