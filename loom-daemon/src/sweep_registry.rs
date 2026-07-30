@@ -4572,10 +4572,32 @@ impl SweepRegistry {
                             // pure no-op with `no_progress` defaulting to
                             // `false` (byte-identical to pre-#4366 behavior)
                             // whenever label-flipping itself is disabled.
+                            //
+                            // Both forge probes below are documented FAIL-OPEN
+                            // (`None` == "probe failed, don't punish"), so the
+                            // issue-state arm demands a POSITIVE "the issue is
+                            // open" verdict (`== Some(false)`) rather than the
+                            // weaker `!= Some(true)`: a timed-out / rate-limited
+                            // `gh` probe returns `None`, and `None != Some(true)`
+                            // would have been *satisfied*, turning a benign
+                            // self-skip into a counted failed attempt and
+                            // wrongly quarantining an issue during a forge
+                            // outage. With `== Some(false)`, a full forge outage
+                            // (both probes `None`) yields `no_progress == false`
+                            // — the pre-#4366 behavior — so an outage can never
+                            // manufacture quarantine pressure.
+                            //
+                            // KNOWN LIMITATION: `first_open_linked_pr` returns
+                            // `Option<u32>`, which conflates "no open linked PR"
+                            // with "the PR probe itself failed", so a PARTIAL
+                            // outage (PR probe fails, issue probe succeeds and
+                            // says open) can still false-positive. Widening that
+                            // return type to distinguish the two is tracked in
+                            // issue #4452.
                             let no_progress = !self.config.skip_label_flip
                                 && exit_code == Some(0)
                                 && self.first_open_linked_pr(issue).is_none()
-                                && self.issue_is_closed(issue) != Some(true);
+                                && self.issue_is_closed(issue) == Some(false);
                             // Insta-crash quarantine (#3939): a checkpoint-less
                             // death inside the insta-crash window that did NOT
                             // exit cleanly (exit_code != 0, or an unknown
@@ -7173,6 +7195,45 @@ exit 0
             "a clean exit on an already-closed issue must not count toward quarantine"
         );
         assert!(!registry.is_quarantined(43_662));
+    }
+
+    /// AC (PR #4408 judge feedback): the no-progress predicate must FAIL OPEN
+    /// when the forge probes themselves fail. [`Self::issue_is_closed`] returns
+    /// `None` on a missing/failed/timed-out/unparseable `gh` answer and its
+    /// contract says callers MUST treat that as "don't punish" — the original
+    /// `!= Some(true)` spelling was *satisfied* by `None`, so a rate-limited or
+    /// timed-out probe during a forge outage silently converted every benign
+    /// self-skip into a counted failed attempt and wrongly quarantined the
+    /// issue. Requiring a positive `== Some(false)` ("the issue is verifiably
+    /// open") verdict means a probe failure yields `no_progress == false`.
+    ///
+    /// The fixture answers `issue view` with an unparseable `"WEDGED"` state
+    /// (the same shape a truncated/garbled `gh` response has), which makes
+    /// `issue_is_closed` return `None`. Three consecutive clean exits under
+    /// that condition — enough to trip the quarantine threshold if any of them
+    /// counted — must leave the tally at 0 and the issue un-quarantined.
+    #[test]
+    fn reaper_probe_failure_fails_open_and_does_not_count_no_progress() {
+        let dir = tempdir().unwrap();
+        let mut registry = no_progress_test_registry(dir.path(), "WEDGED", "", false);
+        assert_eq!(registry.quarantine_config().threshold, 3);
+
+        for seq in 0..3 {
+            insert_clean_exit_running(&mut registry, 43_665, seq);
+            let changed = registry.reap_once();
+            assert!(changed >= 1, "reap_once should observe the dead fixture child");
+        }
+
+        assert_eq!(
+            registry.insta_crash_count(43_665),
+            0,
+            "an unresolvable issue-state probe must fail open — a clean exit during a forge \
+             outage must never accrue toward quarantine"
+        );
+        assert!(
+            !registry.is_quarantined(43_665),
+            "3 consecutive probe-failure clean exits must not quarantine the issue"
+        );
     }
 
     /// AC: `skip_label_flip` disables the whole no-progress probe (no `gh`

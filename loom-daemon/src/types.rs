@@ -1578,7 +1578,9 @@ pub enum Event {
         /// (`false`) — e.g. a legitimate self-skip / already-done no-work
         /// exit, or a clean exit that produced an open linked PR or a closed
         /// issue. `true` requires ALL of: `exit_code == Some(0)`, no open
-        /// linked PR, and the issue still open — the reaper counts a `true`
+        /// linked PR, and the issue *verifiably* open (a positive "open"
+        /// verdict — a failed/timed-out forge probe fails open and yields
+        /// `false`, per PR #4408's review) — the reaper counts a `true`
         /// verdict toward the insta-crash quarantine tally instead of
         /// resetting it, so a headless child that repeatedly parks on a
         /// monitored background task and exits 0 (the observed "cache
