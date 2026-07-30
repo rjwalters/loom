@@ -3406,9 +3406,70 @@ compatibility. The probe never fails the command — an
 unreadable/malformed marker, absent `launchctl`, a stale/unowned pid, or an
 unreadable heartbeat mtime all degrade to a less-specific verdict (or, if no
 loom dir can be resolved at all, `install_state` is simply omitted and the
-generic pre-#4069 message is printed). The success path (a reachable, healthy
-daemon) is untouched — this probe only runs after `query_daemon_status` has
-already failed.
+generic pre-#4069 message is printed). `install_state` itself only ever runs
+after `query_daemon_status` has already failed — the reachable path's own
+protection reporting is the separate probe described next.
+
+**Fourth consumer: `status`'s REACHABLE path — watchdog protection state
+(#4354, AC4 of #4331).** `install_state` above answers *"why is the daemon
+unreachable?"*, so it runs only on the `Err` arm. A **reachable** daemon (one
+answering over IPC) needs a different question answered: *"is it actually
+protected?"* Before #4354 it did not surface one, so a healthy-looking daemon
+could be running with crash protection silently disarmed, and an operator would
+only find out by reading `daemon-watchdog.log` or poking
+`launchctl`/`systemctl` by hand. `status` now prints a `Protection:` line (and a
+`protection` object under `--json`) built from a **sibling** classification —
+`ProtectionState` in the same `daemon_install_state.rs` module, deliberately
+*not* new `InstallState` variants, whose exit-code semantics above must not
+change:
+
+| State (`--json` `state`) | Human phrase | Meaning |
+|--------------------------|--------------|---------|
+| `protected` | `protected` | autonomy-desired marker present **and** the watchdog job/timer is provisioned |
+| `no-marker` | `unprotected — no autonomy-desired marker` | no marker: crash protection is DISARMED — the watchdog fires on cadence but logs `[OK] … nothing to check` (the #4331 state) |
+| `watchdog-not-provisioned` | `watchdog job not provisioned` | marker present, but no watchdog launchd job / systemd timer is scheduled — nothing will ever notice a future death |
+| `unknown` | `unknown` | marker present but the provisioning probe could not answer (no `launchctl`/`systemctl`, or an unreachable `systemctl --user` bus) — a degradation, never a false verdict |
+
+Two independent facts feed this, and **both** are always reported: the JSON
+object carries `marker_present` and `watchdog_provisioned` separately (the
+latter `null` when undeterminable) alongside `marker_path`, `watchdog_job`,
+`watchdog_job_kind`, `detail`, and the dominant `state`. When both are bad,
+`state` is `no-marker` — the stronger statement, since even a provisioned
+watchdog is inert without a marker — while `watchdog_provisioned: false` still
+records the second fact for a script.
+
+**How the probe resolves its inputs** (client-side and host-local, so nothing is
+plumbed through the IPC report):
+
+- **Marker** — via the same `LOOM_AUTONOMY_MARKER`-honoring resolver the startup
+  healer uses (`autonomy_marker::resolve_marker_path`, now the single
+  implementation `daemon_install_state` also delegates to), else
+  `<loom_dir>/autonomy-desired`.
+- **Watchdog job** — mirrors `loom-daemon-start.sh` exactly: launchd
+  `${LOOM_WATCHDOG_LABEL:-<daemon-label>-watchdog}` (daemon label from
+  `LOOM_LAUNCHD_LABEL`, else the marker's own `launchd_label`, else
+  `com.rjwalters.loom-daemon`), probed with
+  `launchctl print <domain>/<label>` in the `resolve_launchd_domain` domain
+  (`LOOM_LAUNCHD_DOMAIN` → `gui/<uid>` → `user/<uid>`); systemd
+  `${LOOM_WATCHDOG_LABEL:-<LOOM_SYSTEMD_UNIT%.service>-watchdog}.timer`, probed
+  with `systemctl --user is-enabled <unit>`. A **non-Darwin host always resolves
+  the systemd side** (the same non-Darwin blanket override the unreachable path
+  applies), so `launchctl`'s absence on Linux is never even consulted.
+- **Provisioning verdict** — `enabled`/`enabled-runtime` ⇒ provisioned; any other
+  `is-enabled` verdict (`disabled`, `static`, `masked`, absent, …) ⇒ **not**
+  provisioned, deliberately collapsing "present but disabled" and "absent" into
+  the same operator-relevant answer (neither will fire). A `Failed to connect to
+  bus` / missing-binary / undeterminable-domain outcome ⇒ `unknown`.
+
+Like the `install_state` probe, it is **read-only and never fails the command**:
+at most three query-only subprocess calls, no writes, and the reachable path
+still **exits 0** whatever protection state it reports (only `no-marker` and
+`watchdog-not-provisioned` add remediation lines — `protected` and `unknown`
+print none, since `unknown` is a probe limitation on this host, not evidence of a
+fault). When no loom dir resolves at all the `Protection:` line is omitted and
+`--json`'s `protection` is `null`. The unreachable-path `install_state` output
+and its exit codes are unchanged. `fleet status`'s local-host row carries the
+same `protection` field, since it shares the `status --json` payload builder.
 
 ### macOS session-bootstrap hazard (#3972)
 
