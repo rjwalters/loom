@@ -103,6 +103,21 @@ Loom ships with several built-in `PreToolUse` guard hooks, registered independen
 
 You can also add project-specific guards to protect read-only directories from accidental edits (see below).
 
+### Which generic guard is authoritative — and why the vendored copy stays (#4403, #4566)
+
+**At runtime the canonical Repo Skills guard always wins** when it is present: `guard-destructive.sh` is a dispatcher, so the vendored `guard-destructive-generic.sh` is a *fallback*, never a second guard running alongside it.
+
+Whether the vendored copy is **installed** is a separate, per-repo choice, and both answers are supported:
+
+| Repo layout | Vendored `.loom/hooks/guard-destructive-generic.sh` | What `resync-installed.sh` does |
+|---|---|---|
+| `.loom/` gitignored (the usual consumer repo) | untracked, per-host | **removes** it once a canonical Repo Skills guard is detected locally — the dispatcher covers this host |
+| `.loom/` committed (**Loom itself dogfoods this layout**) | **git-tracked on purpose** | **keeps** it, and reports an informational `unchanged … (git-tracked vendored fallback kept)` line |
+
+The committed case is deliberate, not drift: a git-tracked vendored guard is repo-shared state, so contributors and CI runners **without** Repo Skills installed still get full generic-guard coverage. Resync must therefore never delete it on the strength of one host's local, typically-gitignored `.claude/skills/repo/` install (#4403) — and because that state is the expected steady state rather than an anomaly, it is reported as a `note` (suppressed under `--quiet`) instead of a `WARN` that would reprint on every resync forever (#4566).
+
+If a repo genuinely wants to rely on Repo Skills provisioning instead, it drops the vendored copy **deliberately and repo-wide** with `git rm .loom/hooks/guard-destructive-generic.sh`; after that commit the branch above stops firing entirely and hosts without Repo Skills fall back to no generic guard, so make that trade consciously.
+
 ### SQL DDL/DML Guard Opt-Out (`guards.sqlDdl` / `LOOM_GUARD_SQL`)
 
 `guard-destructive.sh` blocks SQL DDL/DML patterns — `DROP DATABASE`, `DROP TABLE`, `DROP SCHEMA`, `TRUNCATE TABLE`, and `DELETE FROM` without a `WHERE` clause. For most repos this is a useful safety net, but for a project that is **itself a database engine** (e.g. a SQLite-compatible engine running a SQL conformance suite) those statements are the product's own dev/test vocabulary and the guard is a category error — the match is a case-insensitive substring, so it even fires when the words appear in a comment or a `--description` label.
