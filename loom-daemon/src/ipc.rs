@@ -2722,8 +2722,11 @@ fn handle_request(
                     token_name: outcome.token_name,
                     log_path: outcome.log_path,
                 },
-                Err(e) => Response::Error {
-                    message: format!("dispatch_sweep failed: {e}"),
+                Err(e) => match e.downcast::<crate::runtime_admission::RuntimeRejection>() {
+                    Ok(rejection) => Response::RuntimeRejected(rejection),
+                    Err(e) => Response::Error {
+                        message: format!("dispatch_sweep failed: {e}"),
+                    },
                 },
             }
         }
@@ -4037,6 +4040,29 @@ exit 0
         let (tm, db, _, bus) = setup_test_context();
         let dir_a = tempdir().unwrap();
         let dir_b = tempdir().unwrap();
+        // Runtime admission is the first dispatch decision. Install a valid
+        // zero-config Claude surface in both candidate roots so this fixture
+        // reaches (and continues to assert) the downstream workspace-command
+        // guard rather than bypassing admission.
+        for root in [dir_a.path(), dir_b.path()] {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::create_dir_all(root.join(".loom/roles")).unwrap();
+            std::fs::create_dir_all(root.join(".loom/runtimes")).unwrap();
+            std::fs::create_dir_all(root.join(".loom/scripts")).unwrap();
+            std::fs::write(
+                root.join(".loom/roles/builder.json"),
+                r#"{"runtimeRequirements":["worktreeIsolation","mcp"]}"#,
+            )
+            .unwrap();
+            std::fs::write(
+                root.join(".loom/runtimes/claude.json"),
+                r#"{"runtime":"claude","capabilities":{"worktreeIsolation":"yes","mcp":"yes"}}"#,
+            )
+            .unwrap();
+            let adapter = root.join(".loom/scripts/spawn-claude.sh");
+            std::fs::write(&adapter, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(adapter, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         // Neither workspace has `.claude/commands/loom/sweep.md`, and
         // `skip_label_flip` is left at its default `false` so the #4027 guard
         // is actually evaluated (unlike `setup_sweep_registry_in_tempdir`,
@@ -4089,6 +4115,27 @@ exit 0
             }
             other => panic!("Expected Error (wedge-guard refusal), got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn runtime_rejection_response_is_structured_and_secret_free_on_the_wire() {
+        let response = Response::RuntimeRejected(crate::runtime_admission::RuntimeRejection {
+            role: "sweep-lifecycle".into(),
+            runtime: "codex".into(),
+            source: crate::runtime_admission::RuntimeSource::DefaultConfig,
+            unmet_capabilities: vec!["worktreeIsolation".into()],
+            reason: "unmet capabilities: worktreeIsolation".into(),
+        });
+        let wire = serde_json::to_string(&response).unwrap();
+        assert!(wire.contains("\"type\":\"RuntimeRejected\""));
+        assert!(wire.contains("\"source\":\"default-config\""));
+        assert!(wire.contains("\"unmet_capabilities\":[\"worktreeIsolation\"]"));
+        assert!(!wire.contains("oauth"));
+        assert!(!wire.contains("token"));
+        assert!(matches!(
+            serde_json::from_str::<Response>(&wire).unwrap(),
+            Response::RuntimeRejected(_)
+        ));
     }
 
     #[test]

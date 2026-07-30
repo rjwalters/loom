@@ -209,6 +209,8 @@ pub enum RoleTickOutcome {
     /// The invocation could not be run, or ran and reported failure. Never
     /// fatal to the daemon — logged and skipped.
     Failure(String),
+    /// Fail-closed scheduling rejection with machine-readable provenance.
+    RuntimeRejected(crate::runtime_admission::RuntimeRejection),
 }
 
 impl RoleTickOutcome {
@@ -312,6 +314,14 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
             Some(m) => (m.clone(), "override"),
             None => resolve_role_runner_model(&self.workspace_root),
         };
+        let admission = if self.spawn_bin.is_none() {
+            match crate::runtime_admission::resolve_and_admit(&self.workspace_root, role, None) {
+                Ok(value) => Some(value),
+                Err(e) => return RoleTickOutcome::RuntimeRejected(e),
+            }
+        } else {
+            None
+        };
         run_role_with_timeout(
             &script,
             &self.workspace_root,
@@ -321,6 +331,7 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
             self.timeout,
             &model,
             model_source,
+            admission.as_ref(),
         )
     }
 }
@@ -371,6 +382,7 @@ fn run_role_with_timeout(
     timeout: Duration,
     model: &str,
     model_source: &str,
+    admission: Option<&crate::runtime_admission::ResolvedRuntime>,
 ) -> RoleTickOutcome {
     if let Err(e) = std::fs::create_dir_all(&logs_dir) {
         return RoleTickOutcome::Failure(format!(
@@ -446,6 +458,17 @@ fn run_role_with_timeout(
         .stdin(Stdio::null())
         .stdout(Stdio::from(out_file))
         .stderr(Stdio::from(stderr_file));
+    if let Some(admission) = admission {
+        // Pin the already-admitted choice so spawn-worker cannot re-resolve a
+        // different runtime after the pre-spawn decision.
+        cmd.env("LOOM_RUNTIME", &admission.runtime);
+        log::info!(
+            "role_runner: admitted role={} runtime={} source={}",
+            admission.role,
+            admission.runtime,
+            admission.source
+        );
+    }
 
     // Run the child as its own process-group leader so a timeout can tear
     // down the whole subtree (the `claude` session's tool-call
@@ -1376,6 +1399,9 @@ fn log_outcome(role: &str, outcome: &RoleTickOutcome, elapsed: Duration) {
                  fatal): {reason}"
             );
         }
+        RoleTickOutcome::RuntimeRejected(rejection) => {
+            log::warn!("role_runner: {role} runtime admission rejected: {rejection}");
+        }
     }
 }
 
@@ -1408,6 +1434,10 @@ fn log_outcome_for_root(role: &str, root: &Path, outcome: &RoleTickOutcome, elap
         RoleTickOutcome::Failure(reason) => log::warn!(
             "role_runner: {role} tick failed for {} after {elapsed:.1?} (logged and skipped, \
              never fatal): {reason}",
+            root.display()
+        ),
+        RoleTickOutcome::RuntimeRejected(rejection) => log::warn!(
+            "role_runner: {role} runtime admission rejected for {} after {elapsed:.1?}: {rejection}",
             root.display()
         ),
     }
@@ -1456,8 +1486,12 @@ fn classify_root_tick_log(
     was_failing: bool,
 ) -> RootTickLogAction {
     match outcome {
-        RoleTickOutcome::Failure(_) if was_failing => RootTickLogAction::FailureRepeat,
-        RoleTickOutcome::Failure(_) => RootTickLogAction::FailureEdge,
+        RoleTickOutcome::Failure(_) | RoleTickOutcome::RuntimeRejected(_) if was_failing => {
+            RootTickLogAction::FailureRepeat
+        }
+        RoleTickOutcome::Failure(_) | RoleTickOutcome::RuntimeRejected(_) => {
+            RootTickLogAction::FailureEdge
+        }
         RoleTickOutcome::Success if tick_is_implausibly_fast(outcome, elapsed) && was_failing => {
             RootTickLogAction::RecoveredImplausiblyFast
         }
@@ -1484,6 +1518,7 @@ fn log_outcome_for_root_deduped(
     let action = classify_root_tick_log(outcome, elapsed, was_failing);
     let reason = match outcome {
         RoleTickOutcome::Failure(reason) => reason.as_str(),
+        RoleTickOutcome::RuntimeRejected(rejection) => rejection.reason.as_str(),
         RoleTickOutcome::Success => "",
     };
     match action {
@@ -1548,6 +1583,42 @@ mod tests {
     fn write_config(root: &Path, contents: &str) {
         fs::create_dir_all(root.join(".loom")).unwrap();
         fs::write(root.join(".loom").join("config.json"), contents).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn mixed_runtime_role_launch_is_admitted_and_pinned_before_spawn() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for sub in [".loom/roles", ".loom/runtimes", ".loom/scripts"] {
+            fs::create_dir_all(root.join(sub)).unwrap();
+        }
+        write_config(root, r#"{"runtimes":{"roles":{"curator":"codex"}}}"#);
+        fs::write(root.join(".loom/roles/curator.json"), r#"{"runtimeRequirements":["mcp"]}"#)
+            .unwrap();
+        fs::write(
+            root.join(".loom/runtimes/codex.json"),
+            r#"{"runtime":"codex","capabilities":{"mcp":"yes","worktreeIsolation":"partial"}}"#,
+        )
+        .unwrap();
+        let adapter = root.join(".loom/scripts/spawn-codex.sh");
+        fs::write(&adapter, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&adapter, fs::Permissions::from_mode(0o755)).unwrap();
+        let observed = root.join("observed-runtime");
+        let worker = root.join(".loom/scripts/spawn-worker.sh");
+        fs::write(
+            &worker,
+            format!("#!/bin/sh\nprintf '%s' \"$LOOM_RUNTIME\" > '{}'\n", observed.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&worker, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut runner = ScriptRoleInvocationRunner::new(root.to_path_buf())
+            .with_timeout(Duration::from_secs(5));
+        assert_eq!(runner.invoke("curator", "/loom:curator"), RoleTickOutcome::Success);
+        assert_eq!(fs::read_to_string(observed).unwrap(), "codex");
     }
 
     /// A fake script that just exits with a fixed code, optionally writing to

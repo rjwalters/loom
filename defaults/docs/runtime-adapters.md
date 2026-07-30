@@ -346,8 +346,9 @@ compatibility and refuses to dispatch a role onto a runtime that cannot meet its
 requirements, rather than letting the session fail partway. The declaration is
 per-runtime; the requirements are per-role; the match happens at dispatch time.
 
-**Landed today (#4170):** the declaration and requirement sides of this contract
-exist as data + a standalone checker, ahead of dispatch wiring:
+**Capability contract (#4170, enforced for daemon scheduling by #4494):** the
+declaration and requirement sides exist as data and are interpreted identically
+by the standalone checker and daemon admission:
 
 - **Declaration** — `defaults/runtimes/<name>.json` (e.g.
   `defaults/runtimes/claude.json`), matching the sketch above exactly (tri-state
@@ -364,9 +365,7 @@ exist as data + a standalone checker, ahead of dispatch wiring:
   where a requirement is satisfied only by a declared `"yes"` (`"partial"` fails
   closed). Exit 0 on match or no-requirements, exit 78 (`EX_CONFIG`) on mismatch
   naming each unmet capability, non-zero with a distinct message on an
-  unknown/missing role or runtime file. It is intentionally **standalone** —
-  not yet wired into `spawn-worker.sh` or any dispatch path; that wiring is a
-  follow-up decision.
+  unknown/missing role or runtime file.
 
 **Second manifest (#4468):** `defaults/runtimes/codex.json` declares
 `mcp: "yes"`, `subagents: "no"` (the fork PR #59 prohibition), `hooks: "partial"`
@@ -379,6 +378,82 @@ workspace root, not to one `issue-N` worktree). Because `"partial"` fails closed
 parity doc's residual gap 2, and the CI leg asserts both outcomes. That is the
 intended relationship between points 6 and 7: the parity doc states the gap in
 prose, the manifest makes it enforceable.
+
+### Daemon runtime binding and admission
+
+Standalone periodic roles support per-role bindings:
+
+```json
+{
+  "runtimes": {
+    "default": "claude",
+    "roles": {
+      "curator": "codex",
+      "judge": "codex"
+    }
+  }
+}
+```
+
+The daemon resolves an explicit dispatch value (where the API offers one), then
+`LOOM_RUNTIME_<ROLE>`, `LOOM_RUNTIME`, `runtimes.roles.<role>`,
+`runtimes.default`, and finally `claude`. Empty strings are unset. It
+canonicalizes the role first and validates the selected adapter, role sidecar,
+runtime manifest, and every required capability before starting a child.
+`partial`, `no`, missing, malformed, and unknown values fail closed. The
+admitted runtime is pinned into the child environment so `spawn-worker.sh`
+cannot make a second, divergent choice.
+
+Unknown keys under `runtimes.roles` are a **hard configuration error**, not a
+silently ignored entry: `runtimes.roles.not-a-role` (or a typo such as
+`buidler`) refuses every admission for that workspace with a diagnostic naming
+the offending key, so a misconfigured binding can never leave a role quietly
+running on the default runtime. A known key with an **empty** value keeps its
+established "unset" meaning and falls through to the next precedence tier.
+
+Daemon admission runs before any claim lock, forge mutation, account selection,
+log header, or child spawn. Successful sweep status and
+`sweep.global.dispatch` events include both `runtime` and `runtime_source`.
+Refused work is represented too: the daemon publishes
+`sweep.global.runtime_rejected` carrying `kind`, `role`, `runtime`,
+`runtime_source`, `unmet_capabilities`, and `reason` — emitting it is a pure
+publish that creates no claim, account, or log side effect.
+
+Rejected IPC dispatches return `RuntimeRejected` with structured `role`,
+`runtime`, `source`, `unmet_capabilities`, and `reason` fields, and **both**
+real dispatch clients model it:
+
+- `loom-daemon dispatch <N>` renders the role/runtime/source/unmet diagnostic
+  and exits `78` (`EX_CONFIG`) — the same code the shell checker uses for a
+  mismatch — so a script can tell a capability refusal apart from a daemon
+  error without parsing text.
+- The MCP bridge (`mcp__loom__dispatch_sweep`) returns the parsed rejection as
+  a structured `runtime_rejection` object plus a rendered summary line, instead
+  of an opaque "unexpected response".
+
+These records contain selection metadata only; configuration values,
+environment contents, tokens, and credentials are never serialized.
+
+The native admission path and `check-runtime-capabilities.sh` are held to one
+decision by a shared conformance matrix over **every** shipped role/runtime
+pair, asserting identical decisions *and* identical named unmet-capability
+sets. The checker's `--json` flag (additive; exit codes and stderr are
+unchanged) emits that comparison surface:
+
+```json
+{"role":"builder","runtime":"codex","decision":"reject",
+ "unmet":["worktreeIsolation"],"reason":"unmet capabilities: worktreeIsolation"}
+```
+
+A `/loom:sweep` is different from a standalone role tick: it is one coordinator
+process for the entire Curator → Builder → Judge → Doctor → Merge lifecycle.
+Loom does not switch its CLI runtime between those nested phases. Consequently
+the daemon resolves the sweep runtime once from the global/default tiers and
+admits it against Builder's strongest lifecycle requirements. A per-role
+`curator: codex` binding can route a standalone Curator tick to Codex, but it
+does not make a full sweep partly Codex. With the shipped manifests, standalone
+Curator and Judge can use Codex; Builder and a full sweep cannot, because Codex
+declares `worktreeIsolation: partial`.
 
 ## Phase 1: the `spawn-worker.sh` runtime-dispatch seam
 

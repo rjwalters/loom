@@ -4363,6 +4363,15 @@ async fn handle_dispatch_command(
             eprintln!("Daemon rejected the dispatch: {}", err.message);
             std::process::exit(1);
         }
+        // Issue #4494: the typed capability-admission refusal is a REAL client
+        // outcome, not an "unexpected response" — render the structured
+        // role/runtime/source/unmet payload instead of discarding it, and exit
+        // EX_CONFIG(78) so a script can tell a capability mismatch apart from a
+        // daemon error (mirroring check-runtime-capabilities.sh's exit codes).
+        Ok(Response::RuntimeRejected(rejection)) => {
+            eprintln!("{}", rejection.diagnostic());
+            std::process::exit(loom_daemon::runtime_admission::EX_CONFIG);
+        }
         Ok(other) => {
             eprintln!("Unexpected response from daemon: {other:?}");
             std::process::exit(1);
@@ -8557,6 +8566,66 @@ mod dispatch_tests {
             }
             other => panic!("expected SweepDispatched, got {other:?}"),
         }
+
+        server.await.expect("server task");
+    }
+
+    /// Issue #4494: a fake daemon that refuses the dispatch with the typed
+    /// `RuntimeRejected` response. The native `loom-daemon dispatch` client
+    /// must MODEL that variant — parse it off the wire with its structured
+    /// payload intact and render role/runtime/source/unmet — instead of
+    /// falling into the generic "Unexpected response from daemon" path that
+    /// discarded the whole diagnostic.
+    #[tokio::test]
+    async fn round_trip_parses_runtime_rejected_response_with_structured_payload() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind");
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (reader, mut writer) = stream.into_split();
+            let mut lines = BufReader::new(reader).lines();
+            let _ = lines.next_line().await.expect("read").expect("line");
+            let response =
+                Response::RuntimeRejected(loom_daemon::runtime_admission::RuntimeRejection {
+                    role: "sweep-lifecycle".to_string(),
+                    runtime: "codex".to_string(),
+                    source: loom_daemon::runtime_admission::RuntimeSource::DefaultConfig,
+                    unmet_capabilities: vec!["worktreeIsolation".to_string()],
+                    reason: "unmet capabilities: worktreeIsolation".to_string(),
+                });
+            let json = serde_json::to_string(&response).expect("serialize");
+            writer.write_all(json.as_bytes()).await.expect("write");
+            writer.write_all(b"\n").await.expect("newline");
+            writer.flush().await.expect("flush");
+        });
+
+        let request = build_dispatch_request(4494, None, None, None, None, false);
+        let response = query_daemon_bounded(&socket_path, &request, Duration::from_secs(5))
+            .await
+            .expect("round-trip ok");
+
+        let Response::RuntimeRejected(rejection) = response else {
+            panic!("expected RuntimeRejected, got {response:?}");
+        };
+        assert_eq!(rejection.role, "sweep-lifecycle");
+        assert_eq!(rejection.runtime, "codex");
+        assert_eq!(rejection.unmet_capabilities, vec!["worktreeIsolation"]);
+
+        // The rendered operator diagnostic carries every required field.
+        let diagnostic = rejection.diagnostic();
+        for expected in [
+            "sweep-lifecycle",
+            "codex",
+            "default-config",
+            "worktreeIsolation",
+        ] {
+            assert!(diagnostic.contains(expected), "{diagnostic}");
+        }
+        // ...and the CLI's refusal exit code stays distinguishable from a
+        // generic daemon error (EX_CONFIG, as the shell checker uses).
+        assert_eq!(loom_daemon::runtime_admission::EX_CONFIG, 78);
 
         server.await.expect("server task");
     }

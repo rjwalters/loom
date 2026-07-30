@@ -4,6 +4,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+pub use crate::runtime_admission::{RuntimeRejection, RuntimeSource};
+
 pub type TerminalId = String;
 
 /// Unique identifier for a sweep dispatched via the daemon (Issue #3452).
@@ -527,6 +529,8 @@ pub enum Response {
         token_name: String,
         log_path: PathBuf,
     },
+    /// Typed, secret-free fail-closed runtime admission rejection.
+    RuntimeRejected(RuntimeRejection),
     /// Result of a `ListSweeps` request.
     SweepList {
         sweeps: Vec<SweepInfo>,
@@ -802,6 +806,9 @@ pub struct SweepInfo {
     /// observability contract safely degrade to `unknown`.
     #[serde(default = "default_sweep_runtime")]
     pub runtime: String,
+    /// Precedence tier that selected `runtime`; absent for legacy entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_source: Option<RuntimeSource>,
     /// Path to the per-sweep log file (relative to the workspace).
     pub log_path: PathBuf,
     /// Optional idempotency key supplied at dispatch.
@@ -1696,6 +1703,10 @@ pub enum Event {
     SweepGlobalDispatch {
         sweep_id: SweepId,
         kind: SweepKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        runtime: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        runtime_source: Option<RuntimeSource>,
         /// Owning managed-workspace root (Issue #3929's pattern, extended here
         /// by #4201). This was the one sweep-scoped variant that did **not**
         /// carry `repo` — the safehouse narration sink needs it to
@@ -1703,6 +1714,39 @@ pub enum Event {
         /// across managed repos, e.g. loom #N vs vibesql #N narrating into the
         /// same Matrix thread). `#[serde(default)]` keeps pre-#4201 wire data
         /// compatible.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repo: Option<String>,
+    },
+    /// `sweep.global.runtime_rejected` — a dispatch was **refused** by
+    /// fail-closed runtime admission (issue #4494, epic #4489 Phase 5), before
+    /// any claim lock, forge mutation, account selection, log header, or child
+    /// spawn. `SweepGlobalDispatch` only exists for *admitted* work, so without
+    /// this variant refused work had no event representation at all.
+    ///
+    /// The payload is deliberately the same structured, secret-free shape the
+    /// typed [`RuntimeRejection`] carries over IPC (role / runtime / source /
+    /// unmet capability names / reason) — no token name, account, credential,
+    /// or log path is included, and emitting it introduces **no** claim,
+    /// account, or log side effect (it is a pure event publish).
+    SweepGlobalRuntimeRejected {
+        /// The refused work item (issue or PR set) — there is no `sweep_id`,
+        /// because no sweep was ever created.
+        kind: SweepKind,
+        /// Canonical role/lifecycle the admission decision was made for
+        /// (`sweep-lifecycle` for a full sweep).
+        role: String,
+        /// Runtime that was resolved and then refused.
+        runtime: String,
+        /// Precedence tier that selected `runtime`.
+        runtime_source: RuntimeSource,
+        /// Named capabilities the runtime failed to declare as exactly `"yes"`.
+        /// Empty for config/adapter/manifest-shaped refusals.
+        #[serde(default)]
+        unmet_capabilities: Vec<String>,
+        /// Operator-facing rejection reason (the [`RuntimeRejection`] reason).
+        reason: String,
+        /// Owning managed-workspace root (Issue #3929's pattern). Stamped by
+        /// `SweepRegistry::emit_event` -> [`Self::set_repo_if_absent`].
         #[serde(default, skip_serializing_if = "Option::is_none")]
         repo: Option<String>,
     },
@@ -1805,6 +1849,7 @@ impl Event {
     /// | `SweepCrashed {issue, ..}` | `sweep.issue.{issue}.crashed` |
     /// | `SweepResumeDispatched {issue, ..}` | `sweep.issue.{issue}.resume_dispatched` |
     /// | `SweepGlobalDispatch {..}` | `sweep.global.dispatch` |
+    /// | `SweepGlobalRuntimeRejected {..}` | `sweep.global.runtime_rejected` |
     /// | `SweepGlobalCompleted {..}` | `sweep.global.completed` |
     /// | `EpicAction {epic, action, ..}` | `epic.issue.{epic}.{action}` |
     /// | `CapacityAdvisory {..}` | `daemon.capacity.advisory` |
@@ -1829,6 +1874,7 @@ impl Event {
                 format!("sweep.issue.{issue}.resume_dispatched")
             }
             Self::SweepGlobalDispatch { .. } => "sweep.global.dispatch".to_string(),
+            Self::SweepGlobalRuntimeRejected { .. } => "sweep.global.runtime_rejected".to_string(),
             Self::SweepGlobalCompleted { .. } => "sweep.global.completed".to_string(),
             Self::EpicAction { epic, action, .. } => {
                 format!("epic.issue.{epic}.{}", action.as_str())
@@ -1860,7 +1906,8 @@ impl Event {
             | Self::SweepExited { repo, .. }
             | Self::SweepCrashed { repo, .. }
             | Self::SweepResumeDispatched { repo, .. }
-            | Self::SweepGlobalDispatch { repo, .. } => repo,
+            | Self::SweepGlobalDispatch { repo, .. }
+            | Self::SweepGlobalRuntimeRejected { repo, .. } => repo,
             _ => return,
         };
         if slot.is_none() {
