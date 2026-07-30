@@ -781,6 +781,178 @@ fi
 
 ---
 
+## Capped-PR Recovery Pass (`loom:blocked` + `loom:changes-requested`)
+
+**Scope**: open PRs carrying **both** `loom:blocked` and `loom:changes-requested`. This is the parked state `/loom:sweep` writes when a PR exhausts `sweep.max_doctor_cycles` (`PR #P blocked: doctor cycle exhausted after <k> Doctor→Judge round(s); human attention required`). Without this pass that state is **terminal for automation** — the work-finder skips blocked items and Mode C pre-flight skips blocked PRs — so a PR whose Doctor was making real, distinct progress is never reconsidered (issue #4574, PR #4543 incident, 2026-07-30).
+
+This pass **never merges anything and never closes anything**. For each parked PR it makes exactly one of three decisions, each with a mandatory rationale comment: **grant one more Doctor→Judge cycle**, **keep parked**, or **recommend closing** (routed to the operator). Run it after the auto-merge queue has been drained — it is the lowest-priority Champion work.
+
+### Step 1: Find capped PRs
+
+`gh pr list` ANDs repeated `--label` values, so this returns exactly the parked set:
+
+```bash
+gh pr list \
+  --label "loom:blocked" \
+  --label "loom:changes-requested" \
+  --state open \
+  --json number,title,updatedAt,labels \
+  --jq '.[] | "#\(.number) \(.title)"'
+```
+
+**Skip any PR that also carries `loom:operator-only`** — a previous pass (or a human) already routed it out to the operator; do not re-decide it. Process the remaining PRs oldest first.
+
+Two more entry guards, checked against the thread in Step 2 before any decision is made:
+
+- **Only PRs parked by the Doctor-cycle cap are in scope.** The label pair alone is not proof. If the history shows no cap block (no `doctor cycle exhausted` block line or equivalent, or fewer than two Judge rejections), this PR was blocked for some other reason — keep it parked and say so.
+- **A human hold is authoritative.** If a human comment holds the PR — instruction-shaped phrasing such as `hold until`, `wait until`, `defer`, `not before`, `do not start` (not a bare `hold`/`wait` substring, mirroring the sweep's explicit-hold convention) — never grant. Keep it parked, quoting the hold.
+
+### Step 2: Read the full rejection history
+
+```bash
+PR_NUMBER=<number>
+gh pr view "$PR_NUMBER" --comments
+```
+
+Read the **whole** thread — that complete post-mortem view is the entire reason this decision lives here rather than in the dying sweep that parked the PR. Identify:
+
+- Every Judge rejection (Judge rejections start with `❌ **Changes Requested**`), in order.
+- The Doctor work between them (fix comments, pushed commits) — evidence that a previous rejection's defects were actually addressed.
+- Any prior grants from this pass, marked `<!-- champion:capped-pr-grant -->`:
+
+```bash
+# How many extra cycles this pass has already granted (0 for a first-time decision).
+PRIOR_GRANTS=$(gh pr view "$PR_NUMBER" --json comments \
+  --jq '[.comments[] | select(.body | contains("champion:capped-pr-grant"))] | length')
+```
+
+The two comments the decision turns on are the **latest** Judge rejection and the **immediately preceding** one.
+
+### Step 3: Apply the forward-progress test
+
+This is the **same test** as the sweep's in-sweep distinct-defect exception (`sweep.md` → "Doctor-cycle cap" → "Distinct-defect exception"), applied at a different decision point: periodic, post-mortem, with the full history instead of the dying sweep's local context.
+
+**Grant only when ALL of these hold:**
+
+1. There are **at least two** Judge rejections to compare (nothing to compare = no grant).
+2. The latest rejection names defects **demonstrably distinct** from the previous rejection's defects: the previous defects are not re-raised, the Doctor's fix for them visibly landed, and the new findings were reachable only *because* that fix landed. Judge saying so explicitly ("the Doctor made real progress") is strong evidence.
+3. The new defects look **fixable by one Doctor cycle** — a bounded code change, not a design disagreement or a scope renegotiation.
+4. Read as a whole, the chain is **converging**: each earlier grant also produced fresh progress, and the defect list is not migrating around the same area with no end in sight.
+
+**Never grant when:**
+
+- The latest rejection **re-litigates** a defect already named in a prior rejection — the same underlying disagreement restated, even in different words. This is thrash, exactly what the cap exists to stop, and it stays parked no matter how many grants preceded it.
+- The comparison is **ambiguous** — the rejections partly overlap, or the comments do not make clear whether the prior fix actually landed. **Ambiguity is not a grant**; fall through to keep-parked (or recommend-closing).
+- The rejection is about the **approach** rather than the implementation — no number of Doctor cycles fixes a wrong design.
+- The chain is long and each round buys less than the one before it, even if every individual step technically moved forward. Park it and say so.
+
+**No hard grant cap.** Champion may grant repeatedly across ticks as long as *each* new rejection shows fresh forward progress. The anti-thrash guarantee comes from applying this test **every round**, not from a counter — so do not add one, and do not treat a high `PRIOR_GRANTS` as automatic grounds for either granting or parking. The `<!-- champion:capped-pr-grant -->` comments are the audit trail that makes a long chain reviewable at a glance.
+
+**No double-grant with the sweep-side exception.** A PR only reaches `loom:blocked` *after* the sweep's single-use distinct-defect grace cycle was already consumed or was not applicable, so this pass can never stack on top of it. The two are the same mechanism at two decision points; neither imposes a numeric cap on the other.
+
+**Checkpoints are not this pass's business.** Do not write or edit `.loom/sweep-checkpoint/` state. The terminal rejection deliberately left the last `doctor-done` checkpoint in place with its `attempt` value, so the next Doctor cycle increments from there and the escalation ladder (`ladder[min(attempt - 1, len - 1)]`, saturating at the top rung) keeps progressing across grants with no plumbing change.
+
+### Step 4a: Outcome — grant another Doctor cycle
+
+Remove **only** `loom:blocked`. `loom:changes-requested` stays, and it is what routes the PR back to Doctor via the normal flow (the fleet role runner, or the next `/loom:sweep --prs` at C1b). Do **not** add `loom:pr` or `loom:review-requested`, and do not dispatch anything yourself — there is no new dispatch surface here.
+
+```bash
+PR_NUMBER=<number>
+GRANT_MARKER="<!-- champion:capped-pr-grant -->"
+# PRIOR_GRANTS from Step 2 (0 on a first-time decision).
+
+gh pr comment "$PR_NUMBER" --body "$GRANT_MARKER
+**Champion: Extra Doctor Cycle Granted**
+
+This PR was parked at the Doctor-cycle cap. Reviewing its full rejection history, the latest rejection shows forward progress, so it is being returned to the Doctor→Judge flow for one more bounded cycle.
+
+- **Previous rejection**: <DEFECTS_NAMED_IN_PRIOR_REJECTION>
+- **Latest rejection**: <DEFECTS_NAMED_IN_LATEST_REJECTION>
+- **Why this is forward progress**: <WHY_THE_LATEST_DEFECTS_ARE_DISTINCT_AND_ONLY_REACHABLE_AFTER_THE_PRIOR_FIX_LANDED>
+- **Grants so far on this PR (including this one)**: $((PRIOR_GRANTS + 1))
+
+Removing \`loom:blocked\`; \`loom:changes-requested\` stays, so Doctor picks this up on the normal path. If the next rejection re-litigates a defect already raised here, this PR parks again regardless of history.
+
+---
+*Automated by Champion role*"
+
+# Remove ONLY loom:blocked — never touch loom:changes-requested here.
+gh pr edit "$PR_NUMBER" --remove-label "loom:blocked"
+echo "Granted an extra Doctor cycle on #$PR_NUMBER (loom:blocked removed)"
+```
+
+A granted PR leaves the parked set immediately, so this outcome is self-idempotent — the next tick will not see it again unless a fresh rejection re-parks it.
+
+### Step 4b: Outcome — keep parked
+
+Comment the **specific** reason a human is still needed (not a generic "still blocked"), and change no labels. Because the parked PR stays in the query, guard the comment with a marker keyed to the rejection that is being ruled on, so the 10-minute cron does not re-post the same verdict every tick while a genuinely new rejection still gets a fresh decision:
+
+```bash
+PR_NUMBER=<number>
+
+# Per-episode idempotency key: the newest Judge rejection comment. Champion's
+# own capped-PR comments are excluded from the match so this pass's output can
+# never become its own key (which would re-post forever).
+LATEST_REJECTION_ID=$(gh pr view "$PR_NUMBER" --json comments \
+  --jq '[.comments[]
+         | select((.body | contains("champion:capped-pr")) | not)
+         | select(.body | test("Changes Requested"; "i"))]
+        | last | .id // "none"')
+PARK_MARKER="<!-- champion:capped-pr-parked:$LATEST_REJECTION_ID -->"
+
+if gh pr view "$PR_NUMBER" --json comments --jq '.comments[].body' | grep -qF "$PARK_MARKER"; then
+  echo "Keep-parked verdict already posted for #$PR_NUMBER on this rejection — skipping"
+else
+  gh pr comment "$PR_NUMBER" --body "$PARK_MARKER
+**Champion: Keeping This PR Parked**
+
+Reviewed the full rejection history against the forward-progress test; this PR does not qualify for another Doctor cycle.
+
+- **Reason**: <SAME_DEFECT_RE_LITIGATED | AMBIGUOUS_COMPARISON | ONLY_ONE_REJECTION | CHAIN_NOT_CONVERGING | APPROACH_DISAGREEMENT | NOT_CAP_PARKED | HUMAN_HOLD>
+- **Specifics**: <WHICH_DEFECT_REPEATS_ACROSS_REJECTIONS_OR_WHAT_IS_UNCLEAR>
+- **What a human needs to decide**: <THE_SPECIFIC_JUDGMENT_AUTOMATION_CANNOT_MAKE>
+
+Labels unchanged (\`loom:blocked\` + \`loom:changes-requested\`). Champion will re-evaluate this PR if a new Judge rejection lands.
+
+---
+*Automated by Champion role*"
+  echo "Kept #$PR_NUMBER parked (rationale posted)"
+fi
+```
+
+### Step 4c: Outcome — recommend closing (route to the operator)
+
+Use this when the history shows the **approach itself** is not viable — repeated rejections on the design, a superseded change, or a PR whose premise a merged change invalidated. **Champion is the router here, not the closer**: do not close the PR. Add `loom:operator-only` (keeping `loom:blocked` + `loom:changes-requested`) so the PR leaves the automation queue for good — Mode C pre-flight hard-skips `loom:operator-only` PRs — and state the recommendation plainly for the human.
+
+```bash
+PR_NUMBER=<number>
+CLOSE_MARKER="<!-- champion:capped-pr-close-recommended -->"
+
+if gh pr view "$PR_NUMBER" --json comments --jq '.comments[].body' | grep -qF "$CLOSE_MARKER"; then
+  echo "Close recommendation already posted for #$PR_NUMBER — skipping"
+else
+  gh pr comment "$PR_NUMBER" --body "$CLOSE_MARKER
+**Champion: Recommending Closure — Operator Decision Required**
+
+This PR has been parked at the Doctor-cycle cap, and its rejection history indicates the approach is not viable rather than merely unfinished. Champion does not close PRs; routing this to the operator instead.
+
+- **Rejection history**: <SHORT_SUMMARY_OF_THE_ROUNDS>
+- **Why more Doctor cycles will not help**: <WHY_THE_APPROACH_NOT_THE_IMPLEMENTATION_IS_THE_PROBLEM>
+- **Recommendation**: close this PR<AND_OPTIONALLY_WHAT_TO_FILE_INSTEAD>
+
+Added \`loom:operator-only\` so automation stops re-evaluating this PR. A human should close it, or remove \`loom:operator-only\` to return it to the Champion recovery pass.
+
+---
+*Automated by Champion role*"
+  gh pr edit "$PR_NUMBER" --add-label "loom:operator-only"
+  echo "Routed #$PR_NUMBER to the operator with a close recommendation"
+fi
+```
+
+**Never** `gh pr close` from this pass, and never close the PR's linked issue — a still-pending human decision is routed, not resolved.
+
+---
+
 ## PR Auto-Merge Batch Processing
 
 **Process all qualifying PRs in one iteration — drain the full queue.**
@@ -788,6 +960,8 @@ fi
 Evaluate and merge qualifying PRs sequentially (oldest first) until the queue is empty. Sequential processing is safe and prevents the bottleneck that occurs when PRs accumulate while the champion waits for the next interval.
 
 If an individual merge fails, continue to the next PR rather than aborting the entire iteration.
+
+The **Capped-PR Recovery Pass** drains the same way (oldest first, one decision per parked PR, continue past individual failures), but only after the `loom:pr` merge queue is empty — merging approved work always outranks reconsidering parked work.
 
 ---
 
