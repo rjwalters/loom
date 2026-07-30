@@ -305,6 +305,7 @@ pub fn format_count(count: Option<usize>) -> String {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::sync::Mutex;
 
     // ===================================================================
@@ -465,7 +466,14 @@ mod tests {
         path
     }
 
+    /// `#[serial]` is load-bearing (#4547): concurrent `std::env::set_var`
+    /// (used by `disk_headroom.rs`'s PATH-mutating tests) races any
+    /// concurrently-running thread that reads the process environment,
+    /// including the implicit env read inside every `std::process::Command`
+    /// spawn below — not just subprocesses that literally do a `PATH`
+    /// lookup for their own executable.
     #[test]
+    #[serial]
     fn gh_pipeline_source_counts_each_metric_independently() {
         let tmp = tempfile::tempdir().unwrap();
         let gh = write_fake_gh(
@@ -511,7 +519,11 @@ esac
         assert!(snap.is_complete());
     }
 
+    /// `#[serial]` is load-bearing (#4547): the fake-`gh` script this test
+    /// spawns is a subprocess whose resolution depends on the inherited
+    /// `PATH`, which `disk_headroom.rs`'s tests mutate process-globally.
     #[test]
+    #[serial]
     fn gh_pipeline_source_records_error_but_keeps_other_metrics() {
         let tmp = tempfile::tempdir().unwrap();
         let gh = write_fake_gh(
@@ -544,7 +556,11 @@ esac
         assert_eq!(snap.merged_24h, Some(0));
     }
 
+    /// `#[serial]` is load-bearing (#4547) for the same reason as
+    /// `gh_pipeline_source_counts_each_metric_independently` above — even a
+    /// failed `Command::spawn` attempt reads the process environment.
     #[test]
+    #[serial]
     fn gh_pipeline_source_missing_binary_is_a_contained_failure() {
         let tmp = tempfile::tempdir().unwrap();
         let source = GhPipelineSource::new().with_gh_bin(PathBuf::from("/no/such/gh-binary"));

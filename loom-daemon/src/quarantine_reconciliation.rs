@@ -587,14 +587,19 @@ mod tests {
     /// A `loom:blocked` issue carrying the daemon's quarantine comment is
     /// released, and the recorded `gh` argv proves the real label-flip
     /// command ran (not just the in-memory decision).
+    ///
+    /// `#[serial]` is load-bearing (#4547): the fake-`gh` script below spawns
+    /// a subprocess whose `bash` resolution depends on the inherited `PATH`,
+    /// which `disk_headroom.rs`'s tests mutate process-globally.
     #[test]
+    #[serial]
     fn reconcile_workspace_releases_issue_with_quarantine_comment() {
         let dir = tempdir().unwrap();
         let repo_root = dir.path().join("repo");
         std::fs::create_dir_all(&repo_root).unwrap();
         let gh_log = dir.path().join("gh-invocations.log");
         let script = format!(
-            r#"#!/usr/bin/env bash
+            r#"#!/bin/bash
 printf '%s\n' "$*" >> "{log}"
 if [ "$1" = "issue" ] && [ "$2" = "list" ]; then
   echo '[{{"number":99,"comments":[{{"body":"Auto-quarantined by loom-daemon (#3939): insta-crashed 3 times"}}]}}]'
@@ -620,14 +625,18 @@ exit 0
     /// A `loom:blocked` issue with NO daemon quarantine comment (an
     /// operator's manual block) is left untouched — no `gh issue edit` call
     /// is ever made for it.
+    ///
+    /// `#[serial]` is load-bearing (#4547) for the same reason as
+    /// `reconcile_workspace_releases_issue_with_quarantine_comment` above.
     #[test]
+    #[serial]
     fn reconcile_workspace_never_touches_manual_block() {
         let dir = tempdir().unwrap();
         let repo_root = dir.path().join("repo");
         std::fs::create_dir_all(&repo_root).unwrap();
         let gh_log = dir.path().join("gh-invocations.log");
         let script = format!(
-            r#"#!/usr/bin/env bash
+            r#"#!/bin/bash
 printf '%s\n' "$*" >> "{log}"
 if [ "$1" = "issue" ] && [ "$2" = "list" ]; then
   echo '[{{"number":77,"comments":[{{"body":"Blocked manually pending a human decision"}}]}}]'
@@ -652,14 +661,21 @@ exit 0
 
     /// The per-workspace cap is passed through to `gh issue list --limit`, so
     /// an unexpectedly huge backlog cannot turn startup into an API storm.
+    ///
+    /// `#[serial]` is load-bearing (#4547): `std::env::set_var`/`remove_var`
+    /// (used by `disk_headroom.rs`'s PATH-mutating tests) race any
+    /// concurrently-running thread that reads the process environment —
+    /// including the implicit env read inside `std::process::Command`'s
+    /// child-spawn plumbing below, not just literal `PATH` lookups.
     #[test]
+    #[serial]
     fn reconcile_workspace_passes_issue_cap_to_gh_list() {
         let dir = tempdir().unwrap();
         let repo_root = dir.path().join("repo");
         std::fs::create_dir_all(&repo_root).unwrap();
         let gh_log = dir.path().join("gh-invocations.log");
         let script = format!(
-            r#"#!/usr/bin/env bash
+            r#"#!/bin/bash
 printf '%s\n' "$*" >> "{log}"
 echo '[]'
 exit 0
@@ -681,12 +697,16 @@ exit 0
 
     /// A `gh issue list` failure is absorbed (logged, not propagated) so one
     /// repo's forge hiccup never blocks startup.
+    ///
+    /// `#[serial]` is load-bearing (#4547) for the same reason as
+    /// `reconcile_workspace_passes_issue_cap_to_gh_list` above.
     #[test]
+    #[serial]
     fn reconcile_workspace_absorbs_gh_list_failure() {
         let dir = tempdir().unwrap();
         let repo_root = dir.path().join("repo");
         std::fs::create_dir_all(&repo_root).unwrap();
-        let fake_gh = write_fake_gh(dir.path(), "#!/usr/bin/env bash\necho 'boom' >&2\nexit 1\n");
+        let fake_gh = write_fake_gh(dir.path(), "#!/bin/bash\necho 'boom' >&2\nexit 1\n");
 
         let (checked, released) = forge::reconcile_workspace(&fake_gh, &repo_root);
         assert_eq!(checked, 0);
