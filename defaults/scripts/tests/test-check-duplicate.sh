@@ -107,24 +107,57 @@ exit 1
 STUB
 chmod +x "$STUB_DIR/loom-daemon"
 
+# --- Stub git on PATH ---
+#   git remote get-url origin -> "https://github.com/owner/repo.git" (or fail
+#                                 if $STUB_DIR/git-remote-fail exists). check-
+#                                 duplicate.sh's get_repo_nwo() (#4659) resolves
+#                                 "owner/repo" from this LOCAL read -- no `gh
+#                                 repo view` (GraphQL) round-trip -- so this stub
+#                                 never needs to simulate a rate limit for it.
+#   anything else              -> delegated to the real `git` binary (unused by
+#                                 check-duplicate.sh today; a safety net only).
+REAL_GIT_BIN="$(command -v git)"
+export REAL_GIT_BIN
+cat > "$STUB_DIR/git" <<'STUB'
+#!/usr/bin/env bash
+STUB_DIR_FROM_ENV="${LOOM_TEST_STUB_DIR:?stub git: LOOM_TEST_STUB_DIR not set}"
+if [[ "$1" == "remote" && "$2" == "get-url" && "$3" == "origin" ]]; then
+  if [[ -f "$STUB_DIR_FROM_ENV/git-remote-fail" ]]; then
+    echo "stub git: No such remote 'origin'" >&2
+    exit 1
+  fi
+  echo "https://github.com/owner/repo.git"
+  exit 0
+fi
+exec "$REAL_GIT_BIN" "$@"
+STUB
+chmod +x "$STUB_DIR/git"
+
 # --- Stub gh on PATH ---
 #   gh auth status                                     -> exit 0 (authenticated)
-#   gh repo view --json nameWithOwner --jq ...          -> "owner/repo" (or fail
-#                                                          if $STUB_DIR/repo-view-fail exists)
 #   gh issue list --state=open|closed ...               -> cat $STUB_DIR/issues-<state>.json (or [];
 #                                                           simulates a GraphQL rate-limit failure if
 #                                                           $STUB_DIR/issue-list-rate-limit-<state> exists)
 #   gh pr list --state=merged ...                        -> cat $STUB_DIR/prs-merged.json (or [];
 #                                                           simulates a GraphQL rate-limit failure if
 #                                                           $STUB_DIR/pr-list-rate-limit exists)
-#   gh api repos/OWNER/REPO/issues/N/timeline --paginate -> cat $STUB_DIR/timeline-N.json (or [];
+#   gh api repos/{owner}/{repo}/issues/N/timeline --paginate -> cat $STUB_DIR/timeline-N.json (or [];
 #                                                           fails if $STUB_DIR/timeline-fail exists)
-#   gh api repos/OWNER/REPO/issues?state=<state>&...     -> REST fallback (#4526): cat
+#   gh api repos/{owner}/{repo}/issues?state=<state>&... -> REST fallback (#4526): cat
 #                                                           $STUB_DIR/rest-issues-<state>.json (or [];
 #                                                           fails if $STUB_DIR/rest-issues-fail exists)
-#   gh api repos/OWNER/REPO/pulls?state=closed&...       -> REST fallback (#4526): cat
+#   gh api repos/{owner}/{repo}/pulls?state=closed&...   -> REST fallback (#4526): cat
 #                                                           $STUB_DIR/rest-prs.json (or [];
 #                                                           fails if $STUB_DIR/rest-prs-fail exists)
+#
+# Note (#4659): check-duplicate.sh no longer calls `gh repo view` anywhere --
+# repo resolution (get_repo_nwo(), used only by search_cross_references())
+# reads the git remote directly (see the `git` stub above), and the REST
+# fallback call sites hit `gh api "repos/{owner}/{repo}/..."` verbatim,
+# letting `gh` resolve the placeholder locally. So this stub deliberately has
+# no "repo" case left: a resurrected `gh repo view` call in production code
+# would fail this test suite with "unhandled args" rather than silently
+# passing, which is the point.
 cat > "$STUB_DIR/gh" <<'STUB'
 #!/usr/bin/env bash
 STUB_DIR_FROM_ENV="${LOOM_TEST_STUB_DIR:?stub gh: LOOM_TEST_STUB_DIR not set}"
@@ -147,14 +180,6 @@ rate_limit_message() {
 
 case "$1" in
   auth)
-    exit 0
-    ;;
-  repo)
-    if [[ -f "$STUB_DIR_FROM_ENV/repo-view-fail" ]]; then
-      echo "stub gh: repo view failed" >&2
-      exit 1
-    fi
-    echo "owner/repo"
     exit 0
     ;;
   issue)
@@ -239,7 +264,7 @@ export PATH="$STUB_DIR:$PATH"
 reset_state() {
     rm -f "$STUB_DIR"/issues-*.json "$STUB_DIR"/prs-merged.json "$STUB_DIR"/timeline-*.json
     rm -f "$STUB_DIR"/rest-issues-*.json "$STUB_DIR/rest-prs.json"
-    rm -f "$STUB_DIR/timeline-fail" "$STUB_DIR/repo-view-fail"
+    rm -f "$STUB_DIR/timeline-fail" "$STUB_DIR/git-remote-fail"
     rm -f "$STUB_DIR"/issue-list-rate-limit-* "$STUB_DIR/pr-list-rate-limit"
     rm -f "$STUB_DIR/rest-issues-fail" "$STUB_DIR/rest-prs-fail"
     rm -f "$STUB_DIR/rate-limit-message"
@@ -348,14 +373,15 @@ assert_eq "true" "$duplicate_found" "(f) --json duplicate_found is true when onl
 cross_num="$(echo "$OUT" | jq -r '.matches[] | select(.type == "cross_reference") | .number')"
 assert_eq "33" "$cross_num" "(f) --json cross_reference entry carries the correct issue number"
 
-# (g) Non-GitHub-forge-style failure (repo can't be resolved) degrades
-# gracefully: probe skipped, similarity check unaffected, no hard failure.
+# (g) Repo can't be resolved from the git remote (#4659: get_repo_nwo() reads
+# `git remote get-url origin`, not `gh repo view`) -> degrades gracefully:
+# probe skipped, similarity check unaffected, no hard failure.
 reset_state
-: > "$STUB_DIR/repo-view-fail"
+: > "$STUB_DIR/git-remote-fail"
 run_cds --issue 80 --title "Some issue title"
-assert_eq "0" "$RC" "(g) repo view failure -> exit code driven by similarity check alone"
-assert_not_contains "$OUT" "RELATED_OPEN_WORK" "(g) repo view failure -> probe result skipped"
-assert_contains "$ERR" "Failed to resolve repository" "(g) repo view failure -> stderr warning emitted"
+assert_eq "0" "$RC" "(g) git remote resolution failure -> exit code driven by similarity check alone"
+assert_not_contains "$OUT" "RELATED_OPEN_WORK" "(g) git remote resolution failure -> probe result skipped"
+assert_contains "$ERR" "Failed to resolve repository" "(g) git remote resolution failure -> stderr warning emitted"
 
 echo ""
 echo "Testing check-duplicate.sh keyword-similarity scoring (issue #4409)..."
@@ -545,6 +571,28 @@ assert_eq "1" "$RC" "(p) Rate-limited GraphQL open-issues search falls back to R
 assert_contains "$OUT" "DUPLICATE_FOUND (REST fallback" "(p) REST fallback output is labeled distinctly from a normal GraphQL match"
 assert_contains "$OUT" "#801: Alpha Bravo Charlie Delta (similarity: 100%)" "(p) REST fallback finds the matching issue"
 assert_not_contains "$OUT" "#802" "(p) REST fallback excludes PR entries returned by the /issues endpoint"
+
+# (p2) GLOBAL GraphQL exhaustion (issue #4659): not just the `issue list`
+# GraphQL call is rate-limited, but repo resolution is ALSO unavailable (here,
+# `git remote get-url origin` fails outright) -- modeling the real production
+# incident this issue is about, where get_repo_nwo() used to be `gh repo
+# view` (itself GraphQL-backed) and its failure short-circuited the REST
+# fallback via `&&` BEFORE `gh api` was ever attempted, reporting exit 2
+# ("could not check") and blaming REST for a failure REST never had. With the
+# fix, the REST-fallback call sites resolve "{owner}/{repo}" via `gh api`'s
+# own local placeholder substitution and never call get_repo_nwo()/git at
+# all, so this must still succeed with exit 1, not degrade to exit 2.
+reset_state
+: > "$STUB_DIR/issue-list-rate-limit-open"
+: > "$STUB_DIR/git-remote-fail"
+cat > "$STUB_DIR/rest-issues-open.json" <<'EOF'
+[{"number": 801, "title": "Alpha Bravo Charlie Delta", "body": "", "pull_request": null}]
+EOF
+run_cds --threshold 50 --title "Alpha Bravo Charlie Delta"
+assert_eq "1" "$RC" "(p2) Global GraphQL exhaustion (list AND repo resolution both down) -> REST fallback still completes, exit 1"
+assert_contains "$OUT" "DUPLICATE_FOUND (REST fallback" "(p2) REST fallback output labeled distinctly even under global exhaustion"
+assert_contains "$OUT" "#801: Alpha Bravo Charlie Delta (similarity: 100%)" "(p2) REST fallback still finds the matching issue"
+assert_not_contains "$ERR" "REST fallback also failed" "(p2) REST never actually failed -- must not be blamed for the repo-resolution outage"
 
 # (q) Open-issues GraphQL rate-limited AND the REST fallback also fails ->
 # exit 2 ("could not run at all"), not silently treated as no duplicates.

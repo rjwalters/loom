@@ -428,7 +428,9 @@ gh issue close <number> --reason "not planned"
 
 ### Duplicate Detection
 
-**Check for potential duplicates during curation** using the duplicate detection script. Use `--include-merged-prs` to also catch issues that overlap with recently merged PRs or recently closed issues, and pass `--issue <number>` so the script also probes for **related open work** — see "Related Open Work (Cross-References)" immediately below, a different question from duplication:
+**Check for potential duplicates during curation** using the duplicate detection script. Use `--include-merged-prs` to also catch issues that overlap with recently merged PRs or recently closed issues, and pass `--issue <number>` so the script also probes for **related open work** — see "Related Open Work (Cross-References)" immediately below, a different question from duplication.
+
+**Distinguish exit 1 from exit 2** (issue #4659): exit 1 means the check *ran* and found a `DUPLICATE_FOUND` and/or `RELATED_OPEN_WORK` block — read it before curating. Exit 2 means the check **could not run at all** (e.g. GraphQL exhaustion with no working fallback) — there is no match list to read, and treating it the same as exit 1 falsely reports "potential duplicate detected" when nothing was actually checked. Do not let exit 2 block curation; log it and proceed, noting in your enhancement comment that the duplicate check was inconclusive:
 
 ```bash
 # Get issue title and body
@@ -437,10 +439,17 @@ BODY=$(gh issue view <number> --json body --jq .body)
 
 # Check for similar existing issues, merged PRs, closed issues, AND open
 # issues/PRs that cross-reference this one (--issue, issue #4162)
-if ! ./.loom/scripts/check-duplicate.sh --include-merged-prs --issue "<number>" "$TITLE" "$BODY"; then
+./.loom/scripts/check-duplicate.sh --include-merged-prs --issue "<number>" "$TITLE" "$BODY"
+CHECK_RC=$?
+if [[ $CHECK_RC -eq 1 ]]; then
     # DUPLICATE_FOUND and/or RELATED_OPEN_WORK found - read the full output
     # before marking curated
     echo "Potential duplicate or related open work detected - review before curating"
+elif [[ $CHECK_RC -eq 2 ]]; then
+    # Could not check at all (e.g. GraphQL exhaustion with no working
+    # fallback) - this is NOT "duplicate found". Don't block curation on it;
+    # note the inconclusive check in your enhancement comment instead.
+    echo "Duplicate check could not complete (forge error) - proceeding without a duplicate verdict"
 fi
 ```
 
