@@ -1492,7 +1492,7 @@ mod tests {
         let RoleTickOutcome::Failure(reason) = outcome else {
             panic!("expected Failure");
         };
-        assert!(reason.contains("spawn-claude.sh not found"), "{reason}");
+        assert!(reason.contains("spawn-worker.sh not found"), "{reason}");
     }
 
     #[test]

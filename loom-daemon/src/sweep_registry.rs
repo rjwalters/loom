@@ -84,7 +84,7 @@ pub const DEFAULT_REAPER_INTERVAL_SECS: u64 = 30;
 pub const REAPER_INTERVAL_ENV: &str = "LOOM_SWEEP_REAPER_INTERVAL_SECS";
 
 /// Environment variable for overriding the dispatch entry point used by
-/// the registry. Defaults to `defaults/scripts/spawn-claude.sh` relative to
+/// the registry. Defaults to `defaults/scripts/spawn-worker.sh` relative to
 /// the workspace. Used by integration tests to substitute a fake child.
 pub const SPAWN_BIN_ENV: &str = "LOOM_SWEEP_SPAWN_BIN";
 
@@ -387,6 +387,9 @@ pub const UNKNOWN_TOKEN_NAME: &str = "unknown";
 /// account name itself carries no ANSI colour codes (only the timestamp prefix
 /// does), so a plain substring scan is sufficient — no ANSI stripping needed.
 const TOKEN_NAME_LOG_MARKER: &str = "using OAuth account '";
+const ACCOUNT_LOG_MARKER: &str = "# LOOM_ACCOUNT name=";
+const RUNTIME_LOG_MARKER: &str = "# LOOM_RUNTIME_RESOLVED runtime=";
+const CLI_START_MARKER: &str = "# LOOM_CLI_START";
 
 /// Issue #3802: how long `spawn_child` polls the per-sweep log for the
 /// `TOKEN_NAME_LOG_MARKER` line before giving up and recording
@@ -922,8 +925,7 @@ pub fn ranking_has_capacity(contents: &str) -> bool {
 }
 
 /// Decide, from a sweep log's contents, whether the child has produced any
-/// output *past* the daemon spawn header + `spawn-claude.sh` wrapper lines —
-/// i.e. whether Claude Code itself has started doing work (Issue #3887).
+/// output *past* the daemon spawn header + runtime-adapter preamble lines.
 ///
 /// A hung child's log region (after the most recent dispatch header) contains
 /// only the header itself and `spawn-claude:`-prefixed wrapper lines (the
@@ -939,7 +941,13 @@ pub fn log_has_progress(contents: &str) -> bool {
     };
     region.lines().any(|line| {
         let t = line.trim();
-        !t.is_empty() && !t.contains("loom-daemon dispatch:") && !t.contains("spawn-claude:")
+        !t.is_empty()
+            && !t.contains("loom-daemon dispatch:")
+            && !t.contains("spawn-claude:")
+            && !t.contains("spawn-codex:")
+            && !t.contains("spawn-worker:")
+            && !t.starts_with("# LOOM_RUNTIME_RESOLVED")
+            && !t.starts_with("# LOOM_ACCOUNT")
     })
 }
 
@@ -958,15 +966,32 @@ fn parse_token_name_after(contents: &str, header_anchor: &str) -> Option<String>
     // current child logs its selection after the most recent one.
     let region_start = contents.rfind(header_anchor)?;
     let region = &contents[region_start..];
-    let marker_at = region.find(TOKEN_NAME_LOG_MARKER)? + TOKEN_NAME_LOG_MARKER.len();
+    let (marker_at, terminator) = if let Some(i) = region.find(ACCOUNT_LOG_MARKER) {
+        (i + ACCOUNT_LOG_MARKER.len(), '\n')
+    } else {
+        (region.find(TOKEN_NAME_LOG_MARKER)? + TOKEN_NAME_LOG_MARKER.len(), '\'')
+    };
     let after = &region[marker_at..];
-    let close = after.find('\'')?;
-    let name = &after[..close];
+    let close = after.find(terminator).unwrap_or(after.len());
+    let name = after[..close].trim();
     if name.is_empty() {
         None
     } else {
         Some(name.to_string())
     }
+}
+
+fn parse_runtime_after(contents: &str, header_anchor: &str) -> Option<String> {
+    let region = &contents[contents.rfind(header_anchor)?..];
+    let after = &region[region.find(RUNTIME_LOG_MARKER)? + RUNTIME_LOG_MARKER.len()..];
+    let runtime = after.lines().next()?.trim();
+    (!runtime.is_empty()).then(|| runtime.to_string())
+}
+
+fn marker_after(contents: &str, header_anchor: &str, marker: &str) -> bool {
+    contents
+        .rfind(header_anchor)
+        .is_some_and(|start| contents[start..].contains(marker))
 }
 
 /// Poll `log_path` for the account-selection marker until it appears, the
@@ -981,12 +1006,20 @@ fn parse_token_name_after(contents: &str, header_anchor: &str) -> Option<String>
 /// exits without logging is detected immediately rather than waiting out the
 /// full window). `try_wait` caches the exit status, so the reaper's later
 /// `try_wait` on the same handle still observes the exit.
-fn poll_token_name(child: &mut Child, log_path: &Path, header_anchor: &str) -> String {
+fn poll_observability(child: &mut Child, log_path: &Path, header_anchor: &str) -> (String, String) {
     let deadline = std::time::Instant::now() + TOKEN_NAME_CAPTURE_TIMEOUT;
+    let mut runtime = None;
     loop {
         if let Ok(contents) = std::fs::read_to_string(log_path) {
+            runtime = runtime.or_else(|| parse_runtime_after(&contents, header_anchor));
             if let Some(name) = parse_token_name_after(&contents, header_anchor) {
-                return name;
+                return (name, runtime.unwrap_or_else(|| UNKNOWN_TOKEN_NAME.to_string()));
+            }
+            if runtime.is_some() && marker_after(&contents, header_anchor, CLI_START_MARKER) {
+                return (
+                    UNKNOWN_TOKEN_NAME.to_string(),
+                    runtime.unwrap_or_else(|| UNKNOWN_TOKEN_NAME.to_string()),
+                );
             }
         }
         // If the child has already exited without logging a selection, the
@@ -995,13 +1028,24 @@ fn poll_token_name(child: &mut Child, log_path: &Path, header_anchor: &str) -> S
         if matches!(child.try_wait(), Ok(Some(_))) {
             if let Ok(contents) = std::fs::read_to_string(log_path) {
                 if let Some(name) = parse_token_name_after(&contents, header_anchor) {
-                    return name;
+                    return (
+                        name,
+                        parse_runtime_after(&contents, header_anchor)
+                            .or(runtime)
+                            .unwrap_or_else(|| UNKNOWN_TOKEN_NAME.to_string()),
+                    );
                 }
             }
-            return UNKNOWN_TOKEN_NAME.to_string();
+            return (
+                UNKNOWN_TOKEN_NAME.to_string(),
+                runtime.unwrap_or_else(|| UNKNOWN_TOKEN_NAME.to_string()),
+            );
         }
         if std::time::Instant::now() >= deadline {
-            return UNKNOWN_TOKEN_NAME.to_string();
+            return (
+                UNKNOWN_TOKEN_NAME.to_string(),
+                runtime.unwrap_or_else(|| UNKNOWN_TOKEN_NAME.to_string()),
+            );
         }
         std::thread::sleep(TOKEN_NAME_CAPTURE_POLL_INTERVAL);
     }
@@ -1039,6 +1083,14 @@ fn recover_adopted_token_name(log_path: &Path, sweep_id: &str) -> String {
     std::fs::read_to_string(log_path)
         .ok()
         .and_then(|contents| parse_token_name_after(&contents, &anchor))
+        .unwrap_or_else(|| UNKNOWN_TOKEN_NAME.to_string())
+}
+
+fn recover_adopted_runtime(log_path: &Path, sweep_id: &str) -> String {
+    let anchor = format!("sweep_id={sweep_id}");
+    std::fs::read_to_string(log_path)
+        .ok()
+        .and_then(|contents| parse_runtime_after(&contents, &anchor))
         .unwrap_or_else(|| UNKNOWN_TOKEN_NAME.to_string())
 }
 
@@ -1152,13 +1204,21 @@ const CLAUDE_CLI_START_MARKER: &str = "# CLAUDE_CLI_START";
 /// unreadable/missing log as `None`/"unknown" rather than calling this with
 /// an empty tail (mirrors how [`classify_crash`] is fed by its callers).
 fn classify_preflight_death(log_tail: &str) -> Option<&'static str> {
+    // Per-issue logs are append-only. Restrict both positive and absence-based
+    // classification to the newest dispatch so markers from a prior run
+    // cannot classify (or clear) the current run's pre-flight death.
+    let current_dispatch = log_tail
+        .rfind(DISPATCH_HEADER_MARKER)
+        .map_or(log_tail, |start| &log_tail[start..]);
     if let Some((label, _)) = preflight_death_signatures()
         .iter()
-        .find(|(_, re)| re.is_match(log_tail))
+        .find(|(_, re)| re.is_match(current_dispatch))
     {
         return Some(label);
     }
-    if !log_tail.contains(CLAUDE_CLI_START_MARKER) {
+    if !current_dispatch.contains(CLAUDE_CLI_START_MARKER)
+        && !current_dispatch.contains(CLI_START_MARKER)
+    {
         return Some("preflight-no-cli-start");
     }
     None
@@ -1342,8 +1402,8 @@ pub struct SweepRegistryConfig {
     /// Absolute path to the workspace root (parent of `.loom/`).
     pub workspace_root: PathBuf,
     /// Optional override for the spawn binary. Defaults to
-    /// `<workspace_root>/defaults/scripts/spawn-claude.sh` or, if absent,
-    /// `<workspace_root>/.loom/scripts/spawn-claude.sh`.
+    /// `<workspace_root>/.loom/scripts/spawn-worker.sh` or, if absent,
+    /// `<workspace_root>/defaults/scripts/spawn-worker.sh`.
     pub spawn_bin: Option<PathBuf>,
     /// Override the `gh` binary (for tests). Defaults to `gh` from `PATH`.
     pub gh_bin: Option<PathBuf>,
@@ -1383,20 +1443,22 @@ impl SweepRegistryConfig {
     /// Resolve the spawn binary, preferring (in order):
     /// 1. `spawn_bin` explicit override.
     /// 2. `LOOM_SWEEP_SPAWN_BIN` env var.
-    /// 3. `<workspace>/.loom/scripts/spawn-claude.sh`.
-    /// 4. `<workspace>/defaults/scripts/spawn-claude.sh`.
+    /// 3. `<workspace>/.loom/scripts/spawn-worker.sh`.
+    /// 4. `<workspace>/defaults/scripts/spawn-worker.sh`.
     pub fn resolve_spawn_bin(&self) -> Result<PathBuf> {
         if let Some(ref p) = self.spawn_bin {
             return Ok(p.clone());
         }
         if let Ok(path) = std::env::var(SPAWN_BIN_ENV) {
-            return Ok(PathBuf::from(path));
+            if !path.trim().is_empty() {
+                return Ok(PathBuf::from(path));
+            }
         }
         let installed = self
             .workspace_root
             .join(".loom")
             .join("scripts")
-            .join("spawn-claude.sh");
+            .join("spawn-worker.sh");
         if installed.exists() {
             return Ok(installed);
         }
@@ -1404,12 +1466,12 @@ impl SweepRegistryConfig {
             .workspace_root
             .join("defaults")
             .join("scripts")
-            .join("spawn-claude.sh");
+            .join("spawn-worker.sh");
         if defaults.exists() {
             return Ok(defaults);
         }
         Err(anyhow!(
-            "spawn-claude.sh not found under {} (looked in .loom/scripts and defaults/scripts; \
+            "spawn-worker.sh not found under {} (looked in .loom/scripts and defaults/scripts; \
              set {SPAWN_BIN_ENV} to override)",
             self.workspace_root.display()
         ))
@@ -2483,7 +2545,7 @@ impl SweepRegistry {
         // stagger (the default outside production / in tests) is a no-op.
         self.apply_dispatch_stagger();
         let log_path = self.compute_log_path(issue_number);
-        let (child, token_name) = self
+        let (child, token_name, runtime) = self
             .spawn_child(issue_number, &log_path, &sweep_id, model, effort, depends_on)
             .context("failed to spawn sweep child")?;
         let pid = child.id();
@@ -2514,6 +2576,7 @@ impl SweepRegistry {
             kind: kind.clone(),
             pid,
             token_name: token_name.clone(),
+            runtime,
             log_path: log_path.clone(),
             idempotency_key,
             started_at: Utc::now(),
@@ -3710,7 +3773,7 @@ impl SweepRegistry {
         model: Option<&str>,
         effort: Option<&str>,
         depends_on: Option<u32>,
-    ) -> Result<(Child, String)> {
+    ) -> Result<(Child, String, String)> {
         let spawn_bin = self.config.resolve_spawn_bin()?;
 
         // Ensure log dir exists.
@@ -3928,8 +3991,8 @@ impl SweepRegistry {
         // Falls back to `UNKNOWN_TOKEN_NAME` on timeout / no-selection — never
         // blocks or fails dispatch.
         let header_anchor = format!("sweep_id={sweep_id}");
-        let token_name = poll_token_name(&mut child, log_path, &header_anchor);
-        Ok((child, token_name))
+        let (token_name, runtime) = poll_observability(&mut child, log_path, &header_anchor);
+        Ok((child, token_name, runtime))
     }
 
     // ------------------------------------------------------------------------
@@ -5544,6 +5607,7 @@ impl SweepRegistry {
                 // to owner.sweep_id, to restore attribution before falling back
                 // to `unknown`. Degrades gracefully — adoption never fails here.
                 let token_name = recover_adopted_token_name(&log_path, &owner.sweep_id);
+                let runtime = recover_adopted_runtime(&log_path, &owner.sweep_id);
                 self.entries.insert(
                     owner.sweep_id.clone(),
                     SweepInfo {
@@ -5551,6 +5615,7 @@ impl SweepRegistry {
                         kind: SweepKind::Issue(issue),
                         pid: owner.owner_pid,
                         token_name,
+                        runtime,
                         log_path,
                         idempotency_key: None,
                         started_at,
@@ -5629,6 +5694,7 @@ impl SweepRegistry {
                         // lock was already removed as stale above), so this
                         // path legitimately stays `unknown`.
                         token_name: "unknown".to_string(),
+                        runtime: "unknown".to_string(),
                         log_path,
                         idempotency_key: None,
                         started_at: Utc::now(),
@@ -6309,6 +6375,33 @@ mod tests {
     use std::time::SystemTime;
     use tempfile::tempdir;
 
+    #[test]
+    #[serial]
+    fn resolve_spawn_bin_prefers_worker_install_then_source_tree() {
+        let dir = tempdir().unwrap();
+        let config = SweepRegistryConfig::new(dir.path().to_path_buf());
+        std::env::remove_var(SPAWN_BIN_ENV);
+
+        let defaults = dir.path().join("defaults/scripts/spawn-worker.sh");
+        std::fs::create_dir_all(defaults.parent().unwrap()).unwrap();
+        std::fs::write(&defaults, "# fixture\n").unwrap();
+        assert_eq!(config.resolve_spawn_bin().unwrap(), defaults);
+
+        let installed = dir.path().join(".loom/scripts/spawn-worker.sh");
+        std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
+        std::fs::write(&installed, "# fixture\n").unwrap();
+        assert_eq!(config.resolve_spawn_bin().unwrap(), installed);
+
+        let explicit = dir.path().join("explicit-worker");
+        let mut explicit_config = config.clone();
+        explicit_config.spawn_bin = Some(explicit.clone());
+        assert_eq!(explicit_config.resolve_spawn_bin().unwrap(), explicit);
+
+        std::env::set_var(SPAWN_BIN_ENV, "/tmp/loom-worker-override");
+        assert_eq!(config.resolve_spawn_bin().unwrap(), PathBuf::from("/tmp/loom-worker-override"));
+        std::env::remove_var(SPAWN_BIN_ENV);
+    }
+
     /// Install the `/loom:sweep` command marker under `workspace` (Issue
     /// #4027) so the workspace-commands guard in `dispatch()` treats it as
     /// initialized. Only tests that run with `skip_label_flip = false` need
@@ -6351,6 +6444,7 @@ mod tests {
                 kind: SweepKind::Issue(issue),
                 pid: 0,
                 token_name: "unknown".into(),
+                runtime: "unknown".into(),
                 log_path,
                 idempotency_key: None,
                 started_at: Utc::now(),
@@ -6999,6 +7093,7 @@ exit 0
                 kind: SweepKind::Issue(41_110),
                 pid,
                 token_name: "unknown".into(),
+                runtime: "unknown".into(),
                 log_path: registry.compute_log_path(41_110),
                 idempotency_key: None,
                 started_at: Utc::now(),
@@ -7115,6 +7210,7 @@ exit 0
                 kind: SweepKind::Issue(issue),
                 pid,
                 token_name: "unknown".into(),
+                runtime: "unknown".into(),
                 log_path: registry.compute_log_path(issue),
                 idempotency_key: None,
                 started_at: Utc::now(),
@@ -7817,6 +7913,7 @@ exit 0
                     kind: SweepKind::Issue(issue),
                     pid: 2_147_483_640,
                     token_name: "unknown".into(),
+                    runtime: "unknown".into(),
                     log_path: registry.compute_log_path(issue),
                     idempotency_key: None,
                     started_at: Utc::now(),
@@ -7861,6 +7958,7 @@ exit 0
                 kind: SweepKind::Issue(issue),
                 pid: 2_147_483_640,
                 token_name: "unknown".into(),
+                runtime: "unknown".into(),
                 log_path: PathBuf::from(format!(".loom/logs/sweep-issue-{issue}.log")),
                 idempotency_key: None,
                 started_at: Utc::now(),
@@ -8087,6 +8185,7 @@ exit 0
                 kind: SweepKind::Issue(issue),
                 pid: std::process::id(), // any live-looking pid; list() never probes liveness
                 token_name: "unknown".into(),
+                runtime: "unknown".into(),
                 log_path: registry.compute_log_path(issue),
                 idempotency_key: None,
                 started_at,
@@ -8294,6 +8393,7 @@ exit 0
                 kind: SweepKind::Issue(55),
                 pid: 2_147_483_640,
                 token_name: "unknown".into(),
+                runtime: "unknown".into(),
                 log_path: registry.compute_log_path(55),
                 idempotency_key: None,
                 started_at: Utc::now(),
@@ -8380,6 +8480,7 @@ exit 0
                 kind: SweepKind::Issue(57),
                 pid: 2_147_483_641,
                 token_name: "unknown".into(),
+                runtime: "unknown".into(),
                 log_path,
                 idempotency_key: None,
                 started_at: Utc::now(),
@@ -8439,6 +8540,7 @@ exit 0
                 kind: SweepKind::Issue(66),
                 pid: 2_147_483_640,
                 token_name: "unknown".into(),
+                runtime: "unknown".into(),
                 log_path: registry.compute_log_path(66),
                 idempotency_key: None,
                 started_at: Utc::now() - chrono::Duration::seconds(10),
@@ -8494,6 +8596,7 @@ exit 0
                 kind: SweepKind::Issue(21),
                 pid: 2_147_483_640, // ~i32::MAX, almost certainly dead
                 token_name: "unknown".into(),
+                runtime: "unknown".into(),
                 log_path: registry.compute_log_path(21),
                 idempotency_key: None,
                 started_at: Utc::now(),
@@ -8542,6 +8645,7 @@ exit 0
                 kind: SweepKind::Issue(issue),
                 pid: 2_147_483_640, // ~i32::MAX, almost certainly dead
                 token_name: "unknown".into(),
+                runtime: "unknown".into(),
                 log_path: registry.compute_log_path(issue),
                 idempotency_key: None,
                 started_at,
@@ -8714,6 +8818,14 @@ exit 0
                 "spawn-claude: dispatching\n# CLAUDE_CLI_START\nClaude: working on it\n"
             ),
             None
+        );
+        assert_eq!(
+            classify_preflight_death(
+                "==== loom-daemon dispatch: old ====\n\
+# LOOM_CLI_START runtime=codex\n\
+==== loom-daemon dispatch: current ====\nspawn-codex: preflight failed\n"
+            ),
+            Some("preflight-no-cli-start")
         );
     }
 
@@ -9818,6 +9930,7 @@ exit 0
                 kind: SweepKind::Issue(77),
                 pid: 2_147_483_640, // ~i32::MAX, almost certainly dead
                 token_name: "unknown".into(),
+                runtime: "unknown".into(),
                 log_path: registry.compute_log_path(77),
                 idempotency_key: None,
                 started_at: Utc::now(),
@@ -9934,6 +10047,7 @@ exit 0
                 kind: kind.clone(),
                 pid: 2_147_483_640, // ~i32::MAX, almost certainly dead
                 token_name: "unknown".into(),
+                runtime: "unknown".into(),
                 log_path: registry.compute_log_path(88),
                 idempotency_key: None,
                 started_at,
@@ -10072,6 +10186,7 @@ exit 0
                 kind: kind.clone(),
                 pid: 2_147_483_640,
                 token_name: "unknown".into(),
+                runtime: "unknown".into(),
                 log_path: registry.compute_log_path(99),
                 idempotency_key: None,
                 started_at,
@@ -10134,6 +10249,7 @@ exit 0
                 kind: kind.clone(),
                 pid: 2_147_483_640,
                 token_name: "unknown".into(),
+                runtime: "unknown".into(),
                 log_path: registry.compute_log_path(0),
                 idempotency_key: None,
                 started_at,
@@ -10179,6 +10295,7 @@ exit 0
                 kind: SweepKind::Issue(33),
                 pid: 2_147_483_640,
                 token_name: "unknown".into(),
+                runtime: "unknown".into(),
                 log_path: registry.compute_log_path(33),
                 idempotency_key: None,
                 started_at: Utc::now(),
@@ -10667,6 +10784,50 @@ exit 0
     }
 
     #[test]
+    fn neutral_observability_parser_is_current_dispatch_scoped() {
+        let log = "==== loom-daemon dispatch: old sweep_id=old ====\n\
+# LOOM_RUNTIME_RESOLVED runtime=claude\n# LOOM_ACCOUNT name=stale\n\
+==== loom-daemon dispatch: new sweep_id=new ====\n\
+# LOOM_RUNTIME_RESOLVED runtime=codex\n# LOOM_ACCOUNT name=codex-profile\n";
+        assert_eq!(parse_runtime_after(log, "sweep_id=new").as_deref(), Some("codex"));
+        assert_eq!(parse_token_name_after(log, "sweep_id=new").as_deref(), Some("codex-profile"));
+    }
+
+    #[test]
+    fn poll_observability_waits_for_current_account_after_stale_cli_start() {
+        let dir = tempdir().unwrap();
+        let log_path = dir.path().join("sweep.log");
+        let header_anchor = "sweep_id=current";
+        std::fs::write(
+            &log_path,
+            "==== loom-daemon dispatch: old sweep_id=old ====\n\
+# LOOM_CLI_START runtime=codex\n\
+==== loom-daemon dispatch: new sweep_id=current ====\n\
+# LOOM_RUNTIME_RESOLVED runtime=codex\n",
+        )
+        .unwrap();
+
+        let append_path = log_path.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            use std::io::Write;
+            let mut log = std::fs::OpenOptions::new()
+                .append(true)
+                .open(append_path)
+                .unwrap();
+            writeln!(log, "# LOOM_ACCOUNT name=current-profile").unwrap();
+        });
+        let mut child = Command::new("sleep").arg("1").spawn().unwrap();
+
+        let observed = poll_observability(&mut child, &log_path, header_anchor);
+
+        child.kill().ok();
+        child.wait().ok();
+        writer.join().unwrap();
+        assert_eq!(observed, ("current-profile".to_string(), "codex".to_string()));
+    }
+
+    #[test]
     fn parse_token_name_after_ignores_stale_line_before_current_header() {
         // A previous dispatch's selection line, then this dispatch's header
         // with NO selection line yet: must NOT return the stale name.
@@ -10772,6 +10933,7 @@ exit 0\n";
             kind: SweepKind::Issue(42),
             pid: 12_345,
             token_name: "agent-1.token".to_string(),
+            runtime: "unknown".into(),
             log_path: PathBuf::from(".loom/logs/sweep-issue-42.log"),
             idempotency_key: Some("operator-key".to_string()),
             started_at: chrono::DateTime::parse_from_rfc3339("2026-06-05T10:00:00Z")
@@ -10791,6 +10953,7 @@ exit 0\n";
             "kind": {"type": "Issue", "value": 42},
             "pid": 12_345,
             "token_name": "agent-1.token",
+            "runtime": "unknown",
             "log_path": ".loom/logs/sweep-issue-42.log",
             "idempotency_key": "operator-key",
             "started_at": "2026-06-05T10:00:00Z",
@@ -10824,6 +10987,7 @@ exit 0\n";
         // None (#[serde(default)]) and be omitted on re-serialization
         // (skip_serializing_if).
         assert_eq!(legacy.effort, None);
+        assert_eq!(legacy.runtime, "unknown");
         let reserialized = serde_json::to_value(&legacy).unwrap();
         assert!(
             reserialized.get("model").is_none(),
@@ -10884,6 +11048,7 @@ exit 0\n";
                 kind: SweepKind::Issue(42),
                 pid: 1234,
                 token_name: "agent-1.token".into(),
+                runtime: "unknown".into(),
                 log_path: registry.compute_log_path(42),
                 idempotency_key: None,
                 started_at: Utc::now(),
@@ -10924,6 +11089,7 @@ exit 0\n";
                 kind: SweepKind::Issue(99),
                 pid: 1,
                 token_name: "unknown".into(),
+                runtime: "unknown".into(),
                 log_path: log_path.clone(),
                 idempotency_key: None,
                 started_at: Utc::now(),
@@ -10983,6 +11149,7 @@ exit 0\n";
                 kind: SweepKind::Issue(11),
                 pid: 1,
                 token_name: "unknown".into(),
+                runtime: "unknown".into(),
                 log_path: registry.compute_log_path(11),
                 idempotency_key: None,
                 started_at: Utc::now(),
@@ -11026,6 +11193,7 @@ exit 0\n";
                 kind: SweepKind::Issue(22),
                 pid: 2_147_483_640, // ~i32::MAX, almost certainly dead
                 token_name: "unknown".into(),
+                runtime: "unknown".into(),
                 log_path: registry.compute_log_path(22),
                 idempotency_key: None,
                 started_at: Utc::now(),
@@ -11084,6 +11252,7 @@ exit 0\n";
                 kind: SweepKind::Issue(77),
                 pid,
                 token_name: "unknown".into(),
+                runtime: "unknown".into(),
                 log_path: registry.compute_log_path(77),
                 idempotency_key: None,
                 started_at: Utc::now(),
@@ -11161,6 +11330,7 @@ exit 0\n";
                     kind: SweepKind::Issue(880),
                     pid: target_pid,
                     token_name: "unknown".into(),
+                    runtime: "unknown".into(),
                     log_path: target_log,
                     idempotency_key: None,
                     started_at: Utc::now(),
@@ -11180,6 +11350,7 @@ exit 0\n";
                     kind: SweepKind::Issue(881),
                     pid: 2_147_483_640, // ~i32::MAX, harmless dead pid
                     token_name: "unknown".into(),
+                    runtime: "unknown".into(),
                     log_path: other_log,
                     idempotency_key: None,
                     started_at: Utc::now(),
@@ -11274,6 +11445,7 @@ exit 0\n";
                 kind: SweepKind::Issue(88),
                 pid: 2_147_483_640,
                 token_name: "unknown".into(),
+                runtime: "unknown".into(),
                 log_path: registry.compute_log_path(88),
                 idempotency_key: None,
                 started_at: Utc::now(),
@@ -11722,6 +11894,17 @@ exit 0\n";
     }
 
     #[test]
+    fn log_has_progress_ignores_codex_adapter_preamble() {
+        let log = "==== loom-daemon dispatch: t sweep_id=s issue=7 ====\n\
+# LOOM_RUNTIME_RESOLVED runtime=codex\n\
+[ts] spawn-worker: runtime=codex\n\
+[ts] spawn-codex: model=default\n\
+# LOOM_ACCOUNT name=profile-a\n";
+        assert!(!log_has_progress(log));
+        assert!(log_has_progress(&format!("{log}# LOOM_CLI_START runtime=codex\n")));
+    }
+
+    #[test]
     fn log_has_progress_true_when_claude_emits_output() {
         let log = "\n==== loom-daemon dispatch: 2026-07-23T00:00:00Z sweep_id=sweep-issue-1-1 issue=1 ====\n\
                    [2026-07-23T00:00:01Z] spawn-claude: using OAuth account 'agent-2' (mode=ranked)\n\
@@ -11888,6 +12071,7 @@ exit 0\n";
                 kind: SweepKind::Issue(issue),
                 pid: 2_147_483_640,
                 token_name: "unknown".into(),
+                runtime: "unknown".into(),
                 log_path: reg.compute_log_path(issue),
                 idempotency_key: None,
                 started_at: Utc::now(),
@@ -12063,6 +12247,7 @@ exit 0\n";
                 kind: SweepKind::Issue(6006),
                 pid: 2_147_483_640,
                 token_name: "unknown".into(),
+                runtime: "unknown".into(),
                 log_path: reg.compute_log_path(6006),
                 idempotency_key: None,
                 started_at: Utc::now(),
@@ -12392,6 +12577,7 @@ exit 0\n";
                 kind: SweepKind::Issue(6001),
                 pid: 2_147_483_640,
                 token_name: "unknown".into(),
+                runtime: "unknown".into(),
                 log_path: ws.join(".loom/logs/sweep-issue-6001.log"),
                 idempotency_key: None,
                 started_at: old,
@@ -12977,6 +13163,7 @@ exit 0\n";
                 kind: SweepKind::Issue(issue),
                 pid: 2_147_483_641,
                 token_name: "unknown".into(),
+                runtime: "unknown".into(),
                 log_path: reg.compute_log_path(issue),
                 idempotency_key: None,
                 started_at: Utc::now() - chrono::Duration::seconds(5),

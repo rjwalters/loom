@@ -313,6 +313,15 @@ assert_contains "-c model_reasoning_effort=high" "$out" \
 out="$(run_argv -- -p x)"
 assert_not_contains "model_reasoning_effort" "$out" \
     "no LOOM_EFFORT emits no reasoning-effort override"
+out="$(run_argv -- -p daemon --effort xhigh --dangerously-skip-permissions --use-wrapper)"
+assert_contains "-c model_reasoning_effort=xhigh" "$out" \
+    "daemon --effort maps to Codex reasoning config"
+assert_contains "-s workspace-write" "$out" \
+    "daemon unattended permissions map to workspace-write"
+assert_not_contains "--effort" "$out" \
+    "Claude-only --effort never reaches codex exec"
+assert_not_contains "--use-wrapper" "$out" \
+    "generic retry convention never reaches codex exec"
 out="$(run_argv LOOM_EFFORT=high -- -p x -c model_reasoning_effort=low)"
 assert_not_contains "model_reasoning_effort=high" "$out" \
     "an explicit -c model_reasoning_effort= wins over LOOM_EFFORT"

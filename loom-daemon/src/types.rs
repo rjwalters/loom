@@ -779,6 +779,11 @@ pub struct SweepInfo {
     /// "unknown" when not surfaced by the wrapper (Phase A logs this in
     /// the per-sweep log rather than recording it on the entry).
     pub token_name: String,
+    /// Runtime adapter selected for this dispatch (`claude`, `codex`, etc.).
+    /// Legacy entries and fixture adapters that do not emit the neutral
+    /// observability contract safely degrade to `unknown`.
+    #[serde(default = "default_sweep_runtime")]
+    pub runtime: String,
     /// Path to the per-sweep log file (relative to the workspace).
     pub log_path: PathBuf,
     /// Optional idempotency key supplied at dispatch.
@@ -842,6 +847,10 @@ pub struct SweepInfo {
     /// compatible.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
+}
+
+fn default_sweep_runtime() -> String {
+    "unknown".to_string()
 }
 
 // ========================================================================
