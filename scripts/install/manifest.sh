@@ -72,6 +72,7 @@ _read_loom_internal_skip_list() {
 #   .codex/X              → .codex/X        (literal)
 #   .github/X             → .github/X       (literal)
 #   CLAUDE.md             → CLAUDE.md
+#   AGENTS.md             → AGENTS.md
 #   loom.sh               → loom.sh
 #   package.json          → package.json    (only if target lacks one)
 #
@@ -202,7 +203,7 @@ _emit_installed_files_manifest() {
       .claude/*|.codex/*|.github/*)
         target_path="${rel_path}"
         ;;
-      CLAUDE.md|loom.sh)
+      CLAUDE.md|AGENTS.md|loom.sh)
         target_path="${rel_path}"
         ;;
       package.json)

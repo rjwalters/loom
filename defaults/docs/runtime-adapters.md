@@ -278,11 +278,15 @@ them from a single source so role/repo instructions never fork per-runtime.
 - **`CLAUDE.md`** is Claude Code's richer native format. Claude Code also reads
   `AGENTS.md`, but `CLAUDE.md` carries the full operating surface.
 
-Both are generated from one source (the fork's `AGENTS.md` codegen, fork PR #8,
-is the seed) so a new runtime that reads `AGENTS.md` gets correct instructions
-with no per-runtime prompt fork. An adapter declares its instruction-file set
-(e.g. Codex reads `AGENTS.md` + `.codex/` config); it must **not** introduce a
-per-runtime copy of the role prompts.
+Both derive from one source (#4479, seeded by the fork's `AGENTS.md` codegen,
+fork PR #8): `defaults/scripts/generate-agents-md.sh` extracts the
+`agents-md:include` marker ranges from `defaults/.loom/CLAUDE.md` and wraps them
+with dual-runtime framing, writing the checked-in `defaults/.loom/AGENTS.md`
+(CI `scripts/check-agents-md-sync.sh` fails if it is stale). So a new runtime
+that reads `AGENTS.md` gets correct instructions with no per-runtime prompt fork,
+and there is exactly one place a human edits the prose. An adapter declares its
+instruction-file set (e.g. Codex reads `AGENTS.md` + `.codex/` config); it must
+**not** introduce a per-runtime copy of the role prompts.
 
 ### 6. Permission / sandbox mapping
 
@@ -529,7 +533,7 @@ collaboration:
 | #15 | Codex runner | **1. Spawn** — Codex's `spawn-<runtime>.sh` implementation | **landed** as `defaults/scripts/spawn-codex.sh` (#4468). Ported, not cherry-picked: token-pool auth deferred to Phase 4, `--full-auto`/`-a` replaced (absent on `codex exec` 0.146.0), and the skip-permissions → sandbox mapping deliberately diverges (see the parity doc). |
 | #16 | `.codex/` config | **5. Instruction format** — Codex's config/instruction file set | not started (separate issue) |
 | #20, #40 | `GUARDRAIL-PARITY.md` guardrail parity | **6. Permission / sandbox mapping** — the parity-doc requirement | **landed** as [`guardrail-parity-codex.md`](guardrail-parity-codex.md) (#4468), re-verified against 0.146.0 — several fork claims no longer hold and are corrected there |
-| #8 | `AGENTS.md` codegen | **5. Instruction format** — single-source instruction generation | not started (separate issue) |
+| #8 | `AGENTS.md` codegen | **5. Instruction format** — single-source instruction generation | **landed** (#4479) as a *generator* (`defaults/scripts/generate-agents-md.sh`) that extracts `agents-md:include` ranges from `defaults/.loom/CLAUDE.md` — not the fork's hand-authored static file (that would violate this repo's single-source non-goal). CI `check-agents-md-sync.sh` keeps the checked-in `defaults/.loom/AGENTS.md` in sync; scaffolding installs the root pointer + `.loom/AGENTS.md` full guide. |
 | #12, #17 | Provider-aware account pool (per-account provider, waterfall fill, `CODEX_HOME` rotation) | **4. Usage accounting** — provider-aware selection consuming the pool signals | Phase 4. #4468 ships only single-profile `CODEX_HOME` passthrough — no pool, no rotation, no bad-token marking. |
 | #14 | Reusable CI role workflow (`loom-role.yml`) parameterized by runtime | Cross-cutting — the tier-2 CI gate every non-Claude adapter must pass | partially landed: Codex has its own `codex-adapter-smoke` leg in `ci.yml` (#4468); the parameterized reusable workflow is not adopted |
 | #59 | Finding: native Codex agents prohibited for Loom lifecycles | **6/7. Constraint** — encoded in the parity doc + capability matrix | **landed** — recorded as residual gap 9 in the parity doc; `codex.json` declares `subagents: "no"` |
