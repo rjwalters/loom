@@ -3035,8 +3035,14 @@ done
 
 `--dry-run` is deliberately forge-free (it reports intent from labels.yml alone
 and makes zero `gh` calls), so it also validates the parse and the NWO offline.
-`--repo` is GitHub-only — for a Gitea root, run `sync-labels.sh` from a checkout
-of that repo so the Gitea helpers can resolve a base URL and token.
+Because that means a dry run cannot tell a typo'd NWO apart from a repo that
+really exists, the **real** run preflights the named target with `gh repo view`
+before deleting anything and aborts if it is missing or read-only (#4524) —
+nothing is deleted when the preflight fails. `--repo` is GitHub-only — an
+explicitly configured Gitea forge rejects it, whether that comes from
+`LOOM_FORGE_TYPE=gitea` or `forge.type: gitea` in any config tier. For a Gitea
+root, run `sync-labels.sh` from a checkout of that repo so the Gitea helpers can
+resolve a base URL and token.
 
 **3. Refresh a stale install.** A root installed before the machine-level daemon
 model carries a committed file-copy of `.loom/` that **shadows** the machine
