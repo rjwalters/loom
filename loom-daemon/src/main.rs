@@ -29,7 +29,7 @@ use loom_daemon::workspace_pool::WorkspacePool;
 use loom_daemon::worktree_ops::{aggressive, clean};
 use loom_daemon::{extract_configured_terminal_ids, rotate_log_file};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use std::fs;
@@ -972,6 +972,11 @@ enum TokensAction {
         /// root when called from a worktree — no upward `.git` walk).
         #[arg(long, value_name = "PATH", default_value = ".")]
         workspace: String,
+
+        /// Account provider. The default preserves the legacy Claude token
+        /// selector and every one of its state formats.
+        #[arg(long, value_name = "PROVIDER", default_value = "claude")]
+        provider: String,
 
         /// Emit shell-evalable `export CLAUDE_CODE_OAUTH_TOKEN=...` /
         /// `export LOOM_TOKEN_NAME=...` lines (plus a non-exported
@@ -6326,17 +6331,59 @@ fn handle_forge_command(action: ForgeAction) -> Result<()> {
 /// file-based — does not require a running daemon. See
 /// `loom-daemon/src/tokens_pool/mod.rs` for the ported subset and what is
 /// deliberately deferred.
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 fn handle_tokens_command(action: TokensAction) -> Result<()> {
     use loom_daemon::tokens_pool::{allowlist, bad_tokens, failure_counts, select};
 
     match action {
         TokensAction::Select {
             workspace,
+            provider,
             export,
             no_key,
             auto_unpin,
         } => {
             let ws = resolve_tokens_workspace(&workspace)?;
+            if provider == "codex" {
+                let selected = loom_daemon::tokens_pool::select_account(
+                    &ws,
+                    loom_daemon::tokens_pool::AccountProvider::Codex,
+                )
+                .map_err(|error| anyhow!(error))?;
+                let directory = match &selected.binding {
+                    loom_daemon::tokens_pool::AccountBinding::CodexHome { directory } => directory,
+                    _ => unreachable!("Codex selection returned a non-Codex binding"),
+                };
+                if export {
+                    println!(
+                        "export CODEX_HOME={}",
+                        shell_single_quote(&directory.display().to_string())
+                    );
+                    println!(
+                        "export LOOM_ACCOUNT_PROVIDER='codex'\nexport LOOM_ACCOUNT_NAME={}",
+                        shell_single_quote(&selected.id.name)
+                    );
+                    println!("LOOM_TOKEN_MODE='{}'", selected.mode);
+                } else {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "provider": "codex",
+                            "name": selected.id.name,
+                            "credential_kind": "codex_home",
+                            "credential_reference": directory,
+                            "mode": selected.mode,
+                        })
+                    );
+                }
+                return Ok(());
+            }
+            if provider != "claude" {
+                bail!("invalid provider {provider:?}; expected claude or codex");
+            }
             if auto_unpin {
                 if let Some(msg) = loom_daemon::tokens_pool::maybe_auto_unpin(&ws) {
                     eprintln!("{msg}");

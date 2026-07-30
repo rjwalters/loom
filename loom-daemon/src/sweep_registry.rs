@@ -56,6 +56,7 @@ use crate::peer_claims::{self, ClaimAd, PeerClaimView};
 use crate::quarantine_reconciliation;
 use crate::sweep_journal;
 use crate::tokens_pool::bad_tokens;
+use crate::tokens_pool::{self, AccountId, AccountProvider, TerminalClassification};
 use crate::types::{Event, SweepId, SweepInfo, SweepKind, SweepOutcome, SweepState};
 
 use anyhow::{anyhow, Context, Result};
@@ -390,6 +391,56 @@ const TOKEN_NAME_LOG_MARKER: &str = "using OAuth account '";
 const ACCOUNT_LOG_MARKER: &str = "# LOOM_ACCOUNT name=";
 const RUNTIME_LOG_MARKER: &str = "# LOOM_RUNTIME_RESOLVED runtime=";
 const CLI_START_MARKER: &str = "# LOOM_CLI_START";
+const TERMINAL_RESULT_MARKER: &str = "# LOOM_TERMINAL_RESULT ";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TerminalResult {
+    provider: AccountProvider,
+    account: String,
+    category: TerminalClassification,
+    exit_code: i32,
+}
+
+/// Parse the adapter's strict v1 record from only the current dispatch region.
+/// Unknown fields, duplicate records, malformed identities, and unknown
+/// categories all fail closed: no account health is mutated.
+fn parse_terminal_result_after(contents: &str, header_anchor: &str) -> Option<TerminalResult> {
+    let region = &contents[contents.rfind(header_anchor)?..];
+    let records: Vec<_> = region
+        .lines()
+        .filter(|line| line.starts_with(TERMINAL_RESULT_MARKER))
+        .collect();
+    if records.len() != 1 {
+        return None;
+    }
+    let fields: HashMap<_, _> = records[0][TERMINAL_RESULT_MARKER.len()..]
+        .split_ascii_whitespace()
+        .filter_map(|field| field.split_once('='))
+        .collect();
+    if fields.len() != 5 || fields.get("v") != Some(&"1") {
+        return None;
+    }
+    let provider = match *fields.get("provider")? {
+        "claude" => AccountProvider::Claude,
+        "codex" => AccountProvider::Codex,
+        _ => return None,
+    };
+    let account = fields.get("account")?.to_string();
+    if account == UNKNOWN_TOKEN_NAME
+        || account.is_empty()
+        || !account
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        return None;
+    }
+    Some(TerminalResult {
+        provider,
+        account,
+        category: fields.get("category")?.parse().ok()?,
+        exit_code: fields.get("exit_code")?.parse().ok()?,
+    })
+}
 
 /// Issue #3802: how long `spawn_child` polls the per-sweep log for the
 /// `TOKEN_NAME_LOG_MARKER` line before giving up and recording
@@ -3223,6 +3274,44 @@ impl SweepRegistry {
         self.record_terminal_outcome(issue, insta_crash);
     }
 
+    /// Persist provider health before any reaper retry/failover decision.
+    fn apply_provider_health_feedback(&self, sweep_id: &SweepId, exit_code: Option<i32>) {
+        let Some(info) = self.entries.get(sweep_id) else {
+            return;
+        };
+        if info.runtime != "codex" || info.token_name == UNKNOWN_TOKEN_NAME {
+            return;
+        }
+        let Ok(contents) = std::fs::read_to_string(&info.log_path) else {
+            return;
+        };
+        let anchor = format!("sweep_id={sweep_id}");
+        let Some(result) = parse_terminal_result_after(&contents, &anchor) else {
+            return;
+        };
+        if result.provider != AccountProvider::Codex
+            || result.account != info.token_name
+            || exit_code.is_some_and(|code| code != result.exit_code)
+        {
+            log::warn!("sweep_registry: ignored mismatched Codex terminal feedback for {sweep_id}");
+            return;
+        }
+        let id = AccountId {
+            provider: result.provider,
+            name: result.account,
+        };
+        if let Err(error) = tokens_pool::record_terminal(
+            &self.config.workspace_root,
+            &id,
+            result.category,
+            "spawn-codex:v1",
+        ) {
+            log::warn!(
+                "sweep_registry: failed to persist Codex terminal feedback for {sweep_id}: {error}"
+            );
+        }
+    }
+
     /// Classify whether an insta-crash death was caused by account exhaustion
     /// (#4122).
     ///
@@ -4431,6 +4520,9 @@ impl SweepRegistry {
             // handle fall back to the `kill(pid, 0)` probe.
             let (is_dead, exit_code) = self.poll_liveness(&sweep_id, pid);
             if is_dead {
+                // #4493: account health must be updated before any bounded
+                // re-dispatch path below asks the selector for another profile.
+                self.apply_provider_health_feedback(&sweep_id, exit_code);
                 {
                     changes += 1;
                     let issue = match &kind {
@@ -10977,6 +11069,40 @@ exit 0
 
         let pr = generate_sweep_id(&SweepKind::PrSet(vec![10, 20]));
         assert!(pr.starts_with("sweep-prs-10-20-"));
+    }
+
+    #[test]
+    fn terminal_result_parser_is_anchored_strict_and_provider_aware() {
+        let log = "\
+sweep_id=old
+# LOOM_TERMINAL_RESULT v=1 provider=codex account=stale category=TOKEN_EXPIRED exit_code=1
+sweep_id=current
+# LOOM_TERMINAL_RESULT v=1 provider=codex account=profile-a category=TOKEN_EXHAUSTED exit_code=42
+";
+        assert_eq!(
+            parse_terminal_result_after(log, "sweep_id=current"),
+            Some(TerminalResult {
+                provider: AccountProvider::Codex,
+                account: "profile-a".into(),
+                category: TerminalClassification::TokenExhausted,
+                exit_code: 42,
+            })
+        );
+        assert!(parse_terminal_result_after(
+            "sweep_id=current\n# LOOM_TERMINAL_RESULT v=9 provider=codex account=a category=SUCCESS exit_code=0",
+            "sweep_id=current"
+        )
+        .is_none());
+        assert!(parse_terminal_result_after(
+            "sweep_id=current\n# LOOM_TERMINAL_RESULT v=1 provider=codex account=unknown category=SUCCESS exit_code=0",
+            "sweep_id=current"
+        )
+        .is_none());
+        assert!(parse_terminal_result_after(
+            "sweep_id=current\n# LOOM_TERMINAL_RESULT v=1 provider=codex account=a category=BOGUS exit_code=1",
+            "sweep_id=current"
+        )
+        .is_none());
     }
 
     #[test]

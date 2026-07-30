@@ -67,6 +67,7 @@ pub mod bad_tokens;
 pub mod bootstrap;
 pub mod check;
 pub mod failure_counts;
+pub mod health;
 pub mod locking;
 pub mod monitor;
 pub mod monitor_db;
@@ -78,6 +79,10 @@ pub mod select;
 pub use account_registry::{
     account_inventory, select_account, AccountBinding, AccountDescriptor, AccountId,
     AccountProvider, CredentialKind, InventoryProvenance, SelectedAccount,
+};
+pub use health::{
+    account_health, clear_reauth, provider_capacity_at, record_terminal, select_healthy_at,
+    AccountHealth, HealthReason, NoHealthyAccountError, ProviderCapacity, TerminalClassification,
 };
 pub use select::{EmptyTokenPoolError, SelectedToken, EX_CONFIG};
 

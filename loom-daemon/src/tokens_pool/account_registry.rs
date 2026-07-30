@@ -324,10 +324,9 @@ pub fn select_account(workspace: &Path, provider: AccountProvider) -> Result<Sel
             })
         }
         AccountProvider::Codex => {
-            let descriptor = account_inventory(workspace, provider)?
-                .into_iter()
-                .find(|account| account.enabled)
-                .ok_or_else(|| anyhow!("no enabled Codex profiles are available"))?;
+            let inventory = account_inventory(workspace, provider)?;
+            let descriptor =
+                super::health::select_healthy_at(workspace, provider, &inventory, epoch_now())?;
             Ok(SelectedAccount {
                 id: descriptor.id,
                 binding: AccountBinding::CodexHome {
@@ -337,6 +336,13 @@ pub fn select_account(workspace: &Path, provider: AccountProvider) -> Result<Sel
             })
         }
     }
+}
+
+fn epoch_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 #[cfg(test)]
