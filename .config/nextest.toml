@@ -2,10 +2,11 @@
 #
 # WHY THIS FILE EXISTS
 #
-# CI runs the Rust suite with `cargo nextest run --workspace`, which executes
-# every test in its **own process**. That is deliberate: the daemon's unit tests
-# mutate the process environment (`std::env::set_var` / `remove_var`) in ~600
-# places while other tests in the same binary `Command::spawn` child processes.
+# The Rust suite is meant to run as `cargo nextest run --workspace`, which
+# executes every test in its **own process**. That is deliberate: the daemon's
+# unit tests mutate the process environment (`std::env::set_var` /
+# `remove_var`) at 774 call sites, while other tests in the same binary
+# `Command::spawn` child processes.
 # `Command::spawn` reads the process environ non-atomically, so an env mutation
 # racing a spawn can corrupt a child's environment mid-flight — the cause of the
 # 2026-07-29 CI flakes in `pipeline_snapshot` (PR #4305) and
@@ -24,18 +25,20 @@
 # See `loom-daemon/src/lib.rs` (crate-level "Test isolation convention" docs) for
 # the author-facing version of this contract.
 #
-# ONE OPERATOR STEP STILL OUTSTANDING (2026-07-30, #4385)
+# ONE OPERATOR STEP STILL OUTSTANDING -> #4559 (2026-07-30, #4385)
 #
 # The `backend-tests` job in `.github/workflows/ci.yml` still invokes plain
-# `cargo test --workspace`. Flipping it to nextest could not be committed here:
-# GitHub refuses any push or Contents-API write that touches
-# `.github/workflows/**` unless the credential carries the `workflow` scope
-# (fine-grained PATs: "Workflows: write"), and the automation account's token does
-# not. The exact replacement hunk is in the PR that introduced this file; a
-# maintainer with `gh auth refresh -s workflow` applies it in one commit. Until
-# then everything in this file is live for local `cargo nextest run` only, and CI
-# remains exposed to the race described above. Delete this block once the job is
-# switched.
+# `cargo test --workspace`, so CI is still exposed to the race described above and
+# this file is live for local `cargo nextest run` only. Flipping the job could not
+# be committed with #4385: GitHub refuses any push *or* Contents-API write that
+# touches `.github/workflows/**` unless the credential carries the `workflow` scope
+# (fine-grained PAT: "Workflows: write"), and the automation account's token does
+# not (both paths were tried and rejected — see #4559 for the transcripts and the
+# exact two-hunk replacement). A maintainer with `gh auth refresh -s workflow`
+# applies it in one commit.
+#
+# When that lands, delete this block *and* the matching `<div class="warning">`
+# note in `loom-daemon/src/lib.rs`'s crate docs in the same commit.
 
 nextest-version = "0.9.98"
 
