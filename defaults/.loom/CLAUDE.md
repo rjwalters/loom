@@ -354,6 +354,7 @@ concurrency errors are covered in
 - **Configuration**: `.loom/config.json` (your local terminal setup)
 - **Scripts**: `.loom/scripts/` (worktree, merge, daemon, token-pool helpers)
 - **GitHub Labels**: `.github/labels.yml`
+- **Issue Template Workflow**: [`.github/CONFIGURATION.md`](.github/CONFIGURATION.md)
 - **Docs**: [daemon-reference](.loom/docs/daemon-reference.md) ·
   [build-gate](.loom/docs/build-gate.md) ·
   [troubleshooting](.loom/docs/troubleshooting.md) ·
