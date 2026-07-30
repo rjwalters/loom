@@ -332,8 +332,9 @@ CLAIMED_AT=$(gh api "repos/{owner}/{repo}/issues/$N/timeline" --paginate \
 MARKER="<!-- loom:standdown claim=$CLAIMED_AT -->"
 COMMENTS_JSON=$(gh api "repos/{owner}/{repo}/issues/$N/comments" \
   | jq --arg t "$CLAIMED_AT" '[.[] | select(.created_at > $t)]')
-COMMENTS_AFTER=$(echo "$COMMENTS_JSON" | jq --arg m "$MARKER" '[.[] | select(.body | contains($m) | not)] | length')
-STANDDOWN_COUNT=$(echo "$COMMENTS_JSON" | jq --arg m "$MARKER" '[.[] | select(.body | contains($m))] | length')
+# printf, not echo: zsh's echo interprets \n escapes inside the JSON, corrupting it
+COMMENTS_AFTER=$(printf '%s\n' "$COMMENTS_JSON" | jq --arg m "$MARKER" '[.[] | select(.body | contains($m) | not)] | length')
+STANDDOWN_COUNT=$(printf '%s\n' "$COMMENTS_JSON" | jq --arg m "$MARKER" '[.[] | select(.body | contains($m))] | length')
 ```
 
 Then decide:
