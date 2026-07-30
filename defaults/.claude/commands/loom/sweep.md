@@ -63,7 +63,54 @@ Run this query **once at the start of Mode B label-token validation** and reuse 
 
 If a label token in the description is not in the repo's actual label set, **do not** silently fabricate a `--label <name>` filter — ask the user to clarify which existing label they meant, or supply explicit issue numbers.
 
-**Offline fallback.** If `gh label list` fails (non-zero exit — network outage, auth failure, rate limit), fall back to consulting `.github/labels.yml` and log a warning to stderr (e.g., `warning: gh label list failed, falling back to .github/labels.yml (Loom-managed subset only)`). This keeps the skill functional in offline or restricted environments. Note that `.github/labels.yml` is only the Loom-managed subset, so the fallback may produce false "unknown-label" rejections for labels added via the GitHub UI, Dependabot, or other project conventions; this is the trade-off for offline operation.
+**Offline fallback.** If `gh label list` fails (non-zero exit — network outage, auth failure, rate limit), fall back to consulting `.github/labels.yml` and log a warning to stderr (e.g., `warning: gh label list failed, falling back to .github/labels.yml (Loom-managed subset only)`). This keeps the skill functional in offline or restricted environments. Note that `.github/labels.yml` is only the Loom-managed subset, so the fallback may produce false "unknown-label" rejections for labels added via the GitHub UI, Dependabot, or other project conventions; this is the trade-off for offline operation. **When the failure is specifically a rate-limit rejection, this is the *last* rung, not the first** — try the REST label read described under "GraphQL-exhaustion fallback" below and drop to `.github/labels.yml` only if REST fails too, so a healthy REST budget still yields the complete live label set.
+
+**GraphQL-exhaustion fallback (REST issue discovery, #4670).** `gh issue list`, `gh pr list`, and `gh label list` are **GraphQL**-backed; `gh api repos/{owner}/{repo}/…` is **REST**. The two draw on **independent quotas** — confirmed live during the #4526 incident and again in the `/loom:sweep` run that filed #4670, where GraphQL was exhausted while >4,500 REST core requests were still available. So a candidate-resolution failure that is *specifically* a rate-limit rejection must be re-issued over REST rather than aborting the sweep. The full degradation ladder for Mode B is **GraphQL → REST → (labels only) `.github/labels.yml`**.
+
+1. **Detect exhaustion — reuse the existing signature table, do not derive a new one.** Capture the failing call's output with stderr merged (`2>&1`), lowercase it, and treat the failure as quota exhaustion **only** when it contains one of these five signatures. This is exactly the table `defaults/scripts/check-duplicate.sh`'s `is_rate_limit_error()` implements, itself mirrored from `loom-daemon/src/rate_limit_breaker.rs`'s `RATE_LIMIT_SIGNATURES` — the repo's tested ground truth for what `gh` actually prints:
+
+   | Signature (match case-insensitively) | Seen as |
+   |---|---|
+   | `api rate limit exceeded` | REST: `HTTP 403: API rate limit exceeded for …` |
+   | `api rate limit already exceeded` | GraphQL: `GraphQL: API rate limit already exceeded for user ID …` |
+   | `secondary rate limit` | either transport, burst throttling |
+   | `abuse detection mechanism` | either transport, burst throttling |
+   | `was submitted too quickly` | either transport, burst throttling |
+
+   The GraphQL and REST phrasings are **not** substrings of each other — the word `already` breaks the contiguous `api rate limit exceeded` match — which is why both are listed. Matching one substring is not enough.
+
+   **Anything else is NOT exhaustion — keep today's fail-safe behavior.** An auth failure (`gh auth status` expired, missing `GH_TOKEN` scope), a DNS/network error, an HTTP 404 on a mistyped repo, a rejected flag: report the error verbatim, do **not** retry over REST, and EXIT without spawning any agent. A blind REST retry on an auth failure just fails again with a more confusing message and buries the real cause. Never infer exhaustion from a bare non-zero exit code.
+
+2. **Resolve the repository locally — never with another GraphQL call.** Do **not** call `gh repo view --json nameWithOwner` to learn owner/repo: that call is itself GraphQL-backed, so under GraphQL exhaustion it fails *before* any REST fallback is attempted (#4659 fixed this exact bug in `check-duplicate.sh`). Two supported forms, both free of API calls:
+   - Preferred: write the endpoint with the literal `{owner}/{repo}` placeholder — `gh api "repos/{owner}/{repo}/issues?…"` — and let `gh` expand it locally from the git remote.
+   - When the literal `owner/repo` string is needed (log lines, `-R` flags): parse `git remote get-url origin`, strip a trailing `.git` and/or `/`, and take the final two `/`- or `:`-delimited segments (works for both the SSH `git@host:owner/repo.git` and HTTPS `https://host/owner/repo` forms) — the same parse `check-duplicate.sh`'s `get_repo_nwo()` performs.
+
+3. **Re-issue the query as a paginated REST listing.** Translate the Mode B flags you had derived:
+
+   | `gh issue list` flag | REST equivalent on `repos/{owner}/{repo}/issues` |
+   |---|---|
+   | `--state open` (default) | `state=open` (`--state all` → `state=all`; `--state closed` → `state=closed`) |
+   | `--label loom:issue` (repeatable) | `labels=loom:issue,loom:curated` — comma-separated is AND, matching repeated `--label` |
+   | `--author rjwalters` | `creator=rjwalters` (`@me` → resolve the login first with `gh api user --jq .login`, itself REST) |
+   | `--assignee X` | `assignee=X` |
+   | `--limit 100` | `per_page=100` plus `--paginate`, then truncate client-side to the requested limit |
+   | `--json number,title,labels,updatedAt` | already present in the REST payload — project with `--jq` (`updatedAt` is `updated_at`) |
+   | `--search "…"` | **not expressible** on `/issues`; use `gh api "search/issues?q=repo:{owner}/{repo}+…"` (REST search, its own 30/min quota) or ask the operator to narrow to flags / explicit issue numbers |
+
+   ```bash
+   "$GH_READ" api --paginate "repos/{owner}/{repo}/issues?state=open&labels=loom:issue&per_page=100" \
+     --jq '[.[] | select(.pull_request == null) | {number, title, labels: [.labels[].name], updatedAt: .updated_at}]'
+   ```
+
+   Candidate resolution is an observation read, so the REST retry routes through `$GH_READ` exactly like the GraphQL call it replaces (the wrapper caches `gh api` GETs too and degrades to plain `gh api` when absent). The **uncached carve-outs** listed under "Cached forge reads (`gh-cached`)" — claim arbitration, Mode C's C0 pre-flight, merge gating — stay on plain `gh api` if they need this fallback.
+
+   **`/issues` returns pull requests too.** GitHub's REST issue endpoint includes PRs; drop them with `select(.pull_request == null)` (what `check-duplicate.sh` does) or Mode B will resolve PR numbers as issue candidates.
+
+4. **Preserve every Mode B safeguard — this is a transport substitution, not a policy change.** Deduplicate the resulting numbers (preserve first-seen order) and union them with any explicit numeric tokens exactly as on the GraphQL path; keep the **explicit limit** (never rely on REST's default `per_page=30`, mirroring this skill's explicit-`--limit` convention); and apply the same edge-case rules — zero matches → print the resolved REST query and its empty result, then EXIT cleanly (edge case #1); results at the cap → warn that the set was truncated and ask the operator to narrow before proceeding (edge case #2). Because `--paginate` walks past the cap, the truncation point is now a client-side decision: state the cap you applied in that warning.
+
+5. **Announce the degradation.** Log one warning to stderr (e.g. `warning: gh issue list rate-limited (GraphQL quota exhausted), falling back to REST via gh api`) and repeat it above the candidate set shown at the confirmation gate, so the operator knows the plan was resolved over the fallback path.
+
+6. **Label validation degrades on the same ladder.** `gh label list` is GraphQL-backed, so under exhaustion the unknown-label guard goes `gh label list` → `"$GH_READ" api --paginate "repos/{owner}/{repo}/labels?per_page=100" --jq '.[].name'` (the live, complete label set — preferred) → `.github/labels.yml` (the "Offline fallback" above; Loom-managed subset only, so false "unknown-label" rejections are possible). Drop to the YAML only when the REST read also fails. **The unknown-label safety rule is unchanged at every rung**: never fabricate a `--label <name>` filter for a label you could not verify — ask the operator to clarify or supply explicit issue numbers.
 
 ### Mode C — PR-set mode (back half of the lifecycle: Judge → Doctor → Merge)
 
@@ -100,6 +147,24 @@ When uncertain whether the description means issues or PRs (e.g., `/loom:sweep a
 | "in the last week" / "from the last N days" | `--search "created:>=YYYY-MM-DD"` (compute the date) |
 
 Combine flags as needed. Always pass `--state open` explicitly (Mode C operates exclusively on open PRs — closed/merged PRs are skipped). Default to `--limit 100` rather than the `gh` default of `30` to avoid silent truncation. The same **unknown-label guard** (one `gh label list` call per invocation, with `.github/labels.yml` offline fallback) applies to PR labels too — PR and issue labels are in the same repo-wide label set.
+
+**GraphQL-exhaustion fallback (REST PR discovery, #4670).** `gh pr list` is GraphQL-backed and fails under the same quota exhaustion as `gh issue list`. Mode C uses the **identical ladder** documented in Mode B's "GraphQL-exhaustion fallback" — same five-signature detection table (`api rate limit exceeded` / `api rate limit already exceeded` / `secondary rate limit` / `abuse detection mechanism` / `was submitted too quickly`, matched case-insensitively against `2>&1` output), same rule that **any other failure — auth, network, 404 — is not exhaustion** and must fail safe with the error reported and no agents spawned, and the same local repo resolution (`gh api "repos/{owner}/{repo}/…"` placeholder expansion, or parsing `git remote get-url origin`; **never** `gh repo view --json nameWithOwner`, which is itself GraphQL-backed — #4659). Only the endpoint and the flag mapping differ:
+
+| `gh pr list` flag | REST equivalent on `repos/{owner}/{repo}/pulls` |
+|---|---|
+| `--state open` (mandatory in Mode C) | `state=open` |
+| `--limit 100` | `per_page=100` plus `--paginate`, truncated client-side to the requested limit |
+| `--json number,title,labels` | `number`, `title`, and `labels[].name` are all in the list payload — project with `--jq` |
+| `--label loom:review-requested` | **no `labels=` parameter on `/pulls`** — filter client-side on the payload's `labels[].name` (below), or list via `repos/{owner}/{repo}/issues?labels=…&state=open` and keep only entries where `.pull_request != null` |
+| `--author rjwalters` / `@me` | no `creator=` parameter on `/pulls` either — filter client-side on `.user.login` (resolve `@me` with `gh api user --jq .login`) |
+| `--search "…"` | not expressible; use `gh api "search/issues?q=repo:{owner}/{repo}+is:pr+…"` or ask the operator for explicit PR numbers |
+
+```bash
+"$GH_READ" api --paginate "repos/{owner}/{repo}/pulls?state=open&per_page=100" \
+  --jq '[.[] | {number, title, labels: [.labels[].name]} | select(.labels | index("loom:review-requested"))]'
+```
+
+All Mode C safeguards carry over unchanged: deduplicate the resulting PR numbers (preserve first-seen order), keep the explicit limit (never REST's default `per_page=30`), apply the zero-match (print query + empty result, EXIT cleanly) and truncation-warning edge cases, **display the candidate set and await confirmation before spawning any agents**, and log the degradation to stderr (e.g. `warning: gh pr list rate-limited (GraphQL quota exhausted), falling back to REST via gh api`) plus above the confirmation-gate listing. The unknown-label guard degrades on the same GraphQL → REST (`repos/{owner}/{repo}/labels`) → `.github/labels.yml` ladder as Mode B. Note that only **candidate discovery** may be served from `$GH_READ`; Mode C's C0 per-PR pre-flight is a deliberately uncached live routing read (see "Cached forge reads (`gh-cached`)") — if it too hits GraphQL exhaustion, its REST equivalent is plain `gh api "repos/{owner}/{repo}/pulls/<N>"` (plus `repos/{owner}/{repo}/issues/<N>` for the label set), never a cached read.
 
 **Mode C validation rules:**
 
@@ -162,7 +227,7 @@ Combine flags as needed. Always pass `--state open` explicitly (Mode C operates 
     ```bash
     "$GH_READ" issue list --state open --limit 100 --json number,title,labels,updatedAt
     ```
-    Every open issue is a candidate regardless of label — promotion, unblocking, stale-claim recovery, and epic fan-out happen per-issue per the "Aggressive candidate taxonomy" table below, not by pre-filtering the query (`updatedAt` feeds the staleness rule). `$GH_READ` is the cached-read wrapper (see "Cached forge reads (`gh-cached`)"); candidate resolution is a pure observation read — every claim decision is re-made from an **uncached** per-issue pre-flight read in Wave Lifecycle step 1, so a 30s-old listing cannot cause a stale claim. Pass `--limit 100` explicitly (never rely on gh's default of 30) and apply the existing **edge-case rules**: zero matches → print the resolved query + empty result and EXIT cleanly (edge case #1, do **not** fall through to any other mode); 100 candidates returned → warn about truncation and ask the operator to narrow (or deliberately raise `--limit`) before proceeding (edge case #2).
+    Every open issue is a candidate regardless of label — promotion, unblocking, stale-claim recovery, and epic fan-out happen per-issue per the "Aggressive candidate taxonomy" table below, not by pre-filtering the query (`updatedAt` feeds the staleness rule). `$GH_READ` is the cached-read wrapper (see "Cached forge reads (`gh-cached`)"); candidate resolution is a pure observation read — every claim decision is re-made from an **uncached** per-issue pre-flight read in Wave Lifecycle step 1, so a 30s-old listing cannot cause a stale claim. Pass `--limit 100` explicitly (never rely on gh's default of 30) and apply the existing **edge-case rules**: zero matches → print the resolved query + empty result and EXIT cleanly (edge case #1, do **not** fall through to any other mode); 100 candidates returned → warn about truncation and ask the operator to narrow (or deliberately raise `--limit`) before proceeding (edge case #2). If this call fails with a rate-limit signature, re-issue it over REST per Mode B's "GraphQL-exhaustion fallback" (`repos/{owner}/{repo}/issues?state=open&per_page=100`, PRs filtered out) — the sentinel's query is a `gh issue list` like any other.
   - **Orphaned-claim recovery pass (run once, AFTER the confirmation gate, before per-issue pre-flight)** — reclaim `loom:building` labels left behind by dead workers so stale claims don't mask buildable issues:
     ```bash
     ./.loom/scripts/recover-orphaned-shepherds.sh --recover
@@ -172,7 +237,7 @@ Combine flags as needed. Always pass `--state open` explicitly (Mode C operates 
     ```bash
     "$GH_READ" pr list --state open --limit 100 --json number,title,labels
     ```
-    Mode C's C0 pre-flight already skips PRs with no actionable label, `loom:operator-only`, or `loom:blocked`, and routes the rest by current label (Judge / Doctor → Judge / Merge) — so grabbing every open PR and letting C0 filter matches the "get every in-flight PR over the finish line" intent. Same zero-match / truncation edge-case rules apply.
+    Mode C's C0 pre-flight already skips PRs with no actionable label, `loom:operator-only`, or `loom:blocked`, and routes the rest by current label (Judge / Doctor → Judge / Merge) — so grabbing every open PR and letting C0 filter matches the "get every in-flight PR over the finish line" intent. Same zero-match / truncation edge-case rules apply, and the same rate-limit fallback: on a rate-limit signature, re-issue over REST per Mode C's "GraphQL-exhaustion fallback" (`repos/{owner}/{repo}/pulls?state=open&per_page=100`).
   - **Existing-PR routing (issues path)**: the sentinel adds **no** new PR-detection logic. Issues with an open linked PR are handed to the wave machinery, which routes an issue with one open linked PR to Judge (or Merge if the PR is already `loom:pr`) via the per-issue existing-PR probe (Wave Lifecycle step 1, #3359 + #3677 — the union of `closedByPullRequestsReferences` filtered to `state == OPEN` and timeline `cross-referenced` open-PR events, so a non-closing `Part of #N` PR is detected too). This is the single source of truth for existing-PR routing and **takes precedence over the label routing** in the taxonomy table (an issue with an open PR is driven to merge, never rebuilt).
   - **Mandatory confirmation gate**: the sentinel path **always** displays the resolved candidate set (with the per-issue planned action from the taxonomy table) and awaits operator confirmation before spawning any agent — identical to Mode B/C's "display candidate set before spawning any agents" rule. A whole-backlog sweep must never auto-dispatch silently. Declining EXITs cleanly. **When the resolved plan has an unavoidable same-file overlap** (more overlapping candidates than waves to spread them across — see "Overlap-aware wave partitioning"), print the overlap warning **above** the candidate listing, naming the shared files and the specific candidates, so the operator can reorder or drop to `--builders-per-wave 1` before confirming.
   - **Flag composition**: `--dry-run` resolves the candidate set, prints the standard issue-set (or PR-set) dry-run plan with wave grouping + the aggressive per-issue actions, and EXITs with no mutation (the Stage-0 dry-run contract is backend-independent — the orphaned-claim recovery pass is skipped under `--dry-run`). `--builders-per-wave N` and `--no-daemon` compose with the wave / Stage -1 machinery exactly as for Mode A/B. Stage -1 backend detection is unchanged: after `all` resolves the issue set, the normal strict-AND daemon/pool probe decides daemon-dispatch vs subagent fallthrough; `all --prs` (Mode C) always routes to the subagent path per the existing Mode C short-circuit.
