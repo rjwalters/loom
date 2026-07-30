@@ -85,6 +85,11 @@ pub struct ValidationReport {
     pub agents_found: Vec<String>,
     /// Whether CLAUDE.md exists
     pub has_claude_md: bool,
+    /// Whether AGENTS.md exists (issue #4479, dual-runtime instruction anchor).
+    /// Unlike `has_claude_md`, a missing AGENTS.md is NOT recorded as a
+    /// validation issue — it is not mandatory for pre-existing installs that
+    /// predate the dual-runtime work.
+    pub has_agents_md: bool,
     /// Whether .github/labels.yml exists
     pub has_labels_yml: bool,
     /// Issues found during validation

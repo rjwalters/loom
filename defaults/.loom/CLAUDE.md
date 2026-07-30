@@ -11,6 +11,7 @@ This repository uses **Loom** for AI-powered development orchestration.
 > alongside this file. Sections below link to the specific doc rather than
 > inlining it, so this file stays a manageable per-dispatch context cost.
 
+<!-- agents-md:include:start -->
 ## What is Loom?
 
 Loom is a CLI + daemon for AI-powered development orchestration. It coordinates
@@ -35,6 +36,7 @@ Loom decomposes development into three coordination tiers, with the forge
 | Tier 2 | `loom-daemon` (MCP) + tmux agent pool | Multi-issue dispatch + scheduled support roles | Continuous |
 | Tier 1 | `/loom:sweep <issue>` | Single-issue lifecycle (Curator → Merge) | Per-issue |
 | Tier 0 | `/loom:builder`, `/loom:judge`, etc. | Task execution — single focused work units | Per-task |
+<!-- agents-md:include:end -->
 
 ## Usage Modes
 
@@ -132,6 +134,7 @@ for the full autonomous config surface and event taxonomy.
 
 Full role definitions: `.loom/roles/*.md`.
 
+<!-- agents-md:include:start -->
 ## Label-Based Workflow
 
 Agents coordinate through labels. See `.github/labels.yml` for full definitions.
@@ -163,6 +166,16 @@ credentials, infra, hardware; skipped by autonomous dispatch), `loom:abort`
 (signal to abort in-flight work for this issue, returns to `loom:issue`),
 `loom:urgent`. Priority axis: `tier:goal-advancing` / `tier:goal-supporting` /
 `tier:maintenance`.
+
+### REST vs GraphQL for forge queries
+
+Prefer forge REST calls over GraphQL-backed convenience commands when GraphQL is
+rate-limited or exhausted (they share separate hourly budgets). In practice:
+read and mutate issues/labels via `gh api repos/:owner/:repo/issues/:number`
+(and the `--method PATCH`/`POST` forms) rather than GraphQL-backed
+`gh issue list --label` / `gh issue view` queries when GraphQL quota is tight.
+The REST path stays available after GraphQL is exhausted, so it is the reliable
+fallback for issue reads, edits, and label changes during heavy dispatch.
 
 ### Issues Are Suggestions (Role Autonomy)
 
@@ -204,6 +217,7 @@ merge` attempts a local checkout that fails when the PR branch is linked to a
 worktree; the script merges via the forge API directly and handles worktree
 cleanup automatically. A `PreToolUse` hook redirects `gh pr merge` calls to
 this script.
+<!-- agents-md:include:end -->
 
 ## Development Workflow
 

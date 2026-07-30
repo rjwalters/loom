@@ -190,6 +190,12 @@ pub fn validate_loom_source_repo(workspace_path: &Path) -> ValidationReport {
         report.issues.push("Missing CLAUDE.md".to_string());
     }
 
+    // Check AGENTS.md (issue #4479, dual-runtime instruction anchor).
+    // Intentionally NOT mandatory: unlike CLAUDE.md, pre-existing installs from
+    // before this feature landed won't have AGENTS.md, and that must not be
+    // flagged as a validation issue for those repos.
+    report.has_agents_md = workspace_path.join("AGENTS.md").exists();
+
     // Check labels.yml
     report.has_labels_yml = workspace_path.join(".github").join("labels.yml").exists();
     if !report.has_labels_yml {

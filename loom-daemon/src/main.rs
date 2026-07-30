@@ -2705,7 +2705,7 @@ fn handle_cli_command(command: Commands) -> Result<()> {
                 println!("  1. Validate {workspace_str} is a git repository");
                 println!("  2. Copy .loom/ configuration from {defaults}");
                 println!(
-                    "  3. Setup repository scaffolding (CLAUDE.md, .claude/, .codex/, .github/)"
+                    "  3. Setup repository scaffolding (CLAUDE.md, AGENTS.md, .claude/, .github/)"
                 );
                 println!("  4. Update .gitignore with Loom ephemeral patterns");
                 return Ok(());
@@ -2740,6 +2740,14 @@ fn handle_cli_command(command: Commands) -> Result<()> {
                                 println!("  CLAUDE.md       - Present");
                             } else {
                                 println!("  CLAUDE.md       - Missing");
+                            }
+
+                            // AGENTS.md is not mandatory (see ValidationReport::has_agents_md),
+                            // so its absence is informational only, never an issue.
+                            if validation.has_agents_md {
+                                println!("  AGENTS.md       - Present");
+                            } else {
+                                println!("  AGENTS.md       - Not present (optional)");
                             }
 
                             if validation.has_labels_yml {
@@ -2778,9 +2786,9 @@ fn handle_cli_command(command: Commands) -> Result<()> {
                     println!("  .loom/          - Configuration directory");
                     println!("  .loom/config.json - Terminal configuration");
                     println!("  .loom/roles/    - Agent role definitions");
-                    println!("  CLAUDE.md       - AI context documentation");
+                    println!("  CLAUDE.md       - AI context documentation (Claude Code)");
+                    println!("  AGENTS.md       - AI context documentation (OpenAI Codex)");
                     println!("  .claude/        - Claude Code configuration");
-                    println!("  .codex/         - Codex configuration");
                     println!("  .github/        - GitHub labels and issue templates");
                     println!("  .gitignore      - Updated with Loom patterns");
 
