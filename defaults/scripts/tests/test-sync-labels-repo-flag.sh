@@ -17,8 +17,9 @@
 #
 # The load-bearing assertions:
 #   1. --repo resolves the target WITHOUT consulting the forge/git for the NWO
-#      (no `gh repo view` in the log) and works from a directory that is not a
-#      git repo at all — the short-circuit, proven rather than asserted.
+#      (no *bare* `gh repo view --json nameWithOwner` in the log) and works
+#      from a directory that is not a git repo at all — the short-circuit,
+#      proven rather than asserted.
 #   2. Every mutating gh call carries `-R <override>`, never the invoking repo.
 #   3. labels.yml is still read from WORKTREE_PATH (the source stays local;
 #      only the target moves).
@@ -30,6 +31,18 @@
 #      remote still hard-errors.
 #   6. Argument-parsing rejections: missing/invalid NWO, unknown option, extra
 #      positional, and --repo combined with a Gitea forge.
+#
+# Issue #4524 hardened four things on top of that (PR #4506 judge follow-ups),
+# each with its own section below:
+#   7. `--` is honored as a real end-of-options terminator (a `-`-leading
+#      WORKTREE_PATH after it is a path, not an "Unknown option").
+#   8. The Gitea rejection also fires for forge.type=gitea resolved from the
+#      config-tier chain, not just the LOOM_FORGE_TYPE env var.
+#   9. The NWO regex rejects path-traversal ('../..') and `-`-leading segments
+#      ('-foo/bar') while still accepting real names ('my-org/my-repo.name').
+#  10. A real (non-dry-run) --repo sync preflights the named target with
+#      `gh repo view <NWO>` BEFORE the first deletion, so a typo that names a
+#      real administrable repo is caught before anything is destroyed.
 #
 # Usage:
 #   ./defaults/scripts/tests/test-sync-labels-repo-flag.sh
@@ -106,7 +119,13 @@ mkdir -p "$STUB_DIR"
 # Appends every invocation's argv to $LOOM_TEST_GH_LOG (one line per call), so a
 # test can assert both what WAS called and what was NOT.
 #
-#   gh repo view ...   -> echoes $LOOM_TEST_GH_NWO, or exits 1 when it is empty
+#   gh repo view <NWO> ... -> the #4524 existence/permission preflight (an
+#                         EXPLICIT target, not resolution). Answers from
+#                         $LOOM_TEST_GH_REPO_VIEW: "" => ADMIN, "fail" =>
+#                         exit 1 (repo missing / invisible), anything else is
+#                         echoed as the viewerPermission.
+#   gh repo view ...   -> NWO *resolution* (no positional target): echoes
+#                         $LOOM_TEST_GH_NWO, or exits 1 when it is empty
 #                         (simulating "no resolvable remote here")
 #   gh label list ...  -> echoes nothing (script takes the `create` branch)
 #   gh label create|edit|delete ... -> exit 0
@@ -116,6 +135,16 @@ printf '%s\n' "$*" >> "${LOOM_TEST_GH_LOG:?stub gh: LOOM_TEST_GH_LOG not set}"
 
 case "$1" in
   repo)
+    if [[ "${2:-}" == "view" && -n "${3:-}" && "$3" != -* ]]; then
+      case "${LOOM_TEST_GH_REPO_VIEW:-}" in
+        fail)
+          echo "stub gh: Could not resolve to a Repository with the name '$3'." >&2
+          exit 1
+          ;;
+        "")  printf 'ADMIN\n'; exit 0 ;;
+        *)   printf '%s\n' "$LOOM_TEST_GH_REPO_VIEW"; exit 0 ;;
+      esac
+    fi
     if [[ -z "${LOOM_TEST_GH_NWO:-}" ]]; then
       echo "stub gh: no remote configured" >&2
       exit 1
@@ -155,19 +184,56 @@ cat > "$SRC/.github/labels.yml" <<'EOF'
 # END LOOM LABELS
 EOF
 
+# A SECOND labels.yml, in a subdirectory whose name begins with '-'. It exists
+# to exercise the `--` end-of-options terminator (#4524): only a real
+# terminator lets this be passed as WORKTREE_PATH instead of being rejected as
+# an unknown option. It holds exactly ONE label, so "Synced 1 labels" proves
+# the sync actually read THIS tree and not $SRC's two-label file.
+mkdir -p "$SRC/-alt/.github"
+cat > "$SRC/-alt/.github/labels.yml" <<'EOF'
+# BEGIN LOOM LABELS
+- name: loom:only
+  description: "The lone label in the dash-prefixed tree"
+  color: "AABBCC"
+# END LOOM LABELS
+EOF
+
+# A config-tier root that declares Gitea WITHOUT setting LOOM_FORGE_TYPE — the
+# #4524 case the old env-only guard missed. Passed to the script as $REPO_ROOT,
+# which is the first tier of forge-helpers.sh's _forge_config_root precedence.
+CFG_GITEA="$TMP/cfg-gitea"
+mkdir -p "$CFG_GITEA/.loom"
+echo '{"forge":{"type":"gitea"}}' > "$CFG_GITEA/.loom/config.json"
+
+# ...and the same shape declaring GitHub, to prove the guard keys on the value
+# and not merely on "a config file exists".
+CFG_GITHUB="$TMP/cfg-github"
+mkdir -p "$CFG_GITHUB/.loom"
+echo '{"forge":{"type":"github"}}' > "$CFG_GITHUB/.loom/config.json"
+
 GH_LOG="$TMP/gh.log"
 
 # Run the real script with the stub gh first on PATH, from $SRC.
-#   run_sls [--nwo NWO] -- <script args...>
+#   run_sls [--nwo NWO] [--repo-view ANSWER] [--repo-root DIR] -- <script args...>
+#
+#   --repo-view   what the stub's targeted `gh repo view <NWO>` answers
+#                 (default ADMIN; "fail" => the repo is missing/invisible)
+#   --repo-root   value for $REPO_ROOT, i.e. the root the config-tier chain
+#                 resolves from (default: unset/empty)
+#
+# LOOM_CONFIG_DEFAULTS_FILE is pinned to empty so the host's private-defaults
+# tier (~/.local/share/loom/config/defaults.json) can never leak into a run.
 # Sets: RC, OUT (merged stdout+stderr), LOG (recorded gh argv lines).
 RC=0
 OUT=""
 LOG=""
 run_sls() {
-    local nwo=""
+    local nwo="" repo_view="" repo_root=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --nwo) nwo="$2"; shift 2 ;;
+            --repo-view) repo_view="$2"; shift 2 ;;
+            --repo-root) repo_root="$2"; shift 2 ;;
             --) shift; break ;;
             *) break ;;
         esac
@@ -178,6 +244,9 @@ run_sls() {
         PATH="$STUB_DIR:$PATH" \
         LOOM_TEST_GH_LOG="$GH_LOG" \
         LOOM_TEST_GH_NWO="$nwo" \
+        LOOM_TEST_GH_REPO_VIEW="$repo_view" \
+        LOOM_CONFIG_DEFAULTS_FILE="" \
+        REPO_ROOT="$repo_root" \
         LOOM_FORGE_TYPE="${LOOM_FORGE_TYPE_OVERRIDE:-}" \
         bash "$SLS" "$@" 2>&1
     )"
@@ -194,8 +263,12 @@ run_sls -- --repo octocat/hello-world
 assert_eq "0" "$RC" "--repo succeeds in a directory with no resolvable remote"
 assert_contains "$OUT" "Target repository: octocat/hello-world (github)" \
     "--repo resolves REPO to the flag value"
-assert_not_contains "$LOG" "repo view" \
-    "--repo never calls 'gh repo view' (forge_get_repo_nwo short-circuited)"
+# The short-circuit proof, kept precise after #4524 added a preflight: what
+# --repo must never do is ASK the forge which repo this is. That call is the
+# bare, targetless `gh repo view --json nameWithOwner` in forge_get_repo_nwo;
+# the preflight below is a different call (it NAMES the target).
+assert_not_contains "$LOG" "repo view --json nameWithOwner --jq" \
+    "--repo never resolves the NWO from the forge (forge_get_repo_nwo short-circuited)"
 assert_contains "$LOG" "label delete bug -R octocat/hello-world" \
     "default-label deletion targets the override NWO"
 assert_contains "$LOG" "label create loom:issue -R octocat/hello-world" \
@@ -208,8 +281,10 @@ assert_contains "$OUT" "Synced 2 labels" \
 assert_eq "-R octocat/hello-world" \
     "$(printf '%s\n' "$LOG" | grep -o -- '-R [^ ]*' | sort -u | tr '\n' ' ' | sed 's/ *$//')" \
     "the override NWO is the ONLY -R target in the whole gh log"
+# The preflight names its target positionally (`gh repo view` has no -R flag),
+# so match on the NWO itself rather than on '-R': no call may go anywhere else.
 assert_eq "" \
-    "$(printf '%s\n' "$LOG" | grep -v -- '-R octocat/hello-world' || true)" \
+    "$(printf '%s\n' "$LOG" | grep -v -- 'octocat/hello-world' || true)" \
     "no gh call was made without the override target"
 
 # --repo=OWNER/NAME is the same flag.
@@ -267,6 +342,12 @@ assert_contains "$OUT" "Target repository: owner/from-remote (github)" \
 assert_not_contains "$LOG" "label create" \
     "--dry-run without --repo performs no label mutations"
 
+# Byte-identical proof for #4524's preflight: the no-flag path must NOT gain a
+# second `gh repo view`. Exactly one `gh repo ...` call — the resolution one.
+run_sls --nwo owner/from-remote --
+assert_eq "1" "$(printf '%s\n' "$LOG" | grep -c '^repo ' || true)" \
+    "no-flag run still makes exactly ONE 'gh repo view' call (no preflight added)"
+
 echo ""
 echo "=== Argument-parsing rejections (exit 2, no forge contact) ==="
 
@@ -286,6 +367,72 @@ for bad in bad-nwo owner/repo/extra "own er/repo" /repo owner/; do
         "invalid --repo value '$bad' is reported as invalid"
 done
 
+echo ""
+echo "=== NWO validation rejects traversal / '-'-leading segments (#4524) ==="
+
+# The pre-#4524 class ([A-Za-z0-9._-]+ per segment) accepted every value below.
+# '../..' and friends are path-traversal shapes that must never reach a gh
+# argument; '-foo/bar' would be read by gh as a bundle of short flags rather
+# than a repository. Each segment must now START with an alphanumeric.
+for bad in "../.." "./x" "owner/.." "../owner" "-foo/bar" "owner/-bar" \
+           ".hidden/repo" "owner/.hidden" "_leading/repo"; do
+    run_sls -- --repo "$bad"
+    assert_eq "2" "$RC" "hardened NWO check rejects '$bad'"
+    assert_contains "$OUT" "Invalid --repo value" \
+        "'$bad' is reported as an invalid --repo value"
+    assert_eq "" "$LOG" "'$bad' never reaches the forge"
+done
+
+# ...and the tightening must not have caught real names. Dots, dashes and
+# underscores stay legal INSIDE a segment. --dry-run keeps these assertions
+# about parsing rather than about the stubbed forge.
+for good in owner/repo my-org/my-repo owner-2/repo.name a/b \
+            under_score/re_po owner/repo-1.2.3 0rg/9repo; do
+    run_sls -- --repo "$good" --dry-run
+    assert_eq "0" "$RC" "legitimate NWO '$good' is still accepted"
+    assert_contains "$OUT" "Target repository: $good (github)" \
+        "legitimate NWO '$good' resolves to itself"
+done
+
+echo ""
+echo "=== '--' is a real end-of-options terminator (#4524) ==="
+
+# Baseline: without --, a '-'-leading path is (still) an unknown option. That
+# is exactly why -- has to work.
+run_sls -- --repo octocat/hello-world -alt
+assert_eq "2" "$RC" "a '-'-leading WORKTREE_PATH without -- is rejected as an option"
+assert_contains "$OUT" "Unknown option: -alt" \
+    "the '-'-leading path is named as the rejected option"
+
+# With --, it becomes the positional WORKTREE_PATH — proven by the label count:
+# the dash-prefixed tree holds ONE label, $SRC holds two.
+run_sls -- --repo octocat/hello-world -- -alt
+assert_eq "0" "$RC" "-- lets a '-'-leading WORKTREE_PATH through"
+assert_contains "$OUT" "Synced 1 labels" \
+    "-- routed '-alt' to WORKTREE_PATH (its one-label labels.yml was read)"
+assert_contains "$LOG" "label create loom:only -R octocat/hello-world" \
+    "the synced label came from the dash-prefixed tree, not from \$SRC"
+
+# After --, an option-looking token is a PATH: --dry-run must not be re-parsed
+# as the flag (it becomes a nonexistent directory, so the cd fails).
+run_sls -- --repo octocat/hello-world -- --dry-run
+assert_eq "1" "$RC" "a --dry-run after -- is treated as a (nonexistent) path"
+assert_not_contains "$OUT" "[dry-run] would" \
+    "a --dry-run after -- does not re-enable dry-run mode"
+
+# A trailing -- with no operand stays the harmless no-op it always was.
+run_sls -- --repo octocat/hello-world --
+assert_eq "0" "$RC" "a trailing -- with no operand is a no-op"
+assert_contains "$OUT" "Synced 2 labels" \
+    "the trailing -- left WORKTREE_PATH at its default"
+
+# The extra-positional rejection still applies on the post---- path (the two
+# branches share one take_positional helper).
+run_sls -- -- "$SRC" extra
+assert_eq "2" "$RC" "a second positional after -- still exits 2"
+assert_contains "$OUT" "Unexpected extra argument: extra" \
+    "the post-'--' extra positional is named"
+
 run_sls -- --bogus
 assert_eq "2" "$RC" "unknown option exits 2"
 assert_contains "$OUT" "Unknown option: --bogus" "unknown option is named"
@@ -304,6 +451,82 @@ assert_contains "$OUT" "--repo is GitHub-only" \
     "the Gitea combination fails loudly instead of silently syncing GitHub"
 assert_eq "" "$LOG" "the Gitea rejection contacts no forge"
 
+# #4524: forge.type=gitea resolved from the CONFIG TIERS, with LOOM_FORGE_TYPE
+# unset, must reject --repo exactly like the env var does. The pre-#4524 guard
+# read only the env var, so this combination silently synced GitHub instead.
+run_sls --repo-root "$CFG_GITEA" -- --repo octocat/hello-world
+assert_eq "2" "$RC" "--repo with config-tier forge.type=gitea exits 2"
+assert_contains "$OUT" "--repo is GitHub-only" \
+    "the config-tier Gitea setting fails just as loudly as the env var"
+assert_contains "$OUT" "forge.type=gitea" \
+    "the rejection names the config setting, not a phantom LOOM_FORGE_TYPE"
+assert_eq "" "$LOG" "the config-tier Gitea rejection contacts no forge"
+
+# The guard must key on the VALUE, not on "a config file exists".
+run_sls --repo-root "$CFG_GITHUB" -- --repo octocat/hello-world
+assert_eq "0" "$RC" "--repo with config-tier forge.type=github is allowed"
+assert_contains "$OUT" "Synced 2 labels" "the GitHub config-tier run syncs normally"
+
+# Env var beats the config tier, matching forge_detect's precedence.
+LOOM_FORGE_TYPE_OVERRIDE="github" run_sls --repo-root "$CFG_GITEA" -- --repo octocat/hello-world
+assert_eq "0" "$RC" "LOOM_FORGE_TYPE=github overrides a config-tier gitea setting"
+
+# The Gitea guard is scoped to --repo: a config-tier gitea repo without the
+# flag still takes the normal (Gitea) detection path, not this rejection.
+run_sls --repo-root "$CFG_GITEA" -- --dry-run
+assert_not_contains "$OUT" "--repo is GitHub-only" \
+    "config-tier gitea WITHOUT --repo is not rejected"
+
+echo ""
+echo "=== --repo preflights the target before any deletion (#4524) ==="
+
+# --dry-run is deliberately forge-free, so it cannot tell a typo'd NWO apart
+# from a real repo. The real run therefore verifies the target FIRST.
+run_sls -- --repo octocat/hello-world
+assert_eq "0" "$RC" "a reachable, writable --repo target syncs normally"
+assert_contains "$LOG" "repo view octocat/hello-world --json nameWithOwner,viewerPermission" \
+    "the real --repo path preflights the named target with 'gh repo view'"
+assert_contains "$(printf '%s\n' "$LOG" | head -1)" "repo view octocat/hello-world" \
+    "the preflight is the FIRST gh call — it precedes every label operation"
+
+# A typo that resolves to nothing this identity can see must abort before the
+# deletion loop, not partway through it.
+run_sls --repo-view fail -- --repo octocat/typo-repo
+assert_eq "1" "$RC" "an unreachable --repo target aborts"
+assert_contains "$OUT" "is not reachable" \
+    "the abort explains that the target could not be reached"
+assert_contains "$OUT" "nothing was deleted" \
+    "the abort states explicitly that nothing was deleted"
+assert_not_contains "$LOG" "label delete" \
+    "the unreachable target aborted BEFORE any label deletion"
+assert_not_contains "$LOG" "label create" \
+    "the unreachable target aborted before any label creation"
+assert_eq "1" "$(printf '%s\n' "$LOG" | grep -c . || true)" \
+    "the preflight was the only gh call made against the bad target"
+
+# Existing-but-read-only is the other half of "existence/permission": deleting
+# labels there would fail partway, so refuse up front.
+run_sls --repo-view READ -- --repo octocat/hello-world
+assert_eq "1" "$RC" "a read-only --repo target aborts"
+assert_contains "$OUT" "is not writable" "the read-only abort names the problem"
+assert_contains "$OUT" "READ" "the read-only abort reports the observed permission"
+assert_not_contains "$LOG" "label delete" \
+    "the read-only target aborted before any label deletion"
+
+# Some tokens omit viewerPermission entirely. Existence is still proven, so
+# warn and continue rather than blocking a legitimate sync.
+run_sls --repo-view " " -- --repo octocat/hello-world
+assert_eq "0" "$RC" "an indeterminate permission does not block the sync"
+assert_contains "$OUT" "Could not determine your permission" \
+    "an indeterminate permission is warned about"
+assert_contains "$LOG" "label delete bug -R octocat/hello-world" \
+    "the sync proceeds once existence is proven"
+
+# The preflight is real-run only: --dry-run must stay forge-free.
+run_sls -- --repo octocat/hello-world --dry-run
+assert_eq "" "$LOG" \
+    "--dry-run makes no preflight call (it stays completely forge-free)"
+
 echo ""
 echo "=== --help documents the new flags ==="
 
@@ -311,6 +534,7 @@ run_sls -- --help
 assert_eq "0" "$RC" "--help exits 0"
 assert_contains "$OUT" "--repo OWNER/NAME" "--help documents --repo"
 assert_contains "$OUT" "--dry-run" "--help documents --dry-run"
+assert_contains "$OUT" "End of options" "--help documents the -- terminator (#4524)"
 
 echo ""
 echo "=== Installed-tree parity (.loom/scripts is a symlinked dir) ==="
