@@ -10,13 +10,24 @@
 # orphan_recovery.py's recover_issue() semantics). Closing keywords
 # (`Closes`/`Fixes`/`Resolves`) are untouched (GitHub auto-closes those).
 #
-# Strategy: the two functions under test (_reset_one_partial_issue and
-# _reset_partial_increment_labels) depend only on globals (PR_JSON, REPO_NWO,
-# PR_NUMBER, FORGE_TYPE) and the `gh` CLI. We extract just those two function
-# definitions from merge-pr.sh and source them, stub `gh` on PATH to serve
-# canned issue JSON and record mutating calls, then assert on the recorded
-# calls. Extracting from source (rather than replicating) keeps the test in
-# lockstep with the script.
+# Also covers the #4569 closing-keyword conflict guard: GitHub honors a closing
+# keyword ANYWHERE in a PR body (not just a line-leading trailer), so prose like
+# "...then close #N" in a follow-up checklist silently overrides the deliberate
+# `Contributes to #N` trailer and closes the issue on merge. merge-pr.sh detects
+# that pre-merge (_check_partial_increment_close_conflict, warning + two
+# published globals) and reverts it post-merge (reopen inside
+# _reset_one_partial_issue) — while explicitly NOT reverting a close it cannot
+# attribute to this PR (a deliberate close in the same window).
+#
+# Strategy: the functions under test (_partial_increment_refs,
+# _body_closing_refs, _check_partial_increment_close_conflict,
+# _reset_one_partial_issue, _reset_partial_increment_labels) depend only on
+# globals (PR_JSON, REPO_NWO, PR_NUMBER, FORGE_TYPE, GH,
+# PARTIAL_CONFLICT_ISSUES, PARTIAL_OPEN_BEFORE_MERGE) and the `gh` CLI. We
+# extract just those function definitions from merge-pr.sh and source them, stub
+# `gh` on PATH to serve canned issue JSON and record mutating calls, then assert
+# on the recorded calls. Extracting from source (rather than replicating) keeps
+# the test in lockstep with the script.
 #
 # Usage:
 #   ./.loom/scripts/tests/test-merge-pr-partial-increment.sh
@@ -91,22 +102,34 @@ info()    { echo "INFO: $*"; }
 success() { echo "OK: $*"; }
 warning() { echo "WARN: $*" >&2; }
 
-# --- Extract the two functions under test from merge-pr.sh and source them ---
-# From `_reset_one_partial_issue() {` up to (not including) the
-# `# Handle auto-merge mode` line — this span contains exactly the two function
-# definitions plus intervening comments (harmless when sourced).
+# --- Extract the functions under test from merge-pr.sh and source them ---
+# Two spans, each bounded by an anchor line that is NOT part of the span:
+#   1. `_partial_increment_refs() {` .. `_check_partial_increment_close_conflict
+#      || true` — the #4569 pre-merge guard and its two pure-text ref extractors.
+#      Stopping at the INVOCATION line keeps the top-level call out of the
+#      sourced file (we drive the guard explicitly from the tests).
+#   2. `_reset_one_partial_issue() {` .. `# Handle auto-merge mode` — the
+#      post-merge reset/reopen pass.
+# Both spans contain only function definitions plus comments (harmless when
+# sourced).
 FUNCS_FILE="$(mktemp)"
 trap 'rm -rf "$FUNCS_FILE" "$STUB_DIR" 2>/dev/null || true' EXIT
 awk '
-  /^_reset_one_partial_issue\(\) \{/ { capture=1 }
-  /^# Handle auto-merge mode/        { capture=0 }
+  /^_partial_increment_refs\(\) \{/                     { capture=1 }
+  /^_check_partial_increment_close_conflict \|\| true/   { capture=0 }
+  /^_reset_one_partial_issue\(\) \{/                    { capture=1 }
+  /^# Handle auto-merge mode/                           { capture=0 }
   capture { print }
 ' "$MERGE_PR_SRC" > "$FUNCS_FILE"
 
-if ! grep -q '_reset_partial_increment_labels()' "$FUNCS_FILE"; then
-    echo -e "${RED}FATAL${NC}: could not extract functions from $MERGE_PR_SRC" >&2
-    exit 2
-fi
+for _fn in _partial_increment_refs _body_closing_refs \
+           _check_partial_increment_close_conflict _reset_one_partial_issue \
+           _reset_partial_increment_labels; do
+    if ! grep -q "^${_fn}() {" "$FUNCS_FILE"; then
+        echo -e "${RED}FATAL${NC}: could not extract $_fn from $MERGE_PR_SRC" >&2
+        exit 2
+    fi
+done
 # shellcheck disable=SC1090
 source "$FUNCS_FILE"
 
@@ -148,6 +171,16 @@ export PATH="$STUB_DIR:$PATH"
 REPO_NWO="owner/repo"
 PR_NUMBER="999"
 FORGE_TYPE="github"
+GH="gh"
+PARTIAL_OPEN_BEFORE_MERGE=""
+PARTIAL_CONFLICT_ISSUES=""
+
+# Shim for the GraphQL-backed close-target helper merge-pr.sh gets from
+# forge-helpers.sh. Driven by $FORGE_CLOSE_TARGETS so tests can simulate both
+# "GraphQL answered" and "GraphQL quota exhausted -> empty" (the condition the
+# #4569 incident actually occurred under).
+FORGE_CLOSE_TARGETS=""
+forge_pr_close_targets() { printf '%s' "$FORGE_CLOSE_TARGETS"; }
 
 # Canned issue fixtures.
 cat > "$STUB_DIR/issue-123.json" <<'EOF'
@@ -166,8 +199,23 @@ cat > "$STUB_DIR/issue-321.json" <<'EOF'
 {"state":"open","pull_request":{"url":"x"},"labels":[{"name":"loom:building"}]}
 EOF
 
-reset_log() { : > "$STUB_DIR/gh-calls.log"; }
+# Clearing the two #4569 globals here keeps every pre-existing case below running
+# against the same "no conflict recorded" state it was written for.
+reset_log() {
+  : > "$STUB_DIR/gh-calls.log"
+  PARTIAL_OPEN_BEFORE_MERGE=""
+  PARTIAL_CONFLICT_ISSUES=""
+  FORGE_CLOSE_TARGETS=""
+}
 read_log()  { cat "$STUB_DIR/gh-calls.log" 2>/dev/null || true; }
+
+# Run one of the functions under test IN THE CURRENT SHELL (never a command
+# substitution — the #4569 guard publishes its results via globals, which a
+# subshell would discard) while capturing its stderr for assertions.
+run_capturing_stderr() {
+    "$@" 2>"$STUB_DIR/stderr.log" || true
+}
+read_stderr() { cat "$STUB_DIR/stderr.log" 2>/dev/null || true; }
 
 echo "Testing _reset_partial_increment_labels behavior..."
 
@@ -253,6 +301,156 @@ assert_contains "$log" "issue edit 123 --repo owner/repo --remove-label loom:bui
 assert_not_contains "$log" "issue edit 888" \
   "Mixed body: Closes #888 is NOT touched"
 
+# ---------------------------------------------------------------------------
+# #4569: closing-keyword conflict detection + premature-close revert.
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "Testing _body_closing_refs (GitHub closing-keyword extraction)..."
+
+# The incident phrasing: a closing keyword buried in prose, NOT line-leading.
+assert_eq "123" "$(_body_closing_refs '3. Verify the publish, then close #123.')" \
+  "Prose 'then close #123' is a closing reference (keyword is not line-leading)"
+assert_eq "123" "$(_body_closing_refs 'Closes #123')" \
+  "Canonical 'Closes #123' trailer extracted"
+assert_eq "$(printf '7\n9')" "$(_body_closing_refs 'Fixes #7 and resolved #9')" \
+  "Tense/case variants (Fixes/resolved) both extracted, numerically sorted"
+assert_eq "" "$(_body_closing_refs 'Contributes to #123')" \
+  "Non-closing 'Contributes to #123' is NOT a closing reference"
+assert_eq "" "$(_body_closing_refs 'Discloses #123 and Updates #456')" \
+  "Word-boundary guard: 'Discloses'/'Updates' are not closing keywords"
+assert_eq "" "$(_body_closing_refs 'close issue #123')" \
+  "'close issue #123' is NOT a closing reference (keyword not adjacent to #N)"
+assert_eq "1234" "$(_body_closing_refs 'Closes #1234')" \
+  "Full number is extracted (no #123 prefix confusion)"
+
+echo ""
+echo "Testing _check_partial_increment_close_conflict (pre-merge guard)..."
+
+# T11: reproduces the censusapi#5 -> censusapi#2 incident shape — a deliberate
+# `Contributes to #123` trailer plus an "Operator follow-up" step saying
+# "...then close #123", with GraphQL unavailable (quota exhausted).
+reset_log
+PR_JSON='{"body":"## Summary\n\nBuilder scope only; publish steps stay with the operator.\n\n## Operator follow-up (after merge)\n\n1. npm publish\n2. Verify, then close #123.\n\nContributes to #123\n"}'
+run_capturing_stderr _check_partial_increment_close_conflict
+guard_err="$(read_stderr)"
+assert_eq "123" "$PARTIAL_CONFLICT_ISSUES" \
+  "Incident shape: #123 recorded as a closing-keyword conflict (body regex, no GraphQL)"
+assert_eq "123" "$PARTIAL_OPEN_BEFORE_MERGE" \
+  "Incident shape: #123 recorded as open before the merge"
+assert_contains "$guard_err" "Partial-increment conflict (#4569)" \
+  "Incident shape: emits the actionable pre-merge warning"
+assert_contains "$guard_err" "close #123" \
+  "Incident shape: warning quotes the offending phrase"
+
+# T12: a clean partial-increment body -> tracked as open-before-merge, no conflict.
+reset_log
+PR_JSON='{"body":"Implements a slice.\n\nContributes to #123"}'
+_check_partial_increment_close_conflict 2>/dev/null
+assert_eq "" "$PARTIAL_CONFLICT_ISSUES" \
+  "Clean 'Contributes to #123' body -> no conflict recorded"
+assert_eq "123" "$PARTIAL_OPEN_BEFORE_MERGE" \
+  "Clean body -> #123 still recorded as open before the merge"
+
+# T13: closing keyword aimed at a DIFFERENT issue -> not a conflict.
+reset_log
+PR_JSON='{"body":"Closes #888\n\nPart of #123"}'
+_check_partial_increment_close_conflict 2>/dev/null
+assert_eq "" "$PARTIAL_CONFLICT_ISSUES" \
+  "Closes #888 + Part of #123 -> no conflict (different issues)"
+
+# T14: partial ref already closed BEFORE the merge -> tracked in neither set,
+# so nothing this merge does can be blamed on it.
+reset_log
+PR_JSON='{"body":"Part of #777"}'
+_check_partial_increment_close_conflict 2>/dev/null
+assert_eq "" "$PARTIAL_CONFLICT_ISSUES" "Pre-closed #777 -> no conflict recorded"
+assert_eq "" "$PARTIAL_OPEN_BEFORE_MERGE" "Pre-closed #777 -> not recorded as open before merge"
+
+# T15: GraphQL-only closing link (e.g. a Development-sidebar link no body text
+# reveals) is also caught, via the forge_pr_close_targets union.
+reset_log
+FORGE_CLOSE_TARGETS="123"
+PR_JSON='{"body":"Contributes to #123"}'
+_check_partial_increment_close_conflict 2>/dev/null
+assert_eq "123" "$PARTIAL_CONFLICT_ISSUES" \
+  "closingIssuesReferences-only link (no body keyword) -> conflict recorded"
+
+# T16: the reference target is a PR -> never tracked, never mutated.
+reset_log
+PR_JSON='{"body":"Part of #321"}'
+_check_partial_increment_close_conflict 2>/dev/null
+assert_eq "" "$PARTIAL_OPEN_BEFORE_MERGE" "Partial ref that is a PR (#321) -> not tracked"
+
+# T17: gitea -> guard is a no-op (matches the GitHub-only reset path).
+reset_log
+FORGE_TYPE="gitea"
+PR_JSON='{"body":"Contributes to #123\n\nthen close #123"}'
+_check_partial_increment_close_conflict 2>/dev/null
+assert_eq "" "$PARTIAL_CONFLICT_ISSUES" "FORGE_TYPE=gitea -> conflict guard no-op"
+FORGE_TYPE="github"
+
+# T17b: --dry-run still DETECTS and reports the conflict, but must not phrase it
+# as an accomplished merge (same dry-run contract as
+# _check_no_open_stacked_children: report the would-be outcome, prefixed).
+reset_log
+DRY_RUN=true
+PR_JSON='{"body":"Verify, then close #123.\n\nContributes to #123"}'
+run_capturing_stderr _check_partial_increment_close_conflict
+dryrun_err="$(read_stderr)"
+assert_eq "123" "$PARTIAL_CONFLICT_ISSUES" \
+  "--dry-run still detects the closing-keyword conflict"
+assert_contains "$dryrun_err" "[dry-run] Partial-increment conflict (#4569)" \
+  "--dry-run prefixes the conflict warning"
+assert_contains "$dryrun_err" "would reopen #123" \
+  "--dry-run phrases the reopen as conditional, not as an accomplished action"
+assert_not_contains "$dryrun_err" "will reopen #123" \
+  "--dry-run does not claim a reopen will happen"
+DRY_RUN=false
+
+echo ""
+echo "Testing the post-merge premature-close revert..."
+
+# T18: conflicted + closed after the merge -> reopen, comment, THEN the normal
+# label swap (the issue re-enters the ready queue in the same pass).
+reset_log
+PARTIAL_OPEN_BEFORE_MERGE="777"
+PARTIAL_CONFLICT_ISSUES="777"
+PR_JSON='{"body":"Verify, then close #777.\n\nContributes to #777"}'
+run_capturing_stderr _reset_partial_increment_labels
+revert_err="$(read_stderr)"
+log="$(read_log)"
+assert_contains "$log" "issue reopen 777 --repo owner/repo" \
+  "Conflicted + auto-closed #777 -> reopened (repo-scoped)"
+assert_contains "$log" "issue edit 777 --repo owner/repo --remove-label loom:building --add-label loom:issue" \
+  "Reopened #777 falls through to the normal loom:building -> loom:issue swap"
+assert_contains "$log" "issue comment 777 --repo owner/repo" \
+  "Reopened #777 -> posts an auditable comment"
+assert_contains "$revert_err" "was auto-closed by PR #999's merge" \
+  "Reopen path warns with the attribution"
+
+# T19: EDGE CASE — open before the merge, closed after it, but NO closing
+# reference on this PR (e.g. a human closed it deliberately in the same window):
+# warn loudly, but do NOT reopen.
+reset_log
+PARTIAL_OPEN_BEFORE_MERGE="777"
+PARTIAL_CONFLICT_ISSUES=""
+PR_JSON='{"body":"Contributes to #777"}'
+run_capturing_stderr _reset_partial_increment_labels
+edge_err="$(read_stderr)"
+assert_eq "" "$(read_log)" \
+  "Deliberate close in the merge window (no closing reference) -> no reopen, no label mutation"
+assert_contains "$edge_err" "NOT reopening automatically" \
+  "Deliberate-close case still warns so the coincidence is investigable"
+
+# T20: closed BEFORE the merge and untracked -> byte-for-byte the pre-#4569
+# skip (already asserted by T3; re-asserted here with the globals in play).
+reset_log
+PR_JSON='{"body":"Part of #777"}'
+_reset_partial_increment_labels 2>/dev/null
+assert_eq "" "$(read_log)" \
+  "Untracked closed #777 -> unchanged log-and-skip behavior"
+
 # --- Source-contains guards (fail if a refactor drops the key behavior) ---
 echo ""
 echo "Testing merge-pr.sh source guards..."
@@ -267,6 +465,12 @@ assert_contains "$src" "--add-label \"loom:issue\"" \
   "merge-pr.sh restores loom:issue"
 assert_contains "$src" "--repo \"\$REPO_NWO\"" \
   "merge-pr.sh scopes the partial-increment mutations to REPO_NWO"
+assert_contains "$src" "_check_partial_increment_close_conflict || true" \
+  "merge-pr.sh invokes the #4569 conflict guard BEFORE either merge path"
+assert_contains "$src" 'gh issue reopen "$issue_num"' \
+  "merge-pr.sh reverts a premature auto-close with gh issue reopen"
+assert_contains "$src" 'close[sd]?|fix(e[sd])?|resolve[sd]?' \
+  "merge-pr.sh matches the canonical GitHub closing-keyword set"
 
 # --- Summary ---
 echo ""
