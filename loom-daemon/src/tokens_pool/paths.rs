@@ -17,6 +17,22 @@ use std::path::{Path, PathBuf};
 /// Env override for the shared machine-level pool location. Mirrors
 /// `loom_tools.tokens.paths.SHARED_TOKENS_DIR_ENV`.
 pub const SHARED_TOKENS_DIR_ENV: &str = "LOOM_SHARED_TOKENS_DIR";
+pub const CODEX_PROFILE_ROOT_ENV: &str = "LOOM_CODEX_PROFILE_ROOT";
+
+#[must_use]
+pub fn per_repo_accounts_file(workspace: &Path) -> PathBuf {
+    workspace.join(".loom").join("accounts.json")
+}
+
+/// Machine-level Codex profile root. An explicitly empty override disables it.
+#[must_use]
+pub fn codex_profile_root() -> Option<PathBuf> {
+    match std::env::var(CODEX_PROFILE_ROOT_ENV) {
+        Ok(value) if value.trim().is_empty() => None,
+        Ok(value) => Some(expand_tilde(value.trim())),
+        Err(_) => dirs::home_dir().map(|home| home.join(".loom").join("codex-profiles")),
+    }
+}
 
 /// Return the canonical per-repo pool dir `<workspace>/.loom/tokens`.
 #[must_use]
