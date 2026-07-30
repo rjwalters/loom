@@ -1519,7 +1519,13 @@ pub mod forge {
         pr_number: u32,
         since: DateTime<Utc>,
     ) -> Option<DateTime<Utc>> {
-        let since_iso = since.to_rfc3339();
+        // Render `since` in exactly the shape the forge emits for `createdAt`
+        // (`...Z`, second precision) so the jq `>` comparison — which is a raw
+        // *string* comparison — orders correctly. `to_rfc3339()` would render
+        // the same instant with a `+00:00` offset suffix, which sorts *before*
+        // a `Z`-suffixed timestamp of the identical second and so would
+        // misclassify a comment posted in the same second as the claim label.
+        let since_iso = since.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let mut cmd = Command::new(gh_bin);
         cmd.arg("pr")
             .arg("view")
