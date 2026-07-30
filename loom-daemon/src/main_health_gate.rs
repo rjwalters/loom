@@ -236,6 +236,14 @@ pub struct MainHealthState {
     /// same cores — the CPU contention that made a `nice -n 5` gate still time
     /// out under 2 concurrent sweeps (#4073 was necessary, not sufficient).
     /// `false` for a fresh state and whenever no gate run is executing.
+    ///
+    /// This is an **in-process** flag, scoped to one daemon and one root. The
+    /// cross-process, machine-wide equivalent — which serializes this gate's
+    /// build against `cargo`/build-gate stages in *other* processes (every
+    /// concurrent sweep worktree, another workspace's gate) — is the build slot
+    /// ([`crate::build_slot`], #4512), taken around the gate command itself.
+    /// They compose: this flag holds *dispatch* off a root with a live gate; the
+    /// slot holds *concurrent heavy builds* off each other machine-wide.
     gate_in_flight: AtomicBool,
     /// The current load-deferral streak (#4259), or `None` when the gate is not
     /// deferring. A deferred tick is a *scheduling* decision, not an
@@ -1638,8 +1646,24 @@ impl GateRunner for CommandGateRunner {
                 PrepOutcome::Ready => evaluated_sha = resolve_head_sha(&self.repo_root),
             }
         }
-        let outcome =
-            run_command_with_timeout(&self.config.command, &self.repo_root, self.config.timeout);
+        // Machine-wide build slot (#4512): the gate command is this host's
+        // heaviest recurring CPU stage (a full `cargo test` workspace build), so
+        // it takes a slot before starting rather than racing every concurrent
+        // sweep's own build. Acquired OUTSIDE the timeout window on purpose — a
+        // queue wait must not eat into `config.timeout` and turn contention into
+        // a false UNEVALUATED (the #3978/#4020 failure mode). Never blocks
+        // indefinitely and never fails: the lease degrades open on a bounded-wait
+        // expiry or an unusable lock dir, so the gate always runs.
+        let slot = crate::build_slot::acquire("main-health-gate");
+        let outcome = run_command_with_timeout(
+            &self.config.command,
+            &self.repo_root,
+            self.config.timeout,
+            slot.covers_children(),
+        );
+        // Explicit drop for the release log line's ordering (the RAII drop would
+        // fire at end of scope anyway).
+        drop(slot);
         match outcome {
             GateOutcome::Red { detail } => self.corroborate_red(evaluated_sha.as_deref(), detail),
             other => other,
@@ -2429,7 +2453,18 @@ fn classify_failed_exit(
 /// the spawn, the poll, the timeout — yields [`GateOutcome::Unevaluated`]
 /// (#3974): those say nothing about `main`, and halting on them turns an
 /// environmental hiccup into a total dispatch outage.
-fn run_command_with_timeout(command: &str, cwd: &Path, timeout: Duration) -> GateOutcome {
+///
+/// `build_slot_held` propagates [`crate::build_slot::BUILD_SLOT_HELD_ENV`] into
+/// the child (#4512). The shipped gate command is `build-gate.sh`, which takes
+/// the machine-wide build slot itself via `lib/build-slot.sh`; the sentinel makes
+/// that nested acquire a re-entrant no-op instead of a self-inflicted wait
+/// against the slot this process is already holding.
+fn run_command_with_timeout(
+    command: &str,
+    cwd: &Path,
+    timeout: Duration,
+    build_slot_held: bool,
+) -> GateOutcome {
     use std::fs::File;
 
     let log_path =
@@ -2461,6 +2496,7 @@ fn run_command_with_timeout(command: &str, cwd: &Path, timeout: Duration) -> Gat
         .arg("-c")
         .arg(command)
         .current_dir(cwd)
+        .env(crate::build_slot::BUILD_SLOT_HELD_ENV, if build_slot_held { "1" } else { "0" })
         .stdin(Stdio::null())
         .stdout(Stdio::from(out_file))
         .stderr(Stdio::from(err_file))

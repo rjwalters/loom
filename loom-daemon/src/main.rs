@@ -166,25 +166,23 @@ enum Commands {
         pipeline: bool,
     },
 
-    /// Measure the host and recommend — or with `--write`, apply — the
-    /// autonomous concurrency knobs (`autonomous.workFinder.maxConcurrent` /
-    /// `autonomous.perTokenConcurrency`, issue #4390). Prints the same
-    /// `min(...)` cap breakdown `status` uses, plus which term would bind
-    /// after applying the recommendation. Purely file/host-based; does not
-    /// require a running daemon (unlike `status`, which reports the running
-    /// daemon's own in-memory dispatch state).
+    /// Measure the host and the currently-resolved concurrency knobs (issue
+    /// #4390; measurement-only since #4512). Prints the same `min(token axis,
+    /// disk, maxConcurrent)` cap breakdown `status` uses, which term binds, and
+    /// a one-line reading of whether this machine's `maxConcurrent` should go
+    /// up. Purely file/host-based; does not require a running daemon (unlike
+    /// `status`, which reports the running daemon's own in-memory dispatch
+    /// state). Always read-only.
     Calibrate {
-        /// Repo root to measure/write (plain path, default `.` — no upward
-        /// `.git` walk).
+        /// Repo root to measure (plain path, default `.` — no upward `.git` walk).
         #[arg(long, value_name = "PATH", default_value = ".")]
         workspace: String,
 
-        /// Merge the recommendation into `<workspace>/.loom/config.json`
-        /// (only `autonomous.workFinder.maxConcurrent` /
-        /// `autonomous.perTokenConcurrency` — every other key is preserved).
-        /// Idempotent: a repeat `--write` with the same recommendation is
-        /// byte-identical. Without this flag, calibrate is strictly
-        /// read-only.
+        /// DEPRECATED and ignored (#4512). calibrate no longer derives a
+        /// recommendation to write: the CPU-headroom term it was based on is
+        /// gone, and `autonomous.workFinder.maxConcurrent` is a per-machine knob
+        /// you tune by hand from the measurements. Retained so existing scripts
+        /// passing `--write` keep working; prints a deprecation notice.
         #[arg(long)]
         write: bool,
 
@@ -2432,16 +2430,12 @@ async fn main() -> Result<()> {
         let interval = work_finder::resolve_interval_with_config(&work_finder_config);
         let configured_max = work_finder::resolve_max_concurrent_with_config(&work_finder_config);
         let per_token_concurrency = work_finder::resolve_per_token_concurrency(&work_finder_config);
-        // CPU headroom knobs (#4032): resolved once at startup from the same
-        // `work_finder_config`, precedence env > config > default — matching
-        // `per_token_concurrency` exactly (single-root, startup-time; the
-        // dynamic cap is one global number per tick, computed before the
-        // workspace registry is even loaded, so there is no per-workspace
-        // variant of these knobs).
-        let cpu_utilization_target =
-            work_finder::resolve_cpu_utilization_target(&work_finder_config);
-        let cpu_est_cores_per_sweep =
-            work_finder::resolve_cpu_est_cores_per_sweep(&work_finder_config);
+        // Retired CPU-headroom knobs (#4512): `cpuUtilizationTarget` /
+        // `estCoresPerSweep` (and their env twins) are accepted-but-ignored, so
+        // a fleet's committed config keeps parsing across the upgrade. Warn
+        // once, here at startup, naming exactly what is being ignored and what
+        // to tune instead.
+        work_finder::warn_deprecated_cpu_knobs(&work_finder_config);
         // Per-tick admission (ramp) cap (#4234): resolved once at startup from
         // the same `work_finder_config`, precedence env > config > default —
         // the same startup-capture pattern as the CPU knobs above. Bounds how
@@ -2481,12 +2475,12 @@ async fn main() -> Result<()> {
         );
         log::info!(
             "work_finder: enabled (multi-workspace, interval={}s, configured_max={configured_max}, \
-             per_token_concurrency={per_token_concurrency}, cpu_utilization_target={cpu_utilization_target}, \
-             cpu_est_cores_per_sweep={cpu_est_cores_per_sweep}, \
-             max_admissions_per_tick={max_admissions_per_tick}, \
-             dynamic cap = min(healthy tokens × per-token, disk, cpu, configured_max), \
+             per_token_concurrency={per_token_concurrency}, \
+             max_admissions_per_tick={max_admissions_per_tick}, build_slots={}, \
+             dynamic cap = min(healthy tokens × per-token, disk, configured_max), \
              global across workspaces)",
-            interval.as_secs()
+            interval.as_secs(),
+            loom_daemon::build_slot::resolve_slots()
         );
         // Multi-workspace fan-out (#3928): re-reads `effective_roots()` each tick
         // and dispatches into each registered repo's own working tree via the
@@ -2497,8 +2491,6 @@ async fn main() -> Result<()> {
             interval,
             configured_max,
             per_token_concurrency,
-            cpu_utilization_target,
-            cpu_est_cores_per_sweep,
             max_admissions_per_tick,
             workspace_health_states.clone(),
             suppress_dispatch_during_gate,
@@ -4839,8 +4831,8 @@ struct ResolvedCapacity {
     /// fallback) — the "healthy tokens" input to the dynamic concurrency cap.
     token_axis_limit: usize,
     /// The effective dynamic cap consistent with `token_axis_limit`:
-    /// `min(token_axis_limit, disk_headroom, cpu_headroom, configured_max)`
-    /// (CPU term added in #3978).
+    /// `min(token_axis_limit, disk_headroom, configured_max)` (the CPU term
+    /// added in #3978 was removed in #4512).
     effective_cap: usize,
     /// Whether the token axis is the binding (minimum) constraint.
     token_bound: bool,
@@ -4874,24 +4866,15 @@ fn resolve_capacity(
             // pre-#3947 wire `0` as the effective floor of 1.
             let factor = report.per_token_concurrency.max(1);
             let token_axis_effective = token_axis_limit.saturating_mul(factor);
-            // The CPU term (#3978) is policy-floored at 1 by
-            // `cpu_headroom::cpu_headroom` on every real computation, so a wire
-            // value of exactly `0` unambiguously means "an older daemon that
-            // predates #3978 didn't send this field" (`#[serde(default)]`) —
-            // not a genuine zero-headroom reading. Treat it as unconstrained
-            // rather than collapsing the cap to 0 against a daemon that never
-            // computed a CPU term at all.
-            let cpu_headroom = if report.cpu_headroom == 0 {
-                usize::MAX
-            } else {
-                report.cpu_headroom
-            };
+            // #4512: the cap is min(token axis, disk, configured max). A
+            // pre-#4512 daemon still SENDS a `cpu_headroom` field; serde ignores
+            // it, and we deliberately do not reintroduce it into the client-side
+            // recomputation — the daemon's own `dynamic_cap` (shown as the
+            // headline below) remains the authority either way.
             let effective_cap = token_axis_effective
                 .min(report.disk_headroom)
-                .min(cpu_headroom)
                 .min(report.configured_max);
             let token_bound = token_axis_effective <= report.disk_headroom
-                && token_axis_effective <= cpu_headroom
                 && token_axis_effective <= report.configured_max;
             return ResolvedCapacity {
                 source: "probe",
@@ -4984,14 +4967,11 @@ fn build_status_json_value(
             // whatever cwd `loom-daemon status` itself was run from.
             "token_pool_dir": report.token_pool_dir,
             "disk_headroom": report.disk_headroom,
-            // CPU headroom term (#3978; measured-idle signal #4031) — see the
-            // field docs on `DaemonStatusReport::cpu_headroom` for the pre-#3978
-            // `0` ⇒ "field absent" wire-compat convention.
-            "cpu_headroom": report.cpu_headroom,
+            // Host CPU OBSERVATIONS (#3978/#4031), not cap terms: #4512 removed
+            // the CPU headroom term from admission. Reported because observed
+            // idle is the evidence for tuning `configured_max` on this machine.
             "logical_cpus": report.logical_cpus,
             "loadavg_1m": report.loadavg_1m,
-            // Measured CPU idle fraction (#4031), the signal that replaced
-            // loadavg as the source of consumed cores. `null` until sampled.
             "cpu_idle_fraction": report.cpu_idle_fraction,
             "configured_max": report.configured_max,
             "per_token_concurrency": report.per_token_concurrency.max(1),
@@ -5454,13 +5434,12 @@ fn print_status_human(
     let dispatch_token_axis = report.capacity.token_axis_limit;
     println!("\nDynamic concurrency cap: {dispatch_cap}  (the number dispatch uses)");
     println!(
-        "  = min(healthy {} × per-token {} = {}, disk headroom {}, cpu headroom {}, \
+        "  = min(healthy {} × per-token {} = {}, disk headroom {}, \
          configured max {})",
         dispatch_token_axis,
         factor,
         dispatch_token_axis.saturating_mul(factor),
         report.disk_headroom,
-        report.cpu_headroom,
         report.configured_max
     );
     if rc.source == "probe" && rc.effective_cap != dispatch_cap {
@@ -5473,36 +5452,32 @@ fn print_status_human(
             rc.token_axis_limit.saturating_mul(factor)
         );
     }
-    // CPU headroom detail (#3978 AC4; measured-idle signal #4031). The signal
-    // chain is measured idle → loadavg → static capacity, so the line names
-    // which signal actually fed the term. `logical_cpus == 0` means an older
+    // Host CPU OBSERVATION (#3978 AC4; measured-idle signal #4031) — since
+    // #4512 this is deliberately NOT a cap term: it is the evidence an operator
+    // uses to decide whether this machine's `maxConcurrent` should go up (host
+    // mostly idle) or not (host saturated). `logical_cpus == 0` means an older
     // daemon (pre-#3978) never sent these fields — nothing to show.
     if report.logical_cpus > 0 {
         let basis = match (report.cpu_idle_fraction, report.loadavg_1m) {
-            // Preferred: measured CPU consumption (#4031). Show consumed cores so
-            // the operator can see the term is tracking real usage, not loadavg.
-            (Some(idle), _) => {
+            (Some(idle), load) => {
                 let consumed = report.logical_cpus as f64 * (1.0 - idle.clamp(0.0, 1.0));
                 format!(
-                    "{} logical cores, {:.0}% idle measured (≈{:.1} cores consumed)",
+                    "{} logical cores, {:.0}% idle measured (≈{:.1} cores consumed){}",
                     report.logical_cpus,
                     idle * 100.0,
-                    consumed
+                    consumed,
+                    load.map_or_else(String::new, |l| format!(", 1m loadavg {l:.2}"))
                 )
             }
-            // Fallback: 1-minute load average (#3978 behavior) until an idle
-            // sample exists (e.g. the first Linux cross-tick delta not yet taken).
             (None, Some(load)) => format!(
-                "{} logical cores, 1m loadavg {load:.2} (no idle sample yet — loadavg fallback)",
+                "{} logical cores, 1m loadavg {load:.2} (no idle sample yet)",
                 report.logical_cpus
             ),
-            // Static capacity only: no CPU signal at all on this platform.
-            (None, None) => format!(
-                "{} logical cores, no CPU signal on this platform — static capacity only",
-                report.logical_cpus
-            ),
+            (None, None) => {
+                format!("{} logical cores, no CPU signal on this platform", report.logical_cpus)
+            }
         };
-        println!("  cpu headroom: {} concurrent-sweep slot(s) ({basis})", report.cpu_headroom);
+        println!("  host cpu (observed, not a cap term since #4512): {basis}");
     }
 
     // Token-capacity backpressure section (#3902, source-unified in #3936).
@@ -7878,40 +7853,49 @@ fn handle_recover_orphans_command(
     Ok(())
 }
 
-/// Handle `loom-daemon calibrate` (issue #4390): measure the host, print (or
-/// `--write` apply) the recommended `autonomous.workFinder.maxConcurrent` /
-/// `autonomous.perTokenConcurrency` values. See `loom_daemon::calibrate` for
-/// the measurement + recommendation policy this thinly wires up.
+/// Handle `loom-daemon calibrate` (issue #4390; measurement-only since #4512):
+/// measure the host + the currently-resolved knobs and print the
+/// `min(token axis, disk, maxConcurrent)` breakdown, which term binds, and the
+/// one-line tuning reading. See `loom_daemon::calibrate`.
+///
+/// `--write` is **accepted but ignored** with a deprecation notice: #4512
+/// removed the CPU-headroom term the recommendation was derived from, so there
+/// is nothing to compute and write — `maxConcurrent` is a per-machine knob the
+/// operator tunes from these measurements. Keeping the flag (rather than
+/// deleting it) means an existing `calibrate --write` in a script keeps exiting
+/// 0 instead of failing on an unknown argument.
+///
+/// The retired-knob deprecation notice is printed to **stderr** here rather than
+/// left to `work_finder::warn_deprecated_cpu_knobs`'s `log::warn!`: CLI
+/// subcommands return from `main` before `setup_logging()` runs, so on this path
+/// a log warning would go nowhere at all. stderr also keeps `--json`'s stdout
+/// payload clean for machine consumers.
 fn handle_calibrate_command(workspace: &str, write: bool, json: bool) -> Result<()> {
     use loom_daemon::calibrate;
     use loom_daemon::worktree_ops::repo;
 
     let repo_root = repo::resolve_repo_root(workspace)?;
-
     let measurements = calibrate::measure(&repo_root);
-    let recommendation = calibrate::recommend(&measurements);
 
-    let written = if write {
-        Some(
-            calibrate::write_workfinder_config(
-                &repo_root,
-                recommendation.recommended_max_concurrent,
-                recommendation.recommended_per_token_concurrency,
-            )
-            .map_err(|e| anyhow!("{e}"))?,
-        )
-    } else {
-        None
-    };
+    if let Some(notice) = loom_daemon::work_finder::deprecated_cpu_knob_notice(
+        &loom_daemon::work_finder::read_work_finder_config(&repo_root),
+    ) {
+        eprintln!("loom-daemon calibrate: {notice}");
+    }
+
+    if write {
+        eprintln!(
+            "loom-daemon calibrate: --write is deprecated and ignored (#4512). calibrate no \
+             longer derives a recommendation: the CPU-headroom admission term it was based on was \
+             removed, and autonomous.workFinder.maxConcurrent is now a per-machine knob you tune \
+             from the measurements below. Edit .loom/config.json directly, then restart the daemon."
+        );
+    }
 
     if json {
-        let report = calibrate::report_json(&measurements, &recommendation, written.as_deref());
-        println!("{}", serde_json::to_string_pretty(&report)?);
+        println!("{}", serde_json::to_string_pretty(&calibrate::report_json(&measurements))?);
     } else {
-        print!(
-            "{}",
-            calibrate::report_human(&measurements, &recommendation, written.as_deref())
-        );
+        print!("{}", calibrate::report_human(&measurements));
     }
 
     Ok(())
@@ -9079,7 +9063,6 @@ mod status_client_tests {
             token_pool_size: 4,
             token_pool_dir: Some(std::path::PathBuf::from("/repo/a/.loom/tokens")),
             disk_headroom: 10,
-            cpu_headroom: 6,
             logical_cpus: 8,
             loadavg_1m: Some(1.25),
             cpu_idle_fraction: Some(0.90),

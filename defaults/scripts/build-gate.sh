@@ -83,6 +83,33 @@ if [[ -z "${LOOM_BUILD_GATE_NICED:-}" \
   exec nice -n "${_gate_niceness}" "$0" "$@"
 fi
 
+# Machine-wide build slot (#4512).
+#
+# #4512 removed the CPU-headroom term from the daemon's admission formula (it
+# priced every sweep as a build and throttled a 95%-idle host to 2 concurrent
+# sweeps) and moved the protection HERE, to the stage that actually burns the
+# cores. Every invocation of this gate — the daemon's main-health gate, and each
+# sweep's post-builder quality gate in its own worktree — takes one machine-wide
+# slot before compiling, so N sweeps can run while at most LOOM_BUILD_SLOTS of
+# them build. Without this, deleting the admission-time CPU term would leave
+# nothing between N concurrent `cargo test --workspace` runs and the host.
+#
+# The lease NEVER blocks indefinitely and NEVER fails: it waits at most
+# LOOM_BUILD_SLOT_WAIT_SECS (default 300) and then degrades open, so a wedged or
+# crashed holder costs one build's worth of serialization, never this gate's
+# liveness. LOOM_BUILD_SLOTS=0 opts out entirely. When the daemon already holds
+# a slot around this command it exports LOOM_BUILD_SLOT_HELD=1 and the acquire
+# below is a re-entrant no-op rather than a wait on our own parent's slot.
+_build_slot_lib="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/build-slot.sh"
+if [[ -f "$_build_slot_lib" ]]; then
+  # shellcheck source=lib/build-slot.sh
+  source "$_build_slot_lib"
+  trap loom_build_slot_release EXIT
+  loom_build_slot_acquire "build-gate(${LOOM_BUILD_GATE_TIER:-full})"
+else
+  echo "[build-gate] note: lib/build-slot.sh not found — running unserialized (#4512)" >&2
+fi
+
 cd "$(git rev-parse --show-toplevel)"
 
 # Tiered gate mode (#4259). LOOM_BUILD_GATE_TIER selects the stage set:

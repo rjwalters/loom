@@ -620,13 +620,17 @@ print_safehouse_status() {
     fi
 }
 
-# ---------- calibrate binding-ceiling hint (#4390) ----------
+# ---------- calibrate binding-ceiling hint (#4390, re-based on #4512) ----------
 # `loom-daemon calibrate` is purely file/host-based (no running daemon
 # required, unlike `status`), so it is safe to run right here at start time.
-# One advisory line, printed only when the configured
-# `autonomous.workFinder.maxConcurrent` ceiling is CURRENTLY the binding term
-# AND both the cpu and token axes have at least 2x headroom above it -- i.e.
-# this host is obviously bigger than the shipped default was sized for.
+# One advisory line, printed only when `autonomous.workFinder.maxConcurrent` is
+# CURRENTLY the binding term AND the host is measurably idle -- i.e. this machine
+# is under-subscribed at its current knob.
+#
+# #4512 changed the basis: calibrate no longer computes a *recommended* value
+# (the CPU-headroom term it derived one from is gone; maxConcurrent is now a
+# per-machine knob tuned empirically), so the hint reports the observed idle
+# fraction instead of a number to copy.
 # Never fatal: a missing jq, a calibrate error, or an unparseable payload all
 # fall through silently -- this is advisory-only, exactly like
 # print_safehouse_status above.
@@ -638,22 +642,25 @@ print_calibrate_hint() {
     calib_json="$("$DAEMON_BIN" calibrate --workspace "$REPO_ROOT" --json 2>/dev/null)" || return 0
     [[ -n "$calib_json" ]] || return 0
 
-    local binding ceiling cpu token_axis recommended
-    binding=$(jq -r '.recommendation.binding_term_before // empty' <<<"$calib_json" 2>/dev/null)
+    local binding ceiling idle idle_pct
+    binding=$(jq -r '.binding_term // empty' <<<"$calib_json" 2>/dev/null)
     [[ "$binding" == "ceiling" ]] || return 0
 
     ceiling=$(jq -r '.measurements.configured_max_concurrent // empty' <<<"$calib_json" 2>/dev/null)
-    cpu=$(jq -r '.measurements.cpu_headroom // empty' <<<"$calib_json" 2>/dev/null)
-    token_axis=$(jq -r '.measurements.token_axis_effective // empty' <<<"$calib_json" 2>/dev/null)
-    recommended=$(jq -r '.recommendation.recommended_max_concurrent // empty' <<<"$calib_json" 2>/dev/null)
+    # Integer percent so the comparison below is plain shell arithmetic; `null`
+    # (no idle sample on this host yet) yields an empty string and we bail.
+    idle=$(jq -r '.measurements.cpu_idle_fraction // empty' <<<"$calib_json" 2>/dev/null)
+    [[ -n "$idle" ]] || return 0
+    idle_pct=$(jq -rn --argjson f "$idle" '($f * 100) | floor' 2>/dev/null) || return 0
 
-    # Defensively require all four to be plain non-negative integers before
-    # doing shell arithmetic on them.
-    [[ "$ceiling" =~ ^[0-9]+$ && "$cpu" =~ ^[0-9]+$ && "$token_axis" =~ ^[0-9]+$ && "$recommended" =~ ^[0-9]+$ ]] || return 0
+    # Defensively require plain non-negative integers before shell arithmetic.
+    [[ "$ceiling" =~ ^[0-9]+$ && "$idle_pct" =~ ^[0-9]+$ ]] || return 0
     (( ceiling > 0 )) || return 0
 
-    if (( cpu >= 2 * ceiling )) && (( token_axis >= 2 * ceiling )); then
-        warn "ceiling ${ceiling} binds; this host could run ${recommended} -- run 'loom-daemon calibrate'"
+    # 50% idle mirrors calibrate::IDLE_HEADROOM_FRACTION -- the "grossly
+    # under-subscribed" bar (#4512's motivating host measured 95% idle at cap 2).
+    if (( idle_pct >= 50 )); then
+        warn "maxConcurrent ${ceiling} binds while the host is ${idle_pct}% idle -- consider raising autonomous.workFinder.maxConcurrent ('loom-daemon calibrate' for the full reading)"
     fi
 }
 
