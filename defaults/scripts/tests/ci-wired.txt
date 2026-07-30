@@ -12,6 +12,7 @@ test-archive-transcripts.sh
 test-blame-issue.sh
 test-build-rs-watchset.sh
 test-build-slot.sh
+test-champion-critical-file-check.sh
 test-check-duplicate.sh
 test-check-git-identity.sh
 test-check-host-sleep.sh

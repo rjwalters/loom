@@ -111,8 +111,11 @@ echo "PASS: Label check"
 ```bash
 PR_NUMBER=<number>
 
-# What files, and how the diff is distributed across them
-gh pr view "$PR_NUMBER" --json files --jq '.files[] | "\(.additions)+/\(.deletions)- \(.path)"'
+# What files, and how the diff is distributed across them. Use the paginated
+# REST endpoint, not `gh pr view --json files` — that field silently
+# truncates at 100 files with no error (see criterion #3 below and #4613),
+# which on a 100+ file PR would hide files from this risk read too.
+gh api "repos/{owner}/{repo}/pulls/$PR_NUMBER/files" --paginate --jq -r '.[] | "\(.additions)+/\(.deletions)- \(.filename)"'
 
 # The actual diff (read it — the load-bearing hunks are what you are judging)
 gh pr diff "$PR_NUMBER"
@@ -201,8 +204,17 @@ fi
 
 **Verification command**:
 ```bash
-# Get all changed files
-FILES=$(gh pr view <number> --json files --jq -r '.files[].path')
+# Get ALL changed files via the paginated REST endpoint, NOT `gh pr view
+# --json files`. The latter silently truncates at 100 files with no error or
+# warning (confirmed empirically: a 117-changed-file PR returns exactly 100
+# entries from `gh pr view --json files`, dropping the rest) — on a PR with
+# more than 100 changed files this can drop a critical file straight out of
+# FILES with no signal that anything was skipped. This was the confirmed
+# false-negative mechanism on PR #4611 (#4613): a removed
+# `.github/workflows/gitea-integration.yml` was skipped in one Champion
+# instance's evaluation over a 117-file PR. `--paginate` walks every page of
+# the REST response regardless of file count.
+FILES=$(gh api "repos/{owner}/{repo}/pulls/<number>/files" --paginate --jq -r '.[].filename')
 
 # Define critical patterns (extend as needed)
 CRITICAL_PATTERNS=(
@@ -215,7 +227,14 @@ CRITICAL_PATTERNS=(
   "migration"
 )
 
-# Check each file against patterns
+# Check each file against patterns. This loop MUST actually run over the full
+# $FILES list above — do not skip straight to "PASS" or "no critical-file
+# changes" in any comment/summary without having executed it. A rejection or
+# pass comment that states a criterion's result without the corresponding
+# variable/command backing it is exactly the boilerplate-text failure mode
+# that produced the PR #4611 false negative (#4613): reuse the FAIL/PASS
+# lines emitted here verbatim in any later comment, never restate them from
+# memory.
 for file in $FILES; do
   for pattern in "${CRITICAL_PATTERNS[@]}"; do
     if [[ "$file" == *"$pattern"* ]]; then
@@ -231,6 +250,8 @@ echo "PASS: No critical files modified"
 **Rationale**: Changes to these files require careful human review due to high impact.
 
 This criterion is deliberately kept **in addition to** the merge-risk judgment in criterion #2, not folded into it: it is a deterministic, wording-independent floor that hard-fails on a known list of filenames no matter how the judgment call goes. Criterion #2 is the open-ended complement — it covers the high-blast-radius surfaces this list does not enumerate (see Edge Case 10 in `champion-reference.md`: the pattern list is known to miss new critical files). Neither replaces the other, and `loom:auto-merge-ok` overrides only #2.
+
+**Regression note (#4613, PR #4611 incident, 2026-07-30)**: a concurrent Champion evaluation of a 117-changed-file PR posted a comment claiming "no critical-file changes" while the PR actually removed a `.github/workflows/*.yml` file matching this criterion's own pattern list. The evaluation used `gh pr view --json files`, which truncates at 100 files with no error, and/or asserted the pass without re-running the loop above. Always fetch files via the paginated `gh api .../pulls/<number>/files --paginate` command shown above, and never assert this criterion's result in prose without having just executed that loop against the full file list.
 
 ### 4. Merge Conflict Check
 - [ ] PR is mergeable (no conflicts with base branch)
@@ -350,6 +371,18 @@ For each candidate PR, check ALL 6 criteria in order. If any criterion fails, sk
 ### Step 2: Add Pre-Merge Comment
 
 Before merging, add a comment documenting why the PR is safe to auto-merge.
+
+**Every bullet below is a claim about a specific criterion's result, not
+boilerplate praise — only write it if that criterion's check-loop actually ran
+in Step 1 of *this* pass and produced that result.** In particular, "No
+critical files modified" must only appear if criterion #3's `for file in
+$FILES` loop (paginated file list) just executed to completion with zero
+matches, and "No merge conflicts" only if criterion #4's `mergeable` check
+just returned `MERGEABLE` — never restate either from memory, from a stale
+prior pass, or as a template fill-in. This is a direct regression guard for
+#4613 (PR #4611 incident): a Champion pass claimed "no critical-file changes"
+in a comment without the check having actually run against the full file
+list.
 
 ```bash
 PR_NUMBER=$1
