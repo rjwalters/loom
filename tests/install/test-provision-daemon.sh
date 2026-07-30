@@ -69,6 +69,20 @@ trap 'rm -rf "$WORKDIR"' EXIT
 # exercise the gate itself with the bypass explicitly unset.
 export LOOM_PROVISION_ALLOW_SCRIPT=1
 
+# Portable mtime (epoch secs). GNU `stat -c` first (it is an illegal option on
+# BSD/macOS, so it fails cleanly there), then BSD `stat -f %m`. The reverse
+# order MISFIRES on GNU: `stat -f %m <path>` there means --file-system (a bare
+# mode flag), which prints a multi-line filesystem report to STDOUT while
+# exiting non-zero — `2>/dev/null || fallback` only silences stderr, so the
+# report leaks into the captured value and corrupts the comparison below.
+file_mtime() {
+  local v
+  v="$(stat -c %Y "$1" 2>/dev/null || true)"
+  [[ "$v" =~ ^[0-9]+$ ]] || v="$(stat -f %m "$1" 2>/dev/null || true)"
+  [[ "$v" =~ ^[0-9]+$ ]] || v=""
+  printf '%s\n' "$v"
+}
+
 # Build a fake loom-daemon binary that prints $1 as its --version.
 make_fake_bin() {
   local path="$1" ver="$2"
@@ -95,11 +109,11 @@ assert_contains "fresh-install output names the destination" "$out1" "$DEST1/loo
 # ---------- test 2: idempotent — same version is a no-op copy ----------
 # Record mtime, run again, assert it did not re-copy (mtime unchanged) and it
 # reports "already current".
-before_mtime=$(stat -f %m "$DEST1/loom-daemon" 2>/dev/null || stat -c %Y "$DEST1/loom-daemon")
+before_mtime=$(file_mtime "$DEST1/loom-daemon")
 sleep 1
 out2=$(LOOM_DAEMON_BIN_DIR="$DEST1" provision_machine_daemon "$SRC1" 2>&1)
 rc2=$?
-after_mtime=$(stat -f %m "$DEST1/loom-daemon" 2>/dev/null || stat -c %Y "$DEST1/loom-daemon")
+after_mtime=$(file_mtime "$DEST1/loom-daemon")
 assert_eq "idempotent run returns 0" "0" "$rc2"
 assert_eq "idempotent run does NOT re-copy (mtime unchanged)" "$before_mtime" "$after_mtime"
 assert_contains "idempotent run reports already current" "$out2" "already current"
