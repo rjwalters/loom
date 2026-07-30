@@ -822,6 +822,10 @@ enum CheckpointAction {
 }
 
 /// Sub-actions for `loom-daemon sweep-experiment` (issue #4275).
+// `Record` carries the full outcome-chain field set, so it is much larger
+// than the other variants; boxing it would only add an allocation to a
+// once-per-invocation CLI parse.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum SweepExperimentAction {
     /// Print the effective tri-state mode (after the canary guardrail).

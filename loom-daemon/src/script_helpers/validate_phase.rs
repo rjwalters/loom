@@ -106,7 +106,7 @@ impl ValidationResult {
 
 /// Everything a validation run needs, so the whole surface stays testable
 /// without touching the process environment.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ValidateOpts {
     pub phase: String,
     pub issue: i64,
@@ -121,21 +121,6 @@ pub struct ValidateOpts {
     /// failure. Used by retry loops so an intermediate failure does not leave a
     /// noisy comment behind after the sweep later recovers (issue #2609).
     pub quiet: bool,
-}
-
-impl Default for ValidateOpts {
-    fn default() -> Self {
-        Self {
-            phase: String::new(),
-            issue: 0,
-            worktree: None,
-            pr_number: None,
-            task_id: None,
-            json_output: false,
-            check_only: false,
-            quiet: false,
-        }
-    }
 }
 
 // --------------------------------------------------------------------------
@@ -2201,30 +2186,30 @@ mod tests {
         assert_eq!(parse_pr_number(""), None);
         assert_eq!(parse_pr_number("not-a-number"), None);
     }
-}
 
-/// Test-only helper mirroring the Python's "lowercase the first character"
-/// behavior, so the expectation in `conventional_titles_add_a_prefix_when_absent`
-/// reads as the rule rather than a hardcoded string.
-#[cfg(test)]
-trait LowercaseFirst {
-    fn to_lowercase_first(&self) -> String;
-}
+    /// Test-only helper mirroring the Python's "lowercase the first character"
+    /// behavior, so the expectation in `conventional_titles_add_a_prefix_when_absent`
+    /// reads as the rule rather than a hardcoded string.
+    #[cfg(test)]
+    trait LowercaseFirst {
+        fn to_lowercase_first(&self) -> String;
+    }
 
-#[cfg(test)]
-impl LowercaseFirst for str {
-    fn to_lowercase_first(&self) -> String {
-        // "feat: Strip ANSI escapes" -> "feat: strip ANSI escapes"
-        match self.split_once(": ") {
-            Some((prefix, rest)) => {
-                let mut chars = rest.chars();
-                let first = chars
-                    .next()
-                    .map(|c| c.to_lowercase().to_string())
-                    .unwrap_or_default();
-                format!("{prefix}: {first}{}", chars.as_str())
+    #[cfg(test)]
+    impl LowercaseFirst for str {
+        fn to_lowercase_first(&self) -> String {
+            // "feat: Strip ANSI escapes" -> "feat: strip ANSI escapes"
+            match self.split_once(": ") {
+                Some((prefix, rest)) => {
+                    let mut chars = rest.chars();
+                    let first = chars
+                        .next()
+                        .map(|c| c.to_lowercase().to_string())
+                        .unwrap_or_default();
+                    format!("{prefix}: {first}{}", chars.as_str())
+                }
+                None => self.to_string(),
             }
-            None => self.to_string(),
         }
     }
 }

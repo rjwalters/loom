@@ -110,11 +110,16 @@ fi
 
 VENV_PATH="$LOOM_TOOLS/.venv"
 # Sentinel binary used to detect a complete installation. Must be a command
-# defined in loom-tools/pyproject.toml [project.scripts]. loom-claim is stable
-# (core dispatch-claim command) and its --help short-circuits with sys.exit(0)
-# before any forge queries, so the runtime verify step below works offline.
-# (Was loom-status until epic #4081 phase 3 (#4274) deleted status.py.)
-LOOM_SENTINEL="$VENV_PATH/bin/loom-claim"
+# defined in loom-tools/pyproject.toml [project.scripts], and its --help must
+# short-circuit before any network/forge access so the runtime verify step below
+# works offline.
+#
+# History: loom-status (until #4274 deleted status.py) -> loom-claim (until
+# #4275, epic #4081 phase 3 family 5, ported claim.py to `loom-daemon claim`)
+# -> loom-tokens. loom-tokens is the right long-term choice: it backs the token
+# pool, which is the one part of loom-tools with no pending port, so this
+# sentinel should not need rechasing as the remaining families land.
+LOOM_SENTINEL="$VENV_PATH/bin/loom-tokens"
 
 # Check-only mode
 if [[ "$CHECK_ONLY" == "true" ]]; then
@@ -174,12 +179,12 @@ info "Installing loom-tools..."
 
 # Verify installation
 if [[ ! -x "$LOOM_SENTINEL" ]]; then
-  error "Installation verification failed: loom-claim not found"
+  error "Installation verification failed: loom-tokens not found"
 fi
 
 # Test that it runs
 if ! "$LOOM_SENTINEL" --help &>/dev/null; then
-  error "Installation verification failed: loom-claim cannot run"
+  error "Installation verification failed: loom-tokens cannot run"
 fi
 
 success "loom-tools installed successfully"

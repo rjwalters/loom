@@ -157,8 +157,13 @@ sign_daemon_binary() {
 # Issue #4272 (epic #4081 Phase 3 family 2): install a thin PATH shim next to
 # the provisioned `loom-daemon` binary so operator muscle-memory commands
 # (`loom-clean`, `loom-recover-orphans`) keep working with zero pip installs
-# now that their Python console-script entry points are removed. Each shim
-# is a tiny script that execs `loom-daemon <daemon_subcommand> "$@"` —
+# now that their Python console-script entry points are removed. Issue #4275
+# (family 5) adds `loom-claim` for the same reason, but with a stronger
+# requirement: that name is not muscle memory, it is an AGENT-FACING contract —
+# `builder-worktree.md` instructs builders to run `loom-claim claim <issue>
+# <agent-id>` and branches on its exit codes, behind a `command -v loom-claim`
+# guard that would silently disable file-based claiming if the name vanished.
+# Each shim is a tiny script that execs `loom-daemon <daemon_subcommand> "$@"` —
 # resolved via `dest_dir` at call time (not baked in), so a later daemon
 # rebuild/reprovision at the same path is picked up automatically.
 #
@@ -266,6 +271,7 @@ provision_machine_daemon() {
       _pmd_ok "already current at $dest_bin ($dest_ver)"
       _pmd_install_shim "loom-clean" "clean" "$dest_dir"
       _pmd_install_shim "loom-recover-orphans" "recover-orphans" "$dest_dir"
+      _pmd_install_shim "loom-claim" "claim" "$dest_dir"
       _pmd_check_path "$dest_dir"
       return 0
     fi
@@ -288,6 +294,7 @@ provision_machine_daemon() {
     sign_daemon_binary "$dest_bin"
     _pmd_install_shim "loom-clean" "clean" "$dest_dir"
     _pmd_install_shim "loom-recover-orphans" "recover-orphans" "$dest_dir"
+    _pmd_install_shim "loom-claim" "claim" "$dest_dir"
   else
     _pmd_warn "failed to install loom-daemon to $dest_bin"
     _pmd_warn "set LOOM_DAEMON_BIN=$src_bin in the consumer env to run the daemon"
