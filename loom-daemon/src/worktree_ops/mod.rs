@@ -28,5 +28,5 @@ pub mod logs;
 pub(crate) mod naming;
 pub mod orphan_recovery;
 pub mod repo;
-mod safety;
+pub(crate) mod safety;
 mod spawn_loop_state;

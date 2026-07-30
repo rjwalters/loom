@@ -2210,6 +2210,35 @@ the forge** (best-effort, fail-open on a `gh` error) — this covers all three
 watchdogs, since each re-dispatches through the same method, so no self-heal path
 can ever re-claim a closed/merged issue.
 
+**Mid-build-death live-use veto (#4449).** The mid-build-death watchdog (#3895)
+infers "died mid-build" from `(terminal state ∧ no PR ∧ dirty worktree)` and then
+resets the worktree (`git reset --hard` + `git clean -fd`) before re-dispatching.
+That signature is necessary but **not sufficient**: on 2026-07-29 the daemon's
+tracked sweep for issue #4366 had indeed died, but an *untracked* recovery session
+was concurrently editing the same worktree — and the watchdog destroyed its
+tested-but-uncommitted fix mid `git commit`. `git status` cannot tell dead-sweep
+debris from a live session's work in progress, so the watchdog now also requires
+that **nothing live still holds the worktree**. Four signals veto the reset (any
+one is enough):
+
+| Signal | What it means |
+|--------|---------------|
+| `.loom-in-use` marker in the worktree | A session (including a manual, non-daemon one) claims it. This is the one an operator can plant by hand to fence off a worktree. |
+| `.loom/locks/issue-<N>/owner.json` whose `owner_pid` is **alive** | A live claim holder. A dead owner's lock is ignored, so a stale lock never wedges recovery. |
+| `index.lock` in the worktree's gitdir | A git index write (`git add`/`git commit`) is in flight — precisely the #4449 window. |
+| A live process whose cwd is inside the worktree | An operator shell, a manual role session, or an orphaned grandchild still writing files. |
+
+A veto logs one loud `midbuild-watchdog: … REFUSING to git reset --hard …` line
+naming the holder, leaves the worktree untouched, and **does not consume** the
+single recovery retry — so a genuinely-dead sweep is still recovered on a later
+tick once the holder goes away. If the holder is stale, clear it (remove
+`.loom-in-use` / the claim-lock / the `index.lock`, or exit the shell) and the
+next tick recovers normally. Independently, every `clean_worktree` call now logs
+the porcelain status + diffstat of what it is about to destroy, so a wipe can
+never again be silent in the daemon log. The same defense-in-depth guard exists on
+the script side: `worktree.sh remove <N>` refuses a worktree with uncommitted
+changes and requires an explicit `--force` to discard them.
+
 **Review-phase stall watchdog (#3910).** The startup watchdog rescues a sweep
 that shows *no* progress, and the mid-build-death watchdog (#3895) rescues one
 that made progress then *died*. Neither covers a sweep that is **still alive**

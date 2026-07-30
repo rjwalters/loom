@@ -941,10 +941,31 @@ pub fn review_stall_decision(
 // philosophy as #3892). A pre-flight token-health gate reads `.ranking` and
 // defers the re-dispatch when the whole pool is exhausted, so a mid-run
 // exhaustion is less likely to recur.
+//
+// ## The live-use veto (Issue #4449)
+//
+// That signature is NECESSARY but not SUFFICIENT, which cost real work on
+// 2026-07-29: the daemon's tracked sweep for issue #4366 had indeed died, but a
+// separate, untracked recovery Doctor session was concurrently editing the same
+// worktree. `(terminal ∧ no PR ∧ dirty)` matched, the watchdog ran
+// `git reset --hard` + `git clean -fd`, and a tested-but-uncommitted fix was
+// destroyed in the window between the test run and `git commit`.
+//
+// Dirtiness cannot distinguish "debris a dead sweep left behind" from "a live
+// session's work in progress" — both look identical to `git status`. So the
+// watchdog now requires a second, independent condition: NOTHING LIVE may still
+// hold the worktree. `SweepRegistry::worktree_in_use` gathers four signals (a
+// `.loom-in-use` marker, a claim-lock whose owner PID is alive, an in-flight
+// `index.lock`, and processes whose cwd is inside the worktree); any one of them
+// vetoes the reset, yielding `MidbuildDecision::InUse` — logged loudly, with the
+// single recovery retry left unconsumed so a genuinely-dead sweep is still
+// recovered on a later tick once the holder goes away. And `clean_worktree` now
+// logs the porcelain status + diffstat of everything it is about to destroy, so
+// a wipe can never again be silent in the daemon log.
 
 /// The mid-build-death watchdog's per-sweep decision (Issue #3895). Pure state
 /// machine — [`midbuild_decision`] maps `(worktree_dirty, produced_pr,
-/// already_retried)` onto exactly one of these.
+/// already_retried, worktree_in_use)` onto exactly one of these.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MidbuildDecision {
     /// Not a mid-build death (no dirty worktree, or a PR was produced) — leave
@@ -956,28 +977,165 @@ pub enum MidbuildDecision {
     /// A dead sweep matching the signature but already recovered once — give up
     /// (bounded: never loop). Left for the operator.
     GiveUp,
+    /// The signature matches BUT the worktree is still held by a live session
+    /// the daemon does not track (Issue #4449) — refuse the destructive reset
+    /// and leave both the worktree and the single recovery retry untouched.
+    InUse,
 }
 
-/// Pure mid-build-death state machine (Issue #3895).
+/// Pure mid-build-death state machine (Issue #3895, extended by #4449).
 ///
 /// - No dirty worktree, or the sweep already produced a PR ⇒
 ///   [`MidbuildDecision::Healthy`] (nothing to recover).
-/// - Dirty worktree + no PR + not yet recovered ⇒ [`MidbuildDecision::Recover`].
-/// - Dirty worktree + no PR + already recovered ⇒ [`MidbuildDecision::GiveUp`]
-///   — the recovery is bounded to exactly one re-dispatch per issue.
+/// - Dirty worktree + no PR + **a live session still using the worktree** ⇒
+///   [`MidbuildDecision::InUse`] (#4449). This gate sits *above* the retry
+///   bookkeeping on purpose: "someone is editing this right now" is never a
+///   dead-sweep-recovery candidate, and a refusal must not burn the single
+///   recovery retry (the worktree may be legitimately free on a later tick).
+/// - Dirty worktree + no PR + not in use + not yet recovered ⇒
+///   [`MidbuildDecision::Recover`].
+/// - Dirty worktree + no PR + not in use + already recovered ⇒
+///   [`MidbuildDecision::GiveUp`] — the recovery is bounded to exactly one
+///   re-dispatch per issue.
+///
+/// # Why the in-use gate exists (#4449)
+///
+/// Before #4449 the watchdog inferred "died mid-build" from `(terminal state ∧
+/// no PR ∧ dirty worktree)` alone and immediately reset the worktree. On
+/// 2026-07-29 that inference was wrong: the daemon's own tracked sweep for
+/// issue #4366 *had* died, but a separate, untracked recovery Doctor session was
+/// concurrently and legitimately working in the same worktree. The watchdog read
+/// that session's uncommitted fix as dead-sweep debris and destroyed it mid
+/// `git commit`. Dirtiness alone cannot distinguish the two cases — only a
+/// liveness signal can.
 #[must_use]
 pub fn midbuild_decision(
     worktree_dirty: bool,
     produced_pr: bool,
     already_retried: bool,
+    worktree_in_use: bool,
 ) -> MidbuildDecision {
     if !worktree_dirty || produced_pr {
         MidbuildDecision::Healthy
+    } else if worktree_in_use {
+        MidbuildDecision::InUse
     } else if already_retried {
         MidbuildDecision::GiveUp
     } else {
         MidbuildDecision::Recover
     }
+}
+
+/// One piece of evidence that a *live* process is still using an issue
+/// worktree, gathered by [`SweepRegistry::worktree_in_use`] (Issue #4449).
+///
+/// Any non-empty set of evidence vetoes the mid-build watchdog's destructive
+/// `git reset --hard` / `git clean -fd` path. Each variant carries enough detail
+/// to name the holder in the daemon log so a refusal is actionable rather than
+/// mysterious.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorktreeUseEvidence {
+    /// A `.loom-in-use` marker file names an owning session. Written by flows
+    /// that enter a worktree (including manual, non-daemon sessions), so this
+    /// is the one signal an operator can set by hand to fence off a worktree.
+    InUseMarker { task_id: String, pid: String },
+    /// A claim-lock (`.loom/locks/issue-<N>/owner.json`) whose recorded owner
+    /// PID is still alive. A dead owner's lock is *not* evidence (the reaper /
+    /// `reconstruct` prune those), so this only fires for a genuinely live
+    /// claim the in-memory registry does not represent as active.
+    LiveClaimLock { pid: u32, sweep_id: String },
+    /// One or more live processes have their current working directory inside
+    /// the worktree — an operator's shell, a manual role session, or an
+    /// orphaned grandchild still writing files.
+    LiveProcesses(Vec<u32>),
+    /// A git operation is mid-flight (`index.lock` present) — precisely the
+    /// `git commit` window in which #4449 lost an uncommitted fix.
+    GitOperationInFlight(PathBuf),
+}
+
+impl std::fmt::Display for WorktreeUseEvidence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InUseMarker { task_id, pid } => {
+                write!(f, ".loom-in-use marker (task: {task_id}, pid: {pid})")
+            }
+            Self::LiveClaimLock { pid, sweep_id } => {
+                write!(f, "live claim-lock owner (pid {pid}, sweep {sweep_id})")
+            }
+            Self::LiveProcesses(pids) => {
+                write!(f, "live process(es) with cwd inside the worktree: {pids:?}")
+            }
+            Self::GitOperationInFlight(path) => {
+                write!(f, "git operation in flight ({} exists)", path.display())
+            }
+        }
+    }
+}
+
+/// Render a set of [`WorktreeUseEvidence`] as a single `; `-joined log fragment.
+#[must_use]
+pub fn describe_worktree_use(evidence: &[WorktreeUseEvidence]) -> String {
+    evidence
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Max lines of `git status` / `git diff --stat` echoed into the
+/// "about to discard" log line (Issue #4449) — enough to identify the lost work,
+/// bounded so a runaway worktree cannot flood the daemon log.
+const DISCARD_LOG_MAX_LINES: usize = 40;
+
+/// Truncate `text` to at most `max` lines, appending a `… (+N more)` marker when
+/// lines were dropped. Returns an empty string for empty/blank input.
+#[must_use]
+fn truncate_lines(text: &str, max: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let lines: Vec<&str> = trimmed.lines().collect();
+    if lines.len() <= max {
+        return lines.join("\n");
+    }
+    let extra = lines.len() - max;
+    let mut out = lines[..max].join("\n");
+    out.push_str(&format!("\n… (+{extra} more line(s))"));
+    out
+}
+
+/// Resolve a worktree's `index.lock` path — the marker git holds while an index
+/// write (`git add`, `git commit`, …) is in flight (Issue #4449).
+///
+/// Asks git itself (`git rev-parse --git-path index.lock`) rather than assuming
+/// `<wt>/.git/index.lock`, because a linked worktree's `.git` is a *file*
+/// pointing at `.git/worktrees/<name>/`. Returns `None` when the path cannot be
+/// resolved (not a repo, git unavailable) — the caller treats that as "no
+/// evidence" and relies on the other signals.
+#[must_use]
+fn git_index_lock_path(worktree: &Path) -> Option<PathBuf> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["rev-parse", "--git-path", "index.lock"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let rel = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if rel.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(&rel);
+    // `--git-path` yields a path relative to the *worktree* when git was invoked
+    // with `-C <worktree>`; absolutise it so `exists()` is cwd-independent.
+    Some(if path.is_absolute() {
+        path
+    } else {
+        worktree.join(path)
+    })
 }
 
 /// Decide, from a `.loom/tokens/.ranking` file's contents, whether the token
@@ -1712,6 +1870,12 @@ pub struct SweepRegistry {
     /// Issues the mid-build-death watchdog has already logged a give-up for
     /// (Issue #3895), so the loud give-up warning fires once per issue.
     midbuild_gaveup: HashSet<u32>,
+    /// Issues whose worktree the mid-build-death watchdog has already refused to
+    /// reset because a live, untracked session still holds it (Issue #4449).
+    /// Log-once bookkeeping only — it never suppresses the refusal itself, and
+    /// the issue is removed again as soon as the worktree stops being in use so a
+    /// later refusal (or a genuine give-up) still surfaces.
+    midbuild_inuse: HashSet<u32>,
     /// Issues the review-phase stall watchdog has already restarted once (Issue
     /// #3910). Bounds the "log went silent mid-review (hung Judge/Doctor)"
     /// recovery to a single re-dispatch per issue — a second stall resolves to
@@ -1876,6 +2040,7 @@ impl SweepRegistry {
             watchdog_progressed: HashSet::new(),
             midbuild_retried: HashSet::new(),
             midbuild_gaveup: HashSet::new(),
+            midbuild_inuse: HashSet::new(),
             review_stall_retried: HashSet::new(),
             review_stall_gaveup: HashSet::new(),
             quarantine_config: QuarantineConfig::default(),
@@ -1910,6 +2075,7 @@ impl SweepRegistry {
             watchdog_progressed: HashSet::new(),
             midbuild_retried: HashSet::new(),
             midbuild_gaveup: HashSet::new(),
+            midbuild_inuse: HashSet::new(),
             review_stall_retried: HashSet::new(),
             review_stall_gaveup: HashSet::new(),
             quarantine_config: QuarantineConfig::default(),
@@ -5492,16 +5658,132 @@ impl SweepRegistry {
         }
     }
 
+    /// Gather every signal that issue `N`'s worktree is still being used by a
+    /// **live** process the in-memory registry does not represent as an active
+    /// sweep (Issue #4449). An empty vec means "no live holder found".
+    ///
+    /// This is the veto gate on the mid-build watchdog's destructive path. It
+    /// deliberately fails *closed* on ambiguity in the one direction that matters:
+    /// any positive signal blocks the reset. Signals that cannot be probed on
+    /// this host simply contribute nothing (the probe helpers already degrade to
+    /// "unknown ⇒ empty"), so a host without `/proc` or `lsof` still gets the
+    /// marker / claim-lock / index.lock signals.
+    ///
+    /// Order is cheapest-first so the common "nothing is using it" case does the
+    /// least work: two `stat`s and a `read_to_string` before the process scan.
+    fn worktree_in_use(&self, issue: u32) -> Vec<WorktreeUseEvidence> {
+        let wt = self.worktree_path(issue);
+        let mut evidence = Vec::new();
+        if !wt.exists() {
+            return evidence;
+        }
+
+        // 1. Explicit `.loom-in-use` marker — the one signal a manual session
+        //    (or an operator) can plant by hand to fence off a worktree.
+        if let Some(marker) = crate::worktree_ops::safety::read_in_use_marker(&wt) {
+            evidence.push(WorktreeUseEvidence::InUseMarker {
+                task_id: marker.task_id,
+                pid: marker.pid,
+            });
+        }
+
+        // 2. A claim-lock whose recorded owner PID is still alive. A dead owner
+        //    is NOT evidence — the reaper and `reconstruct` prune those, and
+        //    treating a stale lock as "in use" would wedge legitimate recovery.
+        let owner_path = self
+            .config
+            .locks_dir()
+            .join(format!("issue-{issue}"))
+            .join("owner.json");
+        if let Some(owner) = std::fs::read_to_string(&owner_path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<LockOwner>(&s).ok())
+        {
+            if is_pid_alive(owner.owner_pid) {
+                evidence.push(WorktreeUseEvidence::LiveClaimLock {
+                    pid: owner.owner_pid,
+                    sweep_id: owner.sweep_id,
+                });
+            }
+        }
+
+        // 3. A git operation mid-flight (`index.lock`) — the exact `git commit`
+        //    window in which #4449 destroyed an uncommitted fix.
+        if let Some(lock) = git_index_lock_path(&wt) {
+            if lock.exists() {
+                evidence.push(WorktreeUseEvidence::GitOperationInFlight(lock));
+            }
+        }
+
+        // 4. Live processes with a cwd inside the worktree (shells, manual role
+        //    sessions, orphaned grandchildren still writing files).
+        let pids = crate::worktree_ops::safety::find_processes_using_directory(&wt);
+        if !pids.is_empty() {
+            evidence.push(WorktreeUseEvidence::LiveProcesses(pids));
+        }
+
+        evidence
+    }
+
+    /// Record, at `warn`, exactly what a [`clean_worktree`] call is about to
+    /// destroy (Issue #4449) — the porcelain status plus a diffstat, truncated to
+    /// [`DISCARD_LOG_MAX_LINES`]. A wipe must never be silent in the daemon log:
+    /// this line is the only forensic trace that survives the `reset --hard`.
+    ///
+    /// [`clean_worktree`]: SweepRegistry::clean_worktree
+    fn log_worktree_discard(&self, wt: &Path, issue: u32) {
+        let run = |args: &[&str]| -> String {
+            Command::new("git")
+                .arg("-C")
+                .arg(wt)
+                .args(args)
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim_end().to_string())
+                .unwrap_or_default()
+        };
+        let status = truncate_lines(
+            &run(&["status", "--porcelain", "--untracked-files=all"]),
+            DISCARD_LOG_MAX_LINES,
+        );
+        let diffstat = truncate_lines(&run(&["diff", "--stat", "HEAD"]), DISCARD_LOG_MAX_LINES);
+        if status.is_empty() && diffstat.is_empty() {
+            // Nothing probeable to report (missing git, unborn HEAD, …) — still
+            // announce the destructive action so the log shows it happened.
+            log::warn!(
+                "clean-worktree: discarding uncommitted state in {} (issue #{issue}) via \
+                 `git reset --hard` + `git clean -fd`; could not enumerate the discarded \
+                 changes (#4449).",
+                wt.display()
+            );
+            return;
+        }
+        log::warn!(
+            "clean-worktree: DISCARDING uncommitted state in {} (issue #{issue}) via \
+             `git reset --hard` + `git clean -fd` — this is irreversible (#4449).\n\
+             status --porcelain:\n{status}\n\
+             diff --stat HEAD:\n{diffstat}",
+            wt.display()
+        );
+    }
+
     /// Discard a mid-build-death worktree's uncommitted changes so the
     /// re-dispatched sweep resumes from a clean checkout (Issue #3895): a
     /// `git reset --hard` followed by `git clean -fd`. Best-effort — any commits
     /// the dead sweep managed to make are preserved (only the dirty working tree
     /// and untracked files are dropped).
+    ///
+    /// Every call first logs what it is about to destroy via
+    /// [`log_worktree_discard`](Self::log_worktree_discard) (Issue #4449) — the
+    /// #4449 incident was made unrecoverable partly because the wipe left no
+    /// trace at all in the daemon log.
     fn clean_worktree(&self, issue: u32) -> Result<()> {
         let wt = self.worktree_path(issue);
         if !wt.exists() {
             return Ok(());
         }
+        self.log_worktree_discard(&wt, issue);
         let reset = Command::new("git")
             .arg("-C")
             .arg(&wt)
@@ -5572,6 +5854,16 @@ impl SweepRegistry {
     /// re-dispatch (without consuming the single retry) when the whole pool is
     /// `exhausted`/`blocked`, so a mid-run exhaustion is less likely to recur.
     ///
+    /// **Live-use veto (Issue #4449)**: before anything destructive happens, a
+    /// dirty worktree is probed for live holders ([`worktree_in_use`]). A dirty
+    /// worktree is only *dead-sweep debris* if nothing live still owns it — if a
+    /// `.loom-in-use` marker, a live claim-lock owner, an in-flight `index.lock`,
+    /// or a process with its cwd inside the worktree says otherwise, the decision
+    /// resolves to [`MidbuildDecision::InUse`]: log loudly, touch nothing, and do
+    /// **not** consume the single recovery retry.
+    ///
+    /// [`worktree_in_use`]: SweepRegistry::worktree_in_use
+    ///
     /// No new event topics are introduced (the taxonomy is frozen): the
     /// re-dispatch reuses `sweep.global.dispatch` from [`dispatch`], and a
     /// bounded give-up / a pool-exhausted defer surface on the existing frozen
@@ -5603,8 +5895,39 @@ impl SweepRegistry {
                 continue;
             }
             let dirty = self.worktree_dirty(issue);
+            // #4449: a dirty worktree is only dead-sweep debris if nothing LIVE
+            // is still using it. Probe only when dirty (the probe is the
+            // expensive part and a clean worktree is never reset anyway).
+            let in_use = if dirty {
+                self.worktree_in_use(issue)
+            } else {
+                Vec::new()
+            };
+            if in_use.is_empty() {
+                // No longer held — clear the log-once latch so a later refusal
+                // (or a genuine give-up) still surfaces in the daemon log.
+                self.midbuild_inuse.remove(&issue);
+            }
             let already_retried = self.midbuild_retried.contains(&issue);
-            match midbuild_decision(dirty, false, already_retried) {
+            match midbuild_decision(dirty, false, already_retried, !in_use.is_empty()) {
+                MidbuildDecision::InUse => {
+                    if self.midbuild_inuse.insert(issue) {
+                        log::warn!(
+                            "midbuild-watchdog: issue #{issue} ({sweep_id}) matches the \
+                             mid-build-death signature (terminal, no PR, dirty worktree) but its \
+                             worktree at {} is STILL IN USE by a live session the daemon does not \
+                             track — {}. REFUSING to `git reset --hard` it: that is exactly how \
+                             #4449 destroyed an active recovery session's uncommitted fix \
+                             mid-commit. The worktree is left intact and the single recovery retry \
+                             is NOT consumed; the watchdog re-assesses once the holder releases \
+                             it. If the holder is stale, clear it (remove .loom-in-use / the \
+                             claim-lock / the index.lock, or exit the shell) and the next tick \
+                             will recover normally.",
+                            self.worktree_path(issue).display(),
+                            describe_worktree_use(&in_use),
+                        );
+                    }
+                }
                 MidbuildDecision::Healthy => {}
                 MidbuildDecision::GiveUp => {
                     if self.midbuild_gaveup.insert(issue) {
@@ -12571,26 +12894,75 @@ exit 0\n";
     #[test]
     fn midbuild_decision_no_dirty_worktree_is_healthy() {
         // No dirty worktree ⇒ nothing to recover, regardless of retry state.
-        assert_eq!(midbuild_decision(false, false, false), MidbuildDecision::Healthy);
-        assert_eq!(midbuild_decision(false, false, true), MidbuildDecision::Healthy);
+        assert_eq!(midbuild_decision(false, false, false, false), MidbuildDecision::Healthy);
+        assert_eq!(midbuild_decision(false, false, true, false), MidbuildDecision::Healthy);
     }
 
     #[test]
     fn midbuild_decision_produced_pr_is_healthy() {
         // A dead sweep that produced a PR is a completed Builder, not a
         // mid-build death — never recovered even with a dirty worktree.
-        assert_eq!(midbuild_decision(true, true, false), MidbuildDecision::Healthy);
+        assert_eq!(midbuild_decision(true, true, false, false), MidbuildDecision::Healthy);
     }
 
     #[test]
     fn midbuild_decision_dirty_no_pr_first_time_recovers() {
-        assert_eq!(midbuild_decision(true, false, false), MidbuildDecision::Recover);
+        assert_eq!(midbuild_decision(true, false, false, false), MidbuildDecision::Recover);
     }
 
     #[test]
     fn midbuild_decision_dirty_no_pr_after_retry_gives_up() {
         // Bounded: a second mid-build death gives up (never loops).
-        assert_eq!(midbuild_decision(true, false, true), MidbuildDecision::GiveUp);
+        assert_eq!(midbuild_decision(true, false, true, false), MidbuildDecision::GiveUp);
+    }
+
+    #[test]
+    fn midbuild_decision_in_use_worktree_is_never_recovered() {
+        // #4449: a live holder vetoes the destructive path, and the veto sits
+        // ABOVE the retry bookkeeping — it must win over both Recover and
+        // GiveUp so a refusal never consumes the single recovery retry.
+        assert_eq!(midbuild_decision(true, false, false, true), MidbuildDecision::InUse);
+        assert_eq!(midbuild_decision(true, false, true, true), MidbuildDecision::InUse);
+    }
+
+    #[test]
+    fn midbuild_decision_in_use_is_irrelevant_when_not_dirty_or_pr_exists() {
+        // The in-use flag must not manufacture work: a clean worktree or a
+        // produced PR is still Healthy even while a session holds the worktree.
+        assert_eq!(midbuild_decision(false, false, false, true), MidbuildDecision::Healthy);
+        assert_eq!(midbuild_decision(true, true, false, true), MidbuildDecision::Healthy);
+    }
+
+    // --- #4449 helpers: truncate_lines / describe_worktree_use ---
+
+    #[test]
+    fn truncate_lines_keeps_short_input_and_caps_long_input() {
+        assert_eq!(truncate_lines("", 5), "");
+        assert_eq!(truncate_lines("   \n  ", 5), "");
+        assert_eq!(truncate_lines("a\nb", 5), "a\nb");
+        let long = (1..=10)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let capped = truncate_lines(&long, 3);
+        assert!(capped.starts_with("1\n2\n3"), "keeps the first `max` lines: {capped}");
+        assert!(capped.contains("+7 more"), "reports how many lines were dropped: {capped}");
+    }
+
+    #[test]
+    fn describe_worktree_use_joins_every_signal() {
+        let described = describe_worktree_use(&[
+            WorktreeUseEvidence::InUseMarker {
+                task_id: "t1".into(),
+                pid: "42".into(),
+            },
+            WorktreeUseEvidence::LiveProcesses(vec![7, 9]),
+        ]);
+        assert!(described.contains(".loom-in-use"), "{described}");
+        assert!(described.contains("pid: 42"), "{described}");
+        assert!(described.contains("[7, 9]"), "{described}");
+        assert!(described.contains("; "), "signals are joined: {described}");
+        assert_eq!(describe_worktree_use(&[]), "");
     }
 
     // --- ranking_has_capacity token-health gate ---
@@ -12826,6 +13198,195 @@ exit 0\n";
             !ws.join(".loom/worktrees/issue-6003/dirty.txt").exists(),
             "worktree cleaned on recovery"
         );
+    }
+
+    // --- #4449: the live-use veto on the destructive recovery path -----------
+
+    /// Assert the watchdog refused to touch issue `N`'s dirty worktree: nothing
+    /// recovered, the uncommitted edit still on disk, and — critically — the
+    /// single recovery retry NOT consumed (the worktree may be free later).
+    fn assert_midbuild_refused(reg: &mut SweepRegistry, ws: &Path, issue: u32, why: &str) {
+        assert_eq!(reg.midbuild_watchdog_once(), 0, "no recovery when {why}");
+        assert!(
+            ws.join(format!(".loom/worktrees/issue-{issue}/dirty.txt"))
+                .exists(),
+            "uncommitted work MUST survive when {why} (#4449)"
+        );
+        assert!(
+            !reg.midbuild_retried.contains(&issue),
+            "a refusal must NOT consume the single recovery retry when {why}"
+        );
+        assert!(
+            reg.midbuild_inuse.contains(&issue),
+            "the refusal is recorded (and logged once) when {why}"
+        );
+    }
+
+    #[test]
+    fn midbuild_refuses_to_wipe_worktree_held_by_in_use_marker() {
+        // The #4449 incident shape: the daemon's tracked sweep really did die
+        // (terminal, no PR) but a SEPARATE live session is still using the
+        // worktree. A `.loom-in-use` marker is the explicit form of that signal.
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let (mut reg, _rec) = fixture_registry(ws);
+
+        let wt = make_dirty_git_worktree(ws, 6101);
+        insert_terminal_issue(&mut reg, "sweep-issue-6101-dead", 6101, None);
+        std::fs::write(
+            wt.join(".loom-in-use"),
+            r#"{"shepherd_task_id": "recovery-doctor", "pid": 4321}"#,
+        )
+        .unwrap();
+
+        assert!(!reg.worktree_in_use(6101).is_empty(), "marker is detected as a live holder");
+        assert_midbuild_refused(&mut reg, ws, 6101, "a .loom-in-use marker names a live session");
+
+        // Once the holder releases the worktree, the legitimate dead-sweep
+        // recovery still works — the veto defers, it does not disable.
+        std::fs::remove_file(wt.join(".loom-in-use")).unwrap();
+        assert_eq!(reg.midbuild_watchdog_once(), 1, "recovery resumes once the holder releases");
+        assert!(reg.midbuild_retried.contains(&6101));
+        assert!(!reg.midbuild_inuse.contains(&6101), "the log-once latch is cleared");
+        assert!(!wt.join("dirty.txt").exists(), "worktree cleaned on the real recovery");
+    }
+
+    #[test]
+    fn midbuild_refuses_to_wipe_worktree_with_git_operation_in_flight() {
+        // The precise window #4449 lost work in: a `git commit` was mid-write,
+        // so git held index.lock. Never reset a worktree in that state.
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let (mut reg, _rec) = fixture_registry(ws);
+
+        let wt = make_dirty_git_worktree(ws, 6102);
+        insert_terminal_issue(&mut reg, "sweep-issue-6102-dead", 6102, None);
+        let index_lock =
+            git_index_lock_path(&wt).expect("index.lock path resolves for a real repo");
+        std::fs::write(&index_lock, "").unwrap();
+
+        assert_midbuild_refused(&mut reg, ws, 6102, "a git index.lock write is in flight");
+
+        // Committing finishes (lock released) ⇒ recovery is available again.
+        std::fs::remove_file(&index_lock).unwrap();
+        assert_eq!(reg.midbuild_watchdog_once(), 1, "recovery resumes once index.lock clears");
+    }
+
+    #[test]
+    fn midbuild_refuses_to_wipe_worktree_with_live_claim_lock_owner() {
+        // A claim-lock whose owner PID is ALIVE means some session (daemon or
+        // not) still owns this issue — never reset its worktree underneath it.
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let (mut reg, _rec) = fixture_registry(ws);
+
+        make_dirty_git_worktree(ws, 6103);
+        insert_terminal_issue(&mut reg, "sweep-issue-6103-dead", 6103, None);
+        let lock = reg.config.locks_dir().join("issue-6103");
+        std::fs::create_dir_all(&lock).unwrap();
+        // Our own PID is trivially alive — stands in for the live holder.
+        std::fs::write(
+            lock.join("owner.json"),
+            format!(
+                r#"{{"issue": 6103, "owner_pid": {}, "acquired_at": "{}", "sweep_id": "manual-session"}}"#,
+                std::process::id(),
+                Utc::now().to_rfc3339()
+            ),
+        )
+        .unwrap();
+
+        assert_midbuild_refused(
+            &mut reg,
+            ws,
+            6103,
+            "a live claim-lock owner still holds the issue",
+        );
+    }
+
+    #[test]
+    fn midbuild_ignores_stale_claim_lock_with_dead_owner() {
+        // The inverse guard: the dead sweep's OWN claim-lock, left behind
+        // because the reaper never released it, must not wedge the legitimate
+        // dead-sweep recovery path forever.
+        //
+        // The lock's `sweep_id` is deliberately the dead entry's own id. A lock
+        // naming a *different* sweep is a separate, pre-existing refusal
+        // (`lock_owned_by_other`, #4463: a newer sweep superseded this one) that
+        // fails closed on the id comparison alone and is covered by its own
+        // tests. This test isolates the #4449 live-use veto: a dead owner PID is
+        // not live-use evidence, so recovery proceeds.
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let (mut reg, _rec) = fixture_registry(ws);
+
+        make_dirty_git_worktree(ws, 6104);
+        insert_terminal_issue(&mut reg, "sweep-issue-6104-dead", 6104, None);
+        let lock = reg.config.locks_dir().join("issue-6104");
+        std::fs::create_dir_all(&lock).unwrap();
+        std::fs::write(
+            lock.join("owner.json"),
+            format!(
+                r#"{{"issue": 6104, "owner_pid": 2147483640, "acquired_at": "{}", "sweep_id": "sweep-issue-6104-dead"}}"#,
+                Utc::now().to_rfc3339()
+            ),
+        )
+        .unwrap();
+
+        assert!(
+            reg.worktree_in_use(6104).is_empty(),
+            "a dead owner's lock is not live-use evidence"
+        );
+        assert_eq!(reg.midbuild_watchdog_once(), 1, "a stale lock does not block recovery");
+        assert!(!ws.join(".loom/worktrees/issue-6104/dirty.txt").exists());
+    }
+
+    #[test]
+    fn midbuild_refuses_to_wipe_worktree_with_live_process_cwd_inside() {
+        // The signal that would have saved the #4449 session with no cooperation
+        // from it at all: a live process whose cwd is inside the worktree.
+        // `find_processes_using_directory` degrades to an empty list on hosts
+        // where it cannot probe (no /proc, no lsof), so self-skip there rather
+        // than assert something the host cannot express.
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let (mut reg, _rec) = fixture_registry(ws);
+
+        let wt = make_dirty_git_worktree(ws, 6105);
+        insert_terminal_issue(&mut reg, "sweep-issue-6105-dead", 6105, None);
+
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .current_dir(&wt)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn a live process with cwd inside the worktree");
+
+        // The child's `chdir` happens after `fork`, so poll briefly rather than
+        // read the probe once and race it.
+        let mut detected = Vec::new();
+        for _ in 0..40 {
+            detected = crate::worktree_ops::safety::find_processes_using_directory(&wt);
+            if !detected.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if detected.is_empty() {
+            // Probe unavailable on this host — nothing to assert; don't leak.
+            let _ = child.kill();
+            let _ = child.wait();
+            return;
+        }
+        assert!(
+            detected.contains(&child.id()),
+            "the probe found the spawned holder: {detected:?}"
+        );
+
+        assert_midbuild_refused(&mut reg, ws, 6105, "a live process has its cwd in the worktree");
+
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     #[test]
