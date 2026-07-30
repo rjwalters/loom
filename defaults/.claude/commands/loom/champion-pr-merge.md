@@ -12,6 +12,66 @@ The Champion acts as the final step in the PR pipeline, merging PRs that have pa
 
 ---
 
+## Cached forge reads (`gh-cached`, #4667)
+
+Champion runs on a 10-minute cron alongside concurrent Judges and sweeps, all
+sharing **one** personal `gh` rate-limit budget (#4665). Its repeated
+*observation* reads — idempotency-marker comment greps, backlog scans,
+duplicate searches — go through the short-TTL cache wrapper. Its
+*merge-gating* reads do not: this skill performs the single most irreversible
+action in the pipeline, so every read a merge decision rests on must observe
+current state unconditionally.
+
+Resolve the wrapper **once**, at the start of the pass:
+
+```bash
+# Degrades to plain `gh` when absent or when its Python runtime is broken —
+# the same probe merge-pr.sh uses. Nothing here depends on the cache existing.
+GH_READ="gh"
+_ghc="$(git rev-parse --show-toplevel 2>/dev/null)/.loom/scripts/gh-cached"
+if [[ -x "$_ghc" ]] && "$_ghc" --version >/dev/null 2>&1; then GH_READ="$_ghc"; fi
+```
+
+**Route through `$GH_READ` (cached, 30s TTL):**
+
+- Idempotency-marker comment greps (`--json comments` reads for the
+  verdict-janitor, hold, stale-PR, park, close, and prior-grant markers).
+  These only answer "did I already post this?"; the cache is invalidated by
+  your own `--clear-cache` after you post (see below).
+- The `loom:blocked` unblock scan (`gh issue list --label "loom:blocked"`) and
+  its per-issue body/state reads.
+- The follow-on-issue duplicate search (`gh issue list --search …`).
+- The parked-PR listing (`gh pr list --label …`).
+
+**Keep on plain `gh` (deliberately uncached — do NOT wrap these):**
+
+| Call site | Why it must be live |
+|---|---|
+| Verdict-State Janitor's label read | Decides whether the PR is eligible to merge at all |
+| All 6 safety criteria (labels, `mergeable`, `updatedAt`, `gh pr checks`) | **Merge gating** — the last reads before an irreversible merge; a cached green can predate the push that broke the build |
+| Criterion #3's paginated changed-file list (`gh api …/files --paginate`) | #4613 requires this loop to run fresh against the full list in *this* pass — a cached answer is exactly the "asserted from a stale read" failure that incident was |
+| Step 2's pre-merge comment data gathering | Every bullet is a claim about a criterion's result in this pass; restating from a cached read reintroduces #4613 |
+
+`gh pr checks` is passthrough inside the wrapper regardless, so that carve-out
+holds even if wrapped by accident; the rest rely on this list.
+
+**Writes stay literal `gh`.** Never wrap `gh pr comment` / `gh pr edit` /
+`gh issue edit` in `"$GH_READ"` — the destructive-command guard hooks
+pattern-match the literal command text and a wrapped form slips past them.
+After a mutation you made in this pass (a marker comment, a label change, a
+merge), drop the cache instead so a later marker grep cannot return pre-write
+state:
+
+```bash
+gh pr comment "$PR_NUMBER" --body "…"
+"$GH_READ" --clear-cache   # local /tmp sweep — zero API cost
+```
+
+Full policy, TTL/invalidation semantics, and manual verification steps:
+`.loom/docs/gh-cached.md` (source: `defaults/docs/gh-cached.md`).
+
+---
+
 ## Verdict-State Janitor (run FIRST, before the 6 safety criteria)
 
 **Every `loom:pr` PR must pass this janitor step before any of the 6 safety
@@ -32,6 +92,8 @@ before Step 1 of the 6 criteria below):
 
 ```bash
 PR_NUMBER=<number>
+# Plain `gh` — NOT "$GH_READ": this label read decides whether the PR is
+# eligible to merge, so it must be live (see "Cached forge reads").
 LABELS=$(gh pr view "$PR_NUMBER" --json labels --jq '[.labels[].name] | join(",")')
 
 if echo "$LABELS" | grep -qw "loom:changes-requested"; then
@@ -39,7 +101,9 @@ if echo "$LABELS" | grep -qw "loom:changes-requested"; then
   # Idempotency guard — mirrors the stale-PR notice pattern below: only
   # comment + relabel once per contradictory episode, so a 10-minute cron
   # tick doesn't re-post while the contradiction is being resolved.
-  if gh pr view "$PR_NUMBER" --json comments --jq '.comments[].body' | grep -qF "$JANITOR_MARKER"; then
+  # Cached ("$GH_READ") — a marker grep only answers "did I already post
+  # this?", and your own `--clear-cache` after posting keeps it honest.
+  if "$GH_READ" pr view "$PR_NUMBER" --json comments --jq '.comments[].body' | grep -qF "$JANITOR_MARKER"; then
     echo "Verdict-janitor notice already posted for #$PR_NUMBER — skipping (still not eligible to merge)"
   else
     gh pr comment "$PR_NUMBER" --body "$JANITOR_MARKER
@@ -52,6 +116,7 @@ Resolving fail-safe: \`loom:changes-requested\` wins. Removing \`loom:pr\` so th
 ---
 *Automated by Champion role*"
     gh pr edit "$PR_NUMBER" --remove-label "loom:pr"
+    "$GH_READ" --clear-cache   # your own write must not be masked by your own cache
     echo "Resolved contradictory verdict state on #$PR_NUMBER (loom:pr removed) — skipping merge"
   fi
   # Skip this PR entirely for this pass — do not proceed to the 6 safety
@@ -76,7 +141,9 @@ For each `loom:pr` PR, verify ALL 6 safety criteria. If ANY criterion fails, do 
 
 **Verification command**:
 ```bash
-# Get all labels for the PR
+# Get all labels for the PR. Plain `gh` — NOT "$GH_READ": all 6 safety
+# criteria are merge-gating and must observe current state (see "Cached
+# forge reads").
 LABELS=$(gh pr view <number> --json labels --jq '.labels[].name' | tr '\n' ' ')
 
 # Check for loom:pr label
@@ -115,6 +182,8 @@ PR_NUMBER=<number>
 # REST endpoint, not `gh pr view --json files` — that field silently
 # truncates at 100 files with no error (see criterion #3 below and #4613),
 # which on a 100+ file PR would hide files from this risk read too.
+# Plain `gh` — NOT "$GH_READ": #4613 requires this list to be fetched fresh in
+# THIS pass, never answered from a cache (see "Cached forge reads").
 gh api "repos/{owner}/{repo}/pulls/$PR_NUMBER/files" --paginate --jq '.[] | "\(.additions)+/\(.deletions)- \(.filename)"'
 
 # The actual diff (read it — the load-bearing hunks are what you are judging)
@@ -152,7 +221,8 @@ HOLD_MARKER="<!-- champion:merge-risk-hold -->"
 # silently re-evaluated each tick and merges as soon as the concern is resolved
 # (a follow-up push that narrows the blast radius, a deeper Judge re-review, or
 # `loom:auto-merge-ok` applied by a human).
-if gh pr view "$PR_NUMBER" --json comments --jq '.comments[].body' | grep -qF "$HOLD_MARKER"; then
+# Cached ("$GH_READ") — idempotency-marker grep; see "Cached forge reads".
+if "$GH_READ" pr view "$PR_NUMBER" --json comments --jq '.comments[].body' | grep -qF "$HOLD_MARKER"; then
   echo "Merge-risk hold already posted for #$PR_NUMBER — re-evaluating silently"
 else
   gh pr comment "$PR_NUMBER" --body "$HOLD_MARKER
@@ -214,6 +284,11 @@ fi
 # `.github/workflows/gitea-integration.yml` was skipped in one Champion
 # instance's evaluation over a 117-file PR. `--paginate` walks every page of
 # the REST response regardless of file count.
+#
+# Plain `gh` — NOT "$GH_READ". #4613's lesson is that this criterion must be
+# asserted from a list fetched in THIS pass; a cached answer is the same class
+# of failure as restating the result from a prior pass (see "Cached forge
+# reads").
 FILES=$(gh api "repos/{owner}/{repo}/pulls/<number>/files" --paginate --jq '.[].filename')
 
 # Define critical patterns (extend as needed)
@@ -258,7 +333,8 @@ This criterion is deliberately kept **in addition to** the merge-risk judgment i
 
 **Verification command**:
 ```bash
-# Check merge status
+# Check merge status. Plain `gh` — NOT "$GH_READ": merge-gating (see
+# "Cached forge reads").
 MERGEABLE=$(gh pr view <number> --json mergeable --jq '.mergeable')
 
 # Verify mergeable state
@@ -282,7 +358,7 @@ echo "PASS: No merge conflicts"
 
 **Verification command**:
 ```bash
-# Get PR last update time
+# Get PR last update time. Plain `gh` — NOT "$GH_READ": merge-gating.
 UPDATED_AT=$(gh pr view <number> --json updatedAt --jq '.updatedAt')
 
 # Convert to Unix timestamp
@@ -322,6 +398,9 @@ echo "PASS: Recently updated ($HOURS_AGO hours ago)"
 # Capture stdout ONLY: when a PR has no checks, gh prints "no checks reported..."
 # to STDERR and exits non-zero with EMPTY stdout, so an empty result is the
 # robust no-checks signal (do not grep error text).
+# Plain `gh` — NOT "$GH_READ": CI status is the read the merge is gated on,
+# and a cached green can predate the push that broke the build. (`gh pr checks`
+# is passthrough inside the wrapper anyway; this is belt-and-suspenders.)
 CHECKS=$(gh pr checks <number> --json bucket,name 2>/dev/null)
 
 # Handle case where no checks exist (empty stdout, or an empty JSON array)
@@ -387,7 +466,10 @@ list.
 ```bash
 PR_NUMBER=$1
 
-# Gather verification data
+# Gather verification data. Plain `gh` throughout this block — NOT "$GH_READ":
+# every bullet in the comment below is a claim about a criterion's result in
+# THIS pass, and answering from cache is the same failure as restating it from
+# memory (#4613; see "Cached forge reads").
 PR_DATA=$(gh pr view "$PR_NUMBER" --json additions,deletions,updatedAt)
 ADDITIONS=$(echo "$PR_DATA" | jq -r '.additions')
 DELETIONS=$(echo "$PR_DATA" | jq -r '.deletions')
@@ -478,7 +560,9 @@ if [ -z "$LINKED_ISSUES" ]; then
   exit 0
 fi
 
-# Check each linked issue
+# Check each linked issue. Plain `gh` — NOT "$GH_READ": this runs immediately
+# after your own merge and gates a write (`gh issue close`), so it must observe
+# post-merge state (see "Cached forge reads").
 for issue in $LINKED_ISSUES; do
   ISSUE_STATE=$(gh issue view "$issue" --json state --jq '.state' 2>&1)
 
@@ -504,7 +588,8 @@ echo "Checking for issues blocked by #$CLOSED_ISSUE..."
 # Find issues with loom:blocked that reference the closed issue.
 # Tolerant of markdown emphasis/colon between the phrase and #N (e.g.
 # "**Blocked by:** #1 (reason)") — #4508.
-BLOCKED_ISSUES=$(gh issue list --label "loom:blocked" --state open --limit 500 --json number,body \
+# Cached ("$GH_READ") — a backlog scan, not a merge gate.
+BLOCKED_ISSUES=$("$GH_READ" issue list --label "loom:blocked" --state open --limit 500 --json number,body \
   --jq ".[] | select(.body | test(\"(Blocked by|Depends on|Requires)[*_:[:space:]]*#$CLOSED_ISSUE\"; \"i\")) | .number")
 
 if [ -z "$BLOCKED_ISSUES" ]; then
@@ -516,7 +601,7 @@ for blocked in $BLOCKED_ISSUES; do
   echo "Checking if #$blocked can be unblocked..."
 
   # Get the issue body to check ALL dependencies
-  BLOCKED_BODY=$(gh issue view "$blocked" --json body --jq '.body')
+  BLOCKED_BODY=$("$GH_READ" issue view "$blocked" --json body --jq '.body')
 
   # Extract all referenced dependencies. Two-stage (#4508): stage 1 selects
   # lines declaring a dependency phrase, tolerant of markdown emphasis/colon
@@ -528,6 +613,8 @@ for blocked in $BLOCKED_ISSUES; do
 
   # Check if ALL dependencies are now closed
   ALL_RESOLVED=true
+  # Plain `gh` — NOT "$GH_READ": a stale CLOSED here removes `loom:blocked`
+  # from a still-blocked issue, the highest-severity failure mode in this block.
   for dep in $ALL_DEPS; do
     DEP_STATE=$(gh issue view "$dep" --json state --jq '.state' 2>/dev/null)
     if [ "$DEP_STATE" != "CLOSED" ]; then
@@ -688,7 +775,8 @@ fi
 # ============================================
 
 # Search for existing follow-on issues from this PR
-EXISTING_ISSUE=$(gh issue list --state open --search "Follow-on from PR #$PR_NUMBER" --limit 500 --json number --jq '.[0].number // empty')
+# Cached ("$GH_READ") — duplicate search, not a merge gate.
+EXISTING_ISSUE=$("$GH_READ" issue list --state open --search "Follow-on from PR #$PR_NUMBER" --limit 500 --json number --jq '.[0].number // empty')
 
 if [ -n "$EXISTING_ISSUE" ]; then
   echo "Follow-on issue already exists: #$EXISTING_ISSUE - skipping creation"
@@ -888,7 +976,8 @@ STALE_MARKER="<!-- champion:stale-pr-notice -->"
 
 # Idempotency guard: only comment + relabel once. If a prior tick already
 # posted the stale notice, do nothing (prevents per-tick comment spam).
-if gh pr view "$PR_NUMBER" --json comments --jq '.comments[].body' | grep -qF "$STALE_MARKER"; then
+# Cached ("$GH_READ") — idempotency-marker grep.
+if "$GH_READ" pr view "$PR_NUMBER" --json comments --jq '.comments[].body' | grep -qF "$STALE_MARKER"; then
   echo "Stale-PR notice already posted for #$PR_NUMBER — skipping"
 else
   gh pr comment "$PR_NUMBER" --body "$STALE_MARKER
@@ -921,7 +1010,9 @@ This pass **never merges anything and never closes anything**. For each parked P
 `gh pr list` ANDs repeated `--label` values, so this returns exactly the parked set:
 
 ```bash
-gh pr list \
+# Cached ("$GH_READ") — queue discovery; each parked PR is re-read live
+# before any action is taken on it.
+"$GH_READ" pr list \
   --label "loom:blocked" \
   --label "loom:changes-requested" \
   --state open \
@@ -952,7 +1043,7 @@ Read the **whole** thread — that complete post-mortem view is the entire reaso
 
 ```bash
 # How many extra cycles this pass has already granted (0 for a first-time decision).
-PRIOR_GRANTS=$(gh pr view "$PR_NUMBER" --json comments \
+PRIOR_GRANTS=$("$GH_READ" pr view "$PR_NUMBER" --json comments \
   --jq '[.comments[] | select(.body | contains("champion:capped-pr-grant"))] | length')
 ```
 
@@ -1030,7 +1121,8 @@ LATEST_REJECTION_ID=$(gh pr view "$PR_NUMBER" --json comments \
         | last | .id // "none"')
 PARK_MARKER="<!-- champion:capped-pr-parked:$LATEST_REJECTION_ID -->"
 
-if gh pr view "$PR_NUMBER" --json comments --jq '.comments[].body' | grep -qF "$PARK_MARKER"; then
+# Cached ("$GH_READ") — idempotency-marker grep.
+if "$GH_READ" pr view "$PR_NUMBER" --json comments --jq '.comments[].body' | grep -qF "$PARK_MARKER"; then
   echo "Keep-parked verdict already posted for #$PR_NUMBER on this rejection — skipping"
 else
   gh pr comment "$PR_NUMBER" --body "$PARK_MARKER
@@ -1058,7 +1150,8 @@ Use this when the history shows the **approach itself** is not viable — repeat
 PR_NUMBER=<number>
 CLOSE_MARKER="<!-- champion:capped-pr-close-recommended -->"
 
-if gh pr view "$PR_NUMBER" --json comments --jq '.comments[].body' | grep -qF "$CLOSE_MARKER"; then
+# Cached ("$GH_READ") — idempotency-marker grep.
+if "$GH_READ" pr view "$PR_NUMBER" --json comments --jq '.comments[].body' | grep -qF "$CLOSE_MARKER"; then
   echo "Close recommendation already posted for #$PR_NUMBER — skipping"
 else
   gh pr comment "$PR_NUMBER" --body "$CLOSE_MARKER

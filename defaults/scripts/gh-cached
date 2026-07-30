@@ -39,13 +39,20 @@ MAX_CACHE_SIZE = int(os.environ.get("GH_CACHE_MAX_SIZE", "256"))
 CACHE_DISABLED = os.environ.get("GH_CACHE_DISABLE", "") == "1"
 DEBUG = os.environ.get("GH_CACHE_DEBUG", "") == "1"
 
-# TTL overrides by command type (seconds)
+# TTL overrides by command type (seconds).
+#
+# These are the hot polling shapes the sweep/judge/champion skills route through
+# this wrapper (#4667). They all track DEFAULT_TTL so that GH_CACHE_TTL is a real
+# knob: previously these were hard-coded 30s, which silently made GH_CACHE_TTL a
+# no-op for exactly the commands that matter (it only applied to the shapes that
+# fell through to the default). Unset GH_CACHE_TTL still yields 30s, so this is
+# behavior-identical unless an operator deliberately tunes the window.
 TTL_BY_COMMAND = {
-    ("issue", "view"):   30,
-    ("issue", "list"):   30,
-    ("pr", "view"):      30,
-    ("pr", "list"):      30,
-    ("api",):            30,
+    ("issue", "view"):   DEFAULT_TTL,
+    ("issue", "list"):   DEFAULT_TTL,
+    ("pr", "view"):      DEFAULT_TTL,
+    ("pr", "list"):      DEFAULT_TTL,
+    ("api",):            DEFAULT_TTL,
 }
 
 # Commands that are read-only and safe to cache
