@@ -21,11 +21,26 @@
 #   1 - Potential duplicates found (listed to stdout)
 #   2 - Error (invalid arguments, gh command failed, etc.)
 #
+# A confirmed duplicate always wins over a partial failure (#4526): if ANY
+# search pool (open issues / merged PRs / closed issues) finds a match, the
+# exit code is 1 even when another pool could not be searched at all. Exit 2
+# means "no answer at all", never "we found something but also had trouble".
+#
 # Output format (when duplicates found):
 #   DUPLICATE_FOUND
 #   #<number>: <title> (similarity: <percent>%)
 #   PR #<number>: <title> (similarity: <percent>%)
 #   ...
+#
+# Degraded-coverage marker lines (#4526), appended after the match list when
+# GraphQL rate-limiting forced a degraded search. Both are informational: they
+# are not matches, and the --json parser reports them as `search_incomplete`
+# rather than as entries in `matches`.
+#   SEARCH_INCOMPLETE: <pools> -- that pool could not be searched at all
+#                                 (GraphQL rate-limited AND REST fallback
+#                                 failed), so the match list is partial
+#   REST_FALLBACK: <pools>     -- that pool was answered by the REST fallback,
+#                                 whose similarity ranking basis differs
 #
 # Degenerate-result self-detection (#4409): if more than half of the
 # candidates scanned in a given search (open issues / merged PRs / closed
@@ -251,15 +266,37 @@ calculate_similarity() {
     echo "$percent"
 }
 
-# Detect GitHub's GraphQL rate-limit error signature in captured `gh` output
-# (stdout+stderr merged via `2>&1`). GraphQL and REST draw on independent
-# quotas (confirmed live during the #4526 incident: `gh issue/pr list --json
-# ...` failed with this exact string while `gh api repos/OWNER/REPO/...`
-# succeeded), so this specific error -- and only this one -- justifies
-# retrying the same query via REST instead of giving up.
+# Detect a GitHub rate-limit rejection in captured `gh` output (stdout+stderr
+# merged via `2>&1`). GraphQL and REST draw on independent quotas (confirmed
+# live during the #4526 incident: `gh issue/pr list --json ...` failed with a
+# rate-limit error while `gh api repos/OWNER/REPO/...` succeeded), so this
+# class of error -- and only this class -- justifies retrying the same query
+# via REST instead of giving up.
+#
+# The signature table below mirrors loom-daemon/src/rate_limit_breaker.rs's
+# RATE_LIMIT_SIGNATURES, which is this repo's tested ground truth for what
+# `gh` actually prints. Two phrasings matter and they are NOT substrings of
+# each other:
+#
+#   GraphQL (`gh issue list` / `gh pr list`, i.e. every call in this script):
+#     "GraphQL: API rate limit already exceeded for user ID ..."
+#   REST (`gh api ...`, i.e. the fallbacks below):
+#     "HTTP 403: API rate limit exceeded for ..."
+#
+# The word "already" breaks the contiguous "API rate limit exceeded" match, so
+# a single-pattern check misses the GraphQL form -- which is precisely the
+# form #4526 is about. Matching is case-insensitive, as in the Rust original.
 is_rate_limit_error() {
-    local text="$1"
-    [[ "$text" == *"API rate limit exceeded"* ]]
+    local text
+    text=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+    case "$text" in
+        *"api rate limit exceeded"*) return 0 ;;
+        *"api rate limit already exceeded"*) return 0 ;;
+        *"secondary rate limit"*) return 0 ;;
+        *"abuse detection mechanism"*) return 0 ;;
+        *"was submitted too quickly"*) return 0 ;;
+    esac
+    return 1
 }
 
 # Resolve "owner/repo" via REST, for the REST fallback paths below. Mirrors
@@ -683,10 +720,37 @@ main() {
         exit 2
     fi
 
+    # Verdict tracking (#4526). "A duplicate was found" and "a search pool
+    # could not be checked at all" are INDEPENDENT facts, and each of the
+    # three pools (open issues / merged PRs / closed issues) can report them
+    # separately -- partial rate-limiting across pools is the exact scenario
+    # this fallback exists for. Keeping the two facts in separate variables
+    # (instead of overwriting one exit code as each pool reports in) is what
+    # stops a total failure in one pool from discarding a confirmed match
+    # found by another: `exit_code` is derived from both, once, below.
+    #
+    #   duplicate_found  -> any pool produced a match/NON_DISCRIMINATIVE line
+    #   incomplete_pools -> human-readable list of pools where GraphQL was
+    #                       rate-limited AND the REST fallback also failed
+    #   fallback_pools   -> pools that were answered by the REST fallback
+    #
+    # Comma-joined strings rather than arrays: this script runs under
+    # `set -u` on bash 3.2 (macOS system bash), where empty-array expansion
+    # is a portability landmine.
+    local duplicate_found=false
+    local incomplete_pools=""
+    local fallback_pools=""
+    local header_labeled_rest=false
+
     # Search for similar issues
     local result
     local exit_code=0
     result=$(search_similar_issues "$title" "$body" "$threshold") || exit_code=$?
+    if [[ $exit_code -eq 1 ]]; then
+        duplicate_found=true
+    elif [[ $exit_code -eq 2 ]]; then
+        incomplete_pools="open issues"
+    fi
 
     # If --include-merged-prs, also search merged PRs and closed issues
     local merged_result=""
@@ -698,11 +762,15 @@ main() {
         closed_result=$(search_closed_issues "$title" "$body" "$threshold") || closed_exit_code=$?
 
         # #4526: a GraphQL rate-limit that ALSO fails via REST means this
-        # pool genuinely could not be checked -- surface that as exit 2
-        # ("could not run at all"), not silently as "no duplicates" the way
-        # a plain `return 0` used to.
-        if [[ $merged_exit_code -eq 2 || $closed_exit_code -eq 2 ]]; then
-            exit_code=2
+        # pool genuinely could not be checked. Record it; the final verdict
+        # below turns that into exit 2 ("could not run at all") rather than
+        # silently reporting "no duplicates" the way a plain `return 0` used
+        # to -- but only when no other pool found a real duplicate.
+        if [[ $merged_exit_code -eq 2 ]]; then
+            incomplete_pools="${incomplete_pools:+${incomplete_pools}, }merged PRs"
+        fi
+        if [[ $closed_exit_code -eq 2 ]]; then
+            incomplete_pools="${incomplete_pools:+${incomplete_pools}, }closed issues"
         fi
 
         # Strip the leading REST-fallback sentinel line (if present) from
@@ -719,28 +787,48 @@ main() {
             closed_rest_fallback=true
             closed_result="${closed_result#RATE_LIMIT_FALLBACK$'\n'}"
         fi
+        if $merged_rest_fallback; then
+            fallback_pools="${fallback_pools:+${fallback_pools}, }merged PRs"
+        fi
+        if $closed_rest_fallback; then
+            fallback_pools="${fallback_pools:+${fallback_pools}, }closed issues"
+        fi
 
         # If we found matches in merged PRs or closed issues, flag as duplicate
         if [[ -n "$merged_result" || -n "$closed_result" ]]; then
-            if [[ $exit_code -eq 0 ]]; then
-                # No open issue duplicates found, but merged/closed matches
-                # exist. Only synthesize a "DUPLICATE_FOUND" umbrella header
-                # when at least one of merged/closed is a real match list --
-                # a degenerate (#4409) result already self-announces with its
-                # own "NON_DISCRIMINATIVE (...)" line, and prefixing THAT
-                # with "DUPLICATE_FOUND" would be misleading. Check each side
+            if ! $duplicate_found; then
+                # The open-issues search produced no match of its own (either
+                # it found nothing, or it could not run at all -- in both
+                # cases $result is empty here, so overwriting it is safe), but
+                # merged/closed matches exist. Only synthesize a
+                # "DUPLICATE_FOUND" umbrella header when at least one of
+                # merged/closed is a real match list -- a degenerate (#4409)
+                # result already self-announces with its own
+                # "NON_DISCRIMINATIVE (...)" line, and prefixing THAT with
+                # "DUPLICATE_FOUND" would be misleading. Check each side
                 # independently (not "both must be non-degenerate") so a real
                 # match on one side still gets its header even when the other
                 # side is degenerate.
                 if [[ ( -n "$merged_result" && "$merged_result" != NON_DISCRIMINATIVE* ) || \
                       ( -n "$closed_result" && "$closed_result" != NON_DISCRIMINATIVE* ) ]]; then
-                    if $merged_rest_fallback || $closed_rest_fallback; then
+                    if [[ -n "$fallback_pools" ]]; then
                         result="DUPLICATE_FOUND (REST fallback -- similarity ranking basis differs from GraphQL)"$'\n'
+                        header_labeled_rest=true
                     else
                         result="DUPLICATE_FOUND"$'\n'
                     fi
                 fi
-                exit_code=1
+                duplicate_found=true
+            fi
+            # Re-establish the line separator before appending another pool's
+            # list. `result=$(search_similar_issues ...)` came back through a
+            # command substitution, which STRIPS the trailing newline, so
+            # appending directly splices the last open-issue line and the
+            # first merged-PR line into one line -- which the --json parser
+            # then reads as a single bogus match (the second entry's number
+            # lost, its title swallowed into the first entry's title).
+            if [[ -n "$result" && "$result" != *$'\n' ]]; then
+                result+=$'\n'
             fi
             if [[ -n "$merged_result" ]]; then
                 result+="$merged_result"$'\n'
@@ -749,6 +837,42 @@ main() {
                 result+="$closed_result"$'\n'
             fi
         fi
+    fi
+
+    # Degraded-coverage notes (#4526). Appended as their own marker lines so a
+    # Curator reading text output learns WHY a match list may be partial or
+    # differently ranked, and so --json can surface it as a field. Both are
+    # skipped by the --json line parser below.
+    #
+    # SEARCH_INCOMPLETE only appears alongside a real match: with no match the
+    # verdict is exit 2 and the per-pool stderr errors already say what broke.
+    if [[ -n "$result" && "$result" != *$'\n' ]] && \
+       { [[ -n "$incomplete_pools" ]] || [[ -n "$fallback_pools" ]]; } && $duplicate_found; then
+        result+=$'\n'
+    fi
+    if [[ -n "$incomplete_pools" ]] && $duplicate_found; then
+        result+="SEARCH_INCOMPLETE: ${incomplete_pools} -- GraphQL rate-limited and REST fallback also failed; matches below are partial"$'\n'
+    fi
+    # REST_FALLBACK covers the interleaving the umbrella header above cannot:
+    # the open-issues search already matched via ordinary GraphQL (so its own
+    # plain "DUPLICATE_FOUND" header stands) while a LATER pool fell back to
+    # REST. Without this, that REST-sourced subset would be reported with no
+    # indication its similarity ranking basis differs.
+    if [[ -n "$fallback_pools" ]] && ! $header_labeled_rest && $duplicate_found; then
+        result+="REST_FALLBACK: ${fallback_pools} -- answered via REST; similarity ranking basis differs from GraphQL"$'\n'
+    fi
+
+    # Final verdict (#4526): a confirmed duplicate ALWAYS outranks incomplete
+    # coverage. Reporting exit 2 when some other pool did find a match would
+    # discard the actionable answer -- and in --json mode the exit-2 branch
+    # below emits a bare {"error": ...} with no `matches` array at all, so the
+    # match would vanish entirely rather than merely be mis-coded.
+    if $duplicate_found; then
+        exit_code=1
+    elif [[ -n "$incomplete_pools" ]]; then
+        exit_code=2
+    else
+        exit_code=0
     fi
 
     # Cross-reference probe (--issue N only, issue #4162). Distinct from
@@ -780,6 +904,16 @@ main() {
                 degenerate=true
             fi
 
+            # Degraded-coverage flag (#4526): true when at least one search
+            # pool could not be checked at all (GraphQL rate-limited and its
+            # REST fallback also failed) while another pool still produced
+            # matches. Surfaced separately from `matches` so a caller can tell
+            # "no other duplicates exist" from "we could not look everywhere".
+            local search_incomplete=false
+            if [[ -n "$incomplete_pools" ]]; then
+                search_incomplete=true
+            fi
+
             # Parse duplicates into JSON (unconditional -- harmless no-op on
             # an empty $result, e.g. exit_code 0 or "related work only")
             local matches="[]"
@@ -788,6 +922,10 @@ main() {
                 # (#4526) emits "DUPLICATE_FOUND (REST fallback -- ...)".
                 [[ "$line" == DUPLICATE_FOUND* ]] && continue
                 [[ "$line" == NON_DISCRIMINATIVE* ]] && continue
+                # Degraded-coverage marker lines (#4526) -- reported via the
+                # `search_incomplete` field, never as a match.
+                [[ "$line" == SEARCH_INCOMPLETE:* ]] && continue
+                [[ "$line" == REST_FALLBACK:* ]] && continue
                 [[ -z "$line" ]] && continue
 
                 # Parse "#123: Title (similarity: 75%)" or "PR #123: Title (similarity: 75%)"
@@ -821,13 +959,9 @@ main() {
             fi
 
             if [[ "$matches" == "[]" ]]; then
-                if $degenerate; then
-                    echo "{\"duplicate_found\": false, \"degenerate\": true, \"matches\": []}"
-                else
-                    echo '{"duplicate_found": false, "degenerate": false, "matches": []}'
-                fi
+                echo "{\"duplicate_found\": false, \"degenerate\": $degenerate, \"search_incomplete\": $search_incomplete, \"matches\": []}"
             else
-                echo "{\"duplicate_found\": true, \"degenerate\": $degenerate, \"matches\": $matches}"
+                echo "{\"duplicate_found\": true, \"degenerate\": $degenerate, \"search_incomplete\": $search_incomplete, \"matches\": $matches}"
             fi
         fi
     else

@@ -129,6 +129,22 @@ cat > "$STUB_DIR/gh" <<'STUB'
 #!/usr/bin/env bash
 STUB_DIR_FROM_ENV="${LOOM_TEST_STUB_DIR:?stub gh: LOOM_TEST_STUB_DIR not set}"
 
+# The rate-limit error text the stubbed GraphQL calls emit. Defaults to the
+# REAL phrasing GitHub's GraphQL API returns -- "API rate limit ALREADY
+# exceeded" -- which is what loom-daemon/src/rate_limit_breaker.rs documents
+# and unit-tests (RATE_LIMIT_SIGNATURES). This matters: "already exceeded"
+# does not contain "API rate limit exceeded" as a contiguous substring, so a
+# stub using the REST phrasing would let a check that only matches the REST
+# form pass every test while never firing in production (#4526). Tests can
+# override via $STUB_DIR/rate-limit-message to exercise other phrasings.
+rate_limit_message() {
+  if [[ -f "$STUB_DIR_FROM_ENV/rate-limit-message" ]]; then
+    cat "$STUB_DIR_FROM_ENV/rate-limit-message"
+  else
+    echo "GraphQL: API rate limit already exceeded for user ID 12345667."
+  fi
+}
+
 case "$1" in
   auth)
     exit 0
@@ -152,7 +168,7 @@ case "$1" in
         shift
       done
       if [[ -f "$STUB_DIR_FROM_ENV/issue-list-rate-limit-$state" ]]; then
-        echo "GraphQL: API rate limit exceeded for installation ID 123. (issue)" >&2
+        echo "$(rate_limit_message) (issue)" >&2
         exit 1
       fi
       canned="$STUB_DIR_FROM_ENV/issues-$state.json"
@@ -165,7 +181,7 @@ case "$1" in
   pr)
     if [[ "$2" == "list" ]]; then
       if [[ -f "$STUB_DIR_FROM_ENV/pr-list-rate-limit" ]]; then
-        echo "GraphQL: API rate limit exceeded for installation ID 123. (pr)" >&2
+        echo "$(rate_limit_message) (pr)" >&2
         exit 1
       fi
       canned="$STUB_DIR_FROM_ENV/prs-merged.json"
@@ -226,6 +242,7 @@ reset_state() {
     rm -f "$STUB_DIR/timeline-fail" "$STUB_DIR/repo-view-fail"
     rm -f "$STUB_DIR"/issue-list-rate-limit-* "$STUB_DIR/pr-list-rate-limit"
     rm -f "$STUB_DIR/rest-issues-fail" "$STUB_DIR/rest-prs-fail"
+    rm -f "$STUB_DIR/rate-limit-message"
 }
 
 run_cds() {
@@ -595,6 +612,205 @@ run_cds --threshold 50 --title "Alpha Bravo Charlie Delta"
 assert_eq "1" "$RC" "(v) Ordinary GraphQL success -> exit 1"
 assert_contains "$OUT" "DUPLICATE_FOUND" "(v) Ordinary GraphQL success still emits a DUPLICATE_FOUND header"
 assert_not_contains "$OUT" "REST fallback" "(v) Ordinary GraphQL success never mentions the REST fallback"
+
+echo ""
+echo "Testing rate-limit signature coverage (both GraphQL and REST phrasings)..."
+
+# (w) The REST phrasing ("API rate limit exceeded", no "already") must ALSO
+# trigger the fallback. Cases (p)-(v) above now run against the default stub
+# message, which is the GraphQL phrasing ("API rate limit ALREADY exceeded"),
+# so this case pins the other half of the signature table. A single-pattern
+# check for either phrasing alone fails one of these two groups: "already
+# exceeded" does not contain "API rate limit exceeded" contiguously, and vice
+# versa. Ground truth: loom-daemon/src/rate_limit_breaker.rs
+# RATE_LIMIT_SIGNATURES lists both as distinct, both-required entries.
+reset_state
+echo "HTTP 403: API rate limit exceeded for 1.2.3.4" > "$STUB_DIR/rate-limit-message"
+: > "$STUB_DIR/issue-list-rate-limit-open"
+cat > "$STUB_DIR/rest-issues-open.json" <<'EOF'
+[{"number": 811, "title": "Alpha Bravo Charlie Delta", "body": "", "pull_request": null}]
+EOF
+run_cds --threshold 50 --title "Alpha Bravo Charlie Delta"
+assert_eq "1" "$RC" "(w) REST phrasing 'API rate limit exceeded' also triggers the fallback -> exit 1"
+assert_contains "$OUT" "DUPLICATE_FOUND (REST fallback" "(w) REST-phrasing rate limit is recognized, not treated as a hard error"
+assert_contains "$OUT" "#811" "(w) REST fallback still finds the match under the REST phrasing"
+
+# (w2) Case-insensitivity: the signature match lowercases first (mirroring
+# rate_limit_breaker.rs's to_ascii_lowercase), so an all-caps deployment
+# variant is still recognized.
+reset_state
+echo "GRAPHQL: API RATE LIMIT ALREADY EXCEEDED FOR USER ID 99" > "$STUB_DIR/rate-limit-message"
+: > "$STUB_DIR/issue-list-rate-limit-open"
+cat > "$STUB_DIR/rest-issues-open.json" <<'EOF'
+[{"number": 812, "title": "Alpha Bravo Charlie Delta", "body": "", "pull_request": null}]
+EOF
+run_cds --threshold 50 --title "Alpha Bravo Charlie Delta"
+assert_eq "1" "$RC" "(w2) Rate-limit signature match is case-insensitive -> exit 1"
+assert_contains "$OUT" "#812" "(w2) Uppercase rate-limit text still routes to the REST fallback"
+
+# (w3) Secondary rate limits are in the same signature table and also route
+# to the REST fallback rather than the hard-error path.
+reset_state
+echo "You have exceeded a secondary rate limit. Please wait a few minutes." > "$STUB_DIR/rate-limit-message"
+: > "$STUB_DIR/issue-list-rate-limit-open"
+cat > "$STUB_DIR/rest-issues-open.json" <<'EOF'
+[{"number": 813, "title": "Alpha Bravo Charlie Delta", "body": "", "pull_request": null}]
+EOF
+run_cds --threshold 50 --title "Alpha Bravo Charlie Delta"
+assert_eq "1" "$RC" "(w3) Secondary rate limit routes to the REST fallback -> exit 1"
+assert_contains "$OUT" "#813" "(w3) Secondary-rate-limit text still routes to the REST fallback"
+
+# (w4) Regression guard on the narrow gate: a NON-rate-limit GraphQL failure
+# must still take the original hard-error path (exit 2), never the fallback.
+reset_state
+echo "GraphQL: Could not resolve to a Repository with the name 'owner/repo'." > "$STUB_DIR/rate-limit-message"
+: > "$STUB_DIR/issue-list-rate-limit-open"
+cat > "$STUB_DIR/rest-issues-open.json" <<'EOF'
+[{"number": 814, "title": "Alpha Bravo Charlie Delta", "body": "", "pull_request": null}]
+EOF
+run_cds --threshold 50 --title "Alpha Bravo Charlie Delta"
+assert_eq "2" "$RC" "(w4) Non-rate-limit GraphQL failure still hard-errors -> exit 2"
+assert_contains "$ERR" "Failed to fetch issues" "(w4) Non-rate-limit failure uses the original error path"
+assert_not_contains "$OUT" "#814" "(w4) Non-rate-limit failure never consults the REST fallback fixture"
+
+echo ""
+echo "Testing partial-failure vs confirmed-duplicate precedence (issue #4526)..."
+
+# (x) THE regression this section exists for: the open-issues search finds a
+# real duplicate via ordinary GraphQL while the merged-PRs pool fails
+# COMPLETELY (GraphQL rate-limited AND REST fallback failed). A confirmed
+# duplicate must win: exit 1 with the match reported, plus a
+# SEARCH_INCOMPLETE note naming the pool that could not be checked. The
+# earlier draft unconditionally overwrote the exit code with 2 whenever any
+# pool totally failed, silently discarding the real match.
+reset_state
+cat > "$STUB_DIR/issues-open.json" <<'EOF'
+[{"number": 801, "title": "Alpha Bravo Charlie Delta", "body": ""}]
+EOF
+: > "$STUB_DIR/pr-list-rate-limit"
+: > "$STUB_DIR/rest-prs-fail"
+run_cds --include-merged-prs --threshold 50 --title "Alpha Bravo Charlie Delta"
+assert_eq "1" "$RC" "(x) Confirmed open-issue duplicate outranks a total merged-PR failure -> exit 1, not 2"
+assert_contains "$OUT" "DUPLICATE_FOUND" "(x) The confirmed duplicate is still reported"
+assert_contains "$OUT" "#801: Alpha Bravo Charlie Delta (similarity: 100%)" "(x) The match itself is not discarded"
+assert_contains "$OUT" "SEARCH_INCOMPLETE: merged PRs" "(x) The uncheckable pool is named in a SEARCH_INCOMPLETE note"
+assert_contains "$ERR" "REST fallback also failed" "(x) stderr still explains the merged-PR pool failure"
+
+# (x2) Same scenario in --json mode, where the old behavior was worse than a
+# wrong exit code: the exit-2 branch emits a bare {"error": ...} and drops the
+# `matches` array entirely, so a confirmed duplicate vanished from the output.
+reset_state
+cat > "$STUB_DIR/issues-open.json" <<'EOF'
+[{"number": 801, "title": "Alpha Bravo Charlie Delta", "body": ""}]
+EOF
+: > "$STUB_DIR/pr-list-rate-limit"
+: > "$STUB_DIR/rest-prs-fail"
+run_cds --include-merged-prs --threshold 50 --title "Alpha Bravo Charlie Delta" --json
+assert_eq "1" "$RC" "(x2) --json: confirmed duplicate + total pool failure -> exit 1"
+assert_eq "true" "$(echo "$OUT" | jq -r '.duplicate_found')" "(x2) --json reports duplicate_found true"
+assert_eq "801" "$(echo "$OUT" | jq -r '.matches[0].number')" "(x2) --json still carries the confirmed match"
+assert_eq "1" "$(echo "$OUT" | jq -r '.matches | length')" "(x2) --json matches contains exactly the real match"
+assert_eq "true" "$(echo "$OUT" | jq -r '.search_incomplete')" "(x2) --json flags the degraded coverage separately from the match"
+assert_not_contains "$OUT" '"error"' "(x2) --json no longer collapses to a bare error object"
+
+# (x3) Mirror image: the OPEN-issues pool fails completely while the
+# merged-PRs pool finds a real duplicate. Same principle, opposite direction
+# -- the match must survive and get its DUPLICATE_FOUND header even though
+# the pool searched first could not run.
+reset_state
+: > "$STUB_DIR/issue-list-rate-limit-open"
+: > "$STUB_DIR/rest-issues-fail"
+cat > "$STUB_DIR/prs-merged.json" <<'EOF'
+[{"number": 901, "title": "Alpha Bravo Charlie Delta", "body": ""}]
+EOF
+run_cds --include-merged-prs --threshold 50 --title "Alpha Bravo Charlie Delta"
+assert_eq "1" "$RC" "(x3) Merged-PR duplicate outranks a total open-issues failure -> exit 1"
+assert_contains "$OUT" "DUPLICATE_FOUND" "(x3) The merged-PR match still gets an umbrella header"
+assert_contains "$OUT" "PR #901: Alpha Bravo Charlie Delta (similarity: 100%)" "(x3) The merged-PR match is reported"
+assert_contains "$OUT" "SEARCH_INCOMPLETE: open issues" "(x3) The uncheckable open-issues pool is named"
+
+# (y) Total failure with NO duplicate anywhere still means exit 2 -- the
+# precedence fix must not weaken the "could not run at all" signal that the
+# rest of this section depends on.
+reset_state
+cat > "$STUB_DIR/issues-open.json" <<'EOF'
+[{"number": 805, "title": "Completely unrelated banana fruit basket", "body": ""}]
+EOF
+: > "$STUB_DIR/pr-list-rate-limit"
+: > "$STUB_DIR/rest-prs-fail"
+run_cds --include-merged-prs --threshold 50 --title "Alpha Bravo Charlie Delta"
+assert_eq "2" "$RC" "(y) Total pool failure with no duplicate found anywhere -> still exit 2"
+assert_not_contains "$OUT" "SEARCH_INCOMPLETE" "(y) No SEARCH_INCOMPLETE note when there is no match to qualify"
+
+# (y2) ...and its --json form still reports the bare error object, unchanged.
+reset_state
+: > "$STUB_DIR/pr-list-rate-limit"
+: > "$STUB_DIR/rest-prs-fail"
+run_cds --include-merged-prs --threshold 50 --title "Alpha Bravo Charlie Delta" --json
+assert_eq "2" "$RC" "(y2) --json: total failure with no match -> exit 2"
+assert_contains "$OUT" '"error"' "(y2) --json still reports the error object when nothing could be determined"
+
+# (z) Non-blocking gap from review, fixed here: the open-issues search matches
+# via ORDINARY GraphQL (so its plain DUPLICATE_FOUND header stands) while the
+# merged-PRs pool separately succeeds through the REST fallback. Without a
+# REST_FALLBACK note the REST-sourced subset would be reported with no hint
+# that its similarity ranking basis differs.
+reset_state
+cat > "$STUB_DIR/issues-open.json" <<'EOF'
+[{"number": 801, "title": "Alpha Bravo Charlie Delta", "body": ""}]
+EOF
+: > "$STUB_DIR/pr-list-rate-limit"
+cat > "$STUB_DIR/rest-prs.json" <<'EOF'
+[{"number": 901, "title": "Alpha Bravo Charlie Delta", "body": "", "merged_at": "2026-01-01T00:00:00Z"}]
+EOF
+run_cds --include-merged-prs --threshold 50 --title "Alpha Bravo Charlie Delta"
+assert_eq "1" "$RC" "(z) Ordinary-GraphQL open match + REST-fallback merged match -> exit 1"
+assert_contains "$OUT" "#801: Alpha Bravo Charlie Delta (similarity: 100%)" "(z) Open-issue match reported"
+assert_contains "$OUT" "PR #901: Alpha Bravo Charlie Delta (similarity: 100%)" "(z) REST-fallback merged-PR match reported"
+assert_contains "$OUT" "REST_FALLBACK: merged PRs" "(z) REST provenance is labeled even though the umbrella header came from the open-issues search"
+
+# (z2) The new marker lines must never be parsed as matches by --json.
+reset_state
+cat > "$STUB_DIR/issues-open.json" <<'EOF'
+[{"number": 801, "title": "Alpha Bravo Charlie Delta", "body": ""}]
+EOF
+: > "$STUB_DIR/pr-list-rate-limit"
+cat > "$STUB_DIR/rest-prs.json" <<'EOF'
+[{"number": 901, "title": "Alpha Bravo Charlie Delta", "body": "", "merged_at": "2026-01-01T00:00:00Z"}]
+EOF
+run_cds --include-merged-prs --threshold 50 --title "Alpha Bravo Charlie Delta" --json
+assert_eq "2" "$(echo "$OUT" | jq -r '.matches | length')" "(z2) --json parses exactly the two real matches, not the REST_FALLBACK marker line"
+assert_eq "false" "$(echo "$OUT" | jq -r '.search_incomplete')" "(z2) A successful REST fallback is NOT reported as incomplete coverage"
+
+# (z3) Line-splicing regression, latent on main and first exposed by (z)/(z2):
+# `result=$(search_similar_issues ...)` loses its trailing newline to command
+# substitution, so appending the merged-PR list ran the two pools' lists
+# together on ONE line ("#801: ... (similarity: 100%)PR #901: ..."). Text
+# output was merely garbled; --json was worse, parsing the spliced pair as a
+# single match whose title swallowed the second entry and whose number was
+# lost. Exercised here with no rate-limiting at all, so it pins the plain
+# multi-pool aggregation path independently of the #4526 fallback.
+reset_state
+cat > "$STUB_DIR/issues-open.json" <<'EOF'
+[{"number": 801, "title": "Alpha Bravo Charlie Delta", "body": ""}]
+EOF
+cat > "$STUB_DIR/prs-merged.json" <<'EOF'
+[{"number": 901, "title": "Alpha Bravo Charlie Delta", "body": ""}]
+EOF
+cat > "$STUB_DIR/issues-closed.json" <<'EOF'
+[{"number": 1001, "title": "Alpha Bravo Charlie Delta", "body": ""}]
+EOF
+run_cds --include-merged-prs --threshold 50 --title "Alpha Bravo Charlie Delta"
+assert_eq "1" "$RC" "(z3) Matches in all three pools (no rate limiting) -> exit 1"
+assert_contains "$OUT" "#801: Alpha Bravo Charlie Delta (similarity: 100%)" "(z3) Open-issue match occupies its own line"
+assert_contains "$OUT" "PR #901: Alpha Bravo Charlie Delta (similarity: 100%)" "(z3) Merged-PR match occupies its own line"
+assert_contains "$OUT" "Closed #1001: Alpha Bravo Charlie Delta (similarity: 100%)" "(z3) Closed-issue match occupies its own line"
+assert_not_contains "$OUT" "100%)PR #901" "(z3) Open-issue and merged-PR lines are not spliced onto one line"
+
+run_cds --include-merged-prs --threshold 50 --title "Alpha Bravo Charlie Delta" --json
+assert_eq "3" "$(echo "$OUT" | jq -r '.matches | length')" "(z3) --json parses all three pool matches separately"
+assert_eq "801 901 1001" "$(echo "$OUT" | jq -r '[.matches[].number] | join(" ")')" "(z3) --json recovers every match number, none swallowed by a splice"
+assert_eq "issue pr closed_issue" "$(echo "$OUT" | jq -r '[.matches[].type] | join(" ")')" "(z3) --json assigns each match its correct pool type"
 
 # --- Summary ---
 echo ""
