@@ -72,6 +72,19 @@
 //! strings (`publish` does not reject unknown topics) so the publisher side
 //! stays open for future extension, but the documented taxonomy is the
 //! contract subscribers should rely on.
+//!
+//! # Durability (Issue #4644)
+//!
+//! This bus is **in-memory only** — a bounded [`tokio::sync::broadcast`]
+//! channel. A published event with no attached subscriber (or one that
+//! disconnects/lags past the buffer) is gone forever; nothing here persists
+//! across a daemon restart. For `sweep.issue.{N}.exited` / `.crashed`
+//! specifically, [`crate::sweep_outcomes`] closes that gap with a durable,
+//! append-only on-disk journal (`<workspace>/.loom/logs/sweep-outcomes.jsonl`)
+//! written at the same emit sites, additively — this bus's behavior and topic
+//! contract are unchanged. Consult that module when a terminal outcome needs
+//! to be queryable after the sweep registry's ~1h in-memory GC window, or
+//! after a daemon restart.
 
 use crate::types::Event;
 
