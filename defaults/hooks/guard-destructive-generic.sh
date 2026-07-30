@@ -1546,6 +1546,21 @@ if echo "$COMMAND" | grep -qiE "$GH_COMMENT_BODY_AT_PATTERN"; then
 fi
 
 # =============================================================================
+# `gh pr/issue edit --body @path` — same literal-@ silent data loss, different
+# subcommand (#4685). The #4523 rule above is hard-anchored to `comment`, so
+# `gh issue edit N --body @path` sailed through untouched and posted the
+# literal string as the issue/PR BODY (not a comment) — real-world evidence:
+# issue #4608's body was corrupted to the literal string
+# `@/tmp/issue4608_body_new.txt`. Deliberately a SEPARATE rule/regex, not a
+# widened GH_COMMENT_BODY_AT_PATTERN (#4577's additive-not-widened precedent),
+# so the two subcommands' patterns can be fixed/tuned independently.
+# =============================================================================
+GH_EDIT_BODY_AT_PATTERN="(^|[;&|[:space:]])gh[[:space:]]+(pr|issue)[[:space:]]+edit[^;&]*(-b|--body)[[:space:]]*=?[[:space:]]*[\"']?@[/.~]"
+if echo "$COMMAND" | grep -qiE "$GH_EDIT_BODY_AT_PATTERN"; then
+    deny "BLOCKED: 'gh pr edit'/'gh issue edit --body @path' does NOT expand the file — it writes the literal string '@path' as the issue/PR body (corrupted issue #4608's body this way). Use --body \"\$(cat <<'EOF' ... EOF)\", -F/--body-file <path>, or 'gh api ... -F body=@<path>' instead." "gh-edit-body-literal-at"
+fi
+
+# =============================================================================
 # The same literal-@ loss reached through SHELL-VARIABLE INDIRECTION (#4601)
 #
 # The #4523 rule above inspects only the STATIC text immediately following the
@@ -1611,6 +1626,24 @@ if [[ "$COMMAND" == *"@"* ]]; then
     fi
 
     # -------------------------------------------------------------------------
+    # Same shell-variable-indirection shape, `edit` subcommand (#4685). Kept as
+    # a separate parallel `if`/loop rather than folding `edit` into the
+    # `comment` subcommand regex above, for the identical #4577-precedent
+    # reason cited on GH_EDIT_BODY_AT_PATTERN.
+    # -------------------------------------------------------------------------
+    if echo "$COMMAND" | grep -qiE "(^|[;&|[:space:]])gh[[:space:]]+(pr|issue)[[:space:]]+edit"; then
+        _gh_at_path_vars_edit=$(printf '%s\n' "$COMMAND" \
+            | grep -oE "(^|[;&|(){}[:space:]])[A-Za-z_][A-Za-z0-9_]*=[\"']?$GH_AT_PATHISH" 2>/dev/null \
+            | grep -oE "[A-Za-z_][A-Za-z0-9_]*=" 2>/dev/null \
+            | tr -d '=' | sort -u)
+        for _gh_at_var in $_gh_at_path_vars_edit; do
+            if echo "$COMMAND" | grep -qiE "(-b|--body)[[:space:]]*=?[[:space:]]*[\"']?[\$]\{?${_gh_at_var}(\}|[^A-Za-z0-9_]|\$)"; then
+                deny "BLOCKED: '\$${_gh_at_var}' is assigned a path-shaped '@<path>' value and passed as --body — 'gh pr edit'/'gh issue edit' does NOT expand '@path' from a variable either; it writes the literal string as the issue/PR body (corrupted issue #4608's body this way). Use --body-file <path>, 'gh api ... -F body=@<path>', or --body \"\$(cat <<'EOF' ... EOF)\"." "gh-edit-body-literal-at-var"
+            fi
+        done
+    fi
+
+    # -------------------------------------------------------------------------
     # `gh api … -f/--raw-field body=@path` — the same silent literal-@ loss.
     #
     # On `gh api`, ONLY `-F`/`--field` gives `@<path>` its read-from-file
@@ -1624,10 +1657,18 @@ if [[ "$COMMAND" == *"@"* ]]; then
     # leading whitespace anchor before the flag is likewise load-bearing —
     # without it, `-f` matches inside `--field` (the long form of `-F`) and
     # denies that too. GH_AT_PATHISH keeps `-f body="@mention …"` prose allowed.
+    #
+    # ENDPOINT SCOPE (#4685): this pattern was never anchored to a
+    # `/comments` endpoint — it matches `gh api <any-endpoint> ... -f
+    # body=@path` regardless of path — so it already covers `gh api
+    # repos/{o}/{r}/issues/{n}` (issue PATCH) and
+    # `repos/{o}/{r}/pulls/{n}` (PR PATCH) exactly as it covers
+    # `.../issues/{n}/comments`. Confirmed via the test suite's new
+    # non-comments-endpoint case; no widening was needed here.
     # -------------------------------------------------------------------------
     GH_API_RAWFIELD_BODY_AT_PATTERN="(^|[;&|[:space:]])gh[[:space:]]+api[^;&]*[[:space:]](-f|--raw-field)[[:space:]]*=?[[:space:]]*[\"']?body=[\"']?$GH_AT_PATHISH"
     if echo "$COMMAND" | grep -qE "$GH_API_RAWFIELD_BODY_AT_PATTERN"; then
-        deny "BLOCKED: 'gh api ... -f/--raw-field body=@<path>' does NOT read the file — only -F/--field gives '@<path>' its read-from-file meaning. As written this posts the literal string '@<path>' as the comment body (same silent data loss as PR #4457). Use '-F body=@<path>' instead." "gh-api-rawfield-body-literal-at"
+        deny "BLOCKED: 'gh api ... -f/--raw-field body=@<path>' does NOT read the file — only -F/--field gives '@<path>' its read-from-file meaning. As written this posts the literal string '@<path>' as the body (same silent data loss as PR #4457/issue #4608). Use '-F body=@<path>' instead." "gh-api-rawfield-body-literal-at"
     fi
 fi
 

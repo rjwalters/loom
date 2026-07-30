@@ -546,6 +546,56 @@ assert_allow "#4601: Allow gh api --field body=@path (long form of -F, must not 
 assert_allow "#4601/#4577: Allow gh api -f body=\"@mention prose\" (not path-shaped)" \
     "gh api repos/o/r/issues/123/comments -f body=\"@rjwalters thanks for the review\""
 
+# --- #4685: the same literal-@ loss on the `edit` subcommand — real-world
+# evidence is issue #4608's body being corrupted to the literal string
+# `@/tmp/issue4608_body_new.txt`. The #4523/#4601 rules above are hard-anchored
+# to `comment`, so `gh issue edit`/`gh pr edit --body @path` sailed through
+# untouched. Mirrors the comment-subcommand cases above shape-for-shape.
+assert_deny "#4685: Block gh issue edit --body @path (unquoted)" \
+    "gh issue edit 4608 --body @/tmp/issue4608_body_new.txt"
+
+assert_deny "#4685: Block gh issue edit --body @path (double-quoted)" \
+    'gh issue edit 4608 --body "@/tmp/issue4608_body_new.txt"'
+
+assert_deny "#4685: Block gh issue edit --body @path (single-quoted)" \
+    "gh issue edit 4608 --body '@/tmp/issue4608_body_new.txt'"
+
+assert_deny "#4685: Block gh pr edit --body @path (unquoted)" \
+    "gh pr edit 123 --body @/tmp/review.md"
+
+assert_deny "#4685: Block gh issue edit -b @path (short flag)" \
+    "gh issue edit 4608 -b @/tmp/issue4608_body_new.txt"
+
+assert_deny "#4685: Block --body \"\$VAR\" where VAR is assigned an @path in the same command (edit)" \
+    'BODY_FILE="@/tmp/issue4608_body_new.txt"; gh issue edit 4608 --body "$BODY_FILE"'
+
+assert_deny "#4685: Block --body \$VAR (unquoted var, unquoted @path assignment, edit)" \
+    'BODY_FILE=@/tmp/issue4608_body_new.txt; gh issue edit 4608 --body $BODY_FILE'
+
+assert_deny "#4685: Block --body \"\${VAR}\" (braced expansion, edit)" \
+    'BODY_FILE="@/tmp/issue4608_body_new.txt"; gh issue edit 4608 --body "${BODY_FILE}"'
+
+assert_deny "#4685: Block gh pr edit -b \"\$VAR\" (short flag, && chain, single-quoted value)" \
+    "F='@/tmp/x.md' && gh pr edit 123 -b \"\$F\""
+
+assert_allow "#4685: Allow gh issue edit --body \"\$SUMMARY\" (no @path assigned anywhere)" \
+    'gh issue edit 4608 --body "$SUMMARY"'
+
+assert_allow "#4685: Allow gh issue edit --body \"\$VAR\" holding a bare @mention" \
+    'M=@rjwalters; gh issue edit 4608 --body "$M"'
+
+assert_allow "#4685: Allow a path in a variable expanded through \$(cat …) (edit, the correct pattern)" \
+    'BODY=/tmp/issue4608_body_new.txt; gh issue edit 4608 --body "$(cat $BODY)"'
+
+# `gh api` PATCH endpoint (issues/pulls, not /comments) with -f body=@path —
+# confirms the existing #4601 rule was never endpoint-scoped, so it already
+# covers the edit-equivalent PATCH surface without any widening.
+assert_deny "#4685: Block gh api -f body=@path against the issue PATCH endpoint (not /comments)" \
+    "gh api repos/o/r/issues/4608 -f body=@/tmp/issue4608_body_new.txt -X PATCH"
+
+assert_deny "#4685: Block gh api -f body=@path against the pulls PATCH endpoint" \
+    "gh api repos/o/r/pulls/123 -f body=@/tmp/review.md -X PATCH"
+
 echo ""
 
 # =========================================================================
