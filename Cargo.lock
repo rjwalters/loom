@@ -1223,6 +1223,7 @@ dependencies = [
  "dirs",
  "env_logger",
  "hex",
+ "libc",
  "log",
  "regex",
  "reqwest",

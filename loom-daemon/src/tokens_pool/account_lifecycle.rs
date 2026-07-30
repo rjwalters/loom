@@ -78,7 +78,37 @@ pub struct RunnerOutput {
     pub success: bool,
     pub unavailable: bool,
     pub timed_out: bool,
+    pub exit_code: Option<i32>,
     pub summary: String,
+}
+
+#[derive(Debug)]
+pub struct LoginCommandFailed {
+    pub exit_code: Option<i32>,
+    summary: String,
+}
+
+impl std::fmt::Display for LoginCommandFailed {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.summary)
+    }
+}
+
+impl std::error::Error for LoginCommandFailed {}
+
+#[must_use]
+pub fn login_exit_code(error: &anyhow::Error) -> Option<i32> {
+    error
+        .downcast_ref::<LoginCommandFailed>()
+        .and_then(|failure| failure.exit_code)
+}
+
+fn login_failure(output: RunnerOutput) -> anyhow::Error {
+    LoginCommandFailed {
+        exit_code: output.exit_code,
+        summary: output.summary,
+    }
+    .into()
 }
 
 pub trait CodexCommandRunner {
@@ -103,6 +133,7 @@ impl ProcessCodexRunner {
                     success: false,
                     unavailable: true,
                     timed_out: false,
+                    exit_code: None,
                     summary: "Codex CLI is not installed or not on PATH".into(),
                 });
             }
@@ -136,6 +167,7 @@ impl ProcessCodexRunner {
                     success: status.success(),
                     unavailable: false,
                     timed_out: false,
+                    exit_code: status.code(),
                     summary: summary.into(),
                 });
             }
@@ -146,6 +178,7 @@ impl ProcessCodexRunner {
                     success: false,
                     unavailable: false,
                     timed_out: true,
+                    exit_code: None,
                     summary: "Codex login status timed out".into(),
                 });
             }
@@ -168,6 +201,7 @@ impl CodexCommandRunner for ProcessCodexRunner {
                     success: false,
                     unavailable: true,
                     timed_out: false,
+                    exit_code: None,
                     summary: "Codex CLI is not installed or not on PATH".into(),
                 });
             }
@@ -177,6 +211,7 @@ impl CodexCommandRunner for ProcessCodexRunner {
             success: status.success(),
             unavailable: false,
             timed_out: false,
+            exit_code: status.code(),
             summary: if status.success() {
                 "login completed"
             } else {
@@ -221,7 +256,7 @@ impl<R: CodexCommandRunner> AccountLifecycle<R> {
             if fs::read_dir(&profile)?.next().is_none() {
                 let _ = fs::remove_dir(&profile);
             }
-            bail!("{}", result.summary);
+            return Err(login_failure(result));
         }
         tighten_profile_permissions(&profile)?;
         let diagnostics = inspect_profile(&profile);
@@ -312,7 +347,7 @@ impl<R: CodexCommandRunner> AccountLifecycle<R> {
             .runner
             .login(&account.credential_reference, device_auth)?;
         if !result.success {
-            bail!("{}", result.summary);
+            return Err(login_failure(result));
         }
         tighten_profile_permissions(&account.credential_reference)?;
         let status = self.status(name)?;
@@ -324,28 +359,32 @@ impl<R: CodexCommandRunner> AccountLifecycle<R> {
 
     pub fn remove(&self, name: &str, purge: bool) -> Result<RemovalOutcome> {
         let account = self.find(name)?;
+        let quarantine = self.root.join(".quarantine");
+        ensure_private_dir(&quarantine)?;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
+        let stamp = now.as_secs();
+        let recovery_reference = format!("{name}-{stamp}-{}", now.subsec_nanos());
+        validate_name(&recovery_reference)?;
+        let destination = quarantine.join(&recovery_reference);
+        fs::rename(&account.credential_reference, &destination)
+            .context("failed to quarantine profile atomically")?;
+        if let Err(error) = unregister_codex_account(&self.workspace, name) {
+            fs::rename(&destination, &account.credential_reference)
+                .context("account registry update failed and profile rollback also failed")?;
+            return Err(error.context("account registry update failed; profile was restored"));
+        }
         if purge {
-            fs::remove_dir_all(&account.credential_reference)
-                .context("failed to purge Codex profile")?;
-            unregister_codex_account(&self.workspace, name)?;
+            // Only destroy bytes after the registry commit. A deletion error
+            // may leave private quarantine residue, but never a stale live
+            // registry entry pointing at a partially deleted profile.
+            fs::remove_dir_all(&destination)
+                .context("failed to purge quarantined Codex profile")?;
             return Ok(RemovalOutcome {
                 provider: AccountProvider::Codex,
                 name: name.into(),
                 purged: true,
                 recovery_reference: None,
             });
-        }
-        let quarantine = self.root.join(".quarantine");
-        ensure_private_dir(&quarantine)?;
-        let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-        let recovery_reference = format!("{name}-{stamp}");
-        validate_name(&recovery_reference)?;
-        let destination = quarantine.join(&recovery_reference);
-        fs::rename(&account.credential_reference, &destination)
-            .context("failed to quarantine profile atomically")?;
-        if let Err(error) = unregister_codex_account(&self.workspace, name) {
-            let _ = fs::rename(&destination, &account.credential_reference);
-            return Err(error);
         }
         let metadata = serde_json::json!({
             "version": 1,
@@ -488,6 +527,14 @@ fn tighten_profile_permissions(profile: &Path) -> Result<()> {
 }
 
 fn inspect_profile(profile: &Path) -> ProfileDiagnostics {
+    #[cfg(unix)]
+    let invoking_uid = unsafe { libc::geteuid() };
+    #[cfg(not(unix))]
+    let invoking_uid = 0;
+    inspect_profile_for_uid(profile, invoking_uid)
+}
+
+fn inspect_profile_for_uid(profile: &Path, invoking_uid: u32) -> ProfileDiagnostics {
     let profile_meta = fs::symlink_metadata(profile).ok();
     let auth_meta = fs::symlink_metadata(profile.join(AUTH_FILE)).ok();
     let auth_shape = match &auth_meta {
@@ -514,7 +561,9 @@ fn inspect_profile(profile: &Path) -> ProfileDiagnostics {
             .as_ref()
             .is_some_and(|meta| meta.mode() & 0o077 == 0);
         let owner_valid = match (&profile_meta, &auth_meta) {
-            (Some(directory), Some(auth)) => directory.uid() == auth.uid(),
+            (Some(directory), Some(auth)) => {
+                directory.uid() == invoking_uid && auth.uid() == invoking_uid
+            }
             _ => false,
         };
         (directory_mode_valid, auth_mode_valid, owner_valid)
@@ -532,6 +581,7 @@ fn inspect_profile(profile: &Path) -> ProfileDiagnostics {
 
 #[cfg(test)]
 mod tests {
+    use super::super::paths::per_repo_accounts_file;
     use super::*;
     use serial_test::serial;
     use std::sync::Mutex;
@@ -540,6 +590,18 @@ mod tests {
     struct FakeRunner {
         calls: Mutex<Vec<(PathBuf, Vec<String>)>>,
         fail_login: bool,
+    }
+
+    struct StatusRunner(RunnerOutput);
+
+    impl CodexCommandRunner for StatusRunner {
+        fn login(&self, _profile: &Path, _device_auth: bool) -> Result<RunnerOutput> {
+            unreachable!("status-only test runner")
+        }
+
+        fn login_status(&self, _profile: &Path) -> Result<RunnerOutput> {
+            Ok(self.0.clone())
+        }
     }
 
     impl CodexCommandRunner for FakeRunner {
@@ -564,6 +626,7 @@ mod tests {
                 success: !self.fail_login,
                 unavailable: false,
                 timed_out: false,
+                exit_code: self.fail_login.then_some(23),
                 summary: if self.fail_login {
                     "cancelled"
                 } else {
@@ -582,6 +645,7 @@ mod tests {
                 success: true,
                 unavailable: false,
                 timed_out: false,
+                exit_code: Some(0),
                 summary: "logged in".into(),
             })
         }
@@ -666,7 +730,8 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(service.add("alice", false).is_err());
+        let error = service.add("alice", false).unwrap_err();
+        assert_eq!(login_exit_code(&error), Some(23));
         assert!(!root.path().join("alice").exists());
         assert!(service.list(false).unwrap().is_empty());
         std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
@@ -710,6 +775,9 @@ mod tests {
         let metadata = fs::read_to_string(recovery.join("recovery.json")).unwrap();
         assert!(!metadata.contains("recognizable-fake-secret"));
         assert!(recovery.join("auth.json").exists());
+        service.import("alice", &source).unwrap();
+        let second = service.remove("alice", false).unwrap();
+        assert_ne!(recovery.file_name().unwrap(), second.recovery_reference.as_deref().unwrap());
         service.import("bob", &source).unwrap();
         assert!(service.remove("bob", true).unwrap().purged);
         assert!(!root.path().join("bob").exists());
@@ -728,6 +796,165 @@ mod tests {
         let service = AccountLifecycle::new(workspace.path(), FakeRunner::default()).unwrap();
         for name in ["../escape", "/absolute", "a/b", r"a\b"] {
             assert!(service.add(name, false).is_err());
+        }
+        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
+    }
+
+    #[test]
+    #[serial]
+    fn diagnostics_cover_unsafe_shapes_modes_and_invoking_owner() {
+        let (_workspace, root) = setup();
+        let profile = root.path().join("alice");
+        fs::create_dir(&profile).unwrap();
+
+        let missing = inspect_profile(&profile);
+        assert_eq!(missing.auth_shape, "missing");
+
+        let auth = profile.join(AUTH_FILE);
+        fs::write(&auth, "").unwrap();
+        assert_eq!(inspect_profile(&profile).auth_shape, "empty");
+        fs::remove_file(&auth).unwrap();
+        fs::create_dir(&auth).unwrap();
+        assert_eq!(inspect_profile(&profile).auth_shape, "non_regular");
+        fs::remove_dir(&auth).unwrap();
+        fs::write(&auth, "recognizable-fake-secret").unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            fs::set_permissions(&profile, fs::Permissions::from_mode(0o755)).unwrap();
+            fs::set_permissions(&auth, fs::Permissions::from_mode(0o644)).unwrap();
+            let unsafe_modes = inspect_profile(&profile);
+            assert!(!unsafe_modes.directory_mode_valid);
+            assert!(!unsafe_modes.auth_mode_valid);
+
+            fs::set_permissions(&profile, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::set_permissions(&auth, fs::Permissions::from_mode(0o600)).unwrap();
+            let actual_uid = fs::metadata(&profile).unwrap().uid();
+            assert!(!inspect_profile_for_uid(&profile, actual_uid.saturating_add(1)).owner_valid);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn import_rejects_symlink_and_never_echoes_secret_in_errors() {
+        let (workspace, root) = setup();
+        let source_dir = tempfile::tempdir().unwrap();
+        let source = source_dir.path().join("auth.json");
+        fs::write(&source, "recognizable-fake-secret").unwrap();
+        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", root.path());
+        let service = AccountLifecycle::new(workspace.path(), FakeRunner::default()).unwrap();
+        #[cfg(unix)]
+        {
+            let link = source_dir.path().join("auth-link.json");
+            std::os::unix::fs::symlink(&source, &link).unwrap();
+            let error = service.import("alice", &link).unwrap_err().to_string();
+            assert!(error.contains("regular file"));
+            assert!(!error.contains("recognizable-fake-secret"));
+        }
+        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
+    }
+
+    #[test]
+    #[serial]
+    fn registry_failure_rolls_quarantine_and_purge_back_to_live_profile() {
+        let (workspace, root) = setup();
+        let source_dir = tempfile::tempdir().unwrap();
+        let source = source_dir.path().join("auth.json");
+        fs::write(&source, "recognizable-fake-secret").unwrap();
+        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", root.path());
+        let service = AccountLifecycle::new(workspace.path(), FakeRunner::default()).unwrap();
+
+        for (name, purge) in [("retire", false), ("purge", true)] {
+            service.import(name, &source).unwrap();
+            let lock = per_repo_accounts_file(workspace.path()).with_extension("json.lock");
+            fs::create_dir(&lock).unwrap();
+            let error = service.remove(name, purge).unwrap_err().to_string();
+            fs::remove_dir(&lock).unwrap();
+            assert!(error.contains("registry"));
+            assert!(root.path().join(name).join(AUTH_FILE).exists());
+            assert!(service.find(name).is_ok());
+            assert!(!error.contains("recognizable-fake-secret"));
+        }
+        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
+    }
+
+    #[test]
+    #[serial]
+    fn quarantine_setup_failure_leaves_live_profile_and_registry_unchanged() {
+        let (workspace, root) = setup();
+        let source = root.path().join("source");
+        fs::write(&source, "recognizable-fake-secret").unwrap();
+        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", root.path());
+        let service = AccountLifecycle::new(workspace.path(), FakeRunner::default()).unwrap();
+        service.import("alice", &source).unwrap();
+        fs::write(root.path().join(".quarantine"), "not a directory").unwrap();
+
+        let error = service.remove("alice", false).unwrap_err().to_string();
+        assert!(root.path().join("alice").join(AUTH_FILE).exists());
+        assert!(service.find("alice").is_ok());
+        assert!(!error.contains("recognizable-fake-secret"));
+        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
+    }
+
+    #[test]
+    #[serial]
+    fn status_maps_missing_timeout_nonzero_and_not_logged_in_without_output_leaks() {
+        let cases = [
+            (
+                RunnerOutput {
+                    success: false,
+                    unavailable: true,
+                    timed_out: false,
+                    exit_code: None,
+                    summary: "Codex CLI is not installed or not on PATH".into(),
+                },
+                LoginState::CliMissing,
+            ),
+            (
+                RunnerOutput {
+                    success: false,
+                    unavailable: false,
+                    timed_out: true,
+                    exit_code: None,
+                    summary: "Codex login status timed out".into(),
+                },
+                LoginState::TimedOut,
+            ),
+            (
+                RunnerOutput {
+                    success: false,
+                    unavailable: false,
+                    timed_out: false,
+                    exit_code: Some(9),
+                    summary: "Codex login status failed".into(),
+                },
+                LoginState::Failed,
+            ),
+            (
+                RunnerOutput {
+                    success: false,
+                    unavailable: false,
+                    timed_out: false,
+                    exit_code: Some(1),
+                    summary: "not logged in".into(),
+                },
+                LoginState::NotLoggedIn,
+            ),
+        ];
+        for (index, (output, expected)) in cases.into_iter().enumerate() {
+            let (workspace, root) = setup();
+            let source = root.path().join(format!("source-{index}"));
+            fs::write(&source, "recognizable-fake-secret").unwrap();
+            std::env::set_var("LOOM_CODEX_PROFILE_ROOT", root.path());
+            let importer = AccountLifecycle::new(workspace.path(), FakeRunner::default()).unwrap();
+            importer.import("alice", &source).unwrap();
+            let service = AccountLifecycle::new(workspace.path(), StatusRunner(output)).unwrap();
+            let status = service.status("alice").unwrap();
+            assert_eq!(status.login_state, expected);
+            assert!(!serde_json::to_string(&status)
+                .unwrap()
+                .contains("recognizable-fake-secret"));
         }
         std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
     }

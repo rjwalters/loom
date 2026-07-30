@@ -11,6 +11,7 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
+use super::locking::MkdirLock;
 use super::paths::{codex_profile_root, per_repo_accounts_file, resolve_tokens_dir};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -161,10 +162,24 @@ fn write_repo_registry(workspace: &Path, entries: Vec<RegistryEntry>) -> Result<
         accounts: entries,
     };
     let bytes = serde_json::to_vec_pretty(&file)?;
-    let temp = parent.join(format!(".accounts.json.tmp-{}", std::process::id()));
+    let temp =
+        parent.join(format!(".accounts.json.tmp-{}-{}", std::process::id(), uuid::Uuid::new_v4()));
     std::fs::write(&temp, bytes).context("failed to stage account registry update")?;
     std::fs::rename(&temp, &path).context("failed to commit account registry update")?;
     Ok(())
+}
+
+fn registry_lock_path(workspace: &Path) -> PathBuf {
+    per_repo_accounts_file(workspace).with_extension("json.lock")
+}
+
+fn lock_registry(workspace: &Path) -> Result<MkdirLock> {
+    let path = registry_lock_path(workspace);
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("account registry lock has no parent directory"))?;
+    std::fs::create_dir_all(parent).context("failed to create account registry directory")?;
+    MkdirLock::acquire(&path).map_err(|error| anyhow!("failed to lock account registry: {error}"))
 }
 
 pub(crate) fn register_codex_account(
@@ -175,6 +190,7 @@ pub(crate) fn register_codex_account(
 ) -> Result<()> {
     validate_name(name)?;
     validate_name(credential_reference)?;
+    let _lock = lock_registry(workspace)?;
     let mut entries = read_repo_registry(workspace)?.unwrap_or_default();
     if entries
         .iter()
@@ -194,6 +210,7 @@ pub(crate) fn register_codex_account(
 
 pub(crate) fn set_codex_account_enabled(workspace: &Path, name: &str, enabled: bool) -> Result<()> {
     validate_name(name)?;
+    let _lock = lock_registry(workspace)?;
     let mut entries = read_repo_registry(workspace)?
         .ok_or_else(|| anyhow!("Codex account {name:?} does not exist"))?;
     let entry = entries
@@ -206,6 +223,7 @@ pub(crate) fn set_codex_account_enabled(workspace: &Path, name: &str, enabled: b
 
 pub(crate) fn unregister_codex_account(workspace: &Path, name: &str) -> Result<()> {
     validate_name(name)?;
+    let _lock = lock_registry(workspace)?;
     let mut entries = read_repo_registry(workspace)?
         .ok_or_else(|| anyhow!("Codex account {name:?} does not exist"))?;
     let before = entries.len();
@@ -536,6 +554,32 @@ mod tests {
         );
         assert!(account_inventory(workspace.path(), AccountProvider::Codex).is_err());
         std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
+    }
+
+    #[test]
+    fn concurrent_registry_updates_do_not_lose_accounts() {
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_path = workspace.path().to_path_buf();
+        let start = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|index| {
+                let workspace_path = workspace_path.clone();
+                let start = start.clone();
+                std::thread::spawn(move || {
+                    start.wait();
+                    let name = format!("account-{index}");
+                    register_codex_account(&workspace_path, &name, &name, true).unwrap();
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let entries = read_repo_registry(&workspace_path).unwrap().unwrap();
+        assert_eq!(entries.len(), 8);
+        assert!(!per_repo_accounts_file(&workspace_path)
+            .with_extension("json.lock")
+            .exists());
     }
 
     #[test]

@@ -25,6 +25,7 @@ hex = "0.4.3"
 # drops reqwest's default blocking/cookie/multipart surface this exporter
 # never touches.
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "rustls-native-certs", "json"] }
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3.27"

@@ -9,8 +9,21 @@ use crate::AccountsAction;
 
 pub(crate) fn handle_accounts_command(action: AccountsAction, workspace: &str) -> Result<()> {
     use loom_daemon::tokens_pool::account_lifecycle::{
-        AccountLifecycle, AccountStatus, ProcessCodexRunner,
+        login_exit_code, AccountLifecycle, AccountStatus, ProcessCodexRunner,
     };
+
+    fn preserve_login_exit<T>(result: Result<T>) -> Result<T> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                if let Some(code) = login_exit_code(&error) {
+                    eprintln!("error: {error}");
+                    std::process::exit(code);
+                }
+                Err(error)
+            }
+        }
+    }
 
     fn require_codex(provider: &str) -> Result<()> {
         if provider.eq_ignore_ascii_case("codex") {
@@ -68,7 +81,7 @@ pub(crate) fn handle_accounts_command(action: AccountsAction, workspace: &str) -
             json,
         } => {
             require_codex(&provider)?;
-            print_status(&service.add(&name, device_auth)?, json)
+            print_status(&preserve_login_exit(service.add(&name, device_auth))?, json)
         }
         AccountsAction::Import {
             provider,
@@ -124,7 +137,7 @@ pub(crate) fn handle_accounts_command(action: AccountsAction, workspace: &str) -
             json,
         } => {
             require_codex(&provider)?;
-            print_status(&service.reauth(&name, device_auth)?, json)
+            print_status(&preserve_login_exit(service.reauth(&name, device_auth))?, json)
         }
         AccountsAction::Remove {
             provider,
