@@ -160,6 +160,7 @@ PHASE=1
 PHASE_ISSUES=$(gh issue list \
   --label="loom:epic-phase" \
   --state=all \
+  --limit=500 \
   --search="loom:epic:$EPIC_NUMBER:phase:$PHASE in:body" \
   --json number,state \
   --jq '.')

@@ -302,13 +302,30 @@ fn copy_single_file(
 ///   conflict; keys new in the template are added, unknown consumer keys at any
 ///   depth are preserved. Written with deterministic pretty serialization so
 ///   repeat reinstalls are byte-idempotent. Recorded as `preserved`.
-/// - **Destination exists but is invalid JSON (or not an object)** → fall back
-///   to a template copy with a loud warning; the install does not abort.
-///   Recorded as `updated`.
+/// - **Destination exists but is invalid JSON (or not an object)** → the
+///   previous contents are first copied aside to `.loom/config.json.bak`, then
+///   the template replaces the file, with a loud `warn!`; the install does not
+///   abort. Recorded as `updated`.
 ///
 /// Byte-exact preservation of consumer formatting/comments is explicitly out of
 /// scope — deterministic re-serialization is acceptable as long as keys/values
 /// survive and repeat runs are stable.
+///
+/// # Observability (issue #4641)
+///
+/// Every call emits exactly one branch line through the `log` facade, tagged
+/// with a greppable branch name — `fresh-write`, `merge-preserved`,
+/// `template-invalid-skip`, or `invalid-JSON-fallback-overwrite` — prefixed
+/// `init: config.json:`. `merge-preserved` additionally carries a leaf-level
+/// diff of every key whose effective value changed, and the fallback branch
+/// logs at `warn!` naming the keys it discarded plus the rescue-copy path.
+///
+/// This exists because `loom-daemon init` is invoked unattended from
+/// provisioning scripts (`fleet::add_worker`, `install.sh` reinstalls), where a
+/// bare `eprintln!` disappears into a log nobody reads: an operator-tuned
+/// `autonomous.workFinder.maxConcurrent` was silently reverted on a fleet
+/// worker with no trace of which process rewrote the file. `warn!`/`info!` land
+/// in `daemon.log` and are greppable after the fact.
 fn merge_config_file(
     defaults: &Path,
     loom_path: &Path,
@@ -342,6 +359,11 @@ fn merge_config_file(
                 serialized.push('\n');
                 fs::write(&dst, serialized)
                     .map_err(|e| format!("Failed to write config.json: {e}"))?;
+                log::info!(
+                    "init: config.json: fresh-write {} — no existing file; wrote {} key(s) from the shipped template",
+                    dst.display(),
+                    top_level_key_count(&template_val)
+                );
             }
             Err(e) => {
                 // Template is invalid JSON — fall back to a raw copy rather than
@@ -349,6 +371,10 @@ fn merge_config_file(
                 eprintln!(
                     "Warning: defaults/config.json is not valid JSON ({e}); \
                      copying it verbatim to .loom/config.json"
+                );
+                log::warn!(
+                    "init: config.json: fresh-write {} — defaults/config.json is not valid JSON ({e}); copied verbatim",
+                    dst.display()
                 );
                 fs::copy(&src, &dst).map_err(|e| format!("Failed to copy config.json: {e}"))?;
             }
@@ -369,6 +395,10 @@ fn merge_config_file(
                 "Warning: defaults/config.json is not valid JSON ({e}); \
                  leaving existing .loom/config.json untouched"
             );
+            log::warn!(
+                "init: config.json: template-invalid-skip {} — defaults/config.json is not valid JSON ({e}); existing file left untouched",
+                dst.display()
+            );
             report.preserved.push(report_name.to_string());
             return Ok(());
         }
@@ -376,13 +406,42 @@ fn merge_config_file(
 
     // If the consumer file is missing/invalid/non-object, fall back to the
     // template copy with a loud warning. This must not abort the install.
+    //
+    // This is the ONE branch that can silently discard operator-tuned keys
+    // wholesale (#4641), so before overwriting we (a) copy the unparseable
+    // bytes aside to `.loom/config.json.bak` so nothing is truly lost, and (b)
+    // `warn!` with a best-effort list of the key names visible in the discarded
+    // text. A torn read caused by a concurrent writer is exactly the scenario
+    // this needs to leave evidence for.
     let existing_val: Value = match serde_json::from_str::<Value>(&existing_str) {
         Ok(v) if v.is_object() => v,
-        _ => {
+        parsed => {
+            let reason = match parsed {
+                Ok(_) => "valid JSON but not an object".to_string(),
+                Err(e) => format!("not valid JSON: {e}"),
+            };
+            let discarded = salvage_key_names(&existing_str);
+            let discarded_desc = if discarded.is_empty() {
+                "none recoverable from the unparseable text".to_string()
+            } else {
+                summarize_list(&discarded)
+            };
+            let backup = dst.with_extension("json.bak");
+            let backup_desc = match fs::write(&backup, &existing_str) {
+                Ok(()) => format!("previous contents saved to {}", backup.display()),
+                Err(e) => format!("FAILED to save previous contents to {}: {e}", backup.display()),
+            };
+
             eprintln!(
                 "Warning: existing .loom/config.json is not valid JSON; overwriting \
                  with the shipped template (previous contents were not preserved)"
             );
+            log::warn!(
+                "init: config.json: invalid-JSON-fallback-overwrite {} — existing file is {reason}; \
+                 overwriting with the shipped template. Discarded keys: {discarded_desc}. {backup_desc}",
+                dst.display()
+            );
+
             fs::copy(&src, &dst).map_err(|e| format!("Failed to copy config.json: {e}"))?;
             report.updated.push(report_name.to_string());
             return Ok(());
@@ -393,12 +452,163 @@ fn merge_config_file(
     let mut merged = template_val;
     deep_merge_existing_wins(&mut merged, &existing_val);
 
+    // Diff BEFORE writing, so the log describes the effective config change this
+    // call is about to make. With existing-wins semantics the expected shape is
+    // additions only (new template keys); a `~` or `-` entry here means a
+    // consumer value was overwritten or dropped and is worth investigating.
+    let changes = describe_config_changes(&existing_val, &merged);
+
     let mut serialized = serde_json::to_string_pretty(&merged)
         .map_err(|e| format!("Failed to serialize merged config.json: {e}"))?;
     serialized.push('\n');
     fs::write(&dst, serialized).map_err(|e| format!("Failed to write merged config.json: {e}"))?;
+
+    if changes.is_empty() {
+        log::info!(
+            "init: config.json: merge-preserved {} — no effective config change",
+            dst.display()
+        );
+    } else {
+        log::info!(
+            "init: config.json: merge-preserved {} — {} key(s) changed: {}",
+            dst.display(),
+            changes.len(),
+            summarize_list(&changes)
+        );
+    }
+
     report.preserved.push(report_name.to_string());
     Ok(())
+}
+
+/// Maximum number of individual entries spelled out in one log line before the
+/// remainder is elided as `… and N more`. Keeps a pathological config (or a
+/// fresh install merging a large template) from emitting a multi-kilobyte line.
+const MAX_LOGGED_ENTRIES: usize = 20;
+
+/// Number of top-level keys in a JSON value (0 for non-objects).
+fn top_level_key_count(value: &Value) -> usize {
+    value.as_object().map_or(0, |m| m.len())
+}
+
+/// Join `entries` for a log line, eliding past [`MAX_LOGGED_ENTRIES`].
+fn summarize_list(entries: &[String]) -> String {
+    if entries.len() <= MAX_LOGGED_ENTRIES {
+        entries.join("; ")
+    } else {
+        format!(
+            "{}; … and {} more",
+            entries[..MAX_LOGGED_ENTRIES].join("; "),
+            entries.len() - MAX_LOGGED_ENTRIES
+        )
+    }
+}
+
+/// Flatten a JSON value into `(dotted.path, compact-json-value)` leaf pairs.
+///
+/// Arrays are treated as leaves (compared wholesale), matching
+/// [`deep_merge_existing_wins`], which also replaces arrays wholesale rather
+/// than merging element-by-element.
+fn flatten_json_leaves(value: &Value, prefix: &str, out: &mut Vec<(String, String)>) {
+    match value {
+        Value::Object(map) if !map.is_empty() => {
+            for (key, child) in map {
+                let path = if prefix.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{prefix}.{key}")
+                };
+                flatten_json_leaves(child, &path, out);
+            }
+        }
+        leaf => out.push((prefix.to_string(), leaf.to_string())),
+    }
+}
+
+/// Describe the leaf-level differences between two configs as log-ready lines.
+///
+/// `+ path = value` (added), `- path (was value)` (dropped), and
+/// `~ path: old -> new` (changed). An empty result means the write is a no-op in
+/// effective-config terms.
+fn describe_config_changes(before: &Value, after: &Value) -> Vec<String> {
+    let mut before_leaves = Vec::new();
+    flatten_json_leaves(before, "", &mut before_leaves);
+    let mut after_leaves = Vec::new();
+    flatten_json_leaves(after, "", &mut after_leaves);
+
+    let before_map: std::collections::BTreeMap<&str, &str> = before_leaves
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let after_map: std::collections::BTreeMap<&str, &str> = after_leaves
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+
+    let mut changes = Vec::new();
+    for (path, new_val) in &after_leaves {
+        match before_map.get(path.as_str()) {
+            Some(old_val) if *old_val == new_val.as_str() => {}
+            Some(old_val) => changes.push(format!("~ {path}: {old_val} -> {new_val}")),
+            None => changes.push(format!("+ {path} = {new_val}")),
+        }
+    }
+    for (path, old_val) in &before_leaves {
+        if !after_map.contains_key(path.as_str()) {
+            changes.push(format!("- {path} (was {old_val})"));
+        }
+    }
+    changes
+}
+
+/// Best-effort recovery of key names from text that failed to parse as JSON.
+///
+/// Used only on the invalid-JSON fallback path, where `serde_json` gives us
+/// nothing to enumerate but the operator still needs to know *what* was
+/// discarded. Scans for `"…"` immediately followed (modulo whitespace) by `:`,
+/// deduplicating while preserving first-seen order. Deliberately naive: a key
+/// name appearing inside a string *value* may be reported too. Over-reporting a
+/// name in a warning is far cheaper than reporting nothing.
+fn salvage_key_names(raw: &str) -> Vec<String> {
+    let bytes = raw.as_bytes();
+    let mut keys = Vec::new();
+    let mut seen = HashSet::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'"' {
+            i += 1;
+            continue;
+        }
+        // Walk to the closing quote, honoring backslash escapes. Only ASCII
+        // bytes are inspected, so multi-byte UTF-8 inside the string is safe.
+        let start = i + 1;
+        let mut end = start;
+        let mut escaped = false;
+        while end < bytes.len() {
+            match bytes[end] {
+                b'\\' if !escaped => escaped = true,
+                b'"' if !escaped => break,
+                _ => escaped = false,
+            }
+            end += 1;
+        }
+        if end >= bytes.len() {
+            break; // unterminated string — nothing more to salvage
+        }
+        let mut after = end + 1;
+        while after < bytes.len() && bytes[after].is_ascii_whitespace() {
+            after += 1;
+        }
+        if after < bytes.len() && bytes[after] == b':' {
+            if let Ok(name) = std::str::from_utf8(&bytes[start..end]) {
+                if seen.insert(name.to_string()) {
+                    keys.push(name.to_string());
+                }
+            }
+        }
+        i = end + 1;
+    }
+    keys
 }
 
 /// Deep-merge `overlay` into `base` with **overlay values winning** on conflict.
@@ -2075,6 +2285,323 @@ mod tests {
             "fallback config.json should be reported updated, got: {:?}",
             report.updated
         );
+    }
+
+    // ------------------------------------------------------------------
+    // config.json rewrite observability + repeated-init safety (issue #4641)
+    //
+    // Context: an operator-tuned `autonomous.workFinder.maxConcurrent` was
+    // silently reverted on a fleet worker with no log line naming the writer.
+    // `merge_config_file` is the only production writer of `.loom/config.json`,
+    // and `fleet add-worker` re-invoked it on every provisioning re-run.
+    // ------------------------------------------------------------------
+
+    /// Collect only this module's `init: config.json:` lines from a capture.
+    fn config_log_lines(records: &[(log::Level, String)]) -> Vec<(log::Level, String)> {
+        records
+            .iter()
+            .filter(|(_, msg)| msg.contains("init: config.json:"))
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn test_operator_nested_key_survives_repeated_init() {
+        // AC3 (#4641): the reported loss was of a nested, operator-only knob on
+        // a host that runs provisioning repeatedly — so once is not enough.
+        // Five consecutive `init` passes must leave the tuned value intact and
+        // the file byte-stable.
+        let temp = TempDir::new().unwrap();
+        // The shipped template deliberately has NO maxConcurrent key — exactly
+        // the shape that makes a template-wins or fallback-copy bug show up as
+        // a silent revert to the built-in default.
+        let template = r#"{
+          "version": "2",
+          "autonomous": {"workFinder": {"enabled": true}}
+        }"#;
+        let (workspace, defaults) = setup_config_merge_repo(&temp, template);
+
+        let config_path = workspace.join(".loom").join("config.json");
+        fs::create_dir_all(workspace.join(".loom")).unwrap();
+        fs::write(
+            &config_path,
+            r#"{
+              "version": "2",
+              "autonomous": {"workFinder": {"enabled": true, "maxConcurrent": 10}}
+            }"#,
+        )
+        .unwrap();
+
+        let mut previous: Option<String> = None;
+        for pass in 1..=5 {
+            initialize_workspace(workspace.to_str().unwrap(), defaults.to_str().unwrap(), false)
+                .unwrap_or_else(|e| panic!("init pass {pass} failed: {e}"));
+
+            let raw = fs::read_to_string(&config_path).unwrap();
+            let merged: Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(
+                merged["autonomous"]["workFinder"]["maxConcurrent"],
+                serde_json::json!(10),
+                "operator-tuned maxConcurrent lost on init pass {pass}: {raw}"
+            );
+            // Sibling template keys still delivered, not clobbered by the merge.
+            assert_eq!(merged["autonomous"]["workFinder"]["enabled"], Value::Bool(true));
+
+            if let Some(prev) = &previous {
+                assert_eq!(
+                    prev, &raw,
+                    "config.json must be byte-stable from pass 2 onward (changed on pass {pass})"
+                );
+            }
+            previous = Some(raw);
+        }
+    }
+
+    #[test]
+    fn test_repeated_init_logs_merge_branch_and_no_effective_change() {
+        // AC1 (#4641): every call names its branch. A steady-state reinstall is
+        // a `merge-preserved` no-op and must say so, so an operator reading
+        // daemon.log can tell "init ran and changed nothing" apart from "init
+        // ran and rewrote your config".
+        let temp = TempDir::new().unwrap();
+        let template = r#"{"version": "2", "autonomous": {"workFinder": {"enabled": true}}}"#;
+        let (workspace, defaults) = setup_config_merge_repo(&temp, template);
+        fs::create_dir_all(workspace.join(".loom")).unwrap();
+        fs::write(
+            workspace.join(".loom").join("config.json"),
+            r#"{"version": "2", "autonomous": {"workFinder": {"enabled": true, "maxConcurrent": 10}}}"#,
+        )
+        .unwrap();
+
+        // Pass 1 delivers nothing new here (consumer is a superset), pass 2 is
+        // the steady state either way.
+        initialize_workspace(workspace.to_str().unwrap(), defaults.to_str().unwrap(), false)
+            .expect("first init");
+
+        let records = crate::test_log_capture::capture_logs(|| {
+            initialize_workspace(workspace.to_str().unwrap(), defaults.to_str().unwrap(), false)
+                .expect("second init");
+        });
+        let lines = config_log_lines(&records);
+        assert_eq!(lines.len(), 1, "exactly one config.json branch line expected, got {lines:?}");
+        let (level, msg) = &lines[0];
+        assert_eq!(*level, log::Level::Info, "a preserving merge is not a warning: {msg}");
+        assert!(msg.contains("merge-preserved"), "branch must be named: {msg}");
+        assert!(
+            msg.contains("no effective config change"),
+            "steady state must be explicit: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_merge_logs_diff_of_changed_keys() {
+        // AC1 (#4641): when the write actually changes effective config, the
+        // log carries a per-key diff — the artifact that was missing when the
+        // reported revert happened.
+        let temp = TempDir::new().unwrap();
+        let template = r#"{"version": "2", "newTemplateKey": "shipped", "nested": {"added": 7}}"#;
+        let (workspace, defaults) = setup_config_merge_repo(&temp, template);
+        fs::create_dir_all(workspace.join(".loom")).unwrap();
+        fs::write(workspace.join(".loom").join("config.json"), r#"{"version": "2"}"#).unwrap();
+
+        let records = crate::test_log_capture::capture_logs(|| {
+            initialize_workspace(workspace.to_str().unwrap(), defaults.to_str().unwrap(), false)
+                .expect("merge init");
+        });
+        let lines = config_log_lines(&records);
+        assert_eq!(lines.len(), 1, "exactly one config.json branch line expected, got {lines:?}");
+        let (level, msg) = &lines[0];
+        assert_eq!(*level, log::Level::Info);
+        assert!(msg.contains("merge-preserved"), "branch must be named: {msg}");
+        assert!(msg.contains("2 key(s) changed"), "change count must be reported: {msg}");
+        assert!(
+            msg.contains(r#"+ newTemplateKey = "shipped""#),
+            "added top-level key must appear in the diff: {msg}"
+        );
+        assert!(
+            msg.contains("+ nested.added = 7"),
+            "added nested key must appear with its dotted path: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_fresh_write_logs_branch() {
+        // AC1 (#4641): the fresh-install branch is distinguishable from a merge.
+        let temp = TempDir::new().unwrap();
+        let template = r#"{"version": "2", "offlineMode": false}"#;
+        let (workspace, defaults) = setup_config_merge_repo(&temp, template);
+
+        let records = crate::test_log_capture::capture_logs(|| {
+            initialize_workspace(workspace.to_str().unwrap(), defaults.to_str().unwrap(), false)
+                .expect("fresh init");
+        });
+        let lines = config_log_lines(&records);
+        assert_eq!(lines.len(), 1, "exactly one config.json branch line expected, got {lines:?}");
+        let (level, msg) = &lines[0];
+        assert_eq!(*level, log::Level::Info, "a fresh install is not a warning: {msg}");
+        assert!(msg.contains("fresh-write"), "branch must be named: {msg}");
+        assert!(msg.contains("2 key(s)"), "key count must be reported: {msg}");
+    }
+
+    #[test]
+    fn test_invalid_json_fallback_warns_and_names_discarded_keys() {
+        // AC4 (#4641): the one branch that discards operator config wholesale
+        // must log at warn! and name what it threw away. Presence alone is not
+        // enough — the level assertion is what stops a regression back to a
+        // bare eprintln!/debug! that never reaches daemon.log.
+        let temp = TempDir::new().unwrap();
+        let template = r#"{"version": "2", "offlineMode": false}"#;
+        let (workspace, defaults) = setup_config_merge_repo(&temp, template);
+        fs::create_dir_all(workspace.join(".loom")).unwrap();
+        // A torn/partial write: recognizable keys, unparseable overall.
+        let corrupt = r#"{"version": "2", "autonomous": {"workFinder": {"maxConcurrent": 10"#;
+        fs::write(workspace.join(".loom").join("config.json"), corrupt).unwrap();
+
+        let records = crate::test_log_capture::capture_logs(|| {
+            initialize_workspace(workspace.to_str().unwrap(), defaults.to_str().unwrap(), false)
+                .expect("init must not abort on invalid config");
+        });
+        let lines = config_log_lines(&records);
+        assert_eq!(lines.len(), 1, "exactly one config.json branch line expected, got {lines:?}");
+        let (level, msg) = &lines[0];
+        assert_eq!(*level, log::Level::Warn, "the clobbering branch must warn, not inform: {msg}");
+        assert!(msg.contains("invalid-JSON-fallback-overwrite"), "branch must be named: {msg}");
+        for key in ["version", "autonomous", "workFinder", "maxConcurrent"] {
+            assert!(msg.contains(key), "discarded key `{key}` must be named: {msg}");
+        }
+
+        // The discarded bytes are recoverable, not gone.
+        let backup = workspace.join(".loom").join("config.json.bak");
+        assert!(backup.exists(), "a rescue copy must be written before overwriting");
+        assert_eq!(fs::read_to_string(&backup).unwrap(), corrupt);
+        assert!(
+            msg.contains("config.json.bak"),
+            "the warning must point at the rescue copy: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_valid_json_but_not_an_object_hits_fallback_and_warns() {
+        // Edge case from the #4641 test plan: valid JSON, wrong shape (an
+        // array). It takes the same clobbering branch, so it needs the same
+        // warn-level evidence.
+        let temp = TempDir::new().unwrap();
+        let template = r#"{"version": "2", "offlineMode": false}"#;
+        let (workspace, defaults) = setup_config_merge_repo(&temp, template);
+        fs::create_dir_all(workspace.join(".loom")).unwrap();
+        fs::write(workspace.join(".loom").join("config.json"), r#"[{"maxConcurrent": 10}]"#)
+            .unwrap();
+
+        let records = crate::test_log_capture::capture_logs(|| {
+            initialize_workspace(workspace.to_str().unwrap(), defaults.to_str().unwrap(), false)
+                .expect("init must not abort on a non-object config");
+        });
+        let lines = config_log_lines(&records);
+        assert_eq!(lines.len(), 1, "exactly one config.json branch line expected, got {lines:?}");
+        let (level, msg) = &lines[0];
+        assert_eq!(*level, log::Level::Warn, "the clobbering branch must warn: {msg}");
+        assert!(msg.contains("invalid-JSON-fallback-overwrite"), "branch must be named: {msg}");
+        assert!(
+            msg.contains("valid JSON but not an object"),
+            "the reason must distinguish this case from a parse error: {msg}"
+        );
+        assert!(msg.contains("maxConcurrent"), "discarded key must be named: {msg}");
+        assert!(workspace.join(".loom").join("config.json.bak").exists());
+    }
+
+    #[test]
+    fn test_template_invalid_skip_warns_and_leaves_consumer_untouched() {
+        // AC1 (#4641): the fourth branch. A broken shipped template must not
+        // silently no-op — the consumer file survives, but the operator is told
+        // their install did not deliver template updates.
+        let temp = TempDir::new().unwrap();
+        let (workspace, defaults) = setup_config_merge_repo(&temp, "{ not json at all ,,,");
+        fs::create_dir_all(workspace.join(".loom")).unwrap();
+        let consumer = r#"{"version":"2","autonomous":{"workFinder":{"maxConcurrent":10}}}"#;
+        fs::write(workspace.join(".loom").join("config.json"), consumer).unwrap();
+
+        let records = crate::test_log_capture::capture_logs(|| {
+            initialize_workspace(workspace.to_str().unwrap(), defaults.to_str().unwrap(), false)
+                .expect("init must not abort on an invalid template");
+        });
+        let lines = config_log_lines(&records);
+        assert_eq!(lines.len(), 1, "exactly one config.json branch line expected, got {lines:?}");
+        let (level, msg) = &lines[0];
+        assert_eq!(*level, log::Level::Warn);
+        assert!(msg.contains("template-invalid-skip"), "branch must be named: {msg}");
+        assert_eq!(
+            fs::read_to_string(workspace.join(".loom").join("config.json")).unwrap(),
+            consumer,
+            "consumer config must be left byte-identical"
+        );
+    }
+
+    #[test]
+    fn test_describe_config_changes_unit() {
+        let before = serde_json::json!({
+            "kept": 1,
+            "changed": {"deep": "old"},
+            "dropped": true,
+            "arr": [1, 2]
+        });
+        let after = serde_json::json!({
+            "kept": 1,
+            "changed": {"deep": "new"},
+            "added": {"nested": 9},
+            "arr": [1, 2]
+        });
+        let changes = describe_config_changes(&before, &after);
+
+        assert!(
+            changes
+                .iter()
+                .any(|c| c == r#"~ changed.deep: "old" -> "new""#),
+            "changed leaf must render old -> new: {changes:?}"
+        );
+        assert!(
+            changes.iter().any(|c| c == "+ added.nested = 9"),
+            "added leaf must render with a dotted path: {changes:?}"
+        );
+        assert!(
+            changes.iter().any(|c| c == "- dropped (was true)"),
+            "dropped leaf must be reported: {changes:?}"
+        );
+        // Unchanged scalars and unchanged arrays produce no noise.
+        assert_eq!(changes.len(), 3, "unexpected extra changes: {changes:?}");
+        assert!(describe_config_changes(&before, &before).is_empty());
+    }
+
+    #[test]
+    fn test_salvage_key_names_unit() {
+        // Truncated mid-write — serde gives us nothing, so the scanner is the
+        // only source of "what did we just discard".
+        let keys = salvage_key_names(
+            r#"{"version": "2", "autonomous": {"workFinder": {"maxConcurrent": 10"#,
+        );
+        assert_eq!(keys, vec!["version", "autonomous", "workFinder", "maxConcurrent"]);
+
+        // Escaped quotes inside a value must not desynchronize the scan, and a
+        // repeated key is reported once.
+        let keys = salvage_key_names(r#"{"a": "he said \"hi\": not a key", "b": 1, "a": 2"#);
+        assert_eq!(keys, vec!["a", "b"]);
+
+        // No key-shaped text at all.
+        assert!(salvage_key_names("[1, 2, 3]").is_empty());
+        assert!(salvage_key_names("").is_empty());
+    }
+
+    #[test]
+    fn test_summarize_list_elides_past_cap() {
+        let short: Vec<String> = (0..3).map(|i| format!("k{i}")).collect();
+        assert_eq!(summarize_list(&short), "k0; k1; k2");
+
+        let long: Vec<String> = (0..MAX_LOGGED_ENTRIES + 5)
+            .map(|i| format!("k{i}"))
+            .collect();
+        let rendered = summarize_list(&long);
+        assert!(rendered.contains("k0"), "{rendered}");
+        assert!(rendered.ends_with("… and 5 more"), "{rendered}");
+        assert!(!rendered.contains("k24"), "entries past the cap must be elided: {rendered}");
     }
 
     #[test]

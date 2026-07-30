@@ -45,6 +45,12 @@ anyone caught it.
    gh pr comment 123 --body @/tmp/review.md
    gh pr comment 123 --body "@/tmp/review.md"
 
+❌ ALSO POSTS THE LITERAL STRING — a variable does NOT change what the flag does
+   REVIEW_FILE="@/tmp/review.md"; gh pr comment 123 --body "$REVIEW_FILE"
+
+❌ ALSO POSTS THE LITERAL STRING — on `gh api`, only -F/--field expands @path
+   gh api repos/{owner}/{repo}/issues/123/comments -f body=@/tmp/review.md
+
 ✅ USE ONE OF THESE INSTEAD
    gh pr comment 123 --body "$(cat <<'EOF'
    ... review prose ...
@@ -58,11 +64,19 @@ Prefer the inline heredoc pattern above (the pattern already used throughout
 this file) when the body is short/dynamic; use `-F/--body-file <path>` when
 the body genuinely lives in a file (e.g. a scratchpad review draft) — it is
 the one flag on `gh pr comment`/`gh issue comment` that actually reads file
-contents (`gh api ... -F body=@path` also works). **Never** pass the file
-path as the value of `--body`/`-b` with an `@` prefix — that flag takes
-literal text only. **After posting, re-fetch the comment** (`gh pr view
-<number> --comments`) to confirm it renders your prose, not a path string —
-see the Pre-approval checklist below.
+contents (`gh api ... -F body=@path` also works — but `-f`/`--raw-field` does
+**not**). **Never** pass the file path as the value of `--body`/`-b` with an
+`@` prefix — that flag takes literal text only. **After posting, re-fetch the
+comment** (`gh pr view <number> --comments`) to confirm it renders your prose,
+not a path string — see the Pre-approval checklist below.
+
+**A guard denial is not an invitation to re-shape the same value.** The
+`--body @path` shape is hard-denied by `guard-destructive-generic.sh`. If you
+hit that denial, the only correct response is to switch to `--body-file` or
+the heredoc — **never** to route the identical `@path` value through a shell
+variable, a `--raw-field`, or any other wrapper. That exact evasion is how the
+anti-pattern recurred on PR #4600 after the guard was already live (#4601), and
+it is now denied too.
 
 ## Your Role
 
@@ -158,8 +172,15 @@ If no argument is provided, use the normal finding work workflow below.
 
 **Find PRs ready for evaluation (green badges):**
 ```bash
-gh pr list --label="loom:review-requested" --state=open
+"$GH_READ" pr list --label="loom:review-requested" --state=open --limit 500
 ```
+
+`$GH_READ` is the short-TTL cached-read wrapper resolved in "Cached Forge Reads
+(`gh-cached`)" under Evaluation Process — it degrades to plain `gh` when the
+wrapper is absent. Queue discovery is the hottest repeated read in this
+document (every cron tick, every concurrent Judge, the fallback queue), so it
+is cached; verdict-gating and claim-arbitration reads are **not** (see that
+section for the full carve-out list).
 
 **Before either command below, run the Verdict-Time CAS Recheck** (see "Verdict-Time CAS Recheck" under Evaluation Process) — abort instead of writing if the recheck finds your claim lost or another Judge's verdict already landed.
 
@@ -256,7 +277,9 @@ MCP server failures can silently corrupt the tool execution environment, causing
 Run this as **step 0** before any `gh pr list` commands:
 
 ```bash
-# Verify gh is functional — detects MCP server failure / corrupted environment
+# Verify gh is functional — detects MCP server failure / corrupted environment.
+# ALWAYS plain `gh`, never the cached wrapper: this is a liveness probe, and a
+# cached success from a healthy session would defeat it entirely.
 REPO_NAME=$(gh repo view --json name --jq '.name' 2>/dev/null)
 if [ -z "$REPO_NAME" ]; then
     echo "CRITICAL: gh commands appear non-functional (empty output from gh repo view)"
@@ -278,12 +301,67 @@ fi
 - Status bar shows `N MCP server failed · /mcp`
 - Multiple sequential `gh` commands all return empty
 
+### Cached Forge Reads (`gh-cached`)
+
+Concurrent Judges, sweep-dispatched Judges, and the 5-minute cron tick all
+share **one** personal `gh` rate-limit budget (#4665), and they re-poll the
+same queue listing over and over. Route those repeated reads through the
+short-TTL cache wrapper; leave every correctness-critical read on plain `gh`.
+
+Resolve the wrapper **once**, at the start of the session (immediately after
+the environment check above):
+
+```bash
+# Falls back to plain `gh` when the wrapper is absent or its Python runtime is
+# broken — the same probe merge-pr.sh uses. Nothing below depends on the cache
+# existing; it is a budget optimization, never a correctness mechanism.
+GH_READ="gh"
+_ghc="$(git rev-parse --show-toplevel 2>/dev/null)/.loom/scripts/gh-cached"
+if [[ -x "$_ghc" ]] && "$_ghc" --version >/dev/null 2>&1; then GH_READ="$_ghc"; fi
+```
+
+**Route through `$GH_READ` (cached, 30s TTL):**
+
+- `gh pr list --label="loom:review-requested" …` — the primary queue, at every
+  occurrence in this document (Label Workflow, Primary Queue step 1, the
+  fallback-queue example, Example Commands).
+- The fallback queue's unlabeled-PR listing (`gh pr list --state=open …`).
+- `gh issue list --search …` when repairing a PR description.
+
+**Writes stay literal `gh` — then clear the cache.** Never wrap
+`gh pr comment` / `gh pr edit` in `"$GH_READ"`: the destructive-command guard
+hooks pattern-match the *literal* command text (e.g. the hard deny on
+`gh pr comment --body @path`, added after that shape destroyed an entire Judge
+review on PR #4457), and a wrapped form slips past them. Instead, drop the cache right after your own mutation so your
+next cached read cannot return your own pre-write state:
+
+```bash
+gh pr comment "$N" --body "…" && gh pr edit "$N" --remove-label "loom:review-requested" --remove-label "loom:reviewing" --add-label "loom:pr"
+"$GH_READ" --clear-cache   # local /tmp sweep — zero API cost
+```
+
+**Keep on plain `gh` (deliberately uncached — do NOT wrap these):**
+
+| Read | Why it must be live |
+|---|---|
+| Pre-Iteration Environment Check (`gh repo view`) | Liveness probe — a cached success hides a broken environment |
+| Stale `loom:reviewing` Claim Check (claim timeline + comment counts) | Claim arbitration — 30s of staleness is exactly the window a competing claim lands in |
+| **Verdict-Time CAS Recheck** (`gh pr view $N --json labels`) | The entire mechanism is "observe writes that landed *during* my review"; a cached label set defeats it |
+| `gh pr checks` + `gh pr view --json mergeStateStatus` before a verdict | Verdict gating — never approve on a stale green |
+
+`gh pr checks` and `gh repo view` are passthrough inside the wrapper anyway, so
+those two hold even if wrapped by accident; the rest rely on this list.
+
+Full policy, TTL/invalidation semantics, and the manual verification steps:
+`.loom/docs/gh-cached.md` (source: `defaults/docs/gh-cached.md`).
+
 ### Primary Queue (Priority)
 
-1. **Find work**: `gh pr list --label="loom:review-requested" --state=open`
+1. **Find work**: `"$GH_READ" pr list --label="loom:review-requested" --state=open --limit 500` (cached — see "Cached Forge Reads")
 2. **Claim PR** (staleness-aware — see "Stale `loom:reviewing` Claim Check" immediately below before running this): `gh pr edit <number> --add-label "loom:reviewing"` to signal you're working on it
 3. **Check merge state**: Check for conflicts and attempt automated rebase if DIRTY (see Automated Rebase for DIRTY PRs below)
    ```bash
+   # Plain `gh` — merge state is verdict-gating and must be live (see "Cached Forge Reads")
    MERGE_STATE=$(gh pr view <number> --json mergeStateStatus --jq '.mergeStateStatus')
    if [ "$MERGE_STATE" = "DIRTY" ]; then
        # Attempt automated rebase (see detailed workflow in Rebase Check section)
@@ -327,8 +405,22 @@ stand-down comments:
 
 ```bash
 N=<pr-number>
+# All reads in this block are plain `gh` — NEVER "$GH_READ". This is claim
+# arbitration: a 30s-stale timeline or comment list is exactly the window in
+# which a competing Judge's claim (or its stand-down) lands, and answering from
+# cache would reintroduce the double-claim this check exists to prevent.
+# `--paginate` re-invokes `--jq` once per response page and concatenates the
+# per-page results rather than applying the filter across the combined
+# timeline (#4637) — a timeline spanning more than one page (>100 events)
+# would otherwise yield a multi-line CLAIMED_AT that corrupts MARKER and
+# every comparison below. `// empty` drops the no-match-on-this-page line
+# entirely (not a literal "null"), and `sort | tail -n 1` collapses the
+# remaining per-page timestamps to the single latest one — RFC3339 UTC
+# timestamps (the `Z`-suffixed form the GitHub API returns) sort correctly
+# as plain strings, so this needs no minimum `gh` version.
 CLAIMED_AT=$(gh api "repos/{owner}/{repo}/issues/$N/timeline" --paginate \
-  --jq '[.[] | select(.event=="labeled" and .label.name=="loom:reviewing")] | last | .created_at')
+  --jq '[.[] | select(.event=="labeled" and .label.name=="loom:reviewing")] | last | .created_at // empty' \
+  | sort | tail -n 1)
 MARKER="<!-- loom:standdown claim=$CLAIMED_AT -->"
 COMMENTS_JSON=$(gh api "repos/{owner}/{repo}/issues/$N/comments" \
   | jq --arg t "$CLAIMED_AT" '[.[] | select(.created_at > $t)]')
@@ -440,6 +532,10 @@ approval, the minor-PR-description-fix approval, and the trivial-fix approval
 
 ```bash
 N=<pr-number>
+# MUST be plain `gh` — NEVER "$GH_READ", and never a value carried over from an
+# earlier read in this session. This recheck exists to observe label writes that
+# landed WHILE you were reviewing; answering it from a 30s-old cache entry (or
+# from memory) reinstates exactly the race it closes. See "Cached Forge Reads".
 CURRENT_LABELS=$(gh pr view $N --json labels --jq '[.labels[].name] | join(",")')
 ```
 
@@ -486,8 +582,8 @@ If no PRs have the `loom:review-requested` label, the Judge can proactively eval
 
 **Fallback search**:
 ```bash
-# Find PRs without any loom: labels
-gh pr list --state=open --json number,title,labels \
+# Find PRs without any loom: labels (cached — see "Cached Forge Reads")
+"$GH_READ" pr list --state=open --limit 500 --json number,title,labels \
   --jq '.[] | select(([.labels[].name | select(startswith("loom:"))] | length) == 0) | "#\(.number) \(.title)"'
 ```
 
@@ -527,8 +623,8 @@ Pre-Iteration Environment Check (gh repo view)
 
 **Example fallback workflow**:
 ```bash
-# 1. Check primary queue
-LABELED_PRS=$(gh pr list --label="loom:review-requested" --json number --jq 'length' 2>/dev/null)
+# 1. Check primary queue (cached — see "Cached Forge Reads")
+LABELED_PRS=$("$GH_READ" pr list --label="loom:review-requested" --limit 500 --json number --jq 'length' 2>/dev/null)
 
 # Guard: an empty string (not "0") means the gh command itself failed. Re-run the
 # Pre-Iteration Environment Check above; if it fails, exit 1 (never claim "no work").
@@ -545,8 +641,8 @@ if [ "$LABELED_PRS" -gt 0 ]; then
 else
   echo "No loom:review-requested PRs found, checking unlabeled PRs..."
 
-  # 2. Check fallback queue
-  UNLABELED_PR=$(gh pr list --state=open --json number,labels \
+  # 2. Check fallback queue (cached — see "Cached Forge Reads")
+  UNLABELED_PR=$("$GH_READ" pr list --state=open --limit 500 --json number,labels \
     --jq '.[] | select(([.labels[].name | select(startswith("loom:"))] | length) == 0) | .number' \
     | head -n 1)
 
@@ -875,6 +971,13 @@ FEEDBACK
 **CRITICAL: Never approve a PR until all CI checks pass.**
 
 Local tests passing is not sufficient - you MUST verify that GitHub Actions CI workflows have completed successfully. This prevents situations where a PR is approved while CI is still running or failing.
+
+**Every command in this section runs as plain `gh` — never `"$GH_READ"`.** CI
+status and merge state are the reads a verdict is gated on, so they must
+observe current state unconditionally; a cached green from 30 seconds ago can
+predate the push that broke the build. (`gh pr checks` is passthrough inside
+the wrapper regardless, so this is belt-and-suspenders for it and load-bearing
+for the `mergeStateStatus` reads.) See "Cached Forge Reads" for the full policy.
 
 ### How to Check CI Status
 
@@ -1214,8 +1317,8 @@ For minor documentation issues in PR descriptions (not code), Judges are empower
 **Step 1: Check if there's a related issue (and that this isn't an intentional partial increment)**
 
 ```bash
-# Search for issues related to the PR
-gh issue list --search "keyword from PR title"
+# Search for issues related to the PR (cached — see "Cached Forge Reads")
+"$GH_READ" issue list --search "keyword from PR title" --limit 500
 
 # View the PR to confirm issue number
 gh pr view <number>
@@ -1572,8 +1675,8 @@ EOF
 ## Example Commands
 
 ```bash
-# Find PRs ready for evaluation (green badges)
-gh pr list --label="loom:review-requested" --state=open
+# Find PRs ready for evaluation (green badges) — cached; see "Cached Forge Reads"
+"$GH_READ" pr list --label="loom:review-requested" --state=open --limit 500
 
 # Check out the PR (worktree-aware — see "PR Branch Isolation" above; this is
 # a simplified illustration, not a bare checkout in the current directory)

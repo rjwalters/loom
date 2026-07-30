@@ -33,6 +33,8 @@ If **every** whitespace-separated non-flag token matches the regex `^#?\d+$` (a 
 
 Otherwise, treat `$ARGUMENTS` as an English description of which open issues to process. The orchestrator (Claude, this session) translates the description into one or more `gh issue list` invocations using the appropriate flags, surfaces the derived candidate set, awaits user confirmation, then proceeds with the rest of the lifecycle exactly as in Mode A.
 
+**Issue candidate-resolution and PR candidate-resolution queries below run as `"$GH_READ" issue list …` / `"$GH_READ" pr list …`** — the short-TTL cached-read wrapper resolved once at sweep start (see "Cached forge reads (`gh-cached`)" under the Execution Model; it degrades to plain `gh` when absent). The translation guides are written with the bare `gh issue list` / `gh pr list` flag names because the flags are identical either way; only the leading binary changes.
+
 **This is deliberately not a formal grammar.** There is no parser, no operator precedence, no fixed vocabulary. The orchestrator reads the description and picks reasonable `gh issue list` flags. The interpretation rules below are prose, not a spec.
 
 **Translation guide — common NL fragments to `gh issue list` flags** (verified against `gh` v2):
@@ -54,14 +56,61 @@ Combine flags as needed. Always pass `--state open` explicitly (default) unless 
 **Unknown-label guard.** Loom never invents labels (CLAUDE.md "Never create new GitHub labels" — that rule is about label *creation* via `gh label create`, which is separate from validating that a label the user already named actually exists on the repo). To validate label tokens in the user's description, query the **live repo label set** as the source of truth:
 
 ```bash
-gh label list -R <repo> --limit 200 --json name --jq '.[].name'
+"$GH_READ" label list -R <repo> --limit 200 --json name --jq '.[].name'
 ```
 
-Run this query **once at the start of Mode B label-token validation** and reuse the result for every subsequent token check within the same `/loom:sweep` invocation (at most one `gh label list` call per invocation, regardless of how many label tokens appear in the description). Pass `--limit 200` explicitly (do not rely on `gh`'s default of 30, matching the explicit-limit convention used elsewhere in this skill for `gh issue list`). Scope the query to the repo currently being swept.
+Run this query **once at the start of Mode B label-token validation** and reuse the result for every subsequent token check within the same `/loom:sweep` invocation (at most one `gh label list` call per invocation, regardless of how many label tokens appear in the description). `$GH_READ` is the cached-read wrapper resolved in "Cached forge reads (`gh-cached`)" under the Execution Model — the repo's label set is near-static, so a cross-session cache hit here is free; the wrapper degrades to plain `gh` when absent (the offline fallback below is unchanged either way). Pass `--limit 200` explicitly (do not rely on `gh`'s default of 30, matching the explicit-limit convention used elsewhere in this skill for `gh issue list`). Scope the query to the repo currently being swept.
 
 If a label token in the description is not in the repo's actual label set, **do not** silently fabricate a `--label <name>` filter — ask the user to clarify which existing label they meant, or supply explicit issue numbers.
 
-**Offline fallback.** If `gh label list` fails (non-zero exit — network outage, auth failure, rate limit), fall back to consulting `.github/labels.yml` and log a warning to stderr (e.g., `warning: gh label list failed, falling back to .github/labels.yml (Loom-managed subset only)`). This keeps the skill functional in offline or restricted environments. Note that `.github/labels.yml` is only the Loom-managed subset, so the fallback may produce false "unknown-label" rejections for labels added via the GitHub UI, Dependabot, or other project conventions; this is the trade-off for offline operation.
+**Offline fallback.** If `gh label list` fails (non-zero exit — network outage, auth failure, rate limit), fall back to consulting `.github/labels.yml` and log a warning to stderr (e.g., `warning: gh label list failed, falling back to .github/labels.yml (Loom-managed subset only)`). This keeps the skill functional in offline or restricted environments. Note that `.github/labels.yml` is only the Loom-managed subset, so the fallback may produce false "unknown-label" rejections for labels added via the GitHub UI, Dependabot, or other project conventions; this is the trade-off for offline operation. **When the failure is specifically a rate-limit rejection, this is the *last* rung, not the first** — try the REST label read described under "GraphQL-exhaustion fallback" below and drop to `.github/labels.yml` only if REST fails too, so a healthy REST budget still yields the complete live label set.
+
+**GraphQL-exhaustion fallback (REST issue discovery, #4670).** `gh issue list`, `gh pr list`, and `gh label list` are **GraphQL**-backed; `gh api repos/{owner}/{repo}/…` is **REST**. The two draw on **independent quotas** — confirmed live during the #4526 incident and again in the `/loom:sweep` run that filed #4670, where GraphQL was exhausted while >4,500 REST core requests were still available. So a candidate-resolution failure that is *specifically* a rate-limit rejection must be re-issued over REST rather than aborting the sweep. The full degradation ladder for Mode B is **GraphQL → REST → (labels only) `.github/labels.yml`**.
+
+1. **Detect exhaustion — reuse the existing signature table, do not derive a new one.** Capture the failing call's output with stderr merged (`2>&1`), lowercase it, and treat the failure as quota exhaustion **only** when it contains one of these five signatures. This is exactly the table `defaults/scripts/check-duplicate.sh`'s `is_rate_limit_error()` implements, itself mirrored from `loom-daemon/src/rate_limit_breaker.rs`'s `RATE_LIMIT_SIGNATURES` — the repo's tested ground truth for what `gh` actually prints:
+
+   | Signature (match case-insensitively) | Seen as |
+   |---|---|
+   | `api rate limit exceeded` | REST: `HTTP 403: API rate limit exceeded for …` |
+   | `api rate limit already exceeded` | GraphQL: `GraphQL: API rate limit already exceeded for user ID …` |
+   | `secondary rate limit` | either transport, burst throttling |
+   | `abuse detection mechanism` | either transport, burst throttling |
+   | `was submitted too quickly` | either transport, burst throttling |
+
+   The GraphQL and REST phrasings are **not** substrings of each other — the word `already` breaks the contiguous `api rate limit exceeded` match — which is why both are listed. Matching one substring is not enough.
+
+   **Anything else is NOT exhaustion — keep today's fail-safe behavior.** An auth failure (`gh auth status` expired, missing `GH_TOKEN` scope), a DNS/network error, an HTTP 404 on a mistyped repo, a rejected flag: report the error verbatim, do **not** retry over REST, and EXIT without spawning any agent. A blind REST retry on an auth failure just fails again with a more confusing message and buries the real cause. Never infer exhaustion from a bare non-zero exit code.
+
+2. **Resolve the repository locally — never with another GraphQL call.** Do **not** call `gh repo view --json nameWithOwner` to learn owner/repo: that call is itself GraphQL-backed, so under GraphQL exhaustion it fails *before* any REST fallback is attempted (#4659 fixed this exact bug in `check-duplicate.sh`). Two supported forms, both free of API calls:
+   - Preferred: write the endpoint with the literal `{owner}/{repo}` placeholder — `gh api "repos/{owner}/{repo}/issues?…"` — and let `gh` expand it locally from the git remote.
+   - When the literal `owner/repo` string is needed (log lines, `-R` flags): parse `git remote get-url origin`, strip a trailing `.git` and/or `/`, and take the final two `/`- or `:`-delimited segments (works for both the SSH `git@host:owner/repo.git` and HTTPS `https://host/owner/repo` forms) — the same parse `check-duplicate.sh`'s `get_repo_nwo()` performs.
+
+3. **Re-issue the query as a paginated REST listing.** Translate the Mode B flags you had derived:
+
+   | `gh issue list` flag | REST equivalent on `repos/{owner}/{repo}/issues` |
+   |---|---|
+   | `--state open` (default) | `state=open` (`--state all` → `state=all`; `--state closed` → `state=closed`) |
+   | `--label loom:issue` (repeatable) | `labels=loom:issue,loom:curated` — comma-separated is AND, matching repeated `--label` |
+   | `--author rjwalters` | `creator=rjwalters` (`@me` → resolve the login first with `gh api user --jq .login`, itself REST) |
+   | `--assignee X` | `assignee=X` |
+   | `--limit 100` | `per_page=100` plus `--paginate`, then truncate client-side to the requested limit |
+   | `--json number,title,labels,updatedAt` | already present in the REST payload — project with `--jq` (`updatedAt` is `updated_at`) |
+   | `--search "…"` | **not expressible** on `/issues`; use `gh api "search/issues?q=repo:{owner}/{repo}+…"` (REST search, its own 30/min quota) or ask the operator to narrow to flags / explicit issue numbers |
+
+   ```bash
+   "$GH_READ" api --paginate "repos/{owner}/{repo}/issues?state=open&labels=loom:issue&per_page=100" \
+     --jq '[.[] | select(.pull_request == null) | {number, title, labels: [.labels[].name], updatedAt: .updated_at}]'
+   ```
+
+   Candidate resolution is an observation read, so the REST retry routes through `$GH_READ` exactly like the GraphQL call it replaces (the wrapper caches `gh api` GETs too and degrades to plain `gh api` when absent). The **uncached carve-outs** listed under "Cached forge reads (`gh-cached`)" — claim arbitration, Mode C's C0 pre-flight, merge gating — stay on plain `gh api` if they need this fallback.
+
+   **`/issues` returns pull requests too.** GitHub's REST issue endpoint includes PRs; drop them with `select(.pull_request == null)` (what `check-duplicate.sh` does) or Mode B will resolve PR numbers as issue candidates.
+
+4. **Preserve every Mode B safeguard — this is a transport substitution, not a policy change.** Deduplicate the resulting numbers (preserve first-seen order) and union them with any explicit numeric tokens exactly as on the GraphQL path; keep the **explicit limit** (never rely on REST's default `per_page=30`, mirroring this skill's explicit-`--limit` convention); and apply the same edge-case rules — zero matches → print the resolved REST query and its empty result, then EXIT cleanly (edge case #1); results at the cap → warn that the set was truncated and ask the operator to narrow before proceeding (edge case #2). Because `--paginate` walks past the cap, the truncation point is now a client-side decision: state the cap you applied in that warning.
+
+5. **Announce the degradation.** Log one warning to stderr (e.g. `warning: gh issue list rate-limited (GraphQL quota exhausted), falling back to REST via gh api`) and repeat it above the candidate set shown at the confirmation gate, so the operator knows the plan was resolved over the fallback path.
+
+6. **Label validation degrades on the same ladder.** `gh label list` is GraphQL-backed, so under exhaustion the unknown-label guard goes `gh label list` → `"$GH_READ" api --paginate "repos/{owner}/{repo}/labels?per_page=100" --jq '.[].name'` (the live, complete label set — preferred) → `.github/labels.yml` (the "Offline fallback" above; Loom-managed subset only, so false "unknown-label" rejections are possible). Drop to the YAML only when the REST read also fails. **The unknown-label safety rule is unchanged at every rung**: never fabricate a `--label <name>` filter for a label you could not verify — ask the operator to clarify or supply explicit issue numbers.
 
 ### Mode C — PR-set mode (back half of the lifecycle: Judge → Doctor → Merge)
 
@@ -98,6 +147,24 @@ When uncertain whether the description means issues or PRs (e.g., `/loom:sweep a
 | "in the last week" / "from the last N days" | `--search "created:>=YYYY-MM-DD"` (compute the date) |
 
 Combine flags as needed. Always pass `--state open` explicitly (Mode C operates exclusively on open PRs — closed/merged PRs are skipped). Default to `--limit 100` rather than the `gh` default of `30` to avoid silent truncation. The same **unknown-label guard** (one `gh label list` call per invocation, with `.github/labels.yml` offline fallback) applies to PR labels too — PR and issue labels are in the same repo-wide label set.
+
+**GraphQL-exhaustion fallback (REST PR discovery, #4670).** `gh pr list` is GraphQL-backed and fails under the same quota exhaustion as `gh issue list`. Mode C uses the **identical ladder** documented in Mode B's "GraphQL-exhaustion fallback" — same five-signature detection table (`api rate limit exceeded` / `api rate limit already exceeded` / `secondary rate limit` / `abuse detection mechanism` / `was submitted too quickly`, matched case-insensitively against `2>&1` output), same rule that **any other failure — auth, network, 404 — is not exhaustion** and must fail safe with the error reported and no agents spawned, and the same local repo resolution (`gh api "repos/{owner}/{repo}/…"` placeholder expansion, or parsing `git remote get-url origin`; **never** `gh repo view --json nameWithOwner`, which is itself GraphQL-backed — #4659). Only the endpoint and the flag mapping differ:
+
+| `gh pr list` flag | REST equivalent on `repos/{owner}/{repo}/pulls` |
+|---|---|
+| `--state open` (mandatory in Mode C) | `state=open` |
+| `--limit 100` | `per_page=100` plus `--paginate`, truncated client-side to the requested limit |
+| `--json number,title,labels` | `number`, `title`, and `labels[].name` are all in the list payload — project with `--jq` |
+| `--label loom:review-requested` | **no `labels=` parameter on `/pulls`** — filter client-side on the payload's `labels[].name` (below), or list via `repos/{owner}/{repo}/issues?labels=…&state=open` and keep only entries where `.pull_request != null` |
+| `--author rjwalters` / `@me` | no `creator=` parameter on `/pulls` either — filter client-side on `.user.login` (resolve `@me` with `gh api user --jq .login`) |
+| `--search "…"` | not expressible; use `gh api "search/issues?q=repo:{owner}/{repo}+is:pr+…"` or ask the operator for explicit PR numbers |
+
+```bash
+"$GH_READ" api --paginate "repos/{owner}/{repo}/pulls?state=open&per_page=100" \
+  --jq '[.[] | {number, title, labels: [.labels[].name]} | select(.labels | index("loom:review-requested"))]'
+```
+
+All Mode C safeguards carry over unchanged: deduplicate the resulting PR numbers (preserve first-seen order), keep the explicit limit (never REST's default `per_page=30`), apply the zero-match (print query + empty result, EXIT cleanly) and truncation-warning edge cases, **display the candidate set and await confirmation before spawning any agents**, and log the degradation to stderr (e.g. `warning: gh pr list rate-limited (GraphQL quota exhausted), falling back to REST via gh api`) plus above the confirmation-gate listing. The unknown-label guard degrades on the same GraphQL → REST (`repos/{owner}/{repo}/labels`) → `.github/labels.yml` ladder as Mode B. Note that only **candidate discovery** may be served from `$GH_READ`; Mode C's C0 per-PR pre-flight is a deliberately uncached live routing read (see "Cached forge reads (`gh-cached`)") — if it too hits GraphQL exhaustion, its REST equivalent is plain `gh api "repos/{owner}/{repo}/pulls/<N>"` (plus `repos/{owner}/{repo}/issues/<N>` for the label set), never a cached read.
 
 **Mode C validation rules:**
 
@@ -158,9 +225,9 @@ Combine flags as needed. Always pass `--state open` explicitly (Mode C operates 
   - **Aggressive-mode flag**: resolving the candidate set via this sentinel sets the internal flag `SWEEP_ALL_AGGRESSIVE=true`, carried into the Wave Lifecycle. It **overrides the conservative pre-flight skip rules** (Wave Lifecycle step 1) with the recovery routing in the "Aggressive candidate taxonomy" table below. Mode A/B explicit-list and NL invocations never set this flag — their skip rules are unchanged.
   - **Candidate resolution (issues, `--prs` absent)** — one deterministic `gh issue list` call, **no label filter**, no LLM/NL translation:
     ```bash
-    gh issue list --state open --limit 100 --json number,title,labels,updatedAt
+    "$GH_READ" issue list --state open --limit 100 --json number,title,labels,updatedAt
     ```
-    Every open issue is a candidate regardless of label — promotion, unblocking, stale-claim recovery, and epic fan-out happen per-issue per the "Aggressive candidate taxonomy" table below, not by pre-filtering the query (`updatedAt` feeds the staleness rule). Pass `--limit 100` explicitly (never rely on gh's default of 30) and apply the existing **edge-case rules**: zero matches → print the resolved query + empty result and EXIT cleanly (edge case #1, do **not** fall through to any other mode); 100 candidates returned → warn about truncation and ask the operator to narrow (or deliberately raise `--limit`) before proceeding (edge case #2).
+    Every open issue is a candidate regardless of label — promotion, unblocking, stale-claim recovery, and epic fan-out happen per-issue per the "Aggressive candidate taxonomy" table below, not by pre-filtering the query (`updatedAt` feeds the staleness rule). `$GH_READ` is the cached-read wrapper (see "Cached forge reads (`gh-cached`)"); candidate resolution is a pure observation read — every claim decision is re-made from an **uncached** per-issue pre-flight read in Wave Lifecycle step 1, so a 30s-old listing cannot cause a stale claim. Pass `--limit 100` explicitly (never rely on gh's default of 30) and apply the existing **edge-case rules**: zero matches → print the resolved query + empty result and EXIT cleanly (edge case #1, do **not** fall through to any other mode); 100 candidates returned → warn about truncation and ask the operator to narrow (or deliberately raise `--limit`) before proceeding (edge case #2). If this call fails with a rate-limit signature, re-issue it over REST per Mode B's "GraphQL-exhaustion fallback" (`repos/{owner}/{repo}/issues?state=open&per_page=100`, PRs filtered out) — the sentinel's query is a `gh issue list` like any other.
   - **Orphaned-claim recovery pass (run once, AFTER the confirmation gate, before per-issue pre-flight)** — reclaim `loom:building` labels left behind by dead workers so stale claims don't mask buildable issues:
     ```bash
     ./.loom/scripts/recover-orphaned-shepherds.sh --recover
@@ -168,9 +235,9 @@ Combine flags as needed. Always pass `--state open` explicitly (Mode C operates 
     Best-effort: a non-zero exit is logged and ignored (never abort the sweep). Any issue still labeled `loom:building` after this pass is re-checked inline by the staleness rule in the taxonomy table. **Ordering is load-bearing**: this pass mutates labels, so it runs *only after* the operator confirms the resolved plan at the mandatory confirmation gate — never before. It is **skipped entirely under `--dry-run`** (the dry-run gate is read-only and EXITs before any mutation). This preserves the file-wide "gate before mutation" invariant: nothing on disk or on the forge changes until the operator has confirmed (or `--dry-run` has printed and exited).
   - **Candidate resolution (PRs, `--prs` present)** — every open PR, handed to the Mode C PR-set lifecycle (subagent path):
     ```bash
-    gh pr list --state open --limit 100 --json number,title,labels
+    "$GH_READ" pr list --state open --limit 100 --json number,title,labels
     ```
-    Mode C's C0 pre-flight already skips PRs with no actionable label, `loom:operator-only`, or `loom:blocked`, and routes the rest by current label (Judge / Doctor → Judge / Merge) — so grabbing every open PR and letting C0 filter matches the "get every in-flight PR over the finish line" intent. Same zero-match / truncation edge-case rules apply.
+    Mode C's C0 pre-flight already skips PRs with no actionable label, `loom:operator-only`, or `loom:blocked`, and routes the rest by current label (Judge / Doctor → Judge / Merge) — so grabbing every open PR and letting C0 filter matches the "get every in-flight PR over the finish line" intent. Same zero-match / truncation edge-case rules apply, and the same rate-limit fallback: on a rate-limit signature, re-issue over REST per Mode C's "GraphQL-exhaustion fallback" (`repos/{owner}/{repo}/pulls?state=open&per_page=100`).
   - **Existing-PR routing (issues path)**: the sentinel adds **no** new PR-detection logic. Issues with an open linked PR are handed to the wave machinery, which routes an issue with one open linked PR to Judge (or Merge if the PR is already `loom:pr`) via the per-issue existing-PR probe (Wave Lifecycle step 1, #3359 + #3677 — the union of `closedByPullRequestsReferences` filtered to `state == OPEN` and timeline `cross-referenced` open-PR events, so a non-closing `Part of #N` PR is detected too). This is the single source of truth for existing-PR routing and **takes precedence over the label routing** in the taxonomy table (an issue with an open PR is driven to merge, never rebuilt).
   - **Mandatory confirmation gate**: the sentinel path **always** displays the resolved candidate set (with the per-issue planned action from the taxonomy table) and awaits operator confirmation before spawning any agent — identical to Mode B/C's "display candidate set before spawning any agents" rule. A whole-backlog sweep must never auto-dispatch silently. Declining EXITs cleanly. **When the resolved plan has an unavoidable same-file overlap** (more overlapping candidates than waves to spread them across — see "Overlap-aware wave partitioning"), print the overlap warning **above** the candidate listing, naming the shared files and the specific candidates, so the operator can reorder or drop to `--builders-per-wave 1` before confirming.
   - **Flag composition**: `--dry-run` resolves the candidate set, prints the standard issue-set (or PR-set) dry-run plan with wave grouping + the aggressive per-issue actions, and EXITs with no mutation (the Stage-0 dry-run contract is backend-independent — the orphaned-claim recovery pass is skipped under `--dry-run`). `--builders-per-wave N` and `--no-daemon` compose with the wave / Stage -1 machinery exactly as for Mode A/B. Stage -1 backend detection is unchanged: after `all` resolves the issue set, the normal strict-AND daemon/pool probe decides daemon-dispatch vs subagent fallthrough; `all --prs` (Mode C) always routes to the subagent path per the existing Mode C short-circuit.
@@ -639,6 +706,53 @@ The harvest parses each joined `agent-<id>.jsonl` transcript's `usage` blocks (i
 
 - **Do NOT write to `.loom/daemon-state.json`.** That file is owned by the standalone daemon. `/loom:sweep` runs independently and must not race with the daemon on shepherd-slot bookkeeping. Reading `daemon-state.json` for situational awareness is fine; writing is not.
 
+### Cached forge reads (`gh-cached`, #4667)
+
+Every concurrent sweep, Judge, and Champion on this host shares **one**
+personal `gh` rate-limit budget (#4665), and they re-issue the same candidate
+listings and candidate surveys independently. Route those repeated
+**observation** reads through the short-TTL cache wrapper; keep every
+**arbitration** and **merge-gating** read on plain `gh`.
+
+Resolve the wrapper **once**, at sweep start (alongside Step 0a's run id):
+
+```bash
+# Degrades to plain `gh` when the wrapper is absent or its Python runtime is
+# broken — the same probe merge-pr.sh uses. Nothing in this document depends on
+# the cache existing; it is a budget optimization, never a correctness mechanism.
+GH_READ="gh"
+_ghc="$(git rev-parse --show-toplevel 2>/dev/null)/.loom/scripts/gh-cached"
+if [[ -x "$_ghc" ]] && "$_ghc" --version >/dev/null 2>&1; then GH_READ="$_ghc"; fi
+```
+
+**Route through `$GH_READ` (cached, 30s TTL):**
+
+| Call site | Where |
+|---|---|
+| Mode B / Mode C candidate resolution (`gh issue list` / `gh pr list` translations) | Validation rules, Examples |
+| The `all` sentinel's whole-backlog `gh issue list --state open --limit 100` | Validation rules |
+| The one-per-invocation `gh label list --limit 200` token validation | Validation rules |
+| `--dry-run` Stage 0 per-candidate surveys (`gh issue view` / `gh pr view`) | Dry-run gate, Procedures |
+
+**Keep on plain `gh` (deliberately uncached — do NOT wrap these):**
+
+| Call site | Why it must be live |
+|---|---|
+| Per-issue pre-flight step 1 (`gh issue view N --json state,labels,closedByPullRequestsReferences`), the timeline existing-PR probe, and the follow-up `gh pr view` routing read | **Claim arbitration.** A 30s-stale `loom:building` / open-PR view is exactly the window a competing Builder's claim lands in — the failure mode is a duplicate builder on a claimed issue |
+| Mode C's C0 per-PR pre-flight (`--json number,state,labels,closingIssuesReferences`) | Same: routes a PR to Judge/Doctor/Merge; must see another session's just-written verdict |
+| Step 5's checkpoint-divergence recheck (`gh pr view <PR> --json labels`) | Its entire purpose is detecting that a concurrent process moved the PR on |
+| Step 7's overlap probe (`gh pr view X --json files`) and `mergeStateStatus` recheck | **Merge gating** — the last read before an irreversible merge |
+| The `--dry-run` "Verifying nothing mutates" before/after reads | **Differential check** — the identical command runs twice around the operation under test; a cache hit would return the "before" value and make the check vacuously pass |
+
+**Writes stay literal `gh`.** Never wrap `gh issue edit` / `gh pr comment` in
+`"$GH_READ"` — the destructive-command guard hooks pattern-match the literal
+command text and a wrapped form slips past them. After a mutation this sweep
+made, drop the cache instead: `"$GH_READ" --clear-cache` (a local `/tmp`
+sweep, zero API cost) so a later cached read cannot return pre-write state.
+
+Full policy, TTL/invalidation semantics, and manual verification steps:
+`.loom/docs/gh-cached.md` (source: `defaults/docs/gh-cached.md`).
+
 ## Sweep Run Identity + Peer-`/loom:sweep` Detection (#3768)
 
 Before **any** other stage — including Backend detection (Stage -1), the dry-run gate, and all wave lifecycles — establish a **stable identity for this sweep invocation** and probe for a concurrently-running peer `/loom:sweep`. This runs for **all modes (A, B, and C)** — it is *not* short-circuited by Mode C or `--no-daemon` (those only affect the Stage -1 backend probes below).
@@ -1083,9 +1197,9 @@ If `--dry-run` was supplied, **this stage runs before any mutation** and EXITs a
 
 1. **Survey each candidate (read-only).** For every deduplicated, validated issue number `N` in the candidate list:
    ```bash
-   gh issue view N --json number,title,labels,state --jq '{number, title, state, labels: [.labels[].name]}'
+   "$GH_READ" issue view N --json number,title,labels,state --jq '{number, title, state, labels: [.labels[].name]}'
    ```
-   This is a `gh issue view` read — it does not mutate anything. (If `gh` is unauthenticated or the issue is unreachable, log the error against that candidate and continue surveying the rest.)
+   This is a `gh issue view` read — it does not mutate anything. It runs through the cached-read wrapper (see "Cached forge reads (`gh-cached`)"): a dry-run survey is pure observation whose output is a printed plan, never a claim, so 30s of staleness costs nothing. The **live** path's per-issue pre-flight (step 1 of the Wave Lifecycle) deliberately does *not* use the wrapper. (If `gh` is unauthenticated or the issue is unreachable, log the error against that candidate and continue surveying the rest.)
 
    **Add `body` to this read unconditionally** (`gh issue view N --json number,title,labels,state,body ...`) — one extra `--json` field, **no extra API call** — and parse its `## Affected Files` section into the candidate's estimated file surface per "Overlap-aware wave partitioning" step 1. A missing / "To be determined" section leaves the surface *unknown* (that candidate is excluded from overlap analysis; never blocked). The `body` fetched here also feeds the `--auto-stack` edge-detection pass when that flag is set (see below), so it is read once and used for both.
 
@@ -1160,9 +1274,9 @@ When every overlapping group was separated by the reorder, print the moves witho
 
 1. **Survey each PR candidate (read-only).** For every deduplicated, validated PR number `P` in the candidate list:
    ```bash
-   gh pr view P --json number,title,labels,state --jq '{number, title, state, labels: [.labels[].name]}'
+   "$GH_READ" pr view P --json number,title,labels,state --jq '{number, title, state, labels: [.labels[].name]}'
    ```
-   This is a `gh pr view` read — it does not mutate anything. (If `gh` is unauthenticated or the PR is unreachable, log the error against that candidate and continue surveying the rest.)
+   This is a `gh pr view` read — it does not mutate anything. Cached, for the same reason as the Modes A/B survey above; Mode C's **live** C0 pre-flight is deliberately uncached. (If `gh` is unauthenticated or the PR is unreachable, log the error against that candidate and continue surveying the rest.)
 
 2. **Compute wave partition.** Mode C waves are size-1 (`--builders-per-wave` is ignored). Each PR is its own wave. Record `(pr, wave_index=N, total_waves=M)` for each candidate. Apply the same skip rules the live path uses (closed PRs, multiple-label conflicts, missing required label all tagged "would skip" in the plan but still listed for transparency).
 
@@ -1216,6 +1330,10 @@ Total: 1 would-judge, 1 would-doctor-then-judge, 1 would-merge, 2 would-skip. No
 **Verifying "nothing mutates":**
 
 ```bash
+# EVERY `gh` read below is plain `gh` — NEVER "$GH_READ". This is a
+# before/after differential check: the identical command runs twice around the
+# operation under test, so a cache hit on the "after" read would replay the
+# "before" value and make the check pass vacuously (#4667).
 # Before:
 LABELS_BEFORE=$(gh pr view P --json labels --jq '[.labels[].name]|sort')   # Mode C
 ISSUE_LABELS_BEFORE=$(gh issue view N --json labels --jq '[.labels[].name]|sort')  # Modes A/B
@@ -1238,6 +1356,9 @@ For each PR `P` in the candidate list, processed sequentially one PR per wave (s
 ### C0. Per-PR pre-flight (before any role dispatch)
 
 ```bash
+# Plain `gh` — NOT "$GH_READ". This read routes the PR to Judge / Doctor /
+# Merge, so it must observe a concurrent Judge's or Champion's just-written
+# label. See "Cached forge reads (`gh-cached`)" for the uncached carve-outs.
 gh pr view P --json number,state,labels,closingIssuesReferences \
   --jq '{number, state, labels: [.labels[].name], closes: [.closingIssuesReferences[].number]}'
 ```
@@ -1437,6 +1558,11 @@ For each issue `N` in the wave, before any role skill is invoked:
 
 1. **Verify the issue is open and not already in flight.**
    ```bash
+   # Plain `gh` — NOT "$GH_READ". This is claim arbitration: a 30s-stale label
+   # set is exactly the window in which a competing Builder's `loom:building`
+   # claim (or another sweep's freshly opened PR) lands, and answering from
+   # cache would dispatch a duplicate builder onto claimed work. Uncached by
+   # design — see "Cached forge reads (`gh-cached`)".
    gh issue view N --json state,labels,closedByPullRequestsReferences \
      --jq '{state, labels: [.labels[].name], linked_prs: [.closedByPullRequestsReferences[].url]}'
    ```
@@ -1456,6 +1582,9 @@ For each issue `N` in the wave, before any role skill is invoked:
      1. **Closing-keyword PRs (`closedByPullRequestsReferences`, unchanged since #3359).** The `linked_prs` from the `gh issue view` above. GitHub's native `Closes/Fixes/Resolves #N` parser — populated only by closing keywords.
      2. **Non-closing cross-reference PRs (timeline, #3677).** PRs that reference `N` with a **non-closing** phrase (`Part of #N` / `Contributes to #N`, the #3599 partial-increment convention — see `defaults/roles/builder-pr.md`) never appear in `closedByPullRequestsReferences` by design, so probe the issue's timeline for `cross-referenced` events whose source is a PR:
         ```bash
+        # Plain `gh` — NOT "$GH_READ": same claim-arbitration carve-out as the
+        # `gh issue view` read above (this probe decides whether to dispatch a
+        # Builder at all).
         gh api "repos/OWNER/REPO/issues/N/timeline" --paginate \
           --jq '[.[] | select(.event == "cross-referenced"
                               and .source.issue.pull_request != null
@@ -1467,6 +1596,7 @@ For each issue `N` in the wave, before any role skill is invoked:
 
      **Union + filter.** Merge the two source lists and dedupe by PR number. For any PR discovered only via source 1, filter to `state == "OPEN"` (uppercase — `closedByPullRequestsReferences` includes MERGED and CLOSED PRs, which are not the duplicate-builder hazard); source 2 is already filtered to open. For each surviving open PR, fetch its labels for routing:
      ```bash
+     # Plain `gh` — NOT "$GH_READ" (routing read; must be live).
      gh pr view <pr_number_or_url> --json state,labels --jq '{state, labels: [.labels[].name]}'
      ```
      Apply the routing rules below based on the count of distinct **open** linked PRs (from either source):
@@ -1747,6 +1877,8 @@ post_wave_integration_gate()                    # step 8 — buildGate-against-m
 - If `CHECKPOINT_PHASE == "doctor-done"`, Doctor has already addressed Judge's earlier feedback. **Re-run the Judge phase** for this PR — Judge has not yet evaluated the post-doctor diff in the current sweep run. (The previous Judge result that led to Doctor was `changes-requested`, not `judge-done`.)
 - If `CHECKPOINT_PHASE == "judge-rejected"`, an earlier sweep run's Judge already completed and requested changes on this PR — the sweep was killed before the inline Doctor cycle finished. **Do NOT re-run the initial Judge pass.** Route directly to the Doctor phase (step 6) for this PR. **Forge/checkpoint divergence guard:** before trusting this checkpoint, verify the PR still carries `loom:changes-requested`:
   ```bash
+  # Plain `gh` — NOT "$GH_READ": this recheck exists precisely to detect that a
+  # concurrent process moved the PR on, which a cached label set would hide.
   gh pr view <PR> --json labels --jq '[.labels[].name] | contains(["loom:changes-requested"])'
   ```
   If it does not (e.g. a concurrent process already merged, re-judged, or otherwise moved the PR on), the checkpoint and forge state have diverged — log a warning and fall back to running Judge normally instead of trusting the stale checkpoint.
@@ -1802,6 +1934,9 @@ Before calling `merge-pr.sh` for PR `#X`:
 
 1. **Cheap read-only overlap probe.** Fetch `#X`'s changed-file set and compare it against `WAVE_MERGED_FILES` (the union of paths already merged in this wave — see the step 5 loop):
    ```bash
+   # Plain `gh` — NOT "$GH_READ". Everything from here to the merge call is
+   # merge-gating: the last read before an irreversible action must observe
+   # current state unconditionally (#4667).
    gh pr view X --json files -q '.files[].path'
    ```
    - **Disjoint** (no path shared with `WAVE_MERGED_FILES`) → **keep the fast path**: fall straight through to the merge below. Two PRs touching disjoint files are safe (the issue confirms this), so no revalidation latency is added. This is the common case. *(Caveat: file-path granularity cannot see cross-file semantic coupling — e.g. a `to_dict()` in a source file vs. an exact-dict assertion in a test file, which are disjoint paths. That class is the step 8 integration gate's job, not this probe's.)*

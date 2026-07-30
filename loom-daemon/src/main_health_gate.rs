@@ -3186,62 +3186,14 @@ mod tests {
     // Capturing logger (#4083) — a tiny `log::Log` impl so the green-path
     // severity can be asserted and cannot silently regress to `debug!`.
     //
-    // The global logger can only be installed once per process and tests run
-    // in parallel, so records are routed into a *thread-local* buffer that is
-    // only collected while `capture_logs` is active on the calling thread.
-    // Any log emitted by a concurrent test lands in that other thread's
-    // (inactive) buffer and is dropped — so capture is race-free without
-    // serializing the whole suite.
+    // The implementation moved to `crate::test_log_capture` (#4641) because
+    // `log::set_boxed_logger` succeeds only ONCE per process and every
+    // `#[cfg(test)]` module compiles into the same test binary: a second
+    // per-module logger would silently lose every record for whichever module
+    // lost the race. This alias keeps the `capture::capture_logs(...)` call
+    // sites below unchanged.
     // ===================================================================
-    mod capture {
-        use log::{Level, Log, Metadata, Record};
-        use std::cell::RefCell;
-        use std::sync::Once;
-
-        thread_local! {
-            static RECORDS: RefCell<Vec<(Level, String)>> = const { RefCell::new(Vec::new()) };
-            static ACTIVE: RefCell<bool> = const { RefCell::new(false) };
-        }
-
-        struct CaptureLogger;
-
-        impl Log for CaptureLogger {
-            fn enabled(&self, _: &Metadata) -> bool {
-                true
-            }
-            fn log(&self, record: &Record) {
-                ACTIVE.with(|a| {
-                    if *a.borrow() {
-                        RECORDS.with(|r| {
-                            r.borrow_mut()
-                                .push((record.level(), record.args().to_string()));
-                        });
-                    }
-                });
-            }
-            fn flush(&self) {}
-        }
-
-        static INIT: Once = Once::new();
-
-        /// Run `f`, returning every `(Level, message)` it logged on this thread.
-        pub fn capture_logs<F: FnOnce()>(f: F) -> Vec<(Level, String)> {
-            INIT.call_once(|| {
-                // `set_max_level(Trace)` is required — without it the log macros
-                // short-circuit before reaching the logger. Because it is set to
-                // the most permissive level, a regression of the green path from
-                // `info!` to `debug!` would still be *captured* (as `Debug`), so
-                // the level assertion — not mere presence — is what guards it.
-                let _ = log::set_boxed_logger(Box::new(CaptureLogger));
-                log::set_max_level(log::LevelFilter::Trace);
-            });
-            RECORDS.with(|r| r.borrow_mut().clear());
-            ACTIVE.with(|a| *a.borrow_mut() = true);
-            f();
-            ACTIVE.with(|a| *a.borrow_mut() = false);
-            RECORDS.with(|r| r.borrow_mut().clone())
-        }
-    }
+    use crate::test_log_capture as capture;
 
     // ===================================================================
     // Green-path log severity (#4083)

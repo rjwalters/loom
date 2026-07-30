@@ -5,8 +5,8 @@
 mod common;
 
 use common::{
-    capture_terminal_output, cleanup_all_loom_sessions, cleanup_test_sessions, tmux_available,
-    tmux_session_exists, TestClient, TestDaemon,
+    capture_terminal_output, cleanup_test_sessions, tmux_available, tmux_session_exists,
+    TestClient, TestDaemon,
 };
 use serial_test::serial;
 
@@ -32,12 +32,17 @@ macro_rules! require_tmux {
     };
 }
 
-/// Cleanup helper to run before/after tests.
-/// Cleans ALL loom sessions to prevent the daemon from restoring orphan sessions
-/// from other test binaries or previous runs. This is necessary because the daemon
-/// calls `restore_from_tmux()` on startup which imports any existing loom-* sessions.
+/// Cleanup helper to run before each test.
+///
+/// Scoped to this binary's `TEST_PREFIX` (issue #4622) rather than a host-wide
+/// kill: `TestDaemon::start()` always sets `LOOM_NO_RESTORE=1`, so
+/// `restore_from_tmux()` never runs for these daemons and orphan-session
+/// import from other binaries/previous runs is not a concern here. Every
+/// terminal this suite creates goes through `create_terminal_with_unique_id`,
+/// which is itself `TEST_PREFIX`-scoped, so `cleanup_test_sessions()` sees and
+/// removes everything this binary could have left behind.
 fn setup() {
-    cleanup_all_loom_sessions();
+    cleanup_test_sessions();
 }
 
 /// Test 1.1: Basic Ping/Pong communication

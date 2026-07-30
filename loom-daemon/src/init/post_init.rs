@@ -117,6 +117,11 @@ pub const EPHEMERAL_PATTERNS: &[&str] = &[
     // Worktree sentinel dropped by worktree.sh into each issue worktree; must be
     // ignored so a builder's `git add -A` doesn't sweep it into a commit (#3778).
     ".loom-managed",
+    // Builder "no changes needed" marker (builder.md § "Signaling No Changes
+    // Needed"). Must stay untracked/gitignored so it is born absent in every
+    // fresh worktree and a deliberate write doesn't get swept into a commit by
+    // `git add -A` — a tracked copy on main defeated the signal entirely (#4635).
+    ".no-changes-needed",
     ".loom/.daemon.pid",
     ".loom/.daemon.log",
     ".loom/daemon.sock",
@@ -171,6 +176,11 @@ pub const EPHEMERAL_PATTERNS: &[&str] = &[
     // untracked file that a consumer's `git add -A` swept into a commit. Defense
     // in depth: ignore the whole class rather than one filename.
     ".loom/*.tmp",
+    // Rescue copy written by `init::merge_config_file` before it overwrites an
+    // unparseable `.loom/config.json` with the shipped template (#4641). It
+    // exists so an operator can recover hand-tuned keys after a torn write, but
+    // it is machine-local salvage — never something to commit.
+    ".loom/*.bak",
     ".loom/logs/",
 ];
 
@@ -576,6 +586,10 @@ mod tests {
         assert!(contents.contains(".loom/spawn-loop.pid"));
         assert!(contents.contains(".loom/stop-spawn-loop"));
 
+        // #4635: the builder "no changes needed" marker must be ignored so it
+        // is born absent in every fresh worktree.
+        assert!(contents.contains(".no-changes-needed"));
+
         // Retired daemon-brain patterns must NOT be emitted (Phase 3.5, #3402)
         assert!(!contents.contains(".loom/daemon-state.json"));
         assert!(!contents.contains(".loom/[0-9][0-9]-daemon-state.json"));
@@ -629,6 +643,9 @@ mod tests {
         assert_eq!(contents.matches(".loom/locks/").count(), 1);
         // #4280: `.loom/worktrees-local/` must not duplicate across runs.
         assert_eq!(contents.matches(".loom/worktrees-local/").count(), 1);
+        // #4635: the builder "no changes needed" marker must not duplicate
+        // across runs either.
+        assert_eq!(contents.matches(".no-changes-needed").count(), 1);
     }
 
     #[test]
@@ -647,6 +664,9 @@ mod tests {
             // #3838: the worktree sentinel worktree.sh drops into each issue
             // worktree must be ignored, else a builder's `git add -A` commits it.
             ".loom-managed",
+            // #4635: builder "no changes needed" marker (builder.md § "Signaling
+            // No Changes Needed") must stay untracked/gitignored.
+            ".no-changes-needed",
             ".loom/.daemon.pid",
             ".loom/.daemon.log",
             ".loom/daemon.sock",

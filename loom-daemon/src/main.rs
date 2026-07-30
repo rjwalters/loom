@@ -15,6 +15,7 @@ use loom_daemon::main_health_gate;
 use loom_daemon::metrics_collector;
 use loom_daemon::quarantine_reconciliation;
 use loom_daemon::rate_limit_breaker;
+use loom_daemon::role_collision;
 use loom_daemon::role_runner;
 use loom_daemon::role_validation;
 use loom_daemon::script_helpers;
@@ -52,15 +53,11 @@ use tokio::net::UnixStream;
 // fresh ones and cause hard-to-diagnose install regressions (#3287 class).
 // `LOOM_DAEMON_GIT_COMMIT` and `LOOM_DAEMON_BUILD_TIME` are populated by
 // `build.rs`; both fall back to "unknown" when the build host lacks the
-// tooling, which is loud but harmless.
-#[command(version = concat!(
-    env!("CARGO_PKG_VERSION"),
-    " (commit ",
-    env!("LOOM_DAEMON_GIT_COMMIT"),
-    ", built ",
-    env!("LOOM_DAEMON_BUILD_TIME"),
-    ")"
-))]
+// tooling, which is loud but harmless. The composed string lives in the lib
+// crate (`self_update::BUILD_IDENTITY`) so library code that must name the
+// deciding binary — e.g. the empty-token-pool error (#4643) — reports exactly
+// what `--version` reports.
+#[command(version = loom_daemon::self_update::BUILD_IDENTITY)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -1691,8 +1688,45 @@ mod gh_token_guard_tests {
     }
 }
 
+/// Process entry point.
+///
+/// The real body lives in [`run_daemon`]; this wrapper exists so a startup
+/// failure **terminates the process itself** instead of returning `Err` out of
+/// `#[tokio::main]` (#4531).
+///
+/// Returning `Err` is correct but not prompt: the `#[tokio::main]` wrapper drops
+/// its `Runtime` when `block_on` returns, and `Runtime::drop` blocks the calling
+/// thread until every in-flight `spawn_blocking` task finishes. By the time the
+/// singleton guard refuses to start (`IpcServer::run`, #3806), the daemon has
+/// already spawned its periodic loops, several of which do their work on the
+/// blocking pool — so the refusal message printed, then the process sat in
+/// `Runtime::drop` for ~10s before `Termination` ever ran. Under a shorter
+/// timeout that is indistinguishable from a hang, and it left a doomed second
+/// daemon alive (running role-runner/work-finder ticks) long after it had
+/// decided not to start.
+///
+/// The observable contract is deliberately unchanged: the message is the same
+/// `Error: {err:?}` line `Termination for Result` would have written to stderr,
+/// and [`loom_daemon::ipc::EXIT_STARTUP_FAILURE`] is `1`, the value
+/// `ExitCode::FAILURE` carries.
+/// Only the latency changes. stderr is explicitly flushed before
+/// `std::process::exit` so the refusal is never truncated (`exit` runs no
+/// destructors); the log file needs no such care because `env_logger` flushes
+/// each record as it writes it — the same assumption every other
+/// `std::process::exit` path in this daemon already makes.
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
+    if let Err(err) = run_daemon().await {
+        eprintln!("Error: {err:?}");
+        let _ = std::io::stderr().flush();
+        std::process::exit(loom_daemon::ipc::EXIT_STARTUP_FAILURE);
+    }
+}
+
+/// The daemon's real entry point: CLI dispatch, then full daemon startup ending
+/// in the IPC accept loop (which only returns on a startup failure — a running
+/// daemon leaves via one of the `std::process::exit` paths instead).
+async fn run_daemon() -> Result<()> {
     let cli = Cli::parse();
 
     // Handle CLI commands (init mode)
@@ -2683,6 +2717,23 @@ async fn main() -> Result<()> {
             "role_runner: enabled (multi-workspace, {} role(s): {})",
             roles.len(),
             roles.iter().map(|r| r.name).collect::<Vec<_>>().join(", ")
+        );
+        // Cross-host role-tick collision detection (#4623), the role-runner
+        // counterpart of #4085's sweep-dispatch probe. Resolved per registered
+        // root at tick time (a root can opt in/out on its own); this line
+        // reports the daemon workspace's own resolution so an operator can
+        // confirm the toggle took effect. Detection only — a detected
+        // collision is logged/counted, never acted on.
+        log::info!(
+            "role_runner: cross-host collision detection {} for {} (#4623; \
+             LOOM_ROLE_RUNNER_DETECT_COLLISIONS > autonomous.roleRunner.collisionDetection > \
+             autonomous.collisionDetection.enabled)",
+            if role_collision::resolve_detection_enabled(&sweep_workspace) {
+                "ENABLED"
+            } else {
+                "disabled"
+            },
+            sweep_workspace.display()
         );
         let handles: Vec<_> = roles
             .iter()
@@ -7189,6 +7240,15 @@ fn handle_tokens_command(action: TokensAction) -> Result<()> {
                     eprintln!("{msg}");
                 }
             }
+            // Routine `.bad_tokens` hygiene (#4643). `cleanup_bad_tokens` had
+            // zero callers in the whole tree, so pools accumulated expired
+            // exhaustion entries forever (the live shared pool still held
+            // days-old lines). Selection is the routine path every spawn takes,
+            // and pruning is behavior-neutral — `is_bad` already ignores
+            // aged-out entries — so this only bounds the file. Best-effort:
+            // never let a cleanup failure block a spawn, and no lock is taken
+            // at all when there is nothing to prune.
+            let _ = bad_tokens::cleanup_bad_tokens(&ws, bad_tokens::DEFAULT_CLEANUP_MAX_AGE_SECS);
             match select::select_token(&ws, None) {
                 Ok(sel) => {
                     if export {
@@ -7431,6 +7491,26 @@ fn handle_tokens_command(action: TokensAction) -> Result<()> {
                      workspace; anchoring to the shared machine-level pool at {} (issue #4292)",
                     tokens_dir.display()
                 );
+            }
+
+            // Routine `.bad_tokens` hygiene (#4643) — the second wired path.
+            // `tokens check` is the low-frequency periodic probe (the daemon's
+            // ranking refresh runs it on a cadence), so it prunes the pool the
+            // check is actually anchored to, which may be the shared
+            // machine-level pool rather than `resolve_tokens_dir(workspace)`.
+            match bad_tokens::cleanup_bad_tokens_in_dir(
+                &tokens_dir,
+                bad_tokens::DEFAULT_CLEANUP_MAX_AGE_SECS,
+            ) {
+                Ok(outcome) if outcome.removed > 0 => eprintln!(
+                    "note: pruned {} expired .bad_tokens entr{} older than {}h ({} retained)",
+                    outcome.removed,
+                    if outcome.removed == 1 { "y" } else { "ies" },
+                    bad_tokens::DEFAULT_CLEANUP_MAX_AGE_SECS / 3600,
+                    outcome.kept,
+                ),
+                Ok(_) => {}
+                Err(e) => eprintln!("warning: .bad_tokens cleanup skipped: {e}"),
             }
 
             let source_flag = match source {

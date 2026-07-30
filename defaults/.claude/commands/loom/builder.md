@@ -43,13 +43,14 @@ git checkout -- <out-of-scope-file>
 
 **No Loom runtime markers staged.** `worktree.sh` drops a `.loom-managed` sentinel
 into every issue worktree, and other flows may leave `.loom-in-use` /
-`.loom-checkpoint`. These are gitignored by a correctly-installed repo, but a stale
-or pre-#3838 `.gitignore` may not cover them — so a blanket `git add -A` can sweep
-them into your commit. Before committing, confirm none are staged:
+`.loom-checkpoint` / the `.no-changes-needed` no-changes signal (see "Signaling
+No Changes Needed" below). These are gitignored by a correctly-installed repo, but
+a stale or pre-#3838 `.gitignore` may not cover them — so a blanket `git add -A`
+can sweep them into your commit. Before committing, confirm none are staged:
 
 ```bash
 git -C "$WORKTREE_ABS" diff --cached --name-only \
-  | grep -E '(^|/)\.loom-managed$|(^|/)\.loom-in-use$|(^|/)\.loom-checkpoint$' \
+  | grep -E '(^|/)\.loom-managed$|(^|/)\.loom-in-use$|(^|/)\.loom-checkpoint$|(^|/)\.no-changes-needed$' \
   && echo "ERROR: unstage the Loom runtime marker above (git rm --cached <file>)" \
   || echo "OK: no Loom runtime markers staged"
 ```

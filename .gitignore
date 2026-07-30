@@ -34,6 +34,7 @@ Thumbs.db
 .loom-in-use
 .loom-checkpoint
 .loom-managed
+.no-changes-needed
 .loom/.daemon.pid
 .loom/.daemon.log
 .loom/daemon.sock
@@ -73,6 +74,7 @@ Thumbs.db
 .loom/*.log
 .loom/*.sock
 .loom/*.tmp
+.loom/*.bak
 .loom/logs/
 # <<< loom-managed <<<
 .loom-test-failure-context.json

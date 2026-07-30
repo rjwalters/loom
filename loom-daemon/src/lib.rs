@@ -90,12 +90,20 @@
 //! An audit of every `#[serial]` test in this crate (#4385) found exactly one such
 //! resource: the host-global `tmux -L loom` server, reached by the
 //! `integration_*` binaries in `loom-daemon/tests/`. Each spawns real
-//! `loom-daemon` children and calls `cleanup_all_loom_sessions()`, which kills
-//! **every** `loom-*` session on that server, not just its own. They are therefore
-//! placed in the `daemon-integration` test group (`max-threads = 1`), so at most
-//! one is ever in flight. Everything else those tests touch is per-test
-//! (`tempfile::TempDir` roots, ephemeral ports, per-binary session prefixes).
-//! Confirm group membership rather than assuming it:
+//! `loom-daemon` children against it, and two of the four
+//! (`integration_security.rs`, `integration_factory_reset.rs`) call
+//! `cleanup_all_loom_sessions()`, which kills **every** `loom-*` session on
+//! that server, not just its own — a deliberate, commented exception for
+//! suites whose hardcoded/unprefixed terminal IDs a scoped cleanup cannot see
+//! (issue #4622; see the doc comment on `cleanup_all_loom_sessions()` in
+//! `tests/common/mod.rs`). The other two use the `TEST_PREFIX`-scoped
+//! `cleanup_test_sessions()`. All four are nonetheless placed in the
+//! `daemon-integration` test group (`max-threads = 1`), so at most one is ever
+//! in flight — they still share the same host-global tmux server and spawn
+//! real daemons against it, and two of them retain the host-wide kill.
+//! Everything else those tests touch is per-test (`tempfile::TempDir` roots,
+//! ephemeral ports, per-binary session prefixes). Confirm group membership
+//! rather than assuming it:
 //!
 //! ```text
 //! cargo nextest show-config test-groups --profile ci
@@ -107,8 +115,9 @@
 //!   override declared only on `default` silently does not apply to
 //!   `--profile ci`. Declare it on both.
 //! * **The group bounds one nextest run, not the host.** A `cargo test` in another
-//!   checkout on the same machine runs `cleanup_all_loom_sessions()` too and will
-//!   destroy this run's tmux sessions. If the `integration_*` suites fail with
+//!   checkout on the same machine can still run `cleanup_all_loom_sessions()`
+//!   (from `integration_security.rs`/`integration_factory_reset.rs`) and destroy
+//!   this run's tmux sessions. If the `integration_*` suites fail with
 //!   "session ... does not exist" or daemon-startup timeouts, check for a sibling
 //!   test run before suspecting your change — the same failures reproduce under
 //!   plain `cargo test`.
@@ -158,6 +167,7 @@ pub mod idle_exit;
 pub mod init;
 pub mod ipc;
 pub mod issue_creation_mutex;
+pub mod live_claim;
 pub mod main_health_gate;
 pub mod metrics_collector;
 pub mod peer_claims;
@@ -165,6 +175,7 @@ pub mod phase_join;
 pub mod pipeline_snapshot;
 pub mod quarantine_reconciliation;
 pub mod rate_limit_breaker;
+pub mod role_collision;
 pub mod role_runner;
 pub mod role_validation;
 pub mod runtime_admission;
@@ -173,8 +184,14 @@ pub mod script_helpers;
 pub mod self_update;
 pub mod serve;
 pub mod sweep_journal;
+pub mod sweep_outcomes;
 pub mod sweep_registry;
 pub mod terminal;
+/// Test-only capturing logger (see module docs) — single-sourced so the crate's
+/// one-per-process `log::set_boxed_logger` installation is shared by every test
+/// module that asserts on log severity.
+#[cfg(test)]
+pub mod test_log_capture;
 pub mod token_ranking_refresh;
 pub mod tokens;
 pub mod tokens_pool;

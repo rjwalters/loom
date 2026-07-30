@@ -259,6 +259,44 @@ Reaching for `loom:blocked` when you mean `loom:operator-only` conflates "waitin
 a dependency" with "needs a human action," which muddies the daemon/sweep skip
 semantics. Use `loom:operator-only` for the human-must-act-off-automation case.
 
+### An operator edit to `.loom/config.json` disappeared (#4641)
+
+`.loom/config.json` has exactly one production writer: `loom-daemon init` (run by
+`install.sh` reinstalls and by the `fleet add-worker` provisioning steps).
+`resync-installed.sh` and `loom-daemon calibrate --write` never touch it.
+
+`init`'s merge is **existing-wins** — consumer keys, including ones absent from the
+shipped template such as `autonomous.workFinder.maxConcurrent`, survive — so a
+tuned value vanishing means one of the other branches fired. Every `init` call now
+emits one greppable line naming the branch it took:
+
+```bash
+grep 'init: config.json:' ~/.loom/daemon.log
+```
+
+| Branch | Level | Meaning |
+|--------|-------|---------|
+| `fresh-write` | `info` | No config existed; the template was written verbatim. |
+| `merge-preserved` | `info` | Existing values kept. Carries a per-key diff (`+ added`, `~ changed`, `- dropped`) or "no effective config change". |
+| `template-invalid-skip` | `warn` | The shipped `defaults/config.json` is unparseable; your file was left untouched (and got no template updates). |
+| `invalid-JSON-fallback-overwrite` | `warn` | **Your config was replaced by the template.** The line names the discarded keys. |
+
+A `~` or `-` entry on `merge-preserved` is unexpected under existing-wins semantics
+and is worth investigating.
+
+The fallback branch only fires when the file on disk does not parse as a JSON
+object (a torn write from a concurrent writer, a hand-edit with a syntax error, or
+a top-level array). Before overwriting, `init` copies the unparseable bytes to
+`.loom/config.json.bak` — recover your tuned keys from there:
+
+```bash
+cat .loom/config.json.bak
+```
+
+`.loom/*.bak` is git-ignored, and `fleet add-worker` no longer re-runs
+`loom-daemon init` against a workspace that already has a `.loom/config.json`, so
+repeat provisioning passes cannot re-enter this path on a tuned host.
+
 ### Daemon won't start
 
 ```bash
@@ -681,6 +719,21 @@ checkout's installed copies from this worktree" can pass `--allow-worktree` (or
 export `LOOM_RESYNC_ALLOW_WORKTREE=1`); it then proceeds with a warning naming the
 main-checkout target. Running from the main checkout — including any subdirectory
 of it — is unaffected.
+
+**It can safely update itself (#4669).** `resync-installed.sh` is one of the files
+under `defaults/scripts/`, so every run copies a newer version over the very path
+the running Bash process is still reading from. It used to do that with an
+in-place `cp`, which truncates and rewrites the destination: Bash then resumed
+reading its own (now shorter) script at a stale byte offset and either died with
+`syntax error near unexpected token` or fell off the end mid-run — leaving dozens
+of surfaces refreshed, the rest stale, and no summary saying so. Now every file
+is staged beside its destination and `rename(2)`-d into place (atomic; the
+already-open inode is left intact), and the self-copy is additionally **deferred
+until every other surface has settled**. If a file cannot be staged or renamed
+(read-only mount, permissions, no disk space) the run still finishes the
+remaining files and then prints an explicit **`PARTIAL REFRESH`** block naming
+every failed path and **exits `1`** — nothing is ever half-written, so fixing the
+cause and re-running completes the refresh.
 
 The intended flow is **"freshness warning says you're stale → run resync"**:
 

@@ -13,9 +13,25 @@ use tokio::time::{sleep, Duration};
 use uuid::Uuid;
 
 /// Ensure we always begin with a clean slate of tmux sessions.
-/// Cleans ALL loom sessions to prevent the daemon from restoring orphan sessions
-/// from other test binaries or previous runs. This is necessary because the daemon
-/// calls `restore_from_tmux()` on startup which imports any existing loom-* sessions.
+///
+/// Deliberately uses the host-wide `cleanup_all_loom_sessions()` rather than
+/// the `TEST_PREFIX`-scoped `cleanup_test_sessions()` (issue #4622). This is a
+/// reviewed exception, not an oversight: `create_workspace_terminals()` below
+/// mirrors the real workspace terminal-naming scheme with hardcoded,
+/// unprefixed config IDs (`terminal-1` .. `terminal-7`), on purpose — the test
+/// documents `docs/testing/factory-reset-loop.md`'s real session layout. Those
+/// IDs never carry `TEST_PREFIX`, so `cleanup_test_sessions()` cannot see or
+/// remove `loom-terminal-N-*` sessions a prior crashed/interrupted run of
+/// *this exact suite* may have left behind, and a stale identically-named
+/// session would collide with this run's `create_terminal_with_config` calls.
+/// (`restore_from_tmux()` itself is not the concern — `TestDaemon::start()`
+/// unconditionally sets `LOOM_NO_RESTORE=1`, so it never runs here.)
+///
+/// Known trade-off: on a genuinely shared host this can still kill another
+/// user's sessions or a live production `loom-daemon`'s real sessions. These
+/// `integration_*` suites are confined to the `daemon-integration` nextest
+/// test group (`max-threads = 1`, see `.config/nextest.toml` /
+/// `loom-daemon/src/lib.rs`) precisely because of hazards like this one.
 fn setup() {
     cleanup_all_loom_sessions();
 }

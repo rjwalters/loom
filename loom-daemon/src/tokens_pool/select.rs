@@ -25,7 +25,9 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use super::bad_tokens::is_bad;
+use super::bad_tokens::{
+    blocking_entry, exhaustion_cooldown_secs, is_bad, EXHAUSTION_COOLDOWN_ENV,
+};
 use super::paths::{resolve_tokens_dir, shared_tokens_dir};
 use super::rng::Rng;
 use super::rotation::next_rotation_index;
@@ -83,6 +85,66 @@ impl std::fmt::Display for EmptyTokenPoolError {
 }
 
 impl std::error::Error for EmptyTokenPoolError {}
+
+/// Identity of the binary that evaluated this selection — version, build
+/// commit, and build timestamp (#4643).
+///
+/// The 2026-07-30 incident (13h-old exhaustion entries appearing to block
+/// every spawn) could not be diagnosed from the sweep log because the failure
+/// text never said *which* binary decided. `spawn-claude.sh` resolves the
+/// daemon binary independently of any running daemon (`$LOOM_DAEMON_BIN` →
+/// PATH → build-output candidates), so a stale binary at the selection site is
+/// a real, recurring hypothesis — and now a directly checkable one: this string
+/// is stamped into the empty-pool error itself.
+#[must_use]
+pub fn deciding_binary_identity() -> String {
+    format!("loom-daemon {}", crate::self_update::BUILD_IDENTITY)
+}
+
+/// Render a whole-second duration compactly (`5h48m`, `48m12s`, `12s`) for
+/// the cooldown-remaining field of the empty-pool detail.
+fn format_secs(secs: i64) -> String {
+    let secs = secs.max(0);
+    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    if h > 0 {
+        format!("{h}h{m:02}m")
+    } else if m > 0 {
+        format!("{m}m{s:02}s")
+    } else {
+        format!("{s}s")
+    }
+}
+
+/// One line of per-token exclusion detail for the empty-pool error (#4643):
+/// account name, exclusion cause, reason class (auth = permanent vs
+/// exhaustion = TTL), the entry's own timestamp, and the cooldown remaining.
+///
+/// Computed in the error path by re-walking the pool rather than threading
+/// state through the three tier functions: reaching this point means every
+/// tier — including the fail-safe retry that drops the stale-`.ranking`
+/// advisory exclusions — came up empty, so the surviving causes are exactly
+/// "bad-marked", "empty", and "unreadable", all of which are re-derivable
+/// per token without disturbing the selection hot path.
+fn describe_exclusion(workspace: &Path, token_file: &Path) -> String {
+    let name = stem(token_file);
+    if let Some(entry) = blocking_entry(workspace, &name) {
+        let class = entry.class.label();
+        let permanence = entry.class.permanence();
+        let clears = match entry.cooldown_remaining_secs {
+            Some(remaining) => format!("clears in {}", format_secs(remaining)),
+            None => format!("needs `loom-daemon tokens unblock {name}`"),
+        };
+        return format!(
+            "{name}: bad-marked [{class}, {permanence}] at {} — \"{}\"; {clears}",
+            entry.timestamp, entry.reason
+        );
+    }
+    match read_token_file(token_file) {
+        Ok(key) if key.is_empty() => format!("{name}: empty .token file"),
+        Ok(_) => format!("{name}: no usable tier admitted it (not bad-marked, key non-empty)"),
+        Err(e) => format!("{name}: unreadable .token file ({e})"),
+    }
+}
 
 fn shared_pool_hint() -> String {
     match shared_tokens_dir() {
@@ -473,11 +535,24 @@ pub fn select_token(
         }
     }
 
+    // Per-token exclusion detail (#4643): say WHY each account was excluded and
+    // WHICH binary decided, so a recurrence is diagnosable from the sweep log
+    // alone instead of by reading this source file.
+    let detail: String = all_tokens
+        .iter()
+        .map(|f| format!("\n  - {}", describe_exclusion(workspace, f)))
+        .collect();
     Err(EmptyTokenPoolError(format!(
-        "All {} tokens in {} are marked bad or empty. Inspect .bad_tokens or run \
-         `loom-daemon tokens bootstrap --force`.",
+        "All {} tokens in {} are marked bad or empty.{detail}\n  \
+         deciding binary: {}\n  \
+         exhaustion cooldown: {}s (override {EXHAUSTION_COOLDOWN_ENV}); auth entries never \
+         expire — clear them with `loom-daemon tokens unblock <name>` \
+         (add --all-reasons to drop non-auth entries too).\n  \
+         Inspect .bad_tokens or run `loom-daemon tokens bootstrap --force`.",
         all_tokens.len(),
-        tokens_dir.display()
+        tokens_dir.display(),
+        deciding_binary_identity(),
+        exhaustion_cooldown_secs(),
     )))
 }
 
@@ -640,6 +715,92 @@ mod tests {
         let mut rng = Rng::seeded(1);
         let err = select_token(tmp.path(), Some(&mut rng)).unwrap_err();
         assert!(err.0.contains("marked bad"));
+    }
+
+    // ---- empty-pool error detail (issue #4643) ------------------------
+
+    #[test]
+    fn format_secs_renders_compact_durations() {
+        assert_eq!(format_secs(5 * 3600 + 48 * 60), "5h48m");
+        assert_eq!(format_secs(48 * 60 + 12), "48m12s");
+        assert_eq!(format_secs(12), "12s");
+        assert_eq!(format_secs(-5), "0s");
+    }
+
+    /// #4643: the empty-pool error names every excluded account, its exclusion
+    /// cause, the reason class (auth = permanent vs exhaustion = TTL), the
+    /// entry's own timestamp, the cooldown remaining, and the deciding binary.
+    #[test]
+    fn empty_pool_error_enumerates_per_token_exclusion_detail() {
+        let tmp = make_pool(&["exh", "auth"]);
+        let ts = (chrono::Utc::now() - chrono::Duration::seconds(3600))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        fs::write(
+            pool_dir(tmp.path()).join(".bad_tokens"),
+            format!(
+                "{ts} exh exhausted: hit your session limit\n\
+                 {ts} auth 401 unauthorized\n"
+            ),
+        )
+        .unwrap();
+
+        let mut rng = Rng::seeded(1);
+        let err = select_token(tmp.path(), Some(&mut rng)).unwrap_err();
+        let text = err.0;
+
+        // Per-token lines, with class + permanence + timestamp + reason.
+        assert!(text.contains("exh: bad-marked [exhaustion, TTL]"), "{text}");
+        assert!(text.contains("auth: bad-marked [auth, permanent]"), "{text}");
+        assert!(text.contains(&ts), "{text}");
+        assert!(text.contains("exhausted: hit your session limit"), "{text}");
+        assert!(text.contains("401 unauthorized"), "{text}");
+        // Cooldown remaining for the TTL entry (~5h of the 6h default left),
+        // and the operator action for the permanent one.
+        assert!(text.contains("clears in 4h") || text.contains("clears in 5h"), "{text}");
+        assert!(text.contains("needs `loom-daemon tokens unblock auth`"), "{text}");
+        // Deciding binary + the cooldown knob.
+        assert!(text.contains("deciding binary: loom-daemon "), "{text}");
+        assert!(text.contains(crate::self_update::BUILT_COMMIT), "{text}");
+        assert!(text.contains(EXHAUSTION_COOLDOWN_ENV), "{text}");
+    }
+
+    /// #4643: a token whose file is present but empty is reported as such,
+    /// not lumped in with the bad-marked ones.
+    #[test]
+    #[serial]
+    fn empty_pool_error_distinguishes_empty_token_files() {
+        let tmp = make_pool(&["blank"]);
+        fs::write(pool_dir(tmp.path()).join("blank.token"), "   \n").unwrap();
+        std::env::set_var(super::super::paths::SHARED_TOKENS_DIR_ENV, "");
+        let mut rng = Rng::seeded(1);
+        let err = select_token(tmp.path(), Some(&mut rng)).unwrap_err();
+        std::env::remove_var(super::super::paths::SHARED_TOKENS_DIR_ENV);
+        assert!(err.0.contains("blank: empty .token file"), "{}", err.0);
+    }
+
+    /// #4643: a malformed `.bad_tokens` timestamp shows up as fail-closed
+    /// permanent in the detail rather than as a TTL entry with a bogus clock.
+    #[test]
+    fn empty_pool_error_shows_malformed_entry_as_permanent() {
+        let tmp = make_pool(&["a"]);
+        fs::write(pool_dir(tmp.path()).join(".bad_tokens"), "garbage a exhausted\n").unwrap();
+        let mut rng = Rng::seeded(1);
+        let err = select_token(tmp.path(), Some(&mut rng)).unwrap_err();
+        assert!(
+            err.0
+                .contains("a: bad-marked [malformed-timestamp, permanent (fail-closed)]"),
+            "{}",
+            err.0
+        );
+    }
+
+    #[test]
+    fn deciding_binary_identity_names_version_and_commit() {
+        let id = deciding_binary_identity();
+        assert!(id.starts_with("loom-daemon "), "{id}");
+        assert!(id.contains(env!("CARGO_PKG_VERSION")), "{id}");
+        assert!(id.contains(crate::self_update::BUILT_COMMIT), "{id}");
     }
 
     #[test]

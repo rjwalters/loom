@@ -351,6 +351,11 @@ newlines/carriage-returns are sanitized to spaces so every `.bad_tokens` record
 is exactly one line — byte-compatible with the Python implementation, and
 conformance-tested against it in `loom-tools/tests/tokens/test_rust_conformance.py`.
 
+How long an entry keeps blocking (auth = permanent, exhaustion = 6h TTL) and how
+long it survives on disk (24h / 30d) are two different clocks — see
+[Permanence: auth vs exhaustion](#permanence-auth-vs-exhaustion-at-read-time-and-on-disk)
+below.
+
 ## Error classification (`.loom/scripts/lib/classify-error.sh`)
 
 The `classify_error <output> <exit_code>` function returns one of `SUCCESS`,
@@ -466,6 +471,53 @@ tokens (absent, empty, or all bad). It does **not** silently fall back to
 keychain — that path belongs in `loom-daemon` (#3236), and only when token
 rotation has not been configured at all.
 
+The `loom-daemon` role runner (`autonomous.roleRunner`, see
+[daemon-reference.md](daemon-reference.md)) pre-checks
+[`tokens::token_pool_size`](../../loom-daemon/src/tokens.rs) for exactly this
+condition **before** it ever spawns `spawn-claude.sh` (issue #4642): a repo
+with neither pool provisioned skips the doomed spawn entirely instead of
+hitting this hard-fail on every single tick forever. The skip is logged once
+(`WARN`) per root per role, then downgraded to `DEBUG` on repeats — grep a
+role's log for `no token pool available` — and is re-checked every tick, so
+provisioning either pool later resumes ticking with no daemon restart needed.
+
+## Per-repo pool vs. shared machine-level pool: which to provision (#4642)
+
+A newly-managed repo (added via `loom-daemon workspace add`, or picked up by
+the multi-workspace role runner / work finder) starts with **neither** pool
+provisioned, and stays that way until an operator deliberately runs one of the
+two bootstrap commands below — this is an operator/billing decision, not
+something Loom auto-applies, because it changes **whose usage counts against
+which weekly ceiling**:
+
+- **Per-repo pool** (`loom-daemon tokens bootstrap` from inside the repo,
+  populating `<repo>/.loom/tokens/`): this repo's sweeps and role ticks draw
+  from accounts dedicated to it alone. Usage against each account's weekly
+  limit is isolated to this one repo — the right choice when a repo has its
+  own budget/accounts, or when you want one repo's activity to never compete
+  with another's for the same account's rotation slot.
+- **Shared machine-level pool** (`loom-daemon tokens bootstrap --shared`,
+  populating `~/.loom/tokens/` or the `LOOM_SHARED_TOKENS_DIR` override,
+  resolved by [step 3 of the fallback chain](#shared-machine-level-pool-fallback-3938)
+  above): every repo on the host that has **no per-repo pool of its own**
+  falls back to this one pool and shares its accounts. This is convenient for
+  low-traffic repos (e.g. the canary chip repos that motivated #4642 — several
+  small repos, none busy enough on its own to justify dedicated accounts) but
+  means **every one of those repos' sweeps and role ticks now compete for the
+  same weekly ceiling** — a burst of activity in one consumer repo can exhaust
+  accounts another consumer repo also depends on. A repo with a per-repo pool
+  is never affected by this (the per-repo pool always wins when it holds
+  tokens, `token_pool_size_resolved`'s precedence).
+
+**Rule of thumb**: provision a per-repo pool for any repo whose activity level
+or billing owner is distinct enough to want isolated usage accounting; use the
+shared pool for a cluster of low-traffic repos willing to accept a shared
+ceiling in exchange for zero per-repo token administration. Both can coexist
+on one host — the fallback chain is per-repo-first, so adding a per-repo pool
+to a repo previously riding the shared pool is a strictly additive, safe
+change (it simply stops that one repo from drawing on the shared ceiling, with
+no reconfiguration needed on the shared side).
+
 ## Operator CLI (`loom-daemon tokens pin/unpin/unblock`)
 
 Operators can restrict the rotation pool to a subset of accounts (an "allowlist")
@@ -496,16 +548,75 @@ let an operator dispatch onto a still-poisoned pool), `unblock` now **names the
 still-blocked accounts and exits `3`**. Re-run with `--all-reasons` to drop them,
 or wait for the cooldown to expire them automatically.
 
-**Reason-aware bad-token TTL**: bad-tokens entries whose reason is `auth` (401 /
-OAuth / expired / blocked) persist until `loom-daemon tokens unblock`. Non-auth
-("exhausted"/"rate-limited") entries stop blocking selection once they age past
-the exhaustion cooldown (`LOOM_TOKEN_EXHAUSTION_COOLDOWN_SECS`, default 21600s =
-6h) — enforced at selection time in **both** the Rust daemon and the live Python
-spawn path (`is_bad`), so a recovered account re-enters the pool with no operator
-action even before `cleanup_bad_tokens` prunes the line from disk. Before #4212
-only the Rust path honored the cooldown, so on the live Python spawn path a stale
-`exhausted` marker outlived its rate-limit reset and wedged the account until a
-manual `unblock`.
+### Permanence: auth vs exhaustion, at read time and on disk
+
+There are **two independent clocks**, and conflating them is what made the
+2026-07-30 incident (#4643) hard to read. The table is the contract the error
+text, the CLI, and this document all agree on:
+
+| Reason class | Blocks selection until | Pruned from `.bad_tokens` after |
+|---|---|---|
+| `auth` (401 / OAuth / expired / blocked) | `loom-daemon tokens unblock <name>` — **never expires** | 30d (`AUTH_ENTRY_MIN_RETENTION_SECS`), a garbage-collection floor, *not* an expiry |
+| non-auth (`exhausted` / `rate-limited`) | the **exhaustion cooldown** — `LOOM_TOKEN_EXHAUSTION_COOLDOWN_SECS`, default `21600` (6h) | 24h (`DEFAULT_CLEANUP_MAX_AGE_SECS`) |
+| unparseable timestamp | never (**fail-closed** — a malformed line never silently un-blocks a token) | never (malformed lines are always retained) |
+
+**Read time** (`bad_tokens::is_bad` / `blocking_entry`, enforced by the selector
+on every tier): a non-auth entry stops blocking once it ages past the cooldown,
+so a recovered account re-enters rotation with **no operator action** even
+before the line is pruned from disk (#4122). Auth entries are exempt from that
+TTL by design — a broken credential does not heal on a timer.
+
+**On disk** (`bad_tokens::cleanup_bad_tokens`, wired in #4643 into `tokens
+select` and `tokens check`): entries older than the max-age policy above are
+dropped. The auth floor is deliberately far longer than the routine 24h policy,
+because pruning an auth line *would* silently readmit a broken credential —
+the on-disk clock must never become a back-door expiry for the permanent class.
+Cleanup is best-effort and takes **no lock at all** when nothing is prunable, so
+a burst of concurrent spawns never serializes on `.bad_tokens`. Before #4643
+`cleanup_bad_tokens` had zero callers anywhere in the tree and pools accumulated
+entries indefinitely.
+
+**The oldest visible entry is usually not the deciding one.** Every failed spawn
+appends a *new* line, so an account with a genuinely long-lived limit (e.g.
+`hit your weekly limit`, which outlasts the 6h cooldown by days) is
+continuously re-marked: the 13h-old lines at the top of the file expired long
+ago, while a fresh line further down is what actually blocks. `blocking_entry`
+reports the deciding line, and the empty-pool error prints its timestamp — read
+that, not the head of the file.
+
+### Empty-pool error detail (#4643)
+
+When every account is excluded, `tokens select` no longer prints a bare "All N
+tokens … are marked bad or empty". It enumerates, per account, the exclusion
+cause, the reason class and its permanence, the deciding entry's own timestamp,
+and the cooldown remaining — plus the **identity of the binary that decided**
+(version, build commit, build timestamp):
+
+```
+error: All 2 tokens in ~/.loom/tokens are marked bad or empty.
+  - agent-1: bad-marked [exhaustion, TTL] at 2026-07-30T16:58:32Z — "exhausted: hit your weekly limit"; clears in 5h48m
+  - agent-2: bad-marked [auth, permanent] at 2026-07-29T21:33:41Z — "401 unauthorized"; needs `loom-daemon tokens unblock agent-2`
+  deciding binary: loom-daemon 0.16.0 (commit 105f9c12, built 2026-07-30T05:23:19Z)
+  exhaustion cooldown: 21600s (override LOOM_TOKEN_EXHAUSTION_COOLDOWN_SECS); auth entries never expire …
+```
+
+`spawn-claude.sh` additionally logs the resolved daemon binary path and its
+`--version` at token-selection time, on every spawn:
+
+```
+spawn-claude: token-selection binary: /home/you/.local/bin/loom-daemon (loom-daemon 0.16.0 (commit 105f9c12, built 2026-07-30T05:23:19Z))
+```
+
+Both exist because the selection binary is resolved by `spawn-claude.sh` itself
+(`$LOOM_DAEMON_BIN` → PATH → build-output candidates), **independently of any
+running daemon** — so a long-running daemon can hand a sweep child a binary that
+predates the last merged selection fix. That "stale binary at the selection
+site" hypothesis is now answerable straight from `.loom/logs/sweep-issue-<N>.log`
+instead of by reading Rust source. (For the 2026-07-30 incident itself the
+hypothesis was **refuted** — the host's resolvable binaries were all descendants
+of the cooldown fix — but confirming that required inspecting the host's
+installed binaries after the fact, which is exactly the forensics this log line
+removes.)
 
 **Auto-unpin** (`failure_counts`): the wrapper tracks consecutive
 `TOKEN_EXHAUSTED` failures per account in `.loom/tokens/.failure_counts` (JSON).

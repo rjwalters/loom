@@ -26,6 +26,13 @@
 #   (q) invoked from a linked worktree -> non-zero exit, NOTHING written to main
 #   (r) --allow-worktree / LOOM_RESYNC_ALLOW_WORKTREE=1 -> permitted (warns)
 #   (s) main checkout (incl. a subdirectory of it)      -> unaffected, exit 0
+# Self-update safety (#4669):
+#   (t) the REAL script, installed as a padded "older" copy, resyncs itself from
+#       a substantially different newer source -> run completes, no mid-run
+#       syntax error, self-copy applied LAST, other surfaces fully refreshed
+#   (u) an updated file gets a new inode (staged + renamed, not truncated) with
+#       its permissions preserved, and leaves no .resync-stage.* dirt
+#   (v) an unsyncable file -> explicit PARTIAL REFRESH report + exit 1
 # Plus contract checks:
 #   - --help prints usage (documenting --allow-worktree), exit 0
 #   - unknown arg exits 1
@@ -791,6 +798,161 @@ if [[ "$(cat "$REPO/.loom/hooks/guard.sh")" == "A" ]]; then
     pass "(#4563) run from a main-checkout subdirectory still applies the resync"
 else
     fail "(#4563) run from a main-checkout subdirectory did not apply the resync"
+fi
+
+# --- (#4669) the resync must survive updating the script it is running -------
+#
+# resync-installed.sh is itself a file under defaults/scripts/, so every run
+# copies a newer version over the very path the running bash process is still
+# reading from. The old in-place `cp` truncated and rewrote that file, letting
+# bash resume reading the (shorter) new file at a stale byte offset -> `syntax
+# error near unexpected token`, aborting the run with dozens of surfaces
+# already partially refreshed.
+#
+# This drives the REAL script as the installed/running copy, padded so it
+# differs substantially in both content and byte offsets from the newer source
+# that replaces it mid-run — the exact reported scenario.
+echo "Test group 18: self-update is atomic + deferred; the run completes (#4669)"
+
+# Builds $1/.loom/scripts/resync-installed.sh as a padded "older" variant of the
+# real script, with the real script as the defaults/ source it will sync from.
+make_self_update_fixture() {
+    local repo="$1"
+    mkdir -p "$repo/defaults/scripts" "$repo/.loom/scripts"
+    cp "$SCRIPT" "$repo/defaults/scripts/resync-installed.sh"
+    chmod +x "$repo/defaults/scripts/resync-installed.sh"
+    {
+        head -n 1 "$SCRIPT"
+        awk 'BEGIN { for (i = 0; i < 6000; i++) print "# old-installed-version padding line " i }'
+        tail -n +2 "$SCRIPT"
+    } > "$repo/.loom/scripts/resync-installed.sh"
+    chmod +x "$repo/.loom/scripts/resync-installed.sh"
+}
+
+REPO="$(make_fixture)"
+make_self_update_fixture "$REPO"
+INSTALLED_RESYNC="$REPO/.loom/scripts/resync-installed.sh"
+RC=0; OUT="$(cd "$REPO" && bash "$INSTALLED_RESYNC" 2>&1)" || RC=$?
+if [[ $RC -eq 0 ]]; then
+    pass "(#4669) a self-updating run completes cleanly (exit 0)"
+else
+    fail "(#4669) a self-updating run did not exit 0 (got $RC)"
+fi
+if grep -qiE "syntax error|unexpected token|unexpected end of file" <<<"$OUT"; then
+    fail "(#4669) the running script observed a half-written copy of itself: $(grep -iE "syntax error|unexpected token|unexpected end of file" <<<"$OUT" | head -1)"
+else
+    pass "(#4669) no mid-run syntax error from the rewritten script"
+fi
+if cmp -s "$REPO/defaults/scripts/resync-installed.sh" "$INSTALLED_RESYNC"; then
+    pass "(#4669) the installed resync script was updated to match defaults/"
+else
+    fail "(#4669) the installed resync script was not updated"
+fi
+if [[ -x "$INSTALLED_RESYNC" ]] && bash -n "$INSTALLED_RESYNC" 2>/dev/null; then
+    pass "(#4669) the updated installed script is executable and syntactically whole"
+else
+    fail "(#4669) the updated installed script is not executable/parseable"
+fi
+# The self-update must not cost the rest of the refresh (the reported failure
+# left unrelated surfaces half-refreshed).
+if [[ "$(cat "$REPO/.loom/hooks/guard.sh")" == "A" && -f "$REPO/.loom/scripts/lib/bar.sh" && \
+      "$(cat "$REPO/.loom/roles/builder.md")" == "ROLE-NEW" && \
+      "$(cat "$REPO/.claude/commands/loom/builder.md")" == "CMD-NEW" ]]; then
+    pass "(#4669) every other surface was still fully refreshed in the same run"
+else
+    fail "(#4669) the self-updating run left other surfaces unrefreshed"
+fi
+# Deferral: the self-copy is applied only after every other surface settled.
+SELF_LINE="$(grep -n "scripts/resync-installed.sh" <<<"$OUT" | tail -1 | cut -d: -f1)"
+OTHER_LINE="$(grep -n "commands/loom/builder.md" <<<"$OUT" | tail -1 | cut -d: -f1)"
+if [[ -n "$SELF_LINE" && -n "$OTHER_LINE" && "$SELF_LINE" -gt "$OTHER_LINE" ]]; then
+    pass "(#4669) the self-copy is applied last, after the other surfaces"
+else
+    fail "(#4669) the self-copy was not deferred to the end (self=$SELF_LINE other=$OTHER_LINE)"
+fi
+# Rerunning the freshly-updated installed copy is a clean no-op.
+RC=0; OUT="$(cd "$REPO" && bash "$INSTALLED_RESYNC" 2>&1)" || RC=$?
+if [[ $RC -eq 0 ]] && grep -q "Already in sync" <<<"$OUT"; then
+    pass "(#4669) rerunning the updated installed copy is idempotent (already in sync)"
+else
+    fail "(#4669) rerunning the updated installed copy was not a clean no-op (rc=$RC)"
+fi
+# --dry-run must still preview the self-update without writing it.
+REPO="$(make_fixture)"
+make_self_update_fixture "$REPO"
+INSTALLED_RESYNC="$REPO/.loom/scripts/resync-installed.sh"
+cp "$INSTALLED_RESYNC" "$WORKDIR/self-before-dry-run"
+RC=0; OUT="$(cd "$REPO" && bash "$INSTALLED_RESYNC" --dry-run 2>&1)" || RC=$?
+if [[ $RC -eq 2 ]] && grep -q "scripts/resync-installed.sh" <<<"$OUT"; then
+    pass "(#4669) --dry-run previews the self-update (exit 2)"
+else
+    fail "(#4669) --dry-run did not preview the self-update (rc=$RC)"
+fi
+if cmp -s "$WORKDIR/self-before-dry-run" "$INSTALLED_RESYNC"; then
+    pass "(#4669) --dry-run left the running script byte-identical"
+else
+    fail "(#4669) --dry-run modified the running script"
+fi
+
+# --- (#4669) writes are staged + renamed, never done in place ----------------
+echo "Test group 19: installed files are replaced by atomic rename (#4669)"
+REPO="$(make_fixture)"
+INODE_BEFORE="$(ls -i "$REPO/.loom/hooks/guard.sh" | awk '{print $1}')"
+MODE_BEFORE="$(ls -l "$REPO/.loom/docs/troubleshooting.md" | awk '{print $1}')"
+(cd "$REPO" && bash "$SCRIPT" >/dev/null 2>&1)
+INODE_AFTER="$(ls -i "$REPO/.loom/hooks/guard.sh" | awk '{print $1}')"
+MODE_AFTER="$(ls -l "$REPO/.loom/docs/troubleshooting.md" | awk '{print $1}')"
+if [[ -n "$INODE_BEFORE" && "$INODE_BEFORE" != "$INODE_AFTER" ]]; then
+    pass "(#4669) an updated file gets a NEW inode (renamed into place, not truncated)"
+else
+    fail "(#4669) the updated file kept its inode (still rewritten in place)"
+fi
+if [[ "$MODE_BEFORE" == "$MODE_AFTER" ]]; then
+    pass "(#4669) the rename preserves the destination's permissions (not mktemp's 0600)"
+else
+    fail "(#4669) permissions changed across the rename ($MODE_BEFORE -> $MODE_AFTER)"
+fi
+STRAY_STAGE="$(find "$REPO" -name '.resync-stage.*' 2>/dev/null | wc -l | tr -d '[:space:]')"
+if [[ "$STRAY_STAGE" == "0" ]]; then
+    pass "(#4669) no staging temp files are left behind"
+else
+    fail "(#4669) $STRAY_STAGE staging temp file(s) left behind"
+fi
+
+# --- (#4669) a failed file is reported as a PARTIAL refresh, never swallowed --
+echo "Test group 20: an unsyncable file reports a PARTIAL refresh and exits 1 (#4669)"
+if [[ "$(id -u)" -eq 0 ]]; then
+    skip "(#4669) running as root — an unwritable destination cannot be simulated"
+else
+    REPO="$(make_fixture)"
+    chmod 500 "$REPO/.loom/scripts/lib"      # scripts/lib/bar.sh cannot be staged here
+    RC=0; OUT="$(cd "$REPO" && bash "$SCRIPT" 2>&1)" || RC=$?
+    chmod 700 "$REPO/.loom/scripts/lib"
+    if [[ $RC -eq 1 ]]; then
+        pass "(#4669) an unsyncable file exits 1"
+    else
+        fail "(#4669) an unsyncable file did not exit 1 (got $RC)"
+    fi
+    if grep -q "PARTIAL REFRESH" <<<"$OUT" && grep -q "scripts/lib/bar.sh" <<<"$OUT"; then
+        pass "(#4669) the summary names the partial state and the failed path"
+    else
+        fail "(#4669) the summary did not report the partial state / failed path"
+    fi
+    if grep -qi "re-running completes the refresh\|fixing the cause" <<<"$OUT"; then
+        pass "(#4669) the summary states the recovery action"
+    else
+        fail "(#4669) the summary does not state a recovery action"
+    fi
+    if [[ "$(cat "$REPO/.loom/hooks/guard.sh")" == "A" ]]; then
+        pass "(#4669) unrelated surfaces are still refreshed despite the failure"
+    else
+        fail "(#4669) the failure aborted the rest of the refresh"
+    fi
+    if grep -q "Already in sync\|file(s) updated," <<<"$OUT"; then
+        fail "(#4669) a partial refresh still printed a success summary"
+    else
+        pass "(#4669) no success summary is printed for a partial refresh"
+    fi
 fi
 
 # --- contract checks ---------------------------------------------------------
