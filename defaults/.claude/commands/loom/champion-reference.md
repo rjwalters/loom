@@ -108,6 +108,39 @@ fi
 
 ---
 
+### Edge Case 5b: Doctor-Cycle-Capped PR (`loom:blocked` + `loom:changes-requested`)
+
+**Scenario**: A PR exhausted `sweep.max_doctor_cycles` and `/loom:sweep` parked it with **both** `loom:blocked` and `loom:changes-requested`. Nothing else in the pipeline reconsiders that state — the work-finder skips blocked items and Mode C pre-flight skips blocked PRs — so it is terminal for automation until Champion looks at it (#4574).
+
+**Handling**:
+```bash
+# Parked set (gh ANDs repeated --label values). Skip any that also carry
+# loom:operator-only — already routed to a human.
+gh pr list --label "loom:blocked" --label "loom:changes-requested" --state open \
+  --json number,title,labels --jq '.[] | "#\(.number) \(.title)"'
+
+# Decide from the FULL history, not the last comment alone.
+gh pr view "$PR_NUMBER" --comments
+```
+
+**Decision**: **Three-way, on the forward-progress test** — never a default grant.
+
+| Finding in the rejection history | Decision | Action |
+|----------------------------------|----------|--------|
+| Latest rejection names defects demonstrably **distinct** from the prior one (prior fix landed, new defects only reachable because of it), fixable in one bounded cycle, chain still converging | **Grant one more Doctor cycle** | Comment with `<!-- champion:capped-pr-grant -->` naming both rejections and the distinction, then remove **`loom:blocked` only** (leave `loom:changes-requested` — it is what routes the PR to Doctor) |
+| Same defect **re-litigated**, comparison **ambiguous**, only one rejection exists, or the chain is no longer converging | **Keep parked** | Comment the *specific* human judgment needed, guarded by a `<!-- champion:capped-pr-parked:<latest-rejection-comment-id> -->` marker so the 10-minute cron does not re-post per tick; change no labels |
+| The **approach** (not the implementation) is the problem — repeated design rejections, superseded premise | **Recommend closing, route to the operator** | Comment with `<!-- champion:capped-pr-close-recommended -->` and add `loom:operator-only` (keeping `loom:blocked`); **do not close the PR** — Champion routes, the human decides |
+
+**Rationale**: This is the *same* forward-progress mechanism as the sweep's in-sweep distinct-defect grace cycle (`sweep.md` → "Doctor-cycle cap"), applied at a different decision point — periodically, post-mortem, with the complete history rather than the dying sweep's local context. There is **no hard grant cap**: repeat grants are allowed as long as each new rejection shows fresh progress, because the anti-thrash guarantee comes from re-applying the test every round, not from a counter. Nor is there a double-grant path: a PR only reaches `loom:blocked` after the sweep-side single-use exception was consumed or was not applicable.
+
+**Entry guards**: the label pair alone is not proof of a cap block. Skip PRs also carrying `loom:operator-only`, keep parked any PR whose history shows no cap block (fewer than two Judge rejections, no `doctor cycle exhausted` line), and never grant over an explicit human hold (`hold until` / `wait until` / `defer` / `not before` / `do not start` phrasing — the sweep's explicit-hold convention).
+
+**Human vs. parked**: `loom:operator-only` means *the approach needs a human ruling and automation should stop touching this PR*; plain `loom:blocked` + a keep-parked comment means *a human should look, but a future rejection could still change the answer* — Champion re-evaluates that PR when a new Judge rejection lands.
+
+**Action** (single authoritative policy — implemented in `champion-pr-merge.md` → "Capped-PR Recovery Pass"): see that section for the exact commands, the full grant/never-grant criteria, and the rationale comment templates.
+
+---
+
 ### Edge Case 6: PR Modifying Only Test Files
 
 **Scenario**: PR changes only test files (e.g., `*.test.ts`, `*.spec.rs`).
@@ -299,6 +332,7 @@ gh issue create --title "Follow-on: Work identified in PR #$PR_NUMBER" --label "
 | Force-push after approval | Allow | If criteria still pass |
 | Merge conflicts | Fail | Comment and skip |
 | Stale PR (>24h) | Route to Doctor | Comment once (idempotent marker), swap `loom:pr` → `loom:changes-requested` |
+| Doctor-cycle-capped PR (`loom:blocked` + `loom:changes-requested`) | Three-way on forward progress | Distinct new defects → grant a cycle (remove `loom:blocked` only); same-defect/ambiguous → keep parked with rationale; approach not viable → add `loom:operator-only`, recommend closing (never close it) |
 | Test-only changes | Allow | Standard criteria apply |
 | Human holds PR (removes `loom:pr`) | Skip | Not a merge candidate without `loom:pr` |
 | Multiple linked issues | Allow | Verify all closed |
