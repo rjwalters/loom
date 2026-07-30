@@ -3880,6 +3880,86 @@ throwaway issue from `loom:triage` → Curator → `loom:issue` → work-finder
 dispatch → PR → merge, with a scripted label-transition assertion, and confirms
 the operator only ever created the issue.
 
+## Fleet dashboard (`loom-daemon serve`)
+
+`loom-daemon serve` (#4329 phases 1-3: #4391 status snapshot, #4392 SSE event
+tail, #4393 page rendering) starts a **separate, opt-in** read-only HTTP
+listener that proxies the running daemon's existing Unix socket for
+browser-based fleet visibility. It is not part of the normal daemon-run path —
+a daemon started without `serve` never opens this port, and `serve` itself
+never mutates daemon state or the sweep registry; every request re-fetches a
+live snapshot over IPC.
+
+### Starting it
+
+```bash
+loom-daemon serve                                   # http://127.0.0.1:7420/
+loom-daemon serve --port 9000                        # non-default port, still loopback-only
+loom-daemon serve --peers http://host2:7420,http://host3:7420   # multihost fleet view
+```
+
+| Flag | Default | Purpose |
+|------|---------|---------|
+| `--port` | `7420` | TCP port for the HTTP listener |
+| `--bind` | `127.0.0.1` | Interface address to bind |
+| `--allow-non-loopback` | off | Required opt-in to bind any non-loopback `--bind` address |
+| `--peers` | `""` (empty) | Comma-separated peer `serve` base URLs, served verbatim at `GET /api/peers` for client-side fan-out |
+
+### Security posture (localhost-only invariant)
+
+- **Off by default**: nothing listens on any port unless `loom-daemon serve`
+  is explicitly invoked — a plain `loom-daemon` run (autonomous or not) never
+  opens this listener.
+- **Binds `127.0.0.1` by default.** A wildcard/unspecified bind (`0.0.0.0` /
+  `::`) is refused **unconditionally**, even with `--allow-non-loopback` —
+  this endpoint can never become reachable from the public internet, only
+  from an explicit interface address.
+- A non-loopback `--bind` (e.g. a tailnet interface address, for cross-host
+  fleet visibility) requires the *separate* explicit `--allow-non-loopback`
+  flag — the bind address alone is never enough to opt in.
+- **Read-only, stateless, no steering endpoints.** Every route is a bare
+  `GET`; any other method gets `405`. The SSE bridge only ever sends the
+  IPC `SubscribeEvents` request — it never publishes an event and never
+  writes to the daemon socket beyond that one subscribe call, so nothing
+  this listener originates can appear on the bus. Nothing is written to
+  disk. There is no dispatch/cancel/restart/steering route of any kind.
+- Every response carries a permissive `Access-Control-Allow-Origin: *`
+  header (required for the dashboard's client-side peer fan-out); this is
+  judged safe specifically because the surface is read-only, carries no
+  credentials, and is loopback-by-default — the bind posture is the
+  access-control layer, not CORS.
+
+### What it serves
+
+| Route | Content |
+|-------|---------|
+| `GET /` | The embedded single-page dashboard (plain HTML/CSS/vanilla JS, no build toolchain, compiled into the binary) |
+| `GET /api/status` | JSON status snapshot: the same `DaemonStatusReport` `loom-daemon status --json` aggregates, flattened with a `hostname` field |
+| `GET /api/events` | `text/event-stream` (SSE) tail of the daemon's event bus |
+| `GET /api/pipeline` | Forge-side queue counts per managed repo (same source `status --pipeline` uses), fronted by a 20s in-process cache |
+| `GET /api/tokens` | Per-account rows (name / status / 5h utilization) read from the resolved token pool's `.ranking` file |
+| `GET /api/peers` | The configured `--peers` list, verbatim — this daemon never fetches a peer itself; the browser fetches each peer's own `/api/status`/`/api/events` directly |
+
+The dashboard page renders: the in-flight sweep registry, the dynamic
+concurrency cap/capacity breakdown, per-token usage bars, the per-repo
+main-health gate state, per-repo pipeline queue counts, configured fleet
+peers, and a live event tail — each panel backed by one of the routes above.
+
+### Event tail topics
+
+`GET /api/events` subscribes to the six frozen `sweep.*` topics from the
+[event taxonomy](#event-taxonomy-frozen-for-v0100) above — `sweep.issue.{N}.phase`,
+`.blocker`, `.exited`, `.crashed`, `sweep.global.dispatch`, and
+`sweep.global.completed` — through the exact same `SubscribeEvents` IPC
+request and `event_bus::topic_matches` prefix filter every other subscriber
+uses. It additionally includes the already-authorized `epic.issue.*`,
+`daemon.capacity.advisory`, `daemon.drain.*`, and
+`daemon.dispatch.headroom_advisory` topics, clearly separable from the
+frozen six because every SSE frame carries its exact source topic in the
+JSON payload (never renamed or re-namespaced). There is no replay buffer:
+a reconnecting client (`EventSource`'s built-in retry) resumes from live,
+never from history.
+
 ## Locks and lifecycle
 
 Each dispatched sweep acquires a directory lock under
