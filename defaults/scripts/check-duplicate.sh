@@ -299,10 +299,39 @@ is_rate_limit_error() {
     return 1
 }
 
-# Resolve "owner/repo" via REST, for the REST fallback paths below. Mirrors
-# the resolution already used by search_cross_references() (#4162).
+# Resolve "owner/repo" from the local git remote, for the small number of
+# call sites (search_cross_references() below) that need the literal string
+# rather than just an API endpoint to hit. Deliberately NOT `gh repo view`
+# (#4659): that call is itself GraphQL-backed, so under GraphQL exhaustion it
+# fails before any REST fallback is even attempted -- the exact bug this
+# helper exists to avoid reintroducing. `git remote get-url origin` is a pure
+# local read (no network round-trip at all), so it survives total GraphQL AND
+# REST outages alike.
+#
+# The three REST-fallback call sites in search_similar_issues() /
+# search_merged_prs() / search_closed_issues() do NOT call this helper --
+# they hit `gh api "repos/{owner}/{repo}/..."` directly, letting `gh` resolve
+# the `{owner}/{repo}` placeholder locally from the same git remote with zero
+# API calls of its own (#4659).
 get_repo_nwo() {
-    gh repo view --json nameWithOwner --jq '.nameWithOwner'
+    local url
+    if ! url=$(git remote get-url origin 2>&1); then
+        echo "$url" >&2
+        return 1
+    fi
+    # Strip a trailing ".git" and/or "/", then take the final two "/"- or
+    # ":"-delimited path segments -- "owner/repo" -- which works for both the
+    # SSH ("git@host:owner/repo.git") and HTTPS ("https://host/owner/repo")
+    # remote URL forms.
+    url="${url%.git}"
+    url="${url%/}"
+    local nwo
+    nwo=$(printf '%s' "$url" | grep -oE '[^/:]+/[^/]+$') || true
+    if [[ -z "$nwo" ]]; then
+        echo "could not parse owner/repo from remote URL: $url" >&2
+        return 1
+    fi
+    echo "$nwo"
 }
 
 # Search for similar issues
@@ -326,14 +355,18 @@ search_similar_issues() {
     local rest_fallback=false
     if ! issues=$($FORGE issue list --state=open --limit=50 --json number,title,body 2>&1); then
         if is_rate_limit_error "$issues"; then
-            local repo_nwo rest_issues
-            if repo_nwo=$(get_repo_nwo 2>&1) && \
-               rest_issues=$(gh api "repos/${repo_nwo}/issues?state=open&per_page=50" 2>&1); then
+            # `gh api` resolves the "{owner}/{repo}" placeholder locally from
+            # the git remote -- no GraphQL (or any) API call, unlike the
+            # get_repo_nwo()-via-`gh repo view` round-trip this used to make
+            # (#4659), which itself failed under GraphQL exhaustion before
+            # REST was ever attempted.
+            local rest_issues
+            if rest_issues=$(gh api "repos/{owner}/{repo}/issues?state=open&per_page=50" 2>&1); then
                 # REST's /issues endpoint also returns PRs; exclude them.
                 issues=$(echo "$rest_issues" | jq -c '[.[] | select(.pull_request == null)]')
                 rest_fallback=true
             else
-                print_error "GraphQL rate-limited fetching open issues, and REST fallback also failed: ${rest_issues:-$repo_nwo}"
+                print_error "GraphQL rate-limited fetching open issues, and REST fallback also failed: ${rest_issues}"
                 return 2
             fi
         else
@@ -418,13 +451,14 @@ search_merged_prs() {
     local rest_fallback=false
     if ! prs=$($FORGE pr list --state=merged --limit=20 --json number,title,body 2>&1); then
         if is_rate_limit_error "$prs"; then
-            local repo_nwo rest_prs
-            if repo_nwo=$(get_repo_nwo 2>&1) && \
-               rest_prs=$(gh api "repos/${repo_nwo}/pulls?state=closed&per_page=20" 2>&1); then
+            # See the matching comment in search_similar_issues(): `gh api`
+            # resolves "{owner}/{repo}" locally, no GraphQL call (#4659).
+            local rest_prs
+            if rest_prs=$(gh api "repos/{owner}/{repo}/pulls?state=closed&per_page=20" 2>&1); then
                 prs=$(echo "$rest_prs" | jq -c '[.[] | select(.merged_at != null)]')
                 rest_fallback=true
             else
-                print_error "GraphQL rate-limited fetching merged PRs, and REST fallback also failed: ${rest_prs:-$repo_nwo}"
+                print_error "GraphQL rate-limited fetching merged PRs, and REST fallback also failed: ${rest_prs}"
                 return 2
             fi
         else
@@ -501,14 +535,15 @@ search_closed_issues() {
     local rest_fallback=false
     if ! issues=$($FORGE issue list --state=closed --limit=20 --json number,title,body 2>&1); then
         if is_rate_limit_error "$issues"; then
-            local repo_nwo rest_issues
-            if repo_nwo=$(get_repo_nwo 2>&1) && \
-               rest_issues=$(gh api "repos/${repo_nwo}/issues?state=closed&per_page=20" 2>&1); then
+            # See the matching comment in search_similar_issues(): `gh api`
+            # resolves "{owner}/{repo}" locally, no GraphQL call (#4659).
+            local rest_issues
+            if rest_issues=$(gh api "repos/{owner}/{repo}/issues?state=closed&per_page=20" 2>&1); then
                 # REST's /issues endpoint also returns PRs; exclude them.
                 issues=$(echo "$rest_issues" | jq -c '[.[] | select(.pull_request == null)]')
                 rest_fallback=true
             else
-                print_error "GraphQL rate-limited fetching closed issues, and REST fallback also failed: ${rest_issues:-$repo_nwo}"
+                print_error "GraphQL rate-limited fetching closed issues, and REST fallback also failed: ${rest_issues}"
                 return 2
             fi
         else
@@ -590,9 +625,12 @@ search_cross_references() {
         return 0
     fi
 
+    # Resolved from the local git remote (#4659), not `gh repo view` -- the
+    # literal "owner/repo" string is only needed below to filter the timeline
+    # to same-repo cross-references; it costs no API call either way.
     local repo_nwo
-    if ! repo_nwo=$(gh repo view --json nameWithOwner --jq '.nameWithOwner' 2>&1); then
-        print_warning "Failed to resolve repository for cross-reference probe (non-GitHub forge?): $repo_nwo"
+    if ! repo_nwo=$(get_repo_nwo 2>&1); then
+        print_warning "Failed to resolve repository for cross-reference probe (non-GitHub forge, or no git remote?): $repo_nwo"
         echo "[]"
         return 0
     fi
