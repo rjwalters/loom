@@ -24,10 +24,20 @@ cargo test -- --test-threads=1
 > **Isolation**: under `cargo nextest run --workspace` every test gets its own
 > process (see the crate-level "Test isolation convention" docs in
 > `loom-daemon/src/lib.rs`, issue #4385). These `integration_*` suites touch the
-> host-global `tmux -L loom` server and spawn real daemons, so `.config/nextest.toml`
-> gives them `threads-required = 'num-test-threads'` — each one runs alone, which
-> is the isolation `cargo test` provided implicitly by running one binary at a
-> time. Add new host-global suites to that override's filter.
+> host-global `tmux -L loom` server — `setup()` calls `cleanup_all_loom_sessions()`,
+> which kills *every* `loom-*` session, not just its own — and spawn real daemons,
+> so `.config/nextest.toml` puts them in the `daemon-integration` test group with
+> `max-threads = 1`: at most one is in flight at a time, which is the exclusion
+> `cargo test` provided implicitly by running one test binary at a time. The filter
+> is `binary(/^integration_/)`, so a new `integration_*` suite is covered
+> automatically. Verify with
+> `cargo nextest show-config test-groups --profile ci`.
+>
+> That group bounds one nextest run, not the machine. A `cargo test` in another
+> checkout on the same host runs the same nuclear cleanup and will kill this run's
+> sessions; the resulting "session ... does not exist" failures reproduce
+> identically under plain `cargo test`, so check for sibling test runs before
+> suspecting a regression.
 
 ## Test Structure
 

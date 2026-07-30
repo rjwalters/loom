@@ -68,18 +68,40 @@
 //! `$HOME`, global git config, a fixed TCP port, or the shared `tmux -L loom`
 //! server. `#[serial]` is not enough for those either, because nextest runs tests
 //! from *all* binaries concurrently (plain `cargo test` ran binaries one at a
-//! time). Declare such tests in `.config/nextest.toml` — `threads-required =
-//! 'num-test-threads'` to run alone, or a `max-threads = 1` test group to
-//! serialize a family against itself — or use `serial_test::file_serial`, which
-//! takes an inter-process file lock.
+//! time). Declare such tests in `.config/nextest.toml` — a `max-threads = 1`
+//! [test group](https://nexte.st/docs/configuration/test-groups/) to serialize a
+//! family against itself, or `threads-required = 'num-test-threads'` for a test
+//! that must run completely alone — or use `serial_test::file_serial`, which takes
+//! an inter-process file lock.
 //!
-//! Today the one such override covers the `integration_basic`,
-//! `integration_security`, `integration_factory_reset`, and
-//! `integration_singleton_guard` binaries: each spawns real `loom-daemon`
-//! children and calls `cleanup_all_loom_sessions()`, which kills every `loom-*`
-//! session on the shared tmux server. If you add a test that touches that
-//! server, or any other machine-global resource, add it to that filter — do not
-//! rely on `#[serial]`.
+//! An audit of every `#[serial]` test in this crate (#4385) found exactly one such
+//! resource: the host-global `tmux -L loom` server, reached by the
+//! `integration_*` binaries in `loom-daemon/tests/`. Each spawns real
+//! `loom-daemon` children and calls `cleanup_all_loom_sessions()`, which kills
+//! **every** `loom-*` session on that server, not just its own. They are therefore
+//! placed in the `daemon-integration` test group (`max-threads = 1`), so at most
+//! one is ever in flight. Everything else those tests touch is per-test
+//! (`tempfile::TempDir` roots, ephemeral ports, per-binary session prefixes).
+//! Confirm group membership rather than assuming it:
+//!
+//! ```text
+//! cargo nextest show-config test-groups --profile ci
+//! ```
+//!
+//! Two footguns worth knowing:
+//!
+//! * **Named profiles do not inherit `[[profile.default.overrides]]`.** An
+//!   override declared only on `default` silently does not apply to
+//!   `--profile ci`. Declare it on both.
+//! * **The group bounds one nextest run, not the host.** A `cargo test` in another
+//!   checkout on the same machine runs `cleanup_all_loom_sessions()` too and will
+//!   destroy this run's tmux sessions. If the `integration_*` suites fail with
+//!   "session ... does not exist" or daemon-startup timeouts, check for a sibling
+//!   test run before suspecting your change — the same failures reproduce under
+//!   plain `cargo test`.
+//!
+//! If you add a test that touches the tmux server, or any other machine-global
+//! resource, put it in the group — do not rely on `#[serial]`.
 
 // These modules were originally private to the binary crate. Exposing them as
 // a library (to allow unit tests to run without the binary's tokio runtime)
