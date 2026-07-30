@@ -86,6 +86,25 @@
 //!   re-applies the label, so `claim_labeled_at` cannot be bumped that way.
 //!   `updated_at` remains the fail-open fallback for when the timeline fetch
 //!   failed or found nothing.
+//! - **Genuine comment activity also refreshes the anchor (Issue #4638).**
+//!   Anchoring solely on `claim_labeled_at` fixed #4618's self-perpetuating
+//!   livelock, but it also removed the only protection a claim previously had
+//!   when it is *not* pid-joinable (no journal entry, no run-registry join,
+//!   and a `headRefName` that doesn't match `feature/issue-<N>`) — a
+//!   claimant genuinely reviewing/fixing for 35+ minutes while posting real
+//!   progress comments would have its claim reclaimed out from under it,
+//!   because `claim_labeled_at` itself only moves on a label re-application.
+//!   [`decide_pr`]'s age gate therefore anchors on
+//!   `max(claim_labeled_at, most_recent_substantive_comment_at)`
+//!   ([`ClaimedPr::most_recent_substantive_comment_at`]) — a genuine (i.e.
+//!   non-marker) comment posted after the claim refreshes the anchor exactly
+//!   like a real re-claim would, while a marker-tagged stand-down comment
+//!   (`<!-- loom:standdown claim=... -->`, [`STANDDOWN_MARKER_PREFIX`]) is
+//!   excluded from that signal the same way judge.md/doctor.md's own
+//!   `COMMENTS_AFTER` check excludes it — so the #4618 fix is preserved
+//!   (marked stand-down comments still cannot self-refresh the anchor) while
+//!   a genuinely live, non-pid-joinable claimant is no longer reclaimed out
+//!   from under it.
 //!
 //! Reclaiming removes only the stale claim label (the state label restores
 //! discoverability by itself); as a safety net, if the PR is then left
@@ -631,6 +650,15 @@ impl PrClaimKind {
     }
 }
 
+/// Marker (Issue #4636/#4618) tagging a Judge/Doctor "standing down, not
+/// stomping" comment — evidence of *no* progress (a later pass declining to
+/// reclaim), not genuine activity. A comment containing this substring is
+/// excluded from [`ClaimedPr::most_recent_substantive_comment_at`] (Issue
+/// #4638), mirroring `judge.md`/`doctor.md`'s own `COMMENTS_AFTER` exclusion
+/// (a substring match, not an exact marker+claim-timestamp match, so any
+/// stand-down comment for any claim generation is excluded).
+pub const STANDDOWN_MARKER_PREFIX: &str = "<!-- loom:standdown claim=";
+
 /// An open PR carrying a `loom:reviewing`/`loom:treating` claim label,
 /// trimmed to the fields the reconciliation decision needs.
 #[derive(Debug, Clone, PartialEq)]
@@ -653,6 +681,22 @@ pub struct ClaimedPr {
     /// then fall back to [`Self::updated_at`], preserving pre-#4618 behavior
     /// for that fail-open case.
     pub claim_labeled_at: Option<DateTime<Utc>>,
+    /// Timestamp of the most recent **substantive** (non-stand-down) comment
+    /// posted since [`Self::claim_labeled_at`] (Issue #4638), when
+    /// resolvable. A comment whose body contains [`STANDDOWN_MARKER_PREFIX`]
+    /// is excluded — it evidences a later pass declining to reclaim, not
+    /// activity by the claimant. [`decide_pr`] anchors its age gate on
+    /// `max(claim_labeled_at, most_recent_substantive_comment_at)`, so a
+    /// claimant that is not pid-joinable but is genuinely posting progress
+    /// comments is not reclaimed out from under it purely because
+    /// `claim_labeled_at` itself has aged. `None` when there is no
+    /// `claim_labeled_at` to compare against, the comment fetch failed, or
+    /// every comment since the claim was a marker-tagged stand-down note —
+    /// callers then fall back to `claim_labeled_at`/`updated_at` alone,
+    /// preserving pre-#4638 behavior for that case (including the #4618
+    /// regression guard: a claim with only stand-down comments since must
+    /// still be reclaimed once stale).
+    pub most_recent_substantive_comment_at: Option<DateTime<Utc>>,
     /// The PR's head branch name, when available — the only join key to an
     /// issue number this pass has (see [`parse_issue_from_branch`]).
     pub head_ref_name: Option<String>,
@@ -710,19 +754,28 @@ pub fn parse_issue_from_branch(head_ref_name: &str) -> Option<u32> {
 /// `run_registry_pid` is the caller's join result, consulted only when
 /// `journal_entry` is absent, exactly like [`decide`].
 ///
-/// **Age-gate freshness signal (Issue #4618)**: the age gate below prefers
-/// `pr.claim_labeled_at` (the claim label's own most recent `labeled`
-/// timeline event) over `pr.updated_at` (the PR's aggregate "last modified"
-/// timestamp). Before this fix, `updated_at` was the sole signal, and GitHub
-/// bumps it on ANY comment — including a Judge/Doctor "standing down, not
-/// stomping" comment posted by a later pass declining to reclaim. That made
-/// the check perpetually self-refreshing: each stand-down comment satisfied
-/// the very freshness test the next pass ran, so a claim could survive past
-/// the staleness window once and then never be reclaimed again (PR #4614).
-/// `claim_labeled_at` cannot be bumped that way — it only changes when the
-/// label is genuinely re-applied — so it is used whenever resolvable, with
-/// `updated_at` kept only as the fail-open fallback for when the timeline
-/// fetch itself failed or returned nothing (same fail-safe posture as the
+/// **Age-gate freshness signal (Issue #4618, refined by #4638)**: the age
+/// gate below anchors on
+/// `max(pr.claim_labeled_at, pr.most_recent_substantive_comment_at)`,
+/// falling back to `pr.updated_at` only when BOTH are unavailable.
+/// `claim_labeled_at` (the claim label's own most recent `labeled` timeline
+/// event) replaced `updated_at` as the primary signal in #4618: before that
+/// fix, `updated_at` was the sole signal, and GitHub bumps it on ANY comment
+/// — including a Judge/Doctor "standing down, not stomping" comment posted
+/// by a later pass declining to reclaim. That made the check perpetually
+/// self-refreshing: each stand-down comment satisfied the very freshness
+/// test the next pass ran, so a claim could survive past the staleness
+/// window once and then never be reclaimed again (PR #4614). But anchoring
+/// solely on `claim_labeled_at` also removed the only protection a claim had
+/// when it is not pid-joinable: a claimant genuinely working for 35+ minutes
+/// while posting real progress comments would be reclaimed anyway, since
+/// `claim_labeled_at` itself only moves on a label re-application (#4638).
+/// `most_recent_substantive_comment_at` restores that protection — a
+/// genuine (non-marker) comment posted after the claim refreshes the anchor
+/// — while marker-tagged stand-down comments remain excluded from it, so the
+/// #4618 fix holds (a claim with only stand-down comments since still ages
+/// out and is reclaimed). `updated_at` remains the final fail-open fallback
+/// for when neither signal is available (same fail-safe posture as the
 /// pre-#4618 `None` branch below).
 #[must_use]
 pub fn decide_pr(
@@ -755,11 +808,20 @@ pub fn decide_pr(
     // proof here: the PR->issue join is heuristic, so only *aged* absence (or
     // aged dead-pid evidence) triggers a reclaim.
     //
-    // Prefer claim_labeled_at (Issue #4618) -- it cannot be self-refreshed by
-    // a stand-down comment the way updated_at can. Only fall back to
-    // updated_at when claim_labeled_at is unavailable (timeline fetch
-    // failure/partial response), matching the pre-#4618 fail-open posture.
-    match pr.claim_labeled_at.or(pr.updated_at) {
+    // Anchor on max(claim_labeled_at, most_recent_substantive_comment_at)
+    // (Issue #4638) -- neither can be self-refreshed by a marker-tagged
+    // stand-down comment the way updated_at can, but a genuine comment DOES
+    // refresh the anchor, restoring the protection a non-pid-joinable but
+    // genuinely live claimant needs. Only fall back to updated_at when BOTH
+    // are unavailable (timeline fetch failure/partial response, or no
+    // comment evidence at all), matching the pre-#4618 fail-open posture.
+    let anchor = match (pr.claim_labeled_at, pr.most_recent_substantive_comment_at) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => pr.updated_at,
+    };
+    match anchor {
         Some(freshness_at) => {
             let age_minutes = (now - freshness_at).num_seconds() as f64 / 60.0;
             if age_minutes >= stale_minutes {
@@ -1048,7 +1110,7 @@ pub mod forge {
         apply_live_claim_veto, plan, plan_pr, resolve_no_progress_grace_minutes,
         resolve_stale_hours, BuildingIssue, ClaimedPr, NoProgressEvidence, PrClaimKind,
         PrReclaimReason, PrReconcileAction, ReclaimReason, ReconcileAction,
-        MAX_ISSUES_PER_WORKSPACE,
+        MAX_ISSUES_PER_WORKSPACE, STANDDOWN_MARKER_PREFIX,
     };
     use crate::sweep_journal;
     use anyhow::{anyhow, Context, Result};
@@ -1354,6 +1416,13 @@ pub mod forge {
             .into_iter()
             .map(|r| {
                 let claim_labeled_at = fetch_claim_labeled_at(gh_bin, root, r.number, label);
+                // Issue #4638: only worth fetching when there is a
+                // claim_labeled_at to compare against -- with no anchor at
+                // all, decide_pr falls back to updated_at, which GitHub
+                // already keeps at least as fresh as any comment.
+                let most_recent_substantive_comment_at = claim_labeled_at.and_then(|since| {
+                    fetch_most_recent_substantive_comment_at(gh_bin, root, r.number, since)
+                });
                 ClaimedPr {
                     number: r.number,
                     updated_at: r
@@ -1362,6 +1431,7 @@ pub mod forge {
                         .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
                         .map(|dt| dt.with_timezone(&chrono::Utc)),
                     claim_labeled_at,
+                    most_recent_substantive_comment_at,
                     head_ref_name: r.head_ref_name,
                 }
             })
@@ -1429,6 +1499,61 @@ pub mod forge {
                     .map(|dt| dt.with_timezone(&chrono::Utc))
             })
             .max()
+    }
+
+    /// Best-effort fetch of the most recent **substantive** (non-stand-down)
+    /// comment posted on `pr_number` after `since` (Issue #4638) —
+    /// [`ClaimedPr::most_recent_substantive_comment_at`], the evidence
+    /// [`decide_pr`]'s age gate uses alongside `claim_labeled_at` to avoid
+    /// reclaiming a genuinely live, non-pid-joinable claimant. A comment
+    /// whose body contains [`STANDDOWN_MARKER_PREFIX`] is excluded — mirrors
+    /// judge.md/doctor.md's own `COMMENTS_AFTER` marker exclusion. Returns
+    /// `None` on any failure/timeout/unparseable-output, or when every
+    /// comment since `since` was marker-tagged (or there were none) —
+    /// callers then fall back to `claim_labeled_at`/`updated_at` alone,
+    /// preserving the #4618 regression guard (a claim with only stand-down
+    /// comments since must still age out and be reclaimed).
+    fn fetch_most_recent_substantive_comment_at(
+        gh_bin: &Path,
+        root: &Path,
+        pr_number: u32,
+        since: DateTime<Utc>,
+    ) -> Option<DateTime<Utc>> {
+        // Render `since` in exactly the shape the forge emits for `createdAt`
+        // (`...Z`, second precision) so the jq `>` comparison — which is a raw
+        // *string* comparison — orders correctly. `to_rfc3339()` would render
+        // the same instant with a `+00:00` offset suffix, which sorts *before*
+        // a `Z`-suffixed timestamp of the identical second and so would
+        // misclassify a comment posted in the same second as the claim label.
+        let since_iso = since.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let mut cmd = Command::new(gh_bin);
+        cmd.arg("pr")
+            .arg("view")
+            .arg(pr_number.to_string())
+            .arg("--json")
+            .arg("comments")
+            .arg("--jq")
+            .arg(format!(
+                r#"[.comments[] | select(.createdAt > "{since_iso}") | select(.body | contains("{STANDDOWN_MARKER_PREFIX}") | not) | .createdAt] | max // empty"#
+            ));
+        cmd.current_dir(root);
+        if let Ok(repo) = std::env::var("LOOM_REPO") {
+            cmd.arg("--repo").arg(repo);
+        }
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let out = cmd.output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let raw = String::from_utf8_lossy(&out.stdout);
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed == "null" {
+            return None;
+        }
+        let unquoted = trimmed.trim_matches('"');
+        chrono::DateTime::parse_from_rfc3339(unquoted)
+            .ok()
+            .map(|dt| dt.with_timezone(&chrono::Utc))
     }
 
     /// The PR's currently-applied state labels (a best-effort subset of
@@ -2795,14 +2920,16 @@ exit 0
         updated_at: Option<DateTime<Utc>>,
         head_ref_name: Option<&str>,
     ) -> ClaimedPr {
-        // claim_labeled_at intentionally left unset here so every existing
-        // caller of this helper keeps exercising the pre-#4618
-        // updated_at-only fallback path unchanged; the #4618 regression test
-        // below constructs `ClaimedPr` directly to set it.
+        // claim_labeled_at/most_recent_substantive_comment_at intentionally
+        // left unset here so every existing caller of this helper keeps
+        // exercising the pre-#4618 updated_at-only fallback path unchanged;
+        // the #4618/#4638 regression tests below construct `ClaimedPr`
+        // directly to set them.
         ClaimedPr {
             number,
             updated_at,
             claim_labeled_at: None,
+            most_recent_substantive_comment_at: None,
             head_ref_name: head_ref_name.map(ToString::to_string),
         }
     }
@@ -2939,6 +3066,7 @@ exit 0
             number: 4614,
             updated_at: Some(standdown_inflated),
             claim_labeled_at: Some(claimed_at),
+            most_recent_substantive_comment_at: None,
             head_ref_name: Some("some-doctor-branch".to_string()),
         };
         let action = decide_pr(&pr, None, None, &|_| true, 30.0, now);
@@ -2970,6 +3098,7 @@ exit 0
             number: 4615,
             updated_at: Some(stale_updated_at),
             claim_labeled_at: Some(recent_claim),
+            most_recent_substantive_comment_at: None,
             head_ref_name: None,
         };
         let action = decide_pr(&pr, None, None, &|_| true, 30.0, now);
@@ -2992,6 +3121,67 @@ exit 0
         match action {
             PrReconcileAction::Reclaim(PrReclaimReason::Aged { .. }) => {}
             other => panic!("expected fallback-to-updated_at Aged reclaim, got {other:?}"),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // decide_pr: most_recent_substantive_comment_at anchor (Issue #4638 —
+    // restoring protection for a genuinely live, non-pid-joinable claimant
+    // after #4618 anchored solely on claim_labeled_at)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn decide_pr_keeps_when_old_claim_labeled_at_but_recent_genuine_comment() {
+        // The exact #4638 shape: claim_labeled_at is 35 minutes old (past the
+        // 30-minute threshold) and the PR is not pid-joinable (no journal
+        // entry, no run-registry pid), but a genuine (non-marker) progress
+        // comment was posted 1 minute ago -- most_recent_substantive_comment_at
+        // must refresh the anchor and the claim must be kept, not reclaimed
+        // out from under a still-working claimant.
+        let now = Utc::now();
+        let claimed_at = now - Duration::minutes(35);
+        let recent_genuine_comment = now - Duration::minutes(1);
+        let pr = ClaimedPr {
+            number: 4638,
+            updated_at: Some(claimed_at),
+            claim_labeled_at: Some(claimed_at),
+            most_recent_substantive_comment_at: Some(recent_genuine_comment),
+            head_ref_name: Some("pr-worktree-review-branch".to_string()),
+        };
+        let action = decide_pr(&pr, None, None, &|_| true, 30.0, now);
+        assert_eq!(
+            action,
+            PrReconcileAction::Keep,
+            "a genuine recent comment must refresh the anchor and prevent reclaim"
+        );
+    }
+
+    #[test]
+    fn decide_pr_reclaims_when_old_claim_labeled_at_and_only_standdown_comments_since() {
+        // Regression guard for #4618: the caller-side comment fetch excludes
+        // marker-tagged stand-down comments, so a claim whose only comments
+        // since the claim are stand-down notes surfaces
+        // most_recent_substantive_comment_at == None here (exactly like no
+        // comments at all) -- the anchor must fall back to claim_labeled_at
+        // alone and the stale claim must still be reclaimed. This is the
+        // #4618 livelock this fix must not reopen.
+        let now = Utc::now();
+        let claimed_at = now - Duration::minutes(35);
+        let pr = ClaimedPr {
+            number: 4618,
+            updated_at: Some(now - Duration::seconds(5)),
+            claim_labeled_at: Some(claimed_at),
+            most_recent_substantive_comment_at: None,
+            head_ref_name: Some("some-doctor-branch".to_string()),
+        };
+        let action = decide_pr(&pr, None, None, &|_| true, 30.0, now);
+        match action {
+            PrReconcileAction::Reclaim(PrReclaimReason::Aged { age_minutes }) => {
+                assert!(age_minutes >= 30.0);
+            }
+            other => panic!(
+                "expected Aged reclaim -- marker-only comments must not refresh the anchor, got {other:?}"
+            ),
         }
     }
 
