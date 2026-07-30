@@ -67,12 +67,25 @@
 //!   wrong (a Doctor may hold a PR whose sweep record belongs to a different
 //!   phase, or the branch may simply not follow the convention), a dead pid
 //!   alone is not treated as proof here — [`decide_pr`] only reclaims once
-//!   the PR's `updatedAt` is also stale (per-label threshold,
+//!   the claim's age is also stale (per-label threshold,
 //!   [`resolve_stale_reviewing_minutes`] / [`resolve_stale_treating_minutes`]).
 //!   A **live** joined pid still short-circuits to `Keep` unconditionally,
 //!   exactly like the issue side — that evidence is trustworthy either way.
-//!   A missing/unparseable `updatedAt` fails safe to `Keep`, same rationale
-//!   as the issue side's total-absence-of-evidence case.
+//!   A missing age signal fails safe to `Keep`, same rationale as the issue
+//!   side's total-absence-of-evidence case.
+//! - **Freshness signal (Issue #4618): `claim_labeled_at`, not `updated_at`.**
+//!   The age gate prefers [`ClaimedPr::claim_labeled_at`] — the timestamp of
+//!   the claim label's own most recent `labeled` timeline event — over
+//!   [`ClaimedPr::updated_at`] (the PR's aggregate "last modified"
+//!   timestamp). GitHub bumps `updated_at` on ANY comment, including a
+//!   Judge/Doctor stand-down comment posted by a *later* pass that declined
+//!   to reclaim; using it as the sole freshness signal made the check
+//!   self-perpetuating (PR #4614: 3 consecutive stand-down comments kept the
+//!   claim looking "recently updated" for 30+ minutes with no actual review
+//!   progress, and it was never reclaimed). Posting a comment never
+//!   re-applies the label, so `claim_labeled_at` cannot be bumped that way.
+//!   `updated_at` remains the fail-open fallback for when the timeline fetch
+//!   failed or found nothing.
 //!
 //! Reclaiming removes only the stale claim label (the state label restores
 //! discoverability by itself); as a safety net, if the PR is then left
@@ -592,8 +605,23 @@ impl PrClaimKind {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClaimedPr {
     pub number: u32,
-    /// Parsed `updatedAt` timestamp, when available.
+    /// Parsed `updatedAt` timestamp, when available. Kept as a fallback
+    /// freshness signal only — see [`Self::claim_labeled_at`] for why it is
+    /// no longer the primary one (Issue #4618).
     pub updated_at: Option<DateTime<Utc>>,
+    /// Timestamp of the most recent `labeled <claim-label>` timeline event
+    /// for this PR's currently-held claim label (Issue #4618), when
+    /// resolvable. Unlike [`Self::updated_at`] — GitHub's aggregate
+    /// "last modified" timestamp, which a plain comment (including a Judge's
+    /// or Doctor's own "standing down, not stomping" note) bumps just as
+    /// readily as genuine progress — this timestamp changes ONLY when the
+    /// claim label is re-applied (i.e. an actual reclaim). A stand-down
+    /// comment can therefore never self-refresh it, which is what makes it
+    /// safe to use as the primary age-gate signal in [`decide_pr`]. `None`
+    /// when the timeline fetch failed or returned no matching event — callers
+    /// then fall back to [`Self::updated_at`], preserving pre-#4618 behavior
+    /// for that fail-open case.
+    pub claim_labeled_at: Option<DateTime<Utc>>,
     /// The PR's head branch name, when available — the only join key to an
     /// issue number this pass has (see [`parse_issue_from_branch`]).
     pub head_ref_name: Option<String>,
@@ -650,6 +678,21 @@ pub fn parse_issue_from_branch(head_ref_name: &str) -> Option<u32> {
 ///
 /// `run_registry_pid` is the caller's join result, consulted only when
 /// `journal_entry` is absent, exactly like [`decide`].
+///
+/// **Age-gate freshness signal (Issue #4618)**: the age gate below prefers
+/// `pr.claim_labeled_at` (the claim label's own most recent `labeled`
+/// timeline event) over `pr.updated_at` (the PR's aggregate "last modified"
+/// timestamp). Before this fix, `updated_at` was the sole signal, and GitHub
+/// bumps it on ANY comment — including a Judge/Doctor "standing down, not
+/// stomping" comment posted by a later pass declining to reclaim. That made
+/// the check perpetually self-refreshing: each stand-down comment satisfied
+/// the very freshness test the next pass ran, so a claim could survive past
+/// the staleness window once and then never be reclaimed again (PR #4614).
+/// `claim_labeled_at` cannot be bumped that way — it only changes when the
+/// label is genuinely re-applied — so it is used whenever resolvable, with
+/// `updated_at` kept only as the fail-open fallback for when the timeline
+/// fetch itself failed or returned nothing (same fail-safe posture as the
+/// pre-#4618 `None` branch below).
 #[must_use]
 pub fn decide_pr(
     pr: &ClaimedPr,
@@ -680,9 +723,14 @@ pub fn decide_pr(
     // journal / no run-registry entry). A dead pid alone is never sufficient
     // proof here: the PR->issue join is heuristic, so only *aged* absence (or
     // aged dead-pid evidence) triggers a reclaim.
-    match pr.updated_at {
-        Some(updated) => {
-            let age_minutes = (now - updated).num_seconds() as f64 / 60.0;
+    //
+    // Prefer claim_labeled_at (Issue #4618) -- it cannot be self-refreshed by
+    // a stand-down comment the way updated_at can. Only fall back to
+    // updated_at when claim_labeled_at is unavailable (timeline fetch
+    // failure/partial response), matching the pre-#4618 fail-open posture.
+    match pr.claim_labeled_at.or(pr.updated_at) {
+        Some(freshness_at) => {
+            let age_minutes = (now - freshness_at).num_seconds() as f64 / 60.0;
             if age_minutes >= stale_minutes {
                 PrReconcileAction::Reclaim(
                     dead_pid_reason.unwrap_or(PrReclaimReason::Aged { age_minutes }),
@@ -972,6 +1020,7 @@ pub mod forge {
     };
     use crate::sweep_journal;
     use anyhow::{anyhow, Context, Result};
+    use chrono::{DateTime, Utc};
     use serde::Deserialize;
     use std::path::Path;
     use std::process::{Command, Stdio};
@@ -1247,16 +1296,63 @@ pub mod forge {
             serde_json::from_slice(&out.stdout).context("parse gh pr list JSON")?;
         Ok(rows
             .into_iter()
-            .map(|r| ClaimedPr {
-                number: r.number,
-                updated_at: r
-                    .updated_at
-                    .as_deref()
-                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                    .map(|dt| dt.with_timezone(&chrono::Utc)),
-                head_ref_name: r.head_ref_name,
+            .map(|r| {
+                let claim_labeled_at = fetch_claim_labeled_at(gh_bin, root, r.number, label);
+                ClaimedPr {
+                    number: r.number,
+                    updated_at: r
+                        .updated_at
+                        .as_deref()
+                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                        .map(|dt| dt.with_timezone(&chrono::Utc)),
+                    claim_labeled_at,
+                    head_ref_name: r.head_ref_name,
+                }
             })
             .collect())
+    }
+
+    /// Best-effort fetch of the most recent `labeled <label>` timeline event
+    /// for `pr_number` (Issue #4618) — the freshness signal [`decide_pr`]
+    /// prefers over the PR's aggregate `updatedAt`, since a stand-down
+    /// comment bumps the latter but never re-applies the label. Mirrors
+    /// [`crate::quarantine_reconciliation::forge::fetch_last_blocked_labeled_at`]'s
+    /// shape. Returns `None` on any failure/timeout/unparseable-output or
+    /// when the label was never applied — callers fall back to `updatedAt`
+    /// in that case, the same fail-open posture used elsewhere in this
+    /// module.
+    fn fetch_claim_labeled_at(
+        gh_bin: &Path,
+        root: &Path,
+        pr_number: u32,
+        label: &str,
+    ) -> Option<DateTime<Utc>> {
+        let mut cmd = Command::new(gh_bin);
+        cmd.arg("api")
+            .arg(format!("repos/{{owner}}/{{repo}}/issues/{pr_number}/timeline"))
+            .arg("--paginate")
+            .arg("--jq")
+            .arg(format!(
+                r#"[.[] | select(.event == "labeled" and .label.name == "{label}") | .created_at] | max // empty"#
+            ));
+        cmd.current_dir(root);
+        if let Ok(repo) = std::env::var("LOOM_REPO") {
+            cmd.arg("--repo").arg(repo);
+        }
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let out = cmd.output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let raw = String::from_utf8_lossy(&out.stdout);
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed == "null" {
+            return None;
+        }
+        let unquoted = trimmed.trim_matches('"');
+        chrono::DateTime::parse_from_rfc3339(unquoted)
+            .ok()
+            .map(|dt| dt.with_timezone(&chrono::Utc))
     }
 
     /// The PR's currently-applied state labels (a best-effort subset of
@@ -2572,9 +2668,14 @@ exit 0
         updated_at: Option<DateTime<Utc>>,
         head_ref_name: Option<&str>,
     ) -> ClaimedPr {
+        // claim_labeled_at intentionally left unset here so every existing
+        // caller of this helper keeps exercising the pre-#4618
+        // updated_at-only fallback path unchanged; the #4618 regression test
+        // below constructs `ClaimedPr` directly to set it.
         ClaimedPr {
             number,
             updated_at,
+            claim_labeled_at: None,
             head_ref_name: head_ref_name.map(ToString::to_string),
         }
     }
@@ -2686,6 +2787,85 @@ exit 0
         let pr = claimed_pr(108, None, Some("feature/issue-42"));
         let action = decide_pr(&pr, Some(&entry), Some(999), &|pid| pid == 111, 30.0, now);
         assert_eq!(action, PrReconcileAction::Keep);
+    }
+
+    // ------------------------------------------------------------------
+    // decide_pr: claim_labeled_at freshness signal (Issue #4618 — PR #4614
+    // stand-down-comment livelock regression coverage)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn decide_pr_reclaims_via_claim_labeled_at_despite_standdown_inflated_updated_at() {
+        // Reproduces the exact PR #4614 shape: the claim label itself was
+        // applied 35 minutes ago (well past the 30-minute reviewing
+        // threshold) and never re-applied since, but 2+ "standing down, not
+        // stomping" comments posted by later Judge passes bumped the PR's
+        // aggregate `updatedAt` to a few seconds ago -- each stand-down
+        // comment self-refreshing the very signal the pre-#4618 code used to
+        // decide freshness. `claim_labeled_at` is immune to that: it only
+        // moves when the label is genuinely re-applied, so the reclaim now
+        // fires correctly despite the inflated `updated_at`.
+        let now = Utc::now();
+        let claimed_at = now - Duration::minutes(35);
+        let standdown_inflated = now - Duration::seconds(5);
+        let pr = ClaimedPr {
+            number: 4614,
+            updated_at: Some(standdown_inflated),
+            claim_labeled_at: Some(claimed_at),
+            head_ref_name: Some("some-doctor-branch".to_string()),
+        };
+        let action = decide_pr(&pr, None, None, &|_| true, 30.0, now);
+        match action {
+            PrReconcileAction::Reclaim(PrReclaimReason::Aged { age_minutes }) => {
+                assert!(
+                    age_minutes >= 30.0,
+                    "expected age derived from claim_labeled_at (~35m), got {age_minutes}"
+                );
+            }
+            other => panic!(
+                "expected an Aged reclaim driven by claim_labeled_at, got {other:?} \
+                 (stand-down-comment-inflated updated_at must not mask staleness)"
+            ),
+        }
+    }
+
+    #[test]
+    fn decide_pr_keeps_when_claim_labeled_at_is_fresh_even_if_updated_at_is_old() {
+        // The inverse of the case above, for completeness: a fresh
+        // claim_labeled_at (recent reclaim) must read as fresh even when
+        // updated_at happens to be stale (e.g. a partial/lagging API field),
+        // confirming claim_labeled_at is genuinely primary, not just an
+        // additional condition.
+        let now = Utc::now();
+        let recent_claim = now - Duration::minutes(1);
+        let stale_updated_at = now - Duration::minutes(90);
+        let pr = ClaimedPr {
+            number: 4615,
+            updated_at: Some(stale_updated_at),
+            claim_labeled_at: Some(recent_claim),
+            head_ref_name: None,
+        };
+        let action = decide_pr(&pr, None, None, &|_| true, 30.0, now);
+        assert_eq!(action, PrReconcileAction::Keep);
+    }
+
+    #[test]
+    fn decide_pr_falls_back_to_updated_at_when_claim_labeled_at_unresolvable() {
+        // When the timeline fetch failed/returned nothing (claim_labeled_at
+        // is None), decide_pr must fall back to updated_at exactly like the
+        // pre-#4618 behavior -- this is the fail-open case, not a second
+        // route to the bug: a caller-side fetch failure should never be
+        // amplified into either a spurious reclaim or a permanently-fresh
+        // claim.
+        let now = Utc::now();
+        let old = now - Duration::minutes(60);
+        let pr = claimed_pr(4616, Some(old), None);
+        assert!(pr.claim_labeled_at.is_none());
+        let action = decide_pr(&pr, None, None, &|_| true, 30.0, now);
+        match action {
+            PrReconcileAction::Reclaim(PrReclaimReason::Aged { .. }) => {}
+            other => panic!("expected fallback-to-updated_at Aged reclaim, got {other:?}"),
+        }
     }
 
     #[test]

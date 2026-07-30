@@ -1287,11 +1287,27 @@ weaker evidence:
   unconditional reclaim), a dead pid alone is never sufficient proof on the
   PR side: the branch-name join can be wrong (a Doctor may hold a PR whose
   sweep record belongs to a different phase), so `decide_pr` only reclaims
-  once the PR's `updatedAt` has *also* aged past the per-label threshold. A
+  once the claim's age has *also* aged past the per-label threshold. A
   **live** joined pid still short-circuits to `Keep` unconditionally — that
-  evidence is trustworthy either way. A missing/unparseable `updatedAt`
-  fails safe to `Keep`, same rationale as the issue side's total-absence
-  case.
+  evidence is trustworthy either way.
+
+**Freshness signal: `claim_labeled_at`, not `updatedAt` (#4618).** The age
+gate above originally used the PR's aggregate `updatedAt` — but GitHub bumps
+that on ANY comment, including a Judge/Doctor "standing down, not stomping"
+comment posted by a later pass that *declined* to reclaim. That made the
+check self-perpetuating: once a claim survived long enough for one stand-down
+comment to post, every subsequent pass saw a "recently updated" PR and never
+reclaimed it (PR #4614 — 3 consecutive stand-down comments, never reclaimed).
+`decide_pr` now prefers `ClaimedPr::claim_labeled_at` — the timestamp of the
+claim label's own most recent `labeled` timeline event, fetched via
+`fetch_claim_labeled_at` alongside `list_prs_with_label` — because posting a
+comment does not re-apply the label, so a stand-down comment cannot bump it.
+`updated_at` is kept only as the fail-open fallback for when the timeline
+fetch itself fails or returns nothing (mirroring the pre-#4618,
+missing/unparseable-`updatedAt`-fails-safe-to-`Keep` posture). See
+`claim_reconciliation.rs`'s `decide_pr` doc comment for the full rationale
+and its `decide_pr_reclaims_via_claim_labeled_at_despite_standdown_inflated_updated_at`
+regression test, which reproduces the PR #4614 shape directly.
 
 Thresholds are minutes-scale, not hours, and env-overridable:
 
@@ -1317,6 +1333,20 @@ Claim Check", sharing these exact env vars and defaults. doctor.md additionally
 carries a **pre-push head-SHA recheck** (capture `headRefOid` at claim time,
 re-compare before the final push) — the one race this pass structurally cannot
 cover, since it never hooks into an in-flight Doctor's push.
+
+**Agent-side stand-down marker convention + bounded fallback (#4618).** The
+same self-perpetuating-comment defect fixed on the daemon side above also
+existed in judge.md's and doctor.md's own `COMMENTS_AFTER` heuristic — the
+fast path shared the daemon backstop's blind spot exactly, since both read
+"any comment after the claim" as fresh. Both role prompts now (1) tag every
+stand-down comment they post with `<!-- loom:standdown claim=$CLAIMED_AT -->`
+and exclude marker-tagged comments from `COMMENTS_AFTER`, and (2) count
+marker-tagged comments in a separate `STANDDOWN_COUNT`, force-reclaiming once
+`STANDDOWN_COUNT >= LOOM_MAX_STANDDOWN_STREAK` (default **3**) regardless of
+claim age — a bounded fallback that holds even if the marker-exclusion logic
+above is somehow bypassed. `LOOM_MAX_STANDDOWN_STREAK` is shared by both role
+prompts, mirroring how `LOOM_STALE_REVIEWING_MINUTES`/`LOOM_STALE_TREATING_MINUTES`
+are already shared.
 
 ## Stacked-PR dependency — #3729 (v1), #3747 (v2 item 1)
 
