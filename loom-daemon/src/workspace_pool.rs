@@ -549,7 +549,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial(loom_safehouse_env)]
+    #[serial_test::serial]
     async fn start_safehouse_narration_surfaces_unreachable_for_enabled_unresolved_socket() {
         clear_safehouse_env();
         let dir = tempdir().unwrap();
@@ -581,7 +581,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial(loom_safehouse_env)]
+    #[serial_test::serial]
     async fn start_peer_coordination_disabled_reports_not_configured_even_after_prior_state() {
         clear_safehouse_env();
         let dir = tempdir().unwrap();
