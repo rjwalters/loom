@@ -115,7 +115,7 @@ PR_NUMBER=<number>
 # REST endpoint, not `gh pr view --json files` — that field silently
 # truncates at 100 files with no error (see criterion #3 below and #4613),
 # which on a 100+ file PR would hide files from this risk read too.
-gh api "repos/{owner}/{repo}/pulls/$PR_NUMBER/files" --paginate --jq -r '.[] | "\(.additions)+/\(.deletions)- \(.filename)"'
+gh api "repos/{owner}/{repo}/pulls/$PR_NUMBER/files" --paginate --jq '.[] | "\(.additions)+/\(.deletions)- \(.filename)"'
 
 # The actual diff (read it — the load-bearing hunks are what you are judging)
 gh pr diff "$PR_NUMBER"
@@ -214,7 +214,7 @@ fi
 # `.github/workflows/gitea-integration.yml` was skipped in one Champion
 # instance's evaluation over a 117-file PR. `--paginate` walks every page of
 # the REST response regardless of file count.
-FILES=$(gh api "repos/{owner}/{repo}/pulls/<number>/files" --paginate --jq -r '.[].filename')
+FILES=$(gh api "repos/{owner}/{repo}/pulls/<number>/files" --paginate --jq '.[].filename')
 
 # Define critical patterns (extend as needed)
 CRITICAL_PATTERNS=(
@@ -259,7 +259,7 @@ This criterion is deliberately kept **in addition to** the merge-risk judgment i
 **Verification command**:
 ```bash
 # Check merge status
-MERGEABLE=$(gh pr view <number> --json mergeable --jq -r '.mergeable')
+MERGEABLE=$(gh pr view <number> --json mergeable --jq '.mergeable')
 
 # Verify mergeable state
 if [ "$MERGEABLE" != "MERGEABLE" ]; then
@@ -283,7 +283,7 @@ echo "PASS: No merge conflicts"
 **Verification command**:
 ```bash
 # Get PR last update time
-UPDATED_AT=$(gh pr view <number> --json updatedAt --jq -r '.updatedAt')
+UPDATED_AT=$(gh pr view <number> --json updatedAt --jq '.updatedAt')
 
 # Convert to Unix timestamp
 UPDATED_TS=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$UPDATED_AT" +%s 2>/dev/null || \
@@ -480,7 +480,7 @@ fi
 
 # Check each linked issue
 for issue in $LINKED_ISSUES; do
-  ISSUE_STATE=$(gh issue view "$issue" --json state --jq -r '.state' 2>&1)
+  ISSUE_STATE=$(gh issue view "$issue" --json state --jq '.state' 2>&1)
 
   if [ "$ISSUE_STATE" = "CLOSED" ]; then
     echo "Issue #$issue is closed (auto-closed by PR merge)"
@@ -516,7 +516,7 @@ for blocked in $BLOCKED_ISSUES; do
   echo "Checking if #$blocked can be unblocked..."
 
   # Get the issue body to check ALL dependencies
-  BLOCKED_BODY=$(gh issue view "$blocked" --json body --jq -r '.body')
+  BLOCKED_BODY=$(gh issue view "$blocked" --json body --jq '.body')
 
   # Extract all referenced dependencies. Two-stage (#4508): stage 1 selects
   # lines declaring a dependency phrase, tolerant of markdown emphasis/colon
@@ -529,7 +529,7 @@ for blocked in $BLOCKED_ISSUES; do
   # Check if ALL dependencies are now closed
   ALL_RESOLVED=true
   for dep in $ALL_DEPS; do
-    DEP_STATE=$(gh issue view "$dep" --json state --jq -r '.state' 2>/dev/null)
+    DEP_STATE=$(gh issue view "$dep" --json state --jq '.state' 2>/dev/null)
     if [ "$DEP_STATE" != "CLOSED" ]; then
       echo "  Still blocked: dependency #$dep is still open"
       ALL_RESOLVED=false
@@ -625,7 +625,7 @@ echo "Found $TOTAL_TODOS TODOs ($CRITICAL_COUNT critical, $STANDARD_COUNT standa
 # Stage 2: Parse PR Body Sections
 # ============================================
 
-PR_BODY=$(gh pr view "$PR_NUMBER" --json body --jq -r '.body // ""')
+PR_BODY=$(gh pr view "$PR_NUMBER" --json body --jq '.body // ""')
 
 # Extract follow-on sections (case-insensitive matching)
 FOLLOWON_SECTION=""
@@ -701,11 +701,11 @@ fi
 
 # Get original issue title if available
 if [ -n "$ORIGINAL_ISSUE" ]; then
-  ORIGINAL_TITLE=$(gh issue view "$ORIGINAL_ISSUE" --json title --jq -r '.title' 2>/dev/null || echo "")
+  ORIGINAL_TITLE=$(gh issue view "$ORIGINAL_ISSUE" --json title --jq '.title' 2>/dev/null || echo "")
   PARENT_REF="Follow-on from PR #$PR_NUMBER which closed #$ORIGINAL_ISSUE"
   CONTEXT_LINE="**$ORIGINAL_TITLE** was implemented in PR #$PR_NUMBER."
 else
-  PR_TITLE=$(gh pr view "$PR_NUMBER" --json title --jq -r '.title')
+  PR_TITLE=$(gh pr view "$PR_NUMBER" --json title --jq '.title')
   PARENT_REF="Follow-on from PR #$PR_NUMBER"
   CONTEXT_LINE="**$PR_TITLE** was merged in PR #$PR_NUMBER."
 fi

@@ -71,7 +71,7 @@ fi
 
 **Handling**:
 ```bash
-MERGEABLE=$(gh pr view "$PR_NUMBER" --json mergeable --jq -r '.mergeable')
+MERGEABLE=$(gh pr view "$PR_NUMBER" --json mergeable --jq '.mergeable')
 if [ "$MERGEABLE" != "MERGEABLE" ]; then
   echo "FAIL: Merge conflicts detected"
   # Add comment explaining conflict
@@ -180,7 +180,7 @@ LINKED_ISSUES=$(forge_pr_close_targets "$PR_NUMBER")
 
 # Verify each issue closed after merge
 for issue in $LINKED_ISSUES; do
-  STATE=$(gh issue view "$issue" --json state --jq -r '.state')
+  STATE=$(gh issue view "$issue" --json state --jq '.state')
   if [ "$STATE" != "CLOSED" ]; then
     echo "Warning: Issue #$issue not auto-closed, closing manually"
     gh issue close "$issue" --comment "Closed by PR #$PR_NUMBER (auto-merged by Champion)"
