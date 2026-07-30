@@ -667,7 +667,9 @@ This issue cannot proceed until dependencies are complete.
 
 **If Dependencies section exists:**
 1. Check if all task list boxes are checked (✅)
-2. **All checked** → Safe to mark `loom:curated`
+2. **All checked** → Also check for a superseding block first (see "When
+   Dependencies Complete" below) — only if that check clears too is it safe
+   to mark `loom:curated`
 3. **Any unchecked** → Add/keep `loom:blocked` label, do NOT mark `loom:curated`
 
 **If NO Dependencies section:**
@@ -692,7 +694,41 @@ gh issue edit <number> --add-label "loom:blocked"
 
 ### When Dependencies Complete
 
-GitHub automatically checks boxes when issues close. When you see all boxes checked:
+GitHub automatically checks boxes when issues close. **Before acting on all-boxes-checked, first check for a superseding block reason (#4634)** —
+`loom:blocked` can get re-applied later for a reason that has nothing to do
+with the body's original Dependencies section (e.g. this issue's own
+implementation PR later hit the Doctor-cycle cap and needs human review). A
+body dependency closing does NOT mean the label's *current* justification has
+cleared, and blindly trusting it caused a live flip-flop loop on #4492: three
+separate Curator passes each stripped `loom:blocked` citing "dependency
+resolved" while the real, current block (an open PR with
+`loom:changes-requested`) was still active, forcing Champion to keep manually
+re-blocking with the real reason each time.
+
+**Primary check (preferred, mechanical/testable) — run this first:**
+```bash
+# Any PR that would close this issue, still OPEN and carrying
+# loom:changes-requested or loom:blocked, is a superseding CURRENT block
+# reason — regardless of what the body's Dependencies section says.
+gh issue view <number> --json closedByPullRequestsReferences \
+  --jq '.closedByPullRequestsReferences[].number'
+# For each PR number returned:
+gh pr view <pr_number> --json state,labels
+# state == "OPEN" AND labels include loom:changes-requested or loom:blocked
+#   → a superseding block is active. Leave loom:blocked in place, do NOT mark
+#     loom:curated, and do NOT post an "unblocked"/"dependencies resolved"
+#     comment — even though the body's checklist is fully checked.
+```
+
+**Secondary heuristic (fragile, optional defense-in-depth, does NOT override
+the primary check above):** if there is no linked PR at all, scan recent
+issue comments for the most recent explicit `loom:blocked` justification
+(e.g. "doctor cycle exhausted", "Sweep coordination: blocking", "Champion:
+re-blocking") and confirm that specific condition has since cleared — not
+just that the body's stated dependency closed. When in doubt, leave
+`loom:blocked` in place.
+
+**Only once the superseding-block check clears**, proceed:
 1. Claim the issue if not already claimed: `gh issue edit <number> --add-label "loom:curating"`
 2. Remove `loom:blocked` label and add `loom:curated`: `gh issue edit <number> --remove-label "loom:blocked" --remove-label "loom:curating" --add-label "loom:curated"`
 3. Issue awaits `loom:issue` promotion (human, Champion, or a `/loom:sweep` orchestrator) before Workers can claim
