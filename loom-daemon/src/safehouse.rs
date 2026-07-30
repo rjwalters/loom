@@ -1647,14 +1647,59 @@ async fn completion_for_exit(
         return None;
     }
     let merged = fetch_merged_pr(Path::new(workspace_root), issue).await?;
+    build_and_narrate_completion(
+        persona,
+        workspace_root,
+        issue,
+        merged,
+        duration_sec,
+        exited_at,
+        slug_cache,
+        already_narrated,
+        activity_db,
+    )
+    .await
+}
+
+/// Shared envelope-build/dedup-insert core behind **both** completion trigger
+/// paths (issue #4583): the `SweepExited` emit point above
+/// ([`completion_for_exit`]) and the periodic merge-reconciliation pass below
+/// ([`reconcile_recent_merges`]), which exists precisely because a
+/// champion-tick merge — landing well after the sweep process (and its one
+/// `SweepExited`) already exited — is never observed by the first path alone.
+///
+/// Every caller must have already confirmed the merge (a [`MergedPr`] in
+/// hand); this only re-checks and updates `already_narrated`, so the exactly-
+/// once invariant holds identically regardless of which path found the merge
+/// first. `duration_sec`/`exited_at` are caller-supplied rather than derived
+/// here because the two callers have different clocks available: a live
+/// sweep's reaper clock for [`completion_for_exit`], the forge's
+/// `createdAt`/`mergedAt` pair (no sweep clock exists) for
+/// [`reconcile_recent_merges`].
+#[allow(clippy::too_many_arguments)]
+async fn build_and_narrate_completion(
+    persona: &str,
+    workspace_root: &str,
+    issue: u32,
+    merged: MergedPr,
+    duration_sec: i64,
+    exited_at: DateTime<Utc>,
+    slug_cache: &mut HashMap<String, String>,
+    already_narrated: &mut std::collections::HashSet<(String, u32)>,
+    activity_db: Option<&Arc<Mutex<ActivityDb>>>,
+) -> Option<Envelope> {
+    let key = (workspace_root.to_owned(), issue);
+    if already_narrated.contains(&key) {
+        return None;
+    }
     let slug = fetch_repo_slug_cached(slug_cache, workspace_root).await?;
     // Only reached once the merge is confirmed, so a completion is never delayed
     // by a token lookup it would not have published.
     let tokens = fetch_issue_tokens(activity_db, issue).await;
 
-    // Sweep timing comes from the one clock that produced `duration_sec` (the
-    // reaper's), so the pair is always self-consistent — mixing in the forge's
-    // `mergedAt` could render a `completed_at` before `started_at`.
+    // Timing comes from the one clock the caller had available, so the pair is
+    // always self-consistent — mixing clocks across callers could render a
+    // `completed_at` before `started_at`.
     let started_at = exited_at - chrono::Duration::seconds(duration_sec.max(0));
     let meta = CompletionMeta {
         agent: persona.to_owned(),
@@ -1685,6 +1730,290 @@ async fn completion_for_exit(
             None
         }
     }
+}
+
+// ============================================================================
+// Periodic merge reconciliation (#4583) — catches champion-tick merges
+// ============================================================================
+
+/// One row from the bulk reconciliation query: everything
+/// [`build_and_narrate_completion`] needs, plus the PR's own creation time used
+/// as a `started_at` proxy (there is by definition no live sweep clock at
+/// reconciliation time).
+struct ReconciledMergedPr {
+    issue: u32,
+    merged: MergedPr,
+    created_at: DateTime<Utc>,
+    merged_at: DateTime<Utc>,
+}
+
+/// `gh pr list --json` fields the reconciliation pass requests. Distinct from
+/// [`MERGED_PR_FIELDS`] (the per-issue, branch-filtered lookup): this is a
+/// **bulk**, unfiltered-by-branch query, so it additionally needs `headRefName`
+/// (to recover the issue number via
+/// [`crate::worktree_ops::naming::issue_from_branch`]) and `createdAt` (the
+/// `started_at` proxy described above).
+const RECONCILE_PR_FIELDS: &str =
+    "number,headRefName,url,mergedAt,createdAt,title,additions,deletions";
+
+/// How many of the most-recently-merged PRs one reconciliation pass inspects
+/// per workspace. Bounded rather than time-windowed for simplicity — a repo
+/// merging more than this between two reconciliation ticks would need a
+/// smaller [`reconcile_interval`], not a larger limit.
+const RECONCILE_PR_LIMIT: u32 = 30;
+
+/// Best-effort bulk `gh pr list --state merged` lookup across **all** recently
+/// merged PRs in `workspace_root` (issue #4583) — unlike [`fetch_merged_pr`]
+/// this is not filtered to one issue's branch, which is exactly what lets it
+/// discover a merge the branch-scoped, `SweepExited`-triggered lookup never
+/// ran for (no sweep, no trigger). Every failure — missing `gh`, no network,
+/// unauthenticated, timeout, malformed JSON, an unparsable row — degrades that
+/// row (or the whole call) to being silently skipped; a best-effort
+/// reconciliation pass must never panic or block the sink.
+async fn fetch_recent_merged_prs(workspace_root: &Path) -> Vec<ReconciledMergedPr> {
+    let gh_bin = env_nonempty(GH_BIN_ENV).unwrap_or_else(|| "gh".to_owned());
+    let run = tokio::process::Command::new(&gh_bin)
+        .arg("pr")
+        .arg("list")
+        .arg("--state")
+        .arg("merged")
+        .arg("--json")
+        .arg(RECONCILE_PR_FIELDS)
+        .arg("--limit")
+        .arg(RECONCILE_PR_LIMIT.to_string())
+        .current_dir(workspace_root)
+        .output();
+    let Ok(Ok(output)) = tokio::time::timeout(MERGE_CHECK_TIMEOUT, run).await else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let Ok(rows) = serde_json::from_slice::<Value>(&output.stdout) else {
+        return Vec::new();
+    };
+    let Some(array) = rows.as_array() else {
+        return Vec::new();
+    };
+    array
+        .iter()
+        .filter_map(|row| {
+            let head_ref = row.get("headRefName")?.as_str()?;
+            let issue = crate::worktree_ops::naming::issue_from_branch(head_ref)?;
+            let merged_at_str = row
+                .get("mergedAt")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())?;
+            let merged_at = DateTime::parse_from_rfc3339(merged_at_str)
+                .ok()?
+                .with_timezone(&Utc);
+            let created_at = row
+                .get("createdAt")
+                .and_then(Value::as_str)
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.with_timezone(&Utc))
+                // A missing/unparsable `createdAt` degrades to a zero-duration
+                // proxy rather than losing the whole row — the feed cares far
+                // more about the completion existing than about its duration
+                // figure being exact for a merge with no sweep clock anyway.
+                .unwrap_or(merged_at);
+            let number = u32::try_from(row.get("number")?.as_u64()?).ok()?;
+            let url = row.get("url")?.as_str()?.to_owned();
+            if url.is_empty() {
+                return None;
+            }
+            let title = row
+                .get("title")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(ToOwned::to_owned);
+            let additions = row.get("additions").and_then(Value::as_u64);
+            let deletions = row.get("deletions").and_then(Value::as_u64);
+            Some(ReconciledMergedPr {
+                issue,
+                merged: MergedPr {
+                    number,
+                    url,
+                    title,
+                    additions,
+                    deletions,
+                },
+                created_at,
+                merged_at,
+            })
+        })
+        .collect()
+}
+
+/// The periodic reconciliation pass itself (issue #4583): bulk-lists recently
+/// merged PRs for `workspace_root` and narrates a completion for any
+/// `(workspace, issue)` not already in `already_narrated` — sharing that exact
+/// dedup set with [`completion_for_exit`]'s `SweepExited` path is what keeps
+/// the two trigger paths from ever double-posting the same merge, in either
+/// direction (whichever path observes the merge first wins; the other becomes
+/// a no-op `contains` check).
+///
+/// This is the option the issue's curation explicitly favors over a new event
+/// topic/IPC verb: it needs no change to the frozen v0.10.0 event taxonomy,
+/// and — because it queries forge truth directly rather than depending on any
+/// daemon-emitted event — it also naturally covers a merge that happened while
+/// the daemon itself was down, **provided** the dedup set survives the
+/// restart; see [`load_persisted_completed`] / [`persist_completed_best_effort`]
+/// for that half of the story (the in-memory set alone does not survive one).
+async fn reconcile_recent_merges(
+    persona: &str,
+    workspace_root: &str,
+    slug_cache: &mut HashMap<String, String>,
+    already_narrated: &mut std::collections::HashSet<(String, u32)>,
+    activity_db: Option<&Arc<Mutex<ActivityDb>>>,
+) -> Vec<Envelope> {
+    let rows = fetch_recent_merged_prs(Path::new(workspace_root)).await;
+    let mut out = Vec::new();
+    for row in rows {
+        let duration_sec = (row.merged_at - row.created_at).num_seconds().max(0);
+        if let Some(envelope) = build_and_narrate_completion(
+            persona,
+            workspace_root,
+            row.issue,
+            row.merged,
+            duration_sec,
+            row.merged_at,
+            slug_cache,
+            already_narrated,
+            activity_db,
+        )
+        .await
+        {
+            out.push(envelope);
+        }
+    }
+    out
+}
+
+/// Reconciliation-pass cadence (issue #4583). Test/operator override mirrors
+/// the existing `GH_BIN_ENV` seam: milliseconds, so a test can drive a whole
+/// reconciliation cycle without a real wall-clock wait. Unset/unparsable falls
+/// back to [`DEFAULT_RECONCILE_INTERVAL`].
+const RECONCILE_INTERVAL_ENV: &str = "LOOM_SAFEHOUSE_RECONCILE_INTERVAL_MS";
+
+/// Production default cadence: frequent enough that a champion-tick merge
+/// (production evidence: the fleet feed went dark for 2+ hours) is caught
+/// within a few minutes, infrequent enough that a multi-workspace host issues
+/// at most one bulk `gh pr list` per workspace every few minutes.
+const DEFAULT_RECONCILE_INTERVAL: Duration = Duration::from_secs(300);
+
+fn reconcile_interval() -> Duration {
+    env_nonempty(RECONCILE_INTERVAL_ENV)
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_RECONCILE_INTERVAL)
+}
+
+/// Test/operator override for the persisted dedup file's path (issue #4583),
+/// mirroring [`crate::workspace_registry::REGISTRY_PATH_ENV`]'s pattern.
+const COMPLETIONS_PATH_ENV: &str = "LOOM_SAFEHOUSE_COMPLETIONS_PATH";
+
+/// Resolve the on-disk path for the persisted `(workspace, issue)` completion
+/// dedup set. `None` only when no home directory can be resolved at all (an
+/// exotic environment) — reconciliation still runs, it just cannot survive a
+/// daemon restart without double-checking already-narrated merges.
+fn default_completions_path() -> Option<PathBuf> {
+    if let Some(path) = env_nonempty(COMPLETIONS_PATH_ENV) {
+        return Some(PathBuf::from(path));
+    }
+    Some(
+        dirs::home_dir()?
+            .join(".loom")
+            .join("safehouse-completed.json"),
+    )
+}
+
+/// Load the persisted dedup set (issue #4583 AC3: a merge occurring while the
+/// daemon was down must be picked up after restart, which requires that
+/// *already*-narrated merges are **not** re-narrated just because the
+/// in-memory set reset). A missing/corrupt/unreadable file degrades to an
+/// empty set — the same "narrate it (again), never lose it" tradeoff every
+/// other best-effort lookup in this module makes, and no worse than the
+/// pre-#4583 behavior (which never persisted at all).
+fn load_persisted_completed(path: Option<&Path>) -> std::collections::HashSet<(String, u32)> {
+    let Some(path) = path else {
+        return std::collections::HashSet::new();
+    };
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return std::collections::HashSet::new();
+    };
+    serde_json::from_str::<Vec<(String, u32)>>(&contents)
+        .map(|pairs| pairs.into_iter().collect())
+        .unwrap_or_default()
+}
+
+/// Persist the dedup set atomically (temp file + rename, mirroring
+/// [`crate::workspace_registry::WorkspaceRegistry::save`]). Best-effort: a
+/// write failure (read-only home, disk full, permissions) is logged once at
+/// `debug` and otherwise swallowed — the in-memory set stays authoritative for
+/// the rest of this process's life either way, this only affects
+/// restart-survival.
+fn persist_completed_best_effort(
+    path: Option<&Path>,
+    completed: &std::collections::HashSet<(String, u32)>,
+) {
+    let Some(path) = path else {
+        return;
+    };
+    let pairs: Vec<&(String, u32)> = completed.iter().collect();
+    let Ok(json) = serde_json::to_string(&pairs) else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        if let Err(err) = std::fs::create_dir_all(parent) {
+            log::debug!(
+                "safehouse: could not create completions dir {} ({err:#}); \
+                 restart-recovery for merge reconciliation is degraded",
+                parent.display()
+            );
+            return;
+        }
+    }
+    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+    if let Err(err) = std::fs::write(&tmp, json) {
+        log::debug!(
+            "safehouse: could not write completions file {} ({err:#}); \
+             restart-recovery for merge reconciliation is degraded",
+            tmp.display()
+        );
+        return;
+    }
+    if let Err(err) = std::fs::rename(&tmp, path) {
+        log::debug!(
+            "safehouse: could not install completions file {} ({err:#}); \
+             restart-recovery for merge reconciliation is degraded",
+            path.display()
+        );
+    }
+}
+
+/// Union of every workspace the reconciliation pass should scan (issue #4583):
+/// every repo the sink has *observed* a stamped-`repo` event for
+/// (`known_workspaces`, built up live as events flow through [`run_sink`]) plus
+/// every repo in the machine-level [`crate::workspace_registry::WorkspaceRegistry`]
+/// (which survives a daemon restart on disk, unlike `known_workspaces`) — the
+/// union is what lets a champion-driven merge in a registered-but-otherwise-
+/// quiet workspace still get reconciled promptly after a restart, before any
+/// new sweep event re-populates `known_workspaces`.
+///
+/// A `BTreeSet` gives deterministic round-robin ordering (both for tests and
+/// so a fixed number of workspaces cycle through predictably rather than by
+/// hash-order).
+fn reconciliation_targets(known_workspaces: &std::collections::HashSet<String>) -> Vec<String> {
+    let mut targets: std::collections::BTreeSet<String> =
+        known_workspaces.iter().cloned().collect();
+    if let Ok(registry) = crate::workspace_registry::WorkspaceRegistry::load_default() {
+        for root in registry.roots() {
+            targets.insert(root.to_string_lossy().into_owned());
+        }
+    }
+    targets.into_iter().collect()
 }
 
 // ============================================================================
@@ -2062,67 +2391,132 @@ async fn run_sink(
     // Forge `owner/repo` slugs, and the (workspace, issue) pairs already
     // narrated as completions — both process-lifetime (#4426).
     let mut slug_cache: HashMap<String, String> = HashMap::new();
-    let mut completed: std::collections::HashSet<(String, u32)> = std::collections::HashSet::new();
+    // Persisted dedup (#4583 AC3): loaded once at startup so a merge already
+    // narrated before a daemon restart is not re-posted just because the
+    // process-lifetime set below reset to empty.
+    let completions_path = default_completions_path();
+    let mut completed: std::collections::HashSet<(String, u32)> =
+        load_persisted_completed(completions_path.as_deref());
+    // Every workspace root observed on a stamped-`repo` event, live (#4583).
+    // Reconciliation also folds in the on-disk workspace registry (see
+    // `reconciliation_targets`) so a registered-but-quiet workspace is still
+    // scanned right after a restart, before any new event repopulates this set.
+    let mut known_workspaces: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Round-robins one workspace per reconciliation tick (see
+    // `reconciliation_targets`) rather than sweeping every known workspace in
+    // one tick, so one slow/offline `gh` cannot delay every other workspace's
+    // narration behind it.
+    let mut reconcile_cursor: usize = 0;
+    let mut reconcile_timer = tokio::time::interval(reconcile_interval());
+    reconcile_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // First tick fires immediately; skip it here so a freshly-started sink
+    // does not race its own first live events with an instant reconciliation
+    // pass over an empty `known_workspaces`/registry.
+    reconcile_timer.tick().await;
 
     loop {
-        let event = match subscription.recv().await {
-            Ok(event) => event,
-            Err(RecvError::Closed) => {
-                log::debug!("safehouse: event bus closed; narration sink stopping");
-                break;
-            }
-            // Empty/Lagged are surfaced as events by `recv`; only Closed ends it.
-            Err(_) => continue,
-        };
-
-        // One bus event can narrate more than one envelope: a `SweepExited`
-        // whose PR merged emits its `ack` **and** the public-feed `completion`
-        // (#4426), in that order.
+        // One iteration narrates the envelope(s) produced by exactly one bus
+        // event **or** one reconciliation tick — never both at once, so the
+        // `completed` dedup set is only ever touched from one place at a time
+        // (no cross-task race between the two trigger paths).
         let mut outbox: Vec<Envelope> = Vec::new();
+        let mut narrated_repo: Option<String> = None;
 
-        if let Some(mut envelope) = event_to_envelope(&event) {
-            // Best-effort dispatch-title enrichment (issue #4201, AC3). Only the
-            // dispatch event needs it, and only when a repo is known (needed to
-            // resolve the `gh` working directory) — every other event is narrated
-            // exactly as `event_to_envelope` built it.
-            if let Event::SweepGlobalDispatch {
-                kind: SweepKind::Issue(issue),
-                repo: Some(workspace_root),
-                ..
-            } = &event
-            {
-                if let Some(title) =
-                    fetch_title_cached(&mut title_cache, workspace_root, *issue).await
-                {
-                    envelope.body.push_str(&format!(" — \"{title}\""));
+        tokio::select! {
+            biased;
+
+            recv_result = subscription.recv() => {
+                let event = match recv_result {
+                    Ok(event) => event,
+                    Err(RecvError::Closed) => {
+                        log::debug!("safehouse: event bus closed; narration sink stopping");
+                        break;
+                    }
+                    // Empty/Lagged are surfaced as events by `recv`; only Closed ends it.
+                    Err(_) => continue,
+                };
+
+                if let Some(root) = event_repo(&event) {
+                    known_workspaces.insert(root.to_owned());
                 }
-            }
-            outbox.push(envelope);
-        }
 
-        // Public-feed completion (#4426). Needs the workspace root to resolve
-        // the `gh` working directory, so an event with no `repo` stamped
-        // narrates its `ack` only. Every failure inside degrades to `None`.
-        if let Event::SweepExited {
-            issue,
-            duration_sec,
-            repo: Some(workspace_root),
-            ..
-        } = &event
-        {
-            if let Some(completion) = completion_for_exit(
-                &config.persona,
-                workspace_root,
-                *issue,
-                *duration_sec,
-                Utc::now(),
-                &mut slug_cache,
-                &mut completed,
-                activity_db.as_ref(),
-            )
-            .await
-            {
-                outbox.push(completion);
+                // One bus event can narrate more than one envelope: a `SweepExited`
+                // whose PR merged emits its `ack` **and** the public-feed `completion`
+                // (#4426), in that order.
+                if let Some(mut envelope) = event_to_envelope(&event) {
+                    // Best-effort dispatch-title enrichment (issue #4201, AC3). Only the
+                    // dispatch event needs it, and only when a repo is known (needed to
+                    // resolve the `gh` working directory) — every other event is narrated
+                    // exactly as `event_to_envelope` built it.
+                    if let Event::SweepGlobalDispatch {
+                        kind: SweepKind::Issue(issue),
+                        repo: Some(workspace_root),
+                        ..
+                    } = &event
+                    {
+                        if let Some(title) =
+                            fetch_title_cached(&mut title_cache, workspace_root, *issue).await
+                        {
+                            envelope.body.push_str(&format!(" — \"{title}\""));
+                        }
+                    }
+                    outbox.push(envelope);
+                }
+
+                // Public-feed completion (#4426). Needs the workspace root to resolve
+                // the `gh` working directory, so an event with no `repo` stamped
+                // narrates its `ack` only. Every failure inside degrades to `None`.
+                if let Event::SweepExited {
+                    issue,
+                    duration_sec,
+                    repo: Some(workspace_root),
+                    ..
+                } = &event
+                {
+                    if let Some(completion) = completion_for_exit(
+                        &config.persona,
+                        workspace_root,
+                        *issue,
+                        *duration_sec,
+                        Utc::now(),
+                        &mut slug_cache,
+                        &mut completed,
+                        activity_db.as_ref(),
+                    )
+                    .await
+                    {
+                        outbox.push(completion);
+                        persist_completed_best_effort(completions_path.as_deref(), &completed);
+                    }
+                }
+
+                narrated_repo = event_repo(&event).map(ToOwned::to_owned);
+            }
+
+            _ = reconcile_timer.tick() => {
+                // Merge-reconciliation pass (#4583): covers a champion-tick
+                // merge, which has no live sweep — and so no `SweepExited` —
+                // to trigger the path above. One workspace per tick (see
+                // `reconcile_cursor`'s doc comment).
+                let targets = reconciliation_targets(&known_workspaces);
+                if let Some(workspace_root) = (!targets.is_empty())
+                    .then(|| targets[reconcile_cursor % targets.len()].clone())
+                {
+                    reconcile_cursor = reconcile_cursor.wrapping_add(1);
+                    let new_completions = reconcile_recent_merges(
+                        &config.persona,
+                        &workspace_root,
+                        &mut slug_cache,
+                        &mut completed,
+                        activity_db.as_ref(),
+                    )
+                    .await;
+                    if !new_completions.is_empty() {
+                        persist_completed_best_effort(completions_path.as_deref(), &completed);
+                    }
+                    outbox.extend(new_completions);
+                    narrated_repo = Some(workspace_root);
+                }
             }
         }
 
@@ -2189,8 +2583,9 @@ async fn run_sink(
         // Each envelope's room is resolved **per envelope** by attention class
         // (#4225), which is why one `SweepExited` can put its `ack` in the signal
         // room and (in a future taxonomy) chatter in the repo firehose — severity
-        // routes, and each message lands in exactly one room.
-        let narrated_repo = event_repo(&event).map(ToOwned::to_owned);
+        // routes, and each message lands in exactly one room. `narrated_repo` was
+        // captured above, inside whichever `select!` branch produced this
+        // iteration's `outbox` (a live event or a reconciliation tick).
         let mut send_failure: Option<SendError> = None;
         if let Some(connected) = client.as_mut() {
             for envelope in &outbox {
@@ -2669,6 +3064,38 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::sync::{Arc, Mutex};
     use tokio::net::UnixListener;
+
+    /// Test isolation guard (issue #4583). `run_sink` now reads/writes two
+    /// machine-level paths by default: the persisted merge-reconciliation
+    /// dedup file (`~/.loom/safehouse-completed.json`) and the workspace
+    /// registry (`~/.loom/workspaces.json`, consulted read-only as a
+    /// reconciliation-target source). A host actually running `loom-daemon`
+    /// has both populated with real state — without this guard, the test
+    /// suite would read/write that real state instead of a hermetic tempdir,
+    /// making both correctness (never touch a real daemon's files from a unit
+    /// test) and determinism (reconciliation's target set must not depend on
+    /// whatever repos happen to be registered on the machine running the
+    /// tests) fail silently. Every `run_sink` test holds one of these for its
+    /// duration; `Drop` restores the ambient (unset) env regardless of panic.
+    struct SafehouseTestPaths;
+
+    impl SafehouseTestPaths {
+        fn set(dir: &std::path::Path) -> Self {
+            std::env::set_var(COMPLETIONS_PATH_ENV, dir.join("safehouse-completed.json"));
+            std::env::set_var(
+                crate::workspace_registry::REGISTRY_PATH_ENV,
+                dir.join("workspaces.json"),
+            );
+            Self
+        }
+    }
+
+    impl Drop for SafehouseTestPaths {
+        fn drop(&mut self) {
+            std::env::remove_var(COMPLETIONS_PATH_ENV);
+            std::env::remove_var(crate::workspace_registry::REGISTRY_PATH_ENV);
+        }
+    }
 
     // ---- connection-state cell + wire rendering (#4345) ----
 
@@ -3972,6 +4399,7 @@ mod tests {
     #[serial]
     async fn run_sink_enriches_dispatch_body_with_title() {
         let dir = tempfile::tempdir().unwrap();
+        let _safehouse_test_paths = SafehouseTestPaths::set(dir.path());
         let (fake_gh, _log) = write_fake_gh(dir.path(), Some("Add repo-qualified task_id"));
         std::env::set_var(GH_BIN_ENV, &fake_gh);
 
@@ -4029,8 +4457,10 @@ mod tests {
     /// (blocker) line from the *same* repo lands in the signal room — one room per
     /// message, chosen by severity.
     #[tokio::test]
+    #[serial]
     async fn run_sink_routes_by_attention_class_and_creates_the_repo_room_lazily() {
         let dir = tempfile::tempdir().unwrap();
+        let _safehouse_test_paths = SafehouseTestPaths::set(dir.path());
         let repo = dir.path().to_string_lossy().into_owned();
         let repo_name = dir
             .path()
@@ -4105,8 +4535,10 @@ mod tests {
     /// the pre-#4225 one — one send per event addressed at the single configured
     /// room, and no `create_room` op ever.
     #[tokio::test]
+    #[serial]
     async fn run_sink_without_a_rooms_map_keeps_the_single_room_wire_shape() {
         let dir = tempfile::tempdir().unwrap();
+        let _safehouse_test_paths = SafehouseTestPaths::set(dir.path());
         let socket = dir.path().join("safehoused.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = tokio::spawn(stub_server(listener, false, 1));
@@ -4568,12 +5000,269 @@ mod tests {
         );
     }
 
+    // ---- periodic merge reconciliation: the champion-merge path (#4583) ----
+
+    /// A bulk `gh pr list --state merged` row shape (the reconciliation query):
+    /// carries `headRefName`/`createdAt` on top of the per-issue lookup's
+    /// fields, since the bulk query is not filtered to one issue's branch and
+    /// has no live sweep clock to borrow `started_at` from.
+    const RECONCILE_MERGED_PR_JSON: &str = r#"[{"number":4610,"headRefName":"feature/issue-4610","url":"https://github.com/rjwalters/loom/pull/4610","mergedAt":"2026-07-29T18:40:00Z","createdAt":"2026-07-29T18:10:00Z","title":"fix: champion-merge safehouse gap","additions":120,"deletions":18}]"#;
+
+    /// Two merged PRs in one bulk response: issue #4610 (already narrated
+    /// in-sweep) and issue #4611 (a distinct, not-yet-narrated champion merge).
+    const RECONCILE_TWO_MERGED_PRS_JSON: &str = r#"[
+        {"number":4610,"headRefName":"feature/issue-4610","url":"https://github.com/rjwalters/loom/pull/4610","mergedAt":"2026-07-29T18:40:00Z","createdAt":"2026-07-29T18:10:00Z","title":"fix: champion-merge safehouse gap","additions":120,"deletions":18},
+        {"number":4611,"headRefName":"feature/issue-4611","url":"https://github.com/rjwalters/loom/pull/4611","mergedAt":"2026-07-29T19:05:00Z","createdAt":"2026-07-29T18:50:00Z","title":"docs: unrelated cleanup","additions":4,"deletions":1}
+    ]"#;
+
+    #[tokio::test]
+    #[serial]
+    async fn reconcile_recent_merges_emits_completion_for_a_champion_driven_merge() {
+        // The AC1 case: no live sweep ever observed this merge (no `SweepExited`
+        // at merge time — the champion-tick steady state), so the only way it
+        // is discovered at all is the bulk reconciliation query.
+        let dir = tempfile::tempdir().unwrap();
+        let (fake_gh, _log) =
+            write_fake_forge_gh(dir.path(), Some(RECONCILE_MERGED_PR_JSON), Some("rjwalters/loom"));
+        std::env::set_var(GH_BIN_ENV, &fake_gh);
+
+        let root = dir.path().to_string_lossy().into_owned();
+        let mut slug_cache = HashMap::new();
+        let mut completed = std::collections::HashSet::new();
+        let envelopes =
+            reconcile_recent_merges("loom_daemon", &root, &mut slug_cache, &mut completed, None)
+                .await;
+
+        std::env::remove_var(GH_BIN_ENV);
+        assert_eq!(envelopes.len(), 1, "exactly one completion for the champion merge");
+        let meta = envelopes[0].meta.as_ref().unwrap();
+        assert_eq!(meta["schema"], json!("completion-v1"));
+        assert_eq!(meta["issue"], json!(4610));
+        assert_eq!(meta["result"], json!("success"));
+        assert_eq!(meta["title"], json!("fix: champion-merge safehouse gap"));
+        assert_eq!(meta["additions"], json!(120));
+        assert_eq!(meta["deletions"], json!(18));
+        assert!(
+            completed.contains(&(root, 4610)),
+            "the shared dedup set must record the reconciled merge"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn reconcile_recent_merges_skips_a_merge_already_narrated_in_sweep() {
+        // Regression (AC2): an in-sweep `SweepExited` narrates issue #4610
+        // first; the reconciliation pass then observes the *same* merge via
+        // its bulk query and must not double-post it — the two trigger paths
+        // share one dedup set.
+        let dir = tempfile::tempdir().unwrap();
+        let (fake_gh, log) =
+            write_fake_forge_gh(dir.path(), Some(RECONCILE_MERGED_PR_JSON), Some("rjwalters/loom"));
+        std::env::set_var(GH_BIN_ENV, &fake_gh);
+
+        let root = dir.path().to_string_lossy().into_owned();
+        let mut slug_cache = HashMap::new();
+        let mut completed = std::collections::HashSet::new();
+
+        let in_sweep = completion_for_exit(
+            "loom_daemon",
+            &root,
+            4610,
+            1800,
+            Utc::now(),
+            &mut slug_cache,
+            &mut completed,
+            None,
+        )
+        .await;
+        assert!(in_sweep.is_some(), "the in-sweep SweepExited path must narrate first");
+
+        let reconciled =
+            reconcile_recent_merges("loom_daemon", &root, &mut slug_cache, &mut completed, None)
+                .await;
+
+        std::env::remove_var(GH_BIN_ENV);
+        assert!(
+            reconciled.is_empty(),
+            "the reconciliation pass must not double-post a merge already narrated in-sweep"
+        );
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        assert_eq!(
+            calls.lines().filter(|l| l.starts_with("pr list")).count(),
+            2,
+            "both the per-issue lookup and the bulk reconciliation query must still run \
+             (the skip happens at the dedup check, not by avoiding the query); log: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn reconcile_recent_merges_narrates_distinct_issues_independently() {
+        // Edge case (AC4): two merges for different issues in the same
+        // workspace, one already narrated (in-sweep) and one not (champion-
+        // driven) — both must be handled independently with no cross-
+        // contamination of the dedup key.
+        let dir = tempfile::tempdir().unwrap();
+        let (fake_gh, _log) = write_fake_forge_gh(
+            dir.path(),
+            Some(RECONCILE_TWO_MERGED_PRS_JSON),
+            Some("rjwalters/loom"),
+        );
+        std::env::set_var(GH_BIN_ENV, &fake_gh);
+
+        let root = dir.path().to_string_lossy().into_owned();
+        let mut slug_cache = HashMap::new();
+        let mut completed = std::collections::HashSet::new();
+        // Issue #4610 was already narrated in-sweep before this reconciliation
+        // tick ever ran.
+        completed.insert((root.clone(), 4610));
+
+        let envelopes =
+            reconcile_recent_merges("loom_daemon", &root, &mut slug_cache, &mut completed, None)
+                .await;
+
+        std::env::remove_var(GH_BIN_ENV);
+        assert_eq!(envelopes.len(), 1, "only the not-yet-narrated issue produces a completion");
+        assert_eq!(envelopes[0].meta.as_ref().unwrap()["issue"], json!(4611));
+        assert!(completed.contains(&(root.clone(), 4610)));
+        assert!(completed.contains(&(root, 4611)));
+    }
+
+    #[test]
+    fn load_persisted_completed_round_trips_through_persist_completed_best_effort() {
+        // Building block for AC3 (restart survival): what one process wrote,
+        // the next process's startup load must read back identically.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("safehouse-completed.json");
+
+        let mut completed: std::collections::HashSet<(String, u32)> =
+            std::collections::HashSet::new();
+        completed.insert(("/home/x/GitHub/loom".to_owned(), 4610));
+        completed.insert(("/home/x/GitHub/loom".to_owned(), 4611));
+        completed.insert(("/home/x/GitHub/vibesql".to_owned(), 42));
+        persist_completed_best_effort(Some(&path), &completed);
+
+        let reloaded = load_persisted_completed(Some(&path));
+        assert_eq!(reloaded, completed);
+    }
+
+    #[test]
+    fn load_persisted_completed_degrades_to_empty_when_the_file_is_absent_or_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            load_persisted_completed(Some(&dir.path().join("does-not-exist.json"))),
+            std::collections::HashSet::new()
+        );
+
+        let corrupt = dir.path().join("corrupt.json");
+        std::fs::write(&corrupt, "not valid json").unwrap();
+        assert_eq!(load_persisted_completed(Some(&corrupt)), std::collections::HashSet::new());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn run_sink_reconciliation_narrates_a_champion_merge_with_no_live_sweep() {
+        // End-to-end AC1: reconciliation alone — no `SweepExited` published at
+        // all — must still get the completion onto the wire, discovered
+        // purely from the registered workspace + the bulk `gh pr list` query.
+        let dir = tempfile::tempdir().unwrap();
+        let _safehouse_test_paths = SafehouseTestPaths::set(dir.path());
+        let (fake_gh, _log) =
+            write_fake_forge_gh(dir.path(), Some(RECONCILE_MERGED_PR_JSON), Some("rjwalters/loom"));
+        std::env::set_var(GH_BIN_ENV, &fake_gh);
+        // A fast reconciliation cadence so the test does not wait minutes.
+        std::env::set_var(RECONCILE_INTERVAL_ENV, "20");
+        // Register the workspace directly (mirrors what a real multi-repo
+        // daemon already has on disk) so reconciliation has a target with zero
+        // live events ever having flowed through the sink for it.
+        let mut registry = crate::workspace_registry::WorkspaceRegistry::default();
+        registry.add(dir.path(), None).unwrap();
+        registry
+            .save(&std::path::PathBuf::from(
+                std::env::var(crate::workspace_registry::REGISTRY_PATH_ENV).unwrap(),
+            ))
+            .unwrap();
+
+        let socket = dir.path().join("safehoused.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(stub_server(listener, false, 1));
+
+        let bus = Arc::new(EventBus::new());
+        let subscription = bus.subscribe(Vec::<String>::new());
+        let sink = tokio::spawn(run_sink(
+            SafehouseConfig {
+                enabled: true,
+                socket: Some(socket.clone()),
+                ..SafehouseConfig::default()
+            },
+            socket,
+            subscription,
+            Duration::from_millis(20),
+            Duration::from_millis(80),
+            new_shared_state(),
+            None,
+        ));
+
+        // No SweepExited is ever published — the only way this can reach the
+        // wire is the reconciliation pass.
+        let received = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("reconciliation must narrate the champion merge without any live sweep")
+            .unwrap();
+
+        drop(bus);
+        let _ = tokio::time::timeout(Duration::from_secs(2), sink).await;
+        std::env::remove_var(GH_BIN_ENV);
+        std::env::remove_var(RECONCILE_INTERVAL_ENV);
+
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0]["type"], json!("completion"));
+        assert_eq!(received[0]["meta"]["issue"], json!(4610));
+        assert_eq!(received[0]["meta"]["result"], json!("success"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn reconcile_recent_merges_does_not_repost_a_merge_loaded_from_a_persisted_restart_file()
+    {
+        // AC3, the other half: a merge already narrated by a *previous* daemon
+        // process must not be re-posted by a fresh process's reconciliation
+        // pass just because its in-memory `completed` set starts empty —
+        // `load_persisted_completed` (exactly what `run_sink` calls at
+        // startup) is what makes that survive the restart.
+        let dir = tempfile::tempdir().unwrap();
+        let (fake_gh, _log) =
+            write_fake_forge_gh(dir.path(), Some(RECONCILE_MERGED_PR_JSON), Some("rjwalters/loom"));
+        std::env::set_var(GH_BIN_ENV, &fake_gh);
+
+        let root = dir.path().to_string_lossy().into_owned();
+        let completions_path = dir.path().join("safehouse-completed.json");
+        let mut pre_seeded = std::collections::HashSet::new();
+        pre_seeded.insert((root.clone(), 4610));
+        persist_completed_best_effort(Some(&completions_path), &pre_seeded);
+
+        // Simulate the fresh process's startup load.
+        let mut completed = load_persisted_completed(Some(&completions_path));
+        let mut slug_cache = HashMap::new();
+        let envelopes =
+            reconcile_recent_merges("loom_daemon", &root, &mut slug_cache, &mut completed, None)
+                .await;
+
+        std::env::remove_var(GH_BIN_ENV);
+        assert!(
+            envelopes.is_empty(),
+            "a merge already narrated pre-restart must not be re-posted after loading the \
+             persisted dedup set"
+        );
+    }
+
     #[tokio::test]
     #[serial]
     async fn run_sink_narrates_exit_ack_then_completion() {
         // The emit-point mapping test: one `SweepExited` whose PR merged
         // produces the human `ack` and exactly one public-feed `completion`.
         let dir = tempfile::tempdir().unwrap();
+        let _safehouse_test_paths = SafehouseTestPaths::set(dir.path());
         let (fake_gh, _log) =
             write_fake_forge_gh(dir.path(), Some(MERGED_PR_JSON), Some("rjwalters/loom"));
         std::env::set_var(GH_BIN_ENV, &fake_gh);
@@ -4639,6 +5328,7 @@ mod tests {
     #[serial]
     async fn run_sink_narrates_only_the_ack_when_nothing_merged() {
         let dir = tempfile::tempdir().unwrap();
+        let _safehouse_test_paths = SafehouseTestPaths::set(dir.path());
         let (fake_gh, _log) = write_fake_forge_gh(dir.path(), Some("[]"), Some("rjwalters/loom"));
         std::env::set_var(GH_BIN_ENV, &fake_gh);
 
@@ -4876,8 +5566,10 @@ mod tests {
     /// `unreachable` when safehoused rejects the send, and clears back to
     /// `connected` once a send is accepted (config fixed + daemon restarted).
     #[tokio::test]
+    #[serial]
     async fn sink_send_rejection_reports_send_rejected_then_clears_on_success() {
         let dir = tempfile::tempdir().unwrap();
+        let _safehouse_test_paths = SafehouseTestPaths::set(dir.path());
         let socket = dir.path().join("safehoused.sock");
         let listener = UnixListener::bind(&socket).unwrap();
 
@@ -4968,8 +5660,10 @@ mod tests {
     /// fresh `hello` after a transport blip must NOT flash "connected"; only an
     /// accepted send clears it.
     #[tokio::test]
+    #[serial]
     async fn sink_send_rejected_survives_reconnect() {
         let dir = tempfile::tempdir().unwrap();
+        let _safehouse_test_paths = SafehouseTestPaths::set(dir.path());
         let socket = dir.path().join("safehoused.sock");
         let listener = UnixListener::bind(&socket).unwrap();
 
@@ -5107,10 +5801,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn absent_peer_degrades_without_blocking() {
         // enabled + nonexistent socket: the sink subscribes, but every connect
         // fails and is swallowed — publishing never blocks or errors.
         let dir = tempfile::tempdir().unwrap();
+        let _safehouse_test_paths = SafehouseTestPaths::set(dir.path());
         let socket = dir.path().join("does-not-exist.sock");
         let bus = Arc::new(EventBus::new());
         let subscription = bus.subscribe(Vec::<String>::new());
@@ -5158,8 +5854,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn reconnects_after_mid_run_disconnect() {
         let dir = tempfile::tempdir().unwrap();
+        let _safehouse_test_paths = SafehouseTestPaths::set(dir.path());
         let socket = dir.path().join("safehoused.sock");
 
         // First listener: serve one send, then drop (simulating a restart).

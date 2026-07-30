@@ -552,13 +552,35 @@ safehoused's egress subsystem mirrors well-formed **`completion`** envelopes out
 of allowlisted rooms — redacted and delay-buffered — to a `sink_url`; that is
 what feeds the public fleet feed on 2amlogic.com. Loom is the producer:
 
-- **Emit point**: the narration sink, on `SweepExited`. Exit status alone proves
-  nothing, so the sink checks **forge truth** (`gh pr list --head
-  feature/issue-N --state merged`, in the event's workspace root, 10s timeout)
-  and emits the `completion` only when that issue's PR actually merged — the
-  `ack` still goes out either way. Chosen over having the sweep child publish a
-  post-merge phase event because it is daemon-only (no skill edit), has the
-  sweep timing to hand, and verifies rather than trusts.
+- **Emit point (two, since #4583)**:
+  1. The narration sink, on `SweepExited`. Exit status alone proves nothing, so
+     the sink checks **forge truth** (`gh pr list --head feature/issue-N
+     --state merged`, in the event's workspace root, 10s timeout) and emits
+     the `completion` only when that issue's PR actually merged — the `ack`
+     still goes out either way. Chosen over having the sweep child publish a
+     post-merge phase event because it is daemon-only (no skill edit), has the
+     sweep timing to hand, and verifies rather than trusts.
+  2. **Periodic merge reconciliation** (`reconcile_recent_merges`, #4583): the
+     `SweepExited` path only ever fires while a sweep process is alive to exit
+     — it structurally cannot see a PR that merges *after* the sweep already
+     exited, which is the **common steady-state path**: builder opens a PR,
+     judge approves, the sweep exits, and champion merges it minutes-to-hours
+     later on its own cron tick. On a fixed cadence (`safehouse.reconcile
+     Interval`, default 5 minutes; `LOOM_SAFEHOUSE_RECONCILE_INTERVAL_MS`
+     overrides it, primarily a test seam), the sink round-robins one workspace
+     at a time — drawn from the union of every repo it has observed a
+     stamped-`repo` event for and the on-disk `WorkspaceRegistry` — and runs
+     one **bulk**, branch-unfiltered `gh pr list --state merged --json
+     number,headRefName,url,mergedAt,createdAt,title,additions,deletions
+     --limit 30`. Each row's issue number is recovered from `headRefName` via
+     the `feature/issue-<N>` convention
+     (`worktree_ops::naming::issue_from_branch`); rows that do not match are
+     skipped (not every merged PR is an issue sweep). A row with no sweep clock
+     available uses the PR's own `createdAt`/`mergedAt` pair as the
+     `started_at`/`completed_at` proxy instead of the reaper's clock. Both
+     paths funnel through the same envelope-build/dedup-insert core
+     (`build_and_narrate_completion`), so "exactly one completion per merge"
+     holds regardless of which path observes it first.
 - **`meta` (`completion-v1`)**: `{schema, agent, repo, ref, result, started_at,
   completed_at}` required, plus optional `issue`/`tokens`/`title`/`additions`/
   `deletions` (envelope-v1 preserves unknown `meta` keys, so no schema rev is
@@ -598,9 +620,18 @@ what feeds the public fleet feed on 2amlogic.com. Loom is the producer:
   unfinished, not failed, and is usually resumed). The wire support exists
   (`CompletionResult::Failure`) for a follow-up that identifies a genuinely
   terminal negative outcome.
-- **At most one per merge**, deduped on `(workspace, issue)` for the daemon's
-  lifetime, so a resumed sweep's second `SweepExited` does not double-post.
-  Downstream ingest is additionally idempotent on `event_id`.
+- **At most one per merge**, deduped on `(workspace, issue)` — shared by
+  **both** emit points above, so a resumed sweep's second `SweepExited` does
+  not double-post, and the periodic reconciliation pass does not re-post a
+  merge the `SweepExited` path already narrated (in either order — whichever
+  path observes the merge first wins; the other becomes a no-op dedup check).
+  This dedup set is **persisted** to `~/.loom/safehouse-completed.json`
+  (`LOOM_SAFEHOUSE_COMPLETIONS_PATH` overrides the path) and reloaded at
+  startup — the in-memory set alone would not survive a daemon restart, which
+  would otherwise either re-post every prior completion (if reconciliation's
+  lookback window still covered them) or silently drop a merge that happened
+  while the daemon was down. Downstream ingest is additionally idempotent on
+  `event_id`.
 - **Strict client-side construction.** safehoused **silently degrades a
   malformed `meta` to `chat`** — the event then vanishes from the feed with no
   error anywhere — so `build_send_request` refuses to send a `completion` unless
