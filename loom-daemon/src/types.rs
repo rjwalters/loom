@@ -1567,12 +1567,30 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         repo: Option<String>,
     },
-    /// `sweep.issue.{N}.exited` — reaper detected clean exit.
+    /// `sweep.issue.{N}.exited` — reaper detected clean exit (no checkpoint).
     SweepExited {
         issue: u32,
         #[serde(skip_serializing_if = "Option::is_none")]
         exit_code: Option<i32>,
         duration_sec: i64,
+        /// Issue #4366: classifies this checkpoint-less exit as a genuine
+        /// no-lifecycle-progress death (`true`) vs an ordinary/benign exit
+        /// (`false`) — e.g. a legitimate self-skip / already-done no-work
+        /// exit, or a clean exit that produced an open linked PR or a closed
+        /// issue. `true` requires ALL of: `exit_code == Some(0)`, no open
+        /// linked PR, and the issue *verifiably* open (a positive "open"
+        /// verdict — a failed/timed-out forge probe fails open and yields
+        /// `false`, per PR #4408's review) — the reaper counts a `true`
+        /// verdict toward the insta-crash quarantine tally instead of
+        /// resetting it, so a headless child that repeatedly parks on a
+        /// monitored background task and exits 0 (the observed "cache
+        /// download is running in the background... I'll pick this back up"
+        /// signature) can no longer churn the dispatch queue forever without
+        /// ever being counted as a failure. `#[serde(default)]` keeps
+        /// pre-#4366 wire data compatible (defaults to `false`, the prior
+        /// behavior).
+        #[serde(default)]
+        no_progress: bool,
         /// Issue #4386: set to a claude-wrapper pre-flight-death label (e.g.
         /// `"preflight-mcp-failed"`, `"preflight-no-cli-start"`) when the
         /// reaper's [`crate::sweep_registry::classify_preflight_death`]-derived
@@ -1910,6 +1928,7 @@ mod tests {
             issue: 7,
             exit_code: Some(0),
             duration_sec: 5,
+            no_progress: false,
             death_class: None,
             repo: None,
         };
@@ -1973,6 +1992,7 @@ mod tests {
             issue: 1,
             exit_code: None,
             duration_sec: 0,
+            no_progress: false,
             death_class: None,
             repo: None,
         };

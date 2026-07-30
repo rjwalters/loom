@@ -515,6 +515,7 @@ mod tests {
             issue: 42,
             exit_code: Some(0),
             duration_sec: 12,
+            no_progress: false,
             death_class: None,
             repo: None,
         });
