@@ -1,6 +1,6 @@
 {
   "loom_version": "0.16.0",
-  "loom_commit": "60d31799",
+  "loom_commit": "edb624da",
   "install_date": "2026-04-21",
   "loom_source": "/Users/rwalters/GitHub/loom",
   "installed_files": [
@@ -37,5 +37,5 @@
     ".loom/README.md",
     "CLAUDE.md"
   ],
-  "last_resync": "2026-07-29"
+  "last_resync": "2026-07-30"
 }
