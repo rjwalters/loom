@@ -653,7 +653,13 @@ enum WorkspaceAction {
 }
 
 /// Sub-actions for `loom-daemon fleet` (epic #4340).
+// `AddWorker` legitimately carries many operator-supplied `--safehouse-*`
+// flags (#3998) next to `Drain`/`Status`'s few fields — boxing individual
+// clap-derive `Option`/`Vec` fields would break the derive macro's
+// Option-arity detection for negligible benefit on a parsed-once-at-startup
+// CLI enum, so this size skew is accepted rather than worked around.
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum FleetAction {
     /// Bootstrap a provisioned host into a working loom worker (issue #4341).
     /// Runs an ordered, idempotent plan over `ssh <ssh-host>`: base deps, the
@@ -693,10 +699,58 @@ enum FleetAction {
         #[arg(long, value_name = "URL", default_value = loom_daemon::fleet::add_worker::DEFAULT_LOOM_REPO_URL)]
         loom_repo: String,
 
-        /// Wire safehouse fleet-comms on the worker. Config-gated: skip-with-notice
-        /// until #3998 (the safehoused provisioning fragment) lands.
+        /// Wire safehouse fleet-comms on the worker (issue #3998): tailnet
+        /// join, `safehoused` build/config/room-invite/supervision, then a
+        /// restart of the worker's own loom-daemon with `LOOM_SAFEHOUSE_*`
+        /// env. Requires every `--safehouse-*` input below; preflight fails
+        /// fast (before touching the host) if any is missing.
         #[arg(long)]
         safehouse: bool,
+
+        /// Local path to the operator-minted, ephemeral + `tag:loom-worker`
+        /// Tailscale auth key. Read locally at preflight; transferred to the
+        /// worker only via ssh stdin. Required with `--safehouse`.
+        #[arg(long, value_name = "PATH")]
+        safehouse_tailnet_auth_key_file: Option<String>,
+
+        /// Local path to a `KEY=VALUE` env-style file carrying the per-host
+        /// Matrix account credentials and store/recovery passphrases
+        /// (`SAFEHOUSE_MATRIX_USER_ID`, `SAFEHOUSE_MATRIX_PASSWORD`,
+        /// `SAFEHOUSE_STORE_PASSPHRASE`, `SAFEHOUSE_RECOVERY_PASSPHRASE`).
+        /// Read locally at preflight; transferred to the worker only via ssh
+        /// stdin. Required with `--safehouse`.
+        #[arg(long, value_name = "PATH")]
+        safehouse_secrets_file: Option<String>,
+
+        /// The external `rjwalters/safehouse` checkout `safehoused` is built
+        /// from on the worker.
+        #[arg(long, value_name = "URL", default_value = loom_daemon::fleet::add_worker::DEFAULT_SAFEHOUSE_REPO_URL)]
+        safehouse_repo_url: String,
+
+        /// The homeserver URL (resolves inside the tailnet) written into
+        /// safehoused's config. Not secret. Required with `--safehouse`.
+        #[arg(long, value_name = "URL")]
+        safehouse_homeserver_url: Option<String>,
+
+        /// The fleet room safehoused joins. Not secret. Required with
+        /// `--safehouse`.
+        #[arg(long, value_name = "ROOM")]
+        safehouse_room: Option<String>,
+
+        /// A persona this host's safehoused boots with (repeat for several).
+        /// Mirrors the studio host's allowlist (#3999). Not secret. At least
+        /// one is required with `--safehouse` — the allowlist is written
+        /// into the boot-time TOML before safehoused's first start
+        /// (boot-time-only, no reload).
+        #[arg(long = "safehouse-persona", value_name = "NAME")]
+        safehouse_personas: Vec<String>,
+
+        /// Override the safehouse#39 room-`invite` op invocation (loom does
+        /// not vendor safehoused's argv — owned by the external
+        /// `rjwalters/safehouse` repo). Default: `safehoused invite --config
+        /// <path>`.
+        #[arg(long, value_name = "ARGV")]
+        safehouse_invite_exec: Option<String>,
 
         /// Install an idle-shutdown cron guard that powers the host off after
         /// this many idle minutes (skipping while claude / loom-daemon work).
@@ -729,8 +783,9 @@ enum FleetAction {
     /// a drain-then-*exit* remote invocation (never restart into new dispatch
     /// on a box about to be powered off), an immediate targeted `loom:building`
     /// claim reset via `gh` (not SSH — the forge is global), a safehoused
-    /// key-backup flush check (a documented stub pending #3998 — see
-    /// `loom_daemon::fleet::drain`'s module doc), workspace deregistration, and
+    /// key-backup flush check (a supervised `systemctl --user stop
+    /// safehoused` IS the flush, #3998 — see `loom_daemon::fleet::drain`'s
+    /// module doc), workspace deregistration, and
     /// finally removing the worker from the fleet registry. Idempotent +
     /// resumable: an interrupted drain re-runs from its last completed phase.
     /// Never calls a cloud CLI itself — prints the exact `repo:remote --down`
@@ -5615,6 +5670,13 @@ fn handle_fleet_command(action: FleetAction) -> Result<()> {
             accounts_env,
             loom_repo,
             safehouse,
+            safehouse_tailnet_auth_key_file,
+            safehouse_secrets_file,
+            safehouse_repo_url,
+            safehouse_homeserver_url,
+            safehouse_room,
+            safehouse_personas,
+            safehouse_invite_exec,
             idle_shutdown_minutes,
             dry_run,
         } => {
@@ -5628,6 +5690,13 @@ fn handle_fleet_command(action: FleetAction) -> Result<()> {
                 accounts_env_file: accounts_env.map(PathBuf::from),
                 safehouse_enabled: safehouse,
                 idle_shutdown_minutes,
+                safehouse_tailnet_auth_key_file: safehouse_tailnet_auth_key_file.map(PathBuf::from),
+                safehouse_secrets_file: safehouse_secrets_file.map(PathBuf::from),
+                safehouse_repo_url,
+                safehouse_homeserver_url,
+                safehouse_room,
+                safehouse_personas,
+                safehouse_invite_exec,
             };
             add_worker::run(&config)
         }
@@ -5646,8 +5715,8 @@ fn handle_fleet_command(action: FleetAction) -> Result<()> {
             // Resolved once, from the operator's own cwd (mirrors
             // `WorkspacePool::start_safehouse_narration`'s
             // `safehouse::resolve_config(repo_root)` call shape) — see
-            // `fleet::drain::flush_safehouse`'s doc comment for why this is a
-            // documented stub, not a real flush, pending #3998.
+            // `fleet::drain::flush_safehouse`'s doc comment for the real
+            // supervised-stop flush check this now gates on (#3998).
             let cwd = std::env::current_dir().context("resolving cwd for safehouse config")?;
             let safehouse_enabled = loom_daemon::safehouse::resolve_config(&cwd).enabled;
 

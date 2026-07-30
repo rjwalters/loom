@@ -18,10 +18,13 @@ below.
 > **Out of scope** (tracked separately): per-worker personas (`loom_builder_42`)
 > and `SAFEHOUSE_PERSONA` forwarding to workers → **#3999**; inbound **human**
 > steering (reading `@`-mentions back to agents) → follow-up (it reuses the same
-> inbound read task #4028 adds); cloud-host provisioning of `safehoused` →
-> **#3998**; carrying the judge verdict value in an event payload (needs a
-> frozen-taxonomy amendment) → follow-up; the **atomic cross-host claim
-> authority** (a real CAS behind the soft claim) → Phase 2 of #4028.
+> inbound read task #4028 adds); carrying the judge verdict value in an event
+> payload (needs a frozen-taxonomy amendment) → follow-up; the **atomic
+> cross-host claim authority** (a real CAS behind the soft claim) → Phase 2 of
+> #4028. Cloud-host provisioning of `safehoused` (formerly tracked here as
+> **#3998**) has landed — see
+> [Fleet provisioning: cloud workers](#fleet-provisioning-cloud-workers-fleet-add-worker---safehouse-3998)
+> below.
 
 ## The degradation contract (read this first)
 
@@ -250,6 +253,99 @@ wrapper only supervises an operator-supplied binary and bakes a minimal,
 non-secret environment (`SAFEHOUSED_SOCKET` / `SAFEHOUSED_CONFIG` when
 provided; never a forwarded token). If the safehouse repo ships its own service
 files, point the runbook at those and treat this generator as the fallback.
+
+## Fleet provisioning: cloud workers (`fleet add-worker --safehouse`, #3998)
+
+The onboarding runbook above is for an interactive host an operator sets up by
+hand. `loom-daemon fleet add-worker <ssh-host> --repo <owner/name> --safehouse
+<inputs>` (epic #4340, `loom-daemon/src/fleet/add_worker.rs`) is the same
+onboarding **encoded as an ordered, idempotent plan** that a cloud worker's
+spin-up runs unattended over SSH — no cloud-init fragment, no cloud CLI, no
+Tailscale API call from loom itself (epic #4340's boundary: a VM comes from
+`repo:remote`, loom only consumes "a reachable box + an SSH alias").
+
+### What the plan does
+
+With `--safehouse`, `fleet add-worker` appends seven steps after the plain
+worker's bootstrap (each following the same check/apply contract as the rest
+of the plan, so a re-run against an already-provisioned host reports every one
+`AlreadyDone`):
+
+1. **`safehouse-tailscale-install`** — installs the `tailscale` apt package.
+2. **`safehouse-tailscale-join`** — `tailscale up --auth-key=file:<path>` with
+   the operator-minted key (below). No `--advertise-tags`: the tag is baked
+   into the key server-side.
+3. **`safehouse-build`** — `cargo build --release -p safehoused` from a fresh
+   `rjwalters/safehouse` checkout.
+4. **`safehouse-config`** — writes `~/.loom/safehoused/config.toml` (`0600`):
+   homeserver URL, the per-host Matrix account, fresh store/recovery
+   passphrases, and the persona allowlist. **Must precede step 6** — the
+   allowlist is boot-time-only (no reload), and the plan's step order enforces
+   this (asserted in `add_worker.rs`'s tests).
+5. **`safehouse-room-invite`** — joins the fleet room via
+   [safehouse#39](https://github.com/rjwalters/safehouse/issues/39)'s
+   daemon-side `invite` op — never raw CS-API temporary devices. loom does not
+   vendor this invocation (owned by the external repo); override it with
+   `--safehouse-invite-exec "<argv>"` if it changes upstream.
+6. **`safehouse-supervise`** — installs `safehoused` under `systemd --user` via
+   [`safehoused-service.sh`](#supervised-service-wrapper-safehoused-servicesh-4346)
+   (the same script the interactive runbook uses) and enables lingering.
+7. **`safehouse-daemon-restart`** — wires `LOOM_SAFEHOUSE_ENABLED` /
+   `_SOCKET` / `_ROOM` into the worker's own `loom-daemon` systemd unit and
+   restarts it — env-only, per #3997's decision (no worker-side
+   `.loom/config.json` edit).
+
+**Without `--safehouse`, behavior is byte-for-byte unchanged**: a single
+`safehouse` skip-with-notice entry, a plain worker, zero safehouse
+provisioning.
+
+### Inputs the operator must mint
+
+Every secret travels the same way `AddWorkerConfig`'s existing `--pat-file` /
+`--accounts-env` do: read locally at preflight, transferred to the worker only
+over **ssh stdin**, landing only in `0600` files. None of these ever appear on
+a command line, in the rendered `--dry-run` plan text, in a daemon log at any
+level, or in the fleet registry.
+
+| Flag | Contents | Notes |
+|---|---|---|
+| `--safehouse-tailnet-auth-key-file PATH` | A Tailscale auth key | **Operator-minted, ephemeral + `tag:loom-worker`** — loom never calls the Tailscale API. Ephemeral means a dead VM auto-deregisters from the tailnet with no fleet-roster bookkeeping. |
+| `--safehouse-secrets-file PATH` | `KEY=VALUE` lines: `SAFEHOUSE_MATRIX_USER_ID`, `SAFEHOUSE_MATRIX_PASSWORD`, `SAFEHOUSE_STORE_PASSPHRASE`, `SAFEHOUSE_RECOVERY_PASSPHRASE` | The Matrix account is **operator-created** on the homeserver (the [safehouse#25 verified sequence](#operator-setup-provisioning-the-persona-requires-a-safehoused-restart)) — `fleet add-worker` never needs homeserver admin credentials, only the resulting account. Passphrases are freshly generated per host. |
+| `--safehouse-homeserver-url URL` | Not secret | Must resolve inside the tailnet. |
+| `--safehouse-room ROOM` | Not secret | The fleet room this host joins. |
+| `--safehouse-persona NAME` (repeatable) | Not secret | Mirrors the studio host's allowlist (#3999) — at least one required. |
+| `--safehouse-repo-url URL` | Not secret | Defaults to `rjwalters/safehouse`. |
+| `--safehouse-invite-exec "ARGV"` | Not secret | Overrides the default `safehoused invite --config <path>` if safehouse#39's CLI surface changes upstream. |
+
+`--safehouse` with any of the first five omitted fails **preflight** — before
+any SSH connection — with a message naming exactly which flag is missing (no
+half-joined host).
+
+### Required tailnet ACL
+
+The auth key's `tag:loom-worker` is expected to carry an ACL restricting
+workers to reaching only the homeserver's `443`, not the rest of the tailnet.
+loom documents this requirement; it does not manage the tailnet ACL itself
+(epic #4340's boundary — no Tailscale API call from this repo).
+
+### Teardown: `fleet drain`'s flush verification
+
+`fleet drain <ssh-host>`'s `flush-safehouse` phase (`loom-daemon/src/fleet/drain.rs`)
+is the spin-up's counterpart: it stops the worker's `safehoused` unit over SSH
+(`systemctl --user stop safehoused`) — a supervised stop **is** the flush,
+since safehoused's SIGTERM/ctrl-c shutdown path calls
+`client.encryption().backups().wait_for_steady_state()` and prints
+`"safehoused: room-key backup flushed; bye"` before exiting — then verifies via
+the journal line, falling back to the unit's `ExecMainStatus` when the journal
+has rotated. The verdict maps onto drain's existing contract:
+
+- `safehouse.enabled == false` — `Skipped`, no room keys in play, exit `0`.
+- Flush verified — `Changed`, eligible for "safe to power off", exit `0`.
+- Flush **not** verified (nonzero remote exit, or the host was unreachable) —
+  `Unverified`; the drain still completes (workspace/roster cleanup proceed —
+  loom never refuses to retire a box over this), but the report withholds
+  "safe to power off" and exits `3` so an operator/monitor treats it as a flag,
+  not a clean success.
 
 ## What gets narrated
 

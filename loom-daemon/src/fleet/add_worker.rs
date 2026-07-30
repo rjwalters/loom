@@ -32,6 +32,27 @@ use super::{
 /// Default upstream Loom repo cloned to the worker's machine-level layout.
 pub const DEFAULT_LOOM_REPO_URL: &str = "https://github.com/rjwalters/loom";
 
+/// Default checkout the `safehoused` binary is built from on the worker
+/// (issue #3998's spin-up half — `safehoused` itself is owned by the external
+/// `rjwalters/safehouse` repo, never vendored here).
+pub const DEFAULT_SAFEHOUSE_REPO_URL: &str = "https://github.com/rjwalters/safehouse";
+
+/// The AF_UNIX socket path `safehoused` is supervised to bind on a fleet
+/// worker, and the value wired into the worker's `loom-daemon` unit as
+/// `LOOM_SAFEHOUSE_SOCKET` (#3998). Deterministic (not resolved via the
+/// shared `mcp-config.sh` chain) so the two ends of the pipe always agree on
+/// a fresh worker with no prior `.loom/config.json` safehouse block.
+const SAFEHOUSE_SOCKET_PATH: &str = "$HOME/.loom/safehoused.sock";
+
+/// Default invocation for the safehouse#39 daemon-side room-membership
+/// `invite` op, run once against the freshly-written config so the host's
+/// Matrix account joins the fleet room without raw CS-API temp devices.
+/// Overridable via `--safehouse-invite-exec` (mirrors
+/// `safehoused-service.sh`'s `--exec`: this repo does not vendor safehoused's
+/// argv, since that is owned by the external `rjwalters/safehouse` repo).
+const DEFAULT_SAFEHOUSE_INVITE_EXEC: &str =
+    r#"safehoused invite --config "$HOME/.loom/safehoused/config.toml""#;
+
 /// Base directory (systemd `%h`-relative) under which workspace repos are
 /// cloned on the worker.
 const WORKSPACE_BASE: &str = "loom-workspaces";
@@ -63,6 +84,36 @@ pub struct AddWorkerConfig {
     /// Idle-shutdown guard: power the host off after this many idle minutes.
     /// `None` disables the guard.
     pub idle_shutdown_minutes: Option<u32>,
+    /// Local path to the operator-minted, ephemeral + `tag:loom-worker`
+    /// Tailscale auth key. Read locally at preflight; transferred to the
+    /// worker only via ssh stdin. Required when `safehouse_enabled`.
+    pub safehouse_tailnet_auth_key_file: Option<PathBuf>,
+    /// Local path to a `KEY=VALUE` env-style file carrying the per-host
+    /// Matrix account credentials and store/recovery passphrases
+    /// (`SAFEHOUSE_MATRIX_USER_ID`, `SAFEHOUSE_MATRIX_PASSWORD`,
+    /// `SAFEHOUSE_STORE_PASSPHRASE`, `SAFEHOUSE_RECOVERY_PASSPHRASE`). Read
+    /// locally at preflight; transferred to the worker only via ssh stdin.
+    /// Required when `safehouse_enabled`.
+    pub safehouse_secrets_file: Option<PathBuf>,
+    /// The external `rjwalters/safehouse` checkout `safehoused` is built
+    /// from on the worker.
+    pub safehouse_repo_url: String,
+    /// The homeserver URL (resolves inside the tailnet) written into
+    /// safehoused's config. Not secret. Required when `safehouse_enabled`.
+    pub safehouse_homeserver_url: Option<String>,
+    /// The fleet room safehoused joins. Not secret. Required when
+    /// `safehouse_enabled`.
+    pub safehouse_room: Option<String>,
+    /// The persona allowlist this host's `safehoused` boots with — mirrors
+    /// the studio host's allowlist (#3999). Not secret. Must be non-empty
+    /// when `safehouse_enabled`; written into the boot-time TOML **before**
+    /// safehoused's first start (hard ordering constraint — no reload).
+    pub safehouse_personas: Vec<String>,
+    /// Override for the safehouse#39 room-`invite` op invocation. `None`
+    /// uses [`DEFAULT_SAFEHOUSE_INVITE_EXEC`]. loom does not vendor
+    /// safehoused's real CLI surface (owned by the external repo), so this
+    /// mirrors `safehoused-service.sh --exec`.
+    pub safehouse_invite_exec: Option<String>,
 }
 
 /// Secret payloads read locally during preflight, then fed to the plan over
@@ -73,6 +124,12 @@ pub struct Secrets {
     pub pat: Option<String>,
     /// `accounts.env` contents, if `--accounts-env` was supplied.
     pub accounts_env: Option<String>,
+    /// Tailnet auth-key contents, if `--safehouse-tailnet-auth-key-file` was
+    /// supplied.
+    pub safehouse_tailnet_auth_key: Option<String>,
+    /// The safehouse secrets env-file contents, if
+    /// `--safehouse-secrets-file` was supplied.
+    pub safehouse_secrets: Option<String>,
 }
 
 /// The production [`CommandRunner`]: runs one rendered shell command per call
@@ -159,6 +216,45 @@ fn repo_dir_name(repo: &str) -> &str {
     repo.rsplit('/').next().unwrap_or(repo)
 }
 
+/// Non-secret operator strings that get interpolated into rendered shell
+/// (homeserver URL, room) must pass this before they are ever formatted into
+/// a step's `apply`/`check` text — mirrors [`validate_repo`]'s shell-injection
+/// defense for the same reason: this text is echoed verbatim in `--dry-run`
+/// output and executed on the worker.
+fn validate_safe_token(label: &str, value: &str, extra: &str) -> Result<()> {
+    if value.trim().is_empty() {
+        bail!("--{label} must not be empty");
+    }
+    if !value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || extra.contains(c))
+    {
+        bail!(
+            "--{label} '{value}' contains characters outside [A-Za-z0-9{extra}]; refusing to \
+             render it into shell"
+        );
+    }
+    Ok(())
+}
+
+/// A safehouse persona name: `[a-z0-9_]`, 1..=64 chars (mirrors
+/// `safehouse.rs`'s `valid_persona` charset — this module cannot depend on
+/// `safehouse` directly without pulling in its async/tokio surface, so the
+/// charset is duplicated deliberately, the same tradeoff `drain.rs`'s module
+/// doc makes for `DEFAULT_DRAIN_TIMEOUT_SECS`).
+fn validate_persona_name(persona: &str) -> Result<()> {
+    if persona.is_empty() || persona.len() > 64 {
+        bail!("--safehouse-persona '{persona}' must be 1..=64 characters");
+    }
+    if !persona
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    {
+        bail!("--safehouse-persona '{persona}' must match [a-z0-9_]");
+    }
+    Ok(())
+}
+
 /// `%h`-relative workspace path for a repo (systemd expands `%h` to the user's
 /// home in a user unit; the shell steps use `"$HOME/..."` for the same path).
 fn workspace_rel(repo: &str) -> String {
@@ -199,6 +295,77 @@ pub fn preflight(config: &AddWorkerConfig) -> Result<Secrets> {
         }
         secrets.accounts_env = Some(contents);
     }
+
+    // Safehouse (#3998): when requested, every input is required up front —
+    // a half-specified `--safehouse` would otherwise render a broken plan
+    // (a config step with no homeserver/room, or a join step with no key)
+    // rather than failing fast before any remote action (AC: "no half-joined
+    // host").
+    if config.safehouse_enabled {
+        let mut missing = Vec::new();
+        if config.safehouse_tailnet_auth_key_file.is_none() {
+            missing.push("--safehouse-tailnet-auth-key-file");
+        }
+        if config.safehouse_secrets_file.is_none() {
+            missing.push("--safehouse-secrets-file");
+        }
+        if config
+            .safehouse_homeserver_url
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .is_empty()
+        {
+            missing.push("--safehouse-homeserver-url");
+        }
+        if config
+            .safehouse_room
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .is_empty()
+        {
+            missing.push("--safehouse-room");
+        }
+        if config.safehouse_personas.is_empty() {
+            missing.push("--safehouse-persona (at least one)");
+        }
+        if !missing.is_empty() {
+            bail!(
+                "--safehouse requires the following input(s), none of which were supplied: {}",
+                missing.join(", ")
+            );
+        }
+        if let Some(homeserver) = &config.safehouse_homeserver_url {
+            validate_safe_token("safehouse-homeserver-url", homeserver, ".:/_-")?;
+        }
+        if let Some(room) = &config.safehouse_room {
+            validate_safe_token("safehouse-room", room, "!#:._-")?;
+        }
+        for persona in &config.safehouse_personas {
+            validate_persona_name(persona)?;
+        }
+    }
+    if let Some(path) = &config.safehouse_tailnet_auth_key_file {
+        let contents = std::fs::read_to_string(path).with_context(|| {
+            format!("reading --safehouse-tailnet-auth-key-file {} (does it exist?)", path.display())
+        })?;
+        let trimmed = contents.trim();
+        if trimmed.is_empty() {
+            bail!("--safehouse-tailnet-auth-key-file {} is empty", path.display());
+        }
+        secrets.safehouse_tailnet_auth_key = Some(trimmed.to_string());
+    }
+    if let Some(path) = &config.safehouse_secrets_file {
+        let contents = std::fs::read_to_string(path).with_context(|| {
+            format!("reading --safehouse-secrets-file {} (does it exist?)", path.display())
+        })?;
+        if contents.trim().is_empty() {
+            bail!("--safehouse-secrets-file {} is empty", path.display());
+        }
+        secrets.safehouse_secrets = Some(contents);
+    }
+
     Ok(secrets)
 }
 
@@ -339,18 +506,19 @@ pub fn build_plan(config: &AddWorkerConfig, secrets: &Secrets) -> Plan {
         ),
     }
 
-    // 10. Optional safehouse wiring (#3998 not yet landed → skip-with-notice).
+    // 10. Optional safehouse wiring: tailnet join, safehoused build/config/
+    //     room-invite/supervision, then restart the worker's loom-daemon with
+    //     LOOM_SAFEHOUSE_* env so narration flows (#3998). Every sub-step
+    //     below follows the same check/apply contract as the rest of the
+    //     plan, so a re-run against an already-provisioned host (the pilot,
+    //     `loom-worker-1`) reports every one `AlreadyDone`.
     if config.safehouse_enabled {
-        plan.push_skip(
-            "safehouse",
-            "wire safehouse fleet-comms (tailnet join, account, LOOM_SAFEHOUSE_* env)",
-            "requires #3998 (safehoused provisioning fragment) which has not landed",
-        );
+        push_safehouse_steps(&mut plan, config, secrets, &primary_rel);
     } else {
         plan.push_skip(
             "safehouse",
             "wire safehouse fleet-comms",
-            "safehouse not requested (pass --safehouse to enable once #3998 lands)",
+            "safehouse not requested (pass --safehouse plus its input flags to enable)",
         );
     }
 
@@ -363,6 +531,110 @@ pub fn build_plan(config: &AddWorkerConfig, secrets: &Secrets) -> Plan {
     ));
 
     plan
+}
+
+/// Append the safehouse spin-up sub-sequence (#3998) to `plan`: tailnet join,
+/// `safehoused` build, boot-time TOML config, room-membership invite,
+/// supervision, then a restart of the worker's own `loom-daemon` with
+/// `LOOM_SAFEHOUSE_*` env. Split out of [`build_plan`] purely for
+/// readability — still pure, still called only when `config.safehouse_enabled`.
+///
+/// **Ordering is the load-bearing part of this function**: `safehouse-config`
+/// (which writes the boot-time persona TOML) MUST precede
+/// `safehouse-supervise` (which first starts `safehoused`) — the allowlist is
+/// boot-time-only, no reload (AC: "written before the unit first starts").
+fn push_safehouse_steps(
+    plan: &mut Plan,
+    config: &AddWorkerConfig,
+    secrets: &Secrets,
+    primary_rel: &str,
+) {
+    // 10a. Install the tailscale package (apt repo, arch/codename-agnostic).
+    plan.push_step(Step::new(
+        "safehouse-tailscale-install",
+        "install the tailscale package (apt repo)",
+        Some("command -v tailscale >/dev/null 2>&1".to_string()),
+        render_safehouse_tailscale_install(),
+    ));
+
+    // 10b. Join the tailnet with an operator-minted ephemeral + tag:loom-worker
+    //     auth key (fed over stdin, never on a command line — an expired/
+    //     revoked key fails this step's apply fast, with tailscale's own
+    //     diagnostic surfaced via the checklist's stderr tail).
+    plan.push_step(
+        Step::new(
+            "safehouse-tailscale-join",
+            "tailscale up with an ephemeral + tag:loom-worker auth key (via stdin)",
+            Some("tailscale ip -4 >/dev/null 2>&1".to_string()),
+            render_safehouse_tailscale_join(),
+        )
+        .with_stdin(StepStdin {
+            content: secrets
+                .safehouse_tailnet_auth_key
+                .clone()
+                .unwrap_or_default(),
+            secret: true,
+        }),
+    );
+
+    // 10c. Build safehoused from the external rjwalters/safehouse checkout.
+    plan.push_step(Step::new(
+        "safehouse-build",
+        "cargo build --release -p safehoused from a safehouse checkout",
+        Some(r#"test -x "$HOME/.local/bin/safehoused""#.to_string()),
+        render_safehouse_build(&config.safehouse_repo_url),
+    ));
+
+    // 10d. Write the boot-time config.toml (0600): homeserver URL, per-host
+    //     Matrix account, fresh store/recovery passphrases (via stdin), and
+    //     the persona allowlist mirroring the studio host. MUST land before
+    //     10f (first start) — see this function's doc comment.
+    let homeserver = config.safehouse_homeserver_url.as_deref().unwrap_or("");
+    let room = config.safehouse_room.as_deref().unwrap_or("");
+    plan.push_step(
+        Step::new(
+            "safehouse-config",
+            "write ~/.loom/safehoused/config.toml (0600): homeserver, account, passphrases, personas",
+            Some(r#"test -f "$HOME/.loom/safehoused/config.toml""#.to_string()),
+            render_safehouse_config(homeserver, room, &config.safehouse_personas),
+        )
+        .with_stdin(StepStdin {
+            content: secrets.safehouse_secrets.clone().unwrap_or_default(),
+            secret: true,
+        }),
+    );
+
+    // 10e. Room membership via safehouse#39's daemon-side `invite` op — not
+    //     raw CS-API temp devices.
+    plan.push_step(Step::new(
+        "safehouse-room-invite",
+        "join the fleet room via safehouse#39's invite op",
+        Some(r#"test -f "$HOME/.loom/safehoused/.invited""#.to_string()),
+        render_safehouse_room_invite(config.safehouse_invite_exec.as_deref()),
+    ));
+
+    // 10f. Supervise safehoused under systemd --user + linger (mirrors the
+    //     daemon-unit step's own supervision pattern, step 8). This is the
+    //     first point safehoused ever starts — 10d must precede this.
+    plan.push_step(Step::new(
+        "safehouse-supervise",
+        "install + enable the safehoused systemd --user unit (linger)",
+        Some("systemctl --user is-enabled safehoused.service >/dev/null 2>&1".to_string()),
+        render_safehouse_supervise(primary_rel),
+    ));
+
+    // 10g. Restart the worker's own loom-daemon with LOOM_SAFEHOUSE_* env so
+    //     sweep narration flows (env-only wiring, #3997 — no worker-side
+    //     .loom/config.json edit).
+    plan.push_step(Step::new(
+        "safehouse-daemon-restart",
+        "wire LOOM_SAFEHOUSE_ENABLED/SOCKET/ROOM into the loom-daemon unit and restart it",
+        Some(
+            r#"grep -q '^Environment=LOOM_SAFEHOUSE_ENABLED=true$' "$HOME/.config/systemd/user/loom-daemon.service" 2>/dev/null"#
+                .to_string(),
+        ),
+        render_safehouse_daemon_restart(room),
+    ));
 }
 
 /// Top-level orchestration for `loom-daemon fleet add-worker`.
@@ -693,9 +965,160 @@ LIST="$(loom-daemon workspace list --json 2>/dev/null || echo '{{}}')"
     )
 }
 
+// ---------------------------------------------------------------------------
+// Safehouse spin-up templates (#3998)
+// ---------------------------------------------------------------------------
+
+fn render_safehouse_tailscale_install() -> String {
+    // Codename-derived apt repo (works across Ubuntu releases, not just the
+    // pilot's 24.04/"noble") — the same approach `base-deps` uses for the gh
+    // apt repo.
+    r#"set -e
+if ! command -v tailscale >/dev/null 2>&1; then
+  CODENAME="$(lsb_release -cs 2>/dev/null || echo noble)"
+  curl -fsSL "https://pkgs.tailscale.com/stable/ubuntu/${CODENAME}.noarmor.gpg" | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+  curl -fsSL "https://pkgs.tailscale.com/stable/ubuntu/${CODENAME}.tailscale-keyring.list" | sudo tee /etc/apt/sources.list.d/tailscale.list >/dev/null
+  sudo apt-get update -qq
+  sudo apt-get install -y tailscale
+fi
+sudo systemctl enable --now tailscaled 2>/dev/null || true
+"#
+    .to_string()
+}
+
+fn render_safehouse_tailscale_join() -> String {
+    // The auth key arrives on stdin; written to a 0600 tempfile and fed to
+    // `tailscale up` via the `file:` prefix so the raw key never appears on
+    // the command line (where `ps` on the worker would expose it) or in a
+    // rendered plan/log line. The key is operator-minted ephemeral +
+    // tag:loom-worker (epic #4340's boundary: loom never calls the Tailscale
+    // API itself), so no --advertise-tags flag is needed here — the tag is
+    // baked into the key server-side.
+    r#"set -e
+umask 077
+KEY_FILE="$(mktemp)"
+cat > "$KEY_FILE"
+chmod 600 "$KEY_FILE"
+sudo tailscale up --auth-key="file:$KEY_FILE" --hostname="$(hostname -s)" --ssh=false
+rm -f "$KEY_FILE"
+"#
+    .to_string()
+}
+
+fn render_safehouse_build(safehouse_repo_url: &str) -> String {
+    format!(
+        r#"set -e
+. "$HOME/.cargo/env" 2>/dev/null || true
+SH_SRC="$HOME/.local/share/safehouse"
+if [ -d "$SH_SRC/.git" ]; then
+  git -C "$SH_SRC" pull --ff-only
+else
+  mkdir -p "$(dirname "$SH_SRC")"
+  git clone {safehouse_repo_url} "$SH_SRC"
+fi
+cd "$SH_SRC"
+cargo build --release -p safehoused
+mkdir -p "$HOME/.local/bin"
+install -m 0755 "$SH_SRC/target/release/safehoused" "$HOME/.local/bin/safehoused"
+"#
+    )
+}
+
+/// `homeserver`/`room` are pre-validated shell-safe (`validate_safe_token`) by
+/// [`preflight`] before this is ever called. `personas` are pre-validated by
+/// [`validate_persona_name`] — safe to interpolate as bare TOML string
+/// literals. The Matrix account + store/recovery passphrases arrive on stdin
+/// as a `KEY=VALUE` env file and are sourced into shell variables that are
+/// referenced (never literal) in the rendered heredoc, so the secret VALUES
+/// never appear in this rendered text (only the variable NAMES do).
+fn render_safehouse_config(homeserver: &str, room: &str, personas: &[String]) -> String {
+    let persona_list = personas
+        .iter()
+        .map(|p| format!("\"{p}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        r#"set -e
+umask 077
+mkdir -p "$HOME/.loom/safehoused"
+ENV_FILE="$(mktemp)"
+cat > "$ENV_FILE"
+chmod 600 "$ENV_FILE"
+set -a
+. "$ENV_FILE"
+set +a
+cat > "$HOME/.loom/safehoused/config.toml" <<TOML
+homeserver_url = "{homeserver}"
+room = "{room}"
+personas = [{persona_list}]
+
+[account]
+user_id = "$SAFEHOUSE_MATRIX_USER_ID"
+password = "$SAFEHOUSE_MATRIX_PASSWORD"
+
+[encryption]
+store_passphrase = "$SAFEHOUSE_STORE_PASSPHRASE"
+recovery_passphrase = "$SAFEHOUSE_RECOVERY_PASSPHRASE"
+TOML
+chmod 600 "$HOME/.loom/safehoused/config.toml"
+rm -f "$ENV_FILE"
+"#
+    )
+}
+
+fn render_safehouse_room_invite(invite_exec: Option<&str>) -> String {
+    let exec = invite_exec.unwrap_or(DEFAULT_SAFEHOUSE_INVITE_EXEC);
+    format!(
+        r#"set -e
+export PATH="$HOME/.local/bin:$PATH"
+{exec}
+touch "$HOME/.loom/safehoused/.invited"
+"#
+    )
+}
+
+fn render_safehouse_supervise(primary_rel: &str) -> String {
+    // Reuses the already-shipped `safehoused-service.sh` (cloned onto the
+    // worker by the workspace-clone step's `loom-daemon init`) rather than a
+    // one-off `systemd-run` invocation, so the worker gets the same
+    // Restart=always + linger-aware supervision contract the interactive-host
+    // runbook documents (`.loom/docs/safehouse.md`). `--socket` is pinned to
+    // a deterministic path (not the config-driven resolver) so a fresh worker
+    // with no prior `.loom/config.json` safehouse block still agrees with the
+    // env this plan wires into loom-daemon in the next step.
+    format!(
+        r#"set -e
+export PATH="$HOME/.local/bin:$PATH"
+"$HOME/{primary_rel}/.loom/scripts/cli/safehoused-service.sh" install \
+  --bin "$HOME/.local/bin/safehoused" \
+  --socket "{SAFEHOUSE_SOCKET_PATH}" \
+  --config "$HOME/.loom/safehoused/config.toml"
+loginctl enable-linger "$USER" 2>/dev/null || true
+"#
+    )
+}
+
+fn render_safehouse_daemon_restart(room: &str) -> String {
+    // Patches the loom-daemon unit's env in place (idempotent: strips any
+    // prior LOOM_SAFEHOUSE_* lines before re-inserting) rather than a
+    // worker-side .loom/config.json edit — #3997's decision that loom's
+    // safehouse config is wired entirely via env on a fleet worker.
+    format!(
+        r#"set -e
+UNIT="$HOME/.config/systemd/user/loom-daemon.service"
+test -f "$UNIT" || {{ echo "loom-daemon systemd unit not found (the daemon-unit step must run first)" >&2; exit 1; }}
+sed -i '/^Environment=LOOM_SAFEHOUSE_/d' "$UNIT"
+sed -i "/^Environment=PATH=/a Environment=LOOM_SAFEHOUSE_ENABLED=true\nEnvironment=LOOM_SAFEHOUSE_SOCKET={SAFEHOUSE_SOCKET_PATH}\nEnvironment=LOOM_SAFEHOUSE_ROOM={room}" "$UNIT"
+systemctl --user daemon-reload
+systemctl --user restart loom-daemon.service
+"#
+    )
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use super::super::PlanEntry;
     use super::*;
 
     fn base_config() -> AddWorkerConfig {
@@ -709,6 +1132,42 @@ mod tests {
             accounts_env_file: None,
             safehouse_enabled: false,
             idle_shutdown_minutes: None,
+            safehouse_tailnet_auth_key_file: None,
+            safehouse_secrets_file: None,
+            safehouse_repo_url: DEFAULT_SAFEHOUSE_REPO_URL.to_string(),
+            safehouse_homeserver_url: None,
+            safehouse_room: None,
+            safehouse_personas: Vec::new(),
+            safehouse_invite_exec: None,
+        }
+    }
+
+    /// A full, valid `--safehouse` config — every required input present and
+    /// well-formed. Individual tests mutate a field to exercise a specific
+    /// failure.
+    fn safehouse_config() -> AddWorkerConfig {
+        let mut config = base_config();
+        config.safehouse_enabled = true;
+        config.safehouse_tailnet_auth_key_file = Some(PathBuf::from("/does/not/matter"));
+        config.safehouse_secrets_file = Some(PathBuf::from("/does/not/matter"));
+        config.safehouse_homeserver_url = Some("matrix.internal.example".to_string());
+        config.safehouse_room = Some("!fleet:matrix.internal.example".to_string());
+        config.safehouse_personas = vec!["loom_daemon".to_string()];
+        config
+    }
+
+    fn safehouse_secrets() -> Secrets {
+        Secrets {
+            pat: None,
+            accounts_env: None,
+            safehouse_tailnet_auth_key: Some("tskey-auth-ephemeral-tagged".to_string()),
+            safehouse_secrets: Some(
+                "SAFEHOUSE_MATRIX_USER_ID=@safehoused-worker1:matrix.internal.example\n\
+                 SAFEHOUSE_MATRIX_PASSWORD=hunter2-matrix-pw\n\
+                 SAFEHOUSE_STORE_PASSPHRASE=store-pass-xyz\n\
+                 SAFEHOUSE_RECOVERY_PASSPHRASE=recovery-pass-xyz\n"
+                    .to_string(),
+            ),
         }
     }
 
@@ -797,6 +1256,7 @@ mod tests {
         let secrets = Secrets {
             pat: Some("pat".to_string()),
             accounts_env: Some("ACCOUNT_EMAIL_1=a@b.c".to_string()),
+            ..Secrets::default()
         };
         let plan = build_plan(&config, &secrets);
         let names: Vec<&str> = plan
@@ -846,6 +1306,7 @@ mod tests {
         let secrets = Secrets {
             pat: Some("the-pat".to_string()),
             accounts_env: Some("ACCOUNT_EMAIL_1=a@b.c".to_string()),
+            ..Secrets::default()
         };
         let plan = build_plan(&config, &secrets);
         for name in ["forge-auth", "token-accounts"] {
@@ -884,19 +1345,321 @@ mod tests {
     }
 
     #[test]
-    fn safehouse_is_skip_with_3998_notice_when_enabled() {
-        let mut config = base_config();
-        config.safehouse_enabled = true;
-        let plan = build_plan(&config, &Secrets::default());
+    fn safehouse_disabled_stays_a_single_skip_and_plain_worker_unchanged() {
+        // AC: "Without --safehouse, behavior is unchanged: skip-with-notice,
+        // plain worker, zero safehouse provisioning."
+        let plan = build_plan(&base_config(), &Secrets::default());
+        let names: Vec<&str> = plan.entries.iter().map(PlanEntry::name).collect();
+        assert_eq!(names.iter().filter(|n| n.starts_with("safehouse")).count(), 1);
         let entry = plan
             .entries
             .iter()
             .find(|e| e.name() == "safehouse")
             .unwrap();
         match entry {
-            super::super::PlanEntry::Skip { reason, .. } => assert!(reason.contains("#3998")),
+            PlanEntry::Skip { reason, .. } => assert!(
+                reason.contains("not requested"),
+                "reason should explain safehouse was not requested: {reason}"
+            ),
             other => panic!("expected safehouse skip, got {other:?}"),
         }
+    }
+
+    // ---- safehouse enabled: real steps (#3998) --------------------------
+
+    fn safehouse_step_names() -> Vec<&'static str> {
+        vec![
+            "safehouse-tailscale-install",
+            "safehouse-tailscale-join",
+            "safehouse-build",
+            "safehouse-config",
+            "safehouse-room-invite",
+            "safehouse-supervise",
+            "safehouse-daemon-restart",
+        ]
+    }
+
+    #[test]
+    fn safehouse_enabled_renders_full_step_sequence_in_order_between_idle_shutdown_and_verify() {
+        let config = safehouse_config();
+        let plan = build_plan(&config, &safehouse_secrets());
+        let names: Vec<&str> = plan.entries.iter().map(PlanEntry::name).collect();
+
+        // No bare "safehouse" skip entry remains once real steps render.
+        assert!(!names.contains(&"safehouse"));
+
+        let idle_pos = names.iter().position(|n| *n == "idle-shutdown").unwrap();
+        let verify_pos = names.iter().position(|n| *n == "verify").unwrap();
+        let safehouse_positions: Vec<usize> = safehouse_step_names()
+            .iter()
+            .map(|want| {
+                names
+                    .iter()
+                    .position(|n| n == want)
+                    .unwrap_or_else(|| panic!("missing step {want}"))
+            })
+            .collect();
+
+        // Exact ordering, and the whole block sits between idle-shutdown and verify.
+        let mut sorted = safehouse_positions.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            safehouse_positions, sorted,
+            "safehouse steps must render in the documented order"
+        );
+        assert!(safehouse_positions
+            .iter()
+            .all(|&p| p > idle_pos && p < verify_pos));
+    }
+
+    #[test]
+    fn safehouse_config_step_precedes_supervise_step_boot_time_ordering_constraint() {
+        // AC: the persona allowlist is written before safehoused's first
+        // start (boot-time-only, no reload) — asserted directly on the
+        // rendered plan's step order, not just by construction.
+        let config = safehouse_config();
+        let plan = build_plan(&config, &safehouse_secrets());
+        let names: Vec<&str> = plan.entries.iter().map(PlanEntry::name).collect();
+        let config_pos = names.iter().position(|n| *n == "safehouse-config").unwrap();
+        let supervise_pos = names
+            .iter()
+            .position(|n| *n == "safehouse-supervise")
+            .unwrap();
+        assert!(
+            config_pos < supervise_pos,
+            "safehouse-config ({config_pos}) must precede safehouse-supervise ({supervise_pos})"
+        );
+    }
+
+    #[test]
+    fn safehouse_every_step_has_a_check_for_idempotent_rerun() {
+        // AC: a re-run on an already-provisioned host reports AlreadyDone —
+        // that classification is driven entirely by a present `check`.
+        let config = safehouse_config();
+        let plan = build_plan(&config, &safehouse_secrets());
+        for want in safehouse_step_names() {
+            let step = plan
+                .entries
+                .iter()
+                .find_map(|e| match e {
+                    PlanEntry::Step(s) if s.name == want => Some(s),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("missing step {want}"));
+            assert!(step.check.is_some(), "{want} must have a check phase (idempotency)");
+        }
+    }
+
+    #[test]
+    fn safehouse_full_plan_reruns_idempotently_when_every_check_passes() {
+        struct AlwaysOkRunner;
+        impl CommandRunner for AlwaysOkRunner {
+            fn run(&self, _shell: &str, _stdin: Option<&str>) -> Result<CommandOutput> {
+                Ok(CommandOutput {
+                    code: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            }
+        }
+        let config = safehouse_config();
+        let plan = build_plan(&config, &safehouse_secrets());
+        let reports = super::super::execute_plan(&AlwaysOkRunner, &plan);
+        for name in safehouse_step_names() {
+            let report = reports.iter().find(|r| r.name == name).unwrap();
+            assert_eq!(
+                report.status,
+                StepStatus::AlreadyDone,
+                "{name} should be AlreadyDone on a passing check"
+            );
+        }
+    }
+
+    #[test]
+    fn safehouse_tailscale_join_and_config_steps_carry_secret_stdin_not_in_rendered_text() {
+        let config = safehouse_config();
+        let secrets = safehouse_secrets();
+        let plan = build_plan(&config, &secrets);
+
+        for name in ["safehouse-tailscale-join", "safehouse-config"] {
+            let step = plan
+                .entries
+                .iter()
+                .find_map(|e| match e {
+                    PlanEntry::Step(s) if s.name == name => Some(s),
+                    _ => None,
+                })
+                .unwrap();
+            let stdin = step.stdin.as_ref().expect("secret step must carry stdin");
+            assert!(stdin.secret, "{name} stdin must be marked secret");
+        }
+
+        let dry = plan.render_dry_run("worker-1");
+        assert!(!dry.contains("tskey-auth-ephemeral-tagged"));
+        assert!(!dry.contains("hunter2-matrix-pw"));
+        assert!(!dry.contains("store-pass-xyz"));
+        assert!(!dry.contains("recovery-pass-xyz"));
+    }
+
+    #[test]
+    fn safehouse_config_step_apply_references_secret_vars_not_values() {
+        let config = safehouse_config();
+        let secrets = safehouse_secrets();
+        let plan = build_plan(&config, &secrets);
+        let step = plan
+            .entries
+            .iter()
+            .find_map(|e| match e {
+                PlanEntry::Step(s) if s.name == "safehouse-config" => Some(s),
+                _ => None,
+            })
+            .unwrap();
+        // Non-secret operator values ARE interpolated.
+        assert!(step.apply.contains("matrix.internal.example"));
+        assert!(step.apply.contains("!fleet:matrix.internal.example"));
+        assert!(step.apply.contains("loom_daemon"));
+        // Secret values are referenced only via their sourced variable names.
+        assert!(step.apply.contains("$SAFEHOUSE_MATRIX_USER_ID"));
+        assert!(step.apply.contains("$SAFEHOUSE_MATRIX_PASSWORD"));
+        assert!(step.apply.contains("$SAFEHOUSE_STORE_PASSPHRASE"));
+        assert!(step.apply.contains("$SAFEHOUSE_RECOVERY_PASSPHRASE"));
+        assert!(!step.apply.contains("hunter2-matrix-pw"));
+    }
+
+    #[test]
+    fn safehouse_room_invite_uses_the_daemon_side_op_not_raw_cs_api() {
+        let config = safehouse_config();
+        let plan = build_plan(&config, &safehouse_secrets());
+        let step = plan
+            .entries
+            .iter()
+            .find_map(|e| match e {
+                PlanEntry::Step(s) if s.name == "safehouse-room-invite" => Some(s),
+                _ => None,
+            })
+            .unwrap();
+        assert!(step.apply.contains("safehoused invite"));
+        assert!(!step.apply.to_lowercase().contains("client-server"));
+        assert!(!step.apply.contains("/_matrix/client"));
+
+        // An operator override replaces the default invocation.
+        let mut overridden = safehouse_config();
+        overridden.safehouse_invite_exec = Some("safehoused invite --room-override x".to_string());
+        let plan2 = build_plan(&overridden, &safehouse_secrets());
+        let step2 = plan2
+            .entries
+            .iter()
+            .find_map(|e| match e {
+                PlanEntry::Step(s) if s.name == "safehouse-room-invite" => Some(s),
+                _ => None,
+            })
+            .unwrap();
+        assert!(step2.apply.contains("--room-override x"));
+    }
+
+    #[test]
+    fn safehouse_supervise_step_installs_via_the_shared_service_script_and_lingers() {
+        let config = safehouse_config();
+        let plan = build_plan(&config, &safehouse_secrets());
+        let step = plan
+            .entries
+            .iter()
+            .find_map(|e| match e {
+                PlanEntry::Step(s) if s.name == "safehouse-supervise" => Some(s),
+                _ => None,
+            })
+            .unwrap();
+        assert!(step.apply.contains("safehoused-service.sh"));
+        assert!(step.apply.contains("install"));
+        assert!(step.apply.contains("enable-linger"));
+    }
+
+    #[test]
+    fn safehouse_daemon_restart_step_wires_env_and_restarts() {
+        let config = safehouse_config();
+        let plan = build_plan(&config, &safehouse_secrets());
+        let step = plan
+            .entries
+            .iter()
+            .find_map(|e| match e {
+                PlanEntry::Step(s) if s.name == "safehouse-daemon-restart" => Some(s),
+                _ => None,
+            })
+            .unwrap();
+        assert!(step.apply.contains("LOOM_SAFEHOUSE_ENABLED=true"));
+        assert!(step.apply.contains("LOOM_SAFEHOUSE_SOCKET"));
+        assert!(step
+            .apply
+            .contains("LOOM_SAFEHOUSE_ROOM=!fleet:matrix.internal.example"));
+        assert!(step
+            .apply
+            .contains("systemctl --user restart loom-daemon.service"));
+    }
+
+    // ---- safehouse preflight ---------------------------------------------
+
+    #[test]
+    fn preflight_safehouse_enabled_requires_every_input() {
+        let mut config = base_config();
+        config.safehouse_enabled = true;
+        let err = preflight(&config).unwrap_err().to_string();
+        assert!(err.contains("--safehouse-tailnet-auth-key-file"), "err: {err}");
+        assert!(err.contains("--safehouse-secrets-file"), "err: {err}");
+        assert!(err.contains("--safehouse-homeserver-url"), "err: {err}");
+        assert!(err.contains("--safehouse-room"), "err: {err}");
+        assert!(err.contains("--safehouse-persona"), "err: {err}");
+    }
+
+    #[test]
+    fn preflight_safehouse_enabled_with_full_inputs_reads_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_file = dir.path().join("tailnet.key");
+        let secrets_file = dir.path().join("safehouse.env");
+        std::fs::write(&key_file, "tskey-ephemeral-tagged\n").unwrap();
+        std::fs::write(
+            &secrets_file,
+            "SAFEHOUSE_MATRIX_USER_ID=@w1:example\nSAFEHOUSE_MATRIX_PASSWORD=pw\n\
+             SAFEHOUSE_STORE_PASSPHRASE=sp\nSAFEHOUSE_RECOVERY_PASSPHRASE=rp\n",
+        )
+        .unwrap();
+
+        let mut config = safehouse_config();
+        config.safehouse_tailnet_auth_key_file = Some(key_file);
+        config.safehouse_secrets_file = Some(secrets_file);
+
+        let secrets = preflight(&config).unwrap();
+        assert_eq!(secrets.safehouse_tailnet_auth_key.as_deref(), Some("tskey-ephemeral-tagged"));
+        assert!(secrets
+            .safehouse_secrets
+            .as_ref()
+            .unwrap()
+            .contains("SAFEHOUSE_MATRIX_USER_ID"));
+    }
+
+    #[test]
+    fn preflight_rejects_invalid_persona_name() {
+        let mut config = safehouse_config();
+        config.safehouse_personas = vec!["Not-Valid!".to_string()];
+        let err = preflight(&config).unwrap_err().to_string();
+        assert!(err.contains("safehouse-persona"), "err: {err}");
+    }
+
+    #[test]
+    fn preflight_rejects_unsafe_homeserver_url_and_room() {
+        let mut config = safehouse_config();
+        config.safehouse_homeserver_url = Some("https://evil; rm -rf /".to_string());
+        assert!(preflight(&config).is_err());
+
+        let mut config2 = safehouse_config();
+        config2.safehouse_room = Some("!room`whoami`:example".to_string());
+        assert!(preflight(&config2).is_err());
+    }
+
+    #[test]
+    fn preflight_safehouse_disabled_ignores_missing_safehouse_inputs() {
+        // AC: without --safehouse, nothing about safehouse gates preflight.
+        let config = base_config();
+        assert!(preflight(&config).is_ok());
     }
 
     #[test]
@@ -954,6 +1717,7 @@ mod tests {
         let secrets = Secrets {
             pat: Some("pat".to_string()),
             accounts_env: Some("ACCOUNT_EMAIL_1=a@b.c".to_string()),
+            ..Secrets::default()
         };
         let plan = build_plan(&config, &secrets);
         for entry in &plan.entries {
@@ -995,6 +1759,7 @@ mod tests {
         let secrets = Secrets {
             pat: Some("pat".to_string()),
             accounts_env: Some("env".to_string()),
+            ..Secrets::default()
         };
         let plan = build_plan(&config, &secrets);
         let out = plan.render_dry_run(&config.ssh_host);
