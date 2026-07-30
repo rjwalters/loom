@@ -1546,6 +1546,92 @@ if echo "$COMMAND" | grep -qiE "$GH_COMMENT_BODY_AT_PATTERN"; then
 fi
 
 # =============================================================================
+# The same literal-@ loss reached through SHELL-VARIABLE INDIRECTION (#4601)
+#
+# The #4523 rule above inspects only the STATIC text immediately following the
+# --body/-b flag, so it is blind to an identical `@path` value that arrives via
+# a shell variable. This recurred in the field on PR #4600 (~1h45m AFTER the
+# #4523 guard was live in the installed copy — so the guard was present and
+# simply did not cover the shape):
+#
+#   REVIEW_FILE="@/tmp/pr4600-review.md"; gh pr comment 4600 --body "$REVIEW_FILE"
+#
+# ...was ALLOWED and posted the literal path string as the comment again. This
+# is also the shape an agent naturally reaches for when the literal form is
+# denied — i.e. the deny above actively invites this bypass.
+#
+# An unconditional deny on `--body "$VAR"` would be far too broad: a legitimate
+# `--body "$SUMMARY"` carrying review prose has the identical shape. So this
+# rule CORRELATES instead — it denies only when the SAME command both
+#   (a) assigns a PATH-SHAPED `@…` value to a shell variable, and
+#   (b) passes that same variable as the --body/-b value.
+# That combination has no legitimate use, and `--body "$SUMMARY"` (no @path
+# assignment anywhere in the command) is untouched.
+#
+# COORDINATION (#4577): this is deliberately an ADDITIVE, separate check rather
+# than a widening of GH_COMMENT_BODY_AT_PATTERN above. #4577 is an open fix to
+# that same regex for the OPPOSITE failure direction (bare `@mention` reply
+# prose false-positived); keeping the two rules on separate lines means neither
+# fix can regress or textually conflict with the other. For the same reason
+# GH_AT_PATHISH requires actual path shape (an explicit `/`, `~/`, `./`, `../`
+# prefix, or a text-file extension), so bare `@mention` / `@org/team` prose
+# never matches it — this rule cannot widen #4577's false-positive surface.
+#
+# KNOWN LIMIT (by construction): a variable assigned in an EARLIER Bash call is
+# invisible in a single PreToolUse payload, and no static inspection can reach
+# it. That residual case is covered by the independent second defense layer —
+# the "re-fetch the posted comment and confirm it renders your prose, not a
+# path" step in judge.md's/doctor.md's pre-approval / pre-completion checklists.
+# =============================================================================
+# `@` followed by a genuinely path-shaped value. Two alternatives:
+#   1. an explicit path prefix — @/…, @~/…, @./…, @../…
+#   2. a bare relative path ending in a text-file extension — @review.md,
+#      @scratch/review.md
+# Deliberately NOT `@\S+`: that would match `@rjwalters`, `@org/team`, and
+# `@example.com` prose, i.e. exactly the #4577 false-positive family.
+GH_AT_PATHISH="@((/|~/|\.\.?/)[^[:space:]\"';&|]*|[^[:space:]\"';&|]*\.(md|markdown|txt|text|log|json|ya?ml|diff|patch|out))"
+
+# Both rules below require a literal `@` somewhere in the command, so this
+# bash-builtin prefilter keeps them entirely off the hot path for the vast
+# majority of commands (same pattern as the COMMAND_NO_LITERAL_TEXT /
+# COMMAND_NO_COMMENT `#`-present guards above).
+if [[ "$COMMAND" == *"@"* ]]; then
+    if echo "$COMMAND" | grep -qiE "(^|[;&|[:space:]])gh[[:space:]]+(pr|issue)[[:space:]]+comment"; then
+        # Names of variables assigned a path-shaped `@…` value in THIS command.
+        _gh_at_path_vars=$(printf '%s\n' "$COMMAND" \
+            | grep -oE "(^|[;&|(){}[:space:]])[A-Za-z_][A-Za-z0-9_]*=[\"']?$GH_AT_PATHISH" 2>/dev/null \
+            | grep -oE "[A-Za-z_][A-Za-z0-9_]*=" 2>/dev/null \
+            | tr -d '=' | sort -u)
+        for _gh_at_var in $_gh_at_path_vars; do
+            # ...and passed straight through as the --body/-b value ($V, ${V}, "$V").
+            if echo "$COMMAND" | grep -qiE "(-b|--body)[[:space:]]*=?[[:space:]]*[\"']?[\$]\{?${_gh_at_var}(\}|[^A-Za-z0-9_]|\$)"; then
+                deny "BLOCKED: '\$${_gh_at_var}' is assigned a path-shaped '@<path>' value and passed as --body — 'gh pr comment'/'gh issue comment' does NOT expand '@path' from a variable either; it posts the literal string as the comment (lost the PR #4457 review this way, recurred on PR #4600 through exactly this indirection). Use --body-file <path>, 'gh api ... -F body=@<path>', or --body \"\$(cat <<'EOF' ... EOF)\"." "gh-comment-body-literal-at-var"
+            fi
+        done
+    fi
+
+    # -------------------------------------------------------------------------
+    # `gh api … -f/--raw-field body=@path` — the same silent literal-@ loss.
+    #
+    # On `gh api`, ONLY `-F`/`--field` gives `@<path>` its read-from-file
+    # meaning. `-f`/`--raw-field` is a plain string parameter with no file
+    # expansion, so `gh api … -f body=@/tmp/review.md` posts the literal string
+    # `@/tmp/review.md` as the comment body — byte-for-byte the same silent data
+    # loss as the #4523 shape, on a surface that rule never inspected.
+    #
+    # CASE-SENSITIVE on purpose (grep -qE, NOT -qiE): `-i` would make `-f` match
+    # the documented CORRECT alternative `-F body=@path` and deny it. The
+    # leading whitespace anchor before the flag is likewise load-bearing —
+    # without it, `-f` matches inside `--field` (the long form of `-F`) and
+    # denies that too. GH_AT_PATHISH keeps `-f body="@mention …"` prose allowed.
+    # -------------------------------------------------------------------------
+    GH_API_RAWFIELD_BODY_AT_PATTERN="(^|[;&|[:space:]])gh[[:space:]]+api[^;&]*[[:space:]](-f|--raw-field)[[:space:]]*=?[[:space:]]*[\"']?body=[\"']?$GH_AT_PATHISH"
+    if echo "$COMMAND" | grep -qE "$GH_API_RAWFIELD_BODY_AT_PATTERN"; then
+        deny "BLOCKED: 'gh api ... -f/--raw-field body=@<path>' does NOT read the file — only -F/--field gives '@<path>' its read-from-file meaning. As written this posts the literal string '@<path>' as the comment body (same silent data loss as PR #4457). Use '-F body=@<path>' instead." "gh-api-rawfield-body-literal-at"
+    fi
+fi
+
+# =============================================================================
 # COMMENT-STRIPPED WORKING COPY - used ONLY for the ASK-word and SQL DDL/DML
 # matches below, never for the catastrophic ALWAYS_BLOCK scan.
 #
