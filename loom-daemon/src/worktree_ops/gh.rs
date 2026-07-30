@@ -47,6 +47,37 @@ pub fn issue_state(repo_root: &Path, issue: u32) -> String {
     }
 }
 
+/// `gh api repos/{owner}/{repo}/issues/<N> --jq .state`, normalized to
+/// `"OPEN"` / `"CLOSED"` / `"UNKNOWN"`.
+///
+/// Deliberately the REST endpoint rather than [`issue_state`]'s `gh issue
+/// view` (which goes through GraphQL): GraphQL quota exhaustion under
+/// concurrent agents is a live failure mode in this repo, and the callers of
+/// this probe are bulk hygiene passes that can issue one call per stale file
+/// (#4450). REST returns lowercase states, so they are upper-cased here to
+/// match [`issue_state`]'s contract.
+#[must_use]
+pub fn issue_state_rest(repo_root: &Path, issue: u32) -> String {
+    let out = gh_command(repo_root)
+        .args([
+            "api",
+            &format!("repos/{{owner}}/{{repo}}/issues/{issue}"),
+            "--jq",
+            ".state",
+        ])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {
+            let s = String::from_utf8_lossy(&o.stdout).trim().to_uppercase();
+            match s.as_str() {
+                "OPEN" | "CLOSED" => s,
+                _ => "UNKNOWN".to_string(),
+            }
+        }
+        _ => "UNKNOWN".to_string(),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct PrRow {
     #[allow(dead_code)]
