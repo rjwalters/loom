@@ -728,14 +728,48 @@ If ANY safety criterion fails, do NOT merge. How the failure is handled depends 
 
 ### Transient failures — keep `loom:pr`, retry next tick
 
-Add a comment explaining why, and **keep the `loom:pr` label** so the PR is re-evaluated on the next Champion tick once the blocking condition clears:
+Add a comment explaining why, and **keep the `loom:pr` label** so the PR is re-evaluated on the next Champion tick once the blocking condition clears.
+
+**Idempotency guard (mirrors the stale-PR pattern above, #4586).** A static failing
+criterion (e.g. a size check that cannot pass without a new push) is guaranteed to
+fail identically on every re-evaluation, and closely-spaced Champion ticks (cron +
+daemon role runner, or a busy period with multiple ticks in flight) can hit the same
+PR several times before the condition changes — left unguarded, this reposts a
+near-identical rejection comment on every single tick (8 duplicates in 5 minutes was
+observed on PR #4540, all citing the identical static size-check failure). Key the
+marker to the **specific failing criterion** (not the PR as a whole) so a PR that
+starts failing a *different* criterion still gets a fresh comment, and compare the
+new reason text against the most recently posted comment for that criterion so a
+*changed* reason (the same criterion, but the specifics moved — e.g. CI now fails a
+different check) still gets a fresh comment too:
 
 ```bash
-gh pr comment <number> --body "**Champion: Cannot Auto-Merge**
+PR_NUMBER=<number>
+# Slug for the criterion that failed: label-check | size-check | critical-file |
+# merge-conflict | ci-status. (Recency-check failures use the dedicated Stale PR
+# path below, not this one.)
+CRITERION_KEY="<CRITERION_SLUG>"
+REJECT_MARKER="<!-- champion:reject:$CRITERION_KEY -->"
+REASON="<SPECIFIC_REASON>"  # exact reason text that will go in the comment body
+
+# Idempotency guard: find the most recent comment already posted for this
+# criterion (if any) and compare its reason text against the current one.
+# Skip re-commenting only when the reason is unchanged — a PR that still fails
+# the same criterion but for a *different* specific reason (e.g. CI now fails a
+# different check) still gets a fresh comment.
+LAST_COMMENT=$(gh pr view "$PR_NUMBER" --json comments \
+  --jq --arg marker "$REJECT_MARKER" \
+  '[.comments[] | select(.body | contains($marker))] | last | .body // ""')
+
+if [ -n "$LAST_COMMENT" ] && echo "$LAST_COMMENT" | grep -qF "$REASON"; then
+  echo "Rejection reason for $CRITERION_KEY unchanged since last comment on #$PR_NUMBER — skipping duplicate comment"
+else
+  gh pr comment "$PR_NUMBER" --body "$REJECT_MARKER
+**Champion: Cannot Auto-Merge**
 
 This PR cannot be automatically merged due to the following:
 
-- <CRITERION_NAME>: <SPECIFIC_REASON>
+- <CRITERION_NAME>: $REASON
 
 **Next steps:**
 - <SPECIFIC_ACTION_1>
@@ -745,9 +779,11 @@ Keeping \`loom:pr\` label. Champion will retry on the next tick once the blockin
 
 ---
 *Automated by Champion role*"
+  echo "Posted rejection comment for $CRITERION_KEY on #$PR_NUMBER"
+fi
 ```
 
-**Do NOT remove the `loom:pr` label for transient failures** — the next tick retries automatically.
+**Do NOT remove the `loom:pr` label for transient failures** — the next tick retries automatically. This guard only gates the *comment*, never the retry itself — a still-failing PR is still re-evaluated (and, once the condition clears, still eligible to merge) on every tick; only the redundant comment is suppressed.
 
 ### Stale PR (recency check failed) — comment once, route to Doctor
 
