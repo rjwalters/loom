@@ -116,7 +116,7 @@ fi
 
 **Decision**: **Allow merge if criteria pass** - test-only changes are safe.
 
-**Rationale**: Size limit (configurable, default 200 lines) and CI checks provide sufficient protection.
+**Rationale**: The merge-risk judgment (criterion #2) and CI checks provide sufficient protection — a test-only diff is green on diff composition and revertability by construction, however many lines it is.
 
 ---
 
@@ -195,21 +195,19 @@ fi
 
 ---
 
-### Edge Case 11: PR Size Exactly at Limit
+### Edge Case 11: Size and Risk Point in Opposite Directions
 
-**Scenario**: PR has exactly the configured limit of lines changed (e.g., if limit is 200: 100 additions + 100 deletions).
+**Scenario A — large but low-risk**: An 886-line PR that is ~700 lines of new tests plus one self-contained new module, approved by a Judge whose review names the module's functions and what it verified.
 
-**Handling**:
-```bash
-SIZE_LIMIT=$(jq -r '.champion.auto_merge_max_lines // 200' .loom/config.json 2>/dev/null || echo 200)
-if [ "$TOTAL" -gt "$SIZE_LIMIT" ]; then  # Strictly greater than
-  echo "FAIL: Too large"
-fi
-```
+**Scenario B — small but high-risk**: A 40-line PR that changes the ordering guard in `.loom/scripts/merge-pr.sh` (or a `.loom/hooks/guard-*.sh` hook), approved with a one-line "LGTM".
 
-**Decision**: **Allow merge** - limit is inclusive (<= configured limit allowed).
+**Handling**: There is no line-count gate. Criterion #2 (Merge-Risk Judgment) scores each PR on diff composition, blast radius, Judge review depth, and revertability.
 
-**Rationale**: PRs exactly at the limit are still considered acceptable for auto-merge purposes. The limit is configurable via `champion.auto_merge_max_lines` in `.loom/config.json` (default: 200). PRs can also bypass the size limit entirely with the `loom:auto-merge-ok` label.
+**Decision**:
+- **Scenario A: allow merge** — green on all four axes (test-heavy composition, single-module blast radius, specific review, plain `git revert`).
+- **Scenario B: hold for a human** — red on blast radius (merge/guard automation the whole fleet depends on) *and* on review depth (a generic approval), with revertability weak because a bad guard can delete a branch before the revert lands. Comment names that concern, `loom:pr` stays, Champion retries next tick.
+
+**Rationale**: Size was never the risk; it was a proxy that inverted in both directions. The `champion.auto_merge_max_lines` knob that produced this edge case is retired — see the migration note in `champion-pr-merge.md` → "Safety Criteria → 2. Merge-Risk Judgment". `loom:auto-merge-ok` still exists, repurposed: it is an explicit human/Judge override of a Champion merge-risk hold (it does not waive the critical-file check).
 
 ---
 
@@ -304,7 +302,9 @@ gh issue create --title "Follow-on: Work identified in PR #$PR_NUMBER" --label "
 | Multiple linked issues | Allow | Verify all closed |
 | Mixed-state CI | Fail on `fail`/`cancel` | `pending` defers; `skipping` is OK |
 | Unknown critical file | Miss | Needs pattern update |
-| Exactly at size limit | Allow | Limit is inclusive |
+| Large but low-risk PR (e.g. mostly tests) | Allow | Judged on the 4 risk axes, not line count |
+| Small but high-blast-radius PR | Hold for human | Comment names the specific concern, keep `loom:pr`, retry next tick |
+| `loom:auto-merge-ok` present | Allow | Explicit human/Judge override of a merge-risk hold (does not waive critical files) |
 | API rate limit | Error | Comment and continue |
 | Multiple approvals | Allow | Label is source of truth |
 | Follow-on indicators found | Create | If thresholds met |

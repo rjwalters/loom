@@ -100,37 +100,92 @@ echo "PASS: Label check"
 
 **Rationale**: Only merge PRs explicitly approved by Judge. A human holds a PR by removing its `loom:pr` label (or adding `loom:changes-requested`), which fails this check.
 
-### 2. Size Check
-- [ ] Total lines changed <= configured limit (additions + deletions)
-- [ ] **Default limit**: 200 lines (configurable via `.loom/config.json` `champion.auto_merge_max_lines`)
-- [ ] **`loom:auto-merge-ok` label**: Size limit is waived (applied by Judge or human to signal large PR is safe)
+### 2. Merge-Risk Judgment (no line-count ceiling)
 
-**Verification command**:
+- [ ] The PR is green on **all four risk axes** below — or carries `loom:auto-merge-ok` (an explicit human/Judge override)
+
+**This criterion is a judgment call you make by reading the PR, not an arithmetic check.** You already have the diff, the PR body, and the Judge's review in front of you; use them. **Line count is not a criterion** — there is no numeric ceiling any more (the `champion.auto_merge_max_lines` knob is retired; see the migration note below), and a hold must never be justified by a line count.
+
+**Evidence to gather first** (you cannot judge what you have not read):
+
 ```bash
-# Get additions and deletions
-PR_DATA=$(gh pr view <number> --json additions,deletions --jq '{additions, deletions, total: (.additions + .deletions)}')
-ADDITIONS=$(echo "$PR_DATA" | jq -r '.additions')
-DELETIONS=$(echo "$PR_DATA" | jq -r '.deletions')
-TOTAL=$((ADDITIONS + DELETIONS))
+PR_NUMBER=<number>
 
-# Check for loom:auto-merge-ok label override
-HAS_AUTO_MERGE_OK=$(gh pr view <number> --json labels --jq '[.labels[].name] | any(. == "loom:auto-merge-ok")')
+# What files, and how the diff is distributed across them
+gh pr view "$PR_NUMBER" --json files --jq '.files[] | "\(.additions)+/\(.deletions)- \(.path)"'
 
-if [ "$HAS_AUTO_MERGE_OK" = "true" ]; then
-  echo "PASS: Size check waived by loom:auto-merge-ok label ($TOTAL lines)"
+# The actual diff (read it — the load-bearing hunks are what you are judging)
+gh pr diff "$PR_NUMBER"
+
+# The Judge's verdict comment (how deeply was this verified?)
+gh pr view "$PR_NUMBER" --json comments --jq '.comments[] | select(.body | test("Judge"; "i")) | .body'
+```
+
+**The four risk axes** — answer each; **any red answer holds the PR**:
+
+| Axis | Green (safe to auto-merge) | Red (hold for a human) |
+|------|----------------------------|------------------------|
+| **Diff composition** | The bulk of the diff is tests, docs/markdown, fixtures, or a self-contained new module not yet wired into an existing path. The load-bearing hunks are few and you can name them. | Load-bearing hunks change the *existing* behavior of a shared runtime path, and you cannot enumerate them — or the diff is dense enough that you skimmed rather than read it. |
+| **Blast radius** | Changes are confined to one crate/module/role file, or to surfaces whose failure affects a single feature. | Touches anything that mediates merging, branch/worktree deletion, credential/token selection, guard hooks, installers/updaters, CI workflows, or shared config schema — e.g. `merge-pr.sh`, `worktree.sh`, `loom-clean`, `.loom/hooks/guard-*.sh`, `spawn-claude.sh` / `spawn-worker.sh`, `install-loom.sh`, `resync-installed.sh`. Failure there damages the repo or the whole fleet, not one feature. |
+| **Judge review depth** | The Judge's verdict cites specifics from the diff — named files/functions, concrete behavior, what was run or verified. | A short generic approval ("LGTM", "looks good") with no evidence the diff was read, or a review that explicitly defers verification of some part ("did not check X"). |
+| **Revertability** | `git revert <squash-sha>` fully undoes the change: no data/schema migration, no published artifact, no state written outside the repo. | The change performs a one-way action when it runs (deletes branches/worktrees, rewrites installed files, publishes a release, migrates data, moves credentials), so reverting the commit does not undo the effect. |
+
+**Decision rule**:
+- All four axes green -> **PASS**, continue to criterion #3.
+- Any axis red -> **HOLD** (see hold behavior below).
+- **Unsure on any axis -> HOLD.** Conservative bias: a held PR costs one human merge; a bad auto-merge costs a revert on `main`.
+
+**Size is not a proxy for any axis.** An 886-line PR that is 700 lines of new tests plus one self-contained module is green on all four; a 12-line change to `merge-pr.sh`'s ordering guard is red on blast radius *and* revertability. Never hold a PR because it is large, and never merge a PR because it is small.
+
+**Hold behavior** — name the **specific** concern, keep `loom:pr`, retry next tick:
+
+```bash
+PR_NUMBER=<number>
+HOLD_MARKER="<!-- champion:merge-risk-hold -->"
+
+# Idempotency guard (same pattern as the stale-PR and verdict-janitor notices):
+# a judgment hold does not clear on its own, so comment ONCE per hold episode
+# instead of re-posting every 10-minute cron tick. The label stays, so the PR is
+# silently re-evaluated each tick and merges as soon as the concern is resolved
+# (a follow-up push that narrows the blast radius, a deeper Judge re-review, or
+# `loom:auto-merge-ok` applied by a human).
+if gh pr view "$PR_NUMBER" --json comments --jq '.comments[].body' | grep -qF "$HOLD_MARKER"; then
+  echo "Merge-risk hold already posted for #$PR_NUMBER — re-evaluating silently"
 else
-  # Read configurable size limit from .loom/config.json (default: 200)
-  SIZE_LIMIT=$(jq -r '.champion.auto_merge_max_lines // 200' .loom/config.json 2>/dev/null || echo 200)
+  gh pr comment "$PR_NUMBER" --body "$HOLD_MARKER
+**Champion: Holding for Human Merge**
 
-  if [ "$TOTAL" -gt "$SIZE_LIMIT" ]; then
-    echo "FAIL: Too large ($TOTAL lines, limit is $SIZE_LIMIT)"
-    exit 1
-  fi
-  echo "PASS: Size check ($TOTAL lines, limit is $SIZE_LIMIT)"
+This PR is Judge-approved and passes the mechanical safety criteria, but I am not
+merging it automatically:
+
+- **<AXIS>**: <SPECIFIC_CONCERN — name the file/function and what could break>
+
+**Next steps:**
+- A human can merge this directly with \`./.loom/scripts/merge-pr.sh $PR_NUMBER\`
+- Or apply \`loom:auto-merge-ok\` to override this hold; Champion will merge on the next tick
+
+Keeping \`loom:pr\`. This PR stays in the queue and will be re-evaluated each tick.
+
+---
+*Automated by Champion role*"
+fi
+# Skip this PR for this pass — do not merge.
+```
+
+The concern must be **specific and falsifiable**. Good: *"touches `merge-pr.sh`'s ordering guard — a regression there can delete a worktree branch before the merge lands"*. Bad: *"large PR"*, *"seems risky"*, *"too many lines changed"*.
+
+**`loom:auto-merge-ok` override**: this label is an explicit human/Judge statement that the PR is safe to auto-merge. It **overrides a merge-risk hold on this criterion only** — it does **not** waive criterion #3 (critical file exclusion), nor any of criteria #1, #4, #5, #6. A human who wants a critical-file PR merged should merge it themselves.
+
+```bash
+HAS_AUTO_MERGE_OK=$(gh pr view <number> --json labels --jq '[.labels[].name] | any(. == "loom:auto-merge-ok")')
+if [ "$HAS_AUTO_MERGE_OK" = "true" ]; then
+  echo "PASS: Merge-risk hold overridden by loom:auto-merge-ok label"
 fi
 ```
 
-**Rationale**: Small PRs are easier to revert if problems arise. The size limit is configurable via `.loom/config.json` to allow teams to tune the risk/autonomy tradeoff. The `loom:auto-merge-ok` label provides a per-PR escape hatch for large but safe PRs.
+**Rationale**: A raw line count is a poor risk proxy. Every substantive change-plus-tests PR exceeds any tolerable numeric threshold, so a ceiling holds *all* real work while letting through small changes to exactly the high-blast-radius files that most need human eyes (on 2026-07-30 the 200-line ceiling stalled four consecutive Judge-approved, CI-green PRs: #4551, #4558, #4560, #4562). Champion is an LLM agent that has already read the diff and the Judge's review — it can assess actual risk directly. The four axes keep that judgment concrete and checkable rather than a vague "use your best judgment".
+
+**Migration note (retired config knob)**: `champion.auto_merge_max_lines` is **no longer read**. If your repo's `.loom/config.json` sets it, the key is now inert — delete it (leaving it does no harm, but it no longer has any effect). Repos that used a low value to keep Champion conservative should instead rely on this criterion's conservative bias, hold individual PRs by removing `loom:pr`, or stop running Champion's auto-merge pass. Repos that set a high value to work *around* the ceiling can simply drop the key.
 
 ### 3. Critical File Exclusion Check
 - [ ] No changes to critical configuration or infrastructure files
@@ -174,6 +229,8 @@ echo "PASS: No critical files modified"
 ```
 
 **Rationale**: Changes to these files require careful human review due to high impact.
+
+This criterion is deliberately kept **in addition to** the merge-risk judgment in criterion #2, not folded into it: it is a deterministic, wording-independent floor that hard-fails on a known list of filenames no matter how the judgment call goes. Criterion #2 is the open-ended complement — it covers the high-blast-radius surfaces this list does not enumerate (see Edge Case 10 in `champion-reference.md`: the pattern list is known to miss new critical files). Neither replaces the other, and `loom:auto-merge-ok` overrides only #2.
 
 ### 4. Merge Conflict Check
 - [ ] PR is mergeable (no conflicts with base branch)
@@ -324,7 +381,8 @@ gh pr comment "$PR_NUMBER" --body "$(cat <<EOF
 This PR meets all safety criteria for automatic merging:
 
 - Judge approved (\`loom:pr\` label)
-- Size check passed ($TOTAL_LINES lines: +$ADDITIONS/-$DELETIONS)
+- Merge-risk judgment passed: <ONE_LINE_RATIONALE — e.g. "diff is tests plus one self-contained module; no high-blast-radius surface; fully revertable">
+- Diff size: $TOTAL_LINES lines (+$ADDITIONS/-$DELETIONS) — informational, not a gate
 - No critical files modified
 - No merge conflicts
 - Updated recently ($HOURS_AGO hours ago)
@@ -724,7 +782,9 @@ fi
 
 ## PR Rejection Workflow
 
-If ANY safety criterion fails, do NOT merge. How the failure is handled depends on whether it is **transient** (clears on its own or on the next push — pending CI, conflicts being resolved, `UNKNOWN` mergeability) or **terminal** (the PR has gone stale and cannot clear without a rebase).
+If ANY safety criterion fails, do NOT merge. How the failure is handled depends on whether it is **transient** (clears on its own or on the next push — pending CI, conflicts being resolved, `UNKNOWN` mergeability), **terminal** (the PR has gone stale and cannot clear without a rebase), or a **merge-risk hold** (criterion #2 judged the PR to need a human merge).
+
+**Merge-risk holds** keep `loom:pr` like a transient failure, but comment **once** behind the `<!-- champion:merge-risk-hold -->` idempotency marker because the condition does not clear on its own. The exact commands live with the criterion itself — see "Safety Criteria → 2. Merge-Risk Judgment → Hold behavior"; do not duplicate them here.
 
 ### Transient failures — keep `loom:pr`, retry next tick
 
