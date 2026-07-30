@@ -1831,35 +1831,60 @@ mod tests {
     // Config surface — autonomous.roleRunner
     // ===================================================================
 
+    // NOTE: these tests read `read_role_runner_config`, which merges the
+    // private-defaults tier (`config_resolver::private_defaults_path()`) ahead
+    // of the tempdir-scoped config under test. That tier resolves off
+    // `$LOOM_CONFIG_DEFAULTS_FILE` / `$HOME` — independent of `tmp.path()` — so
+    // a host's real `~/.local/share/loom/config/defaults.json` can leak into
+    // the result. Neutralize it for the duration of each test (#4538), and use
+    // the same named serial group (`loom_config_env`) as the other tests below
+    // that mutate this exact env var — a bare `#[serial]` would not serialize
+    // against it, since `serial_test` locks are per-key.
     #[test]
+    #[serial(loom_config_env)]
     fn test_config_missing_file_is_default() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
         let tmp = tempfile::tempdir().unwrap();
-        assert_eq!(read_role_runner_config(tmp.path()), RoleRunnerConfig::default());
+        let cfg = read_role_runner_config(tmp.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(cfg, RoleRunnerConfig::default());
     }
 
     #[test]
+    #[serial(loom_config_env)]
     fn test_config_malformed_json_is_default() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
         let tmp = tempfile::tempdir().unwrap();
         write_config(tmp.path(), "{not valid json");
-        assert_eq!(read_role_runner_config(tmp.path()), RoleRunnerConfig::default());
+        let cfg = read_role_runner_config(tmp.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(cfg, RoleRunnerConfig::default());
     }
 
     #[test]
+    #[serial(loom_config_env)]
     fn test_config_missing_block_is_default() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
         let tmp = tempfile::tempdir().unwrap();
         write_config(tmp.path(), r#"{"autonomous": {"workFinder": {"enabled": true}}}"#);
-        assert_eq!(read_role_runner_config(tmp.path()), RoleRunnerConfig::default());
+        let cfg = read_role_runner_config(tmp.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(cfg, RoleRunnerConfig::default());
     }
 
     #[test]
+    #[serial(loom_config_env)]
     fn test_config_reads_enabled_roles_and_interval() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
         let tmp = tempfile::tempdir().unwrap();
         write_config(
             tmp.path(),
             r#"{"autonomous": {"roleRunner": {"enabled": true, "roles": ["curator", "guide"], "intervalSecs": 120}}}"#,
         );
+        let cfg = read_role_runner_config(tmp.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
         assert_eq!(
-            read_role_runner_config(tmp.path()),
+            cfg,
             RoleRunnerConfig {
                 enabled: Some(true),
                 roles: Some(vec!["curator".to_string(), "guide".to_string()]),
@@ -1871,10 +1896,14 @@ mod tests {
     }
 
     #[test]
+    #[serial(loom_config_env)]
     fn test_config_zero_interval_is_dropped_to_none() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
         let tmp = tempfile::tempdir().unwrap();
         write_config(tmp.path(), r#"{"autonomous": {"roleRunner": {"intervalSecs": 0}}}"#);
-        assert_eq!(read_role_runner_config(tmp.path()).interval_secs, None);
+        let interval_secs = read_role_runner_config(tmp.path()).interval_secs;
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(interval_secs, None);
     }
 
     // ===================================================================
@@ -2256,31 +2285,48 @@ mod tests {
     // onIdle config parsing (#4364)
     // ===================================================================
 
+    // NOTE: see the comment above `test_config_missing_file_is_default` — these
+    // tests read `read_role_runner_config` too, so they need the same
+    // private-defaults-tier guard + `#[serial(loom_config_env)]` (#4538).
     #[test]
+    #[serial(loom_config_env)]
     fn test_config_on_idle_absent_is_none() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
         let tmp = tempfile::tempdir().unwrap();
         write_config(tmp.path(), r#"{"autonomous": {"roleRunner": {"enabled": true}}}"#);
-        assert_eq!(read_role_runner_config(tmp.path()).on_idle, None);
+        let on_idle = read_role_runner_config(tmp.path()).on_idle;
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(on_idle, None);
     }
 
     #[test]
+    #[serial(loom_config_env)]
     fn test_config_on_idle_parses_array() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
         let tmp = tempfile::tempdir().unwrap();
         write_config(tmp.path(), r#"{"autonomous": {"roleRunner": {"onIdle": ["champion"]}}}"#);
-        assert_eq!(read_role_runner_config(tmp.path()).on_idle, Some(vec!["champion".to_string()]));
+        let on_idle = read_role_runner_config(tmp.path()).on_idle;
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(on_idle, Some(vec!["champion".to_string()]));
     }
 
     #[test]
+    #[serial(loom_config_env)]
     fn test_config_on_idle_non_array_soft_fails_to_none() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
         let tmp = tempfile::tempdir().unwrap();
         // A non-array (string) value must not panic — it soft-fails to `None`,
         // matching the `roles` contract.
         write_config(tmp.path(), r#"{"autonomous": {"roleRunner": {"onIdle": "champion"}}}"#);
-        assert_eq!(read_role_runner_config(tmp.path()).on_idle, None);
+        let on_idle = read_role_runner_config(tmp.path()).on_idle;
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(on_idle, None);
     }
 
     #[test]
+    #[serial(loom_config_env)]
     fn test_config_on_idle_drops_non_string_entries() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
         let tmp = tempfile::tempdir().unwrap();
         // Non-string entries are dropped; string entries survive (unknown
         // *names* are filtered later in `resolve_on_idle_roles`).
@@ -2288,7 +2334,9 @@ mod tests {
             tmp.path(),
             r#"{"autonomous": {"roleRunner": {"onIdle": ["champion", 7, true]}}}"#,
         );
-        assert_eq!(read_role_runner_config(tmp.path()).on_idle, Some(vec!["champion".to_string()]));
+        let on_idle = read_role_runner_config(tmp.path()).on_idle;
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(on_idle, Some(vec!["champion".to_string()]));
     }
 
     // ===================================================================
