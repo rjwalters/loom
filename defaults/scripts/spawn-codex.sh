@@ -271,6 +271,7 @@ EXPLICIT_MODEL=""
 HAS_SANDBOX_ARG=false
 EXPLICIT_SANDBOX=""
 HAS_EFFORT_OVERRIDE=false
+GENERIC_EFFORT=""
 HAS_SKIP_GIT_CHECK_ARG=false
 PASSTHROUGH_ARGS=()
 
@@ -300,6 +301,23 @@ while [[ $# -gt 0 ]]; do
             # (codex does not understand this Claude-specific flag) and mapped
             # to a Codex sandbox mode below.
             SKIP_PERMISSIONS=true
+            shift
+            ;;
+        --effort)
+            if [[ $# -lt 2 ]]; then
+                log_error "$1 requires a value"
+                exit 78
+            fi
+            GENERIC_EFFORT="$2"
+            shift 2
+            ;;
+        --effort=*)
+            GENERIC_EFFORT="${1#--effort=}"
+            shift
+            ;;
+        --use-wrapper)
+            # Generic daemon retry convention. Codex already owns retry
+            # behavior; consume the convention instead of forwarding it.
             shift
             ;;
         -m|--model)
@@ -436,6 +454,9 @@ if [[ "$HAS_EFFORT_OVERRIDE" == "true" ]]; then
     if [[ -n "${LOOM_EFFORT:-}" ]]; then
         log_info "spawn-codex: explicit -c model_reasoning_effort= wins over LOOM_EFFORT='$LOOM_EFFORT'"
     fi
+elif [[ -n "$GENERIC_EFFORT" ]]; then
+    PASSTHROUGH_ARGS+=(-c "model_reasoning_effort=$GENERIC_EFFORT")
+    log_info "spawn-codex: effort=$GENERIC_EFFORT (from --effort)"
 elif [[ -n "${LOOM_EFFORT:-}" ]]; then
     PASSTHROUGH_ARGS+=(-c "model_reasoning_effort=$LOOM_EFFORT")
     log_info "spawn-codex: effort=$LOOM_EFFORT (from LOOM_EFFORT)"
@@ -525,6 +546,7 @@ else
             CODEX_PROFILE_NAME="$(basename "$_requested_home")"
             # Directory NAME only — never the path contents, never auth.json.
             log_info "spawn-codex: using Codex profile '$CODEX_PROFILE_NAME' (source=$_requested_source)"
+            echo "# LOOM_ACCOUNT name=$CODEX_PROFILE_NAME" >&2
         else
             log_error "Codex profile requested via $_requested_source has no usable auth.json."
             log_error "Expected a regular, non-empty, readable file at <profile>/auth.json."
@@ -555,6 +577,7 @@ fi
 # Checked BEFORE the binary check so the mocked test can assert argv assembly on
 # a host with no `codex` installed at all.
 if [[ -n "${LOOM_CODEX_NO_EXEC:-}" ]]; then
+    echo "# LOOM_CLI_START runtime=codex" >&2
     echo "spawn-codex would-exec: codex ${CODEX_ARGS[*]}"
     exit 0
 fi
@@ -576,6 +599,7 @@ fi
 # plain pid-preserving `exec`. Note stdin is NOT redirected in the interactive
 # case — an operator at the keyboard needs it.
 if [[ "$HAS_PROMPT" != "true" || -n "${LOOM_CODEX_NO_CAPTURE:-}" ]]; then
+    echo "# LOOM_CLI_START runtime=codex" >&2
     exec codex ${CODEX_ARGS[@]+"${CODEX_ARGS[@]}"}
 fi
 
@@ -594,6 +618,7 @@ _stderr_file="$(mktemp -t loom-spawn-codex.XXXXXX 2>/dev/null || mktemp)"
 trap "rm -f '$_stderr_file'" EXIT
 
 set +e
+echo "# LOOM_CLI_START runtime=codex" >&2
 { codex ${CODEX_ARGS[@]+"${CODEX_ARGS[@]}"} </dev/null 2>&1 1>&3 3>&- \
     | tee "$_stderr_file" >&2; } 3>&1
 _exit_code=${PIPESTATUS[0]}

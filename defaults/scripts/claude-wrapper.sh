@@ -1776,6 +1776,7 @@ run_with_retry() {
         # distinguish wrapper pre-flight output from actual Claude CLI output.
         # The "# " prefix means it is also filtered as a header line.
         echo "# CLAUDE_CLI_START" >&2
+        echo "# LOOM_CLI_START runtime=claude" >&2
         set +e  # Temporarily disable errexit to capture exit code
         unset CLAUDECODE  # Prevent nested session guard from blocking subprocess
         # Export per-agent config dir if set (for session isolation)

@@ -400,8 +400,11 @@ LOOM_RUNTIME=claude .loom/scripts/spawn-worker.sh --use-wrapper -p "..."
 ```
 
 Callers migrate from `spawn-claude.sh` to `spawn-worker.sh` to gain runtime
-selection; until they do, `spawn-claude.sh` keeps working unchanged (existing
-daemon/tooling callers are intentionally left on the direct path in Phase 1).
+selection; direct `spawn-claude.sh` callers remain supported. The daemon
+`SweepRegistry` uses this dispatcher and sends generic `--effort`,
+`--dangerously-skip-permissions`, and `--use-wrapper` conventions. Each adapter
+must consume or translate these options and must not pass options unsupported
+by its CLI.
 
 The machine-level `loom sweep <N>` dispatcher (`scripts/loom`'s `loom_cmd_sweep`)
 is one such migrated caller (#4480): it resolves the repo's `spawn-worker.sh` and
@@ -409,9 +412,24 @@ execs `spawn-worker.sh -p "/loom:sweep <N>" --dangerously-skip-permissions`
 instead of `claude` directly, so a Codex-hosted (or any non-Claude) operator can
 dispatch the canonical single-issue lifecycle. With nothing configured this stays
 byte-for-byte the old `claude -p ... --dangerously-skip-permissions` invocation
-(via `spawn-worker.sh` → `spawn-claude.sh`). The daemon's own
-`sweep_registry.rs` dispatch still defaults straight to `spawn-claude.sh` — a
-sibling gap tracked separately, deliberately out of #4480's scope.
+(via `spawn-worker.sh` → `spawn-claude.sh`).
+
+### Adapter observability markers
+
+Daemon-compatible runners emit a small, secret-free contract on stderr:
+
+```text
+# LOOM_RUNTIME_RESOLVED runtime=<runtime>
+# LOOM_ACCOUNT name=<account-or-profile>   # optional
+# LOOM_CLI_START runtime=<runtime>
+```
+
+The dispatcher emits runtime resolution, an adapter emits account/profile
+selection when available, and the runner emits CLI-start immediately before
+launching the runtime CLI. Account values are display names only; credential
+values and credential paths must never appear. Parsers anchor these markers
+after the newest daemon dispatch header. Historical `spawn-claude:` preamble
+and `# CLAUDE_CLI_START` records remain supported.
 
 ### Runtime resolution (precedence)
 
