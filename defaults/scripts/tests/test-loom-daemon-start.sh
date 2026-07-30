@@ -703,6 +703,17 @@ EOF
         echo -e "${RED}✗${NC} safehouse: enabled + socket file present -> 'configured (socket present ...)' (#4345)"
         echo "  output: $sh3_out"
     fi
+    # #4464: SH3's config has no `safehouse.room`, so the room-unset caveat MUST
+    # be surfaced (omitting room is valid only for a single-room safehoused).
+    TESTS_RUN=$((TESTS_RUN + 1))
+    if echo "$sh3_out" | grep -q 'safehouse.room is unset'; then
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+        echo -e "${GREEN}✓${NC} safehouse: room unset -> room caveat surfaced (#4464)"
+    else
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+        echo -e "${RED}✗${NC} safehouse: room unset -> room caveat surfaced (#4464)"
+        echo "  output: $sh3_out"
+    fi
     if [[ -f "$SH3_HOME/.loom/.daemon.pid" ]]; then
         kill "$(cat "$SH3_HOME/.loom/.daemon.pid" 2>/dev/null)" 2>/dev/null || true
     fi
@@ -710,6 +721,44 @@ else
     echo "  (skipping SH3: python3 AF_UNIX bind unavailable on this host)"
 fi
 rm -rf "$SH3_HOME"
+
+# SH4. #4464: same as SH3 but WITH an explicit safehouse.room set -> the caveat
+#      must NOT appear (the single-room contract is satisfied by an explicit room).
+SH4_HOME="$(mktemp -d)"
+mkdir -p "$SH4_HOME/.loom"
+SH4_SOCK="$SH4_HOME/.loom/safehoused.sock"
+if command -v python3 >/dev/null 2>&1 \
+    && python3 -c "
+import socket
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.bind('$SH4_SOCK')
+" 2>/dev/null; then
+    cat > "$SH4_HOME/.loom/config.json" <<EOF
+{"safehouse": {"enabled": true, "socket": "$SH4_SOCK", "room": "loom-fleet"}}
+EOF
+    sh4_out=$( ( cd "$SH4_HOME" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
+        -u LOOM_SAFEHOUSE_ENABLED -u LOOM_SAFEHOUSE_SOCKET -u SAFEHOUSED_SOCKET \
+        LOOM_DAEMON_BIN="$SH_BG_FAKE_BIN" \
+        LOOM_SOCKET_PATH="$SH4_HOME/.loom/loom-daemon.sock" \
+        LOOM_AUTONOMY_MARKER="$SH4_HOME/.loom/autonomy-desired" \
+        LOOM_WATCHDOG_LABEL="com.example.loom-sandbox-$$-sh4-watchdog" \
+        bash "$START_SCRIPT" --no-launchd --no-systemd 2>&1 ) )
+    TESTS_RUN=$((TESTS_RUN + 1))
+    if echo "$sh4_out" | grep -q 'safehouse.room is unset'; then
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+        echo -e "${RED}✗${NC} safehouse: room set -> no room caveat (#4464)"
+        echo "  output: $sh4_out"
+    else
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+        echo -e "${GREEN}✓${NC} safehouse: room set -> no room caveat (#4464)"
+    fi
+    if [[ -f "$SH4_HOME/.loom/.daemon.pid" ]]; then
+        kill "$(cat "$SH4_HOME/.loom/.daemon.pid" 2>/dev/null)" 2>/dev/null || true
+    fi
+else
+    echo "  (skipping SH4: python3 AF_UNIX bind unavailable on this host)"
+fi
+rm -rf "$SH4_HOME"
 
 # ---------- summary ----------
 echo
