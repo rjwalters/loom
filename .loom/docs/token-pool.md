@@ -466,6 +466,53 @@ tokens (absent, empty, or all bad). It does **not** silently fall back to
 keychain — that path belongs in `loom-daemon` (#3236), and only when token
 rotation has not been configured at all.
 
+The `loom-daemon` role runner (`autonomous.roleRunner`, see
+[daemon-reference.md](daemon-reference.md)) pre-checks
+[`tokens::token_pool_size`](../../loom-daemon/src/tokens.rs) for exactly this
+condition **before** it ever spawns `spawn-claude.sh` (issue #4642): a repo
+with neither pool provisioned skips the doomed spawn entirely instead of
+hitting this hard-fail on every single tick forever. The skip is logged once
+(`WARN`) per root per role, then downgraded to `DEBUG` on repeats — grep a
+role's log for `no token pool available` — and is re-checked every tick, so
+provisioning either pool later resumes ticking with no daemon restart needed.
+
+## Per-repo pool vs. shared machine-level pool: which to provision (#4642)
+
+A newly-managed repo (added via `loom-daemon workspace add`, or picked up by
+the multi-workspace role runner / work finder) starts with **neither** pool
+provisioned, and stays that way until an operator deliberately runs one of the
+two bootstrap commands below — this is an operator/billing decision, not
+something Loom auto-applies, because it changes **whose usage counts against
+which weekly ceiling**:
+
+- **Per-repo pool** (`loom-daemon tokens bootstrap` from inside the repo,
+  populating `<repo>/.loom/tokens/`): this repo's sweeps and role ticks draw
+  from accounts dedicated to it alone. Usage against each account's weekly
+  limit is isolated to this one repo — the right choice when a repo has its
+  own budget/accounts, or when you want one repo's activity to never compete
+  with another's for the same account's rotation slot.
+- **Shared machine-level pool** (`loom-daemon tokens bootstrap --shared`,
+  populating `~/.loom/tokens/` or the `LOOM_SHARED_TOKENS_DIR` override,
+  resolved by [step 3 of the fallback chain](#shared-machine-level-pool-fallback-3938)
+  above): every repo on the host that has **no per-repo pool of its own**
+  falls back to this one pool and shares its accounts. This is convenient for
+  low-traffic repos (e.g. the canary chip repos that motivated #4642 — several
+  small repos, none busy enough on its own to justify dedicated accounts) but
+  means **every one of those repos' sweeps and role ticks now compete for the
+  same weekly ceiling** — a burst of activity in one consumer repo can exhaust
+  accounts another consumer repo also depends on. A repo with a per-repo pool
+  is never affected by this (the per-repo pool always wins when it holds
+  tokens, `token_pool_size_resolved`'s precedence).
+
+**Rule of thumb**: provision a per-repo pool for any repo whose activity level
+or billing owner is distinct enough to want isolated usage accounting; use the
+shared pool for a cluster of low-traffic repos willing to accept a shared
+ceiling in exchange for zero per-repo token administration. Both can coexist
+on one host — the fallback chain is per-repo-first, so adding a per-repo pool
+to a repo previously riding the shared pool is a strictly additive, safe
+change (it simply stops that one repo from drawing on the shared ceiling, with
+no reconfiguration needed on the shared side).
+
 ## Operator CLI (`loom-daemon tokens pin/unpin/unblock`)
 
 Operators can restrict the rotation pool to a subset of accounts (an "allowlist")

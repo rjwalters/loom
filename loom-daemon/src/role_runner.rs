@@ -137,6 +137,22 @@ const IMPLAUSIBLY_FAST_TICK: Duration = Duration::from_secs(10);
 /// not a config knob — the interval cadence is the tunable backstop.
 const IDLE_TRIGGER_DEBOUNCE: Duration = Duration::from_secs(60);
 
+/// Process-wide count of ticks skipped with [`RoleTickOutcome::NoTokenPool`]
+/// (#4642) — a distinct, independently-attributable tally, deliberately never
+/// folded into the generic [`RoleTickOutcome::Failure`] count a real
+/// invocation failure increments (mirrors the named per-reason skip counters
+/// in `sweep_registry.rs`, e.g. `OpenPrDispatchError`/`DispatchBackoffError`).
+static NO_TOKEN_POOL_SKIP_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Total number of role-runner ticks skipped so far for having no available
+/// token pool (see [`RoleTickOutcome::NoTokenPool`]). Exposed for tests and
+/// future status surfacing; the daemon does not reset this across its
+/// lifetime.
+#[must_use]
+pub fn no_token_pool_skip_count() -> u64 {
+    NO_TOKEN_POOL_SKIP_COUNT.load(Ordering::Relaxed)
+}
+
 /// One standalone support role this module knows how to dispatch: its name
 /// (used for config/env lookups and the per-role log file), the `/role`
 /// slash-command prompt passed to `claude -p`, and its default tick interval.
@@ -211,6 +227,16 @@ pub enum RoleTickOutcome {
     Failure(String),
     /// Fail-closed scheduling rejection with machine-readable provenance.
     RuntimeRejected(crate::runtime_admission::RuntimeRejection),
+    /// No available token pool for this workspace (issue #4642): neither a
+    /// per-repo `.loom/tokens/` pool nor a provisioned shared pool
+    /// (`LOOM_SHARED_TOKENS_DIR` / `~/.loom/tokens`) exists, so
+    /// `spawn-claude.sh`'s own token-selection preflight is guaranteed to
+    /// exit `78` (`EX_CONFIG`). A distinct variant — never folded into the
+    /// generic [`RoleTickOutcome::Failure`] tally a real invocation failure
+    /// increments — because this is a permanent config state until an
+    /// operator provisions a pool, not a transient failure worth retrying
+    /// identically forever.
+    NoTokenPool,
 }
 
 impl RoleTickOutcome {
@@ -306,6 +332,20 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
             Ok(p) => p,
             Err(e) => return RoleTickOutcome::Failure(e),
         };
+        // Pre-spawn token-pool preflight (issue #4642): a workspace with
+        // neither a per-repo `.loom/tokens/` pool nor a provisioned shared
+        // pool is guaranteed to fail `spawn-claude.sh`'s own token-selection
+        // preflight (`EX_CONFIG`, exit 78) — checking here, before spawning
+        // anything, means the role runner skips the doomed spawn instead of
+        // burning a tick on a guaranteed exit-78 failure every single time.
+        // Gated the same way as the admission check just below: only the
+        // real production path (`spawn_bin` unset) checks this — tests that
+        // point `spawn_bin` at a fake script opt out, exactly like
+        // `resolve_and_admit` below.
+        if self.spawn_bin.is_none() && crate::tokens::token_pool_size(&self.workspace_root) == 0 {
+            NO_TOKEN_POOL_SKIP_COUNT.fetch_add(1, Ordering::Relaxed);
+            return RoleTickOutcome::NoTokenPool;
+        }
         // Issue #4501: pin the child's model instead of inheriting the account's
         // interactive CLI default (`fable` on the host that filed the issue,
         // where every role child burned the most constrained quota tier and then
@@ -1270,6 +1310,11 @@ pub fn spawn_multi_role_task(
         // Per-root failing state (#4349), so a persistently failing tick logs
         // only on the fail edge and on recovery, not every tick.
         let mut failing_roots: HashMap<PathBuf, bool> = HashMap::new();
+        // Per-root no-token-pool state (#4642), tracked completely
+        // independently of `failing_roots` so a permanent missing-pool skip
+        // is never conflated with (or silences the WARN for) a genuine
+        // invocation failure — see `RootTickLogAction::is_no_token_pool`.
+        let mut no_token_pool_roots: HashMap<PathBuf, bool> = HashMap::new();
         // Disabled-root warn-once state (#4377): the per-tick disabled-skip
         // below is otherwise only a `debug!` — invisible at the default `info`
         // level, so a registered root left disabled gets zero diagnostics.
@@ -1396,6 +1441,7 @@ pub fn spawn_multi_role_task(
                         &outcome,
                         elapsed,
                         &mut failing_roots,
+                        &mut no_token_pool_roots,
                     ),
                     Err(e) => log::error!(
                         "role_runner: {} invocation task for {} panicked ({e}); continuing to the \
@@ -1448,6 +1494,15 @@ fn log_outcome(role: &str, outcome: &RoleTickOutcome, elapsed: Duration) {
         RoleTickOutcome::RuntimeRejected(rejection) => {
             log::warn!("role_runner: {role} runtime admission rejected: {rejection}");
         }
+        RoleTickOutcome::NoTokenPool => {
+            log::warn!(
+                "role_runner: {role} tick skipped after {elapsed:.1?} — no token pool available \
+                 (neither a per-repo .loom/tokens/ pool nor a provisioned shared pool at \
+                 ~/.loom/tokens; run `loom-daemon tokens bootstrap` for a per-repo pool, or \
+                 `loom-daemon tokens bootstrap --shared` for the machine-level pool — see \
+                 .loom/docs/token-pool.md, #4642)"
+            );
+        }
     }
 }
 
@@ -1486,6 +1541,14 @@ fn log_outcome_for_root(role: &str, root: &Path, outcome: &RoleTickOutcome, elap
             "role_runner: {role} runtime admission rejected for {} after {elapsed:.1?}: {rejection}",
             root.display()
         ),
+        RoleTickOutcome::NoTokenPool => log::warn!(
+            "role_runner: {role} tick for {} skipped after {elapsed:.1?} — no token pool \
+             available (neither a per-repo .loom/tokens/ pool nor a provisioned shared pool at \
+             ~/.loom/tokens; run `loom-daemon tokens bootstrap` for a per-repo pool, or \
+             `loom-daemon tokens bootstrap --shared` for the machine-level pool — see \
+             .loom/docs/token-pool.md, #4642)",
+            root.display()
+        ),
     }
 }
 
@@ -1514,6 +1577,16 @@ enum RootTickLogAction {
     /// tick forever (the #4349 symptom: a broken worktree's MCP preflight
     /// failing every 5-minute champion/curator tick with ERROR-level noise).
     FailureRepeat,
+    /// First tick with no available token pool (edge into this state, #4642):
+    /// log at `WARN`. Distinct from [`Self::FailureEdge`] — a missing token
+    /// pool is a permanent config state, not an invocation failure, and must
+    /// never be tallied as one.
+    NoTokenPoolEdge,
+    /// Repeat tick with no available token pool (already warned, #4642):
+    /// downgrade to `DEBUG`, mirroring [`Self::FailureRepeat`]'s dedup shape
+    /// but tracked completely independently of the Failure/RuntimeRejected
+    /// state.
+    NoTokenPoolRepeat,
 }
 
 impl RootTickLogAction {
@@ -1523,6 +1596,15 @@ impl RootTickLogAction {
     fn is_failing(self) -> bool {
         matches!(self, Self::FailureEdge | Self::FailureRepeat)
     }
+
+    /// Whether this action should mark the root as no-token-pool for the
+    /// *next* tick's edge/repeat decision (#4642) — tracked independently of
+    /// [`Self::is_failing`] so the two conditions never bleed into each
+    /// other's dedup state.
+    #[must_use]
+    fn is_no_token_pool(self) -> bool {
+        matches!(self, Self::NoTokenPoolEdge | Self::NoTokenPoolRepeat)
+    }
 }
 
 #[must_use]
@@ -1530,8 +1612,11 @@ fn classify_root_tick_log(
     outcome: &RoleTickOutcome,
     elapsed: Duration,
     was_failing: bool,
+    was_no_token_pool: bool,
 ) -> RootTickLogAction {
     match outcome {
+        RoleTickOutcome::NoTokenPool if was_no_token_pool => RootTickLogAction::NoTokenPoolRepeat,
+        RoleTickOutcome::NoTokenPool => RootTickLogAction::NoTokenPoolEdge,
         RoleTickOutcome::Failure(_) | RoleTickOutcome::RuntimeRejected(_) if was_failing => {
             RootTickLogAction::FailureRepeat
         }
@@ -1551,21 +1636,26 @@ fn classify_root_tick_log(
 
 /// Root-aware, **state-change-deduped** variant of [`log_outcome`] for the
 /// multi-workspace loop (#4349). `failing` tracks, per root, whether the
-/// *previous* tick for that root ended in [`RoleTickOutcome::Failure`] — see
-/// [`RootTickLogAction`] for the per-transition logging rules.
+/// *previous* tick for that root ended in [`RoleTickOutcome::Failure`] (or
+/// [`RoleTickOutcome::RuntimeRejected`]); `no_token_pool` tracks, per root and
+/// completely independently, whether the previous tick ended in
+/// [`RoleTickOutcome::NoTokenPool`] (#4642) — see [`RootTickLogAction`] for
+/// the per-transition logging rules.
 fn log_outcome_for_root_deduped(
     role: &str,
     root: &Path,
     outcome: &RoleTickOutcome,
     elapsed: Duration,
     failing: &mut HashMap<PathBuf, bool>,
+    no_token_pool: &mut HashMap<PathBuf, bool>,
 ) {
     let was_failing = failing.get(root).copied().unwrap_or(false);
-    let action = classify_root_tick_log(outcome, elapsed, was_failing);
+    let was_no_token_pool = no_token_pool.get(root).copied().unwrap_or(false);
+    let action = classify_root_tick_log(outcome, elapsed, was_failing, was_no_token_pool);
     let reason = match outcome {
         RoleTickOutcome::Failure(reason) => reason.as_str(),
         RoleTickOutcome::RuntimeRejected(rejection) => rejection.reason.as_str(),
-        RoleTickOutcome::Success => "",
+        RoleTickOutcome::Success | RoleTickOutcome::NoTokenPool => "",
     };
     match action {
         RootTickLogAction::Success => {
@@ -1615,8 +1705,28 @@ fn log_outcome_for_root_deduped(
                 root.display()
             );
         }
+        RootTickLogAction::NoTokenPoolEdge => {
+            log::warn!(
+                "role_runner: {role} tick for {} skipped after {elapsed:.1?} — no token pool \
+                 available (neither a per-repo .loom/tokens/ pool nor a provisioned shared pool \
+                 at ~/.loom/tokens; run `loom-daemon tokens bootstrap` for a per-repo pool, or \
+                 `loom-daemon tokens bootstrap --shared` for the machine-level pool — see \
+                 .loom/docs/token-pool.md; further identical skips for this root are logged at \
+                 DEBUG until a pool becomes available, #4642)",
+                root.display()
+            );
+        }
+        RootTickLogAction::NoTokenPoolRepeat => {
+            log::debug!(
+                "role_runner: {role} tick for {} skipped again after {elapsed:.1?} — no token \
+                 pool available (repeat of an already-logged skip; not re-warned every tick — \
+                 see the skip-edge WARN above, #4642)",
+                root.display()
+            );
+        }
     }
     failing.insert(root.to_path_buf(), action.is_failing());
+    no_token_pool.insert(root.to_path_buf(), action.is_no_token_pool());
 }
 
 #[cfg(test)]
@@ -1638,9 +1748,17 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        for sub in [".loom/roles", ".loom/runtimes", ".loom/scripts"] {
+        for sub in [
+            ".loom/roles",
+            ".loom/runtimes",
+            ".loom/scripts",
+            ".loom/tokens",
+        ] {
             fs::create_dir_all(root.join(sub)).unwrap();
         }
+        // #4642: a per-repo token pool so the new pre-spawn token-pool check
+        // does not short-circuit this test's runtime-admission scenario.
+        fs::write(root.join(".loom/tokens/fake.token"), "sk-ant-oat01-fake").unwrap();
         write_config(root, r#"{"runtimes":{"roles":{"curator":"codex"}}}"#);
         fs::write(root.join(".loom/roles/curator.json"), r#"{"runtimeRequirements":["mcp"]}"#)
             .unwrap();
@@ -1698,6 +1816,82 @@ mod tests {
             panic!("expected Failure");
         };
         assert!(reason.contains("spawn-worker.sh not found"), "{reason}");
+    }
+
+    /// #4642: a workspace with a resolvable `spawn-worker.sh` but NO token
+    /// pool (neither per-repo nor shared) must short-circuit to
+    /// `NoTokenPool` — proving the pre-spawn check fires *before*
+    /// `run_role_with_timeout` ever runs the script — by asserting a marker
+    /// file the script would write is never created.
+    #[test]
+    #[serial(loom_shared_tokens_dir_env)]
+    fn test_invoke_short_circuits_with_no_token_pool_before_running_the_script() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Force a deterministic "no shared pool" resolution regardless of a
+        // real `~/.loom/tokens` on the machine running this test.
+        let prev_shared = std::env::var("LOOM_SHARED_TOKENS_DIR").ok();
+        std::env::set_var("LOOM_SHARED_TOKENS_DIR", "");
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".loom/scripts")).unwrap();
+        // A real, resolvable spawn-worker.sh that proves whether it ran by
+        // writing a marker file.
+        let marker = root.join("script-ran");
+        let worker = root.join(".loom/scripts/spawn-worker.sh");
+        fs::write(&worker, format!("#!/bin/sh\ntouch '{}'\nexit 0\n", marker.display())).unwrap();
+        fs::set_permissions(&worker, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let before = no_token_pool_skip_count();
+        let mut runner = ScriptRoleInvocationRunner::new(root.to_path_buf());
+        let outcome = runner.invoke("curator", "/loom:curator");
+
+        assert_eq!(outcome, RoleTickOutcome::NoTokenPool);
+        assert!(!outcome.is_success());
+        assert!(!marker.exists(), "the doomed script must never actually run");
+        assert_eq!(no_token_pool_skip_count(), before + 1);
+
+        match prev_shared {
+            Some(v) => std::env::set_var("LOOM_SHARED_TOKENS_DIR", v),
+            None => std::env::remove_var("LOOM_SHARED_TOKENS_DIR"),
+        }
+    }
+
+    /// #4642: the SAME workspace with a per-repo `.loom/tokens/` pool
+    /// populated proceeds past the check and actually runs the script —
+    /// proving the gate re-checks live state rather than caching a verdict.
+    #[test]
+    #[serial(loom_shared_tokens_dir_env)]
+    fn test_invoke_proceeds_once_a_per_repo_token_pool_exists() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let prev_shared = std::env::var("LOOM_SHARED_TOKENS_DIR").ok();
+        std::env::set_var("LOOM_SHARED_TOKENS_DIR", "");
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".loom/scripts")).unwrap();
+        fs::create_dir_all(root.join(".loom/tokens")).unwrap();
+        fs::write(root.join(".loom/tokens/fake.token"), "sk-ant-oat01-fake").unwrap();
+        let worker = root.join(".loom/scripts/spawn-worker.sh");
+        fs::write(&worker, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&worker, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut runner = ScriptRoleInvocationRunner::new(root.to_path_buf());
+        let outcome = runner.invoke("curator", "/loom:curator");
+        // Not asserting `Success` specifically: with no
+        // `.loom/roles`/`.loom/runtimes` manifests in this minimal fixture,
+        // the runtime-admission step below the token check is expected to
+        // reject the (unconfigured) default runtime — the point of this test
+        // is only that the token-pool gate itself let the tick past, i.e.
+        // the outcome is never `NoTokenPool` once a pool exists.
+        assert_ne!(outcome, RoleTickOutcome::NoTokenPool);
+
+        match prev_shared {
+            Some(v) => std::env::set_var("LOOM_SHARED_TOKENS_DIR", v),
+            None => std::env::remove_var("LOOM_SHARED_TOKENS_DIR"),
+        }
     }
 
     #[test]
@@ -3069,7 +3263,12 @@ mod tests {
     #[test]
     fn test_classify_first_failure_is_edge() {
         assert_eq!(
-            classify_root_tick_log(&RoleTickOutcome::Failure("boom".into()), NORMAL_TICK, false),
+            classify_root_tick_log(
+                &RoleTickOutcome::Failure("boom".into()),
+                NORMAL_TICK,
+                false,
+                false
+            ),
             RootTickLogAction::FailureEdge
         );
     }
@@ -3077,7 +3276,12 @@ mod tests {
     #[test]
     fn test_classify_repeat_failure_is_downgraded() {
         assert_eq!(
-            classify_root_tick_log(&RoleTickOutcome::Failure("boom".into()), NORMAL_TICK, true),
+            classify_root_tick_log(
+                &RoleTickOutcome::Failure("boom".into()),
+                NORMAL_TICK,
+                true,
+                false
+            ),
             RootTickLogAction::FailureRepeat
         );
     }
@@ -3085,7 +3289,7 @@ mod tests {
     #[test]
     fn test_classify_success_after_failure_is_recovery() {
         assert_eq!(
-            classify_root_tick_log(&RoleTickOutcome::Success, NORMAL_TICK, true),
+            classify_root_tick_log(&RoleTickOutcome::Success, NORMAL_TICK, true, false),
             RootTickLogAction::Recovered
         );
     }
@@ -3093,7 +3297,7 @@ mod tests {
     #[test]
     fn test_classify_steady_state_success_is_plain() {
         assert_eq!(
-            classify_root_tick_log(&RoleTickOutcome::Success, NORMAL_TICK, false),
+            classify_root_tick_log(&RoleTickOutcome::Success, NORMAL_TICK, false, false),
             RootTickLogAction::Success
         );
     }
@@ -3101,19 +3305,71 @@ mod tests {
     #[test]
     fn test_classify_implausibly_fast_variants() {
         assert_eq!(
-            classify_root_tick_log(&RoleTickOutcome::Success, Duration::from_millis(100), false),
+            classify_root_tick_log(
+                &RoleTickOutcome::Success,
+                Duration::from_millis(100),
+                false,
+                false
+            ),
             RootTickLogAction::SuccessImplausiblyFast
         );
         assert_eq!(
-            classify_root_tick_log(&RoleTickOutcome::Success, Duration::from_millis(100), true),
+            classify_root_tick_log(
+                &RoleTickOutcome::Success,
+                Duration::from_millis(100),
+                true,
+                false
+            ),
             RootTickLogAction::RecoveredImplausiblyFast
         );
+    }
+
+    // ---- no-token-pool classification (#4642) -------------------------
+
+    #[test]
+    fn test_classify_first_no_token_pool_is_edge() {
+        assert_eq!(
+            classify_root_tick_log(&RoleTickOutcome::NoTokenPool, NORMAL_TICK, false, false),
+            RootTickLogAction::NoTokenPoolEdge
+        );
+    }
+
+    #[test]
+    fn test_classify_repeat_no_token_pool_is_downgraded() {
+        assert_eq!(
+            classify_root_tick_log(&RoleTickOutcome::NoTokenPool, NORMAL_TICK, false, true),
+            RootTickLogAction::NoTokenPoolRepeat
+        );
+    }
+
+    #[test]
+    fn test_classify_no_token_pool_is_independent_of_failing_state() {
+        // A root that was previously `Failure`-failing must not have its
+        // no-token-pool skip demoted to `Repeat` just because `was_failing`
+        // is true — the two conditions are tracked on separate axes.
+        assert_eq!(
+            classify_root_tick_log(&RoleTickOutcome::NoTokenPool, NORMAL_TICK, true, false),
+            RootTickLogAction::NoTokenPoolEdge
+        );
+    }
+
+    #[test]
+    fn test_root_tick_log_action_no_token_pool_is_not_failing() {
+        // #4642: a no-token-pool skip must never contribute to the
+        // Failure/RuntimeRejected tally.
+        assert!(!RootTickLogAction::NoTokenPoolEdge.is_failing());
+        assert!(!RootTickLogAction::NoTokenPoolRepeat.is_failing());
+        assert!(RootTickLogAction::NoTokenPoolEdge.is_no_token_pool());
+        assert!(RootTickLogAction::NoTokenPoolRepeat.is_no_token_pool());
+        assert!(!RootTickLogAction::FailureEdge.is_no_token_pool());
+        assert!(!RootTickLogAction::FailureRepeat.is_no_token_pool());
     }
 
     #[test]
     fn test_log_outcome_for_root_deduped_tracks_failing_state_across_ticks() {
         let root = PathBuf::from("/tmp/does-not-need-to-exist-for-this-test");
         let mut failing: HashMap<PathBuf, bool> = HashMap::new();
+        let mut no_token_pool: HashMap<PathBuf, bool> = HashMap::new();
 
         // Tick 1: failure -> edge, marks failing.
         log_outcome_for_root_deduped(
@@ -3122,6 +3378,7 @@ mod tests {
             &RoleTickOutcome::Failure("MCP_PREFLIGHT_FAILED".into()),
             NORMAL_TICK,
             &mut failing,
+            &mut no_token_pool,
         );
         assert_eq!(failing.get(&root), Some(&true));
 
@@ -3135,6 +3392,7 @@ mod tests {
                 &RoleTickOutcome::Failure("MCP_PREFLIGHT_FAILED".into()),
                 NORMAL_TICK,
                 &mut failing,
+                &mut no_token_pool,
             );
             assert_eq!(failing.get(&root), Some(&true));
         }
@@ -3146,6 +3404,7 @@ mod tests {
             &RoleTickOutcome::Success,
             NORMAL_TICK,
             &mut failing,
+            &mut no_token_pool,
         );
         assert_eq!(failing.get(&root), Some(&false));
 
@@ -3156,6 +3415,7 @@ mod tests {
             &RoleTickOutcome::Success,
             NORMAL_TICK,
             &mut failing,
+            &mut no_token_pool,
         );
         assert_eq!(failing.get(&root), Some(&false));
     }
@@ -3167,6 +3427,7 @@ mod tests {
         let root_a = PathBuf::from("/tmp/root-a");
         let root_b = PathBuf::from("/tmp/root-b");
         let mut failing: HashMap<PathBuf, bool> = HashMap::new();
+        let mut no_token_pool: HashMap<PathBuf, bool> = HashMap::new();
 
         log_outcome_for_root_deduped(
             "curator",
@@ -3174,6 +3435,7 @@ mod tests {
             &RoleTickOutcome::Failure("boom".into()),
             NORMAL_TICK,
             &mut failing,
+            &mut no_token_pool,
         );
         log_outcome_for_root_deduped(
             "curator",
@@ -3181,10 +3443,46 @@ mod tests {
             &RoleTickOutcome::Success,
             NORMAL_TICK,
             &mut failing,
+            &mut no_token_pool,
         );
 
         assert_eq!(failing.get(&root_a), Some(&true));
         assert_eq!(failing.get(&root_b), Some(&false));
+    }
+
+    #[test]
+    fn test_log_outcome_for_root_deduped_no_token_pool_tracked_independently_of_failing() {
+        // #4642: a NoTokenPool tick must never mark `failing` true, and a
+        // real Failure tick must never mark `no_token_pool` true — the two
+        // maps are independent axes even for the SAME root.
+        let root = PathBuf::from("/tmp/does-not-need-to-exist-for-this-test-2");
+        let mut failing: HashMap<PathBuf, bool> = HashMap::new();
+        let mut no_token_pool: HashMap<PathBuf, bool> = HashMap::new();
+
+        log_outcome_for_root_deduped(
+            "auditor",
+            &root,
+            &RoleTickOutcome::NoTokenPool,
+            NORMAL_TICK,
+            &mut failing,
+            &mut no_token_pool,
+        );
+        assert_eq!(no_token_pool.get(&root), Some(&true));
+        assert_eq!(failing.get(&root), Some(&false));
+
+        // A subsequent real failure must still log as a fresh `FailureEdge`
+        // (not `FailureRepeat`) even though the root was just skipped for no
+        // token pool — proving the two states never cross-contaminate.
+        log_outcome_for_root_deduped(
+            "auditor",
+            &root,
+            &RoleTickOutcome::Failure("boom".into()),
+            NORMAL_TICK,
+            &mut failing,
+            &mut no_token_pool,
+        );
+        assert_eq!(failing.get(&root), Some(&true));
+        assert_eq!(no_token_pool.get(&root), Some(&false));
     }
 
     // ===================================================================
