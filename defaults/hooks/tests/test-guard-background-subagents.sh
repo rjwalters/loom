@@ -20,7 +20,10 @@
 #   - unparseable transcript content -> allow (fail-open)
 #   - outstanding background Bash task (dispatch + immediate ack only, no
 #     later task-notification echoing the tool-use-id) -> block (#4389)
-#   - completed background Bash task (task-notification observed) -> allow
+#   - completed background Bash task (task-notification observed in the REAL
+#     harness shapes — `queue-operation` top-level .content and `attachment`
+#     .attachment.prompt, per #4482) -> allow, and re-allows on a second stop
+#     sequence over the same transcript (no one-shot/stateful matching)
 #   - outstanding background Bash task + stop_hook_active=true -> allow
 #     (loop guard applies identically)
 #   - guards.backgroundSubagents / LOOM_GUARD_BACKGROUND_SUBAGENTS toggle
@@ -81,7 +84,15 @@ BG_USE_UNRESOLVED='{"type":"assistant","message":{"role":"assistant","content":[
 BG_ACK_UNRESOLVED='{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_bg01","content":"Command running in background with ID: bgtest01. Output is being written to: /tmp/bgtest01.output. You will be notified when it completes."}]}}'
 BG_USE_RESOLVED='{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_bg02","name":"Bash","input":{"command":"sleep 1","run_in_background":true}}]}}'
 BG_ACK_RESOLVED='{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_bg02","content":"Command running in background with ID: bgtest02. Output is being written to: /tmp/bgtest02.output. You will be notified when it completes."}]}}'
-BG_NOTIFICATION_RESOLVED='{"type":"user","message":{"role":"user","content":"<task-notification>\n<task-id>bgtest02</task-id>\n<tool-use-id>toolu_bg02</tool-use-id>\n<output-file>/tmp/bgtest02.output</output-file>\n<status>completed</status>\n<summary>Background command completed (exit code 0)</summary>\n</task-notification>"}}'
+# Completion notification in the REAL harness shapes (issue #4482). The prior
+# fixture used a `type==\"user\"` string-content shape that does NOT occur in a
+# real transcript, so it re-confirmed the (broken) code instead of testing it.
+# Verified against live transcripts, a background-Bash `<task-notification>`
+# lands as one (or both) of these top-level entry shapes:
+#   shape 1: {"type":"queue-operation", "content":"<task-notification>...</task-notification>"}
+#   shape 2: {"type":"attachment","attachment":{"commandMode":"task-notification","prompt":"<task-notification>...</task-notification>"}}
+BG_NOTIFICATION_QUEUEOP='{"type":"queue-operation","operation":"enqueue","content":"<task-notification>\n<task-id>bgtest02</task-id>\n<tool-use-id>toolu_bg02</tool-use-id>\n<output-file>/tmp/bgtest02.output</output-file>\n<status>completed</status>\n<summary>Background command completed (exit code 0)</summary>\n</task-notification>"}'
+BG_NOTIFICATION_ATTACHMENT='{"type":"attachment","attachment":{"type":"queued_command","commandMode":"task-notification","prompt":"<task-notification>\n<task-id>bgtest02</task-id>\n<tool-use-id>toolu_bg02</tool-use-id>\n<output-file>/tmp/bgtest02.output</output-file>\n<status>completed</status>\n<summary>Background command completed (exit code 0)</summary>\n</task-notification>"}}'
 
 # Build stdin JSON. Args: <transcript_path> <stop_hook_active>
 make_input() {
@@ -180,12 +191,37 @@ write_transcript "$T5" "$BG_USE_UNRESOLVED" "$BG_ACK_UNRESOLVED"
 result=$(run_hook "$T5" false)
 assert_block "(h) outstanding background Bash task -> block" "$result"
 
-# (i) completed background Bash task (dispatch + ack + later task-notification
-# echoing the dispatch tool-use-id) -> allow (silent)
-T6="$TMPROOT/transcript-bg-completed.jsonl"
-write_transcript "$T6" "$BG_USE_RESOLVED" "$BG_ACK_RESOLVED" "$BG_NOTIFICATION_RESOLVED"
+# (i) completed background Bash task, notification in the REAL `queue-operation`
+# shape (top-level .content string echoing the dispatch tool-use-id) -> allow.
+# This is the shape the harness actually emits (#4482); the old fixture used a
+# synthetic `type=="user"` string-content entry that never occurs live and so
+# never exercised the matcher against reality.
+T6="$TMPROOT/transcript-bg-completed-queueop.jsonl"
+write_transcript "$T6" "$BG_USE_RESOLVED" "$BG_ACK_RESOLVED" "$BG_NOTIFICATION_QUEUEOP"
 result=$(run_hook "$T6" false)
-assert_allow "(i) completed background Bash task -> allow" "$result"
+assert_allow "(i) completed background Bash task (queue-operation shape) -> allow" "$result"
+
+# (i2) completed background Bash task, notification in the REAL `attachment`
+# shape (.attachment.prompt string) -> allow. The harness may emit either or
+# both shapes for the same event, so the matcher must recognize each.
+T6b="$TMPROOT/transcript-bg-completed-attachment.jsonl"
+write_transcript "$T6b" "$BG_USE_RESOLVED" "$BG_ACK_RESOLVED" "$BG_NOTIFICATION_ATTACHMENT"
+result=$(run_hook "$T6b" false)
+assert_allow "(i2) completed background Bash task (attachment shape) -> allow" "$result"
+
+# (i3) both real shapes present for the same event (as live transcripts show)
+# -> still allow (no double-count / no interference).
+T6c="$TMPROOT/transcript-bg-completed-both.jsonl"
+write_transcript "$T6c" "$BG_USE_RESOLVED" "$BG_ACK_RESOLVED" "$BG_NOTIFICATION_QUEUEOP" "$BG_NOTIFICATION_ATTACHMENT"
+result=$(run_hook "$T6c" false)
+assert_allow "(i3) completed background Bash task (both shapes) -> allow" "$result"
+
+# (i4) multi-stop-sequence: a second stop over the SAME completed-and-notified
+# transcript also allows. The guard re-scans the full transcript fresh on every
+# Stop and the notification event does not disappear, so correct matching must
+# hold on every scan — not just the "first" one (#4482 regression guard).
+result=$(run_hook "$T6" false)
+assert_allow "(i4) completed background Bash task -> allow again on second stop sequence" "$result"
 
 # (j) outstanding background Bash task + stop_hook_active=true -> allow
 # unconditionally (loop guard applies identically to the bg-Bash detector)
