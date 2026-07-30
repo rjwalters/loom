@@ -768,8 +768,8 @@ The `no_such_tool` case covers older Loom installs without Phase A's MCP additio
 
 A pool exists if **either** of these is true (logical OR, both checked):
 
-1. **Materialized pool**: `.loom/tokens/*.token` contains **two or more** files. The bootstrap step (`loom-tokens bootstrap`) writes one `*.token` file per `ACCOUNT_KEY_*` triple in the merged account set; a count `>= 2` means at least two distinct accounts are available for rotation.
-2. **Configured pool**: **two or more** `ACCOUNT_KEY_*` lines are declared across the **merged account sources** — the claude-monitor master (`${LOOM_CLAUDE_MONITOR_DIR:-$HOME/.claude-monitor}/accounts.env`), the repo-local file (`.loom/accounts.env`, falling back to the legacy `.env`), and — **only when `LOOM_ACCOUNTS_ENV` is set** — the opt-in home master at that path. This catches the case where the operator has configured multiple accounts (in the post-#3695/#3704 claude-monitor-first layout, not just the legacy `.env`) but hasn't yet run `loom-tokens bootstrap` — the daemon's spawn-time selector can still pick a token, and the pool will be materialized on demand.
+1. **Materialized pool**: `.loom/tokens/*.token` contains **two or more** files. The bootstrap step (`loom-daemon tokens bootstrap`) writes one `*.token` file per `ACCOUNT_KEY_*` triple in the merged account set; a count `>= 2` means at least two distinct accounts are available for rotation.
+2. **Configured pool**: **two or more** `ACCOUNT_KEY_*` lines are declared across the **merged account sources** — the claude-monitor master (`${LOOM_CLAUDE_MONITOR_DIR:-$HOME/.claude-monitor}/accounts.env`), the repo-local file (`.loom/accounts.env`, falling back to the legacy `.env`), and — **only when `LOOM_ACCOUNTS_ENV` is set** — the opt-in home master at that path. This catches the case where the operator has configured multiple accounts (in the post-#3695/#3704 claude-monitor-first layout, not just the legacy `.env`) but hasn't yet run `loom-daemon tokens bootstrap` — the daemon's spawn-time selector can still pick a token, and the pool will be materialized on demand.
 
 Both checks are cheap, local, and side-effect-free. The configured-pool count mirrors `bootstrap.py`'s source precedence but does **not** dedupe by email — a raw sum of `ACCOUNT_KEY_*` lines is an accepted approximation for this boolean `>= 2` gate (worst case a single account declared in two sources double-counts at the `== 1` vs `== 2` boundary, a false-positive toward daemon use that still requires `PROBE_DAEMON` to also be true):
 
@@ -807,7 +807,7 @@ fi
 # the merged sources declare a pool (ENV_KEY_COUNT >= 2) yet .loom/tokens/ has < 2
 # token files — NOT on every subagent fallthrough.
 if (( ENV_KEY_COUNT >= 2 )) && (( TOKEN_FILE_COUNT < 2 )); then
-  echo "Configured account pool detected but not bootstrapped — run 'loom-tokens bootstrap' to materialize .loom/tokens/." >&2
+  echo "Configured account pool detected but not bootstrapped — run 'loom-daemon tokens bootstrap' to materialize .loom/tokens/." >&2
 fi
 ```
 

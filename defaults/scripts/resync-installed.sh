@@ -248,7 +248,8 @@ fi
 
 # ---------- resolve the defaults/ source tree ----------
 #
-# Mirrors lib/loom-tools.sh find_loom_tools() resolution order:
+# Mirrors the resolution order lib/loom-tools.sh's find_loom_tools() used before
+# epic #4081 Phase 4 (#4557) retired it with the Python package:
 #   1. Loom source repo (dogfood): $REPO_ROOT/defaults/
 #   2. Recorded loom-source-path (target repo install)
 #   3. install-metadata.json "loom_source"

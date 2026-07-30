@@ -1967,7 +1967,10 @@ run_with_retry() {
                 continue
             fi
             log_error "Whole account pool exhausted — every account is marked bad or rate-limited."
-            log_error "Retry after the soonest account reset, or run 'loom-tokens unblock <name>'."
+            # `loom-daemon tokens unblock`, not the retired Python `loom-tokens`
+            # console script: epic #4081 Phase 4 (#4557) deleted the package that
+            # provided it, so naming it here would be dead-end recovery advice.
+            log_error "Retry after the soonest account reset, or run 'loom-daemon tokens unblock <name>'."
             echo "# ACCOUNT_POOL_EXHAUSTED" >&2
             clear_retry_state
             return 1
