@@ -20,6 +20,18 @@
 //! while every *unmarked* test in the same binary — including every future one
 //! nobody remembers to mark — still runs concurrently with them.
 //!
+//! **Thread-local Tokio runtime context is the same class of hazard.** A
+//! #4494 Doctor-verification run of the full `cargo test --workspace` suite
+//! hit a Tokio-runtime-context test failure that did not reproduce in
+//! isolation — consistent with thread-local runtime state (not just env vars)
+//! colliding between two unrelated tests under `cargo test`'s shared-process,
+//! multi-threaded harness (issue #4561). `cargo nextest run` closes it for the
+//! same structural reason it closes the env-mutation race: no thread-local (or
+//! process-global) state survives a process boundary. Verified via 3
+//! consecutive `cargo nextest run --workspace --profile ci -p loom-daemon
+//! --lib` runs (2,486 tests each) with zero failures — see #4561 and the
+//! matching note in `.config/nextest.toml`.
+//!
 //! ## How the suite is meant to run
 //!
 //! The workspace suite runs under [`cargo nextest`](https://nexte.st) — **one
