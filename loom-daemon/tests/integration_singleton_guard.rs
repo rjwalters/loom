@@ -10,19 +10,14 @@
 
 mod common;
 
-use common::{cleanup_all_loom_sessions, TestClient, TestDaemon};
+use common::{cleanup_all_loom_sessions, daemon_bin, TestClient, TestDaemon};
 use serial_test::serial;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 fn setup() {
     cleanup_all_loom_sessions();
-}
-
-/// Path to the freshly-built daemon binary (matches `TestDaemon::start`).
-fn daemon_bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/debug/loom-daemon")
 }
 
 /// Spawn a raw `loom-daemon` process pointed at `socket_path`, wait up to
@@ -107,6 +102,10 @@ async fn test_stale_socket_is_reclaimed() {
     // Simulate a crashed daemon's leftover: a regular file at the socket path.
     std::fs::write(&socket_path, b"").expect("write stale socket file");
 
+    // Deliberately still short: this only has to catch an *early exit*, and a
+    // longer wait would be paid on every (passing) run. The daemon's remaining
+    // startup latency — which grew once CI began running tests process-per-test
+    // (#4385) — is absorbed by `TestClient::connect`'s retry budget below.
     let (mut child, exited_early) = spawn_daemon_and_wait(&socket_path, Duration::from_secs(2));
     // It should still be running (successfully bound), not exited.
     assert!(

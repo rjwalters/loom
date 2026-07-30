@@ -19,6 +19,32 @@ use tokio::time::timeout;
 static TEST_PREFIX: LazyLock<String> =
     LazyLock::new(|| format!("test-{}", uuid::Uuid::new_v4().simple()));
 
+/// How long [`TestDaemon::start`] waits for the daemon to create its socket.
+///
+/// This is a **liveness** bound, not a latency assertion: it exists so a wedged
+/// daemon fails the test instead of hanging it. It is deliberately generous
+/// because CI runs the suite process-per-test under `cargo nextest` (#4385), so
+/// the daemon can be competing for CPU with `num-cpus` sibling test processes.
+/// The previous 5s budget was calibrated for `cargo test`, which runs one test
+/// binary at a time, and it produced spurious "failed to create socket within 5s"
+/// failures on a loaded host.
+const DAEMON_SOCKET_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Absolute path to the `loom-daemon` binary under test.
+///
+/// Cargo builds the package's bin target before running an integration test and
+/// hands us the path in `CARGO_BIN_EXE_<name>`. Resolving it this way is not just
+/// tidier than hardcoding `../target/debug/loom-daemon` (which ignored
+/// `CARGO_TARGET_DIR`) — it is load-bearing under process-per-test execution.
+/// This harness previously shelled out to `cargo build --bin loom-daemon` on
+/// *every* `TestDaemon::start()`; with one process per test those builds
+/// serialize on `$CARGO_HOME/.package-cache` and the target-directory lock, which
+/// are **cross-process** resources that test process isolation does nothing to
+/// separate (#4385) — and the build raced the very binary it was about to spawn.
+pub fn daemon_bin() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_loom-daemon"))
+}
+
 /// Test daemon instance that cleans up on drop
 pub struct TestDaemon {
     _temp_dir: TempDir,
@@ -32,25 +58,7 @@ impl TestDaemon {
         let temp_dir = TempDir::new().context("Failed to create temp directory")?;
         let socket_path = temp_dir.path().join("daemon.sock");
 
-        // Build the daemon binary (in case it's not already built)
-        let build_output = Command::new("cargo")
-            .args(["build", "--bin", "loom-daemon"])
-            .current_dir(env!("CARGO_MANIFEST_DIR"))
-            .output()
-            .context("Failed to build daemon")?;
-
-        if !build_output.status.success() {
-            anyhow::bail!(
-                "Failed to build daemon: {}",
-                String::from_utf8_lossy(&build_output.stderr)
-            );
-        }
-
-        // Start the daemon process
-        let daemon_bin =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/debug/loom-daemon");
-
-        let mut process = Command::new(&daemon_bin)
+        let mut process = Command::new(daemon_bin())
             .env("LOOM_SOCKET_PATH", &socket_path)
             .env("RUST_LOG", "debug")
             // Disable restore_from_tmux() to prevent cross-test-binary contamination
@@ -64,12 +72,13 @@ impl TestDaemon {
         // Wait for socket to be created (with timeout)
         let start = std::time::Instant::now();
         while !socket_path.exists() {
-            if start.elapsed() > Duration::from_secs(5) {
+            if start.elapsed() > DAEMON_SOCKET_TIMEOUT {
                 // Kill the process and get logs
                 let _ = process.kill();
                 let output = process.wait_with_output()?;
                 anyhow::bail!(
-                    "Daemon failed to create socket within 5s.\nStderr: {}",
+                    "Daemon failed to create socket within {}s.\nStderr: {}",
+                    DAEMON_SOCKET_TIMEOUT.as_secs(),
                     String::from_utf8_lossy(&output.stderr)
                 );
             }
@@ -111,8 +120,14 @@ impl TestClient {
     ///
     /// The daemon creates the socket file before it starts listening, creating a race condition.
     /// This method retries with exponential backoff to handle this race.
+    ///
+    /// The retry budget (~6s of backoff) is sized for process-per-test execution
+    /// under `cargo nextest` (#4385): the daemon may be descheduled between
+    /// creating the socket and calling `listen(2)` while `num-cpus` sibling test
+    /// processes run. The previous 5-attempt budget (~0.75s) was calibrated for
+    /// `cargo test`'s one-binary-at-a-time model.
     pub async fn connect(socket_path: &Path) -> Result<Self> {
-        let max_retries = 5;
+        let max_retries = 8;
         let mut retry_delay = Duration::from_millis(50);
 
         for attempt in 0..max_retries {
