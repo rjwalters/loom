@@ -176,6 +176,11 @@ pub const EPHEMERAL_PATTERNS: &[&str] = &[
     // untracked file that a consumer's `git add -A` swept into a commit. Defense
     // in depth: ignore the whole class rather than one filename.
     ".loom/*.tmp",
+    // Rescue copy written by `init::merge_config_file` before it overwrites an
+    // unparseable `.loom/config.json` with the shipped template (#4641). It
+    // exists so an operator can recover hand-tuned keys after a torn write, but
+    // it is machine-local salvage — never something to commit.
+    ".loom/*.bak",
     ".loom/logs/",
 ];
 
