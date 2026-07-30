@@ -28,6 +28,8 @@
 
 use std::path::{Path, PathBuf};
 
+pub use crate::tokens_pool::account_registry::account_capacity;
+
 /// Env override for the shared machine-level token pool (issue #3938).
 ///
 /// Mirrors `loom_tools.tokens.paths`: a non-empty value names the shared pool

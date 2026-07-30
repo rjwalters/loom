@@ -7,8 +7,9 @@
 //! stale spawn-loop claim-lock cleanup). `--aggressive` lives in
 //! `aggressive.rs`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Utc};
 
@@ -22,6 +23,13 @@ use super::safety::{
 /// Default grace period after PR merge before a worktree is eligible for
 /// `--safe` removal (10 minutes).
 pub const DEFAULT_GRACE_PERIOD_SECS: i64 = 600;
+
+/// Minimum age before a `.loom/sweep-checkpoint/` transient is eligible for
+/// bulk pruning (48 hours). Belt-and-suspenders on top of the liveness checks
+/// in [`clean_sweep_transients`]: a sweep that has only just started (its
+/// registry write racing this scan) is never touched, and it bounds the number
+/// of forge probes a single clean pass can issue.
+pub const SWEEP_TRANSIENT_MIN_AGE_SECS: u64 = 48 * 60 * 60;
 
 /// Prompt on stdout/stdin for a `[y/N]` confirmation. EOF (no TTY attached,
 /// e.g. under cron) is treated as "no" — matches
@@ -51,6 +59,9 @@ pub struct CleanupStats {
     pub errored_branches: usize,
     pub killed_tmux: usize,
     pub cleaned_config_dirs: usize,
+    pub cleaned_sweep_baselines: usize,
+    pub cleaned_sweep_checkpoints: usize,
+    pub kept_sweep_transients: usize,
     pub errors: usize,
 }
 
@@ -703,6 +714,222 @@ pub fn clean_agent_config(repo_root: &Path, stats: &mut CleanupStats, dry_run: b
     stats.cleaned_config_dirs = removed;
 }
 
+/// `<repo_root>/.loom/sweep-checkpoint/` — where `/loom:sweep` keeps its
+/// per-issue checkpoints (#3373) and RUN_ID-keyed main-clean baselines (#3768).
+fn sweep_checkpoint_dir(repo_root: &Path) -> PathBuf {
+    repo_root.join(".loom").join("sweep-checkpoint")
+}
+
+/// `<repo_root>/.loom/sweep-run/` — the sweep run registry written by
+/// `sweep-run-registry.sh new`.
+fn sweep_run_registry_dir(repo_root: &Path) -> PathBuf {
+    repo_root.join(".loom").join("sweep-run")
+}
+
+/// Runtime dependencies of [`clean_sweep_transients`], injected so the
+/// decision logic is unit-testable without a real clock, a live sweep, or
+/// `gh` on PATH.
+struct SweepTransientEnv<'a> {
+    /// Wall clock the age guard measures against.
+    now: SystemTime,
+    /// Minimum age before a transient is eligible for pruning.
+    min_age: Duration,
+    /// `kill -0`-equivalent liveness probe for a registered run's PID.
+    pid_alive: &'a dyn Fn(u32) -> bool,
+    /// Forge issue-state probe: `"OPEN"` / `"CLOSED"` / `"UNKNOWN"`.
+    issue_state: &'a dyn Fn(u32) -> String,
+}
+
+/// Whether `run_id` still names a live sweep run.
+///
+/// Fail-safe by construction: a *missing* registry entry is the only path to
+/// "not live" other than a positively-dead PID. An entry that exists but whose
+/// JSON (or `pid` field) cannot be read is treated as LIVE, so a corrupt
+/// registry write never costs a running sweep its baseline.
+fn sweep_run_is_live(repo_root: &Path, run_id: &str, pid_alive: &dyn Fn(u32) -> bool) -> bool {
+    let entry = sweep_run_registry_dir(repo_root).join(format!("{run_id}.json"));
+    let Ok(text) = std::fs::read_to_string(&entry) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return true;
+    };
+    let Some(pid) = value
+        .get("pid")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|p| u32::try_from(p).ok())
+    else {
+        return true;
+    };
+    pid_alive(pid)
+}
+
+/// Age of `path` relative to `now`. `None` when the mtime is unreadable
+/// (caller treats that as "not eligible", never as "old enough to delete").
+fn file_age(path: &Path, now: SystemTime) -> Option<Duration> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    Some(now.duration_since(modified).unwrap_or_default())
+}
+
+/// Remove one transient file (or report it under `--dry-run`). Returns whether
+/// the removal succeeded / would have happened.
+fn remove_transient(path: &Path, label: &str, dry_run: bool) -> bool {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    if dry_run {
+        println!("  Would remove {label}: {name}");
+        return true;
+    }
+    match std::fs::remove_file(path) {
+        Ok(()) => {
+            println!("  Removed {label}: {name}");
+            true
+        }
+        Err(e) => {
+            eprintln!("  Failed to remove {name}: {e}");
+            false
+        }
+    }
+}
+
+/// Bulk prune of `.loom/sweep-checkpoint/` per-run transients (#4450).
+///
+/// `sweep-run-registry.sh cleanup` deletes a run's own baseline at sweep end,
+/// but that hook is best-effort — a SIGKILLed sweep skips it, and per-issue
+/// checkpoints for issues that are never re-swept live forever. This is the
+/// backstop that keeps the directory bounded. Three categories:
+///
+/// 1. **RUN_ID-keyed baselines** (`main-clean-baseline-<RUN_ID>.txt`) whose run
+///    is not live (no registry entry, or a registered PID that is dead) *and*
+///    which are older than `min_age`.
+/// 2. **The legacy un-keyed baseline** (`main-clean-baseline.txt`, pre-#3768,
+///    in either its `.loom/sweep-checkpoint/` or older `.loom/` location) — no
+///    live run can own it, so age does not matter.
+/// 3. **Per-issue checkpoints** (`issue-<N>.json`) older than `min_age` whose
+///    issue the forge reports CLOSED and which no in-flight sweep is tracking.
+///
+/// Every category fails safe: unknown issue state, unreadable mtime, an
+/// unparseable registry entry, or an in-flight claim all mean *keep*. Files
+/// that match neither naming pattern are never touched.
+fn clean_sweep_transients_with(
+    repo_root: &Path,
+    stats: &mut CleanupStats,
+    dry_run: bool,
+    env: &SweepTransientEnv,
+) {
+    // Category 2 first: no liveness or age question to answer.
+    for legacy in [
+        sweep_checkpoint_dir(repo_root).join("main-clean-baseline.txt"),
+        repo_root.join(".loom").join("main-clean-baseline.txt"),
+    ] {
+        if legacy.is_file() {
+            if remove_transient(&legacy, "legacy un-keyed baseline", dry_run) {
+                stats.cleaned_sweep_baselines += 1;
+            } else {
+                stats.errors += 1;
+            }
+        }
+    }
+
+    let dir = sweep_checkpoint_dir(repo_root);
+    if !dir.is_dir() {
+        println!("  No `.loom/sweep-checkpoint/` directory");
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        println!("  Could not read `.loom/sweep-checkpoint/`");
+        return;
+    };
+    let mut entries: Vec<_> = entries.flatten().collect();
+    entries.sort_by_key(std::fs::DirEntry::path);
+
+    // Issues with an in-flight sweep right now (claim locks + spawn-loop
+    // state). A daemon-owned sweep's checkpoint must survive even if its
+    // issue already reads CLOSED on the forge.
+    let live_issues = active_spawn_loop_issues(repo_root);
+
+    for entry in entries {
+        if !entry.file_type().is_ok_and(|t| t.is_file()) {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        let path = entry.path();
+
+        // Already handled above (and only still visible under --dry-run).
+        if name == "main-clean-baseline.txt" {
+            continue;
+        }
+
+        if let Some(run_id) = name
+            .strip_prefix("main-clean-baseline-")
+            .and_then(|rest| rest.strip_suffix(".txt"))
+        {
+            if sweep_run_is_live(repo_root, run_id, env.pid_alive) {
+                println!("  Keeping baseline of live sweep run: {name}");
+                stats.kept_sweep_transients += 1;
+                continue;
+            }
+            match file_age(&path, env.now) {
+                Some(age) if age >= env.min_age => {
+                    if remove_transient(&path, "stale sweep baseline", dry_run) {
+                        stats.cleaned_sweep_baselines += 1;
+                    } else {
+                        stats.errors += 1;
+                    }
+                }
+                _ => stats.kept_sweep_transients += 1,
+            }
+            continue;
+        }
+
+        if let Some(issue) = name
+            .strip_prefix("issue-")
+            .and_then(|rest| rest.strip_suffix(".json"))
+            .and_then(|n| n.parse::<u32>().ok())
+        {
+            if live_issues.contains(&issue) {
+                println!("  Keeping checkpoint of in-flight sweep: {name}");
+                stats.kept_sweep_transients += 1;
+                continue;
+            }
+            // The age gate also bounds how many forge probes one pass issues.
+            match file_age(&path, env.now) {
+                Some(age) if age >= env.min_age => {}
+                _ => {
+                    stats.kept_sweep_transients += 1;
+                    continue;
+                }
+            }
+            let state = (env.issue_state)(issue);
+            if state == "CLOSED" {
+                if remove_transient(&path, "closed-issue checkpoint", dry_run) {
+                    stats.cleaned_sweep_checkpoints += 1;
+                } else {
+                    stats.errors += 1;
+                }
+            } else {
+                println!("  Issue #{issue} is {state} - keeping {name}");
+                stats.kept_sweep_transients += 1;
+            }
+        }
+        // Anything else in the directory is not ours to delete.
+    }
+}
+
+/// Production entry point for [`clean_sweep_transients_with`]: real clock,
+/// [`SWEEP_TRANSIENT_MIN_AGE_SECS`], `kill -0` liveness, and the REST
+/// issue-state probe (never GraphQL — see [`gh::issue_state_rest`]).
+pub fn clean_sweep_transients(repo_root: &Path, stats: &mut CleanupStats, dry_run: bool) {
+    let pid_alive = |pid: u32| crate::sweep_registry::is_pid_alive(pid);
+    let issue_state = |issue: u32| gh::issue_state_rest(repo_root, issue);
+    let env = SweepTransientEnv {
+        now: SystemTime::now(),
+        min_age: Duration::from_secs(SWEEP_TRANSIENT_MIN_AGE_SECS),
+        pid_alive: &pid_alive,
+        issue_state: &issue_state,
+    };
+    clean_sweep_transients_with(repo_root, stats, dry_run, &env);
+}
+
 fn dir_size_human(path: &Path) -> String {
     fn walk(path: &Path, total: &mut u64) {
         let Ok(entries) = std::fs::read_dir(path) else {
@@ -936,6 +1163,22 @@ pub fn print_summary(stats: &CleanupStats, dry_run: bool, safe_mode: bool) {
             println!("  Removed: {} agent config dir(s)", stats.cleaned_config_dirs);
         }
     }
+    if stats.cleaned_sweep_baselines > 0 || stats.cleaned_sweep_checkpoints > 0 {
+        if dry_run {
+            println!(
+                "  Would remove: {} sweep baseline(s), {} closed-issue checkpoint(s)",
+                stats.cleaned_sweep_baselines, stats.cleaned_sweep_checkpoints
+            );
+        } else {
+            println!(
+                "  Removed: {} sweep baseline(s), {} closed-issue checkpoint(s)",
+                stats.cleaned_sweep_baselines, stats.cleaned_sweep_checkpoints
+            );
+        }
+    }
+    if stats.kept_sweep_transients > 0 {
+        println!("  Kept: {} sweep transient(s)", stats.kept_sweep_transients);
+    }
     if stats.errors > 0 {
         println!("  Errors: {}", stats.errors);
     }
@@ -1008,6 +1251,10 @@ pub fn run_clean(repo_root: &Path, opts: &CleanOptions) -> i32 {
         println!("Cleaning Agent Config Directories\n");
         clean_agent_config(repo_root, &mut stats, opts.dry_run);
         println!();
+
+        println!("Cleaning Sweep Checkpoint Transients\n");
+        clean_sweep_transients(repo_root, &mut stats, opts.dry_run);
+        println!();
     }
 
     if opts.deep {
@@ -1060,6 +1307,217 @@ mod tests {
     fn clear_stale_locks_no_dir_is_zero() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(clear_stale_spawn_loop_locks(dir.path(), true), 0);
+    }
+
+    // --- sweep-checkpoint transient pruning (#4450) ---------------------
+
+    const HOUR: u64 = 3600;
+
+    /// Build a checkpoint-dir fixture and return `(tempdir, checkpoint_dir)`.
+    fn sweep_fixture() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let ckpt = sweep_checkpoint_dir(dir.path());
+        std::fs::create_dir_all(&ckpt).unwrap();
+        (dir, ckpt)
+    }
+
+    fn register_run(repo_root: &Path, run_id: &str, pid: u32) {
+        let reg = sweep_run_registry_dir(repo_root);
+        std::fs::create_dir_all(&reg).unwrap();
+        std::fs::write(
+            reg.join(format!("{run_id}.json")),
+            format!(r#"{{"run_id": "{run_id}", "pid": {pid}, "timestamp": "now"}}"#),
+        )
+        .unwrap();
+    }
+
+    /// Run the pass with a clock advanced by `age_hours`, so every fixture
+    /// file reads as exactly that old without touching filesystem mtimes.
+    fn run_transients(
+        repo_root: &Path,
+        dry_run: bool,
+        age_hours: u64,
+        alive: &[u32],
+        states: &[(u32, &str)],
+    ) -> CleanupStats {
+        let mut stats = CleanupStats::default();
+        let alive: Vec<u32> = alive.to_vec();
+        let states: Vec<(u32, String)> =
+            states.iter().map(|(n, s)| (*n, (*s).to_string())).collect();
+        let pid_alive = |pid: u32| alive.contains(&pid);
+        let issue_state = |issue: u32| {
+            states
+                .iter()
+                .find(|(n, _)| *n == issue)
+                .map_or_else(|| "UNKNOWN".to_string(), |(_, s)| s.clone())
+        };
+        let env = SweepTransientEnv {
+            now: SystemTime::now() + Duration::from_secs(age_hours * HOUR),
+            min_age: Duration::from_secs(SWEEP_TRANSIENT_MIN_AGE_SECS),
+            pid_alive: &pid_alive,
+            issue_state: &issue_state,
+        };
+        clean_sweep_transients_with(repo_root, &mut stats, dry_run, &env);
+        stats
+    }
+
+    #[test]
+    fn sweep_transients_missing_dir_is_a_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let stats = run_transients(dir.path(), false, 100, &[], &[]);
+        assert_eq!(stats.cleaned_sweep_baselines, 0);
+        assert_eq!(stats.cleaned_sweep_checkpoints, 0);
+        assert_eq!(stats.errors, 0);
+    }
+
+    #[test]
+    fn sweep_transients_prunes_orphan_baseline_past_threshold() {
+        let (dir, ckpt) = sweep_fixture();
+        let orphan = ckpt.join("main-clean-baseline-sweep-dead.txt");
+        std::fs::write(&orphan, "").unwrap();
+        let stats = run_transients(dir.path(), false, 100, &[], &[]);
+        assert!(!orphan.exists());
+        assert_eq!(stats.cleaned_sweep_baselines, 1);
+    }
+
+    #[test]
+    fn sweep_transients_keeps_young_orphan_baseline() {
+        let (dir, ckpt) = sweep_fixture();
+        let young = ckpt.join("main-clean-baseline-sweep-dead.txt");
+        std::fs::write(&young, "").unwrap();
+        let stats = run_transients(dir.path(), false, 1, &[], &[]);
+        assert!(young.exists(), "mtime guard must spare a young baseline");
+        assert_eq!(stats.cleaned_sweep_baselines, 0);
+        assert_eq!(stats.kept_sweep_transients, 1);
+    }
+
+    #[test]
+    fn sweep_transients_keep_live_run_baseline_regardless_of_age() {
+        let (dir, ckpt) = sweep_fixture();
+        let live = ckpt.join("main-clean-baseline-sweep-live.txt");
+        std::fs::write(&live, "").unwrap();
+        register_run(dir.path(), "sweep-live", 4242);
+        // 1000h old, but the registered PID is alive.
+        let stats = run_transients(dir.path(), false, 1000, &[4242], &[]);
+        assert!(live.exists(), "a live run's baseline must never be pruned");
+        assert_eq!(stats.cleaned_sweep_baselines, 0);
+        assert_eq!(stats.kept_sweep_transients, 1);
+    }
+
+    #[test]
+    fn sweep_transients_prunes_registered_but_dead_pid_baseline() {
+        let (dir, ckpt) = sweep_fixture();
+        let dead = ckpt.join("main-clean-baseline-sweep-crashed.txt");
+        std::fs::write(&dead, "").unwrap();
+        // Registry entry survives a SIGKILL — the PID liveness check is what
+        // distinguishes it from a running sweep.
+        register_run(dir.path(), "sweep-crashed", 999_999);
+        let stats = run_transients(dir.path(), false, 100, &[], &[]);
+        assert!(!dead.exists());
+        assert_eq!(stats.cleaned_sweep_baselines, 1);
+    }
+
+    #[test]
+    fn sweep_transients_keeps_baseline_with_unparseable_registry_entry() {
+        let (dir, ckpt) = sweep_fixture();
+        let path = ckpt.join("main-clean-baseline-sweep-corrupt.txt");
+        std::fs::write(&path, "").unwrap();
+        let reg = sweep_run_registry_dir(dir.path());
+        std::fs::create_dir_all(&reg).unwrap();
+        std::fs::write(reg.join("sweep-corrupt.json"), "{not json").unwrap();
+        let stats = run_transients(dir.path(), false, 100, &[], &[]);
+        assert!(path.exists(), "corrupt registry entry must fail safe (keep)");
+        assert_eq!(stats.cleaned_sweep_baselines, 0);
+    }
+
+    #[test]
+    fn sweep_transients_removes_legacy_unkeyed_baselines() {
+        let (dir, ckpt) = sweep_fixture();
+        let legacy = ckpt.join("main-clean-baseline.txt");
+        std::fs::write(&legacy, "").unwrap();
+        let older = dir.path().join(".loom").join("main-clean-baseline.txt");
+        std::fs::write(&older, "").unwrap();
+        // Age 0: the legacy files have no owner, so the threshold does not apply.
+        let stats = run_transients(dir.path(), false, 0, &[], &[]);
+        assert!(!legacy.exists());
+        assert!(!older.exists());
+        assert_eq!(stats.cleaned_sweep_baselines, 2);
+    }
+
+    #[test]
+    fn sweep_transients_ignores_unrelated_files() {
+        let (dir, ckpt) = sweep_fixture();
+        let other = ckpt.join("notes.txt");
+        std::fs::write(&other, "").unwrap();
+        let weird = ckpt.join("main-clean-baseline-sweep-x.json");
+        std::fs::write(&weird, "").unwrap();
+        let stats = run_transients(dir.path(), false, 1000, &[], &[]);
+        assert!(other.exists());
+        assert!(weird.exists());
+        assert_eq!(stats.cleaned_sweep_baselines, 0);
+        assert_eq!(stats.cleaned_sweep_checkpoints, 0);
+    }
+
+    #[test]
+    fn sweep_transients_dry_run_deletes_nothing_but_counts() {
+        let (dir, ckpt) = sweep_fixture();
+        let baseline = ckpt.join("main-clean-baseline-sweep-dead.txt");
+        std::fs::write(&baseline, "").unwrap();
+        let legacy = ckpt.join("main-clean-baseline.txt");
+        std::fs::write(&legacy, "").unwrap();
+        let checkpoint = ckpt.join("issue-3784.json");
+        std::fs::write(&checkpoint, "{}").unwrap();
+        let stats = run_transients(dir.path(), true, 100, &[], &[(3784, "CLOSED")]);
+        assert!(baseline.exists());
+        assert!(legacy.exists());
+        assert!(checkpoint.exists());
+        assert_eq!(stats.cleaned_sweep_baselines, 2);
+        assert_eq!(stats.cleaned_sweep_checkpoints, 1);
+    }
+
+    #[test]
+    fn sweep_transients_prunes_closed_issue_checkpoint_only() {
+        let (dir, ckpt) = sweep_fixture();
+        let closed = ckpt.join("issue-3784.json");
+        let open = ckpt.join("issue-4450.json");
+        let unknown = ckpt.join("issue-4451.json");
+        for p in [&closed, &open, &unknown] {
+            std::fs::write(p, "{}").unwrap();
+        }
+        let stats =
+            run_transients(dir.path(), false, 100, &[], &[(3784, "CLOSED"), (4450, "OPEN")]);
+        assert!(!closed.exists());
+        assert!(open.exists(), "OPEN issue checkpoint must be kept");
+        assert!(unknown.exists(), "an unverified issue state must never delete");
+        assert_eq!(stats.cleaned_sweep_checkpoints, 1);
+        assert_eq!(stats.kept_sweep_transients, 2);
+    }
+
+    #[test]
+    fn sweep_transients_keeps_young_closed_issue_checkpoint() {
+        let (dir, ckpt) = sweep_fixture();
+        let closed = ckpt.join("issue-3784.json");
+        std::fs::write(&closed, "{}").unwrap();
+        let stats = run_transients(dir.path(), false, 1, &[], &[(3784, "CLOSED")]);
+        assert!(closed.exists(), "age gate also bounds forge probes");
+        assert_eq!(stats.cleaned_sweep_checkpoints, 0);
+    }
+
+    #[test]
+    fn sweep_transients_keeps_checkpoint_of_in_flight_sweep() {
+        let (dir, ckpt) = sweep_fixture();
+        let inflight = ckpt.join("issue-3784.json");
+        std::fs::write(&inflight, "{}").unwrap();
+        // A daemon-owned sweep holds a claim lock for this issue.
+        std::fs::create_dir_all(super::super::liveness::locks_dir(dir.path()).join("issue-3784"))
+            .unwrap();
+        let stats = run_transients(dir.path(), false, 1000, &[], &[(3784, "CLOSED")]);
+        assert!(
+            inflight.exists(),
+            "an in-flight sweep's checkpoint must survive even when its issue is CLOSED"
+        );
+        assert_eq!(stats.cleaned_sweep_checkpoints, 0);
+        assert_eq!(stats.kept_sweep_transients, 1);
     }
 
     #[test]

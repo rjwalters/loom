@@ -198,6 +198,10 @@ log_warn() { echo -e "${YELLOW}[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] WARN${NC} $*" 
 log_error() { echo -e "${RED}[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] ERROR${NC} $*" >&2; }
 
 _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "${_SCRIPT_DIR}/lib/locate-daemon-bin.sh" ]]; then
+    # shellcheck source=./lib/locate-daemon-bin.sh
+    source "${_SCRIPT_DIR}/lib/locate-daemon-bin.sh"
+fi
 
 # --- Repo root resolution (handles worktrees; mirrors spawn-claude.sh) ---
 _resolve_workspace() {
@@ -271,6 +275,7 @@ EXPLICIT_MODEL=""
 HAS_SANDBOX_ARG=false
 EXPLICIT_SANDBOX=""
 HAS_EFFORT_OVERRIDE=false
+GENERIC_EFFORT=""
 HAS_SKIP_GIT_CHECK_ARG=false
 PASSTHROUGH_ARGS=()
 
@@ -300,6 +305,23 @@ while [[ $# -gt 0 ]]; do
             # (codex does not understand this Claude-specific flag) and mapped
             # to a Codex sandbox mode below.
             SKIP_PERMISSIONS=true
+            shift
+            ;;
+        --effort)
+            if [[ $# -lt 2 ]]; then
+                log_error "$1 requires a value"
+                exit 78
+            fi
+            GENERIC_EFFORT="$2"
+            shift 2
+            ;;
+        --effort=*)
+            GENERIC_EFFORT="${1#--effort=}"
+            shift
+            ;;
+        --use-wrapper)
+            # Generic daemon retry convention. Codex already owns retry
+            # behavior; consume the convention instead of forwarding it.
             shift
             ;;
         -m|--model)
@@ -436,6 +458,9 @@ if [[ "$HAS_EFFORT_OVERRIDE" == "true" ]]; then
     if [[ -n "${LOOM_EFFORT:-}" ]]; then
         log_info "spawn-codex: explicit -c model_reasoning_effort= wins over LOOM_EFFORT='$LOOM_EFFORT'"
     fi
+elif [[ -n "$GENERIC_EFFORT" ]]; then
+    PASSTHROUGH_ARGS+=(-c "model_reasoning_effort=$GENERIC_EFFORT")
+    log_info "spawn-codex: effort=$GENERIC_EFFORT (from --effort)"
 elif [[ -n "${LOOM_EFFORT:-}" ]]; then
     PASSTHROUGH_ARGS+=(-c "model_reasoning_effort=$LOOM_EFFORT")
     log_info "spawn-codex: effort=$LOOM_EFFORT (from LOOM_EFFORT)"
@@ -504,6 +529,35 @@ CODEX_PROFILE_NAME=""
 if [[ -n "${LOOM_SPAWN_NO_EXPORT:-}" ]]; then
     log_info "spawn-codex: LOOM_SPAWN_NO_EXPORT set — skipping CODEX_HOME resolution"
 else
+    # A managed headless dispatch with no explicit pin uses the provider-aware
+    # selector. This fails closed when every profile is disabled, cooling down,
+    # or awaiting reauthentication; it never falls back to ambient ~/.codex.
+    if [[ "$HAS_PROMPT" == "true" && -z "${LOOM_CODEX_NO_EXEC:-}" \
+          && -z "${LOOM_CODEX_HOME:-}" \
+          && -z "${CODEX_HOME:-}" && -z "${LOOM_CODEX_PROFILE:-}" ]]; then
+        if ! declare -F loom_locate_daemon_bin >/dev/null 2>&1; then
+            log_error "Provider-aware account selection support is not installed."
+            exit 78
+        fi
+        _daemon_bin="$(loom_locate_daemon_bin "$WORKSPACE")"
+        if [[ -z "$_daemon_bin" ]] \
+            || ! "$_daemon_bin" tokens select --help 2>&1 | grep -q -- '--provider'; then
+            log_error "No loom-daemon binary supporting provider-aware account selection was found."
+            exit 78
+        fi
+        _selection_stderr_file="$(mktemp)"
+        _selection_output=""
+        if ! _selection_output="$("$_daemon_bin" tokens select --provider codex \
+            --workspace "$WORKSPACE" --export 2>"$_selection_stderr_file")"; then
+            log_error "Codex account selection failed:"
+            cat "$_selection_stderr_file" >&2 || true
+            rm -f "$_selection_stderr_file"
+            exit 78
+        fi
+        cat "$_selection_stderr_file" >&2 || true
+        rm -f "$_selection_stderr_file"
+        eval "$_selection_output"
+    fi
     _requested_home=""
     _requested_source=""
     if [[ -n "${LOOM_CODEX_HOME:-}" ]]; then
@@ -522,9 +576,10 @@ else
         _auth_candidate="${_requested_home}/auth.json"
         if [[ -f "$_auth_candidate" && -r "$_auth_candidate" && -s "$_auth_candidate" ]]; then
             export CODEX_HOME="$_requested_home"
-            CODEX_PROFILE_NAME="$(basename "$_requested_home")"
+            CODEX_PROFILE_NAME="${LOOM_ACCOUNT_NAME:-$(basename "$_requested_home")}"
             # Directory NAME only — never the path contents, never auth.json.
             log_info "spawn-codex: using Codex profile '$CODEX_PROFILE_NAME' (source=$_requested_source)"
+            echo "# LOOM_ACCOUNT name=$CODEX_PROFILE_NAME" >&2
         else
             log_error "Codex profile requested via $_requested_source has no usable auth.json."
             log_error "Expected a regular, non-empty, readable file at <profile>/auth.json."
@@ -555,6 +610,7 @@ fi
 # Checked BEFORE the binary check so the mocked test can assert argv assembly on
 # a host with no `codex` installed at all.
 if [[ -n "${LOOM_CODEX_NO_EXEC:-}" ]]; then
+    echo "# LOOM_CLI_START runtime=codex" >&2
     echo "spawn-codex would-exec: codex ${CODEX_ARGS[*]}"
     exit 0
 fi
@@ -576,6 +632,7 @@ fi
 # plain pid-preserving `exec`. Note stdin is NOT redirected in the interactive
 # case — an operator at the keyboard needs it.
 if [[ "$HAS_PROMPT" != "true" || -n "${LOOM_CODEX_NO_CAPTURE:-}" ]]; then
+    echo "# LOOM_CLI_START runtime=codex" >&2
     exec codex ${CODEX_ARGS[@]+"${CODEX_ARGS[@]}"}
 fi
 
@@ -594,6 +651,7 @@ _stderr_file="$(mktemp -t loom-spawn-codex.XXXXXX 2>/dev/null || mktemp)"
 trap "rm -f '$_stderr_file'" EXIT
 
 set +e
+echo "# LOOM_CLI_START runtime=codex" >&2
 { codex ${CODEX_ARGS[@]+"${CODEX_ARGS[@]}"} </dev/null 2>&1 1>&3 3>&- \
     | tee "$_stderr_file" >&2; } 3>&1
 _exit_code=${PIPESTATUS[0]}
@@ -637,6 +695,31 @@ _tokens_used="$(
 )"
 if [[ -n "$_tokens_used" ]]; then
     log_info "spawn-codex: tokens_used=$_tokens_used"
+fi
+
+# Stable, bounded terminal feedback for the daemon. The classifier remains the
+# single source of truth; this adapter only packages its result with the
+# provider/account attribution already selected for this child. Raw output is
+# neither included in this record nor persisted by the health layer.
+_classifier_lib="${_SCRIPT_DIR}/lib/classify-error.sh"
+if [[ -f "$_classifier_lib" ]]; then
+    # shellcheck source=./lib/classify-error.sh
+    source "$_classifier_lib"
+    _classifier_input="$(tail -c 65536 "$_stderr_file" 2>/dev/null || true)"
+    _terminal_category="$(classify_error "$_classifier_input" "$_exit_code" codex)"
+    _terminal_account="${LOOM_ACCOUNT_NAME:-${CODEX_PROFILE_NAME:-unknown}}"
+    if [[ ! "$_terminal_account" =~ ^[A-Za-z0-9._-]+$ ]]; then
+        _terminal_account="unknown"
+    fi
+    case "$_terminal_category" in
+        SUCCESS|TOKEN_EXPIRED|TOKEN_EXHAUSTED|RECOVERABLE|TIMEOUT|FATAL|CWD_DELETED|MODEL_REFUSAL|SESSION_LIMIT)
+            printf '# LOOM_TERMINAL_RESULT v=1 provider=codex account=%s category=%s exit_code=%s\n' \
+                "$_terminal_account" "$_terminal_category" "$_exit_code" >&2
+            ;;
+        *)
+            log_warn "spawn-codex: classifier returned an invalid category; terminal feedback omitted"
+            ;;
+    esac
 fi
 
 exit "$_exit_code"

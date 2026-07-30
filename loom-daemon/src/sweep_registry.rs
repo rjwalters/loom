@@ -56,6 +56,7 @@ use crate::peer_claims::{self, ClaimAd, PeerClaimView};
 use crate::quarantine_reconciliation;
 use crate::sweep_journal;
 use crate::tokens_pool::bad_tokens;
+use crate::tokens_pool::{self, AccountId, AccountProvider, TerminalClassification};
 use crate::types::{Event, SweepId, SweepInfo, SweepKind, SweepOutcome, SweepState};
 
 use anyhow::{anyhow, Context, Result};
@@ -84,7 +85,7 @@ pub const DEFAULT_REAPER_INTERVAL_SECS: u64 = 30;
 pub const REAPER_INTERVAL_ENV: &str = "LOOM_SWEEP_REAPER_INTERVAL_SECS";
 
 /// Environment variable for overriding the dispatch entry point used by
-/// the registry. Defaults to `defaults/scripts/spawn-claude.sh` relative to
+/// the registry. Defaults to `defaults/scripts/spawn-worker.sh` relative to
 /// the workspace. Used by integration tests to substitute a fake child.
 pub const SPAWN_BIN_ENV: &str = "LOOM_SWEEP_SPAWN_BIN";
 
@@ -158,6 +159,49 @@ impl std::fmt::Display for OpenPrDispatchError {
 }
 
 impl std::error::Error for OpenPrDispatchError {}
+
+/// Typed, matchable error returned by [`SweepRegistry::dispatch`] when the
+/// park-label guard (Issue #4444, step 2.7) refuses a dispatch because the
+/// target issue currently carries a [`PARK_LABELS`] entry (`loom:blocked` /
+/// `loom:operator-only`).
+///
+/// The work-finder's [`SKIP_LABELS`] filter only covers *its own* candidate
+/// query. Every other dispatch route — all three watchdogs (#3887 / #3895 /
+/// #3910), the reaper's checkpoint-resume (#4256), the epic supervisor, and the
+/// IPC/CLI `dispatch_sweep` — funnels through `dispatch_inner` without ever
+/// re-reading the forge labels, so a park applied *after* the original dispatch
+/// was invisible to them and the daemon overrode a deliberate human park
+/// (observed on #4366). This guard closes that hole for every route at once.
+///
+/// Like [`OpenPrDispatchError`] this is a **distinct, downcast-matchable** type
+/// (not a string-matched `anyhow` message) so the work-finder can attribute the
+/// refusal to its labeled-skip counter rather than to a generic dispatch
+/// failure.
+///
+/// [`PARK_LABELS`]: crate::work_finder::PARK_LABELS
+/// [`SKIP_LABELS`]: crate::work_finder::SKIP_LABELS
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParkedIssueDispatchError {
+    /// The issue whose dispatch was refused.
+    pub issue: u32,
+    /// The park label that triggered the refusal (`loom:blocked` or
+    /// `loom:operator-only`).
+    pub label: String,
+}
+
+impl std::fmt::Display for ParkedIssueDispatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "refusing to dispatch issue #{}: it currently carries `{}` (#4444 park-label \
+             guard). A deliberate park must survive every re-dispatch route — watchdog, \
+             checkpoint-resume, epic supervisor, IPC/CLI — until the label is cleared.",
+            self.issue, self.label
+        )
+    }
+}
+
+impl std::error::Error for ParkedIssueDispatchError {}
 
 /// Issue #4256: checkpoint phases at/after Builder completion. A crash whose
 /// checkpoint reads one of these means a PR was opened for the issue, so
@@ -295,27 +339,40 @@ const DEFAULT_TIER_ALIASES: &[(&str, &str)] = &[("opus", "claude-opus-5")];
 /// an individual alias while inheriting the rest from the legacy tier — and is
 /// asserted explicitly by `read_model_aliases_merges_across_tiers`.
 ///
-/// **Cross-language divergence (#4059, Finding 2):** blank keys are dropped
-/// here (`key.is_empty()` guard below), but the Python mirror in
-/// `model_tiers._config_overrides` KEEPS blank keys — it only guards blank
-/// *values*. This is a PRE-EXISTING, known-and-harmless divergence: a blank key
-/// can never match a lookup and [`resolve_model_alias`] returns early on an
-/// empty input model. It is intentionally left as-is here (the Python side is
-/// owned by #4060); do NOT normalize Rust to Python's laxer behavior. Both sides
-/// drop blank values.
+/// **Single implementation (#4060 / #4275, epic #4081 family 5):** this used to
+/// be one half of a hand-synced Python/Rust twin pair
+/// (`model_tiers._config_overrides`), and the twins had already drifted —
+/// Python kept blank alias keys, this side dropped them (#4059, Finding 2).
+/// `loom_tools/model_tiers.py` was deleted in #4275 and
+/// `crate::script_helpers::model_tiers` now calls straight into this function
+/// (via [`model_aliases_from_config`]), so the Rust semantics below — blank
+/// keys AND blank values dropped, cross-tier `deep_merge` union — are the only
+/// surviving definition. The `resolve-model.sh` / `resolve-tier-model.sh` /
+/// `sweep-experiment.sh` entry points and the daemon dispatch path therefore
+/// cannot disagree by construction.
 #[must_use]
 pub fn read_model_aliases(repo_root: &Path) -> BTreeMap<String, String> {
+    model_aliases_from_config(&crate::config_resolver::resolve_effective_config(repo_root))
+}
+
+/// The `sweep.modelAliases` extraction, applied to an **already-resolved**
+/// config value.
+///
+/// Split out of [`read_model_aliases`] (#4275) so the `resolve-model.sh`
+/// `--config <path>` explicit bypass — which reads exactly one file and skips
+/// all config tiering — shares the same normalization rather than growing a
+/// second copy. Soft-fails to an empty map on any error (absent key, non-object
+/// value); blank keys and blank values are dropped.
+#[must_use]
+pub fn model_aliases_from_config(config: &serde_json::Value) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
-    let config = crate::config_resolver::resolve_effective_config(repo_root);
-    let Some(aliases) = crate::config_resolver::get_path(&config, "sweep.modelAliases")
+    let Some(aliases) = crate::config_resolver::get_path(config, "sweep.modelAliases")
         .and_then(serde_json::Value::as_object)
     else {
         return out;
     };
     for (key, val) in aliases {
         let key = key.trim().to_lowercase();
-        // #4059 Finding 2: blank keys dropped here; Python keeps them. Left as a
-        // known-and-harmless divergence — see the function doc comment above.
         if key.is_empty() {
             continue;
         }
@@ -326,6 +383,18 @@ pub fn read_model_aliases(repo_root: &Path) -> BTreeMap<String, String> {
     out
 }
 
+/// The effective logical-tier → ID map: shipped [`DEFAULT_TIER_ALIASES`]
+/// overlaid with the config's `sweep.modelAliases` overrides.
+#[must_use]
+pub fn effective_tier_aliases(config: &serde_json::Value) -> BTreeMap<String, String> {
+    let mut out: BTreeMap<String, String> = DEFAULT_TIER_ALIASES
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+        .collect();
+    out.extend(model_aliases_from_config(config));
+    out
+}
+
 /// Issue #3982: resolve a logical model tier/alias to the concrete model ID to
 /// dispatch, applying the shipped [`DEFAULT_TIER_ALIASES`] map overlaid with the
 /// per-repo `sweep.modelAliases` override. Preserves any `@effort` suffix
@@ -333,6 +402,19 @@ pub fn read_model_aliases(repo_root: &Path) -> BTreeMap<String, String> {
 /// (`claude-sonnet-4-6`) pass through unchanged.
 #[must_use]
 pub fn resolve_model_alias(repo_root: &Path, model: &str) -> String {
+    resolve_model_alias_from_config(
+        &crate::config_resolver::resolve_effective_config(repo_root),
+        model,
+    )
+}
+
+/// [`resolve_model_alias`] against an already-resolved config value.
+///
+/// This is the one alias-resolution implementation in the tree (#4275); both
+/// the daemon dispatch path and the `resolve-model.sh` CLI reach the wire
+/// through it.
+#[must_use]
+pub fn resolve_model_alias_from_config(config: &serde_json::Value, model: &str) -> String {
     if model.is_empty() {
         return String::new();
     }
@@ -341,7 +423,7 @@ pub fn resolve_model_alias(repo_root: &Path, model: &str) -> String {
         None => (model, None),
     };
     let key = base.trim().to_lowercase();
-    let overrides = read_model_aliases(repo_root);
+    let overrides = model_aliases_from_config(config);
     let resolved = overrides
         .get(&key)
         .map(String::as_str)
@@ -387,6 +469,59 @@ pub const UNKNOWN_TOKEN_NAME: &str = "unknown";
 /// account name itself carries no ANSI colour codes (only the timestamp prefix
 /// does), so a plain substring scan is sufficient — no ANSI stripping needed.
 const TOKEN_NAME_LOG_MARKER: &str = "using OAuth account '";
+const ACCOUNT_LOG_MARKER: &str = "# LOOM_ACCOUNT name=";
+const RUNTIME_LOG_MARKER: &str = "# LOOM_RUNTIME_RESOLVED runtime=";
+const CLI_START_MARKER: &str = "# LOOM_CLI_START";
+const TERMINAL_RESULT_MARKER: &str = "# LOOM_TERMINAL_RESULT ";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TerminalResult {
+    provider: AccountProvider,
+    account: String,
+    category: TerminalClassification,
+    exit_code: i32,
+}
+
+/// Parse the adapter's strict v1 record from only the current dispatch region.
+/// Unknown fields, duplicate records, malformed identities, and unknown
+/// categories all fail closed: no account health is mutated.
+fn parse_terminal_result_after(contents: &str, header_anchor: &str) -> Option<TerminalResult> {
+    let region = &contents[contents.rfind(header_anchor)?..];
+    let records: Vec<_> = region
+        .lines()
+        .filter(|line| line.starts_with(TERMINAL_RESULT_MARKER))
+        .collect();
+    if records.len() != 1 {
+        return None;
+    }
+    let fields: HashMap<_, _> = records[0][TERMINAL_RESULT_MARKER.len()..]
+        .split_ascii_whitespace()
+        .filter_map(|field| field.split_once('='))
+        .collect();
+    if fields.len() != 5 || fields.get("v") != Some(&"1") {
+        return None;
+    }
+    let provider = match *fields.get("provider")? {
+        "claude" => AccountProvider::Claude,
+        "codex" => AccountProvider::Codex,
+        _ => return None,
+    };
+    let account = fields.get("account")?.to_string();
+    if account == UNKNOWN_TOKEN_NAME
+        || account.is_empty()
+        || !account
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        return None;
+    }
+    Some(TerminalResult {
+        provider,
+        account,
+        category: fields.get("category")?.parse().ok()?,
+        exit_code: fields.get("exit_code")?.parse().ok()?,
+    })
+}
 
 /// Issue #3802: how long `spawn_child` polls the per-sweep log for the
 /// `TOKEN_NAME_LOG_MARKER` line before giving up and recording
@@ -844,10 +979,31 @@ pub fn review_stall_decision(
 // philosophy as #3892). A pre-flight token-health gate reads `.ranking` and
 // defers the re-dispatch when the whole pool is exhausted, so a mid-run
 // exhaustion is less likely to recur.
+//
+// ## The live-use veto (Issue #4449)
+//
+// That signature is NECESSARY but not SUFFICIENT, which cost real work on
+// 2026-07-29: the daemon's tracked sweep for issue #4366 had indeed died, but a
+// separate, untracked recovery Doctor session was concurrently editing the same
+// worktree. `(terminal ∧ no PR ∧ dirty)` matched, the watchdog ran
+// `git reset --hard` + `git clean -fd`, and a tested-but-uncommitted fix was
+// destroyed in the window between the test run and `git commit`.
+//
+// Dirtiness cannot distinguish "debris a dead sweep left behind" from "a live
+// session's work in progress" — both look identical to `git status`. So the
+// watchdog now requires a second, independent condition: NOTHING LIVE may still
+// hold the worktree. `SweepRegistry::worktree_in_use` gathers four signals (a
+// `.loom-in-use` marker, a claim-lock whose owner PID is alive, an in-flight
+// `index.lock`, and processes whose cwd is inside the worktree); any one of them
+// vetoes the reset, yielding `MidbuildDecision::InUse` — logged loudly, with the
+// single recovery retry left unconsumed so a genuinely-dead sweep is still
+// recovered on a later tick once the holder goes away. And `clean_worktree` now
+// logs the porcelain status + diffstat of everything it is about to destroy, so
+// a wipe can never again be silent in the daemon log.
 
 /// The mid-build-death watchdog's per-sweep decision (Issue #3895). Pure state
 /// machine — [`midbuild_decision`] maps `(worktree_dirty, produced_pr,
-/// already_retried)` onto exactly one of these.
+/// already_retried, worktree_in_use)` onto exactly one of these.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MidbuildDecision {
     /// Not a mid-build death (no dirty worktree, or a PR was produced) — leave
@@ -859,28 +1015,165 @@ pub enum MidbuildDecision {
     /// A dead sweep matching the signature but already recovered once — give up
     /// (bounded: never loop). Left for the operator.
     GiveUp,
+    /// The signature matches BUT the worktree is still held by a live session
+    /// the daemon does not track (Issue #4449) — refuse the destructive reset
+    /// and leave both the worktree and the single recovery retry untouched.
+    InUse,
 }
 
-/// Pure mid-build-death state machine (Issue #3895).
+/// Pure mid-build-death state machine (Issue #3895, extended by #4449).
 ///
 /// - No dirty worktree, or the sweep already produced a PR ⇒
 ///   [`MidbuildDecision::Healthy`] (nothing to recover).
-/// - Dirty worktree + no PR + not yet recovered ⇒ [`MidbuildDecision::Recover`].
-/// - Dirty worktree + no PR + already recovered ⇒ [`MidbuildDecision::GiveUp`]
-///   — the recovery is bounded to exactly one re-dispatch per issue.
+/// - Dirty worktree + no PR + **a live session still using the worktree** ⇒
+///   [`MidbuildDecision::InUse`] (#4449). This gate sits *above* the retry
+///   bookkeeping on purpose: "someone is editing this right now" is never a
+///   dead-sweep-recovery candidate, and a refusal must not burn the single
+///   recovery retry (the worktree may be legitimately free on a later tick).
+/// - Dirty worktree + no PR + not in use + not yet recovered ⇒
+///   [`MidbuildDecision::Recover`].
+/// - Dirty worktree + no PR + not in use + already recovered ⇒
+///   [`MidbuildDecision::GiveUp`] — the recovery is bounded to exactly one
+///   re-dispatch per issue.
+///
+/// # Why the in-use gate exists (#4449)
+///
+/// Before #4449 the watchdog inferred "died mid-build" from `(terminal state ∧
+/// no PR ∧ dirty worktree)` alone and immediately reset the worktree. On
+/// 2026-07-29 that inference was wrong: the daemon's own tracked sweep for
+/// issue #4366 *had* died, but a separate, untracked recovery Doctor session was
+/// concurrently and legitimately working in the same worktree. The watchdog read
+/// that session's uncommitted fix as dead-sweep debris and destroyed it mid
+/// `git commit`. Dirtiness alone cannot distinguish the two cases — only a
+/// liveness signal can.
 #[must_use]
 pub fn midbuild_decision(
     worktree_dirty: bool,
     produced_pr: bool,
     already_retried: bool,
+    worktree_in_use: bool,
 ) -> MidbuildDecision {
     if !worktree_dirty || produced_pr {
         MidbuildDecision::Healthy
+    } else if worktree_in_use {
+        MidbuildDecision::InUse
     } else if already_retried {
         MidbuildDecision::GiveUp
     } else {
         MidbuildDecision::Recover
     }
+}
+
+/// One piece of evidence that a *live* process is still using an issue
+/// worktree, gathered by [`SweepRegistry::worktree_in_use`] (Issue #4449).
+///
+/// Any non-empty set of evidence vetoes the mid-build watchdog's destructive
+/// `git reset --hard` / `git clean -fd` path. Each variant carries enough detail
+/// to name the holder in the daemon log so a refusal is actionable rather than
+/// mysterious.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorktreeUseEvidence {
+    /// A `.loom-in-use` marker file names an owning session. Written by flows
+    /// that enter a worktree (including manual, non-daemon sessions), so this
+    /// is the one signal an operator can set by hand to fence off a worktree.
+    InUseMarker { task_id: String, pid: String },
+    /// A claim-lock (`.loom/locks/issue-<N>/owner.json`) whose recorded owner
+    /// PID is still alive. A dead owner's lock is *not* evidence (the reaper /
+    /// `reconstruct` prune those), so this only fires for a genuinely live
+    /// claim the in-memory registry does not represent as active.
+    LiveClaimLock { pid: u32, sweep_id: String },
+    /// One or more live processes have their current working directory inside
+    /// the worktree — an operator's shell, a manual role session, or an
+    /// orphaned grandchild still writing files.
+    LiveProcesses(Vec<u32>),
+    /// A git operation is mid-flight (`index.lock` present) — precisely the
+    /// `git commit` window in which #4449 lost an uncommitted fix.
+    GitOperationInFlight(PathBuf),
+}
+
+impl std::fmt::Display for WorktreeUseEvidence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InUseMarker { task_id, pid } => {
+                write!(f, ".loom-in-use marker (task: {task_id}, pid: {pid})")
+            }
+            Self::LiveClaimLock { pid, sweep_id } => {
+                write!(f, "live claim-lock owner (pid {pid}, sweep {sweep_id})")
+            }
+            Self::LiveProcesses(pids) => {
+                write!(f, "live process(es) with cwd inside the worktree: {pids:?}")
+            }
+            Self::GitOperationInFlight(path) => {
+                write!(f, "git operation in flight ({} exists)", path.display())
+            }
+        }
+    }
+}
+
+/// Render a set of [`WorktreeUseEvidence`] as a single `; `-joined log fragment.
+#[must_use]
+pub fn describe_worktree_use(evidence: &[WorktreeUseEvidence]) -> String {
+    evidence
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Max lines of `git status` / `git diff --stat` echoed into the
+/// "about to discard" log line (Issue #4449) — enough to identify the lost work,
+/// bounded so a runaway worktree cannot flood the daemon log.
+const DISCARD_LOG_MAX_LINES: usize = 40;
+
+/// Truncate `text` to at most `max` lines, appending a `… (+N more)` marker when
+/// lines were dropped. Returns an empty string for empty/blank input.
+#[must_use]
+fn truncate_lines(text: &str, max: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let lines: Vec<&str> = trimmed.lines().collect();
+    if lines.len() <= max {
+        return lines.join("\n");
+    }
+    let extra = lines.len() - max;
+    let mut out = lines[..max].join("\n");
+    out.push_str(&format!("\n… (+{extra} more line(s))"));
+    out
+}
+
+/// Resolve a worktree's `index.lock` path — the marker git holds while an index
+/// write (`git add`, `git commit`, …) is in flight (Issue #4449).
+///
+/// Asks git itself (`git rev-parse --git-path index.lock`) rather than assuming
+/// `<wt>/.git/index.lock`, because a linked worktree's `.git` is a *file*
+/// pointing at `.git/worktrees/<name>/`. Returns `None` when the path cannot be
+/// resolved (not a repo, git unavailable) — the caller treats that as "no
+/// evidence" and relies on the other signals.
+#[must_use]
+fn git_index_lock_path(worktree: &Path) -> Option<PathBuf> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["rev-parse", "--git-path", "index.lock"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let rel = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if rel.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(&rel);
+    // `--git-path` yields a path relative to the *worktree* when git was invoked
+    // with `-C <worktree>`; absolutise it so `exists()` is cwd-independent.
+    Some(if path.is_absolute() {
+        path
+    } else {
+        worktree.join(path)
+    })
 }
 
 /// Decide, from a `.loom/tokens/.ranking` file's contents, whether the token
@@ -922,8 +1215,7 @@ pub fn ranking_has_capacity(contents: &str) -> bool {
 }
 
 /// Decide, from a sweep log's contents, whether the child has produced any
-/// output *past* the daemon spawn header + `spawn-claude.sh` wrapper lines —
-/// i.e. whether Claude Code itself has started doing work (Issue #3887).
+/// output *past* the daemon spawn header + runtime-adapter preamble lines.
 ///
 /// A hung child's log region (after the most recent dispatch header) contains
 /// only the header itself and `spawn-claude:`-prefixed wrapper lines (the
@@ -939,7 +1231,13 @@ pub fn log_has_progress(contents: &str) -> bool {
     };
     region.lines().any(|line| {
         let t = line.trim();
-        !t.is_empty() && !t.contains("loom-daemon dispatch:") && !t.contains("spawn-claude:")
+        !t.is_empty()
+            && !t.contains("loom-daemon dispatch:")
+            && !t.contains("spawn-claude:")
+            && !t.contains("spawn-codex:")
+            && !t.contains("spawn-worker:")
+            && !t.starts_with("# LOOM_RUNTIME_RESOLVED")
+            && !t.starts_with("# LOOM_ACCOUNT")
     })
 }
 
@@ -958,15 +1256,32 @@ fn parse_token_name_after(contents: &str, header_anchor: &str) -> Option<String>
     // current child logs its selection after the most recent one.
     let region_start = contents.rfind(header_anchor)?;
     let region = &contents[region_start..];
-    let marker_at = region.find(TOKEN_NAME_LOG_MARKER)? + TOKEN_NAME_LOG_MARKER.len();
+    let (marker_at, terminator) = if let Some(i) = region.find(ACCOUNT_LOG_MARKER) {
+        (i + ACCOUNT_LOG_MARKER.len(), '\n')
+    } else {
+        (region.find(TOKEN_NAME_LOG_MARKER)? + TOKEN_NAME_LOG_MARKER.len(), '\'')
+    };
     let after = &region[marker_at..];
-    let close = after.find('\'')?;
-    let name = &after[..close];
+    let close = after.find(terminator).unwrap_or(after.len());
+    let name = after[..close].trim();
     if name.is_empty() {
         None
     } else {
         Some(name.to_string())
     }
+}
+
+fn parse_runtime_after(contents: &str, header_anchor: &str) -> Option<String> {
+    let region = &contents[contents.rfind(header_anchor)?..];
+    let after = &region[region.find(RUNTIME_LOG_MARKER)? + RUNTIME_LOG_MARKER.len()..];
+    let runtime = after.lines().next()?.trim();
+    (!runtime.is_empty()).then(|| runtime.to_string())
+}
+
+fn marker_after(contents: &str, header_anchor: &str, marker: &str) -> bool {
+    contents
+        .rfind(header_anchor)
+        .is_some_and(|start| contents[start..].contains(marker))
 }
 
 /// Poll `log_path` for the account-selection marker until it appears, the
@@ -981,12 +1296,20 @@ fn parse_token_name_after(contents: &str, header_anchor: &str) -> Option<String>
 /// exits without logging is detected immediately rather than waiting out the
 /// full window). `try_wait` caches the exit status, so the reaper's later
 /// `try_wait` on the same handle still observes the exit.
-fn poll_token_name(child: &mut Child, log_path: &Path, header_anchor: &str) -> String {
+fn poll_observability(child: &mut Child, log_path: &Path, header_anchor: &str) -> (String, String) {
     let deadline = std::time::Instant::now() + TOKEN_NAME_CAPTURE_TIMEOUT;
+    let mut runtime = None;
     loop {
         if let Ok(contents) = std::fs::read_to_string(log_path) {
+            runtime = runtime.or_else(|| parse_runtime_after(&contents, header_anchor));
             if let Some(name) = parse_token_name_after(&contents, header_anchor) {
-                return name;
+                return (name, runtime.unwrap_or_else(|| UNKNOWN_TOKEN_NAME.to_string()));
+            }
+            if runtime.is_some() && marker_after(&contents, header_anchor, CLI_START_MARKER) {
+                return (
+                    UNKNOWN_TOKEN_NAME.to_string(),
+                    runtime.unwrap_or_else(|| UNKNOWN_TOKEN_NAME.to_string()),
+                );
             }
         }
         // If the child has already exited without logging a selection, the
@@ -995,13 +1318,24 @@ fn poll_token_name(child: &mut Child, log_path: &Path, header_anchor: &str) -> S
         if matches!(child.try_wait(), Ok(Some(_))) {
             if let Ok(contents) = std::fs::read_to_string(log_path) {
                 if let Some(name) = parse_token_name_after(&contents, header_anchor) {
-                    return name;
+                    return (
+                        name,
+                        parse_runtime_after(&contents, header_anchor)
+                            .or(runtime)
+                            .unwrap_or_else(|| UNKNOWN_TOKEN_NAME.to_string()),
+                    );
                 }
             }
-            return UNKNOWN_TOKEN_NAME.to_string();
+            return (
+                UNKNOWN_TOKEN_NAME.to_string(),
+                runtime.unwrap_or_else(|| UNKNOWN_TOKEN_NAME.to_string()),
+            );
         }
         if std::time::Instant::now() >= deadline {
-            return UNKNOWN_TOKEN_NAME.to_string();
+            return (
+                UNKNOWN_TOKEN_NAME.to_string(),
+                runtime.unwrap_or_else(|| UNKNOWN_TOKEN_NAME.to_string()),
+            );
         }
         std::thread::sleep(TOKEN_NAME_CAPTURE_POLL_INTERVAL);
     }
@@ -1039,6 +1373,14 @@ fn recover_adopted_token_name(log_path: &Path, sweep_id: &str) -> String {
     std::fs::read_to_string(log_path)
         .ok()
         .and_then(|contents| parse_token_name_after(&contents, &anchor))
+        .unwrap_or_else(|| UNKNOWN_TOKEN_NAME.to_string())
+}
+
+fn recover_adopted_runtime(log_path: &Path, sweep_id: &str) -> String {
+    let anchor = format!("sweep_id={sweep_id}");
+    std::fs::read_to_string(log_path)
+        .ok()
+        .and_then(|contents| parse_runtime_after(&contents, &anchor))
         .unwrap_or_else(|| UNKNOWN_TOKEN_NAME.to_string())
 }
 
@@ -1152,13 +1494,21 @@ const CLAUDE_CLI_START_MARKER: &str = "# CLAUDE_CLI_START";
 /// unreadable/missing log as `None`/"unknown" rather than calling this with
 /// an empty tail (mirrors how [`classify_crash`] is fed by its callers).
 fn classify_preflight_death(log_tail: &str) -> Option<&'static str> {
+    // Per-issue logs are append-only. Restrict both positive and absence-based
+    // classification to the newest dispatch so markers from a prior run
+    // cannot classify (or clear) the current run's pre-flight death.
+    let current_dispatch = log_tail
+        .rfind(DISPATCH_HEADER_MARKER)
+        .map_or(log_tail, |start| &log_tail[start..]);
     if let Some((label, _)) = preflight_death_signatures()
         .iter()
-        .find(|(_, re)| re.is_match(log_tail))
+        .find(|(_, re)| re.is_match(current_dispatch))
     {
         return Some(label);
     }
-    if !log_tail.contains(CLAUDE_CLI_START_MARKER) {
+    if !current_dispatch.contains(CLAUDE_CLI_START_MARKER)
+        && !current_dispatch.contains(CLI_START_MARKER)
+    {
         return Some("preflight-no-cli-start");
     }
     None
@@ -1342,8 +1692,8 @@ pub struct SweepRegistryConfig {
     /// Absolute path to the workspace root (parent of `.loom/`).
     pub workspace_root: PathBuf,
     /// Optional override for the spawn binary. Defaults to
-    /// `<workspace_root>/defaults/scripts/spawn-claude.sh` or, if absent,
-    /// `<workspace_root>/.loom/scripts/spawn-claude.sh`.
+    /// `<workspace_root>/.loom/scripts/spawn-worker.sh` or, if absent,
+    /// `<workspace_root>/defaults/scripts/spawn-worker.sh`.
     pub spawn_bin: Option<PathBuf>,
     /// Override the `gh` binary (for tests). Defaults to `gh` from `PATH`.
     pub gh_bin: Option<PathBuf>,
@@ -1383,20 +1733,22 @@ impl SweepRegistryConfig {
     /// Resolve the spawn binary, preferring (in order):
     /// 1. `spawn_bin` explicit override.
     /// 2. `LOOM_SWEEP_SPAWN_BIN` env var.
-    /// 3. `<workspace>/.loom/scripts/spawn-claude.sh`.
-    /// 4. `<workspace>/defaults/scripts/spawn-claude.sh`.
+    /// 3. `<workspace>/.loom/scripts/spawn-worker.sh`.
+    /// 4. `<workspace>/defaults/scripts/spawn-worker.sh`.
     pub fn resolve_spawn_bin(&self) -> Result<PathBuf> {
         if let Some(ref p) = self.spawn_bin {
             return Ok(p.clone());
         }
         if let Ok(path) = std::env::var(SPAWN_BIN_ENV) {
-            return Ok(PathBuf::from(path));
+            if !path.trim().is_empty() {
+                return Ok(PathBuf::from(path));
+            }
         }
         let installed = self
             .workspace_root
             .join(".loom")
             .join("scripts")
-            .join("spawn-claude.sh");
+            .join("spawn-worker.sh");
         if installed.exists() {
             return Ok(installed);
         }
@@ -1404,12 +1756,12 @@ impl SweepRegistryConfig {
             .workspace_root
             .join("defaults")
             .join("scripts")
-            .join("spawn-claude.sh");
+            .join("spawn-worker.sh");
         if defaults.exists() {
             return Ok(defaults);
         }
         Err(anyhow!(
-            "spawn-claude.sh not found under {} (looked in .loom/scripts and defaults/scripts; \
+            "spawn-worker.sh not found under {} (looked in .loom/scripts and defaults/scripts; \
              set {SPAWN_BIN_ENV} to override)",
             self.workspace_root.display()
         ))
@@ -1453,6 +1805,19 @@ impl SweepRegistryConfig {
             .join("sweep.md")
             .exists()
     }
+}
+
+/// Outcome of an ownership-checked lock release (Issue #4463).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockReleaseOutcome {
+    /// The lock dir was removed — either its `owner.json` `sweep_id` matched
+    /// the releasing sweep, or the owner was unreadable (fail-open), or no lock
+    /// existed (idempotent no-op).
+    Released,
+    /// A *different* sweep owns the lock (a newer sweep re-acquired the claim
+    /// after the releasing one died). The lock was left intact; the caller MUST
+    /// NOT restore the label or re-dispatch.
+    Superseded,
 }
 
 /// On-disk owner metadata written inside the lock dir. Schema mirrors
@@ -1543,6 +1908,12 @@ pub struct SweepRegistry {
     /// Issues the mid-build-death watchdog has already logged a give-up for
     /// (Issue #3895), so the loud give-up warning fires once per issue.
     midbuild_gaveup: HashSet<u32>,
+    /// Issues whose worktree the mid-build-death watchdog has already refused to
+    /// reset because a live, untracked session still holds it (Issue #4449).
+    /// Log-once bookkeeping only — it never suppresses the refusal itself, and
+    /// the issue is removed again as soon as the worktree stops being in use so a
+    /// later refusal (or a genuine give-up) still surfaces.
+    midbuild_inuse: HashSet<u32>,
     /// Issues the review-phase stall watchdog has already restarted once (Issue
     /// #3910). Bounds the "log went silent mid-review (hung Judge/Doctor)"
     /// recovery to a single re-dispatch per issue — a second stall resolves to
@@ -1707,6 +2078,7 @@ impl SweepRegistry {
             watchdog_progressed: HashSet::new(),
             midbuild_retried: HashSet::new(),
             midbuild_gaveup: HashSet::new(),
+            midbuild_inuse: HashSet::new(),
             review_stall_retried: HashSet::new(),
             review_stall_gaveup: HashSet::new(),
             quarantine_config: QuarantineConfig::default(),
@@ -1741,6 +2113,7 @@ impl SweepRegistry {
             watchdog_progressed: HashSet::new(),
             midbuild_retried: HashSet::new(),
             midbuild_gaveup: HashSet::new(),
+            midbuild_inuse: HashSet::new(),
             review_stall_retried: HashSet::new(),
             review_stall_gaveup: HashSet::new(),
             quarantine_config: QuarantineConfig::default(),
@@ -2440,6 +2813,56 @@ impl SweepRegistry {
             }
         }
 
+        // 2.7 Park-label guard (Issue #4444). The work-finder's `SKIP_LABELS`
+        //     hard-skip is enforced only in *its own* candidate query, so it
+        //     covers exactly one of the six dispatch routes. Every other route
+        //     — all three watchdogs (#3887 / #3895 / #3910), the reaper's
+        //     checkpoint-resume (#4256), the epic supervisor, the IPC/CLI
+        //     `dispatch_sweep` — funnels through here, and until this guard
+        //     existed none of them ever re-read the forge labels. A
+        //     `loom:blocked` / `loom:operator-only` park applied *after* the
+        //     original dispatch was therefore invisible to every re-dispatch
+        //     path, and the daemon overrode a deliberate human/agent park
+        //     (observed on #4366). Placing the check here — before the
+        //     lock/label flip — covers all routes with one probe.
+        //
+        //     Three properties are load-bearing:
+        //
+        //     - It guards on `PARK_LABELS` only, NOT the full `SKIP_LABELS`
+        //       set. `loom:building` is legitimately present on a watchdog
+        //       re-dispatch or a checkpoint-resume of the daemon's OWN claim,
+        //       so refusing it would break the review-stall watchdog's
+        //       cancel-and-re-dispatch and the reaper's resume.
+        //     - It is NOT exempted by `resume_bypass_pr`. The #4256 bypass
+        //       covers step 2.6 (its own open PR) and nothing else: a park
+        //       applied after the crash must still stop the resume, which is
+        //       the exact defect this guard fixes.
+        //     - It probes over **REST** (`gh api repos/{owner}/{repo}/issues/N`),
+        //       a separate rate-limit bucket from the GraphQL calls 2.5/2.6
+        //       ride, so the park still holds while the GraphQL quota is
+        //       exhausted — the condition under which the #4123 guard failed
+        //       open during the 2026-07-29 incident.
+        //
+        //     Best-effort and fail-open, mirroring 2.5/2.6: any forge
+        //     error/timeout/unresolvable repo returns `None` and dispatch
+        //     proceeds, so a `gh` outage can never wedge the daemon. Skipped
+        //     entirely when label flips are disabled (test fixtures without
+        //     `gh` credentials).
+        if !self.config.skip_label_flip {
+            if let Some(label) = self.first_park_label(issue_number) {
+                log::info!(
+                    "issue #{issue_number}: refusing dispatch — the issue carries `{label}`, a \
+                     deliberate park that every dispatch route must respect (#4444 park-label \
+                     guard); clear the label to re-enable automation"
+                );
+                return Err(ParkedIssueDispatchError {
+                    issue: issue_number,
+                    label,
+                }
+                .into());
+            }
+        }
+
         // 3. Acquire the claim lock atomically.
         let sweep_id = generate_sweep_id(kind);
         self.acquire_lock(issue_number, &sweep_id)?;
@@ -2483,7 +2906,7 @@ impl SweepRegistry {
         // stagger (the default outside production / in tests) is a no-op.
         self.apply_dispatch_stagger();
         let log_path = self.compute_log_path(issue_number);
-        let (child, token_name) = self
+        let (child, token_name, runtime) = self
             .spawn_child(issue_number, &log_path, &sweep_id, model, effort, depends_on)
             .context("failed to spawn sweep child")?;
         let pid = child.id();
@@ -2514,6 +2937,7 @@ impl SweepRegistry {
             kind: kind.clone(),
             pid,
             token_name: token_name.clone(),
+            runtime,
             log_path: log_path.clone(),
             idempotency_key,
             started_at: Utc::now(),
@@ -2683,6 +3107,12 @@ impl SweepRegistry {
     }
 
     /// Release the lock dir for an issue (idempotent).
+    ///
+    /// UNCONDITIONAL: removes `.loom/locks/issue-<N>` regardless of which sweep
+    /// owns it. Prefer [`release_lock_owned`](Self::release_lock_owned) from any
+    /// reaper / cancel / re-dispatch path so a newer sweep's live claim is not
+    /// clobbered (Issue #4463) — this remains for callers that intentionally
+    /// want an owner-blind removal.
     pub fn release_lock(&self, issue: u32) -> Result<()> {
         let lock = self.config.locks_dir().join(format!("issue-{issue}"));
         if lock.exists() {
@@ -2690,6 +3120,71 @@ impl SweepRegistry {
                 .with_context(|| format!("failed to remove lock dir {}", lock.display()))?;
         }
         Ok(())
+    }
+
+    /// Ownership-checked lock release (Issue #4463).
+    ///
+    /// Removes `.loom/locks/issue-<N>` **only when** its `owner.json`
+    /// `sweep_id` matches `sweep_id` — the sweep being reaped / cancelled /
+    /// re-dispatched. When a *different* sweep owns the lock (a newer sweep
+    /// re-acquired the claim after this one died — the double-dispatch incident
+    /// this guards against), the lock is left intact and
+    /// [`LockReleaseOutcome::Superseded`] is returned so the caller skips any
+    /// label restore and any re-dispatch: the newer sweep is the live owner and
+    /// runs its own lifecycle.
+    ///
+    /// FAIL-OPEN: a missing / unreadable / corrupt / unparseable `owner.json`
+    /// falls back to the legacy unconditional removal — the release only refuses
+    /// on a *positively-read, conflicting* owner, so a garbage lock file can
+    /// never wedge an issue permanently. A non-existent lock dir is a no-op
+    /// ([`LockReleaseOutcome::Released`], idempotent).
+    #[must_use]
+    pub fn release_lock_owned(&self, issue: u32, sweep_id: &str) -> LockReleaseOutcome {
+        let lock = self.config.locks_dir().join(format!("issue-{issue}"));
+        if !lock.exists() {
+            return LockReleaseOutcome::Released;
+        }
+        if self.lock_owned_by_other(issue, sweep_id) {
+            return LockReleaseOutcome::Superseded;
+        }
+        if let Err(e) = std::fs::remove_dir_all(&lock) {
+            log::warn!("release_lock: failed to remove lock dir {}: {e}", lock.display());
+        }
+        LockReleaseOutcome::Released
+    }
+
+    /// Read-only ownership probe (Issue #4463): `true` iff the issue lock's
+    /// `owner.json` records a `sweep_id` *different* from `sweep_id` — i.e. a
+    /// newer sweep re-acquired the claim after the querying sweep died. Unlike
+    /// [`release_lock_owned`](Self::release_lock_owned) this never mutates the
+    /// filesystem, so a caller can gate destructive work (worktree cleanup,
+    /// re-dispatch) on it without prematurely freeing the lock.
+    ///
+    /// FAIL-OPEN: a missing lock dir, or an unreadable / unparseable
+    /// `owner.json`, resolves to `false` (not-conflicting) so a garbage owner
+    /// file can never wedge an issue.
+    fn lock_owned_by_other(&self, issue: u32, sweep_id: &str) -> bool {
+        let owner_path = self
+            .config
+            .locks_dir()
+            .join(format!("issue-{issue}"))
+            .join("owner.json");
+        // Only report a conflict on a POSITIVELY-read differing owner.
+        match std::fs::read_to_string(&owner_path) {
+            Ok(contents) => match serde_json::from_str::<LockOwner>(&contents) {
+                Ok(owner) if owner.sweep_id != sweep_id => {
+                    log::info!(
+                        "release_lock: issue #{issue} lock is owned by sweep {} \
+                         (sweep {sweep_id} was superseded) — leaving the lock intact and \
+                         skipping any re-dispatch (#4463)",
+                        owner.sweep_id
+                    );
+                    true
+                }
+                _ => false,
+            },
+            Err(_) => false,
+        }
     }
 
     /// Best-effort removal of this registry's sweep-journal entry for
@@ -2917,11 +3412,76 @@ impl SweepRegistry {
             .find_map(|l| l.trim().parse::<u32>().ok())
     }
 
+    /// Best-effort probe for the first [`PARK_LABELS`] entry currently on
+    /// `issue`, used by the #4444 park-label dispatch guard (step 2.7). Returns
+    /// `Some(label)` when the issue carries a park label and `None` otherwise —
+    /// where `None` covers BOTH "not parked" and any failure (missing/failed/
+    /// timed-out `gh`, unresolvable repo, unparseable output).
+    ///
+    /// Callers MUST treat `None` as **fail-open**, matching
+    /// [`issue_is_closed`](Self::issue_is_closed) and
+    /// [`first_open_linked_pr`](Self::first_open_linked_pr): a forge outage or a
+    /// wedged `gh` must never wedge dispatch. Bounded by [`reap_gh_timeout`] like
+    /// every other dispatch-path `gh` call (#3973).
+    ///
+    /// Deliberately probes over **REST** (`gh api repos/{owner}/{repo}/issues/N`)
+    /// rather than `gh issue view --json labels` (which rides GraphQL, like
+    /// steps 2.5/2.6): REST is a separate rate-limit bucket, so a deliberate park
+    /// still holds while the GraphQL quota is exhausted — exactly the condition
+    /// under which the #4123 open-PR guard failed open during the 2026-07-29
+    /// incident. The `--jq` emits one label name per line.
+    ///
+    /// The returned label is chosen by [`PARK_LABELS`] order, not forge order, so
+    /// the refusal message is deterministic when an issue carries both.
+    ///
+    /// [`PARK_LABELS`]: crate::work_finder::PARK_LABELS
+    fn first_park_label(&self, issue: u32) -> Option<String> {
+        let labels = self.current_labels_via_rest(issue)?;
+        crate::work_finder::PARK_LABELS
+            .iter()
+            .find(|park| labels.iter().any(|l| l == *park))
+            .map(|park| (*park).to_string())
+    }
+
+    /// Read `issue`'s current label names over the GitHub REST API. `None` on any
+    /// failure (see [`first_park_label`](Self::first_park_label) for the
+    /// fail-open contract); `Some(vec![])` for an issue with no labels, which is
+    /// a *successful* read and must stay distinguishable from a failed one.
+    fn current_labels_via_rest(&self, issue: u32) -> Option<Vec<String>> {
+        let (owner, repo) = self.resolve_owner_repo()?;
+        let gh = self
+            .config
+            .gh_bin
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("gh"));
+        let mut cmd = Command::new(&gh);
+        cmd.arg("api")
+            .arg(format!("repos/{owner}/{repo}/issues/{issue}"))
+            .arg("--jq")
+            .arg(".labels[].name");
+        // Resolve against this registry's own workspace, matching the label-flip
+        // helpers and the other dispatch-path probes (#3937).
+        cmd.current_dir(&self.config.workspace_root);
+        let output = output_with_timeout(cmd, reap_gh_timeout()).ok()??;
+        if !output.status.success() {
+            return None;
+        }
+        Some(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(String::from)
+                .collect(),
+        )
+    }
+
     /// Resolve `(owner, repo)` for the registry's workspace, needed because
-    /// `gh api graphql` (unlike `gh issue view`) cannot infer the repo from the
-    /// working directory. Prefers the process-global `LOOM_REPO` override
-    /// (`owner/repo`) when set, else asks `gh repo view` in the workspace root.
-    /// Returns `None` on any failure so the open-PR guard fails open.
+    /// `gh api` (unlike `gh issue view`) cannot infer the repo from the working
+    /// directory — neither the GraphQL open-PR probe nor the REST park-label
+    /// probe accepts a `--repo` flag. Prefers the process-global `LOOM_REPO`
+    /// override (`owner/repo`) when set, else asks `gh repo view` in the
+    /// workspace root. Returns `None` on any failure so both guards fail open.
     fn resolve_owner_repo(&self) -> Option<(String, String)> {
         if let Ok(repo) = std::env::var("LOOM_REPO") {
             if let Some((o, r)) = repo.split_once('/') {
@@ -3074,6 +3634,44 @@ impl SweepRegistry {
             return;
         }
         self.record_terminal_outcome(issue, insta_crash);
+    }
+
+    /// Persist provider health before any reaper retry/failover decision.
+    fn apply_provider_health_feedback(&self, sweep_id: &SweepId, exit_code: Option<i32>) {
+        let Some(info) = self.entries.get(sweep_id) else {
+            return;
+        };
+        if info.runtime != "codex" || info.token_name == UNKNOWN_TOKEN_NAME {
+            return;
+        }
+        let Ok(contents) = std::fs::read_to_string(&info.log_path) else {
+            return;
+        };
+        let anchor = format!("sweep_id={sweep_id}");
+        let Some(result) = parse_terminal_result_after(&contents, &anchor) else {
+            return;
+        };
+        if result.provider != AccountProvider::Codex
+            || result.account != info.token_name
+            || exit_code.is_some_and(|code| code != result.exit_code)
+        {
+            log::warn!("sweep_registry: ignored mismatched Codex terminal feedback for {sweep_id}");
+            return;
+        }
+        let id = AccountId {
+            provider: result.provider,
+            name: result.account,
+        };
+        if let Err(error) = tokens_pool::record_terminal(
+            &self.config.workspace_root,
+            &id,
+            result.category,
+            "spawn-codex:v1",
+        ) {
+            log::warn!(
+                "sweep_registry: failed to persist Codex terminal feedback for {sweep_id}: {error}"
+            );
+        }
     }
 
     /// Classify whether an insta-crash death was caused by account exhaustion
@@ -3710,7 +4308,7 @@ impl SweepRegistry {
         model: Option<&str>,
         effort: Option<&str>,
         depends_on: Option<u32>,
-    ) -> Result<(Child, String)> {
+    ) -> Result<(Child, String, String)> {
         let spawn_bin = self.config.resolve_spawn_bin()?;
 
         // Ensure log dir exists.
@@ -3928,8 +4526,8 @@ impl SweepRegistry {
         // Falls back to `UNKNOWN_TOKEN_NAME` on timeout / no-selection — never
         // blocks or fails dispatch.
         let header_anchor = format!("sweep_id={sweep_id}");
-        let token_name = poll_token_name(&mut child, log_path, &header_anchor);
-        Ok((child, token_name))
+        let (token_name, runtime) = poll_observability(&mut child, log_path, &header_anchor);
+        Ok((child, token_name, runtime))
     }
 
     // ------------------------------------------------------------------------
@@ -4163,7 +4761,12 @@ impl SweepRegistry {
             };
         }
         if let SweepKind::Issue(issue) = kind {
-            let _ = self.release_lock(*issue);
+            // Ownership-checked release (#4463): if a newer sweep re-acquired
+            // this issue's lock after the sweep being cancelled died, leave its
+            // live lock intact and skip the label restore below — the newer
+            // sweep owns the claim and runs its own lifecycle.
+            let superseded =
+                self.release_lock_owned(*issue, sweep_id) == LockReleaseOutcome::Superseded;
             // Best-effort tidy-up of the machine-level liveness journal
             // (#3953) — this cancelled sweep no longer exists.
             self.journal_remove_best_effort(*issue);
@@ -4177,7 +4780,9 @@ impl SweepRegistry {
             // produced no PR, so we never yank the label out from under an
             // in-flight PR's issue. Gated on `!skip_label_flip`, mirroring the
             // reaper path. `SweepKind::PrSet` cancels never reach here.
-            if !self.config.skip_label_flip && !produced_pr {
+            // #4463: a superseded release means a newer sweep now holds the
+            // claim — never restore the label out from under it.
+            if !self.config.skip_label_flip && !produced_pr && !superseded {
                 let _ = self.restore_label_to_ready(*issue);
             }
             self.emit_event(Event::SweepExited {
@@ -4277,6 +4882,9 @@ impl SweepRegistry {
             // handle fall back to the `kill(pid, 0)` probe.
             let (is_dead, exit_code) = self.poll_liveness(&sweep_id, pid);
             if is_dead {
+                // #4493: account health must be updated before any bounded
+                // re-dispatch path below asks the selector for another profile.
+                self.apply_provider_health_feedback(&sweep_id, exit_code);
                 {
                     changes += 1;
                     let issue = match &kind {
@@ -4287,7 +4895,15 @@ impl SweepRegistry {
                     let duration_sec = (now - started_at).num_seconds();
                     // Release lock and decide between Exited vs Crashed.
                     if let Some(issue) = issue {
-                        let _ = self.release_lock(issue);
+                        // Ownership-checked release (#4463): a reaper tick (in
+                        // this daemon or any other instance sharing the
+                        // workspace) must never delete a lock that a *newer*
+                        // live sweep re-acquired after this dead one. When the
+                        // lock is `Superseded`, skip the label restore AND the
+                        // resume/re-dispatch below — the dead sweep is not
+                        // crashed-needing-recovery, it is superseded.
+                        let superseded = self.release_lock_owned(issue, &sweep_id)
+                            == LockReleaseOutcome::Superseded;
                         // Best-effort tidy-up of the machine-level liveness
                         // journal (#3953): the reaper just confirmed this
                         // PID is dead, so drop its entry now rather than
@@ -4300,7 +4916,9 @@ impl SweepRegistry {
                             .checkpoint_dir()
                             .join(format!("issue-{issue}.json"));
                         if checkpoint.exists() {
-                            if !self.config.skip_label_flip {
+                            // #4463: never restore the label when a newer sweep
+                            // owns the lock — it is actively building.
+                            if !self.config.skip_label_flip && !superseded {
                                 let _ = self.restore_label_to_ready(issue);
                             }
                             let checkpoint_phase = read_checkpoint_phase(&checkpoint);
@@ -4430,16 +5048,26 @@ impl SweepRegistry {
                             // credentials never attempt a real forge probe
                             // here) and only checked for phases at/after
                             // Builder completion, so a pre-PR crash never
-                            // pays for the extra forge round trip. Also
-                            // respects the #4206 operator-park guard: never
-                            // resume-dispatch an issue `restore_label_to_ready`
-                            // just deliberately left without `loom:issue`
-                            // because it carries `loom:blocked`.
+                            // pays for the extra forge round trip. A deliberate
+                            // park (`loom:blocked` / `loom:operator-only`,
+                            // possibly applied by `restore_label_to_ready`'s
+                            // #4206 pre-check moments ago) still stops the
+                            // resume — but that check now lives centrally in
+                            // `dispatch_inner` step 2.7 (#4444) rather than
+                            // here, so it covers the watchdogs and IPC/CLI too
+                            // and there is only ONE label probe per resume
+                            // dispatch. A parked issue therefore reaches the
+                            // dispatch call below and is refused there, which
+                            // is deliberately *more* visible than the old
+                            // silent call-site skip: the refusal surfaces as a
+                            // `warn!` naming the park label plus the existing
+                            // `SweepResumeDispatched { dispatched: false }`
+                            // event.
                             if !self.config.skip_label_flip
+                                && !superseded
                                 && resume_phase_check
                                     .as_deref()
                                     .is_some_and(|p| RESUMABLE_CHECKPOINT_PHASES.contains(&p))
-                                && !self.issue_has_blocked_label(issue)
                             {
                                 if let Some(pr) = self.first_open_linked_pr(issue) {
                                     // Bounded resume attempts (#4256, Judge
@@ -4543,7 +5171,9 @@ impl SweepRegistry {
                                 .get(&sweep_id)
                                 .and_then(|info| info.pr_number)
                                 .is_some();
-                            if !self.config.skip_label_flip && !produced_pr {
+                            // #4463: skip the restore when a newer sweep owns
+                            // the lock (superseded) — it holds the live claim.
+                            if !self.config.skip_label_flip && !produced_pr && !superseded {
                                 let _ = self.restore_label_to_ready(issue);
                             }
                             if let Some(info) = self.entries.get_mut(&sweep_id) {
@@ -5066,16 +5696,132 @@ impl SweepRegistry {
         }
     }
 
+    /// Gather every signal that issue `N`'s worktree is still being used by a
+    /// **live** process the in-memory registry does not represent as an active
+    /// sweep (Issue #4449). An empty vec means "no live holder found".
+    ///
+    /// This is the veto gate on the mid-build watchdog's destructive path. It
+    /// deliberately fails *closed* on ambiguity in the one direction that matters:
+    /// any positive signal blocks the reset. Signals that cannot be probed on
+    /// this host simply contribute nothing (the probe helpers already degrade to
+    /// "unknown ⇒ empty"), so a host without `/proc` or `lsof` still gets the
+    /// marker / claim-lock / index.lock signals.
+    ///
+    /// Order is cheapest-first so the common "nothing is using it" case does the
+    /// least work: two `stat`s and a `read_to_string` before the process scan.
+    fn worktree_in_use(&self, issue: u32) -> Vec<WorktreeUseEvidence> {
+        let wt = self.worktree_path(issue);
+        let mut evidence = Vec::new();
+        if !wt.exists() {
+            return evidence;
+        }
+
+        // 1. Explicit `.loom-in-use` marker — the one signal a manual session
+        //    (or an operator) can plant by hand to fence off a worktree.
+        if let Some(marker) = crate::worktree_ops::safety::read_in_use_marker(&wt) {
+            evidence.push(WorktreeUseEvidence::InUseMarker {
+                task_id: marker.task_id,
+                pid: marker.pid,
+            });
+        }
+
+        // 2. A claim-lock whose recorded owner PID is still alive. A dead owner
+        //    is NOT evidence — the reaper and `reconstruct` prune those, and
+        //    treating a stale lock as "in use" would wedge legitimate recovery.
+        let owner_path = self
+            .config
+            .locks_dir()
+            .join(format!("issue-{issue}"))
+            .join("owner.json");
+        if let Some(owner) = std::fs::read_to_string(&owner_path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<LockOwner>(&s).ok())
+        {
+            if is_pid_alive(owner.owner_pid) {
+                evidence.push(WorktreeUseEvidence::LiveClaimLock {
+                    pid: owner.owner_pid,
+                    sweep_id: owner.sweep_id,
+                });
+            }
+        }
+
+        // 3. A git operation mid-flight (`index.lock`) — the exact `git commit`
+        //    window in which #4449 destroyed an uncommitted fix.
+        if let Some(lock) = git_index_lock_path(&wt) {
+            if lock.exists() {
+                evidence.push(WorktreeUseEvidence::GitOperationInFlight(lock));
+            }
+        }
+
+        // 4. Live processes with a cwd inside the worktree (shells, manual role
+        //    sessions, orphaned grandchildren still writing files).
+        let pids = crate::worktree_ops::safety::find_processes_using_directory(&wt);
+        if !pids.is_empty() {
+            evidence.push(WorktreeUseEvidence::LiveProcesses(pids));
+        }
+
+        evidence
+    }
+
+    /// Record, at `warn`, exactly what a [`clean_worktree`] call is about to
+    /// destroy (Issue #4449) — the porcelain status plus a diffstat, truncated to
+    /// [`DISCARD_LOG_MAX_LINES`]. A wipe must never be silent in the daemon log:
+    /// this line is the only forensic trace that survives the `reset --hard`.
+    ///
+    /// [`clean_worktree`]: SweepRegistry::clean_worktree
+    fn log_worktree_discard(&self, wt: &Path, issue: u32) {
+        let run = |args: &[&str]| -> String {
+            Command::new("git")
+                .arg("-C")
+                .arg(wt)
+                .args(args)
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim_end().to_string())
+                .unwrap_or_default()
+        };
+        let status = truncate_lines(
+            &run(&["status", "--porcelain", "--untracked-files=all"]),
+            DISCARD_LOG_MAX_LINES,
+        );
+        let diffstat = truncate_lines(&run(&["diff", "--stat", "HEAD"]), DISCARD_LOG_MAX_LINES);
+        if status.is_empty() && diffstat.is_empty() {
+            // Nothing probeable to report (missing git, unborn HEAD, …) — still
+            // announce the destructive action so the log shows it happened.
+            log::warn!(
+                "clean-worktree: discarding uncommitted state in {} (issue #{issue}) via \
+                 `git reset --hard` + `git clean -fd`; could not enumerate the discarded \
+                 changes (#4449).",
+                wt.display()
+            );
+            return;
+        }
+        log::warn!(
+            "clean-worktree: DISCARDING uncommitted state in {} (issue #{issue}) via \
+             `git reset --hard` + `git clean -fd` — this is irreversible (#4449).\n\
+             status --porcelain:\n{status}\n\
+             diff --stat HEAD:\n{diffstat}",
+            wt.display()
+        );
+    }
+
     /// Discard a mid-build-death worktree's uncommitted changes so the
     /// re-dispatched sweep resumes from a clean checkout (Issue #3895): a
     /// `git reset --hard` followed by `git clean -fd`. Best-effort — any commits
     /// the dead sweep managed to make are preserved (only the dirty working tree
     /// and untracked files are dropped).
+    ///
+    /// Every call first logs what it is about to destroy via
+    /// [`log_worktree_discard`](Self::log_worktree_discard) (Issue #4449) — the
+    /// #4449 incident was made unrecoverable partly because the wipe left no
+    /// trace at all in the daemon log.
     fn clean_worktree(&self, issue: u32) -> Result<()> {
         let wt = self.worktree_path(issue);
         if !wt.exists() {
             return Ok(());
         }
+        self.log_worktree_discard(&wt, issue);
         let reset = Command::new("git")
             .arg("-C")
             .arg(&wt)
@@ -5146,6 +5892,16 @@ impl SweepRegistry {
     /// re-dispatch (without consuming the single retry) when the whole pool is
     /// `exhausted`/`blocked`, so a mid-run exhaustion is less likely to recur.
     ///
+    /// **Live-use veto (Issue #4449)**: before anything destructive happens, a
+    /// dirty worktree is probed for live holders ([`worktree_in_use`]). A dirty
+    /// worktree is only *dead-sweep debris* if nothing live still owns it — if a
+    /// `.loom-in-use` marker, a live claim-lock owner, an in-flight `index.lock`,
+    /// or a process with its cwd inside the worktree says otherwise, the decision
+    /// resolves to [`MidbuildDecision::InUse`]: log loudly, touch nothing, and do
+    /// **not** consume the single recovery retry.
+    ///
+    /// [`worktree_in_use`]: SweepRegistry::worktree_in_use
+    ///
     /// No new event topics are introduced (the taxonomy is frozen): the
     /// re-dispatch reuses `sweep.global.dispatch` from [`dispatch`], and a
     /// bounded give-up / a pool-exhausted defer surface on the existing frozen
@@ -5177,8 +5933,39 @@ impl SweepRegistry {
                 continue;
             }
             let dirty = self.worktree_dirty(issue);
+            // #4449: a dirty worktree is only dead-sweep debris if nothing LIVE
+            // is still using it. Probe only when dirty (the probe is the
+            // expensive part and a clean worktree is never reset anyway).
+            let in_use = if dirty {
+                self.worktree_in_use(issue)
+            } else {
+                Vec::new()
+            };
+            if in_use.is_empty() {
+                // No longer held — clear the log-once latch so a later refusal
+                // (or a genuine give-up) still surfaces in the daemon log.
+                self.midbuild_inuse.remove(&issue);
+            }
             let already_retried = self.midbuild_retried.contains(&issue);
-            match midbuild_decision(dirty, false, already_retried) {
+            match midbuild_decision(dirty, false, already_retried, !in_use.is_empty()) {
+                MidbuildDecision::InUse => {
+                    if self.midbuild_inuse.insert(issue) {
+                        log::warn!(
+                            "midbuild-watchdog: issue #{issue} ({sweep_id}) matches the \
+                             mid-build-death signature (terminal, no PR, dirty worktree) but its \
+                             worktree at {} is STILL IN USE by a live session the daemon does not \
+                             track — {}. REFUSING to `git reset --hard` it: that is exactly how \
+                             #4449 destroyed an active recovery session's uncommitted fix \
+                             mid-commit. The worktree is left intact and the single recovery retry \
+                             is NOT consumed; the watchdog re-assesses once the holder releases \
+                             it. If the holder is stale, clear it (remove .loom-in-use / the \
+                             claim-lock / the index.lock, or exit the shell) and the next tick \
+                             will recover normally.",
+                            self.worktree_path(issue).display(),
+                            describe_worktree_use(&in_use),
+                        );
+                    }
+                }
                 MidbuildDecision::Healthy => {}
                 MidbuildDecision::GiveUp => {
                     if self.midbuild_gaveup.insert(issue) {
@@ -5219,6 +6006,22 @@ impl SweepRegistry {
                         }
                         continue;
                     }
+                    // #4463: before we clean the worktree or re-dispatch,
+                    // confirm the dead sweep still owns the issue lock. If a
+                    // newer sweep re-acquired it (cross-instance double
+                    // dispatch), its worktree and lock are live — cleaning the
+                    // worktree here would clobber its uncommitted work, exactly
+                    // the incident this guards against. Leave everything intact
+                    // and skip the re-dispatch.
+                    if self.lock_owned_by_other(issue, &sweep_id) {
+                        log::info!(
+                            "midbuild-watchdog: issue #{issue} lock now owned by a newer sweep \
+                             (superseding dead {sweep_id}) — not cleaning the worktree and not \
+                             re-dispatching (#4463)."
+                        );
+                        continue;
+                    }
+
                     // A transient defer may have logged a give-up earlier; clear
                     // it so a later genuine give-up still logs once.
                     self.midbuild_gaveup.remove(&issue);
@@ -5250,8 +6053,11 @@ impl SweepRegistry {
                     }
                     // Defensive: the reaper releases the lock on death, but a
                     // reconstructed entry may not have — ensure it's free so the
-                    // re-dispatch can re-acquire cleanly.
-                    let _ = self.release_lock(issue);
+                    // re-dispatch can re-acquire cleanly. Ownership-checked
+                    // (#4463): if a newer sweep raced in and re-acquired since
+                    // the probe above, leave its lock intact — the dispatch
+                    // below then fails cleanly on the lock collision.
+                    let _ = self.release_lock_owned(issue, &sweep_id);
 
                     match self.dispatch(
                         &SweepKind::Issue(issue),
@@ -5544,6 +6350,7 @@ impl SweepRegistry {
                 // to owner.sweep_id, to restore attribution before falling back
                 // to `unknown`. Degrades gracefully — adoption never fails here.
                 let token_name = recover_adopted_token_name(&log_path, &owner.sweep_id);
+                let runtime = recover_adopted_runtime(&log_path, &owner.sweep_id);
                 self.entries.insert(
                     owner.sweep_id.clone(),
                     SweepInfo {
@@ -5551,6 +6358,7 @@ impl SweepRegistry {
                         kind: SweepKind::Issue(issue),
                         pid: owner.owner_pid,
                         token_name,
+                        runtime,
                         log_path,
                         idempotency_key: None,
                         started_at,
@@ -5629,6 +6437,7 @@ impl SweepRegistry {
                         // lock was already removed as stale above), so this
                         // path legitimately stays `unknown`.
                         token_name: "unknown".to_string(),
+                        runtime: "unknown".to_string(),
                         log_path,
                         idempotency_key: None,
                         started_at: Utc::now(),
@@ -6309,6 +7118,33 @@ mod tests {
     use std::time::SystemTime;
     use tempfile::tempdir;
 
+    #[test]
+    #[serial]
+    fn resolve_spawn_bin_prefers_worker_install_then_source_tree() {
+        let dir = tempdir().unwrap();
+        let config = SweepRegistryConfig::new(dir.path().to_path_buf());
+        std::env::remove_var(SPAWN_BIN_ENV);
+
+        let defaults = dir.path().join("defaults/scripts/spawn-worker.sh");
+        std::fs::create_dir_all(defaults.parent().unwrap()).unwrap();
+        std::fs::write(&defaults, "# fixture\n").unwrap();
+        assert_eq!(config.resolve_spawn_bin().unwrap(), defaults);
+
+        let installed = dir.path().join(".loom/scripts/spawn-worker.sh");
+        std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
+        std::fs::write(&installed, "# fixture\n").unwrap();
+        assert_eq!(config.resolve_spawn_bin().unwrap(), installed);
+
+        let explicit = dir.path().join("explicit-worker");
+        let mut explicit_config = config.clone();
+        explicit_config.spawn_bin = Some(explicit.clone());
+        assert_eq!(explicit_config.resolve_spawn_bin().unwrap(), explicit);
+
+        std::env::set_var(SPAWN_BIN_ENV, "/tmp/loom-worker-override");
+        assert_eq!(config.resolve_spawn_bin().unwrap(), PathBuf::from("/tmp/loom-worker-override"));
+        std::env::remove_var(SPAWN_BIN_ENV);
+    }
+
     /// Install the `/loom:sweep` command marker under `workspace` (Issue
     /// #4027) so the workspace-commands guard in `dispatch()` treats it as
     /// initialized. Only tests that run with `skip_label_flip = false` need
@@ -6351,6 +7187,7 @@ mod tests {
                 kind: SweepKind::Issue(issue),
                 pid: 0,
                 token_name: "unknown".into(),
+                runtime: "unknown".into(),
                 log_path,
                 idempotency_key: None,
                 started_at: Utc::now(),
@@ -6999,6 +7836,7 @@ exit 0
                 kind: SweepKind::Issue(41_110),
                 pid,
                 token_name: "unknown".into(),
+                runtime: "unknown".into(),
                 log_path: registry.compute_log_path(41_110),
                 idempotency_key: None,
                 started_at: Utc::now(),
@@ -7115,6 +7953,7 @@ exit 0
                 kind: SweepKind::Issue(issue),
                 pid,
                 token_name: "unknown".into(),
+                runtime: "unknown".into(),
                 log_path: registry.compute_log_path(issue),
                 idempotency_key: None,
                 started_at: Utc::now(),
@@ -7817,6 +8656,7 @@ exit 0
                     kind: SweepKind::Issue(issue),
                     pid: 2_147_483_640,
                     token_name: "unknown".into(),
+                    runtime: "unknown".into(),
                     log_path: registry.compute_log_path(issue),
                     idempotency_key: None,
                     started_at: Utc::now(),
@@ -7861,6 +8701,7 @@ exit 0
                 kind: SweepKind::Issue(issue),
                 pid: 2_147_483_640,
                 token_name: "unknown".into(),
+                runtime: "unknown".into(),
                 log_path: PathBuf::from(format!(".loom/logs/sweep-issue-{issue}.log")),
                 idempotency_key: None,
                 started_at: Utc::now(),
@@ -8087,6 +8928,7 @@ exit 0
                 kind: SweepKind::Issue(issue),
                 pid: std::process::id(), // any live-looking pid; list() never probes liveness
                 token_name: "unknown".into(),
+                runtime: "unknown".into(),
                 log_path: registry.compute_log_path(issue),
                 idempotency_key: None,
                 started_at,
@@ -8294,6 +9136,7 @@ exit 0
                 kind: SweepKind::Issue(55),
                 pid: 2_147_483_640,
                 token_name: "unknown".into(),
+                runtime: "unknown".into(),
                 log_path: registry.compute_log_path(55),
                 idempotency_key: None,
                 started_at: Utc::now(),
@@ -8380,6 +9223,7 @@ exit 0
                 kind: SweepKind::Issue(57),
                 pid: 2_147_483_641,
                 token_name: "unknown".into(),
+                runtime: "unknown".into(),
                 log_path,
                 idempotency_key: None,
                 started_at: Utc::now(),
@@ -8439,6 +9283,7 @@ exit 0
                 kind: SweepKind::Issue(66),
                 pid: 2_147_483_640,
                 token_name: "unknown".into(),
+                runtime: "unknown".into(),
                 log_path: registry.compute_log_path(66),
                 idempotency_key: None,
                 started_at: Utc::now() - chrono::Duration::seconds(10),
@@ -8494,6 +9339,7 @@ exit 0
                 kind: SweepKind::Issue(21),
                 pid: 2_147_483_640, // ~i32::MAX, almost certainly dead
                 token_name: "unknown".into(),
+                runtime: "unknown".into(),
                 log_path: registry.compute_log_path(21),
                 idempotency_key: None,
                 started_at: Utc::now(),
@@ -8542,6 +9388,7 @@ exit 0
                 kind: SweepKind::Issue(issue),
                 pid: 2_147_483_640, // ~i32::MAX, almost certainly dead
                 token_name: "unknown".into(),
+                runtime: "unknown".into(),
                 log_path: registry.compute_log_path(issue),
                 idempotency_key: None,
                 started_at,
@@ -8714,6 +9561,14 @@ exit 0
                 "spawn-claude: dispatching\n# CLAUDE_CLI_START\nClaude: working on it\n"
             ),
             None
+        );
+        assert_eq!(
+            classify_preflight_death(
+                "==== loom-daemon dispatch: old ====\n\
+# LOOM_CLI_START runtime=codex\n\
+==== loom-daemon dispatch: current ====\nspawn-codex: preflight failed\n"
+            ),
+            Some("preflight-no-cli-start")
         );
     }
 
@@ -9818,6 +10673,7 @@ exit 0
                 kind: SweepKind::Issue(77),
                 pid: 2_147_483_640, // ~i32::MAX, almost certainly dead
                 token_name: "unknown".into(),
+                runtime: "unknown".into(),
                 log_path: registry.compute_log_path(77),
                 idempotency_key: None,
                 started_at: Utc::now(),
@@ -9934,6 +10790,7 @@ exit 0
                 kind: kind.clone(),
                 pid: 2_147_483_640, // ~i32::MAX, almost certainly dead
                 token_name: "unknown".into(),
+                runtime: "unknown".into(),
                 log_path: registry.compute_log_path(88),
                 idempotency_key: None,
                 started_at,
@@ -10072,6 +10929,7 @@ exit 0
                 kind: kind.clone(),
                 pid: 2_147_483_640,
                 token_name: "unknown".into(),
+                runtime: "unknown".into(),
                 log_path: registry.compute_log_path(99),
                 idempotency_key: None,
                 started_at,
@@ -10134,6 +10992,7 @@ exit 0
                 kind: kind.clone(),
                 pid: 2_147_483_640,
                 token_name: "unknown".into(),
+                runtime: "unknown".into(),
                 log_path: registry.compute_log_path(0),
                 idempotency_key: None,
                 started_at,
@@ -10179,6 +11038,7 @@ exit 0
                 kind: SweepKind::Issue(33),
                 pid: 2_147_483_640,
                 token_name: "unknown".into(),
+                runtime: "unknown".into(),
                 log_path: registry.compute_log_path(33),
                 idempotency_key: None,
                 started_at: Utc::now(),
@@ -10399,6 +11259,187 @@ exit 0
         assert!(!lock.exists(), "stale daemon lock should be removed");
     }
 
+    // --- ownership-checked lock release (Issue #4463) ---
+
+    /// Core invariant: `release_lock_owned` must NOT delete a lock whose
+    /// `owner.json` records a DIFFERENT `sweep_id` — a newer sweep re-acquired
+    /// the claim after the releasing (older) sweep died. The lock survives and
+    /// `Superseded` is returned so the caller skips any re-dispatch. This is the
+    /// exact double-dispatch mechanism from the incident: reaping an old dead
+    /// sweep must never free a live sweep's claim.
+    #[test]
+    fn release_lock_owned_preserves_lock_owned_by_different_sweep() {
+        let dir = tempdir().unwrap();
+        let (registry, _record_log) = fixture_registry(dir.path());
+
+        // Newer sweep B owns the lock; older sweep A tries to release it.
+        let lock = write_lock_owner(&registry, 4463, "sweep-issue-4463-newer", std::process::id());
+
+        let outcome = registry.release_lock_owned(4463, "sweep-issue-4463-older-dead");
+        assert_eq!(outcome, LockReleaseOutcome::Superseded);
+        assert!(
+            lock.exists(),
+            "the newer sweep's live lock must survive an older sweep's release"
+        );
+        let owner: LockOwner =
+            serde_json::from_str(&std::fs::read_to_string(lock.join("owner.json")).unwrap())
+                .unwrap();
+        assert_eq!(owner.sweep_id, "sweep-issue-4463-newer", "owner.json must be left untouched");
+    }
+
+    /// A sweep releasing its OWN lock (matching `sweep_id`) removes it —
+    /// unchanged from the legacy unconditional release for the common case.
+    #[test]
+    fn release_lock_owned_removes_matching_owner() {
+        let dir = tempdir().unwrap();
+        let (registry, _record_log) = fixture_registry(dir.path());
+
+        let lock = write_lock_owner(&registry, 4464, "sweep-issue-4464-mine", std::process::id());
+
+        let outcome = registry.release_lock_owned(4464, "sweep-issue-4464-mine");
+        assert_eq!(outcome, LockReleaseOutcome::Released);
+        assert!(!lock.exists(), "a sweep must be able to release its own lock");
+    }
+
+    /// FAIL-OPEN: a corrupt / unparseable `owner.json` falls back to the legacy
+    /// unconditional removal — a garbage lock file must never wedge an issue.
+    #[test]
+    fn release_lock_owned_fails_open_on_corrupt_owner() {
+        let dir = tempdir().unwrap();
+        let (registry, _record_log) = fixture_registry(dir.path());
+
+        let locks = registry.config.locks_dir();
+        std::fs::create_dir_all(&locks).unwrap();
+        let lock = locks.join("issue-4465");
+        std::fs::create_dir_all(&lock).unwrap();
+        std::fs::write(lock.join("owner.json"), b"{ this is not valid json").unwrap();
+
+        let outcome = registry.release_lock_owned(4465, "sweep-issue-4465-whoever");
+        assert_eq!(outcome, LockReleaseOutcome::Released);
+        assert!(!lock.exists(), "a corrupt owner.json must not wedge the lock (fail-open)");
+    }
+
+    /// FAIL-OPEN: a lock dir with a MISSING `owner.json` releases too (legacy
+    /// spawn-loop locks predating the owner record, or a partially-written one).
+    #[test]
+    fn release_lock_owned_fails_open_on_missing_owner_json() {
+        let dir = tempdir().unwrap();
+        let (registry, _record_log) = fixture_registry(dir.path());
+
+        let locks = registry.config.locks_dir();
+        std::fs::create_dir_all(&locks).unwrap();
+        let lock = locks.join("issue-4466");
+        std::fs::create_dir_all(&lock).unwrap();
+        // No owner.json written.
+
+        let outcome = registry.release_lock_owned(4466, "sweep-issue-4466-whoever");
+        assert_eq!(outcome, LockReleaseOutcome::Released);
+        assert!(!lock.exists(), "a lock with no owner.json must release (fail-open)");
+    }
+
+    /// A non-existent lock is an idempotent no-op (`Released`), never a spurious
+    /// `Superseded`.
+    #[test]
+    fn release_lock_owned_noop_when_no_lock() {
+        let dir = tempdir().unwrap();
+        let (registry, _record_log) = fixture_registry(dir.path());
+        let outcome = registry.release_lock_owned(4467, "sweep-issue-4467-none");
+        assert_eq!(outcome, LockReleaseOutcome::Released);
+    }
+
+    /// Regression (Test Plan item 2, retained guard): two dispatch requests for
+    /// the same issue racing in one tick produce exactly ONE sweep — the second
+    /// `acquire_lock` collides on the atomic mkdir claim and is refused. Already
+    /// passes today; kept so the cross-instance mutual-exclusion property does
+    /// not silently regress.
+    #[test]
+    fn second_same_issue_dispatch_collides_on_lock() {
+        let dir = tempdir().unwrap();
+        let (registry, _record_log) = fixture_registry(dir.path());
+
+        registry
+            .acquire_lock(4468, "sweep-issue-4468-first")
+            .unwrap();
+        let err = registry
+            .acquire_lock(4468, "sweep-issue-4468-second")
+            .expect_err("a second same-issue claim must collide on the lock");
+        assert!(
+            err.to_string().contains("lock collision"),
+            "the second dispatch must be refused with a lock collision; got: {err}"
+        );
+    }
+
+    /// Regression (Test Plan item 3): `finish_cancel` on a stale entry whose
+    /// issue lock is owned by a NEWER live sweep must leave that lock intact AND
+    /// must not restore the label out from under the newer sweep.
+    #[test]
+    fn cancel_preserves_lock_and_skips_restore_when_superseded() {
+        let dir = tempdir().unwrap();
+        let gh_log = dir.path().join("gh-invocations.log");
+        let fake_gh = dir.path().join("fake-gh.sh");
+        let script = format!(
+            "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"{}\"\nexit 0\n",
+            gh_log.display()
+        );
+        std::fs::write(&fake_gh, &script).unwrap();
+        let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_gh, perms).unwrap();
+        if let Ok(f) = std::fs::File::open(&fake_gh) {
+            let _ = f.sync_all();
+        }
+
+        let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
+        config.gh_bin = Some(fake_gh);
+        config.skip_label_flip = false; // real restore path enabled but must NOT fire
+        let mut registry = SweepRegistry::new(config);
+
+        // A newer live sweep owns the lock.
+        let lock = write_lock_owner(&registry, 8801, "sweep-issue-8801-newer", std::process::id());
+
+        // The OLDER sweep being cancelled.
+        let kind = SweepKind::Issue(8801);
+        let started_at = Utc::now();
+        let sweep_id = "sweep-issue-8801-older".to_string();
+        registry.entries.insert(
+            sweep_id.clone(),
+            SweepInfo {
+                sweep_id: sweep_id.clone(),
+                kind: kind.clone(),
+                pid: 2_147_483_640,
+                token_name: "unknown".into(),
+                runtime: "unknown".into(),
+                log_path: registry.compute_log_path(8801),
+                idempotency_key: None,
+                started_at,
+                state: SweepState::Running,
+                latest_phase: None,
+                pr_number: None,
+                model: None,
+                effort: None,
+                depends_on: None,
+                repo: None,
+            },
+        );
+
+        let outcome = registry.finish_cancel(&sweep_id, 2_147_483_640, &kind, started_at, true);
+        assert!(outcome.was_running);
+
+        // The newer sweep's lock survives untouched.
+        assert!(lock.exists(), "cancelling an older sweep must not free the newer sweep's lock");
+        let owner: LockOwner =
+            serde_json::from_str(&std::fs::read_to_string(lock.join("owner.json")).unwrap())
+                .unwrap();
+        assert_eq!(owner.sweep_id, "sweep-issue-8801-newer");
+
+        // The label must NOT be restored — the newer sweep still holds the claim.
+        let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            !gh_calls.contains("--remove-label loom:building"),
+            "a superseded cancel must not restore loom:building -> loom:issue; got: {gh_calls:?}"
+        );
+    }
+
     /// Issue #4173: adoption recovers the real OAuth account from the surviving
     /// per-sweep log (the `using OAuth account '<name>'` line anchored to the
     /// lock's `sweep_id`), so `status` shows the account, not `unknown`.
@@ -10560,6 +11601,40 @@ exit 0
     }
 
     #[test]
+    fn terminal_result_parser_is_anchored_strict_and_provider_aware() {
+        let log = "\
+sweep_id=old
+# LOOM_TERMINAL_RESULT v=1 provider=codex account=stale category=TOKEN_EXPIRED exit_code=1
+sweep_id=current
+# LOOM_TERMINAL_RESULT v=1 provider=codex account=profile-a category=TOKEN_EXHAUSTED exit_code=42
+";
+        assert_eq!(
+            parse_terminal_result_after(log, "sweep_id=current"),
+            Some(TerminalResult {
+                provider: AccountProvider::Codex,
+                account: "profile-a".into(),
+                category: TerminalClassification::TokenExhausted,
+                exit_code: 42,
+            })
+        );
+        assert!(parse_terminal_result_after(
+            "sweep_id=current\n# LOOM_TERMINAL_RESULT v=9 provider=codex account=a category=SUCCESS exit_code=0",
+            "sweep_id=current"
+        )
+        .is_none());
+        assert!(parse_terminal_result_after(
+            "sweep_id=current\n# LOOM_TERMINAL_RESULT v=1 provider=codex account=unknown category=SUCCESS exit_code=0",
+            "sweep_id=current"
+        )
+        .is_none());
+        assert!(parse_terminal_result_after(
+            "sweep_id=current\n# LOOM_TERMINAL_RESULT v=1 provider=codex account=a category=BOGUS exit_code=1",
+            "sweep_id=current"
+        )
+        .is_none());
+    }
+
+    #[test]
     #[serial]
     fn reaper_interval_env_override() {
         // Serialized: this test mutates a process-wide env var.
@@ -10664,6 +11739,50 @@ exit 0
             parse_token_name_after(log, "sweep_id=sweep-issue-3780-abc").as_deref(),
             Some("agent3-2amlogic"),
         );
+    }
+
+    #[test]
+    fn neutral_observability_parser_is_current_dispatch_scoped() {
+        let log = "==== loom-daemon dispatch: old sweep_id=old ====\n\
+# LOOM_RUNTIME_RESOLVED runtime=claude\n# LOOM_ACCOUNT name=stale\n\
+==== loom-daemon dispatch: new sweep_id=new ====\n\
+# LOOM_RUNTIME_RESOLVED runtime=codex\n# LOOM_ACCOUNT name=codex-profile\n";
+        assert_eq!(parse_runtime_after(log, "sweep_id=new").as_deref(), Some("codex"));
+        assert_eq!(parse_token_name_after(log, "sweep_id=new").as_deref(), Some("codex-profile"));
+    }
+
+    #[test]
+    fn poll_observability_waits_for_current_account_after_stale_cli_start() {
+        let dir = tempdir().unwrap();
+        let log_path = dir.path().join("sweep.log");
+        let header_anchor = "sweep_id=current";
+        std::fs::write(
+            &log_path,
+            "==== loom-daemon dispatch: old sweep_id=old ====\n\
+# LOOM_CLI_START runtime=codex\n\
+==== loom-daemon dispatch: new sweep_id=current ====\n\
+# LOOM_RUNTIME_RESOLVED runtime=codex\n",
+        )
+        .unwrap();
+
+        let append_path = log_path.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            use std::io::Write;
+            let mut log = std::fs::OpenOptions::new()
+                .append(true)
+                .open(append_path)
+                .unwrap();
+            writeln!(log, "# LOOM_ACCOUNT name=current-profile").unwrap();
+        });
+        let mut child = Command::new("sleep").arg("1").spawn().unwrap();
+
+        let observed = poll_observability(&mut child, &log_path, header_anchor);
+
+        child.kill().ok();
+        child.wait().ok();
+        writer.join().unwrap();
+        assert_eq!(observed, ("current-profile".to_string(), "codex".to_string()));
     }
 
     #[test]
@@ -10772,6 +11891,7 @@ exit 0\n";
             kind: SweepKind::Issue(42),
             pid: 12_345,
             token_name: "agent-1.token".to_string(),
+            runtime: "unknown".into(),
             log_path: PathBuf::from(".loom/logs/sweep-issue-42.log"),
             idempotency_key: Some("operator-key".to_string()),
             started_at: chrono::DateTime::parse_from_rfc3339("2026-06-05T10:00:00Z")
@@ -10791,6 +11911,7 @@ exit 0\n";
             "kind": {"type": "Issue", "value": 42},
             "pid": 12_345,
             "token_name": "agent-1.token",
+            "runtime": "unknown",
             "log_path": ".loom/logs/sweep-issue-42.log",
             "idempotency_key": "operator-key",
             "started_at": "2026-06-05T10:00:00Z",
@@ -10824,6 +11945,7 @@ exit 0\n";
         // None (#[serde(default)]) and be omitted on re-serialization
         // (skip_serializing_if).
         assert_eq!(legacy.effort, None);
+        assert_eq!(legacy.runtime, "unknown");
         let reserialized = serde_json::to_value(&legacy).unwrap();
         assert!(
             reserialized.get("model").is_none(),
@@ -10884,6 +12006,7 @@ exit 0\n";
                 kind: SweepKind::Issue(42),
                 pid: 1234,
                 token_name: "agent-1.token".into(),
+                runtime: "unknown".into(),
                 log_path: registry.compute_log_path(42),
                 idempotency_key: None,
                 started_at: Utc::now(),
@@ -10924,6 +12047,7 @@ exit 0\n";
                 kind: SweepKind::Issue(99),
                 pid: 1,
                 token_name: "unknown".into(),
+                runtime: "unknown".into(),
                 log_path: log_path.clone(),
                 idempotency_key: None,
                 started_at: Utc::now(),
@@ -10983,6 +12107,7 @@ exit 0\n";
                 kind: SweepKind::Issue(11),
                 pid: 1,
                 token_name: "unknown".into(),
+                runtime: "unknown".into(),
                 log_path: registry.compute_log_path(11),
                 idempotency_key: None,
                 started_at: Utc::now(),
@@ -11026,6 +12151,7 @@ exit 0\n";
                 kind: SweepKind::Issue(22),
                 pid: 2_147_483_640, // ~i32::MAX, almost certainly dead
                 token_name: "unknown".into(),
+                runtime: "unknown".into(),
                 log_path: registry.compute_log_path(22),
                 idempotency_key: None,
                 started_at: Utc::now(),
@@ -11084,6 +12210,7 @@ exit 0\n";
                 kind: SweepKind::Issue(77),
                 pid,
                 token_name: "unknown".into(),
+                runtime: "unknown".into(),
                 log_path: registry.compute_log_path(77),
                 idempotency_key: None,
                 started_at: Utc::now(),
@@ -11161,6 +12288,7 @@ exit 0\n";
                     kind: SweepKind::Issue(880),
                     pid: target_pid,
                     token_name: "unknown".into(),
+                    runtime: "unknown".into(),
                     log_path: target_log,
                     idempotency_key: None,
                     started_at: Utc::now(),
@@ -11180,6 +12308,7 @@ exit 0\n";
                     kind: SweepKind::Issue(881),
                     pid: 2_147_483_640, // ~i32::MAX, harmless dead pid
                     token_name: "unknown".into(),
+                    runtime: "unknown".into(),
                     log_path: other_log,
                     idempotency_key: None,
                     started_at: Utc::now(),
@@ -11274,6 +12403,7 @@ exit 0\n";
                 kind: SweepKind::Issue(88),
                 pid: 2_147_483_640,
                 token_name: "unknown".into(),
+                runtime: "unknown".into(),
                 log_path: registry.compute_log_path(88),
                 idempotency_key: None,
                 started_at: Utc::now(),
@@ -11722,6 +12852,17 @@ exit 0\n";
     }
 
     #[test]
+    fn log_has_progress_ignores_codex_adapter_preamble() {
+        let log = "==== loom-daemon dispatch: t sweep_id=s issue=7 ====\n\
+# LOOM_RUNTIME_RESOLVED runtime=codex\n\
+[ts] spawn-worker: runtime=codex\n\
+[ts] spawn-codex: model=default\n\
+# LOOM_ACCOUNT name=profile-a\n";
+        assert!(!log_has_progress(log));
+        assert!(log_has_progress(&format!("{log}# LOOM_CLI_START runtime=codex\n")));
+    }
+
+    #[test]
     fn log_has_progress_true_when_claude_emits_output() {
         let log = "\n==== loom-daemon dispatch: 2026-07-23T00:00:00Z sweep_id=sweep-issue-1-1 issue=1 ====\n\
                    [2026-07-23T00:00:01Z] spawn-claude: using OAuth account 'agent-2' (mode=ranked)\n\
@@ -11791,26 +12932,75 @@ exit 0\n";
     #[test]
     fn midbuild_decision_no_dirty_worktree_is_healthy() {
         // No dirty worktree ⇒ nothing to recover, regardless of retry state.
-        assert_eq!(midbuild_decision(false, false, false), MidbuildDecision::Healthy);
-        assert_eq!(midbuild_decision(false, false, true), MidbuildDecision::Healthy);
+        assert_eq!(midbuild_decision(false, false, false, false), MidbuildDecision::Healthy);
+        assert_eq!(midbuild_decision(false, false, true, false), MidbuildDecision::Healthy);
     }
 
     #[test]
     fn midbuild_decision_produced_pr_is_healthy() {
         // A dead sweep that produced a PR is a completed Builder, not a
         // mid-build death — never recovered even with a dirty worktree.
-        assert_eq!(midbuild_decision(true, true, false), MidbuildDecision::Healthy);
+        assert_eq!(midbuild_decision(true, true, false, false), MidbuildDecision::Healthy);
     }
 
     #[test]
     fn midbuild_decision_dirty_no_pr_first_time_recovers() {
-        assert_eq!(midbuild_decision(true, false, false), MidbuildDecision::Recover);
+        assert_eq!(midbuild_decision(true, false, false, false), MidbuildDecision::Recover);
     }
 
     #[test]
     fn midbuild_decision_dirty_no_pr_after_retry_gives_up() {
         // Bounded: a second mid-build death gives up (never loops).
-        assert_eq!(midbuild_decision(true, false, true), MidbuildDecision::GiveUp);
+        assert_eq!(midbuild_decision(true, false, true, false), MidbuildDecision::GiveUp);
+    }
+
+    #[test]
+    fn midbuild_decision_in_use_worktree_is_never_recovered() {
+        // #4449: a live holder vetoes the destructive path, and the veto sits
+        // ABOVE the retry bookkeeping — it must win over both Recover and
+        // GiveUp so a refusal never consumes the single recovery retry.
+        assert_eq!(midbuild_decision(true, false, false, true), MidbuildDecision::InUse);
+        assert_eq!(midbuild_decision(true, false, true, true), MidbuildDecision::InUse);
+    }
+
+    #[test]
+    fn midbuild_decision_in_use_is_irrelevant_when_not_dirty_or_pr_exists() {
+        // The in-use flag must not manufacture work: a clean worktree or a
+        // produced PR is still Healthy even while a session holds the worktree.
+        assert_eq!(midbuild_decision(false, false, false, true), MidbuildDecision::Healthy);
+        assert_eq!(midbuild_decision(true, true, false, true), MidbuildDecision::Healthy);
+    }
+
+    // --- #4449 helpers: truncate_lines / describe_worktree_use ---
+
+    #[test]
+    fn truncate_lines_keeps_short_input_and_caps_long_input() {
+        assert_eq!(truncate_lines("", 5), "");
+        assert_eq!(truncate_lines("   \n  ", 5), "");
+        assert_eq!(truncate_lines("a\nb", 5), "a\nb");
+        let long = (1..=10)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let capped = truncate_lines(&long, 3);
+        assert!(capped.starts_with("1\n2\n3"), "keeps the first `max` lines: {capped}");
+        assert!(capped.contains("+7 more"), "reports how many lines were dropped: {capped}");
+    }
+
+    #[test]
+    fn describe_worktree_use_joins_every_signal() {
+        let described = describe_worktree_use(&[
+            WorktreeUseEvidence::InUseMarker {
+                task_id: "t1".into(),
+                pid: "42".into(),
+            },
+            WorktreeUseEvidence::LiveProcesses(vec![7, 9]),
+        ]);
+        assert!(described.contains(".loom-in-use"), "{described}");
+        assert!(described.contains("pid: 42"), "{described}");
+        assert!(described.contains("[7, 9]"), "{described}");
+        assert!(described.contains("; "), "signals are joined: {described}");
+        assert_eq!(describe_worktree_use(&[]), "");
     }
 
     // --- ranking_has_capacity token-health gate ---
@@ -11888,6 +13078,7 @@ exit 0\n";
                 kind: SweepKind::Issue(issue),
                 pid: 2_147_483_640,
                 token_name: "unknown".into(),
+                runtime: "unknown".into(),
                 log_path: reg.compute_log_path(issue),
                 idempotency_key: None,
                 started_at: Utc::now(),
@@ -12047,6 +13238,195 @@ exit 0\n";
         );
     }
 
+    // --- #4449: the live-use veto on the destructive recovery path -----------
+
+    /// Assert the watchdog refused to touch issue `N`'s dirty worktree: nothing
+    /// recovered, the uncommitted edit still on disk, and — critically — the
+    /// single recovery retry NOT consumed (the worktree may be free later).
+    fn assert_midbuild_refused(reg: &mut SweepRegistry, ws: &Path, issue: u32, why: &str) {
+        assert_eq!(reg.midbuild_watchdog_once(), 0, "no recovery when {why}");
+        assert!(
+            ws.join(format!(".loom/worktrees/issue-{issue}/dirty.txt"))
+                .exists(),
+            "uncommitted work MUST survive when {why} (#4449)"
+        );
+        assert!(
+            !reg.midbuild_retried.contains(&issue),
+            "a refusal must NOT consume the single recovery retry when {why}"
+        );
+        assert!(
+            reg.midbuild_inuse.contains(&issue),
+            "the refusal is recorded (and logged once) when {why}"
+        );
+    }
+
+    #[test]
+    fn midbuild_refuses_to_wipe_worktree_held_by_in_use_marker() {
+        // The #4449 incident shape: the daemon's tracked sweep really did die
+        // (terminal, no PR) but a SEPARATE live session is still using the
+        // worktree. A `.loom-in-use` marker is the explicit form of that signal.
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let (mut reg, _rec) = fixture_registry(ws);
+
+        let wt = make_dirty_git_worktree(ws, 6101);
+        insert_terminal_issue(&mut reg, "sweep-issue-6101-dead", 6101, None);
+        std::fs::write(
+            wt.join(".loom-in-use"),
+            r#"{"shepherd_task_id": "recovery-doctor", "pid": 4321}"#,
+        )
+        .unwrap();
+
+        assert!(!reg.worktree_in_use(6101).is_empty(), "marker is detected as a live holder");
+        assert_midbuild_refused(&mut reg, ws, 6101, "a .loom-in-use marker names a live session");
+
+        // Once the holder releases the worktree, the legitimate dead-sweep
+        // recovery still works — the veto defers, it does not disable.
+        std::fs::remove_file(wt.join(".loom-in-use")).unwrap();
+        assert_eq!(reg.midbuild_watchdog_once(), 1, "recovery resumes once the holder releases");
+        assert!(reg.midbuild_retried.contains(&6101));
+        assert!(!reg.midbuild_inuse.contains(&6101), "the log-once latch is cleared");
+        assert!(!wt.join("dirty.txt").exists(), "worktree cleaned on the real recovery");
+    }
+
+    #[test]
+    fn midbuild_refuses_to_wipe_worktree_with_git_operation_in_flight() {
+        // The precise window #4449 lost work in: a `git commit` was mid-write,
+        // so git held index.lock. Never reset a worktree in that state.
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let (mut reg, _rec) = fixture_registry(ws);
+
+        let wt = make_dirty_git_worktree(ws, 6102);
+        insert_terminal_issue(&mut reg, "sweep-issue-6102-dead", 6102, None);
+        let index_lock =
+            git_index_lock_path(&wt).expect("index.lock path resolves for a real repo");
+        std::fs::write(&index_lock, "").unwrap();
+
+        assert_midbuild_refused(&mut reg, ws, 6102, "a git index.lock write is in flight");
+
+        // Committing finishes (lock released) ⇒ recovery is available again.
+        std::fs::remove_file(&index_lock).unwrap();
+        assert_eq!(reg.midbuild_watchdog_once(), 1, "recovery resumes once index.lock clears");
+    }
+
+    #[test]
+    fn midbuild_refuses_to_wipe_worktree_with_live_claim_lock_owner() {
+        // A claim-lock whose owner PID is ALIVE means some session (daemon or
+        // not) still owns this issue — never reset its worktree underneath it.
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let (mut reg, _rec) = fixture_registry(ws);
+
+        make_dirty_git_worktree(ws, 6103);
+        insert_terminal_issue(&mut reg, "sweep-issue-6103-dead", 6103, None);
+        let lock = reg.config.locks_dir().join("issue-6103");
+        std::fs::create_dir_all(&lock).unwrap();
+        // Our own PID is trivially alive — stands in for the live holder.
+        std::fs::write(
+            lock.join("owner.json"),
+            format!(
+                r#"{{"issue": 6103, "owner_pid": {}, "acquired_at": "{}", "sweep_id": "manual-session"}}"#,
+                std::process::id(),
+                Utc::now().to_rfc3339()
+            ),
+        )
+        .unwrap();
+
+        assert_midbuild_refused(
+            &mut reg,
+            ws,
+            6103,
+            "a live claim-lock owner still holds the issue",
+        );
+    }
+
+    #[test]
+    fn midbuild_ignores_stale_claim_lock_with_dead_owner() {
+        // The inverse guard: the dead sweep's OWN claim-lock, left behind
+        // because the reaper never released it, must not wedge the legitimate
+        // dead-sweep recovery path forever.
+        //
+        // The lock's `sweep_id` is deliberately the dead entry's own id. A lock
+        // naming a *different* sweep is a separate, pre-existing refusal
+        // (`lock_owned_by_other`, #4463: a newer sweep superseded this one) that
+        // fails closed on the id comparison alone and is covered by its own
+        // tests. This test isolates the #4449 live-use veto: a dead owner PID is
+        // not live-use evidence, so recovery proceeds.
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let (mut reg, _rec) = fixture_registry(ws);
+
+        make_dirty_git_worktree(ws, 6104);
+        insert_terminal_issue(&mut reg, "sweep-issue-6104-dead", 6104, None);
+        let lock = reg.config.locks_dir().join("issue-6104");
+        std::fs::create_dir_all(&lock).unwrap();
+        std::fs::write(
+            lock.join("owner.json"),
+            format!(
+                r#"{{"issue": 6104, "owner_pid": 2147483640, "acquired_at": "{}", "sweep_id": "sweep-issue-6104-dead"}}"#,
+                Utc::now().to_rfc3339()
+            ),
+        )
+        .unwrap();
+
+        assert!(
+            reg.worktree_in_use(6104).is_empty(),
+            "a dead owner's lock is not live-use evidence"
+        );
+        assert_eq!(reg.midbuild_watchdog_once(), 1, "a stale lock does not block recovery");
+        assert!(!ws.join(".loom/worktrees/issue-6104/dirty.txt").exists());
+    }
+
+    #[test]
+    fn midbuild_refuses_to_wipe_worktree_with_live_process_cwd_inside() {
+        // The signal that would have saved the #4449 session with no cooperation
+        // from it at all: a live process whose cwd is inside the worktree.
+        // `find_processes_using_directory` degrades to an empty list on hosts
+        // where it cannot probe (no /proc, no lsof), so self-skip there rather
+        // than assert something the host cannot express.
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let (mut reg, _rec) = fixture_registry(ws);
+
+        let wt = make_dirty_git_worktree(ws, 6105);
+        insert_terminal_issue(&mut reg, "sweep-issue-6105-dead", 6105, None);
+
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .current_dir(&wt)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn a live process with cwd inside the worktree");
+
+        // The child's `chdir` happens after `fork`, so poll briefly rather than
+        // read the probe once and race it.
+        let mut detected = Vec::new();
+        for _ in 0..40 {
+            detected = crate::worktree_ops::safety::find_processes_using_directory(&wt);
+            if !detected.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if detected.is_empty() {
+            // Probe unavailable on this host — nothing to assert; don't leak.
+            let _ = child.kill();
+            let _ = child.wait();
+            return;
+        }
+        assert!(
+            detected.contains(&child.id()),
+            "the probe found the spawned holder: {detected:?}"
+        );
+
+        assert_midbuild_refused(&mut reg, ws, 6105, "a live process has its cwd in the worktree");
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
     #[test]
     fn midbuild_ignores_running_sweeps() {
         let tmp = tempdir().unwrap();
@@ -12063,6 +13443,7 @@ exit 0\n";
                 kind: SweepKind::Issue(6006),
                 pid: 2_147_483_640,
                 token_name: "unknown".into(),
+                runtime: "unknown".into(),
                 log_path: reg.compute_log_path(6006),
                 idempotency_key: None,
                 started_at: Utc::now(),
@@ -12392,6 +13773,7 @@ exit 0\n";
                 kind: SweepKind::Issue(6001),
                 pid: 2_147_483_640,
                 token_name: "unknown".into(),
+                runtime: "unknown".into(),
                 log_path: ws.join(".loom/logs/sweep-issue-6001.log"),
                 idempotency_key: None,
                 started_at: old,
@@ -12951,7 +14333,405 @@ exit 0\n";
         );
     }
 
+    // --- park-label dispatch guard (Issue #4444) ---
+
+    /// Install a fake `gh` for the park-label guard (step 2.7):
+    ///
+    /// - `issue view --json state` reports `OPEN` (so the 2.5 closed-issue guard
+    ///   passes) and `issue view --json labels` reports whether `loom:blocked` is
+    ///   present (so the reap path's `issue_has_blocked_label` — still used by
+    ///   `restore_label_to_ready` — behaves faithfully);
+    /// - `api graphql` prints `graphql_pr` (the post-`--jq` open linked PR
+    ///   number, empty for none) so the 2.6 open-PR guard can be steered;
+    /// - `api repos/<owner>/<repo>/issues/<n>` prints `rest_labels`
+    ///   (whitespace-separated label names, one per output line) and exits
+    ///   `rest_exit` — the REST probe the new guard consults;
+    /// - `repo view` resolves the owner/repo.
+    ///
+    /// Every invocation is logged so a test can assert which probes ran.
+    fn park_guard_registry(
+        ws: &Path,
+        rest_labels: &str,
+        rest_exit: i32,
+        graphql_pr: &str,
+        skip_label_flip: bool,
+    ) -> (SweepRegistry, PathBuf) {
+        let gh_log = ws.join("gh-invocations.log");
+        let fake_gh = ws.join("fake-gh.sh");
+        let blocked = rest_labels.split_whitespace().any(|l| l == "loom:blocked");
+        let script = format!(
+            "#!/usr/bin/env bash\n\
+             printf '%s\\n' \"$*\" >> \"{log}\"\n\
+             if [[ \"$1\" == \"issue\" && \"$2\" == \"view\" ]]; then\n\
+             if [[ \"$*\" == *labels* ]]; then printf '%s\\n' \"{blocked}\"; \
+             else printf 'OPEN\\n'; fi\n\
+             exit 0\n\
+             fi\n\
+             if [[ \"$1\" == \"api\" && \"$2\" == \"graphql\" ]]; then\n\
+             printf '%s\\n' \"{gql}\"\n\
+             exit 0\n\
+             fi\n\
+             if [[ \"$1\" == \"api\" && \"$2\" == repos/* ]]; then\n\
+             printf '%s\\n' {labels}\n\
+             exit {rest_exit}\n\
+             fi\n\
+             if [[ \"$1\" == \"repo\" && \"$2\" == \"view\" ]]; then\n\
+             printf 'rjwalters/loom\\n'\n\
+             exit 0\n\
+             fi\n\
+             exit 0\n",
+            log = gh_log.display(),
+            blocked = blocked,
+            gql = graphql_pr,
+            labels = rest_labels,
+            rest_exit = rest_exit,
+        );
+        std::fs::write(&fake_gh, &script).unwrap();
+        let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_gh, perms).unwrap();
+        if let Ok(f) = std::fs::File::open(&fake_gh) {
+            let _ = f.sync_all();
+        }
+
+        let scripts_dir = ws.join(".loom").join("scripts");
+        std::fs::create_dir_all(&scripts_dir).unwrap();
+        let spawn = scripts_dir.join("spawn-claude.sh");
+        std::fs::write(&spawn, "#!/usr/bin/env bash\necho spawned\nexit 0\n").unwrap();
+        let mut sperms = std::fs::metadata(&spawn).unwrap().permissions();
+        sperms.set_mode(0o755);
+        std::fs::set_permissions(&spawn, sperms).unwrap();
+        if let Ok(f) = std::fs::File::open(&spawn) {
+            let _ = f.sync_all();
+        }
+        touch_sweep_command(ws);
+
+        let mut config = SweepRegistryConfig::new(ws.to_path_buf());
+        config.spawn_bin = Some(spawn);
+        config.gh_bin = Some(fake_gh);
+        config.skip_label_flip = skip_label_flip;
+        config.journal_path = Some(ws.join("test-sweeps-journal.json"));
+        (SweepRegistry::new(config), gh_log)
+    }
+
+    /// AC: `dispatch` for an issue carrying `loom:blocked` is refused with the
+    /// typed [`ParkedIssueDispatchError`], and it must NOT acquire the claim lock
+    /// or flip any labels — a deliberate park must survive every dispatch route.
+    /// The probe rides the REST bucket (`gh api repos/.../issues/N`), not
+    /// GraphQL.
+    #[test]
+    #[serial]
+    fn dispatch_refuses_blocked_issue_without_flipping_labels() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::set_var("LOOM_REPO", "rjwalters/loom");
+        let (mut reg, gh_log) = park_guard_registry(ws, "loom:blocked", 0, "", false);
+
+        let err = reg
+            .dispatch(&SweepKind::Issue(4444), None, None, None, None)
+            .expect_err("a parked issue must be refused");
+        let typed = err
+            .downcast_ref::<ParkedIssueDispatchError>()
+            .expect("refusal must carry the typed ParkedIssueDispatchError");
+        assert_eq!(typed.issue, 4444);
+        assert_eq!(typed.label, "loom:blocked");
+
+        let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            calls.contains("api repos/rjwalters/loom/issues/4444"),
+            "the guard must probe labels over REST, not GraphQL; got: {calls:?}"
+        );
+        assert!(
+            !calls.contains("issue edit"),
+            "no label flip on a refused dispatch; got: {calls:?}"
+        );
+        assert!(running_issue_sweep_id(&reg, 4444).is_none(), "no lock, no entry");
+        std::env::remove_var("LOOM_REPO");
+    }
+
+    /// AC: `loom:operator-only` is the second park label and refuses identically
+    /// — the daemon must never dispatch work a human has claimed for themselves.
+    #[test]
+    #[serial]
+    fn dispatch_refuses_operator_only_issue() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::set_var("LOOM_REPO", "rjwalters/loom");
+        let (mut reg, _gh_log) = park_guard_registry(ws, "loom:operator-only", 0, "", false);
+
+        let err = reg
+            .dispatch(&SweepKind::Issue(4445), None, None, None, None)
+            .expect_err("an operator-only issue must be refused");
+        let typed = err
+            .downcast_ref::<ParkedIssueDispatchError>()
+            .expect("refusal must carry the typed ParkedIssueDispatchError");
+        assert_eq!(typed.label, "loom:operator-only");
+        assert!(running_issue_sweep_id(&reg, 4445).is_none());
+        std::env::remove_var("LOOM_REPO");
+    }
+
+    /// AC (the load-bearing exclusion): `loom:building` ALONE must NOT refuse.
+    /// It is legitimately present on the daemon's own in-flight claim, so a guard
+    /// keyed on the full `SKIP_LABELS` set would break the review-stall
+    /// watchdog's cancel-and-re-dispatch and the reaper's checkpoint-resume.
+    #[test]
+    #[serial]
+    fn dispatch_park_guard_allows_building_label_alone() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::set_var("LOOM_REPO", "rjwalters/loom");
+        let (mut reg, gh_log) = park_guard_registry(ws, "loom:building loom:curated", 0, "", false);
+
+        let out = reg
+            .dispatch(&SweepKind::Issue(4446), None, None, None, None)
+            .expect("loom:building alone must never refuse dispatch");
+        assert!(wait_until_dead(out.pid, FIXTURE_CHILD_WAIT_MS));
+
+        let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            calls.contains("api repos/rjwalters/loom/issues/4446"),
+            "the guard still probed; it just did not refuse; got: {calls:?}"
+        );
+        assert!(
+            calls.contains("issue edit 4446"),
+            "dispatch proceeded to the label flip; got: {calls:?}"
+        );
+        if let Some(id) = running_issue_sweep_id(&reg, 4446) {
+            let _ = reg.cancel(&id, Duration::from_secs(2));
+        }
+        std::env::remove_var("LOOM_REPO");
+    }
+
+    /// AC (fail-open, the single most safety-critical property): a forge error on
+    /// the REST label probe (non-zero `gh api`) must NOT wedge dispatch — the
+    /// probe returns `None` and dispatch proceeds to spawn + label flip, exactly
+    /// like the 2.5/2.6 guards.
+    #[test]
+    #[serial]
+    fn dispatch_fails_open_when_park_label_probe_errors() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::set_var("LOOM_REPO", "rjwalters/loom");
+        // The park label IS present, but the probe fails ⇒ unknown ⇒ fail open.
+        let (mut reg, gh_log) = park_guard_registry(ws, "loom:blocked", 1, "", false);
+
+        let out = reg
+            .dispatch(&SweepKind::Issue(4447), None, None, None, None)
+            .expect("a gh outage on the park probe must not wedge dispatch (fail-open)");
+        assert!(wait_until_dead(out.pid, FIXTURE_CHILD_WAIT_MS));
+
+        let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            calls.contains("api repos/rjwalters/loom/issues/4447"),
+            "the guard attempted the REST probe; got: {calls:?}"
+        );
+        assert!(
+            calls.contains("issue edit 4447"),
+            "dispatch proceeded to the label flip after failing open; got: {calls:?}"
+        );
+        if let Some(id) = running_issue_sweep_id(&reg, 4447) {
+            let _ = reg.cancel(&id, Duration::from_secs(2));
+        }
+        std::env::remove_var("LOOM_REPO");
+    }
+
+    /// AC: `skip_label_flip = true` (test fixtures without `gh` credentials)
+    /// never attempts the probe at all — not even the REST call — mirroring the
+    /// 2.5/2.6 skip condition.
+    #[test]
+    #[serial]
+    fn dispatch_skip_label_flip_bypasses_park_guard() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::set_var("LOOM_REPO", "rjwalters/loom");
+        let (mut reg, gh_log) = park_guard_registry(ws, "loom:blocked", 0, "", true);
+
+        let out = reg
+            .dispatch(&SweepKind::Issue(4448), None, None, None, None)
+            .expect("skip_label_flip must bypass the park guard entirely");
+        assert!(wait_until_dead(out.pid, FIXTURE_CHILD_WAIT_MS));
+
+        let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            !calls.contains("api repos/"),
+            "no forge call at all when label flips are disabled; got: {calls:?}"
+        );
+        if let Some(id) = running_issue_sweep_id(&reg, 4448) {
+            let _ = reg.cancel(&id, Duration::from_secs(2));
+        }
+        std::env::remove_var("LOOM_REPO");
+    }
+
+    /// Guard ordering: 2.6 (open-PR) runs before 2.7 (park label), so an ordinary
+    /// dispatch of a parked issue that ALSO has an open PR is attributed to the
+    /// cheaper-to-explain open-PR refusal and never pays for the REST probe.
+    #[test]
+    #[serial]
+    fn open_pr_guard_fires_before_park_guard() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::set_var("LOOM_REPO", "rjwalters/loom");
+        let (mut reg, gh_log) = park_guard_registry(ws, "loom:blocked", 0, "4500", false);
+
+        let err = reg
+            .dispatch(&SweepKind::Issue(4449), None, None, None, None)
+            .expect_err("an issue with an open linked PR must be refused");
+        assert!(
+            err.downcast_ref::<OpenPrDispatchError>().is_some(),
+            "the 2.6 open-PR guard wins for an ordinary dispatch; got: {err}"
+        );
+        let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            !calls.contains("api repos/"),
+            "the 2.7 REST probe must not run once 2.6 refuses; got: {calls:?}"
+        );
+        std::env::remove_var("LOOM_REPO");
+    }
+
+    /// THE CORE REGRESSION (#4444): a checkpoint-resume dispatch — which
+    /// deliberately bypasses the 2.6 open-PR guard for its OWN PR — must still be
+    /// refused by the 2.7 park guard when the issue was parked after the crash.
+    /// This is the path that overrode a `loom:blocked` park on #4366.
+    ///
+    /// The refusal must be failure-visible, not silent: the reaper still emits
+    /// `SweepResumeDispatched { dispatched: false }` (and logs the refusal, whose
+    /// message names the park label), and no fresh `Running` entry is created.
+    #[tokio::test]
+    #[serial]
+    async fn reaper_resume_refused_when_issue_parked_after_crash() {
+        use crate::event_bus::EventBus;
+
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::set_var("LOOM_REPO", "rjwalters/loom");
+        // Open linked PR #4501 (so the resume path engages and the 2.6 bypass
+        // matches) AND a `loom:blocked` park applied after the crash.
+        let (mut reg, gh_log) = park_guard_registry(ws, "loom:blocked", 0, "4501", false);
+        let bus = Arc::new(EventBus::new());
+        reg.set_event_bus(bus.clone());
+        let mut sub = bus.subscribe::<[&str; 0], &str>([]);
+
+        write_checkpoint(&reg, 4366, "builder-done");
+        insert_dead_running_entry(&mut reg, 4366, "sweep-issue-4366-crashed");
+
+        let changed = reg.reap_once();
+        assert!(changed >= 1);
+
+        let mut saw_resume_false = false;
+        for _ in 0..8 {
+            let Ok(ev) = tokio::time::timeout(Duration::from_secs(5), sub.recv()).await else {
+                break;
+            };
+            if let Event::SweepResumeDispatched {
+                issue,
+                pr,
+                dispatched,
+                ..
+            } = ev.unwrap()
+            {
+                assert_eq!(issue, 4366);
+                assert_eq!(pr, 4501);
+                assert!(
+                    !dispatched,
+                    "a park applied after the crash must refuse the resume dispatch"
+                );
+                saw_resume_false = true;
+            }
+        }
+        assert!(
+            saw_resume_false,
+            "the park refusal must stay failure-visible on the resume path (not silent)"
+        );
+
+        assert!(
+            running_issue_sweep_id(&reg, 4366).is_none(),
+            "a refused resume must not create a fresh Running entry"
+        );
+        let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            calls.contains("api repos/rjwalters/loom/issues/4366"),
+            "the resume dispatch went through the central 2.7 REST probe; got: {calls:?}"
+        );
+        assert_eq!(
+            calls
+                .lines()
+                .filter(|l| l.contains("api repos/rjwalters/loom/issues/4366"))
+                .count(),
+            1,
+            "exactly ONE park-label probe per resume dispatch (deduped with the old \
+             call-site-only check); got: {calls:?}"
+        );
+        // The park survives: the crash-path restore removed the stale claim but
+        // did NOT re-add `loom:issue` (#4206), and no fresh claim was flipped on.
+        assert!(
+            !calls.contains("--add-label loom:issue"),
+            "the operator's park must not be clobbered back to loom:issue; got: {calls:?}"
+        );
+        std::env::remove_var("LOOM_REPO");
+    }
+
+    /// Companion to the test above: with the SAME fixture but no park label, the
+    /// resume dispatch succeeds — proving the refusal above is caused by the park
+    /// label and not by some other property of the fixture.
+    #[tokio::test]
+    #[serial]
+    async fn reaper_resume_succeeds_when_issue_not_parked() {
+        use crate::event_bus::EventBus;
+
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::set_var("LOOM_REPO", "rjwalters/loom");
+        let (mut reg, _gh_log) = park_guard_registry(ws, "loom:curated", 0, "4502", false);
+        let bus = Arc::new(EventBus::new());
+        reg.set_event_bus(bus.clone());
+        let mut sub = bus.subscribe::<[&str; 0], &str>([]);
+
+        write_checkpoint(&reg, 4367, "builder-done");
+        insert_dead_running_entry(&mut reg, 4367, "sweep-issue-4367-crashed");
+
+        let changed = reg.reap_once();
+        assert!(changed >= 1);
+
+        let mut saw_resume_true = false;
+        for _ in 0..8 {
+            let Ok(ev) = tokio::time::timeout(Duration::from_secs(5), sub.recv()).await else {
+                break;
+            };
+            if let Event::SweepResumeDispatched { dispatched, .. } = ev.unwrap() {
+                assert!(dispatched, "an unparked issue must still resume normally");
+                saw_resume_true = true;
+            }
+        }
+        assert!(saw_resume_true, "expected a successful resume dispatch");
+        assert!(running_issue_sweep_id(&reg, 4367).is_some());
+        std::env::remove_var("LOOM_REPO");
+    }
+
     // --- reaper-driven resume (Issue #4256) ---
+
+    /// Write a `.loom/locks/issue-<N>/owner.json` for `issue` claimed by
+    /// `sweep_id` with `owner_pid` (Issue #4463 test fixture). Returns the lock
+    /// dir path so callers can assert on its survival.
+    fn write_lock_owner(
+        reg: &SweepRegistry,
+        issue: u32,
+        sweep_id: &str,
+        owner_pid: u32,
+    ) -> PathBuf {
+        let locks = reg.config.locks_dir();
+        std::fs::create_dir_all(&locks).unwrap();
+        let lock = locks.join(format!("issue-{issue}"));
+        std::fs::create_dir_all(&lock).unwrap();
+        let owner = LockOwner {
+            issue,
+            owner_pid,
+            acquired_at: Utc::now().to_rfc3339(),
+            sweep_id: sweep_id.to_string(),
+        };
+        std::fs::write(lock.join("owner.json"), serde_json::to_string_pretty(&owner).unwrap())
+            .unwrap();
+        lock
+    }
 
     /// Write a `sweep-checkpoint.sh`-style checkpoint file for `issue` with
     /// `phase`, matching the on-disk shape `read_checkpoint_phase` parses.
@@ -12977,6 +14757,7 @@ exit 0\n";
                 kind: SweepKind::Issue(issue),
                 pid: 2_147_483_641,
                 token_name: "unknown".into(),
+                runtime: "unknown".into(),
                 log_path: reg.compute_log_path(issue),
                 idempotency_key: None,
                 started_at: Utc::now() - chrono::Duration::seconds(5),
@@ -13059,6 +14840,90 @@ exit 0\n";
             calls.contains("issue edit 4256") && calls.contains("loom:building"),
             "the resume dispatch must flip the label like an ordinary dispatch; got: {calls:?}"
         );
+        std::env::remove_var("LOOM_REPO");
+    }
+
+    /// Core regression (Issue #4463, Test Plan item 1): reaping an OLD dead
+    /// sweep for issue N while a NEWER live sweep owns N's lock must (a) leave
+    /// the lock intact and (b) fire NO resume dispatch — even though the
+    /// checkpoint phase (`builder-done`) and an open linked PR would otherwise
+    /// make this exactly the resume-eligible case. Without the ownership gate,
+    /// the reaper would delete the live sweep's lock and re-dispatch a second
+    /// sweep into the same worktree (the 43s-apart double-dispatch incident).
+    #[test]
+    #[serial]
+    fn reap_dead_sweep_preserves_newer_sweep_lock_and_skips_resume() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::set_var("LOOM_REPO", "rjwalters/loom");
+        // graphql returns a PR ⇒ `first_open_linked_pr` WOULD report one, so the
+        // ONLY thing that can prevent a resume dispatch is the #4463 gate.
+        let (mut reg, gh_log) = open_pr_guard_registry(ws, "9300", 0, false);
+
+        // A newer, still-live sweep B owns the issue lock (our own PID ⇒ alive).
+        let lock = write_lock_owner(&reg, 9256, "sweep-issue-9256-newer", std::process::id());
+        reg.entries.insert(
+            "sweep-issue-9256-newer".to_string(),
+            SweepInfo {
+                sweep_id: "sweep-issue-9256-newer".to_string(),
+                kind: SweepKind::Issue(9256),
+                pid: std::process::id(), // alive
+                token_name: "unknown".into(),
+                runtime: "unknown".into(),
+                log_path: reg.compute_log_path(9256),
+                idempotency_key: None,
+                started_at: Utc::now(),
+                state: SweepState::Running,
+                latest_phase: None,
+                pr_number: None,
+                model: None,
+                effort: None,
+                depends_on: None,
+                repo: None,
+            },
+        );
+
+        // A resume-eligible checkpoint + the OLD dead sweep A that lost the lock.
+        write_checkpoint(&reg, 9256, "builder-done");
+        insert_dead_running_entry(&mut reg, 9256, "sweep-issue-9256-dead");
+
+        let before = reg.entries.len();
+        reg.reap_once();
+
+        // (a) The live sweep's lock is intact and still owned by sweep B.
+        assert!(
+            lock.exists(),
+            "a newer live sweep's lock must survive reaping the old dead sweep"
+        );
+        let owner: LockOwner =
+            serde_json::from_str(&std::fs::read_to_string(lock.join("owner.json")).unwrap())
+                .unwrap();
+        assert_eq!(owner.sweep_id, "sweep-issue-9256-newer");
+
+        // (b) No resume: the superseded gate short-circuits BEFORE the open-PR
+        // probe and BEFORE any label flip, and creates no fresh entry.
+        let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            !calls.contains("api graphql"),
+            "a superseded reap must not probe for a resume PR; got: {calls:?}"
+        );
+        assert!(
+            !calls.contains("issue edit"),
+            "a superseded reap must not flip or restore any label; got: {calls:?}"
+        );
+        assert_eq!(
+            reg.entries.len(),
+            before,
+            "no new sweep entry may be dispatched on a superseded reap"
+        );
+
+        // Exactly one live sweep remains (sweep B); sweep A is terminal.
+        assert!(matches!(
+            reg.get("sweep-issue-9256-dead").unwrap().state,
+            SweepState::Crashed { .. }
+        ));
+        assert!(matches!(reg.get("sweep-issue-9256-newer").unwrap().state, SweepState::Running));
+
         std::env::remove_var("LOOM_REPO");
     }
 

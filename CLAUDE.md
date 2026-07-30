@@ -253,6 +253,7 @@ Configuration lives in `.loom/config.json` (committed for team sharing): a
 - **MCP hooks** — the unified `mcp-loom` server is registered once per machine at
   user scope (`scripts/install-loom.sh`, refreshed by `loom update`); `setup-mcp.sh`
   is demoted to a bundle-rebuild/legacy-migration tool. See the mcp-loom README.
+- **Fleet dashboard** (`loom-daemon serve`, opt-in, read-only, loopback by default): [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md) §Fleet dashboard.
 
 ### Multi-Account Token Pool (operating summary)
 

@@ -80,7 +80,7 @@ loom/
 ├── loom-daemon/            # Rust daemon (terminal management, orchestration)
 ├── loom-api/               # Rust shared types and protocol definitions
 ├── mcp-loom/               # Unified MCP server (TypeScript)
-├── loom-tools/             # Python tools (loom-tokens, loom-claim, loom-checkpoint, etc.)
+├── loom-tools/             # Python tools (loom-tokens, loom-search)
 ├── .loom/                  # Workspace config and agent roles
 ├── defaults/               # Default configuration templates
 ├── docs/                   # Documentation

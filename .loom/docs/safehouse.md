@@ -18,10 +18,13 @@ below.
 > **Out of scope** (tracked separately): per-worker personas (`loom_builder_42`)
 > and `SAFEHOUSE_PERSONA` forwarding to workers → **#3999**; inbound **human**
 > steering (reading `@`-mentions back to agents) → follow-up (it reuses the same
-> inbound read task #4028 adds); cloud-host provisioning of `safehoused` →
-> **#3998**; carrying the judge verdict value in an event payload (needs a
-> frozen-taxonomy amendment) → follow-up; the **atomic cross-host claim
-> authority** (a real CAS behind the soft claim) → Phase 2 of #4028.
+> inbound read task #4028 adds); carrying the judge verdict value in an event
+> payload (needs a frozen-taxonomy amendment) → follow-up; the **atomic
+> cross-host claim authority** (a real CAS behind the soft claim) → Phase 2 of
+> #4028. Cloud-host provisioning of `safehoused` (formerly tracked here as
+> **#3998**) has landed — see
+> [Fleet provisioning: cloud workers](#fleet-provisioning-cloud-workers-fleet-add-worker---safehouse-3998)
+> below.
 
 ## The degradation contract (read this first)
 
@@ -92,7 +95,7 @@ personas (`loom_builder_42`) are blocked upstream until safehoused grows prefix
 support and are tracked in #3999 — do not attempt to register personas at
 dispatch time; there is no such path.
 
-## Connection status: not configured / unreachable / connected (#4345)
+## Connection status: not configured / unreachable / connected / send-rejected (#4345, #4464)
 
 Before #4345, `safehouse.enabled` false/absent, enabled-but-unreachable, and
 enabled-and-connected all looked identical to an operator — silence. Two
@@ -114,6 +117,16 @@ surfaces now report the live state:
     (`safehouse.room` unset is valid only when safehoused joined exactly one
     room, resolved server-side — the daemon is never told that resolved name,
     so the line omits it rather than guessing).
+  - `connected, sends rejected: <reason>` (#4464) — the `hello` handshake
+    succeeds (the socket is reachable) but every `send` is rejected at the
+    protocol layer, so nothing reaches the room. The canonical cause is a
+    **multi-room safehoused with `safehouse.room` unset**: safehoused replies
+    `'room' required: N rooms joined` and the fix is to set `safehouse.room`
+    (see the troubleshooting entry below). This state is **sticky** — a
+    reconnect whose `hello` succeeds does not clear it; only a `send` that is
+    actually accepted returns the line to `connected`. Distinct from
+    `unreachable` on purpose: "unreachable" would send an operator chasing the
+    socket/persona instead of the config.
 - **`loom-daemon-start.sh`** prints a cheaper, **static**, pre-connect check at
   start time (`ok`/`warn` colored, one line): it runs *before* the daemon
   connects, so it can only distinguish "not configured" from "configured" —
@@ -135,6 +148,26 @@ daemon's wire payload — missing the field entirely — still parses).
 `loom-daemon-start.sh`'s static check reuses the same env>config>default
 resolvers `lib/mcp-config.sh` already defines for the safehouse-mcp worker
 injection (phase 2, below) rather than re-deriving them.
+
+### Troubleshooting: `'room' required` rejection (multi-room host) (#4464)
+
+**Symptom.** `loom-daemon status` shows `Safehouse: connected, sends rejected:
+'room' required: N rooms joined`, and the daemon log carries
+`[WARN] safehouse: narration rejected — set safehouse.room — safehoused
+rejected send: 'room' required: …`. Sweeps proceed normally (the degradation
+contract holds), but the room shows nothing from this host and peer-claim dedup
+(#4028/#4431) is silently disabled here.
+
+**Cause.** Omitting `safehouse.room` is valid **only when safehoused joined
+exactly one room** — safehoused then resolves the sole room server-side. Once
+safehoused joins two or more rooms it can no longer guess, so it rejects every
+`send` that does not name a `room`.
+
+**Fix.** Set `safehouse.room` in `.loom/config.json` (or `LOOM_SAFEHOUSE_ROOM`)
+to the room this host should narrate into, then restart the daemon
+(`loom-daemon restart`). The status line returns to `connected` on the first
+accepted send. `loom-daemon-start.sh` also prints a static caveat at start time
+whenever a socket is configured but `safehouse.room` is unset.
 
 ## New-host onboarding (#4345, #4346)
 
@@ -251,6 +284,99 @@ non-secret environment (`SAFEHOUSED_SOCKET` / `SAFEHOUSED_CONFIG` when
 provided; never a forwarded token). If the safehouse repo ships its own service
 files, point the runbook at those and treat this generator as the fallback.
 
+## Fleet provisioning: cloud workers (`fleet add-worker --safehouse`, #3998)
+
+The onboarding runbook above is for an interactive host an operator sets up by
+hand. `loom-daemon fleet add-worker <ssh-host> --repo <owner/name> --safehouse
+<inputs>` (epic #4340, `loom-daemon/src/fleet/add_worker.rs`) is the same
+onboarding **encoded as an ordered, idempotent plan** that a cloud worker's
+spin-up runs unattended over SSH — no cloud-init fragment, no cloud CLI, no
+Tailscale API call from loom itself (epic #4340's boundary: a VM comes from
+`repo:remote`, loom only consumes "a reachable box + an SSH alias").
+
+### What the plan does
+
+With `--safehouse`, `fleet add-worker` appends seven steps after the plain
+worker's bootstrap (each following the same check/apply contract as the rest
+of the plan, so a re-run against an already-provisioned host reports every one
+`AlreadyDone`):
+
+1. **`safehouse-tailscale-install`** — installs the `tailscale` apt package.
+2. **`safehouse-tailscale-join`** — `tailscale up --auth-key=file:<path>` with
+   the operator-minted key (below). No `--advertise-tags`: the tag is baked
+   into the key server-side.
+3. **`safehouse-build`** — `cargo build --release -p safehoused` from a fresh
+   `rjwalters/safehouse` checkout.
+4. **`safehouse-config`** — writes `~/.loom/safehoused/config.toml` (`0600`):
+   homeserver URL, the per-host Matrix account, fresh store/recovery
+   passphrases, and the persona allowlist. **Must precede step 6** — the
+   allowlist is boot-time-only (no reload), and the plan's step order enforces
+   this (asserted in `add_worker.rs`'s tests).
+5. **`safehouse-room-invite`** — joins the fleet room via
+   [safehouse#39](https://github.com/rjwalters/safehouse/issues/39)'s
+   daemon-side `invite` op — never raw CS-API temporary devices. loom does not
+   vendor this invocation (owned by the external repo); override it with
+   `--safehouse-invite-exec "<argv>"` if it changes upstream.
+6. **`safehouse-supervise`** — installs `safehoused` under `systemd --user` via
+   [`safehoused-service.sh`](#supervised-service-wrapper-safehoused-servicesh-4346)
+   (the same script the interactive runbook uses) and enables lingering.
+7. **`safehouse-daemon-restart`** — wires `LOOM_SAFEHOUSE_ENABLED` /
+   `_SOCKET` / `_ROOM` into the worker's own `loom-daemon` systemd unit and
+   restarts it — env-only, per #3997's decision (no worker-side
+   `.loom/config.json` edit).
+
+**Without `--safehouse`, behavior is byte-for-byte unchanged**: a single
+`safehouse` skip-with-notice entry, a plain worker, zero safehouse
+provisioning.
+
+### Inputs the operator must mint
+
+Every secret travels the same way `AddWorkerConfig`'s existing `--pat-file` /
+`--accounts-env` do: read locally at preflight, transferred to the worker only
+over **ssh stdin**, landing only in `0600` files. None of these ever appear on
+a command line, in the rendered `--dry-run` plan text, in a daemon log at any
+level, or in the fleet registry.
+
+| Flag | Contents | Notes |
+|---|---|---|
+| `--safehouse-tailnet-auth-key-file PATH` | A Tailscale auth key | **Operator-minted, ephemeral + `tag:loom-worker`** — loom never calls the Tailscale API. Ephemeral means a dead VM auto-deregisters from the tailnet with no fleet-roster bookkeeping. |
+| `--safehouse-secrets-file PATH` | `KEY=VALUE` lines: `SAFEHOUSE_MATRIX_USER_ID`, `SAFEHOUSE_MATRIX_PASSWORD`, `SAFEHOUSE_STORE_PASSPHRASE`, `SAFEHOUSE_RECOVERY_PASSPHRASE` | The Matrix account is **operator-created** on the homeserver (the [safehouse#25 verified sequence](#operator-setup-provisioning-the-persona-requires-a-safehoused-restart)) — `fleet add-worker` never needs homeserver admin credentials, only the resulting account. Passphrases are freshly generated per host. |
+| `--safehouse-homeserver-url URL` | Not secret | Must resolve inside the tailnet. |
+| `--safehouse-room ROOM` | Not secret | The fleet room this host joins. |
+| `--safehouse-persona NAME` (repeatable) | Not secret | Mirrors the studio host's allowlist (#3999) — at least one required. |
+| `--safehouse-repo-url URL` | Not secret | Defaults to `rjwalters/safehouse`. |
+| `--safehouse-invite-exec "ARGV"` | Not secret | Overrides the default `safehoused invite --config <path>` if safehouse#39's CLI surface changes upstream. |
+
+`--safehouse` with any of the first five omitted fails **preflight** — before
+any SSH connection — with a message naming exactly which flag is missing (no
+half-joined host).
+
+### Required tailnet ACL
+
+The auth key's `tag:loom-worker` is expected to carry an ACL restricting
+workers to reaching only the homeserver's `443`, not the rest of the tailnet.
+loom documents this requirement; it does not manage the tailnet ACL itself
+(epic #4340's boundary — no Tailscale API call from this repo).
+
+### Teardown: `fleet drain`'s flush verification
+
+`fleet drain <ssh-host>`'s `flush-safehouse` phase (`loom-daemon/src/fleet/drain.rs`)
+is the spin-up's counterpart: it stops the worker's `safehoused` unit over SSH
+(`systemctl --user stop safehoused`) — a supervised stop **is** the flush,
+since safehoused's SIGTERM/ctrl-c shutdown path calls
+`client.encryption().backups().wait_for_steady_state()` and prints
+`"safehoused: room-key backup flushed; bye"` before exiting — then verifies via
+the journal line, falling back to the unit's `ExecMainStatus` when the journal
+has rotated. The verdict maps onto drain's existing contract:
+
+- `safehouse.enabled == false` — `Skipped`, no room keys in play, exit `0`.
+- Flush verified — `Changed`, eligible for "safe to power off", exit `0`.
+- Flush **not** verified (nonzero remote exit, or the host was unreachable) —
+  `Unverified`; the drain still completes (workspace/roster cleanup proceed —
+  loom never refuses to retire a box over this), but the report withholds
+  "safe to power off" and exits `3` so an operator/monitor treats it as a flag,
+  not a clean success.
+
 ## What gets narrated
 
 The sink maps the **existing frozen event taxonomy** (`event_bus.rs`,
@@ -332,15 +458,37 @@ what feeds the public fleet feed on 2amlogic.com. Loom is the producer:
   post-merge phase event because it is daemon-only (no skill edit), has the
   sweep timing to hand, and verifies rather than trusts.
 - **`meta` (`completion-v1`)**: `{schema, agent, repo, ref, result, started_at,
-  completed_at}` required, plus optional `issue`/`tokens` (envelope-v1 preserves
-  unknown `meta` keys, so no schema rev is needed for extensions). `body` stays
-  required human prose — a room reader sees a sentence, `meta` is the machine
-  view.
+  completed_at}` required, plus optional `issue`/`tokens`/`title`/`additions`/
+  `deletions` (envelope-v1 preserves unknown `meta` keys, so no schema rev is
+  needed for extensions). `body` stays required human prose — a room reader sees
+  a sentence, `meta` is the machine view.
 - **`repo` is the forge `owner/repo` slug** (`gh repo view --json
   nameWithOwner`, cached per workspace for the daemon's lifetime), deliberately
   **not** the path-basename convention above: the feed links `ref` (the PR URL)
-  and displays the forge identity. `tokens` is omitted rather than guessed — no
-  cheap token source is wired to the sink.
+  and displays the forge identity.
+- **Display fields (#4497)** feed the site's row format
+  `<repo>#<issue>: <title> +A −D · <dur> · <tokens> tok`, i.e. the
+  development-cost-of-quality-code view:
+  - `title`/`additions`/`deletions` come out of the **same** `gh pr list` call
+    that verifies the merge (`--json number,url,mergedAt,title,additions,deletions`),
+    so they cost **zero** extra forge round-trips. Each degrades independently:
+    a row that omits one still publishes the completion without that key. A `gh`
+    too old to know a field rejects the whole request, so that one case retries
+    the pre-#4497 `number,url,mergedAt` set rather than losing the completion.
+  - Unlike `tokens`, a real **`0`** additions/deletions is a fact about the merge
+    (an empty-diff merge, a pure revert) and is published as `0`; a blank `title`
+    is omitted.
+  - `tokens` is a best-effort **input + output** total from the in-process
+    activity DB's per-issue rollup (`ActivityDb::get_cost_by_issue`), read on the
+    blocking pool with a 5s cap. **Attribution is knowingly imperfect** — the
+    rollup keys on a bare issue number (no repo column, so a multi-repo daemon
+    conflates identical numbers across repos) and only counts token samples that
+    are linked to the issue through `agent_inputs`, making the figure a floor.
+    That is a deliberate operator call: for a cost *trend*,
+    imperfect-but-consistent beats absent. An empty or zero rollup omits the key
+    rather than charting free work.
+  - Absent `tokens`/`title`/`additions`/`deletions` ⇒ the envelope is identical
+    to the pre-#4497 one; none of the four can block or fail an emission.
 - **Timestamps** come from the reaper's clock (`started_at = exit − duration_sec`,
   `completed_at = exit`), so the pair is always self-consistent.
 - **`result: "failure"` is out of scope for v1**: `completion-v1` requires a
@@ -358,7 +506,13 @@ what feeds the public fleet feed on 2amlogic.com. Loom is the producer:
   non-empty, `schema == "completion-v1"`, `agent` a valid persona, `repo` an
   `owner/repo` slug, `ref` an absolute http(s) URL, `result` ∈
   {`success`,`failure`}, both timestamps RFC3339 with `completed_at >=
-  started_at`). Nothing here relies on server-side validation.
+  started_at`, `issue`/`tokens`/`additions`/`deletions` non-negative integers
+  when present, `title` a non-empty string when present). Nothing here relies on
+  server-side validation.
+- **Redaction is downstream.** Every `meta` string — `title` included — is
+  published as an ordinary JSON string, so safehoused's egress deny-pattern pass
+  redacts it exactly like `repo`/`ref`. Loom applies no bespoke encoding that
+  could let a value slip past that pass.
 - **Same degradation contract**: a failing/absent/slow `gh`, an unreachable
   safehoused, or a rejected envelope drops the completion silently and never
   affects the sweep.

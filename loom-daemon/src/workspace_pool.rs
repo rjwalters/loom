@@ -137,13 +137,22 @@ impl WorkspacePool {
     /// returns without subscribing or touching a socket. Best-effort by
     /// contract — a missing/refused peer degrades to a `warn`, never a sweep
     /// failure. The handle is detached (daemon-lifetime).
-    pub fn start_safehouse_narration(&self, repo_root: &Path) {
+    ///
+    /// `activity_db` (#4497) is threaded to the completion emit point purely so
+    /// its public-feed `meta` can carry a best-effort per-issue `tokens` total;
+    /// `None` omits that field and changes nothing else.
+    pub fn start_safehouse_narration(
+        &self,
+        repo_root: &Path,
+        activity_db: Option<Arc<Mutex<crate::activity::ActivityDb>>>,
+    ) {
         let config = crate::safehouse::resolve_config(repo_root);
         let _ = crate::safehouse::spawn_sink(
             config,
             &self.event_bus,
             &self.runtime,
             self.safehouse_state.clone(),
+            activity_db,
         );
     }
 
@@ -525,7 +534,7 @@ mod tests {
         );
         let pool = pool();
 
-        pool.start_safehouse_narration(&root);
+        pool.start_safehouse_narration(&root, None);
         // The sink reports "configured, not yet connected" immediately on
         // spawn (before any connect attempt) — poll briefly rather than
         // assuming the spawned task has already run once.
@@ -556,7 +565,7 @@ mod tests {
         let pool = pool();
 
         // Drive the cell to a non-default state first via the narration sink.
-        pool.start_safehouse_narration(&root);
+        pool.start_safehouse_narration(&root, None);
         let mut status = pool.safehouse_status();
         for _ in 0..50 {
             if status.state != "not_configured" {

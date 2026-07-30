@@ -712,12 +712,16 @@ export const sweepTools: Tool[] = [
         workspace_root: {
           type: "string",
           description:
-            "Optional target managed-workspace root (issue #3929). Omit to " +
-            "dispatch into the daemon's default workspace (unchanged behavior). " +
-            "Provide a registered repo root to dispatch the sweep into that " +
-            "repo's working tree / sweep registry — required to address a " +
-            "managed repo other than the default when two repos share issue " +
-            "numbers.",
+            "Optional target managed-workspace root (issue #3929). Omitting " +
+            "it is NOT a safe no-op on a host with multiple registered " +
+            "workspaces (post-#4299/PR #4322 registry resolution): the " +
+            "daemon either returns a structured ambiguity error when no " +
+            "default applies, or — the dangerous case — silently resolves " +
+            "to the daemon's seeded default workspace when that default is " +
+            "itself registered, dispatching into the wrong repo with no " +
+            "warning (issue #4503). Callers should always pass the repo " +
+            "root they intend to target, e.g. `$(git rev-parse " +
+            "--show-toplevel)`, rather than relying on omission.",
         },
         force: {
           type: "boolean",

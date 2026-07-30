@@ -417,6 +417,7 @@ if [[ -z "${LOOM_SPAWN_NO_EXPORT:-}" && -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; th
     fi
 
     log_info "spawn-claude: using OAuth account '${LOOM_TOKEN_NAME:-unknown}' (mode=${LOOM_TOKEN_MODE:-unknown})"
+    echo "# LOOM_ACCOUNT name=${LOOM_TOKEN_NAME:-unknown}" >&2
     unset LOOM_TOKEN_MODE
 fi
 
@@ -527,4 +528,5 @@ if ! command -v claude >/dev/null 2>&1; then
     log_error "Install Claude Code or pass --use-wrapper to invoke claude-wrapper.sh."
     exit 127
 fi
+echo "# LOOM_CLI_START runtime=claude" >&2
 exec claude "${PASSTHROUGH_ARGS[@]}"

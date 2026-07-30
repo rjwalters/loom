@@ -1292,12 +1292,15 @@ dispatch surface is opt-in, daemon-`dispatch_sweep`-only, and
 linear-chains-only.**
 
 **Dispatch a chain** — N independent `dispatch_sweep` calls, each naming its
-immediate predecessor via `depends_on` (there is no multi-node planner):
+immediate predecessor via `depends_on` (there is no multi-node planner). Always
+pass `workspace_root` explicitly — omitting it can silently target the wrong
+managed workspace (#4503; see workspace_root note above):
 
 ```text
-dispatch_sweep  kind={"Issue": A}                    # parent (independent)
-dispatch_sweep  kind={"Issue": B}  depends_on=A      # child stacked on A
-dispatch_sweep  kind={"Issue": C}  depends_on=B      # A→B→C linear chain
+WORKSPACE_ROOT=$(git rev-parse --show-toplevel)
+dispatch_sweep  kind={"Issue": A}  workspace_root=$WORKSPACE_ROOT                    # parent (independent)
+dispatch_sweep  kind={"Issue": B}  depends_on=A  workspace_root=$WORKSPACE_ROOT      # child stacked on A
+dispatch_sweep  kind={"Issue": C}  depends_on=B  workspace_root=$WORKSPACE_ROOT      # A→B→C linear chain
 ```
 
 The daemon forwards `depends_on` to the child as `--depends-on <parent>`; the
@@ -2207,6 +2210,35 @@ the forge** (best-effort, fail-open on a `gh` error) — this covers all three
 watchdogs, since each re-dispatches through the same method, so no self-heal path
 can ever re-claim a closed/merged issue.
 
+**Mid-build-death live-use veto (#4449).** The mid-build-death watchdog (#3895)
+infers "died mid-build" from `(terminal state ∧ no PR ∧ dirty worktree)` and then
+resets the worktree (`git reset --hard` + `git clean -fd`) before re-dispatching.
+That signature is necessary but **not sufficient**: on 2026-07-29 the daemon's
+tracked sweep for issue #4366 had indeed died, but an *untracked* recovery session
+was concurrently editing the same worktree — and the watchdog destroyed its
+tested-but-uncommitted fix mid `git commit`. `git status` cannot tell dead-sweep
+debris from a live session's work in progress, so the watchdog now also requires
+that **nothing live still holds the worktree**. Four signals veto the reset (any
+one is enough):
+
+| Signal | What it means |
+|--------|---------------|
+| `.loom-in-use` marker in the worktree | A session (including a manual, non-daemon one) claims it. This is the one an operator can plant by hand to fence off a worktree. |
+| `.loom/locks/issue-<N>/owner.json` whose `owner_pid` is **alive** | A live claim holder. A dead owner's lock is ignored, so a stale lock never wedges recovery. |
+| `index.lock` in the worktree's gitdir | A git index write (`git add`/`git commit`) is in flight — precisely the #4449 window. |
+| A live process whose cwd is inside the worktree | An operator shell, a manual role session, or an orphaned grandchild still writing files. |
+
+A veto logs one loud `midbuild-watchdog: … REFUSING to git reset --hard …` line
+naming the holder, leaves the worktree untouched, and **does not consume** the
+single recovery retry — so a genuinely-dead sweep is still recovered on a later
+tick once the holder goes away. If the holder is stale, clear it (remove
+`.loom-in-use` / the claim-lock / the `index.lock`, or exit the shell) and the
+next tick recovers normally. Independently, every `clean_worktree` call now logs
+the porcelain status + diffstat of what it is about to destroy, so a wipe can
+never again be silent in the daemon log. The same defense-in-depth guard exists on
+the script side: `worktree.sh remove <N>` refuses a worktree with uncommitted
+changes and requires an explicit `--force` to discard them.
+
 **Review-phase stall watchdog (#3910).** The startup watchdog rescues a sweep
 that shows *no* progress, and the mid-build-death watchdog (#3895) rescues one
 that made progress then *died*. Neither covers a sweep that is **still alive**
@@ -2441,6 +2473,46 @@ never wedge the daemon. It is GitHub-only (uses the `closedByPullRequestsReferen
 closes-graph, filtered to `state == "OPEN"`); a Gitea workspace fails open and
 keeps today's behavior.
 
+**Park-label dispatch guard (#4444, step 2.7).** The `loom:blocked` /
+`loom:operator-only` **park** labels are the state machine's only "take this out
+of automation" signal, and until #4444 they were enforced *only* in the
+work-finder's candidate query (`SKIP_LABELS`) — one of six dispatch routes. Every
+other route (all three watchdogs, the reaper's checkpoint-resume, the epic
+supervisor, the IPC/CLI `dispatch_sweep`) funnels through
+`SweepRegistry::dispatch()` without re-reading the forge labels, so a park applied
+*after* the original dispatch was invisible to them and the daemon re-claimed
+deliberately parked work (observed on #4366). Step 2.7 — immediately after the
+2.6 open-PR guard, still before the claim lock and label flip — refuses any
+dispatch whose issue currently carries a park label, with a typed
+`ParkedIssueDispatchError` the work finder attributes to `labeled-skip` (never to
+`error(s)`). Four properties are load-bearing:
+
+- **`PARK_LABELS`, not `SKIP_LABELS`.** The guard keys on the
+  `loom:blocked` / `loom:operator-only` subset only. `loom:building` is
+  *legitimately* present on a watchdog re-dispatch or a checkpoint-resume of the
+  daemon's **own** claim, so refusing it would break exactly the recovery paths
+  this guard is meant to constrain. The two constants live side by side in
+  `work_finder.rs` (`SKIP_LABELS` is composed as `BUILDING_LABEL` +
+  `PARK_LABELS`), so they cannot drift.
+- **The #4256 resume bypass does not exempt it.** `resume_bypass_pr` exempts step
+  **2.6** for a sweep's own open PR and nothing else — a park applied after the
+  crash still stops the resume. The refusal stays failure-visible: the reaper
+  logs it and still publishes `sweep.issue.{N}.resume_dispatched` with
+  `dispatched: false`.
+- **REST, not GraphQL.** The probe is `gh api repos/{owner}/{repo}/issues/{N}
+  --jq '.labels[].name'`, a *different* rate-limit bucket from the GraphQL calls
+  steps 2.5/2.6 ride — so a park still holds while the GraphQL quota is
+  exhausted, the condition under which the #4123 guard failed open during the
+  2026-07-29 incident.
+- **Fail-open and fixture-safe.** Any `gh` error, timeout, or unresolvable repo
+  lets dispatch proceed (a forge outage must never wedge the daemon), and the
+  probe is skipped entirely when label flips are disabled (`skip_label_flip`).
+
+Operator note: because this covers the IPC/CLI route too, a manual
+`dispatch_sweep` on a parked issue is refused by design — clear the park label
+first (or use `loom-daemon quarantine clear <N>` when the park came from the
+insta-crash quarantine) rather than expecting a manual dispatch to override it.
+
 **Cost / default.** Enabling detection adds exactly one `gh issue view --json
 labels` round-trip per dispatch (measured ~0.4s against GitHub), bounded by the
 same `LOOM_REAP_GH_TIMEOUT_SECS` ceiling as the other best-effort `gh` calls.
@@ -2469,9 +2541,12 @@ Every other dispatch path still refuses via `OpenPrDispatchError`, so
 a `sweep.issue.{N}.resume_dispatched` event (`{pr, checkpoint_phase?,
 dispatched, repo?}`) is published — with `dispatched: false` on the rare
 case the resume dispatch call itself fails — and narrated over Safehouse
-(when enabled) as a `handoff`. The `restore_label_to_ready` operator-park
-guard (#4206) still applies: an issue carrying `loom:blocked` is never
-resume-dispatched.
+(when enabled) as a `handoff`. Operator parks still win: `restore_label_to_ready`
+preserves a `loom:blocked` label instead of flipping it back to `loom:issue`
+(#4206), and the resume dispatch itself is refused by the **step 2.7 park-label
+guard** (#4444) — which the 2.6 resume bypass deliberately does not exempt — so a
+park applied after the crash surfaces as `dispatched: false` rather than an
+overridden park.
 
 ### Completion narration → public fleet feed (#4426)
 
@@ -2479,15 +2554,22 @@ When a sweep exits, the narration sink additionally asks the forge whether that
 issue's PR actually **merged** (`gh pr list --head feature/issue-N --state
 merged`, in the event's workspace root). If it did, the sink emits a second
 envelope of type **`completion`** carrying a `completion-v1` `meta`
-(`{schema, agent, repo, ref, result, started_at, completed_at, issue, tokens?}`)
-alongside the human `ack`. safehoused's egress mirrors well-formed `completion`
-envelopes out of allowlisted rooms to its `sink_url` — that is what fills the
-public fleet feed. Notes:
+(`{schema, agent, repo, ref, result, started_at, completed_at, issue,
+tokens?, title?, additions?, deletions?}`) alongside the human `ack`.
+safehoused's egress mirrors well-formed `completion` envelopes out of allowlisted
+rooms to its `sink_url` — that is what fills the public fleet feed. Notes:
 
 - **`repo` is the forge `owner/repo` slug** (`gh repo view --json nameWithOwner`,
   cached per workspace), not the path-basename narration convention (#4201);
-  `ref` is the PR URL. `tokens` is omitted (no cheap sink-side source) rather
-  than guessed.
+  `ref` is the PR URL.
+- **Display fields (#4497)** back the feed's
+  `<repo>#<issue>: <title> +A −D · <dur> · <tokens> tok` rows.
+  `title`/`additions`/`deletions` come from the *same* `gh pr list` call that
+  verifies the merge (zero extra round-trips) and degrade per-field; `tokens` is
+  a best-effort input+output total from the in-process activity DB's per-issue
+  rollup, whose attribution is knowingly imperfect (bare issue number, no repo
+  column; only linked samples counted) but consistent enough for a cost trend.
+  All four are optional — absent, the envelope is identical to the pre-#4497 one.
 - **Exit 0 ≠ merged.** No merged PR ⇒ no completion, so `result: "success"` is
   never claimed for unmerged work. `result: "failure"` is not emitted in v1 —
   `completion-v1` requires a `ref`, and a sweep with no merged PR has no
@@ -3162,6 +3244,11 @@ loop is not reusable as the reporter). It has three cooperating parts:
 | watchdog interval | `LOOM_WATCHDOG_INTERVAL_SECS` | — | `300` (launchd `StartInterval` / systemd `OnUnitActiveSec`+`OnBootSec`) |
 | watchdog job/unit basename override | `LOOM_WATCHDOG_LABEL` | — | `<daemon label/unit>-watchdog` |
 | staleness threshold | `LOOM_DAEMON_HEARTBEAT_STALE_SECS` | — | `max(5 × cadence, 300)` |
+| IPC probe on/off (#4398) | `LOOM_WATCHDOG_IPC_PROBE` | — | on |
+| IPC probe budget (#4398) | `LOOM_WATCHDOG_STATUS_PROBE_TIMEOUT_SECS` | — | `15` |
+| IPC probe argv (#4398) | `LOOM_WATCHDOG_IPC_PROBE_ARGS` | — | `quarantine list` |
+| confirmed-hang threshold (#4398) | `LOOM_WATCHDOG_IPC_PROBE_FAIL_THRESHOLD` | — | `3` consecutive ticks |
+| IPC probe startup grace (#4398) | `LOOM_WATCHDOG_IPC_PROBE_GRACE_SECS` | — | `LOOM_DAEMON_STARTUP_GRACE_SECS`, else `90` |
 
 **Why an interval timer, not a resident process or `KeepAlive`/`Restart=`.** The
 reporter must itself be supervised, but a long-lived resident watchdog just moves
@@ -3180,7 +3267,8 @@ service's exit code affects the next scheduled run.
 
 | Marker | Reality | Watchdog |
 |--------|---------|----------|
-| present | daemon alive, heartbeat fresh | silent (OK) |
+| present | daemon alive, heartbeat fresh, IPC round-trip OK | silent (OK) |
+| present | daemon alive, heartbeat fresh, **IPC round-trip fails** (#4398) | **report** — 1 tick: "not yet confirmed"; N consecutive: **IPC UNRESPONSIVE (CONFIRMED)** |
 | present | daemon alive, heartbeat **stale**, written this boot (younger than the process) | **report** — daemon may be wedged |
 | present | daemon alive, heartbeat **older than the process itself** (#4368: a previous-boot/enablement leftover) | silent (liveness-only; not evidence about the current process) |
 | present | daemon alive, no heartbeat file | silent (liveness-only; heartbeat disabled or not yet written) |
@@ -3188,7 +3276,53 @@ service's exit code affects the next scheduled run.
 | **absent** | **nothing running** | silent — deliberate stop, no false page |
 | **absent** | **daemon IS running** | **report (WARN)** — state mismatch, crash protection disarmed (#4331) |
 
-The last row is the #4331 fix. Before it, a missing marker short-circuited to a
+**In-band hang detection (#4398).** Rows 1–2 above are the #4398 addition. Both
+pre-existing checks are *out-of-band*: neither ever talks to the daemon over the
+socket it serves work on, and two incidents proved that is not enough. In #4381
+the installed binary was replaced by a stub that answered `--version` and then
+hung forever — a pid-alive check passes against that indefinitely. On 2026-07-29
+the production daemon (pid 1484) was alive **and writing a fresh heartbeat**
+while every `loom-daemon status` round-trip hung: the heartbeat writer
+(`daemon_heartbeat::spawn_heartbeat_task`) and the IPC accept loop are
+independent `tokio::spawn`ed tasks on a multi-threaded runtime, so one keeps
+ticking while the other is wedged. After liveness is confirmed the watchdog now
+also runs a **bounded in-band round-trip** through the resolved `loom-daemon`
+CLI, with these properties:
+
+- **Bounded twice.** The CLI bounds its own connect + round-trip (5s each,
+  `query_daemon_bounded`); the watchdog additionally wraps the invocation in a
+  hard external budget (default 15s), so even a CLI that never returns at all
+  cannot hang the tick. macOS ships no `timeout(1)`, so the no-`timeout` path is
+  a real built-in bounded runner, not a degrade-to-unbounded.
+- **`quarantine list`, not `status --json`.** `status --json` looks like the
+  obvious probe but, *after* a successful round-trip, it also runs a per-account
+  token-pool network check plus a self-update check — measured at **15.3s against
+  a healthy daemon**, which would make the probe budget itself the
+  false-positive generator. `quarantine list` is a pure IPC round-trip with no
+  post-reply work (~5ms). Override with `LOOM_WATCHDOG_IPC_PROBE_ARGS`.
+- **Debounced, pid-keyed.** One failed round-trip can be transient contention
+  (#4279). A single failure is reported loudly but only **N consecutive**
+  failures (default 3), tallied in `<loom_dir>/.watchdog-probe-fail-count` and
+  **keyed to the live pid** so a relaunched daemon never inherits its
+  predecessor's streak, are called a confirmed hang. A successful probe clears
+  the streak.
+- **Startup-grace aware.** A probe against a process younger than the grace
+  window (default 90s, the same `daemon_install_state::DEFAULT_STARTUP_GRACE_SECS`
+  `status` uses) is skipped outright and never counts toward the tally — the
+  post-relaunch socket-bind window is not a wedge.
+- **Gracefully degrading.** No resolvable `loom-daemon` binary, a build whose CLI
+  does not know the probe subcommand, or a daemon-side *application* error (which
+  proves IPC works) all skip the probe rather than invent a divergence. The probe
+  never becomes a new hard dependency that pages on its own absence.
+- **Report-only, deliberately.** Unlike #4232's narrow auto-`kickstart`, there is
+  no provably-safe unattended remediation for a wedged-but-alive process — the
+  only real fix is killing it, which would equally kill a daemon merely under
+  heavy legitimate load. A confirmed hang escalates to a maximally actionable
+  DIVERGENCE report (distinct `IPC UNRESPONSIVE (CONFIRMED)` text, explicit
+  recovery commands, exit `1`) and stops there. Auto-kill remediation, if ever
+  wanted, needs its own narrow provably-safe gate.
+
+The last no-marker row is the #4331 fix. Before it, a missing marker short-circuited to a
 bare `[OK] … nothing to check` **without probing reality at all** — so a
 supervised daemon running with its marker gone (see "Marker ownership" below) was
 reported healthy while the watchdog would in fact never revive it. The no-marker
@@ -3311,9 +3445,70 @@ compatibility. The probe never fails the command — an
 unreadable/malformed marker, absent `launchctl`, a stale/unowned pid, or an
 unreadable heartbeat mtime all degrade to a less-specific verdict (or, if no
 loom dir can be resolved at all, `install_state` is simply omitted and the
-generic pre-#4069 message is printed). The success path (a reachable, healthy
-daemon) is untouched — this probe only runs after `query_daemon_status` has
-already failed.
+generic pre-#4069 message is printed). `install_state` itself only ever runs
+after `query_daemon_status` has already failed — the reachable path's own
+protection reporting is the separate probe described next.
+
+**Fourth consumer: `status`'s REACHABLE path — watchdog protection state
+(#4354, AC4 of #4331).** `install_state` above answers *"why is the daemon
+unreachable?"*, so it runs only on the `Err` arm. A **reachable** daemon (one
+answering over IPC) needs a different question answered: *"is it actually
+protected?"* Before #4354 it did not surface one, so a healthy-looking daemon
+could be running with crash protection silently disarmed, and an operator would
+only find out by reading `daemon-watchdog.log` or poking
+`launchctl`/`systemctl` by hand. `status` now prints a `Protection:` line (and a
+`protection` object under `--json`) built from a **sibling** classification —
+`ProtectionState` in the same `daemon_install_state.rs` module, deliberately
+*not* new `InstallState` variants, whose exit-code semantics above must not
+change:
+
+| State (`--json` `state`) | Human phrase | Meaning |
+|--------------------------|--------------|---------|
+| `protected` | `protected` | autonomy-desired marker present **and** the watchdog job/timer is provisioned |
+| `no-marker` | `unprotected — no autonomy-desired marker` | no marker: crash protection is DISARMED — the watchdog fires on cadence but logs `[OK] … nothing to check` (the #4331 state) |
+| `watchdog-not-provisioned` | `watchdog job not provisioned` | marker present, but no watchdog launchd job / systemd timer is scheduled — nothing will ever notice a future death |
+| `unknown` | `unknown` | marker present but the provisioning probe could not answer (no `launchctl`/`systemctl`, or an unreachable `systemctl --user` bus) — a degradation, never a false verdict |
+
+Two independent facts feed this, and **both** are always reported: the JSON
+object carries `marker_present` and `watchdog_provisioned` separately (the
+latter `null` when undeterminable) alongside `marker_path`, `watchdog_job`,
+`watchdog_job_kind`, `detail`, and the dominant `state`. When both are bad,
+`state` is `no-marker` — the stronger statement, since even a provisioned
+watchdog is inert without a marker — while `watchdog_provisioned: false` still
+records the second fact for a script.
+
+**How the probe resolves its inputs** (client-side and host-local, so nothing is
+plumbed through the IPC report):
+
+- **Marker** — via the same `LOOM_AUTONOMY_MARKER`-honoring resolver the startup
+  healer uses (`autonomy_marker::resolve_marker_path`, now the single
+  implementation `daemon_install_state` also delegates to), else
+  `<loom_dir>/autonomy-desired`.
+- **Watchdog job** — mirrors `loom-daemon-start.sh` exactly: launchd
+  `${LOOM_WATCHDOG_LABEL:-<daemon-label>-watchdog}` (daemon label from
+  `LOOM_LAUNCHD_LABEL`, else the marker's own `launchd_label`, else
+  `com.rjwalters.loom-daemon`), probed with
+  `launchctl print <domain>/<label>` in the `resolve_launchd_domain` domain
+  (`LOOM_LAUNCHD_DOMAIN` → `gui/<uid>` → `user/<uid>`); systemd
+  `${LOOM_WATCHDOG_LABEL:-<LOOM_SYSTEMD_UNIT%.service>-watchdog}.timer`, probed
+  with `systemctl --user is-enabled <unit>`. A **non-Darwin host always resolves
+  the systemd side** (the same non-Darwin blanket override the unreachable path
+  applies), so `launchctl`'s absence on Linux is never even consulted.
+- **Provisioning verdict** — `enabled`/`enabled-runtime` ⇒ provisioned; any other
+  `is-enabled` verdict (`disabled`, `static`, `masked`, absent, …) ⇒ **not**
+  provisioned, deliberately collapsing "present but disabled" and "absent" into
+  the same operator-relevant answer (neither will fire). A `Failed to connect to
+  bus` / missing-binary / undeterminable-domain outcome ⇒ `unknown`.
+
+Like the `install_state` probe, it is **read-only and never fails the command**:
+at most three query-only subprocess calls, no writes, and the reachable path
+still **exits 0** whatever protection state it reports (only `no-marker` and
+`watchdog-not-provisioned` add remediation lines — `protected` and `unknown`
+print none, since `unknown` is a probe limitation on this host, not evidence of a
+fault). When no loom dir resolves at all the `Protection:` line is omitted and
+`--json`'s `protection` is `null`. The unreachable-path `install_state` output
+and its exit codes are unchanged. `fleet status`'s local-host row carries the
+same `protection` field, since it shares the `status --json` payload builder.
 
 ### macOS session-bootstrap hazard (#3972)
 
@@ -3879,6 +4074,86 @@ dispatch — is validated by the E2E playbook at
 throwaway issue from `loom:triage` → Curator → `loom:issue` → work-finder
 dispatch → PR → merge, with a scripted label-transition assertion, and confirms
 the operator only ever created the issue.
+
+## Fleet dashboard (`loom-daemon serve`)
+
+`loom-daemon serve` (#4329 phases 1-3: #4391 status snapshot, #4392 SSE event
+tail, #4393 page rendering) starts a **separate, opt-in** read-only HTTP
+listener that proxies the running daemon's existing Unix socket for
+browser-based fleet visibility. It is not part of the normal daemon-run path —
+a daemon started without `serve` never opens this port, and `serve` itself
+never mutates daemon state or the sweep registry; every request re-fetches a
+live snapshot over IPC.
+
+### Starting it
+
+```bash
+loom-daemon serve                                   # http://127.0.0.1:7420/
+loom-daemon serve --port 9000                        # non-default port, still loopback-only
+loom-daemon serve --peers http://host2:7420,http://host3:7420   # multihost fleet view
+```
+
+| Flag | Default | Purpose |
+|------|---------|---------|
+| `--port` | `7420` | TCP port for the HTTP listener |
+| `--bind` | `127.0.0.1` | Interface address to bind |
+| `--allow-non-loopback` | off | Required opt-in to bind any non-loopback `--bind` address |
+| `--peers` | `""` (empty) | Comma-separated peer `serve` base URLs, served verbatim at `GET /api/peers` for client-side fan-out |
+
+### Security posture (localhost-only invariant)
+
+- **Off by default**: nothing listens on any port unless `loom-daemon serve`
+  is explicitly invoked — a plain `loom-daemon` run (autonomous or not) never
+  opens this listener.
+- **Binds `127.0.0.1` by default.** A wildcard/unspecified bind (`0.0.0.0` /
+  `::`) is refused **unconditionally**, even with `--allow-non-loopback` —
+  this endpoint can never become reachable from the public internet, only
+  from an explicit interface address.
+- A non-loopback `--bind` (e.g. a tailnet interface address, for cross-host
+  fleet visibility) requires the *separate* explicit `--allow-non-loopback`
+  flag — the bind address alone is never enough to opt in.
+- **Read-only, stateless, no steering endpoints.** Every route is a bare
+  `GET`; any other method gets `405`. The SSE bridge only ever sends the
+  IPC `SubscribeEvents` request — it never publishes an event and never
+  writes to the daemon socket beyond that one subscribe call, so nothing
+  this listener originates can appear on the bus. Nothing is written to
+  disk. There is no dispatch/cancel/restart/steering route of any kind.
+- Every response carries a permissive `Access-Control-Allow-Origin: *`
+  header (required for the dashboard's client-side peer fan-out); this is
+  judged safe specifically because the surface is read-only, carries no
+  credentials, and is loopback-by-default — the bind posture is the
+  access-control layer, not CORS.
+
+### What it serves
+
+| Route | Content |
+|-------|---------|
+| `GET /` | The embedded single-page dashboard (plain HTML/CSS/vanilla JS, no build toolchain, compiled into the binary) |
+| `GET /api/status` | JSON status snapshot: the same `DaemonStatusReport` `loom-daemon status --json` aggregates, flattened with a `hostname` field |
+| `GET /api/events` | `text/event-stream` (SSE) tail of the daemon's event bus |
+| `GET /api/pipeline` | Forge-side queue counts per managed repo (same source `status --pipeline` uses), fronted by a 20s in-process cache |
+| `GET /api/tokens` | Per-account rows (name / status / 5h utilization) read from the resolved token pool's `.ranking` file |
+| `GET /api/peers` | The configured `--peers` list, verbatim — this daemon never fetches a peer itself; the browser fetches each peer's own `/api/status`/`/api/events` directly |
+
+The dashboard page renders: the in-flight sweep registry, the dynamic
+concurrency cap/capacity breakdown, per-token usage bars, the per-repo
+main-health gate state, per-repo pipeline queue counts, configured fleet
+peers, and a live event tail — each panel backed by one of the routes above.
+
+### Event tail topics
+
+`GET /api/events` subscribes to the six frozen `sweep.*` topics from the
+[event taxonomy](#event-taxonomy-frozen-for-v0100) above — `sweep.issue.{N}.phase`,
+`.blocker`, `.exited`, `.crashed`, `sweep.global.dispatch`, and
+`sweep.global.completed` — through the exact same `SubscribeEvents` IPC
+request and `event_bus::topic_matches` prefix filter every other subscriber
+uses. It additionally includes the already-authorized `epic.issue.*`,
+`daemon.capacity.advisory`, `daemon.drain.*`, and
+`daemon.dispatch.headroom_advisory` topics, clearly separable from the
+frozen six because every SSE frame carries its exact source topic in the
+JSON payload (never renamed or re-namespaced). There is no replay buffer:
+a reconnecting client (`EventSource`'s built-in retry) resumes from live,
+never from history.
 
 ## Locks and lifecycle
 
