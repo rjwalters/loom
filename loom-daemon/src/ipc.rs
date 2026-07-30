@@ -42,6 +42,7 @@ const LIVENESS_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 //   | SIGTERM (operator stop)       | 143 EXIT_SIGTERM| NO relaunch       |
 //   | SIGINT  (interactive Ctrl-C)  | 130 EXIT_SIGINT | NO relaunch       |
 //   | IPC Shutdown request          | 143 EXIT_SHUTDOWN| NO relaunch      |
+//   | startup failure (e.g. #3806)  | 1 EXIT_STARTUP_FAILURE | NO relaunch |
 //   | crash / panic                 | non-zero        | NO relaunch       |
 //
 // This is Curator Finding 1's remedy: because a SIGTERM'd daemon now exits
@@ -63,6 +64,22 @@ pub const EXIT_SIGINT: i32 = 130;
 /// Exit code for an explicit IPC `Shutdown` request. Non-zero — an explicit
 /// shutdown means "stay down", so launchd must not relaunch.
 pub const EXIT_SHUTDOWN: i32 = 143;
+/// Exit code for a startup failure the daemon reports and terminates on itself
+/// (#4531) — most visibly the singleton guard's "another loom-daemon is already
+/// listening" refusal below.
+///
+/// Deliberately `1`, the exact value `std::process::ExitCode::FAILURE` carries:
+/// `main` previously let such errors propagate out of `#[tokio::main]` and relied
+/// on `Termination for Result` to print `Error: {err:?}` and exit `1`. That path
+/// is correct but **not prompt** — the generated wrapper drops the `Runtime`
+/// after `block_on` returns, and `Runtime::drop` blocks until every in-flight
+/// `spawn_blocking` task finishes, which on a host with real work configured
+/// stalled the refusing process for ~10s (and looked like an indefinite hang
+/// under a shorter timeout). `main` now prints the same message and exits with
+/// this code directly, so the observable contract (message + status) is
+/// unchanged while termination becomes immediate. Non-zero ⇒ launchd does not
+/// relaunch, which is what a refusal wants.
+pub const EXIT_STARTUP_FAILURE: i32 = 1;
 
 /// Detect the daemon's process supervisor from the environment (#4054, #4267).
 ///
@@ -5229,6 +5246,11 @@ exit 0
         assert_ne!(EXIT_SIGTERM, 0, "SIGTERM stop must be non-zero (no relaunch)");
         assert_ne!(EXIT_SIGINT, 0, "SIGINT/Ctrl-C must be non-zero (no relaunch)");
         assert_ne!(EXIT_SHUTDOWN, 0, "explicit Shutdown must be non-zero (no relaunch)");
+        // #4531: the self-reported startup-failure exit must stay non-zero (no
+        // relaunch) AND keep the value `ExitCode::FAILURE` used to produce, so
+        // callers that only knew the old `Termination`-driven exit see no change.
+        assert_ne!(EXIT_STARTUP_FAILURE, 0, "startup failure must be non-zero (no relaunch)");
+        assert_eq!(EXIT_STARTUP_FAILURE, 1, "startup failure must match ExitCode::FAILURE");
 
         // Supervised: scheduled + do_exit.
         std::env::set_var("LOOM_DAEMON_SUPERVISOR", "launchd");
