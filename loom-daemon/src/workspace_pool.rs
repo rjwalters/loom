@@ -141,6 +141,15 @@ impl WorkspacePool {
     /// `activity_db` (#4497) is threaded to the completion emit point purely so
     /// its public-feed `meta` can carry a best-effort per-issue `tokens` total;
     /// `None` omits that field and changes nothing else.
+    ///
+    /// **Per-repo room routing (#4225) needs nothing threaded through here.** The
+    /// sink is a single subscriber on the pool's *shared* bus, and every narrated
+    /// event already carries its owning workspace root (`repo`, #3929/#4201) —
+    /// which is exactly the key `safehouse::RoomRouter` routes firehose traffic
+    /// by. So one sink resolving `safehouse.rooms` once (from `repo_root`, the
+    /// daemon's default workspace, the same layer that already owns socket /
+    /// persona / peer-claim TTL) routes **every** managed repo correctly, and no
+    /// per-workspace sink or per-repo config resolution is introduced.
     pub fn start_safehouse_narration(
         &self,
         repo_root: &Path,
@@ -483,6 +492,10 @@ mod tests {
             "LOOM_SAFEHOUSE_ENABLED",
             "LOOM_SAFEHOUSE_SOCKET",
             "LOOM_SAFEHOUSE_ROOM",
+            // #4225's attention-class routing map is env-overridable too, so an
+            // ambient value would likewise leak the host's rooms into these tests.
+            "LOOM_SAFEHOUSE_ROOM_SIGNAL",
+            "LOOM_SAFEHOUSE_ROOMS_BY_REPO",
             "LOOM_SAFEHOUSE_PERSONA",
             "SAFEHOUSED_SOCKET",
         ] {

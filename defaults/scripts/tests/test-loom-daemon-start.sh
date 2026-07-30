@@ -689,6 +689,7 @@ s.bind('$SH3_SOCK')
 EOF
     sh3_out=$( ( cd "$SH3_HOME" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
         -u LOOM_SAFEHOUSE_ENABLED -u LOOM_SAFEHOUSE_SOCKET -u SAFEHOUSED_SOCKET \
+        -u LOOM_SAFEHOUSE_ROOM -u LOOM_SAFEHOUSE_ROOM_SIGNAL \
         LOOM_DAEMON_BIN="$SH_BG_FAKE_BIN" \
         LOOM_SOCKET_PATH="$SH3_HOME/.loom/loom-daemon.sock" \
         LOOM_AUTONOMY_MARKER="$SH3_HOME/.loom/autonomy-desired" \
@@ -738,6 +739,7 @@ s.bind('$SH4_SOCK')
 EOF
     sh4_out=$( ( cd "$SH4_HOME" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
         -u LOOM_SAFEHOUSE_ENABLED -u LOOM_SAFEHOUSE_SOCKET -u SAFEHOUSED_SOCKET \
+        -u LOOM_SAFEHOUSE_ROOM -u LOOM_SAFEHOUSE_ROOM_SIGNAL \
         LOOM_DAEMON_BIN="$SH_BG_FAKE_BIN" \
         LOOM_SOCKET_PATH="$SH4_HOME/.loom/loom-daemon.sock" \
         LOOM_AUTONOMY_MARKER="$SH4_HOME/.loom/autonomy-desired" \
@@ -1012,6 +1014,48 @@ else
     echo -e "${GREEN}✓${NC} dropped-env-key (systemd): --force-env is excluded from the persisted .daemon.flags file"
 fi
 rm -rf "$DEK_SD_HOME"
+
+# SH5. #4225: attention-class routing supplies the room via
+#      safehouse.rooms.signal instead of the scalar safehouse.room -> the
+#      room-unset caveat must NOT appear (the resolver falls back from
+#      rooms.signal to room, so a host with either one is satisfied).
+SH5_HOME="$(mktemp -d)"
+mkdir -p "$SH5_HOME/.loom"
+SH5_SOCK="$SH5_HOME/.loom/safehoused.sock"
+if command -v python3 >/dev/null 2>&1 \
+    && python3 -c "
+import socket
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.bind('$SH5_SOCK')
+" 2>/dev/null; then
+    cat > "$SH5_HOME/.loom/config.json" <<EOF
+{"safehouse": {"enabled": true, "socket": "$SH5_SOCK",
+  "rooms": {"signal": "!signal:example.org", "byRepo": {"loom": "!fleet-loom:example.org"}}}}
+EOF
+    sh5_out=$( ( cd "$SH5_HOME" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
+        -u LOOM_SAFEHOUSE_ENABLED -u LOOM_SAFEHOUSE_SOCKET -u SAFEHOUSED_SOCKET \
+        -u LOOM_SAFEHOUSE_ROOM -u LOOM_SAFEHOUSE_ROOM_SIGNAL \
+        LOOM_DAEMON_BIN="$SH_BG_FAKE_BIN" \
+        LOOM_SOCKET_PATH="$SH5_HOME/.loom/loom-daemon.sock" \
+        LOOM_AUTONOMY_MARKER="$SH5_HOME/.loom/autonomy-desired" \
+        LOOM_WATCHDOG_LABEL="com.example.loom-sandbox-$$-sh5-watchdog" \
+        bash "$START_SCRIPT" --no-launchd --no-systemd 2>&1 ) )
+    TESTS_RUN=$((TESTS_RUN + 1))
+    if echo "$sh5_out" | grep -q 'safehouse.room is unset'; then
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+        echo -e "${RED}✗${NC} safehouse: rooms.signal set -> no room caveat (#4225)"
+        echo "  output: $sh5_out"
+    else
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+        echo -e "${GREEN}✓${NC} safehouse: rooms.signal set -> no room caveat (#4225)"
+    fi
+    if [[ -f "$SH5_HOME/.loom/.daemon.pid" ]]; then
+        kill "$(cat "$SH5_HOME/.loom/.daemon.pid" 2>/dev/null)" 2>/dev/null || true
+    fi
+else
+    echo "  (skipping SH5: python3 AF_UNIX bind unavailable on this host)"
+fi
+rm -rf "$SH5_HOME"
 
 # ---------- summary ----------
 echo

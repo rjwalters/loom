@@ -604,11 +604,16 @@ print_safehouse_status() {
         # every send ('room' required) -- which silently kills narration and
         # peer-claim dedup, and 'loom-daemon status' will show
         # "connected, sends rejected: ...". Surface the caveat statically here.
-        local room
-        room=$(loom_config_get "$REPO_ROOT" "safehouse.room" "" 2>/dev/null || true)
-        if [[ -z "$room" ]]; then
-            echo "               note: safehouse.room is unset -- valid only if safehoused joined exactly one room;" \
-                 "a multi-room host needs an explicit safehouse.room or every send is rejected"
+        # #4225: attention-class routing can supply the room instead, via
+        # safehouse.rooms.signal -- a host that set it needs no scalar
+        # safehouse.room (the resolver falls back from one to the other), so the
+        # caveat must not fire for it.
+        local room signal
+        room=${LOOM_SAFEHOUSE_ROOM:-$(loom_config_get "$REPO_ROOT" "safehouse.room" "" 2>/dev/null || true)}
+        signal=${LOOM_SAFEHOUSE_ROOM_SIGNAL:-$(loom_config_get "$REPO_ROOT" "safehouse.rooms.signal" "" 2>/dev/null || true)}
+        if [[ -z "$room" && -z "$signal" ]]; then
+            echo "               note: safehouse.room is unset (and so is safehouse.rooms.signal) -- valid only if" \
+                 "safehoused joined exactly one room; a multi-room host needs an explicit room id or every send is rejected"
         fi
     else
         warn "Safehouse:     configured, unreachable (socket $socket does not exist -- is safehoused running?)"
