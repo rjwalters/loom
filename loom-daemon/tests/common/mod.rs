@@ -19,43 +19,98 @@ use tokio::time::timeout;
 static TEST_PREFIX: LazyLock<String> =
     LazyLock::new(|| format!("test-{}", uuid::Uuid::new_v4().simple()));
 
+/// How long [`TestDaemon::start`] waits for the daemon to create its socket.
+///
+/// This is a **liveness** bound, not a latency assertion: it exists so a wedged
+/// daemon fails the test instead of hanging it. It is deliberately generous
+/// because CI runs the suite process-per-test under `cargo nextest` (#4385), so
+/// the daemon can be competing for CPU with `num-cpus` sibling test processes.
+/// The previous 5s budget was calibrated for `cargo test`, which runs one test
+/// binary at a time, and it produced spurious "failed to create socket within 5s"
+/// failures on a loaded host.
+// Not every test binary that includes this module uses `TestDaemon` (e.g. tests
+// that need raw `Child` control over the daemon they spawn), so the shared
+// helper is `dead_code`-exempt rather than warning per-binary.
+#[allow(dead_code)]
+const DAEMON_SOCKET_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Absolute path to the `loom-daemon` binary under test.
+///
+/// Cargo builds the package's bin target before running an integration test and
+/// hands us the path in `CARGO_BIN_EXE_<name>`. Resolving it this way is not just
+/// tidier than hardcoding `../target/debug/loom-daemon` (which ignored
+/// `CARGO_TARGET_DIR`) — it is load-bearing under process-per-test execution.
+/// This harness previously shelled out to `cargo build --bin loom-daemon` on
+/// *every* `TestDaemon::start()`; with one process per test those builds
+/// serialize on `$CARGO_HOME/.package-cache` and the target-directory lock, which
+/// are **cross-process** resources that test process isolation does nothing to
+/// separate (#4385) — and the build raced the very binary it was about to spawn.
+pub fn daemon_bin() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_loom-daemon"))
+}
+
 /// Test daemon instance that cleans up on drop
+#[allow(dead_code)]
 pub struct TestDaemon {
     _temp_dir: TempDir,
     socket_path: PathBuf,
     process: Option<Child>,
 }
 
+#[allow(dead_code)]
 impl TestDaemon {
     /// Start a new daemon instance with a unique socket path
     pub async fn start() -> Result<Self> {
         let temp_dir = TempDir::new().context("Failed to create temp directory")?;
         let socket_path = temp_dir.path().join("daemon.sock");
+        // Isolated registry file (mirrors `integration_drain_then_exit.rs`): an
+        // empty/scratch `LOOM_WORKSPACES_PATH` guarantees `effective_roots()`
+        // reduces to the single seeded default (`LOOM_WORKSPACE`, set below)
+        // rather than silently picking up whatever repos are registered in
+        // this *host's* real `~/.loom/workspaces.json`.
+        let workspaces_path = temp_dir.path().join("workspaces.json");
+        // Absolute (required — `worktree_root()` rejects a relative override
+        // and falls back to the default) and inside the `TempDir`.
+        let worktree_root = temp_dir.path().join("worktrees");
 
-        // Build the daemon binary (in case it's not already built)
-        let build_output = Command::new("cargo")
-            .args(["build", "--bin", "loom-daemon"])
-            .current_dir(env!("CARGO_MANIFEST_DIR"))
-            .output()
-            .context("Failed to build daemon")?;
-
-        if !build_output.status.success() {
-            anyhow::bail!(
-                "Failed to build daemon: {}",
-                String::from_utf8_lossy(&build_output.stderr)
-            );
-        }
-
-        // Start the daemon process
-        let daemon_bin =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/debug/loom-daemon");
-
-        let mut process = Command::new(&daemon_bin)
+        let mut process = Command::new(daemon_bin())
             .env("LOOM_SOCKET_PATH", &socket_path)
             .env("RUST_LOG", "debug")
             // Disable restore_from_tmux() to prevent cross-test-binary contamination
             // via the shared tmux server. Each test manages its own terminals.
             .env("LOOM_NO_RESTORE", "1")
+            // Fail-closed autonomy toggles (#4573): without these, a spawned
+            // test daemon inherits this repo's real `.loom/config.json`
+            // (`autonomous.roleRunner.enabled: true`) and can dispatch real
+            // `/loom:sweep` sessions — burning API/GitHub rate-limit quota in
+            // what is meant to be an inert integration-test daemon. Each of
+            // these env vars *wins outright* over config in the daemon's own
+            // env > config > default precedence (`resolve_enabled` in
+            // `role_runner.rs` / `work_finder.rs` / `epic_supervisor.rs`), so
+            // setting them here is authoritative regardless of what any
+            // repo's committed config says.
+            .env("LOOM_ROLE_RUNNER", "0")
+            .env("LOOM_WORK_FINDER", "0")
+            .env("LOOM_EPIC_SUPERVISOR", "0")
+            // Repoint the daemon's own workspace root at this test's throwaway
+            // `TempDir` (#4573) instead of letting it inherit the real repo
+            // checkout via `LOOM_WORKSPACE`/cwd.
+            .env("LOOM_WORKSPACE", temp_dir.path())
+            .env("LOOM_WORKSPACES_PATH", &workspaces_path)
+            // …and pin the worktree base directory too (#4573). This is NOT
+            // redundant with `LOOM_WORKSPACE`: `worktree_root()` reads
+            // `LOOM_WORKTREE_ROOT` as its *highest-priority* source
+            // (`worktree_root.rs`), ahead of both `worktree.root` in config
+            // and the `${repo_root}/.loom/worktrees` default. A spawned child
+            // inherits the parent's environment, so on a host that sets
+            // `LOOM_WORKTREE_ROOT` (the documented external-scratch-volume
+            // setup) an unpinned test daemon would resolve worktrees onto that
+            // real volume — outside its `TempDir` — even with `LOOM_WORKSPACE`
+            // confined. Setting it explicitly makes confinement independent of
+            // the invoking environment. Note the daemon namespaces an
+            // *override* by repo basename, so the effective root is
+            // `<temp>/worktrees/<temp-basename>` — still inside the `TempDir`.
+            .env("LOOM_WORKTREE_ROOT", &worktree_root)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -64,12 +119,13 @@ impl TestDaemon {
         // Wait for socket to be created (with timeout)
         let start = std::time::Instant::now();
         while !socket_path.exists() {
-            if start.elapsed() > Duration::from_secs(5) {
+            if start.elapsed() > DAEMON_SOCKET_TIMEOUT {
                 // Kill the process and get logs
                 let _ = process.kill();
                 let output = process.wait_with_output()?;
                 anyhow::bail!(
-                    "Daemon failed to create socket within 5s.\nStderr: {}",
+                    "Daemon failed to create socket within {}s.\nStderr: {}",
+                    DAEMON_SOCKET_TIMEOUT.as_secs(),
                     String::from_utf8_lossy(&output.stderr)
                 );
             }
@@ -86,6 +142,26 @@ impl TestDaemon {
     /// Get the socket path for connecting clients
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
+    }
+
+    /// The throwaway `TempDir` this daemon was pinned to via `LOOM_WORKSPACE`
+    /// (#4573) — the workspace root the daemon must resolve to, never the
+    /// real repo checkout.
+    #[allow(dead_code)]
+    pub fn workspace_path(&self) -> &Path {
+        self._temp_dir.path()
+    }
+
+    /// PID of the spawned daemon child, or `None` once it has been reaped.
+    ///
+    /// Exposed so the #4573 confinement regression test can read the child's
+    /// *actual* environment (`/proc/<pid>/environ` on Linux) rather than
+    /// trusting that this module's `.env()` calls are still present — the only
+    /// way to verify pass-through for `LOOM_WORKTREE_ROOT`, which the daemon
+    /// consumes internally and never reports over IPC.
+    #[allow(dead_code)]
+    pub fn pid(&self) -> Option<u32> {
+        self.process.as_ref().map(std::process::Child::id)
     }
 }
 
@@ -111,8 +187,14 @@ impl TestClient {
     ///
     /// The daemon creates the socket file before it starts listening, creating a race condition.
     /// This method retries with exponential backoff to handle this race.
+    ///
+    /// The retry budget (~6s of backoff) is sized for process-per-test execution
+    /// under `cargo nextest` (#4385): the daemon may be descheduled between
+    /// creating the socket and calling `listen(2)` while `num-cpus` sibling test
+    /// processes run. The previous 5-attempt budget (~0.75s) was calibrated for
+    /// `cargo test`'s one-binary-at-a-time model.
     pub async fn connect(socket_path: &Path) -> Result<Self> {
-        let max_retries = 5;
+        let max_retries = 8;
         let mut retry_delay = Duration::from_millis(50);
 
         for attempt in 0..max_retries {

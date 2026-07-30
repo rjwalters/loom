@@ -1,11 +1,12 @@
 #!/bin/bash
-# validate-toolchain.sh - Validate loom-tools commands are available
+# validate-toolchain.sh - Validate the Loom command toolchain is available
 #
-# Validates that essential loom-tools commands are installed and accessible
-# before the daemon enters its main loop.
+# Validates that the commands the daemon needs are installed and accessible
+# before it enters its main loop. They are all native `loom-daemon`
+# subcommands — the Python `loom-tools` package this script was written against
+# was retired in epic #4081 Phase 4 (#4557).
 #
-# See defaults/scripts/validate-toolchain.sh for the full implementation
-# with fallback logic for installations.
+# See defaults/scripts/validate-toolchain.sh for the full implementation.
 #
 # Usage:
 #   validate-toolchain.sh           # Validate all commands

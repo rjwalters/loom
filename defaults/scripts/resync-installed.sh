@@ -37,6 +37,11 @@
 # On a successful non-dry-run it also re-stamps loom_version, loom_commit, and a
 # last_resync date into .loom/install-metadata.json (requires jq or python3;
 # skipped with a warning if neither is present — the file sync still succeeds).
+# It also ensures a `merge=ours` driver is wired up for that same file (#4528)
+# — a machine-local stamp every host re-writes, guaranteeing merge conflicts
+# between hosts otherwise — via a Loom-managed .gitattributes block plus local
+# git config (never committed; runs every time so a pre-#4528 install
+# self-heals on its next resync).
 #
 # It also refreshes the marker-delimited Loom-managed `.gitignore` block via the
 # daemon's `update-gitignore` subcommand (#4280) — the ephemeral-pattern list is
@@ -71,6 +76,20 @@
 #     residual emission role
 #   install-metadata.json's install_date + installed_files - owned by the installer
 #
+# WORKTREE RESTRICTION (#4563): the installed .loom/ is ALWAYS resolved against
+# the PRIMARY worktree (via `git rev-parse --git-common-dir`), so running this
+# from a linked worktree — an issue/PR worktree under .loom/worktrees/ — writes
+# to the MAIN checkout, not to the worktree you are standing in. A Builder that
+# does so contaminates main mid-sweep (the 2026-07-30 incident: four installed
+# paths written into main from a wave-2 builder's worktree and quarantined by
+# check-main-clean.sh). The script therefore REFUSES to run when its own
+# `--show-toplevel` differs from the resolved main-checkout root, and exits 1.
+# Installed-copy propagation is the periodic resync commit's job: land the
+# defaults/ change, then resync from the main checkout. An operator who really
+# does mean "write the main checkout's installed copies from here" can pass
+# --allow-worktree (or export LOOM_RESYNC_ALLOW_WORKTREE=1). Running from the
+# main checkout itself — including any subdirectory of it — is unaffected.
+#
 # Local-override convention: list a relative path (e.g. `hooks/guard-destructive.sh`,
 # `scripts/foo.sh`, `roles/custom-role.md`, `docs/notes.md`, `bin/loom`,
 # `commands/loom/mine.md`, or `package.json` to pin the #4285 stub version edit)
@@ -82,11 +101,21 @@
 #   ./.loom/scripts/resync-installed.sh            # sync; report what changed
 #   ./.loom/scripts/resync-installed.sh --dry-run  # preview only; make no changes
 #   ./.loom/scripts/resync-installed.sh --quiet    # only report updated/skipped
+#   ./.loom/scripts/resync-installed.sh --allow-worktree
+#                                                  # permit running from a linked
+#                                                  # worktree (still writes the MAIN
+#                                                  # checkout's installed copies)
 #   ./.loom/scripts/resync-installed.sh --help     # show usage
+#
+# Environment:
+#   LOOM_RESYNC_ALLOW_WORKTREE=1  - same as --allow-worktree (for non-interactive
+#                                   callers), matching the LOOM_ALLOW_* override
+#                                   convention used elsewhere in .loom/scripts.
 #
 # Exit codes:
 #   0 - Success. Sync applied (or already in sync); or --dry-run found no drift.
-#   1 - Error (not in a git repo, or the source tree could not be located).
+#   1 - Error (not in a git repo, the source tree could not be located, or
+#       invoked from a linked worktree without --allow-worktree).
 #   2 - --dry-run only: drift detected (one or more files WOULD be updated).
 #       Lets callers (e.g. the #3770 warning) use --dry-run as a cheap check.
 #
@@ -114,6 +143,9 @@ fi
 
 DRY_RUN=0
 QUIET=0
+# #4563: refuse to run from a linked worktree unless explicitly overridden.
+ALLOW_WORKTREE=0
+[[ "${LOOM_RESYNC_ALLOW_WORKTREE:-}" == "1" ]] && ALLOW_WORKTREE=1
 
 err()  { printf '%b\n' "${RED}ERROR: $*${NC}" >&2; }
 warn() { printf '%b\n' "${YELLOW}WARN: $*${NC}" >&2; }
@@ -124,10 +156,17 @@ note() { [[ "$QUIET" -eq 1 ]] || printf '%b\n' "$*"; }
 
 for arg in "$@"; do
     case "$arg" in
-        --dry-run|-n) DRY_RUN=1 ;;
-        --quiet|-q)   QUIET=1 ;;
+        --dry-run|-n)     DRY_RUN=1 ;;
+        --quiet|-q)       QUIET=1 ;;
+        --allow-worktree) ALLOW_WORKTREE=1 ;;
         --help|-h)
-            sed -n '2,69p' "$0" | sed 's/^# \{0,1\}//'
+            # Print the whole leading comment block (line 2 through the last
+            # consecutive `#` line). Derived, not a hard-coded line range — the
+            # previous `sed -n '2,69p'` silently truncated the Usage/Exit-codes
+            # sections as the header grew past it.
+            awk 'NR==1 { next }
+                 /^#/  { sub(/^# ?/, ""); print; next }
+                 { exit }' "$0"
             exit 0
             ;;
         *)
@@ -162,9 +201,55 @@ if [[ -z "$REPO_ROOT" || ! -d "$REPO_ROOT/.loom" ]]; then
     exit 1
 fi
 
+# ---------- refuse to run from a linked worktree (#4563) ----------
+#
+# The resolution above is the whole point of the refusal: from an issue/PR
+# worktree it hands back the MAIN checkout, so every write below lands in main
+# rather than in the worktree the caller is standing in. That is a
+# worktree-isolation escape a Builder cannot see (nothing in its own `git
+# status` changes) — it surfaces only as contamination of main.
+#
+# Detection is generic: compare this invocation's own worktree top against the
+# resolved main-checkout root. No path pattern is hard-coded, so a repo that
+# relocates its worktree root (worktree.root / lib/worktree-root.sh) is covered
+# too. Both sides are normalized to physical absolute paths first, because
+# `git rev-parse --git-common-dir` returns a RELATIVE path (e.g. "../../.git")
+# from a subdirectory of the main checkout — a raw string compare there would
+# refuse a perfectly legitimate run.
+
+abs_path() {
+    local p="$1"
+    [[ -d "$p" ]] || { printf '%s' "$p"; return 0; }
+    (cd "$p" 2>/dev/null && pwd -P) || printf '%s' "$p"
+}
+
+WORKTREE_TOP="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+if [[ -n "$WORKTREE_TOP" && "$(abs_path "$WORKTREE_TOP")" != "$(abs_path "$REPO_ROOT")" ]]; then
+    if [[ "$ALLOW_WORKTREE" -eq 1 ]]; then
+        warn "Running from a linked worktree ($WORKTREE_TOP) — writes target the MAIN checkout at $REPO_ROOT (--allow-worktree)."
+    else
+        err "Refusing to run: invoked from a linked git worktree."
+        err "  this worktree : $WORKTREE_TOP"
+        err "  would write to: $REPO_ROOT  (the MAIN checkout — NOT this worktree)"
+        printf '\n' >&2
+        err "The installed .loom/ surfaces are always resolved against the primary"
+        err "worktree, so a resync from here silently modifies the main checkout and"
+        err "contaminates it mid-sweep (#4563)."
+        printf '\n' >&2
+        err "Installed-copy propagation is the periodic resync commit's job: commit your"
+        err "defaults/ change, get it merged, then run this from the main checkout:"
+        err "  cd $REPO_ROOT && ./.loom/scripts/resync-installed.sh"
+        printf '\n' >&2
+        err "If you genuinely intend to rewrite the MAIN checkout's installed copies from"
+        err "here, re-run with --allow-worktree (or LOOM_RESYNC_ALLOW_WORKTREE=1)."
+        exit 1
+    fi
+fi
+
 # ---------- resolve the defaults/ source tree ----------
 #
-# Mirrors lib/loom-tools.sh find_loom_tools() resolution order:
+# Mirrors the resolution order lib/loom-tools.sh's find_loom_tools() used before
+# epic #4081 Phase 4 (#4557) retired it with the Python package:
 #   1. Loom source repo (dogfood): $REPO_ROOT/defaults/
 #   2. Recorded loom-source-path (target repo install)
 #   3. install-metadata.json "loom_source"
@@ -356,8 +441,19 @@ resync_tree() {
 # a repo that commits `.loom/` (this repo dogfoods that layout). Removing a
 # tracked file based purely on one contributor's local skill install deletes a
 # repo-shared file for everyone else. So below, before removing the vendored
-# guard, we check whether the target is git-tracked and skip the removal (with a
-# warning) if so — only untracked (the normal consumer-repo) targets are removed.
+# guard, we check whether the target is git-tracked and skip the removal if so —
+# only untracked (the normal consumer-repo) targets are removed.
+#
+# #4566: that skip is reported as an informational `note`, NOT a `warn`. The
+# condition is a *steady state*, not an anomaly: it can only arise where a
+# maintainer deliberately committed the vendored fallback (posture (a) — keep the
+# tracked copy so contributors/CI without Repo Skills still get full generic-guard
+# coverage; see defaults/docs/guard-hooks.md). Resync already takes the only
+# correct action automatically, every run, forever — so an alarm-level line that
+# reprints on every resync with no way to acknowledge it is pure noise. A repo
+# that genuinely wants posture (b) drops the vendored copy deliberately with
+# `git rm .loom/hooks/guard-destructive-generic.sh`, after which this branch stops
+# firing entirely.
 CANONICAL_GUARD_PRESENT=0
 if [[ -r "$REPO_ROOT/.claude/skills/repo/hooks/guard-destructive.sh" ]] && \
    grep -q 'repo#29' "$REPO_ROOT/.claude/skills/repo/hooks/guard-destructive.sh" 2>/dev/null; then
@@ -379,8 +475,12 @@ if [[ -d "$DEFAULTS_DIR/hooks" && -d "$INSTALLED_HOOKS" ]]; then
                     # repo-shared state, not this host's local install. Removing it
                     # would delete a committed file for every other contributor based
                     # solely on this host's local, typically-gitignored Repo Skills
-                    # install. Leave it alone and warn instead.
-                    warn "hooks/$name is git-tracked in this repo but a canonical Repo Skills guard was detected locally — NOT removing a repo-shared tracked file based on one host's local install. If .loom/hooks/$name should genuinely be dropped repo-wide, remove it deliberately with 'git rm .loom/hooks/$name'."
+                    # install. Leave it alone.
+                    #
+                    # #4566: report this as a `note`, not a `warn` — a committed
+                    # vendored fallback is a deliberate, documented posture, so this
+                    # is the expected steady state on every run, not an anomaly.
+                    note "  ${GREEN}unchanged${NC} hooks/$name ${YELLOW}(git-tracked vendored fallback kept — canonical Repo Skills guard present; see defaults/docs/guard-hooks.md)${NC}"
                 elif [[ "$DRY_RUN" -eq 1 ]]; then
                     printf '%b\n' "  ${BOLD}would remove${NC} hooks/$name ${YELLOW}(canonical Repo Skills guard present)${NC}"
                 else
@@ -558,6 +658,73 @@ fi
 # `update-gitignore` subcommand rather than duplicating the list in shell. A
 # missing/too-old binary is a LOUD stderr warning, never a silent skip.
 
+# ---------- ensure the install-metadata.json merge=ours driver (#4528) ----------
+#
+# .loom/install-metadata.json is a machine-local install stamp: every host's
+# resync (the restamp_metadata step above) re-writes loom_version,
+# loom_commit, and last_resync (plus loom_source, an absolute host-specific
+# path) on every run. Because the file must stay tracked (it is the
+# authoritative ownership manifest consumed by verify-install.sh and
+# uninstall-loom.sh — see is_untracked_runtime_file() in verify-install.sh,
+# which already treats its exact byte content as non-checksum-tracked
+# runtime state), any two hosts that each commit a resync and then
+# `git merge`/`git pull` the other's commit collide on this file, every
+# time, on the exact same lines.
+#
+# The fix: a `merge=ours` attribute for the path in a Loom-managed marker
+# block in .gitattributes (committed, shared) plus the `ours` driver enabled
+# in LOCAL (never committed) git config -- `git config merge.ours.driver
+# true` -- which git-attributes(5) requires a `merge=ours` attribute to be
+# paired with. This is safe because the file is fully re-derived by the
+# next resync regardless of which side "wins" a given merge conflict.
+#
+# Runs on every resync (including a fresh, non-dry-run first run on an
+# existing install predating this fix) so existing hosts self-heal the
+# first time they resync after upgrading past #4528, with no separate
+# migration step required.
+
+ensure_install_metadata_merge_driver() {
+    local ga="$REPO_ROOT/.gitattributes"
+    local begin="# BEGIN LOOM-MANAGED (merge drivers, #4528)"
+    local end="# END LOOM-MANAGED (merge drivers, #4528)"
+    local rule=".loom/install-metadata.json merge=ours"
+    local changed=0
+
+    if [[ ! -f "$ga" ]] || ! grep -qF "$rule" "$ga" 2>/dev/null; then
+        if [[ "$DRY_RUN" -eq 1 ]]; then
+            note "  ${BOLD}would add${NC} .loom/install-metadata.json merge=ours rule to .gitattributes"
+        else
+            {
+                [[ -s "$ga" ]] && printf '\n'
+                printf '%s\n' "$begin"
+                printf '%s\n' "# install-metadata.json is a machine-local install stamp (loom_version,"
+                printf '%s\n' "# loom_commit, last_resync, loom_source) that every host's resync"
+                printf '%s\n' "# re-writes -- always keep our side on a merge conflict; the file is"
+                printf '%s\n' "# fully re-derived by the next resync regardless of which side \"wins\"."
+                printf '%s\n' "$rule"
+                printf '%s\n' "$end"
+            } >> "$ga"
+            changed=1
+        fi
+    fi
+
+    local current
+    current="$(git -C "$REPO_ROOT" config --get merge.ours.driver 2>/dev/null || true)"
+    if [[ "$current" != "true" ]]; then
+        if [[ "$DRY_RUN" -eq 1 ]]; then
+            note "  ${BOLD}would set${NC} local git config merge.ours.driver=true"
+        else
+            git -C "$REPO_ROOT" config merge.ours.driver true 2>/dev/null || true
+            changed=1
+        fi
+    fi
+
+    if [[ "$changed" -eq 1 ]]; then
+        note "  ${GREEN}configured${NC} install-metadata.json merge=ours driver (.gitattributes + local git config)"
+    fi
+}
+ensure_install_metadata_merge_driver
+
 refresh_gitignore_block() {
     local locate_lib bin
     locate_lib="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/locate-daemon-bin.sh"
@@ -650,7 +817,7 @@ suggest_commit_if_resync_only_dirt() {
         path="${path%\"}"
         path="${path#\"}"
         case "$path" in
-            .loom/hooks/*|.loom/scripts/*|.loom/roles/*|.loom/docs/*|.loom/bin/*|.claude/commands/loom/*|.loom/install-metadata.json)
+            .loom/hooks/*|.loom/scripts/*|.loom/roles/*|.loom/docs/*|.loom/bin/*|.claude/commands/loom/*|.loom/install-metadata.json|.gitattributes)
                 resync_paths+=("$path")
                 ;;
             *)

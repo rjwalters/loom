@@ -1,9 +1,14 @@
 #!/bin/bash
-# validate-toolchain.sh - Validate loom-tools commands are available
+# validate-toolchain.sh - Validate the Loom command toolchain is available
 #
-# Validates that essential loom-tools commands are installed and accessible
-# before Tier 2 dispatch (/loom:sweep / loom-daemon) drives worker roles.
-# Provides tiered validation with critical vs optional commands.
+# Validates that the commands Tier 2 dispatch (/loom:sweep / loom-daemon) needs
+# to drive worker roles are present before it starts. Provides tiered validation
+# with critical vs optional commands.
+#
+# Every command it checks is now a native `loom-daemon` subcommand: the Python
+# `loom-tools` package this script was originally written against was retired in
+# epic #4081 Phase 4 (#4557), so a missing command means "build/provision the
+# daemon binary", never "pip install something".
 #
 # Exit codes:
 #   0 - All critical commands available (optional warnings may exist)
@@ -56,7 +61,7 @@ QUICK_MODE=false
 
 show_help() {
     cat << 'EOF'
-validate-toolchain.sh - Validate loom-tools commands
+validate-toolchain.sh - Validate the Loom command toolchain
 
 USAGE:
     validate-toolchain.sh [OPTIONS]
@@ -75,16 +80,24 @@ OPTIONAL COMMANDS (degraded without):
              `loom-daemon agent-wait` / `agent-spawn` subcommands (#4415)
 
 INSTALLATION:
-    If commands are missing, install loom-tools:
+    These are native `loom-daemon` subcommands (`cleanup logs` /
+    `recover-orphans`). If they are reported missing, the loom-daemon binary is
+    absent or predates them — build and provision a fresh one:
 
     # From the repository root:
-    pip install -e ./loom-tools
+    ./.loom/scripts/cli/loom-daemon-update.sh
 
-    # Or with uv (recommended):
-    uv pip install -e ./loom-tools
+    # Or by hand:
+    cargo build --release -p loom-daemon
+    ./scripts/install/provision-daemon.sh
 
-    # Verify installation:
-    which loom-cleanup
+    # Verify:
+    loom-daemon --version
+    loom-daemon cleanup logs --help
+
+    (There is no pip install. The Python `loom-tools` package these commands
+    once came from was retired in epic #4081 Phase 4, #4557 — see
+    docs/adr/0013-loom-tools-python-retirement.md.)
 
 EXIT CODES:
     0 - All critical commands available
@@ -136,23 +149,13 @@ command_exists() {
         return 0
     fi
 
-    # Third try: check if a Python module can be invoked. Only for commands
-    # whose Python implementation still exists — `loom-cleanup` and
-    # `loom-recover-orphans` had theirs deleted in issue #4272, and
-    # `loom-agent-wait` / `loom-agent-spawn` in issue #4415 (all native-only
-    # now), so they are intentionally absent from this map: the first two
-    # tiers above are their only paths to "found". The map is empty today; it
-    # is kept as the extension point for any future Python-backed command.
-    local module_name
-    case "$cmd" in
-        *) return 1 ;;
-    esac
-
-    # Check if module can be imported
-    if python3 -c "import $module_name" 2>/dev/null; then
-        return 0
-    fi
-
+    # There is NO third tier. A Python-module-import fallback (`python3 -c
+    # "import <module>"`) used to sit here, but its command→module map had
+    # already emptied out — `loom-cleanup`/`loom-recover-orphans` went native in
+    # #4272, `loom-agent-wait`/`loom-agent-spawn` in #4415 — making it
+    # unreachable dead code. Epic #4081 Phase 4 (#4557) deleted the Python
+    # package outright, so it can never be reachable again; it was removed
+    # rather than left as a misleading "extension point".
     return 1
 }
 
@@ -346,11 +349,13 @@ output_text() {
             echo ""
             echo "Dispatch cannot start without these commands."
             echo ""
-            echo "To install loom-tools, run:"
-            echo "  pip install -e ./loom-tools"
+            echo "These are native 'loom-daemon' subcommands — build/provision"
+            echo "a fresh binary (there is no pip install; #4557):"
+            echo "  ./.loom/scripts/cli/loom-daemon-update.sh"
             echo ""
-            echo "Or with uv:"
-            echo "  uv pip install -e ./loom-tools"
+            echo "Or by hand:"
+            echo "  cargo build --release -p loom-daemon"
+            echo "  ./scripts/install/provision-daemon.sh"
             ;;
     esac
 }

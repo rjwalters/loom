@@ -1,0 +1,125 @@
+# cargo-nextest configuration (issue #4385).
+#
+# WHY THIS FILE EXISTS
+#
+# The Rust suite is meant to run as `cargo nextest run --workspace`, which
+# executes every test in its **own process**. That is deliberate: the daemon's
+# unit tests mutate the process environment (`std::env::set_var` /
+# `remove_var`) at 774 call sites, while other tests in the same binary
+# `Command::spawn` child processes.
+# `Command::spawn` reads the process environ non-atomically, so an env mutation
+# racing a spawn can corrupt a child's environment mid-flight — the cause of the
+# 2026-07-29 CI flakes in `pipeline_snapshot` (PR #4305) and
+# `quarantine_reconciliation` (PR #4320). `#[serial]` (serial_test) only
+# serializes *marked* tests against each other, so it never closed that window.
+# Process-per-test closes it by construction, including for every future test
+# nobody remembers to mark.
+#
+# THE TRADE-OFF THIS FILE MANAGES
+#
+# `cargo test` runs test binaries one at a time; nextest runs tests from *all*
+# binaries concurrently. Tests whose shared state is genuinely cross-process (not
+# just in-process env/statics) therefore need an explicit override here — process
+# isolation does nothing for state that lives outside the process.
+#
+# See `loom-daemon/src/lib.rs` (crate-level "Test isolation convention" docs) for
+# the author-facing version of this contract.
+#
+# ONE OPERATOR STEP STILL OUTSTANDING -> #4559 (2026-07-30, #4385)
+#
+# The `backend-tests` job in `.github/workflows/ci.yml` still invokes plain
+# `cargo test --workspace`, so CI is still exposed to the race described above and
+# this file is live for local `cargo nextest run` only. Flipping the job could not
+# be committed with #4385: GitHub refuses any push *or* Contents-API write that
+# touches `.github/workflows/**` unless the credential carries the `workflow` scope
+# (fine-grained PAT: "Workflows: write"), and the automation account's token does
+# not (both paths were tried and rejected — see #4559 for the transcripts and the
+# exact two-hunk replacement). A maintainer with `gh auth refresh -s workflow`
+# applies it in one commit.
+#
+# When that lands, delete this block *and* the matching `<div class="warning">`
+# note in `loom-daemon/src/lib.rs`'s crate docs in the same commit.
+#
+# A SECOND FAILURE CLASS THIS FILE ALSO CLOSES -> #4561 (2026-07-30)
+#
+# A #4494 Doctor verification pass on PR #4543 hit a Tokio-runtime-context test
+# failure in a full `cargo test --workspace` run (2,264+ tests) that did not
+# reproduce when the same test was run alone — consistent with thread-local
+# Tokio runtime state (not just env vars/statics) colliding between two
+# unrelated tests under `cargo test`'s shared-process, multi-threaded harness.
+# That is the same process-shared-state hazard class #4385 diagnosed for env
+# mutation, just a different piece of thread-local state leaking across the
+# same kind of boundary. #4561's verification: `cargo nextest run --workspace
+# --profile ci -p loom-daemon --lib` (2,486 tests), run 3 consecutive times —
+# 2486/2486 passed on every run, no Tokio-runtime failure. Process-per-test
+# isolation closes this class structurally for the same reason it closes the
+# env-mutation race: no thread-local (or process-global) state survives across
+# a process boundary. No code fix was needed or made; #4561 is a
+# document-as-covered resolution, not a fixture change.
+
+nextest-version = "0.9.98"
+
+[profile.default]
+# Surface slow tests early rather than letting them silently pad CI wall time.
+# Only *terminate* well past any plausible honest runtime.
+slow-timeout = { period = "60s", terminate-after = 6 }
+# Retries are deliberately 0: this config exists to remove flakes, not to paper
+# over them. A red run stays red.
+retries = 0
+failure-output = "immediate-final"
+status-level = "fail"
+
+# --- Cross-process exclusive state ------------------------------------------
+#
+# The daemon integration suites share host-global state that no amount of process
+# isolation can separate:
+#
+#   * the dedicated `tmux -L loom` server (sessions are host-global),
+#   * `cleanup_all_loom_sessions()` in each suite's `setup()`, which kills EVERY
+#     `loom-*` session — including sessions owned by a concurrently running test
+#     in another process,
+#   * a real `loom-daemon` child per test, which binds a socket and writes an
+#     activity DB.
+#
+# `cargo test` gave them mutual exclusion implicitly by running one test binary at
+# a time. nextest runs tests from *all* binaries concurrently, so the exclusion has
+# to be declared. A `max-threads = 1` test group is exactly that declaration: at
+# most one member of the group is ever in flight, across all four binaries.
+#
+# Deliberately *not* `threads-required = 'num-test-threads'` (run-completely-alone).
+# That was tried first and rejected: it serialises these tests behind the entire
+# ~2350-test unit suite for no benefit, since no unit test touches the tmux server
+# or spawns a daemon (audited — see `loom-daemon/src/lib.rs`). The wall-clock
+# budgets inside the harness are now sized as liveness bounds rather than latency
+# assertions, so co-scheduling with the unit suite is safe.
+[test-groups.daemon-integration]
+max-threads = 1
+
+# Overrides are declared on *both* profiles on purpose. nextest resolves a test's
+# overrides from the selected profile only — the `default` profile's overrides are
+# not inherited by a named profile — so an override that lived solely under
+# `[[profile.default.overrides]]` would silently not apply to `--profile ci`,
+# which is the one CI uses. Verify with:
+#
+#     cargo nextest show-config test-groups --profile ci
+#
+# Keep the two filters identical.
+[[profile.default.overrides]]
+filter = 'package(loom-daemon) & kind(test) & binary(/^integration_/)'
+test-group = 'daemon-integration'
+# Booting a real daemon and driving tmux is slow by nature.
+slow-timeout = { period = "180s", terminate-after = 3 }
+
+# --- CI profile -------------------------------------------------------------
+#
+# Scalar settings are inherited from `default`; overrides are not (see above).
+# CI wants the full failure list rather than a fail-fast bail-out.
+[profile.ci]
+fail-fast = false
+failure-output = "immediate-final"
+final-status-level = "fail"
+
+[[profile.ci.overrides]]
+filter = 'package(loom-daemon) & kind(test) & binary(/^integration_/)'
+test-group = 'daemon-integration'
+slow-timeout = { period = "180s", terminate-after = 3 }

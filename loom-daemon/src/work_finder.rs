@@ -22,28 +22,39 @@
 //! 3. For each remaining issue, dispatches through the existing
 //!    [`SweepRegistry::dispatch`](crate::sweep_registry::SweepRegistry::dispatch)
 //!    path — up to a **work-driven** max-concurrency cap recomputed every tick
-//!    (Phase B, #3811; CPU/load term added in #3978): `min(token-pool size,
-//!    disk headroom, cpu/load headroom, configured max)`. `dispatch()` already
-//!    flips `loom:issue → loom:building`, acquires the per-issue `mkdir`-atomic
-//!    claim lock, and spawns the rotated-token child.
+//!    (Phase B, #3811; simplified in #4512): `min(token axis, disk headroom,
+//!    configured max)`. `dispatch()` already flips `loom:issue →
+//!    loom:building`, acquires the per-issue `mkdir`-atomic claim lock, and
+//!    spawns the rotated-token child.
 //!
-//! # Concurrency scaling (Phase B, #3811; CPU/load term #3978)
+//! # Concurrency scaling (Phase B, #3811; CPU term removed in #4512)
 //!
 //! Phase A resolved a single fixed cap once at daemon startup. Phase B replaces
 //! it with a cap **recomputed every tick** by
-//! [`resolve_dynamic_max_concurrent`] from live inputs — the token-pool size
-//! ([`crate::tokens::token_pool_size`]), the worktree-root disk headroom
-//! ([`crate::disk_headroom::disk_headroom_limit`]), the host's CPU/load
-//! headroom ([`crate::cpu_headroom::cpu_headroom_limit`], #3978 — added because
-//! the token/disk axes alone let a batch of resetting accounts push the cap up
-//! regardless of how many concurrent `cargo build`s were already saturating the
-//! host), and the operator ceiling (`LOOM_WORK_FINDER_MAX_CONCURRENT`,
-//! repurposed from Phase A's fixed target into a *ceiling*). The effective
-//! per-tick concurrency is then `min(dynamic_cap, backlog_depth)`: [`tick`]
-//! iterates the ready `loom:issue` rows and stops at the cap, so concurrency
-//! scales **up** as the backlog grows and drains to **zero** dispatches when
-//! the queue is empty — all without a daemon restart, since
-//! pool/disk/cpu/backlog are read fresh each tick.
+//! [`resolve_dynamic_max_concurrent`] from live inputs — the token axis
+//! ([`crate::tokens::token_pool_size`] / [`crate::capacity::read_ranking`]),
+//! the worktree-root disk headroom
+//! ([`crate::disk_headroom::disk_headroom_limit`]), and the per-machine
+//! operator ceiling (`LOOM_WORK_FINDER_MAX_CONCURRENT` /
+//! `autonomous.workFinder.maxConcurrent`). The effective per-tick concurrency
+//! is then `min(dynamic_cap, backlog_depth)`: [`tick`] iterates the ready
+//! `loom:issue` rows and stops at the cap, so concurrency scales **up** as the
+//! backlog grows and drains to **zero** dispatches when the queue is empty —
+//! all without a daemon restart, since pool/disk/backlog are read fresh each
+//! tick.
+//!
+//! **#4512 removed the CPU term from this formula.** A fourth axis
+//! (`cpu_headroom = (logical_cpus × cpuUtilizationTarget − consumed_cores) /
+//! estCoresPerSweep`, #3978/#4031) used to be part of the `min(...)`. It priced
+//! every sweep as a build, so it throttled the API-wait-dominated majority to
+//! defend against the heavy-build minority — an 8-core worker measured **95%
+//! idle** was capped at 2. The two hard floors that meter genuinely
+//! *exhaustible* resources (the token axis, disk headroom) stay; the CPU
+//! estimate is gone; and the heavy stages now serialize where they actually
+//! occur, on the machine-wide build slot ([`crate::build_slot`]). The host
+//! breaker (#4235, [`crate::host_breaker`]) remains the load safety net that
+//! makes a hand-tuned ceiling safe: a mis-set knob trips a **measured** breaker
+//! instead of melting the host.
 //!
 //! # Idempotency & fail-safe
 //!
@@ -85,13 +96,10 @@ use std::time::Duration;
 use anyhow::Result;
 
 use crate::capacity::{self, CapacityAdvisory};
-use crate::cpu_headroom::{
-    cpu_headroom_limit, resolve_est_cores_per_sweep, resolve_utilization_target,
-};
 use crate::disk_headroom::disk_headroom_limit;
 use crate::event_bus::EventBus;
 use crate::main_health_gate::{MainHealthState, WorkspaceHealthStates};
-use crate::sweep_registry::{OpenPrDispatchError, ParkedIssueDispatchError};
+use crate::sweep_registry::{DispatchBackoffError, OpenPrDispatchError, ParkedIssueDispatchError};
 use crate::tokens::{token_pool_size, token_pool_size_at_dir};
 use crate::types::Event;
 use crate::workspace_pool::WorkspacePool;
@@ -390,6 +398,23 @@ pub trait WorkDispatcher {
         HashSet::new()
     }
 
+    /// The set of issue numbers currently inside a **per-issue dispatch backoff
+    /// window** after a failed dispatch (Issue #4485). Skipped exactly like
+    /// [`quarantined`](Self::quarantined) — filtered out *before* the
+    /// concurrency budget is filled, so a backed-off candidate never reserves a
+    /// shared dispatch slot.
+    ///
+    /// Complements (does not replace) the registry-side step-2.8 guard: this
+    /// keeps a backed-off issue from consuming a slot and from logging a refusal
+    /// every tick, while the guard is the authoritative brake that also covers
+    /// the watchdog / IPC / epic-supervisor dispatch paths.
+    ///
+    /// Defaults to empty so a dispatcher that does not model the backoff (e.g. a
+    /// test fake) opts out with zero boilerplate.
+    fn backed_off(&self) -> HashSet<u32> {
+        HashSet::new()
+    }
+
     /// Cumulative count of cross-host dispatch collisions this dispatcher's
     /// registry has observed (Issue #4085, Phase 0 of #4028) — dispatches whose
     /// pre-flip label read showed a peer host claimed the issue first. Read once
@@ -494,6 +519,13 @@ pub struct TickReport {
     /// separate from the collisions it did not. Always `0` when
     /// `safehouse.enabled` is false (the dispatcher's `peer_claimed()` is empty).
     pub skipped_peer_claim: usize,
+    /// Issues skipped because they are inside a per-issue dispatch-backoff
+    /// window after a failed dispatch (Issue #4485) — either filtered out before
+    /// the capacity gate via [`WorkDispatcher::backed_off`], or refused by the
+    /// registry's step-2.8 guard with the typed [`DispatchBackoffError`].
+    /// Attributed here rather than to [`errors`](Self::errors) because a backoff
+    /// refusal is a deliberate skip, not a failure.
+    pub skipped_backoff: usize,
     /// Dispatch attempts that returned an error (logged, non-fatal).
     pub errors: usize,
     /// Cumulative cross-host dispatch collisions observed (Issue #4085, Phase 0
@@ -591,6 +623,7 @@ pub fn tick_with_admission_cap(
 
     let in_flight = dispatcher.in_flight();
     let quarantined = dispatcher.quarantined();
+    let backed_off = dispatcher.backed_off();
     let peer_claimed = dispatcher.peer_claimed();
     // Occupancy (Issue #4003) is a distinct, possibly-smaller count than
     // `in_flight.len()`: a dispatcher may discount a spawned-but-unproven
@@ -618,6 +651,14 @@ pub fn tick_with_admission_cap(
         //     capacity gate so a quarantined issue never consumes a slot.
         if quarantined.contains(&item.number) {
             report.skipped_quarantined += 1;
+            continue;
+        }
+        // 2b2. Dispatch backoff (#4485): this issue's last dispatch failed and
+        //      its backoff window has not elapsed. Skipped here — before the
+        //      capacity gate, like quarantine — so it neither reserves a slot
+        //      nor re-flips its label every tick.
+        if backed_off.contains(&item.number) {
+            report.skipped_backoff += 1;
             continue;
         }
         // 2c. Peer soft claim (#4028): a peer host advertised a live claim over
@@ -686,6 +727,12 @@ pub fn tick_with_admission_cap(
                         item.number,
                         parked.label
                     );
+                } else if e.downcast_ref::<DispatchBackoffError>().is_some() {
+                    // Dispatch backoff refusal (#4485) — a deliberate skip, not
+                    // a failure. Reachable even when `backed_off()` was empty at
+                    // tick start (the window can be armed mid-tick by a reap).
+                    report.skipped_backoff += 1;
+                    log::info!("work_finder: skipping issue #{} — {e}", item.number);
                 } else {
                     report.errors += 1;
                     log::warn!("work_finder: dispatch for issue #{} failed: {e}", item.number);
@@ -852,6 +899,12 @@ pub fn tick_multi_with_admission_cap<S: WorkSource, D: WorkDispatcher>(
     let quarantined_sets: Vec<HashSet<u32>> =
         workspaces.iter().map(|(_, d)| d.quarantined()).collect();
 
+    // Snapshot each workspace's dispatch-backoff set (#4485) alongside its
+    // quarantined set — dropped in pass 1 for the same reason: a backed-off
+    // candidate must not reserve a shared slot it cannot use.
+    let backed_off_sets: Vec<HashSet<u32>> =
+        workspaces.iter().map(|(_, d)| d.backed_off()).collect();
+
     // Snapshot each workspace's peer-claim set (#4028) alongside its quarantined
     // set. A peer's live soft claim drops the candidate in pass 1, before the
     // global sort and slot fill, so a peer-claimed issue never reserves a shared
@@ -923,6 +976,12 @@ pub fn tick_multi_with_admission_cap<S: WorkSource, D: WorkDispatcher>(
             // enters the global queue, so it consumes no shared slot.
             if quarantined_sets[idx].contains(&item.number) {
                 report.skipped_quarantined += 1;
+                continue;
+            }
+            // Dispatch backoff (#4485): a failing issue inside its backoff
+            // window — drop before the global queue, like quarantine.
+            if backed_off_sets[idx].contains(&item.number) {
+                report.skipped_backoff += 1;
                 continue;
             }
             // Peer soft claim (#4028): a peer host is already building it — drop
@@ -1001,6 +1060,11 @@ pub fn tick_multi_with_admission_cap<S: WorkSource, D: WorkDispatcher>(
                         cand.number,
                         parked.label
                     );
+                } else if e.downcast_ref::<DispatchBackoffError>().is_some() {
+                    // Dispatch backoff refusal (#4485) — see the single-workspace
+                    // `tick` for the rationale. A skip, not a failure.
+                    report.skipped_backoff += 1;
+                    log::info!("work_finder: skipping issue #{} — {e}", cand.number);
                 } else {
                     report.errors += 1;
                     log::warn!("work_finder: dispatch for issue #{} failed: {e}", cand.number);
@@ -1096,17 +1160,17 @@ pub struct WorkFinderConfig {
     /// `autonomous` level (not under `workFinder`), so it is read even when no
     /// `workFinder` block is present. A zero/invalid value is dropped to `None`.
     pub per_token_concurrency: Option<usize>,
-    /// `autonomous.cpuUtilizationTarget` — the fraction of logical CPUs the CPU
-    /// headroom term (#3978) is willing to dedicate to sweep work (#4032). Also
-    /// lives at the `autonomous` level, alongside `perTokenConcurrency`. A
-    /// value outside `(0, 1]` (or the wrong JSON type) is dropped to `None`, so
-    /// it falls through to [`crate::cpu_headroom::DEFAULT_UTILIZATION_TARGET`].
-    pub cpu_utilization_target: Option<f64>,
-    /// `autonomous.estCoresPerSweep` — the estimated CPU cores a single
-    /// concurrent sweep consumes while building/testing (#3978, #4032). A
-    /// value `<= 0` (or the wrong JSON type) is dropped to `None`, so it falls
-    /// through to [`crate::cpu_headroom::DEFAULT_EST_CORES_PER_SWEEP`].
-    pub est_cores_per_sweep: Option<f64>,
+    /// Names of **retired** config keys found in `autonomous` — currently
+    /// `cpuUtilizationTarget` / `estCoresPerSweep` ([`DEPRECATED_CPU_CONFIG_KEYS`]),
+    /// whose CPU-headroom admission term #4512 deleted.
+    ///
+    /// They are **accepted-but-ignored**, never a config error: a fleet's
+    /// committed `.loom/config.json` must keep parsing across the upgrade. Their
+    /// presence (at any value — no range filtering, since nothing consumes the
+    /// value) is recorded here purely so
+    /// [`warn_deprecated_cpu_knobs`] can log one deprecation line naming exactly
+    /// which keys to delete.
+    pub deprecated_cpu_keys: Vec<&'static str>,
 }
 
 /// Read `.loom/config.json → autonomous.workFinder`, soft-failing every field
@@ -1133,20 +1197,17 @@ pub fn read_work_finder_config(repo_root: &Path) -> WorkFinderConfig {
         .filter(|&n| n > 0)
         .and_then(|n| usize::try_from(n).ok());
 
-    // `cpuUtilizationTarget` / `estCoresPerSweep` (#4032) also live at the
-    // `autonomous` level, mirroring `perTokenConcurrency`. `Value::as_f64`
-    // accepts both integer and float JSON (`2` and `2.0`); range filters match
-    // the env-var resolvers in `cpu_headroom.rs` exactly so a config value
-    // that would be rejected there is dropped to `None` here too, rather than
-    // being clamped or silently applied out of range.
-    let cpu_utilization_target = autonomous
-        .get("cpuUtilizationTarget")
-        .and_then(serde_json::Value::as_f64)
-        .filter(|&f| f > 0.0 && f <= 1.0);
-    let est_cores_per_sweep = autonomous
-        .get("estCoresPerSweep")
-        .and_then(serde_json::Value::as_f64)
-        .filter(|&f| f > 0.0);
+    // `cpuUtilizationTarget` / `estCoresPerSweep` used to live at the
+    // `autonomous` level too (#4032), feeding the CPU-headroom admission term
+    // #4512 deleted. They are now accepted-but-ignored: note their presence for
+    // the one-shot deprecation warning and parse nothing — no range filtering,
+    // no type coercion, because no consumer reads the value any more. A
+    // consumer's committed config keeps parsing unchanged (never a hard error).
+    let deprecated_cpu_keys: Vec<&'static str> = DEPRECATED_CPU_CONFIG_KEYS
+        .iter()
+        .copied()
+        .filter(|key| autonomous.get(*key).is_some_and(|v| !v.is_null()))
+        .collect();
 
     // The `workFinder` sub-block is optional; each field independently falls
     // through to `None` (env/default resolution) when absent.
@@ -1171,9 +1232,79 @@ pub fn read_work_finder_config(repo_root: &Path) -> WorkFinderConfig {
             .filter(|&n| n > 0)
             .and_then(|n| usize::try_from(n).ok()),
         per_token_concurrency,
-        cpu_utilization_target,
-        est_cores_per_sweep,
+        deprecated_cpu_keys,
     }
+}
+
+/// Retired `autonomous.*` config keys, accepted-but-ignored since #4512 (they
+/// fed the deleted CPU-headroom admission term, #3978/#4031).
+pub const DEPRECATED_CPU_CONFIG_KEYS: [&str; 2] = ["cpuUtilizationTarget", "estCoresPerSweep"];
+
+/// Retired env vars, accepted-but-ignored since #4512 — the env half of
+/// [`DEPRECATED_CPU_CONFIG_KEYS`].
+pub const DEPRECATED_CPU_ENV_VARS: [&str; 2] =
+    ["LOOM_CPU_UTILIZATION_TARGET", "LOOM_EST_CORES_PER_SWEEP"];
+
+/// One-shot guard so the deprecation warning is logged **once per process**, not
+/// once per config read (the config is re-read on several paths, including every
+/// `status` request).
+static DEPRECATION_WARNED: std::sync::Once = std::sync::Once::new();
+
+/// Render the deprecation notice for any retired CPU-headroom knob still set in
+/// `config` or the environment — `None` when none is set (#4512).
+///
+/// Split out from [`warn_deprecated_cpu_knobs`] because the two channels an
+/// operator actually watches are different processes: the **daemon** has a
+/// logger (`~/.loom/daemon.log`) and warns through it, while a **CLI**
+/// subcommand (`loom-daemon calibrate`) returns from `main` *before*
+/// `setup_logging()` runs, so a `log::warn!` there is a silent no-op. The CLI
+/// therefore prints this same string to stderr instead of relying on the log
+/// (see `handle_calibrate_command`). One message, two delivery paths — never a
+/// warning that exists only in a file nobody is tailing.
+#[must_use]
+pub fn deprecated_cpu_knob_notice(config: &WorkFinderConfig) -> Option<String> {
+    let env_set: Vec<&str> = DEPRECATED_CPU_ENV_VARS
+        .iter()
+        .copied()
+        .filter(|v| std::env::var_os(v).is_some())
+        .collect();
+    if config.deprecated_cpu_keys.is_empty() && env_set.is_empty() {
+        return None;
+    }
+    let mut sources = Vec::new();
+    if !config.deprecated_cpu_keys.is_empty() {
+        sources.push(format!("config `autonomous.{{{}}}`", config.deprecated_cpu_keys.join(", ")));
+    }
+    if !env_set.is_empty() {
+        sources.push(format!("env {}", env_set.join(", ")));
+    }
+    Some(format!(
+        "{} set but IGNORED — #4512 removed the CPU-headroom term from the admission formula \
+         (now min(token axis, disk headroom, maxConcurrent)). Tune \
+         `autonomous.workFinder.maxConcurrent` for this machine instead; heavy build/test stages \
+         are serialized by the machine-wide build slot (LOOM_BUILD_SLOTS), and the host-distress \
+         breaker remains the load safety net. Delete the setting(s) to silence this warning.",
+        sources.join(" and ")
+    ))
+}
+
+/// Log a single deprecation warning naming any retired CPU-headroom knob still
+/// set in config or the environment (#4512).
+///
+/// Accepted-but-ignored is a deliberate compatibility contract: a fleet upgrades
+/// the daemon binary before it edits every repo's committed `.loom/config.json`,
+/// so a stale key must **never** be a parse error — it must be a *visible*
+/// no-op. Called once at daemon startup, it is internally idempotent via
+/// [`std::sync::Once`], so extra call sites are free. CLI subcommands print
+/// [`deprecated_cpu_knob_notice`] to stderr instead (no logger is initialized on
+/// that path).
+pub fn warn_deprecated_cpu_knobs(config: &WorkFinderConfig) {
+    let Some(notice) = deprecated_cpu_knob_notice(config) else {
+        return;
+    };
+    DEPRECATION_WARNED.call_once(|| {
+        log::warn!("work_finder: {notice}");
+    });
 }
 
 /// Resolve whether the loop is enabled with precedence **env > config >
@@ -1219,8 +1350,8 @@ fn env_max_admissions_per_tick() -> Option<usize> {
 /// Resolve the per-tick admission (ramp) cap with precedence **env > config
 /// (`autonomous.workFinder.maxAdmissionsPerTick`) > default** (#4234).
 /// Resolved once at daemon startup — the same startup-capture pattern as
-/// [`resolve_cpu_utilization_target`] / [`resolve_cpu_est_cores_per_sweep`]
-/// (#4032) — and threaded through to [`spawn_work_finder_task`] /
+/// [`resolve_max_concurrent_with_config`] / [`resolve_per_token_concurrency`]
+/// — and threaded through to [`spawn_work_finder_task`] /
 /// [`spawn_multi_work_finder_task`] as a plain `usize`, mirroring
 /// `per_token_concurrency`. See [`WORK_FINDER_MAX_ADMISSIONS_PER_TICK_ENV`] for
 /// why this is a deliberate startup-capture, not a per-tick re-read: the ramp
@@ -1257,29 +1388,10 @@ pub fn resolve_per_token_concurrency(config: &WorkFinderConfig) -> usize {
         .unwrap_or(DEFAULT_PER_TOKEN_CONCURRENCY)
 }
 
-/// Resolve the CPU headroom term's utilization-target knob with precedence
-/// **env > config > default** (#4032). Thin wrapper over
-/// [`crate::cpu_headroom::resolve_utilization_target`] that reads the config
-/// half from this module's already-parsed [`WorkFinderConfig`], mirroring how
-/// [`resolve_per_token_concurrency`] reads `config.per_token_concurrency`.
-#[must_use]
-pub fn resolve_cpu_utilization_target(config: &WorkFinderConfig) -> f64 {
-    resolve_utilization_target(config.cpu_utilization_target)
-}
-
-/// Resolve the CPU headroom term's est-cores-per-sweep knob with precedence
-/// **env > config > default** (#4032). Thin wrapper over
-/// [`crate::cpu_headroom::resolve_est_cores_per_sweep`]; see
-/// [`resolve_cpu_utilization_target`].
-#[must_use]
-pub fn resolve_cpu_est_cores_per_sweep(config: &WorkFinderConfig) -> f64 {
-    resolve_est_cores_per_sweep(config.est_cores_per_sweep)
-}
-
 /// Compute the **work-driven dynamic concurrency cap** (Phase B, #3811;
-/// per-token concurrency factor added in #3947; CPU/load term added in
-/// #3978): `min(token_limit × per_token_concurrency, disk_headroom,
-/// cpu_headroom, configured_max)`.
+/// per-token concurrency factor added in #3947; CPU term **removed** in
+/// #4512): `min(token_limit × per_token_concurrency, disk_headroom,
+/// configured_max)`.
 ///
 /// This is the total-concurrency ceiling for the loop, recomputed every tick
 /// from live inputs. It deliberately does **not** fold in the backlog depth:
@@ -1290,11 +1402,11 @@ pub fn resolve_cpu_est_cores_per_sweep(config: &WorkFinderConfig) -> f64 {
 /// `loom:building` sweeps that are **not** in the ready backlog. Folding backlog
 /// into the cap here would under-utilize the pool whenever prior-tick sweeps are
 /// still running (a smaller "new work" number would cap total occupancy below
-/// the pool/disk/cpu ceiling). Keeping the cap as `min(token×factor, disk, cpu,
+/// the pool/disk ceiling). Keeping the cap as `min(token×factor, disk,
 /// configured)` and letting `tick` apply the backlog bound is what makes
 /// concurrency scale up with the backlog and drain to zero when it empties.
 ///
-/// The bounds map directly to the resource each protects:
+/// The three bounds map directly to the resource each protects:
 /// - `token_limit` — the count of *healthy* accounts (or the raw pool when no
 ///   ranking exists). **Multiplied by `per_token_concurrency`** (#3947): a plan
 ///   limit is a utilization-window token bucket, not a session count, so one
@@ -1304,17 +1416,32 @@ pub fn resolve_cpu_est_cores_per_sweep(config: &WorkFinderConfig) -> f64 {
 ///   even though the single healthy account had ample session-window headroom.
 /// - `disk_headroom` — never provision more worktrees than the scratch volume
 ///   can hold at `LOOM_PER_WORKTREE_GB` each.
-/// - `cpu_headroom` (#3978) — never start more concurrent sweeps than the host
-///   has CPU/load headroom for, at `LOOM_EST_CORES_PER_SWEEP` estimated cores
-///   each. This is the term the pre-#3978 formula lacked: a token-axis jump
-///   (e.g. several exhausted accounts resetting at once) used to raise the
-///   cap regardless of how many concurrent `cargo build`s were already
-///   running in worktrees, which could starve the main-health gate's own
-///   build of CPU badly enough to false-time-out. See
-///   [`crate::cpu_headroom::cpu_headroom_limit`].
-/// - `configured_max` — the operator ceiling
-///   (`LOOM_WORK_FINDER_MAX_CONCURRENT`), a hard upper bound regardless of how
-///   much token/disk/cpu headroom exists.
+/// - `configured_max` — **the** per-machine admission knob
+///   (`LOOM_WORK_FINDER_MAX_CONCURRENT` / `autonomous.workFinder.maxConcurrent`),
+///   tuned empirically per host.
+///
+/// # Why there is no CPU term any more (#4512)
+///
+/// A fourth axis used to sit in this `min(...)`: `cpu_headroom = (logical_cpus ×
+/// cpuUtilizationTarget − consumed_cores) / estCoresPerSweep` (#3978, measured-idle
+/// signal #4031). It was **deleted**, deliberately reversing that design:
+///
+/// - It priced **every** sweep as a build (`estCoresPerSweep`, calibrated
+///   against Rust build phases), but sweep wall-clock is dominated by API-wait
+///   (curator / builder / judge conversations). It therefore throttled the
+///   low-CPU majority to defend against the heavy-build minority: on an 8-core
+///   worker measured **95% idle**, the term computed a cap of `2`.
+/// - The two remaining axes meter genuinely **exhaustible** resources (accounts,
+///   bytes) and can be counted exactly. A CPU *estimate* is neither exact nor
+///   exhaustible — it was a proxy for "will a build starve another build".
+/// - That real concern is now handled where the load actually is: the
+///   machine-wide build slot ([`crate::build_slot`]) serializes the designated
+///   high-CPU stages across concurrent sweeps, so N sweeps run while at most 1–2
+///   build.
+/// - The safety net for a mis-set knob is **measurement, not estimation**: the
+///   host-distress circuit breaker ([`crate::host_breaker`], #4235) suspends
+///   dispatch on observed load-per-core, and the per-tick admission ramp cap
+///   (#4234) still bounds how fast occupancy can grow.
 ///
 /// `per_token_concurrency` is clamped to a floor of `1` so a mis-set `0`
 /// degrades to the pre-#3947 one-sweep-per-account behavior rather than
@@ -1325,13 +1452,11 @@ pub fn resolve_dynamic_max_concurrent(
     token_limit: usize,
     per_token_concurrency: usize,
     disk_headroom: usize,
-    cpu_headroom: usize,
     configured_max: usize,
 ) -> usize {
     token_limit
         .saturating_mul(per_token_concurrency.max(1))
         .min(disk_headroom)
-        .min(cpu_headroom)
         .min(configured_max)
 }
 
@@ -1343,14 +1468,14 @@ pub fn resolve_dynamic_max_concurrent(
 /// handle so the daemon can keep it alive for the process lifetime.
 ///
 /// Every `interval`, the task recomputes the **dynamic** concurrency cap
-/// (Phase B, #3811; CPU/load term #3978) — `min(token-pool size, disk
-/// headroom, cpu/load headroom, configured_max)` via
-/// [`resolve_dynamic_max_concurrent`] — from live inputs read fresh under
-/// `workspace_root`, then runs one [`tick`] with it. The cap is **not** captured
-/// once at startup, so a pool that grows/shrinks (`loom-tokens bootstrap`), a
-/// scratch volume that fills/frees, current host load, or a draining backlog
-/// are all honored without a daemon restart. `configured_max` is the operator
-/// ceiling (`LOOM_WORK_FINDER_MAX_CONCURRENT`).
+/// (Phase B, #3811; CPU term removed in #4512) — `min(token axis, disk
+/// headroom, configured_max)` via [`resolve_dynamic_max_concurrent`] — from
+/// live inputs read fresh under `workspace_root`, then runs one [`tick`] with
+/// it. The cap is **not** captured once at startup, so a pool that
+/// grows/shrinks (`loom-daemon tokens bootstrap`), a scratch volume that fills/frees,
+/// or a draining backlog are all honored without a daemon restart.
+/// `configured_max` is the per-machine admission knob
+/// (`LOOM_WORK_FINDER_MAX_CONCURRENT`).
 ///
 /// Unlike the epic supervisor, no dedicated OS thread is needed:
 /// [`SweepRegistry::dispatch`] returns promptly (fire-and-forget child spawn),
@@ -1368,8 +1493,6 @@ pub fn spawn_work_finder_task<S, D>(
     workspace_root: PathBuf,
     configured_max: usize,
     per_token_concurrency: usize,
-    cpu_utilization_target: f64,
-    cpu_est_cores_per_sweep: f64,
     max_admissions_per_tick: usize,
     health_state: Arc<MainHealthState>,
     suppress_dispatch_during_gate: bool,
@@ -1383,7 +1506,7 @@ where
         "work_finder: starting loop (interval={}s, configured_max={configured_max}, \
          per_token_concurrency={per_token_concurrency}, \
          max_admissions_per_tick={max_admissions_per_tick}, \
-         dynamic cap = min(healthy tokens × per-token, disk, cpu, configured_max))",
+         dynamic cap = min(healthy tokens × per-token, disk, configured_max))",
         interval.as_secs()
     );
     tokio::spawn(async move {
@@ -1475,40 +1598,28 @@ where
             let token_limit = ranking.as_ref().map_or(pool_size, |r| r.available);
             log_healthy_token_transition(&mut was_healthy_tokens, token_limit, ranking.as_ref());
             let disk = disk_headroom_limit(&workspace_root);
-            // CPU headroom (#3978; measured-idle signal #4031): the term the
-            // pre-#3978 formula lacked. `cpu_headroom_limit()` refreshes the
-            // memoized idle sample, which sleeps ~1s on macOS (`iostat`), so it
-            // is moved off the runtime via `spawn_blocking`; a join error falls
-            // back to the policy floor of 1 (soft backoff, never a hard halt).
-            // `cpu_utilization_target` / `cpu_est_cores_per_sweep` are resolved
-            // once at startup (env > config > default, #4032) and captured by
-            // this task, mirroring `per_token_concurrency`. NOTE (#4234): a
-            // release-build-heavy repo should raise `estCoresPerSweep` well
-            // above the shipped default of 2.0 — a `cargo build --release`
-            // parallelizes across every core via rustc codegen units, so 6
-            // concurrent release builds demand far closer to `6 × ncpu` than
-            // `6 × 2`. The per-tick `max_admissions_per_tick` ramp cap below is
-            // a second, independent backstop for exactly this under-estimate:
-            // even if `estCoresPerSweep` is miscalibrated too low and the cpu
-            // axis over-admits, the ramp cap still bounds how many of those
-            // over-admitted sweeps land in any single tick.
-            let cpu = tokio::task::spawn_blocking(move || {
-                cpu_headroom_limit(cpu_utilization_target, cpu_est_cores_per_sweep)
-            })
-            .await
-            .unwrap_or(1);
+            // Refresh the memoized CPU idle sample. Purely **observational**
+            // since #4512 — it no longer feeds admission, it feeds the
+            // `idle=` figure below plus `loom-daemon status` / `calibrate`, which
+            // is how an operator decides whether to raise or lower
+            // `maxConcurrent` for this machine. The refresh sleeps ~1s on macOS
+            // (`iostat`), so it stays on `spawn_blocking`; a join error just
+            // leaves the previous sample in place.
+            let _ = tokio::task::spawn_blocking(crate::cpu_headroom::refresh_cpu_util_cache).await;
+            let idle = crate::cpu_headroom::cached_cpu_idle_fraction();
             let max_concurrent = resolve_dynamic_max_concurrent(
                 token_limit,
                 per_token_concurrency,
                 disk,
-                cpu,
                 configured_max,
             );
             let axis_line = format!(
                 "work_finder: dynamic cap = {max_concurrent} (pool={pool_size}, \
                  healthy_tokens={token_limit}, per_token={per_token_concurrency}, disk={disk}, \
-                 cpu={cpu}, configured_max={configured_max}, \
-                 max_admissions_per_tick={max_admissions_per_tick}, halted={halted})"
+                 configured_max={configured_max}, \
+                 max_admissions_per_tick={max_admissions_per_tick}, halted={halted}, \
+                 observed_idle={})",
+                format_idle(idle)
             );
             if was_max_concurrent != Some(max_concurrent) {
                 log::info!("{axis_line}");
@@ -1537,6 +1648,7 @@ where
                     if report.dispatched > 0
                         || report.errors > 0
                         || report.skipped_quarantined > 0
+                        || report.skipped_backoff > 0
                         || report.skipped_pr_open > 0
                         || report.skipped_peer_claim > 0
                         || report.deferred_ramp_cap > 0
@@ -1544,9 +1656,10 @@ where
                         log::info!(
                             "work_finder: tick — cap {max_concurrent} (pool={pool_size}, \
                              healthy={token_limit}, per_token={per_token_concurrency}, disk={disk}, \
-                             cpu={cpu}, ceiling={configured_max}, ramp_cap={max_admissions_per_tick}); \
+                             ceiling={configured_max}, ramp_cap={max_admissions_per_tick}); \
                              {} seen, {} dispatched, {} labeled-skip, {} in-flight-skip, \
-                             {} quarantine-skip, {} pr-open-skip, {} peer-claim-skip, \
+                             {} quarantine-skip, {} backoff-skip, {} pr-open-skip, \
+                             {} peer-claim-skip, \
                              {} deferred (capacity), {} deferred (ramp), {} error(s), \
                              {} cross-host-collision(s)",
                             report.seen,
@@ -1554,6 +1667,7 @@ where
                             report.skipped_labeled,
                             report.skipped_in_flight,
                             report.skipped_quarantined,
+                            report.skipped_backoff,
                             report.skipped_pr_open,
                             report.skipped_peer_claim,
                             report.deferred_capacity,
@@ -1571,7 +1685,6 @@ where
                             pool_size,
                             token_limit,
                             disk,
-                            cpu,
                             configured_max,
                             report.deferred_capacity,
                             capacity::DEFAULT_ADVISORY_MIN_QUEUED,
@@ -1636,17 +1749,13 @@ where
 /// the `(repo, issue)` key that disambiguates them is phase c (#3929). No new
 /// topic shape is introduced here (CLAUDE.md: "New topics require a follow-up
 /// issue").
-#[allow(clippy::too_many_arguments)] // dynamic-cap inputs (#4032 adds two more
-                                     // resolved-once-at-startup f64 knobs, mirroring
-                                     // per_token_concurrency) + shared state.
+#[allow(clippy::too_many_arguments)] // dynamic-cap inputs + shared state.
 pub fn spawn_multi_work_finder_task(
     pool: Arc<WorkspacePool>,
     fallback_root: PathBuf,
     interval: Duration,
     configured_max: usize,
     per_token_concurrency: usize,
-    cpu_utilization_target: f64,
-    cpu_est_cores_per_sweep: f64,
     max_admissions_per_tick: usize,
     health_states: Arc<WorkspaceHealthStates>,
     suppress_dispatch_during_gate: bool,
@@ -1657,7 +1766,7 @@ pub fn spawn_multi_work_finder_task(
     log::info!(
         "work_finder: starting multi-workspace loop (interval={}s, configured_max={configured_max}, \
          per_token_concurrency={per_token_concurrency}, max_admissions_per_tick={max_admissions_per_tick}, \
-         dynamic cap = min(healthy tokens × per-token, disk, cpu, configured_max), global across workspaces)",
+         dynamic cap = min(healthy tokens × per-token, disk, configured_max), global across workspaces)",
         interval.as_secs()
     );
     tokio::spawn(async move {
@@ -1739,24 +1848,17 @@ pub fn spawn_multi_work_finder_task(
             let token_limit = ranking.as_ref().map_or(pool_size, |r| r.available);
             log_healthy_token_transition(&mut was_healthy_tokens, token_limit, ranking.as_ref());
             let disk = disk_headroom_limit(&fallback_root);
-            // CPU headroom (#3978; measured-idle signal #4031) — also a
-            // machine-level resource, probed once per tick and shared across
-            // every workspace. Moved off the runtime via `spawn_blocking` since
-            // the macOS `iostat` refresh sleeps ~1s; a join error falls back to
-            // the policy floor of 1. `cpu_utilization_target` /
-            // `cpu_est_cores_per_sweep` are resolved once at startup (env >
-            // config > default, #4032) and captured by this task, mirroring
-            // `per_token_concurrency`.
-            let cpu = tokio::task::spawn_blocking(move || {
-                cpu_headroom_limit(cpu_utilization_target, cpu_est_cores_per_sweep)
-            })
-            .await
-            .unwrap_or(1);
+            // Refresh the memoized CPU idle sample — **observational only**
+            // since #4512 (see the single-workspace loop above). It feeds the
+            // `observed_idle=` figure in the axis line and `loom-daemon status`
+            // / `calibrate`, which is how an operator tunes this machine's
+            // `maxConcurrent`; it no longer gates admission.
+            let _ = tokio::task::spawn_blocking(crate::cpu_headroom::refresh_cpu_util_cache).await;
+            let idle = crate::cpu_headroom::cached_cpu_idle_fraction();
             let max_concurrent = resolve_dynamic_max_concurrent(
                 token_limit,
                 per_token_concurrency,
                 disk,
-                cpu,
                 configured_max,
             );
 
@@ -1823,9 +1925,10 @@ pub fn spawn_multi_work_finder_task(
             let axis_line = format!(
                 "work_finder: dynamic cap = {max_concurrent} (pool={pool_size}, \
                  healthy_tokens={token_limit}, per_token={per_token_concurrency}, disk={disk}, \
-                 cpu={cpu}, configured_max={configured_max}, \
+                 configured_max={configured_max}, \
                  max_admissions_per_tick={max_admissions_per_tick}, any_halted={any_halted}, \
-                 workspaces={}, priorities={priorities:?})",
+                 observed_idle={}, workspaces={}, priorities={priorities:?})",
+                format_idle(idle),
                 pairs.len()
             );
             if was_max_concurrent != Some(max_concurrent) {
@@ -1858,6 +1961,7 @@ pub fn spawn_multi_work_finder_task(
             if report.dispatched > 0
                 || report.errors > 0
                 || report.skipped_quarantined > 0
+                || report.skipped_backoff > 0
                 || report.skipped_pr_open > 0
                 || report.skipped_peer_claim > 0
                 || report.deferred_ramp_cap > 0
@@ -1865,10 +1969,11 @@ pub fn spawn_multi_work_finder_task(
                 log::info!(
                     "work_finder: tick — cap {max_concurrent} (pool={pool_size}, \
                      healthy={token_limit}, per_token={per_token_concurrency}, disk={disk}, \
-                     cpu={cpu}, ceiling={configured_max}, ramp_cap={max_admissions_per_tick}); \
+                     ceiling={configured_max}, ramp_cap={max_admissions_per_tick}); \
                      {} workspace(s), \
                      {} seen, {} dispatched, {} labeled-skip, {} in-flight-skip, \
-                     {} quarantine-skip, {} pr-open-skip, {} peer-claim-skip, \
+                     {} quarantine-skip, {} backoff-skip, {} pr-open-skip, \
+                     {} peer-claim-skip, \
                      {} deferred (capacity), {} deferred (ramp), {} error(s), \
                      {} cross-host-collision(s)",
                     pairs.len(),
@@ -1877,6 +1982,7 @@ pub fn spawn_multi_work_finder_task(
                     report.skipped_labeled,
                     report.skipped_in_flight,
                     report.skipped_quarantined,
+                    report.skipped_backoff,
                     report.skipped_pr_open,
                     report.skipped_peer_claim,
                     report.deferred_capacity,
@@ -1892,7 +1998,6 @@ pub fn spawn_multi_work_finder_task(
                     pool_size,
                     token_limit,
                     disk,
-                    cpu,
                     configured_max,
                     report.deferred_capacity,
                     capacity::DEFAULT_ADVISORY_MIN_QUEUED,
@@ -1923,6 +2028,17 @@ pub fn spawn_multi_work_finder_task(
     })
 }
 
+/// Render the measured CPU idle fraction for the per-tick axis line as a
+/// percentage, or `"n/a"` when no sample exists yet (#4512).
+///
+/// This figure is **observational**: it is no longer an input to the cap (the
+/// CPU term is gone), it is the evidence an operator uses to decide whether this
+/// machine's `maxConcurrent` is too low (host sits idle) or too high (host is
+/// saturated / the breaker trips).
+fn format_idle(idle: Option<f64>) -> String {
+    idle.map_or_else(|| "n/a".to_string(), |f| format!("{:.0}%", f * 100.0))
+}
+
 /// Log the count of healthy (`available`) token accounts once, on a **state
 /// change** — never every tick (#4344 AC).
 ///
@@ -1948,7 +2064,7 @@ fn log_healthy_token_transition(
         if healthy == 0 {
             log::warn!(
                 "work_finder: healthy token accounts {old} -> 0 (of {total}) — dispatch is \
-                 token-starved until an account resets or is added (`loom-tokens check --ranking`)"
+                 token-starved until an account resets or is added (`loom-daemon tokens check --ranking`)"
             );
         } else {
             log::info!(
@@ -2153,6 +2269,19 @@ pub mod forge {
             }
         }
 
+        /// Issues inside a live per-issue dispatch-backoff window (Issue #4485).
+        /// Pure in-memory read of the registry state the reaper maintains — no
+        /// forge round trip, mirroring `quarantined()`.
+        fn backed_off(&self) -> HashSet<u32> {
+            match self.registry.lock() {
+                Ok(reg) => reg.dispatch_backoff_issues(chrono::Utc::now()),
+                Err(poisoned) => {
+                    log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
+                    HashSet::new()
+                }
+            }
+        }
+
         /// Discounted occupancy count (Issue #4003): a sweep dispatched longer
         /// than the registry's configured startup-proof grace window with zero
         /// observed startup signal does not count toward the budget — see
@@ -2313,6 +2442,14 @@ mod tests {
         parked_issues: HashSet<u32>,
         /// Issue numbers this dispatcher reports as quarantined (Issue #3939).
         quarantined: HashSet<u32>,
+        /// Issue numbers this dispatcher reports as inside a dispatch-backoff
+        /// window (Issue #4485).
+        backed_off: HashSet<u32>,
+        /// Issue numbers whose dispatch should be refused by the dispatch-backoff
+        /// guard (#4485) — the dispatcher returns the typed
+        /// [`DispatchBackoffError`], as `SweepRegistry::dispatch` step 2.8 does
+        /// when a window is armed mid-tick.
+        backoff_refuse_issues: HashSet<u32>,
         /// Cumulative cross-host collision count this dispatcher reports (#4085).
         collisions: u64,
         /// Issue numbers a peer host has soft-claimed over safehouse (#4028).
@@ -2326,6 +2463,9 @@ mod tests {
         fn quarantined(&self) -> HashSet<u32> {
             self.quarantined.clone()
         }
+        fn backed_off(&self) -> HashSet<u32> {
+            self.backed_off.clone()
+        }
         fn collisions(&self) -> u64 {
             self.collisions
         }
@@ -2333,6 +2473,14 @@ mod tests {
             self.peer_claimed.clone()
         }
         fn dispatch(&mut self, issue: u32) -> Result<bool> {
+            if self.backoff_refuse_issues.contains(&issue) {
+                return Err(DispatchBackoffError {
+                    issue,
+                    consecutive: 2,
+                    retry_after_secs: 120,
+                }
+                .into());
+            }
             if self.pr_open_issues.contains(&issue) {
                 // Mirror the production `SweepRegistry::dispatch` open-PR guard:
                 // refuse with the typed, downcast-matchable error (#4123).
@@ -2633,6 +2781,58 @@ exit 0
     }
 
     #[test]
+    fn test_tick_skips_backed_off_issue() {
+        // Dispatch backoff (#4485): an issue inside its backoff window is skipped
+        // — never dispatched — and counted in `skipped_backoff`, while its
+        // healthy siblings dispatch normally.
+        let mut source = FakeSource::once(vec![issue(1), issue(2), issue(3)]);
+        let mut disp = RecordingDispatcher {
+            backed_off: HashSet::from([2]),
+            ..Default::default()
+        };
+        let report = tick(&mut source, &mut disp, 10, false).unwrap();
+
+        assert_eq!(report.skipped_backoff, 1, "#2 is inside its backoff window");
+        assert_eq!(report.dispatched, 2, "#1 and #3 still dispatch");
+        assert_eq!(disp.dispatched, vec![1, 3], "#2 never dispatched");
+    }
+
+    #[test]
+    fn test_tick_backed_off_does_not_consume_capacity_slot() {
+        // The backoff skip happens BEFORE the capacity gate (like quarantine), so
+        // a backed-off issue never reserves a slot the healthy sibling could use.
+        let mut source = FakeSource::once(vec![issue(1), issue(2)]);
+        let mut disp = RecordingDispatcher {
+            backed_off: HashSet::from([1]),
+            ..Default::default()
+        };
+        let report = tick(&mut source, &mut disp, 1, false).unwrap();
+
+        assert_eq!(report.skipped_backoff, 1);
+        assert_eq!(report.dispatched, 1);
+        assert_eq!(disp.dispatched, vec![2], "the single slot goes to the healthy #2");
+    }
+
+    #[test]
+    fn test_tick_attributes_backoff_refusal_to_skipped_backoff() {
+        // A backoff window armed mid-tick (by a reap between `backed_off()` and
+        // the dispatch call) surfaces as the typed `DispatchBackoffError`. That is
+        // a deliberate skip, NOT a dispatch failure: it must land in
+        // `skipped_backoff`, never in `errors`.
+        let mut source = FakeSource::once(vec![issue(7), issue(8)]);
+        let mut disp = RecordingDispatcher {
+            backoff_refuse_issues: HashSet::from([7]),
+            ..Default::default()
+        };
+        let report = tick(&mut source, &mut disp, 10, false).unwrap();
+
+        assert_eq!(report.skipped_backoff, 1, "#7's refusal is a backoff skip");
+        assert_eq!(report.errors, 0, "a backoff refusal is never a dispatch error");
+        assert_eq!(report.dispatched, 1);
+        assert_eq!(disp.dispatched, vec![8]);
+    }
+
+    #[test]
     fn test_tick_quarantined_does_not_consume_capacity_slot() {
         // The quarantine skip happens BEFORE the capacity gate, so a quarantined
         // issue never reserves a slot: with cap 1 and #1 quarantined, #2 gets the
@@ -2671,6 +2871,48 @@ exit 0
         assert_eq!(report.dispatched, 1);
         assert!(multi[0].1.dispatched.is_empty(), "quarantined workspace dispatches nothing");
         assert_eq!(multi[1].1.dispatched, vec![10], "healthy sibling gets the shared slot");
+    }
+
+    #[test]
+    fn test_tick_multi_backed_off_workspace_does_not_starve_sibling() {
+        // #4485, mirroring the #3939 quarantine property: workspace A's only
+        // candidate is inside its dispatch-backoff window; workspace B has a
+        // healthy candidate. With a shared cap of 1, B's issue MUST be dispatched
+        // — a backed-off candidate never reserves the shared slot.
+        let mut multi = vec![
+            (
+                FakeSource::once(vec![issue(1)]),
+                RecordingDispatcher {
+                    backed_off: HashSet::from([1]),
+                    ..Default::default()
+                },
+            ),
+            (FakeSource::once(vec![issue(10)]), RecordingDispatcher::default()),
+        ];
+        let report = tick_multi(&mut multi, &[], 1, &[false, false]);
+
+        assert_eq!(report.skipped_backoff, 1, "workspace A's #1 is backed off");
+        assert_eq!(report.dispatched, 1);
+        assert!(multi[0].1.dispatched.is_empty(), "backed-off workspace dispatches nothing");
+        assert_eq!(multi[1].1.dispatched, vec![10], "healthy sibling gets the shared slot");
+    }
+
+    #[test]
+    fn test_tick_multi_backoff_refusal_counts_as_backoff_skip() {
+        // A mid-tick backoff refusal in `tick_multi` is attributed to
+        // `skipped_backoff`, not `errors` — same typed-downcast rule as `tick`.
+        let mut multi = vec![(
+            FakeSource::once(vec![issue(5), issue(6)]),
+            RecordingDispatcher {
+                backoff_refuse_issues: HashSet::from([5]),
+                ..Default::default()
+            },
+        )];
+        let report = tick_multi(&mut multi, &[], 10, &[false]);
+
+        assert_eq!(report.skipped_backoff, 1);
+        assert_eq!(report.errors, 0);
+        assert_eq!(multi[0].1.dispatched, vec![6]);
     }
 
     #[test]
@@ -3534,29 +3776,45 @@ exit 0
 
     // ===================================================================
     // resolve_dynamic_max_concurrent — Phase B work-driven policy (#3811),
-    // per-token concurrency factor (#3947), CPU/load headroom term (#3978)
+    // per-token concurrency factor (#3947), CPU term REMOVED (#4512)
     // ===================================================================
 
     #[test]
-    fn test_dynamic_cap_is_min_of_four_inputs() {
-        // Never exceeds any of the four bounds (factor 1 = pre-#3947 semantics).
-        assert_eq!(resolve_dynamic_max_concurrent(10, 1, 10, 10, 10), 10);
-        assert_eq!(resolve_dynamic_max_concurrent(2, 1, 9, 9, 9), 2, "token axis binds");
-        assert_eq!(resolve_dynamic_max_concurrent(9, 1, 3, 9, 9), 3, "disk binds");
-        assert_eq!(resolve_dynamic_max_concurrent(9, 1, 9, 4, 9), 4, "cpu binds");
-        assert_eq!(resolve_dynamic_max_concurrent(9, 1, 9, 9, 4), 4, "ceiling binds");
+    fn test_dynamic_cap_is_min_of_three_inputs() {
+        // Never exceeds any of the three bounds (factor 1 = pre-#3947 semantics).
+        assert_eq!(resolve_dynamic_max_concurrent(10, 1, 10, 10), 10);
+        assert_eq!(resolve_dynamic_max_concurrent(2, 1, 9, 9), 2, "token axis binds");
+        assert_eq!(resolve_dynamic_max_concurrent(9, 1, 3, 9), 3, "disk binds");
+        assert_eq!(resolve_dynamic_max_concurrent(9, 1, 9, 4), 4, "maxConcurrent binds");
+    }
+
+    #[test]
+    fn test_dynamic_cap_has_no_cpu_term_at_all() {
+        // #4512 AC1: the formula is exactly min(token axis, disk, maxConcurrent).
+        // The arity itself is the guard (a 5-arg call no longer compiles), and the
+        // value must be independent of host CPU state: this same input yields the
+        // same cap on a 95%-idle 8-core worker and on a saturated one, which is
+        // the whole point — an idle host must not be throttled to 2 by an
+        // estimate (`estCoresPerSweep`) that priced every sweep as a build.
+        assert_eq!(resolve_dynamic_max_concurrent(6, 2, 36, 10), 10);
+        // The exact #4512 evidence line: healthy 6 × per-token 2 = 12, disk 36,
+        // configured 10 ⇒ 10. Pre-#4512 the cpu term pinned this host at 2.
+        assert_eq!(
+            resolve_dynamic_max_concurrent(6, 2, 36, 10).min(12),
+            10,
+            "no CPU estimate may clamp an idle host below its configured knob"
+        );
     }
 
     #[test]
     fn test_dynamic_cap_pool_size_bound_never_over_subscribes() {
-        // With a large disk headroom, cpu headroom, and ceiling and factor 1,
-        // the token-pool size is the hard bound — the cap never exceeds the
-        // number of accounts.
+        // With a large disk headroom and ceiling and factor 1, the token-pool
+        // size is the hard bound — the cap never exceeds the number of accounts.
         for pool in 0..=5 {
             assert_eq!(
-                resolve_dynamic_max_concurrent(pool, 1, 100, 100, 100),
+                resolve_dynamic_max_concurrent(pool, 1, 100, 100),
                 pool,
-                "cap must equal pool size {pool} when disk/cpu/ceiling are larger"
+                "cap must equal pool size {pool} when disk/ceiling are larger"
             );
         }
     }
@@ -3566,24 +3824,10 @@ exit 0
         // A nearly-full scratch volume (disk headroom 1) caps concurrency at 1
         // even with a big pool, high ceiling, AND a big per-token factor (#3947):
         // stacking never provisions more worktrees than the disk can hold.
-        assert_eq!(resolve_dynamic_max_concurrent(8, 4, 1, 8, 8), 1);
+        assert_eq!(resolve_dynamic_max_concurrent(8, 4, 1, 8), 1);
         // A full volume (0 headroom) drops the cap to 0 — dispatch nothing.
-        assert_eq!(resolve_dynamic_max_concurrent(8, 4, 0, 8, 8), 0);
-    }
-
-    #[test]
-    fn test_dynamic_cap_cpu_headroom_bound() {
-        // #3978 core: a saturated host (cpu headroom 1) caps concurrency at 1
-        // even with a big pool, ample disk, AND a big per-token factor — never
-        // start more concurrent sweep builds than the host's CPU/load headroom
-        // can currently absorb (this is what starved the build-gate's own
-        // `cargo` invocation of CPU in the #3978 incident).
-        assert_eq!(resolve_dynamic_max_concurrent(8, 4, 8, 1, 8), 1);
-        // Unlike disk, the cpu_headroom *term itself* is policy-floored at 1
-        // (see `crate::cpu_headroom::cpu_headroom`), so a caller can never pass
-        // 0 for it from the real end-to-end path — but the raw `min` here still
-        // honors whatever is passed, including a defensive 0.
-        assert_eq!(resolve_dynamic_max_concurrent(8, 4, 8, 0, 8), 0);
+        // #4512 keeps this hard floor: disk meters an exhaustible resource.
+        assert_eq!(resolve_dynamic_max_concurrent(8, 4, 0, 8), 0);
     }
 
     #[test]
@@ -3591,7 +3835,7 @@ exit 0
         // No usable tokens ⇒ cap 0 regardless of the factor (0 × N = 0) ⇒ a
         // subsequent tick dispatches nothing (the spawn path would hard-fail
         // EX_CONFIG anyway).
-        let cap = resolve_dynamic_max_concurrent(0, 2, 10, 10, 10);
+        let cap = resolve_dynamic_max_concurrent(0, 2, 10, 10);
         assert_eq!(cap, 0);
         let mut source = FakeSource::once((1..=3).map(issue).collect());
         let mut disp = RecordingDispatcher::default();
@@ -3604,18 +3848,13 @@ exit 0
     #[test]
     fn test_dynamic_cap_per_token_factor_multiplies_token_axis() {
         // #3947 core: the token axis is `healthy × per-token`, not `healthy × 1`.
-        // 3 healthy accounts × factor 2 = 6, bounded only by disk/cpu/ceiling.
-        assert_eq!(resolve_dynamic_max_concurrent(3, 2, 100, 100, 100), 6);
+        // 3 healthy accounts × factor 2 = 6, bounded only by disk/ceiling.
+        assert_eq!(resolve_dynamic_max_concurrent(3, 2, 100, 100), 6);
         // 2 healthy × factor 3 = 6.
-        assert_eq!(resolve_dynamic_max_concurrent(2, 3, 100, 100, 100), 6);
-        // The product is still clamped by disk, cpu, and the operator ceiling.
-        assert_eq!(resolve_dynamic_max_concurrent(3, 2, 4, 100, 100), 4, "disk clamps the product");
-        assert_eq!(resolve_dynamic_max_concurrent(3, 2, 100, 4, 100), 4, "cpu clamps the product");
-        assert_eq!(
-            resolve_dynamic_max_concurrent(3, 2, 100, 100, 5),
-            5,
-            "ceiling clamps the product"
-        );
+        assert_eq!(resolve_dynamic_max_concurrent(2, 3, 100, 100), 6);
+        // The product is still clamped by disk and the configured knob.
+        assert_eq!(resolve_dynamic_max_concurrent(3, 2, 4, 100), 4, "disk clamps the product");
+        assert_eq!(resolve_dynamic_max_concurrent(3, 2, 100, 5), 5, "ceiling clamps the product");
     }
 
     #[test]
@@ -3623,8 +3862,8 @@ exit 0
         // The load-bearing #3947 scenario (6/7 accounts at their weekly ceiling):
         // ONE healthy account with factor 2 must allow TWO concurrent sweeps —
         // the pre-#3947 implicit 1:1 cap would have collapsed this to 1.
-        let cap = resolve_dynamic_max_concurrent(1, 2, 120, 120, 3);
-        assert_eq!(cap, 2, "1 healthy × per-token 2 = 2 (disk 120, cpu 120, ceiling 3 don't bind)");
+        let cap = resolve_dynamic_max_concurrent(1, 2, 120, 3);
+        assert_eq!(cap, 2, "1 healthy × per-token 2 = 2 (disk 120, ceiling 3 don't bind)");
 
         // And that cap actually dispatches 2 (not 1) against a 2-deep backlog.
         let mut source = FakeSource::once((1..=2).map(issue).collect());
@@ -3639,19 +3878,25 @@ exit 0
     fn test_dynamic_cap_zero_factor_degrades_to_one() {
         // A mis-set factor 0 must NOT collapse the cap to zero — it degrades to
         // the pre-#3947 one-sweep-per-account behavior (floor of 1).
-        assert_eq!(resolve_dynamic_max_concurrent(4, 0, 100, 100, 100), 4);
+        assert_eq!(resolve_dynamic_max_concurrent(4, 0, 100, 100), 4);
     }
 
     #[test]
-    fn test_dynamic_cap_token_axis_jump_bounded_by_cpu_the_3978_scenario() {
-        // The exact incident this issue fixes: several exhausted token
-        // accounts reset at once, jumping the healthy-token count from 2 to
-        // 14 (a pre-#3978 formula would raise the cap to 14 × per-token
-        // regardless of host load). With concurrent Rust builds already
-        // saturating the host (cpu headroom backed off to 3), the cap must
-        // stay bounded at 3, not jump to a CPU-starving 28.
-        let cap = resolve_dynamic_max_concurrent(14, 2, 100, 3, 100);
-        assert_eq!(cap, 3, "cpu headroom protects the host even as the token axis spikes");
+    fn test_token_axis_jump_is_now_bounded_by_max_concurrent_not_cpu() {
+        // The #3978 scenario, re-baselined for #4512: several exhausted token
+        // accounts reset at once, jumping the healthy-token count from 2 to 14,
+        // so the token axis spikes to 14 × 2 = 28. There is no longer a CPU
+        // term to absorb that spike — the per-machine `maxConcurrent` knob is
+        // what bounds it (here 8), and the per-tick admission ramp cap (#4234)
+        // still limits how fast occupancy climbs toward it, with the host
+        // breaker (#4235) as the measured safety net.
+        assert_eq!(resolve_dynamic_max_concurrent(14, 2, 100, 8), 8);
+        // A machine whose operator has NOT tuned the knob rides the shipped
+        // default rather than an estimate of its cores.
+        assert_eq!(
+            resolve_dynamic_max_concurrent(14, 2, 100, DEFAULT_WORK_FINDER_MAX_CONCURRENT),
+            DEFAULT_WORK_FINDER_MAX_CONCURRENT
+        );
     }
 
     // ===================================================================
@@ -3660,10 +3905,10 @@ exit 0
 
     #[test]
     fn test_scale_up_with_growing_backlog_bounded_by_dynamic_cap() {
-        // Fixed resources: pool=4, factor=1, disk=10, cpu=10, ceiling=10 ⇒
+        // Fixed resources: pool=4, factor=1, disk=10, ceiling=10 ⇒
         // dynamic cap 4. As the backlog grows tick-over-tick, effective
         // concurrency scales up but is bounded by the cap (min(cap, backlog)).
-        let cap = resolve_dynamic_max_concurrent(4, 1, 10, 10, 10);
+        let cap = resolve_dynamic_max_concurrent(4, 1, 10, 10);
         assert_eq!(cap, 4);
 
         // Backlog 2 (< cap): all 2 dispatch, nothing deferred.
@@ -3685,7 +3930,7 @@ exit 0
     fn test_scale_to_zero_on_empty_backlog() {
         // Even with ample resources (cap 5), an empty backlog dispatches nothing
         // — no capacity is pre-reserved and no idle workers are spawned.
-        let cap = resolve_dynamic_max_concurrent(5, 1, 5, 5, 5);
+        let cap = resolve_dynamic_max_concurrent(5, 1, 5, 5);
         assert_eq!(cap, 5);
         let mut source = FakeSource::once(vec![]);
         let mut disp = RecordingDispatcher::default();
@@ -3746,90 +3991,144 @@ exit 0
                 max_concurrent: Some(5),
                 max_admissions_per_tick: Some(4),
                 per_token_concurrency: Some(4),
-                cpu_utilization_target: Some(0.6),
-                est_cores_per_sweep: Some(3.5),
+                // Retired keys are recorded (accepted-but-ignored), not parsed.
+                deprecated_cpu_keys: vec!["cpuUtilizationTarget", "estCoresPerSweep"],
             }
         );
     }
 
     // ===================================================================
-    // cpuUtilizationTarget / estCoresPerSweep config parsing (#4032)
+    // Retired cpuUtilizationTarget / estCoresPerSweep knobs: accepted but
+    // IGNORED, never a config error (#4512, replacing the #4032 parsing tests)
     // ===================================================================
 
     #[test]
-    fn test_config_cpu_knobs_read_without_work_finder_block() {
-        // Both knobs live at the `autonomous` level (#4032), so they are read
-        // even when the `workFinder` sub-block is absent — mirroring
-        // `perTokenConcurrency`.
+    fn test_deprecated_cpu_knobs_are_accepted_and_recorded_not_parsed() {
+        // A fleet upgrades the daemon binary before it edits every repo's
+        // committed config, so a stale key must parse fine and simply do nothing
+        // — recorded only so the deprecation warning can name it.
         let tmp = tempfile::tempdir().unwrap();
         write_config(
             tmp.path(),
-            r#"{"autonomous": {"cpuUtilizationTarget": 0.5, "estCoresPerSweep": 1.5}}"#,
+            r#"{"autonomous": {"cpuUtilizationTarget": 0.5, "estCoresPerSweep": 1.5,
+                "workFinder": {"enabled": true, "maxConcurrent": 10}}}"#,
         );
         let cfg = read_work_finder_config(tmp.path());
-        assert_eq!(cfg.cpu_utilization_target, Some(0.5));
-        assert_eq!(cfg.est_cores_per_sweep, Some(1.5));
-        assert_eq!(cfg.enabled, None);
+        assert_eq!(cfg.deprecated_cpu_keys, vec!["cpuUtilizationTarget", "estCoresPerSweep"]);
+        // The live knobs in the same block still parse normally: a deprecated
+        // sibling must never poison the rest of the config.
+        assert_eq!(cfg.enabled, Some(true));
+        assert_eq!(cfg.max_concurrent, Some(10));
     }
 
     #[test]
-    fn test_config_integer_cpu_knobs_parse_as_f64() {
-        // `Value::as_f64` handles integer JSON as well as float — assert it
-        // (#4032 AC: "estCoresPerSweep": 2 as well as 2.0).
-        let tmp = tempfile::tempdir().unwrap();
-        write_config(tmp.path(), r#"{"autonomous": {"estCoresPerSweep": 2}}"#);
-        let cfg = read_work_finder_config(tmp.path());
-        assert_eq!(cfg.est_cores_per_sweep, Some(2.0));
-    }
-
-    #[test]
-    fn test_config_out_of_range_cpu_utilization_target_drops_to_none() {
-        for bad in ["0", "-1", "1.5"] {
+    fn test_deprecated_cpu_knobs_accepted_at_any_value_including_nonsense() {
+        // Pre-#4512 these were range-filtered/type-checked because a value was
+        // consumed. Nothing consumes them now, so out-of-range, wrong-type, and
+        // even absurd values are all equally inert — and equally non-fatal.
+        for body in [
+            r#"{"autonomous": {"cpuUtilizationTarget": 0}}"#,
+            r#"{"autonomous": {"cpuUtilizationTarget": 1.5}}"#,
+            r#"{"autonomous": {"estCoresPerSweep": -2}}"#,
+            r#"{"autonomous": {"estCoresPerSweep": "many"}}"#,
+            r#"{"autonomous": {"estCoresPerSweep": true}}"#,
+        ] {
             let tmp = tempfile::tempdir().unwrap();
-            write_config(
-                tmp.path(),
-                &format!(r#"{{"autonomous": {{"cpuUtilizationTarget": {bad}}}}}"#),
-            );
-            assert_eq!(
-                read_work_finder_config(tmp.path()).cpu_utilization_target,
-                None,
-                "cpuUtilizationTarget={bad} must drop to None, not be clamped"
-            );
+            write_config(tmp.path(), body);
+            let cfg = read_work_finder_config(tmp.path());
+            assert_eq!(cfg.deprecated_cpu_keys.len(), 1, "must be accepted-but-noted: {body}");
+            // And it must not disturb any live knob.
+            assert_eq!(cfg.max_concurrent, None);
+            assert_eq!(cfg.enabled, None);
         }
     }
 
     #[test]
-    fn test_config_out_of_range_est_cores_per_sweep_drops_to_none() {
-        for bad in ["0", "-2"] {
-            let tmp = tempfile::tempdir().unwrap();
-            write_config(
-                tmp.path(),
-                &format!(r#"{{"autonomous": {{"estCoresPerSweep": {bad}}}}}"#),
-            );
-            assert_eq!(
-                read_work_finder_config(tmp.path()).est_cores_per_sweep,
-                None,
-                "estCoresPerSweep={bad} must drop to None, not be clamped"
-            );
-        }
-    }
-
-    #[test]
-    fn test_config_wrong_json_type_cpu_knobs_drop_to_none() {
-        // A string, bool, or null where a number is expected must not panic
-        // and must resolve to None (soft-fail to env/default resolution).
+    fn test_deprecated_cpu_knobs_absent_or_null_are_not_reported() {
         let tmp = tempfile::tempdir().unwrap();
-        write_config(
-            tmp.path(),
-            r#"{"autonomous": {"cpuUtilizationTarget": "0.8", "estCoresPerSweep": true}}"#,
-        );
-        let cfg = read_work_finder_config(tmp.path());
-        assert_eq!(cfg.cpu_utilization_target, None);
-        assert_eq!(cfg.est_cores_per_sweep, None);
+        write_config(tmp.path(), r#"{"autonomous": {"workFinder": {"maxConcurrent": 4}}}"#);
+        assert!(read_work_finder_config(tmp.path())
+            .deprecated_cpu_keys
+            .is_empty());
 
+        // An explicit `null` is "not set" — warning about it would be noise.
         let tmp2 = tempfile::tempdir().unwrap();
         write_config(tmp2.path(), r#"{"autonomous": {"estCoresPerSweep": null}}"#);
-        assert_eq!(read_work_finder_config(tmp2.path()).est_cores_per_sweep, None);
+        assert!(read_work_finder_config(tmp2.path())
+            .deprecated_cpu_keys
+            .is_empty());
+    }
+
+    #[test]
+    fn test_warn_deprecated_cpu_knobs_is_a_noop_without_any_retired_setting() {
+        // No config keys, no env vars — nothing to warn about, and (crucially)
+        // no panic and no config error. The one-shot `Once` inside means this
+        // test cannot assert the log line itself; the observable contract is
+        // that it is safe and side-effect-free on the clean path.
+        warn_deprecated_cpu_knobs(&WorkFinderConfig::default());
+    }
+
+    #[test]
+    #[serial]
+    fn test_deprecated_cpu_knob_notice_is_none_when_nothing_is_set() {
+        for var in DEPRECATED_CPU_ENV_VARS {
+            std::env::remove_var(var);
+        }
+        assert!(deprecated_cpu_knob_notice(&WorkFinderConfig::default()).is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn test_deprecated_cpu_knob_notice_names_the_config_keys_that_are_set() {
+        for var in DEPRECATED_CPU_ENV_VARS {
+            std::env::remove_var(var);
+        }
+        let cfg = WorkFinderConfig {
+            deprecated_cpu_keys: vec!["estCoresPerSweep"],
+            ..Default::default()
+        };
+        let notice = deprecated_cpu_knob_notice(&cfg).expect("a set key must produce a notice");
+        assert!(notice.contains("estCoresPerSweep"), "must name the key: {notice}");
+        assert!(notice.contains("IGNORED"), "must say it is ignored: {notice}");
+        // Actionable: it must point at the knob that replaced it.
+        assert!(
+            notice.contains("autonomous.workFinder.maxConcurrent"),
+            "must name the replacement knob: {notice}"
+        );
+        // A config-only notice must not fabricate an env source.
+        assert!(!notice.contains("env LOOM_"), "no env source was set: {notice}");
+    }
+
+    #[test]
+    #[serial]
+    fn test_deprecated_cpu_knob_notice_names_env_vars_and_combines_both_sources() {
+        std::env::set_var(DEPRECATED_CPU_ENV_VARS[0], "0.85");
+        let env_only = deprecated_cpu_knob_notice(&WorkFinderConfig::default())
+            .expect("a set env var must produce a notice");
+        assert!(env_only.contains(DEPRECATED_CPU_ENV_VARS[0]), "{env_only}");
+
+        let both = deprecated_cpu_knob_notice(&WorkFinderConfig {
+            deprecated_cpu_keys: vec!["estCoresPerSweep"],
+            ..Default::default()
+        })
+        .expect("notice");
+        assert!(both.contains("estCoresPerSweep"), "{both}");
+        assert!(both.contains(DEPRECATED_CPU_ENV_VARS[0]), "{both}");
+        assert!(both.contains(" and "), "both sources must be joined: {both}");
+
+        for var in DEPRECATED_CPU_ENV_VARS {
+            std::env::remove_var(var);
+        }
+    }
+
+    #[test]
+    fn test_deprecated_knob_name_tables_stay_in_sync() {
+        // The config keys and env vars are two halves of one deprecation; a
+        // future edit that adds one must add the other (the warning names both).
+        assert_eq!(DEPRECATED_CPU_CONFIG_KEYS.len(), DEPRECATED_CPU_ENV_VARS.len());
+        assert!(DEPRECATED_CPU_ENV_VARS
+            .iter()
+            .all(|v| v.starts_with("LOOM_")));
     }
 
     #[test]
@@ -4118,56 +4417,31 @@ exit 0
 
     #[test]
     #[serial]
-    fn test_resolve_cpu_utilization_target_precedence() {
-        use crate::cpu_headroom::{DEFAULT_UTILIZATION_TARGET, UTILIZATION_TARGET_ENV};
-        std::env::remove_var(UTILIZATION_TARGET_ENV);
-
-        // Default when neither env nor config set.
-        assert!(
-            (resolve_cpu_utilization_target(&WorkFinderConfig::default())
-                - DEFAULT_UTILIZATION_TARGET)
-                .abs()
-                < f64::EPSILON
-        );
-
-        // Config used when env unset.
+    fn test_retired_cpu_env_vars_are_ignored_not_honored() {
+        // #4512: `LOOM_CPU_UTILIZATION_TARGET` / `LOOM_EST_CORES_PER_SWEEP` no
+        // longer resolve to anything (the functions that read them are gone).
+        // The observable contract is that setting them changes NO cap input and
+        // is not an error — only the deprecation warning notices them.
+        for var in DEPRECATED_CPU_ENV_VARS {
+            std::env::set_var(var, "0.01");
+        }
         let cfg = WorkFinderConfig {
-            cpu_utilization_target: Some(0.6),
+            max_concurrent: Some(10),
+            per_token_concurrency: Some(2),
             ..Default::default()
         };
-        assert!((resolve_cpu_utilization_target(&cfg) - 0.6).abs() < f64::EPSILON);
-
-        // Env overrides config.
-        std::env::set_var(UTILIZATION_TARGET_ENV, "0.5");
-        assert!((resolve_cpu_utilization_target(&cfg) - 0.5).abs() < f64::EPSILON);
-        std::env::remove_var(UTILIZATION_TARGET_ENV);
-    }
-
-    #[test]
-    #[serial]
-    fn test_resolve_cpu_est_cores_per_sweep_precedence() {
-        use crate::cpu_headroom::{DEFAULT_EST_CORES_PER_SWEEP, EST_CORES_PER_SWEEP_ENV};
-        std::env::remove_var(EST_CORES_PER_SWEEP_ENV);
-
-        // Default when neither env nor config set.
-        assert!(
-            (resolve_cpu_est_cores_per_sweep(&WorkFinderConfig::default())
-                - DEFAULT_EST_CORES_PER_SWEEP)
-                .abs()
-                < f64::EPSILON
+        assert_eq!(resolve_max_concurrent_with_config(&cfg), 10);
+        assert_eq!(resolve_per_token_concurrency(&cfg), 2);
+        assert_eq!(
+            resolve_dynamic_max_concurrent(6, resolve_per_token_concurrency(&cfg), 36, 10),
+            10,
+            "a retired env knob must not clamp the cap"
         );
-
-        // Config used when env unset.
-        let cfg = WorkFinderConfig {
-            est_cores_per_sweep: Some(4.0),
-            ..Default::default()
-        };
-        assert!((resolve_cpu_est_cores_per_sweep(&cfg) - 4.0).abs() < f64::EPSILON);
-
-        // Env overrides config.
-        std::env::set_var(EST_CORES_PER_SWEEP_ENV, "1.0");
-        assert!((resolve_cpu_est_cores_per_sweep(&cfg) - 1.0).abs() < f64::EPSILON);
-        std::env::remove_var(EST_CORES_PER_SWEEP_ENV);
+        // Safe to call with only env-side deprecation present (no config keys).
+        warn_deprecated_cpu_knobs(&cfg);
+        for var in DEPRECATED_CPU_ENV_VARS {
+            std::env::remove_var(var);
+        }
     }
 
     // ===================================================================
@@ -4175,7 +4449,7 @@ exit 0
     // ===================================================================
 
     fn pressured_assessment() -> capacity::PressureAssessment {
-        // token_limit 1 < disk 10, cpu 10, ceiling 10; 12 deferred ⇒ token-bound
+        // token_limit 1 < disk 10, ceiling 10; 12 deferred ⇒ token-bound
         // + pressured.
         let snap = capacity::RankingSnapshot {
             total: 7,
@@ -4187,7 +4461,6 @@ exit 0
             Some(&snap),
             7,
             1,
-            10,
             10,
             10,
             12,
@@ -4206,7 +4479,6 @@ exit 0
             Some(&snap),
             7,
             7,
-            10,
             10,
             10,
             0,
@@ -4236,7 +4508,7 @@ exit 0
                 assert!(pressured);
                 assert_eq!(queued, 12);
                 assert_eq!(healthy_accounts, 1);
-                assert!(message.contains("loom-tokens bootstrap"));
+                assert!(message.contains("loom-daemon tokens bootstrap"));
             }
             other => panic!("expected CapacityAdvisory, got {other:?}"),
         }

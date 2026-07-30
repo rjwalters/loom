@@ -55,6 +55,11 @@ An Architecture Decision Record captures an important architectural decision mad
   - **Summary**: Extend the existing Rust `loom-daemon` binary with named sweep dispatch, a pub/sub event bus, and MCP monitoring tools instead of restoring the deleted Python brain
   - **Key Decision**: MCP-tool surface on the existing daemon binary over a restored Python brain or a shell-level `daemon.sh` wrapper
 
+- [ADR-0013: Retire the Python `loom-tools` Package — One Rust Binary Plus Bash](0013-loom-tools-python-retirement.md)
+  - **Status**: Accepted
+  - **Summary**: Delete the ~31.8k-line Python `loom_tools` package over four phases (epic #4081), moving its load-bearing functionality into `loom-daemon` subcommands while every shell entry point keeps its name and flags; motivated by #4079, where a stale editable pip install's frozen console scripts shadowed the Rust binary on PATH
+  - **Key Decision**: One commit-stamped Rust artifact plus bash over a maintained pip install, with a byte-compatible on-disk state contract holding across every phase so no cutover needed a flag day; `loom-search` carved out of the deletion (opt-in, no native port, no test would have caught its removal)
+
 ### CI Infrastructure
 
 - [ADR-0011: CI Runner Platform — Speedup Ceiling and Decision](0011-ci-runner-platform.md)

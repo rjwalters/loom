@@ -361,6 +361,7 @@ mod tests {
         let env = crate::daemon_install_state::EnvOverrides {
             launchd_override: Some(false),
             launchd_label_override: None,
+            launchd_domain_override: None,
             heartbeat_stale_secs_override: None,
             startup_grace_secs_override: Some(0),
             is_darwin: false,

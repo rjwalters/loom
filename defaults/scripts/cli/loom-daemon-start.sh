@@ -75,6 +75,7 @@
 #   ./.loom/scripts/cli/loom-daemon-start.sh --no-systemd    Linux only: use legacy nohup instead of a systemd --user service
 #   ./.loom/scripts/cli/loom-daemon-start.sh --print-plist   Print the LaunchAgent plist that WOULD be installed and exit (no side effects)
 #   ./.loom/scripts/cli/loom-daemon-start.sh --print-unit    Print the systemd --user unit that WOULD be installed and exit (no side effects)
+#   ./.loom/scripts/cli/loom-daemon-start.sh --force-env     Suppress the dropped-env-key warning (#4522) for an intentional narrower re-render
 #   ./.loom/scripts/cli/loom-daemon-start.sh --help
 #
 # Environment:
@@ -258,6 +259,95 @@ extract_plist_path_value() {
         /<key>PATH<\/key>/ { want=1; next }
         want { sub(/^[ \t]*<string>/, ""); sub(/<\/string>[ \t]*$/, ""); print; exit }
     ' "$plist_file"
+}
+
+# ---------- dropped-env-key detection (#4522) ----------
+# Root cause under test: render_launchd_plist / render_systemd_unit render the
+# EnvironmentVariables dict / Environment= lines strictly from whatever THIS
+# invocation has exported ("Respected when already exported" note above). Any
+# invocation missing the operator's exports (a watchdog, a bare re-run, another
+# tool shelling out to this script) silently replaces a richer installed
+# plist/unit with a narrower one -- e.g. every LOOM_SAFEHOUSE_* key and
+# LOOM_WORK_FINDER=1 quietly gone. The functions below detect that KEY REMOVAL
+# (not a value change -- see the PATH-specific drift check above for that) so
+# it is surfaced instead of silently applied.
+
+# extract_plist_env_keys <plist_file> — list of every <key>...</key> entry
+# inside the EnvironmentVariables dict, one per line. Extends
+# extract_plist_path_value's textual-awk approach (no plutil/XML-parser
+# dependency) from a single key to the whole dict.
+extract_plist_env_keys() {
+    local plist_file="$1"
+    [[ -f "$plist_file" ]] || return 1
+    awk '
+        /<key>EnvironmentVariables<\/key>/ { in_env=1; next }
+        in_env && /<\/dict>/ { exit }
+        in_env && /<key>/ {
+            line=$0
+            sub(/^[ \t]*<key>/, "", line)
+            sub(/<\/key>.*$/, "", line)
+            print line
+        }
+    ' "$plist_file"
+}
+
+# extract_systemd_env_keys <unit_file> — list of every `Environment=KEY=...`
+# key in a rendered systemd unit, one per line. The systemd analog of
+# extract_plist_env_keys above.
+extract_systemd_env_keys() {
+    local unit_file="$1"
+    [[ -f "$unit_file" ]] || return 1
+    sed -n 's/^Environment=\([^=]*\)=.*/\1/p' "$unit_file"
+}
+
+# warn_dropped_env_keys <old_file> <new_file> <extractor_function_name> — compare
+# the env-var KEY sets (not values) between an already-installed plist/unit and
+# a freshly-rendered replacement; warn (listing the keys) when the replacement
+# DROPS a key the installed file carried. <extractor_function_name> is
+# extract_plist_env_keys or extract_systemd_env_keys.
+#
+#   - A missing old_file (first-ever install -- nothing installed yet) is not a
+#     drop: returns silently, no warning.
+#   - --force-env (FORCE_ENV=true) acknowledges an intentional narrowing (e.g.
+#     an explicit minimal re-render) and suppresses the warning.
+#   - A dropped LOOM_SAFEHOUSE_* key gets a specific migration hint (the
+#     "safehouse" block in .loom/config.json + --from-config, #4353) instead of
+#     a generic warning.
+warn_dropped_env_keys() {
+    local old_file="$1" new_file="$2" extractor="$3"
+    [[ -f "$old_file" ]] || return 0
+    [[ "${FORCE_ENV:-false}" == "true" ]] && return 0
+
+    local old_keys new_keys
+    old_keys="$("$extractor" "$old_file" 2>/dev/null || true)"
+    [[ -z "$old_keys" ]] && return 0
+    new_keys="$("$extractor" "$new_file" 2>/dev/null || true)"
+
+    local dropped=() k nk hit
+    while IFS= read -r k; do
+        [[ -z "$k" ]] && continue
+        hit=false
+        if [[ -n "$new_keys" ]]; then
+            while IFS= read -r nk; do
+                if [[ "$nk" == "$k" ]]; then hit=true; break; fi
+            done <<< "$new_keys"
+        fi
+        [[ "$hit" == "false" ]] && dropped+=("$k")
+    done <<< "$old_keys"
+
+    [[ "${#dropped[@]}" -eq 0 ]] && return 0
+
+    warn ""
+    warn "WARNING: re-rendering $new_file drops ${#dropped[@]} env key(s) present in the installed $old_file:"
+    for k in "${dropped[@]}"; do
+        if [[ "$k" == LOOM_SAFEHOUSE_* ]]; then
+            warn "  - $k (config-tier equivalent: the \"safehouse\" block in .loom/config.json + --from-config, #4353)"
+        else
+            warn "  - $k"
+        fi
+    done
+    warn "This usually means this invocation ran without the operator's exported env (a watchdog / automated re-render / a bare re-run from a different shell)."
+    warn "Pass --force-env to acknowledge an intentional narrowing and suppress this warning."
 }
 
 # render_launchd_plist <label> <daemon_bin> <workdir> <log_path>
@@ -514,24 +604,33 @@ print_safehouse_status() {
         # every send ('room' required) -- which silently kills narration and
         # peer-claim dedup, and 'loom-daemon status' will show
         # "connected, sends rejected: ...". Surface the caveat statically here.
-        local room
-        room=$(loom_config_get "$REPO_ROOT" "safehouse.room" "" 2>/dev/null || true)
-        if [[ -z "$room" ]]; then
-            echo "               note: safehouse.room is unset -- valid only if safehoused joined exactly one room;" \
-                 "a multi-room host needs an explicit safehouse.room or every send is rejected"
+        # #4225: attention-class routing can supply the room instead, via
+        # safehouse.rooms.signal -- a host that set it needs no scalar
+        # safehouse.room (the resolver falls back from one to the other), so the
+        # caveat must not fire for it.
+        local room signal
+        room=${LOOM_SAFEHOUSE_ROOM:-$(loom_config_get "$REPO_ROOT" "safehouse.room" "" 2>/dev/null || true)}
+        signal=${LOOM_SAFEHOUSE_ROOM_SIGNAL:-$(loom_config_get "$REPO_ROOT" "safehouse.rooms.signal" "" 2>/dev/null || true)}
+        if [[ -z "$room" && -z "$signal" ]]; then
+            echo "               note: safehouse.room is unset (and so is safehouse.rooms.signal) -- valid only if" \
+                 "safehoused joined exactly one room; a multi-room host needs an explicit room id or every send is rejected"
         fi
     else
         warn "Safehouse:     configured, unreachable (socket $socket does not exist -- is safehoused running?)"
     fi
 }
 
-# ---------- calibrate binding-ceiling hint (#4390) ----------
+# ---------- calibrate binding-ceiling hint (#4390, re-based on #4512) ----------
 # `loom-daemon calibrate` is purely file/host-based (no running daemon
 # required, unlike `status`), so it is safe to run right here at start time.
-# One advisory line, printed only when the configured
-# `autonomous.workFinder.maxConcurrent` ceiling is CURRENTLY the binding term
-# AND both the cpu and token axes have at least 2x headroom above it -- i.e.
-# this host is obviously bigger than the shipped default was sized for.
+# One advisory line, printed only when `autonomous.workFinder.maxConcurrent` is
+# CURRENTLY the binding term AND the host is measurably idle -- i.e. this machine
+# is under-subscribed at its current knob.
+#
+# #4512 changed the basis: calibrate no longer computes a *recommended* value
+# (the CPU-headroom term it derived one from is gone; maxConcurrent is now a
+# per-machine knob tuned empirically), so the hint reports the observed idle
+# fraction instead of a number to copy.
 # Never fatal: a missing jq, a calibrate error, or an unparseable payload all
 # fall through silently -- this is advisory-only, exactly like
 # print_safehouse_status above.
@@ -543,22 +642,25 @@ print_calibrate_hint() {
     calib_json="$("$DAEMON_BIN" calibrate --workspace "$REPO_ROOT" --json 2>/dev/null)" || return 0
     [[ -n "$calib_json" ]] || return 0
 
-    local binding ceiling cpu token_axis recommended
-    binding=$(jq -r '.recommendation.binding_term_before // empty' <<<"$calib_json" 2>/dev/null)
+    local binding ceiling idle idle_pct
+    binding=$(jq -r '.binding_term // empty' <<<"$calib_json" 2>/dev/null)
     [[ "$binding" == "ceiling" ]] || return 0
 
     ceiling=$(jq -r '.measurements.configured_max_concurrent // empty' <<<"$calib_json" 2>/dev/null)
-    cpu=$(jq -r '.measurements.cpu_headroom // empty' <<<"$calib_json" 2>/dev/null)
-    token_axis=$(jq -r '.measurements.token_axis_effective // empty' <<<"$calib_json" 2>/dev/null)
-    recommended=$(jq -r '.recommendation.recommended_max_concurrent // empty' <<<"$calib_json" 2>/dev/null)
+    # Integer percent so the comparison below is plain shell arithmetic; `null`
+    # (no idle sample on this host yet) yields an empty string and we bail.
+    idle=$(jq -r '.measurements.cpu_idle_fraction // empty' <<<"$calib_json" 2>/dev/null)
+    [[ -n "$idle" ]] || return 0
+    idle_pct=$(jq -rn --argjson f "$idle" '($f * 100) | floor' 2>/dev/null) || return 0
 
-    # Defensively require all four to be plain non-negative integers before
-    # doing shell arithmetic on them.
-    [[ "$ceiling" =~ ^[0-9]+$ && "$cpu" =~ ^[0-9]+$ && "$token_axis" =~ ^[0-9]+$ && "$recommended" =~ ^[0-9]+$ ]] || return 0
+    # Defensively require plain non-negative integers before shell arithmetic.
+    [[ "$ceiling" =~ ^[0-9]+$ && "$idle_pct" =~ ^[0-9]+$ ]] || return 0
     (( ceiling > 0 )) || return 0
 
-    if (( cpu >= 2 * ceiling )) && (( token_axis >= 2 * ceiling )); then
-        warn "ceiling ${ceiling} binds; this host could run ${recommended} -- run 'loom-daemon calibrate'"
+    # 50% idle mirrors calibrate::IDLE_HEADROOM_FRACTION -- the "grossly
+    # under-subscribed" bar (#4512's motivating host measured 95% idle at cap 2).
+    if (( idle_pct >= 50 )); then
+        warn "maxConcurrent ${ceiling} binds while the host is ${idle_pct}% idle -- consider raising autonomous.workFinder.maxConcurrent ('loom-daemon calibrate' for the full reading)"
     fi
 }
 
@@ -784,6 +886,11 @@ NO_LAUNCHD=false
 NO_SYSTEMD=false
 PRINT_PLIST=false
 PRINT_UNIT=false
+# --force-env (#4522): acknowledges an intentional narrower re-render and
+# suppresses warn_dropped_env_keys' warning. Script-only (like --print-plist),
+# not a daemon autonomy flag -- excluded from the persisted .daemon.flags file
+# below.
+FORCE_ENV=false
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --help|-h) show_help; exit 0 ;;
@@ -797,6 +904,7 @@ while [[ $# -gt 0 ]]; do
         --no-systemd) NO_SYSTEMD=true; shift ;;
         --print-plist) PRINT_PLIST=true; shift ;;
         --print-unit) PRINT_UNIT=true; shift ;;
+        --force-env) FORCE_ENV=true; shift ;;
         *) err "Unknown option '$1'"; echo "Use --help for usage" >&2; exit 1 ;;
     esac
 done
@@ -979,11 +1087,11 @@ fi
 # `loom-daemon-update.sh` reads this file to restart with EXACTLY the same
 # autonomy flags after a rebuild — the FLAGS-OFF/opt-in contract must never
 # widen across an update. Script-only flags that don't describe daemon
-# autonomy state (--foreground/--fg, --help/-h) are filtered out; everything
-# else (--from-config, --work-finder, --health-gate, --no-work-finder,
-# --no-health-gate) is preserved verbatim, one per line. Written on every
-# start attempt (success or failure) so the record always reflects the most
-# recent invocation.
+# autonomy state (--foreground/--fg, --help/-h, --print-plist, --print-unit,
+# --force-env, #4522) are filtered out; everything else (--from-config,
+# --work-finder, --health-gate, --no-work-finder, --no-health-gate) is
+# preserved verbatim, one per line. Written on every start attempt (success or
+# failure) so the record always reflects the most recent invocation.
 FLAGS_FILE="$DAEMON_STATE_HOME/.daemon.flags"
 : > "$FLAGS_FILE"
 # Guard the array expansion: a bare invocation (the common case) leaves
@@ -993,7 +1101,7 @@ FLAGS_FILE="$DAEMON_STATE_HOME/.daemon.flags"
 if [[ "${#ORIGINAL_ARGS[@]}" -gt 0 ]]; then
     for _flag_arg in "${ORIGINAL_ARGS[@]}"; do
         case "$_flag_arg" in
-            --foreground|--fg|--help|-h|--no-launchd|--no-systemd|--print-plist|--print-unit) continue ;;
+            --foreground|--fg|--help|-h|--no-launchd|--no-systemd|--print-plist|--print-unit|--force-env) continue ;;
             *) echo "$_flag_arg" >> "$FLAGS_FILE" ;;
         esac
     done
@@ -1055,7 +1163,8 @@ fi
 
 # ---------- --print-plist: pure inspection, no side effects ----------
 if [[ "$PRINT_PLIST" == "true" ]]; then
-    render_launchd_plist "$(resolve_launchd_label)" "$DAEMON_BIN" "$REPO_ROOT" "$START_LOG"
+    _plist_rendered="$(render_launchd_plist "$(resolve_launchd_label)" "$DAEMON_BIN" "$REPO_ROOT" "$START_LOG")"
+    printf '%s\n' "$_plist_rendered"
     # PATH-drift check (#4172): if a live plist is already installed for this
     # label, compare its PATH against the one just rendered and warn (stderr
     # only -- READ-ONLY, no side effect) when they differ. This is what makes
@@ -1072,13 +1181,32 @@ if [[ "$PRINT_PLIST" == "true" ]]; then
                 echo "+ new:  $PLIST_PATH_VALUE"
             } >&2
         fi
+        # Dropped-env-key check (#4522): read-only inspection counterpart of
+        # the same check the real install path below runs before overwriting.
+        _plist_new_tmp="$(mktemp "${TMPDIR:-/tmp}/loom-print-plist.XXXXXX")"
+        printf '%s\n' "$_plist_rendered" > "$_plist_new_tmp"
+        warn_dropped_env_keys "$_live_plist" "$_plist_new_tmp" extract_plist_env_keys
+        rm -f "$_plist_new_tmp"
     fi
     exit 0
 fi
 
 # ---------- --print-unit: pure inspection, no side effects (#4268) ----------
 if [[ "$PRINT_UNIT" == "true" ]]; then
-    render_systemd_unit "$DAEMON_BIN" "$REPO_ROOT" "$START_LOG"
+    _unit_rendered="$(render_systemd_unit "$DAEMON_BIN" "$REPO_ROOT" "$START_LOG")"
+    printf '%s\n' "$_unit_rendered"
+    # Dropped-env-key check (#4522): read-only inspection counterpart of the
+    # same check the real install path below runs before overwriting.
+    _live_unit=""
+    if declare -f resolve_systemd_unit_path >/dev/null 2>&1; then
+        _live_unit="$(resolve_systemd_unit_path 2>/dev/null || true)"
+    fi
+    if [[ -n "$_live_unit" && -f "$_live_unit" ]]; then
+        _unit_new_tmp="$(mktemp "${TMPDIR:-/tmp}/loom-print-unit.XXXXXX")"
+        printf '%s\n' "$_unit_rendered" > "$_unit_new_tmp"
+        warn_dropped_env_keys "$_live_unit" "$_unit_new_tmp" extract_systemd_env_keys
+        rm -f "$_unit_new_tmp"
+    fi
     exit 0
 fi
 
@@ -1110,7 +1238,13 @@ if [[ "$USE_LAUNCHD" == "true" ]]; then
     PLIST_FILE="$PLIST_DIR/${LAUNCHD_LABEL}.plist"
     mkdir -p "$PLIST_DIR"
 
-    render_launchd_plist "$LAUNCHD_LABEL" "$DAEMON_BIN" "$REPO_ROOT" "$START_LOG" > "$PLIST_FILE"
+    # Render to a scratch file first -- NOT directly over $PLIST_FILE -- so the
+    # dropped-env-key check (#4522) below can compare against whatever
+    # $PLIST_FILE already contains before it gets clobbered.
+    _PLIST_NEW_TMP="$(mktemp "$PLIST_DIR/.${LAUNCHD_LABEL}.new.XXXXXX")"
+    render_launchd_plist "$LAUNCHD_LABEL" "$DAEMON_BIN" "$REPO_ROOT" "$START_LOG" > "$_PLIST_NEW_TMP"
+    warn_dropped_env_keys "$PLIST_FILE" "$_PLIST_NEW_TMP" extract_plist_env_keys
+    mv "$_PLIST_NEW_TMP" "$PLIST_FILE"
 
     # Harden the rendered plist when it carries a forwarded credential
     # (#4005): the token-forwarding loop in render_launchd_plist writes any
@@ -1203,7 +1337,13 @@ if [[ "$IS_LINUX_SYSTEMD" == "true" ]]; then
     SYSTEMD_UNIT_PATH="$(resolve_systemd_unit_path)"
     mkdir -p "$SYSTEMD_UNIT_DIR"
 
-    render_systemd_unit "$DAEMON_BIN" "$REPO_ROOT" "$START_LOG" > "$SYSTEMD_UNIT_PATH"
+    # Render to a scratch file first -- NOT directly over $SYSTEMD_UNIT_PATH --
+    # so the dropped-env-key check (#4522) below can compare against whatever
+    # $SYSTEMD_UNIT_PATH already contains before it gets clobbered.
+    _UNIT_NEW_TMP="$(mktemp "$SYSTEMD_UNIT_DIR/.${SYSTEMD_UNIT}.new.XXXXXX")"
+    render_systemd_unit "$DAEMON_BIN" "$REPO_ROOT" "$START_LOG" > "$_UNIT_NEW_TMP"
+    warn_dropped_env_keys "$SYSTEMD_UNIT_PATH" "$_UNIT_NEW_TMP" extract_systemd_env_keys
+    mv "$_UNIT_NEW_TMP" "$SYSTEMD_UNIT_PATH"
 
     # Harden the rendered unit when it carries a forwarded credential (#4005
     # analog): the env-forwarding loop in render_systemd_unit writes any exported

@@ -88,6 +88,11 @@ Thumbs.db
 # removed (see loom_tools.semantic_search.guard_index_dest_not_tracked).
 .loom/search-index/
 
+# Daemon-owned GH_CONFIG_DIR for GitHub App installation-token delivery
+# (#4458) — host-local hosts.yml/config.yml, rewritten atomically by the
+# credential refresh tick. Never committed (mirrors `.loom/tokens/` above).
+.loom/gh-config/
+
 # Loom workspace config (DO commit for team sharing)
 # - config.json: Persistent terminal configurations (roles, themes, intervals)
 # - roles/: Custom role definitions

@@ -193,7 +193,7 @@ else
         "env-over-config resolution logs source=env"
 
     # A config with no runtimes block falls through to the built-in default.
-    printf '{ "champion": { "auto_merge_max_lines": 500 } }\n' > "$WS/.loom/config.json"
+    printf '{ "commit": { "signoff": true } }\n' > "$WS/.loom/config.json"
     output="$(run_worker "$WS" -- -p ping)"
     assert_contains "runtime=claude (from default)" "$output" \
         "config present but no runtimes block resolves to default claude"

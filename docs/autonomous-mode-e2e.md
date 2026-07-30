@@ -17,11 +17,11 @@ crons — but the label-transition wait in Step 5 is a scripted assertion so the
 - A built `loom-daemon` binary (`cargo build --release -p loom-daemon`), or set
   `LOOM_DAEMON_BIN`.
 - `gh` authenticated against the target repo (`gh auth status`).
-- A multi-account token pool bootstrapped (`loom-tokens bootstrap`) if you want
+- A multi-account token pool bootstrapped (`loom-daemon tokens bootstrap`) if you want
   the daemon dispatch path to rotate accounts; a single token also works.
 - **A fresh token ranking, refreshed on a `<10`-min cadence (#3894).** With a
   multi-account pool, wire `./.loom/scripts/probe-tokens.sh --ranking` on a cron
-  (e.g. `*/5 * * * *`) — or run `loom-tokens check --ranking` before starting —
+  (e.g. `*/5 * * * *`) — or run `loom-daemon tokens check --ranking` before starting —
   so `.loom/tokens/.ranking` stays inside its 10-minute freshness window. A
   stale/absent ranking makes the burst-dispatching work finder repeatedly select
   exhausted accounts, wedging sweeps at startup. The selector has a stale-ranking

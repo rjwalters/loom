@@ -3,8 +3,8 @@
 //!
 //! The work finder (#3810) drives approved `loom:issue` work to dispatch, and
 //! #3811 bounds its concurrency by `min(token-pool size, disk headroom,
-//! cpu/load headroom (#3978), configured max)`. That policy treats the token
-//! pool as a flat count of
+//! configured max)` (a CPU/load term sat in that `min` from #3978 until #4512
+//! removed it). That policy treats the token pool as a flat count of
 //! `*.token` files — but at scale accounts hit their 5h/7d rate limits and go
 //! **exhausted**. Dispatching to an exhausted account produces the startup
 //! hangs / mid-build deaths seen while dogfooding. This module makes the
@@ -22,10 +22,10 @@
 //! 2. **Alert** — [`assess_pressure`] derives whether the token axis is the
 //!    binding constraint *and* work is queued behind it, and
 //!    [`CapacityAdvisory::message`] builds an operator advisory naming the
-//!    concrete levers (add accounts + `loom-tokens bootstrap`, or buy API
-//!    credits, then `loom-tokens check --ranking`; when accounts are `blocked`
+//!    concrete levers (add accounts + `loom-daemon tokens bootstrap`, or buy API
+//!    credits, then `loom-daemon tokens check --ranking`; when accounts are `blocked`
 //!    on revoked tokens — where `bootstrap --force` cannot recover — the
-//!    advisory instead points at `loom-tokens import-from-monitor --force`).
+//!    advisory instead points at `loom-daemon tokens import-from-monitor --force`).
 //!    The advisory surfaces on the daemon status view, the event bus
 //!    (`daemon.capacity.advisory`), and the log — deduplicated to fire only on
 //!    **state change**.
@@ -37,7 +37,7 @@
 //! # Why the ranking file (not a network probe)
 //!
 //! The daemon never performs the slow per-account rate-limit probe itself — that
-//! is `loom-tokens check`'s job, run out-of-band (cron / `probe-tokens.sh` /
+//! is `loom-daemon tokens check`'s job, run out-of-band (cron / `probe-tokens.sh` /
 //! the #4080 self-refresh), which writes the discrete status into
 //! `<resolved-pool-dir>/.ranking` (the format-of-record the spawn-time
 //! selector already consumes). [`read_ranking`] resolves the **same**
@@ -53,7 +53,7 @@
 //! (`available` / `exhausted` / `rate_limited` / `blocked`), where `exhausted`
 //! is already assigned by the probe at 7d utilization ≥ 0.95. A finer
 //! "near-ceiling ≥ 0.90 but not yet exhausted" bucket would require the richer
-//! per-account utilization JSON (`loom-tokens check --json`); this module treats
+//! per-account utilization JSON (`loom-daemon tokens check --json`); this module treats
 //! any non-`available` status as unhealthy, which is the actionable signal for
 //! backpressure (do not dispatch to it). Sub-`exhausted` utilization thresholds
 //! are a documented follow-up.
@@ -158,7 +158,7 @@ impl RankingSnapshot {
 /// a specific one directly, e.g. in tests) can bypass re-resolution.
 ///
 /// The file is the pipe-delimited `name|status|5h_util` format written by
-/// `loom-tokens check --ranking` (one account per line, issue #4195), where the
+/// `loom-daemon tokens check --ranking` (one account per line, issue #4195), where the
 /// status is the **second** field and the trailing 5h-utilization field is
 /// optional (legacy `name|status` lines omit it). Returns `None` when the file
 /// is absent, unreadable, or contains no parseable rows — the signal that no
@@ -283,7 +283,7 @@ pub fn effective_probe_status(status: &str, util_7d: Option<f64>) -> String {
     trimmed.to_string()
 }
 
-/// Aggregate healthy/exhausted counts derived from a fresh `loom-tokens check
+/// Aggregate healthy/exhausted counts derived from a fresh `loom-daemon tokens check
 /// --json` probe, applying [`probe_account_healthy`] uniformly.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ProbeCapacity {
@@ -298,7 +298,7 @@ pub struct ProbeCapacity {
 /// Summarize a fresh probe into a [`ProbeCapacity`].
 ///
 /// Each item is the account's `(status_word, 7d_utilization)` as read from the
-/// `loom-tokens check --json` accounts array. This is the single source of truth
+/// `loom-daemon tokens check --json` accounts array. This is the single source of truth
 /// the status view uses for the capacity summary, the healthy-tokens cap input,
 /// and (via [`effective_probe_status`]) the per-token table — so all three are
 /// computed from the same source and the same threshold and cannot contradict
@@ -329,7 +329,7 @@ where
 /// finder never dispatches beyond the healthy set, so it never targets an
 /// exhausted/blocked account and never over-subscribes. When ranking data is
 /// absent (no probe has run), it falls back to `pool_size` — the pre-#3902
-/// behavior, so a repo that has not wired up `loom-tokens check` sees zero
+/// behavior, so a repo that has not wired up `loom-daemon tokens check` sees zero
 /// change.
 #[must_use]
 pub fn token_axis_limit(workspace_root: &Path, pool_size: usize) -> usize {
@@ -375,20 +375,18 @@ pub struct PressureAssessment {
 /// - `pool_size` — raw `*.token` count (the fallback health basis).
 /// - `token_limit` — the health-adjusted token-axis limit
 ///   ([`token_axis_limit`]).
-/// - `disk` / `cpu` / `configured_max` — the other three dynamic-cap axes
-///   (`cpu` added in #3978 — [`crate::cpu_headroom::cpu_headroom_limit`]).
+/// - `disk` / `configured_max` — the other two dynamic-cap axes. (A `cpu` axis
+///   sat here from #3978 until #4512 removed the CPU term from admission — see
+///   [`crate::work_finder::resolve_dynamic_max_concurrent`].)
 /// - `deferred` — issues the tick deferred for capacity ([`crate`]'s
 ///   `TickReport::deferred_capacity`).
 /// - `min_queued` — the advisory threshold ([`DEFAULT_ADVISORY_MIN_QUEUED`]).
 ///
-/// `token_bound` requires that the token axis is the (co-)minimum of all four
-/// cap axes: dispatch is held back by tokens specifically, not by a full disk,
-/// CPU contention, or the operator ceiling. This keeps the advisory from firing
-/// (and misleadingly telling the operator to add token accounts) when the real
-/// bottleneck is disk, CPU, or a deliberately low `maxConcurrent` — the #3978
-/// incident this guards against: a token-axis jump (exhausted accounts
-/// resetting) looks token-bound by the pre-#3978 three-axis check even though
-/// concurrent Rust builds had already made CPU the actual constraint.
+/// `token_bound` requires that the token axis is the (co-)minimum of every cap
+/// axis: dispatch is held back by tokens specifically, not by a full disk or the
+/// operator ceiling. This keeps the advisory from firing (and misleadingly
+/// telling the operator to add token accounts) when the real bottleneck is disk
+/// or a deliberately low `maxConcurrent`.
 #[must_use]
 #[allow(clippy::too_many_arguments)] // one axis per dynamic-cap input + the
                                      // advisory threshold; grouping them into a
@@ -399,13 +397,11 @@ pub fn assess_pressure(
     pool_size: usize,
     token_limit: usize,
     disk: usize,
-    cpu: usize,
     configured_max: usize,
     deferred: usize,
     min_queued: usize,
 ) -> PressureAssessment {
-    let token_bound =
-        deferred > 0 && token_limit <= disk && token_limit <= cpu && token_limit <= configured_max;
+    let token_bound = deferred > 0 && token_limit <= disk && token_limit <= configured_max;
     let pressured = token_bound && deferred >= min_queued;
 
     let (total_accounts, healthy_accounts, exhausted_accounts) = match ranking {
@@ -471,10 +467,10 @@ impl CapacityAdvisory {
         let message = format!(
             "token capacity: {queued} issue(s) queued; {healthy}/{total} accounts healthy, \
              {exhausted} exhausted/near-ceiling; est. ~{drain} to drain at current capacity. \
-             Add accounts to ~/.claude-monitor/accounts.env then `loom-tokens bootstrap`, or buy \
-             API credits, then re-probe with `loom-tokens check --ranking`. If accounts are \
+             Add accounts to ~/.claude-monitor/accounts.env then `loom-daemon tokens bootstrap`, or buy \
+             API credits, then re-probe with `loom-daemon tokens check --ranking`. If accounts are \
              'blocked' on revoked tokens, 'bootstrap --force' cannot recover — run \
-             'loom-tokens import-from-monitor --force && loom-tokens check --ranking'.",
+             'loom-daemon tokens import-from-monitor --force && loom-daemon tokens check --ranking'.",
             queued = a.queued,
             healthy = a.healthy_accounts,
             total = a.total_accounts,
@@ -856,7 +852,7 @@ mod tests {
         );
 
         // Minutes later, the ranking is refreshed to 2 healthy — no restart,
-        // just an on-disk file change (mirrors a manual `loom-tokens check
+        // just an on-disk file change (mirrors a manual `loom-daemon tokens check
         // --ranking` or the #4080 self-refresh).
         write_ranking_at(&per_repo, "a|available\nb|available\nc|exhausted\n");
         assert_eq!(
@@ -983,7 +979,7 @@ mod tests {
     fn assess_not_token_bound_when_nothing_deferred() {
         // No deferral ⇒ not token-bound, not pressured, regardless of health.
         let s = snap(7, 3);
-        let a = assess_pressure(Some(&s), 7, 3, 10, 10, 10, 0, DEFAULT_ADVISORY_MIN_QUEUED);
+        let a = assess_pressure(Some(&s), 7, 3, 10, 10, 0, DEFAULT_ADVISORY_MIN_QUEUED);
         assert!(!a.token_bound);
         assert!(!a.pressured);
         assert_eq!(a.healthy_accounts, 3);
@@ -992,9 +988,9 @@ mod tests {
 
     #[test]
     fn assess_token_bound_when_token_axis_is_min_and_deferred() {
-        // token_limit 3 < disk 10, cpu 10, and ceiling 10, with 4 deferred ⇒ token-bound.
+        // token_limit 3 < disk 10 and ceiling 10, with 4 deferred ⇒ token-bound.
         let s = snap(7, 3);
-        let a = assess_pressure(Some(&s), 7, 3, 10, 10, 10, 4, DEFAULT_ADVISORY_MIN_QUEUED);
+        let a = assess_pressure(Some(&s), 7, 3, 10, 10, 4, DEFAULT_ADVISORY_MIN_QUEUED);
         assert!(a.token_bound);
         assert!(a.pressured);
         assert_eq!(a.queued, 4);
@@ -1006,7 +1002,7 @@ mod tests {
     fn assess_not_token_bound_when_disk_is_the_binding_axis() {
         // disk 2 < token_limit 3 ⇒ the bottleneck is disk, not tokens.
         let s = snap(7, 3);
-        let a = assess_pressure(Some(&s), 7, 3, 2, 10, 10, 5, DEFAULT_ADVISORY_MIN_QUEUED);
+        let a = assess_pressure(Some(&s), 7, 3, 2, 10, 5, DEFAULT_ADVISORY_MIN_QUEUED);
         assert!(!a.token_bound, "disk binds, so no token advisory");
         assert!(!a.pressured);
     }
@@ -1015,20 +1011,8 @@ mod tests {
     fn assess_not_token_bound_when_ceiling_is_the_binding_axis() {
         // configured_max 2 < token_limit 3 ⇒ operator ceiling binds, not tokens.
         let s = snap(7, 3);
-        let a = assess_pressure(Some(&s), 7, 3, 10, 10, 2, 5, DEFAULT_ADVISORY_MIN_QUEUED);
+        let a = assess_pressure(Some(&s), 7, 3, 10, 2, 5, DEFAULT_ADVISORY_MIN_QUEUED);
         assert!(!a.token_bound);
-        assert!(!a.pressured);
-    }
-
-    #[test]
-    fn assess_not_token_bound_when_cpu_is_the_binding_axis() {
-        // cpu 2 < token_limit 3 ⇒ the bottleneck is CPU/load contention, not
-        // tokens — the #3978 scenario (a token-axis jump from resetting
-        // accounts, while concurrent Rust builds have already saturated the
-        // host). The advisory must not misattribute this to token capacity.
-        let s = snap(7, 3);
-        let a = assess_pressure(Some(&s), 7, 3, 10, 2, 10, 5, DEFAULT_ADVISORY_MIN_QUEUED);
-        assert!(!a.token_bound, "cpu binds, so no token advisory");
         assert!(!a.pressured);
     }
 
@@ -1036,7 +1020,7 @@ mod tests {
     fn assess_drain_none_when_no_healthy_accounts() {
         // All exhausted (token_limit 0), work queued ⇒ token-bound, no drain ETA.
         let s = snap(4, 0);
-        let a = assess_pressure(Some(&s), 4, 0, 10, 10, 10, 3, DEFAULT_ADVISORY_MIN_QUEUED);
+        let a = assess_pressure(Some(&s), 4, 0, 10, 10, 3, DEFAULT_ADVISORY_MIN_QUEUED);
         assert!(a.token_bound);
         assert!(a.pressured);
         assert_eq!(a.healthy_accounts, 0);
@@ -1047,7 +1031,7 @@ mod tests {
     fn assess_no_ranking_treats_pool_as_healthy() {
         // No ranking ⇒ pool treated as fully healthy; still token-bound if the
         // pool-sized limit is the min and work is deferred.
-        let a = assess_pressure(None, 2, 2, 10, 10, 10, 3, DEFAULT_ADVISORY_MIN_QUEUED);
+        let a = assess_pressure(None, 2, 2, 10, 10, 3, DEFAULT_ADVISORY_MIN_QUEUED);
         assert!(a.token_bound);
         assert_eq!(a.healthy_accounts, 2);
         assert_eq!(a.exhausted_accounts, 0);
@@ -1058,7 +1042,7 @@ mod tests {
     fn assess_threshold_gates_pressured() {
         // token_bound but below the queued threshold ⇒ not yet pressured.
         let s = snap(7, 3);
-        let a = assess_pressure(Some(&s), 7, 3, 10, 10, 10, 2, 5);
+        let a = assess_pressure(Some(&s), 7, 3, 10, 10, 2, 5);
         assert!(a.token_bound);
         assert!(!a.pressured, "2 queued < threshold 5");
     }
@@ -1070,12 +1054,12 @@ mod tests {
     #[test]
     fn advisory_pressure_names_the_levers() {
         let s = snap(7, 1);
-        let a = assess_pressure(Some(&s), 7, 1, 10, 10, 10, 12, DEFAULT_ADVISORY_MIN_QUEUED);
+        let a = assess_pressure(Some(&s), 7, 1, 10, 10, 12, DEFAULT_ADVISORY_MIN_QUEUED);
         let adv = CapacityAdvisory::pressure(&a);
         assert!(adv.pressured);
         assert_eq!(adv.queued, 12);
-        assert!(adv.message.contains("loom-tokens bootstrap"));
-        assert!(adv.message.contains("loom-tokens check --ranking"));
+        assert!(adv.message.contains("loom-daemon tokens bootstrap"));
+        assert!(adv.message.contains("loom-daemon tokens check --ranking"));
         assert!(adv.message.contains("API credits"));
         assert!(adv.message.contains("12 issue"));
         assert!(adv.message.contains("import-from-monitor"));
@@ -1084,7 +1068,7 @@ mod tests {
     #[test]
     fn advisory_recovery_is_symmetric() {
         let s = snap(7, 7);
-        let a = assess_pressure(Some(&s), 7, 7, 10, 10, 10, 0, DEFAULT_ADVISORY_MIN_QUEUED);
+        let a = assess_pressure(Some(&s), 7, 7, 10, 10, 0, DEFAULT_ADVISORY_MIN_QUEUED);
         let adv = CapacityAdvisory::recovery(&a);
         assert!(!adv.pressured);
         assert!(adv.message.contains("restored"));
@@ -1094,7 +1078,7 @@ mod tests {
     #[test]
     fn advisory_pressure_message_handles_zero_healthy() {
         let s = snap(3, 0);
-        let a = assess_pressure(Some(&s), 3, 0, 10, 10, 10, 5, DEFAULT_ADVISORY_MIN_QUEUED);
+        let a = assess_pressure(Some(&s), 3, 0, 10, 10, 5, DEFAULT_ADVISORY_MIN_QUEUED);
         let adv = CapacityAdvisory::pressure(&a);
         assert!(adv.message.contains("no healthy accounts"));
     }

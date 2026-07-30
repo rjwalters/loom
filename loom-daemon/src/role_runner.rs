@@ -209,6 +209,8 @@ pub enum RoleTickOutcome {
     /// The invocation could not be run, or ran and reported failure. Never
     /// fatal to the daemon — logged and skipped.
     Failure(String),
+    /// Fail-closed scheduling rejection with machine-readable provenance.
+    RuntimeRejected(crate::runtime_admission::RuntimeRejection),
 }
 
 impl RoleTickOutcome {
@@ -243,6 +245,10 @@ pub struct ScriptRoleInvocationRunner {
     /// sweeps use.
     spawn_bin: Option<PathBuf>,
     timeout: Duration,
+    /// Explicit model override (tests only). Production leaves this `None` and
+    /// resolves per invocation via [`resolve_role_runner_model`] — the same
+    /// precedence chain sweep dispatch uses (issue #4501).
+    model: Option<String>,
 }
 
 impl ScriptRoleInvocationRunner {
@@ -253,6 +259,7 @@ impl ScriptRoleInvocationRunner {
             workspace_root,
             spawn_bin: None,
             timeout: DEFAULT_ROLE_TIMEOUT,
+            model: None,
         }
     }
 
@@ -260,6 +267,14 @@ impl ScriptRoleInvocationRunner {
     #[must_use]
     pub fn with_spawn_bin(mut self, bin: PathBuf) -> Self {
         self.spawn_bin = Some(bin);
+        self
+    }
+
+    /// Override the resolved model (tests only) — bypasses
+    /// [`resolve_role_runner_model`].
+    #[must_use]
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = Some(model.into());
         self
     }
 
@@ -291,6 +306,22 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
             Ok(p) => p,
             Err(e) => return RoleTickOutcome::Failure(e),
         };
+        // Issue #4501: pin the child's model instead of inheriting the account's
+        // interactive CLI default (`fable` on the host that filed the issue,
+        // where every role child burned the most constrained quota tier and then
+        // died on "You've reached your Fable 5 limit").
+        let (model, model_source) = match &self.model {
+            Some(m) => (m.clone(), "override"),
+            None => resolve_role_runner_model(&self.workspace_root),
+        };
+        let admission = if self.spawn_bin.is_none() {
+            match crate::runtime_admission::resolve_and_admit(&self.workspace_root, role, None) {
+                Ok(value) => Some(value),
+                Err(e) => return RoleTickOutcome::RuntimeRejected(e),
+            }
+        } else {
+            None
+        };
         run_role_with_timeout(
             &script,
             &self.workspace_root,
@@ -298,13 +329,47 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
             prompt,
             self.logs_dir(),
             self.timeout,
+            &model,
+            model_source,
+            admission.as_ref(),
         )
     }
 }
 
-/// Run `spawn-claude.sh -p "<prompt>" --dangerously-skip-permissions` in
-/// `workspace_root`, appending combined output to
-/// `<logs_dir>/role-<role>.log` (never a pipe — avoids the pipe-buffer
+/// Issue #4501: resolve the model a role-runner child must run with, joining the
+/// SAME precedence chain sweep dispatch uses
+/// ([`sweep_registry::resolve_dispatch_model`]) with the role-runner-specific
+/// `autonomous.roleRunner.model` occupying the "explicit request" tier:
+///
+/// **`autonomous.roleRunner.model` > `autonomous.model` > shipped
+/// [`sweep_registry::DEFAULT_DISPATCH_MODEL`] (`sonnet`)**
+///
+/// Empty/whitespace values are treated as unset at every tier, so the resolved
+/// model is never the empty string and never the CLI-inherited interactive
+/// default. Returns the model plus a label naming the tier that supplied it (for
+/// the per-role log header).
+///
+/// Before this, `run_role_with_timeout` emitted **no** `--model` argument at
+/// all, so every scheduled curator/champion/judge/auditor/guide child inherited
+/// whatever the selected account's interactive `claude` default happened to be —
+/// the live defect this resolution exists to prevent.
+#[must_use]
+pub fn resolve_role_runner_model(repo_root: &Path) -> (String, &'static str) {
+    let configured = read_role_runner_config(repo_root).model;
+    let (model, source) = sweep_registry::resolve_dispatch_model(repo_root, configured.as_deref());
+    let label = match source {
+        // `Param` can only arise from `autonomous.roleRunner.model` here — this
+        // function is the only caller and it passes exactly that value.
+        sweep_registry::ModelSource::Param => "autonomous.roleRunner.model",
+        sweep_registry::ModelSource::Config => "autonomous.model",
+        sweep_registry::ModelSource::Default => "default",
+    };
+    (model, label)
+}
+
+/// Run `spawn-claude.sh -p "<prompt>" --model <model>
+/// --dangerously-skip-permissions` in `workspace_root`, appending combined
+/// output to `<logs_dir>/role-<role>.log` (never a pipe — avoids the pipe-buffer
 /// deadlock pattern documented in [`crate::main_health_gate`] /
 /// [`crate::token_ranking_refresh`]) and killing it after `timeout`.
 #[allow(clippy::too_many_arguments)]
@@ -315,6 +380,9 @@ fn run_role_with_timeout(
     prompt: &str,
     logs_dir: PathBuf,
     timeout: Duration,
+    model: &str,
+    model_source: &str,
+    admission: Option<&crate::runtime_admission::ResolvedRuntime>,
 ) -> RoleTickOutcome {
     if let Err(e) = std::fs::create_dir_all(&logs_dir) {
         return RoleTickOutcome::Failure(format!(
@@ -331,9 +399,14 @@ fn run_role_with_timeout(
             .append(true)
             .open(&log_path)
         {
+            // The resolved model + the tier that supplied it are recorded in the
+            // per-role log header (#4501) so an operator can confirm from
+            // `role-<role>.log` alone which model a scheduled child ran with —
+            // the manual verification this fix needs on a live host.
             let _ = writeln!(
                 f,
-                "\n==== loom-daemon role_runner: {} role={role} ====",
+                "\n==== loom-daemon role_runner: {} role={role} model={model} \
+                 (source={model_source}) ====",
                 chrono::Utc::now().to_rfc3339()
             );
         }
@@ -358,9 +431,18 @@ fn run_role_with_timeout(
     };
 
     let mut cmd = Command::new(script);
-    cmd.arg("-p")
-        .arg(prompt)
-        .arg("--dangerously-skip-permissions");
+    cmd.arg("-p").arg(prompt);
+    // Model pin (issue #4501): appended immediately after the prompt, exactly as
+    // `sweep_registry::spawn_child` does, so a role child never inherits the
+    // account's interactive CLI default (`fable` on the affected host — the most
+    // constrained quota tier, and the escalation ceiling rather than the floor).
+    // An empty value is treated as unset — `--model ""` must never be emitted —
+    // mirroring the same guard on the sweep-dispatch path; `resolve_role_runner_model`
+    // already filters blanks at every tier, so this is belt-and-braces.
+    if !model.is_empty() {
+        cmd.arg("--model").arg(model);
+    }
+    cmd.arg("--dangerously-skip-permissions");
     // Transient-error recovery (issue #4255): scheduled role spawns are the
     // same unattended class as daemon-dispatched sweeps, so route them through
     // `claude-wrapper.sh` (retry/backoff/classification, bounded by
@@ -376,6 +458,17 @@ fn run_role_with_timeout(
         .stdin(Stdio::null())
         .stdout(Stdio::from(out_file))
         .stderr(Stdio::from(stderr_file));
+    if let Some(admission) = admission {
+        // Pin the already-admitted choice so spawn-worker cannot re-resolve a
+        // different runtime after the pre-spawn decision.
+        cmd.env("LOOM_RUNTIME", &admission.runtime);
+        log::info!(
+            "role_runner: admitted role={} runtime={} source={}",
+            admission.role,
+            admission.runtime,
+            admission.source
+        );
+    }
 
     // Run the child as its own process-group leader so a timeout can tear
     // down the whole subtree (the `claude` session's tool-call
@@ -521,6 +614,13 @@ pub struct RoleRunnerConfig {
     /// because idle firing is a distinct opt-in surface. Resolved by
     /// [`resolve_on_idle_roles`].
     pub on_idle: Option<Vec<String>>,
+    /// `autonomous.roleRunner.model` — the model every role child is pinned to
+    /// (issue #4501). `None` (key absent, blank, or non-string) falls through to
+    /// `autonomous.model` and then the shipped
+    /// [`sweep_registry::DEFAULT_DISPATCH_MODEL`]; it never falls through to the
+    /// account's interactive CLI default. Resolved by
+    /// [`resolve_role_runner_model`].
+    pub model: Option<String>,
 }
 
 /// Read `.loom/config.json -> autonomous.roleRunner`, soft-failing every
@@ -556,6 +656,16 @@ pub fn read_role_runner_config(repo_root: &Path) -> RoleRunnerConfig {
                 .collect::<Vec<_>>()
         });
 
+    // `model` (#4501): a blank / whitespace-only / non-string value soft-fails to
+    // `None` so it falls through to `autonomous.model` -> the shipped default
+    // rather than emitting `--model ""` or an inherited interactive default.
+    let model = block
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(String::from);
+
     RoleRunnerConfig {
         enabled: block.get("enabled").and_then(serde_json::Value::as_bool),
         roles,
@@ -564,6 +674,7 @@ pub fn read_role_runner_config(repo_root: &Path) -> RoleRunnerConfig {
             .and_then(serde_json::Value::as_u64)
             .filter(|&s| s > 0),
         on_idle,
+        model,
     }
 }
 
@@ -1288,6 +1399,9 @@ fn log_outcome(role: &str, outcome: &RoleTickOutcome, elapsed: Duration) {
                  fatal): {reason}"
             );
         }
+        RoleTickOutcome::RuntimeRejected(rejection) => {
+            log::warn!("role_runner: {role} runtime admission rejected: {rejection}");
+        }
     }
 }
 
@@ -1320,6 +1434,10 @@ fn log_outcome_for_root(role: &str, root: &Path, outcome: &RoleTickOutcome, elap
         RoleTickOutcome::Failure(reason) => log::warn!(
             "role_runner: {role} tick failed for {} after {elapsed:.1?} (logged and skipped, \
              never fatal): {reason}",
+            root.display()
+        ),
+        RoleTickOutcome::RuntimeRejected(rejection) => log::warn!(
+            "role_runner: {role} runtime admission rejected for {} after {elapsed:.1?}: {rejection}",
             root.display()
         ),
     }
@@ -1368,8 +1486,12 @@ fn classify_root_tick_log(
     was_failing: bool,
 ) -> RootTickLogAction {
     match outcome {
-        RoleTickOutcome::Failure(_) if was_failing => RootTickLogAction::FailureRepeat,
-        RoleTickOutcome::Failure(_) => RootTickLogAction::FailureEdge,
+        RoleTickOutcome::Failure(_) | RoleTickOutcome::RuntimeRejected(_) if was_failing => {
+            RootTickLogAction::FailureRepeat
+        }
+        RoleTickOutcome::Failure(_) | RoleTickOutcome::RuntimeRejected(_) => {
+            RootTickLogAction::FailureEdge
+        }
         RoleTickOutcome::Success if tick_is_implausibly_fast(outcome, elapsed) && was_failing => {
             RootTickLogAction::RecoveredImplausiblyFast
         }
@@ -1396,6 +1518,7 @@ fn log_outcome_for_root_deduped(
     let action = classify_root_tick_log(outcome, elapsed, was_failing);
     let reason = match outcome {
         RoleTickOutcome::Failure(reason) => reason.as_str(),
+        RoleTickOutcome::RuntimeRejected(rejection) => rejection.reason.as_str(),
         RoleTickOutcome::Success => "",
     };
     match action {
@@ -1462,6 +1585,42 @@ mod tests {
         fs::write(root.join(".loom").join("config.json"), contents).unwrap();
     }
 
+    #[test]
+    #[serial]
+    fn mixed_runtime_role_launch_is_admitted_and_pinned_before_spawn() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for sub in [".loom/roles", ".loom/runtimes", ".loom/scripts"] {
+            fs::create_dir_all(root.join(sub)).unwrap();
+        }
+        write_config(root, r#"{"runtimes":{"roles":{"curator":"codex"}}}"#);
+        fs::write(root.join(".loom/roles/curator.json"), r#"{"runtimeRequirements":["mcp"]}"#)
+            .unwrap();
+        fs::write(
+            root.join(".loom/runtimes/codex.json"),
+            r#"{"runtime":"codex","capabilities":{"mcp":"yes","worktreeIsolation":"partial"}}"#,
+        )
+        .unwrap();
+        let adapter = root.join(".loom/scripts/spawn-codex.sh");
+        fs::write(&adapter, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&adapter, fs::Permissions::from_mode(0o755)).unwrap();
+        let observed = root.join("observed-runtime");
+        let worker = root.join(".loom/scripts/spawn-worker.sh");
+        fs::write(
+            &worker,
+            format!("#!/bin/sh\nprintf '%s' \"$LOOM_RUNTIME\" > '{}'\n", observed.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&worker, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut runner = ScriptRoleInvocationRunner::new(root.to_path_buf())
+            .with_timeout(Duration::from_secs(5));
+        assert_eq!(runner.invoke("curator", "/loom:curator"), RoleTickOutcome::Success);
+        assert_eq!(fs::read_to_string(observed).unwrap(), "codex");
+    }
+
     /// A fake script that just exits with a fixed code, optionally writing to
     /// stdout/stderr first. Written with a shebang so it's directly
     /// executable — mirrors `token_ranking_refresh`'s test helper.
@@ -1520,15 +1679,148 @@ mod tests {
     #[test]
     fn test_invoke_receives_prompt_and_skip_permissions_flag() {
         let tmp = tempfile::tempdir().unwrap();
-        // Fail unless invoked with -p "/curator" --dangerously-skip-permissions.
+        // Fail unless invoked with
+        //   -p "/curator" --model <m> --dangerously-skip-permissions
+        // (the `--model` pin was inserted after the prompt by #4501, mirroring
+        // `sweep_registry::spawn_child`'s argv order).
         let script = write_fake_script(
             tmp.path(),
             "fake-spawn.sh",
-            "[ \"$1\" = \"-p\" ] && [ \"$2\" = \"/curator\" ] && [ \"$3\" = \"--dangerously-skip-permissions\" ] && exit 0 || exit 1",
+            "[ \"$1\" = \"-p\" ] && [ \"$2\" = \"/curator\" ] && [ \"$3\" = \"--model\" ] && [ -n \"$4\" ] && [ \"$5\" = \"--dangerously-skip-permissions\" ] && exit 0 || exit 1",
         );
         let mut runner =
             ScriptRoleInvocationRunner::new(tmp.path().to_path_buf()).with_spawn_bin(script);
         assert_eq!(runner.invoke("curator", "/curator"), RoleTickOutcome::Success);
+    }
+
+    /// Issue #4501: a role spawn pins the model explicitly — a role child must
+    /// never inherit the account's interactive CLI default (`fable` on the host
+    /// that filed the issue, where every child instantly died on "You've reached
+    /// your Fable 5 limit"). With no config the pin is the shipped
+    /// `DEFAULT_DISPATCH_MODEL` (`sonnet`).
+    #[test]
+    fn test_invoke_appends_resolved_model_defaulting_to_sonnet() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = write_fake_script(
+            tmp.path(),
+            "fake-spawn.sh",
+            "printf '%s\\n' \"$@\" > argv.txt; exit 0",
+        );
+        let mut runner =
+            ScriptRoleInvocationRunner::new(tmp.path().to_path_buf()).with_spawn_bin(script);
+        assert_eq!(runner.invoke("curator", "/loom:curator"), RoleTickOutcome::Success);
+        let argv = fs::read_to_string(tmp.path().join("argv.txt")).unwrap();
+        let args: Vec<&str> = argv.lines().collect();
+        let idx = args
+            .iter()
+            .position(|a| *a == "--model")
+            .expect("role spawn argv must contain --model");
+        assert_eq!(
+            args[idx + 1],
+            sweep_registry::DEFAULT_DISPATCH_MODEL,
+            "default role-runner model must be the shipped dispatch default; argv: {args:?}"
+        );
+        assert_ne!(args[idx + 1], "fable", "role children must never run fable by default");
+    }
+
+    /// Issue #4501: `autonomous.roleRunner.model` wins over the shipped default
+    /// (and over `autonomous.model`) — the explicit-request tier of the shared
+    /// `resolve_dispatch_model` chain.
+    #[test]
+    fn test_invoke_config_model_override_wins() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(
+            tmp.path(),
+            r#"{"autonomous": {"model": "opus", "roleRunner": {"enabled": true, "model": "claude-sonnet-4-6"}}}"#,
+        );
+        let script = write_fake_script(
+            tmp.path(),
+            "fake-spawn.sh",
+            "printf '%s\\n' \"$@\" > argv.txt; exit 0",
+        );
+        let mut runner =
+            ScriptRoleInvocationRunner::new(tmp.path().to_path_buf()).with_spawn_bin(script);
+        assert_eq!(runner.invoke("curator", "/loom:curator"), RoleTickOutcome::Success);
+        let argv = fs::read_to_string(tmp.path().join("argv.txt")).unwrap();
+        assert!(
+            argv.contains("--model\nclaude-sonnet-4-6\n"),
+            "autonomous.roleRunner.model must win; argv: {argv}"
+        );
+    }
+
+    /// Issue #4501: with only `autonomous.model` set, the role runner joins the
+    /// SAME chain sweep dispatch uses rather than keeping a private default.
+    //
+    // NOTE: see the comment above `test_config_missing_file_is_default` —
+    // `resolve_role_runner_model` reads `read_role_runner_config` internally
+    // (and this test also calls it directly for the `blank` case), so it needs
+    // the same private-defaults-tier guard + `#[serial(loom_config_env)]`
+    // (#4593, discovered during review of #4590 / #4538).
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_resolve_role_runner_model_precedence_chain() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+
+        // No config at all -> shipped default, labelled `default`.
+        let bare = tempfile::tempdir().unwrap();
+        assert_eq!(
+            resolve_role_runner_model(bare.path()),
+            (sweep_registry::DEFAULT_DISPATCH_MODEL.to_string(), "default")
+        );
+
+        // `autonomous.model` only -> that value, labelled `autonomous.model`.
+        // Routing through `resolve_dispatch_model` also means the role runner
+        // inherits the #3982 logical-tier alias resolution for free
+        // (`opus` -> `claude-opus-5`), exactly as sweep dispatch does.
+        let shared = tempfile::tempdir().unwrap();
+        write_config(shared.path(), r#"{"autonomous": {"model": "opus"}}"#);
+        assert_eq!(
+            resolve_role_runner_model(shared.path()),
+            ("claude-opus-5".to_string(), "autonomous.model")
+        );
+
+        // Both -> the role-runner-specific value, labelled as such.
+        let both = tempfile::tempdir().unwrap();
+        write_config(
+            both.path(),
+            r#"{"autonomous": {"model": "opus", "roleRunner": {"model": "haiku"}}}"#,
+        );
+        assert_eq!(
+            resolve_role_runner_model(both.path()),
+            ("haiku".to_string(), "autonomous.roleRunner.model")
+        );
+
+        // A blank override is treated as unset at every tier (never `--model ""`).
+        let blank = tempfile::tempdir().unwrap();
+        write_config(blank.path(), r#"{"autonomous": {"roleRunner": {"model": "   "}}}"#);
+        assert_eq!(read_role_runner_config(blank.path()).model, None);
+        assert_eq!(
+            resolve_role_runner_model(blank.path()),
+            (sweep_registry::DEFAULT_DISPATCH_MODEL.to_string(), "default")
+        );
+
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+    }
+
+    /// Issue #4501: the per-role log header records the pinned model and the tier
+    /// that supplied it, so an operator can verify the pin from
+    /// `role-<role>.log` alone on a live host.
+    #[test]
+    fn test_invoke_log_header_records_pinned_model() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = write_fake_script(tmp.path(), "fake-spawn.sh", "exit 0");
+        let mut runner =
+            ScriptRoleInvocationRunner::new(tmp.path().to_path_buf()).with_spawn_bin(script);
+        assert_eq!(runner.invoke("guide", "/loom:guide"), RoleTickOutcome::Success);
+        let log = fs::read_to_string(tmp.path().join(".loom").join("logs").join("role-guide.log"))
+            .unwrap();
+        assert!(
+            log.contains(&format!(
+                "model={} (source=default)",
+                sweep_registry::DEFAULT_DISPATCH_MODEL
+            )),
+            "{log}"
+        );
     }
 
     /// Issue #4255: a scheduled role spawn routes through `claude-wrapper.sh` by
@@ -1541,11 +1833,14 @@ mod tests {
     fn test_invoke_appends_use_wrapper_flag() {
         std::env::remove_var("LOOM_USE_WRAPPER");
         let tmp = tempfile::tempdir().unwrap();
-        // Succeeds only when the 4th arg is exactly --use-wrapper.
+        // Succeeds only when --use-wrapper directly follows
+        // --dangerously-skip-permissions (argv is now
+        // `-p <prompt> --model <m> --dangerously-skip-permissions --use-wrapper`
+        // since the #4501 model pin).
         let script = write_fake_script(
             tmp.path(),
             "fake-spawn.sh",
-            "[ \"$3\" = \"--dangerously-skip-permissions\" ] && [ \"$4\" = \"--use-wrapper\" ] && exit 0 || exit 1",
+            "[ \"$5\" = \"--dangerously-skip-permissions\" ] && [ \"$6\" = \"--use-wrapper\" ] && exit 0 || exit 1",
         );
         let mut runner =
             ScriptRoleInvocationRunner::new(tmp.path().to_path_buf()).with_spawn_bin(script);
@@ -1560,11 +1855,12 @@ mod tests {
     fn test_invoke_opt_out_omits_use_wrapper_flag() {
         std::env::set_var("LOOM_USE_WRAPPER", "0");
         let tmp = tempfile::tempdir().unwrap();
-        // Succeeds only when there is NO 4th arg (argv ends at skip-permissions).
+        // Succeeds only when nothing follows --dangerously-skip-permissions
+        // (argv ends there; the #4501 model pin shifted it to $5).
         let script = write_fake_script(
             tmp.path(),
             "fake-spawn.sh",
-            "[ \"$3\" = \"--dangerously-skip-permissions\" ] && [ -z \"$4\" ] && exit 0 || exit 1",
+            "[ \"$5\" = \"--dangerously-skip-permissions\" ] && [ -z \"$6\" ] && exit 0 || exit 1",
         );
         let mut runner =
             ScriptRoleInvocationRunner::new(tmp.path().to_path_buf()).with_spawn_bin(script);
@@ -1617,49 +1913,79 @@ mod tests {
     // Config surface — autonomous.roleRunner
     // ===================================================================
 
+    // NOTE: these tests read `read_role_runner_config`, which merges the
+    // private-defaults tier (`config_resolver::private_defaults_path()`) ahead
+    // of the tempdir-scoped config under test. That tier resolves off
+    // `$LOOM_CONFIG_DEFAULTS_FILE` / `$HOME` — independent of `tmp.path()` — so
+    // a host's real `~/.local/share/loom/config/defaults.json` can leak into
+    // the result. Neutralize it for the duration of each test (#4538), and use
+    // the same named serial group (`loom_config_env`) as the other tests below
+    // that mutate this exact env var — a bare `#[serial]` would not serialize
+    // against it, since `serial_test` locks are per-key.
     #[test]
+    #[serial(loom_config_env)]
     fn test_config_missing_file_is_default() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
         let tmp = tempfile::tempdir().unwrap();
-        assert_eq!(read_role_runner_config(tmp.path()), RoleRunnerConfig::default());
+        let cfg = read_role_runner_config(tmp.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(cfg, RoleRunnerConfig::default());
     }
 
     #[test]
+    #[serial(loom_config_env)]
     fn test_config_malformed_json_is_default() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
         let tmp = tempfile::tempdir().unwrap();
         write_config(tmp.path(), "{not valid json");
-        assert_eq!(read_role_runner_config(tmp.path()), RoleRunnerConfig::default());
+        let cfg = read_role_runner_config(tmp.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(cfg, RoleRunnerConfig::default());
     }
 
     #[test]
+    #[serial(loom_config_env)]
     fn test_config_missing_block_is_default() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
         let tmp = tempfile::tempdir().unwrap();
         write_config(tmp.path(), r#"{"autonomous": {"workFinder": {"enabled": true}}}"#);
-        assert_eq!(read_role_runner_config(tmp.path()), RoleRunnerConfig::default());
+        let cfg = read_role_runner_config(tmp.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(cfg, RoleRunnerConfig::default());
     }
 
     #[test]
+    #[serial(loom_config_env)]
     fn test_config_reads_enabled_roles_and_interval() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
         let tmp = tempfile::tempdir().unwrap();
         write_config(
             tmp.path(),
             r#"{"autonomous": {"roleRunner": {"enabled": true, "roles": ["curator", "guide"], "intervalSecs": 120}}}"#,
         );
+        let cfg = read_role_runner_config(tmp.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
         assert_eq!(
-            read_role_runner_config(tmp.path()),
+            cfg,
             RoleRunnerConfig {
                 enabled: Some(true),
                 roles: Some(vec!["curator".to_string(), "guide".to_string()]),
                 interval_secs: Some(120),
                 on_idle: None,
+                model: None,
             }
         );
     }
 
     #[test]
+    #[serial(loom_config_env)]
     fn test_config_zero_interval_is_dropped_to_none() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
         let tmp = tempfile::tempdir().unwrap();
         write_config(tmp.path(), r#"{"autonomous": {"roleRunner": {"intervalSecs": 0}}}"#);
-        assert_eq!(read_role_runner_config(tmp.path()).interval_secs, None);
+        let interval_secs = read_role_runner_config(tmp.path()).interval_secs;
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(interval_secs, None);
     }
 
     // ===================================================================
@@ -1690,6 +2016,7 @@ mod tests {
                 roles: Some(vec!["curator".to_string()]),
                 interval_secs: Some(60),
                 on_idle: None,
+                model: None,
             }
         );
     }
@@ -1728,6 +2055,7 @@ mod tests {
             roles: Some(vec![]),
             interval_secs: None,
             on_idle: None,
+            model: None,
         };
         assert_eq!(resolve_roles(&config), Vec::new());
     }
@@ -1739,6 +2067,7 @@ mod tests {
             roles: Some(vec!["guide".to_string(), "champion".to_string()]),
             interval_secs: None,
             on_idle: None,
+            model: None,
         };
         let roles = resolve_roles(&config);
         assert_eq!(roles.iter().map(|r| r.name).collect::<Vec<_>>(), vec!["champion", "guide"]);
@@ -1751,6 +2080,7 @@ mod tests {
             roles: Some(vec!["curator".to_string(), "not-a-role".to_string()]),
             interval_secs: None,
             on_idle: None,
+            model: None,
         };
         let roles = resolve_roles(&config);
         assert_eq!(roles.iter().map(|r| r.name).collect::<Vec<_>>(), vec!["curator"]);
@@ -1776,6 +2106,7 @@ mod tests {
             roles: None,
             interval_secs: None,
             on_idle: None,
+            model: None,
         }));
     }
 
@@ -1788,6 +2119,7 @@ mod tests {
             roles: None,
             interval_secs: None,
             on_idle: None,
+            model: None,
         }));
         std::env::set_var(ROLE_RUNNER_ENABLE_ENV, "1");
         assert!(resolve_enabled(&RoleRunnerConfig {
@@ -1795,6 +2127,7 @@ mod tests {
             roles: None,
             interval_secs: None,
             on_idle: None,
+            model: None,
         }));
         std::env::remove_var(ROLE_RUNNER_ENABLE_ENV);
     }
@@ -1820,6 +2153,7 @@ mod tests {
                     roles: None,
                     interval_secs: Some(42),
                     on_idle: None,
+                    model: None,
                 }
             ),
             Duration::from_secs(42)
@@ -1835,6 +2169,7 @@ mod tests {
                     roles: None,
                     interval_secs: Some(42),
                     on_idle: None,
+                    model: None,
                 }
             ),
             Duration::from_secs(7)
@@ -2032,31 +2367,48 @@ mod tests {
     // onIdle config parsing (#4364)
     // ===================================================================
 
+    // NOTE: see the comment above `test_config_missing_file_is_default` — these
+    // tests read `read_role_runner_config` too, so they need the same
+    // private-defaults-tier guard + `#[serial(loom_config_env)]` (#4538).
     #[test]
+    #[serial(loom_config_env)]
     fn test_config_on_idle_absent_is_none() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
         let tmp = tempfile::tempdir().unwrap();
         write_config(tmp.path(), r#"{"autonomous": {"roleRunner": {"enabled": true}}}"#);
-        assert_eq!(read_role_runner_config(tmp.path()).on_idle, None);
+        let on_idle = read_role_runner_config(tmp.path()).on_idle;
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(on_idle, None);
     }
 
     #[test]
+    #[serial(loom_config_env)]
     fn test_config_on_idle_parses_array() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
         let tmp = tempfile::tempdir().unwrap();
         write_config(tmp.path(), r#"{"autonomous": {"roleRunner": {"onIdle": ["champion"]}}}"#);
-        assert_eq!(read_role_runner_config(tmp.path()).on_idle, Some(vec!["champion".to_string()]));
+        let on_idle = read_role_runner_config(tmp.path()).on_idle;
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(on_idle, Some(vec!["champion".to_string()]));
     }
 
     #[test]
+    #[serial(loom_config_env)]
     fn test_config_on_idle_non_array_soft_fails_to_none() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
         let tmp = tempfile::tempdir().unwrap();
         // A non-array (string) value must not panic — it soft-fails to `None`,
         // matching the `roles` contract.
         write_config(tmp.path(), r#"{"autonomous": {"roleRunner": {"onIdle": "champion"}}}"#);
-        assert_eq!(read_role_runner_config(tmp.path()).on_idle, None);
+        let on_idle = read_role_runner_config(tmp.path()).on_idle;
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(on_idle, None);
     }
 
     #[test]
+    #[serial(loom_config_env)]
     fn test_config_on_idle_drops_non_string_entries() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
         let tmp = tempfile::tempdir().unwrap();
         // Non-string entries are dropped; string entries survive (unknown
         // *names* are filtered later in `resolve_on_idle_roles`).
@@ -2064,7 +2416,9 @@ mod tests {
             tmp.path(),
             r#"{"autonomous": {"roleRunner": {"onIdle": ["champion", 7, true]}}}"#,
         );
-        assert_eq!(read_role_runner_config(tmp.path()).on_idle, Some(vec!["champion".to_string()]));
+        let on_idle = read_role_runner_config(tmp.path()).on_idle;
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(on_idle, Some(vec!["champion".to_string()]));
     }
 
     // ===================================================================
@@ -2084,6 +2438,7 @@ mod tests {
             roles: None,
             interval_secs: None,
             on_idle: Some(vec!["guide".to_string(), "champion".to_string()]),
+            model: None,
         };
         let roles = resolve_on_idle_roles(&config);
         assert_eq!(roles.iter().map(|r| r.name).collect::<Vec<_>>(), vec!["champion", "guide"]);
@@ -2100,6 +2455,7 @@ mod tests {
                 "builder".to_string(),
                 "nope".to_string(),
             ]),
+            model: None,
         };
         let roles = resolve_on_idle_roles(&config);
         assert_eq!(roles.iter().map(|r| r.name).collect::<Vec<_>>(), vec!["champion"]);
@@ -2112,6 +2468,7 @@ mod tests {
             roles: None,
             interval_secs: None,
             on_idle: Some(vec![]),
+            model: None,
         };
         assert_eq!(resolve_on_idle_roles(&config), Vec::new());
     }
@@ -2227,6 +2584,7 @@ mod tests {
             roles: None,
             interval_secs: None,
             on_idle: Some(roles.into_iter().map(str::to_string).collect()),
+            model: None,
         }
     }
 
@@ -2297,6 +2655,7 @@ mod tests {
             roles: None,
             interval_secs: None,
             on_idle: None,
+            model: None,
         };
         let now = Instant::now();
         assert!(plan_idle_runs(&mut t, &set, root, &cfg, false, false, now).is_empty());
@@ -2395,10 +2754,16 @@ mod tests {
     /// real entry point the work-finder loop calls, reading the root's own
     /// on-disk config each tick — exercised here end-to-end rather than via
     /// the already-parsed `RoleRunnerConfig` the other tests use.
+    // NOTE: see the comment above `test_config_missing_file_is_default` — this
+    // test's `observe_and_fire_idle` calls read the private-defaults tier via
+    // `read_role_runner_config` too, so it needs the same guard +
+    // `#[serial(loom_config_env)]` (#4593, discovered during review of #4590 /
+    // #4538).
     #[test]
-    #[serial]
+    #[serial(loom_config_env)]
     fn test_observe_and_fire_idle_cross_config_disabled_target_root_warns_and_suppresses() {
         std::env::remove_var(ROLE_RUNNER_ENABLE_ENV);
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
         let tmp = tempfile::tempdir().unwrap();
         write_config(tmp.path(), r#"{"autonomous": {"roleRunner": {"onIdle": ["champion"]}}}"#);
         let mut trigger = IdleTrigger::new();
@@ -2421,6 +2786,7 @@ mod tests {
         // holds (this is the "second edge does not re-warn" acceptance case).
         observe_and_fire_idle(&mut trigger, &in_progress, tmp.path(), false, false);
         observe_and_fire_idle(&mut trigger, &in_progress, tmp.path(), true, false);
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
         assert!(trigger.disabled_warned(tmp.path()));
         assert!(in_progress.lock().unwrap().is_empty());
     }

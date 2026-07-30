@@ -418,8 +418,8 @@ pub fn select_token(
 
     if !tokens_dir.is_dir() {
         return Err(EmptyTokenPoolError(format!(
-            "Token directory does not exist: {}{}. Run `loom-tokens bootstrap` to populate it \
-             (or `loom-tokens bootstrap --shared` for the machine-level pool).",
+            "Token directory does not exist: {}{}. Run `loom-daemon tokens bootstrap` to populate it \
+             (or `loom-daemon tokens bootstrap --shared` for the machine-level pool).",
             tokens_dir.display(),
             shared_pool_hint()
         )));
@@ -428,8 +428,8 @@ pub fn select_token(
     let all_tokens = list_token_files(&tokens_dir);
     if all_tokens.is_empty() {
         return Err(EmptyTokenPoolError(format!(
-            "No .token files in {}{}. Run `loom-tokens bootstrap` \
-             (or `loom-tokens bootstrap --shared` for the machine-level pool).",
+            "No .token files in {}{}. Run `loom-daemon tokens bootstrap` \
+             (or `loom-daemon tokens bootstrap --shared` for the machine-level pool).",
             tokens_dir.display(),
             shared_pool_hint()
         )));
@@ -475,7 +475,7 @@ pub fn select_token(
 
     Err(EmptyTokenPoolError(format!(
         "All {} tokens in {} are marked bad or empty. Inspect .bad_tokens or run \
-         `loom-tokens bootstrap --force`.",
+         `loom-daemon tokens bootstrap --force`.",
         all_tokens.len(),
         tokens_dir.display()
     )))

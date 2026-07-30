@@ -66,9 +66,10 @@
 //!
 //! - **No secret ever crosses into a `CredentialPreflightReport` or a log
 //!   line.** The minted token is threaded back to the caller *only* via
-//!   [`GithubAppPreflight::minted_gh_token`] (for `main.rs` to
-//!   `std::env::set_var("GH_TOKEN", …)`) — never through [`log`], never
-//!   through [`crate::types::DaemonStatusReport`]. The report/status surface
+//!   [`GithubAppPreflight::minted_gh_token`] (for `main.rs` to publish via
+//!   [`publish_github_app_token`] — see "File-based token delivery (#4458)"
+//!   below) — never through [`log`], never through
+//!   [`crate::types::DaemonStatusReport`]. The report/status surface
 //!   carries only the non-secret fingerprint `app <id> installation <id>`.
 //! - **GitHub only.** The daemon's own forge calls all shell out to `gh`,
 //!   which only ever resolves GitHub credentials (whether that's an ambient
@@ -556,6 +557,116 @@ pub fn run_with_github_app(
     }
 }
 
+// ============================================================================
+// File-based token delivery (#4458)
+// ============================================================================
+//
+// The startup preflight and the refresh tick above both used to publish the
+// minted installation token by calling `std::env::set_var("GH_TOKEN", …)`
+// directly in `main.rs`. That is sound *once* at boot (nothing else is
+// spawning `gh`/`git` children yet), but the refresh tick repeats it for the
+// life of the process from a background tokio task — racing the `environ`
+// reads every concurrent `Command::spawn` in this multithreaded runtime
+// performs (~76 `Command::new("gh"|"git")` call sites across 16 files, with
+// no central spawn choke point to inject through instead — see #4458's
+// issue body for the full census). Concurrent `setenv`/`getenv` is undefined
+// behavior on POSIX, which is exactly why `set_var` is `unsafe` as of Rust
+// edition 2024.
+//
+// The fix below replaces the *recurring* write with a **daemon-owned
+// `GH_CONFIG_DIR`** whose `hosts.yml` is rewritten atomically (write a temp
+// file, then `rename` into place — atomic on the same filesystem). `gh`
+// re-reads its config from disk on every invocation, so every one of those
+// ~76 call sites picks up a fresh token automatically, with zero call-site
+// changes and zero recurring `std::env::set_var` calls: the tick becomes a
+// pure file operation. The one remaining `std::env::set_var` — pointing
+// `GH_CONFIG_DIR` at this directory — fires at most once per process
+// lifetime (see `main.rs`), before the tick task or any other `gh`-spawning
+// task exists to race it.
+//
+// This was verified empirically against the `gh` CLI actually pinned in this
+// environment (2.96.0): a `GH_CONFIG_DIR` whose `hosts.yml` has no sibling
+// `config.yml` triggers `gh`'s one-time "multi-account migration", which
+// calls `GET /user` to resolve a login name — a call a GitHub App
+// installation token (not a user-authenticated credential) cannot make, so
+// *every* `gh` invocation hard-fails with "failed to migrate config" instead
+// of a normal 401. Writing a `config.yml` with `version: 1` up front (done by
+// [`publish_github_app_token`] on first use) skips that migration path
+// entirely — this is the reason a bare `hosts.yml` is not sufficient.
+//
+// Trade-off accepted: `GH_CONFIG_DIR` is host-global for the daemon process,
+// so it also shadows the operator's own `~/.config/gh` (aliases, `gh` prefs)
+// for every child the daemon spawns while a GitHub App is configured. That
+// is judged acceptable here — the daemon's own `gh` calls are all
+// non-interactive, alias-free API/CLI invocations — over the alternative
+// (injecting `.env("GH_TOKEN", …)` from a shared store at each of the ~76
+// call sites), which would preserve the operator's ambient config but cost a
+// multi-file refactor for a residual, currently-dormant hazard (see #4458).
+
+/// Directory (under the workspace root's own `.loom/`) the daemon owns for
+/// GitHub-App-token delivery via `GH_CONFIG_DIR` (#4458). Mirrors the
+/// existing `.loom/tokens/` convention (`tokens.rs`) — host-local, never
+/// committed (see `.gitignore`).
+#[must_use]
+pub fn github_app_gh_config_dir(workspace_root: &Path) -> PathBuf {
+    workspace_root.join(".loom").join("gh-config")
+}
+
+/// Static `config.yml` companion `hosts.yml` needs so `gh` skips its
+/// one-time multi-account migration (see module doc above for why that
+/// migration is fatal for a GitHub-App-only credential).
+const GH_CONFIG_YAML: &str = "version: 1\ngit_protocol: https\n";
+
+/// Build the `hosts.yml` content `gh` expects for `token` on `github.com`.
+/// Split from the file I/O so it is unit-testable without touching disk
+/// (mirrors [`parse_github_app_response`]). `user` is set to
+/// `x-access-token` — the conventional placeholder for a GitHub App
+/// installation token (not a real user account); `gh` does not validate it
+/// against the API, it only uses `oauth_token` for authentication.
+fn gh_hosts_yaml(token: &str) -> String {
+    format!("github.com:\n    oauth_token: {token}\n    user: x-access-token\n    git_protocol: https\n")
+}
+
+/// Set `mode` on `path`, a no-op on non-unix targets (the daemon is
+/// unix-only in practice, but this keeps the crate cross-platform-buildable).
+fn set_private_mode(path: &Path, mode: u32) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, mode);
+    }
+    Ok(())
+}
+
+/// Atomically publish `token` into `config_dir/hosts.yml` (write-then-rename,
+/// same filesystem — no partial-file window), creating `config_dir` and its
+/// static `config.yml` companion on first use. This is a **pure file
+/// operation**: it never touches `std::env`, so it cannot race the
+/// `environ` reads of any concurrently spawned `gh`/`git` child (#4458) —
+/// the refresh tick in `main.rs` calls this in place of the old
+/// `std::env::set_var("GH_TOKEN", …)`.
+pub fn publish_github_app_token(config_dir: &Path, token: &str) -> std::io::Result<()> {
+    std::fs::create_dir_all(config_dir)?;
+    set_private_mode(config_dir, 0o700)?;
+
+    let config_path = config_dir.join("config.yml");
+    if !config_path.exists() {
+        std::fs::write(&config_path, GH_CONFIG_YAML)?;
+        set_private_mode(&config_path, 0o600)?;
+    }
+
+    let hosts_path = config_dir.join("hosts.yml");
+    let tmp_path = config_dir.join("hosts.yml.tmp");
+    std::fs::write(&tmp_path, gh_hosts_yaml(token))?;
+    set_private_mode(&tmp_path, 0o600)?;
+    std::fs::rename(&tmp_path, &hosts_path)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -884,5 +995,82 @@ mod tests {
     fn resolve_github_app_script_neither_present_returns_none() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(resolve_github_app_script(dir.path()), None);
+    }
+
+    #[test]
+    fn github_app_gh_config_dir_lives_under_dot_loom() {
+        let root = Path::new("/tmp/some-workspace");
+        assert_eq!(github_app_gh_config_dir(root), root.join(".loom").join("gh-config"));
+    }
+
+    #[test]
+    fn gh_hosts_yaml_embeds_token_and_skips_migration_fields() {
+        // #4458: the format must include `oauth_token` (auth) and
+        // `git_protocol` (gh reads this without a network call); `user` is
+        // an unvalidated placeholder for a GitHub App token.
+        let yaml = gh_hosts_yaml("ghs_example_token");
+        assert!(yaml.contains("oauth_token: ghs_example_token"));
+        assert!(yaml.contains("user: x-access-token"));
+        assert!(yaml.contains("git_protocol: https"));
+        assert!(yaml.starts_with("github.com:\n"));
+    }
+
+    #[test]
+    fn publish_github_app_token_writes_hosts_and_config_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("gh-config");
+
+        publish_github_app_token(&config_dir, "ghs_first").unwrap();
+
+        let hosts = std::fs::read_to_string(config_dir.join("hosts.yml")).unwrap();
+        assert!(hosts.contains("oauth_token: ghs_first"));
+        let config = std::fs::read_to_string(config_dir.join("config.yml")).unwrap();
+        assert!(config.contains("version: 1"));
+
+        // No leftover temp file after a successful publish (rename consumed it).
+        assert!(!config_dir.join("hosts.yml.tmp").exists());
+    }
+
+    #[test]
+    fn publish_github_app_token_rotation_overwrites_hosts_but_not_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("gh-config");
+
+        publish_github_app_token(&config_dir, "ghs_old").unwrap();
+        let config_before = std::fs::read_to_string(config_dir.join("config.yml")).unwrap();
+
+        // Simulate a real #4430 rotation: a second publish with a new value
+        // (this is what the refresh tick calls in place of the old
+        // `std::env::set_var("GH_TOKEN", …)` — a pure file rewrite, no env
+        // mutation anywhere in this path).
+        publish_github_app_token(&config_dir, "ghs_new").unwrap();
+
+        let hosts_after = std::fs::read_to_string(config_dir.join("hosts.yml")).unwrap();
+        assert!(hosts_after.contains("oauth_token: ghs_new"));
+        assert!(!hosts_after.contains("ghs_old"));
+
+        // `config.yml` is written once and never rewritten on rotation.
+        let config_after = std::fs::read_to_string(config_dir.join("config.yml")).unwrap();
+        assert_eq!(config_before, config_after);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn publish_github_app_token_sets_private_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("gh-config");
+        publish_github_app_token(&config_dir, "ghs_secret").unwrap();
+
+        let hosts_mode = std::fs::metadata(config_dir.join("hosts.yml"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(hosts_mode, 0o600);
+
+        let dir_mode = std::fs::metadata(&config_dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700);
     }
 }

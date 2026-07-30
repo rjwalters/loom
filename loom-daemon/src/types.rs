@@ -4,6 +4,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+pub use crate::runtime_admission::{RuntimeRejection, RuntimeSource};
+
 pub type TerminalId = String;
 
 /// Unique identifier for a sweep dispatched via the daemon (Issue #3452).
@@ -442,6 +444,13 @@ pub enum Request {
     ///   nothing to prove supervision *for*). `#[serde(default)]` keeps
     ///   pre-#4343 wire data (`{"type":"DrainAndRestartDaemon","payload":{...}}`
     ///   with no `then_exit` key) parsing as `false` — the original behavior.
+    ///
+    ///   When a drain is **already in progress**, `timeout_secs` and
+    ///   `force_after_timeout` are ignored (the active deadline is pinned) but
+    ///   `then_exit: true` **escalates** the active drain one-way from relaunch
+    ///   to stay-down (Issue #4521); `then_exit: false` never downgrades an
+    ///   active teardown drain. The reply's `then_exit` reports what the active
+    ///   drain will actually do — see [`Response::DaemonDrain`].
     DrainAndRestartDaemon {
         timeout_secs: Option<u64>,
         force_after_timeout: bool,
@@ -520,6 +529,8 @@ pub enum Response {
         token_name: String,
         log_path: PathBuf,
     },
+    /// Typed, secret-free fail-closed runtime admission rejection.
+    RuntimeRejected(RuntimeRejection),
     /// Result of a `ListSweeps` request.
     SweepList {
         sweeps: Vec<SweepInfo>,
@@ -618,10 +629,21 @@ pub enum Response {
     /// `in_flight` is the cross-root non-terminal sweep count at request time,
     /// so the operator immediately sees how much work the drain must wait for.
     /// `message` is a human-readable explanation for operator output.
-    /// `then_exit` (Issue #4343) echoes back the request's `then_exit`: `true`
-    /// means the daemon will exit and stay down once drained (never relaunch),
-    /// rather than restart. `#[serde(default)]` keeps pre-#4343 wire data
-    /// parsing (as `false`).
+    /// `then_exit` (Issue #4343) reports the **active** drain's terminal action:
+    /// `true` means the daemon will exit and stay down once drained (never
+    /// relaunch), `false` means it will exit for a supervised relaunch.
+    ///
+    /// It is **not** an echo of the request (Issue #4521). On the
+    /// already-draining path the requested value may differ from the active
+    /// drain's: a `then_exit: true` request escalates an in-progress
+    /// relaunch-drain one-way to stay-down (so the reply is `true`), while a
+    /// `then_exit: false` request against an active teardown drain is *not*
+    /// honored (the reply stays `true`). Clients MUST render "will stop" vs
+    /// "will restart" from this field, never from their own request — a client
+    /// that renders from the request promises a teardown the daemon never
+    /// performs. `#[serde(default)]` keeps pre-#4343 wire data parsing (as
+    /// `false`), which is also how a new client detects version skew against an
+    /// old daemon that silently dropped the request's `then_exit`.
     DaemonDrain {
         accepted: bool,
         supervisor: Option<String>,
@@ -784,6 +806,9 @@ pub struct SweepInfo {
     /// observability contract safely degrade to `unknown`.
     #[serde(default = "default_sweep_runtime")]
     pub runtime: String,
+    /// Precedence tier that selected `runtime`; absent for legacy entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_source: Option<RuntimeSource>,
     /// Path to the per-sweep log file (relative to the workspace).
     pub log_path: PathBuf,
     /// Optional idempotency key supplied at dispatch.
@@ -909,47 +934,37 @@ pub struct DaemonStatusReport {
     /// Dynamic-cap input 2: how many worktrees the scratch volume can hold at
     /// `LOOM_PER_WORKTREE_GB` each. Via [`crate::disk_headroom::disk_headroom_limit`].
     pub disk_headroom: usize,
-    /// Dynamic-cap input 3 (#3978): how many additional concurrent sweeps the
-    /// host's CPU/load headroom can currently absorb. Via
-    /// [`crate::cpu_headroom::cpu_headroom`]. Added because the token/disk axes
-    /// alone let a batch of resetting token accounts raise the cap regardless
-    /// of how many concurrent `cargo build`s were already saturating the host
-    /// — which starved the main-health gate's own build of CPU badly enough to
-    /// false-time-out (the #3978 incident). `#[serde(default)]` keeps pre-#3978
-    /// wire data / older clients compatible (an absent field parses as `0`,
-    /// which the status renderer never treats as a real reading — see
-    /// [`Self::logical_cpus`]).
-    #[serde(default)]
-    pub cpu_headroom: usize,
-    /// The host's logical CPU count feeding [`Self::cpu_headroom`] (#3978), via
-    /// [`crate::cpu_headroom::logical_cpu_count`]. Surfaced so the status view
-    /// can render "X healthy cores" context next to the headroom number.
-    /// `#[serde(default)]` keeps pre-#3978 wire data compatible.
+    /// The host's logical CPU count (#3978), via
+    /// [`crate::cpu_headroom::logical_cpu_count`]. **Observational only since
+    /// #4512** — the CPU headroom *term* it used to feed was removed from the
+    /// admission formula; the status view still renders it (with
+    /// [`Self::cpu_idle_fraction`]) because observed CPU usage is exactly the
+    /// evidence an operator tunes `maxConcurrent` from. `#[serde(default)]`
+    /// keeps pre-#3978 wire data compatible (`0` = "not reported").
     #[serde(default)]
     pub logical_cpus: usize,
-    /// The current 1-minute load average feeding [`Self::cpu_headroom`]
-    /// (#3978), via [`crate::cpu_headroom::read_loadavg_1m`]. `None` on a
-    /// platform/host where no load-average source is available (the CPU term
-    /// then falls back to its static, load-agnostic capacity — see the
-    /// [`crate::cpu_headroom`] module docs). `#[serde(default)]` keeps
-    /// pre-#3978 wire data compatible.
+    /// The current 1-minute load average (#3978), via
+    /// [`crate::cpu_headroom::read_loadavg_1m`]. `None` on a platform/host where
+    /// no load-average source is available. Observational (see
+    /// [`Self::logical_cpus`]); the load-per-core ratio derived from it is what
+    /// the host-distress circuit breaker (#4235) trips on. `#[serde(default)]`
+    /// keeps pre-#3978 wire data compatible.
     #[serde(default)]
     pub loadavg_1m: Option<f64>,
-    /// The measured CPU idle fraction (`0.0..=1.0`) feeding [`Self::cpu_headroom`]
-    /// (#4031), via [`crate::cpu_headroom::cached_cpu_idle_fraction`]. This is the
-    /// signal that replaced the 1-minute load average as the source of "consumed
-    /// cores" — load average overstated consumption by ~1.5× on macOS because it
-    /// counts network-I/O-blocked `claude` sessions that consume no core. `None`
-    /// when no idle sample has been taken yet (the term then falls back to
-    /// [`Self::loadavg_1m`], then to static capacity — see the
-    /// [`crate::cpu_headroom`] module docs). `#[serde(default)]` keeps pre-#4031
-    /// wire data / older clients compatible.
+    /// The measured CPU idle fraction (`0.0..=1.0`) (#4031), via
+    /// [`crate::cpu_headroom::cached_cpu_idle_fraction`] — the signal that
+    /// replaced the 1-minute load average as the source of "consumed cores"
+    /// (load average overstated consumption by ~1.5× on macOS because it counts
+    /// network-I/O-blocked `claude` sessions that consume no core). `None` when
+    /// no idle sample has been taken yet. Observational since #4512 (see
+    /// [`Self::logical_cpus`]). `#[serde(default)]` keeps pre-#4031 wire data /
+    /// older clients compatible.
     #[serde(default)]
     pub cpu_idle_fraction: Option<f64>,
     /// Whether in-flight occupancy has actually reached the dynamic cap
     /// (`in_flight.len() >= dynamic_cap`) — i.e. the cap is *currently binding*,
     /// not merely the smallest ceiling (#4031). When `false`, no resource term
-    /// (tokens/disk/CPU) is the limiter — the limiter is **work availability**,
+    /// (tokens/disk/ceiling) is the limiter — the limiter is **work availability**,
     /// and the status renderer suppresses the "token-bound" diagnosis rather than
     /// misreporting a bottleneck at, say, 1 in-flight against a cap of 7.
     /// `#[serde(default)]` keeps pre-#4031 wire data / older clients compatible
@@ -976,8 +991,11 @@ pub struct DaemonStatusReport {
     /// wire data compatible.
     #[serde(default)]
     pub preflight_advisory_message: Option<String>,
-    /// Dynamic-cap input 4: the configured operator ceiling
+    /// Dynamic-cap input 3: **the** per-machine admission knob
     /// (`autonomous.workFinder.maxConcurrent` / `LOOM_WORK_FINDER_MAX_CONCURRENT`).
+    /// Since #4512 this is the only *policy* term in the cap — the other two
+    /// meter exhaustible resources (accounts, bytes) — so it is what an operator
+    /// tunes for a host, empirically, from the observed idle fraction above.
     pub configured_max: usize,
     /// The per-token concurrency factor (#3947): how many concurrent sweeps the
     /// dynamic cap allows per *healthy* token. The token axis of the cap is
@@ -989,10 +1007,10 @@ pub struct DaemonStatusReport {
     #[serde(default)]
     pub per_token_concurrency: usize,
     /// The effective dynamic concurrency cap —
-    /// `min(token_axis × per_token_concurrency, disk_headroom, cpu_headroom,
-    /// configured_max)` (`resolve_dynamic_max_concurrent`, CPU term #3978).
-    /// This is the total-occupancy ceiling the work finder recomputes every
-    /// tick.
+    /// `min(token_axis × per_token_concurrency, disk_headroom, configured_max)`
+    /// (`resolve_dynamic_max_concurrent`; the CPU term that sat in this `min`
+    /// from #3978 was removed in #4512). This is the total-occupancy ceiling the
+    /// work finder recomputes every tick.
     pub dynamic_cap: usize,
     /// Whether autonomous dispatch is currently halted by the reactive
     /// main-health gate (#3812). `true` means a red `main` has paused new
@@ -1678,6 +1696,10 @@ pub enum Event {
     SweepGlobalDispatch {
         sweep_id: SweepId,
         kind: SweepKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        runtime: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        runtime_source: Option<RuntimeSource>,
         /// Owning managed-workspace root (Issue #3929's pattern, extended here
         /// by #4201). This was the one sweep-scoped variant that did **not**
         /// carry `repo` — the safehouse narration sink needs it to
@@ -1685,6 +1707,39 @@ pub enum Event {
         /// across managed repos, e.g. loom #N vs vibesql #N narrating into the
         /// same Matrix thread). `#[serde(default)]` keeps pre-#4201 wire data
         /// compatible.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repo: Option<String>,
+    },
+    /// `sweep.global.runtime_rejected` — a dispatch was **refused** by
+    /// fail-closed runtime admission (issue #4494, epic #4489 Phase 5), before
+    /// any claim lock, forge mutation, account selection, log header, or child
+    /// spawn. `SweepGlobalDispatch` only exists for *admitted* work, so without
+    /// this variant refused work had no event representation at all.
+    ///
+    /// The payload is deliberately the same structured, secret-free shape the
+    /// typed [`RuntimeRejection`] carries over IPC (role / runtime / source /
+    /// unmet capability names / reason) — no token name, account, credential,
+    /// or log path is included, and emitting it introduces **no** claim,
+    /// account, or log side effect (it is a pure event publish).
+    SweepGlobalRuntimeRejected {
+        /// The refused work item (issue or PR set) — there is no `sweep_id`,
+        /// because no sweep was ever created.
+        kind: SweepKind,
+        /// Canonical role/lifecycle the admission decision was made for
+        /// (`sweep-lifecycle` for a full sweep).
+        role: String,
+        /// Runtime that was resolved and then refused.
+        runtime: String,
+        /// Precedence tier that selected `runtime`.
+        runtime_source: RuntimeSource,
+        /// Named capabilities the runtime failed to declare as exactly `"yes"`.
+        /// Empty for config/adapter/manifest-shaped refusals.
+        #[serde(default)]
+        unmet_capabilities: Vec<String>,
+        /// Operator-facing rejection reason (the [`RuntimeRejection`] reason).
+        reason: String,
+        /// Owning managed-workspace root (Issue #3929's pattern). Stamped by
+        /// `SweepRegistry::emit_event` -> [`Self::set_repo_if_absent`].
         #[serde(default, skip_serializing_if = "Option::is_none")]
         repo: Option<String>,
     },
@@ -1787,6 +1842,7 @@ impl Event {
     /// | `SweepCrashed {issue, ..}` | `sweep.issue.{issue}.crashed` |
     /// | `SweepResumeDispatched {issue, ..}` | `sweep.issue.{issue}.resume_dispatched` |
     /// | `SweepGlobalDispatch {..}` | `sweep.global.dispatch` |
+    /// | `SweepGlobalRuntimeRejected {..}` | `sweep.global.runtime_rejected` |
     /// | `SweepGlobalCompleted {..}` | `sweep.global.completed` |
     /// | `EpicAction {epic, action, ..}` | `epic.issue.{epic}.{action}` |
     /// | `CapacityAdvisory {..}` | `daemon.capacity.advisory` |
@@ -1811,6 +1867,7 @@ impl Event {
                 format!("sweep.issue.{issue}.resume_dispatched")
             }
             Self::SweepGlobalDispatch { .. } => "sweep.global.dispatch".to_string(),
+            Self::SweepGlobalRuntimeRejected { .. } => "sweep.global.runtime_rejected".to_string(),
             Self::SweepGlobalCompleted { .. } => "sweep.global.completed".to_string(),
             Self::EpicAction { epic, action, .. } => {
                 format!("epic.issue.{epic}.{}", action.as_str())
@@ -1842,7 +1899,8 @@ impl Event {
             | Self::SweepExited { repo, .. }
             | Self::SweepCrashed { repo, .. }
             | Self::SweepResumeDispatched { repo, .. }
-            | Self::SweepGlobalDispatch { repo, .. } => repo,
+            | Self::SweepGlobalDispatch { repo, .. }
+            | Self::SweepGlobalRuntimeRejected { repo, .. } => repo,
             _ => return,
         };
         if slot.is_none() {

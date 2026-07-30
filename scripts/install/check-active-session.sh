@@ -53,17 +53,27 @@ fi
 
 # Portable mtime-in-epoch-seconds reader. Echoes the mtime on stdout, or
 # nothing (and a non-zero exit) when the file doesn't exist.
+#
+# GNU `stat -c` is tried FIRST, BSD `stat -f` second. `-c` is an illegal
+# option on BSD/macOS, so it fails there cleanly (no stdout). The reverse
+# order MISFIRES on GNU/Linux: there, `-f` means --file-system (a bare mode
+# flag, not a format arg), so `stat -f '%m' <path>` prints a multi-line
+# filesystem report to stdout while still exiting non-zero. Because only
+# stderr is redirected, that polluted stdout survives into the captured
+# value ahead of the real epoch from the fallback branch, corrupting every
+# downstream `$((now - mtime))` arithmetic comparison and silently
+# suppressing indicators 2 and 3 on Linux (#4565).
 _file_mtime_epoch() {
   local path="$1"
   if [[ ! -e "$path" ]]; then
     return 1
   fi
-  # BSD stat (macOS)
-  if stat -f '%m' "$path" 2>/dev/null; then
-    return 0
-  fi
   # GNU stat (Linux)
   if stat -c '%Y' "$path" 2>/dev/null; then
+    return 0
+  fi
+  # BSD stat (macOS)
+  if stat -f '%m' "$path" 2>/dev/null; then
     return 0
   fi
   return 1

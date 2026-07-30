@@ -14,7 +14,7 @@
       "enabled": true
     },
     "workFinder": {
-      "maxConcurrent": 8
+      "maxConcurrent": 10
     }
   },
   "buildGate": {

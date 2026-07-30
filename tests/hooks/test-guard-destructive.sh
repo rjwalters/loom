@@ -460,6 +460,27 @@ assert_deny "Block init 0" \
 assert_deny "Block init 6" \
     "init 6"
 
+# gh pr/issue comment --body @path — literal-@ silent data loss (#4523,
+# incident on PR #4457). Covers both the unquoted and the quoted shape: the
+# quoted shape is the one a naive implementation (that scans the
+# strip_literal_text()-redacted copy) would silently miss, since redaction
+# replaces a quoted value's entire inner text — including a leading `@` —
+# with `X`s.
+assert_deny "Block gh pr comment --body @path (unquoted)" \
+    "gh pr comment 123 --body @/tmp/review.md"
+
+assert_deny "Block gh pr comment --body @path (double-quoted)" \
+    'gh pr comment 123 --body "@/tmp/review.md"'
+
+assert_deny "Block gh pr comment --body @path (single-quoted)" \
+    "gh pr comment 123 --body '@/tmp/review.md'"
+
+assert_deny "Block gh issue comment --body @path (unquoted)" \
+    "gh issue comment 42 --body @/tmp/review.md"
+
+assert_deny "Block gh pr comment -b @path (short flag)" \
+    "gh pr comment 123 -b @/tmp/review.md"
+
 echo ""
 
 # =========================================================================
@@ -660,6 +681,31 @@ assert_allow "Allow gh pr list" \
 
 assert_allow "Allow gh pr create" \
     "gh pr create --title 'My PR' --body 'Description'"
+
+assert_allow "Allow gh pr comment with heredoc body (safe pattern)" \
+    'gh pr comment 123 --body "$(cat <<'"'"'EOF'"'"'
+LGTM! Review prose here.
+EOF
+)"'
+
+assert_allow "Allow gh pr comment with quoted prose containing @mention" \
+    'gh pr comment 123 --body "cc @reviewer please take another look"'
+
+# Regression (#4577): an @mention immediately after the opening quote (no
+# leading word) is not path-shaped and must not be caught by
+# GH_COMMENT_BODY_AT_PATTERN — this exact shape is doctor.md's own
+# documented "Can't Understand Feedback" example.
+assert_allow "Allow gh pr comment with leading @mention (no leading word before @)" \
+    'gh pr comment 123 --body "@reviewer Could you clarify what you mean by X?"'
+
+assert_allow "Allow gh pr comment --body-file (distinct flag, actually reads the file)" \
+    "gh pr comment 123 --body-file /tmp/review.md"
+
+assert_allow "Allow gh api -F body=@path (distinct flag, actually reads the file)" \
+    "gh api repos/o/r/issues/123/comments -F body=@/tmp/review.md"
+
+assert_allow "Allow gh pr edit --body-file (PR description, not a comment)" \
+    "gh pr edit 123 --body-file /tmp/pr-body.txt"
 
 assert_allow "Allow pnpm install" \
     "pnpm install"

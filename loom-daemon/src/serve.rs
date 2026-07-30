@@ -1032,7 +1032,6 @@ mod tests {
             token_pool_size: 0,
             token_pool_dir: None,
             disk_headroom: 0,
-            cpu_headroom: 0,
             logical_cpus: 0,
             loadavg_1m: None,
             cpu_idle_fraction: None,
@@ -1393,6 +1392,8 @@ mod tests {
             Event::SweepGlobalDispatch {
                 sweep_id: "sweep-4392".to_string(),
                 kind: SweepKind::Issue(4392),
+                runtime: None,
+                runtime_source: None,
                 repo: None,
             },
             Event::SweepGlobalCompleted {
@@ -1509,6 +1510,8 @@ mod tests {
         let frame = sse_frame(&Event::SweepGlobalDispatch {
             sweep_id: "sweep-4392".to_string(),
             kind: SweepKind::Issue(4392),
+            runtime: None,
+            runtime_source: None,
             repo: Some("/repos/loom".to_string()),
         });
         let data = frame.trim_start_matches("data: ").trim_end_matches("\n\n");
@@ -1813,6 +1816,8 @@ mod tests {
             .publish(Event::SweepGlobalDispatch {
                 sweep_id: "sweep-4392".to_string(),
                 kind: SweepKind::Issue(4392),
+                runtime: None,
+                runtime_source: None,
                 repo: None,
             })
             .expect("publish");

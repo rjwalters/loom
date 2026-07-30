@@ -12,7 +12,7 @@ use crate::workspace_pool::WorkspacePool;
 use crate::workspace_registry::WorkspaceRegistry;
 use anyhow::Result;
 use chrono::Utc;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -201,7 +201,18 @@ pub enum DrainBegin {
     /// A drain was already in progress; the request is an idempotent ack and no
     /// second supervisor should be spawned (the deadline/generation are
     /// unchanged).
-    AlreadyDraining,
+    AlreadyDraining {
+        /// The **active** drain's actual terminal action after this request was
+        /// applied — `true` ⇒ it will exit and stay down, `false` ⇒ it will exit
+        /// for a supervised relaunch. Never a blind echo of the request
+        /// (Issue #4521): the caller must render its ack from this, or it will
+        /// promise a teardown that never happens.
+        active_then_exit: bool,
+        /// `true` when this request *escalated* an in-progress relaunch-drain to
+        /// stay-down (the one-way `then_exit` transition — see
+        /// [`DrainState::begin`]).
+        escalated: bool,
+    },
 }
 
 impl Default for DrainState {
@@ -250,10 +261,30 @@ impl DrainState {
 
     /// Start a drain, or ack an already-running one (idempotent — a second drain
     /// request while DRAINING neither stacks a supervisor nor moves the
-    /// deadline). Sets the drain flag on a fresh start. `then_exit` is ignored
-    /// on the already-draining path (the in-progress drain's terminal action is
-    /// unchanged by a later idempotent ack — mirrors `force_after_timeout` and
-    /// the deadline both staying fixed too).
+    /// deadline). Sets the drain flag on a fresh start.
+    ///
+    /// **`then_exit` on the already-draining path (Issue #4521 — design
+    /// decision).** `timeout`/`force_after_timeout` stay pinned to the active
+    /// drain (a later idempotent ack must not move a deadline someone is already
+    /// waiting on), but `then_exit` is **escalated one-way**:
+    /// `relaunch → stay-down`, never the reverse.
+    ///
+    /// Rationale: the two options were (a) refuse the escalation and tell the
+    /// operator to `--abort-drain` and re-issue, or (b) escalate in place. (a)
+    /// is racy in exactly the case that matters — an operator tearing a host
+    /// down while an auto-update roll-drain (`then_exit=false`,
+    /// `auto_update.rs`) is in flight would have to abort and re-issue, and the
+    /// roll can complete *between* those two commands, relaunching the daemon on
+    /// a host that is about to be powered off. (b) is monotonic and safe: exiting
+    /// and staying down is strictly the more conservative terminal action, and
+    /// the operator's teardown intent is honored on the first command. The
+    /// reverse direction is deliberately **not** applied — a roll trigger
+    /// arriving during an operator teardown drain must never silently downgrade
+    /// the teardown into a relaunch.
+    ///
+    /// The escalation is observed by the already-running supervisor because it
+    /// re-reads `then_exit` from this descriptor at its terminal tick rather
+    /// than using a value captured at spawn (see [`run_drain_supervisor`]).
     pub fn begin(
         &self,
         timeout: Duration,
@@ -262,7 +293,19 @@ impl DrainState {
     ) -> DrainBegin {
         let mut inner = self.inner.lock().expect("Drain mutex poisoned");
         if inner.active {
-            return DrainBegin::AlreadyDraining;
+            let escalated = then_exit && !inner.then_exit;
+            if escalated {
+                inner.then_exit = true;
+                inner.note = Some(
+                    "in-progress drain escalated to then-exit — will stop and stay down \
+                     (was: exit for a supervised relaunch)"
+                        .to_string(),
+                );
+            }
+            return DrainBegin::AlreadyDraining {
+                active_then_exit: inner.then_exit,
+                escalated,
+            };
         }
         let deadline = Utc::now()
             + chrono::Duration::from_std(timeout).unwrap_or_else(|_| chrono::Duration::seconds(0));
@@ -483,7 +526,6 @@ pub fn handle_drain_request(
                     bus_task,
                     generation,
                     DRAIN_POLL_INTERVAL,
-                    then_exit,
                 )
                 .await;
             });
@@ -527,16 +569,107 @@ pub fn handle_drain_request(
                 then_exit,
             }
         }
-        DrainBegin::AlreadyDraining => Response::DaemonDrain {
-            accepted: true,
-            supervisor,
-            in_flight,
-            message: format!(
-                "already draining (idempotent): {in_flight} in-flight sweep(s); the existing \
-                 deadline is unchanged. Use `loom-daemon restart --abort-drain` to cancel."
-            ),
-            then_exit,
-        },
+        // Issue #4521: the ack must describe the **active** drain's terminal
+        // action, never the requested one. Echoing the request here is what let
+        // an operator's `--drain --then-exit` be acked as "will stop" while an
+        // in-progress relaunch-drain (an auto-update roll) exited 0 and launchd
+        // brought the daemon straight back up.
+        DrainBegin::AlreadyDraining {
+            active_then_exit,
+            escalated,
+        } => {
+            let _ = event_bus.publish_generic(
+                "daemon.drain.already_draining",
+                serde_json::json!({
+                    "in_flight": in_flight,
+                    "requested_then_exit": then_exit,
+                    "active_then_exit": active_then_exit,
+                    "escalated": escalated,
+                }),
+            );
+            if escalated {
+                log::warn!(
+                    "drain escalated to then-exit (Issue #4521): an in-progress relaunch-drain \
+                     (e.g. an auto-update roll) will now exit {EXIT_SHUTDOWN} and stay down \
+                     instead of relaunching"
+                );
+            }
+            let message = if escalated {
+                format!(
+                    "already draining (idempotent) — ESCALATED to then-exit: the in-progress \
+                     drain was a relaunch drain (e.g. an auto-update roll) and will now STOP \
+                     and stay down when drained, NOT relaunch. {in_flight} in-flight sweep(s); \
+                     the existing deadline is unchanged. If a relaunch was wanted after all, \
+                     `loom-daemon restart --abort-drain` and re-issue without --then-exit."
+                )
+            } else if active_then_exit && !then_exit {
+                format!(
+                    "already draining (idempotent): the in-progress drain is a then-exit \
+                     teardown — it will STOP and stay down when drained, NOT relaunch, so this \
+                     restart-when-drained request will not be honored (then-exit is never \
+                     downgraded). {in_flight} in-flight sweep(s); the existing deadline is \
+                     unchanged. Use `loom-daemon restart --abort-drain` to cancel."
+                )
+            } else if active_then_exit {
+                format!(
+                    "already draining (idempotent): the in-progress drain will STOP and stay \
+                     down when drained (then-exit). {in_flight} in-flight sweep(s); the existing \
+                     deadline is unchanged. Use `loom-daemon restart --abort-drain` to cancel."
+                )
+            } else {
+                format!(
+                    "already draining (idempotent): the in-progress drain will RESTART when \
+                     drained. {in_flight} in-flight sweep(s); the existing deadline is \
+                     unchanged. Use `loom-daemon restart --abort-drain` to cancel."
+                )
+            };
+            Response::DaemonDrain {
+                accepted: true,
+                supervisor,
+                in_flight,
+                message,
+                then_exit: active_then_exit,
+            }
+        }
+    }
+}
+
+/// The exit code a terminal drain tick must use (Issue #4521).
+///
+/// Load-bearing and deliberately extracted as a pure function so the contract is
+/// unit-testable without spawning a process: a **then-exit** drain must exit
+/// [`EXIT_SHUTDOWN`] (143, non-zero) so a `KeepAlive:{SuccessfulExit:true}`
+/// launchd job stays down — exiting [`EXIT_RESTART`] (0) there is precisely the
+/// "drained, then relaunched anyway" failure. A relaunch drain exits
+/// [`EXIT_RESTART`] so the supervisor brings it straight back.
+#[must_use]
+pub fn drain_exit_code(then_exit: bool) -> i32 {
+    if then_exit {
+        EXIT_SHUTDOWN
+    } else {
+        EXIT_RESTART
+    }
+}
+
+/// The operator-facing log line emitted when a drain completes with zero
+/// in-flight sweeps (Issue #4090, pinned by Issue #4521).
+///
+/// The two terminal actions **must** produce visibly different lines — a host
+/// log has to say which one fired without the reader guessing. Extracted as a
+/// pure function so that distinctness is a test assertion rather than a
+/// convention. `supervisor` is only interpolated on the relaunch line.
+#[must_use]
+pub fn drain_complete_log_line(then_exit: bool, supervisor: &str) -> String {
+    if then_exit {
+        format!(
+            "drain complete — 0 in-flight sweeps; exiting {EXIT_SHUTDOWN} and staying down \
+             (then_exit — Issue #4343 teardown). No sweep was killed; no orphan left behind."
+        )
+    } else {
+        format!(
+            "drain complete — 0 in-flight sweeps; exiting {EXIT_RESTART} for a \
+             {supervisor}-supervised relaunch. No sweep was killed; no orphan left behind."
+        )
     }
 }
 
@@ -544,6 +677,12 @@ pub fn handle_drain_request(
 /// and owns the eventual `std::process::exit(EXIT_RESTART)`; on a fail-safe
 /// timeout it clears the drain flag and stays up. Stops without exiting if it
 /// has been superseded (a new drain) or aborted (generation moved on).
+///
+/// The terminal action (`then_exit`) is **re-read from [`DrainState`] on every
+/// tick** rather than captured at spawn (Issue #4521): an in-progress
+/// relaunch-drain can be escalated to stay-down by a later
+/// `--drain --then-exit` request, and a supervisor holding a stale `false` would
+/// exit `0` and be relaunched by the supervisor anyway.
 async fn run_drain_supervisor(
     drain: Arc<DrainState>,
     workspace_pool: Arc<WorkspacePool>,
@@ -551,7 +690,6 @@ async fn run_drain_supervisor(
     event_bus: Arc<EventBus>,
     my_generation: u64,
     poll_interval: Duration,
-    then_exit: bool,
 ) {
     loop {
         // Superseded / aborted: a newer drain or an abort bumped the generation,
@@ -568,10 +706,13 @@ async fn run_drain_supervisor(
         }
 
         let in_flight = count_in_flight_sweeps(&workspace_pool, &fallback_root);
-        let (past_deadline, force) = {
+        // One consistent read of the live descriptor per tick. `then_exit` comes
+        // from here — not from a spawn-time argument — so a mid-drain escalation
+        // (relaunch → stay-down, Issue #4521) is honored by this supervisor.
+        let (past_deadline, force, then_exit) = {
             let snap = drain.snapshot();
             let past = snap.deadline.is_some_and(|d| Utc::now() >= d);
-            (past, snap.force_after_timeout)
+            (past, snap.force_after_timeout, snap.then_exit)
         };
 
         match evaluate_drain_tick(in_flight, past_deadline, force) {
@@ -584,23 +725,16 @@ async fn run_drain_supervisor(
                     serde_json::json!({ "in_flight": 0, "then_exit": then_exit }),
                 );
                 if then_exit {
-                    log::warn!(
-                        "drain complete — 0 in-flight sweeps; exiting {EXIT_SHUTDOWN} and staying \
-                         down (then_exit — Issue #4343 teardown). No sweep was killed; no orphan \
-                         left behind."
-                    );
-                    std::process::exit(EXIT_SHUTDOWN);
+                    log::warn!("{}", drain_complete_log_line(true, ""));
+                    std::process::exit(drain_exit_code(true));
                 }
                 // This path only runs after `handle_drain_request` proved
                 // supervision, so `detect_supervisor()` should still be `Some`
                 // here; fall back to a generic label rather than hardcoding
                 // launchd if the environment somehow changed underneath us.
                 let sup = detect_supervisor().unwrap_or_else(|| "supervisor".to_string());
-                log::warn!(
-                    "drain complete — 0 in-flight sweeps; exiting {EXIT_RESTART} for a \
-                     {sup}-supervised relaunch. No sweep was killed; no orphan left behind."
-                );
-                std::process::exit(EXIT_RESTART);
+                log::warn!("{}", drain_complete_log_line(false, &sup));
+                std::process::exit(drain_exit_code(false));
             }
             DrainTick::TimedOutRefuse => {
                 let note = format!(
@@ -632,13 +766,13 @@ async fn run_drain_supervisor(
                          cancelled {cancelled} sweep(s); exiting {EXIT_SHUTDOWN} and staying down \
                          (then_exit — Issue #4343 teardown)"
                     );
-                    std::process::exit(EXIT_SHUTDOWN);
+                    std::process::exit(drain_exit_code(true));
                 }
                 log::warn!(
                     "drain timed out with {in_flight} in-flight; --force-after-timeout cancelled \
                      {cancelled} sweep(s); exiting {EXIT_RESTART} for a supervised relaunch"
                 );
-                std::process::exit(EXIT_RESTART);
+                std::process::exit(drain_exit_code(false));
             }
         }
     }
@@ -1374,28 +1508,18 @@ pub fn build_daemon_status(
     // re-resolving a possibly-different one.
     let token_pool_dir = Some(tokens_dir.clone());
     let disk_headroom = crate::disk_headroom::disk_headroom_limit(workspace_root);
-    // Hoisted above the CPU snapshot (#4032) so the resolved
-    // `cpuUtilizationTarget` / `estCoresPerSweep` knobs can feed it — this read
-    // was already happening six lines below; moving it up is not a new config
-    // read, just a reorder so status and dispatch resolve through the same
-    // env > config > default path (`resolve_cpu_utilization_target` /
-    // `resolve_cpu_est_cores_per_sweep`, single-root, matching
-    // `resolve_per_token_concurrency`).
     let wf_config = crate::work_finder::read_work_finder_config(workspace_root);
     let configured_max = crate::work_finder::resolve_max_concurrent_with_config(&wf_config);
     let per_token_concurrency = crate::work_finder::resolve_per_token_concurrency(&wf_config);
-    let cpu_utilization_target = crate::work_finder::resolve_cpu_utilization_target(&wf_config);
-    let cpu_est_cores_per_sweep = crate::work_finder::resolve_cpu_est_cores_per_sweep(&wf_config);
-    // CPU headroom (#3978, measured-idle signal #4031) — a host-level resource
-    // (not per-repo). The snapshot reads the memoized idle fraction (never
-    // blocks; the caller pre-warms it via `spawn_blocking(refresh_cpu_util_cache)`
-    // before invoking `build_daemon_status`) plus a fast fresh loadavg read.
-    let cpu_snapshot =
-        crate::cpu_headroom::cpu_headroom_snapshot(cpu_utilization_target, cpu_est_cores_per_sweep);
-    let logical_cpus = cpu_snapshot.logical_cpus;
-    let loadavg_1m = cpu_snapshot.loadavg_1m;
-    let cpu_idle_fraction = cpu_snapshot.idle_fraction;
-    let cpu_headroom = cpu_snapshot.cpu_headroom;
+    // Host CPU **observations** (#3978, measured-idle signal #4031). Since #4512
+    // these no longer feed the cap — they are reported so an operator can see
+    // whether this machine's `maxConcurrent` leaves it idle or saturated. Never
+    // blocks: the idle fraction is the memoized sample (the caller pre-warms it
+    // via `spawn_blocking(refresh_cpu_util_cache)` before invoking
+    // `build_daemon_status`), plus a fast fresh loadavg read.
+    let logical_cpus = crate::cpu_headroom::logical_cpu_count();
+    let loadavg_1m = crate::cpu_headroom::read_loadavg_1m();
+    let cpu_idle_fraction = crate::cpu_headroom::cached_cpu_idle_fraction();
 
     // Token-capacity backpressure (#3902): back the token axis off from the flat
     // pool count toward the count of *healthy* accounts read from the rotation
@@ -1407,16 +1531,15 @@ pub fn build_daemon_status(
         token_axis_limit,
         per_token_concurrency,
         disk_headroom,
-        cpu_headroom,
         configured_max,
     );
     // The token axis of the cap is `healthy × per-token` (#3947), so it is the
     // binding constraint only when that *product* is the minimum across every
-    // axis — disk, cpu (#3978), and the operator ceiling.
+    // remaining axis — disk and the configured ceiling (#4512 removed the CPU
+    // axis).
     let token_axis_effective = token_axis_limit.saturating_mul(per_token_concurrency.max(1));
-    let token_bound = token_axis_effective <= disk_headroom
-        && token_axis_effective <= cpu_headroom
-        && token_axis_effective <= configured_max;
+    let token_bound =
+        token_axis_effective <= disk_headroom && token_axis_effective <= configured_max;
     // "Currently binding" vs "smallest ceiling" (#4031): the dynamic cap is the
     // minimum of several ceilings, but a ceiling only *binds* once in-flight
     // occupancy reaches it. Below the cap the limiter is work availability, not
@@ -1449,7 +1572,6 @@ pub fn build_daemon_status(
         token_pool_size,
         token_pool_dir,
         disk_headroom,
-        cpu_headroom,
         logical_cpus,
         loadavg_1m,
         cpu_idle_fraction,
@@ -1658,22 +1780,15 @@ fn resolve_dispatch_registry(
 // new `Response` variant. The advisory is a side channel (log + event bus),
 // exactly like `capacity.rs`'s token-pressure advisory.
 //
-// # Never the blocking (~1s on macOS) headroom refresh under the registry lock
+// # Nothing blocking under the registry lock
 //
 // The `DispatchSweep` arm holds the registry mutex from just after this
-// assessment through the dispatch call. `cpu_headroom::cpu_headroom_limit`
-// refreshes the memoized idle-fraction sample, which sleeps ~1s on macOS
-// (`iostat`) — calling it here would stall every other IPC request scoped to
-// the same registry (`ListSweeps` / `GetSweepStatus` / a concurrent
-// `DispatchSweep`) for that second. [`assess_dispatch_headroom`] therefore
-// uses the **non-refreshing** [`crate::cpu_headroom::cpu_headroom_snapshot`]
-// (reads the memoized cache; never blocks) — the exact same call
-// `build_daemon_status` makes, just without that function's own
-// `spawn_blocking` pre-warm (this handler is synchronous, not `async`, so it
-// cannot `.await` a `spawn_blocking` join; a same-generation `iostat` sample
-// from a recent `DaemonStatus` poll or the work-finder's own tick is
-// sufficient for an advisory signal, and a `None` idle fraction falls back
-// through `cpu_headroom`'s documented fail-open chain).
+// assessment through the dispatch call, so nothing here may block. Since #4512
+// the headroom is `min(token axis, disk, configured max)` — three cheap
+// filesystem/config reads, no CPU sampling at all. (Before #4512 this had to
+// carefully avoid `cpu_headroom_limit`, whose macOS `iostat` refresh sleeps ~1s
+// and would have stalled every other IPC request on the same registry for that
+// second; removing the CPU term removed that hazard outright.)
 
 /// Per-repo dynamic-cap headroom snapshot computed for a `dispatch_sweep`
 /// request (#4234). Mirrors the inputs `build_daemon_status` already exposes
@@ -1682,16 +1797,14 @@ fn resolve_dispatch_registry(
 struct DispatchHeadroom {
     /// Live (non-terminal) sweep count already registered for this repo.
     occupancy: usize,
-    /// `resolve_dynamic_max_concurrent` — min(token axis, disk, cpu, configured max).
+    /// `resolve_dynamic_max_concurrent` — min(token axis, disk, configured max).
     dynamic_cap: usize,
-    cpu_headroom: usize,
     disk_headroom: usize,
     token_axis_limit: usize,
 }
 
 /// Compute [`DispatchHeadroom`] for `repo_root` against the **already-locked**
-/// registry `sr`. See the module docs above for why this never calls the
-/// refreshing CPU probe.
+/// registry `sr`. See the module docs above for why nothing here may block.
 fn assess_dispatch_headroom(sr: &mut SweepRegistry, repo_root: &Path) -> DispatchHeadroom {
     // Reap-on-read (mirrors ListSweeps/GetSweepStatus, Issue #3893): a sweep
     // whose child already exited must not inflate occupancy against a stale
@@ -1706,10 +1819,6 @@ fn assess_dispatch_headroom(sr: &mut SweepRegistry, repo_root: &Path) -> Dispatc
     let wf_config = crate::work_finder::read_work_finder_config(repo_root);
     let configured_max = crate::work_finder::resolve_max_concurrent_with_config(&wf_config);
     let per_token_concurrency = crate::work_finder::resolve_per_token_concurrency(&wf_config);
-    let cpu_utilization_target = crate::work_finder::resolve_cpu_utilization_target(&wf_config);
-    let cpu_est_cores_per_sweep = crate::work_finder::resolve_cpu_est_cores_per_sweep(&wf_config);
-    let cpu_snapshot =
-        crate::cpu_headroom::cpu_headroom_snapshot(cpu_utilization_target, cpu_est_cores_per_sweep);
     let disk_headroom = crate::disk_headroom::disk_headroom_limit(repo_root);
     let token_pool_size = crate::tokens::token_pool_size(repo_root);
     let ranking = crate::capacity::read_ranking(repo_root);
@@ -1718,14 +1827,12 @@ fn assess_dispatch_headroom(sr: &mut SweepRegistry, repo_root: &Path) -> Dispatc
         token_axis_limit,
         per_token_concurrency,
         disk_headroom,
-        cpu_snapshot.cpu_headroom,
         configured_max,
     );
 
     DispatchHeadroom {
         occupancy,
         dynamic_cap,
-        cpu_headroom: cpu_snapshot.cpu_headroom,
         disk_headroom,
         token_axis_limit,
     }
@@ -1749,6 +1856,55 @@ fn dispatch_would_meet_or_exceed_headroom(h: &DispatchHeadroom) -> bool {
 /// or falsely flip repo B's advisory.
 static DISPATCH_HEADROOM_STATE: Mutex<BTreeMap<PathBuf, bool>> = Mutex::new(BTreeMap::new());
 
+// ============================================================================
+// Per-terminal input correlation (Issue #4554)
+// ============================================================================
+// `Request::SendInput` and `Request::GetTerminalOutput` are separate IPC round
+// trips for the same agent turn: `SendInput` records the `agent_inputs` row and
+// returns its id, but the forge-event (`prompt_github`) and resource-usage
+// (`resource_usage`) rows recorded from the *output* of that turn are written
+// by a later, independent `GetTerminalOutput` call that has no direct handle
+// on that id. Before this fix both writes hardcoded `input_id: None`, so the
+// `resource_usage -> agent_inputs -> prompt_github` join backing
+// `get_cost_by_issue`/`get_cost_by_pr` could never match in production (#4554).
+//
+// This process-global map tracks the most recently recorded `agent_inputs.id`
+// per terminal so `GetTerminalOutput` can look it up and correlate its writes
+// to the input that (most likely) produced the output being parsed. It is a
+// best-effort correlation, not a strict transactional link: concurrent input on
+// the same terminal between the `SendInput` and the next `GetTerminalOutput`
+// poll would attribute cost to the wrong turn, but every turn still lands on
+// *some* real input row for that terminal (and thus its issue/PR), which is a
+// strict improvement over the always-`None` status quo. Entries are
+// intentionally never evicted on `DestroyTerminal` — a stale mapping is
+// harmless (worst case: one extra analytics write correlates to an older input
+// row for a terminal that no longer exists).
+static LAST_INPUT_ID_BY_TERMINAL: std::sync::LazyLock<Mutex<HashMap<String, i64>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Record `input_id` as the most recent `agent_inputs` row for `terminal_id`.
+/// `0` is the "recording failed" sentinel used by `Request::SendInput` (see
+/// below) and is never a real row id, so it is not recorded.
+fn record_last_input_id(terminal_id: &str, input_id: i64) {
+    if input_id == 0 {
+        return;
+    }
+    LAST_INPUT_ID_BY_TERMINAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(terminal_id.to_string(), input_id);
+}
+
+/// Look up the most recently recorded `agent_inputs.id` for `terminal_id`, if
+/// any turn has been recorded for it yet.
+fn last_input_id_for_terminal(terminal_id: &str) -> Option<i64> {
+    LAST_INPUT_ID_BY_TERMINAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(terminal_id)
+        .copied()
+}
+
 /// Build the advisory/recovery message for a `dispatch_sweep` headroom
 /// transition. Split out from [`emit_dispatch_headroom_advisory_on_change`] so
 /// the message text itself is unit-testable without the global dedup state.
@@ -1761,13 +1917,12 @@ fn dispatch_headroom_message(
     if low_headroom {
         format!(
             "dispatch_sweep: dispatching {kind:?} into {} while occupancy is at/over the \
-             computed dynamic-cap headroom (occupancy={} >= dynamic_cap={}; cpu_headroom={}, \
+             computed dynamic-cap headroom (occupancy={} >= dynamic_cap={}; \
              disk_headroom={}, token_axis_limit={}) — advisory only per #4234 (dispatch \
              proceeds; the autonomous work finder's own cap is unaffected)",
             repo_root.display(),
             h.occupancy,
             h.dynamic_cap,
-            h.cpu_headroom,
             h.disk_headroom,
             h.token_axis_limit
         )
@@ -1816,7 +1971,6 @@ fn emit_dispatch_headroom_advisory_on_change(
             "low_headroom": low_headroom,
             "occupancy": h.occupancy,
             "dynamic_cap": h.dynamic_cap,
-            "cpu_headroom": h.cpu_headroom,
             "disk_headroom": h.disk_headroom,
             "token_axis_limit": h.token_axis_limit,
             "message": message,
@@ -1927,6 +2081,13 @@ fn handle_request(
                 0
             };
 
+            // Track this input as the terminal's most recent turn so a later
+            // `GetTerminalOutput` call can correlate its forge-event / resource-
+            // usage writes back to it (#4554). Recorded unconditionally (even if
+            // `tm.send_input` below fails) since the `agent_inputs` row itself was
+            // already written above regardless of delivery outcome.
+            record_last_input_id(&id, input_id);
+
             // Send input to terminal
             match tm.send_input(&id, &data) {
                 Ok(()) => Response::InputSent {
@@ -1963,9 +2124,15 @@ fn handle_request(
                             output_str.clone()
                         };
 
+                        // Correlate this output batch with the most recently recorded
+                        // input for this terminal (#4554) — `SendInput` and
+                        // `GetTerminalOutput` are separate IPC round trips for the
+                        // same turn, and this is the only link between them.
+                        let correlated_input_id = last_input_id_for_terminal(&id);
+
                         let output_record = AgentOutput {
                             id: None,
-                            input_id: None, // Could link to last input if tracked
+                            input_id: correlated_input_id,
                             terminal_id: id.clone(),
                             timestamp: Utc::now(),
                             content: Some(output_str.clone()),
@@ -1984,7 +2151,8 @@ fn handle_request(
                             let forge_host = "github.com";
                             let forge_events = parse_forge_events(&output_str, forge_host);
                             for parsed_event in forge_events {
-                                let prompt_event = parsed_event.to_prompt_forge_event(None);
+                                let prompt_event =
+                                    parsed_event.to_prompt_forge_event(correlated_input_id);
                                 if let Err(e) = db.record_prompt_forge_event(&prompt_event) {
                                     log::warn!("Failed to record forge event: {e}");
                                 } else {
@@ -1998,7 +2166,11 @@ fn handle_request(
                             }
 
                             // Parse terminal output for resource usage (token counts, costs)
-                            match db.record_resource_usage_from_output(None, &output_str, None) {
+                            match db.record_resource_usage_from_output(
+                                correlated_input_id,
+                                &output_str,
+                                None,
+                            ) {
                                 Ok(Some(usage_id)) => {
                                     log::debug!(
                                         "Recorded resource usage (id: {usage_id}) from terminal output"
@@ -2499,12 +2671,11 @@ fn handle_request(
                 crate::sweep_registry::resolve_dispatch_model(&repo_root, model.as_deref());
             log::info!(
                 "dispatch_sweep: {:?} with model={resolved_model} (source={}); headroom \
-                 occupancy={} dynamic_cap={} (cpu={} disk={} tokens={})",
+                 occupancy={} dynamic_cap={} (disk={} tokens={})",
                 kind,
                 model_source.as_str(),
                 headroom.occupancy,
                 headroom.dynamic_cap,
-                headroom.cpu_headroom,
                 headroom.disk_headroom,
                 headroom.token_axis_limit
             );
@@ -2521,8 +2692,11 @@ fn handle_request(
                     token_name: outcome.token_name,
                     log_path: outcome.log_path,
                 },
-                Err(e) => Response::Error {
-                    message: format!("dispatch_sweep failed: {e}"),
+                Err(e) => match e.downcast::<crate::runtime_admission::RuntimeRejection>() {
+                    Ok(rejection) => Response::RuntimeRejected(rejection),
+                    Err(e) => Response::Error {
+                        message: format!("dispatch_sweep failed: {e}"),
+                    },
                 },
             }
         }
@@ -3216,6 +3390,91 @@ mod tests {
         }
     }
 
+    // ===== SendInput / GetTerminalOutput input correlation (Issue #4554) =====
+
+    /// End-to-end proof that a `SendInput` turn's `agent_inputs.id` is threaded
+    /// through to the `resource_usage` and `prompt_github` rows written by the
+    /// following `GetTerminalOutput` call, so `get_cost_by_issue` — which joins
+    /// `resource_usage -> agent_inputs -> prompt_github` on `input_id` — returns
+    /// a non-empty result for the turn's issue. Before the #4554 fix, both
+    /// writes hardcoded `input_id: None` and this join could never match in
+    /// production.
+    #[test]
+    fn test_send_input_then_get_terminal_output_correlates_cost_by_issue() {
+        let (tm, db, sr, bus) = setup_test_context();
+        let terminal_id = format!("ipc-test-4554-{}", std::process::id());
+
+        // Seed the terminal's output file directly: `get_terminal_output` reads
+        // from `/tmp/loom-<id>.out` unconditionally, regardless of whether `id`
+        // is a live, registered terminal (see `TerminalManager::get_terminal_output`),
+        // so this test doesn't need a real tmux-backed terminal.
+        let output_path = format!("/tmp/loom-{terminal_id}.out");
+        let output_body = "Creating pull request...\n\
+             https://github.com/rjwalters/loom/issues/4554\n\
+             Tokens: 1,234 in / 567 out\n\
+             Model: claude-3-5-sonnet\n";
+        std::fs::write(&output_path, output_body).unwrap();
+
+        // Cleanup guard so a failing assertion below still removes the fixture
+        // file rather than leaking it into later test runs.
+        struct CleanupGuard(String);
+        impl Drop for CleanupGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _cleanup = CleanupGuard(output_path.clone());
+
+        // `SendInput` records the `agent_inputs` row and, via the #4554 fix,
+        // tracks its id for this terminal. `id` isn't a real, registered
+        // terminal, so delivery itself fails — that's fine: the DB write and
+        // the correlation tracking both happen unconditionally before delivery
+        // is attempted (mirrors production, where the two are also decoupled).
+        let send_response = handle_request(
+            Request::SendInput {
+                id: terminal_id.clone(),
+                data: "some command".to_string(),
+            },
+            &tm,
+            &db,
+            &sr,
+            &bus,
+            &test_pool(),
+        );
+        assert!(
+            matches!(send_response, Response::StructuredError(_)),
+            "expected delivery to fail for an unregistered terminal id, got: {send_response:?}"
+        );
+
+        // `GetTerminalOutput` reads the seeded file and, with the fix,
+        // correlates its forge-event/resource-usage writes to the input
+        // recorded above instead of writing `input_id: None`.
+        let output_response = handle_request(
+            Request::GetTerminalOutput {
+                id: terminal_id.clone(),
+                start_byte: None,
+            },
+            &tm,
+            &db,
+            &sr,
+            &bus,
+            &test_pool(),
+        );
+        assert!(
+            matches!(output_response, Response::TerminalOutput { .. }),
+            "expected TerminalOutput, got: {output_response:?}"
+        );
+
+        let cost = db.lock().unwrap().get_cost_by_issue(Some(4554)).unwrap();
+        assert!(
+            !cost.is_empty(),
+            "expected a non-empty cost-by-issue rollup for issue #4554 after a recorded turn \
+             (the resource_usage -> agent_inputs -> prompt_github join must match)"
+        );
+        assert_eq!(cost[0].issue_number, 4554);
+        assert!(cost[0].total_cost > 0.0);
+    }
+
     // ===== get_git_branch tests =====
 
     #[test]
@@ -3276,7 +3535,6 @@ exit 0
         DispatchHeadroom {
             occupancy,
             dynamic_cap,
-            cpu_headroom: dynamic_cap,
             disk_headroom: 10,
             token_axis_limit: 5,
         }
@@ -3303,7 +3561,6 @@ exit 0
         let h = DispatchHeadroom {
             occupancy: 4,
             dynamic_cap: 3,
-            cpu_headroom: 2,
             disk_headroom: 9,
             token_axis_limit: 6,
         };
@@ -3313,7 +3570,6 @@ exit 0
         let entered = dispatch_headroom_message(repo, true, &h, &kind);
         assert!(entered.contains("occupancy=4"), "{entered}");
         assert!(entered.contains("dynamic_cap=3"), "{entered}");
-        assert!(entered.contains("cpu_headroom=2"), "{entered}");
         assert!(entered.contains("disk_headroom=9"), "{entered}");
         assert!(entered.contains("token_axis_limit=6"), "{entered}");
         assert!(entered.contains("123"), "{entered}");
@@ -3751,6 +4007,29 @@ exit 0
         let (tm, db, _, bus) = setup_test_context();
         let dir_a = tempdir().unwrap();
         let dir_b = tempdir().unwrap();
+        // Runtime admission is the first dispatch decision. Install a valid
+        // zero-config Claude surface in both candidate roots so this fixture
+        // reaches (and continues to assert) the downstream workspace-command
+        // guard rather than bypassing admission.
+        for root in [dir_a.path(), dir_b.path()] {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::create_dir_all(root.join(".loom/roles")).unwrap();
+            std::fs::create_dir_all(root.join(".loom/runtimes")).unwrap();
+            std::fs::create_dir_all(root.join(".loom/scripts")).unwrap();
+            std::fs::write(
+                root.join(".loom/roles/builder.json"),
+                r#"{"runtimeRequirements":["worktreeIsolation","mcp"]}"#,
+            )
+            .unwrap();
+            std::fs::write(
+                root.join(".loom/runtimes/claude.json"),
+                r#"{"runtime":"claude","capabilities":{"worktreeIsolation":"yes","mcp":"yes"}}"#,
+            )
+            .unwrap();
+            let adapter = root.join(".loom/scripts/spawn-claude.sh");
+            std::fs::write(&adapter, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(adapter, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         // Neither workspace has `.claude/commands/loom/sweep.md`, and
         // `skip_label_flip` is left at its default `false` so the #4027 guard
         // is actually evaluated (unlike `setup_sweep_registry_in_tempdir`,
@@ -3803,6 +4082,27 @@ exit 0
             }
             other => panic!("Expected Error (wedge-guard refusal), got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn runtime_rejection_response_is_structured_and_secret_free_on_the_wire() {
+        let response = Response::RuntimeRejected(crate::runtime_admission::RuntimeRejection {
+            role: "sweep-lifecycle".into(),
+            runtime: "codex".into(),
+            source: crate::runtime_admission::RuntimeSource::DefaultConfig,
+            unmet_capabilities: vec!["worktreeIsolation".into()],
+            reason: "unmet capabilities: worktreeIsolation".into(),
+        });
+        let wire = serde_json::to_string(&response).unwrap();
+        assert!(wire.contains("\"type\":\"RuntimeRejected\""));
+        assert!(wire.contains("\"source\":\"default-config\""));
+        assert!(wire.contains("\"unmet_capabilities\":[\"worktreeIsolation\"]"));
+        assert!(!wire.contains("oauth"));
+        assert!(!wire.contains("token"));
+        assert!(matches!(
+            serde_json::from_str::<Response>(&wire).unwrap(),
+            Response::RuntimeRejected(_)
+        ));
     }
 
     #[test]
@@ -4745,7 +5045,6 @@ exit 0
             token_pool_size: 4,
             token_pool_dir: Some(std::path::PathBuf::from("/repo/a/.loom/tokens")),
             disk_headroom: 10,
-            cpu_headroom: 6,
             logical_cpus: 8,
             loadavg_1m: Some(1.25),
             cpu_idle_fraction: Some(0.90),
@@ -4820,7 +5119,6 @@ exit 0
                     Some(std::path::PathBuf::from("/repo/a/.loom/tokens"))
                 );
                 assert_eq!(r.disk_headroom, 10);
-                assert_eq!(r.cpu_headroom, 6);
                 assert_eq!(r.logical_cpus, 8);
                 assert!(r.auto_update_enabled);
                 assert_eq!(r.auto_update_consecutive_failures, 2);
@@ -5028,8 +5326,10 @@ exit 0
             !report.main_health_gate_not_evaluated,
             "absent main_health_gate_not_evaluated (#3950) defaults to false"
         );
-        // Absent pre-#3978 fields default rather than failing to parse.
-        assert_eq!(report.cpu_headroom, 0);
+        // Absent pre-#3978 fields default rather than failing to parse. (The
+        // retired `cpu_headroom` field a pre-#4512 daemon still SENDS is
+        // likewise tolerated: serde ignores unknown fields, so an old daemon
+        // and a new CLI stay wire-compatible in both directions.)
         assert_eq!(report.logical_cpus, 0);
         assert_eq!(report.loadavg_1m, None);
         // Absent pre-#4012 fields must default to `None` — NOT `false` — so a
@@ -5858,7 +6158,13 @@ exit 0
         // A second begin while already draining is idempotent: same generation,
         // same deadline, flag still set (AC edge: second drain does not stack).
         match drain.begin(Duration::from_secs(9999), true, false) {
-            DrainBegin::AlreadyDraining => {}
+            DrainBegin::AlreadyDraining {
+                active_then_exit,
+                escalated,
+            } => {
+                assert!(!active_then_exit, "active drain is still a relaunch drain");
+                assert!(!escalated, "a then_exit=false request escalates nothing");
+            }
             other => panic!("expected AlreadyDraining, got {other:?}"),
         }
         assert_eq!(drain.generation(), gen1, "idempotent begin does not bump gen");
@@ -5884,6 +6190,133 @@ exit 0
         assert!(!drain.is_draining());
         assert_eq!(drain.snapshot().note.as_deref(), Some("timed out"));
         assert!(drain.generation() > gen_before);
+    }
+
+    /// Issue #4521 AC1 — `then_exit` on the already-draining path is escalated
+    /// **one way** (relaunch → stay-down) and the outcome reported back is the
+    /// ACTIVE drain's terminal action, never a blind echo of the request.
+    #[test]
+    fn test_drain_then_exit_escalates_one_way() {
+        // A relaunch-drain is in flight (this is the auto-update roll's shape:
+        // `then_exit=false`).
+        let drain = DrainState::new();
+        let deadline = match drain.begin(Duration::from_secs(120), false, false) {
+            DrainBegin::Started { deadline, .. } => deadline,
+            other => panic!("expected Started, got {other:?}"),
+        };
+        assert!(!drain.snapshot().then_exit);
+
+        // An operator teardown request lands mid-roll: it must NOT be silently
+        // ignored (the #4521 defect) — the active drain escalates to stay-down.
+        match drain.begin(Duration::from_secs(9999), true, true) {
+            DrainBegin::AlreadyDraining {
+                active_then_exit,
+                escalated,
+            } => {
+                assert!(active_then_exit, "the active drain now stays down");
+                assert!(escalated, "the escalation must be reported to the caller");
+            }
+            other => panic!("expected AlreadyDraining, got {other:?}"),
+        }
+        assert!(
+            drain.snapshot().then_exit,
+            "the escalation must be visible to the already-running supervisor, \
+             which re-reads the descriptor"
+        );
+        // Everything else about the active drain is still pinned.
+        assert_eq!(drain.snapshot().deadline, Some(deadline));
+        assert!(!drain.snapshot().force_after_timeout);
+
+        // Escalating again is a no-op that still reports the truth.
+        match drain.begin(Duration::from_secs(1), false, true) {
+            DrainBegin::AlreadyDraining {
+                active_then_exit,
+                escalated,
+            } => {
+                assert!(active_then_exit);
+                assert!(!escalated, "already stay-down — nothing to escalate");
+            }
+            other => panic!("expected AlreadyDraining, got {other:?}"),
+        }
+
+        // A relaunch request against an active teardown drain must NOT downgrade
+        // it: the reply still says "will stay down".
+        match drain.begin(Duration::from_secs(1), false, false) {
+            DrainBegin::AlreadyDraining {
+                active_then_exit,
+                escalated,
+            } => {
+                assert!(active_then_exit, "then-exit is never downgraded");
+                assert!(!escalated);
+            }
+            other => panic!("expected AlreadyDraining, got {other:?}"),
+        }
+        assert!(drain.snapshot().then_exit);
+
+        // After an abort, a fresh drain starts from the requested terminal
+        // action again (the escalation does not leak across drains).
+        assert!(drain.abort());
+        match drain.begin(Duration::from_secs(30), false, false) {
+            DrainBegin::Started { .. } => {}
+            other => panic!("expected Started, got {other:?}"),
+        }
+        assert!(!drain.snapshot().then_exit, "a fresh drain honors its own then_exit");
+    }
+
+    /// Issue #4521 AC3 — the drain-completion exit-code contract: a then-exit
+    /// drain must exit `EXIT_SHUTDOWN` (143, **non-zero**) so a launchd job with
+    /// `KeepAlive:{SuccessfulExit:true}` stays down; a relaunch drain exits
+    /// `EXIT_RESTART` (0) so it comes straight back. Exiting 0 on the then-exit
+    /// path is the "drained, then relaunched anyway" failure.
+    #[test]
+    fn test_drain_exit_code_selection() {
+        assert_eq!(drain_exit_code(true), EXIT_SHUTDOWN);
+        assert_eq!(drain_exit_code(true), 143);
+        assert_ne!(drain_exit_code(true), 0, "then-exit must never exit 0");
+        assert_eq!(drain_exit_code(false), EXIT_RESTART);
+        assert_eq!(drain_exit_code(false), 0);
+    }
+
+    /// Issue #4521 AC3 — the supervisor's branch selection follows the LIVE
+    /// descriptor, not a value captured when it was spawned. This is what makes
+    /// a mid-drain escalation effective: the supervisor re-reads `then_exit`
+    /// from `DrainState` on each tick (see `run_drain_supervisor`), so the same
+    /// read modeled here flips 0 → 143 after an escalation.
+    #[test]
+    fn test_supervisor_branch_follows_live_then_exit() {
+        let drain = DrainState::new();
+        let _ = drain.begin(Duration::from_secs(120), false, false);
+
+        // Tick 1 (pre-escalation): zero in-flight ⇒ Complete ⇒ relaunch exit.
+        assert_eq!(evaluate_drain_tick(0, false, false), DrainTick::Complete);
+        assert_eq!(drain_exit_code(drain.snapshot().then_exit), EXIT_RESTART);
+
+        // An operator teardown request escalates the drain in place.
+        let _ = drain.begin(Duration::from_secs(120), false, true);
+
+        // Tick 2 (post-escalation, same supervisor): the very same read now
+        // selects the stay-down exit.
+        assert_eq!(evaluate_drain_tick(0, false, false), DrainTick::Complete);
+        assert_eq!(drain_exit_code(drain.snapshot().then_exit), EXIT_SHUTDOWN);
+
+        // The forced-timeout terminal branch reads the same field.
+        assert_eq!(evaluate_drain_tick(2, true, true), DrainTick::TimedOutForce);
+        assert_eq!(drain_exit_code(drain.snapshot().then_exit), EXIT_SHUTDOWN);
+    }
+
+    /// Issue #4521 AC4 (regression pin) — the two drain-complete log lines stay
+    /// **distinct**, so a host log tells an operator which terminal action fired
+    /// without guessing. Asserted against the exact bodies
+    /// `run_drain_supervisor`'s `DrainTick::Complete` arm emits.
+    #[test]
+    fn test_drain_complete_log_lines_remain_distinct() {
+        let then_exit_line = drain_complete_log_line(true, "launchd");
+        let relaunch_line = drain_complete_log_line(false, "launchd");
+        assert_ne!(then_exit_line, relaunch_line);
+        assert!(then_exit_line.contains("staying down"));
+        assert!(then_exit_line.contains("143"));
+        assert!(relaunch_line.contains("supervised relaunch"));
+        assert!(!relaunch_line.contains("staying down"));
     }
 
     /// AC5 (immediate unsupervised refusal): with no supervisor, a drain request
@@ -5921,6 +6354,81 @@ exit 0
         assert!(!drain.is_draining(), "refused drain must NOT pause dispatch");
         assert_eq!(drain.generation(), 0, "refused drain must not bump generation");
 
+        std::env::remove_var(crate::workspace_registry::REGISTRY_PATH_ENV);
+    }
+
+    /// Issue #4521 AC1 — the `AlreadyDraining` ack reports the ACTIVE drain's
+    /// terminal action, not the requested one.
+    ///
+    /// The pre-fix behavior echoed the request: an operator's
+    /// `--drain --then-exit` landing on an in-progress auto-update roll-drain
+    /// was acked `then_exit: true` ("will stop") while the daemon exited 0 and
+    /// launchd relaunched it — the exact incident shape.
+    ///
+    /// No supervisor task is spawned on this path (only `DrainBegin::Started`
+    /// spawns one), so the drain state is primed with `DrainState::begin`
+    /// directly and the process is never at risk of the supervisor's `exit`.
+    #[test]
+    #[serial_test::serial]
+    fn test_already_draining_ack_reports_active_terminal_action() {
+        let (sr, dir, _rec) = setup_sweep_registry_in_tempdir();
+        let root = dir.path().to_path_buf();
+        let empty_reg = dir.path().join("no-such-workspaces.json");
+        std::env::set_var(crate::workspace_registry::REGISTRY_PATH_ENV, &empty_reg);
+        let pool = Arc::new(WorkspacePool::new(Arc::new(EventBus::new()), test_runtime_handle()));
+        pool.seed(root.clone(), sr);
+        let bus = Arc::new(EventBus::new());
+
+        // An auto-update roll-drain is already in flight (`then_exit=false`).
+        let drain = Arc::new(DrainState::new());
+        let _ = drain.begin(Duration::from_secs(600), false, false);
+
+        // Operator teardown request during that window. `then_exit=true` skips
+        // the supervisor gate, so no `LOOM_DAEMON_SUPERVISOR` is needed.
+        let resp = handle_drain_request(&drain, &pool, &root, &bus, Some(60), false, true);
+        match resp {
+            Response::DaemonDrain {
+                accepted,
+                then_exit,
+                ref message,
+                ..
+            } => {
+                assert!(accepted);
+                assert!(
+                    then_exit,
+                    "the ack must report the ACTIVE drain's terminal action (escalated to \
+                     stay-down), not a blind echo"
+                );
+                assert!(message.contains("ESCALATED"), "message was: {message}");
+            }
+            other => panic!("expected DaemonDrain, got {other:?}"),
+        }
+        assert!(drain.snapshot().then_exit, "the active drain now stays down");
+
+        // The reverse: a plain relaunch drain request against the now-teardown
+        // drain must be acked with `then_exit: true` — it is NOT downgraded, and
+        // the ack must not promise a restart that will never happen.
+        std::env::set_var("LOOM_DAEMON_SUPERVISOR", "launchd");
+        let resp = handle_drain_request(&drain, &pool, &root, &bus, Some(60), false, false);
+        match resp {
+            Response::DaemonDrain {
+                accepted,
+                then_exit,
+                ref message,
+                ..
+            } => {
+                assert!(accepted);
+                assert!(then_exit, "then-exit is never downgraded");
+                assert!(
+                    message.contains("not be honored") || message.contains("NOT relaunch"),
+                    "message was: {message}"
+                );
+            }
+            other => panic!("expected DaemonDrain, got {other:?}"),
+        }
+        assert!(drain.snapshot().then_exit);
+
+        std::env::remove_var("LOOM_DAEMON_SUPERVISOR");
         std::env::remove_var(crate::workspace_registry::REGISTRY_PATH_ENV);
     }
 

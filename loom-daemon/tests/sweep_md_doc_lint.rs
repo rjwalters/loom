@@ -493,3 +493,82 @@ fn sweep_md_documents_experiment_guardrail_and_harvest() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Issue #4505 — the aggressive `all`-sentinel `loom:blocked` taxonomy row must
+// not strip `loom:blocked` on unparseable blocker text that is actually an
+// explicit hold/defer instruction (e.g. "hold until <milestone>"). The
+// no-parseable-dependency branch must check for hold/defer phrasing BEFORE
+// falling through to the fast/sloppy remove-and-attempt behavior, and route a
+// match to a new `would skip (explicit hold: "<phrase>")` planned action
+// instead of unblocking.
+// ---------------------------------------------------------------------------
+
+/// #4505: the `loom:blocked` row of the aggressive candidate taxonomy table
+/// documents the hold/defer-phrase check ahead of the fast/sloppy fallback,
+/// and the fast/sloppy fallback itself remains documented as the behavior for
+/// genuinely empty/unparseable blocker text (unchanged).
+#[test]
+fn sweep_md_documents_explicit_hold_check_in_blocked_taxonomy_row() {
+    let content = read_sweep_md();
+
+    // CONTRACT: the hold/defer phrase vocabulary the taxonomy row instructs
+    // the orchestrator to match (case-insensitive, instruction-shaped
+    // fragments — not bare "hold"/"wait" substrings). Keep EXACT: these are
+    // the specific fragments #4505's acceptance criteria enumerate.
+    let hold_defer_phrases: &[&str] = &[
+        "hold until",
+        "wait until",
+        "defer",
+        "not before",
+        "do not start",
+    ];
+    for phrase in hold_defer_phrases {
+        assert!(
+            content.contains(phrase),
+            "sweep.md's `loom:blocked` aggressive-taxonomy row is missing the \
+             hold/defer phrase `{phrase}` (#4505) — the no-parseable-dependency \
+             branch must check for hold/defer instructions before falling \
+             through to the fast/sloppy remove-and-attempt behavior"
+        );
+    }
+
+    // CONTRACT: the new routing verb for a hold/defer match — must NOT remove
+    // `loom:blocked` and must NOT build. Keep EXACT.
+    assert!(
+        content.contains(r#"skip with `explicit hold: "<quoted phrase>"`"#),
+        "sweep.md's `loom:blocked` taxonomy row must route a hold/defer-phrase \
+         match to `explicit hold: \"<quoted phrase>\"` (#4505) — this is what \
+         prevents the fast/sloppy fallback from overriding an author's \
+         explicit hold instruction"
+    );
+
+    // CONTRACT: the fast/sloppy fallback for genuinely empty/unparseable text
+    // (no hold/defer phrasing) must remain documented unchanged.
+    assert!(
+        content.contains("remove `loom:blocked` and attempt anyway (fast/sloppy)"),
+        "sweep.md's `loom:blocked` taxonomy row must retain the fast/sloppy \
+         remove-and-attempt fallback for truly empty/unparseable blocker text \
+         with no hold/defer phrasing (#4505 — additive, not a regression on \
+         the existing default path)"
+    );
+}
+
+/// #4505: the dry-run per-candidate planned-action enumeration documents the
+/// new `would skip (explicit hold: "<phrase>")` action alongside the other
+/// aggressive-mode `would ...` actions.
+#[test]
+fn sweep_md_documents_explicit_hold_planned_action() {
+    let content = read_sweep_md();
+
+    // CONTRACT: the exact planned-action string a dry-run render must use for
+    // an explicit-hold candidate. Keep EXACT — this is the confirmation-gate
+    // rendering an operator reads before anything mutates.
+    assert!(
+        content.contains(r#"would skip (explicit hold: "<phrase>")"#),
+        "sweep.md's per-candidate planned-action enumeration is missing \
+         `would skip (explicit hold: \"<phrase>\")` (#4505) — the dry-run plan \
+         and confirmation gate must render explicit-hold candidates distinctly \
+         from a generic `would unblock (...), build`"
+    );
+}

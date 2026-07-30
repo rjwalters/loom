@@ -166,25 +166,23 @@ enum Commands {
         pipeline: bool,
     },
 
-    /// Measure the host and recommend — or with `--write`, apply — the
-    /// autonomous concurrency knobs (`autonomous.workFinder.maxConcurrent` /
-    /// `autonomous.perTokenConcurrency`, issue #4390). Prints the same
-    /// `min(...)` cap breakdown `status` uses, plus which term would bind
-    /// after applying the recommendation. Purely file/host-based; does not
-    /// require a running daemon (unlike `status`, which reports the running
-    /// daemon's own in-memory dispatch state).
+    /// Measure the host and the currently-resolved concurrency knobs (issue
+    /// #4390; measurement-only since #4512). Prints the same `min(token axis,
+    /// disk, maxConcurrent)` cap breakdown `status` uses, which term binds, and
+    /// a one-line reading of whether this machine's `maxConcurrent` should go
+    /// up. Purely file/host-based; does not require a running daemon (unlike
+    /// `status`, which reports the running daemon's own in-memory dispatch
+    /// state). Always read-only.
     Calibrate {
-        /// Repo root to measure/write (plain path, default `.` — no upward
-        /// `.git` walk).
+        /// Repo root to measure (plain path, default `.` — no upward `.git` walk).
         #[arg(long, value_name = "PATH", default_value = ".")]
         workspace: String,
 
-        /// Merge the recommendation into `<workspace>/.loom/config.json`
-        /// (only `autonomous.workFinder.maxConcurrent` /
-        /// `autonomous.perTokenConcurrency` — every other key is preserved).
-        /// Idempotent: a repeat `--write` with the same recommendation is
-        /// byte-identical. Without this flag, calibrate is strictly
-        /// read-only.
+        /// DEPRECATED and ignored (#4512). calibrate no longer derives a
+        /// recommendation to write: the CPU-headroom term it was based on is
+        /// gone, and `autonomous.workFinder.maxConcurrent` is a per-machine knob
+        /// you tune by hand from the measurements. Retained so existing scripts
+        /// passing `--write` keep working; prints a deprecation notice.
         #[arg(long)]
         write: bool,
 
@@ -1335,7 +1333,9 @@ enum TokensAction {
     /// opt-in only: read solely when `$LOOM_ACCOUNTS_ENV` (or `--home-env`)
     /// points at it. `ACCOUNT_TOKEN_FILE_N` is optional — auto-derived from
     /// `ACCOUNT_EMAIL_N` when omitted. Native Rust port of the historical Python
-    /// `loom-tokens bootstrap` CLI (issue #4105, epic #4081).
+    /// `loom-tokens bootstrap` CLI (issue #4105, epic #4081). That Python CLI no
+    /// longer exists — the package was deleted in Phase 4 (#4557) — so this name
+    /// is a historical reference, not runnable advice.
     Bootstrap {
         /// Repo root (plain path, default `.` — no upward `.git` walk). The
         /// pool is written to `<workspace>/.loom/tokens` unless `--shared`.
@@ -1927,28 +1927,75 @@ async fn main() -> Result<()> {
             minted_gh_token: None,
         },
     };
+    // #4458: deliver the minted installation token via a daemon-owned
+    // `GH_CONFIG_DIR` (`credential_preflight::publish_github_app_token`)
+    // instead of exporting it as this process's `GH_TOKEN`. Every `gh` child
+    // this daemon spawns (`Command::new("gh")` without `env_clear`, ~76
+    // call sites — see the issue body's census) re-reads
+    // `$GH_CONFIG_DIR/hosts.yml` fresh on each invocation, so the refresh
+    // tick below becomes a pure file rewrite with **zero** recurring
+    // `std::env::set_var` calls — the UB race (concurrent `setenv` vs. the
+    // `environ` reads inside every concurrently spawned `Command`) this issue
+    // eliminates. `github_app_gh_config_dir_active` tracks whether the
+    // one-time env activation below has happened yet, so it fires **at most
+    // once** for the life of the process (see the tick closure further down
+    // for the rare case where activation happens there instead of here).
+    //
+    // The one remaining `std::env::set_var` (`GH_CONFIG_DIR` itself, plus the
+    // paired `remove_var` calls) is that single activation: it runs here,
+    // before the refresh-tick task (or any other tokio task that spawns
+    // `gh`/`git`) has been created, so there is no concurrent `Command::spawn`
+    // in this process yet to race the `environ` write — the residual window
+    // this issue's acceptance criteria allow a startup site to keep, given a
+    // comment naming the race and the rationale for accepting it. Clearing
+    // `GH_TOKEN`/`GITHUB_TOKEN` here (not just setting `GH_CONFIG_DIR`)
+    // matters too: `gh` checks the env vars *before* `GH_CONFIG_DIR`'s
+    // `hosts.yml`, so an operator-exported ambient token would otherwise
+    // silently outrank the just-minted app token — the pre-#4458 code
+    // achieved the same override by unconditionally overwriting `GH_TOKEN`.
+    let github_app_config_dir = credential_preflight::github_app_gh_config_dir(&sweep_workspace);
+    let mut github_app_gh_config_dir_active = false;
     if let Some(token) = &github_app_preflight.minted_gh_token {
-        // NEVER logged: only the fingerprint in `github_app_preflight.report`
-        // is. Exported into this process's own env so every `gh`/`git`
-        // child spawned from here on (Command::new without env_clear)
-        // inherits it.
-        std::env::set_var("GH_TOKEN", token);
+        match credential_preflight::publish_github_app_token(&github_app_config_dir, token) {
+            Ok(()) => {
+                std::env::remove_var("GH_TOKEN");
+                std::env::remove_var("GITHUB_TOKEN");
+                std::env::set_var("GH_CONFIG_DIR", &github_app_config_dir);
+                github_app_gh_config_dir_active = true;
+            }
+            Err(e) => {
+                // Fail open, matching the mint-failure posture elsewhere in
+                // this preflight: never block startup, never leave the
+                // daemon worse off than the pre-#4430 ambient path.
+                log::warn!(
+                    "credential_preflight: failed to publish github-app token to {} ({e}); \
+                     falling back to ambient gh auth — #4458",
+                    github_app_config_dir.display()
+                );
+            }
+        }
     }
     let credential_preflight = github_app_preflight.report;
 
     // #4430: keep the minted installation token fresh across its ~1h
     // lifetime for a long-running daemon. Ticks that don't rotate the token
-    // never *write* `GH_TOKEN`: the `NotConfigured` arm is a true no-op, and a
+    // never *write* anything: the `NotConfigured` arm is a true no-op, and a
     // cache-hit tick (the shell helper's own cache still has plenty of life —
-    // ~10 of every ~11 ticks) *reads* the current value but skips the
-    // `set_var` because the minted value is unchanged (#4456 value-changed
-    // guard). Only a genuine rotation (value differs) rewrites the env; a mint
-    // failure is logged and the loop keeps whatever `GH_TOKEN` the process
-    // already has (fail-open, matching the startup preflight's posture).
+    // ~10 of every ~11 ticks) compares against `current_token` (a plain local
+    // captured by this task, never the process env — #4456's original
+    // intent, now trivially true since there is no shared `GH_TOKEN` env var
+    // left to read) and skips the write because the minted value is
+    // unchanged. Only a genuine rotation (value differs) rewrites
+    // `hosts.yml`; a mint failure is logged and the loop keeps whatever
+    // credential `GH_CONFIG_DIR` already has on disk (fail-open, matching the
+    // startup preflight's posture).
     if let (Some(script_path), Some(owner_repo)) = (&github_app_script, &github_app_owner_repo) {
         let script_path = script_path.clone();
         let cwd = sweep_workspace.clone();
         let owner_repo = owner_repo.clone();
+        let config_dir = github_app_config_dir.clone();
+        let mut current_token = github_app_preflight.minted_gh_token.clone();
+        let mut config_dir_active = github_app_gh_config_dir_active;
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(credential_preflight::GITHUB_APP_REFRESH_INTERVAL).await;
@@ -1967,18 +2014,50 @@ async fn main() -> Result<()> {
                         app_id,
                         ..
                     }) => {
-                        // #4456: only write when the value actually rotated. A
-                        // cache-hit tick returns the unchanged token, and a
-                        // redundant `set_var` under the multithreaded runtime
-                        // needlessly races the `environ` reads of spawned
-                        // `gh`/`git` children.
-                        if gh_token_needs_update(std::env::var("GH_TOKEN").ok().as_deref(), &token)
-                        {
-                            std::env::set_var("GH_TOKEN", token);
-                            log::debug!(
-                                "credential_preflight: github-app refresh tick rotated GH_TOKEN \
-                                 (app {app_id} installation {installation_id}) — #4430"
-                            );
+                        // #4456/#4458: only rewrite when the value actually
+                        // rotated, and do it as a pure file write — no
+                        // `std::env::set_var` anywhere in this arm once
+                        // `config_dir_active` is already true (the common
+                        // case: activation happened at startup above).
+                        if gh_token_needs_update(current_token.as_deref(), &token) {
+                            // Rare edge case: the app becomes configured
+                            // *after* startup (e.g. the shell helper's own
+                            // config appears mid-run) without the daemon
+                            // restarting, so activation didn't happen above.
+                            // This is a second, still-bounded (at most once
+                            // per process) `std::env::set_var` window — the
+                            // recurring, steady-state race this issue targets
+                            // is the one eliminated; this cold-start
+                            // transition is unchanged in kind from the
+                            // pre-#4458 code's own equivalent one-time
+                            // `set_var` in this same arm.
+                            if !config_dir_active {
+                                std::env::remove_var("GH_TOKEN");
+                                std::env::remove_var("GITHUB_TOKEN");
+                                std::env::set_var("GH_CONFIG_DIR", &config_dir);
+                                config_dir_active = true;
+                            }
+                            match credential_preflight::publish_github_app_token(
+                                &config_dir,
+                                &token,
+                            ) {
+                                Ok(()) => {
+                                    current_token = Some(token);
+                                    log::debug!(
+                                        "credential_preflight: github-app refresh tick rotated \
+                                         GH_TOKEN (app {app_id} installation {installation_id}) \
+                                         — #4430"
+                                    );
+                                }
+                                Err(e) => {
+                                    log::warn!(
+                                        "credential_preflight: github-app refresh tick failed to \
+                                         publish token to {} ({e}); GH_CONFIG_DIR left unchanged \
+                                         (app {app_id} installation {installation_id}) — #4458",
+                                        config_dir.display()
+                                    );
+                                }
+                            }
                         } else {
                             log::debug!(
                                 "credential_preflight: github-app refresh tick cache hit, \
@@ -2133,6 +2212,23 @@ async fn main() -> Result<()> {
         quarantine_config.threshold,
         quarantine_config.ttl.as_secs(),
         quarantine_config.insta_crash_secs
+    );
+
+    // Per-issue dispatch backoff (#4485): resolve env > config > default for the
+    // default workspace so a failing issue's re-dispatch cadence is bounded even
+    // when its deaths land in a quarantine carve-out (#4122 exhaustion, #4386
+    // pre-flight) and never reach the 3-strike quarantine threshold.
+    let dispatch_backoff_config = sweep_registry::resolve_dispatch_backoff_config(&sweep_workspace);
+    sweep.set_dispatch_backoff_config(dispatch_backoff_config);
+    log::info!(
+        "sweep_registry: per-issue dispatch backoff {} (base={}s, max={}s) (#4485)",
+        if dispatch_backoff_config.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        dispatch_backoff_config.base.as_secs(),
+        dispatch_backoff_config.max.as_secs()
     );
 
     // Claude-wrapper pre-flight-death workspace tripwire (#4386): resolve
@@ -2336,16 +2432,12 @@ async fn main() -> Result<()> {
         let interval = work_finder::resolve_interval_with_config(&work_finder_config);
         let configured_max = work_finder::resolve_max_concurrent_with_config(&work_finder_config);
         let per_token_concurrency = work_finder::resolve_per_token_concurrency(&work_finder_config);
-        // CPU headroom knobs (#4032): resolved once at startup from the same
-        // `work_finder_config`, precedence env > config > default — matching
-        // `per_token_concurrency` exactly (single-root, startup-time; the
-        // dynamic cap is one global number per tick, computed before the
-        // workspace registry is even loaded, so there is no per-workspace
-        // variant of these knobs).
-        let cpu_utilization_target =
-            work_finder::resolve_cpu_utilization_target(&work_finder_config);
-        let cpu_est_cores_per_sweep =
-            work_finder::resolve_cpu_est_cores_per_sweep(&work_finder_config);
+        // Retired CPU-headroom knobs (#4512): `cpuUtilizationTarget` /
+        // `estCoresPerSweep` (and their env twins) are accepted-but-ignored, so
+        // a fleet's committed config keeps parsing across the upgrade. Warn
+        // once, here at startup, naming exactly what is being ignored and what
+        // to tune instead.
+        work_finder::warn_deprecated_cpu_knobs(&work_finder_config);
         // Per-tick admission (ramp) cap (#4234): resolved once at startup from
         // the same `work_finder_config`, precedence env > config > default —
         // the same startup-capture pattern as the CPU knobs above. Bounds how
@@ -2385,12 +2477,12 @@ async fn main() -> Result<()> {
         );
         log::info!(
             "work_finder: enabled (multi-workspace, interval={}s, configured_max={configured_max}, \
-             per_token_concurrency={per_token_concurrency}, cpu_utilization_target={cpu_utilization_target}, \
-             cpu_est_cores_per_sweep={cpu_est_cores_per_sweep}, \
-             max_admissions_per_tick={max_admissions_per_tick}, \
-             dynamic cap = min(healthy tokens × per-token, disk, cpu, configured_max), \
+             per_token_concurrency={per_token_concurrency}, \
+             max_admissions_per_tick={max_admissions_per_tick}, build_slots={}, \
+             dynamic cap = min(healthy tokens × per-token, disk, configured_max), \
              global across workspaces)",
-            interval.as_secs()
+            interval.as_secs(),
+            loom_daemon::build_slot::resolve_slots()
         );
         // Multi-workspace fan-out (#3928): re-reads `effective_roots()` each tick
         // and dispatches into each registered repo's own working tree via the
@@ -2401,8 +2493,6 @@ async fn main() -> Result<()> {
             interval,
             configured_max,
             per_token_concurrency,
-            cpu_utilization_target,
-            cpu_est_cores_per_sweep,
             max_admissions_per_tick,
             workspace_health_states.clone(),
             suppress_dispatch_during_gate,
@@ -2471,7 +2561,7 @@ async fn main() -> Result<()> {
     // Autonomous token-ranking refresh loop (Issue #3969): the daemon itself
     // periodically re-probes each registered repo's token pool and rewrites
     // `.loom/tokens/.ranking` (atomically — same script an operator's cron used
-    // to run by hand: `probe-tokens.sh --ranking` / `loom-tokens check
+    // to run by hand: `probe-tokens.sh --ranking` / `loom-daemon tokens check
     // --ranking`), so token selection's ranking tier stays fresh without a
     // standing manual/cron step. Unlike the work-finder and main-health-gate
     // loops above, this is **default-ON** — it only ever reads rate-limit
@@ -2482,7 +2572,7 @@ async fn main() -> Result<()> {
     // precedence env > config > default (env:
     // `LOOM_TOKEN_RANKING_REFRESH` / `LOOM_TOKEN_RANKING_REFRESH_INTERVAL_SECS`).
     // An operator cron running the identical script concurrently is harmless —
-    // the underlying `loom-tokens check --ranking` write is atomic, so the two
+    // the underlying `loom-daemon tokens check --ranking` write is atomic, so the two
     // refreshers can race to schedule a write but never to a torn file.
     let token_ranking_refresh_config =
         token_ranking_refresh::read_token_ranking_refresh_config(&sweep_workspace);
@@ -3582,7 +3672,14 @@ async fn handle_quarantine_command(action: QuarantineAction) -> Result<()> {
                              dispatch and `loom:issue` has been restored on the forge."
                         );
                     } else {
-                        println!("Issue #{issue} was not quarantined — nothing to clear (no-op).");
+                        // #4485: the clear ALSO releases any per-issue dispatch
+                        // backoff window, which exists independently of
+                        // quarantine — so "not quarantined" is not the same as
+                        // "nothing happened".
+                        println!(
+                            "Issue #{issue} was not quarantined — nothing to clear (no-op). \
+                             Any dispatch-backoff window (#4485) for it was released."
+                        );
                     }
                     Ok(())
                 }
@@ -3701,23 +3798,9 @@ async fn handle_restart_command(
     // `AbortDrain` and expect a `DaemonDrain` reply; the plain restart keeps its
     // #4054 `RestartDaemon` / `DaemonRestart` contract byte-for-byte.
     if abort_drain {
-        return handle_drain_reply(
-            &socket_path,
-            &Request::AbortDrain,
-            "loom-daemon drain aborted",
-            "no drain was in progress",
-        )
-        .await;
+        return handle_drain_reply(&socket_path, &Request::AbortDrain, DrainReplyKind::Abort).await;
     }
     if drain {
-        let (accepted_prefix, refused_prefix) = if then_exit {
-            (
-                "loom-daemon drain-then-exit scheduled (will stop, not restart, once drained)",
-                "loom-daemon did NOT drain",
-            )
-        } else {
-            ("loom-daemon drain scheduled", "loom-daemon did NOT drain")
-        };
         return handle_drain_reply(
             &socket_path,
             &Request::DrainAndRestartDaemon {
@@ -3725,8 +3808,11 @@ async fn handle_restart_command(
                 force_after_timeout,
                 then_exit,
             },
-            accepted_prefix,
-            refused_prefix,
+            // Issue #4521: the outcome line is rendered from the *reply*, not
+            // from this flag — see `handle_drain_reply`.
+            DrainReplyKind::Drain {
+                requested_then_exit: then_exit,
+            },
         )
         .await;
     }
@@ -3767,6 +3853,80 @@ async fn handle_restart_command(
     }
 }
 
+/// Which drain-mode variant [`handle_drain_reply`] is rendering (Issue #4521).
+///
+/// Carries the *requested* `then_exit` only so the reply can be compared against
+/// it and a version-skew warning raised — never so the outcome line can be
+/// rendered from the request.
+#[derive(Debug, Clone, Copy)]
+enum DrainReplyKind {
+    /// `AbortDrain` — no `then_exit` semantics at all.
+    Abort,
+    /// `DrainAndRestartDaemon` with the `--then-exit` flag as requested.
+    Drain { requested_then_exit: bool },
+}
+
+/// Render the accepted-ack prefix for a `DaemonDrain` reply (Issue #4521).
+///
+/// **Load-bearing: derived from `reply_then_exit` (what the daemon says the
+/// active drain will do), never from the requested flag.** The original defect
+/// picked this line from the CLI's own `--then-exit` argument, so both a stale
+/// daemon (which dropped the unknown wire field) and an already-in-progress
+/// relaunch-drain produced a confident "will stop, not restart" promise for a
+/// daemon that then exited 0 and was relaunched by launchd.
+///
+/// Pure so the request/reply divergence cases are unit-testable.
+fn drain_accepted_prefix(kind: DrainReplyKind, reply_then_exit: bool) -> &'static str {
+    match kind {
+        DrainReplyKind::Abort => "loom-daemon drain aborted",
+        DrainReplyKind::Drain { .. } => {
+            if reply_then_exit {
+                "loom-daemon drain-then-exit scheduled (will stop, not restart, once drained)"
+            } else {
+                "loom-daemon drain scheduled (will RESTART once drained)"
+            }
+        }
+    }
+}
+
+/// The loud version-skew / escalation warning to print when the reply's
+/// `then_exit` contradicts what was requested (Issue #4521), or `None` when they
+/// agree (or there is nothing to compare, i.e. `--abort-drain`).
+///
+/// Pure for testability; the caller prints it to stderr.
+fn drain_then_exit_mismatch_warning(
+    kind: DrainReplyKind,
+    reply_then_exit: bool,
+) -> Option<&'static str> {
+    let DrainReplyKind::Drain {
+        requested_then_exit,
+    } = kind
+    else {
+        return None;
+    };
+    if requested_then_exit == reply_then_exit {
+        return None;
+    }
+    if requested_then_exit {
+        Some(
+            "WARNING: --then-exit was requested but the daemon reports it will RESTART when \
+             drained, not stay down.\n\
+             \x20 This host will come back up. Two known causes:\n\
+             \x20   1. Version skew: the running daemon predates the --then-exit support and \
+             silently dropped the flag — roll the daemon onto the current binary and re-issue.\n\
+             \x20   2. A drain was already in progress and could not be escalated.\n\
+             \x20 Verify with `loom-daemon status` before assuming this host is torn down.",
+        )
+    } else {
+        Some(
+            "WARNING: a plain --drain was requested but the daemon reports a then-exit drain is \
+             active — it will STOP and stay down when drained, NOT restart.\n\
+             \x20 then-exit is never downgraded. Use `loom-daemon restart --abort-drain` and \
+             re-issue if a relaunch was intended.",
+        )
+    }
+}
+
 /// Shared reply handler for the drain-mode restart variants (Issue #4090): both
 /// `DrainAndRestartDaemon` and `AbortDrain` answer with a `DaemonDrain` frame.
 /// A refused request (unsupervised host, or abort with no drain in progress)
@@ -3774,9 +3934,12 @@ async fn handle_restart_command(
 async fn handle_drain_reply(
     socket_path: &Path,
     request: &Request,
-    accepted_prefix: &str,
-    refused_prefix: &str,
+    kind: DrainReplyKind,
 ) -> Result<()> {
+    let refused_prefix = match kind {
+        DrainReplyKind::Abort => "no drain was in progress",
+        DrainReplyKind::Drain { .. } => "loom-daemon did NOT drain",
+    };
     match query_daemon(socket_path, request).await {
         Ok(Response::DaemonDrain {
             accepted,
@@ -3791,8 +3954,13 @@ async fn handle_drain_reply(
                 } else {
                     supervisor.as_deref().unwrap_or("unknown").to_string()
                 };
+                let accepted_prefix = drain_accepted_prefix(kind, then_exit);
                 println!("{accepted_prefix} (supervisor: {sup_note}, {in_flight} in-flight).");
                 println!("{message}");
+                if let Some(warning) = drain_then_exit_mismatch_warning(kind, then_exit) {
+                    eprintln!();
+                    eprintln!("{warning}");
+                }
                 Ok(())
             } else {
                 eprintln!("{refused_prefix}: {message}");
@@ -3814,6 +3982,78 @@ async fn handle_drain_reply(
             eprintln!("  ./.loom/scripts/cli/loom-daemon-start.sh");
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod drain_reply_render_tests {
+    //! Issue #4521 AC2: the drain outcome line is rendered from the daemon's
+    //! REPLY, and a request/reply divergence raises a loud warning. The
+    //! divergence cases are exactly the two ways an operator gets lied to:
+    //! version skew (a stale daemon drops the unknown `then_exit` wire field and
+    //! defaults it to `false`) and an already-in-progress drain with a different
+    //! terminal action.
+    use super::{drain_accepted_prefix, drain_then_exit_mismatch_warning, DrainReplyKind};
+
+    const DRAIN_THEN_EXIT: DrainReplyKind = DrainReplyKind::Drain {
+        requested_then_exit: true,
+    };
+    const DRAIN_RELAUNCH: DrainReplyKind = DrainReplyKind::Drain {
+        requested_then_exit: false,
+    };
+
+    #[test]
+    fn prefix_follows_the_reply_not_the_request() {
+        // Requested --then-exit, daemon confirms it: "will stop".
+        assert!(drain_accepted_prefix(DRAIN_THEN_EXIT, true).contains("will stop, not restart"));
+        // Requested --then-exit but the daemon reports a relaunch (stale daemon,
+        // or an un-escalatable active drain): the CLI must NOT promise a stop.
+        let skewed = drain_accepted_prefix(DRAIN_THEN_EXIT, false);
+        assert!(skewed.contains("will RESTART"), "got: {skewed}");
+        assert!(!skewed.contains("will stop"), "got: {skewed}");
+        // Plain drain against an active teardown drain renders the stop wording.
+        assert!(drain_accepted_prefix(DRAIN_RELAUNCH, true).contains("will stop, not restart"));
+        assert!(drain_accepted_prefix(DRAIN_RELAUNCH, false).contains("will RESTART"));
+    }
+
+    #[test]
+    fn abort_prefix_is_unchanged_and_never_warns() {
+        assert_eq!(
+            drain_accepted_prefix(DrainReplyKind::Abort, false),
+            "loom-daemon drain aborted"
+        );
+        assert_eq!(drain_accepted_prefix(DrainReplyKind::Abort, true), "loom-daemon drain aborted");
+        assert!(drain_then_exit_mismatch_warning(DrainReplyKind::Abort, false).is_none());
+        assert!(drain_then_exit_mismatch_warning(DrainReplyKind::Abort, true).is_none());
+    }
+
+    #[test]
+    fn agreement_produces_no_warning() {
+        assert!(drain_then_exit_mismatch_warning(DRAIN_THEN_EXIT, true).is_none());
+        assert!(drain_then_exit_mismatch_warning(DRAIN_RELAUNCH, false).is_none());
+    }
+
+    /// The incident shape: `--then-exit` requested, daemon replies `false`. The
+    /// warning must name the version-skew cause explicitly — that is what a
+    /// deploy operator needs in order to roll the daemon and re-issue rather
+    /// than assume the host is torn down.
+    #[test]
+    fn requested_then_exit_but_reply_says_restart_warns_loudly() {
+        let warning =
+            drain_then_exit_mismatch_warning(DRAIN_THEN_EXIT, false).expect("divergence must warn");
+        assert!(warning.starts_with("WARNING:"));
+        assert!(warning.contains("Version skew"));
+        assert!(warning.contains("RESTART"));
+        assert!(warning.contains("loom-daemon status"));
+    }
+
+    #[test]
+    fn plain_drain_against_active_teardown_warns() {
+        let warning =
+            drain_then_exit_mismatch_warning(DRAIN_RELAUNCH, true).expect("divergence must warn");
+        assert!(warning.starts_with("WARNING:"));
+        assert!(warning.contains("never downgraded"));
+        assert!(warning.contains("--abort-drain"));
     }
 }
 
@@ -4116,6 +4356,15 @@ async fn handle_dispatch_command(
         Ok(Response::StructuredError(err)) => {
             eprintln!("Daemon rejected the dispatch: {}", err.message);
             std::process::exit(1);
+        }
+        // Issue #4494: the typed capability-admission refusal is a REAL client
+        // outcome, not an "unexpected response" — render the structured
+        // role/runtime/source/unmet payload instead of discarding it, and exit
+        // EX_CONFIG(78) so a script can tell a capability mismatch apart from a
+        // daemon error (mirroring check-runtime-capabilities.sh's exit codes).
+        Ok(Response::RuntimeRejected(rejection)) => {
+            eprintln!("{}", rejection.diagnostic());
+            std::process::exit(loom_daemon::runtime_admission::EX_CONFIG);
         }
         Ok(other) => {
             eprintln!("Unexpected response from daemon: {other:?}");
@@ -4564,7 +4813,7 @@ fn print_status_unreachable_human(
 /// never contradict each other (issue #3936).
 ///
 /// Preference order:
-/// 1. **fresh probe** — when a client-side `loom-tokens check --json` succeeded
+/// 1. **fresh probe** — when a client-side `loom-daemon tokens check --json` succeeded
 ///    (the *same* data that renders the per-token table), the health counts are
 ///    derived from it via [`loom_daemon::capacity::summarize_probe`], applying
 ///    the near-ceiling threshold uniformly. This is the accurate *current*
@@ -4584,8 +4833,8 @@ struct ResolvedCapacity {
     /// fallback) — the "healthy tokens" input to the dynamic concurrency cap.
     token_axis_limit: usize,
     /// The effective dynamic cap consistent with `token_axis_limit`:
-    /// `min(token_axis_limit, disk_headroom, cpu_headroom, configured_max)`
-    /// (CPU term added in #3978).
+    /// `min(token_axis_limit, disk_headroom, configured_max)` (the CPU term
+    /// added in #3978 was removed in #4512).
     effective_cap: usize,
     /// Whether the token axis is the binding (minimum) constraint.
     token_bound: bool,
@@ -4619,24 +4868,15 @@ fn resolve_capacity(
             // pre-#3947 wire `0` as the effective floor of 1.
             let factor = report.per_token_concurrency.max(1);
             let token_axis_effective = token_axis_limit.saturating_mul(factor);
-            // The CPU term (#3978) is policy-floored at 1 by
-            // `cpu_headroom::cpu_headroom` on every real computation, so a wire
-            // value of exactly `0` unambiguously means "an older daemon that
-            // predates #3978 didn't send this field" (`#[serde(default)]`) —
-            // not a genuine zero-headroom reading. Treat it as unconstrained
-            // rather than collapsing the cap to 0 against a daemon that never
-            // computed a CPU term at all.
-            let cpu_headroom = if report.cpu_headroom == 0 {
-                usize::MAX
-            } else {
-                report.cpu_headroom
-            };
+            // #4512: the cap is min(token axis, disk, configured max). A
+            // pre-#4512 daemon still SENDS a `cpu_headroom` field; serde ignores
+            // it, and we deliberately do not reintroduce it into the client-side
+            // recomputation — the daemon's own `dynamic_cap` (shown as the
+            // headline below) remains the authority either way.
             let effective_cap = token_axis_effective
                 .min(report.disk_headroom)
-                .min(cpu_headroom)
                 .min(report.configured_max);
             let token_bound = token_axis_effective <= report.disk_headroom
-                && token_axis_effective <= cpu_headroom
                 && token_axis_effective <= report.configured_max;
             return ResolvedCapacity {
                 source: "probe",
@@ -4729,14 +4969,11 @@ fn build_status_json_value(
             // whatever cwd `loom-daemon status` itself was run from.
             "token_pool_dir": report.token_pool_dir,
             "disk_headroom": report.disk_headroom,
-            // CPU headroom term (#3978; measured-idle signal #4031) — see the
-            // field docs on `DaemonStatusReport::cpu_headroom` for the pre-#3978
-            // `0` ⇒ "field absent" wire-compat convention.
-            "cpu_headroom": report.cpu_headroom,
+            // Host CPU OBSERVATIONS (#3978/#4031), not cap terms: #4512 removed
+            // the CPU headroom term from admission. Reported because observed
+            // idle is the evidence for tuning `configured_max` on this machine.
             "logical_cpus": report.logical_cpus,
             "loadavg_1m": report.loadavg_1m,
-            // Measured CPU idle fraction (#4031), the signal that replaced
-            // loadavg as the source of consumed cores. `null` until sampled.
             "cpu_idle_fraction": report.cpu_idle_fraction,
             "configured_max": report.configured_max,
             "per_token_concurrency": report.per_token_concurrency.max(1),
@@ -5199,55 +5436,50 @@ fn print_status_human(
     let dispatch_token_axis = report.capacity.token_axis_limit;
     println!("\nDynamic concurrency cap: {dispatch_cap}  (the number dispatch uses)");
     println!(
-        "  = min(healthy {} × per-token {} = {}, disk headroom {}, cpu headroom {}, \
+        "  = min(healthy {} × per-token {} = {}, disk headroom {}, \
          configured max {})",
         dispatch_token_axis,
         factor,
         dispatch_token_axis.saturating_mul(factor),
         report.disk_headroom,
-        report.cpu_headroom,
         report.configured_max
     );
     if rc.source == "probe" && rc.effective_cap != dispatch_cap {
         println!(
             "  fresh probe suggests: {} (healthy {} × per-token {} = {}) — not yet reflected in \
-             dispatch; if this persists, refresh with `loom-tokens check --ranking`.",
+             dispatch; if this persists, refresh with `loom-daemon tokens check --ranking`.",
             rc.effective_cap,
             rc.token_axis_limit,
             factor,
             rc.token_axis_limit.saturating_mul(factor)
         );
     }
-    // CPU headroom detail (#3978 AC4; measured-idle signal #4031). The signal
-    // chain is measured idle → loadavg → static capacity, so the line names
-    // which signal actually fed the term. `logical_cpus == 0` means an older
+    // Host CPU OBSERVATION (#3978 AC4; measured-idle signal #4031) — since
+    // #4512 this is deliberately NOT a cap term: it is the evidence an operator
+    // uses to decide whether this machine's `maxConcurrent` should go up (host
+    // mostly idle) or not (host saturated). `logical_cpus == 0` means an older
     // daemon (pre-#3978) never sent these fields — nothing to show.
     if report.logical_cpus > 0 {
         let basis = match (report.cpu_idle_fraction, report.loadavg_1m) {
-            // Preferred: measured CPU consumption (#4031). Show consumed cores so
-            // the operator can see the term is tracking real usage, not loadavg.
-            (Some(idle), _) => {
+            (Some(idle), load) => {
                 let consumed = report.logical_cpus as f64 * (1.0 - idle.clamp(0.0, 1.0));
                 format!(
-                    "{} logical cores, {:.0}% idle measured (≈{:.1} cores consumed)",
+                    "{} logical cores, {:.0}% idle measured (≈{:.1} cores consumed){}",
                     report.logical_cpus,
                     idle * 100.0,
-                    consumed
+                    consumed,
+                    load.map_or_else(String::new, |l| format!(", 1m loadavg {l:.2}"))
                 )
             }
-            // Fallback: 1-minute load average (#3978 behavior) until an idle
-            // sample exists (e.g. the first Linux cross-tick delta not yet taken).
             (None, Some(load)) => format!(
-                "{} logical cores, 1m loadavg {load:.2} (no idle sample yet — loadavg fallback)",
+                "{} logical cores, 1m loadavg {load:.2} (no idle sample yet)",
                 report.logical_cpus
             ),
-            // Static capacity only: no CPU signal at all on this platform.
-            (None, None) => format!(
-                "{} logical cores, no CPU signal on this platform — static capacity only",
-                report.logical_cpus
-            ),
+            (None, None) => {
+                format!("{} logical cores, no CPU signal on this platform", report.logical_cpus)
+            }
         };
-        println!("  cpu headroom: {} concurrent-sweep slot(s) ({basis})", report.cpu_headroom);
+        println!("  host cpu (observed, not a cap term since #4512): {basis}");
     }
 
     // Token-capacity backpressure section (#3902, source-unified in #3936).
@@ -5282,7 +5514,7 @@ fn print_status_human(
         && rc.healthy > 0;
     if rc.ranking_present {
         let src = if rc.source == "probe" {
-            "live probe: loom-tokens check --json"
+            "live probe: loom-daemon tokens check --json"
         } else {
             "from .loom/tokens/.ranking"
         };
@@ -5303,7 +5535,7 @@ fn print_status_human(
                 "  \u{26a0} DISPATCH IS TOKEN-STARVED: the daemon's own ranking read shows \
                  0/{} healthy (dispatch cap {dispatch_cap}), disagreeing with the {} healthy \
                  shown above from {pool_display}. The token term is the limiter — refresh the \
-                 ranking with `loom-tokens check --ranking` (or wait for the next self-refresh).",
+                 ranking with `loom-daemon tokens check --ranking` (or wait for the next self-refresh).",
                 report.capacity.total_accounts, rc.healthy,
             );
         } else if rc.source == "probe"
@@ -5316,7 +5548,7 @@ fn print_status_human(
             // running on slightly stale data.
             println!(
                 "  note: daemon dispatch cap still uses a stale .ranking ({} healthy); \
-                 refresh it with `loom-tokens check --ranking`.",
+                 refresh it with `loom-daemon tokens check --ranking`.",
                 report.capacity.healthy_accounts
             );
         }
@@ -5353,7 +5585,7 @@ fn print_status_human(
                     println!(
                         "  token-bound: NO healthy accounts — new dispatch deferred until \
                          capacity returns. Add accounts (~/.claude-monitor/accounts.env + \
-                         `loom-tokens bootstrap`) or buy API credits, then `loom-tokens check \
+                         `loom-daemon tokens bootstrap`) or buy API credits, then `loom-daemon tokens check \
                          --ranking`."
                     );
                 } else {
@@ -5368,7 +5600,7 @@ fn print_status_human(
         }
     } else {
         println!(
-            "  (no ranking — run `loom-tokens check --ranking`; token pool size {} used as the \
+            "  (no ranking — run `loom-daemon tokens check --ranking`; token pool size {} used as the \
              health basis)",
             report.token_pool_size
         );
@@ -5743,7 +5975,7 @@ fn print_status_human(
     match token_usage {
         Some(value) => print_token_usage_table(value),
         None => println!(
-            "  (unavailable — `loom-tokens check --json` failed or the token pool is not bootstrapped)"
+            "  (unavailable — `loom-daemon tokens check --json` failed or the token pool is not bootstrapped)"
         ),
     }
 
@@ -5787,7 +6019,7 @@ fn print_status_human(
     println!();
 }
 
-/// Render the `loom-tokens check --json` report (`{ "accounts": [ { name,
+/// Render the `loom-daemon tokens check --json` report (`{ "accounts": [ { name,
 /// status, 5h_utilization, 7d_utilization, 7d_reset } ] }`) as a small table.
 /// Falls back to pretty-printed JSON if the shape is unexpected.
 fn print_token_usage_table(value: &serde_json::Value) {
@@ -7468,7 +7700,7 @@ fn handle_pin_action(action: PinAction, ws: &Path) -> Result<()> {
             }
             if all_accounts.is_empty() {
                 println!();
-                eprintln!("No .token files found. Run `loom-tokens bootstrap` first.");
+                eprintln!("No .token files found. Run `loom-daemon tokens bootstrap` first.");
             } else {
                 println!();
                 println!("Available accounts ({}):", all_accounts.len());
@@ -7623,40 +7855,49 @@ fn handle_recover_orphans_command(
     Ok(())
 }
 
-/// Handle `loom-daemon calibrate` (issue #4390): measure the host, print (or
-/// `--write` apply) the recommended `autonomous.workFinder.maxConcurrent` /
-/// `autonomous.perTokenConcurrency` values. See `loom_daemon::calibrate` for
-/// the measurement + recommendation policy this thinly wires up.
+/// Handle `loom-daemon calibrate` (issue #4390; measurement-only since #4512):
+/// measure the host + the currently-resolved knobs and print the
+/// `min(token axis, disk, maxConcurrent)` breakdown, which term binds, and the
+/// one-line tuning reading. See `loom_daemon::calibrate`.
+///
+/// `--write` is **accepted but ignored** with a deprecation notice: #4512
+/// removed the CPU-headroom term the recommendation was derived from, so there
+/// is nothing to compute and write — `maxConcurrent` is a per-machine knob the
+/// operator tunes from these measurements. Keeping the flag (rather than
+/// deleting it) means an existing `calibrate --write` in a script keeps exiting
+/// 0 instead of failing on an unknown argument.
+///
+/// The retired-knob deprecation notice is printed to **stderr** here rather than
+/// left to `work_finder::warn_deprecated_cpu_knobs`'s `log::warn!`: CLI
+/// subcommands return from `main` before `setup_logging()` runs, so on this path
+/// a log warning would go nowhere at all. stderr also keeps `--json`'s stdout
+/// payload clean for machine consumers.
 fn handle_calibrate_command(workspace: &str, write: bool, json: bool) -> Result<()> {
     use loom_daemon::calibrate;
     use loom_daemon::worktree_ops::repo;
 
     let repo_root = repo::resolve_repo_root(workspace)?;
-
     let measurements = calibrate::measure(&repo_root);
-    let recommendation = calibrate::recommend(&measurements);
 
-    let written = if write {
-        Some(
-            calibrate::write_workfinder_config(
-                &repo_root,
-                recommendation.recommended_max_concurrent,
-                recommendation.recommended_per_token_concurrency,
-            )
-            .map_err(|e| anyhow!("{e}"))?,
-        )
-    } else {
-        None
-    };
+    if let Some(notice) = loom_daemon::work_finder::deprecated_cpu_knob_notice(
+        &loom_daemon::work_finder::read_work_finder_config(&repo_root),
+    ) {
+        eprintln!("loom-daemon calibrate: {notice}");
+    }
+
+    if write {
+        eprintln!(
+            "loom-daemon calibrate: --write is deprecated and ignored (#4512). calibrate no \
+             longer derives a recommendation: the CPU-headroom admission term it was based on was \
+             removed, and autonomous.workFinder.maxConcurrent is now a per-machine knob you tune \
+             from the measurements below. Edit .loom/config.json directly, then restart the daemon."
+        );
+    }
 
     if json {
-        let report = calibrate::report_json(&measurements, &recommendation, written.as_deref());
-        println!("{}", serde_json::to_string_pretty(&report)?);
+        println!("{}", serde_json::to_string_pretty(&calibrate::report_json(&measurements))?);
     } else {
-        print!(
-            "{}",
-            calibrate::report_human(&measurements, &recommendation, written.as_deref())
-        );
+        print!("{}", calibrate::report_human(&measurements));
     }
 
     Ok(())
@@ -8315,6 +8556,66 @@ mod dispatch_tests {
         server.await.expect("server task");
     }
 
+    /// Issue #4494: a fake daemon that refuses the dispatch with the typed
+    /// `RuntimeRejected` response. The native `loom-daemon dispatch` client
+    /// must MODEL that variant — parse it off the wire with its structured
+    /// payload intact and render role/runtime/source/unmet — instead of
+    /// falling into the generic "Unexpected response from daemon" path that
+    /// discarded the whole diagnostic.
+    #[tokio::test]
+    async fn round_trip_parses_runtime_rejected_response_with_structured_payload() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind");
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (reader, mut writer) = stream.into_split();
+            let mut lines = BufReader::new(reader).lines();
+            let _ = lines.next_line().await.expect("read").expect("line");
+            let response =
+                Response::RuntimeRejected(loom_daemon::runtime_admission::RuntimeRejection {
+                    role: "sweep-lifecycle".to_string(),
+                    runtime: "codex".to_string(),
+                    source: loom_daemon::runtime_admission::RuntimeSource::DefaultConfig,
+                    unmet_capabilities: vec!["worktreeIsolation".to_string()],
+                    reason: "unmet capabilities: worktreeIsolation".to_string(),
+                });
+            let json = serde_json::to_string(&response).expect("serialize");
+            writer.write_all(json.as_bytes()).await.expect("write");
+            writer.write_all(b"\n").await.expect("newline");
+            writer.flush().await.expect("flush");
+        });
+
+        let request = build_dispatch_request(4494, None, None, None, None, false);
+        let response = query_daemon_bounded(&socket_path, &request, Duration::from_secs(5))
+            .await
+            .expect("round-trip ok");
+
+        let Response::RuntimeRejected(rejection) = response else {
+            panic!("expected RuntimeRejected, got {response:?}");
+        };
+        assert_eq!(rejection.role, "sweep-lifecycle");
+        assert_eq!(rejection.runtime, "codex");
+        assert_eq!(rejection.unmet_capabilities, vec!["worktreeIsolation"]);
+
+        // The rendered operator diagnostic carries every required field.
+        let diagnostic = rejection.diagnostic();
+        for expected in [
+            "sweep-lifecycle",
+            "codex",
+            "default-config",
+            "worktreeIsolation",
+        ] {
+            assert!(diagnostic.contains(expected), "{diagnostic}");
+        }
+        // ...and the CLI's refusal exit code stays distinguishable from a
+        // generic daemon error (EX_CONFIG, as the shell checker uses).
+        assert_eq!(loom_daemon::runtime_admission::EX_CONFIG, 78);
+
+        server.await.expect("server task");
+    }
+
     /// An unresponsive daemon — accepts the connection but never replies —
     /// must trip the bounded round-trip timeout rather than hang (the #3945
     /// failure mode). The client returns an `Err` well before any 1800s wedge.
@@ -8764,7 +9065,6 @@ mod status_client_tests {
             token_pool_size: 4,
             token_pool_dir: Some(std::path::PathBuf::from("/repo/a/.loom/tokens")),
             disk_headroom: 10,
-            cpu_headroom: 6,
             logical_cpus: 8,
             loadavg_1m: Some(1.25),
             cpu_idle_fraction: Some(0.90),
