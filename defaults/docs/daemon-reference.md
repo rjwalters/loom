@@ -1820,7 +1820,7 @@ continue or switch models with /model.` — whose model name sits between "your"
 "limit". That phrasing matched none of the older "hit your … limit" patterns, so
 rotation never fired and every child died instantly; `classify-error.sh` now
 matches the `reached your <model> limit` family as `TOKEN_EXHAUSTED` (ordered
-*after* the `SESSION_LIMIT` branch so "reached your concurrent session limit`"
+*after* the `SESSION_LIMIT` branch so "reached your concurrent session limit"
 keeps its capacity classification). Reusing `TOKEN_EXHAUSTED` is a deliberate safe
 over-approximation: a Fable-only ceiling does not exhaust `sonnet` on the same
 account, so the pool is slightly pessimistic but rotation is correct, and no
