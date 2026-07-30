@@ -60,6 +60,9 @@
 //! - `/api/events` adds no new bind, no new port and no new opt-in knob: it is
 //!   routed off the same [`TcpListener`] `/api/status` already answers, so it
 //!   inherits phase 1's bind validation ([`validate_bind`]) unchanged.
+//! - Every response carries [`CORS_ALLOW_ORIGIN_HEADER`] (`*`), which the
+//!   client-side peer fan-out requires; see that constant for why a permissive
+//!   policy is correct on a read-only, loopback-by-default surface.
 //!
 //! # HTTP dependency decision
 //!
@@ -349,13 +352,35 @@ async fn parse_request<R: tokio::io::AsyncBufRead + Unpin>(
     Ok(ParsedRequest { method, path })
 }
 
+/// The permissive CORS header every response on this listener carries.
+///
+/// Issue #4393's dashboard fans out to peer daemons **client-side**: the browser
+/// on host A fetches host B's `/api/status` (and, for a per-peer tail, host B's
+/// `/api/events`) directly. Those are cross-origin requests, so without an
+/// `Access-Control-Allow-Origin` header on the *peer's* response the browser
+/// blocks every one of them — and a CORS rejection is indistinguishable from a
+/// dead host in the page's error path, so every *healthy* peer would render the
+/// red UNREACHABLE pill. That inverts exactly the reachability signal the
+/// multihost panel exists to provide.
+///
+/// `*` is the right policy here rather than an origin allowlist: these routes are
+/// read-only `GET`s carrying no credentials, the listener is loopback-bound by
+/// default, and exposing it beyond loopback is already an explicit double opt-in
+/// (`--allow-non-loopback` plus a specific bind address). **The bind posture is
+/// the access-control layer, not CORS** — a header allowlist would only enumerate
+/// which browsers may read data any client on a reachable interface can already
+/// `curl`, while breaking the ad-hoc peer lists the fan-out is built around.
+const CORS_ALLOW_ORIGIN_HEADER: &str = "Access-Control-Allow-Origin: *";
+
 /// Write a well-formed HTTP/1.1 JSON response. Always `Connection: close` —
 /// this minimal responder does not support keep-alive/pipelining, so every
-/// connection is single-request.
+/// connection is single-request. Carries [`CORS_ALLOW_ORIGIN_HEADER`] so a peer
+/// dashboard can read this body cross-origin.
 async fn write_json_response(stream: &mut TcpStream, status_line: &str, body: &str) -> Result<()> {
     let response = format!(
         "HTTP/1.1 {status_line}\r\n\
          Content-Type: application/json\r\n\
+         {CORS_ALLOW_ORIGIN_HEADER}\r\n\
          Content-Length: {}\r\n\
          Connection: close\r\n\
          \r\n\
@@ -368,11 +393,13 @@ async fn write_json_response(stream: &mut TcpStream, status_line: &str, body: &s
 }
 
 /// Write a well-formed HTTP/1.1 HTML response (Issue #4393's `GET /`).
-/// `Connection: close`, matching every other route this listener answers.
+/// `Connection: close`, matching every other route this listener answers, plus
+/// [`CORS_ALLOW_ORIGIN_HEADER`] for consistency with the API routes.
 async fn write_html_response(stream: &mut TcpStream, body: &str) -> Result<()> {
     let response = format!(
         "HTTP/1.1 200 OK\r\n\
          Content-Type: text/html; charset=utf-8\r\n\
+         {CORS_ALLOW_ORIGIN_HEADER}\r\n\
          Content-Length: {}\r\n\
          Connection: close\r\n\
          \r\n\
@@ -474,12 +501,16 @@ async fn build_pipeline_rows(
 /// Serve `GET /api/pipeline`: the forge-side queue snapshot for every
 /// managed repo the live status report names, fronted by [`PIPELINE_CACHE_TTL`].
 ///
-/// Roots come from a fresh `/api/status` round-trip (so this always reflects
-/// the *current* set of managed repos, never a stale list) rather than from
-/// the cache itself — only the (slow, `gh`-backed) row computation is cached.
-/// An unreachable daemon degrades to 503, matching `/api/status`'s own
-/// behavior. Zero managed repos yields `[]`, never a crash (Issue #4393 edge
-/// case).
+/// Roots are read from a fresh `/api/status` round-trip rather than from the
+/// cache, so an unreachable daemon is detected on every request (503, matching
+/// `/api/status`'s own behavior). Note that a *changed* root set does not
+/// invalidate the cache: while a cached entry is still within
+/// [`PIPELINE_CACHE_TTL`] the rows served are the ones computed for whatever
+/// root set was current at computation time, so a newly registered or
+/// deregistered workspace can take up to that TTL to appear or disappear from
+/// this endpoint. That is the intended tradeoff — recomputing means a `gh`
+/// subprocess batch, which a fast-polling page must not fire per tick. Zero
+/// managed repos yields `[]`, never a crash (Issue #4393 edge case).
 async fn handle_pipeline(
     stream: &mut TcpStream,
     socket_path: &Path,
@@ -627,6 +658,9 @@ pub fn topic_is_streamed(topic: &str) -> bool {
 /// until the connection ends — the standard framing for an unbounded
 /// `text/event-stream`. `X-Accel-Buffering: no` tells a reverse proxy (should
 /// an operator front this loopback listener with one) not to buffer the stream.
+/// [`CORS_ALLOW_ORIGIN_HEADER`] is required for a cross-origin `EventSource`:
+/// the browser applies the same-origin policy to SSE exactly as it does to
+/// `fetch`, so a per-peer event tail needs it on the peer's response.
 #[must_use]
 fn sse_response_head() -> String {
     format!(
@@ -634,6 +668,7 @@ fn sse_response_head() -> String {
          Content-Type: text/event-stream\r\n\
          Cache-Control: no-cache, no-store\r\n\
          X-Accel-Buffering: no\r\n\
+         {CORS_ALLOW_ORIGIN_HEADER}\r\n\
          Connection: close\r\n\
          \r\n\
          retry: {SSE_RETRY_MS}\n\
@@ -1195,6 +1230,13 @@ mod tests {
     // ===== Integration: full HTTP round-trip on an ephemeral port =====
 
     async fn http_get(addr: std::net::SocketAddr, path: &str) -> (u16, String) {
+        let (status, _head, body) = http_get_full(addr, path).await;
+        (status, body)
+    }
+
+    /// Like [`http_get`] but also returns the response **head**, for assertions
+    /// about headers (e.g. the CORS header the peer fan-out depends on).
+    async fn http_get_full(addr: std::net::SocketAddr, path: &str) -> (u16, String, String) {
         let mut stream = TcpStream::connect(addr).await.expect("connect");
         let request = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
         stream
@@ -1210,12 +1252,17 @@ mod tests {
             .nth(1)
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
+        let head = text
+            .split("\r\n\r\n")
+            .next()
+            .unwrap_or_default()
+            .to_string();
         let body = text
             .split("\r\n\r\n")
             .nth(1)
             .unwrap_or_default()
             .to_string();
-        (status_code, body)
+        (status_code, head, body)
     }
 
     #[tokio::test]
@@ -1543,6 +1590,85 @@ mod tests {
         assert!(head.contains(&format!("retry: {SSE_RETRY_MS}")));
     }
 
+    // ========================================================================
+    // CORS (Issue #4393): the client-side peer fan-out is cross-origin, so the
+    // *peer's* responses must carry `Access-Control-Allow-Origin` or the
+    // browser blocks them — and the page cannot tell a CORS rejection from a
+    // dead host, so a healthy peer would render UNREACHABLE. These tests pin
+    // the header onto all three response paths (JSON, HTML, SSE).
+    // ========================================================================
+
+    #[test]
+    fn cors_header_is_a_wildcard_origin() {
+        // Pinned deliberately: an origin allowlist cannot work for an ad-hoc
+        // peer list, and these are credential-free read-only GETs whose access
+        // control is the bind posture (loopback default + --allow-non-loopback).
+        assert_eq!(CORS_ALLOW_ORIGIN_HEADER, "Access-Control-Allow-Origin: *");
+    }
+
+    #[test]
+    fn sse_response_head_carries_the_cors_header_for_cross_origin_eventsource() {
+        // A cross-origin `EventSource` is subject to the same-origin policy just
+        // like `fetch`, so a per-peer event tail needs the header here too.
+        let head = sse_response_head();
+        assert!(
+            head.contains(&format!("{CORS_ALLOW_ORIGIN_HEADER}\r\n")),
+            "SSE head must carry the CORS header: {head:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_json_route_carries_the_cors_header() {
+        let mut report = empty_report();
+        report.token_pool_size = 3;
+        let socket_path = spawn_fake_daemon_socket(report).await;
+        let tcp_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind tcp");
+        let addr = tcp_listener.local_addr().expect("local addr");
+        let state = ServeState::new(socket_path).with_peers(vec!["http://peer-a:7420".to_string()]);
+        let server_task = tokio::spawn(run_with_state(tcp_listener, state));
+
+        // `/api/status` is the one the fan-out actually fetches cross-origin,
+        // but the header is a property of the JSON writer, so every JSON route
+        // (including the 404 error path) must carry it.
+        for path in [
+            "/api/status",
+            "/api/peers",
+            "/api/tokens",
+            "/api/pipeline",
+            "/nope",
+        ] {
+            let (_status, head, _body) = http_get_full(addr, path).await;
+            assert!(
+                head.contains(&format!("{CORS_ALLOW_ORIGIN_HEADER}\r\n")),
+                "{path} response must carry the CORS header: {head:?}"
+            );
+        }
+
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn html_route_carries_the_cors_header() {
+        let socket_path = spawn_fake_daemon_socket(empty_report()).await;
+        let tcp_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind tcp");
+        let addr = tcp_listener.local_addr().expect("local addr");
+        let server_task = tokio::spawn(run(tcp_listener, socket_path));
+
+        let (status, head, _body) = http_get_full(addr, "/").await;
+        assert_eq!(status, 200);
+        assert!(head.contains("Content-Type: text/html"), "head: {head:?}");
+        assert!(
+            head.contains(&format!("{CORS_ALLOW_ORIGIN_HEADER}\r\n")),
+            "dashboard page response must carry the CORS header: {head:?}"
+        );
+
+        server_task.abort();
+    }
+
     // ----- Integration harness: a fake daemon that answers SubscribeEvents -----
 
     struct FakeEventDaemon {
@@ -1670,6 +1796,13 @@ mod tests {
         let (mut client, head) = connect_sse(addr).await;
         assert!(head.contains("200 OK"), "head: {head:?}");
         assert!(head.contains("text/event-stream"), "head: {head:?}");
+        // On-the-wire companion to
+        // `sse_response_head_carries_the_cors_header_for_cross_origin_eventsource`:
+        // a peer's SSE tail is reachable from a cross-origin `EventSource`.
+        assert!(
+            head.contains(CORS_ALLOW_ORIGIN_HEADER),
+            "live SSE head must carry the CORS header: {head:?}"
+        );
 
         // The bus drops events published with no receivers, so wait until the
         // bridge's subscription has actually landed.

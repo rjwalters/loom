@@ -179,8 +179,10 @@ function el(tag, attrs, children) {
   var node = document.createElement(tag);
   if (attrs) {
     for (var k in attrs) {
+      // Deliberately no "html"/innerHTML branch: every value rendered here is
+      // forge- or daemon-derived text, so textContent is always correct and an
+      // innerHTML escape hatch would only be an unused injection sink.
       if (k === "text") { node.textContent = attrs[k]; }
-      else if (k === "html") { node.innerHTML = attrs[k]; }
       else { node.setAttribute(k, attrs[k]); }
     }
   }
@@ -479,6 +481,12 @@ function refreshPeers(peers) {
   }
   body.innerHTML = "";
   peers.forEach(function (base) {
+    // Cross-origin by design (host A's browser reading host B's daemon). This
+    // works only because the peer's /api/status carries
+    // Access-Control-Allow-Origin (serve.rs CORS_ALLOW_ORIGIN_HEADER) — a CORS
+    // rejection lands in the .catch below and is indistinguishable from a dead
+    // host, so a peer still running a pre-CORS daemon binary renders
+    // UNREACHABLE even while healthy.
     var url = base.replace(/\/$/, "") + "/api/status";
     fetchJson(url, 5000).then(function (report) {
       renderPeer(body, base, report, null);
@@ -518,10 +526,8 @@ function refreshTokens() {
   fetchJson("/api/tokens", 8000).then(renderTokens).catch(function () {});
 }
 
-var peerListLoaded = false;
 function refreshPeerList() {
   fetchJson("/api/peers", 8000).then(function (data) {
-    peerListLoaded = true;
     refreshPeers(data.peers || []);
   }).catch(function () {});
 }
