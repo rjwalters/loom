@@ -808,6 +808,12 @@ pub async fn tick_multi<S: EpicSource, D: EpicDispatcher>(
                 // and counted, the other workspaces still tick this same round.
                 agg.errors += 1;
                 log::warn!("epic_supervisor: a workspace tick failed to list epics: {e}");
+                // A rate-limit failure trips the global breaker (#4429) so the
+                // next round skips its gh polling entirely.
+                crate::rate_limit_breaker::global_observe_failure(
+                    &e.to_string(),
+                    "epic_supervisor",
+                );
             }
         }
     }
@@ -970,6 +976,12 @@ where
             };
             log::info!("epic_supervisor: loop started (interval={}s)", interval.as_secs());
             while !shutdown_thread.load(Ordering::Relaxed) {
+                // Shared GitHub rate limit exhausted (#4429): skip the round.
+                if crate::rate_limit_breaker::global_is_suppressed() {
+                    log::debug!("epic_supervisor: round skipped — rate-limit cooldown (#4429)");
+                    sleep_interruptible(interval, &shutdown_thread);
+                    continue;
+                }
                 match rt.block_on(supervisor.tick()) {
                     Ok(report) => {
                         if report.roles_dispatched > 0
@@ -989,6 +1001,10 @@ where
                     }
                     Err(e) => {
                         log::warn!("epic_supervisor: tick failed to list epics: {e}");
+                        crate::rate_limit_breaker::global_observe_failure(
+                            &e.to_string(),
+                            "epic_supervisor",
+                        );
                     }
                 }
                 sleep_interruptible(interval, &shutdown_thread);
@@ -1139,6 +1155,14 @@ pub fn spawn_multi_supervisor_thread(
                     }
                 }
 
+                // Shared GitHub rate limit exhausted (#4429): every
+                // supervisor's epic listing is a doomed gh call — skip the
+                // round and re-check after the interval.
+                if crate::rate_limit_breaker::global_is_suppressed() {
+                    log::debug!("epic_supervisor: round skipped — rate-limit cooldown (#4429)");
+                    sleep_interruptible(interval, &shutdown_thread);
+                    continue;
+                }
                 let report = rt.block_on(tick_multi(&mut supervisors));
                 if report.roles_dispatched > 0 || report.sweeps_dispatched > 0 || report.errors > 0
                 {
@@ -1280,34 +1304,30 @@ pub mod forge {
         }
 
         fn gh_json(&self, label: &str, state: &str) -> Result<Vec<GhIssue>> {
-            let mut cmd = Command::new(&self.gh_bin);
-            cmd.arg("issue")
-                .arg("list")
-                .arg("--label")
-                .arg(label)
-                .arg("--state")
-                .arg(state)
-                .arg("--limit")
-                .arg("200")
-                .arg("--json")
-                .arg("number,body,state,labels");
-            if let Some(ref repo) = self.repo {
-                cmd.arg("--repo").arg(repo);
-            }
-            if let Some(ref cwd) = self.cwd {
-                cmd.current_dir(cwd);
-            }
-            cmd.stderr(Stdio::piped());
-            let out = cmd
-                .output()
-                .with_context(|| format!("failed to invoke {}", self.gh_bin.display()))?;
-            if !out.status.success() {
-                return Err(anyhow!(
-                    "gh issue list --label {label} failed: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                ));
-            }
-            serde_json::from_slice(&out.stdout).context("parse gh issue list JSON")
+            // ETag-cached REST listing (#4428): unchanged epic sets cost zero
+            // rate limit (304). REST reports state lowercase (`"open"` vs
+            // GraphQL's `"OPEN"`) — `EpicSnapshot::is_open` compares
+            // case-insensitively, so both forms are safe. The `pull_request`
+            // filter keeps the pre-#4428 issue-only semantics.
+            let rows = crate::forge_listing::list_issues_cached(
+                &self.gh_bin,
+                self.cwd.as_deref(),
+                self.repo.as_deref(),
+                label,
+                state,
+            )?;
+            Ok(rows
+                .into_iter()
+                .filter(|r| !r.is_pull_request)
+                .map(|r| GhIssue {
+                    number: r.number,
+                    // REST `body` is nullable; the GraphQL-era parse defaulted
+                    // an absent body to empty, so keep that semantics.
+                    body: r.body.unwrap_or_default(),
+                    state: r.state,
+                    labels: r.labels.into_iter().map(|name| GhLabel { name }).collect(),
+                })
+                .collect())
         }
     }
 

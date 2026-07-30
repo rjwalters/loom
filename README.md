@@ -56,7 +56,8 @@ For continuous multi-account batches, run the `loom-daemon` (Tier 2) and enqueue
                               │
 ┌─────────────────────────────────────────────────────────────────┐
 │                    Workers (Tier 0)                             │
-│  /builder, /judge, /curator, /doctor - Execute single tasks     │
+│  /loom:builder, /loom:judge, /loom:curator, /loom:doctor        │
+│  - Execute single tasks                                         │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -149,7 +150,7 @@ stateDiagram-v2
 ## Features
 
 **Autonomous Orchestration**
-- Signal-based shepherd IPC for deterministic, reliable execution
+- Rust `loom-daemon` DispatchSweep IPC for deterministic, reliable execution
 - Stuck agent detection with automatic kill-and-retry recovery
 - Rate limit resilience with exponential backoff
 - Activity-based completion detection
@@ -239,6 +240,32 @@ From a script:
 claude -p "/loom:sweep 42" --dangerously-skip-permissions
 ```
 
+For a full Builder-through-Merge lifecycle from an **interactive Codex parent
+session**, launch Codex explicitly with:
+
+```bash
+codex --dangerously-bypass-approvals-and-sandbox
+```
+
+> **Warning:** this flag disables both Codex approval prompts and the Codex
+> sandbox. Use it only in an environment where you accept that trust boundary
+> for Loom's network, git, worktree, daemon-socket, and process operations.
+
+For non-mutating Curator or Judge investigation, use a read-only session
+instead:
+
+```bash
+codex --sandbox read-only --ask-for-approval never
+```
+
+The read-only posture cannot claim issues, edit labels, build in worktrees,
+create PRs, or merge; restart Codex with the full-lifecycle posture before
+performing those operations. These flags configure only the interactive parent
+session. They do not configure Codex workers dispatched by `loom-daemon`; that
+policy is tracked in [#4478](https://github.com/rjwalters/loom/issues/4478).
+See the [Codex guardrail-parity document](defaults/docs/guardrail-parity-codex.md)
+for the runtime trust-boundary comparison.
+
 Sweep is self-contained — there is no separate daemon to start. Checkpoints under `.loom/sweep-checkpoint/` survive crashes; restarting the sweep resumes from the last completed phase.
 
 ### Multi-Issue Mode (loom-daemon, Tier 2)
@@ -260,10 +287,10 @@ Each dispatched sweep runs in its own detached process and picks its own OAuth t
 Run worker agents directly (no daemon required):
 
 ```bash
-/builder 42        # Implement issue 42
-/judge 123         # Review PR #123
-/curator 42        # Enhance issue with technical details
-/doctor 123        # Fix PR feedback or conflicts
+/loom:builder 42        # Implement issue 42
+/loom:judge 123         # Review PR #123
+/loom:curator 42        # Enhance issue with technical details
+/loom:doctor 123        # Fix PR feedback or conflicts
 ```
 
 ### Worktree Workflow

@@ -58,6 +58,17 @@ assert_contains() {
 WORKDIR="$(mktemp -d)"
 trap 'rm -rf "$WORKDIR"' EXIT
 
+# Binary-format sanity gate bypass (#4397, deferred from #4381's incident
+# review): provision_machine_daemon now refuses to install anything that
+# isn't a real compiled binary (Mach-O/ELF — see _pmd_is_real_binary in
+# scripts/install/provision-daemon.sh). Every fake "daemon" binary this suite
+# writes (make_fake_bin below) is a bash script standing in for the real
+# compiled binary, so THIS SUITE — and only this suite — sets the explicit,
+# auditable bypass suite-wide. Production callers (scripts/install-loom.sh,
+# defaults/scripts/cli/loom-daemon-update.sh) never set it. Tests 14/15 below
+# exercise the gate itself with the bypass explicitly unset.
+export LOOM_PROVISION_ALLOW_SCRIPT=1
+
 # Build a fake loom-daemon binary that prints $1 as its --version.
 make_fake_bin() {
   local path="$1" ver="$2"
@@ -378,6 +389,35 @@ assert_eq "LOOM_CODESIGN_IDENTITY unset: provision returns 0" "0" "$rc13"
 codesign_args_unset="$(cat "$CODESIGN_ARGS_UNSET_FILE" 2>/dev/null || echo "<missing>")"
 assert_contains "LOOM_CODESIGN_IDENTITY unset: ad-hoc path is unchanged (-s -)" \
   "$codesign_args_unset" "-s -"
+
+# ---------- test 14: binary-format gate (#4397) — refuses a script-based
+# "binary" when LOOM_PROVISION_ALLOW_SCRIPT is unset (production behavior).
+# ---------------------------------------------------------------------------
+SRC14="$WORKDIR/src14/loom-daemon"
+mkdir -p "$WORKDIR/src14"
+make_fake_bin "$SRC14" "0.16.0"   # a bash script, standing in for the real binary
+DEST14="$WORKDIR/dest14"
+out14=$( ( unset LOOM_PROVISION_ALLOW_SCRIPT
+  LOOM_DAEMON_BIN_DIR="$DEST14" provision_machine_daemon "$SRC14" ) 2>&1 )
+rc14=$?
+assert_eq "gate rejects a script-based fake binary without the bypass" "1" "$rc14"
+assert_contains "gate rejection names the reason" "$out14" "not a compiled binary"
+assert_eq "gate rejection installs nothing" "0" "$( [[ -e "$DEST14/loom-daemon" ]] && echo 1 || echo 0 )"
+
+# ---------- test 15: binary-format gate (#4397) — accepts a REAL compiled
+# executable (a copy of /bin/cat, standing in for a real Mach-O/ELF daemon
+# binary) even without the bypass.
+# ---------------------------------------------------------------------------
+SRC15="$WORKDIR/src15/loom-daemon"
+mkdir -p "$WORKDIR/src15"
+cp "$(command -v cat)" "$SRC15"
+chmod +x "$SRC15"
+DEST15="$WORKDIR/dest15"
+out15=$( ( unset LOOM_PROVISION_ALLOW_SCRIPT
+  LOOM_DAEMON_BIN_DIR="$DEST15" provision_machine_daemon "$SRC15" ) 2>&1 )
+rc15=$?
+assert_eq "gate accepts a real compiled binary without the bypass" "0" "$rc15"
+assert_eq "real binary is installed at dest" "1" "$( [[ -x "$DEST15/loom-daemon" ]] && echo 1 || echo 0 )"
 
 # ---------- summary ----------
 echo ""

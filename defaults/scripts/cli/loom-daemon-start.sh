@@ -310,6 +310,24 @@ extract_plist_path_value() {
 # still forwarded verbatim so the launchd job sees EXACTLY the autonomy flags
 # and auth this invocation resolved -- never wider, never narrower (#3972 AC:
 # "preserves the current flag semantics").
+#
+# Reconciling this STATIC forwarding with the #4430 MINTED GitHub App token
+# path (deliberate, not an oversight): `LOOM_GITHUB_APP_ID` /
+# `LOOM_GITHUB_APP_KEY_PATH` already match the `LOOM_[A-Za-z0-9_]*` pattern
+# above, so they ride along into the plist exactly like any other LOOM_* flag
+# -- but note that's a non-secret app id and a *path* to the private key, never
+# the key material itself (which stays on disk wherever the operator put it,
+# read only by openssl at mint time). Any GH_TOKEN forwarded here is this
+# invocation's snapshot at RENDER time; the daemon's own #4430 preflight/
+# refresh loop calls `std::env::set_var("GH_TOKEN", …)` on its OWN process
+# environment once a fresh installation token is minted, which the plist's
+# static value cannot see or fight (it only seeds the daemon's env at
+# process start, same as it always did) -- every `gh`/`git` child spawned
+# AFTER that point inherits the live, minted value, not the stale plist one.
+# If minting ever fails (revoked/unreadable key, network hiccup), the daemon
+# falls back to whatever GH_TOKEN this static forwarding already provided --
+# so leaving GH_TOKEN forwarding in place is exactly the right fallback
+# layer, not a footgun to remove.
 render_launchd_plist() {
     local label="$1" bin="$2" workdir="$3" log_path="$4"
     local plist_path_value="$PLIST_PATH_VALUE"
@@ -381,7 +399,11 @@ render_launchd_plist() {
 #     (#4172, $PLIST_PATH_VALUE), not the invoking shell's PATH; every already-
 #     exported LOOM_* / GH_TOKEN / GITEA_TOKEN / FORGE_TOKEN var is forwarded
 #     verbatim so the service sees EXACTLY the autonomy flags + auth this
-#     invocation resolved -- never wider, never narrower.
+#     invocation resolved -- never wider, never narrower. See
+#     render_launchd_plist's #4430 reconciliation note above -- this static
+#     forwarding and the daemon's own minted-GitHub-App-token refresh loop
+#     are complementary (static = render-time seed/fallback, minted = live
+#     process-env override), never in conflict.
 render_systemd_unit() {
     local bin="$1" workdir="$2" log_path="$3"
     local unit_path_value="$PLIST_PATH_VALUE"
@@ -489,6 +511,43 @@ print_safehouse_status() {
         ok "Safehouse:     configured (socket present at $socket) -- see 'loom-daemon status' for live connection state"
     else
         warn "Safehouse:     configured, unreachable (socket $socket does not exist -- is safehoused running?)"
+    fi
+}
+
+# ---------- calibrate binding-ceiling hint (#4390) ----------
+# `loom-daemon calibrate` is purely file/host-based (no running daemon
+# required, unlike `status`), so it is safe to run right here at start time.
+# One advisory line, printed only when the configured
+# `autonomous.workFinder.maxConcurrent` ceiling is CURRENTLY the binding term
+# AND both the cpu and token axes have at least 2x headroom above it -- i.e.
+# this host is obviously bigger than the shipped default was sized for.
+# Never fatal: a missing jq, a calibrate error, or an unparseable payload all
+# fall through silently -- this is advisory-only, exactly like
+# print_safehouse_status above.
+print_calibrate_hint() {
+    if ! command -v jq >/dev/null 2>&1; then
+        return 0
+    fi
+    local calib_json
+    calib_json="$("$DAEMON_BIN" calibrate --workspace "$REPO_ROOT" --json 2>/dev/null)" || return 0
+    [[ -n "$calib_json" ]] || return 0
+
+    local binding ceiling cpu token_axis recommended
+    binding=$(jq -r '.recommendation.binding_term_before // empty' <<<"$calib_json" 2>/dev/null)
+    [[ "$binding" == "ceiling" ]] || return 0
+
+    ceiling=$(jq -r '.measurements.configured_max_concurrent // empty' <<<"$calib_json" 2>/dev/null)
+    cpu=$(jq -r '.measurements.cpu_headroom // empty' <<<"$calib_json" 2>/dev/null)
+    token_axis=$(jq -r '.measurements.token_axis_effective // empty' <<<"$calib_json" 2>/dev/null)
+    recommended=$(jq -r '.recommendation.recommended_max_concurrent // empty' <<<"$calib_json" 2>/dev/null)
+
+    # Defensively require all four to be plain non-negative integers before
+    # doing shell arithmetic on them.
+    [[ "$ceiling" =~ ^[0-9]+$ && "$cpu" =~ ^[0-9]+$ && "$token_axis" =~ ^[0-9]+$ && "$recommended" =~ ^[0-9]+$ ]] || return 0
+    (( ceiling > 0 )) || return 0
+
+    if (( cpu >= 2 * ceiling )) && (( token_axis >= 2 * ceiling )); then
+        warn "ceiling ${ceiling} binds; this host could run ${recommended} -- run 'loom-daemon calibrate'"
     fi
 }
 
@@ -1111,6 +1170,7 @@ if [[ "$USE_LAUNCHD" == "true" ]]; then
     echo "PID file: $PID_FILE"
     echo "Intent marker: $INTENT_MARKER"
     print_safehouse_status
+    print_calibrate_hint
     if [[ "$MACHINE_MODE" == "true" ]]; then
         echo "Stop with: loom stop"
     else
@@ -1185,6 +1245,7 @@ if [[ "$IS_LINUX_SYSTEMD" == "true" ]]; then
     echo "PID file: $PID_FILE"
     echo "Intent marker: $INTENT_MARKER"
     print_safehouse_status
+    print_calibrate_hint
     warn "Reboot survival requires lingering: run 'loginctl enable-linger \"\$USER\"' once (SSH-only / headless hosts)."
     if [[ "$MACHINE_MODE" == "true" ]]; then
         echo "Stop with: loom stop"
@@ -1223,6 +1284,7 @@ provision_watchdog_job_none
 ok "loom-daemon started (pid $daemon_pid). PID file: $PID_FILE"
 echo "Intent marker: $INTENT_MARKER"
 print_safehouse_status
+print_calibrate_hint
 if [[ "$MACHINE_MODE" == "true" ]]; then
     echo "Stop with: loom stop"
 else

@@ -2,7 +2,7 @@
 
 This module provides a single source of truth for:
 - Directory paths within .loom/
-- File paths for state files (spawn-loop-state.json, health-metrics.json, etc.)
+- File paths for state files (health-metrics.json, alerts.json, etc.)
 - Naming conventions for branches and worktrees
 """
 
@@ -159,8 +159,8 @@ class LoomPaths:
 
     Usage:
         paths = LoomPaths(repo_root)
-        print(paths.spawn_loop_state_file)  # repo_root/.loom/spawn-loop-state.json
-        print(paths.worktree_path(42))       # repo_root/.loom/worktrees/issue-42
+        print(paths.health_metrics_file)  # repo_root/.loom/health-metrics.json
+        print(paths.worktree_path(42))    # repo_root/.loom/worktrees/issue-42
     """
 
     # Directory names (relative to .loom/)
@@ -175,7 +175,6 @@ class LoomPaths:
     CLAUDE_CONFIG_DIR = "claude-config"
 
     # State file names
-    SPAWN_LOOP_STATE_FILE = "spawn-loop-state.json"
     HEALTH_METRICS_FILE = "health-metrics.json"
     ALERTS_FILE = "alerts.json"
     STUCK_HISTORY_FILE = "stuck-history.json"
@@ -258,11 +257,6 @@ class LoomPaths:
             Path to .loom/claude-config/{agent_name}/
         """
         return self.claude_config_base_dir / agent_name
-
-    @property
-    def spawn_loop_state_file(self) -> Path:
-        """Path to .loom/spawn-loop-state.json (Phase 1, #3374)."""
-        return self.loom_dir / self.SPAWN_LOOP_STATE_FILE
 
     @property
     def health_metrics_file(self) -> Path:

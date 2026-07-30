@@ -9,10 +9,12 @@ use loom_daemon::epic_supervisor;
 use loom_daemon::event_bus::EventBus;
 use loom_daemon::health_monitor;
 use loom_daemon::host_breaker;
+use loom_daemon::idle_exit;
 use loom_daemon::ipc::IpcServer;
 use loom_daemon::main_health_gate;
 use loom_daemon::metrics_collector;
 use loom_daemon::quarantine_reconciliation;
+use loom_daemon::rate_limit_breaker;
 use loom_daemon::role_runner;
 use loom_daemon::role_validation;
 use loom_daemon::self_update;
@@ -27,7 +29,7 @@ use loom_daemon::workspace_pool::WorkspacePool;
 use loom_daemon::worktree_ops::{aggressive, clean};
 use loom_daemon::{extract_configured_terminal_ids, rotate_log_file};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use std::fs;
@@ -99,8 +101,21 @@ enum Commands {
         workspace: String,
     },
 
-    /// Display agent effectiveness and activity metrics
+    /// Display agent effectiveness and activity metrics.
+    ///
+    /// With no positional `command`, prints the original interactive
+    /// dashboard (unchanged, backward compatible). With an explicit
+    /// `command` (`summary`/`effectiveness`/`costs`/`velocity`) this is the
+    /// native port of `loom_tools.agent_metrics` (epic #4081 Phase 3 family
+    /// 4, issue #4274) — the CLI contract `agent-metrics.sh` and
+    /// `mcp__loom__get_agent_metrics` invoke, including `--period` and
+    /// `--by-model` (#3482).
     Stats {
+        /// Metrics command: summary, effectiveness, costs, velocity. Omit for
+        /// the original interactive dashboard.
+        #[arg(value_name = "COMMAND")]
+        command: Option<String>,
+
         /// Filter by agent role (builder, judge, curator, etc.)
         #[arg(long)]
         role: Option<String>,
@@ -109,9 +124,20 @@ enum Commands {
         #[arg(long)]
         issue: Option<i32>,
 
-        /// Show weekly trends instead of daily
+        /// Show weekly trends instead of daily (dashboard mode only; use the
+        /// `velocity` command for the agent-metrics-parity table).
         #[arg(long)]
         weekly: bool,
+
+        /// Time period for `command` mode: today, week, month, all (default: week).
+        #[arg(long)]
+        period: Option<String>,
+
+        /// Add a per-model dimension to `effectiveness`/`costs` output
+        /// (`command` mode only); NULL/absent model values render as
+        /// `default` (#3482).
+        #[arg(long)]
+        by_model: bool,
 
         /// Output format: table (default), json
         #[arg(long, default_value = "table")]
@@ -137,6 +163,33 @@ enum Commands {
         /// bundled into the default view.
         #[arg(long)]
         pipeline: bool,
+    },
+
+    /// Measure the host and recommend — or with `--write`, apply — the
+    /// autonomous concurrency knobs (`autonomous.workFinder.maxConcurrent` /
+    /// `autonomous.perTokenConcurrency`, issue #4390). Prints the same
+    /// `min(...)` cap breakdown `status` uses, plus which term would bind
+    /// after applying the recommendation. Purely file/host-based; does not
+    /// require a running daemon (unlike `status`, which reports the running
+    /// daemon's own in-memory dispatch state).
+    Calibrate {
+        /// Repo root to measure/write (plain path, default `.` — no upward
+        /// `.git` walk).
+        #[arg(long, value_name = "PATH", default_value = ".")]
+        workspace: String,
+
+        /// Merge the recommendation into `<workspace>/.loom/config.json`
+        /// (only `autonomous.workFinder.maxConcurrent` /
+        /// `autonomous.perTokenConcurrency` — every other key is preserved).
+        /// Idempotent: a repeat `--write` with the same recommendation is
+        /// byte-identical. Without this flag, calibrate is strictly
+        /// read-only.
+        #[arg(long)]
+        write: bool,
+
+        /// Emit machine-readable JSON instead of the human-readable report.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Manage the machine-level workspace registry (`~/.loom/workspaces.json`):
@@ -213,13 +266,16 @@ enum Commands {
     },
 
     /// Start a minimal read-only HTTP status-snapshot listener (Issue #4391,
-    /// dashboard phase 1 of #4329). A single `GET /api/status` endpoint
-    /// serializes the same `DaemonStatusReport` `loom-daemon status --json`
-    /// already aggregates — fetched live over the *existing* Unix socket (the
-    /// same `DaemonStatus` IPC request `status` sends), so the aggregation
-    /// logic in `ipc::build_daemon_status` runs exactly once and is never
-    /// duplicated here. No new persistent store, no mutation, no SSE/HTML
-    /// (those are later phases #4392-#4394).
+    /// dashboard phases 1-2 of #4329). `GET /api/status` (#4391) serializes the
+    /// same `DaemonStatusReport` `loom-daemon status --json` already
+    /// aggregates — fetched live over the *existing* Unix socket (the same
+    /// `DaemonStatus` IPC request `status` sends), so the aggregation logic in
+    /// `ipc::build_daemon_status` runs exactly once and is never duplicated
+    /// here. `GET /api/events` (#4392) tails the daemon's event bus as
+    /// `text/event-stream`, bridged from the same socket's existing
+    /// `SubscribeEvents` request over the frozen `sweep.*` topics. Both are
+    /// read-only: no new persistent store, no mutation, no publish, no HTML
+    /// page yet (that is phase #4393, docs #4394).
     ///
     /// Off by default: nothing listens until this subcommand is explicitly
     /// run — a running daemon started without `serve` never opens this port.
@@ -272,6 +328,11 @@ enum Commands {
     /// immediately and waits for every in-flight sweep to finish before
     /// restarting — no sweep killed, no orphan left behind. `--abort-drain`
     /// cancels an in-progress drain and resumes normal dispatch.
+    ///
+    /// With `--drain --then-exit` (Issue #4343 — `fleet drain`'s teardown use
+    /// case) the daemon stops (and stays stopped — exits without a supervised
+    /// relaunch) instead of restarting once drained, so it cannot pick up new
+    /// dispatch on a host that is about to be powered off.
     Restart {
         /// Finish all in-flight sweeps before restarting, instead of restarting
         /// immediately (#4090). New dispatch is paused for the duration.
@@ -289,6 +350,13 @@ enum Commands {
         /// Abort an in-progress drain and resume normal dispatch (no restart).
         #[arg(long)]
         abort_drain: bool,
+        /// With `--drain`, stop (and stay down) instead of restarting once
+        /// drained (Issue #4343). Requires `--drain`; the daemon does not
+        /// require a recognized supervisor for this variant (there is
+        /// nothing to prove supervision for — a `then-exit` drain never
+        /// wants a relaunch).
+        #[arg(long)]
+        then_exit: bool,
     },
 
     /// Manage the multi-account OAuth token pool at `.loom/tokens/` (Issue
@@ -539,6 +607,41 @@ enum FleetAction {
     /// non-zero unless every roster host is `UP`.
     Status {
         /// Emit machine-readable JSON instead of the human-readable table.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Retire a worker without losing in-flight work, forge claims, or (when
+    /// wired) E2E room keys (issue #4343). SSH orchestration over the existing
+    /// `restart --drain` primitive (#4090), plus the teardown-specific deltas:
+    /// a drain-then-*exit* remote invocation (never restart into new dispatch
+    /// on a box about to be powered off), an immediate targeted `loom:building`
+    /// claim reset via `gh` (not SSH — the forge is global), a safehoused
+    /// key-backup flush check (a documented stub pending #3998 — see
+    /// `loom_daemon::fleet::drain`'s module doc), workspace deregistration, and
+    /// finally removing the worker from the fleet registry. Idempotent +
+    /// resumable: an interrupted drain re-runs from its last completed phase.
+    /// Never calls a cloud CLI itself — prints the exact `repo:remote --down`
+    /// teardown command instead (epic #4340's boundary).
+    Drain {
+        /// SSH alias/host to drain (must already be in the fleet registry;
+        /// draining a host not in the registry is a clean no-op).
+        #[arg(value_name = "SSH_HOST")]
+        ssh_host: String,
+
+        /// Max seconds the remote daemon waits for in-flight sweeps to drain.
+        #[arg(long, value_name = "SECS", default_value_t = loom_daemon::fleet::drain::DEFAULT_DRAIN_TIMEOUT_SECS)]
+        timeout: u64,
+
+        /// On remote drain timeout, force-cancel stragglers
+        /// (SIGTERM→grace→SIGKILL) and proceed anyway. Without this, a
+        /// timeout refuses and the remote daemon stays running (fail-safe) —
+        /// this command then also refuses to proceed past waiting for it to
+        /// exit.
+        #[arg(long)]
+        force_after_timeout: bool,
+
+        /// Emit machine-readable JSON instead of the human-readable report.
         #[arg(long)]
         json: bool,
     },
@@ -1010,7 +1113,11 @@ async fn main() -> Result<()> {
                 timeout,
                 force_after_timeout,
                 abort_drain,
-            } => handle_restart_command(drain, timeout, force_after_timeout, abort_drain).await,
+                then_exit,
+            } => {
+                handle_restart_command(drain, timeout, force_after_timeout, abort_drain, then_exit)
+                    .await
+            }
             // `fleet status` collects the local host's own status over the
             // daemon's Unix socket (issue #4342), so — unlike `fleet
             // add-worker`, which is pure ssh/filesystem and stays on the sync
@@ -1155,18 +1262,129 @@ async fn main() -> Result<()> {
         Err(e) => log::warn!("sweep_registry: reconstruction failed: {e}"),
     }
 
-    // Startup forge-credential preflight (Issue #4005). Resolved once, here —
-    // immediately before the claim-reconciliation pass below, the daemon's
-    // first `gh` consumer — so a headless/SSH-only start with neither an
-    // exported GH_TOKEN/GITHUB_TOKEN nor an unlockable GUI login keychain is
-    // diagnosed loudly at boot instead of surfacing as silent per-tick 401s
-    // for the life of the process. Non-fatal and bounded (same posture as the
-    // reconciliation pass itself): a `gh` hiccup here never blocks startup.
+    // Startup forge-credential preflight (Issue #4005; GitHub App identity
+    // mechanism added by #4430). Resolved once, here — immediately before the
+    // claim-reconciliation pass below, the daemon's first `gh` consumer — so
+    // a headless/SSH-only start with neither an exported GH_TOKEN/GITHUB_TOKEN
+    // nor an unlockable GUI login keychain is diagnosed loudly at boot
+    // instead of surfacing as silent per-tick 401s for the life of the
+    // process. Non-fatal and bounded (same posture as the reconciliation pass
+    // itself): a `gh` hiccup here never blocks startup.
+    //
+    // #4430: when a GitHub App id + private key are configured (env or
+    // `forge.githubApp.*` config — see `defaults/scripts/lib/github-app-token.sh`),
+    // this mints a short-lived installation token and exports it as this
+    // process's own `GH_TOKEN`, so every `gh`/`git` child the daemon spawns
+    // from this point on inherits it. Absent that config, `owner_repo`
+    // resolves fine but the shell helper reports "not_configured" and
+    // `run_with_github_app` falls through to the byte-identical pre-#4430
+    // `run(...)` path below — no behavior change for any host that hasn't
+    // opted in.
     let credential_preflight_probe = credential_preflight::RealGhAuthProbe {
         gh_bin: "gh".to_string(),
         cwd: sweep_workspace.clone(),
     };
-    let credential_preflight = credential_preflight::run(&credential_preflight_probe);
+    let github_app_script = credential_preflight::resolve_github_app_script(&sweep_workspace);
+    let github_app_owner_repo = credential_preflight::nwo_from_git_remote(&sweep_workspace);
+    let github_app_preflight = match &github_app_script {
+        Some(script_path) => {
+            let minter = credential_preflight::RealGithubAppMinter {
+                script_path: script_path.clone(),
+                cwd: sweep_workspace.clone(),
+            };
+            credential_preflight::run_with_github_app(
+                &credential_preflight_probe,
+                &minter,
+                github_app_owner_repo.as_deref(),
+            )
+        }
+        // No `github-app-token.sh` on disk at all (stale install predating
+        // #4430, or a workspace root with no `.loom`/`defaults` tree) —
+        // exactly the pre-#4430 path, with zero extra subprocess overhead.
+        None => credential_preflight::GithubAppPreflight {
+            report: credential_preflight::run(&credential_preflight_probe),
+            minted_gh_token: None,
+        },
+    };
+    if let Some(token) = &github_app_preflight.minted_gh_token {
+        // NEVER logged: only the fingerprint in `github_app_preflight.report`
+        // is. Exported into this process's own env so every `gh`/`git`
+        // child spawned from here on (Command::new without env_clear)
+        // inherits it.
+        std::env::set_var("GH_TOKEN", token);
+    }
+    let credential_preflight = github_app_preflight.report;
+
+    // #4430: keep the minted installation token fresh across its ~1h
+    // lifetime for a long-running daemon. A no-op tick (unconfigured, or the
+    // shell helper's own cache still has >10min left) costs a handful of
+    // cheap subprocess execs and never touches `GH_TOKEN`; a genuine mint
+    // failure is logged and the loop keeps whatever `GH_TOKEN` the process
+    // already has (fail-open, matching the startup preflight's posture).
+    if let (Some(script_path), Some(owner_repo)) = (&github_app_script, &github_app_owner_repo) {
+        let script_path = script_path.clone();
+        let cwd = sweep_workspace.clone();
+        let owner_repo = owner_repo.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(credential_preflight::GITHUB_APP_REFRESH_INTERVAL).await;
+                let script_path = script_path.clone();
+                let cwd = cwd.clone();
+                let owner_repo = owner_repo.clone();
+                let outcome = tokio::task::spawn_blocking(move || {
+                    let minter = credential_preflight::RealGithubAppMinter { script_path, cwd };
+                    credential_preflight::GithubAppMinter::mint(&minter, &owner_repo)
+                })
+                .await;
+                match outcome {
+                    Ok(credential_preflight::GithubAppOutcome::Minted {
+                        token,
+                        installation_id,
+                        app_id,
+                        ..
+                    }) => {
+                        std::env::set_var("GH_TOKEN", token);
+                        log::debug!(
+                            "credential_preflight: github-app refresh tick minted a token \
+                             (app {app_id} installation {installation_id}) — #4430"
+                        );
+                    }
+                    Ok(credential_preflight::GithubAppOutcome::NotConfigured) => {
+                        // Cheap no-op tick -- nothing to refresh.
+                    }
+                    Ok(credential_preflight::GithubAppOutcome::Error(reason)) => {
+                        log::warn!(
+                            "credential_preflight: github-app refresh tick failed ({reason}); \
+                             GH_TOKEN left unchanged — #4430"
+                        );
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "credential_preflight: github-app refresh task join error: {e} — #4430"
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    // GitHub rate-limit circuit breaker (#4429). Registered here — before the
+    // startup reconciliation passes just below — because *every* gh-polling
+    // consumer (reconciliation, work-finder, epic supervisor, role runner)
+    // starts after this point and consults the global handle. Unlike the host
+    // breaker (registered inside the work-finder branch, which is its sole
+    // sampler), rate-limit failures can be observed by any of those loops, so
+    // the breaker exists whether or not the work-finder is enabled.
+    let rate_limit_config = rate_limit_breaker::resolve_config_for(&sweep_workspace);
+    rate_limit_breaker::register_global(std::sync::Arc::new(
+        rate_limit_breaker::SharedRateLimitBreaker::new(rate_limit_config),
+    ));
+    log::info!(
+        "rate_limit_breaker: enabled={} (fallback_cooldown_secs={}) — forge polling pauses \
+         until the API window resets when the shared rate limit is exhausted (#4429)",
+        rate_limit_config.enabled,
+        rate_limit_config.fallback_cooldown_secs,
+    );
 
     // Stale-`loom:building`-claim reconciliation across every managed
     // workspace (Issue #3953). `sweep.reconstruct()` above only recovers
@@ -1277,6 +1495,18 @@ async fn main() -> Result<()> {
         quarantine_config.threshold,
         quarantine_config.ttl.as_secs(),
         quarantine_config.insta_crash_secs
+    );
+
+    // Claude-wrapper pre-flight-death workspace tripwire (#4386): resolve
+    // env > config > default for the default workspace so a fleet-wide,
+    // cross-issue spawn failure (e.g. a stale `.mcp.json`) trips a visible
+    // advisory instead of reading as an idle-healthy daemon.
+    let preflight_tripwire_config =
+        sweep_registry::resolve_preflight_tripwire_config(&sweep_workspace);
+    sweep.set_preflight_tripwire_config(preflight_tripwire_config);
+    log::info!(
+        "sweep_registry: pre-flight-death tripwire threshold={} (#4386)",
+        preflight_tripwire_config.threshold
     );
 
     // Cross-host collision detection (#4085, Phase 0 of #4028): resolve env >
@@ -1823,6 +2053,32 @@ async fn main() -> Result<()> {
         None
     };
 
+    // Independent, opt-in idle exit (#4467). The daemon only exits; the host
+    // guard retains sole authority to power off.
+    let idle_exit_config = idle_exit::read_config(&sweep_workspace);
+    let _idle_exit_handle = if idle_exit::resolve_enabled(&idle_exit_config) {
+        let minutes = idle_exit::resolve_minutes(&idle_exit_config);
+        let starvation = idle_exit::resolve_starvation(&idle_exit_config);
+        if loom_daemon::ipc::detect_supervisor().as_deref() == Some("launchd") {
+            log::warn!(
+                "idle_exit: ENABLED under launchd; KeepAlive:SuccessfulExit relaunches exit(0), \
+                 so idle exit is meaningful only under on-failure-style supervision"
+            );
+        }
+        log::info!("idle_exit: enabled (idle_minutes={minutes}, on_token_starvation={starvation})");
+        Some(idle_exit::spawn_task(
+            idle_exit_config,
+            sweep_workspace.clone(),
+            workspace_pool.clone(),
+            role_in_progress.clone(),
+            event_bus.clone(),
+            socket_path.clone(),
+        ))
+    } else {
+        log::debug!("idle_exit: disabled (opt in with autonomous.idleExit.enabled=true)");
+        None
+    };
+
     // Start IPC server. `workspace_health_states` is threaded in so the
     // `DaemonStatus` request can report each registered repo's own halt state
     // (#3930), and `sweep_workspace` is the `effective_roots` fallback for the
@@ -2117,11 +2373,32 @@ fn handle_cli_command(command: Commands) -> Result<()> {
             verbose,
         } => handle_validate_command(&workspace, &format, strict, verbose),
         Commands::Stats {
+            command,
             role,
             issue,
             weekly,
+            period,
+            by_model,
             format,
-        } => handle_stats_command(role.as_deref(), issue, weekly, &format),
+        } => {
+            if let Some(cmd) = command {
+                handle_agent_metrics_command(
+                    &cmd,
+                    role.as_deref(),
+                    issue,
+                    period.as_deref().unwrap_or("week"),
+                    by_model,
+                    &format,
+                )
+            } else {
+                handle_stats_command(role.as_deref(), issue, weekly, &format)
+            }
+        }
+        Commands::Calibrate {
+            workspace,
+            write,
+            json,
+        } => handle_calibrate_command(&workspace, write, json),
         Commands::Workspace { action } => handle_workspace_command(action),
         Commands::Fleet { action } => handle_fleet_command(action),
         Commands::Tokens { action } => handle_tokens_command(action),
@@ -2661,8 +2938,14 @@ async fn handle_restart_command(
     timeout: Option<u64>,
     force_after_timeout: bool,
     abort_drain: bool,
+    then_exit: bool,
 ) -> Result<()> {
     let socket_path = resolve_socket_path()?;
+
+    if then_exit && !drain {
+        eprintln!("--then-exit requires --drain (there is nothing to drain-then-exit without it)");
+        std::process::exit(1);
+    }
 
     // Drain-mode variants (Issue #4090) speak `DrainAndRestartDaemon` /
     // `AbortDrain` and expect a `DaemonDrain` reply; the plain restart keeps its
@@ -2677,14 +2960,23 @@ async fn handle_restart_command(
         .await;
     }
     if drain {
+        let (accepted_prefix, refused_prefix) = if then_exit {
+            (
+                "loom-daemon drain-then-exit scheduled (will stop, not restart, once drained)",
+                "loom-daemon did NOT drain",
+            )
+        } else {
+            ("loom-daemon drain scheduled", "loom-daemon did NOT drain")
+        };
         return handle_drain_reply(
             &socket_path,
             &Request::DrainAndRestartDaemon {
                 timeout_secs: timeout,
                 force_after_timeout,
+                then_exit,
             },
-            "loom-daemon drain scheduled",
-            "loom-daemon did NOT drain",
+            accepted_prefix,
+            refused_prefix,
         )
         .await;
     }
@@ -2741,12 +3033,15 @@ async fn handle_drain_reply(
             supervisor,
             in_flight,
             message,
+            then_exit,
         }) => {
             if accepted {
-                println!(
-                    "{accepted_prefix} (supervisor: {}, {in_flight} in-flight).",
-                    supervisor.as_deref().unwrap_or("unknown")
-                );
+                let sup_note = if then_exit {
+                    "then-exit — no relaunch".to_string()
+                } else {
+                    supervisor.as_deref().unwrap_or("unknown").to_string()
+                };
+                println!("{accepted_prefix} (supervisor: {sup_note}, {in_flight} in-flight).");
                 println!("{message}");
                 Ok(())
             } else {
@@ -3153,7 +3448,8 @@ async fn handle_serve_command(port: u16, bind: &str, allow_non_loopback: bool) -
         .map_err(|e| anyhow!("failed to bind {addr}:{port}: {e}"))?;
     let local_addr = listener.local_addr()?;
     println!(
-        "loom-daemon serve: listening on http://{local_addr}/api/status (proxying {})",
+        "loom-daemon serve: listening on http://{local_addr}/api/status and \
+         http://{local_addr}/api/events (proxying {})",
         socket_path.display()
     );
 
@@ -3620,6 +3916,13 @@ fn build_status_json_value(
         // not any resource term, so scripted consumers don't misread the
         // token/CPU ceiling as a bottleneck at low occupancy.
         "capacity_bound": report.capacity_bound,
+        // Claude-wrapper pre-flight-death workspace tripwire (#4386): `true`
+        // means N consecutive dispatches, across different issues, died at
+        // the wrapper's MCP-init pre-flight check before ever reaching
+        // `# CLAUDE_CLI_START` — the classic stale-`.mcp.json` fleet-wide
+        // silent-failure signature. `message` is `null` when not tripped.
+        "preflight_advisory_active": report.preflight_advisory_active,
+        "preflight_advisory_message": report.preflight_advisory_message,
         "dynamic_cap": {
             "token_pool_size": report.token_pool_size,
             // The directory the daemon resolved for the pool above (#4292) —
@@ -3708,6 +4011,13 @@ fn build_status_json_value(
             "health_gate_deferred": r.health_gate_deferred,
             "health_gate_deferred_reason": r.health_gate_deferred_reason,
             "health_gate_verdict_tier": r.health_gate_verdict_tier,
+            // Per-root role-runner enablement (#4377) — resolved from THIS
+            // root's own `.loom/config.json`, independent of the daemon
+            // workspace's own master switch. `on_idle_roles` non-empty while
+            // `enabled` is `false` is the exact silent-no-op this issue fixes.
+            "role_runner_enabled": r.role_runner_enabled,
+            "role_runner_roles": r.role_runner_roles,
+            "role_runner_on_idle_roles": r.role_runner_on_idle_roles,
         })).collect::<Vec<_>>(),
         // Forge-side pipeline snapshot (#3977) — present only when `--pipeline`
         // was passed; `null` otherwise so a consumer can tell "not requested"
@@ -3756,6 +4066,18 @@ fn build_status_json_value(
             "load_per_core_threshold": h.load_per_core_threshold,
             "sustain_ticks": h.sustain_ticks,
             "cooldown_secs": h.cooldown_secs,
+        })),
+        "rate_limit_breaker": report.rate_limit_breaker.as_ref().map(|r| serde_json::json!({
+            "enabled": r.enabled,
+            "phase": r.phase,
+            "suppressed": r.suppressed,
+            "source": r.source,
+            "tripped_at": r.tripped_at,
+            "cooldown_until": r.cooldown_until,
+            "trips_total": r.trips_total,
+            "core_remaining": r.core_remaining,
+            "graphql_remaining": r.graphql_remaining,
+            "budget_probed_at": r.budget_probed_at,
         })),
         // Live safehouse fleet-comms connection state (#4345) — `null` only
         // from a pre-#4345 daemon binary that never computed one. `state` is
@@ -4029,6 +4351,18 @@ fn print_status_human(
         }
     }
 
+    // Claude-wrapper pre-flight-death tripwire (#4386): printed prominently,
+    // ahead of the capacity section, so a fleet-wide spawn failure is visible
+    // even to an operator skimming just the top of `status`. Printed FIRST so
+    // the "not capacity-bound … the limiter is work availability" line further
+    // below is never the only diagnosis shown while this is tripped — see the
+    // guard on that line.
+    if report.preflight_advisory_active {
+        if let Some(msg) = &report.preflight_advisory_message {
+            println!("\n{msg}");
+        }
+    }
+
     // Capacity figures resolved from a single source (fresh probe when
     // available, else the daemon's ranking snapshot) so the cap's healthy-tokens
     // input, the Token-capacity summary, and the Per-token table all agree (#3936).
@@ -4180,11 +4514,21 @@ fn print_status_human(
                 // defect — at, say, 1 in-flight against a cap of 7 the limiter
                 // is simply how much ready work exists. Suppress the
                 // token-bound diagnosis.
-                println!(
-                    "  not capacity-bound ({} in flight, cap {dispatch_cap} — the limiter is \
-                     work availability, not tokens/disk/CPU)",
-                    report.in_flight.len(),
-                );
+                //
+                // #4386: while the pre-flight tripwire is active, this bare
+                // "work availability" line is actively misleading — every
+                // dispatch IS starting, it just dies within ~1s at
+                // claude-wrapper pre-flight, which reads as "no work" rather
+                // than "everything is crashing." The warning printed above
+                // already names the real cause, so suppress this line rather
+                // than let it stand uncontested.
+                if !report.preflight_advisory_active {
+                    println!(
+                        "  not capacity-bound ({} in flight, cap {dispatch_cap} — the limiter is \
+                         work availability, not tokens/disk/CPU)",
+                        report.in_flight.len(),
+                    );
+                }
             } else if rc.token_bound {
                 if rc.healthy == 0 {
                     println!(
@@ -4209,7 +4553,10 @@ fn print_status_human(
              health basis)",
             report.token_pool_size
         );
-        if !capacity_bound {
+        if !capacity_bound && !report.preflight_advisory_active {
+            // #4386: same suppression as the ranking-present branch above —
+            // the warning printed at the top of `status` already names the
+            // real cause while the tripwire is active.
             println!(
                 "  not capacity-bound ({} in flight, cap {dispatch_cap} — the limiter is work \
                  availability, not tokens/disk/CPU)",
@@ -4354,6 +4701,42 @@ fn print_status_human(
         }
     }
 
+    // GitHub rate-limit circuit breaker (#4429): one line while Closed, a
+    // fuller block while cooling (the operator's first question is "when does
+    // polling resume").
+    if let Some(rl) = &report.rate_limit_breaker {
+        if !rl.enabled {
+            println!("GitHub rate limit: breaker disabled");
+        } else if rl.suppressed {
+            let releases = rl.cooldown_until.map_or_else(
+                || "unknown".to_string(),
+                |r| {
+                    let secs = (r - Utc::now()).num_seconds();
+                    if secs >= 0 {
+                        format!("in {secs}s ({r})")
+                    } else {
+                        format!("overdue by {}s ({r})", -secs)
+                    }
+                },
+            );
+            let source = rl.source.as_deref().unwrap_or("unknown");
+            println!(
+                "GitHub rate limit: COOLDOWN — forge polling paused (tripped by {source}), \
+                 resumes {releases}"
+            );
+            if let (Some(core), Some(gql)) = (rl.core_remaining, rl.graphql_remaining) {
+                println!("  last probed budget: core {core} remaining, graphql {gql} remaining");
+            }
+        } else if rl.trips_total > 0 {
+            println!(
+                "GitHub rate limit: OK (breaker closed; {} trip(s) this daemon lifetime)",
+                rl.trips_total
+            );
+        } else {
+            println!("GitHub rate limit: OK (breaker closed)");
+        }
+    }
+
     // Per-repo breakdown across every registered managed workspace (#3930). In
     // the common single-workspace case this is one line for the daemon's own
     // workspace; with `loom-daemon workspace add <path>` it lists every managed
@@ -4365,8 +4748,8 @@ fn print_status_human(
     if report.per_repo.is_empty() {
         println!("  (none)");
     } else {
-        println!("  {:>4}  {:>9}  {:<13}  REPO", "PRIO", "IN-FLIGHT", "GATE");
-        println!("  {:-<60}", "");
+        println!("  {:>4}  {:>9}  {:<13}  {:<5}  REPO", "PRIO", "IN-FLIGHT", "GATE", "ROLES");
+        println!("  {:-<68}", "");
         for r in &report.per_repo {
             // Same classification as the top-level summary above, condensed
             // for the table column (#3950 AC3, widened #4012).
@@ -4381,11 +4764,16 @@ fn print_status_human(
                 r.health_gate_verdict_at,
             );
             let gate = gate_status_short_label(&verdict);
+            // Per-root role-runner enablement (#4377) — resolved from this
+            // root's OWN config, so it can legitimately read "off" even while
+            // the daemon's own workspace has the loops running.
+            let roles = if r.role_runner_enabled { "on" } else { "off" };
             println!(
-                "  {:>4}  {:>9}  {:<13}  {}{}",
+                "  {:>4}  {:>9}  {:<13}  {:<5}  {}{}",
                 r.priority,
                 r.in_flight_count,
                 gate,
+                roles,
                 r.root.display(),
                 if r.root_missing {
                     "  [MISSING ROOT]"
@@ -4427,6 +4815,19 @@ fn print_status_human(
                     .collect::<Vec<_>>()
                     .join(", ");
                 println!("        quarantined (insta-crash, #3939): {list}");
+            }
+            // #4377: onIdle configured but the per-root gate is off is
+            // exactly the silent no-op this issue fixes — call it out
+            // explicitly rather than requiring the operator to cross-check
+            // the ROLES column against a separate onIdle listing.
+            if !r.role_runner_enabled && !r.role_runner_on_idle_roles.is_empty() {
+                let list = r.role_runner_on_idle_roles.join(", ");
+                println!(
+                    "        role runner disabled for this root but onIdle=[{list}] is \
+                     configured — these roles will never fire until \
+                     autonomous.roleRunner.enabled=true is set in this root's own \
+                     .loom/config.json (#4377)"
+                );
             }
         }
     }
@@ -4724,6 +5125,228 @@ fn print_agent_effectiveness(agent: &activity::AgentEffectiveness) {
     println!();
 }
 
+/// Valid `agent-metrics` subcommands (mirrors `loom_tools.agent_metrics`'s
+/// argparse `choices`).
+const AGENT_METRICS_COMMANDS: &[&str] = &["summary", "effectiveness", "costs", "velocity"];
+/// Valid `--period` values.
+const AGENT_METRICS_PERIODS: &[&str] = &["today", "week", "month", "all"];
+/// Valid `--role` values (mirrors `loom_tools.agent_metrics._VALID_ROLES`).
+const AGENT_METRICS_ROLES: &[&str] = &[
+    "builder",
+    "judge",
+    "curator",
+    "architect",
+    "hermit",
+    "doctor",
+    "guide",
+    "champion",
+    "shepherd",
+];
+
+/// Handle `loom-daemon stats <command>` — the native port of
+/// `loom_tools.agent_metrics` (epic #4081 Phase 3 family 4, issue #4274).
+/// `command` is one of `summary`/`effectiveness`/`costs`/`velocity`, the CLI
+/// contract `agent-metrics.sh` forwards to (and, transitively,
+/// `mcp__loom__get_agent_metrics`). Exits nonzero on validation failure or a
+/// missing activity database, matching the retired Python CLI's exit codes.
+#[allow(clippy::too_many_lines)]
+fn handle_agent_metrics_command(
+    command: &str,
+    role: Option<&str>,
+    issue: Option<i32>,
+    period: &str,
+    by_model: bool,
+    format: &str,
+) -> Result<()> {
+    if !AGENT_METRICS_COMMANDS.contains(&command) {
+        eprintln!(
+            "Invalid command: {command} (expected one of: {})",
+            AGENT_METRICS_COMMANDS.join(", ")
+        );
+        std::process::exit(1);
+    }
+
+    if let Some(r) = role {
+        if !AGENT_METRICS_ROLES.contains(&r) {
+            eprintln!("Invalid role: {r}");
+            std::process::exit(1);
+        }
+    }
+
+    if !AGENT_METRICS_PERIODS.contains(&period) {
+        eprintln!(
+            "Invalid period: {period} (expected one of: {})",
+            AGENT_METRICS_PERIODS.join(", ")
+        );
+        std::process::exit(1);
+    }
+
+    let is_json = format == "json";
+
+    let db_path = std::env::var_os("LOOM_ACTIVITY_DB")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            dirs::home_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join(".loom")
+                .join("activity.db")
+        });
+
+    if !db_path.is_file() {
+        if is_json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "error": "Activity database not available",
+                    "db_path": db_path.display().to_string(),
+                })
+            );
+        } else {
+            println!(
+                "Error: activity database not found at {}. Set LOOM_ACTIVITY_DB or enable agent activity tracking.",
+                db_path.display()
+            );
+        }
+        std::process::exit(1);
+    }
+
+    let db = ActivityDb::new(db_path)?;
+
+    match command {
+        "summary" => {
+            let metrics = db.get_summary_metrics(role, period)?;
+            if is_json {
+                println!("{}", serde_json::to_string_pretty(&metrics)?);
+            } else {
+                let tokens_k = metrics.total_tokens / 1000;
+                println!("\nAgent Performance Summary ({period})");
+                println!("{:-<40}", "");
+                println!("  Total Prompts:   {}", metrics.total_prompts);
+                println!("  Total Tokens:    {tokens_k}K");
+                println!("  Total Cost:      ${:.4}", metrics.total_cost);
+                println!("  Issues Worked:   {}", metrics.issues_count);
+                println!("  PRs Created:     {}", metrics.prs_count);
+                println!("  Success Rate:    {:.1}%", metrics.success_rate);
+                println!();
+            }
+        }
+        "effectiveness" => {
+            let rows = db.get_effectiveness_rows(role, period, by_model)?;
+            if is_json {
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+            } else {
+                println!("\nAgent Effectiveness by Role ({period})");
+                if by_model {
+                    println!(
+                        "{:<12} {:<22} {:>10} {:>10} {:>10} {:>10} {:>10}",
+                        "Role", "Model", "Prompts", "Success", "Rate", "Avg Cost", "Avg Time"
+                    );
+                } else {
+                    println!(
+                        "{:<12} {:>10} {:>10} {:>10} {:>10} {:>10}",
+                        "Role", "Prompts", "Success", "Rate", "Avg Cost", "Avg Time"
+                    );
+                }
+                for r in &rows {
+                    let rate_str = format!("{:.1}%", r.success_rate);
+                    let cost_str = format!("${:.4}", r.avg_cost);
+                    let time_str = format!("{:.1}s", r.avg_duration_sec);
+                    if by_model {
+                        println!(
+                            "{:<12} {:<22} {:>10} {:>10} {:>10} {:>10} {:>10}",
+                            r.role,
+                            r.model.as_deref().unwrap_or("default"),
+                            r.total_prompts,
+                            r.successful_prompts,
+                            rate_str,
+                            cost_str,
+                            time_str
+                        );
+                    } else {
+                        println!(
+                            "{:<12} {:>10} {:>10} {:>10} {:>10} {:>10}",
+                            r.role,
+                            r.total_prompts,
+                            r.successful_prompts,
+                            rate_str,
+                            cost_str,
+                            time_str
+                        );
+                    }
+                }
+                if rows.is_empty() {
+                    println!("No data found");
+                }
+                println!();
+            }
+        }
+        "costs" => {
+            let rows = db.get_cost_rows(issue, by_model)?;
+            if is_json {
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+            } else {
+                println!("\nCost Breakdown by Issue");
+                if by_model {
+                    println!(
+                        "{:<8} {:<22} {:>10} {:>12} {:>12}",
+                        "Issue", "Model", "Prompts", "Cost", "Tokens"
+                    );
+                } else {
+                    println!("{:<8} {:>10} {:>12} {:>12}", "Issue", "Prompts", "Cost", "Tokens");
+                }
+                for r in &rows {
+                    let cost_str = format!("${:.4}", r.total_cost);
+                    if by_model {
+                        println!(
+                            "#{:<7} {:<22} {:>10} {:>12} {:>12}",
+                            r.issue_number,
+                            r.model.as_deref().unwrap_or("default"),
+                            r.prompt_count,
+                            cost_str,
+                            r.total_tokens
+                        );
+                    } else {
+                        println!(
+                            "#{:<7} {:>10} {:>12} {:>12}",
+                            r.issue_number, r.prompt_count, cost_str, r.total_tokens
+                        );
+                    }
+                }
+                if rows.is_empty() {
+                    println!("No data found");
+                }
+                println!();
+            }
+        }
+        "velocity" => {
+            let rows = db.get_velocity_rows()?;
+            if is_json {
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+            } else {
+                println!("\nDevelopment Velocity (Last 8 Weeks)");
+                println!(
+                    "{:<10} {:>10} {:>10} {:>10} {:>10}",
+                    "Week", "Prompts", "Issues", "PRs", "Cost"
+                );
+                for r in &rows {
+                    println!(
+                        "{:<10} {:>10} {:>10} {:>10} {:>10}",
+                        r.week,
+                        r.prompts,
+                        r.issues,
+                        r.prs_merged,
+                        format!("${:.2}", r.cost)
+                    );
+                }
+                println!();
+            }
+        }
+        _ => unreachable!("validated above"),
+    }
+
+    Ok(())
+}
+
 /// Handle the `workspace` subcommand — mutate/inspect the machine-level
 /// workspace registry (`~/.loom/workspaces.json`) directly on the filesystem.
 /// This runs whether or not the daemon is up; a running daemon re-reads the
@@ -4734,6 +5357,7 @@ fn print_agent_effectiveness(agent: &activity::AgentEffectiveness) {
 /// lives in [`loom_daemon::fleet`].
 fn handle_fleet_command(action: FleetAction) -> Result<()> {
     use loom_daemon::fleet::add_worker::{self, AddWorkerConfig};
+    use loom_daemon::fleet::drain::{self, DrainConfig};
 
     match action {
         FleetAction::AddWorker {
@@ -4765,6 +5389,43 @@ fn handle_fleet_command(action: FleetAction) -> Result<()> {
             // local host's in-process socket round-trip), never dispatched
             // through this sync handler.
             unreachable!("Fleet Status is handled in main() before handle_cli_command")
+        }
+        FleetAction::Drain {
+            ssh_host,
+            timeout,
+            force_after_timeout,
+            json,
+        } => {
+            // Resolved once, from the operator's own cwd (mirrors
+            // `WorkspacePool::start_safehouse_narration`'s
+            // `safehouse::resolve_config(repo_root)` call shape) — see
+            // `fleet::drain::flush_safehouse`'s doc comment for why this is a
+            // documented stub, not a real flush, pending #3998.
+            let cwd = std::env::current_dir().context("resolving cwd for safehouse config")?;
+            let safehouse_enabled = loom_daemon::safehouse::resolve_config(&cwd).enabled;
+
+            let poll_interval = Duration::from_secs(drain::DEFAULT_POLL_INTERVAL_SECS);
+            let max_polls = ((timeout / drain::DEFAULT_POLL_INTERVAL_SECS.max(1)) + 12) as u32;
+            let config = DrainConfig {
+                ssh_host,
+                timeout_secs: timeout,
+                force_after_timeout,
+                poll_interval,
+                max_polls,
+                safehouse_enabled,
+                json,
+            };
+            let report = drain::run(&config)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", report.render_human());
+            }
+            let code = report.exit_code();
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
         }
     }
 }
@@ -5943,6 +6604,45 @@ fn handle_recover_orphans_command(
     Ok(())
 }
 
+/// Handle `loom-daemon calibrate` (issue #4390): measure the host, print (or
+/// `--write` apply) the recommended `autonomous.workFinder.maxConcurrent` /
+/// `autonomous.perTokenConcurrency` values. See `loom_daemon::calibrate` for
+/// the measurement + recommendation policy this thinly wires up.
+fn handle_calibrate_command(workspace: &str, write: bool, json: bool) -> Result<()> {
+    use loom_daemon::calibrate;
+    use loom_daemon::worktree_ops::repo;
+
+    let repo_root = repo::resolve_repo_root(workspace)?;
+
+    let measurements = calibrate::measure(&repo_root);
+    let recommendation = calibrate::recommend(&measurements);
+
+    let written = if write {
+        Some(
+            calibrate::write_workfinder_config(
+                &repo_root,
+                recommendation.recommended_max_concurrent,
+                recommendation.recommended_per_token_concurrency,
+            )
+            .map_err(|e| anyhow!("{e}"))?,
+        )
+    } else {
+        None
+    };
+
+    if json {
+        let report = calibrate::report_json(&measurements, &recommendation, written.as_deref());
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print!(
+            "{}",
+            calibrate::report_human(&measurements, &recommendation, written.as_deref())
+        );
+    }
+
+    Ok(())
+}
+
 fn handle_validate_command(
     workspace: &str,
     format: &str,
@@ -6702,6 +7402,8 @@ mod status_client_tests {
             loadavg_1m: Some(1.25),
             cpu_idle_fraction: Some(0.90),
             capacity_bound: false,
+            preflight_advisory_active: false,
+            preflight_advisory_message: None,
             configured_max: 5,
             per_token_concurrency: 2,
             dynamic_cap: 3,
@@ -6740,6 +7442,7 @@ mod status_client_tests {
             auto_update_terminal_reason: None,
             auto_update_note: None,
             host_breaker: None,
+            rate_limit_breaker: None,
             safehouse: None,
         }
     }

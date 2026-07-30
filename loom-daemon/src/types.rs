@@ -426,10 +426,27 @@ pub enum Request {
     ///
     /// On an unsupervised host the daemon refuses immediately (before pausing
     /// dispatch) with `DaemonDrain { accepted: false, .. }`, mirroring
-    /// [`Request::RestartDaemon`]'s refusal contract.
+    /// [`Request::RestartDaemon`]'s refusal contract — **unless** `then_exit`
+    /// is set (see below), in which case the supervisor requirement does not
+    /// apply at all.
+    ///
+    /// - `then_exit` (Issue #4343, `fleet drain`'s teardown use case):
+    ///   `false` (the #4090 default) preserves the original restart-when-drained
+    ///   behavior byte-for-byte. `true` changes the terminal action from
+    ///   "exit [`crate::ipc::EXIT_RESTART`] for a supervised relaunch" to "exit
+    ///   [`crate::ipc::EXIT_SHUTDOWN`] and **stay down**" — the daemon must not
+    ///   pick up new dispatch on a host about to be powered off, so a relaunch
+    ///   would defeat the whole point of draining before teardown. Because a
+    ///   `then_exit` drain deliberately does **not** want a relaunch, the
+    ///   supervisor-detection refusal gate is skipped entirely for it (there is
+    ///   nothing to prove supervision *for*). `#[serde(default)]` keeps
+    ///   pre-#4343 wire data (`{"type":"DrainAndRestartDaemon","payload":{...}}`
+    ///   with no `then_exit` key) parsing as `false` — the original behavior.
     DrainAndRestartDaemon {
         timeout_secs: Option<u64>,
         force_after_timeout: bool,
+        #[serde(default)]
+        then_exit: bool,
     },
     /// Abort an in-progress drain (Issue #4090): clear the drain flag so new
     /// dispatch resumes, and stop the drain-supervisor task so no later restart
@@ -601,11 +618,17 @@ pub enum Response {
     /// `in_flight` is the cross-root non-terminal sweep count at request time,
     /// so the operator immediately sees how much work the drain must wait for.
     /// `message` is a human-readable explanation for operator output.
+    /// `then_exit` (Issue #4343) echoes back the request's `then_exit`: `true`
+    /// means the daemon will exit and stay down once drained (never relaunch),
+    /// rather than restart. `#[serde(default)]` keeps pre-#4343 wire data
+    /// parsing (as `false`).
     DaemonDrain {
         accepted: bool,
         supervisor: Option<String>,
         in_flight: usize,
         message: String,
+        #[serde(default)]
+        then_exit: bool,
     },
     // ========================================================================
     // Workspace Registry Responses (Issue #3926 — phase 1 of #3835)
@@ -924,6 +947,26 @@ pub struct DaemonStatusReport {
     /// (an absent field parses as `false` — "not capacity-bound").
     #[serde(default)]
     pub capacity_bound: bool,
+    /// Whether the default/primary workspace's claude-wrapper pre-flight-death
+    /// tripwire is currently tripped (Issue #4386): N consecutive dispatches,
+    /// across *different* issues, died at the wrapper's MCP-init pre-flight
+    /// check before ever reaching `# CLAUDE_CLI_START` — the classic
+    /// stale-`.mcp.json` fleet-wide silent-failure signature. See
+    /// `SweepRegistry::preflight_advisory`. While `true`, the status renderer
+    /// must surface [`Self::preflight_advisory_message`] instead of — or
+    /// immediately alongside — the bare "not capacity-bound … the limiter is
+    /// work availability" line, so a fleet-wide spawn failure never reads as
+    /// an idle-healthy daemon. `#[serde(default)]` keeps pre-#4386 wire data /
+    /// older clients compatible (an absent field parses as `false`).
+    #[serde(default)]
+    pub preflight_advisory_active: bool,
+    /// The operator-facing advisory message when
+    /// [`Self::preflight_advisory_active`] is `true` (e.g. `"WARNING: last 3
+    /// dispatches died at claude-wrapper pre-flight (preflight-mcp-failed) —
+    /// check .mcp.json"`), else `None`. `#[serde(default)]` keeps pre-#4386
+    /// wire data compatible.
+    #[serde(default)]
+    pub preflight_advisory_message: Option<String>,
     /// Dynamic-cap input 4: the configured operator ceiling
     /// (`autonomous.workFinder.maxConcurrent` / `LOOM_WORK_FINDER_MAX_CONCURRENT`).
     pub configured_max: usize,
@@ -1126,6 +1169,13 @@ pub struct DaemonStatusReport {
     /// heap alloc on an already-rare, human-latency status round-trip).
     #[serde(default)]
     pub host_breaker: Option<Box<HostBreakerStatus>>,
+    /// GitHub rate-limit circuit-breaker state (Issue #4429). `Some` once the
+    /// breaker is registered at startup; `None` on older daemons.
+    /// `#[serde(default)]` keeps pre-#4429 wire data / older clients compatible.
+    /// Boxed for the same `clippy::large_enum_variant` reason as
+    /// [`Self::host_breaker`].
+    #[serde(default)]
+    pub rate_limit_breaker: Option<Box<RateLimitBreakerStatus>>,
     /// Live safehouse fleet-comms connection state (Issue #4345): distinguishes
     /// `not_configured` (no `safehouse` block / disabled) from `unreachable`
     /// (enabled, socket resolved, but the daemon's own connection attempt
@@ -1195,6 +1245,41 @@ pub struct HostBreakerStatus {
     pub sustain_ticks: u32,
     /// The configured cool-down window, in seconds.
     pub cooldown_secs: u64,
+}
+
+/// GitHub rate-limit circuit-breaker snapshot for `loom-daemon status` (Issue
+/// #4429). Rendered from [`crate::rate_limit_breaker::RateLimitSnapshot`]. The
+/// `daemon.rate_limit_breaker.state` event carries the transition data on
+/// every phase change; this is the point-in-time status view.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RateLimitBreakerStatus {
+    /// Whether the breaker is enabled (default ON — a safety backstop).
+    pub enabled: bool,
+    /// The current phase: `"closed"` or `"cooldown"`.
+    pub phase: String,
+    /// Whether forge polling is currently suppressed.
+    pub suppressed: bool,
+    /// Which loop's failure tripped the active cooldown; `None` while Closed.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// When the active cooldown was tripped; `None` while Closed.
+    #[serde(default)]
+    pub tripped_at: Option<DateTime<Utc>>,
+    /// When the active cooldown releases; `None` while Closed.
+    #[serde(default)]
+    pub cooldown_until: Option<DateTime<Utc>>,
+    /// Lifetime trip count for this daemon process.
+    pub trips_total: u64,
+    /// Last-probed REST core budget remaining (`None` before the first trip —
+    /// the budget is probed on trip, never on a status call).
+    #[serde(default)]
+    pub core_remaining: Option<u64>,
+    /// Last-probed GraphQL budget remaining.
+    #[serde(default)]
+    pub graphql_remaining: Option<u64>,
+    /// When the cached budget snapshot was probed.
+    #[serde(default)]
+    pub budget_probed_at: Option<DateTime<Utc>>,
 }
 
 /// A live-locked sweep with no matching [`DaemonStatusReport::in_flight`] entry
@@ -1302,6 +1387,38 @@ pub struct RepoStatus {
     /// [`DaemonStatusReport::main_health_gate_verdict_tier`].
     #[serde(default)]
     pub health_gate_verdict_tier: Option<String>,
+    /// Whether the periodic support-role runner (Issue #4015) is enabled for
+    /// **this** root's own `.loom/config.json` (Issue #4377) —
+    /// `role_runner::resolve_enabled(role_runner::read_role_runner_config(root))`,
+    /// resolved daemon-side, never the CLI client's environment. This is a
+    /// **per-root** gate, independent of whether the daemon's own workspace
+    /// happens to have `autonomous.roleRunner.enabled: true` — a registered
+    /// workspace can be `false` here even while the daemon's own workspace is
+    /// `true`, which was previously undiagnosable without reading that root's
+    /// config file directly (the motivating incident: 9 of 10 registered
+    /// workspaces silently receiving zero role ticks). `#[serde(default)]`
+    /// keeps pre-#4377 wire data / older daemon binaries compatible (an
+    /// absent field parses as `false`).
+    #[serde(default)]
+    pub role_runner_enabled: bool,
+    /// The interval-loop roles this root would dispatch if
+    /// [`Self::role_runner_enabled`] were `true` (Issue #4377) —
+    /// `role_runner::resolve_roles(..)` names, in [`crate::role_runner::DEFAULT_ROLES`]
+    /// order. Populated even when disabled, so `loom-daemon status` can show
+    /// *what* is being suppressed, not just *that* it is. `#[serde(default)]`
+    /// keeps pre-#4377 wire data compatible (an absent field parses as an
+    /// empty vec).
+    #[serde(default)]
+    pub role_runner_roles: Vec<String>,
+    /// This root's `autonomous.roleRunner.onIdle` roles (Issue #4377) —
+    /// `role_runner::resolve_on_idle_roles(..)` names. A non-empty value here
+    /// combined with [`Self::role_runner_enabled`] being `false` is exactly
+    /// the silent-no-op this issue fixes: `onIdle` configured, but the
+    /// per-root gate off, so it never fires. `#[serde(default)]` keeps
+    /// pre-#4377 wire data compatible (an absent field parses as an empty
+    /// vec).
+    #[serde(default)]
+    pub role_runner_on_idle_roles: Vec<String>,
 }
 
 /// One active insta-crash quarantine (Issue #4215), as surfaced by
@@ -1359,21 +1476,27 @@ pub struct CapacityReport {
     pub token_bound: bool,
 }
 
-/// Startup forge-credential preflight snapshot (#4005) — see
-/// [`crate::credential_preflight`] for the resolution logic. Resolved exactly
-/// once, before the daemon's first `gh` consumer, so headless/SSH-only
-/// operation (no unlockable GUI login keychain) is diagnosed loudly at boot
-/// instead of surfacing as an unexplained per-tick `401` on every forge call.
+/// Startup forge-credential preflight snapshot (#4005; GitHub App identity
+/// mechanism added by #4430) — see [`crate::credential_preflight`] for the
+/// resolution logic. Resolved exactly once, before the daemon's first `gh`
+/// consumer, so headless/SSH-only operation (no unlockable GUI login
+/// keychain) is diagnosed loudly at boot instead of surfacing as an
+/// unexplained per-tick `401` on every forge call.
 ///
 /// GitHub-only: the daemon's own forge calls all shell out to `gh`, which
-/// resolves GitHub credentials exclusively. `GITEA_TOKEN`/`FORGE_TOKEN`
-/// forwarding (`loom-daemon-start.sh`) exists only for dispatched sweep
-/// children targeting a Gitea-backed repo — the daemon process itself never
-/// calls a Gitea API, so there is nothing here to preflight for it.
+/// resolves GitHub credentials exclusively (whether that's an ambient
+/// `GH_TOKEN`/keyring credential, or a `GH_TOKEN` this process minted itself
+/// via the `"github-app"` mechanism below and exported into its own
+/// environment). `GITEA_TOKEN`/`FORGE_TOKEN` forwarding (`loom-daemon-start.sh`)
+/// exists only for dispatched sweep children targeting a Gitea-backed repo —
+/// the daemon process itself never calls a Gitea API, so there is nothing
+/// here to preflight for it.
 ///
 /// **Never carries a token value** — only a resolution-mechanism label and a
-/// non-secret fingerprint (last 4 chars of an env-sourced token, or the
-/// authenticated `gh` login for a credential-store resolution).
+/// non-secret fingerprint (last 4 chars of an env-sourced token, the
+/// authenticated `gh` login for a credential-store resolution, or `app
+/// <id> installation <id>` for the GitHub App mechanism — never the minted
+/// token itself).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CredentialPreflightReport {
     /// `true` when a usable GitHub credential was resolved; `false` when
@@ -1383,13 +1506,17 @@ pub struct CredentialPreflightReport {
     pub ok: bool,
     /// Which mechanism resolved the credential: `"GH_TOKEN"` / `"GITHUB_TOKEN"`
     /// (the daemon's own process environment) or `gh`'s own `tokenSource`
-    /// (e.g. `"keyring"`, `"oauth_token"`) reported by `gh auth status`.
+    /// (e.g. `"keyring"`, `"oauth_token"`) reported by `gh auth status`;
+    /// `"github-app"` when a GitHub App installation token was minted and
+    /// exported as `GH_TOKEN` (#4430 — see
+    /// [`crate::credential_preflight::resolve_with_github_app`]).
     /// `"none"` when nothing resolved; `"unknown"` when the probe itself
     /// failed to run. NEVER a token value.
     pub mechanism: String,
     /// A non-secret fingerprint: the last 4 characters of an env-sourced
-    /// token, or the authenticated `gh` login for a credential-store
-    /// resolution. `None` when no credential resolved.
+    /// token, the authenticated `gh` login for a credential-store
+    /// resolution, or `app <id> installation <id>` for the `"github-app"`
+    /// mechanism. `None` when no credential resolved.
     pub fingerprint: Option<String>,
     /// Human-readable, log/print-safe summary — never contains a token.
     /// Names both remediations (export `GH_TOKEN` before starting the
@@ -1462,6 +1589,17 @@ pub enum Event {
         /// behavior).
         #[serde(default)]
         no_progress: bool,
+        /// Issue #4386: set to a claude-wrapper pre-flight-death label (e.g.
+        /// `"preflight-mcp-failed"`, `"preflight-no-cli-start"`) when the
+        /// reaper's [`crate::sweep_registry::classify_preflight_death`]-derived
+        /// classification matched this dead sweep's log tail. `None` for every
+        /// other exit (including the common clean self-skip/no-work case).
+        /// This is an additive payload extension of the existing frozen
+        /// `sweep.issue.{N}.exited` topic — the topic string is unchanged.
+        /// `#[serde(default)]` keeps pre-#4386 wire data / older clients
+        /// compatible.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        death_class: Option<String>,
         /// Owning managed-workspace root (Issue #3929). See [`Self::SweepPhase`].
         #[serde(default, skip_serializing_if = "Option::is_none")]
         repo: Option<String>,
@@ -1479,6 +1617,14 @@ pub enum Event {
         /// when the log yields no recognizable signature (or is unreadable).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         classification: Option<String>,
+        /// Issue #4386: set to a claude-wrapper pre-flight-death label when
+        /// this dead sweep's log tail matched the pre-flight classifier —
+        /// same additive-payload-extension rationale as `SweepExited`'s
+        /// `death_class` field, applied here too because a stale checkpoint
+        /// from an earlier dispatch can route a pre-flight death through this
+        /// Crashed branch instead of `SweepExited`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        death_class: Option<String>,
         /// Owning managed-workspace root (Issue #3929). See [`Self::SweepPhase`].
         #[serde(default, skip_serializing_if = "Option::is_none")]
         repo: Option<String>,
@@ -1561,6 +1707,40 @@ pub enum Event {
         /// Operator-facing advisory message naming the concrete levers.
         message: String,
     },
+    /// `daemon.preflight.advisory` — a workspace's reaper crossed (or cleared)
+    /// the consecutive claude-wrapper pre-flight-death threshold (Issue
+    /// #4386): N dispatches in a row, across *different* issues, died at the
+    /// wrapper's MCP-init pre-flight check before ever reaching `# CLAUDE_CLI_
+    /// START` (the classic stale-`.mcp.json` fleet-wide silent failure).
+    /// Published by [`crate::sweep_registry::SweepRegistry`]'s reaper on
+    /// **state change only** (entered/left the tripped state), mirroring
+    /// `daemon.capacity.advisory`'s dedup discipline — never every tick. This
+    /// issue (#4386) is the authorizing issue for this topic per the frozen-
+    /// taxonomy "new topics require a follow-up issue" rule (see
+    /// `event_bus.rs`'s module doc). Advisory only — it never blocks
+    /// dispatch; it tells the operator to check `.mcp.json`.
+    PreflightAdvisory {
+        /// The workspace root whose reaper tripped (or cleared) the advisory.
+        workspace_root: String,
+        /// Consecutive pre-flight deaths observed at the transition.
+        consecutive_deaths: u32,
+        /// The most recent matched pre-flight death-class marker (e.g.
+        /// `"preflight-mcp-failed"`), or empty on the clearing transition.
+        marker: String,
+        /// Operator-facing advisory message naming the concrete cause.
+        message: String,
+    },
+    /// `daemon.idle_exit` — the daemon is cleanly yielding to a host
+    /// idle-shutdown guard (Issue #4467).
+    DaemonIdleExit {
+        trigger: String,
+        idle_minutes: u64,
+        in_flight_sweeps: usize,
+        active_role_runs: usize,
+        healthy_tokens: usize,
+        total_tokens: usize,
+        message: String,
+    },
     /// Synthetic event signalling that the subscription fell behind the
     /// publisher. The number of events dropped is reported in `skipped`.
     /// Matches `tokio::sync::broadcast::Receiver::Lagged` semantics.
@@ -1590,6 +1770,7 @@ impl Event {
     /// | `SweepGlobalCompleted {..}` | `sweep.global.completed` |
     /// | `EpicAction {epic, action, ..}` | `epic.issue.{epic}.{action}` |
     /// | `CapacityAdvisory {..}` | `daemon.capacity.advisory` |
+    /// | `PreflightAdvisory {..}` | `daemon.preflight.advisory` |
     /// | `TopicLag {..}` | `sweep.system.topic_lag` |
     /// | `Generic {topic, ..}` | the explicit topic string |
     ///
@@ -1615,6 +1796,8 @@ impl Event {
                 format!("epic.issue.{epic}.{}", action.as_str())
             }
             Self::CapacityAdvisory { .. } => "daemon.capacity.advisory".to_string(),
+            Self::PreflightAdvisory { .. } => "daemon.preflight.advisory".to_string(),
+            Self::DaemonIdleExit { .. } => "daemon.idle_exit".to_string(),
             Self::TopicLag { .. } => "sweep.system.topic_lag".to_string(),
             Self::Generic { topic, .. } => topic.clone(),
         }
@@ -1627,7 +1810,8 @@ impl Event {
     /// specific workspace) is never overwritten.
     ///
     /// `SweepGlobalCompleted` (already carries a unique `sweep_id`), `EpicAction`,
-    /// `CapacityAdvisory`, `TopicLag`, and `Generic` are left untouched. Called
+    /// `CapacityAdvisory`, `PreflightAdvisory` (already carries its own
+    /// `workspace_root` field), `TopicLag`, and `Generic` are left untouched. Called
     /// centrally from `SweepRegistry::emit_event` so every emitted sweep event
     /// is stamped with its registry's `workspace_root` without touching each
     /// construction site.
@@ -1743,6 +1927,7 @@ mod tests {
             exit_code: Some(0),
             duration_sec: 5,
             no_progress: false,
+            death_class: None,
             repo: None,
         };
         assert_eq!(exited.topic(), "sweep.issue.7.exited");
@@ -1751,6 +1936,7 @@ mod tests {
             issue: 7,
             checkpoint_phase: Some("doctor".to_string()),
             classification: None,
+            death_class: None,
             repo: Some("/repos/c".to_string()),
         };
         assert_eq!(crashed.topic(), "sweep.issue.7.crashed");
@@ -1805,6 +1991,7 @@ mod tests {
             exit_code: None,
             duration_sec: 0,
             no_progress: false,
+            death_class: None,
             repo: None,
         };
         ev.set_repo_if_absent("/repos/x");
@@ -1870,6 +2057,9 @@ mod tests {
             health_gate_deferred: false,
             health_gate_deferred_reason: None,
             health_gate_verdict_tier: None,
+            role_runner_enabled: false,
+            role_runner_roles: vec![],
+            role_runner_on_idle_roles: vec![],
         }
     }
 

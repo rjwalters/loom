@@ -26,8 +26,16 @@
 #                         orchestrator drops one ladder rung (e.g. fable→opus)
 #                         WITHOUT consuming a Doctor cycle (see sweep.md).
 #       RECOVERABLE     — transient (rate limit, 5xx, network, etc.)
-#       FATAL           — non-recoverable (currently never returned;
-#                         reserved for future explicit FATAL signals)
+#       FATAL           — non-recoverable: retrying the same invocation cannot
+#                         succeed because the fault is in the CONFIGURATION,
+#                         not the transport or the account. Never returned for
+#                         provider `claude` (its table has no FATAL patterns),
+#                         so the pre-#4468 claim "currently never returned"
+#                         still holds for every Claude caller. The `codex`
+#                         table (issue #4468) is the first to use it — e.g.
+#                         Codex's trusted-directory refusal and an
+#                         unknown-config-key rejection, both of which loop
+#                         forever under a RECOVERABLE retry.
 #
 # Design — engine vs. provider pattern tables (issue #4190):
 #   classify_error() is a two-layer design: a shared CLASSIFICATION ENGINE
@@ -35,8 +43,9 @@
 #   fallthrough) plus provider-scoped PATTERN TABLES that hold the actual
 #   failure-signature regexes. This keeps a future non-Claude runtime adapter
 #   (Codex, Amp, ... — see #4167) additive: register a new provider table
-#   instead of editing the shared engine. Today only the `claude` table is
-#   populated; a `codex` stub exists for the future adapter to fill in.
+#   instead of editing the shared engine. Both the `claude` and `codex` tables
+#   are populated today (the latter filled in by epic #4167 Phase 2, issue
+#   #4468, alongside `defaults/scripts/spawn-codex.sh`).
 #
 #   Provider selector precedence (highest first): optional 3rd positional
 #   arg > `$LOOM_RUNTIME` (the same env var `spawn-worker.sh` uses for
@@ -47,10 +56,9 @@
 #   does NOT introduce a `LOOM_WORKER` selector (that name belongs to an
 #   older fork design; upstream's convention is `LOOM_RUNTIME`).
 #
-#   An unrecognized provider (or no table for a recognized-but-unimplemented
-#   provider, e.g. `codex` today) never errors — it simply has no
-#   provider-specific matches and falls straight through to the shared
-#   generic-transient table below. Provider tables are ordered case dispatch
+#   An unrecognized provider never errors — it simply has no provider-specific
+#   matches and falls straight through to the shared generic-transient table
+#   below. Provider tables are ordered case dispatch
 #   (sequential pattern checks), NOT associative-array iteration, so match
 #   order is always deterministic — bash does not guarantee iteration order
 #   for associative arrays.
@@ -86,7 +94,10 @@
 # selector/table shape — all six Claude-specific categories, in their
 # current documented order, are carried into the `claude` table below.
 #
-# Test vectors live in `defaults/scripts/tests/test-spawn-claude.sh`.
+# Test vectors: the `claude` table's live in
+# `defaults/scripts/tests/test-spawn-claude.sh`; the `codex` table's (plus the
+# cross-provider isolation checks that prove the claude vectors are unchanged)
+# live in `defaults/scripts/tests/test-spawn-codex.sh`.
 
 # shellcheck disable=SC2120  # OK that callers pass the args; we don't default.
 
@@ -161,15 +172,109 @@ _classify_error_claude() {
     # No Claude-specific pattern matched — fall through to the generic table.
 }
 
-# _classify_error_codex <output> -> stub for the future Codex runtime adapter
-# (#4167). Intentionally empty: upstream has no Codex runner yet, so there are
-# no real failure signatures to encode. Every input falls through to the
-# shared generic table below (rate-limit/5xx/network/catch-all), which is
-# already correct default behavior for an as-yet-unimplemented provider.
-# TODO(#4167): populate with Codex-specific failure signatures (401/quota/
-# rate-limit wording) when the Codex adapter ships. Do not guess at wording.
+# _classify_error_codex <output> -> echoes a category, or nothing if no
+# Codex-specific pattern matched (caller falls through to the generic table).
+# Only called when exit_code != 0.
+#
+# Provider table for the OpenAI Codex CLI adapter (`spawn-codex.sh`, epic #4167
+# Phase 2 / issue #4468). Ported from the gpeyton/loom fork's codex table by
+# Graham Peyton, then re-grounded against the real CLI: every phrase below was
+# either OBSERVED in `codex exec` output on codex-cli 0.146.0 (2026-07-29) or
+# extracted verbatim from that binary's own message strings. Nothing here is
+# guessed — where a category has no defensible Codex signature it is left
+# unimplemented and documented as such rather than filled with Claude wording.
+#
+# Match order and why:
+#   1. FATAL config faults    unambiguous, and they must not be retried.
+#   2. TOKEN_EXHAUSTED        BEFORE TOKEN_EXPIRED: OpenAI has served
+#                             `insufficient_quota` with a 401 status as well as
+#                             429, and mis-classifying a quota fault as an auth
+#                             fault is the expensive direction — TOKEN_EXPIRED
+#                             marks an account bad with reason `auth` (persists
+#                             until a manual `loom-tokens unblock`), whereas
+#                             TOKEN_EXHAUSTED uses reason `exhausted` (TTL-
+#                             expires on its own). Quota wording is also the
+#                             more specific signal, so letting it win is both
+#                             safer and more precise.
+#   3. TOKEN_EXPIRED          401 / not-signed-in / refresh-token failures.
+#
+# Deliberately NOT implemented for codex (documented, not forgotten):
+#   CWD_DELETED    No Codex-specific signature for "the workspace vanished
+#                  mid-run" is known. Claude's "current working directory was
+#                  deleted" phrasing is Claude-CLI-specific and is NOT reused.
+#   SESSION_LIMIT  Codex exposes no concurrent-session-cap error wording. A
+#                  bare 429 stays RECOVERABLE via the generic table, which is
+#                  the correct conservative behavior (retry, don't mark bad).
+#   MODEL_REFUSAL  The Responses API can emit a refusal content part, but the
+#                  Codex CLI has no stable surfaced wording for it, and a
+#                  refusal does not reliably produce a non-zero exit.
+#
+# Sandbox denials are deliberately absent — and that is a FINDING, not an
+# omission. A Codex sandbox denial is an in-session tool failure, not a process
+# failure: verified on 0.146.0 with `-s read-only`, a blocked `touch` returns
+# `Operation not permitted` to the model and the `codex exec` process still
+# exits **0**. Exit-code-first classification therefore never reaches this
+# table for a denial, and adding an "Operation not permitted" pattern here
+# would be dead code that could only ever fire as a false positive on some
+# unrelated non-zero exit. What IS classified below is a sandbox/trust fault
+# that genuinely aborts the run: the trusted-directory refusal, and Codex
+# failing to construct its sandbox at all. See
+# `defaults/docs/guardrail-parity-codex.md` for the full trust-boundary map.
 _classify_error_codex() {
-    :
+    local output="$1"
+
+    # --- FATAL: configuration faults that no retry can fix -----------------
+    # Observed verbatim on 0.146.0 when `codex exec` runs outside a git work
+    # tree: "Not inside a trusted directory and --skip-git-repo-check was not
+    # specified." (exit 1, on stderr). `spawn-codex.sh` injects
+    # --skip-git-repo-check when the cwd is genuinely not a work tree, so
+    # reaching this means something upstream mis-set the cwd — a retry loops.
+    #
+    # "unknown configuration field" is the CLI's own rejection of a bad
+    # `-c key=value` override (observed with --strict-config); also
+    # non-retryable.
+    #
+    # `landlock_sandbox_executable_not_provided` is Codex's internal error code
+    # (string present in the 0.146.0 binary) for being unable to construct its
+    # Linux sandbox — a host/config problem, not a transient one. Classifying
+    # it FATAL is the safe direction: a worker that cannot establish its
+    # sandbox must NOT be silently retried into running unsandboxed.
+    if echo "$output" | grep -qiE "not inside a trusted directory|unknown configuration field|landlock_sandbox_executable_not_provided"; then
+        echo "FATAL"
+        return
+    fi
+
+    # --- TOKEN_EXHAUSTED: plan/quota exhaustion — rotate, mark `exhausted` ---
+    # Strings taken verbatim from the 0.146.0 binary: "You've hit your usage
+    # limit.", "You've reached your usage limit.", "You've reached your
+    # workspace credit limit", "Your workspace is out of credits". Plus the
+    # documented OpenAI API error codes the CLI relays (`rate_limit_exceeded`,
+    # `insufficient_quota`, "exceeded your current quota").
+    # A BARE 429 with no quota wording is intentionally NOT matched here — it
+    # is a transient throttle and belongs to the generic RECOVERABLE table.
+    if echo "$output" | grep -qiE "hit your usage limit|reached your usage limit|usage limit reached|workspace credit limit|out of credits|insufficient_quota|rate_limit_exceeded|exceeded your current quota|quota exceeded"; then
+        echo "TOKEN_EXHAUSTED"
+        return
+    fi
+
+    # --- TOKEN_EXPIRED: this credential is bad — skip/re-auth this profile ---
+    # `401 Unauthorized` was OBSERVED end-to-end: pointing CODEX_HOME at an
+    # unauthenticated profile makes 0.146.0 emit
+    #   "failed to connect to websocket: HTTP error: 401 Unauthorized"
+    # and exit 1. The remaining phrases are verbatim binary strings for the
+    # ChatGPT-login/refresh-token failure modes a rotated `CODEX_HOME` profile
+    # actually hits: "Not signed in. Please run 'codex login'", "...refresh
+    # token has expired. Please log out and sign in again", "Your session has
+    # expired. Please reauthenticate.", "Failed to refresh token", "ChatGPT
+    # auth is missing a refresh token". `invalid_api_key` / "incorrect api key"
+    # cover the API-key (OPENAI_API_KEY) side.
+    if echo "$output" | grep -qiE "401[^a-z]*unauthorized|invalid_api_key|invalid api key|incorrect api key|not signed in|please run .?codex login|refresh token has expired|refresh token was (already used|revoked)|missing a refresh token|no refresh token available|failed to refresh token|session has expired|please reauthenticate"; then
+        echo "TOKEN_EXPIRED"
+        return
+    fi
+
+    # No Codex-specific pattern matched — fall through to the generic table
+    # (rate-limit/429, 5xx, network, catch-all RECOVERABLE).
 }
 
 # _classify_error_provider <output> <provider> -> dispatches to the matching

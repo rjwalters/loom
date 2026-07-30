@@ -669,6 +669,35 @@ impl StatsQueries for ActivityDb {
     fn get_stats_summary(&self) -> rusqlite::Result<StatsSummary> {
         stats::query_stats_summary(&self.conn)
     }
+
+    fn get_summary_metrics(
+        &self,
+        role: Option<&str>,
+        period: &str,
+    ) -> rusqlite::Result<stats::SummaryMetrics> {
+        stats::query_summary_metrics(&self.conn, role, period)
+    }
+
+    fn get_effectiveness_rows(
+        &self,
+        role: Option<&str>,
+        period: &str,
+        by_model: bool,
+    ) -> rusqlite::Result<Vec<stats::EffectivenessRow>> {
+        stats::query_effectiveness_rows(&self.conn, role, period, by_model)
+    }
+
+    fn get_cost_rows(
+        &self,
+        issue_number: Option<i32>,
+        by_model: bool,
+    ) -> rusqlite::Result<Vec<stats::CostRow>> {
+        stats::query_cost_rows(&self.conn, issue_number, by_model)
+    }
+
+    fn get_velocity_rows(&self) -> rusqlite::Result<Vec<stats::VelocityRow>> {
+        stats::query_velocity_rows(&self.conn)
+    }
 }
 
 #[cfg(test)]

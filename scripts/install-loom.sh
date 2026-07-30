@@ -1262,7 +1262,7 @@ fi
 echo ""
 
 # Set up Python tools (loom-tools package)
-# This creates a virtual environment in loom-tools/.venv and installs loom-status, loom-clean, etc.
+# This creates a virtual environment in loom-tools/.venv and installs loom-tokens, loom-claim, etc.
 info "Setting up Python tools..."
 if [[ -x "$LOOM_ROOT/scripts/install/setup-python-tools.sh" ]]; then
   if "$LOOM_ROOT/scripts/install/setup-python-tools.sh" --loom-root "$LOOM_ROOT"; then
@@ -1270,11 +1270,11 @@ if [[ -x "$LOOM_ROOT/scripts/install/setup-python-tools.sh" ]]; then
   else
     warning "Python tools setup failed (non-fatal for installation)"
     info "Run manually: $LOOM_ROOT/scripts/install/setup-python-tools.sh --loom-root $LOOM_ROOT"
-    info "Without Python tools, loom-status and some scripts will not work."
+    info "Without Python tools, loom-tokens and some scripts will not work."
   fi
 else
   warning "Python setup script not found"
-  info "Python tools (loom-status, loom-clean, etc.) may not be available."
+  info "Python tools (loom-tokens, loom-claim, etc.) may not be available."
 fi
 
 # Store Loom source repository path for wrapper scripts

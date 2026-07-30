@@ -465,6 +465,18 @@ export LOOM_WATCHDOG_LABEL="${LOOM_LAUNCHD_LABEL}-watchdog"
 # file, which would otherwise be the only thing catching a regression.
 export LOOM_DAEMON_BIN_DIR="$BASE_WORKDIR/machine-level-bin-sandbox"
 
+# Binary-format sanity gate bypass (#4397, deferred from #4381's incident
+# review): provision_machine_daemon now refuses to install anything that
+# isn't a real compiled binary (Mach-O/ELF — see _pmd_is_real_binary in
+# scripts/install/provision-daemon.sh). EVERY fake daemon binary this suite
+# writes (write_fake_daemon et al.) is a bash script standing in for the real
+# compiled binary, so THIS SUITE — and only this suite — sets the explicit,
+# auditable bypass suite-wide. Production callers (scripts/install-loom.sh,
+# defaults/scripts/cli/loom-daemon-update.sh) never set it; the gate itself is
+# exercised directly (both the reject-a-script and accept-a-real-binary
+# cases) by tests/install/test-provision-daemon.sh.
+export LOOM_PROVISION_ALLOW_SCRIPT=1
+
 # Suite-level decoy (#4078): a process whose argv ends in `/loom-daemon`, which
 # the stop script's label-blind `pgrep -f '(^|/)loom-daemon$'` fallback would
 # match. The whole update suite runs under a scratch LOOM_LAUNCHD_LABEL and

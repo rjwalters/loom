@@ -22,6 +22,22 @@
 //! the final claim (a real cross-host CAS) is **Phase 2**, out of scope here — see
 //! #4028's "Design options for the atomic authority" section.
 //!
+//! # Primary in-flight signal on safehouse hosts (#4431)
+//!
+//! Since #4431 the peer claim is the **primary fast signal** that an issue is
+//! in flight on a safehouse-enabled fleet: the forge `loom:building` label
+//! remains the durable audit trail, but its reconciliation pass demotes to a
+//! slow healing cadence
+//! ([`crate::claim_reconciliation::DEFAULT_SAFEHOUSE_RECONCILE_INTERVAL_SECS`]).
+//! The contract that makes this safe is **re-advertisement**: the dispatch-time
+//! ad is no longer one-shot — `sweep_registry::readvertise_peer_claims`
+//! re-publishes every live sweep's claim each reaper tick (default 30s, well
+//! under the TTL), and [`PeerClaimView::observe_at`] refreshes the local
+//! expiry clock on every repeat `Advertise`. A live claim therefore never
+//! expires from peers' views mid-run, while a crashed host's claims still free
+//! within one TTL of its last heartbeat — the promotion changes how *long* a
+//! claim stays visible, not the "soft, eventually-consistent" nature above.
+//!
 //! # TTL is measured against LOCAL receipt, never the advertiser's clock
 //!
 //! A crashed peer must not starve an issue forever, so every peer claim expires
@@ -487,6 +503,32 @@ mod tests {
         // At/after the TTL: expired.
         assert!(!view.is_claimed_at("loom", 1, base + Duration::from_secs(100)));
         assert!(!view.is_claimed_at("loom", 1, base + Duration::from_secs(101)));
+    }
+
+    /// #4431 crux: a repeat `Advertise` for the same (repo, issue) must
+    /// refresh the local expiry clock, so a claim re-advertised by the
+    /// holder's reaper heartbeat survives arbitrarily far past the original
+    /// TTL — while still expiring one TTL after the LAST heartbeat (the
+    /// crash-release property).
+    #[test]
+    fn readvertisement_refreshes_ttl_so_a_live_claim_never_expires_mid_run() {
+        let ttl = Duration::from_secs(120);
+        let mut view = PeerClaimView::new("me".into(), ttl);
+        let base = Instant::now();
+        view.observe_at(&ad(ClaimKind::Advertise, 7, "loom", "peer"), base);
+
+        // Re-advertised at t+90 (inside the window): the clock restarts.
+        view.observe_at(
+            &ad(ClaimKind::Advertise, 7, "loom", "peer"),
+            base + Duration::from_secs(90),
+        );
+        // t+150 is past the ORIGINAL expiry (t+120) but inside the refreshed
+        // window (t+90 + 120 = t+210): still claimed.
+        assert!(view.is_claimed_at("loom", 7, base + Duration::from_secs(150)));
+        assert!(view.is_claimed_at("loom", 7, base + Duration::from_secs(209)));
+        // One TTL after the LAST heartbeat: expired — a crashed holder still
+        // frees the issue promptly.
+        assert!(!view.is_claimed_at("loom", 7, base + Duration::from_secs(210)));
     }
 
     #[test]
