@@ -271,6 +271,13 @@ as `token_fidelity: sweep-aggregate-log | none`). The provider-aware account poo
 profile rotation) is the fork's shipped work (fork PRs #12/#17) and is the
 consumer of these signals.
 
+Loom's native account foundation separates lifecycle from policy:
+`loom-daemon accounts` securely creates, imports, inspects, disables,
+reauthenticates, quarantines, and purges named Codex profiles, while automatic
+ranking/rotation remains deferred to #4493. The lifecycle CLI treats
+`auth.json` as opaque mutable canonical state, enforces `0700`/`0600`
+permissions, and emits only bounded secret-free diagnostics.
+
 ### 5. Instruction format
 
 **Contract:** declare which instruction files the runtime reads, and generate

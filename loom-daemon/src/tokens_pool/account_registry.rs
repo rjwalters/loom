@@ -110,7 +110,7 @@ impl SelectedAccount {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RegistryFile {
     #[serde(default = "registry_version")]
@@ -122,7 +122,7 @@ const fn registry_version() -> u32 {
     1
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RegistryEntry {
     provider: AccountProvider,
@@ -137,7 +137,7 @@ const fn default_enabled() -> bool {
     true
 }
 
-fn validate_name(name: &str) -> Result<()> {
+pub(crate) fn validate_name(name: &str) -> Result<()> {
     let path = Path::new(name);
     if name.is_empty()
         || path.is_absolute()
@@ -148,6 +148,72 @@ fn validate_name(name: &str) -> Result<()> {
         bail!("invalid account name {name:?}: expected one relative path component");
     }
     Ok(())
+}
+
+fn write_repo_registry(workspace: &Path, entries: Vec<RegistryEntry>) -> Result<()> {
+    let path = per_repo_accounts_file(workspace);
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("account registry has no parent directory"))?;
+    std::fs::create_dir_all(parent).context("failed to create account registry directory")?;
+    let file = RegistryFile {
+        version: registry_version(),
+        accounts: entries,
+    };
+    let bytes = serde_json::to_vec_pretty(&file)?;
+    let temp = parent.join(format!(".accounts.json.tmp-{}", std::process::id()));
+    std::fs::write(&temp, bytes).context("failed to stage account registry update")?;
+    std::fs::rename(&temp, &path).context("failed to commit account registry update")?;
+    Ok(())
+}
+
+pub(crate) fn register_codex_account(
+    workspace: &Path,
+    name: &str,
+    credential_reference: &str,
+    enabled: bool,
+) -> Result<()> {
+    validate_name(name)?;
+    validate_name(credential_reference)?;
+    let mut entries = read_repo_registry(workspace)?.unwrap_or_default();
+    if entries
+        .iter()
+        .any(|entry| entry.provider == AccountProvider::Codex && entry.name == name)
+    {
+        bail!("Codex account {name:?} already exists");
+    }
+    entries.push(RegistryEntry {
+        provider: AccountProvider::Codex,
+        name: name.to_string(),
+        credential_kind: CredentialKind::CodexHome,
+        credential_reference: credential_reference.to_string(),
+        enabled,
+    });
+    write_repo_registry(workspace, entries)
+}
+
+pub(crate) fn set_codex_account_enabled(workspace: &Path, name: &str, enabled: bool) -> Result<()> {
+    validate_name(name)?;
+    let mut entries = read_repo_registry(workspace)?
+        .ok_or_else(|| anyhow!("Codex account {name:?} does not exist"))?;
+    let entry = entries
+        .iter_mut()
+        .find(|entry| entry.provider == AccountProvider::Codex && entry.name == name)
+        .ok_or_else(|| anyhow!("Codex account {name:?} does not exist"))?;
+    entry.enabled = enabled;
+    write_repo_registry(workspace, entries)
+}
+
+pub(crate) fn unregister_codex_account(workspace: &Path, name: &str) -> Result<()> {
+    validate_name(name)?;
+    let mut entries = read_repo_registry(workspace)?
+        .ok_or_else(|| anyhow!("Codex account {name:?} does not exist"))?;
+    let before = entries.len();
+    entries.retain(|entry| !(entry.provider == AccountProvider::Codex && entry.name == name));
+    if entries.len() == before {
+        bail!("Codex account {name:?} does not exist");
+    }
+    write_repo_registry(workspace, entries)
 }
 
 fn validate_codex_directory(root: &Path, reference: &str) -> Result<PathBuf> {
