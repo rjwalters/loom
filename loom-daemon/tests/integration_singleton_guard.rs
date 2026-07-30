@@ -20,6 +20,12 @@ fn setup() {
     cleanup_all_loom_sessions();
 }
 
+/// How long to wait for a second daemon to notice the incumbent and exit.
+///
+/// See the call site for why this is sized as a liveness bound rather than a
+/// latency assertion.
+const DAEMON_REFUSAL_WAIT: Duration = Duration::from_secs(60);
+
 /// Spawn a raw `loom-daemon` process pointed at `socket_path`, wait up to
 /// `wait` for it to exit, and return its exit status (or `None` if still
 /// running when the wait elapses). Captures no output beyond piping it away.
@@ -67,9 +73,17 @@ async fn test_second_daemon_refuses_and_first_survives() {
         client.ping().await.expect("A ping before second daemon");
     }
 
-    // Attempt a second daemon on the SAME socket. It should refuse quickly
-    // (the liveness probe is ~500ms) and exit non-zero.
-    let (mut child, exited) = spawn_daemon_and_wait(&socket_path, Duration::from_secs(10));
+    // Attempt a second daemon on the SAME socket. It must refuse and exit
+    // non-zero.
+    //
+    // The bound is deliberately generous. The singleton guard's liveness probe
+    // itself is ~500ms, but it runs *after* the rest of daemon startup, and a
+    // 10s bound failed deterministically on a loaded 8-core host where spawn to
+    // refusal measured ~15s (#4385). The poll loop below returns as soon as the
+    // child exits, so a large bound costs nothing on a passing run — it only
+    // stops a saturated machine from turning a liveness check into a latency
+    // assertion.
+    let (mut child, exited) = spawn_daemon_and_wait(&socket_path, DAEMON_REFUSAL_WAIT);
     assert!(exited, "second daemon should exit promptly after refusing to start");
     let status = child.wait().expect("wait on second daemon");
     assert!(
