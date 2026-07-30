@@ -235,6 +235,36 @@ impl std::fmt::Display for DispatchBackoffError {
 
 impl std::error::Error for DispatchBackoffError {}
 
+/// Three-state result of the open-linked-PR probe (Issue #4452), replacing the
+/// old `Option<u32>` that conflated a *verified* "no open linked PR" with a
+/// *probe failure* (missing/failed/timed-out `gh`, unresolvable repo, non-zero
+/// exit, unparseable output). Distinguishing the two matters because the probe's
+/// consumers have **opposite** failure stakes:
+///
+/// - The #4123 open-PR **dispatch guard** must fail *open* — a forge outage must
+///   never wedge dispatch — so it treats both [`OpenPrProbe::NoneOpen`] and
+///   [`OpenPrProbe::ProbeFailed`] as "proceed" (only a verified `Open` blocks).
+/// - The #4366 **no-progress predicate** must also fail open, but in the
+///   *opposite* direction: a probe failure must NOT let a benign self-skip count
+///   as a failed attempt, so it counts ONLY a verified [`OpenPrProbe::NoneOpen`]
+///   toward `no_progress`, treating [`OpenPrProbe::ProbeFailed`] as "unverified,
+///   don't punish".
+///
+/// The old `Option<u32>` collapsed `ProbeFailed` into `None`, so a PARTIAL forge
+/// outage (PR probe fails while the issue probe answers OPEN) could still accrue
+/// wrongful quarantine pressure via the no-progress predicate. The enum makes it
+/// impossible to silently re-conflate the two at a call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenPrProbe {
+    /// Verified: at least one *open* linked PR exists (carries its number).
+    Open(u32),
+    /// Verified: the forge answered and there is no open linked PR.
+    NoneOpen,
+    /// The probe could not produce a verdict — `gh` missing/failed/timed out,
+    /// repo unresolvable, non-zero exit, or unparseable output.
+    ProbeFailed,
+}
+
 /// Issue #4256: checkpoint phases at/after Builder completion. A crash whose
 /// checkpoint reads one of these means a PR was opened for the issue, so
 /// [`SweepRegistry::reap_once`]'s reaper-driven resume is eligible to
@@ -3303,7 +3333,10 @@ impl SweepRegistry {
         //     would find; any other PR (or none) still refuses normally, so a
         //     stale/mismatched resume can never widen into a blanket bypass.
         if !self.config.skip_label_flip {
-            if let Some(pr) = self.first_open_linked_pr(issue_number) {
+            // Fail-open (#4452): only a VERIFIED `Open(pr)` blocks; both
+            // `NoneOpen` and `ProbeFailed` fall through and proceed, so a forge
+            // outage can never wedge dispatch (unchanged pre-#4452 behavior).
+            if let OpenPrProbe::Open(pr) = self.probe_open_linked_pr(issue_number) {
                 if resume_bypass_pr != Some(pr) {
                     return Err(OpenPrDispatchError {
                         issue: issue_number,
@@ -3952,15 +3985,21 @@ impl SweepRegistry {
 
     /// Best-effort probe for an **open** pull request linked to `issue` via
     /// GitHub's authoritative closes-graph (`closedByPullRequestsReferences`),
-    /// used by the #4123 open-PR dispatch guard. Returns `Some(pr_number)` when
-    /// at least one *open* linked PR exists, and `None` otherwise — where `None`
-    /// covers BOTH "no open PR" and any failure (missing/failed/timed-out `gh`,
-    /// unresolvable repo, unparseable output).
+    /// used by the #4123 open-PR dispatch guard, the #4366 no-progress predicate,
+    /// and the #4256 crash-resume path. Returns an [`OpenPrProbe`] that
+    /// distinguishes three states (Issue #4452): [`OpenPrProbe::Open`] (verified:
+    /// at least one open linked PR), [`OpenPrProbe::NoneOpen`] (verified: the
+    /// forge answered, no open linked PR), and [`OpenPrProbe::ProbeFailed`] (the
+    /// probe could not produce a verdict — missing/failed/timed-out `gh`,
+    /// unresolvable repo, non-zero exit, or unparseable output).
     ///
-    /// Callers MUST treat `None` as **fail-open** — a forge outage or a wedged
-    /// `gh` must never wedge dispatch. This mirrors [`issue_is_closed_or_pr`]'s `None`
-    /// contract and is bounded by [`reap_gh_timeout`] exactly like the label
-    /// flips so it cannot block the dispatch path.
+    /// The per-variant fail-open contract is documented on [`OpenPrProbe`]: the
+    /// dispatch guard treats `NoneOpen` **and** `ProbeFailed` as "proceed" (a
+    /// forge outage or wedged `gh` must never wedge dispatch), while the
+    /// no-progress predicate counts ONLY `NoneOpen` toward a failed attempt so a
+    /// probe failure never manufactures quarantine pressure. Bounded by
+    /// [`reap_gh_timeout`] exactly like the label flips so it cannot block the
+    /// dispatch path.
     ///
     /// Filtering is on the node `state == "OPEN"` in the `--jq`, NOT on the
     /// GraphQL `includeClosedPrs:false` flag alone: live testing showed a
@@ -3970,8 +4009,13 @@ impl SweepRegistry {
     /// merged. The `state == "OPEN"` filter is the load-bearing one; the flag is
     /// kept only to trim the payload. This uses the forge's closes-link graph,
     /// not `Closes #N` body-parsing. GitHub-only, like the helper above it.
-    fn first_open_linked_pr(&self, issue: u32) -> Option<u32> {
-        let (owner, repo) = self.resolve_owner_repo()?;
+    fn probe_open_linked_pr(&self, issue: u32) -> OpenPrProbe {
+        // Repo resolution failure is a PROBE FAILURE, not a verified absence
+        // (#4452) — collapsing it into `NoneOpen` would let a partial outage
+        // wrongly count a benign self-skip toward quarantine.
+        let Some((owner, repo)) = self.resolve_owner_repo() else {
+            return OpenPrProbe::ProbeFailed;
+        };
         let gh = self
             .config
             .gh_bin
@@ -4001,14 +4045,28 @@ impl SweepRegistry {
         // Resolve against this registry's own workspace, matching the label-flip
         // helpers and `issue_is_closed_or_pr` (#3937).
         cmd.current_dir(&self.config.workspace_root);
-        let output = output_with_timeout(cmd, reap_gh_timeout()).ok()??;
+        // A spawn error or timeout is a PROBE FAILURE (#4452).
+        let Some(output) = output_with_timeout(cmd, reap_gh_timeout()).ok().flatten() else {
+            return OpenPrProbe::ProbeFailed;
+        };
+        // A non-zero `gh` exit (rate limit, auth failure, transient forge error)
+        // is a PROBE FAILURE, not a verified "no open PR".
         if !output.status.success() {
-            return None;
+            return OpenPrProbe::ProbeFailed;
         }
-        // The `--jq` emits one open PR number per line; take the first.
-        String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .find_map(|l| l.trim().parse::<u32>().ok())
+        // On success the `--jq` emits one open PR number per line, or nothing at
+        // all when there is no open linked PR. An EMPTY stdout is therefore a
+        // verified `NoneOpen`. Non-empty stdout should be all PR numbers — take
+        // the first that parses; if NOTHING parses, the output is malformed (a
+        // truncated/garbled response), which is a PROBE FAILURE, not an absence.
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if stdout.trim().is_empty() {
+            return OpenPrProbe::NoneOpen;
+        }
+        match stdout.lines().find_map(|l| l.trim().parse::<u32>().ok()) {
+            Some(pr) => OpenPrProbe::Open(pr),
+            None => OpenPrProbe::ProbeFailed,
+        }
     }
 
     /// Best-effort probe for the first [`PARK_LABELS`] entry currently on
@@ -4019,9 +4077,9 @@ impl SweepRegistry {
     ///
     /// Callers MUST treat `None` as **fail-open**, matching
     /// [`issue_is_closed_or_pr`](Self::issue_is_closed_or_pr) and
-    /// [`first_open_linked_pr`](Self::first_open_linked_pr): a forge outage or a
-    /// wedged `gh` must never wedge dispatch. Bounded by [`reap_gh_timeout`] like
-    /// every other dispatch-path `gh` call (#3973).
+    /// [`probe_open_linked_pr`](Self::probe_open_linked_pr)'s `ProbeFailed`: a
+    /// forge outage or a wedged `gh` must never wedge dispatch. Bounded by
+    /// [`reap_gh_timeout`] like every other dispatch-path `gh` call (#3973).
     ///
     /// Deliberately probes over **REST** (`gh api repos/{owner}/{repo}/issues/N`)
     /// rather than `gh issue view --json labels` (which rides GraphQL, like
@@ -5688,7 +5746,13 @@ impl SweepRegistry {
                                     .as_deref()
                                     .is_some_and(|p| RESUMABLE_CHECKPOINT_PHASES.contains(&p))
                             {
-                                if let Some(pr) = self.first_open_linked_pr(issue) {
+                                // Fail-open (#4452): only a VERIFIED `Open(pr)`
+                                // is eligible for the bounded resume path; both
+                                // `NoneOpen` and `ProbeFailed` fall through to
+                                // ordinary handling (unchanged pre-#4452
+                                // behavior — a probe failure never triggers a
+                                // resume dispatch).
+                                if let OpenPrProbe::Open(pr) = self.probe_open_linked_pr(issue) {
                                     // Bounded resume attempts (#4256, Judge
                                     // residual-risk backstop): the resume path
                                     // bypasses the #4123 open-PR guard, so a sweep
@@ -5823,30 +5887,34 @@ impl SweepRegistry {
                             // `false` (byte-identical to pre-#4366 behavior)
                             // whenever label-flipping itself is disabled.
                             //
-                            // Both forge probes below are documented FAIL-OPEN
-                            // (`None` == "probe failed, don't punish"), so the
-                            // issue-state arm demands a POSITIVE "the issue is
-                            // open" verdict (`== Some(false)`) rather than the
-                            // weaker `!= Some(true)`: a timed-out / rate-limited
-                            // `gh` probe returns `None`, and `None != Some(true)`
-                            // would have been *satisfied*, turning a benign
-                            // self-skip into a counted failed attempt and
-                            // wrongly quarantining an issue during a forge
-                            // outage. With `== Some(false)`, a full forge outage
-                            // (both probes `None`) yields `no_progress == false`
-                            // — the pre-#4366 behavior — so an outage can never
-                            // manufacture quarantine pressure.
+                            // Both forge probes below are FAIL-OPEN, so each arm
+                            // demands a POSITIVE verdict rather than accepting the
+                            // "probe failed" state:
                             //
-                            // KNOWN LIMITATION: `first_open_linked_pr` returns
-                            // `Option<u32>`, which conflates "no open linked PR"
-                            // with "the PR probe itself failed", so a PARTIAL
-                            // outage (PR probe fails, issue probe succeeds and
-                            // says open) can still false-positive. Widening that
-                            // return type to distinguish the two is tracked in
-                            // issue #4452.
+                            // - The issue-state arm demands `== Some(false)` ("the
+                            //   issue is verifiably OPEN") rather than the weaker
+                            //   `!= Some(true)`: a timed-out / rate-limited `gh`
+                            //   probe returns `None`, and `None != Some(true)`
+                            //   would have been *satisfied*, turning a benign
+                            //   self-skip into a counted failed attempt and
+                            //   wrongly quarantining an issue during a forge
+                            //   outage.
+                            // - The open-PR arm (#4452) demands a VERIFIED
+                            //   `OpenPrProbe::NoneOpen` rather than the old
+                            //   `Option::is_none()`, which conflated "no open
+                            //   linked PR" with "the PR probe itself failed". That
+                            //   conflation meant a PARTIAL outage (PR probe fails
+                            //   while the issue probe answers OPEN) could still
+                            //   false-positive; matching `NoneOpen` closes that
+                            //   gap — a `ProbeFailed` yields `no_progress = false`.
+                            //
+                            // Consequently a probe failure on EITHER arm — and a
+                            // fortiori a full forge outage — yields
+                            // `no_progress == false` (the pre-#4366 behavior), so
+                            // an outage can never manufacture quarantine pressure.
                             let no_progress = !self.config.skip_label_flip
                                 && exit_code == Some(0)
-                                && self.first_open_linked_pr(issue).is_none()
+                                && self.probe_open_linked_pr(issue) == OpenPrProbe::NoneOpen
                                 && self.issue_is_closed_or_pr(issue) == Some(false);
                             // Insta-crash quarantine (#3939): a checkpoint-less
                             // death inside the insta-crash window that did NOT
@@ -8728,6 +8796,138 @@ exit 0
         assert!(
             !registry.is_quarantined(43_665),
             "3 consecutive probe-failure clean exits must not quarantine the issue"
+        );
+    }
+
+    /// Like [`no_progress_test_registry`], but the `api graphql` (open-linked-PR)
+    /// probe exits non-zero — simulating a PARTIAL forge outage where the PR
+    /// probe fails while `issue view` still answers (`issue_state`). Used by the
+    /// #4452 regression: the old `Option<u32>` probe collapsed this failure into
+    /// `None` (indistinguishable from a verified "no open PR"), so the
+    /// no-progress predicate's `is_none()` was satisfied and a benign self-skip
+    /// wrongly accrued toward quarantine.
+    fn no_progress_pr_probe_fail_registry(ws: &Path, issue_state: &str) -> SweepRegistry {
+        let fake_gh = ws.join("fake-gh-pr-probe-fail.sh");
+        let script = format!(
+            "#!/usr/bin/env bash\n\
+             if [[ \"$1\" == \"issue\" && \"$2\" == \"view\" ]]; then\n\
+             printf '%s\\n' \"{state}\"\n\
+             exit 0\n\
+             fi\n\
+             if [[ \"$1\" == \"api\" && \"$2\" == \"graphql\" ]]; then\n\
+             printf 'gh: rate limit exceeded\\n' >&2\n\
+             exit 1\n\
+             fi\n\
+             if [[ \"$1\" == \"repo\" && \"$2\" == \"view\" ]]; then\n\
+             printf 'rjwalters/loom\\n'\n\
+             exit 0\n\
+             fi\n\
+             exit 0\n",
+            state = issue_state,
+        );
+        std::fs::write(&fake_gh, &script).unwrap();
+        let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_gh, perms).unwrap();
+        if let Ok(f) = std::fs::File::open(&fake_gh) {
+            let _ = f.sync_all();
+        }
+
+        let scripts_dir = ws.join(".loom").join("scripts");
+        std::fs::create_dir_all(&scripts_dir).unwrap();
+        let spawn = scripts_dir.join("spawn-claude.sh");
+        std::fs::write(&spawn, "#!/usr/bin/env bash\necho spawned\nexit 0\n").unwrap();
+        let mut sperms = std::fs::metadata(&spawn).unwrap().permissions();
+        sperms.set_mode(0o755);
+        std::fs::set_permissions(&spawn, sperms).unwrap();
+        if let Ok(f) = std::fs::File::open(&spawn) {
+            let _ = f.sync_all();
+        }
+
+        let mut config = SweepRegistryConfig::new(ws.to_path_buf());
+        config.spawn_bin = Some(spawn);
+        config.gh_bin = Some(fake_gh);
+        config.skip_label_flip = false;
+        config.journal_path = Some(ws.join("test-sweeps-journal.json"));
+        SweepRegistry::new(config)
+    }
+
+    /// #4452 regression: a PARTIAL forge outage — the open-linked-PR probe fails
+    /// (`api graphql` exits non-zero) while `issue view` still answers OPEN —
+    /// must NOT count a clean exit toward quarantine. The old `Option<u32>`
+    /// return conflated "the PR probe failed" with "verified no open PR", so
+    /// `first_open_linked_pr(issue).is_none()` was satisfied and the predicate
+    /// wrongly fired. With the three-state [`OpenPrProbe`], the predicate now
+    /// requires a VERIFIED `NoneOpen`, so a `ProbeFailed` yields
+    /// `no_progress == false`. Three consecutive clean exits under this
+    /// condition — enough to trip the threshold if any counted — must leave the
+    /// tally at 0 and the issue un-quarantined.
+    #[test]
+    fn reaper_pr_probe_failure_with_open_issue_fails_open_and_does_not_count() {
+        let dir = tempdir().unwrap();
+        let mut registry = no_progress_pr_probe_fail_registry(dir.path(), "OPEN");
+        assert_eq!(registry.quarantine_config().threshold, 3);
+
+        for seq in 0..3 {
+            insert_clean_exit_running(&mut registry, 43_666, seq);
+            let changed = registry.reap_once();
+            assert!(changed >= 1, "reap_once should observe the dead fixture child");
+        }
+
+        assert_eq!(
+            registry.insta_crash_count(43_666),
+            0,
+            "a PR-probe failure (partial outage) with the issue still OPEN must fail open — a \
+             clean exit must never accrue toward quarantine (#4452)"
+        );
+        assert!(
+            !registry.is_quarantined(43_666),
+            "3 consecutive PR-probe-failure clean exits must not quarantine the issue (#4452)"
+        );
+    }
+
+    /// #4452 unit coverage: the three-state probe distinguishes a VERIFIED
+    /// "no open PR" (empty `graphql` stdout, exit 0) from a PROBE FAILURE
+    /// (`graphql` exits non-zero), where the old `Option<u32>` returned `None`
+    /// for both. Also covers the `Open` verdict and the unparseable-stdout leg.
+    #[test]
+    fn probe_open_linked_pr_distinguishes_none_open_from_probe_failure() {
+        // Verified no open PR: gh succeeds with empty stdout.
+        let dir = tempdir().unwrap();
+        let reg = no_progress_test_registry(dir.path(), "OPEN", "", false);
+        assert_eq!(
+            reg.probe_open_linked_pr(9001),
+            OpenPrProbe::NoneOpen,
+            "empty successful graphql output is a VERIFIED absence"
+        );
+
+        // Verified open PR: gh succeeds and prints a PR number.
+        let dir = tempdir().unwrap();
+        let reg = no_progress_test_registry(dir.path(), "OPEN", "9100", false);
+        assert_eq!(
+            reg.probe_open_linked_pr(9002),
+            OpenPrProbe::Open(9100),
+            "a parseable PR number is a VERIFIED open PR"
+        );
+
+        // Probe failure: gh api graphql exits non-zero.
+        let dir = tempdir().unwrap();
+        let reg = no_progress_pr_probe_fail_registry(dir.path(), "OPEN");
+        assert_eq!(
+            reg.probe_open_linked_pr(9003),
+            OpenPrProbe::ProbeFailed,
+            "a non-zero graphql exit is a PROBE FAILURE, not a verified absence"
+        );
+
+        // Probe failure: gh exits 0 but stdout is wholly unparseable (a
+        // truncated/garbled response), which must NOT be read as a verified
+        // absence.
+        let dir = tempdir().unwrap();
+        let reg = no_progress_test_registry(dir.path(), "OPEN", "not-a-number", false);
+        assert_eq!(
+            reg.probe_open_linked_pr(9004),
+            OpenPrProbe::ProbeFailed,
+            "unparseable non-empty stdout is a PROBE FAILURE (#4452)"
         );
     }
 
@@ -16130,7 +16330,7 @@ exit 0\n";
         let tmp = tempdir().unwrap();
         let ws = tmp.path();
         std::env::set_var("LOOM_REPO", "rjwalters/loom");
-        // graphql returns a PR ⇒ `first_open_linked_pr` WOULD report one, so the
+        // graphql returns a PR ⇒ `probe_open_linked_pr` WOULD report one, so the
         // ONLY thing that can prevent a resume dispatch is the #4463 gate.
         let (mut reg, gh_log) = open_pr_guard_registry(ws, "9300", 0, false);
 
@@ -16202,7 +16402,7 @@ exit 0\n";
     }
 
     /// AC (Test Plan item 3): a crashed sweep whose checkpoint is
-    /// `curator-done` (pre-PR) is NOT resumed even though `first_open_linked_pr`
+    /// `curator-done` (pre-PR) is NOT resumed even though `probe_open_linked_pr`
     /// would report one — resume is gated on a Builder-or-later checkpoint
     /// phase, and a pre-PR crash gets ONLY the normal crash handling.
     #[tokio::test]
@@ -16246,8 +16446,8 @@ exit 0\n";
     }
 
     /// Edge case (Test Plan item 4): the crashed sweep's PR already
-    /// merged/closed by the time the reaper ticks — `first_open_linked_pr`
-    /// returns `None` (empty post-`--jq` output), so no resume is attempted
+    /// merged/closed by the time the reaper ticks — `probe_open_linked_pr`
+    /// returns `NoneOpen` (empty post-`--jq` output), so no resume is attempted
     /// and no error surfaces; only the normal crash handling fires.
     #[tokio::test]
     #[serial]
