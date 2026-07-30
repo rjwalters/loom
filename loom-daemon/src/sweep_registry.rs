@@ -63,7 +63,7 @@ use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -202,6 +202,38 @@ impl std::fmt::Display for ParkedIssueDispatchError {
 }
 
 impl std::error::Error for ParkedIssueDispatchError {}
+
+/// Typed, matchable error returned by [`SweepRegistry::dispatch`] when the
+/// per-issue dispatch backoff (Issue #4485, step 2.8) refuses a dispatch
+/// because this issue's previous dispatch failed and its backoff window has
+/// not elapsed yet.
+///
+/// Distinct, downcast-matchable type — same rationale as
+/// [`OpenPrDispatchError`]: a backoff refusal is a *deliberate skip*, not a
+/// dispatch failure, so the work-finder attributes it to its own
+/// `backoff-skip` counter instead of the generic error tally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DispatchBackoffError {
+    /// The issue whose dispatch was refused.
+    pub issue: u32,
+    /// Consecutive failed dispatch attempts recorded for this issue.
+    pub consecutive: u32,
+    /// Whole seconds remaining before the next attempt is allowed.
+    pub retry_after_secs: u64,
+}
+
+impl std::fmt::Display for DispatchBackoffError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "refusing to dispatch issue #{}: its last {} dispatch attempt(s) failed fast; \
+             backing off for another {}s (#4485 dispatch backoff)",
+            self.issue, self.consecutive, self.retry_after_secs
+        )
+    }
+}
+
+impl std::error::Error for DispatchBackoffError {}
 
 /// Issue #4256: checkpoint phases at/after Builder completion. A crash whose
 /// checkpoint reads one of these means a PR was opened for the issue, so
@@ -864,6 +896,220 @@ pub fn resolve_preflight_tripwire_config(repo_root: &Path) -> PreflightTripwireC
         .or_else(|| read_preflight_tripwire_file_threshold(repo_root))
         .unwrap_or(DEFAULT_PREFLIGHT_TRIPWIRE_THRESHOLD);
     PreflightTripwireConfig { threshold }
+}
+
+// ============================================================================
+// Per-issue dispatch backoff / flap circuit breaker (Issue #4485)
+// ============================================================================
+//
+// The insta-crash quarantine above (#3939) is the only brake on re-dispatching
+// a failing issue, and it is a *three-strikes* brake with two deliberate
+// carve-outs: an account-exhaustion death (#4122) and a claude-wrapper
+// pre-flight death (#4386) both leave the per-issue tally **untouched** on
+// purpose (the issue is not at fault). Nothing else limits how *often* one
+// issue may be re-dispatched: `reap_once` restores `loom:building` ->
+// `loom:issue` the moment the child dies and the issue "re-qualifies on the
+// next work-finder poll" (see the module comment at the quarantine section) —
+// a documented no-backoff loop.
+//
+// The observed consequence (#4485) was ~90 `loom:issue`/`loom:building` label
+// events on one issue in ~7 minutes: every dispatch's child died ~4s in, the
+// claim was restored ~1s later, and the next tick re-dispatched it. Because
+// every strike fell into a carve-out (or landed on a *different* daemon
+// process's in-memory tally — quarantine state is per-process and never
+// shared), the 3-strike quarantine did not engage for over 20 cycles.
+//
+// This backoff closes that gap from the other direction: instead of asking
+// *why* a dispatch failed, it caps *how often* a failing issue may be
+// re-attempted at all. A fast (sub-`insta_crash_secs`) or zero-progress
+// terminal outcome — including the two quarantine carve-outs — records a
+// failure and pushes the issue's next-allowed dispatch instant out
+// exponentially (base, 2x, 4x, …, capped). Any outcome that made real progress
+// clears the entry immediately.
+//
+// Deliberately **narrow and fail-open**:
+//
+// - In-memory only, per registry: a daemon restart clears it, so it can never
+//   permanently strand an issue.
+// - Never touches a forge label (so the breaker itself cannot flap anything)
+//   and costs zero API calls.
+// - Bounded by `max`, and the consecutive tally restarts from scratch when the
+//   previous failure is older than `max` (an issue that fails once a day never
+//   accretes toward a long backoff).
+// - Exempts the bounded one-shot recovery paths — the reaper-driven resume
+//   (#4256, capped by `MAX_RESUME_ATTEMPTS`) and the three watchdogs (#3887 /
+//   #3895 / #3910, each latched to a single retry per issue) — so a refusal can
+//   never burn a recovery attempt that is already rate-limited by its own latch.
+
+/// Env var toggling the per-issue dispatch backoff (Issue #4485).
+/// `0`/`false`/`no`/`off` disables; `1`/`true`/`yes`/`on` forces on. Overrides
+/// config. Defaults ON — like quarantine it is a safety backstop, and unlike
+/// quarantine it never blocks an issue for longer than
+/// [`DispatchBackoffConfig::max`].
+pub const DISPATCH_BACKOFF_ENABLE_ENV: &str = "LOOM_DISPATCH_BACKOFF";
+
+/// Env var overriding the first-failure backoff delay, in seconds (Issue
+/// #4485). A zero/invalid value falls through to config/default.
+pub const DISPATCH_BACKOFF_BASE_ENV: &str = "LOOM_DISPATCH_BACKOFF_BASE_SECS";
+
+/// Env var overriding the maximum backoff delay, in seconds (Issue #4485). A
+/// zero/invalid value falls through to config/default.
+pub const DISPATCH_BACKOFF_MAX_ENV: &str = "LOOM_DISPATCH_BACKOFF_MAX_SECS";
+
+/// Default first-failure backoff delay (#4485): one work-finder tick
+/// ([`crate::work_finder::DEFAULT_WORK_FINDER_INTERVAL_SECS`]). A single
+/// failed dispatch therefore costs at most one extra tick of latency, while a
+/// repeatedly-failing issue doubles away from the tick cadence instead of
+/// flapping its label on every poll.
+pub const DEFAULT_DISPATCH_BACKOFF_BASE_SECS: u64 = 60;
+
+/// Default maximum backoff delay (#4485). Reached after 5 consecutive failures
+/// (60s → 120 → 240 → 480 → 900). Well under the quarantine TTL
+/// ([`DEFAULT_QUARANTINE_TTL_SECS`]), so on an issue that IS quarantine-eligible
+/// the quarantine remains the longer, louder, operator-visible brake and this
+/// only smooths the ramp toward it.
+pub const DEFAULT_DISPATCH_BACKOFF_MAX_SECS: u64 = 900;
+
+/// Default label-flip flap window (#4485): the trailing window over which
+/// [`SweepRegistry`] counts its own `loom:issue` <-> `loom:building` writes for
+/// one issue.
+pub const DEFAULT_FLAP_WINDOW_SECS: i64 = 300;
+
+/// Default label-flip flap threshold (#4485): this many of *this registry's*
+/// own label writes for one issue inside [`DEFAULT_FLAP_WINDOW_SECS`] logs a
+/// loud warning. A healthy sweep writes exactly 2 (claim + release) per
+/// dispatch, so 6 means "three full dispatch/revert cycles in five minutes" —
+/// unambiguously a flap, never normal traffic.
+pub const DEFAULT_FLAP_THRESHOLD: usize = 6;
+
+/// Resolved per-issue dispatch-backoff parameters (Issue #4485), set on the
+/// registry at construction so [`SweepRegistry::dispatch`] can enforce them
+/// without a per-dispatch config read. Defaults mirror the shipped constants
+/// (enabled — it is a safety backstop).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DispatchBackoffConfig {
+    /// Whether the backoff is active. When `false`, dispatch neither records
+    /// failures nor refuses on backoff (byte-for-byte the pre-#4485 path).
+    pub enabled: bool,
+    /// Delay applied after the first failed dispatch; doubled per consecutive
+    /// failure.
+    pub base: Duration,
+    /// Ceiling on the doubling — also the idle window after which an issue's
+    /// consecutive-failure tally restarts from zero.
+    pub max: Duration,
+}
+
+impl Default for DispatchBackoffConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            base: Duration::from_secs(DEFAULT_DISPATCH_BACKOFF_BASE_SECS),
+            max: Duration::from_secs(DEFAULT_DISPATCH_BACKOFF_MAX_SECS),
+        }
+    }
+}
+
+/// Per-issue dispatch-backoff bookkeeping (Issue #4485).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DispatchBackoffState {
+    /// Consecutive failed dispatch outcomes for this issue.
+    consecutive: u32,
+    /// When the most recent failure was recorded — used to decide whether the
+    /// streak is still "consecutive" (see [`DispatchBackoffConfig::max`]).
+    last_failure_at: DateTime<Utc>,
+    /// The instant at which the next dispatch attempt becomes allowed.
+    until: DateTime<Utc>,
+}
+
+/// Compute the backoff delay for the `consecutive`-th consecutive failure
+/// (Issue #4485): `base * 2^(consecutive - 1)`, clamped to `max`. Pure function
+/// so the growth curve is unit-testable without a registry.
+///
+/// `consecutive == 0` (no recorded failure) yields [`Duration::ZERO`], and the
+/// doubling saturates rather than overflowing for large streaks.
+#[must_use]
+pub fn backoff_delay(consecutive: u32, base: Duration, max: Duration) -> Duration {
+    if consecutive == 0 || base.is_zero() {
+        return Duration::ZERO;
+    }
+    // Saturating shift: anything past 32 doublings is max regardless.
+    let factor = 2_u64.saturating_pow((consecutive - 1).min(32));
+    let secs = base.as_secs().saturating_mul(factor);
+    Duration::from_secs(secs).min(max)
+}
+
+/// The subset of `.loom/config.json → autonomous.workFinder.dispatchBackoff`
+/// this module consumes (Issue #4485). Mirrors [`QuarantineFileConfig`]'s shape:
+/// every field is `Option` so an absent key falls through to the env-var /
+/// built-in-default resolution — precedence **env > config > default**.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DispatchBackoffFileConfig {
+    /// `autonomous.workFinder.dispatchBackoff.enabled`.
+    pub enabled: Option<bool>,
+    /// `autonomous.workFinder.dispatchBackoff.baseSecs` (zero/invalid dropped).
+    pub base_secs: Option<u64>,
+    /// `autonomous.workFinder.dispatchBackoff.maxSecs` (zero/invalid dropped).
+    pub max_secs: Option<u64>,
+}
+
+/// Read `.loom/config.json → autonomous.workFinder.dispatchBackoff` (Issue
+/// #4485), soft-failing every field to `None` on a missing file, malformed
+/// JSON, or an absent block — mirrors [`read_quarantine_file_config`].
+#[must_use]
+pub fn read_dispatch_backoff_file_config(repo_root: &Path) -> DispatchBackoffFileConfig {
+    let effective = crate::config_resolver::resolve_effective_config(repo_root);
+    let Some(b) =
+        crate::config_resolver::get_path(&effective, "autonomous.workFinder.dispatchBackoff")
+    else {
+        return DispatchBackoffFileConfig::default();
+    };
+    DispatchBackoffFileConfig {
+        enabled: b.get("enabled").and_then(serde_json::Value::as_bool),
+        base_secs: b
+            .get("baseSecs")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|&s| s > 0),
+        max_secs: b
+            .get("maxSecs")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|&s| s > 0),
+    }
+}
+
+/// Resolve the full [`DispatchBackoffConfig`] for `repo_root` with precedence
+/// **env > config > default** for every knob (Issue #4485), mirroring
+/// [`resolve_quarantine_config`]. `max` is clamped up to `base` so a
+/// misconfigured pair can never produce a ceiling below the first delay.
+#[must_use]
+pub fn resolve_dispatch_backoff_config(repo_root: &Path) -> DispatchBackoffConfig {
+    let file = read_dispatch_backoff_file_config(repo_root);
+
+    let enabled = if let Ok(v) = std::env::var(DISPATCH_BACKOFF_ENABLE_ENV) {
+        matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+    } else {
+        file.enabled.unwrap_or(true)
+    };
+
+    let base_secs = std::env::var(DISPATCH_BACKOFF_BASE_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .or(file.base_secs)
+        .unwrap_or(DEFAULT_DISPATCH_BACKOFF_BASE_SECS);
+
+    let max_secs = std::env::var(DISPATCH_BACKOFF_MAX_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .or(file.max_secs)
+        .unwrap_or(DEFAULT_DISPATCH_BACKOFF_MAX_SECS)
+        .max(base_secs);
+
+    DispatchBackoffConfig {
+        enabled,
+        base: Duration::from_secs(base_secs),
+        max: Duration::from_secs(max_secs),
+    }
 }
 
 /// Compute how long a spawn must wait so that consecutive spawns are separated
@@ -2059,6 +2305,39 @@ pub struct SweepRegistry {
     /// [`Event::PreflightAdvisory`] fires only on a state-change transition,
     /// never every tick.
     preflight_advisory_tripped: bool,
+    /// Per-issue dispatch-backoff parameters (Issue #4485). `main.rs` /
+    /// [`crate::workspace_pool::WorkspacePool`] set the resolved env > config >
+    /// default value at provision time, mirroring
+    /// [`quarantine_config`](Self::quarantine_config).
+    dispatch_backoff_config: DispatchBackoffConfig,
+    /// Per-issue dispatch backoff state (Issue #4485): consecutive failed
+    /// dispatch outcomes and the instant the next attempt is allowed. Written by
+    /// [`record_dispatch_failure`](Self::record_dispatch_failure) from
+    /// [`reap_once`](Self::reap_once) and read by
+    /// [`dispatch`](Self::dispatch)'s step-2.8 guard.
+    ///
+    /// Deliberately **wider** than [`insta_crash_counts`](Self::insta_crash_counts):
+    /// the quarantine tally exempts account-exhaustion (#4122) and
+    /// claude-wrapper pre-flight (#4386) deaths on purpose, which is exactly
+    /// how an issue can be re-dispatched indefinitely without ever
+    /// quarantining. This map counts *every* no-progress outcome, so the retry
+    /// cadence is bounded regardless of blame.
+    dispatch_backoff: HashMap<u32, DispatchBackoffState>,
+    /// Trailing timestamps of this registry's own `loom:issue` <->
+    /// `loom:building` label writes per issue (Issue #4485), pruned to
+    /// [`DEFAULT_FLAP_WINDOW_SECS`]. Powers the flap warning in
+    /// [`note_label_flip`](Self::note_label_flip) — the detection half of
+    /// #4485, since nothing surfaced the original ~90-flip incident until an
+    /// operator hand-inspected the forge timeline.
+    ///
+    /// Only *this process's* writes are visible here: a flap driven by a second
+    /// daemon instance (the shape #4485 actually observed) is bounded by the
+    /// backoff above but is not counted by this detector.
+    label_flip_log: HashMap<u32, VecDeque<DateTime<Utc>>>,
+    /// When the flap warning last fired per issue (Issue #4485), so a sustained
+    /// flap logs at most once per [`DEFAULT_FLAP_WINDOW_SECS`] instead of on
+    /// every flip.
+    flap_warned_at: HashMap<u32, DateTime<Utc>>,
 }
 
 /// Classification of a pre-flip label read (Issue #4085). Detection only — the
@@ -2143,6 +2422,10 @@ impl SweepRegistry {
             preflight_death_streak: 0,
             preflight_death_last_marker: None,
             preflight_advisory_tripped: false,
+            dispatch_backoff_config: DispatchBackoffConfig::default(),
+            dispatch_backoff: HashMap::new(),
+            label_flip_log: HashMap::new(),
+            flap_warned_at: HashMap::new(),
         }
     }
 
@@ -2178,6 +2461,10 @@ impl SweepRegistry {
             preflight_death_streak: 0,
             preflight_death_last_marker: None,
             preflight_advisory_tripped: false,
+            dispatch_backoff_config: DispatchBackoffConfig::default(),
+            dispatch_backoff: HashMap::new(),
+            label_flip_log: HashMap::new(),
+            flap_warned_at: HashMap::new(),
         }
     }
 
@@ -2227,6 +2514,20 @@ impl SweepRegistry {
     #[must_use]
     pub fn quarantine_config(&self) -> QuarantineConfig {
         self.quarantine_config
+    }
+
+    /// Set the per-issue dispatch-backoff parameters (Issue #4485). `main.rs`
+    /// and the workspace pool call this once at provision time with the
+    /// resolved env > config > default value, mirroring
+    /// [`set_quarantine_config`](Self::set_quarantine_config).
+    pub fn set_dispatch_backoff_config(&mut self, config: DispatchBackoffConfig) {
+        self.dispatch_backoff_config = config;
+    }
+
+    /// Read-only accessor for the dispatch-backoff parameters (Issue #4485).
+    #[must_use]
+    pub fn dispatch_backoff_config(&self) -> DispatchBackoffConfig {
+        self.dispatch_backoff_config
     }
 
     /// Set the claude-wrapper pre-flight-death workspace-tripwire parameters
@@ -2499,6 +2800,150 @@ impl SweepRegistry {
         self.quarantined.contains_key(&issue)
     }
 
+    // ------------------------------------------------------------------------
+    // Per-issue dispatch backoff (Issue #4485)
+    // ------------------------------------------------------------------------
+
+    /// Record a **failed** dispatch outcome for `issue` (Issue #4485) and push
+    /// its next-allowed dispatch instant out by
+    /// [`backoff_delay`]`(consecutive, base, max)`.
+    ///
+    /// Called by [`reap_once`](Self::reap_once) for a terminal outcome that made
+    /// no progress **and** died fast (inside the insta-crash window) or exited
+    /// cleanly with zero lifecycle progress (#4366) — including the shapes the
+    /// quarantine tally deliberately does NOT charge to the issue (account
+    /// exhaustion #4122, claude-wrapper pre-flight death #4386), which is
+    /// precisely how a failing issue could otherwise be re-dispatched every tick
+    /// forever. A *slow* checkpoint-less death is deliberately excluded: that is
+    /// the mid-build (#3895) / review-stall (#3910) watchdogs' remit, each
+    /// already bounded to one retry per issue.
+    ///
+    /// The streak restarts at `1` when the previous failure is older than
+    /// [`DispatchBackoffConfig::max`], so an issue that fails rarely never
+    /// accretes toward a long backoff. A no-op when the backoff is disabled.
+    fn record_dispatch_failure(&mut self, issue: u32) {
+        if !self.dispatch_backoff_config.enabled {
+            return;
+        }
+        let now = Utc::now();
+        let max_secs =
+            i64::try_from(self.dispatch_backoff_config.max.as_secs()).unwrap_or(i64::MAX);
+        let consecutive = match self.dispatch_backoff.get(&issue) {
+            Some(prev) if (now - prev.last_failure_at).num_seconds() <= max_secs => {
+                prev.consecutive.saturating_add(1)
+            }
+            // No prior record, or the streak went cold — start a fresh streak.
+            _ => 1,
+        };
+        let delay = backoff_delay(
+            consecutive,
+            self.dispatch_backoff_config.base,
+            self.dispatch_backoff_config.max,
+        );
+        let until =
+            now + chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::zero());
+        self.dispatch_backoff.insert(
+            issue,
+            DispatchBackoffState {
+                consecutive,
+                last_failure_at: now,
+                until,
+            },
+        );
+        log::info!(
+            "sweep_registry: issue #{issue} dispatch backoff armed — {consecutive} consecutive \
+             failed dispatch(es), next attempt allowed in {}s (#4485)",
+            delay.as_secs()
+        );
+    }
+
+    /// Clear `issue`'s dispatch-backoff record (Issue #4485) — called on any
+    /// terminal outcome that made real progress, so a recovered issue is
+    /// immediately eligible again. Returns `true` when a record existed.
+    fn clear_dispatch_backoff(&mut self, issue: u32) -> bool {
+        self.dispatch_backoff.remove(&issue).is_some()
+    }
+
+    /// Remaining dispatch backoff for `issue` at `now` (Issue #4485), or `None`
+    /// when it may be dispatched immediately. `Some(Duration::ZERO)` is never
+    /// returned — an elapsed window reads as `None`.
+    #[must_use]
+    pub fn dispatch_backoff_remaining(&self, issue: u32, now: DateTime<Utc>) -> Option<Duration> {
+        if !self.dispatch_backoff_config.enabled {
+            return None;
+        }
+        let state = self.dispatch_backoff.get(&issue)?;
+        let remaining = state.until - now;
+        if remaining <= chrono::Duration::zero() {
+            return None;
+        }
+        remaining.to_std().ok().filter(|d| !d.is_zero())
+    }
+
+    /// Consecutive failed dispatch attempts recorded for `issue` (Issue #4485).
+    /// `0` when no failure is on record. Test/inspection helper, mirroring
+    /// [`insta_crash_count`](Self::insta_crash_count).
+    #[must_use]
+    pub fn dispatch_failure_count(&self, issue: u32) -> u32 {
+        self.dispatch_backoff
+            .get(&issue)
+            .map_or(0, |s| s.consecutive)
+    }
+
+    /// Every issue whose dispatch backoff is still in effect at `now` (Issue
+    /// #4485) — the set the work finder skips *before* the capacity gate, so a
+    /// backed-off candidate never reserves a shared dispatch slot (mirroring
+    /// [`quarantined_issues`](Self::quarantined_issues)).
+    #[must_use]
+    pub fn dispatch_backoff_issues(&self, now: DateTime<Utc>) -> HashSet<u32> {
+        if !self.dispatch_backoff_config.enabled {
+            return HashSet::new();
+        }
+        self.dispatch_backoff
+            .iter()
+            .filter(|(_, s)| s.until > now)
+            .map(|(issue, _)| *issue)
+            .collect()
+    }
+
+    /// Note one `loom:issue` <-> `loom:building` label write this registry
+    /// performed for `issue` (Issue #4485) and warn loudly when the trailing
+    /// [`DEFAULT_FLAP_WINDOW_SECS`] window holds at least
+    /// [`DEFAULT_FLAP_THRESHOLD`] of them — the detection half of #4485.
+    ///
+    /// A healthy dispatch writes exactly two labels (claim + release), so the
+    /// threshold is only reachable by repeated dispatch/revert cycling. Warns at
+    /// most once per window per issue.
+    fn note_label_flip(&mut self, issue: u32) {
+        let now = Utc::now();
+        let window = chrono::Duration::seconds(DEFAULT_FLAP_WINDOW_SECS);
+        let flips = self.label_flip_log.entry(issue).or_default();
+        flips.push_back(now);
+        while flips.front().is_some_and(|t| now - *t > window) {
+            flips.pop_front();
+        }
+        let count = flips.len();
+        if count < DEFAULT_FLAP_THRESHOLD {
+            return;
+        }
+        let recently_warned = self
+            .flap_warned_at
+            .get(&issue)
+            .is_some_and(|t| now - *t <= window);
+        if recently_warned {
+            return;
+        }
+        self.flap_warned_at.insert(issue, now);
+        log::warn!(
+            "sweep_registry: issue #{issue} LABEL FLAPPING — this daemon wrote \
+             loom:issue/loom:building {count} time(s) in the last {}s (threshold \
+             {DEFAULT_FLAP_THRESHOLD}). A dispatch is dying immediately and being retried; check \
+             the sweep log tail, `loom-daemon quarantine list`, and whether a second daemon \
+             instance is dispatching the same workspace (#4485).",
+            DEFAULT_FLAP_WINDOW_SECS
+        );
+    }
+
     /// Manually clear an issue's quarantine + insta-crash tally (Issue #3939),
     /// the operator-action release path (reachable via the `ClearQuarantine` IPC
     /// request / `loom-daemon quarantine clear <issue>` CLI). Returns `true` when
@@ -2514,6 +2959,11 @@ impl SweepRegistry {
     /// instead of leaving the issue permanently stranded at `loom:blocked`.
     pub fn clear_quarantine(&mut self, issue: u32) -> bool {
         self.insta_crash_counts.remove(&issue);
+        // #4485: the operator's "let this run now" action also clears any
+        // dispatch-backoff window — otherwise a cleared quarantine could still
+        // be held back for up to `DispatchBackoffConfig::max`, making the
+        // operator command look like it did nothing.
+        self.clear_dispatch_backoff(issue);
         let was_quarantined = self.quarantined.remove(&issue).is_some();
         if was_quarantined {
             self.attempt_quarantine_release(issue);
@@ -2912,6 +3362,61 @@ impl SweepRegistry {
             }
         }
 
+        // 2.8 Per-issue dispatch backoff (Issue #4485). The quarantine backstop
+        //     (#3939) only engages after three *tally-eligible* insta-crashes,
+        //     and both the account-exhaustion (#4122) and claude-wrapper
+        //     pre-flight (#4386) carve-outs deliberately leave that tally
+        //     untouched — so an issue whose every dispatch dies in that shape
+        //     was re-dispatched on every tick forever, flapping
+        //     `loom:issue`/`loom:building` at the reap→restore→re-poll cadence
+        //     (~90 label events in 7 minutes on #4398). This guard caps the
+        //     *rate* rather than the *cause*: any no-progress terminal outcome
+        //     arms an exponential per-issue window (see
+        //     `record_dispatch_failure`) and dispatch refuses until it elapses.
+        //
+        //     Placed with the other pre-flip guards (2.4-2.7) so one check
+        //     covers every dispatch call site — work-finder, epic supervisor,
+        //     IPC/CLI, and all three watchdogs — and, critically, so a refusal
+        //     costs **no lock, no label write, and no forge round trip of its
+        //     own**: the refusal itself can never contribute to a flap. Unlike
+        //     2.4-2.7 it is NOT gated on `skip_label_flip`: it is pure
+        //     in-memory bookkeeping with no `gh` dependency, and the flap it
+        //     prevents is driven by dispatch cadence, not by credentials.
+        //
+        //     Runs *after* the 2.7 park-label guard, deliberately. When an issue
+        //     is both parked and inside a backoff window, the park is the
+        //     durable operator decision and the more actionable refusal, so it
+        //     wins and the skip is attributed to `labeled-skip` rather than to
+        //     `backoff-skip` (which advertises an imminent auto-retry that a
+        //     park forbids). The two guards share no state: a refusal here never
+        //     spawns a sweep, so no refusal — park or backoff — can ever call
+        //     `record_dispatch_failure` and arm/extend a window, and a backoff
+        //     window keeps decaying on wall-clock time while an issue sits
+        //     parked. Clearing the park therefore re-exposes any *still-live*
+        //     window, which is correct: the park did not prove the failing
+        //     dispatch loop fixed.
+        //
+        //     Exempt: the reaper-driven resume (#4256, `resume_bypass_pr`),
+        //     which re-dispatches an issue whose own PR is open and is already
+        //     bounded by `MAX_RESUME_ATTEMPTS`. Never a work-finder loop.
+        if resume_bypass_pr.is_none() {
+            if let Some(remaining) = self.dispatch_backoff_remaining(issue_number, Utc::now()) {
+                let consecutive = self.dispatch_failure_count(issue_number);
+                log::info!(
+                    "sweep_registry: refusing to dispatch issue #{issue_number} — \
+                     {consecutive} consecutive failed dispatch(es), {}s of backoff remaining \
+                     (#4485)",
+                    remaining.as_secs()
+                );
+                return Err(DispatchBackoffError {
+                    issue: issue_number,
+                    consecutive,
+                    retry_after_secs: remaining.as_secs(),
+                }
+                .into());
+            }
+        }
+
         // 3. Acquire the claim lock atomically.
         let sweep_id = generate_sweep_id(kind);
         self.acquire_lock(issue_number, &sweep_id)?;
@@ -2942,6 +3447,10 @@ impl SweepRegistry {
                     "label flip for issue #{issue_number} failed (continuing dispatch): {e}"
                 );
             }
+            // Flap detection (#4485): count this claim write and warn if this
+            // issue's label is being cycled far faster than a healthy
+            // dispatch/complete rhythm can explain.
+            self.note_label_flip(issue_number);
         }
 
         // 5. Compute the log path and spawn the child.
@@ -4833,6 +5342,7 @@ impl SweepRegistry {
             // claim — never restore the label out from under it.
             if !self.config.skip_label_flip && !produced_pr && !superseded {
                 let _ = self.restore_label_to_ready(*issue);
+                self.note_label_flip(*issue); // #4485 flap detection
             }
             self.emit_event(Event::SweepExited {
                 issue: *issue,
@@ -4969,6 +5479,7 @@ impl SweepRegistry {
                             // owns the lock — it is actively building.
                             if !self.config.skip_label_flip && !superseded {
                                 let _ = self.restore_label_to_ready(issue);
+                                self.note_label_flip(issue); // #4485 flap detection
                             }
                             let checkpoint_phase = read_checkpoint_phase(&checkpoint);
                             // Issue #4255: attribute WHY the sweep died by
@@ -5052,6 +5563,24 @@ impl SweepRegistry {
                             // fall through to the same pre-work insta-crash test the
                             // checkpoint-less branch below uses, so a sub-window
                             // non-clean death still counts toward quarantine.
+                            // #4485: the dispatch-backoff verdict is computed
+                            // here — BEFORE the #4122 / #4386 carve-outs below —
+                            // because those carve-outs exist to spare the
+                            // *issue's* quarantine tally, not to license an
+                            // unbounded retry cadence. Scoped to the same
+                            // fast-death window the tally uses: a run that made
+                            // real progress clears the window; a fast
+                            // checkpoint-less death (the flap shape) arms it; a
+                            // SLOW checkpoint-less death is left untouched — that
+                            // is the mid-build-death (#3895) / review-stall
+                            // (#3910) watchdogs' remit, each already bounded to a
+                            // single retry, and arming a window there would risk
+                            // burning that one retry on a refusal.
+                            if checkpoint_progress {
+                                self.clear_dispatch_backoff(issue);
+                            } else if insta_crash {
+                                self.record_dispatch_failure(issue);
+                            }
                             if checkpoint_progress {
                                 self.record_terminal_outcome(issue, false);
                                 // #4256: a run that advanced the checkpoint made
@@ -5224,6 +5753,7 @@ impl SweepRegistry {
                             // the lock (superseded) — it holds the live claim.
                             if !self.config.skip_label_flip && !produced_pr && !superseded {
                                 let _ = self.restore_label_to_ready(issue);
+                                self.note_label_flip(issue); // #4485 flap detection
                             }
                             if let Some(info) = self.entries.get_mut(&sweep_id) {
                                 info.state = SweepState::Exited {
@@ -5308,6 +5838,19 @@ impl SweepRegistry {
                                 sweep_id: sweep_id.clone(),
                                 outcome: SweepOutcome::Exited,
                             });
+                            // #4485: same rate cap as the crashed branch above,
+                            // evaluated before the #4386 pre-flight carve-out so
+                            // a pre-flight death still bounds its own retry
+                            // cadence. `insta_crash` (fast non-zero death, e.g.
+                            // the exit-78 empty-token-pool shape) and
+                            // `no_progress` (#4366 clean exit that advanced
+                            // nothing) are both failures; a genuinely productive
+                            // exit clears the window.
+                            if insta_crash || no_progress {
+                                self.record_dispatch_failure(issue);
+                            } else {
+                                self.clear_dispatch_backoff(issue);
+                            }
                             if !is_preflight_death {
                                 // #4366: a separate predicate arm from the
                                 // insta-crash window/exit-code check above — a
@@ -5664,6 +6207,13 @@ impl SweepRegistry {
                     // Mark retried BEFORE acting so any error path still counts
                     // the single allowed attempt (never loops).
                     self.watchdog_retried.insert(issue);
+
+                    // #4485: release any dispatch-backoff window first. This
+                    // recovery is already bounded to ONE attempt per issue by the
+                    // latch above (marked before acting), so the rate limiting the
+                    // backoff provides is redundant here — and a refusal would
+                    // silently burn that single allowed attempt.
+                    self.clear_dispatch_backoff(issue);
 
                     // Cancel the hung child (SIGTERM → grace → SIGKILL). This
                     // releases the per-issue lock and restores loom:building ->
@@ -6092,6 +6642,13 @@ impl SweepRegistry {
                     // the single allowed attempt (never loops).
                     self.midbuild_retried.insert(issue);
 
+                    // #4485: release any dispatch-backoff window first. This
+                    // recovery is already bounded to ONE attempt per issue by the
+                    // latch above (marked before acting), so the rate limiting the
+                    // backoff provides is redundant here — and a refusal would
+                    // silently burn that single allowed attempt.
+                    self.clear_dispatch_backoff(issue);
+
                     // Discard the dirty working tree so the resumed sweep starts
                     // clean (commits, if any, are preserved).
                     if let Err(e) = self.clean_worktree(issue) {
@@ -6264,6 +6821,13 @@ impl SweepRegistry {
                     // A prior give-up log (if any) is now stale; clear it so a
                     // later genuine give-up still logs once.
                     self.review_stall_gaveup.remove(&issue);
+
+                    // #4485: release any dispatch-backoff window first. This
+                    // recovery is already bounded to ONE attempt per issue by the
+                    // latch above (marked before acting), so the rate limiting the
+                    // backoff provides is redundant here — and a refusal would
+                    // silently burn that single allowed attempt.
+                    self.clear_dispatch_backoff(issue);
 
                     // Cancel the wedged child (SIGTERM → grace → SIGKILL). This
                     // releases the per-issue lock and restores loom:building ->
@@ -9535,6 +10099,424 @@ exit 0
             "quarantined set exposes #42 to the work finder"
         );
         assert_eq!(registry.quarantined_issues_sorted(), vec![42]);
+    }
+
+    // ------------------------------------------------------------------------
+    // Per-issue dispatch backoff / flap breaker (Issue #4485)
+    // ------------------------------------------------------------------------
+
+    /// A registry with an explicit, fast backoff config so a test never waits on
+    /// the 60s shipped default.
+    fn backoff_registry(workspace: &Path, base_secs: u64, max_secs: u64) -> SweepRegistry {
+        let (mut registry, _record_log) = fixture_registry(workspace);
+        registry.set_dispatch_backoff_config(DispatchBackoffConfig {
+            enabled: true,
+            base: Duration::from_secs(base_secs),
+            max: Duration::from_secs(max_secs),
+        });
+        registry
+    }
+
+    /// The delay curve doubles per consecutive failure and clamps at `max`;
+    /// a zero streak (and a zero base) is always no delay.
+    #[test]
+    fn backoff_delay_doubles_then_clamps_at_max() {
+        let base = Duration::from_secs(60);
+        let max = Duration::from_secs(900);
+        assert_eq!(backoff_delay(0, base, max), Duration::ZERO, "no failures ⇒ no delay");
+        assert_eq!(backoff_delay(1, base, max), Duration::from_secs(60));
+        assert_eq!(backoff_delay(2, base, max), Duration::from_secs(120));
+        assert_eq!(backoff_delay(3, base, max), Duration::from_secs(240));
+        assert_eq!(backoff_delay(4, base, max), Duration::from_secs(480));
+        assert_eq!(backoff_delay(5, base, max), Duration::from_secs(900), "clamped");
+        assert_eq!(backoff_delay(50, base, max), max, "a long streak saturates, never overflows");
+        assert_eq!(backoff_delay(3, Duration::ZERO, max), Duration::ZERO, "zero base disables");
+    }
+
+    /// AC: a minimum interval is enforced between same-issue dispatch attempts
+    /// after a failed dispatch. The refusal carries the typed
+    /// [`DispatchBackoffError`] (so the work finder can attribute it) and clears
+    /// the moment the window is released.
+    #[test]
+    fn dispatch_refused_while_backoff_window_is_live() {
+        let dir = tempdir().unwrap();
+        let mut registry = backoff_registry(dir.path(), 60, 900);
+
+        registry.record_dispatch_failure(4485);
+        assert_eq!(registry.dispatch_failure_count(4485), 1);
+
+        let err = registry
+            .dispatch(&SweepKind::Issue(4485), None, None, None, None)
+            .expect_err("a live backoff window must refuse dispatch");
+        let typed = err
+            .downcast_ref::<DispatchBackoffError>()
+            .expect("refusal must carry the typed DispatchBackoffError");
+        assert_eq!(typed.issue, 4485);
+        assert_eq!(typed.consecutive, 1);
+        assert!(typed.retry_after_secs > 0 && typed.retry_after_secs <= 60);
+
+        // The refusal happens BEFORE the claim lock and the label flip, so
+        // nothing was claimed and nothing was spawned.
+        assert!(
+            !registry.config.locks_dir().join("issue-4485").exists(),
+            "a backoff refusal must not acquire the claim lock"
+        );
+        assert!(registry.entries.is_empty(), "a backoff refusal must not register a sweep");
+
+        // Releasing the window (progress, or the operator's quarantine clear)
+        // makes the issue immediately eligible again — the breaker never wedges.
+        assert!(registry.clear_dispatch_backoff(4485));
+        let outcome = registry
+            .dispatch(&SweepKind::Issue(4485), None, None, None, None)
+            .expect("dispatch proceeds once the window is cleared");
+        assert!(outcome.was_new);
+    }
+
+    /// A disabled backoff is byte-for-byte the pre-#4485 path: no window is ever
+    /// armed and dispatch is never refused.
+    #[test]
+    fn disabled_backoff_never_refuses_dispatch() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _log) = fixture_registry(dir.path());
+        registry.set_dispatch_backoff_config(DispatchBackoffConfig {
+            enabled: false,
+            ..DispatchBackoffConfig::default()
+        });
+
+        registry.record_dispatch_failure(77);
+        assert_eq!(registry.dispatch_failure_count(77), 0, "disabled ⇒ nothing recorded");
+        assert!(registry
+            .dispatch_backoff_remaining(77, Utc::now())
+            .is_none());
+        assert!(registry
+            .dispatch(&SweepKind::Issue(77), None, None, None, None)
+            .is_ok());
+    }
+
+    /// Regression for the #4485 incident shape: an **account-exhaustion**
+    /// insta-crash is deliberately NOT charged to the issue's quarantine tally
+    /// (#4122), so three in a row never quarantine — yet before this change the
+    /// work finder re-dispatched the issue on the very next tick, flapping
+    /// `loom:issue`/`loom:building` indefinitely. The dispatch backoff must
+    /// count those deaths and refuse the re-dispatch.
+    #[test]
+    fn exhaustion_insta_crashes_arm_backoff_even_though_quarantine_is_carved_out() {
+        let dir = tempdir().unwrap();
+        let mut registry = backoff_registry(dir.path(), 60, 900);
+        seed_token_pool(dir.path(), "agent-9");
+
+        for seq in 0..3 {
+            insert_dead_running_with_log(
+                &mut registry,
+                4398,
+                seq,
+                "agent-9",
+                "loom-daemon dispatch: start\nClaude: hit your weekly limit\n",
+            );
+            registry.reap_once();
+        }
+
+        // #4122's carve-out is intact — the issue was never blamed.
+        assert_eq!(registry.insta_crash_count(4398), 0, "#4122 carve-out preserved");
+        assert!(!registry.is_quarantined(4398), "#4122: exhaustion never quarantines the issue");
+
+        // …but the retry cadence is now bounded regardless of blame.
+        assert_eq!(registry.dispatch_failure_count(4398), 3);
+        assert!(registry
+            .dispatch_backoff_remaining(4398, Utc::now())
+            .is_some());
+        assert!(registry.dispatch_backoff_issues(Utc::now()).contains(&4398));
+        let err = registry
+            .dispatch(&SweepKind::Issue(4398), None, None, None, None)
+            .expect_err("the re-dispatch that used to flap the label must be refused");
+        assert!(err.downcast_ref::<DispatchBackoffError>().is_some(), "got: {err}");
+    }
+
+    /// The same property for the OTHER quarantine carve-out: a claude-wrapper
+    /// pre-flight death (#4386) leaves the insta-crash tally untouched but must
+    /// still bound its own re-dispatch cadence.
+    #[test]
+    fn preflight_death_arms_backoff_even_though_quarantine_is_carved_out() {
+        let dir = tempdir().unwrap();
+        let mut registry = backoff_registry(dir.path(), 60, 900);
+
+        // No `# CLAUDE_CLI_START` in the tail ⇒ classified as a pre-flight death.
+        insert_dead_running_with_log(
+            &mut registry,
+            4399,
+            0,
+            "agent-9",
+            "==== loom-daemon dispatch: sweep-issue-4399-0 ====\nspawn-claude: preflight failed\n",
+        );
+        registry.reap_once();
+
+        assert_eq!(registry.insta_crash_count(4399), 0, "#4386 carve-out preserved");
+        assert_eq!(registry.dispatch_failure_count(4399), 1, "backoff still counts it");
+        assert!(registry
+            .dispatch_backoff_remaining(4399, Utc::now())
+            .is_some());
+    }
+
+    /// A cold streak restarts at 1: a failure whose predecessor is older than
+    /// `max` is a fresh incident, not the continuation of an old one — so an
+    /// issue that fails once in a blue moon never accretes a long backoff.
+    #[test]
+    fn stale_failure_streak_restarts_from_one() {
+        let dir = tempdir().unwrap();
+        let mut registry = backoff_registry(dir.path(), 60, 120);
+
+        registry.record_dispatch_failure(31);
+        registry.record_dispatch_failure(31);
+        assert_eq!(registry.dispatch_failure_count(31), 2);
+
+        // Age the recorded failure well past `max` (120s) and record again.
+        let stale = Utc::now() - chrono::Duration::seconds(600);
+        if let Some(state) = registry.dispatch_backoff.get_mut(&31) {
+            state.last_failure_at = stale;
+            state.until = stale;
+        }
+        registry.record_dispatch_failure(31);
+        assert_eq!(registry.dispatch_failure_count(31), 1, "cold streak restarts");
+    }
+
+    /// An elapsed window reads as "no backoff" without any explicit expiry pass —
+    /// the check is purely `until > now`, so a stale record can never hold an
+    /// issue back (and a daemon restart clears the map entirely).
+    #[test]
+    fn elapsed_backoff_window_stops_refusing() {
+        let dir = tempdir().unwrap();
+        let mut registry = backoff_registry(dir.path(), 60, 900);
+        registry.record_dispatch_failure(32);
+        if let Some(state) = registry.dispatch_backoff.get_mut(&32) {
+            state.until = Utc::now() - chrono::Duration::seconds(1);
+        }
+        assert!(registry
+            .dispatch_backoff_remaining(32, Utc::now())
+            .is_none());
+        assert!(registry.dispatch_backoff_issues(Utc::now()).is_empty());
+        assert!(registry
+            .dispatch(&SweepKind::Issue(32), None, None, None, None)
+            .is_ok());
+    }
+
+    /// A run that made real progress clears the window immediately, so a
+    /// recovering issue is never held back by an earlier failure.
+    #[test]
+    fn checkpoint_progress_clears_the_backoff_window() {
+        let dir = tempdir().unwrap();
+        let mut registry = backoff_registry(dir.path(), 60, 900);
+        registry.record_dispatch_failure(33);
+        assert_eq!(registry.dispatch_failure_count(33), 1);
+
+        // A dead run whose checkpoint was (re)written by THIS run = progress.
+        let started_at = Utc::now() - chrono::Duration::seconds(5);
+        insert_dead_running_at(&mut registry, 33, 9, started_at);
+        let checkpoint_dir = registry.config.checkpoint_dir();
+        std::fs::create_dir_all(&checkpoint_dir).unwrap();
+        std::fs::write(checkpoint_dir.join("issue-33.json"), r#"{"phase":"builder-done"}"#)
+            .unwrap();
+        registry.reap_once();
+
+        assert_eq!(registry.dispatch_failure_count(33), 0, "progress clears the streak");
+        assert!(registry
+            .dispatch_backoff_remaining(33, Utc::now())
+            .is_none());
+    }
+
+    /// A **slow** checkpoint-less death does NOT arm the backoff: that shape is
+    /// the mid-build-death (#3895) / review-stall (#3910) watchdogs' remit, each
+    /// already bounded to one retry per issue, and arming a window there would
+    /// risk a refusal burning that single allowed attempt.
+    #[test]
+    fn slow_checkpoint_less_death_does_not_arm_the_backoff() {
+        let dir = tempdir().unwrap();
+        let mut registry = backoff_registry(dir.path(), 60, 900);
+        // `insta_crash_secs` defaults to 60s: start the run well outside it.
+        let started_at = Utc::now() - chrono::Duration::seconds(600);
+        insert_dead_running_at(&mut registry, 36, 0, started_at);
+        registry.reap_once();
+
+        assert_eq!(
+            registry.dispatch_failure_count(36),
+            0,
+            "a slow death is the watchdogs' remit, not the flap breaker's"
+        );
+        assert!(registry
+            .dispatch_backoff_remaining(36, Utc::now())
+            .is_none());
+    }
+
+    /// The mid-build-death watchdog (#3895) recovery must still fire with a
+    /// backoff window armed — the recovery is latched to one attempt per issue,
+    /// so a backoff refusal would silently consume it and strand the sweep.
+    #[test]
+    fn midbuild_recovery_is_not_blocked_by_an_armed_backoff() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let mut reg = backoff_registry(ws, 60, 900);
+
+        make_dirty_git_worktree(ws, 6055);
+        insert_terminal_issue(&mut reg, "sweep-issue-6055-dead", 6055, None);
+        // An earlier fast failure armed a live window for this very issue.
+        reg.record_dispatch_failure(6055);
+        assert!(reg.dispatch_backoff_remaining(6055, Utc::now()).is_some());
+
+        let recovered = reg.midbuild_watchdog_once();
+        assert_eq!(recovered, 1, "the bounded one-shot recovery still re-dispatches");
+        assert!(reg.issue_has_active_sweep(6055));
+        assert_eq!(
+            reg.dispatch_failure_count(6055),
+            0,
+            "the watchdog released the window before dispatching"
+        );
+    }
+
+    /// The operator's `loom-daemon quarantine clear <issue>` releases the
+    /// dispatch-backoff window too — otherwise the command would look like it did
+    /// nothing for up to `max`.
+    #[test]
+    fn clear_quarantine_also_clears_dispatch_backoff() {
+        let dir = tempdir().unwrap();
+        let mut registry = backoff_registry(dir.path(), 60, 900);
+        registry.seed_quarantine_for_test(34);
+        registry.record_dispatch_failure(34);
+
+        assert!(registry.clear_quarantine(34));
+        assert_eq!(registry.dispatch_failure_count(34), 0);
+        assert!(registry
+            .dispatch_backoff_remaining(34, Utc::now())
+            .is_none());
+    }
+
+    /// The reaper-driven resume path (#4256) is exempt: it re-dispatches an
+    /// issue's OWN open PR and is already bounded by `MAX_RESUME_ATTEMPTS`, so the
+    /// backoff must not block it (which would strand a PR at review).
+    #[test]
+    fn reaper_resume_dispatch_bypasses_the_backoff() {
+        let dir = tempdir().unwrap();
+        let mut registry = backoff_registry(dir.path(), 60, 900);
+        registry.record_dispatch_failure(35);
+
+        assert!(
+            registry
+                .dispatch(&SweepKind::Issue(35), None, None, None, None)
+                .is_err(),
+            "an ordinary dispatch is refused"
+        );
+        assert!(
+            registry.dispatch_resume_after_crash(35, 777).is_ok(),
+            "the bounded #4256 resume path is exempt"
+        );
+    }
+
+    /// Flap detection: this registry's own label writes are counted per issue and
+    /// warn once the trailing window holds `DEFAULT_FLAP_THRESHOLD` of them. Below
+    /// the threshold nothing is flagged (a healthy dispatch writes exactly 2).
+    #[test]
+    fn label_flip_flap_detector_flags_only_above_threshold() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _log) = fixture_registry(dir.path());
+
+        for _ in 0..(DEFAULT_FLAP_THRESHOLD - 1) {
+            registry.note_label_flip(4398);
+        }
+        assert!(
+            !registry.flap_warned_at.contains_key(&4398),
+            "below threshold: a normal dispatch/complete rhythm never warns"
+        );
+
+        registry.note_label_flip(4398);
+        assert!(
+            registry.flap_warned_at.contains_key(&4398),
+            "at threshold: the flap is surfaced in the daemon log"
+        );
+        let first_warn = registry.flap_warned_at[&4398];
+
+        // A sustained flap warns at most once per window (no log spam).
+        registry.note_label_flip(4398);
+        assert_eq!(registry.flap_warned_at[&4398], first_warn);
+
+        // Flips outside the trailing window are pruned, so an issue that flipped
+        // long ago does not carry stale credit toward the threshold.
+        let stale = Utc::now() - chrono::Duration::seconds(DEFAULT_FLAP_WINDOW_SECS + 60);
+        registry
+            .label_flip_log
+            .insert(1234, std::iter::repeat_n(stale, DEFAULT_FLAP_THRESHOLD * 2).collect());
+        registry.note_label_flip(1234);
+        assert!(!registry.flap_warned_at.contains_key(&1234), "stale flips are pruned");
+    }
+
+    /// Config resolution honors precedence env > config > default (#4485), and a
+    /// `maxSecs` below `baseSecs` is clamped up rather than inverting the curve.
+    #[test]
+    #[serial]
+    fn resolve_dispatch_backoff_config_env_overrides() {
+        let dir = tempdir().unwrap();
+        for var in [
+            DISPATCH_BACKOFF_ENABLE_ENV,
+            DISPATCH_BACKOFF_BASE_ENV,
+            DISPATCH_BACKOFF_MAX_ENV,
+        ] {
+            std::env::remove_var(var);
+        }
+
+        let base = resolve_dispatch_backoff_config(dir.path());
+        assert!(base.enabled, "defaults ON — it is a safety backstop");
+        assert_eq!(base.base, Duration::from_secs(DEFAULT_DISPATCH_BACKOFF_BASE_SECS));
+        assert_eq!(base.max, Duration::from_secs(DEFAULT_DISPATCH_BACKOFF_MAX_SECS));
+
+        std::env::set_var(DISPATCH_BACKOFF_ENABLE_ENV, "off");
+        std::env::set_var(DISPATCH_BACKOFF_BASE_ENV, "30");
+        std::env::set_var(DISPATCH_BACKOFF_MAX_ENV, "10");
+        let resolved = resolve_dispatch_backoff_config(dir.path());
+        for var in [
+            DISPATCH_BACKOFF_ENABLE_ENV,
+            DISPATCH_BACKOFF_BASE_ENV,
+            DISPATCH_BACKOFF_MAX_ENV,
+        ] {
+            std::env::remove_var(var);
+        }
+        assert!(!resolved.enabled, "LOOM_DISPATCH_BACKOFF=off disables");
+        assert_eq!(resolved.base, Duration::from_secs(30));
+        assert_eq!(resolved.max, Duration::from_secs(30), "max clamped up to base");
+    }
+
+    /// Config-file parsing of `autonomous.workFinder.dispatchBackoff` (#4485),
+    /// including the all-`None` (absent block) case that preserves env/default
+    /// resolution for repos that never configure it.
+    #[test]
+    #[serial]
+    fn read_dispatch_backoff_file_config_parses_block() {
+        for var in [
+            DISPATCH_BACKOFF_ENABLE_ENV,
+            DISPATCH_BACKOFF_BASE_ENV,
+            DISPATCH_BACKOFF_MAX_ENV,
+        ] {
+            std::env::remove_var(var);
+        }
+
+        let dir = tempdir().unwrap();
+        let loom = dir.path().join(".loom");
+        std::fs::create_dir_all(&loom).unwrap();
+        std::fs::write(
+            loom.join("config.json"),
+            r#"{"autonomous":{"workFinder":{"dispatchBackoff":{"enabled":false,"baseSecs":15,"maxSecs":300}}}}"#,
+        )
+        .unwrap();
+
+        let file = read_dispatch_backoff_file_config(dir.path());
+        assert_eq!(file.enabled, Some(false));
+        assert_eq!(file.base_secs, Some(15));
+        assert_eq!(file.max_secs, Some(300));
+
+        let resolved = resolve_dispatch_backoff_config(dir.path());
+        assert!(!resolved.enabled);
+        assert_eq!(resolved.base, Duration::from_secs(15));
+        assert_eq!(resolved.max, Duration::from_secs(300));
+
+        let empty = tempdir().unwrap();
+        let absent = read_dispatch_backoff_file_config(empty.path());
+        assert_eq!(absent, DispatchBackoffFileConfig::default());
     }
 
     // ------------------------------------------------------------------------

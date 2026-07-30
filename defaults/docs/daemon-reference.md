@@ -2009,6 +2009,11 @@ concurrency ceiling 5" and share it with the team:
         "threshold": 3,
         "ttlSecs": 3600,
         "instaCrashSecs": 60
+      },
+      "dispatchBackoff": {
+        "enabled": true,
+        "baseSecs": 60,
+        "maxSecs": 900
       }
     },
     "hostBreaker": {
@@ -2070,6 +2075,9 @@ exactly like `main_health_gate::read_build_gate_config`.
 | `autonomous.workFinder.quarantine.threshold` | `LOOM_WORK_FINDER_QUARANTINE_THRESHOLD` | `3` | Consecutive insta-crashes before an issue is quarantined. Zero/invalid → default |
 | `autonomous.workFinder.quarantine.ttlSecs` | `LOOM_WORK_FINDER_QUARANTINE_TTL_SECS` | `3600` | How long a quarantine entry persists before auto-release. Zero/invalid → default |
 | `autonomous.workFinder.quarantine.instaCrashSecs` | `LOOM_WORK_FINDER_QUARANTINE_INSTA_CRASH_SECS` | `60` | Checkpoint-less death within this window of dispatch counts as an insta-crash. Zero/invalid → default |
+| `autonomous.workFinder.dispatchBackoff.enabled` | `LOOM_DISPATCH_BACKOFF` | `true` | Per-issue dispatch backoff on/off (#4485). A safety backstop — defaults on. Env truthy (`1`/`true`/`yes`/`on`) enables, any other value disables; wins over config |
+| `autonomous.workFinder.dispatchBackoff.baseSecs` | `LOOM_DISPATCH_BACKOFF_BASE_SECS` | `60` | Backoff applied after the **first** failed dispatch of an issue; doubles per consecutive failure. Zero/invalid → default |
+| `autonomous.workFinder.dispatchBackoff.maxSecs` | `LOOM_DISPATCH_BACKOFF_MAX_SECS` | `900` | Ceiling on the doubling — also the idle window after which an issue's consecutive-failure tally restarts at zero. Zero/invalid → default; clamped up to `baseSecs` |
 | `autonomous.hostBreaker.enabled` | `LOOM_HOST_BREAKER` | `true` | Host-distress circuit breaker on/off (#4235). A safety backstop — **defaults on**. Env truthy (`1`/`true`/`yes`/`on`) enables, any other value disables; wins over config. See [Host-distress circuit breaker](#host-distress-circuit-breaker-4235) below |
 | `autonomous.hostBreaker.loadPerCoreTrip` | `LOOM_HOST_BREAKER_LOAD_PER_CORE` | `2.5` | Load-per-core at/over which a tick counts toward tripping. `<= 0`/invalid → default |
 | `autonomous.hostBreaker.sustainTicks` | `LOOM_HOST_BREAKER_SUSTAIN_TICKS` | `3` | Consecutive over-threshold work-finder ticks required to trip (a single spike never trips). Zero/invalid → default |
@@ -2327,6 +2335,49 @@ candidate is dropped **before** the global slot-fill pass, so a workspace whose
 only candidates are quarantined never reserves a shared dispatch slot — healthy
 sibling work in other repos gets it instead. Defaults **on**; disable with
 `LOOM_WORK_FINDER_QUARANTINE=0` or `autonomous.workFinder.quarantine.enabled = false`.
+
+**Per-issue dispatch backoff (#4485, step 2.8).** The quarantine above is a *three-strikes*
+brake, and it has two deliberate carve-outs: a death attributed to account
+exhaustion (#4122) or to a claude-wrapper pre-flight failure (#4386) leaves the
+issue's insta-crash tally **untouched** on purpose — the issue is not at fault.
+Nothing else limited how *often* one issue could be re-dispatched, so an issue
+whose every dispatch died in a carved-out shape flapped
+`loom:issue` ⇄ `loom:building` at the full reap → restore → re-poll cadence. The
+observed incident: ~90 label events on one issue in ~7 minutes (claim, child dead
+~4s later, claim restored, re-dispatched on the next tick), with the quarantine
+not engaging for over 20 cycles. Two further amplifiers: the quarantine tally is
+**per-process, in-memory** (two daemon instances sharing a workspace each need
+their own three strikes), and nothing surfaced the flap in any log — it was found
+by hand-reading the forge timeline.
+
+The dispatch backoff caps the retry *rate* instead of diagnosing the *cause*. A
+terminal outcome that made no progress **and** either died fast (inside
+`instaCrashSecs`) or exited cleanly with zero lifecycle progress — including both
+quarantine carve-outs — arms an exponential per-issue window (`baseSecs`, then ×2
+per consecutive failure, capped at `maxSecs`); `dispatch()` refuses while the
+window is live, **before** the claim lock and the label flip (step 2.8, immediately
+after the #4444 park-label guard at step 2.7 — a deliberate park outranks a
+transient backoff, so a parked *and* backed-off issue is reported as
+`labeled-skip`), so a refusal costs no
+forge write and cannot itself flap anything. A *slow* checkpoint-less death is
+deliberately excluded — that is the mid-build-death (#3895) / review-stall (#3910)
+watchdogs' remit. Any outcome that makes real progress clears
+the window immediately, and a streak whose last failure is older than `maxSecs`
+restarts from zero. The work finder also drops backed-off candidates before the
+capacity gate (reported as `backoff-skip` on the per-tick summary line), so they
+never reserve a shared dispatch slot. Deliberately narrow: in-memory only (a
+daemon restart clears it — it can never permanently strand an issue), never
+touches a forge label, bounded by `maxSecs` (well under the quarantine TTL, so
+quarantine remains the longer, operator-visible brake), cleared by
+`loom-daemon quarantine clear <issue>` alongside the quarantine, and released
+before every **bounded one-shot recovery** dispatch — the reaper-driven resume
+(#4256) and all three watchdogs (#3887/#3895/#3910) — so a refusal can never burn
+a single-attempt recovery those latches already rate-limit.
+Alongside it, the registry counts its **own** `loom:issue`/`loom:building` writes
+per issue and logs a loud `LABEL FLAPPING` warning at 6 writes in 5 minutes
+(a healthy dispatch writes exactly 2), so the pattern shows up in `daemon.log`
+instead of only in the forge timeline. Disable with `LOOM_DISPATCH_BACKOFF=0` or
+`autonomous.workFinder.dispatchBackoff.enabled = false`.
 
 ### Host-distress circuit breaker (#4235)
 
