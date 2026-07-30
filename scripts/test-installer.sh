@@ -3097,6 +3097,32 @@ fi
 echo ""
 
 # ==========================================================================
+# sync-labels.sh --repo / --dry-run (fleet onboarding, #4498)
+# ==========================================================================
+# Its own unit suite lives at defaults/scripts/tests/test-sync-labels-repo-flag.sh
+# (the --repo NWO short-circuit proven from a non-git directory, target
+# exclusivity in the gh argv log, the forge-free --dry-run preview, unchanged
+# no-flag resolution, and the argument-parsing rejections). Fold its result into
+# the installer suite so it runs in CI + the build gate rather than dev-only.
+echo "Test: sync-labels.sh --repo flag suite (test-sync-labels-repo-flag.sh)"
+SYNC_LABELS_TEST="$DEFAULTS_DIR/scripts/tests/test-sync-labels-repo-flag.sh"
+if [[ -f "$SYNC_LABELS_TEST" ]]; then
+  set +e
+  SYNC_LABELS_TEST_OUT=$(bash "$SYNC_LABELS_TEST" 2>&1)
+  SYNC_LABELS_TEST_RC=$?
+  set -e
+  if [[ $SYNC_LABELS_TEST_RC -eq 0 ]]; then
+    pass "test-sync-labels-repo-flag.sh: all cases passed"
+  else
+    fail "test-sync-labels-repo-flag.sh failed (rc=$SYNC_LABELS_TEST_RC)"
+    echo "$SYNC_LABELS_TEST_OUT" | tail -20
+  fi
+else
+  fail "test-sync-labels-repo-flag.sh not found at $SYNC_LABELS_TEST"
+fi
+echo ""
+
+# ==========================================================================
 # Summary
 # ==========================================================================
 echo "======================================"
