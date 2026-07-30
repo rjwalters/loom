@@ -3097,6 +3097,197 @@ fi
 echo ""
 
 # ==========================================================================
+# Quick Install leaves WORKING guard-hook wiring (issue #4401)
+# ==========================================================================
+# Regression guard for the reported zero-coverage state: `install.sh --quick`
+# (fresh AND `--confirm-reinstall`) used to leave a repo with NO guard-hook
+# execution path at all —
+#   - `provision_loom_hooks` had a single caller on the FULL install path, so the
+#     user-scope ~/.claude/settings.json was never wired by --quick, and
+#   - the project-level `.claude/settings.json` entries were gone too: the 0.16.0
+#     defaults carry no `hooks` block (Phase 5 / #4262) and a reinstall's chained
+#     `uninstall-loom.sh` jq-strips every `.loom/hooks/`-prefixed command, while
+#     `install_hooks_and_cli` still writes the `.loom/hooks/` copies those
+#     stripped entries were the only way to reach.
+# Asserting only that provision-hooks.sh EXISTS (the pre-#4401 coverage above)
+# could not catch this, so these cases assert the two things that actually
+# matter: install.sh CALLS the wiring on both quick paths, and the wiring turns a
+# zero-coverage target into a target with at least one working path.
+echo "Test: install.sh --quick wires guard hooks at both call sites (#4401)"
+if grep -q 'source "\$LOOM_ROOT/scripts/install/provision-hooks.sh"' "$WRAPPER_SCRIPT"; then
+  pass "install.sh sources scripts/install/provision-hooks.sh"
+else
+  fail "install.sh does not source scripts/install/provision-hooks.sh (quick path cannot wire guard hooks)"
+fi
+# Two call sites: the --confirm-reinstall quick branch and the fresh quick branch.
+WIRE_CALLS=$(grep -c '^[[:space:]]*wire_quick_install_guard_hooks "\$TARGET_PATH"' "$WRAPPER_SCRIPT" || true)
+if [[ "$WIRE_CALLS" -eq 2 ]]; then
+  pass "wire_quick_install_guard_hooks invoked at both Quick Install call sites (fresh + reinstall)"
+else
+  fail "expected 2 wire_quick_install_guard_hooks call sites in install.sh, found $WIRE_CALLS"
+fi
+# The wiring must run AFTER the hook copies exist (it points project-level
+# entries at them) — assert the ordering rather than mere presence.
+FIRST_COPY_LINE=$(grep -n '^[[:space:]]*install_hooks_and_cli "\$LOOM_ROOT" "\$TARGET_PATH"' "$WRAPPER_SCRIPT" | head -1 | cut -d: -f1)
+FIRST_WIRE_LINE=$(grep -n '^[[:space:]]*wire_quick_install_guard_hooks "\$TARGET_PATH"' "$WRAPPER_SCRIPT" | head -1 | cut -d: -f1)
+if [[ -n "$FIRST_COPY_LINE" && -n "$FIRST_WIRE_LINE" ]] && [[ "$FIRST_WIRE_LINE" -gt "$FIRST_COPY_LINE" ]]; then
+  pass "guard-hook wiring runs after install_hooks_and_cli writes the .loom/hooks/ copies"
+else
+  fail "guard-hook wiring must run after install_hooks_and_cli (copy line=$FIRST_COPY_LINE, wire line=$FIRST_WIRE_LINE)"
+fi
+# It must also precede the reinstall branch's git-index reconcile, so the
+# reconcile sees the final .claude/settings.json content.
+RECONCILE_LINE=$(grep -n 'Reconciling git index after reinstall' "$WRAPPER_SCRIPT" | head -1 | cut -d: -f1)
+if [[ -n "$RECONCILE_LINE" && -n "$FIRST_WIRE_LINE" ]] && [[ "$FIRST_WIRE_LINE" -lt "$RECONCILE_LINE" ]]; then
+  pass "guard-hook wiring runs before the reinstall git-index reconcile"
+else
+  fail "guard-hook wiring must precede the git-index reconcile (wire=$FIRST_WIRE_LINE, reconcile=$RECONCILE_LINE)"
+fi
+echo ""
+
+# Functional halves. Both replay the exact post-`loom-daemon init` on-disk state a
+# Quick Install produces (the daemon binary is deliberately not built in this
+# suite), then run the REAL provisioning functions install.sh now calls.
+if command -v jq >/dev/null 2>&1; then
+  # Count project-level entries that reference a per-repo hook copy. Excludes the
+  # machine-level wrapper form (its transition-dedup probe also mentions
+  # `.loom/hooks/<name>`, but it EXITS instead of running the copy).
+  count_reachable_hooks() {
+    local settings="$1"
+    [[ -f "$settings" ]] || { echo 0; return 0; }
+    jq '[ (.hooks // {}) | to_entries[] | .value[]? | .hooks[]? | .command // ""
+          | select(contains(".loom/hooks/")) | select(contains("defaults/hooks/") | not) ] | length' \
+      "$settings" 2>/dev/null || echo 0
+  }
+
+  # ── #4401a: FRESH `--quick` install ────────────────────────────────────────
+  echo "Test: fresh install.sh --quick leaves working guard-hook wiring (#4401)"
+  Q_FRESH="$TEST_DIR/quick-fresh-hooks"
+  create_temp_repo "$Q_FRESH"
+  # What `loom-daemon init` writes on a fresh install: the 0.16.0 defaults
+  # settings.json, which carries permissions and NO `hooks` block.
+  mkdir -p "$Q_FRESH/.claude"
+  cp "$DEFAULTS_DIR/.claude/settings.json" "$Q_FRESH/.claude/settings.json"
+  # What install.sh's install_hooks_and_cli writes: the per-repo hook copies.
+  mkdir -p "$Q_FRESH/.loom/hooks"
+  for _h in "$DEFAULTS_DIR/hooks/"*.sh; do
+    [[ -f "$_h" ]] || continue
+    cp "$_h" "$Q_FRESH/.loom/hooks/"
+    chmod +x "$Q_FRESH/.loom/hooks/$(basename "$_h")"
+  done
+  # Pre-fix state: copies on disk, nothing referencing them.
+  if [[ "$(count_reachable_hooks "$Q_FRESH/.claude/settings.json")" -eq 0 ]]; then
+    pass "pre-wiring: a fresh --quick target has ZERO reachable guard hooks (the #4401 bug)"
+  else
+    fail "fixture invalid: expected zero reachable hooks before wiring"
+  fi
+  # Now the real wiring, with a sandboxed HOME so the user-scope merge is
+  # exercised without touching the developer's ~/.claude/settings.json.
+  Q_HOME="$TEST_DIR/quick-fresh-home"
+  mkdir -p "$Q_HOME"
+  set +e
+  # shellcheck source=scripts/install/provision-hooks.sh
+  source "$LOOM_ROOT/scripts/install/provision-hooks.sh"
+  provision_loom_hooks "$Q_HOME/.claude" >/dev/null 2>&1
+  ensure_project_hook_wiring "$Q_FRESH" >/dev/null 2>&1
+  set -e
+  Q_FRESH_REACHABLE=$(count_reachable_hooks "$Q_FRESH/.claude/settings.json")
+  if [[ "$Q_FRESH_REACHABLE" -gt 0 ]]; then
+    pass "fresh --quick: $Q_FRESH_REACHABLE guard hook(s) reachable via project-level entries"
+  else
+    fail "fresh --quick: still ZERO reachable guard hooks after wiring"
+  fi
+  # AC1's named check: the machine-level marker landed in the user-scope file.
+  if grep -q '/defaults/hooks/' "$Q_HOME/.claude/settings.json" 2>/dev/null; then
+    pass "fresh --quick: user-scope settings.json carries the /defaults/hooks/ marker"
+  else
+    fail "fresh --quick: user-scope settings.json missing the /defaults/hooks/ marker"
+  fi
+  # Every wired project-level entry must resolve to a real executable script —
+  # a dangling command is not coverage.
+  Q_DANGLING=0
+  while IFS= read -r _cmd; do
+    [[ -n "$_cmd" ]] || continue
+    _rel="${_cmd#\$\{CLAUDE_PROJECT_DIR\}/}"
+    [[ -x "$Q_FRESH/$_rel" ]] || Q_DANGLING=$((Q_DANGLING + 1))
+  done < <(jq -r '[ (.hooks // {}) | to_entries[] | .value[]? | .hooks[]? | .command // ""
+                    | select(contains(".loom/hooks/")) | select(contains("defaults/hooks/") | not) ] | .[]' \
+                 "$Q_FRESH/.claude/settings.json" 2>/dev/null)
+  if [[ "$Q_DANGLING" -eq 0 ]]; then
+    pass "fresh --quick: every wired project-level entry points at an executable hook script"
+  else
+    fail "fresh --quick: $Q_DANGLING wired entr(ies) point at a missing/non-executable script"
+  fi
+  echo ""
+
+  # ── #4401b: `--quick --confirm-reinstall` over a pre-Phase-6 repo ──────────
+  # This is the reported repro. It drives the REAL uninstaller (the component
+  # that strips the project-level entries) rather than simulating the strip.
+  echo "Test: --quick --confirm-reinstall over a pre-Phase-6 repo keeps guard hooks (#4401)"
+  Q_RE="$TEST_DIR/quick-reinstall-hooks"
+  create_temp_repo "$Q_RE"
+  simulate_loom_install "$Q_RE"   # pre-Phase-6 shape: copies + legacy project entries
+  git -C "$Q_RE" add -A >/dev/null 2>&1 || true
+  git -C "$Q_RE" -c user.email=t@t -c user.name=T commit -qm "loom install" >/dev/null 2>&1 || true
+  if [[ "$(count_reachable_hooks "$Q_RE/.claude/settings.json")" -gt 0 ]]; then
+    pass "pre-reinstall: the pre-Phase-6 repo has working project-level guard hooks"
+  else
+    fail "fixture invalid: pre-Phase-6 repo should start with reachable guard hooks"
+  fi
+  # Step 1 of a --confirm-reinstall: the chained uninstall.
+  set +e
+  "$UNINSTALL_SCRIPT" --yes --local "$Q_RE" >/dev/null 2>&1
+  set -e
+  if [[ "$(count_reachable_hooks "$Q_RE/.claude/settings.json")" -eq 0 ]]; then
+    pass "chained uninstall strips every project-level .loom/hooks/ entry (root cause confirmed)"
+  else
+    fail "expected the chained uninstall to strip project-level hook entries"
+  fi
+  # Step 2: `loom-daemon init --force` re-lands the defaults settings.json, which
+  # re-adds NO hooks block (Phase 5). Step 3: install_hooks_and_cli rewrites the
+  # per-repo copies. Together: copies present, nothing referencing them.
+  mkdir -p "$Q_RE/.claude" "$Q_RE/.loom/hooks"
+  cp "$DEFAULTS_DIR/.claude/settings.json" "$Q_RE/.claude/settings.json"
+  for _h in "$DEFAULTS_DIR/hooks/"*.sh; do
+    [[ -f "$_h" ]] || continue
+    cp "$_h" "$Q_RE/.loom/hooks/"
+    chmod +x "$Q_RE/.loom/hooks/$(basename "$_h")"
+  done
+  if [[ "$(count_reachable_hooks "$Q_RE/.claude/settings.json")" -eq 0 ]]; then
+    pass "post-init: still ZERO reachable guard hooks (the exact #4401 report state)"
+  else
+    fail "fixture invalid: expected zero reachable hooks after uninstall+init"
+  fi
+  # Step 4 (the fix): wire_quick_install_guard_hooks' two calls.
+  Q_RE_HOME="$TEST_DIR/quick-reinstall-home"
+  mkdir -p "$Q_RE_HOME"
+  set +e
+  provision_loom_hooks "$Q_RE_HOME/.claude" >/dev/null 2>&1
+  ensure_project_hook_wiring "$Q_RE" >/dev/null 2>&1
+  set -e
+  Q_RE_REACHABLE=$(count_reachable_hooks "$Q_RE/.claude/settings.json")
+  if [[ "$Q_RE_REACHABLE" -gt 0 ]]; then
+    pass "quick reinstall: $Q_RE_REACHABLE guard hook(s) reachable again (not zero)"
+  else
+    fail "quick reinstall: still ZERO reachable guard hooks after wiring (#4401 not fixed)"
+  fi
+  if grep -q '/defaults/hooks/' "$Q_RE_HOME/.claude/settings.json" 2>/dev/null; then
+    pass "quick reinstall: user-scope settings.json carries the /defaults/hooks/ marker"
+  else
+    fail "quick reinstall: user-scope settings.json missing the /defaults/hooks/ marker"
+  fi
+  # The consumer's own project permissions must survive the wiring.
+  if jq -e '.permissions.allow | length > 0' "$Q_RE/.claude/settings.json" >/dev/null 2>&1; then
+    pass "quick reinstall: project permissions preserved by the hook wiring"
+  else
+    fail "quick reinstall: hook wiring damaged the project permissions block"
+  fi
+  echo ""
+else
+  warn "jq not available - skipping #4401 quick-install guard-hook wiring tests"
+fi
+
+# ==========================================================================
 # sync-labels.sh --repo / --dry-run (fleet onboarding, #4498)
 # ==========================================================================
 # Its own unit suite lives at defaults/scripts/tests/test-sync-labels-repo-flag.sh

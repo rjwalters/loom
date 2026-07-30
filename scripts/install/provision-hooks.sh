@@ -11,7 +11,9 @@
 #
 # Source this file with:
 #     source "$LOOM_ROOT/scripts/install/provision-hooks.sh"
-# then call `provision_loom_hooks [claude_dir]`.
+# then call `provision_loom_hooks [claude_dir]` (user-scope wiring) and/or
+# `ensure_project_hook_wiring <target>` (the pre-Phase-6 project-level fallback
+# described under "Why the project-level fallback exists" below).
 #
 # Deliberately self-contained (defines its own output helpers) so the test suite
 # can source it without pulling in the full installer.
@@ -55,6 +57,34 @@
 # (MACHINE_HOOK_MARKER). Dedup and removal both key on that substring, which
 # survives any requoting Claude Code applies to settings.json, so a re-run never
 # duplicates an entry and deprovision never orphans one.
+#
+# ── Why the project-level fallback exists (issue #4401) ───────────────────────
+# The user-scope wiring above is only HALF a guard-hook execution path. Two
+# preconditions must ALSO hold for it to actually fire:
+#   (a) a machine checkout must exist at ${LOOM_HOME:-$HOME/.local/share/loom}
+#       (established by provision_loom_dispatcher on the FULL install path only), and
+#   (b) the repo must carry NO per-repo `.loom/hooks/<name>` copy — otherwise the
+#       TRANSITION DEDUP step above makes the wrapper defer to the project-level
+#       entry that runs that copy.
+# `install.sh --quick` satisfies NEITHER: it never provisions a machine checkout,
+# and `install_hooks_and_cli` writes a fresh `.loom/hooks/*.sh` copy set on every
+# run. Meanwhile the 0.16.0 `defaults/.claude/settings.json` carries no `hooks`
+# block, and a `--confirm-reinstall`'s chained `uninstall-loom.sh` jq-strips every
+# `.loom/hooks/`-prefixed command out of the project `.claude/settings.json`. Net
+# result before #4401: copies present → user-scope defers; project entries gone →
+# ZERO guards ran on a supported update path (the #4401 report).
+#
+# `ensure_project_hook_wiring` closes that hole from the other side: whenever a
+# target still carries per-repo `.loom/hooks/<name>` copies, it (re)asserts the
+# matching project-level `${CLAUDE_PROJECT_DIR}/.loom/hooks/<name>` entries so the
+# copies the quick path just wrote are actually reachable. It is a no-op on a
+# post-Phase-6 (migrated, copy-free) repo, where the user-scope wiring is the one
+# true path. Exactly one path fires in either case — never both, never neither.
+#
+# NOTE this is deliberately re-asserted on EVERY install rather than made to
+# "survive" an uninstall: `uninstall-loom.sh` strips on the `.loom/hooks/` command
+# prefix, not on provenance, so no project-level entry can be made strip-proof.
+# Re-adding after init is the only durable shape (curator addendum, #4401).
 
 # Emit a hooks-provision status line (plain text so sourcing tests can assert).
 _phook_ok()   { echo "  [loom-hooks] $*"; }
@@ -69,6 +99,13 @@ _phook_warn() { echo "  [loom-hooks] WARNING: $*" >&2; }
 PROVISIONED_HOOKS_SETTINGS=""
 # shellcheck disable=SC2034
 PROVISIONED_HOOKS_BACKUP=""
+# Same contract for the project-level fallback (`ensure_project_hook_wiring`,
+# #4401): the resolved project settings path and how many per-repo hook copies it
+# asserted entries for (0 on a migrated, copy-free repo).
+# shellcheck disable=SC2034
+PROJECT_HOOKS_SETTINGS=""
+# shellcheck disable=SC2034
+PROJECT_HOOKS_WIRED=0
 
 # The Loom guard-hook wiring set. Parallel arrays (matcher strings contain `|`,
 # so a delimited single array is unsafe). Order mirrors defaults/.claude/
@@ -162,7 +199,7 @@ provision_loom_hooks() {
         local name="${_PHOOK_NAMES[$i]}"
         local cmd
         cmd="$(_phook_cmd "$name")"
-        if _phook_merge_one "$settings" "$htype" "$matcher" "$name" "$cmd"; then
+        if _phook_merge_one "$settings" "$htype" "$matcher" "defaults/hooks/$name" "$cmd"; then
             _phook_ok "wired $htype/${matcher:-<all>} -> $name"
         else
             _phook_warn "failed to wire $name into $settings"
@@ -173,19 +210,32 @@ provision_loom_hooks() {
     return "$soft_fail"
 }
 
-# Merge a single hook entry into <settings_file>, deduplicating by the
-# machine-level marker substring `defaults/hooks/<name>` (survives requoting).
-#   $1 settings_file  $2 hook_type  $3 matcher  $4 name  $5 command
+# Merge a single hook entry into <settings_file>, deduplicating by a marker
+# substring that survives requoting — `defaults/hooks/<name>` for the
+# machine-level (user-scope) form, `.loom/hooks/<name>` for the project-level
+# form. The marker is passed in rather than derived so both callers share this
+# one merge implementation.
+# <$6 exclude_marker> (optional) narrows the duplicate test: a command counts as
+# an existing copy only when it contains <dedup_marker> and does NOT contain
+# <exclude_marker>. The project-level caller needs this because the MACHINE-level
+# wrapper command embeds `$ROOT/.loom/hooks/<name>` in its transition-dedup probe
+# — so a bare `.loom/hooks/<name>` substring test would mistake a stray
+# machine-level entry for the project-level entry that entry defers TO, and skip
+# writing the only command that actually executes anything.
+#   $1 settings_file  $2 hook_type  $3 matcher  $4 dedup_marker  $5 command
+#   $6 exclude_marker (optional)
 _phook_merge_one() {
-    local f="$1" htype="$2" matcher="$3" name="$4" cmd="$5"
-    local marker="defaults/hooks/$name"
+    local f="$1" htype="$2" matcher="$3" marker="$4" cmd="$5" exclude="${6:-}"
     local tmp
     tmp="$(mktemp 2>/dev/null)" || return 1
     if jq \
         --arg ht "$htype" \
         --arg m "$matcher" \
         --arg marker "$marker" \
+        --arg exclude "$exclude" \
         --arg cmd "$cmd" '
+        def is_dup($c): ($c | contains($marker))
+            and (($exclude | length) == 0 or ($c | contains($exclude) | not));
         .hooks = (.hooks // {})
         | .hooks[$ht] = (.hooks[$ht] // [])
         | (.hooks[$ht] | map(.matcher // "") | index($m)) as $idx
@@ -193,7 +243,7 @@ _phook_merge_one() {
             .hooks[$ht] += [{matcher: $m, hooks: [{type: "command", command: $cmd}]}]
           else
             .hooks[$ht][$idx].hooks = (.hooks[$ht][$idx].hooks // [])
-            | if (.hooks[$ht][$idx].hooks | map(.command // "") | any(contains($marker)))
+            | if (.hooks[$ht][$idx].hooks | map(.command // "") | any(is_dup(.)))
               then .
               else .hooks[$ht][$idx].hooks += [{type: "command", command: $cmd}]
               end
@@ -204,6 +254,106 @@ _phook_merge_one() {
     fi
     rm -f "$tmp"
     return 1
+}
+
+# ensure_project_hook_wiring <target> [settings_rel]
+#
+# Guarantee that a target repo which still carries per-repo `.loom/hooks/<name>`
+# copies has the matching PROJECT-level `.claude/settings.json` entries that
+# execute them (issue #4401). See "Why the project-level fallback exists" in the
+# header for the full rationale; the short version:
+#
+#   copies present  → project-level entries run them; the user-scope wrapper
+#                     defers (transition dedup) so each guard fires exactly once.
+#   copies absent   → no-op; the machine-level user-scope wiring is the one path.
+#
+# Additive and idempotent: an operator's own hook entries are never touched, and
+# an entry already present (matched by the `.loom/hooks/<name>` substring, which
+# also covers the legacy pre-#3277 bare-relative form) is never duplicated. Uses
+# the `${CLAUDE_PROJECT_DIR}` prefix (#3277) for new entries so the command
+# resolves from the project root regardless of Claude Code's cwd.
+#
+# Best-effort — never fatal. Returns 1 on a soft failure (jq missing, invalid
+# existing JSON, unwritable path) so the caller can note it without aborting.
+ensure_project_hook_wiring() {
+    local target="${1:-}"
+    local settings_rel="${2:-.claude/settings.json}"
+    local settings="$target/$settings_rel"
+    local hooks_dir="$target/.loom/hooks"
+
+    # Publish resolved state on EVERY return path so the caller (and the test
+    # suite) can VERIFY the outcome rather than trust a message (#4053 contract).
+    # shellcheck disable=SC2034
+    PROJECT_HOOKS_SETTINGS="$settings"
+    # shellcheck disable=SC2034
+    PROJECT_HOOKS_WIRED=0
+
+    if [[ -z "$target" || ! -d "$target" ]]; then
+        _phook_warn "project hook wiring: target '${target:-<unset>}' is not a directory."
+        return 1
+    fi
+
+    # Post-Phase-6 (migrated / copy-free) repo: nothing to make reachable. The
+    # user-scope wiring provisioned by provision_loom_hooks is the execution path.
+    local have_copy=false i
+    for i in "${!_PHOOK_NAMES[@]}"; do
+        if [[ -f "$hooks_dir/${_PHOOK_NAMES[$i]}" ]]; then
+            have_copy=true
+            break
+        fi
+    done
+    if [[ "$have_copy" != "true" ]]; then
+        _phook_ok "no per-repo .loom/hooks/ copies — guards run from the machine checkout (no project entries needed)"
+        return 0
+    fi
+
+    if ! command -v jq >/dev/null 2>&1; then
+        _phook_warn "jq not available; cannot assert project-level hook entries in $settings."
+        return 1
+    fi
+
+    if ! mkdir -p "$(dirname "$settings")" 2>/dev/null; then
+        _phook_warn "could not create $(dirname "$settings"); skipping project hook wiring."
+        return 1
+    fi
+
+    # Refuse to touch an existing file that is not valid JSON — a blind write
+    # would clobber the consumer's project settings.
+    if [[ -s "$settings" ]]; then
+        if ! jq empty "$settings" >/dev/null 2>&1; then
+            _phook_warn "$settings is not valid JSON; leaving it untouched."
+            return 1
+        fi
+    else
+        printf '{}\n' > "$settings" 2>/dev/null || {
+            _phook_warn "could not initialize $settings."
+            return 1
+        }
+    fi
+
+    local soft_fail=0 wired=0
+    for i in "${!_PHOOK_NAMES[@]}"; do
+        local name="${_PHOOK_NAMES[$i]}"
+        # Only wire a hook whose script is actually present on disk — a missing
+        # copy (e.g. the #4041 vendored generic guard the installer deliberately
+        # skips) must not get a dangling project-level entry.
+        [[ -f "$hooks_dir/$name" ]] || continue
+        local htype="${_PHOOK_TYPES[$i]}"
+        local matcher="${_PHOOK_MATCHERS[$i]}"
+        # shellcheck disable=SC2016  # ${CLAUDE_PROJECT_DIR} is expanded by Claude Code, not bash
+        local cmd='${CLAUDE_PROJECT_DIR}/.loom/hooks/'"$name"
+        if _phook_merge_one "$settings" "$htype" "$matcher" ".loom/hooks/$name" "$cmd" "defaults/hooks/"; then
+            wired=$((wired + 1))
+        else
+            _phook_warn "failed to assert project-level entry for $name in $settings"
+            soft_fail=1
+        fi
+    done
+
+    # shellcheck disable=SC2034
+    PROJECT_HOOKS_WIRED="$wired"
+    _phook_ok "project-level hook entries asserted for $wired per-repo hook copy/copies -> $settings"
+    return "$soft_fail"
 }
 
 # deprovision_loom_hooks [claude_dir]

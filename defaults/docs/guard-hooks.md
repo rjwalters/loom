@@ -44,6 +44,41 @@ place by this phase; removing them is Phase 6 (#4254) migration territory. Daemo
 spawned workers inherit the user-scope wiring because `loom-daemon` copies
 `~/.claude/settings.json` into each worker's isolated `CLAUDE_CONFIG_DIR`.
 
+### Quick Install and the project-level fallback (#4401)
+
+Step 2 above (transition precedence) means the user-scope wiring is **only half** an
+execution path: while a repo still carries `.loom/hooks/` copies, the wrapper defers
+to a **project-level** `.claude/settings.json` entry — so that entry has to exist.
+`install.sh --quick` still writes those copies (`install_hooks_and_cli`), but the
+0.16.0 `defaults/.claude/settings.json` deliberately carries no `hooks` block, and a
+`--confirm-reinstall`'s chained `scripts/uninstall-loom.sh` strips every
+`.loom/hooks/`-prefixed command out of the project file. Before #4401 that combination
+left a `--quick`-installed repo with **zero** guards: copies present (so the wrapper
+deferred) and no project entry to defer to.
+
+Both Quick Install call sites now run `wire_quick_install_guard_hooks`, which calls:
+
+- **`provision_loom_hooks`** — the user-scope wiring (previously reached only via the
+  Full Install path). Note the quick path does not establish the machine checkout
+  (`provision_loom_dispatcher` is Full-Install-only), so on a quick-only machine these
+  entries stay a silent no-op until a Full Install / `loom update` creates
+  `~/.local/share/loom` — or `LOOM_HOME` points at a checkout.
+- **`ensure_project_hook_wiring`** — re-asserts the project-level
+  `${CLAUDE_PROJECT_DIR}/.loom/hooks/<name>` entries for every hook copy actually
+  present on disk. This is the layer that is guaranteed live on the quick path. It is a
+  **no-op** on a post-Phase-6 (migrated, copy-free) repo, where the machine-level path
+  is the one true path.
+
+The two compose to **exactly one** firing path in either configuration — copies present
+⇒ project entry runs, wrapper defers; copies absent ⇒ no project entry written, wrapper
+execs the machine hook. It is re-asserted on every install rather than made
+strip-proof: the uninstaller matches on the `.loom/hooks/` command prefix, not on
+provenance, so no project-level entry can survive an uninstall by design.
+
+If you want the machine-level end state (no per-repo copies at all), run
+`loom migrate` (Phase 6 / #4254) — it untracks the legacy copies, after which
+`ensure_project_hook_wiring` stops writing project entries on its own.
+
 ### Config tiers
 
 The guard toggles below are documented against `.loom/config.json` for historical
