@@ -68,6 +68,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 /// Default macOS launchd label, matching `loom-daemon-start.sh` /
 /// `loom-daemon-watchdog.sh`'s fallback when the marker predates the
@@ -96,6 +97,46 @@ pub const EXIT_ALIVE_BUT_UNRESPONSIVE: i32 = 4;
 /// faulted. Overridable via `LOOM_DAEMON_STARTUP_GRACE_SECS`. Sized above the
 /// observed ~40–60s `bootout`/`bootstrap` socket-bind latency (#4213).
 pub const DEFAULT_STARTUP_GRACE_SECS: u64 = 90;
+
+/// Wall-clock bound (seconds) on every query-only subprocess probe this module
+/// makes — `kill -0`, `id -u`, `ps -o etime=`, `launchctl print`, `systemctl
+/// --user is-enabled` (#4548).
+///
+/// All of these normally answer in milliseconds, but each has a real-world hang
+/// mode: a wedged `systemd --user` bus makes `systemctl` block on a D-Bus
+/// connect, and `launchctl print` against an unreachable domain can stall on
+/// XPC. Unbounded, any one of them wedges `loom-daemon status` — the very
+/// command an operator runs to diagnose a wedge. A couple of seconds is far
+/// above the real cost of these probes even on a loaded CI runner, yet keeps
+/// `status` responsive.
+const PROBE_TIMEOUT_SECS: u64 = 2;
+
+/// [`PROBE_TIMEOUT_SECS`] as a [`Duration`].
+const PROBE_TIMEOUT: Duration = Duration::from_secs(PROBE_TIMEOUT_SECS);
+
+/// Run a query-only probe `cmd`, abandoning (killing) it if it exceeds
+/// `timeout`, and collapse *every* failure mode to `None` (#4548).
+///
+/// `None` therefore means "no usable answer" for all three of: the binary is
+/// absent/unspawnable, the spawn itself failed, or the probe hung past
+/// `timeout`. Every caller in this module already degraded a failed/absent
+/// binary to its unknown value (`None` / `false`), so folding the timeout into
+/// the same arm keeps the existing verdict semantics — including the #4069
+/// exit-code mapping — byte-for-byte unchanged for any probe that completes in
+/// time.
+///
+/// `stdin` is explicitly nulled to preserve `Command::output()`'s contract:
+/// `output()` nulls stdin, while [`output_with_timeout`]'s `spawn()` would
+/// otherwise *inherit* the daemon's stdin. None of these probes read stdin, but
+/// inheriting it is a behavior change this wrap must not smuggle in.
+///
+/// [`output_with_timeout`]: crate::sweep_registry::output_with_timeout
+fn probe_output(mut cmd: Command, timeout: Duration) -> Option<std::process::Output> {
+    cmd.stdin(std::process::Stdio::null());
+    crate::sweep_registry::output_with_timeout(cmd, timeout)
+        .ok()
+        .flatten()
+}
 
 // ============================================================================
 // Public types
@@ -399,19 +440,20 @@ fn resolve_marker_fields(map: &HashMap<String, String>, loom_dir: &Path) -> Mark
 /// `kill -0 <pid>` via subprocess (matches `terminal.rs`'s existing pattern
 /// in this crate — no `libc`/`nix` dependency needed). Returns `false` for
 /// both "no such process" and "not owned by us", exactly like the shell
-/// script's `kill -0 "$pid" 2>/dev/null`.
+/// script's `kill -0 "$pid" 2>/dev/null`. Bounded by [`PROBE_TIMEOUT`]; a hung
+/// `kill` degrades to `false`, exactly like an absent one (#4548).
 fn pid_alive(pid: u32) -> bool {
-    Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .output()
-        .is_ok_and(|o| o.status.success())
+    let mut cmd = Command::new("kill");
+    cmd.args(["-0", &pid.to_string()]);
+    probe_output(cmd, PROBE_TIMEOUT).is_some_and(|o| o.status.success())
 }
 
+/// Current uid via `id -u`. Bounded by [`PROBE_TIMEOUT`]; a hung `id` degrades
+/// to `None`, exactly like an absent one (#4548).
 fn current_uid() -> Option<String> {
-    Command::new("id")
-        .arg("-u")
-        .output()
-        .ok()
+    let mut cmd = Command::new("id");
+    cmd.arg("-u");
+    probe_output(cmd, PROBE_TIMEOUT)
         .filter(|o| o.status.success())
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
@@ -424,12 +466,15 @@ fn current_uid() -> Option<String> {
 /// [`resolve_launchd_domain`]) — the caller resolves it once and reuses it
 /// for both this probe and any human-readable detail string, avoiding a
 /// duplicate `launchctl`/`id` round trip per [`check_liveness`] call.
+///
+/// Bounded by [`PROBE_TIMEOUT`]: a `launchctl print` that stalls on XPC
+/// degrades to `None` — "no live pid" — exactly like an absent `launchctl`
+/// (#4548).
 fn launchctl_pid(domain: &str, label: &str) -> Option<u32> {
     let service = format!("{domain}/{label}");
-    let output = Command::new("launchctl")
-        .args(["print", &service])
-        .output()
-        .ok()?;
+    let mut cmd = Command::new("launchctl");
+    cmd.args(["print", &service]);
+    let output = probe_output(cmd, PROBE_TIMEOUT)?;
     if !output.status.success() {
         return None;
     }
@@ -553,12 +598,12 @@ fn parse_etime(raw: &str) -> Option<u64> {
 /// dependency — matches this module's `kill -0` / `launchctl` subprocess
 /// pattern). Degrades to `None` on a failed/absent `ps` or unparseable output,
 /// so the caller falls through to today's verdicts rather than falsely
-/// reporting "starting" (#4213).
+/// reporting "starting" (#4213). Bounded by [`PROBE_TIMEOUT`]: a hung `ps`
+/// takes the same `None` path (#4548).
 fn process_age_secs(pid: u32) -> Option<u64> {
-    let output = Command::new("ps")
-        .args(["-o", "etime=", "-p", &pid.to_string()])
-        .output()
-        .ok()?;
+    let mut cmd = Command::new("ps");
+    cmd.args(["-o", "etime=", "-p", &pid.to_string()]);
+    let output = probe_output(cmd, PROBE_TIMEOUT)?;
     if !output.status.success() {
         return None;
     }
@@ -967,10 +1012,12 @@ fn resolve_launchd_domain(override_value: Option<&str>) -> Option<String> {
     }
     let uid = current_uid()?;
     let gui = format!("gui/{uid}");
-    let gui_ok = Command::new("launchctl")
-        .args(["print", &gui])
-        .output()
-        .is_ok_and(|o| o.status.success());
+    let mut cmd = Command::new("launchctl");
+    cmd.args(["print", &gui]);
+    // A hung reachability probe reads as "gui/<uid> not reachable" — the same
+    // verdict an absent/nonzero `launchctl` gives — so the caller falls back to
+    // the SSH-reachable `user/<uid>` domain rather than blocking (#4548).
+    let gui_ok = probe_output(cmd, PROBE_TIMEOUT).is_some_and(|o| o.status.success());
     if gui_ok {
         return Some(gui);
     }
@@ -980,13 +1027,13 @@ fn resolve_launchd_domain(override_value: Option<&str>) -> Option<String> {
 /// Is the watchdog launchd job loaded? `launchctl print <domain>/<label>` exits
 /// 0 only for a bootstrapped job, so a nonzero exit is a real
 /// "not provisioned". A missing/unspawnable `launchctl` (or an undeterminable
-/// domain) yields `None` — unknown, never a false negative.
+/// domain) yields `None` — unknown, never a false negative. A probe that hangs
+/// past [`PROBE_TIMEOUT`] takes that same `None` path (#4548).
 fn launchctl_job_provisioned(label: &str, domain_override: Option<&str>) -> Option<bool> {
     let domain = resolve_launchd_domain(domain_override)?;
-    let output = Command::new("launchctl")
-        .args(["print", &format!("{domain}/{label}")])
-        .output()
-        .ok()?;
+    let mut cmd = Command::new("launchctl");
+    cmd.args(["print", &format!("{domain}/{label}")]);
+    let output = probe_output(cmd, PROBE_TIMEOUT)?;
     Some(output.status.success())
 }
 
@@ -1000,11 +1047,14 @@ fn launchctl_job_provisioned(label: &str, domain_override: Option<&str>) -> Opti
 /// "no such file" complaint is a genuine absence (`Some(false)`), while anything
 /// else — most importantly `Failed to connect to bus` on a host with no user
 /// manager — is `None` (unknown), never a false "not provisioned".
+///
+/// Bounded by [`PROBE_TIMEOUT`] (#4548): a wedged `systemd --user` bus can make
+/// `systemctl` block on its D-Bus connect instead of failing fast, and that
+/// hang degrades to the same `None` (unknown) an unspawnable `systemctl` gives.
 fn systemd_timer_provisioned(timer_unit: &str) -> Option<bool> {
-    let output = Command::new("systemctl")
-        .args(["--user", "is-enabled", timer_unit])
-        .output()
-        .ok()?;
+    let mut cmd = Command::new("systemctl");
+    cmd.args(["--user", "is-enabled", timer_unit]);
+    let output = probe_output(cmd, PROBE_TIMEOUT)?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     match stdout.lines().map(str::trim).find(|l| !l.is_empty()) {
         Some("enabled" | "enabled-runtime") => Some(true),
@@ -1148,8 +1198,9 @@ pub fn probe_protection() -> Option<ProtectionReport> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::fs;
-    use std::time::{Duration, SystemTime};
+    use std::time::{Duration, Instant, SystemTime};
 
     fn no_env_overrides() -> EnvOverrides {
         // `is_darwin: false` forces the pid-file path deterministically in
@@ -2041,5 +2092,191 @@ mod tests {
             ));
             assert!(!report.detail.is_empty());
         }
+    }
+
+    // ===================================================================
+    // Probe timeouts (#4548): every query-only subprocess this module
+    // spawns is bounded, and a hang degrades to the same value an
+    // absent/failing binary already produced.
+    // ===================================================================
+
+    /// Write an executable `#!/bin/sh` stub named `name` into `dir` (the
+    /// `disk_headroom.rs` PATH-stub pattern).
+    fn write_stub(dir: &Path, name: &str, body: &str) {
+        let path = dir.join(name);
+        fs::write(&path, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&path, perms).unwrap();
+        }
+    }
+
+    /// A stub that never exits on its own — the wedged-bus / stalled-XPC shape.
+    /// It sleeps far longer than [`PROBE_TIMEOUT`], so an unbounded probe would
+    /// visibly hang the test rather than merely slow it.
+    const HANG_STUB: &str = "#!/bin/sh\nsleep 60\n";
+
+    /// Generous upper bound on a bounded probe: well above `PROBE_TIMEOUT` +
+    /// spawn/kill overhead on a loaded runner, and far below `HANG_STUB`'s 60s.
+    fn hang_budget() -> Duration {
+        PROBE_TIMEOUT + Duration::from_secs(8)
+    }
+
+    /// Run `body` with `dir` prepended to `PATH`, restoring `PATH` afterwards.
+    /// Callers must be `#[serial]` — `PATH` is process-global (#4525).
+    fn with_path_prefix<T>(dir: &Path, body: impl FnOnce() -> T) -> T {
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{old_path}", dir.display()));
+        let out = body();
+        std::env::set_var("PATH", old_path);
+        out
+    }
+
+    #[test]
+    fn probe_output_abandons_a_command_that_outlives_its_timeout() {
+        // The mechanism itself: a child still running at the deadline is killed
+        // and reported as `None` (no usable answer), not awaited.
+        let mut cmd = Command::new("sleep");
+        cmd.arg("60");
+        let started = Instant::now();
+        let out = probe_output(cmd, Duration::from_millis(200));
+        let elapsed = started.elapsed();
+        assert!(out.is_none(), "a timed-out probe must degrade to None");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "probe_output must return at its deadline, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn probe_output_preserves_fast_success_and_fast_failure_verbatim() {
+        // AC: fast paths are unchanged by the wrap. A zero exit stays
+        // `Some(success)`, a NONZERO exit stays `Some(!success)` — collapsing
+        // the latter to `None` would flip `systemd_timer_provisioned`'s
+        // `Some(false)` ("present but disabled") into `None` ("unknown").
+        let mut ok = Command::new("sh");
+        ok.args(["-c", "printf hello; exit 0"]);
+        let ok_out = probe_output(ok, PROBE_TIMEOUT).expect("a fast command must be captured");
+        assert!(ok_out.status.success());
+        assert_eq!(String::from_utf8_lossy(&ok_out.stdout), "hello");
+
+        let mut fail = Command::new("sh");
+        fail.args(["-c", "printf boom >&2; exit 3"]);
+        let fail_out = probe_output(fail, PROBE_TIMEOUT).expect("a fast failure must be captured");
+        assert!(!fail_out.status.success());
+        assert_eq!(String::from_utf8_lossy(&fail_out.stderr), "boom");
+    }
+
+    #[test]
+    fn probe_output_degrades_to_none_when_the_binary_is_absent() {
+        // An unspawnable binary keeps its pre-#4548 `None`, so callers cannot
+        // tell "absent" from "hung" — both are simply "no answer".
+        let cmd = Command::new("loom-nonexistent-probe-binary-4548");
+        assert!(probe_output(cmd, PROBE_TIMEOUT).is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn systemd_timer_provisioned_degrades_to_unknown_when_systemctl_hangs() {
+        // The headline hang mode: `systemctl --user` blocking on a wedged
+        // `systemd --user` D-Bus connect. Bounded, it degrades to `None`
+        // (unknown) — the same verdict an unspawnable `systemctl` gives, never a
+        // false "not provisioned" and never an indefinite block.
+        //
+        // `systemctl` is a deliberately sibling-safe stub target: every other
+        // test in this module either injects its own provisioning probe closure
+        // or (like `protection_probe_never_panics_against_the_real_host`)
+        // already accepts `Unknown`, so shadowing it for this window cannot
+        // change another test's verdict.
+        let stub_dir = tempfile::tempdir().unwrap();
+        write_stub(stub_dir.path(), "systemctl", HANG_STUB);
+
+        let started = Instant::now();
+        let verdict =
+            with_path_prefix(stub_dir.path(), || systemd_timer_provisioned("loom-hang.timer"));
+        let elapsed = started.elapsed();
+
+        assert_eq!(verdict, None, "a hung systemctl must read as unknown");
+        assert!(
+            elapsed < hang_budget(),
+            "systemd_timer_provisioned must be bounded by PROBE_TIMEOUT, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn launchctl_probes_degrade_when_launchctl_hangs() {
+        // `launchctl print` can stall on XPC against an unreachable domain. All
+        // three launchctl probes must fall back to their absent-binary values:
+        // `launchctl_pid` -> None (no live pid), `launchctl_job_provisioned` ->
+        // None (unknown), and `resolve_launchd_domain` -> the SSH-reachable
+        // `user/<uid>` domain (its `gui/<uid>` reachability probe reads as
+        // "not reachable"). An explicit domain override is passed where
+        // possible so the assertions do not depend on a real `id -u`.
+        let stub_dir = tempfile::tempdir().unwrap();
+        write_stub(stub_dir.path(), "launchctl", HANG_STUB);
+
+        let started = Instant::now();
+        let (pid, provisioned) = with_path_prefix(stub_dir.path(), || {
+            (
+                launchctl_pid("gui/501", DEFAULT_LAUNCHD_LABEL),
+                launchctl_job_provisioned(DEFAULT_LAUNCHD_LABEL, Some("gui/501")),
+            )
+        });
+        let elapsed = started.elapsed();
+
+        assert_eq!(pid, None, "a hung launchctl print must yield no pid");
+        assert_eq!(provisioned, None, "a hung launchctl print must read as unknown");
+        assert!(
+            elapsed < hang_budget() * 2,
+            "both launchctl probes must be bounded by PROBE_TIMEOUT, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_launchd_domain_falls_back_to_user_uid_when_launchctl_hangs() {
+        // The reachability probe inside `resolve_launchd_domain` is the one
+        // launchctl call whose *timeout* is a verdict, not an error: it must
+        // read as "gui/<uid> unreachable" and hand back `user/<uid>`, exactly
+        // like the absent-launchctl path this repo's CI already exercises.
+        let uid = current_uid().expect("current_uid resolves in the test env");
+        let stub_dir = tempfile::tempdir().unwrap();
+        write_stub(stub_dir.path(), "launchctl", HANG_STUB);
+
+        let started = Instant::now();
+        let domain = with_path_prefix(stub_dir.path(), || resolve_launchd_domain(None));
+        let elapsed = started.elapsed();
+
+        assert_eq!(domain, Some(format!("user/{uid}")));
+        assert!(
+            elapsed < hang_budget(),
+            "resolve_launchd_domain must be bounded by PROBE_TIMEOUT, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn kill_id_and_ps_backed_probes_keep_their_fast_path_behavior() {
+        // AC: the `kill`/`id`/`ps` probes — the three that exist on Linux CI —
+        // behave identically after the wrap. Deliberately NOT PATH-stubbed:
+        // many sibling tests in this module classify against a real
+        // `pid_alive(std::process::id())` / `ps -o etime=`, and shadowing those
+        // binaries process-globally would flake them (#4525). `probe_output`'s
+        // own timeout coverage above proves the bound they share.
+        assert!(pid_alive(std::process::id()), "our own pid must read as alive");
+        // `i32::MAX` is above every platform's `pid_max`, so it never names a
+        // live process, and (unlike `u32::MAX`, which some `kill` builds
+        // wrap to the "every process" `-1`) it stays a plain positive pid.
+        const NO_SUCH_PID: u32 = i32::MAX as u32;
+        assert!(!pid_alive(NO_SUCH_PID), "an out-of-range pid must read as dead");
+        assert!(current_uid().is_some_and(|u| u.chars().all(|c| c.is_ascii_digit())));
+        assert!(
+            process_age_secs(std::process::id()).is_some(),
+            "a real ps against our own pid must still parse"
+        );
+        assert_eq!(process_age_secs(NO_SUCH_PID), None, "an unknown pid stays None");
     }
 }
