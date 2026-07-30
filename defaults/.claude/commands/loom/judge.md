@@ -341,8 +341,18 @@ stand-down comments:
 
 ```bash
 N=<pr-number>
+# `--paginate` re-invokes `--jq` once per response page and concatenates the
+# per-page results rather than applying the filter across the combined
+# timeline (#4637) — a timeline spanning more than one page (>100 events)
+# would otherwise yield a multi-line CLAIMED_AT that corrupts MARKER and
+# every comparison below. `// empty` drops the no-match-on-this-page line
+# entirely (not a literal "null"), and `sort | tail -n 1` collapses the
+# remaining per-page timestamps to the single latest one — RFC3339 UTC
+# timestamps (the `Z`-suffixed form the GitHub API returns) sort correctly
+# as plain strings, so this needs no minimum `gh` version.
 CLAIMED_AT=$(gh api "repos/{owner}/{repo}/issues/$N/timeline" --paginate \
-  --jq '[.[] | select(.event=="labeled" and .label.name=="loom:reviewing")] | last | .created_at')
+  --jq '[.[] | select(.event=="labeled" and .label.name=="loom:reviewing")] | last | .created_at // empty' \
+  | sort | tail -n 1)
 MARKER="<!-- loom:standdown claim=$CLAIMED_AT -->"
 COMMENTS_JSON=$(gh api "repos/{owner}/{repo}/issues/$N/comments" \
   | jq --arg t "$CLAIMED_AT" '[.[] | select(.created_at > $t)]')

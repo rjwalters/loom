@@ -296,17 +296,30 @@ pub mod forge {
 
     /// Parse a `gh --jq` scalar result that is either a bare RFC-3339
     /// timestamp or a JSON-quoted one, tolerating an empty/`null` result
-    /// (no match).
-    fn parse_timestamp(stdout: &[u8]) -> Option<DateTime<Utc>> {
+    /// (no match). Also tolerates multi-line output: `gh api --paginate`
+    /// re-invokes `--jq` once per page and concatenates the per-page
+    /// results, so a filter like `max // empty` run against a timeline
+    /// spanning more than one page (>100 events, as
+    /// [`fetch_last_blocked_labeled_at`] queries) yields one `max`-per-page
+    /// line rather than a single overall max (Issue #4637). Each
+    /// non-empty/non-`null` line is parsed independently and the maximum
+    /// across all lines is returned; a single-line result (e.g. from
+    /// [`fetch_last_quarantine_comment_at`]'s non-paginated `gh issue view`)
+    /// is handled identically to before.
+    pub(crate) fn parse_timestamp(stdout: &[u8]) -> Option<DateTime<Utc>> {
         let raw = String::from_utf8_lossy(stdout);
-        let trimmed = raw.trim();
-        if trimmed.is_empty() || trimmed == "null" {
-            return None;
-        }
-        let unquoted = trimmed.trim_matches('"');
-        DateTime::parse_from_rfc3339(unquoted)
-            .ok()
-            .map(|dt| dt.with_timezone(&Utc))
+        raw.lines()
+            .filter_map(|line| {
+                let trimmed = line.trim();
+                if trimmed.is_empty() || trimmed == "null" {
+                    return None;
+                }
+                let unquoted = trimmed.trim_matches('"');
+                DateTime::parse_from_rfc3339(unquoted)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&Utc))
+            })
+            .max()
     }
 
     /// Best-effort, single-issue check of whether `issue`'s current
@@ -711,5 +724,55 @@ exit 0
         let (checked, released) = forge::reconcile_workspace(&fake_gh, &repo_root);
         assert_eq!(checked, 0);
         assert_eq!(released, 0);
+    }
+
+    // Issue #4637: `gh api --paginate --jq` re-invokes the `--jq` filter once
+    // per page and concatenates the per-page results, so a `max // empty`
+    // filter against `fetch_last_blocked_labeled_at`'s paginated timeline
+    // query yields one line per page (>100 events) rather than a single
+    // overall max. `parse_timestamp` must resolve the true max across every
+    // line, while still handling the single-line result
+    // `fetch_last_quarantine_comment_at`'s non-paginated query always
+    // produces.
+
+    #[test]
+    fn parse_timestamp_single_line_bare() {
+        let parsed = forge::parse_timestamp(b"2026-01-01T00:00:00Z\n").unwrap();
+        assert_eq!(parsed.to_rfc3339(), "2026-01-01T00:00:00+00:00");
+    }
+
+    #[test]
+    fn parse_timestamp_multi_page_picks_max_out_of_order() {
+        let stdout = b"2026-01-01T00:00:00Z\n2026-03-15T12:30:00Z\n2026-02-01T00:00:00Z\n";
+        let parsed = forge::parse_timestamp(stdout).unwrap();
+        assert_eq!(parsed.to_rfc3339(), "2026-03-15T12:30:00+00:00");
+    }
+
+    #[test]
+    fn parse_timestamp_multi_page_skips_empty_and_null_lines() {
+        let stdout = b"\n2026-05-05T05:05:05Z\nnull\n";
+        let parsed = forge::parse_timestamp(stdout).unwrap();
+        assert_eq!(parsed.to_rfc3339(), "2026-05-05T05:05:05+00:00");
+    }
+
+    #[test]
+    fn parse_timestamp_returns_none_for_empty_output() {
+        assert!(forge::parse_timestamp(b"").is_none());
+        assert!(forge::parse_timestamp(b"\n\n").is_none());
+        assert!(forge::parse_timestamp(b"null\n").is_none());
+        assert!(forge::parse_timestamp(b"null\nnull\n").is_none());
+    }
+
+    #[test]
+    fn parse_timestamp_returns_none_for_garbage() {
+        assert!(forge::parse_timestamp(b"not-a-timestamp\n").is_none());
+        assert!(forge::parse_timestamp(b"not-a-timestamp\nalso-not-one\n").is_none());
+    }
+
+    #[test]
+    fn parse_timestamp_handles_json_quoted_lines() {
+        let stdout = b"\"2026-01-01T00:00:00Z\"\n\"2026-06-06T06:06:06Z\"\n";
+        let parsed = forge::parse_timestamp(stdout).unwrap();
+        assert_eq!(parsed.to_rfc3339(), "2026-06-06T06:06:06+00:00");
     }
 }
