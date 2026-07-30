@@ -69,6 +69,9 @@ impl TestDaemon {
         // rather than silently picking up whatever repos are registered in
         // this *host's* real `~/.loom/workspaces.json`.
         let workspaces_path = temp_dir.path().join("workspaces.json");
+        // Absolute (required — `worktree_root()` rejects a relative override
+        // and falls back to the default) and inside the `TempDir`.
+        let worktree_root = temp_dir.path().join("worktrees");
 
         let mut process = Command::new(daemon_bin())
             .env("LOOM_SOCKET_PATH", &socket_path)
@@ -91,15 +94,23 @@ impl TestDaemon {
             .env("LOOM_EPIC_SUPERVISOR", "0")
             // Repoint the daemon's own workspace root at this test's throwaway
             // `TempDir` (#4573) instead of letting it inherit the real repo
-            // checkout via `LOOM_WORKSPACE`/cwd. `worktree_root()` derives its
-            // default (`${repo_root}/.loom/worktrees`) from this same
-            // `repo_root` parameter and only reads `LOOM_WORKTREE_ROOT`
-            // itself as an *override* of the base directory, so pinning
-            // `LOOM_WORKSPACE` alone is sufficient to keep worktree-root
-            // resolution confined to the temp dir too — no separate
-            // `LOOM_WORKTREE_ROOT` override is needed.
+            // checkout via `LOOM_WORKSPACE`/cwd.
             .env("LOOM_WORKSPACE", temp_dir.path())
             .env("LOOM_WORKSPACES_PATH", &workspaces_path)
+            // …and pin the worktree base directory too (#4573). This is NOT
+            // redundant with `LOOM_WORKSPACE`: `worktree_root()` reads
+            // `LOOM_WORKTREE_ROOT` as its *highest-priority* source
+            // (`worktree_root.rs`), ahead of both `worktree.root` in config
+            // and the `${repo_root}/.loom/worktrees` default. A spawned child
+            // inherits the parent's environment, so on a host that sets
+            // `LOOM_WORKTREE_ROOT` (the documented external-scratch-volume
+            // setup) an unpinned test daemon would resolve worktrees onto that
+            // real volume — outside its `TempDir` — even with `LOOM_WORKSPACE`
+            // confined. Setting it explicitly makes confinement independent of
+            // the invoking environment. Note the daemon namespaces an
+            // *override* by repo basename, so the effective root is
+            // `<temp>/worktrees/<temp-basename>` — still inside the `TempDir`.
+            .env("LOOM_WORKTREE_ROOT", &worktree_root)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -139,6 +150,18 @@ impl TestDaemon {
     #[allow(dead_code)]
     pub fn workspace_path(&self) -> &Path {
         self._temp_dir.path()
+    }
+
+    /// PID of the spawned daemon child, or `None` once it has been reaped.
+    ///
+    /// Exposed so the #4573 confinement regression test can read the child's
+    /// *actual* environment (`/proc/<pid>/environ` on Linux) rather than
+    /// trusting that this module's `.env()` calls are still present — the only
+    /// way to verify pass-through for `LOOM_WORKTREE_ROOT`, which the daemon
+    /// consumes internally and never reports over IPC.
+    #[allow(dead_code)]
+    pub fn pid(&self) -> Option<u32> {
+        self.process.as_ref().map(std::process::Child::id)
     }
 }
 
