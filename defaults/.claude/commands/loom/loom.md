@@ -640,7 +640,7 @@ loom-clean --deep       # Also remove build artifacts
 | `loom:review-requested` | PR ready for review | Builder |
 | `loom:changes-requested` | PR needs fixes | Judge |
 | `loom:pr` | PR approved, ready to merge | Judge |
-| `loom:auto-merge-ok` | Override size limit for merge | Judge/Human |
+| `loom:auto-merge-ok` | Override a Champion merge-risk hold | Judge/Human |
 
 **Proposal labels:**
 
