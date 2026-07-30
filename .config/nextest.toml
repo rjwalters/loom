@@ -39,6 +39,23 @@
 #
 # When that lands, delete this block *and* the matching `<div class="warning">`
 # note in `loom-daemon/src/lib.rs`'s crate docs in the same commit.
+#
+# A SECOND FAILURE CLASS THIS FILE ALSO CLOSES -> #4561 (2026-07-30)
+#
+# A #4494 Doctor verification pass on PR #4543 hit a Tokio-runtime-context test
+# failure in a full `cargo test --workspace` run (2,264+ tests) that did not
+# reproduce when the same test was run alone — consistent with thread-local
+# Tokio runtime state (not just env vars/statics) colliding between two
+# unrelated tests under `cargo test`'s shared-process, multi-threaded harness.
+# That is the same process-shared-state hazard class #4385 diagnosed for env
+# mutation, just a different piece of thread-local state leaking across the
+# same kind of boundary. #4561's verification: `cargo nextest run --workspace
+# --profile ci -p loom-daemon --lib` (2,486 tests), run 3 consecutive times —
+# 2486/2486 passed on every run, no Tokio-runtime failure. Process-per-test
+# isolation closes this class structurally for the same reason it closes the
+# env-mutation race: no thread-local (or process-global) state survives across
+# a process boundary. No code fix was needed or made; #4561 is a
+# document-as-covered resolution, not a fixture change.
 
 nextest-version = "0.9.98"
 

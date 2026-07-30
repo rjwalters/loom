@@ -61,6 +61,23 @@ let daemon = TestDaemon::start().await?;
 let socket_path = daemon.socket_path();
 ```
 
+**Confinement invariant (#4573)** — a test daemon is a *real* `loom-daemon`
+process, so `TestDaemon::start()` spawns it fail-closed:
+
+- `LOOM_ROLE_RUNNER=0`, `LOOM_WORK_FINDER=0`, `LOOM_EPIC_SUPERVISOR=0` — these
+  env vars win outright over `.loom/config.json` in the daemon's
+  `env > config > default` chain, so a test daemon can never dispatch a real
+  sweep or run a real role session (this repo's own committed config has
+  `autonomous.roleRunner.enabled: true`).
+- `LOOM_WORKSPACE`, `LOOM_WORKSPACES_PATH`, `LOOM_WORKTREE_ROOT` — all pinned
+  inside the daemon's own `TempDir`, so it resolves *no* real repository state,
+  no matter what the invoking environment exports.
+
+If you add a new daemon spawn site to this suite, carry the same env over (see
+`integration_drain_then_exit.rs`). `integration_workspace_confinement.rs`
+enforces the invariant for `TestDaemon` and fails loudly if one of these is
+dropped.
+
 ### `TestClient`
 
 Client for communicating with the daemon.

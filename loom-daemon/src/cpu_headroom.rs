@@ -1,33 +1,38 @@
-//! CPU/load headroom term for the autonomous work-finder's dynamic
-//! concurrency cap (Issue #3978).
+//! Host CPU **measurement** — logical core count, load average, and measured
+//! idle fraction (#3978/#4031), plus the shared "is the host saturated?"
+//! predicate (#4259).
 //!
-//! [`crate::work_finder::resolve_dynamic_max_concurrent`] bounds the dynamic
-//! cap by `min(healthy_tokens × per_token, disk_headroom, configured_max)`.
-//! That formula models the token pool and the scratch-volume disk, but not
-//! CPU — so when a batch of exhausted tokens resets and the token axis jumps
-//! (e.g. 5 accounts recovering pushes it from ~2 to ~14), the daemon can
-//! dispatch far more concurrent `cargo build`s than the host has cores for.
-//! The result observed in #3978: 2-3 concurrent Rust builds in worktrees
-//! starved `build-gate.sh` of CPU badly enough that it hit its own 600s
-//! timeout, which the (separate, already-fixed-elsewhere — see #3974) gate
-//! then misreported as a verified-red `main`, halting all dispatch.
+//! # This module no longer gates admission (#4512)
 //!
-//! This module adds a fourth axis to the cap: how many *additional*
-//! concurrent sweeps the host's CPU can currently absorb, given
+//! Until #4512 this module also computed a *concurrency term*: `cpu_headroom =
+//! (logical_cpus × cpuUtilizationTarget − consumed_cores) / estCoresPerSweep`,
+//! folded into [`crate::work_finder::resolve_dynamic_max_concurrent`]'s
+//! `min(...)`. That term is **deleted**. It priced every sweep as if it were a
+//! build (`estCoresPerSweep`), so it throttled the ~90% of sweep wall-clock
+//! that is API-wait (curator / builder / judge conversations) in order to
+//! defend against the minority heavy-build case — measurably: an 8-core worker
+//! sitting **95% idle** was capped at 2 concurrent sweeps. The replacement, per
+//! #4512, is two-part:
 //!
-//! 1. **static capacity** — `logical_cpus × utilization_target`, the number
-//!    of cores this host is willing to dedicate to sweep work (leaving
-//!    headroom for the OS, the daemon itself, and the build-gate's own
-//!    `cargo` invocations), and
-//! 2. **current CPU consumption** — `logical_cpus × (1 − idle_fraction)`,
-//!    the number of cores actually being *consumed* right now, subtracted
-//!    from that capacity so a host that is already busy (someone else's
-//!    build, a live sweep mid-compile) backs the term off reactively.
+//! - **admission** is one per-machine knob (`autonomous.workFinder.maxConcurrent`),
+//!   tuned empirically by the operator, alongside the two hard exhaustible-resource
+//!   floors (the token axis and disk headroom);
+//! - **the genuinely heavy stages serialize where they occur**, via the
+//!   machine-wide build slot ([`crate::build_slot`]).
 //!
-//! Dividing the resulting headroom by an estimated per-sweep core cost
-//! (`est_cores_per_sweep` — a `cargo build`/`clippy` invocation typically
-//! parallelizes across several cores via rustc codegen units) yields how many
-//! more concurrent sweeps the host can start right now.
+//! What remains here is pure measurement, consumed by:
+//!
+//! - the **host-distress circuit breaker** (#4235 — [`load_per_core`]), the
+//!   load safety net that makes a hand-tuned ceiling safe to raise: a mis-set
+//!   knob trips a *measured* breaker instead of melting the host;
+//! - the **build gate's load-aware deferral** (#4259 — [`is_host_saturated`]);
+//! - `loom-daemon status` / `loom-daemon calibrate`, which report the host's
+//!   observed idle fraction so an operator can *see* whether the current
+//!   `maxConcurrent` is leaving the host idle or saturated.
+//!
+//! `LOOM_CPU_UTILIZATION_TARGET` / `LOOM_EST_CORES_PER_SWEEP` (and their
+//! `autonomous.*` config twins) are **accepted-but-ignored** with a one-shot
+//! deprecation warning — see [`crate::work_finder::warn_deprecated_cpu_knobs`].
 //!
 //! # Why measured idle fraction, not the load average (#4031)
 //!
@@ -40,9 +45,10 @@
 //! I/O**, which inflate load without consuming a core. That pointed the
 //! feedback loop the wrong way: more concurrent sweeps → more blocked `claude`
 //! processes → higher load average → *lower* concurrency cap, even while the
-//! CPU sat idle. This module now derives `consumed_cores` from a **measured
-//! idle fraction** (actual CPU consumption), per-platform, and keeps the load
-//! average only as a fail-open fallback.
+//! CPU sat idle. So the reported CPU **consumption** signal is a measured idle
+//! fraction, per-platform, with the load average kept only as a fallback for
+//! reporting and as the (separate, deliberately load-average-based) input to
+//! the saturation predicate and the host breaker.
 //!
 //! # Why shell out / read `/proc` instead of a `sysinfo`-style crate
 //!
@@ -70,22 +76,15 @@
 //!
 //! # Fail-open, not fail-closed
 //!
-//! The signal chain is **measured idle fraction → 1-minute load average →
-//! static capacity**, each stage falling forward to the next when its input is
-//! unavailable. An unreadable utilization signal (no `/proc/stat`, missing
-//! `iostat`, unsupported platform, or simply no delta sampled yet) falls back
-//! to the load average (#3978's behavior); an unreadable load average in turn
-//! falls back to the **static** capacity term (no consumption subtracted)
-//! rather than treating the read failure as "host fully loaded". This mirrors
-//! [`crate::capacity::token_axis_limit`]'s policy of falling back to the
-//! optimistic basis (the raw pool) when no ranking data exists — the absence
-//! of a signal is not evidence of unhealthiness. The term itself is floored
-//! at `1` (never `0`): like the token axis's "one healthy account is the
-//! throughput floor, never a halt" (#3902), a single mis-calibrated or noisy
-//! CPU reading must not be able to wedge the whole dynamic cap shut on its
-//! own — [`crate::disk_headroom`] and the token axis are the terms allowed to
-//! floor to zero (genuine "no room"/"no healthy accounts" signals); CPU is
-//! deliberately a soft backoff, not a hard gate.
+//! Every read here returns `Option` and **absent evidence is never treated as
+//! bad news**: an unreadable idle signal (no `/proc/stat`, missing `iostat`,
+//! unsupported platform, or simply no delta sampled yet) is `None`, and every
+//! consumer must fail safe on `None` rather than assume "host fully loaded" —
+//! [`is_host_saturated`] returns `None` so the build gate runs instead of
+//! deferring, and the host breaker treats a missing sample as a non-observation.
+//! This mirrors [`crate::capacity::token_axis_limit`]'s policy of falling back
+//! to the optimistic basis (the raw pool) when no ranking data exists: the
+//! absence of a signal is not evidence of unhealthiness.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -95,146 +94,6 @@ use std::time::{Duration, Instant};
 // doesn't warn on an unused import under `-D warnings`.
 #[cfg(target_os = "macos")]
 use std::process::{Command, Stdio};
-
-// ============================================================================
-// Configuration (env > config > default — #4032)
-// ============================================================================
-//
-// Both knobs resolve **env > `.loom/config.json` → `autonomous.*` > default**,
-// matching every other autonomous-dispatch knob (`workFinder`,
-// `mainHealthGate`, `perTokenConcurrency`, `tokenRankingRefresh`,
-// `roleRunner`). Resolution is single-root and startup-time — read once from
-// the daemon's primary workspace via [`crate::work_finder::WorkFinderConfig`]
-// and threaded through as plain `f64`s — exactly like
-// [`crate::work_finder::resolve_per_token_concurrency`], not per-workspace
-// (the dynamic cap is one global number per tick; see
-// `crate::work_finder::spawn_multi_work_finder_task`'s module docs).
-//
-// `LOOM_PER_WORKTREE_GB` in [`crate::disk_headroom`] deliberately does **not**
-// get the same treatment here (#4032 decision, recorded rather than
-// implemented): it has a second, independent Bash-side reader
-// (`defaults/scripts/lib/disk-headroom.sh`, consumed by `/loom:sweep` Stage -1
-// wave sizing). Migrating only the Rust side would make the same env var honor
-// `.loom/config.json` on the daemon path while silently ignoring it on the
-// sweep path — a worse, divergent state than today's consistent env-only
-// behavior. Moving both means wiring the Bash `config-resolver.sh` into
-// `disk-headroom.sh` too, which is a separate, larger change. File a follow-up
-// if that cost is judged worth paying.
-
-/// Environment variable overriding the fraction of logical CPUs the dynamic
-/// cap is willing to dedicate to sweep work. Wins over
-/// `autonomous.cpuUtilizationTarget`.
-pub const UTILIZATION_TARGET_ENV: &str = "LOOM_CPU_UTILIZATION_TARGET";
-
-/// Default CPU utilization target: 75% of logical cores. Leaves headroom for
-/// the OS, the daemon process itself, and (crucially, per #3978) the
-/// build-gate's own `cargo`/`clippy` invocations so a fully-subscribed sweep
-/// fleet doesn't starve the gate outright.
-pub const DEFAULT_UTILIZATION_TARGET: f64 = 0.75;
-
-/// Environment variable overriding the estimated CPU cores a single
-/// concurrent sweep consumes while its build/test step is running. Wins over
-/// `autonomous.estCoresPerSweep`.
-pub const EST_CORES_PER_SWEEP_ENV: &str = "LOOM_EST_CORES_PER_SWEEP";
-
-/// Default estimated cores per sweep. `cargo build`/`clippy` parallelize
-/// rustc codegen across multiple cores; `2.0` is a conservative estimate for
-/// a Rust-heavy repo like this one (per #4031's measurement, this is now the
-/// calibrated figure for the primary host rather than an un-measured guess —
-/// still tunable per repo/host via [`EST_CORES_PER_SWEEP_ENV`] or
-/// `autonomous.estCoresPerSweep`).
-///
-/// # The release-build fan-out footgun (#4234, Gap 2 of the #4231 decomposition)
-///
-/// `2.0` is calibrated against typical `cargo check`/`clippy`/debug-build
-/// sweep phases (#4031), **not** the release-build fan-out that triggered the
-/// #4231 host meltdown. `cargo build --release` parallelizes codegen units
-/// across every logical core rustc can grab — a single release build can
-/// legitimately consume close to `ncpu` cores on its own, not `2`. Six
-/// concurrent release-building sweeps on a 28-core host is demand-side closer
-/// to `6 × 28` than `6 × 2`; at the default `2.0` this term under-estimates
-/// consumption by roughly an order of magnitude during exactly the phase that
-/// matters most.
-///
-/// This is a **calibration** gap, not a formula bug: [`cpu_headroom`] and its
-/// floor-at-`1` "never a hard halt" policy are working as designed (#3902's
-/// precedent — CPU is a soft backoff term, not `disk_headroom`'s or the token
-/// axis's hard floor-at-zero). A repo whose sweeps spend meaningful time in a
-/// release build should raise `LOOM_EST_CORES_PER_SWEEP` /
-/// `autonomous.estCoresPerSweep` well above `2.0` — plausibly toward
-/// `logical_cpu_count()` itself for a repo where release builds dominate sweep
-/// wall-clock time — rather than relying on this default. #4234 adds a second,
-/// independent backstop for exactly this under-estimate: the work finder's
-/// per-tick admission (ramp) cap
-/// ([`crate::work_finder::WORK_FINDER_MAX_ADMISSIONS_PER_TICK_ENV`]) bounds how
-/// many *new* sweeps land in any single tick regardless of how (mis)calibrated
-/// this term is, so a wrong `estCoresPerSweep` no longer alone determines
-/// whether a whole wave lands in one tick.
-pub const DEFAULT_EST_CORES_PER_SWEEP: f64 = 2.0;
-
-/// Env override for [`UTILIZATION_TARGET_ENV`] — `None` when unset,
-/// unparseable, or outside `(0, 1]` (a value of `0` would collapse capacity to
-/// nothing; a value `> 1` would claim more than the whole host).
-fn env_utilization_target() -> Option<f64> {
-    std::env::var(UTILIZATION_TARGET_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<f64>().ok())
-        .filter(|f| *f > 0.0 && *f <= 1.0)
-}
-
-/// Env override for [`EST_CORES_PER_SWEEP_ENV`] — `None` when unset,
-/// unparseable, or `<= 0`.
-fn env_est_cores_per_sweep() -> Option<f64> {
-    std::env::var(EST_CORES_PER_SWEEP_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<f64>().ok())
-        .filter(|f| *f > 0.0)
-}
-
-/// Resolve the CPU utilization target with precedence **env > config >
-/// default**. `config` is the already-range-filtered
-/// `autonomous.cpuUtilizationTarget` value from
-/// [`crate::work_finder::read_work_finder_config`] (`None` when absent,
-/// malformed, or out of `(0, 1]`).
-#[must_use]
-pub fn resolve_utilization_target(config: Option<f64>) -> f64 {
-    env_utilization_target()
-        .or(config)
-        .unwrap_or(DEFAULT_UTILIZATION_TARGET)
-}
-
-/// Resolve the estimated cores-per-sweep with precedence **env > config >
-/// default**. `config` is the already-range-filtered
-/// `autonomous.estCoresPerSweep` value from
-/// [`crate::work_finder::read_work_finder_config`] (`None` when absent,
-/// malformed, or `<= 0`).
-#[must_use]
-pub fn resolve_est_cores_per_sweep(config: Option<f64>) -> f64 {
-    env_est_cores_per_sweep()
-        .or(config)
-        .unwrap_or(DEFAULT_EST_CORES_PER_SWEEP)
-}
-
-/// Resolve [`UTILIZATION_TARGET_ENV`] alone, falling back to
-/// [`DEFAULT_UTILIZATION_TARGET`] when unset, unparseable, or outside `(0,
-/// 1]`. Env-only convenience wrapper around [`resolve_utilization_target`]
-/// for callers with no config value in hand (e.g. ad-hoc tooling); production
-/// call sites resolve config too and should call [`resolve_utilization_target`]
-/// directly.
-#[must_use]
-pub fn utilization_target() -> f64 {
-    resolve_utilization_target(None)
-}
-
-/// Resolve [`EST_CORES_PER_SWEEP_ENV`] alone, falling back to
-/// [`DEFAULT_EST_CORES_PER_SWEEP`] when unset, unparseable, or `<= 0`.
-/// Env-only convenience wrapper around [`resolve_est_cores_per_sweep`] for
-/// callers with no config value in hand; production call sites resolve
-/// config too and should call [`resolve_est_cores_per_sweep`] directly.
-#[must_use]
-pub fn est_cores_per_sweep() -> f64 {
-    resolve_est_cores_per_sweep(None)
-}
 
 // ============================================================================
 // Logical CPU count
@@ -590,125 +449,10 @@ pub fn cached_cpu_idle_fraction() -> Option<f64> {
         .idle_fraction
 }
 
-// ============================================================================
-// The pure headroom term
-// ============================================================================
-
-/// Compute the CPU headroom concurrency term.
-///
-/// `capacity = ncpu × utilization_target` is the number of cores this host is
-/// willing to dedicate to sweep work. From it we subtract the cores currently
-/// **consumed**, resolved via the fail-open chain (see module docs):
-///
-/// 1. a measured `idle_fraction` → `consumed = ncpu × (1 − idle_fraction)`
-///    (actual CPU consumption — the #4031 fix), else
-/// 2. the 1-minute `loadavg_1m` as a proxy (#3978's behavior), else
-/// 3. nothing — the static capacity, unadjusted.
-///
-/// The consumption is floored at `0.0` (an already-saturated host contributes
-/// no headroom rather than going negative). The resulting headroom divided by
-/// `est_cores_per_sweep` gives how many additional concurrent sweeps the host
-/// can currently absorb, floored to a minimum of `1` so a single noisy or
-/// mis-calibrated CPU reading can never by itself wedge the dynamic cap to
-/// zero (mirrors the token axis's "never a halt" floor, #3902).
-#[must_use]
-pub fn cpu_headroom(
-    ncpu: usize,
-    idle_fraction: Option<f64>,
-    loadavg_1m: Option<f64>,
-    utilization_target: f64,
-    est_cores_per_sweep: f64,
-) -> usize {
-    let capacity = ncpu as f64 * utilization_target;
-    // Prefer the measured idle fraction; fall back to load average; else no
-    // consumption term at all (static capacity).
-    let consumed = match idle_fraction {
-        Some(idle) => Some(ncpu as f64 * (1.0 - idle.clamp(0.0, 1.0))),
-        None => loadavg_1m,
-    };
-    let available = consumed.map_or(capacity, |c| (capacity - c).max(0.0));
-    let term = (available / est_cores_per_sweep.max(f64::MIN_POSITIVE)).floor();
-    // NaN/negative-infinity can't occur here (all operands are finite and
-    // `est_cores_per_sweep` is clamped away from 0), but `max(1.0)` also
-    // guards the float→usize cast below against any residual edge case.
-    term.max(1.0) as usize
-}
-
-/// A point-in-time snapshot of the inputs feeding [`cpu_headroom`], for the
-/// status surface (`ipc.rs` / `loom-daemon status`). Reads the memoized idle
-/// fraction (no blocking) plus a fresh, fast load-average read.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct CpuHeadroomSnapshot {
-    /// Host logical CPU count.
-    pub logical_cpus: usize,
-    /// Measured idle fraction (`0.0..=1.0`) if one has been sampled, else `None`.
-    pub idle_fraction: Option<f64>,
-    /// Current 1-minute load average if available, else `None`.
-    pub loadavg_1m: Option<f64>,
-    /// The resulting headroom term (concurrent-sweep slots).
-    pub cpu_headroom: usize,
-}
-
-/// Build a [`CpuHeadroomSnapshot`] from the memoized idle fraction, a fresh
-/// load-average read, and the resolved knobs. **Never blocks** — safe on the
-/// tokio runtime and from the synchronous status path. Pre-warm the idle
-/// cache with `spawn_blocking(refresh_cpu_util_cache)` for a fresh
-/// measurement.
-///
-/// `utilization_target` / `est_cores_per_sweep` are the already-resolved
-/// (env > config > default, #4032) values — callers get these from
-/// [`resolve_utilization_target`] / [`resolve_est_cores_per_sweep`] fed by
-/// [`crate::work_finder::read_work_finder_config`], resolved once at startup
-/// (or, in `ipc.rs`, freshly per status request against the same config path).
-#[must_use]
-pub fn cpu_headroom_snapshot(
-    utilization_target: f64,
-    est_cores_per_sweep: f64,
-) -> CpuHeadroomSnapshot {
-    let logical_cpus = logical_cpu_count();
-    let idle_fraction = cached_cpu_idle_fraction();
-    let loadavg_1m = read_loadavg_1m();
-    let cpu_headroom = cpu_headroom(
-        logical_cpus,
-        idle_fraction,
-        loadavg_1m,
-        utilization_target,
-        est_cores_per_sweep,
-    );
-    CpuHeadroomSnapshot {
-        logical_cpus,
-        idle_fraction,
-        loadavg_1m,
-        cpu_headroom,
-    }
-}
-
-/// Resolve the CPU headroom term end-to-end from live host inputs, refreshing
-/// the memoized idle-fraction sample first.
-///
-/// `utilization_target` / `est_cores_per_sweep` are the already-resolved
-/// (env > config > default, #4032) values — see [`cpu_headroom_snapshot`].
-///
-/// **May block** (~1s on macOS via `iostat`; fast, non-sleeping on Linux). The
-/// async work-finder loops call this through `spawn_blocking` so the macOS
-/// sampling window never blocks a tokio runtime worker.
-#[must_use]
-pub fn cpu_headroom_limit(utilization_target: f64, est_cores_per_sweep: f64) -> usize {
-    refresh_cpu_util_cache();
-    cpu_headroom(
-        logical_cpu_count(),
-        cached_cpu_idle_fraction(),
-        read_loadavg_1m(),
-        utilization_target,
-        est_cores_per_sweep,
-    )
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use serial_test::serial;
 
     // ------------------------------------------------------------------
     // parse_proc_loadavg
@@ -829,178 +573,6 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // cpu_headroom — pure math (signature: ncpu, idle, loadavg, target, est)
-    // ------------------------------------------------------------------
-
-    #[test]
-    fn cpu_headroom_static_capacity_when_no_signal_at_all() {
-        // 8 cores, 75% target, no idle + no load reading -> capacity 6.0 / 2.0
-        // cores per sweep = 3.
-        assert_eq!(cpu_headroom(8, None, None, 0.75, 2.0), 3);
-    }
-
-    #[test]
-    fn cpu_headroom_subtracts_current_load_when_no_idle_measurement() {
-        // 8 cores, 75% target -> capacity 6.0. No idle measurement; load 4.0 in
-        // use -> 2.0 available / 2.0 per sweep = 1 (the #3978 fallback path).
-        assert_eq!(cpu_headroom(8, None, Some(4.0), 0.75, 2.0), 1);
-    }
-
-    #[test]
-    fn cpu_headroom_prefers_measured_idle_over_loadavg() {
-        // The #4031 core: 28 cores, 75% target -> capacity 21.0. 85% idle means
-        // consumed = 28 × 0.15 = 4.2 cores; loadavg reads an inflated 6.0. The
-        // term must reflect the idle reading (21 - 4.2 = 16.8 / 2.0 = 8), NOT the
-        // load reading (21 - 6.0 = 15.0 / 2.0 = 7).
-        assert_eq!(cpu_headroom(28, Some(0.85), Some(6.0), 0.75, 2.0), 8);
-        // And it must ignore loadavg entirely when idle is present.
-        assert_eq!(
-            cpu_headroom(28, Some(0.85), None, 0.75, 2.0),
-            cpu_headroom(28, Some(0.85), Some(999.0), 0.75, 2.0),
-            "loadavg must not influence the term once a measured idle exists"
-        );
-    }
-
-    #[test]
-    fn cpu_headroom_floors_at_one_under_a_saturated_idle_reading() {
-        // 0% idle on an 8-core/75% host -> consumed 8.0 > capacity 6.0 ->
-        // available clamps to 0, but the term floors at 1 (soft backoff).
-        assert_eq!(cpu_headroom(8, Some(0.0), None, 0.75, 2.0), 1);
-        // Same floor via the loadavg path when load exceeds capacity.
-        assert_eq!(cpu_headroom(8, None, Some(20.0), 0.75, 2.0), 1);
-    }
-
-    #[test]
-    fn cpu_headroom_scales_with_more_cores() {
-        // 32 cores, 75% target, no signal -> 24.0 / 2.0 = 12.
-        assert_eq!(cpu_headroom(32, None, None, 0.75, 2.0), 12);
-    }
-
-    #[test]
-    fn cpu_headroom_never_zero_even_on_a_single_core_host() {
-        // 1 core, 75% target -> capacity 0.75, / 2.0 per sweep = 0.375 ->
-        // floors to 0 mathematically, but the `max(1.0)` policy floor kicks in.
-        assert_eq!(cpu_headroom(1, None, None, 0.75, 2.0), 1);
-    }
-
-    #[test]
-    fn cpu_headroom_est_cores_per_sweep_scales_the_denominator() {
-        // 16 cores, 100% target -> capacity 16.0. A heavier 4.0-cores-per-
-        // sweep estimate -> 4.
-        assert_eq!(cpu_headroom(16, None, None, 1.0, 4.0), 4);
-    }
-
-    #[test]
-    fn cpu_headroom_idle_fraction_is_clamped() {
-        // A nonsense idle fraction > 1 or < 0 can't push consumed negative /
-        // above ncpu enough to break the term (defensive clamp).
-        assert_eq!(cpu_headroom(8, Some(1.5), None, 0.75, 2.0), 3, "idle>1 clamps to full idle");
-        assert_eq!(cpu_headroom(8, Some(-0.5), None, 0.75, 2.0), 1, "idle<0 clamps to fully busy");
-    }
-
-    // ------------------------------------------------------------------
-    // env-only resolution (no config value in hand)
-    // ------------------------------------------------------------------
-
-    #[test]
-    #[serial]
-    fn utilization_target_default_and_override() {
-        std::env::remove_var(UTILIZATION_TARGET_ENV);
-        assert!((utilization_target() - DEFAULT_UTILIZATION_TARGET).abs() < f64::EPSILON);
-
-        std::env::set_var(UTILIZATION_TARGET_ENV, "0.5");
-        assert!((utilization_target() - 0.5).abs() < f64::EPSILON);
-
-        // Out-of-range and unparseable values fall back to the default.
-        std::env::set_var(UTILIZATION_TARGET_ENV, "0");
-        assert!((utilization_target() - DEFAULT_UTILIZATION_TARGET).abs() < f64::EPSILON);
-        std::env::set_var(UTILIZATION_TARGET_ENV, "1.5");
-        assert!((utilization_target() - DEFAULT_UTILIZATION_TARGET).abs() < f64::EPSILON);
-        std::env::set_var(UTILIZATION_TARGET_ENV, "garbage");
-        assert!((utilization_target() - DEFAULT_UTILIZATION_TARGET).abs() < f64::EPSILON);
-        std::env::remove_var(UTILIZATION_TARGET_ENV);
-    }
-
-    #[test]
-    #[serial]
-    fn est_cores_per_sweep_default_and_override() {
-        std::env::remove_var(EST_CORES_PER_SWEEP_ENV);
-        assert!((est_cores_per_sweep() - DEFAULT_EST_CORES_PER_SWEEP).abs() < f64::EPSILON);
-
-        std::env::set_var(EST_CORES_PER_SWEEP_ENV, "3.5");
-        assert!((est_cores_per_sweep() - 3.5).abs() < f64::EPSILON);
-
-        // Zero, negative, and unparseable values fall back to the default.
-        std::env::set_var(EST_CORES_PER_SWEEP_ENV, "0");
-        assert!((est_cores_per_sweep() - DEFAULT_EST_CORES_PER_SWEEP).abs() < f64::EPSILON);
-        std::env::set_var(EST_CORES_PER_SWEEP_ENV, "-1");
-        assert!((est_cores_per_sweep() - DEFAULT_EST_CORES_PER_SWEEP).abs() < f64::EPSILON);
-        std::env::set_var(EST_CORES_PER_SWEEP_ENV, "garbage");
-        assert!((est_cores_per_sweep() - DEFAULT_EST_CORES_PER_SWEEP).abs() < f64::EPSILON);
-        std::env::remove_var(EST_CORES_PER_SWEEP_ENV);
-    }
-
-    // ------------------------------------------------------------------
-    // resolve_utilization_target / resolve_est_cores_per_sweep — env > config
-    // > default precedence (#4032)
-    // ------------------------------------------------------------------
-
-    #[test]
-    #[serial]
-    fn resolve_utilization_target_precedence() {
-        std::env::remove_var(UTILIZATION_TARGET_ENV);
-
-        // Both unset -> built-in default.
-        assert!(
-            (resolve_utilization_target(None) - DEFAULT_UTILIZATION_TARGET).abs() < f64::EPSILON
-        );
-
-        // Config set, env unset -> config wins.
-        assert!((resolve_utilization_target(Some(0.6)) - 0.6).abs() < f64::EPSILON);
-
-        // Env set, config set -> env wins.
-        std::env::set_var(UTILIZATION_TARGET_ENV, "0.5");
-        assert!((resolve_utilization_target(Some(0.6)) - 0.5).abs() < f64::EPSILON);
-
-        // Env set, config unset -> env still wins.
-        assert!((resolve_utilization_target(None) - 0.5).abs() < f64::EPSILON);
-
-        std::env::remove_var(UTILIZATION_TARGET_ENV);
-    }
-
-    #[test]
-    #[serial]
-    fn resolve_est_cores_per_sweep_precedence() {
-        std::env::remove_var(EST_CORES_PER_SWEEP_ENV);
-
-        // Both unset -> built-in default.
-        assert!(
-            (resolve_est_cores_per_sweep(None) - DEFAULT_EST_CORES_PER_SWEEP).abs() < f64::EPSILON
-        );
-
-        // Config set, env unset -> config wins.
-        assert!((resolve_est_cores_per_sweep(Some(4.0)) - 4.0).abs() < f64::EPSILON);
-
-        // Env set, config set -> env wins.
-        std::env::set_var(EST_CORES_PER_SWEEP_ENV, "1.0");
-        assert!((resolve_est_cores_per_sweep(Some(4.0)) - 1.0).abs() < f64::EPSILON);
-
-        // Env set, config unset -> env still wins.
-        assert!((resolve_est_cores_per_sweep(None) - 1.0).abs() < f64::EPSILON);
-
-        std::env::remove_var(EST_CORES_PER_SWEEP_ENV);
-    }
-
-    // Range validation of the config value (`(0, 1]` for utilization target,
-    // `> 0` for cores-per-sweep) is applied at the config-read layer in
-    // `read_work_finder_config` (see `work_finder.rs` tests
-    // `test_config_out_of_range_cpu_utilization_target_drops_to_none` and
-    // `test_config_out_of_range_est_cores_per_sweep_drops_to_none`), not here —
-    // `resolve_utilization_target` / `resolve_est_cores_per_sweep` trust the
-    // `Option<f64>` they are handed is already filtered, exactly like
-    // `resolve_per_token_concurrency` trusts `WorkFinderConfig`.
-
-    // ------------------------------------------------------------------
     // host saturation (#4259) — pure predicate
     // ------------------------------------------------------------------
 
@@ -1035,13 +607,18 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // cpu_headroom_limit — end-to-end smoke test against the real host
+    // refresh + cached idle fraction — smoke test against the real host
     // ------------------------------------------------------------------
 
     #[test]
-    fn cpu_headroom_limit_returns_at_least_one() {
-        // Whatever this CI/dev host's load looks like, the policy floor
-        // guarantees at least 1.
-        assert!(cpu_headroom_limit(DEFAULT_UTILIZATION_TARGET, DEFAULT_EST_CORES_PER_SWEEP) >= 1);
+    fn refresh_cpu_util_cache_never_panics_and_the_cache_is_readable() {
+        // Purely observational now (#4512): the memo feeds `loom-daemon status`
+        // / `calibrate` reporting, not any admission decision. Whatever this
+        // host supports, neither call may panic and a read must be well-typed.
+        refresh_cpu_util_cache();
+        let frac = cached_cpu_idle_fraction();
+        if let Some(f) = frac {
+            assert!((0.0..=1.0).contains(&f), "idle fraction out of range: {f}");
+        }
     }
 }

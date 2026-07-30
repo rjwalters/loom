@@ -88,7 +88,7 @@ Claude-specific internals):
 | **Prompt delivery** | `-p "…"` / `--prompt` is passed through to `claude -p`. | Deliver the prompt to the runtime's own headless/print-mode flag. |
 | **Model tier env** | `LOOM_MODEL` → `claude --model <v>` unless an explicit `--model` is already present (explicit arg wins). See [model mapping](#2-model-mapping). | Map the logical model tier to the runtime's own model-selection flag with the same precedence. |
 | **Effort tier env** | `LOOM_EFFORT` → `claude --effort <v>` unless an explicit `--effort` is present. This is a **session-default** effort; the in-session Task tool exposes no per-rung effort knob. | Map to the runtime's reasoning-effort knob if it has one; otherwise omit (no error). |
-| **Missing-pool failure** | Exits **78** (`EX_CONFIG`) when neither token pool exists / all tokens are bad, with a message pointing at `loom-tokens bootstrap`. It never silently falls back to keychain. | Fail with a distinct, non-generic exit code on a missing/exhausted credential source rather than silently degrading. |
+| **Missing-pool failure** | Exits **78** (`EX_CONFIG`) when neither token pool exists / all tokens are bad, with a message pointing at `loom-daemon tokens bootstrap`. It never silently falls back to keychain. | Fail with a distinct, non-generic exit code on a missing/exhausted credential source rather than silently degrading. |
 | **Runtime-missing failure** | Exits `127` when the `claude` CLI is not on `PATH`. | Fail cleanly when the runtime binary is absent. |
 | **Observability** | Emits exactly one structured `spawn-claude: model=<v>` line (and an effort line when resolved) to stderr on every spawn, changing no behavior. | Emit an equivalent single structured line so log scrapers can attribute the dispatch. |
 
@@ -96,9 +96,11 @@ The daemon dispatch path (`loom-daemon`'s `spawn_child`) sets
 `LOOM_SWEEP_CLAIM_OWNED` and per-sweep log redirection around this script; an
 adapter's spawn entry point is invoked the same way, so it must tolerate that
 env var being present (Claude's script logs `LOOM_SWEEP_CLAIM_OWNED` on every
-spawn for dispatch diagnosability). `LOOM_PACKAGE_PATH` forwarding — the
-bridge that let a dispatched `spawn-claude.sh` locate the Python `loom_tools`
-package — was retired end-to-end in #4228 once token selection went native.
+spawn for dispatch diagnosability). **An adapter has no Python bridge to
+implement:** `LOOM_PACKAGE_PATH` forwarding — the mechanism that let a
+dispatched `spawn-claude.sh` locate a Python package — was retired end-to-end in
+#4228 once token selection went native, and the package itself was deleted in
+epic #4081 Phase 4 (#4557). Nothing on the spawn path reads or sets it.
 
 The runtime-neutral **dispatch seam** that realizes this contract point today —
 `spawn-worker.sh` plus the `runtimes` config block — is specified in
@@ -346,8 +348,9 @@ compatibility and refuses to dispatch a role onto a runtime that cannot meet its
 requirements, rather than letting the session fail partway. The declaration is
 per-runtime; the requirements are per-role; the match happens at dispatch time.
 
-**Landed today (#4170):** the declaration and requirement sides of this contract
-exist as data + a standalone checker, ahead of dispatch wiring:
+**Capability contract (#4170, enforced for daemon scheduling by #4494):** the
+declaration and requirement sides exist as data and are interpreted identically
+by the standalone checker and daemon admission:
 
 - **Declaration** — `defaults/runtimes/<name>.json` (e.g.
   `defaults/runtimes/claude.json`), matching the sketch above exactly (tri-state
@@ -364,9 +367,7 @@ exist as data + a standalone checker, ahead of dispatch wiring:
   where a requirement is satisfied only by a declared `"yes"` (`"partial"` fails
   closed). Exit 0 on match or no-requirements, exit 78 (`EX_CONFIG`) on mismatch
   naming each unmet capability, non-zero with a distinct message on an
-  unknown/missing role or runtime file. It is intentionally **standalone** —
-  not yet wired into `spawn-worker.sh` or any dispatch path; that wiring is a
-  follow-up decision.
+  unknown/missing role or runtime file.
 
 **Second manifest (#4468):** `defaults/runtimes/codex.json` declares
 `mcp: "yes"`, `subagents: "no"` (the fork PR #59 prohibition), `hooks: "partial"`
@@ -379,6 +380,82 @@ workspace root, not to one `issue-N` worktree). Because `"partial"` fails closed
 parity doc's residual gap 2, and the CI leg asserts both outcomes. That is the
 intended relationship between points 6 and 7: the parity doc states the gap in
 prose, the manifest makes it enforceable.
+
+### Daemon runtime binding and admission
+
+Standalone periodic roles support per-role bindings:
+
+```json
+{
+  "runtimes": {
+    "default": "claude",
+    "roles": {
+      "curator": "codex",
+      "judge": "codex"
+    }
+  }
+}
+```
+
+The daemon resolves an explicit dispatch value (where the API offers one), then
+`LOOM_RUNTIME_<ROLE>`, `LOOM_RUNTIME`, `runtimes.roles.<role>`,
+`runtimes.default`, and finally `claude`. Empty strings are unset. It
+canonicalizes the role first and validates the selected adapter, role sidecar,
+runtime manifest, and every required capability before starting a child.
+`partial`, `no`, missing, malformed, and unknown values fail closed. The
+admitted runtime is pinned into the child environment so `spawn-worker.sh`
+cannot make a second, divergent choice.
+
+Unknown keys under `runtimes.roles` are a **hard configuration error**, not a
+silently ignored entry: `runtimes.roles.not-a-role` (or a typo such as
+`buidler`) refuses every admission for that workspace with a diagnostic naming
+the offending key, so a misconfigured binding can never leave a role quietly
+running on the default runtime. A known key with an **empty** value keeps its
+established "unset" meaning and falls through to the next precedence tier.
+
+Daemon admission runs before any claim lock, forge mutation, account selection,
+log header, or child spawn. Successful sweep status and
+`sweep.global.dispatch` events include both `runtime` and `runtime_source`.
+Refused work is represented too: the daemon publishes
+`sweep.global.runtime_rejected` carrying `kind`, `role`, `runtime`,
+`runtime_source`, `unmet_capabilities`, and `reason` — emitting it is a pure
+publish that creates no claim, account, or log side effect.
+
+Rejected IPC dispatches return `RuntimeRejected` with structured `role`,
+`runtime`, `source`, `unmet_capabilities`, and `reason` fields, and **both**
+real dispatch clients model it:
+
+- `loom-daemon dispatch <N>` renders the role/runtime/source/unmet diagnostic
+  and exits `78` (`EX_CONFIG`) — the same code the shell checker uses for a
+  mismatch — so a script can tell a capability refusal apart from a daemon
+  error without parsing text.
+- The MCP bridge (`mcp__loom__dispatch_sweep`) returns the parsed rejection as
+  a structured `runtime_rejection` object plus a rendered summary line, instead
+  of an opaque "unexpected response".
+
+These records contain selection metadata only; configuration values,
+environment contents, tokens, and credentials are never serialized.
+
+The native admission path and `check-runtime-capabilities.sh` are held to one
+decision by a shared conformance matrix over **every** shipped role/runtime
+pair, asserting identical decisions *and* identical named unmet-capability
+sets. The checker's `--json` flag (additive; exit codes and stderr are
+unchanged) emits that comparison surface:
+
+```json
+{"role":"builder","runtime":"codex","decision":"reject",
+ "unmet":["worktreeIsolation"],"reason":"unmet capabilities: worktreeIsolation"}
+```
+
+A `/loom:sweep` is different from a standalone role tick: it is one coordinator
+process for the entire Curator → Builder → Judge → Doctor → Merge lifecycle.
+Loom does not switch its CLI runtime between those nested phases. Consequently
+the daemon resolves the sweep runtime once from the global/default tiers and
+admits it against Builder's strongest lifecycle requirements. A per-role
+`curator: codex` binding can route a standalone Curator tick to Codex, but it
+does not make a full sweep partly Codex. With the shipped manifests, standalone
+Curator and Judge can use Codex; Builder and a full sweep cannot, because Codex
+declares `worktreeIsolation: partial`.
 
 ## Phase 1: the `spawn-worker.sh` runtime-dispatch seam
 
@@ -536,9 +613,10 @@ unknown to known did not weaken this guard for other names.)
 - No capability-matrix enforcement in the dispatcher
   ([contract point 7](#7-capability-declaration) is a separate issue) — the seam
   only routes; it does not validate a runtime's feature set.
-- `spawn-claude.sh`, `claude-wrapper.sh`, the Rust `loom-daemon`, and the Python
-  `loom-tools` callers are unchanged; migrating callers onto `spawn-worker.sh`
-  is a follow-up once the seam has soaked.
+- `spawn-claude.sh`, `claude-wrapper.sh`, and the Rust `loom-daemon` callers are
+  unchanged; migrating callers onto `spawn-worker.sh` is a follow-up once the
+  seam has soaked. (The Python `loom-tools` callers this list used to name no
+  longer exist — epic #4081 Phase 4, #4557.)
 
 ## Fork mapping table
 

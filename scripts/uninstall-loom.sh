@@ -1261,6 +1261,38 @@ if [[ -f "$WORKTREE_ABS/.gitignore" ]]; then
   fi
 fi
 
+# Handle .gitattributes - remove the Loom-managed merge-driver block (#4528)
+#
+# Written by scripts/install/gitattributes.sh (full/quick install) and
+# defaults/scripts/resync-installed.sh (self-heal on existing installs) to
+# give .loom/install-metadata.json a `merge=ours` attribute. Marker-delimited
+# the same way as the CLAUDE.md / .gitignore blocks above — delete BEGIN..END
+# inclusive in one pass, leaving any other .gitattributes content untouched.
+if [[ -f "$WORKTREE_ABS/.gitattributes" ]]; then
+  GITATTRS="$WORKTREE_ABS/.gitattributes"
+  GITATTRS_BEGIN_MARKER="# BEGIN LOOM-MANAGED (merge drivers, #4528)"
+  GITATTRS_END_MARKER="# END LOOM-MANAGED (merge drivers, #4528)"
+
+  if grep -qxF "$GITATTRS_BEGIN_MARKER" "$GITATTRS" 2>/dev/null && \
+     grep -qxF "$GITATTRS_END_MARKER" "$GITATTRS" 2>/dev/null; then
+    info "Removing Loom-managed merge-driver block from .gitattributes..."
+    awk -v b="$GITATTRS_BEGIN_MARKER" -v e="$GITATTRS_END_MARKER" '
+      $0 == b { inblock = 1; next }
+      inblock { if ($0 == e) inblock = 0; next }
+      { print }
+    ' "$GITATTRS" > "${GITATTRS}.tmp" && mv "${GITATTRS}.tmp" "$GITATTRS"
+
+    if [[ ! -s "$GITATTRS" ]] || ! grep -q '[^[:space:]]' "$GITATTRS" 2>/dev/null; then
+      rm -f "$GITATTRS"
+      REMOVED_LIST+=(".gitattributes")
+      success ".gitattributes removed (was entirely Loom-managed content)"
+    else
+      REMOVED_LIST+=(".gitattributes (Loom-managed block removed)")
+      success ".gitattributes Loom-managed block removed"
+    fi
+  fi
+fi
+
 # Handle .claude/settings.json - remove only Loom hooks and permissions
 if [[ -f "$WORKTREE_ABS/.claude/settings.json" ]]; then
   SETTINGS_FILE="$WORKTREE_ABS/.claude/settings.json"

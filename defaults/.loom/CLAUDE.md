@@ -315,9 +315,9 @@ Configuration lives in `.loom/config.json` (committed for team sharing): a
 
 For Pro/Max plans, Loom rotates among multiple Claude OAuth accounts so one
 weekly limit does not stall the pipeline. Provision `.loom/tokens/` with
-`loom-tokens bootstrap` (or `import-from-monitor --force` on a host running
+`loom-daemon tokens bootstrap` (or `import-from-monitor --force` on a host running
 [claude-monitor](https://github.com/Maciek-roboblog/Claude-Code-Usage-Monitor))
-plus `loom-tokens check --ranking` to rank accounts by remaining capacity.
+plus `loom-daemon tokens check --ranking` to rank accounts by remaining capacity.
 Agents spawn through `.loom/scripts/spawn-claude.sh` (never `claude` directly),
 which selects a token (ranking → allowlist → random); a missing/exhausted pool
 exits `78` (`EX_CONFIG`). Full reference:

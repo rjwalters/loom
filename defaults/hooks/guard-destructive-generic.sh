@@ -1532,7 +1532,15 @@ done
 # (`--body @/tmp/x`) is untouched by redaction either way, so a naive
 # implementation that only smoke-tests the unquoted shape can look correct
 # while silently missing the quoted shape actually seen in the field.
-GH_COMMENT_BODY_AT_PATTERN="(^|[;&|[:space:]])gh[[:space:]]+(pr|issue)[[:space:]]+comment[^;&]*(-b|--body)[[:space:]]*=?[[:space:]]*[\"']?@"
+#
+# The `@` must be followed by a path-shaped character (`/`, `.`, or `~`) —
+# every real incident/test case is an absolute or relative path
+# (`@/tmp/...`, `@./relative/path`, `@~/home/path`). A bare `@word` right
+# after the opening quote is an @mention addressed to a reviewer (e.g.
+# `--body "@reviewer Could you clarify..."`, the shape doctor.md's own
+# "Can't Understand Feedback" example uses) and must NOT be treated as the
+# `-F body=@path` anti-pattern (#4577).
+GH_COMMENT_BODY_AT_PATTERN="(^|[;&|[:space:]])gh[[:space:]]+(pr|issue)[[:space:]]+comment[^;&]*(-b|--body)[[:space:]]*=?[[:space:]]*[\"']?@[/.~]"
 if echo "$COMMAND" | grep -qiE "$GH_COMMENT_BODY_AT_PATTERN"; then
     deny "BLOCKED: 'gh pr comment'/'gh issue comment --body @path' does NOT expand the file — it posts the literal string '@path' as the comment (lost the PR #4457 review this way). Use --body \"\$(cat <<'EOF' ... EOF)\", -F/--body-file <path>, or 'gh api ... -F body=@<path>' instead." "gh-comment-body-literal-at"
 fi

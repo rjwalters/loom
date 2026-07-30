@@ -258,9 +258,9 @@ Configuration lives in `.loom/config.json` (committed for team sharing): a
 ### Multi-Account Token Pool (operating summary)
 
 For Pro/Max plans, Loom rotates among multiple Claude OAuth accounts so one weekly
-limit does not stall the pipeline. Provision `.loom/tokens/` with `loom-tokens
+limit does not stall the pipeline. Provision `.loom/tokens/` with `loom-daemon tokens
 bootstrap` (or `import-from-monitor --force` on a claude-monitor host) +
-`loom-tokens check --ranking`. Agents spawn through `.loom/scripts/spawn-claude.sh`
+`loom-daemon tokens check --ranking`. Agents spawn through `.loom/scripts/spawn-claude.sh`
 (never `claude` directly), which selects a token (ranking → allowlist → random); a
 missing/exhausted pool exits `78` (`EX_CONFIG`). Full reference:
 [`.loom/docs/token-pool.md`](.loom/docs/token-pool.md).

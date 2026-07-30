@@ -25,7 +25,8 @@
 //! | `sweep.issue.{N}.blocker` | Sweep child | `{reason, label_added}` |
 //! | `sweep.issue.{N}.exited`  | Daemon reaper | `{exit_code, duration_sec, death_class?}` |
 //! | `sweep.issue.{N}.crashed` | Daemon reaper | `{checkpoint_phase, death_class?}` |
-//! | `sweep.global.dispatch`   | Daemon | `{sweep_id, kind}` |
+//! | `sweep.global.dispatch`   | Daemon | `{sweep_id, kind, runtime?, runtime_source?}` |
+//! | `sweep.global.runtime_rejected` | Daemon | `{kind, role, runtime, runtime_source, unmet_capabilities, reason}` |
 //! | `sweep.global.completed`  | Daemon | `{sweep_id, outcome}` |
 //! | `epic.issue.{N}.decompose` | Epic supervisor | `{epic, action, state}` |
 //! | `epic.issue.{N}.expand`    | Epic supervisor | `{epic, action, state}` |
@@ -58,6 +59,13 @@
 //! on a state change into/out of "N consecutive dispatches, across different
 //! issues, died at the wrapper's MCP-init pre-flight check before ever
 //! exec'ing the CLI," the same dedup discipline as the two advisories above.
+//! `sweep.global.runtime_rejected` topic was authorized by **#4494** (epic
+//! #4489 Phase 5) for fail-closed runtime-capability admission: `.dispatch`
+//! only ever describes *admitted* work, so refused work — a dispatch the
+//! daemon declined before any claim/label/account/log/spawn side effect —
+//! needed its own structured, secret-free representation rather than being
+//! invisible on the bus. It is emitted once per refused dispatch attempt (not
+//! on a state-change/dedup schedule) because each attempt is itself the event.
 //! Per-death classification (`death_class`) rides the existing frozen
 //! `sweep.issue.{N}.exited` / `.crashed` topics as an additive payload field
 //! rather than a new topic (#4386). The bus accepts arbitrary topic
@@ -630,8 +638,46 @@ mod tests {
         let ev = Event::SweepGlobalDispatch {
             sweep_id: "sweep-issue-42-1".to_string(),
             kind: SweepKind::Issue(42),
+            runtime: None,
+            runtime_source: None,
             repo: None,
         };
         assert_eq!(ev.topic(), "sweep.global.dispatch");
+    }
+
+    /// Issue #4494: refused (capability-rejected) work has its own topic, and
+    /// the payload must serialize as a structured, secret-free rejection
+    /// reason that a prefix subscriber on `sweep.global.*` receives.
+    #[tokio::test]
+    async fn runtime_rejected_topic_serializes_structured_and_secret_free() {
+        let ev = Event::SweepGlobalRuntimeRejected {
+            kind: SweepKind::Issue(4494),
+            role: "sweep-lifecycle".to_string(),
+            runtime: "codex".to_string(),
+            runtime_source: crate::types::RuntimeSource::DefaultConfig,
+            unmet_capabilities: vec!["worktreeIsolation".to_string()],
+            reason: "unmet capabilities: worktreeIsolation".to_string(),
+            repo: None,
+        };
+        assert_eq!(ev.topic(), "sweep.global.runtime_rejected");
+
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains("\"role\":\"sweep-lifecycle\""), "{json}");
+        assert!(json.contains("\"runtime_source\":\"default-config\""), "{json}");
+        assert!(json.contains("\"unmet_capabilities\":[\"worktreeIsolation\"]"), "{json}");
+        // Secret-free: no account/token/credential material rides this event.
+        for forbidden in ["token", "oauth", "credential", "api_key"] {
+            assert!(!json.to_ascii_lowercase().contains(forbidden), "{json}");
+        }
+        // Round-trips (subscribers deserialize the same shape).
+        let decoded: Event = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.topic(), "sweep.global.runtime_rejected");
+
+        // A `sweep.global.*` prefix subscriber receives it alongside dispatch.
+        let bus = EventBus::with_capacity(8);
+        let mut sub = bus.subscribe(["sweep.global"]);
+        bus.publish(ev).unwrap();
+        let received = sub.recv().await.unwrap();
+        assert_eq!(received.topic(), "sweep.global.runtime_rejected");
     }
 }

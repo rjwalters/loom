@@ -104,10 +104,15 @@ pub const DEFAULT_HOST_BREAKER_ENABLED: bool = true;
 /// Default load-per-core trip threshold. Normal healthy hosts sit well below
 /// `1.0` load-per-core; sustained `2.5×` oversubscription is clear distress
 /// (the #4231 meltdown peaked at ~4.2 load-per-core) while leaving bursty
-/// build spikes below the line. Deliberately well above the CPU-headroom
-/// utilization target (`cpuUtilizationTarget`, default ~0.85) — the breaker is
-/// for *distress*, not for the routine headroom throttling #3978/#4234 already
-/// handle.
+/// build spikes below the line. Deliberately well above the build gate's own
+/// saturation-deferral ratio ([`crate::cpu_headroom::DEFAULT_GATE_LOAD_THRESHOLD`],
+/// `0.9`) — the breaker is for *distress*, not routine scheduling politeness.
+///
+/// Since #4512 removed the CPU-headroom estimate from admission, this **measured**
+/// breaker is the load safety net that makes a hand-tuned per-machine
+/// `maxConcurrent` safe to raise: a mis-set knob trips it (and the machine-wide
+/// build slot, [`crate::build_slot`], keeps the heavy stages serialized) instead
+/// of melting the host.
 pub const DEFAULT_HOST_BREAKER_LOAD_PER_CORE: f64 = 2.5;
 
 /// Default consecutive over-threshold ticks before tripping. At the default

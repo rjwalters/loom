@@ -1,6 +1,41 @@
-# Measuring `LOOM_EST_CORES_PER_SWEEP`
+# Measuring `LOOM_EST_CORES_PER_SWEEP` (HISTORICAL — the knob it tunes was retired in #4512)
 
-`LOOM_EST_CORES_PER_SWEEP` is the one hand-tuned constant left in the daemon's
+> **⚠️ This document is historical. Do not follow it as current guidance.**
+>
+> **#4512 deleted the CPU-headroom term from the daemon's admission formula.**
+> `resolve_dynamic_max_concurrent` is now `min(token axis, disk headroom,
+> configured maxConcurrent)` — there is no CPU estimate in it, and therefore
+> nothing for `LOOM_EST_CORES_PER_SWEEP` (or `LOOM_CPU_UTILIZATION_TARGET`) to
+> tune. Both knobs, and their `autonomous.estCoresPerSweep` /
+> `autonomous.cpuUtilizationTarget` config twins, are **accepted but ignored**;
+> the daemon logs one deprecation warning per process
+> (`work_finder::warn_deprecated_cpu_knobs`) naming any that are still set.
+> Measuring a value and setting it will change nothing.
+>
+> **What to do instead:**
+>
+> 1. **Tune `autonomous.workFinder.maxConcurrent` empirically.** It is the one
+>    per-machine admission knob. Run `loom-daemon calibrate` (measurement-only
+>    since #4512) or read `loom-daemon status`: if the cap binds on `ceiling`
+>    while the host sits idle, raise it; if it binds on `token`/`disk`, raising
+>    it changes nothing.
+> 2. **Rely on the machine-wide build slot for the heavy stages.** `cargo
+>    build`/`test` and the build gate take a `mkdir`-atomic slot
+>    (`LOOM_BUILD_SLOTS`, default 1) so at most one or two builds run
+>    concurrently on a host regardless of how many sweeps are admitted. This is
+>    what the per-sweep core estimate was a (poor) proxy for.
+> 3. **Trust the host-distress circuit breaker (#4235)** as the safety net — it
+>    trips on *measured* load-per-core rather than an estimated constant.
+>
+> See `defaults/docs/daemon-reference.md` → *Why there is no CPU term in
+> admission (#4512)* and *Machine-wide build slot (#4512)*.
+>
+> The rest of this file is retained only as a record of how the retired constant
+> was intended to be measured, and because the marginal-cores-per-sweep
+> methodology is still a reasonable way to characterize a host before picking a
+> `maxConcurrent`.
+
+`LOOM_EST_CORES_PER_SWEEP` was the one hand-tuned constant left in the daemon's
 CPU-headroom term (`loom-daemon/src/cpu_headroom.rs`). It estimates how many CPU
 cores a **single** concurrent sweep consumes while its build/test step is
 running. The headroom term is:

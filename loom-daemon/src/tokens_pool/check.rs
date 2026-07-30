@@ -46,6 +46,12 @@ use std::process::{Command, Stdio};
 pub const ANTHROPIC_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const ANTHROPIC_OAUTH_BETA: &str = "oauth-2025-04-20";
+/// DELIBERATELY still `loom-tokens/...` after epic #4081 Phase 4 (#4557)
+/// retired the Python `loom-tokens` CLI. This is an outbound HTTP header value,
+/// not operator-facing advice: it is part of the byte-compatibility contract
+/// with `check.py`'s probe (identical request => identical rate-limit-header
+/// response), and changing it would alter what Anthropic's API sees for no
+/// benefit. Do not "fix" this to `loom-daemon`.
 const USER_AGENT: &str = "loom-tokens/0.1 (claude-code-compatible)";
 /// Default model used for the minimal probe request.
 pub const DEFAULT_PROBE_MODEL: &str = "claude-haiku-4-5-20251001";
