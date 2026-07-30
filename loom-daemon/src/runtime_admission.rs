@@ -247,6 +247,7 @@ pub fn resolve_and_admit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     fn fixture() -> tempfile::TempDir {
         let d = tempfile::tempdir().unwrap();
@@ -357,5 +358,97 @@ mod tests {
             .unwrap_err()
             .reason
             .contains("unknown role"));
+    }
+
+    /// One matrix drives both implementations: every shipped role/runtime
+    /// pair is evaluated natively and by the installed shell checker, and the
+    /// decisions must be identical. This prevents two independent assertion
+    /// lists from silently drifting.
+    #[test]
+    fn native_and_shell_conformance_for_every_shipped_pair() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let defaults = repo.join("defaults");
+        let checker = defaults.join("scripts/check-runtime-capabilities.sh");
+        let roles = fs::read_dir(defaults.join("roles")).unwrap();
+        let runtimes: Vec<String> = fs::read_dir(defaults.join("runtimes"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|e| e.path().file_stem()?.to_str().map(str::to_owned))
+            .collect();
+
+        for role_entry in roles.filter_map(Result::ok) {
+            if role_entry.path().extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(role) = role_entry
+                .path()
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(str::to_owned)
+            else {
+                continue;
+            };
+            for runtime in &runtimes {
+                let native = resolve_and_admit(repo, &role, Some(runtime));
+                // Roles outside the daemon's canonical launch set are not
+                // schedulable here; the shell checker remains a generic tool.
+                if canonical_role(&role).is_none() {
+                    continue;
+                }
+                let shell_role = if canonical_role(&role) == Some("sweep-lifecycle") {
+                    "builder"
+                } else {
+                    &role
+                };
+                let shell = Command::new("bash")
+                    .arg(&checker)
+                    .args(["--role", shell_role, "--runtime", runtime, "--dir"])
+                    .arg(&defaults)
+                    .status()
+                    .unwrap();
+                assert_eq!(
+                    native.is_ok(),
+                    shell.success(),
+                    "native/shell admission drift for role={role} runtime={runtime}: native={native:?}, shell={shell}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn installed_layout_has_identical_resolution_and_rejection() {
+        let source = fixture();
+        let installed = tempfile::tempdir().unwrap();
+        fs::create_dir_all(installed.path().join(".loom")).unwrap();
+        for sub in ["roles", "runtimes", "scripts"] {
+            fs::rename(
+                source.path().join("defaults").join(sub),
+                installed.path().join(".loom").join(sub),
+            )
+            .unwrap();
+        }
+        let admitted = resolve_and_admit(installed.path(), "judge", Some("codex")).unwrap();
+        assert!(admitted
+            .role_manifest
+            .starts_with(installed.path().join(".loom")));
+        let rejected =
+            resolve_and_admit(installed.path(), "sweep-lifecycle", Some("codex")).unwrap_err();
+        assert_eq!(rejected.unmet_capabilities, vec!["worktreeIsolation"]);
+    }
+
+    #[test]
+    fn rejection_serialization_is_structured_backward_compatible_and_secret_free() {
+        let rejection = RuntimeRejection {
+            role: "builder".into(),
+            runtime: "codex".into(),
+            source: RuntimeSource::RoleConfig,
+            unmet_capabilities: vec!["worktreeIsolation".into()],
+            reason: "unmet capabilities: worktreeIsolation".into(),
+        };
+        let json = serde_json::to_string(&rejection).unwrap();
+        assert!(json.contains("\"role\":\"builder\""));
+        assert!(json.contains("\"source\":\"role-config\""));
+        assert!(!json.contains("TOKEN"));
+        assert_eq!(serde_json::from_str::<RuntimeRejection>(&json).unwrap(), rejection);
     }
 }

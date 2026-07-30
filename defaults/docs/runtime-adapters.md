@@ -401,6 +401,14 @@ runtime manifest, and every required capability before starting a child.
 admitted runtime is pinned into the child environment so `spawn-worker.sh`
 cannot make a second, divergent choice.
 
+Daemon admission runs before any claim lock, forge mutation, account selection,
+log header, or child spawn. Successful sweep status and
+`sweep.global.dispatch` events include both `runtime` and `runtime_source`.
+Rejected IPC dispatches return `RuntimeRejected` with structured `role`,
+`runtime`, `source`, `unmet_capabilities`, and `reason` fields. These records
+contain selection metadata only; configuration values, environment contents,
+tokens, and credentials are never serialized.
+
 A `/loom:sweep` is different from a standalone role tick: it is one coordinator
 process for the entire Curator → Builder → Judge → Doctor → Merge lifecycle.
 Loom does not switch its CLI runtime between those nested phases. Consequently

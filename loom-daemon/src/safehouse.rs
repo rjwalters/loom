@@ -2467,6 +2467,8 @@ mod tests {
         let dispatch = Event::SweepGlobalDispatch {
             sweep_id: "sweep-issue-42-1".to_owned() as SweepId,
             kind: SweepKind::Issue(42),
+            runtime: None,
+            runtime_source: None,
             repo: Some("/repos/vibesql".to_owned()),
         };
         let env = event_to_envelope(&dispatch).unwrap();
@@ -2600,6 +2602,8 @@ mod tests {
         let dispatch = Event::SweepGlobalDispatch {
             sweep_id: "sweep-issue-42-1".to_owned() as SweepId,
             kind: SweepKind::Issue(42),
+            runtime: None,
+            runtime_source: None,
             repo: None,
         };
         let env = event_to_envelope(&dispatch).unwrap();
@@ -2761,6 +2765,8 @@ mod tests {
         bus.publish(Event::SweepGlobalDispatch {
             sweep_id: "sweep-issue-4201-1".to_owned() as SweepId,
             kind: SweepKind::Issue(4201),
+            runtime: None,
+            runtime_source: None,
             repo: Some(dir.path().to_string_lossy().into_owned()),
         })
         .unwrap();

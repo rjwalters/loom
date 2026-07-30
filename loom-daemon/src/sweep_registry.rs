@@ -2759,6 +2759,7 @@ impl SweepRegistry {
             pid,
             token_name: token_name.clone(),
             runtime,
+            runtime_source: runtime_admission.as_ref().map(|a| a.source.clone()),
             log_path: log_path.clone(),
             idempotency_key,
             started_at: Utc::now(),
@@ -2806,6 +2807,8 @@ impl SweepRegistry {
         self.emit_event(Event::SweepGlobalDispatch {
             sweep_id: sweep_id.clone(),
             kind: kind.clone(),
+            runtime: runtime_admission.as_ref().map(|a| a.runtime.clone()),
+            runtime_source: runtime_admission.as_ref().map(|a| a.source.clone()),
             // Stamped by `emit_event` -> `set_repo_if_absent` below (#4201),
             // matching the pattern already used for SweepPhase/Blocker/Exited/
             // Crashed — leave it `None` at construction.
@@ -6034,6 +6037,7 @@ impl SweepRegistry {
                         pid: owner.owner_pid,
                         token_name,
                         runtime,
+                        runtime_source: None,
                         log_path,
                         idempotency_key: None,
                         started_at,
@@ -6113,6 +6117,7 @@ impl SweepRegistry {
                         // path legitimately stays `unknown`.
                         token_name: "unknown".to_string(),
                         runtime: "unknown".to_string(),
+                        runtime_source: None,
                         log_path,
                         idempotency_key: None,
                         started_at: Utc::now(),
@@ -6830,6 +6835,95 @@ mod tests {
         let dir = workspace.join(".claude").join("commands").join("loom");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("sweep.md"), "# /loom:sweep (test fixture)\n").unwrap();
+        install_runtime_admission_fixture(workspace);
+    }
+
+    /// Install the minimum zero-config Claude admission surface used by real
+    /// dispatch fixtures. Tests exercise admission rather than bypassing it,
+    /// preserving the ordering contract of the established typed guards.
+    fn install_runtime_admission_fixture(workspace: &Path) {
+        let roles = workspace.join(".loom/roles");
+        let runtimes = workspace.join(".loom/runtimes");
+        let scripts = workspace.join(".loom/scripts");
+        std::fs::create_dir_all(&roles).unwrap();
+        std::fs::create_dir_all(&runtimes).unwrap();
+        std::fs::create_dir_all(&scripts).unwrap();
+        std::fs::write(
+            roles.join("builder.json"),
+            r#"{"runtimeRequirements":["worktreeIsolation","mcp"]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            runtimes.join("claude.json"),
+            r#"{"runtime":"claude","capabilities":{"worktreeIsolation":"yes","mcp":"yes"}}"#,
+        )
+        .unwrap();
+        let adapter = scripts.join("spawn-claude.sh");
+        if !adapter.exists() {
+            std::fs::write(&adapter, "#!/bin/sh\nexit 0\n").unwrap();
+        }
+        let mut perms = std::fs::metadata(&adapter).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(adapter, perms).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn runtime_rejection_precedes_every_dispatch_side_effect() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path();
+        touch_sweep_command(workspace);
+        let config_dir = workspace.join(".loom");
+        std::fs::write(config_dir.join("config.json"), r#"{"runtimes":{"default":"codex"}}"#)
+            .unwrap();
+        std::fs::write(
+            config_dir.join("runtimes/codex.json"),
+            r#"{"runtime":"codex","capabilities":{"worktreeIsolation":"partial","mcp":"yes"}}"#,
+        )
+        .unwrap();
+        let codex = config_dir.join("scripts/spawn-codex.sh");
+        std::fs::write(&codex, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut perms = std::fs::metadata(&codex).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(codex, perms).unwrap();
+
+        let gh_marker = workspace.join("gh-called");
+        let fake_gh = workspace.join("fake-gh.sh");
+        std::fs::write(&fake_gh, format!("#!/bin/sh\ntouch '{}'\nexit 0\n", gh_marker.display()))
+            .unwrap();
+        let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_gh, perms).unwrap();
+        let spawn_marker = workspace.join("spawn-called");
+        let fake_spawn = workspace.join("fake-spawn.sh");
+        std::fs::write(
+            &fake_spawn,
+            format!("#!/bin/sh\ntouch '{}'\nexit 0\n", spawn_marker.display()),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&fake_spawn).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_spawn, perms).unwrap();
+
+        let mut config = SweepRegistryConfig::new(workspace.to_path_buf());
+        config.skip_label_flip = false;
+        config.gh_bin = Some(fake_gh);
+        config.spawn_bin = Some(fake_spawn);
+        config.journal_path = Some(workspace.join("journal.json"));
+        let mut registry = SweepRegistry::new(config);
+        let error = registry
+            .dispatch(&SweepKind::Issue(4494), None, None, None, None)
+            .unwrap_err();
+        let rejection = error
+            .downcast_ref::<crate::runtime_admission::RuntimeRejection>()
+            .unwrap();
+        assert_eq!(rejection.runtime, "codex");
+        assert_eq!(rejection.unmet_capabilities, vec!["worktreeIsolation"]);
+        assert!(!gh_marker.exists(), "forge probe/mutation ran before admission");
+        assert!(!spawn_marker.exists(), "child spawn ran before admission");
+        assert!(!workspace.join(".loom/locks/issues/4494").exists(), "claim lock was created");
+        assert!(!registry.compute_log_path(4494).exists(), "log header was created");
+        assert!(registry.entries.is_empty(), "capacity/registry entry was consumed");
     }
 
     /// Build a temp-workspace registry with a fake spawn binary that
@@ -6863,6 +6957,7 @@ mod tests {
                 pid: 0,
                 token_name: "unknown".into(),
                 runtime: "unknown".into(),
+                runtime_source: None,
                 log_path,
                 idempotency_key: None,
                 started_at: Utc::now(),
@@ -7512,6 +7607,7 @@ exit 0
                 pid,
                 token_name: "unknown".into(),
                 runtime: "unknown".into(),
+                runtime_source: None,
                 log_path: registry.compute_log_path(41_110),
                 idempotency_key: None,
                 started_at: Utc::now(),
@@ -7629,6 +7725,7 @@ exit 0
                 pid,
                 token_name: "unknown".into(),
                 runtime: "unknown".into(),
+                runtime_source: None,
                 log_path: registry.compute_log_path(issue),
                 idempotency_key: None,
                 started_at: Utc::now(),
@@ -8332,6 +8429,7 @@ exit 0
                     pid: 2_147_483_640,
                     token_name: "unknown".into(),
                     runtime: "unknown".into(),
+                    runtime_source: None,
                     log_path: registry.compute_log_path(issue),
                     idempotency_key: None,
                     started_at: Utc::now(),
@@ -8377,6 +8475,7 @@ exit 0
                 pid: 2_147_483_640,
                 token_name: "unknown".into(),
                 runtime: "unknown".into(),
+                runtime_source: None,
                 log_path: PathBuf::from(format!(".loom/logs/sweep-issue-{issue}.log")),
                 idempotency_key: None,
                 started_at: Utc::now(),
@@ -8604,6 +8703,7 @@ exit 0
                 pid: std::process::id(), // any live-looking pid; list() never probes liveness
                 token_name: "unknown".into(),
                 runtime: "unknown".into(),
+                runtime_source: None,
                 log_path: registry.compute_log_path(issue),
                 idempotency_key: None,
                 started_at,
@@ -8812,6 +8912,7 @@ exit 0
                 pid: 2_147_483_640,
                 token_name: "unknown".into(),
                 runtime: "unknown".into(),
+                runtime_source: None,
                 log_path: registry.compute_log_path(55),
                 idempotency_key: None,
                 started_at: Utc::now(),
@@ -8899,6 +9000,7 @@ exit 0
                 pid: 2_147_483_641,
                 token_name: "unknown".into(),
                 runtime: "unknown".into(),
+                runtime_source: None,
                 log_path,
                 idempotency_key: None,
                 started_at: Utc::now(),
@@ -8959,6 +9061,7 @@ exit 0
                 pid: 2_147_483_640,
                 token_name: "unknown".into(),
                 runtime: "unknown".into(),
+                runtime_source: None,
                 log_path: registry.compute_log_path(66),
                 idempotency_key: None,
                 started_at: Utc::now() - chrono::Duration::seconds(10),
@@ -9015,6 +9118,7 @@ exit 0
                 pid: 2_147_483_640, // ~i32::MAX, almost certainly dead
                 token_name: "unknown".into(),
                 runtime: "unknown".into(),
+                runtime_source: None,
                 log_path: registry.compute_log_path(21),
                 idempotency_key: None,
                 started_at: Utc::now(),
@@ -9064,6 +9168,7 @@ exit 0
                 pid: 2_147_483_640, // ~i32::MAX, almost certainly dead
                 token_name: "unknown".into(),
                 runtime: "unknown".into(),
+                runtime_source: None,
                 log_path: registry.compute_log_path(issue),
                 idempotency_key: None,
                 started_at,
@@ -10349,6 +10454,7 @@ exit 0
                 pid: 2_147_483_640, // ~i32::MAX, almost certainly dead
                 token_name: "unknown".into(),
                 runtime: "unknown".into(),
+                runtime_source: None,
                 log_path: registry.compute_log_path(77),
                 idempotency_key: None,
                 started_at: Utc::now(),
@@ -10466,6 +10572,7 @@ exit 0
                 pid: 2_147_483_640, // ~i32::MAX, almost certainly dead
                 token_name: "unknown".into(),
                 runtime: "unknown".into(),
+                runtime_source: None,
                 log_path: registry.compute_log_path(88),
                 idempotency_key: None,
                 started_at,
@@ -10605,6 +10712,7 @@ exit 0
                 pid: 2_147_483_640,
                 token_name: "unknown".into(),
                 runtime: "unknown".into(),
+                runtime_source: None,
                 log_path: registry.compute_log_path(99),
                 idempotency_key: None,
                 started_at,
@@ -10668,6 +10776,7 @@ exit 0
                 pid: 2_147_483_640,
                 token_name: "unknown".into(),
                 runtime: "unknown".into(),
+                runtime_source: None,
                 log_path: registry.compute_log_path(0),
                 idempotency_key: None,
                 started_at,
@@ -10714,6 +10823,7 @@ exit 0
                 pid: 2_147_483_640,
                 token_name: "unknown".into(),
                 runtime: "unknown".into(),
+                runtime_source: None,
                 log_path: registry.compute_log_path(33),
                 idempotency_key: None,
                 started_at: Utc::now(),
@@ -11084,6 +11194,7 @@ exit 0
                 pid: 2_147_483_640,
                 token_name: "unknown".into(),
                 runtime: "unknown".into(),
+                runtime_source: None,
                 log_path: registry.compute_log_path(8801),
                 idempotency_key: None,
                 started_at,
@@ -11567,6 +11678,7 @@ exit 0\n";
             pid: 12_345,
             token_name: "agent-1.token".to_string(),
             runtime: "unknown".into(),
+            runtime_source: None,
             log_path: PathBuf::from(".loom/logs/sweep-issue-42.log"),
             idempotency_key: Some("operator-key".to_string()),
             started_at: chrono::DateTime::parse_from_rfc3339("2026-06-05T10:00:00Z")
@@ -11682,6 +11794,7 @@ exit 0\n";
                 pid: 1234,
                 token_name: "agent-1.token".into(),
                 runtime: "unknown".into(),
+                runtime_source: None,
                 log_path: registry.compute_log_path(42),
                 idempotency_key: None,
                 started_at: Utc::now(),
@@ -11723,6 +11836,7 @@ exit 0\n";
                 pid: 1,
                 token_name: "unknown".into(),
                 runtime: "unknown".into(),
+                runtime_source: None,
                 log_path: log_path.clone(),
                 idempotency_key: None,
                 started_at: Utc::now(),
@@ -11783,6 +11897,7 @@ exit 0\n";
                 pid: 1,
                 token_name: "unknown".into(),
                 runtime: "unknown".into(),
+                runtime_source: None,
                 log_path: registry.compute_log_path(11),
                 idempotency_key: None,
                 started_at: Utc::now(),
@@ -11827,6 +11942,7 @@ exit 0\n";
                 pid: 2_147_483_640, // ~i32::MAX, almost certainly dead
                 token_name: "unknown".into(),
                 runtime: "unknown".into(),
+                runtime_source: None,
                 log_path: registry.compute_log_path(22),
                 idempotency_key: None,
                 started_at: Utc::now(),
@@ -11886,6 +12002,7 @@ exit 0\n";
                 pid,
                 token_name: "unknown".into(),
                 runtime: "unknown".into(),
+                runtime_source: None,
                 log_path: registry.compute_log_path(77),
                 idempotency_key: None,
                 started_at: Utc::now(),
@@ -11964,6 +12081,7 @@ exit 0\n";
                     pid: target_pid,
                     token_name: "unknown".into(),
                     runtime: "unknown".into(),
+                    runtime_source: None,
                     log_path: target_log,
                     idempotency_key: None,
                     started_at: Utc::now(),
@@ -11984,6 +12102,7 @@ exit 0\n";
                     pid: 2_147_483_640, // ~i32::MAX, harmless dead pid
                     token_name: "unknown".into(),
                     runtime: "unknown".into(),
+                    runtime_source: None,
                     log_path: other_log,
                     idempotency_key: None,
                     started_at: Utc::now(),
@@ -12079,6 +12198,7 @@ exit 0\n";
                 pid: 2_147_483_640,
                 token_name: "unknown".into(),
                 runtime: "unknown".into(),
+                runtime_source: None,
                 log_path: registry.compute_log_path(88),
                 idempotency_key: None,
                 started_at: Utc::now(),
@@ -12705,6 +12825,7 @@ exit 0\n";
                 pid: 2_147_483_640,
                 token_name: "unknown".into(),
                 runtime: "unknown".into(),
+                runtime_source: None,
                 log_path: reg.compute_log_path(issue),
                 idempotency_key: None,
                 started_at: Utc::now(),
@@ -12881,6 +13002,7 @@ exit 0\n";
                 pid: 2_147_483_640,
                 token_name: "unknown".into(),
                 runtime: "unknown".into(),
+                runtime_source: None,
                 log_path: reg.compute_log_path(6006),
                 idempotency_key: None,
                 started_at: Utc::now(),
@@ -13211,6 +13333,7 @@ exit 0\n";
                 pid: 2_147_483_640,
                 token_name: "unknown".into(),
                 runtime: "unknown".into(),
+                runtime_source: None,
                 log_path: ws.join(".loom/logs/sweep-issue-6001.log"),
                 idempotency_key: None,
                 started_at: old,
@@ -14195,6 +14318,7 @@ exit 0\n";
                 pid: 2_147_483_641,
                 token_name: "unknown".into(),
                 runtime: "unknown".into(),
+                runtime_source: None,
                 log_path: reg.compute_log_path(issue),
                 idempotency_key: None,
                 started_at: Utc::now() - chrono::Duration::seconds(5),
@@ -14307,6 +14431,7 @@ exit 0\n";
                 pid: std::process::id(), // alive
                 token_name: "unknown".into(),
                 runtime: "unknown".into(),
+                runtime_source: None,
                 log_path: reg.compute_log_path(9256),
                 idempotency_key: None,
                 started_at: Utc::now(),

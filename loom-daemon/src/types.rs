@@ -4,6 +4,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+pub use crate::runtime_admission::{RuntimeRejection, RuntimeSource};
+
 pub type TerminalId = String;
 
 /// Unique identifier for a sweep dispatched via the daemon (Issue #3452).
@@ -520,6 +522,8 @@ pub enum Response {
         token_name: String,
         log_path: PathBuf,
     },
+    /// Typed, secret-free fail-closed runtime admission rejection.
+    RuntimeRejected(RuntimeRejection),
     /// Result of a `ListSweeps` request.
     SweepList {
         sweeps: Vec<SweepInfo>,
@@ -784,6 +788,9 @@ pub struct SweepInfo {
     /// observability contract safely degrade to `unknown`.
     #[serde(default = "default_sweep_runtime")]
     pub runtime: String,
+    /// Precedence tier that selected `runtime`; absent for legacy entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_source: Option<RuntimeSource>,
     /// Path to the per-sweep log file (relative to the workspace).
     pub log_path: PathBuf,
     /// Optional idempotency key supplied at dispatch.
@@ -1678,6 +1685,10 @@ pub enum Event {
     SweepGlobalDispatch {
         sweep_id: SweepId,
         kind: SweepKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        runtime: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        runtime_source: Option<RuntimeSource>,
         /// Owning managed-workspace root (Issue #3929's pattern, extended here
         /// by #4201). This was the one sweep-scoped variant that did **not**
         /// carry `repo` — the safehouse narration sink needs it to
