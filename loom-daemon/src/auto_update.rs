@@ -462,6 +462,26 @@ impl DrainTrigger for IpcDrainTrigger {
             false,
             false,
         );
+        // Issue #4521: the reply's `then_exit` reports the ACTIVE drain's
+        // terminal action, not this request's. `true` here means an operator
+        // teardown drain (`--drain --then-exit`) was already in flight, so this
+        // roll piggybacks on a drain that will STOP the daemon rather than
+        // relaunch it into the freshly-built binary. That is intentional
+        // (then-exit is never downgraded — the host is being torn down), but it
+        // must not be silent: the new binary will not be picked up until the
+        // daemon is started again.
+        if let crate::types::Response::DaemonDrain {
+            accepted: true,
+            then_exit: true,
+            ..
+        } = &resp
+        {
+            log::warn!(
+                "auto-update roll joined an in-progress then-exit (teardown) drain: the daemon \
+                 will STOP when drained and will NOT relaunch into the rebuilt binary. Start it \
+                 again to pick up the update."
+            );
+        }
         matches!(resp, crate::types::Response::DaemonDrain { accepted: true, .. })
     }
 }

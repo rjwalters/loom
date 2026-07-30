@@ -28,6 +28,10 @@ static TEST_PREFIX: LazyLock<String> =
 /// The previous 5s budget was calibrated for `cargo test`, which runs one test
 /// binary at a time, and it produced spurious "failed to create socket within 5s"
 /// failures on a loaded host.
+// Not every test binary that includes this module uses `TestDaemon` (e.g. tests
+// that need raw `Child` control over the daemon they spawn), so the shared
+// helper is `dead_code`-exempt rather than warning per-binary.
+#[allow(dead_code)]
 const DAEMON_SOCKET_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Absolute path to the `loom-daemon` binary under test.
@@ -46,12 +50,14 @@ pub fn daemon_bin() -> PathBuf {
 }
 
 /// Test daemon instance that cleans up on drop
+#[allow(dead_code)]
 pub struct TestDaemon {
     _temp_dir: TempDir,
     socket_path: PathBuf,
     process: Option<Child>,
 }
 
+#[allow(dead_code)]
 impl TestDaemon {
     /// Start a new daemon instance with a unique socket path
     pub async fn start() -> Result<Self> {
