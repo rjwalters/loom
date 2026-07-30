@@ -28,6 +28,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 DISPATCHER="$REPO_ROOT/scripts/loom"
 PROVISION_LIB="$REPO_ROOT/scripts/install/provision-dispatcher.sh"
 REAL_RESOLVER="$REPO_ROOT/defaults/scripts/lib/config-resolver.sh"
+REAL_SPAWN_WORKER="$REPO_ROOT/defaults/scripts/spawn-worker.sh"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -87,6 +88,30 @@ make_consumer_repo() {
 echo "POOL_MANAGER args=[$*]"
 EOF
     chmod +x "$r/.loom/bin/loom"
+    printf '%s\n' "$r"
+}
+
+# Build a fake consumer repo whose .loom/scripts carries a REAL spawn-worker.sh
+# + config-resolver.sh, plus stub spawn-<runtime>.sh runners that just echo
+# their own name and argv (no real claude/codex, no live tokens) — the pattern
+# test-spawn-worker.sh uses. Exercises `loom sweep`'s runtime routing (#4480).
+# Echoes the repo path.
+make_sweep_repo() {
+    local r; r="$(mktemp -d)"
+    mkdir -p "$r/.loom/scripts/lib"
+    cp "$REAL_SPAWN_WORKER" "$r/.loom/scripts/spawn-worker.sh"
+    cp "$REAL_RESOLVER" "$r/.loom/scripts/lib/config-resolver.sh"
+    # Stub runners: each announces which runtime ran and forwards its argv so a
+    # test can assert on both the selected runner and the passthrough flags.
+    cat > "$r/.loom/scripts/spawn-claude.sh" <<'EOF'
+#!/usr/bin/env bash
+echo "STUB_CLAUDE argv=[$*]"
+EOF
+    cat > "$r/.loom/scripts/spawn-codex.sh" <<'EOF'
+#!/usr/bin/env bash
+echo "STUB_CODEX argv=[$*]"
+EOF
+    chmod +x "$r/.loom/scripts/"spawn-*.sh
     printf '%s\n' "$r"
 }
 
@@ -362,6 +387,74 @@ MIGREPO="$(make_consumer_repo)"
 migrate_run=$(cd "$MIGREPO" && LOOM_HOME="$CHK" bash "$DISPATCHER" migrate --dry-run 2>&1 || true)
 assert_contains "$migrate_run" "MIGRATE args=" "'loom migrate' delegates to migrate-consumer.sh"
 assert_contains "$migrate_run" "machine_checkout=[$CHK]" "'loom migrate' hands off LOOM_MACHINE_CHECKOUT"
+
+# ── #4480: `loom sweep` is runtime-neutral (routes through spawn-worker.sh) ───
+echo "Test 19: 'loom sweep' default path (no env, no config) routes to spawn-claude.sh unchanged"
+SWEEPREPO="$(make_sweep_repo)"
+set +e
+out=$(cd "$SWEEPREPO" && LOOM_CONFIG_DEFAULTS_FILE="" LOOM_HOME="$CHK" bash "$DISPATCHER" sweep 4467 2>&1)
+rc=$?
+set -e 2>/dev/null || true
+assert_eq "$rc" "0" "'loom sweep' default path exits 0"
+assert_contains "$out" "STUB_CLAUDE" "default (no env/config) resolves to spawn-claude.sh"
+assert_not_contains "$out" "STUB_CODEX" "default path does not touch the codex runner"
+assert_contains "$out" 'argv=[-p /loom:sweep 4467 --dangerously-skip-permissions]' "default path forwards the same claude args as before (byte-for-byte)"
+
+echo "Test 20: 'LOOM_RUNTIME=codex loom sweep' routes to spawn-codex.sh"
+set +e
+out=$(cd "$SWEEPREPO" && LOOM_RUNTIME=codex LOOM_CONFIG_DEFAULTS_FILE="" LOOM_HOME="$CHK" bash "$DISPATCHER" sweep 4467 2>&1)
+rc=$?
+set -e 2>/dev/null || true
+assert_eq "$rc" "0" "'LOOM_RUNTIME=codex loom sweep' exits 0"
+assert_contains "$out" "STUB_CODEX" "LOOM_RUNTIME=codex resolves to spawn-codex.sh"
+assert_not_contains "$out" "STUB_CLAUDE" "codex env path does not touch the claude runner"
+assert_contains "$out" 'argv=[-p /loom:sweep 4467 --dangerously-skip-permissions]' "codex path forwards the same passthrough args"
+
+if command -v jq >/dev/null 2>&1; then
+    echo "Test 21: 'loom sweep' honors .loom/config.json runtimes.default (no env)"
+    SWEEPCFG="$(make_sweep_repo)"
+    echo '{"runtimes":{"default":"codex"}}' > "$SWEEPCFG/.loom/config.json"
+    set +e
+    out=$(cd "$SWEEPCFG" && LOOM_CONFIG_DEFAULTS_FILE="" LOOM_HOME="$CHK" bash "$DISPATCHER" sweep 4467 2>&1)
+    rc=$?
+    set -e 2>/dev/null || true
+    assert_eq "$rc" "0" "'loom sweep' with runtimes.default=codex exits 0"
+    assert_contains "$out" "STUB_CODEX" "runtimes.default=codex (no env) resolves to spawn-codex.sh"
+    assert_not_contains "$out" "STUB_CLAUDE" "config-selected codex path does not touch the claude runner"
+else
+    echo "Test 21: SKIP (jq not on PATH)"
+fi
+
+echo "Test 22: 'loom sweep' with an unknown runtime exits 78 naming runtime, source, and runners present"
+set +e
+out=$(cd "$SWEEPREPO" && LOOM_RUNTIME=nonexistent LOOM_CONFIG_DEFAULTS_FILE="" LOOM_HOME="$CHK" bash "$DISPATCHER" sweep 4467 2>&1)
+rc=$?
+set -e 2>/dev/null || true
+assert_eq "$rc" "78" "unknown runtime exits 78 (EX_CONFIG)"
+assert_contains "$out" "nonexistent" "error names the resolved runtime"
+assert_contains "$out" "env (LOOM_RUNTIME)" "error names where the runtime was resolved from"
+assert_contains "$out" "claude" "error lists the runners actually present on disk"
+assert_not_contains "$out" "STUB_CLAUDE" "unknown runtime never falls through to a runner"
+
+echo "Test 23: 'loom sweep' still refuses outside a Loom repo and with no issue arg (unchanged)"
+NRSWEEP=$(mktemp -d)
+set +e
+out=$(cd "$NRSWEEP" && LOOM_HOME="$CHK" bash "$DISPATCHER" sweep 4467 2>&1)
+rc=$?
+set -e 2>/dev/null || true
+assert_eq "$rc" "1" "'loom sweep' outside a Loom repo exits 1"
+assert_contains "$out" "must run inside a Loom repo" "'loom sweep' outside a repo keeps the existing message"
+
+set +e
+out=$(cd "$SWEEPREPO" && LOOM_HOME="$CHK" bash "$DISPATCHER" sweep 2>&1)
+rc=$?
+set -e 2>/dev/null || true
+assert_eq "$rc" "1" "'loom sweep' with no issue arg exits 1"
+assert_contains "$out" "usage: loom sweep" "'loom sweep' with no arg keeps the existing usage message"
+
+echo "Test 24: 'loom sweep' no longer hardcodes a Claude-only prerequisite gate (#4480)"
+src="$(cat "$DISPATCHER")"
+assert_not_contains "$src" "'claude' CLI not found on PATH; cannot dispatch a sweep." "the Claude-only prereq gate was removed from sweep"
 
 echo ""
 echo "======================================"

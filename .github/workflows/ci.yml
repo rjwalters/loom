@@ -93,6 +93,18 @@ jobs:
       - name: Check CLAUDE.md line budget
         run: bash scripts/check-claude-md-budget.sh
 
+  agents-md-sync:
+    name: AGENTS.md Sync Check
+    # Cheap structural check; always runs. defaults/.loom/AGENTS.md is generated
+    # from defaults/.loom/CLAUDE.md's agents-md:include marker ranges — this
+    # fails if the checked-in artifact is stale, keeping instructions
+    # single-source (#4479, epic #4167).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check AGENTS.md is in sync with its source
+        run: bash scripts/check-agents-md-sync.sh
+
   installer-tests:
     name: Installer Integration Tests
     needs: changes

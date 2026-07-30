@@ -15,6 +15,29 @@
 //!   topic-prefix filtering runs exactly once, in
 //!   [`crate::event_bus::EventBus::subscribe`], never re-implemented here.
 //!
+//! - `GET /` (#4393, dashboard phase 3) — an embedded single-page HTML/CSS/JS
+//!   dashboard (`dashboard.html`, via [`include_str!`]) with **no JS build
+//!   toolchain**. It polls `/api/status`, opens an `EventSource` against
+//!   `/api/events`, and additionally consumes two new read-only endpoints
+//!   this phase adds:
+//!   - `GET /api/pipeline` — forge-side queue counts per managed repo, via
+//!     [`crate::pipeline_snapshot::GhPipelineSource`] (the exact same
+//!     `gh`-backed source `loom-daemon status --pipeline` already uses — no
+//!     new forge-query code), fronted by a short in-process TTL cache
+//!     ([`PIPELINE_CACHE_TTL`]) so a 5s-interval poller does not fire a batch
+//!     of `gh` subprocesses on every tick.
+//!   - `GET /api/tokens` — per-account rows (name / status / 5h utilization)
+//!     read directly from the resolved pool's `.ranking` file (the same file
+//!     [`crate::capacity::read_ranking_at`] aggregates into counts) — a
+//!     cheap local file read, deliberately **not** the slow live network
+//!     probe `loom-daemon status`'s (unconditional) per-token table runs.
+//!   - `GET /api/peers` — the configured list of peer daemon `serve` base
+//!     URLs (Issue #4393's multihost requirement). Fan-out is **client-side
+//!     only**: this daemon never fetches a peer itself; the browser fetches
+//!     each peer's own `/api/status` directly and renders per-host panels
+//!     with a reachability indicator. No central store, no server-side
+//!     aggregation.
+//!
 //! Nothing starts until the `serve` subcommand is explicitly invoked (never
 //! from the default daemon-run path, never from a config value alone).
 //!
@@ -37,6 +60,9 @@
 //! - `/api/events` adds no new bind, no new port and no new opt-in knob: it is
 //!   routed off the same [`TcpListener`] `/api/status` already answers, so it
 //!   inherits phase 1's bind validation ([`validate_bind`]) unchanged.
+//! - Every response carries [`CORS_ALLOW_ORIGIN_HEADER`] (`*`), which the
+//!   client-side peer fan-out requires; see that constant for why a permissive
+//!   policy is correct on a read-only, loopback-by-default surface.
 //!
 //! # HTTP dependency decision
 //!
@@ -51,23 +77,61 @@
 //! so the long-lived `/api/events` connection needs no framework support
 //! beyond what [`tokio::net::TcpStream`] already provides.
 
+use crate::pipeline_snapshot::{self, PipelineSource};
 use crate::types::{DaemonStatusReport, Event, Request, Response};
 use anyhow::{anyhow, Result};
 use serde::Serialize;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream, UnixStream};
+use tokio::sync::Mutex as AsyncMutex;
 
 /// Default TCP port for `loom-daemon serve`.
 pub const DEFAULT_PORT: u16 = 7420;
+
+/// Path the embedded dashboard page answers (Issue #4393, dashboard phase 3).
+const ROOT_PATH: &str = "/";
 
 /// Path the JSON status-snapshot endpoint answers (Issue #4391).
 const STATUS_PATH: &str = "/api/status";
 
 /// Path the SSE event-tail endpoint answers (Issue #4392).
 const EVENTS_PATH: &str = "/api/events";
+
+/// Path the forge-side pipeline queue endpoint answers (Issue #4393).
+const PIPELINE_PATH: &str = "/api/pipeline";
+
+/// Path the per-token-account usage endpoint answers (Issue #4393).
+const TOKENS_PATH: &str = "/api/tokens";
+
+/// Path the configured peer-daemon list endpoint answers (Issue #4393).
+const PEERS_PATH: &str = "/api/peers";
+
+/// Every route this listener answers (used for the 404 dispatch check).
+const KNOWN_PATHS: &[&str] = &[
+    ROOT_PATH,
+    STATUS_PATH,
+    EVENTS_PATH,
+    PIPELINE_PATH,
+    TOKENS_PATH,
+    PEERS_PATH,
+];
+
+/// The embedded dashboard page (Issue #4393). Plain HTML/CSS/vanilla JS, no
+/// build toolchain — compiled directly into the binary via [`include_str!`]
+/// so `GET /` never touches the filesystem at request time.
+const DASHBOARD_HTML: &str = include_str!("dashboard.html");
+
+/// How long a computed `/api/pipeline` response is reused before the next
+/// request triggers a fresh `gh`-backed fetch (Issue #4393). The dashboard
+/// polls on a short interval (seconds); the underlying `gh` calls are one
+/// subprocess per metric per repo and far too slow to run on every poll, so
+/// this cache trades a bounded staleness window for not hammering `gh` (and,
+/// on a busy repo, its rate limit) from a page nobody may even have open.
+const PIPELINE_CACHE_TTL: Duration = Duration::from_secs(20);
 
 /// Topic **prefixes** the SSE bridge subscribes to, passed verbatim as
 /// `Request::SubscribeEvents { topics }` so the daemon applies them through the
@@ -288,13 +352,35 @@ async fn parse_request<R: tokio::io::AsyncBufRead + Unpin>(
     Ok(ParsedRequest { method, path })
 }
 
+/// The permissive CORS header every response on this listener carries.
+///
+/// Issue #4393's dashboard fans out to peer daemons **client-side**: the browser
+/// on host A fetches host B's `/api/status` (and, for a per-peer tail, host B's
+/// `/api/events`) directly. Those are cross-origin requests, so without an
+/// `Access-Control-Allow-Origin` header on the *peer's* response the browser
+/// blocks every one of them — and a CORS rejection is indistinguishable from a
+/// dead host in the page's error path, so every *healthy* peer would render the
+/// red UNREACHABLE pill. That inverts exactly the reachability signal the
+/// multihost panel exists to provide.
+///
+/// `*` is the right policy here rather than an origin allowlist: these routes are
+/// read-only `GET`s carrying no credentials, the listener is loopback-bound by
+/// default, and exposing it beyond loopback is already an explicit double opt-in
+/// (`--allow-non-loopback` plus a specific bind address). **The bind posture is
+/// the access-control layer, not CORS** — a header allowlist would only enumerate
+/// which browsers may read data any client on a reachable interface can already
+/// `curl`, while breaking the ad-hoc peer lists the fan-out is built around.
+const CORS_ALLOW_ORIGIN_HEADER: &str = "Access-Control-Allow-Origin: *";
+
 /// Write a well-formed HTTP/1.1 JSON response. Always `Connection: close` —
 /// this minimal responder does not support keep-alive/pipelining, so every
-/// connection is single-request.
+/// connection is single-request. Carries [`CORS_ALLOW_ORIGIN_HEADER`] so a peer
+/// dashboard can read this body cross-origin.
 async fn write_json_response(stream: &mut TcpStream, status_line: &str, body: &str) -> Result<()> {
     let response = format!(
         "HTTP/1.1 {status_line}\r\n\
          Content-Type: application/json\r\n\
+         {CORS_ALLOW_ORIGIN_HEADER}\r\n\
          Content-Length: {}\r\n\
          Connection: close\r\n\
          \r\n\
@@ -304,6 +390,250 @@ async fn write_json_response(stream: &mut TcpStream, status_line: &str, body: &s
     stream.write_all(response.as_bytes()).await?;
     stream.flush().await?;
     Ok(())
+}
+
+/// Write a well-formed HTTP/1.1 HTML response (Issue #4393's `GET /`).
+/// `Connection: close`, matching every other route this listener answers, plus
+/// [`CORS_ALLOW_ORIGIN_HEADER`] for consistency with the API routes.
+async fn write_html_response(stream: &mut TcpStream, body: &str) -> Result<()> {
+    let response = format!(
+        "HTTP/1.1 200 OK\r\n\
+         Content-Type: text/html; charset=utf-8\r\n\
+         {CORS_ALLOW_ORIGIN_HEADER}\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {body}",
+        body.len(),
+    );
+    stream.write_all(response.as_bytes()).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+// ============================================================================
+// Forge-side pipeline queues (`GET /api/pipeline`, Issue #4393)
+// ============================================================================
+
+/// One managed repo's queue counts, as answered by `/api/pipeline`: the same
+/// [`pipeline_snapshot::RepoPipelineSnapshot`]
+/// `loom-daemon status --pipeline` already renders, plus a best-effort forge
+/// web URL for the dashboard's "links to the forge" requirement.
+#[derive(Debug, Clone, Serialize)]
+pub struct PipelineRow {
+    #[serde(flatten)]
+    pub snapshot: pipeline_snapshot::RepoPipelineSnapshot,
+    /// A browser-navigable URL for this repo's forge page, derived from `git
+    /// remote get-url origin` (no extra network/API call — see
+    /// [`derive_forge_url`]). `None` when it cannot be derived (no `git`, no
+    /// `origin` remote, or an unrecognized remote URL shape) — the dashboard
+    /// renders plain text for that repo rather than a broken link.
+    pub forge_url: Option<String>,
+}
+
+/// Best-effort forge web URL for `root`, derived from `git remote get-url
+/// origin` — a fast, local, network-free lookup (never a second `gh` call).
+/// Handles the two common remote URL shapes:
+/// `https://host/owner/repo(.git)` and `git@host:owner/repo(.git)`.
+/// `None` when `git` is unavailable, there is no `origin` remote, or the URL
+/// shape is unrecognized.
+#[must_use]
+fn derive_forge_url(root: &Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .current_dir(root)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    normalize_forge_url(&raw)
+}
+
+/// Pure URL-shape normalization for [`derive_forge_url`], split out so it is
+/// unit-testable without shelling out to `git`.
+#[must_use]
+fn normalize_forge_url(raw: &str) -> Option<String> {
+    let stripped = raw.strip_suffix(".git").unwrap_or(raw);
+    if stripped.starts_with("https://") || stripped.starts_with("http://") {
+        return Some(stripped.to_string());
+    }
+    if let Some(rest) = stripped.strip_prefix("ssh://git@") {
+        return Some(format!("https://{rest}"));
+    }
+    if let Some(rest) = stripped.strip_prefix("git@") {
+        let (host, path) = rest.split_once(':')?;
+        return Some(format!("https://{host}/{path}"));
+    }
+    None
+}
+
+/// Shared, mutex-guarded `/api/pipeline` cache: the last computed row set
+/// plus when it was computed. `None` until the first request.
+pub type PipelineCache = Arc<AsyncMutex<Option<(Instant, Vec<PipelineRow>)>>>;
+
+/// Fetch fresh pipeline rows for `roots` via `source`, decorating each with a
+/// best-effort forge URL. The `gh` fan-out itself is
+/// [`pipeline_snapshot::collect_pipeline_snapshots`] verbatim (Issue #4393's
+/// "reuse, don't reinvent" constraint) — this function only adds the URL
+/// decoration on top, each root's `git remote` lookup running on the
+/// blocking-thread pool alongside the `gh` calls it already uses.
+async fn build_pipeline_rows(
+    source: Arc<dyn PipelineSource + Send + Sync>,
+    roots: Vec<PathBuf>,
+) -> Vec<PipelineRow> {
+    let snapshots = pipeline_snapshot::collect_pipeline_snapshots(source, roots).await;
+    let mut rows = Vec::with_capacity(snapshots.len());
+    for snapshot in snapshots {
+        let root = snapshot.root.clone();
+        let forge_url = tokio::task::spawn_blocking(move || derive_forge_url(&root))
+            .await
+            .unwrap_or(None);
+        rows.push(PipelineRow {
+            snapshot,
+            forge_url,
+        });
+    }
+    rows
+}
+
+/// Serve `GET /api/pipeline`: the forge-side queue snapshot for every
+/// managed repo the live status report names, fronted by [`PIPELINE_CACHE_TTL`].
+///
+/// Roots are read from a fresh `/api/status` round-trip rather than from the
+/// cache, so an unreachable daemon is detected on every request (503, matching
+/// `/api/status`'s own behavior). Note that a *changed* root set does not
+/// invalidate the cache: while a cached entry is still within
+/// [`PIPELINE_CACHE_TTL`] the rows served are the ones computed for whatever
+/// root set was current at computation time, so a newly registered or
+/// deregistered workspace can take up to that TTL to appear or disappear from
+/// this endpoint. That is the intended tradeoff — recomputing means a `gh`
+/// subprocess batch, which a fast-polling page must not fire per tick. Zero
+/// managed repos yields `[]`, never a crash (Issue #4393 edge case).
+async fn handle_pipeline(
+    stream: &mut TcpStream,
+    socket_path: &Path,
+    source: Arc<dyn PipelineSource + Send + Sync>,
+    cache: &PipelineCache,
+) -> Result<()> {
+    let report = match fetch_report(socket_path).await {
+        Ok(r) => r,
+        Err(e) => {
+            let body = serde_json::json!({ "error": format!("daemon unreachable: {e}") });
+            write_json_response(stream, "503 Service Unavailable", &body.to_string()).await?;
+            return Ok(());
+        }
+    };
+    let roots: Vec<PathBuf> = report.per_repo.iter().map(|r| r.root.clone()).collect();
+
+    let mut guard = cache.lock().await;
+    let fresh = guard
+        .as_ref()
+        .is_some_and(|(computed_at, _)| computed_at.elapsed() < PIPELINE_CACHE_TTL);
+    if !fresh {
+        let rows = build_pipeline_rows(source, roots).await;
+        *guard = Some((Instant::now(), rows));
+    }
+    let rows = guard
+        .as_ref()
+        .map_or_else(Vec::new, |(_, rows)| rows.clone());
+    drop(guard);
+
+    let body = serde_json::to_string(&rows)?;
+    write_json_response(stream, "200 OK", &body).await
+}
+
+// ============================================================================
+// Per-token usage (`GET /api/tokens`, Issue #4393)
+// ============================================================================
+
+/// One rotation account's row for the dashboard's per-token panel: name,
+/// discrete health status word, and the 5h-utilization fraction (when the
+/// `.ranking` line carries one — legacy two-field rows omit it).
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct TokenAccountRow {
+    pub name: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub util_5h: Option<f64>,
+}
+
+/// Read every account row from `{pool_dir}/.ranking`, via the **same** triple
+/// parser (`name|status|5h_util`) the spawn-time selector and
+/// [`crate::capacity::read_ranking_at`]'s aggregation both use
+/// ([`crate::tokens_pool::select::parse_ranking_line`]) — so this panel can
+/// never disagree with the aggregate counts on `/api/status` about what a row
+/// means. Deliberately a **local file read**, not the live per-account
+/// network probe `loom-daemon status`'s table runs — that probe is far too
+/// slow for a page polling every few seconds. An absent/unreadable file
+/// yields an empty list rather than an error (Issue #4393: a daemon with no
+/// probe data yet must render an empty panel, not crash the endpoint).
+#[must_use]
+pub fn read_token_rows(pool_dir: &Path) -> Vec<TokenAccountRow> {
+    let ranking_path = pool_dir.join(".ranking");
+    let Ok(contents) = std::fs::read_to_string(&ranking_path) else {
+        return Vec::new();
+    };
+    contents
+        .lines()
+        .filter_map(crate::tokens_pool::select::parse_ranking_line)
+        .map(|(name, status, util_5h)| TokenAccountRow {
+            name,
+            status,
+            util_5h,
+        })
+        .collect()
+}
+
+/// Serve `GET /api/tokens`: per-account rows for whichever pool directory the
+/// live status report resolved ([`DaemonStatusReport::token_pool_dir`]), so
+/// this panel always reads the same pool `/api/status` describes. `None`
+/// pool dir (a pre-#4292 wire payload, or a daemon that resolved none) yields
+/// an empty list. An unreachable daemon degrades to 503, matching the other
+/// endpoints.
+async fn handle_tokens(stream: &mut TcpStream, socket_path: &Path) -> Result<()> {
+    let report = match fetch_report(socket_path).await {
+        Ok(r) => r,
+        Err(e) => {
+            let body = serde_json::json!({ "error": format!("daemon unreachable: {e}") });
+            write_json_response(stream, "503 Service Unavailable", &body.to_string()).await?;
+            return Ok(());
+        }
+    };
+    let rows = report
+        .token_pool_dir
+        .as_deref()
+        .map(read_token_rows)
+        .unwrap_or_default();
+    let body = serde_json::to_string(&rows)?;
+    write_json_response(stream, "200 OK", &body).await
+}
+
+// ============================================================================
+// Peer daemon list (`GET /api/peers`, Issue #4393)
+// ============================================================================
+
+/// Parse a `--peers` CLI value into a list of peer base URLs: comma-separated,
+/// trimmed, empty entries dropped. `""` (the flag's default) yields an empty
+/// list — the common single-host case, where the dashboard renders no peer
+/// panels at all.
+#[must_use]
+pub fn parse_peer_list(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Serve `GET /api/peers`: the configured peer-daemon base URL list (Issue
+/// #4393's multihost requirement). This daemon never fetches a peer itself —
+/// fan-out is entirely client-side (the browser fetches each peer's own
+/// `/api/status`); this endpoint only hands the browser the configured list.
+async fn handle_peers(stream: &mut TcpStream, peers: &[String]) -> Result<()> {
+    let body = serde_json::json!({ "peers": peers });
+    write_json_response(stream, "200 OK", &body.to_string()).await
 }
 
 // ============================================================================
@@ -328,6 +658,9 @@ pub fn topic_is_streamed(topic: &str) -> bool {
 /// until the connection ends — the standard framing for an unbounded
 /// `text/event-stream`. `X-Accel-Buffering: no` tells a reverse proxy (should
 /// an operator front this loopback listener with one) not to buffer the stream.
+/// [`CORS_ALLOW_ORIGIN_HEADER`] is required for a cross-origin `EventSource`:
+/// the browser applies the same-origin policy to SSE exactly as it does to
+/// `fetch`, so a per-peer event tail needs it on the peer's response.
 #[must_use]
 fn sse_response_head() -> String {
     format!(
@@ -335,6 +668,7 @@ fn sse_response_head() -> String {
          Content-Type: text/event-stream\r\n\
          Cache-Control: no-cache, no-store\r\n\
          X-Accel-Buffering: no\r\n\
+         {CORS_ALLOW_ORIGIN_HEADER}\r\n\
          Connection: close\r\n\
          \r\n\
          retry: {SSE_RETRY_MS}\n\
@@ -516,10 +850,52 @@ async fn handle_event_stream(stream: &mut TcpStream, socket_path: &Path) -> Resu
     }
 }
 
+/// Shared, per-listener state every accepted connection routes against
+/// (Issue #4393). Everything here is either immutable for the life of the
+/// listener (`socket_path`, `peers`, `pipeline_source`) or its own
+/// independently-guarded cache (`pipeline_cache`) — there is no server-side
+/// mutable daemon state, preserving phase 1/2's read-only invariant.
+pub struct ServeState {
+    socket_path: PathBuf,
+    pipeline_source: Arc<dyn PipelineSource + Send + Sync>,
+    pipeline_cache: PipelineCache,
+    peers: Vec<String>,
+}
+
+impl ServeState {
+    /// Build the default state: the real `gh`-backed pipeline source, no
+    /// configured peers, and a cold pipeline cache.
+    #[must_use]
+    pub fn new(socket_path: PathBuf) -> Self {
+        Self {
+            socket_path,
+            pipeline_source: Arc::new(pipeline_snapshot::GhPipelineSource::new()),
+            pipeline_cache: Arc::new(AsyncMutex::new(None)),
+            peers: Vec::new(),
+        }
+    }
+
+    /// Configure the peer-daemon base URL list (Issue #4393's multihost
+    /// requirement — served verbatim by `GET /api/peers`).
+    #[must_use]
+    pub fn with_peers(mut self, peers: Vec<String>) -> Self {
+        self.peers = peers;
+        self
+    }
+
+    /// Override the pipeline source (tests only — production always uses the
+    /// real `gh`-backed [`pipeline_snapshot::GhPipelineSource`] from [`Self::new`]).
+    #[must_use]
+    pub fn with_pipeline_source(mut self, source: Arc<dyn PipelineSource + Send + Sync>) -> Self {
+        self.pipeline_source = source;
+        self
+    }
+}
+
 /// Handle a single accepted connection: parse the request, route it, and
 /// write exactly one response. Every branch is read-only — this function
 /// never mutates daemon state and never writes to disk.
-async fn handle_connection(mut stream: TcpStream, socket_path: PathBuf) -> Result<()> {
+async fn handle_connection(mut stream: TcpStream, state: Arc<ServeState>) -> Result<()> {
     // Scoped so the `BufReader`'s mutable borrow of `stream` ends before this
     // function needs `&mut stream` again to write the response.
     let parse_result = {
@@ -541,7 +917,7 @@ async fn handle_connection(mut stream: TcpStream, socket_path: PathBuf) -> Resul
         }
     };
 
-    if parsed.path != STATUS_PATH && parsed.path != EVENTS_PATH {
+    if !KNOWN_PATHS.contains(&parsed.path.as_str()) {
         write_json_response(
             &mut stream,
             "404 Not Found",
@@ -564,10 +940,32 @@ async fn handle_connection(mut stream: TcpStream, socket_path: PathBuf) -> Resul
     // The SSE tail (#4392) is a long-lived response: it owns the connection
     // from here until either side disconnects.
     if parsed.path == EVENTS_PATH {
-        return handle_event_stream(&mut stream, &socket_path).await;
+        return handle_event_stream(&mut stream, &state.socket_path).await;
     }
 
-    match fetch_snapshot(&socket_path).await {
+    if parsed.path == ROOT_PATH {
+        return write_html_response(&mut stream, DASHBOARD_HTML).await;
+    }
+
+    if parsed.path == PIPELINE_PATH {
+        return handle_pipeline(
+            &mut stream,
+            &state.socket_path,
+            Arc::clone(&state.pipeline_source),
+            &state.pipeline_cache,
+        )
+        .await;
+    }
+
+    if parsed.path == TOKENS_PATH {
+        return handle_tokens(&mut stream, &state.socket_path).await;
+    }
+
+    if parsed.path == PEERS_PATH {
+        return handle_peers(&mut stream, &state.peers).await;
+    }
+
+    match fetch_snapshot(&state.socket_path).await {
         Ok(snapshot) => {
             let body = serde_json::to_string(&snapshot)?;
             write_json_response(&mut stream, "200 OK", &body).await?;
@@ -580,22 +978,36 @@ async fn handle_connection(mut stream: TcpStream, socket_path: PathBuf) -> Resul
     Ok(())
 }
 
-/// Run the HTTP accept loop against an already-bound [`TcpListener`]. Each
-/// connection is handled on its own task; a per-connection failure (parse
-/// error, client disconnect mid-write, …) is logged and never brings down the
-/// listener. Returns only on a fatal `accept()` error.
+/// Run the HTTP accept loop against an already-bound [`TcpListener`], using
+/// the default [`ServeState`] (real `gh`-backed pipeline source, no
+/// configured peers). This is the entry point every phase-1/2 test and the
+/// pre-#4393 call sites already use; [`run_with_state`] is the #4393
+/// extension point for a configured peer list / an overridden pipeline
+/// source (tests).
 pub async fn run(listener: TcpListener, socket_path: PathBuf) -> Result<()> {
+    run_with_state(listener, ServeState::new(socket_path)).await
+}
+
+/// Run the HTTP accept loop against an already-bound [`TcpListener`] with an
+/// explicit [`ServeState`] (Issue #4393: a configured peer list and/or a
+/// non-default pipeline source). Each connection is handled on its own task;
+/// a per-connection failure (parse error, client disconnect mid-write, …) is
+/// logged and never brings down the listener. Returns only on a fatal
+/// `accept()` error.
+pub async fn run_with_state(listener: TcpListener, state: ServeState) -> Result<()> {
     let local_addr = listener.local_addr().ok();
     log::info!(
-        "serve: listening on {} ({STATUS_PATH}, {EVENTS_PATH}; proxying {})",
+        "serve: listening on {} ({ROOT_PATH}, {STATUS_PATH}, {EVENTS_PATH}, {PIPELINE_PATH}, \
+         {TOKENS_PATH}, {PEERS_PATH}; proxying {})",
         local_addr.map_or_else(|| "?".to_string(), |a| a.to_string()),
-        socket_path.display()
+        state.socket_path.display()
     );
+    let state = Arc::new(state);
     loop {
         let (stream, peer) = listener.accept().await?;
-        let socket_path = socket_path.clone();
+        let state = Arc::clone(&state);
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, socket_path).await {
+            if let Err(e) = handle_connection(stream, state).await {
                 log::debug!("serve: connection from {peer} ended with error: {e}");
             }
         });
@@ -760,6 +1172,38 @@ mod tests {
         socket_path
     }
 
+    /// Like [`spawn_fake_daemon_socket`], but loops accepting connections and
+    /// answers every one with a clone of `report` — needed by tests (Issue
+    /// #4393) that issue more than one HTTP request against the same fake
+    /// daemon (e.g. exercising the `/api/pipeline` TTL cache, which
+    /// re-fetches the live report on every request regardless of cache
+    /// state).
+    async fn spawn_repeating_fake_daemon_socket(report: DaemonStatusReport) -> PathBuf {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("fake-daemon.sock");
+        std::mem::forget(dir);
+        let listener = UnixListener::bind(&socket_path).expect("bind fake socket");
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let report = report.clone();
+                tokio::spawn(async move {
+                    let (reader, mut writer) = stream.into_split();
+                    let mut lines = BufReader::new(reader).lines();
+                    if let Ok(Some(line)) = lines.next_line().await {
+                        let _req: Request = serde_json::from_str(&line).expect("valid request");
+                        let response = Response::DaemonStatus(Box::new(report));
+                        let response_json = serde_json::to_string(&response).expect("serialize");
+                        let _ = writer.write_all(response_json.as_bytes()).await;
+                        let _ = writer.write_all(b"\n").await;
+                        let _ = writer.flush().await;
+                    }
+                });
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        socket_path
+    }
+
     // ===== Integration: fetch_snapshot over a fake daemon socket =====
 
     #[tokio::test]
@@ -786,6 +1230,13 @@ mod tests {
     // ===== Integration: full HTTP round-trip on an ephemeral port =====
 
     async fn http_get(addr: std::net::SocketAddr, path: &str) -> (u16, String) {
+        let (status, _head, body) = http_get_full(addr, path).await;
+        (status, body)
+    }
+
+    /// Like [`http_get`] but also returns the response **head**, for assertions
+    /// about headers (e.g. the CORS header the peer fan-out depends on).
+    async fn http_get_full(addr: std::net::SocketAddr, path: &str) -> (u16, String, String) {
         let mut stream = TcpStream::connect(addr).await.expect("connect");
         let request = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
         stream
@@ -801,12 +1252,17 @@ mod tests {
             .nth(1)
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
+        let head = text
+            .split("\r\n\r\n")
+            .next()
+            .unwrap_or_default()
+            .to_string();
         let body = text
             .split("\r\n\r\n")
             .nth(1)
             .unwrap_or_default()
             .to_string();
-        (status_code, body)
+        (status_code, head, body)
     }
 
     #[tokio::test]
@@ -923,6 +1379,7 @@ mod tests {
                 issue: 4392,
                 exit_code: Some(0),
                 duration_sec: 12,
+                no_progress: false,
                 death_class: None,
                 repo: None,
             },
@@ -1134,6 +1591,85 @@ mod tests {
         assert!(head.contains(&format!("retry: {SSE_RETRY_MS}")));
     }
 
+    // ========================================================================
+    // CORS (Issue #4393): the client-side peer fan-out is cross-origin, so the
+    // *peer's* responses must carry `Access-Control-Allow-Origin` or the
+    // browser blocks them — and the page cannot tell a CORS rejection from a
+    // dead host, so a healthy peer would render UNREACHABLE. These tests pin
+    // the header onto all three response paths (JSON, HTML, SSE).
+    // ========================================================================
+
+    #[test]
+    fn cors_header_is_a_wildcard_origin() {
+        // Pinned deliberately: an origin allowlist cannot work for an ad-hoc
+        // peer list, and these are credential-free read-only GETs whose access
+        // control is the bind posture (loopback default + --allow-non-loopback).
+        assert_eq!(CORS_ALLOW_ORIGIN_HEADER, "Access-Control-Allow-Origin: *");
+    }
+
+    #[test]
+    fn sse_response_head_carries_the_cors_header_for_cross_origin_eventsource() {
+        // A cross-origin `EventSource` is subject to the same-origin policy just
+        // like `fetch`, so a per-peer event tail needs the header here too.
+        let head = sse_response_head();
+        assert!(
+            head.contains(&format!("{CORS_ALLOW_ORIGIN_HEADER}\r\n")),
+            "SSE head must carry the CORS header: {head:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_json_route_carries_the_cors_header() {
+        let mut report = empty_report();
+        report.token_pool_size = 3;
+        let socket_path = spawn_fake_daemon_socket(report).await;
+        let tcp_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind tcp");
+        let addr = tcp_listener.local_addr().expect("local addr");
+        let state = ServeState::new(socket_path).with_peers(vec!["http://peer-a:7420".to_string()]);
+        let server_task = tokio::spawn(run_with_state(tcp_listener, state));
+
+        // `/api/status` is the one the fan-out actually fetches cross-origin,
+        // but the header is a property of the JSON writer, so every JSON route
+        // (including the 404 error path) must carry it.
+        for path in [
+            "/api/status",
+            "/api/peers",
+            "/api/tokens",
+            "/api/pipeline",
+            "/nope",
+        ] {
+            let (_status, head, _body) = http_get_full(addr, path).await;
+            assert!(
+                head.contains(&format!("{CORS_ALLOW_ORIGIN_HEADER}\r\n")),
+                "{path} response must carry the CORS header: {head:?}"
+            );
+        }
+
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn html_route_carries_the_cors_header() {
+        let socket_path = spawn_fake_daemon_socket(empty_report()).await;
+        let tcp_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind tcp");
+        let addr = tcp_listener.local_addr().expect("local addr");
+        let server_task = tokio::spawn(run(tcp_listener, socket_path));
+
+        let (status, head, _body) = http_get_full(addr, "/").await;
+        assert_eq!(status, 200);
+        assert!(head.contains("Content-Type: text/html"), "head: {head:?}");
+        assert!(
+            head.contains(&format!("{CORS_ALLOW_ORIGIN_HEADER}\r\n")),
+            "dashboard page response must carry the CORS header: {head:?}"
+        );
+
+        server_task.abort();
+    }
+
     // ----- Integration harness: a fake daemon that answers SubscribeEvents -----
 
     struct FakeEventDaemon {
@@ -1261,6 +1797,13 @@ mod tests {
         let (mut client, head) = connect_sse(addr).await;
         assert!(head.contains("200 OK"), "head: {head:?}");
         assert!(head.contains("text/event-stream"), "head: {head:?}");
+        // On-the-wire companion to
+        // `sse_response_head_carries_the_cors_header_for_cross_origin_eventsource`:
+        // a peer's SSE tail is reachable from a cross-origin `EventSource`.
+        assert!(
+            head.contains(CORS_ALLOW_ORIGIN_HEADER),
+            "live SSE head must carry the CORS header: {head:?}"
+        );
 
         // The bus drops events published with no receivers, so wait until the
         // bridge's subscription has actually landed.
@@ -1418,6 +1961,459 @@ mod tests {
         assert!(text.starts_with("HTTP/1.1 405"), "response: {text:?}");
         // Read-only invariant: a rejected write attempt never reaches the bus.
         assert_eq!(fake.bus.receiver_count(), 0);
+
+        server_task.abort();
+    }
+
+    // ========================================================================
+    // Dashboard page (`GET /`, Issue #4393)
+    // ========================================================================
+
+    #[tokio::test]
+    async fn http_get_root_returns_the_dashboard_page() {
+        let socket_path = spawn_fake_daemon_socket(empty_report()).await;
+        let tcp_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind tcp");
+        let addr = tcp_listener.local_addr().expect("local addr");
+        let server_task = tokio::spawn(run(tcp_listener, socket_path));
+
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            .await
+            .expect("write request");
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.expect("read response");
+        let text = String::from_utf8_lossy(&buf).to_string();
+
+        assert!(text.starts_with("HTTP/1.1 200 OK\r\n"), "response head: {text:?}");
+        assert!(text.contains("Content-Type: text/html"), "response head: {text:?}");
+        assert!(text.contains("loom-daemon fleet dashboard"), "body missing dashboard title");
+        assert!(
+            text.contains("EventSource"),
+            "page must open an EventSource against /api/events"
+        );
+        assert!(text.contains("/api/status"), "page must consume /api/status");
+        assert!(text.contains("/api/pipeline"), "page must consume /api/pipeline");
+        assert!(text.contains("/api/tokens"), "page must consume /api/tokens");
+
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn http_get_root_rejects_non_get_methods() {
+        let socket_path = spawn_fake_daemon_socket(empty_report()).await;
+        let tcp_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind tcp");
+        let addr = tcp_listener.local_addr().expect("local addr");
+        let server_task = tokio::spawn(run(tcp_listener, socket_path));
+
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        stream
+            .write_all(b"POST / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            .await
+            .expect("write request");
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.expect("read response");
+        let text = String::from_utf8_lossy(&buf);
+        assert!(text.starts_with("HTTP/1.1 405"), "response: {text:?}");
+
+        server_task.abort();
+    }
+
+    // ========================================================================
+    // Peer list (`GET /api/peers`, Issue #4393)
+    // ========================================================================
+
+    #[test]
+    fn parse_peer_list_splits_trims_and_drops_empties() {
+        assert_eq!(
+            parse_peer_list(" http://a:7420 , http://b:7420,,http://c:7420 "),
+            vec!["http://a:7420", "http://b:7420", "http://c:7420"]
+        );
+    }
+
+    #[test]
+    fn parse_peer_list_of_empty_string_is_empty() {
+        assert!(parse_peer_list("").is_empty());
+        assert!(parse_peer_list("   ").is_empty());
+    }
+
+    #[tokio::test]
+    async fn http_get_peers_returns_the_configured_list_verbatim() {
+        let socket_path = spawn_fake_daemon_socket(empty_report()).await;
+        let tcp_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind tcp");
+        let addr = tcp_listener.local_addr().expect("local addr");
+        let peers = vec![
+            "http://peer-a:7420".to_string(),
+            "http://peer-b:7420".to_string(),
+        ];
+        let state = ServeState::new(socket_path).with_peers(peers.clone());
+        let server_task = tokio::spawn(run_with_state(tcp_listener, state));
+
+        let (status, body) = http_get(addr, "/api/peers").await;
+        assert_eq!(status, 200);
+        let value: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+        assert_eq!(value["peers"], serde_json::json!(peers));
+
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn http_get_peers_defaults_to_an_empty_list() {
+        let socket_path = spawn_fake_daemon_socket(empty_report()).await;
+        let tcp_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind tcp");
+        let addr = tcp_listener.local_addr().expect("local addr");
+        let server_task = tokio::spawn(run(tcp_listener, socket_path));
+
+        let (status, body) = http_get(addr, "/api/peers").await;
+        assert_eq!(status, 200);
+        let value: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+        assert_eq!(value["peers"], serde_json::json!([]));
+
+        server_task.abort();
+    }
+
+    // ========================================================================
+    // Per-token usage (`GET /api/tokens`, Issue #4393)
+    // ========================================================================
+
+    #[test]
+    fn read_token_rows_parses_the_ranking_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join(".ranking"),
+            "agent-1|available|0.42\nagent-2|exhausted|0.99\nagent-3|available\n",
+        )
+        .expect("write ranking");
+
+        let rows = read_token_rows(dir.path());
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].name, "agent-1");
+        assert_eq!(rows[0].status, "available");
+        assert_eq!(rows[0].util_5h, Some(0.42));
+        assert_eq!(rows[1].status, "exhausted");
+        // Legacy two-field row: no trailing 5h_util.
+        assert_eq!(rows[2].name, "agent-3");
+        assert_eq!(rows[2].util_5h, None);
+    }
+
+    #[test]
+    fn read_token_rows_missing_file_is_an_empty_list_not_an_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(read_token_rows(dir.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn http_get_tokens_reads_the_reports_resolved_pool_dir() {
+        let pool_dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(pool_dir.path().join(".ranking"), "agent-1|available|0.10\n")
+            .expect("write ranking");
+
+        let mut report = empty_report();
+        report.token_pool_dir = Some(pool_dir.path().to_path_buf());
+        let socket_path = spawn_fake_daemon_socket(report).await;
+        let tcp_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind tcp");
+        let addr = tcp_listener.local_addr().expect("local addr");
+        let server_task = tokio::spawn(run(tcp_listener, socket_path));
+
+        let (status, body) = http_get(addr, "/api/tokens").await;
+        assert_eq!(status, 200);
+        let value: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+        assert_eq!(value[0]["name"], serde_json::json!("agent-1"));
+        assert_eq!(value[0]["status"], serde_json::json!("available"));
+        assert_eq!(value[0]["util_5h"], serde_json::json!(0.10));
+
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn http_get_tokens_with_no_pool_dir_is_an_empty_array() {
+        // The zero-workspaces / no-probe-yet edge case (#4393 test plan): the
+        // daemon resolved no pool directory at all — must render `[]`, never
+        // crash the connection.
+        let socket_path = spawn_fake_daemon_socket(empty_report()).await;
+        let tcp_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind tcp");
+        let addr = tcp_listener.local_addr().expect("local addr");
+        let server_task = tokio::spawn(run(tcp_listener, socket_path));
+
+        let (status, body) = http_get(addr, "/api/tokens").await;
+        assert_eq!(status, 200);
+        assert_eq!(body, "[]");
+
+        server_task.abort();
+    }
+
+    // ========================================================================
+    // Forge URL derivation (Issue #4393)
+    // ========================================================================
+
+    #[test]
+    fn normalize_forge_url_handles_https_git_suffix() {
+        assert_eq!(
+            normalize_forge_url("https://github.com/rjwalters/loom.git"),
+            Some("https://github.com/rjwalters/loom".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_forge_url_handles_bare_https_without_git_suffix() {
+        assert_eq!(
+            normalize_forge_url("https://github.com/rjwalters/loom"),
+            Some("https://github.com/rjwalters/loom".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_forge_url_handles_scp_like_ssh() {
+        assert_eq!(
+            normalize_forge_url("git@github.com:rjwalters/loom.git"),
+            Some("https://github.com/rjwalters/loom".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_forge_url_handles_ssh_scheme() {
+        assert_eq!(
+            normalize_forge_url("ssh://git@github.com/rjwalters/loom.git"),
+            Some("https://github.com/rjwalters/loom".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_forge_url_rejects_unrecognized_shapes() {
+        assert_eq!(normalize_forge_url("not-a-url"), None);
+        assert_eq!(normalize_forge_url(""), None);
+    }
+
+    #[test]
+    fn derive_forge_url_on_a_non_git_directory_is_none_not_a_panic() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(derive_forge_url(dir.path()), None);
+    }
+
+    // ========================================================================
+    // Forge-side pipeline queues (`GET /api/pipeline`, Issue #4393)
+    // ========================================================================
+
+    /// A scripted, call-counting [`PipelineSource`] — mirrors
+    /// [`pipeline_snapshot::tests::FakeSource`] (that one is private to its
+    /// own module) but additionally counts invocations so the TTL cache
+    /// behavior is directly observable.
+    struct CountingFakeSource {
+        by_root: std::collections::HashMap<PathBuf, pipeline_snapshot::RepoPipelineSnapshot>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingFakeSource {
+        fn new(entries: Vec<(PathBuf, pipeline_snapshot::RepoPipelineSnapshot)>) -> Self {
+            Self {
+                by_root: entries.into_iter().collect(),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl PipelineSource for CountingFakeSource {
+        fn fetch(&self, root: &Path) -> pipeline_snapshot::RepoPipelineSnapshot {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.by_root.get(root).cloned().unwrap_or_else(|| {
+                pipeline_snapshot::RepoPipelineSnapshot {
+                    root: root.to_path_buf(),
+                    error: Some("no fixture for this root".to_string()),
+                    ..Default::default()
+                }
+            })
+        }
+    }
+
+    fn report_with_repo_root(root: &Path) -> DaemonStatusReport {
+        let mut report = empty_report();
+        report.per_repo = vec![crate::types::RepoStatus {
+            root: root.to_path_buf(),
+            priority: crate::workspace_registry::default_priority(),
+            in_flight_count: 0,
+            health_gate_halted: false,
+            quarantined_issues: vec![],
+            health_gate_not_evaluated: false,
+            health_gate_not_evaluated_reason: None,
+            health_gate_enabled: None,
+            health_gate_verdict_at: None,
+            root_missing: false,
+            health_gate_deferred: false,
+            health_gate_deferred_reason: None,
+            health_gate_verdict_tier: None,
+            role_runner_enabled: false,
+            role_runner_roles: vec![],
+            role_runner_on_idle_roles: vec![],
+        }];
+        report
+    }
+
+    #[tokio::test]
+    async fn http_get_pipeline_with_zero_managed_repos_is_an_empty_array() {
+        let socket_path = spawn_fake_daemon_socket(empty_report()).await;
+        let tcp_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind tcp");
+        let addr = tcp_listener.local_addr().expect("local addr");
+        let state = ServeState::new(socket_path)
+            .with_pipeline_source(Arc::new(CountingFakeSource::new(vec![])));
+        let server_task = tokio::spawn(run_with_state(tcp_listener, state));
+
+        let (status, body) = http_get(addr, "/api/pipeline").await;
+        assert_eq!(status, 200);
+        assert_eq!(body, "[]");
+
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn http_get_pipeline_renders_counts_and_a_forge_url() {
+        let root = PathBuf::from("/repos/loom");
+        let source = CountingFakeSource::new(vec![(
+            root.clone(),
+            pipeline_snapshot::RepoPipelineSnapshot {
+                root: root.clone(),
+                queued: Some(3),
+                building: Some(1),
+                review_requested: Some(2),
+                changes_requested: Some(0),
+                approved: Some(1),
+                merged_24h: Some(5),
+                error: None,
+            },
+        )]);
+        let socket_path = spawn_fake_daemon_socket(report_with_repo_root(&root)).await;
+        let tcp_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind tcp");
+        let addr = tcp_listener.local_addr().expect("local addr");
+        let state = ServeState::new(socket_path).with_pipeline_source(Arc::new(source));
+        let server_task = tokio::spawn(run_with_state(tcp_listener, state));
+
+        let (status, body) = http_get(addr, "/api/pipeline").await;
+        assert_eq!(status, 200);
+        let value: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+        assert_eq!(value[0]["queued"], serde_json::json!(3));
+        assert_eq!(value[0]["merged_24h"], serde_json::json!(5));
+        // `/repos/loom` is not a real git checkout, so the URL derivation is
+        // expected to fail gracefully rather than fabricate a link.
+        assert_eq!(value[0]["forge_url"], serde_json::Value::Null);
+
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn http_get_pipeline_degrades_a_failed_repo_without_dropping_the_connection() {
+        // Edge case from the #4393 test plan: a `gh` pipeline-snapshot query
+        // failure degrades the queue panel with an error string, and the
+        // listener stays live for the next request.
+        let root = PathBuf::from("/repos/unreachable");
+        let source = CountingFakeSource::new(vec![(
+            root.clone(),
+            pipeline_snapshot::RepoPipelineSnapshot {
+                root: root.clone(),
+                error: Some("gh: not authenticated".to_string()),
+                ..Default::default()
+            },
+        )]);
+        let socket_path = spawn_repeating_fake_daemon_socket(report_with_repo_root(&root)).await;
+        let tcp_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind tcp");
+        let addr = tcp_listener.local_addr().expect("local addr");
+        let state = ServeState::new(socket_path).with_pipeline_source(Arc::new(source));
+        let server_task = tokio::spawn(run_with_state(tcp_listener, state));
+
+        let (status, body) = http_get(addr, "/api/pipeline").await;
+        assert_eq!(status, 200);
+        let value: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+        assert_eq!(value[0]["queued"], serde_json::Value::Null);
+        assert_eq!(value[0]["error"], serde_json::json!("gh: not authenticated"));
+
+        // The listener survived the degraded fetch — a second, unrelated
+        // request still gets a clean response.
+        let (status2, _) = http_get(addr, "/api/peers").await;
+        assert_eq!(status2, 200);
+
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn http_get_pipeline_returns_503_when_the_daemon_is_unreachable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("nonexistent.sock");
+        let tcp_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind tcp");
+        let addr = tcp_listener.local_addr().expect("local addr");
+        let server_task = tokio::spawn(run(tcp_listener, socket_path));
+
+        let (status, body) = http_get(addr, "/api/pipeline").await;
+        assert_eq!(status, 503, "body: {body:?}");
+        assert!(body.contains("daemon unreachable"), "body: {body:?}");
+
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn http_get_pipeline_reuses_the_cache_within_the_ttl() {
+        let root = PathBuf::from("/repos/loom");
+        let source = Arc::new(CountingFakeSource::new(vec![(
+            root.clone(),
+            pipeline_snapshot::RepoPipelineSnapshot {
+                root: root.clone(),
+                queued: Some(1),
+                ..Default::default()
+            },
+        )]));
+        let socket_path = spawn_repeating_fake_daemon_socket(report_with_repo_root(&root)).await;
+        let tcp_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind tcp");
+        let addr = tcp_listener.local_addr().expect("local addr");
+        let state = ServeState::new(socket_path).with_pipeline_source(Arc::clone(&source) as _);
+        let server_task = tokio::spawn(run_with_state(tcp_listener, state));
+
+        let (status1, _) = http_get(addr, "/api/pipeline").await;
+        let (status2, _) = http_get(addr, "/api/pipeline").await;
+        assert_eq!(status1, 200);
+        assert_eq!(status2, 200);
+        // Two requests well within `PIPELINE_CACHE_TTL` must hit the fake
+        // source exactly once — the whole point of the cache (Issue #4393:
+        // a short-interval poller must not fire a `gh` subprocess batch on
+        // every tick).
+        assert_eq!(source.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        server_task.abort();
+    }
+
+    // ========================================================================
+    // Unknown routes still 404 alongside the new endpoints (Issue #4393)
+    // ========================================================================
+
+    #[tokio::test]
+    async fn http_get_unknown_path_still_returns_404_with_new_routes_present() {
+        let socket_path = spawn_fake_daemon_socket(empty_report()).await;
+        let tcp_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind tcp");
+        let addr = tcp_listener.local_addr().expect("local addr");
+        let server_task = tokio::spawn(run(tcp_listener, socket_path));
+
+        let (status, _) = http_get(addr, "/api/nonexistent").await;
+        assert_eq!(status, 404);
 
         server_task.abort();
     }

@@ -317,22 +317,41 @@ loom_cmd_restart() {
 }
 
 # `sweep <issue>` dispatches a single-issue lifecycle for the CURRENT repo.
+#
+# Runtime-neutral (#4480): rather than exec'ing `claude` directly, sweep routes
+# through the resolved repo's `spawn-worker.sh` — the runtime-resolution seam
+# (`LOOM_RUNTIME` env > `.loom/config.json` runtimes.default > built-in
+# "claude"). With nothing configured this is byte-for-byte identical to before
+# (spawn-worker.sh -> spawn-claude.sh -> `claude -p ... --dangerously-skip-permissions`),
+# but a Codex-hosted (or any non-Claude) operator can now dispatch the canonical
+# single-issue lifecycle too. Prerequisite checking (which runtime, which binary
+# is missing, unknown-runtime -> exit 78) belongs to spawn-worker.sh and each
+# spawn-<runtime>.sh — so the old hardcoded `command -v claude` gate is gone: it
+# always blamed Claude even on a fully-usable Codex-only host.
 loom_cmd_sweep() {
     loom_detect_context
     if [[ -z "$LOOM_CTX_ROOT" ]]; then
         _err "'sweep' must run inside a Loom repo (no .loom/ found from $PWD)."
         exit 1
     fi
-    if ! command -v claude >/dev/null 2>&1; then
-        _err "'claude' CLI not found on PATH; cannot dispatch a sweep."
-        exit 1
-    fi
     if [[ $# -eq 0 ]]; then
         _err "usage: loom sweep <issue-number> [more issues|flags]"
         exit 1
     fi
+    local scripts_dir
+    if ! scripts_dir="$(loom_checkout_scripts_dir "$LOOM_CTX_ROOT")"; then
+        _err "no scripts/ tree found under $LOOM_CTX_ROOT (looked in defaults/scripts and .loom/scripts)."
+        exit 1
+    fi
+    local spawn_worker="$scripts_dir/spawn-worker.sh"
+    if [[ ! -x "$spawn_worker" ]]; then
+        _err "spawn-worker.sh not found or not executable at $spawn_worker."
+        exit 1
+    fi
+    # cd into the repo root so spawn-worker.sh's own workspace/config resolution
+    # (git rev-parse --git-common-dir -> .loom/config.json) lands on this repo.
     cd "$LOOM_CTX_ROOT"
-    exec claude -p "/loom:sweep $*" --dangerously-skip-permissions
+    exec "$spawn_worker" -p "/loom:sweep $*" --dangerously-skip-permissions
 }
 
 # `migrate` takes a historical file-copy Loom install in the CURRENT repo to the

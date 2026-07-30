@@ -11,6 +11,7 @@
 #![allow(clippy::missing_panics_doc)]
 
 pub mod activity;
+pub mod agent_session;
 pub mod auto_update;
 pub mod autonomy_marker;
 pub mod calibrate;

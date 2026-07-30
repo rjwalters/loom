@@ -993,6 +993,50 @@ if [[ "$AUTO_MERGE" == "true" ]]; then
       error "Failed to enable auto-merge for PR #$PR_NUMBER: $AUTO_MERGE_OUTPUT"
     fi
 
+    # GraphQL-layer unavailability fallback (#4447). GitHub's
+    # enablePullRequestAutoMerge mutation is GraphQL-only; when the shared
+    # credential's GraphQL quota is exhausted (or the native `loom-daemon`
+    # path cannot resolve the repo NWO via `gh repo view`, which is itself a
+    # GraphQL call), the mutation never has a chance to run. Unlike #3763
+    # (a permanent repo-level setting), this is a TRANSIENT environmental
+    # condition — REST (used by `forge_get_pr_nocache`, `forge_get_check_runs`,
+    # `forge_get_required_status_check_contexts`, and the synchronous merge
+    # itself) has a separate quota and typically still has headroom. It
+    # matches NEITHER the "is in clean status" NOR the "is in unstable status"
+    # grep below, so before this fix it fell through to the generic terminal
+    # error even when a plain synchronous REST merge would have succeeded
+    # immediately (the observed failure: `could not resolve repository NWO`
+    # under GraphQL quota exhaustion, 0/5000 remaining while REST had ~4000
+    # left).
+    #
+    # As with #3763, recheck mergeability first (immediate merge if already
+    # mergeable). If not yet mergeable (checks still running / `.mergeable`
+    # not yet computed), degrade to the same #3820 wait-for-checks-then-merge
+    # path used for repo-level auto-merge-disabled — its helpers are REST-only
+    # and do not depend on the exhausted GraphQL quota. Do NOT re-attempt the
+    # native/shell auto-merge mutation itself; it is the same GraphQL call and
+    # will fail identically.
+    if echo "$AUTO_MERGE_OUTPUT" | grep -Eq "API rate limit|rate limit exceeded|RATE_LIMITED|was submitted too quickly|could not resolve repository NWO"; then
+      info "PR #$PR_NUMBER: auto-merge enablement unavailable (GraphQL rate limit) — degrading to immediate/wait merge"
+      _RLF_RECHECK_JSON="$(forge_get_pr_nocache "$REPO_NWO" "$PR_NUMBER" "$GH" 2>/dev/null || echo '{}')"
+      _RLF_MERGEABLE="$(echo "$_RLF_RECHECK_JSON" | jq -r '.mergeable // empty')"
+      unset _RLF_RECHECK_JSON 2>/dev/null || true
+      if [[ "$_RLF_MERGEABLE" == "true" ]]; then
+        unset _RLF_MERGEABLE 2>/dev/null || true
+        AUTO_MERGE=false      # let the synchronous-merge block below run
+        AUTO_MERGE_OK=true    # bypass the post-loop "after N attempts" guard
+        break
+      fi
+      unset _RLF_MERGEABLE 2>/dev/null || true
+      # Not yet mergeable — reuse the #3820 REST-only wait path. It either
+      # returns 0 (safe to proceed to the synchronous merge) or error()s out
+      # terminally (a required check genuinely failed, or the wait timed out).
+      _wait_for_checks_then_sync_merge
+      AUTO_MERGE=false      # let the synchronous-merge block below run
+      AUTO_MERGE_OK=true    # bypass the post-loop "after N attempts" guard
+      break
+    fi
+
     # PR is already CLEAN — GitHub's enablePullRequestAutoMerge mutation rejects
     # this state with "Pull request Pull request is in clean status" (the
     # doubled-word prefix is from GitHub's GraphQL error formatter). Match on

@@ -119,17 +119,35 @@ UNRESOLVED_TASK_IDS=$(jq -s -r '
 # `<task-notification>...<tool-use-id>ID</tool-use-id>...` completion event.
 # Deliberately does NOT treat the immediate dispatch-time `tool_result` ack as
 # resolution (see header) — only a later task-notification counts.
+#
+# The completion `<task-notification>` for a background Bash task is NOT a
+# `type=="user"` message (issue #4482). Verified against live transcripts, the
+# harness writes it as one (or both) of these top-level entry shapes:
+#   1. `{"type":"queue-operation", "content":"<task-notification>...</task-notification>", ...}`
+#      — the notification text is the top-level `.content` STRING field.
+#   2. `{"type":"attachment","attachment":{"commandMode":"task-notification",
+#      "prompt":"<task-notification>...</task-notification>"}, ...}`
+#      — the notification text is `.attachment.prompt`.
+# We scan all three shapes (both real ones above + the legacy `type=="user"`
+# string-content path, kept for forward/backward compatibility) and extract the
+# `<tool-use-id>ID</tool-use-id>` tag from whichever the harness emitted.
 UNRESOLVED_BG_IDS=$(jq -s -r '
   [ .[]? | select(.type=="assistant") | .message.content[]?
     | select(.type=="tool_use" and .name=="Bash" and (.input.run_in_background == true))
     | .id ] as $bg_ids
   | [ .[]?
-      | select(.type=="user")
-      | .message.content as $c
-      | ( if ($c|type) == "string" then [$c]
-          else [ $c[]? | (.content? // empty) | select(type=="string") ]
-          end )
-      | .[]?
+      | (
+          # shape 1: queue-operation, top-level .content string
+          ( select(.type=="queue-operation") | (.content? // empty) | select(type=="string") ),
+          # shape 2: attachment, .attachment.prompt string
+          ( select(.type=="attachment") | (.attachment.prompt? // empty) | select(type=="string") ),
+          # shape 3 (legacy/backcompat): user message.content (string or blocks)
+          ( select(.type=="user")
+            | .message.content as $c
+            | ( if ($c|type) == "string" then $c
+                else ($c[]? | (.content? // empty) | select(type=="string"))
+                end ) )
+        )
       | (capture("<tool-use-id>(?<id>[^<]+)</tool-use-id>")?).id // empty
     ] as $notified_ids
   | ($bg_ids - $notified_ids) | .[]

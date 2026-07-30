@@ -479,28 +479,60 @@ fn github_auto_merge(pr: u32, method: &str) -> i32 {
     }
 }
 
-/// Resolve `owner/repo` via `gh repo view` (GitHub only).
+/// Resolve `owner/repo`. Prefers `gh repo view --json nameWithOwner`
+/// (GitHub); on failure — e.g. GraphQL/API unavailability such as rate-limit
+/// exhaustion (#4447) — falls back to parsing `git remote get-url origin`,
+/// mirroring the shell helper `forge_get_repo_nwo`
+/// (`defaults/scripts/lib/forge-helpers.sh`), which has always had this
+/// fallback. The git fallback works offline / under API exhaustion because it
+/// never calls out to `gh`.
 fn repo_nwo(gh: &str) -> Option<String> {
-    let out = Command::new(gh)
-        .args([
-            "repo",
-            "view",
-            "--json",
-            "nameWithOwner",
-            "--jq",
-            ".nameWithOwner",
-        ])
-        .output()
-        .ok()?;
-    if !out.status.success() {
+    repo_nwo_in(gh, None)
+}
+
+fn repo_nwo_in(gh: &str, cwd: Option<&Path>) -> Option<String> {
+    let mut cmd = Command::new(gh);
+    cmd.args([
+        "repo",
+        "view",
+        "--json",
+        "nameWithOwner",
+        "--jq",
+        ".nameWithOwner",
+    ]);
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    if let Ok(out) = cmd.output() {
+        if out.status.success() {
+            if let Ok(raw) = String::from_utf8(out.stdout) {
+                let nwo = raw.trim().to_string();
+                if !nwo.is_empty() {
+                    return Some(nwo);
+                }
+            }
+        }
+    }
+    // `gh repo view` failed or returned nothing — fall back to the local git
+    // remote, exactly as the shell helper does.
+    let dir = cwd
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let remote_url = get_remote_url(&dir)?;
+    parse_nwo_from_remote_url(&remote_url)
+}
+
+/// Extract `owner/repo` from a git remote URL (SSH `git@host:owner/repo.git`
+/// or HTTPS `https://host/owner/repo(.git)` form), mirroring the shell sed in
+/// `forge_get_repo_nwo` (`defaults/scripts/lib/forge-helpers.sh`).
+fn parse_nwo_from_remote_url(url: &str) -> Option<String> {
+    let trimmed = url.strip_suffix(".git").unwrap_or(url);
+    let mut parts: Vec<&str> = trimmed.rsplit(['/', ':']).take(2).collect();
+    if parts.len() != 2 || parts.iter().any(|p| p.is_empty()) {
         return None;
     }
-    let nwo = String::from_utf8(out.stdout).ok()?.trim().to_string();
-    if nwo.is_empty() {
-        None
-    } else {
-        Some(nwo)
-    }
+    parts.reverse();
+    Some(parts.join("/"))
 }
 
 /// Handle `loom-daemon forge auto-merge`. GitHub goes native (GraphQL); Gitea
@@ -851,5 +883,88 @@ mod tests {
         // Clean up the worktree registration.
         git(main.path(), &["worktree", "remove", "--force", wt.to_str().unwrap()]);
         clear_forge_env();
+    }
+
+    // ===== #4447: repo_nwo() git-remote fallback under gh/GraphQL outage =====
+
+    fn write_failing_gh(dir: &Path) -> PathBuf {
+        let path = dir.join("fake-gh.sh");
+        std::fs::write(
+            &path,
+            "#!/bin/sh\necho 'gh: API rate limit exceeded for user ID 1 (HTTP 403)' 1>&2\nexit 1\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).unwrap();
+        }
+        path
+    }
+
+    #[test]
+    fn repo_nwo_falls_back_to_git_remote_when_gh_fails_ssh() {
+        let dir = tempdir().unwrap();
+        init_repo(dir.path(), "git@github.com:acme/widgets.git");
+        let gh = write_failing_gh(dir.path());
+        let nwo = repo_nwo_in(gh.to_str().unwrap(), Some(dir.path()));
+        assert_eq!(nwo.as_deref(), Some("acme/widgets"));
+    }
+
+    #[test]
+    fn repo_nwo_falls_back_to_git_remote_when_gh_fails_https() {
+        let dir = tempdir().unwrap();
+        init_repo(dir.path(), "https://github.com/acme/widgets.git");
+        let gh = write_failing_gh(dir.path());
+        let nwo = repo_nwo_in(gh.to_str().unwrap(), Some(dir.path()));
+        assert_eq!(nwo.as_deref(), Some("acme/widgets"));
+    }
+
+    #[test]
+    fn repo_nwo_prefers_gh_when_it_succeeds() {
+        let dir = tempdir().unwrap();
+        // Deliberately mismatched remote to prove `gh`'s answer wins, not the
+        // git-remote fallback.
+        init_repo(dir.path(), "git@github.com:other/mismatch.git");
+        let path = dir.path().join("fake-gh.sh");
+        std::fs::write(&path, "#!/bin/sh\nprintf 'acme/widgets'\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).unwrap();
+        }
+        let nwo = repo_nwo_in(path.to_str().unwrap(), Some(dir.path()));
+        assert_eq!(nwo.as_deref(), Some("acme/widgets"));
+    }
+
+    #[test]
+    fn repo_nwo_returns_none_when_both_gh_and_git_remote_fail() {
+        let dir = tempdir().unwrap();
+        // git-init'd but with NO origin remote configured.
+        git(dir.path(), &["init", "-q"]);
+        let gh = write_failing_gh(dir.path());
+        let nwo = repo_nwo_in(gh.to_str().unwrap(), Some(dir.path()));
+        assert_eq!(nwo, None);
+    }
+
+    #[test]
+    fn parse_nwo_from_remote_url_handles_ssh_and_https() {
+        assert_eq!(
+            parse_nwo_from_remote_url("git@github.com:acme/widgets.git").as_deref(),
+            Some("acme/widgets")
+        );
+        assert_eq!(
+            parse_nwo_from_remote_url("https://github.com/acme/widgets.git").as_deref(),
+            Some("acme/widgets")
+        );
+        assert_eq!(
+            parse_nwo_from_remote_url("https://github.com/acme/widgets").as_deref(),
+            Some("acme/widgets")
+        );
+        assert_eq!(parse_nwo_from_remote_url("not-a-remote"), None);
     }
 }

@@ -136,10 +136,11 @@ stages in order under `set -euo pipefail`, aborting on the first non-zero exit:
    `loom-daemon/tests/` are deliberately excluded here — see "Local gate vs.
    CI" below.
 2. `uv run pytest tests/ -q` in `loom-tools/`, scoped with
-   `--ignore=tests/integration` (live-network/credentials e2e) and
-   `--ignore=tests/tokens/test_agent_spawn_integration.py` (a slow real-time
-   modal-poll integration file). `uv run` is used so `loom_tools` is importable
-   from the project venv.
+   `--ignore=tests/integration` (live-network/credentials e2e). `uv run` is
+   used so `loom_tools` is importable from the project venv. (A second
+   `--ignore` for `tests/tokens/test_agent_spawn_integration.py` — a slow
+   real-time modal-poll file — was dropped in #4415 when `agent_spawn.py` went
+   native; its coverage now lives in `cargo test -p loom-daemon`.)
 3. `bash scripts/test-installer.sh` — the 131-case bash installer suite.
 
 **`mcp-loom` (TypeScript) is intentionally excluded** from the gate: it needs

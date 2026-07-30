@@ -11,7 +11,13 @@ use std::process::Command;
 /// terminals don't fight over sessions, lock files, and temp directories in the
 /// shared `~/.claude/` directory.
 ///
-/// Mirrors the Python implementation in `loom_tools.common.claude_config`.
+/// Originally a port of `loom_tools.common.claude_config`; since epic #4081
+/// Phase 3 family 4 (#4415) deleted that module, this is the **sole**
+/// implementation. Reached three ways: the daemon's
+/// `create_terminal`/`destroy_terminal`, the native `agent-spawn` path
+/// (`agent_session::SystemEnv`), and the standalone `loom-daemon
+/// claude-config` CLI. The `_SHARED_CONFIG_FILES` / `_MUTABLE_DIRS` comments
+/// below still name their historical Python counterparts for provenance.
 mod claude_config {
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -449,6 +455,186 @@ mod claude_config {
             true
         } else {
             false
+        }
+    }
+
+    /// Validate that an agent's config directory is in a healthy state.
+    ///
+    /// Checks that the config directory exists and its key components are
+    /// intact: `.claude.json` is a valid symlink (pointing to an existing
+    /// target) or a valid plain file — but NOT a broken/dangling symlink —
+    /// `settings.json` exists, all mutable directories exist, and any
+    /// project-claude link whose source is present resolves.  Used before
+    /// each spawn/retry attempt to detect corrupted state that
+    /// `setup_agent_config_dir` (idempotent, skips existing files) would
+    /// otherwise silently preserve. Mirrors the historical Python
+    /// `validate_agent_config_dir`. See issue #2909.
+    pub fn validate_agent_config_dir(agent_name: &str, repo_root: &Path) -> bool {
+        let config_dir = repo_root
+            .join(".loom")
+            .join("claude-config")
+            .join(agent_name);
+        if !config_dir.is_dir() {
+            return false; // Missing — not an error, just not set up yet.
+        }
+
+        // `.claude.json`: if it's a symlink, the target must exist (not
+        // dangling); if it's a plain file, it must exist.
+        let state_dst = config_dir.join(".claude.json");
+        let is_symlink = fs::symlink_metadata(&state_dst)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false);
+        if is_symlink {
+            if !state_dst.exists() {
+                log::debug!(
+                    "Agent config dir validation failed for {agent_name}: \
+                     .claude.json is a dangling symlink (target missing)"
+                );
+                return false;
+            }
+        } else if !state_dst.exists() {
+            log::debug!(
+                "Agent config dir validation failed for {agent_name}: .claude.json is missing"
+            );
+            return false;
+        }
+
+        // settings.json must exist — without it Claude Code falls back to
+        // the global ~/.claude/settings.json which may contain
+        // enabledPlugins, causing ghost sessions (issue #3065).
+        let settings_file = config_dir.join("settings.json");
+        if !settings_file.is_file() {
+            log::debug!(
+                "Agent config dir validation failed for {agent_name}: settings.json is missing"
+            );
+            return false;
+        }
+
+        for dirname in MUTABLE_DIRS {
+            if !config_dir.join(dirname).is_dir() {
+                log::debug!(
+                    "Agent config dir validation failed for {agent_name}: mutable dir '{dirname}' is missing"
+                );
+                return false;
+            }
+        }
+
+        // Project-claude links must be present and resolvable whenever the
+        // project itself has the corresponding directory.  A missing or
+        // dangling link here causes Claude Code 2.1+ to fail with "Unknown
+        // command: /loom:<role>". See issue #3346.
+        let project_claude = repo_root.join(".claude");
+        for name in PROJECT_CLAUDE_LINKS {
+            let src = project_claude.join(name);
+            if !src.exists() {
+                continue; // Project doesn't have this dir — nothing to validate.
+            }
+            let dst = config_dir.join(name);
+            if !dst.exists() {
+                log::debug!(
+                    "Agent config dir validation failed for {agent_name}: project link '{name}' is missing or dangling"
+                );
+                return false;
+            }
+        }
+
+        true
+    }
+
+    /// Resolve the Claude Code state file path relative to the current
+    /// user's home directory. CLI-facing convenience wrapper around
+    /// `resolve_state_file`, which takes an explicit `home` for testability.
+    pub fn default_state_file() -> PathBuf {
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        resolve_state_file(&home)
+    }
+
+    /// Ensure `.claude.json` marks `project_dir` as trusted (skip the
+    /// folder-trust modal).
+    ///
+    /// Claude Code shows a blocking "Is this a project you created or one
+    /// you trust?" modal on first launch in any working directory that has
+    /// no `projects[<abs-path>].hasTrustDialogAccepted: true` entry in the
+    /// state file. In a non-interactive agent spawn into a freshly-created
+    /// repo/worktree that Claude Code has never opened, the role command is
+    /// delivered as keystrokes into that modal instead of being run,
+    /// stalling or killing the session. See issue #4334.
+    ///
+    /// Behavioral contract:
+    /// - **Merge, never replace**: only the `projects[<project_dir>]`
+    ///   entry's `hasTrustDialogAccepted` flag is touched; every other
+    ///   field (and every other `projects` entry) is preserved unchanged.
+    /// - **Write through the symlink** (issue #2835): when `state_path` is
+    ///   a healthy symlink, write to the resolved target rather than
+    ///   unlinking and replacing it with a standalone file, which would
+    ///   sever every future session from the operator's global state.
+    /// - Gated by `LOOM_AUTO_TRUST` (default enabled; set to "0" to disable).
+    /// - Idempotent: a no-op (no rewrite) if already trusted.
+    pub fn ensure_project_trusted(state_path: &Path, project_dir: &Path) {
+        if std::env::var("LOOM_AUTO_TRUST").as_deref() == Ok("0") {
+            log::debug!("Project trust auto-seed disabled via LOOM_AUTO_TRUST=0");
+            return;
+        }
+
+        let project_key = project_dir.to_string_lossy().to_string();
+
+        let mut existing_data = serde_json::Map::new();
+        if state_path.exists() {
+            if let Ok(contents) = fs::read_to_string(state_path) {
+                if let Ok(serde_json::Value::Object(map)) =
+                    serde_json::from_str::<serde_json::Value>(&contents)
+                {
+                    existing_data = map;
+                }
+            }
+        }
+
+        let mut projects = existing_data
+            .get("projects")
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
+
+        if let Some(entry) = projects.get(&project_key).and_then(|v| v.as_object()) {
+            if entry.get("hasTrustDialogAccepted") == Some(&serde_json::Value::Bool(true)) {
+                return; // Already trusted — idempotent no-op, no rewrite.
+            }
+        }
+
+        let mut project_entry = projects
+            .get(&project_key)
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
+        project_entry.insert("hasTrustDialogAccepted".to_string(), serde_json::Value::Bool(true));
+        projects.insert(project_key.clone(), serde_json::Value::Object(project_entry));
+        existing_data.insert("projects".to_string(), serde_json::Value::Object(projects));
+        let merged = serde_json::Value::Object(existing_data);
+
+        // Write through a healthy symlink rather than replacing it (issue #2835).
+        if let Ok(meta) = fs::symlink_metadata(state_path) {
+            if meta.file_type().is_symlink() {
+                if let Ok(target) = fs::canonicalize(state_path) {
+                    if target.exists() {
+                        if let Err(e) = fs::write(&target, merged.to_string()) {
+                            log::warn!("Failed to write trust state to symlink target: {e}");
+                        } else {
+                            log::debug!(
+                                "Updated symlink target .claude.json with trust for {project_key}"
+                            );
+                        }
+                        return;
+                    }
+                }
+                // Dangling symlink — fall through to unlink and recreate below.
+            }
+        }
+
+        let _ = fs::remove_file(state_path);
+        if let Err(e) = fs::write(state_path, merged.to_string()) {
+            log::warn!("Failed to write merged .claude.json with trust: {e}");
+        } else {
+            log::debug!("Wrote merged .claude.json with trust for {project_key}");
         }
     }
 
@@ -928,6 +1114,111 @@ mod claude_config {
             let second_target = fs::canonicalize(first.join("commands")).unwrap();
             assert_eq!(first_target, second_target);
         }
+
+        #[test]
+        fn test_validate_missing_dir_is_unhealthy() {
+            let tmp = tempfile::tempdir().unwrap();
+            assert!(!validate_agent_config_dir("nope", tmp.path()));
+        }
+
+        #[test]
+        fn test_validate_healthy_after_setup() {
+            let tmp = tempfile::tempdir().unwrap();
+            let repo_root = tmp.path();
+            fs::create_dir_all(repo_root.join(".loom")).unwrap();
+
+            let _ = setup_agent_config_dir("validate-1", repo_root).unwrap();
+            assert!(validate_agent_config_dir("validate-1", repo_root));
+        }
+
+        #[test]
+        fn test_validate_fails_on_missing_settings_json() {
+            let tmp = tempfile::tempdir().unwrap();
+            let repo_root = tmp.path();
+            fs::create_dir_all(repo_root.join(".loom")).unwrap();
+
+            let config_dir = setup_agent_config_dir("validate-2", repo_root).unwrap();
+            fs::remove_file(config_dir.join("settings.json")).unwrap();
+            assert!(!validate_agent_config_dir("validate-2", repo_root));
+        }
+
+        #[test]
+        fn test_validate_fails_on_missing_mutable_dir() {
+            let tmp = tempfile::tempdir().unwrap();
+            let repo_root = tmp.path();
+            fs::create_dir_all(repo_root.join(".loom")).unwrap();
+
+            let config_dir = setup_agent_config_dir("validate-3", repo_root).unwrap();
+            fs::remove_dir_all(config_dir.join("tmp")).unwrap();
+            assert!(!validate_agent_config_dir("validate-3", repo_root));
+        }
+
+        #[test]
+        fn test_validate_fails_on_dangling_claude_json_symlink() {
+            let tmp = tempfile::tempdir().unwrap();
+            let repo_root = tmp.path();
+            fs::create_dir_all(repo_root.join(".loom")).unwrap();
+
+            let config_dir = setup_agent_config_dir("validate-4", repo_root).unwrap();
+            let state_dst = config_dir.join(".claude.json");
+            if state_dst.exists() || fs::symlink_metadata(&state_dst).is_ok() {
+                fs::remove_file(&state_dst).unwrap();
+            }
+            // Point the symlink at a target that doesn't exist.
+            std::os::unix::fs::symlink(repo_root.join("does-not-exist"), &state_dst).unwrap();
+            assert!(!validate_agent_config_dir("validate-4", repo_root));
+        }
+
+        #[test]
+        fn test_ensure_project_trusted_is_idempotent_and_merges() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state_path = tmp.path().join(".claude.json");
+            fs::write(&state_path, r#"{"otherField": "keep-me"}"#).unwrap();
+
+            let project_dir = tmp.path().join("worktree-1");
+            ensure_project_trusted(&state_path, &project_dir);
+
+            let contents = fs::read_to_string(&state_path).unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&contents).unwrap();
+            assert_eq!(parsed["otherField"], "keep-me");
+            assert_eq!(
+                parsed["projects"][project_dir.to_string_lossy().to_string()]
+                    ["hasTrustDialogAccepted"],
+                true
+            );
+
+            // Idempotent: calling again does not blow away other fields.
+            ensure_project_trusted(&state_path, &project_dir);
+            let contents2 = fs::read_to_string(&state_path).unwrap();
+            let parsed2: serde_json::Value = serde_json::from_str(&contents2).unwrap();
+            assert_eq!(parsed2["otherField"], "keep-me");
+        }
+
+        #[test]
+        fn test_ensure_project_trusted_writes_through_symlink() {
+            let tmp = tempfile::tempdir().unwrap();
+            let target = tmp.path().join("real-state.json");
+            fs::write(&target, r#"{"otherField": "keep-me"}"#).unwrap();
+            let state_path = tmp.path().join(".claude.json");
+            std::os::unix::fs::symlink(&target, &state_path).unwrap();
+
+            let project_dir = tmp.path().join("worktree-3");
+            ensure_project_trusted(&state_path, &project_dir);
+
+            // Symlink must survive (not replaced by a standalone file).
+            assert!(fs::symlink_metadata(&state_path)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            let contents = fs::read_to_string(&target).unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&contents).unwrap();
+            assert_eq!(parsed["otherField"], "keep-me");
+            assert_eq!(
+                parsed["projects"][project_dir.to_string_lossy().to_string()]
+                    ["hasTrustDialogAccepted"],
+                true
+            );
+        }
     }
 }
 
@@ -942,6 +1233,40 @@ mod claude_config {
 /// - Bare escape sequences (ESC not followed by [ or ]) from raw cursor movement
 fn pipe_pane_cmd(output_file: &str) -> String {
     format!("sed -E 's/\\x1b\\[[?0-9;]*[a-zA-Z]//g; s/\\x1b\\][^\\x07]*\\x07//g; s/\\r//g; s/\\x08//g; s/\\x1b[^][]//g' >> {output_file}")
+}
+
+// ---------------------------------------------------------------------------
+// `claude_config` CLI surface (issue #4415, epic #4081 Phase 3 family 4).
+//
+// Thin `pub` wrappers around the private `claude_config` module so
+// `loom-daemon claude-config <action>` (see `main.rs`) and the native
+// `agent-spawn` path (`agent_session::SystemEnv`) can both reuse per-agent
+// `CLAUDE_CONFIG_DIR` isolation without a running daemon
+// (`create_terminal`/`destroy_terminal`) and without a second
+// reimplementation (the deleted `loom_tools.common.claude_config`).
+// ---------------------------------------------------------------------------
+
+/// Create (or refresh) an isolated `CLAUDE_CONFIG_DIR` for `agent_name`.
+/// Returns the config dir path, or `None` on failure (already logged).
+pub fn claude_config_setup(agent_name: &str, repo_root: &Path) -> Option<PathBuf> {
+    claude_config::setup_agent_config_dir(agent_name, repo_root)
+}
+
+/// Remove one agent's config directory. Returns `true` if it existed.
+pub fn claude_config_cleanup(agent_name: &str, repo_root: &Path) -> bool {
+    claude_config::cleanup_agent_config_dir(agent_name, repo_root)
+}
+
+/// Validate that an agent's config directory is present and healthy.
+pub fn claude_config_validate(agent_name: &str, repo_root: &Path) -> bool {
+    claude_config::validate_agent_config_dir(agent_name, repo_root)
+}
+
+/// Mark `project_dir` as trusted in the resolved Claude Code state file, so
+/// a non-interactive spawn into it never stalls on the folder-trust modal.
+pub fn claude_config_trust(project_dir: &Path) {
+    let state_path = claude_config::default_state_file();
+    claude_config::ensure_project_trusted(&state_path, project_dir);
 }
 
 pub struct TerminalManager {
