@@ -260,8 +260,8 @@ else
 fi
 
 # Alternative: manual search
-gh issue list --state open --label "loom:auditor-capability-request" --json number,title --jq '.[] | "#\(.number): \(.title)"'
-gh issue list --state open --label "loom:auditor-capability-request" --search "screenshot" --json number,title
+gh issue list --state open --label "loom:auditor-capability-request" --limit 500 --json number,title --jq '.[] | "#\(.number): \(.title)"'
+gh issue list --state open --label "loom:auditor-capability-request" --search "screenshot" --limit 500 --json number,title
 ```
 
 If a similar request exists, add a comment instead of creating a duplicate.
@@ -428,8 +428,8 @@ else
 fi
 
 # Alternative: manual search
-gh issue list --state open --json number,title --jq '.[] | "#\(.number): \(.title)"' | head -20
-gh issue list --state open --search "build failure" --json number,title
+gh issue list --state open --limit 500 --json number,title --jq '.[] | "#\(.number): \(.title)"' | head -20
+gh issue list --state open --search "build failure" --limit 500 --json number,title
 ```
 
 **When duplicates are found:**

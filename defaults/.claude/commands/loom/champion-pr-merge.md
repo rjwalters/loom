@@ -504,7 +504,7 @@ echo "Checking for issues blocked by #$CLOSED_ISSUE..."
 # Find issues with loom:blocked that reference the closed issue.
 # Tolerant of markdown emphasis/colon between the phrase and #N (e.g.
 # "**Blocked by:** #1 (reason)") — #4508.
-BLOCKED_ISSUES=$(gh issue list --label "loom:blocked" --state open --json number,body \
+BLOCKED_ISSUES=$(gh issue list --label "loom:blocked" --state open --limit 500 --json number,body \
   --jq ".[] | select(.body | test(\"(Blocked by|Depends on|Requires)[*_:[:space:]]*#$CLOSED_ISSUE\"; \"i\")) | .number")
 
 if [ -z "$BLOCKED_ISSUES" ]; then
@@ -688,7 +688,7 @@ fi
 # ============================================
 
 # Search for existing follow-on issues from this PR
-EXISTING_ISSUE=$(gh issue list --state open --search "Follow-on from PR #$PR_NUMBER" --json number --jq '.[0].number // empty')
+EXISTING_ISSUE=$(gh issue list --state open --search "Follow-on from PR #$PR_NUMBER" --limit 500 --json number --jq '.[0].number // empty')
 
 if [ -n "$EXISTING_ISSUE" ]; then
   echo "Follow-on issue already exists: #$EXISTING_ISSUE - skipping creation"
@@ -925,6 +925,7 @@ gh pr list \
   --label "loom:blocked" \
   --label "loom:changes-requested" \
   --state open \
+  --limit 500 \
   --json number,title,updatedAt,labels \
   --jq '.[] | "#\(.number) \(.title)"'
 ```

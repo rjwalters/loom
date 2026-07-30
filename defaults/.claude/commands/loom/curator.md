@@ -122,7 +122,7 @@ Use a **priority-based search** to find the highest-value curation opportunity:
 Issues with `loom:issue` (human-approved) but missing `loom:curated`:
 
 ```bash
-gh issue list --label="loom:issue" --state=open --json number,title,labels \
+gh issue list --label="loom:issue" --state=open --limit 500 --json number,title,labels \
   --jq '.[] | select(([.labels[].name] | contains(["loom:curated"]) | not) and ([.labels[].name] | contains(["external"]) | not)) |
   "#\(.number): \(.title)"'
 ```
@@ -168,7 +168,7 @@ enhancement") is the entry point, so **target it first**:
 
 ```bash
 # Newly filed issues awaiting Curator enhancement
-gh issue list --label="loom:triage" --state=open --json number,title,labels \
+gh issue list --label="loom:triage" --state=open --limit 500 --json number,title,labels \
   --jq '.[] | select(([.labels[].name] | contains(["external"]) | not)) |
   "#\(.number) \(.title)"'
 ```
@@ -179,7 +179,7 @@ exclusion set must match CLAUDE.md's own curator discovery query so an autonomou
 Curator never "curates" an issue being built or awaiting evaluation:
 
 ```bash
-gh issue list --state=open --json number,title,labels \
+gh issue list --state=open --limit 500 --json number,title,labels \
   --jq '.[] | select(
     ([.labels[].name] | contains(["loom:curated"]) | not) and
     ([.labels[].name] | contains(["loom:curating"]) | not) and

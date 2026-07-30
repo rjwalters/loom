@@ -236,7 +236,7 @@ Install Loom into the new repository:
 sleep 2
 
 # Find and merge the installation PR
-PR_NUMBER=$(gh pr list --label "loom:review-requested" --json number --jq '.[0].number')
+PR_NUMBER=$(gh pr list --label "loom:review-requested" --limit 500 --json number --jq '.[0].number')
 
 if [ -n "$PR_NUMBER" ]; then
   echo "Merging Loom installation PR #$PR_NUMBER..."

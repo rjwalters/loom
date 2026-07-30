@@ -311,7 +311,7 @@ while true; do
   fi
 
   # Find available issues
-  ISSUES=$(gh issue list --label="loom:issue" --state=open --json number --jq '.[].number')
+  ISSUES=$(gh issue list --label="loom:issue" --state=open --limit 500 --json number --jq '.[].number')
 
   for ISSUE_NUMBER in $ISSUES; do
     # Try atomic claim
