@@ -80,7 +80,7 @@ echo
 echo "--- Detection: authoritative body-text signal, same-candidate-set only ---"
 
 assert_contains "Detection reuses guide.md parse_dependencies convention" 'parse_dependencies'
-assert_contains "Detection restricted to Depends on / Requires" '(Depends on|Requires) #[0-9]+'
+assert_contains "Detection restricted to Depends on / Requires" '(Depends on|Requires)[*_:[:space:]]*#[0-9]+'
 assert_contains "Blocked by deliberately excluded from stacking detection" 'EXCLUDES `Blocked by`'
 assert_contains "body field added to existing gh issue view read (no new API call)" 'no new API call'
 # THE load-bearing guard: same-candidate-set restriction must be stated explicitly.
@@ -146,7 +146,7 @@ echo
 echo "--- Cross-file: guide.md regex convention still present (reused, not modified) ---"
 
 if [[ -f "$GUIDE_MD" ]]; then
-    if grep -qF -- '(Blocked by|Depends on|Requires|\- \[.\]) #[0-9]+' "$GUIDE_MD"; then
+    if grep -qF -- '(Blocked by|Depends on|Requires|\- \[.\])[*_:[:space:]]*#[0-9]+' "$GUIDE_MD"; then
         echo "PASS: guide.md parse_dependencies regex convention intact (reused by --auto-stack)"
         PASS=$((PASS + 1))
     else

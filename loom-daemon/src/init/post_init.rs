@@ -108,6 +108,11 @@ const GITIGNORE_BLOCK_HEADER: &str = "# Loom runtime state (don't commit these)"
 /// during a full `init`, so a fix here never reached repos between installs.
 pub const EPHEMERAL_PATTERNS: &[&str] = &[
     ".loom-in-use",
+    // Per-worktree builder progress checkpoint. Its WRITER moved from Python to
+    // Rust in #4275 (`loom_tools.checkpoints` -> `loom-daemon checkpoint`,
+    // behind `checkpoint.sh`), but the file, its path and this pattern are
+    // unchanged — checkpoints remain live, and a builder's `git add -A` must
+    // still never sweep one into a commit.
     ".loom-checkpoint",
     // Worktree sentinel dropped by worktree.sh into each issue worktree; must be
     // ignored so a builder's `git add -A` doesn't sweep it into a commit (#3778).

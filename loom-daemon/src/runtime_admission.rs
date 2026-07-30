@@ -60,6 +60,42 @@ impl fmt::Display for RuntimeRejection {
 
 impl std::error::Error for RuntimeRejection {}
 
+/// Exit code a client uses for a capability/config admission refusal:
+/// `EX_CONFIG`, the same code `check-runtime-capabilities.sh` uses for a
+/// mismatch. Keeping the shell checker's 78-vs-1 distinction in the CLI lets a
+/// script tell "this runtime cannot run this role" apart from "the daemon
+/// errored" without parsing text.
+pub const EX_CONFIG: i32 = 78;
+
+impl RuntimeRejection {
+    /// Operator-facing, multi-line diagnostic naming the role/lifecycle, the
+    /// runtime, the precedence tier that selected it, and the unmet capability
+    /// names. Shared by every real client (`loom-daemon dispatch`, the MCP
+    /// bridge's rendering, role-runner logs) so one wording is maintained once
+    /// and a typed rejection never degrades into "unexpected response".
+    #[must_use]
+    pub fn diagnostic(&self) -> String {
+        let mut out = format!(
+            "Runtime admission refused this work (fail-closed).\n  \
+             role/lifecycle:   {}\n  runtime:          {}\n  selected by:      {}",
+            self.role, self.runtime, self.source
+        );
+        if !self.unmet_capabilities.is_empty() {
+            out.push_str(&format!("\n  unmet capability: {}", self.unmet_capabilities.join(", ")));
+        }
+        out.push_str(&format!("\n  reason:           {}", self.reason));
+        if self.role == "sweep-lifecycle" {
+            out.push_str(
+                "\n\nA full sweep runs as ONE runtime and is admitted against Builder's \
+                 requirements\n(the strongest in the Curator->Builder->Judge->Doctor->Merge \
+                 lifecycle); a per-role\nbinding cannot switch runtimes between phases. See \
+                 defaults/docs/runtime-adapters.md.",
+            );
+        }
+        out
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct RoleManifest {
     #[serde(default, rename = "runtimeRequirements")]
@@ -116,9 +152,58 @@ pub fn canonical_role(role: &str) -> Option<&'static str> {
     }
 }
 
-fn config_runtime(root: &Path, role: &str) -> (Option<String>, Option<String>) {
+/// Validate the whole `runtimes.roles` key set, then read the requested role's
+/// binding plus `runtimes.default`.
+///
+/// Fail-closed key validation (#4494): a key that is not a known role name —
+/// `runtimes.roles.not-a-role`, a typo like `builderr`, or a key whose value is
+/// not a string — is an **error**, not a silently-ignored entry. Before this,
+/// `config_runtime` only looked up the *requested* canonical role, so a
+/// misconfigured key never surfaced anywhere: an operator who typed
+/// `runtimes.roles.buidler = "claude"` got the (possibly Codex) default for
+/// every Builder launch with no diagnostic at all. The scoped requirement is to
+/// "reject unknown role names in explicit dispatch/config", so the whole map is
+/// checked on every admission, not just the requested key.
+///
+/// Empty-value semantics are preserved exactly: `"curator": ""` is a *valid*
+/// key with an unset value (it falls through to the next precedence tier), and
+/// an absent `runtimes.roles` block is not an error.
+fn config_runtime(root: &Path, role: &str) -> Result<(Option<String>, Option<String>), String> {
     let config = crate::config_resolver::resolve_effective_config(root);
     let roles = crate::config_resolver::get_path(&config, "runtimes.roles");
+    if let Some(roles) = roles {
+        let Some(map) = roles.as_object() else {
+            return Err(format!(
+                "runtimes.roles must be an object mapping role names to runtimes, got {}",
+                type_name_of(roles)
+            ));
+        };
+        let mut unknown: Vec<String> = map
+            .keys()
+            .filter(|key| canonical_role(key).is_none())
+            .cloned()
+            .collect();
+        unknown.sort();
+        if !unknown.is_empty() {
+            return Err(format!(
+                "unknown role name(s) in runtimes.roles: {} (known roles: {})",
+                unknown.join(", "),
+                KNOWN_ROLE_KEYS.join(", ")
+            ));
+        }
+        let mut non_string: Vec<String> = map
+            .iter()
+            .filter(|(_, value)| !value.is_string())
+            .map(|(key, _)| key.clone())
+            .collect();
+        non_string.sort();
+        if !non_string.is_empty() {
+            return Err(format!(
+                "runtimes.roles value(s) must be strings: {}",
+                non_string.join(", ")
+            ));
+        }
+    }
     let per_role = roles
         .and_then(|v| v.get(role))
         .and_then(serde_json::Value::as_str)
@@ -126,7 +211,36 @@ fn config_runtime(root: &Path, role: &str) -> (Option<String>, Option<String>) {
     let default = crate::config_resolver::get_path(&config, "runtimes.default")
         .and_then(serde_json::Value::as_str)
         .and_then(|v| nonempty(Some(v)));
-    (per_role, default)
+    Ok((per_role, default))
+}
+
+/// Canonical role names accepted as `runtimes.roles` keys, for the fail-closed
+/// diagnostic above. Aliases (`issue-curator`, `pr-fixer`, `sweep`, …) are also
+/// accepted by [`canonical_role`]; only the canonical spellings are listed so
+/// the message stays short and points at the documented shape.
+const KNOWN_ROLE_KEYS: &[&str] = &[
+    "architect",
+    "auditor",
+    "builder",
+    "champion",
+    "curator",
+    "doctor",
+    "driver",
+    "guide",
+    "hermit",
+    "judge",
+    "sweep-lifecycle",
+];
+
+fn type_name_of(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
 }
 
 fn roots(root: &Path) -> (PathBuf, PathBuf, PathBuf) {
@@ -165,7 +279,23 @@ pub fn resolve_and_admit(
         canonical
     };
     let env_name = format!("LOOM_RUNTIME_{}", canonical.replace('-', "_").to_ascii_uppercase());
-    let (role_config, default_config) = config_runtime(root, canonical);
+    // A malformed `runtimes.roles` map fails closed for EVERY role, even one
+    // whose own key is spelled correctly and even under an explicit override:
+    // the config tier is the thing that is broken, and silently honouring the
+    // rest of a map with an unknown role key is exactly the "silently ignored"
+    // behaviour this rejects.
+    let (role_config, default_config) = match config_runtime(root, canonical) {
+        Ok(pair) => pair,
+        Err(reason) => {
+            return Err(RuntimeRejection {
+                role: canonical.to_string(),
+                runtime: nonempty(explicit).unwrap_or_else(|| BUILTIN_RUNTIME.into()),
+                source: RuntimeSource::RoleConfig,
+                unmet_capabilities: vec![],
+                reason,
+            });
+        }
+    };
     let role_env = std::env::var(&env_name).ok();
     let global_env = std::env::var("LOOM_RUNTIME").ok();
     let (runtime, source) = choose_runtime(
@@ -360,10 +490,50 @@ mod tests {
             .contains("unknown role"));
     }
 
-    /// One matrix drives both implementations: every shipped role/runtime
-    /// pair is evaluated natively and by the installed shell checker, and the
-    /// decisions must be identical. This prevents two independent assertion
-    /// lists from silently drifting.
+    /// The shell checker's `--json` decision object (#4494), parsed so the
+    /// conformance matrix can compare the exact unmet-capability SET rather
+    /// than just pass/fail.
+    #[derive(Debug, Deserialize)]
+    struct ShellDecision {
+        decision: String,
+        unmet: Vec<String>,
+    }
+
+    /// Run `check-runtime-capabilities.sh --json` and return its parsed
+    /// decision plus its exit code. Panics (rather than degrading) if the
+    /// script does not produce parseable JSON — a silent parse failure is
+    /// exactly the drift blindness this checker exists to prevent.
+    fn shell_decision(
+        checker: &Path,
+        dir: &Path,
+        role: &str,
+        runtime: &str,
+    ) -> (ShellDecision, i32) {
+        let out = Command::new("bash")
+            .arg(checker)
+            .args(["--role", role, "--runtime", runtime, "--json", "--dir"])
+            .arg(dir)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let json = stdout.lines().last().unwrap_or_default();
+        let parsed: ShellDecision = serde_json::from_str(json).unwrap_or_else(|e| {
+            panic!("checker --json output for role={role} runtime={runtime} unparseable ({e}): {stdout:?}")
+        });
+        (parsed, out.status.code().unwrap_or(-1))
+    }
+
+    fn sorted(mut values: Vec<String>) -> Vec<String> {
+        values.sort();
+        values
+    }
+
+    /// One matrix drives both implementations: every shipped role/runtime pair
+    /// is evaluated natively and by the installed shell checker, and BOTH the
+    /// decision and the exact named unmet-capability set must be identical.
+    /// This prevents two independent assertion lists from silently drifting —
+    /// comparing only pass/fail would let the two paths agree on "reject" while
+    /// naming different capabilities.
     #[test]
     fn native_and_shell_conformance_for_every_shipped_pair() {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
@@ -375,6 +545,9 @@ mod tests {
             .filter_map(Result::ok)
             .filter_map(|e| e.path().file_stem()?.to_str().map(str::to_owned))
             .collect();
+        assert!(!runtimes.is_empty(), "no shipped runtime manifests found");
+        let mut compared = 0_usize;
+        let mut rejections = 0_usize;
 
         for role_entry in roles.filter_map(Result::ok) {
             if role_entry.path().extension().and_then(|s| s.to_str()) != Some("json") {
@@ -388,31 +561,141 @@ mod tests {
             else {
                 continue;
             };
+            // Roles outside the daemon's canonical launch set are not
+            // schedulable here; the shell checker remains a generic tool.
+            let Some(canonical) = canonical_role(&role) else {
+                continue;
+            };
             for runtime in &runtimes {
                 let native = resolve_and_admit(repo, &role, Some(runtime));
-                // Roles outside the daemon's canonical launch set are not
-                // schedulable here; the shell checker remains a generic tool.
-                if canonical_role(&role).is_none() {
-                    continue;
-                }
-                let shell_role = if canonical_role(&role) == Some("sweep-lifecycle") {
+                // A full sweep is one runtime admitted against Builder's
+                // (strongest lifecycle) requirements — that is the role the
+                // shell checker must be asked about for the `loom`/sweep entry.
+                let shell_role = if canonical == "sweep-lifecycle" {
                     "builder"
                 } else {
-                    &role
+                    canonical
                 };
-                let shell = Command::new("bash")
-                    .arg(&checker)
-                    .args(["--role", shell_role, "--runtime", runtime, "--dir"])
-                    .arg(&defaults)
-                    .status()
-                    .unwrap();
+                let (shell, code) = shell_decision(&checker, &defaults, shell_role, runtime);
+
+                // 1. Identical decisions.
                 assert_eq!(
                     native.is_ok(),
-                    shell.success(),
-                    "native/shell admission drift for role={role} runtime={runtime}: native={native:?}, shell={shell}"
+                    shell.decision == "admit",
+                    "native/shell admission drift for role={role} runtime={runtime}: \
+                     native={native:?}, shell={shell:?} (exit {code})"
                 );
+                // 2. Identical unmet-capability SETS (the named capabilities,
+                //    not merely the pass/fail verdict).
+                let native_unmet = native
+                    .as_ref()
+                    .err()
+                    .map(|r| r.unmet_capabilities.clone())
+                    .unwrap_or_default();
+                assert_eq!(
+                    sorted(native_unmet),
+                    sorted(shell.unmet.clone()),
+                    "native/shell unmet-capability drift for role={role} runtime={runtime}: \
+                     native={native:?}, shell={shell:?}"
+                );
+                // 3. The checker's EX_CONFIG(78)-vs-error(1) distinction is
+                //    preserved and matches the decision it reported.
+                match shell.decision.as_str() {
+                    "admit" => assert_eq!(code, 0, "role={role} runtime={runtime}"),
+                    "reject" => {
+                        assert_eq!(code, 78, "role={role} runtime={runtime}");
+                        rejections += 1;
+                    }
+                    other => {
+                        panic!("unexpected decision {other:?} for role={role} runtime={runtime}")
+                    }
+                }
+                compared += 1;
             }
         }
+
+        // The matrix must be non-degenerate: it has to actually contain the
+        // shipped `builder`/sweep + `codex` refusals whose named unmet set is
+        // the contract under test (`worktreeIsolation`).
+        assert!(compared >= 2, "conformance matrix compared only {compared} pair(s)");
+        assert!(rejections > 0, "conformance matrix contained no rejection to compare");
+        let (builder_codex, code) = shell_decision(&checker, &defaults, "builder", "codex");
+        assert_eq!(code, 78);
+        assert_eq!(builder_codex.unmet, vec!["worktreeIsolation"]);
+        assert_eq!(
+            resolve_and_admit(repo, "sweep-lifecycle", Some("codex"))
+                .unwrap_err()
+                .unmet_capabilities,
+            builder_codex.unmet,
+            "the full-sweep gate must name the same unmet set as the shell checker"
+        );
+    }
+
+    /// Fail-closed `runtimes.roles` key validation (#4494): an unknown role key
+    /// is rejected rather than silently ignored, while an empty *value* keeps
+    /// its established "unset, fall through" meaning.
+    #[test]
+    #[serial_test::serial]
+    fn unknown_configured_role_keys_fail_closed() {
+        let d = fixture();
+        let write_config = |contents: &str| {
+            fs::create_dir_all(d.path().join(".loom")).unwrap();
+            fs::write(d.path().join(".loom/config.json"), contents).unwrap();
+        };
+
+        // Unknown key -> fail closed, for the requested role AND for any other.
+        write_config(r#"{"runtimes":{"roles":{"not-a-role":"codex"}}}"#);
+        let rejection = resolve_and_admit(d.path(), "judge", None).unwrap_err();
+        assert_eq!(rejection.source, RuntimeSource::RoleConfig);
+        assert!(rejection.reason.contains("not-a-role"), "{}", rejection.reason);
+        assert!(rejection.unmet_capabilities.is_empty());
+        // Even an explicit per-dispatch runtime does not rescue a broken map.
+        assert!(resolve_and_admit(d.path(), "curator", Some("claude"))
+            .unwrap_err()
+            .reason
+            .contains("unknown role name"));
+
+        // A misspelled real role is caught by the same check.
+        write_config(r#"{"runtimes":{"roles":{"buidler":"claude"}}}"#);
+        assert!(resolve_and_admit(d.path(), "judge", None)
+            .unwrap_err()
+            .reason
+            .contains("buidler"));
+
+        // Non-string values fail closed too.
+        write_config(r#"{"runtimes":{"roles":{"curator":true}}}"#);
+        assert!(resolve_and_admit(d.path(), "curator", None)
+            .unwrap_err()
+            .reason
+            .contains("must be strings"));
+
+        // A non-object `runtimes.roles` fails closed.
+        write_config(r#"{"runtimes":{"roles":"codex"}}"#);
+        assert!(resolve_and_admit(d.path(), "curator", None)
+            .unwrap_err()
+            .reason
+            .contains("must be an object"));
+
+        // Known keys (canonical + alias) with an EMPTY value stay "unset":
+        // resolution falls through to `runtimes.default`, unchanged semantics.
+        write_config(
+            r#"{"runtimes":{"default":"codex","roles":{"curator":"","issue-curator":"","sweep-lifecycle":""}}}"#,
+        );
+        let admitted = resolve_and_admit(d.path(), "curator", None).unwrap();
+        assert_eq!(admitted.runtime, "codex");
+        assert_eq!(admitted.source, RuntimeSource::DefaultConfig);
+
+        // And a valid per-role binding still wins over the default.
+        write_config(r#"{"runtimes":{"default":"claude","roles":{"curator":"codex"}}}"#);
+        let admitted = resolve_and_admit(d.path(), "curator", None).unwrap();
+        assert_eq!(admitted.runtime, "codex");
+        assert_eq!(admitted.source, RuntimeSource::RoleConfig);
+
+        // No `runtimes` block at all remains the zero-config Claude path.
+        write_config("{}");
+        let admitted = resolve_and_admit(d.path(), "curator", None).unwrap();
+        assert_eq!(admitted.runtime, "claude");
+        assert_eq!(admitted.source, RuntimeSource::BuiltIn);
     }
 
     #[test]

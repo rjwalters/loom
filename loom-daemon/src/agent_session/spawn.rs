@@ -516,16 +516,25 @@ pub fn build_claude_command(cmd: &ClaudeCommand<'_>) -> String {
     }
 }
 
-/// The `pipe-pane` filter command: the Python log filter when importable,
+/// The `pipe-pane` filter command: the native `loom-daemon strip-ansi` filter,
 /// falling back to GNU/BSD `sed` line-buffered ANSI stripping.
 ///
-/// Kept identical to the Python original so log formatting does not regress in
-/// workspaces that still have `loom_tools` importable, while zero-pip consumer
-/// workspaces transparently drop to the `sed` fallbacks.
+/// Issue #4275 repointed the first rung from `python3 -u -m
+/// loom_tools.log_filter` (deleted with the rest of the script-helper family) to
+/// the native subcommand that replaced it. The behavior of that rung is
+/// unchanged — `strip-ansi` with no `--file` is the same real-time stdin filter,
+/// including the `[repeated N more times]` dedup summary and the #2798
+/// short-line safety rule.
+///
+/// The two `sed` rungs are retained verbatim: this string is evaluated inside
+/// tmux's own shell long after the daemon returns, so if the binary is missing
+/// or unreadable at that moment the pane must still get *some* ANSI stripping
+/// rather than losing the log entirely. `$LOOM_DAEMON_BIN` is honored first for
+/// the same reason every other resolver honors it (a non-PATH install).
 pub fn pipe_filter_cmd(log_file: &Path) -> String {
     let log = log_file.display();
     format!(
-        "python3 -u -m loom_tools.log_filter >> '{log}' 2>/dev/null \
+        "\"${{LOOM_DAEMON_BIN:-loom-daemon}}\" strip-ansi >> '{log}' 2>/dev/null \
          || sed -l -E 's/\\x1b\\[[?0-9;]*[a-zA-Z]//g; s/\\x1b\\][^\\x07]*\\x07//g' >> '{log}' 2>/dev/null \
          || sed -u -E 's/\\x1b\\[[?0-9;]*[a-zA-Z]//g; s/\\x1b\\][^\\x07]*\\x07//g' >> '{log}'"
     )
@@ -1442,9 +1451,16 @@ mod tests {
     }
 
     #[test]
-    fn test_pipe_filter_prefers_python_log_filter_then_sed() {
+    fn test_pipe_filter_prefers_native_strip_ansi_then_sed() {
         let cmd = pipe_filter_cmd(Path::new("/logs/loom-a.log"));
-        assert!(cmd.starts_with("python3 -u -m loom_tools.log_filter >> '/logs/loom-a.log'"));
+        assert!(
+            cmd.starts_with("\"${LOOM_DAEMON_BIN:-loom-daemon}\" strip-ansi >> '/logs/loom-a.log'"),
+            "got {cmd}"
+        );
+        assert!(
+            !cmd.contains("loom_tools"),
+            "the deleted Python filter must not be referenced: {cmd}"
+        );
         assert!(cmd.contains("|| sed -l -E"));
         assert!(cmd.contains("|| sed -u -E"));
         assert!(cmd.contains("x1b"), "must strip ANSI CSI sequences");
@@ -1608,12 +1624,13 @@ mod tests {
     }
 
     #[test]
-    fn test_spawn_agent_uses_python_log_filter_in_pipe_pane() {
+    fn test_spawn_agent_uses_native_strip_ansi_in_pipe_pane() {
         let tmp = tempfile::tempdir().unwrap();
         let root = repo(&tmp);
         let env = ready_env();
         spawn_agent(&env, &spawn_opts("builder-1"), &root);
-        assert!(env.saw("python3 -u -m loom_tools.log_filter"));
+        assert!(env.saw("strip-ansi"));
+        assert!(!env.saw("loom_tools"));
     }
 
     #[test]

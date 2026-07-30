@@ -63,7 +63,7 @@ use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -203,6 +203,38 @@ impl std::fmt::Display for ParkedIssueDispatchError {
 
 impl std::error::Error for ParkedIssueDispatchError {}
 
+/// Typed, matchable error returned by [`SweepRegistry::dispatch`] when the
+/// per-issue dispatch backoff (Issue #4485, step 2.8) refuses a dispatch
+/// because this issue's previous dispatch failed and its backoff window has
+/// not elapsed yet.
+///
+/// Distinct, downcast-matchable type — same rationale as
+/// [`OpenPrDispatchError`]: a backoff refusal is a *deliberate skip*, not a
+/// dispatch failure, so the work-finder attributes it to its own
+/// `backoff-skip` counter instead of the generic error tally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DispatchBackoffError {
+    /// The issue whose dispatch was refused.
+    pub issue: u32,
+    /// Consecutive failed dispatch attempts recorded for this issue.
+    pub consecutive: u32,
+    /// Whole seconds remaining before the next attempt is allowed.
+    pub retry_after_secs: u64,
+}
+
+impl std::fmt::Display for DispatchBackoffError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "refusing to dispatch issue #{}: its last {} dispatch attempt(s) failed fast; \
+             backing off for another {}s (#4485 dispatch backoff)",
+            self.issue, self.consecutive, self.retry_after_secs
+        )
+    }
+}
+
+impl std::error::Error for DispatchBackoffError {}
+
 /// Issue #4256: checkpoint phases at/after Builder completion. A crash whose
 /// checkpoint reads one of these means a PR was opened for the issue, so
 /// [`SweepRegistry::reap_once`]'s reaper-driven resume is eligible to
@@ -339,27 +371,40 @@ const DEFAULT_TIER_ALIASES: &[(&str, &str)] = &[("opus", "claude-opus-5")];
 /// an individual alias while inheriting the rest from the legacy tier — and is
 /// asserted explicitly by `read_model_aliases_merges_across_tiers`.
 ///
-/// **Cross-language divergence (#4059, Finding 2):** blank keys are dropped
-/// here (`key.is_empty()` guard below), but the Python mirror in
-/// `model_tiers._config_overrides` KEEPS blank keys — it only guards blank
-/// *values*. This is a PRE-EXISTING, known-and-harmless divergence: a blank key
-/// can never match a lookup and [`resolve_model_alias`] returns early on an
-/// empty input model. It is intentionally left as-is here (the Python side is
-/// owned by #4060); do NOT normalize Rust to Python's laxer behavior. Both sides
-/// drop blank values.
+/// **Single implementation (#4060 / #4275, epic #4081 family 5):** this used to
+/// be one half of a hand-synced Python/Rust twin pair
+/// (`model_tiers._config_overrides`), and the twins had already drifted —
+/// Python kept blank alias keys, this side dropped them (#4059, Finding 2).
+/// `loom_tools/model_tiers.py` was deleted in #4275 and
+/// `crate::script_helpers::model_tiers` now calls straight into this function
+/// (via [`model_aliases_from_config`]), so the Rust semantics below — blank
+/// keys AND blank values dropped, cross-tier `deep_merge` union — are the only
+/// surviving definition. The `resolve-model.sh` / `resolve-tier-model.sh` /
+/// `sweep-experiment.sh` entry points and the daemon dispatch path therefore
+/// cannot disagree by construction.
 #[must_use]
 pub fn read_model_aliases(repo_root: &Path) -> BTreeMap<String, String> {
+    model_aliases_from_config(&crate::config_resolver::resolve_effective_config(repo_root))
+}
+
+/// The `sweep.modelAliases` extraction, applied to an **already-resolved**
+/// config value.
+///
+/// Split out of [`read_model_aliases`] (#4275) so the `resolve-model.sh`
+/// `--config <path>` explicit bypass — which reads exactly one file and skips
+/// all config tiering — shares the same normalization rather than growing a
+/// second copy. Soft-fails to an empty map on any error (absent key, non-object
+/// value); blank keys and blank values are dropped.
+#[must_use]
+pub fn model_aliases_from_config(config: &serde_json::Value) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
-    let config = crate::config_resolver::resolve_effective_config(repo_root);
-    let Some(aliases) = crate::config_resolver::get_path(&config, "sweep.modelAliases")
+    let Some(aliases) = crate::config_resolver::get_path(config, "sweep.modelAliases")
         .and_then(serde_json::Value::as_object)
     else {
         return out;
     };
     for (key, val) in aliases {
         let key = key.trim().to_lowercase();
-        // #4059 Finding 2: blank keys dropped here; Python keeps them. Left as a
-        // known-and-harmless divergence — see the function doc comment above.
         if key.is_empty() {
             continue;
         }
@@ -370,6 +415,18 @@ pub fn read_model_aliases(repo_root: &Path) -> BTreeMap<String, String> {
     out
 }
 
+/// The effective logical-tier → ID map: shipped [`DEFAULT_TIER_ALIASES`]
+/// overlaid with the config's `sweep.modelAliases` overrides.
+#[must_use]
+pub fn effective_tier_aliases(config: &serde_json::Value) -> BTreeMap<String, String> {
+    let mut out: BTreeMap<String, String> = DEFAULT_TIER_ALIASES
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+        .collect();
+    out.extend(model_aliases_from_config(config));
+    out
+}
+
 /// Issue #3982: resolve a logical model tier/alias to the concrete model ID to
 /// dispatch, applying the shipped [`DEFAULT_TIER_ALIASES`] map overlaid with the
 /// per-repo `sweep.modelAliases` override. Preserves any `@effort` suffix
@@ -377,6 +434,19 @@ pub fn read_model_aliases(repo_root: &Path) -> BTreeMap<String, String> {
 /// (`claude-sonnet-4-6`) pass through unchanged.
 #[must_use]
 pub fn resolve_model_alias(repo_root: &Path, model: &str) -> String {
+    resolve_model_alias_from_config(
+        &crate::config_resolver::resolve_effective_config(repo_root),
+        model,
+    )
+}
+
+/// [`resolve_model_alias`] against an already-resolved config value.
+///
+/// This is the one alias-resolution implementation in the tree (#4275); both
+/// the daemon dispatch path and the `resolve-model.sh` CLI reach the wire
+/// through it.
+#[must_use]
+pub fn resolve_model_alias_from_config(config: &serde_json::Value, model: &str) -> String {
     if model.is_empty() {
         return String::new();
     }
@@ -385,7 +455,7 @@ pub fn resolve_model_alias(repo_root: &Path, model: &str) -> String {
         None => (model, None),
     };
     let key = base.trim().to_lowercase();
-    let overrides = read_model_aliases(repo_root);
+    let overrides = model_aliases_from_config(config);
     let resolved = overrides
         .get(&key)
         .map(String::as_str)
@@ -828,6 +898,220 @@ pub fn resolve_preflight_tripwire_config(repo_root: &Path) -> PreflightTripwireC
     PreflightTripwireConfig { threshold }
 }
 
+// ============================================================================
+// Per-issue dispatch backoff / flap circuit breaker (Issue #4485)
+// ============================================================================
+//
+// The insta-crash quarantine above (#3939) is the only brake on re-dispatching
+// a failing issue, and it is a *three-strikes* brake with two deliberate
+// carve-outs: an account-exhaustion death (#4122) and a claude-wrapper
+// pre-flight death (#4386) both leave the per-issue tally **untouched** on
+// purpose (the issue is not at fault). Nothing else limits how *often* one
+// issue may be re-dispatched: `reap_once` restores `loom:building` ->
+// `loom:issue` the moment the child dies and the issue "re-qualifies on the
+// next work-finder poll" (see the module comment at the quarantine section) —
+// a documented no-backoff loop.
+//
+// The observed consequence (#4485) was ~90 `loom:issue`/`loom:building` label
+// events on one issue in ~7 minutes: every dispatch's child died ~4s in, the
+// claim was restored ~1s later, and the next tick re-dispatched it. Because
+// every strike fell into a carve-out (or landed on a *different* daemon
+// process's in-memory tally — quarantine state is per-process and never
+// shared), the 3-strike quarantine did not engage for over 20 cycles.
+//
+// This backoff closes that gap from the other direction: instead of asking
+// *why* a dispatch failed, it caps *how often* a failing issue may be
+// re-attempted at all. A fast (sub-`insta_crash_secs`) or zero-progress
+// terminal outcome — including the two quarantine carve-outs — records a
+// failure and pushes the issue's next-allowed dispatch instant out
+// exponentially (base, 2x, 4x, …, capped). Any outcome that made real progress
+// clears the entry immediately.
+//
+// Deliberately **narrow and fail-open**:
+//
+// - In-memory only, per registry: a daemon restart clears it, so it can never
+//   permanently strand an issue.
+// - Never touches a forge label (so the breaker itself cannot flap anything)
+//   and costs zero API calls.
+// - Bounded by `max`, and the consecutive tally restarts from scratch when the
+//   previous failure is older than `max` (an issue that fails once a day never
+//   accretes toward a long backoff).
+// - Exempts the bounded one-shot recovery paths — the reaper-driven resume
+//   (#4256, capped by `MAX_RESUME_ATTEMPTS`) and the three watchdogs (#3887 /
+//   #3895 / #3910, each latched to a single retry per issue) — so a refusal can
+//   never burn a recovery attempt that is already rate-limited by its own latch.
+
+/// Env var toggling the per-issue dispatch backoff (Issue #4485).
+/// `0`/`false`/`no`/`off` disables; `1`/`true`/`yes`/`on` forces on. Overrides
+/// config. Defaults ON — like quarantine it is a safety backstop, and unlike
+/// quarantine it never blocks an issue for longer than
+/// [`DispatchBackoffConfig::max`].
+pub const DISPATCH_BACKOFF_ENABLE_ENV: &str = "LOOM_DISPATCH_BACKOFF";
+
+/// Env var overriding the first-failure backoff delay, in seconds (Issue
+/// #4485). A zero/invalid value falls through to config/default.
+pub const DISPATCH_BACKOFF_BASE_ENV: &str = "LOOM_DISPATCH_BACKOFF_BASE_SECS";
+
+/// Env var overriding the maximum backoff delay, in seconds (Issue #4485). A
+/// zero/invalid value falls through to config/default.
+pub const DISPATCH_BACKOFF_MAX_ENV: &str = "LOOM_DISPATCH_BACKOFF_MAX_SECS";
+
+/// Default first-failure backoff delay (#4485): one work-finder tick
+/// ([`crate::work_finder::DEFAULT_WORK_FINDER_INTERVAL_SECS`]). A single
+/// failed dispatch therefore costs at most one extra tick of latency, while a
+/// repeatedly-failing issue doubles away from the tick cadence instead of
+/// flapping its label on every poll.
+pub const DEFAULT_DISPATCH_BACKOFF_BASE_SECS: u64 = 60;
+
+/// Default maximum backoff delay (#4485). Reached after 5 consecutive failures
+/// (60s → 120 → 240 → 480 → 900). Well under the quarantine TTL
+/// ([`DEFAULT_QUARANTINE_TTL_SECS`]), so on an issue that IS quarantine-eligible
+/// the quarantine remains the longer, louder, operator-visible brake and this
+/// only smooths the ramp toward it.
+pub const DEFAULT_DISPATCH_BACKOFF_MAX_SECS: u64 = 900;
+
+/// Default label-flip flap window (#4485): the trailing window over which
+/// [`SweepRegistry`] counts its own `loom:issue` <-> `loom:building` writes for
+/// one issue.
+pub const DEFAULT_FLAP_WINDOW_SECS: i64 = 300;
+
+/// Default label-flip flap threshold (#4485): this many of *this registry's*
+/// own label writes for one issue inside [`DEFAULT_FLAP_WINDOW_SECS`] logs a
+/// loud warning. A healthy sweep writes exactly 2 (claim + release) per
+/// dispatch, so 6 means "three full dispatch/revert cycles in five minutes" —
+/// unambiguously a flap, never normal traffic.
+pub const DEFAULT_FLAP_THRESHOLD: usize = 6;
+
+/// Resolved per-issue dispatch-backoff parameters (Issue #4485), set on the
+/// registry at construction so [`SweepRegistry::dispatch`] can enforce them
+/// without a per-dispatch config read. Defaults mirror the shipped constants
+/// (enabled — it is a safety backstop).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DispatchBackoffConfig {
+    /// Whether the backoff is active. When `false`, dispatch neither records
+    /// failures nor refuses on backoff (byte-for-byte the pre-#4485 path).
+    pub enabled: bool,
+    /// Delay applied after the first failed dispatch; doubled per consecutive
+    /// failure.
+    pub base: Duration,
+    /// Ceiling on the doubling — also the idle window after which an issue's
+    /// consecutive-failure tally restarts from zero.
+    pub max: Duration,
+}
+
+impl Default for DispatchBackoffConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            base: Duration::from_secs(DEFAULT_DISPATCH_BACKOFF_BASE_SECS),
+            max: Duration::from_secs(DEFAULT_DISPATCH_BACKOFF_MAX_SECS),
+        }
+    }
+}
+
+/// Per-issue dispatch-backoff bookkeeping (Issue #4485).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DispatchBackoffState {
+    /// Consecutive failed dispatch outcomes for this issue.
+    consecutive: u32,
+    /// When the most recent failure was recorded — used to decide whether the
+    /// streak is still "consecutive" (see [`DispatchBackoffConfig::max`]).
+    last_failure_at: DateTime<Utc>,
+    /// The instant at which the next dispatch attempt becomes allowed.
+    until: DateTime<Utc>,
+}
+
+/// Compute the backoff delay for the `consecutive`-th consecutive failure
+/// (Issue #4485): `base * 2^(consecutive - 1)`, clamped to `max`. Pure function
+/// so the growth curve is unit-testable without a registry.
+///
+/// `consecutive == 0` (no recorded failure) yields [`Duration::ZERO`], and the
+/// doubling saturates rather than overflowing for large streaks.
+#[must_use]
+pub fn backoff_delay(consecutive: u32, base: Duration, max: Duration) -> Duration {
+    if consecutive == 0 || base.is_zero() {
+        return Duration::ZERO;
+    }
+    // Saturating shift: anything past 32 doublings is max regardless.
+    let factor = 2_u64.saturating_pow((consecutive - 1).min(32));
+    let secs = base.as_secs().saturating_mul(factor);
+    Duration::from_secs(secs).min(max)
+}
+
+/// The subset of `.loom/config.json → autonomous.workFinder.dispatchBackoff`
+/// this module consumes (Issue #4485). Mirrors [`QuarantineFileConfig`]'s shape:
+/// every field is `Option` so an absent key falls through to the env-var /
+/// built-in-default resolution — precedence **env > config > default**.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DispatchBackoffFileConfig {
+    /// `autonomous.workFinder.dispatchBackoff.enabled`.
+    pub enabled: Option<bool>,
+    /// `autonomous.workFinder.dispatchBackoff.baseSecs` (zero/invalid dropped).
+    pub base_secs: Option<u64>,
+    /// `autonomous.workFinder.dispatchBackoff.maxSecs` (zero/invalid dropped).
+    pub max_secs: Option<u64>,
+}
+
+/// Read `.loom/config.json → autonomous.workFinder.dispatchBackoff` (Issue
+/// #4485), soft-failing every field to `None` on a missing file, malformed
+/// JSON, or an absent block — mirrors [`read_quarantine_file_config`].
+#[must_use]
+pub fn read_dispatch_backoff_file_config(repo_root: &Path) -> DispatchBackoffFileConfig {
+    let effective = crate::config_resolver::resolve_effective_config(repo_root);
+    let Some(b) =
+        crate::config_resolver::get_path(&effective, "autonomous.workFinder.dispatchBackoff")
+    else {
+        return DispatchBackoffFileConfig::default();
+    };
+    DispatchBackoffFileConfig {
+        enabled: b.get("enabled").and_then(serde_json::Value::as_bool),
+        base_secs: b
+            .get("baseSecs")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|&s| s > 0),
+        max_secs: b
+            .get("maxSecs")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|&s| s > 0),
+    }
+}
+
+/// Resolve the full [`DispatchBackoffConfig`] for `repo_root` with precedence
+/// **env > config > default** for every knob (Issue #4485), mirroring
+/// [`resolve_quarantine_config`]. `max` is clamped up to `base` so a
+/// misconfigured pair can never produce a ceiling below the first delay.
+#[must_use]
+pub fn resolve_dispatch_backoff_config(repo_root: &Path) -> DispatchBackoffConfig {
+    let file = read_dispatch_backoff_file_config(repo_root);
+
+    let enabled = if let Ok(v) = std::env::var(DISPATCH_BACKOFF_ENABLE_ENV) {
+        matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+    } else {
+        file.enabled.unwrap_or(true)
+    };
+
+    let base_secs = std::env::var(DISPATCH_BACKOFF_BASE_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .or(file.base_secs)
+        .unwrap_or(DEFAULT_DISPATCH_BACKOFF_BASE_SECS);
+
+    let max_secs = std::env::var(DISPATCH_BACKOFF_MAX_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .or(file.max_secs)
+        .unwrap_or(DEFAULT_DISPATCH_BACKOFF_MAX_SECS)
+        .max(base_secs);
+
+    DispatchBackoffConfig {
+        enabled,
+        base: Duration::from_secs(base_secs),
+        max: Duration::from_secs(max_secs),
+    }
+}
+
 /// Compute how long a spawn must wait so that consecutive spawns are separated
 /// by at least `stagger` (Issue #3887). Pure function of the last spawn instant,
 /// the configured gap, and the current instant — unit-tested in isolation.
@@ -941,10 +1225,31 @@ pub fn review_stall_decision(
 // philosophy as #3892). A pre-flight token-health gate reads `.ranking` and
 // defers the re-dispatch when the whole pool is exhausted, so a mid-run
 // exhaustion is less likely to recur.
+//
+// ## The live-use veto (Issue #4449)
+//
+// That signature is NECESSARY but not SUFFICIENT, which cost real work on
+// 2026-07-29: the daemon's tracked sweep for issue #4366 had indeed died, but a
+// separate, untracked recovery Doctor session was concurrently editing the same
+// worktree. `(terminal ∧ no PR ∧ dirty)` matched, the watchdog ran
+// `git reset --hard` + `git clean -fd`, and a tested-but-uncommitted fix was
+// destroyed in the window between the test run and `git commit`.
+//
+// Dirtiness cannot distinguish "debris a dead sweep left behind" from "a live
+// session's work in progress" — both look identical to `git status`. So the
+// watchdog now requires a second, independent condition: NOTHING LIVE may still
+// hold the worktree. `SweepRegistry::worktree_in_use` gathers four signals (a
+// `.loom-in-use` marker, a claim-lock whose owner PID is alive, an in-flight
+// `index.lock`, and processes whose cwd is inside the worktree); any one of them
+// vetoes the reset, yielding `MidbuildDecision::InUse` — logged loudly, with the
+// single recovery retry left unconsumed so a genuinely-dead sweep is still
+// recovered on a later tick once the holder goes away. And `clean_worktree` now
+// logs the porcelain status + diffstat of everything it is about to destroy, so
+// a wipe can never again be silent in the daemon log.
 
 /// The mid-build-death watchdog's per-sweep decision (Issue #3895). Pure state
 /// machine — [`midbuild_decision`] maps `(worktree_dirty, produced_pr,
-/// already_retried)` onto exactly one of these.
+/// already_retried, worktree_in_use)` onto exactly one of these.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MidbuildDecision {
     /// Not a mid-build death (no dirty worktree, or a PR was produced) — leave
@@ -956,28 +1261,165 @@ pub enum MidbuildDecision {
     /// A dead sweep matching the signature but already recovered once — give up
     /// (bounded: never loop). Left for the operator.
     GiveUp,
+    /// The signature matches BUT the worktree is still held by a live session
+    /// the daemon does not track (Issue #4449) — refuse the destructive reset
+    /// and leave both the worktree and the single recovery retry untouched.
+    InUse,
 }
 
-/// Pure mid-build-death state machine (Issue #3895).
+/// Pure mid-build-death state machine (Issue #3895, extended by #4449).
 ///
 /// - No dirty worktree, or the sweep already produced a PR ⇒
 ///   [`MidbuildDecision::Healthy`] (nothing to recover).
-/// - Dirty worktree + no PR + not yet recovered ⇒ [`MidbuildDecision::Recover`].
-/// - Dirty worktree + no PR + already recovered ⇒ [`MidbuildDecision::GiveUp`]
-///   — the recovery is bounded to exactly one re-dispatch per issue.
+/// - Dirty worktree + no PR + **a live session still using the worktree** ⇒
+///   [`MidbuildDecision::InUse`] (#4449). This gate sits *above* the retry
+///   bookkeeping on purpose: "someone is editing this right now" is never a
+///   dead-sweep-recovery candidate, and a refusal must not burn the single
+///   recovery retry (the worktree may be legitimately free on a later tick).
+/// - Dirty worktree + no PR + not in use + not yet recovered ⇒
+///   [`MidbuildDecision::Recover`].
+/// - Dirty worktree + no PR + not in use + already recovered ⇒
+///   [`MidbuildDecision::GiveUp`] — the recovery is bounded to exactly one
+///   re-dispatch per issue.
+///
+/// # Why the in-use gate exists (#4449)
+///
+/// Before #4449 the watchdog inferred "died mid-build" from `(terminal state ∧
+/// no PR ∧ dirty worktree)` alone and immediately reset the worktree. On
+/// 2026-07-29 that inference was wrong: the daemon's own tracked sweep for
+/// issue #4366 *had* died, but a separate, untracked recovery Doctor session was
+/// concurrently and legitimately working in the same worktree. The watchdog read
+/// that session's uncommitted fix as dead-sweep debris and destroyed it mid
+/// `git commit`. Dirtiness alone cannot distinguish the two cases — only a
+/// liveness signal can.
 #[must_use]
 pub fn midbuild_decision(
     worktree_dirty: bool,
     produced_pr: bool,
     already_retried: bool,
+    worktree_in_use: bool,
 ) -> MidbuildDecision {
     if !worktree_dirty || produced_pr {
         MidbuildDecision::Healthy
+    } else if worktree_in_use {
+        MidbuildDecision::InUse
     } else if already_retried {
         MidbuildDecision::GiveUp
     } else {
         MidbuildDecision::Recover
     }
+}
+
+/// One piece of evidence that a *live* process is still using an issue
+/// worktree, gathered by [`SweepRegistry::worktree_in_use`] (Issue #4449).
+///
+/// Any non-empty set of evidence vetoes the mid-build watchdog's destructive
+/// `git reset --hard` / `git clean -fd` path. Each variant carries enough detail
+/// to name the holder in the daemon log so a refusal is actionable rather than
+/// mysterious.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorktreeUseEvidence {
+    /// A `.loom-in-use` marker file names an owning session. Written by flows
+    /// that enter a worktree (including manual, non-daemon sessions), so this
+    /// is the one signal an operator can set by hand to fence off a worktree.
+    InUseMarker { task_id: String, pid: String },
+    /// A claim-lock (`.loom/locks/issue-<N>/owner.json`) whose recorded owner
+    /// PID is still alive. A dead owner's lock is *not* evidence (the reaper /
+    /// `reconstruct` prune those), so this only fires for a genuinely live
+    /// claim the in-memory registry does not represent as active.
+    LiveClaimLock { pid: u32, sweep_id: String },
+    /// One or more live processes have their current working directory inside
+    /// the worktree — an operator's shell, a manual role session, or an
+    /// orphaned grandchild still writing files.
+    LiveProcesses(Vec<u32>),
+    /// A git operation is mid-flight (`index.lock` present) — precisely the
+    /// `git commit` window in which #4449 lost an uncommitted fix.
+    GitOperationInFlight(PathBuf),
+}
+
+impl std::fmt::Display for WorktreeUseEvidence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InUseMarker { task_id, pid } => {
+                write!(f, ".loom-in-use marker (task: {task_id}, pid: {pid})")
+            }
+            Self::LiveClaimLock { pid, sweep_id } => {
+                write!(f, "live claim-lock owner (pid {pid}, sweep {sweep_id})")
+            }
+            Self::LiveProcesses(pids) => {
+                write!(f, "live process(es) with cwd inside the worktree: {pids:?}")
+            }
+            Self::GitOperationInFlight(path) => {
+                write!(f, "git operation in flight ({} exists)", path.display())
+            }
+        }
+    }
+}
+
+/// Render a set of [`WorktreeUseEvidence`] as a single `; `-joined log fragment.
+#[must_use]
+pub fn describe_worktree_use(evidence: &[WorktreeUseEvidence]) -> String {
+    evidence
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Max lines of `git status` / `git diff --stat` echoed into the
+/// "about to discard" log line (Issue #4449) — enough to identify the lost work,
+/// bounded so a runaway worktree cannot flood the daemon log.
+const DISCARD_LOG_MAX_LINES: usize = 40;
+
+/// Truncate `text` to at most `max` lines, appending a `… (+N more)` marker when
+/// lines were dropped. Returns an empty string for empty/blank input.
+#[must_use]
+fn truncate_lines(text: &str, max: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let lines: Vec<&str> = trimmed.lines().collect();
+    if lines.len() <= max {
+        return lines.join("\n");
+    }
+    let extra = lines.len() - max;
+    let mut out = lines[..max].join("\n");
+    out.push_str(&format!("\n… (+{extra} more line(s))"));
+    out
+}
+
+/// Resolve a worktree's `index.lock` path — the marker git holds while an index
+/// write (`git add`, `git commit`, …) is in flight (Issue #4449).
+///
+/// Asks git itself (`git rev-parse --git-path index.lock`) rather than assuming
+/// `<wt>/.git/index.lock`, because a linked worktree's `.git` is a *file*
+/// pointing at `.git/worktrees/<name>/`. Returns `None` when the path cannot be
+/// resolved (not a repo, git unavailable) — the caller treats that as "no
+/// evidence" and relies on the other signals.
+#[must_use]
+fn git_index_lock_path(worktree: &Path) -> Option<PathBuf> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["rev-parse", "--git-path", "index.lock"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let rel = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if rel.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(&rel);
+    // `--git-path` yields a path relative to the *worktree* when git was invoked
+    // with `-C <worktree>`; absolutise it so `exists()` is cwd-independent.
+    Some(if path.is_absolute() {
+        path
+    } else {
+        worktree.join(path)
+    })
 }
 
 /// Decide, from a `.loom/tokens/.ranking` file's contents, whether the token
@@ -1240,13 +1682,62 @@ fn exhaustion_signatures() -> &'static [(&'static str, Regex)] {
     })
 }
 
+/// The PER-MODEL usage-ceiling signature (#4501): `You've reached your Fable 5
+/// limit. Run /usage-credits to continue or switch models with /model.` The model
+/// name sits between "your" and "limit", so none of the "hit your … limit"
+/// phrasings in [`exhaustion_signatures`] matched it — a child that insta-crashed
+/// on this banner was charged to the ISSUE's quarantine tally instead of the
+/// ACCOUNT, which is exactly backwards. The filler is bounded to at most three
+/// words so an unrelated sentence merely ending in "limit" cannot match.
+///
+/// Kept out of [`exhaustion_signatures`] because it needs the line-wise
+/// concurrency exclusion below, which a plain `(label, regex)` row cannot express
+/// (the `regex` crate has no lookaround).
+fn model_limit_signature() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?i)reached your (?:\S+\s+){0,3}limit")
+            .expect("valid static model-limit regex")
+    })
+}
+
+/// The concurrent-session-limit wording (#3947), used ONLY to exclude a line from
+/// [`model_limit_signature`] (#4501). `Error: you have reached your concurrent
+/// session limit` also matches the "reached your … limit" shape, but it is a
+/// CAPACITY fault (the account is healthy, it just cannot start another
+/// simultaneous session) — marking the account bad for it would shrink the healthy
+/// pool. This mirrors `classify-error.sh`'s SESSION_LIMIT-before-TOKEN_EXHAUSTED
+/// ordering on the daemon side.
+fn session_capacity_exclusion() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"(?i)concurrent (session|sessions|request)|maximum number of concurrent|too many concurrent|simultaneous session|another session is (already )?(active|running)",
+        )
+        .expect("valid static session-capacity regex")
+    })
+}
+
 /// Scan `log_tail` for any account-exhaustion signature (#4122). Returns the
 /// matched signature label on the first hit, else `None`.
+///
+/// The per-model ceiling (#4501) is matched LINE-WISE after the table rows, so a
+/// line whose wording is a concurrent-session capacity fault (#3947) is skipped
+/// rather than mistaken for quota exhaustion.
 fn classify_account_exhaustion(log_tail: &str) -> Option<&'static str> {
-    exhaustion_signatures()
+    if let Some(label) = exhaustion_signatures()
         .iter()
         .find(|(_, re)| re.is_match(log_tail))
         .map(|(label, _)| *label)
+    {
+        return Some(label);
+    }
+    log_tail
+        .lines()
+        .any(|line| {
+            model_limit_signature().is_match(line) && !session_capacity_exclusion().is_match(line)
+        })
+        .then_some("model-limit")
 }
 
 // ============================================================================
@@ -1712,6 +2203,12 @@ pub struct SweepRegistry {
     /// Issues the mid-build-death watchdog has already logged a give-up for
     /// (Issue #3895), so the loud give-up warning fires once per issue.
     midbuild_gaveup: HashSet<u32>,
+    /// Issues whose worktree the mid-build-death watchdog has already refused to
+    /// reset because a live, untracked session still holds it (Issue #4449).
+    /// Log-once bookkeeping only — it never suppresses the refusal itself, and
+    /// the issue is removed again as soon as the worktree stops being in use so a
+    /// later refusal (or a genuine give-up) still surfaces.
+    midbuild_inuse: HashSet<u32>,
     /// Issues the review-phase stall watchdog has already restarted once (Issue
     /// #3910). Bounds the "log went silent mid-review (hung Judge/Doctor)"
     /// recovery to a single re-dispatch per issue — a second stall resolves to
@@ -1808,6 +2305,39 @@ pub struct SweepRegistry {
     /// [`Event::PreflightAdvisory`] fires only on a state-change transition,
     /// never every tick.
     preflight_advisory_tripped: bool,
+    /// Per-issue dispatch-backoff parameters (Issue #4485). `main.rs` /
+    /// [`crate::workspace_pool::WorkspacePool`] set the resolved env > config >
+    /// default value at provision time, mirroring
+    /// [`quarantine_config`](Self::quarantine_config).
+    dispatch_backoff_config: DispatchBackoffConfig,
+    /// Per-issue dispatch backoff state (Issue #4485): consecutive failed
+    /// dispatch outcomes and the instant the next attempt is allowed. Written by
+    /// [`record_dispatch_failure`](Self::record_dispatch_failure) from
+    /// [`reap_once`](Self::reap_once) and read by
+    /// [`dispatch`](Self::dispatch)'s step-2.8 guard.
+    ///
+    /// Deliberately **wider** than [`insta_crash_counts`](Self::insta_crash_counts):
+    /// the quarantine tally exempts account-exhaustion (#4122) and
+    /// claude-wrapper pre-flight (#4386) deaths on purpose, which is exactly
+    /// how an issue can be re-dispatched indefinitely without ever
+    /// quarantining. This map counts *every* no-progress outcome, so the retry
+    /// cadence is bounded regardless of blame.
+    dispatch_backoff: HashMap<u32, DispatchBackoffState>,
+    /// Trailing timestamps of this registry's own `loom:issue` <->
+    /// `loom:building` label writes per issue (Issue #4485), pruned to
+    /// [`DEFAULT_FLAP_WINDOW_SECS`]. Powers the flap warning in
+    /// [`note_label_flip`](Self::note_label_flip) — the detection half of
+    /// #4485, since nothing surfaced the original ~90-flip incident until an
+    /// operator hand-inspected the forge timeline.
+    ///
+    /// Only *this process's* writes are visible here: a flap driven by a second
+    /// daemon instance (the shape #4485 actually observed) is bounded by the
+    /// backoff above but is not counted by this detector.
+    label_flip_log: HashMap<u32, VecDeque<DateTime<Utc>>>,
+    /// When the flap warning last fired per issue (Issue #4485), so a sustained
+    /// flap logs at most once per [`DEFAULT_FLAP_WINDOW_SECS`] instead of on
+    /// every flip.
+    flap_warned_at: HashMap<u32, DateTime<Utc>>,
 }
 
 /// Classification of a pre-flip label read (Issue #4085). Detection only — the
@@ -1876,6 +2406,7 @@ impl SweepRegistry {
             watchdog_progressed: HashSet::new(),
             midbuild_retried: HashSet::new(),
             midbuild_gaveup: HashSet::new(),
+            midbuild_inuse: HashSet::new(),
             review_stall_retried: HashSet::new(),
             review_stall_gaveup: HashSet::new(),
             quarantine_config: QuarantineConfig::default(),
@@ -1891,6 +2422,10 @@ impl SweepRegistry {
             preflight_death_streak: 0,
             preflight_death_last_marker: None,
             preflight_advisory_tripped: false,
+            dispatch_backoff_config: DispatchBackoffConfig::default(),
+            dispatch_backoff: HashMap::new(),
+            label_flip_log: HashMap::new(),
+            flap_warned_at: HashMap::new(),
         }
     }
 
@@ -1910,6 +2445,7 @@ impl SweepRegistry {
             watchdog_progressed: HashSet::new(),
             midbuild_retried: HashSet::new(),
             midbuild_gaveup: HashSet::new(),
+            midbuild_inuse: HashSet::new(),
             review_stall_retried: HashSet::new(),
             review_stall_gaveup: HashSet::new(),
             quarantine_config: QuarantineConfig::default(),
@@ -1925,6 +2461,10 @@ impl SweepRegistry {
             preflight_death_streak: 0,
             preflight_death_last_marker: None,
             preflight_advisory_tripped: false,
+            dispatch_backoff_config: DispatchBackoffConfig::default(),
+            dispatch_backoff: HashMap::new(),
+            label_flip_log: HashMap::new(),
+            flap_warned_at: HashMap::new(),
         }
     }
 
@@ -1974,6 +2514,20 @@ impl SweepRegistry {
     #[must_use]
     pub fn quarantine_config(&self) -> QuarantineConfig {
         self.quarantine_config
+    }
+
+    /// Set the per-issue dispatch-backoff parameters (Issue #4485). `main.rs`
+    /// and the workspace pool call this once at provision time with the
+    /// resolved env > config > default value, mirroring
+    /// [`set_quarantine_config`](Self::set_quarantine_config).
+    pub fn set_dispatch_backoff_config(&mut self, config: DispatchBackoffConfig) {
+        self.dispatch_backoff_config = config;
+    }
+
+    /// Read-only accessor for the dispatch-backoff parameters (Issue #4485).
+    #[must_use]
+    pub fn dispatch_backoff_config(&self) -> DispatchBackoffConfig {
+        self.dispatch_backoff_config
     }
 
     /// Set the claude-wrapper pre-flight-death workspace-tripwire parameters
@@ -2246,6 +2800,150 @@ impl SweepRegistry {
         self.quarantined.contains_key(&issue)
     }
 
+    // ------------------------------------------------------------------------
+    // Per-issue dispatch backoff (Issue #4485)
+    // ------------------------------------------------------------------------
+
+    /// Record a **failed** dispatch outcome for `issue` (Issue #4485) and push
+    /// its next-allowed dispatch instant out by
+    /// [`backoff_delay`]`(consecutive, base, max)`.
+    ///
+    /// Called by [`reap_once`](Self::reap_once) for a terminal outcome that made
+    /// no progress **and** died fast (inside the insta-crash window) or exited
+    /// cleanly with zero lifecycle progress (#4366) — including the shapes the
+    /// quarantine tally deliberately does NOT charge to the issue (account
+    /// exhaustion #4122, claude-wrapper pre-flight death #4386), which is
+    /// precisely how a failing issue could otherwise be re-dispatched every tick
+    /// forever. A *slow* checkpoint-less death is deliberately excluded: that is
+    /// the mid-build (#3895) / review-stall (#3910) watchdogs' remit, each
+    /// already bounded to one retry per issue.
+    ///
+    /// The streak restarts at `1` when the previous failure is older than
+    /// [`DispatchBackoffConfig::max`], so an issue that fails rarely never
+    /// accretes toward a long backoff. A no-op when the backoff is disabled.
+    fn record_dispatch_failure(&mut self, issue: u32) {
+        if !self.dispatch_backoff_config.enabled {
+            return;
+        }
+        let now = Utc::now();
+        let max_secs =
+            i64::try_from(self.dispatch_backoff_config.max.as_secs()).unwrap_or(i64::MAX);
+        let consecutive = match self.dispatch_backoff.get(&issue) {
+            Some(prev) if (now - prev.last_failure_at).num_seconds() <= max_secs => {
+                prev.consecutive.saturating_add(1)
+            }
+            // No prior record, or the streak went cold — start a fresh streak.
+            _ => 1,
+        };
+        let delay = backoff_delay(
+            consecutive,
+            self.dispatch_backoff_config.base,
+            self.dispatch_backoff_config.max,
+        );
+        let until =
+            now + chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::zero());
+        self.dispatch_backoff.insert(
+            issue,
+            DispatchBackoffState {
+                consecutive,
+                last_failure_at: now,
+                until,
+            },
+        );
+        log::info!(
+            "sweep_registry: issue #{issue} dispatch backoff armed — {consecutive} consecutive \
+             failed dispatch(es), next attempt allowed in {}s (#4485)",
+            delay.as_secs()
+        );
+    }
+
+    /// Clear `issue`'s dispatch-backoff record (Issue #4485) — called on any
+    /// terminal outcome that made real progress, so a recovered issue is
+    /// immediately eligible again. Returns `true` when a record existed.
+    fn clear_dispatch_backoff(&mut self, issue: u32) -> bool {
+        self.dispatch_backoff.remove(&issue).is_some()
+    }
+
+    /// Remaining dispatch backoff for `issue` at `now` (Issue #4485), or `None`
+    /// when it may be dispatched immediately. `Some(Duration::ZERO)` is never
+    /// returned — an elapsed window reads as `None`.
+    #[must_use]
+    pub fn dispatch_backoff_remaining(&self, issue: u32, now: DateTime<Utc>) -> Option<Duration> {
+        if !self.dispatch_backoff_config.enabled {
+            return None;
+        }
+        let state = self.dispatch_backoff.get(&issue)?;
+        let remaining = state.until - now;
+        if remaining <= chrono::Duration::zero() {
+            return None;
+        }
+        remaining.to_std().ok().filter(|d| !d.is_zero())
+    }
+
+    /// Consecutive failed dispatch attempts recorded for `issue` (Issue #4485).
+    /// `0` when no failure is on record. Test/inspection helper, mirroring
+    /// [`insta_crash_count`](Self::insta_crash_count).
+    #[must_use]
+    pub fn dispatch_failure_count(&self, issue: u32) -> u32 {
+        self.dispatch_backoff
+            .get(&issue)
+            .map_or(0, |s| s.consecutive)
+    }
+
+    /// Every issue whose dispatch backoff is still in effect at `now` (Issue
+    /// #4485) — the set the work finder skips *before* the capacity gate, so a
+    /// backed-off candidate never reserves a shared dispatch slot (mirroring
+    /// [`quarantined_issues`](Self::quarantined_issues)).
+    #[must_use]
+    pub fn dispatch_backoff_issues(&self, now: DateTime<Utc>) -> HashSet<u32> {
+        if !self.dispatch_backoff_config.enabled {
+            return HashSet::new();
+        }
+        self.dispatch_backoff
+            .iter()
+            .filter(|(_, s)| s.until > now)
+            .map(|(issue, _)| *issue)
+            .collect()
+    }
+
+    /// Note one `loom:issue` <-> `loom:building` label write this registry
+    /// performed for `issue` (Issue #4485) and warn loudly when the trailing
+    /// [`DEFAULT_FLAP_WINDOW_SECS`] window holds at least
+    /// [`DEFAULT_FLAP_THRESHOLD`] of them — the detection half of #4485.
+    ///
+    /// A healthy dispatch writes exactly two labels (claim + release), so the
+    /// threshold is only reachable by repeated dispatch/revert cycling. Warns at
+    /// most once per window per issue.
+    fn note_label_flip(&mut self, issue: u32) {
+        let now = Utc::now();
+        let window = chrono::Duration::seconds(DEFAULT_FLAP_WINDOW_SECS);
+        let flips = self.label_flip_log.entry(issue).or_default();
+        flips.push_back(now);
+        while flips.front().is_some_and(|t| now - *t > window) {
+            flips.pop_front();
+        }
+        let count = flips.len();
+        if count < DEFAULT_FLAP_THRESHOLD {
+            return;
+        }
+        let recently_warned = self
+            .flap_warned_at
+            .get(&issue)
+            .is_some_and(|t| now - *t <= window);
+        if recently_warned {
+            return;
+        }
+        self.flap_warned_at.insert(issue, now);
+        log::warn!(
+            "sweep_registry: issue #{issue} LABEL FLAPPING — this daemon wrote \
+             loom:issue/loom:building {count} time(s) in the last {}s (threshold \
+             {DEFAULT_FLAP_THRESHOLD}). A dispatch is dying immediately and being retried; check \
+             the sweep log tail, `loom-daemon quarantine list`, and whether a second daemon \
+             instance is dispatching the same workspace (#4485).",
+            DEFAULT_FLAP_WINDOW_SECS
+        );
+    }
+
     /// Manually clear an issue's quarantine + insta-crash tally (Issue #3939),
     /// the operator-action release path (reachable via the `ClearQuarantine` IPC
     /// request / `loom-daemon quarantine clear <issue>` CLI). Returns `true` when
@@ -2261,6 +2959,11 @@ impl SweepRegistry {
     /// instead of leaving the issue permanently stranded at `loom:blocked`.
     pub fn clear_quarantine(&mut self, issue: u32) -> bool {
         self.insta_crash_counts.remove(&issue);
+        // #4485: the operator's "let this run now" action also clears any
+        // dispatch-backoff window — otherwise a cleared quarantine could still
+        // be held back for up to `DispatchBackoffConfig::max`, making the
+        // operator command look like it did nothing.
+        self.clear_dispatch_backoff(issue);
         let was_quarantined = self.quarantined.remove(&issue).is_some();
         if was_quarantined {
             self.attempt_quarantine_release(issue);
@@ -2501,14 +3204,32 @@ impl SweepRegistry {
         let runtime_admission = if self.config.skip_label_flip {
             None // hermetic unit fixtures do not install runtime manifests
         } else {
-            Some(
-                crate::runtime_admission::resolve_and_admit(
-                    &self.config.workspace_root,
-                    "sweep-lifecycle",
-                    None,
-                )
-                .map_err(anyhow::Error::new)?,
-            )
+            match crate::runtime_admission::resolve_and_admit(
+                &self.config.workspace_root,
+                "sweep-lifecycle",
+                None,
+            ) {
+                Ok(admitted) => Some(admitted),
+                Err(rejection) => {
+                    // Refused work still gets an event representation (#4494):
+                    // `sweep.global.dispatch` describes admitted work only, so
+                    // without this the refusal was invisible on the bus. This
+                    // is a PURE publish — no claim lock, no account selection,
+                    // no log header, no forge call — so the pre-claim
+                    // side-effect contract is preserved.
+                    self.emit_event(Event::SweepGlobalRuntimeRejected {
+                        kind: kind.clone(),
+                        role: rejection.role.clone(),
+                        runtime: rejection.runtime.clone(),
+                        runtime_source: rejection.source.clone(),
+                        unmet_capabilities: rejection.unmet_capabilities.clone(),
+                        reason: rejection.reason.clone(),
+                        // Stamped by `emit_event` -> `set_repo_if_absent`.
+                        repo: None,
+                    });
+                    return Err(anyhow::Error::new(rejection));
+                }
+            }
         };
 
         // 1. Idempotency dedup against Running entries.
@@ -2564,21 +3285,27 @@ impl SweepRegistry {
             ));
         }
 
-        // 2.5 Closed-issue guard (Issue #4088). All three watchdogs
-        //     (startup #3887, mid-build-death #3895, review-stall #3910)
-        //     re-dispatch through this method, and `gh issue edit` succeeds on a
-        //     closed issue, so nothing else stops a watchdog false-positive from
-        //     re-claiming an issue whose PR already merged. Placing the guard
-        //     here — before the lock/label flip — covers all three call sites
-        //     with one check. Best-effort and fail-open: a forge lookup error
-        //     returns `None` and dispatch proceeds, so a `gh` outage can never
-        //     wedge the daemon. Skipped when label flips are disabled (test
-        //     fixtures without `gh` credentials).
-        if !self.config.skip_label_flip && self.issue_is_closed(issue_number) == Some(true) {
+        // 2.5 Closed-issue guard (Issue #4088, widened in #4504). All three
+        //     watchdogs (startup #3887, mid-build-death #3895, review-stall
+        //     #3910) re-dispatch through this method, and `gh issue edit`
+        //     succeeds on a closed issue, so nothing else stops a watchdog
+        //     false-positive from re-claiming an issue whose PR already merged.
+        //     Placing the guard here — before the lock/label flip — covers all
+        //     three call sites with one check. #4504 widened the probe from a
+        //     `state == "CLOSED"` string match to a REST payload that also
+        //     reports PR-ness, so a dispatch number that resolves to a pull
+        //     request (open, closed, or merged — issues and PRs share one number
+        //     namespace) is refused too instead of slipping through the fail-open
+        //     arm. Best-effort and fail-open: a forge lookup error returns `None`
+        //     and dispatch proceeds, so a `gh` outage can never wedge the daemon.
+        //     Skipped when label flips are disabled (test fixtures without `gh`
+        //     credentials).
+        if !self.config.skip_label_flip && self.issue_is_closed_or_pr(issue_number) == Some(true) {
             return Err(anyhow!(
-                "refusing to dispatch issue #{issue_number}: it is closed on the forge \
-                 (#4088 closed-issue guard). A watchdog re-dispatch must not re-claim a \
-                 closed/merged issue."
+                "refusing to dispatch issue #{issue_number}: it is closed on the forge, or the \
+                 number resolves to a pull request rather than an open issue (#4088/#4504 \
+                 closed-issue guard). A watchdog re-dispatch must not re-claim a closed/merged \
+                 issue or a PR number."
             ));
         }
 
@@ -2600,7 +3327,7 @@ impl SweepRegistry {
         //     Judge/Champion/Doctor path's job, not the issue work-finder's.
         //     Best-effort and fail-open: any forge error/timeout/unparseable
         //     output returns `None` and dispatch proceeds, so a `gh` outage (or
-        //     a Gitea workspace — this is GitHub-only, like `issue_is_closed`)
+        //     a Gitea workspace — this is GitHub-only, like `issue_is_closed_or_pr`)
         //     can never wedge the daemon. Skipped when label flips are disabled
         //     (test fixtures without `gh` credentials), mirroring 2.5.
         //
@@ -2676,6 +3403,61 @@ impl SweepRegistry {
             }
         }
 
+        // 2.8 Per-issue dispatch backoff (Issue #4485). The quarantine backstop
+        //     (#3939) only engages after three *tally-eligible* insta-crashes,
+        //     and both the account-exhaustion (#4122) and claude-wrapper
+        //     pre-flight (#4386) carve-outs deliberately leave that tally
+        //     untouched — so an issue whose every dispatch dies in that shape
+        //     was re-dispatched on every tick forever, flapping
+        //     `loom:issue`/`loom:building` at the reap→restore→re-poll cadence
+        //     (~90 label events in 7 minutes on #4398). This guard caps the
+        //     *rate* rather than the *cause*: any no-progress terminal outcome
+        //     arms an exponential per-issue window (see
+        //     `record_dispatch_failure`) and dispatch refuses until it elapses.
+        //
+        //     Placed with the other pre-flip guards (2.4-2.7) so one check
+        //     covers every dispatch call site — work-finder, epic supervisor,
+        //     IPC/CLI, and all three watchdogs — and, critically, so a refusal
+        //     costs **no lock, no label write, and no forge round trip of its
+        //     own**: the refusal itself can never contribute to a flap. Unlike
+        //     2.4-2.7 it is NOT gated on `skip_label_flip`: it is pure
+        //     in-memory bookkeeping with no `gh` dependency, and the flap it
+        //     prevents is driven by dispatch cadence, not by credentials.
+        //
+        //     Runs *after* the 2.7 park-label guard, deliberately. When an issue
+        //     is both parked and inside a backoff window, the park is the
+        //     durable operator decision and the more actionable refusal, so it
+        //     wins and the skip is attributed to `labeled-skip` rather than to
+        //     `backoff-skip` (which advertises an imminent auto-retry that a
+        //     park forbids). The two guards share no state: a refusal here never
+        //     spawns a sweep, so no refusal — park or backoff — can ever call
+        //     `record_dispatch_failure` and arm/extend a window, and a backoff
+        //     window keeps decaying on wall-clock time while an issue sits
+        //     parked. Clearing the park therefore re-exposes any *still-live*
+        //     window, which is correct: the park did not prove the failing
+        //     dispatch loop fixed.
+        //
+        //     Exempt: the reaper-driven resume (#4256, `resume_bypass_pr`),
+        //     which re-dispatches an issue whose own PR is open and is already
+        //     bounded by `MAX_RESUME_ATTEMPTS`. Never a work-finder loop.
+        if resume_bypass_pr.is_none() {
+            if let Some(remaining) = self.dispatch_backoff_remaining(issue_number, Utc::now()) {
+                let consecutive = self.dispatch_failure_count(issue_number);
+                log::info!(
+                    "sweep_registry: refusing to dispatch issue #{issue_number} — \
+                     {consecutive} consecutive failed dispatch(es), {}s of backoff remaining \
+                     (#4485)",
+                    remaining.as_secs()
+                );
+                return Err(DispatchBackoffError {
+                    issue: issue_number,
+                    consecutive,
+                    retry_after_secs: remaining.as_secs(),
+                }
+                .into());
+            }
+        }
+
         // 3. Acquire the claim lock atomically.
         let sweep_id = generate_sweep_id(kind);
         self.acquire_lock(issue_number, &sweep_id)?;
@@ -2706,6 +3488,10 @@ impl SweepRegistry {
                     "label flip for issue #{issue_number} failed (continuing dispatch): {e}"
                 );
             }
+            // Flap detection (#4485): count this claim write and warn if this
+            // issue's label is being cycled far faster than a healthy
+            // dispatch/complete rhythm can explain.
+            self.note_label_flip(issue_number);
         }
 
         // 5. Compute the log path and spawn the child.
@@ -3133,44 +3919,79 @@ impl SweepRegistry {
     // Forge label flip
     // ------------------------------------------------------------------------
 
-    /// Best-effort probe of whether an issue is closed on the forge (Issue
-    /// #4088). Returns `Some(true)` when closed, `Some(false)` when open, and
-    /// `None` on any error (missing/failed/timed-out `gh`, unparseable output).
+    /// Best-effort probe of whether a dispatch number is **terminal or not an
+    /// issue at all** (Issues #4088, #4504). Returns `Some(true)` when the number
+    /// must not be dispatched (a closed issue, or a pull request in ANY state),
+    /// `Some(false)` when it is a verifiably open issue, and `None` on any error
+    /// (missing/failed/timed-out `gh`, unresolvable repo, unparseable output).
     ///
     /// Callers MUST treat `None` as **fail-open** — a forge outage or a wedged
     /// `gh` must never wedge dispatch. The call is bounded by [`reap_gh_timeout`]
     /// exactly like the label flips so it cannot block the dispatch path.
-    fn issue_is_closed(&self, issue: u32) -> Option<bool> {
+    ///
+    /// **Why REST and not `gh issue view --json state` (#4504).** Issues and PRs
+    /// share one number namespace, and `gh issue view` resolves a PR number
+    /// happily — as a GraphQL `PullRequest` node, whose `state` is a *three*-value
+    /// enum (`OPEN`/`CLOSED`/`MERGED`) rather than an issue's two. The original
+    /// #4088 probe matched only `"CLOSED"`, so a merged PR's `"MERGED"` fell into
+    /// the `_ => None` fail-open arm — indistinguishable from a `gh` outage — and
+    /// dispatch proceeded against already-merged work. Widening the state match to
+    /// include `"MERGED"` is *not* sufficient: an **open** PR reports `"OPEN"`,
+    /// byte-identical to an open issue, so no state string can separate the two.
+    /// The REST payload (`repos/{owner}/{repo}/issues/{N}`) carries a
+    /// `pull_request` key present **if and only if** the number is a PR,
+    /// regardless of its open/closed/merged state — a structural discriminator
+    /// instead of an ever-expanding state-string set. REST is also a separate
+    /// rate-limit bucket from GraphQL, matching the #4444 park-label probe.
+    ///
+    /// The `--jq` collapses both facts into one JSON object
+    /// (`{"state":"open","is_pr":false}`); anything that does not parse into that
+    /// shape is a genuine lookup failure and returns `None`. `MERGED` is accepted
+    /// as terminal alongside `CLOSED` as belt-and-suspenders — REST reports a
+    /// merged PR as `state: "closed"`, but an Issue-shaped node reporting `MERGED`
+    /// must never fall through to the fail-open arm again.
+    fn issue_is_closed_or_pr(&self, issue: u32) -> Option<bool> {
+        // `gh api` cannot infer the repo from the working directory; this helper
+        // prefers the process-global LOOM_REPO override and falls back to
+        // `gh repo view` in the workspace root, so the override keeps working
+        // exactly as it did with `gh issue view --repo`. Returns `None` (fail
+        // open) when the repo cannot be resolved.
+        let (owner, repo) = self.resolve_owner_repo()?;
         let gh = self
             .config
             .gh_bin
             .clone()
             .unwrap_or_else(|| PathBuf::from("gh"));
         let mut cmd = Command::new(&gh);
-        cmd.arg("issue")
-            .arg("view")
-            .arg(issue.to_string())
-            .arg("--json")
-            .arg("state")
+        cmd.arg("api")
+            .arg(format!("repos/{owner}/{repo}/issues/{issue}"))
             .arg("--jq")
-            .arg(".state");
-        // Resolve the issue against this registry's own workspace, matching the
-        // label-flip helpers (#3937). LOOM_REPO still overrides when set.
+            .arg("{state, is_pr: (.pull_request != null)}");
+        // Resolve against this registry's own workspace, matching the label-flip
+        // helpers and the other dispatch-path probes (#3937).
         cmd.current_dir(&self.config.workspace_root);
-        if let Ok(repo) = std::env::var("LOOM_REPO") {
-            cmd.arg("--repo").arg(repo);
-        }
         let output = output_with_timeout(cmd, reap_gh_timeout()).ok()??;
         if !output.status.success() {
             return None;
         }
-        match String::from_utf8_lossy(&output.stdout)
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).ok()?;
+        // A PR is terminal for dispatch purposes in EVERY state — an open PR is
+        // still not an issue anyone can build.
+        if parsed.get("is_pr")?.as_bool()? {
+            return Some(true);
+        }
+        match parsed
+            .get("state")?
+            .as_str()?
             .trim()
             .to_ascii_uppercase()
             .as_str()
         {
-            "CLOSED" => Some(true),
+            "CLOSED" | "MERGED" => Some(true),
             "OPEN" => Some(false),
+            // Reserved for genuine lookup failures only: an unrecognized state
+            // string is an unparseable answer, not a verdict.
             _ => None,
         }
     }
@@ -3183,7 +4004,7 @@ impl SweepRegistry {
     /// unresolvable repo, unparseable output).
     ///
     /// Callers MUST treat `None` as **fail-open** — a forge outage or a wedged
-    /// `gh` must never wedge dispatch. This mirrors [`issue_is_closed`]'s `None`
+    /// `gh` must never wedge dispatch. This mirrors [`issue_is_closed_or_pr`]'s `None`
     /// contract and is bounded by [`reap_gh_timeout`] exactly like the label
     /// flips so it cannot block the dispatch path.
     ///
@@ -3224,7 +4045,7 @@ impl SweepRegistry {
                  | select(.state == \"OPEN\") | .number",
             );
         // Resolve against this registry's own workspace, matching the label-flip
-        // helpers and `issue_is_closed` (#3937).
+        // helpers and `issue_is_closed_or_pr` (#3937).
         cmd.current_dir(&self.config.workspace_root);
         let output = output_with_timeout(cmd, reap_gh_timeout()).ok()??;
         if !output.status.success() {
@@ -3243,7 +4064,7 @@ impl SweepRegistry {
     /// timed-out `gh`, unresolvable repo, unparseable output).
     ///
     /// Callers MUST treat `None` as **fail-open**, matching
-    /// [`issue_is_closed`](Self::issue_is_closed) and
+    /// [`issue_is_closed_or_pr`](Self::issue_is_closed_or_pr) and
     /// [`first_open_linked_pr`](Self::first_open_linked_pr): a forge outage or a
     /// wedged `gh` must never wedge dispatch. Bounded by [`reap_gh_timeout`] like
     /// every other dispatch-path `gh` call (#3973).
@@ -4619,6 +5440,7 @@ impl SweepRegistry {
             // claim — never restore the label out from under it.
             if !self.config.skip_label_flip && !produced_pr && !superseded {
                 let _ = self.restore_label_to_ready(*issue);
+                self.note_label_flip(*issue); // #4485 flap detection
             }
             self.emit_event(Event::SweepExited {
                 issue: *issue,
@@ -4755,6 +5577,7 @@ impl SweepRegistry {
                             // owns the lock — it is actively building.
                             if !self.config.skip_label_flip && !superseded {
                                 let _ = self.restore_label_to_ready(issue);
+                                self.note_label_flip(issue); // #4485 flap detection
                             }
                             let checkpoint_phase = read_checkpoint_phase(&checkpoint);
                             // Issue #4255: attribute WHY the sweep died by
@@ -4838,6 +5661,24 @@ impl SweepRegistry {
                             // fall through to the same pre-work insta-crash test the
                             // checkpoint-less branch below uses, so a sub-window
                             // non-clean death still counts toward quarantine.
+                            // #4485: the dispatch-backoff verdict is computed
+                            // here — BEFORE the #4122 / #4386 carve-outs below —
+                            // because those carve-outs exist to spare the
+                            // *issue's* quarantine tally, not to license an
+                            // unbounded retry cadence. Scoped to the same
+                            // fast-death window the tally uses: a run that made
+                            // real progress clears the window; a fast
+                            // checkpoint-less death (the flap shape) arms it; a
+                            // SLOW checkpoint-less death is left untouched — that
+                            // is the mid-build-death (#3895) / review-stall
+                            // (#3910) watchdogs' remit, each already bounded to a
+                            // single retry, and arming a window there would risk
+                            // burning that one retry on a refusal.
+                            if checkpoint_progress {
+                                self.clear_dispatch_backoff(issue);
+                            } else if insta_crash {
+                                self.record_dispatch_failure(issue);
+                            }
                             if checkpoint_progress {
                                 self.record_terminal_outcome(issue, false);
                                 // #4256: a run that advanced the checkpoint made
@@ -5010,6 +5851,7 @@ impl SweepRegistry {
                             // the lock (superseded) — it holds the live claim.
                             if !self.config.skip_label_flip && !produced_pr && !superseded {
                                 let _ = self.restore_label_to_ready(issue);
+                                self.note_label_flip(issue); // #4485 flap detection
                             }
                             if let Some(info) = self.entries.get_mut(&sweep_id) {
                                 info.state = SweepState::Exited {
@@ -5062,7 +5904,7 @@ impl SweepRegistry {
                             let no_progress = !self.config.skip_label_flip
                                 && exit_code == Some(0)
                                 && self.first_open_linked_pr(issue).is_none()
-                                && self.issue_is_closed(issue) == Some(false);
+                                && self.issue_is_closed_or_pr(issue) == Some(false);
                             // Insta-crash quarantine (#3939): a checkpoint-less
                             // death inside the insta-crash window that did NOT
                             // exit cleanly (exit_code != 0, or an unknown
@@ -5094,6 +5936,19 @@ impl SweepRegistry {
                                 sweep_id: sweep_id.clone(),
                                 outcome: SweepOutcome::Exited,
                             });
+                            // #4485: same rate cap as the crashed branch above,
+                            // evaluated before the #4386 pre-flight carve-out so
+                            // a pre-flight death still bounds its own retry
+                            // cadence. `insta_crash` (fast non-zero death, e.g.
+                            // the exit-78 empty-token-pool shape) and
+                            // `no_progress` (#4366 clean exit that advanced
+                            // nothing) are both failures; a genuinely productive
+                            // exit clears the window.
+                            if insta_crash || no_progress {
+                                self.record_dispatch_failure(issue);
+                            } else {
+                                self.clear_dispatch_backoff(issue);
+                            }
                             if !is_preflight_death {
                                 // #4366: a separate predicate arm from the
                                 // insta-crash window/exit-code check above — a
@@ -5451,6 +6306,13 @@ impl SweepRegistry {
                     // the single allowed attempt (never loops).
                     self.watchdog_retried.insert(issue);
 
+                    // #4485: release any dispatch-backoff window first. This
+                    // recovery is already bounded to ONE attempt per issue by the
+                    // latch above (marked before acting), so the rate limiting the
+                    // backoff provides is redundant here — and a refusal would
+                    // silently burn that single allowed attempt.
+                    self.clear_dispatch_backoff(issue);
+
                     // Cancel the hung child (SIGTERM → grace → SIGKILL). This
                     // releases the per-issue lock and restores loom:building ->
                     // loom:issue (finish_cancel's orphaned-claim recovery), so
@@ -5531,16 +6393,132 @@ impl SweepRegistry {
         }
     }
 
+    /// Gather every signal that issue `N`'s worktree is still being used by a
+    /// **live** process the in-memory registry does not represent as an active
+    /// sweep (Issue #4449). An empty vec means "no live holder found".
+    ///
+    /// This is the veto gate on the mid-build watchdog's destructive path. It
+    /// deliberately fails *closed* on ambiguity in the one direction that matters:
+    /// any positive signal blocks the reset. Signals that cannot be probed on
+    /// this host simply contribute nothing (the probe helpers already degrade to
+    /// "unknown ⇒ empty"), so a host without `/proc` or `lsof` still gets the
+    /// marker / claim-lock / index.lock signals.
+    ///
+    /// Order is cheapest-first so the common "nothing is using it" case does the
+    /// least work: two `stat`s and a `read_to_string` before the process scan.
+    fn worktree_in_use(&self, issue: u32) -> Vec<WorktreeUseEvidence> {
+        let wt = self.worktree_path(issue);
+        let mut evidence = Vec::new();
+        if !wt.exists() {
+            return evidence;
+        }
+
+        // 1. Explicit `.loom-in-use` marker — the one signal a manual session
+        //    (or an operator) can plant by hand to fence off a worktree.
+        if let Some(marker) = crate::worktree_ops::safety::read_in_use_marker(&wt) {
+            evidence.push(WorktreeUseEvidence::InUseMarker {
+                task_id: marker.task_id,
+                pid: marker.pid,
+            });
+        }
+
+        // 2. A claim-lock whose recorded owner PID is still alive. A dead owner
+        //    is NOT evidence — the reaper and `reconstruct` prune those, and
+        //    treating a stale lock as "in use" would wedge legitimate recovery.
+        let owner_path = self
+            .config
+            .locks_dir()
+            .join(format!("issue-{issue}"))
+            .join("owner.json");
+        if let Some(owner) = std::fs::read_to_string(&owner_path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<LockOwner>(&s).ok())
+        {
+            if is_pid_alive(owner.owner_pid) {
+                evidence.push(WorktreeUseEvidence::LiveClaimLock {
+                    pid: owner.owner_pid,
+                    sweep_id: owner.sweep_id,
+                });
+            }
+        }
+
+        // 3. A git operation mid-flight (`index.lock`) — the exact `git commit`
+        //    window in which #4449 destroyed an uncommitted fix.
+        if let Some(lock) = git_index_lock_path(&wt) {
+            if lock.exists() {
+                evidence.push(WorktreeUseEvidence::GitOperationInFlight(lock));
+            }
+        }
+
+        // 4. Live processes with a cwd inside the worktree (shells, manual role
+        //    sessions, orphaned grandchildren still writing files).
+        let pids = crate::worktree_ops::safety::find_processes_using_directory(&wt);
+        if !pids.is_empty() {
+            evidence.push(WorktreeUseEvidence::LiveProcesses(pids));
+        }
+
+        evidence
+    }
+
+    /// Record, at `warn`, exactly what a [`clean_worktree`] call is about to
+    /// destroy (Issue #4449) — the porcelain status plus a diffstat, truncated to
+    /// [`DISCARD_LOG_MAX_LINES`]. A wipe must never be silent in the daemon log:
+    /// this line is the only forensic trace that survives the `reset --hard`.
+    ///
+    /// [`clean_worktree`]: SweepRegistry::clean_worktree
+    fn log_worktree_discard(&self, wt: &Path, issue: u32) {
+        let run = |args: &[&str]| -> String {
+            Command::new("git")
+                .arg("-C")
+                .arg(wt)
+                .args(args)
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim_end().to_string())
+                .unwrap_or_default()
+        };
+        let status = truncate_lines(
+            &run(&["status", "--porcelain", "--untracked-files=all"]),
+            DISCARD_LOG_MAX_LINES,
+        );
+        let diffstat = truncate_lines(&run(&["diff", "--stat", "HEAD"]), DISCARD_LOG_MAX_LINES);
+        if status.is_empty() && diffstat.is_empty() {
+            // Nothing probeable to report (missing git, unborn HEAD, …) — still
+            // announce the destructive action so the log shows it happened.
+            log::warn!(
+                "clean-worktree: discarding uncommitted state in {} (issue #{issue}) via \
+                 `git reset --hard` + `git clean -fd`; could not enumerate the discarded \
+                 changes (#4449).",
+                wt.display()
+            );
+            return;
+        }
+        log::warn!(
+            "clean-worktree: DISCARDING uncommitted state in {} (issue #{issue}) via \
+             `git reset --hard` + `git clean -fd` — this is irreversible (#4449).\n\
+             status --porcelain:\n{status}\n\
+             diff --stat HEAD:\n{diffstat}",
+            wt.display()
+        );
+    }
+
     /// Discard a mid-build-death worktree's uncommitted changes so the
     /// re-dispatched sweep resumes from a clean checkout (Issue #3895): a
     /// `git reset --hard` followed by `git clean -fd`. Best-effort — any commits
     /// the dead sweep managed to make are preserved (only the dirty working tree
     /// and untracked files are dropped).
+    ///
+    /// Every call first logs what it is about to destroy via
+    /// [`log_worktree_discard`](Self::log_worktree_discard) (Issue #4449) — the
+    /// #4449 incident was made unrecoverable partly because the wipe left no
+    /// trace at all in the daemon log.
     fn clean_worktree(&self, issue: u32) -> Result<()> {
         let wt = self.worktree_path(issue);
         if !wt.exists() {
             return Ok(());
         }
+        self.log_worktree_discard(&wt, issue);
         let reset = Command::new("git")
             .arg("-C")
             .arg(&wt)
@@ -5611,6 +6589,16 @@ impl SweepRegistry {
     /// re-dispatch (without consuming the single retry) when the whole pool is
     /// `exhausted`/`blocked`, so a mid-run exhaustion is less likely to recur.
     ///
+    /// **Live-use veto (Issue #4449)**: before anything destructive happens, a
+    /// dirty worktree is probed for live holders ([`worktree_in_use`]). A dirty
+    /// worktree is only *dead-sweep debris* if nothing live still owns it — if a
+    /// `.loom-in-use` marker, a live claim-lock owner, an in-flight `index.lock`,
+    /// or a process with its cwd inside the worktree says otherwise, the decision
+    /// resolves to [`MidbuildDecision::InUse`]: log loudly, touch nothing, and do
+    /// **not** consume the single recovery retry.
+    ///
+    /// [`worktree_in_use`]: SweepRegistry::worktree_in_use
+    ///
     /// No new event topics are introduced (the taxonomy is frozen): the
     /// re-dispatch reuses `sweep.global.dispatch` from [`dispatch`], and a
     /// bounded give-up / a pool-exhausted defer surface on the existing frozen
@@ -5642,8 +6630,39 @@ impl SweepRegistry {
                 continue;
             }
             let dirty = self.worktree_dirty(issue);
+            // #4449: a dirty worktree is only dead-sweep debris if nothing LIVE
+            // is still using it. Probe only when dirty (the probe is the
+            // expensive part and a clean worktree is never reset anyway).
+            let in_use = if dirty {
+                self.worktree_in_use(issue)
+            } else {
+                Vec::new()
+            };
+            if in_use.is_empty() {
+                // No longer held — clear the log-once latch so a later refusal
+                // (or a genuine give-up) still surfaces in the daemon log.
+                self.midbuild_inuse.remove(&issue);
+            }
             let already_retried = self.midbuild_retried.contains(&issue);
-            match midbuild_decision(dirty, false, already_retried) {
+            match midbuild_decision(dirty, false, already_retried, !in_use.is_empty()) {
+                MidbuildDecision::InUse => {
+                    if self.midbuild_inuse.insert(issue) {
+                        log::warn!(
+                            "midbuild-watchdog: issue #{issue} ({sweep_id}) matches the \
+                             mid-build-death signature (terminal, no PR, dirty worktree) but its \
+                             worktree at {} is STILL IN USE by a live session the daemon does not \
+                             track — {}. REFUSING to `git reset --hard` it: that is exactly how \
+                             #4449 destroyed an active recovery session's uncommitted fix \
+                             mid-commit. The worktree is left intact and the single recovery retry \
+                             is NOT consumed; the watchdog re-assesses once the holder releases \
+                             it. If the holder is stale, clear it (remove .loom-in-use / the \
+                             claim-lock / the index.lock, or exit the shell) and the next tick \
+                             will recover normally.",
+                            self.worktree_path(issue).display(),
+                            describe_worktree_use(&in_use),
+                        );
+                    }
+                }
                 MidbuildDecision::Healthy => {}
                 MidbuildDecision::GiveUp => {
                     if self.midbuild_gaveup.insert(issue) {
@@ -5720,6 +6739,13 @@ impl SweepRegistry {
                     // Mark recovered BEFORE acting so any error path still counts
                     // the single allowed attempt (never loops).
                     self.midbuild_retried.insert(issue);
+
+                    // #4485: release any dispatch-backoff window first. This
+                    // recovery is already bounded to ONE attempt per issue by the
+                    // latch above (marked before acting), so the rate limiting the
+                    // backoff provides is redundant here — and a refusal would
+                    // silently burn that single allowed attempt.
+                    self.clear_dispatch_backoff(issue);
 
                     // Discard the dirty working tree so the resumed sweep starts
                     // clean (commits, if any, are preserved).
@@ -5893,6 +6919,13 @@ impl SweepRegistry {
                     // A prior give-up log (if any) is now stale; clear it so a
                     // later genuine give-up still logs once.
                     self.review_stall_gaveup.remove(&issue);
+
+                    // #4485: release any dispatch-backoff window first. This
+                    // recovery is already bounded to ONE attempt per issue by the
+                    // latch above (marked before acting), so the rate limiting the
+                    // backoff provides is redundant here — and a refusal would
+                    // silently burn that single allowed attempt.
+                    self.clear_dispatch_backoff(issue);
 
                     // Cancel the wedged child (SIGTERM → grace → SIGKILL). This
                     // releases the per-issue lock and restores loom:building ->
@@ -6911,6 +7944,9 @@ mod tests {
         config.spawn_bin = Some(fake_spawn);
         config.journal_path = Some(workspace.join("journal.json"));
         let mut registry = SweepRegistry::new(config);
+        let bus = Arc::new(EventBus::with_capacity(8));
+        let mut events = bus.subscribe(["sweep.global"]);
+        registry.set_event_bus(bus);
         let error = registry
             .dispatch(&SweepKind::Issue(4494), None, None, None, None)
             .unwrap_err();
@@ -6924,6 +7960,34 @@ mod tests {
         assert!(!workspace.join(".loom/locks/issues/4494").exists(), "claim lock was created");
         assert!(!registry.compute_log_path(4494).exists(), "log header was created");
         assert!(registry.entries.is_empty(), "capacity/registry entry was consumed");
+
+        // #4494: refused work IS represented on the bus — and only by the
+        // rejection topic (never a `sweep.global.dispatch` for work that was
+        // never admitted).
+        let event = events.try_recv().expect("a rejection event was published");
+        assert_eq!(event.topic(), "sweep.global.runtime_rejected");
+        match event {
+            Event::SweepGlobalRuntimeRejected {
+                kind,
+                role,
+                runtime,
+                runtime_source,
+                unmet_capabilities,
+                reason,
+                repo,
+            } => {
+                assert_eq!(kind, SweepKind::Issue(4494));
+                assert_eq!(role, "sweep-lifecycle");
+                assert_eq!(runtime, "codex");
+                assert_eq!(runtime_source, crate::types::RuntimeSource::DefaultConfig);
+                assert_eq!(unmet_capabilities, vec!["worktreeIsolation"]);
+                assert!(reason.contains("worktreeIsolation"), "{reason}");
+                // Stamped centrally by `emit_event` (#4201's pattern).
+                assert_eq!(repo.as_deref(), Some(workspace.display().to_string().as_str()));
+            }
+            other => panic!("expected SweepGlobalRuntimeRejected, got {other:?}"),
+        }
+        assert!(events.try_recv().is_err(), "no further events for refused work");
     }
 
     /// Build a temp-workspace registry with a fake spawn binary that
@@ -7648,11 +8712,13 @@ exit 0
     // No-progress backstop (Issue #4366)
     // ------------------------------------------------------------------------
 
-    /// Build a registry whose fake `gh` answers `issue view` with `issue_state`
-    /// (`"OPEN"` or `"CLOSED"`) and `api graphql` (the open-linked-PR probe)
-    /// with `graphql_stdout` (one PR number per line, empty for "no open PR").
-    /// Unlike [`open_pr_guard_registry`] (which hardcodes `OPEN`), this lets
-    /// #4366's no-progress tests exercise the issue-closed exemption too.
+    /// Build a registry whose fake `gh` answers the issue-state probe
+    /// (`api repos/<owner>/<repo>/issues/<n>`, #4504) with `issue_state`
+    /// (`"OPEN"` or `"CLOSED"`, always as a NON-PR node) and `api graphql` (the
+    /// open-linked-PR probe) with `graphql_stdout` (one PR number per line,
+    /// empty for "no open PR"). Unlike [`open_pr_guard_registry`] (which
+    /// hardcodes an open issue), this lets #4366's no-progress tests exercise
+    /// the issue-closed exemption too.
     fn no_progress_test_registry(
         ws: &Path,
         issue_state: &str,
@@ -7662,8 +8728,8 @@ exit 0
         let fake_gh = ws.join("fake-gh-no-progress.sh");
         let script = format!(
             "#!/usr/bin/env bash\n\
-             if [[ \"$1\" == \"issue\" && \"$2\" == \"view\" ]]; then\n\
-             printf '%s\\n' \"{state}\"\n\
+             if [[ \"$1\" == \"api\" && \"$2\" == repos/* ]]; then\n\
+             printf '%s\\n' '{state}'\n\
              exit 0\n\
              fi\n\
              if [[ \"$1\" == \"api\" && \"$2\" == \"graphql\" ]]; then\n\
@@ -7675,7 +8741,7 @@ exit 0
              exit 0\n\
              fi\n\
              exit 0\n",
-            state = issue_state,
+            state = state_probe_json(issue_state, false),
             gql = graphql_stdout,
         );
         std::fs::write(&fake_gh, &script).unwrap();
@@ -7809,7 +8875,7 @@ exit 0
     }
 
     /// AC (PR #4408 judge feedback): the no-progress predicate must FAIL OPEN
-    /// when the forge probes themselves fail. [`Self::issue_is_closed`] returns
+    /// when the forge probes themselves fail. [`Self::issue_is_closed_or_pr`] returns
     /// `None` on a missing/failed/timed-out/unparseable `gh` answer and its
     /// contract says callers MUST treat that as "don't punish" — the original
     /// `!= Some(true)` spelling was *satisfied* by `None`, so a rate-limited or
@@ -7820,7 +8886,7 @@ exit 0
     ///
     /// The fixture answers `issue view` with an unparseable `"WEDGED"` state
     /// (the same shape a truncated/garbled `gh` response has), which makes
-    /// `issue_is_closed` return `None`. Three consecutive clean exits under
+    /// `issue_is_closed_or_pr` return `None`. Three consecutive clean exits under
     /// that condition — enough to trip the quarantine threshold if any of them
     /// counted — must leave the tally at 0 and the issue un-quarantined.
     #[test]
@@ -9269,6 +10335,424 @@ exit 0
     }
 
     // ------------------------------------------------------------------------
+    // Per-issue dispatch backoff / flap breaker (Issue #4485)
+    // ------------------------------------------------------------------------
+
+    /// A registry with an explicit, fast backoff config so a test never waits on
+    /// the 60s shipped default.
+    fn backoff_registry(workspace: &Path, base_secs: u64, max_secs: u64) -> SweepRegistry {
+        let (mut registry, _record_log) = fixture_registry(workspace);
+        registry.set_dispatch_backoff_config(DispatchBackoffConfig {
+            enabled: true,
+            base: Duration::from_secs(base_secs),
+            max: Duration::from_secs(max_secs),
+        });
+        registry
+    }
+
+    /// The delay curve doubles per consecutive failure and clamps at `max`;
+    /// a zero streak (and a zero base) is always no delay.
+    #[test]
+    fn backoff_delay_doubles_then_clamps_at_max() {
+        let base = Duration::from_secs(60);
+        let max = Duration::from_secs(900);
+        assert_eq!(backoff_delay(0, base, max), Duration::ZERO, "no failures ⇒ no delay");
+        assert_eq!(backoff_delay(1, base, max), Duration::from_secs(60));
+        assert_eq!(backoff_delay(2, base, max), Duration::from_secs(120));
+        assert_eq!(backoff_delay(3, base, max), Duration::from_secs(240));
+        assert_eq!(backoff_delay(4, base, max), Duration::from_secs(480));
+        assert_eq!(backoff_delay(5, base, max), Duration::from_secs(900), "clamped");
+        assert_eq!(backoff_delay(50, base, max), max, "a long streak saturates, never overflows");
+        assert_eq!(backoff_delay(3, Duration::ZERO, max), Duration::ZERO, "zero base disables");
+    }
+
+    /// AC: a minimum interval is enforced between same-issue dispatch attempts
+    /// after a failed dispatch. The refusal carries the typed
+    /// [`DispatchBackoffError`] (so the work finder can attribute it) and clears
+    /// the moment the window is released.
+    #[test]
+    fn dispatch_refused_while_backoff_window_is_live() {
+        let dir = tempdir().unwrap();
+        let mut registry = backoff_registry(dir.path(), 60, 900);
+
+        registry.record_dispatch_failure(4485);
+        assert_eq!(registry.dispatch_failure_count(4485), 1);
+
+        let err = registry
+            .dispatch(&SweepKind::Issue(4485), None, None, None, None)
+            .expect_err("a live backoff window must refuse dispatch");
+        let typed = err
+            .downcast_ref::<DispatchBackoffError>()
+            .expect("refusal must carry the typed DispatchBackoffError");
+        assert_eq!(typed.issue, 4485);
+        assert_eq!(typed.consecutive, 1);
+        assert!(typed.retry_after_secs > 0 && typed.retry_after_secs <= 60);
+
+        // The refusal happens BEFORE the claim lock and the label flip, so
+        // nothing was claimed and nothing was spawned.
+        assert!(
+            !registry.config.locks_dir().join("issue-4485").exists(),
+            "a backoff refusal must not acquire the claim lock"
+        );
+        assert!(registry.entries.is_empty(), "a backoff refusal must not register a sweep");
+
+        // Releasing the window (progress, or the operator's quarantine clear)
+        // makes the issue immediately eligible again — the breaker never wedges.
+        assert!(registry.clear_dispatch_backoff(4485));
+        let outcome = registry
+            .dispatch(&SweepKind::Issue(4485), None, None, None, None)
+            .expect("dispatch proceeds once the window is cleared");
+        assert!(outcome.was_new);
+    }
+
+    /// A disabled backoff is byte-for-byte the pre-#4485 path: no window is ever
+    /// armed and dispatch is never refused.
+    #[test]
+    fn disabled_backoff_never_refuses_dispatch() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _log) = fixture_registry(dir.path());
+        registry.set_dispatch_backoff_config(DispatchBackoffConfig {
+            enabled: false,
+            ..DispatchBackoffConfig::default()
+        });
+
+        registry.record_dispatch_failure(77);
+        assert_eq!(registry.dispatch_failure_count(77), 0, "disabled ⇒ nothing recorded");
+        assert!(registry
+            .dispatch_backoff_remaining(77, Utc::now())
+            .is_none());
+        assert!(registry
+            .dispatch(&SweepKind::Issue(77), None, None, None, None)
+            .is_ok());
+    }
+
+    /// Regression for the #4485 incident shape: an **account-exhaustion**
+    /// insta-crash is deliberately NOT charged to the issue's quarantine tally
+    /// (#4122), so three in a row never quarantine — yet before this change the
+    /// work finder re-dispatched the issue on the very next tick, flapping
+    /// `loom:issue`/`loom:building` indefinitely. The dispatch backoff must
+    /// count those deaths and refuse the re-dispatch.
+    #[test]
+    fn exhaustion_insta_crashes_arm_backoff_even_though_quarantine_is_carved_out() {
+        let dir = tempdir().unwrap();
+        let mut registry = backoff_registry(dir.path(), 60, 900);
+        seed_token_pool(dir.path(), "agent-9");
+
+        for seq in 0..3 {
+            insert_dead_running_with_log(
+                &mut registry,
+                4398,
+                seq,
+                "agent-9",
+                "loom-daemon dispatch: start\nClaude: hit your weekly limit\n",
+            );
+            registry.reap_once();
+        }
+
+        // #4122's carve-out is intact — the issue was never blamed.
+        assert_eq!(registry.insta_crash_count(4398), 0, "#4122 carve-out preserved");
+        assert!(!registry.is_quarantined(4398), "#4122: exhaustion never quarantines the issue");
+
+        // …but the retry cadence is now bounded regardless of blame.
+        assert_eq!(registry.dispatch_failure_count(4398), 3);
+        assert!(registry
+            .dispatch_backoff_remaining(4398, Utc::now())
+            .is_some());
+        assert!(registry.dispatch_backoff_issues(Utc::now()).contains(&4398));
+        let err = registry
+            .dispatch(&SweepKind::Issue(4398), None, None, None, None)
+            .expect_err("the re-dispatch that used to flap the label must be refused");
+        assert!(err.downcast_ref::<DispatchBackoffError>().is_some(), "got: {err}");
+    }
+
+    /// The same property for the OTHER quarantine carve-out: a claude-wrapper
+    /// pre-flight death (#4386) leaves the insta-crash tally untouched but must
+    /// still bound its own re-dispatch cadence.
+    #[test]
+    fn preflight_death_arms_backoff_even_though_quarantine_is_carved_out() {
+        let dir = tempdir().unwrap();
+        let mut registry = backoff_registry(dir.path(), 60, 900);
+
+        // No `# CLAUDE_CLI_START` in the tail ⇒ classified as a pre-flight death.
+        insert_dead_running_with_log(
+            &mut registry,
+            4399,
+            0,
+            "agent-9",
+            "==== loom-daemon dispatch: sweep-issue-4399-0 ====\nspawn-claude: preflight failed\n",
+        );
+        registry.reap_once();
+
+        assert_eq!(registry.insta_crash_count(4399), 0, "#4386 carve-out preserved");
+        assert_eq!(registry.dispatch_failure_count(4399), 1, "backoff still counts it");
+        assert!(registry
+            .dispatch_backoff_remaining(4399, Utc::now())
+            .is_some());
+    }
+
+    /// A cold streak restarts at 1: a failure whose predecessor is older than
+    /// `max` is a fresh incident, not the continuation of an old one — so an
+    /// issue that fails once in a blue moon never accretes a long backoff.
+    #[test]
+    fn stale_failure_streak_restarts_from_one() {
+        let dir = tempdir().unwrap();
+        let mut registry = backoff_registry(dir.path(), 60, 120);
+
+        registry.record_dispatch_failure(31);
+        registry.record_dispatch_failure(31);
+        assert_eq!(registry.dispatch_failure_count(31), 2);
+
+        // Age the recorded failure well past `max` (120s) and record again.
+        let stale = Utc::now() - chrono::Duration::seconds(600);
+        if let Some(state) = registry.dispatch_backoff.get_mut(&31) {
+            state.last_failure_at = stale;
+            state.until = stale;
+        }
+        registry.record_dispatch_failure(31);
+        assert_eq!(registry.dispatch_failure_count(31), 1, "cold streak restarts");
+    }
+
+    /// An elapsed window reads as "no backoff" without any explicit expiry pass —
+    /// the check is purely `until > now`, so a stale record can never hold an
+    /// issue back (and a daemon restart clears the map entirely).
+    #[test]
+    fn elapsed_backoff_window_stops_refusing() {
+        let dir = tempdir().unwrap();
+        let mut registry = backoff_registry(dir.path(), 60, 900);
+        registry.record_dispatch_failure(32);
+        if let Some(state) = registry.dispatch_backoff.get_mut(&32) {
+            state.until = Utc::now() - chrono::Duration::seconds(1);
+        }
+        assert!(registry
+            .dispatch_backoff_remaining(32, Utc::now())
+            .is_none());
+        assert!(registry.dispatch_backoff_issues(Utc::now()).is_empty());
+        assert!(registry
+            .dispatch(&SweepKind::Issue(32), None, None, None, None)
+            .is_ok());
+    }
+
+    /// A run that made real progress clears the window immediately, so a
+    /// recovering issue is never held back by an earlier failure.
+    #[test]
+    fn checkpoint_progress_clears_the_backoff_window() {
+        let dir = tempdir().unwrap();
+        let mut registry = backoff_registry(dir.path(), 60, 900);
+        registry.record_dispatch_failure(33);
+        assert_eq!(registry.dispatch_failure_count(33), 1);
+
+        // A dead run whose checkpoint was (re)written by THIS run = progress.
+        let started_at = Utc::now() - chrono::Duration::seconds(5);
+        insert_dead_running_at(&mut registry, 33, 9, started_at);
+        let checkpoint_dir = registry.config.checkpoint_dir();
+        std::fs::create_dir_all(&checkpoint_dir).unwrap();
+        std::fs::write(checkpoint_dir.join("issue-33.json"), r#"{"phase":"builder-done"}"#)
+            .unwrap();
+        registry.reap_once();
+
+        assert_eq!(registry.dispatch_failure_count(33), 0, "progress clears the streak");
+        assert!(registry
+            .dispatch_backoff_remaining(33, Utc::now())
+            .is_none());
+    }
+
+    /// A **slow** checkpoint-less death does NOT arm the backoff: that shape is
+    /// the mid-build-death (#3895) / review-stall (#3910) watchdogs' remit, each
+    /// already bounded to one retry per issue, and arming a window there would
+    /// risk a refusal burning that single allowed attempt.
+    #[test]
+    fn slow_checkpoint_less_death_does_not_arm_the_backoff() {
+        let dir = tempdir().unwrap();
+        let mut registry = backoff_registry(dir.path(), 60, 900);
+        // `insta_crash_secs` defaults to 60s: start the run well outside it.
+        let started_at = Utc::now() - chrono::Duration::seconds(600);
+        insert_dead_running_at(&mut registry, 36, 0, started_at);
+        registry.reap_once();
+
+        assert_eq!(
+            registry.dispatch_failure_count(36),
+            0,
+            "a slow death is the watchdogs' remit, not the flap breaker's"
+        );
+        assert!(registry
+            .dispatch_backoff_remaining(36, Utc::now())
+            .is_none());
+    }
+
+    /// The mid-build-death watchdog (#3895) recovery must still fire with a
+    /// backoff window armed — the recovery is latched to one attempt per issue,
+    /// so a backoff refusal would silently consume it and strand the sweep.
+    #[test]
+    fn midbuild_recovery_is_not_blocked_by_an_armed_backoff() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let mut reg = backoff_registry(ws, 60, 900);
+
+        make_dirty_git_worktree(ws, 6055);
+        insert_terminal_issue(&mut reg, "sweep-issue-6055-dead", 6055, None);
+        // An earlier fast failure armed a live window for this very issue.
+        reg.record_dispatch_failure(6055);
+        assert!(reg.dispatch_backoff_remaining(6055, Utc::now()).is_some());
+
+        let recovered = reg.midbuild_watchdog_once();
+        assert_eq!(recovered, 1, "the bounded one-shot recovery still re-dispatches");
+        assert!(reg.issue_has_active_sweep(6055));
+        assert_eq!(
+            reg.dispatch_failure_count(6055),
+            0,
+            "the watchdog released the window before dispatching"
+        );
+    }
+
+    /// The operator's `loom-daemon quarantine clear <issue>` releases the
+    /// dispatch-backoff window too — otherwise the command would look like it did
+    /// nothing for up to `max`.
+    #[test]
+    fn clear_quarantine_also_clears_dispatch_backoff() {
+        let dir = tempdir().unwrap();
+        let mut registry = backoff_registry(dir.path(), 60, 900);
+        registry.seed_quarantine_for_test(34);
+        registry.record_dispatch_failure(34);
+
+        assert!(registry.clear_quarantine(34));
+        assert_eq!(registry.dispatch_failure_count(34), 0);
+        assert!(registry
+            .dispatch_backoff_remaining(34, Utc::now())
+            .is_none());
+    }
+
+    /// The reaper-driven resume path (#4256) is exempt: it re-dispatches an
+    /// issue's OWN open PR and is already bounded by `MAX_RESUME_ATTEMPTS`, so the
+    /// backoff must not block it (which would strand a PR at review).
+    #[test]
+    fn reaper_resume_dispatch_bypasses_the_backoff() {
+        let dir = tempdir().unwrap();
+        let mut registry = backoff_registry(dir.path(), 60, 900);
+        registry.record_dispatch_failure(35);
+
+        assert!(
+            registry
+                .dispatch(&SweepKind::Issue(35), None, None, None, None)
+                .is_err(),
+            "an ordinary dispatch is refused"
+        );
+        assert!(
+            registry.dispatch_resume_after_crash(35, 777).is_ok(),
+            "the bounded #4256 resume path is exempt"
+        );
+    }
+
+    /// Flap detection: this registry's own label writes are counted per issue and
+    /// warn once the trailing window holds `DEFAULT_FLAP_THRESHOLD` of them. Below
+    /// the threshold nothing is flagged (a healthy dispatch writes exactly 2).
+    #[test]
+    fn label_flip_flap_detector_flags_only_above_threshold() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _log) = fixture_registry(dir.path());
+
+        for _ in 0..(DEFAULT_FLAP_THRESHOLD - 1) {
+            registry.note_label_flip(4398);
+        }
+        assert!(
+            !registry.flap_warned_at.contains_key(&4398),
+            "below threshold: a normal dispatch/complete rhythm never warns"
+        );
+
+        registry.note_label_flip(4398);
+        assert!(
+            registry.flap_warned_at.contains_key(&4398),
+            "at threshold: the flap is surfaced in the daemon log"
+        );
+        let first_warn = registry.flap_warned_at[&4398];
+
+        // A sustained flap warns at most once per window (no log spam).
+        registry.note_label_flip(4398);
+        assert_eq!(registry.flap_warned_at[&4398], first_warn);
+
+        // Flips outside the trailing window are pruned, so an issue that flipped
+        // long ago does not carry stale credit toward the threshold.
+        let stale = Utc::now() - chrono::Duration::seconds(DEFAULT_FLAP_WINDOW_SECS + 60);
+        registry
+            .label_flip_log
+            .insert(1234, std::iter::repeat_n(stale, DEFAULT_FLAP_THRESHOLD * 2).collect());
+        registry.note_label_flip(1234);
+        assert!(!registry.flap_warned_at.contains_key(&1234), "stale flips are pruned");
+    }
+
+    /// Config resolution honors precedence env > config > default (#4485), and a
+    /// `maxSecs` below `baseSecs` is clamped up rather than inverting the curve.
+    #[test]
+    #[serial]
+    fn resolve_dispatch_backoff_config_env_overrides() {
+        let dir = tempdir().unwrap();
+        for var in [
+            DISPATCH_BACKOFF_ENABLE_ENV,
+            DISPATCH_BACKOFF_BASE_ENV,
+            DISPATCH_BACKOFF_MAX_ENV,
+        ] {
+            std::env::remove_var(var);
+        }
+
+        let base = resolve_dispatch_backoff_config(dir.path());
+        assert!(base.enabled, "defaults ON — it is a safety backstop");
+        assert_eq!(base.base, Duration::from_secs(DEFAULT_DISPATCH_BACKOFF_BASE_SECS));
+        assert_eq!(base.max, Duration::from_secs(DEFAULT_DISPATCH_BACKOFF_MAX_SECS));
+
+        std::env::set_var(DISPATCH_BACKOFF_ENABLE_ENV, "off");
+        std::env::set_var(DISPATCH_BACKOFF_BASE_ENV, "30");
+        std::env::set_var(DISPATCH_BACKOFF_MAX_ENV, "10");
+        let resolved = resolve_dispatch_backoff_config(dir.path());
+        for var in [
+            DISPATCH_BACKOFF_ENABLE_ENV,
+            DISPATCH_BACKOFF_BASE_ENV,
+            DISPATCH_BACKOFF_MAX_ENV,
+        ] {
+            std::env::remove_var(var);
+        }
+        assert!(!resolved.enabled, "LOOM_DISPATCH_BACKOFF=off disables");
+        assert_eq!(resolved.base, Duration::from_secs(30));
+        assert_eq!(resolved.max, Duration::from_secs(30), "max clamped up to base");
+    }
+
+    /// Config-file parsing of `autonomous.workFinder.dispatchBackoff` (#4485),
+    /// including the all-`None` (absent block) case that preserves env/default
+    /// resolution for repos that never configure it.
+    #[test]
+    #[serial]
+    fn read_dispatch_backoff_file_config_parses_block() {
+        for var in [
+            DISPATCH_BACKOFF_ENABLE_ENV,
+            DISPATCH_BACKOFF_BASE_ENV,
+            DISPATCH_BACKOFF_MAX_ENV,
+        ] {
+            std::env::remove_var(var);
+        }
+
+        let dir = tempdir().unwrap();
+        let loom = dir.path().join(".loom");
+        std::fs::create_dir_all(&loom).unwrap();
+        std::fs::write(
+            loom.join("config.json"),
+            r#"{"autonomous":{"workFinder":{"dispatchBackoff":{"enabled":false,"baseSecs":15,"maxSecs":300}}}}"#,
+        )
+        .unwrap();
+
+        let file = read_dispatch_backoff_file_config(dir.path());
+        assert_eq!(file.enabled, Some(false));
+        assert_eq!(file.base_secs, Some(15));
+        assert_eq!(file.max_secs, Some(300));
+
+        let resolved = resolve_dispatch_backoff_config(dir.path());
+        assert!(!resolved.enabled);
+        assert_eq!(resolved.base, Duration::from_secs(15));
+        assert_eq!(resolved.max, Duration::from_secs(300));
+
+        let empty = tempdir().unwrap();
+        let absent = read_dispatch_backoff_file_config(empty.path());
+        assert_eq!(absent, DispatchBackoffFileConfig::default());
+    }
+
+    // ------------------------------------------------------------------------
     // Account-exhaustion attribution at insta-crash time (Issue #4122)
     // ------------------------------------------------------------------------
 
@@ -9320,6 +10804,55 @@ exit 0
         );
         assert_eq!(classify_account_exhaustion("thread 'main' panicked at foo.rs:1"), None);
         assert_eq!(classify_account_exhaustion(""), None);
+    }
+
+    /// Issue #4501: the CLI's PER-MODEL ceiling is an account fault too. Before
+    /// this, a child that insta-crashed on "You've reached your Fable 5 limit"
+    /// matched no signature, so the reaper charged the ISSUE's quarantine tally
+    /// instead of marking the account bad — the daemon-side half of the same
+    /// missed phrasing `classify-error.sh` missed.
+    #[test]
+    fn classify_account_exhaustion_matches_per_model_ceiling() {
+        assert_eq!(
+            classify_account_exhaustion(
+                "You've reached your Fable 5 limit. Run /usage-credits to continue or switch \
+                 models with /model."
+            ),
+            Some("model-limit")
+        );
+        assert_eq!(
+            classify_account_exhaustion("Claude: you have reached your limit"),
+            Some("model-limit")
+        );
+        // A concurrent-session capacity fault (#3947) must NOT be treated as
+        // exhaustion — marking the account bad would shrink the healthy pool.
+        assert_eq!(
+            classify_account_exhaustion("Error: you have reached your concurrent session limit"),
+            None
+        );
+        // An unrelated sentence that merely ends in "limit" is not exhaustion.
+        assert_eq!(
+            classify_account_exhaustion(
+                "reached your goal well before the team agreed on any spending limit"
+            ),
+            None
+        );
+        // Mixed tail: the model-limit line still classifies even when a
+        // concurrency line is also present.
+        assert_eq!(
+            classify_account_exhaustion(
+                "Error: you have reached your concurrent session limit\n\
+                 You've reached your Fable 5 limit. Run /usage-credits to continue."
+            ),
+            Some("model-limit")
+        );
+        // The legacy table still wins its label when both shapes appear.
+        assert_eq!(
+            classify_account_exhaustion(
+                "You've hit your weekly limit\nYou've reached your Fable 5 limit."
+            ),
+            Some("rate-limited")
+        );
     }
 
     /// #4386: `classify_preflight_death` matches the explicit
@@ -12727,26 +14260,75 @@ exit 0\n";
     #[test]
     fn midbuild_decision_no_dirty_worktree_is_healthy() {
         // No dirty worktree ⇒ nothing to recover, regardless of retry state.
-        assert_eq!(midbuild_decision(false, false, false), MidbuildDecision::Healthy);
-        assert_eq!(midbuild_decision(false, false, true), MidbuildDecision::Healthy);
+        assert_eq!(midbuild_decision(false, false, false, false), MidbuildDecision::Healthy);
+        assert_eq!(midbuild_decision(false, false, true, false), MidbuildDecision::Healthy);
     }
 
     #[test]
     fn midbuild_decision_produced_pr_is_healthy() {
         // A dead sweep that produced a PR is a completed Builder, not a
         // mid-build death — never recovered even with a dirty worktree.
-        assert_eq!(midbuild_decision(true, true, false), MidbuildDecision::Healthy);
+        assert_eq!(midbuild_decision(true, true, false, false), MidbuildDecision::Healthy);
     }
 
     #[test]
     fn midbuild_decision_dirty_no_pr_first_time_recovers() {
-        assert_eq!(midbuild_decision(true, false, false), MidbuildDecision::Recover);
+        assert_eq!(midbuild_decision(true, false, false, false), MidbuildDecision::Recover);
     }
 
     #[test]
     fn midbuild_decision_dirty_no_pr_after_retry_gives_up() {
         // Bounded: a second mid-build death gives up (never loops).
-        assert_eq!(midbuild_decision(true, false, true), MidbuildDecision::GiveUp);
+        assert_eq!(midbuild_decision(true, false, true, false), MidbuildDecision::GiveUp);
+    }
+
+    #[test]
+    fn midbuild_decision_in_use_worktree_is_never_recovered() {
+        // #4449: a live holder vetoes the destructive path, and the veto sits
+        // ABOVE the retry bookkeeping — it must win over both Recover and
+        // GiveUp so a refusal never consumes the single recovery retry.
+        assert_eq!(midbuild_decision(true, false, false, true), MidbuildDecision::InUse);
+        assert_eq!(midbuild_decision(true, false, true, true), MidbuildDecision::InUse);
+    }
+
+    #[test]
+    fn midbuild_decision_in_use_is_irrelevant_when_not_dirty_or_pr_exists() {
+        // The in-use flag must not manufacture work: a clean worktree or a
+        // produced PR is still Healthy even while a session holds the worktree.
+        assert_eq!(midbuild_decision(false, false, false, true), MidbuildDecision::Healthy);
+        assert_eq!(midbuild_decision(true, true, false, true), MidbuildDecision::Healthy);
+    }
+
+    // --- #4449 helpers: truncate_lines / describe_worktree_use ---
+
+    #[test]
+    fn truncate_lines_keeps_short_input_and_caps_long_input() {
+        assert_eq!(truncate_lines("", 5), "");
+        assert_eq!(truncate_lines("   \n  ", 5), "");
+        assert_eq!(truncate_lines("a\nb", 5), "a\nb");
+        let long = (1..=10)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let capped = truncate_lines(&long, 3);
+        assert!(capped.starts_with("1\n2\n3"), "keeps the first `max` lines: {capped}");
+        assert!(capped.contains("+7 more"), "reports how many lines were dropped: {capped}");
+    }
+
+    #[test]
+    fn describe_worktree_use_joins_every_signal() {
+        let described = describe_worktree_use(&[
+            WorktreeUseEvidence::InUseMarker {
+                task_id: "t1".into(),
+                pid: "42".into(),
+            },
+            WorktreeUseEvidence::LiveProcesses(vec![7, 9]),
+        ]);
+        assert!(described.contains(".loom-in-use"), "{described}");
+        assert!(described.contains("pid: 42"), "{described}");
+        assert!(described.contains("[7, 9]"), "{described}");
+        assert!(described.contains("; "), "signals are joined: {described}");
+        assert_eq!(describe_worktree_use(&[]), "");
     }
 
     // --- ranking_has_capacity token-health gate ---
@@ -12983,6 +14565,195 @@ exit 0\n";
             !ws.join(".loom/worktrees/issue-6003/dirty.txt").exists(),
             "worktree cleaned on recovery"
         );
+    }
+
+    // --- #4449: the live-use veto on the destructive recovery path -----------
+
+    /// Assert the watchdog refused to touch issue `N`'s dirty worktree: nothing
+    /// recovered, the uncommitted edit still on disk, and — critically — the
+    /// single recovery retry NOT consumed (the worktree may be free later).
+    fn assert_midbuild_refused(reg: &mut SweepRegistry, ws: &Path, issue: u32, why: &str) {
+        assert_eq!(reg.midbuild_watchdog_once(), 0, "no recovery when {why}");
+        assert!(
+            ws.join(format!(".loom/worktrees/issue-{issue}/dirty.txt"))
+                .exists(),
+            "uncommitted work MUST survive when {why} (#4449)"
+        );
+        assert!(
+            !reg.midbuild_retried.contains(&issue),
+            "a refusal must NOT consume the single recovery retry when {why}"
+        );
+        assert!(
+            reg.midbuild_inuse.contains(&issue),
+            "the refusal is recorded (and logged once) when {why}"
+        );
+    }
+
+    #[test]
+    fn midbuild_refuses_to_wipe_worktree_held_by_in_use_marker() {
+        // The #4449 incident shape: the daemon's tracked sweep really did die
+        // (terminal, no PR) but a SEPARATE live session is still using the
+        // worktree. A `.loom-in-use` marker is the explicit form of that signal.
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let (mut reg, _rec) = fixture_registry(ws);
+
+        let wt = make_dirty_git_worktree(ws, 6101);
+        insert_terminal_issue(&mut reg, "sweep-issue-6101-dead", 6101, None);
+        std::fs::write(
+            wt.join(".loom-in-use"),
+            r#"{"shepherd_task_id": "recovery-doctor", "pid": 4321}"#,
+        )
+        .unwrap();
+
+        assert!(!reg.worktree_in_use(6101).is_empty(), "marker is detected as a live holder");
+        assert_midbuild_refused(&mut reg, ws, 6101, "a .loom-in-use marker names a live session");
+
+        // Once the holder releases the worktree, the legitimate dead-sweep
+        // recovery still works — the veto defers, it does not disable.
+        std::fs::remove_file(wt.join(".loom-in-use")).unwrap();
+        assert_eq!(reg.midbuild_watchdog_once(), 1, "recovery resumes once the holder releases");
+        assert!(reg.midbuild_retried.contains(&6101));
+        assert!(!reg.midbuild_inuse.contains(&6101), "the log-once latch is cleared");
+        assert!(!wt.join("dirty.txt").exists(), "worktree cleaned on the real recovery");
+    }
+
+    #[test]
+    fn midbuild_refuses_to_wipe_worktree_with_git_operation_in_flight() {
+        // The precise window #4449 lost work in: a `git commit` was mid-write,
+        // so git held index.lock. Never reset a worktree in that state.
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let (mut reg, _rec) = fixture_registry(ws);
+
+        let wt = make_dirty_git_worktree(ws, 6102);
+        insert_terminal_issue(&mut reg, "sweep-issue-6102-dead", 6102, None);
+        let index_lock =
+            git_index_lock_path(&wt).expect("index.lock path resolves for a real repo");
+        std::fs::write(&index_lock, "").unwrap();
+
+        assert_midbuild_refused(&mut reg, ws, 6102, "a git index.lock write is in flight");
+
+        // Committing finishes (lock released) ⇒ recovery is available again.
+        std::fs::remove_file(&index_lock).unwrap();
+        assert_eq!(reg.midbuild_watchdog_once(), 1, "recovery resumes once index.lock clears");
+    }
+
+    #[test]
+    fn midbuild_refuses_to_wipe_worktree_with_live_claim_lock_owner() {
+        // A claim-lock whose owner PID is ALIVE means some session (daemon or
+        // not) still owns this issue — never reset its worktree underneath it.
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let (mut reg, _rec) = fixture_registry(ws);
+
+        make_dirty_git_worktree(ws, 6103);
+        insert_terminal_issue(&mut reg, "sweep-issue-6103-dead", 6103, None);
+        let lock = reg.config.locks_dir().join("issue-6103");
+        std::fs::create_dir_all(&lock).unwrap();
+        // Our own PID is trivially alive — stands in for the live holder.
+        std::fs::write(
+            lock.join("owner.json"),
+            format!(
+                r#"{{"issue": 6103, "owner_pid": {}, "acquired_at": "{}", "sweep_id": "manual-session"}}"#,
+                std::process::id(),
+                Utc::now().to_rfc3339()
+            ),
+        )
+        .unwrap();
+
+        assert_midbuild_refused(
+            &mut reg,
+            ws,
+            6103,
+            "a live claim-lock owner still holds the issue",
+        );
+    }
+
+    #[test]
+    fn midbuild_ignores_stale_claim_lock_with_dead_owner() {
+        // The inverse guard: the dead sweep's OWN claim-lock, left behind
+        // because the reaper never released it, must not wedge the legitimate
+        // dead-sweep recovery path forever.
+        //
+        // The lock's `sweep_id` is deliberately the dead entry's own id. A lock
+        // naming a *different* sweep is a separate, pre-existing refusal
+        // (`lock_owned_by_other`, #4463: a newer sweep superseded this one) that
+        // fails closed on the id comparison alone and is covered by its own
+        // tests. This test isolates the #4449 live-use veto: a dead owner PID is
+        // not live-use evidence, so recovery proceeds.
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let (mut reg, _rec) = fixture_registry(ws);
+
+        make_dirty_git_worktree(ws, 6104);
+        insert_terminal_issue(&mut reg, "sweep-issue-6104-dead", 6104, None);
+        let lock = reg.config.locks_dir().join("issue-6104");
+        std::fs::create_dir_all(&lock).unwrap();
+        std::fs::write(
+            lock.join("owner.json"),
+            format!(
+                r#"{{"issue": 6104, "owner_pid": 2147483640, "acquired_at": "{}", "sweep_id": "sweep-issue-6104-dead"}}"#,
+                Utc::now().to_rfc3339()
+            ),
+        )
+        .unwrap();
+
+        assert!(
+            reg.worktree_in_use(6104).is_empty(),
+            "a dead owner's lock is not live-use evidence"
+        );
+        assert_eq!(reg.midbuild_watchdog_once(), 1, "a stale lock does not block recovery");
+        assert!(!ws.join(".loom/worktrees/issue-6104/dirty.txt").exists());
+    }
+
+    #[test]
+    fn midbuild_refuses_to_wipe_worktree_with_live_process_cwd_inside() {
+        // The signal that would have saved the #4449 session with no cooperation
+        // from it at all: a live process whose cwd is inside the worktree.
+        // `find_processes_using_directory` degrades to an empty list on hosts
+        // where it cannot probe (no /proc, no lsof), so self-skip there rather
+        // than assert something the host cannot express.
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let (mut reg, _rec) = fixture_registry(ws);
+
+        let wt = make_dirty_git_worktree(ws, 6105);
+        insert_terminal_issue(&mut reg, "sweep-issue-6105-dead", 6105, None);
+
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .current_dir(&wt)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn a live process with cwd inside the worktree");
+
+        // The child's `chdir` happens after `fork`, so poll briefly rather than
+        // read the probe once and race it.
+        let mut detected = Vec::new();
+        for _ in 0..40 {
+            detected = crate::worktree_ops::safety::find_processes_using_directory(&wt);
+            if !detected.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if detected.is_empty() {
+            // Probe unavailable on this host — nothing to assert; don't leak.
+            let _ = child.kill();
+            let _ = child.wait();
+            return;
+        }
+        assert!(
+            detected.contains(&child.id()),
+            "the probe found the spawned holder: {detected:?}"
+        );
+
+        assert_midbuild_refused(&mut reg, ws, 6105, "a live process has its cwd in the worktree");
+
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     #[test]
@@ -13580,29 +15351,45 @@ exit 0\n";
         std::env::remove_var(STARTUP_PROOF_GRACE_ENV);
     }
 
-    // --- closed-issue dispatch guard (Issue #4088, AC6) ---
+    // --- closed-issue dispatch guard (Issue #4088, AC6; widened by #4504) ---
 
-    /// Install a fake `gh` that reports a fixed `issue view` state and records
-    /// every invocation, returning `(registry, gh_log)`. `spawn-claude.sh` is a
-    /// benign echo-and-exit so a dispatch that passes the guard still spawns.
+    /// Render the post-`--jq` payload of the #4504 issue-state probe
+    /// (`gh api repos/{owner}/{repo}/issues/{N} --jq '{state, is_pr: …}'`).
+    /// `is_pr` is REST's structural PR discriminator — present for a pull request
+    /// number in ANY state (open, closed, or merged) and absent for an issue.
+    fn state_probe_json(state: &str, is_pr: bool) -> String {
+        format!("{{\"state\":\"{state}\",\"is_pr\":{is_pr}}}")
+    }
+
+    /// Install a fake `gh` that answers the #4504 issue-state probe
+    /// (`api repos/<owner>/<repo>/issues/<n>`) with a fixed payload and records
+    /// every invocation, returning `(registry, gh_log)`. `repo view` resolves the
+    /// owner/repo (the probe rides `gh api`, which cannot infer it from the
+    /// working directory) so the fixture works with or without `LOOM_REPO` set.
+    /// `spawn-claude.sh` is a benign echo-and-exit so a dispatch that passes the
+    /// guard still spawns.
     fn closed_guard_registry(
         ws: &Path,
-        view_stdout: &str,
-        view_exit: i32,
+        probe_stdout: &str,
+        probe_exit: i32,
     ) -> (SweepRegistry, PathBuf) {
         let gh_log = ws.join("gh-invocations.log");
         let fake_gh = ws.join("fake-gh.sh");
         let script = format!(
             "#!/usr/bin/env bash\n\
              printf '%s\\n' \"$*\" >> \"{log}\"\n\
-             if [[ \"$1\" == \"issue\" && \"$2\" == \"view\" ]]; then\n\
-             printf '%s\\n' \"{state}\"\n\
+             if [[ \"$1\" == \"api\" && \"$2\" == repos/* ]]; then\n\
+             printf '%s\\n' '{state}'\n\
              exit {exit}\n\
+             fi\n\
+             if [[ \"$1\" == \"repo\" && \"$2\" == \"view\" ]]; then\n\
+             printf 'rjwalters/loom\\n'\n\
+             exit 0\n\
              fi\n\
              exit 0\n",
             log = gh_log.display(),
-            state = view_stdout,
-            exit = view_exit,
+            state = probe_stdout,
+            exit = probe_exit,
         );
         std::fs::write(&fake_gh, &script).unwrap();
         let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
@@ -13644,7 +15431,7 @@ exit 0\n";
         let tmp = tempdir().unwrap();
         let ws = tmp.path();
         std::env::remove_var("LOOM_REPO");
-        let (mut reg, gh_log) = closed_guard_registry(ws, "CLOSED", 0);
+        let (mut reg, gh_log) = closed_guard_registry(ws, &state_probe_json("closed", false), 0);
 
         let err = reg
             .dispatch(&SweepKind::Issue(4078), None, None, None, None)
@@ -13655,13 +15442,109 @@ exit 0\n";
         );
 
         let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
-        assert!(calls.contains("issue view 4078"), "the guard probed issue state");
+        assert!(
+            calls.contains("api repos/rjwalters/loom/issues/4078"),
+            "the guard probed issue state over REST; got: {calls:?}"
+        );
         assert!(
             !calls.contains("issue edit"),
             "no label flip on a refused dispatch; got: {calls:?}"
         );
         // No lock was acquired and no entry recorded.
         assert!(running_issue_sweep_id(&reg, 4078).is_none());
+    }
+
+    /// #4504 case (b): a dispatch number that resolves to a **merged** pull
+    /// request is refused. REST reports a merged PR as `state: "closed"` with a
+    /// `pull_request` key, so this case is caught by BOTH legs of the guard —
+    /// the point is that it can no longer reach the `_ => None` fail-open arm the
+    /// way `gh issue view`'s GraphQL `MERGED` state did.
+    #[test]
+    #[serial]
+    fn dispatch_refuses_merged_pr_number_without_flipping_labels() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::remove_var("LOOM_REPO");
+        let (mut reg, gh_log) = closed_guard_registry(ws, &state_probe_json("closed", true), 0);
+
+        let err = reg
+            .dispatch(&SweepKind::Issue(4501), None, None, None, None)
+            .expect_err("a merged PR number must be refused");
+        assert!(
+            err.to_string().contains("pull request"),
+            "error names the PR-number case; got: {err}"
+        );
+
+        let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            calls.contains("api repos/rjwalters/loom/issues/4501"),
+            "the guard probed the number over REST; got: {calls:?}"
+        );
+        assert!(
+            !calls.contains("issue edit"),
+            "no label flip on a refused dispatch; got: {calls:?}"
+        );
+        assert!(running_issue_sweep_id(&reg, 4501).is_none(), "no lock, no entry");
+    }
+
+    /// #4504 case (c), the load-bearing one: a dispatch number that resolves to
+    /// an **open** pull request is refused too. Its `state` is `"open"` — byte
+    /// identical to an open issue's — so only the structural `pull_request`
+    /// discriminator can catch it. A fix that merely appended `"MERGED"` to the
+    /// old state-string match would dispatch this happily.
+    #[test]
+    #[serial]
+    fn dispatch_refuses_open_pr_number_without_flipping_labels() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::remove_var("LOOM_REPO");
+        let (mut reg, gh_log) = closed_guard_registry(ws, &state_probe_json("open", true), 0);
+
+        let err = reg
+            .dispatch(&SweepKind::Issue(4502), None, None, None, None)
+            .expect_err("an open PR number must be refused");
+        assert!(
+            err.to_string().contains("pull request"),
+            "error names the PR-number case; got: {err}"
+        );
+
+        let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            calls.contains("api repos/rjwalters/loom/issues/4502"),
+            "the guard probed the number over REST; got: {calls:?}"
+        );
+        assert!(
+            !calls.contains("issue edit"),
+            "no label flip on a refused dispatch; got: {calls:?}"
+        );
+        assert!(running_issue_sweep_id(&reg, 4502).is_none(), "no lock, no entry");
+    }
+
+    /// #4504 belt-and-suspenders: an Issue-shaped node that reports `MERGED` is
+    /// terminal exactly like `CLOSED` — it must never fall through to the
+    /// fail-open arm (the original #4088 bug).
+    #[test]
+    #[serial]
+    fn dispatch_refuses_merged_state_on_issue_shaped_node() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::remove_var("LOOM_REPO");
+        let (mut reg, gh_log) = closed_guard_registry(ws, &state_probe_json("MERGED", false), 0);
+
+        let err = reg
+            .dispatch(&SweepKind::Issue(4505), None, None, None, None)
+            .expect_err("a MERGED state must be refused like CLOSED");
+        assert!(
+            err.to_string().contains("closed"),
+            "error explains the closed-issue guard; got: {err}"
+        );
+
+        let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            !calls.contains("issue edit"),
+            "no label flip on a refused dispatch; got: {calls:?}"
+        );
+        assert!(running_issue_sweep_id(&reg, 4505).is_none(), "no lock, no entry");
     }
 
     /// AC6 fail-open: a forge lookup error (non-zero `gh`) must NOT wedge
@@ -13672,7 +15555,7 @@ exit 0\n";
         let tmp = tempdir().unwrap();
         let ws = tmp.path();
         std::env::remove_var("LOOM_REPO");
-        // `issue view` exits non-zero ⇒ state unknown ⇒ fail open.
+        // The state probe exits non-zero ⇒ state unknown ⇒ fail open.
         let (mut reg, gh_log) = closed_guard_registry(ws, "", 1);
 
         let out = reg
@@ -13681,7 +15564,10 @@ exit 0\n";
         assert!(wait_until_dead(out.pid, FIXTURE_CHILD_WAIT_MS));
 
         let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
-        assert!(calls.contains("issue view 4079"), "the guard probed issue state");
+        assert!(
+            calls.contains("api repos/rjwalters/loom/issues/4079"),
+            "the guard probed issue state; got: {calls:?}"
+        );
         assert!(
             calls.contains("issue edit 4079"),
             "dispatch proceeded to the label flip after failing open; got: {calls:?}"
@@ -13692,14 +15578,42 @@ exit 0\n";
         }
     }
 
+    /// AC6 fail-open (unparseable): a `gh` that exits 0 but emits output the
+    /// probe cannot parse into `{state, is_pr}` is a genuine lookup failure, not
+    /// a verdict — dispatch must proceed.
+    #[test]
+    #[serial]
+    fn dispatch_fails_open_when_issue_state_output_is_unparseable() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::remove_var("LOOM_REPO");
+        let (mut reg, gh_log) = closed_guard_registry(ws, "not json at all", 0);
+
+        let out = reg
+            .dispatch(&SweepKind::Issue(4080), None, None, None, None)
+            .expect("an unparseable probe answer must not wedge dispatch (fail-open)");
+        assert!(wait_until_dead(out.pid, FIXTURE_CHILD_WAIT_MS));
+
+        let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            calls.contains("issue edit 4080"),
+            "dispatch proceeded to the label flip after failing open; got: {calls:?}"
+        );
+
+        if let Some(id) = running_issue_sweep_id(&reg, 4080) {
+            let _ = reg.cancel(&id, Duration::from_secs(2));
+        }
+    }
+
     // --- open-PR dispatch guard (Issue #4123) ---
 
-    /// Install a fake `gh` for the open-PR guard: `issue view` always reports
-    /// `OPEN` (so the 2.5 closed-issue guard passes and the 2.6 open-PR guard is
-    /// reached), `api graphql` prints `graphql_stdout` (the post-`--jq` open-PR
-    /// numbers, one per line) and exits `graphql_exit`, and `repo view` resolves
-    /// the owner/repo. Every invocation is logged. `spawn-claude.sh` is a benign
-    /// echo-and-exit so a dispatch that passes the guard still spawns.
+    /// Install a fake `gh` for the open-PR guard: the #4504 issue-state probe
+    /// (`api repos/<owner>/<repo>/issues/<n>`) always reports an **open,
+    /// non-PR** node (so the 2.5 closed-issue guard passes and the 2.6 open-PR
+    /// guard is reached), `api graphql` prints `graphql_stdout` (the post-`--jq`
+    /// open-PR numbers, one per line) and exits `graphql_exit`, and `repo view`
+    /// resolves the owner/repo. Every invocation is logged. `spawn-claude.sh` is
+    /// a benign echo-and-exit so a dispatch that passes the guard still spawns.
     fn open_pr_guard_registry(
         ws: &Path,
         graphql_stdout: &str,
@@ -13711,8 +15625,8 @@ exit 0\n";
         let script = format!(
             "#!/usr/bin/env bash\n\
              printf '%s\\n' \"$*\" >> \"{log}\"\n\
-             if [[ \"$1\" == \"issue\" && \"$2\" == \"view\" ]]; then\n\
-             printf 'OPEN\\n'\n\
+             if [[ \"$1\" == \"api\" && \"$2\" == repos/* ]]; then\n\
+             printf '%s\\n' '{state}'\n\
              exit 0\n\
              fi\n\
              if [[ \"$1\" == \"api\" && \"$2\" == \"graphql\" ]]; then\n\
@@ -13725,6 +15639,7 @@ exit 0\n";
              fi\n\
              exit 0\n",
             log = gh_log.display(),
+            state = state_probe_json("open", false),
             gql = graphql_stdout,
             exit = graphql_exit,
         );
@@ -13877,7 +15792,7 @@ exit 0\n";
         let tmp = tempdir().unwrap();
         let ws = tmp.path();
         std::env::remove_var("LOOM_REPO");
-        let (mut reg, gh_log) = closed_guard_registry(ws, "CLOSED", 0);
+        let (mut reg, gh_log) = closed_guard_registry(ws, &state_probe_json("closed", false), 0);
 
         let err = reg
             .dispatch(&SweepKind::Issue(4200), None, None, None, None)
@@ -13897,15 +15812,18 @@ exit 0\n";
 
     /// Install a fake `gh` for the park-label guard (step 2.7):
     ///
-    /// - `issue view --json state` reports `OPEN` (so the 2.5 closed-issue guard
-    ///   passes) and `issue view --json labels` reports whether `loom:blocked` is
-    ///   present (so the reap path's `issue_has_blocked_label` — still used by
+    /// - `issue view --json labels` reports whether `loom:blocked` is present (so
+    ///   the reap path's `issue_has_blocked_label` — still used by
     ///   `restore_label_to_ready` — behaves faithfully);
     /// - `api graphql` prints `graphql_pr` (the post-`--jq` open linked PR
     ///   number, empty for none) so the 2.6 open-PR guard can be steered;
-    /// - `api repos/<owner>/<repo>/issues/<n>` prints `rest_labels`
-    ///   (whitespace-separated label names, one per output line) and exits
-    ///   `rest_exit` — the REST probe the new guard consults;
+    /// - `api repos/<owner>/<repo>/issues/<n> --jq '{state, is_pr: …}'` reports an
+    ///   open, non-PR node so the 2.5 closed-issue guard (#4088/#4504) passes —
+    ///   it now rides the same REST endpoint as the park probe, discriminated by
+    ///   the `--jq` expression;
+    /// - `api repos/<owner>/<repo>/issues/<n> --jq .labels[].name` prints
+    ///   `rest_labels` (whitespace-separated label names, one per output line) and
+    ///   exits `rest_exit` — the REST probe the park guard consults;
     /// - `repo view` resolves the owner/repo.
     ///
     /// Every invocation is logged so a test can assert which probes ran.
@@ -13923,12 +15841,15 @@ exit 0\n";
             "#!/usr/bin/env bash\n\
              printf '%s\\n' \"$*\" >> \"{log}\"\n\
              if [[ \"$1\" == \"issue\" && \"$2\" == \"view\" ]]; then\n\
-             if [[ \"$*\" == *labels* ]]; then printf '%s\\n' \"{blocked}\"; \
-             else printf 'OPEN\\n'; fi\n\
+             printf '%s\\n' \"{blocked}\"\n\
              exit 0\n\
              fi\n\
              if [[ \"$1\" == \"api\" && \"$2\" == \"graphql\" ]]; then\n\
              printf '%s\\n' \"{gql}\"\n\
+             exit 0\n\
+             fi\n\
+             if [[ \"$1\" == \"api\" && \"$2\" == repos/* && \"$*\" == *is_pr* ]]; then\n\
+             printf '%s\\n' '{state}'\n\
              exit 0\n\
              fi\n\
              if [[ \"$1\" == \"api\" && \"$2\" == repos/* ]]; then\n\
@@ -13943,6 +15864,7 @@ exit 0\n";
             log = gh_log.display(),
             blocked = blocked,
             gql = graphql_pr,
+            state = state_probe_json("open", false),
             labels = rest_labels,
             rest_exit = rest_exit,
         );
@@ -13998,7 +15920,7 @@ exit 0\n";
 
         let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
         assert!(
-            calls.contains("api repos/rjwalters/loom/issues/4444"),
+            calls.contains("api repos/rjwalters/loom/issues/4444 --jq .labels[].name"),
             "the guard must probe labels over REST, not GraphQL; got: {calls:?}"
         );
         assert!(
@@ -14049,7 +15971,7 @@ exit 0\n";
 
         let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
         assert!(
-            calls.contains("api repos/rjwalters/loom/issues/4446"),
+            calls.contains("api repos/rjwalters/loom/issues/4446 --jq .labels[].name"),
             "the guard still probed; it just did not refuse; got: {calls:?}"
         );
         assert!(
@@ -14082,7 +16004,7 @@ exit 0\n";
 
         let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
         assert!(
-            calls.contains("api repos/rjwalters/loom/issues/4447"),
+            calls.contains("api repos/rjwalters/loom/issues/4447 --jq .labels[].name"),
             "the guard attempted the REST probe; got: {calls:?}"
         );
         assert!(
@@ -14142,8 +16064,8 @@ exit 0\n";
         );
         let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
         assert!(
-            !calls.contains("api repos/"),
-            "the 2.7 REST probe must not run once 2.6 refuses; got: {calls:?}"
+            !calls.contains(".labels[].name"),
+            "the 2.7 REST label probe must not run once 2.6 refuses; got: {calls:?}"
         );
         std::env::remove_var("LOOM_REPO");
     }
@@ -14209,13 +16131,13 @@ exit 0\n";
         );
         let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
         assert!(
-            calls.contains("api repos/rjwalters/loom/issues/4366"),
+            calls.contains("api repos/rjwalters/loom/issues/4366 --jq .labels[].name"),
             "the resume dispatch went through the central 2.7 REST probe; got: {calls:?}"
         );
         assert_eq!(
             calls
                 .lines()
-                .filter(|l| l.contains("api repos/rjwalters/loom/issues/4366"))
+                .filter(|l| l.contains("api repos/rjwalters/loom/issues/4366 --jq .labels[].name"))
                 .count(),
             1,
             "exactly ONE park-label probe per resume dispatch (deduped with the old \
@@ -14776,7 +16698,7 @@ exit 0\n";
         let tmp = tempdir().unwrap();
         let ws = tmp.path();
         std::env::remove_var("LOOM_REPO");
-        let (mut reg, gh_log) = closed_guard_registry(ws, "OPEN", 0);
+        let (mut reg, gh_log) = closed_guard_registry(ws, &state_probe_json("open", false), 0);
         // `closed_guard_registry` installs the marker by default (so its own
         // AC6 tests reach the closed-issue guard under test there) — remove
         // it here to simulate the #4027 wedge scenario.
@@ -14821,7 +16743,7 @@ exit 0\n";
         let tmp = tempdir().unwrap();
         let ws = tmp.path();
         std::env::remove_var("LOOM_REPO");
-        let (mut reg, gh_log) = closed_guard_registry(ws, "OPEN", 0);
+        let (mut reg, gh_log) = closed_guard_registry(ws, &state_probe_json("open", false), 0);
 
         let out = reg
             .dispatch(&SweepKind::Issue(4223), None, None, None, None)

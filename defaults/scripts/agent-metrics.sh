@@ -28,21 +28,22 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # shellcheck source=lib/locate-daemon-bin.sh
 source "$SCRIPT_DIR/lib/locate-daemon-bin.sh"
-# Source shared loom-tools helper (still used by --model-experiment below)
-source "$SCRIPT_DIR/lib/loom-tools.sh"
+# shellcheck source=lib/script-helper.sh
+source "$SCRIPT_DIR/lib/script-helper.sh"
 
 # --model-experiment (or `sweep-experiment`) routes to the sweep model-cost
 # experiment reader (#3725) rather than the activity-db metrics. It aggregates
 # .loom/stats/sweep-model-stats.jsonl into the per-arm inequality inputs #3718
 # needs; keeping it here puts it next to the existing --by-model cost dimension.
-# This path is untouched by the #4274 native-metrics cutover — sweep_experiment
-# stays a separate Python module out of that family's scope.
+# Issue #4275 (epic #4081 Phase 3 family 5) ported `loom_tools.sweep_experiment`
+# to native `loom-daemon sweep-experiment`, so this branch now execs the daemon
+# subcommand instead of the Python module; the forwarded flags are unchanged.
 if [[ "${1:-}" == "--model-experiment" || "${1:-}" == "sweep-experiment" ]]; then
     shift
-    run_loom_tool "sweep-experiment" "sweep_experiment" harvest "$@"
+    loom_exec_script_helper sweep-experiment harvest "$@"
 fi
 
-REPO_ROOT="$(_find_repo_root "$SCRIPT_DIR" 2>/dev/null || echo "$PWD")"
+REPO_ROOT="$(_lsh_find_repo_root "$SCRIPT_DIR" 2>/dev/null || echo "$PWD")"
 DAEMON_BIN="$(loom_locate_daemon_bin "$REPO_ROOT")"
 
 if [[ -z "$DAEMON_BIN" ]]; then

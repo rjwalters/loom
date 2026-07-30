@@ -444,6 +444,13 @@ pub enum Request {
     ///   nothing to prove supervision *for*). `#[serde(default)]` keeps
     ///   pre-#4343 wire data (`{"type":"DrainAndRestartDaemon","payload":{...}}`
     ///   with no `then_exit` key) parsing as `false` — the original behavior.
+    ///
+    ///   When a drain is **already in progress**, `timeout_secs` and
+    ///   `force_after_timeout` are ignored (the active deadline is pinned) but
+    ///   `then_exit: true` **escalates** the active drain one-way from relaunch
+    ///   to stay-down (Issue #4521); `then_exit: false` never downgrades an
+    ///   active teardown drain. The reply's `then_exit` reports what the active
+    ///   drain will actually do — see [`Response::DaemonDrain`].
     DrainAndRestartDaemon {
         timeout_secs: Option<u64>,
         force_after_timeout: bool,
@@ -622,10 +629,21 @@ pub enum Response {
     /// `in_flight` is the cross-root non-terminal sweep count at request time,
     /// so the operator immediately sees how much work the drain must wait for.
     /// `message` is a human-readable explanation for operator output.
-    /// `then_exit` (Issue #4343) echoes back the request's `then_exit`: `true`
-    /// means the daemon will exit and stay down once drained (never relaunch),
-    /// rather than restart. `#[serde(default)]` keeps pre-#4343 wire data
-    /// parsing (as `false`).
+    /// `then_exit` (Issue #4343) reports the **active** drain's terminal action:
+    /// `true` means the daemon will exit and stay down once drained (never
+    /// relaunch), `false` means it will exit for a supervised relaunch.
+    ///
+    /// It is **not** an echo of the request (Issue #4521). On the
+    /// already-draining path the requested value may differ from the active
+    /// drain's: a `then_exit: true` request escalates an in-progress
+    /// relaunch-drain one-way to stay-down (so the reply is `true`), while a
+    /// `then_exit: false` request against an active teardown drain is *not*
+    /// honored (the reply stays `true`). Clients MUST render "will stop" vs
+    /// "will restart" from this field, never from their own request — a client
+    /// that renders from the request promises a teardown the daemon never
+    /// performs. `#[serde(default)]` keeps pre-#4343 wire data parsing (as
+    /// `false`), which is also how a new client detects version skew against an
+    /// old daemon that silently dropped the request's `then_exit`.
     DaemonDrain {
         accepted: bool,
         supervisor: Option<String>,
@@ -1534,7 +1552,7 @@ pub struct CredentialPreflightReport {
     /// (e.g. `"keyring"`, `"oauth_token"`) reported by `gh auth status`;
     /// `"github-app"` when a GitHub App installation token was minted and
     /// exported as `GH_TOKEN` (#4430 — see
-    /// [`crate::credential_preflight::resolve_with_github_app`]).
+    /// [`crate::credential_preflight::run_with_github_app`]).
     /// `"none"` when nothing resolved; `"unknown"` when the probe itself
     /// failed to run. NEVER a token value.
     pub mechanism: String,
@@ -1699,6 +1717,39 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         repo: Option<String>,
     },
+    /// `sweep.global.runtime_rejected` — a dispatch was **refused** by
+    /// fail-closed runtime admission (issue #4494, epic #4489 Phase 5), before
+    /// any claim lock, forge mutation, account selection, log header, or child
+    /// spawn. `SweepGlobalDispatch` only exists for *admitted* work, so without
+    /// this variant refused work had no event representation at all.
+    ///
+    /// The payload is deliberately the same structured, secret-free shape the
+    /// typed [`RuntimeRejection`] carries over IPC (role / runtime / source /
+    /// unmet capability names / reason) — no token name, account, credential,
+    /// or log path is included, and emitting it introduces **no** claim,
+    /// account, or log side effect (it is a pure event publish).
+    SweepGlobalRuntimeRejected {
+        /// The refused work item (issue or PR set) — there is no `sweep_id`,
+        /// because no sweep was ever created.
+        kind: SweepKind,
+        /// Canonical role/lifecycle the admission decision was made for
+        /// (`sweep-lifecycle` for a full sweep).
+        role: String,
+        /// Runtime that was resolved and then refused.
+        runtime: String,
+        /// Precedence tier that selected `runtime`.
+        runtime_source: RuntimeSource,
+        /// Named capabilities the runtime failed to declare as exactly `"yes"`.
+        /// Empty for config/adapter/manifest-shaped refusals.
+        #[serde(default)]
+        unmet_capabilities: Vec<String>,
+        /// Operator-facing rejection reason (the [`RuntimeRejection`] reason).
+        reason: String,
+        /// Owning managed-workspace root (Issue #3929's pattern). Stamped by
+        /// `SweepRegistry::emit_event` -> [`Self::set_repo_if_absent`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repo: Option<String>,
+    },
     /// `sweep.global.completed` — daemon reaper recorded sweep completion.
     SweepGlobalCompleted {
         sweep_id: SweepId,
@@ -1798,6 +1849,7 @@ impl Event {
     /// | `SweepCrashed {issue, ..}` | `sweep.issue.{issue}.crashed` |
     /// | `SweepResumeDispatched {issue, ..}` | `sweep.issue.{issue}.resume_dispatched` |
     /// | `SweepGlobalDispatch {..}` | `sweep.global.dispatch` |
+    /// | `SweepGlobalRuntimeRejected {..}` | `sweep.global.runtime_rejected` |
     /// | `SweepGlobalCompleted {..}` | `sweep.global.completed` |
     /// | `EpicAction {epic, action, ..}` | `epic.issue.{epic}.{action}` |
     /// | `CapacityAdvisory {..}` | `daemon.capacity.advisory` |
@@ -1822,6 +1874,7 @@ impl Event {
                 format!("sweep.issue.{issue}.resume_dispatched")
             }
             Self::SweepGlobalDispatch { .. } => "sweep.global.dispatch".to_string(),
+            Self::SweepGlobalRuntimeRejected { .. } => "sweep.global.runtime_rejected".to_string(),
             Self::SweepGlobalCompleted { .. } => "sweep.global.completed".to_string(),
             Self::EpicAction { epic, action, .. } => {
                 format!("epic.issue.{epic}.{}", action.as_str())
@@ -1853,7 +1906,8 @@ impl Event {
             | Self::SweepExited { repo, .. }
             | Self::SweepCrashed { repo, .. }
             | Self::SweepResumeDispatched { repo, .. }
-            | Self::SweepGlobalDispatch { repo, .. } => repo,
+            | Self::SweepGlobalDispatch { repo, .. }
+            | Self::SweepGlobalRuntimeRejected { repo, .. } => repo,
             _ => return,
         };
         if slot.is_none() {

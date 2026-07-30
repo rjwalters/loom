@@ -265,11 +265,19 @@ mod tests {
     // ===================================================================
 
     #[test]
+    #[serial]
     fn test_worktree_root_free_gb_returns_a_value() {
         // Integration smoke: the repo root's volume has some free space, so a
         // real `df -Pk` should parse to a value. We only assert it doesn't panic
         // and returns a plausible (non-astronomical) integer — the exact GB is
         // environment-dependent.
+        //
+        // `#[serial]` is load-bearing (#4525): the sibling tests below prepend a
+        // stub-`df` dir to the process-global `PATH`, and cargo's default
+        // multi-threaded runner would otherwise schedule this real-`df` probe
+        // inside that window — the stub always exits 1, so the probe returns
+        // `None` and the `.expect(...)` panics. Sharing the serial lock with
+        // those PATH mutators closes the race.
         let tmp = tempfile::tempdir().unwrap();
         let free = worktree_root_free_gb(tmp.path())
             .expect("a real df -Pk against a real tempdir should succeed in the test env");

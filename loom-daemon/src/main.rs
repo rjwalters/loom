@@ -17,6 +17,7 @@ use loom_daemon::quarantine_reconciliation;
 use loom_daemon::rate_limit_breaker;
 use loom_daemon::role_runner;
 use loom_daemon::role_validation;
+use loom_daemon::script_helpers;
 use loom_daemon::self_update;
 use loom_daemon::serve;
 use loom_daemon::sweep_registry::{self, SweepRegistry, SweepRegistryConfig};
@@ -589,6 +590,153 @@ enum Commands {
         action: ForgeAction,
     },
 
+    // ---------------------------------------------------------------------
+    // Script helpers (epic #4081 Phase 3 family 5, issue #4275) — native
+    // replacements for the `loom_tools` modules that existed only to back a
+    // thin `defaults/scripts/*.sh` entry point. Flags, stdout shapes and exit
+    // codes are unchanged from the Python CLIs they replace, so a zero-pip
+    // consumer workspace behaves identically.
+    // ---------------------------------------------------------------------
+    /// Strip ANSI escapes and Claude Code TUI noise from terminal output
+    /// (native port of `loom_tools.log_filter`, #4275). Backs
+    /// `defaults/scripts/strip-ansi.sh`.
+    ///
+    /// With no arguments this is the real-time stdin→stdout `tmux pipe-pane`
+    /// filter (dedup + noise suppression); `--file` deep-cleans a captured
+    /// agent log to stdout.
+    StripAnsi {
+        /// Post-process a captured log file instead of filtering stdin.
+        #[arg(long, value_name = "PATH")]
+        file: Option<String>,
+    },
+
+    /// Resolve a logical model tier/alias to the concrete model ID to dispatch
+    /// on the wire (issue #3982; native port of `loom_tools.model_tiers`,
+    /// #4275). Backs `resolve-model.sh` and `resolve-tier-model.sh`.
+    ///
+    /// Unknown aliases and pinned IDs pass through unchanged and the
+    /// `model@effort` grammar is preserved. `--config` is an **explicit
+    /// bypass**: it reads exactly that file and skips all config tiering
+    /// (#4060); only the default path routes through the config resolver.
+    /// Resolution never fails — outside a Loom repo the config is simply empty
+    /// and the shipped default map applies.
+    ///
+    /// Exit codes: `0` resolved, `2` usage error, `3` no mapping (both `--tier`
+    /// and `--task-alias`) so the caller falls through to its own precedence
+    /// chain.
+    ResolveModel {
+        /// A logical tier/alias (`opus`, `sonnet`, `sonnet@xhigh`) or a pinned
+        /// model ID.
+        #[arg(value_name = "MODEL")]
+        model: Option<String>,
+
+        /// Path to a `.loom/config.json` to read verbatim (default: resolve
+        /// the `./.loom` config tier chain).
+        #[arg(long, value_name = "PATH")]
+        config: Option<String>,
+
+        /// Print the resolved generation number instead of the model ID.
+        #[arg(long)]
+        generation: bool,
+
+        /// Map the model back to the nearest value the in-session Task/Agent
+        /// tool's `model` enum accepts (`haiku|sonnet|opus|fable`) — issue
+        /// #4282. Exits 3 with no output when there is no Task-passable alias,
+        /// so the caller omits `model` entirely.
+        #[arg(long = "task-alias")]
+        task_alias: bool,
+
+        /// Complexity-tier mode (issue #4238): resolve
+        /// `sweep.tierModels[<runtime>][<tier>]`, falling back to the
+        /// `sweep.optimization` preset, instead of a bare alias.
+        #[arg(long, value_name = "TIER")]
+        tier: Option<String>,
+
+        /// Worker runtime for `--tier` resolution.
+        #[arg(long, default_value = "claude")]
+        runtime: String,
+    },
+
+    /// Query Claude API usage via the Anthropic OAuth API (native port of
+    /// `loom_tools.common.usage`, #4275). Backs `check-usage.sh`.
+    ///
+    /// Exits 1 when the payload carries an `error` key (no Keychain token, API
+    /// failure, or not inside a Loom repo) — the historical contract.
+    Usage {
+        /// Print a human-readable status block instead of JSON.
+        #[arg(long)]
+        status: bool,
+    },
+
+    /// Manage builder checkpoints for progress tracking (native port of
+    /// `loom_tools.checkpoints`, #4275). Backs `checkpoint.sh`.
+    Checkpoint {
+        #[command(subcommand)]
+        action: CheckpointAction,
+    },
+
+    /// Atomic file-based issue claiming for parallel agent orchestration
+    /// (native port of `loom_tools.claim`, #4275). Backs `claim.sh`.
+    ///
+    /// Exit codes: `0` success, `1` already claimed / general error, `2`
+    /// invalid arguments, `3` claim not found, `4` agent-ID mismatch.
+    Claim {
+        /// One of: `claim`, `extend`, `release`, `check`, `list`, `cleanup`.
+        #[arg(value_name = "COMMAND")]
+        command: Option<String>,
+
+        /// Positional command arguments (issue number, agent id, ttl).
+        #[arg(value_name = "ARGS", trailing_var_arg = true)]
+        args: Vec<String>,
+    },
+
+    /// Model-cost experiment instrumentation for `/loom:sweep` (issue #3725;
+    /// native port of `loom_tools.sweep_experiment`, #4275). Backs
+    /// `sweep-experiment.sh`.
+    SweepExperiment {
+        #[command(subcommand)]
+        action: SweepExperimentAction,
+    },
+
+    /// Validate a sweep phase contract and attempt mechanical recovery (native
+    /// port of `loom_tools.validate_phase`, #4275). Backs `validate-phase.sh`.
+    ///
+    /// Exit codes: `0` contract satisfied (initially or after recovery), `1`
+    /// contract failed, `2` invalid arguments.
+    ValidatePhase {
+        /// `curator` | `builder` | `judge` | `doctor`.
+        #[arg(value_name = "PHASE")]
+        phase: String,
+
+        #[arg(value_name = "ISSUE")]
+        issue: i64,
+
+        /// Worktree path (required for builder recovery).
+        #[arg(long, value_name = "PATH")]
+        worktree: Option<String>,
+
+        /// PR number (for judge/doctor, and a cached hint for builder).
+        #[arg(long = "pr", value_name = "N")]
+        pr_number: Option<i64>,
+
+        /// Sweep task ID for milestone reporting.
+        #[arg(long = "task-id", value_name = "ID")]
+        task_id: Option<String>,
+
+        /// Emit the result as JSON.
+        #[arg(long)]
+        json: bool,
+
+        /// Only check contract status; skip all side effects.
+        #[arg(long = "check-only")]
+        check_only: bool,
+
+        /// Attempt recovery but suppress diagnostic comments and label changes
+        /// on failure (issue #2609 — used by retry loops).
+        #[arg(long)]
+        quiet: bool,
+    },
+
     /// Validate role configuration completeness
     Validate {
         /// Workspace directory containing .loom/config.json
@@ -606,6 +754,188 @@ enum Commands {
         /// Show verbose output including configured roles
         #[arg(long, short)]
         verbose: bool,
+    },
+}
+
+/// Sub-actions for `loom-daemon checkpoint` (issue #4275).
+#[derive(Subcommand)]
+enum CheckpointAction {
+    /// Write a checkpoint to a worktree.
+    Write {
+        /// Worktree directory (default: the current directory).
+        #[arg(long, short = 'w', value_name = "PATH")]
+        worktree: Option<String>,
+
+        /// One of: planning, implementing, tested, committed, pushed, pr_created.
+        #[arg(long, short = 's', value_name = "STAGE")]
+        stage: String,
+
+        #[arg(long, short = 'i', value_name = "N")]
+        issue: Option<i64>,
+
+        #[arg(long = "files-changed", value_name = "N")]
+        files_changed: Option<i64>,
+
+        #[arg(long = "test-command", value_name = "CMD")]
+        test_command: Option<String>,
+
+        /// `pass` or `fail`.
+        #[arg(long = "test-result", value_name = "RESULT")]
+        test_result: Option<String>,
+
+        #[arg(long = "test-output-summary", value_name = "TEXT")]
+        test_output_summary: Option<String>,
+
+        #[arg(long = "commit-sha", value_name = "SHA")]
+        commit_sha: Option<String>,
+
+        #[arg(long = "pr-number", value_name = "N")]
+        pr_number: Option<i64>,
+
+        #[arg(long, short = 'q')]
+        quiet: bool,
+    },
+
+    /// Read the checkpoint from a worktree.
+    Read {
+        #[arg(long, short = 'w', value_name = "PATH")]
+        worktree: Option<String>,
+
+        #[arg(long, short = 'j')]
+        json: bool,
+    },
+
+    /// Clear the checkpoint in a worktree.
+    Clear {
+        #[arg(long, short = 'w', value_name = "PATH")]
+        worktree: Option<String>,
+
+        #[arg(long, short = 'q')]
+        quiet: bool,
+    },
+
+    /// List the valid checkpoint stages and their recovery paths.
+    Stages {
+        #[arg(long, short = 'j')]
+        json: bool,
+    },
+}
+
+/// Sub-actions for `loom-daemon sweep-experiment` (issue #4275).
+// `Record` carries the full outcome-chain field set, so it is much larger
+// than the other variants; boxing it would only add an allocation to a
+// once-per-invocation CLI parse.
+#[allow(clippy::large_enum_variant)]
+#[derive(Subcommand)]
+enum SweepExperimentAction {
+    /// Print the effective tri-state mode (after the canary guardrail).
+    ResolveMode {
+        #[arg(long, value_name = "PATH")]
+        config: Option<String>,
+    },
+
+    /// Print the deterministic per-issue arm + forced model.
+    AssignArm {
+        #[arg(long, value_name = "N")]
+        issue: i64,
+
+        #[arg(long, value_name = "TIER")]
+        complexity: Option<String>,
+
+        #[arg(long, default_value = "text", value_parser = ["text", "json"])]
+        format: String,
+
+        /// Print the concrete model ID the arm's alias resolves to (#3982)
+        /// instead of the bare alias.
+        #[arg(long)]
+        resolve: bool,
+
+        #[arg(long, value_name = "PATH")]
+        config: Option<String>,
+    },
+
+    /// Print the loud startup banner naming mode + arm.
+    Banner {
+        #[arg(long, value_name = "N")]
+        issue: i64,
+
+        #[arg(long, value_name = "TIER")]
+        complexity: Option<String>,
+
+        #[arg(long, value_name = "PATH")]
+        config: Option<String>,
+    },
+
+    /// Append one JSONL outcome-chain record.
+    Record {
+        #[arg(long, value_name = "N")]
+        issue: i64,
+
+        #[arg(long)]
+        phase: String,
+
+        #[arg(long)]
+        role: String,
+
+        #[arg(long)]
+        model: Option<String>,
+
+        #[arg(long, default_value = "observe")]
+        mode: String,
+
+        #[arg(long)]
+        arm: Option<String>,
+
+        #[arg(long, default_value_t = 1)]
+        attempt: i64,
+
+        #[arg(long)]
+        complexity: Option<String>,
+
+        #[arg(long)]
+        verdict: Option<String>,
+
+        #[arg(long = "cycle-count", default_value_t = 0)]
+        cycle_count: i64,
+
+        #[arg(long)]
+        pr: Option<i64>,
+
+        #[arg(long)]
+        effort: Option<String>,
+
+        #[arg(long = "agent-id")]
+        agent_id: Option<String>,
+
+        #[arg(long)]
+        transcript: Option<String>,
+
+        #[arg(long = "in-tok")]
+        in_tok: Option<i64>,
+
+        #[arg(long = "out-tok")]
+        out_tok: Option<i64>,
+
+        #[arg(long = "token-fidelity", default_value = "none")]
+        token_fidelity: String,
+
+        #[arg(long = "stats-file")]
+        stats_file: Option<String>,
+
+        #[arg(long)]
+        quiet: bool,
+    },
+
+    /// Aggregate the stats store into the per-arm #3718 inequality inputs.
+    Harvest {
+        #[arg(long = "stats-file")]
+        stats_file: Option<String>,
+
+        #[arg(long = "archive-dir")]
+        archive_dir: Option<String>,
+
+        #[arg(long, default_value = "text", value_parser = ["text", "json"])]
+        format: String,
     },
 }
 
@@ -1304,6 +1634,63 @@ enum CleanupAction {
     },
 }
 
+/// Decide whether a freshly minted/cached `GH_TOKEN` value warrants a
+/// `std::env::set_var` write, given the value currently exported in the process
+/// environment (#4456).
+///
+/// The `github-app` refresh tick fires every `GITHUB_APP_REFRESH_INTERVAL`
+/// (~5min), but the shell helper only re-mints when the cached token is close
+/// to expiry (~hourly). A cache hit still reports [`GithubAppOutcome::Minted`]
+/// with the *unchanged* token, so writing unconditionally rewrites `GH_TOKEN`
+/// ~10 of every ~11 ticks with an identical value. Each redundant `set_var`
+/// under the multithreaded tokio runtime opens a (tiny) `environ`
+/// use-after-free window against the `gh`/`git` children the daemon constantly
+/// spawns, for no benefit.
+///
+/// Returns `true` only when the minted value actually differs from `current`
+/// (including the case where nothing is exported yet, `current == None`). This
+/// is a pure seam so the guard can be unit-tested without mutating the
+/// process-global environment (which would add to the test-race hazard tracked
+/// by #4385).
+fn gh_token_needs_update(current: Option<&str>, minted: &str) -> bool {
+    current != Some(minted)
+}
+
+#[cfg(test)]
+mod gh_token_guard_tests {
+    //! Tests for the #4456 value-changed guard on the `github-app` refresh
+    //! tick. Deliberately a *pure* function test — it does not touch the
+    //! process-global `GH_TOKEN`, so it neither races nor adds to the
+    //! test-env-mutation hazard tracked by #4385.
+    use super::gh_token_needs_update;
+
+    #[test]
+    fn cache_hit_same_value_skips_write() {
+        // The ~10-of-11 common case: the shell helper returned the unchanged
+        // cached token, so no `set_var` is warranted.
+        assert!(!gh_token_needs_update(Some("ghs_abc"), "ghs_abc"));
+    }
+
+    #[test]
+    fn genuine_rotation_writes() {
+        // A real ~hourly rotation: the minted value differs -> write.
+        assert!(gh_token_needs_update(Some("ghs_old"), "ghs_new"));
+    }
+
+    #[test]
+    fn unset_env_writes() {
+        // Nothing exported yet (Err(VarError) -> None): treat as different so
+        // the first post-boot tick still exports the token.
+        assert!(gh_token_needs_update(None, "ghs_first"));
+    }
+
+    #[test]
+    fn empty_current_differs_from_nonempty() {
+        // An empty exported value is not equal to a real minted token.
+        assert!(gh_token_needs_update(Some(""), "ghs_real"));
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -1540,25 +1927,75 @@ async fn main() -> Result<()> {
             minted_gh_token: None,
         },
     };
+    // #4458: deliver the minted installation token via a daemon-owned
+    // `GH_CONFIG_DIR` (`credential_preflight::publish_github_app_token`)
+    // instead of exporting it as this process's `GH_TOKEN`. Every `gh` child
+    // this daemon spawns (`Command::new("gh")` without `env_clear`, ~76
+    // call sites — see the issue body's census) re-reads
+    // `$GH_CONFIG_DIR/hosts.yml` fresh on each invocation, so the refresh
+    // tick below becomes a pure file rewrite with **zero** recurring
+    // `std::env::set_var` calls — the UB race (concurrent `setenv` vs. the
+    // `environ` reads inside every concurrently spawned `Command`) this issue
+    // eliminates. `github_app_gh_config_dir_active` tracks whether the
+    // one-time env activation below has happened yet, so it fires **at most
+    // once** for the life of the process (see the tick closure further down
+    // for the rare case where activation happens there instead of here).
+    //
+    // The one remaining `std::env::set_var` (`GH_CONFIG_DIR` itself, plus the
+    // paired `remove_var` calls) is that single activation: it runs here,
+    // before the refresh-tick task (or any other tokio task that spawns
+    // `gh`/`git`) has been created, so there is no concurrent `Command::spawn`
+    // in this process yet to race the `environ` write — the residual window
+    // this issue's acceptance criteria allow a startup site to keep, given a
+    // comment naming the race and the rationale for accepting it. Clearing
+    // `GH_TOKEN`/`GITHUB_TOKEN` here (not just setting `GH_CONFIG_DIR`)
+    // matters too: `gh` checks the env vars *before* `GH_CONFIG_DIR`'s
+    // `hosts.yml`, so an operator-exported ambient token would otherwise
+    // silently outrank the just-minted app token — the pre-#4458 code
+    // achieved the same override by unconditionally overwriting `GH_TOKEN`.
+    let github_app_config_dir = credential_preflight::github_app_gh_config_dir(&sweep_workspace);
+    let mut github_app_gh_config_dir_active = false;
     if let Some(token) = &github_app_preflight.minted_gh_token {
-        // NEVER logged: only the fingerprint in `github_app_preflight.report`
-        // is. Exported into this process's own env so every `gh`/`git`
-        // child spawned from here on (Command::new without env_clear)
-        // inherits it.
-        std::env::set_var("GH_TOKEN", token);
+        match credential_preflight::publish_github_app_token(&github_app_config_dir, token) {
+            Ok(()) => {
+                std::env::remove_var("GH_TOKEN");
+                std::env::remove_var("GITHUB_TOKEN");
+                std::env::set_var("GH_CONFIG_DIR", &github_app_config_dir);
+                github_app_gh_config_dir_active = true;
+            }
+            Err(e) => {
+                // Fail open, matching the mint-failure posture elsewhere in
+                // this preflight: never block startup, never leave the
+                // daemon worse off than the pre-#4430 ambient path.
+                log::warn!(
+                    "credential_preflight: failed to publish github-app token to {} ({e}); \
+                     falling back to ambient gh auth — #4458",
+                    github_app_config_dir.display()
+                );
+            }
+        }
     }
     let credential_preflight = github_app_preflight.report;
 
     // #4430: keep the minted installation token fresh across its ~1h
-    // lifetime for a long-running daemon. A no-op tick (unconfigured, or the
-    // shell helper's own cache still has >10min left) costs a handful of
-    // cheap subprocess execs and never touches `GH_TOKEN`; a genuine mint
-    // failure is logged and the loop keeps whatever `GH_TOKEN` the process
-    // already has (fail-open, matching the startup preflight's posture).
+    // lifetime for a long-running daemon. Ticks that don't rotate the token
+    // never *write* anything: the `NotConfigured` arm is a true no-op, and a
+    // cache-hit tick (the shell helper's own cache still has plenty of life —
+    // ~10 of every ~11 ticks) compares against `current_token` (a plain local
+    // captured by this task, never the process env — #4456's original
+    // intent, now trivially true since there is no shared `GH_TOKEN` env var
+    // left to read) and skips the write because the minted value is
+    // unchanged. Only a genuine rotation (value differs) rewrites
+    // `hosts.yml`; a mint failure is logged and the loop keeps whatever
+    // credential `GH_CONFIG_DIR` already has on disk (fail-open, matching the
+    // startup preflight's posture).
     if let (Some(script_path), Some(owner_repo)) = (&github_app_script, &github_app_owner_repo) {
         let script_path = script_path.clone();
         let cwd = sweep_workspace.clone();
         let owner_repo = owner_repo.clone();
+        let config_dir = github_app_config_dir.clone();
+        let mut current_token = github_app_preflight.minted_gh_token.clone();
+        let mut config_dir_active = github_app_gh_config_dir_active;
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(credential_preflight::GITHUB_APP_REFRESH_INTERVAL).await;
@@ -1577,11 +2014,57 @@ async fn main() -> Result<()> {
                         app_id,
                         ..
                     }) => {
-                        std::env::set_var("GH_TOKEN", token);
-                        log::debug!(
-                            "credential_preflight: github-app refresh tick minted a token \
-                             (app {app_id} installation {installation_id}) — #4430"
-                        );
+                        // #4456/#4458: only rewrite when the value actually
+                        // rotated, and do it as a pure file write — no
+                        // `std::env::set_var` anywhere in this arm once
+                        // `config_dir_active` is already true (the common
+                        // case: activation happened at startup above).
+                        if gh_token_needs_update(current_token.as_deref(), &token) {
+                            // Rare edge case: the app becomes configured
+                            // *after* startup (e.g. the shell helper's own
+                            // config appears mid-run) without the daemon
+                            // restarting, so activation didn't happen above.
+                            // This is a second, still-bounded (at most once
+                            // per process) `std::env::set_var` window — the
+                            // recurring, steady-state race this issue targets
+                            // is the one eliminated; this cold-start
+                            // transition is unchanged in kind from the
+                            // pre-#4458 code's own equivalent one-time
+                            // `set_var` in this same arm.
+                            if !config_dir_active {
+                                std::env::remove_var("GH_TOKEN");
+                                std::env::remove_var("GITHUB_TOKEN");
+                                std::env::set_var("GH_CONFIG_DIR", &config_dir);
+                                config_dir_active = true;
+                            }
+                            match credential_preflight::publish_github_app_token(
+                                &config_dir,
+                                &token,
+                            ) {
+                                Ok(()) => {
+                                    current_token = Some(token);
+                                    log::debug!(
+                                        "credential_preflight: github-app refresh tick rotated \
+                                         GH_TOKEN (app {app_id} installation {installation_id}) \
+                                         — #4430"
+                                    );
+                                }
+                                Err(e) => {
+                                    log::warn!(
+                                        "credential_preflight: github-app refresh tick failed to \
+                                         publish token to {} ({e}); GH_CONFIG_DIR left unchanged \
+                                         (app {app_id} installation {installation_id}) — #4458",
+                                        config_dir.display()
+                                    );
+                                }
+                            }
+                        } else {
+                            log::debug!(
+                                "credential_preflight: github-app refresh tick cache hit, \
+                                 GH_TOKEN unchanged (app {app_id} installation {installation_id}) \
+                                 — #4456"
+                            );
+                        }
                     }
                     Ok(credential_preflight::GithubAppOutcome::NotConfigured) => {
                         // Cheap no-op tick -- nothing to refresh.
@@ -1731,6 +2214,23 @@ async fn main() -> Result<()> {
         quarantine_config.insta_crash_secs
     );
 
+    // Per-issue dispatch backoff (#4485): resolve env > config > default for the
+    // default workspace so a failing issue's re-dispatch cadence is bounded even
+    // when its deaths land in a quarantine carve-out (#4122 exhaustion, #4386
+    // pre-flight) and never reach the 3-strike quarantine threshold.
+    let dispatch_backoff_config = sweep_registry::resolve_dispatch_backoff_config(&sweep_workspace);
+    sweep.set_dispatch_backoff_config(dispatch_backoff_config);
+    log::info!(
+        "sweep_registry: per-issue dispatch backoff {} (base={}s, max={}s) (#4485)",
+        if dispatch_backoff_config.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        dispatch_backoff_config.base.as_secs(),
+        dispatch_backoff_config.max.as_secs()
+    );
+
     // Claude-wrapper pre-flight-death workspace tripwire (#4386): resolve
     // env > config > default for the default workspace so a fleet-wide,
     // cross-issue spawn failure (e.g. a stale `.mcp.json`) trips a visible
@@ -1776,8 +2276,11 @@ async fn main() -> Result<()> {
 
     // Optional safehouse fleet-comms narration (#3997): subscribe the shared
     // event bus and narrate sweep-lifecycle transitions into an E2E Matrix room.
-    // Byte-for-byte no-op when `safehouse.enabled` is false/absent.
-    workspace_pool.start_safehouse_narration(&sweep_workspace);
+    // Byte-for-byte no-op when `safehouse.enabled` is false/absent. The activity
+    // DB handle (#4497) is the same `Arc` the IPC server gets, shared so the
+    // public-feed `completion` envelope can carry a best-effort per-issue token
+    // total; the sink only ever reads, on the blocking pool.
+    workspace_pool.start_safehouse_narration(&sweep_workspace, Some(activity_db.clone()));
 
     // Optional cross-host soft-claim coordination (#4028): a dedicated safehouse
     // connection that advertises this daemon's dispatch claims and consumes peer
@@ -2600,6 +3103,56 @@ fn handle_update_gitignore_command(workspace: &str) -> Result<()> {
 #[allow(clippy::too_many_lines)]
 fn handle_cli_command(command: Commands) -> Result<()> {
     match command {
+        // Script helpers (epic #4081 Phase 3 family 5, issue #4275).
+        Commands::StripAnsi { file } => handle_strip_ansi_command(file.as_deref()),
+        Commands::ResolveModel {
+            model,
+            config,
+            generation,
+            task_alias,
+            tier,
+            runtime,
+        } => handle_resolve_model_command(
+            model.as_deref(),
+            config.as_deref(),
+            generation,
+            task_alias,
+            tier.as_deref(),
+            &runtime,
+        ),
+        Commands::Usage { status } => {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            std::process::exit(script_helpers::usage::run(status, &cwd));
+        }
+        Commands::Checkpoint { action } => handle_checkpoint_command(action),
+        Commands::Claim { command, args } => {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            std::process::exit(script_helpers::claim::run(&cwd, command.as_deref(), &args));
+        }
+        Commands::SweepExperiment { action } => handle_sweep_experiment_command(action),
+        Commands::ValidatePhase {
+            phase,
+            issue,
+            worktree,
+            pr_number,
+            task_id,
+            json,
+            check_only,
+            quiet,
+        } => {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let opts = script_helpers::validate_phase::ValidateOpts {
+                phase,
+                issue,
+                worktree,
+                pr_number,
+                task_id,
+                json_output: json,
+                check_only,
+                quiet,
+            };
+            std::process::exit(script_helpers::validate_phase::run(&cwd, &opts));
+        }
         Commands::Validate {
             workspace,
             format,
@@ -3125,7 +3678,14 @@ async fn handle_quarantine_command(action: QuarantineAction) -> Result<()> {
                              dispatch and `loom:issue` has been restored on the forge."
                         );
                     } else {
-                        println!("Issue #{issue} was not quarantined — nothing to clear (no-op).");
+                        // #4485: the clear ALSO releases any per-issue dispatch
+                        // backoff window, which exists independently of
+                        // quarantine — so "not quarantined" is not the same as
+                        // "nothing happened".
+                        println!(
+                            "Issue #{issue} was not quarantined — nothing to clear (no-op). \
+                             Any dispatch-backoff window (#4485) for it was released."
+                        );
                     }
                     Ok(())
                 }
@@ -3244,23 +3804,9 @@ async fn handle_restart_command(
     // `AbortDrain` and expect a `DaemonDrain` reply; the plain restart keeps its
     // #4054 `RestartDaemon` / `DaemonRestart` contract byte-for-byte.
     if abort_drain {
-        return handle_drain_reply(
-            &socket_path,
-            &Request::AbortDrain,
-            "loom-daemon drain aborted",
-            "no drain was in progress",
-        )
-        .await;
+        return handle_drain_reply(&socket_path, &Request::AbortDrain, DrainReplyKind::Abort).await;
     }
     if drain {
-        let (accepted_prefix, refused_prefix) = if then_exit {
-            (
-                "loom-daemon drain-then-exit scheduled (will stop, not restart, once drained)",
-                "loom-daemon did NOT drain",
-            )
-        } else {
-            ("loom-daemon drain scheduled", "loom-daemon did NOT drain")
-        };
         return handle_drain_reply(
             &socket_path,
             &Request::DrainAndRestartDaemon {
@@ -3268,8 +3814,11 @@ async fn handle_restart_command(
                 force_after_timeout,
                 then_exit,
             },
-            accepted_prefix,
-            refused_prefix,
+            // Issue #4521: the outcome line is rendered from the *reply*, not
+            // from this flag — see `handle_drain_reply`.
+            DrainReplyKind::Drain {
+                requested_then_exit: then_exit,
+            },
         )
         .await;
     }
@@ -3310,6 +3859,80 @@ async fn handle_restart_command(
     }
 }
 
+/// Which drain-mode variant [`handle_drain_reply`] is rendering (Issue #4521).
+///
+/// Carries the *requested* `then_exit` only so the reply can be compared against
+/// it and a version-skew warning raised — never so the outcome line can be
+/// rendered from the request.
+#[derive(Debug, Clone, Copy)]
+enum DrainReplyKind {
+    /// `AbortDrain` — no `then_exit` semantics at all.
+    Abort,
+    /// `DrainAndRestartDaemon` with the `--then-exit` flag as requested.
+    Drain { requested_then_exit: bool },
+}
+
+/// Render the accepted-ack prefix for a `DaemonDrain` reply (Issue #4521).
+///
+/// **Load-bearing: derived from `reply_then_exit` (what the daemon says the
+/// active drain will do), never from the requested flag.** The original defect
+/// picked this line from the CLI's own `--then-exit` argument, so both a stale
+/// daemon (which dropped the unknown wire field) and an already-in-progress
+/// relaunch-drain produced a confident "will stop, not restart" promise for a
+/// daemon that then exited 0 and was relaunched by launchd.
+///
+/// Pure so the request/reply divergence cases are unit-testable.
+fn drain_accepted_prefix(kind: DrainReplyKind, reply_then_exit: bool) -> &'static str {
+    match kind {
+        DrainReplyKind::Abort => "loom-daemon drain aborted",
+        DrainReplyKind::Drain { .. } => {
+            if reply_then_exit {
+                "loom-daemon drain-then-exit scheduled (will stop, not restart, once drained)"
+            } else {
+                "loom-daemon drain scheduled (will RESTART once drained)"
+            }
+        }
+    }
+}
+
+/// The loud version-skew / escalation warning to print when the reply's
+/// `then_exit` contradicts what was requested (Issue #4521), or `None` when they
+/// agree (or there is nothing to compare, i.e. `--abort-drain`).
+///
+/// Pure for testability; the caller prints it to stderr.
+fn drain_then_exit_mismatch_warning(
+    kind: DrainReplyKind,
+    reply_then_exit: bool,
+) -> Option<&'static str> {
+    let DrainReplyKind::Drain {
+        requested_then_exit,
+    } = kind
+    else {
+        return None;
+    };
+    if requested_then_exit == reply_then_exit {
+        return None;
+    }
+    if requested_then_exit {
+        Some(
+            "WARNING: --then-exit was requested but the daemon reports it will RESTART when \
+             drained, not stay down.\n\
+             \x20 This host will come back up. Two known causes:\n\
+             \x20   1. Version skew: the running daemon predates the --then-exit support and \
+             silently dropped the flag — roll the daemon onto the current binary and re-issue.\n\
+             \x20   2. A drain was already in progress and could not be escalated.\n\
+             \x20 Verify with `loom-daemon status` before assuming this host is torn down.",
+        )
+    } else {
+        Some(
+            "WARNING: a plain --drain was requested but the daemon reports a then-exit drain is \
+             active — it will STOP and stay down when drained, NOT restart.\n\
+             \x20 then-exit is never downgraded. Use `loom-daemon restart --abort-drain` and \
+             re-issue if a relaunch was intended.",
+        )
+    }
+}
+
 /// Shared reply handler for the drain-mode restart variants (Issue #4090): both
 /// `DrainAndRestartDaemon` and `AbortDrain` answer with a `DaemonDrain` frame.
 /// A refused request (unsupervised host, or abort with no drain in progress)
@@ -3317,9 +3940,12 @@ async fn handle_restart_command(
 async fn handle_drain_reply(
     socket_path: &Path,
     request: &Request,
-    accepted_prefix: &str,
-    refused_prefix: &str,
+    kind: DrainReplyKind,
 ) -> Result<()> {
+    let refused_prefix = match kind {
+        DrainReplyKind::Abort => "no drain was in progress",
+        DrainReplyKind::Drain { .. } => "loom-daemon did NOT drain",
+    };
     match query_daemon(socket_path, request).await {
         Ok(Response::DaemonDrain {
             accepted,
@@ -3334,8 +3960,13 @@ async fn handle_drain_reply(
                 } else {
                     supervisor.as_deref().unwrap_or("unknown").to_string()
                 };
+                let accepted_prefix = drain_accepted_prefix(kind, then_exit);
                 println!("{accepted_prefix} (supervisor: {sup_note}, {in_flight} in-flight).");
                 println!("{message}");
+                if let Some(warning) = drain_then_exit_mismatch_warning(kind, then_exit) {
+                    eprintln!();
+                    eprintln!("{warning}");
+                }
                 Ok(())
             } else {
                 eprintln!("{refused_prefix}: {message}");
@@ -3357,6 +3988,78 @@ async fn handle_drain_reply(
             eprintln!("  ./.loom/scripts/cli/loom-daemon-start.sh");
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod drain_reply_render_tests {
+    //! Issue #4521 AC2: the drain outcome line is rendered from the daemon's
+    //! REPLY, and a request/reply divergence raises a loud warning. The
+    //! divergence cases are exactly the two ways an operator gets lied to:
+    //! version skew (a stale daemon drops the unknown `then_exit` wire field and
+    //! defaults it to `false`) and an already-in-progress drain with a different
+    //! terminal action.
+    use super::{drain_accepted_prefix, drain_then_exit_mismatch_warning, DrainReplyKind};
+
+    const DRAIN_THEN_EXIT: DrainReplyKind = DrainReplyKind::Drain {
+        requested_then_exit: true,
+    };
+    const DRAIN_RELAUNCH: DrainReplyKind = DrainReplyKind::Drain {
+        requested_then_exit: false,
+    };
+
+    #[test]
+    fn prefix_follows_the_reply_not_the_request() {
+        // Requested --then-exit, daemon confirms it: "will stop".
+        assert!(drain_accepted_prefix(DRAIN_THEN_EXIT, true).contains("will stop, not restart"));
+        // Requested --then-exit but the daemon reports a relaunch (stale daemon,
+        // or an un-escalatable active drain): the CLI must NOT promise a stop.
+        let skewed = drain_accepted_prefix(DRAIN_THEN_EXIT, false);
+        assert!(skewed.contains("will RESTART"), "got: {skewed}");
+        assert!(!skewed.contains("will stop"), "got: {skewed}");
+        // Plain drain against an active teardown drain renders the stop wording.
+        assert!(drain_accepted_prefix(DRAIN_RELAUNCH, true).contains("will stop, not restart"));
+        assert!(drain_accepted_prefix(DRAIN_RELAUNCH, false).contains("will RESTART"));
+    }
+
+    #[test]
+    fn abort_prefix_is_unchanged_and_never_warns() {
+        assert_eq!(
+            drain_accepted_prefix(DrainReplyKind::Abort, false),
+            "loom-daemon drain aborted"
+        );
+        assert_eq!(drain_accepted_prefix(DrainReplyKind::Abort, true), "loom-daemon drain aborted");
+        assert!(drain_then_exit_mismatch_warning(DrainReplyKind::Abort, false).is_none());
+        assert!(drain_then_exit_mismatch_warning(DrainReplyKind::Abort, true).is_none());
+    }
+
+    #[test]
+    fn agreement_produces_no_warning() {
+        assert!(drain_then_exit_mismatch_warning(DRAIN_THEN_EXIT, true).is_none());
+        assert!(drain_then_exit_mismatch_warning(DRAIN_RELAUNCH, false).is_none());
+    }
+
+    /// The incident shape: `--then-exit` requested, daemon replies `false`. The
+    /// warning must name the version-skew cause explicitly — that is what a
+    /// deploy operator needs in order to roll the daemon and re-issue rather
+    /// than assume the host is torn down.
+    #[test]
+    fn requested_then_exit_but_reply_says_restart_warns_loudly() {
+        let warning =
+            drain_then_exit_mismatch_warning(DRAIN_THEN_EXIT, false).expect("divergence must warn");
+        assert!(warning.starts_with("WARNING:"));
+        assert!(warning.contains("Version skew"));
+        assert!(warning.contains("RESTART"));
+        assert!(warning.contains("loom-daemon status"));
+    }
+
+    #[test]
+    fn plain_drain_against_active_teardown_warns() {
+        let warning =
+            drain_then_exit_mismatch_warning(DRAIN_RELAUNCH, true).expect("divergence must warn");
+        assert!(warning.starts_with("WARNING:"));
+        assert!(warning.contains("never downgraded"));
+        assert!(warning.contains("--abort-drain"));
     }
 }
 
@@ -3659,6 +4362,15 @@ async fn handle_dispatch_command(
         Ok(Response::StructuredError(err)) => {
             eprintln!("Daemon rejected the dispatch: {}", err.message);
             std::process::exit(1);
+        }
+        // Issue #4494: the typed capability-admission refusal is a REAL client
+        // outcome, not an "unexpected response" — render the structured
+        // role/runtime/source/unmet payload instead of discarding it, and exit
+        // EX_CONFIG(78) so a script can tell a capability mismatch apart from a
+        // daemon error (mirroring check-runtime-capabilities.sh's exit codes).
+        Ok(Response::RuntimeRejected(rejection)) => {
+            eprintln!("{}", rejection.diagnostic());
+            std::process::exit(loom_daemon::runtime_admission::EX_CONFIG);
         }
         Ok(other) => {
             eprintln!("Unexpected response from daemon: {other:?}");
@@ -7205,6 +7917,350 @@ fn handle_calibrate_command(workspace: &str, write: bool, json: bool) -> Result<
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Script-helper CLIs (epic #4081 Phase 3 family 5, issue #4275)
+//
+// Each of these backs one `defaults/scripts/*.sh` entry point whose Python
+// implementation was deleted. The shell stubs exec the daemon binary with the
+// same flags they always accepted, so a zero-pip consumer workspace sees no
+// behavior change.
+// ---------------------------------------------------------------------------
+
+/// `loom-daemon strip-ansi [--file PATH]` — backs `strip-ansi.sh`.
+fn handle_strip_ansi_command(file: Option<&str>) -> Result<()> {
+    use script_helpers::log_filter;
+
+    if let Some(path) = file {
+        print!("{}", log_filter::clean_file(Path::new(path)));
+        return Ok(());
+    }
+    let stdin = std::io::stdin();
+    let mut stdout = std::io::stdout();
+    // A broken downstream pipe is the normal way a pipe-pane filter ends; the
+    // Python swallowed BrokenPipeError, so do the same rather than surfacing a
+    // crash in every agent log.
+    match log_filter::filter_stream(stdin.lock(), &mut stdout) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// `loom-daemon resolve-model` — backs `resolve-model.sh` / `resolve-tier-model.sh`.
+///
+/// Exit codes mirror the retired Python CLI exactly: `0` on success, `2` when
+/// neither a model nor `--tier` was supplied, and `3` with NO output when
+/// `--tier` / `--task-alias` has no mapping so the caller keeps its own
+/// precedence chain.
+fn handle_resolve_model_command(
+    model: Option<&str>,
+    config: Option<&str>,
+    generation: bool,
+    task_alias: bool,
+    tier: Option<&str>,
+    runtime: &str,
+) -> Result<()> {
+    use script_helpers::model_tiers;
+
+    let cfg = model_tiers::load_config(config.map(Path::new));
+
+    // Complexity-tier mode (#4238). Checked before the positional model, which
+    // the Python parser also treated as optional in this mode.
+    if let Some(tier) = tier {
+        let env_override = std::env::var("LOOM_SWEEP_OPTIMIZATION").ok();
+        let resolved =
+            model_tiers::resolve_tier_model(Some(tier), runtime, &cfg, env_override.as_deref());
+        if resolved.is_empty() {
+            std::process::exit(3);
+        }
+        println!("{resolved}");
+        return Ok(());
+    }
+
+    let Some(model) = model else {
+        eprintln!("loom-daemon resolve-model: error: a model argument or --tier is required");
+        std::process::exit(2);
+    };
+
+    // Task-tool degradation mode (#4282).
+    if task_alias {
+        let alias = model_tiers::task_alias_of(model);
+        if alias.is_empty() {
+            std::process::exit(3);
+        }
+        println!("{alias}");
+        return Ok(());
+    }
+
+    if generation {
+        match model_tiers::generation_of(model, &cfg) {
+            Some(g) => println!("{g}"),
+            // The Python printed an empty line for an unrecognized model.
+            None => println!(),
+        }
+    } else {
+        println!("{}", model_tiers::resolve_model(model, &cfg));
+    }
+    Ok(())
+}
+
+/// The worktree a checkpoint command targets: `--worktree` when given, else the
+/// current directory (matching the Python default).
+fn checkpoint_worktree(worktree: Option<&str>) -> PathBuf {
+    worktree.map_or_else(
+        || std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        |w| std::fs::canonicalize(w).unwrap_or_else(|_| PathBuf::from(w)),
+    )
+}
+
+/// `loom-daemon checkpoint <write|read|clear|stages>` — backs `checkpoint.sh`.
+fn handle_checkpoint_command(action: CheckpointAction) -> Result<()> {
+    use script_helpers::checkpoints;
+
+    match action {
+        CheckpointAction::Stages { json } => {
+            if json {
+                println!("{}", checkpoints::stages_value());
+            } else {
+                println!("{}", checkpoints::stages_text());
+            }
+            Ok(())
+        }
+        CheckpointAction::Write {
+            worktree,
+            stage,
+            issue,
+            files_changed,
+            test_command,
+            test_result,
+            test_output_summary,
+            commit_sha,
+            pr_number,
+            quiet,
+        } => {
+            let details = checkpoints::CheckpointDetails {
+                files_changed: files_changed.unwrap_or(0),
+                test_command: test_command.unwrap_or_default(),
+                test_result: test_result.unwrap_or_default(),
+                test_output_summary: test_output_summary.unwrap_or_default(),
+                commit_sha: commit_sha.unwrap_or_default(),
+                pr_number,
+            };
+            let ok = checkpoints::write_checkpoint(
+                &checkpoint_worktree(worktree.as_deref()),
+                &stage,
+                issue.unwrap_or(0),
+                details,
+                quiet,
+            );
+            std::process::exit(i32::from(!ok));
+        }
+        CheckpointAction::Read { worktree, json } => {
+            let path = checkpoint_worktree(worktree.as_deref());
+            match checkpoints::read_checkpoint(&path) {
+                None => {
+                    if json {
+                        println!("{}", serde_json::json!({"checkpoint": null, "exists": false}));
+                    } else {
+                        script_helpers::log_warning(&format!(
+                            "No checkpoint found in {}",
+                            path.display()
+                        ));
+                    }
+                }
+                Some(cp) => {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "checkpoint": cp.to_value(),
+                                "exists": true,
+                                "recommendation": checkpoints::recovery_recommendation(Some(&cp)),
+                            })
+                        );
+                    } else {
+                        println!("{}", checkpoints::read_text(&cp));
+                    }
+                }
+            }
+            Ok(())
+        }
+        CheckpointAction::Clear { worktree, quiet } => {
+            let ok =
+                checkpoints::clear_checkpoint(&checkpoint_worktree(worktree.as_deref()), quiet);
+            std::process::exit(i32::from(!ok));
+        }
+    }
+}
+
+/// `loom-daemon sweep-experiment <subcommand>` — backs `sweep-experiment.sh`.
+#[allow(clippy::too_many_lines)]
+fn handle_sweep_experiment_command(action: SweepExperimentAction) -> Result<()> {
+    use script_helpers::{model_tiers, sweep_experiment as se};
+
+    let env_mode = std::env::var("LOOM_MODEL_EXPERIMENT").ok();
+    let env_canary = std::env::var("LOOM_MODEL_EXPERIMENT_CANARY").ok();
+
+    match action {
+        SweepExperimentAction::ResolveMode { config } => {
+            let cfg = model_tiers::load_config(config.as_deref().map(Path::new));
+            let (mode, warnings) = se::resolve_effective_mode_default(
+                env_mode.as_deref(),
+                env_canary.as_deref(),
+                &cfg,
+                None,
+            );
+            for w in warnings {
+                eprintln!("[sweep-experiment] WARNING: {w}");
+            }
+            println!("{mode}");
+            Ok(())
+        }
+        SweepExperimentAction::AssignArm {
+            issue,
+            complexity,
+            format,
+            resolve,
+            config,
+        } => {
+            let arm = se::assign_arm(issue, complexity.as_deref());
+            // The default prints the logical alias (Arm A -> `opus`), which the
+            // arm identity and the shell test key off. `--resolve` prints the
+            // concrete ID the #3982 tier map resolves that alias to.
+            let model = if resolve {
+                let cfg = model_tiers::load_config(config.as_deref().map(Path::new));
+                se::resolved_arm_model(arm, &cfg)
+            } else {
+                se::arm_model(arm)
+            };
+            if format == "json" {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "issue": issue,
+                        "complexity": se::normalize_complexity(complexity.as_deref()),
+                        "arm": arm,
+                        "model": model,
+                    })
+                );
+            } else {
+                println!("{arm} {model}");
+            }
+            Ok(())
+        }
+        SweepExperimentAction::Banner {
+            issue,
+            complexity,
+            config,
+        } => {
+            let cfg = model_tiers::load_config(config.as_deref().map(Path::new));
+            let (raw_mode, _) = se::resolve_raw_mode(env_mode.as_deref(), &cfg);
+            let (mode, warnings) = se::resolve_effective_mode_default(
+                env_mode.as_deref(),
+                env_canary.as_deref(),
+                &cfg,
+                None,
+            );
+            for w in warnings {
+                eprintln!("[sweep-experiment] WARNING: {w}");
+            }
+            let mut arm: Option<&str> = None;
+            let mut model = String::new();
+            let mut canary_source: Option<String> = None;
+            if mode == "experiment" {
+                let assigned = se::assign_arm(issue, complexity.as_deref());
+                arm = Some(assigned);
+                model = se::arm_model(assigned);
+                let (_ok, source, _w) = se::evaluate_canary_default(env_canary.as_deref(), None);
+                canary_source = source.map(|s| s.label().to_string());
+            } else if raw_mode == "experiment" {
+                // Requested experiment but downgraded to observe — canary
+                // unconfirmed.
+                canary_source = Some("unconfirmed".to_string());
+            }
+            println!(
+                "{}",
+                se::format_banner(
+                    &mode,
+                    issue,
+                    arm,
+                    if model.is_empty() {
+                        None
+                    } else {
+                        Some(model.as_str())
+                    },
+                    canary_source.as_deref(),
+                )
+            );
+            Ok(())
+        }
+        SweepExperimentAction::Record {
+            issue,
+            phase,
+            role,
+            model,
+            mode,
+            arm,
+            attempt,
+            complexity,
+            verdict,
+            cycle_count,
+            pr,
+            effort,
+            agent_id,
+            transcript,
+            in_tok,
+            out_tok,
+            token_fidelity,
+            stats_file,
+            quiet,
+        } => {
+            let record = se::build_record(
+                &se::RecordFields {
+                    issue,
+                    phase: &phase,
+                    role: &role,
+                    model: model.as_deref(),
+                    mode: &mode,
+                    arm: arm.as_deref(),
+                    attempt,
+                    complexity: complexity.as_deref(),
+                    judge_verdict: verdict.as_deref(),
+                    cycle_count,
+                    pr,
+                    effort: effort.as_deref(),
+                    agent_id: agent_id.as_deref(),
+                    transcript: transcript.as_deref(),
+                    in_tok,
+                    out_tok,
+                    token_fidelity: &token_fidelity,
+                },
+                &script_helpers::now_iso(),
+            );
+            se::append_record(&record, stats_file.as_deref())?;
+            if !quiet {
+                println!("{record}");
+            }
+            Ok(())
+        }
+        SweepExperimentAction::Harvest {
+            stats_file,
+            archive_dir,
+            format,
+        } => {
+            let raw = archive_dir.or_else(|| std::env::var("LOOM_TRANSCRIPT_ARCHIVE").ok());
+            let archive = se::normalize_archive_dir(raw.as_deref());
+            let report = se::harvest(stats_file.as_deref(), archive.as_deref());
+            if format == "json" {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("{}", se::format_harvest_text(&report));
+            }
+            Ok(())
+        }
+    }
+}
+
 fn handle_validate_command(
     workspace: &str,
     format: &str,
@@ -7510,6 +8566,66 @@ mod dispatch_tests {
             }
             other => panic!("expected SweepDispatched, got {other:?}"),
         }
+
+        server.await.expect("server task");
+    }
+
+    /// Issue #4494: a fake daemon that refuses the dispatch with the typed
+    /// `RuntimeRejected` response. The native `loom-daemon dispatch` client
+    /// must MODEL that variant — parse it off the wire with its structured
+    /// payload intact and render role/runtime/source/unmet — instead of
+    /// falling into the generic "Unexpected response from daemon" path that
+    /// discarded the whole diagnostic.
+    #[tokio::test]
+    async fn round_trip_parses_runtime_rejected_response_with_structured_payload() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind");
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (reader, mut writer) = stream.into_split();
+            let mut lines = BufReader::new(reader).lines();
+            let _ = lines.next_line().await.expect("read").expect("line");
+            let response =
+                Response::RuntimeRejected(loom_daemon::runtime_admission::RuntimeRejection {
+                    role: "sweep-lifecycle".to_string(),
+                    runtime: "codex".to_string(),
+                    source: loom_daemon::runtime_admission::RuntimeSource::DefaultConfig,
+                    unmet_capabilities: vec!["worktreeIsolation".to_string()],
+                    reason: "unmet capabilities: worktreeIsolation".to_string(),
+                });
+            let json = serde_json::to_string(&response).expect("serialize");
+            writer.write_all(json.as_bytes()).await.expect("write");
+            writer.write_all(b"\n").await.expect("newline");
+            writer.flush().await.expect("flush");
+        });
+
+        let request = build_dispatch_request(4494, None, None, None, None, false);
+        let response = query_daemon_bounded(&socket_path, &request, Duration::from_secs(5))
+            .await
+            .expect("round-trip ok");
+
+        let Response::RuntimeRejected(rejection) = response else {
+            panic!("expected RuntimeRejected, got {response:?}");
+        };
+        assert_eq!(rejection.role, "sweep-lifecycle");
+        assert_eq!(rejection.runtime, "codex");
+        assert_eq!(rejection.unmet_capabilities, vec!["worktreeIsolation"]);
+
+        // The rendered operator diagnostic carries every required field.
+        let diagnostic = rejection.diagnostic();
+        for expected in [
+            "sweep-lifecycle",
+            "codex",
+            "default-config",
+            "worktreeIsolation",
+        ] {
+            assert!(diagnostic.contains(expected), "{diagnostic}");
+        }
+        // ...and the CLI's refusal exit code stays distinguishable from a
+        // generic daemon error (EX_CONFIG, as the shell checker uses).
+        assert_eq!(loom_daemon::runtime_admission::EX_CONFIG, 78);
 
         server.await.expect("server task");
     }

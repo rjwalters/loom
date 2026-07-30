@@ -222,6 +222,11 @@ source "$LOOM_ROOT/scripts/install/provision-hooks.sh"
 # shellcheck source=scripts/install/dogfood-commands.sh
 source "$LOOM_ROOT/scripts/install/dogfood-commands.sh"
 
+# install-metadata.json merge=ours wiring (#4528) — extracted so the test
+# suite can exercise it without running the full installer.
+# shellcheck source=scripts/install/gitattributes.sh
+source "$LOOM_ROOT/scripts/install/gitattributes.sh"
+
 # Check the state of the Loom *source* checkout (the directory that contains
 # this script). We refuse to install from a feature branch, a stale main, or
 # an arbitrary detached HEAD unless the operator explicitly opts in. Detached
@@ -1262,7 +1267,7 @@ fi
 echo ""
 
 # Set up Python tools (loom-tools package)
-# This creates a virtual environment in loom-tools/.venv and installs loom-tokens, loom-claim, etc.
+# This creates a virtual environment in loom-tools/.venv and installs loom-tokens, loom-search, etc.
 info "Setting up Python tools..."
 if [[ -x "$LOOM_ROOT/scripts/install/setup-python-tools.sh" ]]; then
   if "$LOOM_ROOT/scripts/install/setup-python-tools.sh" --loom-root "$LOOM_ROOT"; then
@@ -1274,7 +1279,7 @@ if [[ -x "$LOOM_ROOT/scripts/install/setup-python-tools.sh" ]]; then
   fi
 else
   warning "Python setup script not found"
-  info "Python tools (loom-tokens, loom-claim, etc.) may not be available."
+  info "Python tools (loom-tokens, loom-search) may not be available."
 fi
 
 # Store Loom source repository path for wrapper scripts
@@ -1561,6 +1566,12 @@ cat > .loom/install-metadata.json <<METADATA
 }
 METADATA
 success "Installation metadata recorded ($(echo "$INSTALLED_FILES_JSON" | grep -o '"' | wc -l | awk '{print $1/2}') files tracked)"
+echo ""
+
+# Wire the install-metadata.json merge=ours driver (#4528) so this host's
+# resync commits stop conflicting with other hosts' on `git merge`.
+ensure_install_metadata_merge_driver "$TARGET_PATH"
+success "Configured install-metadata.json merge=ours driver (.gitattributes + local git config)"
 echo ""
 
 # Reconcile install-metadata.json against on-disk state.

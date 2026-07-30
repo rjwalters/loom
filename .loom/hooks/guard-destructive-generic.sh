@@ -1510,6 +1510,34 @@ for pattern in "${ALWAYS_BLOCK_PATTERNS[@]}"; do
 done
 
 # =============================================================================
+# `gh pr/issue comment --body @path` — literal-@ silent data loss (#4523)
+#
+# `gh pr comment`/`gh issue comment --body @path` does NOT expand `@path` to
+# the file's contents the way `-F body=@path` (gh api) or `gh pr edit
+# --body-file path` do — it posts the literal string `@path` as the comment.
+# A real incident (PR #4457) lost an entire Judge changes-requested review
+# this way. The shape is never intentional (see judge.md's/doctor.md's
+# `--body @path` anti-pattern warning), so this is an ungated hard deny, like
+# the GitHub destructive ops above.
+#
+# DELIBERATELY scans the RAW $COMMAND, NOT COMMAND_NO_LITERAL_TEXT. This rule
+# is narrowly anchored — it only inspects the character immediately after the
+# --body/-b flag's opening quote (if any) — so, unlike the broad dangerous-
+# substring scans above, it does not need strip_literal_text()'s quoted-value
+# redaction to avoid false-positiving on prose. Scanning the redacted copy
+# would in fact silently BREAK this rule: strip_literal_text() replaces a
+# quoted value's entire inner text (including a leading `@`) with `X`s, so
+# `gh pr comment 123 --body "@/tmp/x"` would come out of redaction as
+# `--body "XXXXXXXXX"` — no `@` left to match. The unquoted form
+# (`--body @/tmp/x`) is untouched by redaction either way, so a naive
+# implementation that only smoke-tests the unquoted shape can look correct
+# while silently missing the quoted shape actually seen in the field.
+GH_COMMENT_BODY_AT_PATTERN="(^|[;&|[:space:]])gh[[:space:]]+(pr|issue)[[:space:]]+comment[^;&]*(-b|--body)[[:space:]]*=?[[:space:]]*[\"']?@"
+if echo "$COMMAND" | grep -qiE "$GH_COMMENT_BODY_AT_PATTERN"; then
+    deny "BLOCKED: 'gh pr comment'/'gh issue comment --body @path' does NOT expand the file — it posts the literal string '@path' as the comment (lost the PR #4457 review this way). Use --body \"\$(cat <<'EOF' ... EOF)\", -F/--body-file <path>, or 'gh api ... -F body=@<path>' instead." "gh-comment-body-literal-at"
+fi
+
+# =============================================================================
 # COMMENT-STRIPPED WORKING COPY - used ONLY for the ASK-word and SQL DDL/DML
 # matches below, never for the catastrophic ALWAYS_BLOCK scan.
 #

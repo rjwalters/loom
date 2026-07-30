@@ -345,9 +345,11 @@ CLOSED_ISSUE=$2
 
 echo "Checking for issues blocked by #$CLOSED_ISSUE..."
 
-# Find issues with loom:blocked that reference the closed issue
+# Find issues with loom:blocked that reference the closed issue.
+# Tolerant of markdown emphasis/colon between the phrase and #N (e.g.
+# "**Blocked by:** #1 (reason)") — #4508.
 BLOCKED_ISSUES=$(gh issue list --label "loom:blocked" --state open --json number,body \
-  --jq ".[] | select(.body | test(\"(Blocked by|Depends on|Requires) #$CLOSED_ISSUE\"; \"i\")) | .number")
+  --jq ".[] | select(.body | test(\"(Blocked by|Depends on|Requires)[*_:[:space:]]*#$CLOSED_ISSUE\"; \"i\")) | .number")
 
 if [ -z "$BLOCKED_ISSUES" ]; then
   echo "No issues found blocked by #$CLOSED_ISSUE"
@@ -360,8 +362,13 @@ for blocked in $BLOCKED_ISSUES; do
   # Get the issue body to check ALL dependencies
   BLOCKED_BODY=$(gh issue view "$blocked" --json body --jq -r '.body')
 
-  # Extract all referenced dependencies
-  ALL_DEPS=$(echo "$BLOCKED_BODY" | grep -Eo "(Blocked by|Depends on|Requires) #[0-9]+" | grep -Eo "[0-9]+" | sort -u)
+  # Extract all referenced dependencies. Two-stage (#4508): stage 1 selects
+  # lines declaring a dependency phrase, tolerant of markdown emphasis/colon
+  # between the phrase and the first #N (e.g. "**Blocked by:** #1 (x), #3
+  # (y)"); stage 2 extracts every #N on those lines, not just the first — an
+  # empty ALL_DEPS here would silently remove loom:blocked with no
+  # confirmation gate, so under-parsing is the highest-severity failure mode.
+  ALL_DEPS=$(echo "$BLOCKED_BODY" | grep -E "(Blocked by|Depends on|Requires)[*_:[:space:]]*#[0-9]+" | grep -Eo "#[0-9]+" | grep -Eo "[0-9]+" | sort -u)
 
   # Check if ALL dependencies are now closed
   ALL_RESOLVED=true

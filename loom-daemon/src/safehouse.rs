@@ -51,6 +51,7 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc::error::TryRecvError;
 
+use crate::activity::ActivityDb;
 use crate::event_bus::{EventBus, RecvError};
 use crate::peer_claims::{ClaimAd, PeerClaimView};
 use crate::types::{Event, SweepKind};
@@ -64,6 +65,19 @@ const ENABLED_ENV: &str = "LOOM_SAFEHOUSE_ENABLED";
 const SOCKET_ENV: &str = "LOOM_SAFEHOUSE_SOCKET";
 const ROOM_ENV: &str = "LOOM_SAFEHOUSE_ROOM";
 const PERSONA_ENV: &str = "LOOM_SAFEHOUSE_PERSONA";
+
+/// Attention-class room routing (#4225): the signal room id, and the per-repo
+/// firehose map as a `repo=room[,repo=room…]` list. Either one present is enough
+/// to switch the daemon out of single-room mode — see [`RoomMap`].
+const ROOM_SIGNAL_ENV: &str = "LOOM_SAFEHOUSE_ROOM_SIGNAL";
+const ROOMS_BY_REPO_ENV: &str = "LOOM_SAFEHOUSE_ROOMS_BY_REPO";
+
+/// Alias prefix for a lazily-created per-repo firehose room (#4225): the
+/// `vibesql` workspace's firehose is `fleet-vibesql`. Deliberately **not** the
+/// signal room's own name (`loom-fleet`) — the prefix reads as "the fleet's view
+/// of one repo", and the inverted word order keeps the two visually distinct in
+/// an Element room list.
+const REPO_ROOM_ALIAS_PREFIX: &str = "fleet-";
 
 /// Convention for discovering the socket when neither env nor config sets one
 /// (matches safehoused clients, which read `$SAFEHOUSED_SOCKET`).
@@ -133,6 +147,25 @@ const COMPLETION_REQUIRED_KEYS: [&str; 7] = [
 /// then and nothing downstream waits on it.
 const MERGE_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// `gh pr list --json` fields the completion emit point requests.
+/// `number,url,mergedAt` are load-bearing (a missing one degrades the whole
+/// lookup, and with it the completion); `title,additions,deletions` are the
+/// #4497 feed display fields, harvested from the same call and degrading
+/// per-field.
+const MERGED_PR_FIELDS: &str = "number,url,mergedAt,title,additions,deletions";
+
+/// The pre-#4497 field set, retried only when a `gh` too old to know one of the
+/// display fields rejects [`MERGED_PR_FIELDS`] outright — so an older host keeps
+/// publishing completions instead of losing them to a cosmetic field.
+const MERGED_PR_FIELDS_BASE: &str = "number,url,mergedAt";
+
+/// Timeout for the sink-side activity-DB token rollup behind a `completion`
+/// envelope (#4497). The query is a single indexed SQLite aggregate on a local
+/// file, but it contends with the IPC handler's writes for the DB mutex, so it
+/// runs on the blocking pool under this cap; on timeout `tokens` is simply
+/// omitted.
+const TOKEN_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Reconnect backoff floor and ceiling. The floor keeps a burst of events from
 /// hammering an absent peer (one `warn`, not a hot loop); the ceiling caps the
 /// wait so a peer that comes back is picked up promptly.
@@ -143,6 +176,39 @@ const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(60);
 // Config
 // ============================================================================
 
+/// The attention-class room map (#4225): the operator's signal room plus the
+/// per-repo firehose rooms. **`None` on [`SafehouseConfig::rooms`] is the
+/// migration default** and means "single-room mode" — every message goes to
+/// [`SafehouseConfig::room`] exactly as it did before #4225.
+///
+/// A present-but-*empty* map (no `signal`, no `byRepo` entries) is normalized
+/// back to `None` by [`rooms_from_value`] / [`apply_room_env_overrides`]: an
+/// operator who leaves `"rooms": {}` in config gets the unchanged single-room
+/// behavior rather than a routing mode with nothing to route to.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RoomMap {
+    /// The everyone/signal room (`loom-fleet`): operator ↔ fleet conversation,
+    /// every `handoff`, and terminal outcomes (`ack`/`completion`). Low volume,
+    /// notifications on, cross-repo by design. `None` ⇒ fall back to the legacy
+    /// [`SafehouseConfig::room`] (see [`SafehouseConfig::signal_room`]).
+    pub signal: Option<String>,
+    /// Per-repo firehose rooms keyed by the **workspace-root basename** — the
+    /// same narration repo convention #4201 established for `task_id`/body
+    /// prefixes (`/Users/x/GitHub/vibesql` ⇒ `vibesql`). A repo absent from the
+    /// map is created lazily as `fleet-<repo>` on first narration (see
+    /// [`RoomRouter`]). `BTreeMap` for deterministic iteration in tests/logs.
+    pub by_repo: std::collections::BTreeMap<String, String>,
+}
+
+impl RoomMap {
+    /// Whether this map carries no usable routing target at all, in which case
+    /// callers normalize it to `None` (single-room mode).
+    #[must_use]
+    fn is_empty(&self) -> bool {
+        self.signal.is_none() && self.by_repo.is_empty()
+    }
+}
+
 /// Resolved `safehouse` config block. `enabled: false` is the default and a
 /// byte-for-byte no-op.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,7 +218,15 @@ pub struct SafehouseConfig {
     pub socket: Option<PathBuf>,
     /// Room name/id; `None` is valid only when safehoused joined exactly one
     /// room (it then resolves the sole room server-side).
+    ///
+    /// Once [`rooms`](Self::rooms) is present this is only a **fallback** for
+    /// the signal room ([`signal_room`](Self::signal_room)) — and once the bot
+    /// is in several rooms, `null` no longer resolves server-side at all, so
+    /// explicit ids become required (documented migration note, #4225).
     pub room: Option<String>,
+    /// Attention-class room routing (#4225). `None` ⇒ single-room mode (the
+    /// pre-#4225 behavior, byte-identical).
+    pub rooms: Option<RoomMap>,
     /// Persona to authenticate as; must be in safehoused's allowlist.
     pub persona: String,
 }
@@ -163,8 +237,33 @@ impl Default for SafehouseConfig {
             enabled: false,
             socket: None,
             room: None,
+            rooms: None,
             persona: DEFAULT_PERSONA.to_owned(),
         }
+    }
+}
+
+impl SafehouseConfig {
+    /// The room signal-class traffic goes to (#4225): `rooms.signal` when the
+    /// map configures one, else the legacy scalar [`room`](Self::room). In
+    /// single-room mode this **is** `room`, which is what keeps the absent-map
+    /// path byte-identical.
+    ///
+    /// Doubles as the room the peer-claim coordination connection advertises
+    /// into — see [`run_coordination`] for why claim ads deliberately stay on
+    /// the signal room.
+    #[must_use]
+    pub fn signal_room(&self) -> Option<&str> {
+        self.rooms
+            .as_ref()
+            .and_then(|rooms| rooms.signal.as_deref())
+            .or(self.room.as_deref())
+    }
+
+    /// Whether attention-class routing is active (a `rooms` map resolved).
+    #[must_use]
+    pub fn routes_by_attention(&self) -> bool {
+        self.rooms.is_some()
     }
 }
 
@@ -204,7 +303,33 @@ fn config_from_value(block: Option<&Value>) -> SafehouseConfig {
             cfg.persona = persona.to_owned();
         }
     }
+    cfg.rooms = rooms_from_value(block.get("rooms"));
     cfg
+}
+
+/// Parse the `safehouse.rooms` sub-block (#4225). Every malformed shape — a
+/// non-object `rooms`, a non-object `byRepo`, non-string/blank ids — degrades to
+/// "that key was not configured" rather than erroring, and a map with nothing
+/// usable in it normalizes to `None` (single-room mode, unchanged behavior).
+#[must_use]
+fn rooms_from_value(block: Option<&Value>) -> Option<RoomMap> {
+    let rooms = block?.as_object()?;
+    let mut map = RoomMap::default();
+    if let Some(signal) = rooms.get("signal").and_then(Value::as_str) {
+        if !signal.trim().is_empty() {
+            map.signal = Some(signal.trim().to_owned());
+        }
+    }
+    if let Some(by_repo) = rooms.get("byRepo").and_then(Value::as_object) {
+        for (repo, room) in by_repo {
+            let Some(room) = room.as_str() else { continue };
+            let (repo, room) = (repo.trim(), room.trim());
+            if !repo.is_empty() && !room.is_empty() {
+                map.by_repo.insert(repo.to_owned(), room.to_owned());
+            }
+        }
+    }
+    (!map.is_empty()).then_some(map)
 }
 
 /// Apply the env layer on top of a config-resolved [`SafehouseConfig`]. Env
@@ -223,7 +348,52 @@ fn apply_env_overrides(mut cfg: SafehouseConfig) -> SafehouseConfig {
     if let Some(persona) = env_nonempty(PERSONA_ENV) {
         cfg.persona = persona;
     }
+    cfg.rooms = apply_room_env_overrides(cfg.rooms);
     cfg
+}
+
+/// Apply the env layer to the [`RoomMap`] (#4225), preserving **env > config >
+/// default**:
+///
+/// - `LOOM_SAFEHOUSE_ROOM_SIGNAL` overrides `rooms.signal` alone.
+/// - `LOOM_SAFEHOUSE_ROOMS_BY_REPO` (`repo=room,repo=room…`) replaces the
+///   **whole** `byRepo` map rather than merging into it, so an operator can
+///   override a stale committed map from the environment without editing config
+///   (the same wholesale-replacement semantics `LOOM_SAFEHOUSE_WORKER_PERSONAS`
+///   uses for its list).
+/// - Either env var alone is enough to *enable* routing on a config that has no
+///   `rooms` block at all.
+/// - Neither set ⇒ the config-layer map is returned untouched (so the absent-map
+///   single-room default stays byte-identical).
+#[must_use]
+fn apply_room_env_overrides(rooms: Option<RoomMap>) -> Option<RoomMap> {
+    let signal = env_nonempty(ROOM_SIGNAL_ENV);
+    let by_repo = env_nonempty(ROOMS_BY_REPO_ENV).map(|raw| parse_by_repo_env(&raw));
+    if signal.is_none() && by_repo.is_none() {
+        return rooms;
+    }
+    let mut map = rooms.unwrap_or_default();
+    if let Some(signal) = signal {
+        map.signal = Some(signal);
+    }
+    if let Some(by_repo) = by_repo {
+        map.by_repo = by_repo;
+    }
+    (!map.is_empty()).then_some(map)
+}
+
+/// Parse `repo=room,repo=room…` into a [`RoomMap::by_repo`] map. Entries without
+/// a `=`, or with a blank half, are skipped (a malformed env var degrades to the
+/// entries it *can* parse — never a panic, never a hard failure).
+#[must_use]
+fn parse_by_repo_env(raw: &str) -> std::collections::BTreeMap<String, String> {
+    raw.split(',')
+        .filter_map(|pair| {
+            let (repo, room) = pair.split_once('=')?;
+            let (repo, room) = (repo.trim(), room.trim());
+            (!repo.is_empty() && !room.is_empty()).then(|| (repo.to_owned(), room.to_owned()))
+        })
+        .collect()
 }
 
 /// Resolve the socket path at connect time: configured value, else
@@ -448,7 +618,24 @@ pub struct CompletionMeta {
     /// schema revision downstream. Omitted entirely when `None` — the feed
     /// handles absence, and the issue's rule is "omit rather than guess".
     pub issue: Option<u32>,
+    /// Best-effort total (input + output) tokens the activity DB attributes to
+    /// this issue (#4497), for the feed's cost-of-quality-code trend. **Known
+    /// imperfect** — see [`fetch_issue_tokens`] for the attribution caveats
+    /// (issue-number-only, so no repo qualification, and dependent on the
+    /// activity DB having a per-issue rollup at all). Imperfect-but-consistent
+    /// beats absent for trend purposes; a zero/absent rollup still omits the
+    /// key rather than publishing a bogus `0`.
     pub tokens: Option<u64>,
+    /// Merged PR title (#4497) — the feed renders rows as
+    /// `<repo>#<issue>: <title> +A −D`. Trimmed; an empty title is treated as
+    /// absent.
+    pub title: Option<String>,
+    /// Merged PR diff size (#4497), from the same `gh pr list` call that
+    /// verifies the merge. Unlike `tokens`, a real `0` is **meaningful** for a
+    /// merge (a docs-only revert legitimately adds nothing), so zeros are
+    /// published rather than filtered.
+    pub additions: Option<u64>,
+    pub deletions: Option<u64>,
 }
 
 impl CompletionMeta {
@@ -472,6 +659,24 @@ impl CompletionMeta {
         // nothing", so it is omitted rather than published as a real zero.
         if let Some(tokens) = self.tokens.filter(|t| *t > 0) {
             obj.insert("tokens".into(), json!(tokens));
+        }
+        // Display fields (#4497). `title` is trimmed and an empty one is
+        // dropped (an empty string would render as a blank row label); the
+        // counts publish real zeros because `0 additions` is a fact about the
+        // merge, not the "no data" sentinel a `0` token count would be.
+        if let Some(title) = self
+            .title
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+        {
+            obj.insert("title".into(), json!(title));
+        }
+        if let Some(additions) = self.additions {
+            obj.insert("additions".into(), json!(additions));
+        }
+        if let Some(deletions) = self.deletions {
+            obj.insert("deletions".into(), json!(deletions));
         }
         validate_completion_meta(&meta)?;
         Ok(meta)
@@ -550,12 +755,24 @@ pub fn validate_completion_meta(meta: &Value) -> Result<()> {
             get("started_at")
         );
     }
-    // `issue`/`tokens` are optional extension fields; when present they must
-    // still be non-negative integers rather than strings/floats.
-    for key in ["issue", "tokens"] {
+    // `issue`/`tokens`/`additions`/`deletions` are optional extension fields;
+    // when present they must still be non-negative integers rather than
+    // strings/floats.
+    for key in ["issue", "tokens", "additions", "deletions"] {
         if let Some(v) = obj.get(key) {
             if v.as_u64().is_none() {
                 bail!("completion `meta.{key}` must be a non-negative integer, got {v}");
+            }
+        }
+    }
+    // `title` (#4497) is an optional string; a present-but-blank one would
+    // render as an empty row label on the feed, so it is rejected here rather
+    // than published (the builder omits it instead — see `to_meta_value`).
+    if let Some(v) = obj.get("title") {
+        match v.as_str() {
+            Some(s) if !s.trim().is_empty() => {}
+            _ => {
+                bail!("completion `meta.title`, when present, must be a non-empty string, got {v}")
             }
         }
     }
@@ -642,6 +859,235 @@ pub fn build_send_request(env: &Envelope, id: u64, room: Option<&str>) -> Result
         obj.insert("meta".into(), meta.clone());
     }
     Ok(req)
+}
+
+// ============================================================================
+// Attention-class room routing (#4225)
+// ============================================================================
+//
+// One room carrying everything (operator conversation + human-must-act handoffs
+// + the full narration firehose) drowns the signal it exists to deliver: at full
+// concurrency the operator's primary interface takes hundreds of messages a
+// night. #4225 routes by **attention class first, repo second**:
+//
+// | Tier | Room | Carries | Notifications |
+// |---|---|---|---|
+// | 1 | `loom-fleet` (signal) | operator ↔ fleet, every `handoff`, terminal `ack`/`completion` | on |
+// | 2 | `fleet-<repo>` (firehose) | `task` (dispatch/phase) + `chat` (worker chatter) | muted, opened when watching |
+//
+// **Severity routes, never duplicates** — every message resolves to exactly one
+// room. The Matrix Space grouping the rooms is out of scope here (tracked in the
+// safehouse repo).
+
+/// The closed envelope `type` enum as a Rust enum, so the kind → room routing
+/// table ([`EnvelopeKind::attention_class`]) is a **compile-time-exhaustive**
+/// `match` with no wildcard arm: a sixth envelope type cannot be introduced
+/// without the compiler pointing straight at the routing decision, instead of
+/// silently defaulting into the wrong room.
+///
+/// [`KNOWN_TYPES`] remains the wire-level source of truth ([`build_send_request`]
+/// validates against it); the `known_types_and_envelope_kind_stay_in_lockstep`
+/// test pins the two representations together so adding a member to one without
+/// the other fails a test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvelopeKind {
+    Chat,
+    Task,
+    Handoff,
+    Ack,
+    Completion,
+}
+
+impl EnvelopeKind {
+    /// Every member, in [`KNOWN_TYPES`] order.
+    pub const ALL: [Self; 5] = [
+        Self::Chat,
+        Self::Task,
+        Self::Handoff,
+        Self::Ack,
+        Self::Completion,
+    ];
+
+    /// The wire string for this kind.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Chat => "chat",
+            Self::Task => "task",
+            Self::Handoff => "handoff",
+            Self::Ack => "ack",
+            Self::Completion => "completion",
+        }
+    }
+
+    /// Parse a wire `type` string; `None` for anything outside [`KNOWN_TYPES`]
+    /// (which [`build_send_request`] refuses to send anyway).
+    #[must_use]
+    pub fn parse(kind: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|k| k.as_str() == kind)
+    }
+
+    /// **The routing table** (#4225). Exhaustive by construction — no wildcard
+    /// arm — so a future sixth type (e.g. the wave-digest kind #4217 folds into
+    /// this layer, which would slot in as another [`AttentionClass::Signal`] arm)
+    /// fails to compile here rather than defaulting into the wrong room.
+    #[must_use]
+    pub const fn attention_class(self) -> AttentionClass {
+        match self {
+            // Terminal / human-attention outcomes → the signal room.
+            Self::Handoff | Self::Ack | Self::Completion => AttentionClass::Signal,
+            // Dispatch, phase transitions, worker chatter → the repo firehose.
+            Self::Task | Self::Chat => AttentionClass::Firehose,
+        }
+    }
+}
+
+/// Which attention tier a message belongs to (#4225).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttentionClass {
+    /// The everyone/signal room — low volume, notifications on, cross-repo.
+    Signal,
+    /// The per-repo firehose room — muted by default, opened when watching a repo.
+    Firehose,
+}
+
+/// The room `alias` a repo's firehose is created under: `fleet-<repo>` from the
+/// workspace-root basename (#4201's narration repo convention).
+#[must_use]
+fn repo_room_alias(repo: &str) -> String {
+    format!("{REPO_ROOM_ALIAS_PREFIX}{repo}")
+}
+
+/// Where one envelope should be sent, as decided by [`RoomRouter::resolve`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RoomDecision {
+    /// Send with this `room` value verbatim. `None` means "send no `room` key
+    /// and let safehoused resolve its sole joined room" — the pre-#4225
+    /// single-room convenience, which stops resolving once the bot joins several
+    /// rooms (see the migration note in `.loom/docs/safehouse.md`).
+    Send(Option<String>),
+    /// This repo's firehose room is not configured yet: create `alias` first,
+    /// then send there. On any creation failure, send to `fallback` (the signal
+    /// room) instead — narration is never lost and never blocks.
+    Create {
+        /// Workspace-root basename, the [`RoomMap::by_repo`] key.
+        repo: String,
+        /// `fleet-<repo>`, the alias to create.
+        alias: String,
+        /// Degradation target when creation fails.
+        fallback: Option<String>,
+    },
+}
+
+/// Resolves each envelope's room by attention class (#4225), remembering rooms it
+/// lazily created and repos whose creation failed.
+///
+/// Owned by the narration sink ([`run_sink`]) for the daemon's lifetime — the
+/// `created`/`degraded` memory is per-daemon-run, so an operator who fixes room
+/// permissions restarts the daemon (the same restart discipline the rest of this
+/// module's config already has).
+pub struct RoomRouter {
+    /// `None` ⇒ single-room mode: every envelope resolves to `single`.
+    map: Option<RoomMap>,
+    /// The legacy scalar `safehouse.room`.
+    single: Option<String>,
+    /// Repos whose firehose room this run created (repo basename → room id).
+    created: HashMap<String, String>,
+    /// Repos whose firehose room could not be created — routed to the signal
+    /// room from then on, with **one** warning ever (never one per message).
+    degraded: std::collections::HashSet<String>,
+}
+
+impl RoomRouter {
+    #[must_use]
+    pub fn new(config: &SafehouseConfig) -> Self {
+        Self {
+            map: config.rooms.clone(),
+            single: config.room.clone(),
+            created: HashMap::new(),
+            degraded: std::collections::HashSet::new(),
+        }
+    }
+
+    /// The signal room: `rooms.signal`, else the legacy scalar `room`.
+    #[must_use]
+    pub fn signal_room(&self) -> Option<String> {
+        self.map
+            .as_ref()
+            .and_then(|map| map.signal.clone())
+            .or_else(|| self.single.clone())
+    }
+
+    /// Decide where an envelope of `kind` narrating workspace `repo` (an absolute
+    /// workspace root, basename-reduced per #4201) goes.
+    ///
+    /// Pure — the caller performs any room creation and reports the outcome back
+    /// via [`record_created`](Self::record_created) /
+    /// [`record_degraded`](Self::record_degraded).
+    #[must_use]
+    pub fn resolve(&self, kind: &str, repo: Option<&str>) -> RoomDecision {
+        // Absent `rooms` map ⇒ the pre-#4225 behavior, byte-identical: one room
+        // for everything, `None` included. This is the migration default and the
+        // single most important invariant of this change.
+        let Some(map) = self.map.as_ref() else {
+            return RoomDecision::Send(self.single.clone());
+        };
+        // An unparseable kind cannot reach the wire (`build_send_request` refuses
+        // it), but if one ever did, the operator-visible room is the safer place
+        // for it than a muted firehose.
+        let class =
+            EnvelopeKind::parse(kind).map_or(AttentionClass::Signal, EnvelopeKind::attention_class);
+        if matches!(class, AttentionClass::Signal) {
+            return RoomDecision::Send(self.signal_room());
+        }
+        // Firehose class, but the firehose is *per repo* — an event with no repo
+        // stamped (a synthetic/test event, or `DaemonIdleExit`-shaped daemon-wide
+        // news) has no firehose to go to, so it degrades to the signal room
+        // rather than inventing a room name.
+        let Some(repo) = repo_basename(repo) else {
+            return RoomDecision::Send(self.signal_room());
+        };
+        if let Some(room) = map.by_repo.get(&repo).or_else(|| self.created.get(&repo)) {
+            return RoomDecision::Send(Some(room.clone()));
+        }
+        if self.degraded.contains(&repo) {
+            return RoomDecision::Send(self.signal_room());
+        }
+        RoomDecision::Create {
+            alias: repo_room_alias(&repo),
+            repo,
+            fallback: self.signal_room(),
+        }
+    }
+
+    /// Record a successful lazy room creation so later messages for `repo` route
+    /// straight there with no further `create_room` op.
+    pub fn record_created(&mut self, repo: &str, room: String) {
+        self.created.insert(repo.to_owned(), room);
+    }
+
+    /// Record a failed lazy room creation. Returns `true` **only the first time**
+    /// for a given repo, which is how the caller warns once per repo instead of
+    /// once per message.
+    pub fn record_degraded(&mut self, repo: &str) -> bool {
+        self.degraded.insert(repo.to_owned())
+    }
+}
+
+/// The workspace root stamped onto a bus event, if any — the input firehose
+/// routing keys on (reduced to a basename by [`repo_basename`]). Events with no
+/// `repo` field (or `None`) route to the signal room.
+#[must_use]
+fn event_repo(event: &Event) -> Option<&str> {
+    match event {
+        Event::SweepPhase { repo, .. }
+        | Event::SweepBlocker { repo, .. }
+        | Event::SweepExited { repo, .. }
+        | Event::SweepCrashed { repo, .. }
+        | Event::SweepResumeDispatched { repo, .. }
+        | Event::SweepGlobalDispatch { repo, .. } => repo.as_deref(),
+        _ => None,
+    }
 }
 
 // ============================================================================
@@ -919,6 +1365,13 @@ struct MergedPr {
     number: u32,
     /// Canonical web URL (`completion-v1` `ref`).
     url: String,
+    /// Display fields (#4497), read from the *same* `gh pr list` call that
+    /// verifies the merge — zero extra round-trips. Each degrades to `None`
+    /// independently: a row missing one of them still yields a `MergedPr`, so a
+    /// completion is never lost over a cosmetic field.
+    title: Option<String>,
+    additions: Option<u64>,
+    deletions: Option<u64>,
 }
 
 /// Build the `completion` envelope for a merged sweep. Pure and total: every
@@ -963,26 +1416,27 @@ pub fn build_completion_envelope(
 /// `None` here and narrates no completion, so `result: "success"` is never
 /// claimed for unmerged work. Every failure — missing `gh`, no network,
 /// unauthenticated, timeout, malformed JSON — also degrades to `None`.
+///
+/// The same single call also harvests the feed's display fields (#4497:
+/// `title`/`additions`/`deletions`), so enriching the completion costs **zero**
+/// extra forge round-trips on the happy path.
 async fn fetch_merged_pr(workspace_root: &Path, issue: u32) -> Option<MergedPr> {
     let gh_bin = env_nonempty(GH_BIN_ENV).unwrap_or_else(|| "gh".to_owned());
     let branch = crate::worktree_ops::naming::branch_name(issue);
-    let run = tokio::process::Command::new(&gh_bin)
-        .arg("pr")
-        .arg("list")
-        .arg("--head")
-        .arg(&branch)
-        .arg("--state")
-        .arg("merged")
-        .arg("--json")
-        .arg("number,url,mergedAt")
-        .arg("--limit")
-        .arg("1")
-        .current_dir(workspace_root)
-        .output();
-    let output = tokio::time::timeout(MERGE_CHECK_TIMEOUT, run)
-        .await
-        .ok()?
-        .ok()?;
+    let mut output =
+        run_merged_pr_query(&gh_bin, &branch, MERGED_PR_FIELDS, workspace_root).await?;
+    if !output.status.success() && rejects_unknown_json_field(&output.stderr) {
+        // A `gh` old enough not to know one of the #4497 display fields rejects
+        // the *whole* request rather than omitting that field, which would have
+        // silently cost us every completion. Retry the pre-#4497 field set so
+        // such a host keeps publishing completions, just without the extras.
+        log::debug!(
+            "safehouse: gh rejected the completion display fields; \
+             retrying with the base field set (completion will omit title/additions/deletions)"
+        );
+        output =
+            run_merged_pr_query(&gh_bin, &branch, MERGED_PR_FIELDS_BASE, workspace_root).await?;
+    }
     if !output.status.success() {
         return None;
     }
@@ -997,7 +1451,63 @@ async fn fetch_merged_pr(workspace_root: &Path, issue: u32) -> Option<MergedPr> 
     }
     let number = u32::try_from(row.get("number")?.as_u64()?).ok()?;
     let url = row.get("url")?.as_str()?.to_owned();
-    (!url.is_empty()).then_some(MergedPr { number, url })
+    // Display fields are read with `and_then`/`filter` rather than `?`: an
+    // absent or wrongly-typed one must degrade that field alone, never the
+    // merge verification.
+    let title = row
+        .get("title")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(ToOwned::to_owned);
+    let additions = row.get("additions").and_then(Value::as_u64);
+    let deletions = row.get("deletions").and_then(Value::as_u64);
+    (!url.is_empty()).then_some(MergedPr {
+        number,
+        url,
+        title,
+        additions,
+        deletions,
+    })
+}
+
+/// One `gh pr list --head <branch> --state merged --json <fields>` invocation,
+/// bounded by [`MERGE_CHECK_TIMEOUT`]. `None` means the process could not be
+/// run or did not finish in time; a nonzero exit is returned to the caller so it
+/// can inspect `stderr`.
+async fn run_merged_pr_query(
+    gh_bin: &str,
+    branch: &str,
+    fields: &str,
+    workspace_root: &Path,
+) -> Option<std::process::Output> {
+    let run = tokio::process::Command::new(gh_bin)
+        .arg("pr")
+        .arg("list")
+        .arg("--head")
+        .arg(branch)
+        .arg("--state")
+        .arg("merged")
+        .arg("--json")
+        .arg(fields)
+        .arg("--limit")
+        .arg("1")
+        .current_dir(workspace_root)
+        .output();
+    tokio::time::timeout(MERGE_CHECK_TIMEOUT, run)
+        .await
+        .ok()?
+        .ok()
+}
+
+/// Whether `gh` failed specifically because it does not recognize one of the
+/// requested `--json` fields (`unknown JSON field: "additions"`), as opposed to
+/// the ordinary degradations (no auth, no network, not a repo). Only this case
+/// is worth a retry with a narrower field set.
+fn rejects_unknown_json_field(stderr: &[u8]) -> bool {
+    String::from_utf8_lossy(stderr)
+        .to_ascii_lowercase()
+        .contains("unknown json field")
 }
 
 /// Best-effort `gh repo view --json nameWithOwner` lookup for the forge
@@ -1042,6 +1552,56 @@ async fn fetch_repo_slug_cached(
     Some(slug)
 }
 
+/// Best-effort per-issue token total for a `completion` envelope (#4497):
+/// `sum(input + output)` over the activity DB's per-issue cost rollup
+/// ([`ActivityDb::get_cost_by_issue`]). The DB is already in-process, so this
+/// needs no forge call and no new accounting.
+///
+/// **Attribution is imperfect, by explicit operator decision** — for a cost
+/// *trend*, imperfect-but-consistent beats absent. Two known limits, documented
+/// here rather than papered over:
+///
+/// 1. **Not repo-qualified.** The activity DB's forge-correlation table keys on
+///    a bare issue number with no repo column, so a daemon managing several
+///    repos conflates identical issue numbers across them.
+/// 2. **Only as good as the prompt↔usage linkage.** The rollup joins recorded
+///    token samples to an issue through `agent_inputs`; samples recorded without
+///    that link contribute nothing, so the figure is a **floor**, not a full
+///    accounting — and is empty on hosts where nothing has established the link
+///    yet, in which case the key is simply omitted.
+///
+/// Every failure — no DB handle, a poisoned mutex, a query error, a timeout, an
+/// empty rollup — degrades to `None`. A zero total is likewise indistinguishable
+/// from "accounting had nothing" and is filtered out downstream by
+/// [`CompletionMeta::to_meta_value`], so no bogus `0` reaches the feed.
+async fn fetch_issue_tokens(
+    activity_db: Option<&Arc<Mutex<ActivityDb>>>,
+    issue: u32,
+) -> Option<u64> {
+    let db = activity_db?.clone();
+    let issue_number = i32::try_from(issue).ok()?;
+    // The rusqlite handle sits behind a std mutex shared with the IPC recorder's
+    // writes, so lock+query goes to the blocking pool: the sink must never park
+    // a daemon-runtime worker on it (and a std guard cannot cross an `await`).
+    let query = tokio::task::spawn_blocking(move || {
+        let rollup = {
+            let guard = db.lock().ok()?;
+            guard.get_cost_by_issue(Some(issue_number)).ok()?
+        };
+        let total = rollup.iter().fold(0_i64, |acc, row| {
+            acc.saturating_add(
+                row.total_input_tokens
+                    .saturating_add(row.total_output_tokens),
+            )
+        });
+        u64::try_from(total).ok()
+    });
+    tokio::time::timeout(TOKEN_LOOKUP_TIMEOUT, query)
+        .await
+        .ok()?
+        .ok()?
+}
+
 /// The Option-B emit point (#4426): on a `SweepExited`, verify against forge
 /// truth that the sweep's PR actually merged and, if so, build the
 /// public-feed `completion` envelope.
@@ -1065,6 +1625,13 @@ async fn fetch_repo_slug_cached(
 /// one (an open PR is un-finished, not failed, and is usually resumed). The
 /// wire support exists ([`CompletionResult::Failure`]) for a follow-up that
 /// identifies a genuinely terminal negative outcome.
+///
+/// The feed's display fields (#4497) ride along here: `title`/`additions`/
+/// `deletions` come out of the merge-verification call itself (no extra forge
+/// round-trip) and `tokens` out of the in-process activity DB when a handle was
+/// threaded in. All four are optional and independently degradable — with all
+/// four absent the envelope is byte-identical to the pre-#4497 one.
+#[allow(clippy::too_many_arguments)]
 async fn completion_for_exit(
     persona: &str,
     workspace_root: &str,
@@ -1073,6 +1640,7 @@ async fn completion_for_exit(
     exited_at: DateTime<Utc>,
     slug_cache: &mut HashMap<String, String>,
     already_narrated: &mut std::collections::HashSet<(String, u32)>,
+    activity_db: Option<&Arc<Mutex<ActivityDb>>>,
 ) -> Option<Envelope> {
     let key = (workspace_root.to_owned(), issue);
     if already_narrated.contains(&key) {
@@ -1080,6 +1648,9 @@ async fn completion_for_exit(
     }
     let merged = fetch_merged_pr(Path::new(workspace_root), issue).await?;
     let slug = fetch_repo_slug_cached(slug_cache, workspace_root).await?;
+    // Only reached once the merge is confirmed, so a completion is never delayed
+    // by a token lookup it would not have published.
+    let tokens = fetch_issue_tokens(activity_db, issue).await;
 
     // Sweep timing comes from the one clock that produced `duration_sec` (the
     // reaper's), so the pair is always self-consistent — mixing in the forge's
@@ -1093,10 +1664,12 @@ async fn completion_for_exit(
         started_at: started_at.to_rfc3339_opts(SecondsFormat::Secs, true),
         completed_at: exited_at.to_rfc3339_opts(SecondsFormat::Secs, true),
         issue: Some(issue),
-        // No cheap token source is wired to the sink (the activity DB lives
-        // behind the IPC handler, not the bus subscriber), so this is omitted
-        // rather than guessed — the feed handles absence.
-        tokens: None,
+        // Best-effort, knowingly imperfect attribution (#4497) — see
+        // `fetch_issue_tokens`. Absent/zero ⇒ the key is omitted, never guessed.
+        tokens,
+        title: merged.title,
+        additions: merged.additions,
+        deletions: merged.deletions,
     };
     match build_completion_envelope(Some(workspace_root), issue, merged.number, duration_sec, &meta)
     {
@@ -1185,16 +1758,29 @@ impl SafehouseClient {
         Ok(client)
     }
 
-    /// Serialize and send one narration envelope, then read + `id`-match the
-    /// reply (skipping any interleaved push line).
+    /// Serialize and send one narration envelope into this connection's default
+    /// room, then read + `id`-match the reply (skipping any interleaved push
+    /// line).
     pub async fn send(&mut self, env: &Envelope) -> std::result::Result<(), SendError> {
+        let room = self.room.clone();
+        self.send_to(env, room.as_deref()).await
+    }
+
+    /// [`send`](Self::send) addressed at an explicit `room`, which is how the
+    /// attention-class router (#4225) puts one connection's envelopes into
+    /// different rooms. `None` sends no `room` key at all (the single-room
+    /// convenience). The connection's own default room is ignored.
+    pub async fn send_to(
+        &mut self,
+        env: &Envelope,
+        room: Option<&str>,
+    ) -> std::result::Result<(), SendError> {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
         // A malformed envelope is a transport-class caller bug (the connection
         // is fine) but is not a server rejection either; surface it as
         // Transport so the sink logs it rather than treating it as sticky.
-        let req =
-            build_send_request(env, id, self.room.as_deref()).map_err(SendError::Transport)?;
+        let req = build_send_request(env, id, room).map_err(SendError::Transport)?;
         self.write_line(&req).await.map_err(SendError::Transport)?;
         let reply = self.read_reply().await.map_err(SendError::Transport)?;
         if !reply.get("ok").and_then(Value::as_bool).unwrap_or(false) {
@@ -1216,6 +1802,55 @@ impl SafehouseClient {
             }
         }
         Ok(())
+    }
+
+    /// Lazily create (or resolve) the room named `alias` via the socket
+    /// `create_room` op and return the value later `send`s should address
+    /// (#4225's tier-2 firehose rooms are created on a repo's **first**
+    /// narration, never eagerly for every managed repo).
+    ///
+    /// The op/reply shape is owned by the external `rjwalters/safehouse` repo and
+    /// is not verifiable from this repository, so this is deliberately lenient in
+    /// both directions: the request names the room with both `name` and `alias`
+    /// (safehoused ignores unknown keys the same way it ignores our `v`), and the
+    /// reply's room identity is read from whichever of the plausible keys is
+    /// present, falling back to the alias we asked for (safehoused accepts an
+    /// alias anywhere it accepts a room id). Every failure is an `Err` the caller
+    /// degrades from; nothing here can block or fail a sweep.
+    ///
+    /// The error is the same [`SendError`] split the send path uses, and for the
+    /// same reason: a [`SendError::Rejected`] (safehoused said no — unsupported
+    /// op, no permission to create) will be refused identically forever, so the
+    /// caller gives up on that room permanently and warns once, while a
+    /// [`SendError::Transport`] is a dead connection that says nothing about
+    /// whether the room is creatable — so the next event retries after the
+    /// reconnect instead of writing the repo off.
+    pub async fn create_room(&mut self, alias: &str) -> std::result::Result<String, SendError> {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        let req = json!({
+            "id": id,
+            "op": "create_room",
+            "name": alias,
+            "alias": alias,
+        });
+        self.write_line(&req).await.map_err(SendError::Transport)?;
+        let reply = self.read_reply().await.map_err(SendError::Transport)?;
+        if !reply.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+            let reason = reply
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown error")
+                .to_owned();
+            return Err(SendError::Rejected { reason });
+        }
+        let room = ["room_id", "room", "alias", "name"]
+            .iter()
+            .find_map(|key| reply.get(*key).and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|room| !room.is_empty())
+            .map_or_else(|| alias.to_owned(), ToOwned::to_owned);
+        Ok(room)
     }
 
     async fn write_line(&mut self, value: &Value) -> Result<()> {
@@ -1274,12 +1909,17 @@ impl SafehouseClient {
 /// with the resolved config-only state immediately (before any connection
 /// attempt) and further updated by [`run_sink`] as connect/disconnect
 /// transitions happen — see [`SafehouseState`].
+///
+/// `activity_db` (#4497) is the optional in-process handle the completion emit
+/// point uses for its best-effort per-issue `tokens` rollup; `None` simply omits
+/// that one field.
 #[must_use]
 pub fn spawn_sink(
     config: SafehouseConfig,
     bus: &EventBus,
     runtime: &tokio::runtime::Handle,
     state: SharedSafehouseState,
+    activity_db: Option<Arc<Mutex<ActivityDb>>>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     if !config.enabled {
         // Disabled ⇒ do not even subscribe. No syscalls, no behavior change.
@@ -1305,8 +1945,16 @@ pub fn spawn_sink(
     // Empty topic set ⇒ receive every event; we filter in `event_to_envelope`.
     let subscription = bus.subscribe(Vec::<String>::new());
     Some(runtime.spawn(async move {
-        run_sink(config, socket, subscription, DEFAULT_MIN_BACKOFF, DEFAULT_MAX_BACKOFF, state)
-            .await;
+        run_sink(
+            config,
+            socket,
+            subscription,
+            DEFAULT_MIN_BACKOFF,
+            DEFAULT_MAX_BACKOFF,
+            state,
+            activity_db,
+        )
+        .await;
     }))
 }
 
@@ -1370,6 +2018,7 @@ async fn fetch_title_cached(
 /// narrates them, reconnecting lazily with capped exponential backoff. A
 /// connection failure never blocks or fails a sweep — it degrades to a single
 /// `warn` per outage (not per event) and drops that narration.
+#[allow(clippy::too_many_arguments)]
 async fn run_sink(
     config: SafehouseConfig,
     socket: PathBuf,
@@ -1377,6 +2026,7 @@ async fn run_sink(
     min_backoff: Duration,
     max_backoff: Duration,
     state: SharedSafehouseState,
+    activity_db: Option<Arc<Mutex<ActivityDb>>>,
 ) {
     // Report "configured, not yet connected" immediately — the sink connects
     // lazily on the first narrated event (below), so without this a daemon
@@ -1390,6 +2040,13 @@ async fn run_sink(
         },
     );
     let mut client: Option<SafehouseClient> = None;
+    // Attention-class room routing (#4225). With no `rooms` map configured this
+    // resolves every envelope to `config.room` — the pre-#4225 single-room
+    // behavior, byte-identical.
+    let mut router = RoomRouter::new(&config);
+    // The room this connection reports as "connected to" and defaults sends to:
+    // the signal room, which in single-room mode *is* `config.room`.
+    let signal_room = router.signal_room();
     // Next instant a reconnect may be attempted, and the current backoff.
     let mut next_attempt = Instant::now();
     let mut backoff = min_backoff;
@@ -1461,6 +2118,7 @@ async fn run_sink(
                 Utc::now(),
                 &mut slug_cache,
                 &mut completed,
+                activity_db.as_ref(),
             )
             .await
             {
@@ -1478,7 +2136,7 @@ async fn run_sink(
             if Instant::now() < next_attempt {
                 continue; // in backoff window — drop this narration silently
             }
-            match SafehouseClient::connect(&socket, &config.persona, config.room.clone()).await {
+            match SafehouseClient::connect(&socket, &config.persona, signal_room.clone()).await {
                 Ok(connected) => {
                     if warned {
                         log::info!("safehouse: reconnected to {}", socket.display());
@@ -1499,7 +2157,7 @@ async fn run_sink(
                             },
                             None => SafehouseState::Connected {
                                 socket: socket.clone(),
-                                room: config.room.clone(),
+                                room: signal_room.clone(),
                             },
                         },
                     );
@@ -1528,10 +2186,59 @@ async fn run_sink(
 
         // Send this event's envelopes in order, stopping at the first failure
         // (the connection is gone or every send would be rejected identically).
+        // Each envelope's room is resolved **per envelope** by attention class
+        // (#4225), which is why one `SweepExited` can put its `ack` in the signal
+        // room and (in a future taxonomy) chatter in the repo firehose — severity
+        // routes, and each message lands in exactly one room.
+        let narrated_repo = event_repo(&event).map(ToOwned::to_owned);
         let mut send_failure: Option<SendError> = None;
         if let Some(connected) = client.as_mut() {
             for envelope in &outbox {
-                if let Err(err) = connected.send(envelope).await {
+                let room = match router.resolve(&envelope.kind, narrated_repo.as_deref()) {
+                    RoomDecision::Send(room) => room,
+                    // Lazy creation (#4225): a repo's firehose room is created on
+                    // its first narration, not eagerly for every managed repo.
+                    RoomDecision::Create {
+                        repo,
+                        alias,
+                        fallback,
+                    } => match connected.create_room(&alias).await {
+                        Ok(room) => {
+                            log::info!(
+                                "safehouse: created the {alias} firehose room for {repo} \
+                                 narration (room={room})"
+                            );
+                            router.record_created(&repo, room.clone());
+                            Some(room)
+                        }
+                        // safehoused refused: it will refuse identically until the
+                        // operator changes something, so write the room off for
+                        // this run, warn **once** per repo (never once per
+                        // message), and narrate into the signal room instead.
+                        Err(err @ SendError::Rejected { .. }) => {
+                            if router.record_degraded(&repo) {
+                                log::warn!(
+                                    "safehouse: cannot create the {alias} firehose room \
+                                     ({err}); narrating {repo} into the signal room instead \
+                                     for the rest of this run, sweep unaffected"
+                                );
+                            }
+                            fallback
+                        }
+                        // A dead connection says nothing about whether the room is
+                        // creatable — do NOT write the repo off. The send below
+                        // fails too, which drops this narration and reconnects;
+                        // the next event retries the creation.
+                        Err(SendError::Transport(err)) => {
+                            log::debug!(
+                                "safehouse: create_room for {alias} failed at the transport \
+                                 layer ({err:#}); will retry after reconnect"
+                            );
+                            fallback
+                        }
+                    },
+                };
+                if let Err(err) = connected.send_to(envelope, room.as_deref()).await {
                     send_failure = Some(err);
                     break;
                 }
@@ -1548,7 +2255,7 @@ async fn run_sink(
                         &state,
                         SafehouseState::Connected {
                             socket: socket.clone(),
-                            room: config.room.clone(),
+                            room: signal_room.clone(),
                         },
                     );
                 }
@@ -1664,6 +2371,13 @@ impl InboundEventSink for PeerClaimSink {
 /// #4028): the envelope `type` enum is closed and owned by the safehouse repo, so
 /// a claim rides a `task` envelope with the bare issue number as `task_id` and
 /// the structured payload in `body`.
+///
+/// **Routing exception (#4225).** By the attention-class table this `task`
+/// envelope would belong in the per-repo firehose — claim ads *are* per-repo
+/// machine chatter. They deliberately stay on the **signal room** anyway; see
+/// [`run_coordination`] for the full rationale (in one line: it is the only room
+/// every host's bot is guaranteed to be joined to, and cross-host dedup is a
+/// correctness property, not a cosmetic one).
 #[must_use]
 pub fn claim_ad_to_envelope(ad: &ClaimAd) -> Envelope {
     Envelope {
@@ -1738,6 +2452,38 @@ pub fn spawn_peer_coordination(
 /// connection it concurrently reads inbound room events (→ `sink`) and drains
 /// outbound claim ads (→ socket). Any I/O failure degrades to a reconnect — it
 /// never blocks or fails a dispatch. Returns when all outbound senders drop.
+///
+/// # Room routing: claim ads stay on the signal room (#4225, resolved in-PR)
+///
+/// Attention-class routing sends `task` envelopes to the per-repo firehose, and a
+/// claim ad *is* a per-repo `task` envelope — yet this connection deliberately
+/// advertises into (and reads from) the **signal room**, the one deliberate
+/// exception to "signal-only". Why:
+///
+/// 1. **The signal room is the only room with guaranteed common membership.**
+///    Rooms are per-repo and created **lazily** by whichever host narrates that
+///    repo first (`RoomDecision::Create`), and hosts run **separate per-host bot
+///    accounts**. Host A creating `fleet-loom` does not join host B's bot to it,
+///    so an ad posted there is invisible to B until an operator invites it —
+///    silently disabling cross-host dedup with no error anywhere, exactly the
+///    failure class #4464 had to add a status state for. Every host's bot is
+///    already in the signal room; that is what makes it usable as a coordination
+///    channel at all.
+/// 2. **Dedup is correctness, room hygiene is cosmetics.** A missed claim ad
+///    costs a duplicate cross-host sweep (wasted tokens, two PRs for one issue).
+///    A little machine JSON in the signal room costs the operator some scroll.
+///    When those trade off, correctness wins.
+/// 3. **The reader must agree with the writer.** This task's inbound handler is
+///    unfiltered — it folds *any* inbound line carrying a parseable `loom_claim`
+///    body into the view — so it consumes ads from whatever rooms safehoused
+///    pushes to it. Keeping the write side on the signal room keeps the pair
+///    trivially consistent instead of depending on which rooms this host's bot
+///    happens to have joined.
+///
+/// Ads are low volume (one per dispatch / terminal outcome). A dedicated
+/// coordination room (a third tier) is the clean long-term fix and is left as a
+/// follow-up — it needs cross-host *provisioning*, not just routing, which is the
+/// same reason tier 3 (the Matrix Space) is out of scope here.
 async fn run_coordination(
     config: SafehouseConfig,
     socket: PathBuf,
@@ -1749,6 +2495,9 @@ async fn run_coordination(
 ) {
     let mut backoff = min_backoff;
     let mut warned = false;
+    // The signal room (see the routing rationale above). In single-room mode this
+    // *is* `config.room`, so the pre-#4225 behavior is byte-identical.
+    let signal_room = config.signal_room().map(ToOwned::to_owned);
     loop {
         set_state(
             &state,
@@ -1756,7 +2505,7 @@ async fn run_coordination(
                 socket: socket.clone(),
             },
         );
-        let client = match SafehouseClient::connect(&socket, &config.persona, config.room.clone())
+        let client = match SafehouseClient::connect(&socket, &config.persona, signal_room.clone())
             .await
         {
             Ok(client) => {
@@ -1769,7 +2518,7 @@ async fn run_coordination(
                     &state,
                     SafehouseState::Connected {
                         socket: socket.clone(),
-                        room: config.room.clone(),
+                        room: signal_room.clone(),
                     },
                 );
                 client
@@ -2084,6 +2833,385 @@ mod tests {
         std::env::remove_var(SAFEHOUSED_SOCKET_ENV);
     }
 
+    // ---- attention-class room routing: kind → room table (#4225) ----
+
+    /// The routing `match` is exhaustive over [`EnvelopeKind`] with no wildcard
+    /// arm, so a sixth *enum* member fails to compile. This test is the other
+    /// half of that guard: it pins the enum to the wire-level [`KNOWN_TYPES`], so
+    /// a sixth member added to only one of the two representations fails here
+    /// instead of silently escaping the routing table.
+    #[test]
+    fn known_types_and_envelope_kind_stay_in_lockstep() {
+        assert_eq!(
+            KNOWN_TYPES.len(),
+            EnvelopeKind::ALL.len(),
+            "a new envelope type must be added to BOTH KNOWN_TYPES and EnvelopeKind \
+             (the latter is what makes the #4225 routing match exhaustive)"
+        );
+        for (wire, kind) in KNOWN_TYPES.iter().zip(EnvelopeKind::ALL) {
+            assert_eq!(*wire, kind.as_str(), "KNOWN_TYPES and EnvelopeKind::ALL must agree");
+            assert_eq!(EnvelopeKind::parse(wire), Some(kind));
+        }
+        assert_eq!(EnvelopeKind::parse("smoke_signal"), None);
+    }
+
+    /// The final routing table (#4225): `handoff`/`ack`/`completion` → signal,
+    /// `task`/`chat` → the repo firehose. Every known type is covered and each
+    /// resolves to exactly one class.
+    #[test]
+    fn attention_class_routes_every_known_type_to_exactly_one_tier() {
+        let expected = [
+            ("chat", AttentionClass::Firehose),
+            ("task", AttentionClass::Firehose),
+            ("handoff", AttentionClass::Signal),
+            ("ack", AttentionClass::Signal),
+            ("completion", AttentionClass::Signal),
+        ];
+        assert_eq!(
+            expected.len(),
+            KNOWN_TYPES.len(),
+            "every KNOWN_TYPES member needs a routing expectation here"
+        );
+        for (kind, class) in expected {
+            let parsed = EnvelopeKind::parse(kind).expect("known type must parse");
+            assert_eq!(
+                parsed.attention_class(),
+                class,
+                "{kind:?} must route to {class:?} and nowhere else"
+            );
+        }
+    }
+
+    /// `completion` (#4553, the newest `KNOWN_TYPES` member) is a terminal
+    /// outcome and belongs in the operator's signal room — called out explicitly
+    /// because it is the easiest one to miss.
+    #[test]
+    fn completion_routes_to_the_signal_room() {
+        assert_eq!(EnvelopeKind::Completion.attention_class(), AttentionClass::Signal);
+
+        let cfg = routing_config();
+        let router = RoomRouter::new(&cfg);
+        assert_eq!(
+            router.resolve("completion", Some("/home/x/GitHub/loom")),
+            RoomDecision::Send(Some("!signal:example.org".to_owned())),
+            "a completion must reach the signal room even when the repo has its own firehose"
+        );
+    }
+
+    // ---- attention-class room routing: RoomRouter (#4225) ----
+
+    /// A `rooms` map with a signal room and one pre-configured repo firehose.
+    fn routing_config() -> SafehouseConfig {
+        SafehouseConfig {
+            enabled: true,
+            room: None,
+            rooms: Some(RoomMap {
+                signal: Some("!signal:example.org".to_owned()),
+                by_repo: [("loom".to_owned(), "!fleet-loom:example.org".to_owned())]
+                    .into_iter()
+                    .collect(),
+            }),
+            ..SafehouseConfig::default()
+        }
+    }
+
+    /// **The most important regression guard of #4225**: with no `rooms` map,
+    /// every envelope of every kind resolves to the single configured `room`,
+    /// exactly as before — including the `None` "let safehoused resolve its sole
+    /// room" form, which must still serialize with no `room` key at all.
+    #[test]
+    fn absent_rooms_map_is_byte_identical_single_room_behavior() {
+        for room in [Some("loom-fleet".to_owned()), None] {
+            let cfg = SafehouseConfig {
+                enabled: true,
+                room: room.clone(),
+                ..SafehouseConfig::default()
+            };
+            assert!(!cfg.routes_by_attention());
+            let router = RoomRouter::new(&cfg);
+            for kind in KNOWN_TYPES {
+                for repo in [Some("/home/x/GitHub/vibesql"), None] {
+                    assert_eq!(
+                        router.resolve(kind, repo),
+                        RoomDecision::Send(room.clone()),
+                        "with no rooms map, {kind:?} (repo={repo:?}) must go to the single room"
+                    );
+                }
+            }
+        }
+
+        // And the wire shape of that `None` case: no `room` key is emitted.
+        let env = Envelope {
+            to: "*".to_owned(),
+            kind: "task".to_owned(),
+            task_id: Some("loom_4225".to_owned()),
+            body: "loom#4225 · dispatch".to_owned(),
+            meta: None,
+        };
+        let req = build_send_request(&env, 1, None).unwrap();
+        assert!(req.get("room").is_none(), "single-room mode with room=null sends no room key");
+    }
+
+    #[test]
+    fn signal_room_falls_back_to_the_legacy_room_key() {
+        // Migration shape: an operator adds `rooms.byRepo` but leaves the signal
+        // room as the existing scalar `safehouse.room`.
+        let cfg = SafehouseConfig {
+            enabled: true,
+            room: Some("!legacy:example.org".to_owned()),
+            rooms: Some(RoomMap {
+                signal: None,
+                by_repo: [("loom".to_owned(), "!fleet-loom:example.org".to_owned())]
+                    .into_iter()
+                    .collect(),
+            }),
+            ..SafehouseConfig::default()
+        };
+        assert_eq!(cfg.signal_room(), Some("!legacy:example.org"));
+        let router = RoomRouter::new(&cfg);
+        assert_eq!(
+            router.resolve("handoff", Some("/home/x/GitHub/loom")),
+            RoomDecision::Send(Some("!legacy:example.org".to_owned()))
+        );
+        // …and `rooms.signal`, when set, wins over the legacy scalar.
+        assert_eq!(routing_config().signal_room(), Some("!signal:example.org"));
+    }
+
+    #[test]
+    fn firehose_kinds_route_to_the_configured_repo_room() {
+        let cfg = routing_config();
+        let router = RoomRouter::new(&cfg);
+        for kind in ["task", "chat"] {
+            assert_eq!(
+                router.resolve(kind, Some("/home/x/GitHub/loom")),
+                RoomDecision::Send(Some("!fleet-loom:example.org".to_owned())),
+                "{kind:?} is repo chatter and belongs in that repo's firehose"
+            );
+        }
+        for kind in ["handoff", "ack", "completion"] {
+            assert_eq!(
+                router.resolve(kind, Some("/home/x/GitHub/loom")),
+                RoomDecision::Send(Some("!signal:example.org".to_owned())),
+                "{kind:?} is a human-attention outcome and belongs in the signal room"
+            );
+        }
+    }
+
+    #[test]
+    fn unconfigured_repo_firehose_is_created_lazily_then_reused() {
+        let cfg = routing_config();
+        let mut router = RoomRouter::new(&cfg);
+        // vibesql has no configured firehose ⇒ create `fleet-vibesql` on first
+        // narration (lazily — never eagerly for every managed repo).
+        assert_eq!(
+            router.resolve("task", Some("/home/x/GitHub/vibesql")),
+            RoomDecision::Create {
+                repo: "vibesql".to_owned(),
+                alias: "fleet-vibesql".to_owned(),
+                fallback: Some("!signal:example.org".to_owned()),
+            }
+        );
+        router.record_created("vibesql", "!created:example.org".to_owned());
+        // Every later message reuses the recorded id — no second create_room op.
+        assert_eq!(
+            router.resolve("task", Some("/home/x/GitHub/vibesql")),
+            RoomDecision::Send(Some("!created:example.org".to_owned()))
+        );
+        // Signal-class traffic for the same repo still goes to the signal room.
+        assert_eq!(
+            router.resolve("handoff", Some("/home/x/GitHub/vibesql")),
+            RoomDecision::Send(Some("!signal:example.org".to_owned()))
+        );
+    }
+
+    #[test]
+    fn uncreatable_repo_room_degrades_to_signal_and_warns_once() {
+        let cfg = routing_config();
+        let mut router = RoomRouter::new(&cfg);
+        assert!(matches!(
+            router.resolve("task", Some("/home/x/GitHub/anvil")),
+            RoomDecision::Create { .. }
+        ));
+        // First failure ⇒ warn (record_degraded returns true exactly once).
+        assert!(router.record_degraded("anvil"), "the first failure must warn");
+        assert!(!router.record_degraded("anvil"), "later failures must NOT warn again");
+        // …and from then on this repo narrates into the signal room, with no
+        // further creation attempts (never a blocked or failed sweep).
+        for kind in KNOWN_TYPES {
+            assert_eq!(
+                router.resolve(kind, Some("/home/x/GitHub/anvil")),
+                RoomDecision::Send(Some("!signal:example.org".to_owned())),
+                "a degraded repo must keep narrating ({kind:?}), just into the signal room"
+            );
+        }
+    }
+
+    #[test]
+    fn firehose_without_a_repo_degrades_to_signal_rather_than_inventing_a_room() {
+        let cfg = routing_config();
+        let router = RoomRouter::new(&cfg);
+        // No repo stamped (a synthetic/test event, or daemon-wide news): there is
+        // no per-repo firehose to route to, so it lands in the signal room.
+        assert_eq!(
+            router.resolve("task", None),
+            RoomDecision::Send(Some("!signal:example.org".to_owned()))
+        );
+        // A routing mode with no signal room configured at all resolves to `None`
+        // — the documented "explicit ids required once the map exists" caveat,
+        // where safehoused answers `'room' required` and #4464's send-rejected
+        // status names the fix. It never panics and never drops the message.
+        let cfg = SafehouseConfig {
+            enabled: true,
+            room: None,
+            rooms: Some(RoomMap {
+                signal: None,
+                by_repo: [("loom".to_owned(), "!fleet-loom:example.org".to_owned())]
+                    .into_iter()
+                    .collect(),
+            }),
+            ..SafehouseConfig::default()
+        };
+        assert_eq!(RoomRouter::new(&cfg).resolve("handoff", None), RoomDecision::Send(None));
+    }
+
+    #[test]
+    fn repo_room_alias_uses_the_narration_basename_convention() {
+        assert_eq!(repo_room_alias("vibesql"), "fleet-vibesql");
+        // The basename convention (#4201) is what keys the map, so a full
+        // workspace path resolves to the same room as its basename.
+        let cfg = routing_config();
+        let router = RoomRouter::new(&cfg);
+        assert_eq!(
+            router.resolve("task", Some("/Users/someone/GitHub/loom")),
+            router.resolve("task", Some("loom"))
+        );
+    }
+
+    #[test]
+    fn event_repo_reads_the_stamped_workspace_root() {
+        assert_eq!(
+            event_repo(&Event::SweepPhase {
+                issue: 4225,
+                phase: "builder".to_owned(),
+                pr_number: None,
+                repo: Some("/home/x/GitHub/loom".to_owned()),
+            }),
+            Some("/home/x/GitHub/loom")
+        );
+        assert_eq!(
+            event_repo(&Event::SweepGlobalCompleted {
+                sweep_id: "sweep-issue-4225-1".to_owned() as SweepId,
+                outcome: crate::types::SweepOutcome::Exited,
+            }),
+            None
+        );
+    }
+
+    // ---- attention-class room routing: config + env (#4225) ----
+
+    #[test]
+    fn config_parses_the_rooms_map() {
+        let block = json!({
+            "enabled": true,
+            "rooms": {
+                "signal": "!signal:example.org",
+                "byRepo": {"loom": "!fleet-loom:example.org", "vibesql": "!fleet-vibesql:example.org"}
+            }
+        });
+        let cfg = config_from_value(Some(&block));
+        let rooms = cfg.rooms.expect("the rooms map must parse");
+        assert_eq!(rooms.signal.as_deref(), Some("!signal:example.org"));
+        assert_eq!(rooms.by_repo.get("loom").map(String::as_str), Some("!fleet-loom:example.org"));
+        assert_eq!(
+            rooms.by_repo.get("vibesql").map(String::as_str),
+            Some("!fleet-vibesql:example.org")
+        );
+    }
+
+    #[test]
+    fn config_without_a_rooms_map_stays_in_single_room_mode() {
+        // The migration default: absent, malformed, and present-but-empty all
+        // resolve to `None` ⇒ unchanged single-room behavior.
+        for block in [
+            json!({"enabled": true, "room": "loom-fleet"}),
+            json!({"enabled": true, "rooms": {}}),
+            json!({"enabled": true, "rooms": "loom-fleet"}),
+            json!({"enabled": true, "rooms": {"signal": "  ", "byRepo": {}}}),
+            json!({"enabled": true, "rooms": {"byRepo": {"loom": ""}}}),
+            json!({"enabled": true, "rooms": {"byRepo": ["loom"]}}),
+        ] {
+            let cfg = config_from_value(Some(&block));
+            assert!(
+                cfg.rooms.is_none(),
+                "{block} must resolve to single-room mode, got {:?}",
+                cfg.rooms
+            );
+            assert!(!cfg.routes_by_attention());
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn env_overrides_config_for_the_rooms_map() {
+        std::env::set_var(ROOM_SIGNAL_ENV, "!env-signal:example.org");
+        std::env::set_var(ROOMS_BY_REPO_ENV, "loom=!env-loom:example.org, anvil=!env-anvil:x");
+
+        let cfg = apply_env_overrides(config_from_value(Some(&json!({
+            "enabled": true,
+            "rooms": {
+                "signal": "!cfg-signal:example.org",
+                "byRepo": {"loom": "!cfg-loom:example.org", "vibesql": "!cfg-vibesql:example.org"}
+            }
+        }))));
+        let rooms = cfg.rooms.expect("env must keep the map present");
+        assert_eq!(rooms.signal.as_deref(), Some("!env-signal:example.org"));
+        assert_eq!(rooms.by_repo.get("loom").map(String::as_str), Some("!env-loom:example.org"));
+        assert_eq!(rooms.by_repo.get("anvil").map(String::as_str), Some("!env-anvil:x"));
+        assert!(
+            !rooms.by_repo.contains_key("vibesql"),
+            "the byRepo env override replaces the whole map rather than merging into it"
+        );
+
+        std::env::remove_var(ROOM_SIGNAL_ENV);
+        std::env::remove_var(ROOMS_BY_REPO_ENV);
+    }
+
+    #[test]
+    #[serial]
+    fn env_alone_can_enable_routing_and_absent_env_changes_nothing() {
+        // Env with no config `rooms` block at all ⇒ routing enabled from env.
+        std::env::set_var(ROOM_SIGNAL_ENV, "!env-signal:example.org");
+        let cfg = apply_env_overrides(config_from_value(Some(&json!({"enabled": true}))));
+        assert_eq!(cfg.signal_room(), Some("!env-signal:example.org"));
+        std::env::remove_var(ROOM_SIGNAL_ENV);
+
+        // Neither env var set ⇒ the config layer's map is returned untouched, so
+        // the absent-map single-room default stays byte-identical. (`room` itself
+        // is deliberately not asserted here: `LOOM_SAFEHOUSE_ROOM` may be set in
+        // the ambient environment, and its precedence is already covered by
+        // `env_overrides_config_for_all_keys`.)
+        std::env::remove_var(ROOMS_BY_REPO_ENV);
+        let cfg = apply_env_overrides(config_from_value(Some(
+            &json!({"enabled": true, "room": "loom-fleet"}),
+        )));
+        assert!(cfg.rooms.is_none());
+        assert_eq!(
+            config_from_value(Some(&json!({"enabled": true, "room": "loom-fleet"}))).signal_room(),
+            Some("loom-fleet"),
+            "with no rooms map the signal room IS the legacy scalar room"
+        );
+
+        // A garbage byRepo env value degrades to the pairs it can parse (here:
+        // none) instead of panicking.
+        assert!(parse_by_repo_env("loom,,=,=x,vibesql=").is_empty());
+        assert_eq!(
+            parse_by_repo_env("loom=!a:x,,vibesql = !b:x ")
+                .get("vibesql")
+                .map(String::as_str),
+            Some("!b:x")
+        );
+    }
+
     // ---- envelope serialization / validation ----
 
     #[test]
@@ -2189,6 +3317,9 @@ mod tests {
             completed_at: "2026-07-29T10:12:30Z".to_owned(),
             issue: Some(4321),
             tokens: Some(791_000),
+            title: Some("Add repo-qualified task_id".to_owned()),
+            additions: Some(214),
+            deletions: Some(37),
         }
     }
 
@@ -2224,6 +3355,11 @@ mod tests {
         assert_eq!(req["meta"]["completed_at"], json!("2026-07-29T10:12:30Z"));
         assert_eq!(req["meta"]["issue"], json!(4321));
         assert_eq!(req["meta"]["tokens"], json!(791_000));
+        // Feed display fields (#4497) ride the same `meta`, so the egress
+        // publishes them with no schema revision.
+        assert_eq!(req["meta"]["title"], json!("Add repo-qualified task_id"));
+        assert_eq!(req["meta"]["additions"], json!(214));
+        assert_eq!(req["meta"]["deletions"], json!(37));
         assert!(req["body"].as_str().unwrap().contains("merged ✓"));
     }
 
@@ -2308,6 +3444,28 @@ mod tests {
                 m["tokens"] = json!("791000");
                 m
             }),
+            // #4497 display fields are validated to the same standard as the
+            // pre-existing extensions.
+            ("additions is a string", {
+                let mut m = valid.clone();
+                m["additions"] = json!("214");
+                m
+            }),
+            ("deletions is negative", {
+                let mut m = valid.clone();
+                m["deletions"] = json!(-1);
+                m
+            }),
+            ("title is blank", {
+                let mut m = valid.clone();
+                m["title"] = json!("   ");
+                m
+            }),
+            ("title is not a string", {
+                let mut m = valid.clone();
+                m["title"] = json!(4497);
+                m
+            }),
         ];
         // Every required key, dropped one at a time.
         for key in COMPLETION_REQUIRED_KEYS {
@@ -2340,12 +3498,25 @@ mod tests {
         let meta = CompletionMeta {
             issue: None,
             tokens: None,
+            title: None,
+            additions: None,
+            deletions: None,
             ..sample_completion_meta()
         }
         .to_meta_value()
         .unwrap();
         assert!(meta.get("issue").is_none(), "absent issue must be omitted, not null/0");
         assert!(meta.get("tokens").is_none(), "absent tokens must be omitted, not null/0");
+        assert!(meta.get("title").is_none(), "absent title must be omitted, not null/empty");
+        assert!(meta.get("additions").is_none(), "absent additions must be omitted, not 0");
+        assert!(meta.get("deletions").is_none(), "absent deletions must be omitted, not 0");
+        // With every extension absent, the envelope is exactly the required
+        // completion-v1 object — no new keys, so no new failure modes (#4497).
+        assert_eq!(
+            meta.as_object().unwrap().len(),
+            COMPLETION_REQUIRED_KEYS.len(),
+            "all-absent extensions ⇒ meta identical to the required-keys-only envelope; got {meta}"
+        );
         // A zero token count is indistinguishable from "no accounting data".
         let zeroed = CompletionMeta {
             tokens: Some(0),
@@ -2354,6 +3525,67 @@ mod tests {
         .to_meta_value()
         .unwrap();
         assert!(zeroed.get("tokens").is_none());
+        // A blank/whitespace title would render as an empty feed row label.
+        for blank in ["", "   ", "\n\t"] {
+            let meta = CompletionMeta {
+                title: Some(blank.to_owned()),
+                ..sample_completion_meta()
+            }
+            .to_meta_value()
+            .unwrap();
+            assert!(meta.get("title").is_none(), "blank title must be omitted: {blank:?}");
+        }
+    }
+
+    #[test]
+    fn completion_meta_publishes_zero_diff_counts_and_trims_the_title() {
+        // Unlike `tokens`, `0` additions/deletions is a *fact* about the merge
+        // (a pure revert, an empty-diff merge commit), not a "no data" sentinel
+        // — so it is published rather than filtered (#4497).
+        let meta = CompletionMeta {
+            additions: Some(0),
+            deletions: Some(0),
+            title: Some("  fix: trim me  ".to_owned()),
+            ..sample_completion_meta()
+        }
+        .to_meta_value()
+        .unwrap();
+        assert_eq!(meta["additions"], json!(0));
+        assert_eq!(meta["deletions"], json!(0));
+        assert_eq!(meta["title"], json!("fix: trim me"));
+    }
+
+    #[test]
+    fn completion_meta_carries_the_title_verbatim_for_downstream_redaction() {
+        // Deny-pattern redaction is safehoused's egress job (it redacts every
+        // string in the published payload), not loom's — so the contract loom
+        // owns is that `title` reaches the wire as an ordinary JSON string in
+        // `meta`, exactly like `repo`/`ref`, with no escaping or bespoke
+        // encoding that would let it bypass that pass (#4497 AC3).
+        let secretish = "fix: rotate ghp_EXAMPLETOKEN0123456789 in \"prod\"\\config";
+        let env = build_completion_envelope(
+            Some("/x/loom"),
+            4497,
+            4500,
+            60,
+            &CompletionMeta {
+                title: Some(secretish.to_owned()),
+                ..sample_completion_meta()
+            },
+        )
+        .unwrap();
+        let req = build_send_request(&env, 1, Some("fleet")).unwrap();
+        assert_eq!(
+            req["meta"]["title"],
+            json!(secretish),
+            "title must be a plain JSON string in meta, like every other redactable field"
+        );
+        // And it survives a JSON round-trip through the wire encoding intact —
+        // the shape safehoused's redactor walks.
+        let line = serde_json::to_string(&req).unwrap();
+        let parsed: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed["meta"]["title"], json!(secretish));
+        assert!(parsed["meta"]["title"].is_string());
     }
 
     #[test]
@@ -2760,6 +3992,7 @@ mod tests {
             Duration::from_millis(20),
             Duration::from_millis(80),
             new_shared_state(),
+            None,
         ));
 
         bus.publish(Event::SweepGlobalDispatch {
@@ -2787,6 +4020,144 @@ mod tests {
             "dispatch body must be enriched with the fetched title; got: {body:?}"
         );
         assert!(body.contains("#4201 · dispatch"));
+    }
+
+    // ---- run_sink room routing end-to-end (#4225) ----
+
+    /// End-to-end through the sink and a stub safehoused: a `task` (phase) line
+    /// lazily creates and lands in the repo firehose room, while a `handoff`
+    /// (blocker) line from the *same* repo lands in the signal room — one room per
+    /// message, chosen by severity.
+    #[tokio::test]
+    async fn run_sink_routes_by_attention_class_and_creates_the_repo_room_lazily() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().to_string_lossy().into_owned();
+        let repo_name = dir
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let alias = format!("fleet-{repo_name}");
+
+        let socket = dir.path().join("safehoused.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        // 3 requests: create_room, the routed task send, the routed handoff send.
+        let server = tokio::spawn(stub_server(listener, false, 3));
+
+        let bus = Arc::new(EventBus::new());
+        let subscription = bus.subscribe(Vec::<String>::new());
+        let sink = tokio::spawn(run_sink(
+            SafehouseConfig {
+                enabled: true,
+                socket: Some(socket.clone()),
+                room: None,
+                rooms: Some(RoomMap {
+                    signal: Some("!signal:example.org".to_owned()),
+                    by_repo: std::collections::BTreeMap::new(),
+                }),
+                ..SafehouseConfig::default()
+            },
+            socket,
+            subscription,
+            Duration::from_millis(20),
+            Duration::from_millis(80),
+            new_shared_state(),
+            None,
+        ));
+
+        bus.publish(Event::SweepPhase {
+            issue: 4225,
+            phase: "builder".to_owned(),
+            pr_number: None,
+            repo: Some(repo.clone()),
+        })
+        .unwrap();
+        bus.publish(Event::SweepBlocker {
+            issue: 4225,
+            reason: "needs a human".to_owned(),
+            label_added: "loom:blocked".to_owned(),
+            repo: Some(repo),
+        })
+        .unwrap();
+
+        let received = tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("stub server must receive the create_room + both routed sends")
+            .unwrap();
+        drop(bus);
+        let _ = tokio::time::timeout(Duration::from_secs(2), sink).await;
+
+        assert_eq!(received.len(), 3);
+        // 1. The firehose room is created lazily, on this repo's first narration.
+        assert_eq!(received[0]["op"], json!("create_room"));
+        assert_eq!(received[0]["name"], json!(alias));
+        // 2. `task` (dispatch/phase chatter) → the repo firehose room.
+        assert_eq!(received[1]["op"], json!("send"));
+        assert_eq!(received[1]["type"], json!("task"));
+        assert_eq!(received[1]["room"], json!(alias));
+        // 3. `handoff` (a human must act) → the signal room, same repo.
+        assert_eq!(received[2]["type"], json!("handoff"));
+        assert_eq!(received[2]["room"], json!("!signal:example.org"));
+    }
+
+    /// The migration default: with **no** `rooms` map the wire shape is exactly
+    /// the pre-#4225 one — one send per event addressed at the single configured
+    /// room, and no `create_room` op ever.
+    #[tokio::test]
+    async fn run_sink_without_a_rooms_map_keeps_the_single_room_wire_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("safehoused.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(stub_server(listener, false, 1));
+
+        let bus = Arc::new(EventBus::new());
+        let subscription = bus.subscribe(Vec::<String>::new());
+        let state = new_shared_state();
+        let sink = tokio::spawn(run_sink(
+            SafehouseConfig {
+                enabled: true,
+                socket: Some(socket.clone()),
+                room: Some("loom-fleet".to_owned()),
+                rooms: None, // ← the migration default
+                ..SafehouseConfig::default()
+            },
+            socket.clone(),
+            subscription,
+            Duration::from_millis(20),
+            Duration::from_millis(80),
+            state.clone(),
+            None,
+        ));
+
+        // A `task`-class event, which routing mode would have sent to a firehose.
+        bus.publish(Event::SweepPhase {
+            issue: 4225,
+            phase: "builder".to_owned(),
+            pr_number: None,
+            repo: Some(dir.path().to_string_lossy().into_owned()),
+        })
+        .unwrap();
+
+        let received = tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("stub server must receive the single-room send")
+            .unwrap();
+        drop(bus);
+        let _ = tokio::time::timeout(Duration::from_secs(2), sink).await;
+
+        assert_eq!(received.len(), 1, "no create_room op, no extra sends");
+        assert_eq!(received[0]["op"], json!("send"));
+        assert_eq!(received[0]["type"], json!("task"));
+        assert_eq!(received[0]["room"], json!("loom-fleet"));
+        // …and `status` still reports the same room it always did.
+        assert_eq!(
+            snapshot_state(&state),
+            SafehouseState::Connected {
+                socket,
+                room: Some("loom-fleet".to_owned()),
+            }
+        );
     }
 
     // ---- completion emit point: SweepExited + forge merge check (#4426) ----
@@ -2820,7 +4191,93 @@ mod tests {
         (script_path, log)
     }
 
-    const MERGED_PR_JSON: &str = r#"[{"number":4400,"url":"https://github.com/rjwalters/loom/pull/4400","mergedAt":"2026-07-29T10:12:00Z"}]"#;
+    /// A `gh pr list` row carrying everything the enriched query asks for: the
+    /// load-bearing merge facts plus the #4497 feed display fields.
+    const MERGED_PR_JSON: &str = r#"[{"number":4400,"url":"https://github.com/rjwalters/loom/pull/4400","mergedAt":"2026-07-29T10:12:00Z","title":"feat: enrich completion meta","additions":214,"deletions":37}]"#;
+
+    /// The pre-#4497 row shape: merge facts only. Stands in for a forge/`gh`
+    /// that answers the query but returns none of the display fields — the
+    /// completion must still publish, minus those keys.
+    const MERGED_PR_JSON_NO_DISPLAY_FIELDS: &str = r#"[{"number":4400,"url":"https://github.com/rjwalters/loom/pull/4400","mergedAt":"2026-07-29T10:12:00Z"}]"#;
+
+    /// Build an activity DB under `dir` carrying exactly one per-issue token
+    /// rollup for `issue`, wired the way [`fetch_issue_tokens`]'s query reads it:
+    /// a recorded input, a forge event linking that input to the issue, and a
+    /// resource-usage sample linked to the same input.
+    fn seed_activity_db_with_issue_tokens(
+        dir: &std::path::Path,
+        issue: i32,
+        tokens_input: i64,
+        tokens_output: i64,
+    ) -> Arc<Mutex<ActivityDb>> {
+        use crate::activity::{
+            AgentInput, InputContext, InputType, PromptForgeEvent, PromptForgeEventType,
+        };
+
+        let db = ActivityDb::new(dir.join("activity.db")).unwrap();
+        let input_id = db
+            .record_input(&AgentInput {
+                id: None,
+                terminal_id: "loom-builder-1".to_owned(),
+                timestamp: Utc::now(),
+                input_type: InputType::Autonomous,
+                content: "/loom:builder".to_owned(),
+                agent_role: Some("builder".to_owned()),
+                context: InputContext::default(),
+            })
+            .unwrap();
+        db.record_prompt_forge_event(&PromptForgeEvent {
+            id: None,
+            input_id: Some(input_id),
+            issue_number: Some(issue),
+            pr_number: None,
+            label_before: None,
+            label_after: None,
+            event_type: PromptForgeEventType::PrCreated,
+        })
+        .unwrap();
+        db.record_resource_usage(&crate::activity::resource_usage::ResourceUsage {
+            input_id: Some(input_id),
+            model: "claude-opus-5".to_owned(),
+            tokens_input,
+            tokens_output,
+            tokens_cache_read: None,
+            tokens_cache_write: None,
+            cost_usd: 1.25,
+            duration_ms: Some(1_000),
+            provider: "anthropic".to_owned(),
+            timestamp: Utc::now(),
+        })
+        .unwrap();
+        Arc::new(Mutex::new(db))
+    }
+
+    /// Write an executable fake `gh` whose `pr list` arm **rejects** the
+    /// enriched `--json` field set exactly the way a `gh` too old to know
+    /// `additions` does, and answers the narrower pre-#4497 set. Also logs every
+    /// invocation so a test can prove the retry happened.
+    fn write_fake_gh_rejecting_display_fields(dir: &std::path::Path) -> (PathBuf, PathBuf) {
+        let log = dir.join("gh-forge-invocations.log");
+        let script_path = dir.join("fake-old-gh.sh");
+        let body = format!(
+            "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"{}\"\n\
+             case \"$1 $2\" in\n  \
+             'pr list')\n    \
+             if [[ \"$*\" == *additions* ]]; then\n      \
+             echo 'unknown JSON field: \"additions\"' >&2\n      exit 1\n    fi\n    \
+             printf '%s\\n' {}; exit 0 ;;\n  \
+             'repo view') printf '%s\\n' {}; exit 0 ;;\n  \
+             *) exit 1 ;;\nesac\n",
+            log.display(),
+            shell_quote(MERGED_PR_JSON_NO_DISPLAY_FIELDS),
+            shell_quote("rjwalters/loom"),
+        );
+        std::fs::write(&script_path, body).unwrap();
+        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).unwrap();
+        (script_path, log)
+    }
 
     #[tokio::test]
     #[serial]
@@ -2842,6 +4299,7 @@ mod tests {
             exited_at,
             &mut HashMap::new(),
             &mut std::collections::HashSet::new(),
+            None,
         )
         .await;
 
@@ -2859,9 +4317,160 @@ mod tests {
         // started_at is derived from the exit clock minus duration_sec.
         assert_eq!(meta["started_at"], json!("2026-07-29T10:00:00Z"));
         assert_eq!(meta["completed_at"], json!("2026-07-29T10:12:30Z"));
-        // No cheap token source is wired to the sink — omitted, never guessed.
+        // Feed display fields (#4497), harvested from the same `gh pr list` call
+        // that verified the merge — no extra forge round-trip.
+        assert_eq!(meta["title"], json!("feat: enrich completion meta"));
+        assert_eq!(meta["additions"], json!(214));
+        assert_eq!(meta["deletions"], json!(37));
+        // No activity-DB handle was threaded in ⇒ `tokens` is omitted, never
+        // guessed (the degradation contract).
         assert!(meta.get("tokens").is_none());
         assert!(build_send_request(&envelope, 1, None).is_ok());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn completion_for_exit_omits_display_fields_the_forge_did_not_return() {
+        // The pre-#4497 row shape: the merge facts are all there, none of the
+        // display fields are. The completion must still publish, with an
+        // envelope byte-identical to the pre-#4497 one (#4497 AC2).
+        let dir = tempfile::tempdir().unwrap();
+        let (fake_gh, _log) = write_fake_forge_gh(
+            dir.path(),
+            Some(MERGED_PR_JSON_NO_DISPLAY_FIELDS),
+            Some("rjwalters/loom"),
+        );
+        std::env::set_var(GH_BIN_ENV, &fake_gh);
+
+        let envelope = completion_for_exit(
+            "loom_daemon",
+            &dir.path().to_string_lossy(),
+            4426,
+            750,
+            Utc::now(),
+            &mut HashMap::new(),
+            &mut std::collections::HashSet::new(),
+            None,
+        )
+        .await;
+
+        std::env::remove_var(GH_BIN_ENV);
+        let envelope = envelope.expect("missing display fields must not cost us the completion");
+        let meta = envelope.meta.as_ref().unwrap();
+        for key in ["title", "additions", "deletions", "tokens"] {
+            assert!(meta.get(key).is_none(), "{key} must be omitted when unavailable");
+        }
+        // Required keys + `issue`, i.e. exactly the pre-#4497 envelope.
+        assert_eq!(meta.as_object().unwrap().len(), COMPLETION_REQUIRED_KEYS.len() + 1);
+        assert!(build_send_request(&envelope, 1, None).is_ok());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn completion_for_exit_retries_the_base_field_set_when_gh_rejects_the_new_ones() {
+        // A `gh` that does not know `additions` rejects the *whole* request, so
+        // without the narrower retry #4497 would have silently cost every
+        // completion on such a host.
+        let dir = tempfile::tempdir().unwrap();
+        let (fake_gh, log) = write_fake_gh_rejecting_display_fields(dir.path());
+        std::env::set_var(GH_BIN_ENV, &fake_gh);
+
+        let envelope = completion_for_exit(
+            "loom_daemon",
+            &dir.path().to_string_lossy(),
+            4426,
+            750,
+            Utc::now(),
+            &mut HashMap::new(),
+            &mut std::collections::HashSet::new(),
+            None,
+        )
+        .await;
+
+        std::env::remove_var(GH_BIN_ENV);
+        let envelope = envelope.expect("an old gh must still yield a completion, minus the extras");
+        let meta = envelope.meta.as_ref().unwrap();
+        assert_eq!(meta["ref"], json!("https://github.com/rjwalters/loom/pull/4400"));
+        assert!(meta.get("title").is_none());
+        assert!(meta.get("additions").is_none());
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            calls.contains("additions"),
+            "the enriched field set must be tried first; log: {calls:?}"
+        );
+        assert!(
+            calls
+                .lines()
+                .any(|l| l.starts_with("pr list") && !l.contains("additions")),
+            "the rejection must be retried with the base field set; log: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn completion_for_exit_carries_tokens_from_the_activity_db_rollup() {
+        // The per-issue rollup is the sink's token source (#4497). Attribution is
+        // knowingly imperfect (see `fetch_issue_tokens`), but when the DB *has* a
+        // rollup for the issue the completion must publish input+output.
+        let dir = tempfile::tempdir().unwrap();
+        let (fake_gh, _log) =
+            write_fake_forge_gh(dir.path(), Some(MERGED_PR_JSON), Some("rjwalters/loom"));
+        std::env::set_var(GH_BIN_ENV, &fake_gh);
+
+        let db = seed_activity_db_with_issue_tokens(dir.path(), 4426, 700_000, 91_000);
+
+        let envelope = completion_for_exit(
+            "loom_daemon",
+            &dir.path().to_string_lossy(),
+            4426,
+            750,
+            Utc::now(),
+            &mut HashMap::new(),
+            &mut std::collections::HashSet::new(),
+            Some(&db),
+        )
+        .await;
+
+        std::env::remove_var(GH_BIN_ENV);
+        let envelope = envelope.expect("a merged PR must produce a completion envelope");
+        let meta = envelope.meta.as_ref().unwrap();
+        assert_eq!(meta["tokens"], json!(791_000), "tokens = input + output");
+        assert!(build_send_request(&envelope, 1, None).is_ok());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn completion_for_exit_omits_tokens_when_the_rollup_is_empty() {
+        // "Omit rather than guess": an activity DB with no rollup for this issue
+        // must not publish a `0`, which the feed would chart as free work.
+        let dir = tempfile::tempdir().unwrap();
+        let (fake_gh, _log) =
+            write_fake_forge_gh(dir.path(), Some(MERGED_PR_JSON), Some("rjwalters/loom"));
+        std::env::set_var(GH_BIN_ENV, &fake_gh);
+
+        // Seeded for a *different* issue, so this issue's rollup is empty.
+        let db = seed_activity_db_with_issue_tokens(dir.path(), 999, 12_345, 678);
+
+        let envelope = completion_for_exit(
+            "loom_daemon",
+            &dir.path().to_string_lossy(),
+            4426,
+            750,
+            Utc::now(),
+            &mut HashMap::new(),
+            &mut std::collections::HashSet::new(),
+            Some(&db),
+        )
+        .await;
+
+        std::env::remove_var(GH_BIN_ENV);
+        let meta = envelope
+            .as_ref()
+            .and_then(|e| e.meta.as_ref())
+            .expect("an empty rollup must never cost us the completion");
+        assert!(meta.get("tokens").is_none(), "an empty rollup ⇒ omitted, not 0");
+        // The forge-sourced display fields are unaffected by the token miss.
+        assert_eq!(meta["title"], json!("feat: enrich completion meta"));
     }
 
     #[tokio::test]
@@ -2881,6 +4490,7 @@ mod tests {
             Utc::now(),
             &mut HashMap::new(),
             &mut std::collections::HashSet::new(),
+            None,
         )
         .await;
 
@@ -2903,6 +4513,7 @@ mod tests {
             Utc::now(),
             &mut HashMap::new(),
             &mut std::collections::HashSet::new(),
+            None,
         )
         .await;
 
@@ -2931,6 +4542,7 @@ mod tests {
             Utc::now(),
             &mut slug_cache,
             &mut completed,
+            None,
         )
         .await;
         let second = completion_for_exit(
@@ -2941,6 +4553,7 @@ mod tests {
             Utc::now(),
             &mut slug_cache,
             &mut completed,
+            None,
         )
         .await;
 
@@ -2982,6 +4595,7 @@ mod tests {
             Duration::from_millis(20),
             Duration::from_millis(80),
             new_shared_state(),
+            None,
         ));
 
         bus.publish(Event::SweepExited {
@@ -3011,6 +4625,11 @@ mod tests {
         assert_eq!(received[1]["meta"]["repo"], json!("rjwalters/loom"));
         assert_eq!(received[1]["meta"]["result"], json!("success"));
         assert_eq!(received[1]["meta"]["issue"], json!(4426));
+        // The #4497 display fields make it all the way onto the wire, where
+        // safehoused's egress redacts and publishes them.
+        assert_eq!(received[1]["meta"]["title"], json!("feat: enrich completion meta"));
+        assert_eq!(received[1]["meta"]["additions"], json!(214));
+        assert_eq!(received[1]["meta"]["deletions"], json!(37));
         // Both lines thread together under the repo-qualified task_id.
         assert_eq!(received[0]["task_id"], received[1]["task_id"]);
         assert!(received[1]["body"].as_str().unwrap().contains("merged ✓"));
@@ -3040,6 +4659,7 @@ mod tests {
             Duration::from_millis(20),
             Duration::from_millis(80),
             new_shared_state(),
+            None,
         ));
 
         bus.publish(Event::SweepExited {
@@ -3310,6 +4930,7 @@ mod tests {
             Duration::from_millis(50),
             Duration::from_millis(200),
             state.clone(),
+            None,
         ));
 
         // Event 1 → rejected → send_rejected (with reason), NOT unreachable.
@@ -3406,6 +5027,7 @@ mod tests {
             Duration::from_millis(30),
             Duration::from_millis(60),
             state.clone(),
+            None,
         ));
 
         // Event 1 → conn1 rejects → SendRejected.
@@ -3475,6 +5097,7 @@ mod tests {
             &bus,
             &tokio::runtime::Handle::current(),
             state.clone(),
+            None,
         );
         assert!(handle.is_none(), "disabled ⇒ no sink task");
         // The load-bearing no-op assertion: no subscription was created.
@@ -3504,6 +5127,7 @@ mod tests {
             Duration::from_millis(50),
             Duration::from_millis(200),
             state.clone(),
+            None,
         ));
 
         // Publish a burst; the sink must consume them all without wedging.
@@ -3556,6 +5180,7 @@ mod tests {
             Duration::from_millis(20),
             Duration::from_millis(80),
             state.clone(),
+            None,
         ));
 
         // First event: delivered over listener1.
@@ -3725,6 +5350,85 @@ mod tests {
             other => panic!("expected Connected, got {other:?}"),
         }
         server.await.unwrap();
+        task.abort();
+    }
+
+    /// #4225's resolved open question: claim ads are per-repo `task` chatter, but
+    /// they are advertised into the **signal room** as a deliberate exception —
+    /// it is the only room every host's bot is guaranteed to be joined to, and
+    /// cross-host dedup is a correctness property (see `run_coordination`'s doc
+    /// comment). The reader is trivially consistent with that choice because it
+    /// consumes any inbound claim regardless of room.
+    #[tokio::test]
+    async fn coordination_advertises_claim_ads_into_the_signal_room() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("safehoused.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read_half, mut write_half) = stream.into_split();
+            let mut lines = BufReader::new(read_half).lines();
+            let hello: Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            assert_eq!(hello["op"], json!("hello"));
+            write_half
+                .write_all(b"{\"ok\":true,\"id\":0}\n")
+                .await
+                .unwrap();
+            let ad: Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            let reply = json!({"ok": true, "id": ad["id"].clone()});
+            write_half
+                .write_all(format!("{reply}\n").as_bytes())
+                .await
+                .unwrap();
+            ad
+        });
+
+        let view = Arc::new(Mutex::new(PeerClaimView::new("me".into(), Duration::from_secs(120))));
+        let sink: Arc<dyn InboundEventSink> = Arc::new(PeerClaimSink::new(view));
+        let (tx, rx) = tokio::sync::mpsc::channel::<ClaimAd>(8);
+
+        let task = tokio::spawn(run_coordination(
+            SafehouseConfig {
+                enabled: true,
+                socket: Some(socket.clone()),
+                // Routing mode with the legacy scalar `room` unset — exactly the
+                // configuration in which an ad would be rejected outright
+                // (`'room' required`) if it did not resolve the signal room.
+                room: None,
+                rooms: Some(RoomMap {
+                    signal: Some("!signal:example.org".to_owned()),
+                    by_repo: [("loom".to_owned(), "!fleet-loom:example.org".to_owned())]
+                        .into_iter()
+                        .collect(),
+                }),
+                ..SafehouseConfig::default()
+            },
+            socket,
+            sink,
+            rx,
+            Duration::from_millis(20),
+            Duration::from_millis(80),
+            new_shared_state(),
+        ));
+
+        tx.send(ClaimAd::advertise(4225, "loom".into(), "maple".into(), 7, "ts".into()))
+            .await
+            .unwrap();
+
+        let ad = tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("the stub must receive the claim ad")
+            .unwrap();
+        assert_eq!(ad["op"], json!("send"));
+        assert_eq!(ad["type"], json!("task"));
+        assert_eq!(
+            ad["room"],
+            json!("!signal:example.org"),
+            "claim ads ride the signal room, NOT the repo firehose (documented exception)"
+        );
         task.abort();
     }
 

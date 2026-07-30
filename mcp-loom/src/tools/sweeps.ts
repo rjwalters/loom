@@ -157,6 +157,51 @@ interface ListResponse {
   };
 }
 
+/**
+ * Precedence tier that selected a runtime — mirrors the Rust `RuntimeSource`
+ * enum (`loom-daemon/src/runtime_admission.rs`, serde `rename_all =
+ * "kebab-case"`).
+ */
+export type RuntimeSource =
+  | "explicit"
+  | "role-environment"
+  | "global-environment"
+  | "role-config"
+  | "default-config"
+  | "built-in";
+
+/**
+ * `RuntimeRejection` mirrors the Rust struct of the same name (issue #4494,
+ * epic #4489 Phase 5): a fail-closed runtime-capability admission refusal,
+ * returned INSTEAD of a sweep when the resolved runtime cannot safely run the
+ * requested role/lifecycle. Structured and secret-free by construction — no
+ * token name, account, or credential material rides this payload.
+ */
+export interface RuntimeRejection {
+  /** Canonical role/lifecycle the decision was made for (`sweep-lifecycle`). */
+  role: string;
+  /** Runtime that was resolved and then refused. */
+  runtime: string;
+  /** Precedence tier that selected `runtime`. */
+  source: RuntimeSource;
+  /** Named capabilities the runtime failed to declare as exactly `"yes"`. */
+  unmet_capabilities: string[];
+  /** Operator-facing reason (mirrors the daemon's own wording). */
+  reason: string;
+}
+
+/**
+ * Typed capability-admission refusal (issue #4494). Before this the bridge had
+ * no model for the variant, so `dispatch_sweep` reported the useless
+ * `Unexpected response: RuntimeRejected` and DISCARDED the whole
+ * role/runtime/source/unmet payload the daemon had gone to the trouble of
+ * emitting.
+ */
+interface RuntimeRejectedResponse {
+  type: "RuntimeRejected";
+  payload: RuntimeRejection;
+}
+
 interface ErrorResponse {
   type: "Error";
   payload?: { message?: string };
@@ -257,6 +302,7 @@ type DaemonResponse =
   | WatchRegisteredResponse
   | WatchListResponse
   | WatchRemovedResponse
+  | RuntimeRejectedResponse
   | ErrorResponse
   | StructuredErrorResponse
   | { type: string; payload?: unknown };
@@ -264,6 +310,52 @@ type DaemonResponse =
 // ============================================================================
 // Helpers
 // ============================================================================
+
+/**
+ * Extract the typed capability-admission refusal (issue #4494), or `null` when
+ * the response is not one. Exported for tests: this is the seam that keeps the
+ * structured payload from being flattened into an opaque string.
+ */
+export function extractRuntimeRejection(response: DaemonResponse): RuntimeRejection | null {
+  if (response.type !== "RuntimeRejected") return null;
+  const raw = (response as { payload?: unknown }).payload;
+  if (typeof raw !== "object" || raw === null) return null;
+  const payload = raw as Partial<RuntimeRejection>;
+  const unmet = Array.isArray(payload.unmet_capabilities)
+    ? (payload.unmet_capabilities as unknown[]).filter((c): c is string => typeof c === "string")
+    : [];
+  return {
+    role: typeof payload.role === "string" ? payload.role : "unknown",
+    runtime: typeof payload.runtime === "string" ? payload.runtime : "unknown",
+    source: (typeof payload.source === "string" ? payload.source : "built-in") as RuntimeSource,
+    unmet_capabilities: unmet,
+    reason: typeof payload.reason === "string" ? payload.reason : "runtime admission refused",
+  };
+}
+
+/**
+ * Render a refusal as a single actionable operator line (issue #4494). Names
+ * every field the acceptance contract requires — role/lifecycle, runtime, the
+ * precedence tier that selected it, and the unmet capability names — so the
+ * diagnostic survives the string-only `error` channel of a tool result even
+ * though `runtime_rejection` also carries it structurally.
+ */
+export function formatRuntimeRejection(rejection: RuntimeRejection): string {
+  const unmet =
+    rejection.unmet_capabilities.length > 0
+      ? `; unmet capabilities: ${rejection.unmet_capabilities.join(", ")}`
+      : "";
+  const lifecycleNote =
+    rejection.role === "sweep-lifecycle"
+      ? " A full sweep runs as one runtime and is admitted against Builder's requirements;" +
+        " a per-role binding cannot switch runtimes between phases."
+      : "";
+  return (
+    `Runtime admission refused this dispatch (fail-closed): role=${rejection.role}, ` +
+    `runtime=${rejection.runtime}, selected by=${rejection.source}${unmet}. ` +
+    `${rejection.reason}.${lifecycleNote}`
+  );
+}
 
 function extractError(response: DaemonResponse): string | null {
   if (response.type === "Error") {
@@ -273,6 +365,10 @@ function extractError(response: DaemonResponse): string | null {
   if (response.type === "StructuredError") {
     const r = response as StructuredErrorResponse;
     return r.payload?.message || "Unknown structured error";
+  }
+  const rejection = extractRuntimeRejection(response);
+  if (rejection) {
+    return formatRuntimeRejection(rejection);
   }
   return null;
 }
@@ -350,7 +446,10 @@ async function dispatchSweep(args: {
   depends_on?: number;
   workspace_root?: string;
   force?: boolean;
-}): Promise<{ success: true; result: DispatchResponse["payload"] } | { success: false; error: string }> {
+}): Promise<
+  | { success: true; result: DispatchResponse["payload"] }
+  | { success: false; error: string; runtime_rejection?: RuntimeRejection }
+> {
   try {
     const response = (await sendDaemonRequest({
       type: "DispatchSweep",
@@ -386,6 +485,19 @@ async function dispatchSweep(args: {
     if (response.type === "SweepDispatched") {
       const payload = (response as DispatchResponse).payload;
       return { success: true, result: payload };
+    }
+
+    // Issue #4494: a fail-closed capability refusal is a first-class dispatch
+    // outcome. Return the STRUCTURED payload alongside the rendered line so an
+    // operator/agent sees the role, runtime, precedence tier, and the named
+    // unmet capabilities rather than "Unexpected response: RuntimeRejected".
+    const rejection = extractRuntimeRejection(response);
+    if (rejection) {
+      return {
+        success: false,
+        error: formatRuntimeRejection(rejection),
+        runtime_rejection: rejection,
+      };
     }
 
     const err = extractError(response);
@@ -712,12 +824,16 @@ export const sweepTools: Tool[] = [
         workspace_root: {
           type: "string",
           description:
-            "Optional target managed-workspace root (issue #3929). Omit to " +
-            "dispatch into the daemon's default workspace (unchanged behavior). " +
-            "Provide a registered repo root to dispatch the sweep into that " +
-            "repo's working tree / sweep registry — required to address a " +
-            "managed repo other than the default when two repos share issue " +
-            "numbers.",
+            "Optional target managed-workspace root (issue #3929). Omitting " +
+            "it is NOT a safe no-op on a host with multiple registered " +
+            "workspaces (post-#4299/PR #4322 registry resolution): the " +
+            "daemon either returns a structured ambiguity error when no " +
+            "default applies, or — the dangerous case — silently resolves " +
+            "to the daemon's seeded default workspace when that default is " +
+            "itself registered, dispatching into the wrong repo with no " +
+            "warning (issue #4503). Callers should always pass the repo " +
+            "root they intend to target, e.g. `$(git rev-parse " +
+            "--show-toplevel)`, rather than relying on omission.",
         },
         force: {
           type: "boolean",
@@ -1149,10 +1265,26 @@ export async function handleSweepTool(
         force,
       });
       if (!result.success) {
+        // Issue #4494: a capability refusal renders the structured fields as
+        // named lines (role / runtime / selected by / unmet capabilities) so
+        // the diagnostic is readable in the transcript, not just a sentence.
+        const rejection = result.runtime_rejection;
+        const detail = rejection
+          ? `\n\n${[
+              `Role:       ${rejection.role}`,
+              `Runtime:    ${rejection.runtime}`,
+              `Selected by: ${rejection.source}`,
+              `Unmet:      ${
+                rejection.unmet_capabilities.length > 0
+                  ? rejection.unmet_capabilities.join(", ")
+                  : "(none — config/adapter/manifest refusal)"
+              }`,
+            ].join("\n")}`
+          : "";
         return [
           {
             type: "text",
-            text: `=== Dispatch Sweep ===\n\nFailed\n\n${result.error}`,
+            text: `=== Dispatch Sweep ===\n\nFailed\n\n${result.error}${detail}`,
           },
         ];
       }

@@ -20,7 +20,7 @@
 //!   surface; see each module's doc comment for its Python counterpart).
 
 pub mod aggressive;
-mod claim_file;
+pub mod claim_file;
 pub mod clean;
 mod gh;
 mod liveness;
@@ -28,5 +28,9 @@ pub mod logs;
 pub(crate) mod naming;
 pub mod orphan_recovery;
 pub mod repo;
-mod safety;
+pub(crate) mod safety;
 mod spawn_loop_state;
+
+pub use claim_file::{
+    has_valid_claim, is_abandoned as claim_is_abandoned, is_expired as claim_is_expired,
+};

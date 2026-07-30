@@ -91,7 +91,7 @@ use crate::cpu_headroom::{
 use crate::disk_headroom::disk_headroom_limit;
 use crate::event_bus::EventBus;
 use crate::main_health_gate::{MainHealthState, WorkspaceHealthStates};
-use crate::sweep_registry::{OpenPrDispatchError, ParkedIssueDispatchError};
+use crate::sweep_registry::{DispatchBackoffError, OpenPrDispatchError, ParkedIssueDispatchError};
 use crate::tokens::{token_pool_size, token_pool_size_at_dir};
 use crate::types::Event;
 use crate::workspace_pool::WorkspacePool;
@@ -390,6 +390,23 @@ pub trait WorkDispatcher {
         HashSet::new()
     }
 
+    /// The set of issue numbers currently inside a **per-issue dispatch backoff
+    /// window** after a failed dispatch (Issue #4485). Skipped exactly like
+    /// [`quarantined`](Self::quarantined) — filtered out *before* the
+    /// concurrency budget is filled, so a backed-off candidate never reserves a
+    /// shared dispatch slot.
+    ///
+    /// Complements (does not replace) the registry-side step-2.8 guard: this
+    /// keeps a backed-off issue from consuming a slot and from logging a refusal
+    /// every tick, while the guard is the authoritative brake that also covers
+    /// the watchdog / IPC / epic-supervisor dispatch paths.
+    ///
+    /// Defaults to empty so a dispatcher that does not model the backoff (e.g. a
+    /// test fake) opts out with zero boilerplate.
+    fn backed_off(&self) -> HashSet<u32> {
+        HashSet::new()
+    }
+
     /// Cumulative count of cross-host dispatch collisions this dispatcher's
     /// registry has observed (Issue #4085, Phase 0 of #4028) — dispatches whose
     /// pre-flip label read showed a peer host claimed the issue first. Read once
@@ -494,6 +511,13 @@ pub struct TickReport {
     /// separate from the collisions it did not. Always `0` when
     /// `safehouse.enabled` is false (the dispatcher's `peer_claimed()` is empty).
     pub skipped_peer_claim: usize,
+    /// Issues skipped because they are inside a per-issue dispatch-backoff
+    /// window after a failed dispatch (Issue #4485) — either filtered out before
+    /// the capacity gate via [`WorkDispatcher::backed_off`], or refused by the
+    /// registry's step-2.8 guard with the typed [`DispatchBackoffError`].
+    /// Attributed here rather than to [`errors`](Self::errors) because a backoff
+    /// refusal is a deliberate skip, not a failure.
+    pub skipped_backoff: usize,
     /// Dispatch attempts that returned an error (logged, non-fatal).
     pub errors: usize,
     /// Cumulative cross-host dispatch collisions observed (Issue #4085, Phase 0
@@ -591,6 +615,7 @@ pub fn tick_with_admission_cap(
 
     let in_flight = dispatcher.in_flight();
     let quarantined = dispatcher.quarantined();
+    let backed_off = dispatcher.backed_off();
     let peer_claimed = dispatcher.peer_claimed();
     // Occupancy (Issue #4003) is a distinct, possibly-smaller count than
     // `in_flight.len()`: a dispatcher may discount a spawned-but-unproven
@@ -618,6 +643,14 @@ pub fn tick_with_admission_cap(
         //     capacity gate so a quarantined issue never consumes a slot.
         if quarantined.contains(&item.number) {
             report.skipped_quarantined += 1;
+            continue;
+        }
+        // 2b2. Dispatch backoff (#4485): this issue's last dispatch failed and
+        //      its backoff window has not elapsed. Skipped here — before the
+        //      capacity gate, like quarantine — so it neither reserves a slot
+        //      nor re-flips its label every tick.
+        if backed_off.contains(&item.number) {
+            report.skipped_backoff += 1;
             continue;
         }
         // 2c. Peer soft claim (#4028): a peer host advertised a live claim over
@@ -686,6 +719,12 @@ pub fn tick_with_admission_cap(
                         item.number,
                         parked.label
                     );
+                } else if e.downcast_ref::<DispatchBackoffError>().is_some() {
+                    // Dispatch backoff refusal (#4485) — a deliberate skip, not
+                    // a failure. Reachable even when `backed_off()` was empty at
+                    // tick start (the window can be armed mid-tick by a reap).
+                    report.skipped_backoff += 1;
+                    log::info!("work_finder: skipping issue #{} — {e}", item.number);
                 } else {
                     report.errors += 1;
                     log::warn!("work_finder: dispatch for issue #{} failed: {e}", item.number);
@@ -852,6 +891,12 @@ pub fn tick_multi_with_admission_cap<S: WorkSource, D: WorkDispatcher>(
     let quarantined_sets: Vec<HashSet<u32>> =
         workspaces.iter().map(|(_, d)| d.quarantined()).collect();
 
+    // Snapshot each workspace's dispatch-backoff set (#4485) alongside its
+    // quarantined set — dropped in pass 1 for the same reason: a backed-off
+    // candidate must not reserve a shared slot it cannot use.
+    let backed_off_sets: Vec<HashSet<u32>> =
+        workspaces.iter().map(|(_, d)| d.backed_off()).collect();
+
     // Snapshot each workspace's peer-claim set (#4028) alongside its quarantined
     // set. A peer's live soft claim drops the candidate in pass 1, before the
     // global sort and slot fill, so a peer-claimed issue never reserves a shared
@@ -923,6 +968,12 @@ pub fn tick_multi_with_admission_cap<S: WorkSource, D: WorkDispatcher>(
             // enters the global queue, so it consumes no shared slot.
             if quarantined_sets[idx].contains(&item.number) {
                 report.skipped_quarantined += 1;
+                continue;
+            }
+            // Dispatch backoff (#4485): a failing issue inside its backoff
+            // window — drop before the global queue, like quarantine.
+            if backed_off_sets[idx].contains(&item.number) {
+                report.skipped_backoff += 1;
                 continue;
             }
             // Peer soft claim (#4028): a peer host is already building it — drop
@@ -1001,6 +1052,11 @@ pub fn tick_multi_with_admission_cap<S: WorkSource, D: WorkDispatcher>(
                         cand.number,
                         parked.label
                     );
+                } else if e.downcast_ref::<DispatchBackoffError>().is_some() {
+                    // Dispatch backoff refusal (#4485) — see the single-workspace
+                    // `tick` for the rationale. A skip, not a failure.
+                    report.skipped_backoff += 1;
+                    log::info!("work_finder: skipping issue #{} — {e}", cand.number);
                 } else {
                     report.errors += 1;
                     log::warn!("work_finder: dispatch for issue #{} failed: {e}", cand.number);
@@ -1537,6 +1593,7 @@ where
                     if report.dispatched > 0
                         || report.errors > 0
                         || report.skipped_quarantined > 0
+                        || report.skipped_backoff > 0
                         || report.skipped_pr_open > 0
                         || report.skipped_peer_claim > 0
                         || report.deferred_ramp_cap > 0
@@ -1546,7 +1603,8 @@ where
                              healthy={token_limit}, per_token={per_token_concurrency}, disk={disk}, \
                              cpu={cpu}, ceiling={configured_max}, ramp_cap={max_admissions_per_tick}); \
                              {} seen, {} dispatched, {} labeled-skip, {} in-flight-skip, \
-                             {} quarantine-skip, {} pr-open-skip, {} peer-claim-skip, \
+                             {} quarantine-skip, {} backoff-skip, {} pr-open-skip, \
+                             {} peer-claim-skip, \
                              {} deferred (capacity), {} deferred (ramp), {} error(s), \
                              {} cross-host-collision(s)",
                             report.seen,
@@ -1554,6 +1612,7 @@ where
                             report.skipped_labeled,
                             report.skipped_in_flight,
                             report.skipped_quarantined,
+                            report.skipped_backoff,
                             report.skipped_pr_open,
                             report.skipped_peer_claim,
                             report.deferred_capacity,
@@ -1858,6 +1917,7 @@ pub fn spawn_multi_work_finder_task(
             if report.dispatched > 0
                 || report.errors > 0
                 || report.skipped_quarantined > 0
+                || report.skipped_backoff > 0
                 || report.skipped_pr_open > 0
                 || report.skipped_peer_claim > 0
                 || report.deferred_ramp_cap > 0
@@ -1868,7 +1928,8 @@ pub fn spawn_multi_work_finder_task(
                      cpu={cpu}, ceiling={configured_max}, ramp_cap={max_admissions_per_tick}); \
                      {} workspace(s), \
                      {} seen, {} dispatched, {} labeled-skip, {} in-flight-skip, \
-                     {} quarantine-skip, {} pr-open-skip, {} peer-claim-skip, \
+                     {} quarantine-skip, {} backoff-skip, {} pr-open-skip, \
+                     {} peer-claim-skip, \
                      {} deferred (capacity), {} deferred (ramp), {} error(s), \
                      {} cross-host-collision(s)",
                     pairs.len(),
@@ -1877,6 +1938,7 @@ pub fn spawn_multi_work_finder_task(
                     report.skipped_labeled,
                     report.skipped_in_flight,
                     report.skipped_quarantined,
+                    report.skipped_backoff,
                     report.skipped_pr_open,
                     report.skipped_peer_claim,
                     report.deferred_capacity,
@@ -2153,6 +2215,19 @@ pub mod forge {
             }
         }
 
+        /// Issues inside a live per-issue dispatch-backoff window (Issue #4485).
+        /// Pure in-memory read of the registry state the reaper maintains — no
+        /// forge round trip, mirroring `quarantined()`.
+        fn backed_off(&self) -> HashSet<u32> {
+            match self.registry.lock() {
+                Ok(reg) => reg.dispatch_backoff_issues(chrono::Utc::now()),
+                Err(poisoned) => {
+                    log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
+                    HashSet::new()
+                }
+            }
+        }
+
         /// Discounted occupancy count (Issue #4003): a sweep dispatched longer
         /// than the registry's configured startup-proof grace window with zero
         /// observed startup signal does not count toward the budget — see
@@ -2313,6 +2388,14 @@ mod tests {
         parked_issues: HashSet<u32>,
         /// Issue numbers this dispatcher reports as quarantined (Issue #3939).
         quarantined: HashSet<u32>,
+        /// Issue numbers this dispatcher reports as inside a dispatch-backoff
+        /// window (Issue #4485).
+        backed_off: HashSet<u32>,
+        /// Issue numbers whose dispatch should be refused by the dispatch-backoff
+        /// guard (#4485) — the dispatcher returns the typed
+        /// [`DispatchBackoffError`], as `SweepRegistry::dispatch` step 2.8 does
+        /// when a window is armed mid-tick.
+        backoff_refuse_issues: HashSet<u32>,
         /// Cumulative cross-host collision count this dispatcher reports (#4085).
         collisions: u64,
         /// Issue numbers a peer host has soft-claimed over safehouse (#4028).
@@ -2326,6 +2409,9 @@ mod tests {
         fn quarantined(&self) -> HashSet<u32> {
             self.quarantined.clone()
         }
+        fn backed_off(&self) -> HashSet<u32> {
+            self.backed_off.clone()
+        }
         fn collisions(&self) -> u64 {
             self.collisions
         }
@@ -2333,6 +2419,14 @@ mod tests {
             self.peer_claimed.clone()
         }
         fn dispatch(&mut self, issue: u32) -> Result<bool> {
+            if self.backoff_refuse_issues.contains(&issue) {
+                return Err(DispatchBackoffError {
+                    issue,
+                    consecutive: 2,
+                    retry_after_secs: 120,
+                }
+                .into());
+            }
             if self.pr_open_issues.contains(&issue) {
                 // Mirror the production `SweepRegistry::dispatch` open-PR guard:
                 // refuse with the typed, downcast-matchable error (#4123).
@@ -2633,6 +2727,58 @@ exit 0
     }
 
     #[test]
+    fn test_tick_skips_backed_off_issue() {
+        // Dispatch backoff (#4485): an issue inside its backoff window is skipped
+        // — never dispatched — and counted in `skipped_backoff`, while its
+        // healthy siblings dispatch normally.
+        let mut source = FakeSource::once(vec![issue(1), issue(2), issue(3)]);
+        let mut disp = RecordingDispatcher {
+            backed_off: HashSet::from([2]),
+            ..Default::default()
+        };
+        let report = tick(&mut source, &mut disp, 10, false).unwrap();
+
+        assert_eq!(report.skipped_backoff, 1, "#2 is inside its backoff window");
+        assert_eq!(report.dispatched, 2, "#1 and #3 still dispatch");
+        assert_eq!(disp.dispatched, vec![1, 3], "#2 never dispatched");
+    }
+
+    #[test]
+    fn test_tick_backed_off_does_not_consume_capacity_slot() {
+        // The backoff skip happens BEFORE the capacity gate (like quarantine), so
+        // a backed-off issue never reserves a slot the healthy sibling could use.
+        let mut source = FakeSource::once(vec![issue(1), issue(2)]);
+        let mut disp = RecordingDispatcher {
+            backed_off: HashSet::from([1]),
+            ..Default::default()
+        };
+        let report = tick(&mut source, &mut disp, 1, false).unwrap();
+
+        assert_eq!(report.skipped_backoff, 1);
+        assert_eq!(report.dispatched, 1);
+        assert_eq!(disp.dispatched, vec![2], "the single slot goes to the healthy #2");
+    }
+
+    #[test]
+    fn test_tick_attributes_backoff_refusal_to_skipped_backoff() {
+        // A backoff window armed mid-tick (by a reap between `backed_off()` and
+        // the dispatch call) surfaces as the typed `DispatchBackoffError`. That is
+        // a deliberate skip, NOT a dispatch failure: it must land in
+        // `skipped_backoff`, never in `errors`.
+        let mut source = FakeSource::once(vec![issue(7), issue(8)]);
+        let mut disp = RecordingDispatcher {
+            backoff_refuse_issues: HashSet::from([7]),
+            ..Default::default()
+        };
+        let report = tick(&mut source, &mut disp, 10, false).unwrap();
+
+        assert_eq!(report.skipped_backoff, 1, "#7's refusal is a backoff skip");
+        assert_eq!(report.errors, 0, "a backoff refusal is never a dispatch error");
+        assert_eq!(report.dispatched, 1);
+        assert_eq!(disp.dispatched, vec![8]);
+    }
+
+    #[test]
     fn test_tick_quarantined_does_not_consume_capacity_slot() {
         // The quarantine skip happens BEFORE the capacity gate, so a quarantined
         // issue never reserves a slot: with cap 1 and #1 quarantined, #2 gets the
@@ -2671,6 +2817,48 @@ exit 0
         assert_eq!(report.dispatched, 1);
         assert!(multi[0].1.dispatched.is_empty(), "quarantined workspace dispatches nothing");
         assert_eq!(multi[1].1.dispatched, vec![10], "healthy sibling gets the shared slot");
+    }
+
+    #[test]
+    fn test_tick_multi_backed_off_workspace_does_not_starve_sibling() {
+        // #4485, mirroring the #3939 quarantine property: workspace A's only
+        // candidate is inside its dispatch-backoff window; workspace B has a
+        // healthy candidate. With a shared cap of 1, B's issue MUST be dispatched
+        // — a backed-off candidate never reserves the shared slot.
+        let mut multi = vec![
+            (
+                FakeSource::once(vec![issue(1)]),
+                RecordingDispatcher {
+                    backed_off: HashSet::from([1]),
+                    ..Default::default()
+                },
+            ),
+            (FakeSource::once(vec![issue(10)]), RecordingDispatcher::default()),
+        ];
+        let report = tick_multi(&mut multi, &[], 1, &[false, false]);
+
+        assert_eq!(report.skipped_backoff, 1, "workspace A's #1 is backed off");
+        assert_eq!(report.dispatched, 1);
+        assert!(multi[0].1.dispatched.is_empty(), "backed-off workspace dispatches nothing");
+        assert_eq!(multi[1].1.dispatched, vec![10], "healthy sibling gets the shared slot");
+    }
+
+    #[test]
+    fn test_tick_multi_backoff_refusal_counts_as_backoff_skip() {
+        // A mid-tick backoff refusal in `tick_multi` is attributed to
+        // `skipped_backoff`, not `errors` — same typed-downcast rule as `tick`.
+        let mut multi = vec![(
+            FakeSource::once(vec![issue(5), issue(6)]),
+            RecordingDispatcher {
+                backoff_refuse_issues: HashSet::from([5]),
+                ..Default::default()
+            },
+        )];
+        let report = tick_multi(&mut multi, &[], 10, &[false]);
+
+        assert_eq!(report.skipped_backoff, 1);
+        assert_eq!(report.errors, 0);
+        assert_eq!(multi[0].1.dispatched, vec![6]);
     }
 
     #[test]

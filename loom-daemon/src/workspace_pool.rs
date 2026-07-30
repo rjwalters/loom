@@ -137,13 +137,31 @@ impl WorkspacePool {
     /// returns without subscribing or touching a socket. Best-effort by
     /// contract — a missing/refused peer degrades to a `warn`, never a sweep
     /// failure. The handle is detached (daemon-lifetime).
-    pub fn start_safehouse_narration(&self, repo_root: &Path) {
+    ///
+    /// `activity_db` (#4497) is threaded to the completion emit point purely so
+    /// its public-feed `meta` can carry a best-effort per-issue `tokens` total;
+    /// `None` omits that field and changes nothing else.
+    ///
+    /// **Per-repo room routing (#4225) needs nothing threaded through here.** The
+    /// sink is a single subscriber on the pool's *shared* bus, and every narrated
+    /// event already carries its owning workspace root (`repo`, #3929/#4201) —
+    /// which is exactly the key `safehouse::RoomRouter` routes firehose traffic
+    /// by. So one sink resolving `safehouse.rooms` once (from `repo_root`, the
+    /// daemon's default workspace, the same layer that already owns socket /
+    /// persona / peer-claim TTL) routes **every** managed repo correctly, and no
+    /// per-workspace sink or per-repo config resolution is introduced.
+    pub fn start_safehouse_narration(
+        &self,
+        repo_root: &Path,
+        activity_db: Option<Arc<Mutex<crate::activity::ActivityDb>>>,
+    ) {
         let config = crate::safehouse::resolve_config(repo_root);
         let _ = crate::safehouse::spawn_sink(
             config,
             &self.event_bus,
             &self.runtime,
             self.safehouse_state.clone(),
+            activity_db,
         );
     }
 
@@ -284,6 +302,10 @@ impl WorkspacePool {
         // workspace so the reaper quarantines a repeatedly-insta-crashing issue
         // instead of letting it be re-dispatched every tick.
         registry.set_quarantine_config(sweep_registry::resolve_quarantine_config(root));
+        // Per-issue dispatch backoff (#4485): resolve env > config > default for
+        // this workspace so a failing issue's re-dispatch cadence is bounded
+        // even when its deaths land in a quarantine carve-out.
+        registry.set_dispatch_backoff_config(sweep_registry::resolve_dispatch_backoff_config(root));
         // Claude-wrapper pre-flight-death workspace tripwire (#4386): resolve
         // env > config > default for this workspace, mirroring the
         // insta-crash quarantine config above.
@@ -453,6 +475,34 @@ mod tests {
         std::fs::write(loom.join("config.json"), body).unwrap();
     }
 
+    /// Drop the safehouse **env layer** so the `.loom/config.json` written by
+    /// [`write_config`] is authoritative.
+    ///
+    /// `safehouse::apply_env_overrides` lets `$LOOM_SAFEHOUSE_ENABLED` /
+    /// `$LOOM_SAFEHOUSE_SOCKET` / `$LOOM_SAFEHOUSE_ROOM` win over config, and
+    /// `resolve_socket` falls back to `$SAFEHOUSED_SOCKET`. Any agent session
+    /// spawned by a running `loom-daemon` with safehouse narration on exports
+    /// exactly those, so a test that only writes a config file silently asserts
+    /// against the *host's* socket there instead of its own tempdir (#4385).
+    /// These tests passed under `cargo test` only because a sibling test in the
+    /// same process happened to clear the vars first — the class of accidental
+    /// dependency that per-test process isolation makes visible.
+    fn clear_safehouse_env() {
+        for key in [
+            "LOOM_SAFEHOUSE_ENABLED",
+            "LOOM_SAFEHOUSE_SOCKET",
+            "LOOM_SAFEHOUSE_ROOM",
+            // #4225's attention-class routing map is env-overridable too, so an
+            // ambient value would likewise leak the host's rooms into these tests.
+            "LOOM_SAFEHOUSE_ROOM_SIGNAL",
+            "LOOM_SAFEHOUSE_ROOMS_BY_REPO",
+            "LOOM_SAFEHOUSE_PERSONA",
+            "SAFEHOUSED_SOCKET",
+        ] {
+            std::env::remove_var(key);
+        }
+    }
+
     #[tokio::test]
     async fn provision_is_idempotent_per_root() {
         let dir = tempdir().unwrap();
@@ -512,7 +562,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn start_safehouse_narration_surfaces_unreachable_for_enabled_unresolved_socket() {
+        clear_safehouse_env();
         let dir = tempdir().unwrap();
         let root = dir.path().to_path_buf();
         let socket = dir.path().join("nope.sock"); // never bound
@@ -525,7 +577,7 @@ mod tests {
         );
         let pool = pool();
 
-        pool.start_safehouse_narration(&root);
+        pool.start_safehouse_narration(&root, None);
         // The sink reports "configured, not yet connected" immediately on
         // spawn (before any connect attempt) — poll briefly rather than
         // assuming the spawned task has already run once.
@@ -542,7 +594,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn start_peer_coordination_disabled_reports_not_configured_even_after_prior_state() {
+        clear_safehouse_env();
         let dir = tempdir().unwrap();
         let root = dir.path().to_path_buf();
         let socket = dir.path().join("nope.sock");
@@ -556,7 +610,7 @@ mod tests {
         let pool = pool();
 
         // Drive the cell to a non-default state first via the narration sink.
-        pool.start_safehouse_narration(&root);
+        pool.start_safehouse_narration(&root, None);
         let mut status = pool.safehouse_status();
         for _ in 0..50 {
             if status.state != "not_configured" {

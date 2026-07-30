@@ -14,8 +14,9 @@
       "enabled": true
     },
     "workFinder": {
-      "maxConcurrent": 8
-    }
+      "maxConcurrent": 10
+    },
+    "estCoresPerSweep": 1.25
   },
   "buildGate": {
     "enabled": true,
