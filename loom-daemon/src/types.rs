@@ -947,6 +947,26 @@ pub struct DaemonStatusReport {
     /// (an absent field parses as `false` — "not capacity-bound").
     #[serde(default)]
     pub capacity_bound: bool,
+    /// Whether the default/primary workspace's claude-wrapper pre-flight-death
+    /// tripwire is currently tripped (Issue #4386): N consecutive dispatches,
+    /// across *different* issues, died at the wrapper's MCP-init pre-flight
+    /// check before ever reaching `# CLAUDE_CLI_START` — the classic
+    /// stale-`.mcp.json` fleet-wide silent-failure signature. See
+    /// `SweepRegistry::preflight_advisory`. While `true`, the status renderer
+    /// must surface [`Self::preflight_advisory_message`] instead of — or
+    /// immediately alongside — the bare "not capacity-bound … the limiter is
+    /// work availability" line, so a fleet-wide spawn failure never reads as
+    /// an idle-healthy daemon. `#[serde(default)]` keeps pre-#4386 wire data /
+    /// older clients compatible (an absent field parses as `false`).
+    #[serde(default)]
+    pub preflight_advisory_active: bool,
+    /// The operator-facing advisory message when
+    /// [`Self::preflight_advisory_active`] is `true` (e.g. `"WARNING: last 3
+    /// dispatches died at claude-wrapper pre-flight (preflight-mcp-failed) —
+    /// check .mcp.json"`), else `None`. `#[serde(default)]` keeps pre-#4386
+    /// wire data compatible.
+    #[serde(default)]
+    pub preflight_advisory_message: Option<String>,
     /// Dynamic-cap input 4: the configured operator ceiling
     /// (`autonomous.workFinder.maxConcurrent` / `LOOM_WORK_FINDER_MAX_CONCURRENT`).
     pub configured_max: usize,
@@ -1553,6 +1573,17 @@ pub enum Event {
         #[serde(skip_serializing_if = "Option::is_none")]
         exit_code: Option<i32>,
         duration_sec: i64,
+        /// Issue #4386: set to a claude-wrapper pre-flight-death label (e.g.
+        /// `"preflight-mcp-failed"`, `"preflight-no-cli-start"`) when the
+        /// reaper's [`crate::sweep_registry::classify_preflight_death`]-derived
+        /// classification matched this dead sweep's log tail. `None` for every
+        /// other exit (including the common clean self-skip/no-work case).
+        /// This is an additive payload extension of the existing frozen
+        /// `sweep.issue.{N}.exited` topic — the topic string is unchanged.
+        /// `#[serde(default)]` keeps pre-#4386 wire data / older clients
+        /// compatible.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        death_class: Option<String>,
         /// Owning managed-workspace root (Issue #3929). See [`Self::SweepPhase`].
         #[serde(default, skip_serializing_if = "Option::is_none")]
         repo: Option<String>,
@@ -1570,6 +1601,14 @@ pub enum Event {
         /// when the log yields no recognizable signature (or is unreadable).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         classification: Option<String>,
+        /// Issue #4386: set to a claude-wrapper pre-flight-death label when
+        /// this dead sweep's log tail matched the pre-flight classifier —
+        /// same additive-payload-extension rationale as `SweepExited`'s
+        /// `death_class` field, applied here too because a stale checkpoint
+        /// from an earlier dispatch can route a pre-flight death through this
+        /// Crashed branch instead of `SweepExited`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        death_class: Option<String>,
         /// Owning managed-workspace root (Issue #3929). See [`Self::SweepPhase`].
         #[serde(default, skip_serializing_if = "Option::is_none")]
         repo: Option<String>,
@@ -1652,6 +1691,40 @@ pub enum Event {
         /// Operator-facing advisory message naming the concrete levers.
         message: String,
     },
+    /// `daemon.preflight.advisory` — a workspace's reaper crossed (or cleared)
+    /// the consecutive claude-wrapper pre-flight-death threshold (Issue
+    /// #4386): N dispatches in a row, across *different* issues, died at the
+    /// wrapper's MCP-init pre-flight check before ever reaching `# CLAUDE_CLI_
+    /// START` (the classic stale-`.mcp.json` fleet-wide silent failure).
+    /// Published by [`crate::sweep_registry::SweepRegistry`]'s reaper on
+    /// **state change only** (entered/left the tripped state), mirroring
+    /// `daemon.capacity.advisory`'s dedup discipline — never every tick. This
+    /// issue (#4386) is the authorizing issue for this topic per the frozen-
+    /// taxonomy "new topics require a follow-up issue" rule (see
+    /// `event_bus.rs`'s module doc). Advisory only — it never blocks
+    /// dispatch; it tells the operator to check `.mcp.json`.
+    PreflightAdvisory {
+        /// The workspace root whose reaper tripped (or cleared) the advisory.
+        workspace_root: String,
+        /// Consecutive pre-flight deaths observed at the transition.
+        consecutive_deaths: u32,
+        /// The most recent matched pre-flight death-class marker (e.g.
+        /// `"preflight-mcp-failed"`), or empty on the clearing transition.
+        marker: String,
+        /// Operator-facing advisory message naming the concrete cause.
+        message: String,
+    },
+    /// `daemon.idle_exit` — the daemon is cleanly yielding to a host
+    /// idle-shutdown guard (Issue #4467).
+    DaemonIdleExit {
+        trigger: String,
+        idle_minutes: u64,
+        in_flight_sweeps: usize,
+        active_role_runs: usize,
+        healthy_tokens: usize,
+        total_tokens: usize,
+        message: String,
+    },
     /// Synthetic event signalling that the subscription fell behind the
     /// publisher. The number of events dropped is reported in `skipped`.
     /// Matches `tokio::sync::broadcast::Receiver::Lagged` semantics.
@@ -1681,6 +1754,7 @@ impl Event {
     /// | `SweepGlobalCompleted {..}` | `sweep.global.completed` |
     /// | `EpicAction {epic, action, ..}` | `epic.issue.{epic}.{action}` |
     /// | `CapacityAdvisory {..}` | `daemon.capacity.advisory` |
+    /// | `PreflightAdvisory {..}` | `daemon.preflight.advisory` |
     /// | `TopicLag {..}` | `sweep.system.topic_lag` |
     /// | `Generic {topic, ..}` | the explicit topic string |
     ///
@@ -1706,6 +1780,8 @@ impl Event {
                 format!("epic.issue.{epic}.{}", action.as_str())
             }
             Self::CapacityAdvisory { .. } => "daemon.capacity.advisory".to_string(),
+            Self::PreflightAdvisory { .. } => "daemon.preflight.advisory".to_string(),
+            Self::DaemonIdleExit { .. } => "daemon.idle_exit".to_string(),
             Self::TopicLag { .. } => "sweep.system.topic_lag".to_string(),
             Self::Generic { topic, .. } => topic.clone(),
         }
@@ -1718,7 +1794,8 @@ impl Event {
     /// specific workspace) is never overwritten.
     ///
     /// `SweepGlobalCompleted` (already carries a unique `sweep_id`), `EpicAction`,
-    /// `CapacityAdvisory`, `TopicLag`, and `Generic` are left untouched. Called
+    /// `CapacityAdvisory`, `PreflightAdvisory` (already carries its own
+    /// `workspace_root` field), `TopicLag`, and `Generic` are left untouched. Called
     /// centrally from `SweepRegistry::emit_event` so every emitted sweep event
     /// is stamped with its registry's `workspace_root` without touching each
     /// construction site.
@@ -1833,6 +1910,7 @@ mod tests {
             issue: 7,
             exit_code: Some(0),
             duration_sec: 5,
+            death_class: None,
             repo: None,
         };
         assert_eq!(exited.topic(), "sweep.issue.7.exited");
@@ -1841,6 +1919,7 @@ mod tests {
             issue: 7,
             checkpoint_phase: Some("doctor".to_string()),
             classification: None,
+            death_class: None,
             repo: Some("/repos/c".to_string()),
         };
         assert_eq!(crashed.topic(), "sweep.issue.7.crashed");
@@ -1894,6 +1973,7 @@ mod tests {
             issue: 1,
             exit_code: None,
             duration_sec: 0,
+            death_class: None,
             repo: None,
         };
         ev.set_repo_if_absent("/repos/x");

@@ -111,3 +111,74 @@ jobs:
         run: bash scripts/test-installer.sh
       - name: Run installer reinstall-safety tests (#4188)
         run: bash defaults/scripts/tests/test-install-reinstall-safety.sh
+
+  codex-adapter-smoke:
+    name: Codex Adapter Smoke (mocked)
+    needs: changes
+    if: always() && (github.event_name == 'push' || needs.changes.outputs.scripts == 'true')
+    # Tier-2 admission gate for the Codex runtime adapter (epic #4167 Phase 2,
+    # issue #4468): a green leg here is what admits the adapter per
+    # defaults/docs/runtime-adapters.md's tier policy.
+    #
+    # NO LIVE OpenAI CALLS. The suite is hermetic by construction — it uses
+    # spawn-codex.sh's LOOM_CODEX_NO_EXEC argv-only hook plus a fake `codex`
+    # shim on a temp PATH, so the real Codex CLI is never installed or invoked
+    # and no credential is required. `codex` is deliberately NOT on PATH here,
+    # which also exercises the missing-binary (exit 127) path.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Syntax-check the Codex adapter and its test
+        run: |
+          bash -n defaults/scripts/spawn-codex.sh
+          bash -n defaults/scripts/tests/test-spawn-codex.sh
+      - name: Assert the suite cannot reach a real Codex CLI
+        # Structural guard: the test must never install, download, or otherwise
+        # obtain the real Codex CLI. Combined with `codex` being absent from
+        # this runner's PATH, that makes a live OpenAI call impossible.
+        run: |
+          if grep -nE '(npm|brew|pipx?|curl|wget) .*(codex|openai)' \
+              defaults/scripts/tests/test-spawn-codex.sh; then
+            echo "::error::test-spawn-codex.sh must not install or fetch a real Codex CLI"
+            exit 1
+          fi
+          # This leg is expected to run on a runner with no Codex CLI at all.
+          # A warning rather than a failure: if a future runner image ships
+          # `codex`, the suite is still hermetic (every dispatch test prepends
+          # its own mock to PATH, and the argv tests never exec anything), so a
+          # hard failure here would be spurious rather than protective.
+          if command -v codex >/dev/null 2>&1; then
+            echo "::warning::a real 'codex' is on PATH; the suite still mocks every dispatch, but verify no test bypasses the mock"
+          fi
+      - name: Validate the Codex runtime capability manifest
+        run: |
+          # Valid JSON with the tri-state schema check-runtime-capabilities.sh reads.
+          jq -e '.runtime == "codex" and (.capabilities | type == "object")' \
+            defaults/runtimes/codex.json > /dev/null
+          bad="$(jq -r '.capabilities | to_entries[]
+                        | select(.value != "yes" and .value != "no" and .value != "partial")
+                        | .key' defaults/runtimes/codex.json)"
+          if [[ -n "$bad" ]]; then
+            echo "::error::codex.json capability value outside yes|no|partial: $bad"
+            exit 1
+          fi
+          # Codex declares worktreeIsolation=partial, so the Builder role (which
+          # requires it) must fail closed with EX_CONFIG (78). This pins the
+          # guardrail-parity doc's residual gap 2 to an executable assertion.
+          rc=0
+          bash defaults/scripts/check-runtime-capabilities.sh \
+            --role builder --runtime codex --dir defaults >/dev/null 2>&1 || rc=$?
+          if [[ "$rc" != "78" ]]; then
+            echo "::error::builder+codex must be incompatible (expected 78, got $rc)"
+            exit 1
+          fi
+          # Judge requires only mcp (declared "yes"), so it must be compatible.
+          bash defaults/scripts/check-runtime-capabilities.sh \
+            --role judge --runtime codex --dir defaults >/dev/null
+      - name: Assert the guardrail-parity doc exists (contract point 6)
+        # No runtime is admitted without a parity doc naming its residual gaps.
+        run: |
+          test -f defaults/docs/guardrail-parity-codex.md
+          grep -q '## Residual gaps' defaults/docs/guardrail-parity-codex.md
+      - name: Run the mocked Codex adapter test suite
+        run: bash defaults/scripts/tests/test-spawn-codex.sh

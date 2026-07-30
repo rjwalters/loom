@@ -634,15 +634,15 @@ systemctl --user enable --now loom-daemon.service
 }
 
 fn render_idle_shutdown(minutes: u32) -> String {
-    // Guard: power off after N idle minutes, but never while a sweep child
-    // (claude) runs or the daemon reports in-flight sweeps. Pilot-equivalent.
+    // Stage 2 of power-off: autonomous.idleExit is stage 1. A running daemon
+    // remains a veto because only it can interpret queued/rate-limited work.
     format!(
         r#"set -e
 mkdir -p "$HOME/.local/bin"
 cat > "$HOME/.local/bin/loom-idle-shutdown.sh" <<'GUARD'
 #!/usr/bin/env bash
-# loom-idle-shutdown (#4341): power off after {minutes} idle minutes, skipping
-# while claude or loom-daemon are actively working.
+# loom-idle-shutdown (#4341/#4467), stage 2. autonomous.idleExit must first
+# stop loom-daemon; this guard remains the sole power-off authority.
 set -euo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 LIMIT={minutes}
@@ -650,6 +650,7 @@ STAMP="$HOME/.loom/last-active"
 mkdir -p "$HOME/.loom"
 active=0
 if pgrep -x claude >/dev/null 2>&1; then active=1; fi
+if pgrep -f '[l]oom-daemon' >/dev/null 2>&1; then active=1; fi
 if loom-daemon status --json 2>/dev/null | grep -Eq '"active_sweeps"[[:space:]]*:[[:space:]]*[1-9]'; then active=1; fi
 if [ "$active" = "1" ]; then
   date +%s > "$STAMP"

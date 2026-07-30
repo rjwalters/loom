@@ -9,6 +9,7 @@ use loom_daemon::epic_supervisor;
 use loom_daemon::event_bus::EventBus;
 use loom_daemon::health_monitor;
 use loom_daemon::host_breaker;
+use loom_daemon::idle_exit;
 use loom_daemon::ipc::IpcServer;
 use loom_daemon::main_health_gate;
 use loom_daemon::metrics_collector;
@@ -1654,6 +1655,18 @@ async fn main() -> Result<()> {
         quarantine_config.insta_crash_secs
     );
 
+    // Claude-wrapper pre-flight-death workspace tripwire (#4386): resolve
+    // env > config > default for the default workspace so a fleet-wide,
+    // cross-issue spawn failure (e.g. a stale `.mcp.json`) trips a visible
+    // advisory instead of reading as an idle-healthy daemon.
+    let preflight_tripwire_config =
+        sweep_registry::resolve_preflight_tripwire_config(&sweep_workspace);
+    sweep.set_preflight_tripwire_config(preflight_tripwire_config);
+    log::info!(
+        "sweep_registry: pre-flight-death tripwire threshold={} (#4386)",
+        preflight_tripwire_config.threshold
+    );
+
     // Cross-host collision detection (#4085, Phase 0 of #4028): resolve env >
     // config > default(off) for the default workspace so a shared-backlog
     // deployment can measure the baseline duplicate-dispatch rate. Detection
@@ -2195,6 +2208,32 @@ async fn main() -> Result<()> {
         log::debug!(
             "auto_update: disabled (set LOOM_AUTO_UPDATE=1 or autonomous.autoUpdate.enabled=true to opt in)"
         );
+        None
+    };
+
+    // Independent, opt-in idle exit (#4467). The daemon only exits; the host
+    // guard retains sole authority to power off.
+    let idle_exit_config = idle_exit::read_config(&sweep_workspace);
+    let _idle_exit_handle = if idle_exit::resolve_enabled(&idle_exit_config) {
+        let minutes = idle_exit::resolve_minutes(&idle_exit_config);
+        let starvation = idle_exit::resolve_starvation(&idle_exit_config);
+        if loom_daemon::ipc::detect_supervisor().as_deref() == Some("launchd") {
+            log::warn!(
+                "idle_exit: ENABLED under launchd; KeepAlive:SuccessfulExit relaunches exit(0), \
+                 so idle exit is meaningful only under on-failure-style supervision"
+            );
+        }
+        log::info!("idle_exit: enabled (idle_minutes={minutes}, on_token_starvation={starvation})");
+        Some(idle_exit::spawn_task(
+            idle_exit_config,
+            sweep_workspace.clone(),
+            workspace_pool.clone(),
+            role_in_progress.clone(),
+            event_bus.clone(),
+            socket_path.clone(),
+        ))
+    } else {
+        log::debug!("idle_exit: disabled (opt in with autonomous.idleExit.enabled=true)");
         None
     };
 
@@ -4086,6 +4125,13 @@ fn build_status_json_value(
         // not any resource term, so scripted consumers don't misread the
         // token/CPU ceiling as a bottleneck at low occupancy.
         "capacity_bound": report.capacity_bound,
+        // Claude-wrapper pre-flight-death workspace tripwire (#4386): `true`
+        // means N consecutive dispatches, across different issues, died at
+        // the wrapper's MCP-init pre-flight check before ever reaching
+        // `# CLAUDE_CLI_START` — the classic stale-`.mcp.json` fleet-wide
+        // silent-failure signature. `message` is `null` when not tripped.
+        "preflight_advisory_active": report.preflight_advisory_active,
+        "preflight_advisory_message": report.preflight_advisory_message,
         "dynamic_cap": {
             "token_pool_size": report.token_pool_size,
             // The directory the daemon resolved for the pool above (#4292) —
@@ -4514,6 +4560,18 @@ fn print_status_human(
         }
     }
 
+    // Claude-wrapper pre-flight-death tripwire (#4386): printed prominently,
+    // ahead of the capacity section, so a fleet-wide spawn failure is visible
+    // even to an operator skimming just the top of `status`. Printed FIRST so
+    // the "not capacity-bound … the limiter is work availability" line further
+    // below is never the only diagnosis shown while this is tripped — see the
+    // guard on that line.
+    if report.preflight_advisory_active {
+        if let Some(msg) = &report.preflight_advisory_message {
+            println!("\n{msg}");
+        }
+    }
+
     // Capacity figures resolved from a single source (fresh probe when
     // available, else the daemon's ranking snapshot) so the cap's healthy-tokens
     // input, the Token-capacity summary, and the Per-token table all agree (#3936).
@@ -4665,11 +4723,21 @@ fn print_status_human(
                 // defect — at, say, 1 in-flight against a cap of 7 the limiter
                 // is simply how much ready work exists. Suppress the
                 // token-bound diagnosis.
-                println!(
-                    "  not capacity-bound ({} in flight, cap {dispatch_cap} — the limiter is \
-                     work availability, not tokens/disk/CPU)",
-                    report.in_flight.len(),
-                );
+                //
+                // #4386: while the pre-flight tripwire is active, this bare
+                // "work availability" line is actively misleading — every
+                // dispatch IS starting, it just dies within ~1s at
+                // claude-wrapper pre-flight, which reads as "no work" rather
+                // than "everything is crashing." The warning printed above
+                // already names the real cause, so suppress this line rather
+                // than let it stand uncontested.
+                if !report.preflight_advisory_active {
+                    println!(
+                        "  not capacity-bound ({} in flight, cap {dispatch_cap} — the limiter is \
+                         work availability, not tokens/disk/CPU)",
+                        report.in_flight.len(),
+                    );
+                }
             } else if rc.token_bound {
                 if rc.healthy == 0 {
                     println!(
@@ -4694,7 +4762,10 @@ fn print_status_human(
              health basis)",
             report.token_pool_size
         );
-        if !capacity_bound {
+        if !capacity_bound && !report.preflight_advisory_active {
+            // #4386: same suppression as the ranking-present branch above —
+            // the warning printed at the top of `status` already names the
+            // real cause while the tripwire is active.
             println!(
                 "  not capacity-bound ({} in flight, cap {dispatch_cap} — the limiter is work \
                  availability, not tokens/disk/CPU)",
@@ -7628,6 +7699,8 @@ mod status_client_tests {
             loadavg_1m: Some(1.25),
             cpu_idle_fraction: Some(0.90),
             capacity_bound: false,
+            preflight_advisory_active: false,
+            preflight_advisory_message: None,
             configured_max: 5,
             per_token_concurrency: 2,
             dynamic_cap: 3,
