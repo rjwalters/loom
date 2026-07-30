@@ -183,7 +183,7 @@ Combine flags as needed. Always pass `--state open` explicitly (Mode C operates 
   | `loom:curated` | Promote to `loom:issue` (Approval gate, step 3) → build. |
   | Uncurated: none / `loom:triage` / `loom:curating` | Curate (step 2) → promote → build. |
   | Stale `loom:building` | Reclaim → build. "Stale" = no **open** linked PR **and** `updatedAt` older than `LOOM_STALE_BUILDING_HOURS` (default 2). "Open linked PR" here means the **union** probe (step 1, #3359 + #3677) — `closedByPullRequestsReferences` **and** timeline `cross-referenced` open-PR events — so an in-flight non-closing `Part of #N` slice PR counts and blocks reclaim. Fresh `loom:building` (recently updated, or has an open PR) is genuinely in flight → route its open PR (if any) to Judge/Merge, else skip with `in flight (fresh loom:building)`. |
-  | `loom:blocked` | Probe the blocker: if every `#N` it depends on (parsed from the blocker comment / issue body via GitHub's reference parser) is CLOSED/MERGED, remove `loom:blocked` → build. If a dependency is still open → skip with `still blocked by #N`. If no dependency is parseable → remove `loom:blocked` and attempt anyway (fast/sloppy). |
+  | `loom:blocked` | Probe the blocker: if every `#N` it depends on (parsed from the blocker comment / issue body via `defaults/.claude/commands/loom/guide.md`'s `parse_dependencies` convention — tolerant of markdown emphasis/colon between the phrase and `#N`, e.g. `**Blocked by:** #1 (reason), #3 (reason)`, #4508) is CLOSED/MERGED, remove `loom:blocked` → build. If a dependency is still open → skip with `still blocked by #N`. If no dependency is parseable → remove `loom:blocked` and attempt anyway (fast/sloppy). |
   | `loom:epic` | Fan out: build its open `loom:epic-phase` children (already in the candidate set). Skip the container with `expanded to #a #b …`. If it has **no** open phase children → skip with `needs decomposition (run Champion/Architect)` — a container is not directly buildable. |
   | `loom:epic-phase` | Build directly (a phase issue is a normal buildable unit). |
   | Has an **open** linked PR (any label) | Drive the existing PR through Judge / Doctor → Merge via the step-1 union probe (#3359 + #3677 — closing-keyword **and** non-closing `Part of #N` timeline references) — do not build a duplicate. Takes precedence over every row above. |
@@ -1670,14 +1670,16 @@ The step is **best-effort** — a reconciliation failure never fails the parent 
 
 This section is the single home for the opt-in `--auto-stack` behavior. It is entered **only** when `AUTO_STACK=true` (Modes A/B). Absent the flag, none of this runs and the sweep is byte-for-byte unchanged. It **generalizes the single-value `--depends-on` / `worktree.sh --base` / auto-reconcile mechanics above (already shipped, #3729/#3747/#3752) from one global value to a per-issue dependency map** — it does **not** introduce any new worktree/PR/merge machinery. Mode C never runs this (no Builder phase to stack).
 
-**1. Detection — authoritative body-text signal, same-candidate-set only.** During the Stage 0 candidate survey (which already reads each candidate's `title,labels,state` — auto-stack adds `body` to that same `gh issue view N --json` read, **no new API call**), grep each candidate's body for the dependency phrases. **Reuse the exact regex vocabulary already established in `defaults/roles/guide.md` (`parse_dependencies`, the `(Blocked by|Depends on|Requires|\- \[.\]) #[0-9]+` convention), restricted here to `Depends on` / `Requires` only:**
+**1. Detection — authoritative body-text signal, same-candidate-set only.** During the Stage 0 candidate survey (which already reads each candidate's `title,labels,state` — auto-stack adds `body` to that same `gh issue view N --json` read, **no new API call**), grep each candidate's body for the dependency phrases. **Reuse the exact regex vocabulary already established in `defaults/.claude/commands/loom/guide.md` (`parse_dependencies`, the `(Blocked by|Depends on|Requires|\- \[.\])[*_:[:space:]]*#[0-9]+` convention — tolerant of markdown emphasis/colon between the phrase and `#N`, #4508), restricted here to `Depends on` / `Requires` only:**
 
 ```bash
 # Modeled on guide.md's parse_dependencies — restricted to the two declaration phrases.
 # Deliberately EXCLUDES `Blocked by` (that phrase drives the distinct loom:blocked
 # unblock machinery in guide.md / champion-reference.md and is NOT repurposed here)
 # and EXCLUDES the `- [ ]` task-list form (not a stacking declaration).
-echo "$BODY" | grep -oE '(Depends on|Requires) #[0-9]+' | grep -oE '#[0-9]+' | tr -d '#' | sort -u
+# Two-stage (#4508): select matching lines, tolerant of markdown emphasis/colon
+# before the first #N, then extract every #N on those lines.
+echo "$BODY" | grep -E '(Depends on|Requires)[*_:[:space:]]*#[0-9]+' | grep -oE '#[0-9]+' | tr -d '#' | sort -u
 ```
 
 A matched `#A` becomes a **stacking edge only when `#A` is also a member of this sweep invocation's own deduplicated candidate list.** A `Depends on #A` naming an issue **outside** the candidate set is left completely untouched — it is not an edge, it does not stack, and it flows through the existing `loom:blocked` handling exactly as today (this feature never touches out-of-set references). This "same-candidate-set only" restriction is load-bearing: it is what keeps auto-stack scoped to one sweep's own resolved set and prevents it from silently reaching out to arbitrary external issues.
@@ -1708,7 +1710,7 @@ This is the **safe** half of broad dependency-awareness: the *detection* of depe
     --depends-on "<operator --depends-on values, if any>"
 ```
 
-- **Parser reuse (not a second parser).** `warn-out-of-set-deps.sh` REUSES the exact `(Depends on|Requires|Part of) #[0-9]+` vocabulary — a restriction of guide.md's `parse_dependencies` — rather than introducing a divergent parser. It EXCLUDES `Blocked by` (that phrase drives the distinct `loom:blocked` unblock machinery), exactly as `--auto-stack` does.
+- **Parser reuse (not a second parser).** `warn-out-of-set-deps.sh` REUSES the exact `(Depends on|Requires|Part of)[*_:[:space:]]*#[0-9]+` vocabulary (tolerant of markdown emphasis/colon before `#N`, #4508) — a restriction of guide.md's `parse_dependencies` — rather than introducing a divergent parser. It EXCLUDES `Blocked by` (that phrase drives the distinct `loom:blocked` unblock machinery), exactly as `--auto-stack` does.
 - **Warn condition.** For each referenced `#A` that is **open** AND **not** a member of this sweep's resolved candidate set AND **not** already covered by an operator `--depends-on`, emit a clear advisory warning, e.g.:
   `warning: issue #B declares "Depends on #A", but #A is not in this sweep's candidate set — pass --depends-on <A> or include #A to stack them; otherwise #B may build against a stale base.`
 - **No auto-expansion — the load-bearing safety property stays intact.** The candidate set is **never** auto-grown to include `#A`; the tool never probes/expands to external issues beyond the single openness check on a referenced number. This is detection + advisory *only* — the inverse (auto-adding un-named external issues) was **rejected** (operator, 2026-07-23) precisely because it would break the same-set guarantee.
