@@ -265,17 +265,22 @@ enum Commands {
         force: bool,
     },
 
-    /// Start a minimal read-only HTTP status-snapshot listener (Issue #4391,
-    /// dashboard phases 1-2 of #4329). `GET /api/status` (#4391) serializes the
-    /// same `DaemonStatusReport` `loom-daemon status --json` already
-    /// aggregates — fetched live over the *existing* Unix socket (the same
-    /// `DaemonStatus` IPC request `status` sends), so the aggregation logic in
+    /// Start a minimal read-only HTTP status-snapshot listener + embedded
+    /// dashboard (Issue #4391 phase 1, #4392 phase 2, #4393 phase 3 of
+    /// #4329). `GET /api/status` (#4391) serializes the same
+    /// `DaemonStatusReport` `loom-daemon status --json` already aggregates —
+    /// fetched live over the *existing* Unix socket (the same `DaemonStatus`
+    /// IPC request `status` sends), so the aggregation logic in
     /// `ipc::build_daemon_status` runs exactly once and is never duplicated
     /// here. `GET /api/events` (#4392) tails the daemon's event bus as
     /// `text/event-stream`, bridged from the same socket's existing
-    /// `SubscribeEvents` request over the frozen `sweep.*` topics. Both are
-    /// read-only: no new persistent store, no mutation, no publish, no HTML
-    /// page yet (that is phase #4393, docs #4394).
+    /// `SubscribeEvents` request over the frozen `sweep.*` topics. `GET /`
+    /// (#4393) serves an embedded single-page dashboard (vanilla JS, no
+    /// build toolchain) that consumes both of the above plus two new
+    /// read-only endpoints: `GET /api/pipeline` (forge queue counts per
+    /// managed repo, reusing `pipeline_snapshot::GhPipelineSource`) and
+    /// `GET /api/tokens` (per-account `.ranking` rows). Every endpoint is
+    /// read-only: no new persistent store, no mutation, no publish.
     ///
     /// Off by default: nothing listens until this subcommand is explicitly
     /// run — a running daemon started without `serve` never opens this port.
@@ -284,9 +289,9 @@ enum Commands {
     /// additionally requires `--allow-non-loopback` — the address alone is
     /// never enough, and a wildcard bind (`0.0.0.0`/`::`) is refused even
     /// with both flags, so this can never become publicly reachable. Every
-    /// response carries this host's identity (`hostname`) so a later phase's
-    /// client-side aggregator (#4393) can label sources without any
-    /// server-side fan-out in this phase.
+    /// response carries this host's identity (`hostname`) so the dashboard's
+    /// client-side multihost aggregator (#4393) can label sources without
+    /// any server-side fan-out.
     Serve {
         /// TCP port for the HTTP listener.
         #[arg(long, default_value_t = serve::DEFAULT_PORT)]
@@ -303,6 +308,16 @@ enum Commands {
         /// tailnet interface). Never permits a wildcard bind even when set.
         #[arg(long)]
         allow_non_loopback: bool,
+
+        /// Comma-separated list of peer daemon `serve` base URLs (e.g.
+        /// `http://host2:7420,http://host3:7420`), Issue #4393's multihost
+        /// fleet requirement. Served verbatim at `GET /api/peers`; the
+        /// dashboard fetches each one **from the browser** — this daemon
+        /// never queries a peer itself, so there is no server-side
+        /// aggregation and no new central store. Empty by default (the
+        /// single-host view).
+        #[arg(long, default_value = "")]
+        peers: String,
     },
 
     /// Manage durable operator watches on issue/PR terminal state (Issue #3971).
@@ -1262,7 +1277,8 @@ async fn main() -> Result<()> {
                 port,
                 bind,
                 allow_non_loopback,
-            } => handle_serve_command(port, &bind, allow_non_loopback).await,
+                peers,
+            } => handle_serve_command(port, &bind, allow_non_loopback, &peers).await,
             // `restart` connects to the running daemon over its Unix socket to
             // trigger the supervised restart primitive (Issue #4054), or a
             // scheduled drain-and-restart (Issue #4090).
@@ -3645,7 +3661,12 @@ fn collect_token_usage(tokens_dir: Option<&Path>) -> Option<serde_json::Value> {
 /// [`serve::run`] for the accept loop. Each request re-fetches a fresh
 /// snapshot over the daemon's existing Unix socket — this function never
 /// touches daemon state directly.
-async fn handle_serve_command(port: u16, bind: &str, allow_non_loopback: bool) -> Result<()> {
+async fn handle_serve_command(
+    port: u16,
+    bind: &str,
+    allow_non_loopback: bool,
+    peers: &str,
+) -> Result<()> {
     let addr: std::net::IpAddr = bind
         .parse()
         .map_err(|e| anyhow!("invalid --bind address {bind:?}: {e}"))?;
@@ -3656,13 +3677,22 @@ async fn handle_serve_command(port: u16, bind: &str, allow_non_loopback: bool) -
         .await
         .map_err(|e| anyhow!("failed to bind {addr}:{port}: {e}"))?;
     let local_addr = listener.local_addr()?;
+    let peer_list = serve::parse_peer_list(peers);
     println!(
-        "loom-daemon serve: listening on http://{local_addr}/api/status and \
-         http://{local_addr}/api/events (proxying {})",
-        socket_path.display()
+        "loom-daemon serve: listening on http://{local_addr}/ (dashboard), \
+         http://{local_addr}/api/status, http://{local_addr}/api/events, \
+         http://{local_addr}/api/pipeline, http://{local_addr}/api/tokens, \
+         http://{local_addr}/api/peers (proxying {}){}",
+        socket_path.display(),
+        if peer_list.is_empty() {
+            String::new()
+        } else {
+            format!(" — {} configured peer(s)", peer_list.len())
+        }
     );
 
-    serve::run(listener, socket_path).await
+    let state = serve::ServeState::new(socket_path).with_peers(peer_list);
+    serve::run_with_state(listener, state).await
 }
 
 /// Handle the `status` subcommand — render the running daemon's autonomous-mode
