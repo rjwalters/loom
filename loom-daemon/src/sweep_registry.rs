@@ -988,6 +988,12 @@ fn parse_runtime_after(contents: &str, header_anchor: &str) -> Option<String> {
     (!runtime.is_empty()).then(|| runtime.to_string())
 }
 
+fn marker_after(contents: &str, header_anchor: &str, marker: &str) -> bool {
+    contents
+        .rfind(header_anchor)
+        .is_some_and(|start| contents[start..].contains(marker))
+}
+
 /// Poll `log_path` for the account-selection marker until it appears, the
 /// child exits, or `TOKEN_NAME_CAPTURE_TIMEOUT` elapses.
 ///
@@ -1009,7 +1015,7 @@ fn poll_observability(child: &mut Child, log_path: &Path, header_anchor: &str) -
             if let Some(name) = parse_token_name_after(&contents, header_anchor) {
                 return (name, runtime.unwrap_or_else(|| UNKNOWN_TOKEN_NAME.to_string()));
             }
-            if runtime.is_some() && contents.contains(CLI_START_MARKER) {
+            if runtime.is_some() && marker_after(&contents, header_anchor, CLI_START_MARKER) {
                 return (
                     UNKNOWN_TOKEN_NAME.to_string(),
                     runtime.unwrap_or_else(|| UNKNOWN_TOKEN_NAME.to_string()),
@@ -1198,13 +1204,21 @@ const CLAUDE_CLI_START_MARKER: &str = "# CLAUDE_CLI_START";
 /// unreadable/missing log as `None`/"unknown" rather than calling this with
 /// an empty tail (mirrors how [`classify_crash`] is fed by its callers).
 fn classify_preflight_death(log_tail: &str) -> Option<&'static str> {
+    // Per-issue logs are append-only. Restrict both positive and absence-based
+    // classification to the newest dispatch so markers from a prior run
+    // cannot classify (or clear) the current run's pre-flight death.
+    let current_dispatch = log_tail
+        .rfind(DISPATCH_HEADER_MARKER)
+        .map_or(log_tail, |start| &log_tail[start..]);
     if let Some((label, _)) = preflight_death_signatures()
         .iter()
-        .find(|(_, re)| re.is_match(log_tail))
+        .find(|(_, re)| re.is_match(current_dispatch))
     {
         return Some(label);
     }
-    if !log_tail.contains(CLAUDE_CLI_START_MARKER) && !log_tail.contains(CLI_START_MARKER) {
+    if !current_dispatch.contains(CLAUDE_CLI_START_MARKER)
+        && !current_dispatch.contains(CLI_START_MARKER)
+    {
         return Some("preflight-no-cli-start");
     }
     None
@@ -8805,6 +8819,14 @@ exit 0
             ),
             None
         );
+        assert_eq!(
+            classify_preflight_death(
+                "==== loom-daemon dispatch: old ====\n\
+# LOOM_CLI_START runtime=codex\n\
+==== loom-daemon dispatch: current ====\nspawn-codex: preflight failed\n"
+            ),
+            Some("preflight-no-cli-start")
+        );
     }
 
     /// AC #1: an exhaustion insta-crash marks the account bad and does NOT
@@ -10769,6 +10791,40 @@ exit 0
 # LOOM_RUNTIME_RESOLVED runtime=codex\n# LOOM_ACCOUNT name=codex-profile\n";
         assert_eq!(parse_runtime_after(log, "sweep_id=new").as_deref(), Some("codex"));
         assert_eq!(parse_token_name_after(log, "sweep_id=new").as_deref(), Some("codex-profile"));
+    }
+
+    #[test]
+    fn poll_observability_waits_for_current_account_after_stale_cli_start() {
+        let dir = tempdir().unwrap();
+        let log_path = dir.path().join("sweep.log");
+        let header_anchor = "sweep_id=current";
+        std::fs::write(
+            &log_path,
+            "==== loom-daemon dispatch: old sweep_id=old ====\n\
+# LOOM_CLI_START runtime=codex\n\
+==== loom-daemon dispatch: new sweep_id=current ====\n\
+# LOOM_RUNTIME_RESOLVED runtime=codex\n",
+        )
+        .unwrap();
+
+        let append_path = log_path.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            use std::io::Write;
+            let mut log = std::fs::OpenOptions::new()
+                .append(true)
+                .open(append_path)
+                .unwrap();
+            writeln!(log, "# LOOM_ACCOUNT name=current-profile").unwrap();
+        });
+        let mut child = Command::new("sleep").arg("1").spawn().unwrap();
+
+        let observed = poll_observability(&mut child, &log_path, header_anchor);
+
+        child.kill().ok();
+        child.wait().ok();
+        writer.join().unwrap();
+        assert_eq!(observed, ("current-profile".to_string(), "codex".to_string()));
     }
 
     #[test]
