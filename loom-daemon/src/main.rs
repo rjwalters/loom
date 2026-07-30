@@ -2180,8 +2180,11 @@ async fn main() -> Result<()> {
 
     // Optional safehouse fleet-comms narration (#3997): subscribe the shared
     // event bus and narrate sweep-lifecycle transitions into an E2E Matrix room.
-    // Byte-for-byte no-op when `safehouse.enabled` is false/absent.
-    workspace_pool.start_safehouse_narration(&sweep_workspace);
+    // Byte-for-byte no-op when `safehouse.enabled` is false/absent. The activity
+    // DB handle (#4497) is the same `Arc` the IPC server gets, shared so the
+    // public-feed `completion` envelope can carry a best-effort per-issue token
+    // total; the sink only ever reads, on the blocking pool.
+    workspace_pool.start_safehouse_narration(&sweep_workspace, Some(activity_db.clone()));
 
     // Optional cross-host soft-claim coordination (#4028): a dedicated safehouse
     // connection that advertises this daemon's dispatch claims and consumes peer
