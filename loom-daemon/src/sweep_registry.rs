@@ -13138,8 +13138,16 @@ exit 0\n";
 
     #[test]
     fn midbuild_ignores_stale_claim_lock_with_dead_owner() {
-        // The inverse guard: a lock left behind by a DEAD owner must not wedge
-        // the legitimate dead-sweep recovery path forever.
+        // The inverse guard: the dead sweep's OWN claim-lock, left behind
+        // because the reaper never released it, must not wedge the legitimate
+        // dead-sweep recovery path forever.
+        //
+        // The lock's `sweep_id` is deliberately the dead entry's own id. A lock
+        // naming a *different* sweep is a separate, pre-existing refusal
+        // (`lock_owned_by_other`, #4463: a newer sweep superseded this one) that
+        // fails closed on the id comparison alone and is covered by its own
+        // tests. This test isolates the #4449 live-use veto: a dead owner PID is
+        // not live-use evidence, so recovery proceeds.
         let tmp = tempdir().unwrap();
         let ws = tmp.path();
         let (mut reg, _rec) = fixture_registry(ws);
@@ -13151,7 +13159,7 @@ exit 0\n";
         std::fs::write(
             lock.join("owner.json"),
             format!(
-                r#"{{"issue": 6104, "owner_pid": 2147483640, "acquired_at": "{}", "sweep_id": "dead-sweep"}}"#,
+                r#"{{"issue": 6104, "owner_pid": 2147483640, "acquired_at": "{}", "sweep_id": "sweep-issue-6104-dead"}}"#,
                 Utc::now().to_rfc3339()
             ),
         )
