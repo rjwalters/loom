@@ -20,14 +20,23 @@
 //! while every *unmarked* test in the same binary — including every future one
 //! nobody remembers to mark — still runs concurrently with them.
 //!
-//! ## What CI does
+//! ## How the suite is meant to run
 //!
-//! CI runs the workspace suite with [`cargo nextest`](https://nexte.st) — **one
-//! process per test** (`.github/workflows/ci.yml`, `backend-tests` job). One
-//! test's env mutation is then invisible to every other test by construction,
-//! and so are process-global statics (`OnceLock` / `Mutex` caches, atomics).
-//! Configuration lives in `.config/nextest.toml`. Doctests are covered by a
-//! separate `cargo test --workspace --doc` step, since nextest does not run them.
+//! The workspace suite runs under [`cargo nextest`](https://nexte.st) — **one
+//! process per test**. One test's env mutation is then invisible to every other
+//! test by construction, and so are process-global statics (`OnceLock` / `Mutex`
+//! caches, atomics). Configuration lives in `.config/nextest.toml`. Doctests need
+//! a separate `cargo test --workspace --doc` invocation, since nextest does not
+//! run them.
+//!
+//! <div class="warning">
+//!
+//! The `backend-tests` CI job has **not** been switched over yet — see the
+//! outstanding-operator-step note at the top of `.config/nextest.toml` (#4385).
+//! Treat the rules below as the standing convention regardless; they are what
+//! makes the switch a no-op when it lands.
+//!
+//! </div>
 //!
 //! ## What you should do
 //!

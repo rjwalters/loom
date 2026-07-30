@@ -23,6 +23,19 @@
 #
 # See `loom-daemon/src/lib.rs` (crate-level "Test isolation convention" docs) for
 # the author-facing version of this contract.
+#
+# ONE OPERATOR STEP STILL OUTSTANDING (2026-07-30, #4385)
+#
+# The `backend-tests` job in `.github/workflows/ci.yml` still invokes plain
+# `cargo test --workspace`. Flipping it to nextest could not be committed here:
+# GitHub refuses any push or Contents-API write that touches
+# `.github/workflows/**` unless the credential carries the `workflow` scope
+# (fine-grained PATs: "Workflows: write"), and the automation account's token does
+# not. The exact replacement hunk is in the PR that introduced this file; a
+# maintainer with `gh auth refresh -s workflow` applies it in one commit. Until
+# then everything in this file is live for local `cargo nextest run` only, and CI
+# remains exposed to the race described above. Delete this block once the job is
+# switched.
 
 nextest-version = "0.9.98"
 
@@ -39,37 +52,54 @@ status-level = "fail"
 # --- Cross-process exclusive state ------------------------------------------
 #
 # The daemon integration suites share host-global state that no amount of process
-# isolation can separate, and they are latency-sensitive:
+# isolation can separate:
 #
 #   * the dedicated `tmux -L loom` server (sessions are host-global),
 #   * `cleanup_all_loom_sessions()` in each suite's `setup()`, which kills EVERY
 #     `loom-*` session — including sessions owned by a concurrently running test
 #     in another process,
-#   * a real `loom-daemon` child per test (plus a `cargo build --bin loom-daemon`
-#     from `TestDaemon::start()`), which must create its socket inside a fixed
-#     timeout — a wall-clock budget that a machine saturated by ~2200 concurrent
-#     unit tests will blow.
+#   * a real `loom-daemon` child per test, which binds a socket and writes an
+#     activity DB.
 #
-# `cargo test` gave them this isolation implicitly: it runs one test binary at a
-# time, so no unit test was ever in flight beside them. `threads-required =
-# 'num-test-threads'` reproduces that property under nextest — each of these
-# tests takes the whole thread budget, so it runs alone. It is deliberately
-# stronger than a `max-threads = 1` test group, which would only serialize these
-# tests against *each other* while still letting the unit suite run alongside
-# (empirically not enough: the daemon needs >2s to bind its socket against a
-# 5s budget on a loaded host).
+# `cargo test` gave them mutual exclusion implicitly by running one test binary at
+# a time. nextest runs tests from *all* binaries concurrently, so the exclusion has
+# to be declared. A `max-threads = 1` test group is exactly that declaration: at
+# most one member of the group is ever in flight, across all four binaries.
+#
+# Deliberately *not* `threads-required = 'num-test-threads'` (run-completely-alone).
+# That was tried first and rejected: it serialises these tests behind the entire
+# ~2350-test unit suite for no benefit, since no unit test touches the tmux server
+# or spawns a daemon (audited — see `loom-daemon/src/lib.rs`). The wall-clock
+# budgets inside the harness are now sized as liveness bounds rather than latency
+# assertions, so co-scheduling with the unit suite is safe.
+[test-groups.daemon-integration]
+max-threads = 1
+
+# Overrides are declared on *both* profiles on purpose. nextest resolves a test's
+# overrides from the selected profile only — the `default` profile's overrides are
+# not inherited by a named profile — so an override that lived solely under
+# `[[profile.default.overrides]]` would silently not apply to `--profile ci`,
+# which is the one CI uses. Verify with:
+#
+#     cargo nextest show-config test-groups --profile ci
+#
+# Keep the two filters identical.
 [[profile.default.overrides]]
-filter = 'package(loom-daemon) & kind(test) & (binary(integration_basic) | binary(integration_factory_reset) | binary(integration_security) | binary(integration_singleton_guard))'
-threads-required = 'num-test-threads'
-# Booting a real daemon (including a debug `cargo build`) is slow by nature.
-slow-timeout = { period = "120s", terminate-after = 5 }
+filter = 'package(loom-daemon) & kind(test) & binary(/^integration_/)'
+test-group = 'daemon-integration'
+# Booting a real daemon and driving tmux is slow by nature.
+slow-timeout = { period = "180s", terminate-after = 3 }
 
 # --- CI profile -------------------------------------------------------------
 #
-# Inherits every setting above from `default`, including the overrides (nextest
-# merges a profile's overrides with the default profile's). CI wants the full
-# failure list rather than a fail-fast bail-out.
+# Scalar settings are inherited from `default`; overrides are not (see above).
+# CI wants the full failure list rather than a fail-fast bail-out.
 [profile.ci]
 fail-fast = false
 failure-output = "immediate-final"
 final-status-level = "fail"
+
+[[profile.ci.overrides]]
+filter = 'package(loom-daemon) & kind(test) & binary(/^integration_/)'
+test-group = 'daemon-integration'
+slow-timeout = { period = "180s", terminate-after = 3 }
