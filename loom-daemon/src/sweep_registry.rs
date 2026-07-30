@@ -4400,6 +4400,48 @@ impl SweepRegistry {
         }
     }
 
+    /// Best-effort probe for whether `issue` resolves to a pull request in ANY
+    /// state (Issue #4653), used by [`restore_label_to_ready`] to refuse
+    /// re-adding `loom:issue` to a PR number during cancel/crash-recovery.
+    /// Returns `Some(true)` when the number is a PR, `Some(false)` when it is
+    /// a genuine issue, and `None` on any probe failure (missing/failed/
+    /// timed-out `gh`, unresolvable repo, unparseable output).
+    ///
+    /// Mirrors the same REST call as [`issue_is_closed_or_pr`] (the `is_pr`
+    /// half of its payload), kept as a separate probe so this fix does not
+    /// touch the 2.5 dispatch guard or its tests. Callers MUST treat `None`
+    /// as **fail-open** — a forge outage must never block the `loom:building`
+    /// cleanup that [`restore_label_to_ready`] performs regardless of this
+    /// probe's outcome.
+    ///
+    /// [`restore_label_to_ready`]: Self::restore_label_to_ready
+    /// [`issue_is_closed_or_pr`]: Self::issue_is_closed_or_pr
+    fn issue_is_pull_request(&self, issue: u32) -> Option<bool> {
+        let (owner, repo) = self.resolve_owner_repo()?;
+        let gh = self
+            .config
+            .gh_bin
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("gh"));
+        let mut cmd = Command::new(&gh);
+        cmd.arg("api")
+            .arg(format!("repos/{owner}/{repo}/issues/{issue}"))
+            .arg("--jq")
+            .arg(".pull_request != null");
+        // Resolve against this registry's own workspace, matching the other
+        // dispatch-path probes (#3937).
+        cmd.current_dir(&self.config.workspace_root);
+        let output = output_with_timeout(cmd, reap_gh_timeout()).ok()??;
+        if !output.status.success() {
+            return None;
+        }
+        match String::from_utf8_lossy(&output.stdout).trim() {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        }
+    }
+
     /// Best-effort probe for the first [`PARK_LABELS`] entry currently on
     /// `issue`, used by the #4444 park-label dispatch guard (step 2.7). Returns
     /// `Some(label)` when the issue carries a park label and `None` otherwise —
@@ -4548,15 +4590,20 @@ impl SweepRegistry {
 
     /// Restore a crashed/orphaned claim's `loom:building` back to
     /// `loom:issue` — UNLESS the issue currently carries `loom:blocked`
-    /// (Issue #4206). A deliberate operator park (applied by hand, possibly
-    /// while the now-dead sweep was still `loom:building`) must never be
-    /// clobbered into the illegal `loom:blocked` + `loom:issue` combo by the
-    /// crash-recovery path. Re-reads the issue's current labels first (the
-    /// same probe pattern as [`Self::issue_has_blocked_label`], used
-    /// elsewhere on the reap path) — best-effort and fail-open: an
-    /// unverifiable read falls back to the pre-#4206 unconditional restore,
-    /// since a stranded `loom:building` claim is the more common failure
-    /// mode this path exists to fix.
+    /// (Issue #4206) OR the target number actually resolves to a pull
+    /// request (Issue #4653). A deliberate operator park (applied by hand,
+    /// possibly while the now-dead sweep was still `loom:building`) must
+    /// never be clobbered into the illegal `loom:blocked` + `loom:issue`
+    /// combo by the crash-recovery path, and a PR number must never be
+    /// handed a `loom:issue` label meant for issues — that reproduces the
+    /// stray-label symptom from #4653's incident report, reached whenever the
+    /// 2.5 dispatch guard's fail-open window lets a PR number through and the
+    /// sweep is later cancelled or crash-recovered. Both checks are
+    /// best-effort and fail-open: an unverifiable read falls back to the
+    /// pre-#4206 unconditional restore (re-adding `loom:issue`), since a
+    /// stranded `loom:building` claim is the more common failure mode this
+    /// path exists to fix. Either carve-out only skips the `loom:issue`
+    /// re-add — the stale `loom:building` claim is always removed.
     fn restore_label_to_ready(&self, issue: u32) -> Result<()> {
         let gh = self
             .config
@@ -4564,6 +4611,10 @@ impl SweepRegistry {
             .clone()
             .unwrap_or_else(|| PathBuf::from("gh"));
         let blocked = self.issue_has_blocked_label(issue);
+        // Only probe PR-ness when the blocked carve-out doesn't already
+        // decide the outcome — avoids a redundant `gh` call on the (more
+        // common) blocked path.
+        let is_pr = !blocked && self.issue_is_pull_request(issue).unwrap_or(false);
         let mut cmd = Command::new(&gh);
         cmd.arg("issue")
             .arg("edit")
@@ -4575,6 +4626,12 @@ impl SweepRegistry {
                 "sweep_registry: restore_label_to_ready for #{issue} found `loom:blocked` \
                  already present — preserving the operator's park by removing the stale \
                  `loom:building` claim only, NOT re-adding `loom:issue` (#4206)"
+            );
+        } else if is_pr {
+            log::info!(
+                "sweep_registry: restore_label_to_ready for #{issue} resolved to a pull \
+                 request — removing the stale `loom:building` claim only, NOT re-adding \
+                 `loom:issue` (#4653)"
             );
         } else {
             cmd.arg("--add-label").arg("loom:issue");
@@ -12632,6 +12689,68 @@ exit 0
         );
     }
 
+    /// Issue #4653: the crash-path label restore must NEVER add `loom:issue`
+    /// when the target number resolves to a pull request. This covers the
+    /// #4123-fail-open window where the 2.5 dispatch guard (`gh` outage) lets
+    /// a PR number through to `loom:building` and the sweep is later
+    /// cancelled or crash-recovered — the stale `loom:building` claim is
+    /// still cleared, but `loom:issue` must not be reapplied to a PR.
+    #[test]
+    fn restore_label_to_ready_does_not_add_loom_issue_when_target_is_pr() {
+        let dir = tempdir().unwrap();
+        let gh_log = dir.path().join("gh-invocations.log");
+        let fake_gh = dir.path().join("fake-gh.sh");
+        // `gh issue view <n> --json labels --jq '...'` (the #4206 blocked
+        // pre-check) reports not-blocked; `gh api repos/.../issues/<n>
+        // --jq '.pull_request != null'` (the #4653 is-pr probe) reports
+        // `true`. Any `gh issue edit` call is recorded and always succeeds.
+        let script = format!(
+            r#"#!/usr/bin/env bash
+printf '%s\n' "$*" >> "{log}"
+if [ "$1" = "issue" ] && [ "$2" = "view" ]; then
+  echo "false"
+  exit 0
+fi
+if [ "$1" = "api" ]; then
+  echo "true"
+  exit 0
+fi
+exit 0
+"#,
+            log = gh_log.display(),
+        );
+        std::fs::write(&fake_gh, &script).unwrap();
+        let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_gh, perms).unwrap();
+        if let Ok(f) = std::fs::File::open(&fake_gh) {
+            let _ = f.sync_all();
+        }
+
+        let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
+        config.gh_bin = Some(fake_gh);
+        config.skip_label_flip = false; // exercise the real restore path
+        let registry = SweepRegistry::new(config);
+
+        // Bypass the `resolve_owner_repo` -> `gh repo view` hop (irrelevant to
+        // this test) exactly like the dispatch-guard PR tests do.
+        std::env::set_var("LOOM_REPO", "rjwalters/loom");
+        let result = registry.restore_label_to_ready(6501);
+        std::env::remove_var("LOOM_REPO");
+        result.unwrap();
+
+        let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            gh_calls.contains("issue edit 6501 --remove-label loom:building"),
+            "expected the stale loom:building claim to still be removed; got: {gh_calls:?}"
+        );
+        assert!(
+            !gh_calls.contains("--add-label loom:issue"),
+            "must NOT add loom:issue when the target number resolves to a pull request; got: \
+             {gh_calls:?}"
+        );
+    }
+
     /// Issue #3827: a cancelled daemon-owned Issue sweep that never opened a
     /// PR must have its pre-dispatch loom:building claim restored to loom:issue
     /// by `finish_cancel` — mirroring the reaper's clean-exit recovery (#3823b).
@@ -12750,9 +12869,12 @@ exit 0
         let cwds: Vec<_> = recorded.lines().filter(|l| !l.is_empty()).collect();
         assert_eq!(
             cwds.len(),
-            3,
+            4,
             "expected the flip (1 call) + restore (Issue #4206's pre-check `loom:blocked` \
-             probe, then the edit — 2 calls) to invoke gh three times total; got cwds: {cwds:?}"
+             probe, Issue #4653's `is_pr` probe's `resolve_owner_repo` lookup — which bails \
+             before the second `gh api` call since the fake `gh` prints nothing for `repo \
+             view` — then the edit — 3 calls) to invoke gh four times total; got cwds: \
+             {cwds:?}"
         );
         for cwd in &cwds {
             let got = std::fs::canonicalize(cwd).unwrap();
