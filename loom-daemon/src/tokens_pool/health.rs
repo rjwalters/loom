@@ -259,14 +259,21 @@ pub fn record_terminal_at(
         entry.updated_at = now;
         entry.signal_provenance = provenance.to_string();
         match classification {
+            // Once authentication has expired, ordinary runtime feedback cannot
+            // verify that credentials were repaired. Keep the hold sticky until
+            // clear_reauth() performs that explicit transition.
+            _ if entry.reason == HealthReason::ReauthRequired => {
+                entry.cooldown_until = None;
+                if classification == TerminalClassification::Success {
+                    entry.last_success = Some(now);
+                    entry.consecutive_transient_failures = 0;
+                }
+            }
             TerminalClassification::Success => {
                 entry.last_success = Some(now);
                 entry.consecutive_transient_failures = 0;
-                // A normal success must not silently clear an auth hold.
-                if entry.reason != HealthReason::ReauthRequired {
-                    entry.reason = HealthReason::Healthy;
-                    entry.cooldown_until = None;
-                }
+                entry.reason = HealthReason::Healthy;
+                entry.cooldown_until = None;
             }
             TerminalClassification::TokenExpired => {
                 entry.reason = HealthReason::ReauthRequired;
@@ -342,6 +349,16 @@ pub fn select_healthy_at(
     now: u64,
 ) -> Result<AccountDescriptor> {
     with_state(workspace, |state| {
+        for entry in &mut state.accounts {
+            if entry.reason == HealthReason::TransientFailure
+                && entry.cooldown_until.is_some_and(|deadline| deadline <= now)
+            {
+                entry.reason = HealthReason::Healthy;
+                entry.cooldown_until = None;
+                entry.consecutive_transient_failures = 0;
+                entry.updated_at = now;
+            }
+        }
         let health: HashMap<AccountId, AccountHealth> = state
             .accounts
             .iter()
@@ -529,6 +546,78 @@ mod tests {
         .is_err());
         clear_reauth(tmp.path(), &account.id, "verified_reauth").unwrap();
         assert!(select_healthy_at(tmp.path(), AccountProvider::Codex, &[account], u64::MAX).is_ok());
+    }
+
+    #[test]
+    fn expired_survives_all_later_runtime_feedback_until_explicit_clear() {
+        for classification in [
+            TerminalClassification::TokenExhausted,
+            TerminalClassification::Recoverable,
+            TerminalClassification::SessionLimit,
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let account = descriptor(AccountProvider::Codex, "a");
+            record_terminal_at(
+                tmp.path(),
+                &account.id,
+                TerminalClassification::TokenExpired,
+                "adapter_v1",
+                1,
+            )
+            .unwrap();
+            record_terminal_at(tmp.path(), &account.id, classification, "adapter_v1", 2).unwrap();
+
+            let health = account_health(tmp.path(), &account.id).unwrap().unwrap();
+            assert_eq!(health.reason, HealthReason::ReauthRequired);
+            assert_eq!(health.cooldown_until, None);
+            assert!(select_healthy_at(
+                tmp.path(),
+                AccountProvider::Codex,
+                std::slice::from_ref(&account),
+                u64::MAX
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn expired_transient_backoff_restores_fair_rotation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let accounts = vec![
+            descriptor(AccountProvider::Codex, "a"),
+            descriptor(AccountProvider::Codex, "b"),
+        ];
+        record_terminal_at(
+            tmp.path(),
+            &accounts[0].id,
+            TerminalClassification::Recoverable,
+            "adapter_v1",
+            100,
+        )
+        .unwrap();
+
+        assert_eq!(
+            select_healthy_at(tmp.path(), AccountProvider::Codex, &accounts, 101)
+                .unwrap()
+                .id
+                .name,
+            "b"
+        );
+
+        let deadline = 100 + DEFAULT_RECOVERABLE_BACKOFF_SECS;
+        let first =
+            select_healthy_at(tmp.path(), AccountProvider::Codex, &accounts, deadline).unwrap();
+        let second =
+            select_healthy_at(tmp.path(), AccountProvider::Codex, &accounts, deadline).unwrap();
+        assert_ne!(first.id, second.id);
+        assert!([first.id.name, second.id.name].contains(&"a".to_string()));
+
+        let recovered = account_health(tmp.path(), &accounts[0].id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.reason, HealthReason::Healthy);
+        assert_eq!(recovered.cooldown_until, None);
+        assert_eq!(recovered.consecutive_transient_failures, 0);
     }
 
     #[test]
