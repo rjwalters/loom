@@ -63,6 +63,12 @@ impl TestDaemon {
     pub async fn start() -> Result<Self> {
         let temp_dir = TempDir::new().context("Failed to create temp directory")?;
         let socket_path = temp_dir.path().join("daemon.sock");
+        // Isolated registry file (mirrors `integration_drain_then_exit.rs`): an
+        // empty/scratch `LOOM_WORKSPACES_PATH` guarantees `effective_roots()`
+        // reduces to the single seeded default (`LOOM_WORKSPACE`, set below)
+        // rather than silently picking up whatever repos are registered in
+        // this *host's* real `~/.loom/workspaces.json`.
+        let workspaces_path = temp_dir.path().join("workspaces.json");
 
         let mut process = Command::new(daemon_bin())
             .env("LOOM_SOCKET_PATH", &socket_path)
@@ -70,6 +76,30 @@ impl TestDaemon {
             // Disable restore_from_tmux() to prevent cross-test-binary contamination
             // via the shared tmux server. Each test manages its own terminals.
             .env("LOOM_NO_RESTORE", "1")
+            // Fail-closed autonomy toggles (#4573): without these, a spawned
+            // test daemon inherits this repo's real `.loom/config.json`
+            // (`autonomous.roleRunner.enabled: true`) and can dispatch real
+            // `/loom:sweep` sessions — burning API/GitHub rate-limit quota in
+            // what is meant to be an inert integration-test daemon. Each of
+            // these env vars *wins outright* over config in the daemon's own
+            // env > config > default precedence (`resolve_enabled` in
+            // `role_runner.rs` / `work_finder.rs` / `epic_supervisor.rs`), so
+            // setting them here is authoritative regardless of what any
+            // repo's committed config says.
+            .env("LOOM_ROLE_RUNNER", "0")
+            .env("LOOM_WORK_FINDER", "0")
+            .env("LOOM_EPIC_SUPERVISOR", "0")
+            // Repoint the daemon's own workspace root at this test's throwaway
+            // `TempDir` (#4573) instead of letting it inherit the real repo
+            // checkout via `LOOM_WORKSPACE`/cwd. `worktree_root()` derives its
+            // default (`${repo_root}/.loom/worktrees`) from this same
+            // `repo_root` parameter and only reads `LOOM_WORKTREE_ROOT`
+            // itself as an *override* of the base directory, so pinning
+            // `LOOM_WORKSPACE` alone is sufficient to keep worktree-root
+            // resolution confined to the temp dir too — no separate
+            // `LOOM_WORKTREE_ROOT` override is needed.
+            .env("LOOM_WORKSPACE", temp_dir.path())
+            .env("LOOM_WORKSPACES_PATH", &workspaces_path)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -101,6 +131,14 @@ impl TestDaemon {
     /// Get the socket path for connecting clients
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
+    }
+
+    /// The throwaway `TempDir` this daemon was pinned to via `LOOM_WORKSPACE`
+    /// (#4573) — the workspace root the daemon must resolve to, never the
+    /// real repo checkout.
+    #[allow(dead_code)]
+    pub fn workspace_path(&self) -> &Path {
+        self._temp_dir.path()
     }
 }
 
