@@ -154,6 +154,47 @@ pub fn resolve_effective_config(repo_root: &Path) -> Value {
     effective
 }
 
+/// The tier files consulted by [`resolve_effective_config`], **highest
+/// precedence first** — the reverse of the merge order, i.e. the order in which
+/// to search for "who actually supplied this value".
+///
+/// The private/shared defaults tier is included only when
+/// [`private_defaults_path`] resolves (it is disabled by an empty
+/// [`PRIVATE_DEFAULTS_ENV`], and absent on any host without the machine-level
+/// checkout). Paths are returned whether or not the file exists — a caller that
+/// cares reads it with the same soft-fail contract the merge uses.
+#[must_use]
+pub fn tier_paths_by_precedence(repo_root: &Path) -> Vec<PathBuf> {
+    let mut paths = vec![
+        repo_root.join(LOCAL_CONFIG_REL),
+        repo_root.join(PROJECT_CONFIG_REL),
+        repo_root.join(LEGACY_CONFIG_REL),
+    ];
+    paths.extend(private_defaults_path());
+    paths
+}
+
+/// Which tier file actually supplied `dotted` — the highest-precedence tier in
+/// which the key is present and non-null, or `None` when no tier sets it (the
+/// caller's env/default fallback is what supplied the value).
+///
+/// This exists because a **multi-workspace** daemon makes "which
+/// `.loom/config.json` did that number come from?" a real operator question
+/// (#4512): the effective config is a merge across up to four files, and a knob
+/// that reads as `3` might be a repo's committed value, a host-local override,
+/// or the built-in default. Reporting the provenance alongside the value —
+/// rather than only the value — is the same fix `token_pool_dir` applied to the
+/// token pool's directory ambiguity in #4292.
+///
+/// Soft-fail throughout: an unreadable or malformed tier simply cannot be the
+/// source, exactly as it contributes nothing to the merge.
+#[must_use]
+pub fn source_of(repo_root: &Path, dotted: &str) -> Option<PathBuf> {
+    tier_paths_by_precedence(repo_root)
+        .into_iter()
+        .find(|path| get_path(&soft_read_json_object(path), dotted).is_some_and(|v| !v.is_null()))
+}
+
 /// Look up a dotted key path (e.g. `"autonomous.workFinder.enabled"`) in an
 /// already-resolved effective config tree. Returns `None` on any missing
 /// segment or when a non-object value is indexed further.
@@ -432,6 +473,99 @@ mod tests {
     // Python: `loom-tools/tests/test_config_resolver.py`
     // (`TestConformanceFixture`). Bash:
     // `defaults/scripts/tests/test-config-resolver.sh`.
+
+    // ===== source_of / tier_paths_by_precedence (#4512) =====
+
+    #[test]
+    #[serial]
+    fn test_tier_paths_are_ordered_highest_precedence_first() {
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
+        let root = tempdir().unwrap();
+        let paths = tier_paths_by_precedence(root.path());
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+        // Reverse of the merge order in `resolve_effective_config`, so the first
+        // tier that sets a key is the one that actually supplied it.
+        assert_eq!(
+            paths,
+            vec![
+                root.path().join(LOCAL_CONFIG_REL),
+                root.path().join(PROJECT_CONFIG_REL),
+                root.path().join(LEGACY_CONFIG_REL),
+            ]
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_source_of_names_the_legacy_tier_when_only_it_sets_the_key() {
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
+        let root = tempdir().unwrap();
+        write(
+            &root.path().join(LEGACY_CONFIG_REL),
+            r#"{"autonomous": {"workFinder": {"maxConcurrent": 8}}}"#,
+        );
+        let src = source_of(root.path(), "autonomous.workFinder.maxConcurrent");
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+        assert_eq!(src, Some(root.path().join(LEGACY_CONFIG_REL)));
+    }
+
+    #[test]
+    #[serial]
+    fn test_source_of_prefers_the_highest_precedence_tier_that_sets_the_key() {
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
+        let root = tempdir().unwrap();
+        write(
+            &root.path().join(LEGACY_CONFIG_REL),
+            r#"{"autonomous": {"workFinder": {"maxConcurrent": 8}}}"#,
+        );
+        write(
+            &root.path().join(LOCAL_CONFIG_REL),
+            r#"{"autonomous": {"workFinder": {"maxConcurrent": 20}}}"#,
+        );
+        let src = source_of(root.path(), "autonomous.workFinder.maxConcurrent");
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+        assert_eq!(
+            src,
+            Some(root.path().join(LOCAL_CONFIG_REL)),
+            "the host-local override is what dispatch actually sees"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_source_of_is_none_when_no_tier_sets_the_key_or_sets_it_null() {
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
+        let root = tempdir().unwrap();
+        assert_eq!(source_of(root.path(), "autonomous.workFinder.maxConcurrent"), None);
+
+        // An explicit `null` is "not set" — it must not be reported as a source.
+        write(
+            &root.path().join(LEGACY_CONFIG_REL),
+            r#"{"autonomous": {"workFinder": {"maxConcurrent": null}}}"#,
+        );
+        let src = source_of(root.path(), "autonomous.workFinder.maxConcurrent");
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+        assert_eq!(src, None);
+    }
+
+    #[test]
+    #[serial]
+    fn test_source_of_skips_a_malformed_tier_instead_of_erroring() {
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
+        let root = tempdir().unwrap();
+        write(&root.path().join(LOCAL_CONFIG_REL), "{ this is not json");
+        write(
+            &root.path().join(LEGACY_CONFIG_REL),
+            r#"{"autonomous": {"workFinder": {"maxConcurrent": 8}}}"#,
+        );
+        let src = source_of(root.path(), "autonomous.workFinder.maxConcurrent");
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+        assert_eq!(
+            src,
+            Some(root.path().join(LEGACY_CONFIG_REL)),
+            "a malformed tier contributes nothing to the merge, so it cannot be the source"
+        );
+    }
 
     fn conformance_fixture_dir() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))

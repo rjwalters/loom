@@ -349,9 +349,61 @@ load average overstates consumption on macOS (see "measured idle fraction",
 #4031), so an operator on a chronically-loaded host may raise `loadThreshold`.
 
 Explicitly **out of scope** here (separable follow-ups): a dedicated gate cargo
-target-dir / shared build-lock to isolate contention (never shipped by #4020);
-per-test timeouts (would require adopting cargo-nextest); and any change to sweep
-spawn priority (that is #4233).
+target-dir to isolate contention (never shipped by #4020); per-test timeouts
+(would require adopting cargo-nextest); and any change to sweep spawn priority
+(that is #4233). The **shared build lock** half of that first item did land
+later — see the next section.
+
+### Machine-wide build slot (#4512)
+
+`nice` (#4020) reorders the run queue and the gate-in-flight flag (#4084) holds
+*dispatch* off one root, but neither stops the genuinely concurrent case: N
+sweep worktrees each running their own post-Builder `build-gate.sh` in separate
+processes, plus the daemon's own main-health gate, all compiling at once. Until
+#4512 the daemon's admission formula tried to prevent that up front with a CPU
+estimate (`estCoresPerSweep × cpuUtilizationTarget` minus live idle) — which
+priced *every* sweep as a build and throttled a 95%-idle 8-core host to 2
+concurrent sweeps. #4512 deleted that term and moved the protection here, to the
+stage that actually burns the cores.
+
+**Every invocation of `build-gate.sh` takes one machine-wide build slot before
+compiling**, and releases it on exit (via an `EXIT` trap, so a failed or killed
+gate never leaks the slot). N sweeps run concurrently; at most
+`LOOM_BUILD_SLOTS` (default **1**) of them build at any moment.
+
+- **Mechanism**: `defaults/scripts/lib/build-slot.sh`, sourced by
+  `build-gate.sh` (`loom_build_slot_acquire` / `loom_build_slot_release`). A
+  slot is a lock **directory** created with `mkdir` — POSIX-atomic and available
+  on stock macOS, unlike `flock` — at `~/.loom/locks/build-slot/slot-<i>`,
+  machine-wide rather than per-repo, because cores are a machine-level resource
+  shared by every workspace and worktree on the host. The daemon's Rust half
+  (`loom-daemon/src/build_slot.rs`) implements the identical protocol and wraps
+  the main-health gate's own command, so the two serialize against each other.
+- **Never blocks the gate indefinitely**: the acquire waits at most
+  `LOOM_BUILD_SLOT_WAIT_SECS` (default 300s) and then **degrades open**,
+  proceeding unserialized. A wedged holder costs one build's worth of
+  serialization, never the gate's liveness.
+- **Never fails the gate**: an unusable lock directory (unwritable, missing
+  parent, a file in the way) also degrades open, with a warning. `mkdir` locks
+  carry no heartbeat, so an abandoned slot is reaped after
+  `LOOM_BUILD_SLOT_STALE_SECS` (default 1h — deliberately long, so a peer cannot
+  reap a healthy in-progress build).
+- **Re-entrant**: when the daemon already holds a slot around this gate command
+  it exports `LOOM_BUILD_SLOT_HELD=1`, and the acquire inside `build-gate.sh` is
+  a logged no-op instead of a wait on its own parent's slot.
+- **Opt out** with `LOOM_BUILD_SLOTS=0` (every acquire degrades open — exactly
+  the pre-#4512 behavior). If `lib/build-slot.sh` is missing from an install the
+  gate prints a note and runs unserialized.
+- **Interaction with the timeout**: the daemon acquires the slot **outside** the
+  `buildGate.timeoutSeconds` window, so queueing behind another build never eats
+  into the gate's own budget and turns contention into a false `UNEVALUATED`.
+- **Interaction with deferral**: the load-aware deferral above is a *scheduling*
+  decision made before any command runs; the slot is a *mutual-exclusion*
+  decision made at the moment of compiling. They compose — a deferred tick never
+  reaches the acquire at all.
+
+Full rationale, telemetry, and the env-knob table live in
+[`daemon-reference.md` → Machine-wide build slot](daemon-reference.md).
 
 > **Rule of thumb:** if a check's outcome can differ between an idle host and a
 > busy one — or between a host with tmux and one without — it is

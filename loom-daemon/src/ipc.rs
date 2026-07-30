@@ -1508,28 +1508,18 @@ pub fn build_daemon_status(
     // re-resolving a possibly-different one.
     let token_pool_dir = Some(tokens_dir.clone());
     let disk_headroom = crate::disk_headroom::disk_headroom_limit(workspace_root);
-    // Hoisted above the CPU snapshot (#4032) so the resolved
-    // `cpuUtilizationTarget` / `estCoresPerSweep` knobs can feed it — this read
-    // was already happening six lines below; moving it up is not a new config
-    // read, just a reorder so status and dispatch resolve through the same
-    // env > config > default path (`resolve_cpu_utilization_target` /
-    // `resolve_cpu_est_cores_per_sweep`, single-root, matching
-    // `resolve_per_token_concurrency`).
     let wf_config = crate::work_finder::read_work_finder_config(workspace_root);
     let configured_max = crate::work_finder::resolve_max_concurrent_with_config(&wf_config);
     let per_token_concurrency = crate::work_finder::resolve_per_token_concurrency(&wf_config);
-    let cpu_utilization_target = crate::work_finder::resolve_cpu_utilization_target(&wf_config);
-    let cpu_est_cores_per_sweep = crate::work_finder::resolve_cpu_est_cores_per_sweep(&wf_config);
-    // CPU headroom (#3978, measured-idle signal #4031) — a host-level resource
-    // (not per-repo). The snapshot reads the memoized idle fraction (never
-    // blocks; the caller pre-warms it via `spawn_blocking(refresh_cpu_util_cache)`
-    // before invoking `build_daemon_status`) plus a fast fresh loadavg read.
-    let cpu_snapshot =
-        crate::cpu_headroom::cpu_headroom_snapshot(cpu_utilization_target, cpu_est_cores_per_sweep);
-    let logical_cpus = cpu_snapshot.logical_cpus;
-    let loadavg_1m = cpu_snapshot.loadavg_1m;
-    let cpu_idle_fraction = cpu_snapshot.idle_fraction;
-    let cpu_headroom = cpu_snapshot.cpu_headroom;
+    // Host CPU **observations** (#3978, measured-idle signal #4031). Since #4512
+    // these no longer feed the cap — they are reported so an operator can see
+    // whether this machine's `maxConcurrent` leaves it idle or saturated. Never
+    // blocks: the idle fraction is the memoized sample (the caller pre-warms it
+    // via `spawn_blocking(refresh_cpu_util_cache)` before invoking
+    // `build_daemon_status`), plus a fast fresh loadavg read.
+    let logical_cpus = crate::cpu_headroom::logical_cpu_count();
+    let loadavg_1m = crate::cpu_headroom::read_loadavg_1m();
+    let cpu_idle_fraction = crate::cpu_headroom::cached_cpu_idle_fraction();
 
     // Token-capacity backpressure (#3902): back the token axis off from the flat
     // pool count toward the count of *healthy* accounts read from the rotation
@@ -1541,16 +1531,15 @@ pub fn build_daemon_status(
         token_axis_limit,
         per_token_concurrency,
         disk_headroom,
-        cpu_headroom,
         configured_max,
     );
     // The token axis of the cap is `healthy × per-token` (#3947), so it is the
     // binding constraint only when that *product* is the minimum across every
-    // axis — disk, cpu (#3978), and the operator ceiling.
+    // remaining axis — disk and the configured ceiling (#4512 removed the CPU
+    // axis).
     let token_axis_effective = token_axis_limit.saturating_mul(per_token_concurrency.max(1));
-    let token_bound = token_axis_effective <= disk_headroom
-        && token_axis_effective <= cpu_headroom
-        && token_axis_effective <= configured_max;
+    let token_bound =
+        token_axis_effective <= disk_headroom && token_axis_effective <= configured_max;
     // "Currently binding" vs "smallest ceiling" (#4031): the dynamic cap is the
     // minimum of several ceilings, but a ceiling only *binds* once in-flight
     // occupancy reaches it. Below the cap the limiter is work availability, not
@@ -1583,7 +1572,6 @@ pub fn build_daemon_status(
         token_pool_size,
         token_pool_dir,
         disk_headroom,
-        cpu_headroom,
         logical_cpus,
         loadavg_1m,
         cpu_idle_fraction,
@@ -1792,22 +1780,15 @@ fn resolve_dispatch_registry(
 // new `Response` variant. The advisory is a side channel (log + event bus),
 // exactly like `capacity.rs`'s token-pressure advisory.
 //
-// # Never the blocking (~1s on macOS) headroom refresh under the registry lock
+// # Nothing blocking under the registry lock
 //
 // The `DispatchSweep` arm holds the registry mutex from just after this
-// assessment through the dispatch call. `cpu_headroom::cpu_headroom_limit`
-// refreshes the memoized idle-fraction sample, which sleeps ~1s on macOS
-// (`iostat`) — calling it here would stall every other IPC request scoped to
-// the same registry (`ListSweeps` / `GetSweepStatus` / a concurrent
-// `DispatchSweep`) for that second. [`assess_dispatch_headroom`] therefore
-// uses the **non-refreshing** [`crate::cpu_headroom::cpu_headroom_snapshot`]
-// (reads the memoized cache; never blocks) — the exact same call
-// `build_daemon_status` makes, just without that function's own
-// `spawn_blocking` pre-warm (this handler is synchronous, not `async`, so it
-// cannot `.await` a `spawn_blocking` join; a same-generation `iostat` sample
-// from a recent `DaemonStatus` poll or the work-finder's own tick is
-// sufficient for an advisory signal, and a `None` idle fraction falls back
-// through `cpu_headroom`'s documented fail-open chain).
+// assessment through the dispatch call, so nothing here may block. Since #4512
+// the headroom is `min(token axis, disk, configured max)` — three cheap
+// filesystem/config reads, no CPU sampling at all. (Before #4512 this had to
+// carefully avoid `cpu_headroom_limit`, whose macOS `iostat` refresh sleeps ~1s
+// and would have stalled every other IPC request on the same registry for that
+// second; removing the CPU term removed that hazard outright.)
 
 /// Per-repo dynamic-cap headroom snapshot computed for a `dispatch_sweep`
 /// request (#4234). Mirrors the inputs `build_daemon_status` already exposes
@@ -1816,16 +1797,14 @@ fn resolve_dispatch_registry(
 struct DispatchHeadroom {
     /// Live (non-terminal) sweep count already registered for this repo.
     occupancy: usize,
-    /// `resolve_dynamic_max_concurrent` — min(token axis, disk, cpu, configured max).
+    /// `resolve_dynamic_max_concurrent` — min(token axis, disk, configured max).
     dynamic_cap: usize,
-    cpu_headroom: usize,
     disk_headroom: usize,
     token_axis_limit: usize,
 }
 
 /// Compute [`DispatchHeadroom`] for `repo_root` against the **already-locked**
-/// registry `sr`. See the module docs above for why this never calls the
-/// refreshing CPU probe.
+/// registry `sr`. See the module docs above for why nothing here may block.
 fn assess_dispatch_headroom(sr: &mut SweepRegistry, repo_root: &Path) -> DispatchHeadroom {
     // Reap-on-read (mirrors ListSweeps/GetSweepStatus, Issue #3893): a sweep
     // whose child already exited must not inflate occupancy against a stale
@@ -1840,10 +1819,6 @@ fn assess_dispatch_headroom(sr: &mut SweepRegistry, repo_root: &Path) -> Dispatc
     let wf_config = crate::work_finder::read_work_finder_config(repo_root);
     let configured_max = crate::work_finder::resolve_max_concurrent_with_config(&wf_config);
     let per_token_concurrency = crate::work_finder::resolve_per_token_concurrency(&wf_config);
-    let cpu_utilization_target = crate::work_finder::resolve_cpu_utilization_target(&wf_config);
-    let cpu_est_cores_per_sweep = crate::work_finder::resolve_cpu_est_cores_per_sweep(&wf_config);
-    let cpu_snapshot =
-        crate::cpu_headroom::cpu_headroom_snapshot(cpu_utilization_target, cpu_est_cores_per_sweep);
     let disk_headroom = crate::disk_headroom::disk_headroom_limit(repo_root);
     let token_pool_size = crate::tokens::token_pool_size(repo_root);
     let ranking = crate::capacity::read_ranking(repo_root);
@@ -1852,14 +1827,12 @@ fn assess_dispatch_headroom(sr: &mut SweepRegistry, repo_root: &Path) -> Dispatc
         token_axis_limit,
         per_token_concurrency,
         disk_headroom,
-        cpu_snapshot.cpu_headroom,
         configured_max,
     );
 
     DispatchHeadroom {
         occupancy,
         dynamic_cap,
-        cpu_headroom: cpu_snapshot.cpu_headroom,
         disk_headroom,
         token_axis_limit,
     }
@@ -1944,13 +1917,12 @@ fn dispatch_headroom_message(
     if low_headroom {
         format!(
             "dispatch_sweep: dispatching {kind:?} into {} while occupancy is at/over the \
-             computed dynamic-cap headroom (occupancy={} >= dynamic_cap={}; cpu_headroom={}, \
+             computed dynamic-cap headroom (occupancy={} >= dynamic_cap={}; \
              disk_headroom={}, token_axis_limit={}) — advisory only per #4234 (dispatch \
              proceeds; the autonomous work finder's own cap is unaffected)",
             repo_root.display(),
             h.occupancy,
             h.dynamic_cap,
-            h.cpu_headroom,
             h.disk_headroom,
             h.token_axis_limit
         )
@@ -1999,7 +1971,6 @@ fn emit_dispatch_headroom_advisory_on_change(
             "low_headroom": low_headroom,
             "occupancy": h.occupancy,
             "dynamic_cap": h.dynamic_cap,
-            "cpu_headroom": h.cpu_headroom,
             "disk_headroom": h.disk_headroom,
             "token_axis_limit": h.token_axis_limit,
             "message": message,
@@ -2700,12 +2671,11 @@ fn handle_request(
                 crate::sweep_registry::resolve_dispatch_model(&repo_root, model.as_deref());
             log::info!(
                 "dispatch_sweep: {:?} with model={resolved_model} (source={}); headroom \
-                 occupancy={} dynamic_cap={} (cpu={} disk={} tokens={})",
+                 occupancy={} dynamic_cap={} (disk={} tokens={})",
                 kind,
                 model_source.as_str(),
                 headroom.occupancy,
                 headroom.dynamic_cap,
-                headroom.cpu_headroom,
                 headroom.disk_headroom,
                 headroom.token_axis_limit
             );
@@ -3562,7 +3532,6 @@ exit 0
         DispatchHeadroom {
             occupancy,
             dynamic_cap,
-            cpu_headroom: dynamic_cap,
             disk_headroom: 10,
             token_axis_limit: 5,
         }
@@ -3589,7 +3558,6 @@ exit 0
         let h = DispatchHeadroom {
             occupancy: 4,
             dynamic_cap: 3,
-            cpu_headroom: 2,
             disk_headroom: 9,
             token_axis_limit: 6,
         };
@@ -3599,7 +3567,6 @@ exit 0
         let entered = dispatch_headroom_message(repo, true, &h, &kind);
         assert!(entered.contains("occupancy=4"), "{entered}");
         assert!(entered.contains("dynamic_cap=3"), "{entered}");
-        assert!(entered.contains("cpu_headroom=2"), "{entered}");
         assert!(entered.contains("disk_headroom=9"), "{entered}");
         assert!(entered.contains("token_axis_limit=6"), "{entered}");
         assert!(entered.contains("123"), "{entered}");
@@ -5031,7 +4998,6 @@ exit 0
             token_pool_size: 4,
             token_pool_dir: Some(std::path::PathBuf::from("/repo/a/.loom/tokens")),
             disk_headroom: 10,
-            cpu_headroom: 6,
             logical_cpus: 8,
             loadavg_1m: Some(1.25),
             cpu_idle_fraction: Some(0.90),
@@ -5106,7 +5072,6 @@ exit 0
                     Some(std::path::PathBuf::from("/repo/a/.loom/tokens"))
                 );
                 assert_eq!(r.disk_headroom, 10);
-                assert_eq!(r.cpu_headroom, 6);
                 assert_eq!(r.logical_cpus, 8);
                 assert!(r.auto_update_enabled);
                 assert_eq!(r.auto_update_consecutive_failures, 2);
@@ -5314,8 +5279,10 @@ exit 0
             !report.main_health_gate_not_evaluated,
             "absent main_health_gate_not_evaluated (#3950) defaults to false"
         );
-        // Absent pre-#3978 fields default rather than failing to parse.
-        assert_eq!(report.cpu_headroom, 0);
+        // Absent pre-#3978 fields default rather than failing to parse. (The
+        // retired `cpu_headroom` field a pre-#4512 daemon still SENDS is
+        // likewise tolerated: serde ignores unknown fields, so an old daemon
+        // and a new CLI stay wire-compatible in both directions.)
         assert_eq!(report.logical_cpus, 0);
         assert_eq!(report.loadavg_1m, None);
         // Absent pre-#4012 fields must default to `None` — NOT `false` — so a

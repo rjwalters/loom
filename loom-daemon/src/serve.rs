@@ -1032,7 +1032,6 @@ mod tests {
             token_pool_size: 0,
             token_pool_dir: None,
             disk_headroom: 0,
-            cpu_headroom: 0,
             logical_cpus: 0,
             loadavg_1m: None,
             cpu_idle_fraction: None,
