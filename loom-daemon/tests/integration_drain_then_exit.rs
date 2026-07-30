@@ -67,6 +67,20 @@ async fn test_drain_then_exit_exits_143_and_stays_down() {
             // scratch daemon count that repo's REAL in-flight sweeps and the
             // drain never completes.
             .env("LOOM_WORKSPACE", &workspace_root)
+            // Fail-closed autonomy toggles (#4573). This is the suite's only
+            // daemon spawn outside `TestDaemon::start()`, so it needs the same
+            // guard: each of these env vars wins outright over config in the
+            // daemon's env > config > default chain, so a test daemon can never
+            // dispatch a real sweep or run a real role session regardless of
+            // which checkout's `.loom/config.json` it ends up resolving.
+            .env("LOOM_ROLE_RUNNER", "0")
+            .env("LOOM_WORK_FINDER", "0")
+            .env("LOOM_EPIC_SUPERVISOR", "0")
+            // Pinned for the same reason as `LOOM_WORKSPACE` above: an
+            // inherited `LOOM_WORKTREE_ROOT` is the highest-priority source in
+            // `worktree_root()`, so without this the scratch daemon would
+            // resolve worktrees onto the host's real scratch volume (#4573).
+            .env("LOOM_WORKTREE_ROOT", temp_dir.path().join("worktrees"))
             .env("RUST_LOG", "debug")
             .env("LOOM_NO_RESTORE", "1")
             // Deliberately UNSET: a then-exit drain must not require a supervisor
