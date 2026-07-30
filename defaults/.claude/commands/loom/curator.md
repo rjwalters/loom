@@ -537,7 +537,10 @@ There are **three, and only three**, cost-of-being-wrong strata (issue #4238 add
 
 ```bash
 ./.loom/scripts/require-complexity-marker.sh <issue>   # exit 0 = has a valid tier; exit 1 = missing or out-of-vocabulary
+                                                       # exit 2 = could not fetch (retry/check quota, NOT a curation defect)
 ```
+
+Exit 2 means the issue body could not be fetched (both GraphQL and REST failed — usually API quota exhaustion), not that the marker is absent. Retry once quota recovers; do not re-edit the body on an exit-2.
 
 ## Where to Add Enhancements
 

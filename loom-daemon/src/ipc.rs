@@ -2686,18 +2686,26 @@ fn handle_request(
         // Event Bus Handlers (Issue #3453 — Phase B of #3449)
         // ====================================================================
         Request::PublishEvent { topic, payload } => {
-            // Generic publish path used by sweep children — the topic is
-            // the canonical name (e.g., "sweep.issue.123.phase") and the
-            // payload is opaque JSON. See `defaults/.claude/commands/loom/
-            // sweep.md` for the per-topic payload schema.
-            let event = Event::Generic {
-                topic: topic.clone(),
-                payload,
-            };
+            // Publish path used by sweep children — the topic is the canonical
+            // name (e.g., "sweep.issue.123.phase") and the payload is JSON. See
+            // `defaults/.claude/commands/loom/sweep.md` for the per-topic
+            // payload schema.
+            //
+            // Issue #4466: the two documented child-published topics
+            // (`sweep.issue.{N}.phase` / `.blocker`) are upgraded to their
+            // typed variants here so the narration sink can emit the documented
+            // room lines — an `Event::Generic` is never narrated. Unknown
+            // topics and malformed payloads fall through to `Event::Generic`
+            // unchanged (publish is fire-and-forget advisory).
+            let topic_ack = topic.clone();
+            let event = Event::from_published(topic, payload);
             match event_bus.publish(event) {
-                Ok(receivers) => Response::EventPublished { topic, receivers },
+                Ok(receivers) => Response::EventPublished {
+                    topic: topic_ack,
+                    receivers,
+                },
                 Err(_) => Response::EventPublished {
-                    topic,
+                    topic: topic_ack,
                     receivers: 0,
                 },
             }
@@ -4179,14 +4187,149 @@ exit 0
             other => panic!("Expected EventPublished, got: {other:?}"),
         }
 
-        // Subscriber should now see the published event.
+        // Issue #4466: the documented child-published `sweep.issue.{N}.phase`
+        // topic is upgraded to the typed `Event::SweepPhase` variant (was
+        // previously delivered as `Event::Generic`, which the narration sink
+        // never narrated).
         let ev = sub.recv().await.unwrap();
         match ev {
-            Event::Generic { topic, payload } => {
-                assert_eq!(topic, "sweep.issue.123.phase");
-                assert_eq!(payload, serde_json::json!({"phase": "builder"}));
+            Event::SweepPhase {
+                issue,
+                phase,
+                pr_number,
+                repo,
+            } => {
+                assert_eq!(issue, 123);
+                assert_eq!(phase, "builder");
+                assert_eq!(pr_number, None);
+                assert_eq!(repo, None);
             }
-            other => panic!("Expected Generic event, got: {other:?}"),
+            other => panic!("Expected SweepPhase event, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_request_publish_event_upgrades_blocker_topic() {
+        // Issue #4466: `sweep.issue.{N}.blocker` upgrades to `Event::SweepBlocker`
+        // with the full documented payload (incl. the optional `repo`).
+        let (tm, db, sr, bus) = setup_test_context();
+        let mut sub = bus.subscribe::<[&str; 0], &str>([]);
+
+        handle_request(
+            Request::PublishEvent {
+                topic: "sweep.issue.456.blocker".to_string(),
+                payload: serde_json::json!({
+                    "reason": "needs human decision",
+                    "label_added": "loom:operator-only",
+                    "repo": "/work/loom",
+                }),
+            },
+            &tm,
+            &db,
+            &sr,
+            &bus,
+            &test_pool(),
+        );
+
+        match sub.recv().await.unwrap() {
+            Event::SweepBlocker {
+                issue,
+                reason,
+                label_added,
+                repo,
+            } => {
+                assert_eq!(issue, 456);
+                assert_eq!(reason, "needs human decision");
+                assert_eq!(label_added, "loom:operator-only");
+                assert_eq!(repo.as_deref(), Some("/work/loom"));
+            }
+            other => panic!("Expected SweepBlocker event, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_request_publish_event_phase_carries_pr_and_repo() {
+        // Issue #4466: the optional `pr_number` + `repo` fields survive the
+        // typed upgrade (the phase narration line appends ` · PR #M open`).
+        let (tm, db, sr, bus) = setup_test_context();
+        let mut sub = bus.subscribe::<[&str; 0], &str>([]);
+
+        handle_request(
+            Request::PublishEvent {
+                topic: "sweep.issue.789.phase".to_string(),
+                payload: serde_json::json!({
+                    "phase": "judge",
+                    "pr_number": 501,
+                    "repo": "/work/loom",
+                }),
+            },
+            &tm,
+            &db,
+            &sr,
+            &bus,
+            &test_pool(),
+        );
+
+        match sub.recv().await.unwrap() {
+            Event::SweepPhase {
+                issue,
+                phase,
+                pr_number,
+                repo,
+            } => {
+                assert_eq!(issue, 789);
+                assert_eq!(phase, "judge");
+                assert_eq!(pr_number, Some(501));
+                assert_eq!(repo.as_deref(), Some("/work/loom"));
+            }
+            other => panic!("Expected SweepPhase event, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_request_publish_event_malformed_and_unknown_stay_generic() {
+        // Issue #4466: publish is fire-and-forget advisory — a malformed
+        // payload (missing required `phase`), an unknown sweep sub-topic, a
+        // non-integer issue segment, and an entirely unrelated topic all stay
+        // `Event::Generic` with the payload passed through UNCHANGED.
+        let (tm, db, sr, bus) = setup_test_context();
+
+        let cases: &[(&str, serde_json::Value)] = &[
+            // Documented topic, but the required `phase` field is missing.
+            ("sweep.issue.123.phase", serde_json::json!({"pr_number": 5})),
+            // Documented blocker topic, but `label_added` is missing.
+            ("sweep.issue.123.blocker", serde_json::json!({"reason": "x"})),
+            // Unknown sweep sub-topic.
+            ("sweep.issue.123.other", serde_json::json!({"phase": "builder"})),
+            // Non-integer issue segment.
+            ("sweep.issue.abc.phase", serde_json::json!({"phase": "builder"})),
+            // Entirely unrelated topic.
+            ("custom.topic", serde_json::json!({"phase": "builder"})),
+        ];
+
+        for (topic, payload) in cases {
+            let mut sub = bus.subscribe::<[&str; 0], &str>([]);
+            handle_request(
+                Request::PublishEvent {
+                    topic: (*topic).to_string(),
+                    payload: payload.clone(),
+                },
+                &tm,
+                &db,
+                &sr,
+                &bus,
+                &test_pool(),
+            );
+            match sub.recv().await.unwrap() {
+                Event::Generic {
+                    topic: got_topic,
+                    payload: got_payload,
+                } => {
+                    assert_eq!(&got_topic, topic, "topic preserved for {topic}");
+                    assert_eq!(&got_payload, payload, "payload passed through for {topic}");
+                }
+                other => panic!("Expected Generic event for {topic}, got: {other:?}"),
+            }
         }
     }
 

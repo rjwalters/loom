@@ -26,7 +26,8 @@
 //!    exited) flips any of them still `loom:building` back to `loom:issue`
 //!    via `gh` **from the orchestrator, not over SSH** — the forge is global,
 //!    so no remote access is needed for this step.
-//! 3. **Safehoused flush verification is a documented stub (#3998).** See
+//! 3. **Safehoused flush verification via a supervised stop (#3998).** A
+//!    supervised `systemctl --user stop safehoused` IS the flush — see
 //!    [`flush_safehouse`]'s doc comment.
 //!
 //! # Phase state machine (idempotent + resumable, body step 6)
@@ -745,7 +746,7 @@ fn run_phase(
             }
         }
 
-        DrainPhase::FlushSafehouse => flush_safehouse(config),
+        DrainPhase::FlushSafehouse => flush_safehouse(config, runner),
 
         DrainPhase::DeregisterWorkspace => {
             let mut failures = Vec::new();
@@ -844,46 +845,92 @@ fn wait_remote_exit(runner: &dyn CommandRunner, config: &DrainConfig) -> PhaseOu
     }
 }
 
-/// Safehoused key-backup flush verification (body step 3 / AC 2) — **a
-/// documented stub, not a re-implementation of #3998's teardown fragment.**
+/// Safehoused key-backup flush verification (body step 3 / AC 2, #3998).
 ///
-/// #3998 (the safehoused provisioning/teardown fragment) is open, and
-/// `loom-daemon/src/safehouse.rs` exposes only the narration-sink and
-/// peer-claim-coordination client seams — there is no invocable
-/// `wait_for_steady_state`-equivalent reachable from this (synchronous, CLI)
-/// call path. Rather than block every drain on #3998 (steps 1, 2, 4, 5, 6 are
-/// explicitly unblocked per the issue's dependency table) or fabricate a check
-/// that cannot actually verify anything, this phase degrades honestly:
+/// `safehoused` has no clean-exit restart primitive of its own — a supervised
+/// **stop IS the flush**: safehoused's SIGTERM/ctrl-c shutdown path calls
+/// `client.encryption().backups().wait_for_steady_state()` and prints
+/// `"safehoused: room-key backup flushed; bye"` before exiting (confirmed on
+/// the safehouse repo's `main`, `safehoused/src/main.rs`). So this phase, over
+/// `runner`:
+///
+/// 1. `systemctl --user stop safehoused` (idempotent — a no-op, exit 0, on an
+///    already-stopped unit, so a drain of a host where safehoused is already
+///    down verifies via unit state rather than hanging).
+/// 2. Polls `systemctl --user is-active safehoused` briefly for the stop to
+///    settle (bounded — never spins forever).
+/// 3. Verifies via the journal's flush line, falling back to the unit's
+///    `ExecMainStatus` (ordinarily a stale/rotated journal case) when the
+///    line is absent but the unit exited cleanly.
 ///
 /// - `safehouse.enabled == false` (the default): [`PhaseOutcome::Skipped`] —
-///   no room keys are in play on this host, so "safe to power off" is
-///   accurate.
-/// - `safehouse.enabled == true`: [`PhaseOutcome::Unverified`] — the drain
-///   still completes (workspace deregistration + roster removal proceed;
-///   loom never *refuses* to retire a box over this), but the final verdict
-///   explicitly withholds "safe to power off" (AC 2: "never print safe to
-///   power off when the key-backup check did not pass") and exits non-zero
+///   no room keys are in play on this host; "safe to power off" is accurate
+///   without touching the host.
+/// - `safehouse.enabled == true` and the flush verifies (remote exit 0):
+///   [`PhaseOutcome::Changed`] — eligible for "safe to power off" (AC:
+///   verified ⇒ exit 0).
+/// - `safehouse.enabled == true` and the flush does **not** verify (remote
+///   nonzero exit, or the host could not be reached): [`PhaseOutcome::Unverified`]
+///   — the drain still completes (workspace deregistration + roster removal
+///   proceed; loom never *refuses* to retire a box over this), but the final
+///   verdict explicitly withholds "safe to power off" and exits non-zero
 ///   (`3`) so an operator/monitor treats it as a flag, not a clean success.
-///
-/// TODO(#3998): once a concrete flush/steady-state-check seam lands in
-/// `safehouse.rs`, replace this stub with a real SSH-invoked check (or a
-/// direct call if the daemon exposes one), and this phase's `Unverified`
-/// branch becomes reachable only on an *actual* verification failure.
 #[must_use]
-fn flush_safehouse(config: &DrainConfig) -> PhaseOutcome {
+fn flush_safehouse(config: &DrainConfig, runner: &dyn CommandRunner) -> PhaseOutcome {
     if !config.safehouse_enabled {
         return PhaseOutcome::Skipped {
             reason: "safehouse.enabled is false — no room keys in play on this host".to_string(),
         };
     }
-    PhaseOutcome::Unverified {
-        reason: "safehouse.enabled is true, but no invocable key-backup steady-state check \
-                 exists in this repo yet (#3998 is open) — cannot verify the flush before this \
-                 host is torn down. Teardown proceeds (workspace/roster cleanup complete), but is \
-                 NOT certified safe for room-key continuity."
-            .to_string(),
+    match runner.run(FLUSH_SAFEHOUSE_SHELL, None) {
+        Ok(out) if out.ok() => PhaseOutcome::Changed,
+        Ok(out) => PhaseOutcome::Unverified {
+            reason: format!(
+                "safehoused key-backup flush could not be verified on {} (exit {}): {} — \
+                 teardown proceeds (workspace/roster cleanup complete), but is NOT certified \
+                 safe for room-key continuity.",
+                config.ssh_host,
+                out.code,
+                tail(&out.stderr)
+            ),
+        },
+        Err(e) => PhaseOutcome::Unverified {
+            reason: format!(
+                "could not reach {} to stop safehoused and verify the key-backup flush: {e} — \
+                 teardown proceeds (workspace/roster cleanup complete), but is NOT certified \
+                 safe for room-key continuity.",
+                config.ssh_host
+            ),
+        },
     }
 }
+
+/// Remote shell for [`flush_safehouse`]: stop the `safehoused` unit (its
+/// SIGTERM path IS the flush) and verify. Exits `0` when the flush is
+/// verified (journal line, or a clean `ExecMainStatus` when the unit is
+/// inactive), non-zero otherwise. Bounded polling (`30` × `1s` max) so an
+/// already-stopped unit — or one that never comes down — never hangs the
+/// drain.
+const FLUSH_SAFEHOUSE_SHELL: &str = r#"set +e
+systemctl --user stop safehoused >/dev/null 2>&1
+i=0
+while [ "$i" -lt 30 ]; do
+  state="$(systemctl --user is-active safehoused 2>/dev/null)"
+  [ "$state" = "active" ] || break
+  sleep 1
+  i=$((i + 1))
+done
+if journalctl --user -u safehoused --no-pager -n 200 2>/dev/null | grep -q "room-key backup flushed"; then
+  exit 0
+fi
+exit_status="$(systemctl --user show safehoused -p ExecMainStatus --value 2>/dev/null)"
+state="$(systemctl --user is-active safehoused 2>/dev/null)"
+if [ "$exit_status" = "0" ] && [ "$state" != "active" ]; then
+  exit 0
+fi
+echo "safehoused flush not verified (state=$state exec_main_status=$exit_status)" >&2
+exit 1
+"#;
 
 fn tail(s: &str) -> String {
     s.lines()
@@ -1615,7 +1662,7 @@ mod tests {
         assert_eq!(claims.calls.lock().unwrap().len(), 1);
     }
 
-    // ---- unverified safehouse flush → non-zero, no "safe to power off" ---
+    // ---- safehouse flush verification (#3998) -----------------------------
 
     #[test]
     fn unverified_safehouse_flush_yields_nonzero_exit_and_no_safe_line() {
@@ -1630,6 +1677,14 @@ mod tests {
                 stderr: String::new(),
             }),
             Err("connection refused".to_string()),
+            // FlushSafehouse's own stop-and-verify call: the remote script
+            // could not verify the flush (state still unclear).
+            Ok(CommandOutput {
+                code: 1,
+                stdout: String::new(),
+                stderr: "safehoused flush not verified (state=activating exec_main_status=)"
+                    .to_string(),
+            }),
             Ok(CommandOutput {
                 code: 0,
                 stdout: String::new(),
@@ -1644,6 +1699,17 @@ mod tests {
         // Not blocked — deregistration/roster-removal still proceed.
         assert!(removed);
 
+        let flush_report = reports
+            .iter()
+            .find(|r| r.phase == DrainPhase::FlushSafehouse.name())
+            .unwrap();
+        match &flush_report.outcome {
+            PhaseOutcome::Unverified { reason } => {
+                assert!(reason.contains("not verified"), "reason: {reason}")
+            }
+            other => panic!("expected Unverified, got {other:?}"),
+        }
+
         let report = build_report(&config, reports);
         assert!(!report.safe_to_power_off);
         assert_eq!(report.exit_code(), 3);
@@ -1653,10 +1719,104 @@ mod tests {
     }
 
     #[test]
-    fn safehouse_disabled_is_skipped_and_stays_safe() {
+    fn unreachable_host_during_flush_yields_unverified_not_failed() {
+        // A drain must never let an SSH hiccup during the flush phase halt
+        // the run — workspace deregistration + roster removal must still
+        // proceed (loom never refuses to retire a box over this).
+        let mut config = base_config("worker-1");
+        config.safehouse_enabled = true;
+
+        let runner = MockRunner::new(vec![
+            Ok(ok_with_in_flight(&[], true)),
+            Ok(CommandOutput {
+                code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            }),
+            Err("connection refused".to_string()),
+            Err("ssh: connect to host worker-1 port 22: Connection timed out".to_string()),
+            Ok(CommandOutput {
+                code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            }),
+        ]);
+        let claims = MockClaimResetter::new(HashMap::new());
+        let mut record = worker("worker-1");
+        let config2 = config.clone();
+
+        let (reports, removed) =
+            execute_drain(&runner, &claims, &mut record, &config, |_| Ok(())).unwrap();
+        assert!(removed);
+        assert!(!reports.iter().any(|r| r.outcome.is_failure()));
+        let report = build_report(&config2, reports);
+        assert_eq!(report.exit_code(), 3);
+    }
+
+    #[test]
+    fn verified_safehouse_flush_yields_exit_zero_and_safe_line() {
+        let mut config = base_config("worker-1");
+        config.safehouse_enabled = true;
+
+        let runner = MockRunner::new(vec![
+            Ok(ok_with_in_flight(&[], true)),
+            Ok(CommandOutput {
+                code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            }),
+            Err("connection refused".to_string()),
+            // FlushSafehouse's stop-and-verify call succeeds (journal showed
+            // "room-key backup flushed", or a clean ExecMainStatus).
+            Ok(CommandOutput {
+                code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            }),
+            Ok(CommandOutput {
+                code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            }),
+        ]);
+        let claims = MockClaimResetter::new(HashMap::new());
+        let mut record = worker("worker-1");
+        let config2 = config.clone();
+
+        let (reports, removed) =
+            execute_drain(&runner, &claims, &mut record, &config, |_| Ok(())).unwrap();
+        assert!(removed);
+
+        let flush_report = reports
+            .iter()
+            .find(|r| r.phase == DrainPhase::FlushSafehouse.name())
+            .unwrap();
+        assert_eq!(flush_report.outcome, PhaseOutcome::Changed);
+
+        let report = build_report(&config2, reports);
+        assert!(report.safe_to_power_off);
+        assert_eq!(report.exit_code(), 0);
+        assert!(report.render_human().contains("safe to power off."));
+    }
+
+    #[test]
+    fn safehouse_disabled_is_skipped_and_stays_safe_without_touching_the_host() {
         let config = base_config("worker-1"); // safehouse_enabled: false
-        let outcome = flush_safehouse(&config);
+        let runner = MockRunner::new(vec![]);
+        let outcome = flush_safehouse(&config, &runner);
         assert!(matches!(outcome, PhaseOutcome::Skipped { .. }));
+        assert!(runner.calls.borrow().is_empty(), "disabled flush must never touch the host");
+    }
+
+    #[test]
+    fn flush_safehouse_stop_command_targets_the_safehoused_unit() {
+        // The rendered remote shell must stop (never kill -9) the unit and
+        // check both the journal flush line and the unit's exit status —
+        // asserted directly on the constant so a future edit cannot silently
+        // drop either verification path.
+        assert!(FLUSH_SAFEHOUSE_SHELL.contains("systemctl --user stop safehoused"));
+        assert!(FLUSH_SAFEHOUSE_SHELL.contains("room-key backup flushed"));
+        assert!(FLUSH_SAFEHOUSE_SHELL.contains("ExecMainStatus"));
     }
 
     // ---- roster entry removed only in the final phase ---------------------
