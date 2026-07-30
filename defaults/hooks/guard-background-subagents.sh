@@ -34,8 +34,18 @@
 #      completion arrives later as a `task-notification` message whose
 #      `<tool-use-id>` tag echoes the original dispatch id; only that event
 #      counts as resolution for a background Bash task.
+#   3. Assistant `Monitor` / `ScheduleWakeup` `tool_use` entries (issue #4462)
+#      whose dispatch id has no matching `<task-notification>...
+#      <tool-use-id>ID</tool-use-id>...` fired/resolved event later in the
+#      transcript. Like a background Bash task, arming a `Monitor` returns an
+#      IMMEDIATE `tool_result` ack ("timer armed") that is NOT the fire event —
+#      so it is matched against the same later `task-notification` echo, never
+#      the dispatch-time ack. This is the exact #4462 strand: a transport
+#      failure (529/Overloaded) handled by arming `Monitor {command:
+#      "sleep 90 && …"}` and ending the turn — in headless `-p` mode the timer
+#      has no session to wake, the process exits 0, and the sweep is orphaned.
 #
-# In both cases, this is a HEURISTIC over the transcript file, not a live
+# In all three cases, this is a HEURISTIC over the transcript file, not a live
 # process check (no such live signal exists here), so it can have false
 # positives (e.g. a slow transcript flush) — hence the single-block semantics
 # below rather than a hard, repeatable deny.
@@ -153,21 +163,57 @@ UNRESOLVED_BG_IDS=$(jq -s -r '
   | ($bg_ids - $notified_ids) | .[]
 ' "$TRANSCRIPT_PATH" 2>/dev/null) || UNRESOLVED_BG_IDS=""
 
-[[ -n "$UNRESOLVED_TASK_IDS" || -n "$UNRESOLVED_BG_IDS" ]] || exit 0
+# Diff armed Monitor / ScheduleWakeup dispatch ids (issue #4462) against the
+# same later `<task-notification>...<tool-use-id>ID</tool-use-id>...` fired/
+# resolved event used for background Bash. Arming a `Monitor` returns an
+# IMMEDIATE dispatch-time `tool_result` ack ("timer armed") that is NOT the
+# fire event, so — exactly like the background-Bash detector — the immediate
+# ack is deliberately NOT treated as resolution; only a later task-notification
+# echoing the dispatch id counts. An armed-but-unfired timer left as the only
+# pending work is the #4462 transport-failure strand: in headless `-p` mode the
+# turn end kills the process before the timer fires, exit 0 orphans the claim.
+UNRESOLVED_MONITOR_IDS=$(jq -s -r '
+  [ .[]? | select(.type=="assistant") | .message.content[]?
+    | select(.type=="tool_use" and (.name=="Monitor" or .name=="ScheduleWakeup"))
+    | .id ] as $monitor_ids
+  | [ .[]?
+      | (
+          # shape 1: queue-operation, top-level .content string
+          ( select(.type=="queue-operation") | (.content? // empty) | select(type=="string") ),
+          # shape 2: attachment, .attachment.prompt string
+          ( select(.type=="attachment") | (.attachment.prompt? // empty) | select(type=="string") ),
+          # shape 3 (legacy/backcompat): user message.content (string or blocks)
+          ( select(.type=="user")
+            | .message.content as $c
+            | ( if ($c|type) == "string" then $c
+                else ($c[]? | (.content? // empty) | select(type=="string"))
+                end ) )
+        )
+      | (capture("<tool-use-id>(?<id>[^<]+)</tool-use-id>")?).id // empty
+    ] as $notified_ids
+  | ($monitor_ids - $notified_ids) | .[]
+' "$TRANSCRIPT_PATH" 2>/dev/null) || UNRESOLVED_MONITOR_IDS=""
+
+[[ -n "$UNRESOLVED_TASK_IDS" || -n "$UNRESOLVED_BG_IDS" || -n "$UNRESOLVED_MONITOR_IDS" ]] || exit 0
 
 TASK_COUNT=0
 [[ -z "$UNRESOLVED_TASK_IDS" ]] || TASK_COUNT=$(printf '%s\n' "$UNRESOLVED_TASK_IDS" | grep -c . || true)
 BG_COUNT=0
 [[ -z "$UNRESOLVED_BG_IDS" ]] || BG_COUNT=$(printf '%s\n' "$UNRESOLVED_BG_IDS" | grep -c . || true)
+MONITOR_COUNT=0
+[[ -z "$UNRESOLVED_MONITOR_IDS" ]] || MONITOR_COUNT=$(printf '%s\n' "$UNRESOLVED_MONITOR_IDS" | grep -c . || true)
 
-REASON="STOP BLOCKED (guard-background-subagents.sh, issues #4257/#4389):"
+REASON="STOP BLOCKED (guard-background-subagents.sh, issues #4257/#4389/#4462):"
 if [[ "$TASK_COUNT" -gt 0 ]]; then
     REASON="${REASON} ${TASK_COUNT} dispatched Task subagent(s) have no observed completion in this transcript yet."
 fi
 if [[ "$BG_COUNT" -gt 0 ]]; then
     REASON="${REASON} ${BG_COUNT} background Bash command(s) (run_in_background) have no completion notification in this transcript yet."
 fi
-REASON="${REASON} In headless \`claude -p\` mode, ending this turn TERMINATES THE PROCESS and kills every still-running background child -- there is no 'it finishes after I stop talking'. Before writing a final message, you MUST explicitly await each dispatched subagent's completion (blocking TaskOutput / completion notification) and each background Bash task's completion notification -- see defaults/.claude/commands/loom/sweep.md, 'CRITICAL: Subagent dispatch is async-only' (#3822). If you are certain every subagent/background task has actually finished (e.g. this is a false positive from a slow transcript flush), it is safe to stop again -- this guard blocks at most once per stop sequence."
+if [[ "$MONITOR_COUNT" -gt 0 ]]; then
+    REASON="${REASON} ${MONITOR_COUNT} armed Monitor/ScheduleWakeup timer(s) have not fired in this transcript yet (issue #4462) -- a transport-failure backoff (529/Overloaded) MUST be retried inline in the same turn, or the orchestrator must exit NONZERO, never parked on an end-of-turn timer."
+fi
+REASON="${REASON} In headless \`claude -p\` mode, ending this turn TERMINATES THE PROCESS and kills every still-running background child -- there is no 'it finishes after I stop talking'. Before writing a final message, you MUST explicitly await each dispatched subagent's completion (blocking TaskOutput / completion notification), each background Bash task's completion notification, and each armed Monitor/ScheduleWakeup timer's fire event -- see defaults/.claude/commands/loom/sweep.md, 'CRITICAL: Subagent dispatch is async-only' (#3822). If you are certain every subagent/background task/timer has actually finished (e.g. this is a false positive from a slow transcript flush), it is safe to stop again -- this guard blocks at most once per stop sequence."
 
 jq -n --arg reason "$REASON" '{decision: "block", reason: $reason}' 2>/dev/null && exit 0
 
