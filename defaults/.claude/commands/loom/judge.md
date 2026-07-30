@@ -321,25 +321,65 @@ practice, not hours, so the grace period is minutes, not hours.
 behavior change: `gh pr edit <number> --add-label "loom:reviewing"`.
 
 **If the PR DOES carry `loom:reviewing`:** determine the claim's age and
-whether anyone has commented since the claim was made:
+whether anyone has *genuinely* commented since the claim was made — see
+"Stand-down marker convention" below for why the comment count excludes
+stand-down comments:
 
 ```bash
 N=<pr-number>
 CLAIMED_AT=$(gh api "repos/{owner}/{repo}/issues/$N/timeline" --paginate \
   --jq '[.[] | select(.event=="labeled" and .label.name=="loom:reviewing")] | last | .created_at')
-COMMENTS_AFTER=$(gh api "repos/{owner}/{repo}/issues/$N/comments" \
-  | jq --arg t "$CLAIMED_AT" '[.[] | select(.created_at > $t)] | length')
+MARKER="<!-- loom:standdown claim=$CLAIMED_AT -->"
+COMMENTS_JSON=$(gh api "repos/{owner}/{repo}/issues/$N/comments" \
+  | jq --arg t "$CLAIMED_AT" '[.[] | select(.created_at > $t)]')
+COMMENTS_AFTER=$(echo "$COMMENTS_JSON" | jq --arg m "$MARKER" '[.[] | select(.body | contains($m) | not)] | length')
+STANDDOWN_COUNT=$(echo "$COMMENTS_JSON" | jq --arg m "$MARKER" '[.[] | select(.body | contains($m))] | length')
 ```
 
 Then decide:
 
 | Condition | Verdict | Action |
 |-----------|---------|--------|
-| Claim age < `LOOM_STALE_REVIEWING_MINUTES` (default **30**), OR `COMMENTS_AFTER > 0` | **Fresh** — a Judge is actively working this PR | **Do not stomp the claim.** Skip this PR and continue the batch to the next candidate PR. |
+| `STANDDOWN_COUNT >= LOOM_MAX_STANDDOWN_STREAK` (default **3**) | **Stale — bounded fallback** (see below) | Force-reclaim regardless of claim age or `COMMENTS_AFTER`. Breaks the livelock even if the marker/exclusion logic above is somehow bypassed. |
+| Claim age < `LOOM_STALE_REVIEWING_MINUTES` (default **30**), OR `COMMENTS_AFTER > 0` | **Fresh** — a Judge is actively working this PR | **Do not stomp the claim.** Post a marked stand-down comment (see below), then skip this PR and continue the batch to the next candidate PR. |
 | Claim age ≥ `LOOM_STALE_REVIEWING_MINUTES` AND `COMMENTS_AFTER == 0` | **Stale** — the claiming Judge's process almost certainly died mid-review | Reclaim (see below), then proceed with the normal review from step 3. |
 | Timeline API call fails or returns empty (`CLAIMED_AT` unset) | **Unknown — fail safe** | Treat as **fresh**. Never stomp a claim on API failure or missing data. |
 
-**Reclaiming a stale claim:**
+**Stand-down marker convention (#4618 — breaks the livelock)**: a "standing
+down, not stomping" comment is evidence of **no activity**, not activity — it
+means a *later* Judge pass declined to touch the claim, not that the
+*original* claimant is still working. Before #4618, `COMMENTS_AFTER` counted
+every comment after the claim indiscriminately, so each stand-down comment
+satisfied the very freshness test the next pass ran, making the claim look
+eternally fresh even though nothing was actually happening (PR #4614: 3
+consecutive stand-down comments over 30+ minutes, never reclaimed). Every
+stand-down comment you post in the "Fresh" row above MUST end with the
+`<!-- loom:standdown claim=$CLAIMED_AT -->` marker so it is excluded from
+`COMMENTS_AFTER` on every subsequent pass, and counted in `STANDDOWN_COUNT`
+instead:
+
+```bash
+gh pr comment $N --body "Judge pass: PR still carries a fresh \`loom:reviewing\` claim (claimed $CLAIMED_AT) — standing down without reclaiming. Not stomping.
+<!-- loom:standdown claim=$CLAIMED_AT -->"
+```
+
+**Bounded fallback (AC3, #4618)**: `STANDDOWN_COUNT` is a hard cap
+independent of the marker-exclusion logic working correctly — it counts how
+many stand-down comments have accumulated against *this exact*
+`$CLAIMED_AT` (the marker embeds it, so a genuine reclaim — which changes
+`CLAIMED_AT` — resets the count to zero automatically). Once
+`LOOM_MAX_STANDDOWN_STREAK` marked comments have piled up against the same
+claim with no reclaim, force-reclaim regardless of age or `COMMENTS_AFTER`,
+using this reclaim comment:
+
+```bash
+gh pr edit $N --remove-label "loom:reviewing"
+gh pr comment $N --body "Reclaiming loom:reviewing claim: $STANDDOWN_COUNT consecutive stand-down comments have accumulated against claim $CLAIMED_AT with no actual review progress (bounded fallback, LOOM_MAX_STANDDOWN_STREAK=${LOOM_MAX_STANDDOWN_STREAK:-3}) — breaking the livelock."
+gh pr edit $N --add-label "loom:reviewing"
+# Continue to step 3 (Check merge state) and evaluate normally
+```
+
+**Reclaiming a stale claim** (the ordinary claim-age path):
 
 ```bash
 gh pr edit $N --remove-label "loom:reviewing"
@@ -348,18 +388,25 @@ gh pr edit $N --add-label "loom:reviewing"
 # Continue to step 3 (Check merge state) and evaluate normally
 ```
 
-**Env var**: `LOOM_STALE_REVIEWING_MINUTES` (default **30**) — named to
+**Env vars**: `LOOM_STALE_REVIEWING_MINUTES` (default **30**) — named to
 mirror `LOOM_STALE_BUILDING_HOURS` (`loom-daemon/src/claim_reconciliation.rs`,
 the analogous no-record staleness threshold for `loom:building` claims), but
 on a **minutes**, not hours, scale, since review turnaround (5–15 minutes) is
-two orders of magnitude faster than a build.
+two orders of magnitude faster than a build. `LOOM_MAX_STANDDOWN_STREAK`
+(default **3**) — the AC3 bounded-fallback cap described above.
 
-**Daemon backstop (#4367)**: this check is the fast path — it only fires when
-another Judge happens to revisit the same PR. `loom-daemon`'s
-`claim_reconciliation` pass now also reconciles `loom:reviewing` (and
-`loom:treating`, Doctor's equivalent) as an always-on backstop at startup and
-on its periodic tick, sharing this exact env var and default. See
-[`daemon-reference.md`'s "Stale-claim reconciliation" section](../../../docs/daemon-reference.md#pr-side-claim-labels-loomreviewing--loomtreating-4367).
+**Daemon backstop (#4367, freshness signal fixed by #4618)**: this check is
+the fast path — it only fires when another Judge happens to revisit the same
+PR. `loom-daemon`'s `claim_reconciliation` pass now also reconciles
+`loom:reviewing` (and `loom:treating`, Doctor's equivalent) as an always-on
+backstop at startup and on its periodic tick, sharing this exact
+`LOOM_STALE_REVIEWING_MINUTES`/`LOOM_STALE_TREATING_MINUTES` env vars and
+defaults — and, since #4618, deriving its own age gate from the claim
+label's own `labeled` timeline-event timestamp rather than the PR's
+aggregate `updatedAt`, for the identical reason the marker convention above
+exists (a stand-down comment self-refreshes `updatedAt` but not the label
+event). See [`daemon-reference.md`'s "Stale-claim reconciliation"
+section](../../../docs/daemon-reference.md#pr-side-claim-labels-loomreviewing--loomtreating-4367).
 
 **Applies everywhere a Judge claims a PR from a multi-PR pass** — not just
 this single-PR narrative. This same check-then-claim rule governs the batch

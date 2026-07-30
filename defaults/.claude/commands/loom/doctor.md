@@ -403,25 +403,67 @@ same fix (the failure this section exists to prevent).
 behavior change: `gh pr edit <number> --add-label "loom:treating"`.
 
 **If the PR DOES carry `loom:treating`:** determine the claim's age and
-whether anyone has commented since the claim was made:
+whether anyone has *genuinely* commented since the claim was made — see
+"Stand-down marker convention" below for why the comment count excludes
+stand-down comments:
 
 ```bash
 N=<pr-number>
 CLAIMED_AT=$(gh api "repos/{owner}/{repo}/issues/$N/timeline" --paginate \
   --jq '[.[] | select(.event=="labeled" and .label.name=="loom:treating")] | last | .created_at')
-COMMENTS_AFTER=$(gh api "repos/{owner}/{repo}/issues/$N/comments" \
-  | jq --arg t "$CLAIMED_AT" '[.[] | select(.created_at > $t)] | length')
+MARKER="<!-- loom:standdown claim=$CLAIMED_AT -->"
+COMMENTS_JSON=$(gh api "repos/{owner}/{repo}/issues/$N/comments" \
+  | jq --arg t "$CLAIMED_AT" '[.[] | select(.created_at > $t)]')
+COMMENTS_AFTER=$(echo "$COMMENTS_JSON" | jq --arg m "$MARKER" '[.[] | select(.body | contains($m) | not)] | length')
+STANDDOWN_COUNT=$(echo "$COMMENTS_JSON" | jq --arg m "$MARKER" '[.[] | select(.body | contains($m))] | length')
 ```
 
 Then decide:
 
 | Condition | Verdict | Action |
 |-----------|---------|--------|
-| Claim age < `LOOM_STALE_TREATING_MINUTES` (default **60**), OR `COMMENTS_AFTER > 0` | **Fresh** — a Doctor is actively fixing this PR | **Do not stomp the claim.** Skip this PR and move to the next candidate in the queue. |
+| `STANDDOWN_COUNT >= LOOM_MAX_STANDDOWN_STREAK` (default **3**) | **Stale — bounded fallback** (see below) | Force-reclaim regardless of claim age or `COMMENTS_AFTER`. Breaks the livelock even if the marker/exclusion logic above is somehow bypassed. |
+| Claim age < `LOOM_STALE_TREATING_MINUTES` (default **60**), OR `COMMENTS_AFTER > 0` | **Fresh** — a Doctor is actively fixing this PR | **Do not stomp the claim.** Post a marked stand-down comment (see below), then skip this PR and move to the next candidate in the queue. |
 | Claim age ≥ `LOOM_STALE_TREATING_MINUTES` AND `COMMENTS_AFTER == 0` | **Stale** — the claiming Doctor's process almost certainly died mid-fix | Reclaim (see below), then proceed with the normal fix from step 3. |
 | Timeline API call fails or returns empty (`CLAIMED_AT` unset) | **Unknown — fail safe** | Treat as **fresh**. Never stomp a claim on API failure or missing data. |
 
-**Reclaiming a stale claim:**
+**Stand-down marker convention (#4618 — breaks the livelock)**: a "standing
+down, not stomping" comment is evidence of **no activity**, not activity — it
+means a *later* Doctor pass declined to touch the claim, not that the
+*original* claimant is still working. Before #4618, `COMMENTS_AFTER` counted
+every comment after the claim indiscriminately, so each stand-down comment
+satisfied the very freshness test the next pass ran, making the claim look
+eternally fresh even though nothing was actually happening (the `loom:reviewing`
+analog of this played out on PR #4614: 3 consecutive stand-down comments over
+30+ minutes, never reclaimed — the same defect shape applies here to
+`loom:treating`). Every stand-down comment you post in the "Fresh" row above
+MUST end with the `<!-- loom:standdown claim=$CLAIMED_AT -->` marker so it is
+excluded from `COMMENTS_AFTER` on every subsequent pass, and counted in
+`STANDDOWN_COUNT` instead:
+
+```bash
+gh pr comment $N --body "Doctor pass: PR still carries a fresh \`loom:treating\` claim (claimed $CLAIMED_AT) — standing down without reclaiming. Not stomping.
+<!-- loom:standdown claim=$CLAIMED_AT -->"
+```
+
+**Bounded fallback (AC3, #4618)**: `STANDDOWN_COUNT` is a hard cap
+independent of the marker-exclusion logic working correctly — it counts how
+many stand-down comments have accumulated against *this exact*
+`$CLAIMED_AT` (the marker embeds it, so a genuine reclaim — which changes
+`CLAIMED_AT` — resets the count to zero automatically). Once
+`LOOM_MAX_STANDDOWN_STREAK` marked comments have piled up against the same
+claim with no reclaim, force-reclaim regardless of age or `COMMENTS_AFTER`,
+using this reclaim comment:
+
+```bash
+gh pr edit $N --remove-label "loom:treating"
+gh pr comment $N --body "Reclaiming loom:treating claim: $STANDDOWN_COUNT consecutive stand-down comments have accumulated against claim $CLAIMED_AT with no actual fix progress (bounded fallback, LOOM_MAX_STANDDOWN_STREAK=${LOOM_MAX_STANDDOWN_STREAK:-3}) — breaking the livelock."
+gh pr edit $N --add-label "loom:treating"
+CLAIM_HEAD_SHA=$(gh pr view $N --json headRefOid --jq '.headRefOid')
+# Continue to step 3 (Check PR details) and fix normally
+```
+
+**Reclaiming a stale claim** (the ordinary claim-age path):
 
 ```bash
 gh pr edit $N --remove-label "loom:treating"
@@ -431,20 +473,27 @@ CLAIM_HEAD_SHA=$(gh pr view $N --json headRefOid --jq '.headRefOid')
 # Continue to step 3 (Check PR details) and fix normally
 ```
 
-**Env var**: `LOOM_STALE_TREATING_MINUTES` (default **60**) — deliberately
+**Env vars**: `LOOM_STALE_TREATING_MINUTES` (default **60**) — deliberately
 longer than the Judge's `LOOM_STALE_REVIEWING_MINUTES` (30): a Doctor's fix
 cycle (assess all CI failures → fix → verify locally → push → re-verify
 remotely) legitimately runs longer than a single review pass. Use the
 **treating** var here; do not borrow the Judge's 30-minute threshold.
+`LOOM_MAX_STANDDOWN_STREAK` (default **3**) — the AC3 bounded-fallback cap
+described above, shared with `judge.md`'s identical check.
 
-**Daemon backstop (#4367)**: this check is the fast path — it only fires when
-another Doctor happens to revisit the same PR. `loom-daemon`'s
-`claim_reconciliation` pass (`reconcile_pr_claims`) reconciles stale
-`loom:treating` (and `loom:reviewing`) as an always-on backstop at startup and
-on its periodic tick, sharing this exact env var and default. That pass runs on
-an interval (up to ~10 minutes of lag) and cannot see an *in-flight* Doctor, so
-it never substitutes for this check or the pre-push recheck below. See
-[`daemon-reference.md`'s "Stale-claim reconciliation" section](../../../docs/daemon-reference.md#pr-side-claim-labels-loomreviewing--loomtreating-4367).
+**Daemon backstop (#4367, freshness signal fixed by #4618)**: this check is
+the fast path — it only fires when another Doctor happens to revisit the same
+PR. `loom-daemon`'s `claim_reconciliation` pass (`reconcile_pr_claims`)
+reconciles stale `loom:treating` (and `loom:reviewing`) as an always-on
+backstop at startup and on its periodic tick, sharing this exact env var and
+default — and, since #4618, deriving its own age gate from the claim label's
+own `labeled` timeline-event timestamp rather than the PR's aggregate
+`updatedAt`, for the identical reason the marker convention above exists (a
+stand-down comment self-refreshes `updatedAt` but not the label event). That
+pass runs on an interval (up to ~10 minutes of lag) and cannot see an
+*in-flight* Doctor, so it never substitutes for this check or the pre-push
+recheck below. See [`daemon-reference.md`'s "Stale-claim reconciliation"
+section](../../../docs/daemon-reference.md#pr-side-claim-labels-loomreviewing--loomtreating-4367).
 
 ### Pre-Push Head-SHA Recheck (Step 9)
 
