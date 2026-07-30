@@ -898,16 +898,22 @@ The resolved `WAVE_SIZE` replaces `--builders-per-wave` everywhere the wave-part
 
 When `DECIDE` lands on `use_daemon`, the skill **dispatches each candidate issue** to the daemon and **exits sub-2-second**. There is no in-session orchestration after dispatch — operators monitor with `mcp__loom__list_sweeps` (Phase A) or the richer Phase C tools once they land.
 
+**Derive `WORKSPACE_ROOT` once, before dispatching, and pass it explicitly on every `dispatch_sweep` call below.** Omitting `workspace_root` routes through the daemon's workspace-registry resolution (#4299/PR #4322): on a host with multiple managed workspaces registered, it either returns a structured ambiguity error, or — the dangerous case — silently resolves to the daemon's seeded default workspace when that default happens to be registered, targeting the wrong repo with no warning. Always pin the target explicitly:
+
+```bash
+WORKSPACE_ROOT=$(git rev-parse --show-toplevel)
+```
+
 For each candidate issue `N` in the candidate set:
 
 ```text
-mcp__loom__dispatch_sweep(kind={"Issue": N})
+mcp__loom__dispatch_sweep(kind={"Issue": N}, workspace_root=$WORKSPACE_ROOT)
 ```
 
 **When `AUTO_STACK=true` and edge detection populated `DEPENDS_ON[N]` for candidate `N`** (see "Auto-stack detection and wave ordering"), forward the detected parent on the dispatch:
 
 ```text
-mcp__loom__dispatch_sweep(kind={"Issue": N}, depends_on=<parent>)
+mcp__loom__dispatch_sweep(kind={"Issue": N}, depends_on=<parent>, workspace_root=$WORKSPACE_ROOT)
 ```
 
 This is purely "start populating a parameter that already exists" — the daemon and the `mcp__loom__dispatch_sweep` schema already accept `depends_on` (#3729/#3742), forwarding it to the child as `--depends-on <parent>`, so there is **no daemon-side code change**. Candidates with no detected edge dispatch exactly as today (no `depends_on` argument). To respect the parent-before-child topological ordering on the daemon path, dispatch the reordered candidate list in order (a parent stacked-before its child is dispatched first so its `feature/issue-<parent>` branch exists when the child's Builder resolves the base).
@@ -1627,11 +1633,11 @@ Stacked-PR mode pipelines a genuine dependency: when issue B consumes issue A's 
 
 ```text
 # Parent A (independent):
-mcp__loom__dispatch_sweep  kind={"Issue": A}
+mcp__loom__dispatch_sweep  kind={"Issue": A}  workspace_root=$WORKSPACE_ROOT
 # Child B stacked on A:
-mcp__loom__dispatch_sweep  kind={"Issue": B}  depends_on=A
+mcp__loom__dispatch_sweep  kind={"Issue": B}  depends_on=A  workspace_root=$WORKSPACE_ROOT
 # Grandchild C stacked on B (A→B→C works because each hop names only its parent):
-mcp__loom__dispatch_sweep  kind={"Issue": C}  depends_on=B
+mcp__loom__dispatch_sweep  kind={"Issue": C}  depends_on=B  workspace_root=$WORKSPACE_ROOT
 ```
 
 The daemon forwards `depends_on` to the child as `--depends-on <parent>`; the child's Builder branches off `feature/issue-<parent>` and opens its PR with `--base feature/issue-<parent>` (see the gated path in the Builder phase above). A single optional parent makes diamonds / multi-parent stacks **unrepresentable** — there is no rejection logic because the type itself forbids them.
