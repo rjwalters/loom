@@ -92,7 +92,7 @@ personas (`loom_builder_42`) are blocked upstream until safehoused grows prefix
 support and are tracked in #3999 — do not attempt to register personas at
 dispatch time; there is no such path.
 
-## Connection status: not configured / unreachable / connected (#4345)
+## Connection status: not configured / unreachable / connected / send-rejected (#4345, #4464)
 
 Before #4345, `safehouse.enabled` false/absent, enabled-but-unreachable, and
 enabled-and-connected all looked identical to an operator — silence. Two
@@ -114,6 +114,16 @@ surfaces now report the live state:
     (`safehouse.room` unset is valid only when safehoused joined exactly one
     room, resolved server-side — the daemon is never told that resolved name,
     so the line omits it rather than guessing).
+  - `connected, sends rejected: <reason>` (#4464) — the `hello` handshake
+    succeeds (the socket is reachable) but every `send` is rejected at the
+    protocol layer, so nothing reaches the room. The canonical cause is a
+    **multi-room safehoused with `safehouse.room` unset**: safehoused replies
+    `'room' required: N rooms joined` and the fix is to set `safehouse.room`
+    (see the troubleshooting entry below). This state is **sticky** — a
+    reconnect whose `hello` succeeds does not clear it; only a `send` that is
+    actually accepted returns the line to `connected`. Distinct from
+    `unreachable` on purpose: "unreachable" would send an operator chasing the
+    socket/persona instead of the config.
 - **`loom-daemon-start.sh`** prints a cheaper, **static**, pre-connect check at
   start time (`ok`/`warn` colored, one line): it runs *before* the daemon
   connects, so it can only distinguish "not configured" from "configured" —
@@ -135,6 +145,26 @@ daemon's wire payload — missing the field entirely — still parses).
 `loom-daemon-start.sh`'s static check reuses the same env>config>default
 resolvers `lib/mcp-config.sh` already defines for the safehouse-mcp worker
 injection (phase 2, below) rather than re-deriving them.
+
+### Troubleshooting: `'room' required` rejection (multi-room host) (#4464)
+
+**Symptom.** `loom-daemon status` shows `Safehouse: connected, sends rejected:
+'room' required: N rooms joined`, and the daemon log carries
+`[WARN] safehouse: narration rejected — set safehouse.room — safehoused
+rejected send: 'room' required: …`. Sweeps proceed normally (the degradation
+contract holds), but the room shows nothing from this host and peer-claim dedup
+(#4028/#4431) is silently disabled here.
+
+**Cause.** Omitting `safehouse.room` is valid **only when safehoused joined
+exactly one room** — safehoused then resolves the sole room server-side. Once
+safehoused joins two or more rooms it can no longer guess, so it rejects every
+`send` that does not name a `room`.
+
+**Fix.** Set `safehouse.room` in `.loom/config.json` (or `LOOM_SAFEHOUSE_ROOM`)
+to the room this host should narrate into, then restart the daemon
+(`loom-daemon restart`). The status line returns to `connected` on the first
+accepted send. `loom-daemon-start.sh` also prints a static caveat at start time
+whenever a socket is configured but `safehouse.room` is unset.
 
 ## New-host onboarding (#4345, #4346)
 

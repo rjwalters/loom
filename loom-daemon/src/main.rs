@@ -4328,11 +4328,13 @@ fn build_status_json_value(
         })),
         // Live safehouse fleet-comms connection state (#4345) — `null` only
         // from a pre-#4345 daemon binary that never computed one. `state` is
-        // one of "not_configured" / "unreachable" / "connected".
+        // one of "not_configured" / "unreachable" / "connected" /
+        // "send_rejected" (#4464, carries `reason`).
         "safehouse": report.safehouse.as_ref().map(|s| serde_json::json!({
             "state": s.state,
             "socket": s.socket,
             "room": s.room,
+            "reason": s.reason,
         })),
     })
 }
@@ -4872,7 +4874,28 @@ fn print_status_human(
                     .map_or_else(|| "unresolved".to_string(), |p| p.display().to_string())
             );
         }
-        Some(_) => println!("Safehouse:     not configured"),
+        // #4464: handshake succeeds but every send is rejected — the socket is
+        // reachable, so "unreachable" would point the operator at the wrong
+        // fix. Surface the rejection reason directly (canonically a missing
+        // `safehouse.room` on a multi-room host).
+        Some(s) if s.state == "send_rejected" => {
+            println!(
+                "Safehouse:     connected, sends rejected: {} (socket: {})",
+                s.reason.as_deref().unwrap_or("unknown reason"),
+                s.socket
+                    .as_ref()
+                    .map_or_else(|| "?".to_string(), |p| p.display().to_string())
+            );
+        }
+        Some(s) if s.state == "not_configured" => println!("Safehouse:     not configured"),
+        // #4464: an unknown state string (version skew with a newer daemon)
+        // degrades legibly — print the raw state rather than mislabeling it
+        // "not configured" (the old fallthrough, which hid real states).
+        Some(s) => println!("Safehouse:     {} (socket: {})", s.state, {
+            s.socket
+                .as_ref()
+                .map_or_else(|| "?".to_string(), |p| p.display().to_string())
+        }),
         None => {
             println!("Safehouse:     unknown (older daemon binary — restart to pick up #4345)")
         }

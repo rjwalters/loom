@@ -4663,6 +4663,7 @@ exit 0
                 state: "connected".to_string(),
                 socket: Some(std::path::PathBuf::from("/tmp/safehoused.sock")),
                 room: Some("fleet".to_string()),
+                reason: None,
             }),
         };
         let resp = Response::DaemonStatus(Box::new(report));
