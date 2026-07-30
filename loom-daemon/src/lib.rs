@@ -48,6 +48,7 @@ pub mod quarantine_reconciliation;
 pub mod rate_limit_breaker;
 pub mod role_runner;
 pub mod role_validation;
+pub mod runtime_admission;
 pub mod safehouse;
 pub mod self_update;
 pub mod serve;

@@ -2494,6 +2494,23 @@ impl SweepRegistry {
         depends_on: Option<u32>,
         resume_bypass_pr: Option<u32>,
     ) -> Result<DispatchOutcome> {
+        // Runtime admission is deliberately the first dispatch decision:
+        // before idempotency/account selection, claim lock, forge mutation,
+        // log header, or child spawn. A full sweep remains one runtime and is
+        // checked against Builder's (strongest lifecycle) requirements.
+        let runtime_admission = if self.config.skip_label_flip {
+            None // hermetic unit fixtures do not install runtime manifests
+        } else {
+            Some(
+                crate::runtime_admission::resolve_and_admit(
+                    &self.config.workspace_root,
+                    "sweep-lifecycle",
+                    None,
+                )
+                .map_err(anyhow::Error::new)?,
+            )
+        };
+
         // 1. Idempotency dedup against Running entries.
         if let Some(ref key) = idempotency_key {
             if let Some(existing) = self.find_running_by_key(key) {
@@ -2703,7 +2720,15 @@ impl SweepRegistry {
         self.apply_dispatch_stagger();
         let log_path = self.compute_log_path(issue_number);
         let (child, token_name, runtime) = self
-            .spawn_child(issue_number, &log_path, &sweep_id, model, effort, depends_on)
+            .spawn_child(
+                issue_number,
+                &log_path,
+                &sweep_id,
+                model,
+                effort,
+                depends_on,
+                runtime_admission.as_ref(),
+            )
             .context("failed to spawn sweep child")?;
         let pid = child.id();
         // Retain the handle so the reaper can `try_wait()` it (Issue #3801).
@@ -4096,6 +4121,7 @@ impl SweepRegistry {
         self.last_spawn_at = Some(Instant::now());
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn spawn_child(
         &self,
         issue: u32,
@@ -4104,6 +4130,7 @@ impl SweepRegistry {
         model: Option<&str>,
         effort: Option<&str>,
         depends_on: Option<u32>,
+        runtime_admission: Option<&crate::runtime_admission::ResolvedRuntime>,
     ) -> Result<(Child, String, String)> {
         let spawn_bin = self.config.resolve_spawn_bin()?;
 
@@ -4267,6 +4294,15 @@ impl SweepRegistry {
             .stdin(Stdio::null())
             .stdout(Stdio::from(log_file))
             .stderr(Stdio::from(log_clone));
+        if let Some(admission) = runtime_admission {
+            cmd.env("LOOM_RUNTIME", &admission.runtime);
+            log::info!(
+                "sweep_registry: admitted role={} runtime={} source={}",
+                admission.role,
+                admission.runtime,
+                admission.source
+            );
+        }
 
         // Issue #3800: put the sweep child in its OWN process group
         // (`setpgid(0, 0)` runs post-fork/pre-exec via `process_group(0)`,

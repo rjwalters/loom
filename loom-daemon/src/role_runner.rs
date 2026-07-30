@@ -291,6 +291,14 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
             Ok(p) => p,
             Err(e) => return RoleTickOutcome::Failure(e),
         };
+        let admission = if self.spawn_bin.is_none() {
+            match crate::runtime_admission::resolve_and_admit(&self.workspace_root, role, None) {
+                Ok(value) => Some(value),
+                Err(e) => return RoleTickOutcome::Failure(e.to_string()),
+            }
+        } else {
+            None
+        };
         run_role_with_timeout(
             &script,
             &self.workspace_root,
@@ -298,6 +306,7 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
             prompt,
             self.logs_dir(),
             self.timeout,
+            admission.as_ref(),
         )
     }
 }
@@ -315,6 +324,7 @@ fn run_role_with_timeout(
     prompt: &str,
     logs_dir: PathBuf,
     timeout: Duration,
+    admission: Option<&crate::runtime_admission::ResolvedRuntime>,
 ) -> RoleTickOutcome {
     if let Err(e) = std::fs::create_dir_all(&logs_dir) {
         return RoleTickOutcome::Failure(format!(
@@ -376,6 +386,17 @@ fn run_role_with_timeout(
         .stdin(Stdio::null())
         .stdout(Stdio::from(out_file))
         .stderr(Stdio::from(stderr_file));
+    if let Some(admission) = admission {
+        // Pin the already-admitted choice so spawn-worker cannot re-resolve a
+        // different runtime after the pre-spawn decision.
+        cmd.env("LOOM_RUNTIME", &admission.runtime);
+        log::info!(
+            "role_runner: admitted role={} runtime={} source={}",
+            admission.role,
+            admission.runtime,
+            admission.source
+        );
+    }
 
     // Run the child as its own process-group leader so a timeout can tear
     // down the whole subtree (the `claude` session's tool-call

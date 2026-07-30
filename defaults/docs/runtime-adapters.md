@@ -343,8 +343,9 @@ compatibility and refuses to dispatch a role onto a runtime that cannot meet its
 requirements, rather than letting the session fail partway. The declaration is
 per-runtime; the requirements are per-role; the match happens at dispatch time.
 
-**Landed today (#4170):** the declaration and requirement sides of this contract
-exist as data + a standalone checker, ahead of dispatch wiring:
+**Capability contract (#4170, enforced for daemon scheduling by #4494):** the
+declaration and requirement sides exist as data and are interpreted identically
+by the standalone checker and daemon admission:
 
 - **Declaration** — `defaults/runtimes/<name>.json` (e.g.
   `defaults/runtimes/claude.json`), matching the sketch above exactly (tri-state
@@ -361,9 +362,7 @@ exist as data + a standalone checker, ahead of dispatch wiring:
   where a requirement is satisfied only by a declared `"yes"` (`"partial"` fails
   closed). Exit 0 on match or no-requirements, exit 78 (`EX_CONFIG`) on mismatch
   naming each unmet capability, non-zero with a distinct message on an
-  unknown/missing role or runtime file. It is intentionally **standalone** —
-  not yet wired into `spawn-worker.sh` or any dispatch path; that wiring is a
-  follow-up decision.
+  unknown/missing role or runtime file.
 
 **Second manifest (#4468):** `defaults/runtimes/codex.json` declares
 `mcp: "yes"`, `subagents: "no"` (the fork PR #59 prohibition), `hooks: "partial"`
@@ -376,6 +375,41 @@ workspace root, not to one `issue-N` worktree). Because `"partial"` fails closed
 parity doc's residual gap 2, and the CI leg asserts both outcomes. That is the
 intended relationship between points 6 and 7: the parity doc states the gap in
 prose, the manifest makes it enforceable.
+
+### Daemon runtime binding and admission
+
+Standalone periodic roles support per-role bindings:
+
+```json
+{
+  "runtimes": {
+    "default": "claude",
+    "roles": {
+      "curator": "codex",
+      "judge": "codex"
+    }
+  }
+}
+```
+
+The daemon resolves an explicit dispatch value (where the API offers one), then
+`LOOM_RUNTIME_<ROLE>`, `LOOM_RUNTIME`, `runtimes.roles.<role>`,
+`runtimes.default`, and finally `claude`. Empty strings are unset. It
+canonicalizes the role first and validates the selected adapter, role sidecar,
+runtime manifest, and every required capability before starting a child.
+`partial`, `no`, missing, malformed, and unknown values fail closed. The
+admitted runtime is pinned into the child environment so `spawn-worker.sh`
+cannot make a second, divergent choice.
+
+A `/loom:sweep` is different from a standalone role tick: it is one coordinator
+process for the entire Curator → Builder → Judge → Doctor → Merge lifecycle.
+Loom does not switch its CLI runtime between those nested phases. Consequently
+the daemon resolves the sweep runtime once from the global/default tiers and
+admits it against Builder's strongest lifecycle requirements. A per-role
+`curator: codex` binding can route a standalone Curator tick to Codex, but it
+does not make a full sweep partly Codex. With the shipped manifests, standalone
+Curator and Judge can use Codex; Builder and a full sweep cannot, because Codex
+declares `worktreeIsolation: partial`.
 
 ## Phase 1: the `spawn-worker.sh` runtime-dispatch seam
 
