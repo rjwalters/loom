@@ -290,6 +290,92 @@ else
     fail "\`get-token\` CLI should report not_configured when unconfigured" "$get_token_output"
 fi
 
+# ============================================================================
+# Installation-id validation (#4456): a 2xx response missing/`null` `.id` must
+# not be echoed (and thus never cached), and a pre-poisoned cache holding a
+# non-numeric value must be treated as a miss (self-healing).
+# ============================================================================
+echo "Testing installation-id validation (#4456)..."
+
+# Stub the network + JWT so these run without a live GitHub App. `curl` is
+# dispatched on the request URL (its last argument); `github_app_jwt` is a
+# constant so no signing is required.
+STUB_INSTALL_BODY='{"id": 55}'
+STUB_INSTALL_CODE='200'
+curl() {
+    local url=""
+    for _a in "$@"; do url="$_a"; done
+    case "$url" in
+        */installation) printf '%s\n%s' "$STUB_INSTALL_BODY" "$STUB_INSTALL_CODE" ;;
+        */access_tokens) printf '%s\n%s' '{"token":"ghs_mintedvalue","expires_at":"2099-01-01T00:00:00Z"}' '200' ;;
+        *) printf '%s\n%s' '{}' '404' ;;
+    esac
+}
+github_app_jwt() { echo "fake.jwt.signature"; }
+
+export LOOM_GITHUB_APP_ID="424242"
+export LOOM_GITHUB_APP_KEY_PATH="$KEY_PATH"
+
+# Valid numeric id -> echoed, success.
+STUB_INSTALL_BODY='{"id": 55}'
+if resolved_id=$(_github_app_api_get_installation "acme/widgets") && [[ "$resolved_id" == "55" ]]; then
+    pass "installation resolve echoes a numeric id on a well-formed 2xx response"
+else
+    fail "well-formed 2xx installation response should echo the numeric id" "got: ${resolved_id:-<none>}"
+fi
+
+# 2xx body with `"id": null` -> must NOT echo, must return 1 with an error set.
+# Run in the current shell (stdout redirected to a file, not command
+# substitution) so the `_GH_APP_LAST_ERROR` the function sets is observable.
+inst_out="$WORK_DIR/get-installation.out"
+STUB_INSTALL_BODY='{"id": null}'
+_GH_APP_LAST_ERROR=""
+if _github_app_api_get_installation "acme/widgets" > "$inst_out" 2>/dev/null; then
+    fail "2xx response with null id should fail, not succeed" "echoed: $(cat "$inst_out")"
+else
+    echoed=$(cat "$inst_out")
+    if [[ "$echoed" != *"null"* && -n "$_GH_APP_LAST_ERROR" ]]; then
+        pass "2xx response with null id -> returns 1, no 'null' echoed, error set"
+    else
+        fail "null id should not be echoed and must set _GH_APP_LAST_ERROR" "echoed='${echoed}' err='${_GH_APP_LAST_ERROR}'"
+    fi
+fi
+
+# 2xx body with no `.id` field at all -> same rejection.
+STUB_INSTALL_BODY='{"message":"Not Found"}'
+_GH_APP_LAST_ERROR=""
+if _github_app_api_get_installation "acme/widgets" > "$inst_out" 2>/dev/null; then
+    fail "2xx response missing .id should fail" "echoed: $(cat "$inst_out")"
+else
+    if [[ -n "$_GH_APP_LAST_ERROR" ]]; then
+        pass "2xx response missing .id -> returns 1 with error set"
+    else
+        fail "missing .id must set _GH_APP_LAST_ERROR"
+    fi
+fi
+
+# Pre-poisoned cache holding the literal "null" -> treated as a miss and
+# re-resolved (self-healing), so github_app_get_token still succeeds and the
+# cache file is rewritten with the numeric id.
+STUB_INSTALL_BODY='{"id": 55}'
+poison_owner="poisoned"
+poison_cache="$(_github_app_installation_cache_path "$poison_owner")"
+mkdir -p "$(dirname "$poison_cache")"
+printf '%s' "null" > "$poison_cache"
+if heal_token=$(github_app_get_token "${poison_owner}/repo") && [[ "$heal_token" == "ghs_mintedvalue" ]]; then
+    cache_after=$(cat "$poison_cache")
+    if [[ "$cache_after" == "55" ]]; then
+        pass "pre-poisoned 'null' installation cache is treated as a miss and self-heals to the numeric id"
+    else
+        fail "poisoned cache should be rewritten with the numeric id" "cache now: '${cache_after}'"
+    fi
+else
+    fail "github_app_get_token should self-heal past a poisoned 'null' cache" "got: ${heal_token:-<none>}"
+fi
+
+unset -f curl github_app_jwt
+unset LOOM_GITHUB_APP_ID LOOM_GITHUB_APP_KEY_PATH
+
 # --- Summary ---
 echo ""
 echo "────────────────────────────────"

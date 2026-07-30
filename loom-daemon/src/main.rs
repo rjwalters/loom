@@ -1304,6 +1304,63 @@ enum CleanupAction {
     },
 }
 
+/// Decide whether a freshly minted/cached `GH_TOKEN` value warrants a
+/// `std::env::set_var` write, given the value currently exported in the process
+/// environment (#4456).
+///
+/// The `github-app` refresh tick fires every `GITHUB_APP_REFRESH_INTERVAL`
+/// (~5min), but the shell helper only re-mints when the cached token is close
+/// to expiry (~hourly). A cache hit still reports [`GithubAppOutcome::Minted`]
+/// with the *unchanged* token, so writing unconditionally rewrites `GH_TOKEN`
+/// ~10 of every ~11 ticks with an identical value. Each redundant `set_var`
+/// under the multithreaded tokio runtime opens a (tiny) `environ`
+/// use-after-free window against the `gh`/`git` children the daemon constantly
+/// spawns, for no benefit.
+///
+/// Returns `true` only when the minted value actually differs from `current`
+/// (including the case where nothing is exported yet, `current == None`). This
+/// is a pure seam so the guard can be unit-tested without mutating the
+/// process-global environment (which would add to the test-race hazard tracked
+/// by #4385).
+fn gh_token_needs_update(current: Option<&str>, minted: &str) -> bool {
+    current != Some(minted)
+}
+
+#[cfg(test)]
+mod gh_token_guard_tests {
+    //! Tests for the #4456 value-changed guard on the `github-app` refresh
+    //! tick. Deliberately a *pure* function test — it does not touch the
+    //! process-global `GH_TOKEN`, so it neither races nor adds to the
+    //! test-env-mutation hazard tracked by #4385.
+    use super::gh_token_needs_update;
+
+    #[test]
+    fn cache_hit_same_value_skips_write() {
+        // The ~10-of-11 common case: the shell helper returned the unchanged
+        // cached token, so no `set_var` is warranted.
+        assert!(!gh_token_needs_update(Some("ghs_abc"), "ghs_abc"));
+    }
+
+    #[test]
+    fn genuine_rotation_writes() {
+        // A real ~hourly rotation: the minted value differs -> write.
+        assert!(gh_token_needs_update(Some("ghs_old"), "ghs_new"));
+    }
+
+    #[test]
+    fn unset_env_writes() {
+        // Nothing exported yet (Err(VarError) -> None): treat as different so
+        // the first post-boot tick still exports the token.
+        assert!(gh_token_needs_update(None, "ghs_first"));
+    }
+
+    #[test]
+    fn empty_current_differs_from_nonempty() {
+        // An empty exported value is not equal to a real minted token.
+        assert!(gh_token_needs_update(Some(""), "ghs_real"));
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -1550,9 +1607,12 @@ async fn main() -> Result<()> {
     let credential_preflight = github_app_preflight.report;
 
     // #4430: keep the minted installation token fresh across its ~1h
-    // lifetime for a long-running daemon. A no-op tick (unconfigured, or the
-    // shell helper's own cache still has >10min left) costs a handful of
-    // cheap subprocess execs and never touches `GH_TOKEN`; a genuine mint
+    // lifetime for a long-running daemon. Ticks that don't rotate the token
+    // never *write* `GH_TOKEN`: the `NotConfigured` arm is a true no-op, and a
+    // cache-hit tick (the shell helper's own cache still has plenty of life —
+    // ~10 of every ~11 ticks) *reads* the current value but skips the
+    // `set_var` because the minted value is unchanged (#4456 value-changed
+    // guard). Only a genuine rotation (value differs) rewrites the env; a mint
     // failure is logged and the loop keeps whatever `GH_TOKEN` the process
     // already has (fail-open, matching the startup preflight's posture).
     if let (Some(script_path), Some(owner_repo)) = (&github_app_script, &github_app_owner_repo) {
@@ -1577,11 +1637,25 @@ async fn main() -> Result<()> {
                         app_id,
                         ..
                     }) => {
-                        std::env::set_var("GH_TOKEN", token);
-                        log::debug!(
-                            "credential_preflight: github-app refresh tick minted a token \
-                             (app {app_id} installation {installation_id}) — #4430"
-                        );
+                        // #4456: only write when the value actually rotated. A
+                        // cache-hit tick returns the unchanged token, and a
+                        // redundant `set_var` under the multithreaded runtime
+                        // needlessly races the `environ` reads of spawned
+                        // `gh`/`git` children.
+                        if gh_token_needs_update(std::env::var("GH_TOKEN").ok().as_deref(), &token)
+                        {
+                            std::env::set_var("GH_TOKEN", token);
+                            log::debug!(
+                                "credential_preflight: github-app refresh tick rotated GH_TOKEN \
+                                 (app {app_id} installation {installation_id}) — #4430"
+                            );
+                        } else {
+                            log::debug!(
+                                "credential_preflight: github-app refresh tick cache hit, \
+                                 GH_TOKEN unchanged (app {app_id} installation {installation_id}) \
+                                 — #4456"
+                            );
+                        }
                     }
                     Ok(credential_preflight::GithubAppOutcome::NotConfigured) => {
                         // Cheap no-op tick -- nothing to refresh.
