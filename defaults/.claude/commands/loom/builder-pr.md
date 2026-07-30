@@ -641,10 +641,23 @@ the cause — Loom's `feature/issue-N` convention does not create a Development-
   grep -inE '\b(close[sd]?|fix(e[sd])?|resolve[sd]?)[[:space:]]+#N\b' <<<"$PR_BODY"
   ```
 
+- **The same rule applies to every commit message on the branch** (#4595). The squash message
+  GitHub composes from your commits is parsed for closing keywords too, so a stray
+  `close #N` in a commit body closes the issue even when the PR body is spotless. Scan them
+  before pushing — and amend/reword (`git commit --amend`, `git rebase -i`) if one is there:
+
+  ```bash
+  # Must print nothing for the tracked issue N:
+  git log --format=%B origin/main..HEAD \
+    | grep -inE '\b(close[sd]?|fix(e[sd])?|resolve[sd]?)[[:space:]]+#N\b'
+  ```
+
 **Backstop (not a substitute for the above)**: `merge-pr.sh` detects this contradiction
-before merging and warns, then reopens the issue immediately after the merge if GitHub closed
-it anyway. That leaves a close/reopen flicker plus notification churn on the issue — fix the
-body instead of relying on it.
+before merging — in the PR body, in any commit message of the PR, and in GitHub's
+`closingIssuesReferences` — and warns naming which source is at fault, then reopens the issue
+immediately after the merge if GitHub closed it anyway. That leaves a close/reopen flicker
+plus notification churn on the issue — fix the body or the commit message instead of relying
+on it.
 
 ### PR Creation Checklist
 
