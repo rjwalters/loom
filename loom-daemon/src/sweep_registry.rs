@@ -159,6 +159,49 @@ impl std::fmt::Display for OpenPrDispatchError {
 
 impl std::error::Error for OpenPrDispatchError {}
 
+/// Typed, matchable error returned by [`SweepRegistry::dispatch`] when the
+/// park-label guard (Issue #4444, step 2.7) refuses a dispatch because the
+/// target issue currently carries a [`PARK_LABELS`] entry (`loom:blocked` /
+/// `loom:operator-only`).
+///
+/// The work-finder's [`SKIP_LABELS`] filter only covers *its own* candidate
+/// query. Every other dispatch route — all three watchdogs (#3887 / #3895 /
+/// #3910), the reaper's checkpoint-resume (#4256), the epic supervisor, and the
+/// IPC/CLI `dispatch_sweep` — funnels through `dispatch_inner` without ever
+/// re-reading the forge labels, so a park applied *after* the original dispatch
+/// was invisible to them and the daemon overrode a deliberate human park
+/// (observed on #4366). This guard closes that hole for every route at once.
+///
+/// Like [`OpenPrDispatchError`] this is a **distinct, downcast-matchable** type
+/// (not a string-matched `anyhow` message) so the work-finder can attribute the
+/// refusal to its labeled-skip counter rather than to a generic dispatch
+/// failure.
+///
+/// [`PARK_LABELS`]: crate::work_finder::PARK_LABELS
+/// [`SKIP_LABELS`]: crate::work_finder::SKIP_LABELS
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParkedIssueDispatchError {
+    /// The issue whose dispatch was refused.
+    pub issue: u32,
+    /// The park label that triggered the refusal (`loom:blocked` or
+    /// `loom:operator-only`).
+    pub label: String,
+}
+
+impl std::fmt::Display for ParkedIssueDispatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "refusing to dispatch issue #{}: it currently carries `{}` (#4444 park-label \
+             guard). A deliberate park must survive every re-dispatch route — watchdog, \
+             checkpoint-resume, epic supervisor, IPC/CLI — until the label is cleared.",
+            self.issue, self.label
+        )
+    }
+}
+
+impl std::error::Error for ParkedIssueDispatchError {}
+
 /// Issue #4256: checkpoint phases at/after Builder completion. A crash whose
 /// checkpoint reads one of these means a PR was opened for the issue, so
 /// [`SweepRegistry::reap_once`]'s reaper-driven resume is eligible to
@@ -2502,6 +2545,56 @@ impl SweepRegistry {
             }
         }
 
+        // 2.7 Park-label guard (Issue #4444). The work-finder's `SKIP_LABELS`
+        //     hard-skip is enforced only in *its own* candidate query, so it
+        //     covers exactly one of the six dispatch routes. Every other route
+        //     — all three watchdogs (#3887 / #3895 / #3910), the reaper's
+        //     checkpoint-resume (#4256), the epic supervisor, the IPC/CLI
+        //     `dispatch_sweep` — funnels through here, and until this guard
+        //     existed none of them ever re-read the forge labels. A
+        //     `loom:blocked` / `loom:operator-only` park applied *after* the
+        //     original dispatch was therefore invisible to every re-dispatch
+        //     path, and the daemon overrode a deliberate human/agent park
+        //     (observed on #4366). Placing the check here — before the
+        //     lock/label flip — covers all routes with one probe.
+        //
+        //     Three properties are load-bearing:
+        //
+        //     - It guards on `PARK_LABELS` only, NOT the full `SKIP_LABELS`
+        //       set. `loom:building` is legitimately present on a watchdog
+        //       re-dispatch or a checkpoint-resume of the daemon's OWN claim,
+        //       so refusing it would break the review-stall watchdog's
+        //       cancel-and-re-dispatch and the reaper's resume.
+        //     - It is NOT exempted by `resume_bypass_pr`. The #4256 bypass
+        //       covers step 2.6 (its own open PR) and nothing else: a park
+        //       applied after the crash must still stop the resume, which is
+        //       the exact defect this guard fixes.
+        //     - It probes over **REST** (`gh api repos/{owner}/{repo}/issues/N`),
+        //       a separate rate-limit bucket from the GraphQL calls 2.5/2.6
+        //       ride, so the park still holds while the GraphQL quota is
+        //       exhausted — the condition under which the #4123 guard failed
+        //       open during the 2026-07-29 incident.
+        //
+        //     Best-effort and fail-open, mirroring 2.5/2.6: any forge
+        //     error/timeout/unresolvable repo returns `None` and dispatch
+        //     proceeds, so a `gh` outage can never wedge the daemon. Skipped
+        //     entirely when label flips are disabled (test fixtures without
+        //     `gh` credentials).
+        if !self.config.skip_label_flip {
+            if let Some(label) = self.first_park_label(issue_number) {
+                log::info!(
+                    "issue #{issue_number}: refusing dispatch — the issue carries `{label}`, a \
+                     deliberate park that every dispatch route must respect (#4444 park-label \
+                     guard); clear the label to re-enable automation"
+                );
+                return Err(ParkedIssueDispatchError {
+                    issue: issue_number,
+                    label,
+                }
+                .into());
+            }
+        }
+
         // 3. Acquire the claim lock atomically.
         let sweep_id = generate_sweep_id(kind);
         self.acquire_lock(issue_number, &sweep_id)?;
@@ -2980,11 +3073,76 @@ impl SweepRegistry {
             .find_map(|l| l.trim().parse::<u32>().ok())
     }
 
+    /// Best-effort probe for the first [`PARK_LABELS`] entry currently on
+    /// `issue`, used by the #4444 park-label dispatch guard (step 2.7). Returns
+    /// `Some(label)` when the issue carries a park label and `None` otherwise —
+    /// where `None` covers BOTH "not parked" and any failure (missing/failed/
+    /// timed-out `gh`, unresolvable repo, unparseable output).
+    ///
+    /// Callers MUST treat `None` as **fail-open**, matching
+    /// [`issue_is_closed`](Self::issue_is_closed) and
+    /// [`first_open_linked_pr`](Self::first_open_linked_pr): a forge outage or a
+    /// wedged `gh` must never wedge dispatch. Bounded by [`reap_gh_timeout`] like
+    /// every other dispatch-path `gh` call (#3973).
+    ///
+    /// Deliberately probes over **REST** (`gh api repos/{owner}/{repo}/issues/N`)
+    /// rather than `gh issue view --json labels` (which rides GraphQL, like
+    /// steps 2.5/2.6): REST is a separate rate-limit bucket, so a deliberate park
+    /// still holds while the GraphQL quota is exhausted — exactly the condition
+    /// under which the #4123 open-PR guard failed open during the 2026-07-29
+    /// incident. The `--jq` emits one label name per line.
+    ///
+    /// The returned label is chosen by [`PARK_LABELS`] order, not forge order, so
+    /// the refusal message is deterministic when an issue carries both.
+    ///
+    /// [`PARK_LABELS`]: crate::work_finder::PARK_LABELS
+    fn first_park_label(&self, issue: u32) -> Option<String> {
+        let labels = self.current_labels_via_rest(issue)?;
+        crate::work_finder::PARK_LABELS
+            .iter()
+            .find(|park| labels.iter().any(|l| l == *park))
+            .map(|park| (*park).to_string())
+    }
+
+    /// Read `issue`'s current label names over the GitHub REST API. `None` on any
+    /// failure (see [`first_park_label`](Self::first_park_label) for the
+    /// fail-open contract); `Some(vec![])` for an issue with no labels, which is
+    /// a *successful* read and must stay distinguishable from a failed one.
+    fn current_labels_via_rest(&self, issue: u32) -> Option<Vec<String>> {
+        let (owner, repo) = self.resolve_owner_repo()?;
+        let gh = self
+            .config
+            .gh_bin
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("gh"));
+        let mut cmd = Command::new(&gh);
+        cmd.arg("api")
+            .arg(format!("repos/{owner}/{repo}/issues/{issue}"))
+            .arg("--jq")
+            .arg(".labels[].name");
+        // Resolve against this registry's own workspace, matching the label-flip
+        // helpers and the other dispatch-path probes (#3937).
+        cmd.current_dir(&self.config.workspace_root);
+        let output = output_with_timeout(cmd, reap_gh_timeout()).ok()??;
+        if !output.status.success() {
+            return None;
+        }
+        Some(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(String::from)
+                .collect(),
+        )
+    }
+
     /// Resolve `(owner, repo)` for the registry's workspace, needed because
-    /// `gh api graphql` (unlike `gh issue view`) cannot infer the repo from the
-    /// working directory. Prefers the process-global `LOOM_REPO` override
-    /// (`owner/repo`) when set, else asks `gh repo view` in the workspace root.
-    /// Returns `None` on any failure so the open-PR guard fails open.
+    /// `gh api` (unlike `gh issue view`) cannot infer the repo from the working
+    /// directory — neither the GraphQL open-PR probe nor the REST park-label
+    /// probe accepts a `--repo` flag. Prefers the process-global `LOOM_REPO`
+    /// override (`owner/repo`) when set, else asks `gh repo view` in the
+    /// workspace root. Returns `None` on any failure so both guards fail open.
     fn resolve_owner_repo(&self) -> Option<(String, String)> {
         if let Ok(repo) = std::env::var("LOOM_REPO") {
             if let Some((o, r)) = repo.split_once('/') {
@@ -4493,16 +4651,25 @@ impl SweepRegistry {
                             // credentials never attempt a real forge probe
                             // here) and only checked for phases at/after
                             // Builder completion, so a pre-PR crash never
-                            // pays for the extra forge round trip. Also
-                            // respects the #4206 operator-park guard: never
-                            // resume-dispatch an issue `restore_label_to_ready`
-                            // just deliberately left without `loom:issue`
-                            // because it carries `loom:blocked`.
+                            // pays for the extra forge round trip. A deliberate
+                            // park (`loom:blocked` / `loom:operator-only`,
+                            // possibly applied by `restore_label_to_ready`'s
+                            // #4206 pre-check moments ago) still stops the
+                            // resume — but that check now lives centrally in
+                            // `dispatch_inner` step 2.7 (#4444) rather than
+                            // here, so it covers the watchdogs and IPC/CLI too
+                            // and there is only ONE label probe per resume
+                            // dispatch. A parked issue therefore reaches the
+                            // dispatch call below and is refused there, which
+                            // is deliberately *more* visible than the old
+                            // silent call-site skip: the refusal surfaces as a
+                            // `warn!` naming the park label plus the existing
+                            // `SweepResumeDispatched { dispatched: false }`
+                            // event.
                             if !self.config.skip_label_flip
                                 && resume_phase_check
                                     .as_deref()
                                     .is_some_and(|p| RESUMABLE_CHECKPOINT_PHASES.contains(&p))
-                                && !self.issue_has_blocked_label(issue)
                             {
                                 if let Some(pr) = self.first_open_linked_pr(issue) {
                                     // Bounded resume attempts (#4256, Judge
@@ -13135,6 +13302,380 @@ exit 0\n";
             !calls.contains("api graphql"),
             "the open-PR (2.6) probe must never run once 2.5 refuses; got: {calls:?}"
         );
+    }
+
+    // --- park-label dispatch guard (Issue #4444) ---
+
+    /// Install a fake `gh` for the park-label guard (step 2.7):
+    ///
+    /// - `issue view --json state` reports `OPEN` (so the 2.5 closed-issue guard
+    ///   passes) and `issue view --json labels` reports whether `loom:blocked` is
+    ///   present (so the reap path's `issue_has_blocked_label` — still used by
+    ///   `restore_label_to_ready` — behaves faithfully);
+    /// - `api graphql` prints `graphql_pr` (the post-`--jq` open linked PR
+    ///   number, empty for none) so the 2.6 open-PR guard can be steered;
+    /// - `api repos/<owner>/<repo>/issues/<n>` prints `rest_labels`
+    ///   (whitespace-separated label names, one per output line) and exits
+    ///   `rest_exit` — the REST probe the new guard consults;
+    /// - `repo view` resolves the owner/repo.
+    ///
+    /// Every invocation is logged so a test can assert which probes ran.
+    fn park_guard_registry(
+        ws: &Path,
+        rest_labels: &str,
+        rest_exit: i32,
+        graphql_pr: &str,
+        skip_label_flip: bool,
+    ) -> (SweepRegistry, PathBuf) {
+        let gh_log = ws.join("gh-invocations.log");
+        let fake_gh = ws.join("fake-gh.sh");
+        let blocked = rest_labels.split_whitespace().any(|l| l == "loom:blocked");
+        let script = format!(
+            "#!/usr/bin/env bash\n\
+             printf '%s\\n' \"$*\" >> \"{log}\"\n\
+             if [[ \"$1\" == \"issue\" && \"$2\" == \"view\" ]]; then\n\
+             if [[ \"$*\" == *labels* ]]; then printf '%s\\n' \"{blocked}\"; \
+             else printf 'OPEN\\n'; fi\n\
+             exit 0\n\
+             fi\n\
+             if [[ \"$1\" == \"api\" && \"$2\" == \"graphql\" ]]; then\n\
+             printf '%s\\n' \"{gql}\"\n\
+             exit 0\n\
+             fi\n\
+             if [[ \"$1\" == \"api\" && \"$2\" == repos/* ]]; then\n\
+             printf '%s\\n' {labels}\n\
+             exit {rest_exit}\n\
+             fi\n\
+             if [[ \"$1\" == \"repo\" && \"$2\" == \"view\" ]]; then\n\
+             printf 'rjwalters/loom\\n'\n\
+             exit 0\n\
+             fi\n\
+             exit 0\n",
+            log = gh_log.display(),
+            blocked = blocked,
+            gql = graphql_pr,
+            labels = rest_labels,
+            rest_exit = rest_exit,
+        );
+        std::fs::write(&fake_gh, &script).unwrap();
+        let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_gh, perms).unwrap();
+        if let Ok(f) = std::fs::File::open(&fake_gh) {
+            let _ = f.sync_all();
+        }
+
+        let scripts_dir = ws.join(".loom").join("scripts");
+        std::fs::create_dir_all(&scripts_dir).unwrap();
+        let spawn = scripts_dir.join("spawn-claude.sh");
+        std::fs::write(&spawn, "#!/usr/bin/env bash\necho spawned\nexit 0\n").unwrap();
+        let mut sperms = std::fs::metadata(&spawn).unwrap().permissions();
+        sperms.set_mode(0o755);
+        std::fs::set_permissions(&spawn, sperms).unwrap();
+        if let Ok(f) = std::fs::File::open(&spawn) {
+            let _ = f.sync_all();
+        }
+        touch_sweep_command(ws);
+
+        let mut config = SweepRegistryConfig::new(ws.to_path_buf());
+        config.spawn_bin = Some(spawn);
+        config.gh_bin = Some(fake_gh);
+        config.skip_label_flip = skip_label_flip;
+        config.journal_path = Some(ws.join("test-sweeps-journal.json"));
+        (SweepRegistry::new(config), gh_log)
+    }
+
+    /// AC: `dispatch` for an issue carrying `loom:blocked` is refused with the
+    /// typed [`ParkedIssueDispatchError`], and it must NOT acquire the claim lock
+    /// or flip any labels — a deliberate park must survive every dispatch route.
+    /// The probe rides the REST bucket (`gh api repos/.../issues/N`), not
+    /// GraphQL.
+    #[test]
+    #[serial]
+    fn dispatch_refuses_blocked_issue_without_flipping_labels() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::set_var("LOOM_REPO", "rjwalters/loom");
+        let (mut reg, gh_log) = park_guard_registry(ws, "loom:blocked", 0, "", false);
+
+        let err = reg
+            .dispatch(&SweepKind::Issue(4444), None, None, None, None)
+            .expect_err("a parked issue must be refused");
+        let typed = err
+            .downcast_ref::<ParkedIssueDispatchError>()
+            .expect("refusal must carry the typed ParkedIssueDispatchError");
+        assert_eq!(typed.issue, 4444);
+        assert_eq!(typed.label, "loom:blocked");
+
+        let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            calls.contains("api repos/rjwalters/loom/issues/4444"),
+            "the guard must probe labels over REST, not GraphQL; got: {calls:?}"
+        );
+        assert!(
+            !calls.contains("issue edit"),
+            "no label flip on a refused dispatch; got: {calls:?}"
+        );
+        assert!(running_issue_sweep_id(&reg, 4444).is_none(), "no lock, no entry");
+        std::env::remove_var("LOOM_REPO");
+    }
+
+    /// AC: `loom:operator-only` is the second park label and refuses identically
+    /// — the daemon must never dispatch work a human has claimed for themselves.
+    #[test]
+    #[serial]
+    fn dispatch_refuses_operator_only_issue() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::set_var("LOOM_REPO", "rjwalters/loom");
+        let (mut reg, _gh_log) = park_guard_registry(ws, "loom:operator-only", 0, "", false);
+
+        let err = reg
+            .dispatch(&SweepKind::Issue(4445), None, None, None, None)
+            .expect_err("an operator-only issue must be refused");
+        let typed = err
+            .downcast_ref::<ParkedIssueDispatchError>()
+            .expect("refusal must carry the typed ParkedIssueDispatchError");
+        assert_eq!(typed.label, "loom:operator-only");
+        assert!(running_issue_sweep_id(&reg, 4445).is_none());
+        std::env::remove_var("LOOM_REPO");
+    }
+
+    /// AC (the load-bearing exclusion): `loom:building` ALONE must NOT refuse.
+    /// It is legitimately present on the daemon's own in-flight claim, so a guard
+    /// keyed on the full `SKIP_LABELS` set would break the review-stall
+    /// watchdog's cancel-and-re-dispatch and the reaper's checkpoint-resume.
+    #[test]
+    #[serial]
+    fn dispatch_park_guard_allows_building_label_alone() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::set_var("LOOM_REPO", "rjwalters/loom");
+        let (mut reg, gh_log) = park_guard_registry(ws, "loom:building loom:curated", 0, "", false);
+
+        let out = reg
+            .dispatch(&SweepKind::Issue(4446), None, None, None, None)
+            .expect("loom:building alone must never refuse dispatch");
+        assert!(wait_until_dead(out.pid, FIXTURE_CHILD_WAIT_MS));
+
+        let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            calls.contains("api repos/rjwalters/loom/issues/4446"),
+            "the guard still probed; it just did not refuse; got: {calls:?}"
+        );
+        assert!(
+            calls.contains("issue edit 4446"),
+            "dispatch proceeded to the label flip; got: {calls:?}"
+        );
+        if let Some(id) = running_issue_sweep_id(&reg, 4446) {
+            let _ = reg.cancel(&id, Duration::from_secs(2));
+        }
+        std::env::remove_var("LOOM_REPO");
+    }
+
+    /// AC (fail-open, the single most safety-critical property): a forge error on
+    /// the REST label probe (non-zero `gh api`) must NOT wedge dispatch — the
+    /// probe returns `None` and dispatch proceeds to spawn + label flip, exactly
+    /// like the 2.5/2.6 guards.
+    #[test]
+    #[serial]
+    fn dispatch_fails_open_when_park_label_probe_errors() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::set_var("LOOM_REPO", "rjwalters/loom");
+        // The park label IS present, but the probe fails ⇒ unknown ⇒ fail open.
+        let (mut reg, gh_log) = park_guard_registry(ws, "loom:blocked", 1, "", false);
+
+        let out = reg
+            .dispatch(&SweepKind::Issue(4447), None, None, None, None)
+            .expect("a gh outage on the park probe must not wedge dispatch (fail-open)");
+        assert!(wait_until_dead(out.pid, FIXTURE_CHILD_WAIT_MS));
+
+        let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            calls.contains("api repos/rjwalters/loom/issues/4447"),
+            "the guard attempted the REST probe; got: {calls:?}"
+        );
+        assert!(
+            calls.contains("issue edit 4447"),
+            "dispatch proceeded to the label flip after failing open; got: {calls:?}"
+        );
+        if let Some(id) = running_issue_sweep_id(&reg, 4447) {
+            let _ = reg.cancel(&id, Duration::from_secs(2));
+        }
+        std::env::remove_var("LOOM_REPO");
+    }
+
+    /// AC: `skip_label_flip = true` (test fixtures without `gh` credentials)
+    /// never attempts the probe at all — not even the REST call — mirroring the
+    /// 2.5/2.6 skip condition.
+    #[test]
+    #[serial]
+    fn dispatch_skip_label_flip_bypasses_park_guard() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::set_var("LOOM_REPO", "rjwalters/loom");
+        let (mut reg, gh_log) = park_guard_registry(ws, "loom:blocked", 0, "", true);
+
+        let out = reg
+            .dispatch(&SweepKind::Issue(4448), None, None, None, None)
+            .expect("skip_label_flip must bypass the park guard entirely");
+        assert!(wait_until_dead(out.pid, FIXTURE_CHILD_WAIT_MS));
+
+        let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            !calls.contains("api repos/"),
+            "no forge call at all when label flips are disabled; got: {calls:?}"
+        );
+        if let Some(id) = running_issue_sweep_id(&reg, 4448) {
+            let _ = reg.cancel(&id, Duration::from_secs(2));
+        }
+        std::env::remove_var("LOOM_REPO");
+    }
+
+    /// Guard ordering: 2.6 (open-PR) runs before 2.7 (park label), so an ordinary
+    /// dispatch of a parked issue that ALSO has an open PR is attributed to the
+    /// cheaper-to-explain open-PR refusal and never pays for the REST probe.
+    #[test]
+    #[serial]
+    fn open_pr_guard_fires_before_park_guard() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::set_var("LOOM_REPO", "rjwalters/loom");
+        let (mut reg, gh_log) = park_guard_registry(ws, "loom:blocked", 0, "4500", false);
+
+        let err = reg
+            .dispatch(&SweepKind::Issue(4449), None, None, None, None)
+            .expect_err("an issue with an open linked PR must be refused");
+        assert!(
+            err.downcast_ref::<OpenPrDispatchError>().is_some(),
+            "the 2.6 open-PR guard wins for an ordinary dispatch; got: {err}"
+        );
+        let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            !calls.contains("api repos/"),
+            "the 2.7 REST probe must not run once 2.6 refuses; got: {calls:?}"
+        );
+        std::env::remove_var("LOOM_REPO");
+    }
+
+    /// THE CORE REGRESSION (#4444): a checkpoint-resume dispatch — which
+    /// deliberately bypasses the 2.6 open-PR guard for its OWN PR — must still be
+    /// refused by the 2.7 park guard when the issue was parked after the crash.
+    /// This is the path that overrode a `loom:blocked` park on #4366.
+    ///
+    /// The refusal must be failure-visible, not silent: the reaper still emits
+    /// `SweepResumeDispatched { dispatched: false }` (and logs the refusal, whose
+    /// message names the park label), and no fresh `Running` entry is created.
+    #[tokio::test]
+    #[serial]
+    async fn reaper_resume_refused_when_issue_parked_after_crash() {
+        use crate::event_bus::EventBus;
+
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::set_var("LOOM_REPO", "rjwalters/loom");
+        // Open linked PR #4501 (so the resume path engages and the 2.6 bypass
+        // matches) AND a `loom:blocked` park applied after the crash.
+        let (mut reg, gh_log) = park_guard_registry(ws, "loom:blocked", 0, "4501", false);
+        let bus = Arc::new(EventBus::new());
+        reg.set_event_bus(bus.clone());
+        let mut sub = bus.subscribe::<[&str; 0], &str>([]);
+
+        write_checkpoint(&reg, 4366, "builder-done");
+        insert_dead_running_entry(&mut reg, 4366, "sweep-issue-4366-crashed");
+
+        let changed = reg.reap_once();
+        assert!(changed >= 1);
+
+        let mut saw_resume_false = false;
+        for _ in 0..8 {
+            let Ok(ev) = tokio::time::timeout(Duration::from_secs(5), sub.recv()).await else {
+                break;
+            };
+            if let Event::SweepResumeDispatched {
+                issue,
+                pr,
+                dispatched,
+                ..
+            } = ev.unwrap()
+            {
+                assert_eq!(issue, 4366);
+                assert_eq!(pr, 4501);
+                assert!(
+                    !dispatched,
+                    "a park applied after the crash must refuse the resume dispatch"
+                );
+                saw_resume_false = true;
+            }
+        }
+        assert!(
+            saw_resume_false,
+            "the park refusal must stay failure-visible on the resume path (not silent)"
+        );
+
+        assert!(
+            running_issue_sweep_id(&reg, 4366).is_none(),
+            "a refused resume must not create a fresh Running entry"
+        );
+        let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            calls.contains("api repos/rjwalters/loom/issues/4366"),
+            "the resume dispatch went through the central 2.7 REST probe; got: {calls:?}"
+        );
+        assert_eq!(
+            calls
+                .lines()
+                .filter(|l| l.contains("api repos/rjwalters/loom/issues/4366"))
+                .count(),
+            1,
+            "exactly ONE park-label probe per resume dispatch (deduped with the old \
+             call-site-only check); got: {calls:?}"
+        );
+        // The park survives: the crash-path restore removed the stale claim but
+        // did NOT re-add `loom:issue` (#4206), and no fresh claim was flipped on.
+        assert!(
+            !calls.contains("--add-label loom:issue"),
+            "the operator's park must not be clobbered back to loom:issue; got: {calls:?}"
+        );
+        std::env::remove_var("LOOM_REPO");
+    }
+
+    /// Companion to the test above: with the SAME fixture but no park label, the
+    /// resume dispatch succeeds — proving the refusal above is caused by the park
+    /// label and not by some other property of the fixture.
+    #[tokio::test]
+    #[serial]
+    async fn reaper_resume_succeeds_when_issue_not_parked() {
+        use crate::event_bus::EventBus;
+
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::set_var("LOOM_REPO", "rjwalters/loom");
+        let (mut reg, _gh_log) = park_guard_registry(ws, "loom:curated", 0, "4502", false);
+        let bus = Arc::new(EventBus::new());
+        reg.set_event_bus(bus.clone());
+        let mut sub = bus.subscribe::<[&str; 0], &str>([]);
+
+        write_checkpoint(&reg, 4367, "builder-done");
+        insert_dead_running_entry(&mut reg, 4367, "sweep-issue-4367-crashed");
+
+        let changed = reg.reap_once();
+        assert!(changed >= 1);
+
+        let mut saw_resume_true = false;
+        for _ in 0..8 {
+            let Ok(ev) = tokio::time::timeout(Duration::from_secs(5), sub.recv()).await else {
+                break;
+            };
+            if let Event::SweepResumeDispatched { dispatched, .. } = ev.unwrap() {
+                assert!(dispatched, "an unparked issue must still resume normally");
+                saw_resume_true = true;
+            }
+        }
+        assert!(saw_resume_true, "expected a successful resume dispatch");
+        assert!(running_issue_sweep_id(&reg, 4367).is_some());
+        std::env::remove_var("LOOM_REPO");
     }
 
     // --- reaper-driven resume (Issue #4256) ---
