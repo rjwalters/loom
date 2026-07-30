@@ -430,6 +430,147 @@ Or, if you have already verified/reconciled them, re-run with --allow-stacked-ch
 # Invoke the guard before either merge path attempts the actual merge API call.
 _check_no_open_stacked_children
 
+# ---------------------------------------------------------------------------
+# Partial-increment closing-keyword conflict detection (#4569).
+#
+# ROOT CAUSE (established from the rjwalters/censusapi#5 -> censusapi#2 incident,
+# NOT from the branch-name theory the report floated):
+#
+#   GitHub's closing-reference parser scans the ENTIRE PR body and honors ANY
+#   `close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved` that is
+#   IMMEDIATELY followed by `#N` — wherever it appears, including buried in
+#   prose, inside a list item, or mid-sentence. It is NOT limited to a
+#   line-leading trailer.
+#
+#   censusapi PR #5 ended with the deliberate non-closing trailer
+#   `Contributes to #2`, but an earlier "Operator follow-up (after merge)" step
+#   read "...then close #2". GitHub honored that `close #2` as a real closing
+#   reference and closed issue #2 on squash-merge, silently defeating the #3599
+#   partial-increment convention. The evidence:
+#     - issue #2's timeline has NO `connected` event, so there was no
+#       Development-sidebar / branch-name link -> the `feature/issue-N`
+#       branch-name auto-link hypothesis is RULED OUT;
+#     - the squash commit message contained only `Contributes to #2` (no closing
+#       keyword), so the close did not come from the commit message either;
+#     - the `closed` event has `commit_id: null` with the merger as actor at the
+#       merge instant — the signature of a PR-body closing-reference close.
+#
+# Fix shape: DETECT (here, pre-merge, with a loud actionable warning) plus
+# SELF-HEAL (post-merge reopen in _reset_one_partial_issue below). Prevention by
+# rewriting the PR body at merge time was rejected — mutating a body the Judge
+# already reviewed is a worse failure mode than a seconds-long close/reopen.
+#
+# Two globals are published for the post-merge pass, both space-separated:
+#   PARTIAL_OPEN_BEFORE_MERGE - partial-increment refs that were OPEN right
+#       before the merge (so "closed afterwards" is attributable to this merge).
+#   PARTIAL_CONFLICT_ISSUES   - the subset that ALSO carries a closing reference
+#       from this PR, i.e. the ones GitHub is about to close against the
+#       declared intent. Only these are auto-reopened; that keeps a deliberate
+#       human close inside the merge window (which carries no closing reference)
+#       from being reverted.
+PARTIAL_OPEN_BEFORE_MERGE=""
+PARTIAL_CONFLICT_ISSUES=""
+
+# Issue numbers referenced with a NON-closing partial-increment keyword
+# (`Part of #N` / `Contributes to #N`, case-insensitive), one per line, deduped.
+_partial_increment_refs() {
+  { printf '%s\n' "$1" \
+      | grep -oiE '(Part of|Contributes to)[[:space:]]+#[0-9]+' \
+      | grep -oE '[0-9]+' \
+      | sort -un; } || true
+}
+
+# Issue numbers referenced with a GitHub CLOSING keyword anywhere in the text,
+# one per line, deduped. The regex is deliberately the same one
+# forge_pr_close_targets() uses on its Gitea branch (the canonical keyword set,
+# with `\b` guarding against substring traps like `Discloses #N`).
+#
+# Why a body regex and not only the authoritative GraphQL
+# `closingIssuesReferences`: that field is GraphQL-only, and the incident this
+# guard exists for happened while GraphQL quota was exhausted (the PR was even
+# created via raw REST for that reason). A quota-free text signal is the one that
+# still works in exactly the conditions where this bug bites.
+_body_closing_refs() {
+  { printf '%s\n' "$1" \
+      | grep -oiE '\b(close[sd]?|fix(e[sd])?|resolve[sd]?)\b[[:space:]]+#[0-9]+' \
+      | grep -oE '[0-9]+' \
+      | sort -un; } || true
+}
+
+# Membership tests over the space-separated globals above.
+_partial_ref_is_conflicted() {
+  [[ -n "${PARTIAL_CONFLICT_ISSUES:-}" ]] || return 1
+  [[ " $PARTIAL_CONFLICT_ISSUES " == *" $1 "* ]]
+}
+_partial_ref_was_open_before_merge() {
+  [[ -n "${PARTIAL_OPEN_BEFORE_MERGE:-}" ]] || return 1
+  [[ " $PARTIAL_OPEN_BEFORE_MERGE " == *" $1 "* ]]
+}
+
+# Populate the two globals and warn about each detected conflict. Best-effort:
+# never fails the merge, and a lookup failure simply yields a smaller set.
+_check_partial_increment_close_conflict() {
+  [[ "$FORGE_TYPE" == "github" ]] || return 0
+
+  local pr_body
+  pr_body="$(echo "$PR_JSON" | jq -r '.body // ""')"
+  [[ -n "$pr_body" ]] || return 0
+
+  local partial_refs
+  partial_refs="$(_partial_increment_refs "$pr_body")"
+  [[ -n "$partial_refs" ]] || return 0
+
+  # Closing references GitHub will honor on merge: the body's own closing
+  # keywords (quota-free) UNION GitHub's authoritative closingIssuesReferences
+  # (best-effort — empty under GraphQL quota exhaustion, but when it does answer
+  # it also surfaces a Development-sidebar link that no body text reveals).
+  local body_close_refs graphql_close_refs close_refs
+  body_close_refs="$(_body_closing_refs "$pr_body")"
+  graphql_close_refs="$(forge_pr_close_targets "$PR_NUMBER" "$GH" 2>/dev/null || true)"
+  close_refs="$(printf '%s\n%s\n' "$body_close_refs" "$graphql_close_refs" \
+    | grep -E '^[0-9]+$' | sort -un || true)"
+
+  local issue_num issue_json
+  while IFS= read -r issue_num; do
+    [[ -n "$issue_num" ]] || continue
+
+    # Fresh (uncached) read — plain `gh api`, not $GH, mirroring
+    # _reset_one_partial_issue's freshness discipline. Skip PRs that slipped
+    # through the regex (the issues endpoint also returns PRs).
+    issue_json="$(gh api "repos/$REPO_NWO/issues/$issue_num" 2>/dev/null || echo '{}')"
+    if [[ "$(echo "$issue_json" | jq -r 'has("pull_request")')" == "true" ]]; then
+      continue
+    fi
+    # Only an issue that is OPEN right now can be closed BY this merge; one that
+    # is already closed was closed by something else and is not ours to revert.
+    if [[ "$(echo "$issue_json" | jq -r '.state // ""')" != "open" ]]; then
+      continue
+    fi
+    PARTIAL_OPEN_BEFORE_MERGE="${PARTIAL_OPEN_BEFORE_MERGE:+$PARTIAL_OPEN_BEFORE_MERGE }$issue_num"
+
+    if ! grep -qx "$issue_num" <<<"$close_refs"; then
+      continue
+    fi
+    PARTIAL_CONFLICT_ISSUES="${PARTIAL_CONFLICT_ISSUES:+$PARTIAL_CONFLICT_ISSUES }$issue_num"
+
+    local offending dr=""
+    # Match _check_no_open_stacked_children's dry-run contract: report the
+    # would-be outcome without claiming a merge is happening.
+    [[ "${DRY_RUN:-false}" == "true" ]] && dr="[dry-run] "
+    offending="$(printf '%s\n' "$pr_body" \
+      | grep -oiE "\\b(close[sd]?|fix(e[sd])?|resolve[sd]?)\\b[[:space:]]+#$issue_num\\b" \
+      | sort -u | tr '\n' '|' | sed 's/|$//; s/|/", "/g' || true)"
+    warning "${dr}Partial-increment conflict (#4569): PR #$PR_NUMBER declares a NON-closing \`Part of\`/\`Contributes to\` reference to #$issue_num, but its body ALSO carries a closing reference to #$issue_num${offending:+ (\"$offending\")} — GitHub honors a closing keyword ANYWHERE in the body, so merging this PR WILL close #$issue_num against the declared intent."
+    warning "  ${dr}merge-pr.sh would reopen #$issue_num immediately after the merge. To avoid the close/reopen flicker entirely, edit the PR body so no closing keyword is immediately followed by \`#$issue_num\` (e.g. write \`close the issue\` or \`close issue #$issue_num\` instead of \`close #$issue_num\`), then re-run this merge."
+  done <<< "$partial_refs"
+
+  return 0
+}
+
+# Runs before either merge path so the operator sees the conflict BEFORE the
+# close happens, and so --dry-run reports it without merging. Best-effort.
+_check_partial_increment_close_conflict || true
+
 info "Merging PR #$PR_NUMBER: $PR_TITLE"
 info "Branch: $PR_BRANCH"
 
@@ -466,7 +607,7 @@ info "Branch: $PR_BRANCH"
 # second builder), or is actually a PR.
 _reset_one_partial_issue() {
   local issue_num="$1"
-  local issue_json issue_state issue_labels
+  local issue_json issue_state issue_labels reopened=false
 
   # Fresh (uncached) read so we see the label state AS OF the merge, not as of
   # PR creation. Plain `gh api` is uncached; use it directly (not $GH, which may
@@ -481,8 +622,33 @@ _reset_one_partial_issue() {
 
   issue_state="$(echo "$issue_json" | jq -r '.state // ""')"
   if [[ "$issue_state" != "open" ]]; then
-    info "Partial-increment reset: issue #$issue_num is not open (state='${issue_state:-unknown}') — skipping"
-    return 0
+    # #4569: a partial-increment issue that was OPEN pre-merge and is closed now
+    # was closed BY this merge. If the pre-merge guard recorded a closing
+    # reference to it from this very PR (a stray `close #N` in prose, or a
+    # Development-sidebar link), that close contradicts the PR's own declared
+    # `Part of` / `Contributes to` intent — revert it, then fall through to the
+    # normal label swap so the issue re-enters the ready queue.
+    if _partial_ref_is_conflicted "$issue_num"; then
+      warning "Partial-increment reset: issue #$issue_num was auto-closed by PR #$PR_NUMBER's merge despite its non-closing \`Part of\`/\`Contributes to\` reference (a closing reference to #$issue_num was detected pre-merge) — reopening (#4569)"
+      if gh issue reopen "$issue_num" --repo "$REPO_NWO" >/dev/null 2>&1; then
+        success "Issue #$issue_num reopened (premature auto-close reverted)"
+        reopened=true
+        _post_premature_close_comment "$issue_num"
+      else
+        warning "Could not reopen issue #$issue_num after its premature auto-close — reopen manually: gh issue reopen $issue_num --repo $REPO_NWO"
+        return 0
+      fi
+    elif _partial_ref_was_open_before_merge "$issue_num"; then
+      # Open before the merge, closed after it, but this PR carries no closing
+      # reference we can attribute it to. Could be a deliberate close by a human
+      # or another agent in the same window, so do NOT revert it — just make the
+      # coincidence loud enough to investigate.
+      warning "Partial-increment reset: issue #$issue_num was open before PR #$PR_NUMBER merged and is now closed (state='${issue_state:-unknown}'), but no closing reference to it was detected on this PR — NOT reopening automatically (it may be a deliberate close). If this was a premature auto-close, reopen it with: gh issue reopen $issue_num --repo $REPO_NWO"
+      return 0
+    else
+      info "Partial-increment reset: issue #$issue_num is not open (state='${issue_state:-unknown}') — skipping"
+      return 0
+    fi
   fi
 
   issue_labels="$(echo "$issue_json" | jq -r '.labels[]?.name' 2>/dev/null || true)"
@@ -497,13 +663,15 @@ _reset_one_partial_issue() {
        --remove-label "loom:building" \
        --add-label "loom:issue" >/dev/null 2>&1; then
     success "Issue #$issue_num: loom:building -> loom:issue (partial increment; issue remains open)"
-    local ts comment
+    local ts comment reopen_note=""
     ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    [[ "$reopened" == "true" ]] && reopen_note="
+- **Reopened** this issue (GitHub had auto-closed it from a stray closing keyword in PR #$PR_NUMBER's body — see #4569)"
     comment="## Partial Increment Merged
 
 PR #$PR_NUMBER merged with a non-closing \`Part of\` / \`Contributes to\` reference, so this issue remains **open** for further work.
 
-**Action taken**:
+**Action taken**:$reopen_note
 - Removed \`loom:building\` label
 - Added \`loom:issue\` label to return to the ready queue
 
@@ -518,6 +686,28 @@ This issue is now available for the next increment (a subsequent \`/loom:sweep\`
   fi
 }
 
+# Audit trail for a reverted premature auto-close (#4569). Posted right after
+# the reopen so the record survives even when the label swap below is skipped
+# (e.g. the issue no longer carries loom:building). Best-effort.
+_post_premature_close_comment() {
+  local issue_num="$1" ts comment
+  ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  comment="## Premature Auto-Close Reverted
+
+PR #$PR_NUMBER referenced this issue with a **non-closing** \`Part of\` / \`Contributes to\` keyword — a declared partial increment, so this issue was meant to stay **open** after the merge. GitHub closed it anyway, because a **closing keyword** (\`close\`/\`fix\`/\`resolve\` and their tense variants) appeared somewhere else in the PR body immediately followed by \`#$issue_num\`.
+
+GitHub honors a closing keyword **anywhere** in a PR body — not only in a line-leading trailer — so prose like \"…then close #$issue_num\" in a follow-up checklist creates a real closing link that overrides the intended \`Contributes to #$issue_num\`.
+
+**Action taken**: reopened this issue.
+
+**To avoid this**: never put a closing keyword immediately before \`#$issue_num\` anywhere in a partial-increment PR body. Write \`close the issue\` or \`close issue #$issue_num\` instead of \`close #$issue_num\`.
+
+---
+*Reopened by merge-pr.sh (#4569) at $ts*"
+  gh issue comment "$issue_num" --repo "$REPO_NWO" --body "$comment" >/dev/null 2>&1 || \
+    warning "Could not post premature-close comment on issue #$issue_num (reopen still applied)"
+}
+
 # Parse the merged PR body for non-closing partial-increment references and
 # reset each referenced issue. Best-effort; returns 0 unconditionally.
 _reset_partial_increment_labels() {
@@ -527,14 +717,11 @@ _reset_partial_increment_labels() {
   pr_body="$(echo "$PR_JSON" | jq -r '.body // ""')"
   [[ -n "$pr_body" ]] || return 0
 
-  # Extract issue numbers referenced with a NON-closing partial-increment
-  # keyword: "Part of #N" / "Contributes to #N" (case-insensitive), deduped.
-  # grep -oiE emits e.g. "Part of #123"; a second grep strips to the number.
+  # Issue numbers referenced with a NON-closing partial-increment keyword.
+  # Shares _partial_increment_refs with the pre-merge #4569 conflict guard so the
+  # two passes can never disagree about which issues are partial increments.
   local refs
-  refs="$(printf '%s\n' "$pr_body" \
-    | grep -oiE '(Part of|Contributes to)[[:space:]]+#[0-9]+' \
-    | grep -oE '[0-9]+' \
-    | sort -u || true)"
+  refs="$(_partial_increment_refs "$pr_body")"
   [[ -n "$refs" ]] || return 0
 
   local issue_num

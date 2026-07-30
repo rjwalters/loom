@@ -1020,6 +1020,15 @@ If EITHER is true, the PR is a **partial increment** of a larger tracked body of
 - Do NOT flag the missing closing keyword.
 - Do NOT insert or rewrite a closing keyword (skip the auto-fix in "Minor PR Description Fixes" below).
 - Verify the non-closing reference (`Part of #N` / `Contributes to #N`) is present so the PR stays discoverable; if it references the issue only as bare "Issue #N", ask the Builder to change it to `Part of #N` (do not "fix" it to `Closes #N`).
+- **Verify no STRAY closing keyword targets #N anywhere else in the body (#4569).** `Part of #N` does not shield the issue: GitHub honors any `close`/`fix`/`resolve` keyword immediately followed by `#N` **anywhere** in the body — including buried in prose, a numbered list, or an "Operator follow-up (after merge)" section — and closes the issue on merge regardless. This has happened for real ("…then close #2" in a handoff checklist closed the very issue the PR declared `Contributes to #2`).
+
+  ```bash
+  # Run for the tracked issue N. ANY output is a defect that will close #N on merge.
+  gh pr view <number> --json body -q .body \
+    | grep -inE '\b(close[sd]?|fix(e[sd])?|resolve[sd]?)[[:space:]]+#N\b'
+  ```
+
+  This is a **minor PR description fix** you should make directly (it does not need a Builder round-trip): edit the body so the keyword is no longer adjacent to the reference — `then close the issue`, or `then close issue #N`. An intervening word breaks the link; moving the phrase to a different line does not.
 - Evaluate the code on its own merits and approve/reject normally.
 
 **If PR description is missing "Closes #X" syntax (and the partial-increment exception above does NOT apply):**
