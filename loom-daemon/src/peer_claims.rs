@@ -38,6 +38,21 @@
 //! within one TTL of its last heartbeat — the promotion changes how *long* a
 //! claim stays visible, not the "soft, eventually-consistent" nature above.
 //!
+//! # Which room claim ads ride: the signal room (#4225)
+//!
+//! #4225 splits narration across a low-volume **signal** room and per-repo
+//! **firehose** rooms, routing by attention class: `task` envelopes (which a
+//! claim ad is — see [`crate::safehouse::claim_ad_to_envelope`]) go to the repo
+//! firehose. Claim ads are the **one deliberate exception** and stay on the
+//! signal room, because coordination has a membership requirement narration does
+//! not: firehose rooms are created *lazily* by whichever host narrates a repo
+//! first, and each host runs its own bot account, so a peer that never joined
+//! `fleet-<repo>` would silently stop seeing ads there — disabling dedup with no
+//! error anywhere. Every host's bot is already in the signal room. The full
+//! rationale (and the matching reader behavior) is on
+//! `safehouse::run_coordination`; nothing in *this* module is room-aware, which
+//! is why the exception costs no code here.
+//!
 //! # TTL is measured against LOCAL receipt, never the advertiser's clock
 //!
 //! A crashed peer must not starve an issue forever, so every peer claim expires

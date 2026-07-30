@@ -52,6 +52,7 @@ default(disabled)**:
   "socket": null,         // default: $SAFEHOUSED_SOCKET
   "room": null,           // omit only if safehoused joined exactly one room
   "persona": "loom_daemon"
+  // "rooms": { … }       // optional attention-class routing — see below (#4225)
 }
 ```
 
@@ -63,9 +64,97 @@ Env overrides (each wins over config for that key):
 | `LOOM_SAFEHOUSE_SOCKET` | `socket` |
 | `LOOM_SAFEHOUSE_ROOM` | `room` |
 | `LOOM_SAFEHOUSE_PERSONA` | `persona` |
+| `LOOM_SAFEHOUSE_ROOM_SIGNAL` | `rooms.signal` (#4225) |
+| `LOOM_SAFEHOUSE_ROOMS_BY_REPO` | `rooms.byRepo`, as `repo=room[,repo=room…]` (#4225) |
 
 **Socket resolution**: configured `socket` → `$LOOM_SAFEHOUSE_SOCKET` →
 `$SAFEHOUSED_SOCKET`. If none resolves, narration logs one `warn!` and stays off.
+
+### Room routing by attention class (`safehouse.rooms`, #4225)
+
+One room carrying everything — operator conversation, human-must-act handoffs,
+*and* the full narration firehose — drowns the signal it exists to deliver: at
+full concurrency the operator's primary interface (phone, notifications on) takes
+hundreds of messages a night. The optional `rooms` map routes by **attention
+class first, repo second**:
+
+```jsonc
+"safehouse": {
+  "enabled": true,
+  "socket": "/run/safehoused.sock",
+  "persona": "loom_daemon",
+  "rooms": {
+    "signal": "!AbC…:example.org",           // tier 1: loom-fleet, notifications ON
+    "byRepo": {                                // tier 2: per-repo firehose, muted
+      "loom": "!DeF…:example.org",
+      "vibesql": "!GhI…:example.org"
+    }
+  }
+}
+```
+
+| Tier | Room | Carries | Volume / notifications |
+|---|---|---|---|
+| 1 | `rooms.signal` (`loom-fleet`) | operator ↔ fleet conversation, every `handoff`, terminal `ack` / `completion`, future wave digests (#4217) | low, notifications **on**, cross-repo by design |
+| 2 | `rooms.byRepo[<repo>]` (`fleet-<repo>`) | `task` (dispatch + phase transitions) and `chat` (worker chatter) | high, **muted** by default, opened while actively watching a repo |
+
+A Matrix **Space** ("2AM Fleet") grouping these rooms is tracked separately in the
+safehouse repo — Loom creates no Space.
+
+**Routing rules**
+
+- **Severity routes, never duplicates.** Every message lands in exactly **one**
+  room; nothing is mirrored.
+- The kind → tier table is the whole routing decision:
+  | Envelope `type` | Room |
+  |---|---|
+  | `handoff`, `ack`, `completion` | signal |
+  | `task`, `chat` | repo firehose |
+  It is written as a **compile-time-exhaustive `match`** over an `EnvelopeKind`
+  enum (`safehouse.rs`), with no wildcard arm, so a future sixth envelope type
+  fails to compile (and a type added to only one of `KNOWN_TYPES` /
+  `EnvelopeKind` fails a test) rather than silently defaulting into the wrong
+  room.
+- **Rooms are per-repo, not per-host.** Host attribution already rides the Matrix
+  sender (per-host bot accounts), so a second host working the same repo posts
+  into the same room.
+- The repo key is the **workspace-root basename** — the same narration convention
+  #4201 uses for `task_id`/body prefixes (`/Users/x/GitHub/vibesql` ⇒ `vibesql`).
+- **`rooms.signal` falls back to the scalar `room`**, so the migration step "add a
+  `byRepo` map, leave `room` as it is" keeps the existing room as the signal room.
+- Workers follow the same map via `fleet-comms.md`: worker `chat`/`task` posts go
+  to the repo room, worker `handoff` to the signal room.
+
+**Lazy room creation.** A repo absent from `byRepo` gets its firehose created on
+its **first narration** (never eagerly for every managed repo): the sink issues a
+socket `create_room` op for the alias `fleet-<repo>` and remembers the resulting
+id for the rest of the daemon's run. If creation is **refused**, that repo
+degrades to the signal room with **one** `warn!` for the whole run (never one per
+message) and the sweep is unaffected — after fixing permissions, restart the
+daemon. A creation that fails at the *transport* layer (a dropped connection) is
+not held against the room: it is retried after the reconnect. As with
+`safehouse.mcpCommand`, the exact `create_room` request/reply shape lives in the
+external `rjwalters/safehouse` repo and is not verifiable from here, so the client
+is lenient (it names the room with both `name` and `alias`, accepts the room id
+under any of the plausible reply keys, and falls back to addressing sends by the
+alias it asked for).
+
+**Migration notes**
+
+- **Absent `rooms` map ⇒ nothing changes.** Every envelope goes to the single
+  `room` exactly as before (including `room: null` ⇒ no `room` key on the wire).
+  This is the default, and it is covered by explicit regression tests. A
+  present-but-empty `"rooms": {}` (or one whose entries are all blank) normalizes
+  back to single-room mode rather than to a routing mode with nowhere to route.
+- **Once the map exists and the bot is in several rooms, explicit ids are
+  required.** The `room: null` convenience only resolves while safehoused has
+  joined *exactly one* room; a multi-room bot rejects every roomless `send` with
+  `'room' required: N rooms joined`. So when you adopt `rooms`, give it a real
+  `signal` id (or leave a real `room` for it to fall back to) — otherwise
+  narration stops with the send-rejected status described below, which names the
+  fix. See the troubleshooting entry.
+- **Peer-claim ads stay on the signal room** — the one deliberate exception to
+  "signal-only". See the peer-claim section below for why.
 
 New template keys reach existing consumer configs via the installer deep-merge
 (template is the base, existing values win) — no migration needed. The tier
@@ -168,6 +257,14 @@ to the room this host should narrate into, then restart the daemon
 (`loom-daemon restart`). The status line returns to `connected` on the first
 accepted send. `loom-daemon-start.sh` also prints a static caveat at start time
 whenever a socket is configured but `safehouse.room` is unset.
+
+**With attention-class routing (#4225)** this is the same failure with one more
+place to look: adopting a `rooms` map *guarantees* a multi-room bot, so the
+roomless convenience stops working for good. Set `rooms.signal` (or
+`LOOM_SAFEHOUSE_ROOM_SIGNAL`) to a real id — or leave `safehouse.room` set, which
+`rooms.signal` falls back to — and give each actively-watched repo a
+`rooms.byRepo` entry (unset repos are created lazily as `fleet-<repo>`, and a
+refused creation degrades that repo to the signal room with one `warn!`).
 
 ## New-host onboarding (#4345, #4346)
 
@@ -380,7 +477,12 @@ has rotated. The verdict maps onto drain's existing contract:
 ## What gets narrated
 
 The sink maps the **existing frozen event taxonomy** (`event_bus.rs`,
-`types.rs`) to envelope-v1 messages. All are broadcast (`to: "*"`).
+`types.rs`) to envelope-v1 messages. All are broadcast (`to: "*"`). Which **room**
+each one lands in is decided by its envelope `type` — see
+[Room routing by attention class](#room-routing-by-attention-class-safehouserooms-4225):
+`task` lines (dispatch/phase) go to that repo's firehose, while `handoff` /
+`ack` / `completion` (blockers, crashes, terminal outcomes) go to the signal room.
+With no `rooms` map configured they all go to the one `room`, as before.
 
 ### Repo qualification (issue #4201)
 
@@ -538,7 +640,11 @@ what feeds the public fleet feed on 2amlogic.com. Loom is the producer:
 
 - `loom-daemon/src/safehouse.rs` — config resolver, envelope-v1 client, the
   event→envelope mapping, the reconnecting bus-subscriber narration sink, and
-  (#4028) the peer-claim coordination task + `InboundEventSink`.
+  (#4028) the peer-claim coordination task + `InboundEventSink`. Also (#4225) the
+  attention-class routing layer: `RoomMap` (config/env), `EnvelopeKind` +
+  `AttentionClass` (the exhaustive kind → tier table), `RoomRouter` (per-envelope
+  room resolution, lazy `fleet-<repo>` creation, warn-once degradation) and
+  `SafehouseClient::send_to` / `create_room`.
 - `loom-daemon/src/peer_claims.rs` — the pure, socket-free peer-claim view
   (TTL expiry, self-claim recognition, retraction, `ClaimAd` parse/serialize).
 - `loom-daemon/src/workspace_pool.rs` — `start_safehouse_narration()` and
@@ -598,6 +704,33 @@ coordination shrinks that window:
   off on its own advertisement.**
 - **Event taxonomy.** The internal pub/sub topic taxonomy is frozen; peer claims
   add **no new bus topic** — they travel entirely over the safehouse room.
+
+### Which room claim ads ride: the signal room (#4225's resolved open question)
+
+A claim ad is a `task` envelope carrying per-repo machine chatter, so the
+attention-class table would put it in the repo firehose. It stays on the **signal
+room** instead — the one deliberate exception to "the signal room is signal-only":
+
+1. **The signal room is the only room with guaranteed common membership.** Firehose
+   rooms are created **lazily** by whichever host narrates that repo first, and
+   each host runs its **own bot account**. Host A creating `fleet-loom` does not
+   join host B's bot to it, so an ad posted there is invisible to B until an
+   operator invites it — silently disabling cross-host dedup with no error
+   anywhere (exactly the failure class #4464 had to add a status state for). Every
+   host's bot is already in the signal room.
+2. **Dedup is correctness; room hygiene is cosmetics.** A missed ad costs a
+   duplicate cross-host sweep (wasted tokens, two PRs for one issue); a little
+   machine JSON in the signal room costs some scroll. Correctness wins, and ads
+   are low volume (one per dispatch / terminal outcome, plus the #4431 re-ad).
+3. **The reader agrees with the writer by construction.** The coordination task's
+   inbound handler is unfiltered — it folds *any* inbound line with a parseable
+   `loom_claim` body into the view — so keeping the write side on the signal room
+   makes the pair trivially consistent instead of dependent on which rooms this
+   host's bot happens to have joined.
+
+A dedicated coordination room (a third tier) is the clean long-term fix and is
+left as a follow-up: like the tier-3 Matrix Space, it needs cross-host
+*provisioning*, not just routing.
 
 ### Soft claim, NOT a mutex (the load-bearing caveat)
 
