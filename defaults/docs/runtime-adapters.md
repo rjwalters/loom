@@ -403,6 +403,16 @@ Callers migrate from `spawn-claude.sh` to `spawn-worker.sh` to gain runtime
 selection; until they do, `spawn-claude.sh` keeps working unchanged (existing
 daemon/tooling callers are intentionally left on the direct path in Phase 1).
 
+The machine-level `loom sweep <N>` dispatcher (`scripts/loom`'s `loom_cmd_sweep`)
+is one such migrated caller (#4480): it resolves the repo's `spawn-worker.sh` and
+execs `spawn-worker.sh -p "/loom:sweep <N>" --dangerously-skip-permissions`
+instead of `claude` directly, so a Codex-hosted (or any non-Claude) operator can
+dispatch the canonical single-issue lifecycle. With nothing configured this stays
+byte-for-byte the old `claude -p ... --dangerously-skip-permissions` invocation
+(via `spawn-worker.sh` → `spawn-claude.sh`). The daemon's own
+`sweep_registry.rs` dispatch still defaults straight to `spawn-claude.sh` — a
+sibling gap tracked separately, deliberately out of #4480's scope.
+
 ### Runtime resolution (precedence)
 
 The runtime is resolved with the standard Loom precedence chain
