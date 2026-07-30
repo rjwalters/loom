@@ -234,6 +234,19 @@ show_help() {
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# harvest_plist_env / harvest_unit_env (used by perform_relaunch /
+# perform_systemd_relaunch below) live in lib/daemon-env-harvest.sh (#4581) so
+# scripts/loom's loom_cmd_restart() bare-exec fallback can apply the identical
+# harvest-and-preserve pattern from a single source instead of a second copy.
+_LOOM_ENV_HARVEST_LIB="$SCRIPT_DIR/../lib/daemon-env-harvest.sh"
+if [[ -r "$_LOOM_ENV_HARVEST_LIB" ]]; then
+    # shellcheck source=/dev/null
+    source "$_LOOM_ENV_HARVEST_LIB"
+else
+    err "daemon-env-harvest.sh not found at $_LOOM_ENV_HARVEST_LIB — this checkout is missing an expected lib file."
+    exit 1
+fi
+
 # ---------- repo root ----------
 find_repo_root() {
     local dir="$PWD"
@@ -862,45 +875,10 @@ log_launchd_diagnostics() {
 # hardcodes the two supervised keys), preserving the live plist's autonomy/auth
 # env, and to stop the old daemon gracefully so sweep children reparent.
 
-# harvest_plist_env <plist> — echo the live plist's EnvironmentVariables,
-# restricted to exactly the keys render_launchd_plist itself forwards (LOOM_*,
-# GH_TOKEN, GITEA_TOKEN, FORGE_TOKEN) and EXCLUDING:
-#   - PATH / HOME     (start.sh resolves PATH deterministically -- a pinned
-#                      canonical minimal PATH by default, or an explicit
-#                      LOOM_DAEMON_PATH / LOOM_DAEMON_PATH_EXTRA override,
-#                      #4172; round-tripping the plist's PATH here would
-#                      re-introduce the non-deterministic-render bug),
-#   - LOOM_DAEMON_SUPERVISOR (start.sh hardcodes it; re-exporting is pointless).
-# Emits one "<key>\t<base64(value)>" line per key so values containing spaces or
-# newlines survive. Fails loudly (return 2) when the plist is absent or
-# unparseable — it must NEVER silently return an empty set, which would let the
-# re-render narrow the autonomy flags to FLAGS-OFF defaults (the #4011 class).
-harvest_plist_env() {
-    local plist="$1"
-    if [[ ! -f "$plist" ]]; then
-        err "Cannot harvest launchd env: plist not found at $plist"
-        return 2
-    fi
-    if ! command -v plutil >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
-        err "Cannot harvest launchd env: plutil and jq are both required on the macOS launchd path."
-        return 2
-    fi
-    local json
-    json=$(plutil -convert json -o - "$plist" 2>/dev/null) || {
-        err "Cannot harvest launchd env: plist at $plist is not parseable by plutil."
-        return 2
-    }
-    printf '%s' "$json" | jq -r '
-        .EnvironmentVariables // {}
-        | to_entries[]
-        | select(.key | test("^(LOOM_[A-Za-z0-9_]*|GH_TOKEN|GITEA_TOKEN|FORGE_TOKEN)$"))
-        | select(.key != "LOOM_DAEMON_SUPERVISOR")
-        | .key + "\t" + (.value | @base64)
-    ' 2>/dev/null || {
-        err "Cannot harvest launchd env: failed to extract EnvironmentVariables from $plist."
-        return 2
-    }
-}
+# harvest_plist_env is defined in lib/daemon-env-harvest.sh (#4581, sourced
+# near the top of this script) — shared with scripts/loom's loom_cmd_restart()
+# bare-exec fallback so both call sites apply the identical harvest-and-
+# preserve pattern from one source instead of two drifting copies.
 
 # perform_relaunch <plist> <service> — re-render the LaunchAgent and relaunch it
 # under launchd supervision, preserving the live plist's autonomy/auth env.
@@ -953,37 +931,9 @@ perform_relaunch() {
     "$START_SCRIPT"
 }
 
-# harvest_unit_env <unit_path> — echo the live systemd unit's `Environment=`
-# lines, restricted to exactly the keys render_systemd_unit itself forwards
-# (LOOM_*, GH_TOKEN, GITEA_TOKEN, FORGE_TOKEN) and EXCLUDING:
-#   - PATH / HOME     (start.sh resolves PATH deterministically, mirroring the
-#                      launchd plist path — round-tripping the unit's PATH here
-#                      would re-introduce the non-deterministic-render bug),
-#   - LOOM_DAEMON_SUPERVISOR (start.sh hardcodes it; re-exporting is pointless).
-# Emits one "<key>\t<value>" line per key (a systemd `Environment=KEY=VALUE`
-# line is single-valued, unlike the plist's XML dict, so no base64 round-trip is
-# needed here). Fails loudly (return 2) when the unit file is absent — it must
-# NEVER silently return an empty set, which would let the re-render narrow the
-# autonomy flags to FLAGS-OFF defaults (the #4011 class).
-harvest_unit_env() {
-    local unit_path="$1"
-    if [[ ! -f "$unit_path" ]]; then
-        err "Cannot harvest systemd unit env: unit file not found at $unit_path"
-        return 2
-    fi
-    local line rest key value
-    while IFS= read -r line; do
-        [[ "$line" == Environment=* ]] || continue
-        rest="${line#Environment=}"
-        key="${rest%%=*}"
-        value="${rest#*=}"
-        case "$key" in
-            LOOM_DAEMON_SUPERVISOR) continue ;;
-            LOOM_*|GH_TOKEN|GITEA_TOKEN|FORGE_TOKEN) printf '%s\t%s\n' "$key" "$value" ;;
-            *) continue ;;
-        esac
-    done < "$unit_path"
-}
+# harvest_unit_env is defined in lib/daemon-env-harvest.sh (#4581, sourced
+# near the top of this script) — see the harvest_plist_env pointer comment
+# above perform_relaunch for why it moved.
 
 # perform_systemd_relaunch <unit_path> <unit> — re-render the systemd --user
 # unit and relaunch it under supervision, preserving the live unit's
