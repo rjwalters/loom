@@ -483,10 +483,10 @@ pub fn build_plan(config: &AddWorkerConfig, secrets: &Secrets) -> Plan {
         render_workspace_register(&config.repos, config.priority),
     ));
 
-    // 8. Start the daemon under a systemd --user unit (Restart=on-failure, linger).
+    // 8. Start the daemon under a systemd --user unit (Restart=on-success, linger).
     plan.push_step(Step::new(
         "daemon-unit",
-        "install + enable the loom-daemon systemd --user unit (linger, Restart=on-failure)",
+        "install + enable the loom-daemon systemd --user unit (linger, Restart=on-success, LOOM_DAEMON_SUPERVISOR=systemd)",
         Some("systemctl --user is-enabled loom-daemon.service >/dev/null 2>&1".to_string()),
         render_daemon_unit(&primary_rel),
     ));
@@ -871,6 +871,19 @@ export PATH="$HOME/.local/bin:$PATH"
 fn render_daemon_unit(primary_rel: &str) -> String {
     // WorkingDirectory pinned to a workspace clone is the #4292 token-pool cwd
     // workaround — REMOVE once #4292 lands (token pool no longer cwd-coupled).
+    //
+    // Restart=on-success + Environment=LOOM_DAEMON_SUPERVISOR=systemd mirror the
+    // canonical systemd --user unit rendered by `render_systemd_unit()` in
+    // `loom-daemon-start.sh` (#4268) — the same supervised-restart contract
+    // documented in `ipc.rs` (`detect_supervisor` / `EXIT_RESTART` /
+    // `EXIT_SIGINT` / `EXIT_SHUTDOWN`, #4054). `LOOM_DAEMON_SUPERVISOR=systemd`
+    // lets the daemon prove it is supervised before `restart --drain` exits it
+    // (#4640); `Restart=on-success` relaunches ONLY on the clean `EXIT_RESTART`
+    // (exit 0) the restart primitive uses, and leaves the daemon down on
+    // `EXIT_SIGINT` (130) / `EXIT_SHUTDOWN` (143) / a crash — deliberately NOT
+    // `Restart=on-failure`, which would do the opposite (never relaunch a
+    // requested restart, but crash-loop-relaunch is watchdog territory the
+    // fleet unit does not attempt).
     format!(
         r#"set -e
 export PATH="$HOME/.local/bin:$PATH"
@@ -889,9 +902,15 @@ Type=simple
 # lands.
 WorkingDirectory=%h/{primary_rel}
 ExecStart=%h/.local/bin/loom-daemon
-Restart=on-failure
-RestartSec=5
+# Restart=on-success == the launchd KeepAlive:{{SuccessfulExit:true}} analog
+# (#4054, mirrored from loom-daemon-start.sh's render_systemd_unit): only the
+# clean EXIT_RESTART (0) relaunches; EXIT_SIGINT (130) / EXIT_SHUTDOWN (143) /
+# a crash all exit non-zero and stay down.
+Restart=on-success
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Lets detect_supervisor() (ipc.rs) prove this daemon is supervised so
+# `restart --drain` will actually exit for a relaunch instead of refusing.
+Environment=LOOM_DAEMON_SUPERVISOR=systemd
 
 [Install]
 WantedBy=default.target
@@ -1706,8 +1725,49 @@ mod tests {
             .apply
             .contains("WorkingDirectory=%h/loom-workspaces/anvil"));
         assert!(step.apply.contains("#4292"), "workaround must be marked with #4292");
-        assert!(step.apply.contains("Restart=on-failure"));
+        assert!(step.apply.contains("Restart=on-success"));
         assert!(step.apply.contains("enable-linger"));
+    }
+
+    #[test]
+    fn daemon_unit_sets_supervisor_env_and_correct_restart_policy() {
+        // #4640: without LOOM_DAEMON_SUPERVISOR=systemd, detect_supervisor()
+        // (ipc.rs) can't tell the fleet daemon is systemd-supervised, so
+        // `restart --drain` refuses on every fleet worker. Restart=on-failure
+        // additionally inverts the exit-code contract: it never relaunches on
+        // the restart primitive's clean exit 0, and (had it been changed to
+        // `always` instead) would incorrectly relaunch on EXIT_SHUTDOWN (143).
+        // Restart=on-success mirrors the canonical `render_systemd_unit()` in
+        // loom-daemon-start.sh (#4268) and gets both right.
+        let config = base_config();
+        let plan = build_plan(&config, &Secrets::default());
+        let step = plan
+            .entries
+            .iter()
+            .find_map(|e| match e {
+                super::super::PlanEntry::Step(s) if s.name == "daemon-unit" => Some(s),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            step.apply
+                .contains("Environment=LOOM_DAEMON_SUPERVISOR=systemd"),
+            "rendered unit must set LOOM_DAEMON_SUPERVISOR=systemd so detect_supervisor() \
+             recognizes the fleet daemon as supervised"
+        );
+        assert!(
+            step.apply.contains("Restart=on-success"),
+            "rendered unit must use Restart=on-success (the EXIT_RESTART/EXIT_SIGINT/\
+             EXIT_SHUTDOWN contract), not Restart=on-failure or Restart=always"
+        );
+        assert!(
+            !step.apply.contains("Restart=on-failure"),
+            "the old Restart=on-failure policy must be fully replaced"
+        );
+        assert!(
+            step.summary.contains("Restart=on-success"),
+            "step summary must match the rendered policy"
+        );
     }
 
     #[test]

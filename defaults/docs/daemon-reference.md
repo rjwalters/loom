@@ -505,10 +505,13 @@ the plan/ordering/checklist; the per-phase shell is rendered in
 6. **workspace-clone** — `gh repo clone` each `--repo` + `loom-daemon init`
    (installs the `/loom:sweep` command, #4027).
 7. **workspace-register** — `loom-daemon workspace add` each repo at `--priority`.
-8. **daemon-unit** — a systemd `--user` unit (`Restart=on-failure`,
-   `loginctl enable-linger`). `WorkingDirectory=` is pinned to a workspace clone
-   as the **#4292** token-pool-cwd workaround — the rendered unit carries a
-   `#4292` marker so it is removed when that lands.
+8. **daemon-unit** — a systemd `--user` unit (`Restart=on-success`,
+   `Environment=LOOM_DAEMON_SUPERVISOR=systemd`, `loginctl enable-linger`) —
+   mirroring the canonical `render_systemd_unit()` policy in
+   `loom-daemon-start.sh` (#4268) so `restart --drain` (#4090) works on fleet
+   workers (#4640). `WorkingDirectory=` is pinned to a workspace clone as the
+   **#4292** token-pool-cwd workaround — the rendered unit carries a `#4292`
+   marker so it is removed when that lands.
 9. **idle-shutdown** (optional, `--idle-shutdown-minutes N`) — a cron guard that
    powers the host off after N idle minutes. This is stage 2:
    `autonomous.idleExit` is stage 1. On daemon-managed hosts use a short guard
@@ -539,6 +542,25 @@ operator otherwise tracks by hand: `provider_instance_id`, `tailnet_name`,
 `added_by`, and a lifecycle `state` (`fleet drain`'s `"draining"` sentinel,
 #4343) — all `#[serde(default)]`/`Option`, so an older registry file keeps
 parsing.
+
+**Retrofitting a worker provisioned before #4640**: an older `daemon-unit` step
+rendered `Restart=on-failure` with no `LOOM_DAEMON_SUPERVISOR` at all, so
+`loom-daemon restart --drain` refuses on it ("no supervisor detected") even
+though systemd IS managing it. Either re-run `fleet add-worker` against the
+host (the `daemon-unit` step overwrites the unit unconditionally via `cat >`,
+so a re-run fully re-syncs it), or apply a drop-in by hand over ssh without a
+full re-provision:
+
+```bash
+mkdir -p ~/.config/systemd/user/loom-daemon.service.d
+printf '[Service]\nEnvironment=LOOM_DAEMON_SUPERVISOR=systemd\nRestart=on-success\n' \
+  > ~/.config/systemd/user/loom-daemon.service.d/supervisor.conf
+systemctl --user daemon-reload
+```
+
+A systemd drop-in's `Environment=` is additive and its `Restart=` overrides the
+base unit, so this one file fixes both defects (the missing supervisor env and
+the wrong restart policy) without touching the rendered base unit.
 
 ### `fleet status [--json]` (#4342)
 
@@ -2332,10 +2354,14 @@ recovery do. On either trigger the daemon writes
 `<loom-dir>/idle-exit.json`, publishes `daemon.idle_exit`, removes its socket,
 and exits 0. It never calls `shutdown`, `sudo`, or a provider API.
 
-The fleet add-worker systemd unit uses `Restart=on-failure`, so exit 0 stays
-down. macOS launchd uses `KeepAlive:SuccessfulExit`, so exit 0 relaunches the
-daemon; idle exit is meaningful only under on-failure-style supervision. A
-loud warning is logged when it is enabled under launchd.
+The fleet add-worker systemd unit uses `Restart=on-success` (#4640, matching
+`loom-daemon-start.sh`'s canonical unit), so exit 0 relaunches — same as macOS
+launchd's `KeepAlive:SuccessfulExit`. Idle exit is only meaningful under
+on-failure-style supervision (e.g. a non-systemd/nohup Linux host); enabling it
+on a fleet worker or under launchd defeats its own purpose, since the
+supervisor immediately relaunches the daemon it just exited. A loud warning is
+logged when it is enabled under launchd; the same caveat applies to any
+systemd-supervised daemon (fleet workers included).
 
 ### Daemon log path override (`LOOM_DAEMON_LOG`, #4010)
 

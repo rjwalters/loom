@@ -144,7 +144,13 @@ pub fn build_restart_decision() -> (Response, bool) {
                     (LOOM_DAEMON_SUPERVISOR unset). This daemon was not started under \
                     a recognized supervisor (nohup / Linux / --foreground), so nothing \
                     would relaunch it if it exited. Leaving it running. Restart it \
-                    manually with loom-daemon-stop.sh && loom-daemon-start.sh."
+                    manually with loom-daemon-stop.sh && loom-daemon-start.sh. If this IS \
+                    a systemd --user service (e.g. a fleet worker provisioned before #4640), \
+                    retrofit it instead of restarting manually: mkdir -p \
+                    ~/.config/systemd/user/loom-daemon.service.d && printf \
+                    '[Service]\\nEnvironment=LOOM_DAEMON_SUPERVISOR=systemd\\nRestart=on-success\\n' \
+                    > ~/.config/systemd/user/loom-daemon.service.d/supervisor.conf && \
+                    systemctl --user daemon-reload."
                     .to_string(),
             },
             false,
@@ -505,7 +511,12 @@ pub fn handle_drain_request(
                         (LOOM_DAEMON_SUPERVISOR unset). This daemon was not started under \
                         a recognized supervisor, so nothing would relaunch it after a drain. \
                         Dispatch was NOT paused. Restart manually with loom-daemon-stop.sh && \
-                        loom-daemon-start.sh."
+                        loom-daemon-start.sh. If this IS a systemd --user service (e.g. a \
+                        fleet worker provisioned before #4640), retrofit it instead: mkdir -p \
+                        ~/.config/systemd/user/loom-daemon.service.d && printf \
+                        '[Service]\\nEnvironment=LOOM_DAEMON_SUPERVISOR=systemd\\nRestart=on-success\\n' \
+                        > ~/.config/systemd/user/loom-daemon.service.d/supervisor.conf && \
+                        systemctl --user daemon-reload."
                         .to_string(),
                     then_exit,
                 };
@@ -5282,10 +5293,21 @@ exit 0
             Response::DaemonRestart {
                 scheduled,
                 supervisor,
-                ..
+                message,
             } => {
                 assert!(!scheduled);
                 assert!(supervisor.is_none());
+                // #4640: the refusal must mention the systemd retrofit for a
+                // fleet worker provisioned before the fix (missing
+                // LOOM_DAEMON_SUPERVISOR despite being systemd-supervised).
+                assert!(
+                    message.contains("LOOM_DAEMON_SUPERVISOR=systemd"),
+                    "restart refusal must mention the systemd retrofit: {message}"
+                );
+                assert!(
+                    message.contains("Restart=on-success"),
+                    "restart refusal retrofit hint must include the corrected Restart= policy: {message}"
+                );
             }
             other => panic!("Expected DaemonRestart, got: {other:?}"),
         }
@@ -6366,10 +6388,22 @@ exit 0
             Response::DaemonDrain {
                 accepted,
                 supervisor,
+                message,
                 ..
             } => {
                 assert!(!accepted, "unsupervised host must refuse the drain");
                 assert!(supervisor.is_none());
+                // #4640: the refusal must mention the systemd retrofit for a
+                // fleet worker provisioned before the fix (missing
+                // LOOM_DAEMON_SUPERVISOR despite being systemd-supervised).
+                assert!(
+                    message.contains("LOOM_DAEMON_SUPERVISOR=systemd"),
+                    "drain refusal must mention the systemd retrofit: {message}"
+                );
+                assert!(
+                    message.contains("Restart=on-success"),
+                    "drain refusal retrofit hint must include the corrected Restart= policy: {message}"
+                );
             }
             other => panic!("expected DaemonDrain, got {other:?}"),
         }
