@@ -332,9 +332,10 @@ Claude session makes while it works an issue. What bounds those is admission
 control — `autonomous.workFinder.maxConcurrent` and the token / disk terms
 folded into the same `min(...)` ceiling (the fourth cpu/load term was deleted in
 #4512 — see [`daemon-reference.md`](daemon-reference.md)) — which caps how many
-sessions exist at once on a host. A hand-rolled loop has no equivalent: N shells started
-by hand are N unbounded `gh` consumers, and nothing coordinates them across the
-other projects sharing the same machine and the same `gh auth` login.
+sessions exist at once on a host. A hand-rolled loop has no equivalent: N
+shells started by hand are N unbounded `gh` consumers, and nothing
+coordinates them across the other projects sharing the same machine and the
+same `gh auth` login.
 
 ### Recommendation: dispatch through the daemon
 
