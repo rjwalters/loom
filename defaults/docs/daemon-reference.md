@@ -3480,6 +3480,17 @@ its launchd label) that no daemon is still alive after the stop and exits non-ze
 if one is, closing the silent-success hole where a failed bootout could leave a
 relaunched daemon dispatching.
 
+**Startup failures end the process directly (#4531).** A daemon that cannot start
+— most visibly the singleton guard's "another loom-daemon is already listening …
+— refusing to start" refusal (#3806) — prints that error to stderr and calls
+`std::process::exit(1)` itself rather than returning `Err` out of `main`. The
+message and the exit code are exactly what `Termination for Result` used to
+produce; what changes is that termination is now *immediate*. Returning `Err`
+made `#[tokio::main]` drop its `Runtime`, which blocks until every in-flight
+`spawn_blocking` task finishes — so a refusing second daemon kept running its
+already-spawned periodic loops for ~10s after announcing it would not start, long
+enough to look like a hang under any short timeout.
+
 ### Autonomy-loss watchdog + heartbeat (#4011)
 
 **The failure this closes.** On 2026-07-26 the `loom-daemon` launchd job took a
