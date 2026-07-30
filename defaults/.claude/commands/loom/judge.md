@@ -253,7 +253,7 @@ fi
    fi
    ```
 4. **Understand context**: Read PR description and linked issues
-5. **Check out code**: Use existing worktree or `gh pr checkout` (see Worktree-Aware Code Access below)
+5. **Check out code**: Use the existing builder worktree, else `./.loom/scripts/pr-worktree.sh <number>` — never a bare `gh pr checkout` in the main checkout (see "PR Branch Isolation" and Worktree-Aware Code Access below)
 6. **Rebase check**: Verify PR is up-to-date with main (see Rebase Check section below)
 7. **Run quality checks**: Tests, lints, type checks, build (use Scoped Test Execution — see section below)
 7b. **Execute test plan**: Parse PR description for "## Test Plan" section.

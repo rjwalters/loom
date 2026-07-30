@@ -135,18 +135,51 @@ if [[ -n "$pr_branches" ]]; then
     echo
 
     # Reuse merge-pr.sh's `_maybe_delete_local_branch` (tip-SHA-verified
-    # safety check around lines 1449-1521) instead of duplicating it. Extract
-    # the real function body from the live source so the two never drift —
+    # safety check around lines 1493-1568) instead of duplicating it. Extract
+    # the real function bodies from the live source so the two never drift —
     # the same technique defaults/scripts/tests/test-merge-pr-local-branch-cleanup.sh
     # uses to test it.
     MERGE_PR_SCRIPT="$SCRIPT_DIR/merge-pr.sh"
-    _MAYBE_DELETE_FN=""
-    if [[ -f "$MERGE_PR_SCRIPT" ]]; then
-        _MAYBE_DELETE_FN="$(awk '
-            $0 ~ "^_maybe_delete_local_branch\\(\\) \\{" { grab=1 }
+
+    # Extract one top-level function definition verbatim from a shell script.
+    # merge-pr.sh defines every function at column 0 with its closing brace
+    # also at column 0, so "first `^}` after the opening line" is exact.
+    _extract_shell_fn() {
+        local fn_name="$1" src="$2"
+        awk -v fn="$fn_name" '
+            $0 ~ "^" fn "\\(\\) \\{" { grab=1 }
             grab { print }
             grab && /^}/ { exit }
-        ' "$MERGE_PR_SCRIPT")"
+        ' "$src"
+    }
+
+    _MAYBE_DELETE_FN=""
+    # _maybe_delete_local_branch's delete-refusal path calls these three
+    # helpers (merge-pr.sh, #4171) to distinguish "checked out in the primary
+    # checkout" from "checked out in some other worktree". They must be
+    # extracted alongside it — otherwise a merged/closed PR whose `pr-<N>`
+    # branch is still checked out in a live review worktree (exactly the
+    # population this pass targets) aborts the whole script with
+    # `_find_worktree_by_branch: command not found` under `set -e` (#4405).
+    _MAYBE_DELETE_DEPS=(_primary_worktree_path _is_primary_worktree_path _find_worktree_by_branch)
+    _MAYBE_DELETE_DEP_FNS=""
+    if [[ -f "$MERGE_PR_SCRIPT" ]]; then
+        _MAYBE_DELETE_FN="$(_extract_shell_fn _maybe_delete_local_branch "$MERGE_PR_SCRIPT")"
+        for _dep_fn in "${_MAYBE_DELETE_DEPS[@]}"; do
+            _dep_src="$(_extract_shell_fn "$_dep_fn" "$MERGE_PR_SCRIPT")"
+            if [[ -n "$_dep_src" ]]; then
+                _MAYBE_DELETE_DEP_FNS+="$_dep_src"$'\n'
+            else
+                # Upstream renamed/removed the helper: degrade to the generic
+                # "checked out somewhere" warning instead of crashing. Both
+                # shims are safe under `set -e` — the path shims print nothing
+                # and succeed, and the predicate is only used as an `if` test.
+                case "$_dep_fn" in
+                    _is_primary_worktree_path) _MAYBE_DELETE_DEP_FNS+="$_dep_fn() { return 1; }"$'\n' ;;
+                    *)                         _MAYBE_DELETE_DEP_FNS+="$_dep_fn() { :; }"$'\n' ;;
+                esac
+            fi
+        done
     fi
 
     if [[ -z "$_MAYBE_DELETE_FN" ]]; then
@@ -159,9 +192,11 @@ if [[ -n "$pr_branches" ]]; then
         # shellcheck disable=SC2317  # invoked indirectly via the evaluated function
         error() { echo -e "${RED}✗${NC} $*" >&2; return 1; }
 
-        eval "$_MAYBE_DELETE_FN"
-
+        # REPO_ROOT / DEFAULT_BRANCH_NAME are read by the evaluated bodies, so
+        # they must be set before the first call (not before the eval itself).
+        # shellcheck disable=SC2034  # read inside the evaluated merge-pr.sh function bodies
         REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+        # shellcheck disable=SC2034  # read inside the evaluated _maybe_delete_local_branch body
         DEFAULT_BRANCH_NAME=""
         if [[ -f "$SCRIPT_DIR/lib/default-branch.sh" ]]; then
             # shellcheck source=lib/default-branch.sh
@@ -169,6 +204,9 @@ if [[ -n "$pr_branches" ]]; then
             # shellcheck disable=SC2034  # read inside the evaluated _maybe_delete_local_branch body
             DEFAULT_BRANCH_NAME="$(cd "$REPO_ROOT" && loom_default_branch 2>/dev/null || true)"
         fi
+
+        eval "$_MAYBE_DELETE_DEP_FNS"
+        eval "$_MAYBE_DELETE_FN"
 
         for branch in $pr_branches; do
             pr_num=$(echo "$branch" | sed -E 's/^pr-?([0-9]+).*/\1/')

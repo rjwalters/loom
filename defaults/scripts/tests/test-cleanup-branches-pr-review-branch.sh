@@ -22,6 +22,14 @@
 #          only — unaffected by the new pr-* pass (no double-processing).
 #      (d) --dry-run reports the merged-PR branch as "would delete" without
 #          actually deleting it.
+#      (e) a merged-PR branch that is still checked out in a LINKED worktree
+#          exercises _maybe_delete_local_branch's delete-refusal path (which
+#          calls _find_worktree_by_branch / _is_primary_worktree_path): the
+#          run must not abort, the branch must be kept, and the remaining
+#          branches must still be processed.
+#      (f) a merged-PR branch that is the PRIMARY checkout's own HEAD takes
+#          _is_primary_worktree_path's specialized remediation path (which
+#          also reads $DEFAULT_BRANCH_NAME) without aborting.
 #
 # Companion to test-merge-pr-local-branch-cleanup.sh, which tests
 # `_maybe_delete_local_branch` itself (the safety check this script reuses).
@@ -58,11 +66,25 @@ echo "Test 1: cleanup-branches.sh source contains the #4405 pr-* review-branch w
 
 assert_grep "grep -E '\\^pr-\\?\\[0-9\\]\\+\\(-\\.\\*\\)\\?\\\$'" "$CLEANUP_SCRIPT" \
     "discovers pr-<N> / pr<N>-* / pr-<N>-* branches via the shared regex"
-if grep -qF '_MAYBE_DELETE_FN="$(awk '"'"'' "$CLEANUP_SCRIPT" && grep -qF '_maybe_delete_local_branch' "$CLEANUP_SCRIPT"; then
+if grep -qF '_MAYBE_DELETE_FN="$(_extract_shell_fn _maybe_delete_local_branch' "$CLEANUP_SCRIPT"; then
     pass "extracts the real _maybe_delete_local_branch() function body from merge-pr.sh (no duplication)"
 else
     fail "extracts the real _maybe_delete_local_branch() function body from merge-pr.sh (no duplication)"
 fi
+# The refusal path inside _maybe_delete_local_branch calls these (#4171); if
+# they are not extracted too the script dies with "command not found" (#4405).
+for dep_fn in _primary_worktree_path _is_primary_worktree_path _find_worktree_by_branch; do
+    if grep -qF "$dep_fn" "$CLEANUP_SCRIPT"; then
+        pass "extracts _maybe_delete_local_branch's transitive helper $dep_fn"
+    else
+        fail "extracts _maybe_delete_local_branch's transitive helper $dep_fn"
+    fi
+    if grep -qE "^${dep_fn}\(\) \{" "$MERGE_PR_SCRIPT"; then
+        pass "$dep_fn is still a top-level function in merge-pr.sh (extraction target intact)"
+    else
+        fail "$dep_fn is no longer a top-level function in merge-pr.sh — update the extraction list"
+    fi
+done
 assert_grep '_maybe_delete_local_branch "\$branch" "\$pr_head_sha"' "$CLEANUP_SCRIPT" \
     "invokes the extracted helper with the PR's head SHA for the tip-match safety check"
 assert_grep 'pr view "\$pr_num" --json state,headRefOid' "$CLEANUP_SCRIPT" \
@@ -130,6 +152,8 @@ if [[ "\$1" == "pr" && "\$2" == "view" ]]; then
   case "\$3" in
     100) echo '{"state":"MERGED","headRefOid":"$HEAD_SHA"}' ;;
     101) echo '{"state":"MERGED","headRefOid":"$HEAD_SHA"}' ;;
+    102) echo '{"state":"MERGED","headRefOid":"$HEAD_SHA"}' ;;
+    103) echo '{"state":"CLOSED","headRefOid":"$HEAD_SHA"}' ;;
     200) echo '{"state":"OPEN","headRefOid":"$HEAD_SHA"}' ;;
     *) exit 1 ;;
   esac
@@ -186,6 +210,97 @@ else
     fail "(d) expected a dry-run preview mentioning pr-101; got: $dry_output"
 fi
 git -C "$REPO" branch -D pr-101 >/dev/null 2>&1 || true
+
+# --- (e): merged-PR branch checked out in a LINKED worktree exercises
+#     _maybe_delete_local_branch's delete-refusal path. That path calls
+#     _find_worktree_by_branch / _is_primary_worktree_path (merge-pr.sh,
+#     #4171); if cleanup-branches.sh only extracts _maybe_delete_local_branch
+#     itself, the run dies with "_find_worktree_by_branch: command not found"
+#     (exit 127) under `set -e`, aborting the whole cleanup mid-pass.
+git -C "$REPO" branch pr-102 main
+git -C "$REPO" worktree add -q "$TMP_ROOT/wt-102" pr-102 >/dev/null 2>&1
+# A second, deletable branch AFTER pr-102 alphabetically proves the run did
+# not abort partway through the pr-* loop.
+git -C "$REPO" branch pr-103 main
+
+set +e
+refusal_output="$(cd "$REPO" && PATH="$FAKE_BIN:$PATH" ./scripts/cleanup-branches.sh 2>&1)"
+refusal_rc=$?
+set -e
+
+if [[ $refusal_rc -eq 0 ]]; then
+    pass "(e) run exits 0 when a merged-PR branch is checked out in a linked worktree"
+else
+    fail "(e) run exited $refusal_rc (expected 0); got: $refusal_output"
+fi
+
+if [[ "$refusal_output" != *"command not found"* ]]; then
+    pass "(e) no missing-helper 'command not found' in the delete-refusal path"
+else
+    fail "(e) delete-refusal path hit a missing helper; got: $refusal_output"
+fi
+
+if git -C "$REPO" show-ref --verify --quiet refs/heads/pr-102; then
+    pass "(e) branch checked out in a linked worktree is kept, not force-deleted"
+else
+    fail "(e) pr-102 was deleted despite being checked out in a linked worktree"
+fi
+
+if [[ "$refusal_output" == *"Could not delete local branch 'pr-102'"* ]]; then
+    pass "(e) reports the refusal with the checked-out explanation"
+else
+    fail "(e) expected a 'Could not delete local branch' warning for pr-102; got: $refusal_output"
+fi
+
+if ! git -C "$REPO" show-ref --verify --quiet refs/heads/pr-103; then
+    pass "(e) the pr-* loop continues past the refusal (pr-103 still processed)"
+else
+    fail "(e) pr-103 was not processed — the loop aborted at the refusal"
+fi
+
+if [[ "$refusal_output" == *"Kept (unsafe to force-delete)"* ]]; then
+    pass "(e) summary counts the refused branch under 'Kept (unsafe to force-delete)'"
+else
+    fail "(e) expected an unsafe-kept summary line; got: $refusal_output"
+fi
+
+git -C "$REPO" worktree remove --force "$TMP_ROOT/wt-102" >/dev/null 2>&1 || true
+git -C "$REPO" branch -D pr-102 >/dev/null 2>&1 || true
+
+# --- (f): merged-PR branch that is the PRIMARY checkout's own HEAD takes
+#     _is_primary_worktree_path's specialized remediation path, which also
+#     reads $DEFAULT_BRANCH_NAME. Same crash class as (e) if the helpers
+#     aren't extracted, plus it proves DEFAULT_BRANCH_NAME reaches the
+#     evaluated body (it is only referenced there, hence the SC2034 waiver).
+git -C "$REPO" checkout -q -b pr-104 main
+sed -i.bak 's/^    102)/    104) echo '"'"'{"state":"MERGED","headRefOid":"'"$HEAD_SHA"'"}'"'"' ;;\n    102)/' "$FAKE_BIN/gh"
+rm -f "$FAKE_BIN/gh.bak"
+
+set +e
+primary_output="$(cd "$REPO" && PATH="$FAKE_BIN:$PATH" ./scripts/cleanup-branches.sh 2>&1)"
+primary_rc=$?
+set -e
+
+if [[ $primary_rc -eq 0 ]]; then
+    pass "(f) run exits 0 when the merged-PR branch is the primary checkout's HEAD"
+else
+    fail "(f) run exited $primary_rc (expected 0); got: $primary_output"
+fi
+
+if git -C "$REPO" show-ref --verify --quiet refs/heads/pr-104; then
+    pass "(f) the primary checkout's own HEAD branch is kept, not force-deleted"
+else
+    fail "(f) pr-104 was deleted while checked out in the primary checkout"
+fi
+
+if [[ "$primary_output" == *"primary repository checkout"* ]] && [[ "$primary_output" == *"branch -D pr-104"* ]]; then
+    pass "(f) emits the primary-checkout two-step remediation (uses \$DEFAULT_BRANCH_NAME)"
+else
+    fail "(f) expected the primary-checkout remediation for pr-104; got: $primary_output"
+fi
+
+git -C "$REPO" checkout -q main
+git -C "$REPO" branch -D pr-104 >/dev/null 2>&1 || true
 
 # --- Summary ---
 echo ""
