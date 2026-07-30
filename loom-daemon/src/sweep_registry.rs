@@ -51,10 +51,12 @@
 //! after a daemon restart wipes this in-memory registry. See
 //! [`crate::claim_reconciliation`] for the startup consumer.
 
+use crate::capacity;
 use crate::event_bus::EventBus;
 use crate::peer_claims::{self, ClaimAd, PeerClaimView};
 use crate::quarantine_reconciliation;
 use crate::sweep_journal;
+use crate::sweep_outcomes;
 use crate::tokens_pool::bad_tokens;
 use crate::tokens_pool::{self, AccountId, AccountProvider, TerminalClassification};
 use crate::types::{Event, SweepId, SweepInfo, SweepKind, SweepOutcome, SweepState};
@@ -1840,14 +1842,35 @@ fn classify_account_exhaustion(log_tail: &str) -> Option<&'static str> {
 fn preflight_death_signatures() -> &'static [(&'static str, Regex)] {
     static SIGS: OnceLock<Vec<(&'static str, Regex)>> = OnceLock::new();
     SIGS.get_or_init(|| {
-        vec![(
-            "preflight-mcp-failed",
-            // Emitted by claude-wrapper.sh's MCP-init pre-flight check right
-            // before it bails without ever exec'ing the CLI. Case-sensitive:
-            // a literal sentinel token, not free-form prose (mirrors
-            // `RATE_LIMIT_ABORT` in `exhaustion_signatures`).
-            Regex::new(r"#\s*MCP_PREFLIGHT_FAILED").expect("valid static preflight regex"),
-        )]
+        vec![
+            (
+                "preflight-mcp-failed",
+                // Emitted by claude-wrapper.sh's MCP-init pre-flight check right
+                // before it bails without ever exec'ing the CLI. Case-sensitive:
+                // a literal sentinel token, not free-form prose (mirrors
+                // `RATE_LIMIT_ABORT` in `exhaustion_signatures`).
+                Regex::new(r"#\s*MCP_PREFLIGHT_FAILED").expect("valid static preflight regex"),
+            ),
+            (
+                // Issue #4644: `spawn-claude.sh`'s "Token selection" step exits
+                // 78 (`EX_CONFIG`) on any of three distinct failures — no
+                // `loom-daemon` binary supporting `tokens select`, the select
+                // subcommand itself failing (typically an empty/exhausted
+                // pool), or a selection that resolved to an empty key — before
+                // ever touching the CLI. Matching this exact prose gives the
+                // reaper a machine-readable `token_selection_failed`-shaped
+                // label distinct from the generic absence-based
+                // `preflight-no-cli-start` fallback below, so a durable
+                // journal reader (or an operator) can tell "the token pool
+                // itself is the problem" apart from other pre-flight causes
+                // (a stale `.mcp.json`, etc.) without reading log prose.
+                "preflight-token-selection-failed",
+                Regex::new(
+                    r"(?i)token selection failed|token selection returned an empty key|no loom-daemon binary supporting 'tokens select'",
+                )
+                .expect("valid static token-selection preflight regex"),
+            ),
+        ]
     })
 }
 
@@ -2081,6 +2104,15 @@ pub struct SweepRegistryConfig {
     /// tempdir path so `dispatch`/reap never touch the real machine-level
     /// file.
     pub journal_path: Option<PathBuf>,
+    /// Override the durable terminal-outcomes journal path (Issue #4644).
+    /// Defaults to [`sweep_outcomes::default_outcomes_path`]
+    /// (`<workspace_root>/.loom/logs/sweep-outcomes.jsonl`,
+    /// env-overridable via `LOOM_SWEEP_OUTCOMES_JOURNAL_PATH`). Tests set this
+    /// to a tempdir path so terminal-outcome recording never touches a real
+    /// workspace's log directory. Unlike [`journal_path`](Self::journal_path)
+    /// (a machine-level, upsert-keyed liveness snapshot), this is a per-
+    /// workspace, append-only history of every terminal sweep outcome.
+    pub outcomes_journal_path: Option<PathBuf>,
 }
 
 impl SweepRegistryConfig {
@@ -2093,6 +2125,7 @@ impl SweepRegistryConfig {
             gh_bin: None,
             skip_label_flip: false,
             journal_path: None,
+            outcomes_journal_path: None,
         }
     }
 
@@ -2103,6 +2136,16 @@ impl SweepRegistryConfig {
             return Ok(p.clone());
         }
         sweep_journal::default_journal_path()
+    }
+
+    /// Resolve the durable terminal-outcomes journal path (Issue #4644):
+    /// `outcomes_journal_path` explicit override, else
+    /// [`sweep_outcomes::default_outcomes_path`].
+    #[must_use]
+    pub fn resolve_outcomes_journal_path(&self) -> PathBuf {
+        self.outcomes_journal_path
+            .clone()
+            .unwrap_or_else(|| sweep_outcomes::default_outcomes_path(&self.workspace_root))
     }
 
     /// Resolve the spawn binary, preferring (in order):
@@ -2663,7 +2706,11 @@ impl SweepRegistry {
 
     /// Current pre-flight-death advisory state (Issue #4386), for
     /// `DaemonStatusReport`: `(tripped, message)`. `message` is always `None`
-    /// when `tripped` is `false`.
+    /// when `tripped` is `false`. Issue #4644: when a live re-read of
+    /// `.ranking` still confirms zero healthy accounts, the message names
+    /// that specific whole-pool-dead cause instead of the generic streak
+    /// wording — so `loom-daemon status` never reads as a garden-variety
+    /// `.mcp.json` hint while the entire account pool is actually dead.
     #[must_use]
     pub fn preflight_advisory(&self) -> (bool, Option<String>) {
         if !self.preflight_advisory_tripped {
@@ -2673,11 +2720,7 @@ impl SweepRegistry {
             .preflight_death_last_marker
             .as_deref()
             .unwrap_or("unknown");
-        let message = format!(
-            "WARNING: last {} dispatches died at claude-wrapper pre-flight ({marker}) — check \
-             .mcp.json",
-            self.preflight_death_streak
-        );
+        let message = self.preflight_advisory_message(self.preflight_pool_exhausted_now(), marker);
         (true, Some(message))
     }
 
@@ -4136,6 +4179,54 @@ impl SweepRegistry {
         }
     }
 
+    /// Append one line to the durable terminal-outcomes journal (Issue #4644)
+    /// for a single-issue sweep's terminal transition. Called at every site
+    /// that already emits a terminal `SweepExited`/`SweepCrashed` bus event —
+    /// the reaper's dead-child handling in [`reap_once`](Self::reap_once) and
+    /// the operator/watchdog-initiated [`finish_cancel`](Self::finish_cancel)
+    /// — so the record outlives both the in-memory registry's ~1h GC window
+    /// and the in-memory-only event bus.
+    ///
+    /// Best-effort by contract, matching [`journal_remove_best_effort`](Self::journal_remove_best_effort):
+    /// a write failure is logged and swallowed, never allowed to block
+    /// reaping. Deliberately independent of the bus emission's own success —
+    /// the two are separate side effects of the same terminal transition (see
+    /// the `sweep_outcomes` module doc).
+    fn append_outcome_journal(
+        &self,
+        issue: u32,
+        sweep_id: &str,
+        outcome: &str,
+        exit_code: Option<i32>,
+        death_class: Option<String>,
+        duration_sec: i64,
+    ) {
+        let path = self.config.resolve_outcomes_journal_path();
+        let token_name = self
+            .entries
+            .get(sweep_id)
+            .map(|info| info.token_name.clone())
+            .unwrap_or_else(|| UNKNOWN_TOKEN_NAME.to_string());
+        let record = sweep_outcomes::OutcomeRecord {
+            timestamp: Utc::now(),
+            repo: self.config.workspace_root.display().to_string(),
+            issue,
+            sweep_id: sweep_id.to_string(),
+            outcome: outcome.to_string(),
+            exit_code,
+            death_class,
+            token_name,
+            duration_sec,
+        };
+        if let Err(e) = sweep_outcomes::append_outcome(&path, &record) {
+            log::warn!(
+                "sweep_outcomes: failed to append terminal-outcome journal entry for issue \
+                 #{issue} ({sweep_id}) at {}: {e} — best-effort, not blocking reap (#4644)",
+                path.display()
+            );
+        }
+    }
+
     // ------------------------------------------------------------------------
     // Cross-host collision detection (Issue #4085, Phase 0 of #4028)
     // ------------------------------------------------------------------------
@@ -4848,39 +4939,89 @@ impl SweepRegistry {
     /// same dedup discipline `daemon.capacity.advisory` /
     /// `daemon.dispatch.headroom_advisory` use, so this never fires every
     /// tick.
+    ///
+    /// Issue #4644: waiting for `threshold` *consecutive* pre-flight deaths
+    /// (the ordinary #4386 streak gate) is the wrong cadence for the "whole
+    /// account pool is dead" case — when `healthy_accounts == 0`, EVERY
+    /// future dispatch will die identically at token selection, so the very
+    /// FIRST such death already proves it. `pool_exhausted_now` force-trips
+    /// immediately (bypassing the streak/threshold check) whenever the live
+    /// `.ranking` snapshot confirms zero healthy accounts, so the operator
+    /// hears one aggregate signal on the first death rather than after N
+    /// per-issue error blocks accumulate silently.
     fn update_preflight_advisory(&mut self) {
         let threshold = self.preflight_tripwire_config.threshold.max(1);
-        let should_trip = self.preflight_death_streak >= threshold;
+        let pool_exhausted_now = self.preflight_pool_exhausted_now();
+        let should_trip = pool_exhausted_now || self.preflight_death_streak >= threshold;
         if should_trip == self.preflight_advisory_tripped {
             return;
         }
         self.preflight_advisory_tripped = should_trip;
         let marker = self.preflight_death_last_marker.clone().unwrap_or_default();
         let message = if should_trip {
-            format!(
-                "WARNING: last {} dispatches died at claude-wrapper pre-flight ({marker}) — check \
-                 .mcp.json",
-                self.preflight_death_streak
-            )
+            self.preflight_advisory_message(pool_exhausted_now, &marker)
         } else {
             "pre-flight advisory cleared — a recent dispatch reached claude-wrapper CLI start \
              (#4386)"
                 .to_string()
         };
-        log::warn!(
-            "sweep_registry: workspace {} pre-flight advisory {} (streak={}, threshold={}) \
-             (#4386)",
-            self.config.workspace_root.display(),
-            if should_trip { "TRIPPED" } else { "cleared" },
-            self.preflight_death_streak,
-            threshold
-        );
+        if pool_exhausted_now {
+            log::error!(
+                "sweep_registry: workspace {} pre-flight advisory TRIPPED — token pool exhausted \
+                 (0 healthy accounts), streak={} (#4644)",
+                self.config.workspace_root.display(),
+                self.preflight_death_streak
+            );
+        } else {
+            log::warn!(
+                "sweep_registry: workspace {} pre-flight advisory {} (streak={}, threshold={}) \
+                 (#4386)",
+                self.config.workspace_root.display(),
+                if should_trip { "TRIPPED" } else { "cleared" },
+                self.preflight_death_streak,
+                threshold
+            );
+        }
         self.emit_event(Event::PreflightAdvisory {
             workspace_root: self.config.workspace_root.display().to_string(),
             consecutive_deaths: self.preflight_death_streak,
             marker,
             message,
         });
+    }
+
+    /// Whether the live `.ranking` snapshot confirms zero healthy accounts
+    /// RIGHT NOW, given at least one pre-flight death has already been
+    /// observed this streak (Issue #4644). Shared by
+    /// [`update_preflight_advisory`](Self::update_preflight_advisory) (to
+    /// decide whether to force-trip) and
+    /// [`preflight_advisory`](Self::preflight_advisory) (so the status-surface
+    /// message text never drifts from the trip decision).
+    #[must_use]
+    fn preflight_pool_exhausted_now(&self) -> bool {
+        self.preflight_death_streak > 0
+            && capacity::read_ranking(&self.config.workspace_root)
+                .is_some_and(|snap| snap.total > 0 && snap.available == 0)
+    }
+
+    /// Render the operator-facing advisory message for the tripped state,
+    /// naming the specific whole-pool-dead cause (Issue #4644) when
+    /// `pool_exhausted_now` holds, else the ordinary #4386 streak wording.
+    #[must_use]
+    fn preflight_advisory_message(&self, pool_exhausted_now: bool, marker: &str) -> String {
+        if pool_exhausted_now {
+            format!(
+                "WARNING: token pool exhausted (0 healthy accounts) — every dispatch will die at \
+                 token selection ({marker}); add accounts (`loom-daemon tokens bootstrap`) or wait \
+                 for the pool to recover before re-dispatching (#4644)"
+            )
+        } else {
+            format!(
+                "WARNING: last {} dispatches died at claude-wrapper pre-flight ({marker}) — check \
+                 .mcp.json",
+                self.preflight_death_streak
+            )
+        }
     }
 
     /// Record a terminal sweep outcome against the insta-crash tally (#3939).
@@ -5843,6 +5984,10 @@ impl SweepRegistry {
                 let _ = self.restore_label_to_ready(*issue);
                 self.note_label_flip(*issue); // #4485 flap detection
             }
+            // Durable terminal-outcome record (Issue #4644) — a cancel is a
+            // deliberate terminal transition too, so it gets the same
+            // append-only journal line as a reaper-observed death.
+            self.append_outcome_journal(*issue, sweep_id, "exited", None, None, duration_sec);
             self.emit_event(Event::SweepExited {
                 issue: *issue,
                 exit_code: None,
@@ -6038,6 +6183,19 @@ impl SweepRegistry {
                                     info.latest_phase.clone_from(&checkpoint_phase);
                                 }
                             }
+                            // Durable terminal-outcome record (Issue #4644),
+                            // BEFORE the bus emission below moves `death_class`
+                            // — independent best-effort side effects of the
+                            // same terminal transition (never coupled to the
+                            // bus publish's own success).
+                            self.append_outcome_journal(
+                                issue,
+                                &sweep_id,
+                                "crashed",
+                                exit_code,
+                                death_class.clone(),
+                                duration_sec,
+                            );
                             events_to_emit.push(Event::SweepCrashed {
                                 issue,
                                 checkpoint_phase,
@@ -6337,6 +6495,18 @@ impl SweepRegistry {
                                 && exit_code != Some(0);
                             let death_class = self.record_preflight_streak(&sweep_id, insta_crash);
                             let is_preflight_death = death_class.is_some();
+                            // Durable terminal-outcome record (Issue #4644),
+                            // BEFORE the bus emission below moves
+                            // `death_class` — see the sibling call in the
+                            // Crashed branch above for the rationale.
+                            self.append_outcome_journal(
+                                issue,
+                                &sweep_id,
+                                "exited",
+                                exit_code,
+                                death_class.clone(),
+                                duration_sec,
+                            );
                             events_to_emit.push(Event::SweepExited {
                                 issue,
                                 exit_code,
@@ -8606,6 +8776,9 @@ exit 0
         // Confine the #3953 sweep journal to this test's tempdir — never the
         // real machine-level `~/.loom/sweeps.json`.
         config.journal_path = Some(workspace.join("test-sweeps-journal.json"));
+        // Confine the #4644 durable terminal-outcomes journal to this test's
+        // tempdir too, so tests can assert against a known path.
+        config.outcomes_journal_path = Some(workspace.join("test-sweep-outcomes.jsonl"));
         (SweepRegistry::new(config), record_log)
     }
 
@@ -11110,6 +11283,196 @@ exit 0
         assert!(registry
             .dispatch_backoff_remaining(4399, Utc::now())
             .is_some());
+    }
+
+    // ------------------------------------------------------------------------
+    // Durable terminal-outcome journal (Issue #4644)
+    // ------------------------------------------------------------------------
+
+    /// AC: a child that dies at `spawn-claude.sh`'s token-selection step
+    /// (exit 78, `EX_CONFIG`) is (a) classified with the specific
+    /// `preflight-token-selection-failed` death_class rather than the generic
+    /// `preflight-no-cli-start` fallback, (b) still arms the #4485 dispatch
+    /// backoff exactly like any other pre-flight death (confirming the
+    /// existing backoff machinery already covers this shape — no extension
+    /// needed), and (c) is written to the durable outcomes journal with the
+    /// exit code, death_class, token_name, and duration a post-hoc reader
+    /// needs, all without reading log prose.
+    #[test]
+    fn exit_78_token_selection_death_is_classified_backed_off_and_journaled() {
+        let dir = tempdir().unwrap();
+        let mut registry = backoff_registry(dir.path(), 60, 900);
+
+        // The exact prose `defaults/scripts/spawn-claude.sh` logs immediately
+        // before `exit 78` when `loom-daemon tokens select` itself fails
+        // (typically because every account is exhausted/blocked) — no
+        // `# CLAUDE_CLI_START` anywhere in the tail, because the CLI was
+        // never reached.
+        insert_dead_running_with_log(
+            &mut registry,
+            4644,
+            0,
+            "agent-9",
+            "==== loom-daemon dispatch: sweep-issue-4644-0 ====\n\
+             [2026-07-30T00:00:00Z] ERROR Token selection failed:\n\
+             [2026-07-30T00:00:00Z] ERROR Run 'loom-daemon tokens bootstrap' to populate \
+             <repo>/.loom/tokens/,\n",
+        );
+        registry.reap_once();
+
+        // (a) Specific death_class, not the generic fallback.
+        let path = registry.config().resolve_outcomes_journal_path();
+        let records = sweep_outcomes::read_all(&path);
+        let record = records
+            .iter()
+            .find(|r| r.issue == 4644)
+            .expect("terminal outcome must be journaled");
+        assert_eq!(
+            record.death_class.as_deref(),
+            Some("preflight-token-selection-failed"),
+            "exit-78 token-selection death must carry the specific #4644 death_class"
+        );
+        assert_eq!(record.token_name, "agent-9");
+        assert!(record.duration_sec >= 0);
+        assert_eq!(record.sweep_id, "sweep-issue-4644-0");
+
+        // (b) #4485 backoff already covers this shape — confirmed, not
+        // re-implemented.
+        assert_eq!(registry.insta_crash_count(4644), 0, "#4386 carve-out preserved");
+        assert_eq!(registry.dispatch_failure_count(4644), 1, "backoff still counts it");
+        assert!(registry
+            .dispatch_backoff_remaining(4644, Utc::now())
+            .is_some());
+    }
+
+    /// AC: the durable outcomes journal is written on BOTH terminal shapes —
+    /// a checkpoint-less `Exited` death (this test) and a checkpoint-present
+    /// `Crashed` death (the exit-78 test above, and the dedicated crashed-shape
+    /// test below) — at the same emit sites as the existing bus events.
+    #[test]
+    fn outcome_journal_records_exited_terminal_with_no_checkpoint() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _rec) = fixture_registry(dir.path());
+
+        insert_dead_running_with_log(&mut registry, 4645, 0, "agent-2", "clean run, no markers\n");
+        registry.reap_once();
+
+        let path = registry.config().resolve_outcomes_journal_path();
+        let records = sweep_outcomes::read_all(&path);
+        let record = records
+            .iter()
+            .find(|r| r.issue == 4645)
+            .expect("Exited terminal outcome must be journaled");
+        assert_eq!(record.outcome, "exited");
+        assert_eq!(record.repo, registry.config().workspace_root.display().to_string());
+    }
+
+    /// AC: the journal entry outlives `reap_once`'s in-memory GC of terminal
+    /// entries (the ~1h `TERMINAL_RETENTION_SECS` window) — it is the whole
+    /// point of a *durable* journal that it survives past the point the
+    /// in-memory registry has forgotten the sweep ever existed.
+    #[test]
+    fn outcome_journal_entry_survives_reap_once_gc() {
+        let dir = tempdir().unwrap();
+        let mut registry = backoff_registry(dir.path(), 60, 900);
+
+        let sweep_id = insert_dead_running_with_log(
+            &mut registry,
+            4646,
+            0,
+            "agent-3",
+            "==== loom-daemon dispatch: sweep-issue-4646-0 ====\nToken selection failed:\n",
+        );
+        registry.reap_once();
+
+        // Force this entry's terminal timestamp far enough in the past that
+        // the NEXT tick's GC pass drops it from the in-memory registry.
+        if let Some(info) = registry.entries.get_mut(&sweep_id) {
+            match &mut info.state {
+                SweepState::Exited { at, .. } | SweepState::Crashed { at } => {
+                    *at = Utc::now() - chrono::Duration::seconds(TERMINAL_RETENTION_SECS + 60);
+                }
+                other => panic!("expected a terminal state, got {other:?}"),
+            }
+        }
+        registry.reap_once();
+        assert!(
+            !registry.entries.contains_key(&sweep_id),
+            "in-memory entry should be GC'd by the retention-window pass"
+        );
+
+        let path = registry.config().resolve_outcomes_journal_path();
+        let records = sweep_outcomes::read_all(&path);
+        assert!(
+            records.iter().any(|r| r.issue == 4646),
+            "the durable journal entry must survive reap_once's in-memory GC"
+        );
+    }
+
+    /// AC: when the live `.ranking` snapshot shows zero healthy accounts, the
+    /// pre-flight advisory trips on the FIRST pre-flight death observed —
+    /// not after `threshold` (default 3) consecutive deaths accumulate — so
+    /// the operator gets one aggregate signal instead of N per-issue error
+    /// blocks while the pool is fully dead.
+    #[test]
+    fn preflight_advisory_trips_immediately_when_pool_is_fully_exhausted() {
+        let dir = tempdir().unwrap();
+        let mut registry = backoff_registry(dir.path(), 60, 900);
+        seed_token_pool(dir.path(), "agent-9"); // ensures the per-repo pool
+                                                // dir wins over any shared
+                                                // fallback
+        std::fs::write(
+            dir.path().join(".loom").join("tokens").join(".ranking"),
+            "agent-9|exhausted|0.99\nagent-10|blocked|0.00\n",
+        )
+        .unwrap();
+
+        assert!(!registry.preflight_advisory().0);
+
+        insert_dead_running_with_log(
+            &mut registry,
+            4647,
+            0,
+            "agent-9",
+            "==== loom-daemon dispatch: sweep-issue-4647-0 ====\nToken selection failed:\n",
+        );
+        registry.reap_once();
+
+        assert_eq!(registry.preflight_death_streak(), 1, "only ONE death observed so far");
+        assert!(
+            registry.preflight_advisory().0,
+            "healthy=0 must force an immediate trip, not wait for the streak threshold"
+        );
+    }
+
+    /// The symmetric negative: an ordinary pre-flight death against a pool
+    /// that still has a healthy account must NOT force-trip — it follows the
+    /// normal #4386 streak/threshold cadence.
+    #[test]
+    fn preflight_advisory_does_not_force_trip_when_pool_has_a_healthy_account() {
+        let dir = tempdir().unwrap();
+        let mut registry = backoff_registry(dir.path(), 60, 900);
+        seed_token_pool(dir.path(), "agent-9");
+        std::fs::write(
+            dir.path().join(".loom").join("tokens").join(".ranking"),
+            "agent-9|available|0.10\nagent-10|exhausted|0.99\n",
+        )
+        .unwrap();
+
+        insert_dead_running_with_log(
+            &mut registry,
+            4648,
+            0,
+            "agent-9",
+            "==== loom-daemon dispatch: sweep-issue-4648-0 ====\nspawn-claude: preflight failed\n",
+        );
+        registry.reap_once();
+
+        assert_eq!(registry.preflight_death_streak(), 1);
+        assert!(
+            !registry.preflight_advisory().0,
+            "a single death with a healthy account still in the pool must not force-trip"
+        );
     }
 
     /// A cold streak restarts at 1: a failure whose predecessor is older than

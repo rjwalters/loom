@@ -1978,6 +1978,29 @@ fn load_persisted_completed(path: Option<&Path>) -> std::collections::HashSet<(S
         .unwrap_or_default()
 }
 
+/// Whether the persisted dedup file represents "no reliable prior state" at
+/// process startup (issue #4649): every case [`load_persisted_completed`]
+/// already degrades to an empty set for — a missing file (fresh install, a
+/// deleted/lost file), an unreadable file (permissions), or one that fails to
+/// parse (corrupt) — all indistinguishable from "we have never reconciled
+/// this host before". Left unaddressed, the very first reconciliation tick
+/// for each workspace would then narrate every in-window merge at once (up
+/// to [`RECONCILE_PR_LIMIT`]) as if they had all just happened.
+///
+/// A file that exists and parses successfully — even to a legitimately empty
+/// set, e.g. a host with zero merges since the last restart — is **not**
+/// fresh: reconciliation has already run at least once on this host, so no
+/// seeding is needed and narration should proceed normally from tick one.
+fn persisted_dedup_state_is_fresh(path: Option<&Path>) -> bool {
+    let Some(path) = path else {
+        return true;
+    };
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return true;
+    };
+    serde_json::from_str::<Vec<(String, u32)>>(&contents).is_err()
+}
+
 /// Persist the dedup set atomically (temp file + rename, mirroring
 /// [`crate::workspace_registry::WorkspaceRegistry::save`]). Best-effort: a
 /// write failure (read-only home, disk full, permissions) is logged once at
@@ -2425,6 +2448,11 @@ async fn run_sink(
     // narrated before a daemon restart is not re-posted just because the
     // process-lifetime set below reset to empty.
     let completions_path = default_completions_path();
+    // Seed-only first pass (#4649): captured *before* the load below degrades
+    // a missing/corrupt/unreadable file to an empty set indistinguishably
+    // from "genuinely reconciled to zero" — this is the only place that
+    // distinction is still observable.
+    let dedup_state_was_fresh = persisted_dedup_state_is_fresh(completions_path.as_deref());
     let mut completed: std::collections::HashSet<(String, u32)> =
         load_persisted_completed(completions_path.as_deref());
     // Every workspace root observed on a stamped-`repo` event, live (#4583).
@@ -2432,6 +2460,14 @@ async fn run_sink(
     // `reconciliation_targets`) so a registered-but-quiet workspace is still
     // scanned right after a restart, before any new event repopulates this set.
     let mut known_workspaces: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Workspaces that have already had their one-time seed-only reconciliation
+    // pass (#4649, only consulted when `dedup_state_was_fresh`) — each
+    // workspace's *first* reconciliation tick on a fresh host seeds
+    // `completed` without narrating, so a backlog of in-window merges never
+    // bursts onto the feed at once; every later tick for that workspace (or
+    // any tick at all when the dedup file was not fresh) narrates normally.
+    let mut seeded_fresh_workspaces: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     // Round-robins one workspace per reconciliation tick (see
     // `reconciliation_targets`) rather than sweeping every known workspace in
     // one tick, so one slow/offline `gh` cannot delay every other workspace's
@@ -2533,6 +2569,16 @@ async fn run_sink(
                     .then(|| targets[reconcile_cursor % targets.len()].clone())
                 {
                     reconcile_cursor = reconcile_cursor.wrapping_add(1);
+                    // Seed-only first pass (#4649): this workspace's very
+                    // first reconciliation tick on a host with no reliable
+                    // persisted dedup state seeds `completed` (and persists
+                    // it) but drops the resulting envelopes instead of
+                    // narrating them — otherwise every in-window merge (up
+                    // to `RECONCILE_PR_LIMIT`) would burst onto the feed at
+                    // once. `insert` returns `false` on a repeat visit, so
+                    // this only ever suppresses one tick per workspace.
+                    let seed_only = dedup_state_was_fresh
+                        && seeded_fresh_workspaces.insert(workspace_root.clone());
                     let new_completions = reconcile_recent_merges(
                         &config.persona,
                         &workspace_root,
@@ -2544,8 +2590,18 @@ async fn run_sink(
                     if !new_completions.is_empty() {
                         persist_completed_best_effort(completions_path.as_deref(), &completed);
                     }
-                    outbox.extend(new_completions);
-                    narrated_repo = Some(workspace_root);
+                    if seed_only {
+                        if !new_completions.is_empty() {
+                            log::info!(
+                                "safehouse: seeded {} completion(s) for {workspace_root} from a \
+                                 fresh dedup file without narrating them (issue #4649)",
+                                new_completions.len()
+                            );
+                        }
+                    } else {
+                        outbox.extend(new_completions);
+                        narrated_repo = Some(workspace_root);
+                    }
                 }
             }
         }
@@ -5282,6 +5338,15 @@ mod tests {
         // purely from the registered workspace + the bulk `gh pr list` query.
         let dir = tempfile::tempdir().unwrap();
         let _safehouse_test_paths = SafehouseTestPaths::set(dir.path());
+        // A non-fresh (but empty) persisted dedup file (#4649): this test
+        // exercises the steady-state narrate-immediately behavior, not the
+        // seed-only first pass (covered separately below) — pre-seeding an
+        // already-valid, empty file is what tells reconciliation this host
+        // has reconciled before.
+        persist_completed_best_effort(
+            Some(&dir.path().join("safehouse-completed.json")),
+            &std::collections::HashSet::new(),
+        );
         let (fake_gh, _log) = write_fake_forge_gh(
             dir.path(),
             Some(&reconcile_merged_pr_json()),
@@ -5337,6 +5402,206 @@ mod tests {
         assert_eq!(received[0]["type"], json!("completion"));
         assert_eq!(received[0]["meta"]["issue"], json!(4610));
         assert_eq!(received[0]["meta"]["result"], json!("success"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn run_sink_reconciliation_seeds_a_fresh_dedup_file_without_narrating_the_backlog() {
+        // #4649: a host with no persisted dedup file (fresh install, upgrade,
+        // lost/corrupt file) must not burst-narrate every in-window merge on
+        // its very first reconciliation tick. Two merges land inside the
+        // lookback window with an absent completions file — every tick must
+        // seed the dedup set (and persist it) without ever narrating either
+        // one, even across several ticks (the same workspace round-robins
+        // back to itself every tick here).
+        let dir = tempfile::tempdir().unwrap();
+        let _safehouse_test_paths = SafehouseTestPaths::set(dir.path());
+        let (fake_gh, _log) = write_fake_forge_gh(
+            dir.path(),
+            Some(&reconcile_two_merged_prs_json()),
+            Some("rjwalters/loom"),
+        );
+        std::env::set_var(GH_BIN_ENV, &fake_gh);
+        // A fast reconciliation cadence so several ticks fire during the test.
+        std::env::set_var(RECONCILE_INTERVAL_ENV, "20");
+        let mut registry = crate::workspace_registry::WorkspaceRegistry::default();
+        registry.add(dir.path(), None).unwrap();
+        registry
+            .save(&std::path::PathBuf::from(
+                std::env::var(crate::workspace_registry::REGISTRY_PATH_ENV).unwrap(),
+            ))
+            .unwrap();
+
+        let socket = dir.path().join("safehoused.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        // Expects one send; the assertion below is that this never resolves
+        // within the timeout — i.e. the backlog is never narrated at all.
+        let server = tokio::spawn(stub_server(listener, false, 1));
+
+        let bus = Arc::new(EventBus::new());
+        let subscription = bus.subscribe(Vec::<String>::new());
+        let sink = tokio::spawn(run_sink(
+            SafehouseConfig {
+                enabled: true,
+                socket: Some(socket.clone()),
+                ..SafehouseConfig::default()
+            },
+            socket,
+            subscription,
+            Duration::from_millis(20),
+            Duration::from_millis(80),
+            new_shared_state(),
+            None,
+        ));
+
+        // Comfortably longer than several reconciliation ticks at the 20ms
+        // cadence above.
+        let outcome = tokio::time::timeout(Duration::from_millis(400), server).await;
+        assert!(
+            outcome.is_err(),
+            "the seed-only first pass must never narrate a backlog merge, on this tick or any \
+             later one"
+        );
+
+        drop(bus);
+        let _ = tokio::time::timeout(Duration::from_secs(2), sink).await;
+        std::env::remove_var(GH_BIN_ENV);
+        std::env::remove_var(RECONCILE_INTERVAL_ENV);
+
+        let completions_path = dir.path().join("safehouse-completed.json");
+        let persisted = load_persisted_completed(Some(&completions_path));
+        let root = dir.path().to_string_lossy().into_owned();
+        assert!(
+            persisted.contains(&(root.clone(), 4610)) && persisted.contains(&(root, 4611)),
+            "the seed pass must still persist both backlog merges into the dedup set, so a \
+             later daemon restart does not narrate them either: {persisted:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn run_sink_reconciliation_narrates_normally_once_the_dedup_file_is_no_longer_fresh() {
+        // #4649, the other half: once a workspace's one-time seed-only pass
+        // has run (or the persisted file was never fresh to begin with), a
+        // *new* merge must still reach the wire — no regression to the
+        // steady-state behavior added by #4646.
+        let dir = tempfile::tempdir().unwrap();
+        let _safehouse_test_paths = SafehouseTestPaths::set(dir.path());
+        let (fake_gh, _log) = write_fake_forge_gh(
+            dir.path(),
+            Some(&reconcile_merged_pr_json()),
+            Some("rjwalters/loom"),
+        );
+        std::env::set_var(GH_BIN_ENV, &fake_gh);
+        std::env::set_var(RECONCILE_INTERVAL_ENV, "20");
+        let mut registry = crate::workspace_registry::WorkspaceRegistry::default();
+        registry.add(dir.path(), None).unwrap();
+        registry
+            .save(&std::path::PathBuf::from(
+                std::env::var(crate::workspace_registry::REGISTRY_PATH_ENV).unwrap(),
+            ))
+            .unwrap();
+
+        let socket = dir.path().join("safehoused.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(stub_server(listener, false, 1));
+
+        let bus = Arc::new(EventBus::new());
+        let subscription = bus.subscribe(Vec::<String>::new());
+        let sink = tokio::spawn(run_sink(
+            SafehouseConfig {
+                enabled: true,
+                socket: Some(socket.clone()),
+                ..SafehouseConfig::default()
+            },
+            socket,
+            subscription,
+            Duration::from_millis(20),
+            Duration::from_millis(80),
+            new_shared_state(),
+            None,
+        ));
+
+        // Wait for the seed-only first tick to persist issue #4610 without
+        // narrating it.
+        let completions_path = dir.path().join("safehouse-completed.json");
+        let root = dir.path().to_string_lossy().into_owned();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if load_persisted_completed(Some(&completions_path)).contains(&(root.clone(), 4610))
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the seed-only first pass must persist issue #4610 within the timeout");
+
+        // Now a second, distinct merge lands — the fake `gh` is rewritten in
+        // place (same script path, same GH_BIN_ENV) to answer with both the
+        // already-seeded issue and the new one.
+        write_fake_forge_gh(
+            dir.path(),
+            Some(&reconcile_two_merged_prs_json()),
+            Some("rjwalters/loom"),
+        );
+
+        let received = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("a merge landing after the seed-only pass must still be narrated")
+            .unwrap();
+
+        drop(bus);
+        let _ = tokio::time::timeout(Duration::from_secs(2), sink).await;
+        std::env::remove_var(GH_BIN_ENV);
+        std::env::remove_var(RECONCILE_INTERVAL_ENV);
+
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0]["type"], json!("completion"));
+        assert_eq!(
+            received[0]["meta"]["issue"],
+            json!(4611),
+            "only the not-already-seeded issue is narrated; #4610 stays suppressed"
+        );
+    }
+
+    #[test]
+    fn persisted_dedup_state_is_fresh_treats_absent_and_corrupt_files_as_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            persisted_dedup_state_is_fresh(Some(&dir.path().join("does-not-exist.json"))),
+            "an absent file (fresh install, lost file) has no reliable prior state"
+        );
+
+        let corrupt = dir.path().join("corrupt.json");
+        std::fs::write(&corrupt, "not valid json").unwrap();
+        assert!(
+            persisted_dedup_state_is_fresh(Some(&corrupt)),
+            "a corrupt file is indistinguishable from no prior state"
+        );
+
+        assert!(
+            persisted_dedup_state_is_fresh(None),
+            "no resolvable path (no home dir) also has no reliable prior state"
+        );
+    }
+
+    #[test]
+    fn persisted_dedup_state_is_fresh_is_false_for_a_valid_even_if_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("safehouse-completed.json");
+
+        // A host that has already reconciled at least once, with zero
+        // completions recorded, must not be re-treated as fresh on the next
+        // restart — that would otherwise re-suppress narration forever.
+        persist_completed_best_effort(Some(&path), &std::collections::HashSet::new());
+        assert!(!persisted_dedup_state_is_fresh(Some(&path)));
+
+        let mut completed = std::collections::HashSet::new();
+        completed.insert(("/home/x/GitHub/loom".to_owned(), 4610));
+        persist_completed_best_effort(Some(&path), &completed);
+        assert!(!persisted_dedup_state_is_fresh(Some(&path)));
     }
 
     #[tokio::test]
