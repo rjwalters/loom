@@ -111,10 +111,20 @@ chmod +x "$STUB_DIR/loom-daemon"
 #   gh auth status                                     -> exit 0 (authenticated)
 #   gh repo view --json nameWithOwner --jq ...          -> "owner/repo" (or fail
 #                                                          if $STUB_DIR/repo-view-fail exists)
-#   gh issue list --state=open|closed ...               -> cat $STUB_DIR/issues-<state>.json (or [])
-#   gh pr list --state=merged ...                        -> cat $STUB_DIR/prs-merged.json (or [])
+#   gh issue list --state=open|closed ...               -> cat $STUB_DIR/issues-<state>.json (or [];
+#                                                           simulates a GraphQL rate-limit failure if
+#                                                           $STUB_DIR/issue-list-rate-limit-<state> exists)
+#   gh pr list --state=merged ...                        -> cat $STUB_DIR/prs-merged.json (or [];
+#                                                           simulates a GraphQL rate-limit failure if
+#                                                           $STUB_DIR/pr-list-rate-limit exists)
 #   gh api repos/OWNER/REPO/issues/N/timeline --paginate -> cat $STUB_DIR/timeline-N.json (or [];
 #                                                           fails if $STUB_DIR/timeline-fail exists)
+#   gh api repos/OWNER/REPO/issues?state=<state>&...     -> REST fallback (#4526): cat
+#                                                           $STUB_DIR/rest-issues-<state>.json (or [];
+#                                                           fails if $STUB_DIR/rest-issues-fail exists)
+#   gh api repos/OWNER/REPO/pulls?state=closed&...       -> REST fallback (#4526): cat
+#                                                           $STUB_DIR/rest-prs.json (or [];
+#                                                           fails if $STUB_DIR/rest-prs-fail exists)
 cat > "$STUB_DIR/gh" <<'STUB'
 #!/usr/bin/env bash
 STUB_DIR_FROM_ENV="${LOOM_TEST_STUB_DIR:?stub gh: LOOM_TEST_STUB_DIR not set}"
@@ -141,6 +151,10 @@ case "$1" in
         esac
         shift
       done
+      if [[ -f "$STUB_DIR_FROM_ENV/issue-list-rate-limit-$state" ]]; then
+        echo "GraphQL: API rate limit exceeded for installation ID 123. (issue)" >&2
+        exit 1
+      fi
       canned="$STUB_DIR_FROM_ENV/issues-$state.json"
       if [[ -f "$canned" ]]; then cat "$canned"; else echo "[]"; fi
       exit 0
@@ -150,6 +164,10 @@ case "$1" in
     ;;
   pr)
     if [[ "$2" == "list" ]]; then
+      if [[ -f "$STUB_DIR_FROM_ENV/pr-list-rate-limit" ]]; then
+        echo "GraphQL: API rate limit exceeded for installation ID 123. (pr)" >&2
+        exit 1
+      fi
       canned="$STUB_DIR_FROM_ENV/prs-merged.json"
       if [[ -f "$canned" ]]; then cat "$canned"; else echo "[]"; fi
       exit 0
@@ -158,16 +176,38 @@ case "$1" in
     exit 3
     ;;
   api)
-    if [[ -f "$STUB_DIR_FROM_ENV/timeline-fail" ]]; then
-      echo "stub gh: api call failed" >&2
-      exit 1
-    fi
     path="$2"
-    num="${path%/timeline}"
-    num="${num##*/}"
-    canned="$STUB_DIR_FROM_ENV/timeline-$num.json"
-    if [[ -f "$canned" ]]; then cat "$canned"; else echo "[]"; fi
-    exit 0
+    if [[ "$path" == *"/timeline" ]]; then
+      if [[ -f "$STUB_DIR_FROM_ENV/timeline-fail" ]]; then
+        echo "stub gh: api call failed" >&2
+        exit 1
+      fi
+      num="${path%/timeline}"
+      num="${num##*/}"
+      canned="$STUB_DIR_FROM_ENV/timeline-$num.json"
+      if [[ -f "$canned" ]]; then cat "$canned"; else echo "[]"; fi
+      exit 0
+    elif [[ "$path" == *"/issues?"* ]]; then
+      if [[ -f "$STUB_DIR_FROM_ENV/rest-issues-fail" ]]; then
+        echo "stub gh: rest issues api call failed" >&2
+        exit 1
+      fi
+      state="open"
+      [[ "$path" == *"state=closed"* ]] && state="closed"
+      canned="$STUB_DIR_FROM_ENV/rest-issues-$state.json"
+      if [[ -f "$canned" ]]; then cat "$canned"; else echo "[]"; fi
+      exit 0
+    elif [[ "$path" == *"/pulls?"* ]]; then
+      if [[ -f "$STUB_DIR_FROM_ENV/rest-prs-fail" ]]; then
+        echo "stub gh: rest pulls api call failed" >&2
+        exit 1
+      fi
+      canned="$STUB_DIR_FROM_ENV/rest-prs.json"
+      if [[ -f "$canned" ]]; then cat "$canned"; else echo "[]"; fi
+      exit 0
+    fi
+    echo "stub gh: unhandled api args: $*" >&2
+    exit 3
     ;;
   *)
     echo "stub gh: unhandled args: $*" >&2
@@ -182,7 +222,10 @@ export PATH="$STUB_DIR:$PATH"
 
 reset_state() {
     rm -f "$STUB_DIR"/issues-*.json "$STUB_DIR"/prs-merged.json "$STUB_DIR"/timeline-*.json
+    rm -f "$STUB_DIR"/rest-issues-*.json "$STUB_DIR/rest-prs.json"
     rm -f "$STUB_DIR/timeline-fail" "$STUB_DIR/repo-view-fail"
+    rm -f "$STUB_DIR"/issue-list-rate-limit-* "$STUB_DIR/pr-list-rate-limit"
+    rm -f "$STUB_DIR/rest-issues-fail" "$STUB_DIR/rest-prs-fail"
 }
 
 run_cds() {
@@ -465,6 +508,93 @@ run_cds --title "guard-destructive.sh emits PreToolUse decisions without hookEve
 assert_eq "1" "$RC" "(o) Real historical duplicate pair (#3550/#3551) -> exit 1 at the calibrated default threshold"
 assert_contains "$OUT" "#3550" "(o) Real historical duplicate pair (#3550/#3551) -> flagged as a candidate"
 assert_contains "$OUT" "(similarity: 26%)" "(o) Real historical duplicate pair scores the expected 26% true-Jaccard"
+
+echo ""
+echo "Testing check-duplicate.sh REST fallback on GraphQL rate limit (issue #4526)..."
+
+# (p) Open-issues GraphQL rate-limited -> REST fallback succeeds and is used.
+# REST's /issues endpoint also returns PRs, so the fixture includes one
+# (#802) to confirm it's filtered out (pull_request != null).
+reset_state
+: > "$STUB_DIR/issue-list-rate-limit-open"
+cat > "$STUB_DIR/rest-issues-open.json" <<'EOF'
+[
+  {"number": 801, "title": "Alpha Bravo Charlie Delta", "body": "", "pull_request": null},
+  {"number": 802, "title": "Alpha Bravo Charlie Delta", "body": "", "pull_request": {"url": "x"}}
+]
+EOF
+run_cds --threshold 50 --title "Alpha Bravo Charlie Delta"
+assert_eq "1" "$RC" "(p) Rate-limited GraphQL open-issues search falls back to REST -> exit 1"
+assert_contains "$OUT" "DUPLICATE_FOUND (REST fallback" "(p) REST fallback output is labeled distinctly from a normal GraphQL match"
+assert_contains "$OUT" "#801: Alpha Bravo Charlie Delta (similarity: 100%)" "(p) REST fallback finds the matching issue"
+assert_not_contains "$OUT" "#802" "(p) REST fallback excludes PR entries returned by the /issues endpoint"
+
+# (q) Open-issues GraphQL rate-limited AND the REST fallback also fails ->
+# exit 2 ("could not run at all"), not silently treated as no duplicates.
+reset_state
+: > "$STUB_DIR/issue-list-rate-limit-open"
+: > "$STUB_DIR/rest-issues-fail"
+run_cds --title "Alpha Bravo Charlie Delta"
+assert_eq "2" "$RC" "(q) Rate-limited GraphQL AND failed REST fallback (open issues) -> exit 2"
+assert_contains "$ERR" "REST fallback also failed" "(q) stderr explains both GraphQL and REST failed"
+
+# (r) Merged-PRs GraphQL rate-limited -> REST fallback succeeds. REST has no
+# state=merged filter, so the fetch is `pulls?state=closed` filtered locally
+# to merged_at != null; the fixture includes a closed-but-unmerged PR (#902)
+# to confirm it's excluded.
+reset_state
+: > "$STUB_DIR/pr-list-rate-limit"
+cat > "$STUB_DIR/rest-prs.json" <<'EOF'
+[
+  {"number": 901, "title": "Alpha Bravo Charlie Delta", "body": "", "merged_at": "2026-01-01T00:00:00Z"},
+  {"number": 902, "title": "Alpha Bravo Charlie Delta", "body": "", "merged_at": null}
+]
+EOF
+run_cds --include-merged-prs --threshold 50 --title "Alpha Bravo Charlie Delta"
+assert_eq "1" "$RC" "(r) Rate-limited GraphQL merged-PR search falls back to REST -> exit 1"
+assert_contains "$OUT" "DUPLICATE_FOUND (REST fallback" "(r) REST fallback header labeled for the merged-PR pool"
+assert_contains "$OUT" "PR #901: Alpha Bravo Charlie Delta (similarity: 100%)" "(r) REST fallback finds the merged PR"
+assert_not_contains "$OUT" "PR #902" "(r) REST fallback excludes the closed-but-unmerged PR (merged_at null)"
+
+# (s) Merged-PRs GraphQL rate-limited AND the REST fallback also fails ->
+# exit 2, matching the open-issues both-failed case.
+reset_state
+: > "$STUB_DIR/pr-list-rate-limit"
+: > "$STUB_DIR/rest-prs-fail"
+run_cds --include-merged-prs --title "Alpha Bravo Charlie Delta"
+assert_eq "2" "$RC" "(s) Rate-limited GraphQL AND failed REST fallback (merged PRs) -> exit 2"
+assert_contains "$ERR" "REST fallback also failed" "(s) stderr explains both GraphQL and REST failed (merged PRs)"
+
+# (t) Closed-issues GraphQL rate-limited -> REST fallback succeeds.
+reset_state
+: > "$STUB_DIR/issue-list-rate-limit-closed"
+cat > "$STUB_DIR/rest-issues-closed.json" <<'EOF'
+[{"number": 1001, "title": "Alpha Bravo Charlie Delta", "body": "", "pull_request": null}]
+EOF
+run_cds --include-merged-prs --threshold 50 --title "Alpha Bravo Charlie Delta"
+assert_eq "1" "$RC" "(t) Rate-limited GraphQL closed-issues search falls back to REST -> exit 1"
+assert_contains "$OUT" "DUPLICATE_FOUND (REST fallback" "(t) REST fallback header labeled for the closed-issues pool"
+assert_contains "$OUT" "Closed #1001: Alpha Bravo Charlie Delta (similarity: 100%)" "(t) REST fallback finds the closed issue"
+
+# (u) Closed-issues GraphQL rate-limited AND the REST fallback also fails ->
+# exit 2, matching the other two both-failed cases.
+reset_state
+: > "$STUB_DIR/issue-list-rate-limit-closed"
+: > "$STUB_DIR/rest-issues-fail"
+run_cds --include-merged-prs --title "Alpha Bravo Charlie Delta"
+assert_eq "2" "$RC" "(u) Rate-limited GraphQL AND failed REST fallback (closed issues) -> exit 2"
+assert_contains "$ERR" "REST fallback also failed" "(u) stderr explains both GraphQL and REST failed (closed issues)"
+
+# (v) Regression: an ordinary successful (non-rate-limited) GraphQL call must
+# NOT trigger the REST fallback path or its labeling.
+reset_state
+cat > "$STUB_DIR/issues-open.json" <<'EOF'
+[{"number": 1101, "title": "Alpha Bravo Charlie Delta", "body": ""}]
+EOF
+run_cds --threshold 50 --title "Alpha Bravo Charlie Delta"
+assert_eq "1" "$RC" "(v) Ordinary GraphQL success -> exit 1"
+assert_contains "$OUT" "DUPLICATE_FOUND" "(v) Ordinary GraphQL success still emits a DUPLICATE_FOUND header"
+assert_not_contains "$OUT" "REST fallback" "(v) Ordinary GraphQL success never mentions the REST fallback"
 
 # --- Summary ---
 echo ""

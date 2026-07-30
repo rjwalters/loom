@@ -251,6 +251,23 @@ calculate_similarity() {
     echo "$percent"
 }
 
+# Detect GitHub's GraphQL rate-limit error signature in captured `gh` output
+# (stdout+stderr merged via `2>&1`). GraphQL and REST draw on independent
+# quotas (confirmed live during the #4526 incident: `gh issue/pr list --json
+# ...` failed with this exact string while `gh api repos/OWNER/REPO/...`
+# succeeded), so this specific error -- and only this one -- justifies
+# retrying the same query via REST instead of giving up.
+is_rate_limit_error() {
+    local text="$1"
+    [[ "$text" == *"API rate limit exceeded"* ]]
+}
+
+# Resolve "owner/repo" via REST, for the REST fallback paths below. Mirrors
+# the resolution already used by search_cross_references() (#4162).
+get_repo_nwo() {
+    gh repo view --json nameWithOwner --jq '.nameWithOwner'
+}
+
 # Search for similar issues
 search_similar_issues() {
     local title="$1"
@@ -266,11 +283,26 @@ search_similar_issues() {
         return 0
     fi
 
-    # Search open issues
+    # Search open issues. On a GraphQL rate-limit failure, retry via REST
+    # (an independent quota, #4526) before giving up.
     local issues
+    local rest_fallback=false
     if ! issues=$($FORGE issue list --state=open --limit=50 --json number,title,body 2>&1); then
-        print_error "Failed to fetch issues: $issues"
-        return 2
+        if is_rate_limit_error "$issues"; then
+            local repo_nwo rest_issues
+            if repo_nwo=$(get_repo_nwo 2>&1) && \
+               rest_issues=$(gh api "repos/${repo_nwo}/issues?state=open&per_page=50" 2>&1); then
+                # REST's /issues endpoint also returns PRs; exclude them.
+                issues=$(echo "$rest_issues" | jq -c '[.[] | select(.pull_request == null)]')
+                rest_fallback=true
+            else
+                print_error "GraphQL rate-limited fetching open issues, and REST fallback also failed: ${rest_issues:-$repo_nwo}"
+                return 2
+            fi
+        else
+            print_error "Failed to fetch issues: $issues"
+            return 2
+        fi
     fi
 
     # Process each issue for similarity
@@ -315,7 +347,15 @@ search_similar_issues() {
         return 1
     fi
 
-    echo "DUPLICATE_FOUND"
+    # Degraded-mode labeling (#4526): a REST-sourced result set ranks
+    # candidates differently than GraphQL's, so a Curator reading the output
+    # needs to know the basis changed. Callers matching on "DUPLICATE_FOUND"
+    # must match a prefix, not exact-equals (see main()'s --json parser below).
+    if $rest_fallback; then
+        echo "DUPLICATE_FOUND (REST fallback -- similarity ranking basis differs from GraphQL)"
+    else
+        echo "DUPLICATE_FOUND"
+    fi
     echo -n "$duplicates"
     return 1
 }
@@ -334,11 +374,26 @@ search_merged_prs() {
         return 0
     fi
 
-    # Search recently merged PRs
+    # Search recently merged PRs. On a GraphQL rate-limit failure, retry via
+    # REST (#4526). REST has no `state=merged` filter, so fetch closed PRs
+    # and filter to actually-merged ones locally.
     local prs
+    local rest_fallback=false
     if ! prs=$($FORGE pr list --state=merged --limit=20 --json number,title,body 2>&1); then
-        print_warning "Failed to fetch merged PRs: $prs"
-        return 0
+        if is_rate_limit_error "$prs"; then
+            local repo_nwo rest_prs
+            if repo_nwo=$(get_repo_nwo 2>&1) && \
+               rest_prs=$(gh api "repos/${repo_nwo}/pulls?state=closed&per_page=20" 2>&1); then
+                prs=$(echo "$rest_prs" | jq -c '[.[] | select(.merged_at != null)]')
+                rest_fallback=true
+            else
+                print_error "GraphQL rate-limited fetching merged PRs, and REST fallback also failed: ${rest_prs:-$repo_nwo}"
+                return 2
+            fi
+        else
+            print_warning "Failed to fetch merged PRs: $prs"
+            return 0
+        fi
     fi
 
     # Process each PR for similarity
@@ -380,6 +435,12 @@ search_merged_prs() {
         return 0
     fi
 
+    # A leading sentinel line (stripped by main(), never shown to the user)
+    # so the caller can label the umbrella DUPLICATE_FOUND header when this
+    # pool's result came from the REST fallback (#4526).
+    if $rest_fallback; then
+        echo "RATE_LIMIT_FALLBACK"
+    fi
     echo -n "$duplicates"
 }
 
@@ -397,11 +458,26 @@ search_closed_issues() {
         return 0
     fi
 
-    # Search recently closed issues
+    # Search recently closed issues. On a GraphQL rate-limit failure, retry
+    # via REST (#4526).
     local issues
+    local rest_fallback=false
     if ! issues=$($FORGE issue list --state=closed --limit=20 --json number,title,body 2>&1); then
-        print_warning "Failed to fetch closed issues: $issues"
-        return 0
+        if is_rate_limit_error "$issues"; then
+            local repo_nwo rest_issues
+            if repo_nwo=$(get_repo_nwo 2>&1) && \
+               rest_issues=$(gh api "repos/${repo_nwo}/issues?state=closed&per_page=20" 2>&1); then
+                # REST's /issues endpoint also returns PRs; exclude them.
+                issues=$(echo "$rest_issues" | jq -c '[.[] | select(.pull_request == null)]')
+                rest_fallback=true
+            else
+                print_error "GraphQL rate-limited fetching closed issues, and REST fallback also failed: ${rest_issues:-$repo_nwo}"
+                return 2
+            fi
+        else
+            print_warning "Failed to fetch closed issues: $issues"
+            return 0
+        fi
     fi
 
     # Process each issue for similarity
@@ -443,6 +519,11 @@ search_closed_issues() {
         return 0
     fi
 
+    # See search_merged_prs()'s matching comment: leading sentinel line,
+    # stripped by main(), never shown to the user (#4526).
+    if $rest_fallback; then
+        echo "RATE_LIMIT_FALLBACK"
+    fi
     echo -n "$duplicates"
 }
 
@@ -611,8 +692,33 @@ main() {
     local merged_result=""
     local closed_result=""
     if $include_merged_prs; then
-        merged_result=$(search_merged_prs "$title" "$body" "$threshold")
-        closed_result=$(search_closed_issues "$title" "$body" "$threshold")
+        local merged_exit_code=0
+        local closed_exit_code=0
+        merged_result=$(search_merged_prs "$title" "$body" "$threshold") || merged_exit_code=$?
+        closed_result=$(search_closed_issues "$title" "$body" "$threshold") || closed_exit_code=$?
+
+        # #4526: a GraphQL rate-limit that ALSO fails via REST means this
+        # pool genuinely could not be checked -- surface that as exit 2
+        # ("could not run at all"), not silently as "no duplicates" the way
+        # a plain `return 0` used to.
+        if [[ $merged_exit_code -eq 2 || $closed_exit_code -eq 2 ]]; then
+            exit_code=2
+        fi
+
+        # Strip the leading REST-fallback sentinel line (if present) from
+        # each result before it's displayed or aggregated, remembering
+        # whether it fired so the umbrella DUPLICATE_FOUND header below can
+        # be labeled correctly (#4526).
+        local merged_rest_fallback=false
+        local closed_rest_fallback=false
+        if [[ "$merged_result" == "RATE_LIMIT_FALLBACK"$'\n'* ]]; then
+            merged_rest_fallback=true
+            merged_result="${merged_result#RATE_LIMIT_FALLBACK$'\n'}"
+        fi
+        if [[ "$closed_result" == "RATE_LIMIT_FALLBACK"$'\n'* ]]; then
+            closed_rest_fallback=true
+            closed_result="${closed_result#RATE_LIMIT_FALLBACK$'\n'}"
+        fi
 
         # If we found matches in merged PRs or closed issues, flag as duplicate
         if [[ -n "$merged_result" || -n "$closed_result" ]]; then
@@ -628,7 +734,11 @@ main() {
                 # side is degenerate.
                 if [[ ( -n "$merged_result" && "$merged_result" != NON_DISCRIMINATIVE* ) || \
                       ( -n "$closed_result" && "$closed_result" != NON_DISCRIMINATIVE* ) ]]; then
-                    result="DUPLICATE_FOUND"$'\n'
+                    if $merged_rest_fallback || $closed_rest_fallback; then
+                        result="DUPLICATE_FOUND (REST fallback -- similarity ranking basis differs from GraphQL)"$'\n'
+                    else
+                        result="DUPLICATE_FOUND"$'\n'
+                    fi
                 fi
                 exit_code=1
             fi
@@ -674,7 +784,9 @@ main() {
             # an empty $result, e.g. exit_code 0 or "related work only")
             local matches="[]"
             while IFS= read -r line; do
-                [[ "$line" == "DUPLICATE_FOUND" ]] && continue
+                # Prefix match, not exact-equals: the REST-fallback path
+                # (#4526) emits "DUPLICATE_FOUND (REST fallback -- ...)".
+                [[ "$line" == DUPLICATE_FOUND* ]] && continue
                 [[ "$line" == NON_DISCRIMINATIVE* ]] && continue
                 [[ -z "$line" ]] && continue
 
