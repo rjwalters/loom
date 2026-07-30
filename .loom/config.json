@@ -80,5 +80,21 @@
       },
       "theme": "midnight"
     }
-  ]
+  ],
+  "safehouse": {
+    "enabled": true,
+    "socket": "/Users/rwalters/.loom/safehoused/state/safehoused.sock",
+    "room": "loom-fleet",
+    "persona": "loom_daemon",
+    "workerPersonas": [
+      "loom_builder_1",
+      "loom_builder_2",
+      "loom_builder_3",
+      "loom_builder_4",
+      "loom_builder_5",
+      "loom_builder_6",
+      "loom_builder_7",
+      "loom_builder_8"
+    ]
+  }
 }
