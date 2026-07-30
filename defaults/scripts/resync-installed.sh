@@ -440,8 +440,19 @@ resync_tree() {
 # a repo that commits `.loom/` (this repo dogfoods that layout). Removing a
 # tracked file based purely on one contributor's local skill install deletes a
 # repo-shared file for everyone else. So below, before removing the vendored
-# guard, we check whether the target is git-tracked and skip the removal (with a
-# warning) if so — only untracked (the normal consumer-repo) targets are removed.
+# guard, we check whether the target is git-tracked and skip the removal if so —
+# only untracked (the normal consumer-repo) targets are removed.
+#
+# #4566: that skip is reported as an informational `note`, NOT a `warn`. The
+# condition is a *steady state*, not an anomaly: it can only arise where a
+# maintainer deliberately committed the vendored fallback (posture (a) — keep the
+# tracked copy so contributors/CI without Repo Skills still get full generic-guard
+# coverage; see defaults/docs/guard-hooks.md). Resync already takes the only
+# correct action automatically, every run, forever — so an alarm-level line that
+# reprints on every resync with no way to acknowledge it is pure noise. A repo
+# that genuinely wants posture (b) drops the vendored copy deliberately with
+# `git rm .loom/hooks/guard-destructive-generic.sh`, after which this branch stops
+# firing entirely.
 CANONICAL_GUARD_PRESENT=0
 if [[ -r "$REPO_ROOT/.claude/skills/repo/hooks/guard-destructive.sh" ]] && \
    grep -q 'repo#29' "$REPO_ROOT/.claude/skills/repo/hooks/guard-destructive.sh" 2>/dev/null; then
@@ -463,8 +474,12 @@ if [[ -d "$DEFAULTS_DIR/hooks" && -d "$INSTALLED_HOOKS" ]]; then
                     # repo-shared state, not this host's local install. Removing it
                     # would delete a committed file for every other contributor based
                     # solely on this host's local, typically-gitignored Repo Skills
-                    # install. Leave it alone and warn instead.
-                    warn "hooks/$name is git-tracked in this repo but a canonical Repo Skills guard was detected locally — NOT removing a repo-shared tracked file based on one host's local install. If .loom/hooks/$name should genuinely be dropped repo-wide, remove it deliberately with 'git rm .loom/hooks/$name'."
+                    # install. Leave it alone.
+                    #
+                    # #4566: report this as a `note`, not a `warn` — a committed
+                    # vendored fallback is a deliberate, documented posture, so this
+                    # is the expected steady state on every run, not an anomaly.
+                    note "  ${GREEN}unchanged${NC} hooks/$name ${YELLOW}(git-tracked vendored fallback kept — canonical Repo Skills guard present; see defaults/docs/guard-hooks.md)${NC}"
                 elif [[ "$DRY_RUN" -eq 1 ]]; then
                     printf '%b\n' "  ${BOLD}would remove${NC} hooks/$name ${YELLOW}(canonical Repo Skills guard present)${NC}"
                 else
