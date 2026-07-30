@@ -71,16 +71,19 @@ jobs:
       # environment in ~600 places while other tests in the same binary
       # `Command::spawn` children; `Command::spawn` reads the environ
       # non-atomically, so those two classes raced and produced intermittent
-      # unrelated-test failures (2026-07-29: pipeline_snapshot, then
-      # quarantine_reconciliation). `#[serial]` only serializes *marked* tests
-      # against each other, so it never closed that window. nextest runs each
-      # test in its own process, which closes it by construction. Tests whose
-      # shared state is genuinely cross-process (the `tmux -L loom` server, real
-      # daemon children) are given exclusivity in `.config/nextest.toml`.
+      # failures in hermetic, untouched tests (2026-07-29: pipeline_snapshot on
+      # PR #4305, then quarantine_reconciliation on PR #4320). `#[serial]` only
+      # serializes *marked* tests against each other, so it never closed that
+      # window. nextest runs each test in its own process, which closes it by
+      # construction. Tests whose shared state is genuinely cross-process (the
+      # `tmux -L loom` server, real daemon children) are given exclusivity in
+      # `.config/nextest.toml`.
       - uses: taiki-e/install-action@nextest
-      - run: cargo nextest run --workspace
-      # nextest does not run doctests — keep them covered separately.
-      - run: cargo test --workspace --doc
+      - name: Run tests (process-per-test)
+        run: cargo nextest run --workspace --profile ci
+      # nextest does not run doctests, so libtest still owns those (#4385).
+      - name: Run doctests
+        run: cargo test --workspace --doc
 
   mcp-build:
     name: MCP Server Build

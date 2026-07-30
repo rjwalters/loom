@@ -8,9 +8,11 @@
 # places while other tests in the same binary `Command::spawn` child processes.
 # `Command::spawn` reads the process environ non-atomically, so an env mutation
 # racing a spawn can corrupt a child's environment mid-flight — the cause of the
-# 2026-07-29 CI flakes in `pipeline_snapshot` and `quarantine_reconciliation`.
-# `#[serial]` (serial_test) only serializes *marked* tests against each other, so
-# it never closed that window. Process-per-test closes it by construction.
+# 2026-07-29 CI flakes in `pipeline_snapshot` (PR #4305) and
+# `quarantine_reconciliation` (PR #4320). `#[serial]` (serial_test) only
+# serializes *marked* tests against each other, so it never closed that window.
+# Process-per-test closes it by construction, including for every future test
+# nobody remembers to mark.
 #
 # THE TRADE-OFF THIS FILE MANAGES
 #
@@ -19,11 +21,23 @@
 # just in-process env/statics) therefore need an explicit override here — process
 # isolation does nothing for state that lives outside the process.
 #
-# See `loom-daemon/src/lib.rs` (crate-level "Test isolation" docs) for the
-# convention daemon test authors should follow.
+# See `loom-daemon/src/lib.rs` (crate-level "Test isolation convention" docs) for
+# the author-facing version of this contract.
 
 nextest-version = "0.9.98"
 
+[profile.default]
+# Surface slow tests early rather than letting them silently pad CI wall time.
+# Only *terminate* well past any plausible honest runtime.
+slow-timeout = { period = "60s", terminate-after = 6 }
+# Retries are deliberately 0: this config exists to remove flakes, not to paper
+# over them. A red run stays red.
+retries = 0
+failure-output = "immediate-final"
+status-level = "fail"
+
+# --- Cross-process exclusive state ------------------------------------------
+#
 # The daemon integration suites share host-global state that no amount of process
 # isolation can separate, and they are latency-sensitive:
 #
@@ -31,16 +45,31 @@ nextest-version = "0.9.98"
 #   * `cleanup_all_loom_sessions()` in each suite's `setup()`, which kills EVERY
 #     `loom-*` session — including sessions owned by a concurrently running test
 #     in another process,
-#   * a real `loom-daemon` child per test, which must create its socket inside a
-#     fixed timeout — a wall-clock budget that a machine saturated by ~2200
-#     concurrent unit tests will blow.
+#   * a real `loom-daemon` child per test (plus a `cargo build --bin loom-daemon`
+#     from `TestDaemon::start()`), which must create its socket inside a fixed
+#     timeout — a wall-clock budget that a machine saturated by ~2200 concurrent
+#     unit tests will blow.
 #
 # `cargo test` gave them this isolation implicitly: it runs one test binary at a
 # time, so no unit test was ever in flight beside them. `threads-required =
 # 'num-test-threads'` reproduces that property under nextest — each of these
 # tests takes the whole thread budget, so it runs alone. It is deliberately
-# stronger than a `max-threads = 1` test group (which would only serialize these
-# tests against *each other*, still letting the unit suite run alongside).
+# stronger than a `max-threads = 1` test group, which would only serialize these
+# tests against *each other* while still letting the unit suite run alongside
+# (empirically not enough: the daemon needs >2s to bind its socket against a
+# 5s budget on a loaded host).
 [[profile.default.overrides]]
 filter = 'package(loom-daemon) & kind(test) & (binary(integration_basic) | binary(integration_factory_reset) | binary(integration_security) | binary(integration_singleton_guard))'
 threads-required = 'num-test-threads'
+# Booting a real daemon (including a debug `cargo build`) is slow by nature.
+slow-timeout = { period = "120s", terminate-after = 5 }
+
+# --- CI profile -------------------------------------------------------------
+#
+# Inherits every setting above from `default`, including the overrides (nextest
+# merges a profile's overrides with the default profile's). CI wants the full
+# failure list rather than a fail-fast bail-out.
+[profile.ci]
+fail-fast = false
+failure-output = "immediate-final"
+final-status-level = "fail"

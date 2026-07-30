@@ -1,56 +1,76 @@
-//! The `loom-daemon` library crate: the Tier 2 orchestration daemon's modules,
-//! exposed as a library so they can be unit-tested without the binary's tokio
-//! runtime.
+//! Loom daemon internals, exposed as a library so unit tests can run without
+//! the binary's tokio runtime.
 //!
 //! # Test isolation convention (READ BEFORE ADDING TESTS)
 //!
-//! **Environment mutation and child-process spawning share one isolation
-//! domain.** This crate's tests call `std::env::set_var` / `remove_var` in
-//! hundreds of places, and many other tests in the same binary
-//! `std::process::Command::spawn` child processes (fake `gh`/`git` shims, real
-//! `loom-daemon` children). `Command::spawn` reads the process environ
-//! non-atomically, so an env mutation on one thread racing a spawn on another
-//! can hand the child a torn environment — the cause of the 2026-07-29 CI
-//! flakes in `pipeline_snapshot` and `quarantine_reconciliation` (#4385). This
-//! is the same hazard that made `env::set_var` `unsafe` in Rust edition 2024.
+//! **Env mutation and child-spawning tests share one isolation domain.** This
+//! crate reads configuration from process-global environment variables in
+//! hundreds of places, and its tests set/remove those vars to exercise the
+//! `env > config > default` precedence. Many other tests call
+//! `std::process::Command::spawn` (fake `gh`/`git` shims, real `loom-daemon`
+//! children, `tmux`). `spawn` snapshots the process environ non-atomically, so a
+//! concurrent `env::set_var` / `remove_var` can hand a child a torn environment
+//! — the exact hazard that made `env::set_var` `unsafe` in Rust edition 2024. It
+//! is not theoretical: it produced intermittent CI failures in otherwise
+//! hermetic, untouched tests — `pipeline_snapshot` on PR #4305 and
+//! `quarantine_reconciliation` on PR #4320, both on 2026-07-29 (issue #4385).
 //!
-//! `#[serial]` (`serial_test`) does **not** close that window: its lock is
-//! in-process and advisory, so it only serializes *marked* tests against each
-//! other. Any unmarked test — including every future one nobody remembers to
-//! mark — still runs concurrently with a marked env mutator.
+//! `#[serial]` (from `serial_test`) does **not** solve this on its own. Its lock
+//! is advisory and in-process: it serializes marked tests against each other,
+//! while every *unmarked* test in the same binary — including every future one
+//! nobody remembers to mark — still runs concurrently with them.
 //!
 //! ## What CI does
 //!
-//! CI runs the workspace suite with **`cargo nextest run --workspace`**
-//! (`.github/workflows/ci.yml`, `backend-tests` job), which executes **each test
-//! in its own process**. One test's env mutation is therefore invisible to every
-//! other test by construction, and so are process-global statics
-//! (`OnceLock`/`Mutex` caches, atomics). Doctests are covered by a separate
-//! `cargo test --workspace --doc` step, since nextest does not run them.
+//! CI runs the workspace suite with [`cargo nextest`](https://nexte.st) — **one
+//! process per test** (`.github/workflows/ci.yml`, `backend-tests` job). One
+//! test's env mutation is then invisible to every other test by construction,
+//! and so are process-global statics (`OnceLock` / `Mutex` caches, atomics).
+//! Configuration lives in `.config/nextest.toml`. Doctests are covered by a
+//! separate `cargo test --workspace --doc` step, since nextest does not run them.
 //!
-//! ## What this means for you
+//! ## What you should do
 //!
-//! - **Mutating env in a test is fine.** You do not need `#[serial]` for env
-//!   isolation under nextest; existing `#[serial]` attributes are retained
-//!   because they still help plain `cargo test` runs, and they are harmless
-//!   (a no-op) under process-per-test.
-//! - **Prefer `cargo nextest run` for local full-suite runs.** Plain `cargo test`
-//!   still runs a binary's tests on parallel threads, so it can still surface
-//!   this race locally. CI is the arbiter of green.
-//! - **Process isolation does nothing for state outside the process.** If a test
-//!   needs exclusive access to genuinely *cross-process* state — the shared
-//!   `tmux -L loom` server, a fixed path under the real `$HOME`, global git
-//!   config, a fixed port — `#[serial]` is not enough either, because nextest
-//!   runs tests from *all* binaries concurrently (plain `cargo test` ran
-//!   binaries one at a time). Give such tests an override in
-//!   `.config/nextest.toml` — either `threads-required = 'num-test-threads'` to
-//!   run alone (what the `integration_*` suites use: they drive the shared tmux
-//!   server and spawn real daemons) or a `max-threads = 1` test group to
-//!   serialize a family against itself — or mark them
-//!   `#[serial_test::file_serial]` for a file-lock-based cross-process mutex.
-//! - **Otherwise, keep tests hermetic**: `tempfile::TempDir` for paths, explicit
-//!   `.env()` on `Command` for child environments, injected binary paths (e.g.
-//!   `with_gh_bin`) instead of `PATH` lookups.
+//! * **Prefer `cargo nextest run` for full-suite local runs.** Plain `cargo
+//!   test` runs every test in a binary on shared threads and therefore still
+//!   races; a failure seen only under `cargo test` may be this, not your change.
+//!   CI is the arbiter of green.
+//! * **Keep `#[serial]` on env-mutating tests.** It is a no-op under nextest but
+//!   still load-bearing for developers running plain `cargo test`, and it
+//!   documents the dependency. Adding it to a new env-mutating test is correct.
+//! * **Restore what you mutate.** Set the var, assert, then remove it — process
+//!   isolation makes leakage invisible under nextest but not under `cargo test`.
+//! * **Do not depend on a var being *absent*.** Process isolation gives you the
+//!   *real* ambient environment, not a sibling test's leftovers. A test that
+//!   needs `$LOOM_*` unset must clear it itself (see
+//!   `workspace_pool::tests::clear_safehouse_env`) — any agent session spawned by
+//!   a running daemon exports a pile of `LOOM_*` vars.
+//! * **Prefer an explicit seam over an env var** where one exists (e.g. pass a
+//!   `gh` binary path in with `with_gh_bin`, take a root `&Path` argument). A
+//!   test that never touches the environ cannot participate in this class of bug
+//!   at all. Likewise use `tempfile::TempDir` for paths and explicit `.env()` on
+//!   `Command` for child environments.
+//!
+//! ## When a test truly needs cross-process exclusive state
+//!
+//! Process isolation supersedes `#[serial]` only for *process*-scoped state (env
+//! vars, cwd, process-local statics). It does nothing for a resource shared
+//! *between* processes: a fixed path outside a `tempfile::TempDir`, the real
+//! `$HOME`, global git config, a fixed TCP port, or the shared `tmux -L loom`
+//! server. `#[serial]` is not enough for those either, because nextest runs tests
+//! from *all* binaries concurrently (plain `cargo test` ran binaries one at a
+//! time). Declare such tests in `.config/nextest.toml` — `threads-required =
+//! 'num-test-threads'` to run alone, or a `max-threads = 1` test group to
+//! serialize a family against itself — or use `serial_test::file_serial`, which
+//! takes an inter-process file lock.
+//!
+//! Today the one such override covers the `integration_basic`,
+//! `integration_security`, `integration_factory_reset`, and
+//! `integration_singleton_guard` binaries: each spawns real `loom-daemon`
+//! children and calls `cleanup_all_loom_sessions()`, which kills every `loom-*`
+//! session on the shared tmux server. If you add a test that touches that
+//! server, or any other machine-global resource, add it to that filter — do not
+//! rely on `#[serial]`.
 
 // These modules were originally private to the binary crate. Exposing them as
 // a library (to allow unit tests to run without the binary's tokio runtime)
