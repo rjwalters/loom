@@ -336,7 +336,9 @@ For the authoritative, end-to-end implementation — the 6 safety criteria, the 
 - Manual close may be needed for cross-repo references
 
 **Blocked issues not unblocking**
-- Verify dependency format: "Blocked by #123" or "Depends on #123"
+- Verify dependency format: "Blocked by #123" or "Depends on #123" — markdown
+  emphasis and an optional colon before `#N` are also tolerated, e.g.
+  "**Blocked by:** #123 (reason)" or "_Depends on_ #123" (#4508)
 - Check if all dependencies are truly closed
 - Manual unblock may be needed for complex dependency patterns
 
