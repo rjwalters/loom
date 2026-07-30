@@ -470,7 +470,7 @@ pub fn build_plan(config: &AddWorkerConfig, secrets: &Secrets) -> Plan {
     // 6. Clone + init workspace repos (init installs the /loom:sweep command, #4027).
     plan.push_step(Step::new(
         "workspace-clone",
-        "clone workspace repo(s) and run loom-daemon init (installs /loom:sweep)",
+        "clone workspace repo(s) and run loom-daemon init on unconfigured ones (installs /loom:sweep)",
         Some(render_workspace_clone_check(&config.repos)),
         render_workspace_clone(&config.repos),
     ));
@@ -819,6 +819,23 @@ fn render_workspace_clone_check(repos: &[String]) -> String {
     s
 }
 
+/// Render the workspace clone + first-time init step.
+///
+/// **`loom-daemon init` runs only on a workspace that is not yet configured**
+/// (issue #4641). It used to run unconditionally — unlike the `gh repo clone`
+/// above it, which has always been guarded by `[ ! -d .../.git ]` — so every
+/// re-run of `fleet add-worker` (or any idempotent self-heal pass over an
+/// existing host) re-entered `init`'s `.loom/config.json` merge on a workspace
+/// an operator had since hand-tuned. That merge is existing-wins and normally
+/// harmless, but its invalid-JSON fallback branch overwrites the file
+/// wholesale, which is a plausible cause of the observed silent reversion of
+/// `autonomous.workFinder.maxConcurrent` on `loom-worker-1`.
+///
+/// Provisioning only needs `init` to *establish* a workspace; keeping an
+/// already-established one up to date is `loom update` / the resync script's
+/// job, neither of which touches `.loom/config.json`. Gating on
+/// `.loom/config.json` (rather than on having just cloned) also self-heals a
+/// workspace that was cloned by a previous run whose `init` failed.
 fn render_workspace_clone(repos: &[String]) -> String {
     let mut s = String::from(
         r#"set -e
@@ -833,7 +850,11 @@ mkdir -p "$HOME/loom-workspaces"
             r#"if [ ! -d "$HOME/{rel}/.git" ]; then
   gh repo clone {repo} "$HOME/{rel}"
 fi
-loom-daemon init "$HOME/{rel}" --defaults "$LOOM_SRC/defaults" || true
+if [ ! -f "$HOME/{rel}/.loom/config.json" ]; then
+  loom-daemon init "$HOME/{rel}" --defaults "$LOOM_SRC/defaults" || true
+else
+  echo "skip init: $HOME/{rel} already configured (.loom/config.json present)"
+fi
 "#
         ));
     }
@@ -1300,6 +1321,41 @@ mod tests {
                 "safehouse",
                 "verify",
             ]
+        );
+    }
+
+    #[test]
+    fn workspace_clone_only_inits_an_unconfigured_workspace() {
+        // #4641: `loom-daemon init` used to run unconditionally here, so every
+        // re-run of provisioning re-entered the `.loom/config.json` merge on a
+        // workspace an operator had since hand-tuned. The init call must now sit
+        // behind a `.loom/config.json` existence guard, the same way the clone
+        // sits behind a `.git` guard.
+        let script = render_workspace_clone(&["rjwalters/anvil".to_string()]);
+
+        assert!(
+            script.contains(r#"if [ ! -f "$HOME/loom-workspaces/anvil/.loom/config.json" ]; then"#),
+            "init must be guarded on the workspace being unconfigured:\n{script}"
+        );
+
+        // The guard must actually enclose the init call: the only `loom-daemon
+        // init` line has to appear after the guard and before its `else`.
+        let guard = script
+            .find(r#"if [ ! -f "$HOME/loom-workspaces/anvil/.loom/config.json" ]"#)
+            .expect("guard present");
+        let init = script.find("loom-daemon init").expect("init present");
+        let else_branch = script.find("\nelse\n").expect("else present");
+        assert!(guard < init && init < else_branch, "init is outside the guard:\n{script}");
+        assert_eq!(
+            script.matches("loom-daemon init").count(),
+            1,
+            "no second, unguarded init call may remain:\n{script}"
+        );
+
+        // The clone itself stays guarded on .git (unchanged behavior).
+        assert!(
+            script.contains(r#"if [ ! -d "$HOME/loom-workspaces/anvil/.git" ]; then"#),
+            "clone guard regressed:\n{script}"
         );
     }
 

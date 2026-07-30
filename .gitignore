@@ -74,6 +74,7 @@ Thumbs.db
 .loom/*.log
 .loom/*.sock
 .loom/*.tmp
+.loom/*.bak
 .loom/logs/
 # <<< loom-managed <<<
 .loom-test-failure-context.json
