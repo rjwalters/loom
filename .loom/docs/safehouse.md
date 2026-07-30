@@ -584,13 +584,27 @@ what feeds the public fleet feed on 2amlogic.com. Loom is the producer:
      - **Lookback window**: rows merged more than **7 days** ago are dropped
        before the dedup check (`LOOM_SAFEHOUSE_RECONCILE_MAX_AGE_SECS`
        overrides; garbage/negative values fall back to the default). `--limit
-       30` bounds a burst's *size*, not its *age* — without the window, the
-       first pass on a host with no persisted dedup set (fresh install, the
-       upgrade to this version, a lost/corrupt completions file) would backfill
-       the feed with the last 30 merges however old they are, which in a
-       low-traffic workspace means narrating months-old PRs as if they just
-       landed. Seven days is far beyond any plausible daemon outage, so the
-       daemon-was-down case below still recovers.
+       30` bounds a burst's *size*, not its *age* — without the window, a pass
+       on a host with no persisted dedup set (fresh install, the upgrade to
+       this version, a lost/corrupt completions file) would backfill the feed
+       with the last 30 merges however old they are, which in a low-traffic
+       workspace means narrating months-old PRs as if they just landed. Seven
+       days is far beyond any plausible daemon outage, so the daemon-was-down
+       case below still recovers.
+     - **Seed-only first pass per workspace (#4649)**: the lookback window
+       alone still allowed a *burst* — up to 30 genuinely-in-window merges
+       narrated in one tick — the very first time a workspace was reconciled
+       on a host with no reliable persisted dedup state (absent, corrupt, or
+       unreadable `~/.loom/safehouse-completed.json`; a legitimately empty but
+       valid file, e.g. a host that already reconciled to zero, does **not**
+       count as fresh). In that case each workspace's first-ever reconciliation
+       tick after startup inserts every in-window `(workspace, issue)` into the
+       dedup set and persists it, but drops the resulting envelopes instead of
+       narrating them. The same workspace's next tick — and every tick on a
+       host whose dedup file was not fresh to begin with — narrates normally.
+       Trade-off: a merge that landed just before a fresh install is silently
+       never narrated, which is acceptable since nothing was watching the feed
+       at install time anyway.
 - **`meta` (`completion-v1`)**: `{schema, agent, repo, ref, result, started_at,
   completed_at}` required, plus optional `issue`/`tokens`/`title`/`additions`/
   `deletions` (envelope-v1 preserves unknown `meta` keys, so no schema rev is
@@ -642,8 +656,9 @@ what feeds the public fleet feed on 2amlogic.com. Loom is the producer:
   lookback window still covered them) or silently drop a merge that happened
   while the daemon was down. It is written atomically (temp file + rename) and
   every failure to read or write it is best-effort — a corrupt or unwritable
-  file degrades to "the pre-#4583 behavior, plus a bounded re-narration window",
-  never to a crash. It grows by one `["<workspace>", <issue>]` pair (~32 bytes)
+  file degrades to "no reliable prior state", never to a crash, which (#4649)
+  now routes through the seed-only first pass above rather than re-narrating a
+  potential backlog outright. It grows by one `["<workspace>", <issue>]` pair (~32 bytes)
   per narrated completion and is never pruned; at Loom's own merge rate that is
   a couple of MB per decade, so no compaction is implemented. Downstream ingest
   is additionally idempotent on `event_id`.
