@@ -365,9 +365,18 @@ warn_stale_entry_points() {
     local resolved_real=""
     [[ -n "$resolved" ]] && resolved_real="$(_lde_realpath "$resolved")"
 
+    # Counters are tracked ALONGSIDE the arrays rather than derived from them
+    # with `${#arr[@]}`. Under `set -u` (line 217), bash < 4.4 — notably the
+    # bash 3.2 stock macOS still ships, and this script's launchd paths are
+    # macOS-first — treats an empty array as unset, so `${#stale_lines[@]}`
+    # would abort the whole update with "unbound variable" on the overwhelmingly
+    # common clean-PATH case. Every array read below is likewise guarded with
+    # the `${arr[@]+"${arr[@]}"}` idiom for the same reason.
     local -a stale_lines=()
     local -a daemon_hits=()
     local -a seen_dirs=()
+    local stale_count=0
+    local daemon_count=0
 
     local oldifs="$IFS"
     IFS=':'
@@ -397,6 +406,7 @@ warn_stale_entry_points() {
 
             if [[ "$name" == "loom-daemon" ]]; then
                 daemon_hits+=("$entry")
+                daemon_count=$((daemon_count + 1))
                 continue
             fi
 
@@ -413,17 +423,19 @@ warn_stale_entry_points() {
                     continue  # a current shim pointing at the resolved binary
                 fi
                 stale_lines+=("$entry — PATH shim execs $shim_target, which is NOT the resolved binary (${resolved:-<none>})")
+                stale_count=$((stale_count + 1))
                 continue
             fi
 
             stale_lines+=("$entry — $(_lde_describe "$entry")")
+            stale_count=$((stale_count + 1))
         done
     done
 
-    if [[ ${#stale_lines[@]} -gt 0 ]]; then
-        warn "Stale 'loom-*' entry points found on PATH (${#stale_lines[@]}):"
+    if (( stale_count > 0 )); then
+        warn "Stale 'loom-*' entry points found on PATH ($stale_count):"
         local line
-        for line in "${stale_lines[@]}"; do
+        for line in ${stale_lines[@]+"${stale_lines[@]}"}; do
             warn "  - $line"
         done
         warn "These do NOT resolve to the current loom-daemon binary. Loom's Python package"
@@ -436,10 +448,10 @@ warn_stale_entry_points() {
     # A second, distinct hazard: more than one `loom-daemon` on PATH. The first
     # wins for every caller that resolves by name, so later ones are shadowed —
     # exactly the ambiguity #4079 made costly.
-    if [[ ${#daemon_hits[@]} -gt 1 ]]; then
+    if (( daemon_count > 1 )); then
         warn "Multiple 'loom-daemon' binaries on PATH — the FIRST shadows the rest:"
         local hit
-        for hit in "${daemon_hits[@]}"; do
+        for hit in ${daemon_hits[@]+"${daemon_hits[@]}"}; do
             warn "  - $hit ($("$hit" --version 2>/dev/null | head -n1 || echo 'version unreadable'))"
         done
         warn "Callers resolving 'loom-daemon' by name get ${daemon_hits[0]}. Remove the others"
