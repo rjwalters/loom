@@ -21,6 +21,7 @@ test-cleanup-branches-pr-review-branch.sh
 test-config-resolver.sh
 test-config-tiers-cli-migration.sh
 test-default-branch.sh
+test-dependency-parse.sh
 test-disk-headroom.sh
 test-fleet-check.sh
 test-fleet-send.sh
