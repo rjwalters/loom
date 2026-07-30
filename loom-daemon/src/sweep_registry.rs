@@ -1436,13 +1436,62 @@ fn exhaustion_signatures() -> &'static [(&'static str, Regex)] {
     })
 }
 
+/// The PER-MODEL usage-ceiling signature (#4501): `You've reached your Fable 5
+/// limit. Run /usage-credits to continue or switch models with /model.` The model
+/// name sits between "your" and "limit", so none of the "hit your … limit"
+/// phrasings in [`exhaustion_signatures`] matched it — a child that insta-crashed
+/// on this banner was charged to the ISSUE's quarantine tally instead of the
+/// ACCOUNT, which is exactly backwards. The filler is bounded to at most three
+/// words so an unrelated sentence merely ending in "limit" cannot match.
+///
+/// Kept out of [`exhaustion_signatures`] because it needs the line-wise
+/// concurrency exclusion below, which a plain `(label, regex)` row cannot express
+/// (the `regex` crate has no lookaround).
+fn model_limit_signature() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?i)reached your (?:\S+\s+){0,3}limit")
+            .expect("valid static model-limit regex")
+    })
+}
+
+/// The concurrent-session-limit wording (#3947), used ONLY to exclude a line from
+/// [`model_limit_signature`] (#4501). `Error: you have reached your concurrent
+/// session limit` also matches the "reached your … limit" shape, but it is a
+/// CAPACITY fault (the account is healthy, it just cannot start another
+/// simultaneous session) — marking the account bad for it would shrink the healthy
+/// pool. This mirrors `classify-error.sh`'s SESSION_LIMIT-before-TOKEN_EXHAUSTED
+/// ordering on the daemon side.
+fn session_capacity_exclusion() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"(?i)concurrent (session|sessions|request)|maximum number of concurrent|too many concurrent|simultaneous session|another session is (already )?(active|running)",
+        )
+        .expect("valid static session-capacity regex")
+    })
+}
+
 /// Scan `log_tail` for any account-exhaustion signature (#4122). Returns the
 /// matched signature label on the first hit, else `None`.
+///
+/// The per-model ceiling (#4501) is matched LINE-WISE after the table rows, so a
+/// line whose wording is a concurrent-session capacity fault (#3947) is skipped
+/// rather than mistaken for quota exhaustion.
 fn classify_account_exhaustion(log_tail: &str) -> Option<&'static str> {
-    exhaustion_signatures()
+    if let Some(label) = exhaustion_signatures()
         .iter()
         .find(|(_, re)| re.is_match(log_tail))
         .map(|(label, _)| *label)
+    {
+        return Some(label);
+    }
+    log_tail
+        .lines()
+        .any(|line| {
+            model_limit_signature().is_match(line) && !session_capacity_exclusion().is_match(line)
+        })
+        .then_some("model-limit")
 }
 
 // ============================================================================
@@ -9540,6 +9589,55 @@ exit 0
         );
         assert_eq!(classify_account_exhaustion("thread 'main' panicked at foo.rs:1"), None);
         assert_eq!(classify_account_exhaustion(""), None);
+    }
+
+    /// Issue #4501: the CLI's PER-MODEL ceiling is an account fault too. Before
+    /// this, a child that insta-crashed on "You've reached your Fable 5 limit"
+    /// matched no signature, so the reaper charged the ISSUE's quarantine tally
+    /// instead of marking the account bad — the daemon-side half of the same
+    /// missed phrasing `classify-error.sh` missed.
+    #[test]
+    fn classify_account_exhaustion_matches_per_model_ceiling() {
+        assert_eq!(
+            classify_account_exhaustion(
+                "You've reached your Fable 5 limit. Run /usage-credits to continue or switch \
+                 models with /model."
+            ),
+            Some("model-limit")
+        );
+        assert_eq!(
+            classify_account_exhaustion("Claude: you have reached your limit"),
+            Some("model-limit")
+        );
+        // A concurrent-session capacity fault (#3947) must NOT be treated as
+        // exhaustion — marking the account bad would shrink the healthy pool.
+        assert_eq!(
+            classify_account_exhaustion("Error: you have reached your concurrent session limit"),
+            None
+        );
+        // An unrelated sentence that merely ends in "limit" is not exhaustion.
+        assert_eq!(
+            classify_account_exhaustion(
+                "reached your goal well before the team agreed on any spending limit"
+            ),
+            None
+        );
+        // Mixed tail: the model-limit line still classifies even when a
+        // concurrency line is also present.
+        assert_eq!(
+            classify_account_exhaustion(
+                "Error: you have reached your concurrent session limit\n\
+                 You've reached your Fable 5 limit. Run /usage-credits to continue."
+            ),
+            Some("model-limit")
+        );
+        // The legacy table still wins its label when both shapes appear.
+        assert_eq!(
+            classify_account_exhaustion(
+                "You've hit your weekly limit\nYou've reached your Fable 5 limit."
+            ),
+            Some("rate-limited")
+        );
     }
 
     /// #4386: `classify_preflight_death` matches the explicit

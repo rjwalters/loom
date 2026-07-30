@@ -1817,6 +1817,26 @@ which backs off stacking for the saturated account; a bounded
 spinning, after which it falls through to normal transient backoff (still without
 marking the token bad).
 
+**Per-model limit handling + one retry verdict (#4501).** The CLI also emits a
+**per-model** ceiling — `You've reached your Fable 5 limit. Run /usage-credits to
+continue or switch models with /model.` — whose model name sits between "your" and
+"limit". That phrasing matched none of the older "hit your … limit" patterns, so
+rotation never fired and every child died instantly; `classify-error.sh` now
+matches the `reached your <model> limit` family as `TOKEN_EXHAUSTED` (ordered
+*after* the `SESSION_LIMIT` branch so "reached your concurrent session limit`"
+keeps its capacity classification). Reusing `TOKEN_EXHAUSTED` is a deliberate safe
+over-approximation: a Fable-only ceiling does not exhaust `sonnet` on the same
+account, so the pool is slightly pessimistic but rotation is correct, and no
+downstream consumer has to learn a new category. Relatedly, `claude-wrapper.sh`'s
+retry decision no longer keeps its own pattern list — `is_transient_error` derives
+it from `classify_error`'s category via the shared `classification_is_transient`
+**deny-list** (terminal: `SUCCESS`, `TIMEOUT`, `TOKEN_EXPIRED`, `CWD_DELETED`,
+`MODEL_REFUSAL`, `FATAL`; everything else retried, bounded by `LOOM_MAX_RETRIES`).
+That makes the observed contradiction — `Non-transient error detected - not
+retrying` printed next to `classification=RECOVERABLE` — structurally impossible,
+and means an *unrecognized* non-zero exit is now retried rather than dying on
+attempt 1.
+
 The **effective** per-tick concurrency is then `min(dynamic_cap, backlog_depth)`:
 `tick()` iterates the ready `loom:issue` rows and stops at the cap, so
 concurrency **scales up** as the backlog grows and drains to **zero** dispatches
@@ -2065,6 +2085,7 @@ exactly like `main_health_gate::read_build_gate_config`.
 | `autonomous.roleRunner.enabled` | `LOOM_ROLE_RUNNER` | `false` | Periodic standalone support-role runner on/off (#4015). **Resolved per registered root** (#4377) — see the callout below the table |
 | `autonomous.roleRunner.roles` | *(config only)* | all 5 roles | Subset of `champion`/`curator`/`judge`/`auditor`/`guide` to dispatch; explicit empty array runs none. Also resolved from each root's own config |
 | `autonomous.roleRunner.intervalSecs` | `LOOM_ROLE_RUNNER_INTERVAL_SECS` | per-role built-in (5–15 min) | Uniform override applied to every enabled role's cadence |
+| `autonomous.roleRunner.model` | *(config only)* | `sonnet` | Model every role child is pinned to via `--model` (#4501). Resolved through the same `resolve_dispatch_model` chain as sweep dispatch: this key > `autonomous.model` > shipped default; blanks treated as unset. A role child never inherits the account's interactive CLI default |
 | `autonomous.roleRunner.onIdle` | *(config only)* | `[]` (none) | Subset of the same 5 roles to also fire on the work-finder **idle edge** (#4364) — the non-idle → idle transition (0 in-flight sweeps AND nothing dispatched this tick), in addition to the interval cadence. Absent → none (opposite default from `roles`); unknown names ignored with a warning. Debounced to min 60s per (root, role) and skipped while that role's interval/idle run is in progress. **Requires the work finder enabled** to observe idleness (a startup warning fires if set with the work finder off). **Also gated by that same root's own `enabled`** (#4377) — see below |
 | `autonomous.idleExit.enabled` | `LOOM_AUTONOMOUS_IDLE_EXIT_ENABLED` | `false` | End the daemon cleanly after the idle window so a host guard can take over. Independent of Work Finder; never invokes a power command |
 | `autonomous.idleExit.idleMinutes` | `LOOM_AUTONOMOUS_IDLE_EXIT_MINUTES` | `60` | Continuous idle/starvation window. Zero/invalid → default |
@@ -2800,6 +2821,19 @@ leaves the daemon's behavior byte-for-byte unchanged:
 | `LOOM_ROLE_RUNNER_INTERVAL_SECS` | `autonomous.roleRunner.intervalSecs` | env > config > default | per-role built-in (see above) |
 | — | `autonomous.roleRunner.roles` | config only | all five roles |
 | — | `autonomous.roleRunner.onIdle` | config only | `[]` (none) |
+| — | `autonomous.roleRunner.model` | config only (`roleRunner.model` > `autonomous.model` > default) | `sonnet` (`DEFAULT_DISPATCH_MODEL`) |
+
+**Role children are model-pinned (#4501).** Every role spawn appends an explicit
+`--model <resolved>` (immediately after the prompt, mirroring sweep dispatch), so
+a scheduled role never inherits the selected account's *interactive* CLI default.
+Before this, a host whose CLI default was `fable` ran every curator/champion/judge
+tick on the most constrained quota tier and then died instantly on "You've reached
+your Fable 5 limit". Resolution reuses `resolve_dispatch_model` — the same chain
+sweeps use, including the #3982 logical-tier aliases (`opus` → `claude-opus-5`) —
+with `autonomous.roleRunner.model` occupying the explicit-request tier. Blank
+values are treated as unset at every tier (`--model ""` is never emitted). The
+resolved model and the tier that supplied it are recorded in the per-role log
+header: `==== loom-daemon role_runner: <ts> role=<role> model=<m> (source=<tier>) ====`.
 
 `roles` restricts the dispatched subset (an explicit empty array runs none;
 unknown names are ignored with a warning). `intervalSecs` — both the env var
