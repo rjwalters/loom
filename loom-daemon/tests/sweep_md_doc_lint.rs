@@ -554,6 +554,222 @@ fn sweep_md_documents_explicit_hold_check_in_blocked_taxonomy_row() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Issue #4670 — GraphQL-exhaustion REST fallback for Mode B issue discovery and
+// Mode C PR discovery. GraphQL (`gh issue list` / `gh pr list` / `gh label
+// list`) and REST (`gh api repos/{owner}/{repo}/…`) draw on independent quotas,
+// so an exhausted GraphQL budget must not strand candidate resolution while
+// thousands of REST requests remain. The fallback is orchestrator-executed
+// prose (no script backs Mode B/C candidate discovery), so this doc-lint is the
+// only mechanical guard against a future edit silently deleting it.
+//
+// Per #3877: the detection signatures, REST endpoints, jq filters, and the
+// local repo-resolution command are CONTRACT (pinned EXACT — they are the
+// literal strings an orchestrator must reproduce); section lead-ins and the
+// fail-safe/ladder semantics are PROSE (pinned structurally / via tolerant
+// phrasing sets).
+// ---------------------------------------------------------------------------
+
+/// #4670: BOTH Mode B (issue discovery) and Mode C (PR discovery) carry a
+/// GraphQL-exhaustion fallback section — one before the `### Mode C` heading,
+/// one after. A single shared section in only one mode is the regression this
+/// ordering check exists to catch.
+#[test]
+fn sweep_md_documents_graphql_exhaustion_fallback_in_both_mode_b_and_mode_c() {
+    let content = read_sweep_md();
+
+    // PROSE (structural presence): the bold lead-in name is the anchor; the
+    // trailing "(REST issue discovery, #4670)" / "(REST PR discovery, #4670)"
+    // qualifiers are editorial and deliberately not pinned.
+    let occurrences = content.matches("GraphQL-exhaustion fallback").count();
+    assert!(
+        occurrences >= 2,
+        "sweep.md must document a `GraphQL-exhaustion fallback` in BOTH the \
+         Mode B (issue discovery) and Mode C (PR discovery) sections (#4670); \
+         found {occurrences} occurrence(s)"
+    );
+
+    let mode_c_heading = content
+        .find("### Mode C — PR-set mode")
+        .expect("sweep.md is missing the `### Mode C — PR-set mode` heading");
+    let first_fallback = content
+        .find("GraphQL-exhaustion fallback")
+        .expect("checked non-empty above");
+    let last_fallback = content
+        .rfind("GraphQL-exhaustion fallback")
+        .expect("checked non-empty above");
+
+    assert!(
+        first_fallback < mode_c_heading,
+        "sweep.md's first `GraphQL-exhaustion fallback` (byte offset \
+         {first_fallback}) must sit in the Mode B section, i.e. BEFORE the \
+         `### Mode C — PR-set mode` heading (byte offset {mode_c_heading}) — \
+         #4670 requires issue discovery to have its own REST fallback"
+    );
+    assert!(
+        last_fallback > mode_c_heading,
+        "sweep.md's last `GraphQL-exhaustion fallback` (byte offset \
+         {last_fallback}) must sit in the Mode C section, i.e. AFTER the \
+         `### Mode C — PR-set mode` heading (byte offset {mode_c_heading}) — \
+         #4670 requires PR discovery to have its own REST fallback"
+    );
+}
+
+/// #4670: the exhaustion-detection signature table is pinned EXACT. It mirrors
+/// `defaults/scripts/check-duplicate.sh`'s `is_rate_limit_error()` (itself
+/// mirrored from `loom-daemon/src/rate_limit_breaker.rs`'s
+/// `RATE_LIMIT_SIGNATURES`) — deriving a new, subtly different signature set is
+/// exactly the drift this pins against. Note that `api rate limit exceeded` and
+/// `api rate limit already exceeded` are NOT substrings of each other (the word
+/// "already" breaks the contiguous match), so both must be present.
+#[test]
+fn sweep_md_pins_rate_limit_signature_table() {
+    let content = read_sweep_md();
+
+    // CONTRACT: the five signature strings. Keep EXACT.
+    let signatures: &[&str] = &[
+        "api rate limit exceeded",
+        "api rate limit already exceeded",
+        "secondary rate limit",
+        "abuse detection mechanism",
+        "was submitted too quickly",
+    ];
+    for signature in signatures {
+        assert!(
+            content.contains(signature),
+            "sweep.md's GraphQL-exhaustion detection is missing the rate-limit \
+             signature `{signature}` (#4670) — the table must mirror \
+             check-duplicate.sh's is_rate_limit_error() / \
+             rate_limit_breaker.rs's RATE_LIMIT_SIGNATURES, not a new one"
+        );
+    }
+
+    // CONTRACT: the provenance pointers keep future editors on the shared
+    // table instead of re-deriving one. Keep EXACT (file/symbol names).
+    for needle in ["is_rate_limit_error()", "RATE_LIMIT_SIGNATURES"] {
+        assert!(
+            content.contains(needle),
+            "sweep.md must cite `{needle}` as the source of the rate-limit \
+             signature table (#4670)"
+        );
+    }
+}
+
+/// #4670: the REST endpoints, pagination parameters, and the PR-exclusion jq
+/// filter that make the fallback actually executable.
+#[test]
+fn sweep_md_pins_rest_fallback_endpoints_and_pagination() {
+    let content = read_sweep_md();
+
+    // CONTRACT: REST paths, pagination flags/params, and the jq filter are
+    // literal strings the orchestrator reproduces. Keep EXACT.
+    let contract_needles: &[&str] = &[
+        "repos/{owner}/{repo}/issues",   // Mode B REST listing
+        "repos/{owner}/{repo}/pulls",    // Mode C REST listing
+        "repos/{owner}/{repo}/labels",   // unknown-label guard REST rung
+        "--paginate",                    // paginated listing
+        "per_page=100",                  // explicit limit (never REST's 30)
+        "select(.pull_request == null)", // /issues returns PRs too
+    ];
+    for needle in contract_needles {
+        assert!(
+            content.contains(needle),
+            "sweep.md's REST fallback is missing contract token `{needle}` \
+             (#4670) — update sweep.md or this test if the change is intentional"
+        );
+    }
+}
+
+/// #4670 (AC: no second GraphQL call to resolve the repo): owner/repo must be
+/// resolved locally, and `gh repo view --json nameWithOwner` must be explicitly
+/// called out as the anti-pattern (it is itself GraphQL-backed — #4659).
+#[test]
+fn sweep_md_forbids_graphql_repo_resolution_in_rest_fallback() {
+    let content = read_sweep_md();
+
+    // CONTRACT: the local resolution command. Keep EXACT — it is the whole
+    // point of the AC (zero API calls, survives total GraphQL outage).
+    assert!(
+        content.contains("git remote get-url origin"),
+        "sweep.md's REST fallback must resolve owner/repo locally from \
+         `git remote get-url origin` (#4670/#4659) — a GraphQL-backed lookup \
+         fails before the REST fallback is ever attempted"
+    );
+
+    // PROSE (structural / tolerant): the prohibition on the GraphQL-backed
+    // `gh repo view` lookup is stated twice with two phrasings (Mode B: "Do
+    // **not** call …"; Mode C: "**never** …"). Accept either so a reword of one
+    // survives while deleting BOTH — i.e. the warning truly gone — still fails.
+    let prohibition_phrases: &[&str] = &[
+        "Do **not** call `gh repo view --json nameWithOwner`",
+        "never** `gh repo view --json nameWithOwner`",
+        "not** call `gh repo view",
+        "NOT `gh repo view --json nameWithOwner`",
+    ];
+    assert!(
+        prohibition_phrases.iter().any(|p| content.contains(p)),
+        "sweep.md must warn against `gh repo view --json nameWithOwner` for \
+         repo resolution in the REST fallback (#4670/#4659) — asserted via a \
+         tolerant phrasing set"
+    );
+}
+
+/// #4670 (AC: non-rate-limit failures keep fail-safe behavior): auth/network
+/// errors must NOT be mistaken for quota exhaustion and silently retried.
+#[test]
+fn sweep_md_documents_non_rate_limit_failsafe() {
+    let content = read_sweep_md();
+
+    // PROSE (structural / tolerant): the "only a rate-limit signature triggers
+    // the fallback" semantic is wording; accept equivalent phrasings so a
+    // reword survives while a deletion of the guard still fails.
+    let failsafe_phrases: &[&str] = &[
+        "NOT exhaustion",
+        "not exhaustion",
+        "is not a rate limit",
+        "not be mistaken for quota exhaustion",
+    ];
+    assert!(
+        failsafe_phrases.iter().any(|p| content.contains(p)),
+        "sweep.md must state that non-rate-limit failures (auth, network, 404) \
+         are NOT exhaustion and must keep today's fail-safe behavior (#4670) — \
+         asserted via a tolerant phrasing set"
+    );
+}
+
+/// #4670 (AC: preserve the unknown-label safety rule): the label guard degrades
+/// GraphQL → REST → `.github/labels.yml`, with the YAML as the LAST rung, not
+/// the first.
+#[test]
+fn sweep_md_documents_label_guard_rest_before_yaml_ladder() {
+    let content = read_sweep_md();
+
+    // CONTRACT: the degraded-fallback file path stays exact (it is a real
+    // path the orchestrator reads).
+    assert!(
+        content.contains(".github/labels.yml"),
+        "sweep.md must retain `.github/labels.yml` as the degraded label \
+         fallback (#4670 keeps it, demoted to the last rung)"
+    );
+
+    // PROSE (structural / tolerant): the ordering semantic — REST is tried
+    // before the YAML subset — stated in both the Mode B offline-fallback
+    // paragraph and the fallback ladder item.
+    let ladder_phrases: &[&str] = &[
+        "only when the REST read also fails",
+        "only if REST fails too",
+        "last* rung",
+        "last rung",
+    ];
+    assert!(
+        ladder_phrases.iter().any(|p| content.contains(p)),
+        "sweep.md must document `.github/labels.yml` as the LAST rung of the \
+         GraphQL → REST → YAML label ladder (#4670): the live REST label set is \
+         preferred because the YAML is only the Loom-managed subset — asserted \
+         via a tolerant phrasing set"
+    );
+}
+
 /// #4505: the dry-run per-candidate planned-action enumeration documents the
 /// new `would skip (explicit hold: "<phrase>")` action alongside the other
 /// aggressive-mode `would ...` actions.
