@@ -374,6 +374,68 @@ else
     fail "(n) --dry-run re-stamped metadata (should be preview-only)"
 fi
 
+# --- (#4528) install-metadata.json merge=ours driver wiring -----------------
+echo "Test group 12g: resync wires the install-metadata.json merge=ours driver (#4528)"
+REPO="$(make_fixture)"
+(cd "$REPO" && bash "$SCRIPT" >/dev/null 2>&1)
+GA="$REPO/.gitattributes"
+if [[ -f "$GA" ]] && grep -qxF ".loom/install-metadata.json merge=ours" "$GA"; then
+    pass "(q) .gitattributes gets the install-metadata.json merge=ours rule"
+else
+    fail "(q) .gitattributes missing the merge=ours rule"
+fi
+if [[ "$(git -C "$REPO" config --get merge.ours.driver 2>/dev/null)" == "true" ]]; then
+    pass "(q) local git config merge.ours.driver=true is set"
+else
+    fail "(q) local git config merge.ours.driver was not set"
+fi
+# Idempotent rerun: no duplicate marker block.
+(cd "$REPO" && bash "$SCRIPT" >/dev/null 2>&1)
+OCCURRENCES="$(grep -cxF ".loom/install-metadata.json merge=ours" "$GA")"
+if [[ "$OCCURRENCES" -eq 1 ]]; then
+    pass "(q) rerun does not duplicate the .gitattributes rule"
+else
+    fail "(q) rerun duplicated the .gitattributes rule (found $OCCURRENCES occurrences)"
+fi
+# --dry-run must NOT write .gitattributes or local git config.
+REPO="$(make_fixture)"
+(cd "$REPO" && bash "$SCRIPT" --dry-run >/dev/null 2>&1)
+if [[ ! -f "$REPO/.gitattributes" ]]; then
+    pass "(q) --dry-run leaves .gitattributes absent (preview-only)"
+else
+    fail "(q) --dry-run wrote .gitattributes (should be preview-only)"
+fi
+if [[ -z "$(git -C "$REPO" config --get merge.ours.driver 2>/dev/null)" ]]; then
+    pass "(q) --dry-run leaves merge.ours.driver unset (preview-only)"
+else
+    fail "(q) --dry-run set merge.ours.driver (should be preview-only)"
+fi
+# End-to-end: a real merge conflict on install-metadata.json between two
+# divergent branches resolves automatically to "ours" once the driver+
+# attribute are wired up, instead of stopping for manual resolution.
+MERGE_REPO="$(make_fixture)"
+(cd "$MERGE_REPO" && bash "$SCRIPT" >/dev/null 2>&1)
+git -C "$MERGE_REPO" add -A >/dev/null 2>&1
+git -C "$MERGE_REPO" commit -qm "wire merge driver" >/dev/null 2>&1
+MERGE_REPO_DEFAULT_BRANCH="$(git -C "$MERGE_REPO" symbolic-ref --short HEAD)"
+git -C "$MERGE_REPO" checkout -qb host-a >/dev/null 2>&1
+printf '{\n  "loom_version": "1.1.1",\n  "loom_commit": "aaa1111",\n  "install_date": "2020-01-01",\n  "loom_source": "%s",\n  "installed_files": []\n}\n' \
+    "$MERGE_REPO" > "$MERGE_REPO/.loom/install-metadata.json"
+git -C "$MERGE_REPO" commit -qam "host-a resync stamp" >/dev/null 2>&1
+git -C "$MERGE_REPO" checkout -q "$MERGE_REPO_DEFAULT_BRANCH" >/dev/null 2>&1
+printf '{\n  "loom_version": "2.2.2",\n  "loom_commit": "bbb2222",\n  "install_date": "2020-01-01",\n  "loom_source": "%s",\n  "installed_files": []\n}\n' \
+    "$MERGE_REPO" > "$MERGE_REPO/.loom/install-metadata.json"
+git -C "$MERGE_REPO" commit -qam "host-b resync stamp" >/dev/null 2>&1
+if git -C "$MERGE_REPO" merge -q host-a >/dev/null 2>&1; then
+    if grep -q '"loom_version": *"2.2.2"' "$MERGE_REPO/.loom/install-metadata.json"; then
+        pass "(q) two hosts' resync stamps merge cleanly, keeping the local (ours) side"
+    else
+        fail "(q) merge succeeded but did not keep the local side's stamp"
+    fi
+else
+    fail "(q) merge of two divergent resync stamps still conflicts"
+fi
+
 # --- (#4280) .gitignore managed-block refresh + audit ------------------------
 echo "Test group 12b: resync refreshes the Loom-managed .gitignore block (#4280)"
 # Resolve a loom-daemon binary that supports `update-gitignore` (this feature).

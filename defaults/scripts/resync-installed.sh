@@ -37,6 +37,11 @@
 # On a successful non-dry-run it also re-stamps loom_version, loom_commit, and a
 # last_resync date into .loom/install-metadata.json (requires jq or python3;
 # skipped with a warning if neither is present — the file sync still succeeds).
+# It also ensures a `merge=ours` driver is wired up for that same file (#4528)
+# — a machine-local stamp every host re-writes, guaranteeing merge conflicts
+# between hosts otherwise — via a Loom-managed .gitattributes block plus local
+# git config (never committed; runs every time so a pre-#4528 install
+# self-heals on its next resync).
 #
 # It also refreshes the marker-delimited Loom-managed `.gitignore` block via the
 # daemon's `update-gitignore` subcommand (#4280) — the ephemeral-pattern list is
@@ -558,6 +563,73 @@ fi
 # `update-gitignore` subcommand rather than duplicating the list in shell. A
 # missing/too-old binary is a LOUD stderr warning, never a silent skip.
 
+# ---------- ensure the install-metadata.json merge=ours driver (#4528) ----------
+#
+# .loom/install-metadata.json is a machine-local install stamp: every host's
+# resync (the restamp_metadata step above) re-writes loom_version,
+# loom_commit, and last_resync (plus loom_source, an absolute host-specific
+# path) on every run. Because the file must stay tracked (it is the
+# authoritative ownership manifest consumed by verify-install.sh and
+# uninstall-loom.sh — see is_untracked_runtime_file() in verify-install.sh,
+# which already treats its exact byte content as non-checksum-tracked
+# runtime state), any two hosts that each commit a resync and then
+# `git merge`/`git pull` the other's commit collide on this file, every
+# time, on the exact same lines.
+#
+# The fix: a `merge=ours` attribute for the path in a Loom-managed marker
+# block in .gitattributes (committed, shared) plus the `ours` driver enabled
+# in LOCAL (never committed) git config -- `git config merge.ours.driver
+# true` -- which git-attributes(5) requires a `merge=ours` attribute to be
+# paired with. This is safe because the file is fully re-derived by the
+# next resync regardless of which side "wins" a given merge conflict.
+#
+# Runs on every resync (including a fresh, non-dry-run first run on an
+# existing install predating this fix) so existing hosts self-heal the
+# first time they resync after upgrading past #4528, with no separate
+# migration step required.
+
+ensure_install_metadata_merge_driver() {
+    local ga="$REPO_ROOT/.gitattributes"
+    local begin="# BEGIN LOOM-MANAGED (merge drivers, #4528)"
+    local end="# END LOOM-MANAGED (merge drivers, #4528)"
+    local rule=".loom/install-metadata.json merge=ours"
+    local changed=0
+
+    if [[ ! -f "$ga" ]] || ! grep -qF "$rule" "$ga" 2>/dev/null; then
+        if [[ "$DRY_RUN" -eq 1 ]]; then
+            note "  ${BOLD}would add${NC} .loom/install-metadata.json merge=ours rule to .gitattributes"
+        else
+            {
+                [[ -s "$ga" ]] && printf '\n'
+                printf '%s\n' "$begin"
+                printf '%s\n' "# install-metadata.json is a machine-local install stamp (loom_version,"
+                printf '%s\n' "# loom_commit, last_resync, loom_source) that every host's resync"
+                printf '%s\n' "# re-writes -- always keep our side on a merge conflict; the file is"
+                printf '%s\n' "# fully re-derived by the next resync regardless of which side \"wins\"."
+                printf '%s\n' "$rule"
+                printf '%s\n' "$end"
+            } >> "$ga"
+            changed=1
+        fi
+    fi
+
+    local current
+    current="$(git -C "$REPO_ROOT" config --get merge.ours.driver 2>/dev/null || true)"
+    if [[ "$current" != "true" ]]; then
+        if [[ "$DRY_RUN" -eq 1 ]]; then
+            note "  ${BOLD}would set${NC} local git config merge.ours.driver=true"
+        else
+            git -C "$REPO_ROOT" config merge.ours.driver true 2>/dev/null || true
+            changed=1
+        fi
+    fi
+
+    if [[ "$changed" -eq 1 ]]; then
+        note "  ${GREEN}configured${NC} install-metadata.json merge=ours driver (.gitattributes + local git config)"
+    fi
+}
+ensure_install_metadata_merge_driver
+
 refresh_gitignore_block() {
     local locate_lib bin
     locate_lib="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/locate-daemon-bin.sh"
@@ -650,7 +722,7 @@ suggest_commit_if_resync_only_dirt() {
         path="${path%\"}"
         path="${path#\"}"
         case "$path" in
-            .loom/hooks/*|.loom/scripts/*|.loom/roles/*|.loom/docs/*|.loom/bin/*|.claude/commands/loom/*|.loom/install-metadata.json)
+            .loom/hooks/*|.loom/scripts/*|.loom/roles/*|.loom/docs/*|.loom/bin/*|.claude/commands/loom/*|.loom/install-metadata.json|.gitattributes)
                 resync_paths+=("$path")
                 ;;
             *)
