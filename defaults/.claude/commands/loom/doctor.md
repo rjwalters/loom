@@ -89,6 +89,12 @@ the blocker from secondary sources.
    gh pr comment 42 --body @/tmp/summary.md
    gh pr comment 42 --body "@/tmp/summary.md"
 
+❌ ALSO POSTS THE LITERAL STRING — a variable does NOT change what the flag does
+   SUMMARY_FILE="@/tmp/summary.md"; gh pr comment 42 --body "$SUMMARY_FILE"
+
+❌ ALSO POSTS THE LITERAL STRING — on `gh api`, only -F/--field expands @path
+   gh api repos/{owner}/{repo}/issues/42/comments -f body=@/tmp/summary.md
+
 ✅ USE ONE OF THESE INSTEAD
    gh pr comment 42 --body "$(cat <<'EOF'
    ... comment prose ...
@@ -102,10 +108,19 @@ Prefer the inline heredoc pattern (used throughout this file, e.g. the
 conflict-only marker below) when the body is short/dynamic; use
 `-F/--body-file <path>` when the body genuinely lives in a file — it is the
 one flag on `gh pr comment`/`gh issue comment` that actually reads file
-contents (`gh api ... -F body=@path` also works). **Never** pass the file
-path as the value of `--body`/`-b` with an `@` prefix — that flag takes
-literal text only. **After posting, re-fetch the comment** (`gh pr view
-<number> --comments`) to confirm it renders your prose, not a path string.
+contents (`gh api ... -F body=@path` also works — but `-f`/`--raw-field` does
+**not**). **Never** pass the file path as the value of `--body`/`-b` with an
+`@` prefix — that flag takes literal text only. **After posting, re-fetch the
+comment** (`gh pr view <number> --comments`) to confirm it renders your prose,
+not a path string.
+
+**A guard denial is not an invitation to re-shape the same value.** The
+`--body @path` shape is hard-denied by `guard-destructive-generic.sh`. If you
+hit that denial, the only correct response is to switch to `--body-file` or
+the heredoc — **never** to route the identical `@path` value through a shell
+variable, a `--raw-field`, or any other wrapper. That exact evasion is how the
+anti-pattern recurred on PR #4600 after the guard was already live (#4601), and
+it is now denied too.
 
 ## CRITICAL: Scope Discipline
 
