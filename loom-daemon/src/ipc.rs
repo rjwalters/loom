@@ -1691,6 +1691,69 @@ pub fn build_daemon_status_with_drain(
 // Allow expect_used because mutex poisoning is a panic-level error that indicates
 // a thread panicked while holding the lock. This is not recoverable and should crash.
 // Allow too_many_lines because this is a central request dispatcher that handles all IPC commands.
+/// Pure decision for the GitHub rate-limit circuit breaker gate on
+/// `Request::DispatchSweep` (#4666). Given the request's `kind` (for the log
+/// line) and the current rate-limit breaker snapshot — `None` when no
+/// breaker is registered, mirroring the "zero behavior change when unset"
+/// contract [`crate::rate_limit_breaker::global_snapshot`] documents — decide
+/// whether the dispatch should be refused, and produce the refusal
+/// [`Response`] if so.
+///
+/// Extracted as a pure function (rather than reading
+/// `rate_limit_breaker::global_snapshot()` inline, the way the host-distress
+/// breaker check just above this arm does) specifically for testability: the
+/// process-global breaker handle it wraps is a `OnceLock` that accepts only
+/// one registration per process, so a test that wants to exercise a tripped
+/// breaker through the *global* would permanently poison that state for
+/// every other `DispatchSweep` test sharing the same test binary (`cargo
+/// test --workspace`, unlike `cargo nextest run`, does not run each test in
+/// its own process — see `.config/nextest.toml`'s test-isolation notes). This
+/// pure form sidesteps that hazard entirely: unit tests pass a manually
+/// constructed [`crate::rate_limit_breaker::RateLimitSnapshot`] and never
+/// touch the global.
+///
+/// Takes `force` directly (rather than the call site gating on `if !force`
+/// the way the host-distress breaker check just above this arm does) so the
+/// override is itself part of this function's testable contract: a unit test
+/// can assert `force: true` returns `None` even against an already-suppressed
+/// snapshot, proving the override independently of the host-distress
+/// breaker's own `force` handling.
+fn rate_limit_dispatch_refusal(
+    kind: &crate::types::SweepKind,
+    snapshot: Option<&crate::rate_limit_breaker::RateLimitSnapshot>,
+    force: bool,
+) -> Option<Response> {
+    if force {
+        return None;
+    }
+    let snap = snapshot?;
+    if !snap.suppressed {
+        return None;
+    }
+    let releases = snap.cooldown_until.map_or_else(
+        || " (cooldown release time not yet known)".to_string(),
+        |r| format!(" (cooldown releases at {r})"),
+    );
+    log::warn!(
+        "dispatch_sweep: refused {kind:?} — GitHub rate-limit circuit breaker is {} \
+         ({}){releases}; the shared gh API budget is in cooldown. This is the rate-limit \
+         breaker, not the host-distress breaker: the fix here is waiting for the gh \
+         rate-limit reset, not host load dropping. Re-run with force to override.",
+        snap.phase.as_str(),
+        snap.source.as_deref().unwrap_or("gh rate-limit exhaustion"),
+    );
+    Some(Response::Error {
+        message: format!(
+            "dispatch_sweep refused: GitHub rate-limit circuit breaker is {} ({}).{releases} \
+             This is the shared gh API rate-limit cooldown breaker (#4429/#4440), distinct \
+             from the host-distress breaker: the remediation here is waiting for the gh \
+             rate-limit reset, not host load dropping. Re-run with force to override.",
+            snap.phase.as_str(),
+            snap.source.as_deref().unwrap_or("gh rate-limit exhaustion"),
+        ),
+    })
+}
+
 /// Resolve which per-repo [`SweepRegistry`] a sweep request targets (Issue
 /// #3929). When `workspace_root` is `Some(non-empty)`, the root is normalized
 /// (canonicalize/absolutize — matching how `WorkspaceRegistry::add` and the
@@ -2654,6 +2717,29 @@ fn handle_request(
                         };
                     }
                 }
+            }
+            // GitHub rate-limit circuit breaker (#4429/#4440, gap closed by
+            // #4666): the daemon's own internal polling loops (work-finder,
+            // claim/quarantine reconciliation, epic supervisor, role-runner)
+            // already pause against this breaker during cooldown — but until
+            // now an explicit `dispatch_sweep` never consulted it, so a
+            // brand-new sweep/judge/champion session could still be
+            // dispatched while the shared forge rate-limit budget was in a
+            // known cooldown. This is a *distinct* breaker from the
+            // host-distress one above: different root cause (a `gh`
+            // rate-limit cooldown vs. host CPU/memory distress) and different
+            // remediation (waiting for the `gh` rate-limit reset vs. waiting
+            // for host load to drop) — see [`rate_limit_dispatch_refusal`]'s
+            // doc comment for why the decision itself is a pure, `force`-aware
+            // helper rather than inlined here. Hard-blocks by default;
+            // `force: true` overrides this breaker independently of the
+            // host-distress one.
+            if let Some(refusal) = rate_limit_dispatch_refusal(
+                &kind,
+                crate::rate_limit_breaker::global_snapshot().as_ref(),
+                force,
+            ) {
+                return refusal;
             }
             // Dispatch-only resolution (Issue #4299): consults the workspace
             // registry for the explicit-param-absent case instead of always
@@ -4270,6 +4356,128 @@ exit 0
             "expected --claim-owned 3964 in the spawned child's argv via the IPC \
              DispatchSweep handler (#4111); got: {recorded:?}"
         );
+    }
+
+    /// Issue #4666: `Request::DispatchSweep` previously consulted only the
+    /// host-distress breaker (`host_breaker`), never the GitHub rate-limit
+    /// breaker (`rate_limit_breaker`, #4429/#4440) — so a brand-new dispatch
+    /// could still land while the shared forge API budget was in a known
+    /// cooldown. These tests exercise [`rate_limit_dispatch_refusal`] — the
+    /// exact decision `handle_request`'s `DispatchSweep` arm makes — directly
+    /// with a manually constructed [`crate::rate_limit_breaker::RateLimitSnapshot`]
+    /// rather than through the process-global breaker: see that function's
+    /// doc comment for why (registering the real global would permanently
+    /// poison every other `DispatchSweep` test sharing this test binary under
+    /// plain `cargo test --workspace`, which this repo's CI still runs
+    /// alongside `cargo nextest run`).
+    mod rate_limit_dispatch_refusal_tests {
+        use super::*;
+
+        fn suppressed_snapshot(
+            cooldown_until: Option<chrono::DateTime<Utc>>,
+        ) -> crate::rate_limit_breaker::RateLimitSnapshot {
+            crate::rate_limit_breaker::RateLimitSnapshot {
+                enabled: true,
+                phase: crate::rate_limit_breaker::BreakerPhase::Cooldown,
+                suppressed: true,
+                source: Some("test_source".to_string()),
+                tripped_at: Some(Utc::now()),
+                cooldown_until,
+                trips_total: 1,
+                core_remaining: None,
+                graphql_remaining: None,
+                budget_probed_at: None,
+            }
+        }
+
+        /// No breaker registered at all (`global_snapshot()` returns `None`)
+        /// must be a complete no-op — zero behavior change for daemons that
+        /// never enabled the breaker.
+        #[test]
+        fn no_snapshot_never_refuses() {
+            let kind = SweepKind::Issue(4666);
+            assert!(rate_limit_dispatch_refusal(&kind, None, false).is_none());
+            assert!(rate_limit_dispatch_refusal(&kind, None, true).is_none());
+        }
+
+        /// A registered breaker that is Closed (not suppressed) must not
+        /// refuse either.
+        #[test]
+        fn closed_breaker_never_refuses() {
+            let kind = SweepKind::Issue(4666);
+            let snap = crate::rate_limit_breaker::RateLimitSnapshot {
+                enabled: true,
+                phase: crate::rate_limit_breaker::BreakerPhase::Closed,
+                suppressed: false,
+                source: None,
+                tripped_at: None,
+                cooldown_until: None,
+                trips_total: 0,
+                core_remaining: None,
+                graphql_remaining: None,
+                budget_probed_at: None,
+            };
+            assert!(rate_limit_dispatch_refusal(&kind, Some(&snap), false).is_none());
+        }
+
+        /// The core #4666 fix: a suppressed (Cooldown) snapshot refuses the
+        /// dispatch by default, with a message that (a) names the rate-limit
+        /// breaker and its cooldown release time, and (b) does not reuse the
+        /// host-distress breaker's wording — the two must never be conflated
+        /// since they have different root causes and different remediations.
+        #[test]
+        fn suppressed_breaker_refuses_with_distinct_message() {
+            let kind = SweepKind::Issue(4666);
+            let until = Utc::now() + chrono::Duration::seconds(600);
+            let snap = suppressed_snapshot(Some(until));
+
+            let response = rate_limit_dispatch_refusal(&kind, Some(&snap), false);
+            match response {
+                Some(Response::Error { message }) => {
+                    assert!(
+                        message.contains("rate-limit"),
+                        "expected the rate-limit breaker refusal message, got: {message}"
+                    );
+                    assert!(
+                        message.contains(&until.to_string()),
+                        "expected the cooldown release time in the message, got: {message}"
+                    );
+                    assert!(
+                        !message.contains("host circuit breaker")
+                            && !message.contains("host distress"),
+                        "rate-limit refusal must not be conflated with the host-distress \
+                         breaker's wording: {message}"
+                    );
+                }
+                other => panic!("Expected Some(Response::Error), got: {other:?}"),
+            }
+        }
+
+        /// A suppressed snapshot with no probed cooldown time yet must still
+        /// refuse, with an informative (not panicking/empty) fallback phrase.
+        #[test]
+        fn suppressed_breaker_without_cooldown_time_still_refuses() {
+            let kind = SweepKind::Issue(4666);
+            let snap = suppressed_snapshot(None);
+            let response = rate_limit_dispatch_refusal(&kind, Some(&snap), false);
+            assert!(
+                matches!(response, Some(Response::Error { .. })),
+                "expected a refusal even without a known cooldown release time, got: {response:?}"
+            );
+        }
+
+        /// `force: true` overrides the rate-limit breaker independently of
+        /// the host-distress breaker's own `force` handling, even while the
+        /// snapshot itself remains suppressed throughout.
+        #[test]
+        fn force_true_overrides_suppressed_breaker() {
+            let kind = SweepKind::Issue(4666);
+            let snap = suppressed_snapshot(Some(Utc::now() + chrono::Duration::seconds(600)));
+            assert!(
+                rate_limit_dispatch_refusal(&kind, Some(&snap), true).is_none(),
+                "force: true must bypass the rate-limit breaker refusal"
+            );
+        }
     }
 
     #[test]
