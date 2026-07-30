@@ -644,7 +644,13 @@ This is a **detect → fix** pair:
   those are reported `skipped`, never overwritten). Loom-internal files declared in
   `defaults/.loom-internal.list` are skipped (never resurrected into a consumer).
   On a successful non-dry-run it also re-stamps `loom_version`, `loom_commit`, and
-  a new `last_resync` date into `.loom/install-metadata.json`. One guard exception
+  a new `last_resync` date into `.loom/install-metadata.json`. Since that file is a
+  machine-local stamp every host's resync rewrites, resync also ensures (every
+  run, self-healing existing installs) a `merge=ours` attribute for it in a
+  Loom-managed `.gitattributes` block plus the required local (never committed)
+  `git config merge.ours.driver true` — so two hosts that each committed a resync
+  no longer conflict on `git merge`/`git pull`; the file is fully re-derived by the
+  next resync regardless of which side "wins" (#4528). One guard exception
   (#4041): the vendored generic guard `hooks/guard-destructive-generic.sh` is
   **not** resynced (and any stale copy is removed) in a repo where the canonical
   Repo Skills guard (`.claude/skills/repo/hooks/guard-destructive.sh`, carrying the

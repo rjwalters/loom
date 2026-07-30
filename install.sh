@@ -289,6 +289,17 @@ finalize_quick_install() {
 METADATA
   success "Recorded installation metadata"
 
+  # 3b. Wire the install-metadata.json merge=ours driver (#4528) so this
+  # host's resync commits stop conflicting with other hosts' on `git merge`.
+  if [[ -f "$loom_root/scripts/install/gitattributes.sh" ]]; then
+    # shellcheck source=/dev/null
+    source "$loom_root/scripts/install/gitattributes.sh"
+    ensure_install_metadata_merge_driver "$target"
+    success "Configured install-metadata.json merge=ours driver (.gitattributes + local git config)"
+  else
+    warning "gitattributes.sh not found — install-metadata.json merge=ours driver not configured"
+  fi
+
   # Quick Install ships .github/labels.yml but does NOT create the labels on
   # the forge (that is a Full Install step). Point the operator at the shipped
   # sync script so the label-based workflow doesn't break on first use (#3582).
