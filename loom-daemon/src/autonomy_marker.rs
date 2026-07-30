@@ -365,7 +365,16 @@ mod tests {
             startup_grace_secs_override: Some(0),
             is_darwin: false,
         };
-        let report = crate::daemon_install_state::classify(dir.path(), &marker, &env);
+        // Pin a synthetic process age well beyond the zero grace window
+        // (#4406): the real `ps -o etime=` lookup reports `00:00` for a
+        // sub-second-old test binary, which parses to 0 and satisfies
+        // `age <= grace`, flaking this assertion to AliveStarting.
+        let report = crate::daemon_install_state::classify_with_process_age_fn(
+            dir.path(),
+            &marker,
+            &env,
+            |_| Some(1_000_000),
+        );
         // Marker present + our own live pid ⇒ NOT the not-expected/dead states.
         assert_eq!(report.state, crate::daemon_install_state::InstallState::AliveButUnresponsive,);
         assert_eq!(report.started_at.as_deref(), Some("2026-07-28T00:00:00Z"));

@@ -79,6 +79,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -668,12 +669,29 @@ pub fn resolve_interval_for_role(spec: &RoleSpec, config: &RoleRunnerConfig) -> 
 /// (the taxonomy is frozen, #4364).
 pub type InProgressGuard = Arc<Mutex<HashSet<(PathBuf, &'static str)>>>;
 
+static ROLE_RUN_START_GENERATION: AtomicU64 = AtomicU64::new(0);
+
 /// Construct an empty [`InProgressGuard`]. One instance is created in `main.rs`
 /// and cloned into every interval role loop and the work-finder's idle path so
 /// they share a single view.
 #[must_use]
 pub fn new_in_progress_guard() -> InProgressGuard {
     Arc::new(Mutex::new(HashSet::new()))
+}
+
+/// Number of role invocations active across all managed workspaces.
+#[must_use]
+pub fn active_run_count(set: &InProgressGuard) -> usize {
+    set.lock().unwrap_or_else(PoisonError::into_inner).len()
+}
+
+/// Monotonic process-wide count of successfully started role invocations.
+///
+/// Unlike an active-count sample, a generation change cannot miss a short role
+/// that starts and finishes between idle-exit polling ticks.
+#[must_use]
+pub fn role_run_start_generation() -> u64 {
+    ROLE_RUN_START_GENERATION.load(Ordering::Relaxed)
 }
 
 /// RAII guard: [`try_acquire`](Self::try_acquire) inserts `(root, role)` into
@@ -702,6 +720,7 @@ impl RoleRunGuard {
             }
             guard.insert(key.clone());
         }
+        ROLE_RUN_START_GENERATION.fetch_add(1, Ordering::Relaxed);
         Some(Self { set, key })
     }
 }
@@ -1005,6 +1024,16 @@ where
                 );
                 continue;
             }
+            // Shared GitHub rate limit exhausted (#4429): a role session
+            // spawned now would burn a token slot just to fail its own gh
+            // calls against the same wall — skip until the window resets.
+            if crate::rate_limit_breaker::global_is_suppressed() {
+                log::debug!(
+                    "role_runner: {} tick skipped — rate-limit cooldown (#4429)",
+                    spec.name
+                );
+                continue;
+            }
             let name = spec.name;
             let prompt = spec.prompt;
             // Shared in-progress guard (#4364): skip this interval tick if an
@@ -1104,6 +1133,16 @@ pub fn spawn_multi_role_task(
             if drain.load(std::sync::atomic::Ordering::Relaxed) {
                 log::debug!(
                     "role_runner: {} multi-workspace tick skipped — drain in progress",
+                    spec.name
+                );
+                continue;
+            }
+            // Shared GitHub rate limit exhausted (#4429): a role session
+            // spawned now would burn a token slot just to fail its own gh
+            // calls against the same wall — skip until the window resets.
+            if crate::rate_limit_breaker::global_is_suppressed() {
+                log::debug!(
+                    "role_runner: {} multi-workspace tick skipped — rate-limit cooldown (#4429)",
                     spec.name
                 );
                 continue;

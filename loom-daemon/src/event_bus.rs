@@ -23,8 +23,8 @@
 //! |-------|-----------|---------|
 //! | `sweep.issue.{N}.phase`   | Sweep child via `PublishEvent` | `{phase, pr_number?}` |
 //! | `sweep.issue.{N}.blocker` | Sweep child | `{reason, label_added}` |
-//! | `sweep.issue.{N}.exited`  | Daemon reaper | `{exit_code, duration_sec}` |
-//! | `sweep.issue.{N}.crashed` | Daemon reaper | `{checkpoint_phase}` |
+//! | `sweep.issue.{N}.exited`  | Daemon reaper | `{exit_code, duration_sec, death_class?}` |
+//! | `sweep.issue.{N}.crashed` | Daemon reaper | `{checkpoint_phase, death_class?}` |
 //! | `sweep.global.dispatch`   | Daemon | `{sweep_id, kind}` |
 //! | `sweep.global.completed`  | Daemon | `{sweep_id, outcome}` |
 //! | `epic.issue.{N}.decompose` | Epic supervisor | `{epic, action, state}` |
@@ -37,6 +37,7 @@
 //! | `daemon.drain.aborted`   | Daemon (IPC) | `{was_draining}` |
 //! | `daemon.drain.timeout`   | Drain supervisor | `{in_flight, forced, cancelled?}` |
 //! | `daemon.dispatch.headroom_advisory` | Daemon (IPC, `dispatch_sweep`) | `{repo_root, low_headroom, occupancy, dynamic_cap, cpu_headroom, disk_headroom, token_axis_limit, message}` |
+//! | `daemon.preflight.advisory` | Daemon reaper (`SweepRegistry`) | `{workspace_root, consecutive_deaths, marker, message}` |
 //!
 //! New topics require a follow-up issue — the taxonomy is intentionally
 //! pinned. The four `epic.issue.{N}.*` topics were authorized by **#3873**
@@ -51,8 +52,15 @@
 //! advisory-first headroom consult — fired on a state change into/out of
 //! "occupancy at or over the dynamic concurrency cap," mirroring
 //! `daemon.capacity.advisory`'s dedup discipline but scoped to a single
-//! dispatch request rather than the work finder's periodic tick. The bus
-//! accepts arbitrary topic
+//! dispatch request rather than the work finder's periodic tick. The
+//! `daemon.preflight.advisory` topic was authorized by **#4386** for the
+//! reaper's workspace-level claude-wrapper pre-flight-death tripwire — fired
+//! on a state change into/out of "N consecutive dispatches, across different
+//! issues, died at the wrapper's MCP-init pre-flight check before ever
+//! exec'ing the CLI," the same dedup discipline as the two advisories above.
+//! Per-death classification (`death_class`) rides the existing frozen
+//! `sweep.issue.{N}.exited` / `.crashed` topics as an additive payload field
+//! rather than a new topic (#4386). The bus accepts arbitrary topic
 //! strings (`publish` does not reject unknown topics) so the publisher side
 //! stays open for future extension, but the documented taxonomy is the
 //! contract subscribers should rely on.
@@ -507,6 +515,7 @@ mod tests {
             issue: 42,
             exit_code: Some(0),
             duration_sec: 12,
+            death_class: None,
             repo: None,
         });
         let _ = bus.publish_generic("sweep.global.dispatch", json!({"sweep_id": "x"}));

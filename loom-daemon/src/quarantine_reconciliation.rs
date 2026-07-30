@@ -378,10 +378,24 @@ pub mod forge {
     /// inspected and the number actually released, for the caller's summary
     /// log line.
     pub fn reconcile_workspace(gh_bin: &Path, root: &Path) -> (usize, usize) {
+        // Shared GitHub rate limit exhausted (#4429): the listing (and the
+        // per-candidate timeline probes below) would all fail — skip.
+        if crate::rate_limit_breaker::global_is_suppressed() {
+            log::info!(
+                "quarantine_reconciliation: {} skipped — shared GitHub API rate limit \
+                 exhausted (#4429)",
+                root.display()
+            );
+            return (0, 0);
+        }
         let issues = match list_blocked_issues(gh_bin, root) {
             Ok(v) => v,
             Err(e) => {
                 log::warn!("quarantine_reconciliation: {}: {e}", root.display());
+                crate::rate_limit_breaker::global_observe_failure(
+                    &e.to_string(),
+                    "quarantine_reconciliation",
+                );
                 return (0, 0);
             }
         };

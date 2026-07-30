@@ -616,10 +616,14 @@ pub fn classify(loom_dir: &Path, marker_path: &Path, env: &EnvOverrides) -> Inst
 /// [`classify`]'s implementation, parameterized over the process-age lookup.
 /// Production code always goes through [`classify`] (which passes the real
 /// `ps`-backed [`process_age_secs`]); tests use this directly with a fixed
-/// closure so heartbeat-vs-process-age comparisons (#4368) are deterministic
-/// — the test binary's own real uptime, shared across every unit test
-/// running in this one process, is not a value any single test can control.
-fn classify_with_process_age_fn(
+/// closure so heartbeat-vs-process-age comparisons (#4368) and startup-grace
+/// comparisons (#4213) are deterministic — the test binary's own real uptime,
+/// shared across every unit test running in this one process, is not a value
+/// any single test can control.
+///
+/// `pub(crate)` so sibling modules' tests (e.g. `autonomy_marker`) can pin an
+/// age too; there is no production caller outside [`classify`] (#4406).
+pub(crate) fn classify_with_process_age_fn(
     loom_dir: &Path,
     marker_path: &Path,
     env: &EnvOverrides,
@@ -730,9 +734,16 @@ mod tests {
             launchd_override: None,
             launchd_label_override: None,
             heartbeat_stale_secs_override: None,
-            // A zero grace window makes the test process (always older than 0s)
-            // fall through to the existing verdicts by default — tests that want
-            // the startup-grace path set a huge window explicitly.
+            // A zero grace window is the *default* here so most tests reach the
+            // post-grace verdicts. It is NOT sufficient on its own: a real
+            // process under one second old reports `ps -o etime=` as `00:00`,
+            // which parses to 0 and satisfies `age <= grace` — so a test that
+            // asserts a post-grace verdict against a real `ps`-backed age
+            // flakes to `AliveStarting` whenever the test binary is still in
+            // its first wall-clock second (#4406). Any test that wants a
+            // post-grace verdict must ALSO pin a synthetic process age via
+            // `classify_with_process_age_fn`. Tests that want the
+            // startup-grace path set a huge window explicitly.
             startup_grace_secs_override: Some(0),
             is_darwin: false,
         }
@@ -779,7 +790,13 @@ mod tests {
                 pid_file.display()
             ),
         );
-        let report = classify(dir.path(), &marker, &no_env_overrides());
+        // Pin a synthetic process age well beyond the zero grace window
+        // (#4406) — a real `ps` age of `00:00` for a sub-second-old test
+        // binary would otherwise satisfy `age <= grace` and flake to
+        // AliveStarting.
+        let report = classify_with_process_age_fn(dir.path(), &marker, &no_env_overrides(), |_| {
+            Some(1_000_000)
+        });
         assert_eq!(report.state, InstallState::AliveButUnresponsive);
         assert_eq!(report.state.exit_code(), EXIT_ALIVE_BUT_UNRESPONSIVE);
         assert_eq!(report.pid, Some(std::process::id()));
@@ -906,7 +923,11 @@ mod tests {
             dir.path(),
             &format!("pid_file={}\nuse_launchd=false\n", pid_file.display()),
         );
-        let report = classify(dir.path(), &marker, &no_env_overrides());
+        // Pinned synthetic age (#4406, see `marker_present_live_pid_...`) so
+        // the zero grace window is genuinely cleared.
+        let report = classify_with_process_age_fn(dir.path(), &marker, &no_env_overrides(), |_| {
+            Some(1_000_000)
+        });
         assert_eq!(report.state, InstallState::AliveButUnresponsive);
         // No heartbeat file was ever written at the fallback location, so the
         // qualifier degrades to Unknown rather than falsely reporting Stale.
@@ -941,7 +962,11 @@ mod tests {
                 dir.path().join("no-such-heartbeat").display()
             ),
         );
-        let report = classify(dir.path(), &marker, &no_env_overrides());
+        // Pinned synthetic age (#4406, see `marker_present_live_pid_...`) so
+        // the zero grace window is genuinely cleared.
+        let report = classify_with_process_age_fn(dir.path(), &marker, &no_env_overrides(), |_| {
+            Some(1_000_000)
+        });
         assert_eq!(report.state, InstallState::AliveButUnresponsive);
         assert_eq!(report.heartbeat_freshness, Some(HeartbeatFreshness::Unknown));
         assert!(report.heartbeat_age_secs.is_none());
@@ -959,7 +984,9 @@ mod tests {
         );
         let mut env = no_env_overrides();
         env.launchd_override = Some(false);
-        let report = classify(dir.path(), &marker, &env);
+        // Pinned synthetic age (#4406, see `marker_present_live_pid_...`) so
+        // the zero grace window is genuinely cleared.
+        let report = classify_with_process_age_fn(dir.path(), &marker, &env, |_| Some(1_000_000));
         assert_eq!(report.state, InstallState::AliveButUnresponsive);
     }
 
@@ -972,8 +999,12 @@ mod tests {
             &format!("pid_file={}\nuse_launchd=true\n", pid_file.display()),
         );
         // is_darwin: false with no explicit launchd_override — the blanket
-        // non-Darwin rule must still force the pid-file path.
-        let report = classify(dir.path(), &marker, &no_env_overrides());
+        // non-Darwin rule must still force the pid-file path. Pinned synthetic
+        // age (#4406, see `marker_present_live_pid_...`) so the zero grace
+        // window is genuinely cleared.
+        let report = classify_with_process_age_fn(dir.path(), &marker, &no_env_overrides(), |_| {
+            Some(1_000_000)
+        });
         assert_eq!(report.state, InstallState::AliveButUnresponsive);
     }
 
@@ -1166,8 +1197,11 @@ mod tests {
 
     #[test]
     fn process_beyond_grace_falls_through_to_fault_verdict() {
-        // A zero-second grace window puts the (always older) test process
-        // beyond grace, so the existing AliveButUnresponsive verdict stands.
+        // A zero-second grace window plus a pinned process age puts the
+        // process beyond grace, so the existing AliveButUnresponsive verdict
+        // stands. The pinned age is load-bearing, not decorative: a real
+        // sub-second-old process reports `etime` as `00:00`, which would land
+        // inside the zero window (#4406).
         let dir = tempfile::tempdir().unwrap();
         let pid_file = write_pid_file(dir.path(), std::process::id());
         let heartbeat = write_heartbeat(dir.path(), Duration::from_secs(5));

@@ -663,6 +663,74 @@ impl Default for QuarantineConfig {
     }
 }
 
+// ============================================================================
+// Claude-wrapper pre-flight-death workspace tripwire (Issue #4386)
+// ============================================================================
+//
+// The per-issue insta-crash quarantine above (#3939) never trips on a
+// fleet-wide, environmental spawn failure (e.g. a stale `.mcp.json`): a dozen
+// *different* issues each dying once at claude-wrapper pre-flight never
+// reaches any single issue's consecutive threshold, so nothing quarantines
+// and `loom-daemon dispatch` / `status` report success and an idle-healthy
+// daemon while every child dies within ~1s. This tripwire tracks the
+// consecutive pre-flight-death streak **across issues**, independent of the
+// per-issue tally, and trips a workspace-level advisory once the streak
+// reaches [`PreflightTripwireConfig::threshold`].
+
+/// Env var overriding the consecutive-pre-flight-death threshold at which the
+/// workspace-level advisory trips (Issue #4386). A zero/invalid value falls
+/// through to config/default.
+pub const PREFLIGHT_TRIPWIRE_THRESHOLD_ENV: &str = "LOOM_PREFLIGHT_TRIPWIRE_THRESHOLD";
+
+/// Default consecutive-pre-flight-death threshold before the workspace
+/// advisory trips (#4386).
+pub const DEFAULT_PREFLIGHT_TRIPWIRE_THRESHOLD: u32 = 3;
+
+/// Resolved pre-flight-death tripwire parameters (Issue #4386), set on the
+/// registry at construction so [`SweepRegistry::reap_once`] can enforce it
+/// without a per-tick config read. Mirrors [`QuarantineConfig`]'s shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreflightTripwireConfig {
+    /// Consecutive cross-issue pre-flight deaths before the workspace
+    /// advisory trips.
+    pub threshold: u32,
+}
+
+impl Default for PreflightTripwireConfig {
+    fn default() -> Self {
+        Self {
+            threshold: DEFAULT_PREFLIGHT_TRIPWIRE_THRESHOLD,
+        }
+    }
+}
+
+/// Read `.loom/config.json → autonomous.workFinder.preflightTripwire.threshold`
+/// (Issue #4386), soft-failing to `None` on a missing file, malformed JSON, or
+/// an absent block — mirrors [`read_quarantine_file_config`].
+#[must_use]
+fn read_preflight_tripwire_file_threshold(repo_root: &Path) -> Option<u32> {
+    let effective = crate::config_resolver::resolve_effective_config(repo_root);
+    crate::config_resolver::get_path(&effective, "autonomous.workFinder.preflightTripwire")
+        .and_then(|c| c.get("threshold"))
+        .and_then(serde_json::Value::as_u64)
+        .filter(|&n| n > 0)
+        .and_then(|n| u32::try_from(n).ok())
+}
+
+/// Resolve the full [`PreflightTripwireConfig`] for `repo_root` with
+/// precedence **env > config > default** (Issue #4386), mirroring
+/// [`resolve_quarantine_config`].
+#[must_use]
+pub fn resolve_preflight_tripwire_config(repo_root: &Path) -> PreflightTripwireConfig {
+    let threshold = std::env::var(PREFLIGHT_TRIPWIRE_THRESHOLD_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|&n| n > 0)
+        .or_else(|| read_preflight_tripwire_file_threshold(repo_root))
+        .unwrap_or(DEFAULT_PREFLIGHT_TRIPWIRE_THRESHOLD);
+    PreflightTripwireConfig { threshold }
+}
+
 /// Compute how long a spawn must wait so that consecutive spawns are separated
 /// by at least `stagger` (Issue #3887). Pure function of the last spawn instant,
 /// the configured gap, and the current instant — unit-tested in isolation.
@@ -1035,10 +1103,128 @@ fn classify_account_exhaustion(log_tail: &str) -> Option<&'static str> {
         .map(|(label, _)| *label)
 }
 
+// ============================================================================
+// Claude-wrapper pre-flight-death classification (Issue #4386)
+// ============================================================================
+
+/// The claude-wrapper pre-flight-death signature table (#4386): explicit
+/// positive markers `defaults/scripts/claude-wrapper.sh` emits when it aborts
+/// **before ever exec'ing the CLI** (e.g. its MCP-init pre-flight probe
+/// fails). Matched against the tail of a dead sweep's log exactly like
+/// [`exhaustion_signatures`] — kept as a table so a future explicit
+/// wrapper-abort marker is one new row, not a new code path.
+///
+/// Unlike `exhaustion_signatures`, this table only covers markers with an
+/// explicit positive signature in the log. The complementary "the process
+/// died without EVER reaching `# CLAUDE_CLI_START`" case has no marker of its
+/// own — it's an absence, not a positive signature — so it is checked
+/// separately by [`classify_preflight_death`], after this table comes up
+/// empty.
+fn preflight_death_signatures() -> &'static [(&'static str, Regex)] {
+    static SIGS: OnceLock<Vec<(&'static str, Regex)>> = OnceLock::new();
+    SIGS.get_or_init(|| {
+        vec![(
+            "preflight-mcp-failed",
+            // Emitted by claude-wrapper.sh's MCP-init pre-flight check right
+            // before it bails without ever exec'ing the CLI. Case-sensitive:
+            // a literal sentinel token, not free-form prose (mirrors
+            // `RATE_LIMIT_ABORT` in `exhaustion_signatures`).
+            Regex::new(r"#\s*MCP_PREFLIGHT_FAILED").expect("valid static preflight regex"),
+        )]
+    })
+}
+
+/// The literal marker `claude-wrapper.sh` logs immediately before exec'ing the
+/// CLI (Issue #4386). Its absence from a dead sweep's ENTIRE log tail means
+/// the child never got that far — the complementary, absence-based half of
+/// [`classify_preflight_death`].
+const CLAUDE_CLI_START_MARKER: &str = "# CLAUDE_CLI_START";
+
+/// Classify `log_tail` as a claude-wrapper pre-flight death (Issue #4386):
+/// either an explicit [`preflight_death_signatures`] marker matched, or —
+/// when no explicit marker matched — the tail never reached
+/// [`CLAUDE_CLI_START_MARKER`] at all, meaning the child died before the
+/// wrapper ever exec'd the CLI. Returns the matched label, else `None`.
+///
+/// Callers are responsible for the precedence rule with
+/// [`classify_account_exhaustion`] (exhaustion wins — see
+/// `SweepRegistry::record_preflight_streak`) and for treating an
+/// unreadable/missing log as `None`/"unknown" rather than calling this with
+/// an empty tail (mirrors how [`classify_crash`] is fed by its callers).
+fn classify_preflight_death(log_tail: &str) -> Option<&'static str> {
+    if let Some((label, _)) = preflight_death_signatures()
+        .iter()
+        .find(|(_, re)| re.is_match(log_tail))
+    {
+        return Some(label);
+    }
+    if !log_tail.contains(CLAUDE_CLI_START_MARKER) {
+        return Some("preflight-no-cli-start");
+    }
+    None
+}
+
+/// The three-way outcome of consulting a dead sweep's log tail for the #4386
+/// pre-flight workspace tripwire, feeding
+/// `SweepRegistry::record_preflight_streak`'s streak update.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PreflightOutcome {
+    /// [`classify_preflight_death`] matched — this death counts toward (and
+    /// is reported as) the pre-flight streak.
+    Preflight(&'static str),
+    /// The tail reached [`CLAUDE_CLI_START_MARKER`] (and no exhaustion
+    /// signature matched) — definitively NOT a pre-flight death, resetting
+    /// the streak.
+    NonPreflight,
+    /// The log was unreadable/missing, OR an account-exhaustion signature
+    /// matched (exhaustion wins — that death is already attributed to the
+    /// account, #4122). Neutral: neither increments nor resets the streak.
+    Unknown,
+}
+
+/// Classify a dead sweep's (possibly absent) log tail for the #4386 pre-flight
+/// workspace tripwire. `tail` is `None` when the log was missing/unreadable at
+/// reap time.
+fn classify_preflight_outcome(tail: Option<&str>) -> PreflightOutcome {
+    let Some(t) = tail else {
+        return PreflightOutcome::Unknown;
+    };
+    if classify_account_exhaustion(t).is_some() {
+        // Exhaustion wins (#4122): this death is already attributed to the
+        // spawn account, so it must not also be counted toward — or reset —
+        // the pre-flight streak.
+        return PreflightOutcome::Unknown;
+    }
+    match classify_preflight_death(t) {
+        Some(label) => PreflightOutcome::Preflight(label),
+        None => PreflightOutcome::NonPreflight,
+    }
+}
+
+/// The `self-kill:background-wait` signature regex (Issue #4389, a recurrence
+/// of #4257): matches final assistant/log text that promises to be notified
+/// about — or to check back on — outstanding background work, e.g. "I'll
+/// wait for the background rebuild to complete and check back" or "will be
+/// notified when the background task completes". That is the exact self-kill
+/// pattern this issue targets: in headless `claude -p` mode there is no
+/// "later" — ending the turn kills the process and every still-running
+/// background child with it, so a death whose log tail reads like this is a
+/// process-design self-kill, not a crash. Matched case-insensitively.
+fn background_wait_signature() -> &'static Regex {
+    static SIG: OnceLock<Regex> = OnceLock::new();
+    SIG.get_or_init(|| {
+        Regex::new(r"(?i)background.*(notify|complete|check|pick up)")
+            .expect("valid static background-wait regex")
+    })
+}
+
 /// Best-effort crash classification for the `sweep.issue.{N}.crashed` payload
-/// (Issue #4255). Derives a short, stable label from the dead sweep's log tail
-/// plus its exit code so a subscriber (#4137 telemetry) can attribute WHY the
-/// sweep died rather than re-parsing free-form logs.
+/// (Issue #4255, extended by #4389). Derives a short, stable label from the
+/// dead sweep's log tail plus its exit code so a subscriber (#4137
+/// telemetry) can attribute WHY the sweep died rather than re-parsing
+/// free-form logs. The caller only invokes this when a checkpoint exists for
+/// the dead sweep (i.e. it made mid-lifecycle progress before dying) — see
+/// the `checkpoint.exists()` guard around this function's call site.
 ///
 /// Precedence, most-specific first:
 /// 1. `account-exhausted:<signature>` — the account hit a usage/weekly/session
@@ -1047,7 +1233,14 @@ fn classify_account_exhaustion(log_tail: &str) -> Option<&'static str> {
 /// 2. `execution-error` — the CLI printed the bare `Execution error` string
 ///    (the chronic transient-death mode this issue targets; the wrapper now
 ///    retries it, so reaching the reaper means retries were exhausted).
-/// 3. `exit-<code>` — any other non-zero exit whose log yields no known
+/// 3. `self-kill:background-wait` (#4389) — the log tail reads like the
+///    orchestrator ended its turn believing outstanding background work
+///    (a Task subagent or a `run_in_background` Bash task) would notify it
+///    later. Checked regardless of exit code: this self-kill mode often
+///    exits *clean* (0) or with no captured code — the orchestrator believed
+///    it was finishing normally — which is exactly why it fell through to
+///    `None` (unclassified) before this signature existed.
+/// 4. `exit-<code>` — any other non-zero exit whose log yields no known
 ///    signature. `None` when the exit was clean/unknown with no signature, so
 ///    the field is omitted from the wire form rather than carrying noise.
 fn classify_crash(log_tail: &str, exit_code: Option<i32>) -> Option<String> {
@@ -1059,6 +1252,12 @@ fn classify_crash(log_tail: &str, exit_code: Option<i32>) -> Option<String> {
     // so a death that survived the wrapper's retry loop is still labeled.
     if log_tail.to_ascii_lowercase().contains("execution error") {
         return Some("execution-error".to_string());
+    }
+    // #4389: a background-wait self-kill often exits clean/uncaptured, so this
+    // must be checked BEFORE the exit_code match below (which would otherwise
+    // silently fall through to `None` for exactly that case).
+    if background_wait_signature().is_match(log_tail) {
+        return Some("self-kill:background-wait".to_string());
     }
     match exit_code {
         Some(0) | None => None,
@@ -1416,6 +1615,30 @@ pub struct SweepRegistry {
     /// which the work-finder skips. `None` (default) ⇒ the work-finder sees an
     /// empty set (no behavior change).
     peer_claims: Option<Arc<Mutex<PeerClaimView>>>,
+    /// Workspace-level claude-wrapper pre-flight-death tripwire parameters
+    /// (Issue #4386). `main.rs` / [`crate::workspace_pool::WorkspacePool`] set
+    /// the resolved env > config > default value at provision time, mirroring
+    /// [`quarantine_config`](Self::quarantine_config).
+    preflight_tripwire_config: PreflightTripwireConfig,
+    /// Consecutive claude-wrapper pre-flight deaths this registry's reaper has
+    /// observed, **across issues** (Issue #4386) — distinct from
+    /// [`insta_crash_counts`](Self::insta_crash_counts), which is per-issue and
+    /// so never trips on a fleet-wide environmental failure spread across many
+    /// different issues. Incremented by [`record_preflight_streak`](Self::record_preflight_streak)
+    /// on a death classified as pre-flight; reset to `0` by any death that
+    /// reached `# CLAUDE_CLI_START` (or by genuine checkpoint-proven progress).
+    preflight_death_streak: u32,
+    /// The most recent pre-flight death-class marker that fed
+    /// [`preflight_death_streak`](Self::preflight_death_streak) (e.g.
+    /// `"preflight-mcp-failed"`), carried into the advisory message. `None`
+    /// once the streak resets to `0`.
+    preflight_death_last_marker: Option<String>,
+    /// Whether the workspace-level pre-flight advisory is currently tripped
+    /// (Issue #4386) — mirrors the dedup discipline `daemon.capacity.advisory`
+    /// / `daemon.dispatch.headroom_advisory` use, so
+    /// [`Event::PreflightAdvisory`] fires only on a state-change transition,
+    /// never every tick.
+    preflight_advisory_tripped: bool,
 }
 
 /// Classification of a pre-flip label read (Issue #4085). Detection only — the
@@ -1495,6 +1718,10 @@ impl SweepRegistry {
             collision_count: 0,
             peer_claim_publisher: None,
             peer_claims: None,
+            preflight_tripwire_config: PreflightTripwireConfig::default(),
+            preflight_death_streak: 0,
+            preflight_death_last_marker: None,
+            preflight_advisory_tripped: false,
         }
     }
 
@@ -1525,6 +1752,10 @@ impl SweepRegistry {
             collision_count: 0,
             peer_claim_publisher: None,
             peer_claims: None,
+            preflight_tripwire_config: PreflightTripwireConfig::default(),
+            preflight_death_streak: 0,
+            preflight_death_last_marker: None,
+            preflight_advisory_tripped: false,
         }
     }
 
@@ -1574,6 +1805,48 @@ impl SweepRegistry {
     #[must_use]
     pub fn quarantine_config(&self) -> QuarantineConfig {
         self.quarantine_config
+    }
+
+    /// Set the claude-wrapper pre-flight-death workspace-tripwire parameters
+    /// (Issue #4386). `main.rs` and the workspace pool call this once at
+    /// provision time with the resolved env > config > default value,
+    /// mirroring [`set_quarantine_config`](Self::set_quarantine_config).
+    pub fn set_preflight_tripwire_config(&mut self, config: PreflightTripwireConfig) {
+        self.preflight_tripwire_config = config;
+    }
+
+    /// Read-only accessor for the pre-flight tripwire parameters (Issue #4386).
+    #[must_use]
+    pub fn preflight_tripwire_config(&self) -> PreflightTripwireConfig {
+        self.preflight_tripwire_config
+    }
+
+    /// Current pre-flight-death advisory state (Issue #4386), for
+    /// `DaemonStatusReport`: `(tripped, message)`. `message` is always `None`
+    /// when `tripped` is `false`.
+    #[must_use]
+    pub fn preflight_advisory(&self) -> (bool, Option<String>) {
+        if !self.preflight_advisory_tripped {
+            return (false, None);
+        }
+        let marker = self
+            .preflight_death_last_marker
+            .as_deref()
+            .unwrap_or("unknown");
+        let message = format!(
+            "WARNING: last {} dispatches died at claude-wrapper pre-flight ({marker}) — check \
+             .mcp.json",
+            self.preflight_death_streak
+        );
+        (true, Some(message))
+    }
+
+    /// Current consecutive pre-flight-death streak (Issue #4386), for tests /
+    /// observability. Read-only — production code should consult
+    /// [`preflight_advisory`](Self::preflight_advisory) instead.
+    #[must_use]
+    pub fn preflight_death_streak(&self) -> u32 {
+        self.preflight_death_streak
     }
 
     /// Enable or disable cross-host dispatch-collision detection (Issue #4085).
@@ -1661,6 +1934,43 @@ impl SweepRegistry {
                  ({e}); dispatch unaffected (#4028)"
             );
         }
+    }
+
+    /// Re-advertise the peer claim of every live (`Running`/`Pending`) Issue
+    /// sweep over the safehouse room (Issue #4431).
+    ///
+    /// The dispatch-time advertisement is a one-shot publish, and peer claims
+    /// expire after [`crate::peer_claims::DEFAULT_PEER_CLAIM_TTL`] (120s) —
+    /// tuned for the *soft-backoff* era when the forge label was the durable
+    /// signal behind it. With claim reconciliation slowed to a healing cadence
+    /// on safehouse-enabled hosts (#4431), a live sweep's claim must not
+    /// silently fall out of peers' [`crate::peer_claims::PeerClaimView`]s
+    /// mid-run. The reaper calls this every tick (default 30s, well under the
+    /// TTL), so a live claim is refreshed ~4× per TTL window while a crashed
+    /// host's claims still expire within one TTL of its last heartbeat — the
+    /// crash-release property the short TTL exists for is preserved exactly.
+    ///
+    /// Same fail-open contract as [`Self::publish_peer_claim`]: a no-op
+    /// without a publisher (`safehouse.enabled` false), and a full/closed
+    /// channel drops the ad without blocking the reaper. Returns how many
+    /// claims were re-advertised (for the reaper's debug line).
+    pub fn readvertise_peer_claims(&self) -> usize {
+        if self.peer_claim_publisher.is_none() {
+            return 0;
+        }
+        let live: Vec<u32> = self
+            .entries
+            .values()
+            .filter(|info| matches!(info.state, SweepState::Running | SweepState::Pending))
+            .filter_map(|info| match info.kind {
+                SweepKind::Issue(issue) => Some(issue),
+                _ => None,
+            })
+            .collect();
+        for issue in &live {
+            self.publish_peer_claim(peer_claims::ClaimKind::Advertise, *issue);
+        }
+        live.len()
     }
 
     /// The set of issue numbers currently quarantined for insta-crashing (Issue
@@ -2822,6 +3132,114 @@ impl SweepRegistry {
         true
     }
 
+    // ------------------------------------------------------------------------
+    // Claude-wrapper pre-flight-death workspace tripwire (Issue #4386)
+    // ------------------------------------------------------------------------
+
+    /// Consult the workspace-level pre-flight-death streak for one terminal
+    /// Issue sweep, updating [`preflight_death_streak`](Self::preflight_death_streak)
+    /// and the tripwire advisory, and returning the death-class label to carry
+    /// on the terminal event's `death_class` payload field (`None` when this
+    /// death is not classified as pre-flight).
+    ///
+    /// `insta_crash` is the SAME checkpoint-less-fast-death window bool the
+    /// caller already computes for [`record_insta_crash_outcome`] — a
+    /// pre-flight death is, by construction, always inside that window
+    /// (claude-wrapper bails within ~1s), so this only needs to inspect the
+    /// log tail when `insta_crash` is `true`:
+    ///
+    /// - `insta_crash == false` (a clean exit, a slow death, or a call site
+    ///   that already proved genuine checkpoint progress this run): this
+    ///   death definitely is not a pre-flight death — reset the streak
+    ///   unconditionally and return `None`.
+    /// - `insta_crash == true`: classify the tail via
+    ///   [`classify_preflight_outcome`]. A `Preflight` verdict increments the
+    ///   streak and returns the matched label; `NonPreflight` (the log reached
+    ///   `# CLAUDE_CLI_START`) resets the streak; `Unknown` (unreadable log,
+    ///   or an account-exhaustion signature — exhaustion wins, #4122) leaves
+    ///   the streak untouched. Either way `update_preflight_advisory` runs so
+    ///   a threshold crossing is caught immediately.
+    fn record_preflight_streak(&mut self, sweep_id: &SweepId, insta_crash: bool) -> Option<String> {
+        if !insta_crash {
+            self.reset_preflight_streak();
+            return None;
+        }
+        let tail = self
+            .entries
+            .get(sweep_id)
+            .map(|info| info.log_path.clone())
+            .and_then(|p| tail_lines(&p, EXHAUSTION_LOG_TAIL_LINES).ok())
+            .map(|lines| lines.join("\n"));
+
+        match classify_preflight_outcome(tail.as_deref()) {
+            PreflightOutcome::Preflight(label) => {
+                self.preflight_death_streak += 1;
+                self.preflight_death_last_marker = Some(label.to_string());
+                self.update_preflight_advisory();
+                Some(label.to_string())
+            }
+            PreflightOutcome::NonPreflight => {
+                self.reset_preflight_streak();
+                None
+            }
+            PreflightOutcome::Unknown => None,
+        }
+    }
+
+    /// Reset the cross-issue pre-flight-death streak to `0` (Issue #4386):
+    /// called for any terminal outcome that is definitively NOT a pre-flight
+    /// death (reached `# CLAUDE_CLI_START`, or genuine checkpoint-proven
+    /// progress this run). Always re-evaluates the advisory so a tripped
+    /// state clears the instant a healthy dispatch is observed.
+    fn reset_preflight_streak(&mut self) {
+        self.preflight_death_streak = 0;
+        self.preflight_death_last_marker = None;
+        self.update_preflight_advisory();
+    }
+
+    /// Re-evaluate the workspace-level pre-flight advisory against
+    /// [`preflight_death_streak`](Self::preflight_death_streak) and
+    /// [`PreflightTripwireConfig::threshold`], emitting
+    /// [`Event::PreflightAdvisory`] on the `daemon.preflight.advisory` topic
+    /// **only on a state-change transition** (into or out of tripped) — the
+    /// same dedup discipline `daemon.capacity.advisory` /
+    /// `daemon.dispatch.headroom_advisory` use, so this never fires every
+    /// tick.
+    fn update_preflight_advisory(&mut self) {
+        let threshold = self.preflight_tripwire_config.threshold.max(1);
+        let should_trip = self.preflight_death_streak >= threshold;
+        if should_trip == self.preflight_advisory_tripped {
+            return;
+        }
+        self.preflight_advisory_tripped = should_trip;
+        let marker = self.preflight_death_last_marker.clone().unwrap_or_default();
+        let message = if should_trip {
+            format!(
+                "WARNING: last {} dispatches died at claude-wrapper pre-flight ({marker}) — check \
+                 .mcp.json",
+                self.preflight_death_streak
+            )
+        } else {
+            "pre-flight advisory cleared — a recent dispatch reached claude-wrapper CLI start \
+             (#4386)"
+                .to_string()
+        };
+        log::warn!(
+            "sweep_registry: workspace {} pre-flight advisory {} (streak={}, threshold={}) \
+             (#4386)",
+            self.config.workspace_root.display(),
+            if should_trip { "TRIPPED" } else { "cleared" },
+            self.preflight_death_streak,
+            threshold
+        );
+        self.emit_event(Event::PreflightAdvisory {
+            workspace_root: self.config.workspace_root.display().to_string(),
+            consecutive_deaths: self.preflight_death_streak,
+            marker,
+            message,
+        });
+    }
+
     /// Record a terminal sweep outcome against the insta-crash tally (#3939).
     ///
     /// `insta_crash` is `true` only when the reaper classified the death as a
@@ -3766,7 +4184,8 @@ impl SweepRegistry {
                 issue: *issue,
                 exit_code: None,
                 duration_sec,
-                repo: None, // stamped by emit_event (#3929)
+                death_class: None, // manual cancel, never a pre-flight death (#4386)
+                repo: None,        // stamped by emit_event (#3929)
             });
         }
         self.emit_event(Event::SweepGlobalCompleted {
@@ -3893,6 +4312,39 @@ impl SweepRegistry {
                                 .and_then(|p| tail_lines(p, EXHAUSTION_LOG_TAIL_LINES).ok())
                                 .map(|lines| lines.join("\n"))
                                 .and_then(|tail| classify_crash(&tail, exit_code));
+                            // Issue #4386: whether THIS run's checkpoint write
+                            // proves genuine progress (see the comment above
+                            // the `if checkpoint_written_by_run` branch below)
+                            // — hoisted here because it also determines
+                            // whether this death can even be a pre-flight
+                            // death: genuine progress definitely reached past
+                            // `# CLAUDE_CLI_START`, so there is nothing left
+                            // to classify.
+                            let checkpoint_progress =
+                                checkpoint_written_by_run(&checkpoint, started_at);
+                            let insta_crash = duration_sec
+                                < self.quarantine_config.insta_crash_secs
+                                && exit_code != Some(0);
+                            // Reaper-side pre-flight-death classification +
+                            // workspace tripwire streak update (#4386),
+                            // consulted alongside the #4255 crash
+                            // classification above. Precedence: exhaustion
+                            // wins (handled inside `record_preflight_streak`),
+                            // so a death already attributed to the account is
+                            // never also charged toward — or reset — the
+                            // pre-flight streak.
+                            let death_class = if checkpoint_progress {
+                                self.reset_preflight_streak();
+                                None
+                            } else {
+                                self.record_preflight_streak(&sweep_id, insta_crash)
+                            };
+                            // Captured before `death_class` moves into the
+                            // `SweepCrashed` event below — the carve-out check
+                            // further down needs to know whether THIS death was
+                            // pre-flight-classified without re-borrowing the
+                            // (by-then-moved) `Option<String>`.
+                            let is_preflight_death = death_class.is_some();
                             // Captured before `checkpoint_phase` moves into the
                             // `SweepCrashed` event below — needed for the
                             // reaper-driven resume check further down (#4256).
@@ -3907,6 +4359,7 @@ impl SweepRegistry {
                                 issue,
                                 checkpoint_phase,
                                 classification,
+                                death_class,
                                 repo: None, // stamped by emit_event (#3929)
                             });
                             events_to_emit.push(Event::SweepGlobalCompleted {
@@ -3928,7 +4381,7 @@ impl SweepRegistry {
                             // fall through to the same pre-work insta-crash test the
                             // checkpoint-less branch below uses, so a sub-window
                             // non-clean death still counts toward quarantine.
-                            if checkpoint_written_by_run(&checkpoint, started_at) {
+                            if checkpoint_progress {
                                 self.record_terminal_outcome(issue, false);
                                 // #4256: a run that advanced the checkpoint made
                                 // real progress (reached Judge/Doctor and wrote a
@@ -3940,12 +4393,17 @@ impl SweepRegistry {
                                 // capped. Mirrors `record_terminal_outcome`'s
                                 // reset of `insta_crash_counts` on progress.
                                 self.resume_attempt_counts.remove(&issue);
-                            } else {
-                                let insta_crash = duration_sec
-                                    < self.quarantine_config.insta_crash_secs
-                                    && exit_code != Some(0);
+                            } else if !is_preflight_death {
                                 // #4122: re-attribute account-exhaustion deaths
                                 // to the spawn account instead of the issue.
+                                // #4386: a pre-flight-classified death is skipped
+                                // entirely here — it must not charge the issue's
+                                // quarantine tally either, same carve-out
+                                // reasoning as exhaustion. The exhaustion case
+                                // itself is NOT skipped (`PreflightOutcome::Unknown`
+                                // always yields a `None`/non-preflight death_class,
+                                // so exhaustion still reaches — and is handled
+                                // inside — `record_insta_crash_outcome`).
                                 self.record_insta_crash_outcome(&sweep_id, issue, insta_crash);
                             }
                             // Reaper-driven resume (Issue #4256): a crash whose
@@ -4090,16 +4548,6 @@ impl SweepRegistry {
                                     at: now,
                                 };
                             }
-                            events_to_emit.push(Event::SweepExited {
-                                issue,
-                                exit_code,
-                                duration_sec,
-                                repo: None, // stamped by emit_event (#3929)
-                            });
-                            events_to_emit.push(Event::SweepGlobalCompleted {
-                                sweep_id: sweep_id.clone(),
-                                outcome: SweepOutcome::Exited,
-                            });
                             // Insta-crash quarantine (#3939): a checkpoint-less
                             // death inside the insta-crash window that did NOT
                             // exit cleanly (exit_code != 0, or an unknown
@@ -4108,12 +4556,41 @@ impl SweepRegistry {
                             // toward quarantine. A clean exit (code 0 — the
                             // legitimate self-skip / no-work path) or a slow death
                             // past the window resets the tally instead.
+                            //
+                            // Hoisted so the #4386 pre-flight classification below
+                            // can consult the same window bool the tally uses —
+                            // this branch has no checkpoint at all, so (unlike the
+                            // Crashed branch above) there is no "genuine progress"
+                            // carve-out to check first.
                             let insta_crash = duration_sec
                                 < self.quarantine_config.insta_crash_secs
                                 && exit_code != Some(0);
-                            // #4122: re-attribute account-exhaustion deaths to
-                            // the spawn account instead of the issue.
-                            self.record_insta_crash_outcome(&sweep_id, issue, insta_crash);
+                            let death_class = self.record_preflight_streak(&sweep_id, insta_crash);
+                            let is_preflight_death = death_class.is_some();
+                            events_to_emit.push(Event::SweepExited {
+                                issue,
+                                exit_code,
+                                duration_sec,
+                                death_class,
+                                repo: None, // stamped by emit_event (#3929)
+                            });
+                            events_to_emit.push(Event::SweepGlobalCompleted {
+                                sweep_id: sweep_id.clone(),
+                                outcome: SweepOutcome::Exited,
+                            });
+                            if !is_preflight_death {
+                                // #4122: re-attribute account-exhaustion deaths to
+                                // the spawn account instead of the issue.
+                                // #4386: a pre-flight-classified death must not
+                                // charge the issue's quarantine tally either (same
+                                // carve-out reasoning as exhaustion) — skipped
+                                // entirely here. The exhaustion case itself is
+                                // NOT skipped (`PreflightOutcome::Unknown` always
+                                // yields a `None` death_class, so exhaustion still
+                                // reaches — and is handled inside —
+                                // `record_insta_crash_outcome`).
+                                self.record_insta_crash_outcome(&sweep_id, issue, insta_crash);
+                            }
                         }
                         // Block-the-subtree (issue #3729, v1 item 4): if this
                         // parent ended in `loom:blocked` and stacked children
@@ -4643,7 +5120,8 @@ impl SweepRegistry {
                             issue,
                             checkpoint_phase: None,
                             classification: None,
-                            repo: None, // stamped by emit_event (#3929)
+                            death_class: None, // mid-build death, not pre-flight (#4386)
+                            repo: None,        // stamped by emit_event (#3929)
                         });
                     }
                 }
@@ -4663,7 +5141,8 @@ impl SweepRegistry {
                                 issue,
                                 checkpoint_phase: None,
                                 classification: None,
-                                repo: None, // stamped by emit_event (#3929)
+                                death_class: None, // pool-exhausted defer, not pre-flight (#4386)
+                                repo: None,        // stamped by emit_event (#3929)
                             });
                         }
                         continue;
@@ -4824,7 +5303,8 @@ impl SweepRegistry {
                             issue,
                             checkpoint_phase: None,
                             classification: None,
-                            repo: None, // stamped by emit_event (#3929)
+                            death_class: None, // review-stall give-up, not pre-flight (#4386)
+                            repo: None,        // stamped by emit_event (#3929)
                         });
                     }
                 }
@@ -5196,7 +5676,23 @@ pub fn spawn_reaper_task(registry: Arc<Mutex<SweepRegistry>>) -> tokio::task::Jo
             ticker.tick().await;
             let changed = {
                 match registry.lock() {
-                    Ok(mut r) => r.reap_once(),
+                    Ok(mut r) => {
+                        let changed = r.reap_once();
+                        // Peer-claim heartbeat (#4431): re-advertise every
+                        // live claim each reaper tick so it never expires
+                        // from peers' views mid-run, now that label
+                        // reconciliation is a slow healing cadence on
+                        // safehouse-enabled hosts. Runs after `reap_once` so
+                        // a just-reaped (dead) sweep is never re-advertised.
+                        let readvertised = r.readvertise_peer_claims();
+                        if readvertised > 0 {
+                            log::debug!(
+                                "sweep_registry: re-advertised {readvertised} live peer \
+                                 claim(s) (#4431)"
+                            );
+                        }
+                        changed
+                    }
                     Err(poisoned) => {
                         log::error!("sweep_registry: mutex poisoned ({poisoned:?})");
                         return;
@@ -5762,6 +6258,67 @@ mod tests {
     /// exec bit, because parallel-test load on macOS occasionally races the
     /// chmod with the child's posix_spawn exec call and the script silently
     /// fails to launch (no shebang resolution, no exec-bit yet).
+    /// #4431: the reaper's peer-claim heartbeat must re-advertise every live
+    /// (`Running`/`Pending`) Issue sweep's claim — and ONLY those (a
+    /// terminal-state entry is a dead sweep whose claim must be allowed to
+    /// expire), and be a publisher-less no-op (safehouse disabled).
+    #[test]
+    fn readvertise_republishes_live_issue_claims_only() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _log) = fixture_registry(dir.path());
+
+        // No publisher attached (safehouse.enabled false): a silent no-op.
+        assert_eq!(registry.readvertise_peer_claims(), 0);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        registry.set_peer_claim_publisher(tx);
+
+        let mk_info =
+            |sweep_id: &str, issue: u32, state: SweepState, log_path: PathBuf| SweepInfo {
+                sweep_id: sweep_id.to_string(),
+                kind: SweepKind::Issue(issue),
+                pid: 0,
+                token_name: "unknown".into(),
+                log_path,
+                idempotency_key: None,
+                started_at: Utc::now(),
+                state,
+                latest_phase: None,
+                pr_number: None,
+                model: None,
+                effort: None,
+                depends_on: None,
+                repo: None,
+            };
+        let live_log = registry.compute_log_path(4431);
+        let dead_log = registry.compute_log_path(999);
+        registry.entries.insert(
+            "sweep-live".to_string(),
+            mk_info("sweep-live", 4431, SweepState::Running, live_log),
+        );
+        registry.entries.insert(
+            "sweep-dead".to_string(),
+            mk_info(
+                "sweep-dead",
+                999,
+                SweepState::Exited {
+                    code: None,
+                    at: Utc::now(),
+                },
+                dead_log,
+            ),
+        );
+
+        assert_eq!(registry.readvertise_peer_claims(), 1);
+        let ad = rx.try_recv().expect("one re-advertisement published");
+        assert_eq!(ad.issue, 4431);
+        assert_eq!(ad.kind, crate::peer_claims::ClaimKind::Advertise);
+        assert!(
+            rx.try_recv().is_err(),
+            "the terminal-state sweep's claim must NOT be re-advertised"
+        );
+    }
+
     fn fixture_registry(workspace: &Path) -> (SweepRegistry, PathBuf) {
         let record_log = workspace.join("fake-spawn.log");
         // We use /bin/bash as the spawn binary, and the dispatch path appends
@@ -6202,6 +6759,60 @@ exit 0
         // A clean/unknown exit with no signature carries no classification.
         assert_eq!(classify_crash("", Some(0)), None);
         assert_eq!(classify_crash("nothing notable", None), None);
+    }
+
+    /// Issue #4389 (a recurrence of #4257): `classify_crash` gains a
+    /// `self-kill:background-wait` signature for a dead sweep whose log tail
+    /// reads like the orchestrator ended its turn believing outstanding
+    /// background work would notify it later.
+    #[test]
+    fn classify_crash_labels_background_wait_self_kill() {
+        // Match: promises to be notified when a background task completes,
+        // with a clean exit code — exactly the case that fell through to
+        // `None` before this signature existed (#4389's root cause).
+        assert_eq!(
+            classify_crash(
+                "I'll wait for the background rebuild to notify me when it completes.",
+                Some(0),
+            )
+            .as_deref(),
+            Some("self-kill:background-wait")
+        );
+        // Match: also fires with no captured exit code at all.
+        assert_eq!(
+            classify_crash(
+                "I'll wait for the background task and check back once it's done.",
+                None
+            )
+            .as_deref(),
+            Some("self-kill:background-wait")
+        );
+        // Non-match: "background" appears but not paired with a
+        // notify/complete/check/pick-up promise anywhere after it.
+        assert_eq!(
+            classify_crash("running the rebuild in the background for speed", Some(0)),
+            None
+        );
+        // Non-match: a notify/complete/check word with no "background" in the
+        // same tail — not this signature at all.
+        assert_eq!(classify_crash("the build will complete shortly", Some(0)), None);
+        // Precedence: account exhaustion still wins over the background-wait
+        // signature even when both are present in the tail.
+        assert_eq!(
+            classify_crash(
+                "hit your weekly limit — try again later\nI'll check the background task after that.",
+                Some(1),
+            )
+            .as_deref(),
+            Some("account-exhausted:rate-limited")
+        );
+        // Precedence: the literal `Execution error` signature still wins over
+        // the background-wait signature.
+        assert_eq!(
+            classify_crash("Execution error\nI'll check on the background task later.", Some(1),)
+                .as_deref(),
+            Some("execution-error")
+        );
     }
 
     /// Issue #3823 (Option A): `spawn_child` exports the claim-ownership
@@ -7748,6 +8359,28 @@ exit 0
         assert_eq!(classify_account_exhaustion(""), None);
     }
 
+    /// #4386: `classify_preflight_death` matches the explicit
+    /// `# MCP_PREFLIGHT_FAILED` marker, matches a tail that never reaches
+    /// `# CLAUDE_CLI_START` at all, and does NOT match a normal tail that
+    /// does reach `# CLAUDE_CLI_START`.
+    #[test]
+    fn classify_preflight_death_matches_signatures() {
+        assert_eq!(
+            classify_preflight_death("spawn-claude: dispatching\n# MCP_PREFLIGHT_FAILED\n"),
+            Some("preflight-mcp-failed")
+        );
+        assert_eq!(
+            classify_preflight_death("spawn-claude: dispatching\nsome other early failure\n"),
+            Some("preflight-no-cli-start")
+        );
+        assert_eq!(
+            classify_preflight_death(
+                "spawn-claude: dispatching\n# CLAUDE_CLI_START\nClaude: working on it\n"
+            ),
+            None
+        );
+    }
+
     /// AC #1: an exhaustion insta-crash marks the account bad and does NOT
     /// charge the issue's quarantine tally — three in a row never quarantine.
     #[test]
@@ -7792,7 +8425,13 @@ exit 0
                 56,
                 seq,
                 "agent-3",
-                "loom-daemon dispatch: start\nsome unrelated crash: boom\n",
+                // Includes `# CLAUDE_CLI_START` (#4386): a REAL wrapper log for
+                // "the CLI actually started, then something unrelated crashed
+                // it" always carries this marker — the wrapper logs it
+                // unconditionally right before exec'ing the CLI. Without it,
+                // this log would misclassify as a pre-flight death (#4386's
+                // own carve-out), which is not what this fixture is testing.
+                "loom-daemon dispatch: start\n# CLAUDE_CLI_START\nsome unrelated crash: boom\n",
             );
             registry.reap_once();
         }
@@ -7837,6 +8476,199 @@ exit 0
         );
         assert!(!registry.is_quarantined(57));
         assert!(bad_tokens::is_bad(dir.path(), "agent-3"));
+    }
+
+    // ------------------------------------------------------------------------
+    // Claude-wrapper pre-flight-death workspace tripwire (Issue #4386)
+    // ------------------------------------------------------------------------
+
+    /// AC: a reaped sweep whose log shows the claude-wrapper pre-flight
+    /// marker is classified `death_class: Some("preflight-mcp-failed")` on
+    /// its terminal event, and does NOT charge the issue's insta-crash
+    /// quarantine tally (same carve-out reasoning as #4122's account
+    /// exhaustion).
+    #[tokio::test]
+    async fn reaper_preflight_death_does_not_charge_insta_crash_tally() {
+        use crate::event_bus::EventBus;
+
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+        let bus = Arc::new(EventBus::new());
+        registry.set_event_bus(bus.clone());
+        let mut sub = bus.subscribe::<[&str; 0], &str>([]);
+
+        insert_dead_running_with_log(
+            &mut registry,
+            4386,
+            0,
+            "unknown",
+            "spawn-claude: dispatching\n# MCP_PREFLIGHT_FAILED\n",
+        );
+        let changed = registry.reap_once();
+        assert!(changed >= 1);
+
+        let mut saw_exited = false;
+        for _ in 0..2 {
+            let ev = sub.recv().await.unwrap();
+            if let Event::SweepExited {
+                issue, death_class, ..
+            } = ev
+            {
+                assert_eq!(issue, 4386);
+                assert_eq!(death_class.as_deref(), Some("preflight-mcp-failed"));
+                saw_exited = true;
+            }
+        }
+        assert!(saw_exited, "expected a classified sweep.issue.4386.exited event");
+
+        assert_eq!(
+            registry.insta_crash_count(4386),
+            0,
+            "pre-flight deaths must not charge the issue's quarantine tally (#4386)"
+        );
+        assert!(!registry.is_quarantined(4386));
+        assert_eq!(registry.preflight_death_streak(), 1);
+    }
+
+    /// AC: 3 consecutive pre-flight deaths across DIFFERENT issues trip the
+    /// workspace-level advisory (default threshold 3); a sweep whose log
+    /// reaches `# CLAUDE_CLI_START` resets the streak and clears the
+    /// advisory; the advisory event fires only on the state-change
+    /// transition (dedup), never every tick.
+    #[tokio::test]
+    async fn workspace_tripwire_trips_across_issues_resets_on_progress_and_dedups() {
+        use crate::event_bus::EventBus;
+
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+        let bus = Arc::new(EventBus::new());
+        registry.set_event_bus(bus.clone());
+        let mut sub = bus.subscribe(["daemon.preflight.advisory"]);
+
+        assert!(!registry.preflight_advisory().0);
+
+        // Two pre-flight deaths (different issues) do NOT yet trip (default
+        // threshold 3).
+        for (issue, seq) in [(9101u32, 0u32), (9102, 0)] {
+            insert_dead_running_with_log(
+                &mut registry,
+                issue,
+                seq,
+                "unknown",
+                "# MCP_PREFLIGHT_FAILED\n",
+            );
+            registry.reap_once();
+        }
+        assert!(!registry.preflight_advisory().0);
+        assert_eq!(registry.preflight_death_streak(), 2);
+        assert!(
+            matches!(sub.try_recv(), Err(crate::event_bus::RecvError::Empty)),
+            "no advisory before the streak reaches the threshold"
+        );
+
+        // A third consecutive pre-flight death, on a THIRD different issue,
+        // trips it.
+        insert_dead_running_with_log(&mut registry, 9103, 0, "unknown", "# MCP_PREFLIGHT_FAILED\n");
+        registry.reap_once();
+        let (tripped, message) = registry.preflight_advisory();
+        assert!(tripped, "3 consecutive cross-issue pre-flight deaths must trip the advisory");
+        let message = message.expect("advisory message present when tripped");
+        assert!(message.contains("pre-flight"));
+        assert!(message.contains("mcp.json"));
+
+        match sub.recv().await.unwrap() {
+            Event::PreflightAdvisory {
+                consecutive_deaths, ..
+            } => assert_eq!(consecutive_deaths, 3),
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        // A fourth consecutive pre-flight death (still tripped) must NOT
+        // re-fire the advisory event — dedup on state change only.
+        insert_dead_running_with_log(&mut registry, 9104, 0, "unknown", "# MCP_PREFLIGHT_FAILED\n");
+        registry.reap_once();
+        assert!(registry.preflight_advisory().0);
+        assert!(
+            matches!(sub.try_recv(), Err(crate::event_bus::RecvError::Empty)),
+            "advisory must not re-fire while already tripped (dedup)"
+        );
+
+        // A sweep whose log reaches `# CLAUDE_CLI_START` resets the streak
+        // and clears the advisory, firing the clearing transition event.
+        insert_dead_running_with_log(
+            &mut registry,
+            9105,
+            0,
+            "unknown",
+            "# CLAUDE_CLI_START\nsome later crash\n",
+        );
+        registry.reap_once();
+        assert_eq!(registry.preflight_death_streak(), 0);
+        assert!(!registry.preflight_advisory().0);
+        match sub.recv().await.unwrap() {
+            Event::PreflightAdvisory {
+                consecutive_deaths, ..
+            } => assert_eq!(consecutive_deaths, 0),
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    /// Edge case (#4386): a dead sweep whose log file is missing/unreadable
+    /// at reap time is classified "unknown", NOT pre-flight — it must
+    /// neither increment nor reset the workspace streak.
+    #[test]
+    fn reaper_preflight_classification_unreadable_log_is_unknown_not_reset() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+
+        // Prime a genuine streak of 2 via two real pre-flight deaths.
+        insert_dead_running_with_log(&mut registry, 9201, 0, "unknown", "# MCP_PREFLIGHT_FAILED\n");
+        registry.reap_once();
+        insert_dead_running_with_log(&mut registry, 9202, 0, "unknown", "# MCP_PREFLIGHT_FAILED\n");
+        registry.reap_once();
+        assert_eq!(registry.preflight_death_streak(), 2);
+
+        // A dead sweep with NO log file at all (missing/unreadable).
+        insert_dead_running(&mut registry, 9203, 0);
+        registry.reap_once();
+        assert_eq!(
+            registry.preflight_death_streak(),
+            2,
+            "an unreadable log must classify as unknown — neither incrementing nor resetting \
+             the pre-flight streak"
+        );
+    }
+
+    /// Edge case (#4386): when BOTH an account-exhaustion signature and a
+    /// pre-flight marker are present in the same log tail, exhaustion wins —
+    /// it is already attributed to the account, so it must not also be
+    /// charged toward (or reset) the pre-flight streak.
+    #[test]
+    fn reaper_preflight_marker_with_exhaustion_signature_exhaustion_wins() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+        seed_token_pool(dir.path(), "agent-9");
+
+        insert_dead_running_with_log(
+            &mut registry,
+            9301,
+            0,
+            "agent-9",
+            "Claude: hit your weekly limit\n# MCP_PREFLIGHT_FAILED\n",
+        );
+        registry.reap_once();
+
+        assert!(
+            bad_tokens::is_bad(dir.path(), "agent-9"),
+            "exhaustion still marks the account bad"
+        );
+        assert_eq!(registry.insta_crash_count(9301), 0);
+        assert!(!registry.is_quarantined(9301));
+        assert_eq!(
+            registry.preflight_death_streak(),
+            0,
+            "an exhaustion-classified death must not count toward the pre-flight streak (#4386)"
+        );
     }
 
     /// AC #1 + #3 (#4009): a death whose checkpoint was written BY THIS run

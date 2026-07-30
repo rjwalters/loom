@@ -18,6 +18,9 @@
 #   (l) symlinked install target -> skipped, not clobbered
 #   (m) recorded loom_source gone -> clear error, exit 1
 #   (n) metadata re-stamp -> loom_version/loom_commit/last_resync present after apply
+# Canonical-guard-defer (#4041, #4403):
+#   (o) canonical guard + git-TRACKED vendored guard -> preserved, WARN, tree clean
+#   (p) canonical guard + UNTRACKED vendored guard   -> removed (unchanged behavior)
 # Plus contract checks:
 #   - --help prints usage, exit 0
 #   - unknown arg exits 1
@@ -537,6 +540,63 @@ if grep -q "skipped.*package.json" <<<"$OUT"; then
     pass "(#4285) pinned package.json reported as skipped"
 else
     fail "(#4285) pinned package.json not reported skipped"
+fi
+
+# --- (#4403) canonical-guard-defer: git-tracked target must NOT be removed --
+echo "Test group 14: canonical guard present + tracked vendored guard is preserved (#4403)"
+REPO="$(make_fixture)"
+mkdir -p "$REPO/.claude/skills/repo/hooks"
+printf '#!/usr/bin/env bash\n# rjwalters/repo#29 canonical guard\necho canonical\n' \
+    > "$REPO/.claude/skills/repo/hooks/guard-destructive.sh"
+printf '#!/usr/bin/env bash\necho vendored\n' \
+    > "$REPO/defaults/hooks/guard-destructive-generic.sh"
+printf '#!/usr/bin/env bash\necho vendored\n' \
+    > "$REPO/.loom/hooks/guard-destructive-generic.sh"
+git -C "$REPO" add .loom/hooks/guard-destructive-generic.sh >/dev/null 2>&1
+git -C "$REPO" commit -qm "track vendored guard" >/dev/null 2>&1
+OUT="$(cd "$REPO" && bash "$SCRIPT" 2>&1)"
+RC=$?
+if [[ $RC -eq 0 ]]; then pass "(#4403) apply exits 0 with a tracked vendored guard present"; else fail "(#4403) apply exits 0 (got $RC)"; fi
+if [[ -f "$REPO/.loom/hooks/guard-destructive-generic.sh" ]]; then
+    pass "(#4403) git-tracked hooks/guard-destructive-generic.sh preserved (not removed)"
+else
+    fail "(#4403) git-tracked hooks/guard-destructive-generic.sh was removed"
+fi
+if grep -qi "WARN.*git-tracked" <<<"$OUT"; then
+    pass "(#4403) a WARN is printed explaining the tracked file was preserved"
+else
+    fail "(#4403) no WARN printed for the preserved tracked file"
+fi
+if [[ -z "$(cd "$REPO" && git status --porcelain -- .loom/hooks/guard-destructive-generic.sh 2>&1)" ]]; then
+    pass "(#4403) tracked guard file stays non-dirty (no local mods/deletions) after the run"
+else
+    fail "(#4403) tracked guard file is dirty after the run"
+fi
+
+# --- (#4403) canonical-guard-defer: untracked target keeps existing behavior -
+echo "Test group 15: canonical guard present + UNTRACKED vendored guard is still removed (#4403)"
+REPO="$(make_fixture)"
+mkdir -p "$REPO/.claude/skills/repo/hooks"
+printf '#!/usr/bin/env bash\n# rjwalters/repo#29 canonical guard\necho canonical\n' \
+    > "$REPO/.claude/skills/repo/hooks/guard-destructive.sh"
+printf '#!/usr/bin/env bash\necho vendored\n' \
+    > "$REPO/defaults/hooks/guard-destructive-generic.sh"
+printf '#!/usr/bin/env bash\necho vendored\n' \
+    > "$REPO/.loom/hooks/guard-destructive-generic.sh"
+# Note: intentionally NOT git-added, so this is the normal consumer-repo case
+# where .loom/ isn't committed.
+OUT="$(cd "$REPO" && bash "$SCRIPT" 2>&1)"
+RC=$?
+if [[ $RC -eq 0 ]]; then pass "(#4403) apply exits 0 with an untracked vendored guard present"; else fail "(#4403) apply exits 0 (got $RC)"; fi
+if [[ ! -f "$REPO/.loom/hooks/guard-destructive-generic.sh" ]]; then
+    pass "(#4403) untracked hooks/guard-destructive-generic.sh removed (existing behavior unchanged)"
+else
+    fail "(#4403) untracked hooks/guard-destructive-generic.sh was NOT removed"
+fi
+if grep -q "removed.*hooks/guard-destructive-generic.sh" <<<"$OUT"; then
+    pass "(#4403) removal reported as before"
+else
+    fail "(#4403) removal not reported"
 fi
 
 # --- contract checks ---------------------------------------------------------
