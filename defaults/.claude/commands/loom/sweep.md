@@ -1499,10 +1499,11 @@ Curator runs sequentially per-issue within wave setup — it is cheap and does n
 Each issue must reach `loom:issue` before the Builder can claim it. This promotion is authorized — see `.loom/roles/curator.md` § "Who promotes `loom:curated` → `loom:issue`" for the full rule. In short: the orchestrator only ever promotes an issue that is already a member of *this sweep's own resolved candidate set*, so the promotion executes an approval already given one step earlier in this same run (the operator named or confirmed the issue, or the daemon dispatch that started this sweep did) — it is not independent agent judgment, and it is not the Curator acting.
 
 - If the issue already has `loom:issue`, proceed.
-- Otherwise, promote it:
+- Otherwise, promote it (add-only — matches Champion promotion):
   ```bash
-  gh issue edit N --remove-label "loom:curated" --add-label "loom:issue"
+  gh issue edit N --add-label "loom:issue"
   ```
+  **Do not remove `loom:curated`.** Per #3288 (Option A), `loom:curated` is a persistent milestone marker, not a transient step label — a promoted issue carries *both* `loom:curated` and `loom:issue`. Stripping it here would falsely surface the issue in the Curator Priority 1 "approved-but-uncurated" query (`loom:issue` without `loom:curated`) and drop the Builder prioritization signal that ranks `loom:issue` + `loom:curated` ahead of `loom:issue` alone. This keeps sweep promotion consistent with `champion-issue-promo.md`, which also preserves `loom:curated`.
 
 ### 4. Builder phase (parallel within the wave)
 
