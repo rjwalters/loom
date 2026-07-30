@@ -7,9 +7,25 @@ mod common;
 use common::{cleanup_all_loom_sessions, TestClient, TestDaemon};
 use serial_test::serial;
 
-/// Cleanup helper to run before/after tests.
-/// Uses broad cleanup because security tests intentionally create terminals
-/// with hardcoded IDs (for injection testing) that don't match `TEST_PREFIX`.
+/// Cleanup helper to run before/after each test.
+///
+/// Deliberately uses the host-wide `cleanup_all_loom_sessions()` rather than
+/// the `TEST_PREFIX`-scoped `cleanup_test_sessions()` (issue #4622). This is a
+/// reviewed exception, not an oversight: several tests below intentionally
+/// pass hardcoded, unprefixed terminal IDs — `terminal-1`, `isolated-terminal`,
+/// `test-symlink`, `test-traversal`, `test-sensitive`, etc. — either as the
+/// injection payload under test, or to exercise "accept a valid ID" /
+/// isolation / symlink / traversal paths. `create_terminal` uses that ID as
+/// both `config_id` and the tmux session name (`loom-{id}-{role}-{instance}`),
+/// so those real sessions never carry `TEST_PREFIX` and `cleanup_test_sessions()`
+/// cannot see or remove them, leaving stale sessions that would collide with
+/// (or be silently reused by) a later run.
+///
+/// Known trade-off: on a genuinely shared host this can still kill another
+/// user's sessions or a live production `loom-daemon`'s real sessions. These
+/// `integration_*` suites are confined to the `daemon-integration` nextest
+/// test group (`max-threads = 1`, see `.config/nextest.toml` /
+/// `loom-daemon/src/lib.rs`) precisely because of hazards like this one.
 fn setup() {
     cleanup_all_loom_sessions();
 }

@@ -10,7 +10,7 @@
 
 mod common;
 
-use common::{cleanup_all_loom_sessions, daemon_bin, TestClient, TestDaemon};
+use common::{cleanup_test_sessions, daemon_bin, TestClient, TestDaemon};
 use serial_test::serial;
 use std::io::BufRead;
 use std::os::unix::fs::FileTypeExt;
@@ -19,8 +19,12 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// Scoped to this binary's `TEST_PREFIX` (issue #4622) — a host-wide kill was
+/// never actually needed here: this suite tests socket/singleton behavior and
+/// never creates a named terminal/tmux session at all, so there is nothing for
+/// the broad cleanup to catch that the scoped helper would miss.
 fn setup() {
-    cleanup_all_loom_sessions();
+    cleanup_test_sessions();
 }
 
 /// How long to wait for a second daemon to notice the incumbent and exit.

@@ -75,9 +75,12 @@ status-level = "fail"
 # isolation can separate:
 #
 #   * the dedicated `tmux -L loom` server (sessions are host-global),
-#   * `cleanup_all_loom_sessions()` in each suite's `setup()`, which kills EVERY
-#     `loom-*` session — including sessions owned by a concurrently running test
-#     in another process,
+#   * `cleanup_all_loom_sessions()` in two of the four suites' `setup()`
+#     (`integration_security.rs`, `integration_factory_reset.rs` — a reviewed,
+#     commented exception, see issue #4622 and `tests/common/mod.rs`), which
+#     kills EVERY `loom-*` session — including sessions owned by a
+#     concurrently running test in another process. The other two suites use
+#     the `TEST_PREFIX`-scoped `cleanup_test_sessions()`,
 #   * a real `loom-daemon` child per test, which binds a socket and writes an
 #     activity DB.
 #

@@ -24,13 +24,17 @@ cargo test -- --test-threads=1
 > **Isolation**: under `cargo nextest run --workspace` every test gets its own
 > process (see the crate-level "Test isolation convention" docs in
 > `loom-daemon/src/lib.rs`, issue #4385). These `integration_*` suites touch the
-> host-global `tmux -L loom` server — `setup()` calls `cleanup_all_loom_sessions()`,
-> which kills *every* `loom-*` session, not just its own — and spawn real daemons,
-> so `.config/nextest.toml` puts them in the `daemon-integration` test group with
+> host-global `tmux -L loom` server and spawn real daemons, so
+> `.config/nextest.toml` puts them in the `daemon-integration` test group with
 > `max-threads = 1`: at most one is in flight at a time, which is the exclusion
-> `cargo test` provided implicitly by running one test binary at a time. The filter
-> is `binary(/^integration_/)`, so a new `integration_*` suite is covered
-> automatically. Verify with
+> `cargo test` provided implicitly by running one test binary at a time. Two of
+> the four suites (`integration_security.rs`, `integration_factory_reset.rs`)
+> additionally call `cleanup_all_loom_sessions()` in `setup()`, which kills
+> *every* `loom-*` session, not just its own — a reviewed, commented exception
+> for hardcoded/unprefixed terminal IDs a scoped cleanup can't see (issue
+> #4622; see `tests/common/mod.rs`). The other two use the `TEST_PREFIX`-scoped
+> `cleanup_test_sessions()`. The filter is `binary(/^integration_/)`, so a new
+> `integration_*` suite is covered automatically. Verify with
 > `cargo nextest show-config test-groups --profile ci`.
 >
 > That group bounds one nextest run, not the machine. A `cargo test` in another

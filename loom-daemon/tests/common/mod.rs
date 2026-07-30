@@ -437,7 +437,27 @@ pub fn get_loom_tmux_sessions() -> Vec<String> {
     }
 }
 
-/// Helper: Clean up all loom-* tmux sessions (for test teardown)
+/// Helper: Kill **every** `loom-*` tmux session on the shared `-L loom` server —
+/// not just this test binary's own sessions.
+///
+/// # Danger (issue #4622)
+///
+/// This is host-wide and unscoped: on a shared host it can destroy another
+/// user's sessions, a concurrently running (unrelated) test binary's sessions,
+/// or a live *production* `loom-daemon`'s real work sessions. **Prefer
+/// [`cleanup_test_sessions`] by default** — it is scoped to this binary's
+/// `TEST_PREFIX` and is safe for the overwhelming majority of tests.
+///
+/// Reach for this nuclear variant only when a suite provably creates tmux
+/// sessions whose names do **not** carry `TEST_PREFIX` (e.g. hardcoded/literal
+/// terminal IDs used to test injection handling or to mirror a fixed
+/// production naming scheme) — in which case `cleanup_test_sessions()` cannot
+/// see, and therefore cannot clean up, those sessions. Every such call site
+/// must carry a comment at the point of use explaining *why* the scoped helper
+/// is insufficient there (see `integration_security.rs` and
+/// `integration_factory_reset.rs` for examples). Do not use it just for
+/// convenience or as a "belt and suspenders" default — `cleanup_test_sessions()`
+/// is enough for any suite whose terminal IDs are TEST_PREFIX-scoped.
 #[allow(dead_code)]
 pub fn cleanup_all_loom_sessions() {
     for session in get_loom_tmux_sessions() {
@@ -460,9 +480,11 @@ pub fn get_test_tmux_sessions() -> Vec<String> {
 
 /// Helper: Clean up only tmux sessions belonging to the current test binary.
 ///
-/// Uses `TEST_PREFIX` to scope cleanup so that parallel test binaries don't
-/// destroy each other's sessions. Use `cleanup_all_loom_sessions()` for
-/// a nuclear cleanup (e.g., CI pre-test).
+/// Uses `TEST_PREFIX` to scope cleanup so that parallel test binaries — and
+/// anything else sharing the host's `-L loom` tmux server, including another
+/// user's sessions or a live production `loom-daemon` — are left untouched.
+/// This is the default cleanup helper; see [`cleanup_all_loom_sessions`] for
+/// the narrow, justified-only-per-call-site exception.
 #[allow(dead_code)]
 pub fn cleanup_test_sessions() {
     for session in get_test_tmux_sessions() {
