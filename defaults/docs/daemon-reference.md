@@ -1292,12 +1292,15 @@ dispatch surface is opt-in, daemon-`dispatch_sweep`-only, and
 linear-chains-only.**
 
 **Dispatch a chain** — N independent `dispatch_sweep` calls, each naming its
-immediate predecessor via `depends_on` (there is no multi-node planner):
+immediate predecessor via `depends_on` (there is no multi-node planner). Always
+pass `workspace_root` explicitly — omitting it can silently target the wrong
+managed workspace (#4503; see workspace_root note above):
 
 ```text
-dispatch_sweep  kind={"Issue": A}                    # parent (independent)
-dispatch_sweep  kind={"Issue": B}  depends_on=A      # child stacked on A
-dispatch_sweep  kind={"Issue": C}  depends_on=B      # A→B→C linear chain
+WORKSPACE_ROOT=$(git rev-parse --show-toplevel)
+dispatch_sweep  kind={"Issue": A}  workspace_root=$WORKSPACE_ROOT                    # parent (independent)
+dispatch_sweep  kind={"Issue": B}  depends_on=A  workspace_root=$WORKSPACE_ROOT      # child stacked on A
+dispatch_sweep  kind={"Issue": C}  depends_on=B  workspace_root=$WORKSPACE_ROOT      # A→B→C linear chain
 ```
 
 The daemon forwards `depends_on` to the child as `--depends-on <parent>`; the
