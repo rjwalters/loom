@@ -268,7 +268,9 @@ missing/exhausted pool exits `78` (`EX_CONFIG`). Full reference:
 ## Forge Authentication & Releasing
 
 - **GitHub** — Loom uses the `gh` CLI (the `gh auth login` credential; scope to
-  one repo with `export GH_TOKEN=…`). See [`.loom/docs/github-authentication.md`](.loom/docs/github-authentication.md).
+  one repo with `export GH_TOKEN=…`). Fleet rate-limit protections (breaker, ETag
+  cache, App tokens — epic #4432) are `loom-daemon`-internal; hand-rolled parallel
+  `claude-wrapper.sh` loops get none. See [`.loom/docs/github-authentication.md`](.loom/docs/github-authentication.md).
 - **Gitea** — set `GITEA_TOKEN` or `FORGE_TOKEN` (repository read/write). See
   [`.loom/docs/forge-authentication.md`](.loom/docs/forge-authentication.md).
 - **Releasing** — `scripts/version.sh` keeps all 5 version-bearing files in sync
