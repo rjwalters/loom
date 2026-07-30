@@ -15,6 +15,7 @@ use loom_daemon::main_health_gate;
 use loom_daemon::metrics_collector;
 use loom_daemon::quarantine_reconciliation;
 use loom_daemon::rate_limit_breaker;
+use loom_daemon::role_collision;
 use loom_daemon::role_runner;
 use loom_daemon::role_validation;
 use loom_daemon::script_helpers;
@@ -2720,6 +2721,23 @@ async fn run_daemon() -> Result<()> {
             "role_runner: enabled (multi-workspace, {} role(s): {})",
             roles.len(),
             roles.iter().map(|r| r.name).collect::<Vec<_>>().join(", ")
+        );
+        // Cross-host role-tick collision detection (#4623), the role-runner
+        // counterpart of #4085's sweep-dispatch probe. Resolved per registered
+        // root at tick time (a root can opt in/out on its own); this line
+        // reports the daemon workspace's own resolution so an operator can
+        // confirm the toggle took effect. Detection only — a detected
+        // collision is logged/counted, never acted on.
+        log::info!(
+            "role_runner: cross-host collision detection {} for {} (#4623; \
+             LOOM_ROLE_RUNNER_DETECT_COLLISIONS > autonomous.roleRunner.collisionDetection > \
+             autonomous.collisionDetection.enabled)",
+            if role_collision::resolve_detection_enabled(&sweep_workspace) {
+                "ENABLED"
+            } else {
+                "disabled"
+            },
+            sweep_workspace.display()
         );
         let handles: Vec<_> = roles
             .iter()

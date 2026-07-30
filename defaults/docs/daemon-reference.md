@@ -2286,6 +2286,8 @@ exactly like `main_health_gate::read_build_gate_config`.
 | `autonomous.roleRunner.intervalSecs` | `LOOM_ROLE_RUNNER_INTERVAL_SECS` | per-role built-in (5–15 min) | Uniform override applied to every enabled role's cadence |
 | `autonomous.roleRunner.model` | *(config only)* | `sonnet` | Model every role child is pinned to via `--model` (#4501). Resolved through the same `resolve_dispatch_model` chain as sweep dispatch: this key > `autonomous.model` > shipped default; blanks treated as unset. A role child never inherits the account's interactive CLI default |
 | `autonomous.roleRunner.onIdle` | *(config only)* | `[]` (none) | Subset of the same 5 roles to also fire on the work-finder **idle edge** (#4364) — the non-idle → idle transition (0 in-flight sweeps AND nothing dispatched this tick), in addition to the interval cadence. Absent → none (opposite default from `roles`); unknown names ignored with a warning. Debounced to min 60s per (root, role) and skipped while that role's interval/idle run is in progress. **Requires the work finder enabled** to observe idleness (a startup warning fires if set with the work finder off). **Also gated by that same root's own `enabled`** (#4377) — see below |
+| `autonomous.roleRunner.collisionDetection` | `LOOM_ROLE_RUNNER_DETECT_COLLISIONS` | inherits `autonomous.collisionDetection.enabled`, else `false` | Cross-host role-tick collision baseline (#4623). Detection only — a pre-tick probe of that role's own label queue, logged/counted, never acted on. Absent → falls through to #4085's shared toggle; see [Cross-host role-tick collision detection](#cross-host-role-tick-collision-detection-4623) |
+| `autonomous.roleRunner.collisionWindowSecs` | `LOOM_ROLE_RUNNER_COLLISION_WINDOW_SECS` | that role's tick interval | Lookback window for the #4623 probe, clamped to `[60, 3600]`. Zero/invalid dropped to the next tier |
 | `autonomous.idleExit.enabled` | `LOOM_AUTONOMOUS_IDLE_EXIT_ENABLED` | `false` | End the daemon cleanly after the idle window so a host guard can take over. Independent of Work Finder; never invokes a power command |
 | `autonomous.idleExit.idleMinutes` | `LOOM_AUTONOMOUS_IDLE_EXIT_MINUTES` | `60` | Continuous idle/starvation window. Zero/invalid → default |
 | `autonomous.idleExit.onTokenStarvation` | `LOOM_AUTONOMOUS_IDLE_EXIT_ON_TOKEN_STARVATION` | `true` | Also exit after zero healthy accounts for the full window with no sweep in flight, even if roles keep cycling |
@@ -2792,6 +2794,75 @@ per the config/env row above (`LOOM_DETECT_COLLISIONS=1` or
 `autonomous.collisionDetection.enabled = true`, precedence **env > config >
 default**) on the hosts sharing a backlog while you take the measurement.
 
+### Cross-host role-tick collision detection (#4623)
+
+The #4085 probe above covers **sweep dispatch** only. The standalone role runner
+(Champion / Curator / Judge / Auditor / Guide ticks) had the same blind spot with
+none of the instrumentation: its `RoleRunGuard` overlap guard is an in-memory
+`HashSet<(root, role)>` — one *process* — and `loom-daemon-start.sh`'s PID-file
+guard is one *host*. Two daemons (two hosts, or two clones on one host each with
+their own PID file) pointed at the same forge repo with
+`autonomous.roleRunner.enabled=true` therefore ran the same role with zero mutual
+awareness. That is the leading explanation for #4586's eight duplicate "Cannot
+Auto-Merge" Champion comments on PR #4540 inside ~5 minutes, far above the
+documented 10-minute Champion cadence; a repo that leaves the
+`.github/workflows/loom-*.yml` cron schedules enabled *alongside* the daemon role
+runner has the same shape.
+
+**The signal: foreign activity on the role's own queue.** Each role acts on a
+label-defined queue, and any pass over it bumps `updated_at` on the items it
+touches. Immediately before a tick for `(root, role)` the daemon lists that queue
+over the **ETag-cached REST listing** (#4428 — an unchanged queue is a `304` at
+*zero* rate-limit cost, and it never touches the GraphQL budget), then compares
+the newest `updated_at` against the wall-clock window of **this process's own
+last completed tick**. Activity strictly after our own pass finished (plus a 90s
+clock-skew margin) was not written by us.
+
+| Role | Probed queue |
+|------|--------------|
+| `champion` | open PRs labeled `loom:pr` |
+| `judge` | open PRs labeled `loom:review-requested` |
+| `curator` | open issues labeled `loom:curating` |
+| `guide` | open issues labeled `loom:triage` |
+| `auditor` | open issues labeled `loom:auditor` |
+
+Outcomes mirror #4085's three-way classification: **collision** (logged at `warn`
+with role, repo, host identity, the newest item and its timestamp, the lookback
+window, and a running process-lifetime count), **clean**, or **unknown** —
+fail-closed, so no self-run baseline yet (the first tick after daemon start) and
+any listing failure are never counted.
+
+**Detection only.** Nothing suppresses, delays, or reorders a role invocation; a
+detected collision is one log line. Enforcement is #4028 Phase 2's cross-host
+CAS, deliberately out of scope.
+
+**Read the count as a baseline, not proof.** It **under**-counts (a peer pass
+whose writes land inside our own tick's window is invisible; a pass that changes
+nothing writes nothing) and can **over**-count in a bounded way (a human, a
+Builder, or a *sweep-internal* Judge/Doctor/Champion touching the same queue is
+indistinguishable here). The `warn` line says so explicitly.
+
+**Config.** The role runner honors #4085's shared toggle directly — the same
+problem class should need one switch — but accepts a role-runner-specific
+override, because the two probe shapes have different costs and cadences (one
+`gh issue view` *per dispatch* vs. one cached REST listing *per role per tick*).
+Precedence, highest first:
+
+1. `LOOM_ROLE_RUNNER_DETECT_COLLISIONS` (env; `1`/`true`/`yes`/`on` enable, any
+   other value — including an explicit `0` — disables even when the shared
+   toggle is on)
+2. `autonomous.roleRunner.collisionDetection` (config, bool)
+3. `LOOM_DETECT_COLLISIONS` / `autonomous.collisionDetection.enabled` (#4085)
+4. default **off**
+
+The lookback window is `LOOM_ROLE_RUNNER_COLLISION_WINDOW_SECS` >
+`autonomous.roleRunner.collisionWindowSecs` > that role's own tick interval,
+clamped to `[60s, 3600s]`. Defaulting to the role's cadence is the natural
+choice: a peer running the same role on the same cadence writes to the queue at
+least once per interval. Like every other per-root role-runner knob, enablement
+is resolved from **each registered root's own** `.loom/config.json` (#4377); the
+daemon logs its own workspace's resolution once at startup.
+
 **Reaper-driven resume (#4256): the guard's own escape valve.** A sweep that
 dies **after** its Builder opened a PR would otherwise strand that PR at
 `loom:review-requested` forever — the #4123 guard above correctly refuses
@@ -3072,6 +3143,12 @@ leaves the daemon's behavior byte-for-byte unchanged:
 | — | `autonomous.roleRunner.roles` | config only | all five roles |
 | — | `autonomous.roleRunner.onIdle` | config only | `[]` (none) |
 | — | `autonomous.roleRunner.model` | config only (`roleRunner.model` > `autonomous.model` > default) | `sonnet` (`DEFAULT_DISPATCH_MODEL`) |
+| `LOOM_ROLE_RUNNER_DETECT_COLLISIONS` | `autonomous.roleRunner.collisionDetection` | env > config > `autonomous.collisionDetection.enabled` > default | `false` (off) |
+| `LOOM_ROLE_RUNNER_COLLISION_WINDOW_SECS` | `autonomous.roleRunner.collisionWindowSecs` | env > config > default | that role's tick interval, clamped to `[60, 3600]` |
+
+The last two rows are the role runner's half of the cross-host collision
+baseline — detection only, opt-in, and fully described under
+[Cross-host role-tick collision detection (#4623)](#cross-host-role-tick-collision-detection-4623).
 
 **Role children are model-pinned (#4501).** Every role spawn appends an explicit
 `--model <resolved>` (immediately after the prompt, mirroring sweep dispatch), so
