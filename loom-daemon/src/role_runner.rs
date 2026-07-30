@@ -1750,8 +1750,17 @@ mod tests {
 
     /// Issue #4501: with only `autonomous.model` set, the role runner joins the
     /// SAME chain sweep dispatch uses rather than keeping a private default.
+    //
+    // NOTE: see the comment above `test_config_missing_file_is_default` —
+    // `resolve_role_runner_model` reads `read_role_runner_config` internally
+    // (and this test also calls it directly for the `blank` case), so it needs
+    // the same private-defaults-tier guard + `#[serial(loom_config_env)]`
+    // (#4593, discovered during review of #4590 / #4538).
     #[test]
+    #[serial(loom_config_env)]
     fn test_resolve_role_runner_model_precedence_chain() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+
         // No config at all -> shipped default, labelled `default`.
         let bare = tempfile::tempdir().unwrap();
         assert_eq!(
@@ -1789,6 +1798,8 @@ mod tests {
             resolve_role_runner_model(blank.path()),
             (sweep_registry::DEFAULT_DISPATCH_MODEL.to_string(), "default")
         );
+
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
     }
 
     /// Issue #4501: the per-role log header records the pinned model and the tier
@@ -2743,10 +2754,16 @@ mod tests {
     /// real entry point the work-finder loop calls, reading the root's own
     /// on-disk config each tick — exercised here end-to-end rather than via
     /// the already-parsed `RoleRunnerConfig` the other tests use.
+    // NOTE: see the comment above `test_config_missing_file_is_default` — this
+    // test's `observe_and_fire_idle` calls read the private-defaults tier via
+    // `read_role_runner_config` too, so it needs the same guard +
+    // `#[serial(loom_config_env)]` (#4593, discovered during review of #4590 /
+    // #4538).
     #[test]
-    #[serial]
+    #[serial(loom_config_env)]
     fn test_observe_and_fire_idle_cross_config_disabled_target_root_warns_and_suppresses() {
         std::env::remove_var(ROLE_RUNNER_ENABLE_ENV);
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
         let tmp = tempfile::tempdir().unwrap();
         write_config(tmp.path(), r#"{"autonomous": {"roleRunner": {"onIdle": ["champion"]}}}"#);
         let mut trigger = IdleTrigger::new();
@@ -2769,6 +2786,7 @@ mod tests {
         // holds (this is the "second edge does not re-warn" acceptance case).
         observe_and_fire_idle(&mut trigger, &in_progress, tmp.path(), false, false);
         observe_and_fire_idle(&mut trigger, &in_progress, tmp.path(), true, false);
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
         assert!(trigger.disabled_warned(tmp.path()));
         assert!(in_progress.lock().unwrap().is_empty());
     }
