@@ -51,6 +51,7 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc::error::TryRecvError;
 
+use crate::activity::ActivityDb;
 use crate::event_bus::{EventBus, RecvError};
 use crate::peer_claims::{ClaimAd, PeerClaimView};
 use crate::types::{Event, SweepKind};
@@ -132,6 +133,25 @@ const COMPLETION_REQUIRED_KEYS: [&str; 7] = [
 /// on timeout the completion is simply not narrated — the sweep is long over by
 /// then and nothing downstream waits on it.
 const MERGE_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// `gh pr list --json` fields the completion emit point requests.
+/// `number,url,mergedAt` are load-bearing (a missing one degrades the whole
+/// lookup, and with it the completion); `title,additions,deletions` are the
+/// #4497 feed display fields, harvested from the same call and degrading
+/// per-field.
+const MERGED_PR_FIELDS: &str = "number,url,mergedAt,title,additions,deletions";
+
+/// The pre-#4497 field set, retried only when a `gh` too old to know one of the
+/// display fields rejects [`MERGED_PR_FIELDS`] outright — so an older host keeps
+/// publishing completions instead of losing them to a cosmetic field.
+const MERGED_PR_FIELDS_BASE: &str = "number,url,mergedAt";
+
+/// Timeout for the sink-side activity-DB token rollup behind a `completion`
+/// envelope (#4497). The query is a single indexed SQLite aggregate on a local
+/// file, but it contends with the IPC handler's writes for the DB mutex, so it
+/// runs on the blocking pool under this cap; on timeout `tokens` is simply
+/// omitted.
+const TOKEN_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Reconnect backoff floor and ceiling. The floor keeps a burst of events from
 /// hammering an absent peer (one `warn`, not a hot loop); the ceiling caps the
@@ -448,7 +468,24 @@ pub struct CompletionMeta {
     /// schema revision downstream. Omitted entirely when `None` — the feed
     /// handles absence, and the issue's rule is "omit rather than guess".
     pub issue: Option<u32>,
+    /// Best-effort total (input + output) tokens the activity DB attributes to
+    /// this issue (#4497), for the feed's cost-of-quality-code trend. **Known
+    /// imperfect** — see [`fetch_issue_tokens`] for the attribution caveats
+    /// (issue-number-only, so no repo qualification, and dependent on the
+    /// activity DB having a per-issue rollup at all). Imperfect-but-consistent
+    /// beats absent for trend purposes; a zero/absent rollup still omits the
+    /// key rather than publishing a bogus `0`.
     pub tokens: Option<u64>,
+    /// Merged PR title (#4497) — the feed renders rows as
+    /// `<repo>#<issue>: <title> +A −D`. Trimmed; an empty title is treated as
+    /// absent.
+    pub title: Option<String>,
+    /// Merged PR diff size (#4497), from the same `gh pr list` call that
+    /// verifies the merge. Unlike `tokens`, a real `0` is **meaningful** for a
+    /// merge (a docs-only revert legitimately adds nothing), so zeros are
+    /// published rather than filtered.
+    pub additions: Option<u64>,
+    pub deletions: Option<u64>,
 }
 
 impl CompletionMeta {
@@ -472,6 +509,24 @@ impl CompletionMeta {
         // nothing", so it is omitted rather than published as a real zero.
         if let Some(tokens) = self.tokens.filter(|t| *t > 0) {
             obj.insert("tokens".into(), json!(tokens));
+        }
+        // Display fields (#4497). `title` is trimmed and an empty one is
+        // dropped (an empty string would render as a blank row label); the
+        // counts publish real zeros because `0 additions` is a fact about the
+        // merge, not the "no data" sentinel a `0` token count would be.
+        if let Some(title) = self
+            .title
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+        {
+            obj.insert("title".into(), json!(title));
+        }
+        if let Some(additions) = self.additions {
+            obj.insert("additions".into(), json!(additions));
+        }
+        if let Some(deletions) = self.deletions {
+            obj.insert("deletions".into(), json!(deletions));
         }
         validate_completion_meta(&meta)?;
         Ok(meta)
@@ -550,12 +605,24 @@ pub fn validate_completion_meta(meta: &Value) -> Result<()> {
             get("started_at")
         );
     }
-    // `issue`/`tokens` are optional extension fields; when present they must
-    // still be non-negative integers rather than strings/floats.
-    for key in ["issue", "tokens"] {
+    // `issue`/`tokens`/`additions`/`deletions` are optional extension fields;
+    // when present they must still be non-negative integers rather than
+    // strings/floats.
+    for key in ["issue", "tokens", "additions", "deletions"] {
         if let Some(v) = obj.get(key) {
             if v.as_u64().is_none() {
                 bail!("completion `meta.{key}` must be a non-negative integer, got {v}");
+            }
+        }
+    }
+    // `title` (#4497) is an optional string; a present-but-blank one would
+    // render as an empty row label on the feed, so it is rejected here rather
+    // than published (the builder omits it instead — see `to_meta_value`).
+    if let Some(v) = obj.get("title") {
+        match v.as_str() {
+            Some(s) if !s.trim().is_empty() => {}
+            _ => {
+                bail!("completion `meta.title`, when present, must be a non-empty string, got {v}")
             }
         }
     }
@@ -919,6 +986,13 @@ struct MergedPr {
     number: u32,
     /// Canonical web URL (`completion-v1` `ref`).
     url: String,
+    /// Display fields (#4497), read from the *same* `gh pr list` call that
+    /// verifies the merge — zero extra round-trips. Each degrades to `None`
+    /// independently: a row missing one of them still yields a `MergedPr`, so a
+    /// completion is never lost over a cosmetic field.
+    title: Option<String>,
+    additions: Option<u64>,
+    deletions: Option<u64>,
 }
 
 /// Build the `completion` envelope for a merged sweep. Pure and total: every
@@ -963,26 +1037,27 @@ pub fn build_completion_envelope(
 /// `None` here and narrates no completion, so `result: "success"` is never
 /// claimed for unmerged work. Every failure — missing `gh`, no network,
 /// unauthenticated, timeout, malformed JSON — also degrades to `None`.
+///
+/// The same single call also harvests the feed's display fields (#4497:
+/// `title`/`additions`/`deletions`), so enriching the completion costs **zero**
+/// extra forge round-trips on the happy path.
 async fn fetch_merged_pr(workspace_root: &Path, issue: u32) -> Option<MergedPr> {
     let gh_bin = env_nonempty(GH_BIN_ENV).unwrap_or_else(|| "gh".to_owned());
     let branch = crate::worktree_ops::naming::branch_name(issue);
-    let run = tokio::process::Command::new(&gh_bin)
-        .arg("pr")
-        .arg("list")
-        .arg("--head")
-        .arg(&branch)
-        .arg("--state")
-        .arg("merged")
-        .arg("--json")
-        .arg("number,url,mergedAt")
-        .arg("--limit")
-        .arg("1")
-        .current_dir(workspace_root)
-        .output();
-    let output = tokio::time::timeout(MERGE_CHECK_TIMEOUT, run)
-        .await
-        .ok()?
-        .ok()?;
+    let mut output =
+        run_merged_pr_query(&gh_bin, &branch, MERGED_PR_FIELDS, workspace_root).await?;
+    if !output.status.success() && rejects_unknown_json_field(&output.stderr) {
+        // A `gh` old enough not to know one of the #4497 display fields rejects
+        // the *whole* request rather than omitting that field, which would have
+        // silently cost us every completion. Retry the pre-#4497 field set so
+        // such a host keeps publishing completions, just without the extras.
+        log::debug!(
+            "safehouse: gh rejected the completion display fields; \
+             retrying with the base field set (completion will omit title/additions/deletions)"
+        );
+        output =
+            run_merged_pr_query(&gh_bin, &branch, MERGED_PR_FIELDS_BASE, workspace_root).await?;
+    }
     if !output.status.success() {
         return None;
     }
@@ -997,7 +1072,63 @@ async fn fetch_merged_pr(workspace_root: &Path, issue: u32) -> Option<MergedPr> 
     }
     let number = u32::try_from(row.get("number")?.as_u64()?).ok()?;
     let url = row.get("url")?.as_str()?.to_owned();
-    (!url.is_empty()).then_some(MergedPr { number, url })
+    // Display fields are read with `and_then`/`filter` rather than `?`: an
+    // absent or wrongly-typed one must degrade that field alone, never the
+    // merge verification.
+    let title = row
+        .get("title")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(ToOwned::to_owned);
+    let additions = row.get("additions").and_then(Value::as_u64);
+    let deletions = row.get("deletions").and_then(Value::as_u64);
+    (!url.is_empty()).then_some(MergedPr {
+        number,
+        url,
+        title,
+        additions,
+        deletions,
+    })
+}
+
+/// One `gh pr list --head <branch> --state merged --json <fields>` invocation,
+/// bounded by [`MERGE_CHECK_TIMEOUT`]. `None` means the process could not be
+/// run or did not finish in time; a nonzero exit is returned to the caller so it
+/// can inspect `stderr`.
+async fn run_merged_pr_query(
+    gh_bin: &str,
+    branch: &str,
+    fields: &str,
+    workspace_root: &Path,
+) -> Option<std::process::Output> {
+    let run = tokio::process::Command::new(gh_bin)
+        .arg("pr")
+        .arg("list")
+        .arg("--head")
+        .arg(branch)
+        .arg("--state")
+        .arg("merged")
+        .arg("--json")
+        .arg(fields)
+        .arg("--limit")
+        .arg("1")
+        .current_dir(workspace_root)
+        .output();
+    tokio::time::timeout(MERGE_CHECK_TIMEOUT, run)
+        .await
+        .ok()?
+        .ok()
+}
+
+/// Whether `gh` failed specifically because it does not recognize one of the
+/// requested `--json` fields (`unknown JSON field: "additions"`), as opposed to
+/// the ordinary degradations (no auth, no network, not a repo). Only this case
+/// is worth a retry with a narrower field set.
+fn rejects_unknown_json_field(stderr: &[u8]) -> bool {
+    String::from_utf8_lossy(stderr)
+        .to_ascii_lowercase()
+        .contains("unknown json field")
 }
 
 /// Best-effort `gh repo view --json nameWithOwner` lookup for the forge
@@ -1042,6 +1173,56 @@ async fn fetch_repo_slug_cached(
     Some(slug)
 }
 
+/// Best-effort per-issue token total for a `completion` envelope (#4497):
+/// `sum(input + output)` over the activity DB's per-issue cost rollup
+/// ([`ActivityDb::get_cost_by_issue`]). The DB is already in-process, so this
+/// needs no forge call and no new accounting.
+///
+/// **Attribution is imperfect, by explicit operator decision** — for a cost
+/// *trend*, imperfect-but-consistent beats absent. Two known limits, documented
+/// here rather than papered over:
+///
+/// 1. **Not repo-qualified.** The activity DB's forge-correlation table keys on
+///    a bare issue number with no repo column, so a daemon managing several
+///    repos conflates identical issue numbers across them.
+/// 2. **Only as good as the prompt↔usage linkage.** The rollup joins recorded
+///    token samples to an issue through `agent_inputs`; samples recorded without
+///    that link contribute nothing, so the figure is a **floor**, not a full
+///    accounting — and is empty on hosts where nothing has established the link
+///    yet, in which case the key is simply omitted.
+///
+/// Every failure — no DB handle, a poisoned mutex, a query error, a timeout, an
+/// empty rollup — degrades to `None`. A zero total is likewise indistinguishable
+/// from "accounting had nothing" and is filtered out downstream by
+/// [`CompletionMeta::to_meta_value`], so no bogus `0` reaches the feed.
+async fn fetch_issue_tokens(
+    activity_db: Option<&Arc<Mutex<ActivityDb>>>,
+    issue: u32,
+) -> Option<u64> {
+    let db = activity_db?.clone();
+    let issue_number = i32::try_from(issue).ok()?;
+    // The rusqlite handle sits behind a std mutex shared with the IPC recorder's
+    // writes, so lock+query goes to the blocking pool: the sink must never park
+    // a daemon-runtime worker on it (and a std guard cannot cross an `await`).
+    let query = tokio::task::spawn_blocking(move || {
+        let rollup = {
+            let guard = db.lock().ok()?;
+            guard.get_cost_by_issue(Some(issue_number)).ok()?
+        };
+        let total = rollup.iter().fold(0_i64, |acc, row| {
+            acc.saturating_add(
+                row.total_input_tokens
+                    .saturating_add(row.total_output_tokens),
+            )
+        });
+        u64::try_from(total).ok()
+    });
+    tokio::time::timeout(TOKEN_LOOKUP_TIMEOUT, query)
+        .await
+        .ok()?
+        .ok()?
+}
+
 /// The Option-B emit point (#4426): on a `SweepExited`, verify against forge
 /// truth that the sweep's PR actually merged and, if so, build the
 /// public-feed `completion` envelope.
@@ -1065,6 +1246,13 @@ async fn fetch_repo_slug_cached(
 /// one (an open PR is un-finished, not failed, and is usually resumed). The
 /// wire support exists ([`CompletionResult::Failure`]) for a follow-up that
 /// identifies a genuinely terminal negative outcome.
+///
+/// The feed's display fields (#4497) ride along here: `title`/`additions`/
+/// `deletions` come out of the merge-verification call itself (no extra forge
+/// round-trip) and `tokens` out of the in-process activity DB when a handle was
+/// threaded in. All four are optional and independently degradable — with all
+/// four absent the envelope is byte-identical to the pre-#4497 one.
+#[allow(clippy::too_many_arguments)]
 async fn completion_for_exit(
     persona: &str,
     workspace_root: &str,
@@ -1073,6 +1261,7 @@ async fn completion_for_exit(
     exited_at: DateTime<Utc>,
     slug_cache: &mut HashMap<String, String>,
     already_narrated: &mut std::collections::HashSet<(String, u32)>,
+    activity_db: Option<&Arc<Mutex<ActivityDb>>>,
 ) -> Option<Envelope> {
     let key = (workspace_root.to_owned(), issue);
     if already_narrated.contains(&key) {
@@ -1080,6 +1269,9 @@ async fn completion_for_exit(
     }
     let merged = fetch_merged_pr(Path::new(workspace_root), issue).await?;
     let slug = fetch_repo_slug_cached(slug_cache, workspace_root).await?;
+    // Only reached once the merge is confirmed, so a completion is never delayed
+    // by a token lookup it would not have published.
+    let tokens = fetch_issue_tokens(activity_db, issue).await;
 
     // Sweep timing comes from the one clock that produced `duration_sec` (the
     // reaper's), so the pair is always self-consistent — mixing in the forge's
@@ -1093,10 +1285,12 @@ async fn completion_for_exit(
         started_at: started_at.to_rfc3339_opts(SecondsFormat::Secs, true),
         completed_at: exited_at.to_rfc3339_opts(SecondsFormat::Secs, true),
         issue: Some(issue),
-        // No cheap token source is wired to the sink (the activity DB lives
-        // behind the IPC handler, not the bus subscriber), so this is omitted
-        // rather than guessed — the feed handles absence.
-        tokens: None,
+        // Best-effort, knowingly imperfect attribution (#4497) — see
+        // `fetch_issue_tokens`. Absent/zero ⇒ the key is omitted, never guessed.
+        tokens,
+        title: merged.title,
+        additions: merged.additions,
+        deletions: merged.deletions,
     };
     match build_completion_envelope(Some(workspace_root), issue, merged.number, duration_sec, &meta)
     {
@@ -1274,12 +1468,17 @@ impl SafehouseClient {
 /// with the resolved config-only state immediately (before any connection
 /// attempt) and further updated by [`run_sink`] as connect/disconnect
 /// transitions happen — see [`SafehouseState`].
+///
+/// `activity_db` (#4497) is the optional in-process handle the completion emit
+/// point uses for its best-effort per-issue `tokens` rollup; `None` simply omits
+/// that one field.
 #[must_use]
 pub fn spawn_sink(
     config: SafehouseConfig,
     bus: &EventBus,
     runtime: &tokio::runtime::Handle,
     state: SharedSafehouseState,
+    activity_db: Option<Arc<Mutex<ActivityDb>>>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     if !config.enabled {
         // Disabled ⇒ do not even subscribe. No syscalls, no behavior change.
@@ -1305,8 +1504,16 @@ pub fn spawn_sink(
     // Empty topic set ⇒ receive every event; we filter in `event_to_envelope`.
     let subscription = bus.subscribe(Vec::<String>::new());
     Some(runtime.spawn(async move {
-        run_sink(config, socket, subscription, DEFAULT_MIN_BACKOFF, DEFAULT_MAX_BACKOFF, state)
-            .await;
+        run_sink(
+            config,
+            socket,
+            subscription,
+            DEFAULT_MIN_BACKOFF,
+            DEFAULT_MAX_BACKOFF,
+            state,
+            activity_db,
+        )
+        .await;
     }))
 }
 
@@ -1370,6 +1577,7 @@ async fn fetch_title_cached(
 /// narrates them, reconnecting lazily with capped exponential backoff. A
 /// connection failure never blocks or fails a sweep — it degrades to a single
 /// `warn` per outage (not per event) and drops that narration.
+#[allow(clippy::too_many_arguments)]
 async fn run_sink(
     config: SafehouseConfig,
     socket: PathBuf,
@@ -1377,6 +1585,7 @@ async fn run_sink(
     min_backoff: Duration,
     max_backoff: Duration,
     state: SharedSafehouseState,
+    activity_db: Option<Arc<Mutex<ActivityDb>>>,
 ) {
     // Report "configured, not yet connected" immediately — the sink connects
     // lazily on the first narrated event (below), so without this a daemon
@@ -1461,6 +1670,7 @@ async fn run_sink(
                 Utc::now(),
                 &mut slug_cache,
                 &mut completed,
+                activity_db.as_ref(),
             )
             .await
             {
@@ -2189,6 +2399,9 @@ mod tests {
             completed_at: "2026-07-29T10:12:30Z".to_owned(),
             issue: Some(4321),
             tokens: Some(791_000),
+            title: Some("Add repo-qualified task_id".to_owned()),
+            additions: Some(214),
+            deletions: Some(37),
         }
     }
 
@@ -2224,6 +2437,11 @@ mod tests {
         assert_eq!(req["meta"]["completed_at"], json!("2026-07-29T10:12:30Z"));
         assert_eq!(req["meta"]["issue"], json!(4321));
         assert_eq!(req["meta"]["tokens"], json!(791_000));
+        // Feed display fields (#4497) ride the same `meta`, so the egress
+        // publishes them with no schema revision.
+        assert_eq!(req["meta"]["title"], json!("Add repo-qualified task_id"));
+        assert_eq!(req["meta"]["additions"], json!(214));
+        assert_eq!(req["meta"]["deletions"], json!(37));
         assert!(req["body"].as_str().unwrap().contains("merged ✓"));
     }
 
@@ -2308,6 +2526,28 @@ mod tests {
                 m["tokens"] = json!("791000");
                 m
             }),
+            // #4497 display fields are validated to the same standard as the
+            // pre-existing extensions.
+            ("additions is a string", {
+                let mut m = valid.clone();
+                m["additions"] = json!("214");
+                m
+            }),
+            ("deletions is negative", {
+                let mut m = valid.clone();
+                m["deletions"] = json!(-1);
+                m
+            }),
+            ("title is blank", {
+                let mut m = valid.clone();
+                m["title"] = json!("   ");
+                m
+            }),
+            ("title is not a string", {
+                let mut m = valid.clone();
+                m["title"] = json!(4497);
+                m
+            }),
         ];
         // Every required key, dropped one at a time.
         for key in COMPLETION_REQUIRED_KEYS {
@@ -2340,12 +2580,25 @@ mod tests {
         let meta = CompletionMeta {
             issue: None,
             tokens: None,
+            title: None,
+            additions: None,
+            deletions: None,
             ..sample_completion_meta()
         }
         .to_meta_value()
         .unwrap();
         assert!(meta.get("issue").is_none(), "absent issue must be omitted, not null/0");
         assert!(meta.get("tokens").is_none(), "absent tokens must be omitted, not null/0");
+        assert!(meta.get("title").is_none(), "absent title must be omitted, not null/empty");
+        assert!(meta.get("additions").is_none(), "absent additions must be omitted, not 0");
+        assert!(meta.get("deletions").is_none(), "absent deletions must be omitted, not 0");
+        // With every extension absent, the envelope is exactly the required
+        // completion-v1 object — no new keys, so no new failure modes (#4497).
+        assert_eq!(
+            meta.as_object().unwrap().len(),
+            COMPLETION_REQUIRED_KEYS.len(),
+            "all-absent extensions ⇒ meta identical to the required-keys-only envelope; got {meta}"
+        );
         // A zero token count is indistinguishable from "no accounting data".
         let zeroed = CompletionMeta {
             tokens: Some(0),
@@ -2354,6 +2607,67 @@ mod tests {
         .to_meta_value()
         .unwrap();
         assert!(zeroed.get("tokens").is_none());
+        // A blank/whitespace title would render as an empty feed row label.
+        for blank in ["", "   ", "\n\t"] {
+            let meta = CompletionMeta {
+                title: Some(blank.to_owned()),
+                ..sample_completion_meta()
+            }
+            .to_meta_value()
+            .unwrap();
+            assert!(meta.get("title").is_none(), "blank title must be omitted: {blank:?}");
+        }
+    }
+
+    #[test]
+    fn completion_meta_publishes_zero_diff_counts_and_trims_the_title() {
+        // Unlike `tokens`, `0` additions/deletions is a *fact* about the merge
+        // (a pure revert, an empty-diff merge commit), not a "no data" sentinel
+        // — so it is published rather than filtered (#4497).
+        let meta = CompletionMeta {
+            additions: Some(0),
+            deletions: Some(0),
+            title: Some("  fix: trim me  ".to_owned()),
+            ..sample_completion_meta()
+        }
+        .to_meta_value()
+        .unwrap();
+        assert_eq!(meta["additions"], json!(0));
+        assert_eq!(meta["deletions"], json!(0));
+        assert_eq!(meta["title"], json!("fix: trim me"));
+    }
+
+    #[test]
+    fn completion_meta_carries_the_title_verbatim_for_downstream_redaction() {
+        // Deny-pattern redaction is safehoused's egress job (it redacts every
+        // string in the published payload), not loom's — so the contract loom
+        // owns is that `title` reaches the wire as an ordinary JSON string in
+        // `meta`, exactly like `repo`/`ref`, with no escaping or bespoke
+        // encoding that would let it bypass that pass (#4497 AC3).
+        let secretish = "fix: rotate ghp_EXAMPLETOKEN0123456789 in \"prod\"\\config";
+        let env = build_completion_envelope(
+            Some("/x/loom"),
+            4497,
+            4500,
+            60,
+            &CompletionMeta {
+                title: Some(secretish.to_owned()),
+                ..sample_completion_meta()
+            },
+        )
+        .unwrap();
+        let req = build_send_request(&env, 1, Some("fleet")).unwrap();
+        assert_eq!(
+            req["meta"]["title"],
+            json!(secretish),
+            "title must be a plain JSON string in meta, like every other redactable field"
+        );
+        // And it survives a JSON round-trip through the wire encoding intact —
+        // the shape safehoused's redactor walks.
+        let line = serde_json::to_string(&req).unwrap();
+        let parsed: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed["meta"]["title"], json!(secretish));
+        assert!(parsed["meta"]["title"].is_string());
     }
 
     #[test]
@@ -2756,6 +3070,7 @@ mod tests {
             Duration::from_millis(20),
             Duration::from_millis(80),
             new_shared_state(),
+            None,
         ));
 
         bus.publish(Event::SweepGlobalDispatch {
@@ -2814,7 +3129,93 @@ mod tests {
         (script_path, log)
     }
 
-    const MERGED_PR_JSON: &str = r#"[{"number":4400,"url":"https://github.com/rjwalters/loom/pull/4400","mergedAt":"2026-07-29T10:12:00Z"}]"#;
+    /// A `gh pr list` row carrying everything the enriched query asks for: the
+    /// load-bearing merge facts plus the #4497 feed display fields.
+    const MERGED_PR_JSON: &str = r#"[{"number":4400,"url":"https://github.com/rjwalters/loom/pull/4400","mergedAt":"2026-07-29T10:12:00Z","title":"feat: enrich completion meta","additions":214,"deletions":37}]"#;
+
+    /// The pre-#4497 row shape: merge facts only. Stands in for a forge/`gh`
+    /// that answers the query but returns none of the display fields — the
+    /// completion must still publish, minus those keys.
+    const MERGED_PR_JSON_NO_DISPLAY_FIELDS: &str = r#"[{"number":4400,"url":"https://github.com/rjwalters/loom/pull/4400","mergedAt":"2026-07-29T10:12:00Z"}]"#;
+
+    /// Build an activity DB under `dir` carrying exactly one per-issue token
+    /// rollup for `issue`, wired the way [`fetch_issue_tokens`]'s query reads it:
+    /// a recorded input, a forge event linking that input to the issue, and a
+    /// resource-usage sample linked to the same input.
+    fn seed_activity_db_with_issue_tokens(
+        dir: &std::path::Path,
+        issue: i32,
+        tokens_input: i64,
+        tokens_output: i64,
+    ) -> Arc<Mutex<ActivityDb>> {
+        use crate::activity::{
+            AgentInput, InputContext, InputType, PromptForgeEvent, PromptForgeEventType,
+        };
+
+        let db = ActivityDb::new(dir.join("activity.db")).unwrap();
+        let input_id = db
+            .record_input(&AgentInput {
+                id: None,
+                terminal_id: "loom-builder-1".to_owned(),
+                timestamp: Utc::now(),
+                input_type: InputType::Autonomous,
+                content: "/loom:builder".to_owned(),
+                agent_role: Some("builder".to_owned()),
+                context: InputContext::default(),
+            })
+            .unwrap();
+        db.record_prompt_forge_event(&PromptForgeEvent {
+            id: None,
+            input_id: Some(input_id),
+            issue_number: Some(issue),
+            pr_number: None,
+            label_before: None,
+            label_after: None,
+            event_type: PromptForgeEventType::PrCreated,
+        })
+        .unwrap();
+        db.record_resource_usage(&crate::activity::resource_usage::ResourceUsage {
+            input_id: Some(input_id),
+            model: "claude-opus-5".to_owned(),
+            tokens_input,
+            tokens_output,
+            tokens_cache_read: None,
+            tokens_cache_write: None,
+            cost_usd: 1.25,
+            duration_ms: Some(1_000),
+            provider: "anthropic".to_owned(),
+            timestamp: Utc::now(),
+        })
+        .unwrap();
+        Arc::new(Mutex::new(db))
+    }
+
+    /// Write an executable fake `gh` whose `pr list` arm **rejects** the
+    /// enriched `--json` field set exactly the way a `gh` too old to know
+    /// `additions` does, and answers the narrower pre-#4497 set. Also logs every
+    /// invocation so a test can prove the retry happened.
+    fn write_fake_gh_rejecting_display_fields(dir: &std::path::Path) -> (PathBuf, PathBuf) {
+        let log = dir.join("gh-forge-invocations.log");
+        let script_path = dir.join("fake-old-gh.sh");
+        let body = format!(
+            "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"{}\"\n\
+             case \"$1 $2\" in\n  \
+             'pr list')\n    \
+             if [[ \"$*\" == *additions* ]]; then\n      \
+             echo 'unknown JSON field: \"additions\"' >&2\n      exit 1\n    fi\n    \
+             printf '%s\\n' {}; exit 0 ;;\n  \
+             'repo view') printf '%s\\n' {}; exit 0 ;;\n  \
+             *) exit 1 ;;\nesac\n",
+            log.display(),
+            shell_quote(MERGED_PR_JSON_NO_DISPLAY_FIELDS),
+            shell_quote("rjwalters/loom"),
+        );
+        std::fs::write(&script_path, body).unwrap();
+        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).unwrap();
+        (script_path, log)
+    }
 
     #[tokio::test]
     #[serial]
@@ -2836,6 +3237,7 @@ mod tests {
             exited_at,
             &mut HashMap::new(),
             &mut std::collections::HashSet::new(),
+            None,
         )
         .await;
 
@@ -2853,9 +3255,160 @@ mod tests {
         // started_at is derived from the exit clock minus duration_sec.
         assert_eq!(meta["started_at"], json!("2026-07-29T10:00:00Z"));
         assert_eq!(meta["completed_at"], json!("2026-07-29T10:12:30Z"));
-        // No cheap token source is wired to the sink — omitted, never guessed.
+        // Feed display fields (#4497), harvested from the same `gh pr list` call
+        // that verified the merge — no extra forge round-trip.
+        assert_eq!(meta["title"], json!("feat: enrich completion meta"));
+        assert_eq!(meta["additions"], json!(214));
+        assert_eq!(meta["deletions"], json!(37));
+        // No activity-DB handle was threaded in ⇒ `tokens` is omitted, never
+        // guessed (the degradation contract).
         assert!(meta.get("tokens").is_none());
         assert!(build_send_request(&envelope, 1, None).is_ok());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn completion_for_exit_omits_display_fields_the_forge_did_not_return() {
+        // The pre-#4497 row shape: the merge facts are all there, none of the
+        // display fields are. The completion must still publish, with an
+        // envelope byte-identical to the pre-#4497 one (#4497 AC2).
+        let dir = tempfile::tempdir().unwrap();
+        let (fake_gh, _log) = write_fake_forge_gh(
+            dir.path(),
+            Some(MERGED_PR_JSON_NO_DISPLAY_FIELDS),
+            Some("rjwalters/loom"),
+        );
+        std::env::set_var(GH_BIN_ENV, &fake_gh);
+
+        let envelope = completion_for_exit(
+            "loom_daemon",
+            &dir.path().to_string_lossy(),
+            4426,
+            750,
+            Utc::now(),
+            &mut HashMap::new(),
+            &mut std::collections::HashSet::new(),
+            None,
+        )
+        .await;
+
+        std::env::remove_var(GH_BIN_ENV);
+        let envelope = envelope.expect("missing display fields must not cost us the completion");
+        let meta = envelope.meta.as_ref().unwrap();
+        for key in ["title", "additions", "deletions", "tokens"] {
+            assert!(meta.get(key).is_none(), "{key} must be omitted when unavailable");
+        }
+        // Required keys + `issue`, i.e. exactly the pre-#4497 envelope.
+        assert_eq!(meta.as_object().unwrap().len(), COMPLETION_REQUIRED_KEYS.len() + 1);
+        assert!(build_send_request(&envelope, 1, None).is_ok());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn completion_for_exit_retries_the_base_field_set_when_gh_rejects_the_new_ones() {
+        // A `gh` that does not know `additions` rejects the *whole* request, so
+        // without the narrower retry #4497 would have silently cost every
+        // completion on such a host.
+        let dir = tempfile::tempdir().unwrap();
+        let (fake_gh, log) = write_fake_gh_rejecting_display_fields(dir.path());
+        std::env::set_var(GH_BIN_ENV, &fake_gh);
+
+        let envelope = completion_for_exit(
+            "loom_daemon",
+            &dir.path().to_string_lossy(),
+            4426,
+            750,
+            Utc::now(),
+            &mut HashMap::new(),
+            &mut std::collections::HashSet::new(),
+            None,
+        )
+        .await;
+
+        std::env::remove_var(GH_BIN_ENV);
+        let envelope = envelope.expect("an old gh must still yield a completion, minus the extras");
+        let meta = envelope.meta.as_ref().unwrap();
+        assert_eq!(meta["ref"], json!("https://github.com/rjwalters/loom/pull/4400"));
+        assert!(meta.get("title").is_none());
+        assert!(meta.get("additions").is_none());
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            calls.contains("additions"),
+            "the enriched field set must be tried first; log: {calls:?}"
+        );
+        assert!(
+            calls
+                .lines()
+                .any(|l| l.starts_with("pr list") && !l.contains("additions")),
+            "the rejection must be retried with the base field set; log: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn completion_for_exit_carries_tokens_from_the_activity_db_rollup() {
+        // The per-issue rollup is the sink's token source (#4497). Attribution is
+        // knowingly imperfect (see `fetch_issue_tokens`), but when the DB *has* a
+        // rollup for the issue the completion must publish input+output.
+        let dir = tempfile::tempdir().unwrap();
+        let (fake_gh, _log) =
+            write_fake_forge_gh(dir.path(), Some(MERGED_PR_JSON), Some("rjwalters/loom"));
+        std::env::set_var(GH_BIN_ENV, &fake_gh);
+
+        let db = seed_activity_db_with_issue_tokens(dir.path(), 4426, 700_000, 91_000);
+
+        let envelope = completion_for_exit(
+            "loom_daemon",
+            &dir.path().to_string_lossy(),
+            4426,
+            750,
+            Utc::now(),
+            &mut HashMap::new(),
+            &mut std::collections::HashSet::new(),
+            Some(&db),
+        )
+        .await;
+
+        std::env::remove_var(GH_BIN_ENV);
+        let envelope = envelope.expect("a merged PR must produce a completion envelope");
+        let meta = envelope.meta.as_ref().unwrap();
+        assert_eq!(meta["tokens"], json!(791_000), "tokens = input + output");
+        assert!(build_send_request(&envelope, 1, None).is_ok());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn completion_for_exit_omits_tokens_when_the_rollup_is_empty() {
+        // "Omit rather than guess": an activity DB with no rollup for this issue
+        // must not publish a `0`, which the feed would chart as free work.
+        let dir = tempfile::tempdir().unwrap();
+        let (fake_gh, _log) =
+            write_fake_forge_gh(dir.path(), Some(MERGED_PR_JSON), Some("rjwalters/loom"));
+        std::env::set_var(GH_BIN_ENV, &fake_gh);
+
+        // Seeded for a *different* issue, so this issue's rollup is empty.
+        let db = seed_activity_db_with_issue_tokens(dir.path(), 999, 12_345, 678);
+
+        let envelope = completion_for_exit(
+            "loom_daemon",
+            &dir.path().to_string_lossy(),
+            4426,
+            750,
+            Utc::now(),
+            &mut HashMap::new(),
+            &mut std::collections::HashSet::new(),
+            Some(&db),
+        )
+        .await;
+
+        std::env::remove_var(GH_BIN_ENV);
+        let meta = envelope
+            .as_ref()
+            .and_then(|e| e.meta.as_ref())
+            .expect("an empty rollup must never cost us the completion");
+        assert!(meta.get("tokens").is_none(), "an empty rollup ⇒ omitted, not 0");
+        // The forge-sourced display fields are unaffected by the token miss.
+        assert_eq!(meta["title"], json!("feat: enrich completion meta"));
     }
 
     #[tokio::test]
@@ -2875,6 +3428,7 @@ mod tests {
             Utc::now(),
             &mut HashMap::new(),
             &mut std::collections::HashSet::new(),
+            None,
         )
         .await;
 
@@ -2897,6 +3451,7 @@ mod tests {
             Utc::now(),
             &mut HashMap::new(),
             &mut std::collections::HashSet::new(),
+            None,
         )
         .await;
 
@@ -2925,6 +3480,7 @@ mod tests {
             Utc::now(),
             &mut slug_cache,
             &mut completed,
+            None,
         )
         .await;
         let second = completion_for_exit(
@@ -2935,6 +3491,7 @@ mod tests {
             Utc::now(),
             &mut slug_cache,
             &mut completed,
+            None,
         )
         .await;
 
@@ -2976,6 +3533,7 @@ mod tests {
             Duration::from_millis(20),
             Duration::from_millis(80),
             new_shared_state(),
+            None,
         ));
 
         bus.publish(Event::SweepExited {
@@ -3005,6 +3563,11 @@ mod tests {
         assert_eq!(received[1]["meta"]["repo"], json!("rjwalters/loom"));
         assert_eq!(received[1]["meta"]["result"], json!("success"));
         assert_eq!(received[1]["meta"]["issue"], json!(4426));
+        // The #4497 display fields make it all the way onto the wire, where
+        // safehoused's egress redacts and publishes them.
+        assert_eq!(received[1]["meta"]["title"], json!("feat: enrich completion meta"));
+        assert_eq!(received[1]["meta"]["additions"], json!(214));
+        assert_eq!(received[1]["meta"]["deletions"], json!(37));
         // Both lines thread together under the repo-qualified task_id.
         assert_eq!(received[0]["task_id"], received[1]["task_id"]);
         assert!(received[1]["body"].as_str().unwrap().contains("merged ✓"));
@@ -3034,6 +3597,7 @@ mod tests {
             Duration::from_millis(20),
             Duration::from_millis(80),
             new_shared_state(),
+            None,
         ));
 
         bus.publish(Event::SweepExited {
@@ -3304,6 +3868,7 @@ mod tests {
             Duration::from_millis(50),
             Duration::from_millis(200),
             state.clone(),
+            None,
         ));
 
         // Event 1 → rejected → send_rejected (with reason), NOT unreachable.
@@ -3400,6 +3965,7 @@ mod tests {
             Duration::from_millis(30),
             Duration::from_millis(60),
             state.clone(),
+            None,
         ));
 
         // Event 1 → conn1 rejects → SendRejected.
@@ -3469,6 +4035,7 @@ mod tests {
             &bus,
             &tokio::runtime::Handle::current(),
             state.clone(),
+            None,
         );
         assert!(handle.is_none(), "disabled ⇒ no sink task");
         // The load-bearing no-op assertion: no subscription was created.
@@ -3498,6 +4065,7 @@ mod tests {
             Duration::from_millis(50),
             Duration::from_millis(200),
             state.clone(),
+            None,
         ));
 
         // Publish a burst; the sink must consume them all without wedging.
@@ -3550,6 +4118,7 @@ mod tests {
             Duration::from_millis(20),
             Duration::from_millis(80),
             state.clone(),
+            None,
         ));
 
         // First event: delivered over listener1.

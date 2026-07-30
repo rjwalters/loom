@@ -458,15 +458,37 @@ what feeds the public fleet feed on 2amlogic.com. Loom is the producer:
   post-merge phase event because it is daemon-only (no skill edit), has the
   sweep timing to hand, and verifies rather than trusts.
 - **`meta` (`completion-v1`)**: `{schema, agent, repo, ref, result, started_at,
-  completed_at}` required, plus optional `issue`/`tokens` (envelope-v1 preserves
-  unknown `meta` keys, so no schema rev is needed for extensions). `body` stays
-  required human prose — a room reader sees a sentence, `meta` is the machine
-  view.
+  completed_at}` required, plus optional `issue`/`tokens`/`title`/`additions`/
+  `deletions` (envelope-v1 preserves unknown `meta` keys, so no schema rev is
+  needed for extensions). `body` stays required human prose — a room reader sees
+  a sentence, `meta` is the machine view.
 - **`repo` is the forge `owner/repo` slug** (`gh repo view --json
   nameWithOwner`, cached per workspace for the daemon's lifetime), deliberately
   **not** the path-basename convention above: the feed links `ref` (the PR URL)
-  and displays the forge identity. `tokens` is omitted rather than guessed — no
-  cheap token source is wired to the sink.
+  and displays the forge identity.
+- **Display fields (#4497)** feed the site's row format
+  `<repo>#<issue>: <title> +A −D · <dur> · <tokens> tok`, i.e. the
+  development-cost-of-quality-code view:
+  - `title`/`additions`/`deletions` come out of the **same** `gh pr list` call
+    that verifies the merge (`--json number,url,mergedAt,title,additions,deletions`),
+    so they cost **zero** extra forge round-trips. Each degrades independently:
+    a row that omits one still publishes the completion without that key. A `gh`
+    too old to know a field rejects the whole request, so that one case retries
+    the pre-#4497 `number,url,mergedAt` set rather than losing the completion.
+  - Unlike `tokens`, a real **`0`** additions/deletions is a fact about the merge
+    (an empty-diff merge, a pure revert) and is published as `0`; a blank `title`
+    is omitted.
+  - `tokens` is a best-effort **input + output** total from the in-process
+    activity DB's per-issue rollup (`ActivityDb::get_cost_by_issue`), read on the
+    blocking pool with a 5s cap. **Attribution is knowingly imperfect** — the
+    rollup keys on a bare issue number (no repo column, so a multi-repo daemon
+    conflates identical numbers across repos) and only counts token samples that
+    are linked to the issue through `agent_inputs`, making the figure a floor.
+    That is a deliberate operator call: for a cost *trend*,
+    imperfect-but-consistent beats absent. An empty or zero rollup omits the key
+    rather than charting free work.
+  - Absent `tokens`/`title`/`additions`/`deletions` ⇒ the envelope is identical
+    to the pre-#4497 one; none of the four can block or fail an emission.
 - **Timestamps** come from the reaper's clock (`started_at = exit − duration_sec`,
   `completed_at = exit`), so the pair is always self-consistent.
 - **`result: "failure"` is out of scope for v1**: `completion-v1` requires a
@@ -484,7 +506,13 @@ what feeds the public fleet feed on 2amlogic.com. Loom is the producer:
   non-empty, `schema == "completion-v1"`, `agent` a valid persona, `repo` an
   `owner/repo` slug, `ref` an absolute http(s) URL, `result` ∈
   {`success`,`failure`}, both timestamps RFC3339 with `completed_at >=
-  started_at`). Nothing here relies on server-side validation.
+  started_at`, `issue`/`tokens`/`additions`/`deletions` non-negative integers
+  when present, `title` a non-empty string when present). Nothing here relies on
+  server-side validation.
+- **Redaction is downstream.** Every `meta` string — `title` included — is
+  published as an ordinary JSON string, so safehoused's egress deny-pattern pass
+  redacts it exactly like `repo`/`ref`. Loom applies no bespoke encoding that
+  could let a value slip past that pass.
 - **Same degradation contract**: a failing/absent/slow `gh`, an unreachable
   safehoused, or a rejected envelope drops the completion silently and never
   affects the sweep.

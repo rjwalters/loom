@@ -2522,15 +2522,22 @@ When a sweep exits, the narration sink additionally asks the forge whether that
 issue's PR actually **merged** (`gh pr list --head feature/issue-N --state
 merged`, in the event's workspace root). If it did, the sink emits a second
 envelope of type **`completion`** carrying a `completion-v1` `meta`
-(`{schema, agent, repo, ref, result, started_at, completed_at, issue, tokens?}`)
-alongside the human `ack`. safehoused's egress mirrors well-formed `completion`
-envelopes out of allowlisted rooms to its `sink_url` — that is what fills the
-public fleet feed. Notes:
+(`{schema, agent, repo, ref, result, started_at, completed_at, issue,
+tokens?, title?, additions?, deletions?}`) alongside the human `ack`.
+safehoused's egress mirrors well-formed `completion` envelopes out of allowlisted
+rooms to its `sink_url` — that is what fills the public fleet feed. Notes:
 
 - **`repo` is the forge `owner/repo` slug** (`gh repo view --json nameWithOwner`,
   cached per workspace), not the path-basename narration convention (#4201);
-  `ref` is the PR URL. `tokens` is omitted (no cheap sink-side source) rather
-  than guessed.
+  `ref` is the PR URL.
+- **Display fields (#4497)** back the feed's
+  `<repo>#<issue>: <title> +A −D · <dur> · <tokens> tok` rows.
+  `title`/`additions`/`deletions` come from the *same* `gh pr list` call that
+  verifies the merge (zero extra round-trips) and degrade per-field; `tokens` is
+  a best-effort input+output total from the in-process activity DB's per-issue
+  rollup, whose attribution is knowingly imperfect (bare issue number, no repo
+  column; only linked samples counted) but consistent enough for a cost trend.
+  All four are optional — absent, the envelope is identical to the pre-#4497 one.
 - **Exit 0 ≠ merged.** No merged PR ⇒ no completion, so `result: "success"` is
   never claimed for unmerged work. `result: "failure"` is not emitted in v1 —
   `completion-v1` requires a `ref`, and a sweep with no merged PR has no
