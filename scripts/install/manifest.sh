@@ -192,6 +192,15 @@ _emit_installed_files_manifest() {
         # sweep no longer chase per-repo copies that a fresh install never wrote.
         # (The #4041 canonical-guard skip above is now unreachable for hooks/* but
         # left in place — harmless.)
+        #
+        # CAVEAT (#4401): "a fresh install never wrote" holds for the FULL install
+        # path only. `install.sh --quick` still copies defaults/hooks/*.sh into
+        # .loom/hooks/ (install_hooks_and_cli) because the quick path establishes
+        # no machine checkout for the user-scope wrapper to exec into. Those
+        # copies are intentionally left OUT of this manifest — they are not
+        # Loom-owned-for-deletion, and `wire_quick_install_guard_hooks` keeps them
+        # reachable via project-level `.claude/settings.json` entries until
+        # `loom migrate` (Phase 6 / #4254) retires them.
         continue
         ;;
       docs/*)

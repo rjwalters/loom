@@ -123,6 +123,11 @@ install_hooks_and_cli() {
       fi
     done
   fi
+  # NOTE (#4401): the copies written above are ONLY reachable through a
+  # project-level `.claude/settings.json` entry, and neither the 0.16.0 defaults
+  # nor `loom-daemon init` writes one. `wire_quick_install_guard_hooks` (below)
+  # MUST run after this function on every Quick Install path or the copies are
+  # dead weight and the repo has zero guard coverage.
 
   # Install CLI wrapper
   if [[ -f "$loom_root/defaults/.loom/bin/loom" ]]; then
@@ -138,6 +143,60 @@ install_hooks_and_cli() {
     chmod +x "$target/loom.sh"
     success "Installed loom.sh"
   fi
+}
+
+# Guarantee that a Quick Install leaves the target with at least one WORKING
+# guard-hook execution path (issue #4401).
+#
+# Background — why this exists at all. `provision_loom_hooks` had exactly one
+# caller (scripts/install-loom.sh:1128), on the Full Install path. The Quick
+# Install path (`--quick`, fresh AND `--confirm-reinstall`) ran `loom-daemon init`
+# directly and never provisioned any hook wiring, so a repo whose only Loom
+# install/update ever went through `--quick` had:
+#   - no user-scope ~/.claude/settings.json entries (never provisioned), and
+#   - no project-level .claude/settings.json entries either — the 0.16.0
+#     defaults/.claude/settings.json deliberately carries no `hooks` block
+#     (Phase 5 / #4262), and a --confirm-reinstall's chained uninstall
+#     jq-strips every pre-existing `.loom/hooks/`-prefixed command out of the
+#     project file before init runs (scripts/uninstall-loom.sh).
+# Net: ZERO guards fired after a supported update. That is the #4401 report.
+#
+# CHOSEN RESOLUTION: Option A + Option B(b2) from the issue.
+#   A — call `provision_loom_hooks` here, so the machine-level (user-scope)
+#       wiring exists on the quick path too. This is the forward-looking layer:
+#       it becomes the live path once a machine checkout exists (Full Install /
+#       `loom update` establish ~/.local/share/loom) AND the repo has been
+#       migrated past Phase 6 (`loom migrate` untracks the per-repo copies).
+#       Until then it self-gates to a silent no-op — it can never double-fire.
+#   b2 — call `ensure_project_hook_wiring`, which (re)asserts the project-level
+#       `${CLAUDE_PROJECT_DIR}/.loom/hooks/<name>` entries whenever the target
+#       still carries per-repo `.loom/hooks/` copies. Since `install_hooks_and_cli`
+#       writes exactly those copies on every quick install, this is the layer
+#       that is GUARANTEED live on the quick path — it is what turns the reported
+#       zero-coverage state into working coverage.
+#
+# Why not Option B(b1) ("stop writing .loom/hooks/ copies on the quick path")?
+# Because the quick path never establishes the machine checkout that the
+# user-scope wrapper resolves into, dropping the copies would leave a quick-only
+# install with *no* hook scripts to run at all — trading a silent-zero-coverage
+# bug for a louder one. Retiring the per-repo copies is `loom migrate`'s job
+# (Phase 6 / #4254), which also removes them from the index.
+#
+# Exactly one path fires in either configuration: with copies present the
+# user-scope wrapper defers to the project entry (transition dedup); with copies
+# absent the project entries are not written and the wrapper execs the machine
+# hook. Never both, never neither. Both calls are best-effort (a soft failure
+# warns, never aborts the install), matching install-loom.sh's contract.
+wire_quick_install_guard_hooks() {
+  local target="$1"
+
+  info "Provisioning user-scope loom guard hooks..."
+  provision_loom_hooks || \
+    warning "User-scope loom guard hooks not fully provisioned; guards still fire from the per-repo .loom/hooks/ copies + project-level settings entries asserted below."
+
+  info "Asserting project-level guard-hook entries for per-repo .loom/hooks/ copies..."
+  ensure_project_hook_wiring "$target" || \
+    warning "Project-level guard-hook entries not fully asserted in $target/.claude/settings.json; run scripts/install-loom.sh (Full Install) or re-add them manually — see defaults/docs/guard-hooks.md."
 }
 
 # Export LOOM_VERSION and LOOM_COMMIT so `loom-daemon init`'s template
@@ -421,6 +480,17 @@ LOOM_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Install path `exec`s scripts/install-loom.sh, which sources this helper itself.
 # shellcheck source=scripts/install/provision-daemon.sh
 source "$LOOM_ROOT/scripts/install/provision-daemon.sh"
+
+# Guard-hook provisioning helpers (Epic #3835 Phase 5 / #4262, gap closed in
+# #4401). Sourced for the SAME reason as provision-daemon.sh above: the Quick
+# Install path runs `loom-daemon init` directly instead of delegating to
+# scripts/install-loom.sh, so it must invoke these itself or the target ends up
+# with no guard-hook execution path at all. Provides `provision_loom_hooks`
+# (user-scope ~/.claude/settings.json wiring, mirroring
+# scripts/install-loom.sh:1128) and `ensure_project_hook_wiring` (the
+# project-level fallback for a repo that still carries `.loom/hooks/` copies).
+# shellcheck source=scripts/install/provision-hooks.sh
+source "$LOOM_ROOT/scripts/install/provision-hooks.sh"
 
 # Show banner
 echo ""
@@ -925,6 +995,15 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
     # loom-daemon-start.sh resolves it via `command -v loom-daemon` post-install.
     provision_machine_daemon "$LOOM_ROOT/target/release/loom-daemon" || true
 
+    # Guard-hook wiring (#4401). MUST run after install_hooks_and_cli (which
+    # writes the .loom/hooks/ copies the project-level entries point at) and
+    # BEFORE the git-index reconcile below, so the reconcile sees the final
+    # .claude/settings.json content. On this reinstall path the chained uninstall
+    # above stripped every project-level `.loom/hooks/` entry and `init` re-added
+    # none (the 0.16.0 defaults carry no `hooks` block) — this call is what
+    # restores a working guard-hook execution path instead of leaving zero.
+    wire_quick_install_guard_hooks "$TARGET_PATH"
+
     # Issue #3545: reconcile the git index after the uninstall→reinstall cycle.
     # The chained uninstall staged the deletion of every prior Loom file (now
     # scoped to Loom-managed paths — see scripts/uninstall-loom.sh), then
@@ -1303,6 +1382,12 @@ case "$METHOD" in
     # Provision a machine-level loom-daemon binary (#3922) so the consumer's
     # loom-daemon-start.sh resolves it via `command -v loom-daemon` post-install.
     provision_machine_daemon "$LOOM_ROOT/target/release/loom-daemon" || true
+
+    # Guard-hook wiring (#4401) — same call as the --confirm-reinstall branch
+    # above. Without it a brand-new `--quick` install ends up with .loom/hooks/
+    # copies that nothing references (the 0.16.0 defaults settings.json has no
+    # `hooks` block) and no user-scope wiring at all: zero guard coverage.
+    wire_quick_install_guard_hooks "$TARGET_PATH"
 
     echo ""
     success "Quick installation complete!"
