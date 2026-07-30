@@ -284,6 +284,10 @@ impl WorkspacePool {
         // workspace so the reaper quarantines a repeatedly-insta-crashing issue
         // instead of letting it be re-dispatched every tick.
         registry.set_quarantine_config(sweep_registry::resolve_quarantine_config(root));
+        // Per-issue dispatch backoff (#4485): resolve env > config > default for
+        // this workspace so a failing issue's re-dispatch cadence is bounded
+        // even when its deaths land in a quarantine carve-out.
+        registry.set_dispatch_backoff_config(sweep_registry::resolve_dispatch_backoff_config(root));
         // Claude-wrapper pre-flight-death workspace tripwire (#4386): resolve
         // env > config > default for this workspace, mirroring the
         // insta-crash quarantine config above.

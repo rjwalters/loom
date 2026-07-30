@@ -1726,6 +1726,23 @@ async fn main() -> Result<()> {
         quarantine_config.insta_crash_secs
     );
 
+    // Per-issue dispatch backoff (#4485): resolve env > config > default for the
+    // default workspace so a failing issue's re-dispatch cadence is bounded even
+    // when its deaths land in a quarantine carve-out (#4122 exhaustion, #4386
+    // pre-flight) and never reach the 3-strike quarantine threshold.
+    let dispatch_backoff_config = sweep_registry::resolve_dispatch_backoff_config(&sweep_workspace);
+    sweep.set_dispatch_backoff_config(dispatch_backoff_config);
+    log::info!(
+        "sweep_registry: per-issue dispatch backoff {} (base={}s, max={}s) (#4485)",
+        if dispatch_backoff_config.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        dispatch_backoff_config.base.as_secs(),
+        dispatch_backoff_config.max.as_secs()
+    );
+
     // Claude-wrapper pre-flight-death workspace tripwire (#4386): resolve
     // env > config > default for the default workspace so a fleet-wide,
     // cross-issue spawn failure (e.g. a stale `.mcp.json`) trips a visible
@@ -3120,7 +3137,13 @@ async fn handle_quarantine_command(action: QuarantineAction) -> Result<()> {
                              dispatch and `loom:issue` has been restored on the forge."
                         );
                     } else {
-                        println!("Issue #{issue} was not quarantined — nothing to clear (no-op).");
+                        // #4485: the clear ALSO releases any per-issue dispatch
+                        // backoff window, which exists independently of
+                        // quarantine — so "not quarantined" is not the same as
+                        // "nothing happened".
+                        println!(
+                            "Issue #{issue} was not quarantined — nothing to clear (no-op).                              Any dispatch-backoff window (#4485) for it was released."
+                        );
                     }
                     Ok(())
                 }
