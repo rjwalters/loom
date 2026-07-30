@@ -1298,7 +1298,7 @@ Thresholds are minutes-scale, not hours, and env-overridable:
 | Claim label | Env var | Default |
 |-------------|---------|---------|
 | `loom:reviewing` | `LOOM_STALE_REVIEWING_MINUTES` | 30 — the SAME env var `.claude/commands/loom/judge.md`'s "Stale `loom:reviewing` Claim Check" already established, so the agent-side fast path and this always-on daemon backstop share one convention |
-| `loom:treating` | `LOOM_STALE_TREATING_MINUTES` | 60 — a Doctor's fix cycle legitimately runs longer than a single Judge review pass |
+| `loom:treating` | `LOOM_STALE_TREATING_MINUTES` | 60 — a Doctor's fix cycle legitimately runs longer than a single Judge review pass; the SAME env var `.claude/commands/loom/doctor.md`'s "Stale `loom:treating` Claim Check" fast path uses (#4527) |
 
 Reclaiming removes only the stale claim label — the PR's state label (still
 present in the normal case) restores discoverability by itself. As a safety
@@ -1307,6 +1307,16 @@ net, if the PR is left carrying none of `loom:review-requested` /
 `forge::reclaim_pr` adds `loom:review-requested` so a fresh Judge pass picks
 it back up. Log lines mirror the issue-side format, e.g. `claim_reconciliation:
 removed stale loom:reviewing from PR #N in <root> (DeadPid { pid: … }, …)`.
+
+**Agent-side fast paths are complementary, not redundant (#4527).** This pass
+is periodic (up to `LOOM_CLAIM_RECONCILE_INTERVAL_SECS`, default 600s, of lag)
+and only ever sees *finished* state, so both role prompts carry a synchronous
+check that fires the moment another agent revisits the same PR: judge.md's
+"Stale `loom:reviewing` Claim Check" and doctor.md's "Stale `loom:treating`
+Claim Check", sharing these exact env vars and defaults. doctor.md additionally
+carries a **pre-push head-SHA recheck** (capture `headRefOid` at claim time,
+re-compare before the final push) — the one race this pass structurally cannot
+cover, since it never hooks into an in-flight Doctor's push.
 
 ## Stacked-PR dependency — #3729 (v1), #3747 (v2 item 1)
 
