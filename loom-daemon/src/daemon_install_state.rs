@@ -234,6 +234,10 @@ pub struct EnvOverrides {
     pub launchd_override: Option<bool>,
     /// From `LOOM_LAUNCHD_LABEL`.
     pub launchd_label_override: Option<String>,
+    /// From `LOOM_LAUNCHD_DOMAIN` — the launchd domain to probe in, mirroring
+    /// `lib/launchd-domain.sh::resolve_launchd_domain`'s override (same field
+    /// [`ProtectionEnv`] carries for the reachable-path protection probe).
+    pub launchd_domain_override: Option<String>,
     /// From `LOOM_DAEMON_HEARTBEAT_STALE_SECS`.
     pub heartbeat_stale_secs_override: Option<u64>,
     /// From `LOOM_DAEMON_STARTUP_GRACE_SECS` — the startup-grace window in
@@ -269,6 +273,9 @@ impl EnvOverrides {
         let launchd_label_override = std::env::var("LOOM_LAUNCHD_LABEL")
             .ok()
             .filter(|s| !s.is_empty());
+        let launchd_domain_override = std::env::var("LOOM_LAUNCHD_DOMAIN")
+            .ok()
+            .filter(|s| !s.is_empty());
         let heartbeat_stale_secs_override = std::env::var("LOOM_DAEMON_HEARTBEAT_STALE_SECS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok());
@@ -278,6 +285,7 @@ impl EnvOverrides {
         EnvOverrides {
             launchd_override,
             launchd_label_override,
+            launchd_domain_override,
             heartbeat_stale_secs_override,
             startup_grace_secs_override,
             is_darwin: cfg!(target_os = "macos"),
@@ -410,11 +418,14 @@ fn current_uid() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Parse `launchctl print gui/<uid>/<label>` output for a live pid — mirrors
+/// Parse `launchctl print <domain>/<label>` output for a live pid — mirrors
 /// the watchdog's `awk -F'= ' '/^[[:space:]]*pid = /{...; print $2; exit}'`.
-fn launchctl_pid(label: &str) -> Option<u32> {
-    let uid = current_uid()?;
-    let service = format!("gui/{uid}/{label}");
+/// `domain` is an already-resolved launchd domain (see
+/// [`resolve_launchd_domain`]) — the caller resolves it once and reuses it
+/// for both this probe and any human-readable detail string, avoiding a
+/// duplicate `launchctl`/`id` round trip per [`check_liveness`] call.
+fn launchctl_pid(domain: &str, label: &str) -> Option<u32> {
+    let service = format!("{domain}/{label}");
     let output = Command::new("launchctl")
         .args(["print", &service])
         .output()
@@ -444,13 +455,25 @@ struct Liveness {
     pid: Option<u32>,
 }
 
-fn check_liveness(use_launchd: bool, label: &str, pid_file: Option<&Path>) -> Liveness {
+fn check_liveness(
+    use_launchd: bool,
+    label: &str,
+    pid_file: Option<&Path>,
+    domain_override: Option<&str>,
+) -> Liveness {
     if use_launchd {
-        if let Some(pid) = launchctl_pid(label) {
+        // Same domain-resolution rule the reachable-path protection probe
+        // uses (#4354/#4533): explicit `LOOM_LAUNCHD_DOMAIN` override, else
+        // `gui/<uid>` when that domain resolves, else `user/<uid>`. Resolved
+        // once and reused for both the probe and the detail string so they
+        // never disagree (#4536).
+        let domain = resolve_launchd_domain(domain_override);
+        let service = domain
+            .as_deref()
+            .map(|d| format!("{d}/{label}"))
+            .unwrap_or_else(|| label.to_string());
+        if let Some(pid) = domain.as_deref().and_then(|d| launchctl_pid(d, label)) {
             if pid_alive(pid) {
-                let service = current_uid()
-                    .map(|uid| format!("gui/{uid}/{label}"))
-                    .unwrap_or_else(|| label.to_string());
                 return Liveness {
                     alive: true,
                     detail: format!("launchd job {service} alive (pid {pid})"),
@@ -458,9 +481,6 @@ fn check_liveness(use_launchd: bool, label: &str, pid_file: Option<&Path>) -> Li
                 };
             }
         }
-        let service = current_uid()
-            .map(|uid| format!("gui/{uid}/{label}"))
-            .unwrap_or_else(|| label.to_string());
         return Liveness {
             alive: false,
             detail: format!("launchd job {service} is not loaded/alive"),
@@ -658,7 +678,12 @@ pub(crate) fn classify_with_process_age_fn(
         .clone()
         .unwrap_or(fields.launchd_label);
 
-    let liveness = check_liveness(use_launchd, &label, fields.pid_file.as_deref());
+    let liveness = check_liveness(
+        use_launchd,
+        &label,
+        fields.pid_file.as_deref(),
+        env.launchd_domain_override.as_deref(),
+    );
 
     if !liveness.alive {
         return InstallStateReport {
@@ -1134,6 +1159,7 @@ mod tests {
         EnvOverrides {
             launchd_override: None,
             launchd_label_override: None,
+            launchd_domain_override: None,
             heartbeat_stale_secs_override: None,
             // A zero grace window is the *default* here so most tests reach the
             // post-grace verdicts. It is NOT sufficient on its own: a real
@@ -1389,6 +1415,59 @@ mod tests {
         // the zero grace window is genuinely cleared.
         let report = classify_with_process_age_fn(dir.path(), &marker, &env, |_| Some(1_000_000));
         assert_eq!(report.state, InstallState::AliveButUnresponsive);
+    }
+
+    // ===================================================================
+    // launchctl_pid domain resolution (#4536): the unreachable-path launchd
+    // probe must use the same `resolve_launchd_domain` fallback rule
+    // (explicit `LOOM_LAUNCHD_DOMAIN` override -> `gui/<uid>` -> `user/<uid>`)
+    // the reachable-path protection probe uses (#4354/#4533), instead of a
+    // hardcoded `gui/<uid>`. These tests run in CI on `ubuntu-latest`, where
+    // `launchctl` does not exist, so both the probe itself and the
+    // `gui/<uid>` reachability check inside `resolve_launchd_domain` always
+    // fail — making the `user/<uid>` fallback branch deterministic here.
+    // ===================================================================
+
+    #[test]
+    fn launchctl_pid_domain_override_is_honored_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = write_marker(dir.path(), "use_launchd=true\n");
+        let mut env = no_env_overrides();
+        // is_darwin: true so `use_launchd` actually selects the launchd probe
+        // path in `check_liveness`, exercising `launchctl_pid`'s domain
+        // resolution rather than the pid-file fallback.
+        env.is_darwin = true;
+        env.launchd_domain_override = Some("custom/999".to_string());
+        let report = classify_with_process_age_fn(dir.path(), &marker, &env, |_| Some(1_000_000));
+        // launchctl is absent on the CI runner, so the probe itself always
+        // fails — but the detail string must reflect the *override* domain
+        // verbatim, not a hardcoded `gui/<uid>`.
+        let detail = report.liveness_detail.expect("liveness_detail set");
+        assert!(
+            detail.contains(&format!("custom/999/{DEFAULT_LAUNCHD_LABEL}")),
+            "expected override domain in detail, got: {detail}"
+        );
+        assert!(!detail.contains("gui/"), "detail should not fall back to gui/<uid>: {detail}");
+    }
+
+    #[test]
+    fn launchctl_pid_falls_back_to_gui_uid_then_user_uid_when_no_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = write_marker(dir.path(), "use_launchd=true\n");
+        let mut env = no_env_overrides();
+        env.is_darwin = true;
+        env.launchd_domain_override = None;
+        let report = classify_with_process_age_fn(dir.path(), &marker, &env, |_| Some(1_000_000));
+        let detail = report.liveness_detail.expect("liveness_detail set");
+        // No `LOOM_LAUNCHD_DOMAIN` override: `resolve_launchd_domain` tries
+        // `gui/<uid>` first, but `launchctl` is absent on this CI runner, so
+        // that probe fails and it falls through to `user/<uid>` — the same
+        // fallback order `resolve_launchd_domain` documents.
+        let uid = current_uid().expect("current_uid resolves in test env");
+        assert!(
+            detail.contains(&format!("user/{uid}/{DEFAULT_LAUNCHD_LABEL}")),
+            "expected user/<uid> fallback domain in detail, got: {detail}"
+        );
     }
 
     #[test]
