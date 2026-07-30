@@ -1054,6 +1054,10 @@ pub fn observe_and_fire_idle(
         let root_owned = root.to_path_buf();
         let name = spec.name;
         let prompt = spec.prompt;
+        // The idle path has no ticker of its own, so the collision probe's
+        // lookback window (#4623) defaults to this role's *interval* cadence —
+        // the same span a peer's interval-driven pass would write within.
+        let interval = resolve_interval_for_role(&spec, &config);
         log::info!(
             "role_runner: idle edge for {} — firing idle-triggered {} run (#4364)",
             root.display(),
@@ -1066,7 +1070,9 @@ pub fn observe_and_fire_idle(
             let run_root = root_owned.clone();
             let tick_start = Instant::now();
             let joined = tokio::task::spawn_blocking(move || {
-                ScriptRoleInvocationRunner::new(run_root).invoke(name, prompt)
+                let mut runner = ScriptRoleInvocationRunner::new(run_root.clone());
+                // Cross-host collision detection (#4623) — detection only.
+                invoke_with_collision_probe(&mut runner, &run_root, name, prompt, interval)
             })
             .await;
             let elapsed = tick_start.elapsed();
@@ -1096,6 +1102,40 @@ fn should_warn_disabled_root(warned: &mut HashSet<PathBuf>, root: &Path) -> bool
 // ============================================================================
 // Runtime wiring
 // ============================================================================
+
+/// Run one role invocation wrapped in cross-host collision **detection**
+/// (#4623): a pre-tick probe of the role's own forge queue, then self-run
+/// window bookkeeping so the *next* probe can tell this process's own writes
+/// apart from a peer daemon's.
+///
+/// Ordering matters and is load-bearing:
+/// 1. **probe first** — [`crate::role_collision::probe_before_tick`] reads the
+///    baseline left by our *previous* completed run; starting a new run first
+///    would clear it.
+/// 2. `record_run_started` opens this run's window (suppressing attribution
+///    while it is in flight — under-count, never over-count).
+/// 3. `record_run_finished` closes it, becoming the next probe's baseline.
+///
+/// The probe is a **no-op with no forge call** when detection is disabled for
+/// `root` (default), so the disabled path costs one config read; the tick's
+/// behavior is identical either way — detection never suppresses, delays, or
+/// reorders an invocation.
+///
+/// **Must run on a blocking thread** (every call site is already inside
+/// `spawn_blocking`): the probe shells out to `gh`.
+fn invoke_with_collision_probe<R: RoleInvocationRunner + ?Sized>(
+    runner: &mut R,
+    root: &Path,
+    role: &'static str,
+    prompt: &str,
+    interval: Duration,
+) -> RoleTickOutcome {
+    crate::role_collision::probe_before_tick(root, role, interval);
+    crate::role_collision::record_run_started(root, role, chrono::Utc::now());
+    let outcome = runner.invoke(role, prompt);
+    crate::role_collision::record_run_finished(root, role, chrono::Utc::now());
+    outcome
+}
 
 /// Spawn the role-runner loop for a single role on a single workspace on the
 /// shared daemon runtime. Intended for tests; production uses
@@ -1161,8 +1201,12 @@ where
                 continue;
             };
             let tick_start = Instant::now();
+            let probe_root = root.clone();
             let joined = tokio::task::spawn_blocking(move || {
-                let outcome = runner.invoke(name, prompt);
+                // Cross-host collision detection (#4623) — detection only; the
+                // invocation itself is unchanged.
+                let outcome =
+                    invoke_with_collision_probe(&mut runner, &probe_root, name, prompt, interval);
                 (outcome, runner)
             })
             .await;
@@ -1338,8 +1382,10 @@ pub fn spawn_multi_role_task(
                 let root_for_task = root.clone();
                 let tick_start = Instant::now();
                 let joined = tokio::task::spawn_blocking(move || {
-                    let mut runner = ScriptRoleInvocationRunner::new(root_for_task);
-                    runner.invoke(name, prompt)
+                    let mut runner = ScriptRoleInvocationRunner::new(root_for_task.clone());
+                    // Cross-host collision detection (#4623) — detection only;
+                    // the invocation itself is unchanged.
+                    invoke_with_collision_probe(&mut runner, &root_for_task, name, prompt, interval)
                 })
                 .await;
                 let elapsed = tick_start.elapsed();
@@ -2572,6 +2618,84 @@ mod tests {
             RoleRunGuard::try_acquire(set, root, "champion").is_some(),
             "guard must clear its entry on drop"
         );
+    }
+
+    // ===================================================================
+    // invoke_with_collision_probe — cross-host collision detection (#4623)
+    // ===================================================================
+
+    /// A runner that records every `(role, prompt)` it was asked to invoke and
+    /// returns a scripted outcome.
+    struct RecordingRunner {
+        calls: Vec<(String, String)>,
+        outcome: RoleTickOutcome,
+    }
+
+    impl RoleInvocationRunner for RecordingRunner {
+        fn invoke(&mut self, role: &str, prompt: &str) -> RoleTickOutcome {
+            self.calls.push((role.to_string(), prompt.to_string()));
+            self.outcome.clone()
+        }
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_collision_probe_wrapper_is_transparent_to_the_invocation() {
+        // Detection is opt-in and default-off: with it disabled the wrapper
+        // must pass the invocation through byte-for-byte (same role, same
+        // prompt, same outcome) and make no forge call.
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        std::env::remove_var(crate::role_collision::ROLE_COLLISION_DETECT_ENV);
+        std::env::remove_var(crate::sweep_registry::COLLISION_DETECT_ENV);
+        let tmp = tempfile::tempdir().unwrap();
+        let mut runner = RecordingRunner {
+            calls: Vec::new(),
+            outcome: RoleTickOutcome::Failure("boom".into()),
+        };
+        let outcome = invoke_with_collision_probe(
+            &mut runner,
+            tmp.path(),
+            "champion",
+            "/loom:champion",
+            Duration::from_secs(600),
+        );
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(outcome, RoleTickOutcome::Failure("boom".into()));
+        assert_eq!(runner.calls, vec![("champion".to_string(), "/loom:champion".to_string())]);
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_collision_probe_wrapper_records_the_self_run_window() {
+        // The baseline the NEXT tick attributes foreign forge activity
+        // against: the wrapper must open and close a self-run window around
+        // every invocation, even a failing one, and even with detection off
+        // (so enabling it mid-run has a baseline immediately).
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        std::env::remove_var(crate::role_collision::ROLE_COLLISION_DETECT_ENV);
+        std::env::remove_var(crate::sweep_registry::COLLISION_DETECT_ENV);
+        let tmp = tempfile::tempdir().unwrap();
+        let mut runner = RecordingRunner {
+            calls: Vec::new(),
+            outcome: RoleTickOutcome::Failure("boom".into()),
+        };
+        let before = chrono::Utc::now();
+        let _ = invoke_with_collision_probe(
+            &mut runner,
+            tmp.path(),
+            "guide",
+            "/loom:guide",
+            Duration::from_secs(900),
+        );
+        let after = chrono::Utc::now();
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        let window = crate::role_collision::last_self_run(tmp.path(), "guide")
+            .expect("a self-run window must be recorded");
+        assert!(window.started >= before && window.started <= after);
+        let ended = window
+            .ended
+            .expect("the window must be closed after the invocation");
+        assert!(ended >= window.started && ended <= after);
     }
 
     // ===================================================================
