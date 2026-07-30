@@ -1927,28 +1927,75 @@ async fn main() -> Result<()> {
             minted_gh_token: None,
         },
     };
+    // #4458: deliver the minted installation token via a daemon-owned
+    // `GH_CONFIG_DIR` (`credential_preflight::publish_github_app_token`)
+    // instead of exporting it as this process's `GH_TOKEN`. Every `gh` child
+    // this daemon spawns (`Command::new("gh")` without `env_clear`, ~76
+    // call sites — see the issue body's census) re-reads
+    // `$GH_CONFIG_DIR/hosts.yml` fresh on each invocation, so the refresh
+    // tick below becomes a pure file rewrite with **zero** recurring
+    // `std::env::set_var` calls — the UB race (concurrent `setenv` vs. the
+    // `environ` reads inside every concurrently spawned `Command`) this issue
+    // eliminates. `github_app_gh_config_dir_active` tracks whether the
+    // one-time env activation below has happened yet, so it fires **at most
+    // once** for the life of the process (see the tick closure further down
+    // for the rare case where activation happens there instead of here).
+    //
+    // The one remaining `std::env::set_var` (`GH_CONFIG_DIR` itself, plus the
+    // paired `remove_var` calls) is that single activation: it runs here,
+    // before the refresh-tick task (or any other tokio task that spawns
+    // `gh`/`git`) has been created, so there is no concurrent `Command::spawn`
+    // in this process yet to race the `environ` write — the residual window
+    // this issue's acceptance criteria allow a startup site to keep, given a
+    // comment naming the race and the rationale for accepting it. Clearing
+    // `GH_TOKEN`/`GITHUB_TOKEN` here (not just setting `GH_CONFIG_DIR`)
+    // matters too: `gh` checks the env vars *before* `GH_CONFIG_DIR`'s
+    // `hosts.yml`, so an operator-exported ambient token would otherwise
+    // silently outrank the just-minted app token — the pre-#4458 code
+    // achieved the same override by unconditionally overwriting `GH_TOKEN`.
+    let github_app_config_dir = credential_preflight::github_app_gh_config_dir(&sweep_workspace);
+    let mut github_app_gh_config_dir_active = false;
     if let Some(token) = &github_app_preflight.minted_gh_token {
-        // NEVER logged: only the fingerprint in `github_app_preflight.report`
-        // is. Exported into this process's own env so every `gh`/`git`
-        // child spawned from here on (Command::new without env_clear)
-        // inherits it.
-        std::env::set_var("GH_TOKEN", token);
+        match credential_preflight::publish_github_app_token(&github_app_config_dir, token) {
+            Ok(()) => {
+                std::env::remove_var("GH_TOKEN");
+                std::env::remove_var("GITHUB_TOKEN");
+                std::env::set_var("GH_CONFIG_DIR", &github_app_config_dir);
+                github_app_gh_config_dir_active = true;
+            }
+            Err(e) => {
+                // Fail open, matching the mint-failure posture elsewhere in
+                // this preflight: never block startup, never leave the
+                // daemon worse off than the pre-#4430 ambient path.
+                log::warn!(
+                    "credential_preflight: failed to publish github-app token to {} ({e}); \
+                     falling back to ambient gh auth — #4458",
+                    github_app_config_dir.display()
+                );
+            }
+        }
     }
     let credential_preflight = github_app_preflight.report;
 
     // #4430: keep the minted installation token fresh across its ~1h
     // lifetime for a long-running daemon. Ticks that don't rotate the token
-    // never *write* `GH_TOKEN`: the `NotConfigured` arm is a true no-op, and a
+    // never *write* anything: the `NotConfigured` arm is a true no-op, and a
     // cache-hit tick (the shell helper's own cache still has plenty of life —
-    // ~10 of every ~11 ticks) *reads* the current value but skips the
-    // `set_var` because the minted value is unchanged (#4456 value-changed
-    // guard). Only a genuine rotation (value differs) rewrites the env; a mint
-    // failure is logged and the loop keeps whatever `GH_TOKEN` the process
-    // already has (fail-open, matching the startup preflight's posture).
+    // ~10 of every ~11 ticks) compares against `current_token` (a plain local
+    // captured by this task, never the process env — #4456's original
+    // intent, now trivially true since there is no shared `GH_TOKEN` env var
+    // left to read) and skips the write because the minted value is
+    // unchanged. Only a genuine rotation (value differs) rewrites
+    // `hosts.yml`; a mint failure is logged and the loop keeps whatever
+    // credential `GH_CONFIG_DIR` already has on disk (fail-open, matching the
+    // startup preflight's posture).
     if let (Some(script_path), Some(owner_repo)) = (&github_app_script, &github_app_owner_repo) {
         let script_path = script_path.clone();
         let cwd = sweep_workspace.clone();
         let owner_repo = owner_repo.clone();
+        let config_dir = github_app_config_dir.clone();
+        let mut current_token = github_app_preflight.minted_gh_token.clone();
+        let mut config_dir_active = github_app_gh_config_dir_active;
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(credential_preflight::GITHUB_APP_REFRESH_INTERVAL).await;
@@ -1967,18 +2014,50 @@ async fn main() -> Result<()> {
                         app_id,
                         ..
                     }) => {
-                        // #4456: only write when the value actually rotated. A
-                        // cache-hit tick returns the unchanged token, and a
-                        // redundant `set_var` under the multithreaded runtime
-                        // needlessly races the `environ` reads of spawned
-                        // `gh`/`git` children.
-                        if gh_token_needs_update(std::env::var("GH_TOKEN").ok().as_deref(), &token)
-                        {
-                            std::env::set_var("GH_TOKEN", token);
-                            log::debug!(
-                                "credential_preflight: github-app refresh tick rotated GH_TOKEN \
-                                 (app {app_id} installation {installation_id}) — #4430"
-                            );
+                        // #4456/#4458: only rewrite when the value actually
+                        // rotated, and do it as a pure file write — no
+                        // `std::env::set_var` anywhere in this arm once
+                        // `config_dir_active` is already true (the common
+                        // case: activation happened at startup above).
+                        if gh_token_needs_update(current_token.as_deref(), &token) {
+                            // Rare edge case: the app becomes configured
+                            // *after* startup (e.g. the shell helper's own
+                            // config appears mid-run) without the daemon
+                            // restarting, so activation didn't happen above.
+                            // This is a second, still-bounded (at most once
+                            // per process) `std::env::set_var` window — the
+                            // recurring, steady-state race this issue targets
+                            // is the one eliminated; this cold-start
+                            // transition is unchanged in kind from the
+                            // pre-#4458 code's own equivalent one-time
+                            // `set_var` in this same arm.
+                            if !config_dir_active {
+                                std::env::remove_var("GH_TOKEN");
+                                std::env::remove_var("GITHUB_TOKEN");
+                                std::env::set_var("GH_CONFIG_DIR", &config_dir);
+                                config_dir_active = true;
+                            }
+                            match credential_preflight::publish_github_app_token(
+                                &config_dir,
+                                &token,
+                            ) {
+                                Ok(()) => {
+                                    current_token = Some(token);
+                                    log::debug!(
+                                        "credential_preflight: github-app refresh tick rotated \
+                                         GH_TOKEN (app {app_id} installation {installation_id}) \
+                                         — #4430"
+                                    );
+                                }
+                                Err(e) => {
+                                    log::warn!(
+                                        "credential_preflight: github-app refresh tick failed to \
+                                         publish token to {} ({e}); GH_CONFIG_DIR left unchanged \
+                                         (app {app_id} installation {installation_id}) — #4458",
+                                        config_dir.display()
+                                    );
+                                }
+                            }
                         } else {
                             log::debug!(
                                 "credential_preflight: github-app refresh tick cache hit, \

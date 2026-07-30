@@ -226,11 +226,28 @@ each workspace's own git remote picks the right installation automatically.
 At startup (and on a periodic refresh tick thereafter, well inside the
 token's ~1h lifetime), the daemon mints a JWT from the app id + private key
 (RS256, signed locally via `openssl` — the key never leaves the host) and
-exchanges it for a short-lived installation access token, which it exports as
-its own process's `GH_TOKEN` — every `gh`/`git` child the daemon spawns from
-that point inherits it. The token is cached on disk (`0600`, keyed by
-installation) and re-minted whenever fewer than 10 minutes of its lifetime
-remain, so a live daemon never has to wait on a fresh mint mid-tick.
+exchanges it for a short-lived installation access token. The token is
+cached on disk (`0600`, keyed by installation) and re-minted whenever fewer
+than 10 minutes of its lifetime remain, so a live daemon never has to wait on
+a fresh mint mid-tick.
+
+**Delivery mechanism (#4458).** Earlier releases exported the minted token as
+this process's own `GH_TOKEN` on every refresh — a `std::env::set_var` from a
+background task that recurred roughly every 5 minutes for the life of the
+process, racing the `environ` reads every concurrently spawned `gh`/`git`
+child performs (undefined behavior on POSIX; the reason `set_var` is
+`unsafe` as of Rust edition 2024). The daemon now instead owns a dedicated
+`GH_CONFIG_DIR` (`<workspace>/.loom/gh-config/`, `0700`) whose `hosts.yml` it
+rewrites **atomically** (write a temp file, then rename into place) on every
+rotation — a pure file operation with no process-env mutation at all. `gh`
+re-reads its config from disk on every invocation, so every one of the
+daemon's own `gh`/`git` children (`Command::new` without `env_clear`) picks
+up a fresh token automatically, without any per-call-site change. The single
+`std::env::set_var("GH_CONFIG_DIR", …)` that points the process at this
+directory (clearing any ambient `GH_TOKEN`/`GITHUB_TOKEN` at the same time,
+so the app token isn't outranked by an operator-exported one) fires at most
+once per process lifetime, before any task that spawns `gh`/`git` exists to
+race it.
 
 `loom-daemon status` and the startup log line report this as mechanism
 `github-app` with a **non-secret fingerprint** — `app <id> installation
@@ -253,6 +270,32 @@ Forge credential: OK — github-app (app 123456 installation 789)
   app is installed on.
 - **Clock skew**: the minted JWT's `iat` is backdated 60 seconds per GitHub's
   own guidance, tolerating modest host clock drift without a manual fix.
+
+### Long-running sweep children and credential snapshots (#4458)
+
+The daemon's own forge calls (claim reconciliation, the main-health gate, the
+refresh tick, work finder, …) all run inside the one long-lived daemon
+process, so once `GH_CONFIG_DIR`/`hosts.yml` are set up they stay current for
+every one of those calls, for the life of the process — the daemon's own
+forge auth never goes stale between restarts.
+
+**Dispatched sweep children are a different story.** A sweep worker (the
+tmux-hosted Claude session `loom-daemon` spawns per issue/PR, often running
+for an hour or more on a complex issue) inherits whatever forge-credential
+environment is ambient **at the moment it is spawned** — an operator-exported
+`GH_TOKEN`/`GITHUB_TOKEN`, or the daemon's own credential setup, whichever
+resolves. That is a **snapshot**, not a live subscription: env beats the
+ambient keyring/`gh`-config lookup inside that child's own process (the same
+precedence order described throughout this doc), so if the snapshotted
+reference stops being valid partway through a long sweep — a GitHub App
+installation token's ~1h lifetime is the common case — the child does not
+re-resolve credentials on its own. Its own `gh` calls start 401ing with **no
+automatic fallback**, and the daemon rotating its own credential afterwards
+does not reach an already-running child. If you run consistently long sweeps
+against a GitHub-App-only host, prefer a long-lived PAT (`export GH_TOKEN`
+before starting the daemon — see "Headless and SSH-only daemon operation"
+above) for that workload, or expect to restart a sweep that 401s mid-run past
+the ~1h mark.
 
 ## Troubleshooting
 
