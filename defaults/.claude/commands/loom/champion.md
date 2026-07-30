@@ -29,6 +29,7 @@ Find Judge-approved PRs ready for merge:
 gh pr list \
   --label="loom:pr" \
   --state=open \
+  --limit=500 \
   --json number,title,additions,deletions,mergeable,updatedAt,files,statusCheckRollup,labels \
   --jq '.[] | "#\(.number) \(.title)"'
 ```
@@ -43,6 +44,7 @@ If no PRs need merging, check for curated issues:
 gh issue list \
   --label="loom:curated" \
   --state=open \
+  --limit=500 \
   --json number,title,body,labels,comments \
   --jq '.[] | "#\(.number) \(.title)"'
 ```
@@ -58,6 +60,7 @@ If no curated issues need promotion, check for well-formed proposals:
 gh issue list \
   --label="loom:architect" \
   --state=open \
+  --limit=500 \
   --json number,title,body,labels,comments \
   --jq '.[] | "#\(.number) \(.title) [architect]"'
 
@@ -65,6 +68,7 @@ gh issue list \
 gh issue list \
   --label="loom:hermit" \
   --state=open \
+  --limit=500 \
   --json number,title,body,labels,comments \
   --jq '.[] | "#\(.number) \(.title) [hermit]"'
 
@@ -72,6 +76,7 @@ gh issue list \
 gh issue list \
   --label="loom:auditor" \
   --state=open \
+  --limit=500 \
   --json number,title,body,labels,comments \
   --jq '.[] | "#\(.number) \(.title) [auditor]"'
 ```
@@ -89,6 +94,7 @@ If no individual proposals need promotion, check for epic proposals:
 gh issue list \
   --label="loom:epic" \
   --state=open \
+  --limit=500 \
   --json number,title,body,labels,comments \
   --jq '.[] | "#\(.number) \(.title) [epic]"'
 ```
@@ -105,6 +111,7 @@ gh pr list \
   --label="loom:blocked" \
   --label="loom:changes-requested" \
   --state=open \
+  --limit=500 \
   --json number,title,updatedAt,labels \
   --jq '.[] | "#\(.number) \(.title)"'
 ```

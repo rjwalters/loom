@@ -116,7 +116,7 @@ fi
 ```bash
 # Parked set (gh ANDs repeated --label values). Skip any that also carry
 # loom:operator-only — already routed to a human.
-gh pr list --label "loom:blocked" --label "loom:changes-requested" --state open \
+gh pr list --label "loom:blocked" --label "loom:changes-requested" --state open --limit 500 \
   --json number,title,labels --jq '.[] | "#\(.number) \(.title)"'
 
 # Decide from the FULL history, not the last comment alone.
@@ -291,7 +291,7 @@ NOTES=$(gh api repos/.../pulls/$PR_NUMBER/comments --jq '...')
 # - Otherwise -> skip (too noisy)
 
 # Stage 5: Duplicate detection
-EXISTING=$(gh issue list --search "Follow-on from PR #$PR_NUMBER")
+EXISTING=$(gh issue list --search "Follow-on from PR #$PR_NUMBER" --limit 500)
 
 # Stage 6: Create issue with proper linking
 gh issue create --title "Follow-on: Work identified in PR #$PR_NUMBER" --label "$LABEL"
@@ -391,7 +391,7 @@ gh pr view <number> --json state,mergeable,statusCheckRollup
 gh pr view <number> --json closingIssuesReferences --jq '.closingIssuesReferences[].number'
 
 # List blocked issues
-gh issue list --label "loom:blocked" --state open
+gh issue list --label "loom:blocked" --state open --limit 500
 
 # Check API rate limit
 gh api rate_limit

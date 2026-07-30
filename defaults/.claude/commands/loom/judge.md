@@ -172,7 +172,7 @@ If no argument is provided, use the normal finding work workflow below.
 
 **Find PRs ready for evaluation (green badges):**
 ```bash
-gh pr list --label="loom:review-requested" --state=open
+gh pr list --label="loom:review-requested" --state=open --limit 500
 ```
 
 **Before either command below, run the Verdict-Time CAS Recheck** (see "Verdict-Time CAS Recheck" under Evaluation Process) — abort instead of writing if the recheck finds your claim lost or another Judge's verdict already landed.
@@ -294,7 +294,7 @@ fi
 
 ### Primary Queue (Priority)
 
-1. **Find work**: `gh pr list --label="loom:review-requested" --state=open`
+1. **Find work**: `gh pr list --label="loom:review-requested" --state=open --limit 500`
 2. **Claim PR** (staleness-aware — see "Stale `loom:reviewing` Claim Check" immediately below before running this): `gh pr edit <number> --add-label "loom:reviewing"` to signal you're working on it
 3. **Check merge state**: Check for conflicts and attempt automated rebase if DIRTY (see Automated Rebase for DIRTY PRs below)
    ```bash
@@ -501,7 +501,7 @@ If no PRs have the `loom:review-requested` label, the Judge can proactively eval
 **Fallback search**:
 ```bash
 # Find PRs without any loom: labels
-gh pr list --state=open --json number,title,labels \
+gh pr list --state=open --limit 500 --json number,title,labels \
   --jq '.[] | select(([.labels[].name | select(startswith("loom:"))] | length) == 0) | "#\(.number) \(.title)"'
 ```
 
@@ -542,7 +542,7 @@ Pre-Iteration Environment Check (gh repo view)
 **Example fallback workflow**:
 ```bash
 # 1. Check primary queue
-LABELED_PRS=$(gh pr list --label="loom:review-requested" --json number --jq 'length' 2>/dev/null)
+LABELED_PRS=$(gh pr list --label="loom:review-requested" --limit 500 --json number --jq 'length' 2>/dev/null)
 
 # Guard: an empty string (not "0") means the gh command itself failed. Re-run the
 # Pre-Iteration Environment Check above; if it fails, exit 1 (never claim "no work").
@@ -560,7 +560,7 @@ else
   echo "No loom:review-requested PRs found, checking unlabeled PRs..."
 
   # 2. Check fallback queue
-  UNLABELED_PR=$(gh pr list --state=open --json number,labels \
+  UNLABELED_PR=$(gh pr list --state=open --limit 500 --json number,labels \
     --jq '.[] | select(([.labels[].name | select(startswith("loom:"))] | length) == 0) | .number' \
     | head -n 1)
 
@@ -1229,7 +1229,7 @@ For minor documentation issues in PR descriptions (not code), Judges are empower
 
 ```bash
 # Search for issues related to the PR
-gh issue list --search "keyword from PR title"
+gh issue list --search "keyword from PR title" --limit 500
 
 # View the PR to confirm issue number
 gh pr view <number>
@@ -1587,7 +1587,7 @@ EOF
 
 ```bash
 # Find PRs ready for evaluation (green badges)
-gh pr list --label="loom:review-requested" --state=open
+gh pr list --label="loom:review-requested" --state=open --limit 500
 
 # Check out the PR (worktree-aware — see "PR Branch Isolation" above; this is
 # a simplified illustration, not a bare checkout in the current directory)

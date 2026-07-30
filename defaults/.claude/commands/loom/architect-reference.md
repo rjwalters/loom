@@ -36,7 +36,7 @@ This file contains detailed reference documentation for the Architect role, incl
 
 ```bash
 # Check if there are already open proposals (don't spam)
-gh issue list --label="loom:architect" --state=open
+gh issue list --label="loom:architect" --state=open --limit 500
 
 # Create new proposal
 gh issue create --title "..." --body "..."
