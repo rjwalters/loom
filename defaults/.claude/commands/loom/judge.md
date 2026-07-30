@@ -29,6 +29,41 @@ You are a thorough and constructive PR evaluator working in this repository.
 - Label-based workflow (`loom:pr`) is the coordination mechanism, not GitHub review status
 - This approach is intentional, not a limitation to work around
 
+## ⚠️ `--body @path` Does NOT Expand — It Posts the Literal String
+
+**If your review body lives in a scratch/scratchpad file, do not pass it as
+`--body @path`.** Unlike some shells' `@file` conventions, `gh pr comment
+--body @path` and `gh issue comment --body @path` do **not** read the file —
+they post the literal text `@path` as the comment. A real incident (PR #4457)
+lost an entire changes-requested review this way: the comment body was the
+string `@/private/tmp/.../scratchpad/review.md`, not the review prose, and the
+scratchpad file was later overwritten by an unrelated PR's review before
+anyone caught it.
+
+```
+❌ POSTS THE LITERAL STRING "@path" — NOT THE FILE CONTENTS
+   gh pr comment 123 --body @/tmp/review.md
+   gh pr comment 123 --body "@/tmp/review.md"
+
+✅ USE ONE OF THESE INSTEAD
+   gh pr comment 123 --body "$(cat <<'EOF'
+   ... review prose ...
+   EOF
+   )"
+   gh pr comment 123 --body-file /tmp/review.md
+   gh api repos/{owner}/{repo}/issues/123/comments -F body=@/tmp/review.md
+```
+
+Prefer the inline heredoc pattern above (the pattern already used throughout
+this file) when the body is short/dynamic; use `-F/--body-file <path>` when
+the body genuinely lives in a file (e.g. a scratchpad review draft) — it is
+the one flag on `gh pr comment`/`gh issue comment` that actually reads file
+contents (`gh api ... -F body=@path` also works). **Never** pass the file
+path as the value of `--body`/`-b` with an `@` prefix — that flag takes
+literal text only. **After posting, re-fetch the comment** (`gh pr view
+<number> --comments`) to confirm it renders your prose, not a path string —
+see the Pre-approval checklist below.
+
 ## Your Role
 
 **Your primary task is to evaluate PRs labeled `loom:review-requested` (green badges).**
@@ -340,6 +375,12 @@ dead one.
 - [ ] Merge state is CLEAN (verified via `gh pr view --json mergeStateStatus`)
 - [ ] I will NEVER call `gh pr review` in any form
 - [ ] I will run `gh pr comment` AND `gh pr edit` atomically (chained with `&&`)
+- [ ] If my review body came from a scratch file, I passed it via `--body-file
+      <path>` (or `gh api -F body=@<path>`) — NEVER `--body @<path>` (see the
+      `--body @path` anti-pattern warning above) — and I re-fetched the posted
+      comment (`gh pr view <number> --comments` or `gh api
+      .../issues/<number>/comments`) to verify it renders my actual review
+      prose, not a literal path string
 
 ### Fallback Queue (When No Labeled Work)
 
