@@ -1203,7 +1203,10 @@ pub struct DaemonStatusReport {
 /// "New-host onboarding" for the operator story.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SafehouseStatus {
-    /// One of `"not_configured"`, `"unreachable"`, `"connected"`.
+    /// One of `"not_configured"`, `"unreachable"`, `"connected"`,
+    /// `"send_rejected"` (#4464: handshake succeeds but every `send` is
+    /// rejected at the protocol layer, e.g. `'room' required` on a multi-room
+    /// host with `safehouse.room` unset).
     pub state: String,
     /// The resolved socket path the daemon last tried/uses, when known.
     /// `None` for `"not_configured"` (including the "enabled but no socket
@@ -1218,6 +1221,12 @@ pub struct SafehouseStatus {
     /// case).
     #[serde(default)]
     pub room: Option<String>,
+    /// The rejection reason, present only when `state == "send_rejected"`
+    /// (#4464) — the raw `error` string safehoused returned for the rejected
+    /// `send` (e.g. `'room' required: 3 rooms joined`). `#[serde(default)]`
+    /// keeps pre-#4464 wire payloads (which never carried it) compatible.
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 /// Host-distress circuit-breaker snapshot for `loom-daemon status` (Issue
@@ -1518,7 +1527,7 @@ pub struct CredentialPreflightReport {
     /// (e.g. `"keyring"`, `"oauth_token"`) reported by `gh auth status`;
     /// `"github-app"` when a GitHub App installation token was minted and
     /// exported as `GH_TOKEN` (#4430 — see
-    /// [`crate::credential_preflight::resolve_with_github_app`]).
+    /// [`crate::credential_preflight::run_with_github_app`]).
     /// `"none"` when nothing resolved; `"unknown"` when the probe itself
     /// failed to run. NEVER a token value.
     pub mechanism: String,

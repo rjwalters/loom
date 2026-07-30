@@ -157,6 +157,15 @@ pub const EPHEMERAL_PATTERNS: &[&str] = &[
     ".loom/CANARY",
     ".loom/*.log",
     ".loom/*.sock",
+    // Interrupted atomic writes under .loom/ (#4401). Several Loom writers use
+    // the write-to-`<path>.tmp`-then-`mv` idiom — most visibly
+    // `defaults/scripts/verify-install.sh generate`, which builds
+    // `.loom/manifest.json.tmp` before renaming it over `.loom/manifest.json`.
+    // The destination is ignored above, but the tmp sidecar was not, so a failed
+    // or interrupted `mv` (a killed installer, a full disk) left a 1000+-line
+    // untracked file that a consumer's `git add -A` swept into a commit. Defense
+    // in depth: ignore the whole class rather than one filename.
+    ".loom/*.tmp",
     ".loom/logs/",
 ];
 
@@ -663,6 +672,9 @@ mod tests {
             ".loom/claude-config/",
             ".loom/*.log",
             ".loom/*.sock",
+            // #4401: tmp sidecars from interrupted atomic writes (e.g.
+            // `.loom/manifest.json.tmp` from verify-install.sh's `generate`).
+            ".loom/*.tmp",
             ".loom/logs/",
         ];
 

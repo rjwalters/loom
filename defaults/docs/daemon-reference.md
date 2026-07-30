@@ -1292,12 +1292,15 @@ dispatch surface is opt-in, daemon-`dispatch_sweep`-only, and
 linear-chains-only.**
 
 **Dispatch a chain** — N independent `dispatch_sweep` calls, each naming its
-immediate predecessor via `depends_on` (there is no multi-node planner):
+immediate predecessor via `depends_on` (there is no multi-node planner). Always
+pass `workspace_root` explicitly — omitting it can silently target the wrong
+managed workspace (#4503; see workspace_root note above):
 
 ```text
-dispatch_sweep  kind={"Issue": A}                    # parent (independent)
-dispatch_sweep  kind={"Issue": B}  depends_on=A      # child stacked on A
-dispatch_sweep  kind={"Issue": C}  depends_on=B      # A→B→C linear chain
+WORKSPACE_ROOT=$(git rev-parse --show-toplevel)
+dispatch_sweep  kind={"Issue": A}  workspace_root=$WORKSPACE_ROOT                    # parent (independent)
+dispatch_sweep  kind={"Issue": B}  depends_on=A  workspace_root=$WORKSPACE_ROOT      # child stacked on A
+dispatch_sweep  kind={"Issue": C}  depends_on=B  workspace_root=$WORKSPACE_ROOT      # A→B→C linear chain
 ```
 
 The daemon forwards `depends_on` to the child as `--depends-on <parent>`; the
@@ -2215,6 +2218,35 @@ the forge** (best-effort, fail-open on a `gh` error) — this covers all three
 watchdogs, since each re-dispatches through the same method, so no self-heal path
 can ever re-claim a closed/merged issue.
 
+**Mid-build-death live-use veto (#4449).** The mid-build-death watchdog (#3895)
+infers "died mid-build" from `(terminal state ∧ no PR ∧ dirty worktree)` and then
+resets the worktree (`git reset --hard` + `git clean -fd`) before re-dispatching.
+That signature is necessary but **not sufficient**: on 2026-07-29 the daemon's
+tracked sweep for issue #4366 had indeed died, but an *untracked* recovery session
+was concurrently editing the same worktree — and the watchdog destroyed its
+tested-but-uncommitted fix mid `git commit`. `git status` cannot tell dead-sweep
+debris from a live session's work in progress, so the watchdog now also requires
+that **nothing live still holds the worktree**. Four signals veto the reset (any
+one is enough):
+
+| Signal | What it means |
+|--------|---------------|
+| `.loom-in-use` marker in the worktree | A session (including a manual, non-daemon one) claims it. This is the one an operator can plant by hand to fence off a worktree. |
+| `.loom/locks/issue-<N>/owner.json` whose `owner_pid` is **alive** | A live claim holder. A dead owner's lock is ignored, so a stale lock never wedges recovery. |
+| `index.lock` in the worktree's gitdir | A git index write (`git add`/`git commit`) is in flight — precisely the #4449 window. |
+| A live process whose cwd is inside the worktree | An operator shell, a manual role session, or an orphaned grandchild still writing files. |
+
+A veto logs one loud `midbuild-watchdog: … REFUSING to git reset --hard …` line
+naming the holder, leaves the worktree untouched, and **does not consume** the
+single recovery retry — so a genuinely-dead sweep is still recovered on a later
+tick once the holder goes away. If the holder is stale, clear it (remove
+`.loom-in-use` / the claim-lock / the `index.lock`, or exit the shell) and the
+next tick recovers normally. Independently, every `clean_worktree` call now logs
+the porcelain status + diffstat of what it is about to destroy, so a wipe can
+never again be silent in the daemon log. The same defense-in-depth guard exists on
+the script side: `worktree.sh remove <N>` refuses a worktree with uncommitted
+changes and requires an explicit `--force` to discard them.
+
 **Review-phase stall watchdog (#3910).** The startup watchdog rescues a sweep
 that shows *no* progress, and the mid-build-death watchdog (#3895) rescues one
 that made progress then *died*. Neither covers a sweep that is **still alive**
@@ -2283,7 +2315,7 @@ only candidates are quarantined never reserves a shared dispatch slot — health
 sibling work in other repos gets it instead. Defaults **on**; disable with
 `LOOM_WORK_FINDER_QUARANTINE=0` or `autonomous.workFinder.quarantine.enabled = false`.
 
-**Per-issue dispatch backoff (#4485).** The quarantine above is a *three-strikes*
+**Per-issue dispatch backoff (#4485, step 2.8).** The quarantine above is a *three-strikes*
 brake, and it has two deliberate carve-outs: a death attributed to account
 exhaustion (#4122) or to a claude-wrapper pre-flight failure (#4386) leaves the
 issue's insta-crash tally **untouched** on purpose — the issue is not at fault.
@@ -2302,7 +2334,10 @@ terminal outcome that made no progress **and** either died fast (inside
 `instaCrashSecs`) or exited cleanly with zero lifecycle progress — including both
 quarantine carve-outs — arms an exponential per-issue window (`baseSecs`, then ×2
 per consecutive failure, capped at `maxSecs`); `dispatch()` refuses while the
-window is live, **before** the claim lock and the label flip, so a refusal costs no
+window is live, **before** the claim lock and the label flip (step 2.8, immediately
+after the #4444 park-label guard at step 2.7 — a deliberate park outranks a
+transient backoff, so a parked *and* backed-off issue is reported as
+`labeled-skip`), so a refusal costs no
 forge write and cannot itself flap anything. A *slow* checkpoint-less death is
 deliberately excluded — that is the mid-build-death (#3895) / review-stall (#3910)
 watchdogs' remit. Any outcome that makes real progress clears
@@ -2489,6 +2524,46 @@ never wedge the daemon. It is GitHub-only (uses the `closedByPullRequestsReferen
 closes-graph, filtered to `state == "OPEN"`); a Gitea workspace fails open and
 keeps today's behavior.
 
+**Park-label dispatch guard (#4444, step 2.7).** The `loom:blocked` /
+`loom:operator-only` **park** labels are the state machine's only "take this out
+of automation" signal, and until #4444 they were enforced *only* in the
+work-finder's candidate query (`SKIP_LABELS`) — one of six dispatch routes. Every
+other route (all three watchdogs, the reaper's checkpoint-resume, the epic
+supervisor, the IPC/CLI `dispatch_sweep`) funnels through
+`SweepRegistry::dispatch()` without re-reading the forge labels, so a park applied
+*after* the original dispatch was invisible to them and the daemon re-claimed
+deliberately parked work (observed on #4366). Step 2.7 — immediately after the
+2.6 open-PR guard, still before the claim lock and label flip — refuses any
+dispatch whose issue currently carries a park label, with a typed
+`ParkedIssueDispatchError` the work finder attributes to `labeled-skip` (never to
+`error(s)`). Four properties are load-bearing:
+
+- **`PARK_LABELS`, not `SKIP_LABELS`.** The guard keys on the
+  `loom:blocked` / `loom:operator-only` subset only. `loom:building` is
+  *legitimately* present on a watchdog re-dispatch or a checkpoint-resume of the
+  daemon's **own** claim, so refusing it would break exactly the recovery paths
+  this guard is meant to constrain. The two constants live side by side in
+  `work_finder.rs` (`SKIP_LABELS` is composed as `BUILDING_LABEL` +
+  `PARK_LABELS`), so they cannot drift.
+- **The #4256 resume bypass does not exempt it.** `resume_bypass_pr` exempts step
+  **2.6** for a sweep's own open PR and nothing else — a park applied after the
+  crash still stops the resume. The refusal stays failure-visible: the reaper
+  logs it and still publishes `sweep.issue.{N}.resume_dispatched` with
+  `dispatched: false`.
+- **REST, not GraphQL.** The probe is `gh api repos/{owner}/{repo}/issues/{N}
+  --jq '.labels[].name'`, a *different* rate-limit bucket from the GraphQL calls
+  steps 2.5/2.6 ride — so a park still holds while the GraphQL quota is
+  exhausted, the condition under which the #4123 guard failed open during the
+  2026-07-29 incident.
+- **Fail-open and fixture-safe.** Any `gh` error, timeout, or unresolvable repo
+  lets dispatch proceed (a forge outage must never wedge the daemon), and the
+  probe is skipped entirely when label flips are disabled (`skip_label_flip`).
+
+Operator note: because this covers the IPC/CLI route too, a manual
+`dispatch_sweep` on a parked issue is refused by design — clear the park label
+first (or use `loom-daemon quarantine clear <N>` when the park came from the
+insta-crash quarantine) rather than expecting a manual dispatch to override it.
+
 **Cost / default.** Enabling detection adds exactly one `gh issue view --json
 labels` round-trip per dispatch (measured ~0.4s against GitHub), bounded by the
 same `LOOM_REAP_GH_TIMEOUT_SECS` ceiling as the other best-effort `gh` calls.
@@ -2517,9 +2592,12 @@ Every other dispatch path still refuses via `OpenPrDispatchError`, so
 a `sweep.issue.{N}.resume_dispatched` event (`{pr, checkpoint_phase?,
 dispatched, repo?}`) is published — with `dispatched: false` on the rare
 case the resume dispatch call itself fails — and narrated over Safehouse
-(when enabled) as a `handoff`. The `restore_label_to_ready` operator-park
-guard (#4206) still applies: an issue carrying `loom:blocked` is never
-resume-dispatched.
+(when enabled) as a `handoff`. Operator parks still win: `restore_label_to_ready`
+preserves a `loom:blocked` label instead of flipping it back to `loom:issue`
+(#4206), and the resume dispatch itself is refused by the **step 2.7 park-label
+guard** (#4444) — which the 2.6 resume bypass deliberately does not exempt — so a
+park applied after the crash surfaces as `dispatched: false` rather than an
+overridden park.
 
 ### Completion narration → public fleet feed (#4426)
 
@@ -3411,9 +3489,70 @@ compatibility. The probe never fails the command — an
 unreadable/malformed marker, absent `launchctl`, a stale/unowned pid, or an
 unreadable heartbeat mtime all degrade to a less-specific verdict (or, if no
 loom dir can be resolved at all, `install_state` is simply omitted and the
-generic pre-#4069 message is printed). The success path (a reachable, healthy
-daemon) is untouched — this probe only runs after `query_daemon_status` has
-already failed.
+generic pre-#4069 message is printed). `install_state` itself only ever runs
+after `query_daemon_status` has already failed — the reachable path's own
+protection reporting is the separate probe described next.
+
+**Fourth consumer: `status`'s REACHABLE path — watchdog protection state
+(#4354, AC4 of #4331).** `install_state` above answers *"why is the daemon
+unreachable?"*, so it runs only on the `Err` arm. A **reachable** daemon (one
+answering over IPC) needs a different question answered: *"is it actually
+protected?"* Before #4354 it did not surface one, so a healthy-looking daemon
+could be running with crash protection silently disarmed, and an operator would
+only find out by reading `daemon-watchdog.log` or poking
+`launchctl`/`systemctl` by hand. `status` now prints a `Protection:` line (and a
+`protection` object under `--json`) built from a **sibling** classification —
+`ProtectionState` in the same `daemon_install_state.rs` module, deliberately
+*not* new `InstallState` variants, whose exit-code semantics above must not
+change:
+
+| State (`--json` `state`) | Human phrase | Meaning |
+|--------------------------|--------------|---------|
+| `protected` | `protected` | autonomy-desired marker present **and** the watchdog job/timer is provisioned |
+| `no-marker` | `unprotected — no autonomy-desired marker` | no marker: crash protection is DISARMED — the watchdog fires on cadence but logs `[OK] … nothing to check` (the #4331 state) |
+| `watchdog-not-provisioned` | `watchdog job not provisioned` | marker present, but no watchdog launchd job / systemd timer is scheduled — nothing will ever notice a future death |
+| `unknown` | `unknown` | marker present but the provisioning probe could not answer (no `launchctl`/`systemctl`, or an unreachable `systemctl --user` bus) — a degradation, never a false verdict |
+
+Two independent facts feed this, and **both** are always reported: the JSON
+object carries `marker_present` and `watchdog_provisioned` separately (the
+latter `null` when undeterminable) alongside `marker_path`, `watchdog_job`,
+`watchdog_job_kind`, `detail`, and the dominant `state`. When both are bad,
+`state` is `no-marker` — the stronger statement, since even a provisioned
+watchdog is inert without a marker — while `watchdog_provisioned: false` still
+records the second fact for a script.
+
+**How the probe resolves its inputs** (client-side and host-local, so nothing is
+plumbed through the IPC report):
+
+- **Marker** — via the same `LOOM_AUTONOMY_MARKER`-honoring resolver the startup
+  healer uses (`autonomy_marker::resolve_marker_path`, now the single
+  implementation `daemon_install_state` also delegates to), else
+  `<loom_dir>/autonomy-desired`.
+- **Watchdog job** — mirrors `loom-daemon-start.sh` exactly: launchd
+  `${LOOM_WATCHDOG_LABEL:-<daemon-label>-watchdog}` (daemon label from
+  `LOOM_LAUNCHD_LABEL`, else the marker's own `launchd_label`, else
+  `com.rjwalters.loom-daemon`), probed with
+  `launchctl print <domain>/<label>` in the `resolve_launchd_domain` domain
+  (`LOOM_LAUNCHD_DOMAIN` → `gui/<uid>` → `user/<uid>`); systemd
+  `${LOOM_WATCHDOG_LABEL:-<LOOM_SYSTEMD_UNIT%.service>-watchdog}.timer`, probed
+  with `systemctl --user is-enabled <unit>`. A **non-Darwin host always resolves
+  the systemd side** (the same non-Darwin blanket override the unreachable path
+  applies), so `launchctl`'s absence on Linux is never even consulted.
+- **Provisioning verdict** — `enabled`/`enabled-runtime` ⇒ provisioned; any other
+  `is-enabled` verdict (`disabled`, `static`, `masked`, absent, …) ⇒ **not**
+  provisioned, deliberately collapsing "present but disabled" and "absent" into
+  the same operator-relevant answer (neither will fire). A `Failed to connect to
+  bus` / missing-binary / undeterminable-domain outcome ⇒ `unknown`.
+
+Like the `install_state` probe, it is **read-only and never fails the command**:
+at most three query-only subprocess calls, no writes, and the reachable path
+still **exits 0** whatever protection state it reports (only `no-marker` and
+`watchdog-not-provisioned` add remediation lines — `protected` and `unknown`
+print none, since `unknown` is a probe limitation on this host, not evidence of a
+fault). When no loom dir resolves at all the `Protection:` line is omitted and
+`--json`'s `protection` is `null`. The unreachable-path `install_state` output
+and its exit codes are unchanged. `fleet status`'s local-host row carries the
+same `protection` field, since it shares the `status --json` payload builder.
 
 ### macOS session-bootstrap hazard (#3972)
 

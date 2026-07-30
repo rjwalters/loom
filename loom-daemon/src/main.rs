@@ -29,7 +29,7 @@ use loom_daemon::workspace_pool::WorkspacePool;
 use loom_daemon::worktree_ops::{aggressive, clean};
 use loom_daemon::{extract_configured_terminal_ids, rotate_log_file};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use std::fs;
@@ -973,6 +973,11 @@ enum TokensAction {
         #[arg(long, value_name = "PATH", default_value = ".")]
         workspace: String,
 
+        /// Account provider. The default preserves the legacy Claude token
+        /// selector and every one of its state formats.
+        #[arg(long, value_name = "PROVIDER", default_value = "claude")]
+        provider: String,
+
         /// Emit shell-evalable `export CLAUDE_CODE_OAUTH_TOKEN=...` /
         /// `export LOOM_TOKEN_NAME=...` lines (plus a non-exported
         /// `LOOM_TOKEN_MODE=...` assignment) instead of JSON — designed to be
@@ -1299,6 +1304,63 @@ enum CleanupAction {
     },
 }
 
+/// Decide whether a freshly minted/cached `GH_TOKEN` value warrants a
+/// `std::env::set_var` write, given the value currently exported in the process
+/// environment (#4456).
+///
+/// The `github-app` refresh tick fires every `GITHUB_APP_REFRESH_INTERVAL`
+/// (~5min), but the shell helper only re-mints when the cached token is close
+/// to expiry (~hourly). A cache hit still reports [`GithubAppOutcome::Minted`]
+/// with the *unchanged* token, so writing unconditionally rewrites `GH_TOKEN`
+/// ~10 of every ~11 ticks with an identical value. Each redundant `set_var`
+/// under the multithreaded tokio runtime opens a (tiny) `environ`
+/// use-after-free window against the `gh`/`git` children the daemon constantly
+/// spawns, for no benefit.
+///
+/// Returns `true` only when the minted value actually differs from `current`
+/// (including the case where nothing is exported yet, `current == None`). This
+/// is a pure seam so the guard can be unit-tested without mutating the
+/// process-global environment (which would add to the test-race hazard tracked
+/// by #4385).
+fn gh_token_needs_update(current: Option<&str>, minted: &str) -> bool {
+    current != Some(minted)
+}
+
+#[cfg(test)]
+mod gh_token_guard_tests {
+    //! Tests for the #4456 value-changed guard on the `github-app` refresh
+    //! tick. Deliberately a *pure* function test — it does not touch the
+    //! process-global `GH_TOKEN`, so it neither races nor adds to the
+    //! test-env-mutation hazard tracked by #4385.
+    use super::gh_token_needs_update;
+
+    #[test]
+    fn cache_hit_same_value_skips_write() {
+        // The ~10-of-11 common case: the shell helper returned the unchanged
+        // cached token, so no `set_var` is warranted.
+        assert!(!gh_token_needs_update(Some("ghs_abc"), "ghs_abc"));
+    }
+
+    #[test]
+    fn genuine_rotation_writes() {
+        // A real ~hourly rotation: the minted value differs -> write.
+        assert!(gh_token_needs_update(Some("ghs_old"), "ghs_new"));
+    }
+
+    #[test]
+    fn unset_env_writes() {
+        // Nothing exported yet (Err(VarError) -> None): treat as different so
+        // the first post-boot tick still exports the token.
+        assert!(gh_token_needs_update(None, "ghs_first"));
+    }
+
+    #[test]
+    fn empty_current_differs_from_nonempty() {
+        // An empty exported value is not equal to a real minted token.
+        assert!(gh_token_needs_update(Some(""), "ghs_real"));
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -1545,9 +1607,12 @@ async fn main() -> Result<()> {
     let credential_preflight = github_app_preflight.report;
 
     // #4430: keep the minted installation token fresh across its ~1h
-    // lifetime for a long-running daemon. A no-op tick (unconfigured, or the
-    // shell helper's own cache still has >10min left) costs a handful of
-    // cheap subprocess execs and never touches `GH_TOKEN`; a genuine mint
+    // lifetime for a long-running daemon. Ticks that don't rotate the token
+    // never *write* `GH_TOKEN`: the `NotConfigured` arm is a true no-op, and a
+    // cache-hit tick (the shell helper's own cache still has plenty of life —
+    // ~10 of every ~11 ticks) *reads* the current value but skips the
+    // `set_var` because the minted value is unchanged (#4456 value-changed
+    // guard). Only a genuine rotation (value differs) rewrites the env; a mint
     // failure is logged and the loop keeps whatever `GH_TOKEN` the process
     // already has (fail-open, matching the startup preflight's posture).
     if let (Some(script_path), Some(owner_repo)) = (&github_app_script, &github_app_owner_repo) {
@@ -1572,11 +1637,25 @@ async fn main() -> Result<()> {
                         app_id,
                         ..
                     }) => {
-                        std::env::set_var("GH_TOKEN", token);
-                        log::debug!(
-                            "credential_preflight: github-app refresh tick minted a token \
-                             (app {app_id} installation {installation_id}) — #4430"
-                        );
+                        // #4456: only write when the value actually rotated. A
+                        // cache-hit tick returns the unchanged token, and a
+                        // redundant `set_var` under the multithreaded runtime
+                        // needlessly races the `environ` reads of spawned
+                        // `gh`/`git` children.
+                        if gh_token_needs_update(std::env::var("GH_TOKEN").ok().as_deref(), &token)
+                        {
+                            std::env::set_var("GH_TOKEN", token);
+                            log::debug!(
+                                "credential_preflight: github-app refresh tick rotated GH_TOKEN \
+                                 (app {app_id} installation {installation_id}) — #4430"
+                            );
+                        } else {
+                            log::debug!(
+                                "credential_preflight: github-app refresh tick cache hit, \
+                                 GH_TOKEN unchanged (app {app_id} installation {installation_id}) \
+                                 — #4456"
+                            );
+                        }
                     }
                     Ok(credential_preflight::GithubAppOutcome::NotConfigured) => {
                         // Cheap no-op tick -- nothing to refresh.
@@ -3841,10 +3920,32 @@ async fn handle_status_command(json: bool, pipeline: bool) -> Result<()> {
         None
     };
 
+    // Watchdog protection state (#4354, AC4 of #4331) — the REACHABLE-path
+    // counterpart to the `install_state` classification above. A healthy daemon
+    // answering over IPC can still be unprotected: no autonomy-desired marker
+    // (crash protection disarmed) or no watchdog job/timer provisioned (nothing
+    // scheduled to notice a future death). Both facts are host-local and visible
+    // to this CLI process, so nothing is plumbed through the IPC report.
+    // Read-only, and never fails the command: an unanswerable probe degrades to
+    // `unknown` and `status` still exits 0.
+    let protection = daemon_install_state::probe_protection();
+
     if json {
-        print_status_json(&report, token_usage.as_ref(), &update, pipeline_snapshots.as_deref())?;
+        print_status_json(
+            &report,
+            token_usage.as_ref(),
+            &update,
+            pipeline_snapshots.as_deref(),
+            protection.as_ref(),
+        )?;
     } else {
-        print_status_human(&report, token_usage.as_ref(), &update, pipeline_snapshots.as_deref());
+        print_status_human(
+            &report,
+            token_usage.as_ref(),
+            &update,
+            pipeline_snapshots.as_deref(),
+            protection.as_ref(),
+        );
     }
     Ok(())
 }
@@ -3927,8 +4028,18 @@ async fn collect_local_fleet_report() -> loom_daemon::fleet::status::HostReport 
         Ok(daemon_report) => {
             let token_usage = collect_token_usage(daemon_report.token_pool_dir.as_deref());
             let update = self_update::check();
-            let value =
-                build_status_json_value(&daemon_report, token_usage.as_ref(), &update, None);
+            // Same host-local protection probe the reachable `status` path runs
+            // (#4354), so the local fleet row carries the `protection` field a
+            // remote host's own `status --json` would self-report — payload-shape
+            // parity is the whole point of sharing this builder.
+            let protection = daemon_install_state::probe_protection();
+            let value = build_status_json_value(
+                &daemon_report,
+                token_usage.as_ref(),
+                &update,
+                None,
+                protection.as_ref(),
+            );
             HostReport::local_up(value)
         }
         Err(e) => {
@@ -4219,6 +4330,7 @@ fn build_status_json_value(
     token_usage: Option<&serde_json::Value>,
     update: &self_update::SelfUpdateStatus,
     pipeline: Option<&[loom_daemon::pipeline_snapshot::RepoPipelineSnapshot]>,
+    protection: Option<&daemon_install_state::ProtectionReport>,
 ) -> serde_json::Value {
     let rc = resolve_capacity(report, token_usage);
     serde_json::json!({
@@ -4406,11 +4518,31 @@ fn build_status_json_value(
         })),
         // Live safehouse fleet-comms connection state (#4345) — `null` only
         // from a pre-#4345 daemon binary that never computed one. `state` is
-        // one of "not_configured" / "unreachable" / "connected".
+        // one of "not_configured" / "unreachable" / "connected" /
+        // "send_rejected" (#4464, carries `reason`).
         "safehouse": report.safehouse.as_ref().map(|s| serde_json::json!({
             "state": s.state,
             "socket": s.socket,
             "room": s.room,
+            "reason": s.reason,
+        })),
+        // Watchdog protection state (#4354) — client-side, host-local, read-only.
+        // `state` is one of "protected" / "no-marker" /
+        // "watchdog-not-provisioned" / "unknown". `marker_present` and
+        // `watchdog_provisioned` carry the two underlying facts separately, so a
+        // consumer can see BOTH even though `state` names only the dominant one
+        // (a missing marker outranks the watchdog fact). `null` only when no loom
+        // dir could be resolved at all.
+        "protection": protection.map(|p| serde_json::json!({
+            "state": p.state.as_str(),
+            "marker_present": p.marker_present,
+            "marker_path": p.marker_path.display().to_string(),
+            "watchdog_job": p.job.identifier(),
+            "watchdog_job_kind": p.job.kind_str(),
+            // `null` ⇒ the provisioning probe could not answer (no
+            // launchctl/systemctl, or an unreachable `systemctl --user` bus).
+            "watchdog_provisioned": p.watchdog_provisioned,
+            "detail": p.detail,
         })),
     })
 }
@@ -4421,8 +4553,9 @@ fn print_status_json(
     token_usage: Option<&serde_json::Value>,
     update: &self_update::SelfUpdateStatus,
     pipeline: Option<&[loom_daemon::pipeline_snapshot::RepoPipelineSnapshot]>,
+    protection: Option<&daemon_install_state::ProtectionReport>,
 ) -> Result<()> {
-    let combined = build_status_json_value(report, token_usage, update, pipeline);
+    let combined = build_status_json_value(report, token_usage, update, pipeline, protection);
     println!("{}", serde_json::to_string_pretty(&combined)?);
     Ok(())
 }
@@ -4637,6 +4770,7 @@ fn print_status_human(
     token_usage: Option<&serde_json::Value>,
     update: &self_update::SelfUpdateStatus,
     pipeline: Option<&[loom_daemon::pipeline_snapshot::RepoPipelineSnapshot]>,
+    protection: Option<&daemon_install_state::ProtectionReport>,
 ) {
     println!("\n=== Loom Autonomous Daemon Status ===\n");
 
@@ -4950,9 +5084,65 @@ fn print_status_human(
                     .map_or_else(|| "unresolved".to_string(), |p| p.display().to_string())
             );
         }
-        Some(_) => println!("Safehouse:     not configured"),
+        // #4464: handshake succeeds but every send is rejected — the socket is
+        // reachable, so "unreachable" would point the operator at the wrong
+        // fix. Surface the rejection reason directly (canonically a missing
+        // `safehouse.room` on a multi-room host).
+        Some(s) if s.state == "send_rejected" => {
+            println!(
+                "Safehouse:     connected, sends rejected: {} (socket: {})",
+                s.reason.as_deref().unwrap_or("unknown reason"),
+                s.socket
+                    .as_ref()
+                    .map_or_else(|| "?".to_string(), |p| p.display().to_string())
+            );
+        }
+        Some(s) if s.state == "not_configured" => println!("Safehouse:     not configured"),
+        // #4464: an unknown state string (version skew with a newer daemon)
+        // degrades legibly — print the raw state rather than mislabeling it
+        // "not configured" (the old fallthrough, which hid real states).
+        Some(s) => println!("Safehouse:     {} (socket: {})", s.state, {
+            s.socket
+                .as_ref()
+                .map_or_else(|| "?".to_string(), |p| p.display().to_string())
+        }),
         None => {
             println!("Safehouse:     unknown (older daemon binary — restart to pick up #4345)")
+        }
+    }
+
+    // Watchdog protection state (#4354): this daemon is answering, so it is
+    // alive — but is anything positioned to notice when it *stops* being? Before
+    // this line an operator had to read `daemon-watchdog.log` or poke
+    // `launchctl`/`systemctl` by hand to find out. Client-side, read-only, and
+    // never fatal: `unknown` when the provisioning probe cannot answer, and this
+    // line is simply omitted when no loom dir resolved at all.
+    if let Some(p) = protection {
+        println!("Protection:    {}", p.state.description());
+        println!("               {}", p.detail);
+        match p.state {
+            daemon_install_state::ProtectionState::NoMarker => {
+                // The #4331 state. A supervised daemon self-heals the marker at
+                // startup, so seeing this on a supervised host means the marker
+                // went away *after* boot — a restart re-arms it.
+                println!(
+                    "               Crash protection is DISARMED — the watchdog will log \
+                     \"nothing to check\"."
+                );
+                println!("               Re-arm with a supervised restart:");
+                println!("                 ./.loom/scripts/cli/loom-daemon-stop.sh && ./.loom/scripts/cli/loom-daemon-start.sh");
+            }
+            daemon_install_state::ProtectionState::WatchdogNotProvisioned => {
+                println!("               Nothing is scheduled to detect a future daemon death.");
+                println!(
+                    "               Re-provision it (the start script installs the watchdog job):"
+                );
+                println!("                 ./.loom/scripts/cli/loom-daemon-start.sh");
+            }
+            // Protected / Unknown: no remediation — `unknown` is a probe
+            // limitation on this host, not evidence of a fault, so steering the
+            // operator into a restart for it would be the #4213 ghost-chase.
+            _ => {}
         }
     }
 
@@ -6349,17 +6539,59 @@ fn handle_forge_command(action: ForgeAction) -> Result<()> {
 /// file-based — does not require a running daemon. See
 /// `loom-daemon/src/tokens_pool/mod.rs` for the ported subset and what is
 /// deliberately deferred.
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 fn handle_tokens_command(action: TokensAction) -> Result<()> {
     use loom_daemon::tokens_pool::{allowlist, bad_tokens, failure_counts, select};
 
     match action {
         TokensAction::Select {
             workspace,
+            provider,
             export,
             no_key,
             auto_unpin,
         } => {
             let ws = resolve_tokens_workspace(&workspace)?;
+            if provider == "codex" {
+                let selected = loom_daemon::tokens_pool::select_account(
+                    &ws,
+                    loom_daemon::tokens_pool::AccountProvider::Codex,
+                )
+                .map_err(|error| anyhow!(error))?;
+                let directory = match &selected.binding {
+                    loom_daemon::tokens_pool::AccountBinding::CodexHome { directory } => directory,
+                    _ => unreachable!("Codex selection returned a non-Codex binding"),
+                };
+                if export {
+                    println!(
+                        "export CODEX_HOME={}",
+                        shell_single_quote(&directory.display().to_string())
+                    );
+                    println!(
+                        "export LOOM_ACCOUNT_PROVIDER='codex'\nexport LOOM_ACCOUNT_NAME={}",
+                        shell_single_quote(&selected.id.name)
+                    );
+                    println!("LOOM_TOKEN_MODE='{}'", selected.mode);
+                } else {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "provider": "codex",
+                            "name": selected.id.name,
+                            "credential_kind": "codex_home",
+                            "credential_reference": directory,
+                            "mode": selected.mode,
+                        })
+                    );
+                }
+                return Ok(());
+            }
+            if provider != "claude" {
+                bail!("invalid provider {provider:?}; expected claude or codex");
+            }
             if auto_unpin {
                 if let Some(msg) = loom_daemon::tokens_pool::maybe_auto_unpin(&ws) {
                     eprintln!("{msg}");
@@ -7817,7 +8049,11 @@ mod status_client_tests {
     /// A fully-populated report the fake daemon can serialize back to the client
     /// on a successful round-trip. Every field is compiler-checked, so a schema
     /// change surfaces here rather than as a silently-skewed wire payload.
-    fn sample_report() -> DaemonStatusReport {
+    ///
+    /// `pub(super)` so the reachable-path status-rendering tests (#4354) build
+    /// their payload from this same fixture instead of duplicating the whole
+    /// struct.
+    pub(super) fn sample_report() -> DaemonStatusReport {
         DaemonStatusReport {
             in_flight: vec![],
             unregistered_locked: vec![],
@@ -7966,5 +8202,139 @@ mod status_client_tests {
             elapsed < Duration::from_secs(2),
             "absent-socket path took too long: {elapsed:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod status_protection_tests {
+    //! Reachable-path watchdog-protection surfacing (#4354, AC4 of #4331).
+    //!
+    //! These tests pin the `--json` contract for the `protection` object and the
+    //! deliberate separation from the unreachable path's `install_state` block
+    //! (#4069): the reachable payload carries `protection` and never
+    //! `install_state`, and `protection` is wire-compatible-nullable so a host
+    //! where no loom dir resolves still emits a well-formed payload.
+    use super::build_status_json_value;
+    use super::status_client_tests::sample_report;
+    use loom_daemon::daemon_install_state::{ProtectionReport, ProtectionState, WatchdogJob};
+    use std::path::PathBuf;
+
+    fn protection(
+        state: ProtectionState,
+        marker_present: bool,
+        watchdog_provisioned: Option<bool>,
+    ) -> ProtectionReport {
+        ProtectionReport {
+            state,
+            marker_present,
+            marker_path: PathBuf::from("/home/u/.loom/autonomy-desired"),
+            job: WatchdogJob::SystemdTimer {
+                timer_unit: "loom-daemon-watchdog.timer".to_string(),
+            },
+            watchdog_provisioned,
+            detail: "fixture detail".to_string(),
+        }
+    }
+
+    /// The `update` argument's fixture — an "unknown" self-update status is
+    /// enough for these tests (they assert only on the `protection` object).
+    fn no_update() -> loom_daemon::self_update::SelfUpdateStatus {
+        loom_daemon::self_update::SelfUpdateStatus {
+            built_commit: "abc1234".to_string(),
+            source_commit: None,
+            update_available: None,
+        }
+    }
+
+    #[test]
+    fn protection_object_is_emitted_on_the_reachable_path() {
+        let report = sample_report();
+        let value = build_status_json_value(
+            &report,
+            None,
+            &no_update(),
+            None,
+            Some(&protection(ProtectionState::Protected, true, Some(true))),
+        );
+        let p = &value["protection"];
+        assert_eq!(p["state"], "protected");
+        assert_eq!(p["marker_present"], true);
+        assert_eq!(p["marker_path"], "/home/u/.loom/autonomy-desired");
+        assert_eq!(p["watchdog_job"], "loom-daemon-watchdog.timer");
+        assert_eq!(p["watchdog_job_kind"], "systemd-timer");
+        assert_eq!(p["watchdog_provisioned"], true);
+        assert_eq!(p["detail"], "fixture detail");
+    }
+
+    #[test]
+    fn protection_object_carries_both_facts_for_the_no_marker_verdict() {
+        // `state` names the dominant fact (no marker), but a consumer must still
+        // be able to read the watchdog fact independently (#4354 AC1: "both
+        // should be reported").
+        let value = build_status_json_value(
+            &sample_report(),
+            None,
+            &no_update(),
+            None,
+            Some(&protection(ProtectionState::NoMarker, false, Some(true))),
+        );
+        let p = &value["protection"];
+        assert_eq!(p["state"], "no-marker");
+        assert_eq!(p["marker_present"], false);
+        assert_eq!(p["watchdog_provisioned"], true);
+    }
+
+    #[test]
+    fn protection_watchdog_not_provisioned_and_unknown_serialize_distinctly() {
+        let not_provisioned = build_status_json_value(
+            &sample_report(),
+            None,
+            &no_update(),
+            None,
+            Some(&protection(ProtectionState::WatchdogNotProvisioned, true, Some(false))),
+        );
+        assert_eq!(not_provisioned["protection"]["state"], "watchdog-not-provisioned");
+        assert_eq!(not_provisioned["protection"]["watchdog_provisioned"], false);
+
+        // An unanswerable probe is `unknown` with a NULL provisioning fact —
+        // never `false` (AC4: degrade, never mis-report).
+        let unknown = build_status_json_value(
+            &sample_report(),
+            None,
+            &no_update(),
+            None,
+            Some(&protection(ProtectionState::Unknown, true, None)),
+        );
+        assert_eq!(unknown["protection"]["state"], "unknown");
+        assert!(unknown["protection"]["watchdog_provisioned"].is_null());
+    }
+
+    #[test]
+    fn protection_is_null_when_no_report_could_be_built() {
+        // No loom dir resolvable ⇒ the field is present but null, so the payload
+        // stays well-formed for consumers that always read it.
+        let value = build_status_json_value(&sample_report(), None, &no_update(), None, None);
+        assert!(value["protection"].is_null());
+    }
+
+    #[test]
+    fn reachable_payload_never_carries_the_unreachable_install_state_block() {
+        // #4069 regression guard: `install_state` (with its exit-code semantics)
+        // belongs to the unreachable `Err` arm ONLY. Protection is a sibling
+        // classification, so adding it must not leak `install_state` into the
+        // reachable payload — nor gain an exit code of its own (the reachable
+        // path always exits 0).
+        let value = build_status_json_value(
+            &sample_report(),
+            None,
+            &no_update(),
+            None,
+            Some(&protection(ProtectionState::NoMarker, false, Some(false))),
+        );
+        assert!(
+            value.get("install_state").is_none(),
+            "install_state must stay on the unreachable path only"
+        );
+        assert!(value.get("protection").is_some());
     }
 }

@@ -52,6 +52,18 @@
 //!
 //! This module changes reporting only: it starts nothing, stops nothing, and
 //! writes no state (Non-goal in #4069 — do not add writes here).
+//!
+//! # Watchdog protection state (#4354, AC4 of #4331)
+//!
+//! [`InstallState`] above answers "why is the daemon unreachable?" and therefore
+//! only runs on the `Err` arm. A *reachable* daemon needs a different question
+//! answered: **is it actually protected?** — i.e. is the autonomy-desired marker
+//! present (so a crash is detectable at all), and is the watchdog launchd job /
+//! systemd timer actually provisioned (so something is scheduled to notice)?
+//! [`ProtectionState`] / [`probe_protection`] are that **sibling** classification.
+//! They deliberately do NOT add [`InstallState`] variants: those variants carry
+//! exit-code semantics (#4069) that the reachable path must not perturb — the
+//! reachable path always exits 0 regardless of protection state.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -289,12 +301,12 @@ fn resolve_loom_dir() -> Option<PathBuf> {
 /// Resolve the autonomy-desired marker path: `LOOM_AUTONOMY_MARKER` env
 /// override first (matching `loom-daemon-start.sh`'s `INTENT_MARKER`), else
 /// `<loom_dir>/autonomy-desired`.
+///
+/// Delegates to [`crate::autonomy_marker::resolve_marker_path`] (#4354) so this
+/// module, the startup healer (#4331), and the watchdog can never resolve the
+/// marker differently — there is exactly one implementation of the rule.
 fn resolve_marker_path(loom_dir: &Path) -> PathBuf {
-    std::env::var("LOOM_AUTONOMY_MARKER")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| loom_dir.join(MARKER_FILENAME))
+    crate::autonomy_marker::resolve_marker_path(loom_dir)
 }
 
 // ============================================================================
@@ -717,6 +729,395 @@ pub fn probe() -> Option<InstallStateReport> {
     let loom_dir = resolve_loom_dir()?;
     let marker_path = resolve_marker_path(&loom_dir);
     Some(classify(&loom_dir, &marker_path, &EnvOverrides::from_env()))
+}
+
+// ============================================================================
+// Watchdog protection state (#4354) — the REACHABLE-path sibling classification
+// ============================================================================
+
+/// Whether a *reachable* daemon is actually protected against a future death.
+///
+/// Two independent host-local facts feed this, both visible to the CLI process
+/// with no IPC involvement:
+///
+/// 1. the **autonomy-desired marker** — absent ⇒ the watchdog logs
+///    `[OK] … nothing to check` and crash protection is disarmed (the #4331
+///    state), and
+/// 2. the **watchdog job/timer** — not provisioned ⇒ nothing is scheduled to
+///    ever notice a death, however armed the marker is.
+///
+/// Precedence when both are bad: [`ProtectionState::NoMarker`] wins for the
+/// single-word verdict (it is the stronger statement — even a provisioned
+/// watchdog is inert without a marker), but
+/// [`ProtectionReport::watchdog_provisioned`] still carries the second fact
+/// verbatim so `--json` consumers and the human detail line report **both**.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtectionState {
+    /// Marker present AND the watchdog job/timer is provisioned.
+    Protected,
+    /// No autonomy-desired marker — crash protection is disarmed (#4331).
+    NoMarker,
+    /// Marker present, but no watchdog launchd job / systemd timer is
+    /// provisioned: nothing is scheduled to detect a future death.
+    WatchdogNotProvisioned,
+    /// Marker present but the provisioning probe could not answer (no
+    /// `launchctl`/`systemctl`, or a `systemctl --user` bus that could not be
+    /// reached). A degradation, never a false verdict.
+    Unknown,
+}
+
+impl ProtectionState {
+    /// Machine-readable enum value for `--json` rendering.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProtectionState::Protected => "protected",
+            ProtectionState::NoMarker => "no-marker",
+            ProtectionState::WatchdogNotProvisioned => "watchdog-not-provisioned",
+            ProtectionState::Unknown => "unknown",
+        }
+    }
+
+    /// The operator-facing phrase for the human `Protection:` line — the exact
+    /// wording #4354's AC1 specifies.
+    #[must_use]
+    pub fn description(self) -> &'static str {
+        match self {
+            ProtectionState::Protected => "protected",
+            ProtectionState::NoMarker => "unprotected — no autonomy-desired marker",
+            ProtectionState::WatchdogNotProvisioned => "watchdog job not provisioned",
+            ProtectionState::Unknown => "unknown",
+        }
+    }
+}
+
+/// The scheduled watchdog job this host would use, resolved (name and all) the
+/// same way `loom-daemon-start.sh` provisions it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WatchdogJob {
+    /// macOS launchd job — `${LOOM_WATCHDOG_LABEL:-<daemon-label>-watchdog}`
+    /// (`loom-daemon-start.sh::resolve_watchdog_label`), probed with
+    /// `launchctl print <domain>/<label>`.
+    Launchd { label: String },
+    /// `systemd --user` timer unit —
+    /// `${LOOM_WATCHDOG_LABEL:-<daemon-unit%.service>-watchdog}.timer`
+    /// (`loom-daemon-start.sh::resolve_systemd_watchdog_unit`), probed with
+    /// `systemctl --user is-enabled <unit>`.
+    SystemdTimer { timer_unit: String },
+}
+
+impl WatchdogJob {
+    /// The job's identifier as an operator would type it.
+    #[must_use]
+    pub fn identifier(&self) -> &str {
+        match self {
+            WatchdogJob::Launchd { label } => label,
+            WatchdogJob::SystemdTimer { timer_unit } => timer_unit,
+        }
+    }
+
+    /// Which scheduling mechanism this is (`"launchd"` / `"systemd-timer"`).
+    #[must_use]
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            WatchdogJob::Launchd { .. } => "launchd",
+            WatchdogJob::SystemdTimer { .. } => "systemd-timer",
+        }
+    }
+}
+
+/// The full protection classification for one probe.
+#[derive(Debug, Clone)]
+pub struct ProtectionReport {
+    pub state: ProtectionState,
+    /// Whether the autonomy-desired marker file was readable.
+    pub marker_present: bool,
+    /// The marker path that was checked (after `LOOM_AUTONOMY_MARKER`).
+    pub marker_path: PathBuf,
+    /// The watchdog job whose provisioning was probed.
+    pub job: WatchdogJob,
+    /// `Some(true/false)` when the provisioning probe answered; `None` when it
+    /// could not be run at all (degradation ⇒ [`ProtectionState::Unknown`]).
+    pub watchdog_provisioned: Option<bool>,
+    /// One-sentence operator-facing explanation carrying BOTH facts.
+    pub detail: String,
+}
+
+/// Env overrides the protection probe honors — a **separate** struct from
+/// [`EnvOverrides`] on purpose: that one encodes the unreachable path's
+/// marker-vs-heartbeat precedence (#4069) and is constructed literally by
+/// sibling tests, so widening it here would couple two unrelated
+/// classifications. Split out so unit tests drive every branch without mutating
+/// process-global env vars.
+#[derive(Debug, Clone)]
+pub struct ProtectionEnv {
+    /// From `LOOM_WATCHDOG_LABEL` — overrides the derived watchdog job name on
+    /// BOTH platforms, exactly as `loom-daemon-start.sh` does.
+    pub watchdog_label_override: Option<String>,
+    /// From `LOOM_LAUNCHD_LABEL` — the *daemon* label the watchdog label is
+    /// derived from (`<daemon-label>-watchdog`).
+    pub launchd_label_override: Option<String>,
+    /// From `LOOM_SYSTEMD_UNIT` — the *daemon* unit the watchdog unit is
+    /// derived from (`<unit%.service>-watchdog`).
+    pub systemd_unit_override: Option<String>,
+    /// From `LOOM_LAUNCHD_DOMAIN` — the launchd domain to probe in, mirroring
+    /// `lib/launchd-domain.sh::resolve_launchd_domain`'s override.
+    pub launchd_domain_override: Option<String>,
+    /// From `LOOM_DAEMON_LAUNCHD` — see [`parse_launchd_override`]; can only
+    /// ever force launchd *off*.
+    pub launchd_override: Option<bool>,
+    /// Whether this host can have a launchd job at all.
+    pub is_darwin: bool,
+}
+
+impl ProtectionEnv {
+    /// Resolve from the real process environment + platform.
+    #[must_use]
+    pub fn from_env() -> Self {
+        let non_empty = |key: &str| std::env::var(key).ok().filter(|s| !s.is_empty());
+        ProtectionEnv {
+            watchdog_label_override: non_empty("LOOM_WATCHDOG_LABEL"),
+            launchd_label_override: non_empty("LOOM_LAUNCHD_LABEL"),
+            systemd_unit_override: non_empty("LOOM_SYSTEMD_UNIT"),
+            launchd_domain_override: non_empty("LOOM_LAUNCHD_DOMAIN"),
+            launchd_override: parse_launchd_override(
+                std::env::var("LOOM_DAEMON_LAUNCHD").ok().as_deref(),
+            ),
+            is_darwin: cfg!(target_os = "macos"),
+        }
+    }
+}
+
+/// Default `systemd --user` daemon unit, matching
+/// `lib/systemd-user.sh::resolve_systemd_unit`'s fallback.
+pub const DEFAULT_SYSTEMD_UNIT: &str = "loom-daemon.service";
+
+/// Resolve which watchdog job this host schedules, mirroring
+/// `loom-daemon-start.sh` exactly:
+///
+/// - launchd (`use_launchd`): `${LOOM_WATCHDOG_LABEL:-<daemon-label>-watchdog}`
+///   where the daemon label is `${LOOM_LAUNCHD_LABEL:-<marker label>}`
+///   (`resolve_watchdog_label`, `loom-daemon-start.sh:511`).
+/// - systemd otherwise: `${LOOM_WATCHDOG_LABEL:-<daemon-unit%.service>-watchdog}`
+///   plus the `.timer` suffix the timer unit carries
+///   (`resolve_systemd_watchdog_unit`, `loom-daemon-start.sh:596`).
+///
+/// `use_launchd` is already the env-and-platform-resolved value (a non-Darwin
+/// host is always `false`), so a Linux host never resolves — or probes — a
+/// launchd job, and `launchctl`'s absence there is never even consulted.
+#[must_use]
+pub fn resolve_watchdog_job(
+    use_launchd: bool,
+    daemon_launchd_label: &str,
+    env: &ProtectionEnv,
+) -> WatchdogJob {
+    if use_launchd {
+        let label = env
+            .watchdog_label_override
+            .clone()
+            .unwrap_or_else(|| format!("{daemon_launchd_label}-watchdog"));
+        return WatchdogJob::Launchd { label };
+    }
+    let daemon_unit = env
+        .systemd_unit_override
+        .clone()
+        .unwrap_or_else(|| DEFAULT_SYSTEMD_UNIT.to_string());
+    let base = env
+        .watchdog_label_override
+        .clone()
+        .unwrap_or_else(|| format!("{}-watchdog", daemon_unit.trim_end_matches(".service")));
+    WatchdogJob::SystemdTimer {
+        timer_unit: format!("{base}.timer"),
+    }
+}
+
+/// Resolve the launchd domain to probe in, mirroring
+/// `lib/launchd-domain.sh::resolve_launchd_domain`: an explicit
+/// `LOOM_LAUNCHD_DOMAIN` wins, else `gui/<uid>` when that domain resolves, else
+/// the SSH-reachable background `user/<uid>` domain. `None` only when the uid
+/// itself is undeterminable (⇒ the caller degrades to `Unknown`).
+fn resolve_launchd_domain(override_value: Option<&str>) -> Option<String> {
+    if let Some(explicit) = override_value.filter(|s| !s.is_empty()) {
+        return Some(explicit.to_string());
+    }
+    let uid = current_uid()?;
+    let gui = format!("gui/{uid}");
+    let gui_ok = Command::new("launchctl")
+        .args(["print", &gui])
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if gui_ok {
+        return Some(gui);
+    }
+    Some(format!("user/{uid}"))
+}
+
+/// Is the watchdog launchd job loaded? `launchctl print <domain>/<label>` exits
+/// 0 only for a bootstrapped job, so a nonzero exit is a real
+/// "not provisioned". A missing/unspawnable `launchctl` (or an undeterminable
+/// domain) yields `None` — unknown, never a false negative.
+fn launchctl_job_provisioned(label: &str, domain_override: Option<&str>) -> Option<bool> {
+    let domain = resolve_launchd_domain(domain_override)?;
+    let output = Command::new("launchctl")
+        .args(["print", &format!("{domain}/{label}")])
+        .output()
+        .ok()?;
+    Some(output.status.success())
+}
+
+/// Is the watchdog systemd timer provisioned? `systemctl --user is-enabled
+/// <unit>` prints its verdict on stdout: `enabled` / `enabled-runtime` ⇒
+/// provisioned; any other verdict (`disabled`, `static`, `masked`, `not-found`,
+/// …) ⇒ NOT provisioned, which deliberately collapses "present but disabled"
+/// and "absent" into the same operator-relevant answer — neither will fire.
+///
+/// No stdout verdict at all is ambiguous, so it is disambiguated from stderr: a
+/// "no such file" complaint is a genuine absence (`Some(false)`), while anything
+/// else — most importantly `Failed to connect to bus` on a host with no user
+/// manager — is `None` (unknown), never a false "not provisioned".
+fn systemd_timer_provisioned(timer_unit: &str) -> Option<bool> {
+    let output = Command::new("systemctl")
+        .args(["--user", "is-enabled", timer_unit])
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    match stdout.lines().map(str::trim).find(|l| !l.is_empty()) {
+        Some("enabled" | "enabled-runtime") => Some(true),
+        Some(_) => Some(false),
+        None => {
+            let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+            if stderr.contains("no such file") || stderr.contains("not found") {
+                Some(false)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// The real provisioning probe: dispatch to the mechanism the resolved job
+/// names. Read-only (`launchctl print` / `systemctl is-enabled` are both
+/// queries) and never fails — every failure mode degrades to `None`.
+fn probe_watchdog_provisioned(job: &WatchdogJob, domain_override: Option<&str>) -> Option<bool> {
+    match job {
+        WatchdogJob::Launchd { label } => launchctl_job_provisioned(label, domain_override),
+        WatchdogJob::SystemdTimer { timer_unit } => systemd_timer_provisioned(timer_unit),
+    }
+}
+
+/// Classify protection from an already-resolved loom dir + marker path, with the
+/// provisioning check **injected** — the same testability seam [`classify`] uses
+/// for process age, so unit tests pin every (marker × provisioning) combination
+/// without a live launchd/systemd on the host.
+#[must_use]
+pub fn classify_protection(
+    loom_dir: &Path,
+    marker_path: &Path,
+    env: &ProtectionEnv,
+    // `FnMut` (not `Fn`) so a test's injected probe can record which job it was
+    // asked about; production passes a plain closure and it is called exactly
+    // once either way.
+    mut provisioned_fn: impl FnMut(&WatchdogJob) -> Option<bool>,
+) -> ProtectionReport {
+    // Marker read is the ONLY filesystem touch, and its failure (absent or
+    // unreadable) is a first-class verdict, never an error.
+    let contents = std::fs::read_to_string(marker_path).ok();
+    let marker_present = contents.is_some();
+    let fields = contents
+        .as_deref()
+        .map(|c| resolve_marker_fields(&parse_marker(c), loom_dir));
+
+    // Which supervisor owns the watchdog job — same env-wins-over-marker rule
+    // plus the non-Darwin blanket override the unreachable path applies. With no
+    // marker to consult, fall back to the platform default (launchd on Darwin).
+    let marker_use_launchd = fields.as_ref().map_or(env.is_darwin, |f| f.use_launchd);
+    let use_launchd = env.launchd_override.unwrap_or(marker_use_launchd) && env.is_darwin;
+    let daemon_label = env
+        .launchd_label_override
+        .clone()
+        .or_else(|| fields.as_ref().map(|f| f.launchd_label.clone()))
+        .unwrap_or_else(|| DEFAULT_LAUNCHD_LABEL.to_string());
+
+    let job = resolve_watchdog_job(use_launchd, &daemon_label, env);
+    let watchdog_provisioned = provisioned_fn(&job);
+
+    let kind = job.kind_str();
+    let id = job.identifier().to_string();
+    let marker_display = marker_path.display();
+
+    let (state, detail) = match (marker_present, watchdog_provisioned) {
+        // No marker: the strongest verdict, but still report the watchdog fact.
+        (false, provisioned) => {
+            let watchdog_note = match provisioned {
+                Some(true) => {
+                    format!("the watchdog {kind} job {id} IS provisioned but has nothing to check")
+                }
+                Some(false) => {
+                    format!("the watchdog {kind} job {id} is not provisioned either")
+                }
+                None => format!("watchdog {kind} job {id} provisioning is undeterminable"),
+            };
+            (
+                ProtectionState::NoMarker,
+                format!(
+                    "no autonomy-desired marker at {marker_display} — crash protection is \
+                     DISARMED; {watchdog_note}"
+                ),
+            )
+        }
+        (true, Some(true)) => (
+            ProtectionState::Protected,
+            format!(
+                "autonomy-desired marker present at {marker_display}; watchdog {kind} job {id} \
+                 is provisioned"
+            ),
+        ),
+        (true, Some(false)) => (
+            ProtectionState::WatchdogNotProvisioned,
+            format!(
+                "autonomy-desired marker present at {marker_display}, but the watchdog {kind} \
+                 job {id} is not provisioned — nothing is scheduled to detect a future daemon \
+                 death"
+            ),
+        ),
+        (true, None) => (
+            ProtectionState::Unknown,
+            format!(
+                "autonomy-desired marker present at {marker_display}, but the watchdog {kind} \
+                 job {id} could not be probed on this host"
+            ),
+        ),
+    };
+
+    ProtectionReport {
+        state,
+        marker_present,
+        marker_path: marker_path.to_path_buf(),
+        job,
+        watchdog_provisioned,
+        detail,
+    }
+}
+
+/// Production entry point for the reachable path (#4354): resolve the loom dir +
+/// marker path from env (via [`crate::autonomy_marker::resolve_marker_path`], so
+/// `LOOM_AUTONOMY_MARKER` is honored identically to the watchdog and the startup
+/// healer) and classify with the real launchd/systemd provisioning probe.
+///
+/// Returns `None` only when no loom dir can be resolved at all — the caller then
+/// prints nothing rather than guessing. Read-only and infallible by
+/// construction: at most three query-only subprocess calls, no writes, and no
+/// path that can fail `loom-daemon status` (the reachable path still exits 0
+/// whatever this reports).
+#[must_use]
+pub fn probe_protection() -> Option<ProtectionReport> {
+    let loom_dir = resolve_loom_dir()?;
+    let marker_path = resolve_marker_path(&loom_dir);
+    let env = ProtectionEnv::from_env();
+    let domain_override = env.launchd_domain_override.clone();
+    Some(classify_protection(&loom_dir, &marker_path, &env, |job| {
+        probe_watchdog_provisioned(job, domain_override.as_deref())
+    }))
 }
 
 #[cfg(test)]
@@ -1251,5 +1652,315 @@ mod tests {
 
         // Unset defers to the marker.
         assert_eq!(parse_launchd_override(None), None);
+    }
+
+    // ===================================================================
+    // Watchdog protection state (#4354)
+    // ===================================================================
+
+    /// Deterministic protection env: no overrides, non-Darwin (so the systemd
+    /// timer branch is selected regardless of the host the tests run on).
+    fn protection_env() -> ProtectionEnv {
+        ProtectionEnv {
+            watchdog_label_override: None,
+            launchd_label_override: None,
+            systemd_unit_override: None,
+            launchd_domain_override: None,
+            launchd_override: None,
+            is_darwin: false,
+        }
+    }
+
+    fn darwin_protection_env() -> ProtectionEnv {
+        ProtectionEnv {
+            is_darwin: true,
+            ..protection_env()
+        }
+    }
+
+    #[test]
+    fn protection_marker_present_and_watchdog_provisioned_is_protected() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = write_marker(dir.path(), "use_launchd=false\n");
+        let report = classify_protection(dir.path(), &marker, &protection_env(), |_| Some(true));
+        assert_eq!(report.state, ProtectionState::Protected);
+        assert!(report.marker_present);
+        assert_eq!(report.watchdog_provisioned, Some(true));
+        assert!(report.detail.contains("is provisioned"), "{}", report.detail);
+    }
+
+    #[test]
+    fn protection_marker_absent_is_no_marker_even_when_watchdog_provisioned() {
+        // The #4331 state: the watchdog job exists and fires on cadence, but with
+        // no marker it logs "nothing to check" — protection is disarmed. The
+        // verdict must say so, while still reporting the watchdog fact (AC1).
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join(MARKER_FILENAME);
+        let report = classify_protection(dir.path(), &marker, &protection_env(), |_| Some(true));
+        assert_eq!(report.state, ProtectionState::NoMarker);
+        assert!(!report.marker_present);
+        assert_eq!(report.watchdog_provisioned, Some(true));
+        assert!(report.detail.contains("DISARMED"), "{}", report.detail);
+        assert!(report.detail.contains("IS provisioned"), "{}", report.detail);
+        assert_eq!(
+            ProtectionState::NoMarker.description(),
+            "unprotected — no autonomy-desired marker"
+        );
+    }
+
+    #[test]
+    fn protection_marker_absent_and_watchdog_absent_reports_both_facts() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join(MARKER_FILENAME);
+        let report = classify_protection(dir.path(), &marker, &protection_env(), |_| Some(false));
+        assert_eq!(report.state, ProtectionState::NoMarker);
+        assert_eq!(report.watchdog_provisioned, Some(false));
+        assert!(report.detail.contains("not provisioned either"), "{}", report.detail);
+    }
+
+    #[test]
+    fn protection_marker_present_watchdog_absent_is_watchdog_not_provisioned() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = write_marker(dir.path(), "use_launchd=false\n");
+        let report = classify_protection(dir.path(), &marker, &protection_env(), |_| Some(false));
+        assert_eq!(report.state, ProtectionState::WatchdogNotProvisioned);
+        assert_eq!(report.watchdog_provisioned, Some(false));
+        assert_eq!(
+            ProtectionState::WatchdogNotProvisioned.description(),
+            "watchdog job not provisioned"
+        );
+    }
+
+    #[test]
+    fn protection_undeterminable_probe_degrades_to_unknown() {
+        // AC4: never fail, never guess — an unanswerable provisioning probe is
+        // `unknown`, not a false "not provisioned".
+        let dir = tempfile::tempdir().unwrap();
+        let marker = write_marker(dir.path(), "use_launchd=false\n");
+        let report = classify_protection(dir.path(), &marker, &protection_env(), |_| None);
+        assert_eq!(report.state, ProtectionState::Unknown);
+        assert!(report.watchdog_provisioned.is_none());
+        assert!(report.detail.contains("could not be probed"), "{}", report.detail);
+    }
+
+    #[test]
+    fn protection_state_taxonomy_strings_are_stable() {
+        assert_eq!(ProtectionState::Protected.as_str(), "protected");
+        assert_eq!(ProtectionState::NoMarker.as_str(), "no-marker");
+        assert_eq!(ProtectionState::WatchdogNotProvisioned.as_str(), "watchdog-not-provisioned");
+        assert_eq!(ProtectionState::Unknown.as_str(), "unknown");
+        assert_eq!(ProtectionState::Protected.description(), "protected");
+        assert_eq!(ProtectionState::Unknown.description(), "unknown");
+    }
+
+    #[test]
+    fn watchdog_job_defaults_mirror_the_start_script() {
+        // Darwin: `<daemon label>-watchdog` (loom-daemon-start.sh:511).
+        let job = resolve_watchdog_job(true, DEFAULT_LAUNCHD_LABEL, &darwin_protection_env());
+        assert_eq!(
+            job,
+            WatchdogJob::Launchd {
+                label: "com.rjwalters.loom-daemon-watchdog".to_string()
+            }
+        );
+        assert_eq!(job.kind_str(), "launchd");
+
+        // systemd: `<daemon unit%.service>-watchdog.timer` (…:596).
+        let job = resolve_watchdog_job(false, DEFAULT_LAUNCHD_LABEL, &protection_env());
+        assert_eq!(
+            job,
+            WatchdogJob::SystemdTimer {
+                timer_unit: "loom-daemon-watchdog.timer".to_string()
+            }
+        );
+        assert_eq!(job.kind_str(), "systemd-timer");
+        assert_eq!(job.identifier(), "loom-daemon-watchdog.timer");
+    }
+
+    #[test]
+    fn watchdog_label_env_override_is_honored_on_both_platforms() {
+        // AC3: LOOM_WATCHDOG_LABEL wins over the derived name, exactly as
+        // `resolve_watchdog_label` / `resolve_systemd_watchdog_unit` do.
+        let mut env = darwin_protection_env();
+        env.watchdog_label_override = Some("com.example.custom-wd".to_string());
+        assert_eq!(
+            resolve_watchdog_job(true, DEFAULT_LAUNCHD_LABEL, &env),
+            WatchdogJob::Launchd {
+                label: "com.example.custom-wd".to_string()
+            }
+        );
+
+        let mut env = protection_env();
+        env.watchdog_label_override = Some("my-wd".to_string());
+        assert_eq!(
+            resolve_watchdog_job(false, DEFAULT_LAUNCHD_LABEL, &env),
+            WatchdogJob::SystemdTimer {
+                timer_unit: "my-wd.timer".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn watchdog_job_derives_from_the_daemon_label_and_unit_overrides() {
+        // launchd: the derivation base is the *already-resolved* daemon label
+        // `resolve_watchdog_job` is handed — `LOOM_LAUNCHD_LABEL`'s precedence
+        // over the marker is applied one level up, in `classify_protection` (see
+        // `protection_launchd_label_override_beats_the_marker_label` below).
+        assert_eq!(
+            resolve_watchdog_job(true, "com.example.loom-daemon", &darwin_protection_env()),
+            WatchdogJob::Launchd {
+                label: "com.example.loom-daemon-watchdog".to_string()
+            }
+        );
+
+        // systemd: `LOOM_SYSTEMD_UNIT` is the derivation base, with `.service`
+        // stripped before the `-watchdog` suffix (loom-daemon-start.sh:596).
+        let mut env = protection_env();
+        env.systemd_unit_override = Some("loom-scratch.service".to_string());
+        assert_eq!(
+            resolve_watchdog_job(false, DEFAULT_LAUNCHD_LABEL, &env),
+            WatchdogJob::SystemdTimer {
+                timer_unit: "loom-scratch-watchdog.timer".to_string()
+            }
+        );
+        // A unit name with no `.service` suffix is left verbatim, matching
+        // `resolve_systemd_unit`'s documented no-normalization rule.
+        let mut env = protection_env();
+        env.systemd_unit_override = Some("loom-scratch".to_string());
+        assert_eq!(
+            resolve_watchdog_job(false, DEFAULT_LAUNCHD_LABEL, &env),
+            WatchdogJob::SystemdTimer {
+                timer_unit: "loom-scratch-watchdog.timer".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn protection_launchd_label_override_beats_the_marker_label() {
+        // AC3: `LOOM_LAUNCHD_LABEL` wins over the marker's recorded
+        // `launchd_label`, mirroring the watchdog's env-wins-over-marker rule —
+        // so the derived `<label>-watchdog` job probed is the env one.
+        let dir = tempfile::tempdir().unwrap();
+        let marker =
+            write_marker(dir.path(), "use_launchd=true\nlaunchd_label=com.example.from-marker\n");
+        let mut env = darwin_protection_env();
+        env.launchd_label_override = Some("com.example.from-env".to_string());
+        let mut probed = None;
+        let _ = classify_protection(dir.path(), &marker, &env, |job| {
+            probed = Some(job.clone());
+            Some(true)
+        });
+        assert_eq!(
+            probed,
+            Some(WatchdogJob::Launchd {
+                label: "com.example.from-env-watchdog".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn protection_marker_launchd_label_feeds_the_watchdog_label_on_darwin() {
+        // With no LOOM_LAUNCHD_LABEL override, the *marker's* recorded label is
+        // the derivation base — so a host started under a custom label probes the
+        // matching watchdog job, not the default one.
+        let dir = tempfile::tempdir().unwrap();
+        let marker =
+            write_marker(dir.path(), "use_launchd=true\nlaunchd_label=com.example.alt-daemon\n");
+        let mut probed = None;
+        let report = classify_protection(dir.path(), &marker, &darwin_protection_env(), |job| {
+            probed = Some(job.clone());
+            Some(true)
+        });
+        assert_eq!(report.state, ProtectionState::Protected);
+        assert_eq!(
+            probed,
+            Some(WatchdogJob::Launchd {
+                label: "com.example.alt-daemon-watchdog".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn protection_non_darwin_never_probes_a_launchd_job() {
+        // Even a marker claiming launchd resolves to the systemd timer on a
+        // non-Darwin host — the "launchctl absent on Linux falls through to the
+        // systemd probe" edge case, resolved before any probe is attempted.
+        let dir = tempfile::tempdir().unwrap();
+        let marker =
+            write_marker(dir.path(), "use_launchd=true\nlaunchd_label=com.example.alt-daemon\n");
+        let mut probed = None;
+        let report = classify_protection(dir.path(), &marker, &protection_env(), |job| {
+            probed = Some(job.clone());
+            Some(false)
+        });
+        assert_eq!(report.state, ProtectionState::WatchdogNotProvisioned);
+        assert_eq!(
+            probed,
+            Some(WatchdogJob::SystemdTimer {
+                timer_unit: "loom-daemon-watchdog.timer".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn protection_env_launchd_override_forces_the_systemd_probe_on_darwin() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = write_marker(dir.path(), "use_launchd=true\n");
+        let mut env = darwin_protection_env();
+        env.launchd_override = Some(false);
+        let mut probed = None;
+        let _ = classify_protection(dir.path(), &marker, &env, |job| {
+            probed = Some(job.clone());
+            Some(true)
+        });
+        assert!(
+            matches!(probed, Some(WatchdogJob::SystemdTimer { .. })),
+            "LOOM_DAEMON_LAUNCHD=0 must force the pid-file/systemd side: {probed:?}"
+        );
+    }
+
+    #[test]
+    fn protection_report_records_the_marker_path_it_checked() {
+        // AC3: the reported path is whatever was resolved (a
+        // LOOM_AUTONOMY_MARKER override lands here verbatim via
+        // `probe_protection`), so an operator can confirm which file was read.
+        let dir = tempfile::tempdir().unwrap();
+        let custom = dir.path().join("custom-autonomy-marker");
+        fs::write(&custom, "use_launchd=false\n").unwrap();
+        let report = classify_protection(dir.path(), &custom, &protection_env(), |_| Some(true));
+        assert_eq!(report.marker_path, custom);
+        assert!(report.detail.contains("custom-autonomy-marker"), "{}", report.detail);
+    }
+
+    #[test]
+    fn protection_marker_resolution_honors_the_autonomy_marker_override() {
+        // The module's resolver now delegates to `autonomy_marker` (#4354) — this
+        // pins that the delegation preserves both the default and the override
+        // behavior. Env is read process-globally, so assert the default here and
+        // rely on `autonomy_marker`'s own override coverage for the env case.
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            resolve_marker_path(dir.path()),
+            crate::autonomy_marker::resolve_marker_path(dir.path())
+        );
+    }
+
+    #[test]
+    fn protection_probe_never_panics_against_the_real_host() {
+        // AC4 (read-only, never fails): the production entry point must return a
+        // report (or `None` when no loom dir resolves) on ANY host — with or
+        // without launchctl/systemctl, with or without a marker.
+        if let Some(report) = probe_protection() {
+            // Whatever the host looks like, the verdict is one of the four and
+            // the detail is non-empty.
+            assert!(matches!(
+                report.state,
+                ProtectionState::Protected
+                    | ProtectionState::NoMarker
+                    | ProtectionState::WatchdogNotProvisioned
+                    | ProtectionState::Unknown
+            ));
+            assert!(!report.detail.is_empty());
+        }
     }
 }

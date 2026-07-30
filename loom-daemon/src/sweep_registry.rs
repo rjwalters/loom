@@ -56,6 +56,7 @@ use crate::peer_claims::{self, ClaimAd, PeerClaimView};
 use crate::quarantine_reconciliation;
 use crate::sweep_journal;
 use crate::tokens_pool::bad_tokens;
+use crate::tokens_pool::{self, AccountId, AccountProvider, TerminalClassification};
 use crate::types::{Event, SweepId, SweepInfo, SweepKind, SweepOutcome, SweepState};
 
 use anyhow::{anyhow, Context, Result};
@@ -160,7 +161,50 @@ impl std::fmt::Display for OpenPrDispatchError {
 impl std::error::Error for OpenPrDispatchError {}
 
 /// Typed, matchable error returned by [`SweepRegistry::dispatch`] when the
-/// per-issue dispatch backoff (Issue #4485, step 2.7) refuses a dispatch
+/// park-label guard (Issue #4444, step 2.7) refuses a dispatch because the
+/// target issue currently carries a [`PARK_LABELS`] entry (`loom:blocked` /
+/// `loom:operator-only`).
+///
+/// The work-finder's [`SKIP_LABELS`] filter only covers *its own* candidate
+/// query. Every other dispatch route — all three watchdogs (#3887 / #3895 /
+/// #3910), the reaper's checkpoint-resume (#4256), the epic supervisor, and the
+/// IPC/CLI `dispatch_sweep` — funnels through `dispatch_inner` without ever
+/// re-reading the forge labels, so a park applied *after* the original dispatch
+/// was invisible to them and the daemon overrode a deliberate human park
+/// (observed on #4366). This guard closes that hole for every route at once.
+///
+/// Like [`OpenPrDispatchError`] this is a **distinct, downcast-matchable** type
+/// (not a string-matched `anyhow` message) so the work-finder can attribute the
+/// refusal to its labeled-skip counter rather than to a generic dispatch
+/// failure.
+///
+/// [`PARK_LABELS`]: crate::work_finder::PARK_LABELS
+/// [`SKIP_LABELS`]: crate::work_finder::SKIP_LABELS
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParkedIssueDispatchError {
+    /// The issue whose dispatch was refused.
+    pub issue: u32,
+    /// The park label that triggered the refusal (`loom:blocked` or
+    /// `loom:operator-only`).
+    pub label: String,
+}
+
+impl std::fmt::Display for ParkedIssueDispatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "refusing to dispatch issue #{}: it currently carries `{}` (#4444 park-label \
+             guard). A deliberate park must survive every re-dispatch route — watchdog, \
+             checkpoint-resume, epic supervisor, IPC/CLI — until the label is cleared.",
+            self.issue, self.label
+        )
+    }
+}
+
+impl std::error::Error for ParkedIssueDispatchError {}
+
+/// Typed, matchable error returned by [`SweepRegistry::dispatch`] when the
+/// per-issue dispatch backoff (Issue #4485, step 2.8) refuses a dispatch
 /// because this issue's previous dispatch failed and its backoff window has
 /// not elapsed yet.
 ///
@@ -422,6 +466,56 @@ const TOKEN_NAME_LOG_MARKER: &str = "using OAuth account '";
 const ACCOUNT_LOG_MARKER: &str = "# LOOM_ACCOUNT name=";
 const RUNTIME_LOG_MARKER: &str = "# LOOM_RUNTIME_RESOLVED runtime=";
 const CLI_START_MARKER: &str = "# LOOM_CLI_START";
+const TERMINAL_RESULT_MARKER: &str = "# LOOM_TERMINAL_RESULT ";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TerminalResult {
+    provider: AccountProvider,
+    account: String,
+    category: TerminalClassification,
+    exit_code: i32,
+}
+
+/// Parse the adapter's strict v1 record from only the current dispatch region.
+/// Unknown fields, duplicate records, malformed identities, and unknown
+/// categories all fail closed: no account health is mutated.
+fn parse_terminal_result_after(contents: &str, header_anchor: &str) -> Option<TerminalResult> {
+    let region = &contents[contents.rfind(header_anchor)?..];
+    let records: Vec<_> = region
+        .lines()
+        .filter(|line| line.starts_with(TERMINAL_RESULT_MARKER))
+        .collect();
+    if records.len() != 1 {
+        return None;
+    }
+    let fields: HashMap<_, _> = records[0][TERMINAL_RESULT_MARKER.len()..]
+        .split_ascii_whitespace()
+        .filter_map(|field| field.split_once('='))
+        .collect();
+    if fields.len() != 5 || fields.get("v") != Some(&"1") {
+        return None;
+    }
+    let provider = match *fields.get("provider")? {
+        "claude" => AccountProvider::Claude,
+        "codex" => AccountProvider::Codex,
+        _ => return None,
+    };
+    let account = fields.get("account")?.to_string();
+    if account == UNKNOWN_TOKEN_NAME
+        || account.is_empty()
+        || !account
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        return None;
+    }
+    Some(TerminalResult {
+        provider,
+        account,
+        category: fields.get("category")?.parse().ok()?,
+        exit_code: fields.get("exit_code")?.parse().ok()?,
+    })
+}
 
 /// Issue #3802: how long `spawn_child` polls the per-sweep log for the
 /// `TOKEN_NAME_LOG_MARKER` line before giving up and recording
@@ -1093,10 +1187,31 @@ pub fn review_stall_decision(
 // philosophy as #3892). A pre-flight token-health gate reads `.ranking` and
 // defers the re-dispatch when the whole pool is exhausted, so a mid-run
 // exhaustion is less likely to recur.
+//
+// ## The live-use veto (Issue #4449)
+//
+// That signature is NECESSARY but not SUFFICIENT, which cost real work on
+// 2026-07-29: the daemon's tracked sweep for issue #4366 had indeed died, but a
+// separate, untracked recovery Doctor session was concurrently editing the same
+// worktree. `(terminal ∧ no PR ∧ dirty)` matched, the watchdog ran
+// `git reset --hard` + `git clean -fd`, and a tested-but-uncommitted fix was
+// destroyed in the window between the test run and `git commit`.
+//
+// Dirtiness cannot distinguish "debris a dead sweep left behind" from "a live
+// session's work in progress" — both look identical to `git status`. So the
+// watchdog now requires a second, independent condition: NOTHING LIVE may still
+// hold the worktree. `SweepRegistry::worktree_in_use` gathers four signals (a
+// `.loom-in-use` marker, a claim-lock whose owner PID is alive, an in-flight
+// `index.lock`, and processes whose cwd is inside the worktree); any one of them
+// vetoes the reset, yielding `MidbuildDecision::InUse` — logged loudly, with the
+// single recovery retry left unconsumed so a genuinely-dead sweep is still
+// recovered on a later tick once the holder goes away. And `clean_worktree` now
+// logs the porcelain status + diffstat of everything it is about to destroy, so
+// a wipe can never again be silent in the daemon log.
 
 /// The mid-build-death watchdog's per-sweep decision (Issue #3895). Pure state
 /// machine — [`midbuild_decision`] maps `(worktree_dirty, produced_pr,
-/// already_retried)` onto exactly one of these.
+/// already_retried, worktree_in_use)` onto exactly one of these.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MidbuildDecision {
     /// Not a mid-build death (no dirty worktree, or a PR was produced) — leave
@@ -1108,28 +1223,165 @@ pub enum MidbuildDecision {
     /// A dead sweep matching the signature but already recovered once — give up
     /// (bounded: never loop). Left for the operator.
     GiveUp,
+    /// The signature matches BUT the worktree is still held by a live session
+    /// the daemon does not track (Issue #4449) — refuse the destructive reset
+    /// and leave both the worktree and the single recovery retry untouched.
+    InUse,
 }
 
-/// Pure mid-build-death state machine (Issue #3895).
+/// Pure mid-build-death state machine (Issue #3895, extended by #4449).
 ///
 /// - No dirty worktree, or the sweep already produced a PR ⇒
 ///   [`MidbuildDecision::Healthy`] (nothing to recover).
-/// - Dirty worktree + no PR + not yet recovered ⇒ [`MidbuildDecision::Recover`].
-/// - Dirty worktree + no PR + already recovered ⇒ [`MidbuildDecision::GiveUp`]
-///   — the recovery is bounded to exactly one re-dispatch per issue.
+/// - Dirty worktree + no PR + **a live session still using the worktree** ⇒
+///   [`MidbuildDecision::InUse`] (#4449). This gate sits *above* the retry
+///   bookkeeping on purpose: "someone is editing this right now" is never a
+///   dead-sweep-recovery candidate, and a refusal must not burn the single
+///   recovery retry (the worktree may be legitimately free on a later tick).
+/// - Dirty worktree + no PR + not in use + not yet recovered ⇒
+///   [`MidbuildDecision::Recover`].
+/// - Dirty worktree + no PR + not in use + already recovered ⇒
+///   [`MidbuildDecision::GiveUp`] — the recovery is bounded to exactly one
+///   re-dispatch per issue.
+///
+/// # Why the in-use gate exists (#4449)
+///
+/// Before #4449 the watchdog inferred "died mid-build" from `(terminal state ∧
+/// no PR ∧ dirty worktree)` alone and immediately reset the worktree. On
+/// 2026-07-29 that inference was wrong: the daemon's own tracked sweep for
+/// issue #4366 *had* died, but a separate, untracked recovery Doctor session was
+/// concurrently and legitimately working in the same worktree. The watchdog read
+/// that session's uncommitted fix as dead-sweep debris and destroyed it mid
+/// `git commit`. Dirtiness alone cannot distinguish the two cases — only a
+/// liveness signal can.
 #[must_use]
 pub fn midbuild_decision(
     worktree_dirty: bool,
     produced_pr: bool,
     already_retried: bool,
+    worktree_in_use: bool,
 ) -> MidbuildDecision {
     if !worktree_dirty || produced_pr {
         MidbuildDecision::Healthy
+    } else if worktree_in_use {
+        MidbuildDecision::InUse
     } else if already_retried {
         MidbuildDecision::GiveUp
     } else {
         MidbuildDecision::Recover
     }
+}
+
+/// One piece of evidence that a *live* process is still using an issue
+/// worktree, gathered by [`SweepRegistry::worktree_in_use`] (Issue #4449).
+///
+/// Any non-empty set of evidence vetoes the mid-build watchdog's destructive
+/// `git reset --hard` / `git clean -fd` path. Each variant carries enough detail
+/// to name the holder in the daemon log so a refusal is actionable rather than
+/// mysterious.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorktreeUseEvidence {
+    /// A `.loom-in-use` marker file names an owning session. Written by flows
+    /// that enter a worktree (including manual, non-daemon sessions), so this
+    /// is the one signal an operator can set by hand to fence off a worktree.
+    InUseMarker { task_id: String, pid: String },
+    /// A claim-lock (`.loom/locks/issue-<N>/owner.json`) whose recorded owner
+    /// PID is still alive. A dead owner's lock is *not* evidence (the reaper /
+    /// `reconstruct` prune those), so this only fires for a genuinely live
+    /// claim the in-memory registry does not represent as active.
+    LiveClaimLock { pid: u32, sweep_id: String },
+    /// One or more live processes have their current working directory inside
+    /// the worktree — an operator's shell, a manual role session, or an
+    /// orphaned grandchild still writing files.
+    LiveProcesses(Vec<u32>),
+    /// A git operation is mid-flight (`index.lock` present) — precisely the
+    /// `git commit` window in which #4449 lost an uncommitted fix.
+    GitOperationInFlight(PathBuf),
+}
+
+impl std::fmt::Display for WorktreeUseEvidence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InUseMarker { task_id, pid } => {
+                write!(f, ".loom-in-use marker (task: {task_id}, pid: {pid})")
+            }
+            Self::LiveClaimLock { pid, sweep_id } => {
+                write!(f, "live claim-lock owner (pid {pid}, sweep {sweep_id})")
+            }
+            Self::LiveProcesses(pids) => {
+                write!(f, "live process(es) with cwd inside the worktree: {pids:?}")
+            }
+            Self::GitOperationInFlight(path) => {
+                write!(f, "git operation in flight ({} exists)", path.display())
+            }
+        }
+    }
+}
+
+/// Render a set of [`WorktreeUseEvidence`] as a single `; `-joined log fragment.
+#[must_use]
+pub fn describe_worktree_use(evidence: &[WorktreeUseEvidence]) -> String {
+    evidence
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Max lines of `git status` / `git diff --stat` echoed into the
+/// "about to discard" log line (Issue #4449) — enough to identify the lost work,
+/// bounded so a runaway worktree cannot flood the daemon log.
+const DISCARD_LOG_MAX_LINES: usize = 40;
+
+/// Truncate `text` to at most `max` lines, appending a `… (+N more)` marker when
+/// lines were dropped. Returns an empty string for empty/blank input.
+#[must_use]
+fn truncate_lines(text: &str, max: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let lines: Vec<&str> = trimmed.lines().collect();
+    if lines.len() <= max {
+        return lines.join("\n");
+    }
+    let extra = lines.len() - max;
+    let mut out = lines[..max].join("\n");
+    out.push_str(&format!("\n… (+{extra} more line(s))"));
+    out
+}
+
+/// Resolve a worktree's `index.lock` path — the marker git holds while an index
+/// write (`git add`, `git commit`, …) is in flight (Issue #4449).
+///
+/// Asks git itself (`git rev-parse --git-path index.lock`) rather than assuming
+/// `<wt>/.git/index.lock`, because a linked worktree's `.git` is a *file*
+/// pointing at `.git/worktrees/<name>/`. Returns `None` when the path cannot be
+/// resolved (not a repo, git unavailable) — the caller treats that as "no
+/// evidence" and relies on the other signals.
+#[must_use]
+fn git_index_lock_path(worktree: &Path) -> Option<PathBuf> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["rev-parse", "--git-path", "index.lock"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let rel = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if rel.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(&rel);
+    // `--git-path` yields a path relative to the *worktree* when git was invoked
+    // with `-C <worktree>`; absolutise it so `exists()` is cwd-independent.
+    Some(if path.is_absolute() {
+        path
+    } else {
+        worktree.join(path)
+    })
 }
 
 /// Decide, from a `.loom/tokens/.ranking` file's contents, whether the token
@@ -1864,6 +2116,12 @@ pub struct SweepRegistry {
     /// Issues the mid-build-death watchdog has already logged a give-up for
     /// (Issue #3895), so the loud give-up warning fires once per issue.
     midbuild_gaveup: HashSet<u32>,
+    /// Issues whose worktree the mid-build-death watchdog has already refused to
+    /// reset because a live, untracked session still holds it (Issue #4449).
+    /// Log-once bookkeeping only — it never suppresses the refusal itself, and
+    /// the issue is removed again as soon as the worktree stops being in use so a
+    /// later refusal (or a genuine give-up) still surfaces.
+    midbuild_inuse: HashSet<u32>,
     /// Issues the review-phase stall watchdog has already restarted once (Issue
     /// #3910). Bounds the "log went silent mid-review (hung Judge/Doctor)"
     /// recovery to a single re-dispatch per issue — a second stall resolves to
@@ -1969,7 +2227,7 @@ pub struct SweepRegistry {
     /// dispatch outcomes and the instant the next attempt is allowed. Written by
     /// [`record_dispatch_failure`](Self::record_dispatch_failure) from
     /// [`reap_once`](Self::reap_once) and read by
-    /// [`dispatch`](Self::dispatch)'s step-2.7 guard.
+    /// [`dispatch`](Self::dispatch)'s step-2.8 guard.
     ///
     /// Deliberately **wider** than [`insta_crash_counts`](Self::insta_crash_counts):
     /// the quarantine tally exempts account-exhaustion (#4122) and
@@ -2061,6 +2319,7 @@ impl SweepRegistry {
             watchdog_progressed: HashSet::new(),
             midbuild_retried: HashSet::new(),
             midbuild_gaveup: HashSet::new(),
+            midbuild_inuse: HashSet::new(),
             review_stall_retried: HashSet::new(),
             review_stall_gaveup: HashSet::new(),
             quarantine_config: QuarantineConfig::default(),
@@ -2099,6 +2358,7 @@ impl SweepRegistry {
             watchdog_progressed: HashSet::new(),
             midbuild_retried: HashSet::new(),
             midbuild_gaveup: HashSet::new(),
+            midbuild_inuse: HashSet::new(),
             review_stall_retried: HashSet::new(),
             review_stall_gaveup: HashSet::new(),
             quarantine_config: QuarantineConfig::default(),
@@ -2965,7 +3225,57 @@ impl SweepRegistry {
             }
         }
 
-        // 2.7 Per-issue dispatch backoff (Issue #4485). The quarantine backstop
+        // 2.7 Park-label guard (Issue #4444). The work-finder's `SKIP_LABELS`
+        //     hard-skip is enforced only in *its own* candidate query, so it
+        //     covers exactly one of the six dispatch routes. Every other route
+        //     — all three watchdogs (#3887 / #3895 / #3910), the reaper's
+        //     checkpoint-resume (#4256), the epic supervisor, the IPC/CLI
+        //     `dispatch_sweep` — funnels through here, and until this guard
+        //     existed none of them ever re-read the forge labels. A
+        //     `loom:blocked` / `loom:operator-only` park applied *after* the
+        //     original dispatch was therefore invisible to every re-dispatch
+        //     path, and the daemon overrode a deliberate human/agent park
+        //     (observed on #4366). Placing the check here — before the
+        //     lock/label flip — covers all routes with one probe.
+        //
+        //     Three properties are load-bearing:
+        //
+        //     - It guards on `PARK_LABELS` only, NOT the full `SKIP_LABELS`
+        //       set. `loom:building` is legitimately present on a watchdog
+        //       re-dispatch or a checkpoint-resume of the daemon's OWN claim,
+        //       so refusing it would break the review-stall watchdog's
+        //       cancel-and-re-dispatch and the reaper's resume.
+        //     - It is NOT exempted by `resume_bypass_pr`. The #4256 bypass
+        //       covers step 2.6 (its own open PR) and nothing else: a park
+        //       applied after the crash must still stop the resume, which is
+        //       the exact defect this guard fixes.
+        //     - It probes over **REST** (`gh api repos/{owner}/{repo}/issues/N`),
+        //       a separate rate-limit bucket from the GraphQL calls 2.5/2.6
+        //       ride, so the park still holds while the GraphQL quota is
+        //       exhausted — the condition under which the #4123 guard failed
+        //       open during the 2026-07-29 incident.
+        //
+        //     Best-effort and fail-open, mirroring 2.5/2.6: any forge
+        //     error/timeout/unresolvable repo returns `None` and dispatch
+        //     proceeds, so a `gh` outage can never wedge the daemon. Skipped
+        //     entirely when label flips are disabled (test fixtures without
+        //     `gh` credentials).
+        if !self.config.skip_label_flip {
+            if let Some(label) = self.first_park_label(issue_number) {
+                log::info!(
+                    "issue #{issue_number}: refusing dispatch — the issue carries `{label}`, a \
+                     deliberate park that every dispatch route must respect (#4444 park-label \
+                     guard); clear the label to re-enable automation"
+                );
+                return Err(ParkedIssueDispatchError {
+                    issue: issue_number,
+                    label,
+                }
+                .into());
+            }
+        }
+
+        // 2.8 Per-issue dispatch backoff (Issue #4485). The quarantine backstop
         //     (#3939) only engages after three *tally-eligible* insta-crashes,
         //     and both the account-exhaustion (#4122) and claude-wrapper
         //     pre-flight (#4386) carve-outs deliberately leave that tally
@@ -2977,14 +3287,27 @@ impl SweepRegistry {
         //     arms an exponential per-issue window (see
         //     `record_dispatch_failure`) and dispatch refuses until it elapses.
         //
-        //     Placed with the other pre-flip guards (2.4-2.6) so one check
+        //     Placed with the other pre-flip guards (2.4-2.7) so one check
         //     covers every dispatch call site — work-finder, epic supervisor,
         //     IPC/CLI, and all three watchdogs — and, critically, so a refusal
-        //     costs **no lock, no label write, and no forge round trip**: the
-        //     refusal itself can never contribute to a flap. Unlike 2.4-2.6 it
-        //     is NOT gated on `skip_label_flip`: it is pure in-memory
-        //     bookkeeping with no `gh` dependency, and the flap it prevents is
-        //     driven by dispatch cadence, not by credentials.
+        //     costs **no lock, no label write, and no forge round trip of its
+        //     own**: the refusal itself can never contribute to a flap. Unlike
+        //     2.4-2.7 it is NOT gated on `skip_label_flip`: it is pure
+        //     in-memory bookkeeping with no `gh` dependency, and the flap it
+        //     prevents is driven by dispatch cadence, not by credentials.
+        //
+        //     Runs *after* the 2.7 park-label guard, deliberately. When an issue
+        //     is both parked and inside a backoff window, the park is the
+        //     durable operator decision and the more actionable refusal, so it
+        //     wins and the skip is attributed to `labeled-skip` rather than to
+        //     `backoff-skip` (which advertises an imminent auto-retry that a
+        //     park forbids). The two guards share no state: a refusal here never
+        //     spawns a sweep, so no refusal — park or backoff — can ever call
+        //     `record_dispatch_failure` and arm/extend a window, and a backoff
+        //     window keeps decaying on wall-clock time while an issue sits
+        //     parked. Clearing the park therefore re-exposes any *still-live*
+        //     window, which is correct: the park did not prove the failing
+        //     dispatch loop fixed.
         //
         //     Exempt: the reaper-driven resume (#4256, `resume_bypass_pr`),
         //     which re-dispatches an issue whose own PR is open and is already
@@ -3560,11 +3883,76 @@ impl SweepRegistry {
             .find_map(|l| l.trim().parse::<u32>().ok())
     }
 
+    /// Best-effort probe for the first [`PARK_LABELS`] entry currently on
+    /// `issue`, used by the #4444 park-label dispatch guard (step 2.7). Returns
+    /// `Some(label)` when the issue carries a park label and `None` otherwise —
+    /// where `None` covers BOTH "not parked" and any failure (missing/failed/
+    /// timed-out `gh`, unresolvable repo, unparseable output).
+    ///
+    /// Callers MUST treat `None` as **fail-open**, matching
+    /// [`issue_is_closed`](Self::issue_is_closed) and
+    /// [`first_open_linked_pr`](Self::first_open_linked_pr): a forge outage or a
+    /// wedged `gh` must never wedge dispatch. Bounded by [`reap_gh_timeout`] like
+    /// every other dispatch-path `gh` call (#3973).
+    ///
+    /// Deliberately probes over **REST** (`gh api repos/{owner}/{repo}/issues/N`)
+    /// rather than `gh issue view --json labels` (which rides GraphQL, like
+    /// steps 2.5/2.6): REST is a separate rate-limit bucket, so a deliberate park
+    /// still holds while the GraphQL quota is exhausted — exactly the condition
+    /// under which the #4123 open-PR guard failed open during the 2026-07-29
+    /// incident. The `--jq` emits one label name per line.
+    ///
+    /// The returned label is chosen by [`PARK_LABELS`] order, not forge order, so
+    /// the refusal message is deterministic when an issue carries both.
+    ///
+    /// [`PARK_LABELS`]: crate::work_finder::PARK_LABELS
+    fn first_park_label(&self, issue: u32) -> Option<String> {
+        let labels = self.current_labels_via_rest(issue)?;
+        crate::work_finder::PARK_LABELS
+            .iter()
+            .find(|park| labels.iter().any(|l| l == *park))
+            .map(|park| (*park).to_string())
+    }
+
+    /// Read `issue`'s current label names over the GitHub REST API. `None` on any
+    /// failure (see [`first_park_label`](Self::first_park_label) for the
+    /// fail-open contract); `Some(vec![])` for an issue with no labels, which is
+    /// a *successful* read and must stay distinguishable from a failed one.
+    fn current_labels_via_rest(&self, issue: u32) -> Option<Vec<String>> {
+        let (owner, repo) = self.resolve_owner_repo()?;
+        let gh = self
+            .config
+            .gh_bin
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("gh"));
+        let mut cmd = Command::new(&gh);
+        cmd.arg("api")
+            .arg(format!("repos/{owner}/{repo}/issues/{issue}"))
+            .arg("--jq")
+            .arg(".labels[].name");
+        // Resolve against this registry's own workspace, matching the label-flip
+        // helpers and the other dispatch-path probes (#3937).
+        cmd.current_dir(&self.config.workspace_root);
+        let output = output_with_timeout(cmd, reap_gh_timeout()).ok()??;
+        if !output.status.success() {
+            return None;
+        }
+        Some(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(String::from)
+                .collect(),
+        )
+    }
+
     /// Resolve `(owner, repo)` for the registry's workspace, needed because
-    /// `gh api graphql` (unlike `gh issue view`) cannot infer the repo from the
-    /// working directory. Prefers the process-global `LOOM_REPO` override
-    /// (`owner/repo`) when set, else asks `gh repo view` in the workspace root.
-    /// Returns `None` on any failure so the open-PR guard fails open.
+    /// `gh api` (unlike `gh issue view`) cannot infer the repo from the working
+    /// directory — neither the GraphQL open-PR probe nor the REST park-label
+    /// probe accepts a `--repo` flag. Prefers the process-global `LOOM_REPO`
+    /// override (`owner/repo`) when set, else asks `gh repo view` in the
+    /// workspace root. Returns `None` on any failure so both guards fail open.
     fn resolve_owner_repo(&self) -> Option<(String, String)> {
         if let Ok(repo) = std::env::var("LOOM_REPO") {
             if let Some((o, r)) = repo.split_once('/') {
@@ -3717,6 +4105,44 @@ impl SweepRegistry {
             return;
         }
         self.record_terminal_outcome(issue, insta_crash);
+    }
+
+    /// Persist provider health before any reaper retry/failover decision.
+    fn apply_provider_health_feedback(&self, sweep_id: &SweepId, exit_code: Option<i32>) {
+        let Some(info) = self.entries.get(sweep_id) else {
+            return;
+        };
+        if info.runtime != "codex" || info.token_name == UNKNOWN_TOKEN_NAME {
+            return;
+        }
+        let Ok(contents) = std::fs::read_to_string(&info.log_path) else {
+            return;
+        };
+        let anchor = format!("sweep_id={sweep_id}");
+        let Some(result) = parse_terminal_result_after(&contents, &anchor) else {
+            return;
+        };
+        if result.provider != AccountProvider::Codex
+            || result.account != info.token_name
+            || exit_code.is_some_and(|code| code != result.exit_code)
+        {
+            log::warn!("sweep_registry: ignored mismatched Codex terminal feedback for {sweep_id}");
+            return;
+        }
+        let id = AccountId {
+            provider: result.provider,
+            name: result.account,
+        };
+        if let Err(error) = tokens_pool::record_terminal(
+            &self.config.workspace_root,
+            &id,
+            result.category,
+            "spawn-codex:v1",
+        ) {
+            log::warn!(
+                "sweep_registry: failed to persist Codex terminal feedback for {sweep_id}: {error}"
+            );
+        }
     }
 
     /// Classify whether an insta-crash death was caused by account exhaustion
@@ -4928,6 +5354,9 @@ impl SweepRegistry {
             // handle fall back to the `kill(pid, 0)` probe.
             let (is_dead, exit_code) = self.poll_liveness(&sweep_id, pid);
             if is_dead {
+                // #4493: account health must be updated before any bounded
+                // re-dispatch path below asks the selector for another profile.
+                self.apply_provider_health_feedback(&sweep_id, exit_code);
                 {
                     changes += 1;
                     let issue = match &kind {
@@ -5110,17 +5539,26 @@ impl SweepRegistry {
                             // credentials never attempt a real forge probe
                             // here) and only checked for phases at/after
                             // Builder completion, so a pre-PR crash never
-                            // pays for the extra forge round trip. Also
-                            // respects the #4206 operator-park guard: never
-                            // resume-dispatch an issue `restore_label_to_ready`
-                            // just deliberately left without `loom:issue`
-                            // because it carries `loom:blocked`.
+                            // pays for the extra forge round trip. A deliberate
+                            // park (`loom:blocked` / `loom:operator-only`,
+                            // possibly applied by `restore_label_to_ready`'s
+                            // #4206 pre-check moments ago) still stops the
+                            // resume — but that check now lives centrally in
+                            // `dispatch_inner` step 2.7 (#4444) rather than
+                            // here, so it covers the watchdogs and IPC/CLI too
+                            // and there is only ONE label probe per resume
+                            // dispatch. A parked issue therefore reaches the
+                            // dispatch call below and is refused there, which
+                            // is deliberately *more* visible than the old
+                            // silent call-site skip: the refusal surfaces as a
+                            // `warn!` naming the park label plus the existing
+                            // `SweepResumeDispatched { dispatched: false }`
+                            // event.
                             if !self.config.skip_label_flip
                                 && !superseded
                                 && resume_phase_check
                                     .as_deref()
                                     .is_some_and(|p| RESUMABLE_CHECKPOINT_PHASES.contains(&p))
-                                && !self.issue_has_blocked_label(issue)
                             {
                                 if let Some(pr) = self.first_open_linked_pr(issue) {
                                     // Bounded resume attempts (#4256, Judge
@@ -5770,16 +6208,132 @@ impl SweepRegistry {
         }
     }
 
+    /// Gather every signal that issue `N`'s worktree is still being used by a
+    /// **live** process the in-memory registry does not represent as an active
+    /// sweep (Issue #4449). An empty vec means "no live holder found".
+    ///
+    /// This is the veto gate on the mid-build watchdog's destructive path. It
+    /// deliberately fails *closed* on ambiguity in the one direction that matters:
+    /// any positive signal blocks the reset. Signals that cannot be probed on
+    /// this host simply contribute nothing (the probe helpers already degrade to
+    /// "unknown ⇒ empty"), so a host without `/proc` or `lsof` still gets the
+    /// marker / claim-lock / index.lock signals.
+    ///
+    /// Order is cheapest-first so the common "nothing is using it" case does the
+    /// least work: two `stat`s and a `read_to_string` before the process scan.
+    fn worktree_in_use(&self, issue: u32) -> Vec<WorktreeUseEvidence> {
+        let wt = self.worktree_path(issue);
+        let mut evidence = Vec::new();
+        if !wt.exists() {
+            return evidence;
+        }
+
+        // 1. Explicit `.loom-in-use` marker — the one signal a manual session
+        //    (or an operator) can plant by hand to fence off a worktree.
+        if let Some(marker) = crate::worktree_ops::safety::read_in_use_marker(&wt) {
+            evidence.push(WorktreeUseEvidence::InUseMarker {
+                task_id: marker.task_id,
+                pid: marker.pid,
+            });
+        }
+
+        // 2. A claim-lock whose recorded owner PID is still alive. A dead owner
+        //    is NOT evidence — the reaper and `reconstruct` prune those, and
+        //    treating a stale lock as "in use" would wedge legitimate recovery.
+        let owner_path = self
+            .config
+            .locks_dir()
+            .join(format!("issue-{issue}"))
+            .join("owner.json");
+        if let Some(owner) = std::fs::read_to_string(&owner_path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<LockOwner>(&s).ok())
+        {
+            if is_pid_alive(owner.owner_pid) {
+                evidence.push(WorktreeUseEvidence::LiveClaimLock {
+                    pid: owner.owner_pid,
+                    sweep_id: owner.sweep_id,
+                });
+            }
+        }
+
+        // 3. A git operation mid-flight (`index.lock`) — the exact `git commit`
+        //    window in which #4449 destroyed an uncommitted fix.
+        if let Some(lock) = git_index_lock_path(&wt) {
+            if lock.exists() {
+                evidence.push(WorktreeUseEvidence::GitOperationInFlight(lock));
+            }
+        }
+
+        // 4. Live processes with a cwd inside the worktree (shells, manual role
+        //    sessions, orphaned grandchildren still writing files).
+        let pids = crate::worktree_ops::safety::find_processes_using_directory(&wt);
+        if !pids.is_empty() {
+            evidence.push(WorktreeUseEvidence::LiveProcesses(pids));
+        }
+
+        evidence
+    }
+
+    /// Record, at `warn`, exactly what a [`clean_worktree`] call is about to
+    /// destroy (Issue #4449) — the porcelain status plus a diffstat, truncated to
+    /// [`DISCARD_LOG_MAX_LINES`]. A wipe must never be silent in the daemon log:
+    /// this line is the only forensic trace that survives the `reset --hard`.
+    ///
+    /// [`clean_worktree`]: SweepRegistry::clean_worktree
+    fn log_worktree_discard(&self, wt: &Path, issue: u32) {
+        let run = |args: &[&str]| -> String {
+            Command::new("git")
+                .arg("-C")
+                .arg(wt)
+                .args(args)
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim_end().to_string())
+                .unwrap_or_default()
+        };
+        let status = truncate_lines(
+            &run(&["status", "--porcelain", "--untracked-files=all"]),
+            DISCARD_LOG_MAX_LINES,
+        );
+        let diffstat = truncate_lines(&run(&["diff", "--stat", "HEAD"]), DISCARD_LOG_MAX_LINES);
+        if status.is_empty() && diffstat.is_empty() {
+            // Nothing probeable to report (missing git, unborn HEAD, …) — still
+            // announce the destructive action so the log shows it happened.
+            log::warn!(
+                "clean-worktree: discarding uncommitted state in {} (issue #{issue}) via \
+                 `git reset --hard` + `git clean -fd`; could not enumerate the discarded \
+                 changes (#4449).",
+                wt.display()
+            );
+            return;
+        }
+        log::warn!(
+            "clean-worktree: DISCARDING uncommitted state in {} (issue #{issue}) via \
+             `git reset --hard` + `git clean -fd` — this is irreversible (#4449).\n\
+             status --porcelain:\n{status}\n\
+             diff --stat HEAD:\n{diffstat}",
+            wt.display()
+        );
+    }
+
     /// Discard a mid-build-death worktree's uncommitted changes so the
     /// re-dispatched sweep resumes from a clean checkout (Issue #3895): a
     /// `git reset --hard` followed by `git clean -fd`. Best-effort — any commits
     /// the dead sweep managed to make are preserved (only the dirty working tree
     /// and untracked files are dropped).
+    ///
+    /// Every call first logs what it is about to destroy via
+    /// [`log_worktree_discard`](Self::log_worktree_discard) (Issue #4449) — the
+    /// #4449 incident was made unrecoverable partly because the wipe left no
+    /// trace at all in the daemon log.
     fn clean_worktree(&self, issue: u32) -> Result<()> {
         let wt = self.worktree_path(issue);
         if !wt.exists() {
             return Ok(());
         }
+        self.log_worktree_discard(&wt, issue);
         let reset = Command::new("git")
             .arg("-C")
             .arg(&wt)
@@ -5850,6 +6404,16 @@ impl SweepRegistry {
     /// re-dispatch (without consuming the single retry) when the whole pool is
     /// `exhausted`/`blocked`, so a mid-run exhaustion is less likely to recur.
     ///
+    /// **Live-use veto (Issue #4449)**: before anything destructive happens, a
+    /// dirty worktree is probed for live holders ([`worktree_in_use`]). A dirty
+    /// worktree is only *dead-sweep debris* if nothing live still owns it — if a
+    /// `.loom-in-use` marker, a live claim-lock owner, an in-flight `index.lock`,
+    /// or a process with its cwd inside the worktree says otherwise, the decision
+    /// resolves to [`MidbuildDecision::InUse`]: log loudly, touch nothing, and do
+    /// **not** consume the single recovery retry.
+    ///
+    /// [`worktree_in_use`]: SweepRegistry::worktree_in_use
+    ///
     /// No new event topics are introduced (the taxonomy is frozen): the
     /// re-dispatch reuses `sweep.global.dispatch` from [`dispatch`], and a
     /// bounded give-up / a pool-exhausted defer surface on the existing frozen
@@ -5881,8 +6445,39 @@ impl SweepRegistry {
                 continue;
             }
             let dirty = self.worktree_dirty(issue);
+            // #4449: a dirty worktree is only dead-sweep debris if nothing LIVE
+            // is still using it. Probe only when dirty (the probe is the
+            // expensive part and a clean worktree is never reset anyway).
+            let in_use = if dirty {
+                self.worktree_in_use(issue)
+            } else {
+                Vec::new()
+            };
+            if in_use.is_empty() {
+                // No longer held — clear the log-once latch so a later refusal
+                // (or a genuine give-up) still surfaces in the daemon log.
+                self.midbuild_inuse.remove(&issue);
+            }
             let already_retried = self.midbuild_retried.contains(&issue);
-            match midbuild_decision(dirty, false, already_retried) {
+            match midbuild_decision(dirty, false, already_retried, !in_use.is_empty()) {
+                MidbuildDecision::InUse => {
+                    if self.midbuild_inuse.insert(issue) {
+                        log::warn!(
+                            "midbuild-watchdog: issue #{issue} ({sweep_id}) matches the \
+                             mid-build-death signature (terminal, no PR, dirty worktree) but its \
+                             worktree at {} is STILL IN USE by a live session the daemon does not \
+                             track — {}. REFUSING to `git reset --hard` it: that is exactly how \
+                             #4449 destroyed an active recovery session's uncommitted fix \
+                             mid-commit. The worktree is left intact and the single recovery retry \
+                             is NOT consumed; the watchdog re-assesses once the holder releases \
+                             it. If the holder is stale, clear it (remove .loom-in-use / the \
+                             claim-lock / the index.lock, or exit the shell) and the next tick \
+                             will recover normally.",
+                            self.worktree_path(issue).display(),
+                            describe_worktree_use(&in_use),
+                        );
+                    }
+                }
                 MidbuildDecision::Healthy => {}
                 MidbuildDecision::GiveUp => {
                     if self.midbuild_gaveup.insert(issue) {
@@ -11950,6 +12545,40 @@ exit 0
     }
 
     #[test]
+    fn terminal_result_parser_is_anchored_strict_and_provider_aware() {
+        let log = "\
+sweep_id=old
+# LOOM_TERMINAL_RESULT v=1 provider=codex account=stale category=TOKEN_EXPIRED exit_code=1
+sweep_id=current
+# LOOM_TERMINAL_RESULT v=1 provider=codex account=profile-a category=TOKEN_EXHAUSTED exit_code=42
+";
+        assert_eq!(
+            parse_terminal_result_after(log, "sweep_id=current"),
+            Some(TerminalResult {
+                provider: AccountProvider::Codex,
+                account: "profile-a".into(),
+                category: TerminalClassification::TokenExhausted,
+                exit_code: 42,
+            })
+        );
+        assert!(parse_terminal_result_after(
+            "sweep_id=current\n# LOOM_TERMINAL_RESULT v=9 provider=codex account=a category=SUCCESS exit_code=0",
+            "sweep_id=current"
+        )
+        .is_none());
+        assert!(parse_terminal_result_after(
+            "sweep_id=current\n# LOOM_TERMINAL_RESULT v=1 provider=codex account=unknown category=SUCCESS exit_code=0",
+            "sweep_id=current"
+        )
+        .is_none());
+        assert!(parse_terminal_result_after(
+            "sweep_id=current\n# LOOM_TERMINAL_RESULT v=1 provider=codex account=a category=BOGUS exit_code=1",
+            "sweep_id=current"
+        )
+        .is_none());
+    }
+
+    #[test]
     #[serial]
     fn reaper_interval_env_override() {
         // Serialized: this test mutates a process-wide env var.
@@ -13247,26 +13876,75 @@ exit 0\n";
     #[test]
     fn midbuild_decision_no_dirty_worktree_is_healthy() {
         // No dirty worktree ⇒ nothing to recover, regardless of retry state.
-        assert_eq!(midbuild_decision(false, false, false), MidbuildDecision::Healthy);
-        assert_eq!(midbuild_decision(false, false, true), MidbuildDecision::Healthy);
+        assert_eq!(midbuild_decision(false, false, false, false), MidbuildDecision::Healthy);
+        assert_eq!(midbuild_decision(false, false, true, false), MidbuildDecision::Healthy);
     }
 
     #[test]
     fn midbuild_decision_produced_pr_is_healthy() {
         // A dead sweep that produced a PR is a completed Builder, not a
         // mid-build death — never recovered even with a dirty worktree.
-        assert_eq!(midbuild_decision(true, true, false), MidbuildDecision::Healthy);
+        assert_eq!(midbuild_decision(true, true, false, false), MidbuildDecision::Healthy);
     }
 
     #[test]
     fn midbuild_decision_dirty_no_pr_first_time_recovers() {
-        assert_eq!(midbuild_decision(true, false, false), MidbuildDecision::Recover);
+        assert_eq!(midbuild_decision(true, false, false, false), MidbuildDecision::Recover);
     }
 
     #[test]
     fn midbuild_decision_dirty_no_pr_after_retry_gives_up() {
         // Bounded: a second mid-build death gives up (never loops).
-        assert_eq!(midbuild_decision(true, false, true), MidbuildDecision::GiveUp);
+        assert_eq!(midbuild_decision(true, false, true, false), MidbuildDecision::GiveUp);
+    }
+
+    #[test]
+    fn midbuild_decision_in_use_worktree_is_never_recovered() {
+        // #4449: a live holder vetoes the destructive path, and the veto sits
+        // ABOVE the retry bookkeeping — it must win over both Recover and
+        // GiveUp so a refusal never consumes the single recovery retry.
+        assert_eq!(midbuild_decision(true, false, false, true), MidbuildDecision::InUse);
+        assert_eq!(midbuild_decision(true, false, true, true), MidbuildDecision::InUse);
+    }
+
+    #[test]
+    fn midbuild_decision_in_use_is_irrelevant_when_not_dirty_or_pr_exists() {
+        // The in-use flag must not manufacture work: a clean worktree or a
+        // produced PR is still Healthy even while a session holds the worktree.
+        assert_eq!(midbuild_decision(false, false, false, true), MidbuildDecision::Healthy);
+        assert_eq!(midbuild_decision(true, true, false, true), MidbuildDecision::Healthy);
+    }
+
+    // --- #4449 helpers: truncate_lines / describe_worktree_use ---
+
+    #[test]
+    fn truncate_lines_keeps_short_input_and_caps_long_input() {
+        assert_eq!(truncate_lines("", 5), "");
+        assert_eq!(truncate_lines("   \n  ", 5), "");
+        assert_eq!(truncate_lines("a\nb", 5), "a\nb");
+        let long = (1..=10)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let capped = truncate_lines(&long, 3);
+        assert!(capped.starts_with("1\n2\n3"), "keeps the first `max` lines: {capped}");
+        assert!(capped.contains("+7 more"), "reports how many lines were dropped: {capped}");
+    }
+
+    #[test]
+    fn describe_worktree_use_joins_every_signal() {
+        let described = describe_worktree_use(&[
+            WorktreeUseEvidence::InUseMarker {
+                task_id: "t1".into(),
+                pid: "42".into(),
+            },
+            WorktreeUseEvidence::LiveProcesses(vec![7, 9]),
+        ]);
+        assert!(described.contains(".loom-in-use"), "{described}");
+        assert!(described.contains("pid: 42"), "{described}");
+        assert!(described.contains("[7, 9]"), "{described}");
+        assert!(described.contains("; "), "signals are joined: {described}");
+        assert_eq!(describe_worktree_use(&[]), "");
     }
 
     // --- ranking_has_capacity token-health gate ---
@@ -13502,6 +14180,195 @@ exit 0\n";
             !ws.join(".loom/worktrees/issue-6003/dirty.txt").exists(),
             "worktree cleaned on recovery"
         );
+    }
+
+    // --- #4449: the live-use veto on the destructive recovery path -----------
+
+    /// Assert the watchdog refused to touch issue `N`'s dirty worktree: nothing
+    /// recovered, the uncommitted edit still on disk, and — critically — the
+    /// single recovery retry NOT consumed (the worktree may be free later).
+    fn assert_midbuild_refused(reg: &mut SweepRegistry, ws: &Path, issue: u32, why: &str) {
+        assert_eq!(reg.midbuild_watchdog_once(), 0, "no recovery when {why}");
+        assert!(
+            ws.join(format!(".loom/worktrees/issue-{issue}/dirty.txt"))
+                .exists(),
+            "uncommitted work MUST survive when {why} (#4449)"
+        );
+        assert!(
+            !reg.midbuild_retried.contains(&issue),
+            "a refusal must NOT consume the single recovery retry when {why}"
+        );
+        assert!(
+            reg.midbuild_inuse.contains(&issue),
+            "the refusal is recorded (and logged once) when {why}"
+        );
+    }
+
+    #[test]
+    fn midbuild_refuses_to_wipe_worktree_held_by_in_use_marker() {
+        // The #4449 incident shape: the daemon's tracked sweep really did die
+        // (terminal, no PR) but a SEPARATE live session is still using the
+        // worktree. A `.loom-in-use` marker is the explicit form of that signal.
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let (mut reg, _rec) = fixture_registry(ws);
+
+        let wt = make_dirty_git_worktree(ws, 6101);
+        insert_terminal_issue(&mut reg, "sweep-issue-6101-dead", 6101, None);
+        std::fs::write(
+            wt.join(".loom-in-use"),
+            r#"{"shepherd_task_id": "recovery-doctor", "pid": 4321}"#,
+        )
+        .unwrap();
+
+        assert!(!reg.worktree_in_use(6101).is_empty(), "marker is detected as a live holder");
+        assert_midbuild_refused(&mut reg, ws, 6101, "a .loom-in-use marker names a live session");
+
+        // Once the holder releases the worktree, the legitimate dead-sweep
+        // recovery still works — the veto defers, it does not disable.
+        std::fs::remove_file(wt.join(".loom-in-use")).unwrap();
+        assert_eq!(reg.midbuild_watchdog_once(), 1, "recovery resumes once the holder releases");
+        assert!(reg.midbuild_retried.contains(&6101));
+        assert!(!reg.midbuild_inuse.contains(&6101), "the log-once latch is cleared");
+        assert!(!wt.join("dirty.txt").exists(), "worktree cleaned on the real recovery");
+    }
+
+    #[test]
+    fn midbuild_refuses_to_wipe_worktree_with_git_operation_in_flight() {
+        // The precise window #4449 lost work in: a `git commit` was mid-write,
+        // so git held index.lock. Never reset a worktree in that state.
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let (mut reg, _rec) = fixture_registry(ws);
+
+        let wt = make_dirty_git_worktree(ws, 6102);
+        insert_terminal_issue(&mut reg, "sweep-issue-6102-dead", 6102, None);
+        let index_lock =
+            git_index_lock_path(&wt).expect("index.lock path resolves for a real repo");
+        std::fs::write(&index_lock, "").unwrap();
+
+        assert_midbuild_refused(&mut reg, ws, 6102, "a git index.lock write is in flight");
+
+        // Committing finishes (lock released) ⇒ recovery is available again.
+        std::fs::remove_file(&index_lock).unwrap();
+        assert_eq!(reg.midbuild_watchdog_once(), 1, "recovery resumes once index.lock clears");
+    }
+
+    #[test]
+    fn midbuild_refuses_to_wipe_worktree_with_live_claim_lock_owner() {
+        // A claim-lock whose owner PID is ALIVE means some session (daemon or
+        // not) still owns this issue — never reset its worktree underneath it.
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let (mut reg, _rec) = fixture_registry(ws);
+
+        make_dirty_git_worktree(ws, 6103);
+        insert_terminal_issue(&mut reg, "sweep-issue-6103-dead", 6103, None);
+        let lock = reg.config.locks_dir().join("issue-6103");
+        std::fs::create_dir_all(&lock).unwrap();
+        // Our own PID is trivially alive — stands in for the live holder.
+        std::fs::write(
+            lock.join("owner.json"),
+            format!(
+                r#"{{"issue": 6103, "owner_pid": {}, "acquired_at": "{}", "sweep_id": "manual-session"}}"#,
+                std::process::id(),
+                Utc::now().to_rfc3339()
+            ),
+        )
+        .unwrap();
+
+        assert_midbuild_refused(
+            &mut reg,
+            ws,
+            6103,
+            "a live claim-lock owner still holds the issue",
+        );
+    }
+
+    #[test]
+    fn midbuild_ignores_stale_claim_lock_with_dead_owner() {
+        // The inverse guard: the dead sweep's OWN claim-lock, left behind
+        // because the reaper never released it, must not wedge the legitimate
+        // dead-sweep recovery path forever.
+        //
+        // The lock's `sweep_id` is deliberately the dead entry's own id. A lock
+        // naming a *different* sweep is a separate, pre-existing refusal
+        // (`lock_owned_by_other`, #4463: a newer sweep superseded this one) that
+        // fails closed on the id comparison alone and is covered by its own
+        // tests. This test isolates the #4449 live-use veto: a dead owner PID is
+        // not live-use evidence, so recovery proceeds.
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let (mut reg, _rec) = fixture_registry(ws);
+
+        make_dirty_git_worktree(ws, 6104);
+        insert_terminal_issue(&mut reg, "sweep-issue-6104-dead", 6104, None);
+        let lock = reg.config.locks_dir().join("issue-6104");
+        std::fs::create_dir_all(&lock).unwrap();
+        std::fs::write(
+            lock.join("owner.json"),
+            format!(
+                r#"{{"issue": 6104, "owner_pid": 2147483640, "acquired_at": "{}", "sweep_id": "sweep-issue-6104-dead"}}"#,
+                Utc::now().to_rfc3339()
+            ),
+        )
+        .unwrap();
+
+        assert!(
+            reg.worktree_in_use(6104).is_empty(),
+            "a dead owner's lock is not live-use evidence"
+        );
+        assert_eq!(reg.midbuild_watchdog_once(), 1, "a stale lock does not block recovery");
+        assert!(!ws.join(".loom/worktrees/issue-6104/dirty.txt").exists());
+    }
+
+    #[test]
+    fn midbuild_refuses_to_wipe_worktree_with_live_process_cwd_inside() {
+        // The signal that would have saved the #4449 session with no cooperation
+        // from it at all: a live process whose cwd is inside the worktree.
+        // `find_processes_using_directory` degrades to an empty list on hosts
+        // where it cannot probe (no /proc, no lsof), so self-skip there rather
+        // than assert something the host cannot express.
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let (mut reg, _rec) = fixture_registry(ws);
+
+        let wt = make_dirty_git_worktree(ws, 6105);
+        insert_terminal_issue(&mut reg, "sweep-issue-6105-dead", 6105, None);
+
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .current_dir(&wt)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn a live process with cwd inside the worktree");
+
+        // The child's `chdir` happens after `fork`, so poll briefly rather than
+        // read the probe once and race it.
+        let mut detected = Vec::new();
+        for _ in 0..40 {
+            detected = crate::worktree_ops::safety::find_processes_using_directory(&wt);
+            if !detected.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if detected.is_empty() {
+            // Probe unavailable on this host — nothing to assert; don't leak.
+            let _ = child.kill();
+            let _ = child.wait();
+            return;
+        }
+        assert!(
+            detected.contains(&child.id()),
+            "the probe found the spawned holder: {detected:?}"
+        );
+
+        assert_midbuild_refused(&mut reg, ws, 6105, "a live process has its cwd in the worktree");
+
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     #[test]
@@ -14408,6 +15275,380 @@ exit 0\n";
             !calls.contains("api graphql"),
             "the open-PR (2.6) probe must never run once 2.5 refuses; got: {calls:?}"
         );
+    }
+
+    // --- park-label dispatch guard (Issue #4444) ---
+
+    /// Install a fake `gh` for the park-label guard (step 2.7):
+    ///
+    /// - `issue view --json state` reports `OPEN` (so the 2.5 closed-issue guard
+    ///   passes) and `issue view --json labels` reports whether `loom:blocked` is
+    ///   present (so the reap path's `issue_has_blocked_label` — still used by
+    ///   `restore_label_to_ready` — behaves faithfully);
+    /// - `api graphql` prints `graphql_pr` (the post-`--jq` open linked PR
+    ///   number, empty for none) so the 2.6 open-PR guard can be steered;
+    /// - `api repos/<owner>/<repo>/issues/<n>` prints `rest_labels`
+    ///   (whitespace-separated label names, one per output line) and exits
+    ///   `rest_exit` — the REST probe the new guard consults;
+    /// - `repo view` resolves the owner/repo.
+    ///
+    /// Every invocation is logged so a test can assert which probes ran.
+    fn park_guard_registry(
+        ws: &Path,
+        rest_labels: &str,
+        rest_exit: i32,
+        graphql_pr: &str,
+        skip_label_flip: bool,
+    ) -> (SweepRegistry, PathBuf) {
+        let gh_log = ws.join("gh-invocations.log");
+        let fake_gh = ws.join("fake-gh.sh");
+        let blocked = rest_labels.split_whitespace().any(|l| l == "loom:blocked");
+        let script = format!(
+            "#!/usr/bin/env bash\n\
+             printf '%s\\n' \"$*\" >> \"{log}\"\n\
+             if [[ \"$1\" == \"issue\" && \"$2\" == \"view\" ]]; then\n\
+             if [[ \"$*\" == *labels* ]]; then printf '%s\\n' \"{blocked}\"; \
+             else printf 'OPEN\\n'; fi\n\
+             exit 0\n\
+             fi\n\
+             if [[ \"$1\" == \"api\" && \"$2\" == \"graphql\" ]]; then\n\
+             printf '%s\\n' \"{gql}\"\n\
+             exit 0\n\
+             fi\n\
+             if [[ \"$1\" == \"api\" && \"$2\" == repos/* ]]; then\n\
+             printf '%s\\n' {labels}\n\
+             exit {rest_exit}\n\
+             fi\n\
+             if [[ \"$1\" == \"repo\" && \"$2\" == \"view\" ]]; then\n\
+             printf 'rjwalters/loom\\n'\n\
+             exit 0\n\
+             fi\n\
+             exit 0\n",
+            log = gh_log.display(),
+            blocked = blocked,
+            gql = graphql_pr,
+            labels = rest_labels,
+            rest_exit = rest_exit,
+        );
+        std::fs::write(&fake_gh, &script).unwrap();
+        let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_gh, perms).unwrap();
+        if let Ok(f) = std::fs::File::open(&fake_gh) {
+            let _ = f.sync_all();
+        }
+
+        let scripts_dir = ws.join(".loom").join("scripts");
+        std::fs::create_dir_all(&scripts_dir).unwrap();
+        let spawn = scripts_dir.join("spawn-claude.sh");
+        std::fs::write(&spawn, "#!/usr/bin/env bash\necho spawned\nexit 0\n").unwrap();
+        let mut sperms = std::fs::metadata(&spawn).unwrap().permissions();
+        sperms.set_mode(0o755);
+        std::fs::set_permissions(&spawn, sperms).unwrap();
+        if let Ok(f) = std::fs::File::open(&spawn) {
+            let _ = f.sync_all();
+        }
+        touch_sweep_command(ws);
+
+        let mut config = SweepRegistryConfig::new(ws.to_path_buf());
+        config.spawn_bin = Some(spawn);
+        config.gh_bin = Some(fake_gh);
+        config.skip_label_flip = skip_label_flip;
+        config.journal_path = Some(ws.join("test-sweeps-journal.json"));
+        (SweepRegistry::new(config), gh_log)
+    }
+
+    /// AC: `dispatch` for an issue carrying `loom:blocked` is refused with the
+    /// typed [`ParkedIssueDispatchError`], and it must NOT acquire the claim lock
+    /// or flip any labels — a deliberate park must survive every dispatch route.
+    /// The probe rides the REST bucket (`gh api repos/.../issues/N`), not
+    /// GraphQL.
+    #[test]
+    #[serial]
+    fn dispatch_refuses_blocked_issue_without_flipping_labels() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::set_var("LOOM_REPO", "rjwalters/loom");
+        let (mut reg, gh_log) = park_guard_registry(ws, "loom:blocked", 0, "", false);
+
+        let err = reg
+            .dispatch(&SweepKind::Issue(4444), None, None, None, None)
+            .expect_err("a parked issue must be refused");
+        let typed = err
+            .downcast_ref::<ParkedIssueDispatchError>()
+            .expect("refusal must carry the typed ParkedIssueDispatchError");
+        assert_eq!(typed.issue, 4444);
+        assert_eq!(typed.label, "loom:blocked");
+
+        let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            calls.contains("api repos/rjwalters/loom/issues/4444"),
+            "the guard must probe labels over REST, not GraphQL; got: {calls:?}"
+        );
+        assert!(
+            !calls.contains("issue edit"),
+            "no label flip on a refused dispatch; got: {calls:?}"
+        );
+        assert!(running_issue_sweep_id(&reg, 4444).is_none(), "no lock, no entry");
+        std::env::remove_var("LOOM_REPO");
+    }
+
+    /// AC: `loom:operator-only` is the second park label and refuses identically
+    /// — the daemon must never dispatch work a human has claimed for themselves.
+    #[test]
+    #[serial]
+    fn dispatch_refuses_operator_only_issue() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::set_var("LOOM_REPO", "rjwalters/loom");
+        let (mut reg, _gh_log) = park_guard_registry(ws, "loom:operator-only", 0, "", false);
+
+        let err = reg
+            .dispatch(&SweepKind::Issue(4445), None, None, None, None)
+            .expect_err("an operator-only issue must be refused");
+        let typed = err
+            .downcast_ref::<ParkedIssueDispatchError>()
+            .expect("refusal must carry the typed ParkedIssueDispatchError");
+        assert_eq!(typed.label, "loom:operator-only");
+        assert!(running_issue_sweep_id(&reg, 4445).is_none());
+        std::env::remove_var("LOOM_REPO");
+    }
+
+    /// AC (the load-bearing exclusion): `loom:building` ALONE must NOT refuse.
+    /// It is legitimately present on the daemon's own in-flight claim, so a guard
+    /// keyed on the full `SKIP_LABELS` set would break the review-stall
+    /// watchdog's cancel-and-re-dispatch and the reaper's checkpoint-resume.
+    #[test]
+    #[serial]
+    fn dispatch_park_guard_allows_building_label_alone() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::set_var("LOOM_REPO", "rjwalters/loom");
+        let (mut reg, gh_log) = park_guard_registry(ws, "loom:building loom:curated", 0, "", false);
+
+        let out = reg
+            .dispatch(&SweepKind::Issue(4446), None, None, None, None)
+            .expect("loom:building alone must never refuse dispatch");
+        assert!(wait_until_dead(out.pid, FIXTURE_CHILD_WAIT_MS));
+
+        let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            calls.contains("api repos/rjwalters/loom/issues/4446"),
+            "the guard still probed; it just did not refuse; got: {calls:?}"
+        );
+        assert!(
+            calls.contains("issue edit 4446"),
+            "dispatch proceeded to the label flip; got: {calls:?}"
+        );
+        if let Some(id) = running_issue_sweep_id(&reg, 4446) {
+            let _ = reg.cancel(&id, Duration::from_secs(2));
+        }
+        std::env::remove_var("LOOM_REPO");
+    }
+
+    /// AC (fail-open, the single most safety-critical property): a forge error on
+    /// the REST label probe (non-zero `gh api`) must NOT wedge dispatch — the
+    /// probe returns `None` and dispatch proceeds to spawn + label flip, exactly
+    /// like the 2.5/2.6 guards.
+    #[test]
+    #[serial]
+    fn dispatch_fails_open_when_park_label_probe_errors() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::set_var("LOOM_REPO", "rjwalters/loom");
+        // The park label IS present, but the probe fails ⇒ unknown ⇒ fail open.
+        let (mut reg, gh_log) = park_guard_registry(ws, "loom:blocked", 1, "", false);
+
+        let out = reg
+            .dispatch(&SweepKind::Issue(4447), None, None, None, None)
+            .expect("a gh outage on the park probe must not wedge dispatch (fail-open)");
+        assert!(wait_until_dead(out.pid, FIXTURE_CHILD_WAIT_MS));
+
+        let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            calls.contains("api repos/rjwalters/loom/issues/4447"),
+            "the guard attempted the REST probe; got: {calls:?}"
+        );
+        assert!(
+            calls.contains("issue edit 4447"),
+            "dispatch proceeded to the label flip after failing open; got: {calls:?}"
+        );
+        if let Some(id) = running_issue_sweep_id(&reg, 4447) {
+            let _ = reg.cancel(&id, Duration::from_secs(2));
+        }
+        std::env::remove_var("LOOM_REPO");
+    }
+
+    /// AC: `skip_label_flip = true` (test fixtures without `gh` credentials)
+    /// never attempts the probe at all — not even the REST call — mirroring the
+    /// 2.5/2.6 skip condition.
+    #[test]
+    #[serial]
+    fn dispatch_skip_label_flip_bypasses_park_guard() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::set_var("LOOM_REPO", "rjwalters/loom");
+        let (mut reg, gh_log) = park_guard_registry(ws, "loom:blocked", 0, "", true);
+
+        let out = reg
+            .dispatch(&SweepKind::Issue(4448), None, None, None, None)
+            .expect("skip_label_flip must bypass the park guard entirely");
+        assert!(wait_until_dead(out.pid, FIXTURE_CHILD_WAIT_MS));
+
+        let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            !calls.contains("api repos/"),
+            "no forge call at all when label flips are disabled; got: {calls:?}"
+        );
+        if let Some(id) = running_issue_sweep_id(&reg, 4448) {
+            let _ = reg.cancel(&id, Duration::from_secs(2));
+        }
+        std::env::remove_var("LOOM_REPO");
+    }
+
+    /// Guard ordering: 2.6 (open-PR) runs before 2.7 (park label), so an ordinary
+    /// dispatch of a parked issue that ALSO has an open PR is attributed to the
+    /// cheaper-to-explain open-PR refusal and never pays for the REST probe.
+    #[test]
+    #[serial]
+    fn open_pr_guard_fires_before_park_guard() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::set_var("LOOM_REPO", "rjwalters/loom");
+        let (mut reg, gh_log) = park_guard_registry(ws, "loom:blocked", 0, "4500", false);
+
+        let err = reg
+            .dispatch(&SweepKind::Issue(4449), None, None, None, None)
+            .expect_err("an issue with an open linked PR must be refused");
+        assert!(
+            err.downcast_ref::<OpenPrDispatchError>().is_some(),
+            "the 2.6 open-PR guard wins for an ordinary dispatch; got: {err}"
+        );
+        let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            !calls.contains("api repos/"),
+            "the 2.7 REST probe must not run once 2.6 refuses; got: {calls:?}"
+        );
+        std::env::remove_var("LOOM_REPO");
+    }
+
+    /// THE CORE REGRESSION (#4444): a checkpoint-resume dispatch — which
+    /// deliberately bypasses the 2.6 open-PR guard for its OWN PR — must still be
+    /// refused by the 2.7 park guard when the issue was parked after the crash.
+    /// This is the path that overrode a `loom:blocked` park on #4366.
+    ///
+    /// The refusal must be failure-visible, not silent: the reaper still emits
+    /// `SweepResumeDispatched { dispatched: false }` (and logs the refusal, whose
+    /// message names the park label), and no fresh `Running` entry is created.
+    #[tokio::test]
+    #[serial]
+    async fn reaper_resume_refused_when_issue_parked_after_crash() {
+        use crate::event_bus::EventBus;
+
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::set_var("LOOM_REPO", "rjwalters/loom");
+        // Open linked PR #4501 (so the resume path engages and the 2.6 bypass
+        // matches) AND a `loom:blocked` park applied after the crash.
+        let (mut reg, gh_log) = park_guard_registry(ws, "loom:blocked", 0, "4501", false);
+        let bus = Arc::new(EventBus::new());
+        reg.set_event_bus(bus.clone());
+        let mut sub = bus.subscribe::<[&str; 0], &str>([]);
+
+        write_checkpoint(&reg, 4366, "builder-done");
+        insert_dead_running_entry(&mut reg, 4366, "sweep-issue-4366-crashed");
+
+        let changed = reg.reap_once();
+        assert!(changed >= 1);
+
+        let mut saw_resume_false = false;
+        for _ in 0..8 {
+            let Ok(ev) = tokio::time::timeout(Duration::from_secs(5), sub.recv()).await else {
+                break;
+            };
+            if let Event::SweepResumeDispatched {
+                issue,
+                pr,
+                dispatched,
+                ..
+            } = ev.unwrap()
+            {
+                assert_eq!(issue, 4366);
+                assert_eq!(pr, 4501);
+                assert!(
+                    !dispatched,
+                    "a park applied after the crash must refuse the resume dispatch"
+                );
+                saw_resume_false = true;
+            }
+        }
+        assert!(
+            saw_resume_false,
+            "the park refusal must stay failure-visible on the resume path (not silent)"
+        );
+
+        assert!(
+            running_issue_sweep_id(&reg, 4366).is_none(),
+            "a refused resume must not create a fresh Running entry"
+        );
+        let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            calls.contains("api repos/rjwalters/loom/issues/4366"),
+            "the resume dispatch went through the central 2.7 REST probe; got: {calls:?}"
+        );
+        assert_eq!(
+            calls
+                .lines()
+                .filter(|l| l.contains("api repos/rjwalters/loom/issues/4366"))
+                .count(),
+            1,
+            "exactly ONE park-label probe per resume dispatch (deduped with the old \
+             call-site-only check); got: {calls:?}"
+        );
+        // The park survives: the crash-path restore removed the stale claim but
+        // did NOT re-add `loom:issue` (#4206), and no fresh claim was flipped on.
+        assert!(
+            !calls.contains("--add-label loom:issue"),
+            "the operator's park must not be clobbered back to loom:issue; got: {calls:?}"
+        );
+        std::env::remove_var("LOOM_REPO");
+    }
+
+    /// Companion to the test above: with the SAME fixture but no park label, the
+    /// resume dispatch succeeds — proving the refusal above is caused by the park
+    /// label and not by some other property of the fixture.
+    #[tokio::test]
+    #[serial]
+    async fn reaper_resume_succeeds_when_issue_not_parked() {
+        use crate::event_bus::EventBus;
+
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::set_var("LOOM_REPO", "rjwalters/loom");
+        let (mut reg, _gh_log) = park_guard_registry(ws, "loom:curated", 0, "4502", false);
+        let bus = Arc::new(EventBus::new());
+        reg.set_event_bus(bus.clone());
+        let mut sub = bus.subscribe::<[&str; 0], &str>([]);
+
+        write_checkpoint(&reg, 4367, "builder-done");
+        insert_dead_running_entry(&mut reg, 4367, "sweep-issue-4367-crashed");
+
+        let changed = reg.reap_once();
+        assert!(changed >= 1);
+
+        let mut saw_resume_true = false;
+        for _ in 0..8 {
+            let Ok(ev) = tokio::time::timeout(Duration::from_secs(5), sub.recv()).await else {
+                break;
+            };
+            if let Event::SweepResumeDispatched { dispatched, .. } = ev.unwrap() {
+                assert!(dispatched, "an unparked issue must still resume normally");
+                saw_resume_true = true;
+            }
+        }
+        assert!(saw_resume_true, "expected a successful resume dispatch");
+        assert!(running_issue_sweep_id(&reg, 4367).is_some());
+        std::env::remove_var("LOOM_REPO");
     }
 
     // --- reaper-driven resume (Issue #4256) ---

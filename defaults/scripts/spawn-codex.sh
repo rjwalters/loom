@@ -198,6 +198,10 @@ log_warn() { echo -e "${YELLOW}[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] WARN${NC} $*" 
 log_error() { echo -e "${RED}[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] ERROR${NC} $*" >&2; }
 
 _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "${_SCRIPT_DIR}/lib/locate-daemon-bin.sh" ]]; then
+    # shellcheck source=./lib/locate-daemon-bin.sh
+    source "${_SCRIPT_DIR}/lib/locate-daemon-bin.sh"
+fi
 
 # --- Repo root resolution (handles worktrees; mirrors spawn-claude.sh) ---
 _resolve_workspace() {
@@ -525,6 +529,35 @@ CODEX_PROFILE_NAME=""
 if [[ -n "${LOOM_SPAWN_NO_EXPORT:-}" ]]; then
     log_info "spawn-codex: LOOM_SPAWN_NO_EXPORT set — skipping CODEX_HOME resolution"
 else
+    # A managed headless dispatch with no explicit pin uses the provider-aware
+    # selector. This fails closed when every profile is disabled, cooling down,
+    # or awaiting reauthentication; it never falls back to ambient ~/.codex.
+    if [[ "$HAS_PROMPT" == "true" && -z "${LOOM_CODEX_NO_EXEC:-}" \
+          && -z "${LOOM_CODEX_HOME:-}" \
+          && -z "${CODEX_HOME:-}" && -z "${LOOM_CODEX_PROFILE:-}" ]]; then
+        if ! declare -F loom_locate_daemon_bin >/dev/null 2>&1; then
+            log_error "Provider-aware account selection support is not installed."
+            exit 78
+        fi
+        _daemon_bin="$(loom_locate_daemon_bin "$WORKSPACE")"
+        if [[ -z "$_daemon_bin" ]] \
+            || ! "$_daemon_bin" tokens select --help 2>&1 | grep -q -- '--provider'; then
+            log_error "No loom-daemon binary supporting provider-aware account selection was found."
+            exit 78
+        fi
+        _selection_stderr_file="$(mktemp)"
+        _selection_output=""
+        if ! _selection_output="$("$_daemon_bin" tokens select --provider codex \
+            --workspace "$WORKSPACE" --export 2>"$_selection_stderr_file")"; then
+            log_error "Codex account selection failed:"
+            cat "$_selection_stderr_file" >&2 || true
+            rm -f "$_selection_stderr_file"
+            exit 78
+        fi
+        cat "$_selection_stderr_file" >&2 || true
+        rm -f "$_selection_stderr_file"
+        eval "$_selection_output"
+    fi
     _requested_home=""
     _requested_source=""
     if [[ -n "${LOOM_CODEX_HOME:-}" ]]; then
@@ -543,7 +576,7 @@ else
         _auth_candidate="${_requested_home}/auth.json"
         if [[ -f "$_auth_candidate" && -r "$_auth_candidate" && -s "$_auth_candidate" ]]; then
             export CODEX_HOME="$_requested_home"
-            CODEX_PROFILE_NAME="$(basename "$_requested_home")"
+            CODEX_PROFILE_NAME="${LOOM_ACCOUNT_NAME:-$(basename "$_requested_home")}"
             # Directory NAME only — never the path contents, never auth.json.
             log_info "spawn-codex: using Codex profile '$CODEX_PROFILE_NAME' (source=$_requested_source)"
             echo "# LOOM_ACCOUNT name=$CODEX_PROFILE_NAME" >&2
@@ -662,6 +695,31 @@ _tokens_used="$(
 )"
 if [[ -n "$_tokens_used" ]]; then
     log_info "spawn-codex: tokens_used=$_tokens_used"
+fi
+
+# Stable, bounded terminal feedback for the daemon. The classifier remains the
+# single source of truth; this adapter only packages its result with the
+# provider/account attribution already selected for this child. Raw output is
+# neither included in this record nor persisted by the health layer.
+_classifier_lib="${_SCRIPT_DIR}/lib/classify-error.sh"
+if [[ -f "$_classifier_lib" ]]; then
+    # shellcheck source=./lib/classify-error.sh
+    source "$_classifier_lib"
+    _classifier_input="$(tail -c 65536 "$_stderr_file" 2>/dev/null || true)"
+    _terminal_category="$(classify_error "$_classifier_input" "$_exit_code" codex)"
+    _terminal_account="${LOOM_ACCOUNT_NAME:-${CODEX_PROFILE_NAME:-unknown}}"
+    if [[ ! "$_terminal_account" =~ ^[A-Za-z0-9._-]+$ ]]; then
+        _terminal_account="unknown"
+    fi
+    case "$_terminal_category" in
+        SUCCESS|TOKEN_EXPIRED|TOKEN_EXHAUSTED|RECOVERABLE|TIMEOUT|FATAL|CWD_DELETED|MODEL_REFUSAL|SESSION_LIMIT)
+            printf '# LOOM_TERMINAL_RESULT v=1 provider=codex account=%s category=%s exit_code=%s\n' \
+                "$_terminal_account" "$_terminal_category" "$_exit_code" >&2
+            ;;
+        *)
+            log_warn "spawn-codex: classifier returned an invalid category; terminal feedback omitted"
+            ;;
+    esac
 fi
 
 exit "$_exit_code"

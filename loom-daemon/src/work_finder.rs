@@ -91,7 +91,7 @@ use crate::cpu_headroom::{
 use crate::disk_headroom::disk_headroom_limit;
 use crate::event_bus::EventBus;
 use crate::main_health_gate::{MainHealthState, WorkspaceHealthStates};
-use crate::sweep_registry::{DispatchBackoffError, OpenPrDispatchError};
+use crate::sweep_registry::{DispatchBackoffError, OpenPrDispatchError, ParkedIssueDispatchError};
 use crate::tokens::{token_pool_size, token_pool_size_at_dir};
 use crate::types::Event;
 use crate::workspace_pool::WorkspacePool;
@@ -193,13 +193,34 @@ pub const WORK_FINDER_MAX_ADMISSIONS_PER_TICK_ENV: &str =
 /// momentarily computed room for all six.
 pub const DEFAULT_MAX_ADMISSIONS_PER_TICK: usize = 3;
 
+/// Labels marking a **deliberate park** — a human (or an agent acting on a
+/// human's behalf) has taken the issue out of the automation queue and it must
+/// stay out until the label is cleared (Issue #4444).
+///
+/// This is the strict subset of [`SKIP_LABELS`] that survives *every* dispatch
+/// route, so it is the constant the dispatch-time guard in
+/// `SweepRegistry::dispatch()` (step 2.7) consults. It deliberately EXCLUDES
+/// [`BUILDING_LABEL`]: `loom:building` is legitimately present on the daemon's
+/// own in-flight claim, so a guard that refused it would break the watchdogs'
+/// cancel-and-re-dispatch and the reaper's checkpoint-resume — both of which
+/// re-dispatch an issue the daemon itself already flipped to `loom:building`.
+pub const PARK_LABELS: &[&str] = &["loom:blocked", "loom:operator-only"];
+
+/// The daemon's own claim label. Disqualifies a *fresh* work-finder candidate
+/// (a `loom:building` row is already being worked), but is NOT a park — see
+/// [`PARK_LABELS`].
+pub const BUILDING_LABEL: &str = "loom:building";
+
 /// Labels that disqualify an issue from dispatch even if it still appears in
 /// the `loom:issue`-filtered listing.
 ///
 /// A `loom:issue` row should never itself carry these (they are mutually
 /// exclusive states in the `.github/labels.yml` state machine), but `gh`'s
 /// label cache can be briefly stale, so the finder checks defensively.
-pub const SKIP_LABELS: &[&str] = &["loom:building", "loom:blocked", "loom:operator-only"];
+///
+/// Composed as [`BUILDING_LABEL`] + [`PARK_LABELS`] rather than re-listing the
+/// label strings, so the two constants can never drift apart (#4444).
+pub const SKIP_LABELS: &[&str] = &[BUILDING_LABEL, PARK_LABELS[0], PARK_LABELS[1]];
 
 /// Label that promotes an issue ahead of its non-urgent siblings **within the
 /// same workspace-priority tier** (Issue #3946). Detection is best-effort: if no
@@ -375,7 +396,7 @@ pub trait WorkDispatcher {
     /// concurrency budget is filled, so a backed-off candidate never reserves a
     /// shared dispatch slot.
     ///
-    /// Complements (does not replace) the registry-side step-2.7 guard: this
+    /// Complements (does not replace) the registry-side step-2.8 guard: this
     /// keeps a backed-off issue from consuming a slot and from logging a refusal
     /// every tick, while the guard is the authoritative brake that also covers
     /// the watchdog / IPC / epic-supervisor dispatch paths.
@@ -451,7 +472,12 @@ pub struct TickReport {
     pub seen: usize,
     /// Issues for which a **new** sweep was dispatched this tick.
     pub dispatched: usize,
-    /// Issues skipped because they carried a [`SKIP_LABELS`] entry.
+    /// Issues skipped because they carried a [`SKIP_LABELS`] entry — either in
+    /// the candidate listing this tick, or at dispatch time when the
+    /// dispatch-side [`PARK_LABELS`] guard (#4444) found a park label the
+    /// listing had not caught yet (`ParkedIssueDispatchError`). Both are the
+    /// same reason, so they share one counter rather than splitting a stale-cache
+    /// race across `labeled-skip` and `error(s)`.
     pub skipped_labeled: usize,
     /// Issues skipped because a live sweep already exists for them (registry
     /// in-flight set, or an idempotency no-op from `dispatch()`).
@@ -488,7 +514,7 @@ pub struct TickReport {
     /// Issues skipped because they are inside a per-issue dispatch-backoff
     /// window after a failed dispatch (Issue #4485) — either filtered out before
     /// the capacity gate via [`WorkDispatcher::backed_off`], or refused by the
-    /// registry's step-2.7 guard with the typed [`DispatchBackoffError`].
+    /// registry's step-2.8 guard with the typed [`DispatchBackoffError`].
     /// Attributed here rather than to [`errors`](Self::errors) because a backoff
     /// refusal is a deliberate skip, not a failure.
     pub skipped_backoff: usize,
@@ -678,6 +704,20 @@ pub fn tick_with_admission_cap(
                         "work_finder: skipping issue #{} — it already has an open linked PR \
                          (#4123 open-PR guard)",
                         item.number
+                    );
+                } else if let Some(parked) = e.downcast_ref::<ParkedIssueDispatchError>() {
+                    // Park-label guard refusal (#4444). The candidate query
+                    // already filters `SKIP_LABELS`, so reaching this means the
+                    // listing was stale relative to the forge — the dispatch-time
+                    // probe is the authoritative read. Same reason as the query
+                    // filter, so it lands on the same `labeled-skip` counter
+                    // rather than on `error(s)`.
+                    report.skipped_labeled += 1;
+                    log::info!(
+                        "work_finder: skipping issue #{} — it carries `{}` on the forge \
+                         (#4444 park-label guard; the candidate listing was stale)",
+                        item.number,
+                        parked.label
                     );
                 } else if e.downcast_ref::<DispatchBackoffError>().is_some() {
                     // Dispatch backoff refusal (#4485) — a deliberate skip, not
@@ -1001,6 +1041,16 @@ pub fn tick_multi_with_admission_cap<S: WorkSource, D: WorkDispatcher>(
                         "work_finder: skipping issue #{} — it already has an open linked PR \
                          (#4123 open-PR guard)",
                         cand.number
+                    );
+                } else if let Some(parked) = e.downcast_ref::<ParkedIssueDispatchError>() {
+                    // Park-label guard refusal (#4444) — see the single-workspace
+                    // `tick` for the rationale. A labeled-skip, not a failure.
+                    report.skipped_labeled += 1;
+                    log::info!(
+                        "work_finder: skipping issue #{} — it carries `{}` on the forge \
+                         (#4444 park-label guard; the candidate listing was stale)",
+                        cand.number,
+                        parked.label
                     );
                 } else if e.downcast_ref::<DispatchBackoffError>().is_some() {
                     // Dispatch backoff refusal (#4485) — see the single-workspace
@@ -2331,6 +2381,11 @@ mod tests {
         /// Issue numbers whose dispatch should be refused by the open-PR guard
         /// (#4123) — the dispatcher returns the typed [`OpenPrDispatchError`].
         pr_open_issues: HashSet<u32>,
+        /// Issue numbers whose dispatch should be refused by the park-label
+        /// guard (#4444) — the dispatcher returns the typed
+        /// [`ParkedIssueDispatchError`], simulating a `loom:blocked` park the
+        /// candidate listing had not caught yet.
+        parked_issues: HashSet<u32>,
         /// Issue numbers this dispatcher reports as quarantined (Issue #3939).
         quarantined: HashSet<u32>,
         /// Issue numbers this dispatcher reports as inside a dispatch-backoff
@@ -2338,7 +2393,7 @@ mod tests {
         backed_off: HashSet<u32>,
         /// Issue numbers whose dispatch should be refused by the dispatch-backoff
         /// guard (#4485) — the dispatcher returns the typed
-        /// [`DispatchBackoffError`], as `SweepRegistry::dispatch` step 2.7 does
+        /// [`DispatchBackoffError`], as `SweepRegistry::dispatch` step 2.8 does
         /// when a window is armed mid-tick.
         backoff_refuse_issues: HashSet<u32>,
         /// Cumulative cross-host collision count this dispatcher reports (#4085).
@@ -2376,6 +2431,15 @@ mod tests {
                 // Mirror the production `SweepRegistry::dispatch` open-PR guard:
                 // refuse with the typed, downcast-matchable error (#4123).
                 return Err(OpenPrDispatchError { issue, pr: 9999 }.into());
+            }
+            if self.parked_issues.contains(&issue) {
+                // Mirror the production `SweepRegistry::dispatch` park-label
+                // guard: refuse with the typed, downcast-matchable error (#4444).
+                return Err(ParkedIssueDispatchError {
+                    issue,
+                    label: "loom:blocked".to_string(),
+                }
+                .into());
             }
             if self.fail_issues.contains(&issue) {
                 anyhow::bail!("forced dispatch failure for #{issue}");
@@ -2933,6 +2997,72 @@ exit 0
         assert_eq!(report.errors, 0, "an open-PR skip is never a dispatch error");
         assert_eq!(report.dispatched, 2, "#1 and #3 still dispatch");
         assert_eq!(disp.dispatched, vec![1, 3], "#2 never dispatched");
+    }
+
+    #[test]
+    fn test_park_labels_are_the_non_building_subset_of_skip_labels() {
+        // #4444: the dispatch-time guard keys on PARK_LABELS, so the two
+        // constants must stay in lockstep — SKIP_LABELS is exactly
+        // BUILDING_LABEL + PARK_LABELS, and PARK_LABELS must never contain
+        // `loom:building` (a guard that refused it would break the watchdogs'
+        // and the reaper's re-dispatch of the daemon's OWN claim).
+        assert!(
+            !PARK_LABELS.contains(&BUILDING_LABEL),
+            "PARK_LABELS must exclude {BUILDING_LABEL}: it is legitimately present on a \
+             watchdog / checkpoint-resume re-dispatch of the daemon's own claim"
+        );
+        for park in PARK_LABELS {
+            assert!(
+                SKIP_LABELS.contains(park),
+                "{park} is a park label, so the work-finder query must skip it too"
+            );
+        }
+        let mut expected: Vec<&str> = vec![BUILDING_LABEL];
+        expected.extend_from_slice(PARK_LABELS);
+        assert_eq!(
+            SKIP_LABELS, expected,
+            "SKIP_LABELS is composed as BUILDING_LABEL + PARK_LABELS"
+        );
+    }
+
+    #[test]
+    fn test_tick_park_label_refusal_counts_as_labeled_skip_not_error() {
+        // #2 carries `loom:blocked` on the forge but the candidate listing was
+        // stale: `dispatch()` refuses with the typed ParkedIssueDispatchError,
+        // which the finder attributes to `skipped_labeled` — NOT `errors` — while
+        // its siblings dispatch normally (#4444).
+        let mut source = FakeSource::once(vec![issue(1), issue(2), issue(3)]);
+        let mut disp = RecordingDispatcher {
+            parked_issues: HashSet::from([2]),
+            ..Default::default()
+        };
+        let report = tick(&mut source, &mut disp, 10, false).unwrap();
+
+        assert_eq!(report.skipped_labeled, 1, "#2's park refusal is a labeled-skip");
+        assert_eq!(report.errors, 0, "a park-label skip is never a dispatch error");
+        assert_eq!(report.skipped_pr_open, 0, "and it is not an open-PR skip either");
+        assert_eq!(report.dispatched, 2, "#1 and #3 still dispatch");
+        assert_eq!(disp.dispatched, vec![1, 3], "#2 never dispatched");
+    }
+
+    #[test]
+    fn test_tick_multi_park_label_refusal_counts_as_labeled_skip() {
+        // Same attribution in the multi-workspace tick (#4444).
+        let mut multi = vec![
+            (
+                FakeSource::once(vec![issue(1)]),
+                RecordingDispatcher {
+                    parked_issues: HashSet::from([1]),
+                    ..Default::default()
+                },
+            ),
+            (FakeSource::once(vec![issue(2)]), RecordingDispatcher::default()),
+        ];
+        let report = tick_multi(&mut multi, &[0, 0], 10, &[false, false]);
+
+        assert_eq!(report.skipped_labeled, 1);
+        assert_eq!(report.errors, 0);
+        assert_eq!(report.dispatched, 1);
     }
 
     #[test]

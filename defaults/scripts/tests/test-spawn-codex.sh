@@ -514,6 +514,7 @@ if [[ -n "\$_stdin" ]]; then echo "MOCK-SAW-STDIN:\$_stdin" >&2; fi
   echo "--------"
   echo "tokens used"
   echo "2,502"
+  [[ -n "\${MOCK_ERROR:-}" ]] && echo "\$MOCK_ERROR"
 } >&2
 echo "MOCK-FINAL-MESSAGE"
 exit "\${MOCK_RC:-0}"
@@ -547,6 +548,10 @@ assert_contains "spawn-codex: session=$MOCK_SESSION" "$mock_stderr" \
     "the 'session id:' line is parsed and reported as the transcript join key"
 assert_contains "spawn-codex: tokens_used=2502" "$mock_stderr" \
     "'tokens used' is parsed (comma-stripped) and reported"
+assert_contains \
+    "# LOOM_TERMINAL_RESULT v=1 provider=codex account=unknown category=SUCCESS exit_code=0" \
+    "$mock_stderr" \
+    "a successful child emits one strict structured terminal record"
 assert_not_contains "MOCK-SAW-STDIN" "$mock_stderr" \
     "the child's stdin is /dev/null (no <stdin> append, no hang)"
 
@@ -565,6 +570,21 @@ run_mock MOCK_RC=42 -- -p "hi" >/dev/null 2>&1
 mock_rc=$?
 set -e
 assert_eq "42" "$mock_rc" "the codex exit code is passed through (PIPESTATUS)"
+
+set +e
+classified_stderr="$({ run_mock MOCK_RC=42 LOOM_ACCOUNT_NAME=profile-a \
+    MOCK_ERROR="Not signed in. recognizable-secret" -- -p "hi" >/dev/null; } 2>&1)"
+classified_rc=$?
+set -e
+assert_eq "42" "$classified_rc" \
+    "structured classification preserves the original child exit code"
+terminal_record="$(printf '%s\n' "$classified_stderr" | grep '^# LOOM_TERMINAL_RESULT ' || true)"
+assert_eq \
+    "# LOOM_TERMINAL_RESULT v=1 provider=codex account=profile-a category=TOKEN_EXPIRED exit_code=42" \
+    "$terminal_record" \
+    "the structured record matches the direct Codex classifier and carries account identity"
+assert_not_contains "recognizable-secret" "$terminal_record" \
+    "the structured record never copies raw child output"
 
 set +e
 run_mock MOCK_RC=0 -- -p "hi" >/dev/null 2>&1
