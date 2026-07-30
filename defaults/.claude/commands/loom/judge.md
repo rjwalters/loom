@@ -161,6 +161,8 @@ If no argument is provided, use the normal finding work workflow below.
 gh pr list --label="loom:review-requested" --state=open
 ```
 
+**Before either command below, run the Verdict-Time CAS Recheck** (see "Verdict-Time CAS Recheck" under Evaluation Process) — abort instead of writing if the recheck finds your claim lost or another Judge's verdict already landed.
+
 **After approval (green → blue) — BOTH commands are REQUIRED:**
 ```bash
 gh pr comment <number> --body "LGTM! Code quality is excellent, tests pass, implementation is solid." && \
@@ -299,7 +301,7 @@ fi
 8. **Verify CI status**: Check GitHub CI passes before approving (see CI Status Check below)
 9. **Evaluate changes**: Examine diff, look for issues, suggest improvements
 10. **Provide feedback**: Use `gh pr comment` to provide evaluation feedback
-11. **Update labels** (⚠️ NEVER use `gh pr review` - see warning at top of file). **The label update is the PRIMARY deliverable — always run it immediately after the comment using `&&`:**
+11. **Update labels** (⚠️ NEVER use `gh pr review` - see warning at top of file). **Run the Verdict-Time CAS Recheck (see below) immediately before this step** — abort instead of writing if it finds your claim lost or another Judge's verdict already landed. **The label update is the PRIMARY deliverable — always run it immediately after the comment using `&&`:**
    - If approved: `gh pr comment ... && gh pr edit <number> --remove-label "loom:review-requested" --remove-label "loom:reviewing" --add-label "loom:pr"` (blue badge - ready for Champion auto-merge)
    - If changes needed: `gh pr comment ... && gh pr edit <number> --remove-label "loom:review-requested" --remove-label "loom:reviewing" --add-label "loom:changes-requested"` (amber badge - Doctor will address)
 
@@ -366,6 +368,54 @@ below, and any cron-invoked pass over `loom:review-requested` PRs: a
 cron-invoked Judge and a `/loom:sweep`-dispatched Judge must apply the
 identical rule so neither stomps the other's fresh claim nor stalls behind a
 dead one.
+
+### Verdict-Time CAS Recheck (MANDATORY immediately before every verdict-label write)
+
+The Stale Claim Check above closes the race window at **claim time** (step 2).
+It does not close the window that opens **while you review**: a full
+evaluation (rebase, tests, CI wait) can run several minutes, and GitHub's
+label API has no compare-and-swap — two Judges can each pass their own claim
+check and then both still write a verdict label, because nothing re-validates
+the PR's label state in between claim and write. This is exactly what
+happened in the PR #4560 incident (2026-07-30): Judge B's approval write
+landed 8 minutes into Judge A's still-fresh `loom:reviewing` claim, leaving
+the PR carrying `loom:pr` **and** `loom:changes-requested` simultaneously
+until Judge A manually corrected it — a state that would have let Champion
+auto-merge a PR with an open rejection (see the mutual-exclusion invariant in
+`.github/labels.yml`).
+
+**Immediately before running ANY verdict-label-writing command in this
+document** — the primary approve/reject write (Label Workflow, Step 11), the
+DIRTY/merge-conflict fallback writes, the CI-failure rejection, the fast-track
+approval, the minor-PR-description-fix approval, and the trivial-fix approval
+— re-read the PR's current labels one more time:
+
+```bash
+N=<pr-number>
+CURRENT_LABELS=$(gh pr view $N --json labels --jq '[.labels[].name] | join(",")')
+```
+
+Then decide:
+
+| Condition | Verdict | Action |
+|-----------|---------|--------|
+| `loom:reviewing` is still present (your claim intact), and neither `loom:pr` nor `loom:changes-requested` has appeared | **Safe** | Proceed with the verdict write as planned. |
+| `loom:reviewing` was removed or replaced (e.g. reclaimed as stale by another Judge while you were still working) | **Claim lost** | **ABORT.** Discard your verdict — do not write any label. Post a short standing-down note (see below). Do NOT re-add `loom:reviewing`. |
+| A verdict label (`loom:pr` or `loom:changes-requested`) is already present that you did not just write | **Raced** | **ABORT.** Another Judge's verdict landed first. Discard your verdict and post a short note citing the label you observed — do NOT overwrite their verdict, even if you disagree with it (raise disagreement as a plain PR comment, not a second label write). |
+| The `gh pr view` call fails or returns empty | **Unknown — fail safe** | Treat as raced/claim-lost: do NOT write the verdict. Retry the recheck once; if it still fails, abort and note the API failure rather than guessing. |
+
+**Standing down** (claim lost or raced):
+
+```bash
+gh pr comment $N --body "Standing down: re-checked labels immediately before writing my verdict and found <loom:reviewing removed | loom:pr or loom:changes-requested already present> — another Judge's verdict raced mine. Discarding my review; not writing any label."
+```
+
+This shrinks the race window from the full review duration (minutes) to the
+gap between the recheck and the write (seconds). It is not a new mechanism —
+it is the existing Stale Claim Check re-run one more time, at the point that
+actually matters (the write), not just at claim entry. Doctor applies the
+analogous recheck (label state, not just head SHA) immediately before its own
+completion write — see `doctor.md`'s "Verdict-Time CAS Recheck".
 
 **Pre-approval checklist** (verify before executing approval commands):
 - [ ] I am using `gh pr comment`, NOT `gh pr review`
@@ -596,6 +646,11 @@ gh pr view <number> --json mergeStateStatus --jq '.mergeStateStatus'
 
 This reduces the Doctor→Judge→Merge cycle by handling simple conflicts directly.
 
+**Both `gh pr edit` fallback writes below are verdict-label writes** — run the
+Verdict-Time CAS Recheck immediately before each one (see "Verdict-Time CAS
+Recheck" above) and abort instead of writing if it finds your claim lost or
+another Judge's verdict already landed.
+
 ```bash
 PR_NUMBER=<number>
 MERGE_STATE=$(gh pr view $PR_NUMBER --json mergeStateStatus --jq '.mergeStateStatus')
@@ -723,6 +778,8 @@ gh pr comment <number> --body "🔀 Rebased branch and resolved merge conflict (
 
 ### For Complex Conflicts (Request Changes)
 
+Run the Verdict-Time CAS Recheck immediately before the `gh pr edit` below.
+
 ```bash
 git rebase --abort
 gh pr comment <number> --body "$(cat <<'FEEDBACK'
@@ -801,7 +858,7 @@ gh pr view <PR_NUMBER> --json mergeStateStatus --jq '.mergeStateStatus'
 
 ### When CI Fails
 
-If CI checks are failing, **do NOT approve**. Instead, apply `loom:ci-failure` for visibility:
+If CI checks are failing, **do NOT approve**. Instead, apply `loom:ci-failure` for visibility. Run the Verdict-Time CAS Recheck immediately before the `gh pr edit` below.
 
 ```bash
 gh pr comment <number> --body "$(cat <<'EOF'
@@ -937,7 +994,7 @@ gh pr checks <PR_NUMBER>
 gh pr view <PR_NUMBER> --json mergeStateStatus --jq '.mergeStateStatus'
 ```
 
-**4. Approve with fast-track audit trail:**
+**4. Approve with fast-track audit trail** (run the Verdict-Time CAS Recheck immediately before the `gh pr edit` below):
 
 ```bash
 gh pr comment <PR_NUMBER> --body "$(cat <<'EOF'
@@ -1134,7 +1191,7 @@ echo -e "\nCloses #123" >> /tmp/pr-body.txt
 gh pr edit <number> --body-file /tmp/pr-body.txt
 ```
 
-**Step 3: Document the change in your comment**
+**Step 3: Document the change in your comment** (run the Verdict-Time CAS Recheck immediately before the `gh pr edit` below)
 
 ```bash
 # Comment with approval note about the fix
@@ -1217,7 +1274,7 @@ git commit -m "Remove unused import (during evaluation)"
 git push
 ```
 
-**Step 5: Note the fix in your approval comment**
+**Step 5: Note the fix in your approval comment** (run the Verdict-Time CAS Recheck immediately before the `gh pr edit` below)
 
 ```bash
 gh pr comment <number> --body "$(cat <<'EOF'
