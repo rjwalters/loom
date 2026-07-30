@@ -259,6 +259,13 @@ only an explicit non-empty regular file, installs it atomically with mode
 targeting the profile's `CODEX_HOME`—never put a secret in argv or registry
 metadata.
 
+Every lifecycle command is all-or-nothing over the (profile, registry) pair. A
+failed `import` removes the profile it committed; a failed `remove` restores the
+live profile, its registry entry, **and** any `recovery.json` that invocation
+staged, so a later recoverable removal is never blocked by residue from a failed
+one. `--purge` destroys credential bytes only after the registry commit
+succeeds, so no failure leaves a registry entry pointing at deleted credentials.
+
 Select a profile at spawn time by any of:
 
 | Precedence | Env var | Meaning |

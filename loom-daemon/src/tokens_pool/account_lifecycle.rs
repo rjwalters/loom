@@ -397,8 +397,24 @@ impl<R: CodexCommandRunner> AccountLifecycle<R> {
             }
             metadata_result.context("failed to prepare recovery metadata")?;
         }
-        fs::rename(&account.credential_reference, &destination)
-            .context("failed to quarantine profile atomically")?;
+        if let Err(error) = fs::rename(&account.credential_reference, &destination) {
+            // A failed rename leaves the live profile in place, but this
+            // invocation already staged `recovery.json` inside it. Remove only
+            // the metadata this call created so the profile is byte-identical
+            // to its pre-command state and a later recoverable removal is not
+            // blocked by stale metadata at `create_new`. The rename error is
+            // the actionable one, so metadata cleanup is best effort and only
+            // annotates the error when residue actually survives.
+            let metadata_left_behind =
+                !purge && fs::remove_file(&recovery_file).is_err() && recovery_file.exists();
+            let result: Result<RemovalOutcome> =
+                Err(error).context("failed to quarantine profile atomically");
+            return if metadata_left_behind {
+                result.context("recovery metadata rollback also failed")
+            } else {
+                result
+            };
+        }
         if let Err(error) = unregister_codex_account(&self.workspace, name) {
             fs::rename(&destination, &account.credential_reference)
                 .context("account registry update failed and profile rollback also failed")?;
@@ -961,6 +977,60 @@ mod tests {
         assert_eq!(fs::read_to_string(recovery).unwrap(), "recognizable-existing-metadata");
         assert!(!error.contains("recognizable-fake-secret"));
         assert!(!error.contains("recognizable-existing-metadata"));
+        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn quarantine_rename_failure_rolls_back_staged_recovery_metadata() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Permission-based rename injection is meaningless as root.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+
+        let (workspace, root) = setup();
+        let source_dir = tempfile::tempdir().unwrap();
+        let source = source_dir.path().join("auth.json");
+        fs::write(&source, "recognizable-fake-secret").unwrap();
+        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", root.path());
+        let service = AccountLifecycle::new(workspace.path(), FakeRunner::default()).unwrap();
+        service.import("alice", &source).unwrap();
+
+        // Pre-create `.quarantine` so lifecycle setup succeeds, then make the
+        // profile root non-writable. Staging `recovery.json` inside the live
+        // profile still succeeds, but unlinking `alice` from the root during
+        // `fs::rename` fails with EACCES.
+        fs::create_dir(root.path().join(".quarantine")).unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o500)).unwrap();
+        let error = service.remove("alice", false).unwrap_err().to_string();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(error.contains("quarantine"));
+        // The staged metadata this invocation created must not survive.
+        assert!(!root.path().join("alice/recovery.json").exists());
+        assert!(!error.contains("recovery metadata rollback also failed"));
+        // Profile, credential bytes, and registry are all untouched.
+        assert!(root.path().join("alice").join(AUTH_FILE).is_file());
+        assert_eq!(
+            fs::read_to_string(root.path().join("alice").join(AUTH_FILE)).unwrap(),
+            "recognizable-fake-secret"
+        );
+        assert!(service.find("alice").is_ok());
+        assert!(!error.contains("recognizable-fake-secret"));
+        assert!(fs::read_dir(root.path().join(".quarantine"))
+            .unwrap()
+            .next()
+            .is_none());
+
+        // A later recoverable removal is not blocked by stale metadata.
+        let removed = service.remove("alice", false).unwrap();
+        assert!(!removed.purged);
+        assert!(removed.recovery_reference.is_some());
+        assert!(!root.path().join("alice").exists());
+        assert!(service.find("alice").is_err());
         std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
     }
 
