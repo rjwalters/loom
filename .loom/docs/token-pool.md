@@ -351,6 +351,11 @@ newlines/carriage-returns are sanitized to spaces so every `.bad_tokens` record
 is exactly one line — byte-compatible with the Python implementation, and
 conformance-tested against it in `loom-tools/tests/tokens/test_rust_conformance.py`.
 
+How long an entry keeps blocking (auth = permanent, exhaustion = 6h TTL) and how
+long it survives on disk (24h / 30d) are two different clocks — see
+[Permanence: auth vs exhaustion](#permanence-auth-vs-exhaustion-at-read-time-and-on-disk)
+below.
+
 ## Error classification (`.loom/scripts/lib/classify-error.sh`)
 
 The `classify_error <output> <exit_code>` function returns one of `SUCCESS`,
@@ -543,16 +548,75 @@ let an operator dispatch onto a still-poisoned pool), `unblock` now **names the
 still-blocked accounts and exits `3`**. Re-run with `--all-reasons` to drop them,
 or wait for the cooldown to expire them automatically.
 
-**Reason-aware bad-token TTL**: bad-tokens entries whose reason is `auth` (401 /
-OAuth / expired / blocked) persist until `loom-daemon tokens unblock`. Non-auth
-("exhausted"/"rate-limited") entries stop blocking selection once they age past
-the exhaustion cooldown (`LOOM_TOKEN_EXHAUSTION_COOLDOWN_SECS`, default 21600s =
-6h) — enforced at selection time in **both** the Rust daemon and the live Python
-spawn path (`is_bad`), so a recovered account re-enters the pool with no operator
-action even before `cleanup_bad_tokens` prunes the line from disk. Before #4212
-only the Rust path honored the cooldown, so on the live Python spawn path a stale
-`exhausted` marker outlived its rate-limit reset and wedged the account until a
-manual `unblock`.
+### Permanence: auth vs exhaustion, at read time and on disk
+
+There are **two independent clocks**, and conflating them is what made the
+2026-07-30 incident (#4643) hard to read. The table is the contract the error
+text, the CLI, and this document all agree on:
+
+| Reason class | Blocks selection until | Pruned from `.bad_tokens` after |
+|---|---|---|
+| `auth` (401 / OAuth / expired / blocked) | `loom-daemon tokens unblock <name>` — **never expires** | 30d (`AUTH_ENTRY_MIN_RETENTION_SECS`), a garbage-collection floor, *not* an expiry |
+| non-auth (`exhausted` / `rate-limited`) | the **exhaustion cooldown** — `LOOM_TOKEN_EXHAUSTION_COOLDOWN_SECS`, default `21600` (6h) | 24h (`DEFAULT_CLEANUP_MAX_AGE_SECS`) |
+| unparseable timestamp | never (**fail-closed** — a malformed line never silently un-blocks a token) | never (malformed lines are always retained) |
+
+**Read time** (`bad_tokens::is_bad` / `blocking_entry`, enforced by the selector
+on every tier): a non-auth entry stops blocking once it ages past the cooldown,
+so a recovered account re-enters rotation with **no operator action** even
+before the line is pruned from disk (#4122). Auth entries are exempt from that
+TTL by design — a broken credential does not heal on a timer.
+
+**On disk** (`bad_tokens::cleanup_bad_tokens`, wired in #4643 into `tokens
+select` and `tokens check`): entries older than the max-age policy above are
+dropped. The auth floor is deliberately far longer than the routine 24h policy,
+because pruning an auth line *would* silently readmit a broken credential —
+the on-disk clock must never become a back-door expiry for the permanent class.
+Cleanup is best-effort and takes **no lock at all** when nothing is prunable, so
+a burst of concurrent spawns never serializes on `.bad_tokens`. Before #4643
+`cleanup_bad_tokens` had zero callers anywhere in the tree and pools accumulated
+entries indefinitely.
+
+**The oldest visible entry is usually not the deciding one.** Every failed spawn
+appends a *new* line, so an account with a genuinely long-lived limit (e.g.
+`hit your weekly limit`, which outlasts the 6h cooldown by days) is
+continuously re-marked: the 13h-old lines at the top of the file expired long
+ago, while a fresh line further down is what actually blocks. `blocking_entry`
+reports the deciding line, and the empty-pool error prints its timestamp — read
+that, not the head of the file.
+
+### Empty-pool error detail (#4643)
+
+When every account is excluded, `tokens select` no longer prints a bare "All N
+tokens … are marked bad or empty". It enumerates, per account, the exclusion
+cause, the reason class and its permanence, the deciding entry's own timestamp,
+and the cooldown remaining — plus the **identity of the binary that decided**
+(version, build commit, build timestamp):
+
+```
+error: All 2 tokens in ~/.loom/tokens are marked bad or empty.
+  - agent-1: bad-marked [exhaustion, TTL] at 2026-07-30T16:58:32Z — "exhausted: hit your weekly limit"; clears in 5h48m
+  - agent-2: bad-marked [auth, permanent] at 2026-07-29T21:33:41Z — "401 unauthorized"; needs `loom-daemon tokens unblock agent-2`
+  deciding binary: loom-daemon 0.16.0 (commit 105f9c12, built 2026-07-30T05:23:19Z)
+  exhaustion cooldown: 21600s (override LOOM_TOKEN_EXHAUSTION_COOLDOWN_SECS); auth entries never expire …
+```
+
+`spawn-claude.sh` additionally logs the resolved daemon binary path and its
+`--version` at token-selection time, on every spawn:
+
+```
+spawn-claude: token-selection binary: /home/you/.local/bin/loom-daemon (loom-daemon 0.16.0 (commit 105f9c12, built 2026-07-30T05:23:19Z))
+```
+
+Both exist because the selection binary is resolved by `spawn-claude.sh` itself
+(`$LOOM_DAEMON_BIN` → PATH → build-output candidates), **independently of any
+running daemon** — so a long-running daemon can hand a sweep child a binary that
+predates the last merged selection fix. That "stale binary at the selection
+site" hypothesis is now answerable straight from `.loom/logs/sweep-issue-<N>.log`
+instead of by reading Rust source. (For the 2026-07-30 incident itself the
+hypothesis was **refuted** — the host's resolvable binaries were all descendants
+of the cooldown fix — but confirming that required inspecting the host's
+installed binaries after the fact, which is exactly the forensics this log line
+removes.)
 
 **Auto-unpin** (`failure_counts`): the wrapper tracks consecutive
 `TOKEN_EXHAUSTED` failures per account in `.loom/tokens/.failure_counts` (JSON).

@@ -53,15 +53,11 @@ use tokio::net::UnixStream;
 // fresh ones and cause hard-to-diagnose install regressions (#3287 class).
 // `LOOM_DAEMON_GIT_COMMIT` and `LOOM_DAEMON_BUILD_TIME` are populated by
 // `build.rs`; both fall back to "unknown" when the build host lacks the
-// tooling, which is loud but harmless.
-#[command(version = concat!(
-    env!("CARGO_PKG_VERSION"),
-    " (commit ",
-    env!("LOOM_DAEMON_GIT_COMMIT"),
-    ", built ",
-    env!("LOOM_DAEMON_BUILD_TIME"),
-    ")"
-))]
+// tooling, which is loud but harmless. The composed string lives in the lib
+// crate (`self_update::BUILD_IDENTITY`) so library code that must name the
+// deciding binary — e.g. the empty-token-pool error (#4643) — reports exactly
+// what `--version` reports.
+#[command(version = loom_daemon::self_update::BUILD_IDENTITY)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -7244,6 +7240,15 @@ fn handle_tokens_command(action: TokensAction) -> Result<()> {
                     eprintln!("{msg}");
                 }
             }
+            // Routine `.bad_tokens` hygiene (#4643). `cleanup_bad_tokens` had
+            // zero callers in the whole tree, so pools accumulated expired
+            // exhaustion entries forever (the live shared pool still held
+            // days-old lines). Selection is the routine path every spawn takes,
+            // and pruning is behavior-neutral — `is_bad` already ignores
+            // aged-out entries — so this only bounds the file. Best-effort:
+            // never let a cleanup failure block a spawn, and no lock is taken
+            // at all when there is nothing to prune.
+            let _ = bad_tokens::cleanup_bad_tokens(&ws, bad_tokens::DEFAULT_CLEANUP_MAX_AGE_SECS);
             match select::select_token(&ws, None) {
                 Ok(sel) => {
                     if export {
@@ -7486,6 +7491,26 @@ fn handle_tokens_command(action: TokensAction) -> Result<()> {
                      workspace; anchoring to the shared machine-level pool at {} (issue #4292)",
                     tokens_dir.display()
                 );
+            }
+
+            // Routine `.bad_tokens` hygiene (#4643) — the second wired path.
+            // `tokens check` is the low-frequency periodic probe (the daemon's
+            // ranking refresh runs it on a cadence), so it prunes the pool the
+            // check is actually anchored to, which may be the shared
+            // machine-level pool rather than `resolve_tokens_dir(workspace)`.
+            match bad_tokens::cleanup_bad_tokens_in_dir(
+                &tokens_dir,
+                bad_tokens::DEFAULT_CLEANUP_MAX_AGE_SECS,
+            ) {
+                Ok(outcome) if outcome.removed > 0 => eprintln!(
+                    "note: pruned {} expired .bad_tokens entr{} older than {}h ({} retained)",
+                    outcome.removed,
+                    if outcome.removed == 1 { "y" } else { "ies" },
+                    bad_tokens::DEFAULT_CLEANUP_MAX_AGE_SECS / 3600,
+                    outcome.kept,
+                ),
+                Ok(_) => {}
+                Err(e) => eprintln!("warning: .bad_tokens cleanup skipped: {e}"),
             }
 
             let source_flag = match source {

@@ -28,6 +28,23 @@ use std::process::Command;
 /// (e.g. a release-tarball build with no `.git` present).
 pub const BUILT_COMMIT: &str = env!("LOOM_DAEMON_GIT_COMMIT");
 
+/// The full build identity of this binary — `"<version> (commit <sha>, built
+/// <ts>)"` — as shown by `loom-daemon --version`.
+///
+/// Lives here (the lib crate) rather than inline in `main.rs` so library code
+/// can stamp it into operator-facing failures too: the empty-token-pool error
+/// names the deciding binary (#4643) precisely because "which binary made this
+/// decision?" was unanswerable from the 2026-07-30 incident logs. `main.rs`'s
+/// clap `--version` string is this same constant, so the two can never drift.
+pub const BUILD_IDENTITY: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (commit ",
+    env!("LOOM_DAEMON_GIT_COMMIT"),
+    ", built ",
+    env!("LOOM_DAEMON_BUILD_TIME"),
+    ")"
+);
+
 /// This crate's own directory in the source tree it was compiled from, baked
 /// in at compile time via `CARGO_MANIFEST_DIR` — the same
 /// compiled-from-source-tree technique the (retired in #4228)
