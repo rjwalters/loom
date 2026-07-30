@@ -2441,6 +2441,46 @@ never wedge the daemon. It is GitHub-only (uses the `closedByPullRequestsReferen
 closes-graph, filtered to `state == "OPEN"`); a Gitea workspace fails open and
 keeps today's behavior.
 
+**Park-label dispatch guard (#4444, step 2.7).** The `loom:blocked` /
+`loom:operator-only` **park** labels are the state machine's only "take this out
+of automation" signal, and until #4444 they were enforced *only* in the
+work-finder's candidate query (`SKIP_LABELS`) — one of six dispatch routes. Every
+other route (all three watchdogs, the reaper's checkpoint-resume, the epic
+supervisor, the IPC/CLI `dispatch_sweep`) funnels through
+`SweepRegistry::dispatch()` without re-reading the forge labels, so a park applied
+*after* the original dispatch was invisible to them and the daemon re-claimed
+deliberately parked work (observed on #4366). Step 2.7 — immediately after the
+2.6 open-PR guard, still before the claim lock and label flip — refuses any
+dispatch whose issue currently carries a park label, with a typed
+`ParkedIssueDispatchError` the work finder attributes to `labeled-skip` (never to
+`error(s)`). Four properties are load-bearing:
+
+- **`PARK_LABELS`, not `SKIP_LABELS`.** The guard keys on the
+  `loom:blocked` / `loom:operator-only` subset only. `loom:building` is
+  *legitimately* present on a watchdog re-dispatch or a checkpoint-resume of the
+  daemon's **own** claim, so refusing it would break exactly the recovery paths
+  this guard is meant to constrain. The two constants live side by side in
+  `work_finder.rs` (`SKIP_LABELS` is composed as `BUILDING_LABEL` +
+  `PARK_LABELS`), so they cannot drift.
+- **The #4256 resume bypass does not exempt it.** `resume_bypass_pr` exempts step
+  **2.6** for a sweep's own open PR and nothing else — a park applied after the
+  crash still stops the resume. The refusal stays failure-visible: the reaper
+  logs it and still publishes `sweep.issue.{N}.resume_dispatched` with
+  `dispatched: false`.
+- **REST, not GraphQL.** The probe is `gh api repos/{owner}/{repo}/issues/{N}
+  --jq '.labels[].name'`, a *different* rate-limit bucket from the GraphQL calls
+  steps 2.5/2.6 ride — so a park still holds while the GraphQL quota is
+  exhausted, the condition under which the #4123 guard failed open during the
+  2026-07-29 incident.
+- **Fail-open and fixture-safe.** Any `gh` error, timeout, or unresolvable repo
+  lets dispatch proceed (a forge outage must never wedge the daemon), and the
+  probe is skipped entirely when label flips are disabled (`skip_label_flip`).
+
+Operator note: because this covers the IPC/CLI route too, a manual
+`dispatch_sweep` on a parked issue is refused by design — clear the park label
+first (or use `loom-daemon quarantine clear <N>` when the park came from the
+insta-crash quarantine) rather than expecting a manual dispatch to override it.
+
 **Cost / default.** Enabling detection adds exactly one `gh issue view --json
 labels` round-trip per dispatch (measured ~0.4s against GitHub), bounded by the
 same `LOOM_REAP_GH_TIMEOUT_SECS` ceiling as the other best-effort `gh` calls.
@@ -2469,9 +2509,12 @@ Every other dispatch path still refuses via `OpenPrDispatchError`, so
 a `sweep.issue.{N}.resume_dispatched` event (`{pr, checkpoint_phase?,
 dispatched, repo?}`) is published — with `dispatched: false` on the rare
 case the resume dispatch call itself fails — and narrated over Safehouse
-(when enabled) as a `handoff`. The `restore_label_to_ready` operator-park
-guard (#4206) still applies: an issue carrying `loom:blocked` is never
-resume-dispatched.
+(when enabled) as a `handoff`. Operator parks still win: `restore_label_to_ready`
+preserves a `loom:blocked` label instead of flipping it back to `loom:issue`
+(#4206), and the resume dispatch itself is refused by the **step 2.7 park-label
+guard** (#4444) — which the 2.6 resume bypass deliberately does not exempt — so a
+park applied after the crash surfaces as `dispatched: false` rather than an
+overridden park.
 
 ### Completion narration → public fleet feed (#4426)
 
