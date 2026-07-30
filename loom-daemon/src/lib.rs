@@ -184,6 +184,7 @@ pub mod script_helpers;
 pub mod self_update;
 pub mod serve;
 pub mod sweep_journal;
+pub mod sweep_outcomes;
 pub mod sweep_registry;
 pub mod terminal;
 pub mod token_ranking_refresh;
