@@ -88,9 +88,22 @@ else
       if [[ "$status" == "CLOSED" ]]; then
           echo -e "${GREEN}✓${NC} Issue #$issue_num is CLOSED - deleting $branch"
           if [[ "$DRY_RUN" == false ]]; then
-              git branch -D "$branch" 2>/dev/null
+              # `git branch -D` exits non-zero when the branch is checked out in
+              # a linked worktree. Under `set -e` a bare, error-swallowed delete
+              # would abort the whole script mid-run — before the pr-* review
+              # pass below ever executes — while still printing the "deleting"
+              # line and counting a success. Make the delete non-fatal and keep
+              # the counters honest (#4405). Same reasoning as the `((var++))`
+              # fix: a single un-deletable branch must not sink the entire run.
+              if git branch -D "$branch" 2>/dev/null; then
+                  closed=$((closed + 1))
+              else
+                  echo -e "${YELLOW}⚠${NC} Could not delete $branch (checked out in a worktree?) - keeping"
+                  errors=$((errors + 1))
+              fi
+          else
+              closed=$((closed + 1))
           fi
-          closed=$((closed + 1))
       elif [[ "$status" == "OPEN" ]]; then
           echo -e "${BLUE}○${NC} Issue #$issue_num is OPEN - keeping $branch"
           open=$((open + 1))
@@ -110,7 +123,7 @@ else
   fi
   echo -e "  ${BLUE}Kept${NC}:    $open (open issues)"
   if [[ $errors -gt 0 ]]; then
-      echo -e "  ${YELLOW}Errors${NC}:  $errors (issue not found)"
+      echo -e "  ${YELLOW}Errors${NC}:  $errors (issue not found / branch not deletable)"
   fi
 fi
 

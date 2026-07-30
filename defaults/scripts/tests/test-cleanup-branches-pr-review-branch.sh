@@ -30,6 +30,12 @@
 #      (f) a merged-PR branch that is the PRIMARY checkout's own HEAD takes
 #          _is_primary_worktree_path's specialized remediation path (which
 #          also reads $DEFAULT_BRANCH_NAME) without aborting.
+#      (g) a CLOSED-issue feature/issue-* branch checked out in a LINKED
+#          worktree: the pre-existing feature loop's raw `git branch -D`
+#          refuses, and under `set -e` a bare delete would abort the whole
+#          script before the new pr-* pass runs. The run must exit 0, still
+#          print the pr-* pass header, and still clean a later merged-PR
+#          pr-* branch (#4405 third-pass regression).
 #
 # Companion to test-merge-pr-local-branch-cleanup.sh, which tests
 # `_maybe_delete_local_branch` itself (the safety check this script reuses).
@@ -144,6 +150,7 @@ cat > "$FAKE_BIN/gh" <<EOF
 if [[ "\$1" == "issue" && "\$2" == "view" ]]; then
   case "\$3" in
     300) echo "OPEN" ;;
+    999) echo "CLOSED" ;;
     *) echo "NOT_FOUND" ;;
   esac
   exit 0
@@ -154,6 +161,7 @@ if [[ "\$1" == "pr" && "\$2" == "view" ]]; then
     101) echo '{"state":"MERGED","headRefOid":"$HEAD_SHA"}' ;;
     102) echo '{"state":"MERGED","headRefOid":"$HEAD_SHA"}' ;;
     103) echo '{"state":"CLOSED","headRefOid":"$HEAD_SHA"}' ;;
+    105) echo '{"state":"MERGED","headRefOid":"$HEAD_SHA"}' ;;
     200) echo '{"state":"OPEN","headRefOid":"$HEAD_SHA"}' ;;
     *) exit 1 ;;
   esac
@@ -301,6 +309,63 @@ fi
 
 git -C "$REPO" checkout -q main
 git -C "$REPO" branch -D pr-104 >/dev/null 2>&1 || true
+
+# --- (g): a CLOSED-issue feature/issue-* branch checked out in a LINKED
+#     worktree must not abort the run. The pre-existing feature loop deletes
+#     CLOSED-issue branches with a raw `git branch -D`; when the branch is
+#     checked out elsewhere that delete exits 1, and under `set -e` a bare,
+#     error-swallowed delete aborts the whole script — BEFORE the new pr-*
+#     review pass ever runs, silently leaking every orphaned pr-* branch
+#     (#4405, third-pass regression). Assert: (a) exit 0, (b) the pr-* pass
+#     header still prints, and (c) a later merged-PR pr-* branch is still
+#     cleaned (i.e. the run reached the second pass at all).
+git -C "$REPO" branch feature/issue-999 main
+git -C "$REPO" worktree add -q "$TMP_ROOT/wt-999" feature/issue-999 >/dev/null 2>&1
+git -C "$REPO" branch pr-105 main
+
+set +e
+feat_output="$(cd "$REPO" && PATH="$FAKE_BIN:$PATH" ./scripts/cleanup-branches.sh 2>&1)"
+feat_rc=$?
+set -e
+
+if [[ $feat_rc -eq 0 ]]; then
+    pass "(g) run exits 0 when a CLOSED-issue feature branch is checked out in a linked worktree"
+else
+    fail "(g) run exited $feat_rc (expected 0); got: $feat_output"
+fi
+
+if [[ "$feat_output" != *"command not found"* ]]; then
+    pass "(g) no crash before the pr-* pass when the feature delete refuses"
+else
+    fail "(g) hit a crash in the feature loop; got: $feat_output"
+fi
+
+if git -C "$REPO" show-ref --verify --quiet refs/heads/feature/issue-999; then
+    pass "(g) the checked-out CLOSED-issue feature branch is kept, not force-deleted"
+else
+    fail "(g) feature/issue-999 was deleted despite being checked out in a linked worktree"
+fi
+
+if [[ "$feat_output" == *"Could not delete feature/issue-999"* ]]; then
+    pass "(g) reports the feature-branch refusal instead of silently mis-counting it"
+else
+    fail "(g) expected a 'Could not delete feature/issue-999' warning; got: $feat_output"
+fi
+
+if [[ "$feat_output" == *"Checking PR review-branch status"* ]]; then
+    pass "(g) the pr-* review pass still runs after the feature-loop refusal"
+else
+    fail "(g) the pr-* pass never ran (feature loop aborted the script); got: $feat_output"
+fi
+
+if ! git -C "$REPO" show-ref --verify --quiet refs/heads/pr-105; then
+    pass "(g) a later merged-PR pr-* branch is still cleaned (run reached the second pass)"
+else
+    fail "(g) pr-105 was not cleaned — the run aborted before the pr-* pass; got: $feat_output"
+fi
+
+git -C "$REPO" worktree remove --force "$TMP_ROOT/wt-999" >/dev/null 2>&1 || true
+git -C "$REPO" branch -D feature/issue-999 >/dev/null 2>&1 || true
 
 # --- Summary ---
 echo ""
