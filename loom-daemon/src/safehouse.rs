@@ -1757,19 +1757,43 @@ const RECONCILE_PR_FIELDS: &str =
     "number,headRefName,url,mergedAt,createdAt,title,additions,deletions";
 
 /// How many of the most-recently-merged PRs one reconciliation pass inspects
-/// per workspace. Bounded rather than time-windowed for simplicity — a repo
-/// merging more than this between two reconciliation ticks would need a
-/// smaller [`reconcile_interval`], not a larger limit.
+/// per workspace. A repo merging more than this between two reconciliation
+/// ticks would need a smaller [`reconcile_interval`], not a larger limit.
 const RECONCILE_PR_LIMIT: u32 = 30;
+
+/// Test/operator override for the reconciliation lookback window, in seconds.
+const RECONCILE_MAX_AGE_ENV: &str = "LOOM_SAFEHOUSE_RECONCILE_MAX_AGE_SECS";
+
+/// How far back a reconciliation pass will narrate a merge it has never seen
+/// (issue #4583). [`RECONCILE_PR_LIMIT`] alone bounds a *burst* but not its
+/// *staleness*: the very first pass on a host that has never persisted a dedup
+/// set — a fresh install, an upgrade to this version, or a lost/corrupt
+/// completions file — would otherwise backfill the public feed with the last 30
+/// merges regardless of age, which in a low-traffic workspace means narrating
+/// months-old PRs as if they just landed. Seven days is well beyond any
+/// plausible daemon outage (the case AC3 asks us to recover), so a merge that
+/// happens while the daemon is down is still picked up on restart, while
+/// genuinely ancient history stays out of the feed.
+const DEFAULT_RECONCILE_MAX_AGE_SECS: i64 = 7 * 24 * 60 * 60;
+
+fn reconcile_max_age() -> chrono::Duration {
+    let secs = env_nonempty(RECONCILE_MAX_AGE_ENV)
+        .and_then(|s| s.parse::<i64>().ok())
+        .filter(|s| *s >= 0)
+        .unwrap_or(DEFAULT_RECONCILE_MAX_AGE_SECS);
+    chrono::Duration::seconds(secs)
+}
 
 /// Best-effort bulk `gh pr list --state merged` lookup across **all** recently
 /// merged PRs in `workspace_root` (issue #4583) — unlike [`fetch_merged_pr`]
 /// this is not filtered to one issue's branch, which is exactly what lets it
 /// discover a merge the branch-scoped, `SweepExited`-triggered lookup never
-/// ran for (no sweep, no trigger). Every failure — missing `gh`, no network,
-/// unauthenticated, timeout, malformed JSON, an unparsable row — degrades that
-/// row (or the whole call) to being silently skipped; a best-effort
-/// reconciliation pass must never panic or block the sink.
+/// ran for (no sweep, no trigger). Rows merged longer than
+/// [`reconcile_max_age`] ago are dropped here, so a first-ever pass cannot
+/// backfill stale history onto the feed. Every failure — missing `gh`, no
+/// network, unauthenticated, timeout, malformed JSON, an unparsable row —
+/// degrades that row (or the whole call) to being silently skipped; a
+/// best-effort reconciliation pass must never panic or block the sink.
 async fn fetch_recent_merged_prs(workspace_root: &Path) -> Vec<ReconciledMergedPr> {
     let gh_bin = env_nonempty(GH_BIN_ENV).unwrap_or_else(|| "gh".to_owned());
     let run = tokio::process::Command::new(&gh_bin)
@@ -1795,6 +1819,7 @@ async fn fetch_recent_merged_prs(workspace_root: &Path) -> Vec<ReconciledMergedP
     let Some(array) = rows.as_array() else {
         return Vec::new();
     };
+    let cutoff = Utc::now() - reconcile_max_age();
     array
         .iter()
         .filter_map(|row| {
@@ -1807,6 +1832,11 @@ async fn fetch_recent_merged_prs(workspace_root: &Path) -> Vec<ReconciledMergedP
             let merged_at = DateTime::parse_from_rfc3339(merged_at_str)
                 .ok()?
                 .with_timezone(&Utc);
+            // Outside the lookback window: never narrated, and now too old to
+            // start (see `DEFAULT_RECONCILE_MAX_AGE_SECS`).
+            if merged_at < cutoff {
+                return None;
+            }
             let created_at = row
                 .get("createdAt")
                 .and_then(Value::as_str)
@@ -5002,18 +5032,40 @@ mod tests {
 
     // ---- periodic merge reconciliation: the champion-merge path (#4583) ----
 
-    /// A bulk `gh pr list --state merged` row shape (the reconciliation query):
-    /// carries `headRefName`/`createdAt` on top of the per-issue lookup's
+    /// One bulk `gh pr list --state merged` row (the reconciliation query
+    /// shape): `headRefName`/`createdAt` on top of the per-issue lookup's
     /// fields, since the bulk query is not filtered to one issue's branch and
     /// has no live sweep clock to borrow `started_at` from.
-    const RECONCILE_MERGED_PR_JSON: &str = r#"[{"number":4610,"headRefName":"feature/issue-4610","url":"https://github.com/rjwalters/loom/pull/4610","mergedAt":"2026-07-29T18:40:00Z","createdAt":"2026-07-29T18:10:00Z","title":"fix: champion-merge safehouse gap","additions":120,"deletions":18}]"#;
+    ///
+    /// Timestamps are **relative to now** rather than literals: the pass drops
+    /// rows merged longer than [`reconcile_max_age`] ago, so hard-coded dates
+    /// would silently turn every reconciliation test into a no-op assertion
+    /// once wall-clock time drifted a week past them.
+    fn reconcile_pr_row(issue: u32, merged_minutes_ago: i64, title: &str) -> String {
+        let merged_at = Utc::now() - chrono::Duration::minutes(merged_minutes_ago);
+        let created_at = merged_at - chrono::Duration::minutes(30);
+        format!(
+            r#"{{"number":{issue},"headRefName":"feature/issue-{issue}","url":"https://github.com/rjwalters/loom/pull/{issue}","mergedAt":"{}","createdAt":"{}","title":"{title}","additions":120,"deletions":18}}"#,
+            merged_at.to_rfc3339(),
+            created_at.to_rfc3339(),
+        )
+    }
+
+    /// The single-row response used by most reconciliation tests: issue #4610,
+    /// merged well inside the lookback window.
+    fn reconcile_merged_pr_json() -> String {
+        format!("[{}]", reconcile_pr_row(4610, 20, "fix: champion-merge safehouse gap"))
+    }
 
     /// Two merged PRs in one bulk response: issue #4610 (already narrated
     /// in-sweep) and issue #4611 (a distinct, not-yet-narrated champion merge).
-    const RECONCILE_TWO_MERGED_PRS_JSON: &str = r#"[
-        {"number":4610,"headRefName":"feature/issue-4610","url":"https://github.com/rjwalters/loom/pull/4610","mergedAt":"2026-07-29T18:40:00Z","createdAt":"2026-07-29T18:10:00Z","title":"fix: champion-merge safehouse gap","additions":120,"deletions":18},
-        {"number":4611,"headRefName":"feature/issue-4611","url":"https://github.com/rjwalters/loom/pull/4611","mergedAt":"2026-07-29T19:05:00Z","createdAt":"2026-07-29T18:50:00Z","title":"docs: unrelated cleanup","additions":4,"deletions":1}
-    ]"#;
+    fn reconcile_two_merged_prs_json() -> String {
+        format!(
+            "[{},{}]",
+            reconcile_pr_row(4610, 20, "fix: champion-merge safehouse gap"),
+            reconcile_pr_row(4611, 5, "docs: unrelated cleanup"),
+        )
+    }
 
     #[tokio::test]
     #[serial]
@@ -5022,8 +5074,11 @@ mod tests {
         // at merge time — the champion-tick steady state), so the only way it
         // is discovered at all is the bulk reconciliation query.
         let dir = tempfile::tempdir().unwrap();
-        let (fake_gh, _log) =
-            write_fake_forge_gh(dir.path(), Some(RECONCILE_MERGED_PR_JSON), Some("rjwalters/loom"));
+        let (fake_gh, _log) = write_fake_forge_gh(
+            dir.path(),
+            Some(&reconcile_merged_pr_json()),
+            Some("rjwalters/loom"),
+        );
         std::env::set_var(GH_BIN_ENV, &fake_gh);
 
         let root = dir.path().to_string_lossy().into_owned();
@@ -5056,8 +5111,11 @@ mod tests {
         // its bulk query and must not double-post it — the two trigger paths
         // share one dedup set.
         let dir = tempfile::tempdir().unwrap();
-        let (fake_gh, log) =
-            write_fake_forge_gh(dir.path(), Some(RECONCILE_MERGED_PR_JSON), Some("rjwalters/loom"));
+        let (fake_gh, log) = write_fake_forge_gh(
+            dir.path(),
+            Some(&reconcile_merged_pr_json()),
+            Some("rjwalters/loom"),
+        );
         std::env::set_var(GH_BIN_ENV, &fake_gh);
 
         let root = dir.path().to_string_lossy().into_owned();
@@ -5105,7 +5163,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (fake_gh, _log) = write_fake_forge_gh(
             dir.path(),
-            Some(RECONCILE_TWO_MERGED_PRS_JSON),
+            Some(&reconcile_two_merged_prs_json()),
             Some("rjwalters/loom"),
         );
         std::env::set_var(GH_BIN_ENV, &fake_gh);
@@ -5126,6 +5184,63 @@ mod tests {
         assert_eq!(envelopes[0].meta.as_ref().unwrap()["issue"], json!(4611));
         assert!(completed.contains(&(root.clone(), 4610)));
         assert!(completed.contains(&(root, 4611)));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn reconcile_recent_merges_ignores_merges_older_than_the_lookback_window() {
+        // The first pass on a host with no persisted dedup set (fresh install,
+        // upgrade, lost completions file) must not backfill the public feed
+        // with stale history: `RECONCILE_PR_LIMIT` bounds the burst size, the
+        // lookback window bounds its age. Here the older row is outside the
+        // window and the newer one is inside, with an empty dedup set — so only
+        // the recent merge may be narrated.
+        let dir = tempfile::tempdir().unwrap();
+        let rows = format!(
+            "[{},{}]",
+            reconcile_pr_row(4610, 240, "chore: merged long before this daemon started"),
+            reconcile_pr_row(4611, 5, "fix: just merged by a champion tick"),
+        );
+        let (fake_gh, _log) = write_fake_forge_gh(dir.path(), Some(&rows), Some("rjwalters/loom"));
+        std::env::set_var(GH_BIN_ENV, &fake_gh);
+        // One hour of lookback: the 240-minute-old row falls outside it.
+        std::env::set_var(RECONCILE_MAX_AGE_ENV, "3600");
+
+        let root = dir.path().to_string_lossy().into_owned();
+        let mut slug_cache = HashMap::new();
+        let mut completed = std::collections::HashSet::new();
+        let envelopes =
+            reconcile_recent_merges("loom_daemon", &root, &mut slug_cache, &mut completed, None)
+                .await;
+
+        std::env::remove_var(GH_BIN_ENV);
+        std::env::remove_var(RECONCILE_MAX_AGE_ENV);
+        assert_eq!(envelopes.len(), 1, "only the in-window merge may be narrated");
+        assert_eq!(envelopes[0].meta.as_ref().unwrap()["issue"], json!(4611));
+        assert!(
+            !completed.contains(&(root.clone(), 4610)),
+            "an out-of-window row is skipped before the dedup set, so a later in-window \
+             observation of it (e.g. a resumed sweep's SweepExited) can still narrate"
+        );
+        assert!(completed.contains(&(root, 4611)));
+    }
+
+    #[test]
+    #[serial]
+    fn reconcile_max_age_defaults_and_honours_its_env_override() {
+        std::env::remove_var(RECONCILE_MAX_AGE_ENV);
+        assert_eq!(reconcile_max_age(), chrono::Duration::seconds(DEFAULT_RECONCILE_MAX_AGE_SECS));
+
+        std::env::set_var(RECONCILE_MAX_AGE_ENV, "600");
+        assert_eq!(reconcile_max_age(), chrono::Duration::seconds(600));
+
+        // Garbage and negatives fall back to the default rather than degrading
+        // into a window that silently narrates nothing.
+        std::env::set_var(RECONCILE_MAX_AGE_ENV, "not-a-number");
+        assert_eq!(reconcile_max_age(), chrono::Duration::seconds(DEFAULT_RECONCILE_MAX_AGE_SECS));
+        std::env::set_var(RECONCILE_MAX_AGE_ENV, "-5");
+        assert_eq!(reconcile_max_age(), chrono::Duration::seconds(DEFAULT_RECONCILE_MAX_AGE_SECS));
+        std::env::remove_var(RECONCILE_MAX_AGE_ENV);
     }
 
     #[test]
@@ -5167,8 +5282,11 @@ mod tests {
         // purely from the registered workspace + the bulk `gh pr list` query.
         let dir = tempfile::tempdir().unwrap();
         let _safehouse_test_paths = SafehouseTestPaths::set(dir.path());
-        let (fake_gh, _log) =
-            write_fake_forge_gh(dir.path(), Some(RECONCILE_MERGED_PR_JSON), Some("rjwalters/loom"));
+        let (fake_gh, _log) = write_fake_forge_gh(
+            dir.path(),
+            Some(&reconcile_merged_pr_json()),
+            Some("rjwalters/loom"),
+        );
         std::env::set_var(GH_BIN_ENV, &fake_gh);
         // A fast reconciliation cadence so the test does not wait minutes.
         std::env::set_var(RECONCILE_INTERVAL_ENV, "20");
@@ -5231,8 +5349,11 @@ mod tests {
         // `load_persisted_completed` (exactly what `run_sink` calls at
         // startup) is what makes that survive the restart.
         let dir = tempfile::tempdir().unwrap();
-        let (fake_gh, _log) =
-            write_fake_forge_gh(dir.path(), Some(RECONCILE_MERGED_PR_JSON), Some("rjwalters/loom"));
+        let (fake_gh, _log) = write_fake_forge_gh(
+            dir.path(),
+            Some(&reconcile_merged_pr_json()),
+            Some("rjwalters/loom"),
+        );
         std::env::set_var(GH_BIN_ENV, &fake_gh);
 
         let root = dir.path().to_string_lossy().into_owned();

@@ -565,12 +565,12 @@ what feeds the public fleet feed on 2amlogic.com. Loom is the producer:
      — it structurally cannot see a PR that merges *after* the sweep already
      exited, which is the **common steady-state path**: builder opens a PR,
      judge approves, the sweep exits, and champion merges it minutes-to-hours
-     later on its own cron tick. On a fixed cadence (`safehouse.reconcile
-     Interval`, default 5 minutes; `LOOM_SAFEHOUSE_RECONCILE_INTERVAL_MS`
-     overrides it, primarily a test seam), the sink round-robins one workspace
-     at a time — drawn from the union of every repo it has observed a
-     stamped-`repo` event for and the on-disk `WorkspaceRegistry` — and runs
-     one **bulk**, branch-unfiltered `gh pr list --state merged --json
+     later on its own cron tick. On a fixed cadence (5 minutes;
+     `LOOM_SAFEHOUSE_RECONCILE_INTERVAL_MS` overrides it, primarily a test
+     seam), the sink round-robins one workspace at a time — drawn from the
+     union of every repo it has observed a stamped-`repo` event for and the
+     on-disk `WorkspaceRegistry` — and runs one **bulk**, branch-unfiltered
+     `gh pr list --state merged --json
      number,headRefName,url,mergedAt,createdAt,title,additions,deletions
      --limit 30`. Each row's issue number is recovered from `headRefName` via
      the `feature/issue-<N>` convention
@@ -581,6 +581,16 @@ what feeds the public fleet feed on 2amlogic.com. Loom is the producer:
      paths funnel through the same envelope-build/dedup-insert core
      (`build_and_narrate_completion`), so "exactly one completion per merge"
      holds regardless of which path observes it first.
+     - **Lookback window**: rows merged more than **7 days** ago are dropped
+       before the dedup check (`LOOM_SAFEHOUSE_RECONCILE_MAX_AGE_SECS`
+       overrides; garbage/negative values fall back to the default). `--limit
+       30` bounds a burst's *size*, not its *age* — without the window, the
+       first pass on a host with no persisted dedup set (fresh install, the
+       upgrade to this version, a lost/corrupt completions file) would backfill
+       the feed with the last 30 merges however old they are, which in a
+       low-traffic workspace means narrating months-old PRs as if they just
+       landed. Seven days is far beyond any plausible daemon outage, so the
+       daemon-was-down case below still recovers.
 - **`meta` (`completion-v1`)**: `{schema, agent, repo, ref, result, started_at,
   completed_at}` required, plus optional `issue`/`tokens`/`title`/`additions`/
   `deletions` (envelope-v1 preserves unknown `meta` keys, so no schema rev is
@@ -630,8 +640,13 @@ what feeds the public fleet feed on 2amlogic.com. Loom is the producer:
   startup — the in-memory set alone would not survive a daemon restart, which
   would otherwise either re-post every prior completion (if reconciliation's
   lookback window still covered them) or silently drop a merge that happened
-  while the daemon was down. Downstream ingest is additionally idempotent on
-  `event_id`.
+  while the daemon was down. It is written atomically (temp file + rename) and
+  every failure to read or write it is best-effort — a corrupt or unwritable
+  file degrades to "the pre-#4583 behavior, plus a bounded re-narration window",
+  never to a crash. It grows by one `["<workspace>", <issue>]` pair (~32 bytes)
+  per narrated completion and is never pruned; at Loom's own merge rate that is
+  a couple of MB per decade, so no compaction is implemented. Downstream ingest
+  is additionally idempotent on `event_id`.
 - **Strict client-side construction.** safehoused **silently degrades a
   malformed `meta` to `chat`** — the event then vanishes from the feed with no
   error anywhere — so `build_send_request` refuses to send a `completion` unless
