@@ -1,0 +1,46 @@
+# cargo-nextest configuration (issue #4385).
+#
+# WHY THIS FILE EXISTS
+#
+# CI runs the Rust suite with `cargo nextest run --workspace`, which executes
+# every test in its **own process**. That is deliberate: the daemon's unit tests
+# mutate the process environment (`std::env::set_var` / `remove_var`) in ~600
+# places while other tests in the same binary `Command::spawn` child processes.
+# `Command::spawn` reads the process environ non-atomically, so an env mutation
+# racing a spawn can corrupt a child's environment mid-flight — the cause of the
+# 2026-07-29 CI flakes in `pipeline_snapshot` and `quarantine_reconciliation`.
+# `#[serial]` (serial_test) only serializes *marked* tests against each other, so
+# it never closed that window. Process-per-test closes it by construction.
+#
+# THE TRADE-OFF THIS FILE MANAGES
+#
+# `cargo test` runs test binaries one at a time; nextest runs tests from *all*
+# binaries concurrently. Tests whose shared state is genuinely cross-process (not
+# just in-process env/statics) therefore need an explicit override here — process
+# isolation does nothing for state that lives outside the process.
+#
+# See `loom-daemon/src/lib.rs` (crate-level "Test isolation" docs) for the
+# convention daemon test authors should follow.
+
+nextest-version = "0.9.98"
+
+# The daemon integration suites share host-global state that no amount of process
+# isolation can separate, and they are latency-sensitive:
+#
+#   * the dedicated `tmux -L loom` server (sessions are host-global),
+#   * `cleanup_all_loom_sessions()` in each suite's `setup()`, which kills EVERY
+#     `loom-*` session — including sessions owned by a concurrently running test
+#     in another process,
+#   * a real `loom-daemon` child per test, which must create its socket inside a
+#     fixed timeout — a wall-clock budget that a machine saturated by ~2200
+#     concurrent unit tests will blow.
+#
+# `cargo test` gave them this isolation implicitly: it runs one test binary at a
+# time, so no unit test was ever in flight beside them. `threads-required =
+# 'num-test-threads'` reproduces that property under nextest — each of these
+# tests takes the whole thread budget, so it runs alone. It is deliberately
+# stronger than a `max-threads = 1` test group (which would only serialize these
+# tests against *each other*, still letting the unit suite run alongside).
+[[profile.default.overrides]]
+filter = 'package(loom-daemon) & kind(test) & (binary(integration_basic) | binary(integration_factory_reset) | binary(integration_security) | binary(integration_singleton_guard))'
+threads-required = 'num-test-threads'

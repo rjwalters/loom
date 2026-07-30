@@ -453,6 +453,30 @@ mod tests {
         std::fs::write(loom.join("config.json"), body).unwrap();
     }
 
+    /// Drop the safehouse **env layer** so the `.loom/config.json` written by
+    /// [`write_config`] is authoritative.
+    ///
+    /// `safehouse::apply_env_overrides` lets `$LOOM_SAFEHOUSE_ENABLED` /
+    /// `$LOOM_SAFEHOUSE_SOCKET` / `$LOOM_SAFEHOUSE_ROOM` win over config, and
+    /// `resolve_socket` falls back to `$SAFEHOUSED_SOCKET`. Any agent session
+    /// spawned by a running `loom-daemon` with safehouse narration on exports
+    /// exactly those, so a test that only writes a config file silently asserts
+    /// against the *host's* socket there instead of its own tempdir (#4385).
+    /// These tests passed under `cargo test` only because a sibling test in the
+    /// same process happened to clear the vars first — the class of accidental
+    /// dependency that per-test process isolation makes visible.
+    fn clear_safehouse_env() {
+        for key in [
+            "LOOM_SAFEHOUSE_ENABLED",
+            "LOOM_SAFEHOUSE_SOCKET",
+            "LOOM_SAFEHOUSE_ROOM",
+            "LOOM_SAFEHOUSE_PERSONA",
+            "SAFEHOUSED_SOCKET",
+        ] {
+            std::env::remove_var(key);
+        }
+    }
+
     #[tokio::test]
     async fn provision_is_idempotent_per_root() {
         let dir = tempdir().unwrap();
@@ -512,7 +536,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(loom_safehouse_env)]
     async fn start_safehouse_narration_surfaces_unreachable_for_enabled_unresolved_socket() {
+        clear_safehouse_env();
         let dir = tempdir().unwrap();
         let root = dir.path().to_path_buf();
         let socket = dir.path().join("nope.sock"); // never bound
@@ -542,7 +568,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(loom_safehouse_env)]
     async fn start_peer_coordination_disabled_reports_not_configured_even_after_prior_state() {
+        clear_safehouse_env();
         let dir = tempdir().unwrap();
         let root = dir.path().to_path_buf();
         let socket = dir.path().join("nope.sock");

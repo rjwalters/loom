@@ -5,18 +5,29 @@ Comprehensive integration tests for the loom-daemon.
 ## Running Tests
 
 ```bash
-# Run all integration tests
-cargo test
+# Run all tests the way CI does (process-per-test isolation) — preferred
+cargo nextest run --workspace
 
 # Run specific test file
-cargo test --test integration_basic
+cargo nextest run --test integration_basic
+
+# Plain cargo test still works; it is what runs doctests
+cargo test --workspace --doc
 
 # Run with output
 cargo test -- --nocapture
 
-# Run serially (required for tmux tests)
+# Run serially (required for tmux tests under plain `cargo test`)
 cargo test -- --test-threads=1
 ```
+
+> **Isolation**: CI runs `cargo nextest run --workspace`, so every test gets its
+> own process (see the crate-level "Test isolation convention" docs in
+> `loom-daemon/src/lib.rs`, issue #4385). These `integration_*` suites touch the
+> host-global `tmux -L loom` server and spawn real daemons, so `.config/nextest.toml`
+> gives them `threads-required = 'num-test-threads'` — each one runs alone, which
+> is the isolation `cargo test` provided implicitly by running one binary at a
+> time. Add new host-global suites to that override's filter.
 
 ## Test Structure
 

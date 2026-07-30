@@ -1,3 +1,57 @@
+//! The `loom-daemon` library crate: the Tier 2 orchestration daemon's modules,
+//! exposed as a library so they can be unit-tested without the binary's tokio
+//! runtime.
+//!
+//! # Test isolation convention (READ BEFORE ADDING TESTS)
+//!
+//! **Environment mutation and child-process spawning share one isolation
+//! domain.** This crate's tests call `std::env::set_var` / `remove_var` in
+//! hundreds of places, and many other tests in the same binary
+//! `std::process::Command::spawn` child processes (fake `gh`/`git` shims, real
+//! `loom-daemon` children). `Command::spawn` reads the process environ
+//! non-atomically, so an env mutation on one thread racing a spawn on another
+//! can hand the child a torn environment — the cause of the 2026-07-29 CI
+//! flakes in `pipeline_snapshot` and `quarantine_reconciliation` (#4385). This
+//! is the same hazard that made `env::set_var` `unsafe` in Rust edition 2024.
+//!
+//! `#[serial]` (`serial_test`) does **not** close that window: its lock is
+//! in-process and advisory, so it only serializes *marked* tests against each
+//! other. Any unmarked test — including every future one nobody remembers to
+//! mark — still runs concurrently with a marked env mutator.
+//!
+//! ## What CI does
+//!
+//! CI runs the workspace suite with **`cargo nextest run --workspace`**
+//! (`.github/workflows/ci.yml`, `backend-tests` job), which executes **each test
+//! in its own process**. One test's env mutation is therefore invisible to every
+//! other test by construction, and so are process-global statics
+//! (`OnceLock`/`Mutex` caches, atomics). Doctests are covered by a separate
+//! `cargo test --workspace --doc` step, since nextest does not run them.
+//!
+//! ## What this means for you
+//!
+//! - **Mutating env in a test is fine.** You do not need `#[serial]` for env
+//!   isolation under nextest; existing `#[serial]` attributes are retained
+//!   because they still help plain `cargo test` runs, and they are harmless
+//!   (a no-op) under process-per-test.
+//! - **Prefer `cargo nextest run` for local full-suite runs.** Plain `cargo test`
+//!   still runs a binary's tests on parallel threads, so it can still surface
+//!   this race locally. CI is the arbiter of green.
+//! - **Process isolation does nothing for state outside the process.** If a test
+//!   needs exclusive access to genuinely *cross-process* state — the shared
+//!   `tmux -L loom` server, a fixed path under the real `$HOME`, global git
+//!   config, a fixed port — `#[serial]` is not enough either, because nextest
+//!   runs tests from *all* binaries concurrently (plain `cargo test` ran
+//!   binaries one at a time). Give such tests an override in
+//!   `.config/nextest.toml` — either `threads-required = 'num-test-threads'` to
+//!   run alone (what the `integration_*` suites use: they drive the shared tmux
+//!   server and spawn real daemons) or a `max-threads = 1` test group to
+//!   serialize a family against itself — or mark them
+//!   `#[serial_test::file_serial]` for a file-lock-based cross-process mutex.
+//! - **Otherwise, keep tests hermetic**: `tempfile::TempDir` for paths, explicit
+//!   `.env()` on `Command` for child environments, injected binary paths (e.g.
+//!   `with_gh_bin`) instead of `PATH` lookups.
+
 // These modules were originally private to the binary crate. Exposing them as
 // a library (to allow unit tests to run without the binary's tokio runtime)
 // triggers public-API clippy lints that don't apply to internal-use code.
