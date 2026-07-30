@@ -8,6 +8,7 @@
 # check-ci-suite-manifest.sh enforces that every test-*.sh is in exactly one
 # of these two files. Blank lines and lines beginning with `#` are ignored.
 
+test-archive-transcripts.sh
 test-blame-issue.sh
 test-build-rs-watchset.sh
 test-build-slot.sh
@@ -30,6 +31,7 @@ test-forge-helpers.sh
 test-github-app-token.sh
 test-gitignore-guard.sh
 test-guard-hook-schema.sh
+test-install-active-session.sh
 test-install-pr-markers.sh
 test-install-source-guard.sh
 test-install-stash-scope.sh
@@ -66,6 +68,7 @@ test-spawn-worker.sh
 test-sweep-auto-stack.sh
 test-sweep-checkpoint.sh
 test-sweep-experiment.sh
+test-sweep-pr-mode.sh
 test-sweep-run-registry.sh
 test-sync-labels-repo-flag.sh
 test-verify-install-scope.sh
