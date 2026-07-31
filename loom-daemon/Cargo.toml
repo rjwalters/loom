@@ -19,6 +19,12 @@ regex = "1.12"
 clap = { version = "4.6", features = ["derive"] }
 sha2 = "0.11.0"
 hex = "0.4.3"
+# Minimal async HTTP client for the observability exporter (#4705): JSON-over-
+# HTTPS push only, no TLS-backend duplication with other tooling in this repo.
+# `rustls-tls` avoids an OpenSSL system dependency; `default-features = false`
+# drops reqwest's default blocking/cookie/multipart surface this exporter
+# never touches.
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "rustls-native-certs", "json"] }
 
 [dev-dependencies]
 tempfile = "3.27"

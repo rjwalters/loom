@@ -170,6 +170,7 @@ pub mod issue_creation_mutex;
 pub mod live_claim;
 pub mod main_health_gate;
 pub mod metrics_collector;
+pub mod observability;
 pub mod peer_claims;
 pub mod phase_join;
 pub mod pipeline_snapshot;

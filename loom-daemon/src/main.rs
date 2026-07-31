@@ -13,6 +13,7 @@ use loom_daemon::idle_exit;
 use loom_daemon::ipc::IpcServer;
 use loom_daemon::main_health_gate;
 use loom_daemon::metrics_collector;
+use loom_daemon::observability;
 use loom_daemon::quarantine_reconciliation;
 use loom_daemon::rate_limit_breaker;
 use loom_daemon::role_collision;
@@ -2860,6 +2861,21 @@ async fn run_daemon() -> Result<()> {
         log::debug!("idle_exit: disabled (opt in with autonomous.idleExit.enabled=true)");
         None
     };
+
+    // Pluggable telemetry exporter (#4705, epic #4702 Phase 1). Off by
+    // default (FLAGS-OFF, `observability.enabled=true` to opt in) — a bus
+    // subscriber plus a queue-drain sender, mirroring the idle_exit wiring
+    // immediately above. `Instant::now()` here approximates daemon uptime for
+    // the periodic `host.health` sample; see `observability::spawn_task`'s
+    // doc comment for why an exact daemon-start timestamp is not threaded
+    // through for this.
+    let observability_config = observability::read_config(&sweep_workspace);
+    let _observability_handles = observability::spawn_task(
+        &observability_config,
+        sweep_workspace.clone(),
+        &event_bus,
+        std::time::Instant::now(),
+    );
 
     // Start IPC server. `workspace_health_states` is threaded in so the
     // `DaemonStatus` request can report each registered repo's own halt state
