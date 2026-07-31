@@ -124,6 +124,7 @@ asserts the `ADMIN_TOKEN` secret exists on the deployed Worker.
 | `GET /public/fleet-state` | none (always public) | Public query API: same data as `/api/fleet-state`, redacted per record `visibility` (issue #4727). |
 | `GET /public/history` | none (always public) | Public query API: same data as `/api/history`, redacted. |
 | `GET /public/events` | none (always public) | Public query API: same data as `/api/events`, redacted. |
+| `GET /public` | none (always public) | The public dashboard page itself (issue #4753) — server-rendered fleet overview + history from the same redacted data above, plus a live feed over `/public/events`. Read-only; never calls `/api/*`. |
 
 Full request/response shapes for the `/api/*` and `/public/*` routes,
 including the exact redaction policy per record kind:
