@@ -2386,7 +2386,7 @@ else
 fi
 
 # ============================================================
-# 49-52. Idle-shutdown cron-guard post-update notice (#4697): the update
+# 49-53. Idle-shutdown cron-guard post-update notice (#4697): the update
 #     script should warn, post-update, that this host will power itself off
 #     after N idle minutes when the stage-2 `fleet add-worker
 #     --idle-shutdown-minutes` cron guard is installed — and stay silent
@@ -2472,6 +2472,28 @@ if echo "$out49" | grep -q . && ( cd "$W49" && PATH="$TEST_PATH" HOME="$HOME49" 
 else
     TESTS_FAILED=$((TESTS_FAILED + 1))
     echo -e "${RED}✗${NC} the idle-shutdown notice never changes the exit code"
+fi
+
+# 53. Guard entry present in cron but the guard SCRIPT (and thus its LIMIT=)
+#     unreadable -- e.g. a hand-installed or relocated guard. The notice must
+#     still fire (the host still powers itself off) with the honest
+#     "window unknown" wording rather than silently degrading to nothing or
+#     inventing a minutes value. $HOME53 has no .local/bin/loom-idle-shutdown.sh.
+HOME53="$BASE_WORKDIR/home53"
+mkdir -p "$HOME53/.local/bin"
+out53=$( cd "$W49" && PATH="$TEST_PATH" HOME="$HOME53" \
+    LOOM_DAEMON_BIN="$W49/resolved-daemon" \
+    FAKE_CRONTAB_CONTENTS_FILE="$CRONFIX49" \
+    bash "$UPDATE_SCRIPT" --check 2>&1 )
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out53" | grep -q 'idle-shutdown cron guard installed' \
+   && echo "$out53" | grep -q 'could not be read from'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} unreadable guard script -> notice still fires with an honest unknown window (#4697)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} unreadable guard script -> notice still fires with an honest unknown window (#4697)"
+    echo "  output: $out53"
 fi
 
 # ============================================================
