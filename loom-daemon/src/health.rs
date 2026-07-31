@@ -282,6 +282,18 @@ pub struct HealthInputs {
     pub install_state: Option<InstallStateReport>,
     /// Live `loom-daemon` pids from `pgrep` — the third liveness signal.
     pub pgrep_pids: Vec<u32>,
+    /// A host-local observation of the daemon pid file (Issue #4774), taken
+    /// against the path the *daemon* reported ([`DaemonStatusReport::pid_file`])
+    /// when it was reachable, else this process's own resolution. `None` when
+    /// no path could be resolved at all.
+    ///
+    /// The pid file is **advisory input, cross-checked but not trusted** —
+    /// exactly the rule #4761's collector spec was refined to on 2026-07-31,
+    /// after a two-relaunch-stale file and a name-matched `pgrep` hit a `/tmp`
+    /// test stub in the same battery. [`assess_liveness`] never *derives*
+    /// liveness from this field; it only reports the file's disagreement with
+    /// the process that actually answered.
+    pub pid_file: Option<crate::daemon_pidfile::PidFileObservation>,
     /// Whether a `.ranking` file was found in the resolved pool.
     pub ranking_present: bool,
     /// Age of the resolved pool's `.ranking` in seconds, when readable.
@@ -418,22 +430,52 @@ pub fn summarize_role_ticks(records: &[RoleTickRecord], since: DateTime<Utc>) ->
 #[must_use]
 pub fn assess_liveness(inputs: &HealthInputs) -> HealthSection {
     // 1. A daemon that just answered IPC is alive. No local probe overrules it.
-    if inputs.status.is_some() {
-        let pid = inputs.install_state.as_ref().and_then(|r| r.pid);
-        return HealthSection::new(
-            "liveness",
-            Verdict::Green,
-            match pid {
-                Some(p) => format!("daemon alive — IPC round-trip ok (pid {p})"),
-                None => "daemon alive — IPC round-trip ok".to_string(),
-            },
-            serde_json::json!({
-                "signal": "ipc",
-                "ipc_reachable": true,
-                "pid": pid,
-                "pgrep_pids": inputs.pgrep_pids,
-            }),
-        );
+    if let Some(status) = &inputs.status {
+        // The pid the daemon itself reported (#4774) is authoritative — it is
+        // `std::process::id()` taken inside the answering process. Fall back to
+        // the install-state probe's pid only for a pre-#4774 daemon.
+        let socket_owner = status.daemon_pid;
+        let pid = socket_owner.or_else(|| inputs.install_state.as_ref().and_then(|r| r.pid));
+
+        // Cross-check the pid file against that owner (#4774 AC3). A daemon
+        // that is demonstrably alive with a pid file naming someone else is
+        // still GREEN on *liveness itself* — but the file is a booby trap for
+        // every other consumer that reads it (the watchdog, the #4694
+        // fallback, an operator's `cat`), so the section degrades and names it.
+        let pid_state = inputs
+            .pid_file
+            .as_ref()
+            .map(|obs| crate::daemon_pidfile::classify(obs, socket_owner));
+        // `note()` is `None` for every non-anomalous verdict, so it is the
+        // single gate on both the message and the degrade below — no separate
+        // `is_stale()` test that could drift out of step with it.
+        let stale_note = inputs
+            .pid_file
+            .as_ref()
+            .zip(pid_state.as_ref())
+            .and_then(|(obs, state)| state.note(&obs.path));
+
+        let base = match pid {
+            Some(p) => format!("daemon alive — IPC round-trip ok (pid {p})"),
+            None => "daemon alive — IPC round-trip ok".to_string(),
+        };
+        let detail = serde_json::json!({
+            "signal": "ipc",
+            "ipc_reachable": true,
+            "pid": pid,
+            "socket_owner_pid": socket_owner,
+            "pgrep_pids": inputs.pgrep_pids,
+            "pid_file": inputs.pid_file.as_ref().map(|o| o.path.display().to_string()),
+            "pid_file_recorded_pid": inputs.pid_file.as_ref().and_then(|o| o.recorded_pid),
+            "pid_file_state": pid_state.as_ref().map(crate::daemon_pidfile::PidFileState::as_str),
+        });
+
+        return match stale_note {
+            Some(note) => {
+                HealthSection::new("liveness", Verdict::Degraded, format!("{base}; {note}"), detail)
+            }
+            None => HealthSection::new("liveness", Verdict::Green, base, detail),
+        };
     }
 
     let ipc_error = inputs
@@ -451,8 +493,13 @@ pub fn assess_liveness(inputs: &HealthInputs) -> HealthSection {
                     "liveness",
                     Verdict::Degraded,
                     format!(
-                        "process alive, still STARTING (age {}s) — IPC not bound yet: {ipc_error}",
-                        report.process_age_secs.unwrap_or_default()
+                        "process alive, still STARTING (age {}s) — IPC not bound yet:                          {ipc_error}{}",
+                        report.process_age_secs.unwrap_or_default(),
+                        // A daemon that has not bound yet has not claimed the
+                        // pid file yet either (#4774 writes it after the bind),
+                        // so a disagreement here is expected-and-transient —
+                        // reported, but not dressed up as a fault.
+                        suffix_note(report.pid_file_stale_note.as_deref())
                     ),
                     liveness_detail_json("install-state", report, inputs, false),
                 );
@@ -462,7 +509,8 @@ pub fn assess_liveness(inputs: &HealthInputs) -> HealthSection {
                     "liveness",
                     Verdict::Degraded,
                     format!(
-                        "process ALIVE but not answering IPC — NOT dead ({detail}); ipc: {ipc_error}"
+                        "process ALIVE but not answering IPC — NOT dead ({detail}); ipc:                          {ipc_error}{}",
+                        suffix_note(report.pid_file_stale_note.as_deref())
                     ),
                     liveness_detail_json("install-state", report, inputs, false),
                 );
@@ -541,6 +589,13 @@ pub fn assess_liveness(inputs: &HealthInputs) -> HealthSection {
     }
 }
 
+/// Append an operator-facing pid-file note (#4774) to a summary line, or
+/// nothing at all when there is no anomaly — so the overwhelmingly common
+/// healthy case reads exactly as it did before this issue.
+fn suffix_note(note: Option<&str>) -> String {
+    note.map(|n| format!("; {n}")).unwrap_or_default()
+}
+
 fn liveness_detail_json(
     signal: &str,
     report: &InstallStateReport,
@@ -557,6 +612,14 @@ fn liveness_detail_json(
         "process_age_secs": report.process_age_secs,
         "pgrep_pids": inputs.pgrep_pids,
         "declared_dead": dead,
+        // #4774: the pid file as *evidence*, never as the verdict. On this
+        // unreachable path there is no `daemon_pid` to arbitrate with, so the
+        // note (when any) comes from the install-state probe's launchd
+        // cross-check, and the raw observation is carried for `--json`.
+        "pid_file": inputs.pid_file.as_ref().map(|o| o.path.display().to_string()),
+        "pid_file_recorded_pid": inputs.pid_file.as_ref().and_then(|o| o.recorded_pid),
+        "pid_file_recorded_pid_alive": inputs.pid_file.as_ref().map(|o| o.recorded_pid_alive),
+        "pid_file_stale_note": report.pid_file_stale_note,
     })
 }
 
@@ -997,6 +1060,7 @@ mod tests {
             process_age_secs: Some(9),
             startup_grace_threshold_secs: Some(45),
             watchdog_log_path: PathBuf::from("/tmp/watchdog.log"),
+            pid_file_stale_note: None,
         }
     }
 
@@ -1033,6 +1097,7 @@ mod tests {
             ipc_error: None,
             install_state: Some(install_report(InstallState::AliveButUnresponsive)),
             pgrep_pids: vec![4321],
+            pid_file: None,
             ranking_present: true,
             ranking_age_secs: Some(240),
             pipeline: Some(vec![RepoPipelineSnapshot {
@@ -1060,6 +1125,140 @@ mod tests {
         let section = assess_liveness(&inputs);
         assert_eq!(section.verdict, Verdict::Green);
         assert_eq!(section.detail["signal"], "ipc");
+    }
+
+    // ===================================================================
+    // #4774 regression pins — the pid file is advisory, cross-checked
+    // ===================================================================
+
+    /// Build a pid-file observation for the assess tests.
+    fn pid_obs(recorded: Option<u32>, alive: bool) -> crate::daemon_pidfile::PidFileObservation {
+        crate::daemon_pidfile::PidFileObservation {
+            path: PathBuf::from("/home/.loom/.daemon.pid"),
+            present: recorded.is_some(),
+            recorded_pid: recorded,
+            recorded_pid_alive: alive,
+        }
+    }
+
+    /// An inputs fixture whose daemon answered IPC and reported its own pid —
+    /// the post-#4774 wire shape every assertion below builds on.
+    fn reachable_inputs_with_socket_owner(pid: u32) -> HealthInputs {
+        let mut inputs = healthy_inputs();
+        let mut status = healthy_status();
+        status.daemon_pid = Some(pid);
+        inputs.status = Some(status);
+        inputs
+    }
+
+    /// The healthy case must be *unchanged* by #4774: a pid file naming the
+    /// process that answered adds no note and no verdict change.
+    #[test]
+    fn a_pid_file_matching_the_socket_owner_stays_green() {
+        let mut inputs = reachable_inputs_with_socket_owner(99917);
+        inputs.pid_file = Some(pid_obs(Some(99917), true));
+        let section = assess_liveness(&inputs);
+        assert_eq!(section.verdict, Verdict::Green);
+        assert_eq!(section.detail["pid_file_state"], "matches");
+        assert_eq!(section.detail["socket_owner_pid"], 99917);
+        assert!(!section.summary.contains("STALE"), "{}", section.summary);
+    }
+
+    /// THE #4774 pin. The 2026-07-31 incident, exactly: the file says 13724,
+    /// the daemon answering the socket says 99917. Liveness is not in doubt —
+    /// the daemon just answered — but the file is a booby trap for every other
+    /// consumer, so the section degrades and names both pids.
+    #[test]
+    fn a_pid_file_naming_a_different_process_degrades_and_is_named() {
+        let mut inputs = reachable_inputs_with_socket_owner(99917);
+        inputs.pid_file = Some(pid_obs(Some(13724), true));
+        let section = assess_liveness(&inputs);
+        assert_eq!(
+            section.verdict,
+            Verdict::Degraded,
+            "a stale pid file must not be reported as healthy: {}",
+            section.summary
+        );
+        assert_eq!(section.detail["pid_file_state"], "mismatch");
+        assert!(
+            section.summary.contains("13724") && section.summary.contains("99917"),
+            "the summary must name both the recorded and the real pid: {}",
+            section.summary
+        );
+        // Liveness itself is still positively established.
+        assert_eq!(section.detail["ipc_reachable"], true);
+    }
+
+    /// A reachable daemon whose pid file records a pid that is not a live
+    /// process at all — a relaunch after the old pid was recycled away.
+    #[test]
+    fn a_pid_file_naming_a_dead_process_degrades() {
+        let mut inputs = reachable_inputs_with_socket_owner(99917);
+        inputs.pid_file = Some(pid_obs(Some(13724), false));
+        let section = assess_liveness(&inputs);
+        assert_eq!(section.verdict, Verdict::Degraded);
+        assert_eq!(section.detail["pid_file_state"], "mismatch");
+    }
+
+    /// An absent pid file makes no false claim, so it is not an anomaly — a
+    /// daemon started outside the managed start path legitimately has none.
+    #[test]
+    fn an_absent_pid_file_does_not_degrade_a_reachable_daemon() {
+        let mut inputs = reachable_inputs_with_socket_owner(99917);
+        inputs.pid_file = Some(pid_obs(None, false));
+        let section = assess_liveness(&inputs);
+        assert_eq!(section.verdict, Verdict::Green);
+        assert_eq!(section.detail["pid_file_state"], "absent");
+    }
+
+    /// Backward compatibility: a **pre-#4774 daemon** answers without a
+    /// `daemon_pid`, so there is nothing to cross-check against. That must read
+    /// as "unverified", never as a mismatch — an upgrade-order false alarm would
+    /// be worse than the bug this issue fixes, since it would fire on every
+    /// fleet host until the last daemon rolled.
+    #[test]
+    fn a_pre_4774_daemon_never_produces_a_false_mismatch() {
+        let mut inputs = healthy_inputs();
+        let mut status = healthy_status();
+        status.daemon_pid = None;
+        inputs.status = Some(status);
+        inputs.pid_file = Some(pid_obs(Some(13724), true));
+        let section = assess_liveness(&inputs);
+        assert_eq!(section.verdict, Verdict::Green);
+        assert_eq!(section.detail["pid_file_state"], "unverified");
+        assert!(section.detail["socket_owner_pid"].is_null());
+    }
+
+    /// The daemon's self-reported pid outranks the install-state probe's pid
+    /// for the rendered `pid` — it is `std::process::id()` from inside the
+    /// answering process, versus a launchd/pid-file inference from outside.
+    #[test]
+    fn the_reported_pid_prefers_the_daemons_own_over_the_probes() {
+        // `install_report` pins the probe's pid at 4321.
+        let inputs = reachable_inputs_with_socket_owner(99917);
+        let section = assess_liveness(&inputs);
+        assert_eq!(section.detail["pid"], 99917);
+        assert!(section.summary.contains("99917"), "{}", section.summary);
+    }
+
+    /// On the *unreachable* path there is no `daemon_pid` to arbitrate with, so
+    /// the note comes from the install-state probe's own launchd cross-check —
+    /// and it must reach the operator-facing summary, not just the JSON.
+    #[test]
+    fn an_unreachable_daemons_stale_note_reaches_the_summary() {
+        let mut inputs = healthy_inputs();
+        inputs.status = None;
+        inputs.ipc_error = Some("round-trip timed out".to_string());
+        let mut report = install_report(InstallState::AliveButUnresponsive);
+        report.pid_file_stale_note = Some("STALE pid file /home/.loom/.daemon.pid: …".to_string());
+        inputs.install_state = Some(report);
+        let section = assess_liveness(&inputs);
+        assert_eq!(section.verdict, Verdict::Degraded);
+        assert!(
+            section.summary.contains("STALE pid file"),
+            "the install-state probe's #4774 note must be surfaced: {}",
+            section.summary
+        );
     }
 
     /// The launchd domain probe alone can never produce a DEAD verdict: with

@@ -618,6 +618,15 @@ async fn handle_health(
         .and_then(|r| r.token_pool_dir.clone())
         .map_or((false, None), |dir| ranking_state(&dir));
 
+    // Pid-file observation (#4774) against the path the daemon itself
+    // reported, falling back to a local resolution for an unreachable /
+    // pre-#4774 daemon — the same precedence `cli::health` uses.
+    let pid_file = report
+        .as_ref()
+        .and_then(|r| r.pid_file.clone())
+        .or_else(crate::daemon_pidfile::resolve_pid_file_path)
+        .map(|path| crate::daemon_pidfile::observe(&path));
+
     let health = crate::health::assess(&crate::health::HealthInputs {
         at: chrono::Utc::now(),
         window: HEALTH_WINDOW,
@@ -625,6 +634,7 @@ async fn handle_health(
         ipc_error,
         install_state: crate::daemon_install_state::probe(),
         pgrep_pids: crate::daemon_install_state::pgrep_daemon_pids(),
+        pid_file,
         ranking_present,
         ranking_age_secs,
         pipeline,
@@ -1193,6 +1203,8 @@ mod tests {
             work_finder_enabled: None,
             last_work_finder_tick: None,
             role_tick_records: vec![],
+            daemon_pid: None,
+            pid_file: None,
         }
     }
 

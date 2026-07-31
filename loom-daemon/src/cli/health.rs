@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use loom_daemon::daemon_install_state;
+use loom_daemon::daemon_pidfile;
 use loom_daemon::health::{self, HealthInputs, HealthReport};
 use loom_daemon::pipeline_snapshot::{self, GhPipelineSource, PipelineMetrics};
 use loom_daemon::types::{DaemonStatusReport, Request, Response};
@@ -69,6 +70,19 @@ async fn collect(window: Duration) -> HealthReport {
     let install_state = daemon_install_state::probe();
     let pgrep_pids = daemon_install_state::pgrep_daemon_pids();
 
+    // 2b. The pid file, observed against the path the DAEMON resolved (#4774)
+    //     when it answered — same rule as `.ranking` below and `status`'s token
+    //     probe (#4292): never re-derive from this CLI process's own cwd/env
+    //     when the daemon has told us which file it actually writes. Falling
+    //     back to a local resolution only for an unreachable / pre-#4774
+    //     daemon. Observed unconditionally so `--json` carries the corroborating
+    //     evidence either way; the collector decides what it means.
+    let pid_file = status
+        .as_ref()
+        .and_then(|r| r.pid_file.clone())
+        .or_else(daemon_pidfile::resolve_pid_file_path)
+        .map(|path| daemon_pidfile::observe(&path));
+
     // 3. `.ranking` staleness, against the pool directory the DAEMON resolved
     //    (#4292) rather than one re-derived from this CLI process's own cwd —
     //    the same rule `status`'s client-side token probe follows.
@@ -106,6 +120,7 @@ async fn collect(window: Duration) -> HealthReport {
         ipc_error,
         install_state,
         pgrep_pids,
+        pid_file,
         ranking_present,
         ranking_age_secs,
         pipeline,

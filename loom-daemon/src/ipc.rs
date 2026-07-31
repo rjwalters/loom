@@ -963,6 +963,45 @@ impl IpcServer {
         let listener = UnixListener::bind(&self.socket_path)?;
         log::info!("IPC server listening at {}", self.socket_path.display());
 
+        // Claim the pid file (#4774). THIS is the correct choke point: the bind
+        // above just made this process the confirmed *sole* owner of the socket,
+        // and every supervised relaunch (launchd `KeepAlive:SuccessfulExit`,
+        // systemd `Restart=on-success`, the #4054 restart primitive, the
+        // in-daemon self-update loop, `launchctl kickstart`) reaches it —
+        // whereas none of them re-run `loom-daemon-start.sh`, which was the only
+        // writer before now. Deliberately NOT hoisted next to #4331's marker
+        // healing in `daemon_service.rs`: that call runs *before* the singleton
+        // guard, so a daemon about to be refused would stomp the live
+        // incumbent's pid file with its own doomed pid. Non-fatal in every
+        // branch — a daemon without a pid file beats no daemon.
+        match crate::daemon_pidfile::claim_for_current_process() {
+            crate::daemon_pidfile::ClaimOutcome::Claimed {
+                path,
+                previous: Some(previous),
+            } if previous != std::process::id() => log::warn!(
+                "daemon_pidfile: pid file {} named stale pid {previous} — rewrote it to this \
+                 daemon's pid {} (a supervisor relaunch does not re-run loom-daemon-start.sh, \
+                 #4774)",
+                path.display(),
+                std::process::id()
+            ),
+            crate::daemon_pidfile::ClaimOutcome::Claimed { path, .. } => log::info!(
+                "daemon_pidfile: claimed {} for pid {} (#4774)",
+                path.display(),
+                std::process::id()
+            ),
+            crate::daemon_pidfile::ClaimOutcome::Unresolvable => log::warn!(
+                "daemon_pidfile: could not resolve a pid file path (no LOOM_PID_FILE, \
+                 LOOM_WORKSPACE, LOOM_SOCKET_PATH, or home directory) — liveness cross-checks \
+                 that consult it will have no signal (#4774)"
+            ),
+            crate::daemon_pidfile::ClaimOutcome::WriteFailed { path, error } => log::warn!(
+                "daemon_pidfile: could not write {} — {error}. Continuing without a self-written \
+                 pid file (#4774)",
+                path.display()
+            ),
+        }
+
         loop {
             match listener.accept().await {
                 Ok((stream, _)) => {
@@ -1680,6 +1719,16 @@ pub fn build_daemon_status(
         // "no tick observed", never "nothing happened".
         last_work_finder_tick: crate::work_finder::last_tick_summary(),
         role_tick_records: crate::role_runner::role_tick_records(),
+        // The answering process's own pid + the pid file it claimed at startup
+        // (#4774). `std::process::id()` is deliberately taken HERE, in the
+        // daemon, rather than inferred by the client from a file: it is the
+        // only unforgeable statement of "who owns this socket", and it is what
+        // lets `status`/`health` call a stale `.daemon.pid` stale instead of
+        // trusting it. The path is re-resolved (not cached from the startup
+        // claim) so the report always names the file *this* daemon's
+        // environment points at.
+        daemon_pid: Some(std::process::id()),
+        pid_file: crate::daemon_pidfile::resolve_pid_file_path(),
     }
 }
 
@@ -5375,6 +5424,8 @@ exit 0
                 ok: true,
                 detail: None,
             }],
+            daemon_pid: Some(99917),
+            pid_file: Some(std::path::PathBuf::from("/repo/a/.loom/.daemon.pid")),
         };
         let resp = Response::DaemonStatus(Box::new(report));
         let json = serde_json::to_string(&resp).expect("serialize response");

@@ -3690,7 +3690,16 @@ process:
   — or, in **machine mode** (dispatcher-driven, `LOOM_MACHINE_CHECKOUT` set,
   #4229), at `$HOME/.loom/.daemon.pid` so the same machine-wide launchd
   singleton is tracked consistently no matter which repo `loom start` ran
-  from; see [`machine-dispatcher.md`](machine-dispatcher.md#the-pidflags-relocation-decision),
+  from; see [`machine-dispatcher.md`](machine-dispatcher.md#the-pidflags-relocation-decision).
+  Since **#4774 the daemon also writes this file itself**, immediately after its
+  socket bind succeeds, to the path the start script exports as `LOOM_PID_FILE`.
+  That is what keeps it correct across the relaunches this script is not part of
+  — launchd `KeepAlive`, systemd `Restart=`, the `RestartDaemon` primitive, the
+  self-update roll, `launchctl kickstart`. The write sits *after* the singleton
+  guard's bind on purpose: a daemon the guard refuses must never overwrite the
+  live incumbent's entry. `status` / `health` cross-check the recorded pid
+  against `daemon_pid` (the answering process's own `std::process::id()`) and
+  report a stale file rather than trusting it,
 - refuses a second start when the PID file points at a live process, and surfaces
   the daemon's own **singleton-guard** refusal (#3806) — if the backgrounded
   process exits immediately it prints the startup-log tail instead of leaving a
