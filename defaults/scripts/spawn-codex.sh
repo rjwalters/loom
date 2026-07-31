@@ -21,6 +21,12 @@
 # `pre_tool_use` event, but Loom does not wire into it yet (see gap 1 in that
 # doc), so Loom's guard hooks do not fire for a Codex worker today.
 #
+# Production sandbox posture (issue #4478, decided 2026-07-31): read-only
+# default, with Builder-role-only escalation to workspace-write (+
+# LOOM_CODEX_NETWORK=1 for push access) — no fleet-wide danger-full-access.
+# See guardrail-parity-codex.md § "Promotion gate" for the full decision and
+# its relationship to the hooks/worktreeIsolation evidence gate above.
+#
 # ---------------------------------------------------------------------------
 # Minimum supported Codex CLI version: 0.146.0
 #
