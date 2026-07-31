@@ -4479,6 +4479,97 @@ throwaway issue from `loom:triage` → Curator → `loom:issue` → work-finder
 dispatch → PR → merge, with a scripted label-transition assertion, and confirms
 the operator only ever created the issue.
 
+## Observability exporter (`observability`, #4705, epic #4702 Phase 1)
+
+An **opt-in, off-by-default** telemetry exporter that pushes fleet telemetry
+(sweep lifecycle/outcome, token-pool snapshots, host health) to a configured
+HTTP(S) sink. This is the daemon-side half of epic #4702's rich fleet
+dashboard; the Phase-2 Cloudflare Workers backend (the first real sink) is a
+separate, later issue — this issue ships value standalone, with no cloud
+dependency: a disabled or under-configured `observability` block is a
+zero-syscall no-op, exactly like `autonomous.idleExit` above.
+
+### Config surface (`.loom/config.json → observability`)
+
+```json
+{
+  "observability": {
+    "enabled": false,
+    "endpoint": "https://ingest.example.com/v1/telemetry",
+    "ingestKeyFile": "/etc/loom/observability-ingest.key",
+    "batchSize": 50,
+    "flushIntervalSecs": 30,
+    "queueCapacity": 2000
+  }
+}
+```
+
+Precedence is **env > config > default**, same convention as every other
+`autonomous.*`-style block: `LOOM_OBSERVABILITY_ENABLED` /
+`LOOM_OBSERVABILITY_ENDPOINT` / `LOOM_OBSERVABILITY_INGEST_KEY_FILE` /
+`LOOM_OBSERVABILITY_BATCH_SIZE` / `LOOM_OBSERVABILITY_FLUSH_INTERVAL_SECS` /
+`LOOM_OBSERVABILITY_QUEUE_CAPACITY` override the matching config key, which
+overrides the built-in default (`false` / *(none)* / *(none)* / `50` / `30` /
+`2000`). The **ingest key is never inline in config** — `ingestKeyFile` names
+a path the daemon reads once at startup; the key contents never appear in a
+log line or error message (only the *path* does), and requests authenticate
+via an `Authorization: Bearer <key>` header. `loom-daemon` refuses to export
+(logs a `WARN` and skips both background tasks) when enabled without a
+resolvable `endpoint` or a readable, non-empty `ingestKeyFile` — treated the
+same as "not configured", not a startup failure.
+
+### Architecture
+
+Two background tasks, spawned together (`observability::spawn_task`,
+`loom-daemon/src/observability/`) alongside the `idle_exit`/`auto_update`
+wiring in `main.rs`:
+
+- **Collector** (`observability::collector`) — a pure [`EventBus`](#event-taxonomy-frozen-for-v0100)
+  subscriber (`sweep.global.dispatch` + `sweep.issue.*`, adding **no new emit
+  call sites** anywhere else in the daemon, the same design
+  [safehouse](#completion-narration--public-fleet-feed-4426) narration
+  uses) that maps lifecycle events to the versioned
+  `loom-daemon/src/telemetry/` schema (#4703) — `sweep.started` /
+  `sweep.phase` / `sweep.completed` / `sweep.outcome` — resolves the emitting
+  repo's `owner/repo` slug and public/private visibility tag
+  (`telemetry::visibility`, an existing `gh api repos/{owner}/{repo}
+  --jq .private` TTL-cached probe, private-by-default on any failure), and
+  every 5 minutes additionally samples host-level `tokens.snapshot` (from the
+  resolved token pool's `.ranking` file) and `host.health` (CPU idle
+  fraction, load-per-core, logical CPU count, worktree-root free space,
+  daemon version/uptime) records, which have no corresponding bus event.
+- **Sender** (`observability::sender`) — drains the queue on a jittered
+  `flushIntervalSecs` timer via `observability::exporter::HttpsExporter`
+  (`reqwest`, JSON array POST per batch), retrying a failed batch with
+  jittered exponential backoff (5s floor, 5 minute ceiling) — jitter comes
+  from this crate's existing dependency-free `tokens_pool::rng::Rng`, not a
+  new `rand` dependency.
+
+Between them sits `observability::queue::DurableQueue` — a bounded,
+disk-backed FIFO (`<workspace>/.loom/logs/observability-queue.jsonl`,
+override `LOOM_OBSERVABILITY_QUEUE_PATH`) that survives a clean daemon
+restart across host sleep/idle-shutdown (#4467/#4697): every push/ack
+atomically rewrites the file (temp-file + rename, mirroring
+`idle_exit::write_marker`). Once `queueCapacity` is reached, the **oldest**
+queued record is dropped and a running `dropped_total` counter is logged —
+bounded growth, never an unbounded queue, and never a silent loss.
+
+### Exporter trait boundary (Phase 4 forward-compat, no OTel dependency yet)
+
+`observability::exporter::Exporter` is a two-method trait (`emit_batch`,
+`flush`) `observability::sender`'s drain loop is generic over — `HttpsExporter`
+is its only implementation today. This issue adds **no OTel dependency**; the
+trait boundary exists so epic #4702 Phase 4's optional OTLP exporter (for
+operators with an existing Grafana/Honeycomb/self-hosted-collector stack) can
+be a second `impl Exporter` later without touching the queue or sender.
+
+### Read-only invariant
+
+The exporter only ever originates outbound HTTP POSTs; it never parses a
+response body for anything beyond a batch-accepted/rejected status, and
+nothing received over this channel ever mutates daemon state — steering
+(dispatch/cancel/pause) stays with MCP, per the epic's explicit scope.
+
 ## Fleet dashboard (`loom-daemon serve`)
 
 `loom-daemon serve` (#4329 phases 1-3: #4391 status snapshot, #4392 SSE event
