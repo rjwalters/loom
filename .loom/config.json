@@ -97,5 +97,8 @@
       "loom_builder_7",
       "loom_builder_8"
     ]
+  },
+  "sweep": {
+    "modelExperiment": "observe"
   }
 }
