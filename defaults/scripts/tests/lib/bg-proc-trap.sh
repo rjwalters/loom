@@ -47,6 +47,19 @@
 # a single combined trap would clean up once and then keep executing every
 # remaining test case in the suite, re-populating $WORKDIR as it goes. The
 # INT/TERM trap must end with an explicit `exit` to actually stop the script.
+#
+# Two documented contracts (PR #4790 judge nits, #4800):
+#   1. bg_proc_track ALWAYS returns 0, even when called with an empty/absent
+#      PID (e.g. a failed spawn produced no `$!`). This is a tolerated no-op,
+#      not an error, so the call is safe to make under `set -e` — a future
+#      `set -e` suite sourcing this helper will not abort on a benign empty
+#      capture.
+#   2. A few suites add a path-pattern `pkill -f "$WORKDIR"` backstop (on top
+#      of bg_proc_reap) to catch fixture processes whose argv references a
+#      scratch directory rather than a tracked PID. If `mktemp -d` ever fails,
+#      $WORKDIR is empty and `pkill -f ""` matches (and kills) EVERY process
+#      visible to the caller — any suite adding such a backstop MUST guard it
+#      with `[ -n "$WORKDIR" ] && pkill -f "$WORKDIR" ...` first.
 
 # Array of PIDs to kill on cleanup. Declared at source time so every sourcing
 # script (and any function it defines) shares one array without redeclaring
@@ -54,11 +67,13 @@
 BG_PROC_TRACKED_PIDS=()
 
 # Record a backgrounded PID for later reaping. Call immediately after `&`,
-# e.g. `some_cmd & bg_proc_track "$!"`. Silently ignores an empty PID so it
-# is always safe to call even if the spawn failed to produce one.
+# e.g. `some_cmd & bg_proc_track "$!"`. Contract: an empty/absent PID is a
+# tolerated no-op that always returns 0 (success) — never 1 — so it is safe
+# to call under `set -e` even if the spawn failed to produce a PID.
 bg_proc_track() {
     local pid="$1"
     [[ -n "$pid" ]] && BG_PROC_TRACKED_PIDS+=("$pid")
+    return 0
 }
 
 # Kill every tracked PID that is still alive. Idempotent and safe to call
