@@ -61,35 +61,82 @@ function extractDaemonErrorMessage(response: {
 }
 
 /**
- * List all active terminals from the daemon
+ * Where a `listTerminalsWithSource()` result came from (Issue #4794).
+ *
+ * - `"daemon"`: the live `loom-daemon`'s registry, which the daemon itself
+ *   garbage-collects against actual tmux session liveness on every
+ *   `ListTerminals` request (see `TerminalManager::prune_dead_terminals` in
+ *   `loom-daemon/src/terminal.rs`) — entries here are verified live.
+ * - `"state-fallback"`: the daemon was unreachable, so this is the
+ *   last-written `.loom/state.json` snapshot with NO tmux verification —
+ *   it can include terminals whose sessions have since died.
  */
-async function listTerminals(): Promise<Terminal[]> {
+export type TerminalListSource = "daemon" | "state-fallback";
+
+export interface TerminalListResult {
+  terminals: Terminal[];
+  source: TerminalListSource;
+}
+
+/**
+ * List all active terminals from the daemon, reporting which source served
+ * the result (Issue #4794) so callers can flag an unverified fallback list.
+ */
+async function listTerminalsWithSource(): Promise<TerminalListResult> {
   try {
     const response = (await sendDaemonRequest({
       type: "ListTerminals",
     })) as { type: string; payload?: { terminals: Terminal[] } };
 
     if (response.type === "TerminalList" && response.payload?.terminals) {
-      return response.payload.terminals;
+      return { terminals: response.payload.terminals, source: "daemon" };
     }
 
-    return [];
+    return { terminals: [], source: "daemon" };
   } catch (_error) {
-    // If daemon is not running, fall back to state file
+    // If daemon is not running, fall back to state file. Unlike the daemon
+    // path, this is NOT cross-checked against live tmux sessions — the
+    // caller must treat it as unverified (Issue #4794).
     const state = await readStateFile();
-    if (!state) return [];
+    if (!state) return { terminals: [], source: "state-fallback" };
 
     // Map state file format to Terminal format
-    return state.terminals.map((t) => ({
-      id: t.id,
-      name: t.id, // State file doesn't have name
-      role: undefined,
-      working_dir: t.worktreePath,
-      tmux_session: `loom-${t.id}`,
-      created_at: 0,
-      isPrimary: t.isPrimary,
-    }));
+    return {
+      terminals: state.terminals.map((t) => ({
+        id: t.id,
+        name: t.id, // State file doesn't have name
+        role: undefined,
+        working_dir: t.worktreePath,
+        tmux_session: `loom-${t.id}`,
+        created_at: 0,
+        isPrimary: t.isPrimary,
+      })),
+      source: "state-fallback",
+    };
   }
+}
+
+/**
+ * List all active terminals from the daemon
+ */
+async function listTerminals(): Promise<Terminal[]> {
+  return (await listTerminalsWithSource()).terminals;
+}
+
+/**
+ * Build the operator-facing note appended to `list_terminals` output when
+ * the result did not come from the live, tmux-verified daemon path
+ * (Issue #4794). Returns `""` for the verified `"daemon"` source.
+ */
+export function buildTerminalListFallbackNote(source: TerminalListSource): string {
+  if (source !== "state-fallback") {
+    return "";
+  }
+  return (
+    "\n\nNote: loom-daemon did not respond, so this list was read from the last-written " +
+    "local state file (.loom/state.json) and is UNVERIFIED against live tmux sessions — " +
+    "it may include terminals whose sessions have since ended."
+  );
 }
 
 /**
@@ -839,13 +886,20 @@ export async function handleTerminalTool(
 ): Promise<{ type: "text"; text: string }[]> {
   switch (name) {
     case "list_terminals": {
-      const terminals = await listTerminals();
+      const { terminals, source } = await listTerminalsWithSource();
+
+      // Issue #4794: the daemon path is verified live (the daemon
+      // garbage-collects registry entries whose tmux session no longer
+      // exists on every `ListTerminals` request); the state-file fallback
+      // (daemon unreachable) is NOT — flag it explicitly rather than
+      // presenting a possibly-stale snapshot as if it were confirmed live.
+      const fallbackNote = buildTerminalListFallbackNote(source);
 
       if (terminals.length === 0) {
         return [
           {
             type: "text",
-            text: "No active terminals found. Either Loom hasn't been started yet, or all terminals have been closed.",
+            text: `No active terminals found. Either Loom hasn't been started yet, or all terminals have been closed.${fallbackNote}`,
           },
         ];
       }
@@ -868,7 +922,7 @@ export async function handleTerminalTool(
       return [
         {
           type: "text",
-          text: `=== Active Loom Terminals (${terminals.length}) ===\n\n${terminalList}`,
+          text: `=== Active Loom Terminals (${terminals.length}) ===\n\n${terminalList}${fallbackNote}`,
         },
       ];
     }
