@@ -35,6 +35,13 @@
  *                                      summarized (see `./redaction.ts`).
  *   GET  /public/history             — public: same query, redacted.
  *   GET  /public/events              — public: same live tail, redacted.
+ *   GET  /public                     — public: the Phase-3 dashboard page
+ *                                      itself (issue #4753), server-rendered
+ *                                      from the same redacted data the three
+ *                                      routes above return. See
+ *                                      `./publicPage.ts` for the rendering +
+ *                                      the token/cost-widget exposure
+ *                                      decision.
  *
  * All `/admin/*` routes require `Authorization: Bearer <ADMIN_TOKEN>`
  * (a `wrangler secret`, never committed) — see README.md.
@@ -53,8 +60,10 @@
 
 import { extractBearerToken, authenticateHost, hashIngestKey } from "./auth";
 import { FleetState, type FleetSnapshot } from "./fleetState";
+import { renderPublicPage } from "./publicPage";
 import {
   createLiveTailStream,
+  DEFAULT_HISTORY_LIMIT,
   parseHistoryQuery,
   queryHistory,
   type LiveTailFilter,
@@ -334,6 +343,25 @@ function handleLiveTail(request: Request, env: Env, url: URL, isAuthenticated: b
   });
 }
 
+/** `GET /public` (issue #4753) — the unauthenticated dashboard page itself.
+ * Sources its data by calling `fleetStateStub`/`queryHistory` directly, the
+ * same in-process calls `handleFleetStateQuery`/`handleHistoryQuery` make,
+ * then redacts with `isAuthenticated: false` before handing off to
+ * `./publicPage.ts` for rendering — there is no HTTP round-trip through
+ * `/api/*` anywhere in this path, so this route cannot accidentally source
+ * unredacted data. */
+async function handlePublicPage(env: Env): Promise<Response> {
+  const stateResponse = await fleetStateStub(env).fetch("https://fleet-state/snapshot");
+  const snapshot = (await stateResponse.json()) as FleetSnapshot;
+  const redactedSnapshot = redactFleetSnapshot(snapshot, /* isAuthenticated */ false);
+
+  const historyResult = await queryHistory(env.DB, { limit: DEFAULT_HISTORY_LIMIT });
+  const redactedHistory = redactHistoryQueryResult(historyResult, /* isAuthenticated */ false);
+
+  const html = renderPublicPage(redactedSnapshot, redactedHistory);
+  return new Response(html, { status: 200, headers: { "content-type": "text/html; charset=utf-8" } });
+}
+
 // ---------------------------------------------------------------------------
 // Entrypoint
 // ---------------------------------------------------------------------------
@@ -365,6 +393,9 @@ export default {
     }
     if (request.method === "GET" && url.pathname === "/public/events") {
       return handleLiveTail(request, env, url, /* isAuthenticated */ false);
+    }
+    if (request.method === "GET" && url.pathname === "/public") {
+      return handlePublicPage(env);
     }
     if (request.method === "GET" && url.pathname === "/") {
       return new Response("loom-observability-ingest: see /ingest, /admin/*, /api/*, /public/*", { status: 200 });
