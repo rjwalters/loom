@@ -256,8 +256,10 @@ PR_JSON=$(gh pr view "$PR_NUMBER" --json comments,commits,labels,headRefOid)
 HOLD_BODY=$(jq -r --arg m "<!-- champion:merge-risk-hold -->" \
   '[.comments[] | select(.body | contains($m))] | last | .body // ""' <<<"$PR_JSON")
 # Released only by: loom:auto-merge-ok | an explicit operator clearing comment
-# posted after the hold | a new head SHA (recorded as `champion:hold-state
-# head=<sha>` in the hold comment) | a new Judge review after the hold.
+# posted after the hold (the instruction must OPEN the comment's leading clause
+# and not be a question — "do not merge anyway" / "is it ok to merge?" do NOT
+# release) | a new head SHA (recorded as `champion:hold-state head=<sha>` in the
+# hold comment) | a new Judge review after the hold.
 ```
 
 **Decision**: **Hold stands** — skip the PR for this pass whatever the axes say this tick. A green re-read of an unchanged diff is not a release signal, and Champion's own comments never count as one.
@@ -364,7 +366,7 @@ gh issue create --title "Follow-on: Work identified in PR #$PR_NUMBER" --label "
 | Unknown critical file | Miss | Needs pattern update |
 | Large but low-risk PR (e.g. mostly tests) | Allow | Judged on the 4 risk axes, not line count |
 | Small but high-blast-radius PR | Hold for human | Comment names the specific concern, keep `loom:pr`, retry next tick |
-| Prior merge-risk hold, later tick scores the same diff green | **Hold stands (sticky)** | Skip silently, post nothing (anti-spam guard already covers it). Release only on `loom:auto-merge-ok`, an explicit operator clearing comment after the hold, a new head SHA, or a new Judge review |
+| Prior merge-risk hold, later tick scores the same diff green | **Hold stands (sticky)** | Skip silently, post nothing (anti-spam guard already covers it). Release only on `loom:auto-merge-ok`, an explicit operator clearing comment after the hold (leading-clause instruction, not a negation or a question), a new head SHA, or a new Judge review |
 | Prior merge-risk hold released, PR merges | Allow + **mandatory reversal comment** | Pre-merge comment carries `<!-- champion:merge-risk-hold-cleared -->` naming the override honored or the axis that flipped and why; never suppressed by the hold idempotency guard |
 | `loom:auto-merge-ok` present | Allow | Explicit human/Judge override of a merge-risk hold (does not waive critical files); a *previously posted* hold still requires the reversal comment |
 | API rate limit | Error | Comment and continue |

@@ -270,15 +270,35 @@ else
   fi
 
   # (b) An operator comment posted AFTER the hold that explicitly clears it.
-  #     Instruction-shaped phrasing only (mirrors the sweep's explicit-hold
-  #     convention used in the Capped-PR pass), and never a Champion-authored
-  #     comment — Champion must not be able to release its own hold.
+  #     **Instruction-shaped phrasing, mechanically enforced**: the trigger
+  #     phrase must OPEN the comment's leading clause (its first sentence), and
+  #     that clause must not be a question. A plain substring match is not good
+  #     enough — it reads "please do NOT merge anyway", "do not clear the hold
+  #     yet" and "is it ok to merge?" as release signals, i.e. it releases the
+  #     hold on the very comments where a human just reinforced it. Anchoring is
+  #     what rules those out: any negation or interrogative lead-in ("do not",
+  #     "don't", "never", "can we", "should I") necessarily sits *before* the
+  #     phrase, so the phrase is no longer the leading clause. Never a
+  #     Champion-authored comment either — Champion must not release its own hold.
   if [ -z "$RELEASE_REASON" ]; then
     CLEARED=$(jq -r --arg at "$HOLD_AT" '
       [ .comments[]
         | select(.createdAt > $at)
         | select((.body | test("champion:|Automated by Champion role")) | not)
-        | select(.body | test("(clear|clearing|cleared|lift|lifting|lifted|override|overriding)[[:space:]]+(this[[:space:]]+|the[[:space:]]+)?hold|merge[[:space:]]+(it[[:space:]]+)?anyway|ok to merge|proceed with (the )?merge"; "i"))
+        | . as $c
+        # Leading clause = first sentence of the first line (up to the first
+        # . ? or !), minus an optional "@mention " / "please " courtesy prefix.
+        | ( $c.body
+            | sub("^[[:space:]]+"; "")
+            | split("\n")[0]
+            | match("^[^.?!]*[.?!]?").string
+            | sub("^@[A-Za-z0-9_-]+[[:space:]]+"; "")
+            | sub("^please[[:space:]]*,?[[:space:]]*"; ""; "i") ) as $lead
+        # Interrogative mood is a question, not an instruction.
+        | select($lead | test("\\?[[:space:]]*$") | not)
+        # Trigger phrase anchored at the start of that clause.
+        | select($lead | test("^(clear|clearing|cleared|lift|lifting|lifted|override|overriding)([[:space:]]+(this[[:space:]]+|the[[:space:]]+)?hold\\b|[[:space:]]*[:,.—-]|[[:space:]]*$)|^merge[[:space:]]+(it[[:space:]]+)?anyway\\b|^ok[[:space:]]+to[[:space:]]+merge\\b|^proceed[[:space:]]+with[[:space:]]+(the[[:space:]]+)?merge\\b"; "i"))
+        | $c
       ] | last
       | if . == null then "" else "\(.author.login) at \(.createdAt): \(.body | split("\n")[0])" end' <<<"$PR_JSON")
     if [ -n "$CLEARED" ]; then
@@ -356,6 +376,13 @@ tripping release path (b) or (d).
   force-push keeps them held (fail-safe, the conservative direction).
 - **PR closed and reopened** — comments survive, so the hold survives with them.
   A reopened PR is re-held until a real release signal appears.
+- **A comment that *reinforces* or merely *asks about* the hold** — `Please do NOT
+  merge anyway until QA signs off`, `Do not clear the hold yet`, `Is it ok to
+  merge?` — is **not** a release signal. Path (b) matches the trigger phrase only
+  as the leading clause of a non-interrogative first sentence, so a negation or a
+  question lead-in (which must precede the phrase) fails the anchor. The
+  conservative direction is preserved: an unrecognized phrasing leaves the hold in
+  force, which costs one human merge; a false release costs a bad auto-merge.
 
 **Reversal is one mandatory comment, and the idempotency guard must not eat it.**
 Whenever `PRIOR_HOLD=true` and this PR proceeds to merge, Step 2's pre-merge
@@ -417,7 +444,7 @@ merging it automatically:
 **Next steps** — this hold stays in force until one of these happens; Champion re-reading the same diff will **not** clear it:
 - A human merges it directly with \`./.loom/scripts/merge-pr.sh $PR_NUMBER\`
 - Or applies \`loom:auto-merge-ok\` to override the hold; Champion merges on the next tick
-- Or comments here to clear it explicitly (say \`clear the hold\` / \`merge anyway\` / \`ok to merge\` — instruction-shaped phrasing, not a bare 'looks fine')
+- Or comments here to clear it explicitly — **start the comment with the instruction**: \`clear the hold — <why>\`, \`cleared: <why>\`, \`override: <why>\`, \`merge anyway, <why>\`, \`ok to merge — <why>\`. Phrasing that only mentions those words later in a sentence, negates them (\`do not merge anyway\`), or asks about them (\`is it ok to merge?\`) deliberately does **not** release the hold, and neither does a bare 'looks fine'
 - Or the situation actually changes: a new push that narrows the concern, or a deeper Judge re-review
 
 Whichever path releases it, Champion will post a comment naming what changed before it merges.
