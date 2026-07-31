@@ -438,6 +438,15 @@ The subagent-path target is **soft** — there is no hard upper bound and the wa
 
 **Waves parallelize Builders only.** The reason a wave can safely fan out `N` agents at once is that each Builder works in an isolated git worktree and produces **exactly one PR at the end** — no shared mutable forge state is touched mid-run, so two concurrent Builders never collide. `/loom:sweep` itself only ever dispatches Builders (plus per-issue Curator/Judge/Doctor, which run **sequentially within a wave**), so today's wave loop is safe by construction.
 
+**Exception: the git stash stack (#4821).** `refs/stash` is shared across
+*every* linked worktree of the repo, not per-worktree — so if two
+concurrent Builders in a wave both use bare `git stash` for ad-hoc WIP
+handling, one can pop or drop the other's entry (observed in production:
+kicad-tools PRs #4524/#4526). This is the one piece of shared mutable state
+the isolated-worktree argument above does not cover. Builders must use
+`./.loom/scripts/worktree.sh snapshot <issue-number>` (a per-worktree patch
+file) instead of `git stash` for WIP — see `defaults/roles/builder.md`.
+
 **Never dispatch two or more issue-creating agents concurrently.** Agents that **create issues** — Architect proposals, Curator oversized-issue decomposition, Champion epic-phase creation — mutate the forge's **shared, server-assigned issue-number space** with no client-side coordination, transaction, or idempotency key. When two such agents run `gh issue create` bursts at the same time they **race on issue numbers and cross-contaminate bodies** (one epic's title paired with another's body), and any recovery/retry loop that PATCHes-by-title amplifies the damage by winning every write race against the other still-active filer. This is not hypothetical: it was observed 2026-07-21 on a 4-wide wave (1 builder + 3 architects) — 2 duplicate issues, 3 with mismatched title/body, and a corrupted roadmap comment, all needing manual reconciliation (#3707).
 
 Concrete rules for anyone extending this skill or hand-driving a wave:

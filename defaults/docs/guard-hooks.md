@@ -657,6 +657,22 @@ check does not parse `-C`: `git -C <main-checkout-path> stash pop` run from a
 worktree cwd is **not** caught today. If this bypass shows up in practice,
 extend the check to thread `-C` the same way `parse_force_ops` does.
 
+**Worktree-to-worktree collisions (#4821).** The main-checkout-only test above
+protects the *operator-owned* main-checkout stash stack, but `refs/stash` is
+actually a **single stack shared by every linked worktree of the repo**, not
+per-worktree — so two parallel Builders each in a *different* linked
+worktree (neither one the main checkout) can pop or drop each other's entry.
+This is exactly the incident category that motivated #4821 (kicad-tools PRs
+#4524/#4526): two builders in linked worktrees, not the main checkout, raced
+on the shared stash stack. The guard now additionally asks when cwd is a
+linked worktree **and** two or more `.loom-managed` worktrees currently
+exist under `<main>/.loom/worktrees/` (a single active worktree has no one
+else's entry to collide with, so it stays ungated). The prescribed
+prevention remains procedural, not just guard-enforced — prefer
+`./.loom/scripts/worktree.sh snapshot <issue-number>` (patch-file WIP
+capture, scoped to one worktree, no shared stack) over ad-hoc `git stash`
+for WIP handling (see `defaults/roles/builder.md` / `defaults/roles/doctor.md`).
+
 **Examples**:
 
 ```bash

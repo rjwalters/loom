@@ -296,6 +296,27 @@ For detailed worktree workflows, see **builder-worktree.md**.
 - Use `./.loom/scripts/worktree.sh <issue-number>` to create worktrees
 - Work in `.loom/worktrees/issue-N` directories
 
+### Never use bare `git stash` for ad-hoc WIP (#4821)
+
+`refs/stash` is **one stack shared across every linked worktree of the
+repo** — not per-worktree. If you `git stash` / `git stash pop` /
+`git stash drop` to temporarily shelve WIP, a concurrent builder in a
+*different* worktree doing the same thing can pop or drop **your** stash
+entry (or you can pop theirs), silently swapping or discarding uncommitted
+work. This is not hypothetical — it happened in production (kicad-tools PRs
+#4524/#4526).
+
+**Use `./.loom/scripts/worktree.sh snapshot <issue-number>` instead** — it
+writes your WIP as a patch file under
+`<worktree-root>/.snapshots/issue-<N>-<timestamp>.patch`, scoped to your own
+worktree, so there is no shared stack to collide on.
+
+This does **not** apply to the `check-main-clean.sh --quarantine` recovery
+flow below (§"If it exits 3…") — that flow's use of `git stash` operates on
+the **main checkout**, is single-writer by construction (only one agent's
+mistaken edits land in main at a time), and is a distinct, legitimate use
+case (rescuing contamination, not shelving your own WIP).
+
 ## CRITICAL: Never Work on Main Branch
 
 **You MUST work in a worktree, never directly on main.**
