@@ -526,6 +526,15 @@ already requires an explicit `LOOM_CODEX_SANDBOX=workspace-write` +
 decision here is deliberately *not* the same as promoting capability: promotion
 still waits on items 1–3, which are technical evidence, not posture.
 
+Builder-role-only scope means `suggestedWorkerType: "codex"` belongs only on
+`defaults/roles/builder.json` — the hints that previously sat on
+`judge.json`/`curator.json` (read-and-comment roles) predated this decision and
+have been corrected to `"claude"` accordingly. `suggestedWorkerType` is a
+dispatch *preference* hint only (see `runtime-adapters.md` § "Daemon runtime
+binding and admission"); actual admission still runs through
+`runtimeRequirements` + this document's promotion gate above, so the hint
+correction changes no enforced behavior on its own.
+
 When items 1–3 are satisfied, promote **only** the capabilities the evidence
 proves, append the evidence links to this document, and leave `mcp`,
 `subagents`, and `skills` untouched. `subagents` stays `no` regardless — native
