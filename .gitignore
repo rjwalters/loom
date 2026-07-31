@@ -10,6 +10,11 @@ dist-ssr/
 # Test outputs
 coverage/
 
+# Tool caches (regenerable)
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
 # Env files
 .env
 .env.local
