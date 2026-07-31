@@ -433,7 +433,7 @@ Then decide:
 
 | Condition | Verdict | Action |
 |-----------|---------|--------|
-| `STANDDOWN_COUNT >= LOOM_MAX_STANDDOWN_STREAK` (default **3**) | **Stale — bounded fallback** (see below) | Force-reclaim regardless of claim age or `COMMENTS_AFTER`. Breaks the livelock even if the marker/exclusion logic above is somehow bypassed. |
+| `STANDDOWN_COUNT >= LOOM_MAX_STANDDOWN_STREAK` (default **3**) AND claim age ≥ `LOOM_STALE_REVIEWING_MINUTES` (default **30**) | **Stale — bounded fallback** (see below) | Force-reclaim regardless of `COMMENTS_AFTER`. Breaks the livelock even if the marker/exclusion logic above is somehow bypassed — but the streak alone is never enough (#4790): it also requires the claim to have aged past the normal staleness threshold, so a high *peer arrival rate* (several concurrent Judges each standing down within minutes) cannot force-reclaim a claim that is still genuinely fresh. |
 | Claim age < `LOOM_STALE_REVIEWING_MINUTES` (default **30**), OR `COMMENTS_AFTER > 0` | **Fresh** — a Judge is actively working this PR | **Do not stomp the claim.** Post a marked stand-down comment (see below), then skip this PR and continue the batch to the next candidate PR. |
 | Claim age ≥ `LOOM_STALE_REVIEWING_MINUTES` AND `COMMENTS_AFTER == 0` | **Stale** — the claiming Judge's process almost certainly died mid-review | Reclaim (see below), then proceed with the normal review from step 3. |
 | Timeline API call fails or returns empty (`CLAIMED_AT` unset) | **Unknown — fail safe** | Treat as **fresh**. Never stomp a claim on API failure or missing data. |
@@ -456,18 +456,29 @@ gh pr comment $N --body "Judge pass: PR still carries a fresh \`loom:reviewing\`
 <!-- loom:standdown claim=$CLAIMED_AT -->"
 ```
 
-**Bounded fallback (AC3, #4618)**: `STANDDOWN_COUNT` is a hard cap
-independent of the marker-exclusion logic working correctly — it counts how
-many stand-down comments have accumulated against *this exact*
-`$CLAIMED_AT` (the marker embeds it, so a genuine reclaim — which changes
-`CLAIMED_AT` — resets the count to zero automatically). Once
-`LOOM_MAX_STANDDOWN_STREAK` marked comments have piled up against the same
-claim with no reclaim, force-reclaim regardless of age or `COMMENTS_AFTER`,
-using this reclaim comment:
+**Bounded fallback (AC3, #4618; age-floor join added by #4798)**:
+`STANDDOWN_COUNT` is a hard cap independent of the marker-exclusion logic
+working correctly — it counts how many stand-down comments have accumulated
+against *this exact* `$CLAIMED_AT` (the marker embeds it, so a genuine
+reclaim — which changes `CLAIMED_AT` — resets the count to zero
+automatically). But the streak count by itself measures **peer arrival
+rate** (how many other Judges happened to revisit this exact PR), not claim
+liveness — a claim only minutes old can accumulate `LOOM_MAX_STANDDOWN_STREAK`
+stand-downs from that many concurrent Judges without ever coming close to
+stale in the age sense (#4790: a claim 17m36s old, well under the 30-minute
+default `LOOM_STALE_REVIEWING_MINUTES`, was force-reclaimed after 3 Judges
+each stood down within that same ~17m36s window). So the fallback fires only
+once **both** hold: `LOOM_MAX_STANDDOWN_STREAK` marked comments have piled up
+against the same claim with no reclaim, **and** the claim's own age is ≥
+`LOOM_STALE_REVIEWING_MINUTES` — reusing the same age floor the ordinary
+staleness row below already applies. This still force-reclaims regardless of
+`COMMENTS_AFTER` (the whole reason this fallback exists independent of the
+marker-exclusion logic), it just no longer overrides the age check too. Use
+this reclaim comment:
 
 ```bash
 gh pr edit $N --remove-label "loom:reviewing"
-gh pr comment $N --body "Reclaiming loom:reviewing claim: $STANDDOWN_COUNT consecutive stand-down comments have accumulated against claim $CLAIMED_AT with no actual review progress (bounded fallback, LOOM_MAX_STANDDOWN_STREAK=${LOOM_MAX_STANDDOWN_STREAK:-3}) — breaking the livelock."
+gh pr comment $N --body "Reclaiming loom:reviewing claim: $STANDDOWN_COUNT consecutive stand-down comments have accumulated against claim $CLAIMED_AT (age ≥ ${LOOM_STALE_REVIEWING_MINUTES:-30}m) with no actual review progress (bounded fallback, LOOM_MAX_STANDDOWN_STREAK=${LOOM_MAX_STANDDOWN_STREAK:-3}) — breaking the livelock."
 gh pr edit $N --add-label "loom:reviewing"
 # Continue to step 3 (Check merge state) and evaluate normally
 ```
