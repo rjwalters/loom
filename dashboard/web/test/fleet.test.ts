@@ -123,7 +123,51 @@ describe("summarizeTokens", () => {
 
   it("handles a host with no tokens record at all", () => {
     const summary = summarizeTokens({});
-    expect(summary).toEqual({ accounts: [], total: 0, exhausted: 0, peakUsage: undefined });
+    // `hasAccountDetail: true` with an empty pool: nothing is being withheld,
+    // this host simply has not reported a snapshot.
+    expect(summary).toEqual({ accounts: [], total: 0, exhausted: 0, peakUsage: undefined, hasAccountDetail: true });
+  });
+
+  it("reads the public aggregate when per-account rows were withheld", () => {
+    const summary = summarizeTokens({
+      tokens: {
+        record: {
+          kind: "tokens.snapshot",
+          account_count: 13,
+          exhausted_count: 5,
+          mean_usage_fraction: 0.32,
+          max_usage_fraction: 0.91,
+        },
+        updatedAt: "2026-07-30T12:00:00Z",
+      },
+    });
+    expect(summary).toEqual({
+      accounts: [],
+      total: 13,
+      exhausted: 5,
+      peakUsage: 0.91,
+      hasAccountDetail: false,
+    });
+  });
+
+  it("prefers per-account rows over the aggregate when both are present", () => {
+    const summary = summarizeTokens({
+      tokens: {
+        record: {
+          kind: "tokens.snapshot",
+          accounts: [
+            { account: "a", usage_fraction: 0.5, exhausted: false },
+            { account: "b", exhausted: true },
+          ],
+          account_count: 99,
+          exhausted_count: 99,
+        },
+        updatedAt: "2026-07-30T12:00:00Z",
+      },
+    });
+    expect(summary.total).toBe(2);
+    expect(summary.exhausted).toBe(1);
+    expect(summary.hasAccountDetail).toBe(true);
   });
 });
 

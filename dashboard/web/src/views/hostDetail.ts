@@ -152,6 +152,21 @@ function tokensPanel(host: HostView, now: Date): HTMLElement {
       noticeRow("This host has not pushed a tokens.snapshot record yet.", "tokens-missing"),
     );
   }
+  // Withheld and empty look the same in `accounts` but mean opposite things,
+  // so they get separate notices — "no pool provisioned" would be a plainly
+  // wrong statement to show a public visitor about a host with 13 accounts.
+  if (!host.tokens.hasAccountDetail) {
+    return el(
+      "section",
+      { class: "panel", data: { testid: "tokens-panel" } },
+      title,
+      noticeRow(
+        `Per-account detail is not shown in the public view. This host's pool has ` +
+          `${host.tokens.total} account(s), ${host.tokens.exhausted} exhausted. Sign in for the full breakdown.`,
+        "tokens-aggregate-only",
+      ),
+    );
+  }
   if (host.tokens.accounts.length === 0) {
     return el(
       "section",

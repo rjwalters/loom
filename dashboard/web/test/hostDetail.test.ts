@@ -86,6 +86,31 @@ describe("hostDetailView — token panel", () => {
     expect(fill?.getAttribute("style")).toBe("width:100%");
   });
 
+  it("says per-account rows were withheld rather than claiming the pool is empty", () => {
+    const built = buildFleetView(
+      parseFleetSnapshot({
+        hosts: {
+          h: {
+            tokens: {
+              record: { kind: "tokens.snapshot", account_count: 13, exhausted_count: 5, max_usage_fraction: 0.91 },
+              updatedAt: "2026-07-30T12:09:00Z",
+            },
+          },
+        },
+        activeSweeps: [],
+      }),
+      NOW,
+    );
+    const rendered = hostDetailView(built.hosts[0]!, NOW);
+
+    const notice = rendered.querySelector('[data-testid="tokens-aggregate-only"]')?.textContent ?? "";
+    expect(notice).toContain("not shown in the public view");
+    expect(notice).toContain("13 account(s)");
+    expect(notice).toContain("5 exhausted");
+    // The "no token pool provisioned" wording would be actively wrong here.
+    expect(rendered.querySelector('[data-testid="tokens-empty"]')).toBeNull();
+  });
+
   it("distinguishes 'no tokens record' from 'a tokens record with no accounts'", () => {
     expect(detail(IDLE_HOST_ID).querySelector('[data-testid="tokens-empty"]')?.textContent).toContain(
       "no accounts",

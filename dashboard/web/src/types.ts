@@ -53,11 +53,24 @@ export interface TokenAccount {
   exhausted?: boolean;
 }
 
-/** `tokens.snapshot` — point-in-time view of the multi-account token pool. */
+/** `tokens.snapshot` — point-in-time view of the multi-account token pool.
+ *
+ * **Two shapes, by audience.** An authenticated viewer gets `accounts`: the
+ * per-account rows. A public viewer gets the `*_count` / `*_usage_fraction`
+ * aggregate instead, and no `accounts` at all — the account identifiers and
+ * their individual burn stay behind the Access gate (`../../src/redaction.ts`,
+ * `deriveTokenPoolAggregate`). Both shapes are optional here because either
+ * audience sees only one of them; `summarizeTokens` in `fleet.ts` normalizes
+ * the two into one `TokenSummary` so views do not branch on audience. */
 export interface TokensSnapshotRecord {
   kind?: string;
   captured_at?: string;
   accounts?: TokenAccount[];
+  account_count?: number;
+  exhausted_count?: number;
+  mean_usage_fraction?: number | null;
+  max_usage_fraction?: number | null;
+  next_limit_window_reset_at?: string | null;
 }
 
 /** A record plus when the Durable Object last applied it. `updatedAt` is

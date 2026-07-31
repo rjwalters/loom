@@ -76,6 +76,14 @@ export function parseTokensSnapshot(value: unknown): TokensSnapshotRecord {
     kind: str(value.kind),
     captured_at: str(value.captured_at),
     accounts: Array.isArray(value.accounts) ? value.accounts.map(parseTokenAccount) : undefined,
+    // The public aggregate that stands in for `accounts` — see
+    // `TokensSnapshotRecord`'s doc. `num` drops nulls, which is what the
+    // backend sends for "no account reported one".
+    account_count: num(value.account_count),
+    exhausted_count: num(value.exhausted_count),
+    mean_usage_fraction: num(value.mean_usage_fraction),
+    max_usage_fraction: num(value.max_usage_fraction),
+    next_limit_window_reset_at: str(value.next_limit_window_reset_at),
   });
 }
 

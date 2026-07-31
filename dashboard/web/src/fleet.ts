@@ -41,12 +41,19 @@ export type HostStatus =
   | "unknown";
 
 export interface TokenSummary {
+  /** The per-account rows, or `[]` for a public viewer, who is sent an
+   * aggregate instead. `total` is the pool size either way — check
+   * `hasAccountDetail` rather than `accounts.length` to tell "no accounts"
+   * from "accounts withheld". */
   accounts: TokenAccount[];
   total: number;
   exhausted: number;
   /** Highest known `usage_fraction`, or `undefined` when no account reports
    * one. Deliberately not `0` — see `format.ts`'s unknown-is-not-zero rule. */
   peakUsage: number | undefined;
+  /** False when this summary came from the public aggregate, so the
+   * per-account table has nothing to render and should say why. */
+  hasAccountDetail: boolean;
 }
 
 export interface HostView {
@@ -69,17 +76,41 @@ export interface FleetView {
   needsAttention: number;
 }
 
+/**
+ * Normalize either `tokens.snapshot` shape into one `TokenSummary`.
+ *
+ * An authenticated viewer's record carries `accounts` and the totals are
+ * derived from it. A public viewer's record carries the server-computed
+ * aggregate instead (`../../src/redaction.ts`'s `deriveTokenPoolAggregate`)
+ * and the same totals are read straight off it. Views get identical fields
+ * either way — only the per-account table needs to know the difference, via
+ * `hasAccountDetail`.
+ */
 export function summarizeTokens(entry: HostEntry): TokenSummary {
-  const accounts = entry.tokens?.record.accounts ?? [];
-  let peakUsage: number | undefined;
-  let exhausted = 0;
-  for (const account of accounts) {
-    if (account.exhausted) exhausted += 1;
-    if (account.usage_fraction !== undefined) {
-      peakUsage = peakUsage === undefined ? account.usage_fraction : Math.max(peakUsage, account.usage_fraction);
+  const record = entry.tokens?.record;
+  const accounts = record?.accounts;
+
+  if (accounts) {
+    let peakUsage: number | undefined;
+    let exhausted = 0;
+    for (const account of accounts) {
+      if (account.exhausted) exhausted += 1;
+      if (account.usage_fraction !== undefined) {
+        peakUsage = peakUsage === undefined ? account.usage_fraction : Math.max(peakUsage, account.usage_fraction);
+      }
     }
+    return { accounts, total: accounts.length, exhausted, peakUsage, hasAccountDetail: true };
   }
-  return { accounts, total: accounts.length, exhausted, peakUsage };
+
+  return {
+    accounts: [],
+    total: record?.account_count ?? 0,
+    exhausted: record?.exhausted_count ?? 0,
+    peakUsage: record?.max_usage_fraction ?? undefined,
+    // A host that has simply never sent a tokens.snapshot has no record at
+    // all; a public viewer's record exists but withholds the rows.
+    hasAccountDetail: record === undefined,
+  };
 }
 
 /** Newest of the two `updatedAt`s. String compare is safe here *only* because

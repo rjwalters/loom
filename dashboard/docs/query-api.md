@@ -48,9 +48,10 @@ private, unauthenticated response for a given `kind` includes only the
 fields that module's table explicitly lists as safe (lifecycle/timing/
 model/rate fields) — every other field, known or not-yet-invented, is
 dropped by default. See that module's doc comment for the full policy,
-including the explicit decision on `tokens.snapshot`/`host.health` (host-level
-kinds with no `repo` reference — passed through unredacted on both
-surfaces).
+including the explicit decisions on the two host-level kinds (no `repo`
+reference on either): `host.health` passes through unredacted on both
+surfaces, while `tokens.snapshot`'s per-account rows are replaced by a
+non-identifying aggregate for public viewers.
 
 Implementation: [`src/query.ts`](../src/query.ts) (filter parsing, the D1
 query, and the live-tail stream — unclassified), [`src/redaction.ts`](../src/redaction.ts)
@@ -177,8 +178,30 @@ non-integer), or `cursor` (non-positive or non-integer) returns `400` with a
   per-`kind` field allowlist (see `src/redaction.ts`) — e.g. a private
   `sweep.outcome` keeps `model`/`effort`/`config`/`phase_durations`/
   `total_duration_sec`/`result` but never `repo`/`issue`/`sweep_id`/
-  `pr_number`. `tokens.snapshot`/`host.health` records (host-level, no
-  `repo` reference) are never redacted on either route.
+  `pr_number`. `host.health` records (host-level, no `repo` reference) are
+  never redacted on either route.
+
+  `tokens.snapshot` is the one kind whose *shape* differs by route. `/api/*`
+  returns the per-account rows as ingested (`accounts[]`, each with
+  `account`/`rank`/`usage_fraction`/`limit_window_reset_at`/`exhausted`).
+  `/public/*` drops `accounts` entirely and returns a derived aggregate in
+  its place:
+
+  ```json
+  {
+    "kind": "tokens.snapshot",
+    "captured_at": "2026-07-30T12:00:00Z",
+    "account_count": 13,
+    "exhausted_count": 5,
+    "mean_usage_fraction": 0.3246,
+    "max_usage_fraction": 0.91,
+    "next_limit_window_reset_at": "2026-07-30T18:00:00Z"
+  }
+  ```
+
+  How loaded the pool is, and when capacity returns, without naming an
+  account or exposing any single account's burn. The two usage figures are
+  `null` — never `0` — when no account reported a `usage_fraction`.
 
 ## `GET /api/events` / `GET /public/events`
 
