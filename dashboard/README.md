@@ -1,18 +1,21 @@
 # loom-observability-backend
 
-Cloudflare Workers reference backend — **ingest + storage only** — for the
-Loom fleet observability epic ([#4702](https://github.com/rjwalters/loom/issues/4702),
-Phase 2). Accepts the telemetry batches `loom-daemon`'s `HttpsExporter`
+Cloudflare Workers reference backend for the Loom fleet observability epic
+([#4702](https://github.com/rjwalters/loom/issues/4702), Phase 2). Accepts
+the telemetry batches `loom-daemon`'s `HttpsExporter`
 (`loom-daemon/src/observability/exporter.rs`, Phase 1 — #4705) pushes,
-authenticates the sending host, persists durable history to D1, and
-maintains a live "what is running right now" snapshot in a Durable Object.
+authenticates the sending host, persists durable history to D1, maintains a
+live "what is running right now" snapshot in a Durable Object, and exposes
+the read-side query API + live tail (issue #4726) the Phase 3 dashboard UI
+consumes.
 
 Wire format reference: [`.loom/docs/telemetry-schema.md`](../.loom/docs/telemetry-schema.md).
+Query API reference: [`docs/query-api.md`](docs/query-api.md).
 
-**Out of scope for this issue** (later Phase-2 sibling issues / Phase 3):
-a dashboard read/query API, Cloudflare Access auth, visibility-based
-redaction beyond faithfully storing the `visibility` tag, and a polished
-one-click deploy/hosting template (tracked separately — #4728).
+**Out of scope for this repo** (later epic phases): Cloudflare Access auth,
+visibility-based redaction beyond faithfully storing the `visibility` tag
+(#4727, which wraps the query API added here), and a polished one-click
+deploy/hosting template (tracked separately — #4728).
 
 ## Architecture
 
@@ -100,7 +103,13 @@ above are the minimum needed to stand up a working instance.
 | `POST /admin/hosts` | `Authorization: Bearer <ADMIN_TOKEN>` | Provision a host + ingest key (`{"host_id": "..."}`, optional `"key"` to bring your own). |
 | `POST /admin/hosts/:hostId/revoke` | `Authorization: Bearer <ADMIN_TOKEN>` | Revoke a host's key. |
 | `POST /admin/retention/run` | `Authorization: Bearer <ADMIN_TOKEN>` | Run the retention sweep on demand (also runs hourly via `[triggers] crons`). |
-| `GET /admin/fleet-state` | `Authorization: Bearer <ADMIN_TOKEN>` | Read the Durable Object's live snapshot (introspection/manual verification — not the Phase-3 dashboard query API). |
+| `GET /admin/fleet-state` | `Authorization: Bearer <ADMIN_TOKEN>` | Read the Durable Object's live snapshot (operator introspection/manual verification). |
+| `GET /api/fleet-state` | none (unclassified — see #4727) | Phase 3 query API: current state of every known host/sweep. |
+| `GET /api/history` | none (unclassified — see #4727) | Phase 3 query API: filterable, paginated D1 history query. |
+| `GET /api/events` | none (unclassified — see #4727) | Phase 3 query API: SSE live tail of newly-ingested telemetry. |
+
+Full request/response shapes for the `/api/*` routes:
+[`docs/query-api.md`](docs/query-api.md).
 
 ## Design decisions worth knowing
 
