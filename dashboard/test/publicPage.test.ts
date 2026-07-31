@@ -276,8 +276,11 @@ describe("renderPublicPage — full document", () => {
 });
 
 // ---------------------------------------------------------------------------
-// End-to-end: the actual GET /public route, through the real Worker + D1 +
-// Durable Object, mirroring test/redaction.test.ts's integration style.
+// End-to-end: the actual GET / (and GET /public redirect) routes, through
+// the real Worker + D1 + Durable Object, mirroring test/redaction.test.ts's
+// integration style. Issue #4795 moved the always-rendered public page from
+// `/public` to `/` (with an authenticated variant alongside it, covered in
+// index.test.ts) — `/public` itself now only 301s.
 // ---------------------------------------------------------------------------
 
 async function callWorker(request: Request): Promise<Response> {
@@ -303,11 +306,36 @@ beforeEach(async () => {
   await seedHost(env.DB, "host-abc", "abc-ingest-key");
 });
 
-describe("GET /public — end to end", () => {
+describe("GET /public — redirects to /", () => {
+  it("301s to /", async () => {
+    const response = await callWorker(new Request("https://ingest.example/public", { redirect: "manual" }));
+    expect(response.status).toBe(301);
+    expect(response.headers.get("location")).toBe("https://ingest.example/");
+  });
+});
+
+describe("GET /login — bounces back to /", () => {
+  // Access itself gates this path at the edge (config, not code), so by the
+  // time the Worker sees the request the session cookie already exists —
+  // all the route owes the visitor is a trip back to `/`.
+  it("302s to /", async () => {
+    const response = await callWorker(new Request("https://ingest.example/login", { redirect: "manual" }));
+    expect(response.status).toBe(302);
+    expect(response.headers.get("location")).toBe("https://ingest.example/");
+  });
+});
+
+describe("GET / — end to end (anonymous, public fallback)", () => {
   it("serves an HTML page reachable without authentication", async () => {
-    const response = await callWorker(new Request("https://ingest.example/public"));
+    const response = await callWorker(new Request("https://ingest.example/"));
     expect(response.status).toBe(200);
     expect(response.headers.get("content-type")).toContain("text/html");
+  });
+
+  it("includes a Sign in link pointing at /login", async () => {
+    const response = await callWorker(new Request("https://ingest.example/"));
+    const html = await response.text();
+    expect(html).toContain('href="/login"');
   });
 
   it("a private sweep.outcome record's repo/issue/sweep_id never appear on the rendered page", async () => {
@@ -320,7 +348,7 @@ describe("GET /public — end to end", () => {
       }),
     ]);
 
-    const response = await callWorker(new Request("https://ingest.example/public"));
+    const response = await callWorker(new Request("https://ingest.example/"));
     const html = await response.text();
     expect(html).not.toContain("rjwalters/e2e-private-repo");
     expect(html).not.toContain("sweep-issue-8888-0");
@@ -330,7 +358,7 @@ describe("GET /public — end to end", () => {
   it("a public sweep.started record's repo/issue appear on the rendered page (full detail)", async () => {
     await ingest([sweepStartedEnvelope({ visibility: "public", repo: "rjwalters/loom", issue: 4703 })]);
 
-    const response = await callWorker(new Request("https://ingest.example/public"));
+    const response = await callWorker(new Request("https://ingest.example/"));
     const html = await response.text();
     expect(html).toContain("rjwalters/loom");
     expect(html).toContain("#4703");
@@ -339,8 +367,17 @@ describe("GET /public — end to end", () => {
   it("tokens.snapshot's account identifiers never appear on the rendered page", async () => {
     await ingest([tokensSnapshotEnvelope({ accounts: [{ account: "e2e-secret-account", rank: 0, usage_fraction: 0.5, exhausted: false }] })]);
 
-    const response = await callWorker(new Request("https://ingest.example/public"));
+    const response = await callWorker(new Request("https://ingest.example/"));
     const html = await response.text();
     expect(html).not.toContain("e2e-secret-account");
+  });
+
+  it("a garbage CF_Authorization cookie still falls back to the public view, never a 500", async () => {
+    const response = await callWorker(
+      new Request("https://ingest.example/", { headers: { cookie: "CF_Authorization=not-a-real-jwt" } }),
+    );
+    expect(response.status).toBe(200);
+    const html = await response.text();
+    expect(html).toContain("Public View");
   });
 });

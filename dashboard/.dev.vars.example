@@ -10,3 +10,12 @@
 # Bearer token gating every /admin/* route. While unset, those routes answer
 # 503. Generate a real one with: openssl rand -hex 32
 ADMIN_TOKEN="local-dev-admin-token"
+
+# NOTE: CF_ACCESS_TEAM_DOMAIN / CF_ACCESS_AUD (single-URL dashboard root —
+# see docs/cloudflare-access.md) are NOT secrets, so their home is the
+# `[vars]` block in wrangler.toml (which `wrangler dev` already reads),
+# alongside RETENTION_DAYS/MAX_RECORDS — not this file. Uncomment them there
+# to exercise the authenticated `/` branch locally. (`.dev.vars` does
+# override `[vars]` in dev, so putting them here would also work; keeping
+# non-secrets out of the secrets template is simply the convention this repo
+# follows.)
