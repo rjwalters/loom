@@ -65,6 +65,16 @@ const CANCEL_TIMEOUT_BUFFER_MS = 30_000;
  */
 const READ_PATH_TIMEOUT_MS = 30_000;
 
+/**
+ * Mirrors `loom-daemon/src/sweep_registry.rs`'s `UNKNOWN_TOKEN_NAME` constant
+ * (issue #4689) — the sentinel `token_name` value when `spawn_child`'s
+ * observability poll never captured an account-selection line (a timeout, or
+ * `LOOM_SPAWN_NO_EXPORT`), NOT necessarily a failure. Kept as a named
+ * constant so every render site compares against the daemon's exact wire
+ * value instead of a hardcoded `"unknown"` literal that could silently drift.
+ */
+const UNKNOWN_TOKEN_NAME = "unknown";
+
 // ============================================================================
 // Wire types
 // ============================================================================
@@ -1154,6 +1164,30 @@ export const sweepTools: Tool[] = [
 // Handler
 // ============================================================================
 
+/**
+ * Render `dispatch_sweep`'s `Token:` line (issue #4689).
+ *
+ * The daemon genuinely does not know the token yet at the moment
+ * `dispatch()` returns — `spawn_child` polls the child's log for its
+ * account-selection line for up to `TOKEN_NAME_CAPTURE_TIMEOUT` (5s) before
+ * falling back to `UNKNOWN_TOKEN_NAME`, and a slow-but-healthy child startup
+ * is the overwhelmingly common reason. But a bare `Token: unknown` printed
+ * right next to `Success` reads as cosmetic rather than as "not yet known" —
+ * the exact ambiguity that let dead dispatches (killed by a token-selection
+ * failure the daemon now detects and fails fast on synchronously — see
+ * `sweep_registry.rs`'s `preflight-token-selection-failed` handling) look
+ * like launched sweeps. Never print the bare sentinel next to `Success`:
+ * spell out that it means "not yet captured", not "failed".
+ *
+ * Exported (rather than inlined at the one call site) so it is directly
+ * unit-testable without mocking the daemon IPC round-trip.
+ */
+export function formatDispatchTokenLine(tokenName: string): string {
+  return tokenName === UNKNOWN_TOKEN_NAME
+    ? `Token:      ${UNKNOWN_TOKEN_NAME} (not yet captured — child was still starting when this ack was sent; this dispatch itself succeeded)`
+    : `Token:      ${tokenName}`;
+}
+
 function formatSweepLine(info: SweepInfo): string {
   const kind =
     info.kind.type === "Issue"
@@ -1291,7 +1325,7 @@ export async function handleSweepTool(
       const body = [
         `Sweep ID:   ${result.result.sweep_id}`,
         `PID:        ${result.result.pid}`,
-        `Token:      ${result.result.token_name}`,
+        formatDispatchTokenLine(result.result.token_name),
         // Issue #3482 (Phase 3a): echo the dispatched model so the spawn
         // is attributable from the dispatch transcript alone. "default"
         // means no --model flag was emitted (session/CLI default).

@@ -3719,7 +3719,7 @@ impl SweepRegistry {
         // stagger (the default outside production / in tests) is a no-op.
         self.apply_dispatch_stagger();
         let log_path = self.compute_log_path(issue_number);
-        let (child, token_name, runtime) = self
+        let (child, token_name, runtime, immediate_preflight_death) = self
             .spawn_child(
                 issue_number,
                 &log_path,
@@ -3730,6 +3730,52 @@ impl SweepRegistry {
                 runtime_admission.as_ref(),
             )
             .context("failed to spawn sweep child")?;
+
+        // Issue #4689: the child already died — synchronously observed,
+        // before this dispatch call has returned — from `spawn-claude.sh`'s
+        // token-selection preflight step (exit 78 / `EX_CONFIG`). Absent this
+        // check, dispatch would proceed exactly like a healthy launch: label
+        // flipped to `loom:building`, a `Running` entry recorded, and the
+        // caller told `Success` with `Token: unknown` — which reads as
+        // cosmetic rather than as the hard failure it is. The operator then
+        // has to grep the per-sweep log to discover nothing launched (the
+        // reported bug). Bail out HERE, before any of the success-path
+        // bookkeeping below (`self.children`/`self.entries` insert, sweep
+        // journal record, `sweep.global.dispatch` event) has happened, so the
+        // only side effects to unwind are the ones already applied above:
+        // the peer-claim advertisement (3a), the label flip (4), and the
+        // claim lock (3). Reverting those returns the issue to exactly the
+        // pre-dispatch state, and the caller gets a real `Err` — surfaced by
+        // both the CLI (`Daemon rejected the dispatch: ...`) and
+        // `mcp__loom__dispatch_sweep` (`Failed`) — instead of a false
+        // `Success`. Scoped deliberately narrow (only the specific
+        // `preflight-token-selection-failed` class, not every preflight
+        // death shape) to keep this synchronous fast-path change bounded;
+        // other preflight deaths keep flowing through the existing
+        // `reap_once`-driven classification/backoff/quarantine machinery
+        // unchanged.
+        if immediate_preflight_death == Some("preflight-token-selection-failed") {
+            log::warn!(
+                "sweep_registry: issue #{issue_number} sweep_id={sweep_id} child exited \
+                 immediately after token selection failed (#4689) — reverting the claim and \
+                 reporting dispatch as a failure instead of a misleading Success"
+            );
+            if !self.config.skip_label_flip {
+                let _ = self.restore_label_to_ready(issue_number);
+                self.note_label_flip(issue_number); // #4485 flap detection
+            }
+            self.publish_peer_claim(peer_claims::ClaimKind::Retract, issue_number);
+            let _ = self.release_lock_owned(issue_number, &sweep_id);
+            return Err(anyhow!(
+                "issue #{issue_number}: spawned child exited immediately — token selection \
+                 failed (no usable OAuth token in the pool). Add accounts to \
+                 ~/.claude-monitor/accounts.env then `loom-daemon tokens bootstrap`, or re-probe \
+                 an existing pool with `loom-daemon tokens check --ranking`. See the sweep log \
+                 for the exact failure: {}",
+                log_path.display()
+            ));
+        }
+
         let pid = child.id();
         // Retain the handle so the reaper can `try_wait()` it (Issue #3801).
         self.children.insert(sweep_id.clone(), child);
@@ -5496,7 +5542,7 @@ impl SweepRegistry {
         effort: Option<&str>,
         depends_on: Option<u32>,
         runtime_admission: Option<&crate::runtime_admission::ResolvedRuntime>,
-    ) -> Result<(Child, String, String)> {
+    ) -> Result<(Child, String, String, Option<&'static str>)> {
         let spawn_bin = self.config.resolve_spawn_bin()?;
 
         // Ensure log dir exists.
@@ -5724,7 +5770,33 @@ impl SweepRegistry {
         // blocks or fails dispatch.
         let header_anchor = format!("sweep_id={sweep_id}");
         let (token_name, runtime) = poll_observability(&mut child, log_path, &header_anchor);
-        Ok((child, token_name, runtime))
+
+        // Issue #4689: `poll_observability` already blocks (bounded by
+        // `TOKEN_NAME_CAPTURE_TIMEOUT`) until either a token is captured, the
+        // child logs `CLI_START_MARKER`, or the child exits — so by the time
+        // we reach here we may already know, synchronously, that the child
+        // died before ever selecting a token. `token_name == UNKNOWN_TOKEN_NAME`
+        // alone is NOT sufficient signal — that's also the (far more common)
+        // "child is just slow to log its selection, still alive" case, which
+        // must not be misclassified as a failure. Only a CONFIRMED-dead child
+        // (`try_wait` returns `Some`; cheap and side-effect-free here because
+        // `poll_observability` already cached the exit status, per its own
+        // doc comment) combined with an unknown token name is worth reading
+        // the log tail for. `dispatch_inner` uses this to convert the
+        // specific "token selection failed" preflight shape into a hard
+        // `Err` instead of a misleadingly-`Success` `DispatchOutcome` with
+        // `Token: unknown` (the bug this issue reports).
+        let immediate_preflight_death =
+            if token_name == UNKNOWN_TOKEN_NAME && matches!(child.try_wait(), Ok(Some(_))) {
+                tail_lines(log_path, EXHAUSTION_LOG_TAIL_LINES)
+                    .ok()
+                    .map(|lines| lines.join("\n"))
+                    .and_then(|tail| classify_preflight_death(&tail))
+            } else {
+                None
+            };
+
+        Ok((child, token_name, runtime, immediate_preflight_death))
     }
 
     // ------------------------------------------------------------------------
@@ -11258,6 +11330,165 @@ exit 0
             .dispatch(&SweepKind::Issue(4398), None, None, None, None)
             .expect_err("the re-dispatch that used to flap the label must be refused");
         assert!(err.downcast_ref::<DispatchBackoffError>().is_some(), "got: {err}");
+    }
+
+    // --- synchronous token-selection-failure fast path (Issue #4689) ---
+
+    /// Install a fake `gh` (every dispatch-path guard probe answers "open,
+    /// not a PR, no park label, no open linked PR" so dispatch reaches
+    /// `spawn_child`) and a fake `spawn-claude.sh` that reproduces exactly
+    /// what the real script logs immediately before its token-selection
+    /// `exit 78` (`EX_CONFIG`) — no `# CLAUDE_CLI_START` anywhere, matching
+    /// [`preflight_death_signatures`]'s `preflight-token-selection-failed`
+    /// row. Every `gh` invocation is recorded so tests can assert on the
+    /// claim-flip / claim-revert sequence.
+    fn token_selection_failure_registry(ws: &Path) -> (SweepRegistry, PathBuf) {
+        let gh_log = ws.join("gh-invocations.log");
+        let fake_gh = ws.join("fake-gh.sh");
+        // `api repos/*` covers the 2.5 closed-issue guard, the 2.7 park-label
+        // probe, AND `restore_label_to_ready`'s PR-ness probe — all answer
+        // "open issue, no labels" via the SAME line (`--jq` is ignored by this
+        // fixture, matching `closed_guard_registry`'s established pattern:
+        // the harmless JSON payload never happens to equal a park label or a
+        // "true"/"false" pull_request answer, so every reader of it fails
+        // open exactly as intended). `api graphql` (2.6 open-PR guard) prints
+        // nothing ⇒ `NoneOpen`.
+        let script = format!(
+            "#!/usr/bin/env bash\n\
+             printf '%s\\n' \"$*\" >> \"{log}\"\n\
+             if [[ \"$1\" == \"api\" && \"$2\" == repos/* ]]; then\n\
+             printf '%s\\n' '{{\"state\":\"open\",\"is_pr\":false}}'\n\
+             exit 0\n\
+             fi\n\
+             if [[ \"$1\" == \"repo\" && \"$2\" == \"view\" ]]; then\n\
+             printf 'rjwalters/loom\\n'\n\
+             exit 0\n\
+             fi\n\
+             exit 0\n",
+            log = gh_log.display(),
+        );
+        std::fs::write(&fake_gh, &script).unwrap();
+        let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_gh, perms).unwrap();
+        if let Ok(f) = std::fs::File::open(&fake_gh) {
+            let _ = f.sync_all();
+        }
+
+        let scripts_dir = ws.join(".loom").join("scripts");
+        std::fs::create_dir_all(&scripts_dir).unwrap();
+        let spawn = scripts_dir.join("spawn-claude.sh");
+        // The exact prose `defaults/scripts/spawn-claude.sh` logs immediately
+        // before `exit 78` when `loom-daemon tokens select` itself fails.
+        std::fs::write(
+            &spawn,
+            "#!/usr/bin/env bash\n\
+             echo '[2026-07-30T00:00:00Z] ERROR Token selection failed:' >&2\n\
+             echo '[2026-07-30T00:00:00Z] ERROR All 2 tokens in .loom/tokens are marked bad \
+             or empty.' >&2\n\
+             exit 78\n",
+        )
+        .unwrap();
+        let mut sperms = std::fs::metadata(&spawn).unwrap().permissions();
+        sperms.set_mode(0o755);
+        std::fs::set_permissions(&spawn, sperms).unwrap();
+        if let Ok(f) = std::fs::File::open(&spawn) {
+            let _ = f.sync_all();
+        }
+        touch_sweep_command(ws);
+
+        let mut config = SweepRegistryConfig::new(ws.to_path_buf());
+        config.spawn_bin = Some(spawn);
+        config.gh_bin = Some(fake_gh);
+        config.skip_label_flip = false; // exercise the real flip + revert path
+        config.journal_path = Some(ws.join("test-sweeps-journal.json"));
+        (SweepRegistry::new(config), gh_log)
+    }
+
+    /// AC (#4689): a child that exits immediately with the token-selection
+    /// preflight failure must surface as a hard `Err` from `dispatch()` —
+    /// never a `DispatchOutcome` (which `mcp__loom__dispatch_sweep` would
+    /// render as `Success`, `Token: unknown`) — AND the claim taken before
+    /// the child was spawned (the `loom:issue` -> `loom:building` label flip,
+    /// the claim lock) must be fully reverted, so the issue is exactly as
+    /// dispatchable as before this call.
+    #[test]
+    #[serial]
+    fn dispatch_fails_fast_and_reverts_claim_on_immediate_token_selection_failure() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::remove_var("LOOM_REPO");
+        let (mut reg, gh_log) = token_selection_failure_registry(ws);
+
+        let err = reg
+            .dispatch(&SweepKind::Issue(4689), None, None, None, None)
+            .expect_err("an immediate token-selection death must fail dispatch, not Ok");
+        assert!(
+            err.to_string().contains("token selection failed"),
+            "error must name the real cause, not a generic spawn failure; got: {err}"
+        );
+
+        let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            calls.contains("issue edit 4689 --remove-label loom:issue --add-label loom:building"),
+            "the claim WAS taken (label flip happened before the spawn) — got: {calls:?}"
+        );
+        assert!(
+            calls.contains("issue edit 4689 --remove-label loom:building --add-label loom:issue"),
+            "…and must be REVERTED on the synchronous failure path — got: {calls:?}"
+        );
+
+        // No phantom `Running` entry, no leaked lock, no retained child handle.
+        assert!(
+            running_issue_sweep_id(&reg, 4689).is_none(),
+            "a failed dispatch must not leave a Running entry behind"
+        );
+        assert!(
+            !ws.join(".loom/locks/issues/4689").exists(),
+            "the claim lock must be released on the synchronous failure path"
+        );
+        assert!(reg.children.is_empty(), "no child handle should be retained for a dead child");
+    }
+
+    /// Edge case (#4689): a child that DID log a token selection before
+    /// exiting with `EX_CONFIG`/78 (should not happen from the real
+    /// `spawn-claude.sh` — its token-selection step is the very first thing
+    /// it does, before any CLI/runtime work — but is worth pinning
+    /// explicitly) must NOT be misclassified as the synchronous
+    /// "token-selection failed" fast path. `spawn_child`'s guard is keyed on
+    /// `token_name == UNKNOWN_TOKEN_NAME`, so once a real account name was
+    /// captured, `immediate_preflight_death` is unconditionally `None` and
+    /// `dispatch()` returns its normal `Ok(DispatchOutcome)` carrying that
+    /// token name — the exit-78 death (for whatever *other* reason) is left
+    /// to flow through the existing async `reap_once`-driven classification
+    /// exactly as it does today, unchanged by this issue.
+    #[test]
+    #[serial]
+    fn dispatch_succeeds_when_token_was_logged_before_an_exit_78_death() {
+        let dir = tempdir().unwrap();
+        // Logs a real selection first (so `token_name` is captured), THEN
+        // dies with the same exit code and log prose the genuine
+        // token-selection preflight failure uses — deliberately an
+        // unrealistic combination, to prove the guard reads `token_name`,
+        // not the exit code alone.
+        let script = "#!/usr/bin/env bash\n\
+set -uo pipefail\n\
+echo \"spawn-claude: using OAuth account 'agent3-2amlogic' (mode=random)\" >&2\n\
+echo 'ERROR Token selection failed:' >&2\n\
+exit 78\n";
+        let mut registry = lifecycle_registry(dir.path(), script);
+
+        let outcome = registry
+            .dispatch(&SweepKind::Issue(46_890), None, None, None, None)
+            .expect(
+                "a child that logged a real token selection must dispatch Ok, even if it then \
+                 exits 78 for an unrelated reason — only the no-selection-logged shape is the \
+                 #4689 fast-fail case",
+            );
+        assert_eq!(
+            outcome.token_name, "agent3-2amlogic",
+            "the captured selection must be preserved, not overwritten by the exit-78 guard"
+        );
     }
 
     /// The same property for the OTHER quarantine carve-out: a claude-wrapper
