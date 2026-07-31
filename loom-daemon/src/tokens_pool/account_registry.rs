@@ -182,6 +182,40 @@ fn lock_registry(workspace: &Path) -> Result<MkdirLock> {
     MkdirLock::acquire(&path).map_err(|error| anyhow!("failed to lock account registry: {error}"))
 }
 
+/// Pre-registry Codex profiles discovered on disk, expressed as registry
+/// entries. The first mutation of an existing account (`disable`, `enable`,
+/// `remove`) adopts the whole discovered set so `accounts list` keeps showing
+/// manually provisioned profiles once `.loom/accounts.json` exists, and those
+/// mutations work on exactly the accounts `list` shows.
+fn adopted_codex_entries() -> Result<Vec<RegistryEntry>> {
+    let Some(root) = codex_profile_root() else {
+        return Ok(Vec::new());
+    };
+    Ok(discovered_codex_profiles(&root)?
+        .into_iter()
+        .map(|(name, _)| RegistryEntry {
+            provider: AccountProvider::Codex,
+            name: name.clone(),
+            credential_kind: CredentialKind::CodexHome,
+            credential_reference: name,
+            enabled: true,
+        })
+        .collect())
+}
+
+/// Registry entries when the registry file exists, otherwise the discovered
+/// pre-registry inventory. Callers must hold the registry lock.
+fn registry_entries_or_adopted(workspace: &Path) -> Result<Option<Vec<RegistryEntry>>> {
+    if let Some(entries) = read_repo_registry(workspace)? {
+        return Ok(Some(entries));
+    }
+    let adopted = adopted_codex_entries()?;
+    if adopted.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(adopted))
+}
+
 pub(crate) fn register_codex_account(
     workspace: &Path,
     name: &str,
@@ -191,11 +225,26 @@ pub(crate) fn register_codex_account(
     validate_name(name)?;
     validate_name(credential_reference)?;
     let _lock = lock_registry(workspace)?;
+    // Deliberately no pre-registry adoption here: the caller may be creating
+    // the very first profile under the root, and adoption would rediscover the
+    // directory the caller itself just claimed.
     let mut entries = read_repo_registry(workspace)?.unwrap_or_default();
-    if entries
+    if let Some(existing) = entries
         .iter()
-        .any(|entry| entry.provider == AccountProvider::Codex && entry.name == name)
+        .find(|entry| entry.provider == AccountProvider::Codex && entry.name == name)
     {
+        // Idempotent for a byte-identical entry: if a concurrent
+        // `disable`/`enable`/`remove` adopted this caller's in-flight profile
+        // between directory claim and registration, the adopted entry is
+        // exactly the one this call would write, so it must not be treated as
+        // a conflict (and above all must not push the caller into a rollback
+        // that deletes a directory the registry now references).
+        if existing.credential_kind == CredentialKind::CodexHome
+            && existing.credential_reference == credential_reference
+            && existing.enabled == enabled
+        {
+            return Ok(());
+        }
         bail!("Codex account {name:?} already exists");
     }
     entries.push(RegistryEntry {
@@ -211,7 +260,7 @@ pub(crate) fn register_codex_account(
 pub(crate) fn set_codex_account_enabled(workspace: &Path, name: &str, enabled: bool) -> Result<()> {
     validate_name(name)?;
     let _lock = lock_registry(workspace)?;
-    let mut entries = read_repo_registry(workspace)?
+    let mut entries = registry_entries_or_adopted(workspace)?
         .ok_or_else(|| anyhow!("Codex account {name:?} does not exist"))?;
     let entry = entries
         .iter_mut()
@@ -221,17 +270,30 @@ pub(crate) fn set_codex_account_enabled(workspace: &Path, name: &str, enabled: b
     write_repo_registry(workspace, entries)
 }
 
-pub(crate) fn unregister_codex_account(workspace: &Path, name: &str) -> Result<()> {
+/// Secret-free identity of the entry a successful [`unregister_codex_account`]
+/// removed, so callers can restore it verbatim if a later filesystem step of
+/// their transaction fails.
+#[derive(Debug, Clone)]
+pub(crate) struct RemovedCodexEntry {
+    pub(crate) credential_reference: String,
+    pub(crate) enabled: bool,
+}
+
+pub(crate) fn unregister_codex_account(workspace: &Path, name: &str) -> Result<RemovedCodexEntry> {
     validate_name(name)?;
     let _lock = lock_registry(workspace)?;
-    let mut entries = read_repo_registry(workspace)?
+    let mut entries = registry_entries_or_adopted(workspace)?
         .ok_or_else(|| anyhow!("Codex account {name:?} does not exist"))?;
-    let before = entries.len();
-    entries.retain(|entry| !(entry.provider == AccountProvider::Codex && entry.name == name));
-    if entries.len() == before {
-        bail!("Codex account {name:?} does not exist");
-    }
-    write_repo_registry(workspace, entries)
+    let position = entries
+        .iter()
+        .position(|entry| entry.provider == AccountProvider::Codex && entry.name == name)
+        .ok_or_else(|| anyhow!("Codex account {name:?} does not exist"))?;
+    let removed = entries.remove(position);
+    write_repo_registry(workspace, entries)?;
+    Ok(RemovedCodexEntry {
+        credential_reference: removed.credential_reference,
+        enabled: removed.enabled,
+    })
 }
 
 fn validate_codex_directory(root: &Path, reference: &str) -> Result<PathBuf> {
@@ -314,6 +376,28 @@ fn claude_inventory(workspace: &Path) -> Result<Vec<AccountDescriptor>> {
     Ok(out)
 }
 
+/// Codex profile directories discovered directly under `root`, with their
+/// canonical paths. Hidden names are skipped so machine-private state such as
+/// `.quarantine` is never surfaced as an account.
+fn discovered_codex_profiles(root: &Path) -> Result<Vec<(String, PathBuf)>> {
+    let Ok(canonical_root) = root.canonicalize() else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(root)?.filter_map(std::result::Result::ok) {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') || validate_name(&name).is_err() {
+            continue;
+        }
+        let Ok(directory) = validate_codex_directory(&canonical_root, &name) else {
+            continue;
+        };
+        out.push((name, directory));
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
+}
+
 fn codex_inventory(workspace: &Path) -> Result<Vec<AccountDescriptor>> {
     let root = codex_profile_root()
         .ok_or_else(|| anyhow!("Codex profile root is disabled by LOOM_CODEX_PROFILE_ROOT"))?;
@@ -345,18 +429,7 @@ fn codex_inventory(workspace: &Path) -> Result<Vec<AccountDescriptor>> {
             });
         }
     } else {
-        let canonical_root = match root.canonicalize() {
-            Ok(path) => path,
-            Err(_) => return Ok(out),
-        };
-        for entry in std::fs::read_dir(&root)?.filter_map(std::result::Result::ok) {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if validate_name(&name).is_err() {
-                continue;
-            }
-            let Ok(directory) = validate_codex_directory(&canonical_root, &name) else {
-                continue;
-            };
+        for (name, directory) in discovered_codex_profiles(&root)? {
             out.push(AccountDescriptor {
                 id: AccountId {
                     provider: AccountProvider::Codex,
@@ -498,6 +571,8 @@ mod tests {
         let profiles = tempfile::tempdir().unwrap();
         fs::create_dir(profiles.path().join("alice")).unwrap();
         fs::create_dir(profiles.path().join("bob")).unwrap();
+        // Machine-private state below the root must never surface as accounts.
+        fs::create_dir(profiles.path().join(".quarantine")).unwrap();
         std::env::set_var("LOOM_CODEX_PROFILE_ROOT", profiles.path());
         assert_eq!(account_capacity(workspace.path(), AccountProvider::Codex).unwrap(), 2);
         std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
@@ -557,8 +632,11 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn concurrent_registry_updates_do_not_lose_accounts() {
         let workspace = tempfile::tempdir().unwrap();
+        let profiles = tempfile::tempdir().unwrap();
+        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", profiles.path());
         let workspace_path = workspace.path().to_path_buf();
         let start = std::sync::Arc::new(std::sync::Barrier::new(8));
         let handles: Vec<_> = (0..8)
@@ -580,6 +658,7 @@ mod tests {
         assert!(!per_repo_accounts_file(&workspace_path)
             .with_extension("json.lock")
             .exists());
+        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
     }
 
     #[test]

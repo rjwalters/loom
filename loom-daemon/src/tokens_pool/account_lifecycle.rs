@@ -254,8 +254,7 @@ impl<R: CodexCommandRunner> AccountLifecycle<R> {
     pub fn add(&self, name: &str, device_auth: bool) -> Result<AccountStatus> {
         validate_name(name)?;
         self.ensure_absent(name)?;
-        let profile = self.profile(name)?;
-        ensure_private_dir(&profile)?;
+        let profile = self.claim_profile_dir(name)?;
         let result = self.runner.login(&profile, device_auth)?;
         if !result.success {
             if fs::read_dir(&profile)?.next().is_none() {
@@ -263,12 +262,22 @@ impl<R: CodexCommandRunner> AccountLifecycle<R> {
             }
             return Err(login_failure(result));
         }
-        tighten_profile_permissions(&profile)?;
-        let diagnostics = inspect_profile(&profile);
-        if !diagnostics.valid() {
-            bail!("Codex login completed but the profile credential is missing or unsafe");
+        // The post-login commit is all-or-nothing over the (profile, registry)
+        // pair, mirroring `import`: any failure removes the profile this call
+        // created, so the name stays reusable instead of being wedged as an
+        // unregistered credential directory that `remove` cannot reach.
+        let commit = (|| -> Result<()> {
+            tighten_profile_permissions(&profile)?;
+            if !inspect_profile(&profile).valid() {
+                bail!("Codex login completed but the profile credential is missing or unsafe");
+            }
+            register_codex_account(&self.workspace, name, name, true)
+        })();
+        if let Err(error) = commit {
+            fs::remove_dir_all(&profile)
+                .context("account setup failed and new profile rollback also failed")?;
+            return Err(error.context("account setup failed; new profile was removed"));
         }
-        register_codex_account(&self.workspace, name, name, true)?;
         self.status(name)
     }
 
@@ -288,7 +297,7 @@ impl<R: CodexCommandRunner> AccountLifecycle<R> {
         if source == destination {
             bail!("authentication source and destination must differ");
         }
-        ensure_private_dir(&profile)?;
+        self.claim_profile_dir(name)?;
         let staged = profile.join(format!(".auth.json.tmp-{}", std::process::id()));
         let result = (|| -> Result<()> {
             let mut input = OpenOptions::new()
@@ -309,6 +318,9 @@ impl<R: CodexCommandRunner> AccountLifecycle<R> {
         }
         result?;
         if let Err(error) = register_codex_account(&self.workspace, name, name, true) {
+            // Safe to delete unconditionally: `claim_profile_dir` guarantees
+            // this call exclusively created the directory, so a concurrent
+            // winner's profile can never be destroyed by this rollback.
             fs::remove_dir_all(&profile)
                 .context("account registry update failed and imported profile rollback failed")?;
             return Err(error.context("account registry update failed; imported profile removed"));
@@ -397,32 +409,53 @@ impl<R: CodexCommandRunner> AccountLifecycle<R> {
             }
             metadata_result.context("failed to prepare recovery metadata")?;
         }
+        // The registry commit happens *before* the profile leaves its live
+        // location. If the process dies between the two steps, the residue is
+        // an orphan profile directory with no registry entry — annoying but
+        // inert. The previous order (rename, then unregister) could leave a
+        // registry entry pointing at a vanished directory, which poisoned
+        // `codex_inventory` for every account until the registry was
+        // hand-edited.
+        let removed = match unregister_codex_account(&self.workspace, name) {
+            Ok(removed) => removed,
+            Err(error) => {
+                // Registry and profile are both untouched; remove only the
+                // metadata this call staged so the profile is byte-identical
+                // to its pre-command state. Cleanup is best effort and only
+                // annotates the error when residue actually survives.
+                let metadata_left_behind =
+                    !purge && fs::remove_file(&recovery_file).is_err() && recovery_file.exists();
+                let result: Result<RemovalOutcome> =
+                    Err(error.context("account registry update failed; profile is unchanged"));
+                return if metadata_left_behind {
+                    result.context("recovery metadata rollback also failed")
+                } else {
+                    result
+                };
+            }
+        };
         if let Err(error) = fs::rename(&account.credential_reference, &destination) {
-            // A failed rename leaves the live profile in place, but this
-            // invocation already staged `recovery.json` inside it. Remove only
-            // the metadata this call created so the profile is byte-identical
-            // to its pre-command state and a later recoverable removal is not
-            // blocked by stale metadata at `create_new`. The rename error is
-            // the actionable one, so metadata cleanup is best effort and only
-            // annotates the error when residue actually survives.
+            // The profile is still live: restore its registry entry verbatim
+            // and remove the metadata this call staged. The rename error is
+            // the actionable one; rollback failures only annotate it.
+            let reregistered = register_codex_account(
+                &self.workspace,
+                name,
+                &removed.credential_reference,
+                removed.enabled,
+            );
             let metadata_left_behind =
                 !purge && fs::remove_file(&recovery_file).is_err() && recovery_file.exists();
-            let result: Result<RemovalOutcome> =
+            let mut result: Result<RemovalOutcome> =
                 Err(error).context("failed to quarantine profile atomically");
-            return if metadata_left_behind {
-                result.context("recovery metadata rollback also failed")
-            } else {
-                result
-            };
-        }
-        if let Err(error) = unregister_codex_account(&self.workspace, name) {
-            fs::rename(&destination, &account.credential_reference)
-                .context("account registry update failed and profile rollback also failed")?;
-            if !purge {
-                fs::remove_file(&recovery_file)
-                    .context("account registry update failed and metadata rollback also failed")?;
+            if let Err(reregister_error) = reregistered {
+                result =
+                    result.context(format!("registry rollback also failed: {reregister_error:#}"));
             }
-            return Err(error.context("account registry update failed; profile was restored"));
+            if metadata_left_behind {
+                result = result.context("recovery metadata rollback also failed");
+            }
+            return result;
         }
         if purge {
             // Only destroy bytes after the registry commit. A deletion error
@@ -497,6 +530,36 @@ impl<R: CodexCommandRunner> AccountLifecycle<R> {
     fn profile(&self, name: &str) -> Result<PathBuf> {
         validate_name(name)?;
         Ok(self.root.join(name))
+    }
+
+    /// Atomically claim the profile directory for `name`. The non-recursive
+    /// `create_dir` is the mutual-exclusion point for concurrent `add`/`import`
+    /// of the same name: exactly one caller creates the directory and thereby
+    /// owns every later rollback of it; the loser fails here without ever
+    /// touching the winner's files or registration.
+    fn claim_profile_dir(&self, name: &str) -> Result<PathBuf> {
+        let profile = self.profile(name)?;
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        match builder.create(&profile) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                bail!("Codex account {name:?} already exists");
+            }
+            Err(error) => {
+                return Err(anyhow!(error).context("failed to create Codex profile directory"))
+            }
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&profile, fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(profile)
     }
 }
 
@@ -631,6 +694,7 @@ mod tests {
     struct FakeRunner {
         calls: Mutex<Vec<(PathBuf, Vec<String>)>>,
         fail_login: bool,
+        skip_auth_write: bool,
     }
 
     struct StatusRunner(RunnerOutput);
@@ -652,7 +716,7 @@ mod tests {
                 args.push("--device-auth".into());
             }
             self.calls.lock().unwrap().push((profile.into(), args));
-            if !self.fail_login {
+            if !self.fail_login && !self.skip_auth_write {
                 let mut options = OpenOptions::new();
                 options.write(true).create(true).truncate(true);
                 #[cfg(unix)]
@@ -694,6 +758,20 @@ mod tests {
 
     fn setup() -> (tempfile::TempDir, tempfile::TempDir) {
         (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap())
+    }
+
+    /// A manually provisioned (pre-registry) profile with safe permissions,
+    /// as an operator would create with `codex login` by hand.
+    fn provision_manual_profile(root: &Path, name: &str) {
+        let dir = root.join(name);
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join(AUTH_FILE), "recognizable-fake-secret").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::set_permissions(dir.join(AUTH_FILE), fs::Permissions::from_mode(0o600)).unwrap();
+        }
     }
 
     #[test]
@@ -1031,6 +1109,173 @@ mod tests {
         assert!(removed.recovery_reference.is_some());
         assert!(!root.path().join("alice").exists());
         assert!(service.find("alice").is_err());
+        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
+    }
+
+    #[test]
+    #[serial]
+    fn concurrent_import_of_same_name_never_destroys_the_winner() {
+        let (workspace, root) = setup();
+        let source_dir = tempfile::tempdir().unwrap();
+        let source = source_dir.path().join("auth.json");
+        fs::write(&source, "recognizable-fake-secret").unwrap();
+        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", root.path());
+        let service = AccountLifecycle::new(workspace.path(), FakeRunner::default()).unwrap();
+
+        let outcomes: Vec<Result<AccountStatus>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..4)
+                .map(|_| scope.spawn(|| service.import("alice", &source)))
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect()
+        });
+
+        assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
+        for failure in outcomes.iter().filter(|outcome| outcome.is_err()) {
+            let message = format!("{:#}", failure.as_ref().unwrap_err());
+            assert!(message.contains("exists"));
+            assert!(!message.contains("recognizable-fake-secret"));
+        }
+        // No loser's rollback may have deleted the winner's profile or its
+        // registration.
+        assert_eq!(
+            fs::read_to_string(root.path().join("alice").join(AUTH_FILE)).unwrap(),
+            "recognizable-fake-secret"
+        );
+        let listed = service.list(false).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].diagnostics.valid());
+        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
+    }
+
+    #[test]
+    #[serial]
+    fn add_registry_failure_rolls_back_profile_and_frees_the_name() {
+        let (workspace, root) = setup();
+        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", root.path());
+        let service = AccountLifecycle::new(workspace.path(), FakeRunner::default()).unwrap();
+        let lock = per_repo_accounts_file(workspace.path()).with_extension("json.lock");
+        fs::create_dir_all(lock.parent().unwrap()).unwrap();
+        fs::create_dir(&lock).unwrap();
+
+        let error = format!("{:#}", service.add("alice", false).unwrap_err());
+        fs::remove_dir(&lock).unwrap();
+        assert!(error.contains("new profile was removed"));
+        assert!(!error.contains("recognizable-fake-secret"));
+        assert!(!root.path().join("alice").exists());
+        assert!(service.list(false).unwrap().is_empty());
+        // The name is immediately reusable, not permanently wedged.
+        service.add("alice", false).unwrap();
+        assert_eq!(service.list(false).unwrap().len(), 1);
+        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
+    }
+
+    #[test]
+    #[serial]
+    fn add_without_credential_rolls_back_profile_and_frees_the_name() {
+        let (workspace, root) = setup();
+        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", root.path());
+        let broken = AccountLifecycle::new(
+            workspace.path(),
+            FakeRunner {
+                skip_auth_write: true,
+                ..FakeRunner::default()
+            },
+        )
+        .unwrap();
+
+        let error = format!("{:#}", broken.add("alice", false).unwrap_err());
+        assert!(error.contains("new profile was removed"));
+        assert!(!root.path().join("alice").exists());
+        assert!(broken.list(false).unwrap().is_empty());
+        // A later, healthy login can claim the same name.
+        let healthy = AccountLifecycle::new(workspace.path(), FakeRunner::default()).unwrap();
+        healthy.add("alice", false).unwrap();
+        assert_eq!(healthy.list(false).unwrap().len(), 1);
+        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
+    }
+
+    #[test]
+    #[serial]
+    fn discovered_profiles_support_disable_enable_and_remove() {
+        let (workspace, root) = setup();
+        provision_manual_profile(root.path(), "alice");
+        provision_manual_profile(root.path(), "bob");
+        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", root.path());
+        let service = AccountLifecycle::new(workspace.path(), FakeRunner::default()).unwrap();
+
+        let listed = service.list(false).unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(listed
+            .iter()
+            .all(|account| account.provenance == InventoryProvenance::Shared));
+
+        // Mutating one discovered account adopts the whole discovered set, so
+        // `list` shows the same accounts before and after.
+        let disabled = service.disable("alice").unwrap();
+        assert!(!disabled.enabled);
+        let listed = service.list(false).unwrap();
+        assert_eq!(listed.len(), 2);
+        let bob = listed.iter().find(|account| account.name == "bob").unwrap();
+        assert!(bob.enabled);
+
+        assert!(service.enable("alice").unwrap().enabled);
+
+        let removed = service.remove("bob", false).unwrap();
+        assert!(removed.recovery_reference.is_some());
+        assert!(!root.path().join("bob").exists());
+        assert_eq!(service.list(false).unwrap().len(), 1);
+        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
+    }
+
+    #[test]
+    #[serial]
+    fn disable_enable_and_remove_work_pre_registry_without_registry_file() {
+        let (workspace, root) = setup();
+        provision_manual_profile(root.path(), "alice");
+        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", root.path());
+        let service = AccountLifecycle::new(workspace.path(), FakeRunner::default()).unwrap();
+
+        // `remove` on a discovered account adopts and then unregisters it in
+        // one lifecycle command; the quarantine copy keeps the credential.
+        let removed = service.remove("alice", false).unwrap();
+        let recovery = root
+            .path()
+            .join(".quarantine")
+            .join(removed.recovery_reference.unwrap());
+        assert!(recovery.join(AUTH_FILE).exists());
+        assert!(service.list(false).unwrap().is_empty());
+        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
+    }
+
+    #[test]
+    #[serial]
+    fn orphan_profile_directory_does_not_poison_registered_inventory() {
+        let (workspace, root) = setup();
+        let source = root.path().join("source");
+        fs::write(&source, "recognizable-fake-secret").unwrap();
+        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", root.path());
+        let service = AccountLifecycle::new(workspace.path(), FakeRunner::default()).unwrap();
+        service.import("alice", &source).unwrap();
+        service.import("bob", &source).unwrap();
+
+        // Crash residue from the reordered `remove` (killed between the
+        // registry commit and the quarantine rename) is a live directory with
+        // no registry entry. It must not affect any other account's lifecycle.
+        provision_manual_profile(root.path(), "carol");
+        assert_eq!(service.list(false).unwrap().len(), 2);
+        service.disable("alice").unwrap();
+        service.remove("alice", false).unwrap();
+        assert_eq!(service.list(false).unwrap().len(), 1);
+        // Only the orphaned name itself stays blocked until an operator
+        // clears the directory.
+        assert!(service
+            .import("carol", &source)
+            .unwrap_err()
+            .to_string()
+            .contains("exists"));
         std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
     }
 

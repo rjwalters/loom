@@ -260,11 +260,24 @@ targeting the profile's `CODEX_HOME`—never put a secret in argv or registry
 metadata.
 
 Every lifecycle command is all-or-nothing over the (profile, registry) pair. A
-failed `import` removes the profile it committed; a failed `remove` restores the
-live profile, its registry entry, **and** any `recovery.json` that invocation
-staged, so a later recoverable removal is never blocked by residue from a failed
-one. `--purge` destroys credential bytes only after the registry commit
-succeeds, so no failure leaves a registry entry pointing at deleted credentials.
+failed `add` or `import` removes the profile it created, so the name stays
+reusable; concurrent creations of the same name are serialized by an exclusive
+profile-directory claim, so a losing call can never delete the winner's
+credential. A failed `remove` restores the live profile's registry entry
+**and** removes any `recovery.json` that invocation staged, so a later
+recoverable removal is never blocked by residue from a failed one. `remove`
+commits the registry update *before* moving the profile: if the process dies
+mid-command, the residue is an inert orphan directory (only that name is
+blocked until an operator clears it), never a registry entry pointing at a
+vanished directory that would poison `accounts list` for every account.
+`--purge` destroys credential bytes only after the registry commit succeeds.
+
+Manually provisioned profiles (directories created under the profile root
+before `.loom/accounts.json` exists) appear in `accounts list` as discovered
+accounts. The first `disable`, `enable`, or `remove` adopts the whole
+discovered set into the registry, so mutating one discovered account never
+hides the others and lifecycle commands work on exactly the accounts `list`
+shows.
 
 Select a profile at spawn time by any of:
 
