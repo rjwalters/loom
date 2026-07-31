@@ -943,6 +943,12 @@ run_preflight 78 "development-worker (builder alias) -> exit 78" \
     LOOM_ROLE=development-worker CODEX_HOME="$BARE_PROFILE"
 run_preflight 78 "BUILDER (case-insensitive) -> exit 78" \
     LOOM_ROLE=BUILDER CODEX_HOME="$BARE_PROFILE"
+# Issue #4768: a daemon-dispatched sweep child is admitted against Builder's
+# requirements and gets LOOM_ROLE=sweep-lifecycle (never a bare "builder") —
+# it must get the SAME mutable-role fail-closed treatment, not the read-only
+# fallback an unrecognized role would silently take.
+run_preflight 78 "sweep-lifecycle (daemon sweep-child alias) -> exit 78" \
+    LOOM_ROLE=sweep-lifecycle CODEX_HOME="$BARE_PROFILE"
 
 # (6) Read-only roles keep the conservative fallback, with an explicit warning.
 run_preflight 0 "judge + unprovisioned profile -> proceeds (read-only role)" \

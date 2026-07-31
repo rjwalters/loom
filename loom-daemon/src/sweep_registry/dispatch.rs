@@ -1406,6 +1406,19 @@ impl SweepRegistry {
             .stderr(Stdio::from(log_clone));
         if let Some(admission) = runtime_admission {
             cmd.env("LOOM_RUNTIME", &admission.runtime);
+            // Issue #4768: pin the ALREADY-ADMITTED role alongside the runtime
+            // it was admitted for. Without this, a Codex-runtime sweep child
+            // reaches `spawn-codex.sh` with no `LOOM_ROLE` at all (bash env
+            // vars only propagate what the parent process actually set — this
+            // `Command` never set one), which `spawn-codex.sh` treats as an
+            // ambiguous/unknown role and silently takes the READ-ONLY
+            // sandbox-fallback path instead of the mutable-role hook-trust
+            // preflight. `admission.role` is always `"sweep-lifecycle"` here
+            // (a full sweep is modelled as one launch, admitted against
+            // Builder's requirements — see runtime_admission.rs's module
+            // doc), which `spawn-codex.sh` maps onto `builder` for its own
+            // mutable-role check.
+            cmd.env("LOOM_ROLE", &admission.role);
             log::info!(
                 "sweep_registry: admitted role={} runtime={} source={}",
                 admission.role,
@@ -3097,6 +3110,95 @@ exit 0
         assert!(
             recorded.contains(".loom/tokens/agent-1.token"),
             "expected TOKEN_SOURCE to point at .loom/tokens/; got: {recorded}"
+        );
+    }
+
+    /// Issue #4768: the sweep child must receive `LOOM_ROLE=sweep-lifecycle`
+    /// (the ALREADY-ADMITTED role), not just `LOOM_RUNTIME`. Without this, a
+    /// Codex-runtime sweep child reaches `spawn-codex.sh`'s mutable-role
+    /// hook-trust preflight with no role signal at all, which is
+    /// indistinguishable there from an unrecognized role and silently takes
+    /// the read-only fallback instead of failing closed.
+    #[test]
+    #[serial]
+    fn dispatch_sets_loom_role_from_admitted_role() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path();
+        // Installs the runtime-admission fixture (`.loom/roles/builder.json`
+        // + `.loom/runtimes/claude.json`, satisfied by the built-in `claude`
+        // runtime) AND the `/loom:sweep` command marker the 2.x guards
+        // require with `skip_label_flip = false`.
+        touch_sweep_command(workspace);
+
+        // A permissive fake `gh` so every dispatch-path guard (closed-issue,
+        // open-PR, park-label) passes and dispatch reaches `spawn_child`.
+        let fake_gh = workspace.join("fake-gh.sh");
+        let gh_script = format!(
+            "#!/usr/bin/env bash\n\
+             if [[ \"$1\" == \"api\" && \"$2\" == repos/* ]]; then\n\
+             printf '%s\\n' '{state}'\n\
+             exit 0\n\
+             fi\n\
+             if [[ \"$1\" == \"repo\" && \"$2\" == \"view\" ]]; then\n\
+             printf 'rjwalters/loom\\n'\n\
+             exit 0\n\
+             fi\n\
+             exit 0\n",
+            state = state_probe_json("open", false),
+        );
+        std::fs::write(&fake_gh, &gh_script).unwrap();
+        let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_gh, perms).unwrap();
+
+        // Overwrite the fixture's stub spawn-claude.sh with one that records
+        // LOOM_ROLE (and LOOM_RUNTIME, for good measure) to a log file.
+        let scripts_dir = workspace.join(".loom").join("scripts");
+        let fake_bin = scripts_dir.join("spawn-claude.sh");
+        let record_log = workspace.join("role-record.log");
+        let script = format!(
+            r#"#!/usr/bin/env bash
+{{
+  printf 'LOOM_ROLE=%s\n' "${{LOOM_ROLE:-unset}}"
+  printf 'LOOM_RUNTIME=%s\n' "${{LOOM_RUNTIME:-unset}}"
+}} >> "{rec}"
+exit 0
+"#,
+            rec = record_log.display()
+        );
+        std::fs::write(&fake_bin, script).unwrap();
+        let mut perms = std::fs::metadata(&fake_bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_bin, perms).unwrap();
+        if let Ok(f) = std::fs::File::open(&fake_bin) {
+            let _ = f.sync_all();
+        }
+
+        let mut config = SweepRegistryConfig::new(workspace.to_path_buf());
+        // Bypass the runtime-dispatch seam (`resolve_spawn_bin()` would
+        // otherwise find the REAL `defaults/scripts/spawn-worker.sh` and exec
+        // through to the real `spawn-claude.sh`): point `spawn_bin` directly
+        // at the recording fixture, exactly like every other fixture in this
+        // module.
+        config.spawn_bin = Some(fake_bin);
+        config.gh_bin = Some(fake_gh);
+        config.skip_label_flip = false;
+        config.journal_path = Some(workspace.join("test-sweeps-journal.json"));
+        let mut registry = SweepRegistry::new(config);
+
+        let outcome = registry
+            .dispatch(&SweepKind::Issue(4768), None, None, None, None)
+            .unwrap();
+        assert!(outcome.was_new);
+
+        let recorded = assert_child_wrote(&record_log, "LOOM_ROLE=");
+        assert!(
+            recorded.contains("LOOM_ROLE=sweep-lifecycle"),
+            "expected the admitted role (sweep-lifecycle) in the child env; got: {recorded}"
+        );
+        assert!(
+            recorded.contains("LOOM_RUNTIME=claude"),
+            "expected the admitted (built-in) runtime alongside it; got: {recorded}"
         );
     }
 
