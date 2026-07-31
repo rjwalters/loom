@@ -59,13 +59,27 @@ adapted into whatever component model #4749 lands with.
   can never disagree with each other).
 - `src/charts/durations.ts` — p50/p90/p99 duration percentiles, overall and
   broken down by phase.
+- `src/charts/outcomesChartView.ts` — `renderOutcomesChart`: renders
+  `OutcomeBucket[]` as a stacked SVG bar chart, one bar per bucket segmented
+  by result.
+- `src/charts/successRateChartView.ts` — `renderSuccessRateChart`: renders
+  `SuccessRatePoint[]` as an SVG line chart; a bucket with no completed
+  sweeps (`successRate: null`) breaks the line into a gap rather than
+  interpolating through it.
+- `src/charts/durationsChartView.ts` — `renderDurationPercentilesChart`:
+  renders `DurationPercentiles` as a horizontal grouped-bar chart (one row
+  per `overall`/phase, one bar per percentile rank).
+- `src/historicalChartsPanel.ts` — `HistoricalChartsPanel`: owns fetching
+  `/api/history` (or `/public/history`) via `fetchAllHistory` and rendering
+  all three charts from the result; `refresh(filter)` re-fetches (merging
+  the new filter over the last-applied one) and re-renders, so a filter-input
+  UI has one method to call.
 
-**What's deliberately not here (yet):** rendered chart components
-(SVG/canvas/a charting library) and filter UI for the historical charts.
-Those depend on #4749's framework/build-tooling choice. Once that scaffold
-exists, wire a chart component to call `fetchAllHistory` + the relevant
-`charts/*` transform and render the result; every function in the chart layer
-takes and returns plain data, so it needs no adapter.
+Rendering is plain SVG via DOM APIs (no charting library), matching
+`liveFeedPanel.ts` / `sweepTimelineView.ts`'s framework-agnostic approach —
+issue #4751 calls the sibling Fleet-overview scaffold (#4749) a soft
+dependency ("otherwise independently implementable"), the same precedent
+#4750's panel/timeline views already established.
 
 ## Filters
 
@@ -98,6 +112,24 @@ The exact same call with `"/public/history"` in place of `"/api/history"`
 works unchanged against the redacted public dataset — every transform
 tolerates the reduced `record` shape `/public/history` returns for
 `visibility: "private"` rows (see `HistoryRecord`'s doc in `src/types.ts`).
+
+Or let `HistoricalChartsPanel` own fetch + render end to end:
+
+```ts
+import { HistoricalChartsPanel } from "./src/index.js";
+
+const panel = new HistoricalChartsPanel({
+  basePath: "/api/history", // or "/public/history" for the redacted view
+  outcomesContainer: document.querySelector("#outcomes")!,
+  successRateContainer: document.querySelector("#success-rate")!,
+  durationsContainer: document.querySelector("#durations")!,
+  filter: { repo: "rjwalters/loom" },
+});
+
+await panel.refresh();
+// Later, e.g. from a filter form's submit handler:
+await panel.refresh({ since: "2026-07-01T00:00:00Z" });
+```
 
 ## Development
 

@@ -19,10 +19,14 @@ export * from "./timelineBuilder.js";
 export * from "./liveFeedPanel.js";
 export * from "./sweepTimelineView.js";
 
-// Historical-charting data layer (#4751).
+// Historical-charting data layer + chart views (#4751).
 export * from "./historyClient.js";
 export * from "./charts/timeBuckets.js";
 export * from "./charts/correlate.js";
 export * from "./charts/outcomes.js";
 export * from "./charts/successRate.js";
 export * from "./charts/durations.js";
+export * from "./charts/outcomesChartView.js";
+export * from "./charts/successRateChartView.js";
+export * from "./charts/durationsChartView.js";
+export * from "./historicalChartsPanel.js";
