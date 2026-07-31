@@ -1496,19 +1496,30 @@ carries a **pre-push head-SHA recheck** (capture `headRefOid` at claim time,
 re-compare before the final push) — the one race this pass structurally cannot
 cover, since it never hooks into an in-flight Doctor's push.
 
-**Agent-side stand-down marker convention + bounded fallback (#4618).** The
-same self-perpetuating-comment defect fixed on the daemon side above also
-existed in judge.md's and doctor.md's own `COMMENTS_AFTER` heuristic — the
-fast path shared the daemon backstop's blind spot exactly, since both read
-"any comment after the claim" as fresh. Both role prompts now (1) tag every
-stand-down comment they post with `<!-- loom:standdown claim=$CLAIMED_AT -->`
-and exclude marker-tagged comments from `COMMENTS_AFTER`, and (2) count
-marker-tagged comments in a separate `STANDDOWN_COUNT`, force-reclaiming once
-`STANDDOWN_COUNT >= LOOM_MAX_STANDDOWN_STREAK` (default **3**) regardless of
-claim age — a bounded fallback that holds even if the marker-exclusion logic
-above is somehow bypassed. `LOOM_MAX_STANDDOWN_STREAK` is shared by both role
-prompts, mirroring how `LOOM_STALE_REVIEWING_MINUTES`/`LOOM_STALE_TREATING_MINUTES`
-are already shared.
+**Agent-side stand-down marker convention + bounded fallback (#4618, age-floor
+join added by #4798).** The same self-perpetuating-comment defect fixed on
+the daemon side above also existed in judge.md's and doctor.md's own
+`COMMENTS_AFTER` heuristic — the fast path shared the daemon backstop's blind
+spot exactly, since both read "any comment after the claim" as fresh. Both
+role prompts now (1) tag every stand-down comment they post with `<!--
+loom:standdown claim=$CLAIMED_AT -->` and exclude marker-tagged comments from
+`COMMENTS_AFTER`, and (2) count marker-tagged comments in a separate
+`STANDDOWN_COUNT`, force-reclaiming once `STANDDOWN_COUNT >=
+LOOM_MAX_STANDDOWN_STREAK` (default **3**) **AND** the claim's own age is ≥
+`LOOM_STALE_REVIEWING_MINUTES`/`LOOM_STALE_TREATING_MINUTES` — regardless of
+`COMMENTS_AFTER` — a bounded fallback that holds even if the marker-exclusion
+logic above is somehow bypassed. The age floor (#4798) was added after PR
+#4790 showed the streak count alone conflates **peer arrival rate** (several
+concurrent Judges/Doctors each standing down within minutes of each other)
+with **claim liveness**: a claim only 17m36s old — well under the 30-minute
+default — was force-reclaimed purely because 3 Judges happened to revisit it
+in quick succession, not because the claim itself had gone stale. Joining the
+streak condition with the same age floor the ordinary staleness row already
+uses vetoes that false positive while still catching the original #4614
+livelock (a claim genuinely idle for 30+ minutes). `LOOM_MAX_STANDDOWN_STREAK`
+is shared by both role prompts, mirroring how
+`LOOM_STALE_REVIEWING_MINUTES`/`LOOM_STALE_TREATING_MINUTES` are already
+shared.
 
 ## Stacked-PR dependency — #3729 (v1), #3747 (v2 item 1)
 
