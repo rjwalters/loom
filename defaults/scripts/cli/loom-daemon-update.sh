@@ -1091,8 +1091,24 @@ if [[ "$DRY_RUN" == "true" ]]; then
 fi
 
 # ---------- rebuild ----------
+# Non-interactive SSH sessions (the fleet remote-update path, #4695) don't
+# source a login shell's profile, so a rustup-installed cargo living at the
+# default `~/.cargo/bin` is invisible to `command -v cargo` even though it IS
+# installed. Fall back the same way loom-daemon-start.sh:233 already does for
+# launchd/systemd's non-login-shell PATH: prefer sourcing rustup's own
+# `~/.cargo/env` (the canonical PATH-setup snippet rustup writes), and fall
+# back to prepending `~/.cargo/bin` directly if that script isn't present but
+# the binary still is (e.g. a non-rustup or partially-cleaned install).
 if ! command -v cargo >/dev/null 2>&1; then
-    err "cargo not found on PATH — cannot rebuild loom-daemon."
+    if [[ -f "$HOME/.cargo/env" ]]; then
+        # shellcheck disable=SC1091
+        source "$HOME/.cargo/env"
+    elif [[ -x "$HOME/.cargo/bin/cargo" ]]; then
+        export PATH="$HOME/.cargo/bin:$PATH"
+    fi
+fi
+if ! command -v cargo >/dev/null 2>&1; then
+    err "cargo not found on PATH (checked \$HOME/.cargo/bin too) — cannot rebuild loom-daemon. Install Rust via rustup: https://rustup.rs"
     exit 1
 fi
 
