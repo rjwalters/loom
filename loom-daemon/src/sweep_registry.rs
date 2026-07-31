@@ -57,6 +57,7 @@ use crate::peer_claims::{self, ClaimAd, PeerClaimView};
 use crate::quarantine_reconciliation;
 use crate::sweep_journal;
 use crate::sweep_outcomes;
+use crate::telemetry;
 use crate::tokens_pool::bad_tokens;
 use crate::tokens_pool::{self, AccountId, AccountProvider, TerminalClassification};
 use crate::types::{Event, SweepId, SweepInfo, SweepKind, SweepOutcome, SweepState};
@@ -2113,6 +2114,15 @@ pub struct SweepRegistryConfig {
     /// (a machine-level, upsert-keyed liveness snapshot), this is a per-
     /// workspace, append-only history of every terminal sweep outcome.
     pub outcomes_journal_path: Option<PathBuf>,
+    /// Override the `sweep.outcome` telemetry journal path (Issue #4704).
+    /// Defaults to [`sweep_outcomes::default_outcome_telemetry_path`]
+    /// (`<workspace_root>/.loom/logs/sweep-outcome-telemetry.jsonl`,
+    /// env-overridable via `LOOM_SWEEP_OUTCOME_TELEMETRY_JOURNAL_PATH`). Tests
+    /// set this to a tempdir path so telemetry recording never touches a real
+    /// workspace's log directory. A distinct file from
+    /// [`outcomes_journal_path`](Self::outcomes_journal_path) — see the
+    /// `sweep_outcomes` module doc for why the two are kept separate.
+    pub outcome_telemetry_path: Option<PathBuf>,
 }
 
 impl SweepRegistryConfig {
@@ -2126,6 +2136,7 @@ impl SweepRegistryConfig {
             skip_label_flip: false,
             journal_path: None,
             outcomes_journal_path: None,
+            outcome_telemetry_path: None,
         }
     }
 
@@ -2146,6 +2157,16 @@ impl SweepRegistryConfig {
         self.outcomes_journal_path
             .clone()
             .unwrap_or_else(|| sweep_outcomes::default_outcomes_path(&self.workspace_root))
+    }
+
+    /// Resolve the `sweep.outcome` telemetry journal path (Issue #4704):
+    /// `outcome_telemetry_path` explicit override, else
+    /// [`sweep_outcomes::default_outcome_telemetry_path`].
+    #[must_use]
+    pub fn resolve_outcome_telemetry_path(&self) -> PathBuf {
+        self.outcome_telemetry_path
+            .clone()
+            .unwrap_or_else(|| sweep_outcomes::default_outcome_telemetry_path(&self.workspace_root))
     }
 
     /// Resolve the spawn binary, preferring (in order):
@@ -2496,6 +2517,74 @@ pub struct SweepRegistry {
     /// flap logs at most once per [`DEFAULT_FLAP_WINDOW_SECS`] instead of on
     /// every flip.
     flap_warned_at: HashMap<u32, DateTime<Utc>>,
+    /// Observed lifecycle-phase transitions per live sweep (Issue #4704), the
+    /// raw material for the durable `sweep.outcome` record's
+    /// [`phase_durations`](crate::telemetry::SweepOutcomeRecord::phase_durations).
+    ///
+    /// Sampled by [`reap_once`](Self::reap_once) — see
+    /// [`sample_phase_transition`](Self::sample_phase_transition) — because the
+    /// on-disk checkpoint (`.loom/sweep-checkpoint/issue-<N>.json`) is
+    /// *overwritten* at each phase boundary and **deleted** by the sweep skill
+    /// on success, so it is a point-in-time value, never a history. Keeping the
+    /// observations in the registry is what lets a completed sweep's record
+    /// carry a real per-phase breakdown after its checkpoint is gone.
+    ///
+    /// Keyed by `SweepId` (not issue) so a re-dispatch starts a fresh history,
+    /// and pruned alongside entry GC in [`reap_once`](Self::reap_once) exactly
+    /// like [`watchdog_progressed`](Self::watchdog_progressed). Each vector is
+    /// capped at [`MAX_PHASE_OBSERVATIONS`] so a pathological Judge/Doctor loop
+    /// cannot grow it without bound.
+    phase_history: HashMap<SweepId, Vec<PhaseObservation>>,
+}
+
+/// One observed lifecycle-phase transition for a live sweep (Issue #4704):
+/// the checkpoint phase marker and the instant [`SweepRegistry::reap_once`]
+/// first observed it.
+#[derive(Debug, Clone, PartialEq)]
+struct PhaseObservation {
+    /// The raw checkpoint phase marker (`"curator-done"`, `"judge-rejected"`,
+    /// …) exactly as `sweep-checkpoint.sh` wrote it. Normalized to a lifecycle
+    /// phase name by [`phase_label`] only at record-build time, so the stored
+    /// observation stays faithful to what was on disk.
+    phase: String,
+    /// When this transition was first observed (reaper tick time, not the
+    /// checkpoint's own `updated_at` — see [`SweepRegistry::sample_phase_transition`]).
+    at: DateTime<Utc>,
+    /// The `pr_number` the checkpoint carried at this observation, when it
+    /// carried one (the sweep skill records it from `builder-done` onward).
+    /// Capturing it here is what lets a *successful* sweep's outcome record
+    /// name its PR without a forge round trip — the checkpoint itself is
+    /// deleted on success, before the record is written.
+    pr_number: Option<u32>,
+}
+
+/// Cap on retained [`PhaseObservation`]s per sweep (Issue #4704). A normal
+/// lifecycle records at most ~6 (curator/builder/judge/doctor/judge/merge); the
+/// Judge↔Doctor cycle is already bounded by the escalation ladder, so this cap
+/// is a defensive backstop against an unbounded loop, not a normal-path limit.
+/// Observations past the cap are dropped (the earliest are kept — they are the
+/// ones the per-phase breakdown is built from).
+const MAX_PHASE_OBSERVATIONS: usize = 32;
+
+/// The normalized lifecycle phase name (see [`phase_label`]) whose completion
+/// means the sweep merged — the `Success` signal for the durable
+/// `sweep.outcome` record (Issue #4704).
+const MERGE_PHASE_LABEL: &str = "merge";
+
+/// Normalize a checkpoint phase marker to the lifecycle phase name the
+/// telemetry schema documents (Issue #4704): `"curator-done"` → `"curator"`,
+/// `"judge-rejected"` → `"judge"`, `"merge-done"` → `"merge"`. A marker with
+/// neither known suffix is passed through unchanged rather than being guessed
+/// at, so a future `VALID_PHASES` addition degrades to a readable raw label
+/// instead of a truncated one.
+#[must_use]
+fn phase_label(checkpoint_phase: &str) -> &str {
+    for suffix in ["-done", "-rejected"] {
+        if let Some(head) = checkpoint_phase.strip_suffix(suffix) {
+            return head;
+        }
+    }
+    checkpoint_phase
 }
 
 /// Classification of a pre-flip label read (Issue #4085). Detection only — the
@@ -2585,6 +2674,7 @@ impl SweepRegistry {
             dispatch_backoff: HashMap::new(),
             label_flip_log: HashMap::new(),
             flap_warned_at: HashMap::new(),
+            phase_history: HashMap::new(),
         }
     }
 
@@ -2625,6 +2715,7 @@ impl SweepRegistry {
             dispatch_backoff: HashMap::new(),
             label_flip_log: HashMap::new(),
             flap_warned_at: HashMap::new(),
+            phase_history: HashMap::new(),
         }
     }
 
@@ -4238,6 +4329,10 @@ impl SweepRegistry {
     /// reaping. Deliberately independent of the bus emission's own success —
     /// the two are separate side effects of the same terminal transition (see
     /// the `sweep_outcomes` module doc).
+    // One parameter per journaled field; they come from four different points
+    // in the reaper's terminal branches, so bundling them into a struct would
+    // only move the same argument list to the construction site.
+    #[allow(clippy::too_many_arguments)]
     fn append_outcome_journal(
         &self,
         issue: u32,
@@ -4246,6 +4341,7 @@ impl SweepRegistry {
         exit_code: Option<i32>,
         death_class: Option<String>,
         duration_sec: i64,
+        result: telemetry::SweepResult,
     ) {
         let path = self.config.resolve_outcomes_journal_path();
         let token_name = self
@@ -4271,6 +4367,277 @@ impl SweepRegistry {
                 path.display()
             );
         }
+        // Durable `sweep.outcome` telemetry record (Issue #4704, absorbs
+        // #4137) — a SEPARATE journal from the one above (see the
+        // `sweep_outcomes` module doc for why), carrying model/config/result
+        // detail the #4644 journal was never meant to hold. Independent
+        // best-effort side effect: never allowed to block reaping.
+        self.append_outcome_telemetry_journal(issue, sweep_id, duration_sec, result);
+    }
+
+    /// Append one `sweep.outcome` telemetry record (Issue #4704, absorbs
+    /// #4137) for `sweep_id`'s terminal transition, wrapped in a
+    /// [`telemetry::TelemetryEnvelope`] and appended to the journal
+    /// [`sweep_outcomes::append_outcome_telemetry`] manages. Called only from
+    /// [`append_outcome_journal`](Self::append_outcome_journal) so every
+    /// #4644 terminal-outcome line has a paired telemetry line.
+    ///
+    /// Best-effort like its sibling: a write failure is logged and swallowed.
+    /// Everything except the repo slug + visibility tag is derived from state
+    /// this registry already holds (the entry, plus the phase/PR observations
+    /// it sampled while the sweep ran), so a terminal transition costs no forge
+    /// round trip beyond the one cached `owner/repo` + visibility lookup — and
+    /// even that is skipped entirely (never shelling to `gh`) when
+    /// `skip_label_flip` is set, matching every other real-forge probe in this
+    /// file. A skipped lookup still writes the record, with best-effort
+    /// (workspace-path `repo`, private `visibility`) values.
+    fn append_outcome_telemetry_journal(
+        &self,
+        issue: u32,
+        sweep_id: &str,
+        duration_sec: i64,
+        result: telemetry::SweepResult,
+    ) {
+        let info = self.entries.get(sweep_id);
+        let model = info.and_then(|i| i.model.clone());
+        let effort = info.and_then(|i| i.effort.clone());
+        let runtime = info.map(|i| i.runtime.clone());
+        let token_name = info
+            .map(|i| i.token_name.clone())
+            .unwrap_or_else(|| UNKNOWN_TOKEN_NAME.to_string());
+        let latest_phase = info.and_then(|i| i.latest_phase.clone());
+        let started_at = info.map(|i| i.started_at);
+
+        let mut config = BTreeMap::new();
+        if let Some(runtime) = runtime {
+            config.insert("runtime".to_string(), runtime);
+        }
+        config.insert("token_account".to_string(), token_name);
+
+        // Per-phase breakdown from the transition history this registry
+        // sampled while the sweep was alive (see `sample_phase_transition`).
+        // Fallback (history empty — e.g. a sweep reconstructed after a daemon
+        // restart, or one that died before the first reaper tick): a single
+        // best-effort entry naming the last known phase, attributed the whole
+        // duration. Empty when neither is available, never a fabricated phase.
+        let phase_durations = started_at
+            .map(|started_at| self.phase_durations_for(sweep_id, started_at))
+            .unwrap_or_default();
+        let phase_durations = if phase_durations.is_empty() {
+            latest_phase
+                .map(|phase| {
+                    vec![telemetry::PhaseDuration {
+                        phase: phase_label(&phase).to_string(),
+                        duration_sec,
+                    }]
+                })
+                .unwrap_or_default()
+        } else {
+            phase_durations
+        };
+
+        // The sweep's own PR, taken from the checkpoint values sampled while it
+        // ran (free), falling back to the checkpoint still on disk for a sweep
+        // that died before any sampling tick. Deliberately NOT a
+        // `probe_open_linked_pr` GraphQL round trip: that would add one forge
+        // call per terminal transition on the reaper's hot path (the exact
+        // pressure the fleet rate-limit work exists to relieve), and it answers
+        // a weaker question — "does the issue have any open linked PR" rather
+        // than "which PR did this sweep produce".
+        let pr_number = self.sampled_pr_number(sweep_id).or_else(|| {
+            let started_at = started_at?;
+            let checkpoint = self
+                .config
+                .checkpoint_dir()
+                .join(format!("issue-{issue}.json"));
+            checkpoint_written_by_run(&checkpoint, started_at)
+                .then(|| read_checkpoint_pr_number(&checkpoint))
+                .flatten()
+        });
+
+        let (repo, visibility) = if self.config.skip_label_flip {
+            (
+                self.config.workspace_root.display().to_string(),
+                telemetry::RepoVisibility::Private,
+            )
+        } else {
+            let repo_slug = self
+                .resolve_owner_repo()
+                .map(|(owner, repo)| format!("{owner}/{repo}"));
+            let visibility = repo_slug
+                .as_deref()
+                .map(telemetry::visibility::derive_visibility)
+                .unwrap_or(telemetry::RepoVisibility::Private);
+            let repo =
+                repo_slug.unwrap_or_else(|| self.config.workspace_root.display().to_string());
+            (repo, visibility)
+        };
+
+        let outcome_record = telemetry::SweepOutcomeRecord {
+            repo,
+            visibility,
+            issue,
+            sweep_id: sweep_id.to_string(),
+            model,
+            effort,
+            config,
+            phase_durations,
+            total_duration_sec: duration_sec,
+            result,
+            pr_number,
+        };
+        let envelope = telemetry::TelemetryEnvelope::new(
+            host_identity(),
+            telemetry::TelemetryRecord::SweepOutcome(outcome_record),
+        );
+        let path = self.config.resolve_outcome_telemetry_path();
+        if let Err(e) = sweep_outcomes::append_outcome_telemetry(&path, &envelope) {
+            log::warn!(
+                "sweep_outcomes: failed to append sweep.outcome telemetry record for issue \
+                 #{issue} ({sweep_id}) at {}: {e} — best-effort, not blocking reap (#4704)",
+                path.display()
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // Lifecycle-phase transition sampling (Issue #4704)
+    // ------------------------------------------------------------------------
+
+    /// Record a lifecycle-phase transition for a **live** sweep when the
+    /// on-disk checkpoint has advanced since the last observation (Issue
+    /// #4704). Called once per live entry per [`reap_once`](Self::reap_once)
+    /// tick — which includes the read-path reaps (`ListSweeps` /
+    /// `GetSweepStatus` → [`reap_liveness`](Self::reap_liveness)), so the
+    /// effective sampling resolution is at worst the 30s reaper timer and
+    /// usually finer.
+    ///
+    /// Sampling — rather than reading a history off disk — is required because
+    /// `sweep-checkpoint.sh` *overwrites* the checkpoint at every phase
+    /// boundary and the sweep skill **deletes** it on success: the file is a
+    /// point-in-time value that is gone precisely when a successful sweep's
+    /// record is written. The #4009 freshness guard
+    /// ([`checkpoint_written_by_run`]) still applies, so a checkpoint left by
+    /// an earlier dispatch of the same issue is never misattributed to this
+    /// run.
+    ///
+    /// The timestamp recorded is the *observation* instant, not the
+    /// checkpoint's own `updated_at`: the daemon only ever reads the phase
+    /// string (`read_checkpoint_phase`), and an observation time is the honest
+    /// upper bound on when the transition happened given a polled source.
+    ///
+    /// The checkpoint's `pr_number` is captured on the same read (it is written
+    /// by the sweep skill from `builder-done` onward), which is what lets the
+    /// terminal record carry the sweep's own PR **without** a forge round trip
+    /// — including for a successful sweep, whose checkpoint is deleted before
+    /// the record is written.
+    fn sample_phase_transition(
+        &mut self,
+        sweep_id: &str,
+        kind: &SweepKind,
+        started_at: DateTime<Utc>,
+    ) {
+        let SweepKind::Issue(issue) = kind else {
+            return;
+        };
+        let checkpoint = self
+            .config
+            .checkpoint_dir()
+            .join(format!("issue-{issue}.json"));
+        if !checkpoint_written_by_run(&checkpoint, started_at) {
+            return;
+        }
+        let Some(phase) = read_checkpoint_phase(&checkpoint) else {
+            return;
+        };
+        let pr_number = read_checkpoint_pr_number(&checkpoint);
+        let history = self.phase_history.entry(sweep_id.to_string()).or_default();
+        if history.last().map(|o| o.phase.as_str()) == Some(phase.as_str()) {
+            // Unchanged phase since the previous tick — the common case. Still
+            // absorb a `pr_number` that appeared after the transition was first
+            // observed, so a PR opened mid-phase is not lost.
+            if let Some(last) = history.last_mut() {
+                if last.pr_number.is_none() {
+                    last.pr_number = pr_number;
+                }
+            }
+            return;
+        }
+        if history.len() >= MAX_PHASE_OBSERVATIONS {
+            return;
+        }
+        history.push(PhaseObservation {
+            phase,
+            at: Utc::now(),
+            pr_number,
+        });
+    }
+
+    /// The most recent `pr_number` observed on this sweep's checkpoint (Issue
+    /// #4704), or `None` when the sweep never reached a phase that records one.
+    /// Free (no forge call) — see [`sample_phase_transition`](Self::sample_phase_transition).
+    fn sampled_pr_number(&self, sweep_id: &str) -> Option<u32> {
+        self.phase_history
+            .get(sweep_id)?
+            .iter()
+            .rev()
+            .find_map(|o| o.pr_number)
+    }
+
+    /// Whether this sweep was ever observed completing the Merge phase (Issue
+    /// #4704) — the strongest available "this sweep merged" signal, and the
+    /// [`telemetry::SweepResult::Success`] the schema documents ("merged, or
+    /// otherwise reached its successful terminal state").
+    ///
+    /// Load-bearing because exit codes are not always available: an entry with
+    /// no retained `Child` handle (reconstructed after a daemon restart) is
+    /// reaped via the `kill(pid, 0)` probe, which yields no code at all — so a
+    /// merged sweep would otherwise be recorded as a failure purely because its
+    /// exit status was unobservable.
+    fn sampled_reached_merge(&self, sweep_id: &str) -> bool {
+        self.phase_history.get(sweep_id).is_some_and(|history| {
+            history
+                .iter()
+                .any(|o| phase_label(&o.phase) == MERGE_PHASE_LABEL)
+        })
+    }
+
+    /// Build the `sweep.outcome` record's per-phase breakdown from the
+    /// transition history sampled for `sweep_id` (Issue #4704).
+    ///
+    /// The checkpoint markers are phase *completions* (`curator-done` means the
+    /// Curator phase finished), so the duration attributed to a phase is the
+    /// interval ending at its own observation and beginning at the previous
+    /// observation — or at `started_at` for the first. A phase that appears
+    /// twice in one lifecycle (the Judge↔Doctor cycle) yields two entries, in
+    /// lifecycle order, which is more faithful than collapsing them.
+    ///
+    /// The trailing in-flight segment — from the last observed completion to
+    /// the terminal transition — is deliberately **not** emitted: the daemon
+    /// does not know which phase the sweep was in, and inventing one would be a
+    /// fabricated label. So the entries sum to at most `total_duration_sec`,
+    /// never more.
+    fn phase_durations_for(
+        &self,
+        sweep_id: &str,
+        started_at: DateTime<Utc>,
+    ) -> Vec<telemetry::PhaseDuration> {
+        let Some(history) = self.phase_history.get(sweep_id) else {
+            return Vec::new();
+        };
+        let mut out = Vec::with_capacity(history.len());
+        let mut prev = started_at;
+        for observation in history {
+            // `max(0)` guards against a clock step between observations; a
+            // negative duration on the wire would be nonsense to any consumer.
+            let duration_sec = (observation.at - prev).num_seconds().max(0);
+            out.push(telemetry::PhaseDuration {
+                phase: phase_label(&observation.phase).to_string(),
+                duration_sec,
+            });
+            prev = observation.at;
+        }
+        out
     }
 
     // ------------------------------------------------------------------------
@@ -6058,8 +6425,19 @@ impl SweepRegistry {
             }
             // Durable terminal-outcome record (Issue #4644) — a cancel is a
             // deliberate terminal transition too, so it gets the same
-            // append-only journal line as a reaper-observed death.
-            self.append_outcome_journal(*issue, sweep_id, "exited", None, None, duration_sec);
+            // append-only journal line as a reaper-observed death. The
+            // telemetry `result` (#4704) is unambiguously `Cancelled` here —
+            // an operator/watchdog-initiated cancel, not a self-terminated
+            // success or failure.
+            self.append_outcome_journal(
+                *issue,
+                sweep_id,
+                "exited",
+                None,
+                None,
+                duration_sec,
+                telemetry::SweepResult::Cancelled,
+            );
             self.emit_event(Event::SweepExited {
                 issue: *issue,
                 exit_code: None,
@@ -6151,6 +6529,13 @@ impl SweepRegistry {
             if !matches!(state, SweepState::Running | SweepState::Pending) {
                 continue;
             }
+            // Sample the live checkpoint phase BEFORE the liveness probe
+            // (Issue #4704) so the tick that observes a death still captures
+            // the last phase the sweep reached — the durable `sweep.outcome`
+            // record's per-phase breakdown is built from this history, and the
+            // checkpoint itself is overwritten per phase (and deleted on
+            // success), so nothing else preserves it.
+            self.sample_phase_transition(&sweep_id, &kind, started_at);
             // Liveness via the retained `Child` handle when we own it: this
             // `try_wait()`s the child, reaping any zombie (Issue #3801) and
             // yielding the real exit code. Reconstructed entries with no
@@ -6259,7 +6644,17 @@ impl SweepRegistry {
                             // BEFORE the bus emission below moves `death_class`
                             // — independent best-effort side effects of the
                             // same terminal transition (never coupled to the
-                            // bus publish's own success).
+                            // bus publish's own success). The telemetry
+                            // `result` (#4704) is `Failure` — a checkpoint the
+                            // sweep skill never got to delete means the
+                            // lifecycle did not complete — UNLESS the merge
+                            // phase was observed to complete, in which case the
+                            // work did land and the death came after it.
+                            let telemetry_result = if self.sampled_reached_merge(&sweep_id) {
+                                telemetry::SweepResult::Success
+                            } else {
+                                telemetry::SweepResult::Failure
+                            };
                             self.append_outcome_journal(
                                 issue,
                                 &sweep_id,
@@ -6267,6 +6662,7 @@ impl SweepRegistry {
                                 exit_code,
                                 death_class.clone(),
                                 duration_sec,
+                                telemetry_result,
                             );
                             events_to_emit.push(Event::SweepCrashed {
                                 issue,
@@ -6567,6 +6963,31 @@ impl SweepRegistry {
                                 && exit_code != Some(0);
                             let death_class = self.record_preflight_streak(&sweep_id, insta_crash);
                             let is_preflight_death = death_class.is_some();
+                            // Telemetry `result` classification (#4704),
+                            // strongest signal first:
+                            //   1. An observed `merge-done` means the sweep
+                            //      merged — the schema's `Success` — even when
+                            //      no exit code was captured (the kill-probe
+                            //      path yields none).
+                            //   2. `no_progress` (computed above) flags the
+                            //      pathological "clean exit, zero forward
+                            //      progress" shape as a failure.
+                            //   3. Otherwise a verified clean exit (code 0) is
+                            //      the best success signal available without an
+                            //      extra forge round trip (a self-skip or a
+                            //      completed run); anything else — including an
+                            //      UNKNOWN exit status — is a failure, since an
+                            //      unobservable exit is not evidence of
+                            //      success.
+                            let telemetry_result = if self.sampled_reached_merge(&sweep_id) {
+                                telemetry::SweepResult::Success
+                            } else if no_progress {
+                                telemetry::SweepResult::Failure
+                            } else if exit_code == Some(0) {
+                                telemetry::SweepResult::Success
+                            } else {
+                                telemetry::SweepResult::Failure
+                            };
                             // Durable terminal-outcome record (Issue #4644),
                             // BEFORE the bus emission below moves
                             // `death_class` — see the sibling call in the
@@ -6578,6 +6999,7 @@ impl SweepRegistry {
                                 exit_code,
                                 death_class.clone(),
                                 duration_sec,
+                                telemetry_result,
                             );
                             events_to_emit.push(Event::SweepExited {
                                 issue,
@@ -6711,6 +7133,11 @@ impl SweepRegistry {
             // terminal — the watchdog only ever consults the latch for
             // Running/Pending entries it still owns a Child handle for.
             self.watchdog_progressed.remove(&id);
+            // Prune the per-SweepId phase-transition history for the same
+            // reason (Issue #4704): its only consumer is the durable
+            // `sweep.outcome` record, which was already written at this
+            // entry's terminal transition an hour ago.
+            self.phase_history.remove(&id);
             changes += 1;
         }
         changes
@@ -8447,6 +8874,19 @@ fn read_checkpoint_phase(path: &Path) -> Option<String> {
         .map(ToString::to_string)
 }
 
+/// Best-effort extraction of the `pr_number` field from a sweep checkpoint
+/// JSON file (Issue #4704). Same opaque-file discipline as
+/// [`read_checkpoint_phase`]: one field, no schema coupling. `null` (the
+/// pre-Builder shape `sweep-checkpoint.sh` writes) and any non-numeric or
+/// out-of-range value yield `None`.
+fn read_checkpoint_pr_number(path: &Path) -> Option<u32> {
+    let s = std::fs::read_to_string(path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&s).ok()?;
+    v.get("pr_number")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())
+}
+
 /// Returns `true` when the checkpoint at `path` was last written at or after
 /// `started_at` — i.e. by the sweep run that began at `started_at` — rather than
 /// being a stale artifact left on disk by an earlier dispatch (#4009).
@@ -8851,6 +9291,8 @@ exit 0
         // Confine the #4644 durable terminal-outcomes journal to this test's
         // tempdir too, so tests can assert against a known path.
         config.outcomes_journal_path = Some(workspace.join("test-sweep-outcomes.jsonl"));
+        // Confine the #4704 sweep.outcome telemetry journal likewise.
+        config.outcome_telemetry_path = Some(workspace.join("test-sweep-outcome-telemetry.jsonl"));
         (SweepRegistry::new(config), record_log)
     }
 
@@ -11638,6 +12080,417 @@ exit 78\n";
             records.iter().any(|r| r.issue == 4646),
             "the durable journal entry must survive reap_once's in-memory GC"
         );
+    }
+
+    // ------------------------------------------------------------------------
+    // `sweep.outcome` telemetry journal (Issue #4704, absorbs #4137)
+    // ------------------------------------------------------------------------
+
+    /// AC: every terminal transition that journals a #4644 [`OutcomeRecord`]
+    /// ALSO journals a paired `sweep.outcome` telemetry record carrying
+    /// model/config/result/refs the narrower #4644 record does not — the
+    /// crashed shape here, `Failure`.
+    #[test]
+    fn telemetry_outcome_records_crashed_terminal_as_failure() {
+        let dir = tempdir().unwrap();
+        let mut registry = backoff_registry(dir.path(), 60, 900);
+
+        let sweep_id = insert_dead_running_with_log(
+            &mut registry,
+            4704,
+            0,
+            "agent-4",
+            "==== loom-daemon dispatch: sweep-issue-4704-0 ====\nToken selection failed:\n",
+        );
+        if let Some(info) = registry.entries.get_mut(&sweep_id) {
+            info.model = Some("opus".to_string());
+            info.effort = Some("high".to_string());
+            info.latest_phase = Some("builder".to_string());
+        }
+        registry.reap_once();
+
+        let path = registry.config().resolve_outcome_telemetry_path();
+        let records = sweep_outcomes::read_all_sweep_outcomes(&path);
+        let record = records
+            .iter()
+            .find(|r| r.issue == 4704)
+            .expect("sweep.outcome telemetry record must be journaled on a crash");
+        assert_eq!(record.result, telemetry::SweepResult::Failure);
+        assert_eq!(record.sweep_id, "sweep-issue-4704-0");
+        assert_eq!(record.model.as_deref(), Some("opus"));
+        assert_eq!(record.effort.as_deref(), Some("high"));
+        assert_eq!(record.config.get("token_account").map(String::as_str), Some("agent-4"));
+        assert!(record.total_duration_sec >= 0);
+        // skip_label_flip is set in the fixture registry, so the forge-probe
+        // fields fall back to their private-safe / workspace-path defaults
+        // rather than shelling out — never `Public`, never a stray PR number.
+        assert_eq!(record.visibility, telemetry::RepoVisibility::Private);
+        assert_eq!(record.pr_number, None);
+    }
+
+    /// AC ("result"): a sweep observed completing the Merge phase is
+    /// classified `Success` — the schema's "merged" terminal state — even
+    /// though its exit status was never captured (the kill-probe reap path
+    /// yields no exit code) and its checkpoint was deleted on success.
+    #[test]
+    fn telemetry_outcome_records_merged_lifecycle_as_success() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _rec) = fixture_registry(dir.path());
+        let issue = 4705;
+
+        let sweep_id =
+            insert_dead_running_with_log(&mut registry, issue, 0, "agent-5", "clean run\n");
+        let started_at = Utc::now() - Duration::from_secs(600);
+        {
+            let info = registry.entries.get_mut(&sweep_id).unwrap();
+            info.model = Some("sonnet".to_string());
+            info.started_at = started_at;
+        }
+
+        for phase in ["builder-done", "judge-done", "merge-done"] {
+            write_checkpoint_with_mtime(&registry, issue, phase, SystemTime::now());
+            registry.sample_phase_transition(&sweep_id, &SweepKind::Issue(issue), started_at);
+        }
+        // The sweep skill deletes the checkpoint after a successful merge.
+        std::fs::remove_file(
+            registry
+                .config
+                .checkpoint_dir()
+                .join(format!("issue-{issue}.json")),
+        )
+        .unwrap();
+
+        registry.reap_once();
+
+        let path = registry.config().resolve_outcome_telemetry_path();
+        let records = sweep_outcomes::read_all_sweep_outcomes(&path);
+        let record = records
+            .iter()
+            .find(|r| r.issue == issue)
+            .expect("sweep.outcome telemetry record must be journaled on a merged lifecycle");
+        assert_eq!(record.result, telemetry::SweepResult::Success);
+        assert_eq!(record.model.as_deref(), Some("sonnet"));
+        assert_eq!(
+            record
+                .phase_durations
+                .iter()
+                .map(|p| p.phase.as_str())
+                .collect::<Vec<_>>(),
+            vec!["builder", "judge", "merge"]
+        );
+    }
+
+    /// A checkpoint-less death whose exit status was never observed is NOT
+    /// success: an unobservable exit is not evidence that anything landed.
+    #[test]
+    fn telemetry_outcome_records_unverified_exit_as_failure() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _rec) = fixture_registry(dir.path());
+
+        insert_dead_running_with_log(&mut registry, 4714, 0, "agent-14", "no markers\n");
+        registry.reap_once();
+
+        let path = registry.config().resolve_outcome_telemetry_path();
+        let records = sweep_outcomes::read_all_sweep_outcomes(&path);
+        let record = records.iter().find(|r| r.issue == 4714).unwrap();
+        assert_eq!(record.result, telemetry::SweepResult::Failure);
+    }
+
+    /// AC: an operator/watchdog-initiated cancel is telemetry-classified
+    /// `Cancelled` — distinct from both `Success` and `Failure`.
+    #[test]
+    fn telemetry_outcome_records_cancel_as_cancelled() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _rec) = fixture_registry(dir.path());
+
+        let kind = SweepKind::Issue(4706);
+        let started_at = Utc::now();
+        let sweep_id = "sweep-issue-4706-test".to_string();
+        registry.entries.insert(
+            sweep_id.clone(),
+            SweepInfo {
+                sweep_id: sweep_id.clone(),
+                kind: kind.clone(),
+                pid: 2_147_483_640,
+                token_name: "agent-6".into(),
+                runtime: "claude".into(),
+                runtime_source: None,
+                log_path: registry.compute_log_path(4706),
+                idempotency_key: None,
+                started_at,
+                state: SweepState::Running,
+                latest_phase: None,
+                pr_number: None,
+                model: Some("opus".to_string()),
+                effort: None,
+                depends_on: None,
+                repo: None,
+            },
+        );
+
+        registry.finish_cancel(&sweep_id, 2_147_483_640, &kind, started_at, true);
+
+        let path = registry.config().resolve_outcome_telemetry_path();
+        let records = sweep_outcomes::read_all_sweep_outcomes(&path);
+        let record = records
+            .iter()
+            .find(|r| r.issue == 4706)
+            .expect("sweep.outcome telemetry record must be journaled on cancel");
+        assert_eq!(record.result, telemetry::SweepResult::Cancelled);
+        assert_eq!(record.model.as_deref(), Some("opus"));
+    }
+
+    /// AC: the telemetry journal entry survives `reap_once`'s in-memory GC of
+    /// terminal entries, mirroring [`outcome_journal_entry_survives_reap_once_gc`]
+    /// for the #4644 journal.
+    #[test]
+    fn telemetry_outcome_entry_survives_reap_once_gc() {
+        let dir = tempdir().unwrap();
+        let mut registry = backoff_registry(dir.path(), 60, 900);
+
+        let sweep_id = insert_dead_running_with_log(
+            &mut registry,
+            4707,
+            0,
+            "agent-7",
+            "==== loom-daemon dispatch: sweep-issue-4707-0 ====\nToken selection failed:\n",
+        );
+        registry.reap_once();
+
+        if let Some(info) = registry.entries.get_mut(&sweep_id) {
+            match &mut info.state {
+                SweepState::Exited { at, .. } | SweepState::Crashed { at } => {
+                    *at = Utc::now() - chrono::Duration::seconds(TERMINAL_RETENTION_SECS + 60);
+                }
+                other => panic!("expected a terminal state, got {other:?}"),
+            }
+        }
+        registry.reap_once();
+        assert!(!registry.entries.contains_key(&sweep_id));
+
+        let path = registry.config().resolve_outcome_telemetry_path();
+        let records = sweep_outcomes::read_all_sweep_outcomes(&path);
+        assert!(
+            records.iter().any(|r| r.issue == 4707),
+            "the durable telemetry journal entry must survive reap_once's in-memory GC"
+        );
+    }
+
+    /// AC: with neither a sampled transition history nor a known
+    /// `latest_phase`, `phase_durations` is empty rather than fabricating a
+    /// phase name.
+    #[test]
+    fn telemetry_outcome_phase_durations_empty_without_a_known_phase() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _rec) = fixture_registry(dir.path());
+
+        insert_dead_running_with_log(&mut registry, 4708, 0, "agent-8", "clean run\n");
+        registry.reap_once();
+
+        let path = registry.config().resolve_outcome_telemetry_path();
+        let records = sweep_outcomes::read_all_sweep_outcomes(&path);
+        let record = records.iter().find(|r| r.issue == 4708).unwrap();
+        assert!(record.phase_durations.is_empty());
+    }
+
+    /// AC (#4704 "per-phase durations"): the persisted record carries a REAL
+    /// per-phase breakdown built from the transitions the registry sampled
+    /// while the sweep was alive — one entry per observed phase completion, in
+    /// lifecycle order, with the checkpoint markers normalized to lifecycle
+    /// names and each duration measured from the previous observation.
+    #[test]
+    fn telemetry_outcome_phase_durations_come_from_sampled_transitions() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _rec) = fixture_registry(dir.path());
+        let issue = 4709;
+
+        let sweep_id = insert_dead_running_with_log(&mut registry, issue, 0, "agent-9", "log\n");
+        // Backdate the dispatch so the first phase's measured duration is
+        // unambiguously non-zero (it runs from `started_at` to the first
+        // observation).
+        let started_at = Utc::now() - Duration::from_secs(300);
+        registry.entries.get_mut(&sweep_id).unwrap().started_at = started_at;
+
+        // Two phase completions observed by (simulated) reaper ticks while the
+        // sweep was still alive — exactly what `reap_once` does per tick.
+        write_checkpoint_with_mtime(&registry, issue, "curator-done", SystemTime::now());
+        registry.sample_phase_transition(&sweep_id, &SweepKind::Issue(issue), started_at);
+        write_checkpoint_with_mtime(&registry, issue, "judge-rejected", SystemTime::now());
+        registry.sample_phase_transition(&sweep_id, &SweepKind::Issue(issue), started_at);
+        // A repeat tick with an unchanged checkpoint must NOT add an entry.
+        registry.sample_phase_transition(&sweep_id, &SweepKind::Issue(issue), started_at);
+
+        registry.reap_once();
+
+        let path = registry.config().resolve_outcome_telemetry_path();
+        let records = sweep_outcomes::read_all_sweep_outcomes(&path);
+        let record = records
+            .iter()
+            .find(|r| r.issue == issue)
+            .expect("terminal transition must journal a sweep.outcome record");
+        assert_eq!(
+            record
+                .phase_durations
+                .iter()
+                .map(|p| p.phase.as_str())
+                .collect::<Vec<_>>(),
+            vec!["curator", "judge"],
+            "markers normalize to lifecycle names, in lifecycle order, deduped per tick"
+        );
+        assert!(
+            record.phase_durations[0].duration_sec >= 299,
+            "first phase spans dispatch -> first observation, got {}",
+            record.phase_durations[0].duration_sec
+        );
+        let sum: i64 = record.phase_durations.iter().map(|p| p.duration_sec).sum();
+        assert!(
+            sum <= record.total_duration_sec,
+            "the unattributed trailing in-flight segment means phases sum to at most the total \
+             ({sum} > {})",
+            record.total_duration_sec
+        );
+    }
+
+    /// AC ("…and refs"): the record's `pr_number` comes from the checkpoint
+    /// value sampled while the sweep ran — no forge round trip — and survives
+    /// the checkpoint being deleted, which is what a *successful* sweep does
+    /// before its record is written.
+    #[test]
+    fn telemetry_outcome_pr_number_comes_from_the_sampled_checkpoint() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _rec) = fixture_registry(dir.path());
+        let issue = 4713;
+
+        let sweep_id = insert_dead_running_with_log(&mut registry, issue, 0, "agent-13", "log\n");
+        let started_at = Utc::now() - Duration::from_secs(120);
+        registry.entries.get_mut(&sweep_id).unwrap().started_at = started_at;
+
+        let cp_dir = registry.config.checkpoint_dir();
+        std::fs::create_dir_all(&cp_dir).unwrap();
+        let cp_path = cp_dir.join(format!("issue-{issue}.json"));
+        std::fs::write(
+            &cp_path,
+            format!(r#"{{"phase":"builder-done","issue":{issue},"pr_number":8123}}"#),
+        )
+        .unwrap();
+        registry.sample_phase_transition(&sweep_id, &SweepKind::Issue(issue), started_at);
+        // The sweep skill deletes the checkpoint on success — the sampled
+        // observation must survive that.
+        std::fs::remove_file(&cp_path).unwrap();
+
+        registry.reap_once();
+
+        let path = registry.config().resolve_outcome_telemetry_path();
+        let records = sweep_outcomes::read_all_sweep_outcomes(&path);
+        let record = records.iter().find(|r| r.issue == issue).unwrap();
+        assert_eq!(record.pr_number, Some(8123));
+    }
+
+    /// A checkpoint left behind by an EARLIER dispatch of the same issue must
+    /// never be sampled as this run's progress — the #4009 freshness guard
+    /// (`checkpoint_written_by_run`) applies to phase sampling exactly as it
+    /// does to every other checkpoint read in this file.
+    #[test]
+    fn phase_sampling_ignores_a_checkpoint_from_an_earlier_dispatch() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _rec) = fixture_registry(dir.path());
+        let issue = 4710;
+
+        let sweep_id = insert_dead_running_with_log(&mut registry, issue, 0, "agent-10", "log\n");
+        let started_at = Utc::now();
+        registry.entries.get_mut(&sweep_id).unwrap().started_at = started_at;
+
+        // Checkpoint written an hour BEFORE this run started.
+        write_checkpoint_with_mtime(
+            &registry,
+            issue,
+            "builder-done",
+            SystemTime::now() - Duration::from_secs(3600),
+        );
+        registry.sample_phase_transition(&sweep_id, &SweepKind::Issue(issue), started_at);
+
+        assert!(
+            !registry.phase_history.contains_key(&sweep_id),
+            "a stale checkpoint must not seed this run's phase history"
+        );
+    }
+
+    /// Retained phase observations are capped so a pathological Judge<->Doctor
+    /// loop cannot grow the per-sweep history without bound.
+    #[test]
+    fn phase_history_is_capped() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _rec) = fixture_registry(dir.path());
+        let issue = 4711;
+
+        let sweep_id = insert_dead_running_with_log(&mut registry, issue, 0, "agent-11", "log\n");
+        let started_at = Utc::now() - Duration::from_secs(10);
+        registry.entries.get_mut(&sweep_id).unwrap().started_at = started_at;
+
+        for i in 0..(MAX_PHASE_OBSERVATIONS * 2) {
+            // Alternate so every tick looks like a genuine transition.
+            let phase = if i.is_multiple_of(2) {
+                "judge-rejected"
+            } else {
+                "doctor-done"
+            };
+            write_checkpoint_with_mtime(&registry, issue, phase, SystemTime::now());
+            registry.sample_phase_transition(&sweep_id, &SweepKind::Issue(issue), started_at);
+        }
+
+        assert_eq!(
+            registry.phase_history.get(&sweep_id).map(Vec::len),
+            Some(MAX_PHASE_OBSERVATIONS)
+        );
+    }
+
+    /// The per-SweepId phase history is pruned alongside entry GC, so it
+    /// cannot accumulate across many dispatches.
+    #[test]
+    fn phase_history_is_pruned_with_terminal_entry_gc() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _rec) = fixture_registry(dir.path());
+        let issue = 4712;
+
+        let sweep_id = insert_dead_running_with_log(&mut registry, issue, 0, "agent-12", "log\n");
+        let started_at = Utc::now() - Duration::from_secs(30);
+        registry.entries.get_mut(&sweep_id).unwrap().started_at = started_at;
+        write_checkpoint_with_mtime(&registry, issue, "curator-done", SystemTime::now());
+        registry.sample_phase_transition(&sweep_id, &SweepKind::Issue(issue), started_at);
+        assert!(registry.phase_history.contains_key(&sweep_id));
+
+        registry.reap_once();
+        if let Some(info) = registry.entries.get_mut(&sweep_id) {
+            match &mut info.state {
+                SweepState::Exited { at, .. } | SweepState::Crashed { at } => {
+                    *at = Utc::now() - chrono::Duration::seconds(TERMINAL_RETENTION_SECS + 60);
+                }
+                other => panic!("expected a terminal state, got {other:?}"),
+            }
+        }
+        registry.reap_once();
+
+        assert!(!registry.entries.contains_key(&sweep_id));
+        assert!(
+            !registry.phase_history.contains_key(&sweep_id),
+            "phase history must be pruned with the GC'd entry"
+        );
+    }
+
+    /// Checkpoint markers normalize to the lifecycle phase names the telemetry
+    /// schema documents; an unknown marker passes through unchanged rather
+    /// than being truncated at an arbitrary separator.
+    #[test]
+    fn phase_label_normalizes_checkpoint_markers() {
+        assert_eq!(phase_label("curator-done"), "curator");
+        assert_eq!(phase_label("builder-done"), "builder");
+        assert_eq!(phase_label("judge-done"), "judge");
+        assert_eq!(phase_label("judge-rejected"), "judge");
+        assert_eq!(phase_label("doctor-done"), "doctor");
+        assert_eq!(phase_label("merge-done"), "merge");
+        // No known suffix ⇒ passed through verbatim.
+        assert_eq!(phase_label("some-future-phase"), "some-future-phase");
+        assert_eq!(phase_label("curator"), "curator");
     }
 
     /// AC: when the live `.ranking` snapshot shows zero healthy accounts, the
