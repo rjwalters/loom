@@ -1,40 +1,98 @@
+# =============================================================================
+# loom-observability-ingest — Cloudflare Workers deployment template
+# =============================================================================
+# This file is BOTH the working config used by this repo's test suite AND the
+# template a third party copies to deploy the backend to their own Cloudflare
+# account.
+#
+# Every value you must supply is tagged `CHANGE ME` and carries an obviously
+# fake placeholder. `npm run preflight` fails while any placeholder survives,
+# so a half-configured deploy is caught before `wrangler deploy` runs.
+#
+#   Full deploy walkthrough .... docs/deploy-runbook.md
+#   SSO gate / public view ..... docs/cloudflare-access.md
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Worker identity
+# -----------------------------------------------------------------------------
+# `name` is the Worker's name in your account and the first label of its
+# workers.dev URL (https://<name>.<your-subdomain>.workers.dev). Keeping the
+# default is fine; change it only if one account hosts several instances.
 name = "loom-observability-ingest"
 main = "src/index.ts"
 compatibility_date = "2024-09-23"
 
-# --------------------------------------------------------------------------
-# D1 — durable history for every ingested telemetry record.
+# CHANGE ME — only if your Cloudflare credential can reach more than one
+# account. Wrangler infers the account when the credential has exactly one and
+# errors out otherwise. Find yours with `wrangler whoami`.
 #
-# `database_id` below is a placeholder. After running:
+# Preferred: leave this commented out and `export CLOUDFLARE_ACCOUNT_ID=...`
+# instead, so your account id never lands in git.
+# account_id = "REPLACE_WITH_YOUR_CLOUDFLARE_ACCOUNT_ID"
+
+# workers.dev gives you a public URL with zero DNS setup — right for the first
+# smoke test.
+#
+# CHANGE ME to `false` once you serve from a custom domain (`[[routes]]`
+# below). Cloudflare Access can only gate hostnames inside a zone you own, so a
+# still-enabled workers.dev URL is an unauthenticated bypass straight around
+# your Access policy — see docs/cloudflare-access.md.
+workers_dev = true
+
+# CHANGE ME — required before you can put Cloudflare Access in front of this
+# Worker, optional otherwise. The zone (`example.com`) must already be active
+# in the same Cloudflare account; `custom_domain = true` makes Wrangler create
+# and manage the DNS record for you.
+#
+# [[routes]]
+# pattern = "loom-dashboard.example.com"
+# custom_domain = true
+
+# -----------------------------------------------------------------------------
+# D1 — durable history for every ingested telemetry record.
+# -----------------------------------------------------------------------------
+# CHANGE ME — `database_id` below is an all-zeros placeholder. Create the
+# database in YOUR account and paste back the id it prints:
+#
 #   wrangler d1 create loom-observability
-# paste the returned database_id here (or override per-environment in
-# `[env.<name>]` blocks — see README.md "Deploying your own instance").
-# --------------------------------------------------------------------------
+#
+# `database_name` may be anything; `binding` is the name `src/index.ts` reads
+# off `Env` (`env.DB`) and must NOT be renamed without editing the source.
 [[d1_databases]]
 binding = "DB"
 database_name = "loom-observability"
 database_id = "00000000-0000-0000-0000-000000000000"
 migrations_dir = "migrations"
 
-# --------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Durable Object — live "what is running right now across every host" state,
 # independent of D1's durable history.
-# --------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Nothing account-specific here: Durable Objects are created implicitly on the
+# first deploy, so there is no id to paste. `name` is the binding
+# `src/index.ts` reads (`env.FLEET_STATE`) and `class_name` must match the
+# class exported from `src/fleetState.ts` — renaming either requires a matching
+# source edit plus a new `[[migrations]]` tag below.
 [[durable_objects.bindings]]
 name = "FLEET_STATE"
 class_name = "FleetState"
 
+# Durable Object class migrations. `tag` is an append-only history: never edit
+# or delete a tag that has already been deployed — add a new one.
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["FleetState"]
 
-# --------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Retention policy — see src/retention.ts. Both bounds are enforced on every
 # scheduled run; either alone is sufficient to cap D1 growth, but both are
 # applied for defense in depth (a burst of hosts could blow the row cap well
 # before the age cutoff, and a single very-chatty host could blow the age
 # cutoff's effective size before enough time passes).
-# --------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Tune to your fleet size and D1 plan limits. These are plain (non-secret)
+# vars, so `wrangler deploy` publishes exactly what is written here.
 [vars]
 RETENTION_DAYS = "90"
 MAX_RECORDS = "500000"
@@ -45,7 +103,43 @@ MAX_RECORDS = "500000"
 [triggers]
 crons = ["0 * * * *"]
 
-# --------------------------------------------------------------------------
-# Secrets (NOT committed — set via `wrangler secret put <NAME>`):
-#   ADMIN_TOKEN   — bearer token gating /admin/* host-key management routes.
-# --------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Secrets — NEVER written into this file (it is committed). Set them with:
+#
+#   wrangler secret put ADMIN_TOKEN         # deployed Worker
+#   echo 'ADMIN_TOKEN="..."' > .dev.vars    # local `wrangler dev` (gitignored)
+#
+#   ADMIN_TOKEN — bearer token gating the /admin/* host-key management routes.
+#                 Generate with `openssl rand -hex 32`. While it is unset every
+#                 /admin/* route answers 503, so host provisioning is
+#                 impossible — set it before the first deploy.
+#
+# See .dev.vars.example.
+# -----------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
+# Multiple environments (optional)
+# -----------------------------------------------------------------------------
+# A named environment deploys a separate Worker (`<name>-<env>`) with its own
+# bindings: `wrangler deploy --env staging`.
+#
+# IMPORTANT: `vars`, `d1_databases`, `durable_objects`, and `routes` are NOT
+# inherited from the top level — a named environment must redeclare each one it
+# needs, and needs its own `wrangler secret put --env staging ADMIN_TOKEN`.
+#
+# [env.staging]
+# workers_dev = true
+#
+# [[env.staging.d1_databases]]
+# binding = "DB"
+# database_name = "loom-observability-staging"
+# database_id = "REPLACE_WITH_YOUR_STAGING_D1_DATABASE_ID"
+# migrations_dir = "migrations"
+#
+# [[env.staging.durable_objects.bindings]]
+# name = "FLEET_STATE"
+# class_name = "FleetState"
+#
+# [env.staging.vars]
+# RETENTION_DAYS = "7"
+# MAX_RECORDS = "50000"

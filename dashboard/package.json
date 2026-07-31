@@ -6,6 +6,7 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
+    "preflight": "bash scripts/check-deploy-config.sh",
     "deploy": "wrangler deploy",
     "test": "vitest run",
     "test:watch": "vitest",

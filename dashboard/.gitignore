@@ -2,5 +2,7 @@ node_modules/
 .wrangler/
 .dev.vars
 .dev.vars.*
+# ...but the committed, secret-free template is the point of the file.
+!.dev.vars.example
 dist/
 *.log
