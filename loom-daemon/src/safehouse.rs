@@ -72,6 +72,14 @@ const PERSONA_ENV: &str = "LOOM_SAFEHOUSE_PERSONA";
 const ROOM_SIGNAL_ENV: &str = "LOOM_SAFEHOUSE_ROOM_SIGNAL";
 const ROOMS_BY_REPO_ENV: &str = "LOOM_SAFEHOUSE_ROOMS_BY_REPO";
 
+/// The dedicated peer-claim coordination room (#4713): when set, claim
+/// advertise/retract traffic rides this room instead of the signal room, so a
+/// human watching the signal room no longer sees the 30-second heartbeat
+/// cadence `sweep_registry::readvertise_peer_claims` re-publishes. Absent ⇒
+/// falls back to [`SafehouseConfig::signal_room`] — see
+/// [`SafehouseConfig::claims_room`].
+const ROOM_CLAIMS_ENV: &str = "LOOM_SAFEHOUSE_ROOM_CLAIMS";
+
 /// Alias prefix for a lazily-created per-repo firehose room (#4225): the
 /// `vibesql` workspace's firehose is `fleet-vibesql`. Deliberately **not** the
 /// signal room's own name (`loom-fleet`) — the prefix reads as "the fleet's view
@@ -198,6 +206,16 @@ pub struct RoomMap {
     /// map is created lazily as `fleet-<repo>` on first narration (see
     /// [`RoomRouter`]). `BTreeMap` for deterministic iteration in tests/logs.
     pub by_repo: std::collections::BTreeMap<String, String>,
+    /// The dedicated peer-claim coordination room (#4713), opt-in. `None` ⇒
+    /// fall back to [`signal`](Self::signal) (see
+    /// [`SafehouseConfig::claims_room`]) — the same "absent means
+    /// unchanged-default" contract `signal` itself has against the legacy
+    /// [`SafehouseConfig::room`] scalar. Setting this splits the machine-cadence
+    /// claim advertise/retract heartbeat out of the human-facing signal room
+    /// into its own coordination room; an operator who does this **must**
+    /// ensure every host's safehoused bot is joined to it (the same
+    /// cross-host-provisioning requirement documented for `signal`).
+    pub claims: Option<String>,
 }
 
 impl RoomMap {
@@ -205,7 +223,7 @@ impl RoomMap {
     /// callers normalize it to `None` (single-room mode).
     #[must_use]
     fn is_empty(&self) -> bool {
-        self.signal.is_none() && self.by_repo.is_empty()
+        self.signal.is_none() && self.by_repo.is_empty() && self.claims.is_none()
     }
 }
 
@@ -258,6 +276,21 @@ impl SafehouseConfig {
             .as_ref()
             .and_then(|rooms| rooms.signal.as_deref())
             .or(self.room.as_deref())
+    }
+
+    /// The room peer-claim advertise/retract traffic goes to (#4713):
+    /// `rooms.claims` when the map configures one, else falls back to
+    /// [`signal_room`](Self::signal_room) — which itself falls back to the
+    /// legacy scalar [`room`](Self::room). This chain is what keeps existing
+    /// deployments (no `rooms.claims` configured) byte-identical to pre-#4713
+    /// behavior: claim ads keep riding the signal room exactly as
+    /// [`run_coordination`]'s doc comment describes.
+    #[must_use]
+    pub fn claims_room(&self) -> Option<&str> {
+        self.rooms
+            .as_ref()
+            .and_then(|rooms| rooms.claims.as_deref())
+            .or_else(|| self.signal_room())
     }
 
     /// Whether attention-class routing is active (a `rooms` map resolved).
@@ -329,6 +362,11 @@ fn rooms_from_value(block: Option<&Value>) -> Option<RoomMap> {
             }
         }
     }
+    if let Some(claims) = rooms.get("claims").and_then(Value::as_str) {
+        if !claims.trim().is_empty() {
+            map.claims = Some(claims.trim().to_owned());
+        }
+    }
     (!map.is_empty()).then_some(map)
 }
 
@@ -356,25 +394,30 @@ fn apply_env_overrides(mut cfg: SafehouseConfig) -> SafehouseConfig {
 /// default**:
 ///
 /// - `LOOM_SAFEHOUSE_ROOM_SIGNAL` overrides `rooms.signal` alone.
+/// - `LOOM_SAFEHOUSE_ROOM_CLAIMS` (#4713) overrides `rooms.claims` alone.
 /// - `LOOM_SAFEHOUSE_ROOMS_BY_REPO` (`repo=room,repo=room…`) replaces the
 ///   **whole** `byRepo` map rather than merging into it, so an operator can
 ///   override a stale committed map from the environment without editing config
 ///   (the same wholesale-replacement semantics `LOOM_SAFEHOUSE_WORKER_PERSONAS`
 ///   uses for its list).
-/// - Either env var alone is enough to *enable* routing on a config that has no
-///   `rooms` block at all.
-/// - Neither set ⇒ the config-layer map is returned untouched (so the absent-map
+/// - Any one of these env vars alone is enough to *enable* routing on a config
+///   that has no `rooms` block at all.
+/// - None set ⇒ the config-layer map is returned untouched (so the absent-map
 ///   single-room default stays byte-identical).
 #[must_use]
 fn apply_room_env_overrides(rooms: Option<RoomMap>) -> Option<RoomMap> {
     let signal = env_nonempty(ROOM_SIGNAL_ENV);
+    let claims = env_nonempty(ROOM_CLAIMS_ENV);
     let by_repo = env_nonempty(ROOMS_BY_REPO_ENV).map(|raw| parse_by_repo_env(&raw));
-    if signal.is_none() && by_repo.is_none() {
+    if signal.is_none() && claims.is_none() && by_repo.is_none() {
         return rooms;
     }
     let mut map = rooms.unwrap_or_default();
     if let Some(signal) = signal {
         map.signal = Some(signal);
+    }
+    if let Some(claims) = claims {
+        map.claims = Some(claims);
     }
     if let Some(by_repo) = by_repo {
         map.by_repo = by_repo;
@@ -2934,12 +2977,14 @@ pub fn spawn_peer_coordination(
 /// outbound claim ads (→ socket). Any I/O failure degrades to a reconnect — it
 /// never blocks or fails a dispatch. Returns when all outbound senders drop.
 ///
-/// # Room routing: claim ads stay on the signal room (#4225, resolved in-PR)
+/// # Room routing: claim ads default to the signal room, opt-in dedicated room (#4225, #4713)
 ///
 /// Attention-class routing sends `task` envelopes to the per-repo firehose, and a
 /// claim ad *is* a per-repo `task` envelope — yet this connection deliberately
-/// advertises into (and reads from) the **signal room**, the one deliberate
-/// exception to "signal-only". Why:
+/// advertises into (and reads from) [`SafehouseConfig::claims_room`], **not**
+/// the per-repo firehose. By default (`rooms.claims` unset) `claims_room()`
+/// resolves to the **signal room**, the one deliberate exception to
+/// "signal-only" #4225 established. Why the signal room is the *default*:
 ///
 /// 1. **The signal room is the only room with guaranteed common membership.**
 ///    Rooms are per-repo and created **lazily** by whichever host narrates that
@@ -2953,18 +2998,27 @@ pub fn spawn_peer_coordination(
 /// 2. **Dedup is correctness, room hygiene is cosmetics.** A missed claim ad
 ///    costs a duplicate cross-host sweep (wasted tokens, two PRs for one issue).
 ///    A little machine JSON in the signal room costs the operator some scroll.
-///    When those trade off, correctness wins.
+///    When those trade off, correctness wins — which is exactly why the
+///    dedicated-room escape hatch below is opt-in, not the new default.
 /// 3. **The reader must agree with the writer.** This task's inbound handler is
 ///    unfiltered — it folds *any* inbound line carrying a parseable `loom_claim`
 ///    body into the view — so it consumes ads from whatever rooms safehoused
-///    pushes to it. Keeping the write side on the signal room keeps the pair
-///    trivially consistent instead of depending on which rooms this host's bot
-///    happens to have joined.
+///    pushes to it. Keeping the write side and the read side on the same
+///    resolved room keeps the pair trivially consistent instead of depending on
+///    which rooms this host's bot happens to have joined.
 ///
-/// Ads are low volume (one per dispatch / terminal outcome). A dedicated
-/// coordination room (a third tier) is the clean long-term fix and is left as a
-/// follow-up — it needs cross-host *provisioning*, not just routing, which is the
-/// same reason tier 3 (the Matrix Space) is out of scope here.
+/// Ads are low volume per dispatch / terminal outcome, but
+/// `sweep_registry::readvertise_peer_claims` re-publishes every live sweep's
+/// claim each 30s reaper tick (deliberately under the peer-claim TTL — the
+/// liveness contract requires the repetition), so at fleet scale the cadence is
+/// enough to flood the human-visible signal room (#4713). An operator who finds
+/// that disruptive may set `rooms.claims` (or `LOOM_SAFEHOUSE_ROOM_CLAIMS`) to
+/// route claim ads into a dedicated coordination room instead, keeping the
+/// signal room for sweep-lifecycle narration. **This is provisioning, not just
+/// routing**: every host's safehoused bot must already be joined to that room
+/// before it is configured, or that host silently stops seeing peers' claims —
+/// the exact cross-host dedup failure class reason 1 above exists to avoid.
+/// `rooms.claims` absent (the default) is byte-identical to pre-#4713 behavior.
 async fn run_coordination(
     config: SafehouseConfig,
     socket: PathBuf,
@@ -2976,9 +3030,11 @@ async fn run_coordination(
 ) {
     let mut backoff = min_backoff;
     let mut warned = false;
-    // The signal room (see the routing rationale above). In single-room mode this
-    // *is* `config.room`, so the pre-#4225 behavior is byte-identical.
-    let signal_room = config.signal_room().map(ToOwned::to_owned);
+    // The claims room (see the routing rationale above): `rooms.claims` when
+    // configured (#4713), else the signal room. In single-room mode (no `rooms`
+    // block at all) this *is* `config.room`, so the pre-#4225/#4713 behavior is
+    // byte-identical.
+    let claims_room = config.claims_room().map(ToOwned::to_owned);
     loop {
         set_state(
             &state,
@@ -2986,7 +3042,7 @@ async fn run_coordination(
                 socket: socket.clone(),
             },
         );
-        let client = match SafehouseClient::connect(&socket, &config.persona, signal_room.clone())
+        let client = match SafehouseClient::connect(&socket, &config.persona, claims_room.clone())
             .await
         {
             Ok(client) => {
@@ -2999,7 +3055,7 @@ async fn run_coordination(
                     &state,
                     SafehouseState::Connected {
                         socket: socket.clone(),
-                        room: signal_room.clone(),
+                        room: claims_room.clone(),
                     },
                 );
                 client
@@ -3423,6 +3479,7 @@ mod tests {
                 by_repo: [("loom".to_owned(), "!fleet-loom:example.org".to_owned())]
                     .into_iter()
                     .collect(),
+                claims: None,
             }),
             ..SafehouseConfig::default()
         }
@@ -3432,6 +3489,11 @@ mod tests {
     /// every envelope of every kind resolves to the single configured `room`,
     /// exactly as before — including the `None` "let safehoused resolve its sole
     /// room" form, which must still serialize with no `room` key at all.
+    ///
+    /// Also covers #4713: with no `rooms` map (and so no `rooms.claims`),
+    /// [`SafehouseConfig::claims_room`] must resolve to the exact same single
+    /// `room` — the claim-ad routing path must be byte-identical to pre-#4713
+    /// behavior too, not just the narration path.
     #[test]
     fn absent_rooms_map_is_byte_identical_single_room_behavior() {
         for room in [Some("loom-fleet".to_owned()), None] {
@@ -3441,6 +3503,11 @@ mod tests {
                 ..SafehouseConfig::default()
             };
             assert!(!cfg.routes_by_attention());
+            assert_eq!(
+                cfg.claims_room(),
+                room.as_deref(),
+                "with no rooms map, claim ads must resolve to the same single room as narration"
+            );
             let router = RoomRouter::new(&cfg);
             for kind in KNOWN_TYPES {
                 for repo in [Some("/home/x/GitHub/vibesql"), None] {
@@ -3477,6 +3544,7 @@ mod tests {
                 by_repo: [("loom".to_owned(), "!fleet-loom:example.org".to_owned())]
                     .into_iter()
                     .collect(),
+                claims: None,
             }),
             ..SafehouseConfig::default()
         };
@@ -3488,6 +3556,42 @@ mod tests {
         );
         // …and `rooms.signal`, when set, wins over the legacy scalar.
         assert_eq!(routing_config().signal_room(), Some("!signal:example.org"));
+    }
+
+    /// #4713: `claims_room()` falls back to `signal_room()` — which itself may
+    /// fall back further to the legacy scalar `room` — when `rooms.claims` is
+    /// absent, mirroring `signal_room`'s own fallback chain one level down.
+    #[test]
+    fn claims_room_falls_back_to_signal_room_when_absent() {
+        // rooms.claims absent, rooms.signal present ⇒ claims_room is the signal room.
+        let cfg = routing_config();
+        assert!(cfg.rooms.as_ref().unwrap().claims.is_none());
+        assert_eq!(cfg.claims_room(), Some("!signal:example.org"));
+        assert_eq!(cfg.claims_room(), cfg.signal_room());
+
+        // rooms.claims present ⇒ it wins over the signal room.
+        let cfg_with_claims = SafehouseConfig {
+            rooms: Some(RoomMap {
+                claims: Some("!claims:example.org".to_owned()),
+                ..cfg.rooms.clone().unwrap()
+            }),
+            ..cfg
+        };
+        assert_eq!(cfg_with_claims.claims_room(), Some("!claims:example.org"));
+        assert_eq!(
+            cfg_with_claims.signal_room(),
+            Some("!signal:example.org"),
+            "narration routing (signal_room) must be unaffected by rooms.claims"
+        );
+
+        // No rooms map at all ⇒ claims_room falls all the way back to the
+        // legacy scalar `room`, exactly like `signal_room` does.
+        let legacy = SafehouseConfig {
+            enabled: true,
+            room: Some("!legacy:example.org".to_owned()),
+            ..SafehouseConfig::default()
+        };
+        assert_eq!(legacy.claims_room(), Some("!legacy:example.org"));
     }
 
     #[test]
@@ -3581,6 +3685,7 @@ mod tests {
                 by_repo: [("loom".to_owned(), "!fleet-loom:example.org".to_owned())]
                     .into_iter()
                     .collect(),
+                claims: None,
             }),
             ..SafehouseConfig::default()
         };
@@ -3628,7 +3733,8 @@ mod tests {
             "enabled": true,
             "rooms": {
                 "signal": "!signal:example.org",
-                "byRepo": {"loom": "!fleet-loom:example.org", "vibesql": "!fleet-vibesql:example.org"}
+                "byRepo": {"loom": "!fleet-loom:example.org", "vibesql": "!fleet-vibesql:example.org"},
+                "claims": "!claims:example.org"
             }
         });
         let cfg = config_from_value(Some(&block));
@@ -3639,6 +3745,32 @@ mod tests {
             rooms.by_repo.get("vibesql").map(String::as_str),
             Some("!fleet-vibesql:example.org")
         );
+        assert_eq!(rooms.claims.as_deref(), Some("!claims:example.org"));
+    }
+
+    /// #4713: `rooms.claims` parses independently of `rooms.signal`/`byRepo` —
+    /// an operator can set only the claims room and leave narration routing
+    /// entirely on the legacy single-room scalar.
+    #[test]
+    fn config_parses_the_rooms_claims_field_alone() {
+        let block = json!({
+            "enabled": true,
+            "room": "loom-fleet",
+            "rooms": {"claims": "!claims:example.org"}
+        });
+        let cfg = config_from_value(Some(&block));
+        assert_eq!(cfg.claims_room(), Some("!claims:example.org"));
+        assert_eq!(
+            cfg.signal_room(),
+            Some("loom-fleet"),
+            "narration keeps using the legacy scalar room when only rooms.claims is set"
+        );
+        let rooms = cfg
+            .rooms
+            .expect("rooms.claims alone must still produce a non-empty map");
+        assert!(rooms.signal.is_none());
+        assert!(rooms.by_repo.is_empty());
+        assert_eq!(rooms.claims.as_deref(), Some("!claims:example.org"));
     }
 
     #[test]
@@ -3652,6 +3784,7 @@ mod tests {
             json!({"enabled": true, "rooms": {"signal": "  ", "byRepo": {}}}),
             json!({"enabled": true, "rooms": {"byRepo": {"loom": ""}}}),
             json!({"enabled": true, "rooms": {"byRepo": ["loom"]}}),
+            json!({"enabled": true, "rooms": {"claims": "  "}}),
         ] {
             let cfg = config_from_value(Some(&block));
             assert!(
@@ -3667,13 +3800,15 @@ mod tests {
     #[serial]
     fn env_overrides_config_for_the_rooms_map() {
         std::env::set_var(ROOM_SIGNAL_ENV, "!env-signal:example.org");
+        std::env::set_var(ROOM_CLAIMS_ENV, "!env-claims:example.org");
         std::env::set_var(ROOMS_BY_REPO_ENV, "loom=!env-loom:example.org, anvil=!env-anvil:x");
 
         let cfg = apply_env_overrides(config_from_value(Some(&json!({
             "enabled": true,
             "rooms": {
                 "signal": "!cfg-signal:example.org",
-                "byRepo": {"loom": "!cfg-loom:example.org", "vibesql": "!cfg-vibesql:example.org"}
+                "byRepo": {"loom": "!cfg-loom:example.org", "vibesql": "!cfg-vibesql:example.org"},
+                "claims": "!cfg-claims:example.org"
             }
         }))));
         let rooms = cfg.rooms.expect("env must keep the map present");
@@ -3684,8 +3819,10 @@ mod tests {
             !rooms.by_repo.contains_key("vibesql"),
             "the byRepo env override replaces the whole map rather than merging into it"
         );
+        assert_eq!(rooms.claims.as_deref(), Some("!env-claims:example.org"));
 
         std::env::remove_var(ROOM_SIGNAL_ENV);
+        std::env::remove_var(ROOM_CLAIMS_ENV);
         std::env::remove_var(ROOMS_BY_REPO_ENV);
     }
 
@@ -3697,6 +3834,17 @@ mod tests {
         let cfg = apply_env_overrides(config_from_value(Some(&json!({"enabled": true}))));
         assert_eq!(cfg.signal_room(), Some("!env-signal:example.org"));
         std::env::remove_var(ROOM_SIGNAL_ENV);
+
+        // `LOOM_SAFEHOUSE_ROOM_CLAIMS` alone (#4713) is likewise enough to
+        // enable routing from env, with no `rooms.signal` present at all.
+        std::env::set_var(ROOM_CLAIMS_ENV, "!env-claims:example.org");
+        let cfg = apply_env_overrides(config_from_value(Some(&json!({"enabled": true}))));
+        assert_eq!(cfg.claims_room(), Some("!env-claims:example.org"));
+        assert!(
+            cfg.signal_room().is_none(),
+            "rooms.claims alone must not affect the (unset) signal room"
+        );
+        std::env::remove_var(ROOM_CLAIMS_ENV);
 
         // Neither env var set ⇒ the config layer's map is returned untouched, so
         // the absent-map single-room default stays byte-identical. (`room` itself
@@ -3712,6 +3860,11 @@ mod tests {
             config_from_value(Some(&json!({"enabled": true, "room": "loom-fleet"}))).signal_room(),
             Some("loom-fleet"),
             "with no rooms map the signal room IS the legacy scalar room"
+        );
+        assert_eq!(
+            config_from_value(Some(&json!({"enabled": true, "room": "loom-fleet"}))).claims_room(),
+            Some("loom-fleet"),
+            "with no rooms map the claims room IS also the legacy scalar room"
         );
 
         // A garbage byRepo env value degrades to the pairs it can parse (here:
@@ -4571,6 +4724,7 @@ mod tests {
                 rooms: Some(RoomMap {
                     signal: Some("!signal:example.org".to_owned()),
                     by_repo: std::collections::BTreeMap::new(),
+                    claims: None,
                 }),
                 ..SafehouseConfig::default()
             },
@@ -6487,6 +6641,7 @@ mod tests {
                     by_repo: [("loom".to_owned(), "!fleet-loom:example.org".to_owned())]
                         .into_iter()
                         .collect(),
+                    claims: None,
                 }),
                 ..SafehouseConfig::default()
             },
@@ -6513,6 +6668,91 @@ mod tests {
             json!("!signal:example.org"),
             "claim ads ride the signal room, NOT the repo firehose (documented exception)"
         );
+        task.abort();
+    }
+
+    /// #4713: when `rooms.claims` is configured, claim ads route into that
+    /// dedicated coordination room instead of the signal room — the opt-in
+    /// escape hatch `run_coordination`'s doc comment describes. The signal room
+    /// stays reserved for sweep-lifecycle narration.
+    #[tokio::test]
+    async fn coordination_advertises_claim_ads_into_a_dedicated_claims_room_when_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("safehoused.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read_half, mut write_half) = stream.into_split();
+            let mut lines = BufReader::new(read_half).lines();
+            let hello: Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            assert_eq!(hello["op"], json!("hello"));
+            write_half
+                .write_all(b"{\"ok\":true,\"id\":0}\n")
+                .await
+                .unwrap();
+            let ad: Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            let reply = json!({"ok": true, "id": ad["id"].clone()});
+            write_half
+                .write_all(format!("{reply}\n").as_bytes())
+                .await
+                .unwrap();
+            ad
+        });
+
+        let view = Arc::new(Mutex::new(PeerClaimView::new("me".into(), Duration::from_secs(120))));
+        let sink: Arc<dyn InboundEventSink> = Arc::new(PeerClaimSink::new(view));
+        let (tx, rx) = tokio::sync::mpsc::channel::<ClaimAd>(8);
+        let state = new_shared_state();
+
+        let task = tokio::spawn(run_coordination(
+            SafehouseConfig {
+                enabled: true,
+                socket: Some(socket.clone()),
+                room: None,
+                rooms: Some(RoomMap {
+                    signal: Some("!signal:example.org".to_owned()),
+                    by_repo: [("loom".to_owned(), "!fleet-loom:example.org".to_owned())]
+                        .into_iter()
+                        .collect(),
+                    claims: Some("!claims:example.org".to_owned()),
+                }),
+                ..SafehouseConfig::default()
+            },
+            socket,
+            sink,
+            rx,
+            Duration::from_millis(20),
+            Duration::from_millis(80),
+            state.clone(),
+        ));
+
+        tx.send(ClaimAd::advertise(4713, "loom".into(), "maple".into(), 7, "ts".into()))
+            .await
+            .unwrap();
+
+        let ad = tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("the stub must receive the claim ad")
+            .unwrap();
+        assert_eq!(ad["op"], json!("send"));
+        assert_eq!(ad["type"], json!("task"));
+        assert_eq!(
+            ad["room"],
+            json!("!claims:example.org"),
+            "with rooms.claims configured, claim ads ride the dedicated claims room, \
+             not the signal room and not the repo firehose"
+        );
+        // The connection state (#4345) reflects the room this connection
+        // actually advertises into.
+        match snapshot_state(&state) {
+            SafehouseState::Connected { room, .. } => {
+                assert_eq!(room.as_deref(), Some("!claims:example.org"));
+            }
+            other => panic!("expected Connected, got {other:?}"),
+        }
         task.abort();
     }
 
