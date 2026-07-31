@@ -186,6 +186,14 @@ pub fn initialize_workspace(
     // from issue #3333). Sync alongside other managed dirs so installed
     // repos always carry the latest copy.
     sync_managed_dir(&defaults, &loom_path, "docs", is_reinstall, &mut report)?;
+    // `runtimes` ships the per-runtime capability manifests consumed by
+    // `runtime_admission::roots()` (#4688). This directory was declared in
+    // the install manifest (scripts/install/manifest.sh) since #4183 but
+    // never actually synced by this Rust-native path — every fresh install
+    // and Rust-native reinstall left `.loom/runtimes/` unpopulated, which
+    // made the admission gate fall through to a nonexistent
+    // `defaults/runtimes/...` on every consumer dispatch.
+    sync_managed_dir(&defaults, &loom_path, "runtimes", is_reinstall, &mut report)?;
 
     // Sync `.loom/bin/` from `defaults/.loom/bin/`. The manifest generator
     // (scripts/install/manifest.sh) walks `defaults/.loom/` and registers
@@ -765,7 +773,7 @@ fn verify_all_copied_files(
     report: &mut InitReport,
 ) {
     // Verify .loom managed directories (no template substitution needed)
-    for dir_name in &["roles", "scripts", "hooks", "docs"] {
+    for dir_name in &["roles", "scripts", "hooks", "docs", "runtimes"] {
         let src = defaults.join(dir_name);
         let dst = loom_path.join(dir_name);
         let prefix = format!(".loom/{dir_name}");
@@ -1714,6 +1722,117 @@ mod tests {
     }
 
     #[test]
+    fn test_runtimes_subdirectory_copied_on_fresh_install() {
+        // Regression-guard for #4688: `.loom/runtimes/` (the per-runtime
+        // capability manifests `runtime_admission::roots()` reads) must be
+        // copied during initialization, mirroring the `docs` regression
+        // guard above (#3470). Before this fix `sync_managed_dir` was never
+        // called for "runtimes" at all, so every fresh `loom-daemon init`
+        // left `.loom/runtimes/` unpopulated and the admission gate fell
+        // through to a nonexistent `defaults/runtimes/...` on every
+        // dispatch.
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        let defaults = temp_dir.path().join("defaults");
+
+        fs::create_dir(workspace.join(".git")).unwrap();
+
+        fs::create_dir_all(defaults.join("roles")).unwrap();
+        fs::create_dir_all(defaults.join("runtimes")).unwrap();
+        fs::write(defaults.join("config.json"), "{}").unwrap();
+        fs::write(defaults.join("roles").join("builder.md"), "builder").unwrap();
+        fs::write(
+            defaults.join("runtimes").join("claude.json"),
+            r#"{"runtime":"claude","capabilities":{"mcp":"yes"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            defaults.join("runtimes").join("codex.json"),
+            r#"{"runtime":"codex","capabilities":{"mcp":"yes"}}"#,
+        )
+        .unwrap();
+
+        let result =
+            initialize_workspace(workspace.to_str().unwrap(), defaults.to_str().unwrap(), false);
+
+        assert!(result.is_ok(), "init failed: {:?}", result.err());
+        let report = result.unwrap();
+
+        let runtimes_dir = workspace.join(".loom").join("runtimes");
+        assert!(runtimes_dir.exists(), ".loom/runtimes/ directory should exist");
+        assert!(runtimes_dir.is_dir(), ".loom/runtimes/ should be a directory");
+
+        let claude_json = runtimes_dir.join("claude.json");
+        assert!(claude_json.exists(), ".loom/runtimes/claude.json should exist");
+        assert_eq!(
+            fs::read_to_string(&claude_json).unwrap(),
+            r#"{"runtime":"claude","capabilities":{"mcp":"yes"}}"#
+        );
+        assert!(
+            runtimes_dir.join("codex.json").exists(),
+            ".loom/runtimes/codex.json should exist (whole-directory copy)"
+        );
+
+        assert!(
+            report
+                .added
+                .contains(&".loom/runtimes/claude.json".to_string()),
+            "Report should include runtimes/claude.json, got: {:?}",
+            report.added
+        );
+        assert!(
+            report.verification_failures.is_empty(),
+            "Expected no verification failures, got: {:?}",
+            report.verification_failures
+        );
+    }
+
+    #[test]
+    fn test_runtimes_subdirectory_restored_on_reinstall() {
+        // Reinstall analog of test_runtimes_subdirectory_copied_on_fresh_install:
+        // stale runtime manifests must be cleaned and updated content copied
+        // fresh, and — critically — a workspace that NEVER had
+        // `.loom/runtimes/` at all (the exact #4688 incident layout) must
+        // have it backfilled by a reinstall, not silently skipped.
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        let defaults = temp_dir.path().join("defaults");
+
+        fs::create_dir(workspace.join(".git")).unwrap();
+
+        fs::create_dir_all(defaults.join("roles")).unwrap();
+        fs::create_dir_all(defaults.join("runtimes")).unwrap();
+        fs::write(defaults.join("config.json"), "{}").unwrap();
+        fs::write(defaults.join("roles").join("builder.md"), "builder").unwrap();
+        fs::write(
+            defaults.join("runtimes").join("claude.json"),
+            r#"{"runtime":"claude","capabilities":{"mcp":"yes"}}"#,
+        )
+        .unwrap();
+
+        // Pre-existing install that predates #4688: `.loom/roles/` exists
+        // but `.loom/runtimes/` was never provisioned at all.
+        fs::create_dir_all(workspace.join(".loom").join("roles")).unwrap();
+        assert!(!workspace.join(".loom").join("runtimes").exists());
+
+        let result =
+            initialize_workspace(workspace.to_str().unwrap(), defaults.to_str().unwrap(), false);
+
+        assert!(result.is_ok(), "reinstall failed: {:?}", result.err());
+
+        let claude_json = workspace.join(".loom").join("runtimes").join("claude.json");
+        assert!(
+            claude_json.exists(),
+            ".loom/runtimes/claude.json should be backfilled by reinstall even though \
+             .loom/runtimes/ never existed before"
+        );
+        assert_eq!(
+            fs::read_to_string(&claude_json).unwrap(),
+            r#"{"runtime":"claude","capabilities":{"mcp":"yes"}}"#
+        );
+    }
+
+    #[test]
     fn test_real_defaults_tree_ships_docs_at_top_level() {
         // Regression guard for #3476 Bug 2. The tempdir tests above fabricate
         // a defaults/ layout, so they structurally cannot catch the failure
@@ -1737,7 +1856,7 @@ mod tests {
             "shipped defaults/ tree not found at {defaults:?} — did the repo layout change?"
         );
 
-        for dir_name in &["roles", "scripts", "hooks", "docs"] {
+        for dir_name in &["roles", "scripts", "hooks", "docs", "runtimes"] {
             let managed = defaults.join(dir_name);
             assert!(
                 managed.is_dir(),
