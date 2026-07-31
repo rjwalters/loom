@@ -129,6 +129,12 @@
 #                          forwarded to provision-daemon.sh.
 #   LOOM_SKIP_STALE_ENTRY_POINT_CHECK  1/true/yes suppresses the advisory
 #                          stale-`loom-*`-entry-point warning described below.
+#   LOOM_SKIP_IDLE_SHUTDOWN_NOTICE  1/true/yes suppresses the advisory
+#                          post-update idle-shutdown cron-guard notice (#4697):
+#                          "this host will power itself off after N idle
+#                          minutes" when a `fleet add-worker
+#                          --idle-shutdown-minutes` guard is installed. Silent
+#                          (no notice at all) when no such guard exists.
 #   LOOM_DAEMON_LAUNCHD    macOS only: 0/false/no disables ALL launchd interaction
 #                          (ownership detection + launchd restart), symmetric with
 #                          loom-daemon-start.sh / loom-daemon-stop.sh. A daemon
@@ -713,12 +719,55 @@ fi
 # entry point is invisible precisely when the daemon looks healthy (#4079).
 warn_stale_entry_points "$DAEMON_BIN"
 
+# ---------- idle-shutdown cron-guard post-update notice (#4697) ----------
+#
+# THE INCIDENT THIS EXISTS FOR: a remote worker was updated via this script —
+# the rebuild + supervised restart succeeded onto the new binary — and ~15
+# minutes later the host powered itself off. Nothing in the update flow
+# warned that the "successful" update was landing on a host about to
+# evaporate: the STAGE-2 cron guard `fleet add-worker --idle-shutdown-minutes`
+# installs (`render_idle_shutdown()` in loom-daemon/src/fleet/add_worker.rs,
+# NOT `autonomous.idleExit` stage 1 — that daemon-level exit is self-defeating
+# under `Restart=on-success` systemd/launchd supervision, since the supervisor
+# immediately relaunches it) fired once the freshly-relaunched, idle daemon
+# crossed the configured window, and powered the WHOLE HOST off — SSH,
+# tailnet, everything.
+#
+# This is purely advisory: it never disables/touches the guard, never changes
+# this script's exit code, and is silent when no guard is installed
+# (LOOM_SKIP_IDLE_SHUTDOWN_NOTICE=1 also suppresses it for scripted/quiet
+# use). The idle-shutdown guard's own design (#3998/#4477) is correct and out
+# of scope here — the gap this closes is purely operator awareness at the
+# moment a "successful" update is reported.
+IDLE_SHUTDOWN_GUARD_SCRIPT="$HOME/.local/bin/loom-idle-shutdown.sh"
+
+idle_shutdown_notice() {
+    [[ "${LOOM_SKIP_IDLE_SHUTDOWN_NOTICE:-0}" =~ ^(1|true|yes)$ ]] && return 0
+    command -v crontab >/dev/null 2>&1 || return 0
+    crontab -l 2>/dev/null | grep -q 'loom-idle-shutdown' || return 0
+
+    local minutes=""
+    if [[ -r "$IDLE_SHUTDOWN_GUARD_SCRIPT" ]]; then
+        minutes="$(grep -oE 'LIMIT=[0-9]+' "$IDLE_SHUTDOWN_GUARD_SCRIPT" 2>/dev/null \
+            | head -n1 | cut -d= -f2)"
+    fi
+
+    if [[ -n "$minutes" ]]; then
+        warn "Heads up: this host has an idle-shutdown cron guard installed (fleet add-worker --idle-shutdown-minutes ${minutes}) — after ~${minutes} idle minute(s) it POWERS THE WHOLE HOST OFF (SSH/tailnet included), not just this daemon. This is expected/by-design (#3998/#4477), not a fault in this update. Wake path (provider console/CLI restart; Loom never calls a cloud CLI itself) and tailnet-identity/re-registration notes: daemon-reference.md, 'fleet add-worker' step 9 (idle-shutdown)."
+    else
+        warn "Heads up: this host has an idle-shutdown cron guard installed (crontab holds a loom-idle-shutdown entry, but the configured window could not be read from $IDLE_SHUTDOWN_GUARD_SCRIPT) — it WILL power the whole host off after some idle window. This is expected/by-design (#3998/#4477), not a fault in this update. See daemon-reference.md, 'fleet add-worker' step 9 (idle-shutdown), for the wake path."
+    fi
+}
+
 # print_final_installed_line <commit> — the AC4 "final installed line": states
 # the built/installed commit AND whether it matches origin/<default-branch> at
 # build time. Uses ORIGIN_COMMIT resolved by sync_with_origin above (no
 # re-fetch). Prints an honest "unknown" comparison when the default branch or
 # origin commit could not be resolved (offline, no origin remote, etc.) rather
-# than silently omitting the currency claim.
+# than silently omitting the currency claim. Also where the #4697 idle-shutdown
+# notice fires — every successful/"already up to date" exit path funnels
+# through this one function, so the notice is reported consistently without
+# duplicating the call at each of this script's several exit points.
 print_final_installed_line() {
     local commit="$1"
     if [[ -z "$DEFAULT_BRANCH" || "$ORIGIN_COMMIT" == "unknown" ]]; then
@@ -728,6 +777,7 @@ print_final_installed_line() {
     else
         echo "Installed: ${commit} (origin/${DEFAULT_BRANCH} is at ${ORIGIN_COMMIT} — does NOT match; built from a checkout that was behind or diverged, e.g. --allow-stale)"
     fi
+    idle_shutdown_notice
 }
 
 # ---------- launchd ownership detection (macOS, mirrors loom-daemon-stop.sh #4042) ----------

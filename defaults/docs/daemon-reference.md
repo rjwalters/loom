@@ -516,6 +516,40 @@ the plan/ordering/checklist; the per-phase shell is rendered in
    powers the host off after N idle minutes. This is stage 2:
    `autonomous.idleExit` is stage 1. On daemon-managed hosts use a short guard
    window (typically 15–30 minutes); the running-daemon veto remains.
+
+   **This is a real power-off, not a suspend** — the box goes fully dark (no
+   SSH, no tailnet, nothing) until an operator brings it back (#4697). Wake
+   path:
+   - **Power the host back on** via the provider's own console or CLI. Loom
+     deliberately never calls a cloud CLI itself here (the "Boundary" note
+     above/epic #4340's scope) — this is an operator (or `repo:remote`) action,
+     not something `loom-daemon` automates.
+   - **Tailnet identity**: a Tailscale node's identity/key is stored on local
+     disk (`/var/lib/tailscale` or the equivalent state dir), not tied to the
+     instance being *running* — a plain power-off/power-on (not a
+     re-image/re-provision) preserves it, and the host reappears on the
+     tailnet under its existing name/IP once `tailscaled` starts again at
+     boot, typically within a minute or two of the power-on. A re-imaged or
+     freshly-reprovisioned replacement host does **not** inherit this and
+     needs its own `tailscale up` (a fresh ephemeral auth key if the prior one
+     already expired/was revoked).
+   - **Re-registration**: none needed for a simple power-cycle of the same
+     box — the fleet registry (`~/.loom/fleet.json`) keys on the SSH alias/
+     host, which is unchanged, and `loom-daemon` + the idle-shutdown cron
+     guard restart on boot exactly as they did before the power-off (the
+     systemd `--user` unit + `loginctl enable-linger` from step 8 survive a
+     reboot by design). Re-run `fleet add-worker` against the host only if the
+     box was actually replaced/re-imaged (a fresh OS install has none of the
+     prior bootstrap state).
+   - **Operator visibility**: `fleet status` (#4342, extended by #4697)
+     distinguishes a host that is silently past its configured
+     `--idle-shutdown-minutes` window — reported as `POWERED OFF`,
+     not a bare `UNREACHABLE` — from one whose silence doesn't yet explain
+     itself, which stays `UNREACHABLE` (genuinely worth investigating). This
+     classification is read from the registry's persisted
+     `idle_shutdown_minutes` + `last_seen_up_at` fields; it is advisory
+     (still counts as non-`Up` for `fleet status`'s exit-code policy) and
+     never suppresses the row.
 10. **safehouse** (optional, `--safehouse`) — **skip-with-notice** until #3998
     (the safehoused provisioning fragment) lands.
 11. **verify** — `loom-daemon status` sane from the workspace cwd, ranking
@@ -579,7 +613,30 @@ format was needed.
   - `UP` — the host answered with a well-formed status payload.
   - `DAEMON DOWN` — the host answered, but its own daemon reports the #4069
     unreachable-daemon payload (still valid JSON, carries an `error` key).
-  - `UNREACHABLE` — SSH/connect failure, or the per-host timeout elapsed.
+  - `UNREACHABLE` — SSH/connect failure, or the per-host timeout elapsed, AND
+    (#4697) either no idle-shutdown guard is configured for this host or its
+    silence hasn't yet reached the configured window — genuinely worth
+    investigating.
+  - `POWERED OFF` (#4697) — the host is `Unreachable` by every
+    signal available (SSH/connect failure or timeout — an idle-shutdown
+    power-off looks no different over the wire than a genuinely dead host),
+    **but** it has a configured idle-shutdown window
+    (`WorkerRecord.idle_shutdown_minutes`, populated at `fleet add-worker
+    --idle-shutdown-minutes` time) and its elapsed silence since the last
+    confirmed-`Up` poll (`WorkerRecord.last_seen_up_at`, refreshed by `fleet
+    status` itself on every poll that observes the host `Up`) has already
+    reached that window. Read as "likely powered off as designed, not a
+    failure" — still counts as non-`Up` for the exit-code policy below (it is
+    not confirmed-alive), but is loudly distinguished from a genuine outage so
+    an operator doesn't chase a phantom incident. The "expected, not a
+    failure" qualifier and the wake pointer ride on the row's `->` detail line
+    and the `N powered-off (expected)` summary tally rather than the STATE
+    cell, which stays inside the table's column width. Deliberately conservative:
+    either input missing (no guard configured, or the host has never been
+    observed `Up` by `fleet status` yet) leaves the host `UNREACHABLE`, the
+    pre-#4697 default — a false "expected, don't worry" reading on a
+    genuinely dead host is worse than an occasional false alarm. See the
+    `fleet add-worker` idle-shutdown step above for the wake path.
   - `PARSE ERROR` — the payload could not be parsed as JSON at all (severe
     version skew). Parsing is otherwise **lenient**: the remote payload is kept
     as a raw JSON value, so an older/newer remote binary's reduced/extended
@@ -593,13 +650,14 @@ format was needed.
 - **Empty roster**: never renders as empty output — prints an explicit "no
   fleet workers registered" notice alongside the local host's row.
 - **Exit code**: `0` only when every roster host is `UP`; non-zero otherwise
-  (a monitor/CI check should treat any non-zero exit as "go look").
+  (a monitor/CI check should treat any non-zero exit as "go look" — including
+  a `POWERED OFF` host, since it is still not confirmed-alive).
 - **`--json`** schema: `{ "hosts": [ { "alias", "state", "tailnet_name"?,
   "provider_instance_id"?, "added_by"?, "is_local", "workspaces", "status"?,
   "detail"?, "safehoused" } ], "summary": { "total", "up", "daemon_down",
-  "unreachable", "parse_error", "draining", "empty_roster" } }` — treat this as
-  a consumed interface (the #4329 dashboard's multi-host phase reads it over
-  the tailnet).
+  "unreachable", "powered_off", "parse_error", "draining", "empty_roster" } }`
+  — treat this as a consumed interface (the #4329 dashboard's multi-host phase
+  reads it over the tailnet).
 
 ### `fleet drain <ssh-host> [--timeout N] [--force-after-timeout] [--json]` (#4343)
 
@@ -2362,6 +2420,17 @@ on a fleet worker or under launchd defeats its own purpose, since the
 supervisor immediately relaunches the daemon it just exited. A loud warning is
 logged when it is enabled under launchd; the same caveat applies to any
 systemd-supervised daemon (fleet workers included).
+
+**This is stage 1 only — it never powers off the host.** `autonomous.idleExit`
+above just makes `loom-daemon` itself exit; under `Restart=on-success`
+supervision (the fleet-worker default) the supervisor immediately relaunches
+it, so the *host* stays running and reachable throughout. The actual
+host-power-off mechanism is stage 2: the separate `fleet add-worker
+--idle-shutdown-minutes` cron guard (`render_idle_shutdown()`) documented in
+the `fleet add-worker` step 9 above — that is the one an operator needs a wake
+path for (provider console/CLI restart, tailnet-identity survival,
+re-registration), documented in full at that step, along with the #4697
+`fleet status` "expected power-off" classification.
 
 ### Daemon log path override (`LOOM_DAEMON_LOG`, #4010)
 

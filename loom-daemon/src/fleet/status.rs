@@ -25,18 +25,22 @@
 //! # Loud, distinct per-host states
 //!
 //! Silence must never read as idle (the #3979 pilot's monitoring lesson). Each
-//! host renders one of five distinct [`HostState`]s: [`HostState::Up`],
+//! host renders one of six distinct [`HostState`]s: [`HostState::Up`],
 //! [`HostState::DaemonDown`] (the host answered, but its daemon reports the
 //! #4069 unreachable-daemon payload), [`HostState::Unreachable`] (SSH/connect
-//! failure or a per-host timeout), [`HostState::ParseError`] (severe version
-//! skew — the payload could not be parsed as JSON at all), and
-//! [`HostState::Draining`] (registry `state: "draining"`, written by `fleet
-//! drain`'s first phase, #4343 — rendered distinctly rather than treated as an
-//! unrecognized/parse-error registry state). An empty roster never renders as
-//! empty output: [`FleetStatusReport::render_human`] always prints an explicit
-//! "no fleet workers registered" notice alongside the local host's row.
+//! failure or a per-host timeout), [`HostState::PoweredOff`] (#4697: an
+//! `Unreachable` host with a configured idle-shutdown window whose silence has
+//! already exceeded that window — likely an EXPECTED power-off, not a
+//! failure), [`HostState::ParseError`] (severe version skew — the payload
+//! could not be parsed as JSON at all), and [`HostState::Draining`] (registry
+//! `state: "draining"`, written by `fleet drain`'s first phase, #4343 —
+//! rendered distinctly rather than treated as an unrecognized/parse-error
+//! registry state). An empty roster never renders as empty output:
+//! [`FleetStatusReport::render_human`] always prints an explicit "no fleet
+//! workers registered" notice alongside the local host's row.
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -75,6 +79,15 @@ pub enum HostState {
     DaemonDown,
     /// SSH/connect failure, or the per-host collection timed out.
     Unreachable,
+    /// An `Unreachable` host with a configured idle-shutdown window
+    /// ([`WorkerRecord::idle_shutdown_minutes`]) whose observed silence has
+    /// already exceeded that window (#4697) — likely the host's own
+    /// idle-shutdown guard powering it off as designed (#3998/#4477), not a
+    /// failure. Still not `Up` (the exit-code policy, AC 3, treats it as
+    /// unhealthy like every other non-`Up` state), but rendered + labeled
+    /// distinctly so an operator does not mistake "expected, by design" for
+    /// "outage, investigate".
+    PoweredOff,
     /// The host responded, but the payload could not be parsed as JSON at all
     /// (severe version skew) — distinct from `DaemonDown`, whose payload is
     /// still well-formed JSON (#4069).
@@ -92,6 +105,11 @@ impl HostState {
             HostState::Up => "UP",
             HostState::DaemonDown => "DAEMON DOWN",
             HostState::Unreachable => "UNREACHABLE",
+            // Kept to 11 chars, matching the longest pre-existing label, so
+            // it still fits `render_human`'s `{:<12}` STATE column — the
+            // "expected, not a failure" qualifier rides on the per-row detail
+            // line and the summary tally instead of blowing the table apart.
+            HostState::PoweredOff => "POWERED OFF",
             HostState::ParseError => "PARSE ERROR",
             HostState::Draining => "DRAINING",
         }
@@ -366,6 +384,53 @@ fn classify_status_output(
     }
 }
 
+/// Attempt to reclassify an already-`Unreachable` host as [`HostState::PoweredOff`]
+/// (#4697): an EXPECTED power-off from the host's own idle-shutdown guard
+/// (design correct, #3998/#4477 — out of scope here), rather than a genuinely
+/// unexpected outage. Only ever called on a host `classify_status_output`/the
+/// timeout path already resolved to `Unreachable` — idle-shutdown powers the
+/// WHOLE host off (SSH included), so anything that still answers SSH (even a
+/// `DaemonDown`/`ParseError` payload) is definitionally not this case.
+///
+/// Deliberately conservative (a false "expected, don't worry" reading on a
+/// genuinely dead host is worse than an occasional false alarm, per #4697's
+/// acceptance criteria): reclassifies ONLY when both
+/// [`WorkerRecord::idle_shutdown_minutes`] is configured AND
+/// [`WorkerRecord::last_seen_up_at`] is a parseable past timestamp whose
+/// elapsed silence has already reached that configured window. Either input
+/// missing (no guard configured, or the host has never been observed `Up` by
+/// `fleet status` yet — a freshly-added record, or one predating these
+/// fields) leaves the host `Unreachable`, the pre-#4697,
+/// unexpected-until-proven-otherwise default. Returns `None` to mean "leave
+/// the state alone".
+#[must_use]
+fn classify_expected_power_off(
+    worker: &WorkerRecord,
+    now: DateTime<Utc>,
+) -> Option<(HostState, String)> {
+    let minutes = worker.idle_shutdown_minutes?;
+    let last_seen_raw = worker.last_seen_up_at.as_deref()?;
+    let last_seen_at = DateTime::parse_from_rfc3339(last_seen_raw)
+        .ok()?
+        .with_timezone(&Utc);
+    let elapsed_minutes = now.signed_duration_since(last_seen_at).num_minutes();
+    if elapsed_minutes < i64::from(minutes) {
+        // Silent, but not yet past the configured window — too early to call
+        // this "expected"; stay Unreachable (unexpected-until-proven).
+        return None;
+    }
+    Some((
+        HostState::PoweredOff,
+        format!(
+            "unreachable for {elapsed_minutes}m — past the configured idle-shutdown window \
+             ({minutes}m, last confirmed up at {last_seen_raw}). Likely an EXPECTED power-off \
+             (the host's own idle-shutdown guard), not a failure. Wake it via the provider \
+             console/CLI (Loom never calls a cloud CLI itself — see daemon-reference.md's \
+             `fleet add-worker` idle-shutdown wake-path notes for re-registration steps)."
+        ),
+    ))
+}
+
 fn tail_stderr_or(stderr: &str, fallback: &str) -> String {
     let line = stderr
         .lines()
@@ -415,6 +480,19 @@ pub async fn collect_remote_host(
         }
     };
 
+    // #4697: an Unreachable host may actually be an EXPECTED power-off from
+    // its own idle-shutdown guard rather than a genuine outage — see
+    // classify_expected_power_off's doc comment for the conservative
+    // conditions this requires.
+    let (state, detail) = if state == HostState::Unreachable {
+        match classify_expected_power_off(&worker, Utc::now()) {
+            Some((new_state, new_detail)) => (new_state, Some(new_detail)),
+            None => (state, detail),
+        }
+    } else {
+        (state, detail)
+    };
+
     let safehoused = {
         let src = source.clone();
         let host = alias.clone();
@@ -458,6 +536,11 @@ pub struct FleetStatusSummary {
     pub up: usize,
     pub daemon_down: usize,
     pub unreachable: usize,
+    /// #4697: `Unreachable` hosts reclassified as a likely EXPECTED
+    /// power-off (see [`HostState::PoweredOff`]) — counted separately from
+    /// `unreachable` so a monitor can tell "N unexpected outages" from "N
+    /// hosts probably just idle-shut-down as designed" at a glance.
+    pub powered_off: usize,
     pub parse_error: usize,
     pub draining: usize,
     /// `true` when the fleet registry itself had zero remote workers
@@ -512,12 +595,50 @@ pub async fn collect_fleet_report(
     FleetStatusReport { hosts, summary }
 }
 
+/// After a `fleet status` poll, refresh [`WorkerRecord::last_seen_up_at`] for
+/// every REMOTE host (the local host has no registry record) this poll
+/// observed [`HostState::Up`]. Returns `true` when at least one record
+/// changed, so the caller only re-saves the registry file when something
+/// actually moved.
+///
+/// This is the write side of the #4697 "expected power-off" heuristic
+/// ([`classify_expected_power_off`]): a LATER poll that finds the host
+/// `Unreachable` needs some persisted "last known up" reference point to
+/// measure elapsed silence against, and `fleet status` is the only thing that
+/// ever observes a host's liveness — so it is the one that must persist it
+/// (there is no separate continuous heartbeat/monitor in this design).
+pub fn update_last_seen_up_at(
+    registry: &mut FleetRegistry,
+    report: &FleetStatusReport,
+    now: DateTime<Utc>,
+) -> bool {
+    let now_str = now.to_rfc3339();
+    let mut changed = false;
+    for host in &report.hosts {
+        if host.is_local || host.state != HostState::Up {
+            continue;
+        }
+        if let Some(worker) = registry
+            .workers
+            .iter_mut()
+            .find(|w| w.ssh_host == host.alias)
+        {
+            if worker.last_seen_up_at.as_deref() != Some(now_str.as_str()) {
+                worker.last_seen_up_at = Some(now_str.clone());
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
 fn summarize(hosts: &[HostReport], empty_roster: bool) -> FleetStatusSummary {
     let mut summary = FleetStatusSummary {
         total: hosts.len(),
         up: 0,
         daemon_down: 0,
         unreachable: 0,
+        powered_off: 0,
         parse_error: 0,
         draining: 0,
         empty_roster,
@@ -527,6 +648,7 @@ fn summarize(hosts: &[HostReport], empty_roster: bool) -> FleetStatusSummary {
             HostState::Up => summary.up += 1,
             HostState::DaemonDown => summary.daemon_down += 1,
             HostState::Unreachable => summary.unreachable += 1,
+            HostState::PoweredOff => summary.powered_off += 1,
             HostState::ParseError => summary.parse_error += 1,
             HostState::Draining => summary.draining += 1,
         }
@@ -586,11 +708,12 @@ impl FleetStatusReport {
             }
         }
         out.push_str(&format!(
-            "\n{} host(s): {} up, {} daemon-down, {} unreachable, {} parse-error, {} draining.\n",
+            "\n{} host(s): {} up, {} daemon-down, {} unreachable, {} powered-off (expected), {} parse-error, {} draining.\n",
             self.summary.total,
             self.summary.up,
             self.summary.daemon_down,
             self.summary.unreachable,
+            self.summary.powered_off,
             self.summary.parse_error,
             self.summary.draining,
         ));
@@ -700,6 +823,8 @@ mod tests {
             state: None,
             drain_phase: None,
             drain_captured: Vec::new(),
+            idle_shutdown_minutes: None,
+            last_seen_up_at: None,
         }
     }
 
@@ -756,6 +881,100 @@ mod tests {
         assert!(detail.unwrap().contains("Connection refused"));
     }
 
+    // ---- classify_expected_power_off (#4697) ------------------------------
+
+    #[test]
+    fn expected_power_off_when_silence_exceeds_idle_shutdown_window() {
+        let mut w = worker("worker-1");
+        w.idle_shutdown_minutes = Some(30);
+        let last_seen = Utc::now() - chrono::Duration::minutes(45);
+        w.last_seen_up_at = Some(last_seen.to_rfc3339());
+
+        let result = classify_expected_power_off(&w, Utc::now());
+        let (state, detail) = result.expect("45m silence should exceed a 30m window");
+        assert_eq!(state, HostState::PoweredOff);
+        assert!(detail.contains("30m"));
+        assert!(detail.contains("EXPECTED power-off"));
+    }
+
+    #[test]
+    fn stays_unreachable_when_silence_well_within_idle_shutdown_window() {
+        let mut w = worker("worker-1");
+        w.idle_shutdown_minutes = Some(30);
+        let last_seen = Utc::now() - chrono::Duration::minutes(5);
+        w.last_seen_up_at = Some(last_seen.to_rfc3339());
+
+        // Silent for only 5m against a 30m window — too early to call this
+        // "expected"; the conservative default (None => leave state alone).
+        assert!(classify_expected_power_off(&w, Utc::now()).is_none());
+    }
+
+    #[test]
+    fn stays_unreachable_when_no_idle_shutdown_configured() {
+        let mut w = worker("worker-1");
+        w.idle_shutdown_minutes = None;
+        w.last_seen_up_at = Some((Utc::now() - chrono::Duration::minutes(999)).to_rfc3339());
+        assert!(classify_expected_power_off(&w, Utc::now()).is_none());
+    }
+
+    #[test]
+    fn stays_unreachable_when_last_seen_up_at_unknown() {
+        let mut w = worker("worker-1");
+        w.idle_shutdown_minutes = Some(30);
+        w.last_seen_up_at = None;
+        assert!(classify_expected_power_off(&w, Utc::now()).is_none());
+    }
+
+    // ---- update_last_seen_up_at (#4697) ------------------------------------
+
+    #[test]
+    fn update_last_seen_up_at_touches_only_up_remote_hosts() {
+        let mut registry = FleetRegistry::default();
+        registry.upsert(worker("up-host"));
+        registry.upsert(worker("down-host"));
+
+        let report = FleetStatusReport {
+            hosts: vec![
+                HostReport::local_up(serde_json::json!({})),
+                HostReport {
+                    alias: "up-host".to_string(),
+                    tailnet_name: None,
+                    provider_instance_id: None,
+                    added_by: None,
+                    is_local: false,
+                    state: HostState::Up,
+                    workspaces: Vec::new(),
+                    status: None,
+                    detail: None,
+                    safehoused: SafehousedProbe::Unknown,
+                },
+                HostReport {
+                    alias: "down-host".to_string(),
+                    tailnet_name: None,
+                    provider_instance_id: None,
+                    added_by: None,
+                    is_local: false,
+                    state: HostState::Unreachable,
+                    workspaces: Vec::new(),
+                    status: None,
+                    detail: None,
+                    safehoused: SafehousedProbe::Unknown,
+                },
+            ],
+            summary: summarize(&[], false),
+        };
+
+        let now = Utc::now();
+        let changed = update_last_seen_up_at(&mut registry, &report, now);
+        assert!(changed);
+        assert_eq!(registry.get("up-host").unwrap().last_seen_up_at, Some(now.to_rfc3339()));
+        assert_eq!(registry.get("down-host").unwrap().last_seen_up_at, None);
+
+        // A second call at the exact same timestamp is a no-op (nothing new
+        // to persist).
+        assert!(!update_last_seen_up_at(&mut registry, &report, now));
+    }
+
     // ---- collect_remote_host / collect_fleet_report -----------------------
 
     #[tokio::test]
@@ -795,6 +1014,56 @@ mod tests {
         assert_eq!(report.summary.unreachable, 1);
         assert_eq!(report.summary.parse_error, 1);
         assert!(!report.summary.empty_roster);
+    }
+
+    /// #4697: end-to-end through `collect_fleet_report`, an idle-shutdown-
+    /// configured host silent past its window classifies as `PoweredOff`, and
+    /// one silent well within its window stays `Unreachable`.
+    #[tokio::test]
+    async fn idle_shutdown_configured_host_past_window_is_powered_off_not_unreachable() {
+        // Both hosts fail to answer SSH at all (a genuinely powered-off host
+        // answers no differently than a genuinely dead one — the ONLY signal
+        // available is elapsed silence vs. the configured window).
+        let responses = HashMap::new();
+        let source: Arc<dyn HostStatusSource> = Arc::new(MockSource::new(responses));
+
+        let mut registry = FleetRegistry::default();
+
+        let mut past_window = worker("past-window-host");
+        past_window.idle_shutdown_minutes = Some(30);
+        past_window.last_seen_up_at =
+            Some((Utc::now() - chrono::Duration::minutes(45)).to_rfc3339());
+        registry.upsert(past_window);
+
+        let mut within_window = worker("within-window-host");
+        within_window.idle_shutdown_minutes = Some(30);
+        within_window.last_seen_up_at =
+            Some((Utc::now() - chrono::Duration::minutes(5)).to_rfc3339());
+        registry.upsert(within_window);
+
+        let local = HostReport::local_up(serde_json::json!({}));
+        let report = collect_fleet_report(source, registry, local, Duration::from_secs(5)).await;
+
+        let by_alias = |alias: &str| report.hosts.iter().find(|h| h.alias == alias).unwrap();
+        let past = by_alias("past-window-host");
+        assert_eq!(past.state, HostState::PoweredOff);
+        assert!(past.detail.as_ref().unwrap().contains("EXPECTED power-off"));
+
+        let within = by_alias("within-window-host");
+        assert_eq!(within.state, HostState::Unreachable);
+
+        assert_eq!(report.summary.powered_off, 1);
+        assert_eq!(report.summary.unreachable, 1);
+        // Still not a healthy fleet — an expected power-off is not "up".
+        assert_ne!(report.exit_code(), 0);
+
+        let rendered = report.render_human();
+        assert!(rendered.contains("POWERED OFF"));
+        assert!(rendered.contains("1 powered-off (expected)"));
+        // The STATE label must not overflow render_human's {:<12} column, or
+        // every remaining cell on that row shifts right and the table stops
+        // being scannable.
+        assert!(HostState::PoweredOff.label().len() <= 11);
     }
 
     #[tokio::test]
