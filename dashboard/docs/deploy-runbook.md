@@ -12,6 +12,7 @@ Companion documents:
 | Document | Covers |
 |---|---|
 | [`../wrangler.toml`](../wrangler.toml) | The deployment template itself — every value you must supply is tagged `CHANGE ME` |
+| [`../web/README.md`](../web/README.md) | The dashboard UI this Worker also serves — architecture, local development, why it deploys as Workers Assets |
 | [`cloudflare-access.md`](cloudflare-access.md) | Gating the authenticated view behind zero-trust SSO while leaving the public view ungated |
 | [`reference-deployment.md`](reference-deployment.md) | The 2AM reference instance (`dashboard.2amlogic.com`) — a concrete, filled-in example of every value this runbook asks you to supply, plus its credential-file locations and current Access layout |
 | [`../README.md`](../README.md) | Architecture, routes, local development, tests |
@@ -25,7 +26,7 @@ Companion documents:
 
 ## 0. What you are deploying
 
-One Cloudflare Worker with three pieces of state:
+One Cloudflare Worker with three pieces of state, plus the dashboard UI:
 
 - **D1 database** — durable history (`records` table) plus per-host ingest
   keys (`hosts` table, SHA-256 hashed, individually revocable).
@@ -33,6 +34,11 @@ One Cloudflare Worker with three pieces of state:
   snapshot. Created implicitly on first deploy; nothing to provision.
 - **Cron trigger** — hourly retention sweep bounded by `RETENTION_DAYS` and
   `MAX_RECORDS`.
+- **Static assets** — the Phase-3 dashboard UI (`web/`), uploaded with the
+  Worker. Nothing to provision, but it must be **built** before you deploy;
+  `npm run deploy` does that for you. The UI and the API deliberately share one
+  hostname so a single Cloudflare Access policy gates both — see
+  [`../web/README.md`](../web/README.md).
 
 ### Prerequisites
 
@@ -40,7 +46,7 @@ One Cloudflare Worker with three pieces of state:
 |---|---|
 | Cloudflare account | The free Workers plan is sufficient to start: it includes D1, cron triggers, and SQLite-backed Durable Objects (this Worker declares `new_sqlite_classes`, the free-plan-eligible storage backend — **not** the paid-only KV-backed classes). |
 | Node.js 20+ | `node --version` |
-| This repository | Only the `dashboard/` directory is needed. |
+| This repository | Only the `dashboard/` directory is needed (including `dashboard/web/`). |
 | ~15 minutes | Steps 1-8 are the whole deploy. |
 
 Cost expectation for a small fleet (a handful of hosts): comfortably inside
@@ -54,8 +60,24 @@ one `host.health` + one `tokens.snapshot` record per host per 5 minutes.
 ```bash
 cd dashboard
 npm install
-npm test          # 43 tests, all offline (Miniflare) — proves your checkout is sound
+npm test              # 83 backend tests, all offline (Miniflare)
+
+npm run install:web   # the dashboard UI's own dependencies
+npm run test:web      # 95 UI tests, all offline (happy-dom)
+npm run build:web     # -> web/dist, what the Worker uploads as static assets
 ```
+
+Both suites passing proves your checkout is sound. `npm run check:all` runs
+typechecks plus both suites in one command.
+
+> **Why the UI build matters even if you only care about the API**:
+> `wrangler.toml` declares `[assets] directory = "./web/dist"`, and Wrangler
+> refuses to parse the config while that directory is missing — which would
+> break `npm test`, `npm run dev`, and `npm run preflight` too. Those three
+> commands therefore run `scripts/ensure-web-dist.sh` first, which writes a
+> labelled "not built" placeholder page. Everything works with the
+> placeholder; you just would not want to serve it to real users, so the
+> preflight warns about it.
 
 ## 2. Authenticate Wrangler
 
@@ -149,7 +171,7 @@ credential.
 ## 6. Deploy
 
 ```bash
-npm run deploy      # wrangler deploy
+npm run deploy      # builds web/ then runs wrangler deploy
 ```
 
 Wrangler prints the deployed URL —
@@ -157,18 +179,31 @@ Wrangler prints the deployed URL —
 it:
 
 ```bash
-curl -sS -o /dev/null -w '%{http_code} %{content_type}\n' \
-  https://loom-observability-ingest.<your-subdomain>.workers.dev/
+BASE="https://loom-observability-ingest.<your-subdomain>.workers.dev"
+
+curl -sS -o /dev/null -w '%{http_code} %{content_type}\n' "$BASE/"
 # 200 text/html; charset=utf-8
+
+curl -sS "$BASE/public/fleet-state"
+# {"hosts":{},"activeSweeps":[]}   <- empty until step 9 lands the first push
 ```
 
-`/` serves the dashboard page itself (issue #4795): the **redacted public
-view**, with a Sign in link, for any request without a valid Cloudflare
-Access session — which is every request at this point, since Access is not
+`/` serves the dashboard UI (issue #4749) in its **redacted public variant**,
+with a Sign in link, for any request without a valid Cloudflare Access
+session — which is every request at this point, since Access is not
 configured yet and `CF_ACCESS_TEAM_DOMAIN`/`CF_ACCESS_AUD` are unset in
 `wrangler.toml`. A `200` here (never a redirect, never a 500) is the whole
 smoke test; wiring the authenticated variant is
 [`cloudflare-access.md`](cloudflare-access.md)'s job.
+
+Open `$BASE/` in a browser and you should get the dashboard, reporting "No
+hosts are reporting yet" — that empty state is the correct answer at this
+point in the runbook, not a fault.
+
+> If you instead see the plain-text `loom-observability-ingest: see /ingest,
+> /admin/*` banner, the UI build did not run — that is the Worker's
+> server-rendered fallback when no assets are uploaded. Use `npm run deploy`,
+> not a bare `wrangler deploy`.
 
 ## 7. Set the admin token
 
@@ -284,7 +319,9 @@ curl -sS "$BASE/admin/fleet-state" -H "authorization: Bearer $ADMIN"
 ```
 
 You should see rows for your `host_id`, and the Durable Object snapshot
-should list the host. If `records` is empty, work the troubleshooting table
+should list the host. Reload the dashboard at `$BASE/` and that host now has a
+card; click it for the per-host drill-down (health fields, token pool, and any
+in-flight sweeps). If `records` is empty, work the troubleshooting table
 below.
 
 ---
@@ -378,6 +415,12 @@ the block) and restart, so daemons stop queueing pushes to a dead endpoint.
 | `observability: enabled but no endpoint configured` | Missing/empty `endpoint` | Step 9b |
 | Records stop arriving after a host sleeps | Expected — the durable queue drains on wake | No action; check `observability-queue.jsonl` growth if it persists |
 | `records` grows without bound | Cron trigger not firing | `wrangler deployments list`; force with `POST /admin/retention/run` |
+| `GET /` shows "Dashboard UI not built" | Deployed the placeholder — a bare `wrangler deploy` skipped the UI build | `npm run install:web && npm run deploy` |
+| `GET /` returns the plain-text route banner | No assets were uploaded at all | Confirm `[assets]` is present in `wrangler.toml`, then `npm run deploy` |
+| Dashboard shows "No hosts are reporting yet" | Correct empty state — no host has pushed yet | Steps 8-9; verify with step 10 |
+| Dashboard shows "your Cloudflare Access session may have expired" | Access session lapsed, or `/api/*` is gated but the browser session is not | Reload to re-authenticate ([`cloudflare-access.md`](cloudflare-access.md)) |
+| A host card shows `—` for CPU/load/disk | Expected — the daemon omits a measurement it could not take, and the UI never renders an absent value as zero | No action |
+| `wrangler` errors "assets.directory ... does not exist" | Ran `wrangler` directly on a checkout where the UI was never built | `bash scripts/ensure-web-dist.sh`, or `npm run build:web` |
 
 ---
 
@@ -386,11 +429,15 @@ the block) and restart, so daemons stop queueing pushes to a dead endpoint.
 The template and every command in this runbook were validated against the
 Wrangler CLI (`wrangler deploy --dry-run` for the default config, the
 commented `[[routes]]` custom-domain variant, and the commented
-`[env.staging]` variant) and against the backend's own 43-test Miniflare
-suite. **A live from-scratch deploy against a real Cloudflare account — steps
-2-10 end to end, including a real daemon push — has not been performed** and
-is recommended before treating this as fully proven. Please report any step
-that does not work as written.
+`[env.staging]` variant) and against the backend's own 83-test Miniflare
+suite plus the dashboard UI's 95-test happy-dom suite. The dashboard was
+additionally validated end to end against a local `wrangler dev`: assets
+served at `/`, two hosts provisioned through `/admin/hosts`, telemetry pushed
+through `/ingest`, and the aggregated `/api/fleet-state` response rendered
+through the real view code. **A live from-scratch deploy against a real
+Cloudflare account — steps 2-10 end to end, including a real daemon push — has
+not been performed** and is recommended before treating this as fully proven.
+Please report any step that does not work as written.
 
 The 2026-07-31 deploy of the [2AM reference instance](reference-deployment.md)
 was a real production deploy on a real account, but **it does not satisfy the

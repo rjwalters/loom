@@ -107,3 +107,154 @@ export function makeCompletedSweepPair(args: {
     }),
   ];
 }
+/**
+ * Sample `/api/fleet-state` payloads.
+ *
+ * These are wire-shaped (`unknown` JSON, snake_case inside `record`), not
+ * pre-parsed view models, so every test that uses them exercises `parse.ts`
+ * the same way a live response would. Field names and value shapes are copied
+ * from `../../docs/query-api.md` and `.loom/docs/telemetry-schema.md`.
+ */
+
+/** Fixed "now" for every time-dependent assertion. */
+export const NOW = new Date("2026-07-30T12:10:00Z");
+
+export function isoMinutesBefore(minutes: number, base: Date = NOW): string {
+  return new Date(base.getTime() - minutes * 60_000).toISOString();
+}
+
+/** A healthy, busy host: full health, a healthy token pool, two live sweeps. */
+export const HEALTHY_HOST_ID = "fleet-mac-1";
+
+/** Reports fine but one token account is exhausted → `degraded`. */
+export const DEGRADED_HOST_ID = "fleet-linux-2";
+
+/** Last report is well past `STALE_AFTER_SEC` → `stale`. */
+export const STALE_HOST_ID = "fleet-old-3";
+
+/** Present only in `activeSweeps` — no `hosts` entry at all. */
+export const SWEEP_ONLY_HOST_ID = "fleet-new-4";
+
+/** Present in `hosts` with health but zero sweeps — the idle-host case. */
+export const IDLE_HOST_ID = "fleet-idle-5";
+
+export function multiHostSnapshot(): unknown {
+  return {
+    hosts: {
+      [HEALTHY_HOST_ID]: {
+        health: {
+          record: {
+            kind: "host.health",
+            captured_at: isoMinutesBefore(2),
+            daemon_version: "0.16.0",
+            uptime_sec: 86_400,
+            logical_cpus: 28,
+            cpu_idle_fraction: 0.83,
+            load_per_core: 0.51,
+            worktree_root_free_gb: 200,
+          },
+          updatedAt: isoMinutesBefore(2),
+        },
+        tokens: {
+          record: {
+            kind: "tokens.snapshot",
+            captured_at: isoMinutesBefore(2),
+            accounts: [
+              {
+                account: "agent-1",
+                rank: 0,
+                usage_fraction: 0.42,
+                limit_window_reset_at: "2026-07-30T18:00:00Z",
+                exhausted: false,
+              },
+              { account: "agent-2", rank: 1, usage_fraction: 0.11, exhausted: false },
+            ],
+          },
+          updatedAt: isoMinutesBefore(2),
+        },
+      },
+      [DEGRADED_HOST_ID]: {
+        health: {
+          record: {
+            kind: "host.health",
+            daemon_version: "0.16.0",
+            uptime_sec: 3_600,
+            logical_cpus: 8,
+            // cpu_idle_fraction / load_per_core / worktree_root_free_gb are
+            // absent — the "probe could not measure" case the schema mandates
+            // be rendered as unknown, never zero.
+          },
+          updatedAt: isoMinutesBefore(1),
+        },
+        tokens: {
+          record: {
+            kind: "tokens.snapshot",
+            accounts: [
+              { account: "agent-3", usage_fraction: 1, exhausted: true },
+              { account: "agent-4", exhausted: false },
+            ],
+          },
+          updatedAt: isoMinutesBefore(1),
+        },
+      },
+      [STALE_HOST_ID]: {
+        health: {
+          record: { kind: "host.health", daemon_version: "0.15.0", uptime_sec: 120 },
+          updatedAt: isoMinutesBefore(90),
+        },
+      },
+      [IDLE_HOST_ID]: {
+        health: {
+          record: {
+            kind: "host.health",
+            daemon_version: "0.16.0",
+            uptime_sec: 7_200,
+            logical_cpus: 12,
+            cpu_idle_fraction: 0.99,
+            load_per_core: 0.02,
+            worktree_root_free_gb: 512,
+          },
+          updatedAt: isoMinutesBefore(3),
+        },
+        tokens: { record: { kind: "tokens.snapshot", accounts: [] }, updatedAt: isoMinutesBefore(3) },
+      },
+    },
+    activeSweeps: [
+      {
+        hostId: HEALTHY_HOST_ID,
+        sweepId: "sweep-issue-4703-0",
+        repo: "rjwalters/loom",
+        visibility: "public",
+        issue: 4703,
+        phase: "builder",
+        startedAt: isoMinutesBefore(10),
+        enteredPhaseAt: isoMinutesBefore(4),
+        model: "opus",
+        effort: "high",
+        updatedAt: isoMinutesBefore(4),
+      },
+      {
+        hostId: HEALTHY_HOST_ID,
+        sweepId: "sweep-issue-4749-0",
+        repo: "rjwalters/loom",
+        visibility: "public",
+        issue: 4749,
+        // No phase yet: sweep.started has arrived, sweep.phase has not.
+        startedAt: isoMinutesBefore(1),
+        model: "opus",
+        updatedAt: isoMinutesBefore(1),
+      },
+      {
+        hostId: SWEEP_ONLY_HOST_ID,
+        sweepId: "sweep-issue-9001-0",
+        visibility: "private",
+        phase: "judge",
+        startedAt: isoMinutesBefore(6),
+        enteredPhaseAt: isoMinutesBefore(2),
+        updatedAt: isoMinutesBefore(2),
+      },
+    ],
+  };
+}
+
+export const EMPTY_SNAPSHOT: unknown = { hosts: {}, activeSweeps: [] };

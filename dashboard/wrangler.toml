@@ -50,6 +50,45 @@ workers_dev = true
 # custom_domain = true
 
 # -----------------------------------------------------------------------------
+# Static assets — the Phase-3 dashboard UI (`web/`), served by THIS Worker.
+# -----------------------------------------------------------------------------
+# Nothing account-specific here; you should not need to change any of it.
+#
+# The UI and the API deliberately share one Worker, one hostname, and therefore
+# one Cloudflare Access policy. A split deploy (UI on Pages, API here) would
+# put the two on different hostnames, which means CORS, a second Access
+# application, and a cross-origin cookie problem — for zero benefit at this
+# scale.
+#
+# `directory` is Vite's build output (`cd web && npm run build`). It must EXIST
+# for Wrangler to parse this file at all, even for `--dry-run` or the test
+# suite, so `npm test` / `npm run preflight` / `npm run dev` first run
+# `scripts/ensure-web-dist.sh`, which drops a placeholder when the UI has not
+# been built. `npm run deploy` always does a real build first.
+#
+# `not_found_handling = "none"` is load-bearing: it makes any request that does
+# not match a file here fall through to the Worker (`src/index.ts`), which is
+# what keeps `/ingest`, `/admin/*`, `/api/*`, and `/public/*` reachable. The
+# SPA alternative ("single-page-application") would rewrite every unmatched
+# path to index.html and shadow the entire API — which is why the UI routes on
+# the URL *hash* (`#/hosts/<id>`) and never needs a server-side rewrite. See
+# `web/src/router.ts`.
+#
+# `run_worker_first = ["/"]` + `binding` are load-bearing for the single-URL
+# layout (issue #4795): the Worker must see `/` itself so it can validate the
+# Cloudflare Access JWT and tell the UI which dataset it is entitled to. Left
+# to the asset router, `/` would be served as a static index.html before any
+# Worker code ran, and an anonymous visitor would get a UI that immediately
+# calls `/api/*` and 403s. Every other asset path (`/assets/*`) is still
+# served directly by the router — those are JS/CSS bundles with no fleet data
+# in them.
+[assets]
+directory = "./web/dist"
+not_found_handling = "none"
+binding = "ASSETS"
+run_worker_first = ["/"]
+
+# -----------------------------------------------------------------------------
 # D1 — durable history for every ingested telemetry record.
 # -----------------------------------------------------------------------------
 # CHANGE ME — `database_id` below is an all-zeros placeholder. Create the

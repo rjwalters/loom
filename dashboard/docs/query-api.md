@@ -100,6 +100,13 @@ A completed sweep is not present in `activeSweeps` (removed on
 `sweep.completed` — see `src/fleetState.ts`'s module doc); its full record
 lives in D1 and is queryable via `GET /api/history`.
 
+**Consumer**: the Phase-3 dashboard UI ([`../web/`](../web/)) reads this route
+and only this route. Its client (`web/src/api.ts`) plus the narrowing layer
+(`web/src/parse.ts`) are a worked example of the tolerances this contract
+requires — every `host.health` measurement and most `activeSweeps` fields are
+optional, and an absent measurement must be rendered as unknown rather than
+zero.
+
 On `GET /public/fleet-state`, a `visibility: "private"` entry in
 `activeSweeps` has `repo`/`issue`/`sweepId` omitted entirely (not
 null-valued — `JSON.stringify` drops the key) rather than the shape above;

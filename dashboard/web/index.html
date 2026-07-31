@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark light" />
+    <title>Loom fleet</title>
+    <link rel="icon" href="data:," />
+  </head>
+  <body>
+    <header class="topbar">
+      <h1 class="topbar__title">Loom fleet</h1>
+      <div class="topbar__meta">
+        <span id="refresh-status" class="topbar__status" aria-live="polite"></span>
+        <button id="refresh-button" type="button" class="button">Refresh</button>
+      </div>
+    </header>
+    <main id="app" class="app" aria-busy="true"></main>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
