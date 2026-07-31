@@ -625,6 +625,13 @@ claude -p "/loom:hermit"    --dangerously-skip-permissions
 
 ## Overnight / long-running orchestration
 
+> **Supervising a long window: `/loom:watch` (#4762).** The tick loop that probes
+> fleet health, applies a closed set of remediations, and prints an end-of-window
+> summary is a skill: `/loom:watch [--until 07:00] [--interval 25m]`
+> (`--dry-run` for a single read-only tick). It assumes — and does not restate —
+> the host-sleep and `.loom/` resync procedures in this section. See
+> `.claude/commands/loom/watch.md`.
+
 ### Keeping the host awake (#3350)
 
 `/loom:sweep` automatically runs `./.loom/scripts/check-host-sleep.sh` at startup
