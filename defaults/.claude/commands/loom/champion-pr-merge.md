@@ -1181,18 +1181,34 @@ If ANY safety criterion fails, do NOT merge. How the failure is handled depends 
 
 Add a comment explaining why, and **keep the `loom:pr` label** so the PR is re-evaluated on the next Champion tick once the blocking condition clears.
 
-**Idempotency guard (mirrors the stale-PR pattern above, #4586).** A static failing
-criterion (e.g. a size check that cannot pass without a new push) is guaranteed to
-fail identically on every re-evaluation, and closely-spaced Champion ticks (cron +
-daemon role runner, or a busy period with multiple ticks in flight) can hit the same
-PR several times before the condition changes — left unguarded, this reposts a
-near-identical rejection comment on every single tick (8 duplicates in 5 minutes was
-observed on PR #4540, all citing the identical static size-check failure). Key the
-marker to the **specific failing criterion** (not the PR as a whole) so a PR that
-starts failing a *different* criterion still gets a fresh comment, and compare the
-new reason text against the most recently posted comment for that criterion so a
-*changed* reason (the same criterion, but the specifics moved — e.g. CI now fails a
-different check) still gets a fresh comment too:
+**Idempotency guard (mirrors the stale-PR pattern above, #4586; keyed on a stable
+identity rather than freeform prose, #4818).** A static failing criterion (e.g. a
+size check that cannot pass without a new push) is guaranteed to fail identically on
+every re-evaluation, and closely-spaced Champion ticks (cron + daemon role runner, or
+a busy period with multiple ticks in flight) can hit the same PR several times before
+the condition changes — left unguarded, this reposts a near-identical rejection
+comment on every single tick (8 duplicates in 5 minutes was observed on PR #4540, all
+citing the identical static size-check failure). An earlier version of this guard
+(#4586/#4754) compared the freeform `$REASON` sentence verbatim against the most
+recently posted comment — but `$REASON` is composed fresh by the LLM on every tick,
+so its wording drifts even when the underlying failure hasn't changed at all (PR
+#4796 collected 4 differently-worded "CI check X is failing" comments in 42 minutes,
+all for the same never-changing check — see #4818). Key the marker on a **stable
+identity** instead: the failing criterion (`$CRITERION_KEY`) *plus* a deterministic
+`$REASON_KEY` built mechanically from the failure data — never freeform prose — so
+near-duplicate wording for the *same* underlying failure is recognized and
+suppressed, while a genuinely different failure (a different check name, a different
+set of missing labels, …) or the same check clearing and then failing again still
+produces a fresh comment:
+
+- **ci-status**: the sorted, comma-joined list of currently failing/cancelled check
+  names (`echo "$FAILING_CHECKS" | sort | paste -sd, -`) — not the prose sentence
+  describing them.
+- **label-check**: the sorted, comma-joined list of missing/conflicting label names.
+- **critical-file**: the sorted, comma-joined list of touched critical file paths.
+- **size-check / merge-conflict**: nothing about these failures varies tick to tick
+  (the whole PR is over the line, or has a conflict) — use `$CRITERION_KEY` itself as
+  `$REASON_KEY`.
 
 ```bash
 PR_NUMBER=<number>
@@ -1200,20 +1216,26 @@ PR_NUMBER=<number>
 # merge-conflict | ci-status. (Recency-check failures use the dedicated Stale PR
 # path below, not this one.)
 CRITERION_KEY="<CRITERION_SLUG>"
-REJECT_MARKER="<!-- champion:reject:$CRITERION_KEY -->"
-REASON="<SPECIFIC_REASON>"  # exact reason text that will go in the comment body
+# Deterministic identity of THIS failure, built mechanically from the check/label/file
+# data above (see the per-criterion list) — never the freeform prose sentence. Must
+# not contain a newline or "-->".
+REASON_KEY="<STABLE_IDENTITY>"
+REJECT_MARKER="<!-- champion:reject:$CRITERION_KEY:$REASON_KEY -->"
+REASON="<SPECIFIC_REASON>"  # human-readable prose for the comment body — free to vary
+                            # tick to tick; no longer load-bearing for dedup
 
-# Idempotency guard: find the most recent comment already posted for this
-# criterion (if any) and compare its reason text against the current one.
-# Skip re-commenting only when the reason is unchanged — a PR that still fails
-# the same criterion but for a *different* specific reason (e.g. CI now fails a
-# different check) still gets a fresh comment.
-LAST_COMMENT=$(gh pr view "$PR_NUMBER" --json comments --jq '.comments' \
-  | jq --arg marker "$REJECT_MARKER" \
-  '[.[] | select(.body | contains($marker))] | last | .body // ""')
+# Idempotency guard: find the most recently posted rejection comment for this
+# criterion (any REASON_KEY) and compare its marker line, verbatim, against the
+# marker for the CURRENT failure. Skip re-commenting only when the identity is
+# unchanged — a different REASON_KEY (a different failing check, a different missing
+# label, …), or the same key reappearing after the criterion cleared and failed
+# again, always gets a fresh comment.
+LAST_MARKER=$(gh pr view "$PR_NUMBER" --json comments --jq '.comments' \
+  | jq -r --arg prefix "<!-- champion:reject:$CRITERION_KEY:" \
+  '[.[] | select(.body | startswith($prefix))] | last | .body // "" | split("\n")[0]')
 
-if [ -n "$LAST_COMMENT" ] && echo "$LAST_COMMENT" | grep -qF "$REASON"; then
-  echo "Rejection reason for $CRITERION_KEY unchanged since last comment on #$PR_NUMBER — skipping duplicate comment"
+if [ "$LAST_MARKER" = "$REJECT_MARKER" ]; then
+  echo "Rejection identity for $CRITERION_KEY unchanged since last comment on #$PR_NUMBER — skipping duplicate comment"
 else
   gh pr comment "$PR_NUMBER" --body "$REJECT_MARKER
 **Champion: Cannot Auto-Merge**
