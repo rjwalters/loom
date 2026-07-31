@@ -1085,6 +1085,15 @@ fi
 PLIST_PATH_VALUE="$(resolve_plist_path)"
 
 PID_FILE="$DAEMON_STATE_HOME/.daemon.pid"
+# Exported (#4774) so the daemon writes the SAME file this script does. Both
+# the plist and systemd-unit renderers harvest every exported LOOM_* var, so
+# the path chosen here is baked into the supervisor definition and every
+# supervisor-triggered relaunch resolves it identically -- which is the whole
+# point: those relaunches (launchd KeepAlive, systemd Restart=, the #4054
+# restart primitive, the self-update roll, `launchctl kickstart`) never re-run
+# this script, so before #4774 the file kept naming a long-dead pid. The daemon
+# now claims it itself right after its socket bind succeeds.
+export LOOM_PID_FILE="$PID_FILE"
 SOCKET_PATH="${LOOM_SOCKET_PATH:-$HOME/.loom/loom-daemon.sock}"
 START_LOG="$DAEMON_STATE_HOME/logs/daemon-start.log"
 mkdir -p "$DAEMON_STATE_HOME/logs"
@@ -1481,6 +1490,12 @@ if [[ "$USE_LAUNCHD" == "true" ]]; then
         exit 1
     fi
 
+    # Redundant since #4774 -- the daemon claims $PID_FILE itself immediately
+    # after its socket bind succeeds -- but kept deliberately. It costs nothing,
+    # it closes the window between "supervisor reports a pid" and "the daemon
+    # reaches its bind", and it is the only writer for a daemon binary older
+    # than #4774 (a start script and a daemon roll independently). Harmless if
+    # both write: same path, same pid, and the daemon's write is atomic.
     echo "$daemon_pid" > "$PID_FILE"
     # Record operator intent + arm the host-side autonomy-loss watchdog (#4011).
     write_intent_marker "true" "$LAUNCHD_LABEL"
@@ -1561,6 +1576,12 @@ if [[ "$IS_LINUX_SYSTEMD" == "true" ]]; then
         exit 1
     fi
 
+    # Redundant since #4774 -- the daemon claims $PID_FILE itself immediately
+    # after its socket bind succeeds -- but kept deliberately. It costs nothing,
+    # it closes the window between "supervisor reports a pid" and "the daemon
+    # reaches its bind", and it is the only writer for a daemon binary older
+    # than #4774 (a start script and a daemon roll independently). Harmless if
+    # both write: same path, same pid, and the daemon's write is atomic.
     echo "$daemon_pid" > "$PID_FILE"
     # Record operator intent + arm the systemd-timer autonomy-loss watchdog
     # (#4011, #4260 sub-issue D).
@@ -1599,6 +1620,12 @@ if ! kill -0 "$daemon_pid" 2>/dev/null; then
     exit 1
 fi
 
+# Redundant since #4774 -- the daemon claims $PID_FILE itself immediately
+# after its socket bind succeeds -- but kept deliberately. It costs nothing,
+# it closes the window between "supervisor reports a pid" and "the daemon
+# reaches its bind", and it is the only writer for a daemon binary older
+# than #4774 (a start script and a daemon roll independently). Harmless if
+# both write: same path, same pid, and the daemon's write is atomic.
 echo "$daemon_pid" > "$PID_FILE"
 # Record operator intent (#4011). This is the nohup fallback tier (non-systemd
 # Linux host, or --no-launchd/--no-systemd), so there is no scheduled checker to

@@ -1261,6 +1261,34 @@ pub struct DaemonStatusReport {
     /// pre-#4761 wire data compatible.
     #[serde(default)]
     pub role_tick_records: Vec<RoleTickRecord>,
+    /// The **real OS pid of the process that answered this request** (Issue
+    /// #4774) — i.e. the daemon that actually owns the IPC socket, established
+    /// by `std::process::id()` inside the handler rather than read from any
+    /// file.
+    ///
+    /// This is the ground truth every pid-file consumer was missing. Before
+    /// #4774 the only "daemon pid" available to `status` / `health` came from
+    /// `<state home>/.daemon.pid`, which `loom-daemon-start.sh` wrote once at
+    /// provisioning time and no supervisor relaunch ever refreshed — so a
+    /// stale file was indistinguishable from a correct one. With this field a
+    /// client can cross-check the two ([`crate::daemon_pidfile::classify`])
+    /// and report a mismatch instead of silently trusting the file.
+    /// `#[serde(default)]` keeps pre-#4774 wire data / older daemons
+    /// compatible (an absent field parses as `None` ⇒ "cannot cross-check",
+    /// never a false mismatch).
+    #[serde(default)]
+    pub daemon_pid: Option<u32>,
+    /// The pid file path this daemon resolved and claimed at startup (Issue
+    /// #4774), via [`crate::daemon_pidfile::resolve_pid_file_path`]. `None`
+    /// when no path could be resolved, and for a pre-#4774 wire payload.
+    ///
+    /// Reported so a client cross-checks the file the **daemon** actually
+    /// writes rather than one re-derived from the CLI process's own
+    /// environment — the same rule [`Self::token_pool_dir`] (#4292) follows,
+    /// and for the same reason: `status` / `health` are routinely run from a
+    /// different cwd (and a different `LOOM_*` env) than the daemon.
+    #[serde(default)]
+    pub pid_file: Option<PathBuf>,
 }
 
 /// One work-finder tick's dispatch/skip tally, stamped with the wall-clock

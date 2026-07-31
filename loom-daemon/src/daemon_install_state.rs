@@ -242,6 +242,13 @@ pub struct InstallStateReport {
     /// The watchdog log path to point an operator at (advisory only — never
     /// read by this module).
     pub watchdog_log_path: PathBuf,
+    /// #4774: an operator-facing note when the daemon pid file disagrees with
+    /// the pid this probe established independently (launchd's). Present only
+    /// for a *live* daemon whose pid file names someone else — the signature a
+    /// supervisor relaunch used to leave behind, and a booby trap for every
+    /// other consumer that reads the file. `None` in every non-anomalous case,
+    /// so callers can `if let Some(note) = …` and stay silent.
+    pub pid_file_stale_note: Option<String>,
 }
 
 impl InstallStateReport {
@@ -257,6 +264,7 @@ impl InstallStateReport {
             process_age_secs: None,
             startup_grace_threshold_secs: None,
             watchdog_log_path,
+            pid_file_stale_note: None,
         }
     }
 }
@@ -442,7 +450,10 @@ fn resolve_marker_fields(map: &HashMap<String, String>, loom_dir: &Path) -> Mark
 /// both "no such process" and "not owned by us", exactly like the shell
 /// script's `kill -0 "$pid" 2>/dev/null`. Bounded by [`PROBE_TIMEOUT`]; a hung
 /// `kill` degrades to `false`, exactly like an absent one (#4548).
-fn pid_alive(pid: u32) -> bool {
+/// `pub(crate)` since #4774 so [`crate::daemon_pidfile`]'s stale-detection
+/// observation uses the *same* bounded `kill -0` probe this module's liveness
+/// classification does, rather than a second implementation that could drift.
+pub(crate) fn pid_alive(pid: u32) -> bool {
     let mut cmd = Command::new("kill");
     cmd.args(["-0", &pid.to_string()]);
     probe_output(cmd, PROBE_TIMEOUT).is_some_and(|o| o.status.success())
@@ -545,15 +556,54 @@ struct Liveness {
     alive: bool,
     detail: String,
     pid: Option<u32>,
+    /// #4774: an advisory note when the pid file disagrees with the *authoritative*
+    /// liveness signal this probe used (launchd's own pid). `None` when the file
+    /// agrees, is absent, or was the signal itself — see [`pid_file_stale_note`].
+    pid_file_stale_note: Option<String>,
+}
+
+impl Liveness {
+    /// A liveness verdict with no pid-file anomaly to report — the common case,
+    /// and the only shape the pre-#4774 constructors had.
+    fn plain(alive: bool, detail: String, pid: Option<u32>) -> Self {
+        Liveness {
+            alive,
+            detail,
+            pid,
+            pid_file_stale_note: None,
+        }
+    }
+}
+
+/// The **local** half of #4774's stale-pid-file detection: cross-check the pid
+/// file against a pid this probe established *independently of the file itself*
+/// (launchd's `pid = …`).
+///
+/// This is deliberately weaker than [`crate::health`]'s check, which compares
+/// against `daemon_pid` — the answering process's own `std::process::id()` over
+/// IPC. Here there is no IPC, so launchd's pid is the best available ground
+/// truth; that is enough to catch the exact 2026-07-31 signature (a file naming
+/// a pid from two relaunches ago while launchd names the live one) without a
+/// round-trip, which matters because this probe is what runs when the daemon is
+/// *unreachable*.
+///
+/// `None` — no anomaly worth reporting — when the file is absent (an absent file
+/// makes no false claim) or names the same pid launchd does.
+fn pid_file_stale_note(pid_file: Option<&Path>, authoritative_pid: u32) -> Option<String> {
+    let path = pid_file?;
+    let observation = crate::daemon_pidfile::observe_with(path, pid_alive);
+    let state = crate::daemon_pidfile::classify(&observation, Some(authoritative_pid));
+    state.note(path)
 }
 
 /// Parse a pid file into its recorded pid — `None` when the file is missing,
 /// unreadable, or does not hold a bare integer. Says nothing about whether
 /// that pid is *alive*; see [`pid_file_alive_pid`].
+///
+/// Delegates to [`crate::daemon_pidfile::read_pid_file`] (#4774) so the module
+/// that *writes* the file and the modules that *read* it share one parser.
 fn read_pid_file(pid_file: &Path) -> Option<u32> {
-    std::fs::read_to_string(pid_file)
-        .ok()
-        .and_then(|s| s.trim().parse::<u32>().ok())
+    crate::daemon_pidfile::read_pid_file(pid_file)
 }
 
 /// The pid recorded in `pid_file`, iff that pid is currently alive — an
@@ -588,6 +638,9 @@ fn check_liveness(
                     alive: true,
                     detail: format!("launchd job {service} alive (pid {pid})"),
                     pid: Some(pid),
+                    // launchd's pid is established independently of the file, so
+                    // it can arbitrate against it (#4774).
+                    pid_file_stale_note: pid_file_stale_note(pid_file, pid),
                 };
             }
         }
@@ -609,6 +662,7 @@ fn check_liveness(
                         alive: true,
                         detail: format!("launchd job {check_domain}/{label} alive (pid {pid})"),
                         pid: Some(pid),
+                        pid_file_stale_note: pid_file_stale_note(pid_file, pid),
                     };
                 }
             }
@@ -625,48 +679,39 @@ fn check_liveness(
         // place.
         if let Some(pf) = pid_file {
             if let Some(pid) = pid_file_alive_pid(pf) {
-                return Liveness {
-                    alive: true,
-                    detail: format!(
+                // The pid file IS the signal here — nothing independent to
+                // arbitrate it against, so no #4774 staleness claim is made.
+                return Liveness::plain(
+                    true,
+                    format!(
                         "launchd job {service} not loaded, but pid file {} shows pid {pid} alive",
                         pf.display()
                     ),
-                    pid: Some(pid),
-                };
+                    Some(pid),
+                );
             }
         }
 
-        return Liveness {
-            alive: false,
-            detail: format!("launchd job {service} is not loaded/alive"),
-            pid: None,
-        };
+        return Liveness::plain(false, format!("launchd job {service} is not loaded/alive"), None);
     }
 
     // Non-launchd (nohup / Linux) path: the pid file is the only signal.
     match pid_file {
         Some(pf) => match read_pid_file(pf) {
-            Some(pid) if pid_alive(pid) => Liveness {
-                alive: true,
-                detail: format!("pid {pid} (from {}) alive", pf.display()),
-                pid: Some(pid),
-            },
-            Some(_) => Liveness {
-                alive: false,
-                detail: format!("pid file {} present but pid not alive", pf.display()),
-                pid: None,
-            },
-            None => Liveness {
-                alive: false,
-                detail: format!("no live pid file at {}", pf.display()),
-                pid: None,
-            },
+            // Every branch below derives its verdict *from* the pid file, so
+            // there is no independent signal to call it stale with (#4774); a
+            // dead/absent file is already reported by `detail` + `alive: false`.
+            Some(pid) if pid_alive(pid) => {
+                Liveness::plain(true, format!("pid {pid} (from {}) alive", pf.display()), Some(pid))
+            }
+            Some(_) => Liveness::plain(
+                false,
+                format!("pid file {} present but pid not alive", pf.display()),
+                None,
+            ),
+            None => Liveness::plain(false, format!("no live pid file at {}", pf.display()), None),
         },
-        None => Liveness {
-            alive: false,
-            detail: "no live pid file at <none>".to_string(),
-            pid: None,
-        },
+        None => Liveness::plain(false, "no live pid file at <none>".to_string(), None),
     }
 }
 
@@ -847,6 +892,10 @@ pub(crate) fn classify_with_process_age_fn(
             process_age_secs: None,
             startup_grace_threshold_secs: None,
             watchdog_log_path,
+            // A dead daemon's pid file is already fully described by
+            // `liveness_detail`; the #4774 note is reserved for the
+            // alive-but-misreported case.
+            pid_file_stale_note: None,
         };
     }
 
@@ -870,6 +919,7 @@ pub(crate) fn classify_with_process_age_fn(
                 process_age_secs: Some(age),
                 startup_grace_threshold_secs: Some(grace_threshold),
                 watchdog_log_path,
+                pid_file_stale_note: liveness.pid_file_stale_note,
             };
         }
     }
@@ -889,6 +939,7 @@ pub(crate) fn classify_with_process_age_fn(
         process_age_secs: process_age,
         startup_grace_threshold_secs: Some(grace_threshold),
         watchdog_log_path,
+        pid_file_stale_note: liveness.pid_file_stale_note,
     }
 }
 
@@ -2645,6 +2696,119 @@ mod tests {
         );
         assert_eq!(liveness.pid, Some(std::process::id()));
         assert!(liveness.detail.contains("pid file"), "{}", liveness.detail);
+    }
+
+    // ===================================================================
+    // #4774 — the pid file is cross-checked against launchd, not trusted
+    // ===================================================================
+
+    /// A pid that is guaranteed not to name a live process (the same value the
+    /// process-age tests use, for the same reason).
+    const DEAD_PID: u32 = i32::MAX as u32;
+
+    #[test]
+    fn no_pid_file_configured_yields_no_stale_note() {
+        assert_eq!(pid_file_stale_note(None, std::process::id()), None);
+    }
+
+    #[test]
+    fn an_absent_pid_file_yields_no_stale_note() {
+        // An absent file makes no false claim — silence, not a warning.
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("daemon.pid");
+        assert_eq!(pid_file_stale_note(Some(&missing), std::process::id()), None);
+    }
+
+    #[test]
+    fn a_pid_file_agreeing_with_launchd_yields_no_stale_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = write_pid_file(dir.path(), std::process::id());
+        assert_eq!(pid_file_stale_note(Some(&pid_file), std::process::id()), None);
+    }
+
+    #[test]
+    fn a_pid_file_naming_someone_other_than_launchds_pid_is_reported_stale() {
+        // The 2026-07-31 signature, caught with no IPC round-trip at all: the
+        // file names a pid from a previous generation while launchd names the
+        // live one.
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = write_pid_file(dir.path(), 13724);
+        let note = pid_file_stale_note(Some(&pid_file), std::process::id())
+            .expect("a disagreement with launchd's pid must be reported");
+        assert!(note.contains("13724"), "{note}");
+        assert!(note.contains(&std::process::id().to_string()), "{note}");
+        assert!(note.contains("#4774"), "the note must be traceable to its issue: {note}");
+    }
+
+    #[test]
+    fn a_pid_file_holding_garbage_is_reported_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("daemon.pid");
+        fs::write(&pid_file, "not-a-pid\n").unwrap();
+        assert!(pid_file_stale_note(Some(&pid_file), std::process::id()).is_some());
+    }
+
+    #[test]
+    fn a_pid_file_naming_a_dead_pid_is_reported_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = write_pid_file(dir.path(), DEAD_PID);
+        assert!(pid_file_stale_note(Some(&pid_file), std::process::id()).is_some());
+    }
+
+    #[test]
+    #[serial]
+    fn a_live_launchd_job_whose_pid_file_disagrees_carries_the_stale_note() {
+        // End-to-end through `check_liveness`: launchd reports THIS process
+        // alive, the pid file names someone else. The daemon is alive (the
+        // verdict must not waver) *and* the file is called out.
+        let uid = current_uid().expect("current_uid resolves in the test env");
+        let pid = std::process::id();
+        let stub_dir = tempfile::tempdir().unwrap();
+        write_stub(
+            stub_dir.path(),
+            "launchctl",
+            &format!(
+                "#!/bin/sh\n\
+                 target=\"$2\"\n\
+                 case \"$target\" in\n\
+                   gui/{uid}) exit 0 ;;\n\
+                   gui/{uid}/*) echo \"    pid = {pid}\"; exit 0 ;;\n\
+                   *) exit 1 ;;\n\
+                 esac\n"
+            ),
+        );
+        let pid_dir = tempfile::tempdir().unwrap();
+        let pid_file = write_pid_file(pid_dir.path(), 13724);
+
+        let liveness = with_path_prefix(stub_dir.path(), || {
+            check_liveness(true, DEFAULT_LAUNCHD_LABEL, Some(&pid_file), None)
+        });
+
+        assert!(liveness.alive, "launchd reports the job alive: {}", liveness.detail);
+        assert_eq!(liveness.pid, Some(pid));
+        let note = liveness
+            .pid_file_stale_note
+            .expect("a pid file disagreeing with launchd's live pid must be flagged");
+        assert!(note.contains("13724"), "{note}");
+    }
+
+    #[test]
+    #[serial]
+    fn a_pid_file_used_as_the_liveness_signal_is_never_called_stale_by_itself() {
+        // When launchd is negative and the pid file IS the evidence, there is
+        // nothing independent to arbitrate with — the module must not manufacture
+        // a staleness claim out of the very signal it just trusted.
+        let stub_dir = tempfile::tempdir().unwrap();
+        write_stub(stub_dir.path(), "launchctl", FAIL_STUB);
+        let pid_dir = tempfile::tempdir().unwrap();
+        let pid_file = write_pid_file(pid_dir.path(), std::process::id());
+
+        let liveness = with_path_prefix(stub_dir.path(), || {
+            check_liveness(true, DEFAULT_LAUNCHD_LABEL, Some(&pid_file), None)
+        });
+
+        assert!(liveness.alive);
+        assert_eq!(liveness.pid_file_stale_note, None);
     }
 
     #[test]
