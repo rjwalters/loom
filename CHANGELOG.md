@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-07-31
+
+### Summary
+
+Minor release in which the fleet becomes **observable, multi-runtime, and self-shipping**. A full telemetry pipeline lands (versioned schema → durable outcome records → push exporter → Cloudflare Workers/D1 backend → live dashboard with a public redacted view at a reference deployment); the runtime-adapter contract ships with **OpenAI Codex as adapter #2** behind the `spawn-worker.sh` seam; `loom-daemon health` and the `/loom:watch` skill make fleet supervision a first-class surface; the autonomous self-update loop closes the self-repair cycle (merged daemon fixes now deploy themselves); and epic #4081 Phase 4 deletes the `loom-tools` Python package — a fresh machine provision installs no Python at all. 272 commits since 0.16.0.
+
+### Added
+
+- **Fleet observability pipeline** (epic #4702) — versioned telemetry schema (#4703), durable per-sweep outcome records with model/config/phase timings (#4704, absorbing #4137), and an opt-in push exporter with offline queueing (`observability` config block, #4705); a deploy-to-your-own-account Cloudflare Workers + D1 backend with ingest auth, retention, query API and live tail (#4725, #4726, #4728); visibility classification + redaction (#4727) feeding a dashboard with live event feed, per-sweep timelines, historical charts, and an unauthenticated **public view** (#4750, #4751, #4753). Reference deployment: dashboard.2amlogic.com.
+- **Multi-runtime worker support** (epics #4167/#4489, ported from the gpeyton/loom fork with attribution) — the seven-point runtime adapter contract (`defaults/docs/runtime-adapters.md`, ADR-0012), the `spawn-worker.sh` dispatch seam (`LOOM_RUNTIME` > `runtimes.default` > `claude`), the **Codex adapter** `spawn-codex.sh` with capability manifest, per-provider error classification, an honest guardrail-parity doc, and a mocked CI leg (#4468); secure Codex account lifecycle commands (#4492); `AGENTS.md` single-source instruction anchor generated from Loom's canonical docs with a CI sync gate (#4479). Codex is tier-2, sandboxed conservatively (`read-only`/`workspace-write`), and scoped to the Builder stage by operator decision (#4478).
+- **`loom-daemon health`** (#4761) — one-shot consolidated vitals (trusted pgrep+pidfile liveness, dispatch, tokens, roles, queues, throughput) with a 0/1/2 exit-code contract for watch loops, and the **`/loom:watch` skill** (#4762) — tick-loop fleet supervision with a closed remediation playbook (R1–R5), two-tick confirmation, an escalation contract, and an end-of-window summary.
+- **Autonomous self-update enabled as the self-repair loop's last link** (#4017/#4055) — staleness check every 900s with a 600s settle window; merged daemon fixes now roll themselves onto every fleet host (verified-relaunch semantics, #4232).
+- **Fleet module completion** (epic #4340) — `fleet drain` (retire a worker without losing work/claims, #4343), `loom-daemon calibrate` (measure the host, set concurrency knobs, #4390), joining `fleet status`/`add-worker` from 0.16.0; `sync-labels.sh --repo` + a "bringing a new repo online" runbook (#4498); a REPO column in the in-flight registry (#4698).
+- **Rate-limit survival at fleet scale** (epic #4432) — dispatch-time GitHub rate-gate (#4666), REST conditional-request caching for hot polls (#4667), and REST fallbacks where GraphQL exhaustion previously hard-failed: `merge-pr.sh --auto` (#4447), `check-duplicate.sh` (#4526, #4659), and sweep Mode B/C discovery (#4670).
+
+### Changed
+
+- **Dispatch pins a work-model default** (`model=sonnet` unless overridden, #4501) so children no longer inherit the interactive session's model tier; per-issue dispatch backoff (#4485); CPU demoted from admission term to observation (#4512) with `max_admissions_per_tick` ramping and machine-wide build slots.
+- **Guard family hardened from live incidents** — `gh … --body @path` literal-path deny with variable-correlation and `gh api -f` companions (#4523, #4601); stop-guard coverage extended to armed Monitor/ScheduleWakeup timers (#4462) and background-Bash completion notifications (#4482, #4696); worktree dirty-checks before remove/recreate (#4449).
+- **`loom-daemon-start.sh` FLAGS-OFF transitions are loud** (#4693) — a plain restart that would downgrade a previously-autonomous daemon now warns with the `--from-config` remediation instead of silently disabling dispatch.
+
+### Fixed
+
+- **Runtime-admission fleet outage** (#4688) — `roots()`'s all-or-nothing fallback rejected 21/21 consumer-repo dispatches when `.loom/runtimes/` was missing; per-directory fallback + installer provisioning.
+- **Liveness false negatives** (#4694) — the launchd domain probe declared live, dispatching daemons dead (twice, with sweeps in flight); pgrep+pidfile cross-checks, and the daemon now **owns its pidfile write at boot** so supervisor relaunches can't rot it (#4774); process exits nonzero on startup failure instead of half-running (#4531).
+- **No-progress reaper fails open on probe failure** (#4366, #4408) — a timed-out forge probe no longer counts a benign self-skip as a failed attempt (wrongful-quarantine class), with the `first_open_linked_pr` conflation documented (#4452).
+- **Test-harness process leaks** (#4773) — six suites gained process-group EXIT/INT/TERM traps via a shared `bg-proc-trap.sh` helper (the combined-trap-doesn't-halt bug fixed at 7 sites); `main` compile break from the #4426/#4386 semantic merge conflict (#4474); judge/doctor review branches routed through `pr-worktree.sh` with alias-branch cleanup (#4405); suite-wide env-mutation races serialized (#4385).
+- **Remote fleet ops under non-interactive SSH** — cargo PATH fallback in the update path (#4695); idle-shutdown workers get an update-time warning and a documented wake path (#4697).
+
+### Removed
+
+- **The `loom-tools` Python package** (epic #4081 Phase 4, #4557, ADR-0013) — the tokens/models/common families are deleted outright; every console script has a native `loom-daemon` successor. A fresh provision installs zero Python. The sole carve-out, the opt-in `loom-search`, is decided-for-retirement (#4608) and lands in a follow-up.
+
 ## [0.16.0] - 2026-07-29
 
 ### Summary
