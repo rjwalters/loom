@@ -118,6 +118,7 @@ source "$SCRIPT_DIR/lib/bg-proc-trap.sh"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
 NC='\033[0m'
 
 TESTS_RUN=0
@@ -1471,6 +1472,22 @@ else
 fi
 
 # ============================================================
+# Scenarios 21+22 are the only two in this suite that need a REAL `plutil`
+# (#4799). They drive loom-daemon-update.sh's `--relaunch` path, whose first
+# step is `harvest_plist_env` (lib/daemon-env-harvest.sh) -- which requires
+# plutil + jq by contract ("required on the macOS launchd path") and returns 2
+# when either is missing, so perform_relaunch aborts with 6 and never
+# re-renders the plist. Scenario 22 then reads the result back with
+# `plutil -extract` directly. Everything else launchd-flavored in this suite
+# runs off the stub `launchctl`/`uname` pair and IS portable; these two are
+# not, and plutil is macOS-only (no ubuntu package stands in -- an XML-plist
+# parser stub would be testing the stub, not the production path). So skip
+# them where plutil is absent rather than fail a Linux CI runner on a genuinely
+# Darwin-only code path. They still run on every macOS dev/CI host.
+if ! command -v plutil >/dev/null 2>&1; then
+    echo -e "${YELLOW}⊘${NC} SKIP scenarios 21-22 (--relaunch plist re-render + env preservation): plutil not available — harvest_plist_env is a macOS-only production path"
+else
+# ============================================================
 # 21. --relaunch re-renders the plist with the SUPERVISED keys (#4118 AC1):
 #     after a refused restart, `--relaunch` re-renders via loom-daemon-start.sh,
 #     installing KeepAlive:{SuccessfulExit:true} + LOOM_DAEMON_SUPERVISOR=launchd
@@ -1546,6 +1563,7 @@ else
     echo "  WF=[$wf22] HG=[$hg22] MAXC=[$mc22] PERTOK=[$pt22]"
     echo "  plist: $(cat "$PLIST22" 2>/dev/null)"
 fi
+fi # end plutil-availability guard for scenarios 21-22
 
 # ============================================================
 # 23. --no-restart on a launchd host does NOT print a bare `launchctl bootstrap`
