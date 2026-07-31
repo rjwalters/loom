@@ -3302,6 +3302,7 @@ async fn run_coordination(
 mod tests {
     use super::*;
     use crate::types::{SweepId, SweepKind};
+    use crate::workspace_registry::normalize_path;
     use serde_json::json;
     use serial_test::serial;
     use std::os::unix::fs::PermissionsExt;
@@ -5922,7 +5923,12 @@ mod tests {
 
         let completions_path = dir.path().join("safehouse-completed.json");
         let persisted = load_persisted_completed(Some(&completions_path));
-        let root = dir.path().to_string_lossy().into_owned();
+        // `run_sink` keys the dedup set by the *registry* root, which
+        // `WorkspaceRegistry::add` stores as `normalize_path(root)`. Normalize
+        // the expected key the same way so a raw `tempdir().path()` (which can
+        // differ from its canonical form, e.g. macOS `/var/folders` ->
+        // `/private/var/folders`) still compares equal.
+        let root = normalize_path(dir.path()).to_string_lossy().into_owned();
         assert!(
             persisted.contains(&(root.clone(), 4610)) && persisted.contains(&(root, 4611)),
             "the seed pass must still persist both backlog merges into the dedup set, so a \
@@ -5977,7 +5983,10 @@ mod tests {
         // Wait for the seed-only first tick to persist issue #4610 without
         // narrating it.
         let completions_path = dir.path().join("safehouse-completed.json");
-        let root = dir.path().to_string_lossy().into_owned();
+        // See the sibling seed-pass test: the persisted key is the normalized
+        // registry root, so normalize the tempdir path the same way rather
+        // than comparing against the (possibly uncanonicalized) raw path.
+        let root = normalize_path(dir.path()).to_string_lossy().into_owned();
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 if load_persisted_completed(Some(&completions_path)).contains(&(root.clone(), 4610))
