@@ -32,6 +32,7 @@ test-forge-helpers.sh
 test-gh-cached.sh
 test-github-app-token.sh
 test-gitignore-guard.sh
+test-guard-codex-bridge.sh
 test-guard-hook-schema.sh
 test-install-active-session.sh
 test-install-pr-markers.sh
@@ -58,6 +59,7 @@ test-merge-pr-worktree-awk.sh
 test-merge-pr-worktree-path.sh
 test-pr-worktree-isolation.sh
 test-probe-tokens-fallback.sh
+test-provision-codex-hooks.sh
 test-provision-hooks.sh
 test-provision-skills.sh
 test-rebase-stacked-children.sh

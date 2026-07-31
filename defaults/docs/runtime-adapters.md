@@ -377,16 +377,25 @@ by the standalone checker and daemon admission:
   unknown/missing role or runtime file.
 
 **Second manifest (#4468):** `defaults/runtimes/codex.json` declares
-`mcp: "yes"`, `subagents: "no"` (the fork PR #59 prohibition), `hooks: "partial"`
-(Codex 0.146.0 has a `hooks.json` engine with a `pre_tool_use` event, but Loom
-wires nothing into it), `skills: "partial"`, and
-`worktreeIsolation: "partial"` (Codex's `workspace-write` sandbox confines to the
-workspace root, not to one `issue-N` worktree). Because `"partial"` fails closed,
-`check-runtime-capabilities.sh --role builder --runtime codex` exits 78 while
-`--role judge --runtime codex` passes — the manifest mechanically encodes the
-parity doc's residual gap 2, and the CI leg asserts both outcomes. That is the
+`mcp: "yes"`, `subagents: "no"` (the fork PR #59 prohibition), `hooks: "partial"`,
+`skills: "partial"`, and `worktreeIsolation: "partial"`. Because `"partial"` fails
+closed, `check-runtime-capabilities.sh --role builder --runtime codex` exits 78
+while `--role judge --runtime codex` passes — the manifest mechanically encodes
+the parity doc's residual gaps, and the CI leg asserts both outcomes. That is the
 intended relationship between points 6 and 7: the parity doc states the gap in
 prose, the manifest makes it enforceable.
+
+**Why `hooks`/`worktreeIsolation` are still `partial` after #4495.** Loom *does*
+now wire Codex's `pre_tool_use` event (`defaults/hooks/guard-codex-bridge.sh`,
+installed by `defaults/scripts/provision-codex-hooks.sh`), so the earlier "Loom
+wires nothing into it" is no longer true. The manifest values are nonetheless
+unchanged, deliberately: they are **evidence-gated**, and the remaining evidence
+is recorded machine-readably in `codex.json`'s `capabilityGate.pending` and in
+prose in [`guardrail-parity-codex.md`](guardrail-parity-codex.md) § "Promotion
+gate". Read that block before changing either value. `defaults/roles/doctor.json`
+also declares `["worktreeIsolation", "mcp"]` as of #4495 — Doctor mutates a
+worktree exactly as Builder does, so it must fail closed for the same reason
+instead of slipping through with no constraints.
 
 ### Daemon runtime binding and admission
 
