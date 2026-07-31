@@ -30,3 +30,39 @@ export * from "./charts/outcomesChartView.js";
 export * from "./charts/successRateChartView.js";
 export * from "./charts/durationsChartView.js";
 export * from "./historicalChartsPanel.js";
+
+// Token/cost analytics (issue #4752). `types.js` is exported first above, so
+// the analytics modules are re-exported individually rather than via a nested
+// barrel — `analytics/types.js` deliberately layers its own domain shapes on
+// the shared wire types and only the domain shapes belong on this surface.
+export type {
+  AccountReading,
+  HistoryEnvelope,
+  SweepWindow,
+  TokenAccountPayload,
+  TokenSample,
+  TokensSnapshotPayload,
+} from "./analytics/types.js";
+export * from "./analytics/parse.js";
+export * from "./analytics/burn.js";
+export * from "./analytics/forecast.js";
+export * from "./analytics/format.js";
+// `attribution.ts` and `burn.ts` each own a `DEFAULT_MAX_SAMPLE_GAP_MS`. They
+// are genuinely two independent knobs — one decides where a burn curve is cut
+// into segments, the other decides which snapshot pairs are too far apart to
+// attribute at all — so they are not merged; the barrel disambiguates instead.
+export {
+  attributeUsageToRepos,
+  DEFAULT_EDGE_TOLERANCE_MS,
+  DEFAULT_MAX_SAMPLE_GAP_MS as DEFAULT_ATTRIBUTION_MAX_SAMPLE_GAP_MS,
+  DEFAULT_OPEN_SWEEP_MAX_DURATION_MS,
+} from "./analytics/attribution.js";
+export type {
+  AttributionOptions,
+  AttributionResult,
+  NamedUsage,
+  RepoAttribution,
+} from "./analytics/attribution.js";
+export * from "./analytics/api.js";
+export * from "./analytics/render.js";
+export * from "./analytics/bootstrap.js";

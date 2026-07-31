@@ -179,6 +179,33 @@ await panel.refresh();
 await panel.refresh({ since: "2026-07-01T00:00:00Z" });
 ```
 
+### Token/cost analytics (issue #4752)
+
+`src/analytics/` — burn curves, exhaustion forecasting, and per-repo
+attribution:
+
+| Module | Responsibility |
+|---|---|
+| `types.ts` | Analytics-specific wire + domain shapes, layered on the shared `src/types.ts` envelope |
+| `parse.ts` | Total, never-throwing narrowing of `GET /api/history` JSON |
+| `burn.ts` | Per-account burn curves, segmented at limit-window rollovers and telemetry gaps |
+| `forecast.ts` | Least-squares projection to exhaustion vs. `limit_window_reset_at` |
+| `attribution.ts` | The `tokens.snapshot` × `sweep.*` join that produces per-repo usage |
+| `render.ts` | DOM rendering, and the authenticated-surface-only enforcement point |
+| `api.ts` | Paginated `/api/history` fetch (the API has no `kind` filter, so kinds are partitioned client-side) |
+| `format.ts` | Formatting helpers ("unknown renders as `—`, never `0`") |
+| `bootstrap.ts` | `surfaceFromPath` + `startTokenAnalytics` — the hook an app shell calls. Deliberately not self-executing: the barrel re-exports it, and the barrel must stay importable under the `node` test environment. |
+| `analytics.css` | Stylesheet for the class names `render.ts` emits. Not imported by any module (there is no bundler to resolve a CSS import); an app shell links it, and it stands alone via `:root` custom-property fallbacks so it renders legibly either way. |
+
+The join strategy and the public-exposure decision are documented in
+[`../docs/token-analytics.md`](../docs/token-analytics.md).
+
+Integration point for the app shell: `mountTokenAnalytics(container, opts)`,
+or `startTokenAnalytics(document)` which resolves the surface from
+`window.location.pathname` and wires an optional `#refresh-button`. The
+panel renders on the **authenticated surface only** — on `/public` it
+refuses to render and makes no history request at all.
+
 ## Setup
 
 ```bash
