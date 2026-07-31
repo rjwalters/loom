@@ -1188,9 +1188,9 @@ REASON="<SPECIFIC_REASON>"  # exact reason text that will go in the comment body
 # Skip re-commenting only when the reason is unchanged — a PR that still fails
 # the same criterion but for a *different* specific reason (e.g. CI now fails a
 # different check) still gets a fresh comment.
-LAST_COMMENT=$(gh pr view "$PR_NUMBER" --json comments \
-  --jq --arg marker "$REJECT_MARKER" \
-  '[.comments[] | select(.body | contains($marker))] | last | .body // ""')
+LAST_COMMENT=$(gh pr view "$PR_NUMBER" --json comments --jq '.comments' \
+  | jq --arg marker "$REJECT_MARKER" \
+  '[.[] | select(.body | contains($marker))] | last | .body // ""')
 
 if [ -n "$LAST_COMMENT" ] && echo "$LAST_COMMENT" | grep -qF "$REASON"; then
   echo "Rejection reason for $CRITERION_KEY unchanged since last comment on #$PR_NUMBER — skipping duplicate comment"
