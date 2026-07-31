@@ -297,11 +297,17 @@ mod tests {
         let auth_header = header_text
             .lines()
             .find(|line| line.to_ascii_lowercase().starts_with("authorization:"))
-            .map(|line| line.splitn(2, ':').nth(1).unwrap_or("").trim().to_string());
+            .map(|line| {
+                line.split_once(':')
+                    .map(|x| x.1)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string()
+            });
         let content_length: usize = header_text
             .lines()
             .find(|line| line.to_ascii_lowercase().starts_with("content-length:"))
-            .and_then(|line| line.splitn(2, ':').nth(1))
+            .and_then(|line| line.split_once(':').map(|x| x.1))
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(0);
         while buf.len() < header_end + content_length {
