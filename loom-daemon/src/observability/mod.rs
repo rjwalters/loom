@@ -258,9 +258,7 @@ pub fn spawn_task(
         );
         return None;
     };
-    let Some(ingest_key) = read_ingest_key(&key_file) else {
-        return None;
-    };
+    let ingest_key = read_ingest_key(&key_file)?;
     let exporter = match HttpsExporter::new(endpoint.clone(), ingest_key) {
         Ok(exporter) => exporter,
         Err(error) => {
