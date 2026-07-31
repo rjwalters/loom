@@ -61,6 +61,7 @@
 //! the conformance suite under `loom-tools/tests/tokens/test_rust_conformance.py`
 //! diffs fixture pools driven through both CLIs.
 
+pub mod account_lifecycle;
 pub mod account_registry;
 pub mod allowlist;
 pub mod bad_tokens;

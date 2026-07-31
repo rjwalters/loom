@@ -521,6 +521,9 @@ mod tests {
     /// #4122: an exhaustion (non-auth) entry older than the cooldown no longer
     /// reports `is_bad`, while an auth entry of the same age remains permanent.
     #[test]
+    // Reads the process-global cooldown default, so it must not overlap the
+    // `#[serial]` tests that mutate `EXHAUSTION_COOLDOWN_ENV`.
+    #[serial]
     fn exhaustion_entry_expires_after_cooldown_auth_stays() {
         let tmp = make_pool();
         let dir = pool_dir(tmp.path());
@@ -556,6 +559,9 @@ mod tests {
     /// and how long is left on the cooldown — the detail the empty-pool error
     /// renders per token.
     #[test]
+    // Reads the process-global cooldown default, so it must not overlap the
+    // `#[serial]` tests that mutate `EXHAUSTION_COOLDOWN_ENV`.
+    #[serial]
     fn blocking_entry_reports_exhaustion_class_and_cooldown_remaining() {
         let tmp = make_pool();
         let dir = pool_dir(tmp.path());
@@ -588,6 +594,9 @@ mod tests {
     /// entry reported is the deciding (fresh) one, not the stale one an
     /// operator would see at the top of the file.
     #[test]
+    // Reads the process-global cooldown default, so it must not overlap the
+    // `#[serial]` tests that mutate `EXHAUSTION_COOLDOWN_ENV`.
+    #[serial]
     fn blocking_entry_reports_the_deciding_fresh_line_not_the_stale_one() {
         let tmp = make_pool();
         let dir = pool_dir(tmp.path());
@@ -626,6 +635,9 @@ mod tests {
     /// #4122: a fresh exhaustion entry still blocks (the cooldown only expires
     /// aged entries).
     #[test]
+    // Reads the process-global cooldown default, so it must not overlap the
+    // `#[serial]` tests that mutate `EXHAUSTION_COOLDOWN_ENV`.
+    #[serial]
     fn fresh_exhaustion_entry_still_blocks() {
         let tmp = make_pool();
         mark_bad(tmp.path(), "agent-1", "exhausted: weekly limit").unwrap();

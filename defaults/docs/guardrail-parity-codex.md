@@ -240,8 +240,46 @@ companion provisioning issue #4469 so it has exactly one owner.
     └── …                          # Codex's own state (caches, logs, skills)
 ```
 
-Provision a profile with `CODEX_HOME=~/.loom/codex-profiles/<account> codex
-login`. Select it at spawn time by any of:
+Provision profiles through the secret-safe lifecycle CLI:
+
+```bash
+loom-daemon accounts add codex alice --device-auth
+loom-daemon accounts import codex bob --auth-file ~/.codex/auth.json
+loom-daemon accounts status codex alice --json
+loom-daemon accounts disable codex alice
+loom-daemon accounts reauth codex alice --device-auth
+loom-daemon accounts remove codex alice       # recoverable quarantine
+loom-daemon accounts remove codex alice --purge
+```
+
+`add` and `reauth` inherit the terminal for browser/device login. Import accepts
+only an explicit non-empty regular file, installs it atomically with mode
+`0600`, and never parses or prints it. Codex also supports `codex login
+--with-api-key` and `--with-access-token`; pipe those secrets on stdin while
+targeting the profile's `CODEX_HOME`—never put a secret in argv or registry
+metadata.
+
+Every lifecycle command is all-or-nothing over the (profile, registry) pair. A
+failed `add` or `import` removes the profile it created, so the name stays
+reusable; concurrent creations of the same name are serialized by an exclusive
+profile-directory claim, so a losing call can never delete the winner's
+credential. A failed `remove` restores the live profile's registry entry
+**and** removes any `recovery.json` that invocation staged, so a later
+recoverable removal is never blocked by residue from a failed one. `remove`
+commits the registry update *before* moving the profile: if the process dies
+mid-command, the residue is an inert orphan directory (only that name is
+blocked until an operator clears it), never a registry entry pointing at a
+vanished directory that would poison `accounts list` for every account.
+`--purge` destroys credential bytes only after the registry commit succeeds.
+
+Manually provisioned profiles (directories created under the profile root
+before `.loom/accounts.json` exists) appear in `accounts list` as discovered
+accounts. The first `disable`, `enable`, or `remove` adopts the whole
+discovered set into the registry, so mutating one discovered account never
+hides the others and lifecycle commands work on exactly the accounts `list`
+shows.
+
+Select a profile at spawn time by any of:
 
 | Precedence | Env var | Meaning |
 |---|---|---|
@@ -269,8 +307,10 @@ itself and rewrites `auth.json` in place. Consequences:
 ### Security posture
 
 - Profile dirs `0700`, `auth.json` `0600`. A profile is a live credential.
-- The adapter **assigns** the directory to `CODEX_HOME` — it never copies
-  `auth.json`. Nothing under `.loom/` ever holds a credential copy.
+- The adapter **assigns** the directory to `CODEX_HOME`; lifecycle import makes
+  the one intentional copy into the machine profile root. Repository `.loom/`,
+  token pools, daemon JSON, logs, and registry metadata never hold credential
+  contents.
 - Logging discipline: the adapter logs the profile **directory name** only
   (`spawn-codex: using Codex profile 'alice'`). Never the path's contents, never
   a byte of `auth.json`. Preserve this in any change to the adapter.
@@ -279,9 +319,13 @@ itself and rewrites `auth.json` in place. Consequences:
   fallback would attribute work and cost to the wrong account. Ambient auth
   (tier 4) is not a request and never fails here; Codex reports its own auth
   error, which classifies as `TOKEN_EXPIRED`.
-- **No token-pool integration in this phase.** There is no rotation, no
-  `.bad_tokens` marking, no provider-aware selection. One operator-provisioned
-  profile per dispatch. Provider-aware pooling is epic #4167 Phase 4.
+- Provider-aware inventory and lifecycle management are available, but there is
+  no health ranking, cooldown, automatic rotation, or failure feedback yet.
+  Those policies remain epic #4167 Phase 4 issue #4493.
+- The registry currently exposes no active-use lease/interlock. Operators must
+  not remove a profile while a worker is using it; lifecycle removal cannot yet
+  prove that condition and #4493 remains the integration point for runtime
+  feedback.
 
 ## References
 

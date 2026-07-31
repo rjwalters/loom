@@ -6,6 +6,7 @@
 //! (a sibling of this module, not nested under it) owns the daemon's own
 //! bootstrap/service-loop body, which is not a CLI subcommand handler.
 
+pub(crate) mod accounts;
 pub(crate) mod cleanup_ops;
 pub(crate) mod common;
 pub(crate) mod dispatch;

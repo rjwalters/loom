@@ -355,6 +355,16 @@ enum Commands {
         action: TokensAction,
     },
 
+    /// Manage secret-safe machine-level AI account profiles.
+    Accounts {
+        #[command(subcommand)]
+        action: AccountsAction,
+
+        /// Loom workspace whose provider-aware account registry is updated.
+        #[arg(long, value_name = "PATH", default_value = ".", global = true)]
+        workspace: String,
+    },
+
     /// Standalone CLI surface over `terminal.rs`'s per-agent
     /// `CLAUDE_CONFIG_DIR` isolation (issue #4415, epic #4081 Phase 3 family
     /// 4): create/remove/validate an agent's isolated config directory, and
@@ -1530,6 +1540,90 @@ enum TokensAction {
     },
 }
 
+/// Sub-actions for `loom-daemon accounts`.
+#[derive(Subcommand)]
+enum AccountsAction {
+    /// Create a named profile and run the provider's interactive login.
+    Add {
+        #[arg(value_name = "PROVIDER")]
+        provider: String,
+        #[arg(value_name = "NAME")]
+        name: String,
+        #[arg(long)]
+        device_auth: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Import an explicit opaque Codex auth file into a new named profile.
+    Import {
+        #[arg(value_name = "PROVIDER")]
+        provider: String,
+        #[arg(value_name = "NAME")]
+        name: String,
+        #[arg(long, value_name = "PATH")]
+        auth_file: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List registered accounts and secret-free structural diagnostics.
+    List {
+        #[arg(long, value_name = "PROVIDER", default_value = "codex")]
+        provider: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Probe one account's structural and login status.
+    Status {
+        #[arg(value_name = "PROVIDER")]
+        provider: String,
+        #[arg(value_name = "NAME")]
+        name: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Make an account ineligible without changing its credential state.
+    Disable {
+        #[arg(value_name = "PROVIDER")]
+        provider: String,
+        #[arg(value_name = "NAME")]
+        name: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Restore eligibility after structural and permission validation.
+    Enable {
+        #[arg(value_name = "PROVIDER")]
+        provider: String,
+        #[arg(value_name = "NAME")]
+        name: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Reauthenticate the existing canonical profile in place.
+    Reauth {
+        #[arg(value_name = "PROVIDER")]
+        provider: String,
+        #[arg(value_name = "NAME")]
+        name: String,
+        #[arg(long)]
+        device_auth: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Retire to private quarantine, or irreversibly delete with `--purge`.
+    Remove {
+        #[arg(value_name = "PROVIDER")]
+        provider: String,
+        #[arg(value_name = "NAME")]
+        name: String,
+        /// Irreversibly delete credential state instead of quarantining it.
+        #[arg(long)]
+        purge: bool,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 /// Sub-actions for `loom-daemon claude-config` (issue #4415).
 #[derive(Subcommand)]
 enum ClaudeConfigAction {
@@ -1674,6 +1768,7 @@ async fn main() {
     }
 }
 
+use cli::accounts::handle_accounts_command;
 use cli::cleanup_ops::{
     handle_clean_command, handle_cleanup_command, handle_recover_orphans_command,
 };
@@ -1793,6 +1888,7 @@ fn handle_cli_command(command: Commands) -> Result<()> {
         Commands::Workspace { action } => handle_workspace_command(action),
         Commands::Fleet { action } => handle_fleet_command(action),
         Commands::Tokens { action } => handle_tokens_command(action),
+        Commands::Accounts { action, workspace } => handle_accounts_command(action, &workspace),
         Commands::ClaudeConfig { action } => handle_claude_config_command(action),
         Commands::AgentSpawn {
             role,
