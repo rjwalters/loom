@@ -1460,9 +1460,25 @@ pub mod forge {
             // forced arm model when the workspace resolves to `experiment` mode
             // (CANARY-gated) — see `work_finder::dispatch` for the full
             // rationale; `off`/`observe` modes are unaffected.
+            //
+            // Issue #4827: unlike the work finder, the epic supervisor has no
+            // cached issue body to read the `<!-- loom:complexity=... -->`
+            // stratum from, so it fetches one — but LAZILY, inside
+            // `resolve_autonomous_dispatch_model_lazy`'s `experiment` branch,
+            // so `off`/`observe` dispatch still makes zero extra `gh` calls.
+            // A failed fetch resolves to `None` (the unchanged `routine`
+            // stratum) and never fails the dispatch.
             let repo_root = reg.config().workspace_root.clone();
-            let resolved =
-                crate::sweep_registry::resolve_autonomous_dispatch_model(&repo_root, child);
+            let gh_bin = reg
+                .config()
+                .gh_bin
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("gh"));
+            let resolved = crate::sweep_registry::resolve_autonomous_dispatch_model_lazy(
+                &repo_root,
+                child,
+                || crate::sweep_registry::fetch_issue_complexity(&gh_bin, &repo_root, child),
+            );
             match resolved.arm {
                 Some(arm) => log::info!(
                     "epic_supervisor: dispatching child #{child} for epic #{_epic} with \

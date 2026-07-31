@@ -2864,10 +2864,29 @@ fn handle_request(
             // considers the model-cost A/B experiment's forced arm — mirroring
             // the autonomous work-finder / epic-supervisor dispatch paths —
             // before falling back to `autonomous.model` / the shipped default.
+            //
+            // Issue #4827: the arm is stratified by the issue's real
+            // `<!-- loom:complexity=... -->` marker. Like the epic supervisor
+            // (and unlike the work finder, which carries the body on its
+            // `WorkItem`), this handler has no cached body — so the fetch is
+            // LAZY, running only inside the `experiment` branch. `off` /
+            // `observe` dispatches make zero extra `gh` calls, and a failed
+            // fetch degrades to the unchanged `routine` stratum.
+            let gh_bin = sr
+                .config()
+                .gh_bin
+                .clone()
+                .unwrap_or_else(|| std::path::PathBuf::from("gh"));
             let (resolved_model, model_source_label, arm) = match (&kind, model.as_deref()) {
                 (crate::types::SweepKind::Issue(issue), None) => {
-                    let resolved = crate::sweep_registry::resolve_autonomous_dispatch_model(
-                        &repo_root, *issue,
+                    let resolved = crate::sweep_registry::resolve_autonomous_dispatch_model_lazy(
+                        &repo_root,
+                        *issue,
+                        || {
+                            crate::sweep_registry::fetch_issue_complexity(
+                                &gh_bin, &repo_root, *issue,
+                            )
+                        },
                     );
                     (resolved.model, resolved.source_label, resolved.arm)
                 }

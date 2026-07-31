@@ -261,6 +261,14 @@ pub struct WorkItem {
     /// output / a synthetic item) sorts *after* any dated item and falls back to
     /// the issue number as a monotonic-with-creation age proxy.
     pub created_at: Option<String>,
+    /// The issue's markdown body, when the listing supplied it (#4827).
+    ///
+    /// The ETag-cached REST listing already returns it at zero extra cost, and
+    /// dispatch reads the Curator's `<!-- loom:complexity=<tier> -->` marker out
+    /// of it (see [`Self::complexity`]) to stratify the model-cost A/B
+    /// experiment's arm assignment per issue. `None` (a synthetic item, or a
+    /// listing without bodies) simply falls back to the `routine` stratum.
+    pub body: Option<String>,
 }
 
 impl WorkItem {
@@ -272,6 +280,7 @@ impl WorkItem {
             number,
             labels,
             created_at: None,
+            body: None,
         }
     }
 
@@ -282,7 +291,28 @@ impl WorkItem {
             number,
             labels,
             created_at,
+            body: None,
         }
+    }
+
+    /// Builder-style setter for the issue body (#4827).
+    #[must_use]
+    pub fn with_body(mut self, body: Option<String>) -> Self {
+        self.body = body;
+        self
+    }
+
+    /// The Curator's `<!-- loom:complexity=<tier> -->` stratum for this issue,
+    /// extracted from [`Self::body`] (#4827).
+    ///
+    /// `None` when no body was fetched or no marker is present — which
+    /// [`crate::script_helpers::sweep_experiment::assign_arm`] treats as the
+    /// `routine` stratum, exactly as before this field existed.
+    #[must_use]
+    pub fn complexity(&self) -> Option<&str> {
+        self.body
+            .as_deref()
+            .and_then(crate::script_helpers::sweep_experiment::extract_complexity_marker)
     }
 
     /// True when the issue carries any [`SKIP_LABELS`] entry.
@@ -319,6 +349,11 @@ pub struct PriorityCandidate {
     pub created_at: Option<String>,
     /// The issue number (dispatch target + final deterministic tiebreak).
     pub number: u32,
+    /// The issue's `<!-- loom:complexity=<tier> -->` stratum (#4827), carried
+    /// from its [`WorkItem`] so pass 2's `dispatch()` can stratify the
+    /// model-cost A/B arm assignment without re-fetching the body. Not part of
+    /// the ordering keys — [`candidate_cmp`] ignores it.
+    pub complexity: Option<String>,
 }
 
 /// Total ordering over dispatch candidates (#3946): **(workspace priority asc,
@@ -444,11 +479,17 @@ pub trait WorkDispatcher {
     /// was started, `false` when the dispatch was an idempotency no-op (a sweep
     /// with the same key was already running).
     ///
+    /// `complexity` is the issue's `<!-- loom:complexity=<tier> -->` stratum
+    /// (#4827), already extracted from the listing's issue body by the caller —
+    /// the dispatcher never re-fetches it. Used ONLY to stratify the model-cost
+    /// A/B experiment's arm assignment; `None` (no marker / no body) keeps the
+    /// pre-#4827 `routine` stratum and is never an error.
+    ///
     /// # Errors
     ///
     /// Returns an error when the dispatch fails (e.g. a claim-lock collision).
     /// The caller logs and counts it; it is never fatal.
-    fn dispatch(&mut self, issue: u32) -> Result<bool>;
+    fn dispatch(&mut self, issue: u32, complexity: Option<&str>) -> Result<bool>;
 
     /// Count of in-flight sweeps that occupy the work-finder's concurrency
     /// budget (Issue #4003).
@@ -765,7 +806,7 @@ pub fn tick_with_admission_cap(
         }
         // 4. Dispatch. The registry's idempotency key + claim lock make a
         //    double-dispatch of an already-running issue a no-op / loud error.
-        match dispatcher.dispatch(item.number) {
+        match dispatcher.dispatch(item.number, item.complexity()) {
             Ok(true) => {
                 report.dispatched += 1;
                 occupancy += 1;
@@ -1087,6 +1128,7 @@ pub fn tick_multi_with_admission_cap<S: WorkSource, D: WorkDispatcher>(
                 workspace_idx: idx,
                 workspace_priority,
                 urgent: item.is_urgent(),
+                complexity: item.complexity().map(str::to_owned),
                 created_at: item.created_at,
                 number: item.number,
             });
@@ -1119,7 +1161,7 @@ pub fn tick_multi_with_admission_cap<S: WorkSource, D: WorkDispatcher>(
             continue;
         }
         let dispatcher = &mut workspaces[cand.workspace_idx].1;
-        match dispatcher.dispatch(cand.number) {
+        match dispatcher.dispatch(cand.number, cand.complexity.as_deref()) {
             Ok(true) => {
                 report.dispatched += 1;
                 occupancy += 1;
@@ -2312,7 +2354,13 @@ pub mod forge {
             Ok(rows
                 .into_iter()
                 .filter(|r| !r.is_pull_request)
-                .map(|r| WorkItem::with_created_at(r.number, r.labels, r.created_at))
+                // The REST listing already returns `body` (#4827) — carrying it
+                // onto the item costs no extra request and lets dispatch read
+                // the `<!-- loom:complexity=... -->` stratum without a
+                // per-issue `gh issue view`.
+                .map(|r| {
+                    WorkItem::with_created_at(r.number, r.labels, r.created_at).with_body(r.body)
+                })
                 .collect())
         }
     }
@@ -2420,7 +2468,7 @@ pub mod forge {
             }
         }
 
-        fn dispatch(&mut self, issue: u32) -> Result<bool> {
+        fn dispatch(&mut self, issue: u32, complexity: Option<&str>) -> Result<bool> {
             let mut reg = self
                 .registry
                 .lock()
@@ -2438,13 +2486,22 @@ pub mod forge {
             // for the sweep.md prose instrumentation, which never executed in a
             // headless child and was in any case overridden by this very
             // default-pin precedence. `off`/`observe` modes are unaffected.
+            //
+            // Issue #4827: `complexity` is the issue's real
+            // `<!-- loom:complexity=... -->` stratum, read from the body the
+            // ETag-cached REST listing already returned — so the experiment's
+            // `complex` and `routine` strata each get an independent ~50/50 A/B
+            // balance instead of the whole population being stratified as
+            // `routine`. No extra forge call: the body arrives with the listing.
             let repo_root = reg.config().workspace_root.clone();
-            let resolved =
-                crate::sweep_registry::resolve_autonomous_dispatch_model(&repo_root, issue);
+            let resolved = crate::sweep_registry::resolve_autonomous_dispatch_model(
+                &repo_root, issue, complexity,
+            );
             match resolved.arm {
                 Some(arm) => log::info!(
-                    "work_finder: dispatching issue #{issue} with arm={arm} model={} \
-                     (source={})",
+                    "work_finder: dispatching issue #{issue} with arm={arm} \
+                     (complexity={}) model={} (source={})",
+                    complexity.unwrap_or("routine"),
                     resolved.model,
                     resolved.source_label
                 ),
@@ -2579,6 +2636,10 @@ mod tests {
         /// `in_flight()` cannot see it (a reverted label, a released lock, or a
         /// second daemon instance on the same host).
         live_claim_issues: HashSet<u32>,
+        /// Every `(issue, complexity)` pair `dispatch` was called with (#4827),
+        /// so a test can assert the REAL per-issue complexity stratum reached
+        /// the dispatcher rather than the pre-#4827 `None`.
+        dispatched_complexity: Vec<(u32, Option<String>)>,
     }
 
     impl WorkDispatcher for RecordingDispatcher {
@@ -2597,7 +2658,9 @@ mod tests {
         fn peer_claimed(&self) -> HashSet<u32> {
             self.peer_claimed.clone()
         }
-        fn dispatch(&mut self, issue: u32) -> Result<bool> {
+        fn dispatch(&mut self, issue: u32, complexity: Option<&str>) -> Result<bool> {
+            self.dispatched_complexity
+                .push((issue, complexity.map(str::to_owned)));
             if self.backoff_refuse_issues.contains(&issue) {
                 return Err(DispatchBackoffError {
                     issue,
@@ -2639,6 +2702,81 @@ mod tests {
 
     fn issue(n: u32) -> WorkItem {
         WorkItem::new(n, vec!["loom:issue".to_string()])
+    }
+
+    // ===================================================================
+    // Per-issue complexity threading (#4827)
+    // ===================================================================
+
+    /// A ready issue whose body carries the Curator's `<!-- loom:complexity=... -->`
+    /// marker — the shape `GhWorkSource::list_ready_issues` now materializes
+    /// from the REST listing's `body` field.
+    fn issue_with_complexity(n: u32, tier: &str) -> WorkItem {
+        issue(n).with_body(Some(format!(
+            "## Context\n\nSome body text.\n\n<!-- loom:complexity={tier} -->\n"
+        )))
+    }
+
+    /// `WorkItem::complexity()` reads the marker out of the carried body, and
+    /// degrades to `None` (the unchanged `routine` stratum) when the listing
+    /// supplied no body or the body carries no marker.
+    #[test]
+    fn work_item_extracts_complexity_from_its_body() {
+        assert_eq!(issue_with_complexity(1, "complex").complexity(), Some("complex"));
+        assert_eq!(issue_with_complexity(1, "mechanical").complexity(), Some("mechanical"));
+        // No body at all (a synthetic item / a listing without bodies).
+        assert_eq!(issue(1).complexity(), None);
+        // A body with no marker (a pre-marker issue).
+        assert_eq!(issue(1).with_body(Some("no marker".into())).complexity(), None);
+    }
+
+    /// The core #4827 acceptance criterion for the single-workspace path: the
+    /// issue's REAL complexity stratum reaches `dispatch()` instead of the
+    /// pre-#4827 hardcoded `None`.
+    #[test]
+    fn tick_threads_per_issue_complexity_into_dispatch() {
+        let mut source = FakeSource::once(vec![
+            issue_with_complexity(10, "complex"),
+            issue_with_complexity(11, "mechanical"),
+            issue(12), // no body → None → `routine`, unchanged
+        ]);
+        let mut dispatcher = RecordingDispatcher::default();
+        let report = tick(&mut source, &mut dispatcher, 10, false).unwrap();
+
+        assert_eq!(report.dispatched, 3);
+        assert_eq!(
+            dispatcher.dispatched_complexity,
+            vec![
+                (10, Some("complex".to_string())),
+                (11, Some("mechanical".to_string())),
+                (12, None),
+            ]
+        );
+    }
+
+    /// The same criterion for the multi-workspace path, where the stratum
+    /// travels on `PriorityCandidate` from pass 1 (listing) to pass 2
+    /// (dispatch) — it must survive the global priority sort.
+    #[test]
+    fn tick_multi_threads_per_issue_complexity_into_dispatch() {
+        let mut workspaces = vec![
+            (
+                FakeSource::once(vec![issue_with_complexity(20, "complex")]),
+                RecordingDispatcher::default(),
+            ),
+            (
+                FakeSource::once(vec![issue_with_complexity(21, "routine"), issue(22)]),
+                RecordingDispatcher::default(),
+            ),
+        ];
+        let report = tick_multi(&mut workspaces, &[0, 0], 10, &[false, false]);
+
+        assert_eq!(report.dispatched, 3);
+        assert_eq!(workspaces[0].1.dispatched_complexity, vec![(20, Some("complex".to_string()))]);
+        assert_eq!(
+            workspaces[1].1.dispatched_complexity,
+            vec![(21, Some("routine".to_string())), (22, None)]
+        );
     }
 
     // ===================================================================
@@ -2706,7 +2844,9 @@ exit 0
 
         let (mut dispatcher, _dir, record_log) = setup_registry_dispatcher_in_tempdir();
 
-        let was_new = dispatcher.dispatch(3964).expect("dispatch should succeed");
+        let was_new = dispatcher
+            .dispatch(3964, None)
+            .expect("dispatch should succeed");
         assert!(was_new, "expected a fresh dispatch, not an idempotency no-op");
 
         let start = std::time::Instant::now();
@@ -3814,6 +3954,7 @@ exit 0
             workspace_idx: idx,
             workspace_priority: prio,
             urgent,
+            complexity: None,
             created_at: created.map(str::to_string),
             number: num,
         };
