@@ -1552,14 +1552,13 @@ async fn fetch_repo_slug_cached(
     Some(slug)
 }
 
-/// Best-effort per-issue token total for a `completion` envelope (#4497):
-/// `sum(input + output)` over the activity DB's per-issue cost rollup
-/// ([`ActivityDb::get_cost_by_issue`]). The DB is already in-process, so this
-/// needs no forge call and no new accounting.
+/// Best-effort per-issue token total from the activity DB's per-issue cost
+/// rollup ([`ActivityDb::get_cost_by_issue`]): `sum(input + output)`. The DB is
+/// already in-process, so this needs no forge call and no new accounting.
 ///
 /// **Attribution is imperfect, by explicit operator decision** — for a cost
-/// *trend*, imperfect-but-consistent beats absent. Two known limits, documented
-/// here rather than papered over:
+/// *trend*, imperfect-but-consistent beats absent. Three known limits,
+/// documented here rather than papered over:
 ///
 /// 1. **Not repo-qualified.** The activity DB's forge-correlation table keys on
 ///    a bare issue number with no repo column, so a daemon managing several
@@ -1567,14 +1566,22 @@ async fn fetch_repo_slug_cached(
 /// 2. **Only as good as the prompt↔usage linkage.** The rollup joins recorded
 ///    token samples to an issue through `agent_inputs`; samples recorded without
 ///    that link contribute nothing, so the figure is a **floor**, not a full
-///    accounting — and is empty on hosts where nothing has established the link
-///    yet, in which case the key is simply omitted.
+///    accounting.
+/// 3. **Unreachable from the dispatch path (#4699).** The `resource_usage` and
+///    `prompt_github` rows this rollup joins are written from exactly one place,
+///    the IPC `GetTerminalOutput` handler scraping a *managed terminal's*
+///    scrollback. `dispatch_sweep` spawns a detached `claude -p` and reaps the
+///    OS process — no `SendInput`/`GetTerminalOutput` round trips — so on a
+///    dispatch-driven host both tables stay empty forever and this returns
+///    `None` unconditionally. That is why [`fetch_issue_tokens`] falls back to
+///    the on-disk transcripts; this remains first only because it is the cheaper
+///    lookup on hosts that *do* drive managed terminals.
 ///
 /// Every failure — no DB handle, a poisoned mutex, a query error, a timeout, an
 /// empty rollup — degrades to `None`. A zero total is likewise indistinguishable
 /// from "accounting had nothing" and is filtered out downstream by
 /// [`CompletionMeta::to_meta_value`], so no bogus `0` reaches the feed.
-async fn fetch_issue_tokens(
+async fn fetch_activity_db_tokens(
     activity_db: Option<&Arc<Mutex<ActivityDb>>>,
     issue: u32,
 ) -> Option<u64> {
@@ -1600,6 +1607,70 @@ async fn fetch_issue_tokens(
         .await
         .ok()?
         .ok()?
+        .filter(|total| *total > 0)
+}
+
+/// Whether the on-disk transcript fallback is enabled. Opt **out** with
+/// `LOOM_SAFEHOUSE_TRANSCRIPT_TOKENS=0` (also `false`/`off`/`no`) on a host
+/// where scanning the Claude Code project directory is unwanted; any other
+/// value, or the variable being unset, leaves it on.
+fn transcript_tokens_enabled() -> bool {
+    match std::env::var("LOOM_SAFEHOUSE_TRANSCRIPT_TOKENS") {
+        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no"),
+        Err(_) => true,
+    }
+}
+
+/// Per-issue token total from the sweep's own Claude Code transcripts — the
+/// source that the daemon **dispatch** path actually populates (#4699).
+///
+/// Delegates to [`crate::transcript_tokens`] (see that module for how a sweep's
+/// session is located and why the total includes cache tokens). Runs on the
+/// blocking pool under the same [`TOKEN_LOOKUP_TIMEOUT`] as the DB lookup, so a
+/// slow or pathological project directory can never delay a completion by more
+/// than the lookup budget; a timeout degrades to `None` like every other
+/// failure.
+async fn fetch_transcript_tokens(
+    workspace_root: &str,
+    issue: u32,
+    window: (DateTime<Utc>, DateTime<Utc>),
+) -> Option<u64> {
+    if !transcript_tokens_enabled() {
+        return None;
+    }
+    let projects = crate::transcript_tokens::claude_projects_dir()?;
+    let root = PathBuf::from(workspace_root);
+    let scan = tokio::task::spawn_blocking(move || {
+        crate::transcript_tokens::sum_sweep_tokens(&projects, &root, issue, Some(window))
+    });
+    tokio::time::timeout(TOKEN_LOOKUP_TIMEOUT, scan)
+        .await
+        .ok()?
+        .ok()?
+}
+
+/// Best-effort per-issue token total for a `completion` envelope (#4497,
+/// #4699): the activity DB rollup when the host has one, else the sweep's
+/// on-disk transcripts.
+///
+/// The two sources answer with different fidelity — the DB reports
+/// `input + output`, the transcripts report all four usage counters (cache reads
+/// included, which dominate a sweep both by volume and by cost). The DB is tried
+/// first purely because it is cheaper; on a dispatch-driven host it never
+/// answers at all (see [`fetch_activity_db_tokens`] limit 3), so in practice the
+/// transcript figure is what the fleet feed publishes. Both degrade to `None`
+/// independently, and a `None` omits the key rather than publishing a
+/// misleading `0`.
+async fn fetch_issue_tokens(
+    activity_db: Option<&Arc<Mutex<ActivityDb>>>,
+    issue: u32,
+    workspace_root: &str,
+    window: (DateTime<Utc>, DateTime<Utc>),
+) -> Option<u64> {
+    if let Some(total) = fetch_activity_db_tokens(activity_db, issue).await {
+        return Some(total);
+    }
+    fetch_transcript_tokens(workspace_root, issue, window).await
 }
 
 /// The Option-B emit point (#4426): on a `SweepExited`, verify against forge
@@ -1693,14 +1764,17 @@ async fn build_and_narrate_completion(
         return None;
     }
     let slug = fetch_repo_slug_cached(slug_cache, workspace_root).await?;
-    // Only reached once the merge is confirmed, so a completion is never delayed
-    // by a token lookup it would not have published.
-    let tokens = fetch_issue_tokens(activity_db, issue).await;
 
     // Timing comes from the one clock the caller had available, so the pair is
     // always self-consistent — mixing clocks across callers could render a
     // `completed_at` before `started_at`.
     let started_at = exited_at - chrono::Duration::seconds(duration_sec.max(0));
+    // Only reached once the merge is confirmed, so a completion is never delayed
+    // by a token lookup it would not have published. The window narrows the
+    // transcript fallback's candidate set to sessions that overlap this
+    // completion, so it must be computed before the lookup.
+    let tokens =
+        fetch_issue_tokens(activity_db, issue, workspace_root, (started_at, exited_at)).await;
     let meta = CompletionMeta {
         agent: persona.to_owned(),
         repo_slug: slug,
@@ -4956,15 +5030,60 @@ mod tests {
         assert!(build_send_request(&envelope, 1, None).is_ok());
     }
 
+    /// Point `CLAUDE_CONFIG_DIR` at an empty directory so the #4699 transcript
+    /// fallback is exercised hermetically rather than against whatever sweeps
+    /// the developer's real `~/.claude` happens to hold.
+    fn isolate_claude_config_dir(dir: &Path) -> PathBuf {
+        let config = dir.join("claude-config");
+        std::fs::create_dir_all(config.join("projects")).unwrap();
+        std::env::set_var("CLAUDE_CONFIG_DIR", &config);
+        config
+    }
+
+    /// Seed one `/loom:sweep <issue>` session transcript for `workspace_root`
+    /// under `config_dir`, laid out exactly as Claude Code writes it: the parent
+    /// `<uuid>.jsonl` plus one `<uuid>/subagents/agent-*.jsonl` phase file.
+    fn seed_sweep_transcript(config_dir: &Path, workspace_root: &Path, issue: u32) {
+        let project = config_dir
+            .join("projects")
+            .join(crate::transcript_tokens::project_slug(workspace_root));
+        std::fs::create_dir_all(project.join("uuid-1/subagents")).unwrap();
+        let head = format!(
+            "{{\"type\":\"user\",\"message\":{{\"content\":\
+             \"<command-name>/loom:sweep</command-name>\\n\
+             <command-args>{issue} --claim-owned {issue}</command-args>\"}}}}\n"
+        );
+        let usage = |input: u32, output: u32, read: u32, create: u32| {
+            format!(
+                "{{\"message\":{{\"usage\":{{\"input_tokens\":{input},\
+                 \"output_tokens\":{output},\"cache_read_input_tokens\":{read},\
+                 \"cache_creation_input_tokens\":{create}}}}}}}\n"
+            )
+        };
+        std::fs::write(
+            project.join("uuid-1.jsonl"),
+            format!("{head}{}", usage(1_000, 2_000, 30_000, 4_000)),
+        )
+        .unwrap();
+        std::fs::write(
+            project.join("uuid-1/subagents/agent-bld.jsonl"),
+            usage(100, 200, 3_000, 400),
+        )
+        .unwrap();
+    }
+
     #[tokio::test]
     #[serial]
     async fn completion_for_exit_omits_tokens_when_the_rollup_is_empty() {
         // "Omit rather than guess": an activity DB with no rollup for this issue
-        // must not publish a `0`, which the feed would chart as free work.
+        // must not publish a `0`, which the feed would chart as free work. With
+        // #4699 the transcript fallback must come up empty too — hence the
+        // isolated (and unseeded) `CLAUDE_CONFIG_DIR`.
         let dir = tempfile::tempdir().unwrap();
         let (fake_gh, _log) =
             write_fake_forge_gh(dir.path(), Some(MERGED_PR_JSON), Some("rjwalters/loom"));
         std::env::set_var(GH_BIN_ENV, &fake_gh);
+        isolate_claude_config_dir(dir.path());
 
         // Seeded for a *different* issue, so this issue's rollup is empty.
         let db = seed_activity_db_with_issue_tokens(dir.path(), 999, 12_345, 678);
@@ -4982,6 +5101,7 @@ mod tests {
         .await;
 
         std::env::remove_var(GH_BIN_ENV);
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
         let meta = envelope
             .as_ref()
             .and_then(|e| e.meta.as_ref())
@@ -4989,6 +5109,116 @@ mod tests {
         assert!(meta.get("tokens").is_none(), "an empty rollup ⇒ omitted, not 0");
         // The forge-sourced display fields are unaffected by the token miss.
         assert_eq!(meta["title"], json!("feat: enrich completion meta"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn completion_for_exit_falls_back_to_sweep_transcripts_when_the_db_is_empty() {
+        // Regression for #4699: on a dispatch-driven host the activity DB's
+        // `resource_usage`/`prompt_github` tables have no writer at all, so the
+        // rollup is *structurally* empty and every published completion carried
+        // `tokens: null`. The sweep's own on-disk transcripts must supply the
+        // total instead — parent session + every subagent phase file, all four
+        // usage counters (cache reads included).
+        let dir = tempfile::tempdir().unwrap();
+        let (fake_gh, _log) =
+            write_fake_forge_gh(dir.path(), Some(MERGED_PR_JSON), Some("rjwalters/loom"));
+        std::env::set_var(GH_BIN_ENV, &fake_gh);
+        let config = isolate_claude_config_dir(dir.path());
+        seed_sweep_transcript(&config, dir.path(), 4426);
+
+        // No activity DB handle at all — the exact shape of the dispatch path.
+        let envelope = completion_for_exit(
+            "loom_daemon",
+            &dir.path().to_string_lossy(),
+            4426,
+            750,
+            Utc::now(),
+            &mut HashMap::new(),
+            &mut std::collections::HashSet::new(),
+            None,
+        )
+        .await;
+
+        std::env::remove_var(GH_BIN_ENV);
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        let envelope = envelope.expect("a merged PR must produce a completion envelope");
+        let meta = envelope.meta.as_ref().unwrap();
+        // parent 37_000 + subagent 3_700
+        assert_eq!(
+            meta["tokens"],
+            json!(40_700),
+            "tokens must come from the transcripts when the DB rollup is empty"
+        );
+        assert!(build_send_request(&envelope, 1, None).is_ok());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn completion_for_exit_prefers_the_activity_db_over_the_transcripts() {
+        // The DB is the cheaper lookup and stays authoritative on hosts that do
+        // drive managed terminals; the transcript scan is a fallback, not an
+        // override. Both sources are present here, so the DB figure must win.
+        let dir = tempfile::tempdir().unwrap();
+        let (fake_gh, _log) =
+            write_fake_forge_gh(dir.path(), Some(MERGED_PR_JSON), Some("rjwalters/loom"));
+        std::env::set_var(GH_BIN_ENV, &fake_gh);
+        let config = isolate_claude_config_dir(dir.path());
+        seed_sweep_transcript(&config, dir.path(), 4426);
+
+        let db = seed_activity_db_with_issue_tokens(dir.path(), 4426, 700_000, 91_000);
+
+        let envelope = completion_for_exit(
+            "loom_daemon",
+            &dir.path().to_string_lossy(),
+            4426,
+            750,
+            Utc::now(),
+            &mut HashMap::new(),
+            &mut std::collections::HashSet::new(),
+            Some(&db),
+        )
+        .await;
+
+        std::env::remove_var(GH_BIN_ENV);
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        let meta = envelope.as_ref().and_then(|e| e.meta.as_ref()).unwrap();
+        assert_eq!(meta["tokens"], json!(791_000), "the DB rollup wins when non-empty");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn the_transcript_fallback_can_be_disabled_by_env() {
+        // Escape hatch for an operator who does not want the completion path
+        // reading the Claude Code project directory at all.
+        let dir = tempfile::tempdir().unwrap();
+        let (fake_gh, _log) =
+            write_fake_forge_gh(dir.path(), Some(MERGED_PR_JSON), Some("rjwalters/loom"));
+        std::env::set_var(GH_BIN_ENV, &fake_gh);
+        let config = isolate_claude_config_dir(dir.path());
+        seed_sweep_transcript(&config, dir.path(), 4426);
+        std::env::set_var("LOOM_SAFEHOUSE_TRANSCRIPT_TOKENS", "0");
+
+        let envelope = completion_for_exit(
+            "loom_daemon",
+            &dir.path().to_string_lossy(),
+            4426,
+            750,
+            Utc::now(),
+            &mut HashMap::new(),
+            &mut std::collections::HashSet::new(),
+            None,
+        )
+        .await;
+
+        std::env::remove_var(GH_BIN_ENV);
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        std::env::remove_var("LOOM_SAFEHOUSE_TRANSCRIPT_TOKENS");
+        let meta = envelope
+            .as_ref()
+            .and_then(|e| e.meta.as_ref())
+            .expect("opting out of the fallback must not cost the completion");
+        assert!(meta.get("tokens").is_none(), "opted out ⇒ tokens omitted");
     }
 
     #[tokio::test]
