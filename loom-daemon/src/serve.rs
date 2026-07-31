@@ -110,6 +110,9 @@ const TOKENS_PATH: &str = "/api/tokens";
 /// Path the configured peer-daemon list endpoint answers (Issue #4393).
 const PEERS_PATH: &str = "/api/peers";
 
+/// Path the consolidated health-verdict endpoint answers (Issue #4761).
+const HEALTH_PATH: &str = "/api/health";
+
 /// Every route this listener answers (used for the 404 dispatch check).
 const KNOWN_PATHS: &[&str] = &[
     ROOT_PATH,
@@ -118,6 +121,7 @@ const KNOWN_PATHS: &[&str] = &[
     PIPELINE_PATH,
     TOKENS_PATH,
     PEERS_PATH,
+    HEALTH_PATH,
 ];
 
 /// The embedded dashboard page (Issue #4393). Plain HTML/CSS/vanilla JS, no
@@ -527,6 +531,22 @@ async fn handle_pipeline(
     };
     let roots: Vec<PathBuf> = report.per_repo.iter().map(|r| r.root.clone()).collect();
 
+    let rows = pipeline_rows_cached(source, roots, cache).await;
+
+    let body = serde_json::to_string(&rows)?;
+    write_json_response(stream, "200 OK", &body).await
+}
+
+/// Read the shared pipeline rows, recomputing only past [`PIPELINE_CACHE_TTL`].
+///
+/// Extracted (#4761) so `/api/health` shares the *same* cached `gh` batch
+/// `/api/pipeline` already pays for, instead of firing a second subprocess
+/// fan-out per dashboard poll.
+async fn pipeline_rows_cached(
+    source: Arc<dyn PipelineSource + Send + Sync>,
+    roots: Vec<PathBuf>,
+    cache: &PipelineCache,
+) -> Vec<PipelineRow> {
     let mut guard = cache.lock().await;
     let fresh = guard
         .as_ref()
@@ -535,13 +555,101 @@ async fn handle_pipeline(
         let rows = build_pipeline_rows(source, roots).await;
         *guard = Some((Instant::now(), rows));
     }
-    let rows = guard
+    guard
         .as_ref()
-        .map_or_else(Vec::new, |(_, rows)| rows.clone());
-    drop(guard);
+        .map_or_else(Vec::new, |(_, rows)| rows.clone())
+}
 
-    let body = serde_json::to_string(&rows)?;
-    write_json_response(stream, "200 OK", &body).await
+// ============================================================================
+// Consolidated health verdict (`GET /api/health`, Issue #4761)
+// ============================================================================
+
+/// The window `/api/health` reports role-tick and throughput over.
+///
+/// Fixed at 24h rather than exposed as a query parameter: this endpoint reuses
+/// the `/api/pipeline` cache, whose merge counts are computed over the source's
+/// own (24h default) window, so honoring an arbitrary `?since=` here would
+/// silently report a *different* window than the numbers actually cover. The
+/// CLI (`loom-daemon health --since 30m`) owns the variable-window story — it
+/// builds its own source with a matching
+/// [`pipeline_snapshot::GhPipelineSource::with_merge_window`].
+const HEALTH_WINDOW: Duration = Duration::from_secs(24 * 3600);
+
+/// Serve `GET /api/health`: the same consolidated verdict `loom-daemon health`
+/// renders, via the same [`crate::health::assess`] collector (Issue #4761 AC4).
+///
+/// This endpoint deliberately contains **no verdict logic of its own** — it
+/// collects the identical inputs (IPC report, install-state probe, `pgrep`,
+/// `.ranking` stat, the cached pipeline rows) and hands them to `assess`. A
+/// second implementation here is exactly the duplication AC4 forbids.
+///
+/// Unlike `/api/status`, an unreachable daemon is **200, not 503**: the whole
+/// point of a health verdict is that "the daemon is dead" is a *report*, not a
+/// transport failure. The payload's `overall` field carries `"dead"` and
+/// `exit_code` carries `2`, so a browser/curl consumer branches on the same
+/// contract the CLI's exit code encodes.
+async fn handle_health(
+    stream: &mut TcpStream,
+    socket_path: &Path,
+    source: Arc<dyn PipelineSource + Send + Sync>,
+    cache: &PipelineCache,
+) -> Result<()> {
+    let (report, ipc_error) = match fetch_report(socket_path).await {
+        Ok(r) => (Some(r), None),
+        Err(e) => (None, Some(e.to_string())),
+    };
+
+    let pipeline = match &report {
+        Some(r) => {
+            let roots: Vec<PathBuf> = r.per_repo.iter().map(|repo| repo.root.clone()).collect();
+            Some(
+                pipeline_rows_cached(source, roots, cache)
+                    .await
+                    .into_iter()
+                    .map(|row| row.snapshot)
+                    .collect::<Vec<_>>(),
+            )
+        }
+        None => None,
+    };
+
+    let (ranking_present, ranking_age_secs) = report
+        .as_ref()
+        .and_then(|r| r.token_pool_dir.clone())
+        .map_or((false, None), |dir| ranking_state(&dir));
+
+    let health = crate::health::assess(&crate::health::HealthInputs {
+        at: chrono::Utc::now(),
+        window: HEALTH_WINDOW,
+        status: report,
+        ipc_error,
+        install_state: crate::daemon_install_state::probe(),
+        pgrep_pids: crate::daemon_install_state::pgrep_daemon_pids(),
+        ranking_present,
+        ranking_age_secs,
+        pipeline,
+    });
+
+    let mut body = serde_json::to_value(&health)?;
+    // The exit code the CLI would return, so an HTTP consumer branches on the
+    // same 0/1/2 contract without re-deriving it from `overall`.
+    body["exit_code"] = serde_json::json!(health.exit_code());
+    write_json_response(stream, "200 OK", &serde_json::to_string(&body)?).await
+}
+
+/// `(present, age_secs)` for `<dir>/.ranking` — the tokens section's staleness
+/// input. Mirrors `cli::health`'s probe of the same file; kept local so the
+/// library crate does not depend on the binary's CLI module.
+fn ranking_state(dir: &Path) -> (bool, Option<u64>) {
+    let Ok(meta) = std::fs::metadata(dir.join(".ranking")) else {
+        return (false, None);
+    };
+    let age = meta
+        .modified()
+        .ok()
+        .and_then(|m| m.elapsed().ok())
+        .map(|d| d.as_secs());
+    (true, age)
 }
 
 // ============================================================================
@@ -965,6 +1073,16 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<ServeState>) -> Res
         return handle_peers(&mut stream, &state.peers).await;
     }
 
+    if parsed.path == HEALTH_PATH {
+        return handle_health(
+            &mut stream,
+            &state.socket_path,
+            Arc::clone(&state.pipeline_source),
+            &state.pipeline_cache,
+        )
+        .await;
+    }
+
     match fetch_snapshot(&state.socket_path).await {
         Ok(snapshot) => {
             let body = serde_json::to_string(&snapshot)?;
@@ -1073,6 +1191,8 @@ mod tests {
             rate_limit_breaker: None,
             safehouse: None,
             work_finder_enabled: None,
+            last_work_finder_tick: None,
+            role_tick_records: vec![],
         }
     }
 
@@ -2422,5 +2542,110 @@ mod tests {
         assert_eq!(status, 404);
 
         server_task.abort();
+    }
+
+    // ========================================================================
+    // `/api/health` — the shared health collector (Issue #4761)
+    // ========================================================================
+
+    /// AC4: the dashboard must reuse the collector, so its payload has exactly
+    /// the shape (and the six sections) `loom-daemon health --json` renders.
+    #[tokio::test]
+    async fn health_route_serves_the_shared_collector_report() {
+        let mut report = empty_report();
+        report.dynamic_cap = 4;
+        report.work_finder_enabled = Some(true);
+        report.last_work_finder_tick = Some(crate::types::WorkFinderTickSummary {
+            at: chrono::Utc::now(),
+            max_concurrent: 4,
+            seen: 3,
+            dispatched: 1,
+            ..Default::default()
+        });
+        let socket_path = spawn_repeating_fake_daemon_socket(report).await;
+        let tcp_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind tcp");
+        let addr = tcp_listener.local_addr().expect("local addr");
+        let state = ServeState::new(socket_path)
+            .with_pipeline_source(Arc::new(pipeline_snapshot::GhPipelineSource::new()));
+        let server_task = tokio::spawn(run_with_state(tcp_listener, state));
+
+        let (status, body) = http_get(addr, "/api/health").await;
+        assert_eq!(status, 200);
+        let json: serde_json::Value = serde_json::from_str(&body).expect("valid JSON: {body}");
+        let keys: Vec<&str> = json["sections"]
+            .as_array()
+            .expect("sections array")
+            .iter()
+            .map(|s| s["key"].as_str().expect("key"))
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                "liveness",
+                "dispatch",
+                "tokens",
+                "roles",
+                "queues",
+                "throughput"
+            ]
+        );
+        assert!(json["exit_code"].is_i64(), "payload must carry the 0/1/2 contract");
+        assert!(json["overall"].is_string());
+
+        server_task.abort();
+    }
+
+    /// An unreachable daemon is a *health finding*, not a transport failure:
+    /// the route answers 200 with `overall: dead` / `exit_code: 2` so a watch
+    /// loop branches on the same contract the CLI's exit code encodes.
+    #[tokio::test]
+    async fn health_route_reports_an_unreachable_daemon_as_200_not_503() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("nonexistent.sock");
+        let tcp_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind tcp");
+        let addr = tcp_listener.local_addr().expect("local addr");
+        let server_task = tokio::spawn(run(tcp_listener, socket_path));
+
+        let (status, body) = http_get(addr, "/api/health").await;
+        assert_eq!(status, 200, "body: {body}");
+        let json: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        // The liveness verdict itself depends on this host's real install
+        // state, so assert only the invariant: it is never GREEN when IPC
+        // failed, and the exit code is never 0.
+        let liveness = &json["sections"][0];
+        assert_eq!(liveness["key"], "liveness");
+        assert_ne!(liveness["verdict"], "green");
+        assert_ne!(json["exit_code"], 0);
+
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn health_route_carries_the_cors_header() {
+        let socket_path = spawn_repeating_fake_daemon_socket(empty_report()).await;
+        let tcp_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind tcp");
+        let addr = tcp_listener.local_addr().expect("local addr");
+        let server_task = tokio::spawn(run(tcp_listener, socket_path));
+
+        let (_status, head, _body) = http_get_full(addr, "/api/health").await;
+        assert!(head.contains(&format!("{CORS_ALLOW_ORIGIN_HEADER}\r\n")), "head: {head:?}");
+
+        server_task.abort();
+    }
+
+    #[test]
+    fn ranking_state_reports_absent_and_present() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        assert_eq!(ranking_state(tmp.path()), (false, None));
+        std::fs::write(tmp.path().join(".ranking"), "a|available|0.1\n").expect("write");
+        let (present, age) = ranking_state(tmp.path());
+        assert!(present);
+        assert!(age.expect("age") < 60);
     }
 }

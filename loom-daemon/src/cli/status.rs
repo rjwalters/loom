@@ -659,6 +659,8 @@ pub(crate) mod status_client_tests {
             rate_limit_breaker: None,
             safehouse: None,
             work_finder_enabled: Some(true),
+            last_work_finder_tick: None,
+            role_tick_records: vec![],
         }
     }
 

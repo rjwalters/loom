@@ -92,22 +92,86 @@ struct NumberRow {
     number: u64,
 }
 
-/// A `gh`-backed [`PipelineSource`]. Runs six `gh` invocations per repo (one
-/// per counted metric) scoped to that repo's own working directory so `gh`
-/// auto-detects the remote — same convention as
+/// Which of the six counted metrics a [`GhPipelineSource`] fetches (Issue
+/// #4761).
+///
+/// Each metric costs one `gh` invocation, and they run *sequentially* within a
+/// repo, so the mask is what keeps a consumer that needs two of them from
+/// paying for six. A metric that is masked off is left `None` — a caller that
+/// masks a metric off must simply not read it (every existing caller uses
+/// [`Self::ALL`], for which `None` keeps its original "this query failed"
+/// meaning).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PipelineMetrics {
+    /// Open issues labeled `loom:issue`.
+    pub queued: bool,
+    /// Open issues labeled `loom:building`.
+    pub building: bool,
+    /// Open PRs labeled `loom:review-requested`.
+    pub review_requested: bool,
+    /// Open PRs labeled `loom:changes-requested`.
+    pub changes_requested: bool,
+    /// Open PRs labeled `loom:pr`.
+    pub approved: bool,
+    /// PRs merged inside the configured window.
+    pub merged: bool,
+}
+
+impl PipelineMetrics {
+    /// Every metric — the historical (and default) behavior.
+    pub const ALL: Self = Self {
+        queued: true,
+        building: true,
+        review_requested: true,
+        changes_requested: true,
+        approved: true,
+        merged: true,
+    };
+
+    /// The two metrics `loom-daemon health` needs: queue depth and merge
+    /// throughput. Two `gh` calls per repo instead of six keeps the one-shot
+    /// health command inside its "< 5s typical" budget on a multi-repo fleet.
+    pub const HEALTH: Self = Self {
+        queued: true,
+        building: false,
+        review_requested: false,
+        changes_requested: false,
+        approved: false,
+        merged: true,
+    };
+}
+
+impl Default for PipelineMetrics {
+    fn default() -> Self {
+        Self::ALL
+    }
+}
+
+/// The default merge-throughput window — the 24h the `merged_24h` field is
+/// named for, and what every pre-#4761 caller gets.
+pub const DEFAULT_MERGE_WINDOW_HOURS: i64 = 24;
+
+/// A `gh`-backed [`PipelineSource`]. Runs up to six `gh` invocations per repo
+/// (one per requested metric — see [`PipelineMetrics`]) scoped to that repo's
+/// own working directory so `gh` auto-detects the remote — same convention as
 /// [`crate::work_finder::forge::GhWorkSource::for_root`]. `--limit 500` is
 /// generous headroom over the default `gh` page size of 30, which would
 /// otherwise silently undercount a busy repo's queue.
 pub struct GhPipelineSource {
     gh_bin: PathBuf,
+    metrics: PipelineMetrics,
+    merge_window: chrono::Duration,
 }
 
 impl GhPipelineSource {
-    /// Construct a source using `gh` from `PATH`.
+    /// Construct a source using `gh` from `PATH`, fetching every metric over
+    /// the default 24h merge window.
     #[must_use]
     pub fn new() -> Self {
         Self {
             gh_bin: PathBuf::from("gh"),
+            metrics: PipelineMetrics::ALL,
+            merge_window: chrono::Duration::hours(DEFAULT_MERGE_WINDOW_HOURS),
         }
     }
 
@@ -115,6 +179,26 @@ impl GhPipelineSource {
     #[must_use]
     pub fn with_gh_bin(mut self, bin: PathBuf) -> Self {
         self.gh_bin = bin;
+        self
+    }
+
+    /// Restrict which metrics are fetched (Issue #4761). Unrequested metrics
+    /// are left `None`.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: PipelineMetrics) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    /// Override the merge-throughput window (Issue #4761) — the window
+    /// [`RepoPipelineSnapshot::merged_24h`] is counted over. A non-positive
+    /// window is ignored (the default 24h is kept) rather than producing a
+    /// `merged:>=<future>` query that always returns zero.
+    #[must_use]
+    pub fn with_merge_window(mut self, window: chrono::Duration) -> Self {
+        if window > chrono::Duration::zero() {
+            self.merge_window = window;
+        }
         self
     }
 
@@ -139,10 +223,10 @@ impl GhPipelineSource {
         Ok(rows.len())
     }
 
-    /// The `merged:>=<RFC3339>` search qualifier for "merged in the last 24h",
+    /// The `merged:>=<RFC3339>` search qualifier for "merged inside `window`",
     /// computed from `now`. A separate function so tests can pin the clock.
-    fn merged_since_query(now: chrono::DateTime<chrono::Utc>) -> String {
-        let since = now - chrono::Duration::hours(24);
+    fn merged_since_query(now: chrono::DateTime<chrono::Utc>, window: chrono::Duration) -> String {
+        let since = now - window;
         format!("merged:>={}", since.format("%Y-%m-%dT%H:%M:%SZ"))
     }
 }
@@ -172,82 +256,94 @@ impl PipelineSource for GhPipelineSource {
             }
         };
 
-        snap.queued = record(self.count(
-            root,
-            &[
-                "issue",
-                "list",
-                "--state",
-                "open",
-                "--label",
-                "loom:issue",
-                "--json",
-                "number",
-                "--limit",
-                "500",
-            ],
-        ));
-        snap.building = record(self.count(
-            root,
-            &[
-                "issue",
-                "list",
-                "--state",
-                "open",
-                "--label",
-                "loom:building",
-                "--json",
-                "number",
-                "--limit",
-                "500",
-            ],
-        ));
-        snap.review_requested = record(self.count(
-            root,
-            &[
-                "pr",
-                "list",
-                "--state",
-                "open",
-                "--label",
-                "loom:review-requested",
-                "--json",
-                "number",
-                "--limit",
-                "500",
-            ],
-        ));
-        snap.changes_requested = record(self.count(
-            root,
-            &[
-                "pr",
-                "list",
-                "--state",
-                "open",
-                "--label",
-                "loom:changes-requested",
-                "--json",
-                "number",
-                "--limit",
-                "500",
-            ],
-        ));
-        snap.approved = record(self.count(
-            root,
-            &[
-                "pr", "list", "--state", "open", "--label", "loom:pr", "--json", "number",
-                "--limit", "500",
-            ],
-        ));
+        if self.metrics.queued {
+            snap.queued = record(self.count(
+                root,
+                &[
+                    "issue",
+                    "list",
+                    "--state",
+                    "open",
+                    "--label",
+                    "loom:issue",
+                    "--json",
+                    "number",
+                    "--limit",
+                    "500",
+                ],
+            ));
+        }
+        if self.metrics.building {
+            snap.building = record(self.count(
+                root,
+                &[
+                    "issue",
+                    "list",
+                    "--state",
+                    "open",
+                    "--label",
+                    "loom:building",
+                    "--json",
+                    "number",
+                    "--limit",
+                    "500",
+                ],
+            ));
+        }
+        if self.metrics.review_requested {
+            snap.review_requested = record(self.count(
+                root,
+                &[
+                    "pr",
+                    "list",
+                    "--state",
+                    "open",
+                    "--label",
+                    "loom:review-requested",
+                    "--json",
+                    "number",
+                    "--limit",
+                    "500",
+                ],
+            ));
+        }
+        if self.metrics.changes_requested {
+            snap.changes_requested = record(self.count(
+                root,
+                &[
+                    "pr",
+                    "list",
+                    "--state",
+                    "open",
+                    "--label",
+                    "loom:changes-requested",
+                    "--json",
+                    "number",
+                    "--limit",
+                    "500",
+                ],
+            ));
+        }
+        if self.metrics.approved {
+            snap.approved = record(self.count(
+                root,
+                &[
+                    "pr", "list", "--state", "open", "--label", "loom:pr", "--json", "number",
+                    "--limit", "500",
+                ],
+            ));
+        }
 
-        let search = Self::merged_since_query(chrono::Utc::now());
-        snap.merged_24h = record(self.count(
-            root,
-            &[
-                "pr", "list", "--state", "merged", "--search", &search, "--json", "number",
-                "--limit", "500",
-            ],
-        ));
+        if self.metrics.merged {
+            let search = Self::merged_since_query(chrono::Utc::now(), self.merge_window);
+            snap.merged_24h = record(self.count(
+                root,
+                &[
+                    "pr", "list", "--state", "merged", "--search", &search, "--json", "number",
+                    "--limit", "500",
+                ],
+            ));
+        }
 
         snap.error = first_err;
         snap
@@ -580,7 +676,61 @@ esac
         let now = chrono::DateTime::parse_from_rfc3339("2026-07-27T12:00:00Z")
             .unwrap()
             .with_timezone(&chrono::Utc);
-        let query = GhPipelineSource::merged_since_query(now);
+        let query = GhPipelineSource::merged_since_query(now, chrono::Duration::hours(24));
         assert_eq!(query, "merged:>=2026-07-26T12:00:00Z");
+    }
+
+    #[test]
+    fn merged_since_query_honors_a_custom_window() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-27T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let query = GhPipelineSource::merged_since_query(now, chrono::Duration::minutes(30));
+        assert_eq!(query, "merged:>=2026-07-27T11:30:00Z");
+    }
+
+    #[test]
+    fn a_non_positive_merge_window_keeps_the_default() {
+        let source = GhPipelineSource::new().with_merge_window(chrono::Duration::zero());
+        assert_eq!(source.merge_window, chrono::Duration::hours(24));
+        let source = GhPipelineSource::new().with_merge_window(chrono::Duration::minutes(-5));
+        assert_eq!(source.merge_window, chrono::Duration::hours(24));
+    }
+
+    /// The #4761 cost control: the HEALTH mask must issue exactly the two `gh`
+    /// calls it needs, not all six — the whole reason the mask exists.
+    #[test]
+    #[serial]
+    fn health_metrics_mask_fetches_only_queued_and_merged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let calls = tmp.path().join("calls.log");
+        let gh = write_fake_gh(
+            tmp.path(),
+            &format!("echo \"$*\" >> {}\necho '[{{\"number\":1}}]'", calls.display()),
+        );
+
+        let source = GhPipelineSource::new()
+            .with_gh_bin(gh)
+            .with_metrics(PipelineMetrics::HEALTH);
+        let snap = source.fetch(tmp.path());
+
+        assert_eq!(snap.queued, Some(1));
+        assert_eq!(snap.merged_24h, Some(1));
+        assert_eq!(snap.building, None);
+        assert_eq!(snap.review_requested, None);
+        assert_eq!(snap.changes_requested, None);
+        assert_eq!(snap.approved, None);
+        assert!(snap.is_complete());
+
+        let log = std::fs::read_to_string(&calls).unwrap();
+        assert_eq!(log.lines().count(), 2, "exactly two gh calls, got:\n{log}");
+        assert!(log.contains("loom:issue"));
+        assert!(log.contains("--state merged"));
+        assert!(!log.contains("loom:building"));
+    }
+
+    #[test]
+    fn default_metrics_mask_is_all() {
+        assert_eq!(PipelineMetrics::default(), PipelineMetrics::ALL);
     }
 }

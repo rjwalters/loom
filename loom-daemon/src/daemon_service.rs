@@ -119,6 +119,12 @@ pub(crate) async fn run_daemon() -> Result<()> {
             // `status` connects to the running daemon over its Unix socket, so
             // it needs the async runtime (unlike the other sync subcommands).
             Commands::Status { json, pipeline } => handle_status_command(json, pipeline).await,
+            // `health` (#4761) needs the async runtime for the same reason
+            // `status` does — one IPC round-trip — plus a bounded forge fan-out
+            // for the queue-depth/throughput sections.
+            Commands::Health { since, json } => {
+                cli::health::handle_health_command(since, json).await
+            }
             // `quarantine` connects to the running daemon over its Unix socket
             // (the quarantine state is in-memory), so it needs the async runtime.
             Commands::Quarantine { action } => handle_quarantine_command(action).await,
