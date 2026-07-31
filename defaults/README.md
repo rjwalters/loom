@@ -4,14 +4,21 @@ This directory contains default configuration files and templates for Loom works
 
 ## Structure
 
-- `config.json` - Default configuration for new workspaces
-- `roles/` - System prompt templates for different terminal roles
-- `CLAUDE.md` - AI development context template (copied to workspace root)
+- `config.json` - Default configuration for new workspaces (version 2 schema)
+- `config/` - Additional config data (e.g. `skill-routes.json`)
+- `roles/` - Role definitions (`<role>.md` prompt + `<role>.json` metadata)
+- `docs/` - Reference docs installed to `.loom/docs/`
+- `scripts/` - Helper scripts installed to `.loom/scripts/`
+- `hooks/` - Guard hooks installed to `.loom/hooks/`
+- `runtimes/` - Runtime adapter manifests
+- `optional/` - Opt-in extras (e.g. GitHub workflow templates)
+- `.loom/CLAUDE.md` - AI development context template (copied to workspace root as `CLAUDE.md`)
 - `.claude/` - Claude Code configuration template (copied to workspace root)
 - `.github/` - GitHub labels and issue templates (copied to workspace root)
   - `ISSUE_TEMPLATE/task.yml` - Development task template
   - `ISSUE_TEMPLATE/config.yml` - Issue template configuration
 - `.loom-README.md` - README template for `.loom/` directory
+- `loom.sh` / `package.json` / `.loom-internal.list` - Install plumbing
 
 ## Purpose
 
@@ -105,89 +112,20 @@ This is intentional: defaults/ are distribution templates, the root files are th
 
 ### `config.json`
 
-```json
-{
-  "nextAgentNumber": 4,
-  "agents": [
-    {
-      "id": "1",
-      "name": "Shell",
-      "status": "idle",
-      "isPrimary": true
-    },
-    {
-      "id": "2",
-      "name": "Worker 1",
-      "status": "idle",
-      "isPrimary": false,
-      "role": "claude-code-worker",
-      "roleConfig": {
-        "workerType": "claude",
-        "roleFile": "worker.md",
-        "targetInterval": 300000,
-        "intervalPrompt": "Continue working on open tasks"
-      }
-    }
-  ]
-}
-```
+`config.json` uses the version 2 daemon schema: top-level blocks for `forge`,
+`runtimes`, `safehouse`, `health_monitoring`, `reflection`, `autonomous`, and
+friends, plus the `terminals` array (per-agent role/model). The committed
+`defaults/config.json` is the authoritative example of the structure; the full
+reference for the `autonomous` block and daemon behavior is
+[`.loom/docs/daemon-reference.md`](docs/daemon-reference.md), and `buildGate` /
+`runtimes` / guard-hook options are documented in the docs linked from the root
+`CLAUDE.md` Configuration section.
 
-#### Top-level Fields
+### Role Prompts
 
-- `nextAgentNumber` (number): Counter for naming new agents (Worker 1, Worker 2, etc.)
-  - Increments with each new agent
-  - Persists across app restarts
-  - Independent per workspace
-
-- `agents` (array): List of terminal configurations
-  - Each agent represents a terminal with its configuration
-  - IDs are unique identifiers (can be UUIDs or simple numbers)
-  - One agent should have `isPrimary: true` (the default selected terminal)
-
-#### Agent Fields
-
-**Required:**
-- `id` (string): Unique identifier for the terminal
-- `name` (string): Display name shown in UI
-- `status` (string): Current terminal status - "idle" | "busy" | "needs_input" | "error" | "stopped"
-- `isPrimary` (boolean): Whether this is the default terminal shown on workspace load
-
-**Optional (for worker terminals):**
-- `role` (string): Worker type - `undefined` (plain shell) | "claude-code-worker" | "codex-worker"
-- `roleConfig` (object): Configuration specific to the worker role
-
-#### Role Configuration (`roleConfig`)
-
-When `role` is set to "claude-code-worker" or "codex-worker", the following fields are available:
-
-- `workerType` (string): AI provider - "claude" | "codex"
-  - "claude": Uses Claude Code (Anthropic)
-  - "codex": Uses OpenAI Codex
-
-- `roleFile` (string): Filename of the system prompt in `.loom/roles/`
-  - Example: "worker.md", "issues.md", "reviewer.md"
-  - Prompt files support `{{workspace}}` template variable (replaced with workspace path)
-  - See `roles/` directory for available prompt templates
-
-- `targetInterval` (number): Milliseconds between autonomous worker invocations
-  - `0`: Autonomous mode disabled (manual interaction only)
-  - `300000`: Worker runs every 5 minutes (recommended default)
-  - Must be > 0 to enable autonomous operation
-
-- `intervalPrompt` (string): Message sent to worker at each interval
-  - Only used when `targetInterval > 0`
-  - Example: "Continue working on open tasks"
-  - Can be a simple nudge or specific instruction
-
-### System Prompts
-
-System prompts are stored as markdown files in `.loom/roles/`:
-
-- **`default.md`** - Plain shell environment
-- **`worker.md`** - General development worker
-- **`issues.md`** - GitHub issue creation specialist
-- **`reviewer.md`** - Code review specialist
-- **`architect.md`** - System architecture and design
-- **`curator.md`** - Issue maintenance and enhancement
-
-You can create custom prompt files by adding `.md` files to `.loom/roles/` in your workspace. All prompt files will automatically appear in the Terminal Settings dropdown.
+Role prompts live as markdown files in `roles/` (installed to `.loom/roles/`),
+one `<role>.md` prompt plus an optional `<role>.json` metadata file per role:
+Builder, Judge, Champion, Curator, Architect, Hermit, Doctor, Guide, Driver,
+Auditor, and the `loom.md` daemon-operator surface. See `roles/README.md` for
+the catalog and how to add a custom role (`.loom/roles/<name>.md` in a
+workspace).

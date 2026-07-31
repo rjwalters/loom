@@ -40,8 +40,6 @@ Starts the daemon in the background silently and stores its PID.
 Usage:
 ```bash
 ./scripts/start-daemon.sh
-# or
-pnpm run daemon:start
 ```
 
 ### stop-daemon.sh
@@ -74,8 +72,6 @@ sleep 1
 Usage:
 ```bash
 ./scripts/restart-daemon.sh
-# or
-pnpm run daemon:restart
 ```
 
 ## Integration with pnpm
