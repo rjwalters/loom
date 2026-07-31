@@ -1213,10 +1213,13 @@ make (the `DaemonStatus` round-trip stays a fast, network-free read). The
 managed repo, fetched *after* the IPC round-trip completes:
 
 - **Counts** — for each root in `report.per_repo` (already priority-ordered):
-  open `loom:issue` (queued), open `loom:building` (claimed), open PRs by
-  `loom:review-requested` / `loom:changes-requested` / `loom:pr`, and PRs
-  merged in the last 24h (`gh pr list --state merged --search
-  "merged:>=<24h-ago RFC3339>"`).
+  open, dispatchable `loom:issue` rows (queued — `gh issue list --search
+  "is:open label:loom:issue -label:loom:blocked -label:loom:operator-only"`,
+  excluding every `work_finder::PARK_LABELS` park label so `queued` matches
+  the work-finder's own admission definition, #4825), open `loom:building`
+  (claimed), open PRs by `loom:review-requested` / `loom:changes-requested` /
+  `loom:pr`, and PRs merged in the last 24h (`gh pr list --state merged
+  --search "merged:>=<24h-ago RFC3339>"`).
 - **Module** — `loom_daemon::pipeline_snapshot`: `PipelineSource` is the forge
   abstraction (mirrors `work_finder::WorkSource` / `GhWorkSource`),
   `GhPipelineSource` is the `gh`-backed implementation (six `gh` invocations

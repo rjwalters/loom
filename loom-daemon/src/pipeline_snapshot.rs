@@ -8,9 +8,10 @@
 //! queries the daemon's IPC handler deliberately does *not* make (it stays a
 //! fast, network-free round-trip). This module is the client-side (CLI-only,
 //! opt-in via `--pipeline`) counterpart: for each managed-workspace root it
-//! counts open `loom:issue` (queued), open `loom:building` (claimed), open
-//! PRs by `loom:review-requested` / `loom:changes-requested` / `loom:pr`, and
-//! PRs merged in the last 24h.
+//! counts open dispatchable `loom:issue` rows (queued — park-labeled rows
+//! excluded, see [`RepoPipelineSnapshot::queued`]), open `loom:building`
+//! (claimed), open PRs by `loom:review-requested` / `loom:changes-requested`
+//! / `loom:pr`, and PRs merged in the last 24h.
 //!
 //! # Resilience
 //!
@@ -45,7 +46,11 @@ pub struct RepoPipelineSnapshot {
     /// The workspace root this line describes (matches
     /// [`crate::types::RepoStatus::root`] for the same repo).
     pub root: PathBuf,
-    /// Open issues labeled `loom:issue` — queued, not yet claimed.
+    /// Open issues labeled `loom:issue` — queued, not yet claimed, and
+    /// **dispatchable**: rows also carrying a park label
+    /// (`crate::work_finder::PARK_LABELS` — `loom:blocked` /
+    /// `loom:operator-only`) are excluded, mirroring the work-finder's own
+    /// admission check (Issue #4825).
     pub queued: Option<usize>,
     /// Open issues labeled `loom:building` — claimed, in progress.
     pub building: Option<usize>,
@@ -103,7 +108,8 @@ struct NumberRow {
 /// meaning).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PipelineMetrics {
-    /// Open issues labeled `loom:issue`.
+    /// Open, dispatchable `loom:issue` rows (park-labeled rows excluded —
+    /// see [`RepoPipelineSnapshot::queued`]).
     pub queued: bool,
     /// Open issues labeled `loom:building`.
     pub building: bool,
@@ -229,6 +235,25 @@ impl GhPipelineSource {
         let since = now - window;
         format!("merged:>={}", since.format("%Y-%m-%dT%H:%M:%SZ"))
     }
+
+    /// The `--search` query for the `queued` metric: open `loom:issue` rows
+    /// that are actually **dispatchable** — i.e. excluding every park label
+    /// in [`crate::work_finder::PARK_LABELS`] (Issue #4825).
+    ///
+    /// `gh issue list --label` ANDs its label flags together with no
+    /// negation syntax, so a plain `--label loom:issue` count includes
+    /// `loom:blocked`/`loom:operator-only` rows the work-finder would never
+    /// admit — `queued` and "the work-finder considers this repo to have
+    /// ready work" silently diverged. `--search` supports `-label:` negation,
+    /// so this is built from `PARK_LABELS` (not a re-listed literal) so the
+    /// two definitions can never drift apart again.
+    fn queued_search_query() -> String {
+        let mut query = "is:open label:loom:issue".to_string();
+        for label in crate::work_finder::PARK_LABELS {
+            query.push_str(&format!(" -label:{label}"));
+        }
+        query
+    }
 }
 
 impl Default for GhPipelineSource {
@@ -257,19 +282,11 @@ impl PipelineSource for GhPipelineSource {
         };
 
         if self.metrics.queued {
+            let search = Self::queued_search_query();
             snap.queued = record(self.count(
                 root,
                 &[
-                    "issue",
-                    "list",
-                    "--state",
-                    "open",
-                    "--label",
-                    "loom:issue",
-                    "--json",
-                    "number",
-                    "--limit",
-                    "500",
+                    "issue", "list", "--search", &search, "--json", "number", "--limit", "500",
                 ],
             ));
         }
@@ -576,7 +593,7 @@ mod tests {
             tmp.path(),
             r#"
 case "$*" in
-  *"--label loom:issue "*)
+  *"--search is:open label:loom:issue"*)
     echo '[{"number":1},{"number":2},{"number":3}]'
     ;;
   *"--label loom:building"*)
@@ -626,7 +643,7 @@ esac
             tmp.path(),
             r#"
 case "$*" in
-  *"--label loom:issue "*)
+  *"--search is:open label:loom:issue"*)
     echo "boom: not authenticated" 1>&2
     exit 1
     ;;
@@ -732,5 +749,55 @@ esac
     #[test]
     fn default_metrics_mask_is_all() {
         assert_eq!(PipelineMetrics::default(), PipelineMetrics::ALL);
+    }
+
+    // ===================================================================
+    // queued_search_query — #4825
+    // ===================================================================
+
+    /// The `queued` query must exclude every label in
+    /// `work_finder::PARK_LABELS` so `queued` matches the work-finder's own
+    /// definition of dispatchable — the core #4825 fix.
+    #[test]
+    fn queued_search_query_excludes_every_park_label() {
+        let query = GhPipelineSource::queued_search_query();
+        assert!(query.contains("is:open"));
+        assert!(query.contains("label:loom:issue"));
+        for label in crate::work_finder::PARK_LABELS {
+            assert!(
+                query.contains(&format!("-label:{label}")),
+                "expected '-label:{label}' in query: {query}"
+            );
+        }
+    }
+
+    /// A row that is `loom:issue` *and* park-labeled must not be counted
+    /// toward `queued` — exercised end-to-end against a fake `gh` that
+    /// mimics `--search`'s label-negation semantics.
+    #[test]
+    #[serial]
+    fn gh_pipeline_source_excludes_park_labeled_rows_from_queued() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gh = write_fake_gh(
+            tmp.path(),
+            r#"
+case "$*" in
+  *"--search is:open label:loom:issue -label:loom:blocked -label:loom:operator-only"*)
+    echo '[{"number":1},{"number":2}]'
+    ;;
+  *)
+    echo '[]'
+    ;;
+esac
+"#,
+        );
+
+        let source = GhPipelineSource::new()
+            .with_gh_bin(gh)
+            .with_metrics(PipelineMetrics::HEALTH);
+        let snap = source.fetch(tmp.path());
+
+        assert_eq!(snap.queued, Some(2), "the fake gh only matches the fully-negated query");
+        assert!(snap.is_complete());
     }
 }
