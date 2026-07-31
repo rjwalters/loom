@@ -48,3 +48,81 @@ export function hostHealthEnvelope(overrides: Partial<Record<string, unknown>> =
     },
   };
 }
+
+/** Build a minimal, valid `sweep.phase` envelope for a batch fixture. */
+export function sweepPhaseEnvelope(overrides: Partial<Record<string, unknown>> = {}): Record<string, unknown> {
+  return {
+    schema_version: 1,
+    emitted_at: "2026-07-30T12:03:20Z",
+    host_id: "host-abc",
+    record: {
+      kind: "sweep.phase",
+      repo: "rjwalters/loom",
+      visibility: "public",
+      issue: 4703,
+      sweep_id: "sweep-issue-4703-0",
+      phase: "builder",
+      entered_at: "2026-07-30T12:03:20Z",
+      ...overrides,
+    },
+  };
+}
+
+/** Build a minimal, valid `sweep.completed` envelope for a batch fixture. */
+export function sweepCompletedEnvelope(overrides: Partial<Record<string, unknown>> = {}): Record<string, unknown> {
+  return {
+    schema_version: 1,
+    emitted_at: "2026-07-30T12:08:32Z",
+    host_id: "host-abc",
+    record: {
+      kind: "sweep.completed",
+      repo: "rjwalters/loom",
+      visibility: "public",
+      issue: 4703,
+      sweep_id: "sweep-issue-4703-0",
+      completed_at: "2026-07-30T12:08:32Z",
+      result: "success",
+      ...overrides,
+    },
+  };
+}
+
+/** Build a minimal, valid `sweep.outcome` envelope for a batch fixture. */
+export function sweepOutcomeEnvelope(overrides: Partial<Record<string, unknown>> = {}): Record<string, unknown> {
+  return {
+    schema_version: 1,
+    emitted_at: "2026-07-30T12:08:32Z",
+    host_id: "host-abc",
+    record: {
+      kind: "sweep.outcome",
+      repo: "rjwalters/loom",
+      visibility: "public",
+      issue: 4703,
+      sweep_id: "sweep-issue-4703-0",
+      model: "opus",
+      effort: "high",
+      config: { runtime: "claude" },
+      phase_durations: [{ phase: "builder", duration_sec: 340 }],
+      total_duration_sec: 512,
+      result: "success",
+      pr_number: 4710,
+      ...overrides,
+    },
+  };
+}
+
+/** Build a minimal, valid `tokens.snapshot` envelope for a batch fixture
+ * (host-level — no `repo`/`visibility`). */
+export function tokensSnapshotEnvelope(overrides: Partial<Record<string, unknown>> = {}): Record<string, unknown> {
+  return {
+    schema_version: 1,
+    emitted_at: "2026-07-30T12:00:00Z",
+    host_id: "host-abc",
+    record: {
+      kind: "tokens.snapshot",
+      captured_at: "2026-07-30T12:00:00Z",
+      accounts: [{ account: "agent-1", rank: 0, usage_fraction: 0.42, exhausted: false }],
+      ...overrides,
+    },
+  };
+}
