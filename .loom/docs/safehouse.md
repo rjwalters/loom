@@ -66,6 +66,7 @@ Env overrides (each wins over config for that key):
 | `LOOM_SAFEHOUSE_PERSONA` | `persona` |
 | `LOOM_SAFEHOUSE_ROOM_SIGNAL` | `rooms.signal` (#4225) |
 | `LOOM_SAFEHOUSE_ROOMS_BY_REPO` | `rooms.byRepo`, as `repo=room[,repo=room…]` (#4225) |
+| `LOOM_SAFEHOUSE_ROOM_CLAIMS` | `rooms.claims` — dedicated peer-claim coordination room (#4713) |
 
 **Socket resolution**: configured `socket` → `$LOOM_SAFEHOUSE_SOCKET` →
 `$SAFEHOUSED_SOCKET`. If none resolves, narration logs one `warn!` and stays off.
@@ -89,6 +90,9 @@ class first, repo second**:
       "loom": "!DeF…:example.org",
       "vibesql": "!GhI…:example.org"
     }
+    // "claims": "!JkL…:example.org"         // optional: dedicated peer-claim
+                                               // coordination room (#4713) —
+                                               // see "Which room claim ads ride" below
   }
 }
 ```
@@ -153,8 +157,10 @@ alias it asked for).
   `signal` id (or leave a real `room` for it to fall back to) — otherwise
   narration stops with the send-rejected status described below, which names the
   fix. See the troubleshooting entry.
-- **Peer-claim ads stay on the signal room** — the one deliberate exception to
-  "signal-only". See the peer-claim section below for why.
+- **Peer-claim ads default to the signal room** — the one deliberate exception
+  to "signal-only" — unless an operator opts into a dedicated `rooms.claims`
+  room (#4713). See the peer-claim section below for why, and for the
+  cross-host provisioning requirement that comes with opting in.
 
 New template keys reach existing consumer configs via the installer deep-merge
 (template is the base, existing values win) — no migration needed. The tier
@@ -766,11 +772,12 @@ coordination shrinks that window:
 - **Event taxonomy.** The internal pub/sub topic taxonomy is frozen; peer claims
   add **no new bus topic** — they travel entirely over the safehouse room.
 
-### Which room claim ads ride: the signal room (#4225's resolved open question)
+### Which room claim ads ride: the signal room by default, opt-in dedicated room (#4225, #4713)
 
 A claim ad is a `task` envelope carrying per-repo machine chatter, so the
-attention-class table would put it in the repo firehose. It stays on the **signal
-room** instead — the one deliberate exception to "the signal room is signal-only":
+attention-class table would put it in the repo firehose. By default it rides the
+**signal room** instead — the one deliberate exception to "the signal room is
+signal-only":
 
 1. **The signal room is the only room with guaranteed common membership.** Firehose
    rooms are created **lazily** by whichever host narrates that repo first, and
@@ -781,17 +788,70 @@ room** instead — the one deliberate exception to "the signal room is signal-on
    host's bot is already in the signal room.
 2. **Dedup is correctness; room hygiene is cosmetics.** A missed ad costs a
    duplicate cross-host sweep (wasted tokens, two PRs for one issue); a little
-   machine JSON in the signal room costs some scroll. Correctness wins, and ads
-   are low volume (one per dispatch / terminal outcome, plus the #4431 re-ad).
+   machine JSON in the signal room costs some scroll. Correctness wins, and this
+   is why the dedicated-room escape hatch below is opt-in rather than the new
+   default.
 3. **The reader agrees with the writer by construction.** The coordination task's
    inbound handler is unfiltered — it folds *any* inbound line with a parseable
-   `loom_claim` body into the view — so keeping the write side on the signal room
-   makes the pair trivially consistent instead of dependent on which rooms this
-   host's bot happens to have joined.
+   `loom_claim` body into the view — so keeping the write side and the read side
+   on the same resolved room makes the pair trivially consistent instead of
+   dependent on which rooms this host's bot happens to have joined.
 
-A dedicated coordination room (a third tier) is the clean long-term fix and is
-left as a follow-up: like the tier-3 Matrix Space, it needs cross-host
-*provisioning*, not just routing.
+**The volume problem (#4713).** Ads are low volume per dispatch/terminal outcome,
+but `sweep_registry::readvertise_peer_claims` re-publishes every **live** sweep's
+claim on every 30-second reaper tick — deliberately, to stay under the
+peer-claim TTL; this is a liveness requirement, not a bug, so it cannot simply be
+slowed down. At fleet scale (several sweeps in flight) that heartbeat cadence is
+enough to flood the human-facing signal room with near-identical machine
+messages, burying genuine sweep-lifecycle narration.
+
+**The fix: `rooms.claims` (opt-in, default-unchanged).** An operator who finds
+the heartbeat traffic disruptive can set `rooms.claims` (or
+`LOOM_SAFEHOUSE_ROOM_CLAIMS`) to route claim advertise/retract traffic into a
+**dedicated coordination room**, separate from both the signal room and the
+per-repo firehose:
+
+```jsonc
+"safehouse": {
+  "enabled": true,
+  "rooms": {
+    "signal": "!AbC…:example.org",
+    "claims": "!JkL…:example.org"   // peer-claim heartbeats route here instead
+  }
+}
+```
+
+- **Resolution**: `rooms.claims` when set, else `rooms.signal` (which itself
+  falls back to the legacy scalar `room`) — `SafehouseConfig::claims_room()`
+  mirrors `signal_room()`'s own fallback chain one level down.
+- **Absent (the default) is byte-identical to pre-#4713 behavior**: claim ads
+  keep riding the signal room exactly as before. This is not merely convenient —
+  it is the safe default, because of the provisioning caveat below.
+- **This is provisioning, not just routing** — the reason #4225 deferred this in
+  the first place. Setting `rooms.claims` to a room only some hosts' bots have
+  joined reproduces the exact silent cross-host dedup failure reason 1 above
+  exists to avoid: a host whose bot is not a member of the configured claims
+  room silently stops seeing peers' advertisements, with no error anywhere.
+  **Before setting `rooms.claims`, ensure every host's safehoused bot is already
+  joined to that room** — the identical requirement already documented for
+  `rooms.signal`.
+- The narration sink is unaffected: `run_sink`'s attention-class routing
+  (signal / per-repo firehose) keeps using `signal_room()`/`RoomRouter` exactly
+  as before. Only the peer-claim coordination connection
+  (`run_coordination`/`spawn_peer_coordination`) resolves `claims_room()`.
+  This holds even for a **claims-only** map (`rooms.claims` set with no
+  `rooms.signal`/`rooms.byRepo`): attention-class narration routing gates on a
+  narration target (`signal` and/or `byRepo`), so a claims-only map keeps
+  narration in byte-identical single-room mode — never lazily creating per-repo
+  firehose rooms as a side effect. `rooms.claims` and narration routing are
+  independent knobs.
+- The inbound reader is unchanged and remains **room-agnostic**: it folds any
+  parseable `loom_claim` line regardless of which room delivered it, so this
+  change is purely about which room this daemon *writes into* — receipt-side
+  filtering (teaching the separate `rjwalters/safehouse` server to mark
+  `loom_claim` envelopes as ephemeral coordination traffic that never surfaces
+  in a human-facing feed) is tracked as a **separate, out-of-scope, cross-repo
+  follow-up**, not implemented here.
 
 ### Soft claim, NOT a mutex (the load-bearing caveat)
 
