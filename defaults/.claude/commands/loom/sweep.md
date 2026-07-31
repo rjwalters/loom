@@ -764,11 +764,13 @@ This section exists because `/loom:sweep` was originally hardened (#3373 checkpo
 Run this **exactly once**, before anything else:
 
 ```bash
-RUN_ID=$(./.loom/scripts/sweep-run-registry.sh new)
+RUN_ID=$(./.loom/scripts/sweep-run-registry.sh new --pid "$PPID")
 echo "sweep run id: $RUN_ID"
 ```
 
-`sweep-run-registry.sh new` generates a portable (macOS/Linux, no `uuidgen`) run id combining a UTC timestamp + PID + random suffix (e.g. `sweep-20260722T231500Z-84213-a3f9c1`), and registers it under `.loom/sweep-run/<RUN_ID>.json` (gitignored) with a liveness PID (the orchestrator `$PPID`) for peer detection.
+`sweep-run-registry.sh new` generates a portable (macOS/Linux, no `uuidgen`) run id combining a UTC timestamp + PID + random suffix (e.g. `sweep-20260722T231500Z-84213-a3f9c1`), and registers it under `.loom/sweep-run/<RUN_ID>.json` (gitignored) with a liveness PID for peer detection.
+
+**`--pid "$PPID"` is load-bearing, not decoration (#4691).** `$PPID` expanded *here* — in the tool-call shell — is the long-lived orchestrator (`claude -p /loom:sweep …`) that spans the whole sweep. The tool-call shell itself is a fresh one-shot `<shell> -c …` process that is reaped the moment this Bash block returns, so recording *it* would mark this run dead within seconds of registration; the very next peer scan would then prune this run's registry entry and delete its `main-clean-baseline-<RUN_ID>.txt` mid-sweep (and, because the entry vanishes before the baseline is written, orphan that baseline forever). Passing `$PPID` explicitly also makes the recovery lookup below — which matches on `$PPID` — actually find this entry. `sweep-run-registry.sh` resolves the same orchestrator PID itself when `--pid` is omitted, so an older installed copy of this skill still behaves correctly.
 
 **Treat the printed `RUN_ID` as a fixed literal for the entire rest of this sweep.** Thread it — as that literal string — into every `--task-id "$RUN_ID"` checkpoint write and into the main-clean baseline path below. Do **NOT** regenerate it per Bash tool call, and do **NOT** fall back to `sweep-$$` (that is the exact bug this fixes: `$$` is a fresh subshell PID on every tool call). If you ever lose track of the literal mid-sweep, recover it from the registry rather than minting a new one:
 
@@ -785,6 +787,8 @@ At sweep completion (or abort), remove this run's registry entry:
 `cleanup` removes **both** RUN_ID-keyed transients of this run: the registry entry `.loom/sweep-run/<RUN_ID>.json` and the main-clean baseline `.loom/sweep-checkpoint/main-clean-baseline-<RUN_ID>.txt` (#4450 — before that, baselines accumulated forever).
 
 This is best-effort cleanup — a dead run's entry *and* baseline are also pruned automatically by any later sweep's peer scan (dead-PID liveness check), so a crash that skips cleanup never leaves a permanent false-positive. The bulk backstop for a run whose peer scan never happens is `loom-daemon clean`, which prunes baselines of non-live runs older than 48h plus checkpoints of closed issues.
+
+Both pruners bias toward **keeping** a transient when liveness is ambiguous (#4691): a `kill(pid, 0)` that fails with `EPERM` means the process *exists* but is not signallable by the pruning caller, so only `ESRCH` ("no such process") authorizes deletion. A never-pruned baseline is a bounded, harmless leak; a baseline deleted under a live sweep silently disables the #3648 contamination-subtraction backstop for the rest of that run.
 
 ### Step 0b: Peer-`/loom:sweep` detection (loud, NON-BLOCKING)
 
