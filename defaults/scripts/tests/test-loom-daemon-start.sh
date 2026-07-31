@@ -22,6 +22,12 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 START_SCRIPT="$(cd "$SCRIPT_DIR/../cli" && pwd)/loom-daemon-start.sh"
 
+# Background-PID bookkeeping (#4773): the `sleep 30 &` decoys below stand in
+# for a real daemon MainPID and are tracked here so the EXIT/INT/TERM trap can
+# reap them even if this suite is interrupted before its own inline `kill`.
+# shellcheck source=lib/bg-proc-trap.sh
+source "$SCRIPT_DIR/lib/bg-proc-trap.sh"
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 NC='\033[0m'
@@ -46,7 +52,18 @@ assert_eq() {
 
 # ---------- fixture ----------
 WORKDIR="$(mktemp -d)"
-trap 'rm -rf "$WORKDIR"' EXIT
+# bg_proc_reap kills the `sleep 30 &` decoys tracked via bg_proc_track below
+# (their argv never references $WORKDIR, so a path-pattern pkill would miss
+# them); the pkill backstop catches any real nohup'd fake-daemon process this
+# suite starts (BG_FAKE_BIN / SH_BG_FAKE_BIN both live under $WORKDIR, so
+# their argv always matches). EXIT/INT/TERM (not just EXIT, #4773) so a hard
+# interruption of this suite still reaps every tracked/backstopped process.
+# NOTE: a bare `trap CMD EXIT INT TERM` runs CMD on INT/TERM but does NOT stop
+# the script (only an EXIT-trap firing auto-exits) -- the explicit `exit`
+# below is required, else a SIGTERM'd suite would clean up once and then keep
+# running every remaining test case (re-populating $WORKDIR as it goes).
+trap 'bg_proc_reap; pkill -f "$WORKDIR" >/dev/null 2>&1; rm -rf "$WORKDIR"' EXIT
+trap 'bg_proc_reap; pkill -f "$WORKDIR" >/dev/null 2>&1; rm -rf "$WORKDIR"; exit 1' INT TERM
 mkdir -p "$WORKDIR/.loom/logs"
 
 FAKE_BIN="$WORKDIR/fake-loom-daemon"
@@ -318,6 +335,7 @@ EOF
 #     from `systemctl --user show -p MainPID`. A real sleeper stands in for the
 #     daemon MainPID so the liveness check (kill -0) passes.
 sleep 30 & SD_MAIN_SLEEP_PID=$!
+bg_proc_track "$SD_MAIN_SLEEP_PID"
 SD_LOG="$WORKDIR/sd-enable.log"; : > "$SD_LOG"
 make_sd_stub "$SD_LOG" "$SD_MAIN_SLEEP_PID"
 SD_HOME="$(mktemp -d)"; mkdir -p "$SD_HOME/.loom/logs"
@@ -413,6 +431,7 @@ EOF
 #      (not the service) is enable --now'd, and LOOM_WATCHDOG_INTERVAL_SECS
 #      drives BOTH OnUnitActiveSec and OnBootSec.
 sleep 30 & WD_MAIN_SLEEP_PID=$!
+bg_proc_track "$WD_MAIN_SLEEP_PID"
 WD_LOG="$WORKDIR/sd-watchdog.log"; : > "$WD_LOG"
 make_sd_stub_wd "$WD_LOG" "$WD_MAIN_SLEEP_PID" "0"
 WD_HOME="$(mktemp -d)"; mkdir -p "$WD_HOME/.loom/logs"
@@ -471,6 +490,7 @@ rm -rf "$WD_HOME"
 # WD2. Provisioning failure (stub enable --now on the timer exits 1) is a
 #      WARNING, never a failed daemon start.
 sleep 30 & WD2_MAIN_SLEEP_PID=$!
+bg_proc_track "$WD2_MAIN_SLEEP_PID"
 WD2_LOG="$WORKDIR/sd-watchdog-fail.log"; : > "$WD2_LOG"
 make_sd_stub_wd "$WD2_LOG" "$WD2_MAIN_SLEEP_PID" "1"
 WD2_HOME="$(mktemp -d)"; mkdir -p "$WD2_HOME/.loom/logs"
@@ -910,6 +930,7 @@ fi
 #       actually carries the key.
 : > "$DEK_SD_LOG"
 sleep 30 & DEK_SD_PID1=$!
+bg_proc_track "$DEK_SD_PID1"
 ( cd "$WORKDIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
     PATH="$DEK_SD_BIN:$PATH" HOME="$DEK_SD_HOME" \
     LOOM_SYSTEMD_FORCE=1 LOOM_SYSTEMD_UNIT="$DEK_SD_UNIT" \
@@ -934,6 +955,7 @@ else
 fi
 
 sleep 30 & DEK_SD_PID2=$!
+bg_proc_track "$DEK_SD_PID2"
 dek6_out=$( cd "$WORKDIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE -u LOOM_SAFEHOUSE_ENABLED \
     PATH="$DEK_SD_BIN:$PATH" HOME="$DEK_SD_HOME" \
     LOOM_SYSTEMD_FORCE=1 LOOM_SYSTEMD_UNIT="$DEK_SD_UNIT" \
@@ -967,6 +989,7 @@ fi
 
 # DEK7. --force-env suppresses the warning on the real install path too.
 sleep 30 & DEK_SD_PID3=$!
+bg_proc_track "$DEK_SD_PID3"
 ( cd "$WORKDIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
     PATH="$DEK_SD_BIN:$PATH" HOME="$DEK_SD_HOME" \
     LOOM_SYSTEMD_FORCE=1 LOOM_SYSTEMD_UNIT="$DEK_SD_UNIT" \
@@ -981,6 +1004,7 @@ if [[ -f "$DEK_SD_HOME/.loom/.daemon.pid" ]]; then
     rm -f "$DEK_SD_HOME/.loom/.daemon.pid"
 fi
 sleep 30 & DEK_SD_PID4=$!
+bg_proc_track "$DEK_SD_PID4"
 dek7_out=$( cd "$WORKDIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE -u LOOM_SAFEHOUSE_ENABLED \
     PATH="$DEK_SD_BIN:$PATH" HOME="$DEK_SD_HOME" \
     LOOM_SYSTEMD_FORCE=1 LOOM_SYSTEMD_UNIT="$DEK_SD_UNIT" \
@@ -1243,6 +1267,7 @@ AD8_LOG="$WORKDIR/ad8-install.log"; : > "$AD8_LOG"
 
 # Install the "prior" unit with LOOM_WORK_FINDER=1.
 sleep 30 & AD8_SLEEP_PID1=$!
+bg_proc_track "$AD8_SLEEP_PID1"
 make_sd_stub "$AD8_LOG" "$AD8_SLEEP_PID1"
 env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
     PATH="$SD_BIN:$PATH" HOME="$AD8_HOME" LOOM_SYSTEMD_FORCE=1 LOOM_SYSTEMD_UNIT="$AD_SD_UNIT" \
@@ -1259,6 +1284,7 @@ rm -f "$AD8_HOME/.loom/.daemon.pid"
 #      "prior-plist-had-work-finder + plain restart -> warning emitted",
 #      systemd sibling.
 sleep 30 & AD8_SLEEP_PID2=$!
+bg_proc_track "$AD8_SLEEP_PID2"
 make_sd_stub "$AD8_LOG" "$AD8_SLEEP_PID2"
 ad8_out=$( cd "$WORKDIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
     PATH="$SD_BIN:$PATH" HOME="$AD8_HOME" LOOM_SYSTEMD_FORCE=1 LOOM_SYSTEMD_UNIT="$AD_SD_UNIT" \

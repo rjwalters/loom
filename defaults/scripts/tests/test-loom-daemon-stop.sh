@@ -25,6 +25,14 @@ STOP_SCRIPT="$(cd "$SCRIPT_DIR/../cli" && pwd)/loom-daemon-stop.sh"
 # shellcheck source=lib/launchd-sandbox.sh
 source "$SCRIPT_DIR/lib/launchd-sandbox.sh"
 
+# Background-PID bookkeeping (#4773): every `sleep 30 &` decoy this suite
+# backgrounds as a stand-in "live daemon" for STOP_SCRIPT to kill is tracked
+# here too — each test already falls back to an inline `kill -9` when the
+# stop-under-test assertion fails, but that fallback (like the DECOY_PID
+# tracking above) never runs if the suite itself is interrupted first.
+# shellcheck source=lib/bg-proc-trap.sh
+source "$SCRIPT_DIR/lib/bg-proc-trap.sh"
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 NC='\033[0m'
@@ -68,7 +76,16 @@ WORKDIR="$(mktemp -d)"
 # tier and leave this decoy alive. If ANY test in this suite regresses into a
 # by-name kill, this decoy dies and the final assertion fails loudly.
 DECOY_PID="$(launchd_sandbox_spawn_decoy "$WORKDIR")"
-trap 'kill "$DECOY_PID" 2>/dev/null; rm -rf "$WORKDIR"' EXIT
+bg_proc_track "$DECOY_PID"
+# bg_proc_reap kills every `sleep 30 &` decoy tracked via bg_proc_track below;
+# EXIT/INT/TERM (not just EXIT, #4773) so a hard interruption of this suite
+# still reaps them, not only the individual tests' own inline `kill` calls.
+# NOTE: a bare `trap CMD EXIT INT TERM` runs CMD on INT/TERM but does NOT stop
+# the script (bash only auto-exits after an EXIT-trap firing, not an INT/TERM
+# one) -- without the explicit `exit` below, a SIGTERM'd suite would clean up
+# once and then keep executing every remaining test, re-populating $WORKDIR.
+trap 'bg_proc_reap; rm -rf "$WORKDIR"' EXIT
+trap 'bg_proc_reap; rm -rf "$WORKDIR"; exit 1' INT TERM
 mkdir -p "$WORKDIR/.loom"
 
 # ---------- tests ----------
@@ -90,6 +107,7 @@ fi
 SLEEP_PID_FILE="$WORKDIR/.loom/.daemon.pid"
 ( sleep 30 & echo $! > "$SLEEP_PID_FILE" )
 sleep_pid=$(cat "$SLEEP_PID_FILE")
+bg_proc_track "$sleep_pid"
 ( cd "$WORKDIR" && LOOM_LAUNCHD_LABEL="$FAKE_LABEL" LOOM_DAEMON_STOP_GRACE_SECS=2 bash "$STOP_SCRIPT" >/dev/null 2>&1 )
 rc2=$?
 assert_eq "0" "$rc2" "live pid: stop exits 0"
@@ -114,6 +132,7 @@ fi
 # 3. --force skips the grace window (SIGKILL immediately).
 ( sleep 30 & echo $! > "$SLEEP_PID_FILE" )
 sleep_pid2=$(cat "$SLEEP_PID_FILE")
+bg_proc_track "$sleep_pid2"
 start_ts=$(date +%s)
 ( cd "$WORKDIR" && LOOM_LAUNCHD_LABEL="$FAKE_LABEL" bash "$STOP_SCRIPT" --force >/dev/null 2>&1 )
 end_ts=$(date +%s)
@@ -174,8 +193,10 @@ FAKE
     # Original daemon (killed by the stop) + a separate live "relaunched" daemon.
     ( sleep 30 & echo $! > "$SLEEP_PID_FILE" )
     orig_pid=$(cat "$SLEEP_PID_FILE")
+    bg_proc_track "$orig_pid"
     sleep 30 &
     relaunch_pid=$!
+    bg_proc_track "$relaunch_pid"
 
     stuck_out=$( cd "$WORKDIR" && PATH="$FAKE_BIN_DIR:$PATH" RELAUNCH_PID="$relaunch_pid" \
         LOOM_LAUNCHD_LABEL="$FAKE_LABEL" LOOM_DAEMON_STOP_GRACE_SECS=2 bash "$STOP_SCRIPT" 2>&1 )
@@ -320,6 +341,7 @@ fi
 printf 'started_at=x\n' > "$MARKER"
 ( sleep 30 & echo $! > "$WORKDIR/.loom/.daemon.pid" )
 live_pid=$(cat "$WORKDIR/.loom/.daemon.pid")
+bg_proc_track "$live_pid"
 ( cd "$WORKDIR" && LOOM_LAUNCHD_LABEL="$FAKE_LABEL" LOOM_AUTONOMY_MARKER="$MARKER" \
     LOOM_DAEMON_STOP_GRACE_SECS=2 bash "$STOP_SCRIPT" >/dev/null 2>&1 )
 kill -9 "$live_pid" 2>/dev/null || true
@@ -482,6 +504,7 @@ NON_REPO_DIR="$(mktemp -d)"
 
 ( sleep 30 & echo $! > "$MACHINE_HOME/.loom/.daemon.pid" )
 machine_pid=$(cat "$MACHINE_HOME/.loom/.daemon.pid")
+bg_proc_track "$machine_pid"
 out_machine=$( cd "$NON_REPO_DIR" && HOME="$MACHINE_HOME" LOOM_MACHINE_CHECKOUT="$MACHINE_CHECKOUT" \
     LOOM_LAUNCHD_LABEL="$FAKE_LABEL" LOOM_DAEMON_STOP_GRACE_SECS=2 bash "$STOP_SCRIPT" 2>&1 )
 rc_machine=$?

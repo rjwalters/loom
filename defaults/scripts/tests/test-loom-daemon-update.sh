@@ -79,6 +79,13 @@ UPDATE_SCRIPT="$CLI_DIR/loom-daemon-update.sh"
 source "$SCRIPT_DIR/lib/launchd-sandbox.sh"
 export LOOM_LAUNCHD_LABEL="$(launchd_sandbox_new_label)"
 
+# Background-PID bookkeeping (#4773): every fake-daemon/decoy process this
+# suite backgrounds is tracked here so the EXIT/INT/TERM trap below can reap
+# it even if the parent test process is interrupted before its own inline
+# cleanup runs.
+# shellcheck source=lib/bg-proc-trap.sh
+source "$SCRIPT_DIR/lib/bg-proc-trap.sh"
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 NC='\033[0m'
@@ -521,12 +528,26 @@ chmod +x "$DECOY_DIR/loom-daemon"
 # output — the same command-substitution gotcha the sandbox spawner avoids).
 "$DECOY_DIR/loom-daemon" >/dev/null 2>&1 &
 DECOY_PID=$!
+bg_proc_track "$DECOY_PID"
 
 # Best-effort cleanup of any fake-daemon processes left running (matched by
 # their script path under $BASE_WORKDIR, which appears in `ps`'s command
 # line) — individual tests also kill their own PIDs explicitly, this is a
-# backstop for anything a failed assertion left behind.
-trap 'kill "$DECOY_PID" 2>/dev/null; pkill -f "$BASE_WORKDIR" >/dev/null 2>&1; rm -rf "$BASE_WORKDIR" "$DECOY_DIR"' EXIT
+# backstop for anything a failed assertion left behind. bg_proc_reap kills
+# every PID tracked via bg_proc_track (the W5/W15/W26-style sandbox fixtures
+# below track their own spawned PIDs directly rather than relying solely on
+# the pkill pattern-match); EXIT/INT/TERM (not just EXIT, #4773) so a hard
+# interruption of this suite still reaps every tracked/backstopped process.
+# NOTE: a bare `trap CMD EXIT INT TERM` runs CMD on INT/TERM but does NOT stop
+# the script (only an EXIT-trap firing auto-exits) -- the explicit `exit`
+# below is required, else a SIGTERM'd suite would clean up once and then keep
+# running every remaining (numbered W*) test case, re-populating
+# $BASE_WORKDIR as it goes (observed directly while verifying this fix: an
+# untrapped-exit version of this trap let a SIGTERM'd run limp all the way to
+# a later scenario, which then hit a real, un-stubbed `cargo build --release`
+# once its own fixture dir had already been rm -rf'd out from under it).
+trap 'bg_proc_reap; pkill -f "$BASE_WORKDIR" >/dev/null 2>&1; rm -rf "$BASE_WORKDIR" "$DECOY_DIR"' EXIT
+trap 'bg_proc_reap; pkill -f "$BASE_WORKDIR" >/dev/null 2>&1; rm -rf "$BASE_WORKDIR" "$DECOY_DIR"; exit 1' INT TERM
 
 FAKE_BIN_DIR="$BASE_WORKDIR/fakebin"
 mkdir -p "$FAKE_BIN_DIR"
@@ -632,6 +653,7 @@ echo "--work-finder" > "$W5/.loom/.daemon.flags"
 # record its PID, exactly like loom-daemon-start.sh would have.
 "$INSTALLED5" >/dev/null 2>&1 &
 old_pid=$!
+bg_proc_track "$old_pid"
 sleep 0.3
 echo "$old_pid" > "$W5/.loom/.daemon.pid"
 TESTS_RUN=$((TESTS_RUN + 1))
@@ -712,6 +734,7 @@ write_fake_daemon "$NEW_FAKE5B" "$HEAD5B" "$W5B/new-marker"
 
 "$INSTALLED5B" >/dev/null 2>&1 &
 old_pid5b=$!
+bg_proc_track "$old_pid5b"
 sleep 0.3
 echo "$old_pid5b" > "$W5B/.loom/.daemon.pid"
 
@@ -863,6 +886,7 @@ write_fake_daemon "$NEW_FAKE7" "$HEAD7" "$W7/new-marker"
 
 "$INSTALLED7" >/dev/null 2>&1 &
 old_pid7=$!
+bg_proc_track "$old_pid7"
 sleep 0.3
 echo "$old_pid7" > "$W7/.loom/.daemon.pid"
 
@@ -1143,6 +1167,7 @@ echo "--work-finder" > "$W15/.loom/.daemon.flags"
 # #4232 poll requires a live pid (kill -0), not just a differing number.
 sleep 60 >/dev/null 2>&1 &
 RELAUNCHED_PID15=$!
+bg_proc_track "$RELAUNCHED_PID15"
 LD_BIN15="$W15/launchd-bin"
 write_fake_launchd_loaded_bin "$LD_BIN15" "$W15/launchctl.log" "$RESTART_MARKER15" "$RELAUNCHED_PID15"
 
@@ -1276,6 +1301,7 @@ fi
 # (b) LOOM_DAEMON_LAUNCHD=0 + live pid file -> manager: PID-file/nohup.
 "$INSTALLED17" >/dev/null 2>&1 &
 pid17=$!
+bg_proc_track "$pid17"
 sleep 0.3
 echo "$pid17" > "$W17/.loom/.daemon.pid"
 check_pid_out=$( cd "$W17" && PATH="$TEST_PATH" LOOM_DAEMON_LAUNCHD=0 \
@@ -1941,8 +1967,10 @@ write_fake_daemon_restart "$NEW_FAKE35" "$HEAD35" "$RESTART_MARKER35" 0
 
 sleep 60 >/dev/null 2>&1 &
 OLD_PID26=$!
+bg_proc_track "$OLD_PID26"
 sleep 60 >/dev/null 2>&1 &
 KICKSTART_PID35=$!
+bg_proc_track "$KICKSTART_PID35"
 STATE35="$W35/launchd-pid-state"
 echo "$OLD_PID26" > "$STATE35"
 LD_BIN35="$W35/launchd-bin"
@@ -2001,6 +2029,7 @@ write_fake_daemon_restart "$NEW_FAKE36" "$HEAD36" "$RESTART_MARKER36" 0
 
 sleep 60 >/dev/null 2>&1 &
 OLD_PID27=$!
+bg_proc_track "$OLD_PID27"
 STATE36="$W36/launchd-pid-state"
 echo "$OLD_PID27" > "$STATE36"
 LD_BIN36="$W36/launchd-bin"

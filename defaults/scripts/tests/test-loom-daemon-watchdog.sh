@@ -24,6 +24,12 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WATCHDOG="$(cd "$SCRIPT_DIR/../cli" && pwd)/loom-daemon-watchdog.sh"
 
+# Background-PID bookkeeping (#4773): every `sleeper` (line ~113) and the
+# `sleep 60` kickstart decoy (below) is tracked here so the EXIT/INT/TERM trap
+# can reap it even if this suite is interrupted before its own inline `kill`.
+# shellcheck source=lib/bg-proc-trap.sh
+source "$SCRIPT_DIR/lib/bg-proc-trap.sh"
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 NC='\033[0m'
@@ -40,7 +46,15 @@ assert_rc() { # <expected> <actual> <msg>
 }
 
 WORKDIR="$(mktemp -d)"
-trap 'rm -rf "$WORKDIR"' EXIT
+# bg_proc_reap kills every sleeper()/decoy PID tracked via bg_proc_track;
+# EXIT/INT/TERM (not just EXIT, #4773) so a hard interruption of this suite
+# still reaps them, not only the individual tests' own inline `kill` calls.
+# NOTE: a bare `trap CMD EXIT INT TERM` runs CMD on INT/TERM but does NOT stop
+# the script (only an EXIT-trap firing auto-exits) -- the explicit `exit`
+# below is required, else a SIGTERM'd suite would clean up once and then keep
+# running every remaining test case.
+trap 'bg_proc_reap; rm -rf "$WORKDIR"' EXIT
+trap 'bg_proc_reap; rm -rf "$WORKDIR"; exit 1' INT TERM
 
 MARKER="$WORKDIR/autonomy-desired"
 HEARTBEAT="$WORKDIR/daemon.heartbeat"
@@ -186,6 +200,7 @@ LIVE_PID=""
 start_alive_and_fresh() { # <pid_file_suffix>
     PS_STUB_DIR="$(make_ps_stub "02:00:00")"
     LIVE_PID=$(sleeper)
+    bg_proc_track "$LIVE_PID"
     echo "$LIVE_PID" > "$WORKDIR/pid$1"
     write_marker "$WORKDIR/pid$1" 60
     printf '%s pid=%s ts=now\n' "$(date +%s)" "$LIVE_PID" > "$HEARTBEAT"
@@ -211,6 +226,7 @@ if log_has DIVERGENCE || log_hasi "mismatch"; then fail "marker absent + nothing
 # ===================================================================
 rm -f "$MARKER" "$HEARTBEAT" "$WDLOG"
 live_pid=$(sleeper)
+bg_proc_track "$live_pid"
 echo "$live_pid" > "$WORKDIR/.daemon.pid"
 run_watchdog
 kill "$live_pid" 2>/dev/null || true
@@ -231,6 +247,7 @@ rm -f "$WORKDIR/.daemon.pid"
 # 2. Intent present, daemon ALIVE, heartbeat FRESH ⇒ silent OK.
 # ===================================================================
 live_pid=$(sleeper)
+bg_proc_track "$live_pid"
 echo "$live_pid" > "$WORKDIR/pidA"
 write_marker "$WORKDIR/pidA" 60
 printf '%s pid=%s ts=now\n' "$(date +%s)" "$live_pid" > "$HEARTBEAT"
@@ -250,6 +267,7 @@ assert_rc 0 "$RC" "alive + fresh heartbeat: exits 0"
 # ===================================================================
 PS_STUB3="$(make_ps_stub "02:00:00")"
 live_pid=$(sleeper)
+bg_proc_track "$live_pid"
 echo "$live_pid" > "$WORKDIR/pidB"
 write_marker "$WORKDIR/pidB" 60
 printf 'old\n' > "$HEARTBEAT"
@@ -270,6 +288,7 @@ rm -rf "$PS_STUB3"
 # ===================================================================
 PS_STUB3B="$(make_ps_stub "00:00:05")"
 live_pid=$(sleeper)
+bg_proc_track "$live_pid"
 echo "$live_pid" > "$WORKDIR/pidB2"
 write_marker "$WORKDIR/pidB2" 60
 printf 'old\n' > "$HEARTBEAT"
@@ -294,7 +313,7 @@ rm -rf "$PS_STUB3B"
 # 4. Intent present, daemon DEAD ⇒ DIVERGENCE (expected but not running).
 #    This IS the #4011 outage, reproduced.
 # ===================================================================
-dead_pid=$(sleeper); kill "$dead_pid" 2>/dev/null; wait "$dead_pid" 2>/dev/null
+dead_pid=$(sleeper); bg_proc_track "$dead_pid"; kill "$dead_pid" 2>/dev/null; wait "$dead_pid" 2>/dev/null
 echo "$dead_pid" > "$WORKDIR/pidC"
 write_marker "$WORKDIR/pidC" 60
 printf 'x\n' > "$HEARTBEAT"
@@ -312,6 +331,7 @@ fi
 #    (heartbeat disabled or not yet written — do NOT false-report.)
 # ===================================================================
 live_pid=$(sleeper)
+bg_proc_track "$live_pid"
 echo "$live_pid" > "$WORKDIR/pidD"
 write_marker "$WORKDIR/pidD" 60
 rm -f "$HEARTBEAT"
@@ -325,6 +345,7 @@ assert_rc 0 "$RC" "alive + no heartbeat file: exits 0 (liveness-only, no false p
 #    just under the default 300s threshold is NOT reported (no flapping).
 # ===================================================================
 live_pid=$(sleeper)
+bg_proc_track "$live_pid"
 echo "$live_pid" > "$WORKDIR/pidE"
 write_marker "$WORKDIR/pidE" 60
 printf 'x\n' > "$HEARTBEAT"
@@ -341,6 +362,7 @@ assert_rc 0 "$RC" "heartbeat 120s old < 300s threshold: not flagged (no flapping
 # ===================================================================
 PS_STUB7="$(make_ps_stub "00:01:00")"
 live_pid=$(sleeper)
+bg_proc_track "$live_pid"
 echo "$live_pid" > "$WORKDIR/pidF"
 write_marker "$WORKDIR/pidF" 60
 printf 'x\n' > "$HEARTBEAT"
@@ -400,6 +422,7 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
     : > "$STATE9"   # empty -> "not running" at check time
     sleep 60 >/dev/null 2>&1 &
     NEW_PID9=$!
+    bg_proc_track "$NEW_PID9"
     LOG9="$WORKDIR/launchctl9.log"
     : > "$LOG9"
     cat > "$STUB9/launchctl" <<EOF
