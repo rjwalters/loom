@@ -1297,12 +1297,35 @@ fi
 # Left empty on the nohup fallback tier (no rendered file exists there) -- the
 # autonomy-desired marker alone is the only available signal in that case
 # (see check_autonomy_downgrade_key above).
+#
+# The mechanism this comparison targets is chosen by the INVOCATION, not by the
+# host OS: --print-plist / --print-unit are pure inspection modes that render
+# (and inspect) their mechanism's file regardless of the platform running them,
+# exactly like the pre-existing --print-plist PATH-drift (#4172) and
+# dropped-env-key (#4522) checks below, which read
+# $HOME/Library/LaunchAgents/<label>.plist unconditionally. Gating this
+# resolution on USE_LAUNCHD (Darwin-only) instead made the whole downgrade
+# warning silently unreachable under --print-plist on any Linux host -- the
+# exact silence this check exists to eliminate. Only when NEITHER inspection
+# flag is set does platform detection pick the mechanism, which keeps the real
+# install path (and its nohup-tier "leave empty" contract) byte-identical.
+PRIOR_AUTONOMY_MECH=""
+if [[ "$PRINT_PLIST" == "true" ]]; then
+    PRIOR_AUTONOMY_MECH="launchd"
+elif [[ "$PRINT_UNIT" == "true" ]]; then
+    PRIOR_AUTONOMY_MECH="systemd"
+elif [[ "$USE_LAUNCHD" == "true" ]]; then
+    PRIOR_AUTONOMY_MECH="launchd"
+elif [[ "$IS_LINUX_SYSTEMD" == "true" ]]; then
+    PRIOR_AUTONOMY_MECH="systemd"
+fi
+
 PRIOR_AUTONOMY_FILE=""
 PRIOR_AUTONOMY_EXTRACTOR=""
-if [[ "$USE_LAUNCHD" == "true" ]]; then
+if [[ "$PRIOR_AUTONOMY_MECH" == "launchd" ]]; then
     PRIOR_AUTONOMY_FILE="$HOME/Library/LaunchAgents/$(resolve_launchd_label).plist"
     PRIOR_AUTONOMY_EXTRACTOR="extract_plist_env_value"
-elif [[ "$IS_LINUX_SYSTEMD" == "true" ]] && declare -f resolve_systemd_unit_path >/dev/null 2>&1; then
+elif [[ "$PRIOR_AUTONOMY_MECH" == "systemd" ]] && declare -f resolve_systemd_unit_path >/dev/null 2>&1; then
     PRIOR_AUTONOMY_FILE="$(resolve_systemd_unit_path 2>/dev/null || true)"
     PRIOR_AUTONOMY_EXTRACTOR="extract_systemd_env_value"
 fi

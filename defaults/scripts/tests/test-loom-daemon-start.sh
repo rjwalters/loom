@@ -1101,6 +1101,29 @@ else
     echo "  output: $ad1_out"
 fi
 
+# AD1b. Platform-independence regression (#4709 review): --print-plist is a pure
+#       INSPECTION mode, so the prior-plist comparison must resolve regardless of
+#       whether this host would actually use launchd -- exactly like the
+#       pre-existing --print-plist PATH-drift (#4172) / dropped-env-key (#4522)
+#       checks, which read $HOME/Library/LaunchAgents/<label>.plist
+#       unconditionally. LOOM_DAEMON_LAUNCHD=0 forces USE_LAUNCHD=false, which is
+#       the permanent state on every Linux host (incl. the CI runner): when the
+#       resolution was gated on USE_LAUNCHD, the whole warning was silently
+#       unreachable there -- the exact silence this feature exists to eliminate.
+ad1b_out=$( env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
+    HOME="$AD_HOME" LOOM_LAUNCHD_LABEL="$AD_LABEL" LOOM_DAEMON_BIN="$FAKE_BIN" \
+    LOOM_DAEMON_LAUNCHD=0 \
+    bash "$START_SCRIPT" --print-plist 2>&1 >/dev/null )
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$ad1b_out" | grep -qi 'autonomy downgrade' && echo "$ad1b_out" | grep -q 'LOOM_WORK_FINDER: 1 -> 0'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} autonomy downgrade (plist): --print-plist warns even when this host would NOT use launchd (platform-independent, #4693)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} autonomy downgrade (plist): --print-plist warns even when this host would NOT use launchd"
+    echo "  output: $ad1b_out"
+fi
+
 # AD2. --from-config is exempt entirely -- control is deliberately handed to
 #      .loom/config.json, so re-rendering FLAGS-OFF-equivalent (both vars left
 #      unset) after a WORK_FINDER=1 prior install must NOT warn.
