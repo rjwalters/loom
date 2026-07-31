@@ -35,15 +35,54 @@
 #      `<tool-use-id>` tag echoes the original dispatch id; only that event
 #      counts as resolution for a background Bash task.
 #   3. Assistant `Monitor` / `ScheduleWakeup` `tool_use` entries (issue #4462)
-#      whose dispatch id has no matching `<task-notification>...
-#      <tool-use-id>ID</tool-use-id>...` fired/resolved event later in the
-#      transcript. Like a background Bash task, arming a `Monitor` returns an
-#      IMMEDIATE `tool_result` ack ("timer armed") that is NOT the fire event —
-#      so it is matched against the same later `task-notification` echo, never
-#      the dispatch-time ack. This is the exact #4462 strand: a transport
-#      failure (529/Overloaded) handled by arming `Monitor {command:
-#      "sleep 90 && …"}` and ending the turn — in headless `-p` mode the timer
-#      has no session to wake, the process exits 0, and the sweep is orphaned.
+#      that are still armed — i.e. the transcript shows no later event that
+#      could have retired the timer. Like a background Bash task, arming a
+#      `Monitor` returns an IMMEDIATE `tool_result` ack that is NOT the fire
+#      event, so the dispatch-time ack is never treated as resolution. This is
+#      the exact #4462 strand: a transport failure (529/Overloaded) handled by
+#      arming `Monitor {command: "sleep 90 && …"}` and ending the turn — in
+#      headless `-p` mode the timer has no session to wake, the process exits
+#      0, and the sweep is orphaned.
+#
+#      Monitor resolution is keyed on the timer's TASK id, not its tool-use id
+#      (issue #4696 — the third transcript-format gap after #4482/#4462).
+#      Verified against live transcripts: a Monitor's fired-event
+#      `<task-notification>` carries ONLY `<task-id>` — it never emits the
+#      `<tool-use-id>` tag a background-Bash completion does. Matching Monitor
+#      dispatch ids against `<tool-use-id>` (the #4462 implementation) could
+#      therefore NEVER observe a resolution, so every Monitor ever armed
+#      re-blocked one stop per stop sequence for the rest of the session. The
+#      task id is recovered from the arming ack, whose two real shapes are:
+#        `Monitor started (task <ID>, timeout <N>ms). …`
+#        `Monitor started (task <ID>, persistent — runs until TaskStop or
+#         session end). …`
+#      A timer counts as retired when ANY of these appear for its task id:
+#        a. `TaskStop` — an assistant `tool_use` named `TaskStop` with
+#           `input.task_id == <ID>` (whose result is not a tool_use_error), or
+#           any `tool_result` text containing `Successfully stopped task: <ID>`.
+#        b. A fired `<task-notification>` whose `<task-id>` is `<ID>` (any
+#           status) — the timer was observed doing its job.
+#        c. Its own configured timeout elapsing: `timeout <N>ms` from the ack
+#           (else `input.timeout_ms` when not persistent) measured from the
+#           arming entry's `timestamp`. An expired timer cannot fire again, so
+#           it cannot be orphaned. A `persistent` Monitor has no timeout and is
+#           deliberately NOT retired this way — only (a) or (b) retire it.
+#        d. The arming call itself erroring (`tool_use_error` / `is_error`): no
+#           timer exists.
+#      All four are durable, append-only transcript facts, so a timer retired
+#      once stays retired on every later stop sequence in the same session — no
+#      hook-side state is needed and no re-flagging can occur.
+#      The legacy `<tool-use-id>` echo is still accepted as resolution for
+#      forward compatibility, for the case where no task id can be recovered.
+#
+#      `ScheduleWakeup` is the same detector but a DIFFERENT set of shapes: its
+#      ack is `Next wakeup scheduled for HH:MM:SS (in <N>s). …`, and a fired
+#      wakeup re-invokes the session rather than emitting a task-notification —
+#      it leaves no task id and no notification at all. It is therefore retired
+#      by `(in <N>s)` elapsing since the arming entry's timestamp, by a later
+#      `ScheduleWakeup {stop: true}` cancel (ack `Loop stopped — cancelled <N>
+#      pending wakeup(s); …`, which arms nothing itself), or by the arming call
+#      erroring (`` `prompt` is required when `stop` is not true. ``).
 #
 # In all three cases, this is a HEURISTIC over the transcript file, not a live
 # process check (no such live signal exists here), so it can have false
@@ -125,73 +164,169 @@ UNRESOLVED_TASK_IDS=$(jq -s -r '
   | ($task_ids - $result_ids) | .[]
 ' "$TRANSCRIPT_PATH" 2>/dev/null) || UNRESOLVED_TASK_IDS=""
 
-# Diff background-Bash dispatch ids (issue #4389) against ids echoed back in a
-# `<task-notification>...<tool-use-id>ID</tool-use-id>...` completion event.
-# Deliberately does NOT treat the immediate dispatch-time `tool_result` ack as
-# resolution (see header) — only a later task-notification counts.
+# Shared jq prelude for the background-Bash and Monitor detectors below.
 #
-# The completion `<task-notification>` for a background Bash task is NOT a
-# `type=="user"` message (issue #4482). Verified against live transcripts, the
-# harness writes it as one (or both) of these top-level entry shapes:
+# `texts` yields every transcript entry's notification-bearing STRING payload.
+# A completion `<task-notification>` is NOT a `type=="user"` message (issue
+# #4482). Verified against live transcripts, the harness writes it as one (or
+# both) of these top-level entry shapes:
 #   1. `{"type":"queue-operation", "content":"<task-notification>...</task-notification>", ...}`
 #      — the notification text is the top-level `.content` STRING field.
 #   2. `{"type":"attachment","attachment":{"commandMode":"task-notification",
 #      "prompt":"<task-notification>...</task-notification>"}, ...}`
 #      — the notification text is `.attachment.prompt`.
 # We scan all three shapes (both real ones above + the legacy `type=="user"`
-# string-content path, kept for forward/backward compatibility) and extract the
-# `<tool-use-id>ID</tool-use-id>` tag from whichever the harness emitted.
-UNRESOLVED_BG_IDS=$(jq -s -r '
-  [ .[]? | select(.type=="assistant") | .message.content[]?
-    | select(.type=="tool_use" and .name=="Bash" and (.input.run_in_background == true))
-    | .id ] as $bg_ids
-  | [ .[]?
-      | (
-          # shape 1: queue-operation, top-level .content string
-          ( select(.type=="queue-operation") | (.content? // empty) | select(type=="string") ),
-          # shape 2: attachment, .attachment.prompt string
-          ( select(.type=="attachment") | (.attachment.prompt? // empty) | select(type=="string") ),
-          # shape 3 (legacy/backcompat): user message.content (string or blocks)
-          ( select(.type=="user")
-            | .message.content as $c
-            | ( if ($c|type) == "string" then $c
-                else ($c[]? | (.content? // empty) | select(type=="string"))
-                end ) )
-        )
-      | (capture("<tool-use-id>(?<id>[^<]+)</tool-use-id>")?).id // empty
+# string-content path, kept for forward/backward compatibility).
+#
+# `stopped_task_ids` yields every TASK id the transcript shows as explicitly
+# stopped (issue #4696): from a `TaskStop` tool_use's `input.task_id` (unless
+# that call itself errored) and from any `tool_result` text containing the
+# harness's `Successfully stopped task: <ID>` confirmation. A stopped task
+# cannot be orphaned by ending the turn, so this retires both a Monitor timer
+# and a background Bash task.
+JQ_PRELUDE='
+def texts:
+  ( select(.type=="queue-operation") | (.content? // empty) | select(type=="string") ),
+  ( select(.type=="attachment") | (.attachment.prompt? // empty) | select(type=="string") ),
+  ( select(.type=="user")
+    | .message.content as $c
+    | ( if ($c|type) == "string" then $c
+        else ($c[]? | (.content? // empty) | select(type=="string"))
+        end ) );
+def entry_ts: ((.timestamp? // empty) | select(type=="string")
+               | (sub("\\.[0-9]+Z$";"Z") | fromdateiso8601? // empty));
+def results:
+  [ .[]? | select(.type=="user") | .message.content[]?
+    | select(.type=="tool_result")
+    | { id: (.tool_use_id // ""),
+        text: (.content | if type=="string" then . else tojson end),
+        err: (((.is_error? // false) == true)
+              or ((.content | tojson) | test("tool_use_error"))) } ];
+def notif_texts: [ .[]? | texts | select(test("<task-notification>")) ];
+def stopped_task_ids:
+  . as $t
+  | (results) as $r
+  | ( [ $t[]? | select(.type=="assistant") | .message.content[]?
+        | select(.type=="tool_use" and .name=="TaskStop")
+        | { id: (.id // ""), task: (.input.task_id? // null) }
+        | select(.task != null) ] ) as $stops
+  | ( [ $stops[]
+        | . as $s
+        | (($r | map(select(.id == $s.id)) | .[0]) // null) as $res
+        | select($res == null or ($res.err != true))
+        | $s.task ] )
+    + ( [ $r[] | ((.text | capture("Successfully stopped task: (?<v>[A-Za-z0-9_-]+)")?).v) // empty ] );
+'
+
+# Diff background-Bash dispatch ids (issue #4389) against ids echoed back in a
+# `<task-notification>...<tool-use-id>ID</tool-use-id>...` completion event.
+# Deliberately does NOT treat the immediate dispatch-time `tool_result` ack as
+# resolution (see header) — only a later task-notification counts. An
+# explicitly TaskStop'd background task also counts as resolved (#4696): its
+# task id comes from the same dispatch ack (`running in background with ID:
+# <ID>`) that is otherwise ignored.
+UNRESOLVED_BG_IDS=$(jq -s -r "$JQ_PRELUDE"'
+  . as $t
+  | (results) as $r
+  | (stopped_task_ids) as $stopped
+  | [ notif_texts[] | ((capture("<tool-use-id>(?<v>[^<]+)</tool-use-id>")?).v) // empty
     ] as $notified_ids
-  | ($bg_ids - $notified_ids) | .[]
+  | [ $t[]? | select(.type=="assistant") | .message.content[]?
+      | select(.type=="tool_use" and .name=="Bash" and (.input.run_in_background == true))
+      | .id ] as $bg_ids
+  | [ $bg_ids[]
+      | . as $id
+      | (($r | map(select(.id == $id)) | .[0]) // null) as $ack
+      | (if $ack == null then null
+         else ((($ack.text | capture("background with ID: (?<v>[A-Za-z0-9_-]+)")?).v) // null)
+         end) as $tid
+      | if (($notified_ids | index($id)) != null) then empty
+        elif ($tid != null and ($stopped | index($tid)) != null) then empty
+        else $id end
+    ] | .[]
 ' "$TRANSCRIPT_PATH" 2>/dev/null) || UNRESOLVED_BG_IDS=""
 
-# Diff armed Monitor / ScheduleWakeup dispatch ids (issue #4462) against the
-# same later `<task-notification>...<tool-use-id>ID</tool-use-id>...` fired/
-# resolved event used for background Bash. Arming a `Monitor` returns an
-# IMMEDIATE dispatch-time `tool_result` ack ("timer armed") that is NOT the
-# fire event, so — exactly like the background-Bash detector — the immediate
-# ack is deliberately NOT treated as resolution; only a later task-notification
-# echoing the dispatch id counts. An armed-but-unfired timer left as the only
-# pending work is the #4462 transport-failure strand: in headless `-p` mode the
-# turn end kills the process before the timer fires, exit 0 orphans the claim.
-UNRESOLVED_MONITOR_IDS=$(jq -s -r '
-  [ .[]? | select(.type=="assistant") | .message.content[]?
-    | select(.type=="tool_use" and (.name=="Monitor" or .name=="ScheduleWakeup"))
-    | .id ] as $monitor_ids
-  | [ .[]?
-      | (
-          # shape 1: queue-operation, top-level .content string
-          ( select(.type=="queue-operation") | (.content? // empty) | select(type=="string") ),
-          # shape 2: attachment, .attachment.prompt string
-          ( select(.type=="attachment") | (.attachment.prompt? // empty) | select(type=="string") ),
-          # shape 3 (legacy/backcompat): user message.content (string or blocks)
-          ( select(.type=="user")
-            | .message.content as $c
-            | ( if ($c|type) == "string" then $c
-                else ($c[]? | (.content? // empty) | select(type=="string"))
-                end ) )
-        )
-      | (capture("<tool-use-id>(?<id>[^<]+)</tool-use-id>")?).id // empty
-    ] as $notified_ids
-  | ($monitor_ids - $notified_ids) | .[]
+# Diff armed Monitor / ScheduleWakeup timers (issue #4462) against every event
+# that can retire one (issue #4696 — see the header for why `<tool-use-id>`
+# matching alone never worked here). The two tools have DIFFERENT arming acks
+# and therefore different retirement shapes; all of them, enumerated from live
+# transcripts, are handled below:
+#
+#   Monitor  "Monitor started (task <ID>, timeout <N>ms). …"
+#            "Monitor started (task <ID>, persistent — runs until TaskStop or
+#             session end). …"
+#     retired by: TaskStop of <ID>; a fired `<task-notification>` whose
+#     `<task-id>` is <ID>; `timeout <N>ms` elapsing since the arming entry's
+#     timestamp (a `persistent` Monitor has NO self-timeout and is retired only
+#     by TaskStop or a fired event); or the arming call erroring.
+#
+#   ScheduleWakeup  "Next wakeup scheduled for HH:MM:SS (in <N>s). Nothing more
+#                    to do this turn — the harness re-invokes you when the
+#                    wakeup fires or a task-notification arrives."
+#                   "Loop stopped — cancelled <N> pending wakeup(s); …"  (the
+#                    `{stop: true}` cancel call — arms nothing itself)
+#     retired by: `(in <N>s)` elapsing since the arming entry's timestamp (a
+#     fired wakeup re-invokes the session; it does not leave a task id or a
+#     notification), a LATER `{stop: true}` cancel (which cancels every pending
+#     wakeup), or the arming call erroring (e.g. "`prompt` is required when
+#     `stop` is not true.").
+#
+# An armed-but-unretired timer left as the only pending work is the #4462
+# transport-failure strand: in headless `-p` mode the turn end kills the process
+# before the timer fires, exit 0 orphans the claim.
+UNRESOLVED_MONITOR_IDS=$(jq -s -r "$JQ_PRELUDE"'
+  . as $t
+  | (results) as $r
+  | (notif_texts) as $n
+  | [ $n[] | ((capture("<task-id>(?<v>[^<]+)</task-id>")?).v) // empty ] as $notified_tasks
+  | [ $n[] | ((capture("<tool-use-id>(?<v>[^<]+)</tool-use-id>")?).v) // empty ] as $notified_tools
+  | (stopped_task_ids) as $stopped
+  # Entry indices of every ScheduleWakeup {stop:true} cancel; a cancel retires
+  # every wakeup armed BEFORE it.
+  | [ ($t | to_entries)[] | . as $e | select(.value.type=="assistant")
+      | .value.message.content[]?
+      | select(.type=="tool_use" and .name=="ScheduleWakeup"
+               and ((.input.stop? // false) == true))
+      | $e.key ] as $wake_cancels
+  | [ ($t | to_entries)[] | . as $e | select(.value.type=="assistant")
+      | .value.message.content[]?
+      | select(.type=="tool_use" and (.name=="Monitor" or .name=="ScheduleWakeup"))
+      | select((.input.stop? // false) != true)     # a {stop:true} call arms nothing
+      | { id: (.id // ""),
+          name: .name,
+          idx: $e.key,
+          at: (($e.value | entry_ts) // null),
+          cfg_timeout: (.input.timeout_ms? // null),
+          cfg_delay: (.input.delaySeconds? // null),
+          cfg_persistent: ((.input.persistent? // false) == true) } ] as $armed
+  | [ $armed[]
+      | . as $m
+      | (($r | map(select(.id == $m.id)) | .[0]) // null) as $ack
+      | (if $ack == null then "" else $ack.text end) as $txt
+      | if ($ack != null and $ack.err) then empty          # arm failed: no timer exists
+        elif ($txt | test("Loop stopped")) then empty      # cancel ack: nothing armed
+        else
+          ((($txt | capture("Monitor started \\(task (?<v>[A-Za-z0-9_-]+)")?).v) // null) as $tid
+        # Seconds until this timer retires itself, or null when it never does.
+        | (if ($txt | test("Monitor started \\(task [A-Za-z0-9_-]+, persistent"))
+             then null                                     # persistent: no self-timeout
+           elif ((($txt | capture("timeout (?<v>[0-9]+)ms")?).v) // null) != null
+             then (($txt | capture("timeout (?<v>[0-9]+)ms").v | tonumber) / 1000)
+           elif ((($txt | capture("\\(in (?<v>[0-9]+)s\\)")?).v) // null) != null
+             then ($txt | capture("\\(in (?<v>[0-9]+)s\\)").v | tonumber)
+           elif ($m.cfg_persistent | not) and $m.cfg_timeout != null
+             then ($m.cfg_timeout / 1000)
+           elif $m.cfg_delay != null then $m.cfg_delay
+           else null end) as $tmo
+        | if ($tid != null and ($stopped | index($tid)) != null) then empty
+          elif ($tid != null and ($notified_tasks | index($tid)) != null) then empty
+          elif (($notified_tools | index($m.id)) != null) then empty
+          elif ($tmo != null and $m.at != null and (now - $m.at) >= $tmo) then empty
+          elif ($m.name == "ScheduleWakeup"
+                and (($wake_cancels | map(select(. > $m.idx)) | length) > 0)) then empty
+          else $m.id end
+        end
+    ] | .[]
 ' "$TRANSCRIPT_PATH" 2>/dev/null) || UNRESOLVED_MONITOR_IDS=""
 
 [[ -n "$UNRESOLVED_TASK_IDS" || -n "$UNRESOLVED_BG_IDS" || -n "$UNRESOLVED_MONITOR_IDS" ]] || exit 0
@@ -203,7 +338,7 @@ BG_COUNT=0
 MONITOR_COUNT=0
 [[ -z "$UNRESOLVED_MONITOR_IDS" ]] || MONITOR_COUNT=$(printf '%s\n' "$UNRESOLVED_MONITOR_IDS" | grep -c . || true)
 
-REASON="STOP BLOCKED (guard-background-subagents.sh, issues #4257/#4389/#4462):"
+REASON="STOP BLOCKED (guard-background-subagents.sh, issues #4257/#4389/#4462/#4696):"
 if [[ "$TASK_COUNT" -gt 0 ]]; then
     REASON="${REASON} ${TASK_COUNT} dispatched Task subagent(s) have no observed completion in this transcript yet."
 fi
@@ -211,7 +346,7 @@ if [[ "$BG_COUNT" -gt 0 ]]; then
     REASON="${REASON} ${BG_COUNT} background Bash command(s) (run_in_background) have no completion notification in this transcript yet."
 fi
 if [[ "$MONITOR_COUNT" -gt 0 ]]; then
-    REASON="${REASON} ${MONITOR_COUNT} armed Monitor/ScheduleWakeup timer(s) have not fired in this transcript yet (issue #4462) -- a transport-failure backoff (529/Overloaded) MUST be retried inline in the same turn, or the orchestrator must exit NONZERO, never parked on an end-of-turn timer."
+    REASON="${REASON} ${MONITOR_COUNT} armed Monitor/ScheduleWakeup timer(s) are still live in this transcript -- no TaskStop, no fired task-notification, and no elapsed timeout for them (issues #4462/#4696) -- a transport-failure backoff (529/Overloaded) MUST be retried inline in the same turn, or the orchestrator must exit NONZERO, never parked on an end-of-turn timer. TaskStop each timer you no longer need."
 fi
 REASON="${REASON} In headless \`claude -p\` mode, ending this turn TERMINATES THE PROCESS and kills every still-running background child -- there is no 'it finishes after I stop talking'. Before writing a final message, you MUST explicitly await each dispatched subagent's completion (blocking TaskOutput / completion notification), each background Bash task's completion notification, and each armed Monitor/ScheduleWakeup timer's fire event -- see defaults/.claude/commands/loom/sweep.md, 'CRITICAL: Subagent dispatch is async-only' (#3822). If you are certain every subagent/background task/timer has actually finished (e.g. this is a false positive from a slow transcript flush), it is safe to stop again -- this guard blocks at most once per stop sequence."
 

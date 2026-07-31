@@ -26,6 +26,13 @@
 #     sequence over the same transcript (no one-shot/stateful matching)
 #   - outstanding background Bash task + stop_hook_active=true -> allow
 #     (loop guard applies identically)
+#   - Monitor resolution shapes (#4696): a fired <task-notification> keyed on
+#     <task-id> (Monitor notifications never carry <tool-use-id>), an explicit
+#     TaskStop naming the task id, the Monitor's own configured timeout
+#     elapsing, and a failed arming call all retire a timer -- while a
+#     persistent timer with no resolution signal, and a timeout that has not
+#     yet elapsed, still block. Retired timers are never re-flagged on a later
+#     stop sequence over the same transcript.
 #   - guards.backgroundSubagents / LOOM_GUARD_BACKGROUND_SUBAGENTS toggle
 #     (env beats config; config beats default-on)
 #   - jq absent -> allow (fail-open)
@@ -95,16 +102,69 @@ BG_NOTIFICATION_QUEUEOP='{"type":"queue-operation","operation":"enqueue","conten
 BG_NOTIFICATION_ATTACHMENT='{"type":"attachment","attachment":{"type":"queued_command","commandMode":"task-notification","prompt":"<task-notification>\n<task-id>bgtest02</task-id>\n<tool-use-id>toolu_bg02</tool-use-id>\n<output-file>/tmp/bgtest02.output</output-file>\n<status>completed</status>\n<summary>Background command completed (exit code 0)</summary>\n</task-notification>"}}'
 
 # Armed Monitor / ScheduleWakeup (issue #4462 — the transport-failure backoff
-# strand) fixtures. Arming a Monitor returns an IMMEDIATE tool_result ack
-# ("timer armed") that is NOT the fire event; the real fire arrives later as a
-# <task-notification> whose <tool-use-id> echoes the dispatch id — the same
-# resolution shape as a background Bash task.
-MON_USE_UNRESOLVED='{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_mon01","name":"Monitor","input":{"command":"sleep 90 && echo backoff-complete"}}]}}'
-MON_ACK_UNRESOLVED='{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_mon01","content":"Monitor armed. You will be notified when it fires."}]}}'
-MON_USE_RESOLVED='{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_mon02","name":"Monitor","input":{"command":"sleep 1 && echo done"}}]}}'
-MON_NOTIFICATION_QUEUEOP='{"type":"queue-operation","operation":"enqueue","content":"<task-notification>\n<task-id>montest02</task-id>\n<tool-use-id>toolu_mon02</tool-use-id>\n<status>fired</status>\n<summary>Monitor condition met</summary>\n</task-notification>"}'
+# strand) fixtures. Arming a Monitor returns an IMMEDIATE tool_result ack that
+# is NOT the fire event.
+#
+# CRITICAL (issue #4696): a Monitor's fired-event <task-notification> carries
+# ONLY <task-id> — verified against every live Monitor notification on a real
+# host, it NEVER emits the <tool-use-id> tag a background-Bash completion does.
+# The fixtures below therefore use the REAL harness shapes:
+#   - ack:          "Monitor started (task <ID>, timeout <N>ms). …"
+#                   "Monitor started (task <ID>, persistent — runs until TaskStop or session end). …"
+#   - fired event:  <task-notification><task-id><ID></task-id><summary>Monitor event: …</summary><event>…</event></task-notification>
+#   - TaskStop:     tool_use {name:"TaskStop", input:{task_id:"<ID>"}} +
+#                   tool_result '{"message":"Successfully stopped task: <ID> (…)","task_id":"<ID>",…}'
+# The pre-#4696 fixture synthesised a <tool-use-id> tag into the Monitor
+# notification, which re-confirmed the broken matcher exactly the way the
+# pre-#4482 background-Bash fixture did.
+
+# Persistent Monitor, armed and never retired -> genuinely still armed.
+MON_USE_UNRESOLVED='{"type":"assistant","timestamp":"2026-07-30T12:00:00.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_mon01","name":"Monitor","input":{"command":"sleep 90 && echo backoff-complete","persistent":true}}]}}'
+MON_ACK_UNRESOLVED='{"type":"user","timestamp":"2026-07-30T12:00:01.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_mon01","content":"Monitor started (task bmon0001, persistent — runs until TaskStop or session end). You will be notified on each event. Keep working — do not poll or sleep."}]}}'
+
+# Monitor that fires (real notification shape: <task-id> only, no <tool-use-id>).
+MON_USE_RESOLVED='{"type":"assistant","timestamp":"2026-07-30T12:00:00.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_mon02","name":"Monitor","input":{"command":"sleep 1 && echo done","persistent":true}}]}}'
+MON_ACK_RESOLVED='{"type":"user","timestamp":"2026-07-30T12:00:01.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_mon02","content":"Monitor started (task bmon0002, persistent — runs until TaskStop or session end). You will be notified on each event."}]}}'
+MON_NOTIFICATION_QUEUEOP='{"type":"queue-operation","operation":"enqueue","timestamp":"2026-07-30T12:05:00.000Z","content":"<task-notification>\n<task-id>bmon0002</task-id>\n<summary>Monitor event: \"backoff window elapsed\"</summary>\n<event>backoff-complete</event>\n</task-notification>"}'
+MON_NOTIFICATION_ATTACHMENT='{"type":"attachment","timestamp":"2026-07-30T12:05:00.000Z","attachment":{"type":"queued_command","commandMode":"task-notification","prompt":"<task-notification>\n<task-id>bmon0002</task-id>\n<summary>Monitor event: \"backoff window elapsed\"</summary>\n<event>backoff-complete</event>\n</task-notification>"}}'
+
+# TaskStop of the fired monitor (real tool_use + tool_result shapes).
+MON_TASKSTOP_USE='{"type":"assistant","timestamp":"2026-07-30T12:06:00.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_stop02","name":"TaskStop","input":{"task_id":"bmon0002"}}]}}'
+MON_TASKSTOP_RESULT='{"type":"user","timestamp":"2026-07-30T12:06:01.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_stop02","content":"{\"message\":\"Successfully stopped task: bmon0002 (sleep 1 && echo done)\",\"task_id\":\"bmon0002\",\"task_type\":\"local_bash\",\"command\":\"sleep 1 && echo done\"}"}]}}'
+
+# TaskStop of the OTHER (still-armed) monitor — used to prove TaskStop alone,
+# with no fired event and no timeout, retires a timer.
+MON_TASKSTOP_USE_01='{"type":"assistant","timestamp":"2026-07-30T12:06:00.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_stop01","name":"TaskStop","input":{"task_id":"bmon0001"}}]}}'
+MON_TASKSTOP_RESULT_01='{"type":"user","timestamp":"2026-07-30T12:06:01.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_stop01","content":"{\"message\":\"Successfully stopped task: bmon0001 (sleep 90 && echo backoff-complete)\",\"task_id\":\"bmon0001\",\"task_type\":\"local_bash\",\"command\":\"sleep 90 && echo backoff-complete\"}"}]}}'
+
+# Non-persistent Monitor with its own timeout, armed long ago -> self-expired.
+MON_USE_TIMEOUT='{"type":"assistant","timestamp":"2026-07-30T12:00:00.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_mon03","name":"Monitor","input":{"command":"sleep 90 && echo backoff-complete","timeout_ms":180000}}]}}'
+MON_ACK_TIMEOUT='{"type":"user","timestamp":"2026-07-30T12:00:01.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_mon03","content":"Monitor started (task bmon0003, timeout 180000ms). You will be notified on each event."}]}}'
+MON_NOTIFICATION_TIMEOUT='{"type":"queue-operation","operation":"enqueue","timestamp":"2026-07-30T12:03:01.000Z","content":"<task-notification>\n<task-id>bmon0003</task-id>\n<summary>Monitor event: \"backoff window elapsed\"</summary>\n<event>backoff-complete</event>\n</task-notification>"}'
+
+# Failed arm: the Monitor call itself errored, so no timer exists at all.
+MON_USE_ERRORED='{"type":"assistant","timestamp":"2026-07-30T12:00:00.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_mon04","name":"Monitor","input":{"condition":"nope"}}]}}'
+MON_ACK_ERRORED='{"type":"user","timestamp":"2026-07-30T12:00:01.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_mon04","is_error":true,"content":"<tool_use_error>InputValidationError: Monitor failed due to the following issues:\nAn unexpected parameter `condition` was provided</tool_use_error>"}]}}'
+
 # ScheduleWakeup is the sibling tool name the same detector must also catch.
+# Its arming ack is a DIFFERENT shape from Monitor's (#4696): a fired wakeup
+# re-invokes the session and leaves no task id and no task-notification, so a
+# wakeup is retired only by its own delay elapsing, by a later `{stop: true}`
+# cancel, or by the arming call erroring.
 WAKE_USE_UNRESOLVED='{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_wake01","name":"ScheduleWakeup","input":{"seconds":90}}]}}'
+WAKE_USE_ELAPSED='{"type":"assistant","timestamp":"2026-07-30T12:00:00.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_wake02","name":"ScheduleWakeup","input":{"delaySeconds":1500,"prompt":"night-shift tick","reason":"periodic health tick"}}]}}'
+WAKE_ACK_ELAPSED='{"type":"user","timestamp":"2026-07-30T12:00:01.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_wake02","content":"Next wakeup scheduled for 12:25:00 (in 1500s). Nothing more to do this turn — the harness re-invokes you when the wakeup fires or a task-notification arrives."}]}}'
+WAKE_CANCEL_USE='{"type":"assistant","timestamp":"2026-07-30T12:10:00.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_wake03","name":"ScheduleWakeup","input":{"stop":true}}]}}'
+WAKE_CANCEL_RESULT='{"type":"user","timestamp":"2026-07-30T12:10:01.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_wake03","content":"Loop stopped — cancelled 1 pending wakeup(s); no further dynamic-loop wakeups scheduled. If you armed a Monitor for this loop, TaskStop it now; otherwise nothing more to do this turn."}]}}'
+WAKE_USE_ERRORED='{"type":"assistant","timestamp":"2026-07-30T12:00:00.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_wake04","name":"ScheduleWakeup","input":{"delaySeconds":1500}}]}}'
+WAKE_ACK_ERRORED='{"type":"user","timestamp":"2026-07-30T12:00:01.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_wake04","is_error":true,"content":"`prompt` is required when `stop` is not true."}]}}'
+
+# Background Bash task that was explicitly TaskStop'd instead of completing
+# (issue #4696 — the same false-positive class as the Monitor gap).
+BG_USE_STOPPED='{"type":"assistant","timestamp":"2026-07-30T12:00:00.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_bg03","name":"Bash","input":{"command":"tail -f /tmp/x","run_in_background":true}}]}}'
+BG_ACK_STOPPED='{"type":"user","timestamp":"2026-07-30T12:00:01.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_bg03","content":"Command running in background with ID: bgtest03. Output is being written to: /tmp/bgtest03.output. You will be notified when it completes."}]}}'
+BG_TASKSTOP_USE='{"type":"assistant","timestamp":"2026-07-30T12:01:00.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_stop03","name":"TaskStop","input":{"task_id":"bgtest03"}}]}}'
+BG_TASKSTOP_RESULT='{"type":"user","timestamp":"2026-07-30T12:01:01.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_stop03","content":"{\"message\":\"Successfully stopped task: bgtest03 (tail -f /tmp/x)\",\"task_id\":\"bgtest03\",\"task_type\":\"local_bash\",\"command\":\"tail -f /tmp/x\"}"}]}}'
 
 # Build stdin JSON. Args: <transcript_path> <stop_hook_active>
 make_input() {
@@ -261,13 +321,18 @@ write_transcript "$T7" "$MON_USE_UNRESOLVED" "$MON_ACK_UNRESOLVED"
 result=$(run_hook "$T7" false)
 assert_block "(l) armed-but-unfired Monitor -> block" "$result"
 
-# (m) fired Monitor (task-notification echoing the dispatch tool-use-id) ->
-# allow. The fire event resolves the armed timer exactly like a bg-Bash
-# completion notification.
+# (m) fired Monitor -> allow. The fire event resolves the armed timer. Uses the
+# REAL notification shape (<task-id> only, NO <tool-use-id>) per #4696.
 T8="$TMPROOT/transcript-monitor-fired.jsonl"
-write_transcript "$T8" "$MON_USE_RESOLVED" "$MON_NOTIFICATION_QUEUEOP"
+write_transcript "$T8" "$MON_USE_RESOLVED" "$MON_ACK_RESOLVED" "$MON_NOTIFICATION_QUEUEOP"
 result=$(run_hook "$T8" false)
-assert_allow "(m) fired Monitor (task-notification) -> allow" "$result"
+assert_allow "(m) fired Monitor (task-notification, task-id shape) -> allow" "$result"
+
+# (m2) fired Monitor, notification in the `attachment` shape -> allow.
+T8b="$TMPROOT/transcript-monitor-fired-attachment.jsonl"
+write_transcript "$T8b" "$MON_USE_RESOLVED" "$MON_ACK_RESOLVED" "$MON_NOTIFICATION_ATTACHMENT"
+result=$(run_hook "$T8b" false)
+assert_allow "(m2) fired Monitor (attachment shape) -> allow" "$result"
 
 # (n) armed ScheduleWakeup (sibling tool name, no fire event) -> block. The
 # same detector must catch both tool names.
@@ -291,6 +356,126 @@ if [[ "$reason_mon" == *"Monitor"* && "$reason_mon" == *"#4462"* ]]; then
 else
     fail "(p) block reason explains the armed-Monitor #4462 hazard (got: $reason_mon)"
 fi
+
+# --- Monitor resolution shapes (issue #4696) --------------------------------
+# Third transcript-format gap after #4482/#4462: a Monitor's fired-event
+# <task-notification> carries ONLY <task-id>, never <tool-use-id>, so matching
+# Monitor dispatch ids against <tool-use-id> could NEVER observe a resolution —
+# every Monitor ever armed re-blocked one stop per stop sequence for the rest of
+# the session. Resolution is now keyed on the TASK id recovered from the ack.
+
+# (q) armed + fired + explicitly TaskStop'd -> allow. The exact observed
+# false-positive sequence from #4696.
+T10="$TMPROOT/transcript-monitor-taskstopped.jsonl"
+write_transcript "$T10" "$MON_USE_RESOLVED" "$MON_ACK_RESOLVED" "$MON_NOTIFICATION_QUEUEOP" \
+    "$MON_TASKSTOP_USE" "$MON_TASKSTOP_RESULT"
+result=$(run_hook "$T10" false)
+assert_allow "(q) armed + fired + TaskStop'd Monitor -> allow" "$result"
+
+# (q2) armed + TaskStop'd, with NO fired event and NO elapsed timeout -> allow.
+# TaskStop alone must retire a persistent timer (which has no self-timeout).
+T11="$TMPROOT/transcript-monitor-taskstop-only.jsonl"
+write_transcript "$T11" "$MON_USE_UNRESOLVED" "$MON_ACK_UNRESOLVED" \
+    "$MON_TASKSTOP_USE_01" "$MON_TASKSTOP_RESULT_01"
+result=$(run_hook "$T11" false)
+assert_allow "(q2) armed + TaskStop'd Monitor (no fire, no timeout) -> allow" "$result"
+
+# (q3) armed + fired + its own configured timeout long elapsed -> allow. An
+# expired timer cannot fire again, so it cannot orphan anything.
+T12="$TMPROOT/transcript-monitor-timed-out.jsonl"
+write_transcript "$T12" "$MON_USE_TIMEOUT" "$MON_ACK_TIMEOUT" "$MON_NOTIFICATION_TIMEOUT"
+result=$(run_hook "$T12" false)
+assert_allow "(q3) armed + fired + timed-out Monitor -> allow" "$result"
+
+# (q4) armed with a timeout, never fired, timeout long elapsed -> allow.
+T13="$TMPROOT/transcript-monitor-expired-silent.jsonl"
+write_transcript "$T13" "$MON_USE_TIMEOUT" "$MON_ACK_TIMEOUT"
+result=$(run_hook "$T13" false)
+assert_allow "(q4) armed Monitor whose timeout has elapsed (never fired) -> allow" "$result"
+
+# (q5) armed with a timeout that has NOT yet elapsed -> STILL block. Guards
+# against overcorrecting the timeout rule into a blanket allow.
+NOW_TS="$(date -u +%Y-%m-%dT%H:%M:%S).000Z"
+MON_USE_FRESH="{\"type\":\"assistant\",\"timestamp\":\"$NOW_TS\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"toolu_mon05\",\"name\":\"Monitor\",\"input\":{\"command\":\"sleep 90\",\"timeout_ms\":3600000}}]}}"
+MON_ACK_FRESH="{\"type\":\"user\",\"timestamp\":\"$NOW_TS\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_mon05\",\"content\":\"Monitor started (task bmon0005, timeout 3600000ms). You will be notified on each event.\"}]}}"
+T14="$TMPROOT/transcript-monitor-fresh.jsonl"
+write_transcript "$T14" "$MON_USE_FRESH" "$MON_ACK_FRESH"
+result=$(run_hook "$T14" false)
+assert_block "(q5) armed Monitor whose timeout has NOT elapsed -> block" "$result"
+
+# (q6) genuinely armed persistent Monitor (no TaskStop, no fire, no timeout) ->
+# STILL block. The core regression guard: the #4462 detection must survive.
+result=$(run_hook "$T7" false)
+assert_block "(q6) genuinely armed Monitor (no resolution signal) -> still block" "$result"
+
+# (q7) a retired timer is never re-flagged on a LATER stop sequence in the same
+# session. Resolution is derived from durable, append-only transcript facts, so
+# re-scanning the same transcript must keep allowing.
+result=$(run_hook "$T10" false)
+assert_allow "(q7) retired Monitor -> allow again on a second stop sequence" "$result"
+result=$(run_hook "$T12" false)
+assert_allow "(q7b) timed-out Monitor -> allow again on a second stop sequence" "$result"
+
+# (q8) a Monitor whose arming call ERRORED -> allow. No timer was ever created.
+T15="$TMPROOT/transcript-monitor-arm-failed.jsonl"
+write_transcript "$T15" "$MON_USE_ERRORED" "$MON_ACK_ERRORED"
+result=$(run_hook "$T15" false)
+assert_allow "(q8) Monitor whose arming call errored -> allow" "$result"
+
+# (q9) mixed transcript: one retired timer + one genuinely armed timer -> block,
+# and the block must count exactly ONE armed timer (no over- or under-counting).
+T16="$TMPROOT/transcript-monitor-mixed.jsonl"
+write_transcript "$T16" "$MON_USE_RESOLVED" "$MON_ACK_RESOLVED" "$MON_NOTIFICATION_QUEUEOP" \
+    "$MON_TASKSTOP_USE" "$MON_TASKSTOP_RESULT" "$MON_USE_UNRESOLVED" "$MON_ACK_UNRESOLVED"
+raw_mix=$(run_hook "$T16" false)
+assert_block "(q9) mixed retired + armed Monitors -> block" "$raw_mix"
+reason_mix=$(echo "${raw_mix#*|}" | jq -r '.reason // empty' 2>/dev/null || true)
+if [[ "$reason_mix" == *"1 armed Monitor/ScheduleWakeup timer(s)"* ]]; then
+    pass "(q9b) mixed transcript counts exactly 1 armed Monitor"
+else
+    fail "(q9b) mixed transcript counts exactly 1 armed Monitor (got: $reason_mix)"
+fi
+
+# --- ScheduleWakeup resolution shapes (issue #4696) -------------------------
+
+# (s) armed ScheduleWakeup whose delay has long elapsed -> allow. A fired wakeup
+# re-invokes the session and leaves NO task id and NO task-notification, so the
+# elapsed delay is the only signal it ever produces. Without this, an overnight
+# reschedule loop re-blocks one stop per stop sequence forever.
+T18="$TMPROOT/transcript-wakeup-elapsed.jsonl"
+write_transcript "$T18" "$WAKE_USE_ELAPSED" "$WAKE_ACK_ELAPSED"
+result=$(run_hook "$T18" false)
+assert_allow "(s) armed ScheduleWakeup whose delay has elapsed -> allow" "$result"
+
+# (s2) armed ScheduleWakeup whose delay has NOT elapsed -> STILL block.
+NOW_TS2="$(date -u +%Y-%m-%dT%H:%M:%S).000Z"
+WAKE_USE_FRESH="{\"type\":\"assistant\",\"timestamp\":\"$NOW_TS2\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"toolu_wake05\",\"name\":\"ScheduleWakeup\",\"input\":{\"delaySeconds\":1500,\"prompt\":\"tick\"}}]}}"
+WAKE_ACK_FRESH="{\"type\":\"user\",\"timestamp\":\"$NOW_TS2\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_wake05\",\"content\":\"Next wakeup scheduled for 23:59:00 (in 1500s). Nothing more to do this turn — the harness re-invokes you when the wakeup fires or a task-notification arrives.\"}]}}"
+T19="$TMPROOT/transcript-wakeup-fresh.jsonl"
+write_transcript "$T19" "$WAKE_USE_FRESH" "$WAKE_ACK_FRESH"
+result=$(run_hook "$T19" false)
+assert_block "(s2) armed ScheduleWakeup whose delay has NOT elapsed -> block" "$result"
+
+# (s3) a later ScheduleWakeup {stop:true} cancel retires the pending wakeup, and
+# the cancel call itself arms nothing.
+T20="$TMPROOT/transcript-wakeup-cancelled.jsonl"
+write_transcript "$T20" "$WAKE_USE_FRESH" "$WAKE_ACK_FRESH" "$WAKE_CANCEL_USE" "$WAKE_CANCEL_RESULT"
+result=$(run_hook "$T20" false)
+assert_allow "(s3) ScheduleWakeup {stop:true} cancel -> allow" "$result"
+
+# (s4) a ScheduleWakeup whose arming call errored -> allow. Nothing was armed.
+T21="$TMPROOT/transcript-wakeup-arm-failed.jsonl"
+write_transcript "$T21" "$WAKE_USE_ERRORED" "$WAKE_ACK_ERRORED"
+result=$(run_hook "$T21" false)
+assert_allow "(s4) ScheduleWakeup whose arming call errored -> allow" "$result"
+
+# (t) background Bash explicitly TaskStop'd instead of completing -> allow. The
+# same false-positive class as the Monitor gap: a stopped task cannot be
+# orphaned by ending the turn (#4696).
+T17="$TMPROOT/transcript-bg-taskstopped.jsonl"
+write_transcript "$T17" "$BG_USE_STOPPED" "$BG_ACK_STOPPED" "$BG_TASKSTOP_USE" "$BG_TASKSTOP_RESULT"
+result=$(run_hook "$T17" false)
+assert_allow "(t) TaskStop'd background Bash task -> allow" "$result"
 
 # --- block reason mentions the #3822/#4257 hazard ---------------------------
 raw=$(run_hook "$T1" false)
