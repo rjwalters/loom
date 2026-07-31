@@ -221,7 +221,10 @@ fi
 # Toggle: guards.readOnlyFastPath (default true) / LOOM_GUARD_READONLY_FASTPATH
 # env (0/false/no disables, 1/true/yes forces on; env wins). Optional
 # guards.readOnlyFastPathExtra is an EXTEND-ONLY array of literal first-word
-# commands (each entry is a full-generality bypass for that command word).
+# commands (each entry is a full-generality bypass for that command word), minus
+# the reserved words the escape hatch may not claim (#4791 — see
+# _fastpath_extra_reserved below: no denial-floor command word, no shell/exec
+# wrapper, so no .loom/config.json can fast-path past the ungated floor).
 # =============================================================================
 
 # CARVE-OUT (#4063, UPDATED for Epic #3835 Phase 5, #4262): the fast-path
@@ -446,6 +449,42 @@ fastpath_builtin_admits() {
 # Optional extend-only escape hatch: guards.readOnlyFastPathExtra is an array of
 # literal first-word commands. Read lazily (only when the built-in list did not
 # admit) and cached. Each entry is a full-generality bypass for that word.
+#
+# RESERVED WORDS (#4791) — the escape hatch may NOT reach past the ungated
+# denial floor. The fast path runs before ALWAYS_BLOCK_PATTERNS, so any word
+# admitted here skips the floor entirely for every argument shape; the built-in
+# allowlist above is safe by construction (its `git`/`gh`/`aws` entries are
+# verb-scoped and no floor member survives the structural test under the other
+# entries), but a configured entry is not verb-scoped at all. Before #4791,
+# {"guards":{"readOnlyFastPathExtra":["rm"]}} silently fast-pathed `rm -rf /` to
+# an allow — i.e. a .loom/config.json COULD disable a floor deny, the exact
+# premise defaults/docs/guard-hooks.md now documents as false. So a configured
+# entry naming a floor command word, or any shell/exec wrapper that can carry an
+# arbitrary payload as an argument, is IGNORED and the command falls through to
+# the full deny/ask path.
+#
+# Fail direction is deliberate: rejecting an entry can only make the guard do
+# MORE work, never less, so a false positive here costs a few forks on one
+# command word and can never open a hole. Kept as a bash `case` (zero forks) and
+# checked BEFORE the config read, so a reserved word never even pays for the
+# lazy jq/array read. Silent by design — the fast path emits nothing on any
+# path, and the operator sees the effect immediately (the command is evaluated
+# normally, with the guard's own reason if it denies).
+_fastpath_extra_reserved() {
+    case "$1" in
+        # Denial-floor command words (ALWAYS_BLOCK_PATTERNS + the segment-parsed
+        # system-lifecycle deny + the `--body @path` denies).
+        rm|git|gh|aws|docker|curl|wget|halt|reboot|poweroff|shutdown|init)
+            return 0 ;;
+        # Shell / exec wrappers: admitting one of these admits ANY payload it is
+        # handed, which would bypass the floor transitively. The built-in
+        # allowlist excludes them for the same reason.
+        sudo|doas|env|eval|exec|xargs|nohup|timeout|ssh|bash|sh|zsh|ksh|dash|fish|python|python3|perl|ruby|node)
+            return 0 ;;
+    esac
+    return 1
+}
+
 _FASTPATH_EXTRA_CACHE=""
 _FASTPATH_EXTRA_DONE=""
 fastpath_extra_admits() {
@@ -455,6 +494,7 @@ fastpath_extra_admits() {
     read -ra t <<< "$cmd"
     (( ${#t[@]} >= 1 )) || return 1
     local first="${t[0]}"
+    _fastpath_extra_reserved "$first" && return 1
     if [[ -z "$_FASTPATH_EXTRA_DONE" ]]; then
         _FASTPATH_EXTRA_DONE=1
         _FASTPATH_EXTRA_CACHE=$(_fastpath_tiered_get_array "guards.readOnlyFastPathExtra" 2>/dev/null) || _FASTPATH_EXTRA_CACHE=""

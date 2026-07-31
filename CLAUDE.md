@@ -249,7 +249,7 @@ Configuration lives in `.loom/config.json` (committed for team sharing): a
   confine Edit/Write to a builder's worktree; category toggles (`guards.sqlDdl`,
   `cloudCli`, `reversibleGh`, `rmScope`, `forceScope`, `readOnlyFastPath`,
   `decisionLog`, `worktreeIsolation`, `stashScope`, each with an `LOOM_*` env
-  override) let a repo opt out. Catalog: [`defaults/docs/guard-hooks.md`](defaults/docs/guard-hooks.md).
+  override) let a repo opt out — above an **ungated denial floor** no toggle can disable. Catalog: [`defaults/docs/guard-hooks.md`](defaults/docs/guard-hooks.md); forge text is untrusted input: [`defaults/docs/untrusted-external-content.md`](defaults/docs/untrusted-external-content.md).
 - **MCP hooks** — the unified `mcp-loom` server is registered once per machine at
   user scope (`scripts/install-loom.sh`, refreshed by `loom update`); `setup-mcp.sh`
   is demoted to a bundle-rebuild/legacy-migration tool. See the mcp-loom README.

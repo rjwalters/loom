@@ -92,6 +92,139 @@ read-only fast-path toggles both consult `.loom-project/project.json` first, the
 legacy file — the fast path stays a bounded, direct-`jq` read (never the full resolver
 merge) to preserve the #3687 fork budget on the hottest guard invocation.
 
+## The Ungated Denial Floor
+
+**Guarantee (#4791): a fixed set of catastrophic commands is denied by
+`guard-destructive-generic.sh` regardless of how a repo configures `guards.*`.**
+No value of any `guards.*` key in `.loom-project/project.json` or
+`.loom/config.json`, and no `LOOM_GUARD_*` / `LOOM_RM_SCOPE` / `LOOM_FORCE_SCOPE`
+env var, turns any of these off. The floor is not read through the config
+resolver at all — there is no toggle to consult — so "a misconfigured or hostile
+`.loom/config.json` disables all guard protection" is **not** true of this set.
+Every toggle documented in the rest of this file governs a category *layered on
+top of* the floor; the toggles can only widen or narrow the **ask** tier and the
+opt-in deny categories, never the floor.
+
+The floor is `ALWAYS_BLOCK_PATTERNS` (`guard-destructive-generic.sh`, tagged
+inline as the "hard safety floor (#3593)") plus the ungated checks that live
+outside that array for parsing reasons:
+
+| Floor member | Shape | Where |
+|---|---|---|
+| Repository destruction | `gh repo delete`, `gh repo archive` (command-position anchored) | `ALWAYS_BLOCK_PATTERNS` |
+| Force-push to a shared branch | `git push --force` / `-f` / `--force-with-lease` to `origin main` / `origin master` | `ALWAYS_BLOCK_PATTERNS` |
+| Root / home obliteration | `rm -rf /`, `rm -rf ~`, `rm -rf $HOME` (anchored to the *real* root/home target) | `ALWAYS_BLOCK_PATTERNS` |
+| Fork bomb | `:(){ :\|:& };:` | `ALWAYS_BLOCK_PATTERNS` |
+| Pipe-to-shell supply-chain execution | `curl`/`wget … \| [sudo] sh`-family | `ALWAYS_BLOCK_PATTERNS` |
+| Mass cloud destruction | `aws s3 rm … --recursive`, `aws s3 rb`, `aws cloudformation delete-stack` | `ALWAYS_BLOCK_PATTERNS` |
+| Container mass destruction | `docker system prune` | `ALWAYS_BLOCK_PATTERNS` |
+| System lifecycle | `halt` / `reboot` / `poweroff` / `shutdown` / `init 0` / `init 6` as a segment's **command word** | segment-parsed `lifecycle_or_cloud_reason()` — command-word anchored so it does not fire inside prose (#3584) |
+| Literal-`@path` comment data loss | `gh pr/issue comment --body @path`, the correlated shell-variable form, and `gh api … -f body=@path` (#4523, #4601) | raw-`$COMMAND` checks below the array |
+
+**What is deliberately NOT in the floor** — and why that is the right line:
+
+- **The whole ask tier.** `aws iam delete-*`, `az`/`gcloud … delete`, `gh release
+  delete`, `git clean -fd` / `git checkout .` / `git restore .` **ask** rather
+  than deny. They are *ungated* (no `guards.*` key switches them off) but they
+  are not floor members, because a supervised operator must be able to confirm
+  and proceed — see "Second refinement pass (#4216)" below. In a headless run an
+  unanswered ask blocks anyway.
+- **The toggleable deny categories**: SQL DDL/DML (`guards.sqlDdl`), the
+  cloud/docker ask category (`guards.cloudCli`), rm-scope beyond the
+  catastrophic targets (`guards.rmScope`), the generic force-op ask
+  (`guards.forceScope`), worktree/Bash write confinement
+  (`guards.worktreeIsolation`), the stash-stack ask (`guards.stashScope`). Each
+  is off-able **by design** because each has a legitimate repo class for which it
+  is a category error (a database engine, a cloud-management repo, an operator
+  editing the main checkout). Promoting any of them into the floor would break
+  those repos and buy nothing — none of them is unrecoverable the way the floor
+  members are.
+
+**The one config-reachable weakening, and how it is bounded.** The `#3687`
+read-only fast path runs *before* the floor scan, so anything it admits skips the
+floor. Its built-in allowlist cannot admit a floor member (the structural test
+rejects every command containing `;` `&` `|` `<` `>`, a backtick or `$(`, and the
+admitted first tokens are `ls`/`grep`/`rg`/`jq`/`wc`/`head`/`tail`/`test`/`find`
+plus verb-scoped `git`/`gh`/`aws` read forms). The **operator escape hatch**
+`guards.readOnlyFastPathExtra` was a different story: it admits a literal first
+word in full generality, so `{"guards":{"readOnlyFastPathExtra":["rm"]}}` used to
+fast-path `rm -rf /` to a silent allow — a genuine "config disables the floor"
+path. As of #4791 that hatch carries a **reserved-word list**: a configured entry
+that is a floor command word (`rm`, `git`, `gh`, `aws`, `docker`, `curl`, `wget`,
+`halt`, `reboot`, `poweroff`, `shutdown`, `init`) or a shell/exec wrapper (`sudo`,
+`doas`, `env`, `eval`, `exec`, `xargs`, `nohup`, `timeout`, `ssh`, `bash`, `sh`,
+`zsh`, `ksh`, `dash`, `fish`, `python`, `python3`, `perl`, `ruby`, `node`) is
+**ignored** — the command falls through to the full deny/ask path instead of
+being fast-pathed. The rejection is silent and costs zero forks (a bash `case`),
+and it cannot make anything *less* safe: the worst case is that a legitimately
+read-only command with a reserved name pays full guard cost.
+
+**What the floor is not.** It is a blast-radius limiter on an *agent's* mistakes
+and on injected instructions (see
+[`untrusted-external-content.md`](untrusted-external-content.md)), not a
+sandbox against a hostile operator with shell access. It scans a command string,
+so anything that hides the string from the scan defeats it — most notably the
+**unsanctioned script-file workaround** (§ "When a Legitimate Operation Is
+Pattern-Blocked" below) and interpreter one-liners. And it only fires if the hook
+is actually wired, which is the next section.
+
+### Hook-wiring integrity (#4791 assessment)
+
+The floor's guarantee is conditional on `guard-destructive.sh` *running*. That is
+governed by hook **registration**, which is a different surface from `guards.*`
+policy — so it deserves its own assessment. Verdict: **the machine-level wiring
+is well protected; the transition (copies-present) layout has a real gap, and the
+fix belongs in the installer, not in a new mechanism.**
+
+- **Machine-level wiring is out of reach of a repository change.** Since Phase 5
+  (#4262) the entries live in the operator's user-scope `~/.claude/settings.json`
+  and exec scripts from the machine checkout. Nothing a contributor can put in a
+  PR — no config, no committed settings file, no hook copy — edits that file.
+  Daemon-spawned workers inherit it because `loom-daemon` copies it into each
+  worker's isolated `CLAUDE_CONFIG_DIR`. This is strictly stronger than the old
+  per-repo wiring and needs no additional protection.
+- **The transition layout has a wiring gap.** While a repo still carries per-repo
+  `.loom/hooks/<name>` copies, the user-scope wrapper's transition-dedup step is
+  an unconditional `[ -x "$ROOT/.loom/hooks/<name>" ] && exit 0` — it defers
+  **without checking that a project-level entry exists to defer to.** So the
+  state "copies present, `hooks` block absent from the repo's
+  `.claude/settings.json`" yields **zero guards**: the wrapper steps aside and
+  nothing takes its place. That is the #4401 failure mode, and #4401 fixed only
+  the *installer* half of it (`ensure_project_hook_wiring` re-asserts the project
+  entries on every install); a commit that later deletes the `hooks` block —
+  careless or hostile — re-creates it silently, and Loom itself dogfoods the
+  copies-present layout.
+- **Proposed fix (not implemented here; deliberately deferred).** Make the
+  deferral conditional: defer only when the copy exists **and** the project
+  `.claude/settings.json` actually references `.loom/hooks/<name>`; otherwise
+  exec the machine hook. It is fork-free in the wrapper — `[ -f "$ROOT/.claude/settings.json" ] && case "$(<"$ROOT/.claude/settings.json")" in *".loom/hooks/<name>"*) exit 0;; esac`
+  (the `[ -f ]` guard matters: `$(<missing)` writes to stderr) — and it cannot
+  double-fire, because it defers exactly when the project entry will run the
+  copy. It is *not* landed in this change for one concrete reason: the
+  wrapper string is embedded in every operator's `~/.claude/settings.json`, and
+  `_phook_merge_one` deduplicates on the `defaults/hooks/<name>` marker — which
+  the new wrapper also contains — so re-provisioning would **skip** the entry and
+  leave the old wrapper in place. Landing the fix therefore requires a companion
+  change: a versioned "replace a stale Loom-owned entry" upgrade path in
+  `scripts/install/provision-hooks.sh`. That is installer surgery on live,
+  machine-level state, so it is tracked as its own issue (**#4806**) rather than
+  smuggled into a documentation change.
+- **Verify wiring on demand** (an operator or Auditor can run this in any repo):
+
+  ```bash
+  # 1. Are per-repo copies present?
+  ls .loom/hooks/guard-destructive.sh 2>/dev/null
+  # 2. If YES, the project file must reference them, or there is NO guard:
+  jq -r '.. | .command? // empty' .claude/settings.json 2>/dev/null | grep -c '\.loom/hooks/'
+  # 3. If NO copies, the machine wiring is the live path:
+  jq -r '.. | .command? // empty' ~/.claude/settings.json | grep -c 'defaults/hooks/'
+  ```
+
+  A `0` from step 2 with copies present from step 1 is the zero-guard state
+  above; the repair is `./scripts/install/provision-hooks.sh`'s
+  `ensure_project_hook_wiring` (re-run the installer) or `loom migrate` to drop
+  the copies entirely.
+
 ## Custom Guard Hooks
 
 Loom ships with several built-in `PreToolUse` guard hooks, registered independently under the `Bash` or `Edit|Write` matcher as noted below:
@@ -600,6 +733,19 @@ The fast path is **on by default**. It is resolved in this order (highest preced
 > **Note**: `jq` and `wc` used to be the canonical example entries here, but as of #3772 they are part of the **built-in default** allowlist above — adding them via `readOnlyFastPathExtra` is now redundant. Use this escape hatch only for a genuinely-custom bare read-only command word (e.g. a site-specific query tool).
 
 > **Warning**: each word added here is a **guard bypass for that command word in full generality** (all arguments). Only add bare, argument-independent read-only utilities — never your own scripts or anything that could wrap a mutating call. Entries are matched as the literal first token only; no subcommand/verb parsing is applied to custom entries.
+
+> **Reserved words (#4791)**: an entry that names a **denial-floor command word**
+> (`rm`, `git`, `gh`, `aws`, `docker`, `curl`, `wget`, `halt`, `reboot`,
+> `poweroff`, `shutdown`, `init`) or a **shell/exec wrapper** (`sudo`, `doas`,
+> `env`, `eval`, `exec`, `xargs`, `nohup`, `timeout`, `ssh`, `bash`, `sh`, `zsh`,
+> `ksh`, `dash`, `fish`, `python`, `python3`, `perl`, `ruby`, `node`) is
+> **ignored** — such a command falls through to the full deny/ask path instead of
+> being fast-pathed. Without this, `{"guards":{"readOnlyFastPathExtra":["rm"]}}`
+> would have silently fast-pathed `rm -rf /` to an allow, which is the one way a
+> `.loom/config.json` could reach past the ungated denial floor (§ "The Ungated
+> Denial Floor" above). The rejection is silent and fork-free; the only cost of a
+> false positive is that a genuinely read-only command with a reserved name pays
+> full guard cost.
 
 The config read is best-effort and lazy: it happens only after a command has already passed the structural test, and any missing/empty/malformed `.loom/config.json` falls through to fast-path-ON. Disabling the fast path never weakens any deny/ask rule — it only makes the guard do its full work on every command again.
 
