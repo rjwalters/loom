@@ -1238,6 +1238,88 @@ managed repo, fetched *after* the IPC round-trip completes:
 - **Why opt-in** — six `gh` calls per managed repo is too slow to bundle into
   the default view (which is used for frequent, low-latency operator checks);
   `--pipeline` trades that latency for the queue-depth picture on demand.
+- **Metric mask (#4761)** — `GhPipelineSource::with_metrics(PipelineMetrics)`
+  selects which of the six counts to fetch (each is one `gh` call, run
+  sequentially within a repo). `PipelineMetrics::ALL` is the default and what
+  `status --pipeline` / the dashboard use; `PipelineMetrics::HEALTH` (queued +
+  merged) is what `loom-daemon health` uses to stay inside its latency budget.
+  `with_merge_window(Duration)` widens/narrows the merge-throughput window from
+  its 24h default. A masked-off metric is left `None`; a caller that masks a
+  metric off simply must not read it.
+
+## One-shot fleet vitals (`loom-daemon health`, #4761)
+
+```
+loom-daemon health [--since 30m] [--json]
+```
+
+One consolidated, structured vitals report with an **exit-code contract** so a
+watch loop (human, cron, dashboard, or the `loom:watch` skill) can branch
+without parsing anything:
+
+| exit | meaning |
+|------|---------|
+| `0` | every section green |
+| `1` | degraded — at least one section is non-green, **including "could not determine"** |
+| `2` | the daemon is genuinely dead |
+
+Six sections, one line each (or the full structured payload with `--json`):
+
+| section | what it reports | source |
+|---------|-----------------|--------|
+| `liveness` | trusted liveness verdict | `daemon_install_state::probe()` + `pgrep_daemon_pids()` + the IPC round-trip |
+| `dispatch` | in-flight vs dynamic cap, plus the last work-finder tick's dispatch/skip-reason summary | `DaemonStatusReport` + `work_finder::last_tick_summary()` |
+| `tokens` | healthy/total, exhausted count, `.ranking` staleness | `CapacityReport` + the resolved pool's `.ranking` mtime |
+| `roles` | **persistent** role-tick failures (transient ones are a count only) | `role_runner::role_tick_records()` |
+| `queues` | per-root ready (`loom:issue`) counts | `pipeline_snapshot` (`PipelineMetrics::HEALTH`) |
+| `throughput` | merges across managed repos inside the window | `pipeline_snapshot` (`PipelineMetrics::HEALTH`) |
+
+### Liveness precedence: pgrep + pid-file first, launchd NEVER alone
+
+This is the load-bearing rule. #4694's launchd domain probe twice declared a
+live, *dispatching* daemon dead during an overnight watch; the daemon's
+singleton guard was the only thing that prevented a sweep-killing restart. So
+`health` declares DEAD only on **positive evidence of absence**, in this order:
+
+1. **IPC answered** ⇒ alive, unconditionally. No local probe overrules a daemon
+   that just answered a round-trip.
+2. **`daemon_install_state` says the process is alive** — that classification is
+   itself launchd probe → skipped-domain cross-check → pid-file cross-check, so
+   it already refuses to trust a lone launchd negative ⇒ DEGRADED
+   (alive-but-unresponsive / still-starting), never DEAD.
+3. **`pgrep -x loom-daemon` finds a live process** ⇒ still DEGRADED. The third
+   independent signal, for a daemon started outside the managed wrapper or one
+   whose pid file was removed by hand.
+4. Only when **all three** are negative is the verdict DEAD (exit `2`).
+
+An *undiagnosable* probe (no loom dir resolvable, `pgrep` absent) is `UNKNOWN`
+(exit `1`) — "I could not tell" — never exit `2`.
+
+### Transient vs persistent role ticks
+
+The role-runner loop appends every `(root, role)` tick outcome to a bounded
+process-global ring (`role_runner::ROLE_TICK_RING_CAPACITY`), carried verbatim in
+`DaemonStatusReport::role_tick_records`. The *classifier* is client-side
+(`health::summarize_role_ticks`) because the window is the operator's choice:
+inside `--since`, a `(root, role)` pair whose **latest** record is a failure is
+**persistent** (surfaces, DEGRADED); one that failed but whose latest record is a
+success is **transient** (reported as a count only). Recording happens *before*
+the log-dedup decision, so #4349's DEBUG-downgraded repeat failures are still
+fully visible to a health check.
+
+### One collector, three consumers
+
+`health::assess(&HealthInputs) -> HealthReport` is pure — no daemon, no forge, no
+subprocess — and is the *only* place any verdict rule lives:
+
+- `loom-daemon health` (`cli::health`) collects the inputs and exits with
+  `HealthReport::exit_code()`.
+- The dashboard's `GET /api/health` (`serve.rs`) calls the same `assess` over the
+  same cached `/api/pipeline` `gh` batch. An unreachable daemon there answers
+  **200 with `overall: "dead"` / `exit_code: 2`**, not 503 — "the daemon is dead"
+  is a health *report*, not a transport failure.
+- `loom-daemon status` keeps its own (unchanged) rendering; `fleet status`
+  reuse is a follow-up (it would need a `health --json` fan-out over ssh).
 
 ## Reaper task
 

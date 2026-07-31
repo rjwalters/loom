@@ -90,7 +90,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -103,7 +103,7 @@ use crate::sweep_registry::{
     DispatchBackoffError, LiveClaimDispatchError, OpenPrDispatchError, ParkedIssueDispatchError,
 };
 use crate::tokens::{token_pool_size, token_pool_size_at_dir};
-use crate::types::Event;
+use crate::types::{Event, WorkFinderTickSummary};
 use crate::workspace_pool::WorkspacePool;
 use crate::workspace_registry::{filter_missing_roots, WorkspaceRegistry};
 
@@ -469,6 +469,80 @@ pub trait WorkDispatcher {
     fn occupancy(&self) -> usize {
         self.in_flight().len()
     }
+}
+
+// ============================================================================
+// Last-tick publication (Issue #4761)
+// ============================================================================
+
+/// Process-global slot holding the most recent completed tick's summary.
+///
+/// Mirrors the "loop publishes, status reads" discipline
+/// [`crate::auto_update::global_status_snapshot`] and
+/// [`crate::host_breaker::global_snapshot`] already use: the work-finder loop
+/// writes here at the end of every tick, and `build_daemon_status` reads it
+/// back so a cross-process consumer (`loom-daemon health`) can see the last
+/// tick's dispatch/skip breakdown without scraping the daemon log.
+///
+/// `None` (the initial value) honestly means "no tick has completed in this
+/// process yet" — never "nothing was dispatched".
+static LAST_TICK: OnceLock<Mutex<Option<WorkFinderTickSummary>>> = OnceLock::new();
+
+fn last_tick_slot() -> &'static Mutex<Option<WorkFinderTickSummary>> {
+    LAST_TICK.get_or_init(|| Mutex::new(None))
+}
+
+/// Publish `report` (as run under `max_concurrent`, completed at `at`) as the
+/// most recent work-finder tick (Issue #4761). Called by both the
+/// single-workspace and multi-workspace loops so the two can never diverge on
+/// what "the last tick" means.
+pub fn publish_tick_summary_at(
+    report: &TickReport,
+    max_concurrent: usize,
+    at: chrono::DateTime<chrono::Utc>,
+) {
+    let summary = WorkFinderTickSummary {
+        at,
+        max_concurrent,
+        seen: report.seen,
+        dispatched: report.dispatched,
+        skipped_labeled: report.skipped_labeled,
+        skipped_in_flight: report.skipped_in_flight,
+        skipped_quarantined: report.skipped_quarantined,
+        skipped_pr_open: report.skipped_pr_open,
+        skipped_peer_claim: report.skipped_peer_claim,
+        skipped_backoff: report.skipped_backoff,
+        deferred_capacity: report.deferred_capacity,
+        deferred_ramp_cap: report.deferred_ramp_cap,
+        errors: report.errors,
+        halted: report.halted,
+    };
+    *last_tick_slot()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(summary);
+}
+
+/// [`publish_tick_summary_at`] stamped with the current wall clock.
+pub fn publish_tick_summary(report: &TickReport, max_concurrent: usize) {
+    publish_tick_summary_at(report, max_concurrent, chrono::Utc::now());
+}
+
+/// Read back the most recently published tick summary, or `None` when no tick
+/// has completed in this process (Issue #4761).
+#[must_use]
+pub fn last_tick_summary() -> Option<WorkFinderTickSummary> {
+    last_tick_slot()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// Test-only reset of the process-global last-tick slot.
+#[cfg(test)]
+fn reset_last_tick_summary() {
+    *last_tick_slot()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
 }
 
 // ============================================================================
@@ -1654,6 +1728,9 @@ where
                 max_admissions_per_tick,
             ) {
                 Ok(report) => {
+                    // Publish before any logging so `loom-daemon health` sees the
+                    // same tick the log line describes (#4761).
+                    publish_tick_summary(&report, max_concurrent);
                     if report.halted && !was_halted {
                         log::warn!(
                             "work_finder: main-health gate halted dispatch — {} ready issue(s) \
@@ -1964,6 +2041,10 @@ pub fn spawn_multi_work_finder_task(
                 &halted,
                 max_admissions_per_tick,
             );
+
+            // Publish before any logging so `loom-daemon health` sees the same
+            // tick the log line describes (#4761).
+            publish_tick_summary(&report, max_concurrent);
 
             if report.halted && !was_halted {
                 log::warn!(
@@ -4777,5 +4858,88 @@ exit 0
             vec![10],
             "sibling root with no gate in flight is unaffected"
         );
+    }
+
+    // ===================================================================
+    // Last-tick publication (#4761)
+    // ===================================================================
+
+    #[test]
+    #[serial(work_finder_last_tick)]
+    fn last_tick_summary_is_none_before_any_tick() {
+        reset_last_tick_summary();
+        assert!(last_tick_summary().is_none());
+    }
+
+    #[test]
+    #[serial(work_finder_last_tick)]
+    fn publishing_a_tick_makes_its_counters_readable_cross_process() {
+        reset_last_tick_summary();
+        let at = chrono::Utc::now();
+        let report = TickReport {
+            seen: 12,
+            dispatched: 2,
+            skipped_in_flight: 9,
+            skipped_pr_open: 1,
+            errors: 0,
+            halted: false,
+            ..TickReport::default()
+        };
+        publish_tick_summary_at(&report, 7, at);
+
+        let summary = last_tick_summary().expect("a published tick must be readable");
+        assert_eq!(summary.at, at);
+        assert_eq!(summary.max_concurrent, 7);
+        assert_eq!(summary.seen, 12);
+        assert_eq!(summary.dispatched, 2);
+        assert_eq!(summary.skipped_in_flight, 9);
+        assert_eq!(summary.skipped_pr_open, 1);
+        assert!(!summary.halted);
+    }
+
+    #[test]
+    #[serial(work_finder_last_tick)]
+    fn publishing_replaces_the_previous_tick() {
+        reset_last_tick_summary();
+        publish_tick_summary(
+            &TickReport {
+                seen: 1,
+                ..TickReport::default()
+            },
+            3,
+        );
+        publish_tick_summary(
+            &TickReport {
+                seen: 99,
+                ..TickReport::default()
+            },
+            4,
+        );
+        let summary = last_tick_summary().unwrap();
+        assert_eq!(summary.seen, 99);
+        assert_eq!(summary.max_concurrent, 4);
+    }
+
+    /// The rendered summary must show only the *non-zero* skip reasons, so an
+    /// operator reading one line is not scanning a wall of zeros.
+    #[test]
+    fn reason_summary_omits_zero_terms() {
+        let summary = crate::types::WorkFinderTickSummary {
+            seen: 12,
+            dispatched: 2,
+            skipped_in_flight: 10,
+            ..Default::default()
+        };
+        assert_eq!(summary.reason_summary(), "12 seen, 2 dispatched, 10 in-flight-skip");
+    }
+
+    #[test]
+    fn reason_summary_flags_a_halted_tick() {
+        let summary = crate::types::WorkFinderTickSummary {
+            seen: 5,
+            halted: true,
+            ..Default::default()
+        };
+        assert!(summary.reason_summary().ends_with("HALTED"));
     }
 }

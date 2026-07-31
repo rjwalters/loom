@@ -130,6 +130,30 @@ enum Commands {
         pipeline: bool,
     },
 
+    /// One-shot consolidated fleet vitals with an exit-code contract for watch
+    /// loops (Issue #4761): trusted liveness, dispatch state, token pool,
+    /// role-tick health, queue depth, and merge throughput — one structured
+    /// line per section, or `--json` for machine consumers.
+    ///
+    /// Exit codes: `0` healthy, `1` degraded (any section non-green, including
+    /// "could not determine"), `2` the daemon is genuinely dead. A watch loop
+    /// can therefore branch without parsing anything.
+    ///
+    /// The liveness verdict is **pgrep + pid-file first** — the launchd domain
+    /// probe is never trusted alone (#4694: it twice declared a live,
+    /// dispatching daemon dead). A DEAD verdict requires all three independent
+    /// signals (IPC, launchd/pid-file classification, `pgrep`) to agree.
+    Health {
+        /// Window for the role-tick and throughput sections: `30m` (default),
+        /// `2h`, `90s`, `1d`, or a bare number of seconds.
+        #[arg(long, value_name = "WINDOW")]
+        since: Option<String>,
+
+        /// Emit the machine-readable JSON report instead of the section lines.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Measure the host and the currently-resolved concurrency knobs (issue
     /// #4390; measurement-only since #4512). Prints the same `min(token axis,
     /// disk, maxConcurrent)` cap breakdown `status` uses, which term binds, and
@@ -1980,6 +2004,12 @@ fn handle_cli_command(command: Commands) -> Result<()> {
             // Routed directly in `main()` (it needs the async runtime for the
             // socket round-trip), never dispatched through this sync handler.
             unreachable!("Status is handled in main() before handle_cli_command")
+        }
+        Commands::Health { .. } => {
+            // Routed directly in `main()` (it needs the async runtime for the
+            // socket round-trip + forge fan-out), never dispatched through this
+            // sync handler.
+            unreachable!("Health is handled in main() before handle_cli_command")
         }
         Commands::Quarantine { .. } => {
             // Routed directly in `main()` (it needs the async runtime for the

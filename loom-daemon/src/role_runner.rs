@@ -76,14 +76,15 @@
 //! `claude` sessions at once rather than settling into the steady-state
 //! cadence.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::sweep_registry::{self, SweepRegistryConfig};
+use crate::types::RoleTickRecord;
 use crate::workspace_registry::{filter_missing_roots, WorkspaceRegistry};
 
 // ============================================================================
@@ -245,6 +246,96 @@ impl RoleTickOutcome {
     pub fn is_success(&self) -> bool {
         matches!(self, Self::Success)
     }
+}
+
+// ============================================================================
+// Role-tick health ring (Issue #4761)
+// ============================================================================
+
+/// How many `(root, role)` tick outcomes the process-global ring retains.
+///
+/// The ring is carried verbatim over IPC in
+/// [`crate::types::DaemonStatusReport::role_tick_records`], so the bound is
+/// really a *payload* bound: at ~150 bytes a record this is well under 20 KB
+/// even when full, which a 5s-interval dashboard poll can afford. It is also
+/// generously larger than any window `loom-daemon health --since` would ask
+/// for in practice (5 roles × a 5-minute cadence fills ~60 entries an hour).
+pub const ROLE_TICK_RING_CAPACITY: usize = 128;
+
+/// Process-global newest-last ring of role-runner tick outcomes.
+///
+/// Same "loop publishes, status reads" discipline as
+/// [`crate::work_finder::last_tick_summary`]: the role-runner loop appends one
+/// record per completed `(root, role)` invocation, and `build_daemon_status`
+/// hands the window to clients, which apply their own
+/// transient-vs-persistent classifier ([`crate::health::summarize_role_ticks`]).
+/// The daemon deliberately stores *raw outcomes*, not a verdict — the window an
+/// operator cares about is a client-side choice.
+static ROLE_TICKS: OnceLock<Mutex<VecDeque<RoleTickRecord>>> = OnceLock::new();
+
+fn role_tick_ring() -> &'static Mutex<VecDeque<RoleTickRecord>> {
+    ROLE_TICKS.get_or_init(|| Mutex::new(VecDeque::with_capacity(ROLE_TICK_RING_CAPACITY)))
+}
+
+/// Append one `(root, role)` tick outcome to the process-global ring, stamped
+/// at `at` (Issue #4761). Oldest entries are evicted past
+/// [`ROLE_TICK_RING_CAPACITY`].
+pub fn record_role_tick_at(
+    role: &str,
+    root: &Path,
+    outcome: &RoleTickOutcome,
+    at: chrono::DateTime<chrono::Utc>,
+) {
+    let (ok, detail) = match outcome {
+        RoleTickOutcome::Success => (true, None),
+        RoleTickOutcome::Failure(reason) => (false, Some(reason.clone())),
+        RoleTickOutcome::RuntimeRejected(rejection) => {
+            (false, Some(format!("runtime-rejected: {}", rejection.reason)))
+        }
+        // #4642's permanent no-pool state is recorded as NOT ok on purpose: a
+        // role that cannot run at all is exactly what a health check must
+        // surface, and the persistent-vs-transient classifier will (correctly)
+        // never clear it until a pool is provisioned.
+        RoleTickOutcome::NoTokenPool => (false, Some("no-token-pool".to_string())),
+    };
+    let mut ring = role_tick_ring()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if ring.len() >= ROLE_TICK_RING_CAPACITY {
+        ring.pop_front();
+    }
+    ring.push_back(RoleTickRecord {
+        root: root.to_path_buf(),
+        role: role.to_string(),
+        at,
+        ok,
+        detail,
+    });
+}
+
+/// [`record_role_tick_at`] stamped with the current wall clock.
+pub fn record_role_tick(role: &str, root: &Path, outcome: &RoleTickOutcome) {
+    record_role_tick_at(role, root, outcome, chrono::Utc::now());
+}
+
+/// Snapshot the role-tick ring, oldest first (Issue #4761).
+#[must_use]
+pub fn role_tick_records() -> Vec<RoleTickRecord> {
+    role_tick_ring()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .cloned()
+        .collect()
+}
+
+/// Test-only reset of the process-global role-tick ring.
+#[cfg(test)]
+fn reset_role_tick_ring() {
+    role_tick_ring()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clear();
 }
 
 /// Runs one role invocation. Abstracted behind a trait so the loop is
@@ -1649,6 +1740,11 @@ fn log_outcome_for_root_deduped(
     failing: &mut HashMap<PathBuf, bool>,
     no_token_pool: &mut HashMap<PathBuf, bool>,
 ) {
+    // Record the raw outcome BEFORE the log-dedup decision (#4761): the
+    // edge/repeat dedup exists to keep the *log* quiet, but a health check needs
+    // every tick — a persistently-failing root logs at DEBUG after its first
+    // WARN, which is exactly the case that must still surface as degraded.
+    record_role_tick(role, root, outcome);
     let was_failing = failing.get(root).copied().unwrap_or(false);
     let was_no_token_pool = no_token_pool.get(root).copied().unwrap_or(false);
     let action = classify_root_tick_log(outcome, elapsed, was_failing, was_no_token_pool);
@@ -3567,5 +3663,93 @@ mod tests {
         handle.abort();
 
         std::env::remove_var(crate::workspace_registry::REGISTRY_PATH_ENV);
+    }
+
+    // ===================================================================
+    // Role-tick health ring (#4761)
+    // ===================================================================
+
+    #[test]
+    #[serial(role_tick_ring)]
+    fn recording_a_tick_makes_it_readable_cross_process() {
+        reset_role_tick_ring();
+        let at = chrono::Utc::now();
+        record_role_tick_at("curator", Path::new("/r/loom"), &RoleTickOutcome::Success, at);
+
+        let records = role_tick_records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].role, "curator");
+        assert_eq!(records[0].root, PathBuf::from("/r/loom"));
+        assert_eq!(records[0].at, at);
+        assert!(records[0].ok);
+        assert_eq!(records[0].detail, None);
+    }
+
+    #[test]
+    #[serial(role_tick_ring)]
+    fn a_failure_records_its_reason() {
+        reset_role_tick_ring();
+        record_role_tick(
+            "champion",
+            Path::new("/r/loom"),
+            &RoleTickOutcome::Failure("mcp preflight failed".to_string()),
+        );
+        let records = role_tick_records();
+        assert!(!records[0].ok);
+        assert_eq!(records[0].detail.as_deref(), Some("mcp preflight failed"));
+    }
+
+    /// #4642's permanent no-pool state must surface as NOT-ok — a role that
+    /// cannot run at all is precisely what a health check exists to report.
+    #[test]
+    #[serial(role_tick_ring)]
+    fn a_missing_token_pool_records_as_not_ok() {
+        reset_role_tick_ring();
+        record_role_tick("guide", Path::new("/r/loom"), &RoleTickOutcome::NoTokenPool);
+        let records = role_tick_records();
+        assert!(!records[0].ok);
+        assert_eq!(records[0].detail.as_deref(), Some("no-token-pool"));
+    }
+
+    #[test]
+    #[serial(role_tick_ring)]
+    fn the_ring_is_bounded_and_keeps_the_newest_entries() {
+        reset_role_tick_ring();
+        for _ in 0..(ROLE_TICK_RING_CAPACITY + 10) {
+            record_role_tick("curator", Path::new("/r/loom"), &RoleTickOutcome::Success);
+        }
+        record_role_tick(
+            "curator",
+            Path::new("/r/loom"),
+            &RoleTickOutcome::Failure("newest".to_string()),
+        );
+        let records = role_tick_records();
+        assert_eq!(records.len(), ROLE_TICK_RING_CAPACITY);
+        assert_eq!(records.last().unwrap().detail.as_deref(), Some("newest"));
+    }
+
+    /// The log-dedup path (#4349) downgrades a *repeat* failure to DEBUG, but
+    /// the health ring must still see every one of them — otherwise a
+    /// persistently-broken root would look quiet to a health check.
+    #[test]
+    #[serial(role_tick_ring)]
+    fn repeat_failures_are_all_recorded_even_though_the_log_dedups_them() {
+        reset_role_tick_ring();
+        let mut failing = HashMap::new();
+        let mut no_pool = HashMap::new();
+        let root = PathBuf::from("/r/loom");
+        for _ in 0..3 {
+            log_outcome_for_root_deduped(
+                "curator",
+                &root,
+                &RoleTickOutcome::Failure("boom".to_string()),
+                Duration::from_secs(30),
+                &mut failing,
+                &mut no_pool,
+            );
+        }
+        let records = role_tick_records();
+        assert_eq!(records.len(), 3, "every tick is recorded, not just the fail edge");
+        assert!(records.iter().all(|r| !r.ok));
     }
 }

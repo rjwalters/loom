@@ -891,7 +891,11 @@ fn default_sweep_runtime() -> String {
 /// prints is NOT included here — it is a slow per-account network probe the CLI
 /// collects client-side via `loom-tokens check --json` (mirroring
 /// `probe-tokens.sh`), so the IPC handler stays fast.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `Default` (added with #4761) is the zero-workspaces / zero-in-flight shape a
+/// freshly-started daemon with no registered repos reports — it exists so test
+/// fixtures can spread `..Default::default()` instead of restating ~40 fields
+/// (and needing an edit every time one is added).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DaemonStatusReport {
     /// Sweeps in a non-terminal state (`Pending` / `Running`) at snapshot time.
     /// The full `SweepInfo` is carried so the CLI can render issue numbers,
@@ -1233,6 +1237,126 @@ pub struct DaemonStatusReport {
     /// compatible.
     #[serde(default)]
     pub work_finder_enabled: Option<bool>,
+    /// The most recent work-finder tick's dispatch/skip summary (Issue #4761),
+    /// published by the loop itself via
+    /// [`crate::work_finder::publish_tick_summary`] and read back here so a
+    /// cross-process consumer (`loom-daemon health`, the dashboard) can see
+    /// *why* a tick dispatched nothing without grepping the daemon log. `None`
+    /// when the loop has not completed a tick this process (or is disabled),
+    /// and for a pre-#4761 wire payload. `#[serde(default)]` keeps older wire
+    /// data / older clients compatible.
+    #[serde(default)]
+    pub last_work_finder_tick: Option<WorkFinderTickSummary>,
+    /// A bounded, newest-last window of per-(root, role) role-runner tick
+    /// outcomes (Issue #4761), published by the role-runner loop via
+    /// [`crate::role_runner::record_role_tick`]. Carried as raw records rather
+    /// than a pre-computed verdict so the *client* chooses the window
+    /// (`loom-daemon health --since 30m`) and applies the
+    /// transient-vs-persistent classifier
+    /// ([`crate::health::summarize_role_ticks`]) — the daemon has no opinion
+    /// about which window an operator cares about. Bounded to
+    /// [`crate::role_runner::ROLE_TICK_RING_CAPACITY`] entries so the payload
+    /// stays small enough for a 5s-interval dashboard poll. Empty when the
+    /// role runner is disabled or has not ticked. `#[serde(default)]` keeps
+    /// pre-#4761 wire data compatible.
+    #[serde(default)]
+    pub role_tick_records: Vec<RoleTickRecord>,
+}
+
+/// One work-finder tick's dispatch/skip tally, stamped with the wall-clock
+/// time it completed and the dynamic cap it ran under (Issue #4761).
+///
+/// A serializable projection of [`crate::work_finder::TickReport`] — the
+/// counters an operator reads off the `work_finder: tick — …` log line, made
+/// queryable over IPC so `loom-daemon health` can render the same one-line
+/// dispatch summary without log scraping. Deliberately a *separate* type from
+/// `TickReport`: that struct is the loop's internal per-tick accumulator and
+/// is free to change shape, whereas this is a wire contract.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkFinderTickSummary {
+    /// When the tick completed.
+    pub at: DateTime<Utc>,
+    /// The dynamic concurrency cap this tick ran under.
+    pub max_concurrent: usize,
+    /// Ready `loom:issue` rows the source returned this tick.
+    pub seen: usize,
+    /// Issues for which a new sweep was dispatched this tick.
+    pub dispatched: usize,
+    /// Issues skipped for carrying a park/skip label.
+    pub skipped_labeled: usize,
+    /// Issues skipped because a live sweep already exists for them.
+    pub skipped_in_flight: usize,
+    /// Issues skipped for an insta-crash quarantine.
+    pub skipped_quarantined: usize,
+    /// Issues skipped because they already have an open linked PR.
+    pub skipped_pr_open: usize,
+    /// Issues skipped because a peer host advertised a live soft claim.
+    pub skipped_peer_claim: usize,
+    /// Issues skipped inside a per-issue dispatch-backoff window.
+    pub skipped_backoff: usize,
+    /// Issues deferred because the concurrency cap was reached.
+    pub deferred_capacity: usize,
+    /// Issues deferred because the per-tick admission ramp cap was reached.
+    pub deferred_ramp_cap: usize,
+    /// Dispatch attempts that returned an error.
+    pub errors: usize,
+    /// Whether any workspace was gated by the main-health halt this tick.
+    pub halted: bool,
+}
+
+impl WorkFinderTickSummary {
+    /// The single-line skip-reason summary `loom-daemon health` renders —
+    /// only the non-zero terms, so a clean tick reads `12 seen, 2 dispatched`
+    /// rather than a wall of zeros.
+    #[must_use]
+    pub fn reason_summary(&self) -> String {
+        let mut parts = vec![
+            format!("{} seen", self.seen),
+            format!("{} dispatched", self.dispatched),
+        ];
+        for (n, label) in [
+            (self.skipped_labeled, "labeled-skip"),
+            (self.skipped_in_flight, "in-flight-skip"),
+            (self.skipped_quarantined, "quarantine-skip"),
+            (self.skipped_pr_open, "pr-open-skip"),
+            (self.skipped_peer_claim, "peer-claim-skip"),
+            (self.skipped_backoff, "backoff-skip"),
+            (self.deferred_capacity, "deferred-capacity"),
+            (self.deferred_ramp_cap, "deferred-ramp"),
+            (self.errors, "error"),
+        ] {
+            if n > 0 {
+                parts.push(format!("{n} {label}"));
+            }
+        }
+        if self.halted {
+            parts.push("HALTED".to_string());
+        }
+        parts.join(", ")
+    }
+}
+
+/// One role-runner tick outcome for one `(root, role)` pair (Issue #4761).
+///
+/// The raw evidence the transient-vs-persistent classifier
+/// ([`crate::health::summarize_role_ticks`]) consumes: a failure whose
+/// `(root, role)` later ticked successfully **within the same window** was
+/// self-recovered (transient) and is deliberately not surfaced; only a
+/// `(root, role)` whose *latest* record in the window is a failure is
+/// persistent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RoleTickRecord {
+    /// The workspace root this tick ran for.
+    pub root: PathBuf,
+    /// The role name (`champion`, `curator`, …).
+    pub role: String,
+    /// When the tick completed.
+    pub at: DateTime<Utc>,
+    /// Whether the invocation succeeded.
+    pub ok: bool,
+    /// Short failure detail when `ok` is `false` (the failure reason / runtime
+    /// rejection / `no-token-pool` sentinel), else `None`.
+    pub detail: Option<String>,
 }
 
 /// Live safehouse connection status for `loom-daemon status` (Issue #4345).

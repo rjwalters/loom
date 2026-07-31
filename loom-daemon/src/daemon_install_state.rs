@@ -448,6 +448,52 @@ fn pid_alive(pid: u32) -> bool {
     probe_output(cmd, PROBE_TIMEOUT).is_some_and(|o| o.status.success())
 }
 
+/// The process-name pattern [`pgrep_daemon_pids`] matches. Matched against the
+/// process *name* (`pgrep -x`), never the full command line, so an operator's
+/// `grep loom-daemon` shell or an editor buffer can never be mistaken for a
+/// running daemon.
+const DAEMON_PROCESS_NAME: &str = "loom-daemon";
+
+/// Live `loom-daemon` pids owned by the current user, via `pgrep -x -u <uid>`
+/// (Issue #4761) — a third liveness signal, wholly independent of both launchd
+/// and the pid file.
+///
+/// This exists for the same reason #4694's pid-file cross-check does: a
+/// negative from one probe must never be enough to declare the daemon dead.
+/// The launchd domain probe has already produced two false "dead" verdicts
+/// against a live, dispatching daemon; the pid file closes most of that gap,
+/// but it is itself absent/stale for a daemon started outside the managed
+/// wrapper. `pgrep` covers that last case.
+///
+/// Deliberately NOT wired into [`check_liveness`]: it is weaker evidence than
+/// the other two (it cannot tell *this* installation's daemon from a second one
+/// an operator started in a worktree), so it is exposed for consumers that want
+/// an explicit "do not declare dead without positive evidence" tier —
+/// [`crate::health`] — rather than silently changing `status`'s existing
+/// classification. Bounded by [`PROBE_TIMEOUT`]; an absent/hung `pgrep`
+/// degrades to an empty vec, i.e. "no answer", never "definitely dead".
+#[must_use]
+pub fn pgrep_daemon_pids() -> Vec<u32> {
+    let mut cmd = Command::new("pgrep");
+    match current_uid() {
+        Some(uid) => cmd.args(["-x", "-u", &uid, DAEMON_PROCESS_NAME]),
+        // No uid available: still worth asking, just unscoped.
+        None => cmd.args(["-x", DAEMON_PROCESS_NAME]),
+    };
+    let Some(output) = probe_output(cmd, PROBE_TIMEOUT) else {
+        return Vec::new();
+    };
+    // `pgrep` exits 1 when nothing matched — a legitimate "no processes", not a
+    // probe failure, and its stdout is empty either way.
+    let Ok(stdout) = String::from_utf8(output.stdout) else {
+        return Vec::new();
+    };
+    stdout
+        .lines()
+        .filter_map(|line| line.trim().parse::<u32>().ok())
+        .collect()
+}
+
 /// Current uid via `id -u`. Bounded by [`PROBE_TIMEOUT`]; a hung `id` degrades
 /// to `None`, exactly like an absent one (#4548).
 fn current_uid() -> Option<String> {

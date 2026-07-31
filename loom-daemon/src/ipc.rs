@@ -1670,6 +1670,16 @@ pub fn build_daemon_status(
         // costs no extra config read. Mirrors `main_health_gate_enabled`'s
         // `Some(resolve...)` shape.
         work_finder_enabled: Some(crate::work_finder::resolve_enabled(&wf_config)),
+        // Last completed work-finder tick + the role-tick ring (#4761) — both
+        // process-global slots the respective loops publish to each tick, read
+        // back here for the same reason the auto-update/host-breaker snapshots
+        // above are: they are the only cross-process view of *why* dispatch and
+        // the role cadence are (or are not) making progress, and
+        // `loom-daemon health` must not have to scrape the daemon log for them.
+        // Unset globals (loop never spawned) read as `None` / empty — honestly
+        // "no tick observed", never "nothing happened".
+        last_work_finder_tick: crate::work_finder::last_tick_summary(),
+        role_tick_records: crate::role_runner::role_tick_records(),
     }
 }
 
@@ -5350,6 +5360,21 @@ exit 0
                 reason: None,
             }),
             work_finder_enabled: Some(true),
+            last_work_finder_tick: Some(crate::types::WorkFinderTickSummary {
+                at: chrono::Utc::now(),
+                max_concurrent: 3,
+                seen: 9,
+                dispatched: 1,
+                skipped_in_flight: 8,
+                ..Default::default()
+            }),
+            role_tick_records: vec![crate::types::RoleTickRecord {
+                root: std::path::PathBuf::from("/repo/a"),
+                role: "champion".to_string(),
+                at: chrono::Utc::now(),
+                ok: true,
+                detail: None,
+            }],
         };
         let resp = Response::DaemonStatus(Box::new(report));
         let json = serde_json::to_string(&resp).expect("serialize response");
