@@ -3489,6 +3489,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(role_tick_ring)]
     fn test_log_outcome_for_root_deduped_tracks_failing_state_across_ticks() {
         let root = PathBuf::from("/tmp/does-not-need-to-exist-for-this-test");
         let mut failing: HashMap<PathBuf, bool> = HashMap::new();
@@ -3544,6 +3545,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(role_tick_ring)]
     fn test_log_outcome_for_root_deduped_is_independent_per_root() {
         // A failure on one registered root must not affect another root's
         // failing state (each workspace's health is tracked independently).
@@ -3574,6 +3576,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(role_tick_ring)]
     fn test_log_outcome_for_root_deduped_no_token_pool_tracked_independently_of_failing() {
         // #4642: a NoTokenPool tick must never mark `failing` true, and a
         // real Failure tick must never mark `no_token_pool` true — the two
