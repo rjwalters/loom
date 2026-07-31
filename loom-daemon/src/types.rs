@@ -1289,6 +1289,49 @@ pub struct DaemonStatusReport {
     /// different cwd (and a different `LOOM_*` env) than the daemon.
     #[serde(default)]
     pub pid_file: Option<PathBuf>,
+    /// The git commit the **running daemon binary** was built from (Issue
+    /// #4824) — [`crate::self_update::BUILT_COMMIT`], baked in at compile time
+    /// by `build.rs` and taken daemon-side inside the status handler.
+    ///
+    /// This is the field that lets a client tell *CLI/daemon build skew* apart
+    /// from a genuine fault. `loom-daemon` is one binary serving two roles, so
+    /// a client (`health`, the dashboard) knows its own `BUILT_COMMIT` but had
+    /// no way to learn the answering process's — and after every
+    /// `git pull` + rebuild the two disagree until the daemon is rolled. A
+    /// newer client then reads an *older* daemon's honest "I have no such
+    /// telemetry" (`None`) as "the subsystem is dead" and pages on a healthy
+    /// fleet (the 2026-07-31 false `DEGRADED`: a `health` built from a commit
+    /// with #4771's tick telemetry querying a daemon built one commit before
+    /// it). With this field the client reports the skew as its own condition.
+    ///
+    /// Deliberately distinct from [`crate::self_update::SelfUpdateStatus`]'s
+    /// `built_commit`, which compares *this* process's binary against its
+    /// source checkout; this compares the **client** process's build against
+    /// the **daemon** process's.
+    ///
+    /// `None` for a pre-#4824 wire payload from an older daemon binary that
+    /// never reported one (never misread as "matches"), and `Some("unknown")`
+    /// for a tarball build with no git commit available — both mean "cannot
+    /// compare". `#[serde(default)]` keeps older wire data compatible.
+    #[serde(default)]
+    pub daemon_build_commit: Option<String>,
+    /// The work-finder tick interval, in seconds, that THIS running daemon
+    /// process resolved (Issue #4824) via
+    /// [`crate::work_finder::resolve_interval_with_config`] — env > config >
+    /// default, exactly as the loop itself resolved it.
+    ///
+    /// Reported for the same reason [`Self::work_finder_enabled`] is: a client
+    /// must not re-derive the daemon's cadence from its own cwd/env. It is the
+    /// unit a client scales the post-restart grace window by ("no tick yet" is
+    /// only a fault once the daemon has been up for more than a couple of tick
+    /// intervals); without it a `health` run against a daemon on a longer
+    /// interval false-alarms for the whole first interval after every roll.
+    ///
+    /// `None` for a pre-#4824 wire payload ⇒ clients fall back to
+    /// [`crate::work_finder::DEFAULT_WORK_FINDER_INTERVAL_SECS`].
+    /// `#[serde(default)]` keeps older wire data compatible.
+    #[serde(default)]
+    pub work_finder_interval_secs: Option<u64>,
 }
 
 /// One work-finder tick's dispatch/skip tally, stamped with the wall-clock

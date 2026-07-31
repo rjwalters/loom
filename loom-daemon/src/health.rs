@@ -96,6 +96,26 @@ pub const DEFAULT_WINDOW_SECS: u64 = 30 * 60;
 /// the past.
 pub const RANKING_STALE_SECS: u64 = 6 * 600;
 
+/// How many work-finder tick intervals a daemon process must have been running
+/// before "no tick observed" counts as a fault (Issue #4824).
+///
+/// A freshly (re)started daemon legitimately has empty per-process tick
+/// telemetry until its loop's first tick lands, so for up to one interval after
+/// every `loom-daemon restart` — i.e. after every update roll — `health` used to
+/// report `dispatch DEGRADED` and exit `1` on a perfectly healthy fleet, paging
+/// whatever watchdog was scripted on it. Two intervals is the smallest window
+/// that also absorbs one *overrun* tick (the loop measures the next interval
+/// from when the previous tick's work finished) without absorbing a second
+/// consecutive miss — a work finder that has actually stopped is still caught
+/// within ~2 minutes on the default cadence.
+pub const WORK_FINDER_TICK_GRACE_INTERVALS: u64 = 2;
+
+/// The commit string a build with no git information available bakes in — the
+/// tarball-install case (`build.rs` cannot run `git rev-parse`). Compared as a
+/// value rather than matched structurally so both sides of the skew check treat
+/// it as "cannot compare" instead of as a real commit that never matches.
+const UNKNOWN_BUILD_COMMIT: &str = "unknown";
+
 // ============================================================================
 // Verdicts
 // ============================================================================
@@ -300,6 +320,27 @@ pub struct HealthInputs {
     pub ranking_age_secs: Option<u64>,
     /// Per-repo forge snapshot (`queued` + merged-in-window), when collected.
     pub pipeline: Option<Vec<RepoPipelineSnapshot>>,
+    /// The commit **this client process** was built from (Issue #4824) —
+    /// [`crate::self_update::BUILT_COMMIT`], threaded in by the collector
+    /// rather than read directly here so the skew rules are unit-testable
+    /// against synthetic commit pairs. Compared against the daemon's
+    /// [`DaemonStatusReport::daemon_build_commit`]; `"unknown"` (a tarball
+    /// build) means "cannot compare", never "skew".
+    pub cli_build_commit: String,
+    /// Age in seconds of the newest `work_finder:` line in the daemon log, when
+    /// the log was readable (Issue #4824).
+    ///
+    /// A **corroborating** signal only, in the same spirit as
+    /// [`Self::pid_file`]: it is never used to *derive* dispatch health, only to
+    /// refuse to declare the work finder dead while the daemon's own log shows
+    /// it ticking. That is exactly the 2026-07-31 disagreement this exists for —
+    /// `health` reporting "no work-finder tick observed" while `daemon.log`
+    /// carried a `work_finder: tick —` line every ~60s. `None` when the log
+    /// could not be resolved/read or carries no such line, which is treated as
+    /// "no corroboration either way", never as evidence of death — and also
+    /// when the collector did not bother to probe, which both collectors skip
+    /// unless the daemon actually reported no tick.
+    pub work_finder_log_tick_age_secs: Option<u64>,
 }
 
 // ============================================================================
@@ -623,6 +664,157 @@ fn liveness_detail_json(
     })
 }
 
+// ============================================================================
+// #4824 — telling CLI/daemon build skew and a warming-up daemon apart from a
+// dead work finder
+// ============================================================================
+
+/// The comparison between this client's build commit and the running daemon's
+/// ([`DaemonStatusReport::daemon_build_commit`], #4824).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "state", content = "daemon_commit")]
+pub enum BuildSkew {
+    /// Both commits are known and identical — the client is talking to a daemon
+    /// built from its own source. Only in this state can a client read the
+    /// daemon's absent telemetry as a real fault.
+    Match,
+    /// Both commits are known and differ. The daemon may simply predate the
+    /// telemetry the client expects.
+    Skew(String),
+    /// The daemon reported no commit at all ⇒ it predates #4824, so it also
+    /// predates every field added since. Indistinguishable from `Skew` for
+    /// health purposes, but reported separately because there is no sha to name.
+    DaemonUnknown,
+    /// No comparison is possible — this client (or the daemon) is a build with
+    /// no git commit baked in. Never claim skew from a non-comparison.
+    Incomparable,
+}
+
+impl BuildSkew {
+    /// Whether the two builds are known to differ (or cannot be shown to
+    /// match), i.e. whether missing daemon-side telemetry might be explained by
+    /// the daemon binary predating it.
+    #[must_use]
+    pub const fn may_predate_client(&self) -> bool {
+        matches!(self, Self::Skew(_) | Self::DaemonUnknown)
+    }
+}
+
+/// Compare a client's build commit against the daemon-reported one (#4824).
+///
+/// `"unknown"` on either side (a tarball build with no git information) yields
+/// [`BuildSkew::Incomparable`] rather than a false skew.
+#[must_use]
+pub fn classify_build_skew(cli_commit: &str, daemon_commit: Option<&str>) -> BuildSkew {
+    if cli_commit.is_empty() || cli_commit == UNKNOWN_BUILD_COMMIT {
+        return BuildSkew::Incomparable;
+    }
+    match daemon_commit {
+        None => BuildSkew::DaemonUnknown,
+        Some(c) if c.is_empty() || c == UNKNOWN_BUILD_COMMIT => BuildSkew::Incomparable,
+        Some(c) if c == cli_commit => BuildSkew::Match,
+        Some(c) => BuildSkew::Skew(c.to_string()),
+    }
+}
+
+/// Why the daemon reported no work-finder tick (#4824).
+///
+/// Only [`MissingTick::Dead`] is a fault. The other three are the false-DEGRADED
+/// modes that made `health` exit `1` on a demonstrably dispatching fleet, each
+/// reported as its own condition instead of being flattened into "the work
+/// finder is dead".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "reason")]
+pub enum MissingTick {
+    /// The daemon has not been up long enough for a tick to be due yet.
+    WarmingUp {
+        /// The live daemon process's age in seconds.
+        age_secs: u64,
+        /// The grace window this age was compared against.
+        grace_secs: u64,
+    },
+    /// The client and daemon were built from different commits, so the daemon
+    /// binary may simply predate the tick telemetry the client is looking for.
+    BuildSkew {
+        /// The daemon's build commit, when it reported one.
+        daemon_commit: Option<String>,
+    },
+    /// The status report carries no tick, but the daemon log shows recent
+    /// `work_finder:` activity — the loop is running, the telemetry is not
+    /// reaching the status report.
+    LogCorroborated {
+        /// Age in seconds of the newest `work_finder:` log line.
+        age_secs: u64,
+    },
+    /// Nothing explains the silence: a matching build, a daemon well past the
+    /// grace window, and no corroborating log activity.
+    Dead,
+}
+
+/// The grace window (seconds) a missing tick is tolerated for after a daemon
+/// (re)start: [`WORK_FINDER_TICK_GRACE_INTERVALS`] × the daemon's own resolved
+/// tick interval, falling back to the default cadence for a pre-#4824 daemon
+/// that does not report one.
+#[must_use]
+pub fn work_finder_grace_secs(status: &DaemonStatusReport) -> u64 {
+    status
+        .work_finder_interval_secs
+        .filter(|s| *s > 0)
+        .unwrap_or(crate::work_finder::DEFAULT_WORK_FINDER_INTERVAL_SECS)
+        .saturating_mul(WORK_FINDER_TICK_GRACE_INTERVALS)
+}
+
+/// Classify a missing work-finder tick (#4824), in strict precedence order:
+///
+/// 1. **Warming up** — the daemon process is younger than the grace window, so
+///    no tick is due yet. Checked first because it is the one explanation that
+///    is true regardless of build state, and it is what an operator hits
+///    immediately after every `loom-daemon restart`.
+/// 2. **Build skew** — the client and daemon binaries differ (or the daemon
+///    predates the field entirely), so its silence may just be an older binary
+///    that never had the counter. A client cannot distinguish "older daemon"
+///    from "dead loop" from the status payload alone, so it must not assert the
+///    stronger claim.
+/// 3. **Log corroboration** — the daemon log shows `work_finder:` activity
+///    within the grace window. Advisory evidence only, and it can only *soften*
+///    the verdict, never harden it.
+/// 4. **Dead** — none of the above; report the fault.
+#[must_use]
+pub fn classify_missing_tick(inputs: &HealthInputs, status: &DaemonStatusReport) -> MissingTick {
+    let grace_secs = work_finder_grace_secs(status);
+
+    if let Some(age_secs) = inputs
+        .install_state
+        .as_ref()
+        .and_then(|r| r.process_age_secs)
+        .filter(|age| *age < grace_secs)
+    {
+        return MissingTick::WarmingUp {
+            age_secs,
+            grace_secs,
+        };
+    }
+
+    let skew = classify_build_skew(&inputs.cli_build_commit, status.daemon_build_commit.as_deref());
+    if skew.may_predate_client() {
+        return MissingTick::BuildSkew {
+            daemon_commit: match skew {
+                BuildSkew::Skew(c) => Some(c),
+                _ => None,
+            },
+        };
+    }
+
+    if let Some(age) = inputs
+        .work_finder_log_tick_age_secs
+        .filter(|age| *age <= grace_secs)
+    {
+        return MissingTick::LogCorroborated { age_secs: age };
+    }
+
+    MissingTick::Dead
+}
+
 /// Assess the dispatch section: in-flight occupancy against the dynamic cap,
 /// plus the last work-finder tick's dispatch/skip-reason summary.
 #[must_use]
@@ -663,6 +855,10 @@ pub fn assess_dispatch(inputs: &HealthInputs) -> HealthSection {
         );
     }
 
+    // #4824: why the tick is missing, when it is. `None` whenever a tick was
+    // reported (or the loop is disabled — the DISABLED line above is already the
+    // whole story) so `--json` never carries a reason for a non-condition.
+    let mut missing_tick: Option<MissingTick> = None;
     let tick_line = match &status.last_work_finder_tick {
         Some(tick) => {
             if tick.errors > 0 {
@@ -675,11 +871,47 @@ pub fn assess_dispatch(inputs: &HealthInputs) -> HealthSection {
             )
         }
         None => {
-            // Only a fault when the loop is supposed to be running.
-            if status.work_finder_enabled != Some(false) {
-                degraded.push("no work-finder tick observed in this daemon process".to_string());
+            // Only a fault when the loop is supposed to be running...
+            if status.work_finder_enabled == Some(false) {
+                "no work-finder tick observed".to_string()
+            } else {
+                // ...and only when nothing else explains the silence (#4824).
+                // A newer CLI against an older daemon, and a daemon that has
+                // not been up long enough for its first tick, are both states
+                // in which "no tick" says nothing about the work finder — and
+                // reporting them as a dead loop paged operators after every
+                // update roll.
+                let reason = classify_missing_tick(inputs, status);
+                let line = match &reason {
+                    MissingTick::WarmingUp {
+                        age_secs,
+                        grace_secs,
+                    } => format!(
+                        "no tick yet — daemon warming up (up {}, first tick due within {})",
+                        format_age(i64::try_from(*age_secs).unwrap_or(i64::MAX)),
+                        format_age(i64::try_from(*grace_secs).unwrap_or(i64::MAX)),
+                    ),
+                    MissingTick::BuildSkew { daemon_commit } => format!(
+                        "no tick telemetry: daemon build {} ≠ CLI build {} — daemon predates \
+                         tick telemetry; update via loom-daemon-update.sh",
+                        daemon_commit.as_deref().unwrap_or("<unreported>"),
+                        inputs.cli_build_commit,
+                    ),
+                    MissingTick::LogCorroborated { age_secs } => format!(
+                        "no tick in status, but daemon log shows work_finder activity {} ago \
+                         (tick telemetry not published)",
+                        format_age(i64::try_from(*age_secs).unwrap_or(i64::MAX)),
+                    ),
+                    MissingTick::Dead => {
+                        degraded.push(
+                            "no work-finder tick observed in this daemon process".to_string(),
+                        );
+                        "no work-finder tick observed".to_string()
+                    }
+                };
+                missing_tick = Some(reason);
+                line
             }
-            "no work-finder tick observed".to_string()
         }
     };
 
@@ -705,6 +937,14 @@ pub fn assess_dispatch(inputs: &HealthInputs) -> HealthSection {
             "halted": status.main_health_gate_halted,
             "draining": status.draining,
             "last_tick": status.last_work_finder_tick,
+            // #4824 — the build-skew / warm-up / log-corroboration evidence a
+            // `--json` consumer needs to see *why* a missing tick was (or was
+            // not) treated as a fault.
+            "missing_tick": missing_tick,
+            "daemon_build_commit": status.daemon_build_commit,
+            "cli_build_commit": inputs.cli_build_commit,
+            "work_finder_interval_secs": status.work_finder_interval_secs,
+            "work_finder_log_tick_age_secs": inputs.work_finder_log_tick_age_secs,
             "issues": degraded,
         }),
     )
@@ -1020,6 +1260,100 @@ fn repo_label(root: &std::path::Path) -> String {
         .map_or_else(|| root.display().to_string(), |n| n.to_string_lossy().into_owned())
 }
 
+// ============================================================================
+// #4824 — the daemon-log corroborating signal
+// ============================================================================
+
+/// The substring every work-finder log line carries (`work_finder: tick — …`,
+/// `work_finder: dispatching issue #…`).
+const WORK_FINDER_LOG_MARKER: &str = "work_finder:";
+
+/// How much of the daemon log's tail to read for the corroborating probe.
+///
+/// The log rotates at 10 MiB and the work finder writes at least one line per
+/// tick, so a quarter-megabyte tail always spans far more than the grace window
+/// this signal is compared against — while keeping the probe a single bounded
+/// read rather than a scan of the whole file.
+const DAEMON_LOG_TAIL_BYTES: u64 = 256 * 1024;
+
+/// The daemon log's line-prefix timestamp format, as written by the daemon's
+/// `env_logger` format hook (`[2026-07-31T14:27:33.950] [INFO] …`) — a **local**
+/// naive stamp with no offset, which is why the comparison below is done in
+/// local time rather than UTC.
+const DAEMON_LOG_STAMP_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%.3f";
+
+/// Parse the leading `[<stamp>]` of one daemon-log line.
+fn parse_log_line_stamp(line: &str) -> Option<chrono::NaiveDateTime> {
+    let (stamp, _) = line.strip_prefix('[')?.split_once(']')?;
+    chrono::NaiveDateTime::parse_from_str(stamp, DAEMON_LOG_STAMP_FORMAT).ok()
+}
+
+/// Age in seconds of the newest `work_finder:` line in a daemon-log tail,
+/// measured against `now_local` (Issue #4824).
+///
+/// Pure over the log text so the corroboration rule is unit-testable without a
+/// daemon or a real log file. `None` when the tail carries no parseable
+/// `work_finder:` line — honestly "no corroboration", never "the loop is dead".
+/// A stamp in the future (clock skew) reads as age `0` rather than underflowing.
+#[must_use]
+pub fn work_finder_log_tick_age_secs(
+    log_tail: &str,
+    now_local: chrono::NaiveDateTime,
+) -> Option<u64> {
+    let stamp = log_tail
+        .lines()
+        .rev()
+        .filter(|line| line.contains(WORK_FINDER_LOG_MARKER))
+        .find_map(parse_log_line_stamp)?;
+    Some(u64::try_from((now_local - stamp).num_seconds()).unwrap_or(0))
+}
+
+/// Resolve the daemon log path the way the daemon itself does: `LOOM_DAEMON_LOG`
+/// (full override) when set, else `<loom dir>/daemon.log` where the loom dir is
+/// `LOOM_SOCKET_PATH`'s parent (test isolation) or `$HOME/.loom`.
+///
+/// Mirrors the binary-side `daemon_service::resolve_log_path` /
+/// `resolve_loom_dir` pair (#4010), which is private to the binary crate and so
+/// unreachable from this library module and from `cli::health`.
+#[must_use]
+pub fn resolve_daemon_log_path() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("LOOM_DAEMON_LOG") {
+        return Some(PathBuf::from(path));
+    }
+    let loom_dir = match std::env::var("LOOM_SOCKET_PATH") {
+        Ok(socket) => PathBuf::from(socket).parent()?.to_path_buf(),
+        Err(_) => dirs::home_dir()?.join(".loom"),
+    };
+    Some(loom_dir.join("daemon.log"))
+}
+
+/// Probe the daemon log for the newest `work_finder:` line's age (Issue #4824)
+/// — the I/O half of [`work_finder_log_tick_age_secs`].
+///
+/// Best-effort like every other collector input: any failure (no resolvable
+/// path, unreadable file, no matching line) is `None`, which the classifier
+/// treats as "no corroboration either way".
+#[must_use]
+pub fn probe_work_finder_log_tick_age() -> Option<u64> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let path = resolve_daemon_log_path()?;
+    let mut file = std::fs::File::open(&path).ok()?;
+    let len = file.metadata().ok()?.len();
+    if len > DAEMON_LOG_TAIL_BYTES {
+        file.seek(SeekFrom::Start(len - DAEMON_LOG_TAIL_BYTES))
+            .ok()?;
+    }
+    let mut buf = Vec::with_capacity(DAEMON_LOG_TAIL_BYTES as usize);
+    file.take(DAEMON_LOG_TAIL_BYTES)
+        .read_to_end(&mut buf)
+        .ok()?;
+    work_finder_log_tick_age_secs(
+        &String::from_utf8_lossy(&buf),
+        chrono::Local::now().naive_local(),
+    )
+}
+
 /// Render an age in seconds compactly (`43s`, `7m`, `2h`, `3d`). Negative ages
 /// (a clock skew between the daemon's stamp and this process) render as `0s`
 /// rather than a nonsensical negative.
@@ -1078,6 +1412,12 @@ mod tests {
             },
             dynamic_cap: 7,
             work_finder_enabled: Some(true),
+            // #4824: the healthy baseline is a daemon built from the SAME
+            // commit as the client asking, on the default tick cadence — the
+            // only state in which missing telemetry is attributable to the
+            // daemon rather than to build skew.
+            daemon_build_commit: Some(CLI_COMMIT.to_string()),
+            work_finder_interval_secs: Some(60),
             ..Default::default()
         };
         status.last_work_finder_tick = Some(crate::types::WorkFinderTickSummary {
@@ -1108,8 +1448,15 @@ mod tests {
                 merged_24h: Some(3),
                 ..Default::default()
             }]),
+            cli_build_commit: CLI_COMMIT.to_string(),
+            work_finder_log_tick_age_secs: None,
         }
     }
+
+    /// The client's build commit in every fixture below. A synthetic value, not
+    /// the real [`crate::self_update::BUILT_COMMIT`], so the skew assertions do
+    /// not depend on how the test binary happened to be built.
+    const CLI_COMMIT: &str = "18887b5c";
 
     // ===================================================================
     // #4694 regression pins — liveness precedence
@@ -1424,11 +1771,21 @@ mod tests {
             .contains("12 seen, 2 dispatched, 10 in-flight-skip"));
     }
 
-    #[test]
-    fn dispatch_missing_tick_is_degraded_when_work_finder_is_enabled() {
+    /// Inputs with no tick reported, a daemon well past the warm-up grace
+    /// window, a matching build, and no corroborating log line — the one state
+    /// in which "no tick" really does mean the work finder is dead (#4824).
+    fn missing_tick_inputs() -> HealthInputs {
         let mut inputs = healthy_inputs();
         inputs.status.as_mut().unwrap().last_work_finder_tick = None;
-        let section = assess_dispatch(&inputs);
+        let mut report = install_report(InstallState::AliveButUnresponsive);
+        report.process_age_secs = Some(3600);
+        inputs.install_state = Some(report);
+        inputs
+    }
+
+    #[test]
+    fn dispatch_missing_tick_is_degraded_when_work_finder_is_enabled() {
+        let section = assess_dispatch(&missing_tick_inputs());
         assert_eq!(section.verdict, Verdict::Degraded);
     }
 
@@ -1445,6 +1802,245 @@ mod tests {
         assert!(!section
             .summary
             .contains("no work-finder tick observed in this daemon process"));
+    }
+
+    // ===================================================================
+    // #4824 regression pins — build skew and the post-restart grace window
+    // must not be reported as a dead work finder
+    // ===================================================================
+
+    /// The message a genuinely dead work finder produces. Asserted absent in
+    /// every false-DEGRADED case below.
+    const DEAD_WORK_FINDER_MSG: &str = "no work-finder tick observed in this daemon process";
+
+    /// THE #4824 pin, mode 1. A `health` built from HEAD querying a daemon
+    /// built one commit earlier: the daemon cannot report a counter it does not
+    /// have, and rendering that absence as "work finder dead" paged operators
+    /// on a fleet that was demonstrably dispatching.
+    #[test]
+    fn dispatch_missing_tick_reports_build_skew_not_a_dead_work_finder() {
+        let mut inputs = missing_tick_inputs();
+        inputs.status.as_mut().unwrap().daemon_build_commit = Some("105f9c12".to_string());
+        let section = assess_dispatch(&inputs);
+        assert_eq!(section.verdict, Verdict::Green, "{}", section.summary);
+        assert!(section.summary.contains("105f9c12"), "{}", section.summary);
+        assert!(section.summary.contains("predates tick telemetry"), "{}", section.summary);
+        assert!(section.summary.contains("loom-daemon-update.sh"), "{}", section.summary);
+        assert!(!section.summary.contains(DEAD_WORK_FINDER_MSG), "{}", section.summary);
+        assert_eq!(section.detail["missing_tick"]["reason"], "build_skew");
+    }
+
+    /// A daemon predating #4824 reports no commit at all. That is *also* skew
+    /// (it necessarily predates every field added since), and must be named as
+    /// such rather than collapsed into a dead-loop verdict.
+    #[test]
+    fn dispatch_missing_tick_from_a_daemon_with_no_reported_commit_is_skew() {
+        let mut inputs = missing_tick_inputs();
+        inputs.status.as_mut().unwrap().daemon_build_commit = None;
+        let section = assess_dispatch(&inputs);
+        assert_eq!(section.verdict, Verdict::Green, "{}", section.summary);
+        assert!(section.summary.contains("<unreported>"), "{}", section.summary);
+        assert!(!section.summary.contains(DEAD_WORK_FINDER_MSG), "{}", section.summary);
+    }
+
+    /// AC4: exit code stays 0 under skew when everything else is green.
+    #[test]
+    fn build_skew_alone_does_not_change_the_exit_code() {
+        let mut inputs = missing_tick_inputs();
+        inputs.status.as_mut().unwrap().daemon_build_commit = Some("105f9c12".to_string());
+        assert_eq!(assess(&inputs).exit_code(), EXIT_HEALTHY);
+    }
+
+    /// THE #4824 pin, mode 2. Immediately after `loom-daemon restart` the
+    /// per-process telemetry is legitimately empty for up to one tick interval.
+    #[test]
+    fn dispatch_missing_tick_within_the_grace_window_reports_warming_up() {
+        let mut inputs = missing_tick_inputs();
+        let mut report = install_report(InstallState::AliveButUnresponsive);
+        report.process_age_secs = Some(30);
+        inputs.install_state = Some(report);
+        let section = assess_dispatch(&inputs);
+        assert_eq!(section.verdict, Verdict::Green, "{}", section.summary);
+        assert!(section.summary.contains("warming up"), "{}", section.summary);
+        assert!(!section.summary.contains(DEAD_WORK_FINDER_MSG), "{}", section.summary);
+        assert_eq!(section.detail["missing_tick"]["reason"], "warming_up");
+        assert_eq!(assess(&inputs).exit_code(), EXIT_HEALTHY);
+    }
+
+    /// The grace window is `2 ×` the daemon's OWN resolved interval, not the
+    /// default: a daemon on a 300s cadence must not false-alarm for its whole
+    /// first interval after a roll.
+    #[test]
+    fn the_grace_window_scales_with_the_daemons_own_tick_interval() {
+        let mut inputs = missing_tick_inputs();
+        let mut report = install_report(InstallState::AliveButUnresponsive);
+        report.process_age_secs = Some(400);
+        inputs.install_state = Some(report);
+
+        // Default 60s cadence ⇒ 120s grace ⇒ 400s old is well past it.
+        inputs.status.as_mut().unwrap().work_finder_interval_secs = Some(60);
+        assert_eq!(assess_dispatch(&inputs).verdict, Verdict::Degraded);
+
+        // 300s cadence ⇒ 600s grace ⇒ still warming up.
+        inputs.status.as_mut().unwrap().work_finder_interval_secs = Some(300);
+        let section = assess_dispatch(&inputs);
+        assert_eq!(section.verdict, Verdict::Green, "{}", section.summary);
+        assert!(section.summary.contains("warming up"), "{}", section.summary);
+    }
+
+    /// A pre-#4824 daemon reports no interval; fall back to the default cadence
+    /// rather than treating the absence as "no grace at all".
+    #[test]
+    fn an_unreported_tick_interval_falls_back_to_the_default_cadence() {
+        let mut status = healthy_status();
+        status.work_finder_interval_secs = None;
+        assert_eq!(
+            work_finder_grace_secs(&status),
+            crate::work_finder::DEFAULT_WORK_FINDER_INTERVAL_SECS
+                * WORK_FINDER_TICK_GRACE_INTERVALS
+        );
+    }
+
+    /// AC5: the daemon log is consulted as a corroborating signal before the
+    /// work finder is declared dead — the exact 2026-07-31 disagreement, where
+    /// `health` said "no tick" while `daemon.log` carried one every ~60s.
+    #[test]
+    fn recent_work_finder_log_activity_blocks_a_dead_verdict() {
+        let mut inputs = missing_tick_inputs();
+        inputs.work_finder_log_tick_age_secs = Some(45);
+        let section = assess_dispatch(&inputs);
+        assert_eq!(section.verdict, Verdict::Green, "{}", section.summary);
+        assert!(section.summary.contains("daemon log"), "{}", section.summary);
+        assert!(!section.summary.contains(DEAD_WORK_FINDER_MSG), "{}", section.summary);
+        assert_eq!(section.detail["missing_tick"]["reason"], "log_corroborated");
+    }
+
+    /// Corroboration can only *soften* the verdict, never harden it — and a log
+    /// line older than the grace window corroborates nothing.
+    #[test]
+    fn stale_work_finder_log_activity_does_not_block_a_dead_verdict() {
+        let mut inputs = missing_tick_inputs();
+        inputs.work_finder_log_tick_age_secs = Some(9_999);
+        assert_eq!(assess_dispatch(&inputs).verdict, Verdict::Degraded);
+    }
+
+    /// THE regression guard. With a matching build, a daemon long past the
+    /// grace window, and no corroborating log activity, a missing tick is still
+    /// a fault — this fix must not be able to silence a genuinely dead work
+    /// finder.
+    #[test]
+    fn a_genuinely_dead_work_finder_is_still_degraded() {
+        let inputs = missing_tick_inputs();
+        let section = assess_dispatch(&inputs);
+        assert_eq!(section.verdict, Verdict::Degraded);
+        assert!(section.summary.contains(DEAD_WORK_FINDER_MSG), "{}", section.summary);
+        assert_eq!(section.detail["missing_tick"]["reason"], "dead");
+        assert_eq!(assess(&inputs).exit_code(), EXIT_DEGRADED);
+    }
+
+    /// Warm-up outranks skew: a just-restarted daemon on a *different* commit
+    /// is reported as warming up, the explanation that is true regardless of
+    /// build state.
+    #[test]
+    fn warming_up_outranks_build_skew() {
+        let mut inputs = missing_tick_inputs();
+        inputs.status.as_mut().unwrap().daemon_build_commit = Some("105f9c12".to_string());
+        let mut report = install_report(InstallState::AliveButUnresponsive);
+        report.process_age_secs = Some(5);
+        inputs.install_state = Some(report);
+        assert_eq!(
+            classify_missing_tick(&inputs, inputs.status.as_ref().unwrap()),
+            MissingTick::WarmingUp {
+                age_secs: 5,
+                grace_secs: 120
+            }
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // #4824 — build-skew classification
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn identical_commits_are_a_match() {
+        assert_eq!(classify_build_skew("abc1234", Some("abc1234")), BuildSkew::Match);
+        assert!(!BuildSkew::Match.may_predate_client());
+    }
+
+    #[test]
+    fn differing_commits_are_skew() {
+        assert_eq!(
+            classify_build_skew("abc1234", Some("def5678")),
+            BuildSkew::Skew("def5678".to_string())
+        );
+        assert!(classify_build_skew("abc1234", Some("def5678")).may_predate_client());
+    }
+
+    #[test]
+    fn an_absent_daemon_commit_is_daemon_unknown() {
+        assert_eq!(classify_build_skew("abc1234", None), BuildSkew::DaemonUnknown);
+        assert!(BuildSkew::DaemonUnknown.may_predate_client());
+    }
+
+    /// A tarball build bakes in `"unknown"`. It must never be read as a commit
+    /// that happens to differ from every real one — that would permanently
+    /// suppress the dead-work-finder verdict on such an install.
+    #[test]
+    fn an_unknown_commit_on_either_side_is_incomparable() {
+        assert_eq!(classify_build_skew("unknown", Some("def5678")), BuildSkew::Incomparable);
+        assert_eq!(classify_build_skew("abc1234", Some("unknown")), BuildSkew::Incomparable);
+        assert!(!BuildSkew::Incomparable.may_predate_client());
+    }
+
+    /// …and an incomparable build must therefore still produce a dead verdict
+    /// when nothing else explains the silence.
+    #[test]
+    fn an_incomparable_build_still_reports_a_dead_work_finder() {
+        let mut inputs = missing_tick_inputs();
+        inputs.cli_build_commit = "unknown".to_string();
+        assert_eq!(assess_dispatch(&inputs).verdict, Verdict::Degraded);
+    }
+
+    // -------------------------------------------------------------------
+    // #4824 — the daemon-log corroborating probe (pure half)
+    // -------------------------------------------------------------------
+
+    fn log_now() -> chrono::NaiveDateTime {
+        chrono::NaiveDateTime::parse_from_str("2026-07-31T14:30:00.000", DAEMON_LOG_STAMP_FORMAT)
+            .unwrap()
+    }
+
+    #[test]
+    fn log_probe_reads_the_newest_work_finder_line() {
+        let log = "\
+[2026-07-31T14:20:00.000] [INFO] work_finder: tick — cap 16; 12 seen, 0 dispatched
+[2026-07-31T14:29:30.500] [INFO] work_finder: tick — cap 16; 12 seen, 2 dispatched
+[2026-07-31T14:29:59.000] [INFO] sweep_registry: reaped 1 finished sweep
+";
+        assert_eq!(work_finder_log_tick_age_secs(log, log_now()), Some(29));
+    }
+
+    #[test]
+    fn log_probe_returns_none_without_a_work_finder_line() {
+        let log = "[2026-07-31T14:29:59.000] [INFO] sweep_registry: reaped 1 finished sweep\n";
+        assert_eq!(work_finder_log_tick_age_secs(log, log_now()), None);
+    }
+
+    /// The tail read starts mid-line, so the first line is routinely a fragment
+    /// with no parseable `[stamp]`. It must be skipped, not abort the scan.
+    #[test]
+    fn log_probe_skips_an_unparseable_partial_first_line() {
+        let log = "ck — cap 16; 12 seen, 0 dispatched  work_finder: partial\n\
+[2026-07-31T14:28:00.000] [INFO] work_finder: tick — cap 16; 12 seen, 1 dispatched\n";
+        assert_eq!(work_finder_log_tick_age_secs(log, log_now()), Some(120));
+    }
+
+    /// Clock skew (the log stamped ahead of this process) reads as age 0, never
+    /// an underflow.
+    #[test]
+    fn log_probe_clamps_a_future_stamp_to_zero() {
+        let log = "[2026-07-31T14:35:00.000] [INFO] work_finder: tick — cap 16\n";
+        assert_eq!(work_finder_log_tick_age_secs(log, log_now()), Some(0));
     }
 
     #[test]
