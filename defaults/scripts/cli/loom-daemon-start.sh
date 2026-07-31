@@ -207,6 +207,13 @@ if [[ -r "$_LOOM_LAUNCHD_LIB_DIR/systemd-user.sh" ]]; then
     # shellcheck source=../lib/systemd-user.sh
     source "$_LOOM_LAUNCHD_LIB_DIR/systemd-user.sh"
 fi
+# bounded_run() (#4398, shared with loom-daemon-watchdog.sh's IPC probe) —
+# print_calibrate_hint() below needs it to bound its own blocking `$(...)`
+# call (#4799).
+if [[ -r "$_LOOM_LAUNCHD_LIB_DIR/bounded-run.sh" ]]; then
+    # shellcheck source=../lib/bounded-run.sh
+    source "$_LOOM_LAUNCHD_LIB_DIR/bounded-run.sh"
+fi
 
 # resolve_plist_path() — the deterministic PATH baked into every rendered
 # plist (daemon + watchdog), issue #4172. Previously the rendered PATH was
@@ -753,12 +760,28 @@ print_safehouse_status() {
 # Never fatal: a missing jq, a calibrate error, or an unparseable payload all
 # fall through silently -- this is advisory-only, exactly like
 # print_safehouse_status above.
+#
+# BOUNDED (#4799): `calibrate` is normally file/host-based and fast (see
+# above), but a `$DAEMON_BIN` with no `calibrate` handler at all -- a test
+# fixture stub, or a future breaking CLI change -- makes the `$(...)` below
+# block forever, exactly like the #4773 leak incident this call reproduced
+# verbatim under the #4790 judge's hard-kill repro. Worse, a signal arriving
+# while THIS script is blocked inside that command substitution is deferred
+# until the substitution returns -- which for a truly-wedged child never
+# happens -- so even loom-daemon-start.sh's own EXIT/INT/TERM traps cannot
+# fire in that state. bounded_run() (lib/bounded-run.sh, shared with
+# loom-daemon-watchdog.sh's IPC probe, #4398) guarantees the substitution
+# always returns, closing that gap. If the lib failed to source for any
+# reason, `bounded_run` is simply undefined and the `|| return 0` below
+# degrades this hint to a silent no-op -- never a hang.
+CALIBRATE_HINT_TIMEOUT_SECS="${LOOM_CALIBRATE_HINT_TIMEOUT_SECS:-5}"
+[[ "$CALIBRATE_HINT_TIMEOUT_SECS" =~ ^[0-9]+$ ]] || CALIBRATE_HINT_TIMEOUT_SECS=5
 print_calibrate_hint() {
     if ! command -v jq >/dev/null 2>&1; then
         return 0
     fi
     local calib_json
-    calib_json="$("$DAEMON_BIN" calibrate --workspace "$REPO_ROOT" --json 2>/dev/null)" || return 0
+    calib_json="$(bounded_run "$CALIBRATE_HINT_TIMEOUT_SECS" "$DAEMON_BIN" calibrate --workspace "$REPO_ROOT" --json 2>/dev/null)" || return 0
     [[ -n "$calib_json" ]] || return 0
 
     local binding ceiling idle idle_pct

@@ -28,6 +28,7 @@
 
 test-archive-transcripts.sh
 test-blame-issue.sh
+test-bounded-run.sh
 test-build-rs-watchset.sh
 test-build-slot.sh
 test-champion-critical-file-check.sh
@@ -60,6 +61,7 @@ test-judge-fanout-experiment.sh
 test-loom-daemon-launchd-plist.sh
 test-loom-daemon-start.sh
 test-loom-daemon-stop.sh
+test-loom-daemon-update.sh
 test-loom-daemon-watchdog.sh
 test-loom-dispatcher.sh
 test-loom-status.sh

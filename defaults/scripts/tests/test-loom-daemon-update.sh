@@ -62,6 +62,36 @@ _PROD_DAEMON_CHECKSUM_BEFORE="$(_prod_daemon_checksum)"
 # com.rjwalters.loom-daemon LaunchAgent under the exact same default label.
 export LOOM_DAEMON_LAUNCHD=0
 
+# Force the legacy nohup path on LINUX too (#4799 CI hang). The launchd knob
+# above only sandboxes Darwin; on a Linux runner `MINIMAL_PATH` below still
+# reaches the REAL /usr/bin/systemctl and `is_linux_systemd` (lib/systemd-user.sh)
+# returns true whenever the runner has a reachable `systemctl --user` manager.
+# That made the suite non-hermetic AND non-terminating in CI:
+#
+#   1. scenario 5's real loom-daemon-start.sh took the systemd branch and ran
+#      `systemctl --user enable --now loom-daemon.service` -- the DEFAULT unit
+#      name, i.e. the operator's/runner's real user unit, plus a real
+#      `loom-daemon-watchdog.timer` (provision_watchdog_job_systemd derives its
+#      name from the daemon unit, NOT from the sandboxed LOOM_WATCHDOG_LABEL).
+#   2. every LATER scenario then saw `systemd_unit_loaded` == true, so
+#      loom-daemon-update.sh resolved DAEMON_MANAGER=systemd and took the
+#      supervised-restart branch: `"$PROVISION_TARGET" restart`.
+#   3. PROVISION_TARGET is the fake-daemon fixture, which has no `restart`
+#      handler -- so it fell straight into its `while true; do sleep 1; done`
+#      daemon body IN THE FOREGROUND and never returned. Scenario 5b wedged
+#      there for the full 1200s per-suite CI budget (exit 124).
+#
+# A macOS dev run never exercises any of this (no systemctl), which is exactly
+# why the suite passed locally in ~4m and hung in CI. The systemd-specific
+# scenarios (26-34) opt back in explicitly with LOOM_DAEMON_SYSTEMD=1 alongside
+# their LOOM_SYSTEMD_FORCE=1 seam and their own stub `systemctl` on PATH.
+export LOOM_DAEMON_SYSTEMD=0
+# Belt-and-braces on top of the knob, mirroring LOOM_LAUNCHD_LABEL below: even
+# if a future regression re-opens a systemd path, the unit it would resolve is a
+# per-run scratch name, never the real `loom-daemon.service`. The scenarios that
+# drive systemd deliberately pin their own LOOM_SYSTEMD_UNIT per invocation.
+export LOOM_SYSTEMD_UNIT="loom-daemon-update-test-$$.service"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLI_DIR="$(cd "$SCRIPT_DIR/../cli" && pwd)"
 UPDATE_SCRIPT="$CLI_DIR/loom-daemon-update.sh"
@@ -88,6 +118,7 @@ source "$SCRIPT_DIR/lib/bg-proc-trap.sh"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
 NC='\033[0m'
 
 TESTS_RUN=0
@@ -149,6 +180,11 @@ new_fixture() {
     # #4260 sub-issue C) sources it relative to ITS OWN location, so it must exist
     # alongside the fixture copy too, not just in the real repo tree.
     cp "$CLI_DIR/../lib/systemd-user.sh" "$root/.loom/scripts/lib/systemd-user.sh"
+    # Same for lib/bounded-run.sh (#4799): the fixture start script's
+    # print_calibrate_hint() sources it relative to ITS OWN location to bound
+    # its `calibrate` command substitution, so it must exist alongside the
+    # fixture copy too.
+    cp "$CLI_DIR/../lib/bounded-run.sh" "$root/.loom/scripts/lib/bounded-run.sh"
     cp "$LOOM_REPO_ROOT/scripts/install/provision-daemon.sh" "$root/scripts/install/provision-daemon.sh"
     cat > "$root/loom-daemon/Cargo.toml" <<'EOF'
 [package]
@@ -199,6 +235,29 @@ push_extra_commits_to_origin() {
 # Writes a fake daemon binary at $1 that reports commit $2 on --version and,
 # on a normal run, appends its inherited LOOM_WORK_FINDER / LOOM_MAIN_HEALTH_GATE
 # to marker file $3 before looping forever (so it stays alive for kill -0).
+#
+# `calibrate` is handled explicitly (#4799) and exits immediately with no
+# output: this fixture has no real calibrate implementation, and every
+# successful loom-daemon-start.sh run (nohup/launchd/systemd, all three
+# reached by this suite's restart scenarios) calls `$DAEMON_BIN calibrate
+# --workspace ... --json` via print_calibrate_hint(). Before this fix, that
+# call fell through to the `while true` loop below and hung forever inside
+# print_calibrate_hint()'s blocking `$(...)` -- the exact hang
+# ci-excluded.txt documented. print_calibrate_hint() is bounded independently
+# now (lib/bounded-run.sh), but this fixture also short-circuits so the suite
+# stays fast rather than eating that timeout on every restart.
+#
+# GENERALIZED (#4799 CI hang): `calibrate` was only one instance of a whole
+# CLASS of wedge. ANY *subcommand* the lifecycle scripts dispatch that this
+# fixture does not recognize used to fall through to the `while true` daemon
+# body IN THE FOREGROUND and block its caller forever -- which is precisely how
+# the CI run hung: with a real `systemctl --user` reachable, the update script
+# resolved DAEMON_MANAGER=systemd and ran `"$PROVISION_TARGET" restart`, and
+# this fixture (no `restart` handler) looped instead of answering. So the
+# catch-all below exits non-zero for any unrecognized NON-FLAG first argument
+# (a real daemon rejects an unknown subcommand; it does not daemonize). A
+# leading `-`/`--` still falls through to the daemon body, because the
+# supervisors DO launch the daemon proper with flags.
 write_fake_daemon() {
     local path="$1" commit="$2" marker="$3"
     cat > "$path" <<EOF
@@ -206,6 +265,13 @@ write_fake_daemon() {
 if [[ "\${1:-}" == "--version" ]]; then
     echo "loom-daemon 0.15.0 (commit ${commit}, built 2026-07-26T00:00:00Z)"
     exit 0
+fi
+if [[ "\${1:-}" == "calibrate" ]]; then
+    exit 1
+fi
+if [[ -n "\${1:-}" && "\${1:-}" != -* ]]; then
+    echo "fake loom-daemon: unsupported subcommand: \$*" >&2
+    exit 1
 fi
 echo "FAKE_DAEMON WF=[\${LOOM_WORK_FINDER:-}] HG=[\${LOOM_MAIN_HEALTH_GATE:-}]" > "${marker}"
 while true; do sleep 1; done
@@ -230,6 +296,18 @@ fi
 if [[ "\${1:-}" == "restart" ]]; then
     echo "restart" >> "${restart_marker}"
     exit ${restart_rc}
+fi
+# See write_fake_daemon's comment (#4799): no real calibrate implementation,
+# exit fast instead of falling into the daemon-body loop below.
+if [[ "\${1:-}" == "calibrate" ]]; then
+    exit 1
+fi
+# Same catch-all as write_fake_daemon (#4799): an unrecognized NON-FLAG
+# subcommand must never fall into the foreground daemon loop and wedge its
+# caller. Flags still reach the daemon body.
+if [[ -n "\${1:-}" && "\${1:-}" != -* ]]; then
+    echo "fake loom-daemon: unsupported subcommand: \$*" >&2
+    exit 1
 fi
 while true; do sleep 1; done
 EOF
@@ -738,10 +816,16 @@ bg_proc_track "$old_pid5b"
 sleep 0.3
 echo "$old_pid5b" > "$W5B/.loom/.daemon.pid"
 
+# Capture to a log rather than /dev/null (#4799): when this scenario wedged in
+# CI the tail of the suite output was undiagnostic precisely because its update
+# run wrote nowhere, so the failure surfaced as silence. Mirror scenario 5.
 ( cd "$W5B" && PATH="$TEST_PATH" LOOM_DAEMON_BIN="$INSTALLED5B" NEW_FAKE_BIN_SRC="$NEW_FAKE5B" \
     env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
-    bash "$UPDATE_SCRIPT" >/dev/null 2>&1 )
+    bash "$UPDATE_SCRIPT" >"$W5B/update.log" 2>&1 )
 update5b_rc=$?
+if [[ "$update5b_rc" != "0" ]]; then
+    echo "  update.log (5b): $(tail -n 20 "$W5B/update.log" 2>/dev/null)"
+fi
 assert_eq "0" "$update5b_rc" "restart with an EMPTY persisted-flags file exits 0 (#3968 regression)"
 
 for _ in 1 2 3 4 5 6 7 8 9 10; do
@@ -1388,6 +1472,22 @@ else
 fi
 
 # ============================================================
+# Scenarios 21+22 are the only two in this suite that need a REAL `plutil`
+# (#4799). They drive loom-daemon-update.sh's `--relaunch` path, whose first
+# step is `harvest_plist_env` (lib/daemon-env-harvest.sh) -- which requires
+# plutil + jq by contract ("required on the macOS launchd path") and returns 2
+# when either is missing, so perform_relaunch aborts with 6 and never
+# re-renders the plist. Scenario 22 then reads the result back with
+# `plutil -extract` directly. Everything else launchd-flavored in this suite
+# runs off the stub `launchctl`/`uname` pair and IS portable; these two are
+# not, and plutil is macOS-only (no ubuntu package stands in -- an XML-plist
+# parser stub would be testing the stub, not the production path). So skip
+# them where plutil is absent rather than fail a Linux CI runner on a genuinely
+# Darwin-only code path. They still run on every macOS dev/CI host.
+if ! command -v plutil >/dev/null 2>&1; then
+    echo -e "${YELLOW}⊘${NC} SKIP scenarios 21-22 (--relaunch plist re-render + env preservation): plutil not available — harvest_plist_env is a macOS-only production path"
+else
+# ============================================================
 # 21. --relaunch re-renders the plist with the SUPERVISED keys (#4118 AC1):
 #     after a refused restart, `--relaunch` re-renders via loom-daemon-start.sh,
 #     installing KeepAlive:{SuccessfulExit:true} + LOOM_DAEMON_SUPERVISOR=launchd
@@ -1463,6 +1563,7 @@ else
     echo "  WF=[$wf22] HG=[$hg22] MAXC=[$mc22] PERTOK=[$pt22]"
     echo "  plist: $(cat "$PLIST22" 2>/dev/null)"
 fi
+fi # end plutil-availability guard for scenarios 21-22
 
 # ============================================================
 # 23. --no-restart on a launchd host does NOT print a bare `launchctl bootstrap`
@@ -1614,7 +1715,7 @@ SD_BIN26="$W26/systemd-bin"
 SD_LOG26="$W26/systemctl.log"
 write_fake_systemd_active_bin "$SD_BIN26" "$SD_LOG26" "4242"
 
-out26=$( cd "$W26" && PATH="$SD_BIN26:$TEST_PATH" LOOM_SYSTEMD_FORCE=1 \
+out26=$( cd "$W26" && PATH="$SD_BIN26:$TEST_PATH" LOOM_SYSTEMD_FORCE=1 LOOM_DAEMON_SYSTEMD=1 \
     LOOM_SYSTEMD_UNIT="loom-daemon-test-sd26.service" \
     LOOM_DAEMON_BIN="$INSTALLED26" NEW_FAKE_BIN_SRC="$NEW_FAKE26" \
     bash "$UPDATE_SCRIPT" 2>&1 )
@@ -1669,7 +1770,7 @@ SD_BIN27="$W27/systemd-bin"
 SD_LOG27="$W27/systemctl.log"
 write_fake_systemd_active_bin "$SD_BIN27" "$SD_LOG27" "4242"
 
-out27=$( cd "$W27" && PATH="$SD_BIN27:$TEST_PATH" LOOM_SYSTEMD_FORCE=1 \
+out27=$( cd "$W27" && PATH="$SD_BIN27:$TEST_PATH" LOOM_SYSTEMD_FORCE=1 LOOM_DAEMON_SYSTEMD=1 \
     LOOM_SYSTEMD_UNIT="loom-daemon-test-sd27.service" \
     LOOM_DAEMON_BIN="$INSTALLED27" NEW_FAKE_BIN_SRC="$NEW_FAKE27" \
     bash "$UPDATE_SCRIPT" 2>&1 )
@@ -1714,7 +1815,7 @@ write_fake_daemon "$INSTALLED28" "deadbee" "$W28/marker"
 SD_BIN28="$W28/systemd-bin"
 SD_LOG28="$W28/systemctl.log"
 write_fake_systemd_active_bin "$SD_BIN28" "$SD_LOG28" "4242"
-check_sd_out=$( cd "$W28" && PATH="$SD_BIN28:$TEST_PATH" LOOM_SYSTEMD_FORCE=1 \
+check_sd_out=$( cd "$W28" && PATH="$SD_BIN28:$TEST_PATH" LOOM_SYSTEMD_FORCE=1 LOOM_DAEMON_SYSTEMD=1 \
     LOOM_SYSTEMD_UNIT="loom-daemon-test-sd28.service" LOOM_DAEMON_BIN="$INSTALLED28" \
     bash "$UPDATE_SCRIPT" --check 2>&1 )
 TESTS_RUN=$((TESTS_RUN + 1))
@@ -1740,7 +1841,7 @@ write_fake_daemon_restart "$INSTALLED29" "deadbee" "$RESTART_MARKER29" 0
 SD_BIN29="$W29/systemd-bin"
 SD_LOG29="$W29/systemctl.log"
 write_fake_systemd_active_bin "$SD_BIN29" "$SD_LOG29" "4242"
-dry29_out=$( cd "$W29" && PATH="$SD_BIN29:$TEST_PATH" LOOM_SYSTEMD_FORCE=1 \
+dry29_out=$( cd "$W29" && PATH="$SD_BIN29:$TEST_PATH" LOOM_SYSTEMD_FORCE=1 LOOM_DAEMON_SYSTEMD=1 \
     LOOM_SYSTEMD_UNIT="loom-daemon-test-sd29.service" LOOM_DAEMON_BIN="$INSTALLED29" \
     bash "$UPDATE_SCRIPT" --dry-run 2>&1 )
 TESTS_RUN=$((TESTS_RUN + 1))
@@ -1816,7 +1917,7 @@ write_fake_systemd_active_bin "$SD_BIN31" "$SD_LOG31" "4242"
 HOME31="$W31/home"
 UNIT_PATH31="$HOME31/.config/systemd/user/${UNIT31}"
 write_fixture_unit_pre4267 "$UNIT_PATH31" "$INSTALLED31"
-( cd "$W31" && PATH="$SD_BIN31:$TEST_PATH" HOME="$HOME31" LOOM_SYSTEMD_FORCE=1 \
+( cd "$W31" && PATH="$SD_BIN31:$TEST_PATH" HOME="$HOME31" LOOM_SYSTEMD_FORCE=1 LOOM_DAEMON_SYSTEMD=1 \
     LOOM_SYSTEMD_UNIT="$UNIT31" \
     LOOM_DAEMON_BIN="$INSTALLED31" NEW_FAKE_BIN_SRC="$NEW_FAKE31" \
     bash "$UPDATE_SCRIPT" --relaunch >/dev/null 2>&1 )
@@ -1853,7 +1954,7 @@ write_fake_systemd_active_bin "$SD_BIN32" "$SD_LOG32" "4242"
 HOME32="$W32/home"
 UNIT_PATH32="$HOME32/.config/systemd/user/${UNIT32}"
 write_fixture_unit_pre4267 "$UNIT_PATH32" "$INSTALLED32"
-( cd "$W32" && PATH="$SD_BIN32:$TEST_PATH" HOME="$HOME32" LOOM_SYSTEMD_FORCE=1 \
+( cd "$W32" && PATH="$SD_BIN32:$TEST_PATH" HOME="$HOME32" LOOM_SYSTEMD_FORCE=1 LOOM_DAEMON_SYSTEMD=1 \
     LOOM_SYSTEMD_UNIT="$UNIT32" \
     LOOM_DAEMON_BIN="$INSTALLED32" NEW_FAKE_BIN_SRC="$NEW_FAKE32" \
     bash "$UPDATE_SCRIPT" --relaunch >/dev/null 2>&1 )
@@ -1888,7 +1989,7 @@ write_fake_daemon_restart "$NEW_FAKE33" "$HEAD33" "$RESTART_MARKER33" 0
 SD_BIN33="$W33/systemd-bin"
 SD_LOG33="$W33/systemctl.log"
 write_fake_systemd_active_bin "$SD_BIN33" "$SD_LOG33" "4242"
-out33=$( cd "$W33" && PATH="$SD_BIN33:$TEST_PATH" LOOM_SYSTEMD_FORCE=1 \
+out33=$( cd "$W33" && PATH="$SD_BIN33:$TEST_PATH" LOOM_SYSTEMD_FORCE=1 LOOM_DAEMON_SYSTEMD=1 \
     LOOM_SYSTEMD_UNIT="loom-daemon-test-sd33.service" \
     LOOM_DAEMON_BIN="$INSTALLED33" NEW_FAKE_BIN_SRC="$NEW_FAKE33" \
     bash "$UPDATE_SCRIPT" --no-restart 2>&1 )
@@ -1929,7 +2030,7 @@ write_fake_systemd_active_bin "$SD_BIN34" "$SD_LOG34" "4242"
 HOME34="$W34/home"
 mkdir -p "$HOME34/.config/systemd/user"   # dir exists, unit deliberately absent
 UNIT_PATH34="$HOME34/.config/systemd/user/${UNIT34}"
-out34=$( cd "$W34" && PATH="$SD_BIN34:$TEST_PATH" HOME="$HOME34" LOOM_SYSTEMD_FORCE=1 \
+out34=$( cd "$W34" && PATH="$SD_BIN34:$TEST_PATH" HOME="$HOME34" LOOM_SYSTEMD_FORCE=1 LOOM_DAEMON_SYSTEMD=1 \
     LOOM_SYSTEMD_UNIT="$UNIT34" \
     LOOM_DAEMON_BIN="$INSTALLED34" NEW_FAKE_BIN_SRC="$NEW_FAKE34" \
     bash "$UPDATE_SCRIPT" --relaunch 2>&1 )
