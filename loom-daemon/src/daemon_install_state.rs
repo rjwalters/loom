@@ -1615,12 +1615,22 @@ mod tests {
     // probe must use the same `resolve_launchd_domain_detailed` fallback rule
     // (explicit `LOOM_LAUNCHD_DOMAIN` override -> `gui/<uid>` -> `user/<uid>`)
     // the reachable-path protection probe uses (#4354/#4533), instead of a
-    // hardcoded `gui/<uid>`. These tests run in CI on `ubuntu-latest`, where
-    // `launchctl` does not exist, so both the probe itself and the
-    // `gui/<uid>` reachability check inside
-    // `resolve_launchd_domain_detailed` always fail — making the `user/<uid>`
-    // fallback branch (and, since #4694, its `gui/<uid>` cross-check, which
-    // fails identically) deterministic here.
+    // hardcoded `gui/<uid>`.
+    //
+    // `launchctl_pid_domain_override_is_honored_verbatim` passes an explicit
+    // override, so `resolve_launchd_domain_detailed` returns before ever
+    // invoking `launchctl` — it is genuinely independent of whether the host
+    // has a real `launchctl`, so it needs no stubbing.
+    //
+    // `launchctl_pid_falls_back_to_gui_uid_then_user_uid_when_no_override`
+    // asserts on the no-override fallback path, which *does* call
+    // `launchctl`. It used to rely on CI's `ubuntu-latest` lacking a real
+    // `launchctl` to force that fallback; on a macOS host with a reachable
+    // `gui/<uid>` login session, the real probe would succeed and resolve to
+    // `gui/<uid>` instead, breaking the assertion. It now stubs `launchctl`
+    // to always fail (#4724), making the `user/<uid>` fallback branch (and,
+    // since #4694, its `gui/<uid>` cross-check, which fails identically)
+    // deterministic regardless of the host.
     // ===================================================================
 
     #[test]
@@ -1634,9 +1644,10 @@ mod tests {
         env.is_darwin = true;
         env.launchd_domain_override = Some("custom/999".to_string());
         let report = classify_with_process_age_fn(dir.path(), &marker, &env, |_| Some(1_000_000));
-        // launchctl is absent on the CI runner, so the probe itself always
-        // fails — but the detail string must reflect the *override* domain
-        // verbatim, not a hardcoded `gui/<uid>`.
+        // An explicit override short-circuits before `launchctl` is ever
+        // invoked, so this assertion holds regardless of whether the host has
+        // a real `launchctl` — but the detail string must reflect the
+        // *override* domain verbatim, not a hardcoded `gui/<uid>`.
         let detail = report.liveness_detail.expect("liveness_detail set");
         assert!(
             detail.contains(&format!("custom/999/{DEFAULT_LAUNCHD_LABEL}")),
@@ -1646,19 +1657,31 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn launchctl_pid_falls_back_to_gui_uid_then_user_uid_when_no_override() {
+        // #4724: stub `launchctl` to always fail rather than relying on it
+        // being absent from the host's PATH. On CI's `ubuntu-latest`
+        // `launchctl` genuinely doesn't exist, but on a macOS dev host with a
+        // reachable `gui/<uid>` login session, the real `gui/<uid>`
+        // reachability probe inside `resolve_launchd_domain_detailed` would
+        // succeed and this test's `user/<uid>` fallback assertion would fail.
+        let stub_dir = tempfile::tempdir().unwrap();
+        write_stub(stub_dir.path(), "launchctl", FAIL_STUB);
+
         let dir = tempfile::tempdir().unwrap();
         let marker = write_marker(dir.path(), "use_launchd=true\n");
         let mut env = no_env_overrides();
         env.is_darwin = true;
         env.launchd_domain_override = None;
-        let report = classify_with_process_age_fn(dir.path(), &marker, &env, |_| Some(1_000_000));
+        let report = with_path_prefix(stub_dir.path(), || {
+            classify_with_process_age_fn(dir.path(), &marker, &env, |_| Some(1_000_000))
+        });
         let detail = report.liveness_detail.expect("liveness_detail set");
         // No `LOOM_LAUNCHD_DOMAIN` override: `resolve_launchd_domain_detailed`
-        // tries `gui/<uid>` first, but `launchctl` is absent on this CI runner,
+        // tries `gui/<uid>` first, but the stubbed `launchctl` always fails,
         // so that probe fails and it falls through to `user/<uid>` — the same
         // fallback order `resolve_launchd_domain_detailed` documents. The
-        // #4694 `gui/<uid>` cross-check fails on the same absent `launchctl`,
+        // #4694 `gui/<uid>` cross-check fails on the same stubbed `launchctl`,
         // so the reported detail stays the `user/<uid>` domain.
         let uid = current_uid().expect("current_uid resolves in test env");
         assert!(
@@ -2265,6 +2288,12 @@ mod tests {
     /// visibly hang the test rather than merely slow it.
     const HANG_STUB: &str = "#!/bin/sh\nsleep 60\n";
 
+    /// A stub that always fails fast — used to force a probe's absent/failed
+    /// fallback path deterministically, regardless of whether the host
+    /// actually has the real binary (and, for `launchctl`, regardless of
+    /// whether the host has a reachable `gui/<uid>` login session; #4724).
+    const FAIL_STUB: &str = "#!/bin/sh\nexit 1\n";
+
     /// Generous upper bound on a bounded probe: well above `PROBE_TIMEOUT` +
     /// spawn/kill overhead on a loaded runner, and far below `HANG_STUB`'s 60s.
     fn hang_budget() -> Duration {
@@ -2554,7 +2583,7 @@ mod tests {
         let stub_dir = tempfile::tempdir().unwrap();
         // Both domains genuinely report the job absent — no launchd signal
         // at all.
-        write_stub(stub_dir.path(), "launchctl", "#!/bin/sh\nexit 1\n");
+        write_stub(stub_dir.path(), "launchctl", FAIL_STUB);
 
         let pid_dir = tempfile::tempdir().unwrap();
         let pid_file = write_pid_file(pid_dir.path(), std::process::id());
