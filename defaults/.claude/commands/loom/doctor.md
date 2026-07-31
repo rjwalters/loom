@@ -74,6 +74,30 @@ fi
 
 Both worktree paths get a `.loom-managed` sentinel and are auto-cleaned by `merge-pr.sh` on merge.
 
+### Expected worktree state after setup (#4823)
+
+For a `feature/issue-<N>` branch, `worktree.sh <N>` fetches `origin/feature/issue-<N>`
+first: if that remote branch already exists (the normal case for a Doctor cycle —
+the Builder already pushed it and opened the PR), the worktree's local branch is
+created **tracking that remote branch**, not branched fresh from
+`origin/$DEFAULT_BRANCH`. So after `worktree.sh <ISSUE_NUM>` returns, the worktree
+HEAD should already equal the PR's current head commit:
+
+```bash
+git -C .loom/worktrees/issue-<ISSUE_NUM> rev-parse HEAD
+gh pr view <PR_NUMBER> --json headRefOid --jq '.headRefOid'
+# the two commit SHAs above should match
+```
+
+If they don't match, do **not** assume the worktree is simply stale and force-push
+over it — `git fetch && git reset --hard origin/feature/issue-<ISSUE_NUM>` first
+to align the local branch with the real PR history, then re-point the upstream
+(`git branch --set-upstream-to=origin/feature/issue-<ISSUE_NUM>`) before making any
+edits. A worktree whose HEAD does *not* match the PR's remote head is either
+running an older `worktree.sh` (pre-#4823) or a symptom of a genuinely diverged
+local state — either way, fixing review feedback on top of the wrong base produces
+a PR-clobbering force-push or a diff against the wrong parent.
+
 ## ⚠️ `--body @path` Does NOT Expand — It Posts the Literal String
 
 **If a comment you're posting (fix summary, clarifying question, conflict-only
