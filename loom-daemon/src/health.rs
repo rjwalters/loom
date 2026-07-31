@@ -830,7 +830,9 @@ pub fn assess_roles(inputs: &HealthInputs) -> HealthSection {
     )
 }
 
-/// Assess the queue-depth section: per-root ready (`loom:issue`) counts.
+/// Assess the queue-depth section: per-root ready (dispatchable `loom:issue`,
+/// excluding park-labeled rows — see [`crate::pipeline_snapshot::RepoPipelineSnapshot::queued`])
+/// counts.
 #[must_use]
 pub fn assess_queues(inputs: &HealthInputs) -> HealthSection {
     let Some(pipeline) = &inputs.pipeline else {

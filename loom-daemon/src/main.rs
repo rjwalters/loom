@@ -120,7 +120,8 @@ enum Commands {
         json: bool,
 
         /// Also show the forge-side pipeline snapshot per managed repo (Issue
-        /// #3977): open `loom:issue` (queued), open `loom:building`
+        /// #3977): open, dispatchable `loom:issue` (queued — park-labeled
+        /// rows excluded, #4825), open `loom:building`
         /// (claimed), open PRs by `loom:review-requested` /
         /// `loom:changes-requested` / `loom:pr`, and PRs merged in the last
         /// 24h. Opt-in because it makes several `gh` calls per managed repo
