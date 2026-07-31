@@ -593,6 +593,12 @@ fn run_role_with_timeout(
         // Pin the already-admitted choice so spawn-worker cannot re-resolve a
         // different runtime after the pre-spawn decision.
         cmd.env("LOOM_RUNTIME", &admission.runtime);
+        // Issue #4768: pin the admitted role too, mirroring
+        // `sweep_registry::spawn_child`. Without it, a Codex-runtime role
+        // child (e.g. `LOOM_ROLE` unset for a champion/curator/judge/auditor/
+        // guide tick) reaches `spawn-codex.sh` with no role signal at all,
+        // which is indistinguishable from an unrecognized role there.
+        cmd.env("LOOM_ROLE", &admission.role);
         log::info!(
             "role_runner: admitted role={} runtime={} source={}",
             admission.role,

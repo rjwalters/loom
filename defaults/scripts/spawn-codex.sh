@@ -185,6 +185,14 @@
 #                        Scheduling priority, applied by this runner exactly the
 #                        way spawn-claude.sh applies it (issue #4233 — priority
 #                        is a per-runner policy, never the dispatcher's).
+#   LOOM_ROLE            The acting role (builder/doctor/judge/... or their
+#                        development-worker/pr-fixer/sweep-lifecycle aliases),
+#                        used ONLY by the managed-hook mutable-role preflight
+#                        below. `loom-daemon` sets this for every admitted
+#                        dispatch (sweep child or role-runner tick, issue
+#                        #4768); an UNSET or unrecognized value is treated as
+#                        read-only, NOT fail-closed — see that preflight's
+#                        comments for why this is deliberate today.
 
 set -euo pipefail
 
@@ -623,6 +631,14 @@ _hook_role="$(printf '%s' "${LOOM_ROLE:-}" | tr '[:upper:]_' '[:lower:]-')"
 case "$_hook_role" in
     development-worker) _hook_role="builder" ;;
     pr-fixer)           _hook_role="doctor" ;;
+    # A full `/loom:sweep` dispatch is modelled daemon-side as one
+    # "sweep-lifecycle" launch, admitted against Builder's (strongest
+    # lifecycle) capability requirements (see loom-daemon's
+    # runtime_admission.rs module doc) — it runs the Builder/Doctor phases
+    # in-process, so it needs the same mutable-role hook-trust preflight
+    # `builder`/`doctor` get. `loom-daemon` sets `LOOM_ROLE=sweep-lifecycle`
+    # for every daemon-dispatched sweep child (issue #4768).
+    sweep-lifecycle)   _hook_role="builder" ;;
 esac
 
 _hook_role_is_mutable=false
