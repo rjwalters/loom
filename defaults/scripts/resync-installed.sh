@@ -23,6 +23,7 @@
 #   .loom/scripts/          <- defaults/scripts/          (recursive)
 #   .loom/roles/            <- defaults/roles/            (recursive)
 #   .loom/docs/             <- defaults/docs/             (recursive; symlinks skipped)
+#   .loom/runtimes/         <- defaults/runtimes/         (recursive; BACKFILLED if absent, #4688)
 #   .loom/bin/              <- defaults/.loom/bin/        (recursive; live consumer CLI)
 #   .claude/commands/loom/  <- defaults/.claude/commands/loom/ (recursive)
 #
@@ -682,6 +683,18 @@ fi
 if [[ -d "$REPO_ROOT/.loom/docs" ]]; then
     resync_tree "$DEFAULTS_DIR/docs" "$REPO_ROOT/.loom/docs" "docs" "docs"
 fi
+# `.loom/runtimes/` is deliberately UNCONDITIONAL, unlike the surfaces above
+# (#4688): every one of the gated blocks only backfills a surface the
+# consumer already opted into (destination pre-exists). `runtimes/` is not
+# an opt-in surface — it is a provisioning gap that both the Rust-native
+# `loom-daemon init` path and this script itself failed to populate before
+# this fix, so a host resynced any number of times has NO other path to ever
+# obtain the directory. `resync_tree`'s per-file `sync_one` already creates
+# `$dst_dir` via `mkdir -p` as it copies (skipped harmlessly under
+# `--dry-run`, which only reports "would create"), so this call alone is
+# sufficient to both create `.loom/runtimes/` on hosts that never had it and
+# keep it fresh on hosts that already do.
+resync_tree "$DEFAULTS_DIR/runtimes" "$REPO_ROOT/.loom/runtimes" "runtimes" "runtimes"
 if [[ -d "$REPO_ROOT/.loom/bin" ]]; then
     resync_tree "$DEFAULTS_DIR/.loom/bin" "$REPO_ROOT/.loom/bin" "bin" ".loom/bin"
 fi
@@ -985,7 +998,7 @@ suggest_commit_if_resync_only_dirt() {
         path="${path%\"}"
         path="${path#\"}"
         case "$path" in
-            .loom/hooks/*|.loom/scripts/*|.loom/roles/*|.loom/docs/*|.loom/bin/*|.claude/commands/loom/*|.loom/install-metadata.json|.gitattributes)
+            .loom/hooks/*|.loom/scripts/*|.loom/roles/*|.loom/docs/*|.loom/runtimes/*|.loom/bin/*|.claude/commands/loom/*|.loom/install-metadata.json|.gitattributes)
                 resync_paths+=("$path")
                 ;;
             *)
