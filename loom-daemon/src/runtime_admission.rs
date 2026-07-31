@@ -413,6 +413,33 @@ mod tests {
     use super::*;
     use std::process::Command;
 
+    /// RAII guard that clears the ambient `LOOM_RUNTIME` env var for the
+    /// scope of a test and restores whatever value (if any) it previously
+    /// had — including across a mid-test assertion panic, since Rust
+    /// unwinds through `Drop`. Some host/dev-container shells export
+    /// `LOOM_RUNTIME` (as the `spawn-worker.sh` runtime selector), and
+    /// without this guard that ambient value silently outranks the
+    /// `runtimes.default` / `runtimes.roles` config precedence this test
+    /// exercises (#4739).
+    struct ClearedLoomRuntimeEnv(Option<String>);
+
+    impl ClearedLoomRuntimeEnv {
+        fn new() -> Self {
+            let prior = std::env::var("LOOM_RUNTIME").ok();
+            std::env::remove_var("LOOM_RUNTIME");
+            Self(prior)
+        }
+    }
+
+    impl Drop for ClearedLoomRuntimeEnv {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(v) => std::env::set_var("LOOM_RUNTIME", v),
+                None => std::env::remove_var("LOOM_RUNTIME"),
+            }
+        }
+    }
+
     fn fixture() -> tempfile::TempDir {
         let d = tempfile::tempdir().unwrap();
         for sub in ["defaults/roles", "defaults/runtimes", "defaults/scripts"] {
@@ -671,6 +698,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn unknown_configured_role_keys_fail_closed() {
+        let _env_guard = ClearedLoomRuntimeEnv::new();
         let d = fixture();
         let write_config = |contents: &str| {
             fs::create_dir_all(d.path().join(".loom")).unwrap();
