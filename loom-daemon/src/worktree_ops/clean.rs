@@ -1404,6 +1404,72 @@ mod tests {
         assert_eq!(stats.kept_sweep_transients, 1);
     }
 
+    /// #4691: a run whose PID exists but cannot be signalled by this process
+    /// (`kill(2)` → `EPERM`) is LIVE. Wiring the real
+    /// [`crate::sweep_registry::is_pid_alive_with`] decision core in here — with
+    /// only the raw syscall mocked — proves the production `pid_alive` closure,
+    /// not just the test double, keeps such a baseline.
+    #[cfg(unix)]
+    #[test]
+    fn sweep_transients_keep_baseline_of_unsignallable_but_live_run() {
+        use crate::sweep_registry::{is_pid_alive_with, EPERM};
+
+        let (dir, ckpt) = sweep_fixture();
+        let baseline = ckpt.join("main-clean-baseline-sweep-eperm.txt");
+        std::fs::write(&baseline, "").unwrap();
+        register_run(dir.path(), "sweep-eperm", 4242);
+
+        let pid_alive = |pid: u32| is_pid_alive_with(pid, |_| Err(EPERM));
+        let issue_state = |_: u32| "UNKNOWN".to_string();
+        let mut stats = CleanupStats::default();
+        let env = SweepTransientEnv {
+            // 1000h old: only the liveness verdict can spare it.
+            now: SystemTime::now() + Duration::from_secs(1000 * HOUR),
+            min_age: Duration::from_secs(SWEEP_TRANSIENT_MIN_AGE_SECS),
+            pid_alive: &pid_alive,
+            issue_state: &issue_state,
+        };
+        clean_sweep_transients_with(dir.path(), &mut stats, false, &env);
+
+        assert!(
+            baseline.exists(),
+            "an unsignallable (EPERM) PID means the sweep is still running — \
+             its baseline must not be pruned"
+        );
+        assert_eq!(stats.cleaned_sweep_baselines, 0);
+        assert_eq!(stats.kept_sweep_transients, 1);
+    }
+
+    /// The ESRCH counterpart of the test above: the same wiring, but the raw
+    /// syscall reports "no such process" — the one failure mode that really does
+    /// authorize pruning. Guards against an over-broad #4691 fix that makes
+    /// every `kill(2)` failure mean "alive" and silently reinstates the leak.
+    #[cfg(unix)]
+    #[test]
+    fn sweep_transients_still_prune_baseline_when_pid_is_esrch() {
+        use crate::sweep_registry::is_pid_alive_with;
+        const ESRCH: i32 = 3;
+
+        let (dir, ckpt) = sweep_fixture();
+        let baseline = ckpt.join("main-clean-baseline-sweep-gone.txt");
+        std::fs::write(&baseline, "").unwrap();
+        register_run(dir.path(), "sweep-gone", 4242);
+
+        let pid_alive = |pid: u32| is_pid_alive_with(pid, |_| Err(ESRCH));
+        let issue_state = |_: u32| "UNKNOWN".to_string();
+        let mut stats = CleanupStats::default();
+        let env = SweepTransientEnv {
+            now: SystemTime::now() + Duration::from_secs(1000 * HOUR),
+            min_age: Duration::from_secs(SWEEP_TRANSIENT_MIN_AGE_SECS),
+            pid_alive: &pid_alive,
+            issue_state: &issue_state,
+        };
+        clean_sweep_transients_with(dir.path(), &mut stats, false, &env);
+
+        assert!(!baseline.exists(), "ESRCH means gone — prune must still fire");
+        assert_eq!(stats.cleaned_sweep_baselines, 1);
+    }
+
     #[test]
     fn sweep_transients_prunes_registered_but_dead_pid_baseline() {
         let (dir, ckpt) = sweep_fixture();

@@ -8396,25 +8396,64 @@ pub fn spawn_watchdog_task(
 // Internal helpers
 // ============================================================================
 
-/// Liveness probe via `kill(pid, 0)`. Returns true when the signal would
-/// be deliverable (i.e. the process exists and is owned by us). PID 0 is
-/// always treated as dead.
+/// POSIX `EPERM`. Value 1 on every Loom target (Linux and macOS both fix it at
+/// 1 in `<sys/errno.h>`), so no `libc` dependency is needed to name it.
+#[cfg(unix)]
+pub(crate) const EPERM: i32 = 1;
+
+/// Liveness probe via `kill(pid, 0)`. Returns true when the process exists.
+/// PID 0 is always treated as dead.
+///
+/// **Fail-safe on `EPERM` (#4691).** `kill(2)` has two distinct failure modes
+/// and treating them alike is a correctness bug, not a nicety:
+///
+/// - `ESRCH` — no such process. Genuinely dead; callers may reap its state.
+/// - `EPERM` — the process **exists** but this caller may not signal it
+///   (different UID, sandbox, namespace). Reporting that as "dead" lets the
+///   reaper, [`crate::claim_reconciliation`], and `loom-daemon clean` destroy a
+///   *running* sweep's state — e.g. deleting a live run's
+///   `main-clean-baseline-<RUN_ID>.txt` out from under it.
+///
+/// Every consumer of this probe uses "dead" to authorize destruction, so the
+/// ambiguous case must resolve to *alive*.
 ///
 /// `pub(crate)` so [`crate::sweep_journal`] and [`crate::claim_reconciliation`]
 /// can reuse the exact same probe the reaper uses (Issue #3953) rather than
 /// duplicating the `kill(pid, 0)` dance.
 #[cfg(unix)]
 pub(crate) fn is_pid_alive(pid: u32) -> bool {
+    is_pid_alive_with(pid, |pid_t| {
+        // SAFETY: kill(pid, 0) is a documented liveness probe; signal 0 is not
+        // sent, just checked.
+        if libc_kill(pid_t, 0) == 0 {
+            Ok(())
+        } else {
+            // `errno` is only meaningful immediately after a failed call.
+            Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
+        }
+    })
+}
+
+/// Decision core of [`is_pid_alive`], parameterized over the raw `kill(pid, 0)`
+/// syscall so the `ESRCH`-vs-`EPERM` distinction is unit-testable without
+/// needing a real unsignallable process (#4691).
+///
+/// `probe` returns `Ok(())` when the signal would be deliverable, or
+/// `Err(errno)` with the raw `errno` from the failed `kill(2)`.
+#[cfg(unix)]
+pub(crate) fn is_pid_alive_with(pid: u32, probe: impl Fn(i32) -> Result<(), i32>) -> bool {
     if pid == 0 {
         return false;
     }
-    // SAFETY: kill(pid, 0) is a documented liveness probe; signal 0 is not
-    // sent, just checked.
     let pid_t: i32 = match pid.try_into() {
         Ok(p) => p,
         Err(_) => return false,
     };
-    libc_kill(pid_t, 0) == 0
+    match probe(pid_t) {
+        Ok(()) => true,
+        // EPERM proves existence just as well as success does.
+        Err(errno) => errno == EPERM,
+    }
 }
 
 #[cfg(not(unix))]
@@ -8562,6 +8601,46 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::time::SystemTime;
     use tempfile::tempdir;
+
+    // ---- is_pid_alive: ESRCH vs EPERM (#4691) ------------------------------
+
+    /// POSIX `ESRCH` ("no such process") — 3 on Linux and macOS alike.
+    const ESRCH: i32 = 3;
+
+    #[test]
+    fn is_pid_alive_reports_deliverable_signal_as_alive() {
+        assert!(is_pid_alive_with(4242, |_| Ok(())));
+    }
+
+    #[test]
+    fn is_pid_alive_reports_esrch_as_dead() {
+        // The only failure mode that actually proves the process is gone.
+        assert!(!is_pid_alive_with(4242, |_| Err(ESRCH)));
+    }
+
+    #[test]
+    fn is_pid_alive_treats_eperm_as_alive_not_dead() {
+        // #4691: `kill(pid, 0)` failing with EPERM means the process EXISTS but
+        // is not signallable by this caller. Conflating it with ESRCH lets the
+        // reaper / `loom-daemon clean` destroy a live sweep's state.
+        assert!(
+            is_pid_alive_with(4242, |_| Err(EPERM)),
+            "EPERM proves existence — must never be reported as dead"
+        );
+    }
+
+    #[test]
+    fn is_pid_alive_rejects_pid_zero_without_probing() {
+        // PID 0 addresses the caller's whole process group in kill(2); it is
+        // never a valid liveness handle, so it must short-circuit to dead.
+        assert!(!is_pid_alive_with(0, |_| panic!("must not probe pid 0")));
+    }
+
+    #[test]
+    fn is_pid_alive_of_self_is_true_through_the_real_syscall() {
+        // End-to-end sanity that the real probe still works after the refactor.
+        assert!(is_pid_alive(std::process::id()));
+    }
 
     #[test]
     #[serial]
