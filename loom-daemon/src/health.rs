@@ -493,7 +493,7 @@ pub fn assess_liveness(inputs: &HealthInputs) -> HealthSection {
                     "liveness",
                     Verdict::Degraded,
                     format!(
-                        "process alive, still STARTING (age {}s) — IPC not bound yet:                          {ipc_error}{}",
+                        "process alive, still STARTING (age {}s) — IPC not bound yet: {ipc_error}{}",
                         report.process_age_secs.unwrap_or_default(),
                         // A daemon that has not bound yet has not claimed the
                         // pid file yet either (#4774 writes it after the bind),
@@ -509,7 +509,7 @@ pub fn assess_liveness(inputs: &HealthInputs) -> HealthSection {
                     "liveness",
                     Verdict::Degraded,
                     format!(
-                        "process ALIVE but not answering IPC — NOT dead ({detail}); ipc:                          {ipc_error}{}",
+                        "process ALIVE but not answering IPC — NOT dead ({detail}); ipc: {ipc_error}{}",
                         suffix_note(report.pid_file_stale_note.as_deref())
                     ),
                     liveness_detail_json("install-state", report, inputs, false),
@@ -1189,10 +1189,13 @@ mod tests {
         assert_eq!(section.detail["ipc_reachable"], true);
     }
 
-    /// A reachable daemon whose pid file records a pid that is not a live
-    /// process at all — a relaunch after the old pid was recycled away.
+    /// A reachable daemon whose pid file records a pid that is neither the
+    /// socket owner nor a live process at all — a relaunch after the old pid
+    /// was recycled away. `classify()` still calls this "mismatch" (a live
+    /// socket owner is known, so it always outranks the file's own liveness
+    /// check) — the name reflects the verdict actually produced, not "dead".
     #[test]
-    fn a_pid_file_naming_a_dead_process_degrades() {
+    fn a_pid_file_naming_a_mismatched_dead_process_degrades() {
         let mut inputs = reachable_inputs_with_socket_owner(99917);
         inputs.pid_file = Some(pid_obs(Some(13724), false));
         let section = assess_liveness(&inputs);
@@ -1259,6 +1262,10 @@ mod tests {
             "the install-state probe's #4774 note must be surfaced: {}",
             section.summary
         );
+        // Regression pin: a hand-joined literal + suffix_note() must not
+        // leave a double-space run in the operator-facing summary — fmt and
+        // clippy cannot see this class of bug, only a runtime assertion can.
+        assert!(!section.summary.contains("  "), "double space in summary: {}", section.summary);
     }
 
     /// The launchd domain probe alone can never produce a DEAD verdict: with
@@ -1288,6 +1295,9 @@ mod tests {
         let section = assess_liveness(&inputs);
         assert_eq!(section.verdict, Verdict::Degraded);
         assert!(section.summary.contains("NOT dead"));
+        // Regression pin: the hand-joined literal must not leave a double
+        // space before {ipc_error} — fmt/clippy cannot see this class of bug.
+        assert!(!section.summary.contains("  "), "double space in summary: {}", section.summary);
     }
 
     #[test]
@@ -1300,6 +1310,9 @@ mod tests {
         let section = assess_liveness(&inputs);
         assert_eq!(section.verdict, Verdict::Degraded);
         assert!(section.summary.contains("STARTING"));
+        // Regression pin: the hand-joined literal must not leave a double
+        // space before {ipc_error} — fmt/clippy cannot see this class of bug.
+        assert!(!section.summary.contains("  "), "double space in summary: {}", section.summary);
     }
 
     /// Only when *all three* signals are negative is the daemon declared dead.
