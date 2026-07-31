@@ -709,6 +709,83 @@ if [[ -f "$W5B/.loom/.daemon.pid" ]]; then
 fi
 
 # ============================================================
+# 5c. Non-interactive-SSH cargo fallback (#4695): cargo is absent from PATH
+#     entirely (the exact non-login-shell-SSH symptom), but present at
+#     rustup's default $HOME/.cargo/bin -- the update must still find it via
+#     the fallback and rebuild successfully.
+# ============================================================
+W5C="$BASE_WORKDIR/w5c"
+new_fixture "$W5C"
+HEAD5C="$(cd "$W5C" && git rev-parse --short HEAD)"
+INSTALLED5C="$W5C/installed/loom-daemon"
+mkdir -p "$W5C/installed"
+write_fake_daemon "$INSTALLED5C" "deadbee" "$W5C/old-marker"
+NEW_FAKE5C="$W5C/new-fake-daemon"
+write_fake_daemon "$NEW_FAKE5C" "$HEAD5C" "$W5C/new-marker"
+# No .loom/.daemon.pid -> WAS_RUNNING resolves false, so this test exercises
+# only the rebuild+provision path (the cargo-fallback code under test)
+# without needing a background process to restart.
+
+# A PATH carrying the same launchd-sandbox stubs (launchctl/pgrep) as every
+# other test, but deliberately WITHOUT cargo anywhere on it.
+NO_CARGO_BIN_DIR5C="$BASE_WORKDIR/w5c-no-cargo-bin"
+NO_CARGO_LOG_DIR5C="$BASE_WORKDIR/w5c-no-cargo-log"
+launchd_sandbox_install_stubs "$NO_CARGO_BIN_DIR5C" "$NO_CARGO_LOG_DIR5C"
+TEST_PATH_NO_CARGO5C="$NO_CARGO_BIN_DIR5C:$MINIMAL_PATH"
+
+# The fake cargo lives ONLY under a scratch $HOME's rustup-default location,
+# simulating a non-interactive SSH shell that never sourced the profile line
+# rustup's installer adds.
+HOME5C="$BASE_WORKDIR/w5c-home"
+mkdir -p "$HOME5C/.cargo/bin"
+write_fake_cargo "$HOME5C/.cargo/bin/cargo"
+
+out5c=$( cd "$W5C" && PATH="$TEST_PATH_NO_CARGO5C" HOME="$HOME5C" \
+    LOOM_DAEMON_BIN="$INSTALLED5C" NEW_FAKE_BIN_SRC="$NEW_FAKE5C" \
+    bash "$UPDATE_SCRIPT" 2>&1 )
+rc5c=$?
+assert_eq "0" "$rc5c" "update succeeds when cargo is absent from PATH but present at \$HOME/.cargo/bin (#4695)"
+
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ -x "$INSTALLED5C" ]] && "$INSTALLED5C" --version 2>/dev/null | grep -q "$HEAD5C"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} \$HOME/.cargo/bin fallback cargo actually rebuilt+provisioned the fresh binary"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} \$HOME/.cargo/bin fallback cargo actually rebuilt+provisioned the fresh binary"
+    echo "  output: $out5c"
+fi
+
+# ============================================================
+# 5d. cargo genuinely absent (not on PATH, not under $HOME/.cargo/bin either)
+#     -> exit 1 with a failure message that suggests installing via rustup,
+#     not just "not found" (#4695 AC).
+# ============================================================
+W5D="$BASE_WORKDIR/w5d"
+new_fixture "$W5D"
+HOME5D="$BASE_WORKDIR/w5d-home"
+mkdir -p "$HOME5D" # deliberately no .cargo/bin at all
+NO_CARGO_BIN_DIR5D="$BASE_WORKDIR/w5d-no-cargo-bin"
+NO_CARGO_LOG_DIR5D="$BASE_WORKDIR/w5d-no-cargo-log"
+launchd_sandbox_install_stubs "$NO_CARGO_BIN_DIR5D" "$NO_CARGO_LOG_DIR5D"
+TEST_PATH_NO_CARGO5D="$NO_CARGO_BIN_DIR5D:$MINIMAL_PATH"
+
+out5d=$( cd "$W5D" && PATH="$TEST_PATH_NO_CARGO5D" HOME="$HOME5D" \
+    bash "$UPDATE_SCRIPT" 2>&1 )
+rc5d=$?
+assert_eq "1" "$rc5d" "update exits 1 when cargo is genuinely absent (no PATH, no \$HOME/.cargo/bin)"
+
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out5d" | grep -qi 'rustup'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} genuinely-absent-cargo error message suggests installing via rustup"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} genuinely-absent-cargo error message suggests installing via rustup"
+    echo "  output: $out5d"
+fi
+
+# ============================================================
 # 6. Stale binary but daemon was NOT running -> rebuild+provision
 #    happen, but the daemon is NOT started (never widen FLAGS-OFF
 #    by starting autonomy — or anything — that wasn't already up).
