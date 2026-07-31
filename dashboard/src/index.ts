@@ -500,6 +500,34 @@ export default {
     if (url.pathname.startsWith("/admin/")) {
       return handleAdmin(request, env, url);
     }
+
+    // Every `/api/*` route is operator-only, and the Worker — not the edge —
+    // is what enforces that under the single-URL layout (#4795).
+    //
+    // Before #4795 the reference deployment had one hostname-wide Access
+    // application, so "the request reached /api/*" really did imply "Access
+    // let it through" and the handlers below could hardcode
+    // `isAuthenticated: true`. Serving the public view at `/` means that app
+    // has to go: it is what makes `/` require a login. Deleting it without
+    // this check would leave `/api/*` matched by no Access application at
+    // all — i.e. the unredacted fleet, open to the internet.
+    //
+    // A narrower Access app covering only `/api/*` does not work either.
+    // Every app on a hostname sets the same `CF_Authorization` cookie, so a
+    // second app's session silently overwrites the one `/` validates; and
+    // the SPA reaches these routes by `fetch`, which cannot follow an SSO
+    // redirect. Verifying the same cookie `handleRoot` already verifies
+    // keeps one app, one audience, one cookie.
+    if (url.pathname.startsWith("/api/")) {
+      const identity = await validateAccessJwt(request.headers.get("cookie"), env);
+      if (identity === null) {
+        // 401, not 302: these routes answer JSON to an XHR client. `api.ts`
+        // treats 401/403 as "your session expired, reload" rather than a
+        // backend fault, which is exactly the right remedy here.
+        return jsonError(401, "authentication required");
+      }
+    }
+
     if (request.method === "GET" && url.pathname === "/api/fleet-state") {
       return handleFleetStateQuery(env, /* isAuthenticated */ true);
     }

@@ -126,3 +126,79 @@ export function tokensSnapshotEnvelope(overrides: Partial<Record<string, unknown
     },
   };
 }
+
+// ---------------------------------------------------------------------------
+// Cloudflare Access test identity
+// ---------------------------------------------------------------------------
+//
+// `/api/*` verifies the Access JWT in-Worker (see `src/index.ts`'s route
+// table for why the edge no longer does it), so any suite that exercises an
+// `/api/*` route needs a real, correctly-signed, correctly-audienced cookie.
+// The signing key and the JWKS mock live here so all three suites share one
+// identity rather than each growing its own copy.
+
+/** Matches the `CF_ACCESS_TEAM_DOMAIN`/`CF_ACCESS_AUD` bindings in
+ * `vitest.config.ts`. */
+export const TEST_TEAM_DOMAIN = "test-team.cloudflareaccess.com";
+export const TEST_AUD = "test-login-app-aud-tag";
+export const TEST_CERTS_URL = `https://${TEST_TEAM_DOMAIN}/cdn-cgi/access/certs`;
+
+let signingKey: CryptoKey | undefined;
+let jwks: { keys: Record<string, unknown>[] } | undefined;
+
+/** Generate the suite's RS256 keypair. Call once from `beforeAll`. */
+export async function initAccessTestKeys(): Promise<void> {
+  if (signingKey) return;
+  const { exportJWK, generateKeyPair } = await import("jose");
+  const keyPair = await generateKeyPair("RS256");
+  signingKey = keyPair.privateKey;
+  const jwk = await exportJWK(keyPair.publicKey);
+  jwks = { keys: [{ ...jwk, alg: "RS256" }] };
+}
+
+/**
+ * Intercept only the JWKS certs URL; every other fetch passes through.
+ * Returns the restore function.
+ *
+ * NOTE on ordering: `src/accessAuth.ts` caches one resolver per team domain
+ * per isolate (deliberately — see its module doc), so within a file a test
+ * that needs the JWKS fetch to *fail* must run before any test that lets it
+ * succeed. Suites that only need success can install this once in `beforeAll`.
+ */
+export function mockJwksFetch(): () => void {
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+    if (url === TEST_CERTS_URL) {
+      return new Response(JSON.stringify(jwks), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    return realFetch(input as never, init as never);
+  }) as typeof fetch;
+  return () => {
+    globalThis.fetch = realFetch;
+  };
+}
+
+/** Sign an Access JWT for the test team domain/audience. */
+export async function signAccessToken(
+  overrides: { aud?: string; expiresIn?: string; email?: string } = {},
+): Promise<string> {
+  if (!signingKey) throw new Error("call initAccessTestKeys() in beforeAll first");
+  const { SignJWT } = await import("jose");
+  return new SignJWT({ email: overrides.email ?? "operator@2amlogic.com" })
+    .setProtectedHeader({ alg: "RS256" })
+    .setIssuedAt()
+    .setIssuer(`https://${TEST_TEAM_DOMAIN}`)
+    .setAudience(overrides.aud ?? TEST_AUD)
+    .setExpirationTime(overrides.expiresIn ?? "10m")
+    .sign(signingKey);
+}
+
+/** A `Request` carrying a valid Access session cookie — the shorthand for
+ * "an operator hitting this route from the signed-in dashboard". */
+export async function authedRequest(url: string, init: RequestInit = {}): Promise<Request> {
+  const token = await signAccessToken();
+  const headers = new Headers(init.headers);
+  headers.set("cookie", `CF_Authorization=${token}`);
+  return new Request(url, { ...init, headers });
+}

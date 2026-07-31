@@ -1,5 +1,5 @@
 import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import worker from "../src/index";
 import {
   deriveTokenPoolAggregate,
@@ -13,7 +13,10 @@ import {
 import type { HistoryRecord } from "../src/query";
 import type { ActiveSweepState, FleetSnapshot } from "../src/fleetState";
 import {
+  authedRequest,
   hostHealthEnvelope,
+  initAccessTestKeys,
+  mockJwksFetch,
   seedHost,
   sweepCompletedEnvelope,
   sweepOutcomeEnvelope,
@@ -50,6 +53,14 @@ function ingestRequest(body: unknown, authHeader = "Bearer abc-ingest-key"): Req
 async function ingest(envelopes: unknown[]): Promise<Response> {
   return callWorker(ingestRequest(envelopes));
 }
+
+beforeAll(async () => {
+  // `/api/*` verifies the Access JWT in-Worker (src/index.ts), so this suite
+  // needs a real signed cookie and a stubbed JWKS endpoint. Installed once —
+  // nothing here tests the failure path, which is index.test.ts's job.
+  await initAccessTestKeys();
+  mockJwksFetch();
+});
 
 beforeEach(async () => {
   await seedHost(env.DB, "host-abc", "abc-ingest-key");
@@ -529,7 +540,7 @@ describe("GET /public/history vs GET /api/history — end-to-end redaction", () 
         expect(publicText).not.toContain("4710"); // pr_number
       }
 
-      const authResponse = await callWorker(new Request("https://ingest.example/api/history"));
+      const authResponse = await callWorker(await authedRequest("https://ingest.example/api/history"));
       const authText = await authResponse.text();
       expect(authText).toContain("rjwalters/loom");
       expect(authText).toContain("sweep-issue-4703-0");
@@ -559,7 +570,7 @@ describe("GET /public/history vs GET /api/history — end-to-end redaction", () 
   it("the authenticated route still serves the full per-account token rows", async () => {
     await ingest([tokensSnapshotEnvelope()]);
 
-    const response = await callWorker(new Request("https://ingest.example/api/history"));
+    const response = await callWorker(await authedRequest("https://ingest.example/api/history"));
     const body = (await response.json()) as {
       records: { kind: string; record: Record<string, unknown> }[];
     };
@@ -605,7 +616,7 @@ describe("GET /public/fleet-state vs GET /api/fleet-state — end-to-end redacti
     expect(publicBody.activeSweeps).toHaveLength(1);
     expect(publicBody.activeSweeps[0]?.hostId).toBe("host-abc");
 
-    const authResponse = await callWorker(new Request("https://ingest.example/api/fleet-state"));
+    const authResponse = await callWorker(await authedRequest("https://ingest.example/api/fleet-state"));
     const authText = await authResponse.text();
     expect(authText).toContain("rjwalters/loom");
     expect(authText).toContain("sweep-issue-4703-0");

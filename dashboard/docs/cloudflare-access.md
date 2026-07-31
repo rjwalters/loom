@@ -80,16 +80,40 @@ re-plumbed yet.
 | `/healthz` | **Bypass** | Cloudflare-level health check, no Worker route behind it — unrelated to this Worker's own auth, just needs to stay reachable without a login. |
 | `/login` | **Allow** | The *only* path this reference layout gates. Its sole purpose is to force the SSO round trip and mint the `CF_Authorization` session cookie, then bounce back to `/` (`src/index.ts`'s `/login` route is a bare redirect — Access has already done the real work by the time the Worker sees the request). |
 | `/admin/*` | **Allow** (+ service-token policy) | Host-key management. Already gated by the `ADMIN_TOKEN` bearer secret; Access in front of it is defense in depth. Its own application now (previously the service-token policy lived on the hostname-wide app) — scripted admin never touches `/login`, so giving it a dedicated app keeps the two identity policies from tangling. |
-| `/api/*` | **Allow** | The authenticated JSON query API (`docs/query-api.md`). Kept on its own dedicated app with the same identity policy `/login` uses — narrowing the old hostname-wide app to `/login` only would otherwise leave `/api/*` matched by **no** application at all, i.e. wide open, which is not this issue's intent. |
+| `/api/*` | **No Access application** — verified *in the Worker* | The authenticated JSON query API (`docs/query-api.md`). `src/index.ts` calls `validateAccessJwt` on this prefix and answers `401` without a valid identity, so removing the hostname-wide app does **not** leave it open. See the note below for why an edge app is the wrong tool here. |
 | `/`, `/public`, `/assets/*`, everything else | **No Access application at all** (not even Bypass — simply unmatched) | `/` does its own in-Worker JWT check (`src/accessAuth.ts`) and serves the dashboard UI in its public (redacted) variant on anything but a fully valid, correctly-audienced token; `/public` is a bare 301 to `/`. `/assets/*` is the UI's own JS/CSS bundle, served by the Workers Assets router — it contains no fleet data, only code, and the data it fetches is gated per-route by `/api/*` vs `/public/*`. None of these needs an edge policy. |
 
 Cloudflare evaluates the **most specific matching application** — a
 path-scoped app (`dashboard.example.com/login`) wins over a hostname-wide
-one. With this layout there is no hostname-wide application left at all: every
-gated path (`/login`, `/admin/*`, `/api/*`) gets its own narrowly-scoped app,
-and everything else (chiefly `/`) is simply never matched by any Access
-application, which is equivalent to Bypass but doesn't need to be declared
-as one.
+one. With this layout there is no hostname-wide application left at all:
+`/login` and `/admin/*` get their own narrowly-scoped apps, and everything
+else (chiefly `/`) is simply never matched by any Access application, which
+is equivalent to Bypass but doesn't need to be declared as one.
+
+### Why `/api/*` is verified in the Worker, not at the edge
+
+Gating `/api/*` with its own Access application is the obvious move and it
+does not work. Two independent reasons:
+
+1. **One cookie name per hostname.** Every Access application on
+   `dashboard.example.com` issues its session as a cookie named
+   `CF_Authorization`, scoped to `/` unless `path_cookie_attribute` is set.
+   A second app's session therefore *overwrites* the one `/` validates, and
+   each app has a different `aud` — so after a round trip through the
+   `/api` app, the Worker's `CF_ACCESS_AUD` check at `/` starts failing and
+   the operator silently drops to the public view. Setting
+   `path_cookie_attribute` fixes the clobbering and breaks the thing that
+   made it work: a cookie scoped to `/api` is not sent to `/`.
+2. **`fetch` cannot complete an SSO redirect.** The dashboard reaches these
+   routes by XHR. An Access challenge answers `302` toward the IdP; the SPA
+   gets an opaque redirect to an HTML login page where it expected JSON,
+   with no way to complete the interactive flow.
+
+Verifying the same cookie `handleRoot` already verifies keeps the invariant
+simple — **one application, one audience, one cookie** — and removes an
+assumption worth removing on its own: before this change the API handlers
+inferred authentication from *which route matched*, which was true only for
+as long as an edge application happened to cover that route.
 
 **Create `/ingest` and `/healthz` Bypass applications (if you deploy any at
 all — most reference deployments don't need an explicit Bypass app for a

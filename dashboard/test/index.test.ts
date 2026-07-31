@@ -191,8 +191,55 @@ describe("GET / — Access JWT wired end to end (real createRemoteJWKSet path)",
     expect(publicBody).not.toContain(PRIVATE_REPO);
     expect(publicBody).not.toContain(PRIVATE_SWEEP_ID);
 
-    const apiHistory = await callWorker(new Request("https://ingest.example/api/history"));
+    const apiHistory = await callWorker(
+      new Request("https://ingest.example/api/history", { headers: { cookie: `CF_Authorization=${token}` } }),
+    );
     expect(await apiHistory.text()).toContain(PRIVATE_REPO);
+  });
+
+  // The reason `/api/*` verifies the JWT itself: serving the public view at
+  // `/` requires deleting the hostname-wide Access application, which is
+  // also the only thing that was gating `/api/*` at the edge. If these ever
+  // start passing without a cookie, the unredacted fleet is public.
+  it.each([
+    ["/api/fleet-state", "https://ingest.example/api/fleet-state"],
+    ["/api/history", "https://ingest.example/api/history"],
+    ["/api/events", "https://ingest.example/api/events"],
+  ])("%s refuses an anonymous request", async (_label, url) => {
+    restoreFetch = mockJwksFetch();
+    const response = await callWorker(new Request(url));
+
+    expect(response.status).toBe(401);
+    expect(await response.text()).not.toContain(PRIVATE_REPO);
+  });
+
+  it("/api/* refuses a token this Worker's audience does not accept", async () => {
+    restoreFetch = mockJwksFetch();
+    const token = await signToken({ aud: "some-other-apps-aud-tag" });
+
+    const response = await callWorker(
+      new Request("https://ingest.example/api/fleet-state", {
+        headers: { cookie: `CF_Authorization=${token}` },
+      }),
+    );
+    expect(response.status).toBe(401);
+  });
+
+  it("/api/* refuses an expired token", async () => {
+    restoreFetch = mockJwksFetch();
+    const token = await signToken({ expiresIn: "-10m" });
+
+    const response = await callWorker(
+      new Request("https://ingest.example/api/history", {
+        headers: { cookie: `CF_Authorization=${token}` },
+      }),
+    );
+    expect(response.status).toBe(401);
+  });
+
+  it("/public/* stays reachable anonymously — the split is auth, not obscurity", async () => {
+    const response = await callWorker(new Request("https://ingest.example/public/fleet-state"));
+    expect(response.status).toBe(200);
   });
 
   it("never lets a shared cache store either variant of / under one URL", async () => {
