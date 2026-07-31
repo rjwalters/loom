@@ -175,14 +175,32 @@ plus the `loom:changes-requested` label. Read it with:
 gh pr view <pr> --comments
 ```
 
-Focus on the Judge's most recent comments: look for specific file paths, line
-numbers, and what to change, then make the targeted fix before doing anything else.
+`gh pr view --comments` (and the Judge's own posting convention, `gh pr comment`
+per CLAUDE.md) only surfaces **top-level** PR comments. A human reviewer can
+separately leave **inline** review comments anchored to a specific diff hunk
+(the `#discussion_r...` links in the GitHub UI) — a different API surface that
+`gh pr view --comments` never includes. Fetch those too, every time you read
+feedback, so a reviewer's per-line note is never silently missed:
+
+```bash
+gh api "repos/{owner}/{repo}/pulls/<pr>/comments" \
+  --jq '.[] | "\(.path):\(.line // .original_line) — \(.user.login): \(.body)"'
+```
+
+Fold both sets of comments — top-level and inline — into the context you reason
+about before making a fix. An inline comment on one hunk is actionable feedback
+even if the reviewer never added a top-level summary comment.
+
+Focus on the most recent comments from either surface: look for specific file
+paths, line numbers, and what to change, then make the targeted fix before doing
+anything else.
 
 > **Note**: there is no `--test-fix` flag, no `--context` argument, and no
 > structured JSON feedback file dropped in the worktree. Those were part of the
 > Shepherd's test-fix protocol, which was removed in v0.10.0. `/loom:sweep` now
 > communicates with Doctor entirely through the PR's comments and labels — always
-> read the live feedback with `gh pr view <pr> --comments`.
+> read the live feedback with both `gh pr view <pr> --comments` (top-level) and
+> `gh api repos/{owner}/{repo}/pulls/<pr>/comments` (inline).
 
 If no argument is provided, use the normal "Finding Work" workflow below.
 
@@ -899,8 +917,13 @@ else
   cd ".loom/worktrees/pr-42"
 fi
 
-# See what reviewer said
+# See what reviewer said (top-level comments)
 gh pr view 42 --comments
+
+# See inline/per-line review comments too — anchored to a specific diff hunk
+# (#discussion_r... links), a separate API surface `gh pr view --comments` never includes
+gh api repos/{owner}/{repo}/pulls/42/comments \
+  --jq '.[] | "\(.path):\(.line // .original_line) — \(.user.login): \(.body)"'
 
 # Make your changes...
 # (edit files, add tests, fix bugs, resolve conflicts)
