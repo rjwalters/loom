@@ -149,6 +149,11 @@ new_fixture() {
     # #4260 sub-issue C) sources it relative to ITS OWN location, so it must exist
     # alongside the fixture copy too, not just in the real repo tree.
     cp "$CLI_DIR/../lib/systemd-user.sh" "$root/.loom/scripts/lib/systemd-user.sh"
+    # Same for lib/bounded-run.sh (#4799): the fixture start script's
+    # print_calibrate_hint() sources it relative to ITS OWN location to bound
+    # its `calibrate` command substitution, so it must exist alongside the
+    # fixture copy too.
+    cp "$CLI_DIR/../lib/bounded-run.sh" "$root/.loom/scripts/lib/bounded-run.sh"
     cp "$LOOM_REPO_ROOT/scripts/install/provision-daemon.sh" "$root/scripts/install/provision-daemon.sh"
     cat > "$root/loom-daemon/Cargo.toml" <<'EOF'
 [package]
@@ -199,6 +204,17 @@ push_extra_commits_to_origin() {
 # Writes a fake daemon binary at $1 that reports commit $2 on --version and,
 # on a normal run, appends its inherited LOOM_WORK_FINDER / LOOM_MAIN_HEALTH_GATE
 # to marker file $3 before looping forever (so it stays alive for kill -0).
+#
+# `calibrate` is handled explicitly (#4799) and exits immediately with no
+# output: this fixture has no real calibrate implementation, and every
+# successful loom-daemon-start.sh run (nohup/launchd/systemd, all three
+# reached by this suite's restart scenarios) calls `$DAEMON_BIN calibrate
+# --workspace ... --json` via print_calibrate_hint(). Before this fix, that
+# call fell through to the `while true` loop below and hung forever inside
+# print_calibrate_hint()'s blocking `$(...)` -- the exact hang
+# ci-excluded.txt documented. print_calibrate_hint() is bounded independently
+# now (lib/bounded-run.sh), but this fixture also short-circuits so the suite
+# stays fast rather than eating that timeout on every restart.
 write_fake_daemon() {
     local path="$1" commit="$2" marker="$3"
     cat > "$path" <<EOF
@@ -206,6 +222,9 @@ write_fake_daemon() {
 if [[ "\${1:-}" == "--version" ]]; then
     echo "loom-daemon 0.15.0 (commit ${commit}, built 2026-07-26T00:00:00Z)"
     exit 0
+fi
+if [[ "\${1:-}" == "calibrate" ]]; then
+    exit 1
 fi
 echo "FAKE_DAEMON WF=[\${LOOM_WORK_FINDER:-}] HG=[\${LOOM_MAIN_HEALTH_GATE:-}]" > "${marker}"
 while true; do sleep 1; done
@@ -230,6 +249,11 @@ fi
 if [[ "\${1:-}" == "restart" ]]; then
     echo "restart" >> "${restart_marker}"
     exit ${restart_rc}
+fi
+# See write_fake_daemon's comment (#4799): no real calibrate implementation,
+# exit fast instead of falling into the daemon-body loop below.
+if [[ "\${1:-}" == "calibrate" ]]; then
+    exit 1
 fi
 while true; do sleep 1; done
 EOF
