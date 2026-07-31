@@ -197,6 +197,7 @@ pub mod test_log_capture;
 pub mod token_ranking_refresh;
 pub mod tokens;
 pub mod tokens_pool;
+pub mod transcript_tokens;
 pub mod types;
 pub mod watch_registry;
 pub mod work_finder;

@@ -632,17 +632,66 @@ what feeds the public fleet feed on 2amlogic.com. Loom is the producer:
   - Unlike `tokens`, a real **`0`** additions/deletions is a fact about the merge
     (an empty-diff merge, a pure revert) and is published as `0`; a blank `title`
     is omitted.
-  - `tokens` is a best-effort **input + output** total from the in-process
-    activity DB's per-issue rollup (`ActivityDb::get_cost_by_issue`), read on the
-    blocking pool with a 5s cap. **Attribution is knowingly imperfect** — the
-    rollup keys on a bare issue number (no repo column, so a multi-repo daemon
-    conflates identical numbers across repos) and only counts token samples that
-    are linked to the issue through `agent_inputs`, making the figure a floor.
-    That is a deliberate operator call: for a cost *trend*,
-    imperfect-but-consistent beats absent. An empty or zero rollup omits the key
-    rather than charting free work.
+  - `tokens` is a best-effort per-issue total from **two** sources, tried in
+    order, each on the blocking pool with its own 5s cap:
+    1. The in-process activity DB's per-issue rollup
+       (`ActivityDb::get_cost_by_issue`) — **input + output**.
+    2. **The sweep's own on-disk Claude Code transcripts** (#4699) — all four
+       usage counters (`input`, `output`, `cache_read`, `cache_creation`), i.e.
+       total tokens processed.
+
+    **Attribution is knowingly imperfect** for both. The rollup keys on a bare
+    issue number (no repo column, so a multi-repo daemon conflates identical
+    numbers across repos) and only counts token samples linked to the issue
+    through `agent_inputs`, making the figure a floor. That is a deliberate
+    operator call: for a cost *trend*, imperfect-but-consistent beats absent.
+    Both sources coming up empty omits the key rather than charting free work.
+
+    > **Operational gotcha — why the DB rollup is silent on a fleet host
+    > (#4699).** The `resource_usage` and `prompt_github` rows the rollup joins
+    > are written from exactly **one** place: the IPC `GetTerminalOutput` handler
+    > scraping a *managed terminal's* scrollback. `dispatch_sweep` spawns a
+    > detached `claude -p` via `spawn-worker.sh` and reaps the OS process — it
+    > issues no `SendInput`/`GetTerminalOutput` round trips — so on any host whose
+    > work arrives by dispatch (i.e. every host that publishes to the feed) both
+    > tables are empty **forever**, not merely "until the prompt↔usage linkage is
+    > established". Measured on the reference host 2026-07-31: 0 rows in each,
+    > across 76 published completions, every one of them `tokens: null`. Source 2
+    > exists because of this; do not diagnose a `tokens: null` feed record by
+    > looking for missing rollup rows.
+
+    The transcript source locates a sweep's session by content, since nothing
+    records a sweep-id → session-uuid mapping: a sweep runs `claude -p
+    "/loom:sweep <issue> …"` with cwd = the workspace root, so Claude Code writes
+    `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/<cwd-slug>/<uuid>.jsonl` (plus
+    `<uuid>/subagents/agent-*.jsonl`, one per phase), and the parent session's
+    first `user` record carries the slash command verbatim. Candidates are
+    narrowed by file mtime against the completion's own time window (±2h slack)
+    before any file is read, and a re-dispatched issue's several sessions are all
+    summed. Because the project directory is keyed by the workspace path, this
+    source *is* repo-qualified — it does not share the rollup's cross-repo
+    issue-number conflation. Cache reads are included because they dominate a
+    sweep both by volume (~99%) and — priced at ~10% of base — by cost, so an
+    input+output-only figure under-reports spend by well over an order of
+    magnitude and unevenly between sweeps. Set
+    `LOOM_SAFEHOUSE_TRANSCRIPT_TOKENS=0` to opt out of the transcript scan
+    entirely (the key is then simply omitted on dispatch-driven hosts).
   - Absent `tokens`/`title`/`additions`/`deletions` ⇒ the envelope is identical
     to the pre-#4497 one; none of the four can block or fail an emission.
+
+  > **A `null` field on 2amlogic.com is not evidence of a producer bug (#4699).**
+  > The public feed applies its **own** server-side redaction on read: entries
+  > whose `repo` is not on the site's linked-repo allowlist are served with
+  > `ref` and `title` forced to `null`, keeping the sellable columns
+  > (`repo#issue`, diff stats, timing) while withholding the outbound link. So a
+  > mix of linked and unlinked repos in one feed response legitimately shows
+  > `title: null` next to a populated `additions`. Loom itself cannot emit a
+  > null/absent `ref` at all — it is in `COMPLETION_REQUIRED_KEYS`, so
+  > `validate_completion_meta` rejects the envelope before it can be sent (and
+  > the site's `/api/ingest` validator independently rejects such a payload with
+  > a `400`). **Before filing a producer bug, check the feed record's `repo`
+  > against the site's allowlist and compare against a linked repo's record from
+  > the same tick.**
 - **Timestamps** come from the reaper's clock (`started_at = exit − duration_sec`,
   `completed_at = exit`), so the pair is always self-consistent.
 - **`result: "failure"` is out of scope for v1**: `completion-v1` requires a
@@ -712,6 +761,12 @@ what feeds the public fleet feed on 2amlogic.com. Loom is the producer:
   `AttentionClass` (the exhaustive kind → tier table), `RoomRouter` (per-envelope
   room resolution, lazy `fleet-<repo>` creation, warn-once degradation) and
   `SafehouseClient::send_to` / `create_room`.
+- `loom-daemon/src/transcript_tokens.rs` — (#4699) the on-disk token source
+  behind the completion envelope's `tokens` field: Claude Code's project-slug
+  mangling, the `/loom:sweep <issue>` session match, mtime windowing and the
+  parent+subagents usage sum. Pure filesystem code with no safehouse dependency,
+  so it is unit-testable on its own; `safehouse.rs` wraps it in the timeout and
+  the `LOOM_SAFEHOUSE_TRANSCRIPT_TOKENS` opt-out.
 - `loom-daemon/src/peer_claims.rs` — the pure, socket-free peer-claim view
   (TTL expiry, self-claim recognition, retraction, `ClaimAd` parse/serialize).
 - `loom-daemon/src/workspace_pool.rs` — `start_safehouse_narration()` and
