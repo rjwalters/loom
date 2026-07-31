@@ -131,6 +131,23 @@ jobs:
       - name: Check AGENTS.md is in sync with its source
         run: bash scripts/check-agents-md-sync.sh
 
+  docs-defaults-parity:
+    name: Docs/Defaults Parity Check
+    # Cheap structural check; always runs. Consumer repos populate .loom/docs/
+    # FROM defaults/docs/ (resync-installed.sh), so a doc authored only in
+    # .loom/docs/ never ships, and a defaults/docs/ link to a sibling that only
+    # exists in .loom/docs/ is a dead link in every install — this happened
+    # twice (safehouse.md, token-pool.md) before anything caught it (#4841).
+    # The self-test step regression-tests the checker itself against a
+    # synthetic fixture reproducing that exact case.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Self-test the checker against a synthetic fixture
+        run: bash scripts/check-docs-defaults-parity.sh --self-test
+      - name: Check .loom/docs/ orphans and defaults/docs/ sibling links
+        run: bash scripts/check-docs-defaults-parity.sh
+
   installer-tests:
     name: Installer Integration Tests
     needs: changes
