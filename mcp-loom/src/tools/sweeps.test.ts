@@ -12,6 +12,7 @@
 import { describe, expect, it } from "vitest";
 import {
   extractRuntimeRejection,
+  formatDispatchTokenLine,
   formatRuntimeRejection,
   type RuntimeRejection,
 } from "./sweeps.js";
@@ -98,5 +99,27 @@ describe("formatRuntimeRejection", () => {
     expect(line).not.toContain("unmet capabilities");
     expect(line).toContain("not-a-role");
     expect(line).not.toContain("per-role binding cannot switch");
+  });
+});
+
+/**
+ * Issue #4689: `dispatch_sweep` used to print a bare `Token: unknown` right
+ * alongside `Success`, reading as cosmetic rather than as "not yet known" —
+ * the exact ambiguity that let dead dispatches (killed by a token-selection
+ * failure) look like launched sweeps.
+ */
+describe("formatDispatchTokenLine", () => {
+  it("never renders a bare 'unknown' token name — always a clarifying pending note", () => {
+    const line = formatDispatchTokenLine("unknown");
+    expect(line).toContain("unknown");
+    expect(line).not.toBe("Token:      unknown");
+    expect(line.toLowerCase()).toContain("not yet captured");
+    // The clarifying text must not itself read as a failure — the dispatch
+    // call genuinely succeeded in this case.
+    expect(line.toLowerCase()).toContain("succeeded");
+  });
+
+  it("renders a real token name unchanged", () => {
+    expect(formatDispatchTokenLine("agent3-2amlogic")).toBe("Token:      agent3-2amlogic");
   });
 });
