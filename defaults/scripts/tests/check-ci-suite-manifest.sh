@@ -12,9 +12,13 @@
 # directory is intentionally ignored — only `test-*.sh` files are suites.
 #
 # Since #4769 the invariant also covers tests/hooks/ (repo root) — the
-# Claude-path guard suites. Those entries are qualified with their path
-# relative to the repo root (e.g. `tests/hooks/test-guard-destructive.sh`) so
-# they can't collide with a same-named suite in this directory.
+# Claude-path guard suites. Since #4451 it also covers defaults/hooks/tests/
+# (the Repo Skills' own guard-hook suites — background-subagents,
+# loom-workspace, worktree-paths, methodology-inject, skill-router). Entries
+# for either external directory are qualified with their path relative to the
+# repo root (e.g. `tests/hooks/test-guard-destructive.sh`,
+# `defaults/hooks/tests/test-skill-router.sh`) so they can't collide with a
+# same-named suite in this directory.
 #
 # Exit 0 = invariant holds; exit 1 = violation (details printed to stderr).
 
@@ -24,7 +28,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 WIRED_MANIFEST="$SCRIPT_DIR/ci-wired.txt"
 EXCLUDED_MANIFEST="$SCRIPT_DIR/ci-excluded.txt"
-HOOKS_TEST_DIR="$REPO_ROOT/tests/hooks"
+# Directories of suites outside defaults/scripts/tests/ that this manifest
+# also governs, each relative to the repo root (#4769, #4451).
+EXTERNAL_TEST_DIRS=("tests/hooks" "defaults/hooks/tests")
 
 fail=0
 err() { printf 'ERROR: %s\n' "$1" >&2; fail=1; }
@@ -42,12 +48,16 @@ manifest_names() { # <manifest-file>
 
 # --- Collect the three sets --------------------------------------------------
 mapfile -t actual_local < <(cd "$SCRIPT_DIR" && for f in test-*.sh; do [[ -e "$f" ]] && printf '%s\n' "$f"; done)
-mapfile -t actual_hooks < <(
-    if [[ -d "$HOOKS_TEST_DIR" ]]; then
-        cd "$HOOKS_TEST_DIR" && for f in test-*.sh; do [[ -e "$f" ]] && printf 'tests/hooks/%s\n' "$f"; done
-    fi
-)
-mapfile -t actual < <(printf '%s\n' "${actual_local[@]}" "${actual_hooks[@]}" | sort)
+actual_external=()
+for rel_dir in "${EXTERNAL_TEST_DIRS[@]}"; do
+    ext_dir="$REPO_ROOT/$rel_dir"
+    [[ -d "$ext_dir" ]] || continue
+    while IFS= read -r name; do
+        [[ -n "$name" ]] || continue
+        actual_external+=("$rel_dir/$name")
+    done < <(cd "$ext_dir" && for f in test-*.sh; do [[ -e "$f" ]] && printf '%s\n' "$f"; done)
+done
+mapfile -t actual < <(printf '%s\n' "${actual_local[@]}" "${actual_external[@]}" | sort)
 mapfile -t wired < <(manifest_names "$WIRED_MANIFEST" | sort)
 mapfile -t excluded < <(manifest_names "$EXCLUDED_MANIFEST" | sort)
 
