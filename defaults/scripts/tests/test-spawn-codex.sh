@@ -894,8 +894,14 @@ run_preflight() {
 }
 
 READY_PROFILE="$(mk_hook_profile ready)"
+# No explicit --bridge here: production `install` never passes one either, so
+# this must resolve the bridge the exact same way spawn-codex.sh's `verify`
+# call does (via resolve_bridge()'s --workspace-relative candidate). Pinning
+# to $BRIDGE_SCRIPT (the defaults/ copy) would diverge from verify's
+# resolution whenever a workspace-local .loom/hooks/guard-codex-bridge.sh
+# copy also exists (see #4787), spuriously reporting hooks=not-ready.
 bash "$PROVISION_SCRIPT" install --codex-home "$READY_PROFILE" \
-    --workspace "$(pwd)" --bridge "$BRIDGE_SCRIPT" >/dev/null 2>&1
+    --workspace "$(pwd)" >/dev/null 2>&1
 printf 'hooks.state."loom".trusted_hash = "deadbeef"\n' > "$READY_PROFILE/config.toml"
 
 BARE_PROFILE="$(mk_hook_profile bare)"
