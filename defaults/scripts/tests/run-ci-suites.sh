@@ -13,12 +13,13 @@
 #   LOOM_CI_SUITE_TIMEOUT=180 …      # per-suite timeout in seconds (default 1200)
 #
 # A manifest entry containing a `/` is a suite outside this directory,
-# resolved relative to the repo root (tests/hooks/…, #4769) rather than
-# SCRIPT_DIR; its log file name has the `/` replaced with `_` so it stays a
-# flat /tmp path. The default per-suite timeout was raised from 120s to 1200s
-# in #4769 to cover tests/hooks/test-guard-destructive.sh (531 assertions,
-# observed up to ~14 min / 850s wall-clock on a loaded dev machine — still
-# hermetic, just large — so the ceiling keeps real headroom above that peak).
+# resolved relative to the repo root (tests/hooks/…, #4769; defaults/hooks/
+# tests/…, #4451) rather than SCRIPT_DIR; its log file name has the `/`
+# replaced with `_` so it stays a flat /tmp path. The default per-suite
+# timeout was raised from 120s to 1200s in #4769 to cover
+# tests/hooks/test-guard-destructive.sh (531 assertions, observed up to ~14
+# min / 850s wall-clock on a loaded dev machine — still hermetic, just large
+# — so the ceiling keeps real headroom above that peak).
 #
 # Exit 0 = all wired suites passed; 1 = one or more failed / manifest invalid.
 

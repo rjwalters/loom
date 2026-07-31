@@ -17,6 +17,14 @@
 # the repo root instead of this directory. They were confirmed hermetic (no
 # live forge/network calls — the `gh`/`curl` strings in them are guard-input
 # fixtures, never executed) before being wired in here.
+#
+# Since #4451 the manifest also covers defaults/hooks/tests/ — the remaining
+# unwired guard-hook suites (background-subagents, loom-workspace,
+# worktree-paths, methodology-inject, skill-router). Each copies its hook
+# under test into an isolated `mktemp -d` git tree and drives it purely via
+# stdin JSON + env vars (no live forge/network calls, no BSD-only sed/stat/
+# date flags), so they were confirmed hermetic and ubuntu-portable the same
+# way as the tests/hooks/ suites above before being wired in here.
 
 test-archive-transcripts.sh
 test-blame-issue.sh
@@ -104,3 +112,10 @@ test-worktree-snapshot.sh
 tests/hooks/test-guard-destructive-dispatcher.sh
 tests/hooks/test-guard-destructive.sh
 tests/hooks/test-guard-loom-workflow.sh
+
+# defaults/hooks/tests/ — remaining unwired guard-hook suites, wired since #4451.
+defaults/hooks/tests/test-guard-background-subagents.sh
+defaults/hooks/tests/test-guard-loom-workspace.sh
+defaults/hooks/tests/test-guard-worktree-paths.sh
+defaults/hooks/tests/test-methodology-inject.sh
+defaults/hooks/tests/test-skill-router.sh

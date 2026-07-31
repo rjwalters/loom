@@ -42,6 +42,12 @@ jobs:
               - 'scripts/**'
               - 'defaults/**'
               - 'tests/hooks/**'
+              # .loom/hooks/** is git-tracked (self-install dogfooding) and
+              # several defaults/hooks/tests/*.sh + tests/hooks/*.sh suites
+              # assert it's byte-identical to defaults/hooks/** (#4451) — a
+              # drift here without a matching defaults/ change should still
+              # re-run shell-suite-tests on the PR, not just on push to main.
+              - '.loom/hooks/**'
               - '.github/workflows/ci.yml'
 
   backend-lint-and-check:
@@ -233,6 +239,15 @@ jobs:
     # entirely). tests/hooks/test-guard-destructive.sh alone adds several
     # minutes (531 assertions); run-ci-suites.sh's per-suite timeout was
     # raised accordingly (see its header comment).
+    #
+    # Since #4451 ci-wired.txt also covers defaults/hooks/tests/ — the last
+    # unwired guard-hook location (background-subagents, loom-workspace,
+    # worktree-paths, methodology-inject, skill-router; 128 assertions across
+    # the 5 suites). Measured ~1m43s combined on a loaded macOS dev machine
+    # (this repo's only prior execution environment); ubuntu-latest is
+    # expected to be faster (no per-exec Gatekeeper/codesign overhead, cheaper
+    # fork/exec) but this is the suites' first CI run — watch the actual
+    # ubuntu wall-clock here and tighten LOOM_CI_SUITE_TIMEOUT only if needed.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
