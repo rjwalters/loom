@@ -1095,4 +1095,61 @@ mod tests {
         assert_eq!(w.added_by.as_deref(), Some("operator"));
         assert_eq!(w.state.as_deref(), Some("draining"));
     }
+
+    #[test]
+    fn registry_roundtrips_4697_idle_shutdown_fields() {
+        // #4697: `fleet status`'s expected-power-off heuristic reads both
+        // fields out of the registry in a LATER process than the one that
+        // wrote them, so a real save/load must preserve them exactly.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fleet.json");
+
+        let mut w = record("worker-1");
+        w.idle_shutdown_minutes = Some(30);
+        w.last_seen_up_at = Some("2026-07-30T12:00:00+00:00".to_string());
+        let mut reg = FleetRegistry::default();
+        reg.upsert(w);
+        reg.save(&path).unwrap();
+
+        let loaded = FleetRegistry::load(&path).unwrap();
+        let got = loaded.get("worker-1").unwrap();
+        assert_eq!(got.idle_shutdown_minutes, Some(30));
+        assert_eq!(got.last_seen_up_at.as_deref(), Some("2026-07-30T12:00:00+00:00"));
+    }
+
+    #[test]
+    fn registry_record_without_4697_fields_parses_as_absent() {
+        // Backward-compat: every record written before #4697 lacks both keys.
+        // They must load as `None` (not error, not a bogus default that would
+        // make a live host read as an "expected" power-off).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fleet.json");
+        std::fs::write(
+            &path,
+            r#"{ "version": 1, "workers": [ {
+                "ssh_host": "pre-4697",
+                "bootstrapped_at": "2026-07-29T00:00:00Z"
+            } ] }"#,
+        )
+        .unwrap();
+        let reg = FleetRegistry::load(&path).unwrap();
+        let w = reg.get("pre-4697").unwrap();
+        assert_eq!(w.idle_shutdown_minutes, None);
+        assert_eq!(w.last_seen_up_at, None);
+    }
+
+    #[test]
+    fn registry_omits_absent_4697_fields_from_serialized_json() {
+        // `skip_serializing_if` keeps the registry file unchanged for the
+        // overwhelmingly common no-idle-shutdown worker — a merge/diff of
+        // fleet.json shouldn't churn with null keys after this upgrade.
+        let reg = {
+            let mut r = FleetRegistry::default();
+            r.upsert(record("plain-worker"));
+            r
+        };
+        let json = serde_json::to_string(&reg).unwrap();
+        assert!(!json.contains("idle_shutdown_minutes"));
+        assert!(!json.contains("last_seen_up_at"));
+    }
 }

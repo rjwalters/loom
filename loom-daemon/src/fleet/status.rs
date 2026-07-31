@@ -105,7 +105,11 @@ impl HostState {
             HostState::Up => "UP",
             HostState::DaemonDown => "DAEMON DOWN",
             HostState::Unreachable => "UNREACHABLE",
-            HostState::PoweredOff => "POWERED OFF (EXPECTED)",
+            // Kept to 11 chars, matching the longest pre-existing label, so
+            // it still fits `render_human`'s `{:<12}` STATE column — the
+            // "expected, not a failure" qualifier rides on the per-row detail
+            // line and the summary tally instead of blowing the table apart.
+            HostState::PoweredOff => "POWERED OFF",
             HostState::ParseError => "PARSE ERROR",
             HostState::Draining => "DRAINING",
         }
@@ -1054,8 +1058,12 @@ mod tests {
         assert_ne!(report.exit_code(), 0);
 
         let rendered = report.render_human();
-        assert!(rendered.contains("POWERED OFF (EXPECTED)"));
+        assert!(rendered.contains("POWERED OFF"));
         assert!(rendered.contains("1 powered-off (expected)"));
+        // The STATE label must not overflow render_human's {:<12} column, or
+        // every remaining cell on that row shifts right and the table stops
+        // being scannable.
+        assert!(HostState::PoweredOff.label().len() <= 11);
     }
 
     #[tokio::test]

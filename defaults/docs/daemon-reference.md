@@ -543,7 +543,7 @@ the plan/ordering/checklist; the per-phase shell is rendered in
      prior bootstrap state).
    - **Operator visibility**: `fleet status` (#4342, extended by #4697)
      distinguishes a host that is silently past its configured
-     `--idle-shutdown-minutes` window — reported as `POWERED OFF (EXPECTED)`,
+     `--idle-shutdown-minutes` window — reported as `POWERED OFF`,
      not a bare `UNREACHABLE` — from one whose silence doesn't yet explain
      itself, which stays `UNREACHABLE` (genuinely worth investigating). This
      classification is read from the registry's persisted
@@ -617,7 +617,7 @@ format was needed.
     (#4697) either no idle-shutdown guard is configured for this host or its
     silence hasn't yet reached the configured window — genuinely worth
     investigating.
-  - `POWERED OFF (EXPECTED)` (#4697) — the host is `Unreachable` by every
+  - `POWERED OFF` (#4697) — the host is `Unreachable` by every
     signal available (SSH/connect failure or timeout — an idle-shutdown
     power-off looks no different over the wire than a genuinely dead host),
     **but** it has a configured idle-shutdown window
@@ -628,7 +628,10 @@ format was needed.
     reached that window. Read as "likely powered off as designed, not a
     failure" — still counts as non-`Up` for the exit-code policy below (it is
     not confirmed-alive), but is loudly distinguished from a genuine outage so
-    an operator doesn't chase a phantom incident. Deliberately conservative:
+    an operator doesn't chase a phantom incident. The "expected, not a
+    failure" qualifier and the wake pointer ride on the row's `->` detail line
+    and the `N powered-off (expected)` summary tally rather than the STATE
+    cell, which stays inside the table's column width. Deliberately conservative:
     either input missing (no guard configured, or the host has never been
     observed `Up` by `fleet status` yet) leaves the host `UNREACHABLE`, the
     pre-#4697 default — a false "expected, don't worry" reading on a
@@ -648,7 +651,7 @@ format was needed.
   fleet workers registered" notice alongside the local host's row.
 - **Exit code**: `0` only when every roster host is `UP`; non-zero otherwise
   (a monitor/CI check should treat any non-zero exit as "go look" — including
-  a `POWERED OFF (EXPECTED)` host, since it is still not confirmed-alive).
+  a `POWERED OFF` host, since it is still not confirmed-alive).
 - **`--json`** schema: `{ "hosts": [ { "alias", "state", "tailnet_name"?,
   "provider_instance_id"?, "added_by"?, "is_local", "workspaces", "status"?,
   "detail"?, "safehoused" } ], "summary": { "total", "up", "daemon_down",

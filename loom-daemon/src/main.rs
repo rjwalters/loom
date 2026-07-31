@@ -4726,26 +4726,41 @@ async fn handle_fleet_status_command(json: bool) -> Result<()> {
     };
     use loom_daemon::fleet::FleetRegistry;
 
-    // Kept separate from `registry` below: `collect_fleet_report` consumes
-    // its registry argument (it owns each `WorkerRecord` into the concurrent
-    // per-host collection), so a clone is fanned out while the original stays
-    // available afterward to receive the #4697 `last_seen_up_at` write-back.
-    let registry_for_collection = FleetRegistry::load_default()?;
-    let mut registry = registry_for_collection.clone();
+    // `collect_fleet_report` consumes its registry argument (it owns each
+    // `WorkerRecord` into the concurrent per-host collection).
+    let registry = FleetRegistry::load_default()?;
     let local = collect_local_fleet_report().await;
     let source: Arc<dyn loom_daemon::fleet::status::HostStatusSource> =
         Arc::new(SshStatusSource::new());
     let timeout = Duration::from_secs(loom_daemon::fleet::status::DEFAULT_TIMEOUT_SECS);
-    let report = collect_fleet_report(source, registry_for_collection, local, timeout).await;
+    let report = collect_fleet_report(source, registry, local, timeout).await;
 
     // #4697: persist "last observed Up" so a LATER poll that finds this host
     // Unreachable can measure elapsed silence against its configured
     // idle-shutdown window (the expected-power-off heuristic in
-    // `loom_daemon::fleet::status`). Best-effort: a failure to persist must
-    // never block reporting/exiting on the status the operator asked for.
-    if update_last_seen_up_at(&mut registry, &report, chrono::Utc::now()) {
-        if let Err(e) = registry.save_default() {
-            eprintln!("warning: could not persist fleet registry last-seen-up timestamp(s): {e}");
+    // `loom_daemon::fleet::status`).
+    //
+    // Deliberately RE-LOADS the registry rather than mutating the copy fanned
+    // out above: the SSH collection can take up to DEFAULT_TIMEOUT_SECS, and
+    // `fleet status` is now a writer of a file other commands (`add-worker`,
+    // `drain`) also write. Saving the pre-collection snapshot would silently
+    // clobber anything they committed during that window; re-loading narrows
+    // the lost-update window to the few milliseconds between here and `save`.
+    //
+    // Best-effort throughout: neither a failed re-load nor a failed save may
+    // block reporting/exiting on the status the operator actually asked for.
+    match FleetRegistry::load_default() {
+        Ok(mut fresh) => {
+            if update_last_seen_up_at(&mut fresh, &report, chrono::Utc::now()) {
+                if let Err(e) = fresh.save_default() {
+                    eprintln!(
+                        "warning: could not persist fleet registry last-seen-up timestamp(s): {e}"
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("warning: could not re-read the fleet registry to record last-seen-up: {e}");
         }
     }
 

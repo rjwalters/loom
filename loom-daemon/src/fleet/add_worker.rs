@@ -637,6 +637,58 @@ fn push_safehouse_steps(
     ));
 }
 
+/// Build the [`WorkerRecord`] a fully-successful bootstrap upserts into the
+/// fleet registry. Pure (every ambient input — the config, the `verify` step's
+/// outcome, and the clock — is a parameter) so the field mapping is unit
+/// testable without an SSH host; [`run`] is the only production caller.
+///
+/// `verify_ok` is `None` when the plan carried no `verify` report at all,
+/// `Some(false)` when it ran without confirming.
+fn build_worker_record(
+    config: &AddWorkerConfig,
+    verify_ok: Option<bool>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> WorkerRecord {
+    let now_str = now.to_rfc3339();
+    WorkerRecord {
+        ssh_host: config.ssh_host.clone(),
+        repos: config.repos.clone(),
+        priority: config.priority,
+        bootstrapped_at: now_str.clone(),
+        last_verify: verify_ok.map(|ok| VerifyResult {
+            ok,
+            at: now_str.clone(),
+            summary: if ok {
+                "daemon reachable, ranking fresh, workspace registered".to_string()
+            } else {
+                "verify step did not confirm".to_string()
+            },
+        }),
+        // #4342's extended roster fields (provider/instance id, tailnet
+        // name, added-by) are not yet collected by `add-worker` — left
+        // absent here rather than guessed; `fleet status` renders them as
+        // "–" until a future pass wires them (e.g. from `--tailnet-name`/
+        // `--provider-instance-id` flags or a cloud-metadata probe).
+        provider_instance_id: None,
+        tailnet_name: None,
+        added_by: None,
+        state: None,
+        drain_phase: None,
+        drain_captured: Vec::new(),
+        // Populate the new #4697 fields from this run: the operator's
+        // `--idle-shutdown-minutes` (absent => no guard installed, mirrors
+        // the `render_idle_shutdown()` gate above), and `last_seen_up_at`
+        // — a full bootstrap only reaches this branch when every step
+        // (including `verify`) succeeded over SSH, so the host was
+        // observably up moments ago; this seeds `fleet status`'s
+        // expected-power-off heuristic with a reference point from the
+        // very first poll, rather than leaving it `None` until some later
+        // `fleet status` run happens to observe the host `Up`.
+        idle_shutdown_minutes: config.idle_shutdown_minutes,
+        last_seen_up_at: Some(now_str),
+    }
+}
+
 /// Top-level orchestration for `loom-daemon fleet add-worker`.
 ///
 /// Preflight → build plan → (dry-run: print + return) → execute over ssh →
@@ -665,43 +717,7 @@ pub fn run(config: &AddWorkerConfig) -> Result<()> {
         .map(|r| matches!(r.status, StepStatus::Changed));
 
     if all_succeeded(&reports, &plan) {
-        let record = WorkerRecord {
-            ssh_host: config.ssh_host.clone(),
-            repos: config.repos.clone(),
-            priority: config.priority,
-            bootstrapped_at: chrono::Utc::now().to_rfc3339(),
-            last_verify: verify_ok.map(|ok| VerifyResult {
-                ok,
-                at: chrono::Utc::now().to_rfc3339(),
-                summary: if ok {
-                    "daemon reachable, ranking fresh, workspace registered".to_string()
-                } else {
-                    "verify step did not confirm".to_string()
-                },
-            }),
-            // #4342's extended roster fields (provider/instance id, tailnet
-            // name, added-by) are not yet collected by `add-worker` — left
-            // absent here rather than guessed; `fleet status` renders them as
-            // "–" until a future pass wires them (e.g. from `--tailnet-name`/
-            // `--provider-instance-id` flags or a cloud-metadata probe).
-            provider_instance_id: None,
-            tailnet_name: None,
-            added_by: None,
-            state: None,
-            drain_phase: None,
-            drain_captured: Vec::new(),
-            // Populate the new #4697 fields from this run: the operator's
-            // `--idle-shutdown-minutes` (absent => no guard installed, mirrors
-            // the `render_idle_shutdown()` gate above), and `last_seen_up_at`
-            // — a full bootstrap only reaches this branch when every step
-            // (including `verify`) succeeded over SSH, so the host was
-            // observably up moments ago; this seeds `fleet status`'s
-            // expected-power-off heuristic with a reference point from the
-            // very first poll, rather than leaving it `None` until some later
-            // `fleet status` run happens to observe the host `Up`.
-            idle_shutdown_minutes: config.idle_shutdown_minutes,
-            last_seen_up_at: Some(chrono::Utc::now().to_rfc3339()),
-        };
+        let record = build_worker_record(config, verify_ok, chrono::Utc::now());
         let path = default_fleet_registry_path()?;
         let mut registry = FleetRegistry::load(&path)?;
         let replaced = registry.upsert(record);
@@ -1772,6 +1788,71 @@ mod tests {
             })
             .unwrap();
         assert!(step.apply.contains("LIMIT=45"));
+    }
+
+    // ---- build_worker_record / #4697 registry fields ----------------------
+
+    #[test]
+    fn worker_record_carries_configured_idle_shutdown_window() {
+        // #4697 AC 3's prerequisite: `fleet status` can only tell an EXPECTED
+        // power-off from an outage if the window the guard was installed with
+        // is persisted on the record at bootstrap time.
+        let mut config = base_config();
+        config.idle_shutdown_minutes = Some(45);
+        let now = chrono::Utc::now();
+
+        let record = build_worker_record(&config, Some(true), now);
+        assert_eq!(record.idle_shutdown_minutes, Some(45));
+        // A successful bootstrap observed the host up over SSH moments ago, so
+        // the heuristic has a reference point from the very first poll.
+        assert_eq!(record.last_seen_up_at.as_deref(), Some(now.to_rfc3339()).as_deref());
+    }
+
+    #[test]
+    fn worker_record_leaves_idle_shutdown_absent_when_not_configured() {
+        // Mirrors `render_idle_shutdown()`'s gate: no --idle-shutdown-minutes
+        // => no guard installed => nothing for the heuristic to compare
+        // against, so the host stays UNREACHABLE (never "expected") when
+        // silent.
+        let config = base_config();
+        assert!(config.idle_shutdown_minutes.is_none());
+        let record = build_worker_record(&config, Some(true), chrono::Utc::now());
+        assert_eq!(record.idle_shutdown_minutes, None);
+    }
+
+    #[test]
+    fn worker_record_roundtrips_idle_shutdown_fields_through_the_registry() {
+        // The registry file is the only carrier between `add-worker` (write)
+        // and a LATER `fleet status` process (read), so the #4697 fields must
+        // survive a real save/load — and a record written before they existed
+        // must still load (the `#[serde(default)]` backward-compat pattern).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fleet.json");
+
+        let mut config = base_config();
+        config.idle_shutdown_minutes = Some(30);
+        let record = build_worker_record(&config, Some(true), chrono::Utc::now());
+        let expected_last_seen = record.last_seen_up_at.clone();
+
+        let mut registry = FleetRegistry::default();
+        registry.upsert(record);
+        registry.save(&path).unwrap();
+
+        let loaded = FleetRegistry::load(&path).unwrap();
+        let w = loaded.get(&config.ssh_host).unwrap();
+        assert_eq!(w.idle_shutdown_minutes, Some(30));
+        assert_eq!(w.last_seen_up_at, expected_last_seen);
+
+        // Pre-#4697 record: both fields absent from the JSON entirely.
+        std::fs::write(
+            &path,
+            r#"{ "version": 1, "workers": [ { "ssh_host": "legacy", "bootstrapped_at": "t" } ] }"#,
+        )
+        .unwrap();
+        let legacy = FleetRegistry::load(&path).unwrap();
+        let w = legacy.get("legacy").unwrap();
+        assert_eq!(w.idle_shutdown_minutes, None);
+        assert_eq!(w.last_seen_up_at, None);
     }
 
     #[test]

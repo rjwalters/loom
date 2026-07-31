@@ -753,9 +753,9 @@ idle_shutdown_notice() {
     fi
 
     if [[ -n "$minutes" ]]; then
-        warn "Heads up: this host has an idle-shutdown cron guard installed (fleet add-worker --idle-shutdown-minutes ${minutes}) — after ~${minutes} idle minute(s) it POWERS THE WHOLE HOST OFF (SSH/tailnet included), not just this daemon. This is expected/by-design (#3998/#4477), not a fault in this update. Wake path (provider console/CLI restart; Loom never calls a cloud CLI itself) and tailnet-identity/re-registration notes: defaults/docs/daemon-reference.md, 'fleet add-worker' step 9 (idle-shutdown)."
+        warn "Heads up: this host has an idle-shutdown cron guard installed (fleet add-worker --idle-shutdown-minutes ${minutes}) — after ~${minutes} idle minute(s) it POWERS THE WHOLE HOST OFF (SSH/tailnet included), not just this daemon. This is expected/by-design (#3998/#4477), not a fault in this update. Wake path (provider console/CLI restart; Loom never calls a cloud CLI itself) and tailnet-identity/re-registration notes: daemon-reference.md, 'fleet add-worker' step 9 (idle-shutdown)."
     else
-        warn "Heads up: this host has an idle-shutdown cron guard installed (crontab holds a loom-idle-shutdown entry, but the configured window could not be read from $IDLE_SHUTDOWN_GUARD_SCRIPT) — it WILL power the whole host off after some idle window. This is expected/by-design (#3998/#4477), not a fault in this update. See defaults/docs/daemon-reference.md, 'fleet add-worker' step 9 (idle-shutdown), for the wake path."
+        warn "Heads up: this host has an idle-shutdown cron guard installed (crontab holds a loom-idle-shutdown entry, but the configured window could not be read from $IDLE_SHUTDOWN_GUARD_SCRIPT) — it WILL power the whole host off after some idle window. This is expected/by-design (#3998/#4477), not a fault in this update. See daemon-reference.md, 'fleet add-worker' step 9 (idle-shutdown), for the wake path."
     fi
 }
 
