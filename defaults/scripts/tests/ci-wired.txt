@@ -7,6 +7,16 @@
 # See ci-excluded.txt for the excluded suites and their reasons.
 # check-ci-suite-manifest.sh enforces that every test-*.sh is in exactly one
 # of these two files. Blank lines and lines beginning with `#` are ignored.
+#
+# Since #4769 this manifest also covers the Claude-path guard suites under
+# tests/hooks/ (repo root, NOT defaults/scripts/tests/ — Repo Skills' guard
+# tests live there, one directory per guard family they test). Entries for
+# suites outside this directory are qualified with their path relative to the
+# repo root (e.g. `tests/hooks/test-guard-destructive.sh`); run-ci-suites.sh
+# and check-ci-suite-manifest.sh both resolve a `/`-containing entry against
+# the repo root instead of this directory. They were confirmed hermetic (no
+# live forge/network calls — the `gh`/`curl` strings in them are guard-input
+# fixtures, never executed) before being wired in here.
 
 test-archive-transcripts.sh
 test-blame-issue.sh
@@ -87,3 +97,8 @@ test-worktree-root-override.sh
 test-worktree-sentinel-reinvoke.sh
 test-worktree-sentinel.sh
 test-worktree-snapshot.sh
+
+# tests/hooks/ (repo root) — Claude-path guard suites, wired since #4769.
+tests/hooks/test-guard-destructive-dispatcher.sh
+tests/hooks/test-guard-destructive.sh
+tests/hooks/test-guard-loom-workflow.sh
