@@ -1,0 +1,22 @@
+{
+  "name": "loom-observability-backend",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Cloudflare Workers reference backend (ingest + storage) for the Loom fleet observability epic (#4702, Phase 2). Accepts pushed telemetry batches from loom-daemon's HttpsExporter, authenticates per-host, persists durable history to D1, and maintains live fleet state in a Durable Object.",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm run test"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "0.10.15",
+    "@cloudflare/workers-types": "^4.20251210.0",
+    "typescript": "^5.7.2",
+    "vitest": "^3.2.4",
+    "wrangler": "4.54.0"
+  }
+}
