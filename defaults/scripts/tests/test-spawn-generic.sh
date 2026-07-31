@@ -388,7 +388,9 @@ assert_eq "0" "$auditor_rc" \
 # --json decision surface (#4494) reports the SAME set of unmet capabilities
 # for aider's 'no' that a 'partial' manifest would produce.
 if command -v jq >/dev/null 2>&1; then
+    set +e
     json_out="$(bash "$CHECK_SCRIPT" --role builder --runtime aider --dir "$DEFAULTS_DIR" --json 2>/dev/null)"
+    set -e
     assert_eq "reject" "$(jq -r '.decision' <<<"$json_out")" \
         "--json reports decision=reject for builder+aider"
     assert_contains "worktreeIsolation" "$(jq -rc '.unmet' <<<"$json_out")" \
