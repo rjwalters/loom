@@ -214,6 +214,103 @@ pub fn resolve_model_alias_from_config(config: &serde_json::Value, model: &str) 
     }
 }
 
+// ----------------------------------------------------------------------------
+// Model-cost A/B experiment (#3725) — daemon-native arm assignment (#4809)
+// ----------------------------------------------------------------------------
+
+/// Outcome of [`resolve_autonomous_dispatch_model`] — the daemon-native
+/// replacement for the `sweep.md` "Model-cost experiment mode" prose
+/// instrumentation (issue #4809). That prose never executes in a headless
+/// `-p` child (the LLM-authored per-phase `sweep-experiment.sh record`/banner
+/// calls simply do not run), and even a perfectly-instrumented child was
+/// structurally defeated by the #4501 default-model pin's tier-1 precedence
+/// over a "forced" arm that only ever existed in prose. This resolves the
+/// experiment's arm assignment as PART of the daemon's own dispatch-model
+/// precedence chain, so a resolved `experiment` mode genuinely changes what
+/// model is dispatched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExperimentDispatchModel {
+    /// The model to dispatch the child with.
+    pub model: String,
+    /// The effective experiment mode for this dispatch, AFTER the CANARY
+    /// guardrail (`"off"` | `"observe"` | `"experiment"`).
+    pub mode: String,
+    /// The deterministic arm assigned to this issue — `Some("A" | "B")` only
+    /// when `mode == "experiment"`. `observe`/`off` dispatches do not force a
+    /// model, so they carry no arm at DISPATCH time; the outcome-recording
+    /// path (`sweep_registry::outcome_journal`) still attributes an arm to
+    /// such a record after the fact via
+    /// [`crate::script_helpers::sweep_experiment::infer_arm_from_model`].
+    pub arm: Option<&'static str>,
+    /// A short label for the dispatch log line naming why `model` won:
+    /// `"experiment"` when the arm-forced model won, otherwise the
+    /// underlying [`ModelSource`] label (`param`/`config`/`default`) —
+    /// unchanged from [`resolve_dispatch_model`] for `off`/`observe`.
+    pub source_label: &'static str,
+}
+
+/// Issue #4809: resolve the model for an autonomous, per-`issue` sweep
+/// dispatch, inserting the model-cost A/B experiment's forced arm model
+/// ahead of the #3944/#4501 default-pin precedence chain when — and ONLY
+/// when — the workspace resolves to `experiment` mode. Mode resolution reads
+/// the SAME env vars (`LOOM_MODEL_EXPERIMENT` / `LOOM_MODEL_EXPERIMENT_CANARY`)
+/// and CANARY guardrail (an uncommitted env confirmation or a gitignored
+/// `.loom/CANARY` sentinel under `repo_root` — never the committed
+/// `sweep.modelExperimentCanary` flag, rejected in #3731) that
+/// `sweep-experiment.sh resolve-mode` uses — see
+/// [`crate::script_helpers::sweep_experiment::resolve_effective_mode_default`].
+///
+/// `off` and `observe` modes are BYTE-IDENTICAL to calling
+/// [`resolve_dispatch_model`] directly (the required no-behavior-change
+/// contract for both) — only `experiment` mode substitutes the arm-forced
+/// model, and an explicit dispatch `model` param is never seen at this
+/// call's `resolve_dispatch_model(repo_root, None)` fallback (callers pass
+/// `explicit = None`, matching every existing autonomous dispatch site).
+///
+/// The arm itself is [`crate::script_helpers::sweep_experiment::assign_arm`]
+/// — a pure function of `issue` (+ an optional complexity stratum, currently
+/// always `None` here; real per-issue `<!-- loom:complexity=... -->`
+/// extraction at dispatch time is deferred — see issue #4809's PR
+/// description), so the SAME issue resolves to the SAME arm across a
+/// dispatch resume — no re-roll.
+#[must_use]
+pub fn resolve_autonomous_dispatch_model(repo_root: &Path, issue: u32) -> ExperimentDispatchModel {
+    use crate::script_helpers::sweep_experiment as se;
+
+    let config = crate::config_resolver::resolve_effective_config(repo_root);
+    let env_mode = std::env::var("LOOM_MODEL_EXPERIMENT").ok();
+    let env_canary = std::env::var("LOOM_MODEL_EXPERIMENT_CANARY").ok();
+    let sentinel_path = repo_root.join(se::CANARY_SENTINEL);
+    let (mode, warnings) = se::resolve_effective_mode_default(
+        env_mode.as_deref(),
+        env_canary.as_deref(),
+        &config,
+        Some(&sentinel_path),
+    );
+    for w in &warnings {
+        log::warn!("sweep-experiment: {w}");
+    }
+
+    if mode == "experiment" {
+        let arm = se::assign_arm(i64::from(issue), None);
+        let model = se::resolved_arm_model(arm, &config);
+        return ExperimentDispatchModel {
+            model,
+            mode,
+            arm: Some(arm),
+            source_label: "experiment",
+        };
+    }
+
+    let (model, source) = resolve_dispatch_model(repo_root, None);
+    ExperimentDispatchModel {
+        model,
+        mode,
+        arm: None,
+        source_label: source.as_str(),
+    }
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -420,6 +517,136 @@ mod tests {
                                                                                      // Higher-precedence (project) tier wins on the shared `sonnet` key.
         assert_eq!(aliases.get("sonnet").map(String::as_str), Some("project-sonnet"));
         assert_eq!(aliases.len(), 3);
+    }
+
+    // --- Issue #4809: daemon-native model-cost experiment dispatch --------- //
+
+    /// Clean slate for the experiment env vars this suite mutates — leaked
+    /// state from another test in the same process would make these false
+    /// pass/fail.
+    fn clear_experiment_env() {
+        std::env::remove_var("LOOM_MODEL_EXPERIMENT");
+        std::env::remove_var("LOOM_MODEL_EXPERIMENT_CANARY");
+    }
+
+    /// With no env/config/sentinel, mode resolves to `off` and the result is
+    /// byte-identical to calling `resolve_dispatch_model` directly — no arm,
+    /// `source_label` is the underlying `ModelSource` label.
+    #[test]
+    #[serial]
+    fn autonomous_dispatch_off_by_default_is_byte_identical() {
+        clear_experiment_env();
+        let dir = tempdir().unwrap();
+        let resolved = resolve_autonomous_dispatch_model(dir.path(), 100);
+        clear_experiment_env();
+
+        assert_eq!(resolved.mode, "off");
+        assert_eq!(resolved.arm, None);
+        assert_eq!(resolved.source_label, "default");
+        let (expected_model, expected_source) = resolve_dispatch_model(dir.path(), None);
+        assert_eq!(resolved.model, expected_model);
+        assert_eq!(resolved.source_label, expected_source.as_str());
+    }
+
+    /// `experiment` mode requested with NO canary confirmation downgrades to
+    /// `observe` (the #3731 guardrail) — no arm, model resolution unaffected.
+    #[test]
+    #[serial]
+    fn autonomous_dispatch_experiment_without_canary_downgrades_to_observe() {
+        clear_experiment_env();
+        std::env::set_var("LOOM_MODEL_EXPERIMENT", "experiment");
+        let dir = tempdir().unwrap();
+        let resolved = resolve_autonomous_dispatch_model(dir.path(), 100);
+        clear_experiment_env();
+
+        assert_eq!(resolved.mode, "observe");
+        assert_eq!(resolved.arm, None);
+        assert_eq!(resolved.model, DEFAULT_DISPATCH_MODEL, "observe must not force a model");
+    }
+
+    /// `experiment` mode + a confirmed canary forces the deterministic arm's
+    /// model, suppressing the #3944/#4501 default pin — the core #4809 fix.
+    #[test]
+    #[serial]
+    fn autonomous_dispatch_experiment_with_canary_forces_the_arm_model() {
+        clear_experiment_env();
+        std::env::set_var("LOOM_MODEL_EXPERIMENT", "experiment");
+        std::env::set_var("LOOM_MODEL_EXPERIMENT_CANARY", "1");
+        let dir = tempdir().unwrap();
+        // Issue 100, no complexity ⇒ arm A (see `assign_arm`'s parity table).
+        let resolved = resolve_autonomous_dispatch_model(dir.path(), 100);
+        clear_experiment_env();
+
+        assert_eq!(resolved.mode, "experiment");
+        assert_eq!(resolved.arm, Some("A"));
+        assert_eq!(resolved.model, "claude-opus-5", "Arm A resolves through the #3982 tier map");
+        assert_eq!(resolved.source_label, "experiment");
+
+        // Issue 101 ⇒ arm B (sonnet), still deterministic and un-pinned by
+        // the default.
+        clear_experiment_env();
+        std::env::set_var("LOOM_MODEL_EXPERIMENT", "experiment");
+        std::env::set_var("LOOM_MODEL_EXPERIMENT_CANARY", "1");
+        let resolved_b = resolve_autonomous_dispatch_model(dir.path(), 101);
+        clear_experiment_env();
+        assert_eq!(resolved_b.arm, Some("B"));
+        assert_eq!(resolved_b.model, "sonnet");
+    }
+
+    /// Deterministic assignment: repeated calls for the same issue (a
+    /// dispatch resume) land on the same arm — no re-roll.
+    #[test]
+    #[serial]
+    fn autonomous_dispatch_arm_assignment_is_deterministic_across_resumes() {
+        clear_experiment_env();
+        std::env::set_var("LOOM_MODEL_EXPERIMENT", "experiment");
+        std::env::set_var("LOOM_MODEL_EXPERIMENT_CANARY", "1");
+        let dir = tempdir().unwrap();
+        let first = resolve_autonomous_dispatch_model(dir.path(), 4242);
+        let second = resolve_autonomous_dispatch_model(dir.path(), 4242);
+        clear_experiment_env();
+        assert_eq!(first.arm, second.arm);
+        assert_eq!(first.model, second.model);
+    }
+
+    /// A committed `.loom/CANARY` (git-tracked) is refused exactly like the
+    /// underlying `sweep-experiment.sh` guardrail — this test only exercises
+    /// the untracked-sentinel confirmation path (the tracked-refusal path is
+    /// already covered directly against `evaluate_canary` in
+    /// `script_helpers::sweep_experiment`); here we confirm the SENTINEL path
+    /// (not just the env var) reaches the daemon dispatch resolver.
+    #[test]
+    #[serial]
+    fn autonomous_dispatch_confirms_canary_via_untracked_sentinel_file() {
+        clear_experiment_env();
+        std::env::set_var("LOOM_MODEL_EXPERIMENT", "experiment");
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".loom")).unwrap();
+        std::fs::write(dir.path().join(".loom").join("CANARY"), "").unwrap();
+
+        let resolved = resolve_autonomous_dispatch_model(dir.path(), 100);
+        clear_experiment_env();
+
+        assert_eq!(resolved.mode, "experiment");
+        assert_eq!(resolved.arm, Some("A"));
+    }
+
+    /// `observe` mode (explicit) never forces a model, matching #4809's "zero
+    /// behavior change" contract even with `autonomous.model` configured.
+    #[test]
+    #[serial]
+    fn autonomous_dispatch_observe_mode_honors_existing_config_precedence() {
+        clear_experiment_env();
+        std::env::set_var("LOOM_MODEL_EXPERIMENT", "observe");
+        let dir = tempdir().unwrap();
+        write_config(dir.path(), r#"{"autonomous": {"model": "opus"}}"#);
+        let resolved = resolve_autonomous_dispatch_model(dir.path(), 100);
+        clear_experiment_env();
+
+        assert_eq!(resolved.mode, "observe");
+        assert_eq!(resolved.arm, None);
+        assert_eq!(resolved.model, "claude-opus-5", "config tier still resolves through #3982");
+        assert_eq!(resolved.source_label, "config");
     }
 
     /// Ladder monotonicity: no rung of the shipped escalation ladder resolves to

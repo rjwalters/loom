@@ -649,6 +649,28 @@ Constraints that keep the exception from becoming an unbounded loop:
 
 ### Model-cost experiment mode (`sweep.modelExperiment` / `LOOM_MODEL_EXPERIMENT`, issue #3725)
 
+> **Fallback note (issue #4809).** For a **daemon-dispatched** sweep (the
+> normal `dispatch_sweep` / work-finder / epic-supervisor path), arm
+> assignment and the forced Builder model are now resolved **natively in the
+> daemon at dispatch time** (`sweep_registry::resolve_autonomous_dispatch_model`)
+> — the daemon computes the SAME deterministic arm this section describes and
+> passes the resolved model as the dispatch `--model`, so it wins the #4501
+> default-pin precedence instead of being silently overridden by it. Per-sweep
+> outcome telemetry (`sweep.outcome` records) is likewise attributed an `arm`
+> automatically from the dispatched model, with no action from this skill.
+> This is the fix for two compounding defects discovered in the 2026-07-31
+> canary rollout: (1) the deterministic per-phase instructions below are
+> **LLM-authored prose** and were observed to never execute in a headless
+> `-p` child — no banner, no `assign-arm`/`record` calls, zero rows in
+> `.loom/stats/sweep-model-stats.jsonl` across a full day of canary sweeps;
+> and (2) even when they *would* execute, the #4501 dispatch model pin is
+> tier-1 and structurally outranks a model only ever "forced" in prose. The
+> instructions below remain a **best-effort fallback** for non-daemon
+> contexts (a manual `/loom:sweep` run in an interactive session, or a
+> Task-tool in-session dispatch that never passes through `dispatch_sweep`) —
+> keep following them there — but they are no longer the primary data path
+> for a daemon-dispatched canary.
+
 This mode instruments a sweep to produce the balanced A/B evidence #3718 needs to decide the Builder `opus → sonnet` retune. **It is off by default and is byte-for-byte a no-op when unset** — every deterministic instruction below runs only when the mode resolves to `observe` or `experiment`. All the arithmetic (mode resolution, arm assignment, the durable append, the harvest) lives in `./.loom/scripts/sweep-experiment.sh` (a thin stub over `loom-daemon sweep-experiment`); this skill never computes a modulo by hand.
 
 **Tri-state resolution (read once at lifecycle entry, same point as `sweep.escalation`).** Resolve `./.loom/scripts/sweep-experiment.sh resolve-mode` → one of `off` | `observe` | `experiment`. Precedence follows the **string-valued** guard pattern (`guards.rmScope` / `guards.forceScope`), not the boolean one:

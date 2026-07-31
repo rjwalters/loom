@@ -171,6 +171,21 @@ impl SweepRegistry {
             config.insert("runtime".to_string(), runtime);
         }
         config.insert("token_account".to_string(), token_name);
+        // Issue #4809: attribute this sweep to the model-cost A/B experiment's
+        // arm from its OWN dispatched model — the same inference the #3725
+        // harvest already applies to `observe`-mode records
+        // (`sweep_experiment::infer_arm_from_model`), reused here so a
+        // `experiment`-mode dispatch (which forces exactly an opus/sonnet-family
+        // model — see `resolve_autonomous_dispatch_model`) is attributed
+        // identically without needing a separate stored "explicit arm" field.
+        // Kept in the free-form `config` map (not a new top-level schema field)
+        // so this is additive per #4703 with no schema-version bump. Per-issue
+        // complexity stratification is deferred — see the #4809 PR description.
+        if let Some(arm) =
+            crate::script_helpers::sweep_experiment::infer_arm_from_model(model.as_deref())
+        {
+            config.insert("arm".to_string(), arm.to_string());
+        }
 
         // Per-phase breakdown from the transition history this registry
         // sampled while the sweep was alive (see `sample_phase_transition`).
@@ -516,6 +531,9 @@ mod tests {
         assert_eq!(record.model.as_deref(), Some("opus"));
         assert_eq!(record.effort.as_deref(), Some("high"));
         assert_eq!(record.config.get("token_account").map(String::as_str), Some("agent-4"));
+        // Issue #4809: an opus-family model is attributed to Arm A in the
+        // free-form `config` map — additive, no schema-version bump.
+        assert_eq!(record.config.get("arm").map(String::as_str), Some("A"));
         assert!(record.total_duration_sec >= 0);
         // skip_label_flip is set in the fixture registry, so the forge-probe
         // fields fall back to their private-safe / workspace-path defaults
@@ -566,6 +584,8 @@ mod tests {
             .expect("sweep.outcome telemetry record must be journaled on a merged lifecycle");
         assert_eq!(record.result, telemetry::SweepResult::Success);
         assert_eq!(record.model.as_deref(), Some("sonnet"));
+        // Issue #4809: sonnet-family attributes to Arm B.
+        assert_eq!(record.config.get("arm").map(String::as_str), Some("B"));
         assert_eq!(
             record
                 .phase_durations
@@ -574,6 +594,27 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["builder", "judge", "merge"]
         );
+    }
+
+    /// Issue #4809: a model that is neither arm (or no model at all) carries
+    /// NO `arm` key in the outcome record's `config` map — never a fabricated
+    /// attribution.
+    #[test]
+    fn telemetry_outcome_records_no_arm_for_an_unattributable_model() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _rec) = fixture_registry(dir.path());
+
+        let sweep_id =
+            insert_dead_running_with_log(&mut registry, 4809, 0, "agent-15", "clean run\n");
+        if let Some(info) = registry.entries.get_mut(&sweep_id) {
+            info.model = Some("claude-haiku-5".to_string());
+        }
+        registry.reap_once();
+
+        let path = registry.config().resolve_outcome_telemetry_path();
+        let records = sweep_outcomes::read_all_sweep_outcomes(&path);
+        let record = records.iter().find(|r| r.issue == 4809).unwrap();
+        assert_eq!(record.config.get("arm"), None);
     }
 
     /// A checkpoint-less death whose exit status was never observed is NOT
