@@ -1198,8 +1198,13 @@ identity** instead: the failing criterion (`$CRITERION_KEY`) *plus* a determinis
 `$REASON_KEY` built mechanically from the failure data — never freeform prose — so
 near-duplicate wording for the *same* underlying failure is recognized and
 suppressed, while a genuinely different failure (a different check name, a different
-set of missing labels, …) or the same check clearing and then failing again still
-produces a fresh comment:
+set of missing labels, …) produces a fresh comment. **Known limitation:** the guard
+only compares against the single most-recently-posted marker for the criterion, so
+it cannot represent "this criterion passed at some intervening tick" (a passing tick
+posts no marker) — if the identical `$REASON_KEY` reappears after clearing and
+re-failing, it is still treated as a duplicate and the comment is suppressed. This
+is accepted: it under-notifies on a re-flapped check rather than spamming, and
+doesn't affect merge/safety decisions (#4835):
 
 - **ci-status**: the sorted, comma-joined list of currently failing/cancelled check
   names (`echo "$FAILING_CHECKS" | sort | paste -sd, -`) — not the prose sentence
@@ -1227,9 +1232,13 @@ REASON="<SPECIFIC_REASON>"  # human-readable prose for the comment body — free
 # Idempotency guard: find the most recently posted rejection comment for this
 # criterion (any REASON_KEY) and compare its marker line, verbatim, against the
 # marker for the CURRENT failure. Skip re-commenting only when the identity is
-# unchanged — a different REASON_KEY (a different failing check, a different missing
-# label, …), or the same key reappearing after the criterion cleared and failed
-# again, always gets a fresh comment.
+# unchanged. A different REASON_KEY (a different failing check, a different missing
+# label, …) always gets a fresh comment. Known limitation: because this only looks
+# at the single most-recently-posted marker, a REASON_KEY that reappears after the
+# criterion cleared (passed) and then failed again with the same identity is
+# indistinguishable from "never cleared" and is still suppressed as a duplicate
+# (#4835) — acceptable since it under-notifies rather than spams and doesn't affect
+# merge/safety decisions.
 LAST_MARKER=$(gh pr view "$PR_NUMBER" --json comments --jq '.comments' \
   | jq -r --arg prefix "<!-- champion:reject:$CRITERION_KEY:" \
   '[.[] | select(.body | startswith($prefix))] | last | .body // "" | split("\n")[0]')
