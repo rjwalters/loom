@@ -49,6 +49,7 @@ if [[ -x "$_ghc" ]] && "$_ghc" --version >/dev/null 2>&1; then GH_READ="$_ghc"; 
 |---|---|
 | Verdict-State Janitor's label read | Decides whether the PR is eligible to merge at all |
 | All 6 safety criteria (labels, `mergeable`, `updatedAt`, `gh pr checks`) | **Merge gating** — the last reads before an irreversible merge; a cached green can predate the push that broke the build |
+| Criterion #2's **sticky-hold precheck** (`--json comments,commits,labels,headRefOid`) | **Merge gating** — it decides whether a prior hold still binds; a cached read could miss the very override comment / push that releases it, or (worse) miss the hold itself and let a green re-read merge over it (#4742) |
 | Criterion #3's paginated changed-file list (`gh api …/files --paginate`) | #4613 requires this loop to run fresh against the full list in *this* pass — a cached answer is exactly the "asserted from a stale read" failure that incident was |
 | Step 2's pre-merge comment data gathering | Every bullet is a claim about a criterion's result in this pass; restating from a cached read reintroduces #4613 |
 
@@ -170,8 +171,11 @@ echo "PASS: Label check"
 ### 2. Merge-Risk Judgment (no line-count ceiling)
 
 - [ ] The PR is green on **all four risk axes** below — or carries `loom:auto-merge-ok` (an explicit human/Judge override)
+- [ ] **No prior merge-risk hold is still in force** — if an earlier tick held this PR, a durable release signal exists (see "Sticky holds" below). A fresh green re-read of the same diff is **not** a release signal.
 
 **This criterion is a judgment call you make by reading the PR, not an arithmetic check.** You already have the diff, the PR body, and the Judge's review in front of you; use them. **Line count is not a criterion** — there is no numeric ceiling any more (the `champion.auto_merge_max_lines` knob is retired; see the migration note below), and a hold must never be justified by a line count.
+
+**Run the sticky-hold precheck FIRST** (below) — it decides what a green re-read of this PR is even allowed to do. Then gather the evidence and judge the axes.
 
 **Evidence to gather first** (you cannot judge what you have not read):
 
@@ -203,29 +207,233 @@ gh pr view "$PR_NUMBER" --json comments --jq '.comments[] | select(.body | test(
 | **Revertability** | `git revert <squash-sha>` fully undoes the change: no data/schema migration, no published artifact, no state written outside the repo. | The change performs a one-way action when it runs (deletes branches/worktrees, rewrites installed files, publishes a release, migrates data, moves credentials), so reverting the commit does not undo the effect. |
 
 **Decision rule**:
-- All four axes green -> **PASS**, continue to criterion #3.
+- All four axes green **and** no prior hold is still in force -> **PASS**, continue to criterion #3.
+- All four axes green **but** the sticky-hold precheck found a hold still in force -> **HOLD** (skip silently; the axes do not get a vote here — see "Sticky holds" below).
 - Any axis red -> **HOLD** (see hold behavior below).
 - **Unsure on any axis -> HOLD.** Conservative bias: a held PR costs one human merge; a bad auto-merge costs a revert on `main`.
+- Merging a PR that ever carried a hold marker -> **PASS + mandatory reversal comment** (Step 2 must state what changed; see "Sticky holds").
 
 **Size is not a proxy for any axis.** An 886-line PR that is 700 lines of new tests plus one self-contained module is green on all four; a 12-line change to `merge-pr.sh`'s ordering guard is red on blast radius *and* revertability. Never hold a PR because it is large, and never merge a PR because it is small.
+
+#### Sticky holds — a hold does NOT clear on a re-read alone (#4742)
+
+Axis scoring is a judgment call, so it is **not deterministic across ticks**: the
+same diff read by a later Champion pass can score green where an earlier pass
+scored red. Before this rule existed, that alone was enough to merge — the hold
+carried no state, so the later pass never knew a hold existed, and the
+idempotency guard (which correctly suppresses *repeat hold* comments) meant the
+reversal produced no comment either. On PR #4700 (2026-07-31) a documented hold
+on two red axes was followed ~7h later by a merge with **no** `loom:auto-merge-ok`
+label and **no** comment of any kind: the last comment on the PR is still the
+hold notice. A hold that can silently evaporate is not a hold.
+
+**The rule**: once `<!-- champion:merge-risk-hold -->` is on a PR, that hold
+**binds every later tick** until a *durable, externally-observable* release
+signal exists. Your own re-read of the same diff is never such a signal.
+
+**Run this precheck before judging the axes** (it also computes the reversal
+block Step 2 is required to post):
+
+```bash
+PR_NUMBER=<number>
+HOLD_MARKER="<!-- champion:merge-risk-hold -->"
+
+# Plain `gh` — NOT "$GH_READ". This read gates the merge (see "Cached forge
+# reads"): a cached answer can miss both the hold and the push/comment that
+# releases it. One call serves the whole precheck.
+PR_JSON=$(gh pr view "$PR_NUMBER" --json comments,commits,labels,headRefOid)
+
+HOLD_BODY=$(jq -r --arg m "$HOLD_MARKER" \
+  '[.comments[] | select(.body | contains($m))] | last | .body // ""' <<<"$PR_JSON")
+
+if [ -z "$HOLD_BODY" ]; then
+  PRIOR_HOLD=false          # never held — today's behavior, unchanged
+  HOLD_AT=""; HOLD_HEAD=""; RELEASE_REASON=""; HOLD_OVERRIDE=false
+else
+  PRIOR_HOLD=true
+  HOLD_OVERRIDE=false
+  HOLD_AT=$(jq -r --arg m "$HOLD_MARKER" \
+    '[.comments[] | select(.body | contains($m))] | last | .createdAt' <<<"$PR_JSON")
+  # Persisted state written by the hold template below:
+  #   <!-- champion:hold-state head=<sha> -->
+  # Empty for legacy holds posted before that line existed — the timestamp
+  # tests below still work, only the force-push test degrades.
+  HOLD_HEAD=$(printf '%s' "$HOLD_BODY" \
+    | sed -n 's/.*champion:hold-state head=\([0-9a-f]*\).*/\1/p' | head -1)
+  RELEASE_REASON=""
+
+  # (a) Durable label override — an explicit human/Judge statement. Unchanged
+  #     semantics: it overrides criterion #2 outright (axes are not re-scored).
+  if jq -e '[.labels[].name] | any(. == "loom:auto-merge-ok")' >/dev/null <<<"$PR_JSON"; then
+    RELEASE_REASON="override: \`loom:auto-merge-ok\` applied"
+    HOLD_OVERRIDE=true
+  fi
+
+  # (b) An operator comment posted AFTER the hold that explicitly clears it.
+  #     **Instruction-shaped phrasing, mechanically enforced**: the trigger
+  #     phrase must OPEN the comment's leading clause (its first sentence), and
+  #     that clause must not be a question. A plain substring match is not good
+  #     enough — it reads "please do NOT merge anyway", "do not clear the hold
+  #     yet" and "is it ok to merge?" as release signals, i.e. it releases the
+  #     hold on the very comments where a human just reinforced it. Anchoring is
+  #     what rules those out: any negation or interrogative lead-in ("do not",
+  #     "don't", "never", "can we", "should I") necessarily sits *before* the
+  #     phrase, so the phrase is no longer the leading clause. Never a
+  #     Champion-authored comment either — Champion must not release its own hold.
+  if [ -z "$RELEASE_REASON" ]; then
+    CLEARED=$(jq -r --arg at "$HOLD_AT" '
+      [ .comments[]
+        | select(.createdAt > $at)
+        | select((.body | test("champion:|Automated by Champion role")) | not)
+        | . as $c
+        # Leading clause = first sentence of the first line (up to the first
+        # . ? or !), minus an optional "@mention " / "please " courtesy prefix.
+        | ( $c.body
+            | sub("^[[:space:]]+"; "")
+            | split("\n")[0]
+            | match("^[^.?!]*[.?!]?").string
+            | sub("^@[A-Za-z0-9_-]+[[:space:]]+"; "")
+            | sub("^please[[:space:]]*,?[[:space:]]*"; ""; "i") ) as $lead
+        # Interrogative mood is a question, not an instruction.
+        | select($lead | test("\\?[[:space:]]*$") | not)
+        # Trigger phrase anchored at the start of that clause.
+        | select($lead | test("^(clear|clearing|cleared|lift|lifting|lifted|override|overriding)([[:space:]]+(this[[:space:]]+|the[[:space:]]+)?hold\\b|[[:space:]]*[:,.—-]|[[:space:]]*$)|^merge[[:space:]]+(it[[:space:]]+)?anyway\\b|^ok[[:space:]]+to[[:space:]]+merge\\b|^proceed[[:space:]]+with[[:space:]]+(the[[:space:]]+)?merge\\b"; "i"))
+        | $c
+      ] | last
+      | if . == null then "" else "\(.author.login) at \(.createdAt): \(.body | split("\n")[0])" end' <<<"$PR_JSON")
+    if [ -n "$CLEARED" ]; then
+      RELEASE_REASON="operator comment cleared the hold — $CLEARED"
+    fi
+  fi
+
+  # (c) Changed circumstances: the diff itself moved since the hold. The head
+  #     SHA comparison is the primary test — it catches a force-push/rebase
+  #     that leaves commit dates untouched. `committedDate` is the fallback for
+  #     legacy holds with no recorded head.
+  if [ -z "$RELEASE_REASON" ]; then
+    HEAD_SHA=$(jq -r '.headRefOid' <<<"$PR_JSON")
+    NEW_COMMITS=$(jq -r --arg at "$HOLD_AT" \
+      '[.commits[] | select(.committedDate > $at)] | length' <<<"$PR_JSON")
+    if [ -n "$HOLD_HEAD" ] && [ "$HEAD_SHA" != "$HOLD_HEAD" ]; then
+      RELEASE_REASON="new head commit ${HEAD_SHA:0:7} (hold was written against ${HOLD_HEAD:0:7})"
+    elif [ -z "$HOLD_HEAD" ] && [ "$NEW_COMMITS" -gt 0 ]; then
+      RELEASE_REASON="$NEW_COMMITS commit(s) pushed after the hold at $HOLD_AT"
+    fi
+  fi
+
+  # (d) Changed circumstances: a NEW Judge review landed after the hold (the
+  #     "deeper re-review" path). Match Judge's verdict format, not a bare
+  #     mention of the word — and Champion's own comments never qualify.
+  if [ -z "$RELEASE_REASON" ]; then
+    NEW_REVIEW=$(jq -r --arg at "$HOLD_AT" '
+      [ .comments[]
+        | select(.createdAt > $at)
+        | select((.body | test("champion:|Automated by Champion role")) | not)
+        | select(.body | test("^[[:space:]]*(✅|❌)|\\*\\*(Approved|Changes Requested)"; "i"))
+      ] | last
+      | if . == null then "" else "\(.author.login) at \(.createdAt)" end' <<<"$PR_JSON")
+    if [ -n "$NEW_REVIEW" ]; then
+      RELEASE_REASON="new Judge review after the hold — $NEW_REVIEW"
+    fi
+  fi
+fi
+
+if [ "$PRIOR_HOLD" = true ] && [ -z "$RELEASE_REASON" ]; then
+  echo "STICKY HOLD: #$PR_NUMBER was held at $HOLD_AT and nothing has changed since — not merging"
+  # Post NOTHING (the hold notice is already on the PR — see Hold behavior's
+  # idempotency guard) and skip this PR for this pass, whatever the axes say.
+fi
+```
+
+**Outcomes** — exactly four, and nothing else:
+
+| Precheck result | What criterion #2 does |
+|---|---|
+| `PRIOR_HOLD=false` | Judge the four axes normally. No behavior change from before #4742. |
+| `PRIOR_HOLD=true`, no `RELEASE_REASON` | **HOLD, silently.** Skip the PR for this pass regardless of how the axes read this tick. No comment (anti-spam guard already covers it). |
+| `PRIOR_HOLD=true`, released by `loom:auto-merge-ok` (`HOLD_OVERRIDE=true`) | Criterion #2 **PASS** by override — the axes are not re-scored. Continue to #3. Step 2's reversal block is **mandatory**. |
+| `PRIOR_HOLD=true`, released by (b), (c), or (d) | Re-judge the four axes normally. Still red -> hold persists, skip silently. Now green -> **PASS**, continue to #3, and Step 2's reversal block is **mandatory**. |
+
+**Once released, stays released.** A release signal is consumed by the change
+itself, not by a counter: after a new commit lands, later ticks keep seeing
+`HEAD_SHA != HOLD_HEAD` and are free to re-judge. That is correct — the hold was
+written against a diff that no longer exists. What can never happen is a merge of
+the *same* diff on a *different* read.
+
+**Champion cannot release its own hold.** Every release test excludes comments
+containing `champion:` or `*Automated by Champion role*`. A hold is released by a
+human/Judge signal or by the code moving — never by Champion talking to itself.
+That exclusion is also what keeps Champion's own rejection/janitor comments from
+tripping release path (b) or (d).
+
+**Edge cases the precheck already covers** (no extra handling needed):
+
+- **Several hold comments from different ticks** — only the *latest* one matters
+  (`| last`); the count is irrelevant, and the marker's presence is what binds.
+- **Force-push that leaves commit dates untouched** — caught by the head-SHA
+  comparison, which is why the hold records `champion:hold-state head=<sha>`.
+  Legacy holds without that line fall back to `committedDate`, so a same-date
+  force-push keeps them held (fail-safe, the conservative direction).
+- **PR closed and reopened** — comments survive, so the hold survives with them.
+  A reopened PR is re-held until a real release signal appears.
+- **A comment that *reinforces* or merely *asks about* the hold** — `Please do NOT
+  merge anyway until QA signs off`, `Do not clear the hold yet`, `Is it ok to
+  merge?` — is **not** a release signal. Path (b) matches the trigger phrase only
+  as the leading clause of a non-interrogative first sentence, so a negation or a
+  question lead-in (which must precede the phrase) fails the anchor. The
+  conservative direction is preserved: an unrecognized phrasing leaves the hold in
+  force, which costs one human merge; a false release costs a bad auto-merge.
+
+**Reversal is one mandatory comment, and the idempotency guard must not eat it.**
+Whenever `PRIOR_HOLD=true` and this PR proceeds to merge, Step 2's pre-merge
+comment MUST carry the reversal block (`<!-- champion:merge-risk-hold-cleared -->`).
+That guard governs **repeat hold notices only**; a hold-to-merge transition is a
+distinct, once-per-PR event that must always produce exactly one new comment —
+never zero. Build the block here so Step 2 can inject it verbatim:
+
+```bash
+# Carried into Step 2. Empty string on the never-held path, so the normal
+# pre-merge comment is byte-for-byte what it was before #4742.
+if [ "$PRIOR_HOLD" = true ]; then
+  HOLD_REVERSAL_BLOCK="<!-- champion:merge-risk-hold-cleared -->
+**Reversing a prior merge-risk hold** (held $HOLD_AT):
+
+- **What released it**: $RELEASE_REASON
+- **Axis that flipped**: <NAME_THE_PREVIOUSLY_RED_AXIS and the concrete, falsifiable reason it is now green — same bar as the hold comment itself. Write 'n/a — loom:auto-merge-ok override honored, axes not re-scored' ONLY when the release was the label.>
+- **Original hold concern**: <QUOTE_THE_AXIS_AND_CONCERN_FROM_THE_HOLD_COMMENT>
+"
+else
+  HOLD_REVERSAL_BLOCK=""
+fi
+```
+
+"Seems fine now", "re-evaluated, looks OK", or any restatement that would read
+the same against the original diff is **not** an acceptable flip rationale — if
+you cannot name what changed, the precheck should not have released the hold.
 
 **Hold behavior** — name the **specific** concern, keep `loom:pr`, retry next tick:
 
 ```bash
 PR_NUMBER=<number>
 HOLD_MARKER="<!-- champion:merge-risk-hold -->"
+# Head SHA at hold time, recorded in the comment so a later tick can tell
+# "the diff moved" from "someone re-read the same diff" (#4742). Reuses the
+# sticky-hold precheck's single live read.
+HEAD_SHA=$(jq -r '.headRefOid' <<<"$PR_JSON")
 
 # Idempotency guard (same pattern as the stale-PR and verdict-janitor notices):
 # a judgment hold does not clear on its own, so comment ONCE per hold episode
-# instead of re-posting every 10-minute cron tick. The label stays, so the PR is
-# silently re-evaluated each tick and merges as soon as the concern is resolved
-# (a follow-up push that narrows the blast radius, a deeper Judge re-review, or
-# `loom:auto-merge-ok` applied by a human).
+# instead of re-posting every 10-minute cron tick. The label stays, so the PR
+# keeps its place in the queue — but the hold now BINDS later ticks (see
+# "Sticky holds" above): it is released by `loom:auto-merge-ok`, an explicit
+# operator clearing comment, a new push, or a new Judge review — never by a
+# fresh re-read of the same diff.
 # Cached ("$GH_READ") — idempotency-marker grep; see "Cached forge reads".
 if "$GH_READ" pr view "$PR_NUMBER" --json comments --jq '.comments[].body' | grep -qF "$HOLD_MARKER"; then
-  echo "Merge-risk hold already posted for #$PR_NUMBER — re-evaluating silently"
+  echo "Merge-risk hold already posted for #$PR_NUMBER — hold stands, no comment"
 else
   gh pr comment "$PR_NUMBER" --body "$HOLD_MARKER
+<!-- champion:hold-state head=$HEAD_SHA -->
 **Champion: Holding for Human Merge**
 
 This PR is Judge-approved and passes the mechanical safety criteria, but I am not
@@ -233,11 +441,15 @@ merging it automatically:
 
 - **<AXIS>**: <SPECIFIC_CONCERN — name the file/function and what could break>
 
-**Next steps:**
-- A human can merge this directly with \`./.loom/scripts/merge-pr.sh $PR_NUMBER\`
-- Or apply \`loom:auto-merge-ok\` to override this hold; Champion will merge on the next tick
+**Next steps** — this hold stays in force until one of these happens; Champion re-reading the same diff will **not** clear it:
+- A human merges it directly with \`./.loom/scripts/merge-pr.sh $PR_NUMBER\`
+- Or applies \`loom:auto-merge-ok\` to override the hold; Champion merges on the next tick
+- Or comments here to clear it explicitly — **start the comment with the instruction**: \`clear the hold — <why>\`, \`cleared: <why>\`, \`override: <why>\`, \`merge anyway, <why>\`, \`ok to merge — <why>\`. Phrasing that only mentions those words later in a sentence, negates them (\`do not merge anyway\`), or asks about them (\`is it ok to merge?\`) deliberately does **not** release the hold, and neither does a bare 'looks fine'
+- Or the situation actually changes: a new push that narrows the concern, or a deeper Judge re-review
 
-Keeping \`loom:pr\`. This PR stays in the queue and will be re-evaluated each tick.
+Whichever path releases it, Champion will post a comment naming what changed before it merges.
+
+Keeping \`loom:pr\`. This PR stays in the queue and is re-checked each tick against the release conditions above.
 
 ---
 *Automated by Champion role*"
@@ -255,6 +467,11 @@ if [ "$HAS_AUTO_MERGE_OK" = "true" ]; then
   echo "PASS: Merge-risk hold overridden by loom:auto-merge-ok label"
 fi
 ```
+
+It is also release path (a) in the sticky-hold precheck — the one signal that
+releases a *previously posted* hold without re-scoring the axes. When it does,
+Step 2's reversal block is still mandatory: the comment must cite the label as
+the honored override, so the merge is not silent (#4742).
 
 **Rationale**: A raw line count is a poor risk proxy. Every substantive change-plus-tests PR exceeds any tolerable numeric threshold, so a ceiling holds *all* real work while letting through small changes to exactly the high-blast-radius files that most need human eyes (on 2026-07-30 the 200-line ceiling stalled four consecutive Judge-approved, CI-green PRs: #4551, #4558, #4560, #4562). Champion is an LLM agent that has already read the diff and the Judge's review — it can assess actual risk directly. The four axes keep that judgment concrete and checkable rather than a vague "use your best judgment".
 
@@ -451,6 +668,23 @@ For each candidate PR, check ALL 6 criteria in order. If any criterion fails, sk
 
 Before merging, add a comment documenting why the PR is safe to auto-merge.
 
+**This comment is the merge's provenance record, and posting it is a
+precondition of Step 3 — not a courtesy.** Every fleet agent acts under the
+operator's forge identity, so `mergedBy` cannot tell a Champion merge from a
+human one, and `merge-pr.sh` is shared, identity-agnostic infrastructure that
+posts nothing naming an actor. The one durable signal is this comment. Therefore:
+
+- **Never call `merge-pr.sh` in a pass where this comment did not post
+  successfully.** If `gh pr comment` fails, skip the PR and retry next tick — an
+  un-narrated merge is worse than a late one.
+- **A merged PR with no `*Automated by Champion role*` pre-merge comment was not
+  merged by Champion.** That inference is only sound if this step is
+  unconditional, which is why it has no skip path.
+- **If the PR ever carried a merge-risk hold** (`PRIOR_HOLD=true` from criterion
+  #2's sticky-hold precheck), this comment must additionally carry the
+  `HOLD_REVERSAL_BLOCK` built there. That block is never suppressed by the
+  hold-notice idempotency guard — see "Sticky holds" (#4742).
+
 **Every bullet below is a claim about a specific criterion's result, not
 boilerplate praise — only write it if that criterion's check-loop actually ran
 in Step 1 of *this* pass and produced that result.** In particular, "No
@@ -489,7 +723,10 @@ else
   CI_STATUS="All CI checks passing"
 fi
 
-# Generate comment with actual data
+# Generate comment with actual data. $HOLD_REVERSAL_BLOCK comes from criterion
+# #2's sticky-hold precheck: empty string on the never-held path (so this
+# comment is exactly what it always was), mandatory content when this merge
+# reverses a prior hold (#4742).
 gh pr comment "$PR_NUMBER" --body "$(cat <<EOF
 **Champion Auto-Merge**
 
@@ -503,18 +740,31 @@ This PR meets all safety criteria for automatic merging:
 - Updated recently ($HOURS_AGO hours ago)
 - $CI_STATUS
 
+$HOLD_REVERSAL_BLOCK
 **Proceeding with squash merge...** If this was merged in error, you can revert with:
 \`git revert <commit-sha>\`
 
 ---
 *Automated by Champion role*
 EOF
-)"
+)" || {
+  # Provenance is a precondition, not a courtesy: no comment, no merge.
+  # In a batch loop: `continue`. In a single-PR invocation: exit without merging.
+  echo "Pre-merge comment failed for #$PR_NUMBER — NOT merging this pass"
+  exit 1
+}
+"$GH_READ" --clear-cache   # your own write must not be masked by your own cache
 ```
 
 ### Step 3: Merge the PR
 
 Execute the squash merge with comprehensive error handling.
+
+**Ordering invariant**: Step 2's comment is already on the PR before this runs.
+`merge-pr.sh` records no actor and posts no Champion-identifying comment, so a
+merge performed here without Step 2 having succeeded is indistinguishable after
+the fact from a human running the same script by hand — which is exactly how the
+#4742 incident's hold reversal became unattributable.
 
 ```bash
 PR_NUMBER=$1
@@ -905,7 +1155,7 @@ fi
 
 If ANY safety criterion fails, do NOT merge. How the failure is handled depends on whether it is **transient** (clears on its own or on the next push — pending CI, conflicts being resolved, `UNKNOWN` mergeability), **terminal** (the PR has gone stale and cannot clear without a rebase), or a **merge-risk hold** (criterion #2 judged the PR to need a human merge).
 
-**Merge-risk holds** keep `loom:pr` like a transient failure, but comment **once** behind the `<!-- champion:merge-risk-hold -->` idempotency marker because the condition does not clear on its own. The exact commands live with the criterion itself — see "Safety Criteria → 2. Merge-Risk Judgment → Hold behavior"; do not duplicate them here.
+**Merge-risk holds** keep `loom:pr` like a transient failure, but comment **once** behind the `<!-- champion:merge-risk-hold -->` idempotency marker because the condition does not clear on its own. Unlike a transient failure, the hold is **sticky**: later ticks re-check it against the release conditions (`loom:auto-merge-ok`, an explicit operator clearing comment, a new push, a new Judge review) rather than re-deriving it from a fresh axis read, and any merge that reverses one carries a mandatory reversal comment (#4742). The exact commands live with the criterion itself — see "Safety Criteria → 2. Merge-Risk Judgment → Sticky holds / Hold behavior"; do not duplicate them here.
 
 ### Transient failures — keep `loom:pr`, retry next tick
 

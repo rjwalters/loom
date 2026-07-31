@@ -244,6 +244,34 @@ fi
 
 ---
 
+### Edge Case 11b: Prior Merge-Risk Hold, Later Tick Scores the Same Diff Green
+
+**Scenario**: An earlier Champion tick posted `<!-- champion:merge-risk-hold -->` on a red axis. A later tick re-reads the *same* diff and — axis scoring being a judgment call, not an arithmetic one — scores it green. Nothing external changed: no `loom:auto-merge-ok`, no new push, no new review. (Observed live on PR #4700, 2026-07-31: hold at 04:16Z, merge at 11:21Z, no override label, and no comment of any kind accompanying the merge — the last comment on the PR is still the hold notice. #4742.)
+
+**Handling**: The merge-risk hold is **sticky**. Before scoring the axes, criterion #2 runs a precheck that looks for an existing hold marker and, if found, requires a durable release signal:
+
+```bash
+# Plain `gh` — merge-gating, so never "$GH_READ".
+PR_JSON=$(gh pr view "$PR_NUMBER" --json comments,commits,labels,headRefOid)
+HOLD_BODY=$(jq -r --arg m "<!-- champion:merge-risk-hold -->" \
+  '[.comments[] | select(.body | contains($m))] | last | .body // ""' <<<"$PR_JSON")
+# Released only by: loom:auto-merge-ok | an explicit operator clearing comment
+# posted after the hold (the instruction must OPEN the comment's leading clause
+# and not be a question — "do not merge anyway" / "is it ok to merge?" do NOT
+# release) | a new head SHA (recorded as `champion:hold-state head=<sha>` in the
+# hold comment) | a new Judge review after the hold.
+```
+
+**Decision**: **Hold stands** — skip the PR for this pass whatever the axes say this tick. A green re-read of an unchanged diff is not a release signal, and Champion's own comments never count as one.
+
+**On release, one mandatory comment**: when a release signal *does* exist and the PR merges, the pre-merge comment must carry a `<!-- champion:merge-risk-hold-cleared -->` block naming what released the hold (which override was honored, or which axis flipped and why, citing the new commit/review). The `<!-- champion:merge-risk-hold -->` idempotency guard governs **repeat hold notices only** — it must never suppress a hold-to-merge transition, which is a distinct event that always produces exactly one new comment.
+
+**Rationale**: A hold that a later subjective re-read can silently evaporate is not a hold. Because every fleet agent acts under the operator's forge identity, `mergedBy` cannot distinguish a human override from a Champion tick that scored the axes differently — so the comment is the *only* audit trail, and the anti-spam guard that (correctly) suppresses repeat holds was suppressing precisely the comment that would have explained the reversal.
+
+**Action** (single authoritative policy — implemented in `champion-pr-merge.md` → "Safety Criteria → 2. Merge-Risk Judgment → Sticky holds"): see that section for the precheck, the four outcomes, and the reversal-comment template.
+
+---
+
 ### Edge Case 12: GitHub API Rate Limiting
 
 **Scenario**: Champion makes too many API calls and hits rate limit.
@@ -338,7 +366,9 @@ gh issue create --title "Follow-on: Work identified in PR #$PR_NUMBER" --label "
 | Unknown critical file | Miss | Needs pattern update |
 | Large but low-risk PR (e.g. mostly tests) | Allow | Judged on the 4 risk axes, not line count |
 | Small but high-blast-radius PR | Hold for human | Comment names the specific concern, keep `loom:pr`, retry next tick |
-| `loom:auto-merge-ok` present | Allow | Explicit human/Judge override of a merge-risk hold (does not waive critical files) |
+| Prior merge-risk hold, later tick scores the same diff green | **Hold stands (sticky)** | Skip silently, post nothing (anti-spam guard already covers it). Release only on `loom:auto-merge-ok`, an explicit operator clearing comment after the hold (leading-clause instruction, not a negation or a question), a new head SHA, or a new Judge review |
+| Prior merge-risk hold released, PR merges | Allow + **mandatory reversal comment** | Pre-merge comment carries `<!-- champion:merge-risk-hold-cleared -->` naming the override honored or the axis that flipped and why; never suppressed by the hold idempotency guard |
+| `loom:auto-merge-ok` present | Allow | Explicit human/Judge override of a merge-risk hold (does not waive critical files); a *previously posted* hold still requires the reversal comment |
 | API rate limit | Error | Comment and continue |
 | Multiple approvals | Allow | Label is source of truth |
 | Follow-on indicators found | Create | If thresholds met |
