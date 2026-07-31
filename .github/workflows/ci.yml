@@ -81,6 +81,8 @@ jobs:
           node-version: "20"
       - name: Build unified MCP server
         run: cd mcp-loom && npm install && npm run build
+      - name: Run MCP server test suite
+        run: cd mcp-loom && npm test
       - name: Verify build output
         run: test -f mcp-loom/dist/index.js
 
