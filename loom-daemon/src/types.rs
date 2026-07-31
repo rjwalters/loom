@@ -1214,6 +1214,25 @@ pub struct DaemonStatusReport {
     /// computed one. `#[serde(default)]` keeps that wire data compatible.
     #[serde(default)]
     pub safehouse: Option<SafehouseStatus>,
+    /// Whether the autonomous work-finder loop is enabled for THIS running
+    /// daemon process (Issue #4693), via
+    /// [`crate::work_finder::resolve_enabled`] read from the daemon's own
+    /// environment/config at query time — the exact same precedence (env >
+    /// config > default) `loom-daemon-start.sh` used to bake `LOOM_WORK_FINDER`
+    /// into the plist/unit this process was launched from, so this field always
+    /// reflects the truth of the process actually answering, never a
+    /// re-derivation from the CLI client's own cwd. Mirrors
+    /// [`Self::main_health_gate_enabled`]'s shape and forward-compat contract:
+    /// `Some(true)` / `Some(false)` are resolved daemon-side; `None` only for a
+    /// pre-#4693 wire payload from an older daemon binary that never computed
+    /// one (never misread as `false`). Consumed by the `status` CLI to flag the
+    /// marker-vs-non-autonomous-daemon mismatch (AC3 of #4693): the
+    /// autonomy-desired marker (#4011) present while this reads `Some(false)`
+    /// means dispatch is silently not happening on an otherwise-healthy,
+    /// reachable daemon. `#[serde(default)]` keeps pre-#4693 wire data
+    /// compatible.
+    #[serde(default)]
+    pub work_finder_enabled: Option<bool>,
 }
 
 /// Live safehouse connection status for `loom-daemon status` (Issue #4345).

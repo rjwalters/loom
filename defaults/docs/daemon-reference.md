@@ -3914,6 +3914,33 @@ fault). When no loom dir resolves at all the `Protection:` line is omitted and
 and its exit codes are unchanged. `fleet status`'s local-host row carries the
 same `protection` field, since it shares the `status --json` payload builder.
 
+**Marker-vs-non-autonomous-daemon mismatch (#4693).** `ProtectionState` above
+answers "would we notice a future DEATH?" — but a daemon can be perfectly
+`protected` by that definition (marker present, watchdog provisioned) while
+having **silently stopped dispatching**, because a plain `loom-daemon-start.sh`
+re-render is FLAGS-OFF by default (#3911) even on a host that was previously
+autonomous. This was the exact 2026-07-30 incident: `status` reported a
+healthy, protected daemon while 23 ready issues sat queued for ~3h. The `--json`
+`protection` object therefore also carries `autonomy_mismatch: bool` — `true`
+only when the marker is present **and** this reachable daemon's own
+`work_finder` (a sibling top-level object, `{"enabled": bool|null}`, resolved
+daemon-side from `work_finder::resolve_enabled` — the daemon's own env/config,
+never the CLI client's) reads `false`. `null`/absent `work_finder.enabled`
+(a pre-#4693 daemon binary) degrades to `autonomy_mismatch: false` — never a
+false positive. The human `Protection:` block prints a loud `WARNING:` with the
+`--work-finder` / `--from-config` remediation when it fires.
+
+`loom-daemon-start.sh` closes the writing side of the same gap: before
+re-rendering the plist/unit, it compares the new render's `LOOM_WORK_FINDER` /
+`LOOM_MAIN_HEALTH_GATE` against the **prior installed** plist/unit's value (or,
+absent a readable prior value, the autonomy-desired marker alone) and prints a
+loud, non-blocking `WARNING: autonomy downgrade — <key>: 1 -> 0` when a plain
+(no-flags, non-`--from-config`) start would downgrade a previously-autonomous
+host — naming the `--from-config` / `--work-finder` remediation. This never
+reverses the FLAGS-OFF-by-default policy for a start with no prior-autonomy
+signal at all (#3911) — it only closes the *silent* part of an actual
+autonomous → FLAGS-OFF transition.
+
 ### macOS session-bootstrap hazard (#3972)
 
 **Incident (2026-07-26).** The daemon was started at 21:48 via

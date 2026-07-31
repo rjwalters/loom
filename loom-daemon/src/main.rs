@@ -5064,6 +5064,15 @@ fn build_status_json_value(
             "deferred_reason": report.main_health_gate_deferred_reason,
             "verdict_tier": report.main_health_gate_verdict_tier,
         },
+        // Whether the autonomous work-finder loop is enabled for THIS running
+        // daemon process (#4693), resolved daemon-side (env > config > default,
+        // the same precedence `loom-daemon-start.sh` bakes into the plist/unit).
+        // `null` only from a pre-#4693 daemon binary that never computed one —
+        // never misread as `false`. See `protection.autonomy_mismatch` below
+        // for the marker-vs-non-autonomous-daemon cross-check this feeds.
+        "work_finder": {
+            "enabled": report.work_finder_enabled,
+        },
         // Startup forge-credential preflight (#4005) — resolved once at
         // daemon boot, before the daemon's first `gh` consumer. Never
         // contains a token value; `null` only from a pre-#4005 daemon binary
@@ -5191,6 +5200,14 @@ fn build_status_json_value(
             // launchctl/systemctl, or an unreachable `systemctl --user` bus).
             "watchdog_provisioned": p.watchdog_provisioned,
             "detail": p.detail,
+            // Marker-vs-non-autonomous-daemon mismatch (#4693, AC3): `true`
+            // only when the marker is present AND this reachable daemon's own
+            // `work_finder_enabled` reads `Some(false)` — a healthy,
+            // "protected" (crash-detectable) daemon that has nonetheless
+            // silently stopped dispatching. `false` when work-finder IS on, or
+            // when `work_finder_enabled` is `null` (pre-#4693 daemon binary —
+            // never a false positive).
+            "autonomy_mismatch": p.marker_present && report.work_finder_enabled == Some(false),
         })),
     })
 }
@@ -5786,6 +5803,36 @@ fn print_status_human(
             // limitation on this host, not evidence of a fault, so steering the
             // operator into a restart for it would be the #4213 ghost-chase.
             _ => {}
+        }
+
+        // Marker-vs-non-autonomous-daemon mismatch (#4693): the sibling of the
+        // #4069 ExpectedButDead state above, but for the REACHABLE case — the
+        // daemon IS alive and answering (unlike ExpectedButDead, which only
+        // fires when IPC is unreachable), yet its work-finder loop is OFF
+        // while the marker records an operator's autonomy-desired intent. This
+        // is exactly the 2026-07-30 incident's end state: `loom-daemon status`
+        // reported a perfectly healthy, PROTECTED daemon (marker present,
+        // watchdog provisioned) while dispatch had silently stopped, because
+        // "protected" only ever asked "would we notice a DEATH", never "is
+        // this live daemon actually dispatching". `report.work_finder_enabled`
+        // is `None` only for a pre-#4693 daemon binary that never computed it
+        // — that degrades to no claim, never a false positive.
+        if p.marker_present && report.work_finder_enabled == Some(false) {
+            println!();
+            println!(
+                "WARNING: autonomy-desired marker present, but the work finder is OFF on this"
+            );
+            println!("         running, reachable daemon (LOOM_WORK_FINDER=0/unset) — autonomous");
+            println!("         dispatch is NOT happening, even though the daemon looks healthy.");
+            println!(
+                "         This is the #4693 silent-downgrade scenario (a plain \
+                 loom-daemon-start.sh"
+            );
+            println!("         run can re-render FLAGS-OFF over a previously-autonomous host).");
+            println!("         Re-enable with:");
+            println!("           ./.loom/scripts/cli/loom-daemon-start.sh --work-finder");
+            println!("         or drive from config:");
+            println!("           ./.loom/scripts/cli/loom-daemon-start.sh --from-config");
         }
     }
 
@@ -9191,6 +9238,7 @@ mod status_client_tests {
             host_breaker: None,
             rate_limit_breaker: None,
             safehouse: None,
+            work_finder_enabled: Some(true),
         }
     }
 
@@ -9420,5 +9468,75 @@ mod status_protection_tests {
             "install_state must stay on the unreachable path only"
         );
         assert!(value.get("protection").is_some());
+    }
+
+    // ---- marker-vs-non-autonomous-daemon mismatch (#4693, AC3) ----
+    // The sibling of #4069's ExpectedButDead state, but for the REACHABLE
+    // path: the daemon IS alive and answering, yet its work-finder loop is
+    // OFF while the marker records an operator's autonomy-desired intent —
+    // exactly the 2026-07-30 incident's end state (a "protected", healthy
+    // daemon that had silently stopped dispatching).
+
+    #[test]
+    fn autonomy_mismatch_true_when_marker_present_and_work_finder_off() {
+        let mut report = sample_report();
+        report.work_finder_enabled = Some(false);
+        let value = build_status_json_value(
+            &report,
+            None,
+            &no_update(),
+            None,
+            Some(&protection(ProtectionState::Protected, true, Some(true))),
+        );
+        assert_eq!(value["work_finder"]["enabled"], false);
+        assert_eq!(value["protection"]["autonomy_mismatch"], true);
+    }
+
+    #[test]
+    fn autonomy_mismatch_false_when_work_finder_is_on() {
+        let mut report = sample_report();
+        report.work_finder_enabled = Some(true);
+        let value = build_status_json_value(
+            &report,
+            None,
+            &no_update(),
+            None,
+            Some(&protection(ProtectionState::Protected, true, Some(true))),
+        );
+        assert_eq!(value["work_finder"]["enabled"], true);
+        assert_eq!(value["protection"]["autonomy_mismatch"], false);
+    }
+
+    #[test]
+    fn autonomy_mismatch_false_when_marker_absent_even_if_work_finder_off() {
+        // Work-finder off with NO marker is the ordinary, deliberate FLAGS-OFF
+        // reliability-daemon case (#3911) -- not a mismatch.
+        let mut report = sample_report();
+        report.work_finder_enabled = Some(false);
+        let value = build_status_json_value(
+            &report,
+            None,
+            &no_update(),
+            None,
+            Some(&protection(ProtectionState::NoMarker, false, Some(true))),
+        );
+        assert_eq!(value["protection"]["autonomy_mismatch"], false);
+    }
+
+    #[test]
+    fn autonomy_mismatch_false_when_work_finder_enabled_is_unknown() {
+        // A pre-#4693 daemon binary never computed `work_finder_enabled` —
+        // `null` must degrade to "no claim", never a false positive.
+        let mut report = sample_report();
+        report.work_finder_enabled = None;
+        let value = build_status_json_value(
+            &report,
+            None,
+            &no_update(),
+            None,
+            Some(&protection(ProtectionState::Protected, true, Some(true))),
+        );
+        assert!(value["work_finder"]["enabled"].is_null());
+        assert_eq!(value["protection"]["autonomy_mismatch"], false);
     }
 }

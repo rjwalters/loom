@@ -1057,6 +1057,207 @@ else
 fi
 rm -rf "$SH5_HOME"
 
+# ---------- silent autonomy-downgrade detection (#4693) ----------
+# Incident 2026-07-30: a plain `loom-daemon-start.sh` run silently re-rendered
+# the plist with LOOM_WORK_FINDER=0, downgrading a previously autonomous
+# daemon to FLAGS-OFF with no warning. check_autonomy_downgrade_key /
+# warn_autonomy_downgrade close the SILENT part of that transition (the
+# FLAGS-OFF-by-default policy for a start with NO prior-autonomy signal, #3911,
+# stays unchanged -- these tests assert that too).
+
+# ---------- launchd (plist) path -- exercised read-only via --print-plist,
+# same technique as the #4522 dropped-env-key tests above.
+AD_HOME="$(mktemp -d)"
+mkdir -p "$AD_HOME/Library/LaunchAgents"
+AD_LABEL="com.rjwalters.loom-daemon-ad-test"
+AD_LIVE_PLIST="$AD_HOME/Library/LaunchAgents/${AD_LABEL}.plist"
+
+# AD1. Prior plist had LOOM_WORK_FINDER=1; a plain re-render (no flags) warns
+#      and names the exact transition. This is the issue's required test case:
+#      "prior-plist-had-work-finder + plain restart -> warning emitted".
+env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE HOME="$AD_HOME" LOOM_LAUNCHD_LABEL="$AD_LABEL" \
+    LOOM_WORK_FINDER=1 LOOM_DAEMON_BIN="$FAKE_BIN" \
+    bash "$START_SCRIPT" --print-plist > "$AD_LIVE_PLIST" 2>/dev/null
+
+ad1_out=$( env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
+    HOME="$AD_HOME" LOOM_LAUNCHD_LABEL="$AD_LABEL" LOOM_DAEMON_BIN="$FAKE_BIN" \
+    bash "$START_SCRIPT" --print-plist 2>&1 >/dev/null )
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$ad1_out" | grep -qi 'autonomy downgrade' && echo "$ad1_out" | grep -q 'LOOM_WORK_FINDER: 1 -> 0'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} autonomy downgrade (plist): prior-plist-had-work-finder + plain restart warns and names the transition (#4693)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} autonomy downgrade (plist): prior-plist-had-work-finder + plain restart warns and names the transition"
+    echo "  output: $ad1_out"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$ad1_out" | grep -qi -- '--from-config' && echo "$ad1_out" | grep -qi -- '--work-finder'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} autonomy downgrade (plist): warning names the --from-config / --work-finder remediation (#4693)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} autonomy downgrade (plist): warning names the --from-config / --work-finder remediation"
+    echo "  output: $ad1_out"
+fi
+
+# AD2. --from-config is exempt entirely -- control is deliberately handed to
+#      .loom/config.json, so re-rendering FLAGS-OFF-equivalent (both vars left
+#      unset) after a WORK_FINDER=1 prior install must NOT warn.
+ad2_out=$( env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
+    HOME="$AD_HOME" LOOM_LAUNCHD_LABEL="$AD_LABEL" LOOM_DAEMON_BIN="$FAKE_BIN" \
+    bash "$START_SCRIPT" --print-plist --from-config 2>&1 >/dev/null )
+TESTS_RUN=$((TESTS_RUN + 1))
+if ! echo "$ad2_out" | grep -qi 'autonomy downgrade'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} autonomy downgrade (plist): --from-config is exempt (control explicitly handed to config, #4693)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} autonomy downgrade (plist): --from-config is exempt"
+    echo "  output: $ad2_out"
+fi
+
+# AD3. An explicit --no-work-finder THIS invocation is not silent -- no warning.
+ad3_out=$( env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
+    HOME="$AD_HOME" LOOM_LAUNCHD_LABEL="$AD_LABEL" LOOM_DAEMON_BIN="$FAKE_BIN" \
+    bash "$START_SCRIPT" --print-plist --no-work-finder 2>&1 >/dev/null )
+TESTS_RUN=$((TESTS_RUN + 1))
+if ! echo "$ad3_out" | grep -qi 'autonomy downgrade'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} autonomy downgrade (plist): explicit --no-work-finder is not silent -- no warning (#4693)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} autonomy downgrade (plist): explicit --no-work-finder is not silent"
+    echo "  output: $ad3_out"
+fi
+
+# AD4. An operator-exported LOOM_WORK_FINDER=0 in the calling shell is also an
+#      explicit, non-default signal -- no warning.
+ad4_out=$( env -u LOOM_MAIN_HEALTH_GATE LOOM_WORK_FINDER=0 \
+    HOME="$AD_HOME" LOOM_LAUNCHD_LABEL="$AD_LABEL" LOOM_DAEMON_BIN="$FAKE_BIN" \
+    bash "$START_SCRIPT" --print-plist 2>&1 >/dev/null )
+TESTS_RUN=$((TESTS_RUN + 1))
+if ! echo "$ad4_out" | grep -qi 'autonomy downgrade'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} autonomy downgrade (plist): a pre-exported LOOM_WORK_FINDER=0 is not silent -- no warning (#4693)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} autonomy downgrade (plist): a pre-exported LOOM_WORK_FINDER=0 is not silent"
+    echo "  output: $ad4_out"
+fi
+rm -rf "$AD_HOME"
+
+# AD5. No transition (prior plist already had LOOM_WORK_FINDER=0) -> no
+#      warning at start time; a STANDING marker-vs-FLAGS-OFF mismatch with no
+#      fresh transition is `loom-daemon status`'s job (AC3), not this check's.
+AD5_HOME="$(mktemp -d)"
+mkdir -p "$AD5_HOME/Library/LaunchAgents"
+AD5_LABEL="com.rjwalters.loom-daemon-ad5-test"
+AD5_LIVE_PLIST="$AD5_HOME/Library/LaunchAgents/${AD5_LABEL}.plist"
+env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE HOME="$AD5_HOME" LOOM_LAUNCHD_LABEL="$AD5_LABEL" \
+    LOOM_WORK_FINDER=0 LOOM_DAEMON_BIN="$FAKE_BIN" \
+    bash "$START_SCRIPT" --print-plist > "$AD5_LIVE_PLIST" 2>/dev/null
+ad5_out=$( env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
+    HOME="$AD5_HOME" LOOM_LAUNCHD_LABEL="$AD5_LABEL" LOOM_DAEMON_BIN="$FAKE_BIN" \
+    bash "$START_SCRIPT" --print-plist 2>&1 >/dev/null )
+TESTS_RUN=$((TESTS_RUN + 1))
+if ! echo "$ad5_out" | grep -qi 'autonomy downgrade'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} autonomy downgrade (plist): no warning when the prior value was already 0 (no fresh transition, #4693)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} autonomy downgrade (plist): no warning when the prior value was already 0"
+    echo "  output: $ad5_out"
+fi
+rm -rf "$AD5_HOME"
+
+# AD6. No prior plist AND no marker (clean first-ever install) -> no warning.
+AD6_HOME="$(mktemp -d)"
+mkdir -p "$AD6_HOME/Library/LaunchAgents"
+ad6_out=$( env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
+    HOME="$AD6_HOME" LOOM_LAUNCHD_LABEL="com.rjwalters.loom-daemon-ad6-test" LOOM_DAEMON_BIN="$FAKE_BIN" \
+    bash "$START_SCRIPT" --print-plist 2>&1 >/dev/null )
+TESTS_RUN=$((TESTS_RUN + 1))
+if ! echo "$ad6_out" | grep -qi 'autonomy downgrade'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} autonomy downgrade (plist): clean first-ever install (no prior plist, no marker) never warns (#4693)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} autonomy downgrade (plist): clean first-ever install never warns"
+    echo "  output: $ad6_out"
+fi
+rm -rf "$AD6_HOME"
+
+# AD7. Marker present but no prior plist/unit value could be read (e.g. the
+#      first Darwin start after a nohup-only history) -- the marker ALONE is
+#      sufficient to flag the downgrade (the issue's explicit "or the
+#      autonomy-desired marker is present" clause).
+AD7_HOME="$(mktemp -d)"
+mkdir -p "$AD7_HOME/Library/LaunchAgents" "$AD7_HOME/.loom"
+: > "$AD7_HOME/.loom/autonomy-desired"
+ad7_out=$( env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
+    HOME="$AD7_HOME" LOOM_LAUNCHD_LABEL="com.rjwalters.loom-daemon-ad7-test" LOOM_DAEMON_BIN="$FAKE_BIN" \
+    LOOM_AUTONOMY_MARKER="$AD7_HOME/.loom/autonomy-desired" \
+    bash "$START_SCRIPT" --print-plist 2>&1 >/dev/null )
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$ad7_out" | grep -qi 'autonomy downgrade' && echo "$ad7_out" | grep -q 'autonomy-desired marker'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} autonomy downgrade (plist): marker present + no readable prior value still warns (#4693)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} autonomy downgrade (plist): marker present + no readable prior value still warns"
+    echo "  output: $ad7_out"
+fi
+rm -rf "$AD7_HOME"
+
+# ---------- systemd (unit) path -- exercised through the REAL install site,
+# reusing the LOOM_SYSTEMD_FORCE + stub systemctl seam (SD_BIN / make_sd_stub,
+# defined above at S2) so this covers the actual overwrite code path, not just
+# a read-only render.
+AD_SD_UNIT="loom-daemon-ad-test-$$.service"
+AD8_HOME="$(mktemp -d)"; mkdir -p "$AD8_HOME/.loom/logs"
+AD8_LOG="$WORKDIR/ad8-install.log"; : > "$AD8_LOG"
+
+# Install the "prior" unit with LOOM_WORK_FINDER=1.
+sleep 30 & AD8_SLEEP_PID1=$!
+make_sd_stub "$AD8_LOG" "$AD8_SLEEP_PID1"
+env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
+    PATH="$SD_BIN:$PATH" HOME="$AD8_HOME" LOOM_SYSTEMD_FORCE=1 LOOM_SYSTEMD_UNIT="$AD_SD_UNIT" \
+    LOOM_WORK_FINDER=1 LOOM_DAEMON_BIN="$FAKE_BIN" \
+    LOOM_SOCKET_PATH="$AD8_HOME/.loom/loom-daemon.sock" \
+    LOOM_AUTONOMY_MARKER="$AD8_HOME/.loom/autonomy-desired" \
+    bash "$START_SCRIPT" --no-launchd >/dev/null 2>&1
+kill "$AD8_SLEEP_PID1" 2>/dev/null || true
+rm -f "$AD8_HOME/.loom/.daemon.pid"
+
+# AD8. A plain re-install (no flags) both warns AND still actually
+#      installs/starts (advisory only, never blocks -- matching the #4522
+#      dropped-env-key precedent). This is the issue's required test case:
+#      "prior-plist-had-work-finder + plain restart -> warning emitted",
+#      systemd sibling.
+sleep 30 & AD8_SLEEP_PID2=$!
+make_sd_stub "$AD8_LOG" "$AD8_SLEEP_PID2"
+ad8_out=$( cd "$WORKDIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
+    PATH="$SD_BIN:$PATH" HOME="$AD8_HOME" LOOM_SYSTEMD_FORCE=1 LOOM_SYSTEMD_UNIT="$AD_SD_UNIT" \
+    LOOM_DAEMON_BIN="$FAKE_BIN" \
+    LOOM_SOCKET_PATH="$AD8_HOME/.loom/loom-daemon.sock" \
+    LOOM_AUTONOMY_MARKER="$AD8_HOME/.loom/autonomy-desired" \
+    bash "$START_SCRIPT" --no-launchd 2>&1 )
+ad8_rc=$?
+assert_eq "0" "$ad8_rc" "autonomy downgrade (systemd): the WARNED downgrade still actually installs/starts (warn, don't block, #4693)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$ad8_out" | grep -qi 'autonomy downgrade' && echo "$ad8_out" | grep -q 'LOOM_WORK_FINDER: 1 -> 0'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} autonomy downgrade (systemd): prior-unit-had-work-finder + plain restart warns and names the transition (#4693)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} autonomy downgrade (systemd): prior-unit-had-work-finder + plain restart warns and names the transition"
+    echo "  output: $ad8_out"
+fi
+kill "$AD8_SLEEP_PID2" 2>/dev/null || true
+rm -f "$AD8_HOME/.loom/.daemon.pid"
+rm -rf "$AD8_HOME"
+
 # ---------- summary ----------
 echo
 echo "Ran $TESTS_RUN tests: $TESTS_PASSED passed, $TESTS_FAILED failed"
