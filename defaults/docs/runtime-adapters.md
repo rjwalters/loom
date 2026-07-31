@@ -37,6 +37,18 @@ The contract exists to *generalize* Loom, not to demote Claude Code.
   ownership** — ongoing maintenance of its adapter, its parity doc, and its CI
   leg. Tier is a *maintainership* statement, not a capability statement: a
   perfectly capable runtime stays tier-2 until an owner signs up.
+- **Tier-3 is "generic passthrough": unverified, and refused for every
+  worktree-mutating role by construction.** Tier-2 is still a real bar — a
+  spawn smoke test, error classification, and a guardrail-parity document with
+  an explicit residual-gap section — which means Loom has exactly two admitted
+  runtimes against an ecosystem of many terminal-compatible coding CLIs. Tier-3
+  is the bounded, explicitly-lower-trust escape hatch: a single
+  `spawn-generic.sh` template (thin per-CLI wrappers instantiate it) that
+  satisfies only [contract point 1](#1-spawn) (Spawn) and the
+  generic-transient fallthrough half of [contract point 3](#3-error-classification)
+  (Error classification) — no custom pattern table, no sandbox mapping, no
+  parity doc. See [Tier 3: generic passthrough](#tier-3-generic-passthrough)
+  below for the full shape and why skipping the parity doc is safe.
 
 These are operator policy statements recorded on #4167; the contract encodes
 them but does not decide them.
@@ -47,7 +59,85 @@ them but does not decide them.
 |---------|---------|------|-----------|--------|-------|
 | Claude Code | `defaults/scripts/spawn-claude.sh` | **1** (default) | n/a — Loom's guards *are* the Claude implementation | the whole existing suite | Zero-regression default; no `LOOM_RUNTIME` needed. |
 | OpenAI Codex CLI | `defaults/scripts/spawn-codex.sh` | **2** | [`guardrail-parity-codex.md`](guardrail-parity-codex.md) | `codex-adapter-smoke` in `.github/workflows/ci.yml` (mocked; no live calls) | **Shipped** by epic #4167 Phase 2 (#4468), ported from the gpeyton fork. Requires Codex CLI ≥ 0.146.0. Capability manifest `defaults/runtimes/codex.json` declares `worktreeIsolation: partial`, so `check-runtime-capabilities.sh` fails Builder+codex closed while Judge+codex passes. |
-| Amp, oh-my-pi (omp), … | — | — | — | — | Not started. |
+| Amp, oh-my-pi (omp), … | — | — | — | — | Not started (tier-2 candidates; still need a parity doc + CI leg). |
+| Aider ([aider.chat](https://aider.chat)) | `defaults/scripts/spawn-aider.sh` (thin wrapper over `defaults/scripts/spawn-generic.sh`) | **3** (generic passthrough, unverified) | n/a — tier-3 does not require one | none (no CI leg is required for tier-3; the checker assertion below is a plain `test-*.sh`, not an adapter-admission gate) | **Worked example** for issue #4780 — proves the tier-3 mechanism end-to-end, not a vetted integration. Capability manifest `defaults/runtimes/aider.json` declares every capability `"no"`, including `worktreeIsolation: "no"` EXPLICITLY (not `"partial"`). |
+
+### Tier 3: generic passthrough
+
+A tier-3 adapter exists to try a low-trust CLI against a **read-only**
+role — Judge, Curator, Guide, Auditor — without first writing a full
+guardrail-parity document. It is deliberately a much thinner contract than
+tier-1/tier-2:
+
+- **Implements only contract points 1 and 3, and only partially.** Point 1
+  (Spawn) is the full interface — args passthrough, prompt delivery, a
+  runtime-missing exit code — but with no logical model-tier mapping, no
+  transcript, and no account/usage-pool integration (points 2 and 4 are
+  skipped outright). Point 3 (Error classification) is satisfied by the
+  **generic-transient fallthrough only**: a tier-3 runtime gets no bespoke
+  pattern table in `classify-error.sh`. Passing its name as the
+  `classify_error` provider argument is safe by construction — an
+  unregistered provider matches no table and resolves through the shared
+  engine's exit-code-first ordering and generic transients, exactly like any
+  genuinely unknown provider already does today.
+- **No guardrail-parity document (point 6) and no CI smoke leg are required.**
+  This is not a lowered bar for tier-1/tier-2 — those promotion criteria are
+  unchanged (see the issue's "Non-goals") — it is a *different* trust
+  boundary that does not need a documented residual gap, because the boundary
+  is enforced mechanically instead of by prose:
+- **The capability manifest (point 7) is what makes skipping the parity doc
+  safe.** A tier-3 runtime's `defaults/runtimes/<name>.json` declares
+  `worktreeIsolation: "no"` **explicitly** — not `"partial"`. There is no
+  ambiguity to record ("close but gapped"); it is flatly unverified. Because
+  Builder and Doctor both declare `runtimeRequirements: ["worktreeIsolation",
+  ...]`, `check-runtime-capabilities.sh --role builder --runtime <tier-3-name>`
+  fails closed with exit **78** (`EX_CONFIG`) by the exact same mechanism that
+  already keeps Codex's `worktreeIsolation: partial` out of Builder — **no
+  code change to the checker was needed**: it already treats any value other
+  than exactly `"yes"` as unmet, so `"no"` fails closed identically to
+  `"partial"`.
+- **Read-only admission is per-role, not automatic for the whole "read-only"
+  category.** `judge.json` declares `runtimeRequirements: ["mcp"]`, so a
+  tier-3 runtime with no MCP support (the honest default — see below) is
+  refused for Judge too, for the same reason it is refused for Builder: a
+  declared `"no"` is not a declared `"yes"`. `curator.json`, `guide.json`, and
+  `auditor.json` declare **no** `runtimeRequirements` today, so they are the
+  roles a no-MCP tier-3 runtime is actually admitted for (any runtime is
+  trivially compatible with a role that declares no requirements). A tier-3
+  runtime that *does* support MCP can declare `mcp: "yes"` and pick up Judge
+  too — the manifest is the single source of truth, not a hardcoded
+  runtime-vs-role table.
+
+**The shared template.** `defaults/scripts/spawn-generic.sh` is driven
+entirely by environment variables so one implementation backs many thin
+per-CLI wrappers instead of duplicating the Spawn interface per CLI:
+
+```bash
+#!/usr/bin/env bash
+LOOM_GENERIC_RUNTIME_NAME="aider" \
+LOOM_GENERIC_CLI_BIN="${LOOM_GENERIC_CLI_BIN:-aider}" \
+LOOM_GENERIC_PROMPT_FLAG="${LOOM_GENERIC_PROMPT_FLAG:---message}" \
+    exec "$(dirname "${BASH_SOURCE[0]}")/spawn-generic.sh" "$@"
+```
+
+`spawn-worker.sh` needed **no change** to dispatch a tier-3 runtime: it
+already resolves `spawn-<runtime>.sh` by name off disk, so
+`LOOM_RUNTIME=aider` (or `runtimes.default: "aider"`) reaches
+`spawn-aider.sh` → `spawn-generic.sh` through the exact same seam Codex uses.
+
+**Worked example (issue #4780).** `defaults/scripts/spawn-aider.sh` wires the
+[Aider](https://aider.chat) CLI as a tier-3 runtime end-to-end:
+`defaults/runtimes/aider.json` declares every capability `"no"`, so
+`check-runtime-capabilities.sh --role builder --runtime aider` exits 78 while
+`--role curator --runtime aider` exits 0. This is the *mechanism*, not a
+roster of new runtimes — onboarding any other specific CLI as tier-3 is a
+separate, per-CLI follow-up (see the issue's "Non-goals").
+
+**Promoting a tier-3 runtime to tier-2** means writing the guardrail-parity
+document, adding a CI smoke leg, and — critically — re-declaring its
+capabilities honestly (`"partial"` where a real, if incomplete, mechanism
+exists; `"yes"` only where it is fully proven). Promotion is a manifest edit
+plus the missing artifacts, not a rewrite of the adapter shape.
 
 ## The seven contract points
 
@@ -371,10 +461,13 @@ by the standalone checker and daemon admission:
   reads only `runtimeRequirements`.
 - **Matcher** — `defaults/scripts/check-runtime-capabilities.sh --role <name>
   --runtime <name>` loads both files and checks requirements ⊆ capabilities,
-  where a requirement is satisfied only by a declared `"yes"` (`"partial"` fails
-  closed). Exit 0 on match or no-requirements, exit 78 (`EX_CONFIG`) on mismatch
-  naming each unmet capability, non-zero with a distinct message on an
-  unknown/missing role or runtime file.
+  where a requirement is satisfied only by a declared `"yes"` (`"partial"` AND
+  `"no"` both fail closed identically — this is why a tier-3 manifest can
+  declare `"no"` explicitly instead of reusing `"partial"`'s "close but
+  gapped" connotation, with no change to the matcher itself). Exit 0 on match
+  or no-requirements, exit 78 (`EX_CONFIG`) on mismatch naming each unmet
+  capability, non-zero with a distinct message on an unknown/missing role or
+  runtime file.
 
 **Second manifest (#4468):** `defaults/runtimes/codex.json` declares
 `mcp: "yes"`, `subagents: "no"` (the fork PR #59 prohibition), `hooks: "partial"`,
@@ -384,6 +477,17 @@ while `--role judge --runtime codex` passes — the manifest mechanically encode
 the parity doc's residual gaps, and the CI leg asserts both outcomes. That is the
 intended relationship between points 6 and 7: the parity doc states the gap in
 prose, the manifest makes it enforceable.
+
+**Third manifest, tier-3 (#4780):** `defaults/runtimes/aider.json` declares
+**every** capability `"no"`, including `worktreeIsolation: "no"` **explicitly**
+rather than `"partial"` — there is no residual gap to record in prose because
+there is no parity doc for tier-3 at all (see
+[Tier 3: generic passthrough](#tier-3-generic-passthrough)). The same "any
+non-`yes` value fails closed" matcher rule that enforces Codex's `partial`
+enforces this `no` identically — `--role builder --runtime aider` and
+`--role judge --runtime aider` (judge requires `mcp`, declared `"no"` here)
+both exit 78, while `--role curator --runtime aider` exits 0 because
+`curator.json` declares no `runtimeRequirements` at all.
 
 **Why `hooks`/`worktreeIsolation` are still `partial` after #4495.** Loom *does*
 now wire Codex's `pre_tool_use` event (`defaults/hooks/guard-codex-bridge.sh`,
@@ -603,6 +707,14 @@ capability manifest at `defaults/runtimes/<runtime>.json` (point 7) at the same
 time — declaring a capability `"partial"` fails role matching closed, which is
 how Codex is correctly kept out of Builder dispatch.
 
+**Want to skip both of those for now?** That is exactly what
+[tier-3 generic passthrough](#tier-3-generic-passthrough) is for: instantiate
+`spawn-generic.sh` instead of writing a full adapter, declare every capability
+`"no"` (including `worktreeIsolation: "no"`, explicitly) in the manifest, and
+the runtime is refused for Builder/Doctor with no parity doc required. Use it
+to try a CLI against a read-only role first; write the tier-2 artifacts only
+once you are ready to trust it more broadly.
+
 ### Unknown-runtime failure (exit 78)
 
 If the resolved runtime has no matching `spawn-<runtime>.sh` runner, the
@@ -671,5 +783,10 @@ collaboration:
   guardrail-parity doc (contract point 6), including the `CODEX_HOME` profile
   layout / refresh / security-posture reference absorbed from #4469.
 - **#4468** — Codex adapter port (Phase 2). **#4470** — Codex canary runs.
+- **#4780** — tier-3 "generic passthrough" mechanism: `spawn-generic.sh`, the
+  `defaults/runtimes/aider.json` worked example, and the capability-manifest
+  gate this section documents. Adapted from a survey of
+  [stablyai/orca](https://github.com/stablyai/orca) (`.loom/docs/survey-orca-2026-07-31.md`,
+  idea 5), filed from #4775.
 - [ADR-0012: Multi-Runtime Worker Support via a Runtime Adapter Contract](../../docs/adr/0012-runtime-adapter-contract.md).
 - Fork: https://github.com/gpeyton/loom · `AGENTS.md` standard: https://agents.md
