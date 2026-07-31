@@ -1543,12 +1543,39 @@ if git show-ref --verify --quiet "refs/heads/$BRANCH_NAME"; then
 
     CREATE_ARGS=("$WORKTREE_PATH" "$BRANCH_NAME")
 else
-    # Create new branch from the base ref (origin/$DEFAULT_BRANCH by default, or
-    # the --base override for a stacked child — #3729).
-    if [[ "$JSON_OUTPUT" != "true" ]]; then
-        print_info "Creating new branch from $BASE_DISPLAY"
+    # No local branch by this name. Before falling back to a fresh branch off
+    # BASE_REF, check whether origin already has a pushed branch of the exact
+    # same name — e.g. an existing PR branch from a prior Builder/Doctor cycle
+    # (#4823). Without this check, a Doctor fixing review feedback on an
+    # already-pushed PR would silently get a NEW branch created from
+    # origin/$DEFAULT_BRANCH instead of the real PR history, risking a
+    # PR-clobbering force-push or a diff against the wrong base. This is
+    # independent of --base (which only chooses the start point when we DO
+    # need to create a fresh branch, below).
+    git fetch origin "$BRANCH_NAME" 2>/dev/null || true
+    if git show-ref --verify --quiet "refs/remotes/origin/$BRANCH_NAME"; then
+        if [[ "$JSON_OUTPUT" != "true" ]]; then
+            print_info "Remote branch 'origin/$BRANCH_NAME' already exists - creating a local branch tracking it (not branching from $BASE_DISPLAY)"
+        fi
+        # Informational only: the remote branch always wins here (it IS the
+        # PR history to continue), but note when it doesn't contain all of
+        # BASE_DISPLAY's history (e.g. pushed before recent main commits
+        # landed) so a caller reading the log understands why the worktree
+        # isn't rebased on top of the latest base.
+        if ! git merge-base --is-ancestor "$BASE_REF" "refs/remotes/origin/$BRANCH_NAME" 2>/dev/null; then
+            if [[ "$JSON_OUTPUT" != "true" ]]; then
+                print_warning "origin/$BRANCH_NAME has diverged from $BASE_DISPLAY (does not contain all of its history) - tracking origin/$BRANCH_NAME as-is"
+            fi
+        fi
+        CREATE_ARGS=("$WORKTREE_PATH" "-b" "$BRANCH_NAME" "origin/$BRANCH_NAME")
+    else
+        # Create new branch from the base ref (origin/$DEFAULT_BRANCH by default, or
+        # the --base override for a stacked child — #3729).
+        if [[ "$JSON_OUTPUT" != "true" ]]; then
+            print_info "Creating new branch from $BASE_DISPLAY"
+        fi
+        CREATE_ARGS=("$WORKTREE_PATH" "-b" "$BRANCH_NAME" "$BASE_REF")
     fi
-    CREATE_ARGS=("$WORKTREE_PATH" "-b" "$BRANCH_NAME" "$BASE_REF")
 fi
 
 # In sparse mode, defer file materialization until after we configure the cone.
