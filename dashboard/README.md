@@ -10,12 +10,15 @@ the read-side query API + live tail (issue #4726) the Phase 3 dashboard UI
 consumes.
 
 Wire format reference: [`.loom/docs/telemetry-schema.md`](../.loom/docs/telemetry-schema.md).
-Query API reference: [`docs/query-api.md`](docs/query-api.md).
+Query API reference: [`docs/query-api.md`](docs/query-api.md) — includes the
+`/api/*` (authenticated) vs. `/public/*` (redacted) route split and the
+visibility-based redaction policy (issue #4727).
 
-**Out of scope for this repo**: Worker-side Cloudflare Access JWT verification
-(the [Access guide](docs/cloudflare-access.md) covers gating via the edge
-proxy instead), and visibility-based redaction beyond faithfully storing the
-`visibility` tag (#4727, which wraps the query API added here).
+**Out of scope for this repo**: Worker-side Cloudflare Access JWT
+verification — the [Access guide](docs/cloudflare-access.md) covers gating
+`/api/*` via the edge proxy instead; the Worker only decides *what a request
+sees* (via the route it reached), never *whether it should have reached
+here*.
 
 ## Architecture
 
@@ -115,12 +118,18 @@ asserts the `ADMIN_TOKEN` secret exists on the deployed Worker.
 | `POST /admin/hosts/:hostId/revoke` | `Authorization: Bearer <ADMIN_TOKEN>` | Revoke a host's key. |
 | `POST /admin/retention/run` | `Authorization: Bearer <ADMIN_TOKEN>` | Run the retention sweep on demand (also runs hourly via `[triggers] crons`). |
 | `GET /admin/fleet-state` | `Authorization: Bearer <ADMIN_TOKEN>` | Read the Durable Object's live snapshot (operator introspection/manual verification). |
-| `GET /api/fleet-state` | none (unclassified — see #4727) | Phase 3 query API: current state of every known host/sweep. |
-| `GET /api/history` | none (unclassified — see #4727) | Phase 3 query API: filterable, paginated D1 history query. |
-| `GET /api/events` | none (unclassified — see #4727) | Phase 3 query API: SSE live tail of newly-ingested telemetry. |
+| `GET /api/fleet-state` | none in-Worker — put behind Cloudflare Access (see below) | Authenticated query API: current state of every known host/sweep, full detail. |
+| `GET /api/history` | none in-Worker — put behind Cloudflare Access | Authenticated query API: filterable, paginated D1 history query, full detail. |
+| `GET /api/events` | none in-Worker — put behind Cloudflare Access | Authenticated query API: SSE live tail of newly-ingested telemetry, full detail. |
+| `GET /public/fleet-state` | none (always public) | Public query API: same data as `/api/fleet-state`, redacted per record `visibility` (issue #4727). |
+| `GET /public/history` | none (always public) | Public query API: same data as `/api/history`, redacted. |
+| `GET /public/events` | none (always public) | Public query API: same data as `/api/events`, redacted. |
 
-Full request/response shapes for the `/api/*` routes:
-[`docs/query-api.md`](docs/query-api.md).
+Full request/response shapes for the `/api/*` and `/public/*` routes,
+including the exact redaction policy per record kind:
+[`docs/query-api.md`](docs/query-api.md). Cloudflare Access setup to actually
+gate `/api/*` at the edge (this backend never verifies auth itself):
+[`docs/cloudflare-access.md`](docs/cloudflare-access.md).
 
 ## Design decisions worth knowing
 
@@ -146,3 +155,12 @@ Full request/response shapes for the `/api/*` routes:
   mirroring the Rust daemon's decode rule: only the exact string
   `"public"` is public, everything else (missing, unknown label, wrong
   type, `null`) is private.
+- **Redaction is a per-kind field allowlist, not a blocklist.**
+  `src/redaction.ts` names, per record `kind`, exactly which fields survive
+  into a private/public response — a future schema field (e.g. an issue
+  title, once one exists on the wire) is dropped by default until this
+  table is deliberately updated, rather than leaking by accident because no
+  one thought to add it to a blocklist. `/api/*` vs `/public/*` is a
+  route-based auth split (no JWT/header parsing in this Worker, per the
+  epic's "no auth code in the dashboard itself" constraint) — see
+  `docs/query-api.md` for the full rationale.

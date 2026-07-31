@@ -19,35 +19,47 @@
  *                                      the actual Phase 3 dashboard query
  *                                      API).
  *
- *   GET  /api/fleet-state           — Phase 3 query API: current state of
- *                                      every known host/sweep (issue #4726).
- *   GET  /api/history               — Phase 3 query API: filterable,
- *                                      paginated D1 history query (issue
- *                                      #4726).
- *   GET  /api/events                — Phase 3 query API: SSE live tail of
- *                                      newly-ingested telemetry (issue
- *                                      #4726).
+ *   GET  /api/fleet-state            — authenticated query API: current
+ *                                      state of every known host/sweep,
+ *                                      full detail regardless of visibility
+ *                                      (issue #4726 built the data access;
+ *                                      #4727 added the auth/redaction split
+ *                                      below).
+ *   GET  /api/history                — authenticated: filterable, paginated
+ *                                      D1 history query, full detail.
+ *   GET  /api/events                 — authenticated: SSE live tail of
+ *                                      newly-ingested telemetry, full
+ *                                      detail.
+ *   GET  /public/fleet-state         — public: same query, redacted —
+ *                                      private-visibility data is
+ *                                      summarized (see `./redaction.ts`).
+ *   GET  /public/history             — public: same query, redacted.
+ *   GET  /public/events              — public: same live tail, redacted.
  *
  * All `/admin/*` routes require `Authorization: Bearer <ADMIN_TOKEN>`
- * (a `wrangler secret`, never committed) — see README.md. The `/api/*`
- * routes are deliberately **not** admin-gated: they are the unclassified
- * query surface issue #4726 defines, returning full record detail.
- * Visibility-based redaction (public vs. authenticated views) is issue
- * #4727's job, as a wrapper in front of these routes — not implemented here.
+ * (a `wrangler secret`, never committed) — see README.md.
  *
- * Scope boundary (per the issue): ingest + storage, plus the query API and
- * live tail added by #4726. Cloudflare Access auth / redaction are later
- * epic phases (#4727).
+ * **`/api/*` vs `/public/*` is a route-based authentication split, not an
+ * in-Worker one** (issue #4727; full rationale in `./redaction.ts`'s module
+ * doc and `docs/cloudflare-access.md`): `/api/*` is the surface an
+ * operator's Cloudflare Access policy is expected to gate (the "everything
+ * else… Allow" rule the Access guide already documents), `/public/*` is
+ * always unauthenticated and always redacted, mirroring the `/public` path
+ * that guide already reserves as a Bypass application. Neither route
+ * verifies a JWT or any other credential in-Worker — per the epic's
+ * constraint, that verification lives entirely at the Cloudflare Access
+ * edge layer.
  */
 
 import { extractBearerToken, authenticateHost, hashIngestKey } from "./auth";
-import { FleetState } from "./fleetState";
+import { FleetState, type FleetSnapshot } from "./fleetState";
 import {
   createLiveTailStream,
   parseHistoryQuery,
   queryHistory,
   type LiveTailFilter,
 } from "./query";
+import { redactFleetSnapshot, redactHistoryQueryResult, redactLiveTailStream } from "./redaction";
 import { parseRetentionConfig, runRetentionSweep } from "./retention";
 import { validateEnvelope, extractRecordFields, type TelemetryEnvelope } from "./telemetry";
 
@@ -267,41 +279,50 @@ async function handleAdmin(request: Request, env: Env, url: URL): Promise<Respon
 }
 
 // ---------------------------------------------------------------------------
-// /api/* — Phase 3 dashboard query API (issue #4726)
+// /api/* (authenticated) + /public/* (redacted) — issues #4726 + #4727
 // ---------------------------------------------------------------------------
 
-/** `GET /api/fleet-state` — the unclassified equivalent of
- * `GET /admin/fleet-state`: same Durable Object snapshot, no admin token
- * required. This is the route the Phase 3 dashboard UI actually consumes;
- * `/admin/fleet-state` remains for operator introspection/verification. */
-async function handleFleetStateQuery(env: Env): Promise<Response> {
+/** `GET /api/fleet-state` (authenticated) / `GET /public/fleet-state`
+ * (public, redacted) — the query-API equivalent of `GET /admin/fleet-state`:
+ * same Durable Object snapshot, no admin token required. `isAuthenticated`
+ * is purely a function of which route matched (see the module doc); the
+ * response is redacted via `./redaction.ts` when it is `false`. */
+async function handleFleetStateQuery(env: Env, isAuthenticated: boolean): Promise<Response> {
   const response = await fleetStateStub(env).fetch("https://fleet-state/snapshot");
-  return new Response(response.body, { status: response.status, headers: JSON_HEADERS });
+  const snapshot = (await response.json()) as FleetSnapshot;
+  const body = isAuthenticated ? snapshot : redactFleetSnapshot(snapshot, isAuthenticated);
+  return new Response(JSON.stringify(body), { status: response.status, headers: JSON_HEADERS });
 }
 
-/** `GET /api/history` — filterable, paginated D1 history query. See
- * `query.ts`'s `parseHistoryQuery`/`queryHistory` doc comments for the full
- * filter/pagination contract. */
-async function handleHistoryQuery(env: Env, url: URL): Promise<Response> {
+/** `GET /api/history` (authenticated) / `GET /public/history` (public,
+ * redacted) — filterable, paginated D1 history query. See `query.ts`'s
+ * `parseHistoryQuery`/`queryHistory` doc comments for the full
+ * filter/pagination contract; `./redaction.ts`'s `redactHistoryQueryResult`
+ * for the redaction applied when `isAuthenticated` is `false`. */
+async function handleHistoryQuery(env: Env, url: URL, isAuthenticated: boolean): Promise<Response> {
   const filter = parseHistoryQuery(url.searchParams);
   if ("error" in filter) {
     return jsonError(400, filter.error);
   }
   const result = await queryHistory(env.DB, filter);
-  return new Response(JSON.stringify(result), { status: 200, headers: JSON_HEADERS });
+  const body = redactHistoryQueryResult(result, isAuthenticated);
+  return new Response(JSON.stringify(body), { status: 200, headers: JSON_HEADERS });
 }
 
-/** `GET /api/events` — SSE live tail of newly-ingested telemetry. See
- * `query.ts`'s `createLiveTailStream` doc comment for the framing/polling
- * contract. */
-function handleLiveTail(request: Request, env: Env, url: URL): Response {
+/** `GET /api/events` (authenticated) / `GET /public/events` (public,
+ * redacted) — SSE live tail of newly-ingested telemetry. See `query.ts`'s
+ * `createLiveTailStream` doc comment for the framing/polling contract;
+ * `./redaction.ts`'s `redactLiveTailStream` for the per-frame redaction
+ * applied when `isAuthenticated` is `false`. */
+function handleLiveTail(request: Request, env: Env, url: URL, isAuthenticated: boolean): Response {
   const filter: LiveTailFilter = {};
   const host = url.searchParams.get("host");
   if (host) filter.host = host;
   const repo = url.searchParams.get("repo");
   if (repo) filter.repo = repo;
 
-  const stream = createLiveTailStream(env.DB, filter, { signal: request.signal });
+  const rawStream = createLiveTailStream(env.DB, filter, { signal: request.signal });
+  const stream = redactLiveTailStream(rawStream, isAuthenticated);
   return new Response(stream, {
     status: 200,
     headers: {
@@ -328,16 +349,25 @@ export default {
       return handleAdmin(request, env, url);
     }
     if (request.method === "GET" && url.pathname === "/api/fleet-state") {
-      return handleFleetStateQuery(env);
+      return handleFleetStateQuery(env, /* isAuthenticated */ true);
+    }
+    if (request.method === "GET" && url.pathname === "/public/fleet-state") {
+      return handleFleetStateQuery(env, /* isAuthenticated */ false);
     }
     if (request.method === "GET" && url.pathname === "/api/history") {
-      return handleHistoryQuery(env, url);
+      return handleHistoryQuery(env, url, /* isAuthenticated */ true);
+    }
+    if (request.method === "GET" && url.pathname === "/public/history") {
+      return handleHistoryQuery(env, url, /* isAuthenticated */ false);
     }
     if (request.method === "GET" && url.pathname === "/api/events") {
-      return handleLiveTail(request, env, url);
+      return handleLiveTail(request, env, url, /* isAuthenticated */ true);
+    }
+    if (request.method === "GET" && url.pathname === "/public/events") {
+      return handleLiveTail(request, env, url, /* isAuthenticated */ false);
     }
     if (request.method === "GET" && url.pathname === "/") {
-      return new Response("loom-observability-ingest: see /ingest, /admin/*, /api/*", { status: 200 });
+      return new Response("loom-observability-ingest: see /ingest, /admin/*, /api/*, /public/*", { status: 200 });
     }
     return jsonError(404, "not found");
   },
