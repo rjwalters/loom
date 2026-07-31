@@ -290,6 +290,29 @@ token hits its weekly limit.
    `claude` (or pass `--use-wrapper` to layer on top of `claude-wrapper.sh` for
    retry behavior).
 
+### Verifying token precedence (`defaults/scripts/verify-token-precedence.sh`)
+
+The token rotation mechanism relies on `CLAUDE_CODE_OAUTH_TOKEN` taking precedence
+over Keychain authentication in Claude Code. After upgrading Claude Code or when
+diagnosing suspected rotation failures (e.g., the fallback-to-Keychain behavior
+mentioned in issue #3236), run `defaults/scripts/verify-token-precedence.sh` once
+from the repository root to confirm this assumption still holds:
+
+```bash
+./defaults/scripts/verify-token-precedence.sh
+```
+
+**Exit codes**:
+- `0` — precedence is correct; env-token takes precedence over Keychain
+- `1` — precedence failed; env-token is being ignored and Keychain is used (rotation will not work)
+- `2` — prerequisites missing (claude not installed, not logged in, etc.)
+
+The script creates a test with a deliberately bogus `CLAUDE_CODE_OAUTH_TOKEN` value
+and verifies that auth fails or differs from the Keychain account. If the installed
+Claude Code version silently falls back to Keychain when the env-token is invalid,
+rotation is broken on that version and the issue should be escalated to Claude Code
+support.
+
 ## Selection algorithm (`loom-daemon tokens select`)
 
 Three tiers, falling through to the next when the current tier yields nothing.
