@@ -51,16 +51,25 @@
  * `decodeVisibility` (`src/telemetry.ts`) therefore stores them as
  * `visibility: "private"` by its fail-safe-default rule (a **storage**
  * classification, not a statement that their content is repo-identifying).
- * Every field either kind defines today is host/fleet-operational detail
- * (CPU/uptime/token-pool state) with no reference to a repository, issue,
- * branch, or PR — the four leak vectors this issue's acceptance criteria
- * name. Decision (flagged as open by the Curator, resolved here): these two
- * kinds' allowlists intentionally include every field the schema defines,
- * so they pass through unchanged for both authenticated and public viewers.
- * This is still enforced through the same allowlist mechanism as every other
- * kind (not a special-cased bypass), so a future field added to either kind
- * is dropped by default until this table is deliberately updated — the
- * fail-safe direction never flips silently.
+ * Neither references a repository, issue, branch, or PR — the four leak
+ * vectors the epic's acceptance criteria name.
+ *
+ * `host.health` is pure capacity telemetry (CPU/uptime/disk) and passes
+ * through in full for every viewer.
+ *
+ * `tokens.snapshot` does **not**. Its `accounts` array names the pool's
+ * accounts and gives each one's rank and burn — operational detail about
+ * *who* runs the fleet, which is a different question from how loaded it is.
+ * Operator decision (2026-07-31): the authenticated dashboard shows the
+ * per-account rows; the public view gets `deriveTokenPoolAggregate`'s
+ * non-identifying summary instead (pool size, exhausted count, mean/peak
+ * usage, next reset). Before that decision `/public/fleet-state` served the
+ * whole array to anyone.
+ *
+ * Both are enforced through the same allowlist mechanism as every other kind
+ * (not a special-cased bypass), so a future field added to either is dropped
+ * by default until the table is deliberately updated — the fail-safe
+ * direction never flips silently.
  */
 
 import type { RepoVisibility } from "./telemetry";
@@ -89,7 +98,11 @@ const RECORD_FIELD_ALLOWLIST: Readonly<Record<string, readonly string[]>> = {
   // field the schema defines today is listed explicitly (not "pass
   // everything") so the allowlist mechanism stays the single source of
   // truth even for these two kinds.
-  "tokens.snapshot": ["kind", "captured_at", "accounts"],
+  //
+  // `accounts` is deliberately ABSENT here: the per-account rows carry
+  // `account` identifiers and per-account burn, which the public view
+  // summarizes instead of listing (see `PUBLIC_RECORD_DERIVATIONS`).
+  "tokens.snapshot": ["kind", "captured_at"],
   "host.health": [
     "kind",
     "captured_at",
@@ -101,6 +114,93 @@ const RECORD_FIELD_ALLOWLIST: Readonly<Record<string, readonly string[]>> = {
     "worktree_root_free_gb",
   ],
 };
+
+/** One account row inside a `tokens.snapshot`, as the daemon sends it. Every
+ * measured field is optional: the "unknown != zero" contract says an
+ * unmeasurable probe is absent, never a fake `0`. */
+interface TokenAccountRow {
+  account?: unknown;
+  rank?: unknown;
+  usage_fraction?: unknown;
+  limit_window_reset_at?: unknown;
+  exhausted?: unknown;
+}
+
+/** The non-identifying summary the public view gets in place of the
+ * per-account rows. Field-for-field, this answers "how loaded is the pool"
+ * without answering "which accounts exist" or "which one is nearly spent". */
+export interface TokenPoolAggregate {
+  account_count: number;
+  exhausted_count: number;
+  /** Mean/peak across the accounts that actually reported a
+   * `usage_fraction`; `null` when none did (never a misleading `0`). */
+  mean_usage_fraction: number | null;
+  max_usage_fraction: number | null;
+  /** Earliest limit-window reset across the pool — a fleet-level "capacity
+   * returns at" that names no account. `null` when none reported one. */
+  next_limit_window_reset_at: string | null;
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+/** Round to 4 decimal places, enough resolution for a percentage readout
+ * without exposing float noise that could fingerprint an exact input. */
+function round4(value: number): number {
+  return Math.round(value * 10_000) / 10_000;
+}
+
+/**
+ * Summarize a `tokens.snapshot`'s `accounts` array into
+ * {@link TokenPoolAggregate}.
+ *
+ * Operator decision (2026-07-31): the authenticated dashboard shows
+ * per-account token detail; the public view shows aggregate stats only. The
+ * pool's account identifiers (`agent5-2amlogic`, …), their individual burn
+ * rates, and their ranking are all operational detail about *who* is running
+ * the fleet, so they stay behind the Access gate. Total/peak load and how
+ * many accounts are spent describe the fleet's capacity, which is the part
+ * worth showing publicly.
+ *
+ * Defensive against a malformed payload: a missing or non-array `accounts`
+ * yields a zero-count aggregate rather than throwing, because this runs on
+ * the response path of a live SSE stream.
+ */
+export function deriveTokenPoolAggregate(payload: Record<string, unknown>): TokenPoolAggregate {
+  const rows: TokenAccountRow[] = Array.isArray(payload.accounts) ? (payload.accounts as TokenAccountRow[]) : [];
+
+  const usages = rows.map((row) => row?.usage_fraction).filter(isFiniteNumber);
+  const resets = rows
+    .map((row) => row?.limit_window_reset_at)
+    .filter((value): value is string => typeof value === "string" && value.length > 0)
+    .sort();
+
+  return {
+    account_count: rows.length,
+    exhausted_count: rows.filter((row) => row?.exhausted === true).length,
+    mean_usage_fraction: usages.length ? round4(usages.reduce((sum, u) => sum + u, 0) / usages.length) : null,
+    max_usage_fraction: usages.length ? round4(Math.max(...usages)) : null,
+    next_limit_window_reset_at: resets[0] ?? null,
+  };
+}
+
+/**
+ * Per-kind *derivations* layered on top of the field allowlist: fields the
+ * public view gets that are computed from redacted-away input rather than
+ * copied from it.
+ *
+ * Deliberately a second, separate step from `RECORD_FIELD_ALLOWLIST` so the
+ * fail-safe direction still holds: the allowlist alone decides what is
+ * *copied*, and deleting an entry here can only ever remove data from a
+ * public response, never add it. (Doing this as an allowlist entry plus an
+ * in-place rewrite would mean a future edit that skipped the rewrite leaked
+ * the raw field.)
+ */
+const PUBLIC_RECORD_DERIVATIONS: Readonly<Record<string, (payload: Record<string, unknown>) => Record<string, unknown>>> =
+  {
+    "tokens.snapshot": (payload) => deriveTokenPoolAggregate(payload) as unknown as Record<string, unknown>,
+  };
 
 /** The fail-safe allowlist for a `kind` this table does not (yet) recognize
  * — an unknown, forward-compatible record kind (per the schema doc's
@@ -119,6 +219,10 @@ export function redactPayload(kind: string, payload: Record<string, unknown>): R
     if (field in payload) {
       redacted[field] = payload[field];
     }
+  }
+  const derive = PUBLIC_RECORD_DERIVATIONS[kind];
+  if (derive) {
+    Object.assign(redacted, derive(payload));
   }
   return redacted;
 }
@@ -222,20 +326,32 @@ export interface RedactedFleetSnapshot {
 }
 
 /** Redact a full `FleetSnapshot`: every host's `health`/`tokens` entry is
- * projected through `redactPayload` (a no-op in practice today — see the
- * module doc — but kept on the same single mechanism as every other kind),
- * and every `activeSweeps` entry through `redactActiveSweep`. */
+ * projected through `redactPayload`, and every `activeSweeps` entry through
+ * `redactActiveSweep`.
+ *
+ * **An authenticated viewer's host entries are returned untouched.** This
+ * used to call `redactPayload` unconditionally, which was harmless only
+ * while every allowlist happened to name every field the schema defined. The
+ * moment one did not — `tokens.snapshot`, which now summarizes `accounts`
+ * for the public view — that would have stripped per-account detail from the
+ * authenticated dashboard too. The auth check belongs here, on the same
+ * footing as `redactActiveSweep`'s. */
 export function redactFleetSnapshot(snapshot: FleetSnapshot, isAuthenticated: boolean): RedactedFleetSnapshot {
   const hosts: FleetSnapshot["hosts"] = {};
   for (const [hostId, entry] of Object.entries(snapshot.hosts)) {
-    hosts[hostId] = {
-      ...(entry.health && {
-        health: { record: redactPayload("host.health", entry.health.record), updatedAt: entry.health.updatedAt },
-      }),
-      ...(entry.tokens && {
-        tokens: { record: redactPayload("tokens.snapshot", entry.tokens.record), updatedAt: entry.tokens.updatedAt },
-      }),
-    };
+    hosts[hostId] = isAuthenticated
+      ? entry
+      : {
+          ...(entry.health && {
+            health: { record: redactPayload("host.health", entry.health.record), updatedAt: entry.health.updatedAt },
+          }),
+          ...(entry.tokens && {
+            tokens: {
+              record: redactPayload("tokens.snapshot", entry.tokens.record),
+              updatedAt: entry.tokens.updatedAt,
+            },
+          }),
+        };
   }
   return {
     hosts,

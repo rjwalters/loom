@@ -10,6 +10,12 @@ export default defineWorkersConfig(async () => {
 
   return {
     test: {
+      // Backend tests only. Without this, Vitest's default glob also picks up
+      // `web/test/**` — the browser UI suite — and tries to run it inside the
+      // Workers runtime, where there is no DOM. The UI has its own runner
+      // (`web/vite.config.ts`, happy-dom): `npm run test:web`, or
+      // `npm run check:all` for both.
+      include: ["test/**/*.test.ts"],
       setupFiles: ["./test/apply-migrations.ts"],
       poolOptions: {
         workers: {

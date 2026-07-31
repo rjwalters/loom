@@ -2,16 +2,22 @@
   "name": "loom-observability-backend",
   "version": "0.1.0",
   "private": true,
-  "description": "Cloudflare Workers reference backend (ingest + storage) for the Loom fleet observability epic (#4702, Phase 2). Accepts pushed telemetry batches from loom-daemon's HttpsExporter, authenticates per-host, persists durable history to D1, and maintains live fleet state in a Durable Object.",
+  "description": "Cloudflare Workers reference backend (ingest + storage) for the Loom fleet observability epic (#4702, Phase 2) plus the Phase-3 dashboard UI in web/, served from the same Worker as static assets. Accepts pushed telemetry batches from loom-daemon's HttpsExporter, authenticates per-host, persists durable history to D1, and maintains live fleet state in a Durable Object.",
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
+    "predev": "bash scripts/ensure-web-dist.sh",
     "preflight": "bash scripts/check-deploy-config.sh",
-    "deploy": "wrangler deploy",
+    "install:web": "npm --prefix web install",
+    "build:web": "npm --prefix web run build",
+    "test:web": "npm --prefix web test",
+    "deploy": "npm run build:web && wrangler deploy",
+    "pretest": "bash scripts/ensure-web-dist.sh",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
-    "check": "npm run typecheck && npm run test"
+    "check": "npm run typecheck && npm run test",
+    "check:all": "npm run check && npm --prefix web run check"
   },
   "dependencies": {
     "jose": "^6.2.6"

@@ -1,4 +1,3 @@
-// @vitest-environment jsdom
 import { describe, expect, it } from "vitest";
 import { SweepTimelineView, prLinkFor, renderSweepTimeline } from "../src/sweepTimelineView.js";
 import type { SweepPhaseRecord, SweepOutcomeRecord } from "../src/types.js";

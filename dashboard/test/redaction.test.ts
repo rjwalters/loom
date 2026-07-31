@@ -1,7 +1,8 @@
 import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import worker from "../src/index";
 import {
+  deriveTokenPoolAggregate,
   redactActiveSweep,
   redactFleetSnapshot,
   redactHistoryQueryResult,
@@ -12,7 +13,10 @@ import {
 import type { HistoryRecord } from "../src/query";
 import type { ActiveSweepState, FleetSnapshot } from "../src/fleetState";
 import {
+  authedRequest,
   hostHealthEnvelope,
+  initAccessTestKeys,
+  mockJwksFetch,
   seedHost,
   sweepCompletedEnvelope,
   sweepOutcomeEnvelope,
@@ -49,6 +53,14 @@ function ingestRequest(body: unknown, authHeader = "Bearer abc-ingest-key"): Req
 async function ingest(envelopes: unknown[]): Promise<Response> {
   return callWorker(ingestRequest(envelopes));
 }
+
+beforeAll(async () => {
+  // `/api/*` verifies the Access JWT in-Worker (src/index.ts), so this suite
+  // needs a real signed cookie and a stubbed JWKS endpoint. Installed once —
+  // nothing here tests the failure path, which is index.test.ts's job.
+  await initAccessTestKeys();
+  mockJwksFetch();
+});
 
 beforeEach(async () => {
   await seedHost(env.DB, "host-abc", "abc-ingest-key");
@@ -140,13 +152,39 @@ describe("redactPayload — per-kind field allowlist", () => {
     expect(redacted).not.toHaveProperty("pr_number");
   });
 
-  it("tokens.snapshot: host-level, no repo/issue reference — passes through unchanged (documented decision)", () => {
-    const payload = {
+  it("tokens.snapshot: per-account rows are replaced by a non-identifying aggregate", () => {
+    const redacted = redactPayload("tokens.snapshot", {
       kind: "tokens.snapshot",
       captured_at: "2026-07-30T12:00:00Z",
-      accounts: [{ account: "agent-1", rank: 0, usage_fraction: 0.42, exhausted: false }],
-    };
-    expect(redactPayload("tokens.snapshot", payload)).toEqual(payload);
+      accounts: [
+        { account: "agent-1", rank: 0, usage_fraction: 0.42, exhausted: false },
+        { account: "agent-2", rank: 1, usage_fraction: 0.9, exhausted: false },
+        { account: "agent-3", rank: 2, usage_fraction: 0, exhausted: true },
+      ],
+    });
+
+    expect(redacted).toEqual({
+      kind: "tokens.snapshot",
+      captured_at: "2026-07-30T12:00:00Z",
+      account_count: 3,
+      exhausted_count: 1,
+      mean_usage_fraction: 0.44,
+      max_usage_fraction: 0.9,
+      next_limit_window_reset_at: null,
+    });
+  });
+
+  it("tokens.snapshot: no account identifier survives, at any depth", () => {
+    const serialized = JSON.stringify(
+      redactPayload("tokens.snapshot", {
+        kind: "tokens.snapshot",
+        captured_at: "2026-07-30T12:00:00Z",
+        accounts: [{ account: "agent5-2amlogic", rank: 4, usage_fraction: 0.91, exhausted: false }],
+      }),
+    );
+    expect(serialized).not.toContain("agent5-2amlogic");
+    expect(serialized).not.toContain("accounts");
+    expect(serialized).not.toContain("rank");
   });
 
   it("host.health: host-level, no repo/issue reference — passes through unchanged (documented decision)", () => {
@@ -304,6 +342,105 @@ describe("redactFleetSnapshot", () => {
     expect(redacted.hosts["host-abc"]?.health?.record).toEqual({ kind: "host.health", uptime_sec: 100 });
     expect(redacted.activeSweeps[0]).not.toHaveProperty("sweepId");
   });
+
+  it("summarizes the token pool for a public viewer", () => {
+    const snapshot: FleetSnapshot = {
+      hosts: {
+        "host-abc": {
+          tokens: {
+            record: {
+              kind: "tokens.snapshot",
+              accounts: [
+                { account: "agent-1", rank: 0, usage_fraction: 0.5, exhausted: false },
+                { account: "agent-2", rank: 1, usage_fraction: 0, exhausted: true },
+              ],
+            },
+            updatedAt: "2026-07-30T12:00:00Z",
+          },
+        },
+      },
+      activeSweeps: [],
+    };
+
+    const record = redactFleetSnapshot(snapshot, false).hosts["host-abc"]?.tokens?.record;
+    expect(record).toMatchObject({ account_count: 2, exhausted_count: 1, max_usage_fraction: 0.5 });
+    expect(record).not.toHaveProperty("accounts");
+  });
+
+  // Regression: this function used to project host entries through
+  // `redactPayload` unconditionally, ignoring `isAuthenticated`. That was
+  // invisible while every allowlist named every schema field; once
+  // `tokens.snapshot` started summarizing `accounts`, it would have stripped
+  // per-account detail from the signed-in dashboard as well.
+  it("leaves an authenticated viewer's host entries untouched", () => {
+    const accounts = [{ account: "agent-1", rank: 0, usage_fraction: 0.5, exhausted: false }];
+    const snapshot: FleetSnapshot = {
+      hosts: {
+        "host-abc": {
+          tokens: { record: { kind: "tokens.snapshot", accounts }, updatedAt: "2026-07-30T12:00:00Z" },
+        },
+      },
+      activeSweeps: [],
+    };
+
+    const record = redactFleetSnapshot(snapshot, true).hosts["host-abc"]?.tokens?.record;
+    expect(record).toEqual({ kind: "tokens.snapshot", accounts });
+  });
+});
+
+describe("deriveTokenPoolAggregate", () => {
+  it("reports null rather than a misleading zero when no account measured usage", () => {
+    expect(deriveTokenPoolAggregate({ accounts: [{ account: "a", exhausted: false }] })).toEqual({
+      account_count: 1,
+      exhausted_count: 0,
+      mean_usage_fraction: null,
+      max_usage_fraction: null,
+      next_limit_window_reset_at: null,
+    });
+  });
+
+  it("averages only over accounts that reported a usage_fraction", () => {
+    const aggregate = deriveTokenPoolAggregate({
+      accounts: [{ usage_fraction: 0.2 }, { usage_fraction: 0.8 }, { exhausted: true }],
+    });
+    expect(aggregate.mean_usage_fraction).toBe(0.5);
+    expect(aggregate.max_usage_fraction).toBe(0.8);
+    expect(aggregate.account_count).toBe(3);
+  });
+
+  it("takes the earliest limit-window reset across the pool", () => {
+    const aggregate = deriveTokenPoolAggregate({
+      accounts: [
+        { limit_window_reset_at: "2026-07-30T18:00:00Z" },
+        { limit_window_reset_at: "2026-07-30T14:00:00Z" },
+      ],
+    });
+    expect(aggregate.next_limit_window_reset_at).toBe("2026-07-30T14:00:00Z");
+  });
+
+  // This runs on a live SSE response path, so a malformed payload must
+  // degrade rather than throw and kill the stream.
+  it.each([
+    ["accounts absent", {}],
+    ["accounts not an array", { accounts: "nope" }],
+    ["accounts null", { accounts: null }],
+  ])("degrades to a zero-count aggregate when %s", (_label, payload) => {
+    expect(deriveTokenPoolAggregate(payload as Record<string, unknown>)).toEqual({
+      account_count: 0,
+      exhausted_count: 0,
+      mean_usage_fraction: null,
+      max_usage_fraction: null,
+      next_limit_window_reset_at: null,
+    });
+  });
+
+  it("ignores non-finite usage values rather than propagating NaN", () => {
+    const aggregate = deriveTokenPoolAggregate({
+      accounts: [{ usage_fraction: Number.NaN }, { usage_fraction: 0.4 }],
+    });
+    expect(aggregate.mean_usage_fraction).toBe(0.4);
+    expect(aggregate.max_usage_fraction).toBe(0.4);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -403,24 +540,43 @@ describe("GET /public/history vs GET /api/history — end-to-end redaction", () 
         expect(publicText).not.toContain("4710"); // pr_number
       }
 
-      const authResponse = await callWorker(new Request("https://ingest.example/api/history"));
+      const authResponse = await callWorker(await authedRequest("https://ingest.example/api/history"));
       const authText = await authResponse.text();
       expect(authText).toContain("rjwalters/loom");
       expect(authText).toContain("sweep-issue-4703-0");
     });
   }
 
-  it("tokens.snapshot and host.health (host-level, no repo/visibility) pass through unredacted on the public route", async () => {
+  it("host.health passes through unredacted on the public route; tokens.snapshot is aggregated", async () => {
     await ingest([tokensSnapshotEnvelope(), hostHealthEnvelope()]);
 
     const publicResponse = await callWorker(new Request("https://ingest.example/public/history"));
-    const body = (await publicResponse.json()) as {
+    const publicText = await publicResponse.text();
+    const body = JSON.parse(publicText) as {
       records: { kind: string; record: Record<string, unknown> }[];
     };
     const tokensRecord = body.records.find((r) => r.kind === "tokens.snapshot");
     const healthRecord = body.records.find((r) => r.kind === "host.health");
-    expect(tokensRecord?.record).toMatchObject({ accounts: [{ account: "agent-1" }] });
+
+    // Capacity telemetry: fully public.
     expect(healthRecord?.record).toMatchObject({ daemon_version: "0.16.0", uptime_sec: 100 });
+
+    // Token pool: aggregate only — no account names, no per-account rows.
+    expect(tokensRecord?.record).toMatchObject({ account_count: 1, exhausted_count: 0 });
+    expect(tokensRecord?.record).not.toHaveProperty("accounts");
+    expect(publicText).not.toContain("agent-1");
+  });
+
+  it("the authenticated route still serves the full per-account token rows", async () => {
+    await ingest([tokensSnapshotEnvelope()]);
+
+    const response = await callWorker(await authedRequest("https://ingest.example/api/history"));
+    const body = (await response.json()) as {
+      records: { kind: string; record: Record<string, unknown> }[];
+    };
+    const tokensRecord = body.records.find((r) => r.kind === "tokens.snapshot");
+    expect(tokensRecord?.record).toMatchObject({ accounts: [{ account: "agent-1" }] });
+    expect(tokensRecord?.record).not.toHaveProperty("account_count");
   });
 
   it("a public-visibility record is returned in full on the public route (no over-redaction)", async () => {
@@ -460,7 +616,7 @@ describe("GET /public/fleet-state vs GET /api/fleet-state — end-to-end redacti
     expect(publicBody.activeSweeps).toHaveLength(1);
     expect(publicBody.activeSweeps[0]?.hostId).toBe("host-abc");
 
-    const authResponse = await callWorker(new Request("https://ingest.example/api/fleet-state"));
+    const authResponse = await callWorker(await authedRequest("https://ingest.example/api/fleet-state"));
     const authText = await authResponse.text();
     expect(authText).toContain("rjwalters/loom");
     expect(authText).toContain("sweep-issue-4703-0");

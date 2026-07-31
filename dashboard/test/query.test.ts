@@ -1,7 +1,13 @@
 import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import worker from "../src/index";
-import { seedHost, sweepStartedEnvelope } from "./testHelpers";
+import {
+  authedRequest,
+  initAccessTestKeys,
+  mockJwksFetch,
+  seedHost,
+  sweepStartedEnvelope,
+} from "./testHelpers";
 
 async function callWorker(request: Request): Promise<Response> {
   const ctx = createExecutionContext();
@@ -41,6 +47,14 @@ function outcomeEnvelope(overrides: Partial<Record<string, unknown>> = {}): Reco
   };
 }
 
+beforeAll(async () => {
+  // `/api/*` verifies the Access JWT in-Worker (src/index.ts), so this suite
+  // needs a real signed cookie and a stubbed JWKS endpoint. Installed once —
+  // nothing here tests the failure path, which is index.test.ts's job.
+  await initAccessTestKeys();
+  mockJwksFetch();
+});
+
 beforeEach(async () => {
   await seedHost(env.DB, "host-abc", "abc-ingest-key");
 });
@@ -49,7 +63,7 @@ describe("GET /api/fleet-state", () => {
   it("returns the fleet snapshot with no admin token required", async () => {
     await ingest([sweepStartedEnvelope()]);
 
-    const response = await callWorker(new Request("https://ingest.example/api/fleet-state"));
+    const response = await callWorker(await authedRequest("https://ingest.example/api/fleet-state"));
     expect(response.status).toBe(200);
     const body = (await response.json()) as {
       hosts: Record<string, unknown>;
@@ -69,7 +83,7 @@ describe("GET /api/history — filtering", () => {
       "Bearer xyz-ingest-key",
     );
 
-    const response = await callWorker(new Request("https://ingest.example/api/history?host=host-abc"));
+    const response = await callWorker(await authedRequest("https://ingest.example/api/history?host=host-abc"));
     expect(response.status).toBe(200);
     const body = (await response.json()) as { records: { hostId: string }[] };
     expect(body.records).toHaveLength(1);
@@ -83,7 +97,7 @@ describe("GET /api/history — filtering", () => {
     ]);
 
     const response = await callWorker(
-      new Request("https://ingest.example/api/history?repo=rjwalters/anvil"),
+      await authedRequest("https://ingest.example/api/history?repo=rjwalters/anvil"),
     );
     const body = (await response.json()) as { records: { repo: string | null }[] };
     expect(body.records).toHaveLength(1);
@@ -96,7 +110,7 @@ describe("GET /api/history — filtering", () => {
       outcomeEnvelope({ sweep_id: "sweep-sonnet", model: "sonnet" }),
     ]);
 
-    const response = await callWorker(new Request("https://ingest.example/api/history?model=sonnet"));
+    const response = await callWorker(await authedRequest("https://ingest.example/api/history?model=sonnet"));
     const body = (await response.json()) as { records: { record: { model?: string } }[] };
     expect(body.records).toHaveLength(1);
     expect(body.records[0]?.record.model).toBe("sonnet");
@@ -108,7 +122,7 @@ describe("GET /api/history — filtering", () => {
       outcomeEnvelope({ sweep_id: "sweep-bad", result: "failure" }),
     ]);
 
-    const response = await callWorker(new Request("https://ingest.example/api/history?result=failure"));
+    const response = await callWorker(await authedRequest("https://ingest.example/api/history?result=failure"));
     const body = (await response.json()) as { records: { record: { result?: string } }[] };
     expect(body.records).toHaveLength(1);
     expect(body.records[0]?.record.result).toBe("failure");
@@ -123,14 +137,14 @@ describe("GET /api/history — filtering", () => {
     ]);
 
     const response = await callWorker(
-      new Request("https://ingest.example/api/history?since=2026-07-31T00:00:00Z"),
+      await authedRequest("https://ingest.example/api/history?since=2026-07-31T00:00:00Z"),
     );
     const body = (await response.json()) as { records: { sweepId: string | null }[] };
     expect(body.records).toHaveLength(1);
     expect(body.records[0]?.sweepId).toBe("sweep-late");
 
     const untilResponse = await callWorker(
-      new Request("https://ingest.example/api/history?until=2026-07-31T00:00:00Z"),
+      await authedRequest("https://ingest.example/api/history?until=2026-07-31T00:00:00Z"),
     );
     const untilBody = (await untilResponse.json()) as { records: { sweepId: string | null }[] };
     expect(untilBody.records).toHaveLength(1);
@@ -138,13 +152,13 @@ describe("GET /api/history — filtering", () => {
   });
 
   it("rejects an unparseable since/until/limit/cursor with 400", async () => {
-    const badSince = await callWorker(new Request("https://ingest.example/api/history?since=not-a-date"));
+    const badSince = await callWorker(await authedRequest("https://ingest.example/api/history?since=not-a-date"));
     expect(badSince.status).toBe(400);
 
-    const badLimit = await callWorker(new Request("https://ingest.example/api/history?limit=0"));
+    const badLimit = await callWorker(await authedRequest("https://ingest.example/api/history?limit=0"));
     expect(badLimit.status).toBe(400);
 
-    const badCursor = await callWorker(new Request("https://ingest.example/api/history?cursor=abc"));
+    const badCursor = await callWorker(await authedRequest("https://ingest.example/api/history?cursor=abc"));
     expect(badCursor.status).toBe(400);
   });
 });
@@ -158,7 +172,7 @@ describe("GET /api/history — pagination", () => {
     );
     await ingest(envelopes);
 
-    const firstPage = await callWorker(new Request("https://ingest.example/api/history?limit=2"));
+    const firstPage = await callWorker(await authedRequest("https://ingest.example/api/history?limit=2"));
     const firstBody = (await firstPage.json()) as {
       records: { sweepId: string | null }[];
       nextCursor: number | null;
@@ -169,7 +183,7 @@ describe("GET /api/history — pagination", () => {
     expect(firstBody.records[0]?.sweepId).toBe("sweep-4");
 
     const secondPage = await callWorker(
-      new Request(`https://ingest.example/api/history?limit=2&cursor=${firstBody.nextCursor}`),
+      await authedRequest(`https://ingest.example/api/history?limit=2&cursor=${firstBody.nextCursor}`),
     );
     const secondBody = (await secondPage.json()) as {
       records: { sweepId: string | null }[];
@@ -179,7 +193,7 @@ describe("GET /api/history — pagination", () => {
     expect(secondBody.records.map((r) => r.sweepId)).toEqual(["sweep-2", "sweep-1"]);
 
     const thirdPage = await callWorker(
-      new Request(`https://ingest.example/api/history?limit=2&cursor=${secondBody.nextCursor}`),
+      await authedRequest(`https://ingest.example/api/history?limit=2&cursor=${secondBody.nextCursor}`),
     );
     const thirdBody = (await thirdPage.json()) as {
       records: { sweepId: string | null }[];
@@ -197,7 +211,7 @@ describe("GET /api/events — live tail", () => {
     // (`LIVE_TAIL_DEFAULT_POLL_INTERVAL_MS`, 1s) — this test's own timeout
     // below gives it several polls' worth of headroom.
     const response = await callWorker(
-      new Request("https://ingest.example/api/events", {
+      await authedRequest("https://ingest.example/api/events", {
         headers: { accept: "text/event-stream" },
       }),
     );
@@ -245,7 +259,7 @@ describe("GET /api/events — live tail", () => {
   it("filters the live tail by host", async () => {
     await seedHost(env.DB, "host-xyz", "xyz-ingest-key");
 
-    const response = await callWorker(new Request("https://ingest.example/api/events?host=host-xyz"));
+    const response = await callWorker(await authedRequest("https://ingest.example/api/events?host=host-xyz"));
     const reader = response.body?.getReader();
     if (!reader) throw new Error("expected a readable stream body");
     const decoder = new TextDecoder();

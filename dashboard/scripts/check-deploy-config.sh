@@ -166,6 +166,31 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 5b. Static assets — the dashboard UI this Worker also serves.
+#
+# `[assets] directory` must exist or Wrangler refuses to parse the config at
+# all, so ensure it first (that script writes a placeholder when the UI has
+# never been built). A placeholder is a warning, not an error: the backend is
+# perfectly deployable without the UI, but shipping the "not built" page to a
+# real hostname is almost never what someone meant.
+# ---------------------------------------------------------------------------
+assets_rel="$(printf '%s\n' "$ACTIVE" |
+  grep -E '^[[:space:]]*directory[[:space:]]*=' |
+  head -1 |
+  sed -E 's/.*=[[:space:]]*"([^"]*)".*/\1/')"
+if [ -n "$assets_rel" ]; then
+  bash "$SCRIPT_DIR/ensure-web-dist.sh"
+  assets_dir="$APP_DIR/${assets_rel#./}"
+  if [ ! -d "$assets_dir" ]; then
+    fail "assets directory '$assets_rel' does not exist and could not be created"
+  elif grep -q 'loom-dashboard-placeholder' "$assets_dir/index.html" 2>/dev/null; then
+    warn "the dashboard UI is a placeholder — run 'npm run install:web && npm run build:web' to bundle the real one ('npm run deploy' does this for you)"
+  else
+    pass "dashboard UI built into $assets_rel"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 # 6. Wrangler availability + bundle dry run
 # ---------------------------------------------------------------------------
 WRANGLER=""

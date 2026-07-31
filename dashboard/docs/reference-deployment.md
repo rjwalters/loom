@@ -113,33 +113,70 @@ covered by the same rule; no per-instance gitignore edits are needed.
 
 ## 4. Cloudflare Access layout
 
-**Status check performed at doc-writing time (2026-07-31)**: issue
-[#4795](https://github.com/rjwalters/loom/issues/4795) (the single-URL
-fallback re-plumb) is still open (`loom:building`, not yet merged) — no PR
-for it exists yet. `dashboard/src/index.ts` and
-[`cloudflare-access.md`](cloudflare-access.md) on `origin/main` still
-describe the **app-per-path layout** below, so that is what is actually live
-for the 2AM instance today. **Re-check this section against #4795's state
-before relying on it** — once #4795 merges and changes the live Access
-layout, this section needs a follow-up edit (it does not auto-update).
+**Read against the live API, 2026-07-31.** An earlier revision of this
+section described an app-per-path layout with dedicated `/login`, `/api/*`
+and `/admin/*` applications. **That was never live.** The account actually
+had one hostname-wide app plus three bypasses, which matters a great deal:
+the hostname-wide app was the only thing gating `/api/*`, so deleting it to
+open `/` — the whole point of the single-URL re-plumb — would have exposed
+the unredacted fleet. Verify with the API before trusting any table here:
 
-Per [`cloudflare-access.md`](cloudflare-access.md)'s route map, the 2AM
-instance's Zero Trust → Access → Applications configuration is:
+```bash
+set -a; . ~/.cloudflare/2amlogic/access-2amlogic.env; set +a
+curl -sS -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+  "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/access/apps?per_page=50"
+```
 
-| Application | Public hostname / path | Action | Policy |
+### Current applications
+
+| Application | Path | Action | App ID / AUD |
 |---|---|---|---|
-| `loom-dashboard (private)` (root app) | `dashboard.2amlogic.com` (no path — everything not matched by a more specific app) | Allow | Emails ending in `2amlogic.com`, plus `rjwalters@gmail.com` explicitly (an out-of-domain address that still needs access); **non_identity policy**: a service token (§5 below) for scripted `/admin` calls |
-| `loom-dashboard ingest (bypass)` | `dashboard.2amlogic.com/ingest` | Bypass | Everyone (machine-to-machine — authenticated by the ingest key instead, see `src/auth.ts`) |
-| `loom-dashboard public view (bypass)` | `dashboard.2amlogic.com/public` | Bypass | Everyone (the deliberately public, redacted fleet view) |
-| *(bypass app for `/healthz`)* | `dashboard.2amlogic.com/healthz` | Bypass | Everyone |
+| `Loom Fleet Dashboard (dashboard.2amlogic.com)` — **root app, to be deleted** | `dashboard.2amlogic.com` (everything not matched by a more specific app) | Allow (+ service-token `non_identity`) | `facc1038-3095-4a43-8b62-6483d0bdac39` / `79a6896a0fbdd555ee1aef4cbacf37e80667d0b4a2f2738f81495c4974a874a6` |
+| `loom-dashboard login (cookie mint)` | `/login` | Allow | `e1855040-f181-421b-9b86-2db037fe57e8` / `78838a7fdc48659bf54eec1525822827f812feb4463807ac5dcfe35d1c92c28a` |
+| `loom-dashboard admin` | `/admin` | Allow + service-token `non_identity` | `4267ee80-138b-4a47-9fe2-1f3917500282` / `9426832665cfa69a4f9134eeae549d8c4fad424f7f9fc8fe5b24acfa6d8ce5b7` |
+| `loom-dashboard ingest (bypass)` | `/ingest` | Bypass everyone | `c8edf172-05b3-4a7a-9c15-75079b224e21` |
+| `loom-dashboard public view (bypass)` | `/public` | Bypass everyone | `5c2c787a-4311-4d2c-8c17-6f7ddb8cc4d5` |
+| `Loom Fleet Dashboard healthz (public)` | `/healthz` | Bypass everyone | `732fb318-706e-47e4-97bd-c8122ee3d3ff` |
 
-**App IDs**: not recorded in this doc — record them here once you have them
-from the Zero Trust dashboard (**Access → Applications**, each app's overview
-page shows its ID and Audience/AUD tag) or `curl` the Access Apps API
-(`cloudflare-access.md` §7). Treat the table above as the *shape* to
-reproduce; fill in the actual IDs as an edit to this file once you have them
-to hand, since this doc was written without direct Cloudflare dashboard
-access.
+The identity policy on both Allow apps is `email_domain: 2amlogic.com` OR
+`email: rjwalters@gmail.com`. `allowed_idps: []` (all — Google + one-time
+PIN). The `/admin` app sets `path_cookie_attribute: true` so its session
+cookie is scoped to `/admin` and cannot overwrite the root-scoped cookie the
+Worker validates at `/`.
+
+AUD tags and app IDs are **not secrets** — the AUD is visible in the Access
+redirect URL of any unauthenticated request — so they are recorded here on
+purpose. The service token's *secret* is not, and lives only in §5's file.
+
+### Cutover: the root app is still live, deliberately
+
+`/login` and `/admin` were created ahead of time because they are additive —
+both paths were already covered by the root app's identical policy, so
+adding them changed no behavior. **Deleting the root app is the cutover, and
+it must happen only after** a Worker carrying `src/index.ts`'s in-Worker
+`/api/*` JWT check is deployed *and* configured with:
+
+```
+CF_ACCESS_TEAM_DOMAIN = 2amlogic.cloudflareaccess.com
+CF_ACCESS_AUD         = 78838a7fdc48659bf54eec1525822827f812feb4463807ac5dcfe35d1c92c28a
+```
+
+`CF_ACCESS_AUD` is the **`/login` app's** AUD, because that is the app that
+mints the `CF_Authorization` cookie the Worker validates. Getting this wrong
+does not fail loudly: `accessAuth.ts` fails closed, so a mismatched or unset
+AUD simply renders the public view to a signed-in operator forever.
+
+As of 2026-07-31 the deployed Worker (`loom-fleet-dashboard`) has **neither
+variable set** and predates the single-URL code, so the cutover is not yet
+safe to perform. Order:
+
+1. Merge #4759 and #4760.
+2. `wrangler deploy` with both vars set (see §3's overlay pattern).
+3. Verify: `/api/fleet-state` returns `401` for an anonymous `curl`, and the
+   signed-in dashboard still renders. **Both** must hold.
+4. Only then delete app `facc1038-3095-4a43-8b62-6483d0bdac39`.
+
+Rollback is recreating a hostname-wide Allow app with the policy above.
 
 **`/healthz` discrepancy**: `dashboard/src/index.ts` does not implement a
 dedicated `/healthz` route today (only `/`, `/ingest`, `/admin/*`, `/api/*`,

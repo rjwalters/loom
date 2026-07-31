@@ -1,13 +1,13 @@
 # loom-observability-backend
 
 Cloudflare Workers reference backend for the Loom fleet observability epic
-([#4702](https://github.com/rjwalters/loom/issues/4702), Phase 2). Accepts
-the telemetry batches `loom-daemon`'s `HttpsExporter`
+([#4702](https://github.com/rjwalters/loom/issues/4702), Phase 2), **plus the
+Phase-3 dashboard UI in [`web/`](web/)** which the same Worker serves as
+static assets. Accepts the telemetry batches `loom-daemon`'s `HttpsExporter`
 (`loom-daemon/src/observability/exporter.rs`, Phase 1 — #4705) pushes,
 authenticates the sending host, persists durable history to D1, maintains a
-live "what is running right now" snapshot in a Durable Object, and exposes
-the read-side query API + live tail (issue #4726) the Phase 3 dashboard UI
-consumes.
+live "what is running right now" snapshot in a Durable Object, and exposes the
+read-side query API + live tail (issue #4726) that the dashboard UI consumes.
 
 Wire format reference: [`.loom/docs/telemetry-schema.md`](../.loom/docs/telemetry-schema.md).
 Query API reference: [`docs/query-api.md`](docs/query-api.md) — includes the
@@ -27,6 +27,11 @@ covers and its fail-closed contract.
 
 ## Architecture
 
+- **Static assets** (`web/dist`, built from `web/`) — the Phase-3 dashboard UI,
+  uploaded with this Worker so the UI and the API share one hostname and
+  therefore one Cloudflare Access policy. Requests that do not match a built
+  file fall through to the Worker routes below
+  (`not_found_handling = "none"`). See [`web/README.md`](web/README.md).
 - **D1** (`records` table) — durable history of every accepted record, one
   row per record, indexed for `host_id`/`repo`/time-range queries. Bounded
   by the retention sweep (age + size caps — see `src/retention.ts`).
@@ -43,6 +48,13 @@ npm install
 npx wrangler d1 migrations apply loom-observability --local
 npm run dev          # wrangler dev — binds DB/FLEET_STATE locally
 ```
+
+`npm run dev` (like `npm test` and `npm run preflight`) first runs
+`scripts/ensure-web-dist.sh`, because `wrangler.toml`'s `[assets] directory`
+must exist before Wrangler will parse the config at all. That script writes a
+labelled placeholder page when the UI has not been built; build the real one
+with `npm run install:web && npm run build:web`. For UI development with hot
+reload, run Vite alongside `wrangler dev` — see [`web/README.md`](web/README.md).
 
 `wrangler dev` does not read `wrangler.toml`'s `[vars]`-declared secrets —
 set `ADMIN_TOKEN` for local testing via a `.dev.vars` file (gitignored,
@@ -78,7 +90,13 @@ curl http://localhost:8787/admin/fleet-state -H 'authorization: Bearer local-dev
 npm test          # vitest run, via @cloudflare/vitest-pool-workers (Miniflare)
 npm run typecheck # tsc --noEmit
 npm run check     # both
+npm run test:web  # the UI suite (happy-dom) — a separate runner, see below
+npm run check:all # backend + UI
 ```
+
+The UI has its own Vitest runner (`web/vite.config.ts`, happy-dom): browser
+code cannot run inside the Workers runtime, so this project's
+`vitest.config.ts` scopes itself to `test/**` and never picks up `web/test/**`.
 
 Every test runs inside the real Workers runtime (Miniflare) against an
 isolated in-memory D1 instance with `migrations/` applied — see
@@ -92,8 +110,9 @@ The short version:
 npx wrangler login
 npx wrangler d1 create loom-observability      # paste database_id into wrangler.toml
 npx wrangler d1 migrations apply loom-observability --remote
+npm run install:web                            # once, for the dashboard UI
 npm run preflight                              # fails while any template placeholder remains
-npm run deploy
+npm run deploy                                 # builds web/ then wrangler deploy
 npx wrangler secret put ADMIN_TOKEN            # gates every /admin/* route
 ```
 
@@ -118,6 +137,7 @@ asserts the `ADMIN_TOKEN` secret exists on the deployed Worker.
 
 | Route | Auth | Purpose |
 |---|---|---|
+| `GET /` + `/assets/*` | none in-Worker — put behind Cloudflare Access | The dashboard UI (static assets built from `web/`). Served by the asset router before any Worker code runs; the plain-text banner in `src/index.ts` is only the fallback when no assets are uploaded. |
 | `POST /ingest` | `Authorization: Bearer <ingest_key>` | Accept a batch (bare JSON array of `TelemetryEnvelope`s). |
 | `POST /admin/hosts` | `Authorization: Bearer <ADMIN_TOKEN>` | Provision a host + ingest key (`{"host_id": "..."}`, optional `"key"` to bring your own). |
 | `POST /admin/hosts/:hostId/revoke` | `Authorization: Bearer <ADMIN_TOKEN>` | Revoke a host's key. |

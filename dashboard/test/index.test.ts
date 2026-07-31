@@ -69,6 +69,21 @@ async function signToken(overrides: { aud?: string; expiresIn?: string } = {}): 
  * `/` and must appear on the authenticated one — that pairing is what proves
  * the root route's branch actually swaps redacted for unredacted data, not
  * just the page's heading. */
+/**
+ * Assert which dataset `GET /` told the UI it may request.
+ *
+ * `handleRoot` serves the built SPA shell (`web/dist/index.html` via the
+ * `ASSETS` binding) and stamps the auth decision into `window.__LOOM_FLEET__`
+ * — so the injected flag, not a rendered heading, is where the Access-JWT
+ * verdict is now observable. Asserted as the exact serialized form, since a
+ * substring like `"authenticated"` alone would pass on either value. When no
+ * UI build is present the Worker falls back to the server-rendered page,
+ * which `publicPage.test.ts` covers.
+ */
+function expectAuthState(html: string, authenticated: boolean): void {
+  expect(html).toContain(`window.__LOOM_FLEET__={"authenticated":${authenticated}};`);
+}
+
 const PRIVATE_REPO = "rjwalters/root-route-private-repo";
 const PRIVATE_SWEEP_ID = "sweep-issue-7777-0";
 
@@ -128,10 +143,10 @@ describe("GET / — Access JWT wired end to end (real createRemoteJWKSet path)",
     );
 
     expect(response.status).toBe(200);
-    expect(await response.text()).toContain("Public View");
+    expectAuthState(await response.text(), false);
   });
 
-  it("a valid, correctly-audienced CF_Authorization cookie renders the authenticated dashboard", async () => {
+  it("a valid, correctly-audienced CF_Authorization cookie entitles the UI to the authenticated dataset", async () => {
     restoreFetch = mockJwksFetch();
     const token = await signToken();
 
@@ -140,13 +155,15 @@ describe("GET / — Access JWT wired end to end (real createRemoteJWKSet path)",
     );
 
     expect(response.status).toBe(200);
-    const html = await response.text();
-    expect(html).toContain("Dashboard");
-    expect(html).not.toContain("Sign in");
-    expect(html).toContain("/api/events");
+    expectAuthState(await response.text(), true);
   });
 
-  it("the authenticated variant serves UNREDACTED data the public variant withholds", async () => {
+  it("the shell embeds no fleet data in either variant — the dataset split is enforced at /api vs /public", async () => {
+    // The SPA shell is the same static bytes for everyone plus a one-line
+    // auth flag; it carries no snapshot at all. That is a stronger property
+    // than the server-rendered page's "redact before embedding": there is
+    // nothing to leak in the document, so the only surface that can leak is
+    // the API, which `redaction.test.ts` pins directly.
     restoreFetch = mockJwksFetch();
     await ingestPrivateRecord();
 
@@ -154,13 +171,75 @@ describe("GET / — Access JWT wired end to end (real createRemoteJWKSet path)",
     const anonymousHtml = await anonymous.text();
     expect(anonymousHtml).not.toContain(PRIVATE_REPO);
     expect(anonymousHtml).not.toContain(PRIVATE_SWEEP_ID);
+    expectAuthState(anonymousHtml, false);
 
     const token = await signToken();
     const authenticated = await callWorker(
       new Request("https://ingest.example/", { headers: { cookie: `CF_Authorization=${token}` } }),
     );
     const authenticatedHtml = await authenticated.text();
-    expect(authenticatedHtml).toContain(PRIVATE_REPO);
+    expect(authenticatedHtml).not.toContain(PRIVATE_REPO);
+    expect(authenticatedHtml).not.toContain(PRIVATE_SWEEP_ID);
+    expectAuthState(authenticatedHtml, true);
+
+    // ...and the data itself still splits the way the flag promises. Asserted
+    // against `/history`, not `/fleet-state`: the fixture is a terminal
+    // `sweep.outcome`, which lands in D1 history rather than the Durable
+    // Object's live-sweep snapshot.
+    const publicHistory = await callWorker(new Request("https://ingest.example/public/history"));
+    const publicBody = await publicHistory.text();
+    expect(publicBody).not.toContain(PRIVATE_REPO);
+    expect(publicBody).not.toContain(PRIVATE_SWEEP_ID);
+
+    const apiHistory = await callWorker(
+      new Request("https://ingest.example/api/history", { headers: { cookie: `CF_Authorization=${token}` } }),
+    );
+    expect(await apiHistory.text()).toContain(PRIVATE_REPO);
+  });
+
+  // The reason `/api/*` verifies the JWT itself: serving the public view at
+  // `/` requires deleting the hostname-wide Access application, which is
+  // also the only thing that was gating `/api/*` at the edge. If these ever
+  // start passing without a cookie, the unredacted fleet is public.
+  it.each([
+    ["/api/fleet-state", "https://ingest.example/api/fleet-state"],
+    ["/api/history", "https://ingest.example/api/history"],
+    ["/api/events", "https://ingest.example/api/events"],
+  ])("%s refuses an anonymous request", async (_label, url) => {
+    restoreFetch = mockJwksFetch();
+    const response = await callWorker(new Request(url));
+
+    expect(response.status).toBe(401);
+    expect(await response.text()).not.toContain(PRIVATE_REPO);
+  });
+
+  it("/api/* refuses a token this Worker's audience does not accept", async () => {
+    restoreFetch = mockJwksFetch();
+    const token = await signToken({ aud: "some-other-apps-aud-tag" });
+
+    const response = await callWorker(
+      new Request("https://ingest.example/api/fleet-state", {
+        headers: { cookie: `CF_Authorization=${token}` },
+      }),
+    );
+    expect(response.status).toBe(401);
+  });
+
+  it("/api/* refuses an expired token", async () => {
+    restoreFetch = mockJwksFetch();
+    const token = await signToken({ expiresIn: "-10m" });
+
+    const response = await callWorker(
+      new Request("https://ingest.example/api/history", {
+        headers: { cookie: `CF_Authorization=${token}` },
+      }),
+    );
+    expect(response.status).toBe(401);
+  });
+
+  it("/public/* stays reachable anonymously — the split is auth, not obscurity", async () => {
+    const response = await callWorker(new Request("https://ingest.example/public/fleet-state"));
+    expect(response.status).toBe(200);
   });
 
   it("never lets a shared cache store either variant of / under one URL", async () => {
@@ -190,9 +269,7 @@ describe("GET / — Access JWT wired end to end (real createRemoteJWKSet path)",
     );
 
     expect(response.status).toBe(200);
-    const html = await response.text();
-    expect(html).toContain("Public View");
-    expect(html).toContain("Sign in");
+    expectAuthState(await response.text(), false);
   });
 
   it("an expired token falls back to the public view", async () => {
@@ -204,6 +281,6 @@ describe("GET / — Access JWT wired end to end (real createRemoteJWKSet path)",
     );
 
     expect(response.status).toBe(200);
-    expect(await response.text()).toContain("Public View");
+    expectAuthState(await response.text(), false);
   });
 });

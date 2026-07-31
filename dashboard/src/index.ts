@@ -1,6 +1,17 @@
 /**
  * Worker entrypoint — the Epic #4702 Phase 2 ingest endpoint + storage
- * backend. Routes:
+ * backend.
+ *
+ * Since Phase 3 (#4749) this Worker **also serves the dashboard UI** as static
+ * assets (`wrangler.toml`'s `[assets] directory = "./web/dist"`, built from
+ * `web/`). The asset router runs *before* this module: a request matching a
+ * built file (`/`, `/assets/*`) is served from the bundle and never reaches
+ * `fetch()` below, and everything else falls through here because the config
+ * sets `not_found_handling = "none"`. The practical consequence is that the
+ * `GET /` handler at the bottom of this file is now only a fallback for a
+ * deploy with no assets uploaded.
+ *
+ * Routes:
  *
  *   POST /ingest
  *     The wire contract this route MUST satisfy is fixed by the already-
@@ -110,6 +121,11 @@ export interface Env {
    * render the public view (fails closed, never the other way). */
   CF_ACCESS_TEAM_DOMAIN?: string;
   CF_ACCESS_AUD?: string;
+  /** Workers Assets binding for the built dashboard UI (`web/dist`). Absent
+   * in the Miniflare test env and on a deploy whose UI build did not run —
+   * `handleRoot` falls back to the server-rendered page in that case, so this
+   * is optional by design rather than an invariant to assert. */
+  ASSETS?: Fetcher;
 }
 
 /** A single global Durable Object instance holds fleet-wide live state —
@@ -411,16 +427,63 @@ async function handleDashboardPage(env: Env, isAuthenticated: boolean): Promise<
   });
 }
 
-/** `GET /` (issue #4795) — validate the visitor's Access JWT (the
+/** The global the SPA reads to learn which dataset it may request. Injected
+ * server-side (never inferred in the browser) so there is exactly one
+ * authority on auth state — the same `validateAccessJwt` call that decides
+ * the server-rendered variant. See `web/src/api.ts`. */
+const AUTH_STATE_GLOBAL = "__LOOM_FLEET__";
+
+/** Inject the auth state into the SPA shell as a `<script>` immediately
+ * before `</head>`, so it is defined before the module bundle executes.
+ *
+ * `JSON.stringify` on a boolean cannot emit `<`/`&`, so no HTML-escaping
+ * pass is needed here; keep it that way if this ever carries a string. */
+function injectAuthState(html: string, isAuthenticated: boolean): string {
+  const tag = `<script>window.${AUTH_STATE_GLOBAL}=${JSON.stringify({ authenticated: isAuthenticated })};</script>`;
+  return html.includes("</head>") ? html.replace("</head>", `${tag}</head>`) : `${tag}${html}`;
+}
+
+/** `GET /` (issues #4795 + #4749) — validate the visitor's Access JWT (the
  * `CF_Authorization` cookie; see `./accessAuth.ts`'s module doc for why this
  * is a cookie, not the `Cf-Access-Jwt-Assertion` header) and serve the
- * matching dashboard variant. Fails CLOSED to the public variant on
- * anything but a fully valid, correctly-audienced token — never a 500,
- * never the full view on a doubtful token (this issue's core acceptance
- * criterion). */
+ * dashboard UI with that auth state baked in. Fails CLOSED to the public
+ * variant on anything but a fully valid, correctly-audienced token — never a
+ * 500, never the full view on a doubtful token (#4795's core acceptance
+ * criterion).
+ *
+ * Two variants of "the dashboard", in preference order:
+ *
+ * 1. **The SPA** (`web/dist/index.html` via the `ASSETS` binding) — the real
+ *    Phase-3 UI. `wrangler.toml`'s `run_worker_first = ["/"]` is what routes
+ *    `/` here instead of letting the asset router serve index.html directly,
+ *    which is the only reason this Worker gets to stamp the auth state on it.
+ * 2. **The server-rendered page** (`./publicPage.ts`) — the fallback when no
+ *    UI build is uploaded (`ASSETS` unbound, or the asset miss). Keeps a
+ *    bindings-only deploy and the Miniflare suite working, and keeps #4795's
+ *    behavior intact on a deploy that skipped the UI build. */
 async function handleRoot(request: Request, env: Env): Promise<Response> {
   const identity = await validateAccessJwt(request.headers.get("cookie"), env);
-  return handleDashboardPage(env, identity !== null);
+  const isAuthenticated = identity !== null;
+
+  if (env.ASSETS) {
+    const shell = await env.ASSETS.fetch(new Request(new URL("/index.html", request.url), { method: "GET" }));
+    if (shell.ok) {
+      return new Response(injectAuthState(await shell.text(), isAuthenticated), {
+        status: 200,
+        headers: {
+          "content-type": "text/html; charset=utf-8",
+          // Same reasoning as `handleDashboardPage`, and it matters more
+          // here: this body differs between viewers only by the injected
+          // auth flag, which is exactly the kind of near-identical response
+          // a cache is most likely to collapse.
+          "cache-control": "private, no-store",
+          vary: "Cookie",
+        },
+      });
+    }
+  }
+
+  return handleDashboardPage(env, isAuthenticated);
 }
 
 // ---------------------------------------------------------------------------
@@ -437,6 +500,34 @@ export default {
     if (url.pathname.startsWith("/admin/")) {
       return handleAdmin(request, env, url);
     }
+
+    // Every `/api/*` route is operator-only, and the Worker — not the edge —
+    // is what enforces that under the single-URL layout (#4795).
+    //
+    // Before #4795 the reference deployment had one hostname-wide Access
+    // application, so "the request reached /api/*" really did imply "Access
+    // let it through" and the handlers below could hardcode
+    // `isAuthenticated: true`. Serving the public view at `/` means that app
+    // has to go: it is what makes `/` require a login. Deleting it without
+    // this check would leave `/api/*` matched by no Access application at
+    // all — i.e. the unredacted fleet, open to the internet.
+    //
+    // A narrower Access app covering only `/api/*` does not work either.
+    // Every app on a hostname sets the same `CF_Authorization` cookie, so a
+    // second app's session silently overwrites the one `/` validates; and
+    // the SPA reaches these routes by `fetch`, which cannot follow an SSO
+    // redirect. Verifying the same cookie `handleRoot` already verifies
+    // keeps one app, one audience, one cookie.
+    if (url.pathname.startsWith("/api/")) {
+      const identity = await validateAccessJwt(request.headers.get("cookie"), env);
+      if (identity === null) {
+        // 401, not 302: these routes answer JSON to an XHR client. `api.ts`
+        // treats 401/403 as "your session expired, reload" rather than a
+        // backend fault, which is exactly the right remedy here.
+        return jsonError(401, "authentication required");
+      }
+    }
+
     if (request.method === "GET" && url.pathname === "/api/fleet-state") {
       return handleFleetStateQuery(env, /* isAuthenticated */ true);
     }

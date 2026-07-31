@@ -273,6 +273,13 @@ describe("renderPublicPage — full document", () => {
     expect(html).not.toContain("/ingest");
     expect(html).toContain("/public/events");
   });
+
+  // Covered here rather than through `GET /`, which serves the SPA shell
+  // whenever a UI build is present (see the e2e block below). This page is
+  // the no-UI-build fallback, so its Sign in affordance needs its own test.
+  it("offers a Sign in link pointing at /login", () => {
+    expect(html).toContain('href="/login"');
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -325,17 +332,17 @@ describe("GET /login — bounces back to /", () => {
   });
 });
 
-describe("GET / — end to end (anonymous, public fallback)", () => {
+describe("GET / — end to end (anonymous)", () => {
   it("serves an HTML page reachable without authentication", async () => {
     const response = await callWorker(new Request("https://ingest.example/"));
     expect(response.status).toBe(200);
     expect(response.headers.get("content-type")).toContain("text/html");
   });
 
-  it("includes a Sign in link pointing at /login", async () => {
+  it("tells the UI it is anonymous, so it requests the redacted dataset", async () => {
     const response = await callWorker(new Request("https://ingest.example/"));
     const html = await response.text();
-    expect(html).toContain('href="/login"');
+    expect(html).toContain('window.__LOOM_FLEET__={"authenticated":false};');
   });
 
   it("a private sweep.outcome record's repo/issue/sweep_id never appear on the rendered page", async () => {
@@ -355,13 +362,16 @@ describe("GET / — end to end (anonymous, public fallback)", () => {
     expect(html).not.toContain("8888");
   });
 
-  it("a public sweep.started record's repo/issue appear on the rendered page (full detail)", async () => {
+  it("a public sweep.started record keeps full detail in the anonymous dataset", async () => {
     await ingest([sweepStartedEnvelope({ visibility: "public", repo: "rjwalters/loom", issue: 4703 })]);
 
-    const response = await callWorker(new Request("https://ingest.example/"));
-    const html = await response.text();
-    expect(html).toContain("rjwalters/loom");
-    expect(html).toContain("#4703");
+    // Asserted against the dataset the anonymous UI actually fetches. The
+    // shell at `/` carries no records at all, so "public repos stay visible
+    // to anonymous visitors" is only observable here.
+    const response = await callWorker(new Request("https://ingest.example/public/fleet-state"));
+    const body = await response.text();
+    expect(body).toContain("rjwalters/loom");
+    expect(body).toContain("4703");
   });
 
   it("tokens.snapshot's account identifiers never appear on the rendered page", async () => {
@@ -378,6 +388,6 @@ describe("GET / — end to end (anonymous, public fallback)", () => {
     );
     expect(response.status).toBe(200);
     const html = await response.text();
-    expect(html).toContain("Public View");
+    expect(html).toContain('window.__LOOM_FLEET__={"authenticated":false};');
   });
 });
