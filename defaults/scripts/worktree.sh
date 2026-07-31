@@ -9,6 +9,11 @@
 #   pnpm worktree <issue-number> --sparse <paths...>   # Cone-mode sparse checkout
 #   pnpm worktree <issue-number> --full                # Convert sparse worktree to full
 #   pnpm worktree remove <issue-number> [--keep-branch] [--force]  # Remove one managed worktree
+#   pnpm worktree snapshot <issue-number> [--include-untracked] [--json]
+#     # Write a patch file capturing the worktree's uncommitted diff to
+#     # <worktree-root>/.snapshots/issue-<N>-<UTC-timestamp>.patch — WITHOUT
+#     # touching `git stash` (which is repo-global and can be clobbered by a
+#     # concurrent builder in another worktree). Replay with `git apply`.
 #   pnpm worktree --check                              # Check if currently in a worktree
 #   pnpm worktree --json <issue-number>                # Machine-readable output
 #   pnpm worktree --return-to <dir> <issue-number>     # Store return directory
@@ -560,6 +565,176 @@ remove_worktree_command() {
 }
 
 # --------------------------------------------------------------------------
+# Worktree-scoped snapshot (issue #4778)
+# --------------------------------------------------------------------------
+#
+# `worktree.sh snapshot <N>` captures a worktree's uncommitted WIP as a
+# standalone patch file WITHOUT touching `git stash` at all. `git stash` is
+# repo-global across worktrees — one shared stash list for the whole repo —
+# so two builders stashing around the same time in different `issue-<N>`
+# worktrees can pop/clobber each other's WIP (documented cross-worktree
+# contamination class). A patch file is inherently per-invocation and
+# per-path: there is no shared mutable list to collide on.
+#
+# Deterministic, discoverable location — resolved through the SAME
+# loom_worktree_root() the rest of this script uses, so an overridden
+# LOOM_WORKTREE_ROOT / worktree.root config redirects snapshots along with
+# worktrees rather than falling back to a hardcoded `.loom/worktrees` path:
+#
+#   $(loom_worktree_root <repo_root>)/.snapshots/issue-<N>-<UTC-timestamp>.patch
+#
+# This is deliberately the same family as check-main-clean.sh's --quarantine
+# rescue path: both produce a "replay this diff inside your worktree"
+# artifact, and both are named/labeled by issue for attribution. They differ
+# in mechanism on purpose: check-main-clean.sh rescues contamination that
+# leaked into the shared MAIN checkout (its whole point is a repo-global
+# stash ref, because the dirt itself is repo-global); `snapshot` rescues one
+# worktree's own WIP (its whole point is per-path isolation, because the
+# thing it's defending against IS the shared stash list). Replay contract for
+# both is the same: `git apply <patch>` against a fresh checkout reproduces
+# the captured diff.
+snapshot_worktree_command() {
+    local issue_number="" json=false include_untracked=false
+    local usage="Usage: pnpm worktree snapshot <issue-number> [--include-untracked] [--json]"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --include-untracked) include_untracked=true; shift ;;
+            --json)               json=true; shift ;;
+            --*)
+                print_error "Unknown flag for snapshot: $1"
+                echo ""
+                echo "$usage"
+                return 1
+                ;;
+            *)
+                if [[ -z "$issue_number" ]]; then
+                    issue_number="$1"; shift
+                else
+                    print_error "Unexpected argument: $1"
+                    return 1
+                fi
+                ;;
+        esac
+    done
+
+    if [[ -z "$issue_number" ]]; then
+        print_error "snapshot requires an issue number"
+        echo ""
+        echo "$usage"
+        return 1
+    fi
+    if ! [[ "$issue_number" =~ ^[0-9]+$ ]]; then
+        print_error "Issue number must be numeric (got: '$issue_number')"
+        echo ""
+        echo "$usage"
+        return 1
+    fi
+
+    # Mirrors remove_worktree_command's stdout-purity split: in --json mode
+    # human-readable status goes to stderr so stdout carries only the final
+    # JSON document.
+    _snap_info()    { if [[ "$json" == true ]]; then echo -e "${BLUE}ℹ $*${NC}" >&2; else print_info "$*"; fi; }
+    _snap_success() { if [[ "$json" == true ]]; then echo -e "${GREEN}✓ $*${NC}" >&2; else print_success "$*"; fi; }
+    _snap_json() {
+        # $1=success(bool) $2=patchPath $3=hasChanges(bool) $4=bytes
+        [[ "$json" == true ]] || return 0
+        printf '{"success": %s, "issueNumber": %s, "patchPath": "%s", "hasChanges": %s, "bytes": %s}\n' \
+            "$1" "$issue_number" "$2" "$3" "$4"
+    }
+
+    # Resolve the repo root even when invoked from inside a worktree: the git
+    # common dir's parent is always the main workspace.
+    local git_common repo_root
+    if ! git_common=$(git rev-parse --git-common-dir 2>/dev/null); then
+        print_error "Not inside a git repository"
+        return 1
+    fi
+    repo_root=$(cd "$(dirname "$git_common")" 2>/dev/null && pwd) || repo_root="$(pwd)"
+
+    local worktree_root_dir worktree_path
+    worktree_root_dir="$(loom_worktree_root "$repo_root")"
+    worktree_path="$worktree_root_dir/issue-$issue_number"
+
+    if [[ ! -d "$worktree_path" ]]; then
+        print_error "No worktree found at $worktree_path — nothing to snapshot"
+        _snap_json false "" false 0
+        return 1
+    fi
+    if ! git -C "$worktree_path" rev-parse --git-dir >/dev/null 2>&1; then
+        print_error "$worktree_path is not a git working tree"
+        _snap_json false "" false 0
+        return 1
+    fi
+
+    local snapshot_dir="$worktree_root_dir/.snapshots"
+    if ! mkdir -p "$snapshot_dir" 2>/dev/null; then
+        print_error "Could not create snapshot directory: $snapshot_dir"
+        _snap_json false "" false 0
+        return 1
+    fi
+
+    local ts
+    ts="$(date -u +%Y%m%dT%H%M%SZ)"
+    local patch_path="$snapshot_dir/issue-$issue_number-$ts.patch"
+
+    # Optionally fold untracked files into the same patch via a temporary
+    # intent-to-add (`git add -N`), which makes `git diff HEAD` render them as
+    # new-file hunks WITHOUT staging their content. Reverted immediately after
+    # the diff is captured so the worktree ends in its exact prior state
+    # (still untracked, nothing left staged) — this never touches the index
+    # any longer than the single `git diff` call below. Loom runtime markers
+    # (.loom-managed et al) are excluded, same filter as _worktree_dirty_lines,
+    # so a snapshot never captures noise every managed worktree carries.
+    local -a added_for_diff=()
+    if [[ "$include_untracked" == true ]]; then
+        local untracked
+        untracked="$(git -C "$worktree_path" ls-files --others --exclude-standard 2>/dev/null | \
+            grep -vE '(^|/)\.loom-managed$|(^|/)\.loom-in-use$|(^|/)\.loom-checkpoint$|(^|/)\.no-changes-needed$' || true)"
+        if [[ -n "$untracked" ]]; then
+            while IFS= read -r f; do
+                [[ -n "$f" ]] || continue
+                if git -C "$worktree_path" add -N -- "$f" >/dev/null 2>&1; then
+                    added_for_diff+=("$f")
+                fi
+            done <<< "$untracked"
+        fi
+    fi
+
+    # A plain `git diff` (no --exit-code) always exits 0 unless a real error
+    # occurred (bad HEAD, corrupt worktree, etc.) — it does not use exit code
+    # to signal "has changes", so any nonzero here is a genuine failure.
+    local diff_status=0
+    git -C "$worktree_path" diff HEAD > "$patch_path" 2>/dev/null || diff_status=$?
+
+    if [[ ${#added_for_diff[@]} -gt 0 ]]; then
+        git -C "$worktree_path" reset -- "${added_for_diff[@]}" >/dev/null 2>&1 || true
+    fi
+
+    if [[ $diff_status -ne 0 ]]; then
+        rm -f "$patch_path" 2>/dev/null || true
+        print_error "git diff failed for $worktree_path (exit $diff_status)"
+        _snap_json false "" false 0
+        return 1
+    fi
+
+    local bytes has_changes=false
+    bytes=$(wc -c < "$patch_path" 2>/dev/null | tr -d ' ')
+    bytes="${bytes:-0}"
+    [[ "$bytes" -gt 0 ]] && has_changes=true
+
+    if [[ "$has_changes" == true ]]; then
+        _snap_success "Snapshot written: $patch_path ($bytes bytes)"
+    else
+        _snap_info "No uncommitted changes — wrote an empty snapshot: $patch_path"
+    fi
+    _snap_info "Replay into a fresh worktree with: git apply $patch_path"
+
+    _snap_json true "$patch_path" "$has_changes" "$bytes"
+    return 0
+}
+
+# --------------------------------------------------------------------------
 # Sparse-checkout helpers
 # --------------------------------------------------------------------------
 #
@@ -701,6 +876,8 @@ Usage:
   pnpm worktree <issue-number> --sparse <paths...>      Cone-mode sparse checkout
   pnpm worktree <issue-number> --full                   Convert sparse worktree to full
   pnpm worktree remove <N> [--keep-branch] [--force]    Remove one managed worktree
+  pnpm worktree snapshot <N> [--include-untracked] [--json]
+                                                         Save uncommitted WIP as a patch file
   pnpm worktree --check                                 Check if in a worktree
   pnpm worktree --json <issue-number>                   Machine-readable JSON output
   pnpm worktree --return-to <dir> <issue-number>        Store return directory
@@ -748,6 +925,28 @@ Examples:
     found, and print how to preserve the work (commit / save a patch / stash).
     Loom runtime markers (.loom-managed, .loom-in-use, .loom-checkpoint,
     .no-changes-needed) never count as uncommitted work.
+
+  pnpm worktree snapshot 42
+    Writes the worktree's uncommitted diff (tracked-file changes: staged +
+    unstaged, via 'git diff HEAD') to a patch file at:
+      <worktree-root>/.snapshots/issue-42-<UTC-timestamp>.patch
+    Does NOT touch 'git stash' — unlike stash, which is repo-global across
+    every worktree in the repo, this patch file is scoped to this one
+    invocation and this one path, so concurrent snapshots from other
+    'issue-<N>' worktrees can never collide or clobber each other. Replay
+    into a fresh worktree for the same issue with:
+      git -C .loom/worktrees/issue-42 apply <patch-path>
+    A worktree with no uncommitted changes still succeeds, writing an empty
+    patch file rather than erroring.
+
+  pnpm worktree snapshot 42 --include-untracked
+    Same as above, but also folds untracked files into the patch (via a
+    temporary 'git add -N' intent-to-add that is reverted immediately after
+    the diff is captured — the worktree's index ends unchanged). Loom runtime
+    markers are excluded even with this flag.
+
+  pnpm worktree snapshot 42 --json
+    Output: {"success": true, "issueNumber": 42, "patchPath": "/path/to/.snapshots/issue-42-...patch", "hasChanges": true, "bytes": 1234}
 
   pnpm worktree --check
     Shows current worktree status
@@ -858,6 +1057,16 @@ if [[ "$1" == "remove" || "$1" == "--remove" ]]; then
     shift
     # Left of && so set -e does not abort on a non-zero return from the handler.
     remove_worktree_command "$@" && exit 0
+    exit 1
+fi
+
+# Worktree-scoped WIP snapshot verb (issue #4778). Dispatched HERE, before the
+# generic numeric-issue-number validation below, for the same reason `remove`
+# is: `snapshot <N>` must not be rejected as "Issue number must be numeric".
+if [[ "$1" == "snapshot" ]]; then
+    shift
+    # Left of && so set -e does not abort on a non-zero return from the handler.
+    snapshot_worktree_command "$@" && exit 0
     exit 1
 fi
 

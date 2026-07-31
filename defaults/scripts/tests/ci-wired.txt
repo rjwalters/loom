@@ -86,3 +86,4 @@ test-worktree-remove.sh
 test-worktree-root-override.sh
 test-worktree-sentinel-reinvoke.sh
 test-worktree-sentinel.sh
+test-worktree-snapshot.sh
