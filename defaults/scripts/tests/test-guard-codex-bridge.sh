@@ -267,12 +267,42 @@ for tool in apply_patch write_file edit_file str_replace_editor; do
     assert_bridge "$tool into the main checkout -> deny" deny "$(run_bridge "$(codex_event "$tool" "$bad" "$WT")")"
 done
 
-# Sibling-worktree write: allowed by the shared policy (guard-worktree-paths.sh
-# deliberately does not attempt cross-issue isolation — see #4245). Pinned here
-# so a future change to that policy is a conscious, visible one on BOTH runtimes.
+# Sibling-worktree write, path-derived mechanism (no LOOM_WORKTREE_PATH):
+# allowed by the shared policy, because guard-worktree-paths.sh cannot tell
+# WHICH managed worktree the acting session owns (#4245). Pinned here so a
+# future change to that policy is a conscious, visible one on BOTH runtimes —
+# the Codex side must not be silently stricter or looser than the Claude side.
 assert_bridge "sibling worktree write follows the shared policy (allow, #4245)" allow \
     "$(run_bridge "$(codex_event apply_patch \
         "$(jq -nc --arg p "$SIBLING/src/x.txt" '{input:("*** Begin Patch\n*** Update File: " + $p + "\n@@\n-a\n+b\n*** End Patch")}')" "$WT")")"
+
+# ...and with LOOM_WORKTREE_PATH pinning the acting worktree, the SAME shared
+# guard denies the sibling — for Codex through the bridge exactly as it does for
+# Claude directly. This is the mechanism that satisfies "a sibling worktree is
+# denied": it is the existing env fast path, inherited by the hook process, NOT
+# a Codex-only rule. Both runtimes are asserted so the parity is the test.
+sibling_patch="$(jq -nc --arg p "$SIBLING/src/x.txt" '{input:("*** Begin Patch\n*** Update File: " + $p + "\n@@\n-a\n+b\n*** End Patch")}')"
+pinned_codex_out=""
+pinned_codex_code=0
+pinned_codex_out="$(cd "$TMPROOT" && printf '%s' "$(codex_event apply_patch "$sibling_patch" "$WT")" \
+    | LOOM_WORKTREE_PATH="$WT" bash "$BRIDGE" --project-root "$TMPROOT" 2>/dev/null)" || pinned_codex_code=$?
+assert_bridge "sibling worktree write DENIED when LOOM_WORKTREE_PATH pins the acting worktree" deny \
+    "$pinned_codex_code|$pinned_codex_out"
+pinned_claude_out=""
+pinned_claude_out="$(cd "$TMPROOT" && printf '%s' "$(claude_event Write "$(jq -nc --arg p "$SIBLING/src/x.txt" '{file_path:$p}')" "$WT")" \
+    | LOOM_WORKTREE_PATH="$WT" bash "$TMPROOT/.loom/hooks/guard-worktree-paths.sh" 2>/dev/null)" || true
+if [[ "$(printf '%s' "$pinned_claude_out" | jq -r '.hookSpecificOutput.permissionDecision // "allow"' 2>/dev/null)" == "deny" ]]; then
+    pass "claude parity: the same pinned sibling write is denied on the Claude path too"
+else
+    fail "claude parity: the same pinned sibling write is denied on the Claude path too (got $pinned_claude_out)"
+fi
+# The pin must not over-deny: the acting worktree itself stays writable.
+pinned_ok_out=""
+pinned_ok_code=0
+pinned_ok_out="$(cd "$TMPROOT" && printf '%s' "$(codex_event apply_patch \
+    "$(jq -nc --arg p "$WT/src/pinned.txt" '{input:("*** Begin Patch\n*** Add File: " + $p + "\n+x\n*** End Patch")}')" "$WT")" \
+    | LOOM_WORKTREE_PATH="$WT" bash "$BRIDGE" --project-root "$TMPROOT" 2>/dev/null)" || pinned_ok_code=$?
+assert_bridge "the acting worktree stays writable under the same pin" allow "$pinned_ok_code|$pinned_ok_out"
 
 # apply_patch's JSON call shape: {"command":["apply_patch","<envelope>"]}
 assert_bridge "apply_patch JSON call shape (command array) -> deny on main-checkout target" deny \

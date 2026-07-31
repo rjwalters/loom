@@ -385,9 +385,24 @@ Known, documented, and accepted for tier-2. None is silent.
    (narrowing `sandbox_workspace_write.writable_roots` to the dispatched
    worktree) is **not implemented** — it was evaluated as defense-in-depth and
    deferred; the flag/TOML-key syntax still needs verification against a live
-   CLI. Note also that the shared policy deliberately does not attempt
-   cross-issue isolation (#4245): a write into a *sibling managed worktree* is
-   allowed for Codex exactly as it is for Claude.
+   CLI.
+
+   **Sibling worktrees.** Whether a write into a *sibling* `issue-M` worktree is
+   denied is decided by the same two-mechanism split the Claude path has, not by
+   anything Codex-specific:
+
+   - With `LOOM_WORKTREE_PATH` set (a session pinned to one worktree — tmux,
+     manual, or any dispatcher that exports it), the fast path confines writes
+     to that worktree and **denies siblings**. The Codex hook process inherits
+     the variable, so this holds for Codex through the bridge exactly as it does
+     for Claude directly; the parity suite asserts both.
+   - Without it, the path-derived fallback cannot tell which managed worktree
+     the acting session owns (#4245), so a sibling write is **allowed** — again
+     for both runtimes identically.
+
+   Making Codex stricter here would fork the policy table, which this phase
+   explicitly does not do. Closing the fallback case is a shared-policy change
+   for both runtimes, and is out of scope for #4495.
 3. **Command-pattern blocking now comes from Loom, not Codex.** With the managed
    hook in place, `DROP DATABASE`, `DELETE` without `WHERE`, `git push --force
    origin main`, fork bombs, and `curl … | sh` are matched by
