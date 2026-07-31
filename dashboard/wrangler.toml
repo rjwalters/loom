@@ -1,0 +1,51 @@
+name = "loom-observability-ingest"
+main = "src/index.ts"
+compatibility_date = "2024-09-23"
+
+# --------------------------------------------------------------------------
+# D1 — durable history for every ingested telemetry record.
+#
+# `database_id` below is a placeholder. After running:
+#   wrangler d1 create loom-observability
+# paste the returned database_id here (or override per-environment in
+# `[env.<name>]` blocks — see README.md "Deploying your own instance").
+# --------------------------------------------------------------------------
+[[d1_databases]]
+binding = "DB"
+database_name = "loom-observability"
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "migrations"
+
+# --------------------------------------------------------------------------
+# Durable Object — live "what is running right now across every host" state,
+# independent of D1's durable history.
+# --------------------------------------------------------------------------
+[[durable_objects.bindings]]
+name = "FLEET_STATE"
+class_name = "FleetState"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["FleetState"]
+
+# --------------------------------------------------------------------------
+# Retention policy — see src/retention.ts. Both bounds are enforced on every
+# scheduled run; either alone is sufficient to cap D1 growth, but both are
+# applied for defense in depth (a burst of hosts could blow the row cap well
+# before the age cutoff, and a single very-chatty host could blow the age
+# cutoff's effective size before enough time passes).
+# --------------------------------------------------------------------------
+[vars]
+RETENTION_DAYS = "90"
+MAX_RECORDS = "500000"
+
+# Runs the retention sweep hourly. `wrangler dev` does not fire this on a
+# real clock; trigger it directly in tests / via the admin endpoint instead
+# (see src/index.ts `/admin/retention/run`).
+[triggers]
+crons = ["0 * * * *"]
+
+# --------------------------------------------------------------------------
+# Secrets (NOT committed — set via `wrangler secret put <NAME>`):
+#   ADMIN_TOKEN   — bearer token gating /admin/* host-key management routes.
+# --------------------------------------------------------------------------
