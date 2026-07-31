@@ -156,9 +156,12 @@
 #                                (default: LOOM_DAEMON_STARTUP_GRACE_SECS, else 90).
 #   LOOM_WATCHDOG_IPC_PROBE_STATE  #4398: path to the consecutive-failure counter
 #                                (default <loom dir>/.watchdog-probe-fail-count).
-#   LOOM_WATCHDOG_FORCE_PORTABLE_TIMEOUT  #4398: 1 forces the built-in bounded
-#                                runner instead of `timeout(1)` (test seam for
-#                                the default macOS no-`timeout` shape).
+#   LOOM_FORCE_PORTABLE_TIMEOUT    #4398, renamed from the watchdog-local
+#                                LOOM_WATCHDOG_FORCE_PORTABLE_TIMEOUT by #4832
+#                                when bounded_run() moved to the shared
+#                                lib/bounded-run.sh: 1 forces the built-in
+#                                bounded runner instead of `timeout(1)` (test
+#                                seam for the default macOS no-`timeout` shape).
 #   LOOM_DAEMON_BIN               Explicit loom-daemon binary for the IPC probe
 #                                (same resolution order as loom-daemon-start.sh).
 
@@ -181,6 +184,16 @@ _LOOM_LAUNCHD_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" 2>/dev/null 
 if [[ -r "$_LOOM_LAUNCHD_LIB_DIR/launchd-domain.sh" ]]; then
     # shellcheck source=../lib/launchd-domain.sh
     source "$_LOOM_LAUNCHD_LIB_DIR/launchd-domain.sh"
+fi
+# bounded_run() (#4398, shared with loom-daemon-start.sh's print_calibrate_hint,
+# de-duplicated from this script's own former inline copy by #4832) — the IPC
+# probe's hard wall-clock budget. Unlike the start script's advisory hint, the
+# probe below is NOT optional, so run_ipc_probe() checks explicitly for a
+# missing `bounded_run` rather than letting an undefined-function call degrade
+# silently.
+if [[ -r "$_LOOM_LAUNCHD_LIB_DIR/bounded-run.sh" ]]; then
+    # shellcheck source=../lib/bounded-run.sh
+    source "$_LOOM_LAUNCHD_LIB_DIR/bounded-run.sh"
 fi
 
 VERBOSE=false
@@ -354,50 +367,17 @@ locate_daemon_bin() {
     return 1
 }
 
-# Run a command under a HARD wall-clock budget, returning 124 on timeout exactly
-# like GNU `timeout` does. macOS ships no `timeout(1)`, and for this probe an
-# unbounded fallback is not acceptable — "the CLI never returns" is precisely the
-# failure mode being detected (#4381's hung stub) — so the no-`timeout` path is a
-# real bounded implementation, not a degrade-to-unbounded.
-#
-# `-k 2` is load-bearing on the `timeout(1)` path: a non-interactive bash that is
-# blocked in a foreground command defers SIGTERM, so without the KILL escalation
-# `timeout` itself would wait indefinitely for a child that ignores the TERM —
-# reintroducing the very unbounded wait this helper exists to prevent.
-# LOOM_WATCHDOG_FORCE_PORTABLE_TIMEOUT=1 forces the fallback path, so the
-# no-`timeout(1)` behavior (the default macOS shape) is testable on any host.
-bounded_run() { # <timeout_secs> <cmd> [args...]
-    local secs="$1"; shift
-    if [[ ! "${LOOM_WATCHDOG_FORCE_PORTABLE_TIMEOUT:-}" =~ ^(1|true|yes)$ ]]; then
-        if command -v timeout >/dev/null 2>&1; then
-            timeout -k 2 "$secs" "$@"
-            return $?
-        fi
-        if command -v gtimeout >/dev/null 2>&1; then
-            gtimeout -k 2 "$secs" "$@"
-            return $?
-        fi
-    fi
-    # Portable fallback: run the command in the background and pair it with a
-    # killer subshell that TERM/KILLs it once the budget elapses.
-    "$@" &
-    local cmd_pid=$!
-    (
-        sleep "$secs"
-        kill -TERM "$cmd_pid" 2>/dev/null
-        sleep 2
-        kill -KILL "$cmd_pid" 2>/dev/null
-    ) >/dev/null 2>&1 &
-    local killer_pid=$! rc=0
-    wait "$cmd_pid" 2>/dev/null || rc=$?
-    kill "$killer_pid" 2>/dev/null
-    wait "$killer_pid" 2>/dev/null
-    # Normalize a killed-by-the-budget exit (128+TERM / 128+KILL) to `timeout`'s
-    # own 124 so the caller has ONE code to branch on regardless of which
-    # implementation ran.
-    case "$rc" in 143|137) rc=124 ;; esac
-    return "$rc"
-}
+# bounded_run() — a HARD wall-clock budget around a command, returning 124 on
+# timeout exactly like GNU `timeout` does. Sourced from the shared
+# lib/bounded-run.sh (#4807 extracted this watchdog's own inline copy so
+# loom-daemon-start.sh's print_calibrate_hint() could reuse it, #4799); see
+# that file for the full implementation notes (the `-k 2` KILL escalation,
+# the portable no-`timeout(1)` fallback for macOS, the 143/137 -> 124
+# normalization). The lib is sourced just below (near launchd-domain.sh); if
+# sourcing failed for any reason, `bounded_run` is simply undefined and
+# run_ipc_probe() below detects that explicitly and skips the probe with a
+# clear diagnostic — never a raw `command not found` on a scheduled tick
+# (#4832).
 
 # Read the consecutive-failure tally for <pid> from the state file. The tally is
 # KEYED TO THE PID: a relaunched daemon is a different process and must start
@@ -432,6 +412,15 @@ run_ipc_probe() { # <live_pid> <proc_age_or_empty>
 
     if [[ "${LOOM_WATCHDOG_IPC_PROBE:-}" =~ ^(0|false|no)$ ]]; then
         probe_detail="IPC probe disabled via LOOM_WATCHDOG_IPC_PROBE"
+        return 0
+    fi
+
+    # #4832: bounded_run is defined by sourcing lib/bounded-run.sh above. A
+    # missing/unreadable lib file leaves it undefined -- without this explicit
+    # check, the invocation below would fail as a raw shell "command not
+    # found" (rc 127) on every scheduled tick instead of a diagnosed skip.
+    if ! command -v bounded_run >/dev/null 2>&1; then
+        probe_detail="bounded_run is undefined -- lib/bounded-run.sh failed to source (missing or unreadable)"
         return 0
     fi
 

@@ -822,14 +822,16 @@ rm -rf "$PS_STUB_DIR" "$STUB20"
 
 # ===================================================================
 # 21. The bound holds with NO `timeout(1)` on the host (the default macOS
-#     shape): LOOM_WATCHDOG_FORCE_PORTABLE_TIMEOUT=1 exercises the built-in
-#     bounded runner against a never-returning binary.
+#     shape): LOOM_FORCE_PORTABLE_TIMEOUT=1 (the shared lib/bounded-run.sh
+#     seam, #4832 -- previously the watchdog-local
+#     LOOM_WATCHDOG_FORCE_PORTABLE_TIMEOUT) exercises the built-in bounded
+#     runner against a never-returning binary.
 # ===================================================================
 STUB21="$(make_daemon_stub hang)"
 start_alive_and_fresh 21
 t0=$(date +%s)
 run_watchdog PATH="$PS_STUB_DIR:$PATH" LOOM_WATCHDOG_IPC_PROBE=1 \
-    LOOM_WATCHDOG_FORCE_PORTABLE_TIMEOUT=1 \
+    LOOM_FORCE_PORTABLE_TIMEOUT=1 \
     LOOM_DAEMON_BIN="$STUB21/loom-daemon" \
     LOOM_WATCHDOG_STATUS_PROBE_TIMEOUT_SECS=2 \
     LOOM_WATCHDOG_IPC_PROBE_FAIL_THRESHOLD=3
@@ -842,6 +844,40 @@ else
     fail "no timeout(1) available: watchdog took ${elapsed}s — the portable bound did not hold"
 fi
 rm -rf "$PS_STUB_DIR" "$STUB21"
+
+# ===================================================================
+# 22. #4832: a missing/unreadable lib/bounded-run.sh must degrade to a
+#     clearly-diagnosed skip, never a raw "command not found" (rc 127) on a
+#     scheduled tick. Simulate by temporarily renaming the shared lib file
+#     the watchdog sources bounded_run() from.
+# ===================================================================
+# NOTE: deliberately does NOT register its own EXIT trap for the restore —
+# the suite already owns a single combined EXIT trap (line ~56, `bg_proc_reap;
+# rm -rf "$WORKDIR"`), and `trap ... EXIT` REPLACES rather than stacks, so
+# adding a second one here would silently disable that cleanup for every test
+# after this one. Restore inline instead, immediately after the probing run.
+BOUNDED_RUN_LIB="$(cd "$SCRIPT_DIR/../lib" && pwd)/bounded-run.sh"
+BOUNDED_RUN_LIB_BAK="${BOUNDED_RUN_LIB}.test-disabled-4832"
+mv "$BOUNDED_RUN_LIB" "$BOUNDED_RUN_LIB_BAK"
+
+STUB22="$(make_daemon_stub unreachable)"
+start_alive_and_fresh 22
+run_watchdog_verbose PATH="$PS_STUB_DIR:$PATH" LOOM_WATCHDOG_IPC_PROBE=1 \
+    LOOM_DAEMON_BIN="$STUB22/loom-daemon"
+kill "$LIVE_PID" 2>/dev/null || true
+mv "$BOUNDED_RUN_LIB_BAK" "$BOUNDED_RUN_LIB"
+assert_rc 0 "$RC" "missing lib/bounded-run.sh: degrades to a skip, not a hard failure (exit 0)"
+if log_hasi 'bounded_run is undefined'; then
+    pass "missing lib/bounded-run.sh: clearly-diagnosed skip in the log"
+else
+    fail "missing lib/bounded-run.sh: expected a clear diagnostic ($(cat "$WDLOG" 2>/dev/null))"
+fi
+if grep -qi 'command not found' "$OUT" "$WDLOG" 2>/dev/null; then
+    fail "missing lib/bounded-run.sh: raw 'command not found' leaked instead of the diagnosed skip"
+else
+    pass "missing lib/bounded-run.sh: no raw 'command not found' surfaced"
+fi
+rm -rf "$PS_STUB_DIR" "$STUB22"
 
 echo
 echo "Ran $TESTS_RUN tests: $TESTS_PASSED passed, $TESTS_FAILED failed"
