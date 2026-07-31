@@ -40,6 +40,7 @@ jobs:
             scripts:
               - 'scripts/**'
               - 'defaults/**'
+              - 'tests/hooks/**'
               - '.github/workflows/ci.yml'
 
   backend-lint-and-check:
@@ -207,6 +208,12 @@ jobs:
     # with-a-reason, so a new suite cannot silently join an unwired pool.
     # Measured runtime: ~3 min (72 suites; run-ci-suites.sh prints per-suite
     # timing and a total). Kept sequential for deterministic ordering.
+    #
+    # Since #4769 ci-wired.txt also covers the tests/hooks/ Claude-path guard
+    # suites (repo root, not defaults/scripts/tests/ — previously unwired
+    # entirely). tests/hooks/test-guard-destructive.sh alone adds several
+    # minutes (531 assertions); run-ci-suites.sh's per-suite timeout was
+    # raised accordingly (see its header comment).
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
