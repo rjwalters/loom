@@ -751,6 +751,47 @@ enum Commands {
         #[arg(long, short)]
         verbose: bool,
     },
+
+    /// Inspect the durable `sweep.outcome` telemetry journal (Issue #4704,
+    /// absorbs #4137): every completed sweep's model, config, result, and
+    /// duration, persisted locally regardless of whether any exporter is
+    /// configured. Purely file-based — does not require a running daemon
+    /// (unlike `status`). See `.loom/docs/telemetry-schema.md` for the wire
+    /// format this journal's lines follow.
+    ///
+    /// With no filters, prints the "success rate and median duration by
+    /// model" summary #4137 asked for. `--records` instead lists individual
+    /// outcome records (still respecting `--model`/`--result`/`--limit`).
+    SweepOutcomes {
+        /// Repo root whose `.loom/logs/sweep-outcome-telemetry.jsonl` to
+        /// read (plain path, default `.` — no upward `.git` walk).
+        #[arg(long, value_name = "PATH", default_value = ".")]
+        workspace: String,
+
+        /// Only include records for this dispatched model (matches the
+        /// `"default"` group for records with no explicit model).
+        #[arg(long)]
+        model: Option<String>,
+
+        /// Only include records with this terminal result: success, failure,
+        /// cancelled, blocked.
+        #[arg(long)]
+        result: Option<String>,
+
+        /// List individual records (newest first) instead of the
+        /// summary-by-model table.
+        #[arg(long)]
+        records: bool,
+
+        /// Cap the number of records considered (after filtering), newest
+        /// first. Applies to both the summary and `--records` listing.
+        #[arg(long, value_name = "N")]
+        limit: Option<usize>,
+
+        /// Emit machine-readable JSON instead of the human-readable table.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Sub-actions for `loom-daemon checkpoint` (issue #4275).
@@ -3220,6 +3261,21 @@ fn handle_cli_command(command: Commands) -> Result<()> {
             strict,
             verbose,
         } => handle_validate_command(&workspace, &format, strict, verbose),
+        Commands::SweepOutcomes {
+            workspace,
+            model,
+            result,
+            records,
+            limit,
+            json,
+        } => handle_sweep_outcomes_command(
+            &workspace,
+            model.as_deref(),
+            result.as_deref(),
+            records,
+            limit,
+            json,
+        ),
         Commands::Stats {
             command,
             role,
@@ -8044,6 +8100,123 @@ fn handle_calibrate_command(workspace: &str, write: bool, json: bool) -> Result<
     }
 
     Ok(())
+}
+
+/// `loom-daemon sweep-outcomes` — local inspection path for the durable
+/// `sweep.outcome` telemetry journal (Issue #4704, absorbs #4137). Purely
+/// file-based, like `calibrate` — no running daemon required. With no
+/// `--records` flag, prints the "success rate and median duration by model"
+/// summary #4137 AC4 asked for; `--records` lists individual outcome records
+/// instead (newest first), both respecting `--model`/`--result`/`--limit`.
+fn handle_sweep_outcomes_command(
+    workspace: &str,
+    model_filter: Option<&str>,
+    result_filter: Option<&str>,
+    records_mode: bool,
+    limit: Option<usize>,
+    json: bool,
+) -> Result<()> {
+    use loom_daemon::sweep_outcomes;
+    use loom_daemon::telemetry;
+    use loom_daemon::worktree_ops::repo;
+
+    let repo_root = repo::resolve_repo_root(workspace)?;
+    let path = sweep_outcomes::default_outcome_telemetry_path(&repo_root);
+
+    let result_filter: Option<telemetry::SweepResult> =
+        result_filter.map(parse_sweep_result_arg).transpose()?;
+
+    let mut entries: Vec<(DateTime<Utc>, telemetry::SweepOutcomeRecord)> =
+        sweep_outcomes::read_all_outcome_telemetry(&path)
+            .into_iter()
+            .filter_map(|envelope| match envelope.record {
+                telemetry::TelemetryRecord::SweepOutcome(record) => {
+                    Some((envelope.emitted_at, record))
+                }
+                _ => None,
+            })
+            .filter(|(_, record)| {
+                let model_key = record.model.as_deref().unwrap_or("default");
+                let model_ok = model_filter.is_none() || model_filter == Some(model_key);
+                let result_ok = result_filter.is_none() || result_filter == Some(record.result);
+                model_ok && result_ok
+            })
+            .collect();
+
+    // Newest first — `emitted_at` is the daemon-stamped envelope time, not
+    // file position, so this is correct even across a rotation boundary.
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+    if let Some(limit) = limit {
+        entries.truncate(limit);
+    }
+
+    if records_mode {
+        if json {
+            let records: Vec<&telemetry::SweepOutcomeRecord> =
+                entries.iter().map(|(_, r)| r).collect();
+            println!("{}", serde_json::to_string_pretty(&records)?);
+        } else if entries.is_empty() {
+            println!("No sweep.outcome telemetry records found at {}", path.display());
+        } else {
+            println!(
+                "{:<8} {:<26} {:<10} {:<10} {:>10}  {:<6} EMITTED_AT",
+                "ISSUE", "SWEEP_ID", "MODEL", "RESULT", "DURATION", "PR"
+            );
+            for (emitted_at, record) in &entries {
+                let model = record.model.as_deref().unwrap_or("default");
+                let pr = record
+                    .pr_number
+                    .map_or_else(|| "-".to_string(), |n| format!("#{n}"));
+                println!(
+                    "{:<8} {:<26} {:<10} {:<10} {:>9}s  {:<6} {}",
+                    record.issue,
+                    record.sweep_id,
+                    model,
+                    format!("{:?}", record.result).to_lowercase(),
+                    record.total_duration_sec,
+                    pr,
+                    emitted_at.to_rfc3339(),
+                );
+            }
+        }
+        return Ok(());
+    }
+
+    let records: Vec<telemetry::SweepOutcomeRecord> = entries.into_iter().map(|(_, r)| r).collect();
+    let summary = sweep_outcomes::summarize_by_model(&records);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+    } else if summary.is_empty() {
+        println!("No sweep.outcome telemetry records found at {}", path.display());
+    } else {
+        println!("{:<12} {:>8} {:>10} {:>14}", "MODEL", "TOTAL", "SUCCESS%", "MEDIAN_SEC");
+        for group in &summary {
+            println!(
+                "{:<12} {:>8} {:>9.1}% {:>14}",
+                group.model,
+                group.total,
+                group.success_rate * 100.0,
+                group.median_duration_sec
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Parse `loom-daemon sweep-outcomes --result <VALUE>` into a
+/// [`loom_daemon::telemetry::SweepResult`]. Case-insensitive; accepts both
+/// `cancelled` and `canceled` spellings.
+fn parse_sweep_result_arg(s: &str) -> Result<loom_daemon::telemetry::SweepResult> {
+    use loom_daemon::telemetry::SweepResult;
+    match s.to_ascii_lowercase().as_str() {
+        "success" => Ok(SweepResult::Success),
+        "failure" => Ok(SweepResult::Failure),
+        "cancelled" | "canceled" => Ok(SweepResult::Cancelled),
+        "blocked" => Ok(SweepResult::Blocked),
+        other => bail!(
+            "unknown --result value {other:?} (expected one of: success, failure, cancelled, blocked)"
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------

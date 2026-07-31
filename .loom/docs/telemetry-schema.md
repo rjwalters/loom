@@ -7,9 +7,11 @@
 > **format-independent reference** so the Phase-2 Workers/TypeScript backend can
 > parse the wire format without the Rust types.
 
-This is a **schema + serialization** deliverable only — the daemon does not yet
-emit, persist, or export these records here. Sibling Phase-1 issues consume these
-types: #4704 persists them to a local journal, #4705 pushes them to a backend.
+This document defines the schema + serialization only. **#4704 (below) is the
+first consumer that actually persists records** — a durable, append-only local
+journal of `sweep.outcome` records, with a `loom-daemon` CLI read surface, no
+exporter or cloud backend required. #4705 (still schema-only as of this
+writing) will additionally push these records to a cloud backend.
 
 ## Envelope
 
@@ -214,3 +216,82 @@ contract; see `cpu_headroom.rs` / `disk_headroom.rs`).
 `cpu_idle_fraction`, `load_per_core`, and `worktree_root_free_gb` are omitted when
 unmeasurable. A consumer MUST treat an absent measurement as "unknown", never as
 zero/full.
+
+## Persistence & read surface (`sweep.outcome`, Issue #4704)
+
+The daemon durably records one `sweep.outcome` [`TelemetryEnvelope`] per
+completed sweep — success, failure, or cancellation — to a local, append-only
+JSONL journal: `<workspace_root>/.loom/logs/sweep-outcome-telemetry.jsonl`
+(override via `LOOM_SWEEP_OUTCOME_TELEMETRY_JOURNAL_PATH`, or per-registry via
+`SweepRegistryConfig::outcome_telemetry_path`). This happens **regardless of
+whether any exporter is configured** — local durability is the point: history
+survives a daemon restart and outlives any cloud backend (#4705).
+
+Written by `loom-daemon/src/sweep_registry.rs`'s
+`append_outcome_telemetry_journal` at the same three terminal-transition call
+sites as the older, narrower `#4644` `OutcomeRecord` journal
+(`sweep-outcomes.jsonl` — see `loom-daemon/src/sweep_outcomes.rs`'s module
+doc for why the two files are kept separate): the reaper's crashed/exited
+handling in `reap_once`, and the operator/watchdog-initiated `finish_cancel`.
+Best-effort like its sibling — a write failure is logged and never blocks
+reaping. Same bounded-retention policy: rotates to a single `.1` backup once
+the file exceeds 5 MiB or its oldest line is more than 30 days old.
+
+**`phase_durations` is sampled**: the registry samples each live sweep's
+checkpoint (`.loom/sweep-checkpoint/issue-<N>.json`) once per reaper tick
+(≤30s, finer in practice) and records each transition, because the checkpoint
+is overwritten at every phase boundary and deleted by the sweep skill on
+success — nothing on disk holds a history. Durations are therefore accurate to
+within one sampling interval; the trailing in-flight segment (last observed
+phase completion → terminal transition) is not attributed to any phase, so the
+entries sum to at most `total_duration_sec`. A daemon restart mid-sweep loses
+the earlier observations: such a record falls back to a single best-effort
+entry (last known phase, whole duration) or an empty list, never a fabricated
+phase name. Phase names are the checkpoint markers normalized to lifecycle
+names (`curator-done` → `curator`, `judge-rejected` → `judge`), and a phase
+that runs twice (the Judge↔Doctor cycle) yields two entries in lifecycle order.
+
+**`pr_number` costs no forge call**: it is captured from the same checkpoint
+read (the sweep skill records `pr_number` from `builder-done` onward), so it
+names the PR *this sweep produced* and survives the checkpoint's deletion on
+success. A terminal transition therefore adds no GraphQL round trip to the
+reaper's hot path; the only forge lookup in the write path is the cached
+`owner/repo` + visibility resolution.
+
+**How `result` is decided** (all from state the daemon already holds — no extra
+forge call):
+
+| Terminal transition | `result` |
+|---|---|
+| Merge phase observed to complete (`merge-done` sampled) | `success` |
+| Operator/watchdog cancel (`finish_cancel`) | `cancelled` |
+| Clean exit (code `0`) with no `merge-done`, not the #4366 no-progress shape | `success` |
+| Everything else — non-zero exit, unobservable exit status, the #4366 clean-exit-with-zero-progress shape, or a death that left a checkpoint behind | `failure` |
+
+An *unobservable* exit status (a reconstructed entry reaped via `kill(pid, 0)`,
+which yields no code) is deliberately a `failure`, not a `success`: absence of
+evidence is not evidence of a merge. The schema's fourth variant, `blocked`, is
+reserved for a human-decision blocker; the daemon does not yet emit it, because
+the blocker signal (`sweep.issue.{N}.blocker`) and the post-Builder build gate
+are both child-side and are not routed into the registry.
+
+### Local inspection: `loom-daemon sweep-outcomes`
+
+```bash
+# Success rate and median duration, grouped by model (the #4137 AC4 query):
+loom-daemon sweep-outcomes
+
+# Individual records, newest first:
+loom-daemon sweep-outcomes --records --limit 20
+
+# Filter by model and/or result (success | failure | cancelled | blocked):
+loom-daemon sweep-outcomes --model opus --result failure --records
+
+# Machine-readable:
+loom-daemon sweep-outcomes --json
+```
+
+Purely file-based (like `loom-daemon calibrate`) — no running daemon required.
+`--workspace PATH` selects a different repo root (default `.`).
+
+[`TelemetryEnvelope`]: #envelope
