@@ -13,20 +13,30 @@ policies:
 
 | Prefix | Who reaches it | Visibility-tagged (`private`) data |
 |---|---|---|
-| `/api/*` | **Authenticated** — the surface an operator's Cloudflare Access policy is expected to gate (see [`cloudflare-access.md`](cloudflare-access.md)'s route map: everything not explicitly Bypassed is Allow-gated) | Full detail, unredacted |
+| `/api/*` | **Authenticated** — the surface an operator's Cloudflare Access policy is expected to gate (see [`cloudflare-access.md`](cloudflare-access.md) §3e: `/api/*` gets its own Allow application) | Full detail, unredacted |
 | `/public/*` | **Public** — always reachable, no login | Redacted per record kind (see below); `public`-visibility data is always full detail on either prefix |
 
-**This is a route-based split, not an in-Worker one.** Per the epic's
-explicit constraint ("no auth code in the dashboard itself"), the Worker
-never parses a JWT or any other credential — `isAuthenticated` in
-`src/index.ts` is set purely by which path matched. The `/public` prefix is
-the same path `cloudflare-access.md` already reserves as a Bypass
-application (§2 of that guide, added ahead of the Phase-3 public page); the
-existing `/api/*` prefix is left as the "everything else" Allow-gated
-surface that guide already documents. Putting an operator's Access policy in
-front of `/api/*` (and leaving `/public/*` bypassed) is what actually makes
-the split enforceable end to end — **the Worker's own redaction is a
-defense-in-depth control, not a substitute for that edge configuration.**
+**For these two prefixes this is a route-based split, not an in-Worker
+one.** The Worker does not parse a JWT or any other credential on `/api/*`
+or `/public/*` — `isAuthenticated` in `src/index.ts` is set purely by which
+path matched. Putting an operator's Access policy in front of `/api/*` (and
+leaving `/public/*` ungated) is what actually makes the split enforceable
+end to end — **the Worker's own redaction is a defense-in-depth control, not
+a substitute for that edge configuration.** In particular, since issue #4795
+narrowed the old hostname-wide Access application down to `/login`, `/api/*`
+needs its **own** Access application or it is matched by none at all: see
+[`cloudflare-access.md`](cloudflare-access.md) §3e, and the pitfalls table
+row "The `/api/*` query API is reachable without logging in".
+
+**The dashboard root `/` is the one exception** (issue #4795): it verifies
+the visitor's Access JWT in-Worker ([`src/accessAuth.ts`](../src/accessAuth.ts))
+and picks the redacted or unredacted variant of the same page accordingly,
+so a single URL can serve both audiences without dead-ending an anonymous
+visitor at an SSO wall. That check is fail-closed by construction — a
+missing/malformed/expired/wrong-`aud` token, or an unreachable JWKS
+endpoint, all render the public variant. It does **not** change anything
+about the `/api/*` vs. `/public/*` contract described here; the page's own
+live feed simply points at whichever prefix matches the variant it rendered.
 
 **Redaction is one policy layer, one enforcement point.**
 [`src/redaction.ts`](../src/redaction.ts) wraps every `/api/*` and
@@ -236,8 +246,16 @@ poll loop and D1 query are identical to `/api/events`.
   and `/public/events` only support `host`/`repo` filters today; a client
   wanting to filter by model/result filters client-side on the streamed
   frames.
-- **In-Worker Cloudflare Access JWT verification** — the `/api/*` vs
-  `/public/*` split (above) relies entirely on the Cloudflare Access edge
-  policy an operator configures per [`cloudflare-access.md`](cloudflare-access.md);
-  the Worker itself does not verify a signed Access header. See that guide's
-  §5 for the tradeoff and what a future hardening pass would add.
+- **In-Worker Cloudflare Access JWT verification _on these query routes_** —
+  the `/api/*` vs `/public/*` split (above) still relies entirely on the
+  Cloudflare Access edge policy an operator configures per
+  [`cloudflare-access.md`](cloudflare-access.md); neither prefix's handler
+  verifies a credential itself. (The dashboard root `/` **does**, as of issue
+  #4795 — see that guide's §5 and [`src/accessAuth.ts`](../src/accessAuth.ts)
+  — but extending the same check to `/api/*` as defense in depth is
+  deliberately *not* done here: `/api/*` is also reached non-interactively
+  with an Access **service token**, whose JWT carries the `/api/*`
+  application's own `aud`, so a single pinned-`aud` check would reject
+  exactly the callers it must not break. Doing it properly means accepting
+  the `Cf-Access-Jwt-Assertion` header with a per-application `aud`
+  allowlist — a separate change.)

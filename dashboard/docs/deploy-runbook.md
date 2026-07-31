@@ -156,9 +156,18 @@ Wrangler prints the deployed URL —
 it:
 
 ```bash
-curl https://loom-observability-ingest.<your-subdomain>.workers.dev/
-# loom-observability-ingest: see /ingest, /admin/*
+curl -sS -o /dev/null -w '%{http_code} %{content_type}\n' \
+  https://loom-observability-ingest.<your-subdomain>.workers.dev/
+# 200 text/html; charset=utf-8
 ```
+
+`/` serves the dashboard page itself (issue #4795): the **redacted public
+view**, with a Sign in link, for any request without a valid Cloudflare
+Access session — which is every request at this point, since Access is not
+configured yet and `CF_ACCESS_TEAM_DOMAIN`/`CF_ACCESS_AUD` are unset in
+`wrangler.toml`. A `200` here (never a redirect, never a 500) is the whole
+smoke test; wiring the authenticated variant is
+[`cloudflare-access.md`](cloudflare-access.md)'s job.
 
 ## 7. Set the admin token
 

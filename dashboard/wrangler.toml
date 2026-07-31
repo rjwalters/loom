@@ -97,6 +97,31 @@ new_sqlite_classes = ["FleetState"]
 RETENTION_DAYS = "90"
 MAX_RECORDS = "500000"
 
+# CHANGE ME (both, together) — required only if you want the single-URL
+# fallback layout (docs/cloudflare-access.md): anonymous visitors to `/` see
+# the public view, a `2amlogic.com`-style Access identity sees the full
+# dashboard. Leave both commented out to run `/` as always-public (the
+# Worker fails closed — no team domain/AUD configured means every request is
+# treated as unauthenticated, never the other way around).
+#
+#   CF_ACCESS_TEAM_DOMAIN — your team's Cloudflare Access domain, e.g.
+#     "yourteam.cloudflareaccess.com" (Zero Trust dashboard → Settings →
+#     Custom Pages, or any Access app's overview page shows it). Used to
+#     build the JWKS URL (".../cdn-cgi/access/certs") and the expected `iss`.
+#   CF_ACCESS_AUD — the Application Audience (AUD) tag of the `/login`
+#     Access application, shown on that app's overview page. Pins JWT
+#     acceptance to tokens minted for apps you named here — neither value is
+#     a secret. Accepts a COMMA-SEPARATED LIST: Access names the session
+#     cookie per hostname but mints the token per application, so a browser
+#     on a hostname running several path-scoped apps may hold the `/api/*`
+#     app's token instead of `/login`'s. List every app on this hostname
+#     whose session should count as signed-in (typically `/login` and
+#     `/api/*`) or an already-signed-in operator flaps back to the public
+#     view — see src/accessAuth.ts's module doc.
+#
+# CF_ACCESS_TEAM_DOMAIN = "REPLACE_WITH_YOUR_TEAM.cloudflareaccess.com"
+# CF_ACCESS_AUD = "REPLACE_WITH_YOUR_LOGIN_APP_AUD_TAG,REPLACE_WITH_YOUR_API_APP_AUD_TAG"
+
 # Runs the retention sweep hourly. `wrangler dev` does not fire this on a
 # real clock; trigger it directly in tests / via the admin endpoint instead
 # (see src/index.ts `/admin/retention/run`).

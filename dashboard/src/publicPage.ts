@@ -1,17 +1,27 @@
 /**
- * The `/public` route's HTML page (Epic #4702, Phase 3, issue #4753).
+ * The dashboard HTML page (Epic #4702, Phase 3, issue #4753), rendered by
+ * `src/index.ts`'s root `/` handler in one of two variants (issue #4795 made
+ * `/` single-URL: the same route serves both, chosen by whether
+ * `accessAuth.ts` validated a visitor's Access JWT):
  *
- * Server-rendered from the exact same redacted data `GET /public/fleet-state`
- * and `GET /public/history` return — `src/index.ts`'s `handlePublicPage`
- * calls `redactFleetSnapshot`/`redactHistoryQueryResult` directly, in-process
- * (not over HTTP), so there is no code path by which this page could
- * accidentally source data from the authenticated `/api/*` surface. The
- * page's own inline script tails `GET /public/events` for live updates —
- * never `/api/*`. See `./redaction.ts`'s module doc for the redaction policy
- * this page renders faithfully rather than reimplements: this module MUST
- * NOT re-derive private/public status or attempt to reconstruct a stripped
+ * - **Public** (`options.isAuthenticated` falsy, the default): sourced from
+ *   the exact same redacted data `GET /public/fleet-state` and
+ *   `GET /public/history` return — the caller calls
+ *   `redactFleetSnapshot`/`redactHistoryQueryResult` directly, in-process
+ *   (not over HTTP), before handing data to this module, so there is no code
+ *   path by which this variant could accidentally source data from the
+ *   authenticated `/api/*` surface. Its inline script tails
+ *   `GET /public/events` for live updates.
+ * - **Authenticated** (`options.isAuthenticated: true`): the caller passes
+ *   the raw, unredacted snapshot/history straight through instead — see
+ *   `renderPublicPage`'s own doc for the exact contract. Its inline script
+ *   tails `GET /api/events` (full detail) instead.
+ *
+ * See `./redaction.ts`'s module doc for the redaction policy the public
+ * variant renders faithfully rather than reimplements: this module MUST NOT
+ * re-derive private/public status or attempt to reconstruct a stripped
  * field — it only ever formats fields that are already present on the
- * redacted objects it is handed.
+ * objects it is handed.
  *
  * ## Display allowlist: narrower than the wire allowlist, on purpose
  *
@@ -43,8 +53,8 @@
  * ## Read-only
  *
  * This page contains no `<form>`, no mutating `fetch`/`EventSource` call,
- * and no reference to `/admin/*` or `/ingest` — it only ever reads
- * `/public/*`.
+ * and no reference to `/admin/*` or `/ingest` — the public variant only ever
+ * reads `/public/*`; the authenticated variant only ever reads `/api/*`.
  */
 
 import type { HistoryQueryResult, HistoryRecord } from "./query";
@@ -195,7 +205,7 @@ export function renderHistoryTable(history: HistoryQueryResult): string {
  * the client never has to keep a hand-written allowlist in sync with this
  * module's. A `topic` (== record `kind`) missing from this object is
  * dropped by the `onmessage` handler before touching the DOM. */
-function renderLiveFeedScript(): string {
+function renderLiveFeedScript(eventsPath: string): string {
   const displayFields = JSON.stringify(PUBLIC_PAGE_DISPLAY_FIELDS);
   return `<script>
     (function () {
@@ -237,9 +247,9 @@ function renderLiveFeedScript(): string {
       if (!feed || typeof EventSource === "undefined") return;
 
       // Read-only: this is the ONLY network call the live feed makes — a GET
-      // against the public live-tail route, never the authenticated surface
-      // and never a mutation.
-      var source = new EventSource("/public/events");
+      // against the live-tail route matching this page's own auth state
+      // (never a mutation).
+      var source = new EventSource(${JSON.stringify(eventsPath)});
       source.onmessage = function (evt) {
         var payload;
         try {
@@ -283,31 +293,68 @@ const PAGE_STYLE = `
   section { margin-bottom: 2.5rem; }
 `;
 
+/** Options for {@link renderPublicPage} distinguishing the two callers that
+ * share this rendering: the always-public `/public` history (redirected
+ * from, pre-#4795) and the single-URL dashboard root `/` (issue #4795),
+ * which renders this same page in either its public or authenticated
+ * variant depending on whether `accessAuth.ts` validated a JWT. */
+export interface RenderPageOptions {
+  /** `true` once the caller has already verified the visitor's Access JWT
+   * (`src/accessAuth.ts`) — changes only the heading/subtitle copy below;
+   * it does NOT change what this function renders. The caller is entirely
+   * responsible for choosing redacted vs. unredacted `snapshot`/`history`
+   * to match this flag (see the function doc). */
+  isAuthenticated?: boolean;
+  /** Where the "Sign in" link (shown only when `isAuthenticated` is falsy)
+   * points. Defaults to `/login` (issue #4795's new Access-gated route). */
+  loginPath?: string;
+}
+
 /**
- * Render the full `/public` HTML document from already-redacted data.
- * `snapshot`/`history` MUST already have passed through
- * `redactFleetSnapshot`/`redactHistoryQueryResult` with `isAuthenticated:
- * false` — this function performs no redaction itself, only formatting, per
- * the module doc's single-enforcement-point rule (`redaction.ts` owns
- * redaction; this module owns display).
+ * Render the full dashboard HTML document — the public, redacted view when
+ * `options.isAuthenticated` is falsy/absent, or the full authenticated view
+ * when it is `true`. This function performs no redaction itself, only
+ * formatting, per the module doc's single-enforcement-point rule
+ * (`redaction.ts` owns redaction; this module owns display) — **callers are
+ * entirely responsible for the data/flag pairing**:
+ *
+ * - Public (`isAuthenticated` falsy): `snapshot`/`history` MUST already have
+ *   passed through `redactFleetSnapshot`/`redactHistoryQueryResult` with
+ *   `isAuthenticated: false`.
+ * - Authenticated (`isAuthenticated: true`): pass the raw, unredacted
+ *   snapshot/history straight from `fleetStateStub`/`queryHistory` — do NOT
+ *   redact first, or an authenticated operator would see the public view's
+ *   data despite the "Dashboard" heading.
  */
-export function renderPublicPage(snapshot: RedactedFleetSnapshot, history: HistoryQueryResult): string {
+export function renderPublicPage(
+  snapshot: RedactedFleetSnapshot,
+  history: HistoryQueryResult,
+  options: RenderPageOptions = {},
+): string {
+  const isAuthenticated = options.isAuthenticated ?? false;
+  const loginPath = options.loginPath ?? "/login";
+
+  const heading = isAuthenticated ? "Loom Fleet — Dashboard" : "Loom Fleet — Public View";
+  const subtitle = isAuthenticated
+    ? `<p class="subtitle">Signed in — full, unredacted fleet detail.</p>`
+    : `<p class="subtitle">
+    Unauthenticated, redacted snapshot of fleet activity. Private-repository
+    records show only aggregate lifecycle/timing detail — never a repo name,
+    issue, branch, or PR link.
+    <a href="${escapeHtml(loginPath)}">Sign in</a> for the full view.
+  </p>`;
+
   return `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Loom Fleet — Public View</title>
+  <title>${heading}</title>
   <style>${PAGE_STYLE}</style>
 </head>
 <body>
-  <h1>Loom Fleet — Public View</h1>
-  <p class="subtitle">
-    Unauthenticated, redacted snapshot of fleet activity. Private-repository
-    records show only aggregate lifecycle/timing detail — never a repo name,
-    issue, branch, or PR link. Data sourced exclusively from
-    <code>/public/*</code>.
-  </p>
+  <h1>${heading}</h1>
+  ${subtitle}
 
   ${renderFleetOverview(snapshot)}
   ${renderHistoryTable(history)}
@@ -320,7 +367,7 @@ export function renderPublicPage(snapshot: RedactedFleetSnapshot, history: Histo
     </table>
   </section>
 
-  ${renderLiveFeedScript()}
+  ${renderLiveFeedScript(isAuthenticated ? "/api/events" : "/public/events")}
 </body>
 </html>`;
 }

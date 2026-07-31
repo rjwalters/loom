@@ -14,11 +14,16 @@ Query API reference: [`docs/query-api.md`](docs/query-api.md) — includes the
 `/api/*` (authenticated) vs. `/public/*` (redacted) route split and the
 visibility-based redaction policy (issue #4727).
 
-**Out of scope for this repo**: Worker-side Cloudflare Access JWT
-verification — the [Access guide](docs/cloudflare-access.md) covers gating
-`/api/*` via the edge proxy instead; the Worker only decides *what a request
-sees* (via the route it reached), never *whether it should have reached
-here*.
+**`/api/*` vs. `/public/*` remains a route-based auth split, not an
+in-Worker one**: the [Access guide](docs/cloudflare-access.md) covers gating
+`/api/*` via the edge proxy; the Worker decides what a `/api/*`/`/public/*`
+request sees purely by which route matched, never by verifying a credential
+itself. **The one exception is the dashboard root `/`** (issue
+[#4795](https://github.com/rjwalters/loom/issues/4795)): it validates the
+visitor's Cloudflare Access JWT in-Worker (`src/accessAuth.ts`) so a single
+URL can serve both an anonymous public view and, for an allowed identity, the
+full dashboard — see the Access guide's §5 for exactly what that check
+covers and its fail-closed contract.
 
 ## Architecture
 
@@ -124,12 +129,15 @@ asserts the `ADMIN_TOKEN` secret exists on the deployed Worker.
 | `GET /public/fleet-state` | none (always public) | Public query API: same data as `/api/fleet-state`, redacted per record `visibility` (issue #4727). |
 | `GET /public/history` | none (always public) | Public query API: same data as `/api/history`, redacted. |
 | `GET /public/events` | none (always public) | Public query API: same data as `/api/events`, redacted. |
-| `GET /public` | none (always public) | The public dashboard page itself (issue #4753) — server-rendered fleet overview + history from the same redacted data above, plus a live feed over `/public/events`. Read-only; never calls `/api/*`. |
+| `GET /` | **in-Worker** Access JWT check (`src/accessAuth.ts`) — the only route that verifies a credential itself | The dashboard page (issues #4753, #4795). A valid, correctly-audienced `CF_Authorization` cookie renders the full unredacted view (live feed over `/api/events`); **anything else** — no cookie, malformed/expired/wrong-`aud` token, JWKS fetch failure — falls back to the redacted public view with a Sign in link (live feed over `/public/events`). Never a 302, never a 500. Read-only. |
+| `GET /login` | none in-Worker — **must** be behind Cloudflare Access | Bare 302 back to `/`. Its whole purpose is to make Access run the SSO round trip and mint the `CF_Authorization` cookie that `/` then validates. |
+| `GET /public` | none (always public) | 301 → `/` (issue #4795 merged the public page into the root; kept for old bookmarks). |
 
 Full request/response shapes for the `/api/*` and `/public/*` routes,
 including the exact redaction policy per record kind:
-[`docs/query-api.md`](docs/query-api.md). Cloudflare Access setup to actually
-gate `/api/*` at the edge (this backend never verifies auth itself):
+[`docs/query-api.md`](docs/query-api.md). Cloudflare Access setup to gate
+`/login`, `/api/*`, and `/admin/*` at the edge — and to leave `/` ungated so
+its in-Worker fallback can run:
 [`docs/cloudflare-access.md`](docs/cloudflare-access.md).
 
 ## Design decisions worth knowing

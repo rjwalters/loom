@@ -35,13 +35,35 @@
  *                                      summarized (see `./redaction.ts`).
  *   GET  /public/history             — public: same query, redacted.
  *   GET  /public/events              — public: same live tail, redacted.
- *   GET  /public                     — public: the Phase-3 dashboard page
- *                                      itself (issue #4753), server-rendered
- *                                      from the same redacted data the three
- *                                      routes above return. See
- *                                      `./publicPage.ts` for the rendering +
- *                                      the token/cost-widget exposure
- *                                      decision.
+ *   GET  /public                     — 301s to `/` (issue #4795 — the
+ *                                      single-URL fallback layout replaced
+ *                                      the separate public path; kept as a
+ *                                      redirect only so old bookmarks/links
+ *                                      still work).
+ *   GET  /                            — single-URL dashboard root (issue
+ *                                      #4795): validates the visitor's
+ *                                      Cloudflare Access JWT, carried as the
+ *                                      `CF_Authorization` cookie (see
+ *                                      `./accessAuth.ts`). A valid,
+ *                                      correctly-audienced token renders the
+ *                                      full authenticated dashboard (same
+ *                                      page as the old `/public`, but with
+ *                                      unredacted data + `/api/*` live
+ *                                      feed); anything else — no cookie, a
+ *                                      malformed/expired/wrong-aud token, a
+ *                                      JWKS fetch failure — fails CLOSED to
+ *                                      the redacted public view with a
+ *                                      "Sign in" link, exactly like the old
+ *                                      `/public` page. Never a 500, never
+ *                                      the full view on a doubtful token.
+ *   GET  /login                      — Access-gated at the edge (config,
+ *                                      not code — see
+ *                                      `docs/cloudflare-access.md`): the
+ *                                      only job of this route, once Access
+ *                                      lets a request through, is to bounce
+ *                                      back to `/` so the freshly-minted
+ *                                      `CF_Authorization` cookie is
+ *                                      re-validated there.
  *
  * All `/admin/*` routes require `Authorization: Bearer <ADMIN_TOKEN>`
  * (a `wrangler secret`, never committed) — see README.md.
@@ -53,12 +75,15 @@
  * else… Allow" rule the Access guide already documents), `/public/*` is
  * always unauthenticated and always redacted, mirroring the `/public` path
  * that guide already reserves as a Bypass application. Neither route
- * verifies a JWT or any other credential in-Worker — per the epic's
- * constraint, that verification lives entirely at the Cloudflare Access
- * edge layer.
+ * verifies a JWT or any other credential in-Worker. **The dashboard root `/`
+ * is the one exception** (issue #4795): it is the Worker's first in-Worker
+ * credential check, added specifically so a single URL can serve both
+ * audiences — see `./accessAuth.ts`'s module doc for the full fail-closed
+ * contract.
  */
 
 import { extractBearerToken, authenticateHost, hashIngestKey } from "./auth";
+import { validateAccessJwt } from "./accessAuth";
 import { FleetState, type FleetSnapshot } from "./fleetState";
 import { renderPublicPage } from "./publicPage";
 import {
@@ -80,6 +105,11 @@ export interface Env {
   RETENTION_DAYS?: string;
   MAX_RECORDS?: string;
   ADMIN_TOKEN?: string;
+  /** Single-URL dashboard root (issue #4795) — see `./accessAuth.ts`. Both
+   * are plain, non-secret `[vars]`; leaving either unset makes `/` always
+   * render the public view (fails closed, never the other way). */
+  CF_ACCESS_TEAM_DOMAIN?: string;
+  CF_ACCESS_AUD?: string;
 }
 
 /** A single global Durable Object instance holds fleet-wide live state —
@@ -343,23 +373,54 @@ function handleLiveTail(request: Request, env: Env, url: URL, isAuthenticated: b
   });
 }
 
-/** `GET /public` (issue #4753) — the unauthenticated dashboard page itself.
- * Sources its data by calling `fleetStateStub`/`queryHistory` directly, the
- * same in-process calls `handleFleetStateQuery`/`handleHistoryQuery` make,
- * then redacts with `isAuthenticated: false` before handing off to
- * `./publicPage.ts` for rendering — there is no HTTP round-trip through
- * `/api/*` anywhere in this path, so this route cannot accidentally source
- * unredacted data. */
-async function handlePublicPage(env: Env): Promise<Response> {
+/** The single-URL dashboard root's page body (issue #4795; originally issue
+ * #4753's `/public` page, generalized here to serve both variants). Sources
+ * its data by calling `fleetStateStub`/`queryHistory` directly, the same
+ * in-process calls `handleFleetStateQuery`/`handleHistoryQuery` make.
+ *
+ * `isAuthenticated: false` (the `/` fallback / old `/public`) redacts before
+ * handing off to `./publicPage.ts` — there is no HTTP round-trip through
+ * `/api/*` anywhere in this path, so this branch cannot accidentally source
+ * unredacted data. `isAuthenticated: true` (a validated Access identity)
+ * passes the raw snapshot/history straight through instead — the caller
+ * (the root route below) has already confirmed the JWT via
+ * `./accessAuth.ts` before reaching here. */
+async function handleDashboardPage(env: Env, isAuthenticated: boolean): Promise<Response> {
   const stateResponse = await fleetStateStub(env).fetch("https://fleet-state/snapshot");
   const snapshot = (await stateResponse.json()) as FleetSnapshot;
-  const redactedSnapshot = redactFleetSnapshot(snapshot, /* isAuthenticated */ false);
+  const displaySnapshot = isAuthenticated ? snapshot : redactFleetSnapshot(snapshot, false);
 
   const historyResult = await queryHistory(env.DB, { limit: DEFAULT_HISTORY_LIMIT });
-  const redactedHistory = redactHistoryQueryResult(historyResult, /* isAuthenticated */ false);
+  const displayHistory = isAuthenticated ? historyResult : redactHistoryQueryResult(historyResult, false);
 
-  const html = renderPublicPage(redactedSnapshot, redactedHistory);
-  return new Response(html, { status: 200, headers: { "content-type": "text/html; charset=utf-8" } });
+  const html = renderPublicPage(displaySnapshot, displayHistory, { isAuthenticated });
+  return new Response(html, {
+    status: 200,
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      // One URL, two bodies, keyed on a cookie: any shared cache that stored
+      // the authenticated variant and replayed it to an anonymous visitor
+      // would be a data leak that no amount of in-Worker verification could
+      // catch. Worker responses are not edge-cached by default, but a zone
+      // cache rule or an intermediary proxy could change that — so state the
+      // requirement rather than rely on the default. `Vary: Cookie` is
+      // belt-and-braces for any cache that ignores `private`/`no-store`.
+      "cache-control": "private, no-store",
+      vary: "Cookie",
+    },
+  });
+}
+
+/** `GET /` (issue #4795) — validate the visitor's Access JWT (the
+ * `CF_Authorization` cookie; see `./accessAuth.ts`'s module doc for why this
+ * is a cookie, not the `Cf-Access-Jwt-Assertion` header) and serve the
+ * matching dashboard variant. Fails CLOSED to the public variant on
+ * anything but a fully valid, correctly-audienced token — never a 500,
+ * never the full view on a doubtful token (this issue's core acceptance
+ * criterion). */
+async function handleRoot(request: Request, env: Env): Promise<Response> {
+  const identity = await validateAccessJwt(request.headers.get("cookie"), env);
+  return handleDashboardPage(env, identity !== null);
 }
 
 // ---------------------------------------------------------------------------
@@ -395,10 +456,22 @@ export default {
       return handleLiveTail(request, env, url, /* isAuthenticated */ false);
     }
     if (request.method === "GET" && url.pathname === "/public") {
-      return handlePublicPage(env);
+      // Issue #4795: the single-URL fallback layout replaced the separate
+      // public path — `/` now serves the same content (redacted, for an
+      // unauthenticated visitor). A permanent redirect keeps old
+      // bookmarks/links working without a second route to maintain.
+      return Response.redirect(new URL("/", request.url).toString(), 301);
+    }
+    if (request.method === "GET" && url.pathname === "/login") {
+      // Access-gated at the edge (config, not code — see
+      // docs/cloudflare-access.md). By the time this Worker code runs,
+      // Access has already minted the `CF_Authorization` session cookie;
+      // this route's only job is to bounce back to `/`, where that cookie
+      // gets validated.
+      return Response.redirect(new URL("/", request.url).toString(), 302);
     }
     if (request.method === "GET" && url.pathname === "/") {
-      return new Response("loom-observability-ingest: see /ingest, /admin/*, /api/*, /public/*", { status: 200 });
+      return handleRoot(request, env);
     }
     return jsonError(404, "not found");
   },
