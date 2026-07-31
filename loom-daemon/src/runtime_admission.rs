@@ -246,7 +246,17 @@ fn type_name_of(value: &serde_json::Value) -> &'static str {
 fn roots(root: &Path) -> (PathBuf, PathBuf, PathBuf) {
     let installed = root.join(".loom");
     let defaults = root.join("defaults");
-    let manifests = if installed.join("roles").is_dir() && installed.join("runtimes").is_dir() {
+    // Each subdirectory falls back to `defaults/` independently (#4688): a
+    // consumer repo can have `.loom/roles/` populated while `.loom/runtimes/`
+    // is still missing (a provisioning gap on older installs), and gating
+    // BOTH choices on a single combined boolean sent every dispatch on that
+    // host to a nonexistent `defaults/roles/...` path, rejecting all of them.
+    let roles = if installed.join("roles").is_dir() {
+        installed.clone()
+    } else {
+        defaults.clone()
+    };
+    let runtimes = if installed.join("runtimes").is_dir() {
         installed.clone()
     } else {
         defaults.clone()
@@ -256,7 +266,7 @@ fn roots(root: &Path) -> (PathBuf, PathBuf, PathBuf) {
     } else {
         defaults
     };
-    (manifests.join("roles"), manifests.join("runtimes"), scripts.join("scripts"))
+    (roles.join("roles"), runtimes.join("runtimes"), scripts.join("scripts"))
 }
 
 pub fn resolve_and_admit(
@@ -335,9 +345,33 @@ pub fn resolve_and_admit(
     let role_doc: RoleManifest = serde_json::from_slice(&role_data).map_err(|e| {
         reject(format!("malformed role manifest {}: {e}", role_manifest.display()), vec![])
     })?;
-    let runtime_data = fs::read(&runtime_manifest).map_err(|e| {
-        reject(format!("runtime manifest {}: {e}", runtime_manifest.display()), vec![])
-    })?;
+    let runtime_data = match fs::read(&runtime_manifest) {
+        Ok(data) => data,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && runtime == BUILTIN_RUNTIME => {
+            // #4688: the builtin `claude` runtime is the zero-config default;
+            // its capability manifest is additive, not a hard dependency. A
+            // provisioning gap that leaves `.loom/runtimes/` (and any
+            // `defaults/runtimes/` fallback) without a `claude.json` must not
+            // fail closed for every dispatch on that host — admit with no
+            // capability constraints instead. Non-builtin runtimes keep
+            // failing closed below: their manifest is the only source of
+            // truth for what they can do.
+            return Ok(ResolvedRuntime {
+                role: canonical.to_string(),
+                runtime,
+                source,
+                adapter,
+                role_manifest,
+                runtime_manifest,
+            });
+        }
+        Err(e) => {
+            return Err(reject(
+                format!("runtime manifest {}: {e}", runtime_manifest.display()),
+                vec![],
+            ));
+        }
+    };
     let runtime_doc: RuntimeManifest = serde_json::from_slice(&runtime_data).map_err(|e| {
         reject(
             format!("malformed runtime manifest {}: {e}", runtime_manifest.display()),
@@ -717,6 +751,97 @@ mod tests {
         let rejected =
             resolve_and_admit(installed.path(), "sweep-lifecycle", Some("codex")).unwrap_err();
         assert_eq!(rejected.unmet_capabilities, vec!["worktreeIsolation"]);
+    }
+
+    /// `roots()` must resolve each subdirectory's source independently
+    /// (#4688): a workspace with `.loom/roles/` present but `.loom/runtimes/`
+    /// absent must still resolve `roles` from `.loom/roles`, not fall through
+    /// to `defaults/roles` just because `runtimes` is missing.
+    #[test]
+    fn roots_resolves_roles_and_runtimes_independently() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join(".loom/roles")).unwrap();
+        fs::create_dir_all(root.path().join("defaults/runtimes")).unwrap();
+        fs::create_dir_all(root.path().join("defaults/scripts")).unwrap();
+        // `.loom/roles` exists but `.loom/runtimes` and `.loom/scripts` do not.
+        let (roles, runtimes, scripts) = roots(root.path());
+        assert_eq!(roles, root.path().join(".loom/roles"));
+        assert_eq!(runtimes, root.path().join("defaults/runtimes"));
+        assert_eq!(scripts, root.path().join("defaults/scripts"));
+    }
+
+    /// #4688 regression: a consumer repo can have `.loom/roles/` fully
+    /// provisioned while `.loom/runtimes/` is still missing (the exact live
+    /// incident layout — a provisioning gap on installs that predate
+    /// `defaults/runtimes/`). The per-directory `roots()` fallback resolves
+    /// roles from `.loom/roles` even though runtimes falls through, and the
+    /// builtin `claude` runtime — whose manifest is absent from BOTH
+    /// `.loom/runtimes/` and any `defaults/runtimes/` fallback, since this
+    /// fixture has no `defaults/` at all — degrades open rather than
+    /// rejecting the dispatch.
+    #[test]
+    fn consumer_layout_missing_runtimes_dir_still_admits_claude() {
+        let root = tempfile::tempdir().unwrap();
+        let loom_roles = root.path().join(".loom/roles");
+        fs::create_dir_all(&loom_roles).unwrap();
+        fs::write(
+            loom_roles.join("builder.json"),
+            r#"{"runtimeRequirements":["worktreeIsolation","mcp"]}"#,
+        )
+        .unwrap();
+        let loom_scripts = root.path().join(".loom/scripts");
+        fs::create_dir_all(&loom_scripts).unwrap();
+        let adapter = loom_scripts.join("spawn-claude.sh");
+        fs::write(&adapter, "#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&adapter, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // No `.loom/runtimes/` and no `defaults/` at all — the exact live
+        // incident layout.
+        assert!(!root.path().join(".loom/runtimes").exists());
+        assert!(!root.path().join("defaults").exists());
+
+        let admitted = resolve_and_admit(root.path(), "sweep-lifecycle", None).unwrap();
+        assert_eq!(admitted.runtime, "claude");
+        // Roles resolved from `.loom/roles` — the per-directory fallback
+        // means the absence of `.loom/runtimes/` does NOT drag roles down
+        // to `defaults/roles` too.
+        assert!(admitted
+            .role_manifest
+            .starts_with(root.path().join(".loom")));
+        // Runtimes independently fall through to `defaults/runtimes` (which
+        // does not exist in this fixture either) since `.loom/runtimes/` is
+        // absent — and admission still succeeds because the missing
+        // manifest degrades open for the builtin runtime instead of
+        // rejecting the dispatch.
+        assert!(admitted
+            .runtime_manifest
+            .starts_with(root.path().join("defaults/runtimes")));
+    }
+
+    /// The degrade-open behaviour is scoped to the builtin `claude` runtime
+    /// only. An explicit non-builtin runtime with a missing manifest must
+    /// still fail closed — a regression guard against over-widening the
+    /// #4688 fix beyond the zero-config default.
+    #[test]
+    fn consumer_layout_missing_runtimes_dir_non_builtin_still_fails_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let loom_roles = root.path().join(".loom/roles");
+        fs::create_dir_all(&loom_roles).unwrap();
+        fs::write(loom_roles.join("judge.json"), "{}").unwrap();
+        let loom_scripts = root.path().join(".loom/scripts");
+        fs::create_dir_all(&loom_scripts).unwrap();
+        let adapter = loom_scripts.join("spawn-codex.sh");
+        fs::write(&adapter, "#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&adapter, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let rejected = resolve_and_admit(root.path(), "judge", Some("codex")).unwrap_err();
+        assert!(rejected.reason.contains("runtime manifest"), "{}", rejected.reason);
     }
 
     #[test]

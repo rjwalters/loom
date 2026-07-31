@@ -955,6 +955,71 @@ else
     fi
 fi
 
+# --- (w) .loom/runtimes/ backfill for a workspace that never had it (#4688) --
+echo "Test group 21: .loom/runtimes/ is backfilled when absent (#4688)"
+# Builds its own throwaway repo rather than reusing make_fixture(), so it can
+# deliberately NOT create .loom/runtimes/ at all — the exact live-incident
+# layout: .loom/roles/ (and the rest of a normal install) present, but
+# .loom/runtimes/ was never provisioned by any prior install/resync.
+RUNTIMES_REPO="$WORKDIR/runtimes-repo"
+rm -rf "$RUNTIMES_REPO"
+mkdir -p "$RUNTIMES_REPO/defaults/roles" "$RUNTIMES_REPO/defaults/runtimes" \
+         "$RUNTIMES_REPO/.loom/roles"
+git -C "$RUNTIMES_REPO" init -q
+printf 'ROLE\n' > "$RUNTIMES_REPO/defaults/roles/builder.md"
+printf 'ROLE\n' > "$RUNTIMES_REPO/.loom/roles/builder.md"
+printf '{"runtime":"claude","capabilities":{"mcp":"yes"}}\n' > "$RUNTIMES_REPO/defaults/runtimes/claude.json"
+printf '{\n  "loom_version": "0.0.0",\n  "loom_commit": "old",\n  "install_date": "2020-01-01",\n  "loom_source": "%s",\n  "installed_files": []\n}\n' \
+    "$RUNTIMES_REPO" > "$RUNTIMES_REPO/.loom/install-metadata.json"
+git -C "$RUNTIMES_REPO" add -A >/dev/null 2>&1
+git -C "$RUNTIMES_REPO" commit -qm "fixture" >/dev/null 2>&1
+
+if [[ ! -d "$RUNTIMES_REPO/.loom/runtimes" ]]; then
+    pass "(w) fixture precondition: .loom/runtimes/ absent before resync"
+else
+    fail "(w) fixture precondition: .loom/runtimes/ unexpectedly present before resync"
+fi
+
+# --dry-run must report the directory would be populated, without writing.
+OUT="$(cd "$RUNTIMES_REPO" && bash "$SCRIPT" --dry-run 2>&1)"
+if grep -q "runtimes/claude.json" <<<"$OUT"; then
+    pass "(w) --dry-run reports runtimes/claude.json would be created"
+else
+    fail "(w) --dry-run did not mention runtimes/claude.json"
+fi
+if [[ ! -d "$RUNTIMES_REPO/.loom/runtimes" ]]; then
+    pass "(w) --dry-run does not create .loom/runtimes/"
+else
+    fail "(w) --dry-run created .loom/runtimes/ (should be preview-only)"
+fi
+
+# apply: the directory must now exist and be populated from defaults/.
+OUT="$(cd "$RUNTIMES_REPO" && bash "$SCRIPT" 2>&1)"
+RC=$?
+if [[ $RC -eq 0 ]]; then
+    pass "(w) apply exits 0"
+else
+    fail "(w) apply did not exit 0 (got $RC)"
+fi
+if [[ -d "$RUNTIMES_REPO/.loom/runtimes" ]]; then
+    pass "(w) .loom/runtimes/ created by apply"
+else
+    fail "(w) .loom/runtimes/ was not created by apply"
+fi
+if [[ "$(cat "$RUNTIMES_REPO/.loom/runtimes/claude.json" 2>/dev/null)" == '{"runtime":"claude","capabilities":{"mcp":"yes"}}' ]]; then
+    pass "(w) .loom/runtimes/claude.json populated from defaults/runtimes/"
+else
+    fail "(w) .loom/runtimes/claude.json missing or content mismatch"
+fi
+# second run is a clean no-op.
+OUT="$(cd "$RUNTIMES_REPO" && bash "$SCRIPT" 2>&1)"
+RC=$?
+if [[ $RC -eq 0 ]] && grep -q "Already in sync" <<<"$OUT"; then
+    pass "(w) runtimes backfill is idempotent (second run already in sync)"
+else
+    fail "(w) runtimes backfill is not idempotent (rc=$RC)"
+fi
+
 # --- contract checks ---------------------------------------------------------
 echo "Test group 13: flag/contract checks"
 if bash "$SCRIPT" --help 2>&1 | grep -q "resync-installed.sh"; then
