@@ -4580,10 +4580,20 @@ the operator only ever created the issue.
 An **opt-in, off-by-default** telemetry exporter that pushes fleet telemetry
 (sweep lifecycle/outcome, token-pool snapshots, host health) to a configured
 HTTP(S) sink. This is the daemon-side half of epic #4702's rich fleet
-dashboard; the Phase-2 Cloudflare Workers backend (the first real sink) is a
-separate, later issue — this issue ships value standalone, with no cloud
-dependency: a disabled or under-configured `observability` block is a
-zero-syscall no-op, exactly like `autonomous.idleExit` above.
+dashboard; the Phase-2 Cloudflare Workers backend (#4725) is the first real
+sink. The exporter ships value standalone, with no cloud dependency: a
+disabled or under-configured `observability` block is a zero-syscall no-op,
+exactly like `autonomous.idleExit` above.
+
+**Standing up your own sink**: the Workers backend is a deploy-to-your-own-
+account template — `wrangler.toml` plus a runbook that walks account/D1
+setup, migrations, ingest-key generation and rotation, and pointing the
+`observability` block below at the result, with a companion guide for gating
+the authenticated view behind Cloudflare Access. Both live beside the backend
+in the upstream Loom repo (not shipped to consumer installs):
+[`dashboard/docs/deploy-runbook.md`](https://github.com/rjwalters/loom/blob/main/dashboard/docs/deploy-runbook.md)
+and
+[`dashboard/docs/cloudflare-access.md`](https://github.com/rjwalters/loom/blob/main/dashboard/docs/cloudflare-access.md).
 
 ### Config surface (`.loom/config.json → observability`)
 

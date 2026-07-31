@@ -12,10 +12,10 @@ consumes.
 Wire format reference: [`.loom/docs/telemetry-schema.md`](../.loom/docs/telemetry-schema.md).
 Query API reference: [`docs/query-api.md`](docs/query-api.md).
 
-**Out of scope for this repo** (later epic phases): Cloudflare Access auth,
-visibility-based redaction beyond faithfully storing the `visibility` tag
-(#4727, which wraps the query API added here), and a polished one-click
-deploy/hosting template (tracked separately — #4728).
+**Out of scope for this repo**: Worker-side Cloudflare Access JWT verification
+(the [Access guide](docs/cloudflare-access.md) covers gating via the edge
+proxy instead), and visibility-based redaction beyond faithfully storing the
+`visibility` tag (#4727, which wraps the query API added here).
 
 ## Architecture
 
@@ -41,7 +41,7 @@ set `ADMIN_TOKEN` for local testing via a `.dev.vars` file (gitignored,
 never commit it):
 
 ```bash
-echo 'ADMIN_TOKEN="local-dev-admin-token"' > .dev.vars
+cp .dev.vars.example .dev.vars
 ```
 
 Provision a host and push a batch exactly like the daemon does (bare JSON
@@ -78,22 +78,33 @@ isolated in-memory D1 instance with `migrations/` applied — see
 
 ## Deploying your own instance
 
-1. `npx wrangler d1 create loom-observability` and paste the returned
-   `database_id` into `wrangler.toml`.
-2. `npx wrangler d1 migrations apply loom-observability --remote`.
-3. `npx wrangler secret put ADMIN_TOKEN` (generate one with e.g.
-   `openssl rand -hex 32` — this gates every `/admin/*` route).
-4. `npm run deploy`.
-5. Provision each fleet host: `POST /admin/hosts {"host_id": "..."}`, capture
-   the returned `ingest_key` (shown once), and configure it on that host's
-   daemon (`loom-daemon`'s observability exporter config — endpoint +
-   ingest key).
-6. Revoke a compromised/decommissioned host at any time:
-   `POST /admin/hosts/<host_id>/revoke` — other hosts' keys are unaffected.
+The short version:
 
-A full hosting template + turnkey runbook (one-click deploy button, DNS/
-custom-domain guidance, etc.) is a separate, later issue (#4728); the steps
-above are the minimum needed to stand up a working instance.
+```bash
+npx wrangler login
+npx wrangler d1 create loom-observability      # paste database_id into wrangler.toml
+npx wrangler d1 migrations apply loom-observability --remote
+npm run preflight                              # fails while any template placeholder remains
+npm run deploy
+npx wrangler secret put ADMIN_TOKEN            # gates every /admin/* route
+```
+
+Then provision each fleet host (`POST /admin/hosts {"host_id": "..."}`,
+capture the once-shown `ingest_key`) and point that host's daemon at the
+endpoint via its `observability` config block.
+
+**[`docs/deploy-runbook.md`](docs/deploy-runbook.md) is the full
+walkthrough** — API-token scopes, verification commands after each step, key
+rotation/revocation, retention tuning, teardown, and a troubleshooting
+table. To gate the authenticated view behind SSO, follow it with
+[`docs/cloudflare-access.md`](docs/cloudflare-access.md).
+
+`npm run preflight` (`scripts/check-deploy-config.sh`) is the guard rail: it
+refuses to pass while `wrangler.toml` still holds a template placeholder,
+warns when a custom domain is configured with `workers_dev` still enabled
+(an unauthenticated bypass around any Access policy), and finishes with
+`wrangler deploy --dry-run`. `npm run preflight -- --remote` additionally
+asserts the `ADMIN_TOKEN` secret exists on the deployed Worker.
 
 ## Routes
 

@@ -1,0 +1,12 @@
+# Template for `.dev.vars` — the secrets `wrangler dev` loads for LOCAL
+# development only. Copy it and fill in your own values:
+#
+#   cp .dev.vars.example .dev.vars
+#
+# `.dev.vars` is gitignored; this `.example` file is committed and must never
+# contain a real secret. A deployed Worker does NOT read this file — set its
+# secrets with `wrangler secret put <NAME>` (see docs/deploy-runbook.md § 7).
+
+# Bearer token gating every /admin/* route. While unset, those routes answer
+# 503. Generate a real one with: openssl rand -hex 32
+ADMIN_TOKEN="local-dev-admin-token"
