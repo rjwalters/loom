@@ -39,7 +39,8 @@ document should be read as "Codex is safe to point at your repos".
 | `[sandbox_workspace_write] network_access` | Outbound network from inside a `workspace-write` sandbox. **Off by default.** | `LOOM_CODEX_NETWORK=1` → `-c sandbox_workspace_write.network_access=true`. Read only under `workspace-write`; inert otherwise. |
 | `sandbox_permissions` / `writable_roots` / `--add-dir` | Widen a `workspace-write` sandbox to extra readable/writable roots. | **Not driven by the adapter.** Passes through if an operator supplies it. |
 | `--skip-git-repo-check` | Waives Codex's refusal to run outside a git work tree. | Injected **only** when the cwd is genuinely not inside a work tree (see "Trusted-directory check" below). |
-| `$CODEX_HOME/hooks.json` (`pre_tool_use`, `permission_request`, `post_tool_use`, `user_prompt_submit`, `session_start`, `session_end`, `pre_compact`, `post_compact`, `subagent_start`, `subagent_stop`) | Per-tool-call and per-prompt interception — the direct analogue of Claude Code's hook taxonomy. | **Not wired by Loom in this phase.** This is the single most consequential residual gap; see gap 1. |
+| `$CODEX_HOME/hooks.json` (`pre_tool_use`, `permission_request`, `post_tool_use`, `user_prompt_submit`, `session_start`, `session_end`, `pre_compact`, `post_compact`, `subagent_start`, `subagent_stop`) | Per-tool-call and per-prompt interception — the direct analogue of Claude Code's hook taxonomy. | **`pre_tool_use` is now WIRED** (issue #4495) via the managed bridge `defaults/hooks/guard-codex-bridge.sh`, installed by `defaults/scripts/provision-codex-hooks.sh`. See "Managed `pre_tool_use` hook bridge" below. Every other event remains unwired. |
+| `$CODEX_HOME/config.toml` → `hooks.state."<id>".trusted_hash` | Persisted hook trust. A hook that has not been trusted does not run. | **Verified, never bypassed.** `spawn-codex.sh` fails closed (exit 78) for mutable roles when trust cannot be observed. `--dangerously-bypass-hook-trust` is never passed. |
 | `approval_policy` / `-a` | When Codex pauses to ask a human. | **Irrelevant to Loom.** `codex exec` is non-interactive and exposes no `-a` at all; there is no human to answer, so approvals gate nothing. The sandbox is the only load-bearing guard. |
 | `AGENTS.md` | Repository instructions, read natively by Codex via ancestor traversal. | Advisory context, not a boundary. Loom's `AGENTS.md` codegen is a separate issue (contract point 5). |
 
@@ -54,9 +55,9 @@ document should be read as "Codex is safe to point at your repos".
 3. **Codex has a hook system now.** The fork states Codex has no hooks "as a
    concept". On 0.146.0 it has a `hooks.json` engine with a `pre_tool_use`
    event, a persisted hook-trust model, and a
-   `--dangerously-bypass-hook-trust` escape hatch. The gap is therefore
-   *unwired*, not *impossible* — a materially better position than the fork
-   documented, and a concrete follow-up rather than an architectural dead end.
+   `--dangerously-bypass-hook-trust` escape hatch. The gap was therefore
+   *unwired*, not *impossible* — and issue #4495 wired it. See "Managed
+   `pre_tool_use` hook bridge" below.
 4. **A sandbox denial does not fail the run.** Verified with `-s read-only`: a
    blocked `touch` returns `Operation not permitted` to the model and the
    `codex exec` process still exits **0**. Denials are in-session tool
@@ -67,16 +68,222 @@ document should be read as "Codex is safe to point at your repos".
 ## Loom guard intent → Codex mechanism
 
 Loom's guards are Claude Code `PreToolUse` / `Stop` hooks wired in
-`.claude/settings.json` to scripts under `.loom/hooks/`. **None of them fire for
-a Codex worker** — they are Claude Code hooks, and Loom does not currently
-install anything into Codex's own `hooks.json`. The column below therefore
-records what Codex's *sandbox* incidentally covers, not what runs.
+`.claude/settings.json` to scripts under `.loom/hooks/`. As of issue #4495 the
+three `PreToolUse` guards DO fire for a Codex worker — not as Claude hooks, but
+through the managed `pre_tool_use` bridge described in the next section, which
+normalizes Codex's payload into the shape those same scripts already accept.
+The "Codex coverage" column below still records what the *sandbox* covers on its
+own, because the bridge only applies where it is provisioned AND trusted; a
+session without a ready managed hook falls back to sandbox-only coverage (and
+mutable roles are refused outright rather than run that way).
+
+## Managed `pre_tool_use` hook bridge (issue #4495)
+
+**Tested schema: codex-cli 0.146.0** (verified 2026-07-31 against the JSON
+schemas embedded in the shipped binary: `pre-tool-use.command.input` and
+`pre-tool-use.command.output`). Re-verify and bump this pin before wiring a
+newer Codex.
+
+### Shape
+
+```text
+Codex pre_tool_use JSON
+   │  { hook_event_name:"PreToolUse", tool_name, tool_input, cwd,
+   │    session_id, transcript_path, turn_id, tool_use_id, model,
+   │    permission_mode, agent_id, agent_type }
+   ▼
+defaults/hooks/guard-codex-bridge.sh
+   1. validate the event + classify the tool
+   2. normalize → a Claude-shaped internal guard request
+        shell  → { tool_name:"Bash",  tool_input:{command}, cwd }
+        patch  → { tool_name:"Write", tool_input:{file_path}, cwd }  (one per target)
+   3. dispatch into the EXISTING guards, unmodified:
+        guard-loom-workflow.sh · guard-destructive.sh · guard-worktree-paths.sh
+   4. encode the outcome on Codex's wire
+```
+
+There is **no second policy table**. Step 3 runs the same scripts the Claude
+path runs, so a policy change lands for both runtimes at once.
+
+### Runtime discrimination
+
+The Codex and Claude `PreToolUse` payloads share field names, so payload
+sniffing would be ambiguous and spoofable. The bridge is an **explicit wrapper**
+instead: it is installed *only* as a Codex `hooks.json` `pre_tool_use` command,
+it accepts only `hook_event_name == "PreToolUse"`, and Claude's
+`settings.json` never points at it.
+
+### Response encoding — 0.146.0 only supports `deny`
+
+The output schema advertises `permissionDecision: allow|deny|ask` plus
+`decision`, `continue`, `stopReason`, `suppressOutput`. The 0.146.0 engine
+**rejects almost all of it**; the binary carries these literal refusals:
+
+```text
+PreToolUse hook returned unsupported permissionDecision:allow
+PreToolUse hook returned unsupported permissionDecision:ask
+PreToolUse hook returned unsupported decision:approve
+PreToolUse hook returned unsupported continue:false
+PreToolUse hook returned unsupported stopReason
+PreToolUse hook returned unsupported suppressOutput
+PreToolUse hook returned permissionDecision:deny without a non-empty permissionDecisionReason
+```
+
+So exactly two things are expressible:
+
+| Outcome | Wire form |
+|---|---|
+| allow | emit **nothing**, exit 0 |
+| deny | `{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"<non-empty>"}}` |
+
+**`ask` is therefore not a policy choice, it is not on the wire at all.** Every
+Claude `ask` outcome is translated to `deny` with the original reason preserved
+and prefixed — which is also the only correct answer for `codex exec`, where
+there is no operator to ask.
+
+### Tool classification
+
+| Class | Tool names (0.146.0) | Handling |
+|---|---|---|
+| shell | `shell`, `shell_command`, `local_shell`, `exec_command`, `unified_exec`, `container.exec` | command string extracted from `command` / `cmd` / `action.command` / `input` (argv `<sh> -lc <script>` unwrapped to the script); run through `guard-loom-workflow.sh` then `guard-destructive.sh` |
+| patch | `apply_patch`, `write_file`, `edit_file`, `create_file`, `str_replace_editor` | every target path extracted (`*** Add/Update/Delete File:` + `*** Move to:` for the patch envelope, else `file_path`/`path`), canonicalized, run through `guard-worktree-paths.sh` |
+| opaque-mutating | `write_stdin` | **denied** — bytes into a live PTY are a second, un-inspectable command channel |
+| readonly | `update_plan`, `view_image`, `read_file`, `list_dir`, `glob`, `grep`, `web_search`, `read_mcp_resource`, `request_permissions` | allowed |
+| mcp | `mcp__*` / `mcp.*` | **passed through**, matching Claude exactly (Claude's matchers are `Bash` and `Edit\|Write`; MCP tools match neither). Denying them here would be stricter than Claude, not parity — see gap 10 |
+| unknown | anything else | **denied** (fail closed) |
+
+### Fail-closed contract (deliberately the inverse of the Claude guards)
+
+The Claude guards fail **open** so a broken guard cannot wedge every tool call.
+The bridge fails **closed**: malformed JSON, a wrong/missing `hook_event_name`,
+a missing `tool_name`, a mutating tool whose payload yields no command or path,
+an unknown tool, a sub-guard that exits non-zero, and a sub-guard that emits
+non-JSON all produce `deny`. It still always exits 0 — a non-zero exit is a
+*hook failure* on Codex's wire, not a decision.
+
+**The bridge's own death is also a deny.** On this wire an allow is expressed as
+**no output**, which makes a crashed guard indistinguishable from an approval —
+the single most dangerous way for a fail-closed design to fail. An `EXIT` trap
+therefore emits the deny for any exit path that has not already committed a
+decision (a `set -u` unbound variable, an unexpected abort, a `SIGTERM` from
+Codex's hook timeout), and forces the exit-0 contract so the deny is not
+discarded as a hook failure. Two residuals, both tested-around rather than
+fixable:
+
+- **`SIGKILL` is untrappable** by definition, so a hook killed outright after
+  the timeout grace period still produces silence. This is a named reason the
+  capability manifest stays `partial`.
+- Bash defers a trap until the **foreground child returns**, so a `SIGTERM`
+  arriving while a slow sub-guard is running lands after that sub-guard
+  finishes, not immediately.
+
+### Canonicalization
+
+Path decisions use `defaults/scripts/lib/canonical-path.sh`
+(`loom_canonical_path`), which resolves symlinks in every component that exists
+and normalizes the tail that does not — so a `Write` to a brand-new file still
+resolves, and `<worktree>/link-to-main/x` is recognized as the main checkout.
+This replaced `guard-worktree-paths.sh`'s purely lexical `os.path.normpath`, and
+it applies to the Claude path too. `guard-destructive-generic.sh`'s #4178 Bash
+write-confinement additionally compares against both the physical and the
+logical spelling of the main-checkout root, closing the same symlinked-ancestor
+hole for shell-derived writes.
+
+Untrusted JSON values are **never interpolated into a shell command**: paths and
+commands are passed to `jq`/`awk`/`python3` on stdin or as `--arg` values.
+
+### Provisioning and trust
+
+`defaults/scripts/provision-codex-hooks.sh install|verify|remove` owns the
+managed entry in `$CODEX_HOME/hooks.json`:
+
+- **`hooks.json` is shared user configuration.** The script parses it, merges
+  exactly one Loom-owned `PreToolUse` entry (self-identified by the
+  `guard-codex-bridge.sh` command plus a `--loom-hook-version N` marker),
+  validates the result, and replaces the file **atomically** with mode `0600`.
+  Every other event, group, handler, and unknown top-level key survives
+  byte-for-byte. A malformed operator file is never overwritten (exit 78).
+- **`remove`** deletes only Loom's entry (and any empty structure it leaves),
+  preserving credentials and user configuration.
+- **Credentials are never read, copied, parsed, or logged.** `auth.json` is not
+  touched by any subcommand; only the profile *directory name* is ever printed.
+- **`verify`** is read-only and reports readiness as JSON
+  (`{profile, ready, installed, trusted, stale, bridgeReadable, version, reason}`),
+  exit 0 ready / 78 not ready.
+- **`--all-profiles`** applies any subcommand to **every** pooled profile under
+  `LOOM_CODEX_PROFILE_ROOT` (default `~/.loom/codex-profiles` — the same root
+  `spawn-codex.sh` resolves `LOOM_CODEX_PROFILE` against and `loom-daemon
+  accounts add codex` populates), so "the managed hook is installed in every
+  selected pooled `CODEX_HOME`" is one command, not a hand-written loop. It
+  re-invokes the single-profile path once per profile (one implementation, not
+  two), emits JSONL under `--json`, and returns the **worst** per-profile exit —
+  a single untrusted profile fails the whole pool-wide `verify`.
+
+**Hook trust.** Codex persists trust as `hooks.state."<id>".trusted_hash` in
+`$CODEX_HOME/config.toml`, established interactively or waived with
+`--dangerously-bypass-hook-trust` (equivalently the `bypass_hook_trust` config
+key — Loom passes **neither**). On 0.146.0 there is **no documented
+non-interactive command to establish it**: `codex --help` lists no `hooks`
+subcommand, and `codex doctor --json`, run against a freshly provisioned
+temporary profile, emits **no hook check at all** — its 18 checks are
+`app_server.status`, `auth.credentials`, `config.load`, `git.environment`,
+`installation`, `mcp.config`, `network.*`, `runtime.*`, `sandbox.helpers`,
+`state.*`, `system.environment`, `terminal.*`, `updates.status`. Loom will not
+guess the identity string or the hash algorithm, and it will not pass the bypass
+flag. So `verify` fails closed instead, checking three things:
+
+1. **Structure** — Loom's entry is present at the expected version and names a
+   readable bridge belonging to this workspace.
+2. **Codex trust** — `config.toml` carries at least one `hooks.state` entry with
+   a non-empty `trusted_hash`. This is the only externally-observable Codex
+   trust signal; it proves the profile has been through the trust prompt, **not**
+   that Loom's specific entry was the thing trusted. That imprecision is one of
+   the reasons the capability manifest stays `partial` (gap 11).
+3. **Staleness** — the Loom-owned, non-secret receipt
+   `$CODEX_HOME/loom-codex-hooks.json` pins the SHA-256 of the managed entry as
+   installed. If the entry changed since, readiness is STALE and mutable roles
+   fail closed.
+
+Operator step — install pool-wide once, then trust **once per profile** (the
+trust prompt is interactive by necessity, gap 11):
+
+```bash
+# 1. install the managed hook into every pooled profile (idempotent, credential-free)
+.loom/scripts/provision-codex-hooks.sh install --all-profiles --workspace "$PWD"
+
+# 2. accept Codex's hook-trust prompt once per profile
+CODEX_HOME=~/.loom/codex-profiles/alice codex
+
+# 3. gate the pool: exit 0 only when EVERY profile is ready
+.loom/scripts/provision-codex-hooks.sh verify --all-profiles --workspace "$PWD" --json
+```
+
+Repeat step 1 after any `loom update` that changes the bridge — a changed
+managed entry reads as STALE and every mutable-role spawn fails closed until it
+is reinstalled and re-trusted.
+
+### Role-aware spawn preflight
+
+`spawn-codex.sh` emits one audit line per spawn:
+
+```text
+spawn-codex: hooks=<ready|not-ready|unavailable> role=<name> mutable=<bool> trust-bypass=never reason="…"
+```
+
+- **Mutable roles (`builder`, `doctor`, and their aliases)** exit **78 before the
+  CLI starts** unless `hooks=ready`. Missing, stale, wrong-version, untrusted,
+  unreadable, or ambient-profile states all fail closed.
+- **Read-only roles** keep the conservative sandbox fallback but are told
+  explicitly that hook parity was unavailable, and are never reported as
+  Builder-capable.
+- The audit line carries the profile *name* and the verdict only — no profile
+  path contents, no credential bytes.
 
 | Loom guard (`defaults/hooks/`) | Claude matcher | Intent | Codex coverage | How / why |
 |---|---|---|---|---|
-| `guard-destructive.sh` → `guard-destructive-generic.sh` | `Bash` | Deny catastrophic Bash (`rm -rf /`, force-push to `main`, `gh repo delete`, fork bombs, `curl … \| sh`, cloud/SQL destruction); ask on borderline ops; scope `rm` to the repo; Bash-tool write-confinement (`>`, `tee`, `sed -i`, `cp`/`mv`, #4178) | **partial** | `read-only` blocks every write, so under the adapter's default the destructive-write half is fully covered — more strictly than the guard itself. `workspace-write` blocks writes and `rm` outside the workspace root, and (with network off) blocks `curl \| sh` and remote cloud destruction by making the network unreachable. **Not covered:** command-pattern semantics. Codex cannot recognize `DROP DATABASE`, `DELETE` without `WHERE`, `git push --force` to `main`, or a fork bomb *as such* — anything reachable without leaving the workspace or the network proceeds. With `LOOM_CODEX_NETWORK=1` (which a Builder needs to push) the network-derived coverage evaporates and a force-push to `main` becomes reachable with nothing to stop it. |
-| `guard-worktree-paths.sh` | `Edit\|Write` | Confine Edit/Write to the builder's own `issue-N` worktree; deny escapes into the main checkout (#2441, #4007) | **partial** | `workspace-write` confines writes to the **workspace root** — a strictly coarser boundary. It blocks escaping the repo, but **not** the per-worktree boundary: a Codex builder can write into a sibling `issue-M` worktree, or into the main checkout, because all of those live under the same root. This is the exact class of escape #4178 documented. Mitigation: one Codex worker per workspace root, or narrow `writable_roots` by hand. |
-| `guard-loom-workflow.sh` | `Bash` | `gh pr merge` → `merge-pr.sh` redirect; `pip install -e` worktree block (#2495 + #4079 — still live after #4557 retired Loom's own Python package: it protects orchestrated *Python* repos and stops new frozen `~/.local/bin` console scripts shadowing the `loom-daemon` binary); `loom-daemon workspace` registry-mutation ask (#4326) | **none** | Pure command-pattern convention with no OS analogue. A Codex worker learns these only from `AGENTS.md` / role prompts — advisory, never enforced. |
+| `guard-destructive.sh` → `guard-destructive-generic.sh` | `Bash` | Deny catastrophic Bash (`rm -rf /`, force-push to `main`, `gh repo delete`, fork bombs, `curl … \| sh`, cloud/SQL destruction); ask on borderline ops; scope `rm` to the repo; Bash-tool write-confinement (`>`, `tee`, `sed -i`, `cp`/`mv`, #4178) | **partial** &rarr; **enforced with the managed hook** | With the #4495 bridge provisioned+trusted, the full command-pattern policy runs for every classified Codex shell tool, so this row becomes real parity. Without it, only the sandbox applies: `read-only` blocks every write, so under the adapter's default the destructive-write half is fully covered — more strictly than the guard itself. `workspace-write` blocks writes and `rm` outside the workspace root, and (with network off) blocks `curl \| sh` and remote cloud destruction by making the network unreachable. **Not covered:** command-pattern semantics. Codex cannot recognize `DROP DATABASE`, `DELETE` without `WHERE`, `git push --force` to `main`, or a fork bomb *as such* — anything reachable without leaving the workspace or the network proceeds. With `LOOM_CODEX_NETWORK=1` (which a Builder needs to push) the network-derived coverage evaporates and a force-push to `main` becomes reachable with nothing to stop it. |
+| `guard-worktree-paths.sh` | `Edit\|Write` | Confine Edit/Write to the builder's own `issue-N` worktree; deny escapes into the main checkout (#2441, #4007) | **partial** &rarr; **enforced with the managed hook** | With the #4495 bridge, `guard-worktree-paths.sh` runs for every Codex native patch/write target AND (via `guard-destructive-generic.sh`) for shell-derived write targets, giving per-worktree confinement. Without it, only the sandbox applies: `workspace-write` confines writes to the **workspace root** — a strictly coarser boundary. It blocks escaping the repo, but **not** the per-worktree boundary: a Codex builder can write into a sibling `issue-M` worktree, or into the main checkout, because all of those live under the same root. This is the exact class of escape #4178 documented. Mitigation: one Codex worker per workspace root, or narrow `writable_roots` by hand. |
+| `guard-loom-workflow.sh` | `Bash` | `gh pr merge` → `merge-pr.sh` redirect; `pip install -e` worktree block (#2495 + #4079 — still live after #4557 retired Loom's own Python package: it protects orchestrated *Python* repos and stops new frozen `~/.local/bin` console scripts shadowing the `loom-daemon` binary); `loom-daemon workspace` registry-mutation ask (#4326) | **none** &rarr; **enforced with the managed hook** | With the #4495 bridge these are real denies (and the `loom-daemon workspace` ASK becomes a deny, since Codex cannot express `ask` headless). Without it they are pure command-pattern convention with no OS analogue, learned only from `AGENTS.md` / role prompts — advisory, never enforced. |
 | `guard-background-subagents.sh` | `Stop` | Block one stop when the transcript shows dispatched-but-unresolved `Task` subagents, so ending a headless turn does not kill live background work (#4257) | **none** | Depends on Claude Code's `Stop` event and transcript shape. Codex has `session_end` and `subagent_stop` events that could host an equivalent, but nothing is wired (gap 1). Note the underlying hazard is *also* absent today: Loom does not dispatch Codex subagents at all. |
 | `guard-readonly-dirs.sh.template` | `Edit\|Write` | Optional per-project read-only path protection | **partial** | Expressible as narrowed `writable_roots` under `workspace-write`, but the adapter does not generate it — an operator must configure it manually. |
 | `skill-router.sh` | `UserPromptSubmit` | Inject an agent routing table / `AGENT_ROUTE` suggestion per prompt (opt-in) | **none** | Context injection, not a boundary. Codex has a `user_prompt_submit` hook event that could host it; unwired (gap 1). Static equivalent: `AGENTS.md`. |
@@ -159,31 +366,55 @@ mis-set cwd fails fast instead of retrying forever.
 
 Known, documented, and accepted for tier-2. None is silent.
 
-1. **Loom's guard hooks do not run at all.** This is the headline gap. Every
-   `PreToolUse` protection in `.loom/hooks/` is a Claude Code hook; a Codex
-   worker executes with none of them. Codex 0.146.0 *does* expose a
-   `$CODEX_HOME/hooks.json` engine with `pre_tool_use` / `user_prompt_submit` /
-   `post_tool_use` events and a hook-trust model, so this is a **wiring gap,
-   not an architectural one** — but it is unwired today, and no Loom guard
-   intent is mechanically enforced for Codex beyond what the sandbox happens to
-   cover. Closing it (translating `guard-destructive` / `guard-worktree-paths`
-   into Codex `pre_tool_use` handlers, and deciding how hook trust is
-   provisioned) is follow-up work, not part of this phase.
-2. **No per-worktree write isolation.** `workspace-write` confines to the
-   workspace root, not to one `issue-N` worktree. Parallel Codex builders under
-   one root are not isolated from each other or from the main checkout — the
-   #4178 escape class. Mitigation: one Codex worker per workspace root, or hand-
-   narrowed `writable_roots`.
-3. **No command-pattern blocking.** Codex cannot recognize a dangerous command
-   as dangerous. `DROP DATABASE`, `DELETE` without `WHERE`, `git push --force
-   origin main`, `systemctl stop`, a fork bomb — if it is reachable without
-   leaving the sandbox, it runs.
-4. **Loom's workflow nudges are advisory only.** The `gh pr merge` →
-   `merge-pr.sh` redirect, the `pip install -e` worktree block, and the
-   `loom-daemon workspace` ask are conventions Codex learns from `AGENTS.md` at
-   best. Nothing enforces them. **A Codex worker can merge a PR with
-   `gh pr merge`, bypassing `merge-pr.sh`'s worktree-cleanup and
-   merge-ordering handling.**
+1. ~~**Loom's guard hooks do not run at all.**~~ **CLOSED for `pre_tool_use`
+   (issue #4495)**, conditional on provisioning + trust: the managed bridge
+   dispatches the three `PreToolUse` guards for every classified Codex tool
+   call, and mutable roles refuse to start without it. What remains open:
+   **every other hook event is still unwired** — `user_prompt_submit`,
+   `post_tool_use`, `session_end`, `subagent_stop`, `pre_compact`. So
+   `skill-router` / `methodology-inject` (gap 6) and the `Stop`-event
+   background-subagent guard have no Codex equivalent. Also, a session running
+   **without** a provisioned/trusted managed hook still has zero guard coverage;
+   that state is now loud (`hooks=unavailable` in the audit line) and fatal for
+   Builder/Doctor rather than silent.
+2. **Per-worktree write isolation is enforced by the hook, not the sandbox.**
+   `workspace-write` still confines only to the workspace root, so a sibling
+   `issue-M` worktree and the main checkout remain inside the *kernel* boundary.
+   The managed hook is what denies those writes, which means the isolation is
+   only as strong as hook provisioning + trust. The sandbox-level alternative
+   (narrowing `sandbox_workspace_write.writable_roots` to the dispatched
+   worktree) is **not implemented** — it was evaluated as defense-in-depth and
+   deferred; the flag/TOML-key syntax still needs verification against a live
+   CLI.
+
+   **Sibling worktrees.** Whether a write into a *sibling* `issue-M` worktree is
+   denied is decided by the same two-mechanism split the Claude path has, not by
+   anything Codex-specific:
+
+   - With `LOOM_WORKTREE_PATH` set (a session pinned to one worktree — tmux,
+     manual, or any dispatcher that exports it), the fast path confines writes
+     to that worktree and **denies siblings**. The Codex hook process inherits
+     the variable, so this holds for Codex through the bridge exactly as it does
+     for Claude directly; the parity suite asserts both.
+   - Without it, the path-derived fallback cannot tell which managed worktree
+     the acting session owns (#4245), so a sibling write is **allowed** — again
+     for both runtimes identically.
+
+   Making Codex stricter here would fork the policy table, which this phase
+   explicitly does not do. Closing the fallback case is a shared-policy change
+   for both runtimes, and is out of scope for #4495.
+3. **Command-pattern blocking now comes from Loom, not Codex.** With the managed
+   hook in place, `DROP DATABASE`, `DELETE` without `WHERE`, `git push --force
+   origin main`, fork bombs, and `curl … | sh` are matched by
+   `guard-destructive-generic.sh` for a Codex worker. Codex itself still
+   recognizes none of them, so this coverage disappears entirely if the hook is
+   not provisioned/trusted.
+4. **Loom's workflow policy is now enforced, when the hook runs.** The
+   `gh pr merge` → `merge-pr.sh` redirect and the `pip install -e` worktree block
+   are real denies for a Codex worker; the `loom-daemon workspace` ASK becomes a
+   **deny** (Codex cannot express `ask`, and headless has nobody to ask), which
+   is stricter than Claude, not weaker. Without a ready hook they revert to
+   advisory-only.
 5. **Label-mutation commands are ungated for every runtime.** Nothing in Loom —
    Claude or Codex — gates `gh issue edit --add-label` / `--remove-label`. A
    worker can move an issue anywhere in the state machine. This is *not* a
@@ -212,6 +443,42 @@ Known, documented, and accepted for tier-2. None is silent.
    Codex has no policy hook that can block a session from calling them. Loom
    dispatch is one process per role via `spawn-worker.sh`, never native agents.
 
+10. **MCP tool calls are passed through, on purpose.** The bridge does not
+    inspect `mcp__*` tools, because Claude's own guards do not either (their
+    matchers are `Bash` and `Edit|Write`). This is parity, not coverage: an MCP
+    server that writes files is unguarded on **both** runtimes.
+11. **Hook trust is verified coarsely.** Codex 0.146.0 offers no documented
+    non-interactive way to establish hook trust, and no observable way to prove
+    that *Loom's* entry specifically is the trusted one. `verify` therefore
+    accepts "this profile has some trusted hook" plus Loom's own
+    receipt-pinned staleness check. Loom never passes
+    `--dangerously-bypass-hook-trust`. This is a named reason the capability
+    manifest stays `partial`.
+12. **`write_stdin` is denied, not confined.** Writing bytes into an
+    already-running PTY session is a mutation channel Loom cannot inspect, so it
+    is refused outright. A Codex worker that needs interactive input must run a
+    fresh, inspectable shell call instead.
+13. **The `hooks.json` matcher wildcard is unverified against a live CLI.** Loom
+    emits the Claude-compatible `"*"` (Codex's hook config format is a port of
+    Claude's, down to reading `CLAUDE_PLUGIN_ROOT`), but the 0.146.0 binary does
+    not document whether the matcher is a regex or a glob. If it is a regex,
+    `"*"` may not compile. Confirming this is a listed item in
+    `defaults/runtimes/codex.json`'s `capabilityGate.pending`, and it is one of
+    the reasons promotion waits on the real-CLI canary. `--matcher` /
+    `LOOM_CODEX_HOOK_MATCHER` let an operator override it without a code change.
+14. **A `SIGKILL`ed hook is silence, and silence is allow.** The bridge's `EXIT`
+    trap converts a crash or a `SIGTERM` into a deny, but a hook killed outright
+    after Codex's timeout grace period cannot emit anything, and this wire has no
+    way to express "allow" other than emitting nothing. Loom cannot close this
+    from inside the hook; the mitigations are the generous per-entry `timeout`
+    (default 30s, `--timeout` / `LOOM_CODEX_HOOK_TIMEOUT`) and the fact that the
+    sandbox is still underneath. Named reason the manifest stays `partial`.
+15. **No real-CLI canary evidence yet.** Every parity claim above is proven by
+    fixture-driven tests against the pinned 0.146.0 schemas, not by a live
+    `codex exec` run — and it cannot be, headlessly, until gap 11 (non-interactive
+    hook trust) has an answer: an untrusted hook does not run, so a `codex exec`
+    canary would prove nothing about the bridge. See "Promotion gate" below.
+
 ## Admission checklist (contract point 5/6)
 
 - [x] Guard-intent → mechanism map (above)
@@ -221,8 +488,48 @@ Known, documented, and accepted for tier-2. None is silent.
 - [x] Error-classification table for the runtime
       (`defaults/scripts/lib/classify-error.sh`, `codex` provider)
 - [x] Mocked CI smoke leg (`defaults/scripts/tests/test-spawn-codex.sh`)
-- [ ] Loom guard intent mechanically enforced under Codex — **open** (gap 1);
-      not required for tier-2, required for tier-1
+- [x] Loom guard intent mechanically enforced under Codex for `pre_tool_use`
+      (issue #4495) — bridge + provisioning + fail-closed spawn preflight, with
+      CI suites `test-guard-codex-bridge.sh` and `test-provision-codex-hooks.sh`
+- [ ] Real-CLI canary evidence recorded — **open** (gap 15); required before
+      capability promotion, and itself blocked on gap 11
+
+## Promotion gate (`hooks` / `worktreeIsolation`)
+
+`defaults/runtimes/codex.json` keeps `hooks: partial` and
+`worktreeIsolation: partial`, so `check-runtime-capabilities.sh` (and the
+daemon's `runtime_admission`) continue to reject **Builder + Codex** and
+**Doctor + Codex** with exit 78. `defaults/roles/doctor.json` now declares the
+same `runtimeRequirements` as Builder (`worktreeIsolation`, `mcp`), so Doctor
+fails closed for the same reason instead of slipping through unconstrained.
+
+The implementation and its test coverage have landed; promotion has not,
+because the evidence gate is not satisfied. `codex.json`'s `capabilityGate`
+block carries the machine-readable list; in prose the outstanding items are:
+
+1. **Real-CLI canary** in a disposable repository: one ALLOWED mutation inside a
+   managed worktree, plus DENIALS for a main-checkout file mutation and a
+   protected-branch destructive shell command, with before/after filesystem and
+   `git` evidence proving no denied side effect occurred.
+2. **Matcher semantics** confirmed on the live CLI (gap 13).
+3. **Hook trust** either given a documented non-interactive path or an accepted
+   operator-attested one-time step (gap 11). Item 1 is blocked on this: an
+   untrusted hook does not run, so a canary would prove nothing.
+
+**#4478 (operator sandbox posture) — DECIDED 2026-07-31.** Path 1-then-2: the
+interim posture is a **read-only default** with **Builder-role-only** escalation
+to `workspace-write` + `LOOM_CODEX_NETWORK=1`, scoped to one worker pool. This
+issue's implementation is the durable path-2 half. **No adapter change was
+needed to honor it** — `spawn-codex.sh` already defaults to `read-only` and
+already requires an explicit `LOOM_CODEX_SANDBOX=workspace-write` +
+`LOOM_CODEX_NETWORK=1` to escalate (see "Sandbox-mode mapping" above). Recording the
+decision here is deliberately *not* the same as promoting capability: promotion
+still waits on items 1–3, which are technical evidence, not posture.
+
+When items 1–3 are satisfied, promote **only** the capabilities the evidence
+proves, append the evidence links to this document, and leave `mcp`,
+`subagents`, and `skills` untouched. `subagents` stays `no` regardless — native
+Codex agents remain prohibited (gap 9).
 
 ## CODEX_HOME profile layout, refresh, and security posture
 

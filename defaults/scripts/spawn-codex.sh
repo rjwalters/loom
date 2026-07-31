@@ -593,6 +593,87 @@ else
     fi
 fi
 
+# --- Managed hook readiness / trust preflight (issue #4495) ---
+#
+# Loom's guard intent is enforced for Codex through a managed `pre_tool_use`
+# hook installed into the SELECTED profile's CODEX_HOME (see
+# provision-codex-hooks.sh and defaults/hooks/guard-codex-bridge.sh). That hook
+# is the only mechanism that gives a Codex worker managed-worktree confinement,
+# destructive-command blocking, and Loom workflow interception.
+#
+# Roles are therefore split by whether they mutate:
+#
+#   MUTABLE roles (builder, doctor) MUST prove the managed hook is installed at
+#   the expected version, pinned, readable, points at THIS workspace's bridge,
+#   and that the profile has established Codex hook trust. Any failure exits 78
+#   BEFORE the CLI starts. `--dangerously-bypass-hook-trust` is never passed —
+#   #4495's scope guards forbid it, and waiving trust would defeat the very
+#   boundary this preflight exists to prove.
+#
+#   READ-ONLY roles keep the existing conservative sandbox fallback, but the
+#   audit line states explicitly that hook parity was unavailable. They are
+#   never reported as Builder-capable; capability truth lives in
+#   defaults/runtimes/codex.json, which stays `partial` until the evidence gate
+#   in #4495 is satisfied.
+#
+# The audit line names the profile DIRECTORY NAME and the readiness verdict
+# only — never a profile path's contents and never a byte of auth.json.
+LOOM_CODEX_MUTABLE_ROLES="builder doctor"
+_hook_role="$(printf '%s' "${LOOM_ROLE:-}" | tr '[:upper:]_' '[:lower:]-')"
+case "$_hook_role" in
+    development-worker) _hook_role="builder" ;;
+    pr-fixer)           _hook_role="doctor" ;;
+esac
+
+_hook_role_is_mutable=false
+if [[ -n "$_hook_role" && " $LOOM_CODEX_MUTABLE_ROLES " == *" $_hook_role "* ]]; then
+    _hook_role_is_mutable=true
+fi
+
+_hook_provisioner="${_SCRIPT_DIR}/provision-codex-hooks.sh"
+_hook_status="unknown"
+_hook_reason=""
+
+if [[ ! -x "$_hook_provisioner" && ! -r "$_hook_provisioner" ]]; then
+    _hook_status="unavailable"
+    _hook_reason="provision-codex-hooks.sh is not installed next to this adapter"
+elif [[ -z "${CODEX_HOME:-}" ]]; then
+    # Ambient auth (tier 4): Loom never provisions into the operator's own
+    # ~/.codex, so there is no managed hook to verify.
+    _hook_status="unavailable"
+    _hook_reason="ambient Codex login state (no Loom-managed profile selected)"
+else
+    _hook_verify_out=""
+    if _hook_verify_out="$(bash "$_hook_provisioner" verify \
+            --codex-home "$CODEX_HOME" --workspace "$WORKSPACE" --json 2>/dev/null)"; then
+        _hook_status="ready"
+    else
+        _hook_status="not-ready"
+    fi
+    if [[ -n "$_hook_verify_out" ]] && command -v jq >/dev/null 2>&1; then
+        _hook_reason="$(printf '%s' "$_hook_verify_out" | jq -r '.reason // empty' 2>/dev/null)" || _hook_reason=""
+    fi
+fi
+
+log_info "spawn-codex: hooks=$_hook_status role=${_hook_role:-unset} mutable=$_hook_role_is_mutable trust-bypass=never${_hook_reason:+ reason=\"$_hook_reason\"}"
+
+if [[ "$_hook_role_is_mutable" == "true" && "$_hook_status" != "ready" ]]; then
+    log_error "Role '$_hook_role' mutates the repository, but Loom's managed Codex pre_tool_use hook is not ready (status=$_hook_status)."
+    [[ -n "$_hook_reason" ]] && log_error "  reason: $_hook_reason"
+    log_error "Without it a Codex worker runs with NO managed-worktree confinement,"
+    log_error "NO destructive-command blocking, and NO Loom workflow interception."
+    log_error "Provision and trust the profile, then retry:"
+    log_error "  .loom/scripts/provision-codex-hooks.sh install --all-profiles --workspace $WORKSPACE"
+    log_error "  CODEX_HOME=<profile> codex     # accept the hook-trust prompt once per profile"
+    log_error "  .loom/scripts/provision-codex-hooks.sh verify --all-profiles --workspace $WORKSPACE --json"
+    log_error "Loom will not pass --dangerously-bypass-hook-trust (issue #4495)."
+    exit 78  # EX_CONFIG
+fi
+
+if [[ "$_hook_role_is_mutable" != "true" && "$_hook_status" != "ready" ]]; then
+    log_warn "spawn-codex: hook parity unavailable — this session gets ONLY the Codex sandbox (${SANDBOX_MODE}) as a boundary. Read-only roles may proceed; this session is NOT Builder-capable."
+fi
+
 # --- Assemble the codex invocation ---
 # Non-interactive (prompt present): `codex exec [flags] "<prompt>"`.
 # Interactive (no prompt):          `codex [flags]`.

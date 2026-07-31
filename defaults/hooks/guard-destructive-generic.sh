@@ -2301,13 +2301,25 @@ if worktree_isolation_guard_enabled && \
     # /tmp -> /private/tmp mismatch vs. normalize_abs_path's lexical-only form).
     # Fail open to REPO_ROOT if the git resolution is unavailable.
     _WT_MAIN_ROOT=""
+    _WT_MAIN_ROOT_LOGICAL=""
     if [[ -n "$CWD" && -d "$CWD" ]]; then
         _wt_common=$(cd "$CWD" 2>/dev/null && git rev-parse --git-common-dir 2>/dev/null) || _wt_common=""
         if [[ -n "$_wt_common" ]]; then
             _WT_MAIN_ROOT=$(cd "$CWD" 2>/dev/null && cd "$_wt_common/.." 2>/dev/null && pwd -P) || _WT_MAIN_ROOT=""
+            # ...and the LOGICAL spelling of the same root (symlinks intact).
+            # `pwd -P` alone was NOT sufficient (#4495): the write targets this
+            # block compares against are produced by normalize_abs_path(), which
+            # is lexical-only and therefore keeps a symlinked ancestor intact. A
+            # repo reached through a symlinked path (a `/tmp` checkout on macOS,
+            # a symlinked home, a bind-mounted workspace) produced targets that
+            # never string-matched the physical root, so EVERY Bash write into
+            # the main checkout was silently allowed there — the exact #4178
+            # escape this block exists to close. Both spellings are checked.
+            _WT_MAIN_ROOT_LOGICAL=$(cd "$CWD" 2>/dev/null && cd "$_wt_common/.." 2>/dev/null && pwd) || _WT_MAIN_ROOT_LOGICAL=""
         fi
     fi
     [[ -n "$_WT_MAIN_ROOT" ]] || _WT_MAIN_ROOT="$REPO_ROOT"
+    [[ -n "$_WT_MAIN_ROOT_LOGICAL" ]] || _WT_MAIN_ROOT_LOGICAL="$_WT_MAIN_ROOT"
 
     WRITE_TARGETS=$(extract_write_targets "$COMMAND_ASK_SCAN" "$CWD" | head -20)
     while IFS=$'\037' read -r _wcwd _wtarget; do
@@ -2343,6 +2355,7 @@ if worktree_isolation_guard_enabled && \
         [[ -z "$_WT_MAIN_ROOT" ]] && continue
         case "$_wabs" in
             "$_WT_MAIN_ROOT"|"$_WT_MAIN_ROOT"/*) : ;;
+            "$_WT_MAIN_ROOT_LOGICAL"|"$_WT_MAIN_ROOT_LOGICAL"/*) : ;;
             *) continue ;;
         esac
 
