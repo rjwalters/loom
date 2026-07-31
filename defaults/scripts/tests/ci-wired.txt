@@ -68,6 +68,7 @@ test-require-complexity-marker.sh
 test-resolve-tier-model.sh
 test-resync-installed.sh
 test-safehoused-service.sh
+test-spawn-generic.sh
 test-spawn-worker.sh
 test-sweep-auto-stack.sh
 test-sweep-checkpoint.sh
