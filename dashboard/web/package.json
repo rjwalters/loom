@@ -2,7 +2,7 @@
   "name": "loom-fleet-dashboard-web",
   "version": "0.1.0",
   "private": true,
-  "description": "Frontend for the Loom fleet observability dashboard (Epic #4702, Phase 3): live event feed + per-sweep timeline view over the Phase 2 query API (dashboard/src/query.ts).",
+  "description": "Frontend for the Loom fleet observability dashboard (Epic #4702, Phase 3): live event feed + per-sweep timeline view, and the historical-charting data layer (outcomes over time, success-rate trend, duration percentiles), over the Phase 2 query API (dashboard/src/query.ts).",
   "type": "module",
   "scripts": {
     "test": "vitest run",
