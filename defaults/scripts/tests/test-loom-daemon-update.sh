@@ -439,6 +439,32 @@ EOF
     chmod +x "$path"
 }
 
+# Fake `crontab` (#4697): the update script's idle-shutdown-notice check runs
+# `crontab -l` unconditionally on every invocation, so without this stub every
+# test in this suite would shell out to the REAL system `crontab` for
+# whichever account runs the suite — reading (never writing, but still a real
+# information leak/hang risk on a host with no cron daemon configured) actual
+# operator state, exactly the class of hazard the launchd/systemd sandboxing
+# above exists to prevent. `-l` echoes the contents of
+# $FAKE_CRONTAB_CONTENTS_FILE when set+readable, else exits 1 with no output
+# (mirrors the common "no crontab for this user" case — silence, not an
+# error the caller need alarm on). Any other invocation is a no-op success.
+write_fake_crontab() {
+    local path="$1"
+    cat > "$path" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "-l" ]]; then
+    if [[ -n "${FAKE_CRONTAB_CONTENTS_FILE:-}" && -r "${FAKE_CRONTAB_CONTENTS_FILE:-}" ]]; then
+        cat "$FAKE_CRONTAB_CONTENTS_FILE"
+        exit 0
+    fi
+    exit 1
+fi
+exit 0
+EOF
+    chmod +x "$path"
+}
+
 MINIMAL_PATH="/usr/bin:/bin:/usr/sbin:/sbin"
 
 BASE_WORKDIR="$(mktemp -d)"
@@ -505,6 +531,7 @@ trap 'kill "$DECOY_PID" 2>/dev/null; pkill -f "$BASE_WORKDIR" >/dev/null 2>&1; r
 FAKE_BIN_DIR="$BASE_WORKDIR/fakebin"
 mkdir -p "$FAKE_BIN_DIR"
 write_fake_cargo "$FAKE_BIN_DIR/cargo"
+write_fake_crontab "$FAKE_BIN_DIR/crontab"
 # Stub launchctl/pgrep onto the front of every test PATH (FAKE_BIN_DIR is the
 # first entry of TEST_PATH and TEST_PATH_NO_CODESIGN), recording invocations to
 # $SANDBOX_LOG_DIR so the suite can assert no production label was ever named.
@@ -2356,6 +2383,95 @@ else
     TESTS_FAILED=$((TESTS_FAILED + 1))
     echo -e "${RED}✗${NC} LOOM_SKIP_STALE_ENTRY_POINT_CHECK=1 suppresses the advisory"
     echo "  output: $out48"
+fi
+
+# ============================================================
+# 49-52. Idle-shutdown cron-guard post-update notice (#4697): the update
+#     script should warn, post-update, that this host will power itself off
+#     after N idle minutes when the stage-2 `fleet add-worker
+#     --idle-shutdown-minutes` cron guard is installed — and stay silent
+#     when it is not. Uses --check (fast, no rebuild) exactly like the
+#     stale-entry-point block above; a sandboxed $HOME49 keeps the
+#     `$HOME/.local/bin/loom-idle-shutdown.sh` lookup off the real operator
+#     account (belt-and-braces alongside the fake `crontab` stub above).
+# ============================================================
+W49="$BASE_WORKDIR/w49"
+new_fixture "$W49"
+HEAD49="$(cd "$W49" && git rev-parse --short HEAD)"
+write_fake_daemon "$W49/resolved-daemon" "$HEAD49" "$W49/marker49"
+
+HOME49="$BASE_WORKDIR/home49"
+mkdir -p "$HOME49/.local/bin"
+cat > "$HOME49/.local/bin/loom-idle-shutdown.sh" <<'GUARD'
+#!/usr/bin/env bash
+set -euo pipefail
+LIMIT=45
+GUARD
+chmod +x "$HOME49/.local/bin/loom-idle-shutdown.sh"
+
+CRONFIX49="$BASE_WORKDIR/cron49-with-guard"
+echo "*/5 * * * * $HOME49/.local/bin/loom-idle-shutdown.sh >/dev/null 2>&1" > "$CRONFIX49"
+
+# 49. Guard installed + configured window readable -> notice names "45".
+out49=$( cd "$W49" && PATH="$TEST_PATH" HOME="$HOME49" \
+    LOOM_DAEMON_BIN="$W49/resolved-daemon" \
+    FAKE_CRONTAB_CONTENTS_FILE="$CRONFIX49" \
+    bash "$UPDATE_SCRIPT" --check 2>&1 )
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out49" | grep -q 'idle-shutdown cron guard installed' \
+   && echo "$out49" | grep -q -- '--idle-shutdown-minutes 45)'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} idle-shutdown guard installed -> post-update notice names the configured minutes (#4697)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} idle-shutdown guard installed -> post-update notice names the configured minutes (#4697)"
+    echo "  output: $out49"
+fi
+
+# 50. No guard installed (empty crontab fixture) -> completely silent.
+CRONFIX50="$BASE_WORKDIR/cron50-empty"
+: > "$CRONFIX50"
+out50=$( cd "$W49" && PATH="$TEST_PATH" HOME="$HOME49" \
+    LOOM_DAEMON_BIN="$W49/resolved-daemon" \
+    FAKE_CRONTAB_CONTENTS_FILE="$CRONFIX50" \
+    bash "$UPDATE_SCRIPT" --check 2>&1 )
+TESTS_RUN=$((TESTS_RUN + 1))
+if ! echo "$out50" | grep -qi 'idle-shutdown'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} no idle-shutdown guard installed -> no notice at all (#4697)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} no idle-shutdown guard installed -> no notice at all (#4697)"
+    echo "  output: $out50"
+fi
+
+# 51. LOOM_SKIP_IDLE_SHUTDOWN_NOTICE=1 suppresses it even with the guard present.
+out51=$( cd "$W49" && PATH="$TEST_PATH" HOME="$HOME49" \
+    LOOM_DAEMON_BIN="$W49/resolved-daemon" \
+    FAKE_CRONTAB_CONTENTS_FILE="$CRONFIX49" \
+    LOOM_SKIP_IDLE_SHUTDOWN_NOTICE=1 \
+    bash "$UPDATE_SCRIPT" --check 2>&1 )
+TESTS_RUN=$((TESTS_RUN + 1))
+if ! echo "$out51" | grep -qi 'idle-shutdown'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} LOOM_SKIP_IDLE_SHUTDOWN_NOTICE=1 suppresses the notice"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} LOOM_SKIP_IDLE_SHUTDOWN_NOTICE=1 suppresses the notice"
+    echo "  output: $out51"
+fi
+
+# 52. The notice never changes the exit code (still exit 0 -- up to date).
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out49" | grep -q . && ( cd "$W49" && PATH="$TEST_PATH" HOME="$HOME49" \
+    LOOM_DAEMON_BIN="$W49/resolved-daemon" \
+    FAKE_CRONTAB_CONTENTS_FILE="$CRONFIX49" \
+    bash "$UPDATE_SCRIPT" --check >/dev/null 2>&1 ); then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} the idle-shutdown notice never changes the exit code"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} the idle-shutdown notice never changes the exit code"
 fi
 
 # ============================================================

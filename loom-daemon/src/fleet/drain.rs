@@ -1181,6 +1181,8 @@ mod tests {
             state: None,
             drain_phase: None,
             drain_captured: Vec::new(),
+            idle_shutdown_minutes: None,
+            last_seen_up_at: None,
         }
     }
 

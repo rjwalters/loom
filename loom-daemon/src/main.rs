@@ -4721,15 +4721,33 @@ fn print_status_unreachable_json(
 /// [`loom_daemon::fleet::status`]; only the local-host collection (which needs
 /// this binary's own socket/install-state machinery) lives here.
 async fn handle_fleet_status_command(json: bool) -> Result<()> {
-    use loom_daemon::fleet::status::{collect_fleet_report, SshStatusSource};
+    use loom_daemon::fleet::status::{
+        collect_fleet_report, update_last_seen_up_at, SshStatusSource,
+    };
     use loom_daemon::fleet::FleetRegistry;
 
-    let registry = FleetRegistry::load_default()?;
+    // Kept separate from `registry` below: `collect_fleet_report` consumes
+    // its registry argument (it owns each `WorkerRecord` into the concurrent
+    // per-host collection), so a clone is fanned out while the original stays
+    // available afterward to receive the #4697 `last_seen_up_at` write-back.
+    let registry_for_collection = FleetRegistry::load_default()?;
+    let mut registry = registry_for_collection.clone();
     let local = collect_local_fleet_report().await;
     let source: Arc<dyn loom_daemon::fleet::status::HostStatusSource> =
         Arc::new(SshStatusSource::new());
     let timeout = Duration::from_secs(loom_daemon::fleet::status::DEFAULT_TIMEOUT_SECS);
-    let report = collect_fleet_report(source, registry, local, timeout).await;
+    let report = collect_fleet_report(source, registry_for_collection, local, timeout).await;
+
+    // #4697: persist "last observed Up" so a LATER poll that finds this host
+    // Unreachable can measure elapsed silence against its configured
+    // idle-shutdown window (the expected-power-off heuristic in
+    // `loom_daemon::fleet::status`). Best-effort: a failure to persist must
+    // never block reporting/exiting on the status the operator asked for.
+    if update_last_seen_up_at(&mut registry, &report, chrono::Utc::now()) {
+        if let Err(e) = registry.save_default() {
+            eprintln!("warning: could not persist fleet registry last-seen-up timestamp(s): {e}");
+        }
+    }
 
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);

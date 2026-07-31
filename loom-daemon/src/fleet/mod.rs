@@ -550,6 +550,25 @@ pub struct WorkerRecord {
     /// #758, cites). Empty on a record with no drain in progress.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub drain_captured: Vec<drain::CapturedClaim>,
+    /// The idle-shutdown guard's configured window (minutes), when installed
+    /// via `fleet add-worker --idle-shutdown-minutes` (the stage-2 cron guard
+    /// `add_worker::render_idle_shutdown()` renders). `None` means no guard is
+    /// installed — including every record written before this field existed.
+    /// `fleet status` (#4697) uses this together with [`Self::last_seen_up_at`]
+    /// to distinguish an EXPECTED power-off (the host idle-shut itself down,
+    /// by design — #3998/#4477) from a genuinely UNEXPECTED outage when a host
+    /// stops answering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_shutdown_minutes: Option<u32>,
+    /// RFC3339 timestamp of the most recent `fleet status` poll that observed
+    /// this host [`crate::fleet::status::HostState::Up`]. Written by `fleet
+    /// status` itself (#4697) on every poll that sees the host up; `None`
+    /// until the first such observation (a freshly-bootstrapped worker whose
+    /// first poll hasn't run yet, or a record predating this field). This is
+    /// the reference point the idle-shutdown "expected vs unexpected"
+    /// heuristic measures elapsed silence from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen_up_at: Option<String>,
 }
 
 /// The machine-level set of bootstrapped workers, persisted at
@@ -950,6 +969,8 @@ mod tests {
             state: None,
             drain_phase: None,
             drain_captured: Vec::new(),
+            idle_shutdown_minutes: None,
+            last_seen_up_at: None,
         }
     }
 

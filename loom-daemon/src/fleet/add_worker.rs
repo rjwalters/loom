@@ -690,6 +690,17 @@ pub fn run(config: &AddWorkerConfig) -> Result<()> {
             state: None,
             drain_phase: None,
             drain_captured: Vec::new(),
+            // Populate the new #4697 fields from this run: the operator's
+            // `--idle-shutdown-minutes` (absent => no guard installed, mirrors
+            // the `render_idle_shutdown()` gate above), and `last_seen_up_at`
+            // — a full bootstrap only reaches this branch when every step
+            // (including `verify`) succeeded over SSH, so the host was
+            // observably up moments ago; this seeds `fleet status`'s
+            // expected-power-off heuristic with a reference point from the
+            // very first poll, rather than leaving it `None` until some later
+            // `fleet status` run happens to observe the host `Up`.
+            idle_shutdown_minutes: config.idle_shutdown_minutes,
+            last_seen_up_at: Some(chrono::Utc::now().to_rfc3339()),
         };
         let path = default_fleet_registry_path()?;
         let mut registry = FleetRegistry::load(&path)?;
