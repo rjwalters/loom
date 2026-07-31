@@ -2846,13 +2846,29 @@ fn handle_request(
                 &kind,
             );
 
-            let (resolved_model, model_source) =
-                crate::sweep_registry::resolve_dispatch_model(&repo_root, model.as_deref());
+            // Issue #4809: an explicit `model` param always wins (unchanged
+            // precedence), but an ABSENT one for a single-issue dispatch also
+            // considers the model-cost A/B experiment's forced arm — mirroring
+            // the autonomous work-finder / epic-supervisor dispatch paths —
+            // before falling back to `autonomous.model` / the shipped default.
+            let (resolved_model, model_source_label, arm) = match (&kind, model.as_deref()) {
+                (crate::types::SweepKind::Issue(issue), None) => {
+                    let resolved = crate::sweep_registry::resolve_autonomous_dispatch_model(
+                        &repo_root, *issue,
+                    );
+                    (resolved.model, resolved.source_label, resolved.arm)
+                }
+                _ => {
+                    let (m, s) =
+                        crate::sweep_registry::resolve_dispatch_model(&repo_root, model.as_deref());
+                    (m, s.as_str(), None)
+                }
+            };
             log::info!(
-                "dispatch_sweep: {:?} with model={resolved_model} (source={}); headroom \
-                 occupancy={} dynamic_cap={} (disk={} tokens={})",
+                "dispatch_sweep: {:?} with{} model={resolved_model} (source={model_source_label}); \
+                 headroom occupancy={} dynamic_cap={} (disk={} tokens={})",
                 kind,
-                model_source.as_str(),
+                arm.map_or_else(String::new, |a| format!(" arm={a}")),
                 headroom.occupancy,
                 headroom.dynamic_cap,
                 headroom.disk_headroom,

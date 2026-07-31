@@ -2431,12 +2431,30 @@ pub mod forge {
             // CLI default (which may be a premium tier that burns usage credits).
             // No dispatch-param tier here — the work finder has no per-issue
             // override — so `explicit = None`.
+            //
+            // Issue #4809: this resolution ALSO inserts the model-cost A/B
+            // experiment's forced arm model when the workspace resolves to
+            // `experiment` mode (CANARY-gated) — the daemon-native replacement
+            // for the sweep.md prose instrumentation, which never executed in a
+            // headless child and was in any case overridden by this very
+            // default-pin precedence. `off`/`observe` modes are unaffected.
             let repo_root = reg.config().workspace_root.clone();
-            let (model, source) = crate::sweep_registry::resolve_dispatch_model(&repo_root, None);
-            log::info!(
-                "work_finder: dispatching issue #{issue} with model={model} (source={})",
-                source.as_str()
-            );
+            let resolved =
+                crate::sweep_registry::resolve_autonomous_dispatch_model(&repo_root, issue);
+            match resolved.arm {
+                Some(arm) => log::info!(
+                    "work_finder: dispatching issue #{issue} with arm={arm} model={} \
+                     (source={})",
+                    resolved.model,
+                    resolved.source_label
+                ),
+                None => log::info!(
+                    "work_finder: dispatching issue #{issue} with model={} (source={})",
+                    resolved.model,
+                    resolved.source_label
+                ),
+            }
+            let model = resolved.model;
             // Idempotency key + the registry's claim lock make a re-dispatch of
             // an already-running issue a no-op (`was_new = false`) or a loud
             // lock-collision error.

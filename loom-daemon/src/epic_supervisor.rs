@@ -1455,13 +1455,29 @@ pub mod forge {
             // non-premium model (`autonomous.model` config > shipped default) so
             // the epic child never inherits the operator's interactive CLI
             // default. No per-dispatch override tier here.
+            //
+            // Issue #4809: this ALSO inserts the model-cost A/B experiment's
+            // forced arm model when the workspace resolves to `experiment` mode
+            // (CANARY-gated) — see `work_finder::dispatch` for the full
+            // rationale; `off`/`observe` modes are unaffected.
             let repo_root = reg.config().workspace_root.clone();
-            let (model, source) = crate::sweep_registry::resolve_dispatch_model(&repo_root, None);
-            log::info!(
-                "epic_supervisor: dispatching child #{child} for epic #{_epic} with \
-                 model={model} (source={})",
-                source.as_str()
-            );
+            let resolved =
+                crate::sweep_registry::resolve_autonomous_dispatch_model(&repo_root, child);
+            match resolved.arm {
+                Some(arm) => log::info!(
+                    "epic_supervisor: dispatching child #{child} for epic #{_epic} with \
+                     arm={arm} model={} (source={})",
+                    resolved.model,
+                    resolved.source_label
+                ),
+                None => log::info!(
+                    "epic_supervisor: dispatching child #{child} for epic #{_epic} with \
+                     model={} (source={})",
+                    resolved.model,
+                    resolved.source_label
+                ),
+            }
+            let model = resolved.model;
             // Idempotency key + the registry's claim lock make a re-dispatch of
             // an already-running child a no-op.
             let key = format!("epic-child-{child}");
