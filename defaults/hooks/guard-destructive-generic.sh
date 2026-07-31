@@ -2658,6 +2658,16 @@ fi
 # stash pop` run from a worktree cwd is not caught today. Track any observed
 # bypass via this path as a follow-up.
 #
+# WORKTREE-TO-WORKTREE COLLISION (#4821): refs/stash is a single stack shared
+# by EVERY linked worktree of the repo, not per-worktree — so two parallel
+# Builders each in a *different* linked worktree (neither one the main
+# checkout) can pop/drop each other's WIP, and the main-checkout-only check
+# above asks for neither side. Observed in production: kicad-tools PRs
+# #4524/#4526. Below, when cwd is a linked worktree (not the main checkout)
+# AND two or more `.loom-managed` worktrees currently exist under
+# `<main>/.loom/worktrees/`, we ask too — a single active worktree has no one
+# else's stash entry to collide with, so it stays ungated.
+#
 # Gated by stash_scope_guard_enabled() (guards.stashScope /
 # LOOM_GUARD_STASH_SCOPE, default on), invoked LAZILY only after the pattern
 # already matched, mirroring every other cold-path toggle in this file.
@@ -2679,6 +2689,21 @@ if echo "$COMMAND_ASK_SCAN" | grep -qE '(^|[;&|(]|[[:space:]])git[[:space:]]+sta
 
     if [[ -n "$_stash_toplevel" && -n "$_stash_common_parent" && "$_stash_toplevel" == "$_stash_common_parent" ]]; then
         ask "Command requires confirmation: $COMMAND (git stash pop/drop/clear in the MAIN checkout can destroy operator-preserved state — the main checkout's stash stack is operator-owned, not scratch space for an integration check. Run test-merges in an isolated worktree instead; set guards.stashScope:false / LOOM_GUARD_STASH_SCOPE=0 to disable this ask)" "stash-scope:main-checkout"
+    elif [[ -n "$_stash_toplevel" && -n "$_stash_common_parent" ]]; then
+        # cwd is a linked worktree, not the main checkout. Count OTHER
+        # `.loom-managed` worktrees under the main checkout's worktree root —
+        # a collision needs at least one other active worktree to race with.
+        _stash_worktree_count=0
+        if [[ -d "$_stash_common_parent/.loom/worktrees" ]]; then
+            while IFS= read -r _stash_wt_dir; do
+                [[ -f "$_stash_wt_dir/.loom-managed" ]] && \
+                    _stash_worktree_count=$((_stash_worktree_count + 1))
+            done < <(find "$_stash_common_parent/.loom/worktrees" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
+        fi
+
+        if [[ "$_stash_worktree_count" -ge 2 ]]; then
+            ask "Command requires confirmation: $COMMAND (git stash pop/drop/clear from a linked worktree can destroy ANOTHER builder's WIP — refs/stash is a single stack SHARED across every linked worktree of this repo, not per-worktree, and $_stash_worktree_count managed worktrees are currently active. Use './.loom/scripts/worktree.sh snapshot <issue-number>' instead of git stash for ad-hoc WIP; set guards.stashScope:false / LOOM_GUARD_STASH_SCOPE=0 to disable this ask)" "stash-scope:worktree-collision"
+        fi
     fi
 fi
 

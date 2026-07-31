@@ -2841,6 +2841,70 @@ rm -rf "$ST_REPO" "$ST_REPO_OFF"
 echo ""
 
 # =========================================================================
+echo -e "${YELLOW}--- Stash-stack scope: worktree-to-worktree collision (#4821) ---${NC}"
+# =========================================================================
+#
+# refs/stash is a SINGLE stack shared across every linked worktree of a repo
+# (not per-worktree, despite the intuitive naming) -- so two parallel
+# Builders each in a DIFFERENT linked worktree (neither one the main
+# checkout) can pop/drop each other's WIP. The main-checkout-only branch
+# above never asks in this configuration. With >=2 `.loom-managed`
+# worktrees active, a pop/drop/clear from ANY linked worktree cwd must ask;
+# with only ONE managed worktree (the existing block above), there is no
+# other worktree to collide with, so it stays ungated.
+
+make_wt_repo_two_linked() {
+    local dir
+    dir=$(make_wt_repo_linked)
+    git -C "$dir" worktree add -q "$dir/.loom/worktrees/issue-2" \
+        -b feature/issue-2 >/dev/null 2>&1
+    mkdir -p "$dir/.loom/worktrees/issue-2/src"
+    : > "$dir/.loom/worktrees/issue-2/.loom-managed"
+    echo "$dir"
+}
+
+ST2_REPO=$(make_wt_repo_two_linked)
+ST2_WT1_DIR="$ST2_REPO/.loom/worktrees/issue-1"
+ST2_WT2_DIR="$ST2_REPO/.loom/worktrees/issue-2"
+
+assert_ask "stash-scope: git stash pop from worktree-1 asks when >=2 managed worktrees exist (#4821)" \
+    "git stash pop" "$ST2_WT1_DIR"
+assert_ask "stash-scope: git stash drop from worktree-2 asks when >=2 managed worktrees exist (#4821)" \
+    "git stash drop" "$ST2_WT2_DIR"
+assert_ask "stash-scope: git stash clear from a linked worktree asks when >=2 managed worktrees exist (#4821)" \
+    "git stash clear" "$ST2_WT1_DIR"
+
+# Non-destructive subcommands remain ungated even with >=2 managed worktrees.
+assert_allow "stash-scope: git stash push from worktree stays ungated even with >=2 managed worktrees (#4821)" \
+    "git stash push -m wip" "$ST2_WT1_DIR"
+assert_allow "stash-scope: git stash apply from worktree stays ungated even with >=2 managed worktrees (#4821)" \
+    "git stash apply" "$ST2_WT1_DIR"
+assert_allow "stash-scope: git stash list from worktree stays ungated even with >=2 managed worktrees (#4821)" \
+    "git stash list" "$ST2_WT1_DIR"
+
+# The main checkout still asks via the original main-checkout branch,
+# independently of the worktree-collision branch (either condition alone
+# is sufficient to ask).
+assert_ask "stash-scope: git stash pop in main checkout still asks with >=2 managed worktrees (#4821)" \
+    "git stash pop" "$ST2_REPO"
+
+# Toggle opt-out also covers the worktree-collision branch. Config is
+# resolved from REPO_ROOT = `git rev-parse --show-toplevel` of the command's
+# CWD, which for a worktree CWD is the worktree's own root, NOT the main
+# checkout -- so the config file must live in the WORKTREE's own (nested)
+# `.loom/config.json`, mirroring how a real committed .loom/config.json
+# would appear in every checkout of the same tracked path.
+ST2_REPO_OFF=$(make_wt_repo_two_linked)
+mkdir -p "$ST2_REPO_OFF/.loom/worktrees/issue-1/.loom"
+printf '%s' '{"guards":{"stashScope":false}}' > "$ST2_REPO_OFF/.loom/worktrees/issue-1/.loom/config.json"
+assert_allow "stash-scope: guards.stashScope:false -> allow from worktree even with >=2 managed worktrees (#4821)" \
+    "git stash pop" "$ST2_REPO_OFF/.loom/worktrees/issue-1"
+
+rm -rf "$ST2_REPO" "$ST2_REPO_OFF"
+
+echo ""
+
+# =========================================================================
 echo -e "${YELLOW}--- Performance check ---${NC}"
 # =========================================================================
 

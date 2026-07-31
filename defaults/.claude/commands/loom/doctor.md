@@ -98,6 +98,21 @@ running an older `worktree.sh` (pre-#4823) or a symptom of a genuinely diverged
 local state — either way, fixing review feedback on top of the wrong base produces
 a PR-clobbering force-push or a diff against the wrong parent.
 
+### Never use bare `git stash` for ad-hoc WIP (#4821)
+
+`refs/stash` is **one stack shared across every linked worktree of the
+repo** — not per-worktree. If you `git stash` / `git stash pop` /
+`git stash drop` to temporarily shelve WIP while fixing a PR, a concurrent
+Builder or Doctor in a *different* worktree doing the same thing can pop or
+drop **your** stash entry (or you can pop theirs), silently swapping or
+discarding uncommitted work. This happened in production (kicad-tools PRs
+#4524/#4526).
+
+**Use `./.loom/scripts/worktree.sh snapshot <issue-number>` instead** — it
+writes your WIP as a patch file under
+`<worktree-root>/.snapshots/issue-<N>-<timestamp>.patch`, scoped to your own
+worktree, so there is no shared stack to collide on.
+
 ## ⚠️ `--body @path` Does NOT Expand — It Posts the Literal String
 
 **If a comment you're posting (fix summary, clarifying question, conflict-only
