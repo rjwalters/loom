@@ -1664,6 +1664,12 @@ pub fn build_daemon_status(
         // `start_safehouse_narration`/`start_peer_coordination` spawn, and
         // read back here on every status call (no second connection).
         safehouse: Some(workspace_pool.safehouse_status()),
+        // Whether the work-finder loop is enabled for THIS running daemon
+        // process (#4693) — read from this process's own env/config, the same
+        // `wf_config` already resolved above for the dynamic-cap fields, so it
+        // costs no extra config read. Mirrors `main_health_gate_enabled`'s
+        // `Some(resolve...)` shape.
+        work_finder_enabled: Some(crate::work_finder::resolve_enabled(&wf_config)),
     }
 }
 
@@ -5343,6 +5349,7 @@ exit 0
                 room: Some("fleet".to_string()),
                 reason: None,
             }),
+            work_finder_enabled: Some(true),
         };
         let resp = Response::DaemonStatus(Box::new(report));
         let json = serde_json::to_string(&resp).expect("serialize response");
@@ -5387,6 +5394,7 @@ exit 0
                         .map(|c| c.mechanism.as_str()),
                     Some("test-fixture")
                 );
+                assert_eq!(r.work_finder_enabled, Some(true));
             }
             other => panic!("Expected DaemonStatus, got: {other:?}"),
         }

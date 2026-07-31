@@ -300,6 +300,45 @@ extract_systemd_env_keys() {
     sed -n 's/^Environment=\([^=]*\)=.*/\1/p' "$unit_file"
 }
 
+# ---------- installed-plist/unit VALUE extraction (#4693) ----------
+# Single-key siblings of extract_plist_env_keys / extract_systemd_env_keys
+# above (which list every key present -- these read the VALUE of one named
+# key). Used by the silent-autonomy-downgrade check below to read what
+# LOOM_WORK_FINDER / LOOM_MAIN_HEALTH_GATE the PRIOR installed plist/unit
+# actually carried, before it gets overwritten by this invocation's render.
+
+# extract_plist_env_value <plist_file> <key> — the <string> value paired with
+# <key>KEY</key> inside the EnvironmentVariables dict, or empty when the file
+# or the key is absent.
+extract_plist_env_value() {
+    local plist_file="$1" want_key="$2"
+    [[ -f "$plist_file" ]] || return 1
+    awk -v want="$want_key" '
+        /<key>EnvironmentVariables<\/key>/ { in_env=1; next }
+        in_env && /<\/dict>/ { exit }
+        in_env && found && /<string>/ {
+            line=$0
+            sub(/^[ \t]*<string>/, "", line); sub(/<\/string>[ \t]*$/, "", line)
+            print line
+            exit
+        }
+        in_env && /<key>/ {
+            line=$0
+            sub(/^[ \t]*<key>/, "", line); sub(/<\/key>.*$/, "", line)
+            found = (line == want) ? 1 : 0
+        }
+    ' "$plist_file"
+}
+
+# extract_systemd_env_value <unit_file> <key> — the value of a
+# `Environment=KEY=...` line for a specific key, or empty when the file or the
+# key is absent.
+extract_systemd_env_value() {
+    local unit_file="$1" want_key="$2"
+    [[ -f "$unit_file" ]] || return 1
+    sed -n "s/^Environment=${want_key}=\\(.*\\)\$/\\1/p" "$unit_file" | head -n1
+}
+
 # warn_dropped_env_keys <old_file> <new_file> <extractor_function_name> — compare
 # the env-var KEY sets (not values) between an already-installed plist/unit and
 # a freshly-rendered replacement; warn (listing the keys) when the replacement
@@ -348,6 +387,86 @@ warn_dropped_env_keys() {
     done
     warn "This usually means this invocation ran without the operator's exported env (a watchdog / automated re-render / a bare re-run from a different shell)."
     warn "Pass --force-env to acknowledge an intentional narrowing and suppress this warning."
+}
+
+# ---------- silent autonomy-downgrade detection (#4693) ----------
+# Incident 2026-07-30: a routine loom-daemon-start.sh run (no flags) silently
+# re-rendered the plist with LOOM_WORK_FINDER=0 -- downgrading a previously
+# autonomous daemon to FLAGS-OFF with NO warning. ~3h of dispatch outage (23
+# ready issues sat queued, "work availability is the limiter") before the
+# missing "work_finder: starting" log line was traced back to the plist env.
+#
+# The FLAGS-OFF default for a PLAIN start (#3911) is correct and stays
+# unchanged -- this only closes the SILENT part of a transition FROM
+# autonomous TO FLAGS-OFF. Advisory only, exactly like warn_dropped_env_keys
+# above: it never blocks the start.
+#
+# Signals consulted (either alone is sufficient to flag a downgrade):
+#   1. the PRIOR installed plist/unit had the key ON (=1) -- direct evidence
+#      this daemon was running autonomously a moment ago.
+#   2. the autonomy-desired marker (#4011) is present but no prior plist/unit
+#      value could be read (e.g. the first Darwin start after a nohup-only
+#      history) -- the marker alone is recorded operator intent, and the
+#      issue explicitly calls this combination out.
+# When the prior value was already "0" (no transition) this stays silent --
+# a standing marker-vs-FLAGS-OFF mismatch with no fresh transition is
+# `loom-daemon status`'s job to flag (AC3), not this one-shot start-time check.
+#
+# Deliberately NOT triggered by:
+#   - --from-config (control is explicitly handed to .loom/config.json --
+#     not a silent default; see the FROM_CONFIG guard in the caller),
+#   - an explicit --no-work-finder / --no-health-gate THIS invocation (an
+#     explicit ask is not silent),
+#   - an operator-exported LOOM_WORK_FINDER=0 / LOOM_MAIN_HEALTH_GATE=0 in the
+#     calling shell (also an explicit, non-default signal -- "Respected when
+#     already exported", see the Environment section in the help banner).
+check_autonomy_downgrade_key() {
+    local key="$1" new_val="$2" want_flag="$3" pre_exported="$4"
+    [[ "$new_val" == "0" ]] || return 0
+    [[ "$want_flag" == "off" ]] && return 0
+    [[ -n "$pre_exported" ]] && return 0
+
+    local old_val=""
+    if [[ -n "${PRIOR_AUTONOMY_FILE:-}" && -f "$PRIOR_AUTONOMY_FILE" ]]; then
+        old_val="$("$PRIOR_AUTONOMY_EXTRACTOR" "$PRIOR_AUTONOMY_FILE" "$key" 2>/dev/null || true)"
+    fi
+
+    local marker_present=false
+    [[ -f "$INTENT_MARKER" ]] && marker_present=true
+
+    if [[ "$old_val" == "1" ]]; then
+        warn ""
+        warn "WARNING: autonomy downgrade -- $key: 1 -> 0"
+        warn "  The previously installed daemon had $key=1 (autonomous); this plain start"
+        warn "  renders it OFF -- matching the FLAGS-OFF-by-default contract for a start with"
+        warn "  no explicit flags (#3911), but SILENTLY from an operator's point of view."
+        warn "  Remediation: pass --from-config (drive from .loom/config.json -> autonomous)"
+        warn "  or --work-finder / --health-gate to keep autonomy on."
+        return 0
+    fi
+
+    if [[ -z "$old_val" && "$marker_present" == "true" ]]; then
+        warn ""
+        warn "WARNING: autonomy downgrade -- $key renders 0 this start, and no prior plist/unit"
+        warn "  value could be read -- but the autonomy-desired marker ($INTENT_MARKER) is"
+        warn "  present, meaning this host previously ran loom-daemon autonomously."
+        warn "  Remediation: pass --from-config (drive from .loom/config.json -> autonomous)"
+        warn "  or --work-finder / --health-gate to keep autonomy on."
+        return 0
+    fi
+}
+
+# warn_autonomy_downgrade — evaluate both autonomy loops. Called once
+# PRIOR_AUTONOMY_FILE/PRIOR_AUTONOMY_EXTRACTOR and INTENT_MARKER are resolved
+# (after platform detection, before the plist/unit gets overwritten -- and
+# also from the read-only --print-plist/--print-unit inspection paths, so an
+# operator sees the warning before committing to a real start too).
+warn_autonomy_downgrade() {
+    # --from-config hands control to .loom/config.json deliberately -- not a
+    # silent default -- so it is exempt from this check entirely.
+    [[ "$FROM_CONFIG" == "true" ]] && return 0
+    check_autonomy_downgrade_key "LOOM_WORK_FINDER" "$LOOM_WORK_FINDER" "$WANT_WORK_FINDER" "$PRE_EXPORTED_WORK_FINDER"
+    check_autonomy_downgrade_key "LOOM_MAIN_HEALTH_GATE" "$LOOM_MAIN_HEALTH_GATE" "$WANT_HEALTH_GATE" "$PRE_EXPORTED_MAIN_HEALTH_GATE"
 }
 
 # render_launchd_plist <label> <daemon_bin> <workdir> <log_path>
@@ -909,6 +1028,15 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Snapshot whatever the CALLING SHELL already exported, BEFORE the
+# autonomous-mode env block below applies the FLAGS-OFF default (#3911). The
+# silent-autonomy-downgrade check (#4693) needs to tell "this invocation's
+# own default logic produced 0" (worth a warning if it downgrades a
+# previously-autonomous host) apart from "the operator explicitly exported 0
+# themselves" (an explicit, non-default signal -- never silent).
+PRE_EXPORTED_WORK_FINDER="${LOOM_WORK_FINDER:-}"
+PRE_EXPORTED_MAIN_HEALTH_GATE="${LOOM_MAIN_HEALTH_GATE:-}"
+
 REPO_ROOT=$(find_repo_root)
 
 # ---------- machine-mode resolution (Epic #3835 Phase 3b, #4229) ----------
@@ -1160,6 +1288,52 @@ if [[ "$USE_LAUNCHD" != "true" ]] \
         warn "For a supervised, reboot-surviving daemon, run: loginctl enable-linger \"\$USER\" and retry."
     fi
 fi
+
+# ---------- prior installed plist/unit (autonomy-downgrade check, #4693) ----------
+# Resolved once here, now that platform detection has picked the mechanism
+# this invocation would use -- the SAME label/unit-path helpers the real
+# install below (and --print-plist/--print-unit) use, so "prior" always means
+# "whatever is installed under the identifier THIS invocation would overwrite".
+# Left empty on the nohup fallback tier (no rendered file exists there) -- the
+# autonomy-desired marker alone is the only available signal in that case
+# (see check_autonomy_downgrade_key above).
+#
+# The mechanism this comparison targets is chosen by the INVOCATION, not by the
+# host OS: --print-plist / --print-unit are pure inspection modes that render
+# (and inspect) their mechanism's file regardless of the platform running them,
+# exactly like the pre-existing --print-plist PATH-drift (#4172) and
+# dropped-env-key (#4522) checks below, which read
+# $HOME/Library/LaunchAgents/<label>.plist unconditionally. Gating this
+# resolution on USE_LAUNCHD (Darwin-only) instead made the whole downgrade
+# warning silently unreachable under --print-plist on any Linux host -- the
+# exact silence this check exists to eliminate. Only when NEITHER inspection
+# flag is set does platform detection pick the mechanism, which keeps the real
+# install path (and its nohup-tier "leave empty" contract) byte-identical.
+PRIOR_AUTONOMY_MECH=""
+if [[ "$PRINT_PLIST" == "true" ]]; then
+    PRIOR_AUTONOMY_MECH="launchd"
+elif [[ "$PRINT_UNIT" == "true" ]]; then
+    PRIOR_AUTONOMY_MECH="systemd"
+elif [[ "$USE_LAUNCHD" == "true" ]]; then
+    PRIOR_AUTONOMY_MECH="launchd"
+elif [[ "$IS_LINUX_SYSTEMD" == "true" ]]; then
+    PRIOR_AUTONOMY_MECH="systemd"
+fi
+
+PRIOR_AUTONOMY_FILE=""
+PRIOR_AUTONOMY_EXTRACTOR=""
+if [[ "$PRIOR_AUTONOMY_MECH" == "launchd" ]]; then
+    PRIOR_AUTONOMY_FILE="$HOME/Library/LaunchAgents/$(resolve_launchd_label).plist"
+    PRIOR_AUTONOMY_EXTRACTOR="extract_plist_env_value"
+elif [[ "$PRIOR_AUTONOMY_MECH" == "systemd" ]] && declare -f resolve_systemd_unit_path >/dev/null 2>&1; then
+    PRIOR_AUTONOMY_FILE="$(resolve_systemd_unit_path 2>/dev/null || true)"
+    PRIOR_AUTONOMY_EXTRACTOR="extract_systemd_env_value"
+fi
+
+# Run BEFORE any of --print-plist / --print-unit / the real install below, so
+# an operator sees the warning whether they are just inspecting or actually
+# starting -- and before the prior file gets overwritten either way.
+warn_autonomy_downgrade
 
 # ---------- --print-plist: pure inspection, no side effects ----------
 if [[ "$PRINT_PLIST" == "true" ]]; then

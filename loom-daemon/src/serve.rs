@@ -1072,6 +1072,7 @@ mod tests {
             host_breaker: None,
             rate_limit_breaker: None,
             safehouse: None,
+            work_finder_enabled: None,
         }
     }
 
