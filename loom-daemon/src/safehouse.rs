@@ -193,6 +193,12 @@ const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// back to `None` by [`rooms_from_value`] / [`apply_room_env_overrides`]: an
 /// operator who leaves `"rooms": {}` in config gets the unchanged single-room
 /// behavior rather than a routing mode with nothing to route to.
+///
+/// A **claims-only** map (`claims` set, no `signal`, no `byRepo`) is kept — so
+/// [`SafehouseConfig::claims_room`] resolves — but it does **not** activate
+/// attention-class narration routing: [`routes_narration`](Self::routes_narration)
+/// gates narration on a narration target, keeping `claims` an independent knob
+/// (#4713's "opt-in, default-unchanged" contract).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RoomMap {
     /// The everyone/signal room (`loom-fleet`): operator ↔ fleet conversation,
@@ -224,6 +230,17 @@ impl RoomMap {
     #[must_use]
     fn is_empty(&self) -> bool {
         self.signal.is_none() && self.by_repo.is_empty() && self.claims.is_none()
+    }
+
+    /// Whether this map carries a **narration** routing target (`signal` and/or
+    /// a `byRepo` entry). A claims-only map does **not**: `claims` redirects the
+    /// peer-claim coordination connection only (#4713) and must never flip the
+    /// narration sink out of its byte-identical single-room mode as a side
+    /// effect. Both [`SafehouseConfig::routes_by_attention`] and
+    /// [`RoomRouter::resolve`] gate on this, keeping the two knobs independent.
+    #[must_use]
+    fn routes_narration(&self) -> bool {
+        self.signal.is_some() || !self.by_repo.is_empty()
     }
 }
 
@@ -267,9 +284,10 @@ impl SafehouseConfig {
     /// single-room mode this **is** `room`, which is what keeps the absent-map
     /// path byte-identical.
     ///
-    /// Doubles as the room the peer-claim coordination connection advertises
-    /// into — see [`run_coordination`] for why claim ads deliberately stay on
-    /// the signal room.
+    /// Also the **fallback** for the peer-claim coordination connection: since
+    /// #4713 [`run_coordination`] resolves [`claims_room`](Self::claims_room),
+    /// which lands here only while `rooms.claims` is unset — see
+    /// [`run_coordination`] for why claim ads default to the signal room.
     #[must_use]
     pub fn signal_room(&self) -> Option<&str> {
         self.rooms
@@ -293,10 +311,15 @@ impl SafehouseConfig {
             .or_else(|| self.signal_room())
     }
 
-    /// Whether attention-class routing is active (a `rooms` map resolved).
+    /// Whether attention-class **narration** routing is active: the `rooms` map
+    /// configures a narration target (`signal` and/or `byRepo`). A claims-only
+    /// map deliberately does **not** activate it — `rooms.claims` is an
+    /// independent knob that only redirects the peer-claim coordination
+    /// connection ([`claims_room`](Self::claims_room)); narration stays in
+    /// single-room mode, byte-identical (#4713).
     #[must_use]
     pub fn routes_by_attention(&self) -> bool {
-        self.rooms.is_some()
+        self.rooms.as_ref().is_some_and(RoomMap::routes_narration)
     }
 }
 
@@ -1071,8 +1094,12 @@ impl RoomRouter {
     pub fn resolve(&self, kind: &str, repo: Option<&str>) -> RoomDecision {
         // Absent `rooms` map ⇒ the pre-#4225 behavior, byte-identical: one room
         // for everything, `None` included. This is the migration default and the
-        // single most important invariant of this change.
-        let Some(map) = self.map.as_ref() else {
+        // single most important invariant of this change. A map with no
+        // narration target (claims-only, #4713) is deliberately treated the
+        // same: `rooms.claims` redirects the peer-claim coordination connection
+        // only, and must not switch narration into attention-class routing —
+        // per-repo lazy firehose creation included — as a side effect.
+        let Some(map) = self.map.as_ref().filter(|map| map.routes_narration()) else {
             return RoomDecision::Send(self.single.clone());
         };
         // An unparseable kind cannot reach the wire (`build_send_request` refuses
@@ -3592,6 +3619,47 @@ mod tests {
             ..SafehouseConfig::default()
         };
         assert_eq!(legacy.claims_room(), Some("!legacy:example.org"));
+    }
+
+    /// #4713's "opt-in, default-unchanged" contract, claims-only edition:
+    /// setting `rooms.claims` **alone** (no `signal`, no `byRepo`) redirects
+    /// the peer-claim coordination connection and nothing else. Narration must
+    /// stay in single-room mode — byte-identical to the absent-map case —
+    /// rather than silently activating attention-class routing (per-repo lazy
+    /// firehose creation) as a side effect of an unrelated knob.
+    #[test]
+    fn claims_only_map_does_not_activate_attention_class_narration_routing() {
+        for room in [Some("loom-fleet".to_owned()), None] {
+            let cfg = SafehouseConfig {
+                enabled: true,
+                room: room.clone(),
+                rooms: Some(RoomMap {
+                    signal: None,
+                    by_repo: std::collections::BTreeMap::new(),
+                    claims: Some("!claims:example.org".to_owned()),
+                }),
+                ..SafehouseConfig::default()
+            };
+            // The claims knob works…
+            assert_eq!(cfg.claims_room(), Some("!claims:example.org"));
+            // …and narration routing does not notice it.
+            assert!(
+                !cfg.routes_by_attention(),
+                "a claims-only rooms map must not enable attention-class narration routing"
+            );
+            let router = RoomRouter::new(&cfg);
+            assert_eq!(router.signal_room(), room.clone());
+            for kind in KNOWN_TYPES {
+                for repo in [Some("/home/x/GitHub/vibesql"), None] {
+                    assert_eq!(
+                        router.resolve(kind, repo),
+                        RoomDecision::Send(room.clone()),
+                        "claims-only map: {kind:?} (repo={repo:?}) must stay in \
+                         single-room mode, never Create a firehose room"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

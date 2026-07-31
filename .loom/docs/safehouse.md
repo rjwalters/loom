@@ -839,6 +839,12 @@ per-repo firehose:
   (signal / per-repo firehose) keeps using `signal_room()`/`RoomRouter` exactly
   as before. Only the peer-claim coordination connection
   (`run_coordination`/`spawn_peer_coordination`) resolves `claims_room()`.
+  This holds even for a **claims-only** map (`rooms.claims` set with no
+  `rooms.signal`/`rooms.byRepo`): attention-class narration routing gates on a
+  narration target (`signal` and/or `byRepo`), so a claims-only map keeps
+  narration in byte-identical single-room mode — never lazily creating per-repo
+  firehose rooms as a side effect. `rooms.claims` and narration routing are
+  independent knobs.
 - The inbound reader is unchanged and remains **room-agnostic**: it folds any
   parseable `loom_claim` line regardless of which room delivered it, so this
   change is purely about which room this daemon *writes into* — receipt-side
