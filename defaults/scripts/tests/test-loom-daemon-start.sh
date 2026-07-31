@@ -62,8 +62,8 @@ WORKDIR="$(mktemp -d)"
 # the script (only an EXIT-trap firing auto-exits) -- the explicit `exit`
 # below is required, else a SIGTERM'd suite would clean up once and then keep
 # running every remaining test case (re-populating $WORKDIR as it goes).
-trap 'bg_proc_reap; pkill -f "$WORKDIR" >/dev/null 2>&1; rm -rf "$WORKDIR"' EXIT
-trap 'bg_proc_reap; pkill -f "$WORKDIR" >/dev/null 2>&1; rm -rf "$WORKDIR"; exit 1' INT TERM
+trap 'bg_proc_reap; [ -n "$WORKDIR" ] && pkill -f "$WORKDIR" >/dev/null 2>&1; rm -rf "$WORKDIR"' EXIT
+trap 'bg_proc_reap; [ -n "$WORKDIR" ] && pkill -f "$WORKDIR" >/dev/null 2>&1; rm -rf "$WORKDIR"; exit 1' INT TERM
 mkdir -p "$WORKDIR/.loom/logs"
 
 FAKE_BIN="$WORKDIR/fake-loom-daemon"

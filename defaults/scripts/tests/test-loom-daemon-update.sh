@@ -546,8 +546,8 @@ bg_proc_track "$DECOY_PID"
 # untrapped-exit version of this trap let a SIGTERM'd run limp all the way to
 # a later scenario, which then hit a real, un-stubbed `cargo build --release`
 # once its own fixture dir had already been rm -rf'd out from under it).
-trap 'bg_proc_reap; pkill -f "$BASE_WORKDIR" >/dev/null 2>&1; rm -rf "$BASE_WORKDIR" "$DECOY_DIR"' EXIT
-trap 'bg_proc_reap; pkill -f "$BASE_WORKDIR" >/dev/null 2>&1; rm -rf "$BASE_WORKDIR" "$DECOY_DIR"; exit 1' INT TERM
+trap 'bg_proc_reap; [ -n "$BASE_WORKDIR" ] && pkill -f "$BASE_WORKDIR" >/dev/null 2>&1; rm -rf "$BASE_WORKDIR" "$DECOY_DIR"' EXIT
+trap 'bg_proc_reap; [ -n "$BASE_WORKDIR" ] && pkill -f "$BASE_WORKDIR" >/dev/null 2>&1; rm -rf "$BASE_WORKDIR" "$DECOY_DIR"; exit 1' INT TERM
 
 FAKE_BIN_DIR="$BASE_WORKDIR/fakebin"
 mkdir -p "$FAKE_BIN_DIR"
