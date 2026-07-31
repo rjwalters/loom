@@ -519,7 +519,7 @@ stand-down comment self-refreshes `updatedAt` but not the label event). That
 pass runs on an interval (up to ~10 minutes of lag) and cannot see an
 *in-flight* Doctor, so it never substitutes for this check or the pre-push
 recheck below. See [`daemon-reference.md`'s "Stale-claim reconciliation"
-section](../../../docs/daemon-reference.md#pr-side-claim-labels-loomreviewing--loomtreating-4367).
+section](../../../.loom/docs/daemon-reference.md#stale-claim-reconciliation--the-sweep-journal-3953-fixed-3975-extended-to-pr-side-claims-4367).
 
 ### Pre-Push Head-SHA Recheck (Step 9)
 
