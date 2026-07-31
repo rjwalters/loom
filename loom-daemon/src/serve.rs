@@ -627,6 +627,15 @@ async fn handle_health(
         .or_else(crate::daemon_pidfile::resolve_pid_file_path)
         .map(|path| crate::daemon_pidfile::observe(&path));
 
+    // #4824 corroborating log probe, taken only when the daemon reported no
+    // tick — this route is polled on a dashboard cadence, and a bounded tail
+    // read per poll for a field the healthy path never consults is waste.
+    let work_finder_log_tick_age_secs = report
+        .as_ref()
+        .is_some_and(|r| r.last_work_finder_tick.is_none())
+        .then(crate::health::probe_work_finder_log_tick_age)
+        .flatten();
+
     let health = crate::health::assess(&crate::health::HealthInputs {
         at: chrono::Utc::now(),
         window: HEALTH_WINDOW,
@@ -638,6 +647,13 @@ async fn handle_health(
         ranking_present,
         ranking_age_secs,
         pipeline,
+        // #4824 — this route runs *inside* the daemon, so its own
+        // `BUILT_COMMIT` is by construction the answering daemon's and the
+        // skew check resolves to `Match`. Threaded in anyway (rather than
+        // hardcoded) so the dashboard shares one code path with the CLI
+        // collector and keeps reporting the commit in `--json`-shaped output.
+        cli_build_commit: crate::self_update::BUILT_COMMIT.to_string(),
+        work_finder_log_tick_age_secs,
     });
 
     let mut body = serde_json::to_value(&health)?;
@@ -1205,6 +1221,8 @@ mod tests {
             role_tick_records: vec![],
             daemon_pid: None,
             pid_file: None,
+            daemon_build_commit: None,
+            work_finder_interval_secs: None,
         }
     }
 

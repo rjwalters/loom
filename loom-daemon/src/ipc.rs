@@ -1729,6 +1729,19 @@ pub fn build_daemon_status(
         // environment points at.
         daemon_pid: Some(std::process::id()),
         pid_file: crate::daemon_pidfile::resolve_pid_file_path(),
+        // The commit THIS daemon binary was built from, plus the tick interval
+        // THIS process resolved (#4824). Both are taken daemon-side for the
+        // same reason `daemon_pid` above is: they are statements only the
+        // answering process can make truthfully. A client that knows both its
+        // own `BUILT_COMMIT` and the daemon's can report CLI/daemon build skew
+        // as its own condition instead of misreading an older daemon's absent
+        // telemetry as a dead subsystem, and one that knows the daemon's real
+        // cadence can size the post-restart grace window correctly instead of
+        // assuming the 60s default.
+        daemon_build_commit: Some(crate::self_update::BUILT_COMMIT.to_string()),
+        work_finder_interval_secs: Some(
+            crate::work_finder::resolve_interval_with_config(&wf_config).as_secs(),
+        ),
     }
 }
 
@@ -5442,6 +5455,8 @@ exit 0
             }],
             daemon_pid: Some(99917),
             pid_file: Some(std::path::PathBuf::from("/repo/a/.loom/.daemon.pid")),
+            daemon_build_commit: Some("18887b5c".to_string()),
+            work_finder_interval_secs: Some(60),
         };
         let resp = Response::DaemonStatus(Box::new(report));
         let json = serde_json::to_string(&resp).expect("serialize response");

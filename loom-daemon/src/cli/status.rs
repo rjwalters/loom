@@ -663,6 +663,8 @@ pub(crate) mod status_client_tests {
             role_tick_records: vec![],
             daemon_pid: Some(99917),
             pid_file: Some(std::path::PathBuf::from("/repo/a/.loom/.daemon.pid")),
+            daemon_build_commit: Some("18887b5c".to_string()),
+            work_finder_interval_secs: Some(60),
         }
     }
 

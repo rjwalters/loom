@@ -113,6 +113,18 @@ async fn collect(window: Duration) -> HealthReport {
         None => None,
     };
 
+    // 5. The daemon log's newest `work_finder:` line (#4824) — a *corroborating*
+    //    signal, never a derivation: it exists so the collector refuses to call
+    //    the work finder dead while the daemon's own log shows it ticking. One
+    //    bounded tail read, and only on the path that can consume it (the
+    //    daemon reported no tick) — a reported tick is already the stronger
+    //    signal, so probing then would be pure I/O for a field nothing reads.
+    let work_finder_log_tick_age_secs = status
+        .as_ref()
+        .is_some_and(|r| r.last_work_finder_tick.is_none())
+        .then(health::probe_work_finder_log_tick_age)
+        .flatten();
+
     health::assess(&HealthInputs {
         at: chrono::Utc::now(),
         window,
@@ -124,6 +136,12 @@ async fn collect(window: Duration) -> HealthReport {
         ranking_present,
         ranking_age_secs,
         pipeline,
+        // This CLI process's own build commit (#4824), compared daemon-side
+        // against `DaemonStatusReport::daemon_build_commit` so a newer CLI
+        // querying an older daemon reports build skew rather than a phantom
+        // dead work finder.
+        cli_build_commit: loom_daemon::self_update::BUILT_COMMIT.to_string(),
+        work_finder_log_tick_age_secs,
     })
 }
 
