@@ -13,6 +13,7 @@ Companion documents:
 |---|---|
 | [`../wrangler.toml`](../wrangler.toml) | The deployment template itself — every value you must supply is tagged `CHANGE ME` |
 | [`cloudflare-access.md`](cloudflare-access.md) | Gating the authenticated view behind zero-trust SSO while leaving the public view ungated |
+| [`reference-deployment.md`](reference-deployment.md) | The 2AM reference instance (`dashboard.2amlogic.com`) — a concrete, filled-in example of every value this runbook asks you to supply, plus its credential-file locations and current Access layout |
 | [`../README.md`](../README.md) | Architecture, routes, local development, tests |
 | [`../../.loom/docs/telemetry-schema.md`](../../.loom/docs/telemetry-schema.md) | The wire contract the daemon pushes |
 
@@ -381,3 +382,13 @@ suite. **A live from-scratch deploy against a real Cloudflare account — steps
 2-10 end to end, including a real daemon push — has not been performed** and
 is recommended before treating this as fully proven. Please report any step
 that does not work as written.
+
+The 2026-07-31 deploy of the [2AM reference instance](reference-deployment.md)
+was a real production deploy on a real account, but **it does not satisfy the
+"live from-scratch deploy" item above** — the first Worker that went live at
+that instance's domain turned out to be a bindings-less shell (no D1, no
+Durable Object), which points at that deploy not having followed this
+runbook's steps verbatim from the start. See
+[`reference-deployment.md`](reference-deployment.md) §7 for what happened.
+The outstanding validation this line calls for is still: a fresh account,
+this runbook's steps 1-10, no shortcuts, checked off one by one.
