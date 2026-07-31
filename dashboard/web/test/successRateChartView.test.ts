@@ -1,4 +1,3 @@
-// @vitest-environment jsdom
 import { describe, expect, it } from "vitest";
 import { renderSuccessRateChart } from "../src/charts/successRateChartView.js";
 import type { SuccessRatePoint } from "../src/charts/successRate.js";

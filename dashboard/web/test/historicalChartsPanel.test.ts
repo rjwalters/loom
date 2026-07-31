@@ -1,4 +1,3 @@
-// @vitest-environment jsdom
 import { describe, expect, it } from "vitest";
 import { HistoricalChartsPanel } from "../src/historicalChartsPanel.js";
 import type { FetchLike } from "../src/historyClient.js";

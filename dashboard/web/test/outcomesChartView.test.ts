@@ -1,4 +1,3 @@
-// @vitest-environment jsdom
 import { describe, expect, it } from "vitest";
 import { OUTCOME_COLORS, renderOutcomesChart } from "../src/charts/outcomesChartView.js";
 import type { OutcomeBucket } from "../src/charts/outcomes.js";

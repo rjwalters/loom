@@ -1,4 +1,3 @@
-// @vitest-environment jsdom
 import { describe, expect, it } from "vitest";
 import { PERCENTILE_COLORS, renderDurationPercentilesChart } from "../src/charts/durationsChartView.js";
 import type { DurationPercentiles } from "../src/charts/durations.js";
