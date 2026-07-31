@@ -15,20 +15,39 @@
  *                                      the same sweep hourly).
  *   GET  /admin/fleet-state         — read the Durable Object's live
  *                                      snapshot (introspection/verification
- *                                      only — NOT the Phase 3 dashboard
- *                                      query API, which is a separate,
- *                                      unauthenticated-by-admin-token,
- *                                      out-of-scope-for-this-issue route).
+ *                                      only — the `/api/*` routes below are
+ *                                      the actual Phase 3 dashboard query
+ *                                      API).
+ *
+ *   GET  /api/fleet-state           — Phase 3 query API: current state of
+ *                                      every known host/sweep (issue #4726).
+ *   GET  /api/history               — Phase 3 query API: filterable,
+ *                                      paginated D1 history query (issue
+ *                                      #4726).
+ *   GET  /api/events                — Phase 3 query API: SSE live tail of
+ *                                      newly-ingested telemetry (issue
+ *                                      #4726).
  *
  * All `/admin/*` routes require `Authorization: Bearer <ADMIN_TOKEN>`
- * (a `wrangler secret`, never committed) — see README.md.
+ * (a `wrangler secret`, never committed) — see README.md. The `/api/*`
+ * routes are deliberately **not** admin-gated: they are the unclassified
+ * query surface issue #4726 defines, returning full record detail.
+ * Visibility-based redaction (public vs. authenticated views) is issue
+ * #4727's job, as a wrapper in front of these routes — not implemented here.
  *
- * Scope boundary (per the issue): ingest + storage only. No dashboard read
- * API, no Cloudflare Access auth — those are later epic phases.
+ * Scope boundary (per the issue): ingest + storage, plus the query API and
+ * live tail added by #4726. Cloudflare Access auth / redaction are later
+ * epic phases (#4727).
  */
 
 import { extractBearerToken, authenticateHost, hashIngestKey } from "./auth";
 import { FleetState } from "./fleetState";
+import {
+  createLiveTailStream,
+  parseHistoryQuery,
+  queryHistory,
+  type LiveTailFilter,
+} from "./query";
 import { parseRetentionConfig, runRetentionSweep } from "./retention";
 import { validateEnvelope, extractRecordFields, type TelemetryEnvelope } from "./telemetry";
 
@@ -248,6 +267,53 @@ async function handleAdmin(request: Request, env: Env, url: URL): Promise<Respon
 }
 
 // ---------------------------------------------------------------------------
+// /api/* — Phase 3 dashboard query API (issue #4726)
+// ---------------------------------------------------------------------------
+
+/** `GET /api/fleet-state` — the unclassified equivalent of
+ * `GET /admin/fleet-state`: same Durable Object snapshot, no admin token
+ * required. This is the route the Phase 3 dashboard UI actually consumes;
+ * `/admin/fleet-state` remains for operator introspection/verification. */
+async function handleFleetStateQuery(env: Env): Promise<Response> {
+  const response = await fleetStateStub(env).fetch("https://fleet-state/snapshot");
+  return new Response(response.body, { status: response.status, headers: JSON_HEADERS });
+}
+
+/** `GET /api/history` — filterable, paginated D1 history query. See
+ * `query.ts`'s `parseHistoryQuery`/`queryHistory` doc comments for the full
+ * filter/pagination contract. */
+async function handleHistoryQuery(env: Env, url: URL): Promise<Response> {
+  const filter = parseHistoryQuery(url.searchParams);
+  if ("error" in filter) {
+    return jsonError(400, filter.error);
+  }
+  const result = await queryHistory(env.DB, filter);
+  return new Response(JSON.stringify(result), { status: 200, headers: JSON_HEADERS });
+}
+
+/** `GET /api/events` — SSE live tail of newly-ingested telemetry. See
+ * `query.ts`'s `createLiveTailStream` doc comment for the framing/polling
+ * contract. */
+function handleLiveTail(request: Request, env: Env, url: URL): Response {
+  const filter: LiveTailFilter = {};
+  const host = url.searchParams.get("host");
+  if (host) filter.host = host;
+  const repo = url.searchParams.get("repo");
+  if (repo) filter.repo = repo;
+
+  const stream = createLiveTailStream(env.DB, filter, { signal: request.signal });
+  return new Response(stream, {
+    status: 200,
+    headers: {
+      "content-type": "text/event-stream",
+      "cache-control": "no-cache, no-store",
+      "x-accel-buffering": "no",
+      connection: "keep-alive",
+    },
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Entrypoint
 // ---------------------------------------------------------------------------
 
@@ -261,8 +327,17 @@ export default {
     if (url.pathname.startsWith("/admin/")) {
       return handleAdmin(request, env, url);
     }
+    if (request.method === "GET" && url.pathname === "/api/fleet-state") {
+      return handleFleetStateQuery(env);
+    }
+    if (request.method === "GET" && url.pathname === "/api/history") {
+      return handleHistoryQuery(env, url);
+    }
+    if (request.method === "GET" && url.pathname === "/api/events") {
+      return handleLiveTail(request, env, url);
+    }
     if (request.method === "GET" && url.pathname === "/") {
-      return new Response("loom-observability-ingest: see /ingest, /admin/*", { status: 200 });
+      return new Response("loom-observability-ingest: see /ingest, /admin/*, /api/*", { status: 200 });
     }
     return jsonError(404, "not found");
   },
