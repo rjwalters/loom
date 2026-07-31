@@ -41,16 +41,6 @@
 //! a separate `cargo test --workspace --doc` invocation, since nextest does not
 //! run them.
 //!
-//! <div class="warning">
-//!
-//! The `backend-tests` CI job has **not** been switched over yet: the workflow
-//! edit needs a credential with GitHub's `workflow` scope, which the automation
-//! account lacks. Tracked in #4559, with the rationale at the top of
-//! `.config/nextest.toml` (#4385). Treat the rules below as the standing
-//! convention regardless — they are what makes the switch a no-op when it lands.
-//!
-//! </div>
-//!
 //! ## What you should do
 //!
 //! * **Prefer `cargo nextest run` for full-suite local runs.** Plain `cargo

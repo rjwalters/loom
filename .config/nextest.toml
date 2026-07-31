@@ -25,21 +25,6 @@
 # See `loom-daemon/src/lib.rs` (crate-level "Test isolation convention" docs) for
 # the author-facing version of this contract.
 #
-# ONE OPERATOR STEP STILL OUTSTANDING -> #4559 (2026-07-30, #4385)
-#
-# The `backend-tests` job in `.github/workflows/ci.yml` still invokes plain
-# `cargo test --workspace`, so CI is still exposed to the race described above and
-# this file is live for local `cargo nextest run` only. Flipping the job could not
-# be committed with #4385: GitHub refuses any push *or* Contents-API write that
-# touches `.github/workflows/**` unless the credential carries the `workflow` scope
-# (fine-grained PAT: "Workflows: write"), and the automation account's token does
-# not (both paths were tried and rejected — see #4559 for the transcripts and the
-# exact two-hunk replacement). A maintainer with `gh auth refresh -s workflow`
-# applies it in one commit.
-#
-# When that lands, delete this block *and* the matching `<div class="warning">`
-# note in `loom-daemon/src/lib.rs`'s crate docs in the same commit.
-#
 # A SECOND FAILURE CLASS THIS FILE ALSO CLOSES -> #4561 (2026-07-30)
 #
 # A #4494 Doctor verification pass on PR #4543 hit a Tokio-runtime-context test
