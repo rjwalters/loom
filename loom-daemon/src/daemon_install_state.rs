@@ -463,9 +463,10 @@ fn current_uid() -> Option<String> {
 /// Parse `launchctl print <domain>/<label>` output for a live pid — mirrors
 /// the watchdog's `awk -F'= ' '/^[[:space:]]*pid = /{...; print $2; exit}'`.
 /// `domain` is an already-resolved launchd domain (see
-/// [`resolve_launchd_domain`]) — the caller resolves it once and reuses it
-/// for both this probe and any human-readable detail string, avoiding a
-/// duplicate `launchctl`/`id` round trip per [`check_liveness`] call.
+/// [`resolve_launchd_domain_detailed`]) — the caller resolves it once and
+/// reuses it for both this probe and any human-readable detail string,
+/// avoiding a duplicate `launchctl`/`id` round trip per [`check_liveness`]
+/// call.
 ///
 /// Bounded by [`PROBE_TIMEOUT`]: a `launchctl print` that stalls on XPC
 /// degrades to `None` — "no live pid" — exactly like an absent `launchctl`
@@ -500,6 +501,23 @@ struct Liveness {
     pid: Option<u32>,
 }
 
+/// Parse a pid file into its recorded pid — `None` when the file is missing,
+/// unreadable, or does not hold a bare integer. Says nothing about whether
+/// that pid is *alive*; see [`pid_file_alive_pid`].
+fn read_pid_file(pid_file: &Path) -> Option<u32> {
+    std::fs::read_to_string(pid_file)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+}
+
+/// The pid recorded in `pid_file`, iff that pid is currently alive — an
+/// independent liveness signal that does not involve launchd at all. Shared by
+/// the non-launchd liveness path and, as of #4694 AC2, the launchd path's
+/// pid-file cross-check.
+fn pid_file_alive_pid(pid_file: &Path) -> Option<u32> {
+    read_pid_file(pid_file).filter(|pid| pid_alive(*pid))
+}
+
 fn check_liveness(
     use_launchd: bool,
     label: &str,
@@ -512,7 +530,8 @@ fn check_liveness(
         // `gui/<uid>` when that domain resolves, else `user/<uid>`. Resolved
         // once and reused for both the probe and the detail string so they
         // never disagree (#4536).
-        let domain = resolve_launchd_domain(domain_override);
+        let resolution = resolve_launchd_domain_detailed(domain_override);
+        let domain = resolution.domain.clone();
         let service = domain
             .as_deref()
             .map(|d| format!("{d}/{label}"))
@@ -526,6 +545,51 @@ fn check_liveness(
                 };
             }
         }
+
+        // #4694 AC1: the primary domain came back negative. Before trusting
+        // that, cross-check the domain `resolve_launchd_domain_detailed`
+        // skipped because its `gui/<uid>` reachability probe failed — that
+        // single probe cannot distinguish a genuine absence from a transient
+        // flake, and folding a flake into a permanent `user/<uid>` fallback
+        // for the rest of this call previously produced a false "not
+        // loaded" verdict for a job that was actually alive under
+        // `gui/<uid>`. No cross-check when an explicit `LOOM_LAUNCHD_DOMAIN`
+        // override was honored (AC6) — `fallback_check_domain` is always
+        // `None` in that case.
+        if let Some(check_domain) = resolution.fallback_check_domain.as_deref() {
+            if let Some(pid) = launchctl_pid(check_domain, label) {
+                if pid_alive(pid) {
+                    return Liveness {
+                        alive: true,
+                        detail: format!("launchd job {check_domain}/{label} alive (pid {pid})"),
+                        pid: Some(pid),
+                    };
+                }
+            }
+        }
+
+        // #4694 AC2: both launchd domains agree the job is not loaded/alive.
+        // Cross-check the pid file — an independent liveness signal that does
+        // not depend on `launchctl`/launchd at all — before declaring the
+        // daemon dead. A live pid-file pid overrides the launchd-domain
+        // negative rather than silently disagreeing with it: this is the
+        // specific check that would have prevented the near-miss where the
+        // daemon was alive (with 6 sweeps running) but `status` reported it
+        // dead solely because the launchd domain probe looked in the wrong
+        // place.
+        if let Some(pf) = pid_file {
+            if let Some(pid) = pid_file_alive_pid(pf) {
+                return Liveness {
+                    alive: true,
+                    detail: format!(
+                        "launchd job {service} not loaded, but pid file {} shows pid {pid} alive",
+                        pf.display()
+                    ),
+                    pid: Some(pid),
+                };
+            }
+        }
+
         return Liveness {
             alive: false,
             detail: format!("launchd job {service} is not loaded/alive"),
@@ -535,28 +599,23 @@ fn check_liveness(
 
     // Non-launchd (nohup / Linux) path: the pid file is the only signal.
     match pid_file {
-        Some(pf) => {
-            let pid = std::fs::read_to_string(pf)
-                .ok()
-                .and_then(|s| s.trim().parse::<u32>().ok());
-            match pid {
-                Some(pid) if pid_alive(pid) => Liveness {
-                    alive: true,
-                    detail: format!("pid {pid} (from {}) alive", pf.display()),
-                    pid: Some(pid),
-                },
-                Some(_) => Liveness {
-                    alive: false,
-                    detail: format!("pid file {} present but pid not alive", pf.display()),
-                    pid: None,
-                },
-                None => Liveness {
-                    alive: false,
-                    detail: format!("no live pid file at {}", pf.display()),
-                    pid: None,
-                },
-            }
-        }
+        Some(pf) => match read_pid_file(pf) {
+            Some(pid) if pid_alive(pid) => Liveness {
+                alive: true,
+                detail: format!("pid {pid} (from {}) alive", pf.display()),
+                pid: Some(pid),
+            },
+            Some(_) => Liveness {
+                alive: false,
+                detail: format!("pid file {} present but pid not alive", pf.display()),
+                pid: None,
+            },
+            None => Liveness {
+                alive: false,
+                detail: format!("no live pid file at {}", pf.display()),
+                pid: None,
+            },
+        },
         None => Liveness {
             alive: false,
             detail: "no live pid file at <none>".to_string(),
@@ -1001,40 +1060,123 @@ pub fn resolve_watchdog_job(
     }
 }
 
+/// [`resolve_launchd_domain_detailed`]'s result, carrying enough detail for
+/// callers to cross-check a negative verdict against the domain that domain
+/// resolution *skipped* (#4694).
+///
+/// The `gui/<uid>` → `user/<uid>` fallback itself is intentional (#4130,
+/// headless-SSH support) — this struct does not change which domain is
+/// *primary*, it only lets a caller know when a second, skipped domain
+/// exists and is worth a cross-check before declaring a negative (dead /
+/// not-loaded / not-provisioned) verdict: the single reachability probe used
+/// to decide whether `gui/<uid>` is usable cannot distinguish "genuinely
+/// unreachable" from "a transient hang/flake within `PROBE_TIMEOUT`" —
+/// folding a flaky probe into a permanent domain choice for the rest of the
+/// call previously produced false negatives (#4694).
+struct DomainResolution {
+    /// The primary domain to probe. `None` only when the uid itself is
+    /// undeterminable.
+    domain: Option<String>,
+    /// The `gui/<uid>` domain that was skipped because its reachability probe
+    /// came back non-success, when that is why `domain` is `user/<uid>`.
+    /// `Some` only in that exact case — never when an explicit
+    /// `LOOM_LAUNCHD_DOMAIN` override was honored (AC6: no cross-check
+    /// fallback for an explicit override) and never when `gui/<uid>` was
+    /// itself the resolved domain (nothing was skipped).
+    fallback_check_domain: Option<String>,
+}
+
 /// Resolve the launchd domain to probe in, mirroring
 /// `lib/launchd-domain.sh::resolve_launchd_domain`: an explicit
 /// `LOOM_LAUNCHD_DOMAIN` wins, else `gui/<uid>` when that domain resolves, else
 /// the SSH-reachable background `user/<uid>` domain. `None` only when the uid
-/// itself is undeterminable (⇒ the caller degrades to `Unknown`).
-fn resolve_launchd_domain(override_value: Option<&str>) -> Option<String> {
+/// itself is undeterminable (⇒ the caller degrades to `Unknown`). The result
+/// also carries the skipped-domain detail described in [`DomainResolution`],
+/// for callers that need to cross-check a negative verdict (#4694) — every
+/// caller in this module uses that detail, so there is no separate
+/// domain-only accessor.
+fn resolve_launchd_domain_detailed(override_value: Option<&str>) -> DomainResolution {
     if let Some(explicit) = override_value.filter(|s| !s.is_empty()) {
-        return Some(explicit.to_string());
+        return DomainResolution {
+            domain: Some(explicit.to_string()),
+            fallback_check_domain: None,
+        };
     }
-    let uid = current_uid()?;
+    let Some(uid) = current_uid() else {
+        return DomainResolution {
+            domain: None,
+            fallback_check_domain: None,
+        };
+    };
     let gui = format!("gui/{uid}");
     let mut cmd = Command::new("launchctl");
     cmd.args(["print", &gui]);
     // A hung reachability probe reads as "gui/<uid> not reachable" — the same
     // verdict an absent/nonzero `launchctl` gives — so the caller falls back to
-    // the SSH-reachable `user/<uid>` domain rather than blocking (#4548).
+    // the SSH-reachable `user/<uid>` domain rather than blocking (#4548). That
+    // failure is exactly the ambiguous case #4694 cares about: it may be a
+    // genuine absence, or it may be a transient flake — either way `gui` is
+    // reported back as the domain worth cross-checking before a caller trusts
+    // a negative verdict from `user/<uid>` alone.
     let gui_ok = probe_output(cmd, PROBE_TIMEOUT).is_some_and(|o| o.status.success());
     if gui_ok {
-        return Some(gui);
+        return DomainResolution {
+            domain: Some(gui),
+            fallback_check_domain: None,
+        };
     }
-    Some(format!("user/{uid}"))
+    DomainResolution {
+        domain: Some(format!("user/{uid}")),
+        fallback_check_domain: Some(gui),
+    }
 }
 
-/// Is the watchdog launchd job loaded? `launchctl print <domain>/<label>` exits
-/// 0 only for a bootstrapped job, so a nonzero exit is a real
-/// "not provisioned". A missing/unspawnable `launchctl` (or an undeterminable
-/// domain) yields `None` — unknown, never a false negative. A probe that hangs
-/// past [`PROBE_TIMEOUT`] takes that same `None` path (#4548).
-fn launchctl_job_provisioned(label: &str, domain_override: Option<&str>) -> Option<bool> {
-    let domain = resolve_launchd_domain(domain_override)?;
+/// Probe whether the launchd job `<domain>/<label>` is loaded —
+/// `launchctl print <domain>/<label>` exits 0 only for a bootstrapped job, so
+/// a nonzero exit is a real (for *this domain*) "not loaded". A
+/// missing/unspawnable `launchctl` yields `None` — unknown, never a false
+/// negative. A probe that hangs past [`PROBE_TIMEOUT`] takes that same `None`
+/// path (#4548). Shared by [`launchctl_job_provisioned`]'s primary and
+/// cross-check probes (#4694) — both are this exact same call against
+/// different domains.
+fn probe_domain_provisioned(domain: &str, label: &str) -> Option<bool> {
     let mut cmd = Command::new("launchctl");
     cmd.args(["print", &format!("{domain}/{label}")]);
     let output = probe_output(cmd, PROBE_TIMEOUT)?;
     Some(output.status.success())
+}
+
+/// Is the watchdog launchd job loaded? A missing/unspawnable `launchctl` (or
+/// an undeterminable domain) yields `None` — unknown, never a false negative.
+///
+/// #4694: a negative (or unknown) primary-domain verdict is not trusted on
+/// its own when [`resolve_launchd_domain_detailed`] reports a
+/// `fallback_check_domain` — i.e. when domain resolution fell back to
+/// `user/<uid>` because its `gui/<uid>` reachability probe failed, which
+/// cannot distinguish a genuine absence from a transient flake. In that case
+/// this also probes the skipped `gui/<uid>` domain and only reports
+/// not-provisioned (`Some(false)`) when BOTH domains agree; any timeout/error
+/// on either probe, or a disagreement other than "either domain says loaded",
+/// degrades to `None` rather than a confident negative (never folds "unknown"
+/// into `Some(false)`). No cross-check occurs when an explicit
+/// `LOOM_LAUNCHD_DOMAIN` override was honored (AC6) — that always resolves
+/// with `fallback_check_domain: None`.
+fn launchctl_job_provisioned(label: &str, domain_override: Option<&str>) -> Option<bool> {
+    let resolution = resolve_launchd_domain_detailed(domain_override);
+    let domain = resolution.domain?;
+    let primary = probe_domain_provisioned(&domain, label);
+    if primary == Some(true) {
+        return primary;
+    }
+    let Some(check_domain) = resolution.fallback_check_domain.as_deref() else {
+        return primary;
+    };
+    let secondary = probe_domain_provisioned(check_domain, label);
+    match (primary, secondary) {
+        (_, Some(true)) => Some(true),
+        (Some(false), Some(false)) => Some(false),
+        _ => None,
+    }
 }
 
 /// Is the watchdog systemd timer provisioned? `systemctl --user is-enabled
@@ -1470,13 +1612,15 @@ mod tests {
 
     // ===================================================================
     // launchctl_pid domain resolution (#4536): the unreachable-path launchd
-    // probe must use the same `resolve_launchd_domain` fallback rule
+    // probe must use the same `resolve_launchd_domain_detailed` fallback rule
     // (explicit `LOOM_LAUNCHD_DOMAIN` override -> `gui/<uid>` -> `user/<uid>`)
     // the reachable-path protection probe uses (#4354/#4533), instead of a
     // hardcoded `gui/<uid>`. These tests run in CI on `ubuntu-latest`, where
     // `launchctl` does not exist, so both the probe itself and the
-    // `gui/<uid>` reachability check inside `resolve_launchd_domain` always
-    // fail — making the `user/<uid>` fallback branch deterministic here.
+    // `gui/<uid>` reachability check inside
+    // `resolve_launchd_domain_detailed` always fail — making the `user/<uid>`
+    // fallback branch (and, since #4694, its `gui/<uid>` cross-check, which
+    // fails identically) deterministic here.
     // ===================================================================
 
     #[test]
@@ -1510,10 +1654,12 @@ mod tests {
         env.launchd_domain_override = None;
         let report = classify_with_process_age_fn(dir.path(), &marker, &env, |_| Some(1_000_000));
         let detail = report.liveness_detail.expect("liveness_detail set");
-        // No `LOOM_LAUNCHD_DOMAIN` override: `resolve_launchd_domain` tries
-        // `gui/<uid>` first, but `launchctl` is absent on this CI runner, so
-        // that probe fails and it falls through to `user/<uid>` — the same
-        // fallback order `resolve_launchd_domain` documents.
+        // No `LOOM_LAUNCHD_DOMAIN` override: `resolve_launchd_domain_detailed`
+        // tries `gui/<uid>` first, but `launchctl` is absent on this CI runner,
+        // so that probe fails and it falls through to `user/<uid>` — the same
+        // fallback order `resolve_launchd_domain_detailed` documents. The
+        // #4694 `gui/<uid>` cross-check fails on the same absent `launchctl`,
+        // so the reported detail stays the `user/<uid>` domain.
         let uid = current_uid().expect("current_uid resolves in test env");
         assert!(
             detail.contains(&format!("user/{uid}/{DEFAULT_LAUNCHD_LABEL}")),
@@ -2212,10 +2358,12 @@ mod tests {
         // `launchctl print` can stall on XPC against an unreachable domain. All
         // three launchctl probes must fall back to their absent-binary values:
         // `launchctl_pid` -> None (no live pid), `launchctl_job_provisioned` ->
-        // None (unknown), and `resolve_launchd_domain` -> the SSH-reachable
-        // `user/<uid>` domain (its `gui/<uid>` reachability probe reads as
-        // "not reachable"). An explicit domain override is passed where
-        // possible so the assertions do not depend on a real `id -u`.
+        // None (unknown), and `resolve_launchd_domain_detailed` -> the
+        // SSH-reachable `user/<uid>` domain (its `gui/<uid>` reachability probe
+        // reads as "not reachable"). An explicit domain override is passed
+        // where possible so the assertions do not depend on a real `id -u` —
+        // which also means the #4694 cross-check is deliberately not engaged
+        // here, keeping this a single-probe timing assertion.
         let stub_dir = tempfile::tempdir().unwrap();
         write_stub(stub_dir.path(), "launchctl", HANG_STUB);
 
@@ -2239,22 +2387,262 @@ mod tests {
     #[test]
     #[serial]
     fn resolve_launchd_domain_falls_back_to_user_uid_when_launchctl_hangs() {
-        // The reachability probe inside `resolve_launchd_domain` is the one
-        // launchctl call whose *timeout* is a verdict, not an error: it must
-        // read as "gui/<uid> unreachable" and hand back `user/<uid>`, exactly
-        // like the absent-launchctl path this repo's CI already exercises.
+        // The reachability probe inside `resolve_launchd_domain_detailed` is
+        // the one launchctl call whose *timeout* is a verdict, not an error:
+        // it must read as "gui/<uid> unreachable" and hand back
+        // `user/<uid>`, exactly like the absent-launchctl path this repo's
+        // CI already exercises. It must also report `gui/<uid>` as the
+        // skipped domain to cross-check (#4694) — a hang is exactly the kind
+        // of ambiguous "unreachable" this module cannot tell apart from a
+        // genuine absence.
         let uid = current_uid().expect("current_uid resolves in the test env");
         let stub_dir = tempfile::tempdir().unwrap();
         write_stub(stub_dir.path(), "launchctl", HANG_STUB);
 
         let started = Instant::now();
-        let domain = with_path_prefix(stub_dir.path(), || resolve_launchd_domain(None));
+        let resolution =
+            with_path_prefix(stub_dir.path(), || resolve_launchd_domain_detailed(None));
         let elapsed = started.elapsed();
 
-        assert_eq!(domain, Some(format!("user/{uid}")));
+        assert_eq!(resolution.domain, Some(format!("user/{uid}")));
+        assert_eq!(resolution.fallback_check_domain, Some(format!("gui/{uid}")));
         assert!(
             elapsed < hang_budget(),
-            "resolve_launchd_domain must be bounded by PROBE_TIMEOUT, took {elapsed:?}"
+            "resolve_launchd_domain_detailed must be bounded by PROBE_TIMEOUT, took {elapsed:?}"
+        );
+    }
+
+    // ===================================================================
+    // #4694: a flaky (as opposed to genuinely absent) `gui/<uid>`
+    // reachability probe inside domain resolution must not permanently
+    // misroute `check_liveness`/`launchctl_job_provisioned` to the wrong
+    // domain for the rest of the call. Each stub below dispatches on the
+    // `launchctl print <target>` argument so the *bare*-domain reachability
+    // probe (`gui/<uid>`) and the *job* probes (`<domain>/<uid>/<label>`)
+    // can be scripted independently.
+    // ===================================================================
+
+    #[test]
+    #[serial]
+    fn check_liveness_survives_a_transient_gui_domain_probe_failure() {
+        // The job IS loaded under `gui/<uid>`, but the bare `gui/<uid>`
+        // reachability probe fails (simulating a transient flake) — domain
+        // resolution falls back to `user/<uid>`, where the job is not
+        // loaded. Before this fix that produced a permanent false "not
+        // loaded/alive" verdict; the cross-check must recover the true
+        // positive from `gui/<uid>`.
+        let uid = current_uid().expect("current_uid resolves in the test env");
+        let pid = std::process::id();
+        let stub_dir = tempfile::tempdir().unwrap();
+        write_stub(
+            stub_dir.path(),
+            "launchctl",
+            &format!(
+                "#!/bin/sh\n\
+                 target=\"$2\"\n\
+                 case \"$target\" in\n\
+                   gui/{uid}/*) echo \"    pid = {pid}\"; exit 0 ;;\n\
+                   gui/{uid}) exit 1 ;;\n\
+                   user/{uid}/*) exit 1 ;;\n\
+                   *) exit 1 ;;\n\
+                 esac\n"
+            ),
+        );
+
+        let liveness = with_path_prefix(stub_dir.path(), || {
+            check_liveness(true, DEFAULT_LAUNCHD_LABEL, None, None)
+        });
+
+        assert!(
+            liveness.alive,
+            "a job loaded under gui/<uid> must read as alive despite a flaky gui \
+             reachability probe: {}",
+            liveness.detail
+        );
+        assert_eq!(liveness.pid, Some(pid));
+        assert!(
+            liveness.detail.contains(&format!("gui/{uid}/")),
+            "expected the cross-checked gui/<uid> domain in the detail, got: {}",
+            liveness.detail
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn launchctl_job_provisioned_survives_a_transient_gui_domain_probe_failure() {
+        // Same false-negative shape as the liveness test above, but for the
+        // `Protection: watchdog job not provisioned` call site.
+        let uid = current_uid().expect("current_uid resolves in the test env");
+        let stub_dir = tempfile::tempdir().unwrap();
+        write_stub(
+            stub_dir.path(),
+            "launchctl",
+            &format!(
+                "#!/bin/sh\n\
+                 target=\"$2\"\n\
+                 case \"$target\" in\n\
+                   gui/{uid}/*) exit 0 ;;\n\
+                   gui/{uid}) exit 1 ;;\n\
+                   user/{uid}/*) exit 1 ;;\n\
+                   *) exit 1 ;;\n\
+                 esac\n"
+            ),
+        );
+
+        let provisioned = with_path_prefix(stub_dir.path(), || {
+            launchctl_job_provisioned(DEFAULT_LAUNCHD_LABEL, None)
+        });
+
+        assert_eq!(
+            provisioned,
+            Some(true),
+            "a watchdog job provisioned under gui/<uid> must be reported provisioned \
+             despite a flaky gui reachability probe"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn negative_verdicts_still_reported_when_job_absent_from_both_domains() {
+        // No regression on the true-negative case: when the job is
+        // genuinely absent from BOTH domains, both call sites must still
+        // report the negative verdict, not degrade it to unknown.
+        let uid = current_uid().expect("current_uid resolves in the test env");
+        let stub_dir = tempfile::tempdir().unwrap();
+        write_stub(
+            stub_dir.path(),
+            "launchctl",
+            &format!(
+                "#!/bin/sh\n\
+                 target=\"$2\"\n\
+                 case \"$target\" in\n\
+                   gui/{uid}) exit 1 ;;\n\
+                   gui/{uid}/*) exit 1 ;;\n\
+                   user/{uid}/*) exit 1 ;;\n\
+                   *) exit 1 ;;\n\
+                 esac\n"
+            ),
+        );
+
+        let (liveness, provisioned) = with_path_prefix(stub_dir.path(), || {
+            (
+                check_liveness(true, DEFAULT_LAUNCHD_LABEL, None, None),
+                launchctl_job_provisioned(DEFAULT_LAUNCHD_LABEL, None),
+            )
+        });
+
+        assert!(
+            !liveness.alive,
+            "a job absent from both domains must still read as not loaded: {}",
+            liveness.detail
+        );
+        assert_eq!(
+            provisioned,
+            Some(false),
+            "a job absent from both domains must still read as not provisioned, not unknown"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn pid_file_alive_overrides_a_launchd_domain_negative() {
+        // #4694 AC2 — the specific check that would have prevented the
+        // near-miss: the daemon was alive at a real pid with 6 sweeps
+        // running, but `status` reported it dead because the launchd domain
+        // probe was looking in the wrong place. A live pid-file pid must
+        // override a launchd-domain negative.
+        let stub_dir = tempfile::tempdir().unwrap();
+        // Both domains genuinely report the job absent — no launchd signal
+        // at all.
+        write_stub(stub_dir.path(), "launchctl", "#!/bin/sh\nexit 1\n");
+
+        let pid_dir = tempfile::tempdir().unwrap();
+        let pid_file = write_pid_file(pid_dir.path(), std::process::id());
+
+        let liveness = with_path_prefix(stub_dir.path(), || {
+            check_liveness(true, DEFAULT_LAUNCHD_LABEL, Some(&pid_file), None)
+        });
+
+        assert!(
+            liveness.alive,
+            "a live pid-file pid must override a launchd-domain negative: {}",
+            liveness.detail
+        );
+        assert_eq!(liveness.pid, Some(std::process::id()));
+        assert!(liveness.detail.contains("pid file"), "{}", liveness.detail);
+    }
+
+    #[test]
+    #[serial]
+    fn launchctl_job_provisioned_cross_check_timeout_degrades_to_unknown() {
+        // AC3/AC4d: a cross-check probe that itself hangs (rather than
+        // returning a fast negative) must degrade the verdict to unknown —
+        // never fold a timeout into a confident `Some(false)`.
+        let uid = current_uid().expect("current_uid resolves in the test env");
+        let stub_dir = tempfile::tempdir().unwrap();
+        write_stub(
+            stub_dir.path(),
+            "launchctl",
+            &format!(
+                "#!/bin/sh\n\
+                 target=\"$2\"\n\
+                 case \"$target\" in\n\
+                   gui/{uid}) exit 1 ;;\n\
+                   gui/{uid}/*) sleep 60 ;;\n\
+                   user/{uid}/*) exit 1 ;;\n\
+                   *) exit 1 ;;\n\
+                 esac\n"
+            ),
+        );
+
+        let started = Instant::now();
+        let provisioned = with_path_prefix(stub_dir.path(), || {
+            launchctl_job_provisioned(DEFAULT_LAUNCHD_LABEL, None)
+        });
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            provisioned, None,
+            "a hung cross-check probe must degrade to unknown, not a confident negative"
+        );
+        assert!(
+            elapsed < hang_budget() * 2,
+            "the cross-check probe must be bounded by PROBE_TIMEOUT, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn launchctl_job_provisioned_honors_explicit_domain_override_without_cross_check() {
+        // AC6: an explicit `LOOM_LAUNCHD_DOMAIN` override must be honored
+        // verbatim with no cross-check fallback. Even though the job IS
+        // provisioned under `gui/<uid>`, an explicit override domain that
+        // reports "absent" must stay a confident negative — never upgraded
+        // by a secondary probe the override opted out of.
+        let uid = current_uid().expect("current_uid resolves in the test env");
+        let stub_dir = tempfile::tempdir().unwrap();
+        write_stub(
+            stub_dir.path(),
+            "launchctl",
+            &format!(
+                "#!/bin/sh\n\
+                 target=\"$2\"\n\
+                 case \"$target\" in\n\
+                   custom/1/*) exit 1 ;;\n\
+                   gui/{uid}/*) exit 0 ;;\n\
+                   *) exit 1 ;;\n\
+                 esac\n"
+            ),
+        );
+
+        let provisioned = with_path_prefix(stub_dir.path(), || {
+            launchctl_job_provisioned(DEFAULT_LAUNCHD_LABEL, Some("custom/1"))
+        });
+
+        assert_eq!(
+            provisioned,
+            Some(false),
+            "an explicit domain override must not be upgraded by a gui/<uid> cross-check"
         );
     }
 
