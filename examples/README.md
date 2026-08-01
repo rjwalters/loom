@@ -118,7 +118,7 @@ See [../docs/workflows.md](../docs/workflows.md) for complete workflow documenta
 ### Workers not finding issues?
 - Install GitHub CLI: `brew install gh` (macOS) or equivalent
 - Authenticate: `gh auth login`
-- Create issues with `loom:ready` label
+- Create issues with `loom:issue` label
 
 ### Configuration not loading?
 - Ensure `.loom/config.json` has valid JSON

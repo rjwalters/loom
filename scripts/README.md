@@ -40,8 +40,6 @@ Starts the daemon in the background silently and stores its PID.
 Usage:
 ```bash
 ./scripts/start-daemon.sh
-# or
-pnpm run daemon:start
 ```
 
 ### stop-daemon.sh
@@ -74,8 +72,6 @@ sleep 1
 Usage:
 ```bash
 ./scripts/restart-daemon.sh
-# or
-pnpm run daemon:restart
 ```
 
 ## Integration with pnpm
@@ -92,17 +88,17 @@ These scripts are used by the pnpm commands in `package.json`:
 
 ## Files Created
 
-These scripts create files in the project root (all gitignored):
+These scripts create files under `.loom/` (all gitignored):
 
-- `.daemon.pid` - Process ID of running daemon
-- `.daemon.log` - Daemon stdout/stderr output
+- `.loom/.daemon.pid` - Process ID of running daemon
+- `.loom/.daemon.log` - Daemon stdout/stderr output
 
 ## Troubleshooting
 
 ### Daemon won't start
 Check the log file:
 ```bash
-cat .daemon.log
+cat .loom/.daemon.log
 ```
 
 Common issues:
@@ -120,14 +116,14 @@ ps aux | grep loom-daemon
 kill -9 <PID>
 
 # Clean up
-rm -f .daemon.pid
+rm -f .loom/.daemon.pid
 ```
 
 ### Stale PID file
-If `.daemon.pid` exists but daemon isn't running:
+If `.loom/.daemon.pid` exists but daemon isn't running:
 ```bash
-rm .daemon.pid
-pnpm run daemon:start
+rm .loom/.daemon.pid
+pnpm run daemon:dev
 ```
 
 The stop script handles this automatically by checking if the PID is still alive.

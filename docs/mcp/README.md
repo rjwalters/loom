@@ -1,91 +1,79 @@
 # Loom MCP Server
 
-Loom provides a unified Model Context Protocol (MCP) server (`mcp-loom`) that enables AI agents like Claude Code to interact with the Loom application, access logs, and control terminals programmatically.
+Loom provides a unified Model Context Protocol (MCP) server (`mcp-loom`) that enables AI agents like Claude Code to interact with the Loom application, dispatch sweeps on the Rust `loom-daemon`, and control terminals programmatically.
 
 ## Overview
 
 MCP (Model Context Protocol) is a standard protocol for connecting AI agents to external tools and data sources. Loom's MCP server exposes Loom's capabilities through a standardized interface that AI agents can use for:
 
-- **Testing and Debugging**: Verify factory reset, monitor agent launches, check terminal state
+- **Orchestration**: Dispatch and monitor `/loom:sweep` runs on the Tier 2 daemon
 - **Automation**: Trigger workspace operations, send commands to terminals
-- **Monitoring**: Read logs, check app health, track agent activity
+- **Monitoring**: Stream sweep-lifecycle events, register durable watches, check app health
 - **Development**: Build tools and workflows on top of Loom
 
 ## Available Tools
 
-The unified `mcp-loom` package provides all Loom MCP tools in a single server. Tools are organized into three categories:
+The unified `mcp-loom` package provides all 30 Loom MCP tools in a single server,
+organized into four categories. The authoritative per-tool tables live in
+[`mcp-loom/README.md`](../../mcp-loom/README.md#available-tools-30-total) — the
+summary below is an orientation map, not a second source of truth.
 
-### Log Tools
+### UI/Engine Control (6 tools)
 
-**Purpose**: Access Loom's various log files (daemon, terminal output)
+**Purpose**: Start/stop the engine and inspect app-level state
 
-- `tail_daemon_log` - Read daemon logs (backend activity)
-- `list_terminal_logs` - Find available terminal logs
-- `tail_terminal_log` - Read specific terminal output
+`trigger_start`, `trigger_force_start`, `trigger_force_factory_reset`,
+`get_heartbeat`, `stop_engine`, `get_ui_state`
 
 **When to Use**:
-- Debugging daemon IPC issues
-- Monitoring terminal output
-- Investigating backend errors
-- Verifying agent launch sequences
+- Checking application health (`get_heartbeat`)
+- Starting or stopping the engine, with or without confirmation
+- Reading comprehensive workspace/config/terminal state (`get_ui_state`)
 
 ---
 
-### UI Tools
-
-**Purpose**: Interact with the Loom UI, console logs, and workspace state
-
-- `read_console_log` - Read browser console output
-- `read_state_file` - Check terminal state
-- `read_config_file` - Read terminal configurations
-- `get_heartbeat` - Check if app is running
-- `get_ui_state` - Get comprehensive UI state
-- `trigger_start` - Start workspace with existing config
-- `trigger_force_start` - Start without confirmation
-- `trigger_factory_reset` - Reset config to defaults
-- `trigger_force_factory_reset` - Reset without confirmation
-- `trigger_restart_terminal` - Restart a specific terminal
-- `stop_engine` - Stop all terminals
-- `trigger_run_now` - Execute interval prompt immediately
-- `get_random_file` - Get random file from workspace
-
-**When to Use**:
-- Monitoring UI state and console logs
-- Triggering workspace operations
-- Checking application health
-- Debugging frontend issues
-
----
-
-### Terminal Tools
+### Terminal Management (13 tools)
 
 **Purpose**: Interact with terminal sessions via daemon IPC and control autonomous mode
 
-- `list_terminals` - List active terminals with metadata
-- `get_terminal_output` - Read terminal output
-- `get_selected_terminal` - Get currently selected terminal
-- `send_terminal_input` - Send commands to terminals
-- `create_terminal` - Create a new terminal session
-- `delete_terminal` - Delete a terminal session
-- `restart_terminal` - Restart a terminal preserving config
-- `configure_terminal` - Update terminal settings
-- `set_primary_terminal` - Set primary terminal in UI
-- `clear_terminal_history` - Clear terminal scrollback
-- `check_tmux_server_health` - Check tmux server status
-- `get_tmux_server_info` - Get tmux server details
-- `toggle_tmux_verbose_logging` - Enable tmux debug logging
-- `start_autonomous_mode` - Start interval prompts for all terminals
-- `stop_autonomous_mode` - Stop all interval prompts
-- `launch_interval` - Manually trigger interval prompt for a terminal
-- `get_agent_metrics` - Get agent performance metrics
+`list_terminals`, `get_terminal_output`, `get_selected_terminal`,
+`send_terminal_input`, `create_terminal`, `delete_terminal`, `restart_terminal`,
+`configure_terminal`, `set_primary_terminal`, `start_autonomous_mode`,
+`stop_autonomous_mode`, `launch_interval`, `get_agent_metrics`
 
 **When to Use**:
 - Sending commands to agent terminals
 - Monitoring agent activity in real-time
-- Interactive terminal sessions
 - Automating terminal workflows
 - Controlling autonomous agent execution
-- Testing autonomous mode behavior
+
+See the [Terminal Tools Reference](./loom-terminals.md) for detailed parameters.
+
+---
+
+### Sweep Dispatch (8 tools)
+
+**Purpose**: Drive the Rust `loom-daemon` (Tier 2) over its Unix-socket IPC —
+dispatch single-issue sweeps and observe the event bus. Requires a running
+`loom-daemon`.
+
+`dispatch_sweep`, `list_sweeps`, `get_sweep_status`, `tail_sweep_log`,
+`cancel_sweep`, `publish_event`, `subscribe_to_events`, `tail_event_bus`
+
+**When to Use**:
+- Dispatching `/loom:sweep <N>` with multi-account token rotation
+- Inspecting or cancelling in-flight sweeps
+- Streaming sweep-lifecycle events
+
+---
+
+### Durable Watches (3 tools)
+
+**Purpose**: Register machine-level watches on issue/PR terminal state (#3971)
+that survive the registering session's death and daemon restarts. Resolutions
+append to `~/.loom/logs/watch-results.log`.
+
+`register_watch`, `list_watches`, `remove_watch`
 
 ---
 
@@ -138,9 +126,6 @@ cd mcp-loom && npm install && npm run build
 MCP tools are available with the `mcp__loom__` prefix:
 
 ```typescript
-// Read console logs
-mcp__loom__read_console_log({ lines: 50 })
-
 // List terminals
 mcp__loom__list_terminals()
 
@@ -150,82 +135,51 @@ mcp__loom__get_terminal_output({
   lines: 100
 })
 
-// Trigger factory reset
-mcp__loom__trigger_factory_reset()
+// Dispatch a sweep for issue #123
+mcp__loom__dispatch_sweep({ kind: { Issue: 123 } })
 
-// View daemon logs
-mcp__loom__tail_daemon_log({ lines: 50 })
+// Check on it
+mcp__loom__get_sweep_status({ sweep_id: "sweep-..." })
 ```
 
 ---
 
 ## Common Workflows
 
-### Testing Factory Reset
+### Dispatching and Monitoring a Sweep
 
-**Goal**: Verify factory reset creates all terminals and launches agents successfully
+**Goal**: Run a full issue lifecycle on the daemon and watch it complete
 
 ```typescript
-// 1. Check app is running
-const heartbeat = await mcp__loom__get_heartbeat();
-if (heartbeat.status !== "healthy") {
-  // App needs to be started
-}
+// 1. Check the daemon is reachable and see what's already running
+const sweeps = await mcp__loom__list_sweeps();
 
-// 2. Trigger factory reset
-await mcp__loom__trigger_factory_reset();
+// 2. Dispatch the issue
+const dispatch = await mcp__loom__dispatch_sweep({ kind: { Issue: 123 } });
 
-// 3. Force start without confirmation
-await mcp__loom__trigger_force_start();
+// 3. Poll status (or subscribe to events instead)
+const status = await mcp__loom__get_sweep_status({ sweep_id: dispatch.sweep_id });
 
-// 4. Wait for terminals to be created
-await new Promise(resolve => setTimeout(resolve, 5000));
+// 4. Tail the per-sweep log if something looks stuck
+const log = await mcp__loom__tail_sweep_log({ sweep_id: dispatch.sweep_id, lines: 50 });
 
-// 5. Verify terminals exist
-const terminals = await mcp__loom__list_terminals();
-// Should show 8 terminals (terminal-1 through terminal-8)
-
-// 6. Check each agent terminal launched successfully
-for (const terminalId of ["terminal-2", "terminal-3", "terminal-4"]) {
-  const output = await mcp__loom__get_terminal_output({
-    terminal_id: terminalId,
-    lines: 50
-  });
-  // Look for "Claude Code" or "Codex" startup message
-}
-
-// 7. Read console logs for any errors
-const consoleLogs = await mcp__loom__read_console_log({ lines: 200 });
-// Check for error messages
+// 5. Cancel if needed (SIGTERM → grace → SIGKILL)
+await mcp__loom__cancel_sweep({ sweep_id: dispatch.sweep_id });
 ```
 
-### Debugging Agent Launch Failures
+### Watching an Issue/PR to Resolution
 
-**Goal**: Investigate why an agent didn't start correctly
+**Goal**: Get durable notification when an issue or PR reaches terminal state,
+even if this session dies
 
 ```typescript
-// 1. Read console logs for launch sequence
-const consoleLogs = await mcp__loom__read_console_log({ lines: 100 });
-// Look for [launchAgentInTerminal] messages
+// Register the watch (idempotent; cross-repo via repo/workspace_root)
+await mcp__loom__register_watch({ kind: "pr", number: 456 });
 
-// 2. Check daemon logs for IPC issues
-const daemonLogs = await mcp__loom__tail_daemon_log({ lines: 100 });
-// Look for CreateTerminal and SendInput messages
+// List active watches
+const watches = await mcp__loom__list_watches();
 
-// 3. Check terminal output
-const terminalOutput = await mcp__loom__get_terminal_output({
-  terminal_id: "terminal-3",
-  lines: 50
-});
-// Look for errors or stuck prompts
-
-// 4. Check state file for worktree paths
-const state = await mcp__loom__read_state_file();
-// Verify worktreePath is set
-
-// 5. Check config for role settings
-const config = await mcp__loom__read_config_file();
-// Verify roleFile and workerType are correct
+// Resolutions land in ~/.loom/logs/watch-results.log
 ```
 
 ### Monitoring Agent Activity
@@ -290,45 +244,38 @@ const output = await mcp__loom__get_terminal_output({
          │ MCP Protocol (stdio)
          │
          ▼
-┌─────────────────┐
-│    mcp-loom     │  (Unified MCP Server)
-│                 │
-│  ┌───────────┐  │
-│  │ Log Tools │  │
-│  ├───────────┤  │
-│  │ UI Tools  │  │
-│  ├───────────┤  │
-│  │Term Tools │  │
-│  └───────────┘  │
-└────────┬────────┘
-         │
+┌──────────────────┐
+│     mcp-loom     │  (Unified MCP Server)
+│                  │
+│  ┌────────────┐  │
+│  │ UI/Engine  │  │
+│  ├────────────┤  │
+│  │ Terminals  │  │
+│  ├────────────┤  │
+│  │  Sweeps    │  │
+│  ├────────────┤  │
+│  │  Watches   │  │
+│  └────────────┘  │
+└────────┬─────────┘
+         │ Unix-socket IPC
          ▼
 ┌──────────────────────────────────┐
 │           loom-daemon            │
 │  Orchestration + IPC server      │
 └──────────────────────────────────┘
-         │                │
-         ▼                ▼
-    ~/.loom/          /tmp/
-    daemon.log        loom-daemon.sock
-    state.json        loom-*.out
-    config.json
 ```
 
 ### File System
 
-**Loom Directory** (`~/.loom/`):
+**Machine-level Loom Directory** (`~/.loom/`):
+- `loom-daemon.sock` - Unix socket for daemon IPC (override with `LOOM_SOCKET_PATH`)
 - `daemon.log` - Daemon activity logs
-- `mcp-command.json` - File-based IPC commands
+- `watches.json` - Durable watch registry
+- `logs/watch-results.log` - Terminal resolutions of watches
 
 **Workspace Directory** (`{workspace}/.loom/`):
-- `state.json` - Current terminal state
-- `config.json` - Terminal configurations
+- `config.json` - Terminal/role configurations
 - `worktrees/` - Git worktrees for agents
-
-**Temporary Directory** (`/tmp/`):
-- `loom-daemon.sock` - Unix socket for IPC
-- `loom-terminal-*.out` - Terminal output logs
 
 ---
 
@@ -339,9 +286,9 @@ const output = await mcp__loom__get_terminal_output({
 **1. Add tool to the unified server** (`mcp-loom/src/tools/*.ts`):
 
 Choose the appropriate file based on tool category:
-- `logs.ts` - Log monitoring tools
-- `ui.ts` - UI control and state tools
+- `ui.ts` - UI/engine control and state tools
 - `terminals.ts` - Terminal management tools
+- `sweeps.ts` - Sweep dispatch, event bus, and durable watch tools
 
 ```typescript
 // In the appropriate tools file, add to the tools array
@@ -377,7 +324,8 @@ async function myNewToolImpl(param1: string): Promise<string> {
 }
 ```
 
-**3. Document in API reference** (`docs/mcp/*.md`)
+**3. Document it** — update the tool table in `mcp-loom/README.md` (the
+authoritative list) and, for terminal tools, `docs/mcp/loom-terminals.md`
 
 **4. Rebuild and test**:
 
@@ -403,10 +351,9 @@ node mcp-loom/dist/index.js
 **Integration Testing** (from Claude Code):
 ```typescript
 // Test tools from unified server
-const logs = await mcp__loom__read_console_log();
-const state = await mcp__loom__read_state_file();
+const heartbeat = await mcp__loom__get_heartbeat();
 const terminals = await mcp__loom__list_terminals();
-const daemonLog = await mcp__loom__tail_daemon_log();
+const sweeps = await mcp__loom__list_sweeps();
 ```
 
 ### Debugging
@@ -465,11 +412,10 @@ if (heartbeat.status === "not_running") {
 
 ## API Reference
 
-For detailed tool documentation by category, see:
+For detailed tool documentation, see:
 
-- **[Terminal Tools Reference](./loom-terminals.md)** - tools for terminal and autonomous mode control
-
-Log and UI tools are described inline in the top of this document.
+- **[`mcp-loom/README.md`](../../mcp-loom/README.md)** - authoritative table of all 30 tools
+- **[Terminal Tools Reference](./loom-terminals.md)** - detailed parameters for terminal and autonomous-mode tools
 
 ---
 
@@ -478,10 +424,10 @@ Log and UI tools are described inline in the top of this document.
 When adding new MCP capabilities:
 
 1. **Add tool to mcp-loom package** - All tools go in the unified `mcp-loom/src/tools/` directory
-2. **Choose the right category** - Add to `logs.ts`, `ui.ts`, or `terminals.ts`
+2. **Choose the right category** - Add to `ui.ts`, `terminals.ts`, or `sweeps.ts`
 3. **Write comprehensive documentation** - Include parameters, returns, examples, and error conditions
 4. **Test thoroughly** - Verify tool works from Claude Code
-5. **Update this README** - Add to tool list and workflows if applicable
+5. **Update the tool tables** - `mcp-loom/README.md` first; this overview only if a category changes
 
 ---
 

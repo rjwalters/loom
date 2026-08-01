@@ -8,12 +8,13 @@ Each agent role has a corresponding tarot card image that represents its archety
 
 | Role | Archetype | File | Description |
 |------|-----------|------|-------------|
-| **Builder** | The Magician | `worker.svg` | Transforms ideas into reality through manifestation and creative energy |
+| **Builder** | The Magician | `builder.svg` | Transforms ideas into reality through manifestation and creative energy |
 | **Curator** | The High Priestess | `curator.svg` | Refines chaos into clarity through intuition and knowledge organization |
 | **Architect** | The Emperor | `architect.svg` | Envisions structure and design through systematic vision and authority |
-| **Judge** | Justice | `reviewer.svg` | Maintains quality through impartial discernment and balanced judgment |
-| **Hermit** | The Hermit | `critic.svg` | Questions to find truth through introspective wisdom and skepticism |
-| **Doctor** | The Hanged Man | `fixer.svg` | Heals what is broken through patient transformation and perspective shifts |
+| **Champion** | Strength | `champion.svg` | Promotes quality work and merges what is ready through steady resolve |
+| **Judge** | Justice | `judge.svg` | Maintains quality through impartial discernment and balanced judgment |
+| **Hermit** | The Hermit | `hermit.svg` | Questions to find truth through introspective wisdom and skepticism |
+| **Doctor** | The Hanged Man | `doctor.svg` | Heals what is broken through patient transformation and perspective shifts |
 | **Guide** | The Star | `guide.svg` | Illuminates priorities through focused guidance and clarity |
 | **Driver** | The Chariot | `driver.svg` | Masters direct action through willpower and human agency |
 
@@ -26,23 +27,23 @@ Each agent role has a corresponding tarot card image that represents its archety
 
 ## Usage
 
-These assets are used throughout the Loom UI:
+These are brand assets; nothing in the codebase consumes them today. They are
+available for:
 
-- **Terminal Settings Modal**: Display role card when selecting agent role
-- **Role Selection Dropdown**: Icon preview for each role option
-- **Documentation**: Visual reference in README and WORKFLOWS
-- **About/Help**: Explain archetypal system to users
+- **Documentation**: Visual reference in READMEs and workflow docs
+- **UI surfaces**: Role pickers, settings modals, about/help pages
+- **External use**: Presentations, articles, and other Loom branding
 
 ## Implementation
 
-To use a tarot card image in the UI:
+To use a tarot card image in a UI:
 
 ```typescript
 // Import the SVG
-import workerCard from '@/assets/tarot-cards/worker.svg';
+import builderCard from '@/assets/tarot-cards/builder.svg';
 
 // Use in component
-<img src={workerCard} alt="Worker - The Magician" class="w-32 h-48" />
+<img src={builderCard} alt="Builder - The Magician" class="w-32 h-48" />
 ```
 
 ## Attribution
