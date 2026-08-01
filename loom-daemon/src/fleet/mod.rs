@@ -46,6 +46,7 @@
 
 pub mod add_worker;
 pub mod drain;
+pub mod path_bootstrap;
 pub mod status;
 
 use anyhow::{anyhow, Context, Result};

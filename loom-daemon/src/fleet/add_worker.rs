@@ -24,6 +24,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+use super::path_bootstrap;
 use super::{
     all_succeeded, default_fleet_registry_path, execute_plan, render_checklist, CommandOutput,
     CommandRunner, FleetRegistry, Plan, Step, StepStatus, StepStdin, VerifyResult, WorkerRecord,
@@ -770,6 +771,14 @@ fi
 }
 
 fn render_machine_layout(loom_repo_url: &str) -> String {
+    // The canonical PATH export line (#4831) — see path_bootstrap.rs. Written
+    // into ~/.profile (persisted for future logins) as well as exported
+    // immediately by every other apply step below, so a worker that gets a
+    // fresh interactive login (not just the one-shot provisioning SSH
+    // sessions) also has cargo/homebrew resolvable without sourcing this
+    // provisioning plan again.
+    let export_line = path_bootstrap::canonical_path_export_line();
+    let export_line = export_line.trim_end();
     format!(
         r#"set -e
 . "$HOME/.cargo/env" 2>/dev/null || true
@@ -784,9 +793,13 @@ cd "$LOOM_SRC"
 cargo build -p loom-daemon --release
 mkdir -p "$HOME/.local/bin"
 install -m 0755 "$LOOM_SRC/target/release/loom-daemon" "$HOME/.local/bin/loom-daemon"
-# Ensure ~/.local/bin is on PATH for future logins (Linux worker skips codesign).
-if ! echo "$PATH" | tr ':' '\n' | grep -qx "$HOME/.local/bin"; then
-  echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.profile"
+# Ensure the canonical loom PATH (#4831: ~/.local/bin, ~/.cargo/bin, Homebrew,
+# system dirs) is on PATH for future logins (Linux worker skips codesign).
+if ! grep -qF 'loom-canonical-path (#4831)' "$HOME/.profile" 2>/dev/null; then
+  {{
+    echo '# loom-canonical-path (#4831)'
+    printf '%s\n' '{export_line}'
+  }} >> "$HOME/.profile"
 fi
 "#
     )
@@ -802,12 +815,13 @@ curl -fsSL https://claude.ai/install.sh | bash
 fn render_forge_auth() -> String {
     // The PAT arrives on stdin; pipe it straight into `gh auth login` so it
     // never lands on a command line. `gh` stores it 0600 under ~/.config/gh.
-    r#"set -e
-export PATH="$HOME/.local/bin:$PATH"
-gh auth login --with-token
+    let export_line = path_bootstrap::canonical_path_export_line();
+    format!(
+        r#"set -e
+{export_line}gh auth login --with-token
 gh auth setup-git
 "#
-    .to_string()
+    )
 }
 
 fn render_token_accounts() -> String {
@@ -822,19 +836,21 @@ chmod 600 "$HOME/.loom/accounts.env"
 }
 
 fn render_token_pool() -> String {
-    r#"set -e
-export PATH="$HOME/.local/bin:$PATH"
-LOOM_ACCOUNTS_ENV="$HOME/.loom/accounts.env" loom-daemon tokens bootstrap --shared --home-env "$HOME/.loom/accounts.env"
+    let export_line = path_bootstrap::canonical_path_export_line();
+    format!(
+        r#"set -e
+{export_line}LOOM_ACCOUNTS_ENV="$HOME/.loom/accounts.env" loom-daemon tokens bootstrap --shared --home-env "$HOME/.loom/accounts.env"
 "#
-    .to_string()
+    )
 }
 
 fn render_token_ranking() -> String {
-    r#"set -e
-export PATH="$HOME/.local/bin:$PATH"
-loom-daemon tokens check --ranking --shared 2>/dev/null || loom-daemon tokens check --ranking
+    let export_line = path_bootstrap::canonical_path_export_line();
+    format!(
+        r#"set -e
+{export_line}loom-daemon tokens check --ranking --shared 2>/dev/null || loom-daemon tokens check --ranking
 "#
-    .to_string()
+    )
 }
 
 fn render_workspace_clone_check(repos: &[String]) -> String {
@@ -864,12 +880,12 @@ fn render_workspace_clone_check(repos: &[String]) -> String {
 /// `.loom/config.json` (rather than on having just cloned) also self-heals a
 /// workspace that was cloned by a previous run whose `init` failed.
 fn render_workspace_clone(repos: &[String]) -> String {
-    let mut s = String::from(
+    let export_line = path_bootstrap::canonical_path_export_line();
+    let mut s = format!(
         r#"set -e
-export PATH="$HOME/.local/bin:$PATH"
-LOOM_SRC="$HOME/.local/share/loom"
+{export_line}LOOM_SRC="$HOME/.local/share/loom"
 mkdir -p "$HOME/loom-workspaces"
-"#,
+"#
     );
     for repo in repos {
         let rel = workspace_rel(repo);
@@ -889,11 +905,11 @@ fi
 }
 
 fn render_workspace_register_check(repos: &[String]) -> String {
-    let mut s = String::from(
+    let export_line = path_bootstrap::canonical_path_export_line();
+    let mut s = format!(
         r#"set -e
-export PATH="$HOME/.local/bin:$PATH"
-LIST="$(loom-daemon workspace list --json 2>/dev/null || echo '{}')"
-"#,
+{export_line}LIST="$(loom-daemon workspace list --json 2>/dev/null || echo '{{}}')"
+"#
     );
     for repo in repos {
         let rel = workspace_rel(repo);
@@ -904,10 +920,10 @@ LIST="$(loom-daemon workspace list --json 2>/dev/null || echo '{}')"
 }
 
 fn render_workspace_register(repos: &[String], priority: u32) -> String {
-    let mut s = String::from(
+    let export_line = path_bootstrap::canonical_path_export_line();
+    let mut s = format!(
         r#"set -e
-export PATH="$HOME/.local/bin:$PATH"
-"#,
+{export_line}"#
     );
     for repo in repos {
         let rel = workspace_rel(repo);
@@ -932,10 +948,19 @@ fn render_daemon_unit(primary_rel: &str) -> String {
     // `Restart=on-failure`, which would do the opposite (never relaunch a
     // requested restart, but crash-loop-relaunch is watchdog territory the
     // fleet unit does not attempt).
+    //
+    // Environment=PATH= below is rendered from the SAME canonical set
+    // (path_bootstrap::canonical_path_systemd(), #4831) as
+    // resolve_plist_path() in loom-daemon-start.sh — previously this was a
+    // THIRD, narrower, hand-hardcoded PATH
+    // (`%h/.local/bin:/usr/local/bin:/usr/bin:/bin`, missing `%h/.cargo/bin`
+    // and Homebrew) that disagreed with both the launchd/systemd plist
+    // renderer and this same function's own `export PATH=` line above it.
+    let export_line = path_bootstrap::canonical_path_export_line();
+    let systemd_path = path_bootstrap::canonical_path_systemd();
     format!(
         r#"set -e
-export PATH="$HOME/.local/bin:$PATH"
-mkdir -p "$HOME/.config/systemd/user"
+{export_line}mkdir -p "$HOME/.config/systemd/user"
 cat > "$HOME/.config/systemd/user/loom-daemon.service" <<'UNIT'
 [Unit]
 Description=Loom daemon (fleet worker)
@@ -955,7 +980,7 @@ ExecStart=%h/.local/bin/loom-daemon
 # clean EXIT_RESTART (0) relaunches; EXIT_SIGINT (130) / EXIT_SHUTDOWN (143) /
 # a crash all exit non-zero and stay down.
 Restart=on-success
-Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PATH={systemd_path}
 # Lets detect_supervisor() (ipc.rs) prove this daemon is supervised so
 # `restart --drain` will actually exit for a relaunch instead of refusing.
 Environment=LOOM_DAEMON_SUPERVISOR=systemd
@@ -975,6 +1000,10 @@ systemctl --user enable --now loom-daemon.service
 fn render_idle_shutdown(minutes: u32) -> String {
     // Stage 2 of power-off: autonomous.idleExit is stage 1. A running daemon
     // remains a veto because only it can interpret queued/rate-limited work.
+    // This guard script runs unattended out of cron (#4831: cron's PATH is
+    // typically minimal/empty), so it needs the full canonical PATH, not
+    // just ~/.local/bin, to reliably find `loom-daemon`.
+    let export_line = path_bootstrap::canonical_path_export_line();
     format!(
         r#"set -e
 mkdir -p "$HOME/.local/bin"
@@ -983,8 +1012,7 @@ cat > "$HOME/.local/bin/loom-idle-shutdown.sh" <<'GUARD'
 # loom-idle-shutdown (#4341/#4467), stage 2. autonomous.idleExit must first
 # stop loom-daemon; this guard remains the sole power-off authority.
 set -euo pipefail
-export PATH="$HOME/.local/bin:$PATH"
-LIMIT={minutes}
+{export_line}LIMIT={minutes}
 STAMP="$HOME/.loom/last-active"
 mkdir -p "$HOME/.loom"
 active=0
@@ -1017,10 +1045,10 @@ fn render_verify(primary_rel: &str, repos: &[String]) -> String {
             "echo \"$LIST\" | grep -q \"{name}\" || {{ echo \"workspace {name} not registered\" >&2; exit 1; }}\n"
         ));
     }
+    let export_line = path_bootstrap::canonical_path_export_line();
     format!(
         r#"set -e
-export PATH="$HOME/.local/bin:$PATH"
-cd "$HOME/{primary_rel}" 2>/dev/null || true
+{export_line}cd "$HOME/{primary_rel}" 2>/dev/null || true
 # Daemon reachable + status sane from the workspace cwd.
 loom-daemon status >/dev/null 2>&1 || {{ echo "loom-daemon status failed" >&2; exit 1; }}
 # Token ranking is present + fresh (bootstrap + check ran).
@@ -1135,10 +1163,10 @@ rm -f "$ENV_FILE"
 
 fn render_safehouse_room_invite(invite_exec: Option<&str>) -> String {
     let exec = invite_exec.unwrap_or(DEFAULT_SAFEHOUSE_INVITE_EXEC);
+    let export_line = path_bootstrap::canonical_path_export_line();
     format!(
         r#"set -e
-export PATH="$HOME/.local/bin:$PATH"
-{exec}
+{export_line}{exec}
 touch "$HOME/.loom/safehoused/.invited"
 "#
     )
@@ -1153,10 +1181,10 @@ fn render_safehouse_supervise(primary_rel: &str) -> String {
     // a deterministic path (not the config-driven resolver) so a fresh worker
     // with no prior `.loom/config.json` safehouse block still agrees with the
     // env this plan wires into loom-daemon in the next step.
+    let export_line = path_bootstrap::canonical_path_export_line();
     format!(
         r#"set -e
-export PATH="$HOME/.local/bin:$PATH"
-"$HOME/{primary_rel}/.loom/scripts/cli/safehoused-service.sh" install \
+{export_line}"$HOME/{primary_rel}/.loom/scripts/cli/safehoused-service.sh" install \
   --bin "$HOME/.local/bin/safehoused" \
   --socket "{SAFEHOUSE_SOCKET_PATH}" \
   --config "$HOME/.loom/safehoused/config.toml"
@@ -1916,6 +1944,97 @@ mod tests {
             step.summary.contains("Restart=on-success"),
             "step summary must match the rendered policy"
         );
+    }
+
+    /// #4831: `daemon-unit`'s `Environment=PATH=` used to be a THIRD,
+    /// narrower hand-hardcoded set
+    /// (`%h/.local/bin:/usr/local/bin:/usr/bin:/bin`, missing
+    /// `%h/.cargo/bin` and Homebrew) that disagreed with both
+    /// `resolve_plist_path()` (loom-daemon-start.sh) and this file's own
+    /// provisioning `export PATH=` lines. It must now render the FULL
+    /// shared canonical superset (`path_bootstrap::canonical_path_systemd`),
+    /// byte-for-byte, not a hand-picked subset.
+    #[test]
+    fn daemon_unit_path_is_the_full_canonical_systemd_superset() {
+        let config = base_config();
+        let plan = build_plan(&config, &Secrets::default());
+        let step = plan
+            .entries
+            .iter()
+            .find_map(|e| match e {
+                super::super::PlanEntry::Step(s) if s.name == "daemon-unit" => Some(s),
+                _ => None,
+            })
+            .unwrap();
+        let want =
+            format!("Environment=PATH={}", super::super::path_bootstrap::canonical_path_systemd());
+        assert!(
+            step.apply.contains(&want),
+            "daemon-unit must render the full canonical systemd PATH ({want}), got: {}",
+            step.apply
+        );
+        assert!(
+            step.apply.contains("%h/.cargo/bin"),
+            "the pre-#4831 narrower systemd PATH omitted %h/.cargo/bin -- must be present now"
+        );
+        assert!(
+            step.apply.contains("/opt/homebrew/bin"),
+            "the pre-#4831 narrower systemd PATH omitted Homebrew -- must be present now"
+        );
+    }
+
+    /// #4831: every one of the ~12 duplicated `export PATH="$HOME/.local/bin:
+    /// $PATH"` provisioning lines omitted `${HOME}/.cargo/bin` and
+    /// `/opt/homebrew/bin`. Spot-check a representative sample of rendered
+    /// steps (spanning machine layout, forge auth, token bootstrap, and
+    /// workspace registration) to prove they all now render the FULL
+    /// canonical export line, not just one fixed-up call site.
+    #[test]
+    fn provisioning_steps_export_the_full_canonical_path_not_a_narrower_subset() {
+        let config = base_config();
+        // forge-auth/token-pool/token-ranking only render as Steps (not
+        // Skips) when their secrets are present -- mirrors
+        // forge_auth_and_token_accounts_carry_secret_stdin above.
+        let secrets = Secrets {
+            pat: Some("the-pat".to_string()),
+            accounts_env: Some("ACCOUNT_EMAIL_1=a@b.c".to_string()),
+            ..Secrets::default()
+        };
+        let plan = build_plan(&config, &secrets);
+        let export_line = super::super::path_bootstrap::canonical_path_export_line();
+        for name in [
+            "machine-layout",
+            "forge-auth",
+            "token-pool",
+            "token-ranking",
+            "workspace-clone",
+            "workspace-register",
+        ] {
+            let step = plan
+                .entries
+                .iter()
+                .find_map(|e| match e {
+                    super::super::PlanEntry::Step(s) if s.name == name => Some(s),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("expected a step named {name}"));
+            assert!(
+                step.apply.contains(export_line.trim_end()),
+                "step {name} must export the full canonical PATH ({}), got: {}",
+                export_line.trim_end(),
+                step.apply
+            );
+            assert!(
+                step.apply.contains("${HOME}/.cargo/bin"),
+                "step {name} is missing ${{HOME}}/.cargo/bin -- the pre-#4831 duplicated \
+                 export lines omitted this"
+            );
+            assert!(
+                step.apply.contains("/opt/homebrew/bin"),
+                "step {name} is missing /opt/homebrew/bin -- the pre-#4831 duplicated export \
+                 lines omitted this"
+            );
+        }
     }
 
     #[test]
