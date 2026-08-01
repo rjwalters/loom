@@ -1693,6 +1693,13 @@ pub fn build_daemon_status(
         host_breaker: crate::host_breaker::global_snapshot()
             .map(crate::host_breaker::BreakerSnapshot::into_status)
             .map(Box::new),
+        // Saturation admission brake (#4903) — same process-global snapshot
+        // pattern as the host breaker above. This is the field that answers the
+        // question `capacity_bound: false` could not: a host that is refusing new
+        // work because it is already saturated now says so instead of reading as
+        // idle with free slots.
+        admission_brake: crate::admission_brake::global_snapshot()
+            .map(crate::admission_brake::BrakeSnapshot::into_status),
         // GitHub rate-limit circuit breaker (#4429) — same process-global
         // snapshot pattern as the host breaker above.
         rate_limit_breaker: crate::rate_limit_breaker::global_snapshot()
@@ -5453,6 +5460,7 @@ exit 0
             auto_update_terminal_reason: None,
             auto_update_note: Some("within settle window".to_string()),
             host_breaker: None,
+            admission_brake: None,
             rate_limit_breaker: None,
             safehouse: Some(crate::types::SafehouseStatus {
                 state: "connected".to_string(),

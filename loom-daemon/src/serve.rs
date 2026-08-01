@@ -1214,6 +1214,7 @@ mod tests {
             auto_update_terminal_reason: None,
             auto_update_note: None,
             host_breaker: None,
+            admission_brake: None,
             rate_limit_breaker: None,
             safehouse: None,
             work_finder_enabled: None,

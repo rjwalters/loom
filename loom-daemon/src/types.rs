@@ -1200,6 +1200,16 @@ pub struct DaemonStatusReport {
     /// heap alloc on an already-rare, human-latency status round-trip).
     #[serde(default)]
     pub host_breaker: Option<Box<HostBreakerStatus>>,
+    /// Saturation admission-brake state (Issue #4903). `Some` once a brake has
+    /// been registered this process (the daemon registers one at startup
+    /// alongside the host breaker); `None` when none is active — which the
+    /// status renderer treats as "brake inactive", the zero-behavior-change
+    /// baseline. Answers the question `capacity_bound: false` could not: a host
+    /// that is refusing new work because it is already saturated now says so
+    /// instead of reading as idle. `#[serde(default)]` keeps pre-#4903 wire data
+    /// / older clients compatible (an absent field parses as `None`).
+    #[serde(default)]
+    pub admission_brake: Option<AdmissionBrakeStatus>,
     /// GitHub rate-limit circuit-breaker state (Issue #4429). `Some` once the
     /// breaker is registered at startup; `None` on older daemons.
     /// `#[serde(default)]` keeps pre-#4429 wire data / older clients compatible.
@@ -1410,10 +1420,23 @@ pub struct WorkFinderTickSummary {
     pub deferred_capacity: usize,
     /// Issues deferred because the per-tick admission ramp cap was reached.
     pub deferred_ramp_cap: usize,
+    /// Issues deferred because the saturation admission brake held new
+    /// admissions this tick (Issue #4903) — the host was already at/over the
+    /// configured load-per-core hold threshold. Distinct from
+    /// [`Self::deferred_capacity`]: the cap was not reached, the *host* was.
+    /// `#[serde(default)]` keeps pre-#4903 wire data / older clients compatible.
+    #[serde(default)]
+    pub deferred_saturation: usize,
     /// Dispatch attempts that returned an error.
     pub errors: usize,
     /// Whether any workspace was gated by the main-health halt this tick.
     pub halted: bool,
+    /// Whether the saturation admission brake was engaged for this tick (Issue
+    /// #4903). `true` even when nothing was deferred (an empty backlog on a
+    /// saturated host), so a consumer can tell "held, nothing waiting" from
+    /// "not held". `#[serde(default)]` keeps pre-#4903 wire data compatible.
+    #[serde(default)]
+    pub saturation_held: bool,
 }
 
 impl WorkFinderTickSummary {
@@ -1435,6 +1458,7 @@ impl WorkFinderTickSummary {
             (self.skipped_backoff, "backoff-skip"),
             (self.deferred_capacity, "deferred-capacity"),
             (self.deferred_ramp_cap, "deferred-ramp"),
+            (self.deferred_saturation, "deferred-saturation"),
             (self.errors, "error"),
         ] {
             if n > 0 {
@@ -1443,6 +1467,9 @@ impl WorkFinderTickSummary {
         }
         if self.halted {
             parts.push("HALTED".to_string());
+        }
+        if self.saturation_held {
+            parts.push("SATURATION-HELD".to_string());
         }
         parts.join(", ")
     }
@@ -1536,6 +1563,37 @@ pub struct HostBreakerStatus {
     pub sustain_ticks: u32,
     /// The configured cool-down window, in seconds.
     pub cooldown_secs: u64,
+}
+
+/// Saturation admission-brake snapshot for `loom-daemon status` (Issue #4903).
+/// Rendered from [`crate::admission_brake::BrakeSnapshot`].
+///
+/// Distinct from [`HostBreakerStatus`] on purpose: the brake is the
+/// **point-in-time** guard that holds new admissions while the host is already
+/// saturated and releases the moment it recovers, whereas the breaker is the
+/// stateful trip that remembers sustained distress across a cool-down. A host
+/// holding admissions must *say so* — before this field, a worker at 12×
+/// overcommit reported `capacity_bound: false` and read as idle.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct AdmissionBrakeStatus {
+    /// Whether the brake is enabled (default ON — a safety backstop).
+    pub enabled: bool,
+    /// Whether **new** sweep admissions are currently held. In-flight sweeps are
+    /// never affected by this flag: the brake has no path to running work.
+    pub held: bool,
+    /// The most recent load-per-core sample observed; `None` when no
+    /// load-average source is available (which fails safe to *not* holding).
+    #[serde(default)]
+    pub load_per_core: Option<f64>,
+    /// The configured load-per-core hold threshold.
+    pub load_per_core_threshold: f64,
+    /// When the current hold streak began; `None` while not holding.
+    #[serde(default)]
+    pub held_since: Option<DateTime<Utc>>,
+    /// How many consecutive ticks the current streak has held; `0` when not
+    /// holding.
+    #[serde(default)]
+    pub held_ticks: u32,
 }
 
 /// GitHub rate-limit circuit-breaker snapshot for `loom-daemon status` (Issue

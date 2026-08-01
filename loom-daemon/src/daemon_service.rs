@@ -6,6 +6,7 @@
 //! accept loop that only returns on a startup failure.
 
 use loom_daemon::activity::ActivityDb;
+use loom_daemon::admission_brake;
 use loom_daemon::auto_update;
 use loom_daemon::autonomy_marker;
 use loom_daemon::claim_reconciliation;
@@ -899,6 +900,24 @@ pub(crate) async fn run_daemon() -> Result<()> {
             host_breaker_config.load_per_core_threshold,
             host_breaker_config.sustain_ticks,
             host_breaker_config.cooldown_secs,
+        );
+        // Saturation admission brake (#4903): same startup-resolve +
+        // process-global-registration shape as the breaker above, and registered
+        // in the same place for the same reason — the work-finder loop is its
+        // sole sampler, so a daemon with no work-finder never engages it. The
+        // brake is the *point-in-time* half of the load-aware pair: it holds NEW
+        // admissions while the host is already saturated and releases the moment
+        // it recovers, where the breaker latches on sustained distress and holds
+        // through a cool-down. Neither ever touches a running sweep.
+        let admission_brake_config = admission_brake::resolve_config_for(&sweep_workspace);
+        admission_brake::register_global(std::sync::Arc::new(
+            admission_brake::SharedAdmissionBrake::new(admission_brake_config),
+        ));
+        log::info!(
+            "admission_brake: enabled={} (load_per_core_hold={:.2}; holds NEW sweep admissions \
+             only — in-flight sweeps are never preempted)",
+            admission_brake_config.enabled,
+            admission_brake_config.load_per_core_threshold,
         );
         log::info!(
             "work_finder: enabled (multi-workspace, interval={}s, configured_max={configured_max}, \
