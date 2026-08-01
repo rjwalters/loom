@@ -131,12 +131,17 @@ curl -sS -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
 
 | Application | Path | Action | App ID / AUD |
 |---|---|---|---|
-| `Loom Fleet Dashboard (dashboard.2amlogic.com)` — **root app, to be deleted** | `dashboard.2amlogic.com` (everything not matched by a more specific app) | Allow (+ service-token `non_identity`) | `facc1038-3095-4a43-8b62-6483d0bdac39` / `79a6896a0fbdd555ee1aef4cbacf37e80667d0b4a2f2738f81495c4974a874a6` |
 | `loom-dashboard login (cookie mint)` | `/login` | Allow | `e1855040-f181-421b-9b86-2db037fe57e8` / `78838a7fdc48659bf54eec1525822827f812feb4463807ac5dcfe35d1c92c28a` |
 | `loom-dashboard admin` | `/admin` | Allow + service-token `non_identity` | `4267ee80-138b-4a47-9fe2-1f3917500282` / `9426832665cfa69a4f9134eeae549d8c4fad424f7f9fc8fe5b24acfa6d8ce5b7` |
 | `loom-dashboard ingest (bypass)` | `/ingest` | Bypass everyone | `c8edf172-05b3-4a7a-9c15-75079b224e21` |
 | `loom-dashboard public view (bypass)` | `/public` | Bypass everyone | `5c2c787a-4311-4d2c-8c17-6f7ddb8cc4d5` |
 | `Loom Fleet Dashboard healthz (public)` | `/healthz` | Bypass everyone | `732fb318-706e-47e4-97bd-c8122ee3d3ff` |
+
+**There is no hostname-wide application any more.** `/` is matched by no
+Access app at all, which is what lets it serve the public view; the Worker
+does its own JWT check there and on `/api/*` (see
+[`cloudflare-access.md`](cloudflare-access.md) §2 for why `/api/*` cannot be
+gated at the edge).
 
 The identity policy on both Allow apps is `email_domain: 2amlogic.com` OR
 `email: rjwalters@gmail.com`. `allowed_idps: []` (all — Google + one-time
@@ -148,35 +153,57 @@ AUD tags and app IDs are **not secrets** — the AUD is visible in the Access
 redirect URL of any unauthenticated request — so they are recorded here on
 purpose. The service token's *secret* is not, and lives only in §5's file.
 
-### Cutover: the root app is still live, deliberately
+### Cutover: completed 2026-07-31
 
-`/login` and `/admin` were created ahead of time because they are additive —
-both paths were already covered by the root app's identical policy, so
-adding them changed no behavior. **Deleting the root app is the cutover, and
-it must happen only after** a Worker carrying `src/index.ts`'s in-Worker
-`/api/*` JWT check is deployed *and* configured with:
+The hostname-wide app (`facc1038-3095-4a43-8b62-6483d0bdac39`, aud
+`79a6896a…`) was deleted. `/login` and `/admin` had been created first
+because they were additive — both paths were already covered by the root
+app's identical policy, so adding them changed no behavior and the risky
+step stayed isolated.
+
+**`CF_ACCESS_AUD` carries two audiences, on purpose:**
 
 ```
 CF_ACCESS_TEAM_DOMAIN = 2amlogic.cloudflareaccess.com
-CF_ACCESS_AUD         = 78838a7fdc48659bf54eec1525822827f812feb4463807ac5dcfe35d1c92c28a
+CF_ACCESS_AUD         = 79a6896a…,78838a7f…      # root app, /login app
 ```
 
-`CF_ACCESS_AUD` is the **`/login` app's** AUD, because that is the app that
-mints the `CF_Authorization` cookie the Worker validates. Getting this wrong
-does not fail loudly: `accessAuth.ts` fails closed, so a mismatched or unset
-AUD simply renders the public view to a signed-in operator forever.
+It is a comma-separated allowlist (`accessAuth.ts`'s
+`parseAcceptedAudiences`). Carrying both is what made the cutover
+zero-downtime: operators holding a cookie minted by the *old* root app kept
+working across the deletion instead of being silently demoted to the public
+view, and a rollback would still validate. With only the `/login` aud set,
+every already-signed-in operator would have dropped to the public view the
+moment the Worker deployed — a failure that is completely silent, because
+`accessAuth.ts` fails closed.
 
-As of 2026-07-31 the deployed Worker (`loom-fleet-dashboard`) has **neither
-variable set** and predates the single-URL code, so the cutover is not yet
-safe to perform. Order:
+**Follow-up**: drop `79a6896a…` once the fleet has re-signed-in through
+`/login`. Nothing breaks if it lingers — the app it referenced no longer
+exists, so no live token can carry that audience — but it is dead
+configuration.
 
-1. Merge #4759 and #4760.
-2. `wrangler deploy` with both vars set (see §3's overlay pattern).
-3. Verify: `/api/fleet-state` returns `401` for an anonymous `curl`, and the
-   signed-in dashboard still renders. **Both** must hold.
-4. Only then delete app `facc1038-3095-4a43-8b62-6483d0bdac39`.
+Verified after the cutover, anonymously against `dashboard.2amlogic.com`:
 
-Rollback is recreating a hostname-wide Allow app with the policy above.
+| Path | Expected | Got |
+|---|---|---|
+| `/` | 200, SPA, `authenticated:false` | ✅ |
+| `/public/fleet-state`, `/public/history` | 200, redacted | ✅ |
+| `/api/fleet-state`, `/api/history`, `/api/events` | 401 | ✅ |
+| `/admin/*` | 302 (Access challenge) | ✅ |
+| `/public` | 301 → `/` | ✅ |
+
+Plus a data check: 17 private-visibility sweeps present with no `repo`,
+`issue` or `sweepId`; no token-pool account identifiers anywhere.
+
+**Expect 1-2 minutes of mixed edge state** after deleting an Access app —
+some nodes answer from the pre-delete config and return a `text/plain` 404
+with Access's headers (`x-frame-options: SAMEORIGIN`) rather than the
+Worker's JSON. Not a fault; re-probe until consistent.
+
+**Rollback**: recreate a hostname-wide Allow app on
+`dashboard.2amlogic.com` with the identity policy above plus the
+service-token `non_identity` policy. Because both audiences are still
+accepted, the recreated app's cookies validate immediately.
 
 **`/healthz` discrepancy**: `dashboard/src/index.ts` does not implement a
 dedicated `/healthz` route today (only `/`, `/ingest`, `/admin/*`, `/api/*`,
