@@ -858,6 +858,16 @@ $ sleep 60 && gh pr checks 1448
 - Type errors or compilation issues
 - Unused imports or variables
 
+**Format-only rejections don't need a bigger model.** If the *only* Judge
+complaint is a formatter/linter CI check (e.g. `cargo fmt --check` / `ruff
+format --check`) with no substantive code issue, the fix is a single
+mechanical command (`cargo fmt` / `ruff format <files>`, etc.) — it is not
+evidence the PR needs deeper reasoning. `sweep.md`'s Judge-rejection
+escalation ladder (#3481) is orchestrator-level and dispatch-time, not
+something you control from inside a Doctor session; this note is for a human
+choosing a Doctor model in manual mode — don't reach for a stronger model on a
+purely mechanical format fix (#4882).
+
 ### Medium Complexity (Usually Handle)
 - Refactoring to improve clarity
 - Adding edge case handling
