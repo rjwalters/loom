@@ -1698,6 +1698,10 @@ pub fn build_daemon_status(
         rate_limit_breaker: crate::rate_limit_breaker::global_snapshot()
             .map(crate::rate_limit_breaker::RateLimitSnapshot::into_status)
             .map(Box::new),
+        // Observability host-identity mismatch (#4830) — same process-global
+        // snapshot pattern again, registered only when the exporter actually
+        // starts, so a disabled/keyless exporter always reads `None`.
+        observability_host_id_mismatch: crate::observability::global_host_id_mismatch(),
         // Live safehouse connection state (#4345) — the pool's shared cell is
         // updated by the narration sink / peer-coordination tasks
         // `start_safehouse_narration`/`start_peer_coordination` spawn, and
@@ -5476,6 +5480,11 @@ exit 0
             pid_file: Some(std::path::PathBuf::from("/repo/a/.loom/.daemon.pid")),
             daemon_build_commit: Some("18887b5c".to_string()),
             work_finder_interval_secs: Some(60),
+            observability_host_id_mismatch: Some(crate::types::ObservabilityHostIdMismatch {
+                daemon_host_id: "robb-studio".to_string(),
+                ingest_host_id: "robb-pro".to_string(),
+                first_seen_at: chrono::Utc::now(),
+            }),
         };
         let resp = Response::DaemonStatus(Box::new(report));
         let json = serde_json::to_string(&resp).expect("serialize response");
@@ -5512,6 +5521,14 @@ exit 0
                 assert!(!r.per_repo[0].health_gate_not_evaluated);
                 assert_eq!(r.main_health_gate_enabled, Some(true));
                 assert!(r.main_health_gate_verdict_at.is_some());
+                // #4830: the host-identity mismatch survives the wire so a
+                // `health` client in another process can render the note.
+                let mismatch = r
+                    .observability_host_id_mismatch
+                    .as_ref()
+                    .expect("mismatch round-trips");
+                assert_eq!(mismatch.daemon_host_id, "robb-studio");
+                assert_eq!(mismatch.ingest_host_id, "robb-pro");
                 assert_eq!(r.per_repo[0].health_gate_enabled, Some(true));
                 assert!(r.per_repo[0].health_gate_verdict_at.is_some());
                 assert_eq!(

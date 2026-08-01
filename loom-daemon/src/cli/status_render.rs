@@ -164,6 +164,11 @@ pub(crate) fn build_status_json_value(
         // silent-failure signature. `message` is `null` when not tripped.
         "preflight_advisory_active": report.preflight_advisory_active,
         "preflight_advisory_message": report.preflight_advisory_message,
+        // Observability host-identity mismatch (#4830): non-null means this
+        // host's ingest key is bound to a DIFFERENT host_id than the daemon
+        // reports for itself, so its telemetry is being filed under the wrong
+        // host. `null` in the common case (ids agree, or no exporter running).
+        "observability_host_id_mismatch": report.observability_host_id_mismatch,
         "dynamic_cap": {
             "token_pool_size": report.token_pool_size,
             // The directory the daemon resolved for the pool above (#4292) —
@@ -672,6 +677,20 @@ pub(crate) fn print_status_human(
         if let Some(msg) = &report.preflight_advisory_message {
             println!("\n{msg}");
         }
+    }
+
+    // Observability host-identity mismatch (#4830): printed alongside the
+    // tripwire above because it has the same character — a silent,
+    // config-level fault whose only symptom is that data goes somewhere
+    // unexpected. `loom-daemon health` reports the same condition as an
+    // `observability DEGRADED` section.
+    if let Some(mismatch) = &report.observability_host_id_mismatch {
+        println!(
+            "\nWARNING: telemetry is being filed under host_id {} — this host's ingest key is \
+             bound to that id, not to {}. Install the key provisioned for {}, or set \
+             $LOOM_HOST_ID to match the key's binding, then restart the daemon.",
+            mismatch.ingest_host_id, mismatch.daemon_host_id, mismatch.daemon_host_id
+        );
     }
 
     // Capacity figures resolved from a single source (fresh probe when
@@ -1835,6 +1854,31 @@ mod status_protection_tests {
         );
         assert_eq!(unknown["protection"]["state"], "unknown");
         assert!(unknown["protection"]["watchdog_provisioned"].is_null());
+    }
+
+    #[test]
+    fn observability_host_id_mismatch_is_null_when_the_ids_agree() {
+        // #4830: the common case — no exporter, or an exporter whose key is
+        // bound to this very host — is a null field, so `status` is unchanged
+        // for every daemon that is not actually misconfigured.
+        let value = build_status_json_value(&sample_report(), None, &no_update(), None, None);
+        assert!(value["observability_host_id_mismatch"].is_null());
+    }
+
+    #[test]
+    fn observability_host_id_mismatch_names_both_identities_in_json() {
+        let mut report = sample_report();
+        report.observability_host_id_mismatch =
+            Some(loom_daemon::types::ObservabilityHostIdMismatch {
+                daemon_host_id: "robb-studio".to_string(),
+                ingest_host_id: "robb-pro".to_string(),
+                first_seen_at: chrono::Utc::now(),
+            });
+        let value = build_status_json_value(&report, None, &no_update(), None, None);
+        let m = &value["observability_host_id_mismatch"];
+        assert_eq!(m["daemon_host_id"], "robb-studio");
+        assert_eq!(m["ingest_host_id"], "robb-pro");
+        assert!(m["first_seen_at"].is_string());
     }
 
     #[test]

@@ -82,7 +82,7 @@ describe("POST /ingest — validation", () => {
     const batch = [sweepStartedEnvelope(), hostHealthEnvelope()];
     const response = await callWorker(ingestRequest(batch, "Bearer abc-ingest-key"));
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ accepted: 2 });
+    expect(await response.json()).toEqual({ accepted: 2, host_id: "host-abc" });
 
     const rows = await recordsForHost("host-abc");
     expect(rows).toHaveLength(2);
@@ -97,7 +97,7 @@ describe("POST /ingest — validation", () => {
   it("accepts an empty array batch as a no-op", async () => {
     const response = await callWorker(ingestRequest([], "Bearer abc-ingest-key"));
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ accepted: 0 });
+    expect(await response.json()).toEqual({ accepted: 0, host_id: "host-abc" });
   });
 
   it("rejects the WHOLE batch when any one envelope is missing schema_version", async () => {
@@ -123,6 +123,50 @@ describe("POST /ingest — validation", () => {
     const rows = await recordsForHost("host-abc");
     expect(rows).toHaveLength(1);
     expect(rows[0]?.schema_version).toBe(2);
+  });
+});
+
+describe("POST /ingest — bound host_id echo (issue #4830)", () => {
+  it("echoes the host_id the authenticated key is bound to", async () => {
+    const response = await callWorker(ingestRequest([sweepStartedEnvelope()], "Bearer abc-ingest-key"));
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ accepted: 1, host_id: "host-abc" });
+  });
+
+  it("echoes the KEY's host_id, not the one the envelope claims", async () => {
+    // The whole point of the echo: the exporter has to learn what its key is
+    // actually bound to, which is exactly the value that differs from what the
+    // daemon believes about itself when a wrong key file has been installed.
+    const envelope = sweepStartedEnvelope();
+    (envelope as Record<string, unknown>).host_id = "some-other-claimed-host";
+
+    const response = await callWorker(ingestRequest([envelope], "Bearer abc-ingest-key"));
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ accepted: 1, host_id: "host-abc" });
+  });
+
+  it("echoes each host's own binding when two keys are in play", async () => {
+    await seedHost(env.DB, "host-xyz", "xyz-ingest-key");
+
+    const abc = await callWorker(ingestRequest([sweepStartedEnvelope()], "Bearer abc-ingest-key"));
+    const xyz = await callWorker(
+      ingestRequest([sweepStartedEnvelope({ sweep_id: "sweep-xyz-0" })], "Bearer xyz-ingest-key"),
+    );
+
+    expect(await abc.json()).toEqual({ accepted: 1, host_id: "host-abc" });
+    expect(await xyz.json()).toEqual({ accepted: 1, host_id: "host-xyz" });
+  });
+
+  it("does not echo a host_id on a rejected request", async () => {
+    // A 401/400 must not become an identity oracle for an unauthenticated
+    // caller, and there is no authenticated identity to echo anyway.
+    const unauthorized = await callWorker(ingestRequest([sweepStartedEnvelope()], "Bearer not-a-real-key"));
+    expect(unauthorized.status).toBe(401);
+    expect(await unauthorized.json()).not.toHaveProperty("host_id");
+
+    const badBody = await callWorker(ingestRequest({ not: "an array" }, "Bearer abc-ingest-key"));
+    expect(badBody.status).toBe(400);
+    expect(await badBody.json()).not.toHaveProperty("host_id");
   });
 });
 

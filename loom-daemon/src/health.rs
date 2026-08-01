@@ -26,6 +26,7 @@
 //! | roles | [`crate::role_runner::role_tick_records`] |
 //! | queues | [`crate::pipeline_snapshot`] (`queued`) |
 //! | throughput | [`crate::pipeline_snapshot`] (`merged_24h`, over the requested window) |
+//! | observability *(only when non-green)* | [`crate::types::DaemonStatusReport::observability_host_id_mismatch`], published by [`crate::observability::HostIdStatus`] |
 //!
 //! [`assess`] itself is **pure** — it takes an already-collected
 //! [`HealthInputs`] and returns a [`HealthReport`] — so every verdict rule
@@ -159,7 +160,8 @@ impl Verdict {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct HealthSection {
     /// Stable machine key (`liveness`, `dispatch`, `tokens`, `roles`,
-    /// `queues`, `throughput`).
+    /// `queues`, `throughput`, and `observability` when a mismatch is present
+    /// — #4830).
     pub key: &'static str,
     /// This section's verdict.
     pub verdict: Verdict,
@@ -1202,6 +1204,59 @@ pub fn assess_throughput(inputs: &HealthInputs) -> HealthSection {
 }
 
 // ============================================================================
+// Observability section (Issue #4830) — conditional
+// ============================================================================
+
+/// Assess the observability exporter's host-identity check: `Some(DEGRADED)`
+/// when the daemon has confirmed that its ingest key is bound to a *different*
+/// `host_id` than the one it reports for itself, else `None`.
+///
+/// **Deliberately conditional**, unlike every other section. There is nothing
+/// to say when the exporter is disabled, keyless, or reporting under the right
+/// identity — which is all but a handful of daemons — so a permanent
+/// `observability GREEN — ok` line would be pure noise on a surface whose whole
+/// value is that every line printed is worth reading. When the note IS present
+/// the condition is real and confirmed by the backend's own echo, never
+/// inferred, so it is `Degraded`, never `Unknown`.
+///
+/// Read straight off [`DaemonStatusReport`] rather than through a dedicated
+/// [`HealthInputs`] field: the mismatch is *daemon-process* state (only the
+/// daemon holds both halves — its own identity and the backend's echo), and
+/// `health` runs in a separate CLI process, so the IPC status report is the
+/// only place it can come from. A parallel collector field would just copy it
+/// and add a way for the two to disagree.
+#[must_use]
+pub fn assess_observability(inputs: &HealthInputs) -> Option<HealthSection> {
+    let mismatch = inputs
+        .status
+        .as_ref()?
+        .observability_host_id_mismatch
+        .as_ref()?;
+    let age = inputs
+        .at
+        .signed_duration_since(mismatch.first_seen_at)
+        .num_seconds()
+        .max(0);
+    Some(HealthSection::new(
+        "observability",
+        Verdict::Degraded,
+        format!(
+            "telemetry is being filed under {} — the ingest key on this host is bound to that \
+             id, not to {} (first seen {} ago)",
+            mismatch.ingest_host_id,
+            mismatch.daemon_host_id,
+            format_window(u64::try_from(age).unwrap_or(0))
+        ),
+        serde_json::json!({
+            "daemon_host_id": mismatch.daemon_host_id,
+            "ingest_host_id": mismatch.ingest_host_id,
+            "first_seen_at": mismatch.first_seen_at,
+            "first_seen_age_secs": age,
+        }),
+    ))
+}
+
+// ============================================================================
 // Roll-up
 // ============================================================================
 
@@ -1211,11 +1266,15 @@ pub fn assess_throughput(inputs: &HealthInputs) -> HealthSection {
 /// are reported as [`Verdict::Unknown`] (they are all downstream of an IPC
 /// round-trip that could not happen), and the overall verdict is `Dead` so the
 /// exit code is `2` rather than a misleading `1`.
+///
+/// Every section is unconditional except `observability` (#4830), which is
+/// appended only when there is a mismatch to report — see
+/// [`assess_observability`].
 #[must_use]
 pub fn assess(inputs: &HealthInputs) -> HealthReport {
     let liveness = assess_liveness(inputs);
     let dead = liveness.verdict == Verdict::Dead;
-    let sections = vec![
+    let mut sections = vec![
         liveness,
         assess_dispatch(inputs),
         assess_tokens(inputs),
@@ -1223,6 +1282,7 @@ pub fn assess(inputs: &HealthInputs) -> HealthReport {
         assess_queues(inputs),
         assess_throughput(inputs),
     ];
+    sections.extend(assess_observability(inputs));
     let overall = if dead {
         Verdict::Dead
     } else if sections.iter().all(|s| s.verdict.is_green()) {
@@ -1722,6 +1782,83 @@ mod tests {
         assert_eq!(report.exit_code(), EXIT_DEAD);
         assert_eq!(report.section("dispatch").unwrap().verdict, Verdict::Unknown);
         assert_eq!(report.section("tokens").unwrap().verdict, Verdict::Unknown);
+    }
+
+    // ===================================================================
+    // Observability section (#4830)
+    // ===================================================================
+
+    /// An inputs fixture whose daemon has confirmed a host-identity mismatch —
+    /// the live 2026-07-31 shape (the Studio's key bound to `robb-pro`).
+    fn mismatched_inputs(age_secs: i64) -> HealthInputs {
+        let mut inputs = healthy_inputs();
+        inputs
+            .status
+            .as_mut()
+            .unwrap()
+            .observability_host_id_mismatch = Some(crate::types::ObservabilityHostIdMismatch {
+            daemon_host_id: "robb-studio".to_string(),
+            ingest_host_id: "robb-pro".to_string(),
+            first_seen_at: now() - chrono::Duration::seconds(age_secs),
+        });
+        inputs
+    }
+
+    #[test]
+    fn no_observability_section_when_the_host_ids_agree() {
+        // AC: "no behavior change when they match" — a healthy daemon's report
+        // is byte-for-byte what it was before #4830.
+        let report = assess(&healthy_inputs());
+        assert!(report.section("observability").is_none());
+        assert_eq!(report.overall, Verdict::Green);
+        assert_eq!(report.exit_code(), EXIT_HEALTHY);
+    }
+
+    #[test]
+    fn no_observability_section_for_a_disabled_or_keyless_exporter() {
+        // A disabled exporter never registers a status handle, so the field is
+        // `None` on the wire — indistinguishable, by design, from "enabled and
+        // correctly bound".
+        let mut inputs = healthy_inputs();
+        inputs
+            .status
+            .as_mut()
+            .unwrap()
+            .observability_host_id_mismatch = None;
+        assert!(assess_observability(&inputs).is_none());
+    }
+
+    #[test]
+    fn no_observability_section_when_the_daemon_is_unreachable() {
+        let mut inputs = healthy_inputs();
+        inputs.status = None;
+        assert!(assess_observability(&inputs).is_none());
+    }
+
+    #[test]
+    fn a_host_id_mismatch_is_a_degraded_observability_note() {
+        let report = assess(&mismatched_inputs(3600));
+        let section = report.section("observability").expect("section present");
+        assert_eq!(section.verdict, Verdict::Degraded);
+        assert!(
+            section.summary.contains("robb-pro") && section.summary.contains("robb-studio"),
+            "the note must name BOTH identities: {}",
+            section.summary
+        );
+        assert_eq!(section.detail["daemon_host_id"], "robb-studio");
+        assert_eq!(section.detail["ingest_host_id"], "robb-pro");
+        assert_eq!(section.detail["first_seen_age_secs"], 3600);
+        assert_eq!(report.overall, Verdict::Degraded);
+        assert_eq!(report.exit_code(), EXIT_DEGRADED);
+    }
+
+    #[test]
+    fn the_observability_section_is_appended_last_and_only_when_present() {
+        let with_mismatch = assess(&mismatched_inputs(60));
+        let keys: Vec<&str> = with_mismatch.sections.iter().map(|s| s.key).collect();
+        assert_eq!(keys.last(), Some(&"observability"));
+        assert_eq!(keys.len(), 7);
+        assert_eq!(assess(&healthy_inputs()).sections.len(), 6);
     }
 
     #[test]
