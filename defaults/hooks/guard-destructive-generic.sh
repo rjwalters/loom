@@ -983,10 +983,72 @@ _any_managed_worktree_exists() {
 #
 # A global rather than a subshell echo: this runs per write target and the
 # callers are already in a `while read` loop.
+#
+# Implemented on top of the shared scanner below so the write-confinement
+# block has exactly ONE definition of "what the shell would do to these
+# quotes" — a second, hand-copied quote parser is precisely how the two
+# consumers would drift apart, and a drift in this grammar IS a guard bypass.
 # =============================================================================
 _MARKED_TOKEN=""
 mark_expandable_dollars() {
-    local tok="$1"
+    _scan_token_quoting "$1" $'\001'
+    _MARKED_TOKEN="$_SCANNED_TOKEN"
+}
+
+# =============================================================================
+# strip_target_quoting() — shell-accurate quote removal + backslash
+# unescaping for the write-confinement absolute/relative classification
+# (#4926).
+#
+# extract_write_targets() emits tokens with their quote characters preserved
+# VERBATIM (qsplit's contract, #3755) — extract_rm_targets() and
+# parse_force_ops() depend on that raw form and MUST keep receiving it
+# unchanged, so this is called ONLY from the write-confinement classification
+# below, never from qsplit()/extract_write_targets() themselves. Without it a
+# quoted absolute path (`'/main/evil'`, `"/main/evil"`) starts with a quote
+# character rather than `/`, so the `[[ … == /* ]]` check misclassifies it as
+# RELATIVE and cwd-prefixes it into a location the write will never have.
+# From a LINKED-WORKTREE cwd — the canonical builder setup — that fabrication
+# walks straight back into the acting worktree's own `.loom-managed` sentinel
+# and is silently ALLOWED, defeating the #4178 confinement check by simply
+# quoting the target (the same masked-allow shape as the unresolved-`$`
+# bypass fixed by #4921/#4927, reached here through quoting instead).
+#
+# Emits (in the global _UNQUOTED_TARGET) the token with quote characters
+# removed and backslash escapes applied, and every other character —
+# INCLUDING `$` — copied through unchanged: any expandable-`$` shape was
+# already judged by the dedicated unresolved-`$` block above, so a file
+# genuinely named `$X` or `~` (single-quoted or backslash-escaped) unquotes
+# to the literal `$X`/`~` and still resolves as a plain relative path,
+# exactly as today (#4382 / #4921 contracts preserved).
+#
+# Returns 0 when every quote in the token is balanced (the caller may use
+# _UNQUOTED_TARGET). Returns 1 on an unterminated quote — the caller MUST
+# then fall back to the raw, quote-preserved token, so an unbalanced quote
+# can only ever keep today's verdict, never widen a deny into an allow.
+# =============================================================================
+_UNQUOTED_TARGET=""
+strip_target_quoting() {
+    local rc=0
+    _scan_token_quoting "$1" "" || rc=1
+    _UNQUOTED_TARGET="$_SCANNED_TOKEN"
+    return "$rc"
+}
+
+# =============================================================================
+# _scan_token_quoting() — the single shell-accurate quote-removal /
+# backslash-unescaping pass shared by the two helpers above.
+#
+#   $1  raw token (quote characters preserved verbatim, per qsplit's contract)
+#   $2  text substituted for each EXPANDABLE `$`; empty keeps the `$` literal
+#
+# Sets _SCANNED_TOKEN. Returns 0 when every quote was closed, 1 when the token
+# ended inside an unterminated quote (callers decide the fallback; no caller
+# may treat an unterminated quote as license to widen an allow).
+# =============================================================================
+_SCANNED_TOKEN=""
+_scan_token_quoting() {
+    local tok="$1" dollar="$2"
     local out="" c
     local n=${#tok}
     local i=0 in_s=0 in_d=0
@@ -1008,13 +1070,14 @@ mark_expandable_dollars() {
                 i=$((i + 1))
                 [[ $i -lt $n ]] && out+="${tok:i:1}" ;;
             '$')
-                out+=$'\001' ;;
+                if [[ -n "$dollar" ]]; then out+="$dollar"; else out+="$c"; fi ;;
             *)
                 out+="$c" ;;
         esac
         i=$((i + 1))
     done
-    _MARKED_TOKEN="$out"
+    _SCANNED_TOKEN="$out"
+    [[ $in_s -eq 0 && $in_d -eq 0 ]]
 }
 
 # =============================================================================
@@ -2591,13 +2654,25 @@ if worktree_isolation_guard_enabled && \
             fi
         fi
 
+        # Shell-accurate quote removal, for the classification only (#4926):
+        # `'/main/evil'` / `"/main/evil"` reach here with their quote
+        # characters intact (qsplit's contract), so they start with a quote
+        # rather than `/` and the test below would call an ABSOLUTE path
+        # relative and cwd-prefix it into a location the write never has.
+        # Unquote a COPY: extract_rm_targets()/parse_force_ops() keep their
+        # verbatim tokens, and the deny message below still quotes the raw
+        # `$_wtarget` the operator actually typed. An unterminated quote keeps
+        # the raw token (today's verdict) rather than risk widening a deny.
+        _wclassify="$_wtarget"
+        strip_target_quoting "$_wtarget" && _wclassify="$_UNQUOTED_TARGET"
+
         # Resolve to absolute; a relative target with no resolvable cwd is
         # ambiguous — skip it (allow on uncertainty, never deny on it).
         _wabs=""
-        if [[ "$_wtarget" == /* ]]; then
-            _wabs="$_wtarget"
+        if [[ "$_wclassify" == /* ]]; then
+            _wabs="$_wclassify"
         elif [[ -n "$_wcwd" ]]; then
-            _wabs="$_wcwd/$_wtarget"
+            _wabs="$_wcwd/$_wclassify"
         else
             continue
         fi

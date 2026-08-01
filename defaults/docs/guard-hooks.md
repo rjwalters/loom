@@ -427,6 +427,27 @@ target derived from a variable that would land *outside* the repo entirely
 (`> $HOME/x`, `> $TMPDIR/f`): the guard cannot know that at scan time, and
 fail-closed on an unknowable location is the whole point of the rule.
 
+**Quoted targets are still absolute (issue #4926).** The same classification had
+a second way to be fooled, reached without any `$` at all: the tokenizer copies
+a token's quote characters **verbatim** (`qsplit()`'s contract, #3755 — the `rm`
+and force-op consumers depend on that raw form), so a quoted absolute path
+arrived as `'/main/evil'` / `"/main/evil"`, failed the `== /*` test because it
+starts with a quote rather than a `/`, and was treated as **relative** and
+cwd-prefixed. From a main-checkout cwd the fabricated path happened to stay
+inside the main checkout and denied by accident; from a **linked-worktree** cwd
+it walked back into the acting worktree's own sentinel and was **allowed** —
+i.e. one pair of quotes defeated the whole #4178 check, for every idiom (`>`,
+`>>`, `tee`, `sed -i`, `cp`, `mv`). The write-confinement consumer now applies
+shell-accurate quote removal and backslash unescaping to a **copy** of the token
+before deciding absolute-vs-relative (`strip_target_quoting()`, sharing its
+scanner with `mark_expandable_dollars()` so the two can never disagree about the
+quoting grammar). Scope and fallbacks: `extract_rm_targets()` / `parse_force_ops()`
+keep their verbatim tokens and the deny message still quotes what the operator
+typed; `$`/`~` are copied through untouched, so a file genuinely named `$X` or
+`~` (single-quoted or escaped) is still a plain relative literal (#4382 / #4921
+unchanged); and an **unterminated** quote falls back to the raw token — today's
+verdict in both directions, never widening a deny into an allow.
+
 The guard is **on by default**. It is resolved in this order (highest precedence first):
 
 1. **`LOOM_GUARD_WORKTREE_ISOLATION` env var** — `0`/`false`/`no` disables the guard; `1`/`true`/`yes` forces it on. Overrides the config value.
