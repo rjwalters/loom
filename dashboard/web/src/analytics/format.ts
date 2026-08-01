@@ -8,6 +8,8 @@
  * that distinction can be destroyed.
  */
 
+import { displayTimeZone } from "../timezone";
+
 /** The em-dash every "not known" cell renders as. */
 export const UNKNOWN = "—";
 
@@ -52,10 +54,16 @@ export function formatRelative(seconds: number | undefined): string {
   return seconds >= 0 ? `in ${text}` : `${text} ago`;
 }
 
-/** Short local wall-clock time for an epoch-ms instant. */
-export function formatInstant(at: number | undefined): string {
+/** Short wall-clock time for an epoch-ms instant, in the display timezone.
+ *
+ * Previously used the browser's implicit default (`toLocaleString(undefined,
+ * …)`), which disagreed with the UTC-bucketed charts beside it. Both now
+ * resolve through `../timezone.ts`, so every time on the page is in one zone
+ * (issue #4857). */
+export function formatInstant(at: number | undefined, zone: string = displayTimeZone()): string {
   if (at === undefined || !Number.isFinite(at)) return UNKNOWN;
-  return new Date(at).toLocaleString(undefined, {
+  return new Date(at).toLocaleString("en-US", {
+    timeZone: zone,
     month: "short",
     day: "numeric",
     hour: "2-digit",

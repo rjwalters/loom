@@ -100,8 +100,28 @@ describe("formatCountdown", () => {
 });
 
 describe("formatAbsolute", () => {
-  it("renders a readable UTC timestamp", () => {
-    expect(formatAbsolute("2026-07-30T12:00:00Z")).toBe("2026-07-30 12:00:00Z");
+  // An explicit zone throughout: the default resolves to the machine's zone,
+  // which would make these assertions pass locally and fail in CI.
+  it("renders a readable timestamp in the given zone, with the zone named", () => {
+    expect(formatAbsolute("2026-07-30T12:00:00Z", "UTC")).toBe("2026-07-30 12:00:00 UTC");
+  });
+
+  it("renders the same instant as local wall-clock elsewhere", () => {
+    // 12:00Z is 05:00 PDT the same day.
+    expect(formatAbsolute("2026-07-30T12:00:00Z", "America/Los_Angeles")).toBe(
+      "2026-07-30 05:00:00 PDT",
+    );
+    // 23:30Z is 16:30 PDT the same day — the #4857 case, where UTC would
+    // have shown a different date than the chart bucket.
+    expect(formatAbsolute("2026-07-31T23:30:00Z", "America/Los_Angeles")).toBe(
+      "2026-07-31 16:30:00 PDT",
+    );
+  });
+
+  it("renders local midnight as 00:00, never 24:00", () => {
+    expect(formatAbsolute("2026-08-01T07:00:00Z", "America/Los_Angeles")).toBe(
+      "2026-08-01 00:00:00 PDT",
+    );
   });
 
   it("returns unknown for garbage", () => {

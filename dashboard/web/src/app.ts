@@ -17,6 +17,7 @@
 import { fetchFleetState } from "./api";
 import { replaceChildren } from "./dom";
 import { buildFleetView, findHost, type FleetView } from "./fleet";
+import { formatClock } from "./format";
 import { OVERVIEW, parseRoute, type Route } from "./router";
 import type { FleetSnapshot } from "./types";
 import { fleetOverviewView } from "./views/fleetOverview";
@@ -186,6 +187,6 @@ export class App {
       replaceChildren(this.root, banner, fleetOverviewView(view, now));
     }
 
-    this.setStatus(this.error ? "Stale — last refresh failed" : `Updated ${now.toISOString().slice(11, 19)}Z`);
+    this.setStatus(this.error ? "Stale — last refresh failed" : `Updated ${formatClock(now)}`);
   }
 }

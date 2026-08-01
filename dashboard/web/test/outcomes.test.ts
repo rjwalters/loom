@@ -35,7 +35,7 @@ describe("buildOutcomesOverTime", () => {
       }),
     ];
 
-    const buckets = buildOutcomesOverTime(records, "daily");
+    const buckets = buildOutcomesOverTime(records, "daily", "UTC");
     expect(buckets).toEqual([
       {
         bucketKey: "2026-07-28",
@@ -56,7 +56,7 @@ describe("buildOutcomesOverTime", () => {
       makeSweepCompleted({ sweepId: "s2", emittedAt: "2026-07-30T00:00:00Z", result: "blocked" }),
       makeSweepCompleted({ sweepId: "s3", emittedAt: "2026-08-03T00:00:00Z", result: "cancelled" }),
     ];
-    const buckets = buildOutcomesOverTime(records, "weekly");
+    const buckets = buildOutcomesOverTime(records, "weekly", "UTC");
     expect(buckets.map((b) => b.bucketKey)).toEqual(["2026-07-27", "2026-08-03"]);
     expect(buckets[0]?.total).toBe(2);
     expect(buckets[0]?.counts).toEqual({ success: 1, failure: 0, cancelled: 0, blocked: 1 });
@@ -68,17 +68,17 @@ describe("buildOutcomesOverTime", () => {
     // hypothetically) should not appear in any bucket.
     const inFlight = makeSweepCompleted({ sweepId: "s1", emittedAt: "2026-07-28T00:00:00Z", result: "success" });
     inFlight.record = { ...inFlight.record, result: undefined };
-    const buckets = buildOutcomesOverTime([inFlight], "daily");
+    const buckets = buildOutcomesOverTime([inFlight], "daily", "UTC");
     expect(buckets).toEqual([]);
   });
 
   it("returns an empty array for no records", () => {
-    expect(buildOutcomesOverTime([], "daily")).toEqual([]);
+    expect(buildOutcomesOverTime([], "daily", "UTC")).toEqual([]);
   });
 
   it("defaults to daily granularity", () => {
     const record = makeSweepCompleted({ sweepId: "s1", emittedAt: "2026-07-28T00:00:00Z", result: "success" });
-    expect(buildOutcomesOverTime([record])).toEqual([
+    expect(buildOutcomesOverTime([record], "daily", "UTC")).toEqual([
       { bucketKey: "2026-07-28", counts: { success: 1, failure: 0, cancelled: 0, blocked: 0 }, total: 1 },
     ]);
   });
