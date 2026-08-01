@@ -111,6 +111,20 @@ info()    { echo "INFO: $*"; }
 success() { echo "OK: $*"; }
 warning() { echo "WARN: $*" >&2; }
 
+# --- Real forge-helpers.sh (for the #4856 rate-limit-safe mutation wrappers) ---
+# merge-pr.sh's mutating call sites no longer invoke `gh issue edit` / `gh issue
+# reopen` / `gh issue comment` directly — they route through
+# forge_gh_swap_label_rl_safe / forge_gh_reopen_issue_rl_safe /
+# forge_gh_comment_rl_safe, which live in lib/forge-helpers.sh and fall back to
+# REST when the GraphQL mutation is rate-limited (#4856). Source the REAL
+# helpers (rather than shimming them) so this suite keeps exercising the actual
+# `gh` invocation shape the wrappers produce on their happy path, which the stub
+# below records verbatim. Sourced BEFORE the shared globals are assigned:
+# forge-helpers.sh initializes FORGE_TYPE="" at load time, which would otherwise
+# clobber the FORGE_TYPE="github" the tests rely on.
+# shellcheck source=../lib/forge-helpers.sh
+source "$HELPERS_DIR/lib/forge-helpers.sh"
+
 # --- Extract the functions under test from merge-pr.sh and source them ---
 # Two spans, each bounded by an anchor line that is NOT part of the span:
 #   1. `_partial_increment_refs() {` .. `_check_partial_increment_close_conflict
@@ -645,16 +659,27 @@ assert_contains "$src" "_reset_partial_increment_labels" \
   "merge-pr.sh defines and calls _reset_partial_increment_labels"
 assert_contains "$src" "(Part of|Contributes to)" \
   "merge-pr.sh matches the non-closing partial-increment keywords"
-assert_contains "$src" "--remove-label \"loom:building\"" \
-  "merge-pr.sh swaps loom:building"
-assert_contains "$src" "--add-label \"loom:issue\"" \
-  "merge-pr.sh restores loom:issue"
+# The label swap / reopen / comment mutations route through the #4856
+# rate-limit-safe wrappers in lib/forge-helpers.sh, so the source guards assert
+# on the WRAPPER call sites (with their label/issue arguments) rather than the
+# pre-#4856 raw `gh issue edit --remove-label ... --add-label ...` / `gh issue
+# reopen ...` literals, which no longer appear in merge-pr.sh. The intent is
+# unchanged: fail loudly if a refactor drops the loom:building -> loom:issue
+# swap, the premature-auto-close revert, or the REPO_NWO scoping.
+assert_contains "$src" 'forge_gh_swap_label_rl_safe "$REPO_NWO" "$issue_num" "loom:building" "loom:issue"' \
+  "merge-pr.sh swaps loom:building -> loom:issue via the rate-limit-safe wrapper (#4856)"
+assert_contains "$src" '"loom:building" "loom:issue"' \
+  "merge-pr.sh restores loom:issue as the swap's add-label argument"
 assert_contains "$src" "--repo \"\$REPO_NWO\"" \
   "merge-pr.sh scopes the partial-increment mutations to REPO_NWO"
+assert_contains "$src" 'forge_gh_swap_label_rl_safe "$REPO_NWO"' \
+  "merge-pr.sh passes REPO_NWO to the label-swap wrapper (repo-scoped mutation)"
 assert_contains "$src" "_check_partial_increment_close_conflict || true" \
   "merge-pr.sh invokes the #4569 conflict guard BEFORE either merge path"
-assert_contains "$src" 'gh issue reopen "$issue_num"' \
-  "merge-pr.sh reverts a premature auto-close with gh issue reopen"
+assert_contains "$src" 'forge_gh_reopen_issue_rl_safe "$REPO_NWO" "$issue_num"' \
+  "merge-pr.sh reverts a premature auto-close via the rate-limit-safe reopen wrapper (#4856)"
+assert_contains "$src" 'forge_gh_comment_rl_safe "$REPO_NWO" "$issue_num" "$comment"' \
+  "merge-pr.sh posts the partial-increment / premature-close comments via the rate-limit-safe wrapper (#4856)"
 assert_contains "$src" 'close[sd]?|fix(e[sd])?|resolve[sd]?' \
   "merge-pr.sh matches the canonical GitHub closing-keyword set"
 assert_contains "$src" 'repos/$REPO_NWO/pulls/$PR_NUMBER/commits' \
