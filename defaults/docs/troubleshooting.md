@@ -309,6 +309,36 @@ cat .loom/config.json.bak
 `loom-daemon init` against a workspace that already has a `.loom/config.json`, so
 repeat provisioning passes cannot re-enter this path on a tuned host.
 
+### `install.sh` refuses to run: "Another Loom install is already running" (#4928)
+
+`install.sh`'s `--quick` / `--clean` paths take a per-target lock at
+`<target>/.loom/.install.lock` before any destructive phase, because two
+installers racing over one target interleave one run's uninstall (which stages
+Loom file deletions and strips the Loom sections out of `CLAUDE.md` /
+`.gitignore` **in place**) with the other's copy phase. The message names the
+owning PID, host, and phase:
+
+```bash
+cat <target>/.loom/.install.lock   # pid / host / started / phase
+```
+
+- **The PID is alive** — a real install is in flight (a `cargo build --release`
+  can run for minutes; it emits a progress line every 15s). Wait for it.
+- **The PID is gone** — the next installer reclaims the lock automatically; you
+  should never need to delete it. If you do (e.g. a lock written by another
+  host, which cannot be liveness-probed and is only reclaimed after
+  `LOOM_INSTALL_LOCK_MAX_AGE`, default 6h), `rm -f <target>/.loom/.install.lock`.
+
+If the lock's `phase` is `uninstalling` / `installing` / `restoring`, that run
+died **inside the destructive window** and the target may be partially
+uninstalled. The next installer prints the recovery commands; the short form is:
+
+```bash
+git -C <target> status --short
+git -C <target> restore --staged --worktree -- .loom .claude CLAUDE.md .gitignore
+git -C <target> stash list | grep loom-install   # changes the installer stashed, if any
+```
+
 ### Daemon won't start
 
 ```bash

@@ -214,6 +214,11 @@ pub const EPHEMERAL_PATTERNS: &[&str] = &[
     // exists so an operator can recover hand-tuned keys after a torn write, but
     // it is machine-local salvage — never something to commit.
     ".loom/*.bak",
+    // Per-target install lock written by install.sh (#4928). It is removed by
+    // the installer's EXIT trap, but a SIGKILLed run leaves it behind for the
+    // next installer to reclaim — machine-local coordination state that a
+    // consumer's `git add -A` must never sweep into a commit.
+    ".loom/.install.lock",
     ".loom/logs/",
 ];
 

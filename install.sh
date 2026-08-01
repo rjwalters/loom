@@ -261,6 +261,20 @@ regenerate_manifest_after_hook_wiring() {
 prepare_loom_metadata_env() {
   local loom_root="$1"
 
+  # Issue #4928 (AC #4): clear both before sampling. LOOM_VERSION / LOOM_COMMIT
+  # are ordinary environment variables, so a value inherited from the caller
+  # (another installer run, a resync, an exported shell var) would otherwise
+  # survive every early return below and be written verbatim into
+  # install-metadata.json / CLAUDE.md -- recording a commit that is NOT the
+  # source HEAD being installed, while the warnings claim it will be "unknown".
+  # Sampling itself is correct: `git -C "$loom_root" rev-parse --short HEAD`
+  # reads the Loom source checkout being installed FROM (not the target), and
+  # finalize_quick_install writes the result in the same run.
+  LOOM_VERSION=""
+  LOOM_COMMIT=""
+  export LOOM_VERSION
+  export LOOM_COMMIT
+
   if [[ ! -f "$loom_root/package.json" ]]; then
     warning "Cannot find package.json in $loom_root — LOOM_VERSION will be 'unknown'"
     return 0
@@ -659,6 +673,37 @@ source "$LOOM_ROOT/scripts/install/provision-daemon.sh"
 # project-level fallback for a repo that still carries `.loom/hooks/` copies).
 # shellcheck source=scripts/install/provision-hooks.sh
 source "$LOOM_ROOT/scripts/install/provision-hooks.sh"
+
+# Per-target install lock (issue #4928). Provides acquire_install_lock /
+# release_install_lock / set_install_lock_phase, which serialize the
+# destructive uninstall→reinstall sequence so two installers can never
+# interleave their uninstall and copy phases against the same target.
+# shellcheck source=scripts/install/install-lock.sh
+source "$LOOM_ROOT/scripts/install/install-lock.sh"
+
+# Release the lock on EVERY exit path -- normal completion, `error()`, a
+# `set -e` abort, and the SIGINT/SIGTERM handlers above (both of which `exit`,
+# which runs this trap). A run killed with SIGKILL cannot run it, which is
+# exactly why the lock records a PID: the next installer reclaims it (see
+# _install_lock_reclaim_if_stale).
+#
+# When the run dies inside a destructive phase, print the recovery banner
+# BEFORE dropping the lock, so the operator sees which phase was interrupted
+# and how to restore the target instead of discovering a half-uninstalled tree
+# later (issue #4928, AC #3).
+_install_lock_on_exit() {
+  local status=$?
+  if [[ -n "$INSTALL_LOCK_FILE" ]]; then
+    if [[ $status -ne 0 ]] && install_lock_is_destructive_phase "$INSTALL_LOCK_PHASE"; then
+      echo ""
+      warning "Install exited with status $status during the '$INSTALL_LOCK_PHASE' phase."
+      install_lock_recovery_banner "$INSTALL_LOCK_PHASE" "$INSTALL_LOCK_TARGET"
+    fi
+    release_install_lock
+  fi
+  return $status
+}
+trap '_install_lock_on_exit' EXIT
 
 # Show banner
 echo ""
@@ -1089,6 +1134,15 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
   # install-loom.sh's own idempotency check detects the older installed
   # version and proceeds with a normal upgrade (see the delegation site below).
   if [[ "$INSTALL_TYPE" == "1" ]]; then
+    # Issue #4928: take the per-target install lock BEFORE anything in this
+    # branch touches $TARGET_PATH. Everything below -- the stash, the chained
+    # uninstall, `loom-daemon init --force`, the index reconcile, the stash pop
+    # -- mutates the target's main checkout in place, so a second installer
+    # running concurrently against the same target can land its copy phase
+    # inside this one's uninstall window. Fail fast instead.
+    acquire_install_lock "$TARGET_PATH" "preparing" || \
+      error "Refusing to start a concurrent reinstall of $TARGET_PATH (see above)."
+
     # Issue #3545: for a --quick reinstall, guard uncommitted user changes across
     # the uninstall→reinstall cycle (mirrors the stash guard in the sibling
     # scripts/install-loom.sh --clean path). The uninstall runs `git add` in the
@@ -1143,6 +1197,16 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
       fi
     fi
 
+    # Issue #4928 (AC #3): make the half-uninstalled window explicit in output
+    # AND in state. The uninstall below mutates the target's main checkout in
+    # place and the fresh install only restores it several steps later, so the
+    # phase is recorded in the lock file first -- an interrupted run is then
+    # recognizable (by the next installer and by the operator) instead of
+    # surfacing as an unexplained half-uninstalled tree requiring a blind
+    # `git reset --hard`.
+    set_install_lock_phase "uninstalling"
+    announce_destructive_window "$TARGET_PATH"
+
     # Uninstall existing installation (local mode, no separate PR)
     info "Uninstalling existing Loom installation..."
     "$LOOM_ROOT/scripts/uninstall-loom.sh" --yes --local "$TARGET_PATH" || \
@@ -1150,6 +1214,9 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
     echo ""
     success "Existing installation removed"
     echo ""
+
+    # The target is now stripped; everything from here re-stages the payload.
+    set_install_lock_phase "installing"
 
     info "Running fresh Quick Install..."
     echo ""
@@ -1233,6 +1300,10 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
     # non-Loom changes (sibling installers, unrelated work) stay staged. The
     # uninstall only stages Loom-managed paths (#3450), so the dirty ∩
     # ownership intersection is exactly the set of staged deletions to undo.
+    # The payload is back on disk; what remains is index/stash reconciliation
+    # (issue #4928 phase tracking -- still destructive if interrupted).
+    set_install_lock_phase "restoring"
+
     info "Reconciling git index after reinstall..."
     RECONCILE_PATHS=()
     while IFS= read -r _owned_path; do
@@ -1437,6 +1508,12 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
       done
     fi
 
+    # Issue #4928: the destructive window is closed -- record that, then drop
+    # the lock explicitly (the EXIT trap would do it too, but an explicit
+    # release keeps the "released on normal completion" contract obvious).
+    set_install_lock_phase "complete"
+    release_install_lock
+
     echo ""
     success "Quick reinstallation complete!"
     exit 0
@@ -1461,6 +1538,12 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
   if [[ "$NON_INTERACTIVE" == true ]]; then
     INSTALL_FLAGS+=(--yes)
   fi
+  # `exec` replaces this process, so the EXIT trap never fires -- drop any held
+  # lock first or it would be stranded (issue #4928). No-op on this path today
+  # (the Full Install delegation never takes the lock: it mutates nothing in
+  # the target's main checkout, see #4888), but the release must sit next to
+  # the `exec` so it stays correct if that ever changes.
+  release_install_lock
   exec "$LOOM_ROOT/scripts/install-loom.sh" ${INSTALL_FLAGS[@]+"${INSTALL_FLAGS[@]}"} ${SOURCE_OVERRIDE_FLAGS[@]+"${SOURCE_OVERRIDE_FLAGS[@]}"} "$TARGET_PATH"
 else
   FORCE_FLAG=""
@@ -1563,6 +1646,14 @@ case "$METHOD" in
     info "Running Quick Install..."
     echo ""
 
+    # Issue #4928: take the per-target install lock before ANY mutation of the
+    # target -- the `--clean` uninstall below, and `loom-daemon init` itself.
+    # Two concurrent Quick Installs into the same target interleave their file
+    # copies (and, under --clean, one run's uninstall with the other's copy
+    # phase), which is exactly the reported corruption window.
+    acquire_install_lock "$TARGET_PATH" "preparing" || \
+      error "Refusing to start a concurrent install of $TARGET_PATH (see above)."
+
     # Check if loom-daemon is built AND up to date with the current source
     # tree (issue #4188 -- a bare existence check reuses a binary built from
     # an older commit after `git pull` landed a newer one).
@@ -1592,14 +1683,22 @@ case "$METHOD" in
 
     # Handle --clean: run local uninstall first, then fresh install
     if [[ "$FORCE_FLAG" == "--clean" ]]; then
+      # Issue #4928 (AC #3): same explicit destructive window as the
+      # --confirm-reinstall branch above -- the uninstall strips the target in
+      # place and only the init below puts it back.
+      set_install_lock_phase "uninstalling"
+      announce_destructive_window "$TARGET_PATH"
+
       info "Running local uninstall before fresh install..."
       "$LOOM_ROOT/scripts/uninstall-loom.sh" --yes --local "$TARGET_PATH" || \
         error "Uninstall failed - aborting clean install"
       echo ""
+      set_install_lock_phase "installing"
       info "Uninstall complete, proceeding with fresh install..."
       "$LOOM_ROOT/target/release/loom-daemon" init --force --defaults "$LOOM_ROOT/defaults" "$TARGET_PATH" || \
         error "Installation failed"
     else
+      set_install_lock_phase "installing"
       # Run loom-daemon init
       "$LOOM_ROOT/target/release/loom-daemon" init $FORCE_FLAG --defaults "$LOOM_ROOT/defaults" "$TARGET_PATH" || \
         error "Installation failed"
@@ -1629,6 +1728,10 @@ case "$METHOD" in
     # this install path are complete (issue #5279 — see the function's own
     # comment for why this must run after wire_quick_install_guard_hooks).
     regenerate_manifest_after_hook_wiring "$TARGET_PATH"
+
+    # Issue #4928: destructive window closed -- drop the per-target lock.
+    set_install_lock_phase "complete"
+    release_install_lock
 
     echo ""
     success "Quick installation complete!"
@@ -1695,7 +1798,10 @@ case "$METHOD" in
     fi
     echo ""
 
-    # Run the full installation workflow
+    # Run the full installation workflow. Release first: `exec` replaces this
+    # process, so the EXIT trap never runs and any held lock would be stranded
+    # (issue #4928).
+    release_install_lock
     exec "$LOOM_ROOT/scripts/install-loom.sh" $FORCE_FLAG ${SOURCE_OVERRIDE_FLAGS[@]+"${SOURCE_OVERRIDE_FLAGS[@]}"} "$TARGET_PATH"
     ;;
 esac
