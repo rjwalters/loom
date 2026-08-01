@@ -163,9 +163,9 @@ gh pr create --label "loom:review-requested"
 - **Never run `git worktree` directly** (the helper prevents nested worktrees) — to
   remove one managed worktree on demand use `./.loom/scripts/worktree.sh remove
   <issue-number>` (`loom-clean` is the bulk path).
-- Loom-managed worktrees (with the `.loom-managed` sentinel) are auto-removed when
-  their PR merges; user-provisioned worktrees are never removed — set
-  `LOOM_PRESERVE_WORKTREE=1` to disable cleanup for a session.
+- Loom-managed worktrees (with the `.loom-managed` sentinel) are auto-removed on
+  merge AND by the daemon's periodic reaper (#4876, catches merges made on another
+  host); user-provisioned worktrees are never removed — `LOOM_PRESERVE_WORKTREE=1`.
 
 ### Merging PRs
 

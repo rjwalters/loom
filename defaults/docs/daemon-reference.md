@@ -3281,6 +3281,94 @@ pool, gated by that repo's own config (an empty registry reduces to the single
 daemon workspace). See `loom-daemon/src/token_ranking_refresh.rs` for the
 implementation.
 
+### Merged-PR worktree reaper (#4876)
+
+CLAUDE.md states the contract: *"Loom-managed worktrees (with the
+`.loom-managed` sentinel) are auto-removed when their PR merges."* Through
+v0.17.0 that had exactly **one** implementation — `merge-pr.sh`'s
+`_remove_loom_worktree()`, a synchronous side effect of that script running —
+so the removal only happened when all three of these held:
+
+1. the merge went through `merge-pr.sh` (not the forge UI, `gh api`, or an
+   auto-merge queue), **and**
+2. it ran on the host holding the worktree, **and**
+3. it ran in the checkout holding the worktree (`find_main_repo_root()` walks up
+   from the invoking shell's cwd; there is no host-wide scan).
+
+A multi-host fleet violates (2) constantly: worker-1 builds issue #N, studio
+merges the PR, and worker-1's worktree has nobody to observe the merge. Nothing
+daemon-side covered the gap. Observed on 2026-08-01: **44** stale worktrees on
+`loom-worker-1` (54G under `.loom/`, disk at 81%) and 35 on studio — 16 on each
+were merged-PR worktrees eligible for removal.
+
+**What it does.** On a cadence (default 15 minutes) the daemon walks every
+registered workspace, enumerates `issue-<N>` directories under that repo's
+worktree root, and removes the ones whose issue is closed and whose PR merged
+outside the grace period. The decision comes from *forge state*, not from
+observing a merge event, so it does not matter which host merged or whether any
+merge script ran.
+
+**It can only ever remove a subset of `clean --safe`.** The gate chain is
+`worktree_ops::clean::classify_worktree` — the same function the interactive
+`loom-daemon clean` CLI uses, so there is no second copy to drift. The reaper
+runs it with `safe: true, force: false`, which preserves a worktree on any of:
+a live spawn-loop task or claim-lock, a `.loom-in-use` marker, a process whose
+cwd is inside it, an editable pip install pointing into it, an open issue, an
+open / unmerged / absent PR, an unreadable forge probe, a merge still inside the
+grace period, or any uncommitted change. It adds **one gate the CLI does not
+have**: the `.loom-managed` sentinel is *required*. An unattended remover has
+nobody at the keyboard to say no, so a user-provisioned worktree is never
+touched.
+
+**REST, not GraphQL.** The forge probes use `gh api repos/{owner}/{repo}/...`
+rather than `gh issue view` / `gh pr list`. GraphQL quota exhaustion under
+concurrent agents is a live failure mode, and an unattended cadence prober must
+not compete with interactive agents for the scarcer pool. A failed probe reads
+as `UNKNOWN`, which is always a *skip*.
+
+**Low-disk warning.** Each pass also reads `worktree_root_free_gb` (the metric
+the dashboard already renders but nothing acted on) and logs a `WARN` when free
+space on the worktree-root volume is under the floor. That converts "the disk
+filled and sweeps started failing with unrelated build errors" into an explicit
+signal. An unmeasurable probe is skipped, never treated as zero (#4164).
+
+**Default-on**, like the token-ranking refresh: it restores an
+already-documented behavior whose absence is a slow-motion outage (a full disk
+stops a host running sweeps at all).
+
+```json
+{
+  "autonomous": {
+    "worktreeReaper": {
+      "enabled": true,
+      "intervalSecs": 900,
+      "gracePeriodSecs": 600,
+      "diskWarnFreeGb": 20
+    }
+  }
+}
+```
+
+| Env var | Config key | Precedence | Default |
+|---------|-----------|------------|---------|
+| `LOOM_WORKTREE_REAPER` | `autonomous.worktreeReaper.enabled` | env > config > default | `true` (on) |
+| `LOOM_WORKTREE_REAPER_INTERVAL_SECS` | `autonomous.worktreeReaper.intervalSecs` | env > config > default | `900` (15 min) |
+| — | `autonomous.worktreeReaper.gracePeriodSecs` | config > default | `600` (10 min) |
+| `LOOM_WORKTREE_REAPER_DISK_WARN_GB` | `autonomous.worktreeReaper.diskWarnFreeGb` | env > config > default | `20` |
+
+**Not limited to the daemon's attached workspace.** The loop walks
+`WorkspaceRegistry::effective_roots()` each tick, so a daemon started from
+`~/GitHub/anvil` still reaps `~/GitHub/loom` as long as that repo is registered
+(`loom-daemon workspace add <path>`). A repo that is *not* registered is still
+not reaped — run `loom-daemon clean --safe --deep` there, or register it.
+
+**Idempotent and recoverable.** A missed pass costs nothing: the next tick
+re-evaluates from forge state, and a manual `loom-daemon clean --safe` remains a
+superset recovery path that reports zero errors when the loop already cleaned
+up. The first tick after daemon startup is deliberately skipped so in-flight
+sweeps can re-establish their `.loom-in-use` markers first. See
+`loom-daemon/src/worktree_reaper.rs`.
+
 ### Autonomous periodic support-role runner (#4015)
 
 Before this loop, the periodic **standalone** support roles — Champion,

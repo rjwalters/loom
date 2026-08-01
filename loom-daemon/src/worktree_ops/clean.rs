@@ -17,7 +17,7 @@ use super::gh;
 use super::liveness::active_spawn_loop_issues;
 use super::naming::{self, BRANCH_PREFIX};
 use super::safety::{
-    check_uncommitted_changes, find_processes_using_directory, read_in_use_marker,
+    check_uncommitted_changes, find_processes_using_directory, read_in_use_marker, InUseMarker,
 };
 
 /// Default grace period after PR merge before a worktree is eligible for
@@ -78,6 +78,16 @@ pub struct CleanOptions {
     pub worktrees_only: bool,
     pub branches_only: bool,
     pub tmux_only: bool,
+    /// Require the `.loom-managed` sentinel before a worktree is eligible for
+    /// removal (issue #4876).
+    ///
+    /// The interactive `loom-daemon clean` CLI leaves this **false** to preserve
+    /// its historical behavior (an operator who typed the command and answered
+    /// the prompt is the authority). The daemon-side periodic reaper
+    /// ([`crate::worktree_reaper`]) sets it **true**: an unattended background
+    /// remover must honor CLAUDE.md's "user-provisioned worktrees are never
+    /// removed" contract, because nobody is there to say no.
+    pub require_managed_sentinel: bool,
 }
 
 impl Default for CleanOptions {
@@ -91,6 +101,7 @@ impl Default for CleanOptions {
             worktrees_only: false,
             branches_only: false,
             tmux_only: false,
+            require_managed_sentinel: false,
         }
     }
 }
@@ -175,6 +186,86 @@ pub fn check_pr_merged(repo_root: &Path, issue_num: u32) -> PrStatus {
         PrStatus::Open
     } else {
         PrStatus::Unknown
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct PrRowRest {
+    state: String,
+    #[serde(default)]
+    merged_at: Option<String>,
+}
+
+/// Resolve the repository owner via the **REST** API
+/// (`gh api repos/{owner}/{repo} --jq .owner.login`).
+///
+/// Used to build the `head=<owner>:<branch>` filter [`check_pr_merged_rest`]
+/// needs. Returns `None` on any failure so callers can fall back to the
+/// GraphQL-backed [`check_pr_merged`].
+#[must_use]
+pub fn repo_owner_rest(repo_root: &Path) -> Option<String> {
+    let out = Command::new("gh")
+        .args(["api", "repos/{owner}/{repo}", "--jq", ".owner.login"])
+        .current_dir(repo_root)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let owner = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if owner.is_empty() {
+        None
+    } else {
+        Some(owner)
+    }
+}
+
+/// REST variant of [`check_pr_merged`] (issue #4876).
+///
+/// `gh pr list` goes through GraphQL, whose quota is routinely exhausted on a
+/// host running several agents concurrently; the REST quota is separate and
+/// much less contended. The daemon-side reaper probes unattended on a cadence,
+/// so it must not compete with interactive agents for the scarcer pool.
+///
+/// Queries `repos/{owner}/{repo}/pulls?state=all&head=<owner>:<branch>`. Falls
+/// back to nothing on its own — the caller decides whether an `Unknown` should
+/// be retried through [`check_pr_merged`].
+#[must_use]
+pub fn check_pr_merged_rest(repo_root: &Path, owner: &str, issue_num: u32) -> PrStatus {
+    let branch = naming::branch_name(issue_num);
+    let path = format!("repos/{{owner}}/{{repo}}/pulls?state=all&head={owner}:{branch}&per_page=1");
+    let Ok(out) = Command::new("gh")
+        .args(["api", &path])
+        .current_dir(repo_root)
+        .output()
+    else {
+        return PrStatus::Unknown;
+    };
+    if !out.status.success() {
+        return PrStatus::Unknown;
+    }
+    let Ok(rows) = serde_json::from_slice::<Vec<PrRowRest>>(&out.stdout) else {
+        return PrStatus::Unknown;
+    };
+    let Some(row) = rows.into_iter().next() else {
+        return PrStatus::NoPr;
+    };
+    classify_pr_row(row.state.as_str(), row.merged_at.as_deref())
+}
+
+/// Map a REST pull-request `(state, merged_at)` pair onto a [`PrStatus`].
+/// Pure, so the REST probe's classification is unit-testable without `gh`.
+#[must_use]
+pub fn classify_pr_row(state: &str, merged_at: Option<&str>) -> PrStatus {
+    if let Some(merged_at) = merged_at.filter(|s| !s.is_empty()) {
+        return PrStatus::Merged {
+            merged_at: merged_at.to_string(),
+        };
+    }
+    match state.to_ascii_uppercase().as_str() {
+        "CLOSED" => PrStatus::ClosedNoMerge,
+        "OPEN" => PrStatus::Open,
+        _ => PrStatus::Unknown,
     }
 }
 
@@ -269,7 +360,216 @@ pub fn find_editable_pip_installs(worktree_path: &Path) -> Vec<String> {
     packages
 }
 
-fn cleanup_worktree(repo_root: &Path, worktree_path: &Path, issue_num: u32, dry_run: bool) -> bool {
+// ============================================================================
+// Removal decision (shared by the `clean` CLI and the daemon-side reaper)
+// ============================================================================
+
+/// Whether `worktree_path` carries the `.loom-managed` sentinel that
+/// `worktree.sh` drops into every Loom-provisioned worktree. A worktree
+/// without it is user-provisioned and must never be auto-removed (CLAUDE.md:
+/// "user-provisioned worktrees are never removed").
+#[must_use]
+pub fn is_loom_managed(worktree_path: &Path) -> bool {
+    worktree_path.join(".loom-managed").is_file()
+}
+
+/// The outcome of applying every worktree-removal safety gate to one worktree.
+///
+/// Extracted from [`clean_worktrees`] (issue #4876) so the **decision** has a
+/// single implementation shared by the interactive `loom-daemon clean` CLI and
+/// the daemon-side periodic reaper ([`crate::worktree_reaper`]). A second
+/// hand-rolled copy of these gates in the reaper is exactly the divergence that
+/// would let an unattended remover delete something the manual path preserves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorktreeDecision {
+    /// Every gate passed — the worktree is eligible for removal.
+    Remove,
+    /// Held by a live spawn-loop task/claim-lock, a `.loom-in-use` marker, or a
+    /// process whose cwd is inside the worktree.
+    SkipInUse(String),
+    /// Editable pip install(s) point into the worktree (payload: the package list).
+    SkipEditable(String),
+    /// No `.loom-managed` sentinel and [`CleanOptions::require_managed_sentinel`]
+    /// is set — user-provisioned, never auto-removed.
+    SkipUnmanaged,
+    /// The issue is not `CLOSED` (payload: the observed state, e.g. `OPEN` /
+    /// `UNKNOWN`).
+    SkipIssueNotClosed(String),
+    /// The PR merged, but the post-merge grace period has not elapsed
+    /// (payload: seconds remaining).
+    SkipGrace(i64),
+    /// Uncommitted work in the worktree would be lost.
+    SkipUncommitted,
+    /// Closed issue whose PR did not merge, or that has no PR at all
+    /// (payload: which).
+    SkipNotMerged(String),
+    /// The PR is still open.
+    SkipPrOpen,
+    /// The PR status could not be determined (forge probe failed).
+    SkipUnknownPrStatus,
+    /// Non-`--safe` mode: the issue is closed and the caller decides
+    /// (interactive prompt, or `--force`).
+    ConfirmClosedIssue,
+}
+
+impl WorktreeDecision {
+    /// True only for [`WorktreeDecision::Remove`].
+    #[must_use]
+    pub fn is_remove(&self) -> bool {
+        matches!(self, Self::Remove)
+    }
+}
+
+/// Injected probes for [`classify_worktree`], so the safety decision is
+/// unit-testable without a live forge, process table, pip, or clock — the same
+/// dependency-injection shape [`SweepTransientEnv`] already uses in this module.
+pub struct WorktreeProbes<'a> {
+    /// Issues with a live spawn-loop task or claim-lock.
+    pub active_issues: &'a std::collections::HashSet<u32>,
+    /// Reads a worktree's `.loom-in-use` marker.
+    pub in_use_marker: &'a dyn Fn(&Path) -> Option<InUseMarker>,
+    /// PIDs whose cwd is inside the worktree.
+    pub processes_using: &'a dyn Fn(&Path) -> Vec<u32>,
+    /// Editable pip installs pointing into the worktree.
+    pub editable_installs: &'a dyn Fn(&Path) -> Vec<String>,
+    /// Whether the worktree carries the `.loom-managed` sentinel.
+    pub is_managed: &'a dyn Fn(&Path) -> bool,
+    /// Forge issue state (`"OPEN"` / `"CLOSED"` / `"UNKNOWN"`).
+    pub issue_state: &'a dyn Fn(u32) -> String,
+    /// Forge PR status for the issue's branch.
+    pub pr_status: &'a dyn Fn(u32) -> PrStatus,
+    /// Whether the worktree has uncommitted changes.
+    pub uncommitted: &'a dyn Fn(&Path) -> bool,
+    /// Wall clock the grace-period gate measures against.
+    pub now: DateTime<Utc>,
+}
+
+/// Apply every worktree-removal safety gate, in the order `clean.py` /
+/// [`clean_worktrees`] has always applied them, and report the outcome.
+///
+/// Pure decision logic: performs no removal, prints nothing, and mutates
+/// nothing. Callers map the returned [`WorktreeDecision`] onto their own
+/// reporting (stdout for the CLI, `log::` for the daemon reaper) and act only
+/// on [`WorktreeDecision::Remove`].
+#[must_use]
+pub fn classify_worktree(
+    worktree_path: &Path,
+    issue_num: u32,
+    opts: &CleanOptions,
+    probes: &WorktreeProbes<'_>,
+) -> WorktreeDecision {
+    if !opts.force && probes.active_issues.contains(&issue_num) {
+        return WorktreeDecision::SkipInUse(format!(
+            "issue #{issue_num} has a live spawn-loop task or claim-lock"
+        ));
+    }
+
+    if let Some(marker) = (probes.in_use_marker)(worktree_path) {
+        return WorktreeDecision::SkipInUse(format!(
+            "in use by shepherd (task: {}, pid: {})",
+            marker.task_id, marker.pid
+        ));
+    }
+
+    if !opts.force {
+        let active_pids = (probes.processes_using)(worktree_path);
+        if !active_pids.is_empty() {
+            return WorktreeDecision::SkipInUse(format!(
+                "active process(es) using worktree: {active_pids:?}"
+            ));
+        }
+    }
+
+    if !opts.force {
+        let editable_pkgs = (probes.editable_installs)(worktree_path);
+        if !editable_pkgs.is_empty() {
+            return WorktreeDecision::SkipEditable(editable_pkgs.join(", "));
+        }
+    }
+
+    // Sentinel gate (#4876): only the unattended reaper opts into this. It sits
+    // AFTER the in-use gates so a user-provisioned worktree that is also busy
+    // still reports the more specific "in use" reason.
+    if opts.require_managed_sentinel && !(probes.is_managed)(worktree_path) {
+        return WorktreeDecision::SkipUnmanaged;
+    }
+
+    let issue_state = (probes.issue_state)(issue_num);
+    if issue_state != "CLOSED" {
+        return WorktreeDecision::SkipIssueNotClosed(issue_state);
+    }
+
+    if !opts.safe {
+        return WorktreeDecision::ConfirmClosedIssue;
+    }
+
+    match (probes.pr_status)(issue_num) {
+        PrStatus::Merged { merged_at } => {
+            if !opts.force {
+                if let Ok(dt) = DateTime::parse_from_rfc3339(&merged_at) {
+                    let (passed, remaining) = check_grace_period(
+                        dt.with_timezone(&Utc),
+                        opts.grace_period_secs,
+                        probes.now,
+                    );
+                    if !passed {
+                        return WorktreeDecision::SkipGrace(remaining);
+                    }
+                }
+                if (probes.uncommitted)(worktree_path) {
+                    return WorktreeDecision::SkipUncommitted;
+                }
+            }
+            WorktreeDecision::Remove
+        }
+        PrStatus::ClosedNoMerge => {
+            WorktreeDecision::SkipNotMerged("PR closed without merge".to_string())
+        }
+        PrStatus::Open => WorktreeDecision::SkipPrOpen,
+        PrStatus::NoPr => {
+            WorktreeDecision::SkipNotMerged("no PR found for closed issue".to_string())
+        }
+        PrStatus::Unknown => WorktreeDecision::SkipUnknownPrStatus,
+    }
+}
+
+/// Build the production [`WorktreeProbes`] for `repo_root`, wiring each gate to
+/// its real implementation. Split from [`classify_worktree`] so tests can
+/// substitute scripted probes without touching the classifier.
+///
+/// The returned struct borrows `active_issues` and the caller-provided closures
+/// (`issue_state_fn` / `pr_status_fn` capture `repo_root`), which is why those
+/// two are parameters rather than being constructed here.
+#[must_use]
+pub fn production_probes<'a>(
+    active_issues: &'a std::collections::HashSet<u32>,
+    issue_state_fn: &'a dyn Fn(u32) -> String,
+    pr_status_fn: &'a dyn Fn(u32) -> PrStatus,
+    now: DateTime<Utc>,
+) -> WorktreeProbes<'a> {
+    WorktreeProbes {
+        active_issues,
+        in_use_marker: &read_in_use_marker,
+        processes_using: &find_processes_using_directory,
+        editable_installs: &find_editable_pip_installs,
+        is_managed: &is_loom_managed,
+        issue_state: issue_state_fn,
+        pr_status: pr_status_fn,
+        uncommitted: &check_uncommitted_changes,
+        now,
+    }
+}
+
+/// Remove a worktree and delete its feature branch.
+///
+/// Exposed (issue #4876) so the daemon-side reaper performs the *same*
+/// removal the CLI does, including the `git branch -d` → `-D` fallback.
+pub fn cleanup_worktree(
+    repo_root: &Path,
+    worktree_path: &Path,
+    issue_num: u32,
+    dry_run: bool,
+) -> bool {
     let branch_name = naming::branch_name(issue_num);
     if dry_run {
         println!("Would remove: {}", worktree_path.display());
@@ -327,6 +627,10 @@ pub fn clean_worktrees(repo_root: &Path, stats: &mut CleanupStats, opts: &CleanO
         .collect();
     worktree_dirs.sort_by_key(std::fs::DirEntry::path);
 
+    let issue_state_fn = |n: u32| gh::issue_state(repo_root, n);
+    let pr_status_fn = |n: u32| check_pr_merged(repo_root, n);
+    let probes = production_probes(&active_issues, &issue_state_fn, &pr_status_fn, Utc::now());
+
     for entry in worktree_dirs {
         let name = entry.file_name().to_string_lossy().to_string();
         let Some(issue_num) = naming::issue_from_worktree(&name) else {
@@ -336,118 +640,72 @@ pub fn clean_worktrees(repo_root: &Path, stats: &mut CleanupStats, opts: &CleanO
 
         println!("Checking worktree: issue-{issue_num}");
 
-        if !opts.force && active_issues.contains(&issue_num) {
-            println!("  Issue #{issue_num} has a live spawn-loop task or claim-lock - preserving");
-            stats.skipped_in_use += 1;
-            continue;
-        }
-
-        if let Some(marker) = read_in_use_marker(&worktree_path) {
-            println!(
-                "  Worktree in use by shepherd (task: {}, pid: {}) - preserving",
-                marker.task_id, marker.pid
-            );
-            stats.skipped_in_use += 1;
-            continue;
-        }
-
-        if !opts.force {
-            let active_pids = find_processes_using_directory(&worktree_path);
-            if !active_pids.is_empty() {
-                println!("  Active process(es) using worktree: {active_pids:?} - preserving");
+        match classify_worktree(&worktree_path, issue_num, opts, &probes) {
+            WorktreeDecision::SkipInUse(reason) => {
+                println!("  {reason} - preserving");
                 stats.skipped_in_use += 1;
-                continue;
             }
-        }
-
-        let editable_pkgs = find_editable_pip_installs(&worktree_path);
-        if !editable_pkgs.is_empty() {
-            let pkg_list = editable_pkgs.join(", ");
-            if opts.force {
-                println!(
-                    "  Editable pip install(s) found ({pkg_list}) - removing anyway (--force)"
-                );
-            } else {
+            WorktreeDecision::SkipEditable(pkg_list) => {
                 println!("  Editable pip install(s) found ({pkg_list}) - skipping");
                 stats.skipped_editable += 1;
-                continue;
             }
-        }
-
-        let issue_state = gh::issue_state(repo_root, issue_num);
-        if issue_state != "CLOSED" {
-            println!("  Issue #{issue_num} is {issue_state} - preserving");
-            stats.skipped_open += 1;
-            continue;
-        }
-
-        if opts.safe {
-            let pr_status = check_pr_merged(repo_root, issue_num);
-            match pr_status {
-                PrStatus::Merged { merged_at } => {
-                    if !opts.force {
-                        if let Ok(dt) = DateTime::parse_from_rfc3339(&merged_at) {
-                            let (passed, remaining) = check_grace_period(
-                                dt.with_timezone(&Utc),
-                                opts.grace_period_secs,
-                                Utc::now(),
-                            );
-                            if !passed {
-                                println!("  PR merged but grace period not passed ({remaining}s remaining)");
-                                stats.skipped_grace += 1;
-                                continue;
-                            }
-                        }
-                        if check_uncommitted_changes(&worktree_path) {
-                            println!("  Uncommitted changes detected - skipping");
-                            stats.skipped_uncommitted += 1;
-                            continue;
-                        }
-                    }
+            WorktreeDecision::SkipUnmanaged => {
+                println!("  No .loom-managed sentinel (user-provisioned) - preserving");
+                stats.skipped_in_use += 1;
+            }
+            WorktreeDecision::SkipIssueNotClosed(state) => {
+                println!("  Issue #{issue_num} is {state} - preserving");
+                stats.skipped_open += 1;
+            }
+            WorktreeDecision::SkipGrace(remaining) => {
+                println!("  PR merged but grace period not passed ({remaining}s remaining)");
+                stats.skipped_grace += 1;
+            }
+            WorktreeDecision::SkipUncommitted => {
+                println!("  Uncommitted changes detected - skipping");
+                stats.skipped_uncommitted += 1;
+            }
+            WorktreeDecision::SkipNotMerged(reason) => {
+                println!("  {reason} - skipping (may need investigation)");
+                stats.skipped_not_merged += 1;
+            }
+            WorktreeDecision::SkipPrOpen => {
+                println!("  PR still open - skipping");
+                stats.skipped_open += 1;
+            }
+            WorktreeDecision::SkipUnknownPrStatus => {
+                println!("  Unknown PR status - skipping");
+                stats.errors += 1;
+            }
+            WorktreeDecision::Remove => {
+                if cleanup_worktree(repo_root, &worktree_path, issue_num, opts.dry_run) {
+                    stats.cleaned_worktrees += 1;
+                } else {
+                    stats.errors += 1;
+                }
+            }
+            WorktreeDecision::ConfirmClosedIssue => {
+                println!("  Issue #{issue_num} is CLOSED");
+                if opts.dry_run {
+                    println!("  Would remove: {}", entry.path().display());
+                    stats.cleaned_worktrees += 1;
+                } else if opts.force {
+                    println!("  Auto-removing: {}", entry.path().display());
                     if cleanup_worktree(repo_root, &worktree_path, issue_num, opts.dry_run) {
                         stats.cleaned_worktrees += 1;
                     } else {
                         stats.errors += 1;
                     }
-                }
-                PrStatus::ClosedNoMerge => {
-                    println!("  PR closed without merge - skipping (may need investigation)");
-                    stats.skipped_not_merged += 1;
-                }
-                PrStatus::Open => {
-                    println!("  PR still open - skipping");
+                } else if confirm("  Force remove this worktree? [y/N] ") {
+                    if cleanup_worktree(repo_root, &worktree_path, issue_num, opts.dry_run) {
+                        stats.cleaned_worktrees += 1;
+                    } else {
+                        stats.errors += 1;
+                    }
+                } else {
+                    println!("  Skipping: {}", entry.path().display());
                     stats.skipped_open += 1;
                 }
-                PrStatus::NoPr => {
-                    println!("  No PR found for closed issue - skipping");
-                    stats.skipped_not_merged += 1;
-                }
-                PrStatus::Unknown => {
-                    println!("  Unknown PR status - skipping");
-                    stats.errors += 1;
-                }
-            }
-        } else {
-            println!("  Issue #{issue_num} is CLOSED");
-            if opts.dry_run {
-                println!("  Would remove: {}", entry.path().display());
-                stats.cleaned_worktrees += 1;
-            } else if opts.force {
-                println!("  Auto-removing: {}", entry.path().display());
-                if cleanup_worktree(repo_root, &worktree_path, issue_num, opts.dry_run) {
-                    stats.cleaned_worktrees += 1;
-                } else {
-                    stats.errors += 1;
-                }
-            } else if confirm("  Force remove this worktree? [y/N] ") {
-                if cleanup_worktree(repo_root, &worktree_path, issue_num, opts.dry_run) {
-                    stats.cleaned_worktrees += 1;
-                } else {
-                    stats.errors += 1;
-                }
-            } else {
-                println!("  Skipping: {}", entry.path().display());
-                stats.skipped_open += 1;
             }
         }
     }

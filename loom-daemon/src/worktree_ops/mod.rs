@@ -22,8 +22,8 @@
 pub mod aggressive;
 pub mod claim_file;
 pub mod clean;
-mod gh;
-mod liveness;
+pub(crate) mod gh;
+pub(crate) mod liveness;
 pub mod logs;
 pub(crate) mod naming;
 pub mod orphan_recovery;
@@ -34,3 +34,7 @@ mod spawn_loop_state;
 pub use claim_file::{
     has_valid_claim, is_abandoned as claim_is_abandoned, is_expired as claim_is_expired,
 };
+
+/// Re-exported (issue #4876) because it appears in the public signature of
+/// [`clean::WorktreeProbes`], which the daemon-side reaper constructs.
+pub use safety::InUseMarker;
