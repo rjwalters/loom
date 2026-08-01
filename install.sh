@@ -383,6 +383,107 @@ loom_daemon_binary_stale() {
   [[ -n "$newer_file" ]]
 }
 
+# Issue #4897: `loom_daemon_binary_stale` above only ever compares the
+# *source tree's own build artifact* (`$loom_root/target/release/loom-daemon`)
+# against source mtimes -- it has no idea a machine-level binary already
+# installed at the destination (`provision_machine_daemon`'s target,
+# scripts/install/provision-daemon.sh) was already rebuilt from the exact
+# commit we're about to build, e.g. by a fleet-mate's install/sweep that ran
+# moments ago. Both call sites unconditionally ran `pnpm daemon:build` --
+# i.e. `cargo build --package loom-daemon --release` -- whenever the source
+# artifact looked stale, even when that build would just block for minutes on
+# `target/.cargo-lock` (held by an unrelated `cargo test`/`clippy` in the same
+# tree) and then produce a binary identical to one already on disk.
+#
+# Returns 0 ("current -- skip the build") when a machine-level installed
+# binary exists AND its embedded build commit (`--version`, see
+# loom-daemon/build.rs / loom_daemon::self_update::BUILD_IDENTITY) matches
+# source HEAD. This is the SAME comparison `provision_machine_daemon()`
+# already performs (scripts/install/provision-daemon.sh ~line 268, the
+# "already current at $dest_bin" short-circuit) -- reused here so install.sh
+# can skip the build BEFORE paying for the lock wait, not just discover after
+# the fact that the rebuild wasn't needed. On a match it also copies the
+# installed binary into `$loom_root/target/release/loom-daemon` (creating
+# target/release/ if missing) so the unmodified downstream call sites that
+# reference that in-repo path directly (`loom-daemon init`,
+# `provision_machine_daemon` itself) keep working without further changes.
+#
+# Returns 1 (build still needed) when there is no installed binary, its
+# `--version` can't be read, its embedded commit is "unknown"/unparsable, or
+# it does not match source HEAD.
+loom_daemon_dest_binary_current() {
+  local loom_root="$1"
+  local dest_dir="${LOOM_DAEMON_BIN_DIR:-$HOME/.local/bin}"
+  local dest_bin="$dest_dir/loom-daemon"
+
+  [[ -x "$dest_bin" ]] || return 1
+
+  local head_commit
+  head_commit="$(git -C "$loom_root" rev-parse --short HEAD 2>/dev/null)" || return 1
+  [[ -n "$head_commit" ]] || return 1
+
+  local dest_version dest_commit
+  dest_version="$("$dest_bin" --version 2>/dev/null)" || return 1
+  # `--version` embeds "... (commit <sha>, built <ts>)" -- see
+  # loom-daemon/build.rs and loom_daemon::self_update::BUILD_IDENTITY.
+  case "$dest_version" in
+    *"(commit "*)
+      dest_commit="${dest_version#*"(commit "}"
+      dest_commit="${dest_commit%%,*}"
+      ;;
+    *) return 1 ;;
+  esac
+  [[ -n "$dest_commit" && "$dest_commit" != "unknown" ]] || return 1
+  [[ "$dest_commit" == "$head_commit" ]] || return 1
+
+  mkdir -p "$loom_root/target/release" 2>/dev/null || return 1
+  cp -f "$dest_bin" "$loom_root/target/release/loom-daemon" 2>/dev/null || return 1
+  chmod 755 "$loom_root/target/release/loom-daemon" 2>/dev/null || true
+  return 0
+}
+
+# Issue #4897: runs `pnpm daemon:build` (a `cargo build --package loom-daemon
+# --release` under the hood) in the background and emits a periodic progress
+# line while it is running, so a wait contended on `target/.cargo-lock` (held
+# by an unrelated `cargo test`/`clippy` elsewhere in the same source tree) is
+# visibly distinguishable from a hung installer instead of producing zero
+# output for 10+ minutes. Best-effort: if `lsof` is unavailable or the lock
+# file can't be inspected, the progress line still fires, just without naming
+# the competing PID.
+run_daemon_build_with_progress() {
+  local loom_root="$1"
+  local lockfile="$loom_root/target/.cargo-lock"
+  local log
+  log="$(mktemp 2>/dev/null || echo "/tmp/loom-daemon-build.$$.log")"
+
+  ( cd "$loom_root" && pnpm daemon:build >"$log" 2>&1 ) &
+  local build_pid=$!
+
+  local elapsed=0
+  local interval=15
+  while kill -0 "$build_pid" 2>/dev/null; do
+    sleep "$interval"
+    elapsed=$((elapsed + interval))
+    kill -0 "$build_pid" 2>/dev/null || break
+
+    local holder=""
+    if [[ -f "$lockfile" ]] && command -v lsof >/dev/null 2>&1; then
+      holder="$(lsof -t "$lockfile" 2>/dev/null | head -n1 || true)"
+    fi
+    if [[ -n "$holder" ]]; then
+      info "  ... still building loom-daemon (${elapsed}s elapsed; waiting on cargo build-dir lock, held by pid $holder)"
+    else
+      info "  ... still building loom-daemon (${elapsed}s elapsed)"
+    fi
+  done
+
+  wait "$build_pid"
+  local status=$?
+  cat "$log" 2>/dev/null || true
+  rm -f "$log" 2>/dev/null || true
+  return $status
+}
+
 # Issue #3588: re-append the current Loom ephemeral .gitignore patterns after a
 # --quick reinstall stash pop that was performed against a HEAD-reset .gitignore.
 #
@@ -982,15 +1083,23 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
     # tree (issue #4188 -- a bare existence check reuses a binary built from
     # an older commit after `git pull` landed a newer one).
     if loom_daemon_binary_stale "$LOOM_ROOT"; then
-      if [[ -f "$LOOM_ROOT/target/release/loom-daemon" ]]; then
-        warning "loom-daemon binary is stale (source tree updated since last build)"
+      # Issue #4897: before paying for a `cargo build` (and its
+      # `target/.cargo-lock` wait), check whether the ALREADY-INSTALLED
+      # machine-level binary was already rebuilt from this exact commit --
+      # e.g. by a fleet-mate's install/sweep moments ago -- and reuse it
+      # instead of rebuilding.
+      if loom_daemon_dest_binary_current "$LOOM_ROOT"; then
+        info "loom-daemon already current at ${LOOM_DAEMON_BIN_DIR:-$HOME/.local/bin}/loom-daemon (matches source HEAD) -- skipping rebuild"
       else
-        warning "loom-daemon binary not found"
+        if [[ -f "$LOOM_ROOT/target/release/loom-daemon" ]]; then
+          warning "loom-daemon binary is stale (source tree updated since last build)"
+        else
+          warning "loom-daemon binary not found"
+        fi
+        info "Building loom-daemon (this may take a minute)..."
+        run_daemon_build_with_progress "$LOOM_ROOT" || error "Failed to build loom-daemon"
+        echo ""
       fi
-      info "Building loom-daemon (this may take a minute)..."
-      cd "$LOOM_ROOT"
-      pnpm daemon:build || error "Failed to build loom-daemon"
-      echo ""
     fi
 
     # Export LOOM_VERSION / LOOM_COMMIT so the daemon's template substituter
@@ -1366,15 +1475,23 @@ case "$METHOD" in
     # tree (issue #4188 -- a bare existence check reuses a binary built from
     # an older commit after `git pull` landed a newer one).
     if loom_daemon_binary_stale "$LOOM_ROOT"; then
-      if [[ -f "$LOOM_ROOT/target/release/loom-daemon" ]]; then
-        warning "loom-daemon binary is stale (source tree updated since last build)"
+      # Issue #4897: before paying for a `cargo build` (and its
+      # `target/.cargo-lock` wait), check whether the ALREADY-INSTALLED
+      # machine-level binary was already rebuilt from this exact commit --
+      # e.g. by a fleet-mate's install/sweep moments ago -- and reuse it
+      # instead of rebuilding.
+      if loom_daemon_dest_binary_current "$LOOM_ROOT"; then
+        info "loom-daemon already current at ${LOOM_DAEMON_BIN_DIR:-$HOME/.local/bin}/loom-daemon (matches source HEAD) -- skipping rebuild"
       else
-        warning "loom-daemon binary not found"
+        if [[ -f "$LOOM_ROOT/target/release/loom-daemon" ]]; then
+          warning "loom-daemon binary is stale (source tree updated since last build)"
+        else
+          warning "loom-daemon binary not found"
+        fi
+        info "Building loom-daemon (this may take a minute)..."
+        run_daemon_build_with_progress "$LOOM_ROOT" || error "Failed to build loom-daemon"
+        echo ""
       fi
-      info "Building loom-daemon (this may take a minute)..."
-      cd "$LOOM_ROOT"
-      pnpm daemon:build || error "Failed to build loom-daemon"
-      echo ""
     fi
 
     # Export LOOM_VERSION / LOOM_COMMIT so the daemon's template substituter
