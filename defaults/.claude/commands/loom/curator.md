@@ -98,7 +98,7 @@ gh issue comment 342 --body "Enhancing this issue per user request"
 # ... research codebase, add context, create test plan ...
 
 # Complete normally
-gh issue edit 342 --remove-label "loom:curating" --add-label "loom:curated"
+gh issue edit 342 --remove-label "loom:curating" --remove-label "loom:triage" --add-label "loom:curated"
 gh issue comment 342 --body "✅ Curation complete. Added implementation guidance, acceptance criteria, and test plan."
 ```
 
@@ -262,7 +262,7 @@ When you find an unlabeled issue, **first assess if it's already implementation-
 
 ```bash
 # Signal completion by removing curating and adding curated
-gh issue edit <number> --remove-label "loom:curating" --add-label "loom:curated"
+gh issue edit <number> --remove-label "loom:curating" --remove-label "loom:triage" --add-label "loom:curated"
 ```
 
 **IMPORTANT**: Do NOT add `loom:issue` — that promotion is never the Curator's to make (see "Who promotes `loom:curated` → `loom:issue`" above).
@@ -286,7 +286,7 @@ Issue #84: "Expand frontend unit test coverage"
 - ✅ Includes test plan (Phase 1, 2, 3 approach)
 - ✅ No dependencies mentioned
 
-→ Action: `gh issue edit 84 --remove-label "loom:curating" --add-label "loom:curated"`
+→ Action: `gh issue edit 84 --remove-label "loom:curating" --remove-label "loom:triage" --add-label "loom:curated"`
 → Result: Awaits `loom:issue` promotion (human, Champion, or a `/loom:sweep` orchestrator) before Worker can start
 ```
 
@@ -606,7 +606,7 @@ EOF
 )"
 
 # 3. Mark as curated and unclaim (human will approve with loom:issue)
-gh issue edit 100 --remove-label "loom:curating" --add-label "loom:curated"
+gh issue edit 100 --remove-label "loom:curating" --remove-label "loom:triage" --add-label "loom:curated"
 ```
 
 ### When to Amend Description (Improve Original)
@@ -759,7 +759,7 @@ just that the body's stated dependency closed. When in doubt, leave
 
 **Only once the superseding-block check clears**, proceed:
 1. Claim the issue if not already claimed: `gh issue edit <number> --add-label "loom:curating"`
-2. Remove `loom:blocked` label and add `loom:curated`: `gh issue edit <number> --remove-label "loom:blocked" --remove-label "loom:curating" --add-label "loom:curated"`
+2. Remove `loom:blocked` label and add `loom:curated`: `gh issue edit <number> --remove-label "loom:blocked" --remove-label "loom:curating" --remove-label "loom:triage" --add-label "loom:curated"`
 3. Issue awaits `loom:issue` promotion (human, Champion, or a `/loom:sweep` orchestrator) before Workers can claim
 
 ## Issue Quality Checklist
@@ -848,7 +848,7 @@ EOF
 )"
 
 # 4. Mark as curated
-gh issue edit 100 --remove-label "loom:curating" --add-label "loom:curated"
+gh issue edit 100 --remove-label "loom:curating" --remove-label "loom:triage" --add-label "loom:curated"
 ```
 
 ## Working Style
@@ -862,7 +862,7 @@ gh issue edit 100 --remove-label "loom:curating" --add-label "loom:curated"
 - **Enhance issue**: Add missing details, implementation options, test plans
 - **Mark curated and unclaim** (NOT approved for work):
   ```bash
-  gh issue edit <number> --remove-label "loom:curating" --add-label "loom:curated"
+  gh issue edit <number> --remove-label "loom:curating" --remove-label "loom:triage" --add-label "loom:curated"
   ```
 - **NEVER add `loom:issue`**: promotion is never the Curator's call — see "Who promotes `loom:curated` → `loom:issue`" near the top of this file
 - **Monitor workflow**: Check for `loom:blocked` issues that need help
