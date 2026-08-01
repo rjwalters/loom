@@ -2700,10 +2700,74 @@ assert_deny "write-confinement (#4881): \$VAR assigned earlier in the same comma
     "SCRATCH=$WT_REPO
 echo x >> \$SCRATCH/defaults/hooks/f.sh" "$WT_REPO"
 
-# An UNRESOLVABLE $VAR (no matching assignment anywhere in the command) is
-# treated as unknown and skipped -- never guessed as repo-relative.
-assert_allow "write-confinement (#4881): unresolvable \$VAR (no matching assignment) is treated as unknown, not repo-relative -> allow" \
+# Other assignment SHAPES resolve too (#4914 review). Before this, only a
+# segment that was EXACTLY one bare `NAME=value` populated the resolver, so
+# every other (extremely common) assignment shape stayed unresolvable.
+assert_allow "write-confinement (#4881): 'export'-prefixed assignment resolves outside the repo -> allow" \
+    "export SCRATCH=$OUTSIDE_SCRATCH
+echo x >> \$SCRATCH/out.txt" "$WT_REPO"
+assert_allow "write-confinement (#4881): 'readonly'-prefixed assignment resolves outside the repo -> allow" \
+    "readonly SCRATCH=$OUTSIDE_SCRATCH
+cp /tmp/a.sh \$SCRATCH/out.txt" "$WT_REPO"
+assert_allow "write-confinement (#4881): 'declare -x' assignment (keyword + flag) resolves outside the repo -> allow" \
+    "declare -x SCRATCH=$OUTSIDE_SCRATCH
+echo x >> \$SCRATCH/out.txt" "$WT_REPO"
+assert_allow "write-confinement (#4881): 'local' assignment inside a function body resolves outside the repo -> allow" \
+    "f() {
+  local SCRATCH=$OUTSIDE_SCRATCH
+  cp /tmp/a.sh \$SCRATCH/out.txt
+}" "$WT_REPO"
+assert_allow "write-confinement (#4881): several assignments in one segment resolve outside the repo -> allow" \
+    "A=1 SCRATCH=$OUTSIDE_SCRATCH
+mv /tmp/a.sh \$SCRATCH/out.txt" "$WT_REPO"
+assert_allow "write-confinement (#4881): env-var prefix on the writing command itself resolves outside the repo -> allow" \
+    "SCRATCH=$OUTSIDE_SCRATCH
+LC_ALL=C cp /tmp/a.sh \$SCRATCH/out.txt" "$WT_REPO"
+
+# ...and each of those shapes STILL denies when the resolved value lands
+# inside the main checkout -- widening the assignment scan must not weaken the
+# #4178 protection for the shapes it newly understands.
+assert_deny "write-confinement (#4881): 'export'-prefixed assignment resolving INSIDE the repo -> still denies" \
+    "export SNEAK=$WT_REPO/defaults/hooks
+echo pwned > \$SNEAK/evil.sh" "$WT_REPO"
+assert_deny "write-confinement (#4881): 'readonly'-prefixed assignment resolving INSIDE the repo -> still denies" \
+    "readonly SNEAK=$WT_REPO/defaults/hooks
+cp /tmp/a.sh \$SNEAK/evil.sh" "$WT_REPO"
+assert_deny "write-confinement (#4881): 'declare'-prefixed assignment resolving INSIDE the repo -> still denies" \
+    "declare SNEAK=$WT_REPO/defaults/hooks
+cp /tmp/a.sh \$SNEAK/evil.sh" "$WT_REPO"
+assert_deny "write-confinement (#4881): 'local' assignment in a function resolving INSIDE the repo -> still denies" \
+    "f() {
+  local SNEAK=$WT_REPO/defaults/hooks
+  cp /tmp/a.sh \$SNEAK/evil.sh
+}" "$WT_REPO"
+assert_deny "write-confinement (#4881): multi-assignment segment resolving INSIDE the repo -> still denies" \
+    "A=1 SNEAK=$WT_REPO/defaults/hooks
+mv /tmp/a.sh \$SNEAK/evil.sh" "$WT_REPO"
+assert_deny "write-confinement (#4881): env-var prefix on the writing command itself, target INSIDE the repo -> still denies" \
+    "SNEAK=$WT_REPO/defaults/hooks
+LC_ALL=C cp /tmp/a.sh \$SNEAK/evil.sh" "$WT_REPO"
+# An env-var prefix must not hide the command it prefixes from the scan at all.
+assert_deny "write-confinement (#4881): env-var-prefixed cp to a literal in-repo path -> still denies" \
+    "LC_ALL=C cp /tmp/a.sh $WT_REPO/defaults/hooks/evil.sh" "$WT_REPO"
+
+# FAIL-CLOSED (#4914 review): an UNRESOLVABLE $VAR is NOT skipped. It keeps
+# the pre-#4881 literal (repo-relative) treatment, so an unparsed assignment
+# shape can never become a free worktree-isolation bypass. The narrow #4881
+# fix only relaxes targets it can actually PROVE resolve outside the repo.
+assert_deny "write-confinement (#4881): unresolvable \$VAR (no matching assignment) stays fail-closed -> denies" \
     "echo x >> \$NOSUCHVARFORLOOMTEST4881/out.txt" "$WT_REPO"
+assert_deny "write-confinement (#4881): \$VAR whose value is itself an unresolved \$VAR (chained) stays fail-closed -> denies" \
+    "SNEAK=\$SOMETHINGUNKNOWN4881/defaults/hooks
+cp /tmp/a.sh \$SNEAK/evil.sh" "$WT_REPO"
+assert_deny "write-confinement (#4881): \$(...) command-substitution target stays fail-closed -> denies" \
+    "cp /tmp/a.sh \$(echo defaults)/hooks/evil.sh" "$WT_REPO"
+assert_deny "write-confinement (#4881): \${VAR:-default} (non-bare reference) stays fail-closed -> denies" \
+    "cp /tmp/a.sh \${NOSUCHVAR4881:-defaults}/hooks/evil.sh" "$WT_REPO"
+# An assignment appearing only AFTER the write must not resolve it backwards.
+assert_deny "write-confinement (#4881): assignment AFTER the write does not resolve it retroactively -> denies" \
+    "cp /tmp/a.sh \$LATER4881/evil.sh
+LATER4881=$OUTSIDE_SCRATCH" "$WT_REPO"
 
 rm -rf "$OUTSIDE_SCRATCH"
 

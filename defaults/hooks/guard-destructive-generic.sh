@@ -1962,20 +1962,41 @@ extract_rm_targets() {
 # $SCRATCH/out.txt` on the next, was denied as a worktree-isolation bypass
 # even though the real target resolves to /private/tmp, far outside the
 # repo). `resolve_var()` below performs the ONE unambiguous, narrow piece of
-# this: when the SAME command text contains a standalone `NAME=value`
-# assignment segment (no embedded whitespace in `value`, optionally
-# single/double-quoted) earlier in the stream, later `$NAME`/`${NAME}` leading
-# a write target is substituted with that value. Threaded via the awk global
-# `varmap`, exactly like `curcwd` above. A `$NAME` with NO matching assignment
-# (or a token starting with `$` but not a bare variable reference, e.g. a
-# `$(...)` command substitution) is UNRESOLVABLE — never guessed, never
-# treated as repo-relative. It is tagged with the VARUNKNOWN sentinel (STX,
-# 0x02 — a byte that can never appear in the raw command text this awk
-# program reads) so the caller can treat it as "unknown" and skip the target
-# entirely, per this file's fail-open contract: ambiguity never widens a deny.
+# this: when the SAME command text contains a `NAME=value` assignment (no
+# embedded whitespace in `value`, optionally single/double-quoted) earlier in
+# the stream, later `$NAME`/`${NAME}` leading a write target is substituted
+# with that value. Threaded via the awk global `varmap`, exactly like `curcwd`
+# above. The assignment scan recognizes every ordinary shell assignment
+# position, not just a segment that is exactly one bare `NAME=value`:
+#   NAME=value                       (bare)
+#   export/readonly/declare/typeset/local [-flags] NAME=value [NAME2=value2]
+#   A=1 B=2                          (several assignments in one segment)
+#   A=1 some-command args…           (env-var prefix — A recorded, then the
+#                                     REST of the segment is still scanned as
+#                                     a command for write idioms)
+#
+# FAIL-CLOSED ON UNRESOLVABLE (#4914 review): a `$NAME` with NO matching
+# assignment, or a token starting with `$` that is not a bare variable
+# reference at all (`$(...)` command substitution, `${VAR:-default}`, `$1`,
+# an inherited/sourced env var, …), is UNRESOLVABLE. It is NEVER guessed —
+# and it is NEVER skipped either. It falls back to the PRE-#4881 behavior:
+# the raw token is treated as a literal (repo-relative) path, so a write that
+# lands inside the main checkout still denies with the ordinary
+# `worktree-write-confinement` tag. Skipping an unresolvable target would
+# hand every un-parsed assignment shape a free #4178 worktree-isolation
+# bypass (`export SNEAK=<repo>/defaults/hooks; echo x > $SNEAK/evil.sh`), so
+# this fix only ever RELAXES the one literally-resolvable case it can prove
+# lands outside the repo — it never flips the default for anything else. (The
+# file's broader "ambiguity never widens a deny" contract is about not
+# inventing NEW denies; preserving an EXISTING one is the conservative side.)
 # =============================================================================
 extract_write_targets() {
     printf '%s' "$1" | awk -v startcwd="$2" "$_QSPLIT_AWK""$_MASKGT_AWK"'
+    # Unresolvable cases all return tok UNCHANGED, which is exactly the
+    # pre-#4881 treatment (literal, cwd-prefixed => still denied when it
+    # lands in the main checkout). Fail-closed by construction: this function
+    # can only ever REPLACE a token with a value it actually proved, never
+    # make one disappear.
     function resolve_var(tok,   vname, rest, vv) {
         if (substr(tok, 1, 1) != "$") return tok
         if (match(tok, /^\$\{[A-Za-z_][A-Za-z0-9_]*\}/)) {
@@ -1985,21 +2006,38 @@ extract_write_targets() {
             vname = substr(tok, RSTART + 1, RLENGTH - 1)
             rest = substr(tok, RSTART + RLENGTH)
         } else {
-            return VARUNKNOWN tok
+            # `$(...)`, `${VAR:-x}`, `$1`, … — not a bare variable reference.
+            return tok
         }
-        if (!(vname in varmap)) return VARUNKNOWN tok
+        if (!(vname in varmap)) return tok
         vv = varmap[vname]
         # A value that itself still starts with an unresolved "$" (chained
-        # assignment this single-pass resolver does not follow) stays unknown
-        # rather than being guessed.
-        if (substr(vv, 1, 1) == "$") return VARUNKNOWN tok
+        # assignment this single-pass resolver does not follow) stays
+        # unresolved rather than being guessed.
+        if (vv == "" || substr(vv, 1, 1) == "$") return tok
         return vv rest
+    }
+    # Record a single `NAME=value` word into varmap (value optionally wrapped
+    # in matching single/double quotes, which qsplit() copies verbatim).
+    function record_assign(word,   eqpos, vname, vval, vlen, c1, c2) {
+        eqpos = index(word, "=")
+        if (eqpos < 2) return
+        vname = substr(word, 1, eqpos - 1)
+        vval = substr(word, eqpos + 1)
+        vlen = length(vval)
+        if (vlen >= 2) {
+            c1 = substr(vval, 1, 1)
+            c2 = substr(vval, vlen, 1)
+            if ((c1 == DQ && c2 == DQ) || (c1 == SQ && c2 == SQ)) {
+                vval = substr(vval, 2, vlen - 2)
+            }
+        }
+        varmap[vname] = vval
     }
     BEGIN {
         SEP = sprintf("%c", 31)
         DQ = sprintf("%c", 34)
         SQ = sprintf("%c", 39)
-        VARUNKNOWN = sprintf("%c", 2)
         curcwd = startcwd
     }
     {
@@ -2012,27 +2050,34 @@ extract_write_targets() {
             sub(/^[ \t]+/, "", seg)
             if (seg == "") continue
 
-            # Standalone `NAME=value` assignment (whole segment, no embedded
-            # whitespace in value — the common one-assignment-per-line/segment
-            # shape, e.g. `SCRATCH=/private/tmp/.../scratchpad`, #4881).
-            # Recorded into varmap for LATER segments of this same command;
-            # deliberately does NOT try to also extract a write target from
-            # this segment (a bare assignment writes nothing).
-            if (seg ~ /^[A-Za-z_][A-Za-z0-9_]*=[^ \t]*$/) {
-                eqpos = index(seg, "=")
-                vname = substr(seg, 1, eqpos - 1)
-                vval = substr(seg, eqpos + 1)
-                vlen = length(vval)
-                if (vlen >= 2) {
-                    c1 = substr(vval, 1, 1)
-                    c2 = substr(vval, vlen, 1)
-                    if ((c1 == DQ && c2 == DQ) || (c1 == SQ && c2 == SQ)) {
-                        vval = substr(vval, 2, vlen - 2)
-                    }
+            # `NAME=value` assignments in any ordinary shell assignment
+            # position (#4881; keyword/multi-assignment shapes added by the
+            # #4914 review). Recorded into varmap for LATER write targets in
+            # this same command. A leading declaration keyword
+            # (export/readonly/declare/typeset/local) and its flags are
+            # stripped first, then EVERY leading `NAME=value` word is
+            # consumed. Whatever remains is the real command for the segment,
+            # still scanned for write idioms below (the `A=1 cmd …` env-var
+            # prefix shape), so recognizing an assignment never causes a
+            # command in the same segment to be skipped.
+            if (seg ~ /^(export|readonly|declare|typeset|local)[ \t]/) {
+                sub(/^(export|readonly|declare|typeset|local)[ \t]+/, "", seg)
+                while (seg ~ /^-/) {
+                    if (!sub(/^-[^ \t]*[ \t]*/, "", seg)) break
                 }
-                varmap[vname] = vval
-                continue
             }
+            while (match(seg, /^[A-Za-z_][A-Za-z0-9_]*=[^ \t]*([ \t]+|$)/)) {
+                assignword = substr(seg, 1, RLENGTH)
+                seg = substr(seg, RLENGTH + 1)
+                sub(/[ \t]+$/, "", assignword)
+                record_assign(assignword)
+            }
+            # A segment that was NOTHING but assignments writes nothing.
+            # Anything left over keeps flowing into the command scan below
+            # (a redirection is honoured even on a declaration statement —
+            # `export FOO > f` really does truncate `f`), so consuming an
+            # assignment can never make a real write idiom disappear.
+            if (seg == "") continue
 
             m = split(seg, toks, /[ \t]+/)
             if (m < 1) continue
@@ -2537,17 +2582,18 @@ if worktree_isolation_guard_enabled && \
     while IFS=$'\037' read -r _wcwd _wtarget; do
         [[ -z "$_wtarget" ]] && continue
 
-        # Same-command $VAR/${VAR} resolution (#4881): extract_write_targets()
-        # tags a target it could NOT resolve (no matching NAME=value
-        # assignment earlier in the command text, or a $-prefixed token that
-        # is not a bare variable reference, e.g. a $(...) substitution) with a
-        # leading STX (0x02) sentinel rather than guessing. Treat it as
-        # unknown and skip it entirely -- never fall back to treating it as
-        # repo-relative.
-        case "$_wtarget" in
-            $'\x02'*) continue ;;
-        esac
-
+        # Same-command $VAR/${VAR} resolution (#4881) happens inside
+        # extract_write_targets(): a target whose leading `$NAME`/`${NAME}`
+        # matched an assignment earlier in the SAME command arrives here
+        # already substituted. A target it could NOT resolve (no matching
+        # assignment, or a $-prefixed token that is not a bare variable
+        # reference at all — `$(...)`, `${VAR:-x}`, an inherited env var)
+        # arrives UNCHANGED and is deliberately still treated as a literal
+        # repo-relative path here, exactly as it was before #4881 — an
+        # unresolvable target must stay fail-closed, or every assignment
+        # shape the scan cannot parse becomes a free #4178 bypass (#4914
+        # review).
+        #
         # Shell-accurate tilde expansion (#4382): an unquoted/unescaped
         # leading `~/` or `~user/` in the raw token is what the real shell
         # would expand BEFORE cp/mv/tee/sed -i/redirection ever see it, so
