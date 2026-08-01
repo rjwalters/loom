@@ -1,10 +1,10 @@
 import { beforeEach, describe, expect, it } from "vitest";
 
-import { buildBurnCurves } from "../src/analytics/burn.js";
-import { forecastAccount, forecastAccounts } from "../src/analytics/forecast.js";
-import { parseTokenSamples } from "../src/analytics/parse.js";
+import { buildBurnCurves, buildPoolBurnCurves } from "../src/analytics/burn.js";
+import { forecastAccount, forecastAccounts, summarizePoolHealth, summarizePoolHealths } from "../src/analytics/forecast.js";
+import { parsePoolSamples, parseTokenSamples } from "../src/analytics/parse.js";
 import type { HistoryEnvelope } from "../src/analytics/types.js";
-import { HOUR, MINUTE, T0, resetIds, tokensSnapshot } from "./analyticsFixtures.js";
+import { HOUR, MINUTE, T0, poolTokensSnapshot, resetIds, tokensSnapshot } from "./analyticsFixtures.js";
 
 beforeEach(resetIds);
 
@@ -214,5 +214,67 @@ describe("forecastAccounts", () => {
     const forecasts = forecastAccounts(curves, { now: T0 + HOUR });
     expect(forecasts.map((forecast) => forecast.account)).toEqual(["agent-1", "agent-2"]);
     expect(forecasts.map((forecast) => forecast.status)).toEqual(["resets-first", "exhausted"]);
+  });
+});
+
+describe("summarizePoolHealth", () => {
+  it("reports the newest sample's counts and usage figures — no projection", () => {
+    const curves = buildPoolBurnCurves(
+      parsePoolSamples([
+        poolTokensSnapshot(T0, { accountCount: 10, exhaustedCount: 1, meanUsage: 0.2, maxUsage: 0.4, nextResetAt: T0 + 4 * HOUR }),
+        poolTokensSnapshot(T0 + HOUR, { accountCount: 10, exhaustedCount: 2, meanUsage: 0.3, maxUsage: 0.6, nextResetAt: T0 + 4 * HOUR }),
+      ]),
+    );
+    const summary = summarizePoolHealth(curves[0]!);
+
+    expect(summary).toEqual({
+      hostId: "host-a",
+      accountCount: 10,
+      exhaustedCount: 2,
+      exhaustedFraction: 0.2,
+      maxUsageFraction: 0.6,
+      meanUsageFraction: 0.3,
+      nextLimitWindowResetAt: T0 + 4 * HOUR,
+    });
+    expect(summary).not.toHaveProperty("projectedExhaustionAt");
+  });
+
+  it("leaves nextLimitWindowResetAt undefined when no sample reported one", () => {
+    const curves = buildPoolBurnCurves(
+      parsePoolSamples([poolTokensSnapshot(T0, { accountCount: 2, maxUsage: 0.3 })]),
+    );
+    expect(summarizePoolHealth(curves[0]!).nextLimitWindowResetAt).toBeUndefined();
+  });
+
+  it("reports exhaustedFraction as undefined, not a divide-by-zero 0, for an empty pool", () => {
+    const curves = buildPoolBurnCurves(parsePoolSamples([poolTokensSnapshot(T0, { accountCount: 0 })]));
+    expect(summarizePoolHealth(curves[0]!).exhaustedFraction).toBeUndefined();
+  });
+
+  it("renders sensibly when exhausted_count is 0", () => {
+    const curves = buildPoolBurnCurves(
+      parsePoolSamples([poolTokensSnapshot(T0, { accountCount: 8, exhaustedCount: 0, maxUsage: 0.3 })]),
+    );
+    const summary = summarizePoolHealth(curves[0]!);
+    expect(summary.exhaustedCount).toBe(0);
+    expect(summary.exhaustedFraction).toBe(0);
+  });
+
+  it("renders sensibly when exhausted_count is close to account_count", () => {
+    const curves = buildPoolBurnCurves(
+      parsePoolSamples([poolTokensSnapshot(T0, { accountCount: 8, exhaustedCount: 7, maxUsage: 1 })]),
+    );
+    const summary = summarizePoolHealth(curves[0]!);
+    expect(summary.exhaustedFraction).toBeCloseTo(0.875, 10);
+  });
+
+  it("summarizePoolHealths preserves curve ordering", () => {
+    const curves = buildPoolBurnCurves(
+      parsePoolSamples([
+        poolTokensSnapshot(T0, { accountCount: 3, maxUsage: 0.4 }, "host-b"),
+        poolTokensSnapshot(T0, { accountCount: 8, maxUsage: 0.9 }, "host-a"),
+      ]),
+    );
+    expect(summarizePoolHealths(curves).map((summary) => summary.hostId)).toEqual(["host-a", "host-b"]);
   });
 });

@@ -37,9 +37,18 @@
  * `exhausted` flag, which the schema documents as always present: an account
  * can be known-exhausted while its numeric usage is unknown, and that must
  * still light up the UI.
+ *
+ * ## Pool-level curves (issue #4847)
+ *
+ * `buildPoolBurnCurves` (bottom of this file) is the public-surface
+ * counterpart: one curve per `hostId` (no account key — the aggregate names
+ * none), built from `/public/history`'s `mean_usage_fraction` /
+ * `max_usage_fraction` / `exhausted_count` instead of a per-account
+ * `usage_fraction`. Same segmentation rules, same "unknown != zero" contract,
+ * different input shape (`PoolSample`, not `TokenSample`).
  */
 
-import type { AccountReading, TokenSample } from "./types.js";
+import type { AccountReading, PoolSample, TokenSample } from "./types.js";
 
 /** A usage drop smaller than this is float noise, not a window rollover. */
 const USAGE_DROP_EPSILON = 1e-9;
@@ -222,6 +231,174 @@ function newestDefinedRank(entry: Series): number | undefined {
   for (let i = entry.readings.length - 1; i >= 0; i -= 1) {
     const rank = entry.readings[i]?.reading.rank;
     if (rank !== undefined) return rank;
+  }
+  return undefined;
+}
+
+// ---------------------------------------------------------------------------
+// Pool-level burn curves (`/public/history`'s aggregate — issue #4847)
+// ---------------------------------------------------------------------------
+
+/**
+ * One reading of the pool aggregate, mirroring {@link BurnPoint} but keyed on
+ * the whole pool rather than one account: `usage_fraction` becomes a pair
+ * (mean/peak across every account that reported one) and there is an
+ * `exhaustedCount`/`accountCount` instead of a boolean flag.
+ */
+export interface PoolBurnPoint {
+  /** Epoch ms. */
+  at: number;
+  /** Mean/peak `usage_fraction` across the pool, clamped to `[0, 1]`. Absent
+   * — never `0` — when no account reported one in this sample. */
+  meanUsageFraction?: number;
+  maxUsageFraction?: number;
+  accountCount: number;
+  exhaustedCount: number;
+  /** Epoch ms of this reading's `next_limit_window_reset_at`, when known. */
+  nextLimitWindowResetAt?: number;
+}
+
+export interface PoolBurnSegment {
+  /** Chronological, at least one point. */
+  points: PoolBurnPoint[];
+  /** The `next_limit_window_reset_at` in force for this segment (the newest
+   * one observed in it), when any reading reported one. */
+  nextLimitWindowResetAt?: number;
+  startedBy: "initial" | "window-reset" | "gap";
+}
+
+/** One host's token pool over time. There is one curve per `hostId` — unlike
+ * {@link AccountBurnCurve} there is no per-account key, because the aggregate
+ * carries no account identity to key on. */
+export interface PoolBurnCurve {
+  hostId: string;
+  /** Every usable point across every segment, chronological. */
+  points: PoolBurnPoint[];
+  segments: PoolBurnSegment[];
+  /** The live segment — the tail of `segments`, or `undefined` when no
+   * sample in range reported a usage figure at all. */
+  currentSegment?: PoolBurnSegment;
+  /** Newest reading of any kind (including one with no usage figure). */
+  latestAt: number;
+  /** Pool size / exhausted count as of the newest reading. */
+  accountCount: number;
+  exhaustedCount: number;
+}
+
+interface PoolSeries {
+  hostId: string;
+  samples: PoolSample[];
+}
+
+/**
+ * Build one pool burn curve per `hostId` from a chronological
+ * `/public/history` page. Segmentation mirrors {@link buildBurnCurves}
+ * exactly — a rollover (peak usage dropping, or the pool's next reset
+ * advancing) or a telemetry gap starts a new segment — because the same
+ * "sawtooth would wreck a trend read" problem applies to the pool's peak
+ * usage as it does to any one account's.
+ *
+ * `samples` is expected oldest-first ({@link parsePoolSamples} guarantees
+ * this); re-sorted defensively per host, same as {@link buildBurnCurves}.
+ */
+export function buildPoolBurnCurves(
+  samples: readonly PoolSample[],
+  options: BurnCurveOptions = {},
+): PoolBurnCurve[] {
+  const maxSampleGapMs = options.maxSampleGapMs ?? DEFAULT_MAX_SAMPLE_GAP_MS;
+
+  const byHost = new Map<string, PoolSeries>();
+  for (const sample of samples) {
+    let entry = byHost.get(sample.hostId);
+    if (!entry) {
+      entry = { hostId: sample.hostId, samples: [] };
+      byHost.set(sample.hostId, entry);
+    }
+    entry.samples.push(sample);
+  }
+
+  const curves: PoolBurnCurve[] = [];
+  for (const entry of byHost.values()) {
+    entry.samples.sort((a, b) => a.at - b.at);
+    curves.push(buildPoolCurve(entry, maxSampleGapMs));
+  }
+  curves.sort((a, b) => a.hostId.localeCompare(b.hostId));
+  return curves;
+}
+
+function buildPoolCurve(entry: PoolSeries, maxSampleGapMs: number): PoolBurnCurve {
+  const segments: PoolBurnSegment[] = [];
+  const points: PoolBurnPoint[] = [];
+  let previous: PoolBurnPoint | undefined;
+
+  for (const sample of entry.samples) {
+    // A sample with no usage figure at all contributes no plottable point —
+    // same "unknown != zero" rule as a per-account reading — but the loop
+    // below still uses `entry.samples.at(-1)` (not `points.at(-1)`) for the
+    // curve's latest account/exhausted counts, so that summary never depends
+    // on whether the newest sample happened to carry a usage figure.
+    if (sample.meanUsageFraction === undefined && sample.maxUsageFraction === undefined) continue;
+
+    const point: PoolBurnPoint = {
+      at: sample.at,
+      meanUsageFraction: sample.meanUsageFraction === undefined ? undefined : clampFraction(sample.meanUsageFraction),
+      maxUsageFraction: sample.maxUsageFraction === undefined ? undefined : clampFraction(sample.maxUsageFraction),
+      accountCount: sample.accountCount,
+      exhaustedCount: sample.exhaustedCount,
+      nextLimitWindowResetAt: sample.nextLimitWindowResetAt,
+    };
+    points.push(point);
+
+    const startedBy = poolSegmentBreak(previous, point, maxSampleGapMs);
+    const current = segments.at(-1);
+    if (startedBy === undefined && current) {
+      current.points.push(point);
+      if (point.nextLimitWindowResetAt !== undefined) current.nextLimitWindowResetAt = point.nextLimitWindowResetAt;
+    } else {
+      segments.push({
+        points: [point],
+        nextLimitWindowResetAt: point.nextLimitWindowResetAt,
+        startedBy: startedBy ?? "initial",
+      });
+    }
+    previous = point;
+  }
+
+  const lastSample = entry.samples.at(-1);
+  return {
+    hostId: entry.hostId,
+    points,
+    segments,
+    currentSegment: segments.at(-1),
+    latestAt: lastSample?.at ?? 0,
+    accountCount: lastSample?.accountCount ?? 0,
+    exhaustedCount: lastSample?.exhaustedCount ?? 0,
+  };
+}
+
+/** `undefined` when `point` continues `previous`'s segment. Mirrors
+ * {@link segmentBreak}, reading the pool's peak usage where that reads one
+ * account's `usage_fraction`. */
+function poolSegmentBreak(
+  previous: PoolBurnPoint | undefined,
+  point: PoolBurnPoint,
+  maxSampleGapMs: number,
+): PoolBurnSegment["startedBy"] | undefined {
+  if (previous === undefined) return "initial";
+  if (point.at - previous.at > maxSampleGapMs) return "gap";
+  if (
+    previous.maxUsageFraction !== undefined &&
+    point.maxUsageFraction !== undefined &&
+    previous.maxUsageFraction - point.maxUsageFraction > USAGE_DROP_EPSILON
+  ) {
+    return "window-reset";
+  }
+  if (
+    previous.nextLimitWindowResetAt !== undefined &&
+    point.nextLimitWindowResetAt !== undefined &&
+    point.nextLimitWindowResetAt > previous.nextLimitWindowResetAt
+  ) {
+    return "window-reset";
   }
   return undefined;
 }

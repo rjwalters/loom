@@ -1,8 +1,8 @@
 import { beforeEach, describe, expect, it } from "vitest";
 
-import { buildBurnCurves } from "../src/analytics/burn.js";
-import { parseTokenSamples } from "../src/analytics/parse.js";
-import { HOUR, MINUTE, T0, at, newestFirst, resetIds, tokensSnapshot } from "./analyticsFixtures.js";
+import { buildBurnCurves, buildPoolBurnCurves } from "../src/analytics/burn.js";
+import { parsePoolSamples, parseTokenSamples } from "../src/analytics/parse.js";
+import { HOUR, MINUTE, T0, at, newestFirst, poolTokensSnapshot, resetIds, tokensSnapshot } from "./analyticsFixtures.js";
 
 beforeEach(resetIds);
 
@@ -133,5 +133,83 @@ describe("buildBurnCurves", () => {
       parseTokenSamples([tokensSnapshot(T0, [{ account: "agent-1", usage: 1.4 }])]),
     );
     expect(curves[0]?.points[0]?.usageFraction).toBe(1);
+  });
+});
+
+describe("buildPoolBurnCurves", () => {
+  it("builds one chronological curve per host from the aggregate shape", () => {
+    const curves = buildPoolBurnCurves(
+      parsePoolSamples(
+        newestFirst([
+          poolTokensSnapshot(T0, { accountCount: 5, exhaustedCount: 1, meanUsage: 0.2, maxUsage: 0.5 }),
+          poolTokensSnapshot(T0 + 10 * MINUTE, { accountCount: 5, exhaustedCount: 1, meanUsage: 0.25, maxUsage: 0.55 }),
+        ]),
+      ),
+    );
+
+    expect(curves.map((curve) => curve.hostId)).toEqual(["host-a"]);
+    expect(curves[0]?.points.map((point) => point.meanUsageFraction)).toEqual([0.2, 0.25]);
+    expect(curves[0]?.points.map((point) => point.maxUsageFraction)).toEqual([0.5, 0.55]);
+    expect(curves[0]?.segments).toHaveLength(1);
+    expect(curves[0]?.currentSegment?.startedBy).toBe("initial");
+    expect(curves[0]?.accountCount).toBe(5);
+    expect(curves[0]?.exhaustedCount).toBe(1);
+  });
+
+  it("keeps each host as a separate curve, ordered by hostId", () => {
+    const curves = buildPoolBurnCurves(
+      parsePoolSamples([
+        poolTokensSnapshot(T0, { accountCount: 3, maxUsage: 0.4 }, "host-b"),
+        poolTokensSnapshot(T0, { accountCount: 8, maxUsage: 0.9 }, "host-a"),
+      ]),
+    );
+    expect(curves.map((curve) => curve.hostId)).toEqual(["host-a", "host-b"]);
+  });
+
+  it("starts a new segment at a rollover (peak usage drops)", () => {
+    const curves = buildPoolBurnCurves(
+      parsePoolSamples([
+        poolTokensSnapshot(T0, { accountCount: 4, maxUsage: 0.8, nextResetAt: T0 + HOUR }),
+        poolTokensSnapshot(T0 + 30 * MINUTE, { accountCount: 4, maxUsage: 0.95, nextResetAt: T0 + HOUR }),
+        poolTokensSnapshot(T0 + 70 * MINUTE, { accountCount: 4, maxUsage: 0.05, nextResetAt: T0 + 6 * HOUR }),
+      ]),
+    );
+
+    const curve = at(curves, 0);
+    expect(curve.segments).toHaveLength(2);
+    expect(curve.segments[1]?.startedBy).toBe("window-reset");
+    expect(curve.currentSegment?.points.map((point) => point.maxUsageFraction)).toEqual([0.05]);
+  });
+
+  it("breaks the series across a telemetry gap rather than interpolating it", () => {
+    const curves = buildPoolBurnCurves(
+      parsePoolSamples([
+        poolTokensSnapshot(T0, { accountCount: 4, maxUsage: 0.1 }),
+        poolTokensSnapshot(T0 + 5 * HOUR, { accountCount: 4, maxUsage: 0.6 }),
+      ]),
+    );
+    expect(curves[0]?.segments.map((segment) => segment.startedBy)).toEqual(["initial", "gap"]);
+  });
+
+  it("drops a sample with no usage figure from the plotted points but still tracks the newest account/exhausted counts", () => {
+    const curves = buildPoolBurnCurves(
+      parsePoolSamples([
+        poolTokensSnapshot(T0, { accountCount: 4, exhaustedCount: 0, maxUsage: 0.5 }),
+        poolTokensSnapshot(T0 + 10 * MINUTE, { accountCount: 4, exhaustedCount: 2 }),
+      ]),
+    );
+
+    expect(curves[0]?.points).toHaveLength(1);
+    expect(curves[0]?.exhaustedCount).toBe(2);
+    expect(curves[0]?.accountCount).toBe(4);
+    expect(curves[0]?.latestAt).toBe(T0 + 10 * MINUTE);
+  });
+
+  it("honours a caller-supplied gap tolerance", () => {
+    const samples = parsePoolSamples([
+      poolTokensSnapshot(T0, { accountCount: 2, maxUsage: 0.1 }),
+      poolTokensSnapshot(T0 + 5 * HOUR, { accountCount: 2, maxUsage: 0.6 }),
+    ]);
+    expect(buildPoolBurnCurves(samples, { maxSampleGapMs: 6 * HOUR })[0]?.segments).toHaveLength(1);
   });
 });

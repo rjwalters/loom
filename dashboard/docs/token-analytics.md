@@ -81,50 +81,76 @@ tests at and around their boundaries.
   footnote under the table exists so a reader can see which they are looking
   at.
 
-## 2. Public-exposure decision: authenticated surface only
+## 2. Public-exposure decision: pool-level aggregate, not per-account detail
 
-**Decision: the token/cost analytics render on the authenticated route only.**
+**Original decision (issue #4752, pre-#4795):** the token/cost analytics
+rendered on the authenticated route only — the whole panel was withheld from
+the public surface.
 
-Phase 2's redaction policy ([`../src/redaction.ts`](../src/redaction.ts))
-passes `tokens.snapshot` through **unredacted on both `/api` and `/public`** —
-the kind has no `repo` to key visibility off, so the private/public split has
-nothing to act on. That remains correct backend behavior and **this issue
-changes nothing in `redaction.ts`**. But "the API returns it" is not "the page
-should show it", and this is where that distinction is drawn:
+**Current decision (2026-07-31, issue #4847): the signed-in dashboard shows
+per-account token detail; the public view shows pool-level aggregate stats
+instead of a withheld notice.** Phase 2's redaction policy
+([`../src/redaction.ts`](../src/redaction.ts)) already drew the line this
+panel now follows: `/public/history`'s `tokens.snapshot` carries no
+`accounts[]` at all — `deriveTokenPoolAggregate` replaces it with a
+non-identifying `account_count` / `exhausted_count` / `mean_usage_fraction` /
+`max_usage_fraction` / `next_limit_window_reset_at` summary. A public render
+built from that shape can never surface an account identifier; the work this
+issue added was a **new pool-level computation** (a burn series over the
+aggregate, segmented at rollovers the same way the per-account curves are —
+see [`web/src/analytics/burn.ts`](../web/src/analytics/burn.ts)'s
+`buildPoolBurnCurves`), not a redaction change.
+
+What still does **not** render publicly, and why:
 
 1. **Per-repo attribution is a repo-name table by construction.** Its entire
    output is "which repositories consumed the fleet's quota" — and repo names
    are precisely what Phase 2 strips from `/public/history` for
    private-visibility sweeps. Publishing this panel would reconstruct, by
-   inference from timing, the exact fact the redaction layer removes.
-2. **Account identifiers are operator infrastructure.** `agent-3` +
-   `usage_fraction` + `limit_window_reset_at` is a live capacity map of the
-   operator's account pool: how many accounts exist, which are near their cap,
-   and when each recovers.
-3. **Exhaustion forecasts are a scheduling signal.** "This fleet runs dry in 40
-   minutes" should be a deliberate publication choice, not a side effect of
-   which route happens to permit it.
+   inference from timing, the exact fact the redaction layer removes. Also
+   noted in [`render.ts`](../web/src/analytics/render.ts)'s module doc:
+   attributing usage to time windows can reconstruct private-sweep timing by
+   inference even without repo names — a second, independent reason both the
+   table and the sweep-window join stay behind the Access gate.
+2. **Per-account exhaustion forecasts are a scheduling signal keyed to an
+   identity.** "This fleet runs dry in 40 minutes" is one thing; "*agent-3*
+   runs dry in 40 minutes" ties that to operator infrastructure. The
+   pool-level summary reports the same risk signal (`exhausted_count`,
+   `max_usage_fraction`) without naming which account it is — and,
+   deliberately, without projecting an ETA from it either: a pool-wide mean
+   can sit comfortably mid-range while one account is a sample away from
+   exhaustion, so a trend line through the mean would be actively misleading.
+   See [`web/src/analytics/forecast.ts`](../web/src/analytics/forecast.ts)'s
+   `summarizePoolHealth`.
 
 ### How it is enforced
 
-Two independent UI-layer points, neither of which is a redaction change:
+Two independent points, neither of which is a redaction change:
 
 - [`web/src/analytics/render.ts`](../web/src/analytics/render.ts) —
-  `renderTokenAnalytics` / `mountTokenAnalytics` refuse to render on a
-  `"public"` surface and show a short "withheld" notice instead. On the public
-  surface `mountTokenAnalytics` **makes no request at all**; it does not fetch
-  and then hide.
-- [`web/src/analytics/api.ts`](../web/src/analytics/api.ts) — the fetch prefix
-  is the constant `/api`, not a parameter, so the view cannot be repointed at
-  `/public` by configuration.
+  `renderTokenAnalytics` renders the pool-level burn/health blocks on a
+  `"public"` surface (never the per-account burn curves, forecast table, or
+  attribution table), with a short notice naming only the two blocks that
+  stay operator-only.
+- [`web/src/analytics/api.ts`](../web/src/analytics/api.ts) — `fetchHistory`'s
+  `surface` option selects `/api/history` or `/public/history` explicitly;
+  `mountTokenAnalytics` always passes the same surface it renders with, so a
+  public render can only ever have requested `/public`. Even if a caller got
+  that wrong, the backend does not trust the client's choice of prefix:
+  `/public/history` redacts `tokens.snapshot` down to the aggregate
+  server-side regardless, so per-account detail cannot reach the browser
+  through this path no matter which surface a caller asks for.
 
-The surface itself is derived from the served path
-(`bootstrap.ts`'s `surfaceFromPath`), mirroring the backend's own route-based
-auth split — so a link cannot talk the panel into rendering publicly.
+The surface itself is derived from the server-injected auth state
+(`bootstrap.ts`'s `currentSurface`, issue #4795), mirroring the backend's own
+route-based auth split — so a link cannot talk the panel into requesting
+`/api` publicly.
 
 ### Coordination with the public view page (#4753)
 
-The public page should **not** embed these widgets. If a public capacity
-summary is wanted later, the right shape is a purpose-built aggregate (e.g.
-"fleet capacity: healthy / degraded") carrying no account names, no repo names,
-and no per-account timing — a new component, not a flag on this one.
+The public page **should** embed this panel — the pool-level burn/health
+blocks are the purpose-built, non-identifying aggregate the original
+`token-analytics.md` speculated about ("fleet capacity: healthy / degraded",
+carrying no account names, no repo names, no per-account timing). It should
+**not** embed per-repo attribution or per-account forecasts; those remain
+authenticated-only per the decision above.

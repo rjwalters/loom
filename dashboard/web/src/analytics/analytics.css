@@ -144,6 +144,15 @@
   stroke: var(--analytics-danger);
 }
 
+/* The pool-level card (public surface, #4847) draws two lines: peak usage
+ * (solid, the default `.sparkline__line`) and mean usage (dashed, muted) —
+ * distinguishable without relying on the exhausted-only red/green pairing
+ * above, which this second line does not participate in. */
+.sparkline__line--mean {
+  stroke: var(--analytics-muted);
+  stroke-dasharray: 3 2;
+}
+
 /* --- Tables -------------------------------------------------------------- */
 
 .table {

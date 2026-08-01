@@ -45,6 +45,24 @@ export interface TokensSnapshotPayload {
   accounts?: TokenAccountPayload[];
 }
 
+/**
+ * The shape `/public/history` sends in place of `TokensSnapshotPayload`'s
+ * `accounts` array (`../../src/redaction.ts`'s `deriveTokenPoolAggregate`,
+ * documented in `../../docs/query-api.md`'s "GET /api/history /
+ * /public/history" section). Non-identifying by construction: it names no
+ * account, only how loaded the pool is as a whole (issue #4847).
+ */
+export interface TokenPoolAggregatePayload {
+  kind?: string;
+  captured_at?: string;
+  account_count?: number;
+  exhausted_count?: number;
+  /** `null` — never `0` — when no account reported a `usage_fraction`. */
+  mean_usage_fraction?: number | null;
+  max_usage_fraction?: number | null;
+  next_limit_window_reset_at?: string | null;
+}
+
 /** The subset of the `HistoryRecord` envelope this view reads. Fields the
  * backend nulls for a redacted record (`repo`, `issue`, `sweepId`) are
  * `null`-able here for exactly that reason. */
@@ -84,6 +102,24 @@ export interface AccountReading {
   /** Epoch ms of `limit_window_reset_at`, when known. */
   limitWindowResetAt?: number;
   exhausted: boolean;
+}
+
+/** One `tokens.snapshot` narrowed from {@link TokenPoolAggregatePayload}: a
+ * host, an instant, and the pool-wide stats — no account identity anywhere.
+ * The public-surface counterpart of {@link TokenSample} (issue #4847). */
+export interface PoolSample {
+  hostId: string;
+  /** Epoch ms — same fallback rule as {@link TokenSample.at}. */
+  at: number;
+  accountCount: number;
+  exhaustedCount: number;
+  /** Mean/peak `usage_fraction` across the accounts that reported one.
+   * Absent — never `0` — when none did. */
+  meanUsageFraction?: number;
+  maxUsageFraction?: number;
+  /** Epoch ms of the earliest limit-window reset across the pool, when any
+   * account reported one. */
+  nextLimitWindowResetAt?: number;
 }
 
 /** A sweep's active window, reconstructed from its lifecycle records. This is

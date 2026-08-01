@@ -1,8 +1,25 @@
 import { beforeEach, describe, expect, it } from "vitest";
 
-import { parseSweepWindows, parseTimestamp, parseTokenSample, parseTokenSamples } from "../src/analytics/parse.js";
+import {
+  parsePoolSample,
+  parsePoolSamples,
+  parseSweepWindows,
+  parseTimestamp,
+  parseTokenSample,
+  parseTokenSamples,
+} from "../src/analytics/parse.js";
 import type { HistoryEnvelope } from "../src/analytics/types.js";
-import { HOUR, MINUTE, T0, at, newestFirst, resetIds, sweepRecords, tokensSnapshot } from "./analyticsFixtures.js";
+import {
+  HOUR,
+  MINUTE,
+  T0,
+  at,
+  newestFirst,
+  poolTokensSnapshot,
+  resetIds,
+  sweepRecords,
+  tokensSnapshot,
+} from "./analyticsFixtures.js";
 
 beforeEach(resetIds);
 
@@ -74,6 +91,75 @@ describe("parseTokenSamples", () => {
       tokensSnapshot(T0 + 2 * MINUTE, [{ account: "agent-1", usage: 0.3 }]),
     ]);
     expect(parseTokenSamples(records).map((sample) => sample.at)).toEqual([T0, T0 + MINUTE, T0 + 2 * MINUTE]);
+  });
+});
+
+describe("parsePoolSample", () => {
+  it("narrows a documented /public/history aggregate payload", () => {
+    const sample = parsePoolSample(
+      poolTokensSnapshot(T0, { accountCount: 13, exhaustedCount: 5, meanUsage: 0.3246, maxUsage: 0.91, nextResetAt: T0 + 6 * HOUR }),
+    );
+
+    expect(sample).toEqual({
+      hostId: "host-a",
+      at: T0,
+      accountCount: 13,
+      exhaustedCount: 5,
+      meanUsageFraction: 0.3246,
+      maxUsageFraction: 0.91,
+      nextLimitWindowResetAt: T0 + 6 * HOUR,
+    });
+  });
+
+  it("keeps null mean/max/reset absent rather than zero", () => {
+    const sample = parsePoolSample(poolTokensSnapshot(T0, { accountCount: 3 }));
+    expect(sample?.meanUsageFraction).toBeUndefined();
+    expect(sample?.maxUsageFraction).toBeUndefined();
+    expect(sample?.nextLimitWindowResetAt).toBeUndefined();
+    expect(sample?.exhaustedCount).toBe(0);
+  });
+
+  it("ignores the per-account shape — it is not the aggregate one", () => {
+    const envelope = tokensSnapshot(T0, [{ account: "agent-1", usage: 0.1 }]);
+    expect(parsePoolSample(envelope)).toBeUndefined();
+  });
+
+  it("ignores non-tokens.snapshot kinds", () => {
+    expect(parsePoolSample(at(sweepRecords({ sweepId: "s1", repo: "o/r", startedAt: T0 }), 0))).toBeUndefined();
+  });
+
+  it("falls back to emittedAt when captured_at is missing", () => {
+    const envelope = poolTokensSnapshot(T0, { accountCount: 1 });
+    delete (envelope.record as Record<string, unknown>).captured_at;
+    expect(parsePoolSample(envelope)?.at).toBe(T0);
+  });
+
+  it("returns undefined for a malformed account_count", () => {
+    const envelope = poolTokensSnapshot(T0, { accountCount: 1 });
+    (envelope.record as Record<string, unknown>).account_count = "nope";
+    expect(parsePoolSample(envelope)).toBeUndefined();
+  });
+
+  it("treats account_count: 0 as a valid, empty aggregate — not malformed", () => {
+    const sample = parsePoolSample(poolTokensSnapshot(T0, { accountCount: 0 }));
+    expect(sample?.accountCount).toBe(0);
+    expect(sample?.exhaustedCount).toBe(0);
+  });
+});
+
+describe("parsePoolSamples", () => {
+  it("returns chronological order even from the API's newest-first pages", () => {
+    const records = newestFirst([
+      poolTokensSnapshot(T0, { accountCount: 2, meanUsage: 0.1 }),
+      poolTokensSnapshot(T0 + MINUTE, { accountCount: 2, meanUsage: 0.2 }),
+      poolTokensSnapshot(T0 + 2 * MINUTE, { accountCount: 2, meanUsage: 0.3 }),
+    ]);
+    expect(parsePoolSamples(records).map((sample) => sample.at)).toEqual([T0, T0 + MINUTE, T0 + 2 * MINUTE]);
+  });
+
+  it("does not pick up per-account-shaped records from a mixed page", () => {
+    const records = [tokensSnapshot(T0, [{ account: "agent-1", usage: 0.1 }]), poolTokensSnapshot(T0 + MINUTE, { accountCount: 4 })];
+    expect(parsePoolSamples(records)).toHaveLength(1);
   });
 });
 
