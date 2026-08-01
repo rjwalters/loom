@@ -1762,7 +1762,11 @@ dynamic_cap = min(healthy-token count × per-token concurrency, disk headroom, c
 from live inputs, so pool/disk/backlog changes are honored without a daemon
 restart. A fourth **cpu/load headroom** term sat in this `min(...)` from #3978
 until **#4512 deleted it** — see [Why there is no CPU term in
-admission](#why-there-is-no-cpu-term-in-admission-4512) below.
+admission](#why-there-is-no-cpu-term-in-admission-4512) below. There is still no
+CPU term in the cap; since #4903 a separate
+[saturation admission brake](#saturation-admission-brake-4903) can *hold* new
+admissions when the host is measurably saturated, without resizing the cap or
+touching running work.
 
 | Input | Source | Bound it enforces |
 |-------|--------|-------------------|
@@ -1811,7 +1815,10 @@ actually is**:
 The **host-distress circuit breaker** (#4235) is unchanged and is what makes a
 hand-tuned knob safe to raise: a mis-set `maxConcurrent` trips a **measured**
 breaker (load-per-core), instead of melting the host on the strength of a
-mis-estimated constant.
+mis-estimated constant. #4903 added a third guard on the same measured signal —
+the point-in-time [saturation admission brake](#saturation-admission-brake-4903)
+— after a CPU-heavy (analog-simulation) workload reached 12× overcommit on a
+host whose `maxConcurrent` was never set.
 
 `cpu_headroom.rs` survives as a pure **measurement** module — logical core
 count, load average, measured idle fraction, and the `is_host_saturated`
@@ -1881,6 +1888,108 @@ daemon path while silently ignoring it on the sweep path — worse than today's
 consistent env-only behavior. Wiring the Bash `config-resolver.sh` into
 `disk-headroom.sh` too is a separate, larger change; file a follow-up if that
 cost is judged worth paying.
+
+#### Saturation admission brake (#4903)
+
+Deleting the CPU term left admission with **no term that reads the host at
+all**. That is correct for the workload #4512 measured, and wrong for a workload
+it did not anticipate. `loom-worker-1` (8 vCPU) was observed at **load average
+95** — `11.9` load/core, `0.07%` idle — from only **three** in-flight sweeps,
+because all three were analog-simulation repos (`gf180-*`) that had spawned 16
+`ngspice` processes between them. SPICE simulation is sustained CPU for tens of
+minutes, not API-wait, so for those repos a sweep is closer to a build than to a
+conversation. The daemon *measured* the saturation (`loadavg_1m` and
+`cpu_idle_fraction` are both in the dispatch headroom report) and did not act on
+it: `capacity_bound: false`, cap `12`, nine more slots nominally free.
+
+The fix is a **brake on admission, not a return to CPU-based sizing**. Once per
+work-finder tick the daemon asks `cpu_headroom::is_host_saturated` — the same
+predicate the build gate's load-aware deferral uses — whether load-per-core is
+at/over a hold threshold, and if so it **holds new admissions** for that tick
+and re-checks on the next one. It does not resize the cap, does not estimate
+per-sweep cores, and **never** touches work that is already running.
+
+| | Value |
+|---|---|
+| Config | `autonomous.workFinder.saturationBrake.enabled` / `.loadPerCoreHold` |
+| Env | `LOOM_ADMISSION_BRAKE` / `LOOM_ADMISSION_BRAKE_LOAD_PER_CORE` |
+| Default | **on**, hold at **4.0** load/core |
+| Precedence | env > config > default, resolved once at daemon startup |
+
+Properties that are load-bearing (and are pinned by tests):
+
+- **In-flight sweeps are never killed or preempted.** The brake is applied only
+  where *new* candidates are admitted, immediately before the concurrency-cap
+  check; it has no path to the reaper or to any running child. A held tick
+  dispatches nothing and returns, and the running sweeps drain normally — which
+  is precisely how the host recovers.
+- **A healthy host is unchanged.** Below the threshold the admission path is
+  byte-for-byte the pre-#4903 one, so an idle 8-core host still reaches its
+  configured cap. `4.0` is deliberately generous: a busy-but-fine host sits under
+  `1.0`, and the incident that motivated the brake was at `11.9`.
+- **Fail-safe on missing data.** No load-average source (or a zero CPU count)
+  ⇒ no hold. Absent evidence is never treated as load.
+- **Nothing latches.** The hold is re-evaluated every tick and releases the
+  moment load drops back under the threshold.
+
+**How this differs from the host-distress circuit breaker (#4235)** — the two
+read the same normalized ratio and are complements, not duplicates:
+
+| | Admission brake (#4903) | Host breaker (#4235) |
+|---|---|---|
+| Nature | point-in-time: one reading, one decision | stateful: trips only after N consecutive over-threshold ticks |
+| Default threshold | `4.0` load/core | `2.5` load/core |
+| Release | immediate, first tick under the line | after a 5-minute cool-down |
+| Explicit `dispatch_sweep` | never blocks it | hard-blocks unless `force` |
+| Purpose | stop *adding* to a full host | remember a *meltdown* so a load dip cannot re-admit a whole wave |
+
+The brake's threshold sits *above* the breaker's on purpose: it decides from a
+single reading, so it must be sure, whereas the breaker's lower bar is paid for
+by requiring the load to be sustained.
+
+**Visibility.** `loom-daemon status` prints an `Admission brake:` line
+(`HOLDING …` / `OK …` / `disabled`), `--json` carries an `admission_brake`
+object, and while the brake is holding the capacity block's
+"not capacity-bound … the limiter is work availability" line is **replaced** by
+an `⚠ ADMISSION BRAKE HOLDING` line naming the host as the limiter. Per-tick
+deferrals are counted as `deferred (host saturated)` in the work-finder tick log
+and as `deferred-saturation` in `loom-daemon health`. A host holding back says
+so; it no longer reads as idle.
+
+#### Sizing `maxConcurrent`: per-machine **and** per-workload (#4512, #4903)
+
+`autonomous.workFinder.maxConcurrent` is the only *policy* term in the cap, and
+it is **not** a fleet-wide constant. It is a property of one machine **running
+one kind of work**. Two hosts with identical core counts want very different
+values, and the same host wants a different value if you move a different repo
+onto it:
+
+| Workload | What a sweep actually does | Reasonable `maxConcurrent` on 8 cores |
+|---|---|---|
+| **Software repos** (Loom itself, most product repos) | Dominated by API-wait — curator/builder/judge conversations. The heavy phases (release builds, full test suites, the build gate) are a small fraction of wall-clock, and they already serialize on the [machine-wide build slot](#machine-wide-build-slot-4512). | **10+** — the host sits mostly idle at lower values (#4512 measured 95% idle at a cap of 2) |
+| **Analog / simulation repos** (`gf180-*` running `ngspice`) | Dominated by sustained CPU — one sweep spawns ~5 simulator processes, each near 50% of a core, for tens of minutes. A sweep here is closer to a build than to a conversation. | **2–3** — at 12 the host reaches 12× overcommit and every sweep's simulations contend, so wall-clock per sweep grows faster than concurrency adds |
+
+Consequences worth internalizing:
+
+- **Unset is not "safe".** An unset `maxConcurrent` contributes a *default*, not
+  an operator's judgement — which is exactly the input #4512's design depends on.
+  The `loom-worker-1` incident happened on a host where it was never set.
+- **Set it per machine, on the machine.** A repo's committed `.loom/config.json`
+  is shared by every host that clones it; the per-machine value belongs in the
+  machine-level tier (`~/.local/share/loom/config/defaults.json`) or in
+  `.loom/config.local.json`, which is why the resolver merges four tiers.
+- **Mixed hosts size to the heaviest tenant.** If analog and software repos share
+  a host, one sweep is not one unit of load — tune down to what the heavy repo
+  needs (per-repo weighting is deliberately *not* implemented; see #4903).
+- **Throughput inverts past the knee.** Beyond the point where sweeps contend,
+  adding concurrency makes everything slower. Raise the knob only while
+  `loom-daemon status` shows the ceiling binding *and* the host measurably idle
+  — that is exactly the pair
+  [`loom-daemon calibrate`](#sizing-a-host-loom-daemon-calibrate-4390-measurement-only-since-4512)
+  reports.
+- **The brake is a backstop, not a substitute.** A correctly-tuned
+  `maxConcurrent` should mean the saturation brake never engages. If it *is*
+  engaging, that is the signal to lower the knob for this machine's workload.
 
 #### Machine-wide build slot (#4512)
 
@@ -2436,8 +2545,10 @@ exactly like `main_health_gate::read_build_gate_config`.
 | `autonomous.model` | *(per-dispatch `dispatch_sweep` `model` param)* | `sonnet` | Model pinned on **every** daemon-dispatched child (work-finder, epic supervisor, and `dispatch_sweep` when its `model` param is absent). See below (#3944) |
 | `autonomous.workFinder.enabled` | `LOOM_WORK_FINDER` | `false` | Master on/off for the finder loop |
 | `autonomous.workFinder.intervalSecs` | `LOOM_WORK_FINDER_INTERVAL_SECS` | `60` | Zero/invalid → default |
-| `autonomous.workFinder.maxConcurrent` | `LOOM_WORK_FINDER_MAX_CONCURRENT` | `3` | **The** per-machine admission knob since #4512 — an operator ceiling, not a fixed target, tuned empirically from `loom-daemon calibrate` / `status`. Expect well above the shipped default on an API-bound worker (10+ on 8 cores) |
+| `autonomous.workFinder.maxConcurrent` | `LOOM_WORK_FINDER_MAX_CONCURRENT` | `3` | **The** per-machine admission knob since #4512 — an operator ceiling, not a fixed target, tuned empirically from `loom-daemon calibrate` / `status`. Per-machine **and workload-dependent** (#4903): ~10+ on an 8-core API-bound (software) worker, but **2–3** on the same 8 cores running analog/simulation sweeps. See [Sizing `maxConcurrent`](#sizing-maxconcurrent-per-machine-and-per-workload-4512-4903) below |
 | `autonomous.workFinder.maxAdmissionsPerTick` | `LOOM_WORK_FINDER_MAX_ADMISSIONS_PER_TICK` | `3` | Per-tick **ramp** cap (#4234) — bounds how many *new* sweeps one tick may admit, independent of `maxConcurrent`/the live dynamic cap. Zero/invalid → default; resolved once at startup, mirroring `maxConcurrent`. See [Per-tick admission (ramp) cap](#per-tick-admission-ramp-cap-4234) below |
+| `autonomous.workFinder.saturationBrake.enabled` | `LOOM_ADMISSION_BRAKE` | `true` | Saturation admission brake on/off (#4903). A safety backstop — **defaults on**. Holds *new* admissions while the host is already saturated; never preempts a running sweep. Env truthy (`1`/`true`/`yes`/`on`) enables, any other value disables; wins over config. See [Saturation admission brake](#saturation-admission-brake-4903) below |
+| `autonomous.workFinder.saturationBrake.loadPerCoreHold` | `LOOM_ADMISSION_BRAKE_LOAD_PER_CORE` | `4.0` | Load-per-core at/over which new admissions are held for that tick. `<= 0`/invalid → default. Deliberately above the host breaker's `2.5` trip: the brake decides from a single reading, the breaker from sustained ticks |
 | `autonomous.workFinder.quarantine.enabled` | `LOOM_WORK_FINDER_QUARANTINE` | `true` | Insta-crash quarantine on/off (#3939). A safety backstop — defaults on |
 | `autonomous.workFinder.quarantine.threshold` | `LOOM_WORK_FINDER_QUARANTINE_THRESHOLD` | `3` | Consecutive insta-crashes before an issue is quarantined. Zero/invalid → default |
 | `autonomous.workFinder.quarantine.ttlSecs` | `LOOM_WORK_FINDER_QUARANTINE_TTL_SECS` | `3600` | How long a quarantine entry persists before auto-release. Zero/invalid → default |

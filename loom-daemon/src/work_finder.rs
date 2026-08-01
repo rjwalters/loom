@@ -56,6 +56,18 @@
 //! makes a hand-tuned ceiling safe: a mis-set knob trips a **measured** breaker
 //! instead of melting the host.
 //!
+//! **#4903 added a saturation brake on *admission* (not on the cap).** Removing
+//! the CPU term left the cap with no term that reads the host at all, so a
+//! CPU-heavy workload (analog simulation: minutes of sustained `ngspice`, not
+//! API-wait) could drive an 8-core worker to 12× overcommit while the daemon
+//! still believed it had nine free slots. [`crate::admission_brake`] closes that
+//! without resurrecting the formula: once per tick it asks
+//! [`crate::cpu_headroom::is_host_saturated`] at a generous default of `4.0`
+//! load/core and, when the answer is yes, holds **new** admissions
+//! ([`TickReport::deferred_saturation`]) until the host recovers. In-flight
+//! sweeps are never touched, and a healthy host's behavior is byte-for-byte
+//! unchanged.
+//!
 //! # Idempotency & fail-safe
 //!
 //! The finder never reimplements the claim/label/dedup machinery — it reuses
@@ -555,8 +567,10 @@ pub fn publish_tick_summary_at(
         skipped_backoff: report.skipped_backoff,
         deferred_capacity: report.deferred_capacity,
         deferred_ramp_cap: report.deferred_ramp_cap,
+        deferred_saturation: report.deferred_saturation,
         errors: report.errors,
         halted: report.halted,
+        saturation_held: report.saturation_held,
     };
     *last_tick_slot()
         .lock()
@@ -616,6 +630,17 @@ pub struct TickReport {
     /// cap deliberately smooths *how fast* new sweeps are admitted rather than
     /// how many may run concurrently. See [`WORK_FINDER_MAX_ADMISSIONS_PER_TICK_ENV`].
     pub deferred_ramp_cap: usize,
+    /// Issues deferred to a future tick because the **saturation admission
+    /// brake** (#4903, [`crate::admission_brake`]) held new admissions: the host
+    /// is already at/over the configured load-per-core hold threshold, so adding
+    /// work would only slow the sweeps already running.
+    ///
+    /// Deliberately its own counter, not folded into
+    /// [`deferred_capacity`](Self::deferred_capacity): the concurrency cap was
+    /// *not* reached — the host was. Conflating them would report a token/disk
+    /// shortage on a machine whose only problem is that it is already full, and
+    /// send an operator to raise a knob that is not binding.
+    pub deferred_saturation: usize,
     /// Issues skipped because they are quarantined for repeated insta-crashing
     /// (Issue #3939). Filtered out before the concurrency budget is allocated, so
     /// a quarantined candidate never consumes a shared dispatch slot.
@@ -662,6 +687,14 @@ pub struct TickReport {
     /// flags the gate writes (#3974 AC3), so this can never disagree with what
     /// the gate loop reports — including when a repo's forge query fails.
     pub halted: bool,
+    /// True when the saturation admission brake (#4903) was engaged for this
+    /// tick. Reported separately from
+    /// [`deferred_saturation`](Self::deferred_saturation) so "the host was
+    /// holding" is visible even when the backlog was empty and nothing was
+    /// deferred — otherwise a saturated host with no queued work is
+    /// indistinguishable from a healthy idle one, which is the exact reporting
+    /// gap #4903 was filed on.
+    pub saturation_held: bool,
 }
 
 /// Run one work-finder tick: fetch ready issues, filter, and dispatch up to the
@@ -723,9 +756,65 @@ pub fn tick_with_admission_cap(
     halted: bool,
     max_admissions_per_tick: usize,
 ) -> Result<TickReport> {
+    tick_with_saturation_brake(
+        source,
+        dispatcher,
+        max_concurrent,
+        halted,
+        max_admissions_per_tick,
+        false,
+    )
+}
+
+/// Like [`tick_with_admission_cap`], but additionally honors the **saturation
+/// admission brake** (#4903, [`crate::admission_brake`]): when
+/// `saturation_held` is `true` the host is already at/over its load-per-core
+/// hold threshold, so this tick admits **no new sweeps** and attributes every
+/// otherwise-eligible candidate to [`TickReport::deferred_saturation`].
+/// `false` (what [`tick_with_admission_cap`] passes) reduces to the pre-#4903
+/// behavior byte-for-byte.
+///
+/// Three properties are load-bearing, and each maps to an acceptance criterion
+/// of #4903:
+///
+/// 1. **In-flight sweeps are never touched.** The brake is applied *inside the
+///    candidate loop*, which only ever visits ready `loom:issue` rows that are
+///    not already in flight. There is no branch here — and no path from this
+///    module — that cancels, signals, or reaps a running sweep. A held tick
+///    simply dispatches nothing and returns, and the running sweeps drain
+///    normally, which is how the host recovers.
+/// 2. **The hold is re-evaluated every tick.** Nothing latches: the caller
+///    re-samples load each tick and passes a fresh `saturation_held`, so the
+///    moment the host drops back under the threshold admissions resume (the
+///    sticky, cool-down-bearing guard is the host breaker, #4235 — deliberately
+///    a different mechanism).
+/// 3. **A healthy host is unchanged.** With `saturation_held = false` this
+///    function is the pre-#4903 code path exactly, so an idle 8-core host still
+///    fills its configured cap — no re-introduction of the over-throttling
+///    #4512 removed.
+///
+/// The check sits **before** the concurrency-cap check so a saturated host
+/// reports `deferred-saturation`, not a misleading `deferred-capacity` (the cap
+/// was not reached; the host was).
+///
+/// # Errors
+///
+/// Same as [`tick`].
+pub fn tick_with_saturation_brake(
+    source: &mut impl WorkSource,
+    dispatcher: &mut impl WorkDispatcher,
+    max_concurrent: usize,
+    halted: bool,
+    max_admissions_per_tick: usize,
+    saturation_held: bool,
+) -> Result<TickReport> {
     let ready = source.list_ready_issues()?;
     let mut report = TickReport {
         seen: ready.len(),
+        // Record the brake's engagement even on a tick that defers nothing, so a
+        // saturated host with an empty backlog still reads as "holding" rather
+        // than "idle" (#4903).
+        saturation_held,
         ..TickReport::default()
     };
 
@@ -788,6 +877,16 @@ pub fn tick_with_admission_cap(
                  over safehouse (#4028)",
                 item.number
             );
+            continue;
+        }
+        // 2d. Saturation admission brake (#4903) — the host is already at/over
+        //     its load-per-core hold threshold, so hold this candidate and
+        //     re-check next tick. Checked BEFORE the concurrency cap so the
+        //     deferral is attributed to the host, not to a cap that is not
+        //     actually binding. Running sweeps are untouched: this loop only
+        //     ever sees candidates that are NOT in flight.
+        if saturation_held {
+            report.deferred_saturation += 1;
             continue;
         }
         // 3. Fixed concurrency cap — defer the rest to a future tick.
@@ -1009,9 +1108,45 @@ pub fn tick_multi_with_admission_cap<S: WorkSource, D: WorkDispatcher>(
     halted: &[bool],
     max_admissions_per_tick: usize,
 ) -> TickReport {
+    tick_multi_with_saturation_brake(
+        workspaces,
+        priorities,
+        max_concurrent,
+        halted,
+        max_admissions_per_tick,
+        false,
+    )
+}
+
+/// Like [`tick_multi_with_admission_cap`], but additionally honors the
+/// **saturation admission brake** (#4903) — the multi-workspace analogue of
+/// [`tick_with_saturation_brake`]; see it for the full rationale and the three
+/// load-bearing properties.
+///
+/// The brake is **daemon-global**, not per-root: it measures the *host*, and
+/// every workspace's sweeps run on that one host, so a single `saturation_held`
+/// flag holds admissions across every repo at once (the same shape the
+/// host-distress breaker and the scheduled drain already use). Unlike those two,
+/// it is applied in pass 2 rather than folded into the per-root `halted` slice,
+/// so its deferrals stay attributable to saturation instead of disappearing into
+/// the main-health halt.
+///
+/// `false` (what [`tick_multi_with_admission_cap`] passes) reduces to the
+/// pre-#4903 behavior byte-for-byte.
+pub fn tick_multi_with_saturation_brake<S: WorkSource, D: WorkDispatcher>(
+    workspaces: &mut [(S, D)],
+    priorities: &[u32],
+    max_concurrent: usize,
+    halted: &[bool],
+    max_admissions_per_tick: usize,
+    saturation_held: bool,
+) -> TickReport {
     use crate::workspace_registry::DEFAULT_WORKSPACE_PRIORITY;
 
-    let mut report = TickReport::default();
+    let mut report = TickReport {
+        saturation_held,
+        ..TickReport::default()
+    };
 
     // Snapshot per-workspace in-flight sets *first* (immutable borrow) so the
     // dedup filtering below always has the full in-flight view.
@@ -1147,6 +1282,13 @@ pub fn tick_multi_with_admission_cap<S: WorkSource, D: WorkDispatcher>(
     // budget in the sorted global order, routing each candidate back to its
     // owning workspace's dispatcher.
     for cand in candidates {
+        // Saturation admission brake (#4903) — daemon-global, checked before the
+        // shared cap so the deferral names the host rather than a cap that is
+        // not binding. In-flight sweeps across every workspace are untouched.
+        if saturation_held {
+            report.deferred_saturation += 1;
+            continue;
+        }
         // Shared global cap across all workspaces — defer once the combined
         // occupancy hits the budget, regardless of which workspace still has
         // ready items.
@@ -1716,12 +1858,26 @@ where
             // suppressor alongside the main-health halt flag and the gate
             // in-flight hold. See the multi-workspace loop for the full
             // rationale; when no breaker is registered these are no-ops.
+            //
+            // ONE load reading serves both the breaker and the saturation
+            // admission brake (#4903) this tick: sampling twice would let the
+            // two disagree about the host within a single tick, which is exactly
+            // the race a load-aware admission decision must not have.
+            let ncpu = crate::cpu_headroom::logical_cpu_count();
+            let loadavg_1m = crate::cpu_headroom::read_loadavg_1m();
             if let Some(breaker) = crate::host_breaker::global() {
-                let load_per_core = crate::cpu_headroom::load_per_core();
+                let load_per_core = crate::cpu_headroom::load_per_core_from(loadavg_1m, ncpu);
                 if let Some(transition) = breaker.observe(load_per_core, chrono::Utc::now()) {
                     crate::host_breaker::emit_transition_event(&event_bus, &transition);
                 }
             }
+            // Saturation admission brake (#4903): a point-in-time hold on NEW
+            // admissions while the host is already saturated. Deliberately NOT
+            // folded into `halted` — a held tick must report `deferred-saturation`
+            // (and `SATURATION-HELD` on the status surface) rather than claim the
+            // main-health gate stopped it.
+            let saturation_held =
+                crate::admission_brake::global_observe(loadavg_1m, ncpu, chrono::Utc::now());
             let halted = health_state.is_halted()
                 || (suppress_dispatch_during_gate && health_state.is_gate_in_flight())
                 || crate::host_breaker::global_is_suppressed();
@@ -1753,6 +1909,7 @@ where
                  healthy_tokens={token_limit}, per_token={per_token_concurrency}, disk={disk}, \
                  configured_max={configured_max}, \
                  max_admissions_per_tick={max_admissions_per_tick}, halted={halted}, \
+                 saturation_held={saturation_held}, \
                  observed_idle={})",
                 format_idle(idle)
             );
@@ -1762,12 +1919,13 @@ where
             } else {
                 log::debug!("{axis_line}");
             }
-            match tick_with_admission_cap(
+            match tick_with_saturation_brake(
                 &mut source,
                 &mut dispatcher,
                 max_concurrent,
                 halted,
                 max_admissions_per_tick,
+                saturation_held,
             ) {
                 Ok(report) => {
                     // Publish before any logging so `loom-daemon health` sees the
@@ -1790,6 +1948,7 @@ where
                         || report.skipped_pr_open > 0
                         || report.skipped_peer_claim > 0
                         || report.deferred_ramp_cap > 0
+                        || report.deferred_saturation > 0
                     {
                         log::info!(
                             "work_finder: tick — cap {max_concurrent} (pool={pool_size}, \
@@ -1798,7 +1957,8 @@ where
                              {} seen, {} dispatched, {} labeled-skip, {} in-flight-skip, \
                              {} quarantine-skip, {} backoff-skip, {} pr-open-skip, \
                              {} peer-claim-skip, \
-                             {} deferred (capacity), {} deferred (ramp), {} error(s), \
+                             {} deferred (capacity), {} deferred (ramp), \
+                             {} deferred (host saturated), {} error(s), \
                              {} cross-host-collision(s)",
                             report.seen,
                             report.dispatched,
@@ -1810,6 +1970,7 @@ where
                             report.skipped_peer_claim,
                             report.deferred_capacity,
                             report.deferred_ramp_cap,
+                            report.deferred_saturation,
                             report.errors,
                             report.collisions
                         );
@@ -2034,13 +2195,24 @@ pub fn spawn_multi_work_finder_task(
             // below. The load sample uses the fast, non-sleeping loadavg read (no
             // `iostat`), safe to call inline. When no breaker is registered the
             // helpers are no-ops returning `false` (zero behavior change).
+            //
+            // ONE load reading serves both the breaker and the saturation
+            // admission brake (#4903) — see the single-workspace loop for why
+            // the two must never sample separately within a tick.
+            let ncpu = crate::cpu_headroom::logical_cpu_count();
+            let loadavg_1m = crate::cpu_headroom::read_loadavg_1m();
             if let Some(breaker) = crate::host_breaker::global() {
-                let load_per_core = crate::cpu_headroom::load_per_core();
+                let load_per_core = crate::cpu_headroom::load_per_core_from(loadavg_1m, ncpu);
                 if let Some(transition) = breaker.observe(load_per_core, chrono::Utc::now()) {
                     crate::host_breaker::emit_transition_event(&event_bus, &transition);
                 }
             }
             let breaker_suppressed = crate::host_breaker::global_is_suppressed();
+            // Saturation admission brake (#4903): daemon-global (it measures the
+            // one host every workspace's sweeps run on), passed to the tick
+            // rather than OR'd into `halted` so its deferrals stay attributable.
+            let saturation_held =
+                crate::admission_brake::global_observe(loadavg_1m, ncpu, chrono::Utc::now());
             let halted: Vec<bool> = dispatch_held_per_root_with_drain(
                 &health_states,
                 &roots,
@@ -2065,6 +2237,7 @@ pub fn spawn_multi_work_finder_task(
                  healthy_tokens={token_limit}, per_token={per_token_concurrency}, disk={disk}, \
                  configured_max={configured_max}, \
                  max_admissions_per_tick={max_admissions_per_tick}, any_halted={any_halted}, \
+                 saturation_held={saturation_held}, \
                  observed_idle={}, workspaces={}, priorities={priorities:?})",
                 format_idle(idle),
                 pairs.len()
@@ -2076,12 +2249,13 @@ pub fn spawn_multi_work_finder_task(
                 log::debug!("{axis_line}");
             }
 
-            let report = tick_multi_with_admission_cap(
+            let report = tick_multi_with_saturation_brake(
                 &mut pairs,
                 &priorities,
                 max_concurrent,
                 &halted,
                 max_admissions_per_tick,
+                saturation_held,
             );
 
             // Publish before any logging so `loom-daemon health` sees the same
@@ -2107,6 +2281,7 @@ pub fn spawn_multi_work_finder_task(
                 || report.skipped_pr_open > 0
                 || report.skipped_peer_claim > 0
                 || report.deferred_ramp_cap > 0
+                || report.deferred_saturation > 0
             {
                 log::info!(
                     "work_finder: tick — cap {max_concurrent} (pool={pool_size}, \
@@ -2116,7 +2291,8 @@ pub fn spawn_multi_work_finder_task(
                      {} seen, {} dispatched, {} labeled-skip, {} in-flight-skip, \
                      {} quarantine-skip, {} backoff-skip, {} pr-open-skip, \
                      {} peer-claim-skip, \
-                     {} deferred (capacity), {} deferred (ramp), {} error(s), \
+                     {} deferred (capacity), {} deferred (ramp), \
+                     {} deferred (host saturated), {} error(s), \
                      {} cross-host-collision(s)",
                     pairs.len(),
                     report.seen,
@@ -2129,6 +2305,7 @@ pub fn spawn_multi_work_finder_task(
                     report.skipped_peer_claim,
                     report.deferred_capacity,
                     report.deferred_ramp_cap,
+                    report.deferred_saturation,
                     report.errors,
                     report.collisions
                 );
@@ -2987,6 +3164,274 @@ exit 0
         assert_eq!(report.dispatched, 0);
         assert_eq!(report.deferred_ramp_cap, 3);
         assert!(disp.dispatched.is_empty());
+    }
+
+    // ========================================================================
+    // Saturation admission brake (#4903)
+    // ========================================================================
+
+    #[test]
+    fn test_saturated_host_admits_no_new_sweeps() {
+        // AC1: a host at/over the load-per-core hold threshold admits nothing.
+        // The cap is generous (12, the value the reported worker ran with) and
+        // the backlog is deep — only the brake stops it.
+        let mut source = FakeSource::once((1..=5).map(issue).collect());
+        let mut disp = RecordingDispatcher::default();
+
+        let report =
+            tick_with_saturation_brake(&mut source, &mut disp, 12, false, usize::MAX, true)
+                .unwrap();
+
+        assert_eq!(report.dispatched, 0, "a saturated host must admit nothing");
+        assert!(disp.dispatched.is_empty());
+        assert_eq!(report.deferred_saturation, 5);
+        // Attributed to the HOST, not to a cap that was nowhere near binding —
+        // the whole point of a separate counter.
+        assert_eq!(report.deferred_capacity, 0);
+        assert_eq!(report.deferred_ramp_cap, 0);
+        assert!(report.saturation_held);
+        // Not a main-health halt: `halted` stays false so the operator log/status
+        // never blames a red main for a load hold.
+        assert!(!report.halted);
+        assert_eq!(report.seen, 5, "the backlog is still observed and reported");
+    }
+
+    #[test]
+    fn test_brake_never_preempts_in_flight_sweeps() {
+        // AC2: in-flight sweeps are neither killed nor counted against the brake.
+        // Three sweeps are already running (the reported incident's shape); the
+        // brake holds new admissions and leaves the running set exactly as it was.
+        let in_flight = HashSet::from([101, 102, 103]);
+        let mut source = FakeSource::once(vec![issue(1), issue(2)]);
+        let mut disp = RecordingDispatcher {
+            in_flight: in_flight.clone(),
+            ..Default::default()
+        };
+
+        let report =
+            tick_with_saturation_brake(&mut source, &mut disp, 12, false, usize::MAX, true)
+                .unwrap();
+
+        assert_eq!(report.dispatched, 0);
+        assert_eq!(report.deferred_saturation, 2);
+        // The running set is untouched — the brake has no path to it at all.
+        assert_eq!(
+            disp.in_flight, in_flight,
+            "the brake must never preempt or drop a running sweep"
+        );
+        // And a running sweep is never mistaken for a deferred candidate.
+        assert_eq!(report.skipped_in_flight, 0);
+    }
+
+    #[test]
+    fn test_brake_holds_an_in_flight_candidate_as_in_flight_not_saturation() {
+        // A ready row that is ALSO already in flight (label-flip lag) must be
+        // attributed to the in-flight dedup, not swept into the brake's counter —
+        // otherwise "held by saturation" would over-report on a busy host.
+        let mut source = FakeSource::once(vec![issue(7), issue(8)]);
+        let mut disp = RecordingDispatcher {
+            in_flight: HashSet::from([7]),
+            ..Default::default()
+        };
+
+        let report =
+            tick_with_saturation_brake(&mut source, &mut disp, 12, false, usize::MAX, true)
+                .unwrap();
+
+        assert_eq!(report.skipped_in_flight, 1);
+        assert_eq!(report.deferred_saturation, 1);
+    }
+
+    #[test]
+    fn test_healthy_host_still_reaches_its_configured_cap() {
+        // AC3 (regression guard for #4512): with the brake NOT engaged, an idle
+        // host fills its configured cap exactly as before. If this ever fails,
+        // the brake has re-introduced the over-throttling #4512 removed.
+        let mut source = FakeSource::once((1..=8).map(issue).collect());
+        let mut disp = RecordingDispatcher::default();
+
+        let report =
+            tick_with_saturation_brake(&mut source, &mut disp, 8, false, usize::MAX, false)
+                .unwrap();
+
+        assert_eq!(report.dispatched, 8, "an idle 8-core host must reach its cap");
+        assert_eq!(report.deferred_saturation, 0);
+        assert!(!report.saturation_held);
+    }
+
+    #[test]
+    fn test_brake_disengaged_is_byte_for_byte_the_pre_brake_path() {
+        // The `false` path must be indistinguishable from the pre-#4903 wrapper,
+        // so the brake can never change a healthy host's schedule.
+        let ready: Vec<WorkItem> = (1..=6).map(issue).collect();
+
+        let mut source_a = FakeSource::once(ready.clone());
+        let mut disp_a = RecordingDispatcher::default();
+        let before = tick_with_admission_cap(&mut source_a, &mut disp_a, 4, false, 3).unwrap();
+
+        let mut source_b = FakeSource::once(ready);
+        let mut disp_b = RecordingDispatcher::default();
+        let after =
+            tick_with_saturation_brake(&mut source_b, &mut disp_b, 4, false, 3, false).unwrap();
+
+        assert_eq!(before, after);
+        assert_eq!(disp_a.dispatched, disp_b.dispatched);
+    }
+
+    #[test]
+    fn test_brake_releases_the_moment_the_host_recovers() {
+        // The hold is re-evaluated every tick and nothing latches (that is the
+        // host breaker's cool-down, deliberately a different mechanism): tick 1
+        // saturated holds everything, tick 2 recovered dispatches everything.
+        let ready: Vec<WorkItem> = (1..=3).map(issue).collect();
+        let mut disp = RecordingDispatcher::default();
+
+        let mut hot = FakeSource::once(ready.clone());
+        let held =
+            tick_with_saturation_brake(&mut hot, &mut disp, 10, false, usize::MAX, true).unwrap();
+        assert_eq!(held.dispatched, 0);
+        assert_eq!(held.deferred_saturation, 3);
+
+        let mut cool = FakeSource::once(ready);
+        let resumed =
+            tick_with_saturation_brake(&mut cool, &mut disp, 10, false, usize::MAX, false).unwrap();
+        assert_eq!(resumed.dispatched, 3, "admissions resume with no cool-down");
+        assert_eq!(resumed.deferred_saturation, 0);
+        assert!(!resumed.saturation_held);
+        assert_eq!(disp.dispatched, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_brake_engaged_with_empty_backlog_still_reports_held() {
+        // A saturated host with nothing queued must not read as idle-healthy —
+        // that indistinguishability is the reporting half of #4903.
+        let mut source = FakeSource::once(vec![]);
+        let mut disp = RecordingDispatcher::default();
+
+        let report =
+            tick_with_saturation_brake(&mut source, &mut disp, 12, false, usize::MAX, true)
+                .unwrap();
+
+        assert_eq!(report.deferred_saturation, 0);
+        assert!(report.saturation_held, "held state must survive an empty backlog");
+    }
+
+    #[test]
+    fn test_brake_and_main_health_halt_compose_halt_wins_early_return() {
+        // A red main short-circuits before the candidate loop, so nothing is
+        // attributed to the brake — but the brake's engagement is still recorded
+        // so status does not claim the host is fine.
+        let mut source = FakeSource::once((1..=3).map(issue).collect());
+        let mut disp = RecordingDispatcher::default();
+
+        let report =
+            tick_with_saturation_brake(&mut source, &mut disp, 12, true, usize::MAX, true).unwrap();
+
+        assert!(report.halted);
+        assert!(report.saturation_held);
+        assert_eq!(report.dispatched, 0);
+        assert_eq!(report.deferred_saturation, 0);
+    }
+
+    #[test]
+    fn test_tick_multi_brake_holds_every_workspace() {
+        // The brake is daemon-global: it measures the one host every workspace's
+        // sweeps run on, so a hold applies across repos at once.
+        let source_a = FakeSource::once(vec![issue(1), issue(2)]);
+        let disp_a = RecordingDispatcher::default();
+        let source_b = FakeSource::once(vec![issue(3), issue(4)]);
+        let disp_b = RecordingDispatcher::default();
+        let mut multi = vec![(source_a, disp_a), (source_b, disp_b)];
+
+        let report = tick_multi_with_saturation_brake(
+            &mut multi,
+            &[],
+            10,
+            &[false, false],
+            usize::MAX,
+            true,
+        );
+
+        assert_eq!(report.dispatched, 0);
+        assert_eq!(report.deferred_saturation, 4);
+        assert_eq!(report.deferred_capacity, 0);
+        assert!(report.saturation_held);
+        assert!(multi.iter().all(|(_, d)| d.dispatched.is_empty()));
+    }
+
+    #[test]
+    fn test_tick_multi_healthy_host_unchanged_by_the_brake() {
+        // AC3 for the production (multi-workspace) path: disengaged ⇒ the
+        // pre-#4903 schedule, cap and all.
+        let source_a = FakeSource::once(vec![issue(1), issue(2)]);
+        let disp_a = RecordingDispatcher::default();
+        let source_b = FakeSource::once(vec![issue(3), issue(4)]);
+        let disp_b = RecordingDispatcher::default();
+        let mut multi = vec![(source_a, disp_a), (source_b, disp_b)];
+
+        let report = tick_multi_with_saturation_brake(
+            &mut multi,
+            &[],
+            10,
+            &[false, false],
+            usize::MAX,
+            false,
+        );
+
+        assert_eq!(report.dispatched, 4);
+        assert_eq!(report.deferred_saturation, 0);
+        assert!(!report.saturation_held);
+    }
+
+    #[test]
+    fn test_tick_multi_brake_does_not_disturb_in_flight_across_workspaces() {
+        // AC2 on the multi path: every workspace's running set is preserved and
+        // its occupancy is never re-attributed to the brake.
+        let source_a = FakeSource::once(vec![issue(1)]);
+        let disp_a = RecordingDispatcher {
+            in_flight: HashSet::from([900]),
+            ..Default::default()
+        };
+        let source_b = FakeSource::once(vec![issue(2)]);
+        let disp_b = RecordingDispatcher {
+            in_flight: HashSet::from([901, 902]),
+            ..Default::default()
+        };
+        let mut multi = vec![(source_a, disp_a), (source_b, disp_b)];
+
+        let report = tick_multi_with_saturation_brake(
+            &mut multi,
+            &[],
+            10,
+            &[false, false],
+            usize::MAX,
+            true,
+        );
+
+        assert_eq!(report.deferred_saturation, 2);
+        assert_eq!(multi[0].1.in_flight, HashSet::from([900]));
+        assert_eq!(multi[1].1.in_flight, HashSet::from([901, 902]));
+    }
+
+    #[test]
+    fn test_saturation_deferrals_reach_the_published_tick_summary() {
+        // AC4's plumbing: the counter must survive into the process-global
+        // summary `loom-daemon health` / `status` read back, and the summary
+        // line must NAME it rather than hide it among the zeros.
+        let report = TickReport {
+            seen: 4,
+            deferred_saturation: 4,
+            saturation_held: true,
+            ..TickReport::default()
+        };
+        publish_tick_summary(&report, 12);
+        let summary = last_tick_summary().expect("a tick was just published");
+        assert_eq!(summary.deferred_saturation, 4);
+        assert!(summary.saturation_held);
+        let line = summary.reason_summary();
+        assert!(line.contains("4 deferred-saturation"), "got: {line}");
+        assert!(line.contains("SATURATION-HELD"), "got: {line}");
+        reset_last_tick_summary();
     }
 
     #[test]
