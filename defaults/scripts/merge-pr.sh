@@ -687,7 +687,9 @@ _reset_one_partial_issue() {
     # normal label swap so the issue re-enters the ready queue.
     if _partial_ref_is_conflicted "$issue_num"; then
       warning "Partial-increment reset: issue #$issue_num was auto-closed by PR #$PR_NUMBER's merge despite its non-closing \`Part of\`/\`Contributes to\` reference (a closing reference to #$issue_num was detected pre-merge) — reopening (#4569)"
-      if gh issue reopen "$issue_num" --repo "$REPO_NWO" >/dev/null 2>&1; then
+      # forge_gh_reopen_issue_rl_safe (#4856): falls back to a REST PATCH
+      # (state=open) when `gh issue reopen`'s GraphQL mutation is rate-limited.
+      if forge_gh_reopen_issue_rl_safe "$REPO_NWO" "$issue_num" 2>/dev/null; then
         success "Issue #$issue_num reopened (premature auto-close reverted)"
         reopened=true
         _post_premature_close_comment "$issue_num"
@@ -715,10 +717,10 @@ _reset_one_partial_issue() {
   fi
 
   info "Partial-increment reset: PR #$PR_NUMBER merged as a partial slice of #$issue_num; returning it to the ready queue"
-  if gh issue edit "$issue_num" \
-       --repo "$REPO_NWO" \
-       --remove-label "loom:building" \
-       --add-label "loom:issue" >/dev/null 2>&1; then
+  # forge_gh_swap_label_rl_safe (#4856): falls back to REST (DELETE the old
+  # label, POST the new one) when `gh issue edit`'s GraphQL mutation is
+  # rate-limited, rather than silently dropping the label swap.
+  if forge_gh_swap_label_rl_safe "$REPO_NWO" "$issue_num" "loom:building" "loom:issue" 2>/dev/null; then
     success "Issue #$issue_num: loom:building -> loom:issue (partial increment; issue remains open)"
     local ts comment reopen_note=""
     ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -736,7 +738,9 @@ This issue is now available for the next increment (a subsequent \`/loom:sweep\`
 
 ---
 *Reset by merge-pr.sh (#3667) at $ts*"
-    gh issue comment "$issue_num" --repo "$REPO_NWO" --body "$comment" >/dev/null 2>&1 || \
+    # forge_gh_comment_rl_safe (#4856): falls back to the REST comments
+    # endpoint on a GraphQL rate-limit rejection.
+    forge_gh_comment_rl_safe "$REPO_NWO" "$issue_num" "$comment" 2>/dev/null || \
       warning "Could not post partial-increment comment on issue #$issue_num (label swap still applied)"
   else
     warning "Could not reset labels on issue #$issue_num (partial increment) — may need manual 'gh issue edit'"
@@ -761,7 +765,8 @@ GitHub honors a closing keyword **anywhere** in a PR body or squash commit messa
 
 ---
 *Reopened by merge-pr.sh (#4569) at $ts*"
-  gh issue comment "$issue_num" --repo "$REPO_NWO" --body "$comment" >/dev/null 2>&1 || \
+  # forge_gh_comment_rl_safe (#4856): REST fallback on GraphQL rate limit.
+  forge_gh_comment_rl_safe "$REPO_NWO" "$issue_num" "$comment" 2>/dev/null || \
     warning "Could not post premature-close comment on issue #$issue_num (reopen still applied)"
 }
 
@@ -874,7 +879,10 @@ Parent branch \`$parent_branch\` squash-merged, but this child's issue #$child_i
 
 ---
 *Deferred by merge-pr.sh (#3747) at $ts*"
-    gh pr comment "$child_pr" --repo "$REPO_NWO" --body "$comment" >/dev/null 2>&1 || \
+    # forge_gh_comment_rl_safe (#4856): the REST comments endpoint is shared
+    # by issues and PRs, so the same helper covers this `gh pr comment` call
+    # site's GraphQL rate-limit fallback.
+    forge_gh_comment_rl_safe "$REPO_NWO" "$child_pr" "$comment" 2>/dev/null || \
       warning "Could not post deferred-reconciliation comment on PR #$child_pr"
     return 0
   fi

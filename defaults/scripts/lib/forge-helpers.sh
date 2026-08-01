@@ -725,6 +725,116 @@ forge_pr_close_targets() {
   fi
 }
 
+# ---------------------------------------------------------------------------
+# GraphQL-exhaustion REST fallback for label/comment/state mutations (#4856).
+#
+# `gh issue edit`, `gh issue comment`, `gh issue reopen`, and `gh pr comment`
+# are GraphQL-backed mutations. During a long sweep, GraphQL quota (5000/hr,
+# shared across every agent + tool) can exhaust while REST quota still has
+# headroom -- the same independent-quota fact the read-side fallback in
+# `check-duplicate.sh` and merge-pr.sh's #4447 auto-merge-enable fallback
+# already rely on. Before this fix, the best-effort mutating call sites in
+# merge-pr.sh (partial-increment label reset, premature-auto-close reopen,
+# stacked-child deferral comment) simply swallowed a rate-limit rejection
+# with the same generic warning as any other failure, silently dropping the
+# label/comment update instead of retrying over REST -- the exact incident
+# reported in #4856 (an orchestrator working around it by hand with raw
+# `gh api` DELETE/POST/PATCH calls).
+#
+# is_rate_limit_error() reuses the exact five-signature table from
+# check-duplicate.sh's is_rate_limit_error() (itself mirrored from
+# loom-daemon/src/rate_limit_breaker.rs's RATE_LIMIT_SIGNATURES) rather than
+# deriving a new one. The GraphQL and REST phrasings are NOT substrings of
+# each other -- "already" breaks the contiguous "api rate limit exceeded"
+# match -- so both are listed. GitHub-only helpers: every call site below is
+# already gated on `[[ "$FORGE_TYPE" == "github" ]]` by its caller, mirroring
+# the existing `_reset_partial_increment_labels` / `_auto_reconcile_stacked_children`
+# gating in merge-pr.sh, so no Gitea branch is needed here.
+is_rate_limit_error() {
+  local text
+  text=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  case "$text" in
+    *"api rate limit exceeded"*) return 0 ;;
+    *"api rate limit already exceeded"*) return 0 ;;
+    *"secondary rate limit"*) return 0 ;;
+    *"abuse detection mechanism"*) return 0 ;;
+    *"was submitted too quickly"*) return 0 ;;
+  esac
+  return 1
+}
+
+# Post a comment on an issue OR a pull request via `gh issue comment`, falling
+# back to the REST comments endpoint on a GraphQL rate-limit rejection. The
+# REST endpoint (`repos/{nwo}/issues/{n}/comments`) is shared by issues and
+# PRs on GitHub (a PR IS an issue for labels/comments/state), so one function
+# safely serves both `gh issue comment` and `gh pr comment` call sites.
+# Usage: forge_gh_comment_rl_safe NWO NUMBER BODY
+# Returns 0 on success (either path), 1 on failure (message on stderr).
+forge_gh_comment_rl_safe() {
+  local nwo="$1" number="$2" body="$3"
+  local out
+  if out=$(gh issue comment "$number" --repo "$nwo" --body "$body" 2>&1); then
+    return 0
+  fi
+  if is_rate_limit_error "$out"; then
+    if gh api "repos/$nwo/issues/$number/comments" -f "body=$body" >/dev/null 2>&1; then
+      return 0
+    fi
+    echo "gh issue comment rate-limited on #$number, and the REST fallback also failed: $out" >&2
+    return 1
+  fi
+  echo "$out" >&2
+  return 1
+}
+
+# Reopen a closed issue via `gh issue reopen`, falling back to a REST PATCH
+# (state=open) on a GraphQL rate-limit rejection.
+# Usage: forge_gh_reopen_issue_rl_safe NWO ISSUE_NUMBER
+forge_gh_reopen_issue_rl_safe() {
+  local nwo="$1" issue_num="$2"
+  local out
+  if out=$(gh issue reopen "$issue_num" --repo "$nwo" 2>&1); then
+    return 0
+  fi
+  if is_rate_limit_error "$out"; then
+    if gh api "repos/$nwo/issues/$issue_num" -X PATCH -f state=open >/dev/null 2>&1; then
+      return 0
+    fi
+    echo "gh issue reopen rate-limited on #$issue_num, and the REST fallback also failed: $out" >&2
+    return 1
+  fi
+  echo "$out" >&2
+  return 1
+}
+
+# Swap one label for another on an issue via `gh issue edit --remove-label
+# --add-label`, falling back to two REST calls (DELETE the old label, POST
+# the new one) on a GraphQL rate-limit rejection. The label name is
+# percent-encoded for the DELETE path segment (GitHub labels commonly contain
+# `:`, e.g. `loom:building`, which must be encoded as `%3A`).
+# Usage: forge_gh_swap_label_rl_safe NWO ISSUE_NUMBER REMOVE_LABEL ADD_LABEL
+forge_gh_swap_label_rl_safe() {
+  local nwo="$1" issue_num="$2" remove_label="$3" add_label="$4"
+  local out
+  if out=$(gh issue edit "$issue_num" --repo "$nwo" \
+      --remove-label "$remove_label" --add-label "$add_label" 2>&1); then
+    return 0
+  fi
+  if is_rate_limit_error "$out"; then
+    local encoded_remove ok=true
+    encoded_remove="${remove_label//:/%3A}"
+    gh api "repos/$nwo/issues/$issue_num/labels/$encoded_remove" -X DELETE >/dev/null 2>&1 || ok=false
+    gh api "repos/$nwo/issues/$issue_num/labels" -f "labels[]=$add_label" >/dev/null 2>&1 || ok=false
+    if [[ "$ok" == "true" ]]; then
+      return 0
+    fi
+    echo "gh issue edit (label swap) rate-limited on #$issue_num, and the REST fallback also failed: $out" >&2
+    return 1
+  fi
+  echo "$out" >&2
+  return 1
+}
+
 # Get PR comments.
 # Usage: forge_get_pr_comments NWO PR_NUMBER
 # GitHub: gh pr view --comments

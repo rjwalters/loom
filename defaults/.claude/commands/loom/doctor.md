@@ -161,6 +161,54 @@ variable, a `--raw-field`, or any other wrapper. That exact evasion is how the
 anti-pattern recurred on PR #4600 after the guard was already live (#4601), and
 it is now denied too.
 
+## GraphQL Rate-Limit Exhaustion — REST Fallback for Labels/Comments
+
+`gh pr comment` and `gh pr edit` (both required for the claim/relabel/re-Judge
+handoff below) are **GraphQL-backed mutations**. GitHub's GraphQL quota
+(5000/hr, shared across every agent + tool) and its REST quota are
+**independent** — confirmed live during long sweeps (#4526, #4670, #4856):
+GraphQL can read 0 remaining while REST still has ~4000 left. A rejection
+whose text contains one of these five signatures (case-insensitive) is a
+rate limit, not a real failure, and has a REST equivalent — do **not** give
+up or wait idly; retry the same mutation over REST:
+
+| Signature | Seen as |
+|---|---|
+| `api rate limit exceeded` | REST itself throttling (rare on the fallback path) |
+| `api rate limit already exceeded` | GraphQL: `GraphQL: API rate limit already exceeded for user ID …` |
+| `secondary rate limit` | either transport, burst throttling |
+| `abuse detection mechanism` | either transport, burst throttling |
+| `was submitted too quickly` | either transport, burst throttling |
+
+REST equivalents for the mutations you actually need mid-fix:
+
+```bash
+# gh pr comment <n> --body "..."   ->
+gh api "repos/{owner}/{repo}/issues/<n>/comments" -F body="..."
+
+# gh pr edit <n> --add-label "loom:review-requested"   ->
+gh api "repos/{owner}/{repo}/issues/<n>/labels" -f "labels[]=loom:review-requested"
+
+# gh pr edit <n> --remove-label "loom:treating"   ->
+gh api "repos/{owner}/{repo}/issues/<n>/labels/loom%3Atreating" -X DELETE
+#                                                      ^^^ the ":" in a label
+#   name must be percent-encoded as %3A in the DELETE path segment.
+```
+
+(The PR's REST comments/labels endpoints live under `/issues/<n>/...` —
+GitHub treats a PR as an issue for labels, comments, and state; there is no
+separate `/pulls/<n>/comments` or `/pulls/<n>/labels`.) `gh api` expands the
+literal `{owner}/{repo}` placeholder from the git remote with zero API calls
+of its own — never resolve it via `gh repo view --json nameWithOwner`, which
+is itself GraphQL-backed and fails first under the same exhaustion this
+fallback exists for (#4659). Anything else — auth failure, network error, a
+404 on a bad PR number — is **not** a rate limit; report it and do not
+retry over REST. `merge-pr.sh`'s `lib/forge-helpers.sh` implements this same
+signature table plus ready-made wrappers
+(`forge_gh_comment_rl_safe`, `forge_gh_swap_label_rl_safe`,
+`forge_gh_reopen_issue_rl_safe`, #4856) if you are scripting rather than
+running `gh` interactively.
+
 ## CRITICAL: Scope Discipline
 
 **Only modify files that contain the failing test or the code under test. Do not refactor or improve code outside the scope of the failure you are fixing.**
