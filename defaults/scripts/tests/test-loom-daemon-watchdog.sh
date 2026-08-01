@@ -543,6 +543,128 @@ else
 fi
 
 # ===================================================================
+# 10a/10b. systemd mirror of tests 9/10 (#4862): a stubbed `systemctl` (not a
+# real systemd --user manager — deterministic and portable to a Darwin
+# runner, same technique as the launchctl stubs above) proves the auto-
+# remediation gate fires for the EXACT #4862 signature (unit LOADED + NOT
+# running + ExecMainCode=exited + ExecMainStatus=0) and stays report-only for
+# a genuine crash (ExecMainStatus=1).
+# ===================================================================
+STUB10A="$WORKDIR/stub10a"
+mkdir -p "$STUB10A"
+STATE10A="$WORKDIR/state10a"   # empty -> "not running"; a pid -> "running"
+LOG10A="$WORKDIR/systemctl10a.log"
+: > "$STATE10A" "$LOG10A"
+UNIT10A="loom-daemon-test-remediate-$$.service"
+sleep 60 >/dev/null 2>&1 &
+NEW_PID10A=$!
+bg_proc_track "$NEW_PID10A"
+cat > "$STUB10A/systemctl" <<EOF
+#!/usr/bin/env bash
+echo "\$*" >> "$LOG10A"
+if [[ "\${1:-}" == "--user" ]]; then shift; fi
+case "\${1:-}" in
+  show)
+    case "\$*" in
+      *"-p MainPID"*)         pid="\$(cat "$STATE10A" 2>/dev/null)"; echo "\${pid:-0}" ;;
+      *"-p LoadState"*)       echo "loaded" ;;
+      *"-p ExecMainCode"*)    echo "exited" ;;
+      *"-p ExecMainStatus"*)  echo "0" ;;
+      *)                      echo "" ;;
+    esac
+    ;;
+  reset-failed) exit 0 ;;
+  start)
+    echo "$NEW_PID10A" > "$STATE10A"
+    exit 0
+    ;;
+  *) exit 0 ;;
+esac
+EOF
+chmod +x "$STUB10A/systemctl"
+cat > "$MARKER" <<EOF
+started_at=2026-07-27T00:00:00Z
+heartbeat_file=$HEARTBEAT
+heartbeat_interval_secs=60
+use_launchd=false
+use_systemd=true
+systemd_unit=$UNIT10A
+socket_path=$WORKDIR/loom-daemon.sock
+EOF
+: > "$WDLOG" "$OUT"
+env PATH="$STUB10A:$PATH" LOOM_AUTONOMY_MARKER="$MARKER" LOOM_WATCHDOG_LOG="$WDLOG" \
+    LOOM_WATCHDOG_KICKSTART_RECHECK_ATTEMPTS=5 LOOM_WATCHDOG_KICKSTART_RECHECK_INTERVAL=0.2 \
+    bash "$WATCHDOG" > "$OUT" 2>&1
+rc10a=$?
+kill "$NEW_PID10A" 2>/dev/null || true
+assert_rc 0 "$rc10a" "systemd exit-0-and-down (#4862): auto-remediation relaunches the unit -> exits 0"
+if grep -q -- '--user start ' "$LOG10A"; then
+    pass "systemd exit-0-and-down: auto-remediation invokes 'systemctl --user start'"
+else
+    fail "systemd exit-0-and-down: auto-remediation invokes 'systemctl --user start' (log: $(cat "$LOG10A" 2>/dev/null))"
+fi
+if grep -q -- '--user reset-failed ' "$LOG10A"; then
+    pass "systemd exit-0-and-down: auto-remediation clears the failed state first ('reset-failed')"
+else
+    fail "systemd exit-0-and-down: auto-remediation clears the failed state first"
+fi
+if log_hasi 'remediat'; then
+    pass "systemd exit-0-and-down: watchdog log records the remediation"
+else
+    fail "systemd exit-0-and-down: watchdog log records the remediation"
+fi
+
+# 10b. ExecMainStatus=1 (crash) — the auto-remediation gate must NEVER fire.
+STUB10B="$WORKDIR/stub10b"
+mkdir -p "$STUB10B"
+LOG10B="$WORKDIR/systemctl10b.log"
+: > "$LOG10B"
+UNIT10B="loom-daemon-test-noremediate-$$.service"
+cat > "$STUB10B/systemctl" <<EOF
+#!/usr/bin/env bash
+echo "\$*" >> "$LOG10B"
+if [[ "\${1:-}" == "--user" ]]; then shift; fi
+case "\${1:-}" in
+  show)
+    case "\$*" in
+      *"-p MainPID"*)         echo "0" ;;
+      *"-p LoadState"*)       echo "loaded" ;;
+      *"-p ExecMainCode"*)    echo "exited" ;;
+      *"-p ExecMainStatus"*)  echo "1" ;;
+      *)                      echo "" ;;
+    esac
+    ;;
+  reset-failed) exit 0 ;;
+  start)
+    # If this were ever wrongly invoked it would show up in the log below —
+    # the assertion is that 'start' never appears at all.
+    exit 0
+    ;;
+  *) exit 0 ;;
+esac
+EOF
+chmod +x "$STUB10B/systemctl"
+cat > "$MARKER" <<EOF
+started_at=2026-07-27T00:00:00Z
+heartbeat_file=$HEARTBEAT
+heartbeat_interval_secs=60
+use_launchd=false
+use_systemd=true
+systemd_unit=$UNIT10B
+socket_path=$WORKDIR/loom-daemon.sock
+EOF
+: > "$WDLOG" "$OUT"
+env PATH="$STUB10B:$PATH" LOOM_AUTONOMY_MARKER="$MARKER" LOOM_WATCHDOG_LOG="$WDLOG" \
+    bash "$WATCHDOG" > "$OUT" 2>&1
+rc10b=$?
+assert_rc 1 "$rc10b" "systemd exit-1-and-down: stays report-only (no auto-remediation) -> exits 1 (#4054 no-crash-loop preserved)"
+if grep -q -- '--user start ' "$LOG10B"; then
+    fail "systemd exit-1-and-down: 'systemctl --user start' is NEVER invoked (no crash-loop revival)"
+else
+    pass "systemd exit-1-and-down: 'systemctl --user start' is NEVER invoked (no crash-loop revival)"
+fi
+
+# ===================================================================
 # 11. --help works and documents the marker + StartInterval design.
 # ===================================================================
 help_out=$(bash "$WATCHDOG" --help 2>/dev/null)

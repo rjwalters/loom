@@ -1923,12 +1923,13 @@ write_fixture_unit_pre4267 "$UNIT_PATH31" "$INSTALLED31"
     bash "$UPDATE_SCRIPT" --relaunch >/dev/null 2>&1 )
 TESTS_RUN=$((TESTS_RUN + 1))
 if grep -q 'LOOM_DAEMON_SUPERVISOR=systemd' "$UNIT_PATH31" 2>/dev/null \
-    && grep -qx 'Restart=on-success' "$UNIT_PATH31" 2>/dev/null; then
+    && grep -qx 'Restart=on-success' "$UNIT_PATH31" 2>/dev/null \
+    && grep -qx 'KillMode=mixed' "$UNIT_PATH31" 2>/dev/null; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "${GREEN}✓${NC} --relaunch re-renders the unit with Restart=on-success + LOOM_DAEMON_SUPERVISOR=systemd"
+    echo -e "${GREEN}✓${NC} --relaunch re-renders the unit with Restart=on-success + KillMode=mixed (#4862) + LOOM_DAEMON_SUPERVISOR=systemd"
 else
     TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "${RED}✗${NC} --relaunch re-renders the unit with Restart=on-success + LOOM_DAEMON_SUPERVISOR=systemd"
+    echo -e "${RED}✗${NC} --relaunch re-renders the unit with Restart=on-success + KillMode=mixed + LOOM_DAEMON_SUPERVISOR=systemd"
     echo "  unit: $(cat "$UNIT_PATH31" 2>/dev/null)"
 fi
 

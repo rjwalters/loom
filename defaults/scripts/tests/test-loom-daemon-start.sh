@@ -294,18 +294,19 @@ rm -rf "$MACHINE_HOME" "$MACHINE_CHECKOUT" "$NON_REPO_DIR"
 SD_UNIT="loom-daemon-test-$$.service"
 
 # S1. --print-unit renders the unit with NO side effects (no systemctl, no file
-#     write). Assert the four load-bearing fields from the issue's test plan:
-#     Restart=on-success, WantedBy=default.target, the baked
-#     Environment=LOOM_DAEMON_SUPERVISOR=systemd, and WorkingDirectory=<repo>.
+#     write). Assert the five load-bearing fields from the issue's test plan:
+#     Restart=on-success, KillMode=mixed (#4862), WantedBy=default.target, the
+#     baked Environment=LOOM_DAEMON_SUPERVISOR=systemd, and WorkingDirectory=<repo>.
 unit_out=$( ( cd "$WORKDIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
     LOOM_DAEMON_BIN="$FAKE_BIN" bash "$START_SCRIPT" --print-unit 2>/dev/null ) )
 TESTS_RUN=$((TESTS_RUN + 1))
 if echo "$unit_out" | grep -qx 'Restart=on-success' \
+    && echo "$unit_out" | grep -qx 'KillMode=mixed' \
     && echo "$unit_out" | grep -qx 'WantedBy=default.target' \
     && echo "$unit_out" | grep -qx 'Environment=LOOM_DAEMON_SUPERVISOR=systemd' \
     && echo "$unit_out" | grep -qx "WorkingDirectory=$WORKDIR"; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "${GREEN}✓${NC} --print-unit renders Restart=on-success, WantedBy=default.target, LOOM_DAEMON_SUPERVISOR=systemd, WorkingDirectory=<repo>"
+    echo -e "${GREEN}✓${NC} --print-unit renders Restart=on-success, KillMode=mixed, WantedBy=default.target, LOOM_DAEMON_SUPERVISOR=systemd, WorkingDirectory=<repo>"
 else
     TESTS_FAILED=$((TESTS_FAILED + 1))
     echo -e "${RED}✗${NC} --print-unit renders the expected unit fields"
@@ -371,12 +372,13 @@ fi
 rm -f "$WORKDIR/.loom/.daemon.pid"
 TESTS_RUN=$((TESTS_RUN + 1))
 if [[ -f "$SD_HOME/.config/systemd/user/$SD_UNIT" ]] \
-    && grep -qx 'Restart=on-success' "$SD_HOME/.config/systemd/user/$SD_UNIT"; then
+    && grep -qx 'Restart=on-success' "$SD_HOME/.config/systemd/user/$SD_UNIT" \
+    && grep -qx 'KillMode=mixed' "$SD_HOME/.config/systemd/user/$SD_UNIT"; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "${GREEN}✓${NC} systemd path: renders the unit file under ~/.config/systemd/user with Restart=on-success"
+    echo -e "${GREEN}✓${NC} systemd path: renders the unit file under ~/.config/systemd/user with Restart=on-success + KillMode=mixed (#4862)"
 else
     TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "${RED}✗${NC} systemd path: renders the unit file under ~/.config/systemd/user with Restart=on-success"
+    echo -e "${RED}✗${NC} systemd path: renders the unit file under ~/.config/systemd/user with Restart=on-success + KillMode=mixed"
 fi
 TESTS_RUN=$((TESTS_RUN + 1))
 if echo "$sd_out" | grep -qi 'enable-linger'; then
@@ -1306,6 +1308,132 @@ fi
 kill "$AD8_SLEEP_PID2" 2>/dev/null || true
 rm -f "$AD8_HOME/.loom/.daemon.pid"
 rm -rf "$AD8_HOME"
+
+# ---------- KillMode=mixed real-systemd regression (#4862) ----------
+# The stub-based systemd tests above assert the RENDERED TEXT of the unit
+# (Restart=on-success, KillMode=mixed present) but never exercise a real
+# `systemd --user` manager, so they cannot catch a regression in what those
+# fields actually DO. This block drives the ACTUAL production-rendered unit
+# (via --print-unit, only ExecStart/WorkingDirectory substituted) against a
+# real `systemctl --user` when one is reachable, proving BOTH halves of the
+# issue's acceptance criteria in one shot:
+#   MX1. a clean exit(0) with a SIGTERM-ignoring lingering child (standing in
+#        for an in-flight claude/tee/sleep sweep worker) still causes
+#        Restart=on-success to fire — the #4862 fix.
+#   MX2. a crash exit(1) does NOT get restarted — the #4054 no-crash-loop
+#        property must survive the #4862 change (KillMode=mixed touches only
+#        HOW leftover cgroup members are reaped, never the crash/on-success
+#        exit-code contract).
+# Skips cleanly (not a failure) when no reachable `systemd --user` manager
+# exists — e.g. a Darwin CI runner, or a sandboxed host with no user
+# session/bus. Real unit files land under the ACTUAL $HOME (systemd --user
+# cannot be redirected via an env HOME override the way the stub-based tests
+# above redirect it), uniquely named with $$ so a leftover from an
+# interrupted run cannot collide with a later one.
+MX_HAVE_SYSTEMD=false
+if command -v systemctl >/dev/null 2>&1 && [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
+    mx_state="$(systemctl --user is-system-running 2>/dev/null)"
+    [[ "$mx_state" != "offline" && -n "$mx_state" ]] && MX_HAVE_SYSTEMD=true
+fi
+if [[ "$MX_HAVE_SYSTEMD" == "true" ]]; then
+    MX_UNIT_MIXED="loom-daemon-test-mx-mixed-$$.service"
+    MX_UNIT_CRASH="loom-daemon-test-mx-crash-$$.service"
+    MX_UNIT_DIR="$HOME/.config/systemd/user"
+    MX_SCRIPT_DIR="$WORKDIR/mx-scripts"
+    mkdir -p "$MX_UNIT_DIR" "$MX_SCRIPT_DIR"
+
+    mx_cleanup() {
+        systemctl --user stop "$MX_UNIT_MIXED" "$MX_UNIT_CRASH" >/dev/null 2>&1 || true
+        rm -f "$MX_UNIT_DIR/$MX_UNIT_MIXED" "$MX_UNIT_DIR/$MX_UNIT_CRASH"
+        systemctl --user daemon-reload >/dev/null 2>&1 || true
+        systemctl --user reset-failed "$MX_UNIT_MIXED" "$MX_UNIT_CRASH" >/dev/null 2>&1 || true
+    }
+    # Extend the suite-wide traps (not replace) so an interruption mid-MX-block
+    # still tears down these REAL systemd units, not just $WORKDIR.
+    trap 'mx_cleanup; bg_proc_reap; [ -n "$WORKDIR" ] && pkill -f "$WORKDIR" >/dev/null 2>&1; rm -rf "$WORKDIR"' EXIT
+    trap 'mx_cleanup; bg_proc_reap; [ -n "$WORKDIR" ] && pkill -f "$WORKDIR" >/dev/null 2>&1; rm -rf "$WORKDIR"; exit 1' INT TERM
+    mx_cleanup
+
+    # mx-main.sh: forks a SIGTERM-ignoring child (stand-in for a lingering
+    # claude/tee/sleep sweep worker in the SAME cgroup), then exits 0 quickly
+    # — mirrors the incident's "clean main-process exit, children still
+    # running" shape.
+    cat > "$MX_SCRIPT_DIR/mx-main.sh" <<'MXEOF'
+#!/bin/bash
+trap '' TERM
+(trap '' TERM; sleep 30) &
+sleep 1
+exit 0
+MXEOF
+    chmod +x "$MX_SCRIPT_DIR/mx-main.sh"
+    cat > "$MX_SCRIPT_DIR/mx-crash.sh" <<'MXEOF'
+#!/bin/bash
+sleep 1
+exit 1
+MXEOF
+    chmod +x "$MX_SCRIPT_DIR/mx-crash.sh"
+
+    # Render via the ACTUAL production code path, then retarget ExecStart/
+    # WorkingDirectory at the tiny fixture script above -- proves the SHIPPED
+    # unit shape (not a hand-rolled duplicate) reproduces the fix.
+    mx_render() {
+        local exec_script="$1"
+        ( cd "$WORKDIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
+            LOOM_DAEMON_BIN="$exec_script" bash "$START_SCRIPT" --print-unit 2>/dev/null ) \
+            | sed -e "s|^ExecStart=.*|ExecStart=/bin/bash $exec_script|" \
+                  -e "s|^WorkingDirectory=.*|WorkingDirectory=$MX_SCRIPT_DIR|"
+    }
+    mx_render "$MX_SCRIPT_DIR/mx-main.sh" > "$MX_UNIT_DIR/$MX_UNIT_MIXED"
+    mx_render "$MX_SCRIPT_DIR/mx-crash.sh" > "$MX_UNIT_DIR/$MX_UNIT_CRASH"
+    systemctl --user daemon-reload >/dev/null 2>&1 || true
+
+    # MX1. Clean exit + lingering child -> Restart=on-success fires (NRestarts
+    # climbs above 0 within a few restart cycles). Poll up to ~8s.
+    systemctl --user start "$MX_UNIT_MIXED" >/dev/null 2>&1
+    mx1_restarts=0
+    for _ in 1 2 3 4 5 6 7 8; do
+        mx1_restarts="$(systemctl --user show -p NRestarts --value "$MX_UNIT_MIXED" 2>/dev/null)"
+        [[ "$mx1_restarts" =~ ^[0-9]+$ ]] && (( mx1_restarts > 0 )) && break
+        sleep 1
+    done
+    TESTS_RUN=$((TESTS_RUN + 1))
+    if [[ "$mx1_restarts" =~ ^[0-9]+$ ]] && (( mx1_restarts > 0 )); then
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+        echo -e "${GREEN}✓${NC} real systemd (#4862): clean exit + lingering child -> Restart=on-success fires (NRestarts=$mx1_restarts)"
+    else
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+        echo -e "${RED}✗${NC} real systemd (#4862): clean exit + lingering child -> Restart=on-success fires"
+        echo "  systemctl --user status ${MX_UNIT_MIXED}:"
+        systemctl --user status "$MX_UNIT_MIXED" --no-pager -l 2>&1 | sed 's/^/    /'
+    fi
+    systemctl --user stop "$MX_UNIT_MIXED" >/dev/null 2>&1 || true
+
+    # MX2. Crash exit(1) -> stays down (the #4054 no-crash-loop property).
+    # Wait past the fixture's own 1s sleep + a restart-cycle margin, then
+    # assert BOTH that it never restarted and that it is in a failed/inactive
+    # (not activating/running) state.
+    systemctl --user start "$MX_UNIT_CRASH" >/dev/null 2>&1
+    sleep 3
+    mx2_restarts="$(systemctl --user show -p NRestarts --value "$MX_UNIT_CRASH" 2>/dev/null)"
+    mx2_active="$(systemctl --user show -p ActiveState --value "$MX_UNIT_CRASH" 2>/dev/null)"
+    TESTS_RUN=$((TESTS_RUN + 1))
+    if [[ "$mx2_restarts" == "0" ]] && [[ "$mx2_active" != "active" && "$mx2_active" != "activating" ]]; then
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+        echo -e "${GREEN}✓${NC} real systemd (#4862): crash exit(1) does NOT restart (#4054 no-crash-loop preserved; ActiveState=$mx2_active)"
+    else
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+        echo -e "${RED}✗${NC} real systemd (#4862): crash exit(1) does NOT restart"
+        echo "  NRestarts=$mx2_restarts ActiveState=$mx2_active"
+        systemctl --user status "$MX_UNIT_CRASH" --no-pager -l 2>&1 | sed 's/^/    /'
+    fi
+
+    mx_cleanup
+    # Restore the plain (non-MX) suite-wide traps for the remainder of the run.
+    trap 'bg_proc_reap; [ -n "$WORKDIR" ] && pkill -f "$WORKDIR" >/dev/null 2>&1; rm -rf "$WORKDIR"' EXIT
+    trap 'bg_proc_reap; [ -n "$WORKDIR" ] && pkill -f "$WORKDIR" >/dev/null 2>&1; rm -rf "$WORKDIR"; exit 1' INT TERM
+else
+    echo "  (skipping real-systemd #4862 regression: no reachable 'systemctl --user' manager on this host)"
+fi
 
 # ---------- summary ----------
 echo

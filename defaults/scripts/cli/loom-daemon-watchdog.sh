@@ -106,11 +106,21 @@
 #   report-only, exactly as before: no crash-loop revival, no reviving a
 #   deliberate stop.
 #
-# EXIT CODES (a StartInterval job's exit code does not affect relaunch — these
-# exist for testability and for a human running it by hand):
+#   #4862 adds the systemd --user mirror of this gate: a clean main-process
+#   exit (ExecMainCode=exited, ExecMainStatus=0) with the unit LOADED but not
+#   running auto-runs 'systemctl --user reset-failed <unit> && systemctl
+#   --user start <unit>' — the systemd analog of 'launchctl kickstart', for
+#   the exact "Restart=on-success didn't fire" incident #4862 reported (and
+#   the render_systemd_unit KillMode=mixed fix in loom-daemon-start.sh
+#   addresses at the source). Same narrow construction: an operator stop, a
+#   genuine crash, or a never-installed unit cannot produce this signature.
+#
+# EXIT CODES (a StartInterval/OnUnitActiveSec job's exit code does not affect
+# relaunch — these exist for testability and for a human running it by hand):
 #   0  no divergence — daemon healthy, OR no daemon expected AND none running
-#      (marker absent + nothing alive), OR the #4232 bounded auto-remediation
-#      (see above) successfully relaunched it via 'launchctl kickstart'
+#      (marker absent + nothing alive), OR the #4232/#4862 bounded
+#      auto-remediation (see above) successfully relaunched it via
+#      'launchctl kickstart' / 'systemctl --user start'
 #   1  DIVERGENCE / state mismatch reported — a daemon is expected but is not
 #      running (and either the #4232 remediation gate did not apply, or it fired
 #      but the daemon is still not confirmed running), or is running but its
@@ -136,8 +146,15 @@
 #   LOOM_LAUNCHD_DOMAIN          macOS: pin the launchd domain (gui/<uid> or user/<uid>);
 #                                else auto-resolved gui→user (#4130), matching the start
 #   LOOM_DAEMON_LAUNCHD          0/false/no: treat as a non-launchd (nohup) daemon; check the pid file only
-#   LOOM_WATCHDOG_KICKSTART_RECHECK_ATTEMPTS  #4232: how many times to re-check
-#                                for a live pid after the auto-kickstart fallback
+#   LOOM_SYSTEMD_UNIT             #4862: the systemd --user unit to probe (default
+#                                loom-daemon.service, else the marker's systemd_unit)
+#   LOOM_WATCHDOG_SYSTEMD_PROBE   #4862: 1/true/yes: opt in to the systemd --user
+#                                probe (default: per the marker's use_systemd
+#                                field, else OFF -- `systemctl` merely being on
+#                                PATH is not proof of a systemd-managed daemon).
+#                                0/false/no forces it off regardless of the marker.
+#   LOOM_WATCHDOG_KICKSTART_RECHECK_ATTEMPTS  #4232/#4862: how many times to re-check
+#                                for a live pid after the auto-kickstart / systemctl-start fallback
 #                                (default 3).
 #   LOOM_WATCHDOG_KICKSTART_RECHECK_INTERVAL  #4232: seconds between re-checks
 #                                (default 1; may be fractional).
@@ -250,12 +267,15 @@ report() {
 
 # ---------- reality probe (shared) ----------
 # Determine whether the expected daemon is actually alive. Reads the resolved
-# USE_LAUNCHD / LABEL / PID_FILE and sets four globals the callers branch on:
+# USE_LAUNCHD / USE_SYSTEMD / LABEL / SYSTEMD_UNIT / PID_FILE and sets globals
+# the callers branch on:
 #   daemon_alive     true|false
 #   liveness_detail  human-readable string (mirrored into status/log messages)
-#   job_loaded       true|false — launchd job in the table but with no live pid
-#                    (feeds the #4232 bounded auto-remediation gate)
+#   job_loaded       true|false — launchd job / systemd unit known but with no
+#                    live pid (feeds the #4232 / #4862 bounded auto-remediation
+#                    gates)
 #   launchd_service  <domain>/<label> for the launchd path (else empty)
+#   systemd_service  <unit> for the systemd path (else empty)
 # Factored out (#4331) so the no-marker state-mismatch check below and the
 # marker-present path below run the IDENTICAL liveness logic — they can never
 # diverge on what "alive" means.
@@ -264,6 +284,7 @@ detect_daemon_liveness() {
     liveness_detail=""
     job_loaded=false
     launchd_service=""
+    systemd_service=""
     live_pid=""
     if [[ "$USE_LAUNCHD" == "true" ]] && command -v launchctl >/dev/null 2>&1; then
         # Resolve the domain (gui/<uid> ↦ user/<uid>, #4130) the same way the
@@ -282,8 +303,29 @@ detect_daemon_liveness() {
         else
             liveness_detail="launchd job $launchd_service is not loaded/alive"
         fi
+    elif [[ "$USE_SYSTEMD" == "true" ]] && command -v systemctl >/dev/null 2>&1; then
+        # systemd --user path (#4862): mirrors the launchd branch above so the
+        # #4232-style auto-remediation gate below has an equivalent signal on
+        # Linux. `show -p X --value` against an unknown unit answers cleanly
+        # (LoadState=not-found) rather than erroring, so no separate rc check
+        # is needed the way launchd's print exit code is used above.
+        systemd_service="$SYSTEMD_UNIT"
+        systemd_main_pid="$(systemctl --user show -p MainPID --value "$systemd_service" 2>/dev/null)"
+        if [[ -n "$systemd_main_pid" && "$systemd_main_pid" != "0" ]] && kill -0 "$systemd_main_pid" 2>/dev/null; then
+            daemon_alive=true
+            liveness_detail="systemd unit $systemd_service alive (pid $systemd_main_pid)"
+            live_pid="$systemd_main_pid"
+        else
+            systemd_load_state="$(systemctl --user show -p LoadState --value "$systemd_service" 2>/dev/null)"
+            if [[ "$systemd_load_state" == "loaded" ]]; then
+                job_loaded=true
+                liveness_detail="systemd unit $systemd_service is LOADED but NOT running (no live MainPID)"
+            else
+                liveness_detail="systemd unit $systemd_service is not loaded/alive"
+            fi
+        fi
     else
-        # Non-launchd (nohup / Linux) path: the pid file is the only signal.
+        # Non-launchd, non-systemd (nohup) path: the pid file is the only signal.
         if [[ -n "$PID_FILE" && -f "$PID_FILE" ]]; then
             pid="$(cat "$PID_FILE" 2>/dev/null || true)"
             if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
@@ -521,6 +563,20 @@ if [[ ! -f "$MARKER" ]]; then
     fi
     [[ "$(uname -s)" == "Darwin" ]] || USE_LAUNCHD=false
     LABEL="${LOOM_LAUNCHD_LABEL:-com.rjwalters.loom-daemon}"
+    # #4862: with no marker to read use_systemd/systemd_unit from, there is no
+    # reliable signal that THIS host's daemon is systemd-managed rather than a
+    # bystander user session with `systemctl` merely on PATH (every dev/test
+    # host in this suite has that) -- so, unlike USE_LAUNCHD above (which is
+    # genuinely platform-derived), the systemd probe stays OFF here unless
+    # explicitly requested via LOOM_WATCHDOG_SYSTEMD_PROBE=1. The marker-present path
+    # below (the common case — a daemon just started) gets it from the
+    # use_systemd field loom-daemon-start.sh's systemd branch now writes.
+    USE_SYSTEMD=false
+    if [[ "$USE_LAUNCHD" != "true" ]] && [[ "$(uname -s)" != "Darwin" ]] \
+        && [[ "${LOOM_WATCHDOG_SYSTEMD_PROBE:-}" =~ ^(1|true|yes)$ ]] && command -v systemctl >/dev/null 2>&1; then
+        USE_SYSTEMD=true
+    fi
+    SYSTEMD_UNIT="${LOOM_SYSTEMD_UNIT:-loom-daemon.service}"
     PID_FILE="$LOOM_DIR/.daemon.pid"
     detect_daemon_liveness
     if [[ "$daemon_alive" == "true" ]]; then
@@ -546,6 +602,8 @@ HEARTBEAT_FILE="$(marker_get heartbeat_file)"
 HEARTBEAT_INTERVAL_SECS="$(marker_get heartbeat_interval_secs)"
 MARKER_USE_LAUNCHD="$(marker_get use_launchd)"
 MARKER_LABEL="$(marker_get launchd_label)"
+MARKER_USE_SYSTEMD="$(marker_get use_systemd)"
+MARKER_SYSTEMD_UNIT="$(marker_get systemd_unit)"
 PID_FILE="$(marker_get pid_file)"
 
 # Fallbacks when the marker predates a field or the value is empty.
@@ -561,6 +619,22 @@ if [[ "${LOOM_DAEMON_LAUNCHD:-}" =~ ^(0|false|no)$ ]]; then
 fi
 [[ "$(uname -s)" == "Darwin" ]] || USE_LAUNCHD=false
 LABEL="${LOOM_LAUNCHD_LABEL:-${MARKER_LABEL:-com.rjwalters.loom-daemon}}"
+
+# #4862: use_systemd/systemd_unit are new marker fields, written by
+# loom-daemon-start.sh's systemd branch (a marker from before this fix, or
+# from the launchd/nohup branches, has no use_systemd=true line). A blank
+# MARKER_USE_SYSTEMD stays OFF by default here -- same rationale as section 1
+# above: `systemctl` merely being on PATH is not proof THIS daemon is
+# systemd-managed, so no platform auto-detect. LOOM_WATCHDOG_SYSTEMD_PROBE=1 opts in
+# explicitly for a pre-#4862 marker that has not been rewritten yet.
+USE_SYSTEMD="${MARKER_USE_SYSTEMD:-false}"
+if [[ "${LOOM_WATCHDOG_SYSTEMD_PROBE:-}" =~ ^(1|true|yes)$ ]]; then
+    USE_SYSTEMD=true
+elif [[ "${LOOM_WATCHDOG_SYSTEMD_PROBE:-}" =~ ^(0|false|no)$ ]]; then
+    USE_SYSTEMD=false
+fi
+[[ "$(uname -s)" == "Darwin" ]] && USE_SYSTEMD=false
+SYSTEMD_UNIT="${LOOM_SYSTEMD_UNIT:-${MARKER_SYSTEMD_UNIT:-loom-daemon.service}}"
 
 # ---------- 2. reality: is the expected daemon actually alive? ----------
 # Shared probe (#4331): sets daemon_alive / liveness_detail / job_loaded /
@@ -619,6 +693,48 @@ if [[ "$daemon_alive" != "true" ]]; then
             fi
             report DIVERGENCE \
                 "Auto-remediation attempted ('launchctl kickstart ${launchd_service}') but the daemon is STILL not confirmed running. Escalate manually: launchctl print ${launchd_service}  (or ./.loom/scripts/cli/loom-daemon-start.sh [flags])."
+            exit 1
+        fi
+    fi
+
+    # ---------- bounded auto-remediation, systemd (#4862) ----------
+    # The Linux mirror of the #4232 launchd gate above, closing the exact gap
+    # #4862 reported: on a systemd host the watchdog previously only LOGGED a
+    # clean-exit-turned-timeout divergence, never acted on it. Narrow by the
+    # SAME construction as the launchd gate: fires ONLY for "unit LOADED
+    # (systemd still knows about it) + NOT running + main process's own last
+    # exit was a clean status 0" (ExecMainCode=exited, ExecMainStatus=0). An
+    # operator stop (loom-daemon-stop.sh) disables the unit outright; a genuine
+    # crash leaves a non-zero/signal ExecMainStatus; a never-installed unit
+    # fails LoadState=loaded (job_loaded=false). None of those can produce
+    # "loaded, down, ExecMainStatus=0" — only a restart-primitive exit that
+    # Restart=on-success failed to honor can (e.g. a pre-#4862 unit still
+    # missing KillMode=mixed). Every other divergence falls through unchanged.
+    if [[ "$job_loaded" == "true" && -n "$systemd_service" ]] && command -v systemctl >/dev/null 2>&1; then
+        exec_main_code="$(systemctl --user show -p ExecMainCode --value "$systemd_service" 2>/dev/null)"
+        exec_main_status="$(systemctl --user show -p ExecMainStatus --value "$systemd_service" 2>/dev/null)"
+        if [[ "$exec_main_code" == "exited" && "$exec_main_status" == "0" ]]; then
+            report DIVERGENCE \
+                "A daemon is EXPECTED (autonomy-desired marker present, started $(marker_get started_at)) but is NOT running: ${liveness_detail}. Main process's last exit was clean (status 0) — the restart-primitive's own exit-0 contract (#4054/#4077) — which Restart=on-success failed to honor (likely a unit-result reclassification, #4862). Auto-remediating with 'systemctl --user reset-failed ${systemd_service} && systemctl --user start ${systemd_service}'."
+            systemctl --user reset-failed "$systemd_service" >/dev/null 2>&1 || true
+            systemctl --user start "$systemd_service" >/dev/null 2>&1
+            RECHECK_ATTEMPTS="${LOOM_WATCHDOG_KICKSTART_RECHECK_ATTEMPTS:-3}"
+            RECHECK_INTERVAL="${LOOM_WATCHDOG_KICKSTART_RECHECK_INTERVAL:-1}"
+            recheck_pid=""
+            for _ in $(seq 1 "$RECHECK_ATTEMPTS"); do
+                recheck_pid="$(systemctl --user show -p MainPID --value "$systemd_service" 2>/dev/null)"
+                if [[ -n "$recheck_pid" && "$recheck_pid" != "0" ]] && kill -0 "$recheck_pid" 2>/dev/null; then
+                    break
+                fi
+                recheck_pid=""
+                sleep "$RECHECK_INTERVAL"
+            done
+            if [[ -n "$recheck_pid" ]]; then
+                report OK "auto-remediation succeeded: 'systemctl --user start' relaunched ${systemd_service} (new pid ${recheck_pid})."
+                exit 0
+            fi
+            report DIVERGENCE \
+                "Auto-remediation attempted ('systemctl --user start ${systemd_service}') but the daemon is STILL not confirmed running. Escalate manually: systemctl --user status ${systemd_service}  (or ./.loom/scripts/cli/loom-daemon-start.sh [flags])."
             exit 1
         fi
     fi
