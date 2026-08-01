@@ -164,6 +164,12 @@ mod tests {
     use std::net::{SocketAddr, TcpListener};
     use std::sync::{Arc, Mutex};
 
+    /// Every request the mock sink saw, as `(path, body)` — shared between the
+    /// accept-loop thread and the asserting test. Aliased rather than written
+    /// inline so `clippy::type_complexity` stays satisfied under
+    /// `--all-targets --features otlp`.
+    type RecordedRequests = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+
     /// A minimal two-path mock sink: records every request's path + body so
     /// tests can assert `OtlpExporter` posts to `/v1/logs` and `/v1/metrics`
     /// separately. Deliberately smaller than `exporter::tests::MockSink`
@@ -171,7 +177,7 @@ mod tests {
     /// already covered end-to-end for any `Exporter` by `sender.rs`'s tests.
     struct MockSink {
         addr: SocketAddr,
-        requests: Arc<Mutex<Vec<(String, Vec<u8>)>>>,
+        requests: RecordedRequests,
         shutdown: Arc<std::sync::atomic::AtomicBool>,
         handle: Option<std::thread::JoinHandle<()>>,
     }
