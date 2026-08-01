@@ -2587,7 +2587,7 @@ mod tests {
             "a terminal whose tmux session does not exist must be pruned from list_terminals()"
         );
         assert!(
-            tm.terminals.get("ghost").is_none(),
+            !tm.terminals.contains_key("ghost"),
             "the dead entry must also be removed from the underlying registry, not just filtered on read"
         );
     }

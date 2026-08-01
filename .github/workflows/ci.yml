@@ -96,6 +96,29 @@ jobs:
       - name: Run doctests
         run: cargo test --workspace --doc
 
+  backend-otlp-feature:
+    name: Rust OTLP Feature Build & Test
+    needs: changes
+    if: always() && (github.event_name == 'push' || needs.changes.outputs.backend == 'true')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # The `otlp` feature (#4858, Epic #4702 Phase 4) is off by default, so
+      # the default-feature jobs above never compile or run it — confirmed
+      # during Judge review of PR #4879 that CI had zero `--features otlp` /
+      # `--all-features` coverage anywhere (#4905). --all-targets is required
+      # here (unlike backend-lint-and-check's default job) so the feature's
+      # own unit tests (`otlp/mod.rs`, `otlp/mapping.rs`) are linted too, not
+      # just its non-test code paths.
+      - run: cargo clippy --package loom-daemon --features otlp --all-targets -- -D warnings -A clippy::cast_precision_loss -A clippy::cast_possible_truncation -A clippy::cast_sign_loss -A clippy::too_many_lines -A clippy::panic -A clippy::unwrap_used -A clippy::nonminimal_bool -A clippy::redundant_closure -A clippy::redundant_closure_for_method_calls -A clippy::format_push_string -A clippy::uninlined_format_args
+      - uses: taiki-e/install-action@nextest
+      - name: Run tests (otlp feature)
+        run: cargo nextest run --package loom-daemon --features otlp --profile ci
+
   mcp-build:
     name: MCP Server Build
     needs: changes
