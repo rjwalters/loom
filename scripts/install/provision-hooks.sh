@@ -126,10 +126,22 @@ _PHOOK_NAMES=(
 # single hook script <name>. A single-quoted `bash -c '...'` body with NO
 # embedded single quotes (all internal quoting is double quotes) so it survives
 # JSON round-tripping cleanly. See the header for the four steps this encodes.
+#
+# TRANSITION DEDUP (#4806): the deferral to a present per-repo `.loom/hooks/
+# <name>` copy is CONDITIONAL, not unconditional — it only steps aside when the
+# project's `.claude/settings.json` actually references that copy (i.e. there is
+# something for it to defer TO). Without this guard, a repo that carries stale
+# `.loom/hooks/` copies but has had its project-level `hooks` block deleted
+# (accident or #4401-style installer gap) would silently run ZERO guard hooks:
+# the user-scope wrapper steps aside for an entry that was never wired. The
+# `[ -f ... ]` check matters — `$(<missing-file)` writes an error to stderr,
+# which would leak into hook output.
+# shellcheck disable=SC2016  # literal $-expansion is intentional (a fixed marker string, not evaluated here)
+_PHOOK_WRAPPER_MARKER='ROOT=$(cd "$(git rev-parse --git-common-dir'
 _phook_cmd() {
     local name="$1"
     # shellcheck disable=SC2016  # literal $-expansions are intentional (per-user, at hook time)
-    printf '%s' "bash -c 'ROOT=\$(cd \"\$(git rev-parse --git-common-dir 2>/dev/null)/..\" 2>/dev/null && pwd); [ -n \"\$ROOT\" ] || exit 0; { [ -f \"\$ROOT/.loom-project/project.json\" ] || [ -f \"\$ROOT/.loom/config.json\" ]; } || exit 0; [ -x \"\$ROOT/.loom/hooks/${name}\" ] && exit 0; H=\"\${LOOM_HOME:-\$HOME/.local/share/loom}/defaults/hooks/${name}\"; [ -x \"\$H\" ] && LOOM_PROJECT_ROOT=\"\$ROOT\" exec \"\$H\" || exit 0'"
+    printf '%s' "bash -c 'ROOT=\$(cd \"\$(git rev-parse --git-common-dir 2>/dev/null)/..\" 2>/dev/null && pwd); [ -n \"\$ROOT\" ] || exit 0; { [ -f \"\$ROOT/.loom-project/project.json\" ] || [ -f \"\$ROOT/.loom/config.json\" ]; } || exit 0; [ -x \"\$ROOT/.loom/hooks/${name}\" ] && [ -f \"\$ROOT/.claude/settings.json\" ] && case \"\$(<\"\$ROOT/.claude/settings.json\")\" in *\".loom/hooks/${name}\"*) exit 0 ;; esac; H=\"\${LOOM_HOME:-\$HOME/.local/share/loom}/defaults/hooks/${name}\"; [ -x \"\$H\" ] && LOOM_PROJECT_ROOT=\"\$ROOT\" exec \"\$H\" || exit 0'"
 }
 
 # provision_loom_hooks [claude_dir]
@@ -199,7 +211,7 @@ provision_loom_hooks() {
         local name="${_PHOOK_NAMES[$i]}"
         local cmd
         cmd="$(_phook_cmd "$name")"
-        if _phook_merge_one "$settings" "$htype" "$matcher" "defaults/hooks/$name" "$cmd"; then
+        if _phook_merge_one "$settings" "$htype" "$matcher" "defaults/hooks/$name" "$cmd" "" "$_PHOOK_WRAPPER_MARKER"; then
             _phook_ok "wired $htype/${matcher:-<all>} -> $name"
         else
             _phook_warn "failed to wire $name into $settings"
@@ -222,10 +234,21 @@ provision_loom_hooks() {
 # — so a bare `.loom/hooks/<name>` substring test would mistake a stray
 # machine-level entry for the project-level entry that entry defers TO, and skip
 # writing the only command that actually executes anything.
+#
+# <$7 upgrade_marker> (optional, #4806): enables the stale-Loom-wrapper UPGRADE
+# path. When a duplicate is found (by <dedup_marker>) that is NOT byte-identical
+# to <command>, it is normally left alone (a `_phook_cmd()` edit would otherwise
+# never reach already-provisioned installs, because the dedup marker matches
+# regardless of which version of the wrapper generated it — the exact trap
+# described in #4806). Passing <upgrade_marker> narrows that: a duplicate is
+# REWRITTEN in place only when it ALSO contains <upgrade_marker> — a substring
+# recognizable ONLY in a Loom-authored wrapper (see `_PHOOK_WRAPPER_MARKER`) —
+# so a hand-written / non-Loom entry that happens to reference the same hook
+# name is never touched, only ever left as-is.
 #   $1 settings_file  $2 hook_type  $3 matcher  $4 dedup_marker  $5 command
-#   $6 exclude_marker (optional)
+#   $6 exclude_marker (optional)  $7 upgrade_marker (optional)
 _phook_merge_one() {
-    local f="$1" htype="$2" matcher="$3" marker="$4" cmd="$5" exclude="${6:-}"
+    local f="$1" htype="$2" matcher="$3" marker="$4" cmd="$5" exclude="${6:-}" upgrade="${7:-}"
     local tmp
     tmp="$(mktemp 2>/dev/null)" || return 1
     if jq \
@@ -233,9 +256,13 @@ _phook_merge_one() {
         --arg m "$matcher" \
         --arg marker "$marker" \
         --arg exclude "$exclude" \
+        --arg upgrade "$upgrade" \
         --arg cmd "$cmd" '
         def is_dup($c): ($c | contains($marker))
             and (($exclude | length) == 0 or ($c | contains($exclude) | not));
+        def is_stale_loom_wrapper($c): ($upgrade | length) > 0
+            and ($c != $cmd)
+            and ($c | contains($upgrade));
         .hooks = (.hooks // {})
         | .hooks[$ht] = (.hooks[$ht] // [])
         | (.hooks[$ht] | map(.matcher // "") | index($m)) as $idx
@@ -244,7 +271,17 @@ _phook_merge_one() {
           else
             .hooks[$ht][$idx].hooks = (.hooks[$ht][$idx].hooks // [])
             | if (.hooks[$ht][$idx].hooks | map(.command // "") | any(is_dup(.)))
-              then .
+              then
+                # A duplicate (by dedup_marker) already exists. Rewrite it IN
+                # PLACE only if it is a stale Loom-authored wrapper (recognized
+                # by upgrade_marker) that differs from the current command —
+                # never touch anything else (already-current, or hand-written).
+                .hooks[$ht][$idx].hooks |= map(
+                    if is_dup(.command // "") and is_stale_loom_wrapper(.command // "")
+                    then .command = $cmd
+                    else .
+                    end
+                )
               else .hooks[$ht][$idx].hooks += [{type: "command", command: $cmd}]
               end
           end
