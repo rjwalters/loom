@@ -30,9 +30,11 @@ import type { ActiveSweep, FleetSnapshot, HostEntry, TokenAccount } from "./type
 export const STALE_AFTER_SEC = 15 * 60;
 
 export type HostStatus =
-  /** Reporting recently, no token account exhausted. */
+  /** Reporting recently, and the token pool has healthy capacity left. Some
+   * accounts being exhausted is normal rotation, not a fault — see
+   * `isTokenPoolDegraded` below. */
   | "ok"
-  /** Reporting recently, but at least one token account is exhausted. */
+  /** Reporting recently, but the token pool is at or near exhaustion. */
   | "degraded"
   /** Last report is older than `STALE_AFTER_SEC`. */
   | "stale"
@@ -113,6 +115,25 @@ export function summarizeTokens(entry: HostEntry): TokenSummary {
   };
 }
 
+/**
+ * A pool is treated as "close to the edge" — worth a `degraded` badge — once
+ * one account or fewer is left to rotate onto, or three quarters of the pool
+ * is spent. Below that line, some accounts being exhausted is the pool
+ * working exactly as designed (the selector rotates away from them), not a
+ * fault: see #4864.
+ */
+const LOW_AVAILABILITY_THRESHOLD = 1;
+const HIGH_EXHAUSTION_FRACTION = 0.75;
+
+/** `true` when the token pool is empty of capacity or nearly so. A pool with
+ * no reported accounts (`total === 0`) is not degraded by this check —
+ * that host simply has not sent a `tokens.snapshot` yet. */
+export function isTokenPoolDegraded(tokens: TokenSummary): boolean {
+  if (tokens.total === 0) return false;
+  const available = tokens.total - tokens.exhausted;
+  return available <= LOW_AVAILABILITY_THRESHOLD || tokens.exhausted / tokens.total >= HIGH_EXHAUSTION_FRACTION;
+}
+
 /** Newest of the two `updatedAt`s. String compare is safe here *only* because
  * both are backend-generated `new Date().toISOString()` values — fixed-width
  * UTC, so lexicographic order is chronological order. */
@@ -139,7 +160,7 @@ export function buildHostView(
     status = "unknown";
   } else if (lastReportAgeSec > STALE_AFTER_SEC) {
     status = "stale";
-  } else if (tokens.exhausted > 0) {
+  } else if (isTokenPoolDegraded(tokens)) {
     status = "degraded";
   } else {
     status = "ok";

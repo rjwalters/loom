@@ -1,12 +1,20 @@
 import { describe, expect, it } from "vitest";
 
-import { STALE_AFTER_SEC, buildFleetView, findHost, sortSweeps, summarizeTokens } from "../src/fleet";
+import {
+  STALE_AFTER_SEC,
+  buildFleetView,
+  findHost,
+  isTokenPoolDegraded,
+  sortSweeps,
+  summarizeTokens,
+} from "../src/fleet";
 import { parseFleetSnapshot } from "../src/parse";
 import {
   DEGRADED_HOST_ID,
   HEALTHY_HOST_ID,
   IDLE_HOST_ID,
   NOW,
+  PARTIALLY_EXHAUSTED_HEALTHY_HOST_ID,
   STALE_HOST_ID,
   SWEEP_ONLY_HOST_ID,
   isoMinutesBefore,
@@ -33,12 +41,20 @@ describe("buildFleetView", () => {
     expect(host?.status).toBe("ok");
   });
 
-  it("classifies host status from report age and token exhaustion", () => {
+  it("classifies host status from report age and token pool availability", () => {
     const built = view();
     expect(findHost(built, HEALTHY_HOST_ID)?.status).toBe("ok");
     expect(findHost(built, DEGRADED_HOST_ID)?.status).toBe("degraded");
     expect(findHost(built, STALE_HOST_ID)?.status).toBe("stale");
     expect(findHost(built, SWEEP_ONLY_HOST_ID)?.status).toBe("unknown");
+  });
+
+  it("renders a partially-spent but functioning pool as ok, not degraded (#4864)", () => {
+    // 14 accounts, 5 exhausted: routine rotation, not a fault. Regression
+    // pin for the "any exhausted account -> degraded" false alarm.
+    const host = findHost(view(), PARTIALLY_EXHAUSTED_HEALTHY_HOST_ID);
+    expect(host?.tokens).toMatchObject({ total: 14, exhausted: 5 });
+    expect(host?.status).toBe("ok");
   });
 
   it("treats the staleness boundary as strictly greater-than", () => {
@@ -87,12 +103,15 @@ describe("buildFleetView", () => {
       SWEEP_ONLY_HOST_ID,
       HEALTHY_HOST_ID,
       IDLE_HOST_ID,
+      PARTIALLY_EXHAUSTED_HEALTHY_HOST_ID,
     ]);
   });
 
   it("counts sweeps and attention-needing hosts", () => {
     const built = view();
     expect(built.totalSweeps).toBe(3);
+    // Only the stale host and the truly-at-the-edge degraded host — not the
+    // partially-exhausted-but-healthy one.
     expect(built.needsAttention).toBe(2);
   });
 
@@ -101,6 +120,40 @@ describe("buildFleetView", () => {
     expect(built.hosts).toEqual([]);
     expect(built.totalSweeps).toBe(0);
     expect(built.needsAttention).toBe(0);
+  });
+});
+
+describe("isTokenPoolDegraded", () => {
+  const pool = (total: number, exhausted: number) => ({
+    accounts: [],
+    total,
+    exhausted,
+    peakUsage: undefined,
+    hasAccountDetail: true,
+  });
+
+  it("is not degraded when no accounts have been reported yet", () => {
+    expect(isTokenPoolDegraded(pool(0, 0))).toBe(false);
+  });
+
+  it("is not degraded for a partially-spent pool with plenty of availability", () => {
+    expect(isTokenPoolDegraded(pool(14, 5))).toBe(false);
+  });
+
+  it("is degraded when zero accounts remain available", () => {
+    expect(isTokenPoolDegraded(pool(5, 5))).toBe(true);
+  });
+
+  it("is degraded when only one account remains available", () => {
+    expect(isTokenPoolDegraded(pool(5, 4))).toBe(true);
+  });
+
+  it("is not degraded once two or more accounts remain available", () => {
+    expect(isTokenPoolDegraded(pool(5, 3))).toBe(false);
+  });
+
+  it("is degraded once exhaustion crosses the 75% threshold, even with 2+ available", () => {
+    expect(isTokenPoolDegraded(pool(20, 15))).toBe(true); // 5 available, 75% exhausted
   });
 });
 

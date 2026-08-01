@@ -9,6 +9,7 @@ import {
   HEALTHY_HOST_ID,
   IDLE_HOST_ID,
   NOW,
+  PARTIALLY_EXHAUSTED_HEALTHY_HOST_ID,
   STALE_HOST_ID,
   SWEEP_ONLY_HOST_ID,
   isoMinutesBefore,
@@ -33,12 +34,13 @@ describe("fleetOverviewView", () => {
       SWEEP_ONLY_HOST_ID,
       HEALTHY_HOST_ID,
       IDLE_HOST_ID,
+      PARTIALLY_EXHAUSTED_HEALTHY_HOST_ID,
     ]);
   });
 
   it("summarizes the fleet above the grid", () => {
     const summary = fleetOverviewView(view(), NOW).querySelector('[data-testid="fleet-summary"]');
-    expect(summary?.textContent).toContain("5 hosts");
+    expect(summary?.textContent).toContain("6 hosts");
     expect(summary?.textContent).toContain("3 active sweeps");
     expect(summary?.textContent).toContain("2 need");
   });
