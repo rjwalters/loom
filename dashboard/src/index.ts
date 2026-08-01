@@ -433,13 +433,43 @@ async function handleDashboardPage(env: Env, isAuthenticated: boolean): Promise<
  * the server-rendered variant. See `web/src/api.ts`. */
 const AUTH_STATE_GLOBAL = "__LOOM_FLEET__";
 
-/** Inject the auth state into the SPA shell as a `<script>` immediately
- * before `</head>`, so it is defined before the module bundle executes.
+/**
+ * Serialize a value for embedding inside an inline `<script>`.
  *
- * `JSON.stringify` on a boolean cannot emit `<`/`&`, so no HTML-escaping
- * pass is needed here; keep it that way if this ever carries a string. */
-function injectAuthState(html: string, isAuthenticated: boolean): string {
-  const tag = `<script>window.${AUTH_STATE_GLOBAL}=${JSON.stringify({ authenticated: isAuthenticated })};</script>`;
+ * An earlier revision noted that `JSON.stringify` of a *boolean* can never
+ * emit `<` or `&`, so no escaping was needed — and warned to revisit that if
+ * the payload ever carried a string. It does now (the operator's email), so
+ * this is that revisit.
+ *
+ * The attack this closes is the classic one: a value containing the literal
+ * `</script>` terminates the block early and everything after it parses as
+ * markup. Escaping `<`, `>` and `&` as `\uXXXX` prevents it — those escapes
+ * are valid inside a JSON string literal and decode back to the original
+ * characters, so the value the browser sees is unchanged.
+ *
+ * The email arrives from a Cloudflare-signed, signature-verified JWT, so this
+ * is defense in depth rather than the primary control. It costs nothing and
+ * removes the need to reason about how much an IdP-supplied claim can be
+ * trusted.
+ */
+function serializeForScript(value: unknown): string {
+  return JSON.stringify(value)
+    .replace(/</g, "\\u003c")
+    .replace(/>/g, "\\u003e")
+    .replace(/&/g, "\\u0026");
+}
+
+/** The auth state the SPA reads out of the page. `email` is present only for
+ * an authenticated viewer, and only when the token carried one. */
+interface InjectedAuthState {
+  authenticated: boolean;
+  email?: string;
+}
+
+/** Inject the auth state into the SPA shell as a `<script>` immediately
+ * before `</head>`, so it is defined before the module bundle executes. */
+function injectAuthState(html: string, state: InjectedAuthState): string {
+  const tag = `<script>window.${AUTH_STATE_GLOBAL}=${serializeForScript(state)};</script>`;
   return html.includes("</head>") ? html.replace("</head>", `${tag}</head>`) : `${tag}${html}`;
 }
 
@@ -468,14 +498,18 @@ async function handleRoot(request: Request, env: Env): Promise<Response> {
   if (env.ASSETS) {
     const shell = await env.ASSETS.fetch(new Request(new URL("/index.html", request.url), { method: "GET" }));
     if (shell.ok) {
-      return new Response(injectAuthState(await shell.text(), isAuthenticated), {
+      const state: InjectedAuthState = isAuthenticated
+        ? { authenticated: true, ...(identity.email ? { email: identity.email } : {}) }
+        : { authenticated: false };
+
+      return new Response(injectAuthState(await shell.text(), state), {
         status: 200,
         headers: {
           "content-type": "text/html; charset=utf-8",
           // Same reasoning as `handleDashboardPage`, and it matters more
-          // here: this body differs between viewers only by the injected
-          // auth flag, which is exactly the kind of near-identical response
-          // a cache is most likely to collapse.
+          // here: this body now carries the viewer's own email, so a shared
+          // cache collapsing two viewers' responses would show one
+          // operator's identity to another.
           "cache-control": "private, no-store",
           vary: "Cookie",
         },
