@@ -117,22 +117,28 @@ describe("hostCard", () => {
     expect(idle.querySelector('[data-testid="card-sweeps"]')).toBeNull();
   });
 
-  it("truncates a long sweep list with a +N more row", () => {
+  // #4868: the card used to stop at three and append "+N more", which on a
+  // working fleet hid most of what the overview exists to show.
+  it("renders every in-flight sweep rather than truncating", () => {
     const built = buildFleetView(
       parseFleetSnapshot({
         hosts: {},
-        activeSweeps: Array.from({ length: 5 }, (_, index) => ({
+        activeSweeps: Array.from({ length: 14 }, (_, index) => ({
           hostId: "busy",
           sweepId: `sweep-${index}`,
           issue: 100 + index,
-          startedAt: isoMinutesBefore(10 - index),
+          startedAt: isoMinutesBefore(20 - index),
         })),
       }),
       NOW,
     );
     const card = hostCard(built.hosts[0]!, NOW);
-    expect(card.querySelectorAll(".card__sweep")).toHaveLength(4);
-    expect(card.querySelector(".card__sweep--more")?.textContent).toBe("+2 more");
+
+    expect(card.querySelectorAll(".card__sweep")).toHaveLength(14);
+    expect(card.querySelector(".card__sweep--more")).toBeNull();
+    // The count in the fields block and the number of rows must agree — they
+    // came from the same array, and a reader will compare them.
+    expect(fieldValue(card, "Active sweeps")).toBe("14");
   });
 
   it("says 'Never reported' instead of a fabricated timestamp", () => {
