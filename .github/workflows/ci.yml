@@ -22,6 +22,7 @@ jobs:
       backend: ${{ steps.filter.outputs.backend }}
       mcp: ${{ steps.filter.outputs.mcp }}
       scripts: ${{ steps.filter.outputs.scripts }}
+      dashboard: ${{ steps.filter.outputs.dashboard }}
     steps:
       - uses: dorny/paths-filter@v4
         id: filter
@@ -37,6 +38,9 @@ jobs:
               - '.github/workflows/ci.yml'
             mcp:
               - 'mcp-loom/**'
+              - '.github/workflows/ci.yml'
+            dashboard:
+              - 'dashboard/**'
               - '.github/workflows/ci.yml'
             scripts:
               - 'scripts/**'
@@ -108,6 +112,35 @@ jobs:
         run: cd mcp-loom && npm test
       - name: Verify build output
         run: test -f mcp-loom/dist/index.js
+
+  dashboard-tests:
+    name: Dashboard Tests (Workers backend + web UI)
+    needs: changes
+    if: always() && (github.event_name == 'push' || needs.changes.outputs.dashboard == 'true')
+    # 442 tests (#4849) across two runtimes that were previously unwired: the
+    # Cloudflare Workers backend (dashboard/, 152 Miniflare/vitest-pool-workers
+    # tests — no Cloudflare credentials needed, runs against local D1 + DO
+    # simulation) and the dashboard UI (dashboard/web/, 290 happy-dom tests).
+    # `npm run check:all` runs both in one command (backend typecheck+test,
+    # then `web`'s typecheck+test via --prefix); `dashboard/package.json`'s
+    # `pretest` hook already runs `scripts/ensure-web-dist.sh` first, since
+    # Wrangler will not parse `wrangler.toml` (and therefore Miniflare will not
+    # boot) until `web/dist/` exists.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "20"
+      - name: Install backend dependencies
+        run: npm ci
+        working-directory: dashboard
+      - name: Install web UI dependencies
+        run: npm ci
+        working-directory: dashboard/web
+      - name: Run backend (Miniflare) + web (happy-dom) suites
+        run: npm run check:all
+        working-directory: dashboard
 
   claude-md-budget:
     name: CLAUDE.md Line Budget
