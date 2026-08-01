@@ -126,8 +126,15 @@ export function isoMinutesBefore(minutes: number, base: Date = NOW): string {
 /** A healthy, busy host: full health, a healthy token pool, two live sweeps. */
 export const HEALTHY_HOST_ID = "fleet-mac-1";
 
-/** Reports fine but one token account is exhausted → `degraded`. */
+/** Reports fine, but only one account is left to rotate onto (2 total, 1
+ * exhausted) → `degraded`: the pool is at the edge, not just "some accounts
+ * spent". */
 export const DEGRADED_HOST_ID = "fleet-linux-2";
+
+/** Reports fine with a large pool and several accounts exhausted, but still
+ * well clear of the degraded thresholds → `ok`. Pins #4864: a partially
+ * spent pool operating exactly as designed must not read as degraded. */
+export const PARTIALLY_EXHAUSTED_HEALTHY_HOST_ID = "fleet-partial-6";
 
 /** Last report is well past `STALE_AFTER_SEC` → `stale`. */
 export const STALE_HOST_ID = "fleet-old-3";
@@ -201,6 +208,46 @@ export function multiHostSnapshot(): unknown {
         health: {
           record: { kind: "host.health", daemon_version: "0.15.0", uptime_sec: 120 },
           updatedAt: isoMinutesBefore(90),
+        },
+      },
+      [PARTIALLY_EXHAUSTED_HEALTHY_HOST_ID]: {
+        health: {
+          record: {
+            kind: "host.health",
+            daemon_version: "0.16.0",
+            uptime_sec: 43_200,
+            logical_cpus: 16,
+            cpu_idle_fraction: 0.6,
+            load_per_core: 0.8,
+            worktree_root_free_gb: 300,
+          },
+          updatedAt: isoMinutesBefore(2),
+        },
+        tokens: {
+          record: {
+            kind: "tokens.snapshot",
+            captured_at: isoMinutesBefore(2),
+            // 14 accounts, 5 exhausted: 9 available (well above the
+            // low-availability threshold) and 5/14 ≈ 0.36 exhausted (well
+            // below the high-exhaustion threshold) — routine rotation.
+            accounts: [
+              { account: "p1", usage_fraction: 1, exhausted: true },
+              { account: "p2", usage_fraction: 1, exhausted: true },
+              { account: "p3", usage_fraction: 1, exhausted: true },
+              { account: "p4", usage_fraction: 1, exhausted: true },
+              { account: "p5", usage_fraction: 1, exhausted: true },
+              { account: "p6", usage_fraction: 0.7, exhausted: false },
+              { account: "p7", usage_fraction: 0.5, exhausted: false },
+              { account: "p8", usage_fraction: 0.4, exhausted: false },
+              { account: "p9", usage_fraction: 0.3, exhausted: false },
+              { account: "p10", usage_fraction: 0.2, exhausted: false },
+              { account: "p11", usage_fraction: 0.1, exhausted: false },
+              { account: "p12", usage_fraction: 0.1, exhausted: false },
+              { account: "p13", usage_fraction: 0.05, exhausted: false },
+              { account: "p14", usage_fraction: 0.05, exhausted: false },
+            ],
+          },
+          updatedAt: isoMinutesBefore(2),
         },
       },
       [IDLE_HOST_ID]: {
