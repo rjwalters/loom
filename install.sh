@@ -60,15 +60,28 @@ header() {
 }
 
 # Detect whether the canonical Repo Skills generic guard is present in the
-# target repo AND carries the rjwalters/repo#29 curl-pipe fix (issue #4041).
-# Presence/version probe only — the marker comment stands in for "has the fix",
-# so no version arithmetic is needed. Anything older (or absent) is treated as
-# absent, matching the identical runtime check in the guard-destructive.sh
-# dispatcher so install-time and runtime always agree on which guard wins.
+# target repo AND passes BOTH runtime probes the guard-destructive.sh
+# dispatcher requires (issue #4041, #4894):
+#   1. VERSION probe — carries the rjwalters/repo#29 curl-pipe fix (the
+#      marker comment stands in for "has the fix", so no version arithmetic
+#      is needed).
+#   2. CAPABILITY probe — also carries the `worktree-write-confinement`
+#      decision tag, i.e. actually implements the Loom-only Bash-tool
+#      write-confinement category (issue #4178), not just the unrelated
+#      repo#29 fix.
+# Both are required, matching the identical two-probe runtime check in the
+# guard-destructive.sh dispatcher, so install-time and runtime always agree on
+# which guard wins — and, critically, so this function never treats the
+# vendored copy as installable-skippable while the dispatcher would still fall
+# back to it (#4894: before this, a canonical guard with repo#29 but without
+# write-confinement caused the vendored fallback to be skipped/removed at
+# install time even though the dispatcher needed it).
 canonical_guard_present() {
   local target="$1"
   local canonical="$target/.claude/skills/repo/hooks/guard-destructive.sh"
-  [[ -r "$canonical" ]] && grep -q 'repo#29' "$canonical" 2>/dev/null
+  [[ -r "$canonical" ]] \
+    && grep -q 'repo#29' "$canonical" 2>/dev/null \
+    && grep -q 'worktree-write-confinement' "$canonical" 2>/dev/null
 }
 
 # Install hooks and CLI wrapper that loom-daemon init doesn't handle.
