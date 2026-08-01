@@ -690,12 +690,20 @@ rm -rf "$PS_STUB_DIR" "$STUB15"
 #     is skipped, NOT reported. The watchdog must never page because its own
 #     optional helper is missing. PATH is narrowed to the base system dirs so
 #     the host's real installed loom-daemon is not picked up, and the marker's
-#     repo_root ($WORKDIR) holds no cargo target either.
+#     repo_root ($WORKDIR) holds no cargo target either. HOME is also
+#     sandboxed to a directory with no .local/bin (#4875's machine-level
+#     install fallback in lib/locate-daemon-bin.sh checks
+#     $LOOM_DAEMON_BIN_DIR/loom-daemon, default $HOME/.local/bin/loom-daemon —
+#     without this override the suite would pick up this host's own real
+#     ~/.local/bin/loom-daemon instead of exercising the "nothing resolvable"
+#     path this test targets).
 # ===================================================================
 STUB16_PS="$(make_ps_stub "02:00:00")"
 start_alive_and_fresh 16
 rm -rf "$PS_STUB_DIR"
-run_watchdog_verbose PATH="$STUB16_PS:/usr/bin:/bin" LOOM_WATCHDOG_IPC_PROBE=1 \
+NO_HOME_16="$WORKDIR/no-home-16"
+mkdir -p "$NO_HOME_16"
+run_watchdog_verbose PATH="$STUB16_PS:/usr/bin:/bin" HOME="$NO_HOME_16" LOOM_WATCHDOG_IPC_PROBE=1 \
     LOOM_DAEMON_BIN="$WORKDIR/definitely-not-a-binary"
 kill "$LIVE_PID" 2>/dev/null || true
 assert_rc 0 "$RC" "no loom-daemon binary resolvable: exits 0 (graceful degrade)"

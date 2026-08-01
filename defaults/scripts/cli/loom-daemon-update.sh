@@ -269,25 +269,22 @@ find_repo_root() {
     echo ""
 }
 
-# ---------- locate the daemon binary (mirrors loom-daemon-start.sh) ----------
-locate_daemon_bin() {
-    local root="$1"
-    if [[ -n "${LOOM_DAEMON_BIN:-}" && -x "${LOOM_DAEMON_BIN}" ]]; then
-        echo "${LOOM_DAEMON_BIN}"; return 0
-    fi
-    if command -v loom-daemon >/dev/null 2>&1; then
-        command -v loom-daemon; return 0
-    fi
-    local candidate
-    for candidate in \
-        "$root/loom-daemon/target/release/loom-daemon" \
-        "$root/loom-daemon/target/debug/loom-daemon" \
-        "$root/target/release/loom-daemon" \
-        "$root/target/debug/loom-daemon"; do
-        if [[ -x "$candidate" ]]; then echo "$candidate"; return 0; fi
-    done
-    echo ""
-}
+# ---------- locate the daemon binary ----------
+# Shared with loom-daemon-start.sh / loom-daemon-watchdog.sh / loom-status.sh
+# / `.loom/bin/loom health` via lib/locate-daemon-bin.sh (#4875) — includes
+# the machine-level $LOOM_DAEMON_BIN_DIR (default ~/.local/bin) fallback,
+# reusing the SAME variable this script's own --provision path already
+# writes to (see DEST_DIR below), so discovery and provisioning can never
+# point at different directories.
+_LOOM_LOCATE_BIN_LIB="$SCRIPT_DIR/../lib/locate-daemon-bin.sh"
+if [[ -r "$_LOOM_LOCATE_BIN_LIB" ]]; then
+    # shellcheck source=../lib/locate-daemon-bin.sh
+    source "$_LOOM_LOCATE_BIN_LIB"
+else
+    err "locate-daemon-bin.sh not found at $_LOOM_LOCATE_BIN_LIB — this checkout is missing an expected lib file."
+    exit 1
+fi
+locate_daemon_bin() { loom_locate_daemon_bin "$1"; }
 
 # Extract the short commit from `loom-daemon --version` output, e.g.
 # "loom-daemon 0.15.0 (commit ab12cd3, built 2026-07-26T12:00:00Z)" -> ab12cd3
@@ -705,7 +702,8 @@ fi
 
 UPDATE_NEEDED=false
 if [[ -z "$DAEMON_BIN" ]]; then
-    echo "No loom-daemon binary currently resolvable (LOOM_DAEMON_BIN / PATH / loom-daemon/target/release) — a build is needed."
+    echo "No loom-daemon binary currently resolvable — a build is needed. Checked:"
+    loom_daemon_bin_search_paths "$REPO_ROOT" | sed 's/^/  - /'
     UPDATE_NEEDED=true
 elif [[ "$INSTALLED_COMMIT" == "unknown" || "$SOURCE_COMMIT" == "unknown" ]]; then
     warn "Could not determine one or both commits (installed=$INSTALLED_COMMIT, source=$SOURCE_COMMIT) — staleness unknown; treating as needing a rebuild to be safe."

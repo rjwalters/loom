@@ -195,6 +195,15 @@ if [[ -r "$_LOOM_LAUNCHD_LIB_DIR/bounded-run.sh" ]]; then
     # shellcheck source=../lib/bounded-run.sh
     source "$_LOOM_LAUNCHD_LIB_DIR/bounded-run.sh"
 fi
+# loom_locate_daemon_bin() (#4875, shared with loom-daemon-start.sh /
+# loom-daemon-update.sh / loom-status.sh / `.loom/bin/loom health`) — includes
+# the machine-level ~/.local/bin fallback so this watchdog (which runs from a
+# systemd/launchd timer with a minimal, non-login environment) still finds a
+# machine-level install even though $PATH never carries ~/.local/bin here.
+if [[ -r "$_LOOM_LAUNCHD_LIB_DIR/locate-daemon-bin.sh" ]]; then
+    # shellcheck source=../lib/locate-daemon-bin.sh
+    source "$_LOOM_LAUNCHD_LIB_DIR/locate-daemon-bin.sh"
+fi
 
 VERBOSE=false
 while [[ $# -gt 0 ]]; do
@@ -339,32 +348,21 @@ process_age_secs() {
 
 # ---------- bounded in-band IPC probe (#4398) ----------
 
-# Resolve the loom-daemon binary the probe should invoke, in the SAME order
-# loom-daemon-start.sh's `locate_daemon_bin` uses (LOOM_DAEMON_BIN override ->
-# PATH -> in-repo cargo targets) so the watchdog and the start path can never
-# disagree about which binary is "the" daemon CLI. Echoes nothing and returns 1
-# when nothing is resolvable — the caller must then SKIP the probe, never
-# report a divergence: a watchdog that pages because its own optional helper
-# is missing is worse than one that quietly keeps doing the other two checks.
+# Resolve the loom-daemon binary the probe should invoke, via the shared
+# loom_locate_daemon_bin() (lib/locate-daemon-bin.sh, sourced above) so this
+# watchdog, loom-daemon-start.sh, loom-daemon-update.sh, loom-status.sh and
+# `.loom/bin/loom health` can never disagree about which binary is "the"
+# daemon CLI. Preserves this function's original contract (thin wrapper):
+# echoes nothing and returns 1 when nothing is resolvable — the caller must
+# then SKIP the probe, never report a divergence: a watchdog that pages
+# because its own optional helper is missing is worse than one that quietly
+# keeps doing the other two checks.
 locate_daemon_bin() {
-    if [[ -n "${LOOM_DAEMON_BIN:-}" && -x "${LOOM_DAEMON_BIN}" ]]; then
-        echo "${LOOM_DAEMON_BIN}"; return 0
-    fi
-    if command -v loom-daemon >/dev/null 2>&1; then
-        command -v loom-daemon; return 0
-    fi
-    local root candidate
+    local root bin
     root="$(marker_get repo_root 2>/dev/null)"
-    if [[ -n "$root" ]]; then
-        for candidate in \
-            "$root/loom-daemon/target/release/loom-daemon" \
-            "$root/loom-daemon/target/debug/loom-daemon" \
-            "$root/target/release/loom-daemon" \
-            "$root/target/debug/loom-daemon"; do
-            if [[ -x "$candidate" ]]; then echo "$candidate"; return 0; fi
-        done
-    fi
-    return 1
+    bin="$(loom_locate_daemon_bin "$root")"
+    [[ -n "$bin" ]] || return 1
+    echo "$bin"
 }
 
 # bounded_run() — a HARD wall-clock budget around a command, returning 124 on
