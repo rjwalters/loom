@@ -1653,6 +1653,8 @@ For each issue `N` in the wave, before any role skill is invoked:
 
 > **Pre-flight skip rule.** If `K` of the wave's `N` candidates are skipped at pre-flight (closed, `loom:building`, `loom:blocked`, `loom:operator-only`, or multi-PR ambiguity), dispatch only `N - K` builders for this wave. Issues routed to Judge or Merge via the existing-PR rules consume a wave slot but skip the Builder dispatch. **Do not pull a candidate forward** from the next wave to backfill. Wave boundaries stay clean, and the next wave runs at its originally planned size.
 
+> **This per-issue check is not the only re-verification point.** When a daemon/champion is active in the repo (roleRunner/champion-on-idle, or the legacy daemon), the wave *plan* itself can go stale between waves — see "8a. Wave-boundary candidate re-verification" below, which re-runs this same existing-PR probe and these same skip rules across the **whole remaining candidate list** once per wave boundary, complementing (not replacing) this per-issue check (#4884).
+
 ### 2. Curator phase (still per-issue, before the wave dispatch)
 
 For each surviving issue `N` in the wave:
@@ -2019,6 +2021,22 @@ Under `--dry-run` the gate does not run (no checkout, no command execution); the
 
 Once the gate has passed (or is not configured), advance to the next wave. Do not start the next wave's builders until the current wave's PRs are all settled and the integration gate (if configured) is green.
 
+### 8a. Wave-boundary candidate re-verification (daemon/champion-active only, #4884)
+
+The wave *plan* — which candidates land in which wave — is computed once, at the confirmation gate, before wave 1 ever starts. Per-issue pre-flight (step 1) re-verifies **one** issue immediately before it enters its own wave, but nothing re-checks the **rest of the still-queued candidate list** in between waves. When a daemon or Champion is independently active in the same repo, that gap is real: it can merge PRs and close issues out from under a plan the orchestrator has not looked at again since the confirmation gate (the #4884 incident — see "Modern daemon coexistence" below — merged 3 PRs and closed 4 issues while sweep waves 1-2 were still running, completing the entirety of the planned wave 4 and part of wave 3).
+
+**Trigger.** Immediately after step 8's integration gate settles and before partitioning/dispatching the next wave (i.e. at every wave boundary except after the final wave, where there is no next wave to protect), check whether a daemon/champion is active using the detection already defined in "Coexistence (peer `/loom:sweep` and legacy daemon)" below — either the legacy `.loom/daemon-loop.pid` liveness check, **or** the modern case this issue is about: a reachable `loom-daemon` (reuse this run's Stage -1 `PROBE_DAEMON` result if already probed; otherwise a fresh 500ms `Ping`) whose resolved `.loom/config.json` has `autonomous.roleRunner.enabled=true` with `champion` present in `roleRunner.roles` (interval cadence) or `roleRunner.onIdle` (idle-edge cadence, #4364 — "champion-on-idle"). If neither signal is active, this step is a **no-op** — fall straight through to "advance to the next wave" exactly as step 8 already says, at zero added cost to the common single-runner case.
+
+**When triggered**, before computing/dispatching the next wave's partition, re-read live forge state for **every** remaining (not-yet-dispatched) candidate in this sweep's list — the whole tail of the plan, not just the next issue up — and apply the **existing** step 1 rules, unchanged, to each:
+
+- `gh issue view N --json state,labels,closedByPullRequestsReferences` per remaining candidate (uncached, same claim-arbitration rationale as step 1's per-issue read — a stale answer here is exactly the window a duplicate build or a stale Judge would slip through).
+- Route each candidate through step 1's existing rules verbatim: closed → drop from the remaining list; `loom:building` (and not this sweep's own claim, per Step 1a) → drop; `loom:blocked` / `loom:operator-only` → drop; the existing-PR probe (closing-keyword + timeline cross-reference union, both sources) → route to Judge/Merge instead of Builder, exactly as step 1 already does. When `SWEEP_ALL_AGGRESSIVE=true`, apply the aggressive-mode override / "Aggressive candidate taxonomy" table here too, not the conservative skips — same substitution rule step 1 already documents. **This step invents no new routing** — it is step 1's rules, re-run in a batch, at a different cadence.
+- **New outcome class: "completed externally."** A remaining candidate found already **closed** here, whose close this sweep did not itself just perform (no `merge-done`/`judge-done` checkpoint written by *this run* for it), is classified `completed externally (daemon/champion)` rather than plain `skipped` — it did not fail pre-flight, it was finished by something else. Carry this classification into the Summary Output (see below) so a wave that looks "empty" is legible as external completion, not sweep failure.
+- **Checkpoint hygiene.** For any candidate dropped here, delete a live `.loom/sweep-checkpoint/issue-<N>.json` immediately (`sweep-checkpoint.sh delete N`) rather than leaving it to be discovered later — this is the same stale-checkpoint cleanup step 1 performs on a closed issue at pre-flight, just applied proactively at the wave boundary so a candidate dropped here (and therefore never reaching its own step 1) doesn't strand an orphaned checkpoint for a future sweep run to trip over.
+- **Scope.** Only touches the remaining, not-yet-processed tail of the candidate list — never re-touches a wave that has already settled (merged/blocked candidates from earlier waves are done, not re-opened by this step).
+
+This step composes with, and does not replace, step 1: every surviving candidate still gets its own per-issue pre-flight immediately before its own dispatch, same as today — defense in depth against the (much shorter) window between this wave-boundary batch check and that candidate's actual dispatch. It also does not interact with `--auto-stack` ordering, `--builders-per-wave` sizing, or the step 8 integration gate — it only ever **drops or reroutes** candidates already in the plan; it never adds one or mutates a candidate this sweep has already dispatched a builder for.
+
 ## Summary Output
 
 When the entire list has been processed, print a summary table that includes wave membership for each issue:
@@ -2036,13 +2054,17 @@ When the entire list has been processed, print a summary table that includes wav
   #199  → routed  (existing PR #200, judged in this wave)                [wave 2]
   #198  → merged  (existing PR #201, was loom:pr)                        [wave 2]
   #197  → skipped (multiple open PRs reference issue: #210, #211)        [wave 2]
+  #196  → completed externally (daemon/champion; PR #212 merged, closed before wave 3) [wave 3]
+  #195  → completed externally (daemon/champion; issue closed, no PR)    [wave 3]
 
-Total: 5 merged, 2 blocked, 2 skipped, 1 rate-limited (unresumable).
+Total: 5 merged, 2 blocked, 2 skipped, 1 rate-limited (unresumable), 2 completed externally.
 ```
 
 Wave annotation makes it easier to triage failures (e.g., "every issue in wave 2 failed → probably a base-branch problem, not the issues themselves").
 
 **`rate-limited` vs `blocked` (issue #3683).** These are semantically distinct — reuse the `TOKEN_EXPIRED` / `TOKEN_EXHAUSTED` vocabulary from `.loom/scripts/lib/classify-error.sh` for the reason. `blocked (...)` means the **work itself** failed (build error, doctor cycle exhausted) and a human must fix the actual problem. `rate-limited (...)` means only that a role subagent was killed by an account rate limit mid-phase, so an **extra orchestrator pass** was needed to reach the phase's expected exit state — it says nothing about work quality. A `rate-limited (resumed: <what completed>)` outcome already succeeded (the mid-phase-death recovery finished the missing steps); only a `rate-limited (unresumable: ...)` outcome — where the forge state cannot be recovered without human help — needs attention.
+
+**`completed externally` vs sweep-driven outcomes (issue #4884).** A third axis, distinct from both of the above: `completed externally (daemon/champion; ...)` means the candidate reached a terminal state (merged or closed) **without this sweep run doing the work** — a daemon/champion (roleRunner/champion-on-idle, or the legacy daemon) merged its PR or closed it independently, and this sweep's "8a. Wave-boundary candidate re-verification" (or step 1's per-issue pre-flight) discovered that on re-read rather than performing the merge/build itself. It is **not** a `merged` (this sweep did not produce or land that PR), **not** a `blocked` (nothing failed), and **not** a plain `skipped` (the candidate did not fail a pre-flight condition — it simply finished elsewhere first). Keep the three axes separate in the summary: `merged`/`routed` = this sweep drove the outcome; `blocked`/`skipped`/`rate-limited` = this sweep could not or did not proceed; `completed externally` = some other actor already finished the job. A wave with several `completed externally` entries is a signal the operator may want to check whether a daemon/champion is racing the sweep (see "Modern daemon coexistence" in Coexistence, below), not a sign the sweep itself is malfunctioning.
 
 ## Session Transcript Archival (completion hook, #3726)
 
@@ -2151,6 +2173,14 @@ fi
 ```
 
 Do not auto-stop the daemon. Do not block on this warning — proceed with the sweep. The same dead-PID liveness pattern (`kill -0`) is used by peer-`/loom:sweep` detection.
+
+### Modern daemon coexistence (`autonomous.roleRunner` / champion-on-idle, #4884)
+
+> **This is a different mechanism from "Legacy daemon coexistence" above — do not conflate the two.** The legacy PID-file daemon only ever raced `/loom:sweep` for `loom:issue` **label claims**. The modern Rust `loom-daemon`'s role runner is materially more disruptive: `autonomous.roleRunner.enabled=true` with `champion` in `roleRunner.roles` (interval cadence, every 5-15 min per role) or in `roleRunner.onIdle` (idle-edge cadence, #4364 — the config commonly called "champion-on-idle") periodically dispatches a live Champion subagent that **merges approved PRs and closes issues directly on the forge**, not merely claims labels. See [`.loom/docs/daemon-reference.md`](../../../.loom/docs/daemon-reference.md) for the full `roleRunner` config surface.
+
+A `/loom:sweep` run sharing a repo with an active role-runner Champion can therefore find its own planned candidates already merged or closed by a later wave — externally completing part of the wave plan the confirmation gate committed to. This is the exact incident #4884 documents: on 2026-07-31, the daemon's role-runner Champion merged 3 PRs and closed 4 issues while a sweep's waves 1-2 were still running, completing the sweep's entire planned wave 4 and part of wave 3 before those waves ever started.
+
+**Coexistence behavior:** `/loom:sweep` does not pause, stop, or coordinate with a role-runner Champion — same no-daemon-state-writes posture as the legacy-daemon case above. Instead, the two re-verification defenses catch the drift: per-issue pre-flight (step 1 of the Wave Lifecycle) re-reads live state for each candidate immediately before it is dispatched, and "8a. Wave-boundary candidate re-verification" (Wave Lifecycle, #4884) re-reads the **entire remaining candidate list** at every wave boundary specifically because a role-runner Champion can complete several candidates between waves, not just between pre-flight and dispatch of one issue. A candidate found already merged/closed by either check is logged and surfaced in the Summary Output as `completed externally (daemon/champion)`, distinct from a sweep-driven `merged`/`blocked`/`skipped` outcome (see "Summary Output" above). Detecting whether a role-runner Champion is active: a reachable `loom-daemon` (Stage -1's `PROBE_DAEMON`, reused if already probed this run) whose resolved `.loom/config.json` has `autonomous.roleRunner.enabled=true` with `champion` in `roleRunner.roles` or `roleRunner.onIdle`. As with the legacy-daemon and peer-`/loom:sweep` cases, this is **loud but non-blocking**: warn once (naming which mechanism was detected — legacy PID-file vs. modern role-runner), never auto-stop the daemon or Champion, never block the sweep.
 
 ## Constraints
 
