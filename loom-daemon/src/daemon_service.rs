@@ -30,6 +30,7 @@ use loom_daemon::token_ranking_refresh;
 use loom_daemon::watch_registry;
 use loom_daemon::work_finder;
 use loom_daemon::workspace_pool::WorkspacePool;
+use loom_daemon::worktree_reaper;
 use loom_daemon::{extract_configured_terminal_ids, rotate_log_file};
 
 use anyhow::{anyhow, Result};
@@ -1018,6 +1019,42 @@ pub(crate) async fn run_daemon() -> Result<()> {
             );
             None
         };
+
+    // Periodic merged-PR worktree reaper (Issue #4876). Before this loop the
+    // ONLY trigger for "auto-removed when their PR merges" (CLAUDE.md's stated
+    // contract) was `merge-pr.sh`'s synchronous `_remove_loom_worktree()` — so a
+    // PR merged on a different HOST, in a different CHECKOUT, through the forge
+    // UI/API, or while the daemon was down left its worktree behind forever.
+    // Across a three-host fleet that leaked 44 worktrees (81% disk) on one
+    // worker and 35 on the primary host. This loop makes every host reap its own
+    // worktrees from forge state on a cadence, independent of who merged.
+    //
+    // Multi-workspace like the health gate / ranking refresh: it walks
+    // `effective_roots()` each tick, so cleanup is NOT limited to the daemon's
+    // attached workspace (a daemon attached to `~/GitHub/anvil` still reaps
+    // `~/GitHub/loom` when that repo is registered).
+    //
+    // Default-ON (like the ranking refresh, unlike the work finder / gate): it
+    // restores an already-documented behavior, and its removal decision is
+    // `worktree_ops::clean::classify_worktree` under `--safe, !--force` PLUS a
+    // `.loom-managed` sentinel requirement the interactive CLI does not apply —
+    // i.e. a strict subset of what `loom-daemon clean --safe` would remove.
+    // Opt out with `LOOM_WORKTREE_REAPER=0` / `autonomous.worktreeReaper.enabled=false`.
+    let worktree_reaper_config = worktree_reaper::read_worktree_reaper_config(&sweep_workspace);
+    let _worktree_reaper_handle = if worktree_reaper::resolve_enabled(&worktree_reaper_config) {
+        let interval = worktree_reaper::resolve_interval(&worktree_reaper_config);
+        log::info!("worktree_reaper: enabled (multi-workspace, interval={}s)", interval.as_secs());
+        Some(worktree_reaper::spawn_multi_worktree_reaper_task(
+            sweep_workspace.clone(),
+            interval,
+        ))
+    } else {
+        log::debug!(
+            "worktree_reaper: disabled (set LOOM_WORKTREE_REAPER=0 or \
+             autonomous.worktreeReaper.enabled=false to opt out)"
+        );
+        None
+    };
 
     // Declared-cadence liveness heartbeat (Issue #4011): the daemon touches
     // `<loom_dir>/daemon.heartbeat` on a fixed cadence so a host-side watchdog
