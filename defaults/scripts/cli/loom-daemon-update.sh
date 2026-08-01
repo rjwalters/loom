@@ -1144,11 +1144,16 @@ fi
 # Non-interactive SSH sessions (the fleet remote-update path, #4695) don't
 # source a login shell's profile, so a rustup-installed cargo living at the
 # default `~/.cargo/bin` is invisible to `command -v cargo` even though it IS
-# installed. Fall back the same way loom-daemon-start.sh:233 already does for
-# launchd/systemd's non-login-shell PATH: prefer sourcing rustup's own
-# `~/.cargo/env` (the canonical PATH-setup snippet rustup writes), and fall
-# back to prepending `~/.cargo/bin` directly if that script isn't present but
-# the binary still is (e.g. a non-rustup or partially-cleaned install).
+# installed. Fall back the same way loom-daemon-start.sh's resolve_plist_path()
+# already does for launchd/systemd's non-login-shell PATH: prefer sourcing
+# rustup's own `~/.cargo/env` (the canonical PATH-setup snippet rustup
+# writes), then fall back to prepending `~/.cargo/bin` directly if that
+# script isn't present but the binary still is (e.g. a non-rustup or
+# partially-cleaned install), then finally fall back to the FULL shared
+# canonical PATH superset (lib/canonical-daemon-path.sh, #4831 — the same set
+# resolve_plist_path() renders and fleet add-worker's provisioning uses) in
+# case `cargo` was installed via Homebrew or another non-rustup path this
+# script doesn't special-case.
 if ! command -v cargo >/dev/null 2>&1; then
     if [[ -f "$HOME/.cargo/env" ]]; then
         # shellcheck disable=SC1091
@@ -1158,7 +1163,17 @@ if ! command -v cargo >/dev/null 2>&1; then
     fi
 fi
 if ! command -v cargo >/dev/null 2>&1; then
-    err "cargo not found on PATH (checked \$HOME/.cargo/bin too) — cannot rebuild loom-daemon. Install Rust via rustup: https://rustup.rs"
+    _LOOM_CANONICAL_PATH_LIB="$SCRIPT_DIR/../lib/canonical-daemon-path.sh"
+    if [[ -r "$_LOOM_CANONICAL_PATH_LIB" ]]; then
+        # shellcheck source=../lib/canonical-daemon-path.sh
+        source "$_LOOM_CANONICAL_PATH_LIB"
+        if declare -F canonical_daemon_path >/dev/null 2>&1; then
+            export PATH="$(canonical_daemon_path):$PATH"
+        fi
+    fi
+fi
+if ! command -v cargo >/dev/null 2>&1; then
+    err "cargo not found on PATH (checked \$HOME/.cargo/bin and the shared canonical PATH too, see lib/canonical-daemon-path.sh) — cannot rebuild loom-daemon. Install Rust via rustup: https://rustup.rs"
     exit 1
 fi
 

@@ -214,6 +214,16 @@ if [[ -r "$_LOOM_LAUNCHD_LIB_DIR/bounded-run.sh" ]]; then
     # shellcheck source=../lib/bounded-run.sh
     source "$_LOOM_LAUNCHD_LIB_DIR/bounded-run.sh"
 fi
+# canonical_daemon_path() (#4831) — the single shared canonical PATH superset
+# (~/.local/bin, ~/.cargo/bin, Homebrew, standard system dirs) resolve_plist_path()
+# below renders into every plist/unit. Extracted out of this script so the
+# fleet provisioning path (loom-daemon/src/fleet/add_worker.rs) and the
+# self-update cargo fallback (loom-daemon-update.sh, #4695) can agree with it
+# instead of maintaining their own disagreeing partial copies.
+if [[ -r "$_LOOM_LAUNCHD_LIB_DIR/canonical-daemon-path.sh" ]]; then
+    # shellcheck source=../lib/canonical-daemon-path.sh
+    source "$_LOOM_LAUNCHD_LIB_DIR/canonical-daemon-path.sh"
+fi
 
 # resolve_plist_path() — the deterministic PATH baked into every rendered
 # plist (daemon + watchdog), issue #4172. Previously the rendered PATH was
@@ -234,10 +244,20 @@ fi
 #                               shell's interactive PATH.
 #   3. Default: the canonical minimal PATH -- exactly the pre-#4172 fallback
 #      set (~/.local/bin, ~/.cargo/bin, Homebrew, standard bin dirs, already
-#      sufficient for gh/git/cargo/python3), with NO shell-PATH prefix. This
-#      makes a bare re-render byte-for-byte reproducible across hosts/sessions.
+#      sufficient for gh/git/cargo/python3), sourced from
+#      lib/canonical-daemon-path.sh (#4831) so this is no longer the only
+#      place that set is spelled out, with NO shell-PATH prefix. This makes a
+#      bare re-render byte-for-byte reproducible across hosts/sessions.
 resolve_plist_path() {
-    local canonical="${HOME}/.local/bin:${HOME}/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+    local canonical
+    if declare -F canonical_daemon_path >/dev/null 2>&1; then
+        canonical="$(canonical_daemon_path)"
+    else
+        # Degraded fallback if lib/canonical-daemon-path.sh could not be
+        # sourced (e.g. a partial/corrupted install) -- keep byte-for-byte
+        # identical to the lib's definition.
+        canonical="${HOME}/.local/bin:${HOME}/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+    fi
     if [[ -n "${LOOM_DAEMON_PATH:-}" ]]; then
         echo "Rendered plist PATH: full override via LOOM_DAEMON_PATH -> ${LOOM_DAEMON_PATH}" >&2
         printf '%s' "${LOOM_DAEMON_PATH}"

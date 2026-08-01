@@ -46,6 +46,7 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
+use super::path_bootstrap;
 use super::{CommandOutput, FleetRegistry, WorkerRecord};
 
 /// Default per-host SSH connect + collection timeout (seconds).
@@ -328,13 +329,27 @@ impl HostStatusSource for SshStatusSource {
 
 /// Run one `shell` on `host` over `ssh`, with a bounded connect timeout and no
 /// stdin (status collection never feeds a payload).
+///
+/// `ssh host '<cmd>'` runs `<cmd>` under the remote user's default shell in
+/// **non-interactive, non-login** mode — it does NOT source `~/.profile` (the
+/// canonical PATH #4831 wires into `~/.profile` on a provisioned worker, see
+/// `add_worker.rs::render_machine_layout`), so a bare `loom-daemon` on the
+/// remote command line is only found if the remote sshd's own default PATH
+/// (`/etc/environment`, `sshd_config`'s `PATH=` in `AcceptEnv`/`SetEnv`, or
+/// the shell's non-interactive startup file) happens to include
+/// `$HOME/.local/bin`. Rather than depend on that, every remote command this
+/// module runs is prefixed with the same canonical PATH export line
+/// [`super::add_worker`]'s provisioning steps use, so `loom-daemon` (and, for
+/// the safehouse probe, `pgrep`) resolve deterministically regardless of the
+/// remote shell's non-interactive PATH.
 fn run_ssh(host: &str, shell: &str, connect_timeout_secs: u64) -> Result<CommandOutput> {
+    let remote_command = format!("{}{shell}", path_bootstrap::canonical_path_export_line());
     let mut cmd = Command::new("ssh");
     cmd.arg("-o").arg("BatchMode=yes");
     cmd.arg("-o")
         .arg(format!("ConnectTimeout={connect_timeout_secs}"));
     cmd.arg(host);
-    cmd.arg(shell);
+    cmd.arg(&remote_command);
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
@@ -1183,5 +1198,51 @@ mod tests {
         let report = HostReport::local_down("daemon not running".to_string());
         assert_eq!(report.state, HostState::DaemonDown);
         assert!(report.is_local);
+    }
+
+    // ---- run_ssh PATH bootstrap (#4831) --------------------------------
+
+    /// [`run_ssh`] must prefix EVERY remote command with the canonical PATH
+    /// export line (#4831) — `ssh host '<cmd>'` runs `<cmd>` non-interactively
+    /// and non-login, so a bare `loom-daemon status --json` is not guaranteed
+    /// to resolve on a clean remote PATH. Verified end-to-end against a stub
+    /// `ssh` on PATH (rather than asserting on private string-building logic)
+    /// so this fails if the prefix is ever dropped from the actual spawned
+    /// command, not just from an internal helper.
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial(status_rs_stub_ssh_path)]
+    fn run_ssh_prefixes_canonical_path_export() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let stub_dir = tempfile::tempdir().unwrap();
+        let stub_ssh = stub_dir.path().join("ssh");
+        // Echo the LAST argv (the remote command ssh would have run) to
+        // stdout, verbatim -- this is exactly what `run_ssh` constructs and
+        // passes to the real `ssh` binary.
+        std::fs::write(&stub_ssh, "#!/bin/sh\neval \"last=\\$$#\"\necho \"$last\"\n").unwrap();
+        let mut perms = std::fs::metadata(&stub_ssh).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&stub_ssh, perms).unwrap();
+
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{old_path}", stub_dir.path().display()));
+
+        let result = run_ssh("worker-stub", "loom-daemon status --json", 5);
+
+        std::env::set_var("PATH", old_path);
+
+        let out = result.unwrap();
+        assert!(out.ok(), "stub ssh must succeed: {out:?}");
+        assert!(
+            out.stdout.contains("export PATH=\"${HOME}/.local/bin:${HOME}/.cargo/bin"),
+            "run_ssh must prefix the remote command with the canonical PATH export (#4831), got: {}",
+            out.stdout
+        );
+        assert!(
+            out.stdout.contains("loom-daemon status --json"),
+            "run_ssh must still send the original remote command after the PATH prefix, got: {}",
+            out.stdout
+        );
     }
 }

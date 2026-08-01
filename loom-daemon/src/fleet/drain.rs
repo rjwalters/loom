@@ -346,11 +346,20 @@ pub trait ClaimResetter {
 /// The production [`ClaimResetter`]: `gh issue view` to check the current
 /// label set, then `gh issue edit` + `gh issue comment` to flip it — run
 /// **locally** (never over SSH; the forge is global).
+///
+/// Each `gh` invocation is given an explicit `PATH` env (via
+/// [`super::path_bootstrap::local_gh_path_env`]) rather than relying on this
+/// process's inherited environment (#4831): a `loom-daemon` launched
+/// non-interactively (launchd/systemd) may not have `gh`/Homebrew on its
+/// inherited PATH even though an interactive login shell on the same host
+/// would.
 pub struct GhClaimResetter;
 
 impl ClaimResetter for GhClaimResetter {
     fn reset_claim(&self, repo: &str, issue: u32, host: &str) -> Result<bool> {
+        let gh_path = super::path_bootstrap::local_gh_path_env();
         let view = Command::new("gh")
+            .env("PATH", &gh_path)
             .args([
                 "issue",
                 "view",
@@ -380,6 +389,7 @@ impl ClaimResetter for GhClaimResetter {
         }
 
         let edit = Command::new("gh")
+            .env("PATH", &gh_path)
             .args([
                 "issue",
                 "edit",
@@ -405,6 +415,7 @@ impl ClaimResetter for GhClaimResetter {
         // Best-effort comment — never fails the reset itself (mirrors the
         // rest of Loom's "a forge comment is advisory" posture).
         let _ = Command::new("gh")
+            .env("PATH", &gh_path)
             .args([
                 "issue",
                 "comment",
@@ -1869,5 +1880,101 @@ mod tests {
         assert!(!reports.iter().any(|r| r.outcome.is_failure()));
 
         std::env::remove_var(super::super::FLEET_REGISTRY_PATH_ENV);
+    }
+
+    // ---- GhClaimResetter PATH bootstrap (#4831) -----------------------
+
+    /// Write an executable stub `gh` that dispatches on the subcommand
+    /// (`issue view` / `issue edit` / `issue comment`) at
+    /// `<dir>/gh`, mirroring just enough of the real `gh` CLI's output shape
+    /// for [`GhClaimResetter::reset_claim`] to exercise its full parse/branch
+    /// logic against a *resolved-via-PATH* binary rather than a mocked trait.
+    #[cfg(unix)]
+    fn write_stub_gh(dir: &std::path::Path, has_building_label: bool) {
+        use std::os::unix::fs::PermissionsExt;
+        let script = format!(
+            r#"#!/bin/sh
+case "$2" in
+  view)
+    echo '{{"labels":[{{"name":"{label}"}}]}}'
+    ;;
+  edit|comment)
+    ;;
+esac
+exit 0
+"#,
+            label = if has_building_label {
+                "loom:building"
+            } else {
+                "some-other-label"
+            }
+        );
+        let gh_path = dir.join("gh");
+        std::fs::write(&gh_path, script).unwrap();
+        let mut perms = std::fs::metadata(&gh_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&gh_path, perms).unwrap();
+    }
+
+    /// [`GhClaimResetter`] must resolve `gh` via the canonical PATH built by
+    /// [`super::super::path_bootstrap::local_gh_path_env`] — specifically
+    /// `$HOME/.local/bin` — even when the real `gh` (if any) elsewhere on
+    /// this process's inherited PATH is NOT what should win. Proves the
+    /// canonical set is prepended (highest precedence), not merely appended,
+    /// closing the #4831 gap where `GhClaimResetter` previously ran with
+    /// whatever PATH the daemon process happened to inherit.
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial(env_home_path)]
+    fn gh_claim_resetter_resolves_gh_via_canonical_home_local_bin() {
+        let fake_home = tempfile::tempdir().unwrap();
+        let local_bin = fake_home.path().join(".local/bin");
+        std::fs::create_dir_all(&local_bin).unwrap();
+        write_stub_gh(&local_bin, true);
+
+        let old_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", fake_home.path());
+
+        let result = GhClaimResetter.reset_claim("rjwalters/loom", 4831, "worker-stub");
+
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+
+        // The stub reports the issue still `loom:building`, so a successful
+        // resolve-and-run flips it (Ok(true)); a PATH miss would instead
+        // surface as an `Err` ("gh issue view ... failed" / launch failure)
+        // or (if some unrelated real `gh` on the inherited PATH answered
+        // first) a result inconsistent with our stub's scripted labels.
+        assert!(
+            matches!(result, Ok(true)),
+            "expected GhClaimResetter to resolve+run the stub gh via $HOME/.local/bin, got {result:?}"
+        );
+    }
+
+    /// Same resolution path, but the stub reports the issue as NOT holding
+    /// `loom:building` — [`GhClaimResetter::reset_claim`] must short-circuit
+    /// to `Ok(false)` without attempting `issue edit`/`issue comment`.
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial(env_home_path)]
+    fn gh_claim_resetter_no_op_when_label_absent() {
+        let fake_home = tempfile::tempdir().unwrap();
+        let local_bin = fake_home.path().join(".local/bin");
+        std::fs::create_dir_all(&local_bin).unwrap();
+        write_stub_gh(&local_bin, false);
+
+        let old_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", fake_home.path());
+
+        let result = GhClaimResetter.reset_claim("rjwalters/loom", 4831, "worker-stub");
+
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert!(matches!(result, Ok(false)));
     }
 }
