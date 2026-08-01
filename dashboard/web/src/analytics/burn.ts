@@ -2,14 +2,27 @@
  * Per-account burn curves: `usage_fraction` over time, reconstructed from
  * `tokens.snapshot` history (Epic #4702, Phase 3, issue #4752).
  *
- * ## Series identity is `hostId` + `account`, not `account` alone
+ * ## Series identity is the `account`; `hostId` is provenance (#4898)
  *
- * The token pool is a **per-host** resource (`.loom/tokens/` lives on the
- * machine running `loom-daemon`), and `tokens.snapshot` carries no repo but
- * does arrive under a `hostId` envelope. Two hosts can legitimately have
- * accounts with the same name — pooling them into one series would interleave
- * two independent usage clocks and produce a sawtooth that describes neither.
- * So one curve is one `(hostId, account)` pair.
+ * This used to key on `(hostId, account)`, reasoning that two hosts could
+ * legitimately hold same-named but distinct accounts, so pooling them would
+ * interleave "two independent usage clocks". For a shared token pool that is
+ * backwards: `usage_fraction` is the account's **server-side** consumption,
+ * not the reporting host's contribution to it, so several hosts holding one
+ * account are not two clocks — they are one clock read N times.
+ *
+ * Keying on the pair therefore rendered the same account once per host: on a
+ * three-host fleet, 39 near-identical curves for 13 accounts, and one
+ * exhaustion forecast per copy. Readings are now merged by `account`, and the
+ * contributing hosts are carried as `hostIds` for provenance.
+ *
+ * The old concern is not dismissed, only relocated: nothing guarantees two
+ * operators' `.loom/tokens/` use disjoint local names. That case is now
+ * *detected* rather than assumed — see `divergentHosts` below.
+ *
+ * Merging is safe against ordering because `at` is the daemon's `captured_at`
+ * (the probe instant), not the push time, so a merged series is still in true
+ * chronological order and still monotonically non-decreasing within a window.
  *
  * ## Limit windows, and why the curve is segmented
  *
@@ -50,13 +63,36 @@
 
 import type { AccountReading, PoolSample, TokenSample } from "./types.js";
 
-/** A usage drop smaller than this is float noise, not a window rollover. */
-const USAGE_DROP_EPSILON = 1e-9;
+/**
+ * How far usage must fall to count as a window rollover.
+ *
+ * Was `1e-9` — appropriate when a series came from one host, where the only
+ * sub-threshold movement was float noise. A merged multi-host series (#4898)
+ * also carries small legitimate wobble: hosts probe on independent schedules
+ * and their clocks are not synchronised, so two readings of the same value can
+ * land marginally out of order. At `1e-9` any such pair fabricated a
+ * "window-reset" and shattered the curve into meaningless segments.
+ *
+ * A genuine rollover resets usage toward zero — a drop of most of the range,
+ * never hundredths. `0.02` clears the observed cross-host spread (~0.01) with
+ * room to spare while remaining far below any real reset. Rollovers from a
+ * usage below this are not interesting: an account resetting from 0.01 to 0
+ * has nothing to plot either way.
+ */
+const USAGE_DROP_EPSILON = 0.02;
 
 /** Default telemetry-gap tolerance: samples more than 60 minutes apart start a
  * new segment. The daemon's snapshot cadence is minutes, so an hour-wide hole
  * is a reporting outage, not a slow poll. */
 export const DEFAULT_MAX_SAMPLE_GAP_MS = 60 * 60 * 1000;
+
+/**
+ * Two readings closer together than this are "the same moment" for the
+ * purpose of comparing hosts (`findDivergentHosts`). Comfortably under the
+ * daemon's snapshot cadence, so it pairs cross-host observations without
+ * pairing a host's own consecutive samples.
+ */
+const CONCURRENT_READING_WINDOW_MS = 90 * 1000;
 
 export interface BurnPoint {
   /** Epoch ms. */
@@ -80,7 +116,14 @@ export interface BurnSegment {
 }
 
 export interface AccountBurnCurve {
-  hostId: string;
+  /** Every host that reported this account, first-seen order. Provenance,
+   * not identity — the account is the thing with a quota (#4898). */
+  hostIds: string[];
+  /** Hosts whose readings disagreed materially with a near-simultaneous
+   * reading from another host — i.e. the same local name plausibly refers to
+   * different upstream accounts. Empty in the normal shared-pool case;
+   * non-empty means the merge should not be trusted for this account. */
+  divergentHosts: string[];
   account: string;
   /** Newest known pool rank (lower = preferred by the selector). */
   rank?: number;
@@ -111,9 +154,10 @@ function clampFraction(value: number): number {
 }
 
 interface Series {
-  hostId: string;
   account: string;
-  readings: Array<{ at: number; reading: AccountReading }>;
+  /** Every host that reported this account, in first-seen order. */
+  hostIds: string[];
+  readings: Array<{ at: number; hostId: string; reading: AccountReading }>;
 }
 
 /**
@@ -134,27 +178,29 @@ export function buildBurnCurves(
   const series = new Map<string, Series>();
   for (const sample of samples) {
     for (const reading of sample.accounts) {
-      const key = `${sample.hostId}\u0000${reading.account}`;
-      let entry = series.get(key);
+      let entry = series.get(reading.account);
       if (!entry) {
-        entry = { hostId: sample.hostId, account: reading.account, readings: [] };
-        series.set(key, entry);
+        entry = { account: reading.account, hostIds: [], readings: [] };
+        series.set(reading.account, entry);
       }
-      entry.readings.push({ at: sample.at, reading });
+      if (!entry.hostIds.includes(sample.hostId)) entry.hostIds.push(sample.hostId);
+      entry.readings.push({ at: sample.at, hostId: sample.hostId, reading });
     }
   }
 
   const curves: AccountBurnCurve[] = [];
   for (const entry of series.values()) {
-    entry.readings.sort((a, b) => a.at - b.at);
+    // Stable across hosts: probe time, then host name, so two readings sharing
+    // a `captured_at` second do not reorder between runs.
+    entry.readings.sort((a, b) => a.at - b.at || a.hostId.localeCompare(b.hostId));
     curves.push(buildCurve(entry, maxSampleGapMs));
   }
 
-  // Stable, operator-meaningful ordering: host, then pool rank (the selector's
-  // own preference order), then name. Rank-less accounts sort last.
+  // Stable, operator-meaningful ordering: pool rank (the selector's own
+  // preference order), then name. Rank-less accounts sort last. No longer
+  // grouped by host — one curve now spans every host that reported it.
   curves.sort(
     (a, b) =>
-      a.hostId.localeCompare(b.hostId) ||
       (a.rank ?? Number.MAX_SAFE_INTEGER) - (b.rank ?? Number.MAX_SAFE_INTEGER) ||
       a.account.localeCompare(b.account),
   );
@@ -196,7 +242,8 @@ function buildCurve(entry: Series, maxSampleGapMs: number): AccountBurnCurve {
 
   const lastReading = entry.readings.at(-1);
   return {
-    hostId: entry.hostId,
+    hostIds: entry.hostIds,
+    divergentHosts: findDivergentHosts(entry),
     account: entry.account,
     rank: newestDefinedRank(entry),
     points,
@@ -225,6 +272,44 @@ function segmentBreak(
     return "window-reset";
   }
   return undefined;
+}
+
+/**
+ * Hosts whose reading of this account contradicts another host's at nearly the
+ * same instant.
+ *
+ * This is the safeguard for the case the old `(hostId, account)` keying
+ * assumed was universal: two operators' pools can legitimately use one local
+ * name for different upstream accounts, and merging those would average two
+ * unrelated quotas into a line describing neither.
+ *
+ * Detected rather than assumed. For a genuinely shared account every host
+ * observes the same server-side value, so near-simultaneous readings agree to
+ * within probe timing. A disagreement wider than `USAGE_DROP_EPSILON` between
+ * readings closer together than the probe cadence is not timing — it is two
+ * different accounts.
+ */
+function findDivergentHosts(entry: Series): string[] {
+  const divergent = new Set<string>();
+
+  for (let i = 1; i < entry.readings.length; i += 1) {
+    const previous = entry.readings[i - 1];
+    const current = entry.readings[i];
+    if (!previous || !current) continue;
+    if (previous.hostId === current.hostId) continue;
+    if (current.at - previous.at > CONCURRENT_READING_WINDOW_MS) continue;
+
+    const a = previous.reading.usageFraction;
+    const b = current.reading.usageFraction;
+    if (a === undefined || b === undefined) continue;
+
+    if (Math.abs(a - b) > USAGE_DROP_EPSILON) {
+      divergent.add(previous.hostId);
+      divergent.add(current.hostId);
+    }
+  }
+
+  return [...divergent].sort();
 }
 
 function newestDefinedRank(entry: Series): number | undefined {

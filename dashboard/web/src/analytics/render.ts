@@ -216,16 +216,34 @@ function renderBurnCurves(curves: readonly AccountBurnCurve[]): HTMLElement {
   return block;
 }
 
+/** "studio" for one host, "studio +2" beyond that — the card has room for a
+ * name, not a list, and the full set is on `data-hosts`. */
+function formatHosts(hostIds: readonly string[]): string {
+  if (hostIds.length === 0) return "—";
+  const [first] = hostIds;
+  return hostIds.length === 1 ? String(first) : `${first} +${hostIds.length - 1}`;
+}
+
 function renderBurnCard(curve: AccountBurnCurve): HTMLElement {
   const exhausted = curve.exhausted;
   const card = el("article", `burn-card${exhausted ? " burn-card--exhausted" : ""}`);
   card.setAttribute("data-account", curve.account);
-  card.setAttribute("data-host", curve.hostId);
+  card.setAttribute("data-hosts", curve.hostIds.join(","));
   card.setAttribute("data-exhausted", String(exhausted));
 
   const head = el("header", "burn-card__head");
   head.appendChild(el("span", "burn-card__account", curve.account));
-  head.appendChild(el("span", "burn-card__host", curve.hostId));
+  // Provenance, not identity: one account, however many hosts reported it.
+  head.appendChild(el("span", "burn-card__host", formatHosts(curve.hostIds)));
+  if (curve.divergentHosts.length > 0) {
+    // Same local name, contradictory readings — plausibly different upstream
+    // accounts merged into one series. Say so rather than quietly averaging
+    // two unrelated quotas (see burn.ts's findDivergentHosts).
+    const warn = el("span", "badge badge--divergent", "CONFLICTING");
+    warn.setAttribute("data-testid", "divergent-hosts");
+    warn.title = `Hosts disagree on this account's usage: ${curve.divergentHosts.join(", ")}. It may name different accounts on different hosts.`;
+    head.appendChild(warn);
+  }
   if (exhausted) {
     // The distinct visual flag AC4 requires: a badge, a card modifier class,
     // and a machine-readable data attribute — belt, braces, and a test hook.
@@ -502,7 +520,7 @@ function renderForecasts(forecasts: readonly AccountForecast[], now: number): HT
       row.className = "row--at-risk";
     }
     cell(row, forecast.account, "cell--account");
-    cell(row, forecast.hostId, "cell--host");
+    cell(row, formatHosts(forecast.hostIds), "cell--host");
     cell(row, formatRatePerHour(forecast.slopePerHour));
     cell(row, formatPercent(forecast.latestUsageFraction));
     cell(
