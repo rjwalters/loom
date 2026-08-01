@@ -30,15 +30,27 @@ import type { ActiveSweep, FleetSnapshot, HostEntry, TokenAccount } from "./type
 export const STALE_AFTER_SEC = 15 * 60;
 
 export type HostStatus =
-  /** Reporting recently, no token account exhausted. */
+  /** Reporting recently, with a functioning token pool. Some accounts may be
+   * exhausted — the pool rotates away from them by design, so that alone is
+   * not a fault. */
   | "ok"
-  /** Reporting recently, but at least one token account is exhausted. */
+  /** Reporting recently, but the token pool cannot dispatch (no accounts
+   * available) or is close enough to that edge to warrant a look. */
   | "degraded"
   /** Last report is older than `STALE_AFTER_SEC`. */
   | "stale"
   /** Known only from `activeSweeps`, or from a `hosts` entry with neither
    * `health` nor `tokens` yet — nothing to assess. */
   | "unknown";
+
+/**
+ * A pool this close to its edge needs a look even though it is not literally
+ * at zero: one more exhaustion away from `available === 0`, or three
+ * quarters of the pool already spent. Picked to fire well before the pool
+ * actually stalls, without firing on ordinary rotation (see #4864).
+ */
+const DEGRADED_AVAILABLE_FLOOR = 1;
+const DEGRADED_EXHAUSTED_RATIO = 0.75;
 
 export interface TokenSummary {
   /** The per-account rows, or `[]` for a public viewer, who is sent an
@@ -113,6 +125,26 @@ export function summarizeTokens(entry: HostEntry): TokenSummary {
   };
 }
 
+/**
+ * Whether a token pool warrants a `degraded` status.
+ *
+ * A pool with some accounts exhausted is normal rotation, not a fault — see
+ * the module-level `HostStatus` doc and #4864. Only two shapes count as
+ * degraded: the pool cannot dispatch at all (`available === 0`), or it is
+ * close enough to that edge (`available <= 1`, or three quarters or more of
+ * the pool spent) that a human should look before it does.
+ *
+ * A pool with `total === 0` (no `tokens.snapshot` reported yet) is never
+ * flagged here — that host is `ok` on the tokens axis; a missing report
+ * shows up as `stale`/`unknown` via the liveness check instead.
+ */
+function isTokenPoolDegraded(tokens: TokenSummary): boolean {
+  if (tokens.total === 0) return false;
+  const available = tokens.total - tokens.exhausted;
+  if (available <= DEGRADED_AVAILABLE_FLOOR) return true;
+  return tokens.exhausted / tokens.total >= DEGRADED_EXHAUSTED_RATIO;
+}
+
 /** Newest of the two `updatedAt`s. String compare is safe here *only* because
  * both are backend-generated `new Date().toISOString()` values — fixed-width
  * UTC, so lexicographic order is chronological order. */
@@ -139,7 +171,7 @@ export function buildHostView(
     status = "unknown";
   } else if (lastReportAgeSec > STALE_AFTER_SEC) {
     status = "stale";
-  } else if (tokens.exhausted > 0) {
+  } else if (isTokenPoolDegraded(tokens)) {
     status = "degraded";
   } else {
     status = "ok";

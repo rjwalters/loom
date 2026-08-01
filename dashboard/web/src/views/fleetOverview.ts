@@ -33,8 +33,8 @@ const STATUS_LABEL: Record<HostStatus, string> = {
 };
 
 const STATUS_TITLE: Record<HostStatus, string> = {
-  ok: "Reporting recently; no token account exhausted",
-  degraded: "Reporting recently, but at least one token account is exhausted",
+  ok: "Reporting recently; token pool has capacity (some accounts may be exhausted — that's normal rotation)",
+  degraded: "Reporting recently, but the token pool has no or almost no accounts available",
   stale: "No telemetry received recently — the daemon may be stopped or offline",
   unknown: "This host has not pushed host.health or tokens.snapshot yet",
 };

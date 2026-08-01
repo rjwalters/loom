@@ -126,7 +126,7 @@ export function isoMinutesBefore(minutes: number, base: Date = NOW): string {
 /** A healthy, busy host: full health, a healthy token pool, two live sweeps. */
 export const HEALTHY_HOST_ID = "fleet-mac-1";
 
-/** Reports fine but one token account is exhausted → `degraded`. */
+/** Reports fine but the pool has no accounts left to rotate to → `degraded`. */
 export const DEGRADED_HOST_ID = "fleet-linux-2";
 
 /** Last report is well past `STALE_AFTER_SEC` → `stale`. */
@@ -137,6 +137,10 @@ export const SWEEP_ONLY_HOST_ID = "fleet-new-4";
 
 /** Present in `hosts` with health but zero sweeps — the idle-host case. */
 export const IDLE_HOST_ID = "fleet-idle-5";
+
+/** A pool with some accounts exhausted but plenty of capacity left — normal
+ * rotation, not a fault → `ok` (see #4864). */
+export const PARTIALLY_EXHAUSTED_HOST_ID = "fleet-partial-6";
 
 export function multiHostSnapshot(): unknown {
   return {
@@ -189,12 +193,45 @@ export function multiHostSnapshot(): unknown {
         tokens: {
           record: {
             kind: "tokens.snapshot",
+            // 1 of 2 exhausted → available === 1, at the `available <= 1`
+            // floor: close enough to the edge to warrant a look, even though
+            // the ratio (50%) is under the 75% threshold.
             accounts: [
               { account: "agent-3", usage_fraction: 1, exhausted: true },
               { account: "agent-4", exhausted: false },
             ],
           },
           updatedAt: isoMinutesBefore(1),
+        },
+      },
+      [PARTIALLY_EXHAUSTED_HOST_ID]: {
+        health: {
+          record: {
+            kind: "host.health",
+            daemon_version: "0.16.0",
+            uptime_sec: 10_800,
+            logical_cpus: 16,
+            cpu_idle_fraction: 0.7,
+            load_per_core: 0.6,
+            worktree_root_free_gb: 300,
+          },
+          updatedAt: isoMinutesBefore(2),
+        },
+        tokens: {
+          record: {
+            kind: "tokens.snapshot",
+            // 1 of 5 exhausted: available === 4, well clear of both the
+            // `available <= 1` floor and the 75%-exhausted ratio — this is
+            // ordinary rotation, not a fault (see #4864).
+            accounts: [
+              { account: "agent-5", usage_fraction: 1, exhausted: true },
+              { account: "agent-6", usage_fraction: 0.3, exhausted: false },
+              { account: "agent-7", usage_fraction: 0.2, exhausted: false },
+              { account: "agent-8", usage_fraction: 0.1, exhausted: false },
+              { account: "agent-9", usage_fraction: 0.05, exhausted: false },
+            ],
+          },
+          updatedAt: isoMinutesBefore(2),
         },
       },
       [STALE_HOST_ID]: {

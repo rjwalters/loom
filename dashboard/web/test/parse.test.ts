@@ -6,7 +6,7 @@ import { HEALTHY_HOST_ID, multiHostSnapshot } from "./fixtures";
 describe("parseFleetSnapshot", () => {
   it("narrows a well-formed multi-host snapshot", () => {
     const snapshot = parseFleetSnapshot(multiHostSnapshot());
-    expect(Object.keys(snapshot.hosts)).toHaveLength(4);
+    expect(Object.keys(snapshot.hosts)).toHaveLength(5);
     expect(snapshot.activeSweeps).toHaveLength(3);
     expect(snapshot.hosts[HEALTHY_HOST_ID]?.health?.record.cpu_idle_fraction).toBe(0.83);
     expect(snapshot.hosts[HEALTHY_HOST_ID]?.tokens?.record.accounts).toHaveLength(2);

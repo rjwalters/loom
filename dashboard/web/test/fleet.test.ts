@@ -7,6 +7,7 @@ import {
   HEALTHY_HOST_ID,
   IDLE_HOST_ID,
   NOW,
+  PARTIALLY_EXHAUSTED_HOST_ID,
   STALE_HOST_ID,
   SWEEP_ONLY_HOST_ID,
   isoMinutesBefore,
@@ -39,6 +40,81 @@ describe("buildFleetView", () => {
     expect(findHost(built, DEGRADED_HOST_ID)?.status).toBe("degraded");
     expect(findHost(built, STALE_HOST_ID)?.status).toBe("stale");
     expect(findHost(built, SWEEP_ONLY_HOST_ID)?.status).toBe("unknown");
+  });
+
+  it("pins: a partially-spent but functioning pool is healthy, not degraded", () => {
+    // 1 of 5 accounts exhausted is normal rotation — the pool still has 4
+    // available, nowhere near the `available <= 1` / 75%-exhausted edges.
+    // Exhausted-count-greater-than-zero alone must never flip this to
+    // `degraded` (the #4864 false-alarm bug).
+    const host = findHost(view(), PARTIALLY_EXHAUSTED_HOST_ID);
+    expect(host?.tokens.exhausted).toBeGreaterThan(0);
+    expect(host?.status).toBe("ok");
+  });
+
+  it("degrades a pool with no available accounts", () => {
+    const built = buildFleetView(
+      parseFleetSnapshot({
+        hosts: {
+          h: {
+            health: { record: {}, updatedAt: isoMinutesBefore(1) },
+            tokens: {
+              record: {
+                accounts: [
+                  { account: "a", exhausted: true },
+                  { account: "b", exhausted: true },
+                ],
+              },
+              updatedAt: isoMinutesBefore(1),
+            },
+          },
+        },
+        activeSweeps: [],
+      }),
+      NOW,
+    );
+    expect(findHost(built, "h")?.status).toBe("degraded");
+  });
+
+  it("degrades a pool at exactly one account available, even below the 75% ratio", () => {
+    // 1 of 4 exhausted is only 25% — well under the ratio threshold — but
+    // `available === 1` alone should still flip this to `degraded`.
+    const built = buildFleetView(
+      parseFleetSnapshot({
+        hosts: {
+          h: {
+            health: { record: {}, updatedAt: isoMinutesBefore(1) },
+            tokens: {
+              record: {
+                accounts: [
+                  { account: "a", exhausted: true },
+                  { account: "b", exhausted: true },
+                  { account: "c", exhausted: true },
+                  { account: "d", exhausted: false },
+                ],
+              },
+              updatedAt: isoMinutesBefore(1),
+            },
+          },
+        },
+        activeSweeps: [],
+      }),
+      NOW,
+    );
+    expect(findHost(built, "h")?.status).toBe("degraded");
+  });
+
+  it("does not degrade a host with no tokens.snapshot at all", () => {
+    // total === 0 means "never reported", not "pool exhausted" — the tokens
+    // axis must not manufacture a fault out of an absent report.
+    const built = buildFleetView(
+      parseFleetSnapshot({
+        hosts: { h: { health: { record: {}, updatedAt: isoMinutesBefore(1) } } },
+        activeSweeps: [],
+      }),
+      NOW,
+    );
+    expect(findHost(built, "h")?.status).toBe("ok");
   });
 
   it("treats the staleness boundary as strictly greater-than", () => {
@@ -87,12 +163,15 @@ describe("buildFleetView", () => {
       SWEEP_ONLY_HOST_ID,
       HEALTHY_HOST_ID,
       IDLE_HOST_ID,
+      PARTIALLY_EXHAUSTED_HOST_ID,
     ]);
   });
 
   it("counts sweeps and attention-needing hosts", () => {
     const built = view();
     expect(built.totalSweeps).toBe(3);
+    // Only the stale host and the fully-exhausted-pool host need attention —
+    // the partially-exhausted pool is healthy and must not inflate this count.
     expect(built.needsAttention).toBe(2);
   });
 
