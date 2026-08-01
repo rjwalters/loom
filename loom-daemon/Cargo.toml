@@ -26,6 +26,15 @@ hex = "0.4.3"
 # never touches.
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "rustls-native-certs", "json"] }
 libc = "0.2"
+# OTLP wire-format types for the optional `otlp` exporter (#4858, Epic #4702
+# Phase 4) — gated behind the `otlp` feature so a default (`HttpsExporter`-
+# only) build adds no new dependency. `gen-tonic-messages` generates the OTLP
+# request/record structs via `prost` (message types only); `with-serde` adds
+# JSON (de)serialization to those structs. `gen-tonic`/`tonic` themselves are
+# deliberately NOT enabled — `OtlpExporter` posts the JSON encoding over the
+# existing `reqwest` client (reusing `super::sender`'s drain/retry loop), so
+# no gRPC transport stack is pulled in.
+opentelemetry-proto = { version = "0.32.0", default-features = false, features = ["logs", "metrics", "gen-tonic-messages", "with-serde"], optional = true }
 
 [dev-dependencies]
 tempfile = "3.27"
@@ -36,3 +45,9 @@ criterion = "0.8"
 [[bench]]
 name = "terminal_benchmarks"
 harness = false
+
+[features]
+# Off by default — enabling it selects `OtlpExporter` (see
+# `observability.exporter = "otlp"`); a plain `cargo build`/`cargo test` never
+# pulls in `opentelemetry-proto`.
+otlp = ["dep:opentelemetry-proto"]

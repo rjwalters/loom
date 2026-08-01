@@ -15,6 +15,11 @@
 //!   [`exporter::HttpsExporter`] JSON-over-HTTPS push implementation, and the
 //!   jittered-retry drain loop that pulls batches off the queue and pushes
 //!   them to the sink.
+//! - `otlp` (Epic #4702, Phase 4 — issue #4858, behind the `otlp` Cargo
+//!   feature) — a second [`exporter::Exporter`] implementation for operators
+//!   with an existing OpenTelemetry stack, selected via
+//!   `observability.exporter = "otlp"` ([`resolve_exporter`]). Off by
+//!   default; [`exporter::HttpsExporter`] stays the default sink.
 //!
 //! # Off by default (FLAGS-OFF posture)
 //!
@@ -43,6 +48,13 @@
 //! record. A hostile/broken sink can therefore, at worst, make this daemon
 //! report a mismatch that is not real; it cannot steer the daemon.
 //!
+//! That check is **specific to the native HTTPS ingest protocol**, which is
+//! what defines the echo: the `otlp` sink below has no equivalent (OTLP/HTTP
+//! success responses carry only `partial_success`), so under
+//! `observability.exporter = "otlp"` no [`HostIdStatus`] is registered and
+//! [`global_host_id_mismatch`] reads `None` — see the OTLP arm of
+//! [`spawn_task`] for the full rationale.
+//!
 //! # Ingest key handling
 //!
 //! The ingest key is read once at startup from `ingestKeyFile` (never
@@ -54,6 +66,8 @@
 
 pub mod collector;
 pub mod exporter;
+#[cfg(feature = "otlp")]
+pub mod otlp;
 pub mod queue;
 pub mod sender;
 
@@ -78,6 +92,8 @@ pub const BATCH_SIZE_ENV: &str = "LOOM_OBSERVABILITY_BATCH_SIZE";
 pub const FLUSH_INTERVAL_SECS_ENV: &str = "LOOM_OBSERVABILITY_FLUSH_INTERVAL_SECS";
 /// `observability.queueCapacity` env override.
 pub const QUEUE_CAPACITY_ENV: &str = "LOOM_OBSERVABILITY_QUEUE_CAPACITY";
+/// `observability.exporter` env override (#4858) — `"https"` or `"otlp"`.
+pub const EXPORTER_ENV: &str = "LOOM_OBSERVABILITY_EXPORTER";
 
 /// Default batch size (envelopes per HTTP POST) when unset at every tier.
 pub const DEFAULT_BATCH_SIZE: usize = 50;
@@ -101,6 +117,27 @@ pub struct ObservabilityConfig {
     pub batch_size: Option<usize>,
     pub flush_interval_secs: Option<u64>,
     pub queue_capacity: Option<usize>,
+    /// Raw `observability.exporter` string, resolved by [`resolve_exporter`]
+    /// (#4858) — not parsed to [`ExporterKind`] at read time so an unknown
+    /// value can be logged (and degraded to the default) at the single call
+    /// site that already owns exporter selection.
+    pub exporter: Option<String>,
+}
+
+/// Which [`exporter::Exporter`] implementation [`spawn_task`] selects.
+/// Resolved by [`resolve_exporter`] — **env > config > default**
+/// ([`ExporterKind::Https`]), matching every other `observability.*` knob's
+/// precedence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExporterKind {
+    /// Native JSON-over-HTTPS push ([`exporter::HttpsExporter`]) — the
+    /// default, for backward compatibility with every deployment predating
+    /// this issue.
+    Https,
+    /// OTLP/HTTP+JSON push (`otlp::OtlpExporter`, only compiled in behind the
+    /// `otlp` Cargo feature) — an escape hatch for an existing OpenTelemetry
+    /// stack.
+    Otlp,
 }
 
 /// Read the `observability` block from `root`'s resolved config
@@ -138,6 +175,11 @@ pub fn read_config(root: &Path) -> ObservabilityConfig {
             .and_then(serde_json::Value::as_u64)
             .and_then(|v| usize::try_from(v).ok())
             .filter(|v| *v > 0),
+        exporter: block
+            .get("exporter")
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
     }
 }
 
@@ -279,6 +321,24 @@ pub fn global_host_id_mismatch() -> Option<crate::types::ObservabilityHostIdMism
     GLOBAL_HOST_ID_STATUS.get().and_then(|s| s.snapshot())
 }
 
+/// **env > config > default** ([`ExporterKind::Https`]). An unrecognized
+/// value at either tier (anything but a case-insensitive `"https"` or
+/// `"otlp"`) is logged and degrades to the default, the same "malformed
+/// input never panics/blocks startup" posture as the rest of this module —
+/// it is never a hard error.
+#[must_use]
+pub fn resolve_exporter(config: &ObservabilityConfig) -> ExporterKind {
+    let raw = env_nonempty(EXPORTER_ENV).or_else(|| config.exporter.clone());
+    match raw.as_deref().map(str::to_ascii_lowercase).as_deref() {
+        None | Some("https") => ExporterKind::Https,
+        Some("otlp") => ExporterKind::Otlp,
+        Some(other) => {
+            log::warn!("observability: unrecognized exporter {other:?} — falling back to https");
+            ExporterKind::Https
+        }
+    }
+}
+
 /// Read `path` and return its trimmed contents as the ingest key. Every
 /// failure (missing file, unreadable, empty after trimming) is logged
 /// **by path only** — the key itself never reaches a log line — and yields
@@ -340,35 +400,22 @@ pub fn spawn_task(
         return None;
     };
     let ingest_key = read_ingest_key(&key_file)?;
-    // Resolved ONCE and threaded into both consumers below (Issue #4830): the
-    // collector stamps it on every envelope and the exporter checks the backend's
-    // echo against it. Two independent `host_identity()` calls could not disagree
-    // today, but a single value makes that structurally true rather than
-    // incidentally so — and the whole point of the check is that the two halves
-    // being compared are the *same* identity the records are filed under.
+    // Resolved ONCE and threaded into every consumer below (Issue #4830): the
+    // collector stamps it on every envelope and the HTTPS exporter checks the
+    // backend's echo against it. Two independent `host_identity()` calls could
+    // not disagree today, but a single value makes that structurally true rather
+    // than incidentally so — and the whole point of the check is that the two
+    // halves being compared are the *same* identity the records are filed under.
     let host_id = crate::sweep_registry::host_identity();
-    let host_id_status = Arc::new(HostIdStatus::default());
-    register_global_host_id_status(host_id_status.clone());
-    let exporter = match HttpsExporter::new(
-        endpoint.clone(),
-        ingest_key,
-        host_id.clone(),
-        host_id_status,
-    ) {
-        Ok(exporter) => exporter,
-        Err(error) => {
-            log::warn!("observability: failed to construct HTTPS exporter for {endpoint}: {error} — export off");
-            return None;
-        }
-    };
+    let exporter_kind = resolve_exporter(config);
 
     let batch_size = resolve_batch_size(config);
     let flush_interval = Duration::from_secs(resolve_flush_interval_secs(config));
     let capacity = resolve_queue_capacity(config);
     let queue_path = queue::default_queue_path(&workspace_root);
     log::info!(
-        "observability: enabled (endpoint={endpoint}, batch_size={batch_size}, \
-         flush_interval={}s, queue_capacity={capacity})",
+        "observability: enabled (exporter={exporter_kind:?}, endpoint={endpoint}, \
+         batch_size={batch_size}, flush_interval={}s, queue_capacity={capacity})",
         flush_interval.as_secs()
     );
     let queue = Arc::new(DurableQueue::open(queue_path, capacity));
@@ -377,11 +424,90 @@ pub fn spawn_task(
         bus,
         queue.clone(),
         workspace_root,
-        host_id,
+        host_id.clone(),
         SNAPSHOT_INTERVAL,
         daemon_started_at,
     );
-    let sender_handle = sender::spawn_task(queue, exporter, batch_size, flush_interval);
+    // The two branches below construct different concrete `E: Exporter`
+    // types and each call `sender::spawn_task` with their own — no
+    // dyn/boxing needed, since both calls return the same
+    // `tokio::task::JoinHandle<()>` regardless of `E` (see `exporter.rs`'s
+    // module docs on why `Exporter` uses native `async fn` over
+    // `async-trait`).
+    let sender_handle = match exporter_kind {
+        ExporterKind::Https => {
+            // Host-identity mismatch detection (Issue #4830) is created and
+            // registered *inside* this arm, not before the dispatch: it is a
+            // property of the native ingest protocol, not of exporting in
+            // general (see the OTLP arm below). Registering it only when the
+            // HTTPS sink actually starts keeps `global_host_id_mismatch()`
+            // reading `None` under any other sink, which is exactly the
+            // "the exporter never started" semantics `status`/`health`
+            // already handle.
+            let host_id_status = Arc::new(HostIdStatus::default());
+            register_global_host_id_status(host_id_status.clone());
+            let exporter = match HttpsExporter::new(
+                endpoint.clone(),
+                ingest_key,
+                host_id,
+                host_id_status,
+            ) {
+                Ok(exporter) => exporter,
+                Err(error) => {
+                    log::warn!(
+                        "observability: failed to construct HTTPS exporter for {endpoint}: {error} — export off"
+                    );
+                    return None;
+                }
+            };
+            sender::spawn_task(queue, exporter, batch_size, flush_interval)
+        }
+        ExporterKind::Otlp => {
+            // No `HostIdStatus` wiring here, deliberately (Issue #4830 vs.
+            // #4858). The mismatch check is not a generic exporter concern
+            // that OTLP is missing out on — it is a *native-ingest protocol*
+            // feature: `HttpsExporter::check_host_identity` parses the
+            // Loom `/ingest` success body (`{"accepted":N,"host_id":"…"}`)
+            // and compares the backend's echoed `host_id` against this
+            // daemon's own, which is only meaningful because the Cloudflare
+            // backend binds each ingest key to exactly one host and reports
+            // that binding back.
+            //
+            // OTLP/HTTP has no such echo: a success response is an
+            // `ExportLogsServiceResponse`/`ExportMetricsServiceResponse`
+            // whose only payload is `partial_success`, and a generic OTLP
+            // sink (an OpenTelemetry Collector, Grafana, Honeycomb) has no
+            // concept of a per-host key binding to disagree with in the
+            // first place. Threading a `HostIdStatus` in here would hand the
+            // OTLP exporter a handle it could never write to — parity in the
+            // signature only, while `loom-daemon status`/`health` gained a
+            // field that is unconditionally `None` and indistinguishable
+            // from "checked, and they agree". Better to leave the surface
+            // honestly absent until an OTLP-side identity signal exists to
+            // check against.
+            #[cfg(feature = "otlp")]
+            {
+                let exporter = match otlp::OtlpExporter::new(endpoint.clone(), ingest_key) {
+                    Ok(exporter) => exporter,
+                    Err(error) => {
+                        log::warn!(
+                            "observability: failed to construct OTLP exporter for {endpoint}: {error} — export off"
+                        );
+                        return None;
+                    }
+                };
+                sender::spawn_task(queue, exporter, batch_size, flush_interval)
+            }
+            #[cfg(not(feature = "otlp"))]
+            {
+                log::warn!(
+                    "observability: exporter=otlp requested but this daemon build was not \
+                     compiled with the `otlp` Cargo feature — export off"
+                );
+                return None;
+            }
+        }
+    };
     Some(vec![collector_handle, sender_handle])
 }
 
@@ -399,6 +525,7 @@ mod tests {
         BATCH_SIZE_ENV,
         FLUSH_INTERVAL_SECS_ENV,
         QUEUE_CAPACITY_ENV,
+        EXPORTER_ENV,
     ];
 
     fn clear_env() {
@@ -424,6 +551,57 @@ mod tests {
         assert_eq!(resolve_batch_size(&config), DEFAULT_BATCH_SIZE);
         assert_eq!(resolve_flush_interval_secs(&config), DEFAULT_FLUSH_INTERVAL_SECS);
         assert_eq!(resolve_queue_capacity(&config), DEFAULT_QUEUE_CAPACITY);
+        assert_eq!(resolve_exporter(&config), ExporterKind::Https, "https is the default exporter");
+    }
+
+    // ------------------------------------------------------------------
+    // resolve_exporter — env > config > default("https"); unknown ⇒ https.
+    // ------------------------------------------------------------------
+
+    #[test]
+    #[serial]
+    fn resolve_exporter_env_overrides_config() {
+        clear_env();
+        let config = ObservabilityConfig {
+            exporter: Some("otlp".to_string()),
+            ..Default::default()
+        };
+        std::env::set_var(EXPORTER_ENV, "https");
+        assert_eq!(resolve_exporter(&config), ExporterKind::Https);
+        clear_env();
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_exporter_config_wins_over_default_when_no_env_set() {
+        clear_env();
+        let config = ObservabilityConfig {
+            exporter: Some("otlp".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(resolve_exporter(&config), ExporterKind::Otlp);
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_exporter_is_case_insensitive() {
+        clear_env();
+        let config = ObservabilityConfig {
+            exporter: Some("OTLP".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(resolve_exporter(&config), ExporterKind::Otlp);
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_exporter_unknown_value_falls_back_to_https() {
+        clear_env();
+        let config = ObservabilityConfig {
+            exporter: Some("datadog".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(resolve_exporter(&config), ExporterKind::Https);
     }
 
     #[test]
@@ -472,7 +650,8 @@ mod tests {
                 "ingestKeyFile": "/etc/loom/ingest.key",
                 "batchSize": 25,
                 "flushIntervalSecs": 45,
-                "queueCapacity": 1000
+                "queueCapacity": 1000,
+                "exporter": "otlp"
             }}"#,
         )
         .unwrap();
@@ -485,6 +664,7 @@ mod tests {
         assert_eq!(config.batch_size, Some(25));
         assert_eq!(config.flush_interval_secs, Some(45));
         assert_eq!(config.queue_capacity, Some(1000));
+        assert_eq!(config.exporter.as_deref(), Some("otlp"));
     }
 
     #[test]
@@ -579,6 +759,63 @@ mod tests {
         };
         let handles = spawn_task(&config, dir.path().to_path_buf(), &bus, Instant::now());
         let handles = handles.expect("fully configured ⇒ spawn_task must return Some");
+        assert_eq!(handles.len(), 2, "collector + sender");
+        for handle in handles {
+            handle.abort();
+        }
+    }
+
+    /// `exporter=otlp` in a build that does NOT have the `otlp` Cargo
+    /// feature compiled in must degrade to disabled (never panic, never
+    /// silently fall back to the HTTPS sink the operator did not ask for).
+    /// `#[tokio::test]`, not a plain `#[test]`: `spawn_task` calls
+    /// `collector::spawn_task` (which needs a Tokio reactor) *before* it
+    /// branches on `exporter_kind`, so even the returns-`None` path must run
+    /// inside a runtime — same as the `#[cfg(feature = "otlp")]` sibling below.
+    #[cfg(not(feature = "otlp"))]
+    #[tokio::test]
+    #[serial]
+    async fn spawn_task_otlp_requested_without_the_feature_returns_none() {
+        clear_env();
+        let bus = EventBus::new();
+        let dir = tempdir().unwrap();
+        let key_path = dir.path().join("ingest.key");
+        std::fs::write(&key_path, "s3cr3t\n").unwrap();
+        let config = ObservabilityConfig {
+            enabled: Some(true),
+            endpoint: Some("https://ingest.example.com/v1/telemetry".to_string()),
+            ingest_key_file: Some(key_path.to_string_lossy().to_string()),
+            exporter: Some("otlp".to_string()),
+            ..Default::default()
+        };
+        let handles = spawn_task(&config, dir.path().to_path_buf(), &bus, Instant::now());
+        assert!(handles.is_none());
+    }
+
+    /// The `otlp`-feature counterpart of
+    /// `spawn_task_fully_configured_spawns_two_tasks`: `exporter=otlp`
+    /// with the feature compiled in spawns the same collector+sender pair,
+    /// just wired to `otlp::OtlpExporter` instead of `HttpsExporter`.
+    #[cfg(feature = "otlp")]
+    #[tokio::test]
+    #[serial]
+    async fn spawn_task_otlp_exporter_spawns_two_tasks() {
+        clear_env();
+        let bus = EventBus::new();
+        let dir = tempdir().unwrap();
+        let key_path = dir.path().join("ingest.key");
+        std::fs::write(&key_path, "s3cr3t\n").unwrap();
+        let config = ObservabilityConfig {
+            enabled: Some(true),
+            endpoint: Some("https://collector.example.com".to_string()),
+            ingest_key_file: Some(key_path.to_string_lossy().to_string()),
+            exporter: Some("otlp".to_string()),
+            flush_interval_secs: Some(3600), // avoid a real network attempt during the test
+            ..Default::default()
+        };
+        let handles = spawn_task(&config, dir.path().to_path_buf(), &bus, Instant::now());
+        let handles =
+            handles.expect("fully configured otlp exporter ⇒ spawn_task must return Some");
         assert_eq!(handles.len(), 2, "collector + sender");
         for handle in handles {
             handle.abort();

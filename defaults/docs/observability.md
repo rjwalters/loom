@@ -18,7 +18,7 @@ loom-daemon (per host)
   durable disk-backed queue (survives sink outage / sleep)
         │  drains via a jittered-retry loop
         ▼
-  exporter: HttpsExporter (JSON-over-HTTPS POST /ingest)   [OTLP: planned, #4858]
+  exporter: HttpsExporter (default) or OtlpExporter (opt-in, #4858)
         │
         ▼
 Cloudflare Worker backend (deploy-your-own, or the 2AM reference instance)
@@ -66,6 +66,7 @@ Precedence is **env > config > default**, the same rule every other
 | `batchSize` | `LOOM_OBSERVABILITY_BATCH_SIZE` | 50 |
 | `flushIntervalSecs` | `LOOM_OBSERVABILITY_FLUSH_INTERVAL_SECS` | 30 |
 | `queueCapacity` | `LOOM_OBSERVABILITY_QUEUE_CAPACITY` | 2000 |
+| `exporter` | `LOOM_OBSERVABILITY_EXPORTER` | `"https"` (or `"otlp"`, §3) |
 
 The ingest key is **never inline in config** — `ingestKeyFile` is a path the
 daemon reads once at startup and holds only in memory, sent solely as an
@@ -89,20 +90,33 @@ field-by-field reference, the `visibility` anti-leak contract, and the local
 exporter is configured**):
 [`.loom/docs/telemetry-schema.md`](telemetry-schema.md).
 
-## 3. Exporters: HTTPS today, OTLP planned
+## 3. Exporters: HTTPS (default) or OTLP (opt-in)
 
-The only shipped exporter is `HttpsExporter` — JSON-over-HTTPS `POST
-/ingest`, batched (`batchSize`), retried with jitter, backed by the durable
-disk queue so a sink outage or a sleeping host never silently drops data up
-to `queueCapacity`. The `Exporter` trait (`exporter.rs`) and the drain loop
-(`sender.rs`) are both deliberately generic so a second sink is a drop-in
-addition, not a rewrite: an **OTLP exporter is planned as a feature-flagged
-second sink** (epic Phase 4, tracked separately in
-[#4858](https://github.com/rjwalters/loom/issues/4858)) — as of this writing
-that issue is still open, so OTLP support has **not** landed; every host today
-speaks the native HTTPS/JSON wire format only.
+The default exporter is `HttpsExporter` — JSON-over-HTTPS `POST /ingest`,
+batched (`batchSize`), retried with jitter, backed by the durable disk queue
+so a sink outage or a sleeping host never silently drops data up to
+`queueCapacity`. The `Exporter` trait (`exporter.rs`) and the drain loop
+(`sender.rs`) are both deliberately generic, so a second sink is a drop-in
+addition rather than a rewrite: `OtlpExporter` (epic Phase 4, issue
+[#4858](https://github.com/rjwalters/loom/issues/4858)) translates the same
+`TelemetryEnvelope` batches into OTLP logs (`/v1/logs`) and metrics
+(`/v1/metrics`) requests for operators with an existing OpenTelemetry stack
+(a self-hosted collector, Grafana, Honeycomb, …), reusing `sender.rs`'s
+drain/retry loop unchanged.
 
-**The exporter verifies its own identity** (issue #4830). Each `/ingest`
+Select it with `observability.exporter = "otlp"`
+(`LOOM_OBSERVABILITY_EXPORTER` env override; **env > config > default**,
+default `"https"`). It is opt-in twice over: off unless explicitly selected,
+*and* gated behind the `otlp` Cargo feature — a default `loom-daemon` build
+never compiles in the `opentelemetry-proto` dependency, so choosing
+`HttpsExporter` costs nothing extra. The field-by-field
+`TelemetryEnvelope` → OTLP mapping (which record kinds become logs vs.
+metrics; how `host_id` / `emitted_at` / the repo-visibility tag map onto OTLP
+resource/record attributes) is documented in
+`loom-daemon/src/observability/otlp/mod.rs`'s module doc comment, verified by
+`loom-daemon/src/observability/otlp/mapping.rs`'s unit tests.
+
+**The HTTPS exporter verifies its own identity** (issue #4830). Each `/ingest`
 success response echoes the `host_id` the presented key is bound to; the
 exporter compares that against the identity this daemon resolved for itself
 (`$LOOM_HOST_ID` > `$HOSTNAME` > `hostname`). On a disagreement — the wrong
@@ -112,6 +126,14 @@ and `loom-daemon health` reports an `observability DEGRADED` section (exit
 `1`). Nothing else changes: the batch is still acked, and the key's binding
 stays authoritative on the backend. Fix by installing the right key or setting
 `$LOOM_HOST_ID` to match, then restarting the daemon.
+
+This check is specific to the native ingest protocol, which is what defines
+the echo. OTLP/HTTP has no equivalent — a success response carries only
+`partial_success`, and a generic OTLP sink has no notion of a per-host key
+binding to disagree with — so under `exporter = "otlp"` no mismatch is ever
+published and the `observability` health section stays silent. Choosing OTLP
+therefore trades this particular misconfiguration guardrail away; keep the
+default `"https"` sink if you want it.
 
 ## 4. The backend: deploy your own Cloudflare Worker
 
