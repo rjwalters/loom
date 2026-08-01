@@ -55,8 +55,10 @@ use super::queue::DurableQueue;
 const SLUG_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// In-flight sweep state tracked purely in memory (see module docs).
+/// `pub(crate)` only because it appears in [`map_event_to_records`]'s signature
+/// (#4863) — it is not part of any cross-module contract.
 #[derive(Debug, Clone)]
-struct DispatchState {
+pub(crate) struct DispatchState {
     sweep_id: String,
     started_at: DateTime<Utc>,
 }
@@ -188,7 +190,13 @@ fn event_repo_path(event: &Event) -> Option<String> {
 /// `repo` slug and `visibility`. Returns zero, one, or two records — a
 /// terminal event yields both a `sweep.completed` record (mirrors the frozen
 /// SSE moment) and the richer `sweep.outcome` record.
-fn map_event_to_records(
+///
+/// `pub(crate)` so the registry's own emit-site tests (#4863) can drive a
+/// *genuinely emitted* [`Event::SweepPhase`] through this mapping end-to-end
+/// instead of asserting against a hand-built event fixture — the exact gap that
+/// let `sweep.phase` be defined, mapped, and unit-tested here while never being
+/// published by production code.
+pub(crate) fn map_event_to_records(
     event: &Event,
     issue: u32,
     repo: &str,
