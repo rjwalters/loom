@@ -2617,6 +2617,127 @@ assert_allow "write-confinement: CWD=linked worktree, write to /tmp allows (#421
     "echo x > /tmp/loom-test-$$-linked.sh" "$WT_LINKED_DIR"
 
 # -------------------------------------------------------------------------
+# Unresolvable `$…` write targets fail CLOSED from a LINKED-WORKTREE cwd
+# (#4921).
+#
+# extract_write_targets() emits a target it cannot resolve as the RAW token
+# (`$A/evil`), which the resolution then cwd-prefixes as if it were a relative
+# path. From a MAIN-CHECKOUT cwd that fabricated path landed inside the main
+# checkout, so the containment test denied it and the "unresolvable -> fail
+# closed" backstop appeared to hold. From a LINKED-WORKTREE cwd — the
+# canonical builder setup, and the only mode #4178 actually protects — the
+# very same fabricated path walked straight back up into the acting worktree's
+# own `.loom-managed` sentinel and was ALLOWED before the main-root
+# containment test ever ran, whatever the variable would expand to at runtime.
+#
+# Every fixture below therefore uses cwd == WT_LINKED_DIR (a genuine `git
+# worktree add` linked worktree), which is exactly what the pre-#4921 suite
+# never exercised for these shapes — all of its `$`-target coverage ran with
+# cwd == the main checkout, where the bug is invisible.
+UNRESOLVED_MAIN_TARGET="$WT_REPO_LINKED/defaults/hooks"
+
+# Headline repro: a variable that is never assigned anywhere in the command.
+assert_deny "write-confinement (#4921): CWD=linked worktree, unresolvable \$VAR target denies" \
+    "echo x > \$SNEAK_NOT_ASSIGNED_ANYWHERE/evil" "$WT_LINKED_DIR"
+# Same-command CONFLICTING assignment (the shape #4914's record_assign()
+# poisons to unresolvable on purpose) must reach the same fail-closed answer.
+assert_deny "write-confinement (#4921): CWD=linked worktree, conflicting same-command assignment denies" \
+    "A=/tmp/outside
+A=$UNRESOLVED_MAIN_TARGET
+echo x > \$A/evil" "$WT_LINKED_DIR"
+# Shape variants: a leading `./`, surrounding quotes, or `${}` braces must not
+# buy an allow the bare form does not get.
+assert_deny "write-confinement (#4921): CWD=linked worktree, './\$VAR/…' target denies" \
+    "echo x > ./\$SNEAK/evil" "$WT_LINKED_DIR"
+assert_deny "write-confinement (#4921): CWD=linked worktree, double-quoted \"\$VAR\"/… target denies" \
+    "echo x > \"\$SNEAK\"/evil" "$WT_LINKED_DIR"
+assert_deny "write-confinement (#4921): CWD=linked worktree, \${BRACED} target denies" \
+    "echo x > \${SNEAK}/evil" "$WT_LINKED_DIR"
+# A bare `$VAR` with no path separator at all: the variable may itself hold an
+# absolute path into the main checkout, so the root is unknown -> fail closed.
+assert_deny "write-confinement (#4921): CWD=linked worktree, bare '\$VAR' target (no slash) denies" \
+    "cat > \$DEST" "$WT_LINKED_DIR"
+# `$(...)` command substitution is unresolvable in the same way.
+assert_deny "write-confinement (#4921): CWD=linked worktree, \$(...) command-substitution target denies" \
+    "cat > \$(mktemp)" "$WT_LINKED_DIR"
+# Every write idiom, not just `>` redirection.
+assert_deny "write-confinement (#4921): CWD=linked worktree, tee with an unresolvable \$VAR denies" \
+    "echo x | tee \$OUT/f" "$WT_LINKED_DIR"
+assert_deny "write-confinement (#4921): CWD=linked worktree, cp destination \$VAR denies" \
+    "cp /tmp/a.sh \$DEST" "$WT_LINKED_DIR"
+assert_deny "write-confinement (#4921): CWD=linked worktree, sed -i on an unresolvable \$VAR denies" \
+    "sed -i 's/a/b/' \$DEST" "$WT_LINKED_DIR"
+# The unexpanded `$` can arrive through the CWD channel instead of the target
+# (`cd $A` threads an unresolved curcwd into extract_write_targets()).
+assert_deny "write-confinement (#4921): CWD=linked worktree, 'cd \$VAR && relative write' denies" \
+    "cd \$A && echo y > f.sh" "$WT_LINKED_DIR"
+# An absolute prefix INSIDE the worktree plus an unknown directory component:
+# the variable can hold `../..`, so the sentinel walk-up proves nothing.
+assert_deny "write-confinement (#4921): CWD=linked worktree, worktree-absolute path with a \$VAR directory component denies" \
+    "echo x > $WT_LINKED_DIR/\$X/f.sh" "$WT_LINKED_DIR"
+# `/$A/evil` looks absolute but its FIRST component is the variable, so there
+# is no known prefix to judge — the runtime value picks the top-level
+# directory, the main checkout's own included.
+assert_deny "write-confinement (#4921): CWD=linked worktree, '/\$VAR/…' (variable as first component) denies" \
+    "echo x > /\$SNEAK/evil" "$WT_LINKED_DIR"
+# `/$A` with NO further slash is the same shape — a shell variable's value can
+# contain `/`, so "the final component" is a fiction when that component is
+# everything below the root.
+assert_deny "write-confinement (#4921): CWD=linked worktree, '/\$VAR' (whole path below root is the variable) denies" \
+    "echo x > /\$SNEAK" "$WT_LINKED_DIR"
+# A `..` traversal inside the KNOWN prefix must be normalized before the
+# prefix is judged, or `/tmp/../\$A/evil` hands the test a prefix (`/tmp`) that
+# is not where the write actually starts — it collapses to `/`, i.e. the first
+# real component is the variable again.
+assert_deny "write-confinement (#4921): CWD=linked worktree, known prefix that collapses to '/' via '..' denies" \
+    "echo x > /tmp/../\$SNEAK/evil" "$WT_LINKED_DIR"
+
+# --- No new false positives (all from the same linked-worktree cwd) ---
+# A `$` only in the FINAL path component leaves the directory fully known and
+# genuinely cwd-relative -> the ordinary worktree/main-root logic still applies.
+assert_allow "write-confinement (#4921): CWD=linked worktree, \$VAR only in the filename allows" \
+    "echo x > out-\$STAMP.log" "$WT_LINKED_DIR"
+assert_allow "write-confinement (#4921): CWD=linked worktree, known worktree subdir + \$VAR filename allows" \
+    "echo x > src/\$f.txt" "$WT_LINKED_DIR"
+# A known prefix OUTSIDE the protected area (e.g. /tmp) protects nothing.
+assert_allow "write-confinement (#4921): CWD=linked worktree, /tmp prefix with a \$VAR directory component allows" \
+    "echo x > /tmp/loom-test-\$STAMP/f.log" "$WT_LINKED_DIR"
+# A `$` a real shell would NEVER expand is literal data, not an unknown path:
+# single-quoted and backslash-escaped forms keep their existing treatment
+# (mirrors the quoted-tilde rule of #4382).
+assert_allow "write-confinement (#4921): CWD=linked worktree, single-quoted '\$A/…' is literal (shell never expands it) and allows" \
+    "echo x > '\$A/evil'" "$WT_LINKED_DIR"
+assert_allow "write-confinement (#4921): CWD=linked worktree, backslash-escaped \\\$A/… is literal and allows" \
+    "echo x > \\\$A/evil" "$WT_LINKED_DIR"
+# The filename-only exemption must NOT become a hole into the main checkout:
+# the directory is fully known there, so the ordinary containment test still
+# runs and still denies.
+assert_deny "write-confinement (#4921): CWD=linked worktree, \$VAR filename under a MAIN-checkout dir still denies" \
+    "echo x > $UNRESOLVED_MAIN_TARGET/out-\$STAMP.log" "$WT_LINKED_DIR"
+# A `$` that is only quoted DATA in a message argument (never a write target)
+# must not manufacture a deny — the quote-aware `>` scan of #4245/#4289 and the
+# literal-text redaction still decide that, unchanged.
+assert_allow "write-confinement (#4921): CWD=linked worktree, quoted '>' and '\$' inside a commit message allows" \
+    "git commit -m \"price > \$5 total\"" "$WT_LINKED_DIR"
+# Regression: ordinary in-worktree and /tmp writes are untouched.
+assert_allow "write-confinement (#4921): CWD=linked worktree, plain in-worktree write still allows" \
+    "echo x > $WT_LINKED_DIR/src/plain.sh" "$WT_LINKED_DIR"
+
+# The pre-existing MAIN-checkout-cwd behaviour for the same command must not
+# change (it was already fail-closed there -- #4921 makes the two cwds agree,
+# it does not relax either one).
+assert_deny "write-confinement (#4921): CWD=main checkout, unresolvable \$VAR target still denies" \
+    "echo x > \$SNEAK_NOT_ASSIGNED_ANYWHERE/evil" "$WT_REPO_LINKED"
+
+# Fail-open contract: with no managed worktree anywhere, an unresolvable
+# target is allowed exactly like every other write in that repo.
+assert_allow "write-confinement (#4921): no managed worktree anywhere -> unresolvable \$VAR allows (fail-open)" \
+    "echo x > \$SNEAK/evil" "$WT_REPO_NOWT"
+# And the category toggle still switches the whole check off.
+assert_allow_env "write-confinement (#4921): LOOM_GUARD_WORKTREE_ISOLATION=0 -> unresolvable \$VAR allows" \
+    "LOOM_GUARD_WORKTREE_ISOLATION=0" "echo x > \$SNEAK/evil" "$WT_LINKED_DIR"
+
+# -------------------------------------------------------------------------
 # Tilde expansion for write targets (#4382, same fix family as #4245/#4289's
 # quote-aware `>` scanning). Reported incident: `cp <built-binary>
 # ~/.local/bin/loom-daemon` from a main-checkout cwd was denied because the

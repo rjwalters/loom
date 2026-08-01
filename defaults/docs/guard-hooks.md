@@ -392,6 +392,41 @@ attempt to catch every conceivable write vector (an interpreter one-liner like
 fallback an agent reaches for after an Edit/Write denial, not building a full
 security boundary.
 
+**Unresolvable `$…` targets fail closed, in every cwd (issue #4921).** The
+tokenizer never expands variables, so a target it cannot resolve is emitted as
+the raw token (`$A/evil`) and the resolution then cwd-prefixes it as if it
+were a relative path. From a **main-checkout** cwd that fabricated path landed
+inside the main checkout and denied, so the fallback looked fail-closed; from
+a **linked-worktree** cwd — the canonical builder setup and the only mode
+#4178 actually protects — the same fabricated path walked back up into the
+acting worktree's own `.loom-managed` sentinel and was **allowed**, whatever
+the variable would expand to at runtime. The write-confinement check therefore
+decides on the target's *shape* before trusting either containment test.
+
+**Denied** (the write's *location*, not merely its filename, is unknowable):
+
+| Shape | Example | Why |
+|-------|---------|-----|
+| Variable from the root down | `> $DEST`, `tee "${OUT}"`, `> $(mktemp)`, `> /$X`, `> /$X/evil` | The path root itself is unknown — the value may be (or complete) an absolute path into the main checkout, so the cwd prefix is pure invention. |
+| Expandable `$` in a **directory** component, known prefix inside the repo/worktree area | `> $A/evil`, `> ./$A/evil`, `cd $A && > f`, `> <worktree>/$A/f` | The value may contain `..` or an absolute path, so neither the sentinel walk-up nor the containment test can see where it lands. |
+| …or no usable known prefix (it collapses to `/`) | `> /tmp/../$A/evil` | The known prefix is normalized *before* it is judged, so a `..` traversal cannot manufacture a benign-looking prefix. |
+
+**Not denied**, so the fix adds no new false positives: a `$` only in the final
+filename (`> out-$STAMP.log` — the directory is fully known, so the ordinary
+containment test still runs and still denies a main-checkout directory), a
+known prefix outside the protected area (`> /tmp/$D/f.log`), and a `$` a real
+shell would never expand — single-quoted or backslash-escaped (`> '$A/evil'`),
+mirroring the quoted-tilde rule of #4382. As always, the deny only fires when a
+managed worktree actually exists for the repo, and the category toggle below
+switches it off with the rest of the check.
+
+The workaround when an agent legitimately needs a variable-derived target is to
+spell the path out literally — inside its own issue worktree for repo files, or
+as an explicit `/tmp/...` path for scratch. This deliberately also denies a
+target derived from a variable that would land *outside* the repo entirely
+(`> $HOME/x`, `> $TMPDIR/f`): the guard cannot know that at scan time, and
+fail-closed on an unknowable location is the whole point of the rule.
+
 The guard is **on by default**. It is resolved in this order (highest precedence first):
 
 1. **`LOOM_GUARD_WORKTREE_ISOLATION` env var** — `0`/`false`/`no` disables the guard; `1`/`true`/`yes` forces it on. Overrides the config value.
