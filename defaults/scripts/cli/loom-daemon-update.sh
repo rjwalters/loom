@@ -1093,6 +1093,16 @@ if [[ "$FORCE" == "true" && "$UPDATE_NEEDED" == "false" ]]; then
 fi
 
 if [[ "$UPDATE_NEEDED" == "false" ]]; then
+    # UPDATE_NEEDED compares the installed binary against the CURRENT HEAD. When
+    # the checkout is behind origin, a real run fast-forwards first, so HEAD --
+    # and therefore that comparison -- would change before anything is built.
+    # Reporting a bare "Nothing to do" here would hide the pending ff-sync from
+    # exactly the mode whose job is to print the plan, so --dry-run surfaces it
+    # before exiting.
+    if [[ "$DRY_RUN" == "true" && "$ALLOW_STALE" != "true" \
+          && -n "$DEFAULT_BRANCH" && "$ORIGIN_BEHIND_COUNT" -gt 0 ]]; then
+        echo "[dry-run] Plan includes fast-forwarding local ${DEFAULT_BRANCH} to origin/${DEFAULT_BRANCH} (${ORIGIN_BEHIND_COUNT} commit(s) behind) before building; the up-to-date check below is against the CURRENT HEAD and may change once that ff-merge applies."
+    fi
     ok "loom-daemon binary is already up to date with source HEAD (${SOURCE_COMMIT}). Nothing to do."
     print_final_installed_line "$SOURCE_COMMIT"
     exit 0
