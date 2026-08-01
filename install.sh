@@ -884,8 +884,9 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
     info "Reinstall will uninstall the existing installation first, then perform"
     info "a fresh Quick Install."
   else
-    info "Reinstall will uninstall the existing installation first, then perform"
-    info "a fresh install and create a PR with the changes."
+    info "Reinstall will upgrade the existing installation in an isolated worktree"
+    info "and open a PR with the changes -- your working directory is not touched"
+    info "until you merge it."
   fi
   echo ""
 
@@ -908,22 +909,41 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
     error "Existing Loom installation detected at $TARGET_PATH/.loom -- refusing to run a non-interactive reinstall without explicit acknowledgement.\n       Reinstalling uninstalls the existing Loom payload before writing the new version; inventory and back up any project-owned Loom hooks, scripts, and agent configuration first.\n       Re-run with --confirm-reinstall once you have done so, or omit --quick/--yes/--full to get an interactive y/N prompt instead."
   fi
 
-  # Issue #3545: for a --quick reinstall, guard uncommitted user changes across
-  # the uninstall→reinstall cycle (mirrors the stash guard in the sibling
-  # scripts/install-loom.sh --clean path). The uninstall runs `git add` in the
-  # target tree and the reinstall reconciles the index afterwards; stashing
-  # first keeps a user's pre-existing staged/working changes from being caught
-  # up in either step. The non-quick reinstall delegates to install-loom.sh,
-  # which performs its own guarding, so it is intentionally left unstashed here.
-  #
-  # Issue #3597: scope the stash to Loom-owned paths. The original unscoped
-  # `git stash push` swept sibling installers' uncommitted tracked changes
-  # (.anvil/*, .claude/skills/repo/*, non-Loom CLAUDE.md sections, …) into the
-  # stash and left a half-old/half-new hybrid tree. Restrict the stash to the
-  # dirty ∩ (Loom ownership set + .gitignore) intersection so sibling changes
-  # are never touched. Empty intersection → no stash at all.
-  REINSTALL_STASHED_USER_CHANGES=false
+  # Issue #4888: the chained uninstall below (`uninstall-loom.sh --yes --local`)
+  # mutates $TARGET_PATH's MAIN checkout directly -- it stages deletions and
+  # strips the Loom sections out of CLAUDE.md / .gitignore in place. That is
+  # necessary and safe for a --quick reinstall (the fresh install runs
+  # synchronously in that same working tree right after -- see the
+  # INSTALL_TYPE=="1" branch below, which unstages/restores as part of its own
+  # completion). It is NOT safe for the non-quick (Full Install) path: that
+  # path `exec`s into scripts/install-loom.sh, which does all of its real work
+  # in an isolated worktree branched from `origin/main` (see
+  # scripts/install/create-worktree.sh) and opens a PR -- it never reads or
+  # needs a pre-uninstalled main checkout. Once `exec` replaces this process,
+  # nothing here can roll back a downstream failure (a trap in *this* script
+  # will never fire), so any failure inside the delegated install-loom.sh run
+  # left the chained uninstall's staged deletions stranded on $TARGET_PATH's
+  # main checkout with no automatic recovery (the reported half-uninstalled
+  # target). `loom-daemon init` already performs a careful merge/upgrade of an
+  # existing install (including legacy-content migration) from inside that
+  # worktree, so the Full Install path needs no pre-mutation at all --
+  # install-loom.sh's own idempotency check detects the older installed
+  # version and proceeds with a normal upgrade (see the delegation site below).
   if [[ "$INSTALL_TYPE" == "1" ]]; then
+    # Issue #3545: for a --quick reinstall, guard uncommitted user changes across
+    # the uninstall→reinstall cycle (mirrors the stash guard in the sibling
+    # scripts/install-loom.sh --clean path). The uninstall runs `git add` in the
+    # target tree and the reinstall reconciles the index afterwards; stashing
+    # first keeps a user's pre-existing staged/working changes from being caught
+    # up in either step.
+    #
+    # Issue #3597: scope the stash to Loom-owned paths. The original unscoped
+    # `git stash push` swept sibling installers' uncommitted tracked changes
+    # (.anvil/*, .claude/skills/repo/*, non-Loom CLAUDE.md sections, …) into the
+    # stash and left a half-old/half-new hybrid tree. Restrict the stash to the
+    # dirty ∩ (Loom ownership set + .gitignore) intersection so sibling changes
+    # are never touched. Empty intersection → no stash at all.
+    REINSTALL_STASHED_USER_CHANGES=false
     # shellcheck source=scripts/install/stash-scope.sh
     source "$LOOM_ROOT/scripts/install/stash-scope.sh"
     REINSTALL_OWNED_DIRTY=()
@@ -946,35 +966,32 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
         warning "Uncommitted changes may appear alongside the reinstall diff"
       fi
     fi
-  fi
 
-  # Issue #3598: snapshot the committed .loom/config.json before the chained
-  # uninstall deletes it. `config.json` is listed in uninstall-loom.sh's
-  # RUNTIME_ARTIFACTS and is removed from disk, but it is consumer configuration
-  # (e.g. a load-bearing `worktree.root` override), not a runtime artifact.
-  # Restoring the snapshot before `loom-daemon init` (below) lets the daemon's
-  # merge-aware config copy preserve consumer keys instead of regenerating the
-  # file from the template. Mirrors the #3588 .gitignore snapshot pattern.
-  # Standalone uninstall behavior is intentionally unchanged.
-  REINSTALL_CONFIG_SNAPSHOT=""
-  if [[ -f "$TARGET_PATH/.loom/config.json" ]]; then
-    REINSTALL_CONFIG_SNAPSHOT="$(mktemp 2>/dev/null || true)"
-    if [[ -n "$REINSTALL_CONFIG_SNAPSHOT" ]]; then
-      cp "$TARGET_PATH/.loom/config.json" "$REINSTALL_CONFIG_SNAPSHOT" 2>/dev/null || \
-        REINSTALL_CONFIG_SNAPSHOT=""
+    # Issue #3598: snapshot the committed .loom/config.json before the chained
+    # uninstall deletes it. `config.json` is listed in uninstall-loom.sh's
+    # RUNTIME_ARTIFACTS and is removed from disk, but it is consumer configuration
+    # (e.g. a load-bearing `worktree.root` override), not a runtime artifact.
+    # Restoring the snapshot before `loom-daemon init` (below) lets the daemon's
+    # merge-aware config copy preserve consumer keys instead of regenerating the
+    # file from the template. Mirrors the #3588 .gitignore snapshot pattern.
+    # Standalone uninstall behavior is intentionally unchanged.
+    REINSTALL_CONFIG_SNAPSHOT=""
+    if [[ -f "$TARGET_PATH/.loom/config.json" ]]; then
+      REINSTALL_CONFIG_SNAPSHOT="$(mktemp 2>/dev/null || true)"
+      if [[ -n "$REINSTALL_CONFIG_SNAPSHOT" ]]; then
+        cp "$TARGET_PATH/.loom/config.json" "$REINSTALL_CONFIG_SNAPSHOT" 2>/dev/null || \
+          REINSTALL_CONFIG_SNAPSHOT=""
+      fi
     fi
-  fi
 
-  # Uninstall existing installation (local mode, no separate PR)
-  info "Uninstalling existing Loom installation..."
-  "$LOOM_ROOT/scripts/uninstall-loom.sh" --yes --local "$TARGET_PATH" || \
-    error "Uninstall failed - aborting reinstall"
-  echo ""
-  success "Existing installation removed"
-  echo ""
+    # Uninstall existing installation (local mode, no separate PR)
+    info "Uninstalling existing Loom installation..."
+    "$LOOM_ROOT/scripts/uninstall-loom.sh" --yes --local "$TARGET_PATH" || \
+      error "Uninstall failed - aborting reinstall"
+    echo ""
+    success "Existing installation removed"
+    echo ""
 
-  # If --quick was specified, do a quick reinstall instead of full workflow
-  if [[ "$INSTALL_TYPE" == "1" ]]; then
     info "Running fresh Quick Install..."
     echo ""
 
@@ -1253,7 +1270,19 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
     exit 0
   fi
 
-  # Default: delegate to Full Install (creates worktree + PR)
+  # Default: delegate to Full Install (creates worktree + PR). Issue #4888: no
+  # uninstall runs against $TARGET_PATH's main checkout above for this path --
+  # the delegated install-loom.sh does all of its work in an isolated worktree
+  # (scripts/install/create-worktree.sh branches from `origin/main`) and never
+  # touches the live main checkout, so there is nothing to roll back on
+  # failure. install-loom.sh's own idempotency check will detect the existing
+  # (older) installed version from $TARGET_PATH/.loom/install-metadata.json
+  # and proceed with a normal merge-mode upgrade inside its worktree -- the
+  # same careful preserve/migrate logic (loom-daemon init) that a plain
+  # `install-loom.sh` upgrade already relies on. Deliberately NOT passing
+  # --force here: that flag also flips FORCE_AUTO_MERGE on for the resulting
+  # PR (scripts/install-loom.sh's create-pr.sh call), which is a bigger
+  # behavior change (skips human review) than this fix's scope.
   info "Running fresh install via Full Install workflow..."
   echo ""
   INSTALL_FLAGS=()
