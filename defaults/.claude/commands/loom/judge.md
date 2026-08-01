@@ -1094,6 +1094,37 @@ if gh pr checks <PR_NUMBER> | grep -qE "(pending|queued|in_progress)"; then
 fi
 ```
 
+### CRITICAL: Never End Your Turn on a Background CI Monitor
+
+**A CI-gated verdict must be settled in-turn — either via the skip-and-continue path above, or via a foreground poll loop. It must NEVER be settled by starting a background monitor (a `Monitor`/`ScheduleWakeup` timer, a `run_in_background` Bash watcher, or any other "I'll check back once it finishes" narration) and ending your turn while your verdict is still pending on it.**
+
+This mirrors the orchestrator-level guardrail already documented in `sweep.md` ("ending your turn IS the kill signal", issue #4257) — restated here explicitly for Judge because the failure has already recurred in this exact role. **Incident (issue #4883, 2026-07-31, kicad-tools workspace, headless `/loom:sweep all`):** a Judge subagent finished its static review, started a background CI monitor, and ended its turn narrating *"The background monitor will notify me when it completes, at which point I'll issue the verdict. Awaiting that result."* In an interactive session a human can nudge the agent back to life; in a headless `claude -p` sweep there is no such recovery — ending the turn **terminates the process**, the monitor dies with it, no verdict is ever issued, and the PR is left claimed (`loom:reviewing`) with nobody left to release it.
+
+**There are exactly two safe paths when CI is pending and you cannot approve on a guess:**
+
+1. **Batch mode (there is a next PR to move to): skip and continue.** Use the "When CI is Pending" procedure above — release `loom:reviewing`, leave `loom:review-requested` in place, move on to the next PR. This is not a fallback of last resort; it is the correct default whenever a next PR exists, because a later tick re-evaluates this one.
+2. **Single-PR / manual invocation (there is no next PR — you were dispatched to judge exactly this one PR and a verdict is expected before your turn ends): block-poll in the foreground.** Loop **inside this same turn** — check `gh pr checks <PR_NUMBER>`, `sleep` a fixed interval, repeat — until the checks resolve or you hit an explicit, bounded cap. This is an ordinary shell loop that runs to completion and returns control to you before you write your final message; nothing about it depends on a future turn.
+
+```bash
+# Foreground block-poll — single-PR Judge invocation, no batch to fall back to.
+# Bounded: MAX_WAIT caps total wait time; never loop unboundedly.
+MAX_WAIT=1800   # 30 min cap — tune to the repo's typical CI duration
+INTERVAL=60
+ELAPSED=0
+while gh pr checks <PR_NUMBER> | grep -qE "(pending|queued|in_progress)"; do
+  if [[ "$ELAPSED" -ge "$MAX_WAIT" ]]; then
+    echo "CI still pending after ${MAX_WAIT}s — falling back to a conditional verdict."
+    break
+  fi
+  sleep "$INTERVAL"
+  ELAPSED=$((ELAPSED + INTERVAL))
+done
+```
+
+**If the cap is reached and CI is still pending, do not extend the wait and do not reach for a background watcher instead.** Post a conditional-verdict comment stating plainly that the code review passed but CI had not settled after the bounded wait, then — since there is no batch to hand this off to — release `loom:reviewing` and leave `loom:review-requested` in place, exactly as the skip-and-continue path does, so a later Judge invocation (the next cron tick, or a fresh manual dispatch) can re-evaluate once CI has settled.
+
+**Never substitute an armed `Monitor`/`ScheduleWakeup` timer or a `run_in_background` watcher for either path above.** A timer or background task that is still armed when you end your turn is not "waiting" — in headless `-p` mode it is simply killed along with the process, and the PR is orphaned with a stale claim and no verdict. If you have not personally observed the CI result (via a `gh pr checks` call whose output you read in this turn), you have not verified it, and you MUST NOT write a final message that implies the verdict is settled or "in progress elsewhere."
+
 ### Example CI Verification Workflow
 
 ```bash
