@@ -836,6 +836,19 @@ if [[ ${#MISSING_DEPS[@]} -gt 0 ]]; then
   echo -e "$INSTALL_INSTRUCTIONS"
   echo ""
 
+  # Issue #4888: this gate used to `read` unconditionally, even under
+  # --yes/--quick/--full. On a non-interactive run stdin is not a terminal, so
+  # the read returns immediately at EOF with an empty reply, which then fell
+  # into the "exit to install" default below and aborted -- after printing a
+  # prompt nobody was there to answer, and (when stdin is a pipe rather than
+  # /dev/null) after silently eating a byte of whatever else was on it. Honor
+  # NON_INTERACTIVE explicitly instead: same outcome (a missing required
+  # dependency is still fatal), but as a direct, greppable error rather than a
+  # phantom prompt.
+  if [[ "$NON_INTERACTIVE" == true ]]; then
+    error "Missing required dependencies: ${MISSING_DEPS[*]} -- cannot continue a non-interactive install.\n       Install them (see above) and re-run, or drop --yes/--quick/--full to get an interactive prompt that lets you continue anyway."
+  fi
+
   read -r -p "Exit to install dependencies? [Y/n] " -n 1 INSTALL_DEPS
   echo ""
   if [[ ! $INSTALL_DEPS =~ ^[Nn]$ ]]; then

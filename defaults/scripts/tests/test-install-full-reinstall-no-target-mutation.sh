@@ -92,6 +92,38 @@ exit 1
 EOF
 chmod +x "$FAKE_ROOT/scripts/install-loom.sh"
 
+# --- 1b. Stub the toolchain deps install.sh gates on, so this suite is
+# host-independent ---
+#
+# install.sh runs a "Checking System Dependencies" gate (node / pnpm / cargo /
+# git) BEFORE it reaches any of the reinstall logic under test. A host missing
+# any one of them aborts the run early, and the "stub marker seen" assertion
+# below fails for a reason that has nothing to do with the behavior this suite
+# exists to pin. That is exactly what happened on the hermetic CI runner, which
+# has node/cargo/git but no pnpm -- the suite only passed on developer machines
+# that happened to have pnpm installed.
+#
+# On the --full path under test, install.sh only ever runs `<tool> --version`
+# on these before `exec`ing the (stubbed) Full Install delegate, so trivially
+# satisfying the gate with version-printing stubs is sound and keeps the suite
+# genuinely exercising the reinstall control flow on every host -- strictly
+# better than skipping the whole suite wherever pnpm is absent, which would
+# have left the #4888 regression uncovered in CI.
+#
+# `git` is deliberately NOT stubbed: it is used for real (fixture repo, HEAD
+# and `git status --porcelain` assertions), which is why it keeps the hard
+# `command -v git` skip-guard above instead.
+STUB_BIN="$FAKE_ROOT/stub-bin"
+mkdir -p "$STUB_BIN"
+for _tool in node pnpm cargo; do
+  cat > "$STUB_BIN/$_tool" <<EOF
+#!/usr/bin/env bash
+# Test stub: install.sh's dependency gate only calls \`$_tool --version\`.
+echo "$_tool (loom test stub) 0.0.0"
+EOF
+  chmod +x "$STUB_BIN/$_tool"
+done
+
 # --- 2. Seed a scratch target repo with an existing ("older") Loom install ---
 TARGET="$(mktemp -d /tmp/loom-full-reinstall-target.XXXXXX)"
 git -C "$TARGET" init --quiet
@@ -125,7 +157,7 @@ git -C "$TARGET" commit -m "Initial commit with an older Loom install" --quiet
 PRE_INSTALL_SHA="$(git -C "$TARGET" rev-parse HEAD)"
 
 # --- 3. Run the (fake-rooted) installer's --full --confirm-reinstall path ---
-OUTPUT="$("$FAKE_ROOT/install.sh" --full --confirm-reinstall -y "$TARGET" < /dev/null 2>&1)"
+OUTPUT="$(PATH="$STUB_BIN:$PATH" "$FAKE_ROOT/install.sh" --full --confirm-reinstall -y "$TARGET" < /dev/null 2>&1)"
 EXIT_CODE=$?
 
 if [[ $EXIT_CODE -ne 0 ]]; then

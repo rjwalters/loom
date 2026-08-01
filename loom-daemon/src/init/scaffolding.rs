@@ -925,8 +925,13 @@ pub fn setup_repository_scaffolding(
     // (AGENTS_SECTION_START/END) so the two files' Loom-managed sections are
     // independently detectable. AGENTS.md has no historical "legacy
     // full-guide-in-root" layout to migrate away from (unlike CLAUDE.md's
-    // pre-#3000 layout), so no `is_legacy_loom_managed_root`-style heuristic is
-    // needed for it.
+    // pre-#3000 layout) — but it still needs the same
+    // `is_legacy_loom_managed_root` / `slice_is_discardable_legacy` heuristics
+    // (issue #4888): a broken or interrupted prior install can leave a root
+    // AGENTS.md carrying stale, unsubstituted Loom template text with missing
+    // or malformed markers, and preserving that verbatim would reintroduce the
+    // placeholders and trip `assert_no_placeholders` below. See the marker /
+    // markerless branches further down.
     //
     // `defaults/.loom/AGENTS.md` is itself a generated artifact
     // (defaults/scripts/generate-agents-md.sh, kept in sync by
