@@ -77,49 +77,25 @@ Architect/Hermit cadence is out of scope (#3381).
 
 ## Agent Roles
 
-| Role | File | Purpose | Mode |
-|------|------|---------|------|
-| Builder | `builder.md` | Implement features and fixes | Manual |
-| Judge | `judge.md` | Evaluate pull requests | Cron 5min (GH Actions) |
-| Champion | `champion.md` | Evaluate proposals, auto-merge PRs | Cron 10min (GH Actions) |
-| Curator | `curator.md` | Enhance and organize issues | Cron 5min (GH Actions) |
-| Architect | `architect.md` | Create architectural proposals | Manual (cadence #3381) |
-| Hermit | `hermit.md` | Identify simplification opportunities | Manual (cadence #3381) |
-| Doctor | `doctor.md` | Fix bugs and address PR feedback | Manual |
-| Guide | `guide.md` | Prioritize and triage issues | Cron 15min (GH Actions) |
-| Driver | `driver.md` | Direct command execution | Manual |
-| Auditor | `auditor.md` | Validate main branch build and runtime | Cron 10min (GH Actions) |
-
-Full role definitions: `.loom/roles/*.md`. The `loom.md` role file documents the
-daemon-mode operator surface (observing the running `loom-daemon` via MCP tools).
+Ten specialized roles (Builder, Judge, Champion, Curator, Architect, Hermit,
+Doctor, Guide, Driver, Auditor) plus `loom` (the daemon-mode operator surface)
+— purpose/cadence table: [`.loom/roles/README.md`](.loom/roles/README.md)
+§"Available Roles". Full definitions: `.loom/roles/<name>.md`.
 
 ## Label-Based Workflow
 
-Agents coordinate through labels. See `.github/labels.yml` for full definitions
-(the authoritative `Applied by:` field is on every label).
+Agents coordinate through labels — `.github/labels.yml` is authoritative (every
+label documents its own `Applied by:` owner). State transitions:
 
-**Issue Lifecycle**:
-```
-(created) → loom:triage → loom:curating → loom:curated → loom:issue → loom:building → (closed)
-           ↑ filer        ↑ Curator        ↑ Curator      ↑ human     ↑ Builder
-                                                          (or Champion
-                                                           in --merge mode)
-```
-
-**PR Lifecycle**:
-```
-(created) → loom:review-requested → loom:pr → (auto-merged)
-           ↑ Builder                ↑ Judge    ↑ Champion
-```
-
-**Proposal Lifecycle**:
-```
-(created) → loom:architect/loom:hermit/loom:auditor → (evaluated) → loom:issue
-           ↑ Architect/Hermit/Auditor                 ↑ Champion    ↑ Ready for Builder
-```
-
-**Epic Lifecycle**: `loom:epic` → Champion creates phased `loom:architect` +
-`loom:epic-phase` issues.
+- **Issue**: `loom:triage` (filer) → `loom:curating`/`loom:curated` (Curator) →
+  `loom:issue` (human, or Champion in `--merge` mode) → `loom:building`
+  (Builder) → closed.
+- **PR**: `loom:review-requested` (Builder) → `loom:pr` (Judge) → auto-merged
+  (Champion).
+- **Proposal**: `loom:architect`/`loom:hermit`/`loom:auditor` (proposer) →
+  evaluated (Champion) → `loom:issue` (ready for Builder).
+- **Epic**: `loom:epic` → Champion creates phased `loom:architect` +
+  `loom:epic-phase` issues.
 
 > **Note on label cleanup**: Loom intentionally does **not** remove labels from
 > closed issues or merged PRs (harmless — all agents filter by open state — and it
@@ -127,21 +103,16 @@ Agents coordinate through labels. See `.github/labels.yml` for full definitions
 
 ### Issues Are Suggestions (Role Autonomy)
 
-Filed issues are the *input queue*, not mandates. In autonomous mode the
-**Curator, Builder, and Judge** may **close** or **rescope** an issue — with a
-stated rationale — when building it is not the best outcome (obsolete, duplicate,
-low value, wrong approach, better split/merged). Full guardrails live in each role
-prompt's "Issues Are Suggestions" section (`.loom/roles/curator.md`, `builder.md`,
-`judge.md`). In brief:
-
-- **Comment the rationale BEFORE closing**, then `gh issue close <N> --reason "not
-  planned"`. A closed issue leaves the queue automatically (the work-finder polls
-  only *open* `loom:issue` items).
-- **Rescope** instead of closing when the core is worth keeping: edit/split/relabel,
-  and **remove `loom:issue`** if the labels no longer reflect an approved scope (drop
-  back to `loom:triage`/`loom:curated`) so it is not re-dispatched with a stale scope.
-- **Never close an issue that encodes a still-pending human decision** — route it to
-  `loom:blocked` or `loom:operator-only` with a comment instead. Never invent labels.
+Filed issues are the *input queue*, not mandates — this repo runs
+autonomy-by-default. In autonomous mode **Curator, Builder, and Judge** may
+**close** (rationale commented first, then `--reason "not planned"`) or
+**rescope** (relabel back to `loom:triage`/`loom:curated` if the scope no
+longer matches) an issue rather than build it as filed, when it is obsolete,
+duplicate, low value, or the wrong approach. **Never** close an issue that
+encodes a still-pending human decision — use `loom:blocked`/
+`loom:operator-only` instead. Full guardrails live in each role prompt's own
+"Issues Are Suggestions" section: `.loom/roles/curator.md`, `builder.md`,
+`judge.md`.
 
 ## Git Worktree Workflow
 
@@ -290,13 +261,10 @@ labels), `mcp__loom__cancel_sweep --sweep_id <id>` (cancel a running sweep).
 
 ## Migration History
 
-The v0.10.0 shepherd/daemon deprecation (epic #3372) deleted the Python shepherd
-and daemon brains and `/shepherd`; epic #3449 rebuilt the daemon surface as the
-Rust `loom-daemon` binary; v0.11.0 removed `spawn-loop.sh` (use
-`mcp__loom__dispatch_sweep`). Complete history — phase table, removed-entry-point
-map, downstream-consumer guidance —
-[`docs/migration/v0.10.0-shepherd-deprecation.md`](docs/migration/v0.10.0-shepherd-deprecation.md),
-[ADR-0009](docs/adr/0009-shepherd-deprecation.md).
+Completed-migration history (v0.10.0 shepherd/daemon deprecation, the Rust
+`loom-daemon` rebuild, `spawn-loop.sh` removal in v0.11.0) lives in
+[`docs/migration/v0.10.0-shepherd-deprecation.md`](docs/migration/v0.10.0-shepherd-deprecation.md)
+and [ADR-0009](docs/adr/0009-shepherd-deprecation.md) — not inline here.
 
 ## Resources
 
