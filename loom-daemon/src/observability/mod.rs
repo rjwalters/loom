@@ -768,10 +768,14 @@ mod tests {
     /// `exporter=otlp` in a build that does NOT have the `otlp` Cargo
     /// feature compiled in must degrade to disabled (never panic, never
     /// silently fall back to the HTTPS sink the operator did not ask for).
+    /// `#[tokio::test]`, not a plain `#[test]`: `spawn_task` calls
+    /// `collector::spawn_task` (which needs a Tokio reactor) *before* it
+    /// branches on `exporter_kind`, so even the returns-`None` path must run
+    /// inside a runtime — same as the `#[cfg(feature = "otlp")]` sibling below.
     #[cfg(not(feature = "otlp"))]
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn spawn_task_otlp_requested_without_the_feature_returns_none() {
+    async fn spawn_task_otlp_requested_without_the_feature_returns_none() {
         clear_env();
         let bus = EventBus::new();
         let dir = tempdir().unwrap();
