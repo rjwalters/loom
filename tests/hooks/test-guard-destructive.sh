@@ -2874,6 +2874,59 @@ assert_deny "write-confinement (#4926): CWD=main checkout, unbalanced leading si
 assert_allow "write-confinement (#4926): CWD=linked worktree, unbalanced leading single-quote keeps today's allow" \
     "echo x > '$WT_REPO_LINKED/defaults/hooks/f.sh" "$WT_LINKED_DIR"
 
+# -------------------------------------------------------------------------
+# Quote-aware whitespace masking (#4934) -- mask_ws() in extract_write_targets().
+#
+# A quoted write target containing a literal space (e.g.
+# `echo x > '/main/checkout/evil file.sh'`) was tokenized by the plain
+# `split(seg, toks, /[ \t]+/)` whitespace split into TWO fragments; only the
+# FIRST fragment (carrying a dangling, unterminated quote) was ever used as
+# the write target. strip_target_quoting() correctly reported that dangling
+# quote as unbalanced and fell back to the raw fragment (#4926's "never widen
+# a deny into an allow" contract) -- but the fallback fragment itself was then
+# misclassified as a RELATIVE path and cwd-joined into the acting worktree,
+# turning what should be a main-checkout DENY into a false ALLOW from a
+# linked-worktree cwd (the canonical builder setup). mask_ws() fixes the
+# tokenizer itself so a quoted spaced path yields exactly one token.
+for _q4934 in "'" '"'; do
+    assert_deny "write-confinement (#4934): CWD=main checkout, ${_q4934}-quoted spaced echo > main-checkout path denies" \
+        "echo x > ${_q4934}$WT_REPO/defaults/hooks/evil file.sh${_q4934}" "$WT_REPO"
+    assert_deny "write-confinement (#4934): CWD=main checkout, ${_q4934}-quoted spaced echo >> main-checkout path denies" \
+        "echo x >> ${_q4934}$WT_REPO/defaults/hooks/evil file.sh${_q4934}" "$WT_REPO"
+    assert_deny "write-confinement (#4934): CWD=main checkout, ${_q4934}-quoted spaced tee main-checkout path denies" \
+        "echo x | tee ${_q4934}$WT_REPO/defaults/hooks/evil file.sh${_q4934}" "$WT_REPO"
+    assert_deny "write-confinement (#4934): CWD=main checkout, ${_q4934}-quoted spaced sed -i on main-checkout path denies" \
+        "sed -i 's/a/b/' ${_q4934}$WT_REPO/defaults/hooks/evil file.sh${_q4934}" "$WT_REPO"
+    assert_deny "write-confinement (#4934): CWD=main checkout, ${_q4934}-quoted spaced cp destination in main checkout denies" \
+        "cp /tmp/a.sh ${_q4934}$WT_REPO/defaults/hooks/evil file.sh${_q4934}" "$WT_REPO"
+    assert_deny "write-confinement (#4934): CWD=main checkout, ${_q4934}-quoted spaced mv destination in main checkout denies" \
+        "mv /tmp/a.sh ${_q4934}$WT_REPO/defaults/hooks/evil file.sh${_q4934}" "$WT_REPO"
+
+    # The actual bypass (#4934): every one of these six ALLOWED pre-fix, from
+    # a linked-worktree cwd -- exactly the #4178 protection's canonical mode.
+    assert_deny "write-confinement (#4934): CWD=linked worktree, ${_q4934}-quoted spaced echo > main-checkout path denies" \
+        "echo x > ${_q4934}$WT_REPO_LINKED/defaults/hooks/evil file.sh${_q4934}" "$WT_LINKED_DIR"
+    assert_deny "write-confinement (#4934): CWD=linked worktree, ${_q4934}-quoted spaced echo >> main-checkout path denies" \
+        "echo x >> ${_q4934}$WT_REPO_LINKED/defaults/hooks/evil file.sh${_q4934}" "$WT_LINKED_DIR"
+    assert_deny "write-confinement (#4934): CWD=linked worktree, ${_q4934}-quoted spaced tee main-checkout path denies" \
+        "echo x | tee ${_q4934}$WT_REPO_LINKED/defaults/hooks/evil file.sh${_q4934}" "$WT_LINKED_DIR"
+    assert_deny "write-confinement (#4934): CWD=linked worktree, ${_q4934}-quoted spaced sed -i on main-checkout path denies" \
+        "sed -i 's/a/b/' ${_q4934}$WT_REPO_LINKED/defaults/hooks/evil file.sh${_q4934}" "$WT_LINKED_DIR"
+    assert_deny "write-confinement (#4934): CWD=linked worktree, ${_q4934}-quoted spaced cp destination in main checkout denies" \
+        "cp /tmp/a.sh ${_q4934}$WT_REPO_LINKED/defaults/hooks/evil file.sh${_q4934}" "$WT_LINKED_DIR"
+    assert_deny "write-confinement (#4934): CWD=linked worktree, ${_q4934}-quoted spaced mv destination in main checkout denies" \
+        "mv /tmp/a.sh ${_q4934}$WT_REPO_LINKED/defaults/hooks/evil file.sh${_q4934}" "$WT_LINKED_DIR"
+done
+unset _q4934
+
+# Sibling-allow: a quoted spaced path genuinely inside the acting worktree
+# must still be allowed -- mask_ws() only narrows how a token is SPLIT, it
+# must never widen the containment test itself (no over-blocking regression).
+assert_allow "write-confinement (#4934): CWD=linked worktree, single-quoted spaced target inside the worktree allows" \
+    "echo x > '$WT_LINKED_DIR/src/evil file.sh'" "$WT_LINKED_DIR"
+assert_allow "write-confinement (#4934): CWD=linked worktree, double-quoted spaced target inside the worktree allows" \
+    "echo x > \"$WT_LINKED_DIR/src/evil file.sh\"" "$WT_LINKED_DIR"
+
 rm -rf "$HOME_FIXTURE_OUTSIDE"
 rm -rf "$WT_REPO" "$WT_REPO_NOWT" "$WT_REPO_OFF" "$WT_REPO_LINKED"
 
