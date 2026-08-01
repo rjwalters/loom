@@ -150,7 +150,7 @@ Stage 2 used to be `cd loom-tools && uv run pytest tests/ -q
 retired — everything it did is native in `loom-daemon` now — so that stage would
 fail against a deleted path. Only the `loom-search` module survived the deletion,
 and it is off the core daemon path, so its coverage moved to the non-blocking
-stage 3 above. See [ADR-0013](../../docs/adr/0013-loom-tools-python-retirement.md).
+stage 3 above. See [ADR-0013](https://github.com/rjwalters/loom/blob/main/docs/adr/0013-loom-tools-python-retirement.md).
 
 **`mcp-loom` (TypeScript) is intentionally excluded** from the gate: it needs
 `npm install`/`npm ci` in a fresh worktree (no guaranteed warm `node_modules`),
