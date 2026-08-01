@@ -86,6 +86,20 @@ describe("hostDetailView — token panel", () => {
     expect(cells(rows[1]!)[4]).toBe("available");
   });
 
+  it("counts down to an exhausted account's reset instead of showing a dash", () => {
+    // Issue #4874: the daemon never populated `limit_window_reset_at`, so this
+    // column was permanently `—` for exactly the accounts an operator needs it
+    // for. With the field fed, an exhausted account answers "when does
+    // capacity return?" — a multi-day countdown, not a clamped "just now".
+    const rows = [...detail(DEGRADED_HOST_ID).querySelectorAll('[data-testid="token-account"]')];
+    expect(cells(rows[0]!)[4]).toBe("exhausted");
+    expect(cells(rows[0]!)[3]).toBe("in 2d 14h");
+    expect(cells(rows[0]!)[3]).not.toBe(UNKNOWN);
+    // The absolute instant is still available as the tooltip for a bug report.
+    const resetCell = rows[0]!.querySelectorAll("td")[3];
+    expect(resetCell?.getAttribute("title")).toBeTruthy();
+  });
+
   it("clamps the usage meter to the track", () => {
     const built = buildFleetView(
       parseFleetSnapshot({

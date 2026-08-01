@@ -693,8 +693,8 @@ pub struct TokenAccountRow {
     pub util_5h: Option<f64>,
 }
 
-/// Read every account row from `{pool_dir}/.ranking`, via the **same** triple
-/// parser (`name|status|5h_util`) the spawn-time selector and
+/// Read every account row from `{pool_dir}/.ranking`, via the **same** row
+/// parser (`name|status|5h_util|7d_reset`) the spawn-time selector and
 /// [`crate::capacity::read_ranking_at`]'s aggregation both use
 /// ([`crate::tokens_pool::select::parse_ranking_line`]) — so this panel can
 /// never disagree with the aggregate counts on `/api/status` about what a row
@@ -712,10 +712,10 @@ pub fn read_token_rows(pool_dir: &Path) -> Vec<TokenAccountRow> {
     contents
         .lines()
         .filter_map(crate::tokens_pool::select::parse_ranking_line)
-        .map(|(name, status, util_5h)| TokenAccountRow {
-            name,
-            status,
-            util_5h,
+        .map(|row| TokenAccountRow {
+            name: row.name,
+            status: row.status,
+            util_5h: row.util_5h,
         })
         .collect()
 }
