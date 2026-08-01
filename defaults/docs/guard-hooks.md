@@ -453,6 +453,21 @@ typed; `$`/`~` are copied through untouched, so a file genuinely named `$X` or
 unchanged); and an **unterminated** quote falls back to the raw token — today's
 verdict in both directions, never widening a deny into an allow.
 
+**Quoted `cd` arguments are still absolute (issue #4933).** #4926 fixed quoting
+on the write-*target* side; a quoted **`cd` argument** was a separate hole,
+reached entirely inside `extract_write_targets()`'s awk — `strip_target_quoting()`
+never touches it. `cd '<main>' && echo x > f.sh` from a linked-worktree cwd built
+`curcwd` from the `cd` argument's token verbatim (quote characters intact), so
+`'/main/checkout'` / `"/main/checkout"` failed the `~ /^\//` classification and
+was joined as if **relative** — fabricating `curcwd` as `<worktree>/'/main/checkout'`
+instead of recognizing it as absolute, and the relative write target then
+resolved back inside the acting worktree's own sentinel — **allowed**. The awk
+`cd` handler now strips a leading/matching-trailing quote from a **copy** of the
+argument used only for this classification and for building `curcwd`; `qsplit()`'s
+verbatim-token contract (which `extract_rm_targets()` / `parse_force_ops()`
+depend on) is untouched, and an unbalanced/unterminated quote leaves the copy
+unchanged — the same fallback contract as #4926.
+
 The guard is **on by default**. It is resolved in this order (highest precedence first):
 
 1. **`LOOM_GUARD_WORKTREE_ISOLATION` env var** — `0`/`false`/`no` disables the guard; `1`/`true`/`yes` forces it on. Overrides the config value.

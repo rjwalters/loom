@@ -2102,10 +2102,35 @@ extract_write_targets() {
 
             if (toks[1] == "cd") {
                 if (m >= 2 && toks[2] != "" && toks[2] != "-") {
-                    if (toks[2] ~ /^\//) {
-                        curcwd = toks[2]
+                    # Quote-aware absolute-path classification (#4933): qsplit()
+                    # preserves quote characters VERBATIM in toks[] (its
+                    # contract -- extract_rm_targets()/parse_force_ops() depend
+                    # on that raw form elsewhere in this file), so a quoted `cd`
+                    # argument fails the plain ^/ test below and this code used
+                    # to silently fall into the RELATIVE join branch,
+                    # fabricating curcwd as "<worktree>/<quoted-abs-path>"
+                    # instead of recognizing the argument as absolute. Strip a
+                    # leading/matching-trailing quote from a COPY (cdarg) used
+                    # ONLY for this classification test and for building
+                    # curcwd; toks[2] itself is never modified. An
+                    # unbalanced/unterminated quote (no matching trailing
+                    # quote character) leaves cdarg unchanged, so ambiguity can
+                    # only ever keep the existing verdict, never widen a deny
+                    # into an allow (same fallback contract as #4926).
+                    cdarg = toks[2]
+                    cdq_sq = sprintf("%c", 39)   # single quote
+                    cdq_dq = sprintf("%c", 34)   # double quote
+                    cdqc = substr(cdarg, 1, 1)
+                    if (cdqc == cdq_sq || cdqc == cdq_dq) {
+                        cdlen = length(cdarg)
+                        if (cdlen >= 2 && substr(cdarg, cdlen, 1) == cdqc) {
+                            cdarg = substr(cdarg, 2, cdlen - 2)
+                        }
+                    }
+                    if (cdarg ~ /^\//) {
+                        curcwd = cdarg
                     } else if (curcwd != "") {
-                        curcwd = curcwd "/" toks[2]
+                        curcwd = curcwd "/" cdarg
                     }
                 }
                 continue
