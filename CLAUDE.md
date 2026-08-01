@@ -254,6 +254,7 @@ Configuration lives in `.loom/config.json` (committed for team sharing): a
   user scope (`scripts/install-loom.sh`, refreshed by `loom update`); `setup-mcp.sh`
   is demoted to a bundle-rebuild/legacy-migration tool. See the mcp-loom README.
 - **Fleet dashboard** (`loom-daemon serve`, opt-in, read-only, loopback by default): [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md) §Fleet dashboard.
+- **Fleet observability** (`observability` config block: daemon → Cloudflare backend → dashboard) — [`.loom/docs/observability.md`](.loom/docs/observability.md).
 
 ### Multi-Account Token Pool (operating summary)
 
