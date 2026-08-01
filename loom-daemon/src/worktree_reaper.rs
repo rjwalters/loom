@@ -358,7 +358,22 @@ pub fn reap_repo(repo_root: &Path, config: &WorktreeReaperConfig) -> ReapReport 
 
     let probes =
         clean::production_probes(&active_issues, &issue_state_fn, &pr_status_fn, Utc::now());
-    let remover = |path: &Path, issue: u32| clean::cleanup_worktree(repo_root, path, issue, false);
+    // `cleanup_worktree` reports the underlying cause of a failed removal
+    // (#4877). `reap_worktrees` only needs the removed/failed bit, so name the
+    // cause in the daemon log here rather than discarding it — the reaper is
+    // unattended and its log is the only place an operator can see why.
+    let remover =
+        |path: &Path, issue: u32| match clean::cleanup_worktree(repo_root, path, issue, false) {
+            Ok(()) => true,
+            Err(cause) => {
+                log::warn!(
+                    "worktree_reaper: {} could not remove issue-{issue} ({}): {cause}",
+                    repo_root.display(),
+                    path.display()
+                );
+                false
+            }
+        };
 
     let mut report = reap_worktrees(repo_root, &opts, &probes, &remover);
     report.free_gb = crate::disk_headroom::worktree_root_free_gb(repo_root);

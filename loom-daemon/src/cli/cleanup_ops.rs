@@ -65,14 +65,12 @@ pub(crate) fn handle_clean_command(
 
         let stats = agg::clean_aggressive(&repo_root, dry_run, force, aggressive_min_age);
         agg::print_aggressive_summary(&stats, dry_run);
+        println!("{}", clean::completion_line("Aggressive cleanup", dry_run, stats.errors));
         if dry_run {
-            println!("Dry run complete - no changes made");
             println!("Run without --dry-run to perform cleanup");
-        } else {
-            println!("Aggressive cleanup complete!");
         }
         println!();
-        std::process::exit(i32::from(stats.errors > 0));
+        std::process::exit(clean::exit_code(stats.errors));
     }
 
     let opts = clean::CleanOptions {
