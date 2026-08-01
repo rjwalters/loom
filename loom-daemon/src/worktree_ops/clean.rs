@@ -45,6 +45,61 @@ fn confirm(prompt: &str) -> bool {
     matches!(input.trim().to_lowercase().as_str(), "y" | "yes")
 }
 
+/// Compose one operator-actionable error diagnostic: *what* failed, *to what*,
+/// and *why* (#4877). A bare `Errors: N` tally is not actionable, so every
+/// recorded error carries these three parts.
+#[must_use]
+pub fn error_line(target: &str, operation: &str, cause: &str) -> String {
+    let cause = cause.trim();
+    if cause.is_empty() {
+        format!("{operation} failed for {target}")
+    } else {
+        format!("{operation} failed for {target}: {cause}")
+    }
+}
+
+/// Compose the closing line of a cleanup pass. A run that recorded errors must
+/// never read identically to a clean one (#4877), so the count is folded into
+/// the line itself rather than being buried in the summary block above it.
+#[must_use]
+pub fn completion_line(label: &str, dry_run: bool, errors: usize) -> String {
+    let plural = if errors == 1 { "" } else { "s" };
+    match (dry_run, errors) {
+        (true, 0) => "Dry run complete - no changes made".to_string(),
+        (true, n) => format!(
+            "Dry run complete - no changes made, but {n} error{plural} occurred (see diagnostics above)"
+        ),
+        (false, 0) => format!("{label} complete!"),
+        (false, n) => format!("{label} completed with {n} error{plural} (see diagnostics above)"),
+    }
+}
+
+/// Process exit code for a finished pass: non-zero exactly when at least one
+/// error was recorded, so a scripted caller can distinguish "completed with
+/// errors" from "completed cleanly".
+#[must_use]
+pub fn exit_code(errors: usize) -> i32 {
+    i32::from(errors > 0)
+}
+
+/// Run `cmd`, mapping failure to the underlying cause (git's stderr when it
+/// wrote one, otherwise the exit status or the spawn error) so callers can name
+/// it in their diagnostic instead of discarding it.
+pub(super) fn run_checked(mut cmd: Command) -> Result<(), String> {
+    match cmd.output() {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            Err(if stderr.is_empty() {
+                format!("exited with {}", o.status)
+            } else {
+                stderr
+            })
+        }
+        Err(e) => Err(format!("could not run command: {e}")),
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct CleanupStats {
     pub cleaned_worktrees: usize,
@@ -63,6 +118,21 @@ pub struct CleanupStats {
     pub cleaned_sweep_checkpoints: usize,
     pub kept_sweep_transients: usize,
     pub errors: usize,
+    /// One diagnostic per recorded error, in the order they occurred. Printed
+    /// inline as each error happens and re-listed under the summary tally.
+    pub error_details: Vec<String>,
+}
+
+impl CleanupStats {
+    /// Report a failure where it happens *and* tally it: prints an actionable
+    /// diagnostic naming the target, the operation, and the underlying cause,
+    /// then increments the error counter (#4877).
+    pub fn record_error(&mut self, target: &str, operation: &str, cause: &str) {
+        let line = error_line(target, operation, cause);
+        eprintln!("  ERROR: {line}");
+        self.errors += 1;
+        self.error_details.push(line);
+    }
 }
 
 /// Options mirroring `clean.py`'s argparse surface (minus subcommand-style
@@ -564,29 +634,28 @@ pub fn production_probes<'a>(
 ///
 /// Exposed (issue #4876) so the daemon-side reaper performs the *same*
 /// removal the CLI does, including the `git branch -d` → `-D` fallback.
+///
+/// `Err` carries the underlying cause (git's stderr) so the caller can name it
+/// in a diagnostic (issue #4877).
 pub fn cleanup_worktree(
     repo_root: &Path,
     worktree_path: &Path,
     issue_num: u32,
     dry_run: bool,
-) -> bool {
+) -> Result<(), String> {
     let branch_name = naming::branch_name(issue_num);
     if dry_run {
         println!("Would remove: {}", worktree_path.display());
         println!("Would delete branch: {branch_name}");
-        return true;
+        return Ok(());
     }
-    let removed = Command::new("git")
+    let mut remove = Command::new("git");
+    remove
         .args(["worktree", "remove"])
         .arg(worktree_path)
         .arg("--force")
-        .current_dir(repo_root)
-        .status()
-        .is_ok_and(|s| s.success());
-    if !removed {
-        eprintln!("  Failed to remove worktree: {}", worktree_path.display());
-        return false;
-    }
+        .current_dir(repo_root);
+    run_checked(remove)?;
     println!("  Removed worktree: {}", worktree_path.display());
 
     let deleted = Command::new("git")
@@ -600,7 +669,7 @@ pub fn cleanup_worktree(
             .current_dir(repo_root)
             .status();
     }
-    true
+    Ok(())
 }
 
 /// Standard + `--safe` worktree cleanup pass. Mirrors `clean.py::clean_worktrees`.
@@ -674,14 +743,21 @@ pub fn clean_worktrees(repo_root: &Path, stats: &mut CleanupStats, opts: &CleanO
                 stats.skipped_open += 1;
             }
             WorktreeDecision::SkipUnknownPrStatus => {
-                println!("  Unknown PR status - skipping");
-                stats.errors += 1;
+                stats.record_error(
+                    &format!("issue #{issue_num} ({})", worktree_path.display()),
+                    "PR status lookup (gh pr list)",
+                    "unknown PR state - worktree left in place, re-run once `gh` can reach \
+                     the forge",
+                );
             }
             WorktreeDecision::Remove => {
-                if cleanup_worktree(repo_root, &worktree_path, issue_num, opts.dry_run) {
-                    stats.cleaned_worktrees += 1;
-                } else {
-                    stats.errors += 1;
+                match cleanup_worktree(repo_root, &worktree_path, issue_num, opts.dry_run) {
+                    Ok(()) => stats.cleaned_worktrees += 1,
+                    Err(cause) => stats.record_error(
+                        &worktree_path.display().to_string(),
+                        "git worktree remove --force",
+                        &cause,
+                    ),
                 }
             }
             WorktreeDecision::ConfirmClosedIssue => {
@@ -691,16 +767,22 @@ pub fn clean_worktrees(repo_root: &Path, stats: &mut CleanupStats, opts: &CleanO
                     stats.cleaned_worktrees += 1;
                 } else if opts.force {
                     println!("  Auto-removing: {}", entry.path().display());
-                    if cleanup_worktree(repo_root, &worktree_path, issue_num, opts.dry_run) {
-                        stats.cleaned_worktrees += 1;
-                    } else {
-                        stats.errors += 1;
+                    match cleanup_worktree(repo_root, &worktree_path, issue_num, opts.dry_run) {
+                        Ok(()) => stats.cleaned_worktrees += 1,
+                        Err(cause) => stats.record_error(
+                            &worktree_path.display().to_string(),
+                            "git worktree remove --force",
+                            &cause,
+                        ),
                     }
                 } else if confirm("  Force remove this worktree? [y/N] ") {
-                    if cleanup_worktree(repo_root, &worktree_path, issue_num, opts.dry_run) {
-                        stats.cleaned_worktrees += 1;
-                    } else {
-                        stats.errors += 1;
+                    match cleanup_worktree(repo_root, &worktree_path, issue_num, opts.dry_run) {
+                        Ok(()) => stats.cleaned_worktrees += 1,
+                        Err(cause) => stats.record_error(
+                            &worktree_path.display().to_string(),
+                            "git worktree remove --force",
+                            &cause,
+                        ),
                     }
                 } else {
                     println!("  Skipping: {}", entry.path().display());
@@ -799,6 +881,15 @@ fn remote_branch_exists(repo_root: &Path, branch: &str) -> bool {
         .unwrap_or(true)
 }
 
+/// Force-delete one local branch. `Err` carries git's own message (e.g.
+/// `error: branch 'x' not found.`) so a failure can be reported against the
+/// branch that failed instead of vanishing into the error tally (#4877).
+fn force_delete_branch(repo_root: &Path, branch: &str) -> Result<(), String> {
+    let mut cmd = Command::new("git");
+    cmd.args(["branch", "-D", branch]).current_dir(repo_root);
+    run_checked(cmd)
+}
+
 /// Two-pass local-branch cleanup. Mirrors `clean.py::clean_branches`.
 pub fn clean_branches(repo_root: &Path, stats: &mut CleanupStats, dry_run: bool) {
     let out = Command::new("git")
@@ -839,15 +930,11 @@ pub fn clean_branches(repo_root: &Path, stats: &mut CleanupStats, dry_run: bool)
                 stats.cleaned_branches += 1;
                 continue;
             }
-            let ok = Command::new("git")
-                .args(["branch", "-D", branch])
-                .current_dir(repo_root)
-                .status()
-                .is_ok_and(|s| s.success());
-            if ok {
-                stats.cleaned_branches += 1;
-            } else {
-                stats.errors += 1;
+            match force_delete_branch(repo_root, branch) {
+                Ok(()) => stats.cleaned_branches += 1,
+                Err(cause) => {
+                    stats.record_error(&format!("branch {branch}"), "git branch -D", &cause);
+                }
             }
         } else {
             issue_pass_candidates.push(branch.clone());
@@ -867,15 +954,13 @@ pub fn clean_branches(repo_root: &Path, stats: &mut CleanupStats, dry_run: bool)
             "CLOSED" => {
                 println!("  Issue #{issue_num} CLOSED - deleting {branch}");
                 if !dry_run {
-                    let ok = Command::new("git")
-                        .args(["branch", "-D", branch])
-                        .current_dir(repo_root)
-                        .status()
-                        .is_ok_and(|s| s.success());
-                    if ok {
-                        stats.cleaned_branches += 1;
-                    } else {
-                        stats.errors += 1;
+                    match force_delete_branch(repo_root, branch) {
+                        Ok(()) => stats.cleaned_branches += 1,
+                        Err(cause) => stats.record_error(
+                            &format!("branch {branch} (issue #{issue_num} CLOSED)"),
+                            "git branch -D",
+                            &cause,
+                        ),
                     }
                 } else {
                     stats.cleaned_branches += 1;
@@ -1029,23 +1114,20 @@ fn file_age(path: &Path, now: SystemTime) -> Option<Duration> {
     Some(now.duration_since(modified).unwrap_or_default())
 }
 
-/// Remove one transient file (or report it under `--dry-run`). Returns whether
-/// the removal succeeded / would have happened.
-fn remove_transient(path: &Path, label: &str, dry_run: bool) -> bool {
+/// Remove one transient file (or report it under `--dry-run`). `Err` carries
+/// the underlying `io::Error` so the caller can name it alongside the path.
+fn remove_transient(path: &Path, label: &str, dry_run: bool) -> Result<(), String> {
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     if dry_run {
         println!("  Would remove {label}: {name}");
-        return true;
+        return Ok(());
     }
     match std::fs::remove_file(path) {
         Ok(()) => {
             println!("  Removed {label}: {name}");
-            true
+            Ok(())
         }
-        Err(e) => {
-            eprintln!("  Failed to remove {name}: {e}");
-            false
-        }
+        Err(e) => Err(e.to_string()),
     }
 }
 
@@ -1080,10 +1162,13 @@ fn clean_sweep_transients_with(
         repo_root.join(".loom").join("main-clean-baseline.txt"),
     ] {
         if legacy.is_file() {
-            if remove_transient(&legacy, "legacy un-keyed baseline", dry_run) {
-                stats.cleaned_sweep_baselines += 1;
-            } else {
-                stats.errors += 1;
+            match remove_transient(&legacy, "legacy un-keyed baseline", dry_run) {
+                Ok(()) => stats.cleaned_sweep_baselines += 1,
+                Err(cause) => stats.record_error(
+                    &legacy.display().to_string(),
+                    "remove legacy un-keyed baseline",
+                    &cause,
+                ),
             }
         }
     }
@@ -1128,10 +1213,13 @@ fn clean_sweep_transients_with(
             }
             match file_age(&path, env.now) {
                 Some(age) if age >= env.min_age => {
-                    if remove_transient(&path, "stale sweep baseline", dry_run) {
-                        stats.cleaned_sweep_baselines += 1;
-                    } else {
-                        stats.errors += 1;
+                    match remove_transient(&path, "stale sweep baseline", dry_run) {
+                        Ok(()) => stats.cleaned_sweep_baselines += 1,
+                        Err(cause) => stats.record_error(
+                            &path.display().to_string(),
+                            "remove stale sweep baseline",
+                            &cause,
+                        ),
                     }
                 }
                 _ => stats.kept_sweep_transients += 1,
@@ -1159,10 +1247,13 @@ fn clean_sweep_transients_with(
             }
             let state = (env.issue_state)(issue);
             if state == "CLOSED" {
-                if remove_transient(&path, "closed-issue checkpoint", dry_run) {
-                    stats.cleaned_sweep_checkpoints += 1;
-                } else {
-                    stats.errors += 1;
+                match remove_transient(&path, "closed-issue checkpoint", dry_run) {
+                    Ok(()) => stats.cleaned_sweep_checkpoints += 1,
+                    Err(cause) => stats.record_error(
+                        &path.display().to_string(),
+                        "remove closed-issue checkpoint",
+                        &cause,
+                    ),
                 }
             } else {
                 println!("  Issue #{issue} is {state} - keeping {name}");
@@ -1439,6 +1530,9 @@ pub fn print_summary(stats: &CleanupStats, dry_run: bool, safe_mode: bool) {
     }
     if stats.errors > 0 {
         println!("  Errors: {}", stats.errors);
+        for detail in &stats.error_details {
+            println!("    - {detail}");
+        }
     }
     println!();
 }
@@ -1523,13 +1617,9 @@ pub fn run_clean(repo_root: &Path, opts: &CleanOptions) -> i32 {
 
     print_summary(&stats, opts.dry_run, opts.safe);
 
-    if opts.dry_run {
-        println!("Dry run complete - no changes made");
-    } else {
-        println!("Cleanup complete!");
-    }
+    println!("{}", completion_line("Cleanup", opts.dry_run, stats.errors));
 
-    i32::from(stats.errors > 0)
+    exit_code(stats.errors)
 }
 
 #[cfg(test)]
@@ -1842,6 +1932,134 @@ mod tests {
         );
         assert_eq!(stats.cleaned_sweep_checkpoints, 0);
         assert_eq!(stats.kept_sweep_transients, 1);
+    }
+
+    // --- actionable error reporting (#4877) ------------------------------
+
+    fn git(dir: &Path, args: &[&str]) {
+        let ok = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(ok, "git {args:?} failed in {}", dir.display());
+    }
+
+    /// A recorded error must name the target, the operation, and the cause —
+    /// the three things `Errors: 1` on its own withholds.
+    #[test]
+    fn record_error_names_target_operation_and_cause() {
+        let mut stats = CleanupStats::default();
+        stats.record_error("branch feature/issue-42", "git branch -D", "error: branch not found");
+        assert_eq!(stats.errors, 1);
+        assert_eq!(
+            stats.error_details,
+            vec![
+                "git branch -D failed for branch feature/issue-42: error: branch not found"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn error_line_without_a_cause_still_names_target_and_operation() {
+        assert_eq!(
+            error_line("/tmp/wt", "git worktree remove --force", "  "),
+            "git worktree remove --force failed for /tmp/wt"
+        );
+    }
+
+    /// The reported original symptom: a failed `git branch -D` bumped the
+    /// counter and printed nothing. The failure must now surface a diagnostic
+    /// naming the branch *and* git's own message.
+    #[test]
+    fn failed_branch_delete_reports_branch_and_git_error() {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "-q"]);
+
+        let branch = "feature/issue-4877";
+        let cause = force_delete_branch(dir.path(), branch)
+            .expect_err("deleting a nonexistent branch must fail");
+
+        let mut stats = CleanupStats::default();
+        stats.record_error(&format!("branch {branch}"), "git branch -D", &cause);
+
+        assert_eq!(stats.errors, 1);
+        let detail = &stats.error_details[0];
+        assert!(detail.contains(branch), "diagnostic must name the branch: {detail}");
+        assert!(detail.contains("git branch -D"), "diagnostic must name the operation: {detail}");
+        assert!(
+            detail.to_lowercase().contains("not found"),
+            "diagnostic must carry git's underlying error: {detail}"
+        );
+    }
+
+    /// A successful `git branch -D` must stay silent (no error inflation).
+    #[test]
+    fn successful_branch_delete_records_no_error() {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "-q", "--initial-branch=main"]);
+        git(dir.path(), &["config", "user.email", "loom@example.com"]);
+        git(dir.path(), &["config", "user.name", "Loom Test"]);
+        git(dir.path(), &["commit", "-q", "--allow-empty", "-m", "seed"]);
+        git(dir.path(), &["branch", "feature/issue-4877"]);
+
+        assert!(force_delete_branch(dir.path(), "feature/issue-4877").is_ok());
+    }
+
+    /// AC #3: a run that recorded errors must not read like a clean one.
+    #[test]
+    fn completion_line_differs_when_errors_occurred() {
+        let clean_run = completion_line("Cleanup", false, 0);
+        let errored_run = completion_line("Cleanup", false, 1);
+        assert_eq!(clean_run, "Cleanup complete!");
+        assert_ne!(clean_run, errored_run);
+        assert!(errored_run.contains('1'), "closing line must carry the count: {errored_run}");
+        assert!(errored_run.contains("error"), "closing line must say error: {errored_run}");
+        // Plural agreement, and the same rule for aggressive mode.
+        assert!(completion_line("Cleanup", false, 2).contains("2 errors"));
+        assert!(completion_line("Aggressive cleanup", false, 0).starts_with("Aggressive cleanup"));
+        assert_ne!(
+            completion_line("Aggressive cleanup", false, 0),
+            completion_line("Aggressive cleanup", false, 3)
+        );
+    }
+
+    /// A dry run that hit errors (e.g. an unresolvable PR status) must also
+    /// read differently from a clean dry run.
+    #[test]
+    fn completion_line_dry_run_reflects_errors() {
+        let clean_run = completion_line("Cleanup", true, 0);
+        let errored_run = completion_line("Cleanup", true, 1);
+        assert_eq!(clean_run, "Dry run complete - no changes made");
+        assert_ne!(clean_run, errored_run);
+        assert!(errored_run.contains("1 error"), "{errored_run}");
+    }
+
+    /// AC #4 regression lock: the exit status distinguishes "completed with
+    /// errors" from "completed cleanly".
+    #[test]
+    fn exit_code_is_nonzero_exactly_when_errors_occurred() {
+        assert_eq!(exit_code(0), 0);
+        assert_eq!(exit_code(1), 1);
+        assert_eq!(exit_code(7), 1);
+    }
+
+    /// End-to-end lock on the clean-run contract: a pass with nothing to do
+    /// returns 0. Scoped to `worktrees_only` so the pass touches nothing
+    /// outside the temp repo (no tmux sockets, no branches).
+    #[test]
+    fn run_clean_returns_zero_when_no_errors_occurred() {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "-q"]);
+        let opts = CleanOptions {
+            force: true,
+            worktrees_only: true,
+            ..CleanOptions::default()
+        };
+        assert_eq!(run_clean(dir.path(), &opts), 0);
     }
 
     #[test]

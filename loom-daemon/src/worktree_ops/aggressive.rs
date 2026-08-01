@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::SystemTime;
 
+use super::clean;
 use super::gh;
 use super::naming;
 
@@ -287,15 +288,35 @@ pub struct AggressiveStats {
     pub skipped_unreachable: usize,
     pub skipped_locked: usize,
     pub errors: usize,
+    /// One diagnostic per recorded error, in the order they occurred. Printed
+    /// inline as each error happens and re-listed under the summary tally.
+    pub error_details: Vec<String>,
 }
 
-fn remove_aggressive_worktree(repo_root: &Path, wt: &WorktreeInfo, dry_run: bool) -> bool {
+impl AggressiveStats {
+    /// Report a failure where it happens *and* tally it — same contract as
+    /// [`clean::CleanupStats::record_error`] (#4877).
+    pub fn record_error(&mut self, target: &str, operation: &str, cause: &str) {
+        let line = clean::error_line(target, operation, cause);
+        eprintln!("  ERROR: {line}");
+        self.errors += 1;
+        self.error_details.push(line);
+    }
+}
+
+/// Remove one worktree in `--aggressive` mode. `Err` carries the underlying
+/// cause (git's stderr) so the caller can name it in a diagnostic.
+fn remove_aggressive_worktree(
+    repo_root: &Path,
+    wt: &WorktreeInfo,
+    dry_run: bool,
+) -> Result<(), String> {
     if dry_run {
         println!("Would remove worktree: {}", wt.path.display());
         if let Some(b) = wt.branch_short() {
             println!("Would delete branch: {b}");
         }
-        return true;
+        return Ok(());
     }
     if wt.locked {
         let _ = Command::new("git")
@@ -304,16 +325,12 @@ fn remove_aggressive_worktree(repo_root: &Path, wt: &WorktreeInfo, dry_run: bool
             .current_dir(repo_root)
             .status();
     }
-    let removed = Command::new("git")
+    let mut remove = Command::new("git");
+    remove
         .args(["worktree", "remove", "--force"])
         .arg(&wt.path)
-        .current_dir(repo_root)
-        .status()
-        .is_ok_and(|s| s.success());
-    if !removed {
-        eprintln!("  Failed to remove worktree {}", wt.path.display());
-        return false;
-    }
+        .current_dir(repo_root);
+    clean::run_checked(remove)?;
     println!("  Removed worktree: {}", wt.path.display());
     if let Some(b) = wt.branch_short() {
         let _ = Command::new("git")
@@ -321,7 +338,7 @@ fn remove_aggressive_worktree(repo_root: &Path, wt: &WorktreeInfo, dry_run: bool
             .current_dir(repo_root)
             .status();
     }
-    true
+    Ok(())
 }
 
 /// Run the full `--aggressive` pass. Mirrors `clean.py::clean_aggressive`.
@@ -389,7 +406,15 @@ pub fn clean_aggressive(
                     }
                     Reason::ReachableFromOriginMain | Reason::ForceOverrideUnreachable => {
                         // Unreachable in Keep branch — defensive, never hit.
-                        stats.errors += 1;
+                        stats.record_error(
+                            &label,
+                            "internal decision check",
+                            &format!(
+                                "Keep decision paired with removal reason `{}` - this is a bug in \
+                                 decide_for_worktree; the worktree was left untouched",
+                                reason.as_str()
+                            ),
+                        );
                     }
                 }
                 continue;
@@ -405,10 +430,11 @@ pub fn clean_aggressive(
                 } else {
                     println!("  Remove ({}): {label}", reason.as_str());
                 }
-                if remove_aggressive_worktree(repo_root, wt, dry_run) {
-                    stats.removed += 1;
-                } else {
-                    stats.errors += 1;
+                match remove_aggressive_worktree(repo_root, wt, dry_run) {
+                    Ok(()) => stats.removed += 1,
+                    Err(cause) => {
+                        stats.record_error(&label, "git worktree remove --force", &cause);
+                    }
                 }
             }
         }
@@ -462,6 +488,9 @@ pub fn print_aggressive_summary(stats: &AggressiveStats, dry_run: bool) {
     }
     if stats.errors > 0 {
         println!("  Errors: {}", stats.errors);
+        for detail in &stats.error_details {
+            println!("    - {detail}");
+        }
     }
     println!();
 }
@@ -479,6 +508,23 @@ mod tests {
             locked: false,
             bare: false,
         }
+    }
+
+    /// #4877: an aggressive-mode failure must name the worktree, the
+    /// operation, and git's own message — not just bump `Errors: N`.
+    #[test]
+    fn record_error_names_worktree_operation_and_cause() {
+        let mut stats = AggressiveStats::default();
+        stats.record_error(
+            "/repo/.loom/worktrees/issue-42 [feature/issue-42]",
+            "git worktree remove --force",
+            "fatal: validation failed, cannot remove working tree",
+        );
+        assert_eq!(stats.errors, 1);
+        let detail = &stats.error_details[0];
+        assert!(detail.contains("issue-42"), "must name the worktree: {detail}");
+        assert!(detail.contains("git worktree remove --force"), "must name the op: {detail}");
+        assert!(detail.contains("validation failed"), "must carry git's error: {detail}");
     }
 
     #[test]
