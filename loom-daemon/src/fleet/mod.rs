@@ -43,10 +43,21 @@
 //! status` (#4342) and `fleet drain` (#4343) enumerate workers from this
 //! inventory — `add-worker` is where it gets written. The schema is kept
 //! deliberately minimal; the siblings can extend it.
+//!
+//! ## `fleet bootstrap-spice` (issue #4931, Phase 1a)
+//!
+//! [`spice_runner`] reuses this same Plan/Step architecture (and
+//! [`add_worker::SshRunner`] directly) to provision a pinned SPICE simulation
+//! toolchain (ngspice + Xyce, built from source) plus the gf180mcu and sky130
+//! open PDKs onto a reachable SSH host. It is a **sibling**, not an
+//! extension, of `add_worker`: a sim runner is not a loom worker, so it never
+//! touches the fleet registry, forge auth, the token pool, or safehouse — see
+//! [`spice_runner`]'s own doc comment for the full scope boundary.
 
 pub mod add_worker;
 pub mod drain;
 pub mod path_bootstrap;
+pub mod spice_runner;
 pub mod status;
 
 use anyhow::{anyhow, Context, Result};
@@ -251,13 +262,15 @@ impl Plan {
     /// Render the ordered plan for `--dry-run`: one numbered line per entry with
     /// its status placeholder, plus a `[skip]` reason where applicable. Secrets
     /// are never included (the rendered shell that carries them is not printed).
+    ///
+    /// `command` is the operator-facing command name this plan belongs to
+    /// (`"fleet add-worker"`, `"fleet bootstrap-spice"`, …) — a parameter
+    /// rather than a hardcoded string so a second Plan/Step consumer does not
+    /// print another command's name in its own dry-run header.
     #[must_use]
-    pub fn render_dry_run(&self, host: &str) -> String {
+    pub fn render_dry_run(&self, command: &str, host: &str) -> String {
         let mut out = String::new();
-        out.push_str(&format!(
-            "fleet add-worker plan for {host} ({} steps):\n",
-            self.entries.len()
-        ));
+        out.push_str(&format!("{command} plan for {host} ({} steps):\n", self.entries.len()));
         for (i, entry) in self.entries.iter().enumerate() {
             let n = i + 1;
             match entry {
@@ -420,11 +433,12 @@ pub fn execute_plan(runner: &dyn CommandRunner, plan: &Plan) -> Vec<StepReport> 
 }
 
 /// Render the per-step checklist from a set of [`StepReport`]s (AC: a re-run
-/// "reports unchanged steps"). Human-readable, one line per step.
+/// "reports unchanged steps"). Human-readable, one line per step. `command` is
+/// the operator-facing command name (see [`Plan::render_dry_run`]).
 #[must_use]
-pub fn render_checklist(host: &str, reports: &[StepReport]) -> String {
+pub fn render_checklist(command: &str, host: &str, reports: &[StepReport]) -> String {
     let mut out = String::new();
-    out.push_str(&format!("fleet add-worker checklist for {host}:\n"));
+    out.push_str(&format!("{command} checklist for {host}:\n"));
     for (i, r) in reports.iter().enumerate() {
         let n = i + 1;
         let mark = match r.status {
@@ -898,7 +912,7 @@ mod tests {
             ),
         );
         plan.push_skip("safehouse", "wire safehouse", "requires #3998");
-        let rendered = plan.render_dry_run("worker-1");
+        let rendered = plan.render_dry_run("fleet add-worker", "worker-1");
         assert!(rendered.contains("worker-1"));
         assert!(rendered.contains("token-accounts"));
         assert!(rendered.contains("feeds a secret via stdin"));
@@ -931,7 +945,7 @@ mod tests {
                 status: StepStatus::Failed("apply exited 1: boom".into()),
             },
         ];
-        let out = render_checklist("worker-1", &reports);
+        let out = render_checklist("fleet add-worker", "worker-1", &reports);
         assert!(out.contains("(unchanged)"));
         assert!(out.contains("(changed)"));
         assert!(out.contains("(skipped) — requires #3998"));

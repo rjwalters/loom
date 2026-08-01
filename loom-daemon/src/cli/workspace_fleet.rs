@@ -64,6 +64,7 @@ pub(crate) fn handle_calibrate_command(workspace: &str, write: bool, json: bool)
 pub(crate) fn handle_fleet_command(action: FleetAction) -> Result<()> {
     use loom_daemon::fleet::add_worker::{self, AddWorkerConfig};
     use loom_daemon::fleet::drain::{self, DrainConfig};
+    use loom_daemon::fleet::spice_runner::{self, SpiceBootstrapConfig};
 
     match action {
         FleetAction::AddWorker {
@@ -103,6 +104,42 @@ pub(crate) fn handle_fleet_command(action: FleetAction) -> Result<()> {
                 safehouse_invite_exec,
             };
             add_worker::run(&config)
+        }
+        FleetAction::BootstrapSpice {
+            ssh_host,
+            ngspice_repo_url,
+            ngspice_ref,
+            skip_xyce,
+            xyce_repo_url,
+            xyce_ref,
+            trilinos_repo_url,
+            trilinos_ref,
+            gf180mcu_repo_url,
+            gf180mcu_ref,
+            gf180mcu_models_path,
+            sky130_repo_url,
+            sky130_ref,
+            sky130_models_path,
+            dry_run,
+        } => {
+            let config = SpiceBootstrapConfig {
+                ssh_host,
+                dry_run,
+                ngspice_repo_url,
+                ngspice_ref,
+                install_xyce: !skip_xyce,
+                xyce_repo_url,
+                xyce_ref,
+                trilinos_repo_url,
+                trilinos_ref,
+                gf180mcu_repo_url,
+                gf180mcu_ref,
+                gf180mcu_models_path,
+                sky130_repo_url,
+                sky130_ref,
+                sky130_models_path,
+            };
+            spice_runner::run(&config)
         }
         FleetAction::Status { .. } => {
             // Routed directly in `main()` (it needs the async runtime for the

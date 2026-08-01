@@ -700,7 +700,7 @@ pub fn run(config: &AddWorkerConfig) -> Result<()> {
     let plan = build_plan(config, &secrets);
 
     if config.dry_run {
-        print!("{}", plan.render_dry_run(&config.ssh_host));
+        print!("{}", plan.render_dry_run("fleet add-worker", &config.ssh_host));
         println!(
             "\n(dry run — no action taken on {}. Re-run without --dry-run to execute.)",
             config.ssh_host
@@ -710,7 +710,7 @@ pub fn run(config: &AddWorkerConfig) -> Result<()> {
 
     let runner = SshRunner::new(&config.ssh_host);
     let reports = execute_plan(&runner, &plan);
-    print!("{}", render_checklist(&config.ssh_host, &reports));
+    print!("{}", render_checklist("fleet add-worker", &config.ssh_host, &reports));
 
     let verify_ok = reports
         .iter()
@@ -1452,7 +1452,7 @@ mod tests {
             assert!(stdin.secret, "{name} stdin must be marked secret");
         }
         // The apply strings must NOT embed the secret values (stdin only).
-        let dry = plan.render_dry_run("worker-1");
+        let dry = plan.render_dry_run("fleet add-worker", "worker-1");
         assert!(!dry.contains("the-pat"));
     }
 
@@ -1624,7 +1624,7 @@ mod tests {
             assert!(stdin.secret, "{name} stdin must be marked secret");
         }
 
-        let dry = plan.render_dry_run("worker-1");
+        let dry = plan.render_dry_run("fleet add-worker", "worker-1");
         assert!(!dry.contains("tskey-auth-ephemeral-tagged"));
         assert!(!dry.contains("hunter2-matrix-pw"));
         assert!(!dry.contains("store-pass-xyz"));
@@ -2089,7 +2089,7 @@ mod tests {
             ..Secrets::default()
         };
         let plan = build_plan(&config, &secrets);
-        let out = plan.render_dry_run(&config.ssh_host);
+        let out = plan.render_dry_run("fleet add-worker", &config.ssh_host);
         assert!(out.contains("13 steps"));
         assert!(out.contains("base-deps"));
         assert!(out.contains("verify"));

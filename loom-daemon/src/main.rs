@@ -1142,6 +1142,82 @@ enum FleetAction {
         dry_run: bool,
     },
 
+    /// Provision a pinned SPICE simulation toolchain (ngspice + Xyce, built
+    /// from source) plus the gf180mcu and sky130 open PDKs onto an
+    /// already-reachable SSH host (issue #4931, Phase 1a of "elastic cloud
+    /// compute for SPICE simulations"). A **sim runner is not a loom
+    /// worker**: unlike `add-worker`, this touches no cloud CLI, no
+    /// Tailscale API, no forge/token credentials, and does not write the
+    /// fleet registry. Idempotent: a re-run against an already-bootstrapped
+    /// host (at the same pins) reports every step already-satisfied.
+    BootstrapSpice {
+        /// SSH alias/host to reach the runner (from `repo:remote` or
+        /// operator supplied).
+        #[arg(value_name = "SSH_HOST")]
+        ssh_host: String,
+
+        /// ngspice source repository URL.
+        #[arg(long, value_name = "URL", default_value = loom_daemon::fleet::spice_runner::DEFAULT_NGSPICE_REPO_URL)]
+        ngspice_repo_url: String,
+
+        /// Pinned ngspice ref (tag/branch/commit) to build.
+        #[arg(long, value_name = "REF", default_value = loom_daemon::fleet::spice_runner::DEFAULT_NGSPICE_REF)]
+        ngspice_ref: String,
+
+        /// Skip the Xyce (+ Trilinos) source build — an ngspice-only runner.
+        /// Xyce's from-source build takes hours; analog repos that only
+        /// simulate with ngspice should not pay for it.
+        #[arg(long)]
+        skip_xyce: bool,
+
+        /// Xyce source repository URL.
+        #[arg(long, value_name = "URL", default_value = loom_daemon::fleet::spice_runner::DEFAULT_XYCE_REPO_URL)]
+        xyce_repo_url: String,
+
+        /// Pinned Xyce ref to build.
+        #[arg(long, value_name = "REF", default_value = loom_daemon::fleet::spice_runner::DEFAULT_XYCE_REF)]
+        xyce_ref: String,
+
+        /// Trilinos source repository URL (Xyce's solver dependency).
+        #[arg(long, value_name = "URL", default_value = loom_daemon::fleet::spice_runner::DEFAULT_TRILINOS_REPO_URL)]
+        trilinos_repo_url: String,
+
+        /// Pinned Trilinos ref to build.
+        #[arg(long, value_name = "REF", default_value = loom_daemon::fleet::spice_runner::DEFAULT_TRILINOS_REF)]
+        trilinos_ref: String,
+
+        /// gf180mcu-pdk repository URL.
+        #[arg(long, value_name = "URL", default_value = loom_daemon::fleet::spice_runner::DEFAULT_GF180MCU_REPO_URL)]
+        gf180mcu_repo_url: String,
+
+        /// Pinned gf180mcu-pdk ref to check out.
+        #[arg(long, value_name = "REF", default_value = loom_daemon::fleet::spice_runner::DEFAULT_GF180MCU_REF)]
+        gf180mcu_ref: String,
+
+        /// Submodule path inside the gf180mcu checkout holding the SPICE
+        /// device models. Pass an empty string to clone the top-level repo
+        /// only (when a pin's layout differs from the default).
+        #[arg(long, value_name = "PATH", default_value = loom_daemon::fleet::spice_runner::DEFAULT_GF180MCU_MODELS_PATH)]
+        gf180mcu_models_path: String,
+
+        /// skywater-pdk (sky130) repository URL.
+        #[arg(long, value_name = "URL", default_value = loom_daemon::fleet::spice_runner::DEFAULT_SKY130_REPO_URL)]
+        sky130_repo_url: String,
+
+        /// Pinned skywater-pdk ref to check out.
+        #[arg(long, value_name = "REF", default_value = loom_daemon::fleet::spice_runner::DEFAULT_SKY130_REF)]
+        sky130_ref: String,
+
+        /// Submodule path inside the sky130 checkout holding the SPICE
+        /// device models (see `--gf180mcu-models-path`).
+        #[arg(long, value_name = "PATH", default_value = loom_daemon::fleet::spice_runner::DEFAULT_SKY130_MODELS_PATH)]
+        sky130_models_path: String,
+
+        /// Print the ordered plan without contacting the host.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Aggregate sweep/token/health state across every fleet host, side by
     /// side, including the local host (issue #4342). Reads the fleet registry
     /// #4341 writes, collects the local host's own status in-process (over

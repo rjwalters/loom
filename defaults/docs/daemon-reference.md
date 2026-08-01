@@ -596,6 +596,81 @@ A systemd drop-in's `Environment=` is additive and its `Restart=` overrides the
 base unit, so this one file fixes both defects (the missing supervisor env and
 the wrong restart policy) without touching the rendered base unit.
 
+### `fleet bootstrap-spice <ssh-host>` (#4931, Phase 1a)
+
+Provisions a **pinned SPICE simulation toolchain** (ngspice + Xyce, built from
+source) plus the **gf180mcu and sky130 open PDKs** onto an already-reachable SSH
+host, so analog-repo simulation load can be offloaded off the agent fleet's
+primary host. Same seam as `add-worker`: it consumes "a reachable Ubuntu box + an
+SSH alias" (from `repo:remote` or operator-supplied) and never wrangles a cloud
+CLI.
+
+**A sim runner is not a loom worker.** `spice_runner.rs` is a *sibling* of
+`add_worker.rs`, not a profile of it: it reuses the same `Plan`/`Step`/
+`CommandRunner` machinery (and `add_worker::SshRunner` directly) but touches
+**no** cloud CLI, **no** Tailscale API, and **no** forge/token credentials — no
+`gh auth`, no `accounts.env`, no token pool, no safehouse. Every clone is an
+anonymous HTTPS clone of a public repo. It also does **not** write
+`~/.loom/fleet.json`: that registry models hosts running `loom-daemon`, and
+adding a sim-only box would make `fleet status` poll a host with no daemon to
+answer.
+
+**Ordered plan** (7 entries, each `check` → `apply`):
+
+| # | Step | What it does |
+|---|------|--------------|
+| 1 | `spice-base-deps` | apt: build-essential, bison/flex, cmake, gfortran, BLAS/LAPACK/SuiteSparse, X11/readline headers |
+| 2 | `spice-path` | append the canonical loom PATH (#4831) to `~/.profile` so `~/.local/bin` resolves for interactive logins |
+| 3 | `ngspice` | clone + `configure --prefix=~/.local --enable-xspice --enable-cider` + `make install` at the pinned ref |
+| 4 | `xyce` | build Trilinos (Xyce's documented option set) then Xyce against it; **skipped** with `--skip-xyce` |
+| 5 | `gf180mcu-pdk` | checkout `google/gf180mcu-pdk` at the pinned ref + init the device-model submodule |
+| 6 | `sky130-pdk` | checkout `google/skywater-pdk` at the pinned ref + init the device-model submodule |
+| 7 | `verify` | binaries on PATH, both PDK checkouts present with non-empty model libraries |
+
+Everything lands under `~/.loom/spice/` (`src/`, `pdks/`, `stamps/`,
+`trilinos-install/`); the binaries install to `~/.local/bin`.
+
+**Idempotency is version-aware.** Unlike `add-worker`'s steps (which probe for a
+binary's mere presence), each toolchain/PDK step compares a **ref stamp**
+(`~/.loom/spice/stamps/<name>.ref`, written by that step's `apply` only *after* a
+successful install) against the currently-configured pin. So:
+
+- Re-running at the **same** pins reports every step `unchanged` and touches
+  nothing.
+- Bumping **one** pin (e.g. `--ngspice-ref`) rebuilds only that step; the Xyce
+  stamp covers the Trilinos pin too, so bumping either rebuilds Xyce.
+- A build that dies half-way leaves no stamp, so it is never mistaken for a
+  completed one — and because every step is `check`-guarded, a re-run after
+  fixing the cause skips the satisfied prefix and **resumes at the failure**
+  (same guarantee as `add-worker`).
+
+**Pins and overrides.** The defaults are explicit refs (never `latest`/`main`) —
+ngspice `ngspice-42`, Xyce `Release-7.7` + Trilinos `trilinos-release-14-4-0`,
+gf180mcu-pdk `v0.9.5`, skywater-pdk `v0.0.3` — each overridable via
+`--<tool>-ref` / `--<tool>-repo-url`. The PDK repos keep their device models in
+submodules, so only the configured models submodule is initialized
+(`--gf180mcu-models-path` / `--sky130-models-path`, empty ⇒ top-level clone
+only) rather than the tens of GB of standard-cell libraries a SPICE runner never
+reads. Every ref/URL/path is charset-validated at preflight before it is
+rendered into shell.
+
+`--skip-xyce` renders the Xyce step as a visible `SKIP` entry (Xyce's
+from-source build with Trilinos is measured in hours; analog repos that only
+simulate with ngspice should not pay for it).
+
+```bash
+# Print the ordered plan without contacting the host.
+loom-daemon fleet bootstrap-spice sim-runner-1 --dry-run
+
+# ngspice-only runner, custom pin.
+loom-daemon fleet bootstrap-spice sim-runner-1 --skip-xyce --ngspice-ref ngspice-43
+```
+
+**Out of scope here** (deliberately, per #4931's phasing): the `spice-run`
+dispatch wrapper that routes a sim local-vs-remote lives in the analog repos
+(Phase 1b), result caching keyed on netlist/deck/corner is Phase 2, and
+scale-up/scale-to-zero elasticity is Phase 3.
+
 ### `fleet status [--json]` (#4342)
 
 Aggregates sweep/token/health state across **every** fleet host, side by side,
