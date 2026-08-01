@@ -157,10 +157,12 @@ impl RankingSnapshot {
 /// files, so callers that have their own resolved directory (or want to probe
 /// a specific one directly, e.g. in tests) can bypass re-resolution.
 ///
-/// The file is the pipe-delimited `name|status|5h_util` format written by
-/// `loom-daemon tokens check --ranking` (one account per line, issue #4195), where the
-/// status is the **second** field and the trailing 5h-utilization field is
-/// optional (legacy `name|status` lines omit it). Returns `None` when the file
+/// The file is the pipe-delimited `name|status|5h_util|7d_reset` format written
+/// by `loom-daemon tokens check --ranking` (one account per line, issues #4195 /
+/// #4874), where the status is the **second** field and the trailing
+/// 5h-utilization and 7d-reset fields are optional (legacy `name|status` lines
+/// omit both). Capacity only classifies the status, so the trailing fields are
+/// ignored here. Returns `None` when the file
 /// is absent, unreadable, or contains no parseable rows — the signal that no
 /// probe data exists, in which case callers fall back to the raw token-pool size
 /// (byte-for-byte the pre-#3902 behavior). Blank lines, `#` comments, and
@@ -168,7 +170,7 @@ impl RankingSnapshot {
 /// parsed via [`AccountHealth::parse`].
 ///
 /// Parsing goes through [`crate::tokens_pool::select::parse_ranking_line`] — the
-/// **same** triple parser the spawn-time selector uses — so this reader and the
+/// **same** row parser the spawn-time selector uses — so this reader and the
 /// selector can never de-sync on the field layout (the #4243/#4344 drift, where
 /// this function took the *last* field as the status and mis-read every 3-field
 /// row's `5h_util` — e.g. `agent3-2amlogic|available|0.09` → `"0.09"` →
@@ -189,12 +191,11 @@ pub fn read_ranking_at(pool_dir: &Path) -> Option<RankingSnapshot> {
         if !line.contains('|') {
             continue;
         }
-        let Some((_name, status, _util_5h)) = crate::tokens_pool::select::parse_ranking_line(line)
-        else {
+        let Some(row) = crate::tokens_pool::select::parse_ranking_line(line) else {
             continue;
         };
         snap.total += 1;
-        match AccountHealth::parse(&status) {
+        match AccountHealth::parse(&row.status) {
             AccountHealth::Available => snap.available += 1,
             AccountHealth::Exhausted => snap.exhausted += 1,
             AccountHealth::RateLimited => snap.rate_limited += 1,
@@ -737,50 +738,60 @@ mod tests {
         use crate::tokens_pool::check::ranking_line;
         use crate::tokens_pool::select::parse_ranking_line;
 
-        // (name, status, util) fixtures spanning every health class plus the
-        // optional / absent util field.
-        let accounts: [(&str, &str, Option<f64>); 5] = [
-            ("agent3-2amlogic", "available", Some(0.09)),
-            ("robb-2amlogic", "available", None), // legacy 2-field line
-            ("rjwalters-gmail", "exhausted", Some(0.00)),
-            ("agent2", "rate_limited", Some(0.88)),
-            ("agent4", "blocked", None),
+        // (name, status, util, reset) fixtures spanning every health class plus
+        // every combination of the two optional trailing fields — including the
+        // reset-without-util row (issue #4874), which is the one layout that
+        // needs a placeholder to keep the reset in field 4.
+        let accounts: [(&str, &str, Option<f64>, Option<&str>); 6] = [
+            ("agent3-2amlogic", "available", Some(0.09), None),
+            ("robb-2amlogic", "available", None, None), // legacy 2-field line
+            ("rjwalters-gmail", "exhausted", Some(0.00), Some("2026-08-02T03:00:00Z")),
+            ("agent2", "rate_limited", Some(0.88), Some("2026-08-01T07:00:00Z")),
+            ("agent4", "blocked", None, None),
+            // Reset known, utilization unknown: `name|status||reset`.
+            ("agent5", "exhausted", None, Some("2026-08-04T11:00:00Z")),
         ];
 
         // Render the file exactly as the writer would.
         let body: String = accounts
             .iter()
-            .map(|(name, status, util)| ranking_line(name, status, *util) + "\n")
+            .map(|(name, status, util, reset)| ranking_line(name, status, *util, *reset) + "\n")
             .collect();
 
-        // (2) vs (3): the selector's parser must recover the same name/status
-        // the writer put in, from the writer's own output.
-        for ((name, status, util), line) in accounts.iter().zip(body.lines()) {
-            let (pname, pstatus, putil) =
+        // (2) vs (3): the selector's parser must recover the same
+        // name/status/util/reset the writer put in, from the writer's own output.
+        for ((name, status, util, reset), line) in accounts.iter().zip(body.lines()) {
+            let row =
                 parse_ranking_line(line).expect("writer output must be parseable by the selector");
-            assert_eq!(&pname, name);
+            assert_eq!(&row.name, name);
             assert_eq!(
-                &pstatus, status,
+                &row.status, status,
                 "selector parser must recover the writer's status field, not the util"
             );
             match util {
                 Some(u) => {
-                    let p = putil.expect("a 3-field line must yield a util");
+                    let p = row.util_5h.expect("a line with a util must yield a util");
                     assert_eq!(format!("{p:.2}"), format!("{u:.2}"));
                 }
-                None => assert_eq!(putil, None, "a 2-field line must yield no util"),
+                None => assert_eq!(row.util_5h, None, "an absent util must not become 0.0"),
             }
+            assert_eq!(
+                row.limit_reset.as_deref(),
+                *reset,
+                "selector parser must recover the writer's reset field verbatim (#4874)"
+            );
         }
 
         // (1) → (2): capacity's reader must classify that same file into the
-        // writer's intended statuses — 2 available, 1 exhausted, 1
-        // rate_limited, 1 blocked, and crucially 0 unknown.
+        // writer's intended statuses — 2 available, 2 exhausted, 1
+        // rate_limited, 1 blocked, and crucially 0 unknown. A trailing reset
+        // field must not shift the status column for this reader either.
         let tmp = tempfile::tempdir().unwrap();
         write_ranking_at(tmp.path(), &body);
         let snap = read_ranking_at(tmp.path()).unwrap();
-        assert_eq!(snap.total, 5);
+        assert_eq!(snap.total, 6);
         assert_eq!(snap.available, 2);
-        assert_eq!(snap.exhausted, 1);
+        assert_eq!(snap.exhausted, 2);
         assert_eq!(snap.rate_limited, 1);
         assert_eq!(snap.blocked, 1);
         assert_eq!(

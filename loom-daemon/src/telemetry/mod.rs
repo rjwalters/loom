@@ -407,10 +407,16 @@ pub struct TokenAccountState {
     /// (lower = preferred).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rank: Option<u32>,
-    /// Fraction of the current limit window consumed (`0.0..=1.0`), when known.
+    /// Fraction of the 5h limit window consumed (`0.0..=1.0`), when known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage_fraction: Option<f64>,
-    /// When the account's current limit window resets, when known.
+    /// When the window **currently gating this account** resets, when known —
+    /// the 7d window for an `exhausted` account (the instant it regains
+    /// capacity), the 5h window otherwise (the rollover `usage_fraction` is
+    /// racing). The producer resolves which one, so a consumer reads this as
+    /// the single answer to "when does this account's constraint lift?"
+    /// (`tokens_pool::check::limit_reset`, issue #4874). Absent means
+    /// *unknown*, never "resets now".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit_window_reset_at: Option<DateTime<Utc>>,
     /// Whether the account is currently considered exhausted (excluded from the

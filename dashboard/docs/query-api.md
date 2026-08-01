@@ -202,6 +202,12 @@ non-integer), or `cursor` (non-positive or non-integer) returns `400` with a
   How loaded the pool is, and when capacity returns, without naming an
   account or exposing any single account's burn. The two usage figures are
   `null` — never `0` — when no account reported a `usage_fraction`.
+  `next_limit_window_reset_at` is the **earliest** per-account
+  `limit_window_reset_at` in the pool, and is likewise `null` — never a
+  fabricated instant — when no account reported one. Each account's
+  `limit_window_reset_at` is the reset of whichever window is gating *that*
+  account (7d once exhausted, 5h otherwise; the daemon resolves it before
+  export), so the aggregate reads as "the first moment any account frees up".
 
 ## `GET /api/events` / `GET /public/events`
 

@@ -322,8 +322,9 @@ byte-compatible with the historical `loom_tools.tokens.select` implementation,
 which stays in-tree as reference/conformance material (`loom-tools/tests/tokens/`)
 but is no longer on the runtime path:
 
-1. **Ranking** — `.loom/tokens/.ranking` (pipe-delimited `name|status|5h_util`,
-   refreshed every <10 min). A persistent rotation cursor spreads consecutive
+1. **Ranking** — `.loom/tokens/.ranking` (pipe-delimited
+   `name|status|5h_util|limit_reset`, refreshed every <10 min). A persistent
+   rotation cursor spreads consecutive
    dispatches one-per-account across the eligible accounts (#3909;
    `LOOM_TOKEN_SPREAD_TOP_N` / `tokens.spreadTopN` optionally caps the window).
 2. **Allowlist** — `.loom/tokens/.allowlist` (one name per line). Random pick from
@@ -339,8 +340,8 @@ pinned-account auto-recovery pre-flight (see below) before selecting.
 
 ### Ranking format: 5h-load field + soft gate (issue #4195)
 
-The `.ranking` line format is `name|status|5h_util`, where the **third field**
-is the account's 5h-window utilization (a fraction `0.0`–`1.0`, fixed at 2
+The `.ranking` line format is `name|status|5h_util|limit_reset`, where the **third
+field** is the account's 5h-window utilization (a fraction `0.0`–`1.0`, fixed at 2
 decimals). It is **optional**: a legacy 2-field `name|status` line still parses,
 and an account with no measured 5h utilization is written in the 2-field form
 (the value is left off, never faked as `0.0`). All four ranking writers emit it
@@ -359,6 +360,58 @@ the Rust port (`tokens_pool::select`). This is the Option-A reconciliation of
 the gpeyton-fork load-aware selection proposal (fork commits `283de8e3`,
 `20961dd9`) with upstream's existing rotation-cursor spread — a load-aware gate
 *layered on* #3909, not the fork's waterfall-fill replacement.
+
+### Ranking format: limit-reset field (issue #4874)
+
+The **fourth field** is the instant the account's **binding** limit window
+resets — the answer to "when can I dispatch to this account again?" — written as
+`%Y-%m-%dT%H:%M:%SZ`. Like `5h_util` it is **optional and additive**: a legacy
+2- or 3-field line still parses, with the reset read back as *unknown*
+(`None`) — never a fabricated date.
+
+**Which window is binding depends on the status** (`check::limit_reset` is the
+single place this is decided, and both writers call it):
+
+| Status | Reset written | Why |
+|---|---|---|
+| `exhausted` | 7d | `exhausted` *is* 7d utilization ≥ `EXHAUSTED_THRESHOLD`; the 5h window rolling over releases nothing. |
+| `rate_limited` | 5h | A 429 with 7d utilization below the threshold — the 5h window is what tripped. |
+| anything else | 5h | Not gated at all; the 5h rollover is what the reported `5h_util` is racing. |
+
+Reporting the 7d reset unconditionally would be *worse than an empty column*:
+on a live host a `rate_limited` account had a 5h reset ~1.6h out and a 7d reset
+**six days** out, so a 7d countdown would have told the operator the fleet was
+stalled until Saturday. When the binding window's instant is unknown it is left
+absent — never substituted with the other window's, because an absent countdown
+reads as "unknown" and a wrong one reads as a fact.
+
+Both ranking backends populate it:
+
+- The **claude-monitor backend** (`tokens_pool::monitor`) reads
+  `accounts[].resets["5h"]` and `["7d"]` from `~/.claude-monitor/ranking.json`
+  and normalizes them to the instant format. It previously reported no reset at
+  all, which is why the CLI's reset column was empty on every monitor-sourced
+  run even though the data was on disk the whole time.
+- The **native probe** (`tokens_pool::check`) parses the
+  `anthropic-ratelimit-…-7d-reset` header (it already did, only to discard the
+  value at the writer) plus `-5h-reset` opportunistically — the API does not
+  always send the latter, in which case a `rate_limited` row carries no
+  countdown rather than a misleading one.
+
+`loom-daemon tokens check --ranking`'s table shows this same value in a
+`Resets at` column that names its window, e.g. `2026-08-02T03:00:00Z (7d)`.
+
+**Field-position rule**: a row that knows its reset but *not* its utilization
+writes an empty third field (`name|status||limit_reset`) so the reset stays in
+position 4. The reader parses that empty utilization back to `None`, never to
+`0.0`. A reset containing a `|` or `#` (either would make the line unparseable)
+is dropped rather than written — an absent reset beats a mangled row.
+
+Selection **ignores** this field: it is telemetry, not an input to the tiered
+pick, so adding it cannot perturb which account is chosen. Its consumer is
+`tokens.snapshot`'s `limit_window_reset_at` (see `telemetry-schema.md`), which
+feeds the dashboard's per-account reset countdown, its burn-curve segmentation
+and forecasts, and the pool-level "capacity returns at" aggregate.
 
 ## Bad-token tracking (`loom-daemon tokens mark-bad`)
 

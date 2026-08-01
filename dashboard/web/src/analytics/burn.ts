@@ -34,7 +34,12 @@
  *
  * 1. **A window rollover** — `limit_window_reset_at` changed to a later
  *    instant, or usage fell (by more than `USAGE_DROP_EPSILON`, which absorbs
- *    float noise in a value the daemon computes as a ratio).
+ *    float noise in a value the daemon computes as a ratio). While an account
+ *    is healthy that reset tracks the same 5h window `usage_fraction` measures,
+ *    so the two rollover signals agree; when an account goes `exhausted` the
+ *    daemon switches it to the 7d instant (the one that says when the account
+ *    comes back), which reads here as a jump to a later reset — a real regime
+ *    change, and exactly where a new segment belongs.
  * 2. **A telemetry gap** — consecutive samples further apart than
  *    `maxSampleGapMs`. The host was down, offline, or not reporting; whatever
  *    happened in between is unobserved, and joining across it would draw a

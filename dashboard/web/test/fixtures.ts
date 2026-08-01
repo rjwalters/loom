@@ -197,7 +197,17 @@ export function multiHostSnapshot(): unknown {
           record: {
             kind: "tokens.snapshot",
             accounts: [
-              { account: "agent-3", usage_fraction: 1, exhausted: true },
+              // An exhausted account that reports when its 7d window resets —
+              // the case the whole countdown column exists for ("when does
+              // this exhausted account come back?", issue #4874). Days out,
+              // not hours: that is the distinction between "capacity returns
+              // shortly" and "this host is spent until Saturday".
+              {
+                account: "agent-3",
+                usage_fraction: 1,
+                limit_window_reset_at: "2026-08-02T03:00:00Z",
+                exhausted: true,
+              },
               { account: "agent-4", exhausted: false },
             ],
           },

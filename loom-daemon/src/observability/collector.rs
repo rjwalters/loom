@@ -390,11 +390,36 @@ async fn sample_snapshots(
     queue.push(TelemetryEnvelope::new(host_id, TelemetryRecord::HostHealth(health_record)));
 }
 
+/// Parse a `.ranking` row's binding-window reset text into the typed instant
+/// `tokens.snapshot` carries (issue #4874). The writers emit a canonical
+/// `%Y-%m-%dT%H:%M:%SZ` instant, but this is the trust boundary between an
+/// on-disk file and the pushed telemetry, so an unparseable value degrades to
+/// `None` ("unknown") rather than propagating junk to the dashboard's
+/// countdown — the same "unknown, not a fabricated date" contract the
+/// host-detail view already holds on the rendering side.
+fn parse_reset_instant(raw: Option<&str>) -> Option<DateTime<Utc>> {
+    let raw = raw?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    DateTime::parse_from_rfc3339(raw)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
 /// Read the resolved rotation-ranking file for `workspace_root` into a
 /// [`TokenSnapshotRecord`]. `rank` is the account's position in the ranking
 /// file (lower = preferred); an unreadable/missing/empty ranking yields an
 /// empty `accounts` list rather than an error — mirrors
 /// [`crate::capacity::read_ranking_at`]'s soft-fail contract.
+///
+/// `limit_window_reset_at` comes from the ranking row's optional reset field
+/// (issue #4874) — the instant the window *currently gating that account*
+/// rolls over (7d for an `exhausted` account, 5h otherwise; the writer resolves
+/// this via [`crate::tokens_pool::check::limit_reset`]). Before that field
+/// existed this was hardcoded `None`, which is why every exhausted account
+/// fleet-wide reported no reset instant and the dashboard's countdown column
+/// was permanently `—`.
 fn sample_token_snapshot(workspace_root: &Path) -> TokenSnapshotRecord {
     let pool_dir = crate::tokens_pool::paths::resolve_tokens_dir(workspace_root);
     let ranking_path = pool_dir.join(".ranking");
@@ -404,17 +429,15 @@ fn sample_token_snapshot(workspace_root: &Path) -> TokenSnapshotRecord {
             if !line.contains('|') {
                 continue;
             }
-            let Some((account, status, usage_fraction)) =
-                crate::tokens_pool::select::parse_ranking_line(line)
-            else {
+            let Some(row) = crate::tokens_pool::select::parse_ranking_line(line) else {
                 continue;
             };
-            let exhausted = !crate::capacity::AccountHealth::parse(&status).is_healthy();
+            let exhausted = !crate::capacity::AccountHealth::parse(&row.status).is_healthy();
             accounts.push(TokenAccountState {
-                account,
+                account: row.name,
                 rank: Some(u32::try_from(index).unwrap_or(u32::MAX)),
-                usage_fraction,
-                limit_window_reset_at: None,
+                usage_fraction: row.util_5h,
+                limit_window_reset_at: parse_reset_instant(row.limit_reset.as_deref()),
                 exhausted,
             });
         }
@@ -696,6 +719,113 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let record = sample_token_snapshot(dir.path());
         assert!(record.accounts.is_empty());
+    }
+
+    #[test]
+    fn token_snapshot_populates_limit_window_reset_at_from_the_ranking() {
+        // Issue #4874: this field was hardcoded `None`, so every exhausted
+        // account fleet-wide pushed `limit_window_reset_at: null` and the
+        // dashboard's countdown column was permanently `—`. An exhausted
+        // account with a reset in the ranking must now report it.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".loom/tokens")).unwrap();
+        std::fs::write(
+            dir.path().join(".loom/tokens/.ranking"),
+            "agent-1|available|0.42\n\
+             agent-2|exhausted|0.00|2026-08-02T03:00:00Z\n\
+             agent-3|exhausted||2026-08-04T11:00:00Z\n",
+        )
+        .unwrap();
+        let record = sample_token_snapshot(dir.path());
+        assert_eq!(record.accounts.len(), 3);
+
+        // No reset field -> unknown, not a fabricated date.
+        assert_eq!(record.accounts[0].limit_window_reset_at, None);
+
+        let expected = DateTime::parse_from_rfc3339("2026-08-02T03:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(record.accounts[1].limit_window_reset_at, Some(expected));
+        assert!(record.accounts[1].exhausted);
+        assert_eq!(record.accounts[1].usage_fraction, Some(0.00));
+
+        // Reset known, utilization unknown: the reset still lands, and the
+        // absent utilization is not coerced to 0.0.
+        assert_eq!(record.accounts[2].usage_fraction, None);
+        assert_eq!(
+            record.accounts[2].limit_window_reset_at,
+            Some(
+                DateTime::parse_from_rfc3339("2026-08-04T11:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc)
+            )
+        );
+    }
+
+    #[test]
+    fn token_snapshot_carries_the_writers_binding_reset_end_to_end() {
+        // The whole #4874 chain in one test: the *real* ranking writer renders
+        // the file, the collector reads it back, and the instant that lands in
+        // `tokens.snapshot` is the one the account is actually waiting on.
+        //
+        // The rate_limited row is the case that makes this more than plumbing.
+        // It is 7d-healthy and 5h-spent, so it returns at the 5h boundary
+        // (07:00Z) — writing its 7d reset (a week out) would tell the dashboard
+        // the fleet was stalled for six days when it recovers within the hour.
+        use crate::tokens_pool::check::{format_ranking_lines, AccountResult, ProbeReport};
+
+        let mut spent = AccountResult::new("agent-1", "exhausted");
+        spent.s5h_utilization = Some(0.0);
+        spent.s5h_reset = Some("2026-08-01T05:20:00Z".into());
+        spent.s7d_reset = Some("2026-08-02T03:00:00Z".into());
+        let mut limited = AccountResult::new("agent-2", "rate_limited");
+        limited.s5h_utilization = Some(1.0);
+        limited.s5h_reset = Some("2026-08-01T07:00:00Z".into());
+        limited.s7d_reset = Some("2026-08-07T01:00:00Z".into());
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".loom/tokens")).unwrap();
+        std::fs::write(
+            dir.path().join(".loom/tokens/.ranking"),
+            format_ranking_lines(&ProbeReport {
+                ranked_at: "2026-08-01T05:22:00Z".into(),
+                accounts: vec![spent, limited],
+            }),
+        )
+        .unwrap();
+
+        let record = sample_token_snapshot(dir.path());
+        let at = |iso: &str| {
+            Some(
+                DateTime::parse_from_rfc3339(iso)
+                    .unwrap()
+                    .with_timezone(&Utc),
+            )
+        };
+        assert_eq!(record.accounts[0].limit_window_reset_at, at("2026-08-02T03:00:00Z"));
+        assert!(record.accounts[0].exhausted);
+        assert_eq!(
+            record.accounts[1].limit_window_reset_at,
+            at("2026-08-01T07:00:00Z"),
+            "a 5h-limited account must report the 5h boundary it actually returns at"
+        );
+    }
+
+    #[test]
+    fn token_snapshot_unparseable_reset_degrades_to_unknown() {
+        // The on-disk file is a trust boundary: junk in the reset field must
+        // not propagate to the pushed telemetry as a bogus instant.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".loom/tokens")).unwrap();
+        std::fs::write(
+            dir.path().join(".loom/tokens/.ranking"),
+            "agent-1|exhausted|0.00|not-a-timestamp\n",
+        )
+        .unwrap();
+        let record = sample_token_snapshot(dir.path());
+        assert_eq!(record.accounts.len(), 1, "a bad reset must not drop the whole row");
+        assert_eq!(record.accounts[0].limit_window_reset_at, None);
+        assert!(record.accounts[0].exhausted);
     }
 
     #[tokio::test]

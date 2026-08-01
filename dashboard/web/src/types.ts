@@ -44,7 +44,12 @@ export interface HostHealthRecord {
 
 /** One account inside a `tokens.snapshot`. Only `exhausted` is always sent;
  * `rank` / `usage_fraction` / `limit_window_reset_at` are omitted when the
- * daemon does not know them. */
+ * daemon does not know them.
+ *
+ * `limit_window_reset_at` is the instant the window *currently gating* the
+ * account rolls over — the 7d window once it is `exhausted`, the 5h window
+ * (the one `usage_fraction` measures) otherwise. The daemon resolves which,
+ * so this side reads it as one thing: when the account's constraint lifts. */
 export interface TokenAccount {
   account?: string;
   rank?: number;

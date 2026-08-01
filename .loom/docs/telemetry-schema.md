@@ -230,6 +230,23 @@ A point-in-time view of the multi-account token pool (host-level — no `repo` /
 Per account, `rank` / `usage_fraction` / `limit_window_reset_at` are omitted when
 unknown; `exhausted` is always present.
 
+Every field is read out of the pool's `.ranking` file, so each maps to one of its
+pipe-delimited columns (`name|status|5h_util|limit_reset` — see
+[`token-pool.md`](token-pool.md)): `rank` is the row's position, `usage_fraction`
+is `5h_util`, `exhausted` is derived from `status`, and `limit_window_reset_at`
+is `limit_reset`.
+
+`limit_window_reset_at` is the instant the window **currently gating that
+account** rolls over — the 7-day window for an `exhausted` account (when it
+regains capacity), the 5-hour window otherwise (the rollover `usage_fraction` is
+racing). The daemon resolves which one before writing, so a consumer never has to
+know: it is always "when this account's constraint lifts". It is also the only
+per-account field here that survives public redaction, aggregated across the pool
+into `next_limit_window_reset_at` (the earliest reset, naming no account). A row
+whose reset is absent or unparseable reports no reset at all rather than a
+fabricated instant, so consumers must treat `null`/absent as *unknown* — never as
+"resets now".
+
 ### `host.health`
 
 Host CPU/disk headroom, daemon version, and uptime (host-level — no `repo` /

@@ -19,12 +19,14 @@
 //! # Header resilience
 //!
 //! Rate-limit headers are matched by **suffix**, case-insensitively
-//! (`-5h-utilization`, `-7d-utilization`, `-7d-reset`), so any rename of the
-//! `anthropic-ratelimit-*` prefix segment still maps to our internal fields.
+//! (`-5h-utilization`, `-7d-utilization`, `-7d-reset`, `-5h-reset`), so any
+//! rename of the `anthropic-ratelimit-*` prefix segment still maps to our
+//! internal fields.
 //!
 //! # Byte-compatible `.ranking`
 //!
-//! `.ranking` is pipe-delimited `name|status`, one account per line, trailing
+//! `.ranking` is pipe-delimited `name|status|5h_util|limit_reset` (the last two
+//! fields optional, issues #4195 / #4874), one account per line, trailing
 //! newline (empty report yields an empty string), ordered by
 //! [`STATUS_RANK`] then `7d_reset` ascending with an absent-reset sentinel.
 //! **Every** status is written — no status is filtered at write time (see the
@@ -64,6 +66,12 @@ pub const EXHAUSTED_THRESHOLD: f64 = 0.95;
 const HEADER_SUFFIX_5H_UTIL: &str = "-5h-utilization";
 const HEADER_SUFFIX_7D_UTIL: &str = "-7d-utilization";
 const HEADER_SUFFIX_7D_RESET: &str = "-7d-reset";
+/// The 5h counterpart of `-7d-reset`. Anthropic does not currently send it on
+/// every response, so it is looked up opportunistically: when it is absent a
+/// `rate_limited` account reports **no** reset rather than borrowing the 7d
+/// one, which would claim a days-out return for an account that comes back
+/// within the hour (issue #4874).
+const HEADER_SUFFIX_5H_RESET: &str = "-5h-reset";
 const HEADER_SUFFIX_5H_STATUS: &str = "-5h-status";
 
 // ---------------------------------------------------------------------------
@@ -79,19 +87,36 @@ pub struct AccountResult {
     pub s5h_utilization: Option<f64>,
     pub s7d_utilization: Option<f64>,
     pub s7d_reset: Option<String>,
+    /// When the account's **5h** window rolls over. Populated by the
+    /// claude-monitor backend (`resets["5h"]`) and, when the API sends the
+    /// header, by the native probe. It is the reset that matters for a
+    /// `rate_limited` account — and for the 5h `usage_fraction` the dashboard
+    /// charts (issue #4874). See [`limit_reset`].
+    pub s5h_reset: Option<String>,
     pub error: Option<String>,
 }
 
 impl AccountResult {
-    fn new(name: impl Into<String>, status: impl Into<String>) -> Self {
+    /// A result with only the identity fields set; every measurement is
+    /// "unknown" until a probe (or the monitor backend) fills it in.
+    #[must_use]
+    pub fn new(name: impl Into<String>, status: impl Into<String>) -> Self {
         Self {
             name: name.into(),
             status: status.into(),
             s5h_utilization: None,
             s7d_utilization: None,
             s7d_reset: None,
+            s5h_reset: None,
             error: None,
         }
+    }
+
+    /// [`limit_reset`] for this result — the instant the window currently
+    /// gating this account rolls over.
+    #[must_use]
+    pub fn limit_reset(&self) -> Option<&str> {
+        limit_reset(&self.status, self.s5h_reset.as_deref(), self.s7d_reset.as_deref())
     }
 
     /// JSON shape matching `check.AccountResult.to_dict`.
@@ -106,6 +131,19 @@ impl AccountResult {
             self.s7d_reset
                 .clone()
                 .map_or(serde_json::Value::Null, serde_json::Value::String),
+        );
+        obj.insert(
+            "5h_reset".into(),
+            self.s5h_reset
+                .clone()
+                .map_or(serde_json::Value::Null, serde_json::Value::String),
+        );
+        // The window that is actually gating this account right now — the one
+        // `.ranking` carries and the dashboard counts down to (issue #4874).
+        obj.insert(
+            "limit_reset".into(),
+            self.limit_reset()
+                .map_or(serde_json::Value::Null, |r| serde_json::Value::String(r.to_string())),
         );
         if let Some(err) = &self.error {
             obj.insert("error".into(), serde_json::Value::String(err.clone()));
@@ -365,6 +403,7 @@ struct RateLimitFields {
     s5h_utilization: Option<f64>,
     s7d_utilization: Option<f64>,
     s7d_reset: Option<String>,
+    s5h_reset: Option<String>,
     #[allow(dead_code)]
     s5h_status: Option<String>,
 }
@@ -378,7 +417,46 @@ fn parse_rate_limit_headers(headers: &[(String, String)]) -> RateLimitFields {
             find_header_by_suffix(headers, HEADER_SUFFIX_7D_UTIL).as_deref(),
         ),
         s7d_reset: epoch_to_iso(find_header_by_suffix(headers, HEADER_SUFFIX_7D_RESET).as_deref()),
+        s5h_reset: epoch_to_iso(find_header_by_suffix(headers, HEADER_SUFFIX_5H_RESET).as_deref()),
         s5h_status: find_header_by_suffix(headers, HEADER_SUFFIX_5H_STATUS),
+    }
+}
+
+/// The instant this account's **binding** limit window resets — i.e. the answer
+/// to "when can I dispatch to it again?" (issue #4874).
+///
+/// The pool tracks two independent windows, and which one is holding an
+/// account back depends on its status:
+///
+/// - `exhausted` is derived from **7d** utilization clearing
+///   [`EXHAUSTED_THRESHOLD`], so the 5h window rolling over changes nothing —
+///   the 7d reset is the release.
+/// - `rate_limited` is a 429 whose 7d utilization is *below* the threshold, so
+///   the **5h** window is what tripped and the 5h reset is the release. Naming
+///   the 7d reset here would be actively misleading: on a live host a
+///   `rate_limited` account had a 5h reset ~1.6h out and a 7d reset **six days**
+///   out, and the dashboard would have counted down to the wrong one.
+/// - Anything else (`available`, `blocked`, `error`, …) is not gated by a
+///   window at all. Report the 5h reset, which is the rollover the reported
+///   `5h_utilization` — the `usage_fraction` the dashboard charts and forecasts
+///   against — is actually racing.
+///
+/// Returns `None` when the relevant instant is unknown. It is never
+/// substituted with the other window's: an absent countdown reads as "unknown",
+/// a wrong one reads as a fact.
+///
+/// Takes the three values rather than an [`AccountResult`] so the
+/// claude-monitor writer — which has its own account struct — picks the window
+/// through this same function instead of re-deriving the rule.
+#[must_use]
+pub fn limit_reset<'a>(
+    status: &str,
+    reset_5h: Option<&'a str>,
+    reset_7d: Option<&'a str>,
+) -> Option<&'a str> {
+    match status {
+        "exhausted" => reset_7d,
+        _ => reset_5h,
     }
 }
 
@@ -471,6 +549,7 @@ pub fn probe_account(
             s5h_utilization: parsed.s5h_utilization,
             s7d_utilization: parsed.s7d_utilization,
             s7d_reset: parsed.s7d_reset,
+            s5h_reset: parsed.s5h_reset,
             error: None,
         };
     }
@@ -491,6 +570,7 @@ pub fn probe_account(
         s5h_utilization: parsed.s5h_utilization,
         s7d_utilization: parsed.s7d_utilization,
         s7d_reset: parsed.s7d_reset,
+        s5h_reset: parsed.s5h_reset,
         error: None,
     }
 }
@@ -540,23 +620,43 @@ fn now_iso() -> String {
     chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
-/// Format one `.ranking` line, emitting the optional 5h-utilization field
-/// (issue #4195): `name|status|5h_util` when the 5h utilization is known, else
-/// the legacy `name|status` (backward compatible: a `None` utilization is left
-/// unwritten rather than faked as `0.0`). The float is fixed at 2 decimals so
-/// the probe and monitor writers stay byte-identical with the Python port
-/// (`check._ranking_line`). Shared with `monitor::format_ranking_lines`.
-pub(crate) fn ranking_line(name: &str, status: &str, util_5h: Option<f64>) -> String {
-    match util_5h {
-        Some(u) => format!("{name}|{status}|{u:.2}"),
-        None => format!("{name}|{status}"),
+/// Format one `.ranking` line, emitting the optional 5h-utilization (issue
+/// #4195) and binding-limit-reset (issue #4874) fields:
+/// `name|status|5h_util|limit_reset`, truncated to the shortest form that
+/// carries every known value — `name|status` when neither is known,
+/// `name|status|util` when only the utilization is. A row that knows its reset
+/// but not its utilization writes an **empty** third field
+/// (`name|status||limit_reset`) so the reset stays in position 4; the reader
+/// parses an empty utilization back to `None` rather than a fabricated `0.0`.
+/// The float is fixed at 2 decimals so the probe and monitor writers stay
+/// byte-identical.
+///
+/// `limit_reset` is whichever window is actually gating the account — see
+/// [`limit_reset`], which both writers call to pick it. It is written verbatim
+/// minus surrounding whitespace, and is **dropped** if it contains a `|` or `#`
+/// — either would make the line unparseable (field split / comment strip), and
+/// a silently mangled row is worse than an absent reset.
+pub(crate) fn ranking_line(
+    name: &str,
+    status: &str,
+    util_5h: Option<f64>,
+    limit_reset: Option<&str>,
+) -> String {
+    let reset = limit_reset
+        .map(str::trim)
+        .filter(|r| !r.is_empty() && !r.contains('|') && !r.contains('#'));
+    match (util_5h, reset) {
+        (Some(u), Some(r)) => format!("{name}|{status}|{u:.2}|{r}"),
+        (Some(u), None) => format!("{name}|{status}|{u:.2}"),
+        (None, Some(r)) => format!("{name}|{status}||{r}"),
+        (None, None) => format!("{name}|{status}"),
     }
 }
 
-/// Serialize a report to the selector's `name|status|5h_util` format (trailing
-/// newline, empty report -> empty string). The 5h utilization is an optional
-/// third field, emitted when measured (issue #4195). Mirrors
-/// `check.format_ranking_lines`.
+/// Serialize a report to the selector's `name|status|5h_util|limit_reset`
+/// format (trailing newline, empty report -> empty string). The 5h utilization
+/// (issue #4195) and the binding-window reset instant (issue #4874) are
+/// optional trailing fields, emitted when known.
 #[must_use]
 pub fn format_ranking_lines(report: &ProbeReport) -> String {
     if report.accounts.is_empty() {
@@ -564,7 +664,7 @@ pub fn format_ranking_lines(report: &ProbeReport) -> String {
     }
     let mut out = String::new();
     for a in &report.accounts {
-        out.push_str(&ranking_line(&a.name, &a.status, a.s5h_utilization));
+        out.push_str(&ranking_line(&a.name, &a.status, a.s5h_utilization, a.limit_reset()));
         out.push('\n');
     }
     out
@@ -703,18 +803,24 @@ pub fn run_check(
     report
 }
 
-/// Human-readable status table (best accounts first). Mirrors
-/// `check.format_table`.
+/// Human-readable status table (best accounts first).
+///
+/// The reset column reports the **binding** window ([`limit_reset`]) and names
+/// which one it is, e.g. `2026-08-02T03:00:00Z (7d)`. It was labelled
+/// `7d resets` and fed from `s7d_reset` alone until issue #4874, which was
+/// wrong twice over: on the claude-monitor backend it was never populated at
+/// all (a permanent `-`), and on the probe backend a `rate_limited` account
+/// showed its 7d reset — days away — when the 5h window was the one holding it.
 #[must_use]
 pub fn format_table(report: &ProbeReport) -> String {
     let mut lines: Vec<String> = Vec::new();
     lines.push(format!("Token pool ranking (probed at {})", report.ranked_at));
-    lines.push("=".repeat(78));
+    lines.push("=".repeat(84));
     lines.push(format!(
-        "{:<28} {:>9} {:>9} {:<13} {:<22}",
-        "Account", "5h util", "7d util", "Status", "7d resets"
+        "{:<28} {:>9} {:>9} {:<13} {:<25}",
+        "Account", "5h util", "7d util", "Status", "Resets at"
     ));
-    lines.push("-".repeat(78));
+    lines.push("-".repeat(84));
     for a in &report.accounts {
         let s5 = a
             .s5h_utilization
@@ -722,8 +828,11 @@ pub fn format_table(report: &ProbeReport) -> String {
         let s7 = a
             .s7d_utilization
             .map_or_else(|| "-".to_string(), |v| format!("{v:.2}"));
-        let reset = a.s7d_reset.clone().unwrap_or_else(|| "-".to_string());
-        lines.push(format!("{:<28} {:>9} {:>9} {:<13} {:<22}", a.name, s5, s7, a.status, reset));
+        let window = if a.status == "exhausted" { "7d" } else { "5h" };
+        let reset = a
+            .limit_reset()
+            .map_or_else(|| "-".to_string(), |r| format!("{r} ({window})"));
+        lines.push(format!("{:<28} {:>9} {:>9} {:<13} {:<25}", a.name, s5, s7, a.status, reset));
     }
     let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
     for a in &report.accounts {
@@ -1026,6 +1135,139 @@ mod tests {
             accounts: vec![loaded, AccountResult::new("b-2", "available")],
         };
         assert_eq!(format_ranking_lines(&report), "a-1|available|0.42\nb-2|available\n");
+    }
+
+    #[test]
+    fn format_ranking_lines_emits_the_binding_reset_fourth_field() {
+        // Issue #4874: the probe already parses `anthropic-ratelimit-...-
+        // 7d-reset`; it now survives into `.ranking` as the optional fourth
+        // field instead of being discarded at the writer.
+        let mut a = AccountResult::new("a-1", "exhausted");
+        a.s5h_utilization = Some(0.0);
+        a.s7d_reset = Some("2026-08-02T03:00:00Z".into());
+        let report = ProbeReport {
+            ranked_at: "x".into(),
+            accounts: vec![a],
+        };
+        assert_eq!(format_ranking_lines(&report), "a-1|exhausted|0.00|2026-08-02T03:00:00Z\n");
+    }
+
+    #[test]
+    fn limit_reset_picks_the_window_that_is_actually_gating() {
+        // `exhausted` is derived from 7d utilization, so the 7d reset is the
+        // release; `rate_limited` is the 5h window tripping with 7d still
+        // healthy, so the 5h reset is. Reporting the 7d reset for a
+        // rate_limited account would claim a days-out return for an account
+        // that is back within the hour.
+        let five = Some("2026-08-01T07:00:00Z");
+        let seven = Some("2026-08-07T01:00:00Z");
+        assert_eq!(limit_reset("exhausted", five, seven), seven);
+        assert_eq!(limit_reset("rate_limited", five, seven), five);
+        // Not gated by a window at all: report the rollover the 5h
+        // `usage_fraction` is racing, which is what the dashboard charts.
+        assert_eq!(limit_reset("available", five, seven), five);
+        assert_eq!(limit_reset("blocked", five, seven), five);
+    }
+
+    #[test]
+    fn limit_reset_never_substitutes_the_other_window() {
+        // An unknown binding reset stays unknown. Falling back to the window
+        // that *is* known would turn "I do not know" into a confident wrong
+        // answer — the failure mode this whole field exists to avoid.
+        assert_eq!(limit_reset("exhausted", Some("2026-08-01T07:00:00Z"), None), None);
+        assert_eq!(limit_reset("rate_limited", None, Some("2026-08-07T01:00:00Z")), None);
+    }
+
+    #[test]
+    fn format_ranking_lines_writes_the_5h_reset_for_a_rate_limited_account() {
+        // The writer must go through `limit_reset`, not reach for `s7d_reset`.
+        let mut a = AccountResult::new("b-2", "rate_limited");
+        a.s5h_utilization = Some(1.0);
+        a.s7d_reset = Some("2026-08-07T01:00:00Z".into());
+        a.s5h_reset = Some("2026-08-01T07:00:00Z".into());
+        let report = ProbeReport {
+            ranked_at: "x".into(),
+            accounts: vec![a],
+        };
+        assert_eq!(format_ranking_lines(&report), "b-2|rate_limited|1.00|2026-08-01T07:00:00Z\n");
+    }
+
+    #[test]
+    fn probe_parses_the_5h_reset_header_when_the_api_sends_one() {
+        // The API does not always send a 5h reset header. When it does, the
+        // probe backend picks it up by the same suffix match as every other
+        // rate-limit header; when it does not, the account simply has no 5h
+        // reset (and a rate_limited row carries no countdown at all).
+        let headers = vec![
+            ("anthropic-ratelimit-unified-5h-utilization".to_string(), "1.0".to_string()),
+            ("anthropic-ratelimit-unified-7d-utilization".to_string(), "0.6".to_string()),
+            ("anthropic-ratelimit-unified-7d-reset".to_string(), "1786000000".to_string()),
+            ("anthropic-ratelimit-unified-5h-reset".to_string(), "1785567600".to_string()),
+        ];
+        let parsed = parse_rate_limit_headers(&headers);
+        assert_eq!(parsed.s5h_reset.as_deref(), Some("2026-08-01T07:00:00Z"));
+        assert!(parsed.s7d_reset.is_some());
+
+        let without = parse_rate_limit_headers(&headers[..3]);
+        assert_eq!(without.s5h_reset, None, "an absent header is unknown, not borrowed from 7d");
+    }
+
+    #[test]
+    fn table_names_which_window_the_reset_belongs_to() {
+        // A bare instant in the reset column is ambiguous between the two
+        // windows, and the operator's next action differs a lot depending on
+        // which it is. The column says so explicitly.
+        let mut exhausted = AccountResult::new("a-1", "exhausted");
+        exhausted.s7d_reset = Some("2026-08-02T03:00:00Z".into());
+        exhausted.s5h_reset = Some("2026-08-01T05:20:00Z".into());
+        let mut limited = AccountResult::new("b-2", "rate_limited");
+        limited.s7d_reset = Some("2026-08-07T01:00:00Z".into());
+        limited.s5h_reset = Some("2026-08-01T07:00:00Z".into());
+        let unknown = AccountResult::new("c-3", "error");
+        let table = format_table(&ProbeReport {
+            ranked_at: "x".into(),
+            accounts: vec![exhausted, limited, unknown],
+        });
+        assert!(table.contains("Resets at"), "{table}");
+        assert!(table.contains("2026-08-02T03:00:00Z (7d)"), "{table}");
+        assert!(table.contains("2026-08-01T07:00:00Z (5h)"), "{table}");
+        assert!(
+            !table.contains("2026-08-07T01:00:00Z"),
+            "the 7d reset of a 5h-limited account must not be shown: {table}"
+        );
+        let unknown_row = table.lines().find(|l| l.starts_with("c-3")).unwrap();
+        assert!(
+            unknown_row.trim_end().ends_with('-'),
+            "unknown renders as a dash: {unknown_row:?}"
+        );
+    }
+
+    #[test]
+    fn ranking_line_reset_without_util_keeps_field_position() {
+        // A row that knows its reset but not its utilization must write an
+        // empty third field so the reset stays in position 4 — otherwise the
+        // reader would read the reset as the utilization.
+        assert_eq!(
+            ranking_line("a-1", "exhausted", None, Some("2026-08-02T03:00:00Z")),
+            "a-1|exhausted||2026-08-02T03:00:00Z"
+        );
+    }
+
+    #[test]
+    fn ranking_line_drops_reset_containing_delimiters() {
+        // A `|` or `#` in the reset text would make the line unparseable
+        // (field split / comment strip). Dropping the reset degrades to
+        // "unknown"; writing it would silently mangle the whole row.
+        assert_eq!(
+            ranking_line("a-1", "exhausted", Some(0.5), Some("2026|08")),
+            "a-1|exhausted|0.50"
+        );
+        assert_eq!(
+            ranking_line("a-1", "exhausted", Some(0.5), Some("2026#08")),
+            "a-1|exhausted|0.50"
+        );
+        // Whitespace-only is "unknown", not an empty trailing field.
+        assert_eq!(ranking_line("a-1", "exhausted", Some(0.5), Some("   ")), "a-1|exhausted|0.50");
     }
 
     #[test]

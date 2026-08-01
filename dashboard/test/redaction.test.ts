@@ -159,7 +159,17 @@ describe("redactPayload — per-kind field allowlist", () => {
       accounts: [
         { account: "agent-1", rank: 0, usage_fraction: 0.42, exhausted: false },
         { account: "agent-2", rank: 1, usage_fraction: 0.9, exhausted: false },
-        { account: "agent-3", rank: 2, usage_fraction: 0, exhausted: true },
+        // Shaped like a real daemon push post-#4874: an exhausted account
+        // carries the instant its 7d window resets, so the public view's
+        // fleet-level "capacity returns at" is a real time rather than the
+        // permanent `null` it was while the daemon hardcoded the field away.
+        {
+          account: "agent-3",
+          rank: 2,
+          usage_fraction: 0,
+          limit_window_reset_at: "2026-08-02T03:00:00Z",
+          exhausted: true,
+        },
       ],
     });
 
@@ -170,8 +180,33 @@ describe("redactPayload — per-kind field allowlist", () => {
       exhausted_count: 1,
       mean_usage_fraction: 0.44,
       max_usage_fraction: 0.9,
-      next_limit_window_reset_at: null,
+      next_limit_window_reset_at: "2026-08-02T03:00:00Z",
     });
+  });
+
+  it("tokens.snapshot: a reset instant survives redaction without naming the account it came from", () => {
+    // Issue #4874's aggregate half: the reset is the one per-account field the
+    // public view is allowed to keep, precisely because "capacity returns at
+    // 03:00Z" describes the pool, not who is in it. Guard that the row it was
+    // lifted from still does not survive alongside it.
+    const serialized = JSON.stringify(
+      redactPayload("tokens.snapshot", {
+        kind: "tokens.snapshot",
+        captured_at: "2026-07-30T12:00:00Z",
+        accounts: [
+          { account: "agent5-2amlogic", rank: 4, limit_window_reset_at: "2026-08-04T11:00:00Z", exhausted: true },
+          { account: "robb-2amlogic", rank: 0, limit_window_reset_at: "2026-08-02T03:00:00Z", exhausted: true },
+        ],
+      }),
+    );
+    // The *earliest* reset across the pool, not the first row's.
+    expect(JSON.parse(serialized).next_limit_window_reset_at).toBe("2026-08-02T03:00:00Z");
+    expect(serialized).not.toContain("agent5-2amlogic");
+    expect(serialized).not.toContain("robb-2amlogic");
+    expect(serialized).not.toContain("accounts");
+    // The per-account field itself is gone — only the derived aggregate key
+    // (`next_limit_window_reset_at`) remains.
+    expect(serialized).not.toContain('"limit_window_reset_at"');
   });
 
   it("tokens.snapshot: no account identifier survives, at any depth", () => {
