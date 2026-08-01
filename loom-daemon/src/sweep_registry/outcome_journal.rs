@@ -179,8 +179,10 @@ impl SweepRegistry {
         // model — see `resolve_autonomous_dispatch_model`) is attributed
         // identically without needing a separate stored "explicit arm" field.
         // Kept in the free-form `config` map (not a new top-level schema field)
-        // so this is additive per #4703 with no schema-version bump. Per-issue
-        // complexity stratification is deferred — see the #4809 PR description.
+        // so this is additive per #4703 with no schema-version bump. Inference
+        // stays faithful under #4827's per-issue complexity stratification: the
+        // stratum only shifts WHICH arm an issue lands in, never the arm →
+        // model mapping this reads back.
         if let Some(arm) =
             crate::script_helpers::sweep_experiment::infer_arm_from_model(model.as_deref())
         {

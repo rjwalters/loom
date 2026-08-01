@@ -268,13 +268,39 @@ pub struct ExperimentDispatchModel {
 /// `explicit = None`, matching every existing autonomous dispatch site).
 ///
 /// The arm itself is [`crate::script_helpers::sweep_experiment::assign_arm`]
-/// — a pure function of `issue` (+ an optional complexity stratum, currently
-/// always `None` here; real per-issue `<!-- loom:complexity=... -->`
-/// extraction at dispatch time is deferred — see issue #4809's PR
-/// description), so the SAME issue resolves to the SAME arm across a
-/// dispatch resume — no re-roll.
+/// — a pure function of `issue` and the `complexity` stratum — so the SAME
+/// issue resolves to the SAME arm across a dispatch resume (no re-roll).
+///
+/// `complexity` is the Curator's `<!-- loom:complexity=<tier> -->` tier for
+/// this issue (#4827), which gives the `complex` and `routine` strata an
+/// independent ~50/50 A/B balance instead of stratifying the whole population
+/// as `routine`. `None` (no marker, or an unavailable body) keeps the
+/// pre-#4827 `routine` default — never an error.
 #[must_use]
-pub fn resolve_autonomous_dispatch_model(repo_root: &Path, issue: u32) -> ExperimentDispatchModel {
+pub fn resolve_autonomous_dispatch_model(
+    repo_root: &Path,
+    issue: u32,
+    complexity: Option<&str>,
+) -> ExperimentDispatchModel {
+    resolve_autonomous_dispatch_model_lazy(repo_root, issue, || complexity.map(str::to_owned))
+}
+
+/// [`resolve_autonomous_dispatch_model`] with the complexity stratum supplied
+/// by a **lazily-invoked** closure (#4827).
+///
+/// For call sites that have no issue body in hand (the epic supervisor's
+/// child dispatch, the `dispatch_sweep` MCP handler) the stratum costs a forge
+/// round-trip. Deferring it behind `FnOnce` means that round-trip happens ONLY
+/// when the workspace actually resolves to `experiment` mode — so `off` /
+/// `observe` dispatches (the overwhelming majority, and the modes whose
+/// no-behavior-change contract #4809 established) issue zero extra `gh` calls
+/// and add zero rate-limit pressure (epic #4432).
+#[must_use]
+pub fn resolve_autonomous_dispatch_model_lazy(
+    repo_root: &Path,
+    issue: u32,
+    complexity: impl FnOnce() -> Option<String>,
+) -> ExperimentDispatchModel {
     use crate::script_helpers::sweep_experiment as se;
 
     let config = crate::config_resolver::resolve_effective_config(repo_root);
@@ -292,7 +318,8 @@ pub fn resolve_autonomous_dispatch_model(repo_root: &Path, issue: u32) -> Experi
     }
 
     if mode == "experiment" {
-        let arm = se::assign_arm(i64::from(issue), None);
+        let complexity = complexity();
+        let arm = se::assign_arm(i64::from(issue), complexity.as_deref());
         let model = se::resolved_arm_model(arm, &config);
         return ExperimentDispatchModel {
             model,
@@ -309,6 +336,74 @@ pub fn resolve_autonomous_dispatch_model(repo_root: &Path, issue: u32) -> Experi
         arm: None,
         source_label: source.as_str(),
     }
+}
+
+/// Best-effort fetch of an issue's `<!-- loom:complexity=<tier> -->` stratum
+/// straight from the forge (#4827), for dispatch paths that have no cached
+/// issue body (the epic supervisor's child dispatch, the `dispatch_sweep` MCP
+/// handler — unlike the work finder, which already carries the body on its
+/// [`crate::work_finder::WorkItem`]).
+///
+/// **Never fails the dispatch.** A spawn failure, timeout, non-zero exit,
+/// unparseable payload, or absent marker all resolve to `None` — the unchanged
+/// pre-#4827 `routine` stratum. Mirrors `resolve-tier-model.sh`'s
+/// GraphQL-then-REST fallback (#4472): `gh issue view` is a GraphQL call, and
+/// GraphQL quota exhausts independently of REST under fleet load (epic #4432).
+///
+/// Only ever called from inside [`resolve_autonomous_dispatch_model_lazy`]'s
+/// `experiment` branch, so `off` / `observe` dispatch is untouched.
+#[must_use]
+pub fn fetch_issue_complexity(gh_bin: &Path, workspace_root: &Path, issue: u32) -> Option<String> {
+    use crate::script_helpers::sweep_experiment as se;
+
+    let timeout = super::reaper::reap_gh_timeout();
+    let repo = std::env::var("LOOM_REPO").ok();
+
+    // 1. GraphQL (`gh issue view`) — the same call `resolve-tier-model.sh` tries first.
+    let mut view = Command::new(gh_bin);
+    view.arg("issue")
+        .arg("view")
+        .arg(issue.to_string())
+        .arg("--json")
+        .arg("body")
+        .arg("--jq")
+        .arg(".body");
+    view.current_dir(workspace_root);
+    if let Some(ref r) = repo {
+        view.arg("--repo").arg(r);
+    }
+    if let Ok(Some(out)) = super::reaper::output_with_timeout(view, timeout) {
+        if out.status.success() {
+            let body = String::from_utf8_lossy(&out.stdout);
+            if let Some(tier) = se::extract_complexity_marker(&body) {
+                return Some(tier.to_owned());
+            }
+            // A successful read with no marker is authoritative — do not spend
+            // a second (REST) round-trip re-confirming an absent marker.
+            return None;
+        }
+    }
+
+    // 2. REST fallback — a separate quota bucket from GraphQL (#4472).
+    let path = repo.map_or_else(
+        || format!("repos/{{owner}}/{{repo}}/issues/{issue}"),
+        |r| format!("repos/{r}/issues/{issue}"),
+    );
+    let mut api = Command::new(gh_bin);
+    api.arg("api").arg(&path).arg("--jq").arg(".body");
+    api.current_dir(workspace_root);
+    if let Ok(Some(out)) = super::reaper::output_with_timeout(api, timeout) {
+        if out.status.success() {
+            let body = String::from_utf8_lossy(&out.stdout);
+            return se::extract_complexity_marker(&body).map(str::to_owned);
+        }
+    }
+
+    log::debug!(
+        "sweep-experiment: could not fetch issue #{issue} body for complexity stratification \
+         (GraphQL+REST failed) — falling back to the routine stratum (#4827)"
+    );
+    None
 }
 
 #[cfg(test)]
@@ -537,7 +632,7 @@ mod tests {
     fn autonomous_dispatch_off_by_default_is_byte_identical() {
         clear_experiment_env();
         let dir = tempdir().unwrap();
-        let resolved = resolve_autonomous_dispatch_model(dir.path(), 100);
+        let resolved = resolve_autonomous_dispatch_model(dir.path(), 100, None);
         clear_experiment_env();
 
         assert_eq!(resolved.mode, "off");
@@ -556,7 +651,7 @@ mod tests {
         clear_experiment_env();
         std::env::set_var("LOOM_MODEL_EXPERIMENT", "experiment");
         let dir = tempdir().unwrap();
-        let resolved = resolve_autonomous_dispatch_model(dir.path(), 100);
+        let resolved = resolve_autonomous_dispatch_model(dir.path(), 100, None);
         clear_experiment_env();
 
         assert_eq!(resolved.mode, "observe");
@@ -574,7 +669,7 @@ mod tests {
         std::env::set_var("LOOM_MODEL_EXPERIMENT_CANARY", "1");
         let dir = tempdir().unwrap();
         // Issue 100, no complexity ⇒ arm A (see `assign_arm`'s parity table).
-        let resolved = resolve_autonomous_dispatch_model(dir.path(), 100);
+        let resolved = resolve_autonomous_dispatch_model(dir.path(), 100, None);
         clear_experiment_env();
 
         assert_eq!(resolved.mode, "experiment");
@@ -587,10 +682,89 @@ mod tests {
         clear_experiment_env();
         std::env::set_var("LOOM_MODEL_EXPERIMENT", "experiment");
         std::env::set_var("LOOM_MODEL_EXPERIMENT_CANARY", "1");
-        let resolved_b = resolve_autonomous_dispatch_model(dir.path(), 101);
+        let resolved_b = resolve_autonomous_dispatch_model(dir.path(), 101, None);
         clear_experiment_env();
         assert_eq!(resolved_b.arm, Some("B"));
         assert_eq!(resolved_b.model, "sonnet");
+    }
+
+    /// Issue #4827: a REAL per-issue complexity stratum reaches `assign_arm`
+    /// and shifts the parity, so the `complex` and `routine` strata each get an
+    /// independent ~50/50 A/B balance instead of the pooled population being
+    /// stratified as `routine`.
+    #[test]
+    #[serial]
+    fn autonomous_dispatch_stratifies_the_arm_by_per_issue_complexity() {
+        clear_experiment_env();
+        std::env::set_var("LOOM_MODEL_EXPERIMENT", "experiment");
+        std::env::set_var("LOOM_MODEL_EXPERIMENT_CANARY", "1");
+        let dir = tempdir().unwrap();
+
+        // Issue 100 with NO marker is arm A (the pre-#4827 behavior)...
+        let routine = resolve_autonomous_dispatch_model(dir.path(), 100, None);
+        assert_eq!(routine.arm, Some("A"));
+        assert_eq!(routine.model, "claude-opus-5");
+
+        // ...but the SAME issue marked `complex` flips to arm B — proof the
+        // stratum is threaded through, not discarded.
+        let complex = resolve_autonomous_dispatch_model(dir.path(), 100, Some("complex"));
+        assert_eq!(complex.arm, Some("B"));
+        assert_eq!(complex.model, "sonnet");
+
+        // An explicit `routine` marker is identical to no marker at all.
+        let explicit_routine = resolve_autonomous_dispatch_model(dir.path(), 100, Some("routine"));
+        assert_eq!(explicit_routine.arm, Some("A"));
+
+        // An out-of-vocabulary tier folds to `routine` (never an error).
+        let unknown = resolve_autonomous_dispatch_model(dir.path(), 100, Some("mystery"));
+        assert_eq!(unknown.arm, Some("A"));
+
+        clear_experiment_env();
+    }
+
+    /// The lazy form (#4827) is the one the epic supervisor / MCP handler use.
+    /// In `off` / `observe` mode the closure must NOT run — that is what keeps
+    /// those paths from paying a `gh` round-trip per dispatch. In `experiment`
+    /// mode it runs exactly once and its value reaches `assign_arm`.
+    #[test]
+    #[serial]
+    fn autonomous_dispatch_lazy_complexity_is_only_fetched_in_experiment_mode() {
+        use std::cell::Cell;
+
+        clear_experiment_env();
+        let dir = tempdir().unwrap();
+
+        // `off` (default): closure never invoked.
+        let calls = Cell::new(0_u32);
+        let resolved = resolve_autonomous_dispatch_model_lazy(dir.path(), 100, || {
+            calls.set(calls.get() + 1);
+            Some("complex".to_string())
+        });
+        assert_eq!(resolved.mode, "off");
+        assert_eq!(calls.get(), 0, "off mode must not pay the body fetch");
+
+        // `observe`: still never invoked.
+        std::env::set_var("LOOM_MODEL_EXPERIMENT", "observe");
+        let calls = Cell::new(0_u32);
+        let resolved = resolve_autonomous_dispatch_model_lazy(dir.path(), 100, || {
+            calls.set(calls.get() + 1);
+            Some("complex".to_string())
+        });
+        assert_eq!(resolved.mode, "observe");
+        assert_eq!(calls.get(), 0, "observe mode must not pay the body fetch");
+
+        // `experiment` + canary: invoked exactly once, and the value is used.
+        std::env::set_var("LOOM_MODEL_EXPERIMENT", "experiment");
+        std::env::set_var("LOOM_MODEL_EXPERIMENT_CANARY", "1");
+        let calls = Cell::new(0_u32);
+        let resolved = resolve_autonomous_dispatch_model_lazy(dir.path(), 100, || {
+            calls.set(calls.get() + 1);
+            Some("complex".to_string())
+        });
+        clear_experiment_env();
+        assert_eq!(resolved.mode, "experiment");
+        assert_eq!(calls.get(), 1);
+        assert_eq!(resolved.arm, Some("B"), "the fetched stratum must reach assign_arm");
     }
 
     /// Deterministic assignment: repeated calls for the same issue (a
@@ -602,8 +776,8 @@ mod tests {
         std::env::set_var("LOOM_MODEL_EXPERIMENT", "experiment");
         std::env::set_var("LOOM_MODEL_EXPERIMENT_CANARY", "1");
         let dir = tempdir().unwrap();
-        let first = resolve_autonomous_dispatch_model(dir.path(), 4242);
-        let second = resolve_autonomous_dispatch_model(dir.path(), 4242);
+        let first = resolve_autonomous_dispatch_model(dir.path(), 4242, None);
+        let second = resolve_autonomous_dispatch_model(dir.path(), 4242, None);
         clear_experiment_env();
         assert_eq!(first.arm, second.arm);
         assert_eq!(first.model, second.model);
@@ -624,7 +798,7 @@ mod tests {
         std::fs::create_dir_all(dir.path().join(".loom")).unwrap();
         std::fs::write(dir.path().join(".loom").join("CANARY"), "").unwrap();
 
-        let resolved = resolve_autonomous_dispatch_model(dir.path(), 100);
+        let resolved = resolve_autonomous_dispatch_model(dir.path(), 100, None);
         clear_experiment_env();
 
         assert_eq!(resolved.mode, "experiment");
@@ -640,7 +814,7 @@ mod tests {
         std::env::set_var("LOOM_MODEL_EXPERIMENT", "observe");
         let dir = tempdir().unwrap();
         write_config(dir.path(), r#"{"autonomous": {"model": "opus"}}"#);
-        let resolved = resolve_autonomous_dispatch_model(dir.path(), 100);
+        let resolved = resolve_autonomous_dispatch_model(dir.path(), 100, None);
         clear_experiment_env();
 
         assert_eq!(resolved.mode, "observe");
