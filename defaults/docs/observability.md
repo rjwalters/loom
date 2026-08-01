@@ -116,7 +116,7 @@ resource/record attributes) is documented in
 `loom-daemon/src/observability/otlp/mod.rs`'s module doc comment, verified by
 `loom-daemon/src/observability/otlp/mapping.rs`'s unit tests.
 
-**The exporter verifies its own identity** (issue #4830). Each `/ingest`
+**The HTTPS exporter verifies its own identity** (issue #4830). Each `/ingest`
 success response echoes the `host_id` the presented key is bound to; the
 exporter compares that against the identity this daemon resolved for itself
 (`$LOOM_HOST_ID` > `$HOSTNAME` > `hostname`). On a disagreement — the wrong
@@ -126,6 +126,14 @@ and `loom-daemon health` reports an `observability DEGRADED` section (exit
 `1`). Nothing else changes: the batch is still acked, and the key's binding
 stays authoritative on the backend. Fix by installing the right key or setting
 `$LOOM_HOST_ID` to match, then restarting the daemon.
+
+This check is specific to the native ingest protocol, which is what defines
+the echo. OTLP/HTTP has no equivalent — a success response carries only
+`partial_success`, and a generic OTLP sink has no notion of a per-host key
+binding to disagree with — so under `exporter = "otlp"` no mismatch is ever
+published and the `observability` health section stays silent. Choosing OTLP
+therefore trades this particular misconfiguration guardrail away; keep the
+default `"https"` sink if you want it.
 
 ## 4. The backend: deploy your own Cloudflare Worker
 
