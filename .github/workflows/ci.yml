@@ -46,6 +46,8 @@ jobs:
               - 'scripts/**'
               - 'defaults/**'
               - 'tests/hooks/**'
+              - 'tests/install/**'
+              - 'install.sh'
               # .loom/hooks/** is git-tracked (self-install dogfooding) and
               # several defaults/hooks/tests/*.sh + tests/hooks/*.sh suites
               # assert it's byte-identical to defaults/hooks/** (#4451) — a
