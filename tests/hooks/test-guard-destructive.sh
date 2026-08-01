@@ -2791,6 +2791,89 @@ assert_deny "write-confinement (#4382): non-leading tilde ('backup~/f.sh') is no
 assert_deny "write-confinement (#4382): unresolvable '~nonexistentuser/' falls back to literal repo-relative path, still denies" \
     "cp /tmp/a.sh ~nonexistentloomuser999/defaults/hooks/f.sh" "$WT_REPO"
 
+# -------------------------------------------------------------------------
+# Quoted write targets are still classified as ABSOLUTE (#4926).
+#
+# extract_write_targets() emits a token with its quote characters preserved
+# VERBATIM (qsplit's contract, #3755). A quoted absolute path -- '/main/evil'
+# or "/main/evil" -- therefore starts with a quote character, not `/`, so the
+# `[[ … == /* ]]` classification called it RELATIVE and cwd-prefixed it into a
+# location the write will never actually have. From a MAIN-CHECKOUT cwd that
+# fabrication still happened to land inside the main checkout, so the deny
+# fired by accident. From a LINKED-WORKTREE cwd -- the canonical builder setup
+# -- the very same fabrication instead walked back into the acting worktree's
+# OWN `.loom-managed` sentinel and was silently ALLOWED, defeating the headline
+# #4178 protection with one pair of quotes (the same masked-allow shape as the
+# unresolved-`$` bypass fixed by #4921/#4927, reached through quoting instead).
+#
+# Every write idiom the unquoted fixtures above cover, in BOTH quote styles,
+# from BOTH cwd modes.
+for _q4926 in "'" '"'; do
+    assert_deny "write-confinement (#4926): CWD=main checkout, ${_q4926}-quoted echo > main-checkout path denies" \
+        "echo x > ${_q4926}$WT_REPO/defaults/hooks/f.sh${_q4926}" "$WT_REPO"
+    assert_deny "write-confinement (#4926): CWD=main checkout, ${_q4926}-quoted echo >> main-checkout path denies" \
+        "echo x >> ${_q4926}$WT_REPO/defaults/hooks/f.sh${_q4926}" "$WT_REPO"
+    assert_deny "write-confinement (#4926): CWD=main checkout, ${_q4926}-quoted tee main-checkout path denies" \
+        "echo x | tee ${_q4926}$WT_REPO/defaults/hooks/f.sh${_q4926}" "$WT_REPO"
+    assert_deny "write-confinement (#4926): CWD=main checkout, ${_q4926}-quoted sed -i on main-checkout path denies" \
+        "sed -i 's/a/b/' ${_q4926}$WT_REPO/defaults/hooks/f.sh${_q4926}" "$WT_REPO"
+    assert_deny "write-confinement (#4926): CWD=main checkout, ${_q4926}-quoted cp destination in main checkout denies" \
+        "cp /tmp/a.sh ${_q4926}$WT_REPO/defaults/hooks/f.sh${_q4926}" "$WT_REPO"
+    assert_deny "write-confinement (#4926): CWD=main checkout, ${_q4926}-quoted mv destination in main checkout denies" \
+        "mv /tmp/a.sh ${_q4926}$WT_REPO/defaults/hooks/f.sh${_q4926}" "$WT_REPO"
+
+    # These twelve are the actual bypass: every one of them ALLOWED pre-#4926.
+    assert_deny "write-confinement (#4926): CWD=linked worktree, ${_q4926}-quoted echo > main-checkout path denies" \
+        "echo x > ${_q4926}$WT_REPO_LINKED/defaults/hooks/f.sh${_q4926}" "$WT_LINKED_DIR"
+    assert_deny "write-confinement (#4926): CWD=linked worktree, ${_q4926}-quoted echo >> main-checkout path denies" \
+        "echo x >> ${_q4926}$WT_REPO_LINKED/defaults/hooks/f.sh${_q4926}" "$WT_LINKED_DIR"
+    assert_deny "write-confinement (#4926): CWD=linked worktree, ${_q4926}-quoted tee main-checkout path denies" \
+        "echo x | tee ${_q4926}$WT_REPO_LINKED/defaults/hooks/f.sh${_q4926}" "$WT_LINKED_DIR"
+    assert_deny "write-confinement (#4926): CWD=linked worktree, ${_q4926}-quoted sed -i on main-checkout path denies" \
+        "sed -i 's/a/b/' ${_q4926}$WT_REPO_LINKED/defaults/hooks/f.sh${_q4926}" "$WT_LINKED_DIR"
+    assert_deny "write-confinement (#4926): CWD=linked worktree, ${_q4926}-quoted cp destination in main checkout denies" \
+        "cp /tmp/a.sh ${_q4926}$WT_REPO_LINKED/defaults/hooks/f.sh${_q4926}" "$WT_LINKED_DIR"
+    assert_deny "write-confinement (#4926): CWD=linked worktree, ${_q4926}-quoted mv destination in main checkout denies" \
+        "mv /tmp/a.sh ${_q4926}$WT_REPO_LINKED/defaults/hooks/f.sh${_q4926}" "$WT_LINKED_DIR"
+done
+unset _q4926
+
+# Sibling-allow checks: quote removal changes only the absolute/relative
+# CLASSIFICATION -- it must never widen the containment test itself, so a
+# quoted target genuinely inside the worktree, or in /tmp, still allows.
+assert_allow "write-confinement (#4926): CWD=linked worktree, double-quoted write inside the worktree allows" \
+    "echo x > \"$WT_LINKED_DIR/src/f.sh\"" "$WT_LINKED_DIR"
+assert_allow "write-confinement (#4926): CWD=linked worktree, single-quoted write to /tmp allows" \
+    "echo x > '/tmp/loom-test-$$-quoted.sh'" "$WT_LINKED_DIR"
+
+# Regression guard for the #4382 / #4921 contracts: a file genuinely named
+# literally `$X` or `~` (single-quoted or backslash-escaped) is NOT an
+# expansion -- strip_target_quoting() removes the quote characters but leaves
+# `$`/`~` untouched, so these keep resolving as plain relative literals
+# (allowed here, since they land inside the worktree the write runs from) and
+# still deny when that relative literal sits under the main checkout.
+assert_allow "write-confinement (#4926): CWD=linked worktree, single-quoted literal '\$X' filename allows (not a \$-expansion)" \
+    "echo x > '\$X'" "$WT_LINKED_DIR"
+assert_allow "write-confinement (#4926): CWD=linked worktree, backslash-escaped literal \\\$X filename allows (not a \$-expansion)" \
+    "echo x > \\\$X" "$WT_LINKED_DIR"
+assert_allow "write-confinement (#4926): CWD=linked worktree, single-quoted literal '~evil' filename allows (not tilde-expanded)" \
+    "echo x > '~evil'" "$WT_LINKED_DIR"
+assert_deny "write-confinement (#4926): CWD=linked worktree, single-quoted literal '\$X' filename UNDER the main checkout still denies" \
+    "echo x > '$WT_REPO_LINKED/defaults/hooks/\$X'" "$WT_LINKED_DIR"
+
+# Unbalanced/unterminated quote: strip_target_quoting() reports failure and the
+# caller falls back to the raw, quote-preserved token -- i.e. today's verdict,
+# unchanged in BOTH directions. From a main-checkout cwd the raw token is still
+# read as relative and cwd-joined back inside the main checkout (deny); from a
+# linked-worktree cwd the same fabrication still lands in the worktree's own
+# sentinel (allow). The second case is NOT a regression -- it was already an
+# allow pre-#4926; it pins that the fallback never widens a deny into an allow
+# and never narrows an allow into a deny.
+assert_deny "write-confinement (#4926): CWD=main checkout, unbalanced leading single-quote keeps today's deny" \
+    "echo x > '$WT_REPO/defaults/hooks/f.sh" "$WT_REPO"
+assert_allow "write-confinement (#4926): CWD=linked worktree, unbalanced leading single-quote keeps today's allow" \
+    "echo x > '$WT_REPO_LINKED/defaults/hooks/f.sh" "$WT_LINKED_DIR"
+
 rm -rf "$HOME_FIXTURE_OUTSIDE"
 rm -rf "$WT_REPO" "$WT_REPO_NOWT" "$WT_REPO_OFF" "$WT_REPO_LINKED"
 
