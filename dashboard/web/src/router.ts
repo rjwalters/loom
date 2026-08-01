@@ -1,5 +1,5 @@
 /**
- * Hash-based routing (`#/` and `#/hosts/<hostId>`).
+ * Hash-based routing (`#/`, `#/hosts/<hostId>`, `#/charts`, `#/tokens`, `#/feed`).
  *
  * Hash routing rather than the History API is a deliberate deploy-shape
  * decision, not laziness. The UI ships as Workers Assets on the *same* Worker
@@ -13,13 +13,38 @@
  * shareable.
  */
 
-export type Route = { name: "overview" } | { name: "host"; hostId: string };
+export type Route =
+  | { name: "overview" }
+  | { name: "host"; hostId: string }
+  | { name: "charts" }
+  | { name: "tokens" }
+  | { name: "feed" };
 
 export const OVERVIEW: Route = { name: "overview" };
 
+/** Routes that render a self-contained panel owning its own data fetching,
+ * rather than a view over the fleet snapshot the app polls (issue #4895). */
+export type PanelRouteName = "charts" | "tokens" | "feed";
+
+const PANEL_ROUTES: Readonly<Record<string, PanelRouteName>> = {
+  "/charts": "charts",
+  "/tokens": "tokens",
+  "/feed": "feed",
+};
+
+export function isPanelRoute(route: Route): route is { name: PanelRouteName } {
+  return route.name === "charts" || route.name === "tokens" || route.name === "feed";
+}
+
 export function parseRoute(hash: string): Route {
   const path = hash.replace(/^#/, "");
+
+  const panel = PANEL_ROUTES[path];
+  if (panel) return { name: panel };
+
   const match = /^\/hosts\/(.+)$/.exec(path);
+  // Anything unrecognized falls back to the overview rather than erroring —
+  // a hand-edited or stale bookmark should land somewhere useful.
   if (!match?.[1]) return OVERVIEW;
   try {
     return { name: "host", hostId: decodeURIComponent(match[1]) };
@@ -30,7 +55,9 @@ export function parseRoute(hash: string): Route {
 }
 
 export function routeToHash(route: Route): string {
-  return route.name === "overview" ? "#/" : `#/hosts/${encodeURIComponent(route.hostId)}`;
+  if (route.name === "host") return `#/hosts/${encodeURIComponent(route.hostId)}`;
+  if (isPanelRoute(route)) return `#/${route.name}`;
+  return "#/";
 }
 
 /** Subscribe to hash changes; returns an unsubscribe function. */
