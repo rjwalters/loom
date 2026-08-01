@@ -574,7 +574,17 @@ export LOOM_WATCHDOG_LABEL="${LOOM_LAUNCHD_LABEL}-watchdog"
 # current call site AND any future one that forgets to set LOOM_DAEMON_BIN —
 # belt-and-braces with the checksum guard at both the top and bottom of this
 # file, which would otherwise be the only thing catching a regression.
+#
+# `unset LOOM_DAEMON_BIN` closes the other half of the hole (#4902): every
+# live Loom agent session (Builder/Judge/Doctor, ...) inherits an ambient
+# LOOM_DAEMON_BIN pointing at the real production binary, and
+# loom-daemon-update.sh's `PROVISION_TARGET="${LOOM_DAEMON_BIN:-$DEST_DIR/...}"`
+# lets that ambient value win over the LOOM_DAEMON_BIN_DIR sandbox above,
+# silently defeating it. Tests below that need LOOM_DAEMON_BIN pin it inline
+# on their own invocation (e.g. `LOOM_DAEMON_BIN="$W1/..." bash ...`), which
+# still applies regardless of this ambient unset.
 export LOOM_DAEMON_BIN_DIR="$BASE_WORKDIR/machine-level-bin-sandbox"
+unset LOOM_DAEMON_BIN
 
 # Binary-format sanity gate bypass (#4397, deferred from #4381's incident
 # review): provision_machine_daemon now refuses to install anything that
