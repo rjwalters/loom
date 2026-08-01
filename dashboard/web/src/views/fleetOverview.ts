@@ -112,7 +112,11 @@ export function hostCard(host: HostView, now: Date = new Date()): HTMLElement {
       ? el(
           "ul",
           { class: "card__sweeps", data: { testid: "card-sweeps" } },
-          host.sweeps.slice(0, 3).map((sweep) =>
+          // Every in-flight sweep, not the first three (#4868). This card is
+          // the answer to "what is the fleet doing right now"; truncating to
+          // three made that answer "click into each host" — on a working
+          // fleet it hid 22 of 31 sweeps. The card grows instead.
+          host.sweeps.map((sweep) =>
             el(
               "li",
               { class: "card__sweep" },
@@ -125,9 +129,6 @@ export function hostCard(host: HostView, now: Date = new Date()): HTMLElement {
               sweep.repo ? el("span", { class: "card__sweep-repo" }, sweep.repo) : null,
             ),
           ),
-          sweepCount > 3
-            ? el("li", { class: "card__sweep card__sweep--more" }, `+${sweepCount - 3} more`)
-            : null,
         )
       : null,
   );
