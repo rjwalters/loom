@@ -306,6 +306,21 @@ impl SweepRegistry {
     /// terminal record carry the sweep's own PR **without** a forge round trip
     /// — including for a successful sweep, whose checkpoint is deleted before
     /// the record is written.
+    ///
+    /// # Bus emission (Issue #4863)
+    ///
+    /// Every *newly observed* transition also publishes [`Event::SweepPhase`]
+    /// on the attached bus — the only production emit site for that variant, and
+    /// therefore the only source of the `sweep.phase` telemetry record the
+    /// observability collector maps it to. It lives **here**, rather than in
+    /// [`overlay_live_phase`](Self::overlay_live_phase), precisely because this
+    /// function already dedupes against `phase_history`: the checkpoint is
+    /// re-read on every tick, so an unguarded emit would republish the same
+    /// phase for the whole time a sweep sits in it and flood the bus (and D1).
+    /// The published `phase` is the **normalized** lifecycle name
+    /// ([`phase_label`] — `"curator-done"` → `"curator"`), matching the
+    /// `sweep.phase` schema's documented `curator|builder|judge|doctor|merge`
+    /// vocabulary, while the stored [`PhaseObservation`] keeps the raw marker.
     pub(crate) fn sample_phase_transition(
         &mut self,
         sweep_id: &str,
@@ -342,9 +357,18 @@ impl SweepRegistry {
             return;
         }
         history.push(PhaseObservation {
-            phase,
+            phase: phase.clone(),
             at: Utc::now(),
             pr_number,
+        });
+        // Genuine transition — publish it (see the "Bus emission" doc section
+        // above). Ordered after the history push so the dedupe state is already
+        // committed even if a subscriber panics on delivery.
+        self.emit_event(Event::SweepPhase {
+            issue: *issue,
+            phase: phase_label(&phase).to_string(),
+            pr_number: pr_number.and_then(|n| i32::try_from(n).ok()),
+            repo: None, // stamped by emit_event (#3929)
         });
     }
 
@@ -930,5 +954,181 @@ mod tests {
         // No known suffix ⇒ passed through verbatim.
         assert_eq!(phase_label("some-future-phase"), "some-future-phase");
         assert_eq!(phase_label("curator"), "curator");
+    }
+
+    // ------------------------------------------------------------------------
+    // `Event::SweepPhase` bus emission (Issue #4863)
+    // ------------------------------------------------------------------------
+
+    /// Drive `n` reaper ticks and drain every `Event::SweepPhase` the registry
+    /// published, returning the phase strings in emission order.
+    async fn drain_phase_events(sub: &mut crate::event_bus::Subscription) -> Vec<String> {
+        let mut phases = Vec::new();
+        while let Ok(recv) = tokio::time::timeout(Duration::from_millis(250), sub.recv()).await {
+            match recv {
+                Ok(Event::SweepPhase { phase, .. }) => phases.push(phase),
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        phases
+    }
+
+    /// AC (#4863): a live sweep advancing through phases publishes exactly ONE
+    /// `sweep.issue.{N}.phase` event per transition — and republishes nothing
+    /// on the ticks where it sits in the same phase. The dedupe matters as much
+    /// as the emission: `reap_once` re-reads the checkpoint every tick (every
+    /// 30s, plus every read-path reap), so an unguarded emit would republish
+    /// the same phase for the sweep's entire residence in it.
+    #[tokio::test]
+    async fn phase_transitions_publish_one_sweep_phase_event_each() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _rec) = fixture_registry(dir.path());
+        let bus = Arc::new(crate::event_bus::EventBus::new());
+        registry.set_event_bus(bus.clone());
+        let mut sub = bus.subscribe::<[&str; 0], &str>([]);
+
+        let issue = 4863;
+        let started_at = Utc::now() - Duration::from_secs(60);
+        // A live-looking pid, so `reap_once` samples the phase without reaping
+        // the entry — the real shape of a mid-flight sweep.
+        let _sweep_id = insert_running_at(&mut registry, issue, 0, started_at);
+
+        write_checkpoint_with_mtime(&registry, issue, "curator-done", SystemTime::now());
+        registry.reap_once();
+        // Two more ticks with the checkpoint unchanged: the sweep is still in
+        // the same phase, so these must publish nothing.
+        registry.reap_once();
+        registry.reap_once();
+        write_checkpoint_with_mtime(&registry, issue, "builder-done", SystemTime::now());
+        registry.reap_once();
+        registry.reap_once();
+
+        assert_eq!(
+            drain_phase_events(&mut sub).await,
+            vec!["curator".to_string(), "builder".to_string()],
+            "one event per transition, none while the sweep sits in a phase"
+        );
+    }
+
+    /// AC (#4863): the emitted `phase` agrees with the `sweep.phase` schema's
+    /// vocabulary (`curator|builder|judge|doctor|merge`) rather than carrying
+    /// the raw checkpoint marker (`"judge-rejected"`), which is what the
+    /// dashboard's `SweepPhaseName` renders.
+    #[tokio::test]
+    async fn emitted_phase_uses_the_schema_lifecycle_vocabulary() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _rec) = fixture_registry(dir.path());
+        let bus = Arc::new(crate::event_bus::EventBus::new());
+        registry.set_event_bus(bus.clone());
+        let mut sub = bus.subscribe::<[&str; 0], &str>([]);
+
+        let issue = 4864;
+        let started_at = Utc::now() - Duration::from_secs(60);
+        insert_running_at(&mut registry, issue, 0, started_at);
+
+        for marker in ["judge-rejected", "doctor-done", "merge-done"] {
+            write_checkpoint_with_mtime(&registry, issue, marker, SystemTime::now());
+            registry.reap_once();
+        }
+
+        assert_eq!(
+            drain_phase_events(&mut sub).await,
+            vec![
+                "judge".to_string(),
+                "doctor".to_string(),
+                "merge".to_string()
+            ]
+        );
+    }
+
+    /// AC (#4863), end-to-end: a REAL phase transition — not a hand-built
+    /// `Event::SweepPhase` fixture — produces a `sweep.phase` record on the
+    /// durable telemetry queue via the observability collector's own
+    /// event→record mapping. This is the link that was missing: every piece of
+    /// the pipeline below was already correct and unit-tested, but nothing
+    /// upstream ever published the event that feeds it.
+    #[tokio::test]
+    async fn a_real_phase_transition_reaches_the_telemetry_queue() {
+        use crate::observability::queue::DurableQueue;
+        use crate::telemetry::{RepoVisibility, TelemetryEnvelope, TelemetryRecord};
+
+        let dir = tempdir().unwrap();
+        let (mut registry, _rec) = fixture_registry(dir.path());
+        let bus = Arc::new(crate::event_bus::EventBus::new());
+        registry.set_event_bus(bus.clone());
+        let mut sub = bus.subscribe::<[&str; 0], &str>([]);
+
+        let issue = 4865;
+        let started_at = Utc::now() - Duration::from_secs(60);
+        let sweep_id = insert_running_at(&mut registry, issue, 0, started_at);
+
+        write_checkpoint_with_mtime(&registry, issue, "builder-done", SystemTime::now());
+        registry.reap_once();
+
+        let event = loop {
+            let recv = tokio::time::timeout(Duration::from_secs(5), sub.recv())
+                .await
+                .expect("a phase transition must publish an event");
+            match recv.unwrap() {
+                ev @ Event::SweepPhase { .. } => break ev,
+                _ => continue,
+            }
+        };
+        // The registry stamps its owning workspace root (#3929) on the way out.
+        match &event {
+            Event::SweepPhase { repo, .. } => assert_eq!(
+                repo.as_deref(),
+                Some(
+                    registry
+                        .config()
+                        .workspace_root
+                        .display()
+                        .to_string()
+                        .as_str()
+                )
+            ),
+            other => panic!("expected SweepPhase, got {other:?}"),
+        }
+
+        // Same mapping the collector task applies to every bus event, with the
+        // dispatch state a live daemon would already hold for this sweep.
+        let mut dispatches = HashMap::new();
+        crate::observability::collector::map_event_to_records(
+            &Event::SweepGlobalDispatch {
+                sweep_id: sweep_id.clone(),
+                kind: SweepKind::Issue(issue),
+                runtime: None,
+                runtime_source: None,
+                repo: None,
+            },
+            issue,
+            "rjwalters/loom",
+            RepoVisibility::Public,
+            &mut dispatches,
+        );
+        let records = crate::observability::collector::map_event_to_records(
+            &event,
+            issue,
+            "rjwalters/loom",
+            RepoVisibility::Public,
+            &mut dispatches,
+        );
+
+        let queue = DurableQueue::open(dir.path().join("telemetry-queue.jsonl"), 64);
+        for record in records {
+            queue.push(TelemetryEnvelope::new("host-test", record));
+        }
+
+        assert_eq!(queue.len(), 1, "exactly one sweep.phase record queued");
+        match &queue.peek_batch(1)[0].record {
+            TelemetryRecord::SweepPhase(r) => {
+                assert_eq!(r.issue, issue);
+                assert_eq!(r.phase, "builder");
+                assert_eq!(r.sweep_id, sweep_id);
+                assert_eq!(r.repo, "rjwalters/loom");
+            }
+            other => panic!("expected a SweepPhase record on the queue, got {other:?}"),
+        }
     }
 }

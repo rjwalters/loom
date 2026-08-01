@@ -156,6 +156,21 @@ A sweep advanced to a new lifecycle phase (mirrors `sweep.issue.{N}.phase`).
 
 `phase` is a lifecycle name: `curator`, `builder`, `judge`, `doctor`, `merge`.
 
+**Source and cadence (#4863)**: `Event::SweepPhase` — the record's only upstream —
+is published by `SweepRegistry::sample_phase_transition`, which the reaper calls
+once per live sweep per `reap_once` tick (the 30s reaper timer, plus every
+read-path reap). It reads `.loom/sweep-checkpoint/issue-<N>.json` and publishes
+**only when the phase changed since the previous tick**, so a sweep sitting in a
+phase emits nothing further. The checkpoint's raw marker (`curator-done`,
+`judge-rejected`) is normalized to the lifecycle vocabulary above before it is
+published; an unrecognized marker passes through verbatim rather than being
+guessed at, so `phase` should be read as "one of the five names, or an unknown
+raw marker" — which is exactly how the dashboard types it
+(`SweepPhaseName | string`).
+
+Because the phase is polled rather than pushed, `entered_at` is the daemon's
+*observation* instant, an honest upper bound on the real transition time.
+
 ### `sweep.completed`
 
 A sweep reached a terminal state (the summary moment; richer detail is in the
