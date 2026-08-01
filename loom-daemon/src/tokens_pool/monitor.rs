@@ -208,6 +208,19 @@ pub fn build_monitor_accounts(
 
     let mut accounts: Vec<MonitorAccount> = Vec::new();
     let mut matched: Vec<String> = Vec::new();
+    // Index of `accounts` by Loom account name so a second `ranking.json` row
+    // that resolves to a name already pushed by an earlier iteration of this
+    // same loop updates that entry instead of appending a duplicate (issue
+    // #4873 — two rows for one account inflated `capacity.total_accounts`).
+    // This can happen when `load_index_email_map` legitimately carries two
+    // different emails for one Loom account (e.g. a stale row left behind by
+    // a re-auth/rotation) and `ranking.json` has a row for each. Merge rule,
+    // chosen deliberately: **the more severe status wins** (`status_rank`,
+    // higher = worse) — a scheduler must never treat an account as available
+    // when another record for the same name says it is rate_limited or
+    // exhausted; ties (equal severity) keep the earlier row.
+    let mut index_by_name: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
 
     if let Some(entries) = data.get("accounts").and_then(|a| a.as_array()) {
         for entry in entries {
@@ -230,13 +243,23 @@ pub fn build_monitor_accounts(
                 }
                 _ => (None, None),
             };
-            matched.push(name.clone());
-            accounts.push(MonitorAccount {
-                name,
+            let candidate = MonitorAccount {
+                name: name.clone(),
                 status,
                 util_7d,
                 util_5h,
-            });
+            };
+            if let Some(&idx) = index_by_name.get(&name) {
+                if status_rank(&candidate.status) > status_rank(&accounts[idx].status) {
+                    accounts[idx] = candidate;
+                }
+                // else: an earlier, equal-or-more-severe row already won —
+                // drop this duplicate.
+            } else {
+                index_by_name.insert(name.clone(), accounts.len());
+                matched.push(name);
+                accounts.push(candidate);
+            }
         }
     }
 
@@ -248,6 +271,12 @@ pub fn build_monitor_accounts(
     // dispatch-invisible). Their unknown utilization sorts them after
     // known-utilization `available` accounts via `UTIL_SENTINEL`, but they
     // still rank ahead of `rate_limited`/`exhausted` accounts.
+    //
+    // `matched` is keyed by Loom account **name**, not email, so this is
+    // already dedup-safe against `load_index_email_map` legitimately holding
+    // two different emails for one name (issue #4873): once the first loop
+    // above matches *either* email to a `ranking.json` row for that name, the
+    // name is in `matched` and neither email's fallback entry here fires.
     for (_, name) in &email_to_name {
         if !matched.contains(name) {
             matched.push(name.clone());
@@ -463,6 +492,87 @@ mod tests {
         // the same `available` rank bucket.
         assert_eq!(accounts.last().unwrap().name, "acct-z");
         assert_eq!(accounts.last().unwrap().status, "available");
+    }
+
+    #[test]
+    fn build_accounts_dedupes_two_ranking_rows_for_one_name() {
+        // Regression test for issue #4873: `index.json` carries two different
+        // emails for the same Loom account (a stale row left behind by a
+        // re-auth/rotation), and `ranking.json` has a row for each. Only one
+        // `MonitorAccount` must survive for that name — and the merge picks
+        // the more severe status (`exhausted` beats `available`).
+        let tmp = tempfile::tempdir().unwrap();
+        let tokens_dir = tmp.path().join("tokens");
+        let monitor_dir = tmp.path().join("monitor");
+        write_index(
+            &tokens_dir,
+            &[
+                ("acct-a", "a-old@example.com"),
+                ("acct-a", "a-new@example.com"),
+                ("acct-b", "b@example.com"),
+            ],
+        );
+        let now = fresh_now();
+        write_ranking_json(
+            &monitor_dir,
+            &iso(now),
+            serde_json::json!([
+                {"email": "a-old@example.com", "status": "available", "utilization": {"7d": 0.10, "5h": 0.10}},
+                {"email": "a-new@example.com", "status": "exhausted", "utilization": {"7d": 0.99, "5h": 0.99}},
+                {"email": "b@example.com", "status": "available", "utilization": {"7d": 0.20, "5h": 0.20}},
+            ]),
+        );
+
+        let accounts = build_monitor_accounts(&tokens_dir, Some(&monitor_dir), Some(now)).unwrap();
+        let matches: Vec<&MonitorAccount> =
+            accounts.iter().filter(|a| a.name == "acct-a").collect();
+        assert_eq!(matches.len(), 1, "exactly one row must survive for a duplicated name");
+        assert_eq!(matches[0].status, "exhausted", "the more severe status wins the merge");
+        assert_eq!(accounts.len(), 2, "acct-a (deduped) + acct-b, never 3");
+    }
+
+    #[test]
+    fn build_accounts_dedupes_ranking_row_plus_unmentioned_fallback() {
+        // Regression test for issue #4873 (the second observed shape): one
+        // email for a name is matched by a `ranking.json` row, while a
+        // second, different email for the *same* name is absent from
+        // `ranking.json` and would otherwise fall through to the
+        // "unmentioned manifest account" path (issue #4645). The name-keyed
+        // `matched` guard must suppress the fallback duplicate.
+        let tmp = tempfile::tempdir().unwrap();
+        let tokens_dir = tmp.path().join("tokens");
+        let monitor_dir = tmp.path().join("monitor");
+        write_index(
+            &tokens_dir,
+            &[
+                ("acct-a", "a-matched@example.com"),
+                ("acct-a", "a-unmentioned@example.com"),
+                ("acct-z", "z@example.com"),
+            ],
+        );
+        let now = fresh_now();
+        write_ranking_json(
+            &monitor_dir,
+            &iso(now),
+            serde_json::json!([
+                {"email": "a-matched@example.com", "status": "rate_limited", "utilization": {"7d": 0.5, "5h": 0.5}},
+            ]),
+        );
+
+        let accounts = build_monitor_accounts(&tokens_dir, Some(&monitor_dir), Some(now)).unwrap();
+        let matches: Vec<&MonitorAccount> =
+            accounts.iter().filter(|a| a.name == "acct-a").collect();
+        assert_eq!(matches.len(), 1, "exactly one row must survive for acct-a");
+        assert_eq!(
+            matches[0].status, "rate_limited",
+            "the matched ranking.json row wins, not the fallback"
+        );
+        // acct-z is genuinely absent from ranking.json -> still gets the
+        // unmentioned-manifest fallback (issue #4645 preserved). It sorts
+        // ahead of acct-a here (available < rate_limited in status_rank).
+        assert_eq!(accounts.first().unwrap().name, "acct-z");
+        assert_eq!(accounts.first().unwrap().status, "available");
+        assert_eq!(accounts.len(), 2, "acct-a (deduped) + acct-z, never 3");
     }
 
     #[test]
