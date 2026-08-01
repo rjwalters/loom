@@ -101,7 +101,7 @@ describe("App — loaded state", () => {
     await app.start("#/");
 
     expect(fetchState).toHaveBeenCalledTimes(1);
-    expect(root.querySelectorAll('[data-testid="host-card"]')).toHaveLength(5);
+    expect(root.querySelectorAll('[data-testid="host-card"]')).toHaveLength(6);
     expect(statusEl.textContent).toMatch(/^Updated /);
   });
 
@@ -199,13 +199,13 @@ describe("App — error state", () => {
       throw new FleetStateError("transient", { status: 503 });
     });
     await app.start("#/");
-    expect(root.querySelectorAll('[data-testid="host-card"]')).toHaveLength(5);
+    expect(root.querySelectorAll('[data-testid="host-card"]')).toHaveLength(6);
 
     await app.refresh();
 
     // Banner over live (stale) data — not a blanked page.
     expect(root.querySelector('[data-testid="error"]')?.classList.contains("state--banner")).toBe(true);
-    expect(root.querySelectorAll('[data-testid="host-card"]')).toHaveLength(5);
+    expect(root.querySelectorAll('[data-testid="host-card"]')).toHaveLength(6);
     expect(statusEl.textContent).toBe("Stale — last refresh failed");
   });
 
