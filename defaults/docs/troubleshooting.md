@@ -82,6 +82,18 @@ if it errors out instead of running.
 loom-clean --force  # Non-interactive, safe for automation
 ```
 
+**What `--safe` actually narrows (#4890)**: `--safe` is documented as
+"merged-PR-only mode", but that promise only has meaning for artifacts that
+*are* an artifact of a merged PR — worktrees (gated on issue-closed +
+PR-merged + grace period) and branches. A tmux session has no PR association
+at all, so `loom-clean --safe` skips tmux cleanup **entirely** rather than
+silently killing a live session (a Manual-Orchestration-Mode terminal on
+Loom's isolated `-L loom` tmux socket does not show up in a plain `tmux ls`,
+so an operator has no other way to notice). Use `loom-clean --tmux-only`
+(optionally with `--force`) outside `--safe` to clean tmux sessions
+explicitly. Even then, a session with an attached client (someone is actively
+looking at it) is preserved unless `--force` is passed.
+
 **Backlog of pre-existing `[gone]` local branches (#4100)**: `merge-pr.sh` deletes
 the local feature branch for every PR it merges as of #4100, but repos that ran
 Loom before that fix accumulated one orphaned local branch per merged issue —
