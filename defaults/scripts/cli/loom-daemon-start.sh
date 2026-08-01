@@ -598,6 +598,15 @@ render_launchd_plist() {
     # KeepAlive:SuccessfulExit=true (#4054): relaunch ONLY on a clean exit 0 (the
     # RestartDaemon primitive). A crash/SIGTERM/SIGINT exits non-zero and is NOT
     # respawned -- preserving the pre-#4054 no-crash-loop semantics of KeepAlive=false.
+    # #4862 NOTE: launchd's KeepAlive:{SuccessfulExit:true} has the SAME "was the
+    # exit clean" dependency as systemd's Restart=on-success (see
+    # render_systemd_unit's KillMode=mixed fix above), but launchd has no
+    # documented cgroup-timeout reclassification of a clean exit into a
+    # failure -- there is no launchd analog of systemd's kill(5) Result=timeout
+    # escalation. Not reproduced/fixed here (#4862 scoped its systemd-only
+    # incident); if a launchd analog ever surfaces, audit whether lingering
+    # `claude`/`tee`/`sleep` children under this job's ProcessType=Background
+    # can flip SuccessfulExit's observed exit status before filing a follow-up.
     printf '    <key>KeepAlive</key>\n    <dict>\n        <key>SuccessfulExit</key>\n        <true/>\n    </dict>\n'
     printf '    <key>ProcessType</key>\n    <string>Background</string>\n'
     printf '    <key>StandardOutPath</key>\n    <string>%s</string>\n' "$(xml_escape "$log_path")"
@@ -620,6 +629,26 @@ render_launchd_plist() {
 #     semantics while making the one deliberate clean exit the only relaunch
 #     trigger. Crash relaunch (Restart=always/on-failure) is deliberately NOT set
 #     here -- that is watchdog territory (sub-issue D of #4260).
+#   * KillMode=mixed (#4862): a self-update relaunch calls exit(0) while the
+#     daemon's own `claude`/`tee`/`sleep` worker children (spawned sweeps, in
+#     the SAME cgroup) may still be running. Under the default KillMode=
+#     control-group, systemd's kill(5) escalates to SIGKILLing those leftover
+#     processes only after the FULL TimeoutStopSec deadline elapses -- and a
+#     forced-timeout SIGKILL sets the UNIT's Result to 'timeout', which
+#     Restart=on-success does NOT match (only 'success' does -- see the
+#     Restart= table in systemd.service(5)), so the relaunch never fires and
+#     the daemon sits dead. Empirically verified (see #4862): a clean exit(0)
+#     with lingering cgroup children reproduces Result=timeout under
+#     control-group and Result=success (Restart=on-success DOES fire) under
+#     mixed. Per kill(5): "If set to mixed, the SIGTERM signal is sent to the
+#     main process while the subsequent SIGKILL signal is sent to all
+#     remaining processes... after: the main process of a unit has exited
+#     (applies to KillMode=: mixed)" -- i.e. mixed escalates to SIGKILL
+#     IMMEDIATELY on the main process's own exit, never waiting out
+#     TimeoutStopSec, so the unit's Result tracks the main process's own exit
+#     status. This does not change genuine-crash semantics (still Result=
+#     exit-code / signal, still refused by on-success) -- verified with both
+#     shapes in test-loom-daemon-start.sh.
 #   * [Install] WantedBy=default.target + `systemctl --user enable` is the
 #     RunAtLoad=true analog: the service comes up on login (and, with
 #     `loginctl enable-linger`, after a reboot).
@@ -671,6 +700,12 @@ render_systemd_unit() {
     # clean exit 0 (the RestartDaemon primitive) trips a relaunch; a crash / an
     # operator SIGTERM/SIGINT exits non-zero and stays down.
     printf 'Restart=on-success\n'
+    # KillMode=mixed (#4862): see the render_systemd_unit doc comment above for
+    # the full kill(5)-sourced rationale -- without this, a clean exit(0) with
+    # lingering `claude`/`tee`/`sleep` worker children in the cgroup gets
+    # reclassified as Result=timeout (control-group's default forced-SIGKILL-
+    # after-TimeoutStopSec path) and Restart=on-success never fires.
+    printf 'KillMode=mixed\n'
     printf '%b' "$env_lines"
     printf 'StandardOutput=append:%s\n' "$log_path"
     printf 'StandardError=append:%s\n' "$log_path"
@@ -688,9 +723,14 @@ render_systemd_unit() {
 # reads it to decide whether a missing daemon is a silent failure (marker present
 # ⇒ report) or a deliberate stop (marker absent ⇒ stay silent). Records the paths
 # and label the watchdog needs so it can probe reality without re-deriving them.
-# Args: <use_launchd true|false> <launchd_label>
+# Args: <use_launchd true|false> <launchd_label> [use_systemd true|false] [systemd_unit]
+# #4862: use_systemd/systemd_unit are new, OPTIONAL trailing fields (default
+# false/"") so the watchdog can tell a systemd-supervised daemon apart from the
+# plain-nohup fallback -- both previously wrote identical `use_launchd=false`
+# markers, leaving the watchdog with no way to probe `systemctl --user` for the
+# #4232-style bounded auto-remediation gate (see loom-daemon-watchdog.sh).
 write_intent_marker() {
-    local use_launchd="$1" label="$2"
+    local use_launchd="$1" label="$2" use_systemd="${3:-false}" systemd_unit="${4:-}"
     mkdir -p "$LOOM_DIR" 2>/dev/null || true
     (
         umask 077
@@ -707,6 +747,8 @@ heartbeat_file=$HEARTBEAT_FILE
 heartbeat_interval_secs=$HEARTBEAT_INTERVAL_SECS
 use_launchd=$use_launchd
 launchd_label=$label
+use_systemd=$use_systemd
+systemd_unit=$systemd_unit
 socket_path=$SOCKET_PATH
 EOF
     )
@@ -903,11 +945,30 @@ provision_watchdog_job_launchd() {
     wd_interval="${LOOM_WATCHDOG_INTERVAL_SECS:-300}"
     wd_log="$LOOM_DIR/logs/daemon-watchdog.log"
     mkdir -p "$HOME/Library/LaunchAgents" "$LOOM_DIR/logs" 2>/dev/null || true
-    if ! render_watchdog_plist "$wd_label" "$script" "$REPO_ROOT" "$wd_log" "$wd_interval" > "$wd_plist" 2>/dev/null; then
+    local wd_plist_new; wd_plist_new="$(mktemp "${TMPDIR:-/tmp}/loom-watchdog-plist.XXXXXX" 2>/dev/null)" || wd_plist_new=""
+    if [[ -z "$wd_plist_new" ]] || ! render_watchdog_plist "$wd_label" "$script" "$REPO_ROOT" "$wd_log" "$wd_interval" > "$wd_plist_new" 2>/dev/null; then
         warn "watchdog: could not write $wd_plist — skipping."
+        rm -f "$wd_plist_new" 2>/dev/null || true
         return 0
     fi
-    if launchctl print "$wd_service" >/dev/null 2>&1; then
+    local wd_job_loaded=false
+    launchctl print "$wd_service" >/dev/null 2>&1 && wd_job_loaded=true
+    # #4862 double-fire fix: RunAtLoad=true means EVERY bootout+bootstrap cycle
+    # fires an extra immediate run, on top of the regular StartInterval cadence.
+    # provision_watchdog_job_launchd runs on EVERY loom-daemon-start.sh
+    # invocation (every daemon start, restart, AND self-update relaunch) -- so
+    # unconditionally re-bootstrapping here duplicated a run each time,
+    # independent of the watchdog's own schedule. Skip the reload cycle
+    # entirely when the job is already loaded and the rendered plist is
+    # byte-identical to what's installed -- nothing to apply, so no reason to
+    # trigger RunAtLoad again.
+    if [[ "$wd_job_loaded" == "true" ]] && cmp -s "$wd_plist_new" "$wd_plist" 2>/dev/null; then
+        rm -f "$wd_plist_new" 2>/dev/null || true
+        echo "Watchdog:       $wd_label (StartInterval ${wd_interval}s) → $wd_log (unchanged, already loaded — skipped reload)"
+        return 0
+    fi
+    mv -f "$wd_plist_new" "$wd_plist" 2>/dev/null || { warn "watchdog: could not install $wd_plist — skipping."; rm -f "$wd_plist_new" 2>/dev/null || true; return 0; }
+    if [[ "$wd_job_loaded" == "true" ]]; then
         launchctl bootout "$wd_service" >/dev/null 2>&1 || true
     fi
     if launchctl bootstrap "$wd_domain" "$wd_plist" >/dev/null 2>&1; then
@@ -999,6 +1060,14 @@ provision_watchdog_job_systemd() {
         warn "watchdog: could not write $timer_path — skipping."
         return 0
     fi
+    # #4862: unlike the launchd branch above (which must guard against
+    # re-provisioning triggering an extra RunAtLoad run), `systemctl --user
+    # enable --now` on an ALREADY ACTIVE timer is a no-op job that does NOT
+    # re-trigger OnBootSec/re-run the service -- empirically verified (#4862):
+    # two consecutive `enable --now` calls against the same active timer with
+    # an already-elapsed OnBootSec produced exactly one execution, not two. So
+    # re-running this on every daemon start/relaunch is safe as-is; no
+    # unchanged-content guard needed here.
     systemctl --user daemon-reload >/dev/null 2>&1 || true
     if systemctl --user enable --now "$timer_unit" >/dev/null 2>&1; then
         echo "Watchdog:       $timer_unit (OnUnitActiveSec ${wd_interval}s) → $wd_log"
@@ -1625,8 +1694,10 @@ if [[ "$IS_LINUX_SYSTEMD" == "true" ]]; then
     # both write: same path, same pid, and the daemon's write is atomic.
     echo "$daemon_pid" > "$PID_FILE"
     # Record operator intent + arm the systemd-timer autonomy-loss watchdog
-    # (#4011, #4260 sub-issue D).
-    write_intent_marker "false" ""
+    # (#4011, #4260 sub-issue D). use_systemd=true + the resolved unit name
+    # (#4862) let the watchdog probe `systemctl --user` for its own bounded
+    # auto-remediation gate, mirroring the launchd job_loaded/kickstart path.
+    write_intent_marker "false" "" "true" "$SYSTEMD_UNIT"
     provision_watchdog_job_systemd
     ok "loom-daemon started under systemd (pid $daemon_pid, unit $SYSTEMD_UNIT)."
     echo "PID file: $PID_FILE"

@@ -4467,6 +4467,7 @@ disable-on-stop. The contract mirrors launchd point-for-point:
 |---|---|
 | `RunAtLoad=true` + `launchctl enable` (#3972) | `[Install] WantedBy=default.target` + `systemctl --user enable` |
 | `KeepAlive:{SuccessfulExit:true}` — relaunch only on a clean exit `0` (#4054) | `Restart=on-success` — relaunch only on a clean exit `0` (exact analog; a crash / operator SIGTERM/SIGINT exits non-zero and stays down) |
+| (no cgroup-timeout reclassification of a clean exit — not applicable) | `KillMode=mixed` (#4862) — without it, a clean exit(0) with lingering cgroup children (in-flight `claude`/`tee`/`sleep` sweep workers) gets reclassified `Result=timeout` by the default `control-group` mode once `TimeoutStopSec` elapses, and `Restart=on-success` does not match `timeout` — so the relaunch silently never fires. `mixed` escalates the leftover-process SIGKILL sweep on the *main process's own exit*, not after `TimeoutStopSec`, so the unit's `Result` tracks the main process's exit status |
 | `launchctl bootout` on operator stop | `systemctl --user disable --now <unit>` |
 | plist `EnvironmentVariables` (`LOOM_DAEMON_SUPERVISOR=launchd`, forwarded `LOOM_*`/tokens, deterministic PATH #4172) | `Environment=` lines (`LOOM_DAEMON_SUPERVISOR=systemd`, same forwarded env + PATH) |
 | `WorkingDirectory` = checkout in machine mode (#4229), else repo root | `WorkingDirectory=` — same resolution |
@@ -4509,7 +4510,11 @@ disable-on-stop. The contract mirrors launchd point-for-point:
   On a systemd host it is delivered by the `<unit>-watchdog.timer` +
   `Type=oneshot` `.service` pair (#4260 sub-issue D, "Autonomy-loss watchdog +
   heartbeat" above), mirroring the macOS `StartInterval` autonomy-loss watchdog
-  (#4011) — the watchdog *reports* divergence, it does not restart the daemon.
+  (#4011) — the watchdog mostly *reports* divergence, except for the narrow
+  #4232/#4862 auto-remediation gates (unit LOADED + not running + a clean
+  `ExecMainStatus=0`, mirroring `launchctl kickstart`), which run `systemctl
+  --user reset-failed <unit> && systemctl --user start <unit>` — never for a
+  crash or an operator stop.
 
 ### macOS TCC hygiene under launchd (#3980)
 
