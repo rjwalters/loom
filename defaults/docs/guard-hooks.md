@@ -168,13 +168,13 @@ so anything that hides the string from the scan defeats it — most notably the
 Pattern-Blocked" below) and interpreter one-liners. And it only fires if the hook
 is actually wired, which is the next section.
 
-### Hook-wiring integrity (#4791 assessment)
+### Hook-wiring integrity (#4791 assessment, fixed by #4806)
 
 The floor's guarantee is conditional on `guard-destructive.sh` *running*. That is
 governed by hook **registration**, which is a different surface from `guards.*`
 policy — so it deserves its own assessment. Verdict: **the machine-level wiring
-is well protected; the transition (copies-present) layout has a real gap, and the
-fix belongs in the installer, not in a new mechanism.**
+is well protected; the transition (copies-present) layout's former gap is now
+closed at the installer level.**
 
 - **Machine-level wiring is out of reach of a repository change.** Since Phase 5
   (#4262) the entries live in the operator's user-scope `~/.claude/settings.json`
@@ -183,32 +183,37 @@ fix belongs in the installer, not in a new mechanism.**
   Daemon-spawned workers inherit it because `loom-daemon` copies it into each
   worker's isolated `CLAUDE_CONFIG_DIR`. This is strictly stronger than the old
   per-repo wiring and needs no additional protection.
-- **The transition layout has a wiring gap.** While a repo still carries per-repo
-  `.loom/hooks/<name>` copies, the user-scope wrapper's transition-dedup step is
-  an unconditional `[ -x "$ROOT/.loom/hooks/<name>" ] && exit 0` — it defers
-  **without checking that a project-level entry exists to defer to.** So the
-  state "copies present, `hooks` block absent from the repo's
-  `.claude/settings.json`" yields **zero guards**: the wrapper steps aside and
-  nothing takes its place. That is the #4401 failure mode, and #4401 fixed only
-  the *installer* half of it (`ensure_project_hook_wiring` re-asserts the project
-  entries on every install); a commit that later deletes the `hooks` block —
-  careless or hostile — re-creates it silently, and Loom itself dogfoods the
-  copies-present layout.
-- **Proposed fix (not implemented here; deliberately deferred).** Make the
-  deferral conditional: defer only when the copy exists **and** the project
-  `.claude/settings.json` actually references `.loom/hooks/<name>`; otherwise
-  exec the machine hook. It is fork-free in the wrapper — `[ -f "$ROOT/.claude/settings.json" ] && case "$(<"$ROOT/.claude/settings.json")" in *".loom/hooks/<name>"*) exit 0;; esac`
+- **The transition layout's wiring gap is fixed (#4806).** While a repo still
+  carries per-repo `.loom/hooks/<name>` copies, the user-scope wrapper's
+  transition-dedup step used to be an unconditional `[ -x "$ROOT/.loom/hooks/
+  <name>" ] && exit 0` — it deferred **without checking that a project-level
+  entry exists to defer to.** So the state "copies present, `hooks` block absent
+  from the repo's `.claude/settings.json`" yielded **zero guards**: the wrapper
+  stepped aside and nothing took its place. That was the #4401 failure mode, and
+  #4401 fixed only the *installer* half of it (`ensure_project_hook_wiring`
+  re-asserts the project entries on every install); a commit that later deleted
+  the `hooks` block — careless or hostile — re-created the gap silently, and
+  Loom itself dogfoods the copies-present layout.
+- **The fix (#4806): the deferral is now conditional.** `_phook_cmd()`
+  (`scripts/install/provision-hooks.sh`) defers only when the copy exists **and**
+  the project `.claude/settings.json` actually references `.loom/hooks/<name>`;
+  otherwise it falls through and execs the machine hook. It is fork-free in the
+  wrapper — `[ -x "$ROOT/.loom/hooks/<name>" ] && [ -f "$ROOT/.claude/settings.json" ] && case "$(<"$ROOT/.claude/settings.json")" in *".loom/hooks/<name>"*) exit 0 ;; esac`
   (the `[ -f ]` guard matters: `$(<missing)` writes to stderr) — and it cannot
   double-fire, because it defers exactly when the project entry will run the
-  copy. It is *not* landed in this change for one concrete reason: the
-  wrapper string is embedded in every operator's `~/.claude/settings.json`, and
-  `_phook_merge_one` deduplicates on the `defaults/hooks/<name>` marker — which
-  the new wrapper also contains — so re-provisioning would **skip** the entry and
-  leave the old wrapper in place. Landing the fix therefore requires a companion
-  change: a versioned "replace a stale Loom-owned entry" upgrade path in
-  `scripts/install/provision-hooks.sh`. That is installer surgery on live,
-  machine-level state, so it is tracked as its own issue (**#4806**) rather than
-  smuggled into a documentation change.
+  copy. Landing the wrapper change alone would have been inert on already-
+  installed machines: the wrapper string is embedded in every operator's
+  `~/.claude/settings.json`, and `_phook_merge_one` deduplicates on the
+  `defaults/hooks/<name>` marker — which the new wrapper also contains — so a
+  naive re-provision would **skip** the entry and leave the old wrapper in
+  place forever. #4806 therefore also added a versioned "replace a stale
+  Loom-owned entry" upgrade path: `_phook_merge_one` accepts an optional
+  `upgrade_marker` (`_PHOOK_WRAPPER_MARKER`, the `ROOT=$(cd "$(git rev-parse
+  --git-common-dir` prefix unique to a Loom-authored wrapper) and, when a
+  duplicate-by-marker entry is found whose command differs from the current
+  `_phook_cmd()` output *and* carries that upgrade marker, rewrites it in place
+  — a hand-written / non-Loom entry that happens to reference the same hook name
+  never matches the upgrade marker and is never touched.
 - **Verify wiring on demand** (an operator or Auditor can run this in any repo):
 
   ```bash
