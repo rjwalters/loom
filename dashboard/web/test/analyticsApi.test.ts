@@ -59,6 +59,32 @@ describe("fetchHistory", () => {
     await expect(fetchHistory({ fetchImpl })).rejects.toThrow("401");
   });
 
+  it("requests the public prefix when surface is public", async () => {
+    const calls: string[] = [];
+    const fetchImpl = vi.fn(async (url: string) => {
+      calls.push(url);
+      return jsonResponse({ records: [], nextCursor: null });
+    }) as unknown as typeof fetch;
+
+    await fetchHistory({ since: T0, surface: "public", fetchImpl });
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toContain("/public/history?");
+    expect(calls[0]).not.toContain("/api/");
+  });
+
+  it("defaults to the authenticated prefix when surface is omitted", async () => {
+    const calls: string[] = [];
+    const fetchImpl = vi.fn(async (url: string) => {
+      calls.push(url);
+      return jsonResponse({ records: [], nextCursor: null });
+    }) as unknown as typeof fetch;
+
+    await fetchHistory({ fetchImpl });
+
+    expect(calls[0]).toContain("/api/history?");
+  });
+
   it("drops rows missing the fields every consumer needs", async () => {
     const good = tokensSnapshot(T0, [{ account: "agent-1", usage: 0.1 }]);
     const fetchImpl = vi.fn(async () =>

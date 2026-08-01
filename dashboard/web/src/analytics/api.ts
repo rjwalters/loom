@@ -15,22 +15,34 @@
  * A server-side `kind` filter would be a strict improvement and is the obvious
  * follow-up, but it is a backend change — out of scope for this UI issue.
  *
- * ## `/api` only, never `/public`
+ * ## `/api` or `/public`, chosen explicitly by the caller
  *
- * `API_PREFIX` is a constant, not a parameter. Per this issue's
- * public-exposure decision (see `render.ts` and
- * `../../docs/token-analytics.md`), the token/cost analytics are an
- * authenticated-surface feature: the fetch path is pinned to `/api` so the
- * view cannot be repointed at `/public` by configuration, and `render.ts`
- * independently refuses to render on a public surface. Two enforcement points,
- * because "the API technically returns it" is not the same as "the page should
- * show it".
+ * Issue #4752 pinned this to `/api` unconditionally, on the premise that the
+ * whole panel was authenticated-only. Issue #4847 revisited that: the public
+ * surface now gets a pool-level panel built from `/public/history`'s
+ * non-identifying `tokens.snapshot` aggregate (`../../docs/query-api.md`),
+ * so the fetch prefix is a `surface` option instead of a constant.
+ *
+ * This is *not* a weaker guarantee than the old constant. `render.ts`'s
+ * `mountTokenAnalytics` is the only caller, and it always passes the same
+ * `surface` it renders with — so a public-surface render can only ever have
+ * requested `/public`. And even if a caller got that wrong, the backend does
+ * not trust the client's choice of prefix at all: `/public/history` redacts
+ * `tokens.snapshot` down to the aggregate server-side
+ * (`../../src/redaction.ts`) regardless of what the requester intended, so
+ * per-account detail cannot reach the browser through this path no matter
+ * which `surface` is passed here.
  */
 
 import type { HistoryEnvelope } from "./types.js";
 
-/** Authenticated surface only — see the module doc. */
-const API_PREFIX = "/api";
+/** Which route surface a history fetch targets — see the module doc. */
+export type HistorySurface = "authenticated" | "public";
+
+const HISTORY_PATH_BY_SURFACE: Readonly<Record<HistorySurface, string>> = {
+  authenticated: "/api/history",
+  public: "/public/history",
+};
 
 /** The API's own cap (`docs/query-api.md`: "Default 50, capped at 500"). */
 const MAX_PAGE_SIZE = 500;
@@ -49,6 +61,9 @@ export interface FetchHistoryOptions {
   host?: string;
   /** Page-walk cap. Default 10 pages (up to 5000 records). */
   maxPages?: number;
+  /** Which route to query. Default `"authenticated"` (`/api/history`) — see
+   * the module doc. */
+  surface?: HistorySurface;
   /** Injectable for tests; defaults to the global `fetch`. */
   fetchImpl?: typeof fetch;
   signal?: AbortSignal;
@@ -64,6 +79,7 @@ export interface FetchHistoryOptions {
 export async function fetchHistory(options: FetchHistoryOptions = {}): Promise<HistoryEnvelope[]> {
   const doFetch = options.fetchImpl ?? globalThis.fetch;
   const maxPages = options.maxPages ?? 10;
+  const path = HISTORY_PATH_BY_SURFACE[options.surface ?? "authenticated"];
   const collected: HistoryEnvelope[] = [];
   let cursor: number | null = null;
 
@@ -75,12 +91,12 @@ export async function fetchHistory(options: FetchHistoryOptions = {}): Promise<H
     if (options.host !== undefined) params.set("host", options.host);
     if (cursor !== null) params.set("cursor", String(cursor));
 
-    const response = await doFetch(`${API_PREFIX}/history?${params.toString()}`, {
+    const response = await doFetch(`${path}?${params.toString()}`, {
       signal: options.signal,
       headers: { accept: "application/json" },
     });
     if (!response.ok) {
-      throw new Error(`GET ${API_PREFIX}/history returned ${response.status}`);
+      throw new Error(`GET ${path} returned ${response.status}`);
     }
 
     const parsed = await parsePage(response);

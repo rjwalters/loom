@@ -2,17 +2,23 @@
  * The token/cost analytics panel: burn curves, limit-window forecasts, and
  * per-repo attribution (Epic #4702, Phase 3, issue #4752).
  *
- * ## Public-exposure decision: authenticated surface only
+ * ## Public-exposure decision: pool-level aggregate, not per-account detail
  *
- * Phase 2's redaction policy (`../../src/redaction.ts`) passes
- * `tokens.snapshot` through **unredacted on both `/api` and `/public`** — the
- * kind carries no `repo`, so the private/public visibility split has nothing
- * to key on. That is a correct backend decision and this issue does not change
- * it. It is nonetheless *not* a decision that these widgets belong on the
- * public page, and this module resolves that question the other way:
+ * Operator decision (2026-07-31, issue #4847): **the signed-in dashboard
+ * shows per-account token detail; the public view shows pool-level aggregate
+ * stats instead of nothing.** This supersedes issue #4752's original
+ * decision, which withheld the whole panel from the public surface. Phase
+ * 2's redaction policy (`../../src/redaction.ts`) already draws the line
+ * this module now follows: `/public/history`'s `tokens.snapshot` carries no
+ * `accounts[]` at all — `deriveTokenPoolAggregate` replaces it with a
+ * non-identifying `account_count` / `exhausted_count` / `mean_usage_fraction`
+ * / `max_usage_fraction` / `next_limit_window_reset_at` summary — so a public
+ * render of that data can never surface an account identifier; there is
+ * nothing here to redact in the UI layer, only something to compute (a
+ * pool-level burn series, `burn.ts`'s `buildPoolBurnCurves`) that the
+ * original per-account modules cannot produce.
  *
- * **`mountTokenAnalytics` refuses to render on a `"public"` surface.** Three
- * reasons, in descending order of force:
+ * What still does not render publicly, and why each one stays that way:
  *
  * 1. **Per-repo attribution is a repo-name table by construction.** The whole
  *    output of `attribution.ts` is "which repositories consumed the fleet's
@@ -20,40 +26,43 @@
  *    `/public/history` for private-visibility sweeps. Rendering this panel
  *    publicly would reconstruct, by inference from timing, the exact fact the
  *    redaction layer removes.
- * 2. **Account identifiers are operator infrastructure.** `agent-3` +
- *    `usage_fraction` + `limit_window_reset_at` is a live capacity map of the
- *    operator's account pool: it says how many accounts exist, which are near
- *    their cap, and when each recovers. That is useful to an operator and
- *    useful to nobody else in a way that benefits the operator.
- * 3. **Exhaustion forecasts are a scheduling signal.** "This fleet runs dry in
- *    40 minutes" is exactly the sort of operational state a public status page
- *    should be a deliberate choice to publish, not a side effect of which API
- *    route happens to permit it.
+ * 2. **Per-account forecasts are a scheduling signal keyed to an identity.**
+ *    "This fleet runs dry in 40 minutes" is one thing; "*agent-3* runs dry in
+ *    40 minutes" ties that to operator infrastructure. The pool-level summary
+ *    below reports the same risk (`exhausted_count`, `max_usage_fraction`)
+ *    without naming which account it is — see `forecast.ts`'s
+ *    `summarizePoolHealth` for why this is a summary and not a projection.
  *
- * This is a **UI-layer** decision, enforced here and (independently) by
- * `api.ts` pinning its fetch to `/api`. It changes no redaction behavior. If a
- * future operator wants a public capacity summary, the right shape is a
- * purpose-built aggregate (e.g. "fleet capacity: healthy") with no account or
- * repo names — a new component, not a flag on this one. Coordinated with the
+ * `renderTokenAnalytics` renders the pool-level blocks in place of the
+ * withheld notice on a `"public"` surface, and keeps the notice only for the
+ * two blocks above. `mountTokenAnalytics` fetches from `/public/history`
+ * (never `/api/*`) on that surface — see `api.ts`'s module doc for why that
+ * is still a real boundary and not merely cosmetic. Coordinated with the
  * public view page (#4753) via `../../docs/token-analytics.md`.
  */
 
-import type { AccountBurnCurve, BurnSegment } from "./burn.js";
-import { buildBurnCurves } from "./burn.js";
-import type { AccountForecast, ForecastStatus } from "./forecast.js";
-import { forecastAccounts } from "./forecast.js";
+import type { AccountBurnCurve, BurnSegment, PoolBurnCurve, PoolBurnPoint, PoolBurnSegment } from "./burn.js";
+import { buildBurnCurves, buildPoolBurnCurves } from "./burn.js";
+import type { AccountForecast, ForecastStatus, PoolHealthSummary } from "./forecast.js";
+import { forecastAccounts, summarizePoolHealths } from "./forecast.js";
 import type { AttributionResult } from "./attribution.js";
 import { attributeUsageToRepos } from "./attribution.js";
-import { parseSweepWindows, parseTokenSamples } from "./parse.js";
-import type { HistoryEnvelope, SweepWindow, TokenSample } from "./types.js";
+import { parsePoolSamples, parseSweepWindows, parseTokenSamples } from "./parse.js";
+import type { HistoryEnvelope, PoolSample, SweepWindow, TokenSample } from "./types.js";
 import { fetchHistory } from "./api.js";
 import { formatDuration, formatInstant, formatPercent, formatRatePerHour, formatRelative, UNKNOWN } from "./format.js";
 
 /** Which route surface the panel is being rendered on. */
 export type DashboardSurface = "authenticated" | "public";
 
-/** The only surface this panel renders on — see the module doc. */
-export const REQUIRED_SURFACE: DashboardSurface = "authenticated";
+/** The surface a caller gets when it does not specify one. Authenticated,
+ * not fail-safe-to-public: every real caller (`bootstrap.ts`'s
+ * `startTokenAnalytics`) always passes an explicit surface derived from the
+ * server-injected auth state, so this default only matters to a test or a
+ * future caller that forgot to — and both surfaces now render real content
+ * (see the module doc), so there is no "withheld by default" safety margin
+ * this default used to buy. */
+export const DEFAULT_SURFACE: DashboardSurface = "authenticated";
 
 export interface TokenAnalytics {
   curves: AccountBurnCurve[];
@@ -61,6 +70,13 @@ export interface TokenAnalytics {
   attribution: AttributionResult;
   samples: TokenSample[];
   sweeps: SweepWindow[];
+  /** Pool-level counterparts of `samples`/`curves`, built from the
+   * `/public/history` aggregate shape (issue #4847). Populated from whichever
+   * `tokens.snapshot` shape the input records actually carry — empty when
+   * every record was the per-account shape, and vice versa. */
+  poolSamples: PoolSample[];
+  poolCurves: PoolBurnCurve[];
+  poolHealth: PoolHealthSummary[];
 }
 
 export interface ComputeOptions {
@@ -68,22 +84,28 @@ export interface ComputeOptions {
   now?: number;
 }
 
-/** Partition a history page into the two record families and run all three
- * analytics over them. Pure — no DOM, no network — so the whole computation is
- * unit-testable from fixtures. */
+/** Partition a history page into its record families and run every analytic
+ * over them — both the per-account family and the pool-aggregate family, so
+ * this one function serves either surface. Pure — no DOM, no network — so the
+ * whole computation is unit-testable from fixtures. */
 export function computeTokenAnalytics(
   records: readonly HistoryEnvelope[],
   options: ComputeOptions = {},
 ): TokenAnalytics {
   const samples = parseTokenSamples(records);
+  const poolSamples = parsePoolSamples(records);
   const sweeps = parseSweepWindows(records);
   const curves = buildBurnCurves(samples);
+  const poolCurves = buildPoolBurnCurves(poolSamples);
   return {
     curves,
     forecasts: forecastAccounts(curves, { now: options.now }),
     attribution: attributeUsageToRepos(samples, sweeps, { now: options.now }),
     samples,
     sweeps,
+    poolSamples,
+    poolCurves,
+    poolHealth: summarizePoolHealths(poolCurves),
   };
 }
 
@@ -129,28 +151,32 @@ export interface RenderOptions extends ComputeOptions {
 /**
  * Render the panel into `container` (replacing its contents).
  *
- * Returns `false` without rendering any analytics when the surface is not the
- * authenticated one — the enforcement point for this issue's public-exposure
- * decision (see the module doc). The container instead gets a short notice, so
- * a public page shows an intentional "withheld" state rather than an empty
- * hole that looks like a bug.
+ * Always renders `true` — every surface gets real content now (see the
+ * module doc). On a `"public"` surface it renders the pool-level blocks
+ * (`analytics.poolCurves` / `analytics.poolHealth`) plus a short notice
+ * naming the two blocks that stay operator-only, instead of the per-account
+ * burn curves, forecasts and attribution table an authenticated surface gets.
  */
 export function renderTokenAnalytics(
   container: HTMLElement,
   analytics: TokenAnalytics,
   options: RenderOptions = {},
 ): boolean {
-  const surface = options.surface ?? REQUIRED_SURFACE;
+  const surface = options.surface ?? DEFAULT_SURFACE;
   container.replaceChildren();
-
-  if (surface !== REQUIRED_SURFACE) {
-    container.appendChild(renderWithheldNotice());
-    return false;
-  }
 
   const now = options.now ?? Date.now();
   const section = el("section", "analytics");
   section.appendChild(el("h2", "analytics__title", "Token & cost analytics"));
+
+  if (surface === "public") {
+    section.appendChild(renderPoolBurn(analytics.poolCurves));
+    section.appendChild(renderPoolHealth(analytics.poolHealth));
+    section.appendChild(renderOperatorOnlyNotice());
+    container.appendChild(section);
+    return true;
+  }
+
   section.appendChild(renderBurnCurves(analytics.curves));
   section.appendChild(renderForecasts(analytics.forecasts, now));
   section.appendChild(renderAttribution(analytics.attribution));
@@ -158,20 +184,17 @@ export function renderTokenAnalytics(
   return true;
 }
 
-function renderWithheldNotice(): HTMLElement {
-  const notice = el("section", "analytics analytics--withheld");
-  notice.setAttribute("data-testid", "analytics-withheld");
-  notice.appendChild(el("h2", "analytics__title", "Token & cost analytics"));
-  notice.appendChild(
-    el(
-      "p",
-      "analytics__note",
-      "Per-account detail is operator-only: account identifiers, per-repo attribution and " +
-        "per-account exhaustion forecasts are not shown in the public view. Fleet-level " +
-        "pool load (accounts in use, how many are exhausted, peak usage) is on the host " +
-        "cards above. Sign in for the full breakdown.",
-    ),
+/** The block that replaces `analytics--withheld`'s old full-panel notice: the
+ * public surface now renders real content above this, so the notice only has
+ * to explain the two blocks that are still missing (see the module doc). */
+function renderOperatorOnlyNotice(): HTMLElement {
+  const notice = el(
+    "p",
+    "analytics__note analytics__note--withheld",
+    "Per-repo attribution and per-account exhaustion forecasts are operator-only — they name " +
+      "repositories and individual accounts. Sign in for the full breakdown.",
   );
+  notice.setAttribute("data-testid", "analytics-operator-only-notice");
   return notice;
 }
 
@@ -279,6 +302,170 @@ function renderSegmentLine(
     points.map((point) => `${x(point.at).toFixed(2)},${y(point.usageFraction).toFixed(2)}`).join(" "),
   );
   return line;
+}
+
+// --- Pool-level burn (public surface — issue #4847) -------------------------
+
+/** The public-surface counterpart of `renderBurnCurves`: one card per host,
+ * built from the pool aggregate rather than per-account curves — see the
+ * module doc for what "pool-level" means here and why it names no account. */
+function renderPoolBurn(curves: readonly PoolBurnCurve[]): HTMLElement {
+  const block = el("div", "analytics__block");
+  block.setAttribute("data-testid", "pool-burn");
+  block.appendChild(el("h3", "analytics__heading", "Fleet token-pool load"));
+
+  if (curves.length === 0) {
+    block.appendChild(el("p", "analytics__note", "No tokens.snapshot history in range."));
+    return block;
+  }
+
+  const list = el("div", "burn-grid");
+  for (const curve of curves) list.appendChild(renderPoolBurnCard(curve));
+  block.appendChild(list);
+  block.appendChild(
+    el(
+      "p",
+      "analytics__note",
+      "Mean and peak usage across every account in this host's pool — never any one account's. " +
+        "Peak usage is the solid line, mean usage the dashed one.",
+    ),
+  );
+  return block;
+}
+
+function renderPoolBurnCard(curve: PoolBurnCurve): HTMLElement {
+  const exhausted = curve.exhaustedCount > 0;
+  const card = el("article", `burn-card${exhausted ? " burn-card--exhausted" : ""}`);
+  card.setAttribute("data-host", curve.hostId);
+  card.setAttribute("data-exhausted-count", String(curve.exhaustedCount));
+  card.setAttribute("data-account-count", String(curve.accountCount));
+
+  const head = el("header", "burn-card__head");
+  head.appendChild(el("span", "burn-card__account", curve.hostId));
+  if (exhausted) {
+    const badge = el("span", "badge badge--exhausted", `${curve.exhaustedCount}/${curve.accountCount} exhausted`);
+    badge.setAttribute("data-testid", "pool-exhausted-badge");
+    badge.setAttribute("role", "status");
+    head.appendChild(badge);
+  }
+  card.appendChild(head);
+
+  card.appendChild(renderPoolSparkline(curve));
+
+  const latest = curve.points[curve.points.length - 1];
+  const foot = el("footer", "burn-card__foot");
+  foot.appendChild(el("span", "burn-card__usage", `peak ${formatPercent(latest?.maxUsageFraction)}`));
+  foot.appendChild(el("span", "burn-card__usage", `mean ${formatPercent(latest?.meanUsageFraction)}`));
+  foot.appendChild(el("span", "burn-card__at", formatInstant(curve.latestAt || undefined)));
+  card.appendChild(foot);
+  return card;
+}
+
+/** Pool-level counterpart of `renderSparkline`: two lines per segment (peak,
+ * mean) instead of one, same `[0, 1]`-pinned y-axis and per-segment breaks. */
+function renderPoolSparkline(curve: PoolBurnCurve): SVGSVGElement {
+  const svg = document.createElementNS(SVG_NS, "svg");
+  svg.setAttribute("class", "sparkline");
+  svg.setAttribute("viewBox", `0 0 ${SPARK_WIDTH} ${SPARK_HEIGHT}`);
+  svg.setAttribute("role", "img");
+  svg.setAttribute("preserveAspectRatio", "none");
+  const latest = curve.points[curve.points.length - 1];
+  svg.setAttribute(
+    "aria-label",
+    `${curve.hostId} pool usage over time, latest peak ${formatPercent(latest?.maxUsageFraction)}, ` +
+      `mean ${formatPercent(latest?.meanUsageFraction)}`,
+  );
+
+  const first = curve.points[0];
+  const last = curve.points[curve.points.length - 1];
+  if (!first || !last) return svg;
+
+  const span = Math.max(last.at - first.at, 1);
+  const x = (at: number): number => ((at - first.at) / span) * SPARK_WIDTH;
+  const y = (usage: number): number => SPARK_HEIGHT - usage * SPARK_HEIGHT;
+
+  for (const segment of curve.segments) {
+    svg.appendChild(renderPoolSegmentLine(segment, x, y, (point) => point.maxUsageFraction, "sparkline__line"));
+    svg.appendChild(
+      renderPoolSegmentLine(segment, x, y, (point) => point.meanUsageFraction, "sparkline__line sparkline__line--mean"),
+    );
+  }
+  return svg;
+}
+
+function renderPoolSegmentLine(
+  segment: PoolBurnSegment,
+  x: (at: number) => number,
+  y: (usage: number) => number,
+  select: (point: PoolBurnPoint) => number | undefined,
+  className: string,
+): SVGPolylineElement {
+  const line = document.createElementNS(SVG_NS, "polyline");
+  line.setAttribute("class", className);
+
+  const usable: Array<{ at: number; value: number }> = [];
+  for (const point of segment.points) {
+    const value = select(point);
+    if (value !== undefined) usable.push({ at: point.at, value });
+  }
+  // A single usable point has no line to draw; duplicating it renders a
+  // visible dot rather than silently vanishing (mirrors `renderSegmentLine`).
+  const only = usable[0];
+  const points = usable.length === 1 && only ? [only, only] : usable;
+  line.setAttribute("points", points.map((point) => `${x(point.at).toFixed(2)},${y(point.value).toFixed(2)}`).join(" "));
+  return line;
+}
+
+/** The public-surface counterpart of `renderForecasts`: pool exhaustion state
+ * *as measured*, never projected — see `forecast.ts`'s `summarizePoolHealth`
+ * module doc for why a mean-based ETA is not drawn here. */
+function renderPoolHealth(summaries: readonly PoolHealthSummary[]): HTMLElement {
+  const block = el("div", "analytics__block");
+  block.setAttribute("data-testid", "pool-health");
+  block.appendChild(el("h3", "analytics__heading", "Pool exhaustion"));
+
+  if (summaries.length === 0) {
+    block.appendChild(el("p", "analytics__note", "No accounts observed in range."));
+    return block;
+  }
+
+  const table = el("table", "table table--pool-health");
+  table.appendChild(headerRow(["Host", "Accounts", "Exhausted", "Peak usage", "Mean usage", "Capacity returns"]));
+  const tbody = document.createElement("tbody");
+
+  for (const summary of summaries) {
+    const row = document.createElement("tr");
+    row.setAttribute("data-host", summary.hostId);
+    if (summary.exhaustedFraction !== undefined && summary.exhaustedFraction > 0) row.className = "row--at-risk";
+    cell(row, summary.hostId, "cell--host");
+    cell(row, String(summary.accountCount));
+    cell(
+      row,
+      summary.exhaustedFraction === undefined
+        ? UNKNOWN
+        : `${summary.exhaustedCount} (${formatPercent(summary.exhaustedFraction)})`,
+    );
+    cell(row, formatPercent(summary.maxUsageFraction));
+    cell(row, formatPercent(summary.meanUsageFraction));
+    // "Capacity returns" names no account — the earliest reset across the
+    // whole pool — so it is safe on the public surface even though no
+    // per-account forecast is drawn (see the note below the table).
+    cell(row, formatInstant(summary.nextLimitWindowResetAt));
+    tbody.appendChild(row);
+  }
+
+  table.appendChild(tbody);
+  block.appendChild(table);
+  const note = el(
+    "p",
+    "analytics__note",
+    "No exhaustion timing is projected here: a pool-wide mean can sit comfortably mid-range while one " +
+      "account is a sample away from running dry, and averaging that away would make a forecast actively " +
+      "misleading. Sign in for a per-account burn-rate projection.",
+  );
+  note.setAttribute("data-testid", "pool-forecast-decision");
+  block.appendChild(note);
+  return block;
 }
 
 // --- Forecasts -------------------------------------------------------------
@@ -439,19 +626,16 @@ const DEFAULT_LOOKBACK_MS = 24 * 60 * 60 * 1000;
 /**
  * Fetch, compute and render the panel. The one call an app shell needs.
  *
- * On a non-authenticated surface it renders the withheld notice and **makes no
- * request at all** — the panel does not merely hide data it already fetched.
+ * Fetches from `/public/history` on a `"public"` surface, `/api/history`
+ * otherwise (`api.ts`'s `surface` option) — never the other route, on either
+ * surface. Both surfaces render real content (see the module doc); there is
+ * no longer a surface that renders without fetching.
  */
 export async function mountTokenAnalytics(
   container: HTMLElement,
   options: MountOptions = {},
 ): Promise<TokenAnalytics | undefined> {
-  const surface = options.surface ?? REQUIRED_SURFACE;
-  if (surface !== REQUIRED_SURFACE) {
-    container.replaceChildren(renderWithheldNotice());
-    return undefined;
-  }
-
+  const surface = options.surface ?? DEFAULT_SURFACE;
   const now = options.now ?? Date.now();
   container.replaceChildren(el("p", "analytics__note", "Loading token analytics…"));
 
@@ -461,6 +645,7 @@ export async function mountTokenAnalytics(
       since: now - (options.lookbackMs ?? DEFAULT_LOOKBACK_MS),
       fetchImpl: options.fetchImpl,
       signal: options.signal,
+      surface,
     });
   } catch (error) {
     container.replaceChildren(

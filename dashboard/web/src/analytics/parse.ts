@@ -1,6 +1,7 @@
 /**
- * Narrowing layer: raw `GET /api/history` JSON → the domain shapes in
- * `types.ts` (Epic #4702, Phase 3, issue #4752).
+ * Narrowing layer: raw `GET /api/history` / `GET /public/history` JSON → the
+ * domain shapes in `types.ts` (Epic #4702, Phase 3, issue #4752; the
+ * `/public/history` aggregate shape added in issue #4847).
  *
  * Every function here is total: it never throws on malformed input, it drops
  * what it cannot understand. That is a deliberate contract, not laziness —
@@ -12,12 +13,21 @@
  * measurement stays absent.** It is never coerced to `0`, because `0` means
  * "measured, and it is zero" everywhere downstream (a `usage_fraction` of 0 is
  * a fresh limit window; an unknown one must not be drawn as one).
+ *
+ * `tokens.snapshot` has two disjoint wire shapes depending on which route
+ * served it (`../../docs/query-api.md`): `/api/history` sends per-account
+ * rows (`parseTokenSample`), `/public/history` sends the non-identifying
+ * pool aggregate (`parsePoolSample`). A page is never a mix of the two, but
+ * both parsers are safe to run over any page regardless — each recognizes
+ * only the shape it owns and returns `undefined` for the other.
  */
 
 import type {
   AccountReading,
   HistoryEnvelope,
+  PoolSample,
   SweepWindow,
+  TokenPoolAggregatePayload,
   TokenSample,
   TokensSnapshotPayload,
 } from "./types.js";
@@ -78,6 +88,54 @@ export function parseTokenSamples(envelopes: readonly HistoryEnvelope[]): TokenS
   const withOrder: Array<{ sample: TokenSample; id: number }> = [];
   for (const envelope of envelopes) {
     const sample = parseTokenSample(envelope);
+    if (sample) withOrder.push({ sample, id: envelope.id });
+  }
+  withOrder.sort((a, b) => a.sample.at - b.sample.at || a.id - b.id);
+  return withOrder.map((entry) => entry.sample);
+}
+
+/**
+ * Narrow one `tokens.snapshot` history record shaped as
+ * {@link TokenPoolAggregatePayload} — the `/public/history` form
+ * (`../../docs/query-api.md`), with no per-account detail at all (issue
+ * #4847).
+ *
+ * Returns `undefined` when the record has no usable timestamp, **or when it
+ * is not the aggregate shape** (no numeric `account_count`) — that is
+ * exactly what an authenticated `accounts[]`-carrying record looks like, and
+ * `parseTokenSample` above owns that shape. The two parsers are total and
+ * disjoint on purpose: a caller can run both over the same page and each
+ * only claims the records it understands, never throwing on the other's.
+ */
+export function parsePoolSample(envelope: HistoryEnvelope): PoolSample | undefined {
+  if (envelope.kind !== "tokens.snapshot") return undefined;
+  const payload = envelope.record as TokenPoolAggregatePayload;
+  const at = parseTimestamp(payload?.captured_at) ?? parseTimestamp(envelope.emittedAt);
+  if (at === undefined) return undefined;
+
+  const accountCount = parseFiniteNumber(payload?.account_count);
+  if (accountCount === undefined) return undefined;
+
+  return {
+    hostId: envelope.hostId,
+    at,
+    accountCount,
+    // `exhausted_count` is a count the backend always computes (defaulting to
+    // 0), never an unmeasured probe — unlike the usage fractions below, an
+    // absent/malformed value here reads as 0, not "unknown".
+    exhaustedCount: parseFiniteNumber(payload?.exhausted_count) ?? 0,
+    meanUsageFraction: parseFiniteNumber(payload?.mean_usage_fraction),
+    maxUsageFraction: parseFiniteNumber(payload?.max_usage_fraction),
+    nextLimitWindowResetAt: parseTimestamp(payload?.next_limit_window_reset_at),
+  };
+}
+
+/** Narrow every `tokens.snapshot` in a history page as pool aggregates,
+ * oldest-first — the pool-level counterpart of {@link parseTokenSamples}. */
+export function parsePoolSamples(envelopes: readonly HistoryEnvelope[]): PoolSample[] {
+  const withOrder: Array<{ sample: PoolSample; id: number }> = [];
+  for (const envelope of envelopes) {
+    const sample = parsePoolSample(envelope);
     if (sample) withOrder.push({ sample, id: envelope.id });
   }
   withOrder.sort((a, b) => a.sample.at - b.sample.at || a.id - b.id);

@@ -84,6 +84,45 @@ export function tokensSnapshot(
   };
 }
 
+export interface PoolFixture {
+  accountCount: number;
+  exhaustedCount?: number;
+  meanUsage?: number;
+  maxUsage?: number;
+  nextResetAt?: number;
+}
+
+/**
+ * One `tokens.snapshot` history envelope in the `/public/history` aggregate
+ * shape (`../../docs/query-api.md`'s "GET /api/history / /public/history"
+ * section) — no `accounts[]` at all, only the pool-wide summary
+ * `../src/redaction.ts`'s `deriveTokenPoolAggregate` computes. `meanUsage` /
+ * `maxUsage` / `nextResetAt` are omitted (serialized as `null`, matching the
+ * backend's own "measured but none reported" contract) when undefined, the
+ * aggregate counterpart of `tokensSnapshot`'s "omit when unknown" convention.
+ */
+export function poolTokensSnapshot(at: number, pool: PoolFixture, hostId = "host-a"): HistoryEnvelope {
+  return {
+    id: nextId++,
+    emittedAt: new Date(at).toISOString(),
+    hostId,
+    kind: "tokens.snapshot",
+    repo: null,
+    visibility: "private",
+    issue: null,
+    sweepId: null,
+    record: {
+      kind: "tokens.snapshot",
+      captured_at: new Date(at).toISOString(),
+      account_count: pool.accountCount,
+      exhausted_count: pool.exhaustedCount ?? 0,
+      mean_usage_fraction: pool.meanUsage ?? null,
+      max_usage_fraction: pool.maxUsage ?? null,
+      next_limit_window_reset_at: pool.nextResetAt !== undefined ? new Date(pool.nextResetAt).toISOString() : null,
+    },
+  };
+}
+
 export interface SweepFixture {
   sweepId: string;
   repo: string;

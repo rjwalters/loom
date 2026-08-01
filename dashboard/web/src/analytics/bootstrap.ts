@@ -40,7 +40,9 @@ import type { DashboardSurface } from "./render.js";
  *
  * Fails closed to `"public"`: `isAuthenticatedViewer` treats a missing or
  * malformed flag as anonymous, so a page that never got the injection renders
- * the withheld notice rather than firing an authenticated request.
+ * the pool-level public panel (`render.ts`) and fetches from `/public/history`
+ * rather than firing an authenticated request it has no evidence it is
+ * entitled to.
  */
 export function currentSurface(scope: typeof globalThis = globalThis): DashboardSurface {
   return isAuthenticatedViewer(scope) ? "authenticated" : "public";

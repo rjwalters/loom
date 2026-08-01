@@ -37,7 +37,7 @@
  * than an invented window length.
  */
 
-import type { AccountBurnCurve, BurnPoint } from "./burn.js";
+import type { AccountBurnCurve, BurnPoint, PoolBurnCurve } from "./burn.js";
 
 export type ForecastStatus =
   /** The daemon reports the account as exhausted right now. */
@@ -186,4 +186,68 @@ function leastSquares(points: readonly BurnPoint[]): LinearFit {
   const slopePerMs = sxx === 0 ? 0 : sxy / sxx;
   const relativeIntercept = meanY - slopePerMs * meanX;
   return { slopePerMs, intercept: relativeIntercept - slopePerMs * t0 };
+}
+
+// ---------------------------------------------------------------------------
+// Pool-level "forecast": a deliberate decision not to project (issue #4847)
+// ---------------------------------------------------------------------------
+
+/**
+ * The public surface gets a pool-wide `tokens.snapshot` aggregate
+ * (`mean_usage_fraction` / `max_usage_fraction` / `exhausted_count`), not a
+ * per-account series — see `../../docs/token-analytics.md`. Fitting the same
+ * least-squares projection above to `mean_usage_fraction` was considered and
+ * rejected: a pool-wide mean can sit comfortably mid-range while one account
+ * in the pool is a single sample away from exhaustion, so a trend line
+ * through the mean would read as reassuring exactly when it should not.
+ * Averaging the input away is not a smaller version of the per-account
+ * forecast, it is a different, misleading question — "will the average
+ * account run dry", when the actual risk is "will *any* account run dry".
+ *
+ * So there is no `projectedExhaustionAt` here. Instead this reports the
+ * pool's exhaustion state *as measured*, right now: how many of its accounts
+ * are exhausted, and how loaded its busiest one is — both `exhausted_count`
+ * and `max_usage_fraction` are already the honest, non-averaged answer to
+ * "how much trouble is this pool in" that a mean-based ETA would only
+ * obscure. `render.ts` renders this instead of a chart, and says why the
+ * chart is missing rather than leaving a silent gap.
+ */
+export interface PoolHealthSummary {
+  hostId: string;
+  /** Pool size / exhausted count as of the newest sample. */
+  accountCount: number;
+  exhaustedCount: number;
+  /** `exhaustedCount / accountCount`, or `undefined` when the pool is empty
+   * (never a misleading `0`). */
+  exhaustedFraction?: number;
+  /** The newest sample's peak/mean usage across the pool, when reported. */
+  maxUsageFraction?: number;
+  meanUsageFraction?: number;
+  /** Epoch ms of the earliest limit-window reset across the pool, when
+   * known — "capacity returns at" names no account, unlike a per-account
+   * `limitWindowResetAt`, so it is safe to show alongside this summary even
+   * though no ETA is projected from it. */
+  nextLimitWindowResetAt?: number;
+}
+
+/** Summarize one host's pool curve. Reads the curve's own latest-sample
+ * fields for account/exhausted counts (present even when no usage figure was
+ * reported that sample) and the newest plottable point for the usage
+ * figures (absent when none was). */
+export function summarizePoolHealth(curve: PoolBurnCurve): PoolHealthSummary {
+  const latest = curve.points[curve.points.length - 1];
+  return {
+    hostId: curve.hostId,
+    accountCount: curve.accountCount,
+    exhaustedCount: curve.exhaustedCount,
+    exhaustedFraction: curve.accountCount > 0 ? curve.exhaustedCount / curve.accountCount : undefined,
+    maxUsageFraction: latest?.maxUsageFraction,
+    meanUsageFraction: latest?.meanUsageFraction,
+    nextLimitWindowResetAt: latest?.nextLimitWindowResetAt,
+  };
+}
+
+/** Summarize every pool curve, preserving `buildPoolBurnCurves`' ordering. */
+export function summarizePoolHealths(curves: readonly PoolBurnCurve[]): PoolHealthSummary[] {
+  return curves.map(summarizePoolHealth);
 }
