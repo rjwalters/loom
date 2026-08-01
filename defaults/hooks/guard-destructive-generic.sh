@@ -962,6 +962,62 @@ _any_managed_worktree_exists() {
 }
 
 # =============================================================================
+# mark_expandable_dollars() — rewrite a raw write-target token into its
+# "effective path shape" (#4921).
+#
+# extract_write_targets() is a TOKENIZER, not a shell evaluator: a token is
+# emitted with its quote characters copied verbatim (qsplit's contract) and
+# with every `$…` reference unexpanded. Before the write-confinement block can
+# reason about WHERE a token lands, it needs to know which `$` characters the
+# real shell would actually expand — a `$` inside a SINGLE-quoted span, or one
+# preceded by a backslash, is literal data (a file really named `$X`), while a
+# bare or DOUBLE-quoted `$` is an expansion the guard cannot resolve.
+#
+# Emits (in the global _MARKED_TOKEN) the token with:
+#   - quote characters removed (so `"$A"/x`, `"$A/x"` and `$A/x` all normalize
+#     to the same shape and quoting cannot be used to dodge the shape tests),
+#   - backslash escapes applied (the backslash dropped, the escaped character
+#     kept literal),
+#   - every EXPANDABLE `$` replaced by SOH (0x01) — a character no real path
+#     produced by this tokenizer contains — while a LITERAL `$` stays a `$`.
+#
+# A global rather than a subshell echo: this runs per write target and the
+# callers are already in a `while read` loop.
+# =============================================================================
+_MARKED_TOKEN=""
+mark_expandable_dollars() {
+    local tok="$1"
+    local out="" c
+    local n=${#tok}
+    local i=0 in_s=0 in_d=0
+    while [[ $i -lt $n ]]; do
+        c="${tok:i:1}"
+        if [[ $in_s -eq 1 ]]; then
+            # Inside '…': nothing expands; only the closing quote is special.
+            if [[ "$c" == "'" ]]; then in_s=0; else out+="$c"; fi
+            i=$((i + 1))
+            continue
+        fi
+        case "$c" in
+            "'")
+                if [[ $in_d -eq 1 ]]; then out+="$c"; else in_s=1; fi ;;
+            '"')
+                if [[ $in_d -eq 1 ]]; then in_d=0; else in_d=1; fi ;;
+            '\')
+                # Escapes the NEXT character (a trailing backslash is dropped).
+                i=$((i + 1))
+                [[ $i -lt $n ]] && out+="${tok:i:1}" ;;
+            '$')
+                out+=$'\001' ;;
+            *)
+                out+="$c" ;;
+        esac
+        i=$((i + 1))
+    done
+    _MARKED_TOKEN="$out"
+}
+
+# =============================================================================
 # force-op branch-scope toggle — default ALL (preserve current behaviour).
 #
 # The three generic force-op ASK patterns (git push --force / -f /
@@ -2361,6 +2417,46 @@ if worktree_isolation_guard_enabled && \
     [[ -n "$_WT_MAIN_ROOT" ]] || _WT_MAIN_ROOT="$REPO_ROOT"
     [[ -n "$_WT_MAIN_ROOT_LOGICAL" ]] || _WT_MAIN_ROOT_LOGICAL="$_WT_MAIN_ROOT"
 
+    # "Worktree isolation is actually in play for this repo/session" — a
+    # managed worktree exists somewhere under the worktree base derived from
+    # the SAME main-checkout root the containment tests use. Resolved lazily
+    # and cached, so a command with no confinement-relevant target never pays
+    # for the find(1). Defined here (inside the block) because it reads the
+    # block-local _WT_MAIN_ROOT / _WT_WRITE_BASE* state.
+    _wt_isolation_in_play() {
+        if [[ -z "$_WT_WRITE_BASE_DONE" ]]; then
+            _WT_WRITE_BASE=$(resolve_worktree_root "$_WT_MAIN_ROOT")
+            _WT_WRITE_BASE_DONE=1
+        fi
+        _any_managed_worktree_exists "$_WT_WRITE_BASE"
+    }
+
+    # True if $1 (an absolute, normalized path) sits anywhere in the area this
+    # guard protects: inside a managed worktree, inside the main checkout
+    # (either spelling), or under the configured worktree base (which may live
+    # on an external volume, outside the main checkout entirely).
+    _wt_in_protected_area() {
+        local _p="$1"
+        [[ -n "$_p" ]] || return 1
+        _in_any_managed_worktree "$_p" && return 0
+        if [[ -n "$_WT_MAIN_ROOT" ]]; then
+            case "$_p" in
+                "$_WT_MAIN_ROOT"|"$_WT_MAIN_ROOT"/*) return 0 ;;
+                "$_WT_MAIN_ROOT_LOGICAL"|"$_WT_MAIN_ROOT_LOGICAL"/*) return 0 ;;
+            esac
+        fi
+        if [[ -z "$_WT_WRITE_BASE_DONE" ]]; then
+            _WT_WRITE_BASE=$(resolve_worktree_root "$_WT_MAIN_ROOT")
+            _WT_WRITE_BASE_DONE=1
+        fi
+        if [[ -n "$_WT_WRITE_BASE" ]]; then
+            case "$_p" in
+                "$_WT_WRITE_BASE"|"$_WT_WRITE_BASE"/*) return 0 ;;
+            esac
+        fi
+        return 1
+    }
+
     WRITE_TARGETS=$(extract_write_targets "$COMMAND_ASK_SCAN" "$CWD" | head -20)
     while IFS=$'\037' read -r _wcwd _wtarget; do
         [[ -z "$_wtarget" ]] && continue
@@ -2373,6 +2469,127 @@ if worktree_isolation_guard_enabled && \
         # expand_leading_tilde()'s doc comment) — no change to their
         # existing repo-relative treatment.
         _wtarget=$(expand_leading_tilde "$_wtarget")
+
+        # -------------------------------------------------------------
+        # Unresolved `$…` write targets must fail CLOSED, in every cwd (#4921)
+        #
+        # extract_write_targets() never expands variables; a target it cannot
+        # resolve is emitted as the RAW token (`$A/evil.sh`). The resolution
+        # below then treats that literal as a relative path and cwd-prefixes
+        # it — which fabricates a location the write will not actually have.
+        # From a MAIN-CHECKOUT cwd that fabrication happened to land inside
+        # the main checkout, so the containment test denied and the token was
+        # (accidentally) fail-closed. From a LINKED-WORKTREE cwd — the
+        # canonical builder setup, `cd .loom/worktrees/issue-N` — the very
+        # same fabrication instead walks straight back up into the acting
+        # worktree's own `.loom-managed` sentinel, so check (a) below ALLOWED
+        # it before the main-root containment test ever ran, no matter what
+        # the variable would expand to at runtime (#4921). That silently
+        # defeated the fail-closed backstop for every unresolvable `$` shape
+        # (`$(...)`, `${VAR:-x}`, an inherited env var, a chained or
+        # conflicting same-command assignment) in the ONE operating mode the
+        # #4178 guard exists to protect.
+        #
+        # So: decide on the token's SHAPE before trusting either test. A
+        # target is denial-worthy when the unexpanded `$` makes its LOCATION
+        # (not merely its filename) unknowable:
+        #
+        #   (1) the token IS a variable from the root down — it either starts
+        #       with an expandable `$` (`> $DEST`, `tee "${OUT}"`,
+        #       `> $(mktemp)`) or starts with `/$` (`> /$X`, `> /$X/evil`).
+        #       The path root itself is unknown, so the variable may hold (or
+        #       complete) an absolute path into the main checkout and the cwd
+        #       prefix is pure invention. Denied regardless of where cwd is.
+        #   (2) an expandable `$` appears in a DIRECTORY component of the
+        #       resolved path (`> $A/evil`, `> ./$A/evil`, `cd $A && > f`)
+        #       AND the known prefix — everything before the first `$`, i.e.
+        #       the only part that is a real path — is inside the area this
+        #       guard protects, or there is no usable known prefix at all
+        #       (it is relative, or it normalizes to `/` as in
+        #       `> /tmp/../$A/evil`). An unknown directory component under the
+        #       repo can resolve into the main checkout (directly, or via
+        #       `..`), and neither the sentinel walk-up nor the containment
+        #       test can see it.
+        #
+        # Deliberately NOT denied (no new false positives — these keep their
+        # existing treatment):
+        #   - a `$` only in the FINAL component (`> out-$STAMP.log`,
+        #     `sed -i s/a/b/ src/$f`): the directory is fully known and really
+        #     is cwd-relative, so the sentinel check (a) and the main-root
+        #     containment test below are meaningful again.
+        #   - a known prefix OUTSIDE the protected area (`> /tmp/$D/f.log`):
+        #     the write lands where this guard protects nothing.
+        #   - a LITERAL `$` the shell would never expand — inside a
+        #     single-quoted span or backslash-escaped (`> '$A/evil'`) — which
+        #     really is a relative path to a file named `$A` (mirrors the
+        #     quoted-tilde treatment in expand_leading_tilde, #4382).
+        #
+        # Fail-open contract is preserved: like every other deny in this
+        # block, it only fires when a managed worktree actually exists for
+        # this repo (_wt_isolation_in_play).
+        # -------------------------------------------------------------
+        if [[ "$_wtarget" == *'$'* || "$_wcwd" == *'$'* ]]; then
+            mark_expandable_dollars "$_wtarget"
+            _wmarked="$_MARKED_TOKEN"
+            # The cwd itself can carry the unexpanded `$` instead of the
+            # target (`cd $A && echo x > f.sh` — extract_write_targets threads
+            # the unresolved `cd` argument into curcwd), so mark it too and
+            # judge the JOINED path. A cwd that is absolute and `$`-free
+            # marks to itself, leaving every existing case byte-identical.
+            _wmarkedcwd=""
+            if [[ -n "$_wcwd" ]]; then
+                mark_expandable_dollars "$_wcwd"
+                _wmarkedcwd="$_MARKED_TOKEN"
+            fi
+            if [[ "$_wmarked" == *$'\001'* || ( "$_wmarked" != /* && "$_wmarkedcwd" == *$'\001'* ) ]]; then
+                # (1) Root unknown — the token is a variable from the root
+                # down (`$DEST`, `$(mktemp)`) or is root + a variable
+                # (`/$X`, `/$X/evil`, whose runtime value picks the top-level
+                # directory — the main checkout's own included).
+                if [[ "$_wmarked" == $'\001'* || "$_wmarked" == /$'\001'* ]]; then
+                    if _wt_isolation_in_play; then
+                        deny "BLOCKED: Bash-tool write target '${_wtarget}' is an unexpanded shell variable from the path root down, so this guard cannot tell where the write lands — it may resolve to an absolute path inside the main repository checkout ('${_WT_MAIN_ROOT}'), and a Loom-managed worktree exists in this repository. Unresolvable write targets fail closed (#4921). Write to an explicit literal path — inside your issue worktree (.loom/worktrees/issue-<N>) for repo files, or a spelled-out /tmp path for scratch. (#4178)" "worktree-write-confinement-unresolved-var"
+                    fi
+                    continue
+                fi
+                # (2) Unknown DIRECTORY component. Build the effective path
+                # the same way the resolution below does (cwd-joined when
+                # relative), then test only the KNOWN prefix — everything
+                # before the first unexpanded `$`, trimmed to its directory.
+                _weff=""
+                if [[ "$_wmarked" == /* ]]; then
+                    _weff="$_wmarked"
+                elif [[ -n "$_wmarkedcwd" ]]; then
+                    _weff="$_wmarkedcwd/$_wmarked"
+                fi
+                _wdirpart=""
+                [[ "$_weff" == */* ]] && _wdirpart="${_weff%/*}"
+                if [[ "$_wdirpart" == *$'\001'* ]]; then
+                    _wknown="${_weff%%$'\001'*}"
+                    _wknown="${_wknown%/*}"
+                    # Normalize BEFORE judging: a `..` traversal in the known
+                    # prefix (`> /tmp/../$A/evil`) otherwise hands the test a
+                    # prefix that is not where the write actually starts.
+                    [[ "$_wknown" == /* ]] && _wknown=$(normalize_abs_path "$_wknown")
+                    if [[ "$_wknown" != /* || "$_wknown" == "/" ]]; then
+                        # No usable known prefix — either it is relative (no
+                        # cwd to join against) or it collapses to `/`, i.e.
+                        # the first real path component IS the variable
+                        # (`> /$A/evil`, `> /tmp/../$A/evil`), whose runtime
+                        # value picks a top-level directory, the main
+                        # checkout's own included. Same verdict as (1).
+                        if _wt_isolation_in_play; then
+                            deny "BLOCKED: Bash-tool write target '${_wtarget}' has an unexpanded shell variable as its first real path component, so this guard cannot tell where the write lands — it may resolve inside the main repository checkout ('${_WT_MAIN_ROOT}'), and a Loom-managed worktree exists in this repository. Unresolvable write targets fail closed (#4921). Write to an explicit literal path — inside your issue worktree (.loom/worktrees/issue-<N>) for repo files, or a spelled-out /tmp path for scratch. (#4178)" "worktree-write-confinement-unresolved-var"
+                        fi
+                    elif _wt_in_protected_area "$_wknown"; then
+                        if _wt_isolation_in_play; then
+                            deny "BLOCKED: Bash-tool write target '${_wtarget}' contains an unexpanded shell variable in a directory component, and its known prefix ('${_wknown}') is inside this repository's worktree/checkout area — this guard cannot tell whether the expanded path stays in your worktree or lands in the main repository checkout ('${_WT_MAIN_ROOT}'). Unresolvable write targets fail closed (#4921). Write to an explicit literal path — inside your issue worktree (.loom/worktrees/issue-<N>) for repo files, or a spelled-out /tmp path for scratch. (#4178)" "worktree-write-confinement-unresolved-var"
+                        fi
+                    fi
+                    continue
+                fi
+            fi
+        fi
 
         # Resolve to absolute; a relative target with no resolvable cwd is
         # ambiguous — skip it (allow on uncertainty, never deny on it).
@@ -2406,11 +2623,7 @@ if worktree_isolation_guard_enabled && \
         # unaffected, mirroring guard-worktree-paths.sh exactly. The worktree
         # base is resolved off the same main-checkout root so the "a managed
         # worktree exists" gate stays consistent with the containment test.
-        if [[ -z "$_WT_WRITE_BASE_DONE" ]]; then
-            _WT_WRITE_BASE=$(resolve_worktree_root "$_WT_MAIN_ROOT")
-            _WT_WRITE_BASE_DONE=1
-        fi
-        if _any_managed_worktree_exists "$_WT_WRITE_BASE"; then
+        if _wt_isolation_in_play; then
             deny "BLOCKED: Bash-tool write to '${_wabs}' resolves to the main repository checkout ('${_WT_MAIN_ROOT}'), but a Loom-managed worktree exists elsewhere in this repository (this check cannot verify it belongs to the acting session — see #4245). This is a worktree-isolation bypass via Bash redirection/tee/sed -i/cp/mv — do NOT retry the write through Bash. cd into your issue worktree (.loom/worktrees/issue-<N>) and write there instead. (#4178)" "worktree-write-confinement"
         fi
     done <<< "$WRITE_TARGETS"
