@@ -38,6 +38,8 @@ set -euo pipefail
 _LOOM_STATUS_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../lib/config-resolver.sh
 source "$_LOOM_STATUS_SCRIPT_DIR/../lib/config-resolver.sh"
+# shellcheck source=../lib/locate-daemon-bin.sh
+source "$_LOOM_STATUS_SCRIPT_DIR/../lib/locate-daemon-bin.sh"
 
 # Find repository root
 find_repo_root() {
@@ -292,27 +294,29 @@ read_terminals() {
 #     check when the daemon itself is unreachable -- a static file read
 #     still answers "is this repo registered?" even while the daemon is down.
 
-# Resolve the loom-daemon binary: LOOM_DAEMON_BIN override -> PATH -> in-repo
-# cargo build outputs. Mirrors loom-daemon-watchdog.sh's locate_daemon_bin()
-# / `./.loom/bin/loom health`'s resolution order verbatim, so this script and
-# those two never disagree about which binary is "the" daemon CLI. Echoes
-# the resolved path and returns 0, or returns 1 with nothing echoed.
+# Resolve the loom-daemon binary via the shared loom_locate_daemon_bin()
+# (lib/locate-daemon-bin.sh, #4875) — includes the machine-level
+# $LOOM_DAEMON_BIN_DIR (default ~/.local/bin) fallback, so this script,
+# loom-daemon-start.sh, loom-daemon-watchdog.sh, loom-daemon-update.sh, and
+# `./.loom/bin/loom health` all agree on which binary is "the" daemon CLI.
+# Preserves this function's original contract (thin wrapper): echoes the
+# resolved path and returns 0, or returns 1 with nothing echoed -- INCLUDING
+# the pre-#4875 behavior that an explicitly-set-but-non-executable
+# LOOM_DAEMON_BIN is a hard "not found" (unlike the other four call sites,
+# which fall through to PATH/machine-level/in-repo candidates in that case).
+# This script's own test suite uses LOOM_DAEMON_BIN=<bogus path> as a
+# deterministic "force no binary resolvable" sentinel that must NOT then pick
+# up a real installed binary via PATH or ~/.local/bin, so that contract is
+# preserved here explicitly rather than delegated wholesale.
 locate_daemon_bin() {
     if [[ -n "${LOOM_DAEMON_BIN:-}" ]]; then
         [[ -x "${LOOM_DAEMON_BIN}" ]] && { echo "${LOOM_DAEMON_BIN}"; return 0; }
         return 1
     fi
-    if command -v loom-daemon &>/dev/null; then
-        command -v loom-daemon
-        return 0
-    fi
-    local candidate
-    for candidate in \
-        "$REPO_ROOT/loom-daemon/target/release/loom-daemon" \
-        "$REPO_ROOT/loom-daemon/target/debug/loom-daemon"; do
-        [[ -x "$candidate" ]] && { echo "$candidate"; return 0; }
-    done
-    return 1
+    local bin
+    bin="$(unset LOOM_DAEMON_BIN; loom_locate_daemon_bin "$REPO_ROOT")"
+    [[ -n "$bin" ]] || return 1
+    echo "$bin"
 }
 
 # Query `loom-daemon status --json`. Echoes the JSON payload on success --

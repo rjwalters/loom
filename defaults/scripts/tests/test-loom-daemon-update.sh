@@ -185,6 +185,14 @@ new_fixture() {
     # its `calibrate` command substitution, so it must exist alongside the
     # fixture copy too.
     cp "$CLI_DIR/../lib/bounded-run.sh" "$root/.loom/scripts/lib/bounded-run.sh"
+    # Same for lib/locate-daemon-bin.sh (#4875): the fixture start script
+    # sources it relative to ITS OWN location to resolve the daemon binary
+    # under a minimal PATH, so every fixture flow that execs the copied
+    # loom-daemon-start.sh (restart, --relaunch, the full update run) needs it
+    # in the throwaway tree. Without it those flows abort with
+    # "locate-daemon-bin.sh not found at <fixture>/.loom/scripts/lib" before
+    # reaching the behaviour under test.
+    cp "$CLI_DIR/../lib/locate-daemon-bin.sh" "$root/.loom/scripts/lib/locate-daemon-bin.sh"
     cp "$LOOM_REPO_ROOT/scripts/install/provision-daemon.sh" "$root/scripts/install/provision-daemon.sh"
     cat > "$root/loom-daemon/Cargo.toml" <<'EOF'
 [package]

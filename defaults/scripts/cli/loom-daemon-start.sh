@@ -155,24 +155,21 @@ find_repo_root() {
 }
 
 # ---------- locate the daemon binary ----------
-locate_daemon_bin() {
-    local root="$1"
-    if [[ -n "${LOOM_DAEMON_BIN:-}" && -x "${LOOM_DAEMON_BIN}" ]]; then
-        echo "${LOOM_DAEMON_BIN}"; return 0
-    fi
-    if command -v loom-daemon >/dev/null 2>&1; then
-        command -v loom-daemon; return 0
-    fi
-    local candidate
-    for candidate in \
-        "$root/loom-daemon/target/release/loom-daemon" \
-        "$root/loom-daemon/target/debug/loom-daemon" \
-        "$root/target/release/loom-daemon" \
-        "$root/target/debug/loom-daemon"; do
-        if [[ -x "$candidate" ]]; then echo "$candidate"; return 0; fi
-    done
-    echo ""
-}
+# Shared with loom-daemon-watchdog.sh / loom-daemon-update.sh / loom-status.sh
+# / `.loom/bin/loom health` via lib/locate-daemon-bin.sh (#4875) so all five
+# never disagree about which binary is "the" daemon CLI, and a new candidate
+# path only needs to be added in that one file. Includes the machine-level
+# ~/.local/bin fallback so a non-interactive `ssh host 'cmd'` (which never
+# sources the login profile, so ~/.local/bin is not on PATH) still finds the
+# epic #3835 Phase 3a machine-level install.
+_LOOM_LOCATE_BIN_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" 2>/dev/null && pwd)"
+if [[ -r "$_LOOM_LOCATE_BIN_LIB_DIR/locate-daemon-bin.sh" ]]; then
+    # shellcheck source=../lib/locate-daemon-bin.sh
+    source "$_LOOM_LOCATE_BIN_LIB_DIR/locate-daemon-bin.sh"
+else
+    err "locate-daemon-bin.sh not found at $_LOOM_LOCATE_BIN_LIB_DIR — this checkout is missing an expected lib file."
+    exit 1
+fi
 
 # ---------- launchd plist rendering (#3972) ----------
 # Pure string rendering -- safe to call on ANY platform (used by
@@ -1114,10 +1111,11 @@ else
     exit 1
 fi
 
-DAEMON_BIN=$(locate_daemon_bin "$REPO_ROOT")
+DAEMON_BIN=$(loom_locate_daemon_bin "$REPO_ROOT")
 if [[ -z "$DAEMON_BIN" ]]; then
-    err "loom-daemon binary not found."
-    echo "Build it (cargo build --release -p loom-daemon) or set LOOM_DAEMON_BIN=/path/to/loom-daemon" >&2
+    err "loom-daemon binary not found. Checked:"
+    loom_daemon_bin_search_paths "$REPO_ROOT" | sed 's/^/  - /' >&2
+    echo "Build it (cargo build --release -p loom-daemon), install it to one of the paths above, or set LOOM_DAEMON_BIN=/path/to/loom-daemon" >&2
     exit 1
 fi
 
