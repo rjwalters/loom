@@ -646,7 +646,7 @@ itself and rewrites `auth.json` in place. Consequences:
 ## References
 
 - [`runtime-adapters.md`](runtime-adapters.md) — the seven-point contract and tier policy
-- [ADR-0012](../../docs/adr/0012-runtime-adapter-contract.md) — runtime adapter contract
+- [ADR-0012](https://github.com/rjwalters/loom/blob/main/docs/adr/0012-runtime-adapter-contract.md) — runtime adapter contract
 - [`guard-hooks.md`](guard-hooks.md) — the Loom guard catalog this maps against
 - `defaults/scripts/spawn-codex.sh` — the adapter
 - `defaults/scripts/lib/classify-error.sh` — the `codex` provider table

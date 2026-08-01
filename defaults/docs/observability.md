@@ -142,7 +142,7 @@ Durable Object for live "what's running now" state, an hourly retention
 cron) that also serves the dashboard UI as static assets. Full deploy
 runbook — Wrangler setup, D1 migrations, admin token, per-host ingest key
 provisioning, verifying telemetry lands — is
-[`dashboard/docs/deploy-runbook.md`](../../dashboard/docs/deploy-runbook.md).
+[`dashboard/docs/deploy-runbook.md`](https://github.com/rjwalters/loom/blob/main/dashboard/docs/deploy-runbook.md).
 This is **your own infrastructure**; nothing in Loom points at a shared
 backend by default.
 
@@ -160,9 +160,9 @@ dead-end login wall for an anonymous visitor.
 
 - Gating setup (custom domain requirement, route map, Access application
   config, the single-URL fallback mechanics):
-  [`dashboard/docs/cloudflare-access.md`](../../dashboard/docs/cloudflare-access.md)
+  [`dashboard/docs/cloudflare-access.md`](https://github.com/rjwalters/loom/blob/main/dashboard/docs/cloudflare-access.md)
 - Query API + live event tail, request/response shapes, pagination:
-  [`dashboard/docs/query-api.md`](../../dashboard/docs/query-api.md)
+  [`dashboard/docs/query-api.md`](https://github.com/rjwalters/loom/blob/main/dashboard/docs/query-api.md)
 - Token/cost analytics (burn curves, forecasting, per-repo attribution, and
   why that surface is authenticated-only): `dashboard/docs/token-analytics.md`
 
@@ -173,7 +173,7 @@ backend (not a shared Loom service — every fleet deploys its own). Its
 specific account/database IDs, Access application layout, credential file
 locations, and cutover history (the hostname-wide Access app was retired in
 favor of the single-URL `/login`-scoped layout on 2026-07-31) are recorded
-in [`dashboard/docs/reference-deployment.md`](../../dashboard/docs/reference-deployment.md)
+in [`dashboard/docs/reference-deployment.md`](https://github.com/rjwalters/loom/blob/main/dashboard/docs/reference-deployment.md)
 — useful as a concrete filled-in example of every value the deploy runbook
 asks you to supply, not as a second copy of the how-to.
 

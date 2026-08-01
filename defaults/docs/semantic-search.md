@@ -18,7 +18,7 @@ merged-PR history. Filed as the codecast-evaluation borrow-list item 2
 >   Nothing else in Loom does.
 > - Whether to port `loom-search` to Rust or retire the feature is an open
 >   product decision tracked in its own follow-up issue; see
->   [ADR-0013](../../docs/adr/0013-loom-tools-python-retirement.md).
+>   [ADR-0013](https://github.com/rjwalters/loom/blob/main/docs/adr/0013-loom-tools-python-retirement.md).
 
 ## Install
 

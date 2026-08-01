@@ -788,5 +788,5 @@ collaboration:
   gate this section documents. Adapted from a survey of
   [stablyai/orca](https://github.com/stablyai/orca) (`.loom/docs/survey-orca-2026-07-31.md`,
   idea 5), filed from #4775.
-- [ADR-0012: Multi-Runtime Worker Support via a Runtime Adapter Contract](../../docs/adr/0012-runtime-adapter-contract.md).
+- [ADR-0012: Multi-Runtime Worker Support via a Runtime Adapter Contract](https://github.com/rjwalters/loom/blob/main/docs/adr/0012-runtime-adapter-contract.md).
 - Fork: https://github.com/gpeyton/loom · `AGENTS.md` standard: https://agents.md
