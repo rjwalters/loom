@@ -578,7 +578,7 @@ label's own `labeled` timeline-event timestamp rather than the PR's
 aggregate `updatedAt`, for the identical reason the marker convention above
 exists (a stand-down comment self-refreshes `updatedAt` but not the label
 event). See [`daemon-reference.md`'s "Stale-claim reconciliation"
-section](../../../.loom/docs/daemon-reference.md#stale-claim-reconciliation--the-sweep-journal-3953-fixed-3975-extended-to-pr-side-claims-4367).
+section](https://github.com/rjwalters/loom/blob/main/defaults/docs/daemon-reference.md#stale-claim-reconciliation--the-sweep-journal-3953-fixed-3975-extended-to-pr-side-claims-4367).
 
 **Applies everywhere a Judge claims a PR from a multi-PR pass** — not just
 this single-PR narrative. This same check-then-claim rule governs the batch
