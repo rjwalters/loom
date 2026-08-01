@@ -627,13 +627,25 @@ LABEL="${LOOM_LAUNCHD_LABEL:-${MARKER_LABEL:-com.rjwalters.loom-daemon}}"
 # above: `systemctl` merely being on PATH is not proof THIS daemon is
 # systemd-managed, so no platform auto-detect. LOOM_WATCHDOG_SYSTEMD_PROBE=1 opts in
 # explicitly for a pre-#4862 marker that has not been rewritten yet.
+#
+# Deliberately NO platform clobber here. An earlier revision ended this block
+# with `[[ "$(uname -s)" == "Darwin" ]] && USE_SYSTEMD=false`, which ran after
+# the opt-in and silently overrode both the marker and the documented
+# LOOM_WATCHDOG_SYSTEMD_PROBE=1 escape hatch -- contradicting the comment above
+# and making the whole #4862 systemd remediation path unreachable (and
+# untestable) on a Darwin host.
+#
+# It was also redundant for the case it appeared to protect: the marker is the
+# authority, and only loom-daemon-start.sh's systemd branch writes
+# `use_systemd=true`. The launchd branch calls `write_intent_marker "true"
+# "$LAUNCHD_LABEL"` with no third argument, so a real Darwin host's marker
+# carries `use_systemd=false` and this resolves to false on its own.
 USE_SYSTEMD="${MARKER_USE_SYSTEMD:-false}"
 if [[ "${LOOM_WATCHDOG_SYSTEMD_PROBE:-}" =~ ^(1|true|yes)$ ]]; then
     USE_SYSTEMD=true
 elif [[ "${LOOM_WATCHDOG_SYSTEMD_PROBE:-}" =~ ^(0|false|no)$ ]]; then
     USE_SYSTEMD=false
 fi
-[[ "$(uname -s)" == "Darwin" ]] && USE_SYSTEMD=false
 SYSTEMD_UNIT="${LOOM_SYSTEMD_UNIT:-${MARKER_SYSTEMD_UNIT:-loom-daemon.service}}"
 
 # ---------- 2. reality: is the expected daemon actually alive? ----------
