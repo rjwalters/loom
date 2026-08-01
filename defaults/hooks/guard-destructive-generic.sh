@@ -1329,6 +1329,95 @@ function mask_gt(s,   out, n, i, c, mode, SQ, DQ, MASK) {
 }
 '
 
+# =============================================================================
+# QUOTE-AWARE WHITESPACE MASKING (#4934)
+#
+# extract_write_targets() (below) recognizes each write-idiom argument by
+# `split(seg, toks, /[ \t]+/)` — plain whitespace splitting, NOT quote-aware
+# (documented as a known limitation at extract_write_targets()'s own header).
+# A quoted target containing a literal space, e.g.
+#   echo x > '/main/checkout/evil file.sh'
+# is therefore split into TWO tokens (`'/main/checkout/evil` and `file.sh'`).
+# Only the first fragment is ever used as the write target. That fragment
+# starts with a quote character (not `/`), so it is misclassified as a
+# RELATIVE path (strip_target_quoting() correctly reports the dangling quote
+# as unbalanced and falls back to the raw fragment per #4926's "never widen a
+# deny into an allow" contract -- but the fallback fragment itself still gets
+# cwd-joined and can land INSIDE the acting worktree, turning what should be
+# a main-checkout DENY into an ALLOW (#4934).
+#
+# mask_ws() is the same masking technique as mask_gt() above (#4245), applied
+# to whitespace instead of `>`: it walks the string tracking quote state and
+# replaces every space/tab found INSIDE a quoted span with a placeholder
+# character that can never appear in real shell text (STX 0x02 for a masked
+# space, ETX 0x03 for a masked tab), so `split(seg, toks, /[ \t]+/)` never
+# splits inside a quoted span -- a quoted path containing spaces now yields
+# exactly ONE token. unmask_ws() reverses the substitution so the token's
+# TEXT is unchanged (real spaces/tabs restored) once splitting is done; only
+# the whitespace bytes INSIDE quotes are ever touched, so mask_ws() (like
+# mask_gt()) returns a byte-for-byte-length-identical string with identical
+# non-whitespace content, which is what keeps the `>`-detection pass (mtoks[],
+# masked via mask_gt() on top of mask_ws()'s output) in lockstep with the
+# target-text pass (toks[], unmasked back to real whitespace): the two are
+# always split into the SAME number of tokens at the SAME boundaries, because
+# mask_gt() only ever changes `>` bytes, never whitespace-ness.
+#
+# Deliberately does NOT model backslash-escaped quotes or attempt look-ahead
+# for a terminating quote — same simplification qsplit()/mask_gt() already
+# accept (see mask_gt()'s comment above for the accepted-risk rationale). An
+# unterminated quote just runs to the end of the string in that quote state;
+# never crashes, never mis-indexes, and never widens a deny into an allow
+# (the SAME fallback direction qsplit()'s own unterminated-quote handling
+# already uses, #4926).
+#
+# This is scoped ONLY to extract_write_targets() -- qsplit() itself (and its
+# verbatim-quote-preservation contract depended on by extract_rm_targets() /
+# parse_force_ops()) is untouched.
+# =============================================================================
+_MASKWS_AWK='
+function mask_ws(s,   out, n, i, c, mode, SQ, DQ, SPMASK, TABMASK) {
+    SQ = sprintf("%c", 39)    # single quote
+    DQ = sprintf("%c", 34)    # double quote
+    SPMASK = sprintf("%c", 2)    # STX -- placeholder for a quoted space
+    TABMASK = sprintf("%c", 3)   # ETX -- placeholder for a quoted tab
+    out = ""
+    n = length(s)
+    i = 1
+    mode = 0   # 0 = unquoted, 1 = single-quoted, 2 = double-quoted
+    while (i <= n) {
+        c = substr(s, i, 1)
+        if (mode == 0) {
+            if (c == SQ) { mode = 1; out = out c; i++; continue }
+            if (c == DQ) { mode = 2; out = out c; i++; continue }
+            out = out c
+            i++
+            continue
+        }
+        if (mode == 1) {
+            # Single-quoted: only the matching quote ends the span.
+            if (c == SQ) { mode = 0; out = out c; i++; continue }
+            if (c == " ") { out = out SPMASK; i++; continue }
+            if (c == "\t") { out = out TABMASK; i++; continue }
+            out = out c
+            i++
+            continue
+        }
+        # mode == 2 (double-quoted): only the matching quote ends the span.
+        if (c == DQ) { mode = 0; out = out c; i++; continue }
+        if (c == " ") { out = out SPMASK; i++; continue }
+        if (c == "\t") { out = out TABMASK; i++; continue }
+        out = out c
+        i++
+    }
+    return out
+}
+function unmask_ws(s) {
+    gsub(sprintf("%c", 2), " ", s)
+    gsub(sprintf("%c", 3), "\t", s)
+    return s
+}
+'
+
 # Parse force-op segments out of a command, emitting one TAB-separated
 # "<cpath>\t<target>" line per genuine git force-push / hard-reset. Portable awk
 # only (mirrors extract_rm_targets / lifecycle_or_cloud_reason segment parsing):
@@ -2054,26 +2143,30 @@ extract_rm_targets() {
 # like parse_force_ops threads `cpath` via `git -C`.
 #
 # NOT a full shell parser: like parse_force_ops / extract_rm_targets, splitting
-# a segment into tokens is plain whitespace splitting (not quote-aware), so a
-# quoted argument containing a literal space can be mis-split. The `>`/`>>`
-# redirection scan below is the one exception: it is quote-aware (#4245) via
-# mask_gt() — a `>` inside a quoted argument (e.g. `gh issue create --body
-# "... env > config > default ..."`) is never treated as a redirection
-# operator, regardless of whether the caller's literal-text redaction (next
-# paragraph) already removed it. The caller ALSO feeds this the ASK-tier
-# working copy (COMMAND_ASK_SCAN — comment-stripped AND literal-text-redacted,
-# i.e. --body/-m/--title/--notes/--comment values are replaced with
-# same-length placeholder text) as a second, independent narrowing so a `>`
-# that merely appears INSIDE such a quoted value (e.g. `git commit -m "a > b"`)
-# cannot manufacture a phantom target even in the (non-`>`) tee/sed/cp/mv
-# target-extraction paths below, which stay plain-whitespace-split. Any
-# remaining false positive resolves to, at worst, an extra deny on a target
-# that isn't really a write (safe direction) or a missed target (also safe —
-# the fail-open contract this file uses everywhere: ambiguity never widens a
-# deny).
+# a segment into tokens starts from plain whitespace splitting. Unlike those
+# two, a QUOTED argument containing a literal space is NOT mis-split here: the
+# split runs against mask_ws()'s output (#4934), which replaces whitespace
+# INSIDE a quoted span with a non-whitespace placeholder before
+# `split(seg, toks, /[ \t]+/)` runs, so a quoted path with an embedded space
+# (e.g. `echo x > '/main/checkout/evil file.sh'`) yields exactly ONE token —
+# unmask_ws() restores the real whitespace bytes in that token afterward. The
+# `>`/`>>` redirection scan below is quote-aware in a second, independent way
+# (#4245) via mask_gt() — a `>` inside a quoted argument (e.g. `gh issue
+# create --body "... env > config > default ..."`) is never treated as a
+# redirection operator, regardless of whether the caller's literal-text
+# redaction (next paragraph) already removed it. The caller ALSO feeds this
+# the ASK-tier working copy (COMMAND_ASK_SCAN — comment-stripped AND
+# literal-text-redacted, i.e. --body/-m/--title/--notes/--comment values are
+# replaced with same-length placeholder text) as a second, independent
+# narrowing so a `>` that merely appears INSIDE such a quoted value (e.g.
+# `git commit -m "a > b"`) cannot manufacture a phantom target even in the
+# (non-`>`) tee/sed/cp/mv target-extraction paths below. Any remaining false
+# positive resolves to, at worst, an extra deny on a target that isn't really
+# a write (safe direction) or a missed target (also safe — the fail-open
+# contract this file uses everywhere: ambiguity never widens a deny).
 # =============================================================================
 extract_write_targets() {
-    printf '%s' "$1" | awk -v startcwd="$2" "$_QSPLIT_AWK""$_MASKGT_AWK"'
+    printf '%s' "$1" | awk -v startcwd="$2" "$_QSPLIT_AWK""$_MASKGT_AWK""$_MASKWS_AWK"'
     BEGIN {
         SEP = sprintf("%c", 31)
         curcwd = startcwd
@@ -2088,16 +2181,27 @@ extract_write_targets() {
             sub(/^[ \t]+/, "", seg)
             if (seg == "") continue
 
-            m = split(seg, toks, /[ \t]+/)
+            # Quote-aware whitespace masking (#4934): wseg is byte-for-byte
+            # identical to seg except a space/tab INSIDE a quoted span is
+            # replaced with a non-whitespace placeholder, so splitting on
+            # /[ \t]+/ never breaks a quoted argument (e.g. a quoted path
+            # containing a literal space) into more than one token. toks[]
+            # is then unmasked back to the real whitespace bytes so the
+            # target TEXT downstream is unchanged.
+            wseg = mask_ws(seg)
+            m = split(wseg, toks, /[ \t]+/)
             if (m < 1) continue
+            for (j = 1; j <= m; j++) toks[j] = unmask_ws(toks[j])
 
             # Quote-aware parallel tokenization (#4245): mseg is byte-for-byte
-            # identical to seg except a `>` inside a quoted span is replaced
+            # identical to wseg except a `>` inside a quoted span is replaced
             # with an SOH placeholder, so whitespace splitting yields the SAME
             # token boundaries (mm == m always) but mtoks[] can be tested for
             # a REAL (unquoted) redirection operator without ever matching a
-            # `>` that was only quoted data.
-            mseg = mask_gt(seg)
+            # `>` that was only quoted data. Masking `>` on TOP of wseg (not
+            # seg) keeps the two passes token boundaries in lockstep, since
+            # mask_gt() only ever changes `>` bytes, never whitespace-ness.
+            mseg = mask_gt(wseg)
             mm = split(mseg, mtoks, /[ \t]+/)
 
             if (toks[1] == "cd") {
