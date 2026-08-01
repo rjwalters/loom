@@ -495,6 +495,15 @@ enum Commands {
     /// decision tree from issue #3332. Purely file/git/gh-based; does not
     /// require a running daemon. Flags mirror the retired `loom-clean`
     /// console script byte-for-byte.
+    ///
+    /// **What `--safe` actually narrows** (issue #4890): only the artifact
+    /// classes that have a merged-PR concept to check — worktrees (gated on
+    /// issue-closed + PR-merged + grace period) and branches. Tmux sessions
+    /// are not an artifact of a merged PR, so `--safe` skips tmux cleanup
+    /// entirely rather than pretending to gate it; pair with `--tmux-only`
+    /// (optionally `--force`) to clean tmux sessions explicitly. Outside
+    /// `--safe`, a tmux session with an attached client (a live operator
+    /// terminal) is likewise preserved unless `--force` is passed.
     Clean {
         /// Workspace directory (repo root, or any path under it).
         #[arg(long, value_name = "PATH", default_value = ".")]
@@ -509,6 +518,9 @@ enum Commands {
         #[arg(short = 'f', long, visible_alias = "yes", visible_short_alias = 'y')]
         force: bool,
 
+        /// Merged-PR-only mode for worktrees/branches. Tmux sessions have no
+        /// PR association, so `--safe` skips tmux cleanup entirely (see the
+        /// `Clean` doc comment) rather than silently killing a live session.
         #[arg(long)]
         safe: bool,
 

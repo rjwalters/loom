@@ -113,6 +113,10 @@ pub struct CleanupStats {
     pub kept_branches: usize,
     pub errored_branches: usize,
     pub killed_tmux: usize,
+    /// Tmux sessions preserved because they have an attached client (a live
+    /// operator terminal) or because `--safe` mode does not touch tmux at all
+    /// (issue #4890).
+    pub skipped_tmux: usize,
     pub cleaned_config_dirs: usize,
     pub cleaned_sweep_baselines: usize,
     pub cleaned_sweep_checkpoints: usize,
@@ -996,7 +1000,60 @@ fn list_loom_tmux_sessions() -> Vec<String> {
         .collect()
 }
 
-pub fn clean_tmux_sessions(stats: &mut CleanupStats, dry_run: bool) {
+/// Whether `session` (on Loom's isolated `-L loom` socket) has an attached
+/// client right now. A Manual-Orchestration-Mode terminal an operator is
+/// actively looking at is exactly this — `tmux list-clients` returns one line
+/// per attached client, and an empty (but successful) result means none.
+///
+/// Fails safe: any error running `tmux` (session gone, tmux missing, etc.)
+/// reads as "not attached" — the caller has already confirmed the session is
+/// live via `list-sessions`, so a probe failure here is not the thing that
+/// should block cleanup of an orphaned session.
+#[must_use]
+fn session_has_attached_client(session: &str) -> bool {
+    let Ok(out) = Command::new("tmux")
+        .args(["-L", "loom", "list-clients", "-t", session])
+        .output()
+    else {
+        return false;
+    };
+    out.status.success() && !String::from_utf8_lossy(&out.stdout).trim().is_empty()
+}
+
+/// The outcome of applying every tmux-session-removal safety gate to one
+/// session. Extracted so the decision is unit-testable without a real tmux
+/// server (issue #4890).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TmuxDecision {
+    /// No gate applies — kill the session.
+    Kill,
+    /// `--safe` mode does not touch tmux sessions at all: a tmux session is
+    /// not an artifact of a merged PR, so "merged-PR-only mode" has nothing
+    /// to say about it, and killing it anyway breaks `--safe`'s promise.
+    SkipSafeMode,
+    /// The session has an attached client (a live operator terminal) and no
+    /// explicit opt-in (`--force`) was given.
+    SkipAttached,
+}
+
+/// Apply the tmux-removal safety gates, in order. Pure decision logic —
+/// mirrors the shape of [`classify_worktree`].
+#[must_use]
+pub fn classify_tmux_session(safe: bool, attached: bool, force: bool) -> TmuxDecision {
+    if safe && !force {
+        return TmuxDecision::SkipSafeMode;
+    }
+    if attached && !force {
+        return TmuxDecision::SkipAttached;
+    }
+    TmuxDecision::Kill
+}
+
+/// Tmux session cleanup. `--safe` mode (unless paired with the explicit
+/// `--force` opt-in) skips tmux entirely — see [`TmuxDecision::SkipSafeMode`].
+/// Outside `--safe`, a session with an attached client is preserved unless
+/// `--force` is passed.
+pub fn clean_tmux_sessions(stats: &mut CleanupStats, opts: &CleanOptions) {
     let sessions = list_loom_tmux_sessions();
     if sessions.is_empty() {
         println!("No Loom tmux sessions found");
@@ -1007,18 +1064,45 @@ pub fn clean_tmux_sessions(stats: &mut CleanupStats, dry_run: bool) {
         println!("  - {s}");
     }
     println!();
-    if dry_run {
-        println!("Would kill these sessions");
-        stats.killed_tmux = sessions.len();
-    } else {
-        for s in &sessions {
-            let ok = Command::new("tmux")
-                .args(["-L", "loom", "kill-session", "-t", s])
-                .status()
-                .is_ok_and(|st| st.success());
-            if ok {
-                println!("Killed: {s}");
-                stats.killed_tmux += 1;
+
+    if opts.safe && !opts.force {
+        println!(
+            "--safe mode: tmux sessions are not tied to a merged PR, so `--safe` does not \
+             touch them (a live Manual-Orchestration-Mode terminal has no PR association at \
+             all) - preserving all {} session(s). Use plain `clean --tmux-only` (optionally \
+             with `--force`) to clean tmux sessions.",
+            sessions.len()
+        );
+        stats.skipped_tmux += sessions.len();
+        return;
+    }
+
+    for s in &sessions {
+        let attached = session_has_attached_client(s);
+        match classify_tmux_session(opts.safe, attached, opts.force) {
+            TmuxDecision::SkipSafeMode => {
+                // Unreachable here (handled by the early return above), kept
+                // so the match stays exhaustive if that guard ever moves.
+                stats.skipped_tmux += 1;
+            }
+            TmuxDecision::SkipAttached => {
+                println!("  {s}: has an attached client - preserving (use --force to override)");
+                stats.skipped_tmux += 1;
+            }
+            TmuxDecision::Kill => {
+                if opts.dry_run {
+                    println!("Would kill: {s}");
+                    stats.killed_tmux += 1;
+                    continue;
+                }
+                let ok = Command::new("tmux")
+                    .args(["-L", "loom", "kill-session", "-t", s])
+                    .status()
+                    .is_ok_and(|st| st.success());
+                if ok {
+                    println!("Killed: {s}");
+                    stats.killed_tmux += 1;
+                }
             }
         }
     }
@@ -1439,7 +1523,14 @@ fn revert_stale_building_labels_spawn_loop(repo_root: &Path, dry_run: bool) -> u
 pub fn clean_daemon_crash_state(repo_root: &Path, dry_run: bool) {
     println!("Step 1: Kill orphaned tmux sessions");
     let mut stats = CleanupStats::default();
-    clean_tmux_sessions(&mut stats, dry_run);
+    // Neither `--safe` nor `--force`: crash recovery is unattended, so a
+    // session with an attached client (not actually orphaned — someone is
+    // looking at it) is still preserved (issue #4890).
+    let tmux_opts = CleanOptions {
+        dry_run,
+        ..CleanOptions::default()
+    };
+    clean_tmux_sessions(&mut stats, &tmux_opts);
     println!();
 
     println!("Step 2: Revert stale `loom:building` labels");
@@ -1504,6 +1595,12 @@ pub fn print_summary(stats: &CleanupStats, dry_run: bool, safe_mode: bool) {
         } else {
             println!("  Killed: {} tmux session(s)", stats.killed_tmux);
         }
+    }
+    if stats.skipped_tmux > 0 {
+        println!(
+            "  Skipped (attached client or --safe mode): {} tmux session(s)",
+            stats.skipped_tmux
+        );
     }
     if stats.cleaned_config_dirs > 0 {
         if dry_run {
@@ -1595,7 +1692,7 @@ pub fn run_clean(repo_root: &Path, opts: &CleanOptions) -> i32 {
 
     if !opts.worktrees_only && !opts.branches_only {
         println!("Cleaning Loom Tmux Sessions\n");
-        clean_tmux_sessions(&mut stats, opts.dry_run);
+        clean_tmux_sessions(&mut stats, opts);
         println!();
     }
 
@@ -1649,6 +1746,47 @@ mod tests {
     fn dir_size_human_handles_missing_dir() {
         // A missing directory contributes 0 bytes, not an error.
         assert_eq!(dir_size_human(Path::new("/does/not/exist/at/all")), "0B");
+    }
+
+    // --- tmux cleanup safety gates (#4890) -------------------------------
+
+    #[test]
+    fn tmux_safe_mode_skips_even_an_unattached_session() {
+        // `--safe` is documented as "merged-PR-only mode", but a tmux session
+        // has no PR association at all — the core of #4890 is that `--safe`
+        // must not silently kill tmux sessions just because they are not
+        // attached right now.
+        assert_eq!(classify_tmux_session(true, false, false), TmuxDecision::SkipSafeMode);
+    }
+
+    #[test]
+    fn tmux_safe_mode_skips_an_attached_session_too() {
+        assert_eq!(classify_tmux_session(true, true, false), TmuxDecision::SkipSafeMode);
+    }
+
+    #[test]
+    fn tmux_force_overrides_safe_mode() {
+        // `--safe --force` together is the existing "trust me" combination
+        // used elsewhere in this module (e.g. the grace-period/uncommitted
+        // gates in `classify_worktree`).
+        assert_eq!(classify_tmux_session(true, false, true), TmuxDecision::Kill);
+    }
+
+    #[test]
+    fn tmux_attached_session_skipped_outside_safe_mode() {
+        // A live operator terminal (attached client) must never be killed
+        // without an explicit opt-in, even in plain (non-`--safe`) mode.
+        assert_eq!(classify_tmux_session(false, true, false), TmuxDecision::SkipAttached);
+    }
+
+    #[test]
+    fn tmux_force_overrides_attached_gate() {
+        assert_eq!(classify_tmux_session(false, true, true), TmuxDecision::Kill);
+    }
+
+    #[test]
+    fn tmux_unattached_session_killed_by_default() {
+        assert_eq!(classify_tmux_session(false, false, false), TmuxDecision::Kill);
     }
 
     #[test]
