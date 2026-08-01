@@ -1952,11 +1952,54 @@ extract_rm_targets() {
 # that isn't really a write (safe direction) or a missed target (also safe —
 # the fail-open contract this file uses everywhere: ambiguity never widens a
 # deny).
+#
+# SAME-COMMAND VARIABLE RESOLUTION (#4881): a write-idiom target whose token
+# is `$NAME`/`${NAME}[...]` is not itself a real path — the real shell
+# substitutes it from that variable's value before the redirect/tee/sed/cp/mv
+# ever runs. This tokenizer previously treated such a token as a literal
+# relative path and cwd-prefixed it, manufacturing a phantom repo-relative
+# target (e.g. `SCRATCH=/private/tmp/.../scratchpad` on one line, then `... >
+# $SCRATCH/out.txt` on the next, was denied as a worktree-isolation bypass
+# even though the real target resolves to /private/tmp, far outside the
+# repo). `resolve_var()` below performs the ONE unambiguous, narrow piece of
+# this: when the SAME command text contains a standalone `NAME=value`
+# assignment segment (no embedded whitespace in `value`, optionally
+# single/double-quoted) earlier in the stream, later `$NAME`/`${NAME}` leading
+# a write target is substituted with that value. Threaded via the awk global
+# `varmap`, exactly like `curcwd` above. A `$NAME` with NO matching assignment
+# (or a token starting with `$` but not a bare variable reference, e.g. a
+# `$(...)` command substitution) is UNRESOLVABLE — never guessed, never
+# treated as repo-relative. It is tagged with the VARUNKNOWN sentinel (STX,
+# 0x02 — a byte that can never appear in the raw command text this awk
+# program reads) so the caller can treat it as "unknown" and skip the target
+# entirely, per this file's fail-open contract: ambiguity never widens a deny.
 # =============================================================================
 extract_write_targets() {
     printf '%s' "$1" | awk -v startcwd="$2" "$_QSPLIT_AWK""$_MASKGT_AWK"'
+    function resolve_var(tok,   vname, rest, vv) {
+        if (substr(tok, 1, 1) != "$") return tok
+        if (match(tok, /^\$\{[A-Za-z_][A-Za-z0-9_]*\}/)) {
+            vname = substr(tok, RSTART + 2, RLENGTH - 3)
+            rest = substr(tok, RSTART + RLENGTH)
+        } else if (match(tok, /^\$[A-Za-z_][A-Za-z0-9_]*/)) {
+            vname = substr(tok, RSTART + 1, RLENGTH - 1)
+            rest = substr(tok, RSTART + RLENGTH)
+        } else {
+            return VARUNKNOWN tok
+        }
+        if (!(vname in varmap)) return VARUNKNOWN tok
+        vv = varmap[vname]
+        # A value that itself still starts with an unresolved "$" (chained
+        # assignment this single-pass resolver does not follow) stays unknown
+        # rather than being guessed.
+        if (substr(vv, 1, 1) == "$") return VARUNKNOWN tok
+        return vv rest
+    }
     BEGIN {
         SEP = sprintf("%c", 31)
+        DQ = sprintf("%c", 34)
+        SQ = sprintf("%c", 39)
+        VARUNKNOWN = sprintf("%c", 2)
         curcwd = startcwd
     }
     {
@@ -1968,6 +2011,28 @@ extract_write_targets() {
             sub(/^sudo[ \t]+/, "", seg)
             sub(/^[ \t]+/, "", seg)
             if (seg == "") continue
+
+            # Standalone `NAME=value` assignment (whole segment, no embedded
+            # whitespace in value — the common one-assignment-per-line/segment
+            # shape, e.g. `SCRATCH=/private/tmp/.../scratchpad`, #4881).
+            # Recorded into varmap for LATER segments of this same command;
+            # deliberately does NOT try to also extract a write target from
+            # this segment (a bare assignment writes nothing).
+            if (seg ~ /^[A-Za-z_][A-Za-z0-9_]*=[^ \t]*$/) {
+                eqpos = index(seg, "=")
+                vname = substr(seg, 1, eqpos - 1)
+                vval = substr(seg, eqpos + 1)
+                vlen = length(vval)
+                if (vlen >= 2) {
+                    c1 = substr(vval, 1, 1)
+                    c2 = substr(vval, vlen, 1)
+                    if ((c1 == DQ && c2 == DQ) || (c1 == SQ && c2 == SQ)) {
+                        vval = substr(vval, 2, vlen - 2)
+                    }
+                }
+                varmap[vname] = vval
+                continue
+            }
 
             m = split(seg, toks, /[ \t]+/)
             if (m < 1) continue
@@ -1995,7 +2060,7 @@ extract_write_targets() {
             if (toks[1] == "tee") {
                 for (j = 2; j <= m; j++) {
                     if (toks[j] == "" || toks[j] ~ /^-/) continue
-                    print curcwd SEP toks[j]
+                    print curcwd SEP resolve_var(toks[j])
                 }
             } else if (toks[1] == "sed") {
                 has_i = 0
@@ -2009,7 +2074,7 @@ extract_write_targets() {
                     nfargs[nf] = toks[j]
                 }
                 if (has_i && nf >= 2) {
-                    for (j = 2; j <= nf; j++) print curcwd SEP nfargs[j]
+                    for (j = 2; j <= nf; j++) print curcwd SEP resolve_var(nfargs[j])
                 }
             } else if (toks[1] == "cp" || toks[1] == "mv") {
                 nf = 0
@@ -2020,7 +2085,7 @@ extract_write_targets() {
                     nf++
                     nfargs[nf] = toks[j]
                 }
-                if (nf >= 2) print curcwd SEP nfargs[nf]
+                if (nf >= 2) print curcwd SEP resolve_var(nfargs[nf])
             }
 
             # >/>>  redirection — token-boundary detection only (never a
@@ -2038,7 +2103,7 @@ extract_write_targets() {
                     # Bare operator token. Dup-to-fd (`> &1`) is recognized by
                     # the NEXT token starting with `&` and excluded.
                     if (j + 1 <= m && toks[j+1] != "" && mtoks[j+1] !~ /^&/) {
-                        print curcwd SEP toks[j+1]
+                        print curcwd SEP resolve_var(toks[j+1])
                     }
                     continue
                 }
@@ -2046,7 +2111,7 @@ extract_write_targets() {
                     # Attached form (`>file`, `2>file`, `>>file`).
                     op = toks[j]
                     sub(/^[0-9]*>>?/, "", op)
-                    if (op != "") print curcwd SEP op
+                    if (op != "") print curcwd SEP resolve_var(op)
                 }
             }
         }
@@ -2178,6 +2243,101 @@ expand_leading_tilde() {
             return
             ;;
     esac
+}
+
+# =============================================================================
+# strip_heredoc_bodies() — treat quoted-delimiter heredoc BODIES as opaque
+# DATA, never redirect/write-idiom syntax (#4881, same false-positive family
+# as #4245's quote-aware `>` masking).
+#
+# A heredoc opened with a QUOTED delimiter (`<<'EOF'` / `<<"EOF"`) feeds its
+# body to the receiving command's stdin completely verbatim — the shell
+# parses NOTHING inside it (no redirection, no tee/sed/cp/mv, not even
+# parameter/command substitution). extract_write_targets() is a plain
+# tokenizer with no concept of heredocs at all, so a `>`-looking (or
+# tee/sed/cp/mv-looking) substring that merely APPEARS inside such a body —
+# e.g. an issue/PR body posted via `gh issue create --body "$(cat <<'EOF'
+# ... EOF)"` that happens to quote a worked example containing a redirect —
+# was previously scanned as if it were real command syntax and denied a
+# command that writes nothing to the filesystem at all. This is exactly what
+# happened filing the issue that reported this bug: the heredoc body quoted
+# the ORIGINAL false-positive example, and the `gh issue create` describing
+# the bug tripped the very bug it described.
+#
+# This is a LINE-based pre-pass (heredocs are inherently a line-delimited
+# construct, unlike qsplit()/mask_gt()'s char-by-char quote tracking): it
+# finds a `cat <<[-]'DELIM'` / `cat <<[-]"DELIM"` opener and blanks every
+# line up to (but not including) the line that is EXACTLY the delimiter
+# (leading whitespace is also stripped from the candidate closing line when
+# the operator was `<<-`, matching the shell's own indented-heredoc rule).
+#
+# TWO independent narrowings keep this from becoming a new confinement
+# bypass, not just a false-positive fix:
+#   1. Only a QUOTED delimiter (`<<'EOF'`/`<<"EOF"`) is treated as data — an
+#      unquoted `<<EOF` heredoc body still undergoes the shell's OWN
+#      parameter/command substitution, so it is closer to code than to pure
+#      data and is deliberately left to the existing (narrower) scans.
+#   2. Only a heredoc whose RECEIVING command is `cat` is treated as data.
+#      `cat <<'EOF' ... EOF` is a genuinely inert sink — the body is only
+#      ever echoed to stdout (the well-established `"$(cat <<'EOF' ...
+#      EOF)"` idiom used to build a --body/-m/commit-message value), never
+#      executed. A heredoc fed to a command that DOES execute its stdin as
+#      code (`bash <<'EOF'`, `ssh host <<'EOF'`, `python <<'EOF'`, …) is
+#      NOT touched here — blanking THAT body would hide a real write-idiom
+#      the receiving command actually executes, reopening the #4178
+#      confinement this file exists to enforce. This is the narrow, safe
+#      case the acceptance criteria's "reached only via safe sinks" language
+#      calls for; it is a DIFFERENT (unrelated) safety floor from
+#      strip_literal_text()'s `$(`-command-substitution floor at line ~1315
+#      — this function never touches strip_literal_text() or the
+#      catastrophic ALWAYS_BLOCK_PATTERNS scan (which still reads the raw,
+#      unmodified $COMMAND), so a genuinely smuggled command inside `$(...)`
+#      is completely unaffected by this narrowing and still hard-denies.
+#
+# Best-effort like every other scan in this file: a heredoc this cannot
+# recognize (e.g. an unquoted delimiter, or fed to anything other than
+# `cat`) is left completely unmodified — the worst case is the PRE-EXISTING
+# false-positive risk this function narrows, never a NEW one, and it can
+# only ever REMOVE candidate write-target text (blanking body lines) for the
+# `cat`-fed case, never manufacture one.
+# =============================================================================
+strip_heredoc_bodies() {
+    printf '%s' "$1" | awk '
+    BEGIN {
+        SQ = sprintf("%c", 39)
+        DQ = sprintf("%c", 34)
+        start_re = "(^|[;&|(\t ])cat[ \t]+<<-?[ \t]*(" SQ "[A-Za-z_][A-Za-z0-9_]*" SQ "|" DQ "[A-Za-z_][A-Za-z0-9_]*" DQ ")"
+        in_here = 0
+        delim = ""
+        strip_leading = 0
+    }
+    {
+        line = $0
+        if (in_here) {
+            check = line
+            if (strip_leading) { sub(/^[ \t]+/, "", check) }
+            if (check == delim) {
+                in_here = 0
+                delim = ""
+                print line
+                next
+            }
+            print ""
+            next
+        }
+        if (match(line, start_re)) {
+            matched = substr(line, RSTART, RLENGTH)
+            p = index(matched, "<<")
+            tok = substr(matched, p)
+            strip_leading = (tok ~ /^<<-/) ? 1 : 0
+            d = tok
+            sub(/^<<-?[ \t]*/, "", d)
+            d = substr(d, 2, length(d) - 2)
+            delim = d
+            in_here = 1
+        }
+        print line
+    }'
 }
 
 # Cheap pre-check keeps awk off the hot path for the ~99% of commands that have
@@ -2361,9 +2521,32 @@ if worktree_isolation_guard_enabled && \
     [[ -n "$_WT_MAIN_ROOT" ]] || _WT_MAIN_ROOT="$REPO_ROOT"
     [[ -n "$_WT_MAIN_ROOT_LOGICAL" ]] || _WT_MAIN_ROOT_LOGICAL="$_WT_MAIN_ROOT"
 
-    WRITE_TARGETS=$(extract_write_targets "$COMMAND_ASK_SCAN" "$CWD" | head -20)
+    # Heredoc bodies opened with a QUOTED delimiter (`<<'EOF'`/`<<"EOF"`) are
+    # DATA, not code -- strip them before scanning for write idioms (#4881) so
+    # a redirect-looking substring quoted INSIDE such a body (e.g. a worked
+    # example embedded in a `gh issue create --body "$(cat <<'EOF' ... EOF)"`)
+    # cannot manufacture a phantom write target. Cheap substring pre-check
+    # keeps the extra awk pass off the hot path for the common case with no
+    # heredoc at all.
+    _WT_SCAN="$COMMAND_ASK_SCAN"
+    if [[ "$COMMAND_ASK_SCAN" == *"<<"* ]]; then
+        _WT_SCAN=$(strip_heredoc_bodies "$COMMAND_ASK_SCAN")
+    fi
+
+    WRITE_TARGETS=$(extract_write_targets "$_WT_SCAN" "$CWD" | head -20)
     while IFS=$'\037' read -r _wcwd _wtarget; do
         [[ -z "$_wtarget" ]] && continue
+
+        # Same-command $VAR/${VAR} resolution (#4881): extract_write_targets()
+        # tags a target it could NOT resolve (no matching NAME=value
+        # assignment earlier in the command text, or a $-prefixed token that
+        # is not a bare variable reference, e.g. a $(...) substitution) with a
+        # leading STX (0x02) sentinel rather than guessing. Treat it as
+        # unknown and skip it entirely -- never fall back to treating it as
+        # repo-relative.
+        case "$_wtarget" in
+            $'\x02'*) continue ;;
+        esac
 
         # Shell-accurate tilde expansion (#4382): an unquoted/unescaped
         # leading `~/` or `~user/` in the raw token is what the real shell

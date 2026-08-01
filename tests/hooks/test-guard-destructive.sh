@@ -2670,6 +2670,104 @@ assert_deny "write-confinement (#4382): non-leading tilde ('backup~/f.sh') is no
 assert_deny "write-confinement (#4382): unresolvable '~nonexistentuser/' falls back to literal repo-relative path, still denies" \
     "cp /tmp/a.sh ~nonexistentloomuser999/defaults/hooks/f.sh" "$WT_REPO"
 
+# -------------------------------------------------------------------------
+# Same-command $VAR/${VAR} resolution for write targets (#4881). Reported
+# incident: `SCRATCH=/private/tmp/.../scratchpad` assigned on one line, then
+# `gh pr view ... >> $SCRATCH/wave1-merged-files.txt` on the next, was denied
+# as a worktree-isolation bypass -- the tokenizer treated the literal string
+# "$SCRATCH/wave1-merged-files.txt" as a REPO-RELATIVE path (cwd-prefixed)
+# instead of resolving it via the SCRATCH assignment two lines earlier, even
+# though the real target resolves far outside the repo.
+OUTSIDE_SCRATCH=$(mktemp -d)
+
+assert_allow "write-confinement (#4881): \$VAR assigned earlier in the same command, redirect resolves outside the repo -> allow" \
+    "SCRATCH=$OUTSIDE_SCRATCH
+echo x >> \$SCRATCH/out.txt" "$WT_REPO"
+assert_allow "write-confinement (#4881): \${VAR} (braced) form resolves outside the repo -> allow" \
+    "SCRATCH=$OUTSIDE_SCRATCH
+echo x >> \${SCRATCH}/out.txt" "$WT_REPO"
+assert_allow "write-confinement (#4881): tee target resolved via same-command \$VAR outside the repo -> allow" \
+    "SCRATCH=$OUTSIDE_SCRATCH
+echo x | tee \$SCRATCH/out.txt" "$WT_REPO"
+assert_allow "write-confinement (#4881): cp destination resolved via same-command \$VAR outside the repo -> allow" \
+    "SCRATCH=$OUTSIDE_SCRATCH
+cp /tmp/a.sh \$SCRATCH/out.txt" "$WT_REPO"
+
+# The resolved target STILL denies when it lands inside the main checkout --
+# variable resolution must only narrow the false positive, never weaken the
+# #4178 protection.
+assert_deny "write-confinement (#4881): \$VAR assigned earlier in the same command, redirect resolves INSIDE the repo -> still denies" \
+    "SCRATCH=$WT_REPO
+echo x >> \$SCRATCH/defaults/hooks/f.sh" "$WT_REPO"
+
+# An UNRESOLVABLE $VAR (no matching assignment anywhere in the command) is
+# treated as unknown and skipped -- never guessed as repo-relative.
+assert_allow "write-confinement (#4881): unresolvable \$VAR (no matching assignment) is treated as unknown, not repo-relative -> allow" \
+    "echo x >> \$NOSUCHVARFORLOOMTEST4881/out.txt" "$WT_REPO"
+
+rm -rf "$OUTSIDE_SCRATCH"
+
+# -------------------------------------------------------------------------
+# Heredoc bodies opened with a QUOTED delimiter are DATA, never
+# redirect/write-idiom syntax (#4881). Reported incident: filing THIS issue
+# via `gh issue create --body "$(cat <<'EOF' ... EOF)"` embedded the original
+# bug repro (a redirect-plus-$VAR example) in the heredoc BODY, and the guard
+# scanned that quoted example text as if it were real command syntax, denying
+# the (read-only-plus-API) `gh issue create` call itself.
+HEREDOC_BODY_CMD=$(cat <<'BASH_EOF'
+gh issue create --title "Test" --body "$(cat <<'EOF'
+SCRATCH=/private/tmp/example/scratchpad
+gh pr view 1 --json files -q '.files[].path' >> $SCRATCH/out.txt
+EOF
+)"
+BASH_EOF
+)
+assert_allow "write-confinement (#4881): redirect-looking text inside a single-quoted heredoc body is DATA, not code -> allow" \
+    "$HEREDOC_BODY_CMD" "$WT_REPO"
+
+# Curator-widened repro (#4881): the same false positive is NOT limited to
+# the `>`/`>>` scan -- extract_write_targets()'s cp/mv/tee/sed -i matching is
+# just as un-heredoc-aware, so a heredoc body quoting one of THOSE shapes
+# (e.g. citing a `cp '$src' '$dst'` line from a commit message) manufactured
+# the same phantom target on a plain `gh issue comment`.
+HEREDOC_BODY_CPMV_CMD=$(cat <<'BASH_EOF'
+gh issue comment 1 --body "$(cat <<'EOF'
+See the fix in that commit: cp '$src' '$dst' and tee /some/other/path
+EOF
+)"
+BASH_EOF
+)
+assert_allow "write-confinement (#4881): cp/mv/tee-looking text inside a single-quoted heredoc body is DATA, not code -> allow" \
+    "$HEREDOC_BODY_CPMV_CMD" "$WT_REPO"
+
+# Regression: a REAL (unquoted, outside any heredoc body) redirect on the
+# heredoc's own START line must still deny -- heredoc-body stripping only
+# blanks lines INSIDE the body, never the opening line carrying the actual
+# `>` operator, even when the heredoc's own delimiter is quoted.
+assert_deny "write-confinement (#4881): real redirect on a quoted-delimiter heredoc START line still denies" \
+    "cat > $WT_REPO/defaults/hooks/f.sh <<'EOF'
+hello
+EOF" "$WT_REPO"
+
+# Safety-floor regression: heredoc-body exemption is scoped to `cat` (a
+# genuinely inert sink) ONLY. A heredoc fed to a command that actually
+# EXECUTES its stdin as code (e.g. `bash <<'EOF'`) must NOT be treated as
+# inert data -- a real write idiom inside such a body is real, executed
+# code, and must still be caught by the existing (unmodified) scan.
+assert_deny "write-confinement (#4881): heredoc fed to 'bash' (executes its body) is NOT exempted -- real redirect inside still denies" \
+    "bash <<'EOF'
+echo x > $WT_REPO/defaults/hooks/f.sh
+EOF" "$WT_REPO"
+
+# Safety-floor regression (issue's own AC): a genuinely smuggled dangerous
+# command inside REAL command substitution (not a quoted heredoc at all)
+# must still hard-deny -- this file's #3679/#4178 catastrophic-tier
+# protection (strip_literal_text()'s `$(`-aware redaction floor,
+# ~line 1315-1318) is completely untouched by this issue's fix; neither
+# strip_heredoc_bodies() nor resolve_var() ever run on the ALWAYS_BLOCK scan.
+assert_deny "write-confinement (#4881 regression): smuggled force-push via \$(...) command substitution (not a quoted heredoc) still hard-denies" \
+    "git commit -m \"\$(git push --force origin main)\""
+
 rm -rf "$HOME_FIXTURE_OUTSIDE"
 rm -rf "$WT_REPO" "$WT_REPO_NOWT" "$WT_REPO_OFF" "$WT_REPO_LINKED"
 
