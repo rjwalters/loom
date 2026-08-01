@@ -248,8 +248,33 @@ no way to read it back.
 Choose `host_id` to match what the daemon reports for that machine — it is
 `$LOOM_HOST_ID` if set, else `$HOSTNAME`, else the output of `hostname`
 (`loom-daemon/src/sweep_registry/mod.rs::host_identity`). The backend always
-records the host id **bound to the authenticated key**, so a mismatch is not
-a security problem, only a confusing one when you read the data back.
+records the host id **bound to the authenticated key**, so a mismatch is not a
+security problem — but it is no longer an *undetected* one either (issue
+#4830).
+
+**Mismatches are detected, on the daemon side.** The `/ingest` success response
+echoes the host id the authenticated key is bound to
+(`{"accepted":N,"host_id":"my-laptop"}`), and the exporter compares that echo
+against the identity the daemon resolved for itself. If they disagree — the
+classic symptom of the wrong host's key file being installed on a machine — the
+daemon:
+
+- logs a WARN naming **both** ids, **once per daemon lifetime** (not once per
+  flush, so a permanent misconfiguration does not flood the log), and
+- reports an `observability DEGRADED` line in `loom-daemon health` (exit `1`)
+  and an `observability_host_id_mismatch` field in `loom-daemon status --json`,
+  for as long as that daemon process runs.
+
+This was added after the 2026-07-31 incident in which a Mac Studio pushed its
+first hours of telemetry under `robb-pro`, because that host's key file had been
+installed on it; nothing anywhere warned, and diagnosis meant cross-referencing
+D1 contents against which physical machine held which key file.
+
+To fix a reported mismatch, either install the key provisioned for this host, or
+set `$LOOM_HOST_ID` on the host to match the key's binding — then restart the
+daemon (the detection is deliberately once-per-lifetime, so the note clears on
+restart, not mid-run). The already-ingested rows keep the old host id; the
+backend has no rewrite path for them.
 
 Bring-your-own-key is supported too — `{"host_id":"my-laptop","key":"…"}`.
 

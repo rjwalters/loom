@@ -49,6 +49,43 @@ only on a **breaking** wire change to the record shapes below. A backend should:
 - **never** silently coerce a missing `schema_version` to `0` — a record with no
   `schema_version` is malformed.
 
+## `/ingest` response (the bound-`host_id` echo)
+
+A push is a bare JSON array of envelopes; the backend answers a **2xx with a
+JSON object**:
+
+```json
+{ "accepted": 50, "host_id": "fleet-host-abc" }
+```
+
+| Field      | Type    | Notes |
+|------------|---------|-------|
+| `accepted` | integer | How many envelopes from this batch were persisted. Whole-batch semantics: a batch is either fully accepted or rejected with a non-2xx. |
+| `host_id`  | string  | **The host id the authenticated ingest key is bound to** — i.e. the identity the batch's rows were actually filed under. Added by issue #4830. |
+
+`host_id` here is *not* echoed from the request. Every record is persisted
+under the identity bound to the presented key, never the envelope's own
+(client-supplied, opaque) `host_id` field — so this echo is what a host was
+actually recorded as, which is exactly the value that differs when the wrong
+host's key file has been installed on a machine.
+
+**How the exporter uses it.** `loom-daemon`'s exporter compares this value
+against the identity the daemon resolved for itself (`$LOOM_HOST_ID`, else
+`$HOSTNAME`, else `hostname`) and on a disagreement logs a WARN **once per
+daemon lifetime** and reports an `observability DEGRADED` section in
+`loom-daemon health`. Nothing about the export changes: the batch stays acked
+and the backend keeps filing under the key's binding, which remains
+authoritative. See `dashboard/docs/deploy-runbook.md` §8.
+
+**Compatibility.** The field is purely additive — no `schema_version` rev is
+involved (that integer versions the *record* envelope, not this response).
+Both directions are safe:
+
+- an exporter that ignores the response body behaves exactly as before;
+- a backend that does not send `host_id` (anything predating #4830) is treated
+  by the exporter as "no identity to verify" and is **silently** skipped — it
+  never produces a recurring "cannot verify" warning.
+
 ## `RepoVisibility` contract — private by default
 
 Every record that references a repository carries a `visibility` tag, either

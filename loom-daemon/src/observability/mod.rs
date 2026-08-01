@@ -31,8 +31,17 @@
 //!
 //! This module only ever originates outbound HTTP POSTs
 //! ([`exporter::HttpsExporter::emit_batch`]); nothing here parses a response
-//! body for anything but a batch-accepted/rejected status, and no daemon
-//! state is ever mutated from data received over this channel.
+//! body for anything but a batch-accepted/rejected status **plus the
+//! self-diagnostic host-identity echo below**, and no daemon *behavior* is
+//! ever driven by data received over this channel.
+//!
+//! The one thing read out of a response body (Issue #4830) is the `host_id`
+//! the backend echoes for the key it authenticated. It is compared against
+//! this daemon's own [`crate::sweep_registry::host_identity`] and, on a
+//! mismatch, published to [`HostIdStatus`] + logged once — it never selects an
+//! endpoint, never changes what is exported, and is never written into a
+//! record. A hostile/broken sink can therefore, at worst, make this daemon
+//! report a mismatch that is not real; it cannot steer the daemon.
 //!
 //! # Ingest key handling
 //!
@@ -198,6 +207,78 @@ pub fn resolve_queue_capacity(config: &ObservabilityConfig) -> usize {
         .unwrap_or(DEFAULT_QUEUE_CAPACITY)
 }
 
+// ============================================================================
+// Host-identity mismatch status (Issue #4830)
+// ============================================================================
+
+/// Shared, thread-safe handle the exporter publishes a confirmed host-identity
+/// mismatch to, and [`crate::ipc::build_daemon_status`] reads back — mirroring
+/// [`crate::auto_update::AutoUpdateStatus`]'s process-global pattern rather than
+/// threading an `Arc` through the whole IPC server.
+///
+/// **Write-once per process.** The first mismatch observed wins and is never
+/// overwritten or cleared: the WARN is once-per-daemon-lifetime by AC, so the
+/// published record has to be too, or `first_seen_at` would silently become
+/// "last flush" and the two surfaces would disagree.
+#[derive(Debug, Default)]
+pub struct HostIdStatus {
+    inner: std::sync::Mutex<Option<crate::types::ObservabilityHostIdMismatch>>,
+}
+
+// Allow expect_used: a poisoned status mutex means another thread panicked while
+// holding it — unrecoverable, matching the crash-on-poison policy `auto_update`
+// and `ipc` already use for their status mutexes.
+#[allow(clippy::expect_used)]
+impl HostIdStatus {
+    /// Record the first observed mismatch. Returns `true` when this call is the
+    /// one that recorded it (i.e. the caller owes exactly one WARN), `false`
+    /// when a mismatch was already published this process.
+    pub fn record_mismatch(&self, daemon_host_id: &str, ingest_host_id: &str) -> bool {
+        let mut guard = self
+            .inner
+            .lock()
+            .expect("observability host-id status mutex poisoned");
+        if guard.is_some() {
+            return false;
+        }
+        *guard = Some(crate::types::ObservabilityHostIdMismatch {
+            daemon_host_id: daemon_host_id.to_string(),
+            ingest_host_id: ingest_host_id.to_string(),
+            first_seen_at: chrono::Utc::now(),
+        });
+        true
+    }
+
+    /// The published mismatch, or `None` when the ids have agreed on every
+    /// acked batch so far (the common case).
+    #[must_use]
+    pub fn snapshot(&self) -> Option<crate::types::ObservabilityHostIdMismatch> {
+        self.inner
+            .lock()
+            .expect("observability host-id status mutex poisoned")
+            .clone()
+    }
+}
+
+/// Process-global status handle, registered by [`spawn_task`] when — and only
+/// when — the exporter actually starts. Unset (observability disabled, keyless,
+/// or under-configured) reads as `None`, so a disabled exporter contributes
+/// nothing to `status`/`health`.
+static GLOBAL_HOST_ID_STATUS: std::sync::OnceLock<Arc<HostIdStatus>> = std::sync::OnceLock::new();
+
+/// Register the exporter's status handle as the process-global. Idempotent:
+/// only the first registration wins (there is exactly one exporter per process).
+pub fn register_global_host_id_status(status: Arc<HostIdStatus>) {
+    let _ = GLOBAL_HOST_ID_STATUS.set(status);
+}
+
+/// The process-global host-identity mismatch, or `None` when none has been
+/// observed (or the exporter never started).
+#[must_use]
+pub fn global_host_id_mismatch() -> Option<crate::types::ObservabilityHostIdMismatch> {
+    GLOBAL_HOST_ID_STATUS.get().and_then(|s| s.snapshot())
+}
+
 /// Read `path` and return its trimmed contents as the ingest key. Every
 /// failure (missing file, unreadable, empty after trimming) is logged
 /// **by path only** — the key itself never reaches a log line — and yields
@@ -259,7 +340,21 @@ pub fn spawn_task(
         return None;
     };
     let ingest_key = read_ingest_key(&key_file)?;
-    let exporter = match HttpsExporter::new(endpoint.clone(), ingest_key) {
+    // Resolved ONCE and threaded into both consumers below (Issue #4830): the
+    // collector stamps it on every envelope and the exporter checks the backend's
+    // echo against it. Two independent `host_identity()` calls could not disagree
+    // today, but a single value makes that structurally true rather than
+    // incidentally so — and the whole point of the check is that the two halves
+    // being compared are the *same* identity the records are filed under.
+    let host_id = crate::sweep_registry::host_identity();
+    let host_id_status = Arc::new(HostIdStatus::default());
+    register_global_host_id_status(host_id_status.clone());
+    let exporter = match HttpsExporter::new(
+        endpoint.clone(),
+        ingest_key,
+        host_id.clone(),
+        host_id_status,
+    ) {
         Ok(exporter) => exporter,
         Err(error) => {
             log::warn!("observability: failed to construct HTTPS exporter for {endpoint}: {error} — export off");
@@ -277,7 +372,6 @@ pub fn spawn_task(
         flush_interval.as_secs()
     );
     let queue = Arc::new(DurableQueue::open(queue_path, capacity));
-    let host_id = crate::sweep_registry::host_identity();
 
     let collector_handle = collector::spawn_task(
         bus,

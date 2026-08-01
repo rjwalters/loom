@@ -102,6 +102,17 @@ second sink** (epic Phase 4, tracked separately in
 that issue is still open, so OTLP support has **not** landed; every host today
 speaks the native HTTPS/JSON wire format only.
 
+**The exporter verifies its own identity** (issue #4830). Each `/ingest`
+success response echoes the `host_id` the presented key is bound to; the
+exporter compares that against the identity this daemon resolved for itself
+(`$LOOM_HOST_ID` > `$HOSTNAME` > `hostname`). On a disagreement — the wrong
+host's key file installed on a machine, which silently mislabeled a whole
+night of telemetry on 2026-07-31 — it logs a WARN **once per daemon lifetime**
+and `loom-daemon health` reports an `observability DEGRADED` section (exit
+`1`). Nothing else changes: the batch is still acked, and the key's binding
+stays authoritative on the backend. Fix by installing the right key or setting
+`$LOOM_HOST_ID` to match, then restarting the daemon.
+
 ## 4. The backend: deploy your own Cloudflare Worker
 
 The Phase-2 backend is a Cloudflare Worker (D1 for durable history, a

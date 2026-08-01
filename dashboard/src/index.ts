@@ -168,7 +168,7 @@ async function handleIngest(request: Request, env: Env): Promise<Response> {
     return jsonError(400, "request body must be a bare JSON array of telemetry envelopes");
   }
   if (body.length === 0) {
-    return new Response(JSON.stringify({ accepted: 0 }), { status: 200, headers: JSON_HEADERS });
+    return ingestAck(0, auth.hostId);
   }
 
   // Whole-batch rejection on the first malformed envelope. Documented
@@ -240,7 +240,31 @@ async function handleIngest(request: Request, env: Env): Promise<Response> {
     console.error(`fleet state update failed (D1 write already committed): ${(error as Error).message}`);
   }
 
-  return new Response(JSON.stringify({ accepted: envelopes.length }), {
+  return ingestAck(envelopes.length, auth.hostId);
+}
+
+/**
+ * The `/ingest` success response (issue #4830).
+ *
+ * `host_id` echoes back the identity the *authenticated key* is bound to — the
+ * one this request's rows were actually filed under (see the INSERT above),
+ * which is not necessarily the `host_id` inside the envelopes. The exporter
+ * compares it against the daemon's own host identity and warns when they
+ * disagree.
+ *
+ * That echo exists because of a live 2026-07-31 incident: a Mac Studio spent
+ * hours pushing telemetry under `robb-pro` because the wrong host's key file
+ * had been installed on it. The backend cannot detect this — a key-bound
+ * host_id is authoritative here by design — and the exporter had no idea what
+ * its key was bound to, so nothing anywhere warned. Only the daemon holds both
+ * halves; this field is what hands it the second one.
+ *
+ * Purely additive: `accepted` is unchanged, no envelope `schema_version` rev is
+ * involved, and a pre-#4830 exporter that ignores the response body is
+ * unaffected.
+ */
+function ingestAck(accepted: number, hostId: string): Response {
+  return new Response(JSON.stringify({ accepted, host_id: hostId }), {
     status: 200,
     headers: JSON_HEADERS,
   });

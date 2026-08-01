@@ -1332,6 +1332,47 @@ pub struct DaemonStatusReport {
     /// `#[serde(default)]` keeps older wire data compatible.
     #[serde(default)]
     pub work_finder_interval_secs: Option<u64>,
+    /// An observability-exporter host-identity mismatch detected this process
+    /// (Issue #4830): the ingest key installed on this host is bound to a
+    /// *different* `host_id` than the one this daemon reports for itself, so
+    /// every record it pushes is filed under the wrong host.
+    ///
+    /// `None` in the overwhelmingly common case — the ids agree, the exporter
+    /// is disabled/keyless, or no batch has been acked yet this process — and
+    /// for a pre-#4830 wire payload. Published by
+    /// [`crate::observability::HostIdStatus`] and read here via
+    /// [`crate::observability::global_host_id_mismatch`]. `#[serde(default)]`
+    /// keeps older wire data / older clients compatible.
+    #[serde(default)]
+    pub observability_host_id_mismatch: Option<ObservabilityHostIdMismatch>,
+}
+
+/// A confirmed disagreement between the host identity this daemon resolves for
+/// itself and the `host_id` the ingest backend echoes back for the key it
+/// authenticated (Issue #4830).
+///
+/// Filed as a *data* type on the status wire rather than a log-only condition
+/// because the 2026-07-31 incident it exists for was invisible for hours: a Mac
+/// Studio pushed its whole first night of telemetry under another host's id
+/// because the wrong key file had been installed on it, and neither side had any
+/// way to notice. The backend cannot notice (a key-bound id is authoritative by
+/// design), so the *daemon* is the only party that holds both halves.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObservabilityHostIdMismatch {
+    /// What this daemon calls itself —
+    /// [`crate::sweep_registry::host_identity`], resolved with the precedence
+    /// `$LOOM_HOST_ID`, then `$HOSTNAME`, then the `hostname` binary, then
+    /// `"unknown-host"`. The same value it stamps on every outgoing envelope.
+    pub daemon_host_id: String,
+    /// The `host_id` the `/ingest` response echoed — the identity the
+    /// authenticated key is bound to, i.e. the host every pushed record is
+    /// actually being filed under.
+    pub ingest_host_id: String,
+    /// When the mismatch was first observed this daemon process. Never
+    /// re-stamped on subsequent flushes: the WARN and this record are both
+    /// once-per-lifetime, so this is the age of the condition, not of the last
+    /// flush.
+    pub first_seen_at: DateTime<Utc>,
 }
 
 /// One work-finder tick's dispatch/skip tally, stamped with the wall-clock
