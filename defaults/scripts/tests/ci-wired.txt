@@ -117,6 +117,7 @@ test-worktree-hookspath.sh
 test-worktree-json-purity.sh
 test-worktree-nested-symlinks.sh
 test-worktree-remote-branch-tracking.sh
+test-worktree-remove-squash-merge.sh
 test-worktree-remove.sh
 test-worktree-root-override.sh
 test-worktree-sentinel-reinvoke.sh
