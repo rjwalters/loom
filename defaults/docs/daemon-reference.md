@@ -2597,6 +2597,7 @@ exactly like `main_health_gate::read_build_gate_config`.
 | `autonomous.autoUpdate.enabled` | `LOOM_AUTO_UPDATE` | `false` | Autonomous self-update loop on/off (#4055). **Opt-in** (it rebuilds + restarts the daemon process). Exactly one loop per daemon, not a per-workspace fan-out. See [Autonomous self-update loop](#autonomous-self-update-loop-4055) below |
 | `autonomous.autoUpdate.intervalSecs` | `LOOM_AUTO_UPDATE_INTERVAL_SECS` | `900` | Cadence between staleness checks. Zero/invalid → default |
 | `autonomous.autoUpdate.settleSecs` | `LOOM_AUTO_UPDATE_SETTLE_SECS` | `600` | Settle window: wait this long after first observing a stale commit — resetting on every further commit — before rolling, so a burst of merges collapses into one roll. Zero/invalid → default |
+| `autonomous.autoUpdate.deferDeadlineSecs` | `LOOM_AUTO_UPDATE_DEFER_DEADLINE_SECS` | `21600` (6h) | Bound on the build-stampede gate (#4929): after this much **continuous** deferral for in-flight sweeps, the rebuild runs anyway at reduced CPU priority (`nice 19`) instead of deferring forever. Any check that sees zero in-flight sweeps — or a new source commit, or a completed rebuild — re-arms the clock, so short busy bursts never reach it. Zero/invalid → default; there is deliberately no "defer forever" value (set a very large one instead) |
 
 ### Idle exit for remote hosts (#4467)
 
@@ -4832,10 +4833,11 @@ It is the *deciding + sequencing* layer — it reuses `loom-daemon-update.sh`
 primitive for the restart, reimplementing neither.
 
 **Opt-in, default OFF** (it has side effects on the running process). Enable via
-`autonomous.autoUpdate.enabled` / `LOOM_AUTO_UPDATE=1`; tune the cadence and
-settle window with `intervalSecs` (default 900) / `settleSecs` (default 600).
-All three knobs resolve **env > config > default** through `config_resolver`, so
-the `.loom-project/` tier is honored like every other `autonomous.*` block.
+`autonomous.autoUpdate.enabled` / `LOOM_AUTO_UPDATE=1`; tune the cadence, settle
+window, and stampede-gate deadline with `intervalSecs` (default 900) /
+`settleSecs` (default 600) / `deferDeadlineSecs` (default 21600). All four knobs
+resolve **env > config > default** through `config_resolver`, so the
+`.loom-project/` tier is honored like every other `autonomous.*` block.
 
 **Exactly one loop per daemon process** — not a `spawn_multi_*` per-workspace
 fan-out. Its subject is the daemon process itself (one binary, one source
@@ -4858,9 +4860,19 @@ Each tick (surfaced in `loom-daemon status` — human and `--json` — as
 3. **Settle window** — waits `settleSecs` after first observing a stale commit,
    resetting on every further commit, so a burst of daemon merges collapses into
    a single roll.
-4. **Build-stampede gate** — defers the rebuild while `ipc::count_in_flight_sweeps`
-   reports any non-terminal sweep across every managed root (a `cargo build
-   --release` competes with in-flight sweep builds for CPU).
+4. **Build-stampede gate (bounded, #4929)** — defers the rebuild while
+   `ipc::count_in_flight_sweeps` reports any non-terminal sweep across every
+   managed root (a `cargo build --release` competes with in-flight sweep builds
+   for CPU). The deferral is **not** open-ended: a host that runs at its
+   dispatch cap around the clock never reaches zero in-flight sweeps, and an
+   unconditional gate there starved the roll indefinitely (`last_roll: null`
+   with `update_available: true` for a day+). After `deferDeadlineSecs` of
+   *continuous* deferral the loop rebuilds anyway, niced to 19 so the forced
+   build yields CPU to the running sweeps; the roll then proceeds through the
+   same drain path below (and if that drain is refused or times out, the fresh
+   binary is still provisioned for the next supervised restart). The clock
+   re-arms on any zero-in-flight check, a new source commit, or a completed
+   rebuild, so short busy bursts never reach the deadline.
 5. **Roll via drain, not a bare restart** — on a clean rebuild it triggers
    `ipc::handle_drain_request` (#4090), so in-flight sweeps finish first and
    survive in the registry rather than being orphaned as bare processes. The
