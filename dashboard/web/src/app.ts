@@ -18,7 +18,8 @@ import { fetchFleetState } from "./api";
 import { replaceChildren } from "./dom";
 import { buildFleetView, findHost, type FleetView } from "./fleet";
 import { formatClock } from "./format";
-import { OVERVIEW, parseRoute, type Route } from "./router";
+import { OVERVIEW, isPanelRoute, parseRoute, type PanelRouteName, type Route } from "./router";
+import { PANEL_STATUS, mountPanel } from "./panels";
 import type { FleetSnapshot } from "./types";
 import { fleetOverviewView } from "./views/fleetOverview";
 import { hostDetailView } from "./views/hostDetail";
@@ -57,6 +58,15 @@ export class App {
   private inFlight = false;
   private timer: number | null = null;
   private stopped = false;
+
+  /** Which panel route is currently mounted, and how to tear it down.
+   *
+   * Panel routes (#4895) own their own fetching, so they must be mounted on a
+   * route *change* and not on every `render()` — `render()` runs on each poll
+   * tick, and remounting there would refetch and flicker the panel every
+   * `pollIntervalMs`. */
+  private mountedPanel: PanelRouteName | null = null;
+  private teardownPanel: (() => void) | null = null;
 
   constructor(options: AppOptions) {
     this.root = options.root;
@@ -129,6 +139,7 @@ export class App {
   }
 
   stop(): void {
+    this.unmountPanel();
     this.stopped = true;
     if (this.timer !== null) {
       this.scheduler.clearTimeout(this.timer);
@@ -153,8 +164,35 @@ export class App {
     return this.snapshot ? buildFleetView(this.snapshot, this.now()) : null;
   }
 
+  /** Mount `name`'s panel if it is not already the mounted one. Idempotent by
+   * design — `render()` calls this on every poll tick. */
+  private renderPanel(name: PanelRouteName): void {
+    if (this.mountedPanel === name) return;
+    this.unmountPanel();
+
+    this.root.setAttribute("aria-busy", "false");
+    this.teardownPanel = mountPanel(name, this.root);
+    this.mountedPanel = name;
+  }
+
+  private unmountPanel(): void {
+    this.teardownPanel?.();
+    this.teardownPanel = null;
+    this.mountedPanel = null;
+  }
+
   render(): void {
     const now = this.now();
+
+    // Panel routes short-circuit every snapshot-dependent branch below: they
+    // do not read the fleet snapshot at all, so a first paint before the first
+    // poll returns must not show the fleet's loading view.
+    if (isPanelRoute(this.route)) {
+      this.renderPanel(this.route.name);
+      this.setStatus(PANEL_STATUS[this.route.name]);
+      return;
+    }
+    this.unmountPanel();
 
     if (this.loading && !this.snapshot) {
       this.root.setAttribute("aria-busy", "true");

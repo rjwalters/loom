@@ -7,7 +7,7 @@
 import "./styles.css";
 import { App } from "./app";
 import { wireAccountMenu } from "./accountMenu";
-import { onRouteChange, parseRoute } from "./router";
+import { onRouteChange, parseRoute, routeToHash } from "./router";
 
 const root = document.getElementById("app");
 if (!(root instanceof HTMLElement)) {
@@ -22,7 +22,23 @@ const app = new App({
   refreshButton: document.getElementById("refresh-button"),
 });
 
-onRouteChange((route) => app.navigate(route));
+/** Mark the nav link matching the active route, so the user can see where
+ * they are. Driven from the parsed route rather than the raw hash so an
+ * unrecognized hash highlights Fleet, matching where it actually lands. */
+function syncNav(doc: Document, hash: string): void {
+  const active = routeToHash(parseRoute(hash));
+  for (const link of doc.querySelectorAll<HTMLAnchorElement>(".topbar__navlink")) {
+    if (link.getAttribute("href") === active) link.setAttribute("aria-current", "page");
+    else link.removeAttribute("aria-current");
+  }
+}
+
+syncNav(document, window.location.hash);
+
+onRouteChange((route) => {
+  app.navigate(route);
+  syncNav(document, window.location.hash);
+});
 
 void app.start(window.location.hash).then(() => app.startPolling());
 
