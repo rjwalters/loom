@@ -1975,6 +1975,13 @@ extract_rm_targets() {
 #                                     REST of the segment is still scanned as
 #                                     a command for write idioms)
 #
+# CONFLICTING ASSIGNMENTS ARE UNRESOLVABLE (#4914 review): the scan is not
+# control-flow aware — qsplit() flattens `||`/`&&`/`;` into plain segments — so
+# a name assigned two DIFFERENT values in one command
+# (`A=<repo>/defaults/hooks || A=/tmp/outside`) is poisoned to the unresolvable
+# sentinel rather than resolved to whichever branch happens to come last in the
+# token stream. See record_assign() below.
+#
 # FAIL-CLOSED ON UNRESOLVABLE (#4914 review): a `$NAME` with NO matching
 # assignment, or a token starting with `$` that is not a bare variable
 # reference at all (`$(...)` command substitution, `${VAR:-default}`, `$1`,
@@ -2019,6 +2026,26 @@ extract_write_targets() {
     }
     # Record a single `NAME=value` word into varmap (value optionally wrapped
     # in matching single/double quotes, which qsplit() copies verbatim).
+    #
+    # CONFLICTING ASSIGNMENTS POISON THE VARIABLE (#4914 review): this scan is
+    # NOT control-flow aware -- qsplit() flattens `||`/`&&`/`;` into plain
+    # segments, so `A=<in-repo> || A=/tmp/outside` reaches here as two
+    # assignments to the same name. A plain last-write-wins store would then
+    # resolve `$A` to whichever branch happens to appear LAST in the token
+    # stream, which real bash need never take (`||` short-circuits, so `$A` is
+    # the in-repo value at runtime) -- silently ALLOWing a write into the main
+    # checkout. So when a name is re-assigned a DIFFERENT value within the same
+    # command, its entry is replaced with the AMBIG sentinel instead: a
+    # `$`-leading value, which resolve_var() already refuses to substitute as
+    # an unresolved chain. The token then falls back to the literal
+    # (cwd-prefixed) treatment and denies -- the same fail-closed path every
+    # other unresolvable shape takes. Poisoning is sticky (any later assignment
+    # differs from the sentinel too) and deliberately blunt: it also covers
+    # sequential `A=x; A=y` reassignment, where resolving is *possible* in
+    # principle but the safe direction is to stop guessing. Re-assigning the
+    # SAME value is not a conflict and still resolves normally -- quotes are
+    # stripped above, before the comparison, so a bare and a quoted spelling of
+    # one value compare equal.
     function record_assign(word,   eqpos, vname, vval, vlen, c1, c2) {
         eqpos = index(word, "=")
         if (eqpos < 2) return
@@ -2032,12 +2059,20 @@ extract_write_targets() {
                 vval = substr(vval, 2, vlen - 2)
             }
         }
+        if ((vname in varmap) && varmap[vname] != vval) {
+            varmap[vname] = AMBIG
+            return
+        }
         varmap[vname] = vval
     }
     BEGIN {
         SEP = sprintf("%c", 31)
         DQ = sprintf("%c", 34)
         SQ = sprintf("%c", 39)
+        # Poison value for a name assigned two different values in one command
+        # (see record_assign). The leading "$" is load-bearing: it routes into
+        # the existing unresolved-chain refusal inside resolve_var().
+        AMBIG = "$__LOOM_AMBIGUOUS_ASSIGNMENT__"
         curcwd = startcwd
     }
     {

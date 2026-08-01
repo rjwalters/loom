@@ -2769,6 +2769,45 @@ assert_deny "write-confinement (#4881): assignment AFTER the write does not reso
     "cp /tmp/a.sh \$LATER4881/evil.sh
 LATER4881=$OUTSIDE_SCRATCH" "$WT_REPO"
 
+# CONFLICTING ASSIGNMENTS POISON THE VARIABLE (#4914 review). The assignment
+# scan is not control-flow aware -- qsplit() flattens `||`/`&&`/`;` into plain
+# segments -- so `A=<in-repo> || A=/tmp/outside` reaches record_assign() as two
+# assignments to one name. Last-write-wins would resolve `$A` to the LAST value
+# in the token stream, but a real bash short-circuits `||` and never takes that
+# branch: the write actually lands INSIDE the main checkout. Poisoning the name
+# to the unresolvable sentinel routes it back to the literal (cwd-prefixed)
+# fail-closed path, so it denies either way round.
+assert_deny "write-confinement (#4914): 'A=<in-repo> || A=<outside>' must not resolve to the un-taken branch -> denies" \
+    "SNEAK=$WT_REPO/defaults/hooks || SNEAK=$OUTSIDE_SCRATCH
+echo pwned > \$SNEAK/evil.sh" "$WT_REPO"
+assert_deny "write-confinement (#4914): '&&' + '||' combined branch assignment does not resolve to the un-taken branch -> denies" \
+    "SNEAK=$WT_REPO/defaults/hooks && echo ok || SNEAK=$OUTSIDE_SCRATCH
+echo pwned > \$SNEAK/evil.sh" "$WT_REPO"
+assert_deny "write-confinement (#4914): conflicting assignment in the OTHER order is poisoned too (fail-closed) -> denies" \
+    "SNEAK=$OUTSIDE_SCRATCH || SNEAK=$WT_REPO/defaults/hooks
+echo pwned > \$SNEAK/evil.sh" "$WT_REPO"
+assert_deny "write-confinement (#4914): sequential 'A=<in-repo>; A=<outside>' reassignment is poisoned (fail-closed) -> denies" \
+    "SNEAK=$WT_REPO/defaults/hooks; SNEAK=$OUTSIDE_SCRATCH; echo pwned > \$SNEAK/evil.sh" "$WT_REPO"
+
+# ...but poisoning must not OVERCORRECT. Only a genuinely CONFLICTING value
+# poisons: re-stating the SAME value (quotes are stripped before the
+# comparison) is unambiguous and must still resolve, and one name being
+# re-assigned must never contaminate a DIFFERENT name.
+assert_allow "write-confinement (#4914): same value assigned twice in one command is NOT poisoned -> allow" \
+    "SCRATCH=$OUTSIDE_SCRATCH || SCRATCH=$OUTSIDE_SCRATCH
+echo x > \$SCRATCH/out.txt" "$WT_REPO"
+assert_allow "write-confinement (#4914): same value re-stated with quotes is NOT poisoned -> allow" \
+    "SCRATCH=$OUTSIDE_SCRATCH || SCRATCH='$OUTSIDE_SCRATCH'
+echo x > \$SCRATCH/out.txt" "$WT_REPO"
+assert_allow "write-confinement (#4914): poisoning one name does not contaminate a different name -> allow" \
+    "SNEAK=$WT_REPO/defaults/hooks || SNEAK=$OUTSIDE_SCRATCH
+SCRATCH=$OUTSIDE_SCRATCH
+echo x > \$SCRATCH/out.txt" "$WT_REPO"
+assert_allow "write-confinement (#4914): a write BEFORE the conflicting reassignment still resolves normally -> allow" \
+    "SCRATCH=$OUTSIDE_SCRATCH
+echo x > \$SCRATCH/out.txt
+SCRATCH=$OUTSIDE_SCRATCH/other" "$WT_REPO"
+
 rm -rf "$OUTSIDE_SCRATCH"
 
 # -------------------------------------------------------------------------
