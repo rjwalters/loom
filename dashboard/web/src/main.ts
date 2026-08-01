@@ -6,12 +6,15 @@
 
 import "./styles.css";
 import { App } from "./app";
+import { wireAccountMenu } from "./accountMenu";
 import { onRouteChange, parseRoute } from "./router";
 
 const root = document.getElementById("app");
 if (!(root instanceof HTMLElement)) {
   throw new Error("#app container is missing from index.html");
 }
+
+wireAccountMenu(document);
 
 const app = new App({
   root,

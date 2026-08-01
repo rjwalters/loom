@@ -55,8 +55,10 @@ function mockJwksFetch(): () => void {
   };
 }
 
-async function signToken(overrides: { aud?: string; expiresIn?: string } = {}): Promise<string> {
-  return new SignJWT({ email: "operator@2amlogic.com" })
+async function signToken(
+  overrides: { aud?: string; expiresIn?: string; email?: string } = {},
+): Promise<string> {
+  return new SignJWT({ email: overrides.email ?? "operator@2amlogic.com" })
     .setProtectedHeader({ alg: "RS256" })
     .setIssuedAt()
     .setIssuer(`https://${TEAM_DOMAIN}`)
@@ -81,7 +83,11 @@ async function signToken(overrides: { aud?: string; expiresIn?: string } = {}): 
  * which `publicPage.test.ts` covers.
  */
 function expectAuthState(html: string, authenticated: boolean): void {
-  expect(html).toContain(`window.__LOOM_FLEET__={"authenticated":${authenticated}};`);
+  // Asserted on the key/value pair rather than the whole serialized object,
+  // which also carries the viewer's `email` when there is one. Still pinned
+  // to the exact literal `true`/`false` — a substring like `"authenticated"`
+  // alone would pass on either value.
+  expect(html).toContain(`window.__LOOM_FLEET__={"authenticated":${authenticated}`);
 }
 
 const PRIVATE_REPO = "rjwalters/root-route-private-repo";
@@ -235,6 +241,47 @@ describe("GET / — Access JWT wired end to end (real createRemoteJWKSet path)",
       }),
     );
     expect(response.status).toBe(401);
+  });
+
+  it("hands the SPA the signed-in operator's email for the account menu", async () => {
+    restoreFetch = mockJwksFetch();
+    const token = await signToken();
+
+    const response = await callWorker(
+      new Request("https://ingest.example/", { headers: { cookie: `CF_Authorization=${token}` } }),
+    );
+
+    // `signToken` puts this address in the JWT's `email` claim.
+    expect(await response.text()).toContain('"email":"operator@2amlogic.com"');
+  });
+
+  it("never leaks an identity to an anonymous viewer", async () => {
+    restoreFetch = mockJwksFetch();
+    const response = await callWorker(new Request("https://ingest.example/"));
+    const html = await response.text();
+
+    expect(html).not.toContain("operator@2amlogic.com");
+    expect(html).not.toContain('"email"');
+  });
+
+  // The injected state sits inside an inline <script>. A value containing the
+  // literal `</script>` would terminate the block early and the remainder
+  // would parse as markup. The email comes from a signature-verified JWT so
+  // this is defense in depth, but it costs nothing and removes the need to
+  // reason about how far an IdP claim can be trusted.
+  it("escapes an injected identity so it cannot break out of the script block", async () => {
+    restoreFetch = mockJwksFetch();
+    const token = await signToken({ email: "</script><script>alert(1)</script>@evil.test" });
+
+    const response = await callWorker(
+      new Request("https://ingest.example/", { headers: { cookie: `CF_Authorization=${token}` } }),
+    );
+    const html = await response.text();
+
+    // Exactly the two <script> tags the shell legitimately contains (the
+    // injection and the module bundle) — the payload contributed none.
+    expect(html).not.toContain("</script><script>alert(1)");
+    expect(html).toContain("\\u003c/script\\u003e");
   });
 
   it("/public/* stays reachable anonymously — the split is auth, not obscurity", async () => {

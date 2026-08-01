@@ -12,6 +12,11 @@
       <h1 class="topbar__title">Loom fleet</h1>
       <div class="topbar__meta">
         <span id="refresh-status" class="topbar__status" aria-live="polite"></span>
+        <!-- Populated by `accountMenu.ts` from the server-injected auth
+             state: an avatar + menu when signed in, a Sign in button when
+             not. Empty in the markup so neither variant flashes before the
+             bundle runs. -->
+        <div id="account" class="topbar__account"></div>
         <button id="refresh-button" type="button" class="button">Refresh</button>
       </div>
     </header>

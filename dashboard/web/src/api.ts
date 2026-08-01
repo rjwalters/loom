@@ -53,17 +53,38 @@ export const PUBLIC_FLEET_STATE_PATH = "/public/fleet-state";
 /** The global `handleRoot` injects into the SPA shell. */
 const AUTH_STATE_GLOBAL = "__LOOM_FLEET__";
 
+/** The auth state the Worker stamps into the page. `email` is present only
+ * for an authenticated viewer whose token carried one. */
+export interface AuthState {
+  authenticated: boolean;
+  email?: string;
+}
+
 /**
  * Read the server-injected auth state.
  *
- * Defaults to **false** whenever the global is missing or malformed — a UI
- * that guesses "authenticated" would request `/api/*`, get a 403, and show an
- * error page to a visitor who was entitled to the public view. Guessing
+ * Defaults to **anonymous** whenever the global is missing or malformed — a
+ * UI that guesses "authenticated" would request `/api/*`, get a 401, and show
+ * an error page to a visitor who was entitled to the public view. Guessing
  * "public" merely under-fetches for someone who can reload.
  */
+export function readAuthState(scope: typeof globalThis = globalThis): AuthState {
+  const raw = (scope as Record<string, unknown>)[AUTH_STATE_GLOBAL];
+  if (typeof raw !== "object" || raw === null) return { authenticated: false };
+
+  const state = raw as { authenticated?: unknown; email?: unknown };
+  if (state.authenticated !== true) return { authenticated: false };
+
+  return {
+    authenticated: true,
+    ...(typeof state.email === "string" && state.email.length > 0 ? { email: state.email } : {}),
+  };
+}
+
+/** Whether the viewer is signed in. Thin wrapper over `readAuthState` — the
+ * common case, and the one the data-fetching path cares about. */
 export function isAuthenticatedViewer(scope: typeof globalThis = globalThis): boolean {
-  const state = (scope as Record<string, unknown>)[AUTH_STATE_GLOBAL];
-  return typeof state === "object" && state !== null && (state as { authenticated?: unknown }).authenticated === true;
+  return readAuthState(scope).authenticated;
 }
 
 /** The fleet-state path for a given auth state. */
