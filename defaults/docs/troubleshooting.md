@@ -642,7 +642,9 @@ claude -p "/loom:hermit"    --dangerously-skip-permissions
 > summary is a skill: `/loom:watch [--until 07:00] [--interval 25m]`
 > (`--dry-run` for a single read-only tick). It assumes — and does not restate —
 > the host-sleep and `.loom/` resync procedures in this section. See
-> `.claude/commands/loom/watch.md`.
+> `.claude/commands/loom/watch.md`. Note the host-sleep check above does **not**
+> cover *session* suspension stalling a mode-A `ScheduleWakeup` loop — see
+> `watch.md` → Loop mechanics → A for that hazard and its preflight (#4930).
 
 ### Keeping the host awake (#3350)
 
