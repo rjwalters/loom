@@ -10,6 +10,8 @@
  * `worktree_root_free_gb` as `0 GB` would show a full disk. Both are tested.
  */
 
+import { displayTimeZone, timeZoneAbbreviation } from "./timezone";
+
 export const UNKNOWN = "—";
 
 /** `0.83` → `"83%"`. */
@@ -85,13 +87,59 @@ export function formatCountdown(iso: string | undefined, now: Date = new Date())
   return `${formatDuration(seconds)} ago`;
 }
 
-/** Absolute timestamp for a `title=` tooltip — the relative form is what is
- * shown, the absolute one is what gets pasted into a bug report. */
-export function formatAbsolute(iso: string | undefined): string {
+/**
+ * Absolute timestamp for a `title=` tooltip — the relative form is what is
+ * shown, the absolute one is what gets pasted into a bug report.
+ *
+ * Rendered in the display timezone (`./timezone.ts`) rather than UTC, so it
+ * agrees with the chart buckets and with what the operator sees on their own
+ * clock. The zone abbreviation is always appended: a bare wall-clock time in
+ * a bug report is worse than useless, because the reader cannot tell which
+ * zone it was captured in.
+ */
+export function formatAbsolute(iso: string | undefined, zone: string = displayTimeZone()): string {
   if (!iso) return UNKNOWN;
   const parsed = Date.parse(iso);
   if (Number.isNaN(parsed)) return UNKNOWN;
-  return new Date(parsed).toISOString().replace("T", " ").replace(".000Z", "Z");
+
+  const at = new Date(parsed);
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: zone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).formatToParts(at);
+
+  const get = (type: string): string => parts.find((p) => p.type === type)?.value ?? "";
+  // Assembled from parts rather than the formatted string: locale output
+  // order is not guaranteed, and `hour12: false` can yield "24" for midnight
+  // in some runtimes, which this normalizes away.
+  const hour = get("hour") === "24" ? "00" : get("hour");
+
+  return (
+    `${get("year")}-${get("month")}-${get("day")} ` +
+    `${hour}:${get("minute")}:${get("second")} ${timeZoneAbbreviation(zone, at)}`
+  );
+}
+
+/** Wall-clock `HH:MM:SS TZ` in the display timezone — the refresh status
+ * line, where the date is redundant but the zone is not. */
+export function formatClock(at: Date, zone: string = displayTimeZone()): string {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: zone,
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).formatToParts(at);
+
+  const get = (type: string): string => parts.find((p) => p.type === type)?.value ?? "";
+  const hour = get("hour") === "24" ? "00" : get("hour");
+  return `${hour}:${get("minute")}:${get("second")} ${timeZoneAbbreviation(zone, at)}`;
 }
 
 export function formatCount(value: number | undefined): string {

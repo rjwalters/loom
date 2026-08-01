@@ -121,6 +121,12 @@ export interface Env {
    * render the public view (fails closed, never the other way). */
   CF_ACCESS_TEAM_DOMAIN?: string;
   CF_ACCESS_AUD?: string;
+  /** IANA timezone the UI renders times and buckets chart days in (e.g.
+   * `America/Los_Angeles`). Unset — the committed default — makes the UI fall
+   * back to each viewer's own browser zone. Set it on a deployment whose
+   * chart buckets should mean the same thing to everyone looking (issue
+   * #4857); the UI validates it and falls back rather than failing. */
+  DISPLAY_TIMEZONE?: string;
   /** Workers Assets binding for the built dashboard UI (`web/dist`). Absent
    * in the Miniflare test env and on a deploy whose UI build did not run —
    * `handleRoot` falls back to the server-rendered page in that case, so this
@@ -464,6 +470,8 @@ function serializeForScript(value: unknown): string {
 interface InjectedAuthState {
   authenticated: boolean;
   email?: string;
+  /** Display timezone for the UI, when the deployment configures one. */
+  timeZone?: string;
 }
 
 /** Inject the auth state into the SPA shell as a `<script>` immediately
@@ -498,9 +506,12 @@ async function handleRoot(request: Request, env: Env): Promise<Response> {
   if (env.ASSETS) {
     const shell = await env.ASSETS.fetch(new Request(new URL("/index.html", request.url), { method: "GET" }));
     if (shell.ok) {
+      // The timezone is deployment config, not identity — an anonymous
+      // visitor reads the same charts and must bucket them the same way.
+      const timeZone = env.DISPLAY_TIMEZONE ? { timeZone: env.DISPLAY_TIMEZONE } : {};
       const state: InjectedAuthState = isAuthenticated
-        ? { authenticated: true, ...(identity.email ? { email: identity.email } : {}) }
-        : { authenticated: false };
+        ? { authenticated: true, ...(identity.email ? { email: identity.email } : {}), ...timeZone }
+        : { authenticated: false, ...timeZone };
 
       return new Response(injectAuthState(await shell.text(), state), {
         status: 200,

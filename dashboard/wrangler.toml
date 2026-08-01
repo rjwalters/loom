@@ -136,6 +136,16 @@ new_sqlite_classes = ["FleetState"]
 RETENTION_DAYS = "90"
 MAX_RECORDS = "500000"
 
+# Display timezone for the UI: an IANA name (e.g. "America/Los_Angeles").
+#
+# Unset (the default here) means each viewer sees times in their own browser
+# zone. Setting it pins the whole deployment to one zone, which is what you
+# want once the charts matter: `bucketKey` decides which calendar day a sweep
+# is counted in, so a browser-derived zone gives two viewers different daily
+# totals for the same data. An invalid name falls back rather than failing.
+#
+# DISPLAY_TIMEZONE = "America/Los_Angeles"
+
 # CHANGE ME (both, together) — required only if you want the single-URL
 # fallback layout (docs/cloudflare-access.md): anonymous visitors to `/` see
 # the public view, a `2amlogic.com`-style Access identity sees the full

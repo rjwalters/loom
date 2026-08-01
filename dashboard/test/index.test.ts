@@ -284,6 +284,23 @@ describe("GET / — Access JWT wired end to end (real createRemoteJWKSet path)",
     expect(html).toContain("\\u003c/script\\u003e");
   });
 
+  // The display timezone is deployment config, not identity: an anonymous
+  // visitor reads the same charts as a signed-in one and must bucket them the
+  // same way, or the two would disagree about which day a sweep happened on.
+  // `DISPLAY_TIMEZONE` is unset in the test bindings, so neither variant
+  // carries a `timeZone` and the UI falls back to the viewer's browser zone.
+  it("omits the display timezone when the deployment does not configure one", async () => {
+    restoreFetch = mockJwksFetch();
+    const anonymous = await callWorker(new Request("https://ingest.example/"));
+    expect(await anonymous.text()).not.toContain('"timeZone"');
+
+    const token = await signToken();
+    const authenticated = await callWorker(
+      new Request("https://ingest.example/", { headers: { cookie: `CF_Authorization=${token}` } }),
+    );
+    expect(await authenticated.text()).not.toContain('"timeZone"');
+  });
+
   it("/public/* stays reachable anonymously — the split is auth, not obscurity", async () => {
     const response = await callWorker(new Request("https://ingest.example/public/fleet-state"));
     expect(response.status).toBe(200);

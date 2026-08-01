@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { buildFleetView, findHost } from "../src/fleet";
 import { UNKNOWN } from "../src/format";
@@ -12,6 +12,18 @@ import {
   SWEEP_ONLY_HOST_ID,
   multiHostSnapshot,
 } from "./fixtures";
+
+// Views call `formatAbsolute()` internally with no zone argument, so they
+// resolve through `displayTimeZone()` — which falls back to the *machine's*
+// zone. Pin it the way production does (the Worker injects this global) so
+// these assertions do not depend on where the test runs.
+const injected = globalThis as unknown as Record<string, unknown>;
+beforeAll(() => {
+  injected.__LOOM_FLEET__ = { authenticated: false, timeZone: "UTC" };
+});
+afterAll(() => {
+  delete injected.__LOOM_FLEET__;
+});
 
 const view = () => buildFleetView(parseFleetSnapshot(multiHostSnapshot()), NOW);
 const detail = (hostId: string) => hostDetailView(findHost(view(), hostId)!, NOW);
@@ -139,8 +151,8 @@ describe("hostDetailView — active sweeps", () => {
   it("carries the absolute timestamps in tooltips", () => {
     const row = detail(HEALTHY_HOST_ID).querySelector('[data-testid="sweep-row"]')!;
     const tds = [...row.querySelectorAll("td")];
-    expect(tds[5]!.getAttribute("title")).toBe("2026-07-30 12:00:00Z");
-    expect(tds[6]!.getAttribute("title")).toBe("2026-07-30 12:06:00Z");
+    expect(tds[5]!.getAttribute("title")).toBe("2026-07-30 12:00:00 UTC");
+    expect(tds[6]!.getAttribute("title")).toBe("2026-07-30 12:06:00 UTC");
   });
 
   it("degrades a partially-reported sweep instead of blanking the row", () => {

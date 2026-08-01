@@ -10,6 +10,7 @@
 import type { HistoryRecord, SweepResult } from "../types.js";
 import { correlateSweeps } from "./correlate.js";
 import { type BucketGranularity, groupByTimeBucket } from "./timeBuckets.js";
+import { displayTimeZone } from "../timezone.js";
 
 export const SWEEP_RESULTS: readonly SweepResult[] = ["success", "failure", "cancelled", "blocked"] as const;
 
@@ -34,9 +35,10 @@ function emptyCounts(): Record<SweepResult, number> {
 export function buildOutcomesOverTime(
   records: HistoryRecord[],
   granularity: BucketGranularity = "daily",
+  zone: string = displayTimeZone(),
 ): OutcomeBucket[] {
   const sweeps = [...correlateSweeps(records).values()].filter((sweep) => sweep.result !== undefined);
-  const buckets = groupByTimeBucket(sweeps, (sweep) => sweep.emittedAt, granularity);
+  const buckets = groupByTimeBucket(sweeps, (sweep) => sweep.emittedAt, granularity, zone);
 
   const result: OutcomeBucket[] = [];
   for (const [key, bucketSweeps] of buckets) {
