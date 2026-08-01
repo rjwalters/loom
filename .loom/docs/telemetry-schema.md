@@ -331,4 +331,26 @@ loom-daemon sweep-outcomes --json
 Purely file-based (like `loom-daemon calibrate`) — no running daemon required.
 `--workspace PATH` selects a different repo root (default `.`).
 
+## Alternative sinks: the OTLP exporter (Epic #4702, Phase 4 — issue #4858)
+
+The native JSON-over-HTTPS push (`exporter::HttpsExporter`, above) is the
+default sink and stays that way for backward compatibility. Operators with an
+existing OpenTelemetry stack (a self-hosted collector, Grafana, Honeycomb, …)
+can instead select `observability.exporter = "otlp"`
+(`$LOOM_OBSERVABILITY_EXPORTER=otlp` overrides; **env > config > default**,
+default `"https"`), which POSTs to `{observability.endpoint}/v1/logs` and
+`{observability.endpoint}/v1/metrics` using the same `observability.endpoint`
++ `observability.ingestKeyFile` + `Authorization: Bearer` convention as the
+HTTPS sink.
+
+This is opt-in twice over: off by default (`observability.enabled`) *and*
+gated behind the `otlp` Cargo feature — a default `loom-daemon` build never
+compiles in the `opentelemetry-proto` dependency, so choosing `HttpsExporter`
+costs nothing extra. The full `TelemetryEnvelope` → OTLP field mapping (which
+record kinds become OTLP logs vs. metrics, and how `host_id` / `emitted_at` /
+the repo-visibility tag map onto OTLP resource/record attributes) is
+documented at `loom-daemon/src/observability/otlp/mod.rs`'s module doc
+comment, not duplicated here — that Rust doc comment is the source of truth,
+verified by `loom-daemon/src/observability/otlp/mapping.rs`'s unit tests.
+
 [`TelemetryEnvelope`]: #envelope
