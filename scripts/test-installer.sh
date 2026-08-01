@@ -2416,16 +2416,27 @@ echo ""
 # scripts/version.sh is retained — /repo:release detects and honors it as its
 # first-priority version tool. These tests pin version.sh's list/check surface.
 
-# Test 62: ./scripts/version.sh list emits the expected 5 entries
-echo "Test 62: 'scripts/version.sh list' emits the 5 version-bearing files"
+# Test 62: ./scripts/version.sh list emits the expected version-bearing files
+#
+# The base set is the 5 always-present files. `.loom/install-metadata.json` is
+# a conditional 6th entry (#4842): it exists only on a dogfooded install (loom
+# installed on its own repo — which IS the case for this repo's own CI run),
+# and version.sh's `list` arm existence-checks it before emitting. Mirror that
+# same presence check here rather than hardcoding a fixed line count, so the
+# test passes both in this repo and in a non-dogfooded checkout.
+echo "Test 62: 'scripts/version.sh list' emits the version-bearing files"
 LIST_OUTPUT="$("$LOOM_ROOT/scripts/version.sh" list)"
 EXPECTED_LIST="package.json
 mcp-loom/package.json
 loom-daemon/Cargo.toml
 loom-api/Cargo.toml
 CLAUDE.md"
+if [[ -f "$LOOM_ROOT/.loom/install-metadata.json" ]]; then
+  EXPECTED_LIST="$EXPECTED_LIST
+.loom/install-metadata.json"
+fi
 if [[ "$LIST_OUTPUT" == "$EXPECTED_LIST" ]]; then
-  pass "'version.sh list' emits the 5 expected files"
+  pass "'version.sh list' emits the expected version-bearing files"
 else
   fail "'version.sh list' output diverged from expectation"
   echo "  Expected:"
