@@ -43,18 +43,73 @@ describe("buildBurnCurves", () => {
     expect(curves.map((curve) => curve.account)).toEqual(["zeta", "mid", "alpha"]);
   });
 
-  it("keeps identically-named accounts on different hosts as separate curves", () => {
+  // #4898: one account is one curve, however many hosts report it —
+  // `usage_fraction` is the account's server-side consumption, so N hosts are
+  // one clock read N times, not N clocks.
+  it("merges one account reported by several hosts into a single curve", () => {
+    const curves = buildBurnCurves(
+      parseTokenSamples([
+        tokensSnapshot(T0, [{ account: "agent-1", usage: 0.5 }], "host-a"),
+        tokensSnapshot(T0 + MINUTE, [{ account: "agent-1", usage: 0.5 }], "host-b"),
+        tokensSnapshot(T0 + 2 * MINUTE, [{ account: "agent-1", usage: 0.51 }], "host-c"),
+      ]),
+    );
+
+    expect(curves).toHaveLength(1);
+    expect(curves[0]?.account).toBe("agent-1");
+    expect(curves[0]?.hostIds).toEqual(["host-a", "host-b", "host-c"]);
+    // Agreeing hosts are the normal shared-pool case, not a conflict.
+    expect(curves[0]?.divergentHosts).toEqual([]);
+    // One continuous series, not three fragments.
+    expect(curves[0]?.segments).toHaveLength(1);
+    expect(curves[0]?.points).toHaveLength(3);
+  });
+
+  // Cross-host wobble (independent probe schedules, unsynchronised clocks)
+  // must not read as a limit-window rollover. At the old 1e-9 threshold any
+  // such pair shattered the curve into meaningless segments.
+  it("does not treat sub-threshold cross-host wobble as a window reset", () => {
+    const curves = buildBurnCurves(
+      parseTokenSamples([
+        tokensSnapshot(T0, [{ account: "agent-1", usage: 0.74 }], "host-a"),
+        tokensSnapshot(T0 + MINUTE, [{ account: "agent-1", usage: 0.735 }], "host-b"),
+        tokensSnapshot(T0 + 2 * MINUTE, [{ account: "agent-1", usage: 0.75 }], "host-a"),
+      ]),
+    );
+
+    expect(curves).toHaveLength(1);
+    expect(curves[0]?.segments).toHaveLength(1);
+    expect(curves[0]?.segments[0]?.startedBy).toBe("initial");
+  });
+
+  // The old keying assumed this case was universal; it is now detected
+  // instead. Two hosts reporting wildly different usage for one name at the
+  // same instant are plausibly different upstream accounts.
+  it("flags hosts that disagree materially about the same account name", () => {
     const curves = buildBurnCurves(
       parseTokenSamples([
         tokensSnapshot(T0, [{ account: "agent-1", usage: 0.1 }], "host-a"),
         tokensSnapshot(T0, [{ account: "agent-1", usage: 0.9 }], "host-b"),
       ]),
     );
-    expect(curves).toHaveLength(2);
-    expect(curves.map((curve) => `${curve.hostId}:${curve.points[0]?.usageFraction}`)).toEqual([
-      "host-a:0.1",
-      "host-b:0.9",
-    ]);
+
+    expect(curves).toHaveLength(1);
+    expect(curves[0]?.divergentHosts).toEqual(["host-a", "host-b"]);
+  });
+
+  // A real rollover is a drop of most of the range — still detected, and not
+  // confused with the wobble case above.
+  it("still detects a genuine window rollover after merging", () => {
+    const curves = buildBurnCurves(
+      parseTokenSamples([
+        tokensSnapshot(T0, [{ account: "agent-1", usage: 0.95 }], "host-a"),
+        tokensSnapshot(T0 + MINUTE, [{ account: "agent-1", usage: 0.03 }], "host-b"),
+      ]),
+    );
+
+    expect(curves).toHaveLength(1);
+    expect(curves[0]?.segments).toHaveLength(2);
+    expect(curves[0]?.segments[1]?.startedBy).toBe("window-reset");
   });
 
   it("starts a new segment at a limit-window rollover (usage drops)", () => {

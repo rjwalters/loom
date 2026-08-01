@@ -219,3 +219,11 @@
 .status--insufficient-data {
   color: var(--analytics-muted);
 }
+
+/* Same local name, contradictory readings across hosts (#4898) — the merge
+   should not be trusted for this account. */
+.badge--divergent {
+  background: color-mix(in srgb, var(--warn, #e6b95c) 18%, transparent);
+  color: var(--warn, #e6b95c);
+  border: 1px solid color-mix(in srgb, var(--warn, #e6b95c) 45%, transparent);
+}

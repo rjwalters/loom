@@ -52,7 +52,8 @@ export type ForecastStatus =
   | "insufficient-data";
 
 export interface AccountForecast {
-  hostId: string;
+  /** Hosts that reported the account this forecast covers (#4898). */
+  hostIds: string[];
   account: string;
   status: ForecastStatus;
   /** Points that fed the fit (live segment only). */
@@ -94,7 +95,7 @@ export function forecastAccount(curve: AccountBurnCurve, options: ForecastOption
   const limitWindowResetAt = segment?.limitWindowResetAt ?? latest?.limitWindowResetAt;
 
   const base: AccountForecast = {
-    hostId: curve.hostId,
+    hostIds: curve.hostIds,
     account: curve.account,
     status: "insufficient-data",
     sampleCount: points.length,
