@@ -620,7 +620,7 @@ fi
 echo "Test group 14: canonical guard present + tracked vendored guard is preserved (#4403)"
 REPO="$(make_fixture)"
 mkdir -p "$REPO/.claude/skills/repo/hooks"
-printf '#!/usr/bin/env bash\n# rjwalters/repo#29 canonical guard\necho canonical\n' \
+printf '#!/usr/bin/env bash\n# rjwalters/repo#29 canonical guard\n# implements worktree-write-confinement\necho canonical\n' \
     > "$REPO/.claude/skills/repo/hooks/guard-destructive.sh"
 printf '#!/usr/bin/env bash\necho vendored\n' \
     > "$REPO/defaults/hooks/guard-destructive-generic.sh"
@@ -676,7 +676,7 @@ fi
 echo "Test group 15: canonical guard present + UNTRACKED vendored guard is still removed (#4403)"
 REPO="$(make_fixture)"
 mkdir -p "$REPO/.claude/skills/repo/hooks"
-printf '#!/usr/bin/env bash\n# rjwalters/repo#29 canonical guard\necho canonical\n' \
+printf '#!/usr/bin/env bash\n# rjwalters/repo#29 canonical guard\n# implements worktree-write-confinement\necho canonical\n' \
     > "$REPO/.claude/skills/repo/hooks/guard-destructive.sh"
 printf '#!/usr/bin/env bash\necho vendored\n' \
     > "$REPO/defaults/hooks/guard-destructive-generic.sh"
@@ -696,6 +696,32 @@ if grep -q "removed.*hooks/guard-destructive-generic.sh" <<<"$OUT"; then
     pass "(#4403) removal reported as before"
 else
     fail "(#4403) removal not reported"
+fi
+
+# --- (#4894) capability-gap canonical guard: vendored guard must be KEPT ----
+# The canonical guard carries the repo#29 VERSION marker but NOT the
+# write-confinement CAPABILITY marker (the Repo Skills 0.7.0 shape that
+# motivated #4894). Before #4894, CANONICAL_GUARD_PRESENT was version-only, so
+# this untracked vendored copy would have been removed here too — stripping
+# the dispatcher's fallback out from under it and leaving zero destructive-
+# command coverage, since the dispatcher (correctly, post-#4894) declines to
+# exec a canonical guard that fails the capability probe.
+echo "Test group 15b: canonical guard has version marker but NOT capability marker -> vendored guard is kept, not removed (#4894)"
+REPO="$(make_fixture)"
+mkdir -p "$REPO/.claude/skills/repo/hooks"
+printf '#!/usr/bin/env bash\n# rjwalters/repo#29 canonical guard ONLY\necho canonical\n' \
+    > "$REPO/.claude/skills/repo/hooks/guard-destructive.sh"
+printf '#!/usr/bin/env bash\necho vendored\n' \
+    > "$REPO/defaults/hooks/guard-destructive-generic.sh"
+printf '#!/usr/bin/env bash\necho vendored\n' \
+    > "$REPO/.loom/hooks/guard-destructive-generic.sh"
+OUT="$(cd "$REPO" && bash "$SCRIPT" 2>&1)"
+RC=$?
+if [[ $RC -eq 0 ]]; then pass "(#4894) apply exits 0 with a capability-gap canonical guard present"; else fail "(#4894) apply exits 0 (got $RC)"; fi
+if [[ -f "$REPO/.loom/hooks/guard-destructive-generic.sh" ]]; then
+    pass "(#4894) vendored guard-destructive-generic.sh is KEPT (dispatcher's fallback preserved)"
+else
+    fail "(#4894) vendored guard-destructive-generic.sh was removed despite the canonical guard lacking write-confinement"
 fi
 
 # --- (#4563) refuse to run from a linked worktree ----------------------------
