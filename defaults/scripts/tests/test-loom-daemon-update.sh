@@ -2558,10 +2558,12 @@ fi
 #       - loom-daemon           : the resolved binary itself (never flagged)
 #       - loom-clean            : a legit auto-generated shim exec'ing the
 #                                 sibling loom-daemon (never flagged)
-#       - loom-search           : the allowlisted Python carve-out console
-#                                 script (never flagged)
 #       - loom-tokens           : a STALE pip console script (MUST be flagged)
 #       - loom-agent-spawn      : a second stale pip console script (flagged)
+#       - loom-search           : a third stale console script (flagged) — the
+#                                 `loom-search` carve-out was itself retired in
+#                                 #4970, so it is no longer allowlisted and a
+#                                 leftover binary is exactly the #4079 shape.
 #
 #     LOOM_SKIP_STALE_ENTRY_POINT_CHECK=1 must silence all of it, and the
 #     advisory must never change the exit code.
@@ -2583,18 +2585,9 @@ exec "$(dirname "$0")/loom-daemon" clean "$@"
 SHIM
 chmod +x "$STALE_BIN_DIR/loom-clean"
 
-# The allowlisted loom-search carve-out (a Python console script — allowlisted
-# by NAME precisely because it is not a daemon entry point).
-cat > "$STALE_BIN_DIR/loom-search" <<'SEARCH'
-#!/usr/bin/python3
-# -*- coding: utf-8 -*-
-import sys
-sys.exit(0)
-SEARCH
-chmod +x "$STALE_BIN_DIR/loom-search"
-
-# Two stale pip console scripts of the #4079 shape.
-for _stale in loom-tokens loom-agent-spawn; do
+# Three stale pip/PATH console scripts of the #4079 shape (including
+# `loom-search`, no longer allowlisted post-#4970).
+for _stale in loom-tokens loom-agent-spawn loom-search; do
     cat > "$STALE_BIN_DIR/$_stale" <<'STALEPY'
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
@@ -2609,31 +2602,31 @@ out45=$( cd "$W45" && PATH="$STALE_BIN_DIR:$TEST_PATH" \
     bash "$UPDATE_SCRIPT" --check 2>&1; echo "EXIT=$?" )
 rc45=$(echo "$out45" | grep -o 'EXIT=[0-9]*' | cut -d= -f2)
 
-# 45. The two stale console scripts are named.
+# 45. The three stale console scripts are named.
 TESTS_RUN=$((TESTS_RUN + 1))
 if echo "$out45" | grep -q "Stale 'loom-\*' entry points found on PATH" \
    && echo "$out45" | grep -q "$STALE_BIN_DIR/loom-tokens" \
-   && echo "$out45" | grep -q "$STALE_BIN_DIR/loom-agent-spawn"; then
+   && echo "$out45" | grep -q "$STALE_BIN_DIR/loom-agent-spawn" \
+   && echo "$out45" | grep -q "$STALE_BIN_DIR/loom-search"; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "${GREEN}✓${NC} stale loom-* PATH entry points are warned about by path (#4079/#4557)"
+    echo -e "${GREEN}✓${NC} stale loom-* PATH entry points are warned about by path (#4079/#4557/#4970)"
 else
     TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "${RED}✗${NC} stale loom-* PATH entry points are warned about by path (#4079/#4557)"
+    echo -e "${RED}✗${NC} stale loom-* PATH entry points are warned about by path (#4079/#4557/#4970)"
     echo "  output: $out45"
 fi
 
-# 46. The legit shim, the resolved binary, and the allowlisted carve-out are NOT
-#     flagged (a false positive here would train operators to ignore the check).
+# 46. The legit shim and the resolved binary are NOT flagged (a false positive
+#     here would train operators to ignore the check).
 TESTS_RUN=$((TESTS_RUN + 1))
 _stale_block="$(echo "$out45" | sed -n "/Stale 'loom-\*' entry points/,/Suppress this check/p")"
 if ! echo "$_stale_block" | grep -q 'loom-clean' \
-   && ! echo "$_stale_block" | grep -q 'loom-search' \
    && ! echo "$_stale_block" | grep -qE '(^|/)loom-daemon —'; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "${GREEN}✓${NC} current shims, the resolved binary, and loom-search are not flagged as stale"
+    echo -e "${GREEN}✓${NC} the current shim and the resolved binary are not flagged as stale"
 else
     TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "${RED}✗${NC} current shims, the resolved binary, and loom-search are not flagged as stale"
+    echo -e "${RED}✗${NC} the current shim and the resolved binary are not flagged as stale"
     echo "  stale block: $_stale_block"
 fi
 

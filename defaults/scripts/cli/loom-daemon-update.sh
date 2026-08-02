@@ -56,9 +56,11 @@
 # `loom-daemon` (the first shadows the rest). It is advisory only: nothing is
 # deleted, PATH is untouched, and the exit code is unaffected. The
 # auto-generated `loom-clean`/`loom-recover-orphans`/`loom-claim` shims
-# (#4272/#4275) pointing at the resolved binary, and the surviving `loom-search`
-# console script (#4557's carve-out), are never flagged. Suppress with
-# LOOM_SKIP_STALE_ENTRY_POINT_CHECK=1.
+# (#4272/#4275) pointing at the resolved binary are never flagged. (`loom-search`
+# was allowlisted here as a legitimate non-daemon Python console script from
+# #4557 through #4969 — #4970 retired that package too, so a `loom-search` on
+# PATH is now exactly the #4079 failure shape and IS flagged, like any other
+# stale entry point.) Suppress with LOOM_SKIP_STALE_ENTRY_POINT_CHECK=1.
 #
 # Launchd-managed daemons (#4042): on Darwin the daemon is commonly launchd-
 # managed (default since #3972/#4054), in which case NEITHER .loom/.daemon.pid
@@ -328,14 +330,15 @@ extract_commit() {
 #   1. `loom-daemon` itself (the native binary), or
 #   2. one of the auto-generated PATH shims provision-daemon.sh installs
 #      (`loom-clean`, `loom-recover-orphans`, `loom-claim` — #4272/#4275), whose
-#      sibling `loom-daemon` resolves to the SAME binary this script resolved, or
-#   3. `loom-search`, the one surviving Python console script (#4557's carve-out;
-#      see defaults/docs/semantic-search.md). It is not a daemon entry point and
-#      is never expected to resolve to the daemon binary.
-# Anything else is reported.
+#      sibling `loom-daemon` resolves to the SAME binary this script resolved.
+# Anything else is reported — including a `loom-search` executable, now that
+# #4970 retired that package too (see defaults/docs/semantic-search.md): it
+# is no longer a legitimate console script, just a frozen entry point from a
+# deleted package, exactly the #4079 failure shape.
 
 #: `loom-*` names that are not daemon entry points and must not be flagged.
-STALE_ENTRY_POINT_ALLOWLIST="loom-search"
+#: Empty as of #4970 — the one entry this ever held, `loom-search`, is retired.
+STALE_ENTRY_POINT_ALLOWLIST=""
 
 # Portable realpath (macOS ships no GNU `realpath`/`readlink -f`).
 _lde_realpath() {
@@ -442,7 +445,9 @@ warn_stale_entry_points() {
                 continue
             fi
 
-            # Allowlisted non-daemon entry points (the loom-search carve-out).
+            # Allowlisted non-daemon entry points. Empty as of #4970 (see the
+            # STALE_ENTRY_POINT_ALLOWLIST definition above); kept as a hook for
+            # any future legitimate non-daemon `loom-*` console script.
             case " $STALE_ENTRY_POINT_ALLOWLIST " in
                 *" $name "*) continue ;;
             esac

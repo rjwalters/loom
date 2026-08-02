@@ -704,7 +704,6 @@ refuses to silently auto-clear `.bad_tokens` — that masks real auth problems.
 ## Tests
 
 ```bash
-PYTHONPATH=loom-tools/src python3 -m pytest loom-tools/tests/tokens/ -v
 bash .loom/scripts/tests/test-spawn-claude.sh
 ```
 
