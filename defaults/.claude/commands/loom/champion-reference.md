@@ -141,6 +141,38 @@ gh pr view "$PR_NUMBER" --comments
 
 ---
 
+### Edge Case 5c: Unrevised Proposal Re-Entering the Evaluation Queue Every Cycle (#4954)
+
+**Scenario**: A `loom:curated`/`loom:architect`/`loom:hermit`/`loom:auditor` proposal fails promotion criteria and gets a "NEEDS REVISION" comment, but the author never revises it. Every subsequent Champion pass (cron tick, role-runner tick, or a fresh `/loom:sweep` dispatch) re-discovers the same unchanged issue in its Priority 2/3 listing and, without a guard, re-evaluates it from scratch and posts an equivalent rejection comment — observed live as 6 duplicate "NEEDS REVISION" comments over ~6.5 hours on one proposal, with two of them landing 40 seconds apart because nothing claimed the issue mid-evaluation.
+
+**Handling**: `champion-issue-promo.md`'s "Concurrency Guard and Idempotency (`loom:evaluating`)" section (adapted from this file's own Capped-PR Recovery pattern — `PARK_MARKER`/`CLOSE_MARKER` below — and from Judge's `loom:reviewing` claim/stale-check convention):
+
+```bash
+# Idempotency: skip without commenting if already evaluated at this revision.
+# $BODY_HASH = sha256(title + body), first 16 hex chars — NOT the issue's
+# aggregate updatedAt, which Champion's own comment would bump (see #4966).
+VERDICT_MARKER="<!-- champion:proposal-verdict:body-$BODY_HASH -->"
+
+# Concurrency: claim before evaluating, staleness-aware (LOOM_STALE_EVALUATING_MINUTES, default 15m).
+gh issue edit <number> --add-label "loom:evaluating"
+```
+
+**Decision**:
+
+| Finding | Decision | Action |
+|---------|----------|--------|
+| A prior Champion verdict comment already carries `VERDICT_MARKER` for the issue's **current** title+body hash | **Unrevised since last review — skip** | No comment, no claim, no label change. A genuine title/body edit changes the hash and always produces a fresh marker and a fresh evaluation; comments and label churn do not. |
+| Issue already carries `loom:evaluating` and the claim is younger than `LOOM_STALE_EVALUATING_MINUTES` | **Concurrent evaluation in progress** | Skip, do not stomp the claim; continue the batch. |
+| Issue already carries `loom:evaluating` and the claim is older than `LOOM_STALE_EVALUATING_MINUTES` | **Stale claim — a prior Champion pass likely died mid-evaluation** | Reclaim (`--add-label "loom:evaluating"` again) then evaluate normally. |
+| ≥2 prior "NEEDS REVISION" comments exist and the issue is not already `loom:operator-only` | **N=2 threshold reached** | Escalate instead of posting a third+ near-identical rejection: comment with `<!-- champion:proposal-escalated -->` and add `loom:operator-only` (Champion routes, a human decides — the proposal label stays, nothing is closed). |
+| Fewer than 2 prior rejections | **Ordinary reject** | Post the `VERDICT_MARKER`-tagged "NEEDS REVISION" comment as before, release `loom:evaluating`. |
+
+**Rationale**: This is the *same* idempotency-marker + escalation-marker + operator-routing shape as Edge Case 5b's Capped-PR Recovery Pass, applied to the proposal-evaluation side of Champion instead of the PR-merge side — a marker keyed to the thing whose change would invalidate it (here, the proposal's own title+body text; there, the latest Judge rejection comment ID) stops duplicate comments, and a bounded escalation threshold (here, N=2 identical verdicts; there, the Doctor-cycle cap) converts an infinite silent loop into a single human-visible routing decision.
+
+**Anchor discipline (#4966)**: neither half of this mechanism may key off the issue's aggregate `updatedAt` — Champion's own verdict comment bumps it, so a marker stamped with it can never match on the next pass and the skip never fires. Content staleness anchors on the title+body hash; claim staleness anchors on the `loom:evaluating` label's own `labeled` timeline event. Both are invisible to Champion's own comment writes. This is the same rule `judge.md`/`daemon-reference.md` already apply to `loom:reviewing`/`loom:treating` staleness.
+
+---
+
 ### Edge Case 6: PR Modifying Only Test Files
 
 **Scenario**: PR changes only test files (e.g., `*.test.ts`, `*.spec.rs`).
@@ -359,6 +391,7 @@ gh issue create --title "Follow-on: Work identified in PR #$PR_NUMBER" --label "
 | Merge conflicts | Fail | Comment and skip |
 | Stale PR (>24h) | Route to Doctor | Comment once (idempotent marker), swap `loom:pr` → `loom:changes-requested` |
 | Doctor-cycle-capped PR (`loom:blocked` + `loom:changes-requested`) | Three-way on forward progress | Distinct new defects → grant a cycle (remove `loom:blocked` only); same-defect/ambiguous → keep parked with rationale; approach not viable → add `loom:operator-only`, recommend closing (never close it) |
+| Unrevised proposal re-entering the queue every cycle | Idempotency marker + N=2 escalation | Unrevised since last review → skip silently (title+body hash marker match, never `updatedAt`); ≥2 prior rejections → escalate to `loom:operator-only` instead of a 3rd+ duplicate comment; `loom:evaluating` claim prevents concurrent double-evaluation |
 | Test-only changes | Allow | Standard criteria apply |
 | Human holds PR (removes `loom:pr`) | Skip | Not a merge candidate without `loom:pr` |
 | Multiple linked issues | Allow | Verify all closed |
