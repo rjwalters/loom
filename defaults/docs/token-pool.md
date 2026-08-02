@@ -203,6 +203,21 @@ loom-daemon tokens check --json    # Native Rust equivalent (issue #4108)
 ./.loom/scripts/probe-tokens.sh    # Cron-friendly wrapper for periodic invocation
 ```
 
+`--source` (flag or `$LOOM_RANKING_SOURCE`) selects where the ranking comes
+from: `auto` (default) prefers a fresh claude-monitor `ranking.json` and only
+falls back to this CLI's own native probe when one isn't present; `monitor`
+never falls back (an empty report when claude-monitor has nothing fresh);
+`probe` always uses the native probe, ignoring claude-monitor entirely.
+
+**After adding a new account** (via `bootstrap` or `import-from-monitor`), run
+`loom-daemon tokens check --ranking --source probe` once. Under the `auto`
+default, a fresh claude-monitor `ranking.json` short-circuits the whole probe
+— including for an account claude-monitor itself has not ranked yet — so a
+just-added account can be silently absent from `.ranking` (and therefore
+never selected) until claude-monitor's own next probe cycle catches up.
+`--source probe` reads every `*.token` file on disk directly, so the new
+account is ranked immediately.
+
 **`probe-tokens.sh` delegates to `loom-daemon tokens check`, not Python (#4080).**
 It resolves a `loom-daemon` binary (`$LOOM_DAEMON_BIN` → `loom-daemon` on PATH →
 build-output-relative candidates under the repo), capability-probes it with
