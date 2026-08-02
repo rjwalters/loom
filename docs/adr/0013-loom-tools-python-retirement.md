@@ -130,58 +130,51 @@ One conformance fixture deliberately outlives the package:
 the same tier tree to the same `expected.json`. It stays because two of those
 three consumers are alive and Python-independent.
 
-### The `loom-search` carve-out
+### The `loom-search` carve-out — retired (#4970)
 
 `loom-tools/pyproject.toml` had exactly two active console scripts:
 `loom-tokens` and `loom-search`. `loom-tokens` was superseded by
 `loom-daemon tokens` in Phase 1/2 and is simply gone.
 
-**`loom-search` (`loom_tools/semantic_search.py`) was carved out of the deletion
-and survives.** It backs the opt-in, off-by-default semantic-search feature
-documented in `defaults/docs/semantic-search.md` (#4339, Tier B embeddings
-#4370): a SQLite FTS5 + BM25 index over sweep summaries and merged-PR history,
-with an optional local ONNX embeddings layer.
+**`loom-search` (`loom_tools/semantic_search.py`) was carved out of the Phase 4
+deletion** rather than deleted alongside the rest. It backed the opt-in,
+off-by-default semantic-search feature documented in
+`defaults/docs/semantic-search.md` (#4339, Tier B embeddings #4370): a SQLite
+FTS5 + BM25 index over sweep summaries and merged-PR history, with an optional
+local ONNX embeddings layer.
 
-Why it was carved out rather than deleted with the rest:
+Why it was carved out rather than deleted with the rest, at the time:
 
-- **It has no native port.** No epic #4081 phase covered it. It appears in
+- **It had no native port.** No epic #4081 phase covered it. It appeared in
   neither the "zero external references (delete, don't port)" inventory, nor
-  any Phase 3 family, nor Phase 1's tokens-only scope. No phase ever decided
+  any Phase 3 family, nor Phase 1's tokens-only scope. No phase decided
   whether to port it, retire the feature, or keep it.
-- **Deleting it would have been a silent feature removal.** Because the feature
-  is opt-in and off by default, **no test would have gone red.** CI would have
-  stayed green while a documented, shipped capability disappeared.
-- **Porting it was explicitly out of scope.** Phase 4 is deletion, not another
-  port.
+- **Deleting it silently would have been a silent feature removal.** Because
+  the feature was opt-in and off by default, **no test would have gone red.**
+  CI would have stayed green while a documented, shipped capability
+  disappeared.
+- **Porting it was explicitly out of scope for Phase 4.** Phase 4 was
+  deletion, not another port.
 
-Deleting a live feature by accident, in a phase whose mandate was to remove dead
-weight, would have been the wrong failure. So `loom-tools/` still exists, reduced
-to:
+That left an explicit, tracked open question: port `loom-search` to Rust, or
+retire the feature. **The operator decided RETIRE**, recorded on
+[#4608](https://github.com/rjwalters/loom/issues/4608) (2026-07-31) —
+`loom-search` had zero demonstrated usage (never installed, no index, on any
+host including the primary operator host), and the underlying need
+(searchable fleet memory) is now better served by the telemetry query API
+(#4704/#4705/#4726) than a local Python index. That decision was implemented
+in [#4970](https://github.com/rjwalters/loom/issues/4970), which deleted
+`loom-tools/` in full — including the `loom-search` carve-out described
+above — leaving zero Python anywhere in the repo. The one exception is the
+`tests/fixtures/config_resolver/` cross-language conformance fixture (#4039),
+which was relocated (not deleted) to
+`defaults/scripts/tests/fixtures/config_resolver/` because its two surviving
+consumers (Rust, Bash) are still alive; see "The state-format-compatibility
+contract" above.
 
-```
-loom-tools/
-├── pyproject.toml                       # loom-search only; zero runtime deps
-├── src/loom_tools/
-│   ├── semantic_search.py               # the feature (console script loom-search)
-│   ├── embedders.py                     # optional fastembed backend ([search] extra)
-│   └── common/{config,config_resolver,repo}.py   # the 3 helpers it imports
-└── tests/                               # its tests + the #4039 conformance fixture
-```
-
-Consequences of the carve-out, stated plainly:
-
-- **The core daemon path needs no Python.** A fresh machine provision
-  (`install-loom.sh` → `provision-daemon.sh` → `loom-daemon`) installs no Python
-  and imports nothing from this package. `loom-search` is the *only* thing that
-  requires the **one opt-in Python install step**
-  (`cd loom-tools && pip install -e .`, or `-e '.[search]'` for embeddings).
-- **`loom-search` is not gated by CI.** `build-gate.sh` runs its pytest suite
-  only when the host already has a `python3` that can `import pytest`, and never
-  installs anything — requiring a Python toolchain to gate a PR is exactly what
-  this epic removed. On a host without pytest the stage prints a skip note.
-- **The port-or-retire decision is still open**, and is tracked as its own
-  follow-up issue rather than being smuggled into this ADR. Either outcome
-  (a Rust port, or retiring the feature) removes the last Python from the repo.
+`defaults/docs/semantic-search.md` is retained as a tombstone pointing to git
+history and the telemetry query API as the successor direction, rather than
+being deleted outright, because it is linked from this ADR.
 
 ### Stale-entry-point hardening
 
@@ -237,9 +230,11 @@ scripts being created in the first place.
   destination binary's embedded commit (#4053).
 - **Rust is a higher bar to contribute to** than Python for logic that used to
   live in a script.
-- **One Python residue remains** (`loom-search`), so "zero Python in the repo"
-  is not literally true yet — only "zero Python on any load-bearing path."
-  That residue is un-gated by CI and can rot until it is ported or retired.
+- ~~One Python residue remains (`loom-search`), so "zero Python in the repo"
+  is not literally true yet~~ **Resolved by #4970** (2026-08): the operator's
+  RETIRE decision on #4608 closed this gap — `loom-tools/` is deleted in
+  full and the repo has zero Python anywhere, not merely on the load-bearing
+  path.
 - **The cross-implementation conformance suite is gone.** It was the safety net
   for the migration; it has no remaining purpose (there is one implementation),
   but the on-disk formats it pinned are now pinned only by `loom-daemon`'s own
@@ -293,15 +288,23 @@ have coupled the retirement to an unscoped feature port. Tracked separately.
   - **#4079** — the stale-editable-install incident that motivated the epic
   - Phase 1: #4082, #4105, #4106, #4108 · Phase 2: #4228 (bridge #4080)
   - Phase 3: #4271, #4272, #4273, #4274, #4275 (residuals #4415, #4435)
-  - **#4557** — Phase 4: this retirement
+  - **#4557** — Phase 4: this retirement (carved out the `loom-search` residue)
+  - **#4608** — the operator's decision issue that resolved the carve-out's
+    open port-or-retire question: RETIRE (2026-07-31)
+  - **#4970** — implemented the RETIRE decision: deleted `loom-tools/` in
+    full, relocated the #4039 conformance fixture, tombstoned
+    `semantic-search.md`
   - #3949 (`LOOM_PACKAGE_PATH`, removed) · #3938 (shared token pool) ·
     #3968 / #4053 (daemon self-update + destination verification) ·
     #3835 / #3926 (machine-level daemon architecture) ·
     #4047 / #4051 / #4058 / #4059 / #4060 / #4061 (config resolution) ·
-    #4039 (cross-language config-resolver conformance fixture) ·
+    #4039 (cross-language config-resolver conformance fixture, relocated by
+    #4970 to `defaults/scripts/tests/fixtures/config_resolver/`) ·
     #2495 (`pip install -e` worktree guard) ·
-    #4339 / #4370 (`loom-search` and its Tier B embeddings) ·
-    #4259 (tiered build gate)
+    #4339 / #4370 (`loom-search` and its Tier B embeddings, retired by #4970) ·
+    #4259 (tiered build gate) ·
+    #4704 / #4705 / #4726 (telemetry query API — the successor direction for
+    searchable fleet memory)
 - Related ADRs:
   - [ADR-0009](0009-shepherd-deprecation.md) — deleted the Python shepherd and
     `daemon_v2` brains (the *first* Python removal; this ADR finishes the job)
@@ -312,7 +315,7 @@ have coupled the retirement to an unscoped feature port. Tracked separately.
 - Documentation:
   - [`docs/migration/v0.10.0-shepherd-deprecation.md`](../migration/v0.10.0-shepherd-deprecation.md)
   - [`defaults/docs/semantic-search.md`](../../defaults/docs/semantic-search.md)
-    — the surviving `loom-search` carve-out
+    — tombstone for the retired `loom-search` carve-out (#4970)
   - [`defaults/docs/build-gate.md`](../../defaults/docs/build-gate.md) — the
     now-Python-free quality gate
   - [`defaults/docs/guard-hooks.md`](../../defaults/docs/guard-hooks.md) — the

@@ -6,7 +6,6 @@ This guide describes how to set up the Loom source repo for development and cont
 
 - **Rust** (stable channel)
 - **Node.js** (v18+) and **pnpm** (for `mcp-loom`)
-- **Python 3.10+** with **uv** (for `loom-tools`)
 - **tmux**
 - A POSIX shell (bash/zsh)
 
@@ -44,9 +43,6 @@ Loom uses a comprehensive set of tools to maintain code quality:
 #### TypeScript (mcp-loom)
 - `tsc --noEmit` for typecheck
 - `esbuild` for bundling
-
-#### Python (loom-tools)
-- `pytest` for tests; `ruff` / `mypy` if configured per package
 
 ### Available Commands
 
@@ -118,7 +114,6 @@ loom/
 │       └── ...
 ├── loom-api/              # Shared Rust types and IPC protocol
 ├── mcp-loom/              # Unified MCP server (TypeScript/Node)
-├── loom-tools/            # `loom-search` only (opt-in Python; see docs/adr/0013-*)
 ├── defaults/              # Default configuration templates installed into target repos
 ├── scripts/               # Installation, daemon, and maintenance scripts
 ├── .github/workflows/     # GitHub Actions CI
