@@ -11,10 +11,20 @@ use crate::{ClaudeConfigAction, ForgeAction, PinAction, TokensAction};
 /// simplification since this CLI has no existing callers yet; pass the
 /// canonical repo root explicitly (as `spawn-claude.sh` already resolves via
 /// `git rev-parse --git-common-dir` for the Python selector).
+///
+/// Refuses (issue #4948) a resolved workspace whose path already ends in
+/// `.loom/tokens` — every `tokens` subcommand joins `.loom/tokens` onto the
+/// resolved workspace to find its pool dir, so pointing `--workspace` (or
+/// letting the `"."` default resolve via a cwd) *at* an existing pool would
+/// otherwise silently nest a second pool at
+/// `<pool>/.loom/tokens/.loom/tokens` and still report success. The check is
+/// path-shape-based, not default-vs-explicit — it applies to an explicit
+/// `--workspace /some/path/.loom/tokens` exactly the same as the `"."`
+/// default resolving to a cwd of `/some/path/.loom/tokens`.
 pub(crate) fn resolve_tokens_workspace(workspace: &str) -> Result<PathBuf> {
     let p = Path::new(workspace);
-    if p.is_absolute() {
-        Ok(p.to_path_buf())
+    let resolved = if p.is_absolute() {
+        p.to_path_buf()
     } else if p == Path::new(".") {
         // The common case (every `--workspace` flag defaults to `"."`): return
         // the cwd itself rather than `cwd.join(".")`, which `PathBuf::join`
@@ -22,10 +32,34 @@ pub(crate) fn resolve_tokens_workspace(workspace: &str) -> Result<PathBuf> {
         // CurDir`, producing paths like `/home/ubuntu/./.loom/tokens` in
         // "no tokens found" warnings (issue #4292). Functionally identical
         // either way; this just keeps resolved/printed paths readable.
-        std::env::current_dir().map_err(Into::into)
+        std::env::current_dir()?
     } else {
-        Ok(std::env::current_dir()?.join(p))
+        std::env::current_dir()?.join(p)
+    };
+    reject_workspace_inside_pool(&resolved)?;
+    Ok(resolved)
+}
+
+/// Refuse a resolved workspace that already ends in `.loom/tokens` (issue
+/// #4948, suggested-fix option 1). See [`resolve_tokens_workspace`] for the
+/// full rationale — this is a pure path-shape check, not a filesystem probe,
+/// so it also catches a workspace that does not exist yet.
+fn reject_workspace_inside_pool(resolved: &Path) -> Result<()> {
+    let pool_suffix = Path::new(".loom").join("tokens");
+    if resolved.ends_with(&pool_suffix) {
+        bail!(
+            "refusing to use {} as a --workspace: it is already a token pool directory (or \
+             exactly matches the pool path shape `.loom/tokens`). Using it as a workspace would \
+             silently nest a second pool at {}. Pass the enclosing repo root instead{}.",
+            resolved.display(),
+            resolved.join(&pool_suffix).display(),
+            resolved
+                .parent()
+                .and_then(Path::parent)
+                .map_or_else(String::new, |root| format!(" (e.g. --workspace {})", root.display()))
+        );
     }
+    Ok(())
 }
 
 /// `loom-daemon claude-config` handler (issue #4415).
@@ -203,6 +237,46 @@ mod resolve_tokens_workspace_tests {
             .join("some/relative/repo");
         assert_eq!(resolved, expected);
     }
+
+    /// Issue #4948: an absolute `--workspace` that already ends in
+    /// `.loom/tokens` must error loudly (naming the resolved absolute path)
+    /// rather than resolve — the exact "run a `tokens` subcommand from
+    /// inside the pool dir" incident this issue reports.
+    #[test]
+    fn absolute_workspace_inside_a_pool_is_rejected() {
+        let err = resolve_tokens_workspace("/repo/.loom/tokens").expect_err("must reject");
+        let message = err.to_string();
+        assert!(
+            message.contains("/repo/.loom/tokens"),
+            "error must name the resolved absolute path: {message}"
+        );
+    }
+
+    /// Same guard applies to a *relative* `--workspace` that joins the cwd
+    /// into a `.loom/tokens`-shaped path — the check is path-shape-based,
+    /// not default-vs-explicit-based (per the issue's suggested-fix option 1).
+    #[test]
+    fn relative_workspace_inside_a_pool_is_rejected() {
+        let err =
+            resolve_tokens_workspace("some/relative/repo/.loom/tokens").expect_err("must reject");
+        let cwd = std::env::current_dir().expect("current_dir");
+        let expected_path = cwd.join("some/relative/repo/.loom/tokens");
+        let message = err.to_string();
+        assert!(
+            message.contains(&expected_path.display().to_string()),
+            "error must name the resolved absolute path: {message}"
+        );
+    }
+
+    /// A workspace that merely *contains* `.loom/tokens` somewhere in its
+    /// interior (not as its own trailing suffix) is unaffected — only an
+    /// exact `.loom/tokens` suffix match is rejected.
+    #[test]
+    fn workspace_with_pool_dir_as_a_child_is_not_rejected() {
+        let resolved =
+            resolve_tokens_workspace("/repo/.loom/tokens/subdir").expect("must not reject");
+        assert_eq!(resolved, Path::new("/repo/.loom/tokens/subdir"));
+    }
 }
 
 #[cfg(test)]
@@ -364,6 +438,10 @@ fn print_effective_accounts(result: &loom_daemon::tokens_pool::bootstrap::Bootst
         p.as_ref()
             .map_or_else(|| "(none)".to_string(), |p| p.display().to_string())
     };
+    // Resolved absolute pool path (issue #4948, suggested-fix option 3) —
+    // surfaced up front so an operator can immediately tell which pool a
+    // `bootstrap` run touched (per-repo, `--shared`, or `--workspace`).
+    println!("Resolved pool: {}", disp(&result.tokens_dir));
     println!("Account sources:");
     println!("  claude-monitor: {}", disp(&result.monitor_env));
     println!("  home: {}", disp(&result.home_env));
@@ -469,6 +547,10 @@ pub(crate) fn handle_tokens_command(action: TokensAction) -> Result<()> {
             auto_unpin,
         } => {
             let ws = resolve_tokens_workspace(&workspace)?;
+            // Resolved workspace (issue #4948, suggested-fix option 3) —
+            // always stderr so `--export`'s stdout stays eval-safe and
+            // `--json`'s (non-`--export`) stdout stays a bare JSON object.
+            eprintln!("Resolved workspace: {}", ws.display());
             if provider == "codex" {
                 let selected = loom_daemon::tokens_pool::select_account(
                     &ws,
@@ -756,6 +838,14 @@ pub(crate) fn handle_tokens_command(action: TokensAction) -> Result<()> {
             };
 
             let (tokens_dir, anchored_to_shared) = resolve_tokens_pool_dir_for_cli(&workspace)?;
+            // Resolved absolute pool path (issue #4948, suggested-fix option
+            // 3) — `import-from-monitor` already prints its `Destination
+            // pool:` line; `check` did not until now, which is exactly how
+            // the reported nested-pool incident went unnoticed (the command
+            // reported success against a pool the operator never saw named).
+            // Always goes to stderr, unconditional of `--json`, so scripted
+            // callers' stdout stays parseable.
+            eprintln!("Resolved pool: {}", tokens_dir.display());
             if anchored_to_shared {
                 eprintln!(
                     "note: --workspace defaulted to a directory that is not a registered Loom \
