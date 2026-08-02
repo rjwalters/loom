@@ -213,6 +213,79 @@ Use conservative judgment. **Do NOT promote** if:
 
 ---
 
+## Concurrency Guard and Idempotency (`loom:evaluating`)
+
+**Problem this section fixes (#4954)**: an unrevised `loom:architect` proposal re-entering the queue every cycle used to get a **full re-evaluation and a fresh "NEEDS REVISION" comment every single time** — six duplicate comments over ~6.5 hours in the incident that motivated this section — and two evaluations landed comments 40 seconds apart because nothing claimed the issue while it was being evaluated. The same three mechanisms `champion-pr-merge.md`'s Capped-PR Recovery Pass already uses for PRs (idempotency marker, escalation marker, `loom:operator-only` routing) apply here, adapted with a Curator-style (`loom:curating`) claim label instead of the full Judge-style CAS machinery — proposal evaluation runs seconds to a few minutes, not the review-duration timescale `judge.md`'s stale-claim system is sized for.
+
+**Applies to every proposal evaluated by this file** — `loom:curated`, `loom:architect`, `loom:hermit`, and `loom:auditor` alike — not just the `loom:architect` case that surfaced it.
+
+### Idempotency check (run BEFORE claiming — skip without commenting on a match)
+
+Compute a marker keyed to the issue's `updatedAt` so a genuine body revision (which bumps `updatedAt`) always gets a fresh evaluation, while an unchanged issue never gets re-commented:
+
+```bash
+ISSUE_NUMBER=<number>
+
+# Cached ("$GH_READ") — this is a content check, not claim arbitration.
+ISSUE_JSON=$("$GH_READ" issue view "$ISSUE_NUMBER" --json updatedAt,labels,comments)
+UPDATED_AT=$(echo "$ISSUE_JSON" | jq -r '.updatedAt')
+VERDICT_MARKER="<!-- champion:proposal-verdict:$UPDATED_AT -->"
+
+if echo "$ISSUE_JSON" | jq -e --arg m "$VERDICT_MARKER" \
+     '.comments[] | select(.body | contains($m))' >/dev/null; then
+  echo "Already evaluated #$ISSUE_NUMBER at revision $UPDATED_AT — skipping (no comment, no claim)"
+  # Continue the batch to the next issue; do not read further or claim.
+fi
+```
+
+If the marker is present, **stop here for this issue** — do not read comments further, do not claim, do not comment. This is the mechanism that turns "6 identical NEEDS REVISION comments" into "1 comment, then silent skips" for a truly unrevised proposal.
+
+### Claim (staleness-aware, run only when NOT skipped above)
+
+```bash
+ISSUE_NUMBER=<number>
+
+# Plain `gh` — claim arbitration, never "$GH_READ" (mirrors judge.md's rule for
+# its Stale Claim Check: a stale cache would reintroduce the double-claim race
+# this exists to close).
+CURRENT_LABELS=$(gh issue view "$ISSUE_NUMBER" --json labels --jq '[.labels[].name] | join(",")')
+
+if echo ",$CURRENT_LABELS," | grep -q ",loom:evaluating,"; then
+  CLAIMED_AT=$(gh api "repos/{owner}/{repo}/issues/$ISSUE_NUMBER/timeline" --paginate \
+    --jq '[.[] | select(.event=="labeled" and .label.name=="loom:evaluating")] | last | .created_at // empty' \
+    | sort | tail -n 1)
+  if [ -n "$CLAIMED_AT" ]; then
+    CLAIM_AGE_MIN=$(( ($(date -u +%s) - $(date -u -d "$CLAIMED_AT" +%s)) / 60 ))
+  else
+    CLAIM_AGE_MIN=0   # unknown — fail safe, treat as fresh
+  fi
+  if [ "$CLAIM_AGE_MIN" -lt "${LOOM_STALE_EVALUATING_MINUTES:-15}" ]; then
+    echo "#$ISSUE_NUMBER already claimed by a concurrent evaluation (${CLAIM_AGE_MIN}m ago) — skipping, not stomping"
+    # Continue the batch to the next issue.
+  else
+    echo "Reclaiming stale loom:evaluating claim on #$ISSUE_NUMBER (age ${CLAIM_AGE_MIN}m >= ${LOOM_STALE_EVALUATING_MINUTES:-15}m) — a prior Champion pass likely died mid-evaluation"
+  fi
+fi
+
+gh issue edit "$ISSUE_NUMBER" --add-label "loom:evaluating"
+```
+
+`LOOM_STALE_EVALUATING_MINUTES` (default **15**) — named to mirror `LOOM_STALE_REVIEWING_MINUTES`/`LOOM_STALE_TREATING_MINUTES`, on a shorter scale since proposal evaluation has no build/CI wait.
+
+**Release the claim** — `--remove-label "loom:evaluating"` — as part of the SAME `gh issue edit` command that writes the outcome (promote, reject, or escalate) in Steps 3/4 below, never as a separate call. This keeps "claimed but no verdict written yet" the only window where the label is genuinely in flight.
+
+### Verdict-time recheck (immediately before writing the outcome)
+
+Before posting a verdict comment and writing labels in Step 3 or Step 4, re-read labels one more time — this shrinks the race window from the full evaluation duration to the gap between the recheck and the write:
+
+```bash
+RECHECK_LABELS=$(gh issue view "$ISSUE_NUMBER" --json labels --jq '[.labels[].name] | join(",")')
+```
+
+If `loom:evaluating` is no longer present (reclaimed as stale by a concurrent Champion pass while you were evaluating), **abort**: do not comment, do not write any label. A later pass will pick this issue up cleanly.
+
+---
+
 ## Promotion Workflow
 
 ### Step 1: Read the Issue
@@ -240,14 +313,18 @@ Assess the issue's alignment with current project goals:
 
 **Step 3b: Promote with Tier Label**
 
+Re-run the "Verdict-time recheck" (above) immediately before this write; abort if `loom:evaluating` is gone.
+
 ```bash
-# Add loom:issue AND the appropriate tier label
+# Add loom:issue AND the appropriate tier label; release the loom:evaluating
+# claim in the SAME command that writes the outcome.
 # NOTE: loom:curated is preserved (indicates issue went through curation)
 # Other proposal labels (loom:architect, loom:hermit, loom:auditor) are removed
 gh issue edit <number> \
   --remove-label "loom:architect" \
   --remove-label "loom:hermit" \
   --remove-label "loom:auditor" \
+  --remove-label "loom:evaluating" \
   --add-label "loom:issue" \
   --add-label "tier:goal-advancing"  # OR tier:goal-supporting OR tier:maintenance
 
@@ -275,10 +352,42 @@ This issue has been evaluated and promoted to \`loom:issue\` status. All quality
 
 ### Step 4: Reject (One or More Criteria Fail)
 
-If any criteria fail, leave detailed feedback but keep the original proposal label:
+If any criteria fail, first check whether this rejection should **escalate** instead of posting another comment — the mechanism that stops the 6x duplicate-comment loop:
 
 ```bash
-gh issue comment <number> --body "**Champion Review: NEEDS REVISION**
+# How many NEEDS REVISION verdicts has Champion already posted on this issue
+# (any revision)? This is the "N identical verdicts" counter from the issue.
+PRIOR_REJECTIONS=$(echo "$ISSUE_JSON" | jq \
+  '[.comments[] | select(.body | contains("Champion Review: NEEDS REVISION"))] | length')
+ALREADY_ROUTED=$(echo "$ISSUE_JSON" | jq -e '.labels[] | select(.name=="loom:operator-only")' >/dev/null && echo yes || echo no)
+```
+
+**If `PRIOR_REJECTIONS >= 2` and not already routed** (N=2 threshold): escalate instead of posting a third+ rejection. Re-run the verdict-time recheck first:
+
+```bash
+ESCALATE_MARKER="<!-- champion:proposal-escalated -->"
+gh issue comment <number> --body "$ESCALATE_MARKER
+**Champion: Escalating to Operator — Repeated Rejection Without Revision**
+
+This proposal has now been rejected $PRIOR_REJECTIONS+ times with converging feedback, but has not been revised to address it. Re-running an identical evaluation each cycle only produces duplicate comments; it doesn't move this forward.
+
+**Recurring findings:**
+- [Criterion that failed, repeated across rejections]: [Specific reason]
+
+A human needs to decide whether to revise this proposal, close it, or accept it as-is.
+
+---
+*Automated by Champion role*" \
+  && gh issue edit <number> --remove-label "loom:evaluating" --add-label "loom:operator-only"
+```
+
+`loom:operator-only` removes the issue from every future promotion pass (see "When NOT to Promote" in Batch Processing below), so this escalation comment posts exactly once per issue.
+
+**Otherwise** (first or second rejection, not yet routed): leave detailed feedback, keep the original proposal label, and release the claim in the same command:
+
+```bash
+gh issue comment <number> --body "$VERDICT_MARKER
+**Champion Review: NEEDS REVISION**
 
 This issue requires additional work before promotion to \`loom:issue\`:
 
@@ -292,8 +401,11 @@ This issue requires additional work before promotion to \`loom:issue\`:
 Keeping original proposal label. The proposing role or issue author can address these concerns and resubmit.
 
 ---
-*Automated by Champion role*"
+*Automated by Champion role*" \
+  && gh issue edit <number> --remove-label "loom:evaluating"
 ```
+
+The `$VERDICT_MARKER` (computed in "Idempotency check" above, keyed to this issue's `updatedAt`) is what makes the next cycle's idempotency check skip silently instead of re-evaluating — omitting it reopens the duplicate-comment loop this section exists to close.
 
 Do NOT remove the proposal label (`loom:curated`, `loom:architect`, `loom:hermit`, or `loom:auditor`) when rejecting.
 
@@ -310,14 +422,20 @@ Work through all available curated issues, applying the tier-based rate limits t
 
 Continue evaluating issues until all have been processed or all applicable tier limits are reached. This prevents issues from waiting unnecessarily across multiple 10-minute intervals when they've already met quality criteria.
 
+**Per-issue order in the loop**: run the "Idempotency check" first (skip silently on a marker match, no claim taken), then the "Claim" step (skip if a concurrent evaluation holds a fresh `loom:evaluating`, reclaim if stale) — both from "Concurrency Guard and Idempotency" above — before Step 1 (Read). A skip at either point means: continue the loop to the next issue, do not count it against the tier limits (it was neither promoted nor rejected this pass).
+
 ### When NOT to Promote
 
 Regardless of quality, do NOT promote an issue if:
 - Issue has `loom:blocked` label
-- Issue has `loom:operator-only` label (requires human action outside automation — credentials, infra rotations, manual deploys, hardware access; sweep will skip these in pre-flight, so promoting to `loom:issue` would only stall the queue)
+- Issue has `loom:operator-only` label (requires human action outside automation — credentials, infra rotations, manual deploys, hardware access; sweep will skip these in pre-flight, so promoting to `loom:issue` would only stall the queue). This is also the terminal state the N=2 escalation in Step 4 routes to, so an escalated proposal is automatically excluded from every future pass.
 - Issue title contains "DISCUSSION" or "RFC" (requires human input)
 - Issue mentions breaking changes without migration plan
 - Issue references external dependencies that need coordination
+
+### When NOT to Even Claim (fresh `loom:evaluating`)
+
+Do not claim or evaluate an issue that already carries a fresh `loom:evaluating` label — a concurrent Champion pass (this process's own batch loop, a cron tick, or a role-runner tick on another host) is actively evaluating it. See "Claim (staleness-aware...)" above for the exact age check; skip and continue the batch rather than waiting.
 
 ---
 

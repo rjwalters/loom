@@ -38,22 +38,27 @@ If found, **read and follow instructions in `.claude/commands/loom/champion-pr-m
 
 ### Priority 2: Quality Issues Ready to Promote
 
-If no PRs need merging, check for curated issues:
+If no PRs need merging, check for curated issues. Exclude `loom:evaluating` (a
+fresh claim from a concurrent Champion evaluation, #4954) so a batch doesn't
+re-discover work another pass already claimed — `updatedAt` is also fetched
+here for `champion-issue-promo.md`'s idempotency check:
 
 ```bash
 gh issue list \
   --label="loom:curated" \
   --state=open \
   --limit=500 \
-  --json number,title,body,labels,comments \
-  --jq '.[] | "#\(.number) \(.title)"'
+  --json number,title,body,labels,comments,updatedAt \
+  --jq '.[] | select([.labels[].name] | contains(["loom:evaluating"]) | not) |
+  "#\(.number) \(.title)"'
 ```
 
 If found, **read and follow instructions in `.claude/commands/loom/champion-issue-promo.md`**.
 
 ### Priority 3: Architect/Hermit/Auditor Proposals Ready to Promote
 
-If no curated issues need promotion, check for well-formed proposals:
+If no curated issues need promotion, check for well-formed proposals. Same
+`loom:evaluating` exclusion and `updatedAt` fetch as Priority 2 above:
 
 ```bash
 # Check for Architect proposals
@@ -61,27 +66,30 @@ gh issue list \
   --label="loom:architect" \
   --state=open \
   --limit=500 \
-  --json number,title,body,labels,comments \
-  --jq '.[] | "#\(.number) \(.title) [architect]"'
+  --json number,title,body,labels,comments,updatedAt \
+  --jq '.[] | select([.labels[].name] | contains(["loom:evaluating"]) | not) |
+  "#\(.number) \(.title) [architect]"'
 
 # Check for Hermit proposals
 gh issue list \
   --label="loom:hermit" \
   --state=open \
   --limit=500 \
-  --json number,title,body,labels,comments \
-  --jq '.[] | "#\(.number) \(.title) [hermit]"'
+  --json number,title,body,labels,comments,updatedAt \
+  --jq '.[] | select([.labels[].name] | contains(["loom:evaluating"]) | not) |
+  "#\(.number) \(.title) [hermit]"'
 
 # Check for Auditor bug reports
 gh issue list \
   --label="loom:auditor" \
   --state=open \
   --limit=500 \
-  --json number,title,body,labels,comments \
-  --jq '.[] | "#\(.number) \(.title) [auditor]"'
+  --json number,title,body,labels,comments,updatedAt \
+  --jq '.[] | select([.labels[].name] | contains(["loom:evaluating"]) | not) |
+  "#\(.number) \(.title) [auditor]"'
 ```
 
-If found, **read and follow instructions in `.claude/commands/loom/champion-issue-promo.md`**. Architect/Hermit/Auditor proposals use the same 8 evaluation criteria as curated issues.
+If found, **read and follow instructions in `.claude/commands/loom/champion-issue-promo.md`**. Architect/Hermit/Auditor proposals use the same 8 evaluation criteria as curated issues, plus the concurrency guard and idempotency rules in that file's "Concurrency Guard and Idempotency (`loom:evaluating`)" section.
 
 **Note**: Proposals from Architect, Hermit, and Auditor roles are typically well-formed since these roles generate detailed, implementation-ready issues. Champion should promote proposals that meet all quality criteria without requiring human intervention for routine proposals.
 
