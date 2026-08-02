@@ -4544,6 +4544,7 @@ disable-on-stop. The contract mirrors launchd point-for-point:
 | `RunAtLoad=true` + `launchctl enable` (#3972) | `[Install] WantedBy=default.target` + `systemctl --user enable` |
 | `KeepAlive:{SuccessfulExit:true}` — relaunch only on a clean exit `0` (#4054) | `Restart=on-success` — relaunch only on a clean exit `0` (exact analog; a crash / operator SIGTERM/SIGINT exits non-zero and stays down) |
 | (no cgroup-timeout reclassification of a clean exit — not applicable) | `KillMode=mixed` (#4862) — without it, a clean exit(0) with lingering cgroup children (in-flight `claude`/`tee`/`sleep` sweep workers) gets reclassified `Result=timeout` by the default `control-group` mode once `TimeoutStopSec` elapses, and `Restart=on-success` does not match `timeout` — so the relaunch silently never fires. `mixed` escalates the leftover-process SIGKILL sweep on the *main process's own exit*, not after `TimeoutStopSec`, so the unit's `Result` tracks the main process's exit status |
+| (no `TimeoutStopSec` analog — launchd's `KeepAlive` has no stop-timeout escalation) | `TimeoutStopSec=20` (#4950) — the daemon's own stop paths (`RestartDaemon`'s `exit(0)`, the SIGTERM handler's `exit(143)`) are near-instant with no blocking drain, so 20s is a generous multiple, not a tight fit; it exists purely as a fast-failure backstop against a regression or a stale, not-yet-re-rendered unit, well below systemd's 90s default |
 | `launchctl bootout` on operator stop | `systemctl --user disable --now <unit>` |
 | plist `EnvironmentVariables` (`LOOM_DAEMON_SUPERVISOR=launchd`, forwarded `LOOM_*`/tokens, deterministic PATH #4172) | `Environment=` lines (`LOOM_DAEMON_SUPERVISOR=systemd`, same forwarded env + PATH) |
 | `WorkingDirectory` = checkout in machine mode (#4229), else repo root | `WorkingDirectory=` — same resolution |
@@ -4591,6 +4592,22 @@ disable-on-stop. The contract mirrors launchd point-for-point:
   `ExecMainStatus=0`, mirroring `launchctl kickstart`), which run `systemctl
   --user reset-failed <unit> && systemctl --user start <unit>` — never for a
   crash or an operator stop.
+- **The `restart` primitive itself also verifies, synchronously (#4950).** The
+  watchdog gate above is a periodic (timer-driven) safety net; it can be
+  minutes away from the moment a roll actually breaks the relaunch. So
+  `loom-daemon-update.sh`'s systemd branch (mirroring #4232's launchd
+  verification) polls for a NEW, live `MainPID` within a bounded window
+  (`LOOM_DAEMON_RESTART_POLL_SECS`, default 30s) right after the `restart` IPC
+  ack, *before* reporting success — the 2026-08-02 incident this closes was a
+  `restart` that ack'd cleanly (exit 0) but whose unit landed in `failed
+  (Result: timeout)` because `TimeoutStopSec` (now bounded to 20s, see
+  "systemd unit rendering" below) had not yet been applied to the live,
+  already-installed unit. When the poll times out AND the unit's `ActiveState`
+  is confirmed `failed` — `Restart=on-success` never auto-relaunches a `failed`
+  unit — it self-heals with the identical `systemctl --user reset-failed
+  <unit> && systemctl --user start <unit>` recovery, re-polls
+  (`LOOM_DAEMON_RESTART_KICKSTART_POLL_SECS`, default 15s), and only then gives
+  up (exit 7) with a `systemctl --user status` diagnostic snapshot.
 
 ### macOS TCC hygiene under launchd (#3980)
 

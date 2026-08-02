@@ -95,7 +95,13 @@
 # by the identical `loom-daemon restart` IPC primitive (recognized daemon-side by
 # `detect_supervisor()` since #4267/PR #4298 when `LOOM_DAEMON_SUPERVISOR=systemd`
 # is present — baked into the rendered unit by loom-daemon-start.sh); a clean
-# exit 0 lets systemd's `Restart=on-success` relaunch onto the fresh binary. On a
+# exit 0 lets systemd's `Restart=on-success` relaunch onto the fresh binary.
+# That ack is verified, not trusted (#4950, mirroring #4232's launchd
+# verification): the script polls for a NEW, live MainPID within a bounded
+# window before reporting success, and — if the unit instead lands in `failed`
+# (e.g. a stop-timeout escalation, which `Restart=on-success` never matches) —
+# self-heals via `systemctl --user reset-failed <unit> && systemctl --user
+# start <unit>` before giving up (exit 7). On a
 # refused restart (a pre-#4267 binary with no RestartDaemon handler, or a dead
 # socket), the script refuses loudly (exit 6) exactly like launchd, and
 # --relaunch (or LOOM_DAEMON_UPDATE_RELAUNCH=1) re-renders the unit and forces
@@ -168,15 +174,19 @@
 #                          checkout. Direct invocation of this script (no
 #                          dispatcher -- the existing dev workflow) never sets
 #                          it and is unaffected.
-#   LOOM_DAEMON_RESTART_POLL_SECS  macOS/launchd only: seconds to poll for a
-#                          NEW, live pid after a `restart` ack before falling
-#                          back to `launchctl kickstart` (default 30, #4232).
+#   LOOM_DAEMON_RESTART_POLL_SECS  macOS/launchd (#4232) AND Linux/systemd
+#                          (#4950): seconds to poll for a NEW, live pid after a
+#                          `restart` ack before falling back to the
+#                          supervisor's self-heal (`launchctl kickstart` on
+#                          launchd; `systemctl --user reset-failed && start` on
+#                          systemd, and only when the unit is `failed`)
+#                          (default 30).
 #   LOOM_DAEMON_RESTART_POLL_INTERVAL  Poll interval in seconds between pid
 #                          checks (default 1; may be fractional, e.g. 0.5).
-#   LOOM_DAEMON_RESTART_KICKSTART_POLL_SECS  macOS/launchd only: seconds to
-#                          re-poll for a new, live pid after the `launchctl
-#                          kickstart` fallback before giving up (default 15,
-#                          #4232).
+#   LOOM_DAEMON_RESTART_KICKSTART_POLL_SECS  macOS/launchd (#4232) AND
+#                          Linux/systemd (#4950): seconds to re-poll for a new,
+#                          live pid after the self-heal fallback before giving
+#                          up (default 15).
 #
 # Exit codes:
 #   0  up to date (no-op) OR rebuild+provision+restart succeeded
@@ -205,14 +215,20 @@
 #      with --relaunch (or LOOM_DAEMON_UPDATE_RELAUNCH=1) it performs that
 #      re-render+relaunch itself, propagating loom-daemon-start.sh's exit code
 #      (#4042, #4118, #4260 sub-issue C).
-#   7  launchd restart ACK'd but never took effect (#4232): the running (old)
-#      binary accepted the `restart` IPC request (exit 0), but launchd never
-#      relaunched the job onto a NEW, live pid within the poll window, AND the
-#      `launchctl kickstart` fallback (plain, never -k) also failed to bring it
-#      up within its own poll window. The fresh binary IS provisioned, but the
-#      daemon's live status is NOT confirmed — this is the "restart scheduled
-#      but launchd silently never relaunched" outage this issue closes; the
-#      script refuses to report success on the ack alone.
+#   7  restart ACK'd but never took effect: the running (old) binary accepted
+#      the `restart` IPC request (exit 0), but the supervisor never relaunched
+#      the job/unit onto a NEW, live pid within the poll window, AND the
+#      self-heal fallback also failed to bring it up within its own poll
+#      window. On launchd (#4232) the fallback is a plain `launchctl
+#      kickstart` (never -k). On systemd (#4950) the fallback is `systemctl
+#      --user reset-failed <unit> && systemctl --user start <unit>`, tried ONLY
+#      when the unit's ActiveState is confirmed `failed` (systemd never
+#      auto-relaunches a `failed` unit even under `Restart=on-success` — a
+#      `Result=timeout` stop escalation is the exact incident shape #4950
+#      closes). The fresh binary IS provisioned, but the daemon's live status
+#      is NOT confirmed — this is the "restart scheduled but the supervisor
+#      silently never relaunched" outage class these issues close; the script
+#      refuses to report success on the ack alone.
 #
 # See also: loom-daemon-start.sh (writes .loom/.daemon.flags), loom-daemon-stop.sh
 # (SIGTERM -> grace -> SIGKILL; in-flight sweeps survive by design — this
@@ -863,6 +879,16 @@ systemd_unit_loaded() {
 systemd_unit_pid() {
     systemctl --user show -p MainPID --value "$SYSTEMD_UNIT" 2>/dev/null
 }
+# systemd_unit_active_state / systemd_unit_result — the two `systemctl --user
+# show` properties the #4950 verification/recovery logic below keys off of:
+# ActiveState (e.g. active/inactive/failed) and Result (success/timeout/...).
+# Mirror systemd_unit_pid's plain --value query shape.
+systemd_unit_active_state() {
+    systemctl --user show -p ActiveState --value "$SYSTEMD_UNIT" 2>/dev/null
+}
+systemd_unit_result() {
+    systemctl --user show -p Result --value "$SYSTEMD_UNIT" 2>/dev/null
+}
 
 # ---------- verify a launchd restart actually relaunched the job (#4232) ----------
 # THE PROBLEM: the launchd branch below used to treat a successful `restart`
@@ -910,6 +936,67 @@ log_launchd_diagnostics() {
     while IFS= read -r line; do
         warn "  $line"
     done < <(launchctl print "$LAUNCHD_SERVICE" 2>&1)
+}
+
+# ---------- verify a systemd restart actually relaunched the unit (#4950) ----------
+# THE PROBLEM (the systemd mirror of #4232's launchd gap): the systemd branch
+# below used to treat a successful `restart` ack (the RUNNING binary accepting
+# the IPC request and exiting 0, per #4054) as success and exit 0 immediately —
+# fire-and-forget, with NO verification that `Restart=on-success` actually
+# relaunched the unit. On 2026-08-02 that ack was honest (the daemon exited 0),
+# but the unit's own STOP transition (systemd sends SIGTERM to the main process
+# as part of processing the exit, then waits up to `TimeoutStopSec` for the
+# unit to fully settle) exceeded the default 90s `TimeoutStopSec` — likely
+# because the LIVE, already-installed unit predated #4862's `KillMode=mixed`
+# fix (a plain `restart` IPC request never re-renders the unit; only
+# `--relaunch` does — see perform_systemd_relaunch below) and lingering
+# `claude`/`tee`/`sleep` sweep-worker children in the same cgroup were reaped
+# only after the full timeout. systemd then marked the unit `failed (Result:
+# timeout)`, and `Restart=on-success` does NOT match `Result=timeout` (only
+# `Result=success` triggers it — see the `Restart=` table in
+# systemd.service(5)), so the relaunch silently never fired and the host was
+# daemonless until an operator ran `systemctl --user reset-failed <unit> &&
+# systemctl --user start <unit>` by hand. This closes that gap: verify a NEW,
+# live MainPID before reporting success, and self-heal via the exact
+# reset-failed+start recovery when the unit lands in `failed`.
+#
+# wait_for_new_systemd_pid <pre_pid> <timeout_secs> <interval_secs> — poll
+# `systemd_unit_pid` (the unit's MainPID) until it reports a pid that is BOTH
+# different from <pre_pid> AND alive (`kill -0`), for up to <timeout_secs>. A
+# reported "0" (not running) never counts, and neither does a pid that merely
+# differs but is already dead (a race artifact) or still equals <pre_pid> (the
+# old process lingering mid-teardown during the poll window). On success,
+# echoes the new pid on stdout and returns 0; on timeout, returns 1 with no
+# output. <interval_secs> may be fractional (e.g. 0.2), matching `sleep`'s own
+# support. Mirrors wait_for_new_launchd_pid above byte-for-byte in contract.
+wait_for_new_systemd_pid() {
+    local pre_pid="$1" timeout_secs="$2" interval_secs="$3"
+    local deadline cur_pid
+    deadline=$(( $(date +%s) + timeout_secs ))
+    while true; do
+        cur_pid="$(systemd_unit_pid)"
+        if [[ -n "$cur_pid" && "$cur_pid" != "0" && "$cur_pid" != "$pre_pid" ]] \
+            && kill -0 "$cur_pid" 2>/dev/null; then
+            echo "$cur_pid"
+            return 0
+        fi
+        if (( $(date +%s) >= deadline )); then
+            return 1
+        fi
+        sleep "$interval_secs"
+    done
+}
+
+# log_systemd_diagnostics — dump `systemctl --user status`'s current state
+# (including the `Active:`/`Result:` line the incident's journal excerpt was
+# read off of) as a diagnostic breadcrumb when a relaunch cannot be verified,
+# mirroring log_launchd_diagnostics above.
+log_systemd_diagnostics() {
+    warn "systemctl --user status $SYSTEMD_UNIT diagnostic snapshot:"
+    local line
+    while IFS= read -r line; do
+        warn "  $line"
+    done < <(systemctl --user status "$SYSTEMD_UNIT" --no-pager --full 2>&1)
 }
 
 # ---------- re-render + relaunch on a refused restart (#4118) ----------
@@ -1415,10 +1502,58 @@ if [[ "$DAEMON_MANAGER" == "systemd" ]]; then
     echo "loom-daemon is systemd-managed (unit ${SYSTEMD_UNIT})."
     echo "Restarting via the supervised restart primitive: $PROVISION_TARGET restart"
     echo "(.daemon.flags is NOT consulted — the unit's Environment= lines carry the equivalent config.)"
+
+    # Capture the pre-restart pid BEFORE the request so the poll below can tell
+    # "systemd relaunched onto a new pid" apart from "the same unit never moved".
+    PRE_RESTART_PID="$(systemd_unit_pid)"
+
     if "$PROVISION_TARGET" restart; then
-        ok "loom-daemon restart scheduled — systemd will relaunch it onto the freshly-provisioned binary."
-        print_final_installed_line "$BUILT_COMMIT"
-        exit 0
+        # The RUNNING (old) binary accepted the request — but that ack is the
+        # daemon's promise, not proof systemd actually honored it (#4950: the
+        # daemon can exit 0 and the unit can still land in `failed (Result:
+        # timeout)` before `Restart=on-success` ever fires). Verify a NEW,
+        # live MainPID before reporting success; the success message below is
+        # intentionally the ONLY "restart scheduled"-style success line in
+        # this branch, and it is unreachable until verification passes.
+        RESTART_POLL_SECS="${LOOM_DAEMON_RESTART_POLL_SECS:-30}"
+        RESTART_POLL_INTERVAL="${LOOM_DAEMON_RESTART_POLL_INTERVAL:-1}"
+        KICKSTART_POLL_SECS="${LOOM_DAEMON_RESTART_KICKSTART_POLL_SECS:-15}"
+        echo "Restart request accepted (pre-restart pid: ${PRE_RESTART_PID:-<none>}). Verifying systemd relaunches onto a NEW, live MainPID within ${RESTART_POLL_SECS}s before reporting success (#4950)..."
+
+        if NEW_PID="$(wait_for_new_systemd_pid "$PRE_RESTART_PID" "$RESTART_POLL_SECS" "$RESTART_POLL_INTERVAL")"; then
+            ok "loom-daemon restart scheduled — systemd relaunched it onto the freshly-provisioned binary (new pid ${NEW_PID}, verified within ${RESTART_POLL_SECS}s)."
+            print_final_installed_line "$BUILT_COMMIT"
+            exit 0
+        fi
+
+        warn "systemd did NOT relaunch within ${RESTART_POLL_SECS}s of the restart ack — no new, live MainPID observed (pre-restart pid was ${PRE_RESTART_PID:-<none>})."
+        log_systemd_diagnostics
+        UNIT_ACTIVE_STATE="$(systemd_unit_active_state)"
+        UNIT_RESULT="$(systemd_unit_result)"
+
+        if [[ "$UNIT_ACTIVE_STATE" == "failed" ]]; then
+            # The exact incident shape (#4950): a stop-timeout escalation left
+            # the unit `failed`, so `Restart=on-success` will NEVER fire on its
+            # own — systemd refuses to auto-restart a unit already in `failed`.
+            # Self-heal via the documented recovery.
+            warn "Unit is in a 'failed' state (Result=${UNIT_RESULT:-unknown}) — systemd will NOT auto-relaunch a failed unit even under Restart=on-success. Self-healing via 'systemctl --user reset-failed $SYSTEMD_UNIT && systemctl --user start $SYSTEMD_UNIT'."
+            systemctl --user reset-failed "$SYSTEMD_UNIT" >/dev/null 2>&1
+            systemctl --user start "$SYSTEMD_UNIT" >/dev/null 2>&1
+
+            if NEW_PID="$(wait_for_new_systemd_pid "$PRE_RESTART_PID" "$KICKSTART_POLL_SECS" "$RESTART_POLL_INTERVAL")"; then
+                ok "loom-daemon restart scheduled — systemd's own relaunch did not occur within ${RESTART_POLL_SECS}s (unit landed in 'failed', Result=${UNIT_RESULT:-unknown}), but 'systemctl --user reset-failed && start' recovered it (new pid ${NEW_PID}, verified within ${KICKSTART_POLL_SECS}s). Remediation note: the reset-failed+start fallback was required (#4950) — investigate why the unit's stop sequence exceeded TimeoutStopSec (a live unit that predates #4862's KillMode=mixed fix — never re-rendered by a plain restart — is the most likely cause; re-render it with 'loom-daemon-update.sh --relaunch')."
+                print_final_installed_line "$BUILT_COMMIT"
+                exit 0
+            fi
+
+            err "loom-daemon restart FAILED: no new, live MainPID was observed even after 'systemctl --user reset-failed && start'."
+        else
+            err "loom-daemon restart FAILED: the unit is not confirmed relaunched, and its ActiveState (${UNIT_ACTIVE_STATE:-unknown}) is not 'failed' — refusing to guess at a recovery action."
+        fi
+        log_systemd_diagnostics
+        err "The freshly-built binary IS provisioned, but the daemon's live status is NOT confirmed (pre-restart pid was ${PRE_RESTART_PID:-<none>})."
+        err "Investigate manually: systemctl --user status $SYSTEMD_UNIT"
+        exit 7
     fi
     # The restart request is served by the RUNNING (old) binary. A pre-#4267
     # daemon has no RestartDaemon handler recognizing LOOM_DAEMON_SUPERVISOR=systemd

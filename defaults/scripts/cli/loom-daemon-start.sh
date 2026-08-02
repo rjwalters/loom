@@ -649,6 +649,15 @@ render_launchd_plist() {
 #     status. This does not change genuine-crash semantics (still Result=
 #     exit-code / signal, still refused by on-success) -- verified with both
 #     shapes in test-loom-daemon-start.sh.
+#   * TimeoutStopSec=20 (#4950): a fast-failure backstop well below systemd's
+#     90s default -- see the printf site below for the full sizing rationale
+#     (both the RestartDaemon primitive and the operator-stop SIGTERM handler
+#     exit near-instantly, so a healthy daemon never approaches 20s). Without
+#     this, a stop-transition that DOES stall (e.g. a stale unit predating
+#     KillMode=mixed above, still lingering on an already-provisioned host)
+#     drags out the default 90s before landing the unit in `failed (Result:
+#     timeout)` -- the exact 2026-08-02 incident `loom-daemon-update.sh`'s
+#     #4950 restart-verification poll now detects and self-heals.
 #   * [Install] WantedBy=default.target + `systemctl --user enable` is the
 #     RunAtLoad=true analog: the service comes up on login (and, with
 #     `loginctl enable-linger`, after a reboot).
@@ -706,6 +715,21 @@ render_systemd_unit() {
     # reclassified as Result=timeout (control-group's default forced-SIGKILL-
     # after-TimeoutStopSec path) and Restart=on-success never fires.
     printf 'KillMode=mixed\n'
+    # TimeoutStopSec=20 (#4950): bounds the unit's own stop-transition wait
+    # well below systemd's 90s default. Both the RestartDaemon primitive
+    # (#4054, exit(0) synchronously after the IPC ack) and the operator-stop
+    # SIGTERM handler (#3813, exit(143) right after removing the socket) exit
+    # near-instantly with no blocking drain -- 20s is a generous multiple of
+    # that worst case, not a tight fit -- so a HEALTHY daemon never brushes
+    # this ceiling. It exists purely as a fast-failure backstop: if a future
+    # regression reintroduces a slow/blocking shutdown path (or a stale,
+    # not-yet-re-rendered unit predating KillMode=mixed above leaves lingering
+    # cgroup children), the unit fails fast at 20s instead of dragging out the
+    # full 90s default before `loom-daemon-update.sh`'s #4950 verification
+    # poll (LOOM_DAEMON_RESTART_POLL_SECS, default 30s) even has a chance to
+    # observe the failure and self-heal via `systemctl --user reset-failed &&
+    # start`.
+    printf 'TimeoutStopSec=20\n'
     printf '%b' "$env_lines"
     printf 'StandardOutput=append:%s\n' "$log_path"
     printf 'StandardError=append:%s\n' "$log_path"

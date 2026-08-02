@@ -294,19 +294,21 @@ rm -rf "$MACHINE_HOME" "$MACHINE_CHECKOUT" "$NON_REPO_DIR"
 SD_UNIT="loom-daemon-test-$$.service"
 
 # S1. --print-unit renders the unit with NO side effects (no systemctl, no file
-#     write). Assert the five load-bearing fields from the issue's test plan:
-#     Restart=on-success, KillMode=mixed (#4862), WantedBy=default.target, the
-#     baked Environment=LOOM_DAEMON_SUPERVISOR=systemd, and WorkingDirectory=<repo>.
+#     write). Assert the six load-bearing fields from the issue's test plan:
+#     Restart=on-success, KillMode=mixed (#4862), TimeoutStopSec=20 (#4950),
+#     WantedBy=default.target, the baked Environment=LOOM_DAEMON_SUPERVISOR=systemd,
+#     and WorkingDirectory=<repo>.
 unit_out=$( ( cd "$WORKDIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
     LOOM_DAEMON_BIN="$FAKE_BIN" bash "$START_SCRIPT" --print-unit 2>/dev/null ) )
 TESTS_RUN=$((TESTS_RUN + 1))
 if echo "$unit_out" | grep -qx 'Restart=on-success' \
     && echo "$unit_out" | grep -qx 'KillMode=mixed' \
+    && echo "$unit_out" | grep -qx 'TimeoutStopSec=20' \
     && echo "$unit_out" | grep -qx 'WantedBy=default.target' \
     && echo "$unit_out" | grep -qx 'Environment=LOOM_DAEMON_SUPERVISOR=systemd' \
     && echo "$unit_out" | grep -qx "WorkingDirectory=$WORKDIR"; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "${GREEN}✓${NC} --print-unit renders Restart=on-success, KillMode=mixed, WantedBy=default.target, LOOM_DAEMON_SUPERVISOR=systemd, WorkingDirectory=<repo>"
+    echo -e "${GREEN}✓${NC} --print-unit renders Restart=on-success, KillMode=mixed, TimeoutStopSec=20, WantedBy=default.target, LOOM_DAEMON_SUPERVISOR=systemd, WorkingDirectory=<repo>"
 else
     TESTS_FAILED=$((TESTS_FAILED + 1))
     echo -e "${RED}✗${NC} --print-unit renders the expected unit fields"
@@ -373,12 +375,13 @@ rm -f "$WORKDIR/.loom/.daemon.pid"
 TESTS_RUN=$((TESTS_RUN + 1))
 if [[ -f "$SD_HOME/.config/systemd/user/$SD_UNIT" ]] \
     && grep -qx 'Restart=on-success' "$SD_HOME/.config/systemd/user/$SD_UNIT" \
-    && grep -qx 'KillMode=mixed' "$SD_HOME/.config/systemd/user/$SD_UNIT"; then
+    && grep -qx 'KillMode=mixed' "$SD_HOME/.config/systemd/user/$SD_UNIT" \
+    && grep -qx 'TimeoutStopSec=20' "$SD_HOME/.config/systemd/user/$SD_UNIT"; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "${GREEN}✓${NC} systemd path: renders the unit file under ~/.config/systemd/user with Restart=on-success + KillMode=mixed (#4862)"
+    echo -e "${GREEN}✓${NC} systemd path: renders the unit file under ~/.config/systemd/user with Restart=on-success + KillMode=mixed (#4862) + TimeoutStopSec=20 (#4950)"
 else
     TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "${RED}✗${NC} systemd path: renders the unit file under ~/.config/systemd/user with Restart=on-success + KillMode=mixed"
+    echo -e "${RED}✗${NC} systemd path: renders the unit file under ~/.config/systemd/user with Restart=on-success + KillMode=mixed + TimeoutStopSec=20"
 fi
 TESTS_RUN=$((TESTS_RUN + 1))
 if echo "$sd_out" | grep -qi 'enable-linger'; then

@@ -478,6 +478,99 @@ EOF
     chmod +x "$bin_dir/systemctl"
 }
 
+# Writes a stub `systemctl` at $1/systemctl for the #4950 restart-VERIFICATION
+# tests: `MainPID`/`ActiveState`/`Result` all live in a single state file ($3,
+# colon-delimited "pid:activestate:result") rather than being hardcoded, so a
+# test can drive the exact transitions the update script's #4950 poll +
+# self-heal logic reacts to. Structurally unable to touch a real systemd
+# --user manager — this suite runs on Darwin runners (LOOM_SYSTEMD_FORCE=1).
+#
+# Args: <bin_dir> <log> <state_file> <pre_state> [post_restart_marker]
+#       [post_state] [recovery_state]
+#
+#   <pre_state>            the initial "pid:activestate:result" written to
+#                           <state_file> on first invocation if it does not
+#                           already exist (e.g. "4242:active:success").
+#   <post_restart_marker>  (optional) when this file EXISTS, the state auto-
+#                           advances from <pre_state> to <post_state> exactly
+#                           once — simulating "the instant the restart request
+#                           was accepted, systemd's own transition took
+#                           effect" (paired with write_fake_daemon_restart,
+#                           which creates the marker as a side effect of its
+#                           `restart` subcommand).
+#   <post_state>            the state to advance to once the marker exists
+#                           (e.g. "<new-live-pid>:active:success" to simulate
+#                           an immediate spontaneous relaunch, or
+#                           "0:failed:timeout" to simulate the #4950 incident
+#                           shape — a stop-timeout escalation that
+#                           Restart=on-success never fires for).
+#   <recovery_state>        (optional) the state `start` (as invoked by the
+#                           update script's `systemctl --user reset-failed
+#                           <unit> && systemctl --user start <unit>` self-heal)
+#                           advances to. Omit to simulate a self-heal attempt
+#                           that ALSO fails to bring the unit up (the state
+#                           stays whatever `reset-failed` left it at:
+#                           "<pid>:inactive:success").
+write_fake_systemd_pid_bin() {
+    local bin_dir="$1" log="$2" state_file="$3" pre_state="$4"
+    local post_restart_marker="${5:-}" post_state="${6:-}" recovery_state="${7:-}"
+    mkdir -p "$bin_dir"
+    : > "$log"
+    echo "${pre_state}" > "${state_file}"
+    cat > "$bin_dir/systemctl" <<EOF
+#!/usr/bin/env bash
+echo "\$*" >> "${log}"
+if [[ "\${1:-}" == "--user" ]]; then shift; fi
+
+state_file="${state_file}"
+cur="\$(cat "\$state_file" 2>/dev/null)"
+if [[ -n "${post_restart_marker}" && -e "${post_restart_marker}" && "\$cur" == "${pre_state}" ]]; then
+    echo "${post_state}" > "\$state_file"
+    cur="${post_state}"
+fi
+IFS=: read -r cur_pid cur_active cur_result <<< "\$cur"
+
+case "\${1:-}" in
+  is-active)
+    [[ "\$cur_active" == "active" ]] && exit 0 || exit 1 ;;
+  is-enabled)
+    exit 0 ;;
+  show)
+    prop=""
+    for a in "\$@"; do
+      case "\$a" in
+        MainPID) prop=MainPID ;;
+        ActiveState) prop=ActiveState ;;
+        Result) prop=Result ;;
+      esac
+    done
+    case "\$prop" in
+      MainPID)     echo "\$cur_pid" ;;
+      ActiveState) echo "\$cur_active" ;;
+      Result)      echo "\$cur_result" ;;
+      *)           echo "" ;;
+    esac
+    ;;
+  status)
+    echo "● loom-daemon.service - Loom autonomous daemon (loom-daemon)"
+    echo "   Loaded: loaded"
+    echo "   Active: \$cur_active (Result: \$cur_result) since Mon 2026-08-02 03:17:36 UTC"
+    echo "Main PID: \$cur_pid"
+    ;;
+  reset-failed)
+    echo "\$cur_pid:inactive:success" > "\$state_file"
+    ;;
+  start)
+    if [[ -n "${recovery_state}" ]]; then
+      echo "${recovery_state}" > "\$state_file"
+    fi
+    ;;
+  *) exit 0 ;;
+esac
+EOF
+    chmod +x "$bin_dir/systemctl"
+}
+
 # Writes a stale, PRE-#4267 systemd --user unit at $1 (the exact state that
 # causes the refused-restart exit-6 fallback): NO Restart=on-success, NO
 # LOOM_DAEMON_SUPERVISOR key, four autonomy Environment= lines, and a SENTINEL
@@ -1713,9 +1806,12 @@ fi
 #     with NO .loom/.daemon.pid file -> the updater plans/executes a RESTART
 #     (not "was not running"), drives it through the `restart` subcommand
 #     (stub records the invocation), does NOT consult .daemon.flags, and exits
-#     0. Forced via the LOOM_SYSTEMD_FORCE=1 test seam (lib/systemd-user.sh)
-#     since this suite runs on Darwin; LOOM_DAEMON_LAUNCHD=0 is already the
-#     suite-wide default so launchd never competes for this tier.
+#     0. The stub relaunches onto a NEW, real, live pid the instant the restart
+#     is accepted (#4950 case (a): relaunch observed -> success, no
+#     reset-failed+start self-heal ever invoked). Forced via the
+#     LOOM_SYSTEMD_FORCE=1 test seam (lib/systemd-user.sh) since this suite
+#     runs on Darwin; LOOM_DAEMON_LAUNCHD=0 is already the suite-wide default
+#     so launchd never competes for this tier.
 # ============================================================
 W26="$BASE_WORKDIR/w26"
 new_fixture "$W26"
@@ -1729,15 +1825,23 @@ write_fake_daemon_restart "$NEW_FAKE26" "$HEAD26" "$RESTART_MARKER26" 0
 # A .daemon.flags that MUST NOT be consulted in systemd mode (would otherwise
 # add --work-finder to a stop+start path).
 echo "--work-finder" > "$W26/.loom/.daemon.flags"
+# A real, live process standing in for "the relaunched unit's new MainPID" —
+# the #4950 poll requires a live pid (kill -0), not just a differing number.
+sleep 60 >/dev/null 2>&1 &
+RELAUNCHED_PID26=$!
+bg_proc_track "$RELAUNCHED_PID26"
 SD_BIN26="$W26/systemd-bin"
 SD_LOG26="$W26/systemctl.log"
-write_fake_systemd_active_bin "$SD_BIN26" "$SD_LOG26" "4242"
+SD_STATE26="$W26/systemd-pid-state"
+write_fake_systemd_pid_bin "$SD_BIN26" "$SD_LOG26" "$SD_STATE26" "4242:active:success" \
+    "$RESTART_MARKER26" "${RELAUNCHED_PID26}:active:success"
 
 out26=$( cd "$W26" && PATH="$SD_BIN26:$TEST_PATH" LOOM_SYSTEMD_FORCE=1 LOOM_DAEMON_SYSTEMD=1 \
     LOOM_SYSTEMD_UNIT="loom-daemon-test-sd26.service" \
     LOOM_DAEMON_BIN="$INSTALLED26" NEW_FAKE_BIN_SRC="$NEW_FAKE26" \
     bash "$UPDATE_SCRIPT" 2>&1 )
 rc26=$?
+kill "$RELAUNCHED_PID26" 2>/dev/null || true
 assert_eq "0" "$rc26" "systemd-managed update (no pid file) exits 0"
 TESTS_RUN=$((TESTS_RUN + 1))
 if [[ -s "$RESTART_MARKER26" ]]; then
@@ -1765,6 +1869,24 @@ if echo "$out26" | grep -qi 'FLAGS-OFF'; then
 else
     TESTS_PASSED=$((TESTS_PASSED + 1))
     echo -e "${GREEN}✓${NC} no 'restarting FLAGS-OFF' warning fires for a systemd restart"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q "new pid ${RELAUNCHED_PID26}" <<< "$out26"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} success message reports the VERIFIED new MainPID (#4950)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} success message reports the VERIFIED new MainPID (#4950)"
+    echo "  output: $out26"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q 'reset-failed' "$SD_LOG26" 2>/dev/null; then
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} relaunch observed immediately -> reset-failed+start self-heal is NEVER invoked (#4950 case a)"
+    echo "  systemctl.log: $(cat "$SD_LOG26" 2>/dev/null)"
+else
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} relaunch observed immediately -> reset-failed+start self-heal is NEVER invoked (#4950 case a)"
 fi
 
 # ============================================================
@@ -2643,6 +2765,188 @@ else
     TESTS_FAILED=$((TESTS_FAILED + 1))
     echo -e "${RED}✗${NC} unreadable guard script -> notice still fires with an honest unknown window (#4697)"
     echo "  output: $out53"
+fi
+
+# ============================================================
+# 54. Systemd restart ack'd but the unit never relaunches on its own AND lands
+#     in 'failed (Result: timeout)' -> the #4950 self-heal ('systemctl --user
+#     reset-failed <unit> && systemctl --user start <unit>') DOES recover it:
+#     the restart request is accepted (exit 0) but the reported MainPID never
+#     moves off the pre-restart pid until AFTER reset-failed+start are invoked
+#     -- success, with a remediation note in the output. This is the exact
+#     2026-08-02 incident shape this issue closes. Poll windows are shrunk via
+#     env so the test runs fast without changing the production defaults.
+# ============================================================
+W54="$BASE_WORKDIR/w54"
+new_fixture "$W54"
+INSTALLED54="$W54/installed/loom-daemon"
+mkdir -p "$W54/installed"
+RESTART_MARKER54="$W54/restart-invoked"
+write_fake_daemon_restart "$INSTALLED54" "deadbee" "$RESTART_MARKER54" 0
+NEW_FAKE54="$W54/new-fake-daemon"
+HEAD54="$(cd "$W54" && git rev-parse --short HEAD)"
+write_fake_daemon_restart "$NEW_FAKE54" "$HEAD54" "$RESTART_MARKER54" 0
+
+sleep 60 >/dev/null 2>&1 &
+RECOVERED_PID54=$!
+bg_proc_track "$RECOVERED_PID54"
+SD_BIN54="$W54/systemd-bin"
+SD_LOG54="$W54/systemctl.log"
+SD_STATE54="$W54/systemd-pid-state"
+# pre_state: OLD pid, active/success. post_state (once restart is requested):
+# 0:failed:timeout -- Restart=on-success never fires for a failed unit.
+# recovery_state: only reached via reset-failed + start -- a NEW, live pid.
+write_fake_systemd_pid_bin "$SD_BIN54" "$SD_LOG54" "$SD_STATE54" "9999:active:success" \
+    "$RESTART_MARKER54" "0:failed:timeout" "${RECOVERED_PID54}:active:success"
+
+out54=$( cd "$W54" && PATH="$SD_BIN54:$TEST_PATH" LOOM_SYSTEMD_FORCE=1 LOOM_DAEMON_SYSTEMD=1 \
+    LOOM_SYSTEMD_UNIT="loom-daemon-test-sd54.service" \
+    LOOM_DAEMON_BIN="$INSTALLED54" NEW_FAKE_BIN_SRC="$NEW_FAKE54" \
+    LOOM_DAEMON_RESTART_POLL_SECS=1 LOOM_DAEMON_RESTART_POLL_INTERVAL=0.2 \
+    LOOM_DAEMON_RESTART_KICKSTART_POLL_SECS=3 \
+    bash "$UPDATE_SCRIPT" 2>&1 )
+rc54=$?
+kill "$RECOVERED_PID54" 2>/dev/null || true
+assert_eq "0" "$rc54" "no spontaneous relaunch, unit failed -> reset-failed+start recovers it -> exit 0 (#4950)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out54" | grep -qi 'reset-failed' && echo "$out54" | grep -qi 'remediation'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} success output names the reset-failed+start self-heal + a remediation note"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} success output names the reset-failed+start self-heal + a remediation note"
+    echo "  output: $out54"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q -- 'reset-failed' "$SD_LOG54" 2>/dev/null \
+    && grep -qE -- '(^|[[:space:]])start([[:space:]]|$)' "$SD_LOG54" 2>/dev/null; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} self-heal invokes the EXACT documented recovery: reset-failed then start"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} self-heal invokes the EXACT documented recovery: reset-failed then start"
+    echo "  systemctl.log: $(cat "$SD_LOG54" 2>/dev/null)"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q "new pid ${RECOVERED_PID54}" <<< "$out54"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} success message reports the pid recovered by the self-heal"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} success message reports the pid recovered by the self-heal"
+    echo "  output: $out54"
+fi
+
+# ============================================================
+# 55. Systemd restart ack'd, unit never relaunches, lands in 'failed
+#     (Result: timeout)', AND the reset-failed+start self-heal ALSO fails to
+#     bring it up -> exit NON-ZERO (7), loudly, rather than a silent
+#     half-update success (#4950 case (c), mirrors test 36).
+# ============================================================
+W55="$BASE_WORKDIR/w55"
+new_fixture "$W55"
+INSTALLED55="$W55/installed/loom-daemon"
+mkdir -p "$W55/installed"
+RESTART_MARKER55="$W55/restart-invoked"
+write_fake_daemon_restart "$INSTALLED55" "deadbee" "$RESTART_MARKER55" 0
+NEW_FAKE55="$W55/new-fake-daemon"
+HEAD55="$(cd "$W55" && git rev-parse --short HEAD)"
+write_fake_daemon_restart "$NEW_FAKE55" "$HEAD55" "$RESTART_MARKER55" 0
+
+SD_BIN55="$W55/systemd-bin"
+SD_LOG55="$W55/systemctl.log"
+SD_STATE55="$W55/systemd-pid-state"
+# No recovery_state given -> reset-failed+start leaves the unit inactive; the
+# pid never moves.
+write_fake_systemd_pid_bin "$SD_BIN55" "$SD_LOG55" "$SD_STATE55" "9999:active:success" \
+    "$RESTART_MARKER55" "0:failed:timeout"
+
+out55=$( cd "$W55" && PATH="$SD_BIN55:$TEST_PATH" LOOM_SYSTEMD_FORCE=1 LOOM_DAEMON_SYSTEMD=1 \
+    LOOM_SYSTEMD_UNIT="loom-daemon-test-sd55.service" \
+    LOOM_DAEMON_BIN="$INSTALLED55" NEW_FAKE_BIN_SRC="$NEW_FAKE55" \
+    LOOM_DAEMON_RESTART_POLL_SECS=1 LOOM_DAEMON_RESTART_POLL_INTERVAL=0.2 \
+    LOOM_DAEMON_RESTART_KICKSTART_POLL_SECS=1 \
+    bash "$UPDATE_SCRIPT" 2>&1 )
+rc55=$?
+assert_eq "7" "$rc55" "no relaunch even after reset-failed+start -> exit 7 (never a silent half-update, #4950 case c)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out55" | grep -qi 'FAILED' && echo "$out55" | grep -qi 'reset-failed'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} failure output loudly reports the exhausted self-heal fallback"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} failure output loudly reports the exhausted self-heal fallback"
+    echo "  output: $out55"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out55" | grep -qi 'Active:' && echo "$out55" | grep -qi 'Result:'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} failure output includes systemctl status diagnostics (Active:/Result:)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} failure output includes systemctl status diagnostics (Active:/Result:)"
+    echo "  output: $out55"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q -- 'reset-failed' "$SD_LOG55" 2>/dev/null; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} exhausted self-heal still attempted the documented reset-failed recovery"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} exhausted self-heal still attempted the documented reset-failed recovery"
+    echo "  systemctl.log: $(cat "$SD_LOG55" 2>/dev/null)"
+fi
+
+# ============================================================
+# 56. Systemd restart ack'd but never relaunches, and the unit is NOT in a
+#     'failed' state (some other stall, e.g. still 'activating') -> the
+#     updater refuses to guess at a recovery action (no reset-failed/start
+#     invoked) and exits non-zero (7) with diagnostics (#4950 AC2 scope: the
+#     self-heal is gated on a CONFIRMED 'failed' ActiveState).
+# ============================================================
+W56="$BASE_WORKDIR/w56"
+new_fixture "$W56"
+INSTALLED56="$W56/installed/loom-daemon"
+mkdir -p "$W56/installed"
+RESTART_MARKER56="$W56/restart-invoked"
+write_fake_daemon_restart "$INSTALLED56" "deadbee" "$RESTART_MARKER56" 0
+NEW_FAKE56="$W56/new-fake-daemon"
+HEAD56="$(cd "$W56" && git rev-parse --short HEAD)"
+write_fake_daemon_restart "$NEW_FAKE56" "$HEAD56" "$RESTART_MARKER56" 0
+
+SD_BIN56="$W56/systemd-bin"
+SD_LOG56="$W56/systemctl.log"
+SD_STATE56="$W56/systemd-pid-state"
+# post_state is 'activating', not 'failed' -- the pid never moves, but the
+# self-heal gate must NOT fire since the unit was never confirmed failed.
+write_fake_systemd_pid_bin "$SD_BIN56" "$SD_LOG56" "$SD_STATE56" "9999:active:success" \
+    "$RESTART_MARKER56" "0:activating:success"
+
+out56=$( cd "$W56" && PATH="$SD_BIN56:$TEST_PATH" LOOM_SYSTEMD_FORCE=1 LOOM_DAEMON_SYSTEMD=1 \
+    LOOM_SYSTEMD_UNIT="loom-daemon-test-sd56.service" \
+    LOOM_DAEMON_BIN="$INSTALLED56" NEW_FAKE_BIN_SRC="$NEW_FAKE56" \
+    LOOM_DAEMON_RESTART_POLL_SECS=1 LOOM_DAEMON_RESTART_POLL_INTERVAL=0.2 \
+    bash "$UPDATE_SCRIPT" 2>&1 )
+rc56=$?
+assert_eq "7" "$rc56" "unit stalled but never confirmed failed -> exit 7, no guessed recovery"
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q -- 'reset-failed' "$SD_LOG56" 2>/dev/null \
+    || grep -qE -- '(^|[[:space:]])start([[:space:]]|$)' "$SD_LOG56" 2>/dev/null; then
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} self-heal is NEVER invoked when ActiveState is not confirmed 'failed'"
+    echo "  systemctl.log: $(cat "$SD_LOG56" 2>/dev/null)"
+else
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} self-heal is NEVER invoked when ActiveState is not confirmed 'failed'"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out56" | grep -qi 'FAILED'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} failure output loudly reports the unconfirmed relaunch"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} failure output loudly reports the unconfirmed relaunch"
+    echo "  output: $out56"
 fi
 
 # ============================================================
