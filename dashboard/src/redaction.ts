@@ -107,6 +107,13 @@ const RECORD_FIELD_ALLOWLIST: Readonly<Record<string, readonly string[]>> = {
     "kind",
     "captured_at",
     "daemon_version",
+    // Build identity of the emitting binary (#4956). Reviewed for redaction
+    // and deliberately allowed through: a short commit SHA and a build
+    // timestamp describe the released open-source binary, carry no repo /
+    // issue / branch / operator reference, and are exactly as sensitive as
+    // the `daemon_version` directly above them.
+    "build_commit",
+    "built_at",
     "uptime_sec",
     "logical_cpus",
     "cpu_idle_fraction",

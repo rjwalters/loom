@@ -96,4 +96,29 @@ describe("parseFleetSnapshot", () => {
     expect(snapshot.hosts.h?.health?.record).not.toHaveProperty("gpu_count");
     expect(snapshot.activeSweeps[0]).not.toHaveProperty("runtime");
   });
+
+  it("narrows host.health build identity, dropping wrong-typed values (#4956)", () => {
+    const snapshot = parseFleetSnapshot({
+      hosts: {
+        good: {
+          health: {
+            record: { daemon_version: "0.17.0", build_commit: "8c16fb5b", built_at: "2026-08-02T03:09:51Z" },
+            updatedAt: "2026-08-02T12:00:00Z",
+          },
+        },
+        bad: {
+          health: {
+            record: { daemon_version: "0.17.0", build_commit: 12345, built_at: "" },
+            updatedAt: "2026-08-02T12:00:00Z",
+          },
+        },
+      },
+      activeSweeps: [],
+    });
+    expect(snapshot.hosts.good?.health?.record.build_commit).toBe("8c16fb5b");
+    expect(snapshot.hosts.good?.health?.record.built_at).toBe("2026-08-02T03:09:51Z");
+    // A wrong-typed / empty value is dropped, not coerced to a rendered "12345".
+    expect(snapshot.hosts.bad?.health?.record).not.toHaveProperty("build_commit");
+    expect(snapshot.hosts.bad?.health?.record).not.toHaveProperty("built_at");
+  });
 });

@@ -448,9 +448,10 @@ fn sample_token_snapshot(workspace_root: &Path) -> TokenSnapshotRecord {
     }
 }
 
-/// Sample host CPU/disk headroom into a [`HostHealthRecord`]. Every measured
-/// field is `Option` — an unmeasurable probe stays absent rather than a fake
-/// zero (mirrors `cpu_headroom`/`disk_headroom`'s own contract).
+/// Sample host CPU/disk headroom into a [`HostHealthRecord`], stamped with the
+/// running binary's build identity. Every measured field is `Option` — an
+/// unmeasurable probe stays absent rather than a fake zero (mirrors
+/// `cpu_headroom`/`disk_headroom`'s own contract).
 async fn sample_host_health(workspace_root: &Path, started_at: Instant) -> HostHealthRecord {
     // CPU idle refresh can block ~1s on macOS (`iostat`) — dispatched through
     // `spawn_blocking` per the exact pattern `work_finder`'s dynamic-cap tick
@@ -459,6 +460,12 @@ async fn sample_host_health(workspace_root: &Path, started_at: Instant) -> HostH
     HostHealthRecord {
         captured_at: Utc::now(),
         daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+        // The build identity of the RUNNING binary, straight from the same
+        // compile-time stamps `loom-daemon --version` prints (#4956).
+        // `daemon_version` alone only moves once per release, so it cannot
+        // distinguish a day-stale binary from current `main`.
+        build_commit: crate::self_update::BUILT_COMMIT.to_string(),
+        built_at: crate::self_update::built_at(),
         uptime_sec: started_at.elapsed().as_secs(),
         logical_cpus: crate::cpu_headroom::logical_cpu_count(),
         cpu_idle_fraction: crate::cpu_headroom::cached_cpu_idle_fraction(),
@@ -835,5 +842,44 @@ mod tests {
         let record = sample_host_health(dir.path(), started).await;
         assert_eq!(record.daemon_version, env!("CARGO_PKG_VERSION"));
         assert!(record.logical_cpus >= 1);
+    }
+
+    #[tokio::test]
+    async fn host_health_sample_stamps_the_running_binarys_build_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = sample_host_health(dir.path(), Instant::now()).await;
+
+        // The sample must carry the SAME commit `loom-daemon --version`
+        // prints — that identity is what lets the dashboard tell two
+        // same-`daemon_version` builds apart (#4956).
+        assert_eq!(record.build_commit, crate::self_update::BUILT_COMMIT);
+        assert!(
+            !record.build_commit.is_empty(),
+            "build_commit must always be populated (\"unknown\" is the no-git fallback)"
+        );
+        assert_eq!(record.built_at, crate::self_update::built_at());
+
+        // `built_at` is absent only when the compile-time stamp itself is the
+        // "unknown" fallback; whenever it IS present it must be a real instant
+        // no later than the sample, never a fabricated epoch.
+        if let Some(built_at) = record.built_at {
+            assert!(
+                built_at <= record.captured_at,
+                "built_at ({built_at}) must not be after captured_at ({})",
+                record.captured_at
+            );
+        }
+    }
+
+    #[test]
+    fn built_at_parses_the_compile_time_stamp_or_reports_unknown() {
+        // Pins the "unknown != fabricated instant" half of the contract: the
+        // helper resolves to `Some` exactly when the raw stamp is parseable.
+        let raw = crate::self_update::BUILT_AT_RAW;
+        assert_eq!(
+            crate::self_update::built_at().is_some(),
+            chrono::DateTime::parse_from_rfc3339(raw).is_ok(),
+            "built_at() must be Some iff the raw stamp {raw:?} parses"
+        );
     }
 }

@@ -23,6 +23,7 @@ import {
   formatCount,
 } from "../format";
 import type { FleetView, HostStatus, HostView } from "../fleet";
+import type { HostHealthRecord } from "../types";
 import { emptyFleetView } from "./states";
 
 const STATUS_LABEL: Record<HostStatus, string> = {
@@ -58,11 +59,42 @@ function tokenSummaryText(host: HostView): string {
   return `${exhausted}/${total} exhausted · peak ${peak}`;
 }
 
+/**
+ * The emitting binary's identity, as one line: `"0.17.0 @ 8c16fb5b, built 6h
+ * ago"` (#4956).
+ *
+ * `daemon_version` alone cannot answer "is this host's daemon current?" — it
+ * only moves once per release, so every build between two releases reports the
+ * same string and a day-stale binary reads identically to `main`. The commit
+ * is the precise identity; the build age is what makes staleness obvious at a
+ * glance.
+ *
+ * Each part degrades independently: a record from a pre-#4956 daemon (no
+ * commit, no build time) renders exactly as it did before, and an `"unknown"`
+ * commit sentinel (a build host with no git) is dropped rather than shown as a
+ * fake SHA.
+ */
+export function daemonIdentityText(health: HostHealthRecord, now: Date = new Date()): string {
+  const version = health.daemon_version ?? UNKNOWN;
+  const commit = health.build_commit;
+  const identity = commit && commit !== "unknown" ? `${version} @ ${commit}` : version;
+  const age = formatRelative(health.built_at, now);
+  // An absent/unparseable build stamp shows no age clause at all — "built —"
+  // would be noise, not information.
+  return health.built_at && age !== UNKNOWN ? `${identity}, built ${age}` : identity;
+}
+
 /** The `host.health` field set, in the order the schema documents them. */
-export function healthFields(host: HostView): DocumentFragment {
+export function healthFields(host: HostView, now: Date = new Date()): DocumentFragment {
   const health = host.entry.health?.record ?? {};
   const fragment = document.createDocumentFragment();
-  fragment.appendChild(field("Daemon", health.daemon_version ?? UNKNOWN));
+  fragment.appendChild(
+    field(
+      "Daemon",
+      daemonIdentityText(health, now),
+      health.built_at ? `Built ${formatAbsolute(health.built_at)}` : undefined,
+    ),
+  );
   fragment.appendChild(
     field("Uptime", formatDuration(health.uptime_sec), "host.health.uptime_sec"),
   );
@@ -97,7 +129,7 @@ export function hostCard(host: HostView, now: Date = new Date()): HTMLElement {
         host.lastReportAt ? `Last report ${formatRelative(host.lastReportAt, now)}` : "Never reported",
       ),
     ),
-    el("dl", { class: "card__fields" }, healthFields(host)),
+    el("dl", { class: "card__fields" }, healthFields(host, now)),
     el(
       "dl",
       { class: "card__fields card__fields--wide" },

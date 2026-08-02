@@ -234,6 +234,22 @@ describe("redactPayload — per-kind field allowlist", () => {
     expect(redactPayload("host.health", payload)).toEqual(payload);
   });
 
+  it("host.health: build identity (build_commit/built_at) survives redaction alongside daemon_version", () => {
+    // #4956 — the commit is the only field that tells two builds sharing a
+    // `daemon_version` apart, so stripping it here would re-blind the
+    // dashboard it was added for.
+    const payload = {
+      kind: "host.health",
+      captured_at: "2026-08-02T12:00:00Z",
+      daemon_version: "0.17.0",
+      build_commit: "8c16fb5b",
+      built_at: "2026-08-02T03:09:51Z",
+      uptime_sec: 86400,
+      logical_cpus: 28,
+    };
+    expect(redactPayload("host.health", payload)).toEqual(payload);
+  });
+
   it("an unrecognized (forward-compatible) kind reveals only `kind`", () => {
     const redacted = redactPayload("future.kind", {
       kind: "future.kind",

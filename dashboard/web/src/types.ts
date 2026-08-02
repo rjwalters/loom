@@ -35,6 +35,14 @@ export interface HostHealthRecord {
   kind?: string;
   captured_at?: string;
   daemon_version?: string;
+  /** Short git commit the emitting binary was built from (#4956). Absent on
+   * records from a pre-#4956 daemon; `"unknown"` when the build host had no
+   * git. The version alone only moves once per release, so this is what makes
+   * two same-version builds distinguishable. */
+  build_commit?: string;
+  /** RFC-3339 instant the emitting binary was compiled (#4956). Absent when
+   * the build stamp was unavailable — never a fabricated instant. */
+  built_at?: string;
   uptime_sec?: number;
   logical_cpus?: number;
   cpu_idle_fraction?: number;

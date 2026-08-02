@@ -149,7 +149,15 @@ function snapshotFixture(): RedactedFleetSnapshot {
     hosts: {
       "host-abc": {
         health: {
-          record: { kind: "host.health", captured_at: "2026-07-31T12:00:00Z", uptime_sec: 100, logical_cpus: 8 },
+          record: {
+            kind: "host.health",
+            captured_at: "2026-07-31T12:00:00Z",
+            daemon_version: "0.17.0",
+            build_commit: "8c16fb5b",
+            built_at: "2026-07-31T03:09:51Z",
+            uptime_sec: 100,
+            logical_cpus: 8,
+          },
           updatedAt: "2026-07-31T12:00:00Z",
         },
         // Present on the redacted snapshot exactly as the real API returns
@@ -196,6 +204,15 @@ describe("renderFleetOverview — redaction", () => {
   it("renders host.health lifecycle detail", () => {
     const html = renderFleetOverview(snapshotFixture());
     expect(html).toContain("uptime_sec=100");
+  });
+
+  it("renders the host.health build identity so two same-version builds are distinguishable", () => {
+    // #4956 — `daemon_version` alone only moves once per release; without the
+    // commit on the page, a day-stale binary is indistinguishable from main.
+    const html = renderFleetOverview(snapshotFixture());
+    expect(html).toContain("daemon_version=0.17.0");
+    expect(html).toContain("build_commit=8c16fb5b");
+    expect(html).toContain("built_at=2026-07-31T03:09:51Z");
   });
 });
 

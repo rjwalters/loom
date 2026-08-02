@@ -19,6 +19,7 @@
 //! `.loom/scripts/cli/loom-daemon-update.sh`, a shell script — deliberately
 //! NOT wired to auto-run from here.
 
+use chrono::{DateTime, Utc};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -27,6 +28,24 @@ use std::process::Command;
 /// `loom-daemon --version`). `"unknown"` when the build host lacked `git`
 /// (e.g. a release-tarball build with no `.git` present).
 pub const BUILT_COMMIT: &str = env!("LOOM_DAEMON_GIT_COMMIT");
+
+/// The raw build-time stamp baked in by `build.rs` ->
+/// `LOOM_DAEMON_BUILD_TIME` (ISO-8601 UTC, e.g. `2026-08-02T03:09:51Z`), the
+/// same value `loom-daemon --version` prints. `"unknown"` when the build host
+/// had no usable `date`. Prefer [`built_at`] when you want an instant.
+pub const BUILT_AT_RAW: &str = env!("LOOM_DAEMON_BUILD_TIME");
+
+/// [`BUILT_AT_RAW`] parsed into an instant, or `None` when the stamp is the
+/// `"unknown"` fallback (or otherwise unparseable).
+///
+/// Returning `None` rather than a fabricated epoch keeps the daemon's
+/// "unknown != zero" contract: a consumer that cannot learn when the binary
+/// was built must see *absent*, never a wrong-but-plausible timestamp.
+pub fn built_at() -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(BUILT_AT_RAW)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
+}
 
 /// The full build identity of this binary — `"<version> (commit <sha>, built
 /// <ts>)"` — as shown by `loom-daemon --version`.

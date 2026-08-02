@@ -71,7 +71,20 @@ const PUBLIC_PAGE_DISPLAY_FIELDS: Readonly<Record<string, readonly string[]>> = 
   "sweep.phase": ["phase", "entered_at"],
   "sweep.completed": ["completed_at", "result"],
   "sweep.outcome": ["model", "effort", "result", "total_duration_sec"],
-  "host.health": ["captured_at", "daemon_version", "uptime_sec", "logical_cpus", "cpu_idle_fraction"],
+  // `build_commit`/`built_at` (#4956) sit next to `daemon_version` because
+  // the version alone only moves once per release — the commit is what makes
+  // two same-version builds distinguishable. Both are non-identifying build
+  // metadata about the binary, not about any repo or operator, so they are as
+  // public as the version string itself.
+  "host.health": [
+    "captured_at",
+    "daemon_version",
+    "build_commit",
+    "built_at",
+    "uptime_sec",
+    "logical_cpus",
+    "cpu_idle_fraction",
+  ],
 };
 
 export function isPublicPageDisplayKind(kind: string): boolean {
