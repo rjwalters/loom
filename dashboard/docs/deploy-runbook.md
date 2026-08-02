@@ -15,12 +15,27 @@ Companion documents:
 | [`../web/README.md`](../web/README.md) | The dashboard UI this Worker also serves — architecture, local development, why it deploys as Workers Assets |
 | [`cloudflare-access.md`](cloudflare-access.md) | Gating the authenticated view behind zero-trust SSO while leaving the public view ungated |
 | [`reference-deployment.md`](reference-deployment.md) | The 2AM reference instance (`dashboard.2amlogic.com`) — a concrete, filled-in example of every value this runbook asks you to supply, plus its credential-file locations and current Access layout |
+| [`../../.github/workflows/dashboard-deploy.yml`](../../.github/workflows/dashboard-deploy.yml) | CI auto-deploy for the 2AM reference instance (issue #4958) — see the note below |
 | [`../README.md`](../README.md) | Architecture, routes, local development, tests |
 | [`../../.loom/docs/telemetry-schema.md`](../../.loom/docs/telemetry-schema.md) | The wire contract the daemon pushes |
 
 > **Everything here is your own infrastructure.** Loom never phones home:
 > the daemon's `observability` block is opt-in, off by default, and points
 > only at the endpoint you configure.
+
+> **This is a bootstrap/recovery runbook for the 2AM reference instance
+> (issue #4958).** Since `.github/workflows/dashboard-deploy.yml` landed,
+> `dashboard.2amlogic.com` auto-deploys on every push to `main` that touches
+> `dashboard/**` — tests gate the deploy, D1 migrations apply automatically,
+> and a failed deploy is a loud GitHub Actions failure, never silent. Steps
+> 1-10 below remain exactly what CI (and you, deploying your **own** fresh
+> instance) still needs: they are how any instance, including the 2AM one,
+> gets bootstrapped in the first place, and Step 6's manual `wrangler deploy`
+> is still the right move if CI itself is unavailable and a fix needs to
+> reach production immediately. For the 2AM instance specifically, routine
+> deploys no longer need Step 6 run by hand — see
+> [`reference-deployment.md`](reference-deployment.md) for how the CI
+> workflow's config is provisioned.
 
 ---
 

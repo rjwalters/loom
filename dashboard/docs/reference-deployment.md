@@ -111,6 +111,47 @@ template untouched — the pattern intentionally does not match a bare
 itself). If you create an overlay for a different instance later, it is
 covered by the same rule; no per-instance gitignore edits are needed.
 
+## 3a. CI auto-deploy (issue #4958)
+
+`.github/workflows/dashboard-deploy.yml` deploys this instance automatically
+on every push to `main` touching `dashboard/**` — see that workflow for the
+full pipeline (tests gate the deploy, `wrangler d1 migrations apply` runs
+idempotently, the deploying commit is stamped via `--var
+BUILD_COMMIT:$GITHUB_SHA` and served at `/api/version` + the dashboard
+footer). This section records only the CI-specific secrets it needs, which
+extend — do not replace — the local overlay pattern in §3.
+
+| Secret | Contents | Status |
+|---|---|---|
+| `CLOUDFLARE_API_TOKEN` | The `gha-loom-dashboard-deploy` CI token (Workers Scripts:Edit + D1:Write + Account Settings:Read on the account; Workers Routes:Edit + Zone:Read on the `2amlogic.com` zone) | Provisioned 2026-08-02 |
+| `CLOUDFLARE_ACCOUNT_ID` | `a7a402ccb9616532d8f4ee64447affe9` (§1) | Provisioned 2026-08-02 |
+| `CLOUDFLARE_WRANGLER_CONFIG_2AMLOGIC` | The **full contents** of this instance's `wrangler.2amlogic.toml` overlay (§3) | **Operator action required** — not yet provisioned as of this writing |
+
+**Why a whole-file secret instead of individual account/database/route
+secrets**: those values are not sensitive (§3 already says so), but the
+workflow has no safe way to reconstruct them on its own — in particular the
+`CF_ACCESS_TEAM_DOMAIN`/`CF_ACCESS_AUD` `[vars]` this instance's overlay also
+carries (§4's cutover) are load-bearing for the single-URL Access gate, and a
+generated overlay that silently omitted or mis-set them would risk
+deploying a Worker that treats every request as unauthenticated. Reusing the
+overlay file an operator already maintains locally (§3) avoids the workflow
+ever guessing at those values.
+
+**Provisioning it** (from the operator's machine, where `wrangler.2amlogic.toml`
+already exists per §3):
+
+```bash
+cd dashboard
+gh secret set CLOUDFLARE_WRANGLER_CONFIG_2AMLOGIC < wrangler.2amlogic.toml
+```
+
+Until this secret exists, the deploy job fails loudly on its first step (a
+`::error::` annotation naming the missing secret) rather than deploying with
+a wrong or incomplete config — see the workflow's "Materialize the 2AM
+instance's wrangler config" step. Re-run the same command any time the
+overlay changes (a new D1 database, a rotated route, an Access app change);
+no workflow edit is needed.
+
 ## 4. Cloudflare Access layout
 
 **Read against the live API, 2026-07-31.** An earlier revision of this

@@ -21,9 +21,13 @@ const TEAM_DOMAIN = "test-team.cloudflareaccess.com";
 const AUD = "test-login-app-aud-tag";
 const CERTS_URL = `https://${TEAM_DOMAIN}/cdn-cgi/access/certs`;
 
-async function callWorker(request: Request): Promise<Response> {
+async function callWorker(request: Request, envOverrides: Partial<typeof env> = {}): Promise<Response> {
   const ctx = createExecutionContext();
-  const response = await worker.fetch(request as Request<unknown, IncomingRequestCfProperties>, env, ctx);
+  const response = await worker.fetch(
+    request as Request<unknown, IncomingRequestCfProperties>,
+    { ...env, ...envOverrides },
+    ctx,
+  );
   await waitOnExecutionContext(ctx);
   return response;
 }
@@ -299,6 +303,32 @@ describe("GET / — Access JWT wired end to end (real createRemoteJWKSet path)",
       new Request("https://ingest.example/", { headers: { cookie: `CF_Authorization=${token}` } }),
     );
     expect(await authenticated.text()).not.toContain('"timeZone"');
+  });
+
+  // Issue #4958: the deploying commit is what lets an operator (or automated
+  // drift-detection tooling) tell whether the live Worker matches `main`,
+  // without an Access session.
+  it("GET /api/version reports the build commit, unauthenticated", async () => {
+    const unstamped = await callWorker(new Request("https://ingest.example/api/version"));
+    expect(unstamped.status).toBe(200);
+    // BUILD_COMMIT is unset in the test bindings (vitest.config.ts) — the
+    // same fallback a Miniflare/local `wrangler dev` run sees.
+    expect(await unstamped.json()).toEqual({ commit: "unknown" });
+
+    const stamped = await callWorker(new Request("https://ingest.example/api/version"), {
+      BUILD_COMMIT: "abc1234def",
+    });
+    expect(await stamped.json()).toEqual({ commit: "abc1234def" });
+  });
+
+  it("hands the SPA the build commit for the footer, and omits it when unset", async () => {
+    restoreFetch = mockJwksFetch();
+
+    const unstamped = await callWorker(new Request("https://ingest.example/"));
+    expect(await unstamped.text()).not.toContain('"commit"');
+
+    const stamped = await callWorker(new Request("https://ingest.example/"), { BUILD_COMMIT: "abc1234def" });
+    expect(await stamped.text()).toContain('"commit":"abc1234def"');
   });
 
   it("/public/* stays reachable anonymously — the split is auth, not obscurity", async () => {
