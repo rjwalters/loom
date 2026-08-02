@@ -587,6 +587,7 @@ mod tests {
                 cpu_idle_fraction: Some(0.83),
                 load_per_core: Some(0.51),
                 worktree_root_free_gb: Some(200),
+                active_sweep_ids: Vec::new(),
             }),
         )
     }
@@ -795,6 +796,7 @@ mod tests {
             cpu_idle_fraction: None,
             load_per_core: None,
             worktree_root_free_gb: None,
+            active_sweep_ids: Vec::new(),
         };
         let batch = vec![envelope(
             "host-c",

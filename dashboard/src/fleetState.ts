@@ -24,6 +24,29 @@
  * answers "what is happening right now", and the DO is never treated as a
  * source of truth for history — see `src/index.ts`'s ingest handler, which
  * always writes D1 first and treats a DO update failure as best-effort.
+ *
+ * # Leaked `sweep:` entries (Issue #4955)
+ *
+ * A `sweep:` entry is removed only on a `sweep.completed` record — but that
+ * record can be lost (most commonly across a daemon restart whose reaper-
+ * driven terminal transition does not get re-exported), leaving a phantom
+ * "still in flight" entry forever. Two independent, additive backstops:
+ *
+ *  1. **Staleness bound** ([`STALE_SWEEP_MS`]): `buildSnapshot` excludes (and
+ *     lazily deletes) any `sweep:` entry whose `updatedAt` is older than the
+ *     bound. `sweep.phase` records flow regularly during a real sweep, so a
+ *     silent multi-hour-old entry is dead. Self-contained — needs nothing
+ *     from the daemon side — but only self-heals after the bound elapses.
+ *  2. **Per-host reconciliation**: `applyUpdate`'s `host.health` case reads
+ *     the record's `active_sweep_ids` (Issue #4955, `HostHealthRecord` on the
+ *     daemon side) and deletes every `sweep:` entry for that `hostId` NOT in
+ *     the set — ground truth wins within one health cadence, covering even a
+ *     crash-lost completion immediately. **Only** applied when the field is
+ *     present and non-empty: an absent field (a pre-#4955 daemon) or an
+ *     empty one (the daemon's registry is not yet authoritative, e.g. still
+ *     rebuilding right after its own restart) must never be read as "zero
+ *     sweeps running" — that would wipe every legitimately-live entry for
+ *     the host instead of fixing the leak.
  */
 
 export interface ActiveSweepState {
@@ -173,6 +196,88 @@ export interface FleetStateUpdate {
   record: Record<string, unknown>;
 }
 
+/** A `sweep:` entry whose `updatedAt` is older than this is considered dead
+ * (Issue #4955, fix layer 1) — comfortably above any realistic sweep
+ * duration (a full Curator→Builder→Judge→Doctor→Merge lifecycle is
+ * typically well under an hour) so a genuinely long-running Builder phase is
+ * never prematurely dropped, while still bounding how long a lost
+ * `sweep.completed` can leak a phantom "in flight" entry. */
+export const STALE_SWEEP_MS = 4 * 60 * 60 * 1000; // 4 hours
+
+/** Fix layer 1's pure decision (Issue #4955), split out of `buildSnapshot`
+ * so it is directly unit-testable without a Durable Object / storage layer
+ * — and so `buildSnapshot` itself only has to reason about doing the I/O
+ * (list once, act on the result), not the staleness math.
+ *
+ * An unparseable `updatedAt` decodes to `NaN` from `Date.parse`, which is
+ * treated as NOT stale (fail open, kept in the snapshot) — matches the
+ * "unknown is not evidence of staleness" posture the rest of the pipeline
+ * uses for unmeasurable/malformed data.
+ */
+export function isSweepEntryStale(
+  entry: ActiveSweepState,
+  nowMs: number,
+  staleMs: number = STALE_SWEEP_MS,
+): boolean {
+  const updatedAtMs = Date.parse(entry.updatedAt);
+  return Number.isFinite(updatedAtMs) && nowMs - updatedAtMs > staleMs;
+}
+
+/** Fix layer 1: the storage keys of every stale entry in `entries`, given
+ * `nowMs` (injected rather than read internally so this stays a pure
+ * function of its inputs — see [`isSweepEntryStale`]'s doc comment). */
+export function selectStaleSweepKeys(
+  entries: Iterable<[string, ActiveSweepState]>,
+  nowMs: number,
+  staleMs: number = STALE_SWEEP_MS,
+): string[] {
+  const staleKeys: string[] = [];
+  for (const [key, entry] of entries) {
+    if (isSweepEntryStale(entry, nowMs, staleMs)) {
+      staleKeys.push(key);
+    }
+  }
+  return staleKeys;
+}
+
+/** Fix layer 2's pure decision (Issue #4955): the storage keys of every
+ * `entries` entry that belongs to `hostId` but is NOT in `rawActiveSweepIds`
+ * — i.e. every `sweep:` entry this reconciliation pass should delete.
+ *
+ * `rawActiveSweepIds` is `unknown` because it is a field lifted straight out
+ * of the untyped `record` the Worker forwards from `/ingest` — never assumed
+ * to be well-formed. Returns `[]` (a no-op — never deletes anything) unless
+ * it decodes to a genuinely **non-empty** array of strings: an absent field
+ * (a pre-#4955 daemon), an empty array (the daemon's own registry is not yet
+ * authoritative, e.g. still rebuilding right after its own restart), or an
+ * array with no valid string elements must never be read as "this host has
+ * zero sweeps running" — that would wipe every legitimately-live entry for
+ * the host instead of fixing the leak. Only entries whose `hostId` matches
+ * are ever considered — a health record from one host must never reconcile
+ * away another host's live sweeps. */
+export function selectReconciledAwaySweepKeys(
+  entries: Iterable<[string, ActiveSweepState]>,
+  hostId: string,
+  rawActiveSweepIds: unknown,
+): string[] {
+  if (!Array.isArray(rawActiveSweepIds) || rawActiveSweepIds.length === 0) {
+    return [];
+  }
+  const activeSweepIds = new Set(
+    rawActiveSweepIds.filter((id): id is string => typeof id === "string"),
+  );
+  if (activeSweepIds.size === 0) {
+    return [];
+  }
+  const staleKeys: string[] = [];
+  for (const [key, entry] of entries) {
+    if (entry.hostId === hostId && !activeSweepIds.has(entry.sweepId)) {
+      staleKeys.push(key);
+    }
+  }
+  return staleKeys;
+}
+
 export class FleetState implements DurableObject {
   private readonly state: DurableObjectState;
 
@@ -231,6 +336,7 @@ export class FleetState implements DurableObject {
     switch (kind) {
       case "host.health": {
         await this.state.storage.put(`health:${hostId}`, { record, updatedAt: now });
+        await this.reconcileActiveSweeps(hostId, record.active_sweep_ids);
         break;
       }
       case "tokens.snapshot": {
@@ -292,6 +398,27 @@ export class FleetState implements DurableObject {
     }
   }
 
+  /** Fix layer 2 (Issue #4955): reconcile this host's `sweep:` entries
+   * against its own daemon's authoritative in-flight sweep-id set, carried
+   * on every `host.health` record as `active_sweep_ids`. See
+   * [`selectReconciledAwaySweepKeys`] for the (pure, directly-tested)
+   * decision logic — this method is only the I/O around it. */
+  private async reconcileActiveSweeps(hostId: string, rawActiveSweepIds: unknown): Promise<void> {
+    // Skip the `list()` call entirely for the common case (field absent —
+    // every daemon predating #4955, or this host's daemon hasn't ticked its
+    // next health sample yet): `selectReconciledAwaySweepKeys` would return
+    // `[]` anyway, but there is no reason to pay for a full storage scan to
+    // learn that.
+    if (!Array.isArray(rawActiveSweepIds) || rawActiveSweepIds.length === 0) {
+      return;
+    }
+    const sweepEntries = await this.state.storage.list<ActiveSweepState>({ prefix: "sweep:" });
+    const staleKeys = selectReconciledAwaySweepKeys(sweepEntries, hostId, rawActiveSweepIds);
+    if (staleKeys.length > 0) {
+      await this.state.storage.delete(staleKeys);
+    }
+  }
+
   /**
    * Build the current fleet snapshot, classifying every `health:`/`tokens:`
    * entry's freshness (issue #4957) and pruning any entry older than
@@ -302,6 +429,11 @@ export class FleetState implements DurableObject {
    * `/public/fleet-state`) already calls this on every request, so a
    * decommissioned host's entries are deleted the next time anyone looks —
    * `now` is threaded through for deterministic tests.
+   *
+   * The same pass also applies issue #4955's fix layer 1 to the `sweep:`
+   * prefix (see below): host-entry pruning (#4957) and stale-sweep
+   * exclusion (#4955) are independent policies over disjoint key prefixes
+   * that share this one read, and `now` is threaded through both.
    */
   private async buildSnapshot(now: Date = new Date()): Promise<FleetSnapshot> {
     const healthEntries = await this.state.storage.list<{ record: Record<string, unknown>; updatedAt: string }>({
@@ -315,8 +447,22 @@ export class FleetState implements DurableObject {
       await this.state.storage.delete(pruneKeys);
     }
 
+    // Fix layer 1 (Issue #4955): a `sweep:` entry whose `updatedAt` exceeds
+    // the staleness bound is excluded from the snapshot AND lazily deleted
+    // (self-healing — no separate cleanup pass needed). See
+    // `selectStaleSweepKeys`'s doc comment for the (pure, directly-tested)
+    // decision logic.
     const sweepEntries = await this.state.storage.list<ActiveSweepState>({ prefix: "sweep:" });
-    const activeSweeps = Array.from(sweepEntries.values());
+    const staleKeys = new Set(selectStaleSweepKeys(sweepEntries, now.getTime()));
+    const activeSweeps: ActiveSweepState[] = [];
+    for (const [key, entry] of sweepEntries) {
+      if (!staleKeys.has(key)) {
+        activeSweeps.push(entry);
+      }
+    }
+    if (staleKeys.size > 0) {
+      await this.state.storage.delete(Array.from(staleKeys));
+    }
 
     return { hosts, activeSweeps };
   }

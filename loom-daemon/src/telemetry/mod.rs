@@ -482,6 +482,24 @@ pub struct HostHealthRecord {
     /// Free space (GB) on the worktree-root scratch volume, when measurable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worktree_root_free_gb: Option<u64>,
+    /// This host's currently in-flight (non-terminal) sweep IDs, across every
+    /// repo this daemon actively tracks — the daemon's own authoritative
+    /// registry view (Issue #4955). Consumed by the Phase-2 dashboard's
+    /// `FleetState` Durable Object to reconcile its live `sweep:` entries
+    /// against ground truth on every `host.health` update, so a sweep whose
+    /// `sweep.completed` record was lost (e.g. across a daemon restart) does
+    /// not linger forever as a phantom "in flight" entry.
+    ///
+    /// `#[serde(default)]` so a pre-#4955 queued record still surviving in a
+    /// host's on-disk `DurableQueue` past an upgrade decodes cleanly (empty
+    /// list) rather than failing to send at all. An **empty** list is
+    /// therefore ambiguous between "genuinely zero sweeps running" and "this
+    /// daemon predates the field" / "the registry was not yet queried" —
+    /// callers that reconcile against this field must never treat an empty
+    /// list as proof of zero in-flight sweeps on its own; see the dashboard's
+    /// `applyUpdate` doc comment for the exact caveat it applies.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_sweep_ids: Vec<String>,
 }
 
 #[cfg(test)]
@@ -594,6 +612,7 @@ mod tests {
             cpu_idle_fraction: Some(0.83),
             load_per_core: Some(0.51),
             worktree_root_free_gb: Some(200),
+            active_sweep_ids: vec!["sweep-issue-4703-0".to_string()],
         })
     }
 
@@ -814,6 +833,7 @@ mod tests {
             cpu_idle_fraction: None,
             load_per_core: None,
             worktree_root_free_gb: None,
+            active_sweep_ids: Vec::new(),
         });
         let value = serde_json::to_value(&record).unwrap();
         assert!(
