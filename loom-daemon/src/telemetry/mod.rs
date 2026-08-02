@@ -434,7 +434,8 @@ pub struct TokenSnapshotRecord {
     pub accounts: Vec<TokenAccountState>,
 }
 
-/// `host.health` — host CPU/disk headroom plus daemon version and uptime.
+/// `host.health` — host CPU/disk headroom plus the emitting binary's identity
+/// (version + build commit + build time) and uptime.
 /// Host-level: it references no repository, so it carries no visibility tag.
 /// Every measured field is optional so an unmeasurable probe stays absent rather
 /// than being coerced to a fake zero (matching `cpu_headroom` / `disk_headroom`'s
@@ -445,6 +446,29 @@ pub struct HostHealthRecord {
     pub captured_at: DateTime<Utc>,
     /// The emitting daemon's version (`CARGO_PKG_VERSION`).
     pub daemon_version: String,
+    /// The short git commit the emitting binary was BUILT from
+    /// (`self_update::BUILT_COMMIT`, baked in by `build.rs`), or `"unknown"`
+    /// when the build host had no git.
+    ///
+    /// `daemon_version` alone cannot answer "is this host's daemon current?" —
+    /// it only moves once per release, so every build between two releases
+    /// reports the same string and a day-stale binary is indistinguishable
+    /// from `main` (#4956). The commit is the precise identity.
+    ///
+    /// `#[serde(default)]` so a record emitted by a pre-#4956 daemon still
+    /// decodes (as an empty string) rather than failing the whole envelope.
+    #[serde(default)]
+    pub build_commit: String,
+    /// When the emitting binary was compiled (`LOOM_DAEMON_BUILD_TIME`), when
+    /// that stamp is present and parseable.
+    ///
+    /// `Option` rather than a bare `DateTime<Utc>` on purpose: `build.rs`
+    /// falls back to the literal string `"unknown"` when `date` is
+    /// unavailable, and this struct's contract is that an unavailable value
+    /// stays *absent* rather than being coerced to a fabricated instant (the
+    /// same "unknown != zero" rule the measured fields below follow).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub built_at: Option<DateTime<Utc>>,
     /// Daemon uptime in seconds.
     pub uptime_sec: u64,
     /// Logical CPU count.
@@ -563,6 +587,8 @@ mod tests {
         TelemetryRecord::HostHealth(HostHealthRecord {
             captured_at: ts(),
             daemon_version: "0.16.0".to_string(),
+            build_commit: "8c16fb5b".to_string(),
+            built_at: Some(ts()),
             uptime_sec: 86_400,
             logical_cpus: 28,
             cpu_idle_fraction: Some(0.83),
@@ -730,6 +756,102 @@ mod tests {
                 assert_eq!(r.visibility, RepoVisibility::Private);
             }
             other => panic!("expected SweepCompleted, got {other:?}"),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // host.health build identity (#4956).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn host_health_serializes_build_identity_alongside_version() {
+        let value = serde_json::to_value(host_health()).unwrap();
+        assert_eq!(
+            value
+                .get("daemon_version")
+                .and_then(serde_json::Value::as_str),
+            Some("0.16.0")
+        );
+        // The whole point of #4956: two builds sharing `daemon_version` are
+        // told apart by the commit, so it must be on the wire.
+        assert_eq!(
+            value
+                .get("build_commit")
+                .and_then(serde_json::Value::as_str),
+            Some("8c16fb5b")
+        );
+        assert_eq!(
+            value.get("built_at").and_then(serde_json::Value::as_str),
+            Some("2026-07-30T12:00:00Z")
+        );
+    }
+
+    #[test]
+    fn host_health_round_trips_build_identity() {
+        let json = serde_json::to_string(&host_health()).unwrap();
+        let decoded: TelemetryRecord = serde_json::from_str(&json).unwrap();
+        match decoded {
+            TelemetryRecord::HostHealth(r) => {
+                assert_eq!(r.build_commit, "8c16fb5b");
+                assert_eq!(r.built_at, Some(ts()));
+            }
+            other => panic!("expected HostHealth, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn host_health_omits_built_at_when_unknown() {
+        // `build.rs` stamps the literal "unknown" when the build host had no
+        // usable `date`; that must serialize as an ABSENT field, never as a
+        // fabricated instant (the struct's "unknown != zero" contract).
+        let record = TelemetryRecord::HostHealth(HostHealthRecord {
+            captured_at: ts(),
+            daemon_version: "0.17.0".to_string(),
+            build_commit: "unknown".to_string(),
+            built_at: None,
+            uptime_sec: 1,
+            logical_cpus: 4,
+            cpu_idle_fraction: None,
+            load_per_core: None,
+            worktree_root_free_gb: None,
+        });
+        let value = serde_json::to_value(&record).unwrap();
+        assert!(
+            value.get("built_at").is_none(),
+            "an unknown build time must be absent, not a fabricated instant"
+        );
+        // The commit sentinel, unlike the instant, IS sent — "unknown" is a
+        // meaningful answer for a tarball build, not a missing measurement.
+        assert_eq!(
+            value
+                .get("build_commit")
+                .and_then(serde_json::Value::as_str),
+            Some("unknown")
+        );
+        // Still round-trips.
+        let decoded: TelemetryRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, record);
+    }
+
+    #[test]
+    fn host_health_from_a_pre_4956_daemon_still_decodes() {
+        // Backward compatibility: a record emitted by a daemon that predates
+        // the build-identity fields must decode, not poison the batch.
+        let json = r#"{
+            "kind": "host.health",
+            "captured_at": "2026-07-30T12:00:00Z",
+            "daemon_version": "0.16.0",
+            "uptime_sec": 86400,
+            "logical_cpus": 28
+        }"#;
+        let decoded: TelemetryRecord = serde_json::from_str(json).unwrap();
+        match decoded {
+            TelemetryRecord::HostHealth(r) => {
+                assert_eq!(r.daemon_version, "0.16.0");
+                assert_eq!(r.build_commit, "");
+                assert_eq!(r.built_at, None);
+            }
+            other => panic!("expected HostHealth, got {other:?}"),
         }
     }
 }

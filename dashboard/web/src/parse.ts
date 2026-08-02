@@ -51,6 +51,8 @@ export function parseHostHealth(value: unknown): HostHealthRecord {
     kind: str(value.kind),
     captured_at: str(value.captured_at),
     daemon_version: str(value.daemon_version),
+    build_commit: str(value.build_commit),
+    built_at: str(value.built_at),
     uptime_sec: num(value.uptime_sec),
     logical_cpus: num(value.logical_cpus),
     cpu_idle_fraction: num(value.cpu_idle_fraction),

@@ -29,7 +29,7 @@ accident.
 
 | View | Route | Content |
 |---|---|---|
-| Fleet overview | `#/` | One card per host: the whole `host.health` field set (`daemon_version`, `uptime_sec`, `logical_cpus`, `cpu_idle_fraction`, `load_per_core`, `worktree_root_free_gb`), a `tokens.snapshot` summary (exhausted count + peak `usage_fraction`), a status badge, and that host's live sweeps. |
+| Fleet overview | `#/` | One card per host: the whole `host.health` field set (the binary identity `daemon_version` + `build_commit` + `built_at`, rendered as one line — `0.17.0 @ 8c16fb5b, built 6h ago` — plus `uptime_sec`, `logical_cpus`, `cpu_idle_fraction`, `load_per_core`, `worktree_root_free_gb`), a `tokens.snapshot` summary (exhausted count + peak `usage_fraction`), a status badge, and that host's live sweeps. |
 | Host drill-down | `#/hosts/<hostId>` | The same health fields in full, one row per token-pool account, and one row per in-flight sweep with `repo` / `issue` / `phase` / `model` / `effort` / how long it has been running (`startedAt`) / how long it has been in its current phase (`enteredPhaseAt`). |
 
 Hosts needing attention sort first (stale, then token-degraded), then busiest,

@@ -154,6 +154,10 @@ export function multiHostSnapshot(): unknown {
             kind: "host.health",
             captured_at: isoMinutesBefore(2),
             daemon_version: "0.16.0",
+            // #4956 build identity. The degraded host below deliberately
+            // omits both, standing in for a record from a pre-#4956 daemon.
+            build_commit: "8c16fb5b",
+            built_at: isoMinutesBefore(360),
             uptime_sec: 86_400,
             logical_cpus: 28,
             cpu_idle_fraction: 0.83,

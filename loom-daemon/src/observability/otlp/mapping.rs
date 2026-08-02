@@ -580,6 +580,8 @@ mod tests {
             TelemetryRecord::HostHealth(HostHealthRecord {
                 captured_at: ts(),
                 daemon_version: "0.17.0".to_string(),
+                build_commit: "8c16fb5b".to_string(),
+                built_at: Some(ts()),
                 uptime_sec: 86_400,
                 logical_cpus: 28,
                 cpu_idle_fraction: Some(0.83),
@@ -786,6 +788,8 @@ mod tests {
         let mut record = HostHealthRecord {
             captured_at: ts(),
             daemon_version: "0.17.0".to_string(),
+            build_commit: "8c16fb5b".to_string(),
+            built_at: None,
             uptime_sec: 10,
             logical_cpus: 4,
             cpu_idle_fraction: None,

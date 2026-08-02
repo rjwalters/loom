@@ -67,6 +67,19 @@ function healthPanel(host: HostView, now: Date): HTMLElement {
       "dl",
       { class: "panel__fields" },
       field("Daemon version", health.daemon_version ?? UNKNOWN),
+      // #4956 — the version only moves once per release, so the commit is the
+      // field that actually answers "is this host's binary current?". Both
+      // degrade to `—` for a record from a pre-#4956 daemon.
+      field(
+        "Build commit",
+        health.build_commit ?? UNKNOWN,
+        "The git commit this host's running binary was compiled from",
+      ),
+      field(
+        "Built at",
+        health.built_at ? formatAbsolute(health.built_at) : UNKNOWN,
+        health.built_at ? `Built ${formatRelative(health.built_at, now)}` : undefined,
+      ),
       field("Uptime", formatDuration(health.uptime_sec)),
       field("Logical CPUs", formatCount(health.logical_cpus)),
       field("CPU idle", formatPercent(health.cpu_idle_fraction, 1)),

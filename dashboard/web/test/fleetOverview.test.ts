@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { buildFleetView, findHost } from "../src/fleet";
 import { parseFleetSnapshot } from "../src/parse";
 import { UNKNOWN } from "../src/format";
-import { fleetOverviewView, hostCard } from "../src/views/fleetOverview";
+import { daemonIdentityText, fleetOverviewView, hostCard } from "../src/views/fleetOverview";
 import {
   DEGRADED_HOST_ID,
   HEALTHY_HOST_ID,
@@ -55,12 +55,28 @@ describe("fleetOverviewView", () => {
 describe("hostCard", () => {
   it("shows the whole host.health field set at a glance", () => {
     const card = hostCard(findHost(view(), HEALTHY_HOST_ID)!, NOW);
-    expect(fieldValue(card, "Daemon")).toBe("0.16.0");
+    expect(fieldValue(card, "Daemon")).toBe("0.16.0 @ 8c16fb5b, built 6h 0m ago");
     expect(fieldValue(card, "Uptime")).toBe("1d 0h");
     expect(fieldValue(card, "CPUs")).toBe("28");
     expect(fieldValue(card, "CPU idle")).toBe("83%");
     expect(fieldValue(card, "Load/core")).toBe("0.51");
     expect(fieldValue(card, "Worktree free")).toBe("200 GB");
+  });
+
+  it("distinguishes two same-version hosts by their build commit (#4956)", () => {
+    // The whole point of #4956: `daemon_version` is identical on both hosts
+    // (0.16.0), so the card must carry something that is NOT.
+    const healthy = hostCard(findHost(view(), HEALTHY_HOST_ID)!, NOW);
+    const degraded = hostCard(findHost(view(), DEGRADED_HOST_ID)!, NOW);
+    expect(fieldValue(healthy, "Daemon")).toContain("8c16fb5b");
+    expect(fieldValue(healthy, "Daemon")).not.toBe(fieldValue(degraded, "Daemon"));
+  });
+
+  it("falls back to the bare version for a record from a pre-#4956 daemon", () => {
+    // No `build_commit` / `built_at` on the wire — render exactly what the
+    // pre-#4956 card rendered, never a fabricated commit or build age.
+    const card = hostCard(findHost(view(), DEGRADED_HOST_ID)!, NOW);
+    expect(fieldValue(card, "Daemon")).toBe("0.16.0");
   });
 
   it("renders unmeasured health fields as unknown rather than zero", () => {
@@ -158,5 +174,29 @@ describe("hostCard", () => {
     expect(card.querySelector("img")).toBeNull();
     expect(card.querySelector("script")).toBeNull();
     expect(card.textContent).toContain("<img src=x onerror=alert(1)>");
+  });
+});
+
+describe("daemonIdentityText (#4956)", () => {
+  it("joins version, commit, and build age", () => {
+    expect(
+      daemonIdentityText({ daemon_version: "0.17.0", build_commit: "8c16fb5b", built_at: isoMinutesBefore(360) }, NOW),
+    ).toBe("0.17.0 @ 8c16fb5b, built 6h 0m ago");
+  });
+
+  it("drops the 'unknown' commit sentinel rather than showing it as a SHA", () => {
+    // `build.rs` stamps the literal "unknown" when the build host had no git.
+    expect(daemonIdentityText({ daemon_version: "0.17.0", build_commit: "unknown" }, NOW)).toBe("0.17.0");
+  });
+
+  it("omits the age clause when the build time is absent or unparseable", () => {
+    expect(daemonIdentityText({ daemon_version: "0.17.0", build_commit: "8c16fb5b" }, NOW)).toBe("0.17.0 @ 8c16fb5b");
+    expect(daemonIdentityText({ daemon_version: "0.17.0", build_commit: "8c16fb5b", built_at: "not-a-date" }, NOW)).toBe(
+      "0.17.0 @ 8c16fb5b",
+    );
+  });
+
+  it("renders an entirely empty record as unknown, never a fabricated identity", () => {
+    expect(daemonIdentityText({}, NOW)).toBe(UNKNOWN);
   });
 });

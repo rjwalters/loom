@@ -506,6 +506,8 @@ mod tests {
             TelemetryRecord::HostHealth(HostHealthRecord {
                 captured_at: chrono::Utc::now(),
                 daemon_version: "0.16.0".to_string(),
+                build_commit: "deadbeef".to_string(),
+                built_at: None,
                 uptime_sec: 10,
                 logical_cpus: 8,
                 cpu_idle_fraction: None,

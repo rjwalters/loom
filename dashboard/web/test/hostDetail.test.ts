@@ -41,6 +41,7 @@ describe("hostDetailView — health panel", () => {
   it("renders every host.health field", () => {
     const rendered = detail(HEALTHY_HOST_ID);
     expect(fieldValue(rendered, "Daemon version")).toBe("0.16.0");
+    expect(fieldValue(rendered, "Build commit")).toBe("8c16fb5b");
     expect(fieldValue(rendered, "Uptime")).toBe("1d 0h");
     expect(fieldValue(rendered, "Logical CPUs")).toBe("28");
     expect(fieldValue(rendered, "CPU idle")).toBe("83.0%");
@@ -53,6 +54,14 @@ describe("hostDetailView — health panel", () => {
     expect(fieldValue(rendered, "CPU idle")).toBe(UNKNOWN);
     expect(fieldValue(rendered, "Load per core")).toBe(UNKNOWN);
     expect(fieldValue(rendered, "Worktree root free")).toBe(UNKNOWN);
+  });
+
+  it("renders the build identity as unknown for a record from a pre-#4956 daemon", () => {
+    // The degraded fixture carries no `build_commit`/`built_at` — the panel
+    // must say so rather than invent a commit or a build time (#4956).
+    const rendered = detail(DEGRADED_HOST_ID);
+    expect(fieldValue(rendered, "Build commit")).toBe(UNKNOWN);
+    expect(fieldValue(rendered, "Built at")).toBe(UNKNOWN);
   });
 
   it("explains a host that has no health record yet", () => {
