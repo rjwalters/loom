@@ -40,15 +40,16 @@ If found, **read and follow instructions in `.claude/commands/loom/champion-pr-m
 
 If no PRs need merging, check for curated issues. Exclude `loom:evaluating` (a
 fresh claim from a concurrent Champion evaluation, #4954) so a batch doesn't
-re-discover work another pass already claimed — `updatedAt` is also fetched
-here for `champion-issue-promo.md`'s idempotency check:
+re-discover work another pass already claimed — `title`/`body` feed
+`champion-issue-promo.md`'s body-hash idempotency check (the issue's aggregate
+`updatedAt` is deliberately NOT used for it, #4966):
 
 ```bash
 gh issue list \
   --label="loom:curated" \
   --state=open \
   --limit=500 \
-  --json number,title,body,labels,comments,updatedAt \
+  --json number,title,body,labels,comments \
   --jq '.[] | select([.labels[].name] | contains(["loom:evaluating"]) | not) |
   "#\(.number) \(.title)"'
 ```
@@ -58,7 +59,7 @@ If found, **read and follow instructions in `.claude/commands/loom/champion-issu
 ### Priority 3: Architect/Hermit/Auditor Proposals Ready to Promote
 
 If no curated issues need promotion, check for well-formed proposals. Same
-`loom:evaluating` exclusion and `updatedAt` fetch as Priority 2 above:
+`loom:evaluating` exclusion and `title`/`body` fetch as Priority 2 above:
 
 ```bash
 # Check for Architect proposals
@@ -66,7 +67,7 @@ gh issue list \
   --label="loom:architect" \
   --state=open \
   --limit=500 \
-  --json number,title,body,labels,comments,updatedAt \
+  --json number,title,body,labels,comments \
   --jq '.[] | select([.labels[].name] | contains(["loom:evaluating"]) | not) |
   "#\(.number) \(.title) [architect]"'
 
@@ -75,7 +76,7 @@ gh issue list \
   --label="loom:hermit" \
   --state=open \
   --limit=500 \
-  --json number,title,body,labels,comments,updatedAt \
+  --json number,title,body,labels,comments \
   --jq '.[] | select([.labels[].name] | contains(["loom:evaluating"]) | not) |
   "#\(.number) \(.title) [hermit]"'
 
@@ -84,7 +85,7 @@ gh issue list \
   --label="loom:auditor" \
   --state=open \
   --limit=500 \
-  --json number,title,body,labels,comments,updatedAt \
+  --json number,title,body,labels,comments \
   --jq '.[] | select([.labels[].name] | contains(["loom:evaluating"]) | not) |
   "#\(.number) \(.title) [auditor]"'
 ```

@@ -221,24 +221,49 @@ Use conservative judgment. **Do NOT promote** if:
 
 ### Idempotency check (run BEFORE claiming — skip without commenting on a match)
 
-Compute a marker keyed to the issue's `updatedAt` so a genuine body revision (which bumps `updatedAt`) always gets a fresh evaluation, while an unchanged issue never gets re-commented:
+Compute a marker keyed to a **hash of the proposal's own text** (title + body), so a genuine revision always gets a fresh evaluation while an unchanged proposal never gets re-commented:
 
 ```bash
 ISSUE_NUMBER=<number>
 
 # Cached ("$GH_READ") — this is a content check, not claim arbitration.
-ISSUE_JSON=$("$GH_READ" issue view "$ISSUE_NUMBER" --json updatedAt,labels,comments)
-UPDATED_AT=$(echo "$ISSUE_JSON" | jq -r '.updatedAt')
-VERDICT_MARKER="<!-- champion:proposal-verdict:$UPDATED_AT -->"
+ISSUE_JSON=$("$GH_READ" issue view "$ISSUE_NUMBER" --json title,body,labels,comments)
+
+# Portable sha256 (sha256sum on Linux, shasum on macOS) — same fallback shape
+# the repo's own scripts use. 16 hex chars is plenty for change detection.
+_sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum
+  elif command -v shasum >/dev/null 2>&1; then shasum -a 256
+  else cksum; fi
+}
+BODY_HASH=$(printf '%s\n%s' \
+  "$(echo "$ISSUE_JSON" | jq -r '.title // ""')" \
+  "$(echo "$ISSUE_JSON" | jq -r '.body // ""')" \
+  | _sha256 | awk '{print substr($1, 1, 16)}')
+VERDICT_MARKER="<!-- champion:proposal-verdict:body-$BODY_HASH -->"
 
 if echo "$ISSUE_JSON" | jq -e --arg m "$VERDICT_MARKER" \
      '.comments[] | select(.body | contains($m))' >/dev/null; then
-  echo "Already evaluated #$ISSUE_NUMBER at revision $UPDATED_AT — skipping (no comment, no claim)"
+  echo "Already evaluated #$ISSUE_NUMBER at body revision $BODY_HASH — skipping (no comment, no claim)"
   # Continue the batch to the next issue; do not read further or claim.
 fi
 ```
 
 If the marker is present, **stop here for this issue** — do not read comments further, do not claim, do not comment. This is the mechanism that turns "6 identical NEEDS REVISION comments" into "1 comment, then silent skips" for a truly unrevised proposal.
+
+#### Why a body hash and NOT the issue's `updatedAt` (#4966)
+
+An earlier draft of this check keyed the marker to the issue's aggregate `updatedAt`. That is **self-invalidating and can never match**: the marker baked into a verdict comment necessarily records the `updatedAt` read *before* that comment was posted, and posting the comment itself bumps `updatedAt` forward. Every subsequent pass therefore computes a *newer* `UPDATED_AT`, `contains($m)` never matches, and the proposal is fully re-evaluated and re-commented on every cycle — exactly the loop this section exists to close.
+
+This is the same trap `judge.md` and [`daemon-reference.md`'s "Stale-claim reconciliation"](https://github.com/rjwalters/loom/blob/main/defaults/docs/daemon-reference.md#stale-claim-reconciliation--the-sweep-journal-3953-fixed-3975-extended-to-pr-side-claims-4367) already document for `loom:reviewing`/`loom:treating` staleness ("a stand-down comment self-refreshes `updatedAt` but not the label event"), and the fix has the same shape: **anchor the check to something Champion's own write does not bump.** For claim staleness that anchor is the label's own `labeled` timeline-event timestamp; for *content* staleness it is the proposal text itself. A hash of title + body changes if and only if the proposal is actually edited — comments, label churn, cross-references, and Champion's own verdict all leave it untouched.
+
+The two anchors are complementary, not interchangeable:
+
+| Question | Anchor | Bumped by a Champion comment? |
+|---|---|---|
+| "Has this proposal been revised since my last verdict?" | hash of title + body (this check) | **No** |
+| "Is the `loom:evaluating` claim stale?" | the label's own `labeled` timeline event (see Claim below) | **No** |
+| ~~"…either of the above"~~ | ~~issue `updatedAt`~~ | **Yes — never use it for either** |
 
 ### Claim (staleness-aware, run only when NOT skipped above)
 
@@ -405,7 +430,7 @@ Keeping original proposal label. The proposing role or issue author can address 
   && gh issue edit <number> --remove-label "loom:evaluating"
 ```
 
-The `$VERDICT_MARKER` (computed in "Idempotency check" above, keyed to this issue's `updatedAt`) is what makes the next cycle's idempotency check skip silently instead of re-evaluating — omitting it reopens the duplicate-comment loop this section exists to close.
+The `$VERDICT_MARKER` (computed in "Idempotency check" above, keyed to a hash of this issue's title + body) is what makes the next cycle's idempotency check skip silently instead of re-evaluating — omitting it, or substituting a timestamp-keyed marker, reopens the duplicate-comment loop this section exists to close.
 
 Do NOT remove the proposal label (`loom:curated`, `loom:architect`, `loom:hermit`, or `loom:auditor`) when rejecting.
 

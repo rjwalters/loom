@@ -149,7 +149,9 @@ gh pr view "$PR_NUMBER" --comments
 
 ```bash
 # Idempotency: skip without commenting if already evaluated at this revision.
-VERDICT_MARKER="<!-- champion:proposal-verdict:$UPDATED_AT -->"   # keyed to the issue's updatedAt
+# $BODY_HASH = sha256(title + body), first 16 hex chars — NOT the issue's
+# aggregate updatedAt, which Champion's own comment would bump (see #4966).
+VERDICT_MARKER="<!-- champion:proposal-verdict:body-$BODY_HASH -->"
 
 # Concurrency: claim before evaluating, staleness-aware (LOOM_STALE_EVALUATING_MINUTES, default 15m).
 gh issue edit <number> --add-label "loom:evaluating"
@@ -159,13 +161,15 @@ gh issue edit <number> --add-label "loom:evaluating"
 
 | Finding | Decision | Action |
 |---------|----------|--------|
-| A prior Champion verdict comment already carries `VERDICT_MARKER` for the issue's **current** `updatedAt` | **Unchanged since last review — skip** | No comment, no claim, no label change. A genuine body edit (which bumps `updatedAt`) always produces a fresh marker and a fresh evaluation. |
+| A prior Champion verdict comment already carries `VERDICT_MARKER` for the issue's **current** title+body hash | **Unrevised since last review — skip** | No comment, no claim, no label change. A genuine title/body edit changes the hash and always produces a fresh marker and a fresh evaluation; comments and label churn do not. |
 | Issue already carries `loom:evaluating` and the claim is younger than `LOOM_STALE_EVALUATING_MINUTES` | **Concurrent evaluation in progress** | Skip, do not stomp the claim; continue the batch. |
 | Issue already carries `loom:evaluating` and the claim is older than `LOOM_STALE_EVALUATING_MINUTES` | **Stale claim — a prior Champion pass likely died mid-evaluation** | Reclaim (`--add-label "loom:evaluating"` again) then evaluate normally. |
 | ≥2 prior "NEEDS REVISION" comments exist and the issue is not already `loom:operator-only` | **N=2 threshold reached** | Escalate instead of posting a third+ near-identical rejection: comment with `<!-- champion:proposal-escalated -->` and add `loom:operator-only` (Champion routes, a human decides — the proposal label stays, nothing is closed). |
 | Fewer than 2 prior rejections | **Ordinary reject** | Post the `VERDICT_MARKER`-tagged "NEEDS REVISION" comment as before, release `loom:evaluating`. |
 
-**Rationale**: This is the *same* idempotency-marker + escalation-marker + operator-routing shape as Edge Case 5b's Capped-PR Recovery Pass, applied to the proposal-evaluation side of Champion instead of the PR-merge side — a marker keyed to the event that would invalidate it (here, the issue's `updatedAt`; there, the latest Judge rejection comment ID) stops duplicate comments, and a bounded escalation threshold (here, N=2 identical verdicts; there, the Doctor-cycle cap) converts an infinite silent loop into a single human-visible routing decision.
+**Rationale**: This is the *same* idempotency-marker + escalation-marker + operator-routing shape as Edge Case 5b's Capped-PR Recovery Pass, applied to the proposal-evaluation side of Champion instead of the PR-merge side — a marker keyed to the thing whose change would invalidate it (here, the proposal's own title+body text; there, the latest Judge rejection comment ID) stops duplicate comments, and a bounded escalation threshold (here, N=2 identical verdicts; there, the Doctor-cycle cap) converts an infinite silent loop into a single human-visible routing decision.
+
+**Anchor discipline (#4966)**: neither half of this mechanism may key off the issue's aggregate `updatedAt` — Champion's own verdict comment bumps it, so a marker stamped with it can never match on the next pass and the skip never fires. Content staleness anchors on the title+body hash; claim staleness anchors on the `loom:evaluating` label's own `labeled` timeline event. Both are invisible to Champion's own comment writes. This is the same rule `judge.md`/`daemon-reference.md` already apply to `loom:reviewing`/`loom:treating` staleness.
 
 ---
 
@@ -387,7 +391,7 @@ gh issue create --title "Follow-on: Work identified in PR #$PR_NUMBER" --label "
 | Merge conflicts | Fail | Comment and skip |
 | Stale PR (>24h) | Route to Doctor | Comment once (idempotent marker), swap `loom:pr` → `loom:changes-requested` |
 | Doctor-cycle-capped PR (`loom:blocked` + `loom:changes-requested`) | Three-way on forward progress | Distinct new defects → grant a cycle (remove `loom:blocked` only); same-defect/ambiguous → keep parked with rationale; approach not viable → add `loom:operator-only`, recommend closing (never close it) |
-| Unrevised proposal re-entering the queue every cycle | Idempotency marker + N=2 escalation | Unchanged since last review → skip silently (marker match); ≥2 prior rejections → escalate to `loom:operator-only` instead of a 3rd+ duplicate comment; `loom:evaluating` claim prevents concurrent double-evaluation |
+| Unrevised proposal re-entering the queue every cycle | Idempotency marker + N=2 escalation | Unrevised since last review → skip silently (title+body hash marker match, never `updatedAt`); ≥2 prior rejections → escalate to `loom:operator-only` instead of a 3rd+ duplicate comment; `loom:evaluating` claim prevents concurrent double-evaluation |
 | Test-only changes | Allow | Standard criteria apply |
 | Human holds PR (removes `loom:pr`) | Skip | Not a merge candidate without `loom:pr` |
 | Multiple linked issues | Allow | Verify all closed |
