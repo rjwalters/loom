@@ -47,6 +47,7 @@ use crate::telemetry::{
     SweepStartedRecord, TelemetryEnvelope, TelemetryRecord, TokenAccountState, TokenSnapshotRecord,
 };
 use crate::types::{Event, SweepKind};
+use crate::workspace_pool::WorkspacePool;
 
 use super::queue::DurableQueue;
 
@@ -68,6 +69,11 @@ pub(crate) struct DispatchState {
 /// (every `snapshot_interval`) samples host-level records. `daemon_started_at`
 /// is used only to compute `host.health`'s `uptime_sec` (approximated as this
 /// task's own uptime — see [`super::spawn_task`]'s doc comment).
+///
+/// `workspace_pool` (Issue #4955) is this daemon's shared per-workspace
+/// registry pool — consulted only at each periodic snapshot tick to populate
+/// `host.health`'s `active_sweep_ids` with this host's authoritative
+/// in-flight sweep-id set. See [`collect_active_sweep_ids`].
 pub fn spawn_task(
     bus: &EventBus,
     queue: Arc<DurableQueue>,
@@ -75,6 +81,7 @@ pub fn spawn_task(
     host_id: String,
     snapshot_interval: Duration,
     daemon_started_at: Instant,
+    workspace_pool: Arc<WorkspacePool>,
 ) -> tokio::task::JoinHandle<()> {
     let subscription = bus.subscribe(["sweep.global.dispatch", "sweep.issue"]);
     tokio::spawn(run_collector(
@@ -84,6 +91,7 @@ pub fn spawn_task(
         host_id,
         snapshot_interval,
         daemon_started_at,
+        workspace_pool,
     ))
 }
 
@@ -94,6 +102,7 @@ async fn run_collector(
     host_id: String,
     snapshot_interval: Duration,
     daemon_started_at: Instant,
+    workspace_pool: Arc<WorkspacePool>,
 ) {
     let mut dispatches: HashMap<u32, DispatchState> = HashMap::new();
     let mut slug_cache: HashMap<String, String> = HashMap::new();
@@ -125,7 +134,7 @@ async fn run_collector(
             }
 
             _ = snapshot_timer.tick() => {
-                sample_snapshots(&queue, &workspace_root, &host_id, daemon_started_at).await;
+                sample_snapshots(&queue, &workspace_root, &host_id, daemon_started_at, &workspace_pool).await;
             }
         }
     }
@@ -383,10 +392,11 @@ async fn sample_snapshots(
     workspace_root: &Path,
     host_id: &str,
     daemon_started_at: Instant,
+    workspace_pool: &WorkspacePool,
 ) {
     let token_record = sample_token_snapshot(workspace_root);
     queue.push(TelemetryEnvelope::new(host_id, TelemetryRecord::TokensSnapshot(token_record)));
-    let health_record = sample_host_health(workspace_root, daemon_started_at).await;
+    let health_record = sample_host_health(workspace_root, daemon_started_at, workspace_pool).await;
     queue.push(TelemetryEnvelope::new(host_id, TelemetryRecord::HostHealth(health_record)));
 }
 
@@ -452,7 +462,11 @@ fn sample_token_snapshot(workspace_root: &Path) -> TokenSnapshotRecord {
 /// running binary's build identity. Every measured field is `Option` — an
 /// unmeasurable probe stays absent rather than a fake zero (mirrors
 /// `cpu_headroom`/`disk_headroom`'s own contract).
-async fn sample_host_health(workspace_root: &Path, started_at: Instant) -> HostHealthRecord {
+async fn sample_host_health(
+    workspace_root: &Path,
+    started_at: Instant,
+    workspace_pool: &WorkspacePool,
+) -> HostHealthRecord {
     // CPU idle refresh can block ~1s on macOS (`iostat`) — dispatched through
     // `spawn_blocking` per the exact pattern `work_finder`'s dynamic-cap tick
     // already uses.
@@ -471,7 +485,32 @@ async fn sample_host_health(workspace_root: &Path, started_at: Instant) -> HostH
         cpu_idle_fraction: crate::cpu_headroom::cached_cpu_idle_fraction(),
         load_per_core: crate::cpu_headroom::load_per_core(),
         worktree_root_free_gb: crate::disk_headroom::worktree_root_free_gb(workspace_root),
+        active_sweep_ids: collect_active_sweep_ids(workspace_pool),
     }
+}
+
+/// This host's currently in-flight (`Pending`/`Running`, i.e. non-terminal)
+/// sweep IDs, across every repo [`WorkspacePool::provisioned_registries`]
+/// currently tracks (Issue #4955). Feeds `host.health`'s `active_sweep_ids`
+/// so the Phase-2 dashboard's `FleetState` Durable Object can reconcile its
+/// live `sweep:` entries against this daemon's own authoritative registry
+/// view rather than relying solely on a (sometimes lost) `sweep.completed`
+/// record to know a sweep is done.
+fn collect_active_sweep_ids(workspace_pool: &WorkspacePool) -> Vec<String> {
+    let mut ids = Vec::new();
+    for registry in workspace_pool.provisioned_registries() {
+        let registry = registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ids.extend(
+            registry
+                .list(None)
+                .into_iter()
+                .filter(|info| !info.state.is_terminal())
+                .map(|info| info.sweep_id),
+        );
+    }
+    ids
 }
 
 #[cfg(test)]
@@ -835,11 +874,16 @@ mod tests {
         assert!(record.accounts[0].exhausted);
     }
 
+    fn empty_pool() -> WorkspacePool {
+        WorkspacePool::new(Arc::new(EventBus::new()), tokio::runtime::Handle::current())
+    }
+
     #[tokio::test]
     async fn host_health_sample_populates_daemon_version_and_uptime() {
         let dir = tempfile::tempdir().unwrap();
         let started = Instant::now();
-        let record = sample_host_health(dir.path(), started).await;
+        let pool = empty_pool();
+        let record = sample_host_health(dir.path(), started, &pool).await;
         assert_eq!(record.daemon_version, env!("CARGO_PKG_VERSION"));
         assert!(record.logical_cpus >= 1);
     }
@@ -847,7 +891,8 @@ mod tests {
     #[tokio::test]
     async fn host_health_sample_stamps_the_running_binarys_build_identity() {
         let dir = tempfile::tempdir().unwrap();
-        let record = sample_host_health(dir.path(), Instant::now()).await;
+        let pool = empty_pool();
+        let record = sample_host_health(dir.path(), Instant::now(), &pool).await;
 
         // The sample must carry the SAME commit `loom-daemon --version`
         // prints — that identity is what lets the dashboard tell two
@@ -881,5 +926,84 @@ mod tests {
             chrono::DateTime::parse_from_rfc3339(raw).is_ok(),
             "built_at() must be Some iff the raw stamp {raw:?} parses"
         );
+    }
+
+    #[tokio::test]
+    async fn host_health_sample_reports_no_active_sweeps_when_pool_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = Instant::now();
+        let pool = empty_pool();
+        let record = sample_host_health(dir.path(), started, &pool).await;
+        assert!(
+            record.active_sweep_ids.is_empty(),
+            "an empty pool has no in-flight sweeps to report"
+        );
+    }
+
+    /// A hermetic, `dispatch()`-able registry: `skip_label_flip = true` skips
+    /// runtime admission / the workspace-commands guard / every `gh` call
+    /// (mirrors `sweep_registry::test_support::fixture_registry`, which is
+    /// not reachable from here — `sweep_registry::test_support` is a
+    /// private, `#[cfg(test)]`-only module of a sibling module tree). The
+    /// fake spawn binary sleeps briefly so the dispatched entry stays
+    /// `Running` for the synchronous, single-threaded-until-`.await` body of
+    /// the test below.
+    fn dispatchable_registry(workspace: &Path) -> crate::sweep_registry::SweepRegistry {
+        use crate::sweep_registry::{SweepRegistry, SweepRegistryConfig};
+        use std::os::unix::fs::PermissionsExt;
+
+        let scripts_dir = workspace.join(".loom").join("scripts");
+        std::fs::create_dir_all(&scripts_dir).unwrap();
+        let bin = scripts_dir.join("spawn-worker.sh");
+        std::fs::write(&bin, "#!/bin/sh\nsleep 5\n").unwrap();
+        let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&bin, perms).unwrap();
+
+        let mut config = SweepRegistryConfig::new(workspace.to_path_buf());
+        config.spawn_bin = Some(bin);
+        config.skip_label_flip = true;
+        config.journal_path = Some(workspace.join("sweeps-journal.json"));
+        config.outcomes_journal_path = Some(workspace.join("sweep-outcomes.jsonl"));
+        config.outcome_telemetry_path = Some(workspace.join("sweep-outcome-telemetry.jsonl"));
+        SweepRegistry::new(config)
+    }
+
+    #[tokio::test]
+    async fn collect_active_sweep_ids_reports_running_sweeps_across_every_provisioned_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let a_root = dir.path().join("a");
+        let b_root = dir.path().join("b");
+        std::fs::create_dir_all(&a_root).unwrap();
+        std::fs::create_dir_all(&b_root).unwrap();
+        let pool = empty_pool();
+
+        // `seed` (not `get_or_provision`) so no reaper/watchdog is spawned
+        // for either fixture — nothing races the assertions below.
+        pool.seed(a_root.clone(), Arc::new(std::sync::Mutex::new(dispatchable_registry(&a_root))));
+        pool.seed(b_root.clone(), Arc::new(std::sync::Mutex::new(dispatchable_registry(&b_root))));
+
+        let a_sweep_id = {
+            let registry = pool.get_or_provision(&a_root);
+            let mut registry = registry.lock().unwrap();
+            registry
+                .dispatch(&SweepKind::Issue(1), None, None, None, None)
+                .expect("dispatch into workspace a")
+                .sweep_id
+        };
+        let b_sweep_id = {
+            let registry = pool.get_or_provision(&b_root);
+            let mut registry = registry.lock().unwrap();
+            registry
+                .dispatch(&SweepKind::Issue(2), None, None, None, None)
+                .expect("dispatch into workspace b")
+                .sweep_id
+        };
+
+        let mut ids = collect_active_sweep_ids(&pool);
+        ids.sort();
+        let mut expected = vec![a_sweep_id, b_sweep_id];
+        expected.sort();
+        assert_eq!(ids, expected, "in-flight sweeps from BOTH provisioned registries are reported");
     }
 }

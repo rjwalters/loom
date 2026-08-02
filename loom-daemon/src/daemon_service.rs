@@ -1329,6 +1329,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
         sweep_workspace.clone(),
         &event_bus,
         std::time::Instant::now(),
+        workspace_pool.clone(),
     );
 
     // Start IPC server. `workspace_health_states` is threaded in so the

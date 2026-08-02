@@ -76,6 +76,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::event_bus::EventBus;
+use crate::workspace_pool::WorkspacePool;
 
 use exporter::HttpsExporter;
 use queue::DurableQueue;
@@ -374,12 +375,19 @@ fn read_ingest_key(path: &str) -> Option<String> {
 /// (e.g. after a slow credential-preflight step), `uptime_sec` under-reports
 /// by that startup delay — an accepted approximation for Phase 1 host-health
 /// telemetry, not a correctness requirement of the exporter itself.
+///
+/// `workspace_pool` (Issue #4955) is the daemon's shared per-workspace
+/// [`SweepRegistry`](crate::sweep_registry::SweepRegistry) pool, threaded
+/// through to [`collector::spawn_task`] so `host.health`'s
+/// `active_sweep_ids` reports this host's authoritative in-flight sweep-id
+/// set (`collector::collect_active_sweep_ids`, private to that module).
 #[must_use]
 pub fn spawn_task(
     config: &ObservabilityConfig,
     workspace_root: PathBuf,
     bus: &EventBus,
     daemon_started_at: Instant,
+    workspace_pool: Arc<WorkspacePool>,
 ) -> Option<Vec<tokio::task::JoinHandle<()>>> {
     if !resolve_enabled(config) {
         log::debug!("observability: disabled (set observability.enabled=true to opt in)");
@@ -427,6 +435,7 @@ pub fn spawn_task(
         host_id.clone(),
         SNAPSHOT_INTERVAL,
         daemon_started_at,
+        workspace_pool,
     );
     // The two branches below construct different concrete `E: Exporter`
     // types and each call `sender::spawn_task` with their own — no
@@ -532,6 +541,16 @@ mod tests {
         for var in ALL_ENV_VARS {
             std::env::remove_var(var);
         }
+    }
+
+    /// A freshly-constructed, empty [`WorkspacePool`] — `spawn_task` now
+    /// requires one (Issue #4955) to thread through to the collector.
+    /// `Handle::current()` is why every call site below must run inside a
+    /// Tokio runtime (`#[tokio::test]`), even the `spawn_task` calls whose
+    /// config disables/under-configures export and so never reach the
+    /// collector at all.
+    fn test_workspace_pool() -> Arc<WorkspacePool> {
+        Arc::new(WorkspacePool::new(Arc::new(EventBus::new()), tokio::runtime::Handle::current()))
     }
 
     #[test]
@@ -681,20 +700,26 @@ mod tests {
     // with zero side effects (no queue file created).
     // ------------------------------------------------------------------
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn spawn_task_disabled_returns_none() {
+    async fn spawn_task_disabled_returns_none() {
         clear_env();
         let bus = EventBus::new();
         let dir = tempdir().unwrap();
         let config = ObservabilityConfig::default();
-        let handles = spawn_task(&config, dir.path().to_path_buf(), &bus, Instant::now());
+        let handles = spawn_task(
+            &config,
+            dir.path().to_path_buf(),
+            &bus,
+            Instant::now(),
+            test_workspace_pool(),
+        );
         assert!(handles.is_none());
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn spawn_task_enabled_without_endpoint_returns_none() {
+    async fn spawn_task_enabled_without_endpoint_returns_none() {
         clear_env();
         let bus = EventBus::new();
         let dir = tempdir().unwrap();
@@ -702,13 +727,19 @@ mod tests {
             enabled: Some(true),
             ..Default::default()
         };
-        let handles = spawn_task(&config, dir.path().to_path_buf(), &bus, Instant::now());
+        let handles = spawn_task(
+            &config,
+            dir.path().to_path_buf(),
+            &bus,
+            Instant::now(),
+            test_workspace_pool(),
+        );
         assert!(handles.is_none());
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn spawn_task_enabled_without_ingest_key_file_returns_none() {
+    async fn spawn_task_enabled_without_ingest_key_file_returns_none() {
         clear_env();
         let bus = EventBus::new();
         let dir = tempdir().unwrap();
@@ -717,13 +748,19 @@ mod tests {
             endpoint: Some("https://ingest.example.com/v1/telemetry".to_string()),
             ..Default::default()
         };
-        let handles = spawn_task(&config, dir.path().to_path_buf(), &bus, Instant::now());
+        let handles = spawn_task(
+            &config,
+            dir.path().to_path_buf(),
+            &bus,
+            Instant::now(),
+            test_workspace_pool(),
+        );
         assert!(handles.is_none());
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn spawn_task_enabled_with_unreadable_ingest_key_file_returns_none() {
+    async fn spawn_task_enabled_with_unreadable_ingest_key_file_returns_none() {
         clear_env();
         let bus = EventBus::new();
         let dir = tempdir().unwrap();
@@ -738,7 +775,13 @@ mod tests {
             ),
             ..Default::default()
         };
-        let handles = spawn_task(&config, dir.path().to_path_buf(), &bus, Instant::now());
+        let handles = spawn_task(
+            &config,
+            dir.path().to_path_buf(),
+            &bus,
+            Instant::now(),
+            test_workspace_pool(),
+        );
         assert!(handles.is_none());
     }
 
@@ -757,7 +800,13 @@ mod tests {
             flush_interval_secs: Some(3600), // avoid a real network attempt during the test
             ..Default::default()
         };
-        let handles = spawn_task(&config, dir.path().to_path_buf(), &bus, Instant::now());
+        let handles = spawn_task(
+            &config,
+            dir.path().to_path_buf(),
+            &bus,
+            Instant::now(),
+            test_workspace_pool(),
+        );
         let handles = handles.expect("fully configured ⇒ spawn_task must return Some");
         assert_eq!(handles.len(), 2, "collector + sender");
         for handle in handles {
@@ -788,7 +837,13 @@ mod tests {
             exporter: Some("otlp".to_string()),
             ..Default::default()
         };
-        let handles = spawn_task(&config, dir.path().to_path_buf(), &bus, Instant::now());
+        let handles = spawn_task(
+            &config,
+            dir.path().to_path_buf(),
+            &bus,
+            Instant::now(),
+            test_workspace_pool(),
+        );
         assert!(handles.is_none());
     }
 
@@ -813,7 +868,13 @@ mod tests {
             flush_interval_secs: Some(3600), // avoid a real network attempt during the test
             ..Default::default()
         };
-        let handles = spawn_task(&config, dir.path().to_path_buf(), &bus, Instant::now());
+        let handles = spawn_task(
+            &config,
+            dir.path().to_path_buf(),
+            &bus,
+            Instant::now(),
+            test_workspace_pool(),
+        );
         let handles =
             handles.expect("fully configured otlp exporter ⇒ spawn_task must return Some");
         assert_eq!(handles.len(), 2, "collector + sender");

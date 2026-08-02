@@ -513,6 +513,7 @@ mod tests {
                 cpu_idle_fraction: None,
                 load_per_core: None,
                 worktree_root_free_gb: None,
+                active_sweep_ids: Vec::new(),
             }),
         )
     }
