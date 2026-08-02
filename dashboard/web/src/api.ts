@@ -54,10 +54,13 @@ export const PUBLIC_FLEET_STATE_PATH = "/public/fleet-state";
 const AUTH_STATE_GLOBAL = "__LOOM_FLEET__";
 
 /** The auth state the Worker stamps into the page. `email` is present only
- * for an authenticated viewer whose token carried one. */
+ * for an authenticated viewer whose token carried one. `commit` (issue
+ * #4958) is present whenever the deployment stamps one, for either viewer —
+ * unlike `email` it is not identity, so it is not gated on `authenticated`. */
 export interface AuthState {
   authenticated: boolean;
   email?: string;
+  commit?: string;
 }
 
 /**
@@ -72,12 +75,15 @@ export function readAuthState(scope: typeof globalThis = globalThis): AuthState 
   const raw = (scope as Record<string, unknown>)[AUTH_STATE_GLOBAL];
   if (typeof raw !== "object" || raw === null) return { authenticated: false };
 
-  const state = raw as { authenticated?: unknown; email?: unknown };
-  if (state.authenticated !== true) return { authenticated: false };
+  const state = raw as { authenticated?: unknown; email?: unknown; commit?: unknown };
+  const commit = typeof state.commit === "string" && state.commit.length > 0 ? { commit: state.commit } : {};
+
+  if (state.authenticated !== true) return { authenticated: false, ...commit };
 
   return {
     authenticated: true,
     ...(typeof state.email === "string" && state.email.length > 0 ? { email: state.email } : {}),
+    ...commit,
   };
 }
 

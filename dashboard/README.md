@@ -147,6 +147,7 @@ asserts the `ADMIN_TOKEN` secret exists on the deployed Worker.
 | `POST /admin/hosts/:hostId/revoke` | `Authorization: Bearer <ADMIN_TOKEN>` | Revoke a host's key and clear its `FleetState` Durable Object entries (issue #4957) — no more rendering the last-known health/tokens sample as current. |
 | `POST /admin/retention/run` | `Authorization: Bearer <ADMIN_TOKEN>` | Run the retention sweep on demand (also runs hourly via `[triggers] crons`). |
 | `GET /admin/fleet-state` | `Authorization: Bearer <ADMIN_TOKEN>` | Read the Durable Object's live snapshot (operator introspection/manual verification). |
+| `GET /api/version` | none (always public) | The deploying commit SHA (issue #4958), e.g. `{"commit":"abc1234"}` — `"unknown"` when the deployment never stamped one (local `wrangler dev`, Miniflare tests). Deliberately unauthenticated, unlike the rest of `/api/*`: a build stamp is not sensitive, and drift-detection tooling should not need an Access session to ask "what is live right now?". |
 | `GET /api/fleet-state` | none in-Worker — put behind Cloudflare Access (see below) | Authenticated query API: current state of every known host/sweep, full detail. |
 | `GET /api/history` | none in-Worker — put behind Cloudflare Access | Authenticated query API: filterable, paginated D1 history query, full detail. |
 | `GET /api/events` | none in-Worker — put behind Cloudflare Access | Authenticated query API: SSE live tail of newly-ingested telemetry, full detail. |

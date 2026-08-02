@@ -34,6 +34,11 @@
  *                                      the actual Phase 3 dashboard query
  *                                      API).
  *
+ *   GET  /api/version                 — public, unauthenticated (issue
+ *                                      #4958): the deploying commit SHA,
+ *                                      `{"commit":"unknown"}` when the
+ *                                      deployment never stamped one. See
+ *                                      `handleVersion` below.
  *   GET  /api/fleet-state            — authenticated query API: current
  *                                      state of every known host/sweep,
  *                                      full detail regardless of visibility
@@ -136,6 +141,13 @@ export interface Env {
    * `handleRoot` falls back to the server-rendered page in that case, so this
    * is optional by design rather than an invariant to assert. */
   ASSETS?: Fetcher;
+  /** The commit this Worker was built/deployed from — a plain, non-secret
+   * `[vars]`-equivalent injected at deploy time via `wrangler deploy --var
+   * BUILD_COMMIT:$GITHUB_SHA` (issue #4958), never written into the committed
+   * `wrangler.toml`. Absent in local `wrangler dev` and the Miniflare test
+   * env, where `/api/version` and the footer fall back to `"unknown"` rather
+   * than throwing. */
+  BUILD_COMMIT?: string;
 }
 
 /** A single global Durable Object instance holds fleet-wide live state —
@@ -150,6 +162,25 @@ function jsonError(status: number, message: string): Response {
 
 function fleetStateStub(env: Env): DurableObjectStub {
   return env.FLEET_STATE.get(env.FLEET_STATE.idFromName(FLEET_STATE_ID_NAME));
+}
+
+// ---------------------------------------------------------------------------
+// /api/version — the build/deploy commit stamp (issue #4958)
+// ---------------------------------------------------------------------------
+
+/**
+ * Deliberately unauthenticated (unlike the rest of `/api/*`): the deploying
+ * commit SHA is not sensitive — it is already public in the repo's own commit
+ * history — and drift-detection tooling (a health check, a CI smoke test, an
+ * operator's terminal) should not need a Cloudflare Access session just to
+ * ask "what is live right now?". Routed *before* the `/api/*` auth gate in
+ * the entrypoint below, the same way `/ingest` and `/admin/*` are.
+ */
+function handleVersion(env: Env): Response {
+  return new Response(JSON.stringify({ commit: env.BUILD_COMMIT ?? "unknown" }), {
+    status: 200,
+    headers: JSON_HEADERS,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -518,6 +549,11 @@ interface InjectedAuthState {
   email?: string;
   /** Display timezone for the UI, when the deployment configures one. */
   timeZone?: string;
+  /** The deploying commit SHA (issue #4958) — same value `/api/version`
+   * reports, injected here too so the footer can show it with zero extra
+   * requests. Omitted (not `"unknown"`) when `BUILD_COMMIT` is unset, so the
+   * footer can distinguish "no stamp available" from a real value. */
+  commit?: string;
 }
 
 /** Inject the auth state into the SPA shell as a `<script>` immediately
@@ -555,9 +591,12 @@ async function handleRoot(request: Request, env: Env): Promise<Response> {
       // The timezone is deployment config, not identity — an anonymous
       // visitor reads the same charts and must bucket them the same way.
       const timeZone = env.DISPLAY_TIMEZONE ? { timeZone: env.DISPLAY_TIMEZONE } : {};
+      // Likewise the build commit: every viewer, signed in or not, should be
+      // able to see whether the live page is current.
+      const commit = env.BUILD_COMMIT ? { commit: env.BUILD_COMMIT } : {};
       const state: InjectedAuthState = isAuthenticated
-        ? { authenticated: true, ...(identity.email ? { email: identity.email } : {}), ...timeZone }
-        : { authenticated: false, ...timeZone };
+        ? { authenticated: true, ...(identity.email ? { email: identity.email } : {}), ...timeZone, ...commit }
+        : { authenticated: false, ...timeZone, ...commit };
 
       return new Response(injectAuthState(await shell.text(), state), {
         status: 200,
@@ -590,6 +629,11 @@ export default {
     }
     if (url.pathname.startsWith("/admin/")) {
       return handleAdmin(request, env, url);
+    }
+
+    if (request.method === "GET" && url.pathname === "/api/version") {
+      // Ahead of the auth gate below on purpose — see `handleVersion`'s doc.
+      return handleVersion(env);
     }
 
     // Every `/api/*` route is operator-only, and the Worker — not the edge —
