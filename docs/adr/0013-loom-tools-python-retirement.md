@@ -185,8 +185,10 @@ entries** on every invocation, including `--check`, `--dry-run` and an
 up-to-date no-op. It reports any `loom-*` executable on `PATH` that does not
 resolve to the `loom-daemon` binary the script just resolved, and separately
 warns when `PATH` holds more than one `loom-daemon` (the first shadows the rest).
-The current auto-generated shims and the allowlisted `loom-search` are never
-flagged.
+Only the current auto-generated shims are never flagged; `loom-search` was
+allowlisted here too from Phase 4 through #4969, but #4970 dropped that entry
+(a Python package it retired needs no allowlist carve-out) — a leftover
+`loom-search` binary is now flagged like any other stale entry point.
 
 It is **advisory only** — it deletes nothing, does not touch `PATH`, and never
 changes the exit code. An operator's `~/.local/bin` is theirs, and a false
