@@ -219,9 +219,11 @@ Use conservative judgment. **Do NOT promote** if:
 
 **Applies to every proposal evaluated by this file** — `loom:curated`, `loom:architect`, `loom:hermit`, and `loom:auditor` alike — not just the `loom:architect` case that surfaced it.
 
-### Idempotency check (run BEFORE claiming — skip without commenting on a match)
+**The idempotency skip and the escalation threshold are one mechanism, not two** (#4967). Suppressing duplicate comments must never suppress the escalation that eventually puts a stuck proposal in front of a human — read "Bounding the silent skip" below before changing either half.
 
-Compute a marker keyed to a **hash of the proposal's own text** (title + body), so a genuine revision always gets a fresh evaluation while an unchanged proposal never gets re-commented:
+### Idempotency check (run BEFORE claiming — skip silently on a match, until the skips are capped)
+
+Compute a marker keyed to a **hash of the proposal's own text** (title + body), so a genuine revision always gets a fresh evaluation while an unchanged proposal never gets re-commented. The check is **three-way**, not two-way: no match → evaluate; match with skips left in the budget → skip silently; match with the skip budget exhausted → **escalate** (see "Bounding the silent skip" below).
 
 ```bash
 ISSUE_NUMBER=<number>
@@ -242,14 +244,60 @@ BODY_HASH=$(printf '%s\n%s' \
   | _sha256 | awk '{print substr($1, 1, 16)}')
 VERDICT_MARKER="<!-- champion:proposal-verdict:body-$BODY_HASH -->"
 
+# Escalation inputs, computed HERE rather than in Step 4 (#4967): the skip path
+# below must be able to decide "escalate instead of skipping again" without ever
+# reaching Step 4. Step 4 reuses these same variables.
+PRIOR_REJECTIONS=$(echo "$ISSUE_JSON" | jq \
+  '[.comments[] | select(.body | contains("Champion Review: NEEDS REVISION"))] | length')
+ALREADY_ROUTED=$(echo "$ISSUE_JSON" | jq -e '.labels[] | select(.name=="loom:operator-only")' >/dev/null && echo yes || echo no)
+SKIP_STREAK=0            # silent skips already recorded for THIS body revision
+ESCALATE_UNREVISED=no    # set to yes to bypass re-evaluation and go straight to Step 4's escalation
+
 if echo "$ISSUE_JSON" | jq -e --arg m "$VERDICT_MARKER" \
      '.comments[] | select(.body | contains($m))' >/dev/null; then
-  echo "Already evaluated #$ISSUE_NUMBER at body revision $BODY_HASH — skipping (no comment, no claim)"
-  # Continue the batch to the next issue; do not read further or claim.
+  # This exact revision was already evaluated. Read the silent-skip tally carried
+  # by the matching verdict comment. REST, not `gh issue view`: only the REST
+  # payload has the numeric comment id that the PATCH below needs (the `id` from
+  # `gh issue view --json comments` is a GraphQL node id and cannot be PATCHed).
+  VERDICT_COMMENT=$(gh api "repos/{owner}/{repo}/issues/$ISSUE_NUMBER/comments" --paginate \
+    --jq ".[] | select(.body | contains(\"$VERDICT_MARKER\"))" | jq -s 'last')
+  COMMENT_ID=$(echo "$VERDICT_COMMENT" | jq -r '.id // empty')
+  COMMENT_BODY=$(echo "$VERDICT_COMMENT" | jq -r '.body // ""')
+  SKIP_STREAK=$(printf '%s' "$COMMENT_BODY" \
+    | sed -n "s|.*<!-- champion:unrevised-skips:$BODY_HASH:\([0-9]\{1,\}\) -->.*|\1|p" | tail -n 1)
+  SKIP_STREAK=${SKIP_STREAK:-0}
+  UNREVISED_EVALS=$(( PRIOR_REJECTIONS + SKIP_STREAK ))
+
+  if [ "$ALREADY_ROUTED" = "yes" ]; then
+    # Terminal state — a human owns this now. Skip without tallying or escalating.
+    echo "#$ISSUE_NUMBER already routed to loom:operator-only — skipping (no comment, no claim, no tally)"
+  elif [ "$UNREVISED_EVALS" -ge "${LOOM_MAX_UNREVISED_EVALUATIONS:-2}" ]; then
+    # Silence is not free forever: the skip budget is spent, so this pass does
+    # NOT skip. Fall through to Claim, then jump straight to Step 4's escalation
+    # branch (no re-evaluation — the text is unchanged, so the verdict is too).
+    ESCALATE_UNREVISED=yes
+    echo "#$ISSUE_NUMBER unrevised at $BODY_HASH across $UNREVISED_EVALS evaluations — escalating to the operator instead of skipping again"
+  else
+    # Record this cycle's skip IN PLACE by PATCHing the existing verdict comment.
+    # An edit posts no new comment and sends no notification, so the "1 comment,
+    # then silence" guarantee holds while the counter still advances.
+    NEXT_SKIPS=$(( SKIP_STREAK + 1 ))
+    if printf '%s' "$COMMENT_BODY" | grep -q "<!-- champion:unrevised-skips:$BODY_HASH:"; then
+      NEW_BODY=$(printf '%s' "$COMMENT_BODY" \
+        | sed "s|<!-- champion:unrevised-skips:$BODY_HASH:[0-9]\{1,\} -->|<!-- champion:unrevised-skips:$BODY_HASH:$NEXT_SKIPS -->|")
+    else
+      # Verdict comment predates this tally (posted before #4967) — append it.
+      NEW_BODY=$(printf '%s\n\n%s' "$COMMENT_BODY" "<!-- champion:unrevised-skips:$BODY_HASH:$NEXT_SKIPS -->")
+    fi
+    [ -n "$COMMENT_ID" ] && gh api --method PATCH \
+      "repos/{owner}/{repo}/issues/comments/$COMMENT_ID" -f body="$NEW_BODY" >/dev/null
+    echo "Already evaluated #$ISSUE_NUMBER at body revision $BODY_HASH — skipping silently (skip $NEXT_SKIPS recorded; unrevised evaluations now $(( PRIOR_REJECTIONS + NEXT_SKIPS ))/${LOOM_MAX_UNREVISED_EVALUATIONS:-2}, escalates once it reaches the cap; no comment, no claim)"
+    # Continue the batch to the next issue; do not read further or claim.
+  fi
 fi
 ```
 
-If the marker is present, **stop here for this issue** — do not read comments further, do not claim, do not comment. This is the mechanism that turns "6 identical NEEDS REVISION comments" into "1 comment, then silent skips" for a truly unrevised proposal.
+If the marker is present **and `ESCALATE_UNREVISED=no`**, **stop here for this issue** — do not read comments further, do not claim, do not comment. This is the mechanism that turns "6 identical NEEDS REVISION comments" into "1 comment, then silent skips" for a truly unrevised proposal. If `ESCALATE_UNREVISED=yes`, do **not** stop: continue to the Claim step and then to Step 4, which escalates on that flag without re-running the 8 criteria.
 
 #### Why a body hash and NOT the issue's `updatedAt` (#4966)
 
@@ -264,6 +312,41 @@ The two anchors are complementary, not interchangeable:
 | "Has this proposal been revised since my last verdict?" | hash of title + body (this check) | **No** |
 | "Is the `loom:evaluating` claim stale?" | the label's own `labeled` timeline event (see Claim below) | **No** |
 | ~~"…either of the above"~~ | ~~issue `updatedAt`~~ | **Yes — never use it for either** |
+
+#### Bounding the silent skip: how idempotency interacts with N=2 escalation (#4967)
+
+**Read this before editing either mechanism.** The idempotency check and Step 4's escalation are *coupled*, and the coupling is easy to break by touching only one of them — it has already been broken once. When the body-hash marker landed (#4966) it made the skip real, and a real skip returns before Step 4 ever runs. For a genuinely **unrevised** proposal the hash never changes, so the first rejection's marker matches on every later pass, Step 4 became unreachable forever, and `PRIOR_REJECTIONS` — which counts only *posted* rejection comments — froze at 1. Escalation to `loom:operator-only` could then never fire for exactly the scenario #4954 was filed about: fixing the comment spam had silently traded "noisy, but a human eventually sees it" for "quiet, and no human ever does."
+
+The rule that keeps both properties: **a silent skip must still cost something.** Each skip advances a durable counter, and the counter is what gates escalation — so suppressing comments can never suppress escalation.
+
+| Mechanism | Counts | Written by | Survives a silent skip? |
+|---|---|---|---|
+| `PRIOR_REJECTIONS` | posted `Champion Review: NEEDS REVISION` comments (any revision) | Step 4's reject branch | Yes, but **frozen** while skipping — it cannot advance on its own |
+| `SKIP_STREAK` | silent skips recorded for the **current** body hash | the idempotency skip's in-place `PATCH` of the existing verdict comment | **Yes — this is the counter that keeps advancing** |
+| `UNREVISED_EVALS` = `PRIOR_REJECTIONS + SKIP_STREAK` | evaluation cycles spent on an unrevised proposal | derived | Yes — the single escalation gate, used identically by the skip path and Step 4 |
+
+Escalate once `UNREVISED_EVALS >= LOOM_MAX_UNREVISED_EVALUATIONS` (default **2** — the same N=2 threshold #4954 specified, now measured in *evaluation cycles* rather than in *posted comments*).
+
+**Traced against the #4967 scenario** (proposal fails criteria at body hash H1 and is never revised; Champion cadence is irrelevant — these are consecutive passes):
+
+| Cycle | Marker match? | `PRIOR_REJECTIONS` | `SKIP_STREAK` | `UNREVISED_EVALS` | Outcome | Comments posted |
+|---|---|---|---|---|---|---|
+| 1 | no (H1 unseen) | 0 | 0 | 0 | evaluate → reject → post NEEDS REVISION carrying `VERDICT_MARKER` + `unrevised-skips:H1:0` | 1 |
+| 2 | yes (H1) | 1 | 0 | 1 < 2 | silent skip; `PATCH` the tally to `1` | 0 |
+| 3 | yes (H1) | 1 | 1 | 2 ≥ 2 | `ESCALATE_UNREVISED=yes` → claim → Step 4 escalation → `loom:operator-only` | 1 (escalation) |
+| 4+ | — | — | — | — | `loom:operator-only` excludes it from every future pass | 0 |
+
+**Escalation therefore fires on cycle 3** — the same cycle the pre-#4954 behavior escalated on, but with **2 comments total instead of 6+**, and with the silent-skip guarantee intact (cycle 2 posts nothing).
+
+Invariants a future edit must preserve:
+
+- **Comment budget for an unrevised proposal is exactly 2**: one `NEEDS REVISION`, one escalation. The skip path may only ever *edit* the existing verdict comment (`gh api --method PATCH .../issues/comments/<id>` — no notification, no new timeline entry), never post.
+- **The counter must not live in a comment Champion refuses to write.** Anything that requires posting per cycle re-creates this bug; anything derived from the issue's own text is frozen by construction, which is what makes the tally an *edit* of a comment that already exists.
+- **A revision resets `SKIP_STREAK`, not `PRIOR_REJECTIONS`.** A new hash means a new marker, so the tally starts at 0 for the new revision — but the rejection count keeps accumulating across revisions, so a proposal that is revised-and-rejected twice still escalates on its third cycle. Both paths remain bounded.
+- **Escalation goes through the claim.** `ESCALATE_UNREVISED=yes` falls through to the Claim step and the verdict-time recheck rather than escalating inline, so two concurrent passes cannot post two escalation comments. A lost `PATCH` update between concurrent passes can only *under*count (escalating a cycle later), never double-escalate.
+- **`ALREADY_ROUTED=yes` short-circuits everything.** A proposal already carrying `loom:operator-only` is never re-escalated and never re-tallied; "When NOT to Promote" already excludes it from future passes.
+
+`LOOM_MAX_UNREVISED_EVALUATIONS` (default **2**) — bounds the silent-skip streak the same way `LOOM_MAX_STANDDOWN_STREAK` (default 3) bounds `judge.md`'s silent stand-downs: silence is a valid response to a repeated no-op, but never an unbounded one.
 
 ### Claim (staleness-aware, run only when NOT skipped above)
 
@@ -380,21 +463,23 @@ This issue has been evaluated and promoted to \`loom:issue\` status. All quality
 If any criteria fail, first check whether this rejection should **escalate** instead of posting another comment — the mechanism that stops the 6x duplicate-comment loop:
 
 ```bash
-# How many NEEDS REVISION verdicts has Champion already posted on this issue
-# (any revision)? This is the "N identical verdicts" counter from the issue.
-PRIOR_REJECTIONS=$(echo "$ISSUE_JSON" | jq \
-  '[.comments[] | select(.body | contains("Champion Review: NEEDS REVISION"))] | length')
-ALREADY_ROUTED=$(echo "$ISSUE_JSON" | jq -e '.labels[] | select(.name=="loom:operator-only")' >/dev/null && echo yes || echo no)
+# All three were computed by the Idempotency check above (which always runs
+# first — see "Per-issue order in the loop"), so do NOT recompute them here:
+#   PRIOR_REJECTIONS  — posted "Champion Review: NEEDS REVISION" comments (any revision)
+#   SKIP_STREAK       — silent skips recorded for THIS body revision (0 if the marker did not match)
+#   ALREADY_ROUTED    — yes when loom:operator-only is already present
+# Escalation is gated on evaluation CYCLES, not on posted comments (#4967):
+UNREVISED_EVALS=$(( PRIOR_REJECTIONS + SKIP_STREAK ))
 ```
 
-**If `PRIOR_REJECTIONS >= 2` and not already routed** (N=2 threshold): escalate instead of posting a third+ rejection. Re-run the verdict-time recheck first:
+**If `UNREVISED_EVALS >= ${LOOM_MAX_UNREVISED_EVALUATIONS:-2}` and not already routed** (the N=2 threshold), **or if `ESCALATE_UNREVISED=yes`** (the idempotency check already made this determination and sent you straight here without re-evaluating): escalate instead of posting a third+ rejection. Re-run the verdict-time recheck first:
 
 ```bash
 ESCALATE_MARKER="<!-- champion:proposal-escalated -->"
 gh issue comment <number> --body "$ESCALATE_MARKER
 **Champion: Escalating to Operator — Repeated Rejection Without Revision**
 
-This proposal has now been rejected $PRIOR_REJECTIONS+ times with converging feedback, but has not been revised to address it. Re-running an identical evaluation each cycle only produces duplicate comments; it doesn't move this forward.
+This proposal has been evaluated $UNREVISED_EVALS+ times with converging feedback ($PRIOR_REJECTIONS posted rejection(s) plus $SKIP_STREAK silent skip(s) of an unchanged proposal), but has not been revised to address it. Re-running an identical evaluation each cycle changes nothing, and skipping it silently forever would leave it invisible; escalating is the only move that makes progress.
 
 **Recurring findings:**
 - [Criterion that failed, repeated across rejections]: [Specific reason]
@@ -406,12 +491,18 @@ A human needs to decide whether to revise this proposal, close it, or accept it 
   && gh issue edit <number> --remove-label "loom:evaluating" --add-label "loom:operator-only"
 ```
 
+When you arrive here via `ESCALATE_UNREVISED=yes`, you have not re-run the 8 criteria — and must not. The proposal's title and body are byte-identical to the revision the prior verdict was written against, so the verdict is unchanged by construction: lift the **Recurring findings** verbatim from that prior `NEEDS REVISION` comment (`$COMMENT_BODY`, fetched by the idempotency check) rather than re-deriving them.
+
 `loom:operator-only` removes the issue from every future promotion pass (see "When NOT to Promote" in Batch Processing below), so this escalation comment posts exactly once per issue.
 
-**Otherwise** (first or second rejection, not yet routed): leave detailed feedback, keep the original proposal label, and release the claim in the same command:
+**Otherwise** (first or second evaluation, not yet routed): leave detailed feedback, keep the original proposal label, and release the claim in the same command:
 
 ```bash
+# Both markers are load-bearing: $VERDICT_MARKER makes the next cycle skip
+# silently; the skip tally (seeded at 0) is what that silent skip increments, so
+# the proposal still escalates on schedule while staying quiet (#4967).
 gh issue comment <number> --body "$VERDICT_MARKER
+<!-- champion:unrevised-skips:$BODY_HASH:0 -->
 **Champion Review: NEEDS REVISION**
 
 This issue requires additional work before promotion to \`loom:issue\`:
@@ -430,7 +521,7 @@ Keeping original proposal label. The proposing role or issue author can address 
   && gh issue edit <number> --remove-label "loom:evaluating"
 ```
 
-The `$VERDICT_MARKER` (computed in "Idempotency check" above, keyed to a hash of this issue's title + body) is what makes the next cycle's idempotency check skip silently instead of re-evaluating — omitting it, or substituting a timestamp-keyed marker, reopens the duplicate-comment loop this section exists to close.
+The `$VERDICT_MARKER` (computed in "Idempotency check" above, keyed to a hash of this issue's title + body) is what makes the next cycle's idempotency check skip silently instead of re-evaluating — omitting it, or substituting a timestamp-keyed marker, reopens the duplicate-comment loop this section exists to close. The `champion:unrevised-skips:$BODY_HASH:0` line beside it seeds the silent-skip tally — omitting **that** reopens the opposite failure (#4967): the skips become free, `UNREVISED_EVALS` never advances past `PRIOR_REJECTIONS`, and an unrevised proposal is skipped quietly forever instead of escalating. Both markers ship together or neither works; see "Bounding the silent skip" above.
 
 Do NOT remove the proposal label (`loom:curated`, `loom:architect`, `loom:hermit`, or `loom:auditor`) when rejecting.
 
@@ -447,7 +538,16 @@ Work through all available curated issues, applying the tier-based rate limits t
 
 Continue evaluating issues until all have been processed or all applicable tier limits are reached. This prevents issues from waiting unnecessarily across multiple 10-minute intervals when they've already met quality criteria.
 
-**Per-issue order in the loop**: run the "Idempotency check" first (skip silently on a marker match, no claim taken), then the "Claim" step (skip if a concurrent evaluation holds a fresh `loom:evaluating`, reclaim if stale) — both from "Concurrency Guard and Idempotency" above — before Step 1 (Read). A skip at either point means: continue the loop to the next issue, do not count it against the tier limits (it was neither promoted nor rejected this pass).
+**Per-issue order in the loop**: run the "Idempotency check" first, then the "Claim" step (skip if a concurrent evaluation holds a fresh `loom:evaluating`, reclaim if stale) — both from "Concurrency Guard and Idempotency" above — before Step 1 (Read). The idempotency check has **three** outcomes, not two:
+
+| Idempotency outcome | Next action |
+|---|---|
+| No marker match (new or revised proposal) | Claim → Step 1 (Read) → Step 2 (Evaluate) → Step 3 or 4 |
+| Marker match, `UNREVISED_EVALS < ${LOOM_MAX_UNREVISED_EVALUATIONS:-2}` | Tally the skip (`PATCH` the existing verdict comment), continue the loop to the next issue |
+| Marker match, budget exhausted (`ESCALATE_UNREVISED=yes`) | Claim → **Step 4's escalation branch directly** (skip Steps 1–3: the text is unchanged, so re-evaluating cannot change the verdict) |
+| Marker match, `ALREADY_ROUTED=yes` | Continue the loop — no tally, no escalation; a human already owns it |
+
+A skip (either the idempotency skip or a fresh-claim skip) means: continue the loop to the next issue, do not count it against the tier limits (it was neither promoted nor rejected this pass). An escalation **is** a verdict — count it as you would a rejection.
 
 ### When NOT to Promote
 
