@@ -32,5 +32,5 @@ server-side:
 A search-over-history feature built on that stack lives in the existing
 Rust/Workers dashboard backend, not a re-introduced Python toolchain.
 
-See [ADR-0013](../../docs/adr/0013-loom-tools-python-retirement.md) for the
-full retirement history of `loom-tools/`.
+See [ADR-0013](https://github.com/rjwalters/loom/blob/main/docs/adr/0013-loom-tools-python-retirement.md)
+for the full retirement history of `loom-tools/`.
