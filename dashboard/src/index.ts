@@ -20,7 +20,11 @@
  *     <ingest_key>`. See `handleIngest` below for the full contract.
  *
  *   POST /admin/hosts               — provision a new host + ingest key.
- *   POST /admin/hosts/:hostId/revoke — revoke a host's key.
+ *   POST /admin/hosts/:hostId/revoke — revoke a host's ingest key AND clear
+ *                                      its `FleetState` Durable Object
+ *                                      entries (issue #4957) — the
+ *                                      dashboard's "this host is gone"
+ *                                      signal.
  *   POST /admin/retention/run       — run the retention sweep on demand
  *                                      (the cron `scheduled()` handler runs
  *                                      the same sweep hourly).
@@ -324,6 +328,24 @@ async function handleRevokeHost(env: Env, hostId: string): Promise<Response> {
     .run();
   if ((result.meta.changes ?? 0) === 0) {
     return jsonError(404, `host_id "${hostId}" not found or already revoked`);
+  }
+  // Issue #4957 AC: "fleet drain removes the host's live-state entries" —
+  // this is the dashboard's own "this host is gone" signal (there is no
+  // separate drain concept at this layer), so it also clears the Durable
+  // Object's `health:`/`tokens:` entries for it, rather than leaving a
+  // revoked host's last-known numbers rendering as current until the
+  // 7-day prune horizon (`fleetState.ts`'s `PRUNE_AFTER_MS`) catches up.
+  // Best-effort: a DO hiccup here must not fail the revoke itself — the
+  // D1 key revocation (above) is the security-relevant half of this route,
+  // already committed by the time this runs.
+  try {
+    await fleetStateStub(env).fetch("https://fleet-state/remove-host", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ hostId }),
+    });
+  } catch (err) {
+    console.error(`fleet-state remove-host failed for "${hostId}":`, err);
   }
   return new Response(JSON.stringify({ host_id: hostId, revoked: true }), {
     status: 200,

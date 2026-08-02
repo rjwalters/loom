@@ -57,6 +57,7 @@
  * reads `/public/*`; the authenticated variant only ever reads `/api/*`.
  */
 
+import { classifyFreshness, type FreshnessInfo, type HostFreshness } from "./fleetState";
 import type { HistoryQueryResult, HistoryRecord } from "./query";
 import type { PublicActiveSweep, RedactedFleetSnapshot } from "./redaction";
 
@@ -133,28 +134,98 @@ function renderActiveSweepRow(sweep: PublicActiveSweep): string {
   </tr>`;
 }
 
-function renderHostHealthRow(hostId: string, health?: { record: Record<string, unknown>; updatedAt: string }): string {
+// ---------------------------------------------------------------------------
+// Host staleness (issue #4957): LIVE/STALE/OFFLINE, not a raw timestamp
+// forever presented as current — see `fleetState.ts`'s `classifyFreshness`
+// for the shared cadence/boundary policy this page renders faithfully
+// rather than reimplements.
+// ---------------------------------------------------------------------------
+
+const FRESHNESS_LABEL: Readonly<Record<HostFreshness, string>> = {
+  live: "LIVE",
+  stale: "STALE",
+  offline: "OFFLINE",
+};
+
+/** "just now" / "5m ago" / "3h ago" / "2d ago" — coarse enough to read at a
+ * glance, exact enough to distinguish "missed one sample" from "gone for
+ * days"; the full ISO timestamp is always still available in the cell's
+ * `title` attribute for anyone who wants precision. */
+function formatAge(ageSeconds: number): string {
+  if (!Number.isFinite(ageSeconds)) return "unknown";
+  if (ageSeconds < 60) return "just now";
+  const minutes = Math.floor(ageSeconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
+}
+
+/** The freshness badge + "last seen …" qualifier — rendered directly beside
+ * every cell of host detail so a stale sample's numbers are never shown
+ * without it (issue #4957's AC: "its stale metrics are never displayed as
+ * current"). */
+function renderFreshnessBadge(freshness: FreshnessInfo, updatedAt: string): string {
+  return (
+    `<span class="freshness-badge freshness-badge--${freshness.status}">${FRESHNESS_LABEL[freshness.status]}</span> ` +
+    `<span class="muted" title="${escapeHtml(updatedAt)}">last seen ${escapeHtml(formatAge(freshness.ageSeconds))}</span>`
+  );
+}
+
+function renderHostHealthRow(
+  hostId: string,
+  health: { record: Record<string, unknown>; updatedAt: string } | undefined,
+  now: Date,
+): string {
   if (!health) return "";
-  return `<tr>
+  const freshness = classifyFreshness(health.updatedAt, now);
+  return `<tr class="freshness-${freshness.status}">
     <td>${escapeHtml(hostId)}</td>
-    <td>${escapeHtml(health.updatedAt)}</td>
+    <td>${renderFreshnessBadge(freshness, health.updatedAt)}</td>
     <td>${formatDetails("host.health", health.record)}</td>
   </tr>`;
 }
 
-export function renderFleetOverview(snapshot: RedactedFleetSnapshot): string {
+/** "3 hosts: 2 live, 1 offline (robb-pro, last seen 5h ago)" — the overview
+ * heading's explicit totals (issue #4957's AC). Hosts with no `health` entry
+ * at all (known only from `activeSweeps`) are counted in `hostIds.length`
+ * but contribute no freshness bucket — nothing to classify. */
+function renderFreshnessSummary(hostIds: readonly string[], hosts: RedactedFleetSnapshot["hosts"], now: Date): string {
+  const counts: Record<HostFreshness, number> = { live: 0, stale: 0, offline: 0 };
+  const offlineDescriptions: string[] = [];
+  for (const hostId of hostIds) {
+    const health = hosts[hostId]?.health;
+    if (!health) continue;
+    const freshness = classifyFreshness(health.updatedAt, now);
+    counts[freshness.status] += 1;
+    if (freshness.status === "offline") {
+      offlineDescriptions.push(`${hostId}, last seen ${formatAge(freshness.ageSeconds)}`);
+    }
+  }
+  const reporting = counts.live + counts.stale + counts.offline;
+  if (reporting === 0) return "";
+
+  const parts = [`${counts.live} live`];
+  if (counts.stale > 0) parts.push(`${counts.stale} stale`);
+  if (counts.offline > 0) parts.push(`${counts.offline} offline (${offlineDescriptions.join("; ")})`);
+  return `: ${parts.join(", ")}`;
+}
+
+export function renderFleetOverview(snapshot: RedactedFleetSnapshot, now: Date = new Date()): string {
   const hostIds = Object.keys(snapshot.hosts).sort();
   const healthRows = hostIds
-    .map((id) => renderHostHealthRow(id, snapshot.hosts[id]?.health))
+    .map((id) => renderHostHealthRow(id, snapshot.hosts[id]?.health, now))
     .filter((row) => row.length > 0)
     .join("\n");
   const sweepRows = snapshot.activeSweeps.map(renderActiveSweepRow).join("\n");
+  const freshnessSummary = renderFreshnessSummary(hostIds, snapshot.hosts, now);
 
   return `<section id="fleet-overview">
     <h2>Fleet overview</h2>
-    <h3>Hosts (${hostIds.length})</h3>
+    <h3>Hosts (${hostIds.length})${escapeHtml(freshnessSummary)}</h3>
     <table>
-      <thead><tr><th>Host</th><th>Last health update</th><th>Detail</th></tr></thead>
+      <thead><tr><th>Host</th><th>Status</th><th>Detail</th></tr></thead>
       <tbody>${healthRows || `<tr><td colspan="3" class="muted">No host health reported yet.</td></tr>`}</tbody>
     </table>
     <h3>Active sweeps (${snapshot.activeSweeps.length})</h3>
@@ -291,6 +362,11 @@ const PAGE_STYLE = `
   th { background: #f0f0f0; }
   .muted { color: #999; font-style: italic; }
   section { margin-bottom: 2.5rem; }
+  .freshness-badge { display: inline-block; padding: 0.1rem 0.4rem; border-radius: 0.25rem; font-size: 0.75rem; font-weight: 600; }
+  .freshness-badge--live { background: #d7f5dd; color: #1a7431; }
+  .freshness-badge--stale { background: #fff1cc; color: #8a6100; }
+  .freshness-badge--offline { background: #f3d4d4; color: #8a1f1f; }
+  tr.freshness-stale td, tr.freshness-offline td { color: #888; }
 `;
 
 /** Options for {@link renderPublicPage} distinguishing the two callers that

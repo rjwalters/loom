@@ -308,4 +308,36 @@ describe("POST /admin/hosts/:hostId/revoke", () => {
     const ingestResponse = await callWorker(ingestRequest([sweepStartedEnvelope()], "Bearer abc-ingest-key"));
     expect(ingestResponse.status).toBe(401);
   });
+
+  // Issue #4957 AC: "fleet drain removes the host's live-state entries" —
+  // revoking a host is the dashboard's own retirement signal, so it must
+  // also clear that host's `FleetState` Durable Object entries rather than
+  // leaving its last-known health/tokens rendering as current indefinitely.
+  it("clears the host's FleetState Durable Object entries (health/tokens)", async () => {
+    await callWorker(ingestRequest([hostHealthEnvelope()], "Bearer abc-ingest-key"));
+
+    const beforeSnapshot = await callWorker(
+      new Request("https://ingest.example/admin/fleet-state", {
+        headers: { authorization: "Bearer test-admin-token" },
+      }),
+    );
+    const before = (await beforeSnapshot.json()) as { hosts: Record<string, unknown> };
+    expect(before.hosts).toHaveProperty("host-abc");
+
+    const revokeResponse = await callWorker(
+      new Request("https://ingest.example/admin/hosts/host-abc/revoke", {
+        method: "POST",
+        headers: { authorization: "Bearer test-admin-token" },
+      }),
+    );
+    expect(revokeResponse.status).toBe(200);
+
+    const afterSnapshot = await callWorker(
+      new Request("https://ingest.example/admin/fleet-state", {
+        headers: { authorization: "Bearer test-admin-token" },
+      }),
+    );
+    const after = (await afterSnapshot.json()) as { hosts: Record<string, unknown> };
+    expect(after.hosts).not.toHaveProperty("host-abc");
+  });
 });

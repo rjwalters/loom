@@ -199,6 +199,80 @@ describe("renderFleetOverview — redaction", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Host staleness (issue #4957): LIVE/STALE/OFFLINE, not a raw timestamp
+// rendered as current forever.
+// ---------------------------------------------------------------------------
+
+function snapshotWithHealthUpdatedAt(updatedAt: string): RedactedFleetSnapshot {
+  return {
+    hosts: {
+      "host-abc": {
+        health: {
+          record: { kind: "host.health", captured_at: updatedAt, uptime_sec: 100, logical_cpus: 8 },
+          updatedAt,
+        },
+      },
+    },
+    activeSweeps: [],
+  };
+}
+
+describe("renderFleetOverview — host staleness (issue #4957)", () => {
+  const NOW = new Date("2026-08-02T12:00:00Z");
+
+  it("a host that reported 1 minute ago renders LIVE", () => {
+    const html = renderFleetOverview(snapshotWithHealthUpdatedAt("2026-08-02T11:59:00Z"), NOW);
+    expect(html).toContain("freshness-badge--live");
+    expect(html).toContain("LIVE");
+    expect(html).not.toContain("freshness-badge--stale");
+    expect(html).not.toContain("freshness-badge--offline");
+  });
+
+  it("a host that reported 1 hour ago renders STALE with a last-seen age", () => {
+    const html = renderFleetOverview(snapshotWithHealthUpdatedAt("2026-08-02T11:00:00Z"), NOW);
+    expect(html).toContain("freshness-badge--stale");
+    expect(html).toContain("STALE");
+    expect(html).toContain("last seen 1h ago");
+  });
+
+  it("a host that reported 2 days ago renders OFFLINE with a last-seen age", () => {
+    const html = renderFleetOverview(snapshotWithHealthUpdatedAt("2026-07-31T12:00:00Z"), NOW);
+    expect(html).toContain("freshness-badge--offline");
+    expect(html).toContain("OFFLINE");
+    expect(html).toContain("last seen 2d ago");
+  });
+
+  it("never renders a health row's numeric detail fields without an adjacent freshness badge + age qualifier", () => {
+    for (const updatedAt of ["2026-08-02T11:59:30Z", "2026-08-02T11:00:00Z", "2026-07-31T12:00:00Z"]) {
+      const html = renderFleetOverview(snapshotWithHealthUpdatedAt(updatedAt), NOW);
+      // Every row that carries `uptime_sec=100` (the numeric metric) must
+      // also carry a freshness badge and a "last seen" qualifier — i.e. the
+      // metric is never presented bare, regardless of how stale it is.
+      const row = html.slice(html.indexOf("<tbody>"), html.indexOf("</tbody>"));
+      expect(row).toContain("uptime_sec=100");
+      expect(row).toMatch(/freshness-badge--(live|stale|offline)/);
+      expect(row).toContain("last seen");
+    }
+  });
+
+  it("the Hosts heading reports explicit live/stale/offline totals with offline hosts named", () => {
+    const snapshot: RedactedFleetSnapshot = {
+      hosts: {
+        "host-live": {
+          health: { record: { kind: "host.health" }, updatedAt: "2026-08-02T11:59:30Z" },
+        },
+        "host-offline": {
+          health: { record: { kind: "host.health" }, updatedAt: "2026-07-31T12:00:00Z" },
+        },
+      },
+      activeSweeps: [],
+    };
+    const html = renderFleetOverview(snapshot, NOW);
+    expect(html).toContain("Hosts (2): 1 live, 1 offline (host-offline, last seen 2d ago)");
+  });
+});
+
 describe("renderHistoryTable — redaction", () => {
   it("a private-repo record renders zero occurrences of the repo name, issue title, branch name, or PR link", () => {
     const html = renderHistoryTable(historyFixture());
