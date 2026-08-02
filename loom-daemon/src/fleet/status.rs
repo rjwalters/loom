@@ -148,6 +148,41 @@ impl SafehousedProbe {
     }
 }
 
+/// The local host's own tailnet self-check result (#4952). Mirrors
+/// [`SafehousedProbe`]'s three-way shape — a cheap best-effort probe that
+/// must never fail the whole report — but is explicitly **local-only**: run
+/// once, in-process (never over SSH), only when
+/// [`all_tailnet_hosts_unreachable`] flags every tailnet-addressed remote
+/// roster host as [`HostState::Unreachable`]. That pattern (every tailnet
+/// peer failing simultaneously) is indistinguishable from a genuine
+/// multi-host outage without this check — see the module doc's 2026-08-02
+/// incident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalTailnetState {
+    /// The local `tailscale` client reports the tailnet is up/running.
+    Up,
+    /// The local `tailscale` client reports the tailnet is down/stopped —
+    /// the tell this issue exists for: the correct diagnosis (and
+    /// one-command fix) is on the local host, not a fleet-wide outage.
+    Down,
+    /// `tailscale` ran but its output could not be conclusively classified —
+    /// degrade to "unknown" rather than misreporting either up or down.
+    Unknown,
+}
+
+impl LocalTailnetState {
+    /// Fixed label for the human banner / `--json` twin.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            LocalTailnetState::Up => "up",
+            LocalTailnetState::Down => "down",
+            LocalTailnetState::Unknown => "unknown",
+        }
+    }
+}
+
 // ===========================================================================
 // Per-host report
 // ===========================================================================
@@ -542,6 +577,17 @@ pub async fn collect_remote_host(
 pub struct FleetStatusReport {
     pub hosts: Vec<HostReport>,
     pub summary: FleetStatusSummary,
+    /// #4952: the local tailnet self-check result. `None` when the check was
+    /// never run — either [`all_tailnet_hosts_unreachable`] was `false` (no
+    /// reason to suspect a local tailnet outage) or the `tailscale` CLI is
+    /// not installed on this host (AC 4 — a missing CLI must not become a
+    /// new hard dependency, so the caller skips the check silently rather
+    /// than erroring). Populated by the caller
+    /// (`handle_fleet_status_command`) after [`collect_fleet_report`]
+    /// returns, since the check itself is a local shell-out, not part of the
+    /// SSH fanout this module owns.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_tailnet: Option<LocalTailnetState>,
 }
 
 /// Roll-up counts across [`FleetStatusReport::hosts`].
@@ -607,7 +653,38 @@ pub async fn collect_fleet_report(
     }
 
     let summary = summarize(&hosts, empty_roster);
-    FleetStatusReport { hosts, summary }
+    FleetStatusReport {
+        hosts,
+        summary,
+        local_tailnet: None,
+    }
+}
+
+/// #4952 AC 1 + AC 3: true when every remote roster host that has a tailnet
+/// address ([`HostReport::tailnet_name`] is `Some`) is
+/// [`HostState::Unreachable`] — the trigger condition for the local tailnet
+/// self-check. The local host row is always excluded (it is never collected
+/// over the tailnet-dependent SSH path). A host with no tailnet address
+/// (plain LAN/SSH) is also excluded from the inference (AC 3), so a mixed
+/// roster can still surface a genuine partial outage through those hosts'
+/// own states.
+///
+/// Vacuously `false` when there are no tailnet-addressed remote hosts at all
+/// — with nothing to infer from, there is no reason to suspect a local
+/// tailnet outage.
+#[must_use]
+pub fn all_tailnet_hosts_unreachable(hosts: &[HostReport]) -> bool {
+    let mut saw_tailnet_host = false;
+    for host in hosts {
+        if host.is_local || host.tailnet_name.is_none() {
+            continue;
+        }
+        saw_tailnet_host = true;
+        if host.state != HostState::Unreachable {
+            return false;
+        }
+    }
+    saw_tailnet_host
 }
 
 /// After a `fleet status` poll, refresh [`WorkerRecord::last_seen_up_at`] for
@@ -696,6 +773,16 @@ impl FleetStatusReport {
                 "  (no fleet workers registered — showing the local host only; \
                  add one with `loom-daemon fleet add-worker <ssh-host> --repo <owner/name>`)\n",
             );
+        }
+        if self.local_tailnet == Some(LocalTailnetState::Down) {
+            out.push_str(concat!(
+                "  !!! LOCAL TAILNET DOWN — remote states below are UNKNOWN, not a confirmed ",
+                "fleet outage !!!\n",
+                "      every tailnet-addressed roster host below reports UNREACHABLE because ",
+                "the tailnet client on THIS host is down, not because those hosts are down.\n",
+                "      restart it, then re-run `fleet status`: `tailscale up` (or, on macOS, ",
+                "`open -a Tailscale`).\n",
+            ));
         }
         out.push_str(&format!(
             "  {:<20} {:<12} {:<16} {:<8} {:<10} {:<8}\n",
@@ -977,6 +1064,7 @@ mod tests {
                 },
             ],
             summary: summarize(&[], false),
+            local_tailnet: None,
         };
 
         let now = Utc::now();
@@ -1029,6 +1117,133 @@ mod tests {
         assert_eq!(report.summary.unreachable, 1);
         assert_eq!(report.summary.parse_error, 1);
         assert!(!report.summary.empty_roster);
+    }
+
+    // ---- all_tailnet_hosts_unreachable / LOCAL TAILNET DOWN banner (#4952) --
+
+    fn host_report(alias: &str, tailnet_name: Option<&str>, state: HostState) -> HostReport {
+        HostReport {
+            alias: alias.to_string(),
+            tailnet_name: tailnet_name.map(str::to_string),
+            provider_instance_id: None,
+            added_by: None,
+            is_local: false,
+            state,
+            workspaces: Vec::new(),
+            status: None,
+            detail: None,
+            safehoused: SafehousedProbe::Unknown,
+        }
+    }
+
+    #[test]
+    fn all_tailnet_hosts_unreachable_true_when_every_tailnet_host_is_unreachable() {
+        let hosts = vec![
+            HostReport::local_up(serde_json::json!({})),
+            host_report("worker-1", Some("loom-worker-1"), HostState::Unreachable),
+            host_report("worker-2", Some("loom-worker-2"), HostState::Unreachable),
+        ];
+        assert!(all_tailnet_hosts_unreachable(&hosts));
+    }
+
+    #[test]
+    fn all_tailnet_hosts_unreachable_false_when_one_tailnet_host_is_up() {
+        let hosts = vec![
+            host_report("worker-1", Some("loom-worker-1"), HostState::Unreachable),
+            host_report("worker-2", Some("loom-worker-2"), HostState::Up),
+        ];
+        assert!(!all_tailnet_hosts_unreachable(&hosts));
+    }
+
+    /// AC 3: a mixed roster where a plain LAN/SSH host (no tailnet address)
+    /// is also unreachable must NOT be swallowed into the tailnet inference —
+    /// its own unreachable state is excluded from (not required by) the
+    /// trigger condition, so a genuine partial outage on that host still
+    /// surfaces on its own merits elsewhere in the report.
+    #[test]
+    fn all_tailnet_hosts_unreachable_excludes_hosts_without_tailnet_address() {
+        let hosts = vec![
+            host_report("worker-1", Some("loom-worker-1"), HostState::Unreachable),
+            host_report("lan-host", None, HostState::Unreachable),
+        ];
+        assert!(all_tailnet_hosts_unreachable(&hosts));
+
+        // And a non-tailnet host that is merely Up doesn't change the
+        // outcome either — it plays no part in the inference either way.
+        let hosts2 = vec![
+            host_report("worker-1", Some("loom-worker-1"), HostState::Unreachable),
+            host_report("lan-host", None, HostState::Up),
+        ];
+        assert!(all_tailnet_hosts_unreachable(&hosts2));
+    }
+
+    #[test]
+    fn all_tailnet_hosts_unreachable_false_when_no_tailnet_hosts_registered() {
+        // Vacuous case: nothing tailnet-addressed to infer from at all —
+        // must not spuriously trigger the self-check.
+        let hosts = vec![
+            HostReport::local_up(serde_json::json!({})),
+            host_report("lan-host", None, HostState::Unreachable),
+        ];
+        assert!(!all_tailnet_hosts_unreachable(&hosts));
+    }
+
+    #[test]
+    fn render_human_shows_local_tailnet_down_banner_and_names_restart_action() {
+        let hosts = vec![
+            HostReport::local_up(serde_json::json!({})),
+            host_report("worker-1", Some("loom-worker-1"), HostState::Unreachable),
+        ];
+        let summary = summarize(&hosts, false);
+        let report = FleetStatusReport {
+            hosts,
+            summary,
+            local_tailnet: Some(LocalTailnetState::Down),
+        };
+
+        let rendered = report.render_human();
+        assert!(rendered.contains("LOCAL TAILNET DOWN"));
+        assert!(rendered.contains("tailscale up"));
+        // The per-host UNREACHABLE row is still present underneath the
+        // banner (AC 2 reframes it, it does not hide it).
+        assert!(rendered.contains("UNREACHABLE"));
+    }
+
+    /// Regression guard: when the local tailnet check reports `Up` (or was
+    /// never run, i.e. `None`), rendering is unchanged from before #4952 —
+    /// no banner, plain UNREACHABLE reporting.
+    #[test]
+    fn render_human_omits_banner_when_local_tailnet_is_up_or_unchecked() {
+        let hosts = vec![host_report(
+            "worker-1",
+            Some("loom-worker-1"),
+            HostState::Unreachable,
+        )];
+        let base_summary = summarize(&hosts, false);
+
+        let up_report = FleetStatusReport {
+            hosts: hosts.clone(),
+            summary: base_summary.clone(),
+            local_tailnet: Some(LocalTailnetState::Up),
+        };
+        assert!(!up_report.render_human().contains("LOCAL TAILNET DOWN"));
+
+        let unchecked_report = FleetStatusReport {
+            hosts,
+            summary: base_summary,
+            local_tailnet: None,
+        };
+        assert!(!unchecked_report
+            .render_human()
+            .contains("LOCAL TAILNET DOWN"));
+    }
+
+    /// #4952 AC 4: empty roster + no tailnet hosts at all must not panic and
+    /// must not spuriously trigger the self-check condition.
+    #[test]
+    fn empty_roster_never_triggers_tailnet_inference() {
+        assert!(!all_tailnet_hosts_unreachable(&[HostReport::local_up(serde_json::json!({}))]));
+        assert!(!all_tailnet_hosts_unreachable(&[]));
     }
 
     /// #4697: end-to-end through `collect_fleet_report`, an idle-shutdown-
