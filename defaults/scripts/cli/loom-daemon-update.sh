@@ -124,6 +124,7 @@
 #   ./.loom/scripts/cli/loom-daemon-update.sh --no-restart  Rebuild + provision only; leave the running daemon untouched
 #   ./.loom/scripts/cli/loom-daemon-update.sh --relaunch    Launchd/systemd only: after a refused restart, re-render the plist/unit and relaunch under supervision (SIGTERMs the daemon so sweep children reparent; preserves the live LOOM_* env)
 #   ./.loom/scripts/cli/loom-daemon-update.sh --allow-stale Skip the default ff-first sync with origin/<default-branch> and build the current (possibly stale) checkout as-is (#4330) — for deliberate use: bisecting, testing a local patch
+#   ./.loom/scripts/cli/loom-daemon-update.sh --auto-resolve-safe-abort  When the ff-only sync would otherwise hard-abort (#4330), auto-perform the fix IF the blocking state classifies as safe (#4951): content-identical diverged commits (`git reset --hard origin/<default-branch>`), or dirty tracked files that are ALL Loom-managed installed copies (`git checkout --` them + re-run resync-installed.sh). Any other cause (genuine content divergence, or any unmanaged dirty file) still hard-aborts unchanged — this flag never widens what's classified as safe, only whether the safe cases are printed (default) or performed
 #   ./.loom/scripts/cli/loom-daemon-update.sh --help
 #
 # Environment:
@@ -195,7 +196,12 @@
 #      (diverged local commits, a dirty tracked file conflicting with the
 #      incoming change, or HEAD is not on <default-branch>) — the script
 #      NEVER guesses or hard-resets; resolve manually or pass --allow-stale
-#      (#4330)
+#      (#4330). Two of the ff-abort causes classify as safely resolvable
+#      (#4951): content-identical diverged commits, or dirty tracked files
+#      that are ALL Loom-managed installed copies — by default these still
+#      exit 1 but the abort message names the exact safe command; pass
+#      --auto-resolve-safe-abort to have the script perform it instead (exit
+#      0 on success). Any other cause still hard-aborts unchanged.
 #   3  (--check only) update available
 #   4  build verification FAILED: the freshly-built binary's embedded commit
 #      does not match the source HEAD it was built from. This is a BUILD-SYSTEM
@@ -527,6 +533,7 @@ CHECK_ONLY=false
 NO_RESTART=false
 RELAUNCH=false
 ALLOW_STALE=false
+AUTO_RESOLVE_SAFE_ABORT=false
 [[ "${LOOM_DAEMON_UPDATE_RELAUNCH:-}" =~ ^(1|true|yes)$ ]] && RELAUNCH=true
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -537,6 +544,7 @@ while [[ $# -gt 0 ]]; do
         --no-restart) NO_RESTART=true; shift ;;
         --relaunch) RELAUNCH=true; shift ;;
         --allow-stale) ALLOW_STALE=true; shift ;;
+        --auto-resolve-safe-abort) AUTO_RESOLVE_SAFE_ABORT=true; shift ;;
         *) err "Unknown option '$1'"; echo "Use --help for usage" >&2; exit 1 ;;
     esac
 done
@@ -623,6 +631,146 @@ ORIGIN_COMMIT="unknown"
 ORIGIN_BEHIND_COUNT=0
 FF_SYNCED=false
 
+# ---------- ff-abort classification (#4951) ----------
+# The `git merge --ff-only` failure branch below used to emit ONE generic
+# "resolve manually" message for two structurally distinct, often-safe
+# failure shapes (surfaced by the 2026-08-02 fleet roll aborting on 2/3
+# hosts on local state that turned out to be safely resolvable by hand).
+# These helpers classify which shape applies so the abort message can name
+# (or, with --auto-resolve-safe-abort, perform) the exact safe resolution
+# instead of a bare "resolve manually".
+#
+# Safety note: this is the safety-critical branch of loom-daemon-update.sh —
+# #4381 was a live incident where an update-script code path silently
+# overwrote a real production binary; the same "automation quietly does
+# something destructive to real machine state" risk applies here. Do NOT
+# widen either check below (e.g. a loose substring/prefix match, or an
+# empty-diff check that misses a rename/mode-only change) beyond exactly
+# what's specified in #4951 — when genuinely unsure, both helpers must
+# return false so the caller falls through to the existing hard abort.
+
+# True (exit 0) iff local <default> and origin/<default> are content-IDENTICAL
+# despite having diverged in commit history (e.g. a resync commit + its own
+# revert nets to no change). Deliberately the plain three-dot merge-base diff
+# form with no rename-detection flags, matching the incident's own manual
+# check (`git diff origin/main...main`); `git diff --quiet` also treats a
+# mode-only change as non-empty, which is the conservative (safe) direction.
+#
+# Only meaningful when local <default> has commit(s) NOT reachable from
+# origin/<default> (a genuine history divergence) — the `--is-ancestor` guard
+# below is load-bearing, not an optimization: when local <default> IS an
+# ancestor of origin/<default> (the far more common shape: origin simply
+# advanced and local added no commits of its own), the three-dot form trivially
+# reduces to diffing local HEAD against itself (merge-base == local HEAD),
+# which is ALWAYS empty regardless of what origin changed — so without this
+# guard, every plain "blocked by a dirty tracked file" ff-abort (managed or
+# not) would misclassify as content-identical and risk an incorrect
+# `reset --hard` under --auto-resolve-safe-abort. In that ancestor case the ff
+# failure is necessarily a dirty/conflicting working-tree file instead, which
+# the OTHER classifier below is responsible for.
+_ff_abort_content_identical() {
+    local repo_root="$1" branch="$2"
+    if (cd "$repo_root" && git merge-base --is-ancestor "$branch" "origin/${branch}" 2>/dev/null); then
+        return 1
+    fi
+    (cd "$repo_root" && git diff --quiet "origin/${branch}...${branch}" -- 2>/dev/null)
+}
+
+# Loom-managed installed-surface prefixes/files this script is allowed to
+# discard local edits to when auto-resolving. MUST mirror
+# defaults/scripts/resync-installed.sh's own header comment (search "Surfaces
+# resynced" in that file) — that file, not this list, is the authoritative
+# source; update both together if it ever widens again (#4239 already widened
+# it once).
+_FF_ABORT_MANAGED_PREFIXES=(
+    ".loom/hooks/"
+    ".loom/scripts/"
+    ".loom/roles/"
+    ".loom/docs/"
+    ".loom/runtimes/"
+    ".loom/bin/"
+    ".claude/commands/loom/"
+)
+_FF_ABORT_MANAGED_FILES=(
+    ".loom/install-metadata.json"
+)
+
+# True (exit 0) iff the ONLY diff between the working tree's .gitignore and
+# HEAD's is inside the marker-delimited Loom-managed block (loom-daemon's
+# GITIGNORE_BEGIN_MARKER / GITIGNORE_END_MARKER, loom-daemon/src/init/post_init.rs)
+# — never the whole file, so a consumer's own hand-edited lines outside that
+# block are never silently discarded.
+_ff_abort_gitignore_only_managed_block_dirty() {
+    local repo_root="$1"
+    local file="$repo_root/.gitignore"
+    [[ -f "$file" ]] || return 1
+    local begin='# >>> loom-managed (do not edit) >>>'
+    local end='# <<< loom-managed <<<'
+    local working_stripped head_stripped
+    working_stripped=$(awk -v b="$begin" -v e="$end" 'BEGIN{skip=0} $0==b{skip=1;next} $0==e{skip=0;next} skip==0{print}' "$file" 2>/dev/null)
+    head_stripped=$(cd "$repo_root" && git show "HEAD:.gitignore" 2>/dev/null | awk -v b="$begin" -v e="$end" 'BEGIN{skip=0} $0==b{skip=1;next} $0==e{skip=0;next} skip==0{print}')
+    [[ "$working_stripped" == "$head_stripped" ]]
+}
+
+# True (exit 0) iff $2 (a repo-relative path from `git status --porcelain`) is
+# inside the managed installed-surface set above.
+_ff_abort_is_managed_path() {
+    local repo_root="$1" path="$2" p f
+    for f in "${_FF_ABORT_MANAGED_FILES[@]}"; do
+        [[ "$path" == "$f" ]] && return 0
+    done
+    for p in "${_FF_ABORT_MANAGED_PREFIXES[@]}"; do
+        [[ "$path" == "$p"* ]] && return 0
+    done
+    if [[ "$path" == ".gitignore" ]]; then
+        _ff_abort_gitignore_only_managed_block_dirty "$repo_root" && return 0
+    fi
+    return 1
+}
+
+# Populates the global array _FF_ABORT_DIRTY_MANAGED_PATHS and returns 0 iff
+# (a) at least one TRACKED file is dirty per `git status --porcelain`
+# (untracked `??` entries are excluded — they cannot conflict with a
+# fast-forward merge the way a dirty tracked file can) AND (b) EVERY one of
+# them is a managed path. Conjunctive by design, matching the issue's "every
+# blocking file" wording: one unmanaged dirty file alongside managed ones
+# still falls through to the hard abort.
+_FF_ABORT_DIRTY_MANAGED_PATHS=()
+_ff_abort_all_dirty_tracked_managed() {
+    local repo_root="$1"
+    _FF_ABORT_DIRTY_MANAGED_PATHS=()
+    local line status path found_any=false
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        status="${line:0:2}"
+        [[ "$status" == '??' ]] && continue
+        path="${line:3}"
+        if [[ "$path" == *" -> "* ]]; then
+            path="${path##* -> }"
+        fi
+        path="${path%\"}"
+        path="${path#\"}"
+        found_any=true
+        _ff_abort_is_managed_path "$repo_root" "$path" || return 1
+        _FF_ABORT_DIRTY_MANAGED_PATHS+=("$path")
+    done < <(cd "$repo_root" && git status --porcelain)
+    [[ "$found_any" == "true" ]]
+}
+
+# Best-effort resolve of resync-installed.sh under repo_root: the installed
+# copy first, else the shipped defaults/ source — same installed-then-defaults
+# precedence as resolve_lifecycle_script() above, adjusted for
+# resync-installed.sh living directly under scripts/, not scripts/cli/.
+_ff_abort_resolve_resync_script() {
+    local repo_root="$1" candidate
+    for candidate in \
+        "$repo_root/.loom/scripts/resync-installed.sh" \
+        "$repo_root/defaults/scripts/resync-installed.sh"; do
+        if [[ -x "$candidate" ]]; then echo "$candidate"; return 0; fi
+    done
+    echo ""
+}
+
 sync_with_origin() {
     local repo_root="$1"
     # shellcheck disable=SC1091
@@ -683,6 +831,50 @@ sync_with_origin() {
 
     echo "Local ${DEFAULT_BRANCH} is ${n} commit(s) behind origin/${DEFAULT_BRANCH} — fast-forwarding before building (default; pass --allow-stale to build the current checkout as-is)..."
     if ! (cd "$repo_root" && git merge --ff-only "origin/${DEFAULT_BRANCH}" --quiet); then
+        # Classify the failure (#4951) before falling back to the generic
+        # hard abort — see the "ff-abort classification" helpers above.
+        if _ff_abort_content_identical "$repo_root" "$DEFAULT_BRANCH"; then
+            warn "Fast-forward merge from origin/${DEFAULT_BRANCH} did not apply, but local ${DEFAULT_BRANCH} is content-IDENTICAL to origin/${DEFAULT_BRANCH} (git diff origin/${DEFAULT_BRANCH}...${DEFAULT_BRANCH} is empty) — local-only commit(s) that net to no change (e.g. a resync commit and its own revert)."
+            if [[ "$AUTO_RESOLVE_SAFE_ABORT" == "true" ]]; then
+                if (cd "$repo_root" && git reset --hard "origin/${DEFAULT_BRANCH}" --quiet); then
+                    ok "Auto-resolved (--auto-resolve-safe-abort): reset local ${DEFAULT_BRANCH} to origin/${DEFAULT_BRANCH}."
+                    FF_SYNCED=true
+                    return 0
+                fi
+                err "Auto-resolve (--auto-resolve-safe-abort) failed: 'git reset --hard origin/${DEFAULT_BRANCH}' did not succeed."
+                return 1
+            fi
+            err "Safe to resolve: git -C \"$repo_root\" reset --hard origin/${DEFAULT_BRANCH}"
+            err "Re-run with --auto-resolve-safe-abort to perform this automatically, or run the command above by hand."
+            return 1
+        fi
+        if _ff_abort_all_dirty_tracked_managed "$repo_root"; then
+            warn "Fast-forward merge from origin/${DEFAULT_BRANCH} was blocked by dirty tracked file(s), but ALL of them are Loom-managed installed copies (regenerated from defaults/ by resync-installed.sh, not real local work): ${_FF_ABORT_DIRTY_MANAGED_PATHS[*]}"
+            if [[ "$AUTO_RESOLVE_SAFE_ABORT" == "true" ]]; then
+                if (cd "$repo_root" && git checkout -- "${_FF_ABORT_DIRTY_MANAGED_PATHS[@]}") \
+                    && (cd "$repo_root" && git merge --ff-only "origin/${DEFAULT_BRANCH}" --quiet); then
+                    ok "Auto-resolved (--auto-resolve-safe-abort): discarded local edits to managed file(s) and fast-forwarded to origin/${DEFAULT_BRANCH}."
+                    local resync_script
+                    resync_script="$(_ff_abort_resolve_resync_script "$repo_root")"
+                    if [[ -n "$resync_script" ]]; then
+                        if (cd "$repo_root" && "$resync_script" >/dev/null 2>&1); then
+                            ok "Post-roll resync-installed.sh completed."
+                        else
+                            warn "Post-roll resync-installed.sh failed — run it by hand: $resync_script"
+                        fi
+                    else
+                        warn "Could not resolve resync-installed.sh — run it by hand after this update to re-sync managed files."
+                    fi
+                    FF_SYNCED=true
+                    return 0
+                fi
+                err "Auto-resolve (--auto-resolve-safe-abort) failed: discarding managed edits + fast-forward did not both succeed."
+                return 1
+            fi
+            err "Safe to resolve: git -C \"$repo_root\" checkout -- ${_FF_ABORT_DIRTY_MANAGED_PATHS[*]} && ./.loom/scripts/resync-installed.sh"
+            err "Re-run with --auto-resolve-safe-abort to perform this automatically, or run the commands above by hand."
+            return 1
+        fi
         err "Fast-forward merge from origin/${DEFAULT_BRANCH} did not apply — local commits have diverged, or a dirty tracked file conflicts with the incoming change."
         err "Refusing to guess or hard-reset: resolve manually (rebase/merge by hand), or pass --allow-stale to build the current (stale) checkout as-is."
         return 1
