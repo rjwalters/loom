@@ -343,12 +343,20 @@ export function redactFleetSnapshot(snapshot: FleetSnapshot, isAuthenticated: bo
       ? entry
       : {
           ...(entry.health && {
-            health: { record: redactPayload("host.health", entry.health.record), updatedAt: entry.health.updatedAt },
+            health: {
+              record: redactPayload("host.health", entry.health.record),
+              updatedAt: entry.health.updatedAt,
+              // Staleness (issue #4957) is derived, non-identifying timing
+              // metadata — same footing as `updatedAt` itself, so it passes
+              // through the redaction boundary unchanged for both viewers.
+              freshness: entry.health.freshness,
+            },
           }),
           ...(entry.tokens && {
             tokens: {
               record: redactPayload("tokens.snapshot", entry.tokens.record),
               updatedAt: entry.tokens.updatedAt,
+              freshness: entry.tokens.freshness,
             },
           }),
         };

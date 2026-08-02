@@ -40,12 +40,126 @@ export interface ActiveSweepState {
   updatedAt: string;
 }
 
+/**
+ * Staleness classification for a `health:`/`tokens:` entry, derived purely
+ * from how long ago the Durable Object applied it (`updatedAt` — the
+ * backend's own ingest clock, not the daemon's `captured_at`, so a
+ * skewed host clock can never fake liveness).
+ *
+ * Boundaries (issue #4957 — "dashboard renders last-known host state as
+ * current forever"):
+ *
+ *   - `live`    — within [`LIVE_AFTER_SEC`], roughly 2x the daemon's
+ *     ~5-minute `host.health`/`tokens.snapshot` sampling cadence
+ *     (`SNAPSHOT_INTERVAL` in `loom-daemon/src/observability/mod.rs`,
+ *     documented at `dashboard/docs/deploy-runbook.md` §10) — long enough
+ *     that ordinary batching/flush jitter never flickers a healthy host to
+ *     STALE, short enough to notice a genuinely stalled daemon quickly.
+ *     Matches the "3 missed samples" reasoning `dashboard/web/src/fleet.ts`'s
+ *     own (finer-grained) `STALE_AFTER_SEC` badge already uses.
+ *   - `stale`   — up to [`OFFLINE_AFTER_SEC`]: no longer "current", but a
+ *     single dropped push, a host asleep overnight, or a brief network blip
+ *     is not yet "gone".
+ *   - `offline` — beyond that: the daemon has very likely stopped, the host
+ *     is asleep/powered off, or it lost its tailnet — its last-known
+ *     numbers must never be presented as current (see `publicPage.ts`).
+ */
+export type HostFreshness = "live" | "stale" | "offline";
+
+/** How old an entry may be and still read as `live`. */
+export const LIVE_AFTER_SEC = 15 * 60;
+/** Beyond this, an entry reads as `offline` rather than merely `stale`. */
+export const OFFLINE_AFTER_SEC = 4 * 60 * 60;
+/** Entries older than this are pruned from the Durable Object entirely on
+ * the next [`FleetState.buildSnapshot`] — long enough that a host asleep
+ * over a long weekend does not vanish, short enough that a decommissioned
+ * host does not linger forever (issue #4957 AC: "long-gone hosts age out of
+ * the DO entirely"). */
+export const PRUNE_AFTER_MS = 7 * 24 * 60 * 60 * 1000;
+
+export interface FreshnessInfo {
+  status: HostFreshness;
+  /** Seconds since `updatedAt`, floored at `0`. `Number.POSITIVE_INFINITY`
+   * for an unparseable `updatedAt` (never treated as fresh). */
+  ageSeconds: number;
+}
+
+/** Classify one `updatedAt` timestamp's freshness as of `now`. Exported so
+ * both this module's `buildSnapshot` and `publicPage.ts`'s rendering share
+ * exactly one cadence/boundary policy — see the module doc above. */
+export function classifyFreshness(updatedAt: string, now: Date = new Date()): FreshnessInfo {
+  const ageMs = now.getTime() - Date.parse(updatedAt);
+  if (!Number.isFinite(ageMs)) {
+    return { status: "offline", ageSeconds: Number.POSITIVE_INFINITY };
+  }
+  const ageSeconds = Math.max(0, Math.round(ageMs / 1000));
+  const status: HostFreshness =
+    ageSeconds <= LIVE_AFTER_SEC ? "live" : ageSeconds <= OFFLINE_AFTER_SEC ? "stale" : "offline";
+  return { status, ageSeconds };
+}
+
+/** `true` once an entry is old enough to be pruned from the Durable Object
+ * entirely — see [`PRUNE_AFTER_MS`]. An unparseable `updatedAt` is never
+ * pruned by this check (a `NaN` age fails every numeric comparison), which
+ * is the fail-safe direction: a malformed timestamp should surface as
+ * `offline` via [`classifyFreshness`], not silently vanish. */
+function isPruneable(updatedAt: string, now: Date): boolean {
+  return now.getTime() - Date.parse(updatedAt) > PRUNE_AFTER_MS;
+}
+
+type TimestampedEntry = { record: Record<string, unknown>; updatedAt: string };
+
+/** Pure core of [`FleetState.buildSnapshot`]'s host-classification/pruning
+ * step, split out so it is unit-testable without spinning up a Durable
+ * Object (issue #4957's test plan: "unit test buildSnapshot() classifies a
+ * health/tokens entry as LIVE/STALE/OFFLINE correctly at boundary ages").
+ * Takes the raw `storage.list()` results for both prefixes and returns the
+ * classified `hosts` map plus the full storage keys (`health:<hostId>` /
+ * `tokens:<hostId>`) that are old enough to prune — the instance method
+ * below is the only thing that actually touches `this.state.storage`.
+ */
+export function classifyAndPruneHosts(
+  healthEntries: ReadonlyMap<string, TimestampedEntry>,
+  tokenEntries: ReadonlyMap<string, TimestampedEntry>,
+  now: Date = new Date(),
+): { hosts: FleetSnapshot["hosts"]; pruneKeys: string[] } {
+  const hosts: FleetSnapshot["hosts"] = {};
+  const pruneKeys: string[] = [];
+
+  for (const [key, value] of healthEntries) {
+    if (isPruneable(value.updatedAt, now)) {
+      pruneKeys.push(key);
+      continue;
+    }
+    const hostId = key.slice("health:".length);
+    hosts[hostId] ??= {};
+    hosts[hostId].health = { ...value, freshness: classifyFreshness(value.updatedAt, now) };
+  }
+  for (const [key, value] of tokenEntries) {
+    if (isPruneable(value.updatedAt, now)) {
+      pruneKeys.push(key);
+      continue;
+    }
+    const hostId = key.slice("tokens:".length);
+    hosts[hostId] ??= {};
+    hosts[hostId].tokens = { ...value, freshness: classifyFreshness(value.updatedAt, now) };
+  }
+
+  return { hosts, pruneKeys };
+}
+
 export interface FleetSnapshot {
   hosts: Record<
     string,
     {
-      health?: { record: Record<string, unknown>; updatedAt: string };
-      tokens?: { record: Record<string, unknown>; updatedAt: string };
+      // `freshness` is optional on the *type* (older callers/fixtures that
+      // predate issue #4957 construct a bare `{ record, updatedAt }`) even
+      // though `FleetState.buildSnapshot` always populates it today —
+      // `publicPage.ts` recomputes it from `updatedAt` at render time via
+      // `classifyFreshness` regardless, rather than trusting this field, so
+      // its absence never silently hides a stale sample's age.
+      health?: { record: Record<string, unknown>; updatedAt: string; freshness?: FreshnessInfo };
+      tokens?: { record: Record<string, unknown>; updatedAt: string; freshness?: FreshnessInfo };
     }
   >;
   activeSweeps: ActiveSweepState[];
@@ -82,7 +196,32 @@ export class FleetState implements DurableObject {
       });
     }
 
+    if (request.method === "POST" && url.pathname === "/remove-host") {
+      const body = (await request.json()) as { hostId?: unknown };
+      const hostId = typeof body.hostId === "string" ? body.hostId : undefined;
+      if (!hostId) {
+        return new Response("hostId is required", { status: 400 });
+      }
+      await this.removeHost(hostId);
+      return new Response(null, { status: 204 });
+    }
+
     return new Response("not found", { status: 404 });
+  }
+
+  /**
+   * Remove a host's live-state entries (`health:<hostId>` / `tokens:<hostId>`)
+   * outright — the DO-side half of retiring a host (issue #4957 AC: "fleet
+   * drain removes the host's live-state entries"). Wired from
+   * `src/index.ts`'s `POST /admin/hosts/:hostId/revoke`, the dashboard's
+   * existing "this host is gone" signal — there is no separate "drain"
+   * concept at this layer. Does **not** touch that host's `sweep:<sweepId>`
+   * entries: an in-flight sweep on a host being revoked mid-run is a real
+   * anomaly worth surfacing (via its own staleness), not something this
+   * best-effort cleanup should paper over.
+   */
+  private async removeHost(hostId: string): Promise<void> {
+    await this.state.storage.delete([`health:${hostId}`, `tokens:${hostId}`]);
   }
 
   private async applyUpdate({ hostId, record }: FleetStateUpdate): Promise<void> {
@@ -153,23 +292,27 @@ export class FleetState implements DurableObject {
     }
   }
 
-  private async buildSnapshot(): Promise<FleetSnapshot> {
-    const hosts: FleetSnapshot["hosts"] = {};
+  /**
+   * Build the current fleet snapshot, classifying every `health:`/`tokens:`
+   * entry's freshness (issue #4957) and pruning any entry older than
+   * [`PRUNE_AFTER_MS`] as a side effect — the "DO hygiene" half of the AC
+   * ("long-gone hosts age out of the DO entirely"). Pruning piggybacks on
+   * this read rather than needing its own cron/route: every consumer
+   * (`/snapshot`, `/admin/fleet-state`, `/api/fleet-state`,
+   * `/public/fleet-state`) already calls this on every request, so a
+   * decommissioned host's entries are deleted the next time anyone looks —
+   * `now` is threaded through for deterministic tests.
+   */
+  private async buildSnapshot(now: Date = new Date()): Promise<FleetSnapshot> {
     const healthEntries = await this.state.storage.list<{ record: Record<string, unknown>; updatedAt: string }>({
       prefix: "health:",
     });
-    for (const [key, value] of healthEntries) {
-      const hostId = key.slice("health:".length);
-      hosts[hostId] ??= {};
-      hosts[hostId].health = value;
-    }
     const tokenEntries = await this.state.storage.list<{ record: Record<string, unknown>; updatedAt: string }>({
       prefix: "tokens:",
     });
-    for (const [key, value] of tokenEntries) {
-      const hostId = key.slice("tokens:".length);
-      hosts[hostId] ??= {};
-      hosts[hostId].tokens = value;
+    const { hosts, pruneKeys } = classifyAndPruneHosts(healthEntries, tokenEntries, now);
+    if (pruneKeys.length > 0) {
+      await this.state.storage.delete(pruneKeys);
     }
 
     const sweepEntries = await this.state.storage.list<ActiveSweepState>({ prefix: "sweep:" });
