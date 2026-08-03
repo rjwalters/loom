@@ -362,10 +362,23 @@ else
 fi
 
 # ---------- repo root ----------
+# Walk up from $1 (default $PWD) to the nearest ancestor that is a Loom
+# repository root: a directory holding BOTH a `.git` entry and a `.loom/`
+# directory.
+#
+# Requiring `.git` alongside `.loom/` is load-bearing (#5140). This walk used
+# to accept any ancestor with a `.loom/` directory, and every fleet host that
+# has run `loom-daemon tokens bootstrap` keeps machine-level daemon state in
+# `~/.loom` — so invoking this script from $HOME matched $HOME on the very
+# first iteration, set REPO_ROOT=$HOME and then refused with the misleading
+# "No loom-daemon/Cargo.toml found at $HOME/loom-daemon". `.git` alone is any
+# git checkout; `.loom/` alone is machine state; only the pair is a Loom repo.
+# Mirrors loom-daemon's own `crate::repo_root::find_repo_root`.
 find_repo_root() {
-    local dir="$PWD"
-    while [[ "$dir" != "/" ]]; do
-        if [[ -d "$dir/.loom" ]]; then echo "$dir"; return 0; fi
+    local dir="${1:-$PWD}"
+    dir="$(cd "$dir" 2>/dev/null && pwd)" || { echo ""; return 0; }
+    while [[ -n "$dir" && "$dir" != "/" ]]; do
+        if [[ -d "$dir/.git" && -d "$dir/.loom" ]]; then echo "$dir"; return 0; fi
         if [[ -f "$dir/.git" ]]; then
             local gitdir main_repo
             gitdir=$(sed 's/^gitdir: //' "$dir/.git")
@@ -375,6 +388,11 @@ find_repo_root() {
         dir="$(dirname "$dir")"
     done
     echo ""
+}
+
+# Whether $1 is a Loom SOURCE checkout (has the crate this script rebuilds).
+is_loom_source_checkout() {
+    [[ -n "${1:-}" && -f "$1/loom-daemon/Cargo.toml" ]]
 }
 
 # ---------- locate the daemon binary ----------
@@ -1142,6 +1160,25 @@ done
 
 REPO_ROOT=$(find_repo_root)
 
+# ---------- self-location fallback (#5140) ----------------------------------
+# This script rebuilds FROM SOURCE, and its own location is unambiguous when it
+# is invoked by absolute path (`bash ~/GitHub/loom/.loom/scripts/cli/loom-daemon-update.sh`
+# from $HOME — the reported case). When $PWD is not inside ANY Loom checkout but
+# the checkout this very script lives in is a source checkout, use that instead
+# of refusing on a path the operator never named. Announced on stderr, never
+# silent: choosing a different checkout than $PWD implies is exactly the kind of
+# thing an operator must be able to see in the log.
+#
+# Deliberately scoped to the "no checkout at all" case. When $PWD DOES resolve
+# to a Loom checkout that simply has no loom-daemon/ crate (a consumer repo),
+# the pre-existing refusal stands — retargeting the machine checkout from
+# inside another repo is opt-in via LOOM_MACHINE_CHECKOUT (#4229), not a guess.
+SELF_REPO_ROOT=$(find_repo_root "$SCRIPT_DIR")
+if [[ -z "$REPO_ROOT" ]] && is_loom_source_checkout "$SELF_REPO_ROOT"; then
+    warn "\$PWD ($PWD) is not inside a Loom source checkout; using this script's own checkout: $SELF_REPO_ROOT"
+    REPO_ROOT="$SELF_REPO_ROOT"
+fi
+
 # ---------- machine-mode source-tree override (Epic #3835 Phase 3b, #4229) --
 # Gap 1: this script rebuilds FROM SOURCE and used to resolve that source tree
 # by walking up from $PWD -- so from a consumer repo (find_repo_root() finds
@@ -1164,14 +1201,20 @@ if [[ -n "$MACHINE_CHECKOUT" ]]; then
 elif [[ -n "$REPO_ROOT" ]]; then
     DAEMON_STATE_HOME="$REPO_ROOT/.loom"
 else
-    err "Not in a Loom workspace (.loom directory not found)"
+    # #5140: name what was searched and what is required, so this never reads
+    # as "your checkout is broken" when the real answer is "you are standing in
+    # the wrong directory".
+    err "Not in a Loom workspace: neither \$PWD ($PWD) nor this script's own location ($SCRIPT_DIR) is inside a Loom checkout."
+    echo "A Loom checkout is a directory containing BOTH .git and .loom/ (a bare ~/.loom, e.g. the token pool, is not one)." >&2
+    echo "cd into a Loom source checkout, or set LOOM_MACHINE_CHECKOUT=<path-to-checkout>." >&2
     exit 1
 fi
 
 DAEMON_DIR="$REPO_ROOT/loom-daemon"
 if [[ ! -f "$DAEMON_DIR/Cargo.toml" ]]; then
-    err "No loom-daemon/Cargo.toml found at $DAEMON_DIR."
+    err "No loom-daemon/Cargo.toml found at $DAEMON_DIR (repo root resolved as $REPO_ROOT)."
     echo "loom-daemon-update.sh rebuilds FROM SOURCE and only works inside a Loom source checkout." >&2
+    echo "cd into a Loom source checkout, or set LOOM_MACHINE_CHECKOUT=<path-to-checkout>." >&2
     exit 1
 fi
 

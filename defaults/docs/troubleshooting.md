@@ -392,6 +392,18 @@ fails with `No module named loom_tools.orphan_recovery` or a "stale build"
 error, see [`loom-clean` / `loom-cleanup` / `loom-recover-orphans` fail on a
 stale binary](#loom-clean--loom-cleanup--loom-recover-orphans-fail-on-a-stale-binary-4384).
 
+**Run it from inside the checkout** (or pass `--workspace <path>`): repo-root
+resolution requires an ancestor holding **both** `.git` and `.loom/`, so a
+machine-level `~/.loom` (the token pool) is never mistaken for a repository. Run
+from anywhere else it exits `1` naming the directory it searched — it does not
+guess (#5140).
+
+**Exit codes**: `0` = assessed, nothing orphaned · `2` = orphans found in
+dry-run mode · `3` = **could not assess** (e.g. the `gh issue list --label
+loom:building` query failed). A `3` is never reported as "No orphaned tasks
+found" — a failed query is not evidence that nothing is stranded, and `--json`
+carries `assessment_failed` / `assessment_errors` for automation.
+
 **What it does**:
 - Finds issues with `loom:building` label that have been stuck
 - Checks if there's an associated PR (by branch name or body reference)
