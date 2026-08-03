@@ -215,6 +215,14 @@ pub fn validate_role_completeness(config_json: &str, mode: ValidationMode) -> Va
 /// resolves the effective config through the tier chain. Behaviorally identical
 /// to [`validate_role_completeness`]; it just skips the file-read + string-parse
 /// round-trip.
+///
+/// Also proactively checks the config's `runtimes.roles` map (#5006) using the
+/// same fail-closed rules `runtime_admission::config_runtime` already enforces
+/// at admission time, so a misconfigured entry (unknown role key, non-string
+/// value, non-object shape) is caught here instead of only surfacing the next
+/// time that role's tick actually runs. This is unconditional — it does not
+/// depend on `terminals` being present — since `runtimes.roles` is a config
+/// key in its own right.
 #[must_use]
 pub fn validate_from_config(config: &serde_json::Value, mode: ValidationMode) -> ValidationResult {
     if mode == ValidationMode::Ignore {
@@ -226,7 +234,7 @@ pub fn validate_from_config(config: &serde_json::Value, mode: ValidationMode) ->
         };
     }
 
-    match extract_roles_from_value(config) {
+    let mut result = match extract_roles_from_value(config) {
         Ok(roles) => check_role_dependencies(roles),
         Err(e) => ValidationResult {
             valid: false,
@@ -234,7 +242,15 @@ pub fn validate_from_config(config: &serde_json::Value, mode: ValidationMode) ->
             warnings: Vec::new(),
             errors: vec![e],
         },
+    };
+
+    let runtime_errors = crate::runtime_admission::check_runtimes_roles_config(config);
+    if !runtime_errors.is_empty() {
+        result.valid = false;
+        result.errors.extend(runtime_errors);
     }
+
+    result
 }
 
 /// Shared dependency-satisfaction check over an extracted role set.
@@ -460,6 +476,63 @@ mod tests {
         let result = validate_from_config(&config, ValidationMode::Warn);
         assert!(result.valid);
         assert_eq!(result.configured_roles, vec!["doctor", "judge"]);
+    }
+
+    /// #5006: `validate_from_config` proactively surfaces a misconfigured
+    /// `runtimes.roles` (the same fail-closed rules `runtime_admission`
+    /// enforces at admission time) as a validation error, so `loom-daemon
+    /// validate` catches it any time an operator runs it.
+    #[test]
+    fn test_validate_from_config_reports_bad_runtimes_roles() {
+        let config = serde_json::json!({
+            "terminals": [
+                {"roleConfig": {"roleFile": "judge.md"}},
+                {"roleConfig": {"roleFile": "champion.md"}},
+                {"roleConfig": {"roleFile": "doctor.md"}},
+                {"roleConfig": {"roleFile": "builder.md"}},
+                {"roleConfig": {"roleFile": "curator.md"}},
+            ],
+            "runtimes": {"roles": {"buidler": "claude"}},
+        });
+        let result = validate_from_config(&config, ValidationMode::Warn);
+        assert!(!result.valid);
+        assert_eq!(result.errors.len(), 1);
+        assert!(result.errors[0].contains("buidler"), "{}", result.errors[0]);
+        assert!(result.errors[0].contains("unknown role name"), "{}", result.errors[0]);
+        // Role-completeness warnings are computed independently and still fire.
+        assert!(result.warnings.is_empty());
+    }
+
+    /// A well-formed (or absent) `runtimes.roles` produces no new errors —
+    /// no regression for the common case.
+    #[test]
+    fn test_validate_from_config_silent_on_valid_runtimes_roles() {
+        let config = serde_json::json!({
+            "terminals": [
+                {"roleConfig": {"roleFile": "judge.md"}},
+                {"roleConfig": {"roleFile": "champion.md"}},
+                {"roleConfig": {"roleFile": "doctor.md"}},
+                {"roleConfig": {"roleFile": "builder.md"}},
+                {"roleConfig": {"roleFile": "curator.md"}},
+            ],
+            "runtimes": {"default": "codex", "roles": {"curator": "claude"}},
+        });
+        let result = validate_from_config(&config, ValidationMode::Warn);
+        assert!(result.valid);
+        assert!(result.errors.is_empty());
+
+        let config_no_runtimes = serde_json::json!({
+            "terminals": [
+                {"roleConfig": {"roleFile": "judge.md"}},
+                {"roleConfig": {"roleFile": "champion.md"}},
+                {"roleConfig": {"roleFile": "doctor.md"}},
+                {"roleConfig": {"roleFile": "builder.md"}},
+                {"roleConfig": {"roleFile": "curator.md"}},
+            ],
+        });
+        let result = validate_from_config(&config_no_runtimes, ValidationMode::Warn);
+        assert!(result.valid);
+        assert!(result.errors.is_empty());
     }
 
     #[test]

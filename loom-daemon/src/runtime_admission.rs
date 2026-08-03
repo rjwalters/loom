@@ -168,41 +168,73 @@ pub fn canonical_role(role: &str) -> Option<&'static str> {
 /// Empty-value semantics are preserved exactly: `"curator": ""` is a *valid*
 /// key with an unset value (it falls through to the next precedence tier), and
 /// an absent `runtimes.roles` block is not an error.
+/// Validate a resolved `runtimes.roles` JSON value's shape: must be an
+/// object; every key a known role name; every value a string.
+///
+/// Factored out of [`config_runtime`] (#5006) so the exact same rule set can
+/// be run twice: once here at admission time (unchanged behavior, #4494),
+/// and once proactively from `loom-daemon validate`
+/// ([`check_runtimes_roles_config`]) — before any role actually ticks and
+/// fails on it. Keeping one function means the two call sites can never
+/// silently drift apart.
+pub fn validate_runtimes_roles_shape(roles: &serde_json::Value) -> Result<(), String> {
+    let Some(map) = roles.as_object() else {
+        return Err(format!(
+            "runtimes.roles must be an object mapping role names to runtimes, got {}",
+            type_name_of(roles)
+        ));
+    };
+    let mut unknown: Vec<String> = map
+        .keys()
+        .filter(|key| canonical_role(key).is_none())
+        .cloned()
+        .collect();
+    unknown.sort();
+    if !unknown.is_empty() {
+        return Err(format!(
+            "unknown role name(s) in runtimes.roles: {} (known roles: {})",
+            unknown.join(", "),
+            KNOWN_ROLE_KEYS.join(", ")
+        ));
+    }
+    let mut non_string: Vec<String> = map
+        .iter()
+        .filter(|(_, value)| !value.is_string())
+        .map(|(key, _)| key.clone())
+        .collect();
+    non_string.sort();
+    if !non_string.is_empty() {
+        return Err(format!("runtimes.roles value(s) must be strings: {}", non_string.join(", ")));
+    }
+    Ok(())
+}
+
+/// Proactively check an already-resolved config's `runtimes.roles` map for
+/// the same fail-closed problems [`config_runtime`] rejects at admission
+/// time (unknown role keys, non-string values, a non-object shape). Returns
+/// one formatted message per problem found — currently at most one, since
+/// [`validate_runtimes_roles_shape`] stops at the first violation — so
+/// `loom-daemon validate` can surface a `runtimes.roles` misconfiguration
+/// any time an operator runs it, rather than only when a specific role's
+/// tick fails (#5006). An absent `runtimes.roles` block is not an error and
+/// yields an empty vec, matching [`config_runtime`]'s own empty-is-fine
+/// semantics.
+#[must_use]
+pub fn check_runtimes_roles_config(config: &serde_json::Value) -> Vec<String> {
+    let Some(roles) = crate::config_resolver::get_path(config, "runtimes.roles") else {
+        return Vec::new();
+    };
+    match validate_runtimes_roles_shape(roles) {
+        Ok(()) => Vec::new(),
+        Err(message) => vec![format!("runtimes.roles: {message}")],
+    }
+}
+
 fn config_runtime(root: &Path, role: &str) -> Result<(Option<String>, Option<String>), String> {
     let config = crate::config_resolver::resolve_effective_config(root);
     let roles = crate::config_resolver::get_path(&config, "runtimes.roles");
     if let Some(roles) = roles {
-        let Some(map) = roles.as_object() else {
-            return Err(format!(
-                "runtimes.roles must be an object mapping role names to runtimes, got {}",
-                type_name_of(roles)
-            ));
-        };
-        let mut unknown: Vec<String> = map
-            .keys()
-            .filter(|key| canonical_role(key).is_none())
-            .cloned()
-            .collect();
-        unknown.sort();
-        if !unknown.is_empty() {
-            return Err(format!(
-                "unknown role name(s) in runtimes.roles: {} (known roles: {})",
-                unknown.join(", "),
-                KNOWN_ROLE_KEYS.join(", ")
-            ));
-        }
-        let mut non_string: Vec<String> = map
-            .iter()
-            .filter(|(_, value)| !value.is_string())
-            .map(|(key, _)| key.clone())
-            .collect();
-        non_string.sort();
-        if !non_string.is_empty() {
-            return Err(format!(
-                "runtimes.roles value(s) must be strings: {}",
-                non_string.join(", ")
-            ));
-        }
+        validate_runtimes_roles_shape(roles)?;
     }
     let per_role = roles
         .and_then(|v| v.get(role))
@@ -824,6 +856,54 @@ mod tests {
         let admitted = resolve_and_admit(d.path(), "curator", None).unwrap();
         assert_eq!(admitted.runtime, "claude");
         assert_eq!(admitted.source, RuntimeSource::BuiltIn);
+    }
+
+    /// `check_runtimes_roles_config` (#5006) must report exactly the same
+    /// fail-closed problems `config_runtime` rejects at admission time —
+    /// unknown role key, non-string value, non-object shape — so
+    /// `loom-daemon validate` can catch a bad `runtimes.roles` before any
+    /// role's tick actually runs into it.
+    #[test]
+    fn check_runtimes_roles_config_reports_unknown_key() {
+        let config = serde_json::json!({"runtimes": {"roles": {"buidler": "claude"}}});
+        let errors = check_runtimes_roles_config(&config);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("buidler"), "{}", errors[0]);
+        assert!(errors[0].contains("unknown role name"), "{}", errors[0]);
+    }
+
+    #[test]
+    fn check_runtimes_roles_config_reports_non_string_value() {
+        let config = serde_json::json!({"runtimes": {"roles": {"curator": true}}});
+        let errors = check_runtimes_roles_config(&config);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("must be strings"), "{}", errors[0]);
+        assert!(errors[0].contains("curator"), "{}", errors[0]);
+    }
+
+    #[test]
+    fn check_runtimes_roles_config_reports_non_object_shape() {
+        let config = serde_json::json!({"runtimes": {"roles": "codex"}});
+        let errors = check_runtimes_roles_config(&config);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("must be an object"), "{}", errors[0]);
+    }
+
+    /// Well-formed or absent `runtimes.roles` produces no findings — no
+    /// regression for the common (zero-config, or valid config) case.
+    #[test]
+    fn check_runtimes_roles_config_is_silent_on_valid_or_absent_config() {
+        assert!(check_runtimes_roles_config(&serde_json::json!({})).is_empty());
+        assert!(check_runtimes_roles_config(&serde_json::json!({"terminals": []})).is_empty());
+        assert!(check_runtimes_roles_config(
+            &serde_json::json!({"runtimes": {"default": "codex", "roles": {"curator": "claude"}}})
+        )
+        .is_empty());
+        // Empty-value semantics (an unset per-role binding) are preserved.
+        assert!(check_runtimes_roles_config(
+            &serde_json::json!({"runtimes": {"roles": {"curator": ""}}})
+        )
+        .is_empty());
     }
 
     #[test]

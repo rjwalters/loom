@@ -532,6 +532,10 @@ silently ignored entry: `runtimes.roles.not-a-role` (or a typo such as
 the offending key, so a misconfigured binding can never leave a role quietly
 running on the default runtime. A known key with an **empty** value keeps its
 established "unset" meaning and falls through to the next precedence tier.
+`loom-daemon validate` also checks `runtimes.roles` proactively (#5006), using
+the identical fail-closed rules, so a bad binding is caught any time an
+operator runs the command — not only the next time a role's tick actually hits
+it.
 
 **Runtime manifest resolution and the bundled fallback (#5002).** The role and
 runtime manifest directories are resolved independently (#4688): each prefers
