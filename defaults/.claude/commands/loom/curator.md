@@ -866,7 +866,11 @@ _sha256() {
 # One "<pr#>:<state>:<sorted block labels>" line per current blocker, sorted so
 # ordering churn from the API never looks like a changed conclusion. Prefix with
 # the verdict so blocked→clear can never collide with clear→blocked.
-BLOCKERS=$(for PR in $(echo "$ISSUE_JSON" | jq -r '.closedByPullRequestsReferences[].number'); do
+# NOTE: `printf '%s\n' "$VAR" | jq`, never `echo "$VAR" | jq` — zsh's `echo`
+# builtin reinterprets `\n`/`\t` escapes by default, corrupting captured
+# `gh --json` output (a literal `\n` inside a body/comment string becomes a
+# raw newline) before jq ever parses it (#5094).
+BLOCKERS=$(for PR in $(printf '%s\n' "$ISSUE_JSON" | jq -r '.closedByPullRequestsReferences[].number'); do
   gh pr view "$PR" --json number,state,labels --jq \
     '"\(.number):\(.state):\([.labels[].name | select(startswith("loom:"))] | sort | join(","))"'
 done | sort)
@@ -881,10 +885,10 @@ CONCLUSION_HASH=$(printf '%s\n%s\n%s' "$VERDICT" "$BLOCKERS" "$BLOCK_REASON" \
 RECHECK_MARKER="<!-- curator:dep-recheck:$CONCLUSION_HASH -->"
 
 # Most recent prior Curator re-check comment, of ANY conclusion.
-PRIOR=$(echo "$ISSUE_JSON" | jq -c '[.comments[] | select(.body | test("<!-- curator:dep-recheck:"))] | last // {}')
-PRIOR_HASH=$(echo "$PRIOR" | jq -r '.body // ""' \
+PRIOR=$(printf '%s\n' "$ISSUE_JSON" | jq -c '[.comments[] | select(.body | test("<!-- curator:dep-recheck:"))] | last // {}')
+PRIOR_HASH=$(printf '%s\n' "$PRIOR" | jq -r '.body // ""' \
   | sed -n 's|.*<!-- curator:dep-recheck:\([0-9a-f]\{1,\}\) -->.*|\1|p' | tail -n 1)
-PRIOR_AT=$(echo "$PRIOR" | jq -r '.createdAt // empty')
+PRIOR_AT=$(printf '%s\n' "$PRIOR" | jq -r '.createdAt // empty')
 
 # Age in hours (portable: BSD `date -j -f` on macOS, GNU `date -d` elsewhere).
 _epoch() { date -j -f '%Y-%m-%dT%H:%M:%SZ' "$1" +%s 2>/dev/null || date -d "$1" +%s; }

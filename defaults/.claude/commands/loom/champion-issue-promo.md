@@ -238,22 +238,29 @@ _sha256() {
   elif command -v shasum >/dev/null 2>&1; then shasum -a 256
   else cksum; fi
 }
+# NOTE: use `printf '%s\n' "$VAR" | jq`, never `echo "$VAR" | jq`, for any
+# variable holding captured `gh --json` output. zsh's `echo` builtin
+# reinterprets `\n`/`\t` escape sequences by default, so a body/comment string
+# containing a literal two-character `\n` inside the JSON gets turned into a
+# raw newline before it reaches jq — corrupting the JSON and causing jq to
+# fail (or, worse, an `-e ... && echo yes || echo no` construct to silently
+# take the "no" branch). See #5094.
 BODY_HASH=$(printf '%s\n%s' \
-  "$(echo "$ISSUE_JSON" | jq -r '.title // ""')" \
-  "$(echo "$ISSUE_JSON" | jq -r '.body // ""')" \
+  "$(printf '%s\n' "$ISSUE_JSON" | jq -r '.title // ""')" \
+  "$(printf '%s\n' "$ISSUE_JSON" | jq -r '.body // ""')" \
   | _sha256 | awk '{print substr($1, 1, 16)}')
 VERDICT_MARKER="<!-- champion:proposal-verdict:body-$BODY_HASH -->"
 
 # Escalation inputs, computed HERE rather than in Step 4 (#4967): the skip path
 # below must be able to decide "escalate instead of skipping again" without ever
 # reaching Step 4. Step 4 reuses these same variables.
-PRIOR_REJECTIONS=$(echo "$ISSUE_JSON" | jq \
+PRIOR_REJECTIONS=$(printf '%s\n' "$ISSUE_JSON" | jq \
   '[.comments[] | select(.body | contains("Champion Review: NEEDS REVISION"))] | length')
-ALREADY_ROUTED=$(echo "$ISSUE_JSON" | jq -e '.labels[] | select(.name=="loom:operator-only")' >/dev/null && echo yes || echo no)
+ALREADY_ROUTED=$(printf '%s\n' "$ISSUE_JSON" | jq -e '.labels[] | select(.name=="loom:operator-only")' >/dev/null && echo yes || echo no)
 SKIP_STREAK=0            # silent skips already recorded for THIS body revision
 ESCALATE_UNREVISED=no    # set to yes to bypass re-evaluation and go straight to Step 4's escalation
 
-if echo "$ISSUE_JSON" | jq -e --arg m "$VERDICT_MARKER" \
+if printf '%s\n' "$ISSUE_JSON" | jq -e --arg m "$VERDICT_MARKER" \
      '.comments[] | select(.body | contains($m))' >/dev/null; then
   # This exact revision was already evaluated. Read the silent-skip tally carried
   # by the matching verdict comment. REST, not `gh issue view`: only the REST
@@ -261,8 +268,8 @@ if echo "$ISSUE_JSON" | jq -e --arg m "$VERDICT_MARKER" \
   # `gh issue view --json comments` is a GraphQL node id and cannot be PATCHed).
   VERDICT_COMMENT=$(gh api "repos/{owner}/{repo}/issues/$ISSUE_NUMBER/comments" --paginate \
     --jq ".[] | select(.body | contains(\"$VERDICT_MARKER\"))" | jq -s 'last')
-  COMMENT_ID=$(echo "$VERDICT_COMMENT" | jq -r '.id // empty')
-  COMMENT_BODY=$(echo "$VERDICT_COMMENT" | jq -r '.body // ""')
+  COMMENT_ID=$(printf '%s\n' "$VERDICT_COMMENT" | jq -r '.id // empty')
+  COMMENT_BODY=$(printf '%s\n' "$VERDICT_COMMENT" | jq -r '.body // ""')
   SKIP_STREAK=$(printf '%s' "$COMMENT_BODY" \
     | sed -n "s|.*<!-- champion:unrevised-skips:$BODY_HASH:\([0-9]\{1,\}\) -->.*|\1|p" | tail -n 1)
   SKIP_STREAK=${SKIP_STREAK:-0}
