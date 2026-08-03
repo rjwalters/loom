@@ -24,6 +24,24 @@
 --
 -- NULL `sweep_id` values are exempt from uniqueness by SQL's own NULL != NULL
 -- rule, so this is safe even though `sweep_id` is nullable on the column.
+--
+-- Production already has duplicate (kind, sweep_id) rows for these two kinds
+-- predating this constraint — the `INSERT OR IGNORE` guard above only
+-- prevents *future* duplicates, it does nothing for rows already in the
+-- table. `CREATE UNIQUE INDEX` fails outright (SQLITE_CONSTRAINT_UNIQUE) on
+-- data that already violates the target uniqueness, so dedup first: keep
+-- exactly one row per (kind, sweep_id) pair, the most recently ingested one
+-- (MAX(id)). This DELETE is a no-op on a database with no pre-existing
+-- duplicates (e.g. the test suite's fresh in-memory D1), so it is safe to run
+-- unconditionally ahead of the index creation (Issue #5107).
+DELETE FROM records
+WHERE kind IN ('sweep.completed', 'sweep.outcome')
+  AND id NOT IN (
+    SELECT MAX(id) FROM records
+    WHERE kind IN ('sweep.completed', 'sweep.outcome')
+    GROUP BY kind, sweep_id
+  );
+
 CREATE UNIQUE INDEX idx_records_terminal_sweep_once
   ON records (kind, sweep_id)
   WHERE kind IN ('sweep.completed', 'sweep.outcome');
