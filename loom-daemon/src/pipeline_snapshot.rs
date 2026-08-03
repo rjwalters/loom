@@ -165,6 +165,125 @@ impl Default for PipelineMetrics {
 /// named for, and what every pre-#4761 caller gets.
 pub const DEFAULT_MERGE_WINDOW_HOURS: i64 = 24;
 
+/// The default `gh` binary this module invokes when nothing overrides it —
+/// the single source of truth so [`GhPipelineSource::new`] and
+/// [`probe_gh_availability`]'s caller (`loom-daemon health`'s collector,
+/// #5061) can never drift into checking a different binary than the one that
+/// actually runs the per-repo queries.
+pub const DEFAULT_GH_BIN: &str = "gh";
+
+// ============================================================================
+// `gh` binary availability (Issue #5061)
+// ============================================================================
+
+/// The client-side `gh` binary this process would use for a
+/// [`GhPipelineSource`] fan-out could not be found or executed at all — an
+/// **environment fact about this process**, not a forge outage.
+///
+/// Produced once by [`probe_gh_availability`], *before* any per-repo `gh`
+/// call, precisely so a caller (`loom-daemon health`, #5061) can report it as
+/// a single fact rather than as N independent "forge query FAILED" entries —
+/// one per managed repo — which is what happened before this type existed: a
+/// missing `gh` on a non-login SSH `PATH` made every repo's query fail
+/// identically, and the resulting message read exactly like a forge outage or
+/// a dead credential.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GhUnavailable {
+    /// The configured `gh` binary path/name (`gh` unless overridden via
+    /// [`GhPipelineSource::with_gh_bin`]).
+    pub gh_bin: String,
+    /// Operator-facing reason, already naming the specific cause: PATH
+    /// resolution failure (the common case — the same failure class as
+    /// #4875) vs. an explicit path that does not exist vs. a file found but
+    /// not executable.
+    pub reason: String,
+    /// This process's raw `PATH` value at probe time, when the failure was a
+    /// PATH lookup — `None` for an explicit-path failure (nothing to blame
+    /// on `PATH`) or a permission failure. Kept out of `reason` because a
+    /// summary line should not have to enumerate an arbitrarily long,
+    /// host-specific `PATH`; carried here for `--json` diagnostics.
+    pub observed_path: Option<String>,
+}
+
+/// Probe whether `gh_bin` can be located and invoked at all: a single,
+/// bounded `<gh_bin> --version` spawn attempt — no network, no repo context,
+/// just "does exec even start". `Ok(())` on any outcome other than the
+/// binary failing to *launch*: a `gh` that launches but exits non-zero (an
+/// unexpected `--version` failure) is still "available" for this purpose.
+/// Only [`std::io::ErrorKind::NotFound`] (not on `PATH`, or an explicit path
+/// that does not exist) and [`std::io::ErrorKind::PermissionDenied`] (found
+/// but not executable) are treated as unavailable — matching the acceptance
+/// criteria's "missing or non-executable `gh`". Any other spawn error (e.g. a
+/// transient fork/exec failure) is left for the real per-repo `gh` calls to
+/// surface, exactly as before this probe existed — this function's whole
+/// point is narrowly distinguishing "the binary itself cannot run" from
+/// every other kind of forge-query failure.
+pub fn probe_gh_availability(gh_bin: &Path) -> Result<(), GhUnavailable> {
+    match Command::new(gh_bin).arg("--version").output() {
+        Ok(_) => Ok(()),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            Err(describe_gh_unavailable(gh_bin, &e))
+        }
+        Err(_) => Ok(()),
+    }
+}
+
+/// Build the operator-facing [`GhUnavailable`] for [`probe_gh_availability`]'s
+/// failure, naming the specific PATH problem (the same failure class as
+/// #4875) when `gh_bin` is a bare name subject to a `PATH` lookup, rather
+/// than an explicit path.
+fn describe_gh_unavailable(gh_bin: &Path, err: &std::io::Error) -> GhUnavailable {
+    if err.kind() == std::io::ErrorKind::PermissionDenied {
+        return GhUnavailable {
+            gh_bin: gh_bin.display().to_string(),
+            reason: format!(
+                "`{}` was found but is not executable ({err}) — check its file permissions",
+                gh_bin.display()
+            ),
+            observed_path: None,
+        };
+    }
+
+    // A path is subject to PATH-lookup exec semantics only when it has no
+    // directory component at all (mirrors how `exec`/`Command` itself decides
+    // whether to search `PATH`: any path separator anywhere opts out of the
+    // search). An explicit path (`./gh`, `/usr/bin/gh`, a `with_gh_bin`
+    // override pointing at a specific file) that does not exist is not a
+    // `PATH` problem — no separate hint is useful there.
+    let is_bare_name = gh_bin.parent().is_none_or(|p| p.as_os_str().is_empty());
+    if !is_bare_name {
+        return GhUnavailable {
+            gh_bin: gh_bin.display().to_string(),
+            reason: format!("`{}` does not exist", gh_bin.display()),
+            observed_path: None,
+        };
+    }
+
+    let path = std::env::var("PATH").unwrap_or_default();
+    let hint = crate::fleet::path_bootstrap::CANONICAL_PATH_DIRS
+        .iter()
+        .take(3)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(", ");
+    GhUnavailable {
+        gh_bin: gh_bin.display().to_string(),
+        reason: format!(
+            "`{}` not found on PATH — cannot assess queue depth / merge throughput. This looks \
+             like a non-login shell (e.g. a bare `ssh host 'cmd'` invocation) missing PATH \
+             entries a login shell would add — the same failure class as #4875. Commonly \
+             missing: {hint}",
+            gh_bin.display()
+        ),
+        observed_path: Some(path),
+    }
+}
+
 /// A `gh`-backed [`PipelineSource`]. Runs up to six `gh` invocations per repo
 /// (one per requested metric — see [`PipelineMetrics`]) scoped to that repo's
 /// own working directory so `gh` auto-detects the remote — same convention as
@@ -183,7 +302,7 @@ impl GhPipelineSource {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            gh_bin: PathBuf::from("gh"),
+            gh_bin: PathBuf::from(DEFAULT_GH_BIN),
             metrics: PipelineMetrics::ALL,
             merge_window: chrono::Duration::hours(DEFAULT_MERGE_WINDOW_HOURS),
         }
@@ -441,6 +560,72 @@ mod tests {
     #[test]
     fn format_count_renders_number_for_some() {
         assert_eq!(format_count(Some(7)), "7");
+    }
+
+    // ===================================================================
+    // probe_gh_availability — #5061
+    // ===================================================================
+
+    #[test]
+    fn probe_gh_availability_ok_for_a_real_executable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gh = write_fake_gh(tmp.path(), "echo 'gh version 2.0.0'");
+        assert_eq!(probe_gh_availability(&gh), Ok(()));
+    }
+
+    /// `#[serial]` is load-bearing (#4547): this test mutates the process-wide
+    /// `PATH` env var, which every concurrently-running `Command` spawn in
+    /// this file's other tests implicitly reads.
+    #[test]
+    #[serial]
+    fn probe_gh_availability_names_the_path_problem_for_a_bare_name_missing_from_path() {
+        let saved = std::env::var("PATH").ok();
+        std::env::set_var("PATH", "/no-such-loom-test-dir-5061");
+        let result = probe_gh_availability(Path::new("definitely-not-a-real-gh-binary-5061"));
+        match saved {
+            Some(p) => std::env::set_var("PATH", p),
+            None => std::env::remove_var("PATH"),
+        }
+
+        let err = result.expect_err("a binary absent from PATH must be reported as unavailable");
+        assert_eq!(err.gh_bin, "definitely-not-a-real-gh-binary-5061");
+        assert!(err.reason.contains("PATH"), "reason should name PATH: {}", err.reason);
+        assert!(
+            err.reason.contains("#4875"),
+            "reason should cross-reference #4875: {}",
+            err.reason
+        );
+        assert!(
+            err.observed_path.is_some(),
+            "a PATH-lookup failure should carry the observed PATH for --json"
+        );
+    }
+
+    #[test]
+    fn probe_gh_availability_reports_a_missing_explicit_path_without_a_path_hint() {
+        let err = probe_gh_availability(Path::new("/no/such/gh-binary-5061"))
+            .expect_err("a nonexistent explicit path must be reported as unavailable");
+        assert!(err.reason.contains("does not exist"));
+        assert!(
+            err.observed_path.is_none(),
+            "an explicit-path failure is not a PATH problem, so no PATH should be attached"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_gh_availability_reports_permission_denied_for_a_non_executable_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("not-executable-gh");
+        std::fs::write(&path, "#!/bin/sh\necho hi\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let err = probe_gh_availability(&path)
+            .expect_err("a non-executable file must be reported as unavailable");
+        assert!(err.reason.contains("not executable"), "reason: {}", err.reason);
+        assert!(err.observed_path.is_none());
     }
 
     // ===================================================================

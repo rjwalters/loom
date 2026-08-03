@@ -340,7 +340,24 @@ pub struct HealthInputs {
     /// Age of the resolved pool's `.ranking` in seconds, when readable.
     pub ranking_age_secs: Option<u64>,
     /// Per-repo forge snapshot (`queued` + merged-in-window), when collected.
+    /// `None` both when the daemon was unreachable (nothing to fan out to)
+    /// and when [`Self::gh_unavailable`] is `Some` — the collector skips the
+    /// per-repo fan-out entirely once it already knows every call would fail
+    /// identically (#5061).
     pub pipeline: Option<Vec<RepoPipelineSnapshot>>,
+    /// Set when the collector's one-time [`crate::pipeline_snapshot::probe_gh_availability`]
+    /// check (#5061) found the client-side `gh` binary this process would use
+    /// for the `queues`/`throughput` forge fan-out missing or non-executable.
+    /// This is an **environment fact about this process**, not a forge
+    /// outage — [`assess_queues`]/[`assess_throughput`] report it once,
+    /// distinctly from a genuine per-repo forge query failure, and
+    /// cross-reference [`Self::status`]'s `credential_preflight` (the
+    /// daemon's own IPC-answered "is the forge credential OK" verdict) when
+    /// available, so the two signals can never silently contradict each
+    /// other the way they did before this field existed (a caller with no
+    /// `gh` on `PATH` reporting "forge query FAILED for: <every repo>" next
+    /// to a daemon reporting "Forge credential: OK").
+    pub gh_unavailable: Option<crate::pipeline_snapshot::GhUnavailable>,
     /// The commit **this client process** was built from (Issue #4824) —
     /// [`crate::self_update::BUILT_COMMIT`], threaded in by the collector
     /// rather than read directly here so the skew rules are unit-testable
@@ -1308,6 +1325,9 @@ fn is_review_stalled(snap: &RepoPipelineSnapshot) -> bool {
 /// summary either way.
 #[must_use]
 pub fn assess_queues(inputs: &HealthInputs) -> HealthSection {
+    if let Some(gh) = &inputs.gh_unavailable {
+        return gh_unavailable_section("queues", gh, inputs);
+    }
     let Some(pipeline) = &inputs.pipeline else {
         return unknown_section("queues", "forge snapshot not collected");
     };
@@ -1440,6 +1460,9 @@ pub fn assess_queues(inputs: &HealthInputs) -> HealthSection {
 /// non-green here.
 #[must_use]
 pub fn assess_throughput(inputs: &HealthInputs) -> HealthSection {
+    if let Some(gh) = &inputs.gh_unavailable {
+        return gh_unavailable_section("throughput", gh, inputs);
+    }
     let Some(pipeline) = &inputs.pipeline else {
         return unknown_section("throughput", "forge snapshot not collected");
     };
@@ -1602,6 +1625,58 @@ fn unknown_section(key: &'static str, why: &str) -> HealthSection {
         Verdict::Unknown,
         why.to_string(),
         serde_json::json!({ "unavailable": why }),
+    )
+}
+
+/// Render `queues`/`throughput` for a missing/non-executable `gh` (#5061):
+/// one distinct, environment-attributed reason instead of the pre-#5061
+/// "forge query FAILED for: <every managed repo>" — which duplicated the
+/// same environment fact once per repo and read exactly like a forge outage.
+///
+/// Still [`Verdict::Unknown`] (not [`Verdict::Degraded`]): the queue depth /
+/// merge count genuinely could not be determined, so the existing "unknown
+/// != healthy" exit-code contract (exit `1`) is unchanged — only the
+/// *reason string* changes.
+///
+/// When the daemon answered IPC and reported its own `credential_preflight`
+/// verdict, that signal is cross-referenced by name so an operator never has
+/// to manually reconcile "forge query FAILED" here against "Forge
+/// credential: OK" from `status`/`--json`'s `credential_preflight` — the
+/// exact disagreement that prompted #5061.
+fn gh_unavailable_section(
+    key: &'static str,
+    gh: &crate::pipeline_snapshot::GhUnavailable,
+    inputs: &HealthInputs,
+) -> HealthSection {
+    let credential_preflight = inputs
+        .status
+        .as_ref()
+        .and_then(|s| s.credential_preflight.as_ref());
+    let cred_note = match credential_preflight {
+        Some(c) if c.ok => format!(
+            " (the daemon's own IPC reports its forge credential OK via {} — this is a \
+             caller-side PATH problem in the process running `health`, not a forge outage or a \
+             bad credential)",
+            c.mechanism
+        ),
+        Some(c) => format!(
+            " (the daemon's own IPC separately reports its forge credential as DEGRADED: {} — \
+             but that is the daemon's credential, not this caller's missing `gh`)",
+            c.message
+        ),
+        None => String::new(),
+    };
+    HealthSection::new(
+        key,
+        Verdict::Unknown,
+        format!("{}{cred_note}", gh.reason),
+        serde_json::json!({
+            "unavailable": "gh not found on PATH or not executable",
+            "gh_bin": gh.gh_bin,
+            "reason": gh.reason,
+            "observed_path": gh.observed_path,
+            "daemon_credential_preflight": credential_preflight,
+        }),
     )
 }
 
@@ -1800,6 +1875,7 @@ mod tests {
                 merged_24h: Some(3),
                 ..Default::default()
             }]),
+            gh_unavailable: None,
             cli_build_commit: CLI_COMMIT.to_string(),
             work_finder_log_tick_age_secs: None,
         }
@@ -2874,6 +2950,98 @@ mod tests {
         let section = assess_queues(&inputs);
         assert_eq!(section.verdict, Verdict::Unknown);
         assert_eq!(assess(&inputs).exit_code(), EXIT_DEGRADED);
+    }
+
+    // ===================================================================
+    // A missing/non-executable `gh` is one fact, not N per-repo failures
+    // (#5061)
+    // ===================================================================
+
+    fn gh_unavailable_fixture() -> crate::pipeline_snapshot::GhUnavailable {
+        crate::pipeline_snapshot::GhUnavailable {
+            gh_bin: "gh".to_string(),
+            reason: "`gh` not found on PATH — cannot assess queue depth / merge throughput. \
+                     This looks like a non-login shell missing PATH entries a login shell would \
+                     add — the same failure class as #4875."
+                .to_string(),
+            observed_path: Some("/usr/bin:/bin".to_string()),
+        }
+    }
+
+    fn credential_preflight_ok() -> crate::types::CredentialPreflightReport {
+        crate::types::CredentialPreflightReport {
+            ok: true,
+            mechanism: "keyring".to_string(),
+            fingerprint: Some("rjwalters".to_string()),
+            message: "authenticated as rjwalters via keyring".to_string(),
+            checked_at: now(),
+        }
+    }
+
+    /// The core #5061 regression pin: a missing `gh` collapses to a single
+    /// section-level reason naming PATH, never a per-repo "forge query
+    /// FAILED for: repoA, repoB, ..." list — even though `pipeline` itself is
+    /// `None` (the collector never ran the fan-out).
+    #[test]
+    fn a_missing_gh_is_one_fact_not_a_per_repo_failure_list() {
+        let mut inputs = healthy_inputs();
+        inputs.pipeline = None;
+        inputs.gh_unavailable = Some(gh_unavailable_fixture());
+
+        let queues = assess_queues(&inputs);
+        assert_eq!(queues.verdict, Verdict::Unknown);
+        assert!(queues.summary.contains("PATH"), "{}", queues.summary);
+        assert!(queues.summary.contains("#4875"), "{}", queues.summary);
+        assert!(
+            !queues.summary.contains("forge query FAILED for:"),
+            "must not regress to the per-repo phrasing: {}",
+            queues.summary
+        );
+
+        let throughput = assess_throughput(&inputs);
+        assert_eq!(throughput.verdict, Verdict::Unknown);
+        assert!(
+            !throughput.summary.contains("forge query FAILED for:"),
+            "must not regress to the per-repo phrasing: {}",
+            throughput.summary
+        );
+
+        // exit-code contract is unchanged: still "could not determine", exit 1.
+        assert_eq!(assess(&inputs).exit_code(), EXIT_DEGRADED);
+    }
+
+    /// AC: cross-reference the daemon's own IPC-answered credential verdict
+    /// so the two signals never silently contradict each other.
+    #[test]
+    fn a_missing_gh_cross_references_a_healthy_daemon_credential() {
+        let mut inputs = healthy_inputs();
+        inputs.pipeline = None;
+        inputs.gh_unavailable = Some(gh_unavailable_fixture());
+        inputs.status.as_mut().unwrap().credential_preflight = Some(credential_preflight_ok());
+
+        let queues = assess_queues(&inputs);
+        assert!(
+            queues.summary.contains("credential OK"),
+            "should cross-reference the daemon's own OK verdict: {}",
+            queues.summary
+        );
+        assert!(queues.detail["daemon_credential_preflight"]["ok"] == true);
+    }
+
+    /// Without a daemon-reported credential verdict (unreachable IPC, or a
+    /// pre-#4005 daemon), the section must still render — no cross-reference
+    /// clause, not a panic or an empty summary.
+    #[test]
+    fn a_missing_gh_with_no_daemon_credential_signal_still_renders() {
+        let mut inputs = healthy_inputs();
+        inputs.pipeline = None;
+        inputs.gh_unavailable = Some(gh_unavailable_fixture());
+        inputs.status = None;
+
+        let queues = assess_queues(&inputs);
+        assert_eq!(queues.verdict, Verdict::Unknown);
+        assert!(!queues.summary.is_empty());
+        assert!(queues.detail["daemon_credential_preflight"].is_null());
     }
 
     // ===================================================================
