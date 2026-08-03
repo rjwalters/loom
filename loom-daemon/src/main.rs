@@ -853,6 +853,16 @@ enum Commands {
         #[arg(long, value_name = "N")]
         limit: Option<usize>,
 
+        /// Print how many locally-journaled records the observability
+        /// exporter has not yet attempted to send to the backend (Issue
+        /// #5084) instead of the summary/records output — every other flag
+        /// except `--json`/`--workspace` is ignored in this mode. This is the
+        /// AC's "N local outcomes not yet in the backend" measurability
+        /// gauge: `0` means the backfill drain (see
+        /// `.loom/docs/observability.md`) is caught up.
+        #[arg(long = "pending-export")]
+        pending_export: bool,
+
         /// Emit machine-readable JSON instead of the human-readable table.
         #[arg(long)]
         json: bool,
@@ -2020,6 +2030,7 @@ fn handle_cli_command(command: Commands) -> Result<()> {
             result,
             records,
             limit,
+            pending_export,
             json,
         } => handle_sweep_outcomes_command(
             &workspace,
@@ -2027,6 +2038,7 @@ fn handle_cli_command(command: Commands) -> Result<()> {
             result.as_deref(),
             records,
             limit,
+            pending_export,
             json,
         ),
         Commands::Stats {

@@ -1,7 +1,15 @@
 import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import worker from "../src/index";
-import { hostHealthEnvelope, revokeHost, seedHost, sweepStartedEnvelope } from "./testHelpers";
+import {
+  hostHealthEnvelope,
+  revokeHost,
+  seedHost,
+  sweepCompletedEnvelope,
+  sweepOutcomeEnvelope,
+  sweepPhaseEnvelope,
+  sweepStartedEnvelope,
+} from "./testHelpers";
 
 function ingestRequest(body: unknown, authHeader?: string): Request {
   const headers: Record<string, string> = { "content-type": "application/json" };
@@ -197,6 +205,70 @@ describe("POST /ingest — visibility fail-safe default", () => {
     expect(response.status).toBe(200);
     const rows = await recordsForHost("host-abc");
     expect(rows[0]?.visibility).toBe("public");
+  });
+});
+
+describe("POST /ingest — idempotent terminal records (Issue #5084)", () => {
+  it("re-ingesting the same sweep.completed record does not double-count it", async () => {
+    const envelope = sweepCompletedEnvelope();
+    const first = await callWorker(ingestRequest([envelope], "Bearer abc-ingest-key"));
+    expect(first.status).toBe(200);
+    expect(await first.json()).toEqual({ accepted: 1, host_id: "host-abc" });
+
+    // A backfill re-offer or a transport-retry resend of the EXACT same
+    // record — same kind, same sweep_id. Must still ack 2xx, not surface as
+    // a client error.
+    const second = await callWorker(ingestRequest([envelope], "Bearer abc-ingest-key"));
+    expect(second.status).toBe(200);
+
+    const rows = await recordsForHost("host-abc");
+    expect(rows.filter((r) => r.kind === "sweep.completed")).toHaveLength(1);
+  });
+
+  it("re-ingesting the same sweep.outcome record does not double-count it", async () => {
+    const envelope = sweepOutcomeEnvelope();
+    await callWorker(ingestRequest([envelope], "Bearer abc-ingest-key"));
+    await callWorker(ingestRequest([envelope], "Bearer abc-ingest-key"));
+
+    const rows = await recordsForHost("host-abc");
+    expect(rows.filter((r) => r.kind === "sweep.outcome")).toHaveLength(1);
+  });
+
+  it("a duplicate sweep.completed does not block the REST of a mixed batch from persisting", async () => {
+    const completed = sweepCompletedEnvelope();
+    await callWorker(ingestRequest([completed], "Bearer abc-ingest-key"));
+
+    // Re-send the same completed record alongside a genuinely new one —
+    // `INSERT OR IGNORE` is per-statement, so the duplicate is dropped and
+    // the new health record still lands in the same batch transaction.
+    const response = await callWorker(
+      ingestRequest([completed, hostHealthEnvelope()], "Bearer abc-ingest-key"),
+    );
+    expect(response.status).toBe(200);
+
+    const rows = await recordsForHost("host-abc");
+    expect(rows.filter((r) => r.kind === "sweep.completed")).toHaveLength(1);
+    expect(rows.filter((r) => r.kind === "host.health")).toHaveLength(1);
+  });
+
+  it("does NOT dedupe sweep.phase — a sweep legitimately emits many, one per lifecycle phase", async () => {
+    const builder = sweepPhaseEnvelope({ phase: "builder" });
+    const judge = sweepPhaseEnvelope({ phase: "judge", entered_at: "2026-07-30T12:20:00Z" });
+    await callWorker(ingestRequest([builder], "Bearer abc-ingest-key"));
+    await callWorker(ingestRequest([judge], "Bearer abc-ingest-key"));
+
+    const rows = await recordsForHost("host-abc");
+    expect(rows.filter((r) => r.kind === "sweep.phase")).toHaveLength(2);
+  });
+
+  it("does not dedupe two DIFFERENT sweeps' sweep.completed records", async () => {
+    const first = sweepCompletedEnvelope({ sweep_id: "sweep-issue-1-0", issue: 1 });
+    const secondSweep = sweepCompletedEnvelope({ sweep_id: "sweep-issue-2-0", issue: 2 });
+    await callWorker(ingestRequest([first], "Bearer abc-ingest-key"));
+    await callWorker(ingestRequest([secondSweep], "Bearer abc-ingest-key"));
+
+    const rows = await recordsForHost("host-abc");
+    expect(rows.filter((r) => r.kind === "sweep.completed")).toHaveLength(2);
   });
 });
 
