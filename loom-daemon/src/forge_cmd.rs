@@ -12,6 +12,17 @@
 //! - `forge auto-merge <pr> [--method …]` — the merge path behind
 //!   `merge-pr.sh` (formerly `loom-auto-merge`).
 //!
+//! # NOT a cache — the passthrough burns full GraphQL (#5056)
+//!
+//! `forge issue …` / `forge pr …` are a **byte-identical GraphQL passthrough**
+//! to `gh` ([`gh_passthrough`]); they inherit `gh issue list`'s full GraphQL
+//! rate-limit cost and are **not** the ETag-cached path. The cached,
+//! zero-cost-on-`304` listing lives behind the explicit `--cached` flag
+//! (`forge issue list --cached …` / `forge pr list --cached …`, dispatched to
+//! [`crate::forge_cached_list`]); only that flag routes through the REST/ETag
+//! cache. Reach for it (via the `gh-cached` / `$GH_READ` helper) whenever you
+//! would otherwise write a raw `gh issue list` in an agent hot path.
+//!
 //! # Forge routing (option (b): native GitHub, shell fallback carries Gitea)
 //!
 //! For **GitHub** (the only forge any Loom consumer repo runs today) the
@@ -569,6 +580,16 @@ pub enum ForgeCmd {
 /// a child process cannot be spawned.
 pub fn dispatch(cmd: ForgeCmd) -> Result<()> {
     match cmd {
+        // `forge <issue|pr> list --cached …` routes to the agent-facing ETag
+        // cache (#5056); it serves-and-exits(0) or declines-and-exits(3) so the
+        // caller falls back to plain `gh`. Everything else is the byte-identical
+        // GraphQL passthrough — NOT the cached path.
+        ForgeCmd::Issue(args) if crate::forge_cached_list::is_cached_list(&args) => {
+            crate::forge_cached_list::handle("issue", &args)
+        }
+        ForgeCmd::Pr(args) if crate::forge_cached_list::is_cached_list(&args) => {
+            crate::forge_cached_list::handle("pr", &args)
+        }
         ForgeCmd::Issue(args) => gh_passthrough("issue", &args),
         ForgeCmd::Pr(args) => gh_passthrough("pr", &args),
         ForgeCmd::Auth(args) => gh_passthrough("auth", &args),

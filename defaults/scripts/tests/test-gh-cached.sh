@@ -116,10 +116,14 @@ echo '[{"number":99,"title":"an issue"}]'       > "$STATE_DIR/issue-list.json"
 CACHE_DIR="$TMP_ROOT/cache"
 
 # Run gh-cached with a hermetic environment. Args are passed through verbatim.
+# LOOM_ETAG_LIST_DISABLE=1 pins these to the TTL-cache layer under test — the
+# #5056 ETag/REST routing (which would otherwise front-run `issue/pr list` when
+# a loom-daemon is on PATH) has its own dedicated block at the end of this file.
 ghc() {
     PATH="$STUB_DIR:$PATH" \
     GH_CACHE_DIR="$CACHE_DIR" \
     GH_CACHE_TTL="${TTL_OVERRIDE:-30}" \
+    LOOM_ETAG_LIST_DISABLE=1 \
       "$GH_CACHED" "$@"
 }
 
@@ -263,6 +267,56 @@ echo "Testing the wrapper-resolution probe used by the skills..."
 reset_cache
 if ghc --version >/dev/null 2>&1; then probe_rc=0; else probe_rc=$?; fi
 assert_eq "0" "$probe_rc" "'gh-cached --version' succeeds (the skills' resolution probe)"
+
+# --- 9. ETag/REST routing (#5056) ------------------------------------------
+# `issue list` / `pr list` prefer loom-daemon's ETag-cached REST path when the
+# binary is present (free 304 on repeat, separate REST pool). Here a FAKE
+# loom-daemon on PATH proves: (a) a cacheable list shape is served by it, not
+# the stub gh; (b) a decline (non-zero exit) transparently falls through to the
+# normal gh path; (c) LOOM_ETAG_LIST_DISABLE=1 turns the whole layer off.
+echo ""
+echo "Testing the #5056 ETag/REST cached-listing routing..."
+
+FAKE_DAEMON_DIR="$TMP_ROOT/daemon"
+mkdir -p "$FAKE_DAEMON_DIR"
+# A fake loom-daemon: `forge <e> list --cached` with --json succeeds and emits a
+# sentinel; any shape without --json exits 3 (decline), mirroring the real one.
+cat > "$FAKE_DAEMON_DIR/loom-daemon" <<'FAKE'
+#!/usr/bin/env bash
+if [[ "$1" == "forge" && "$3" == "list" ]]; then
+    if printf '%s\n' "$@" | grep -q -- '--json'; then
+        echo '[{"number":777,"title":"from-etag-daemon"}]'
+        exit 0
+    fi
+    exit 3
+fi
+exit 3
+FAKE
+chmod +x "$FAKE_DAEMON_DIR/loom-daemon"
+
+# Runner with the fake daemon on PATH and the ETag layer ENABLED.
+ghc_etag() {
+    PATH="$STUB_DIR:$FAKE_DAEMON_DIR:$PATH" \
+    GH_CACHE_DIR="$CACHE_DIR" \
+    LOOM_DAEMON_BIN="$FAKE_DAEMON_DIR/loom-daemon" \
+      "$GH_CACHED" "$@"
+}
+
+reset_cache
+etag_out=$(ghc_etag issue list --label "loom:issue" --state open --json number,title)
+assert_eq '[{"number":777,"title":"from-etag-daemon"}]' "$etag_out" \
+    "a cacheable 'issue list --json' is served by the ETag daemon path, not stub gh"
+assert_eq "0" "$(call_count)" "…and the stub gh is never called for the ETag-served list"
+
+# A shape the daemon declines (no --json → daemon exits 3) falls through to gh.
+reset_cache
+ghc_etag pr list --label "loom:review-requested" --state open >/dev/null  # no --json → decline
+assert_eq "1" "$(call_count)" "a daemon-declined list shape falls through to a real gh call"
+
+# The kill switch disables the whole ETag layer even with the daemon present.
+reset_cache
+LOOM_ETAG_LIST_DISABLE=1 ghc_etag issue list --label "loom:issue" --state open --json number,title >/dev/null
+assert_eq "1" "$(call_count)" "LOOM_ETAG_LIST_DISABLE=1 bypasses the ETag path (falls to gh)"
 
 # --- Summary ---------------------------------------------------------------
 echo ""

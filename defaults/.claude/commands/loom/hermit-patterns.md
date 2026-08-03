@@ -11,6 +11,21 @@ This file contains detailed patterns, examples, and reference scripts for the He
 
 **Primary instructions**: See `hermit.md` for core role definition and workflow.
 
+**Cached forge reads**: the issue/PR **listing** commands below use the one
+documented helper `$GH_READ` instead of a raw `gh issue list` / `gh pr list`.
+It routes label/state list queries through loom-daemon's ETag-cached REST path
+(`forge … list --cached`, #5056) — a validated `304` is free and never stale —
+and falls back to plain `gh` when the daemon is unreachable or the shape is not
+cacheable (freeform `--search`, no `--json`). Resolve it once per session:
+
+```bash
+GH_READ="gh"
+_ghc="$(git rev-parse --show-toplevel 2>/dev/null)/.loom/scripts/gh-cached"
+if [[ -x "$_ghc" ]] && "$_ghc" --version >/dev/null 2>&1; then GH_READ="$_ghc"; fi
+```
+
+Full policy: `.loom/docs/gh-cached.md`.
+
 ---
 
 ## Detailed Code Smell Examples
@@ -585,7 +600,7 @@ git log --diff-filter=A --name-only --pretty=format: | \
 
 ```bash
 # Before creating an issue, check for duplicates
-gh issue list --search "filename.ts" --state=open
+"$GH_READ" issue list --search "filename.ts" --state=open
 ```
 
 ### Example Decision Process
@@ -733,8 +748,8 @@ discover_project_goals() {
 
   # 3. Check for urgent/high-priority goal-advancing issues
   echo "Current goal-advancing work:"
-  gh issue list --label="tier:goal-advancing" --state=open --limit=5
-  gh issue list --label="loom:urgent" --state=open --limit=5
+  "$GH_READ" issue list --label="tier:goal-advancing" --state=open --limit=5
+  "$GH_READ" issue list --label="loom:urgent" --state=open --limit=5
 
   # 4. Summary
   echo "Simplification proposals should support these focus areas"
@@ -753,10 +768,10 @@ check_backlog_balance() {
   echo "=== Backlog Tier Balance ==="
 
   # Count issues by tier
-  tier1=$(gh issue list --label="tier:goal-advancing" --state=open --json number --jq 'length')
-  tier2=$(gh issue list --label="tier:goal-supporting" --state=open --json number --jq 'length')
-  tier3=$(gh issue list --label="tier:maintenance" --state=open --json number --jq 'length')
-  unlabeled=$(gh issue list --label="loom:issue" --state=open --json number,labels \
+  tier1=$("$GH_READ" issue list --label="tier:goal-advancing" --state=open --json number --jq 'length')
+  tier2=$("$GH_READ" issue list --label="tier:goal-supporting" --state=open --json number --jq 'length')
+  tier3=$("$GH_READ" issue list --label="tier:maintenance" --state=open --json number --jq 'length')
+  unlabeled=$("$GH_READ" issue list --label="loom:issue" --state=open --json number,labels \
     --jq '[.[] | select([.labels[].name] | any(startswith("tier:")) | not)] | length')
 
   total=$((tier1 + tier2 + tier3 + unlabeled))
@@ -1102,7 +1117,7 @@ src/lib/old-api.ts:  // }
 # Found commented-out code - create standalone issue to remove it
 
 # 4. Check open issues for simplification opportunities
-$ gh issue list --state=open --json number,title,body --jq '.[] | "\(.number): \(.title)"'
+$ "$GH_READ" issue list --state=open --json number,title,body --jq '.[] | "\(.number): \(.title)"'
 42: Refactor authentication system
 55: Add user profile editor
 ...
@@ -1160,14 +1175,14 @@ rg "^import" --count | sort -t: -k2 -rn | head -20
 
 ```bash
 # Find open issues to potentially comment on
-gh issue list --state=open --json number,title,labels \
+"$GH_READ" issue list --state=open --json number,title,labels \
   --jq '.[] | select(([.labels[].name] | inside(["loom:hermit"])) | not) | "\(.number): \(.title)"'
 
 # View issue details before commenting
 gh issue view <number> --comments
 
 # Search for issues related to specific topic
-gh issue list --search "authentication" --state=open
+"$GH_READ" issue list --search "authentication" --state=open
 
 # Add simplification comment to issue
 gh issue comment <number> --body "$(cat <<'EOF'
@@ -1180,5 +1195,5 @@ EOF
 gh issue create --title "Remove [thing]" --body "..." --label "loom:hermit"
 
 # Check existing hermit suggestions
-gh issue list --label="loom:hermit" --state=open
+"$GH_READ" issue list --label="loom:hermit" --state=open
 ```
