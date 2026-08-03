@@ -176,6 +176,15 @@ pub(crate) fn build_status_json_value(
         // reports for itself, so its telemetry is being filed under the wrong
         // host. `null` in the common case (ids agree, or no exporter running).
         "observability_host_id_mismatch": report.observability_host_id_mismatch,
+        // Positive export-liveness signal (#5083). Unlike the anomaly-only
+        // field above, this is non-null for any daemon of this vintage and
+        // always carries a `state`, so a watch loop can assert health rather
+        // than infer it from the absence of a warning:
+        //   loom-daemon status --json \
+        //     | jq -e '.observability_export.state == "healthy"'
+        // States: disabled | starting | never_exported | healthy |
+        // host_id_mismatch | failing. `null` only from a pre-#5083 daemon.
+        "observability_export": report.observability_export,
         "dynamic_cap": {
             "token_pool_size": report.token_pool_size,
             // The directory the daemon resolved for the pool above (#4292) —
@@ -689,6 +698,85 @@ fn render_preflight_advisory_line(report: &DaemonStatusReport) -> Option<String>
     ))
 }
 
+/// The `Observability: …` telemetry-export line (Issue #5083) — always
+/// rendered, because the whole point is that "healthy" must be *stated*, not
+/// inferred from the absence of a warning.
+///
+/// Split out of [`print_status_human`] so every state is unit-testable without
+/// capturing process stdout, mirroring [`render_admission_brake_line`]. `now`
+/// is passed in (rather than read here) so the tests are deterministic.
+///
+/// `status = None` means a pre-#5083 daemon binary that never computed one —
+/// reported as `unknown`, never silently as `disabled`, which would be an
+/// invented fact about a daemon that said nothing.
+fn render_observability_line(
+    status: Option<&loom_daemon::types::ObservabilityExportStatus>,
+    now: DateTime<Utc>,
+) -> String {
+    use loom_daemon::health::format_window;
+    use loom_daemon::types::ObservabilityExportState as State;
+
+    let Some(s) = status else {
+        return "Observability: unknown (older daemon binary — restart to pick up #5083)"
+            .to_string();
+    };
+    let host = s.host_id.as_deref().unwrap_or("unknown-host");
+    let endpoint = s.endpoint.as_deref().unwrap_or("(no endpoint)");
+    let uptime = s
+        .uptime_secs(now)
+        .map_or_else(|| "?".to_string(), format_window);
+    let last_success = s
+        .last_success_age_secs(now)
+        .map_or_else(|| "never".to_string(), |age| format!("{} ago", format_window(age)));
+    // Re-derived rather than trusting the daemon-stamped `state`, so a status
+    // payload that sat in a pipe for a while still reads correctly across the
+    // grace boundary — `classify` is the single shared rule (`types.rs`).
+    match s.classify(now) {
+        State::Disabled => {
+            "Observability: disabled (no telemetry export — set observability.enabled=true to opt in)"
+                .to_string()
+        }
+        State::Starting => format!(
+            "Observability: starting — exporter up {uptime} as host_id={host}, no batch acked yet \
+             (first flush due within {}s) → {endpoint}",
+            s.flush_interval_secs.unwrap_or(0)
+        ),
+        State::NeverExported => format!(
+            "Observability: NEVER EXPORTED — running {uptime} as host_id={host} and no batch has \
+             EVER been acked; telemetry is not reaching {endpoint}{}",
+            s.last_failure_detail
+                .as_deref()
+                .map_or_else(String::new, |d| format!(" (last error: {d})")),
+        ),
+        State::Healthy => format!(
+            "Observability: OK — last export {last_success}, {} record(s) as host_id={host} → {endpoint}",
+            s.records_exported
+        ),
+        State::HostIdMismatch => format!(
+            "Observability: HOST-ID MISMATCH — telemetry is landing under host_id={}, not {host} \
+             (last export {last_success}, {} record(s)) → {endpoint}",
+            s.ingest_host_id.as_deref().unwrap_or("unknown"),
+            s.records_exported
+        ),
+        State::Failing => format!(
+            "Observability: FAILING — {} consecutive failed flush(es) as host_id={host}, last \
+             success {last_success} → {endpoint}{}",
+            s.consecutive_failures,
+            s.last_failure_detail
+                .as_deref()
+                .map_or_else(String::new, |d| format!(" (last error: {d})")),
+        ),
+        // Only reachable from a NEWER daemon reporting a state this build does
+        // not know. Say so plainly rather than collapsing it into one of the
+        // known states — the same "degrade legibly, never mislabel" posture the
+        // Safehouse block takes for an unknown state string (#4464).
+        State::Unrecognized => format!(
+            "Observability: unrecognized state from a newer daemon binary (host_id={host}) — \
+             upgrade this client to read it"
+        ),
+    }
+}
+
 /// The standalone `Admission brake: …` status line (#4903), or `None` when no
 /// brake is registered (older daemon / never registered) — which renders
 /// nothing at all, the zero-behavior-change baseline the host breaker's line
@@ -1107,6 +1195,17 @@ pub(crate) fn print_status_human(
             println!("Safehouse:     unknown (older daemon binary — restart to pick up #4345)")
         }
     }
+
+    // Telemetry export liveness (#5083): the positive counterpart to the
+    // host-id mismatch WARNING printed further up. Before this, "exporting
+    // fine", "observability disabled", and "configured but silently never
+    // exported" were all rendered as the same thing — nothing — and telling
+    // them apart meant grepping `daemon.log` for the *absence* of a warning.
+    // Same shape as the Safehouse block above, for the same reason.
+    println!(
+        "{}",
+        render_observability_line(report.observability_export.as_ref(), Utc::now())
+    );
 
     // Watchdog protection state (#4354): this daemon is answering, so it is
     // alive — but is anything positioned to notice when it *stops* being? Before
@@ -1904,8 +2003,9 @@ mod status_protection_tests {
     //! (#4069): the reachable payload carries `protection` and never
     //! `install_state`, and `protection` is wire-compatible-nullable so a host
     //! where no loom dir resolves still emits a well-formed payload.
-    use super::build_status_json_value;
+    use super::{build_status_json_value, render_observability_line};
     use crate::cli::status::status_client_tests::sample_report;
+    use chrono::{DateTime, Utc};
     use loom_daemon::daemon_install_state::{ProtectionReport, ProtectionState, WatchdogJob};
     use std::path::PathBuf;
 
@@ -2022,6 +2122,143 @@ mod status_protection_tests {
         assert_eq!(m["daemon_host_id"], "robb-studio");
         assert_eq!(m["ingest_host_id"], "robb-pro");
         assert!(m["first_seen_at"].is_string());
+    }
+
+    // ===================================================================
+    // Telemetry export liveness (#5083)
+    // ===================================================================
+
+    fn render_now() -> DateTime<Utc> {
+        "2026-08-03T12:00:00Z".parse().unwrap()
+    }
+
+    /// A running HTTPS exporter, up four hours, that has never been touched by
+    /// a flush attempt — the base the individual states mutate from.
+    fn export_status(
+        mutate: impl FnOnce(&mut loom_daemon::types::ObservabilityExportStatus),
+    ) -> loom_daemon::types::ObservabilityExportStatus {
+        let mut status = loom_daemon::types::ObservabilityExportStatus {
+            state: loom_daemon::types::ObservabilityExportState::Starting,
+            host_id: Some("robb-studio".to_string()),
+            ingest_host_id: None,
+            endpoint: Some("https://dashboard.example/ingest".to_string()),
+            exporter: Some("https".to_string()),
+            started_at: Some(render_now() - chrono::Duration::hours(4)),
+            last_success_at: None,
+            last_failure_at: None,
+            last_failure_detail: None,
+            records_exported: 0,
+            consecutive_failures: 0,
+            flush_interval_secs: Some(30),
+        };
+        mutate(&mut status);
+        status
+    }
+
+    #[test]
+    fn observability_line_states_health_positively_with_the_host_id() {
+        // AC1: an operator can confirm telemetry is flowing, and under which
+        // host_id, without reading logs.
+        let status = export_status(|e| {
+            e.last_success_at = Some(render_now() - chrono::Duration::seconds(12));
+            e.records_exported = 3481;
+        });
+        let line = render_observability_line(Some(&status), render_now());
+        assert!(line.starts_with("Observability: OK"), "{line}");
+        assert!(line.contains("12s ago"), "{line}");
+        assert!(line.contains("host_id=robb-studio"), "{line}");
+        assert!(line.contains("3481 record(s)"), "{line}");
+    }
+
+    #[test]
+    fn observability_line_distinguishes_disabled_from_healthy() {
+        // AC2: a host with observability disabled must not read like a healthy
+        // one (before #5083 both rendered as nothing at all).
+        let disabled = render_observability_line(
+            Some(&loom_daemon::types::ObservabilityExportStatus::disabled()),
+            render_now(),
+        );
+        assert!(disabled.contains("disabled"), "{disabled}");
+        assert!(!disabled.contains("OK"), "{disabled}");
+    }
+
+    #[test]
+    fn observability_line_surfaces_never_exported_as_a_problem() {
+        // AC3: the silent failure mode — configured, running for hours, and
+        // nothing has ever landed.
+        let line = render_observability_line(Some(&export_status(|_| {})), render_now());
+        assert!(line.contains("NEVER EXPORTED"), "{line}");
+        assert!(line.contains("host_id=robb-studio"), "{line}");
+        assert!(line.contains("dashboard.example"), "{line}");
+    }
+
+    #[test]
+    fn observability_line_does_not_alarm_during_the_startup_grace_window() {
+        // A daemon rolled 20 seconds ago must not read as broken.
+        let status = export_status(|e| {
+            e.started_at = Some(render_now() - chrono::Duration::seconds(20));
+        });
+        let line = render_observability_line(Some(&status), render_now());
+        assert!(line.contains("starting"), "{line}");
+        assert!(!line.contains("NEVER EXPORTED"), "{line}");
+    }
+
+    #[test]
+    fn observability_line_reports_a_failing_exporter_with_its_error() {
+        let status = export_status(|e| {
+            e.last_success_at = Some(render_now() - chrono::Duration::hours(2));
+            e.consecutive_failures = 4;
+            e.last_failure_detail = Some("sink rejected batch: HTTP 401 — denied".to_string());
+        });
+        let line = render_observability_line(Some(&status), render_now());
+        assert!(line.contains("FAILING"), "{line}");
+        assert!(line.contains("HTTP 401"), "{line}");
+        assert!(line.contains("2h ago"), "{line}");
+    }
+
+    #[test]
+    fn observability_line_names_both_identities_on_a_mismatch() {
+        let status = export_status(|e| {
+            e.last_success_at = Some(render_now() - chrono::Duration::seconds(12));
+            e.ingest_host_id = Some("robb-pro".to_string());
+            e.records_exported = 77;
+        });
+        let line = render_observability_line(Some(&status), render_now());
+        assert!(line.contains("HOST-ID MISMATCH"), "{line}");
+        assert!(line.contains("robb-pro") && line.contains("robb-studio"), "{line}");
+    }
+
+    #[test]
+    fn observability_line_from_an_older_daemon_is_unknown_not_disabled() {
+        // A `None` field means the daemon could not answer — reporting it as
+        // "disabled" would invent a fact about a daemon that said nothing.
+        let line = render_observability_line(None, render_now());
+        assert!(line.contains("unknown"), "{line}");
+        assert!(line.contains("older daemon binary"), "{line}");
+    }
+
+    #[test]
+    fn observability_export_is_machine_readable_in_json() {
+        // AC5: a watch loop asserts on the state string directly.
+        let mut report = sample_report();
+        report.observability_export = Some(export_status(|e| {
+            e.last_success_at = Some(chrono::Utc::now());
+            e.records_exported = 12;
+            e.state = loom_daemon::types::ObservabilityExportState::Healthy;
+        }));
+        let value = build_status_json_value(&report, None, &no_update(), None, None);
+        let e = &value["observability_export"];
+        assert_eq!(e["state"], "healthy");
+        assert_eq!(e["host_id"], "robb-studio");
+        assert_eq!(e["records_exported"], 12);
+        assert_eq!(e["endpoint"], "https://dashboard.example/ingest");
+        assert!(e["last_success_at"].is_string());
+    }
+
+    #[test]
+    fn observability_export_is_null_for_a_pre_5083_daemon() {
+        let value = build_status_json_value(&sample_report(), None, &no_update(), None, None);
+        assert!(value["observability_export"].is_null());
     }
 
     #[test]

@@ -26,7 +26,7 @@
 //! | roles | [`crate::role_runner::role_tick_records`] |
 //! | queues | [`crate::pipeline_snapshot`] (`queued`) |
 //! | throughput | [`crate::pipeline_snapshot`] (`merged_24h`, over the requested window) |
-//! | observability *(only when non-green)* | [`crate::types::DaemonStatusReport::observability_host_id_mismatch`], published by [`crate::observability::HostIdStatus`] |
+//! | observability *(only when non-green)* | [`crate::types::DaemonStatusReport::observability_host_id_mismatch`] (published by [`crate::observability::HostIdStatus`]) + [`crate::types::DaemonStatusReport::observability_export`] (published by [`crate::observability::ExportStatus`], #5083) |
 //!
 //! [`assess`] itself is **pure** — it takes an already-collected
 //! [`HealthInputs`] and returns a [`HealthReport`] — so every verdict rule
@@ -69,7 +69,7 @@ use serde::Serialize;
 use crate::daemon_install_state::{InstallState, InstallStateReport};
 use crate::pipeline_snapshot::RepoPipelineSnapshot;
 use crate::script_helpers::log_filter::strip_ansi;
-use crate::types::{DaemonStatusReport, RoleTickRecord};
+use crate::types::{DaemonStatusReport, ObservabilityExportState, RoleTickRecord};
 
 // ============================================================================
 // Exit-code contract
@@ -1522,53 +1522,132 @@ pub fn assess_throughput(inputs: &HealthInputs) -> HealthSection {
 // Observability section (Issue #4830) — conditional
 // ============================================================================
 
-/// Assess the observability exporter's host-identity check: `Some(DEGRADED)`
-/// when the daemon has confirmed that its ingest key is bound to a *different*
-/// `host_id` than the one it reports for itself, else `None`.
+/// Assess the observability exporter: `Some(DEGRADED)` when telemetry is
+/// demonstrably going wrong, else `None`.
 ///
 /// **Deliberately conditional**, unlike every other section. There is nothing
-/// to say when the exporter is disabled, keyless, or reporting under the right
-/// identity — which is all but a handful of daemons — so a permanent
+/// to say when the exporter is disabled, still starting, or exporting under the
+/// right identity — which is all but a handful of daemons — so a permanent
 /// `observability GREEN — ok` line would be pure noise on a surface whose whole
-/// value is that every line printed is worth reading. When the note IS present
-/// the condition is real and confirmed by the backend's own echo, never
-/// inferred, so it is `Degraded`, never `Unknown`.
+/// value is that every line printed is worth reading. That anomaly-only rule
+/// (#4830) is preserved verbatim; the *positive* confirmation an operator needs
+/// lives on `loom-daemon status` instead (`Observability: OK — …`, #5083) and,
+/// machine-readably, in `DaemonStatusReport::observability_export`.
+///
+/// Three conditions qualify as anomalies:
+///
+/// 1. **host-identity mismatch** (#4830) — the daemon has confirmed its ingest
+///    key is bound to a *different* `host_id` than it reports for itself, so
+///    every record it pushes is filed under the wrong host. Kept first and
+///    byte-for-byte as it was, including its `detail` keys.
+/// 2. **never exported** (#5083) — the exporter has been running well past its
+///    flush cadence and has still never had a single batch acked. This is the
+///    silent failure this section previously rendered *identically to healthy*:
+///    as nothing at all.
+/// 3. **export failing** (#5083) — flushes are actively erroring, so the queue
+///    is backing up and telemetry is going stale.
 ///
 /// Read straight off [`DaemonStatusReport`] rather than through a dedicated
-/// [`HealthInputs`] field: the mismatch is *daemon-process* state (only the
-/// daemon holds both halves — its own identity and the backend's echo), and
+/// [`HealthInputs`] field: this is *daemon-process* state (only the daemon
+/// holds both halves — its own identity and the backend's responses), and
 /// `health` runs in a separate CLI process, so the IPC status report is the
 /// only place it can come from. A parallel collector field would just copy it
 /// and add a way for the two to disagree.
 #[must_use]
 pub fn assess_observability(inputs: &HealthInputs) -> Option<HealthSection> {
-    let mismatch = inputs
-        .status
-        .as_ref()?
-        .observability_host_id_mismatch
-        .as_ref()?;
-    let age = inputs
-        .at
-        .signed_duration_since(mismatch.first_seen_at)
-        .num_seconds()
-        .max(0);
-    Some(HealthSection::new(
-        "observability",
-        Verdict::Degraded,
-        format!(
-            "telemetry is being filed under {} — the ingest key on this host is bound to that \
-             id, not to {} (first seen {} ago)",
-            mismatch.ingest_host_id,
-            mismatch.daemon_host_id,
-            format_window(u64::try_from(age).unwrap_or(0))
-        ),
-        serde_json::json!({
-            "daemon_host_id": mismatch.daemon_host_id,
-            "ingest_host_id": mismatch.ingest_host_id,
-            "first_seen_at": mismatch.first_seen_at,
-            "first_seen_age_secs": age,
-        }),
-    ))
+    let status = inputs.status.as_ref()?;
+    // Positive facts, when the daemon is new enough to report them (#5083) —
+    // folded into the mismatch note's `detail` below so a machine consumer
+    // reading a DEGRADED section still learns whether anything is landing at
+    // all, and used on its own for conditions 2 and 3.
+    //
+    // `state` is re-stamped from this report's own `at` before serialization:
+    // the daemon classified it at status-build time, and a section whose
+    // verdict said one thing while its `detail.state` said another would be a
+    // new way for the two halves of the same answer to disagree — precisely
+    // the failure mode this issue is about.
+    let export = status.observability_export.as_ref().map(|e| {
+        let mut classified = e.clone();
+        classified.state = classified.classify(inputs.at);
+        classified
+    });
+    let export = export.as_ref();
+    let export_detail = export.map_or(serde_json::Value::Null, |e| {
+        serde_json::to_value(e).unwrap_or(serde_json::Value::Null)
+    });
+
+    if let Some(mismatch) = status.observability_host_id_mismatch.as_ref() {
+        let age = inputs
+            .at
+            .signed_duration_since(mismatch.first_seen_at)
+            .num_seconds()
+            .max(0);
+        return Some(HealthSection::new(
+            "observability",
+            Verdict::Degraded,
+            format!(
+                "telemetry is being filed under {} — the ingest key on this host is bound to that \
+                 id, not to {} (first seen {} ago)",
+                mismatch.ingest_host_id,
+                mismatch.daemon_host_id,
+                format_window(u64::try_from(age).unwrap_or(0))
+            ),
+            serde_json::json!({
+                "daemon_host_id": mismatch.daemon_host_id,
+                "ingest_host_id": mismatch.ingest_host_id,
+                "first_seen_at": mismatch.first_seen_at,
+                "first_seen_age_secs": age,
+                "export": export_detail,
+            }),
+        ));
+    }
+
+    let export = export?;
+    match export.classify(inputs.at) {
+        // The #5083 headline: configured, running, and has never once
+        // succeeded. Called out only after the grace window
+        // (`never_exported_grace_secs`) so a freshly-restarted daemon is never
+        // reported as broken for its first flush interval.
+        ObservabilityExportState::NeverExported => {
+            Some(HealthSection::new(
+                "observability",
+                Verdict::Degraded,
+                format!(
+                "exporter has been running {} as {} and has NEVER had a batch acked — telemetry \
+                 is not reaching {}{}",
+                format_window(export.uptime_secs(inputs.at).unwrap_or(0)),
+                export.host_id.as_deref().unwrap_or("unknown-host"),
+                export.endpoint.as_deref().unwrap_or("the configured endpoint"),
+                export
+                    .last_failure_detail
+                    .as_deref()
+                    .map_or_else(String::new, |d| format!(" (last error: {d})")),
+            ),
+                export_detail,
+            ))
+        }
+        ObservabilityExportState::Failing => Some(HealthSection::new(
+            "observability",
+            Verdict::Degraded,
+            format!(
+                "{} consecutive failed flush(es) as {}; last successful export {}{}",
+                export.consecutive_failures,
+                export.host_id.as_deref().unwrap_or("unknown-host"),
+                export.last_success_age_secs(inputs.at).map_or_else(
+                    || "never".to_string(),
+                    |age| format!("{} ago", format_window(age))
+                ),
+                export
+                    .last_failure_detail
+                    .as_deref()
+                    .map_or_else(String::new, |d| format!(" (last error: {d})")),
+            ),
+            export_detail,
+        )),
+        // Disabled / Starting / Healthy / HostIdMismatch (handled above) — no
+        // section, exactly as before #5083.
+        _ => None,
+    }
 }
 
 // ============================================================================
@@ -2227,6 +2306,161 @@ mod tests {
         assert_eq!(keys.last(), Some(&"observability"));
         assert_eq!(keys.len(), 7);
         assert_eq!(assess(&healthy_inputs()).sections.len(), 6);
+    }
+
+    // ===================================================================
+    // Observability export liveness (#5083)
+    // ===================================================================
+
+    /// Inputs whose daemon reports a running exporter with the given export
+    /// record. `now()` is the report's `at`, so ages are exact.
+    fn exporting_inputs(
+        mutate: impl FnOnce(&mut crate::types::ObservabilityExportStatus),
+    ) -> HealthInputs {
+        let mut inputs = healthy_inputs();
+        let mut export = crate::types::ObservabilityExportStatus {
+            state: ObservabilityExportState::Starting,
+            host_id: Some("robb-studio".to_string()),
+            ingest_host_id: None,
+            endpoint: Some("https://dashboard.example/ingest".to_string()),
+            exporter: Some("https".to_string()),
+            started_at: Some(now() - chrono::Duration::hours(4)),
+            last_success_at: None,
+            last_failure_at: None,
+            last_failure_detail: None,
+            records_exported: 0,
+            consecutive_failures: 0,
+            flush_interval_secs: Some(30),
+        };
+        mutate(&mut export);
+        inputs.status.as_mut().unwrap().observability_export = Some(export);
+        inputs
+    }
+
+    #[test]
+    fn a_healthy_exporter_still_renders_no_observability_section() {
+        // The #4830 guarantee this issue must NOT reverse: exporting normally
+        // stays silent on the anomaly-only surface. The positive confirmation
+        // lives on `loom-daemon status` instead.
+        let inputs = exporting_inputs(|e| {
+            e.last_success_at = Some(now() - chrono::Duration::seconds(12));
+            e.records_exported = 3481;
+        });
+        let report = assess(&inputs);
+        assert!(report.section("observability").is_none());
+        assert_eq!(report.overall, Verdict::Green);
+        assert_eq!(report.sections.len(), 6);
+    }
+
+    #[test]
+    fn a_disabled_exporter_still_renders_no_observability_section() {
+        let mut inputs = healthy_inputs();
+        inputs.status.as_mut().unwrap().observability_export =
+            Some(crate::types::ObservabilityExportStatus::disabled());
+        assert!(assess_observability(&inputs).is_none());
+    }
+
+    #[test]
+    fn a_starting_exporter_is_not_yet_called_out() {
+        // A daemon restarted 20 seconds ago has not had a fair chance to
+        // flush; reporting it as broken would make every roll look like an
+        // outage.
+        let inputs = exporting_inputs(|e| {
+            e.started_at = Some(now() - chrono::Duration::seconds(20));
+        });
+        assert!(assess_observability(&inputs).is_none());
+    }
+
+    #[test]
+    fn a_never_exporting_host_is_a_degraded_observability_note() {
+        // THE gap this issue exists for: configured, running for four hours,
+        // and has never landed a single batch — which before #5083 rendered
+        // exactly like a healthy host: no section at all.
+        let inputs = exporting_inputs(|_| {});
+        let report = assess(&inputs);
+        let section = report.section("observability").expect("section present");
+        assert_eq!(section.verdict, Verdict::Degraded);
+        assert!(
+            section.summary.contains("NEVER"),
+            "the note must name the condition unambiguously: {}",
+            section.summary
+        );
+        assert!(
+            section.summary.contains("robb-studio")
+                && section.summary.contains("dashboard.example"),
+            "the note must name the host identity AND the endpoint: {}",
+            section.summary
+        );
+        // Machine-readable for a watch loop (AC5).
+        assert_eq!(section.detail["state"], "never_exported");
+        assert_eq!(section.detail["host_id"], "robb-studio");
+        assert!(section.detail["last_success_at"].is_null());
+        assert_eq!(report.overall, Verdict::Degraded);
+        assert_eq!(report.exit_code(), EXIT_DEGRADED);
+    }
+
+    #[test]
+    fn a_failing_exporter_is_a_degraded_observability_note() {
+        let inputs = exporting_inputs(|e| {
+            e.last_success_at = Some(now() - chrono::Duration::hours(2));
+            e.records_exported = 900;
+            e.consecutive_failures = 4;
+            e.last_failure_at = Some(now() - chrono::Duration::seconds(30));
+            e.last_failure_detail = Some("sink rejected batch: HTTP 401 — denied".to_string());
+        });
+        let report = assess(&inputs);
+        let section = report.section("observability").expect("section present");
+        assert_eq!(section.verdict, Verdict::Degraded);
+        assert!(
+            section.summary.contains("HTTP 401"),
+            "the exporter's own error must reach the operator: {}",
+            section.summary
+        );
+        assert!(
+            section.summary.contains("2h"),
+            "a regression must be distinguishable from never-worked: {}",
+            section.summary
+        );
+        assert_eq!(section.detail["state"], "failing");
+        assert_eq!(section.detail["consecutive_failures"], 4);
+    }
+
+    #[test]
+    fn a_mismatch_still_wins_and_now_carries_the_export_facts() {
+        // #4830 regression guard: the mismatch note is unchanged, and the
+        // positive facts ride along in `detail.export` so a machine consumer
+        // reading a DEGRADED section still learns whether anything is landing.
+        let mut inputs = mismatched_inputs(3600);
+        inputs.status.as_mut().unwrap().observability_export =
+            Some(crate::types::ObservabilityExportStatus {
+                state: ObservabilityExportState::HostIdMismatch,
+                host_id: Some("robb-studio".to_string()),
+                ingest_host_id: Some("robb-pro".to_string()),
+                last_success_at: Some(now() - chrono::Duration::seconds(12)),
+                records_exported: 77,
+                started_at: Some(now() - chrono::Duration::hours(4)),
+                ..Default::default()
+            });
+        let section = assess_observability(&inputs).expect("section present");
+        assert_eq!(section.verdict, Verdict::Degraded);
+        // Unchanged #4830 keys.
+        assert_eq!(section.detail["daemon_host_id"], "robb-studio");
+        assert_eq!(section.detail["ingest_host_id"], "robb-pro");
+        assert_eq!(section.detail["first_seen_age_secs"], 3600);
+        // Additive #5083 payload.
+        assert_eq!(section.detail["export"]["records_exported"], 77);
+        assert_eq!(section.detail["export"]["state"], "host_id_mismatch");
+    }
+
+    #[test]
+    fn a_pre_5083_daemon_reporting_no_export_field_renders_nothing() {
+        // An older daemon cannot answer, so the section stays absent — the
+        // pre-#5083 baseline, never a fabricated "never exported".
+        let mut inputs = healthy_inputs();
+        let status = inputs.status.as_mut().unwrap();
+        status.observability_export = None;
+        status.observability_host_id_mismatch = None;
+        assert!(assess_observability(&inputs).is_none());
     }
 
     #[test]

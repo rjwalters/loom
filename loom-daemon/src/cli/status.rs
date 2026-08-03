@@ -806,6 +806,7 @@ pub(crate) mod status_client_tests {
             daemon_build_commit: Some("18887b5c".to_string()),
             work_finder_interval_secs: Some(60),
             observability_host_id_mismatch: None,
+            observability_export: None,
         }
     }
 
