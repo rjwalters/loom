@@ -1,4 +1,28 @@
 name: Build and Release
+#
+# Release artifacts (Epic #4990 Phase 1, #5003): on GitHub Release creation
+# this workflow cross-builds `loom-daemon` for every platform in the fleet's
+# target triples and uploads, for EACH one, both the binary and a `.sha256`
+# checksum file as Release assets:
+#
+#   - loom-daemon-aarch64-apple-darwin(.sha256)
+#   - loom-daemon-x86_64-unknown-linux-gnu(.sha256)
+#   - loom-daemon-aarch64-unknown-linux-gnu(.sha256)
+#
+# This is Phase 1 of #4990 (foundation only): NO code signing, notarization,
+# or org-specific identity of any kind is applied here — every artifact is
+# unsigned, verified only by its checksum. Platform signing is a later,
+# secrets-gated phase (#4990 Phase 2); nothing here should ever need to name a
+# cert, team ID, or signing identity — if it does, that's a scope regression.
+# Consuming these artifacts from `loom-daemon-update.sh` / the daemon
+# auto-updater is also out of scope here (#4990 Phase 3) — the LOCAL
+# `cargo build` path in `loom-daemon-update.sh` remains the default/fallback
+# for dev machines, canaries, and forks with no Release access.
+#
+# Each target builds in its own matrix job with `fail-fast: false`: one
+# platform's build failure fails that job (and therefore the overall workflow
+# run) loudly — it never silently drops just that platform's artifact while
+# reporting overall success.
 
 on:
   release:
@@ -15,52 +39,80 @@ permissions:
 
 jobs:
   build-daemon:
-    name: Build loom-daemon
-    runs-on: macos-14  # Apple Silicon runner
+    name: Build loom-daemon (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Never mask a platform's failure with another's success, and never let
+      # one platform's failure cancel an in-flight build for another.
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14 # Apple Silicon runner (native build)
+            cross: false
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest # native build
+            cross: false
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            # No native aarch64 Linux runner assumption is made here — cross
+            # compile via an aarch64 gcc/binutils toolchain instead, which
+            # works on any ubuntu-latest runner regardless of arm64-runner
+            # availability for this repo/org.
+            cross: true
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
+          targets: ${{ matrix.target }}
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
             .
+          key: ${{ matrix.target }}
 
-      - name: Ensure both Apple targets installed
+      - name: Install cross-compilation toolchain
+        if: matrix.cross
         run: |
-          rustup target add aarch64-apple-darwin
-          rustup target add x86_64-apple-darwin
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
 
-      - name: Build daemon (ARM64)
-        run: |
-          cargo build --package loom-daemon --release --target aarch64-apple-darwin
-          mkdir -p target/release
-          cp target/aarch64-apple-darwin/release/loom-daemon target/release/loom-daemon-aarch64-apple-darwin
+      - name: Build loom-daemon
+        env:
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
+          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: cargo build --package loom-daemon --release --target ${{ matrix.target }}
 
-      - name: Build daemon (x86_64)
+      - name: Package artifact + checksum
         run: |
-          cargo build --package loom-daemon --release --target x86_64-apple-darwin
-          mkdir -p target/release
-          cp target/x86_64-apple-darwin/release/loom-daemon target/release/loom-daemon-x86_64-apple-darwin || true
-
-      - name: List build artifacts
-        run: |
-          echo "=== Daemon binaries ==="
-          ls -la target/release/loom-daemon-* || true
+          set -euo pipefail
+          mkdir -p dist
+          artifact="dist/loom-daemon-${{ matrix.target }}"
+          cp "target/${{ matrix.target }}/release/loom-daemon" "$artifact"
+          cd dist
+          if command -v shasum >/dev/null 2>&1; then
+            shasum -a 256 "loom-daemon-${{ matrix.target }}" > "loom-daemon-${{ matrix.target }}.sha256"
+          else
+            sha256sum "loom-daemon-${{ matrix.target }}" > "loom-daemon-${{ matrix.target }}.sha256"
+          fi
+          ls -la
 
       - name: Upload release assets
         if: github.event_name == 'release'
         uses: softprops/action-gh-release@v3
         with:
           files: |
-            target/release/loom-daemon-aarch64-apple-darwin
-            target/release/loom-daemon-x86_64-apple-darwin
+            dist/loom-daemon-${{ matrix.target }}
+            dist/loom-daemon-${{ matrix.target }}.sha256
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -68,8 +120,8 @@ jobs:
         if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v7
         with:
-          name: loom-daemon-binaries
+          name: loom-daemon-${{ matrix.target }}
           path: |
-            target/release/loom-daemon-aarch64-apple-darwin
-            target/release/loom-daemon-x86_64-apple-darwin
+            dist/loom-daemon-${{ matrix.target }}
+            dist/loom-daemon-${{ matrix.target }}.sha256
           retention-days: 7
