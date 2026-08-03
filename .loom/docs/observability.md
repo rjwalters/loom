@@ -184,6 +184,126 @@ in [`dashboard/docs/reference-deployment.md`](../../dashboard/docs/reference-dep
 — useful as a concrete filled-in example of every value the deploy runbook
 asks you to supply, not as a second copy of the how-to.
 
+## 7. Renaming a host
+
+The `host_id` a fleet host reports (`$LOOM_HOST_ID` if set, else `$HOSTNAME`,
+else `hostname` — `loom-daemon/src/sweep_registry/mod.rs::host_identity`) is
+also the identity its ingest key is bound to and the primary key every stored
+telemetry row is filed under. There is no rename endpoint — changing it means
+provisioning a **new** identity, cutting the host over, and only then dealing
+with the old one. Follow these steps in order; do not skip ahead to step 5 or
+6 before step 4 is green. `$BASE` (the Worker's URL) and `$ADMIN` (the admin
+token) below are the same values set up in the deploy runbook's §7 admin
+token / §8 host provisioning.
+
+1. **Provision the new identity.**
+
+   ```bash
+   curl -sS -X POST "$BASE/admin/hosts" -H "authorization: Bearer $ADMIN" \
+     -H 'content-type: application/json' -d '{"host_id":"<new-host-id>"}'
+   # => {"host_id":"<new-host-id>","ingest_key":"<64 hex chars — SHOWN ONLY ONCE>"}
+   ```
+
+   Capture the `ingest_key` now — only its SHA-256 hash is stored server-side.
+
+2. **Install the key on the host.**
+
+   ```bash
+   printf '%s' '<the ingest_key from step 1>' > ~/.loom/observability/ingest.key
+   chmod 600 ~/.loom/observability/ingest.key
+   ```
+
+   (A different path is fine as long as it matches that host's
+   `observability.ingestKeyFile` / `LOOM_OBSERVABILITY_INGEST_KEY_FILE` — see
+   §9 of the deploy runbook.)
+
+3. **Flip `$LOOM_HOST_ID` and restart the daemon.** On a launchd-managed host,
+   edit the `LOOM_HOST_ID` environment entry in the daemon's plist to
+   `<new-host-id>`, then cycle the job so launchd picks up the new
+   environment (a plain process restart does not re-read the plist):
+
+   ```bash
+   launchctl bootout gui/$(id -u)/com.rjwalters.loom-daemon
+   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.rjwalters.loom-daemon.plist
+   ```
+
+   `bootout` is asynchronous — it can return before the old job has fully
+   torn down — and a `bootstrap` issued into that window can fail
+   transiently with `Bootstrap failed: 5: Input/output error`. Don't treat
+   that as terminal: confirm the job is actually gone
+   (`launchctl print gui/$(id -u)/com.rjwalters.loom-daemon` fails to find
+   it), then re-issue `bootstrap`. Either way, verify the outcome by pid, not
+   by the exit code of `bootstrap` itself:
+
+   ```bash
+   launchctl print gui/$(id -u)/com.rjwalters.loom-daemon | grep -E 'state|pid'
+   # expect: state = running, with a NEW pid distinct from the pre-rename one
+   ```
+
+   If `state = running` doesn't appear (or the pid is unchanged), the
+   bootstrap didn't take — retry it rather than moving on.
+
+4. **Verify via `loom-daemon health` before touching any data.**
+
+   ```bash
+   loom-daemon health
+   ```
+
+   Confirm the daemon reports `<new-host-id>` (not the old one, and not an
+   `observability_host_id_mismatch`/DEGRADED line — see the deploy runbook's
+   §8 mismatch-detection note) and that telemetry is actually landing under
+   the new id (§10 of the deploy runbook: a D1 row count or the dashboard
+   card for `<new-host-id>`). Do not proceed to step 5 or 6 until this is
+   green — an unverified rename with a still-broken exporter means the next
+   step either backs up the wrong boundary or revokes the only working key.
+
+5. **Optional: back up and relabel historical D1 rows.** Only worth doing if
+   you need continuous historical trend lines across the rename; otherwise
+   skip this step entirely and let 90-day retention age the old rows out on
+   its own (§"Tuning retention" in the deploy runbook) — that is a legitimate
+   default, not a shortcut.
+
+   If you do want continuity, take a backup first (`wrangler d1 export`, or
+   the `SELECT` pattern from §10), then relabel. Determine the cutover
+   boundary **from the data itself**, not from an assumed timestamp — query
+   the actual last row written under the old id and the first row written
+   under the new one:
+
+   ```bash
+   npx wrangler d1 execute loom-observability --remote \
+     --command "SELECT max(ts) FROM records WHERE host_id = '<old-host-id>'"
+   npx wrangler d1 execute loom-observability --remote \
+     --command "SELECT min(ts) FROM records WHERE host_id = '<new-host-id>'"
+   ```
+
+   Only relabel rows at or before the verified last-old-id timestamp; do not
+   guess a boundary from wall-clock time, which can silently misattribute
+   rows written during any overlap or clock skew around the cutover.
+
+6. **Revoke the old key**, only after step 4 is green and any relabeling in
+   step 5 you intended to do is complete:
+
+   ```bash
+   curl -sS -X POST "$BASE/admin/hosts/<old-host-id>/revoke" -H "authorization: Bearer $ADMIN"
+   ```
+
+### Known gaps
+
+These are real, currently-open sharp edges in this procedure — not fixed by
+following the steps above carefully, tracked separately rather than restated
+here:
+
+- A daemon restart during the rename (step 3) can silently drop in-flight
+  sweep outcome telemetry rather than exporting it before shutdown — #5084.
+- Step 4's health check gives no *positive* confirmation that telemetry is
+  actually flowing; its silence looks identical whether export is healthy or
+  has silently never worked — #5083.
+- Revoking the old key (step 6) while sweep entries still reference the old
+  `host_id` and are active or orphaned can leave a phantom fleet member on
+  the dashboard until those entries clear — #5078.
+- Re-provisioning a previously-revoked `host_id` (e.g. reusing the old name
+  later) currently 409s with no override — #5082.
+
 ## Map of every detail doc
 
 | Doc | Covers |
