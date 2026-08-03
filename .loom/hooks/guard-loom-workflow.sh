@@ -224,6 +224,12 @@ mask_cat_heredoc_bodies() {
                 if (wordend <= start) continue
                 if (substr(line, wordend, 1) != qc) continue
                 delim = substr(line, start, wordend - start)
+                # The opener line must END after the quoted delimiter. Anything
+                # trailing it routes cat stdout somewhere else (a pipe into a
+                # shell, a redirect into a file), which is the class that must
+                # stay visible to the merge-redirect grep.
+                rest = substr(line, wordend + 1)
+                if (rest ~ /[^ \t]/) continue
                 closeat = 0
                 for (j = i + 1; j <= nl; j++) {
                     trimmed = lines[j]
