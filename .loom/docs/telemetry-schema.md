@@ -394,9 +394,18 @@ happens to run `loom-daemon health` locally on that one host.
   omitted from the wire when empty (`skip_serializing_if = "Vec::is_empty"`),
   mirroring `managed_repos`/`active_sweep_ids`.
 - `root` is a local workspace filesystem path, not a forge `owner/repo`
-  slug — it names no repository, issue, branch, or PR, so (unlike
-  `managed_repos`) `roles` passes through public redaction unchanged
-  (`dashboard/src/redaction.ts`).
+  slug — it names no repository, issue, branch, or PR. But on the common
+  macOS/Linux home-directory layout (`/Users/<user>/…`, `/home/<user>/…`) its
+  leading segment *does* name the **operator**, the same "who runs the fleet"
+  category `tokens.snapshot`'s `accounts` is held back for. So (redaction
+  class: **per-entry, `root` basenamed**) the authenticated `/api/*` surface
+  keeps the full path, but the public, unauthenticated view only ever gets each
+  `root` truncated to its basename — mirroring the daemon's
+  `RoleFailure::label()` and the frontend's `pathBasename`. `total`/`ok` and
+  each failure's `role`/`failures`/`last_at`/`detail` pass through unchanged.
+  Enforced by `redactRoleTickHealth` in `dashboard/src/redaction.ts` (like
+  `managed_repos`, `roles` is deliberately absent from the raw allowlist and
+  only reaches a public response through that derivation).
 
 ## Per-host reporting redundancy (why 3x storage is intentional, Issue #4999)
 
