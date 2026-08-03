@@ -33,19 +33,31 @@ const STATUS_LABEL: Record<HostStatus, string> = {
   unknown: "No data",
 };
 
+/**
+ * Fallback tooltip text per status, used when a host has no more specific
+ * reason to show — `"degraded"` almost always does (see `distressReason` /
+ * the `"token pool..."` fallback in `fleet.ts`'s `buildHostView`), so its
+ * entry here is only a defensive backstop, never the normal case.
+ */
 const STATUS_TITLE: Record<HostStatus, string> = {
   ok: "Reporting recently; token pool has healthy capacity",
-  degraded: "Reporting recently, but the token pool is at or near exhaustion",
+  degraded: "Reporting recently, but showing signs of distress",
   stale: "No telemetry received recently — the daemon may be stopped or offline",
   unknown: "This host has not pushed host.health or tokens.snapshot yet",
 };
 
-export function statusBadge(status: HostStatus): HTMLElement {
+/**
+ * `reason` — from `HostView.degradedReason` — names the specific cause
+ * (`"dispatch halted: host-distress breaker …"`, `"token pool at or near
+ * exhaustion"`, …) rather than a generic "Degraded" (#4975). Every other
+ * status keeps its fixed `STATUS_TITLE` line.
+ */
+export function statusBadge(status: HostStatus, reason?: string): HTMLElement {
   return el(
     "span",
     {
       class: `badge badge--${status}`,
-      title: STATUS_TITLE[status],
+      title: reason ?? STATUS_TITLE[status],
       data: { testid: "status-badge", status },
     },
     STATUS_LABEL[status],
@@ -118,7 +130,7 @@ export function hostCard(host: HostView, now: Date = new Date()): HTMLElement {
         { class: "card__title", href: `#/hosts/${encodeURIComponent(host.hostId)}` },
         host.hostId,
       ),
-      statusBadge(host.status),
+      statusBadge(host.status, host.degradedReason),
     ),
     el(
       "p",

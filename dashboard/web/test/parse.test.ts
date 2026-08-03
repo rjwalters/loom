@@ -61,6 +61,33 @@ describe("parseFleetSnapshot", () => {
     expect(snapshot.hosts.h?.health?.record.cpu_idle_fraction).toBe(0);
   });
 
+  it("narrows dispatch-attention state (#4975)", () => {
+    const snapshot = parseFleetSnapshot({
+      hosts: {
+        h: {
+          health: {
+            record: { kind: "host.health", dispatch_halted: true, halt_reason: "host-distress breaker" },
+            updatedAt: "2026-07-30T12:00:00Z",
+          },
+        },
+      },
+      activeSweeps: [],
+    });
+    const health = snapshot.hosts.h?.health?.record ?? {};
+    expect(health.dispatch_halted).toBe(true);
+    expect(health.halt_reason).toBe("host-distress breaker");
+  });
+
+  it("drops dispatch_halted/halt_reason absent from a pre-#4975 daemon's record, never coercing to false", () => {
+    const snapshot = parseFleetSnapshot({
+      hosts: { h: { health: { record: { kind: "host.health" }, updatedAt: "2026-07-30T12:00:00Z" } } },
+      activeSweeps: [],
+    });
+    const health = snapshot.hosts.h?.health?.record ?? {};
+    expect("dispatch_halted" in health).toBe(false);
+    expect("halt_reason" in health).toBe(false);
+  });
+
   it("defaults any visibility that is not exactly \"public\" to private", () => {
     const base = { hostId: "h", sweepId: "s", startedAt: "2026-07-30T12:00:00Z" };
     for (const visibility of [undefined, null, "private", "internal", "PUBLIC", 1, {}, ["public"]]) {

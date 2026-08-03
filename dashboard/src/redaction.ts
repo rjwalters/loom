@@ -119,6 +119,13 @@ const RECORD_FIELD_ALLOWLIST: Readonly<Record<string, readonly string[]>> = {
     "cpu_idle_fraction",
     "load_per_core",
     "worktree_root_free_gb",
+    // Dispatch-attention state (#4975): whether this host's own dispatch is
+    // currently halted (host-distress breaker / saturation-hold / rate-limit
+    // breaker) and why. Neither names a repo, issue, branch, or operator —
+    // same "describes the machine, not the work" reasoning as the fields
+    // directly above.
+    "dispatch_halted",
+    "halt_reason",
   ],
 };
 

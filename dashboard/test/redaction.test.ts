@@ -250,6 +250,22 @@ describe("redactPayload — per-kind field allowlist", () => {
     expect(redactPayload("host.health", payload)).toEqual(payload);
   });
 
+  it("host.health: dispatch-attention state (dispatch_halted/halt_reason) survives redaction (#4975)", () => {
+    // Describes the machine's own admission behavior, not any repo/operator
+    // — same reasoning as `cpu_idle_fraction`/`load_per_core` directly above
+    // it in the allowlist.
+    const payload = {
+      kind: "host.health",
+      captured_at: "2026-08-02T12:00:00Z",
+      daemon_version: "0.17.0",
+      uptime_sec: 86400,
+      logical_cpus: 28,
+      dispatch_halted: true,
+      halt_reason: "load-per-core 4.24 >= 2.50 sustained for 3 consecutive tick(s)",
+    };
+    expect(redactPayload("host.health", payload)).toEqual(payload);
+  });
+
   it("an unrecognized (forward-compatible) kind reveals only `kind`", () => {
     const redacted = redactPayload("future.kind", {
       kind: "future.kind",

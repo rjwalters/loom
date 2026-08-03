@@ -48,6 +48,16 @@ export interface HostHealthRecord {
   cpu_idle_fraction?: number;
   load_per_core?: number;
   worktree_root_free_gb?: number;
+  /** Whether this host's own dispatch is currently halted for a non-idle
+   * reason — the host-distress breaker tripped `Open`/`CoolDown`, the
+   * saturation hold, or the rate-limit breaker (Issue #4975). Absent on a
+   * record from a pre-#4975 daemon, which is indistinguishable from `false`
+   * — neither means "known to be healthy", just "not known to be halted". */
+  dispatch_halted?: boolean;
+  /** Human-readable reason for the halt (e.g. `"load-per-core 4.24 >= 2.50
+   * sustained for 3 consecutive tick(s)"`), naming the specific breaker/gate
+   * that tripped. Absent when `dispatch_halted` is absent/`false`. */
+  halt_reason?: string;
 }
 
 /** One account inside a `tokens.snapshot`. Only `exhausted` is always sent;
