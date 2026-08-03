@@ -1418,6 +1418,108 @@ function unmask_ws(s) {
 }
 '
 
+# =============================================================================
+# HEREDOC-BODY MASKING (#5000)
+#
+# extract_write_targets() (below) is fed the RAW, un-redacted value of a
+# --body/-m/--title/--notes/--comment flag whenever strip_literal_text()'s own
+# `$(`/backtick safety floor (#3679) declines to redact it -- the common
+# real-world trigger being a heredoc-wrapped value, `--body "$(cat <<'EOF'
+# ... EOF)"`, this repo's OWN recommended idiom (see CLAUDE.md/builder role)
+# for any multi-line/special-character body text. A `>` (or `;`, `&`, `|`, or
+# a write-idiom command word like `tee`) sitting on a heredoc BODY line is
+# genuinely inert DATA -- a heredoc body is never shell-parsed for
+# redirection/separator syntax, regardless of whether its delimiter is quoted
+# -- but qsplit()/mask_gt()/mask_ws() are (like awk itself) driven one
+# PHYSICAL LINE at a time, with no memory of the `"` opened several lines
+# earlier once a later heredoc-body line is reached, so a write-idiom-looking
+# byte on such a line was misread as real shell syntax, manufacturing a
+# phantom write target and denying a command that writes nothing to the
+# filesystem (#5000; same failure family as #4245/#3679, one line-boundary
+# narrower).
+#
+# mask_heredoc_bodies() sidesteps that per-line memory gap entirely rather
+# than teaching qsplit()/mask_gt()/mask_ws() cross-line state -- those three
+# are SHARED with extract_rm_targets()/parse_force_ops()/
+# lifecycle_or_cloud_reason(), out of THIS fix's scope (#5000's own Affected
+# Files list names only strip_literal_text() and extract_write_targets()/
+# mask_gt()). It walks the WHOLE (possibly multi-line) buffer ONCE, looking
+# for a `<<`/`<<-` heredoc opener whose delimiter is a bare or single/double
+# -quoted identifier (`EOF`, `'EOF'`, `"EOF"`, ... -- the near-universal
+# real-world shape), then replaces every byte of the BODY -- every full line
+# strictly between the opener line and the first following line that is
+# exactly (barring `<<-`'s permitted leading tabs) the bare delimiter -- with
+# a neutral placeholder byte (ETB, 0x17: never meaningful shell syntax, never
+# matched by any pattern elsewhere in this file). Real newlines, the opener
+# line, and the delimiter line itself are all left untouched, so line counts
+# and the surrounding qsplit()/strip_literal_text() `$(`-floor logic are
+# unaffected -- ONLY the inert body content disappears.
+#
+# Deliberately narrow / best-effort, consistent with every other quote-
+# tracking scan in this file: an exotic delimiter (not a bare identifier, or
+# using shell metacharacters) is simply not recognized as a heredoc opener --
+# fail-open for THIS masking pass only, never a NEW risk, since the text then
+# flows through the pre-#5000 per-line scan exactly as it always has. Never
+# denies by itself; only ever narrows what extract_write_targets() can find,
+# matching that scanner's own documented fail-open contract (a missed target
+# is the accepted safe direction there) -- a real write-idiom byte OUTSIDE
+# any recognized heredoc body, even in the SAME multi-line command, is
+# completely unaffected and still flows through unchanged.
+# =============================================================================
+_MASKHEREDOC_AWK='
+function mask_heredoc_bodies(s,   out, lines, nl, i, line, trimmed, body, delim, inbody, p, start, qc, c, wordend, SQ, DQ, MASKC) {
+    SQ = sprintf("%c", 39)    # single quote
+    DQ = sprintf("%c", 34)    # double quote
+    MASKC = sprintf("%c", 23) # ETB -- placeholder for inert heredoc-body text
+    nl = split(s, lines, "\n")
+    if (nl == 0) return ""
+    inbody = 0
+    delim = ""
+    for (i = 1; i <= nl; i++) {
+        line = lines[i]
+        if (inbody) {
+            # A `<<-` opener permits (and strips) leading tabs on the
+            # delimiter line; a bare `<<` requires an exact match. Either
+            # way only leading TABS (never spaces) are stripped, per real
+            # heredoc semantics.
+            trimmed = line
+            sub(/^\t+/, "", trimmed)
+            if (trimmed == delim) {
+                inbody = 0
+                delim = ""
+            } else {
+                body = line
+                gsub(/./, MASKC, body)
+                lines[i] = body
+            }
+            continue
+        }
+        p = index(line, "<<")
+        if (p > 0) {
+            start = p + 2
+            if (substr(line, start, 1) == "-") start++
+            while (substr(line, start, 1) == " " || substr(line, start, 1) == "\t") start++
+            qc = ""
+            c = substr(line, start, 1)
+            if (c == SQ || c == DQ) { qc = c; start++ }
+            wordend = start
+            while (1) {
+                c = substr(line, wordend, 1)
+                if (c ~ /^[A-Za-z0-9_]$/) { wordend++; continue }
+                break
+            }
+            if (wordend > start) {
+                delim = substr(line, start, wordend - start)
+                inbody = 1
+            }
+        }
+    }
+    out = lines[1]
+    for (i = 2; i <= nl; i++) out = out "\n" lines[i]
+    return out
+}
+'
+
 # Parse force-op segments out of a command, emitting one TAB-separated
 # "<cpath>\t<target>" line per genuine git force-push / hard-reset. Portable awk
 # only (mirrors extract_rm_targets / lifecycle_or_cloud_reason segment parsing):
@@ -2166,13 +2268,31 @@ extract_rm_targets() {
 # contract this file uses everywhere: ambiguity never widens a deny).
 # =============================================================================
 extract_write_targets() {
-    printf '%s' "$1" | awk -v startcwd="$2" "$_QSPLIT_AWK""$_MASKGT_AWK""$_MASKWS_AWK"'
+    printf '%s' "$1" | awk -v startcwd="$2" "$_QSPLIT_AWK""$_MASKGT_AWK""$_MASKWS_AWK""$_MASKHEREDOC_AWK"'
     BEGIN {
         SEP = sprintf("%c", 31)
         curcwd = startcwd
     }
-    {
-        $0 = qsplit($0)   # quote-aware segmentation (#3755)
+    # Slurp the whole (possibly multi-line) command into ONE buffer,
+    # preserving embedded newlines (mirrors the #3898 multi-line
+    # accumulation strip_literal_text() already uses), then do ALL
+    # processing ONCE in END rather than once per PHYSICAL LINE -- the
+    # default per-record awk behaviour, which is what silently reset
+    # qsplit()/mask_gt()/mask_ws() to "unquoted" at every embedded newline
+    # before the #5000 fix below.
+    { buf = buf (NR > 1 ? "\n" : "") $0 }
+    END {
+        # Heredoc-body masking (#5000) runs BEFORE qsplit(): once a heredoc
+        # body write-idiom-looking bytes (`>`, `;`, `tee`, ...) are replaced
+        # with inert placeholders, the per-line loop below -- which still
+        # resets mask_gt()/mask_ws() per SEGMENT, exactly as before -- has
+        # nothing dangerous-looking left to misread on those lines,
+        # regardless of that per-line reset. A real write-idiom byte OUTSIDE
+        # any recognized heredoc body, even later in the SAME multi-line
+        # command, is untouched and still flows through the unchanged
+        # pipeline below.
+        buf = mask_heredoc_bodies(buf)
+        $0 = qsplit(buf)   # quote-aware segmentation (#3755)
         n = split($0, segs, "\n")
         for (i = 1; i <= n; i++) {
             seg = segs[i]
