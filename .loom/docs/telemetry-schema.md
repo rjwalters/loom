@@ -402,7 +402,18 @@ happens to run `loom-daemon health` locally on that one host.
   keeps the full path, but the public, unauthenticated view only ever gets each
   `root` truncated to its basename — mirroring the daemon's
   `RoleFailure::label()` and the frontend's `pathBasename`. `total`/`ok` and
-  each failure's `role`/`failures`/`last_at`/`detail` pass through unchanged.
+  each failure's `role`/`failures`/`last_at` pass through unchanged.
+- `detail` is **authenticated-only** (redaction class: **field, dropped for
+  public**; #5065). It is the free-form failure string the daemon's
+  `RoleTickOutcome::Failure` constructors build (`loom-daemon/src/
+  role_runner.rs`) — on the ordinary "role child exited non-zero" path it
+  interpolates the absolute `spawn-worker.sh` path plus up to
+  `MAX_OUTPUT_TAIL_BYTES` of the failing role child's own log tail, so it can
+  carry further absolute paths, repo slugs, issue numbers, or branch names.
+  Unlike `root` this has no basename-style truncation that makes it safe by
+  construction, so it is held behind the Access gate entirely rather than
+  redacted in place — same footing as `tokens.snapshot`'s `accounts`. The
+  authenticated `/api/*` surface still returns it in full.
   Enforced by `redactRoleTickHealth` in `dashboard/src/redaction.ts` (like
   `managed_repos`, `roles` is deliberately absent from the raw allowlist and
   only reaches a public response through that derivation).
