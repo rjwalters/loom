@@ -129,6 +129,94 @@ paths_out=$( env -i PATH="$MINIMAL_PATH" HOME="$WORKDIR/t8-home" \
 assert_contains "$WORKDIR/t8-home/.local/bin/loom-daemon" "$paths_out" "search-paths summary names the machine-level ~/.local/bin install location"
 assert_contains "$WORKDIR/t8-root/target/release/loom-daemon" "$paths_out" "search-paths summary still names the in-repo build-output candidates"
 
+# ---------- 9. resolving a binary logs its path on stderr (#4997 AC1) ----------
+# The diagnostic line must not contaminate stdout (callers capture stdout via
+# command substitution to get the path itself).
+BIN9_HOME="$WORKDIR/t9-home"
+BIN9="$BIN9_HOME/.local/bin/loom-daemon"
+make_fake_bin "$BIN9"
+stdout_out=$( env -i PATH="$MINIMAL_PATH" HOME="$BIN9_HOME" \
+    bash -c "source '$LIB'; loom_locate_daemon_bin '$WORKDIR/t9-root'" 2>"$WORKDIR/t9-stderr" )
+stderr_out="$(cat "$WORKDIR/t9-stderr")"
+assert_eq "$BIN9" "$stdout_out" "stdout still carries only the resolved path (diagnostics do not contaminate it)"
+assert_contains "$BIN9" "$stderr_out" "stderr names the resolved binary path (#4997 AC1)"
+assert_contains "machine-level install" "$stderr_out" "stderr names which precedence tier the binary was resolved from"
+
+# ---------- 10. $LOOM_PREFER_REPO_BUILD=1 hoists the repo-local build above
+#                the machine-level install and $PATH (#4997) ----------
+REPO10="$WORKDIR/t10-repo"
+make_fake_bin "$REPO10/target/release/loom-daemon"
+PATH10_DIR="$WORKDIR/t10-on-path"
+make_fake_bin "$PATH10_DIR/loom-daemon"
+HOME10="$WORKDIR/t10-home"
+make_fake_bin "$HOME10/.local/bin/loom-daemon"
+
+# Without the opt-in, $PATH still wins (unchanged default precedence).
+out=$( env -i PATH="$PATH10_DIR:$MINIMAL_PATH" HOME="$HOME10" \
+    bash -c "source '$LIB'; loom_locate_daemon_bin '$REPO10'" 2>/dev/null )
+assert_eq "$PATH10_DIR/loom-daemon" "$out" "without LOOM_PREFER_REPO_BUILD, \$PATH still wins over the fresh repo build (default precedence unchanged)"
+
+# With the opt-in, the repo-local build wins over both $PATH and the
+# machine-level install, even though both of those also resolve.
+out=$( env -i PATH="$PATH10_DIR:$MINIMAL_PATH" HOME="$HOME10" LOOM_PREFER_REPO_BUILD=1 \
+    bash -c "source '$LIB'; loom_locate_daemon_bin '$REPO10'" 2>"$WORKDIR/t10-stderr" )
+stderr_out="$(cat "$WORKDIR/t10-stderr")"
+assert_eq "$REPO10/target/release/loom-daemon" "$out" "LOOM_PREFER_REPO_BUILD=1 hoists the fresh repo-local build above \$PATH and the machine-level install"
+assert_contains "LOOM_PREFER_REPO_BUILD" "$stderr_out" "stderr names LOOM_PREFER_REPO_BUILD as the provenance when the opt-in fires"
+
+# ---------- 11. #4875 regression still holds under LOOM_PREFER_REPO_BUILD=1:
+#                a non-login SSH session with no repo-local build present and
+#                no $PATH entry still finds the machine-level install ----------
+SSH11_HOME="$WORKDIR/t11-ssh-home"
+SSH11_BIN="$SSH11_HOME/.local/bin/loom-daemon"
+make_fake_bin "$SSH11_BIN"
+out=$( env -i PATH="$MINIMAL_PATH" HOME="$SSH11_HOME" LOOM_PREFER_REPO_BUILD=1 \
+    bash -c "source '$LIB'; loom_locate_daemon_bin '$WORKDIR/t11-root'" 2>/dev/null )
+assert_eq "$SSH11_BIN" "$out" "LOOM_PREFER_REPO_BUILD=1 does not break the #4875 non-login-\$PATH ssh case when no repo build exists"
+
+# ---------- 12. LOCKSTEP: loom_locate_daemon_bin must always agree with the
+#                first existing candidate in loom_daemon_bin_search_paths's
+#                own ordering (#4997 AC2 -- fails if the two functions
+#                disagree on precedence, in either default or
+#                LOOM_PREFER_REPO_BUILD=1 mode). ----------
+assert_lockstep() { # <label> <extra_env...=value...> -- reads globals REPO/HOME/PATH via env args
+    local label="$1"; shift
+    local resolved first_existing
+    resolved=$(env -i "$@" LOCKSTEP_LIB="$LIB" bash -c 'source "$LOCKSTEP_LIB"; loom_locate_daemon_bin "$LOCKSTEP_ROOT"' 2>/dev/null)
+    # Resolve loom_daemon_bin_search_paths's own ordering to real, checkable
+    # filesystem paths in the SAME environment (so a "loom-daemon on \$PATH"
+    # descriptive line resolves via that env's own $PATH, not the test
+    # runner's), then walk it to find the first one that actually exists.
+    first_existing=$(env -i "$@" LOCKSTEP_LIB="$LIB" bash -c '
+        source "$LOCKSTEP_LIB"
+        while IFS= read -r line; do
+            path="${line%% (*}"
+            path="${path#\$LOOM_DAEMON_BIN=}"
+            if [[ "$path" == "loom-daemon on \$PATH" ]]; then
+                path="$(command -v loom-daemon 2>/dev/null || true)"
+            fi
+            if [[ -n "$path" && -x "$path" ]]; then echo "$path"; break; fi
+        done <<< "$(loom_daemon_bin_search_paths "$LOCKSTEP_ROOT")"
+    ')
+    assert_eq "$first_existing" "$resolved" "$label: loom_locate_daemon_bin agrees with loom_daemon_bin_search_paths's first existing candidate"
+}
+
+LOCK12_ROOT="$WORKDIR/t12-repo"
+make_fake_bin "$LOCK12_ROOT/target/release/loom-daemon"
+LOCK12_PATH_DIR="$WORKDIR/t12-on-path"
+make_fake_bin "$LOCK12_PATH_DIR/loom-daemon"
+LOCK12_HOME="$WORKDIR/t12-home"
+make_fake_bin "$LOCK12_HOME/.local/bin/loom-daemon"
+
+assert_lockstep "default precedence" \
+    PATH="$LOCK12_PATH_DIR:$MINIMAL_PATH" HOME="$LOCK12_HOME" LOCKSTEP_ROOT="$LOCK12_ROOT"
+assert_lockstep "LOOM_PREFER_REPO_BUILD=1 precedence" \
+    PATH="$LOCK12_PATH_DIR:$MINIMAL_PATH" HOME="$LOCK12_HOME" LOCKSTEP_ROOT="$LOCK12_ROOT" LOOM_PREFER_REPO_BUILD=1
+assert_lockstep "default precedence, nothing but the machine install resolves" \
+    PATH="$MINIMAL_PATH" HOME="$LOCK12_HOME" LOCKSTEP_ROOT="$WORKDIR/t12-empty-root"
+assert_lockstep "LOOM_PREFER_REPO_BUILD=1, no repo build present falls through to machine install" \
+    PATH="$MINIMAL_PATH" HOME="$LOCK12_HOME" LOCKSTEP_ROOT="$WORKDIR/t12-empty-root" LOOM_PREFER_REPO_BUILD=1
+
 # ---------- summary ----------
 echo
 echo "Ran $TESTS_RUN tests: $TESTS_PASSED passed, $TESTS_FAILED failed"
