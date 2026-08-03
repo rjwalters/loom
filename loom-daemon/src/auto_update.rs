@@ -1086,23 +1086,35 @@ mod tests {
     // ===================================================================
 
     #[test]
+    #[serial(loom_config_env)]
     fn test_config_missing_file_is_default() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
         let tmp = tempfile::tempdir().unwrap();
-        assert_eq!(read_auto_update_config(tmp.path()), AutoUpdateConfig::default());
+        let cfg = read_auto_update_config(tmp.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(cfg, AutoUpdateConfig::default());
     }
 
     #[test]
+    #[serial(loom_config_env)]
     fn test_config_malformed_json_is_default() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
         let tmp = tempfile::tempdir().unwrap();
         write_config(tmp.path(), "{not valid json");
-        assert_eq!(read_auto_update_config(tmp.path()), AutoUpdateConfig::default());
+        let cfg = read_auto_update_config(tmp.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(cfg, AutoUpdateConfig::default());
     }
 
     #[test]
+    #[serial(loom_config_env)]
     fn test_config_missing_block_is_default() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
         let tmp = tempfile::tempdir().unwrap();
         write_config(tmp.path(), r#"{"autonomous": {"workFinder": {"enabled": true}}}"#);
-        assert_eq!(read_auto_update_config(tmp.path()), AutoUpdateConfig::default());
+        let cfg = read_auto_update_config(tmp.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(cfg, AutoUpdateConfig::default());
     }
 
     #[test]
