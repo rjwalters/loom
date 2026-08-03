@@ -198,6 +198,73 @@ assert_deny "Block gh pr merge --squash" \
 assert_deny_reason_matches "gh pr merge deny reason names merge-pr.sh" \
     "gh pr merge 123" "merge-pr\.sh"
 
+# --- False-positive regression tests (issue #5109) -----------------------
+# The phrase "gh pr merge" appearing as INERT TEXT (a heredoc-quoted commit
+# message, a --search query value) must not deny -- only an actual invocation
+# should. Both reproduce the exact occurrences reported in #5109.
+
+PHRASE_CMD="gh pr merge"
+
+# Occurrence 1: a commit message built via the CLAUDE.md-documented
+# `-m "$(cat <<'EOF' ... EOF)"` heredoc idiom, quoting the phrase as prose
+# documenting the very rule this guard enforces.
+GH_5109_COMMIT_CMD='git add foo.md && git commit -m "$(cat <<'"'"'EOF'"'"'
+Document the rule: never `'"$PHRASE_CMD"'` directly, use merge-pr.sh instead.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+EOF
+)" && git push'
+assert_allow "Allow heredoc commit message that quotes the phrase as prose" \
+    "$GH_5109_COMMIT_CMD"
+
+# Occurrence 2: a read-only search query whose --search value happens to
+# contain the phrase as text to search FOR, not a command to run.
+assert_allow "Allow gh issue list --search containing the phrase as query text" \
+    "gh issue list --state open --search \"$PHRASE_CMD redirect guard false positive\" --limit 20 --json number,title,url"
+
+# Regression guard: masking must NOT weaken the guard against an actual
+# invocation wrapped in a shell -c string -- '-c' is deliberately not in the
+# masked-flag whitelist, so this must still deny.
+assert_deny "Still block gh pr merge wrapped in sh -c (no masking regression)" \
+    "sh -c \"$PHRASE_CMD 123\""
+
+# Regression guard: a heredoc that feeds an INTERPRETER (not `cat`) is live
+# code, not inert data, and must stay visible to the check.
+GH_5109_BASH_HEREDOC_CMD='bash <<'"'"'EOF'"'"'
+'"$PHRASE_CMD"' 123
+EOF'
+assert_deny "Still block gh pr merge inside a bash-fed (non-cat) heredoc" \
+    "$GH_5109_BASH_HEREDOC_CMD"
+
+# Regression guard (PR #5115 review): `cat` never executes its own body, but
+# piping its stdout into a shell on the SAME line -- `cat <<'EOF' | bash` --
+# makes the heredoc body live, executed code despite `cat` being the literal
+# consumer. The cat-heredoc masking must NOT neutralize such a body (it is not
+# confined to inert text: it reaches `bash`), so a real invocation shaped this
+# way must still deny. This is the exact bypass reported in the #5115 review.
+GH_5115_CAT_PIPE_BASH_CMD='cat <<'"'"'EOF'"'"' | bash
+'"$PHRASE_CMD"' 123 --admin
+EOF'
+assert_deny "Still block gh pr merge in a cat-heredoc piped into bash" \
+    "$GH_5115_CAT_PIPE_BASH_CMD"
+
+# And its `| sh` cousin -- same reasoning, different interpreter.
+GH_5115_CAT_PIPE_SH_CMD='cat <<'"'"'EOF'"'"' | sh
+'"$PHRASE_CMD"' 123
+EOF'
+assert_deny "Still block gh pr merge in a cat-heredoc piped into sh" \
+    "$GH_5115_CAT_PIPE_SH_CMD"
+
+# And a cat-heredoc captured then eval-executed: captured by $() but the
+# consumer is `eval`, NOT a text-data flag, so the body is not inert and must
+# stay visible.
+GH_5115_CAT_EVAL_CMD='eval "$(cat <<'"'"'EOF'"'"'
+'"$PHRASE_CMD"' 123
+EOF
+)"'
+assert_deny "Still block gh pr merge in a cat-heredoc captured then eval'd" \
+    "$GH_5115_CAT_EVAL_CMD"
+
 echo ""
 
 # =========================================================================
