@@ -370,10 +370,12 @@ below.
 
 ### Rotating an ingest key
 
-`POST /admin/hosts` refuses a `host_id` that already exists (`409`), so
-rotation is a two-move operation. Pick whichever fits:
+`POST /admin/hosts` refuses a `host_id` that is currently **live** (`409`), so
+rotation is a two-move operation. A **revoked** `host_id` is re-provisionable
+(issue #5082) — the re-provision replaces the dead key rather than reviving it,
+so no raw SQL is involved either way. Pick whichever fits:
 
-**A. Rolling rotation (no raw SQL, brief dual-identity window)** — provision a
+**A. Rolling rotation (brief dual-identity window, no `401`s)** — provision a
 successor identity, cut the host over, then revoke the old one:
 
 ```bash
@@ -385,17 +387,16 @@ curl -sS -X POST "$BASE/admin/hosts/my-laptop/revoke" -H "authorization: Bearer 
 
 Historical rows keep the old `host_id`; new rows use the new one.
 
-**B. In-place rotation (same `host_id`, needs one D1 statement)** — delete the
-host row, then re-provision the same id with a fresh key:
+**B. In-place rotation (same `host_id`)** — revoke the host, then re-provision
+the same id, which mints a fresh key and clears the revocation atomically:
 
 ```bash
-npx wrangler d1 execute loom-observability --remote \
-  --command "DELETE FROM hosts WHERE host_id = 'my-laptop'"
+curl -sS -X POST "$BASE/admin/hosts/my-laptop/revoke" -H "authorization: Bearer $ADMIN"
 curl -sS -X POST "$BASE/admin/hosts" -H "authorization: Bearer $ADMIN" \
   -H 'content-type: application/json' -d '{"host_id":"my-laptop"}'
 ```
 
-Between the delete and the daemon picking up the new key, that host's pushes
+Between the revoke and the daemon picking up the new key, that host's pushes
 get `401` — they are **not lost**: the daemon's durable queue retries with
 backoff and drains once the new key is in place (up to `queueCapacity`).
 
