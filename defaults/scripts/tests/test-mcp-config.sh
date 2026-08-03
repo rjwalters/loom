@@ -866,7 +866,7 @@ JSON
         echo "RC=$?"
     ' _ "$WRAPPER" 2>&1)"
     assert_eq "RC=0" "$_out_no_file" \
-        "~/.claude.json missing entirely: no output, RC=0 (early-return regression check)"
+        "user .claude.json missing entirely: no output, RC=0 (early-return regression check)"
     rm -rf "$_home_no_file"
 else
     echo -e "  ${YELLOW}SKIP${NC}: check_global_mcp_configs presence tests (python3 not installed)"
