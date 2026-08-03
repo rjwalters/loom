@@ -1620,8 +1620,12 @@ fi
 #     socket). Without --relaunch the updater must exit NON-ZERO (6) and print
 #     the CORRECTED fallback: it names the `--relaunch` re-render path (NOT a
 #     bare `launchctl bootstrap` of the stale plist, which was the #4118 bug),
-#     warns that `launchctl bootout` terminates in-flight sweeps (AC4), and
-#     prefers a graceful `kill -TERM`.
+#     mentions `launchctl bootout` and a graceful `kill -TERM` (AC4) — as of
+#     #5081, bootout no longer terminates in-flight sweeps on a current build
+#     (every sweep holds its own process group, #3800), so the warning is now
+#     about the async bootout/bootstrap race leaving the daemon down, not
+#     about sweep safety; `kill -TERM` is still named as the graceful,
+#     settled/retried/verified path.
 # ============================================================
 W16="$BASE_WORKDIR/w16"
 new_fixture "$W16"
@@ -1652,15 +1656,17 @@ else
     echo -e "${RED}✗${NC} refused restart names --relaunch, never a bare bootstrap of the stale plist"
     echo "  output: $out16"
 fi
-# (b) AC4: warns that bootout terminates in-flight sweeps + prefers kill -TERM.
+# (b) AC4: mentions bootout + sweeps (the #5081-corrected framing: bootout no
+#     longer kills in-flight sweeps, but hand-running it can still race the
+#     async teardown) and still prefers a graceful `kill -TERM` fallback.
 TESTS_RUN=$((TESTS_RUN + 1))
 if echo "$out16" | grep -qi 'bootout' && echo "$out16" | grep -qi 'sweep' \
     && echo "$out16" | grep -q 'kill -TERM'; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "${GREEN}✓${NC} refused restart warns bootout kills in-flight sweeps + prefers kill -TERM (AC4)"
+    echo -e "${GREEN}✓${NC} refused restart mentions bootout+sweeps (#5081-corrected) + prefers kill -TERM (AC4)"
 else
     TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "${RED}✗${NC} refused restart warns bootout kills in-flight sweeps + prefers kill -TERM (AC4)"
+    echo -e "${RED}✗${NC} refused restart mentions bootout+sweeps (#5081-corrected) + prefers kill -TERM (AC4)"
     echo "  output: $out16"
 fi
 
@@ -1875,7 +1881,10 @@ fi # end plutil-availability guard for scenarios 21-22
 # ============================================================
 # 23. --no-restart on a launchd host does NOT print a bare `launchctl bootstrap`
 #     of the stale plist (the second #4118 stale-advice site): it names the
-#     --relaunch re-render path and warns that bootout kills in-flight sweeps.
+#     --relaunch re-render path and mentions bootout + sweeps (#5081-corrected
+#     framing: bootout no longer kills in-flight sweeps on a current build,
+#     but the async bootout/bootstrap race is still a reason to prefer
+#     --relaunch's settled/retried/verified sequence over a hand-run one).
 # ============================================================
 W23="$BASE_WORKDIR/w23"
 new_fixture "$W23"
@@ -1898,10 +1907,10 @@ if echo "$out23" | grep -q -- '--relaunch' \
     && ! echo "$out23" | grep -qi 'launchctl bootstrap' \
     && echo "$out23" | grep -qi 'bootout' && echo "$out23" | grep -qi 'sweep'; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "${GREEN}✓${NC} --no-restart names --relaunch, no bare bootstrap, warns bootout kills sweeps"
+    echo -e "${GREEN}✓${NC} --no-restart names --relaunch, no bare bootstrap, mentions bootout+sweeps (#5081-corrected)"
 else
     TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "${RED}✗${NC} --no-restart names --relaunch, no bare bootstrap, warns bootout kills sweeps"
+    echo -e "${RED}✗${NC} --no-restart names --relaunch, no bare bootstrap, mentions bootout+sweeps (#5081-corrected)"
     echo "  output: $out23"
 fi
 
