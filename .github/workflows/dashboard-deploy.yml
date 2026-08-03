@@ -212,8 +212,16 @@ jobs:
 
           body+=$'\n_Last checked: '"$(date -u +"%Y-%m-%dT%H:%M:%SZ")"$'_'
 
-          existing_number="$(gh issue list --state open --search "\"$title\" in:title" \
-            --json number,title --jq ".[] | select(.title == \"$title\") | .number" | head -1)"
+          # $title always contains literal embedded double quotes (from the
+          # \"${failing_name}\" wrapping above), so it cannot be safely dropped
+          # into either a quoted GitHub search phrase or a jq program string.
+          # Narrow the --search to a quote-free constant substring (a superset
+          # is fine -- correctness comes from the --arg exact-title match below).
+          # `gh`'s own --jq flag takes exactly one expression argument (it does
+          # not support jq's --arg passthrough), so pipe the raw JSON to a
+          # standalone jq invocation instead of using `gh issue list --jq`.
+          existing_number="$(gh issue list --state open --search "deploy failed in:title" \
+            --json number,title | jq -r --arg t "$title" '.[] | select(.title == $t) | .number' | head -1)"
 
           if [[ -n "$existing_number" ]]; then
             gh issue comment "$existing_number" --body "$body"
