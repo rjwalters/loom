@@ -75,6 +75,29 @@
 //! CLAUDE.md already documents as the contract, and its absence is a
 //! slow-motion outage. Opt out with `LOOM_WORKTREE_REAPER=0` or
 //! `autonomous.worktreeReaper.enabled=false`.
+//!
+//! # Orphaned processes, not just orphaned directories (Issue #5110)
+//!
+//! Every pass also runs [`crate::orphan_process_reaper::reap_orphan_processes`]
+//! ahead of the directory-removal pass above. That module answers a question
+//! this one never did: "is a **process** still working inside an issue
+//! worktree with no live sweep claim for that issue?" — the gap that let an
+//! orphaned driver script (reparented to `systemd --user`/launchd after its
+//! sweep died, and having escaped #4982's pgid-scoped teardown via
+//! `timeout`'s fresh process group) pin a host at load 65 for 5h52m while
+//! starving that host's own dispatched sweep. Running it first means a
+//! worktree whose only obstacle was a now-reaped orphan process becomes
+//! eligible for the removal pass in the very same tick. It shares this
+//! module's fail-safe gates — `.loom-managed` sentinel, no live sweep claim,
+//! issue closed, PR not open and past its post-merge grace — so a worktree
+//! this pass would refuse to *remove* is a worktree the orphan pass refuses to
+//! *kill inside*. That symmetry is load-bearing: a daemon claim only exists
+//! for Tier-2 dispatched sweeps, so the forge gates are the only thing
+//! standing between a manually-run Judge's `cargo test` and a SIGKILL. It
+//! shares this module's enable/interval cadence but has its own opt-out —
+//! `LOOM_ORPHAN_PROCESS_REAPER=0` / `autonomous.worktreeReaper.orphanProcessReapEnabled=false`
+//! — because terminating a live process is a strictly more consequential
+//! action than removing an already-idle directory.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -101,6 +124,15 @@ pub const WORKTREE_REAPER_INTERVAL_ENV: &str = "LOOM_WORKTREE_REAPER_INTERVAL_SE
 /// Env override for the low-disk warning floor (GB of free space on the
 /// worktree-root volume).
 pub const WORKTREE_REAPER_DISK_WARN_ENV: &str = "LOOM_WORKTREE_REAPER_DISK_WARN_GB";
+
+/// Master on/off env override for the orphan-**process** sub-pass (Issue
+/// #5110), independent of [`WORKTREE_REAPER_ENABLE_ENV`] which gates the
+/// whole loop (including this sub-pass). Same truthy/falsy parsing as
+/// [`WORKTREE_REAPER_ENABLE_ENV`]. Split out because terminating a live
+/// process is a strictly more consequential action than removing an
+/// already-idle directory — an operator may want directory reaping on while
+/// keeping this off.
+pub const ORPHAN_PROCESS_REAPER_ENABLE_ENV: &str = "LOOM_ORPHAN_PROCESS_REAPER";
 
 /// Default reap cadence (15 minutes). Slow enough that the forge probes are
 /// negligible next to normal sweep traffic, fast enough that a merged
@@ -133,6 +165,11 @@ pub struct WorktreeReaperConfig {
     /// `autonomous.worktreeReaper.diskWarnFreeGb` — free-GB floor below which
     /// the pass logs a low-disk warning.
     pub disk_warn_free_gb: Option<u64>,
+    /// `autonomous.worktreeReaper.orphanProcessReapEnabled` (default
+    /// **true**) — Issue #5110's orphan-process sub-pass. Independent of
+    /// `enabled` above only in that it can be turned off while directory
+    /// reaping stays on; it never runs at all when `enabled` is false.
+    pub orphan_process_reap_enabled: Option<bool>,
 }
 
 /// Read `.loom/config.json → autonomous.worktreeReaper`, soft-failing every
@@ -159,6 +196,9 @@ pub fn read_worktree_reaper_config(repo_root: &Path) -> WorktreeReaperConfig {
         disk_warn_free_gb: block
             .get("diskWarnFreeGb")
             .and_then(serde_json::Value::as_u64),
+        orphan_process_reap_enabled: block
+            .get("orphanProcessReapEnabled")
+            .and_then(serde_json::Value::as_bool),
     }
 }
 
@@ -184,6 +224,19 @@ pub fn resolve_interval(config: &WorktreeReaperConfig) -> Duration {
             || Duration::from_secs(DEFAULT_WORKTREE_REAPER_INTERVAL_SECS),
             Duration::from_secs,
         )
+}
+
+/// Resolve whether the orphan-**process** sub-pass runs (Issue #5110) —
+/// precedence **env > config > default(true)**. Only consulted when
+/// [`resolve_enabled`] is already true; this is an additional, independent
+/// gate on the more consequential of the two sub-passes, not a substitute for
+/// the master switch.
+#[must_use]
+pub fn resolve_orphan_process_reap_enabled(config: &WorktreeReaperConfig) -> bool {
+    if let Ok(v) = std::env::var(ORPHAN_PROCESS_REAPER_ENABLE_ENV) {
+        return matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
+    }
+    config.orphan_process_reap_enabled.unwrap_or(true)
 }
 
 /// Resolve the post-merge grace period — precedence **config > default**
@@ -345,7 +398,9 @@ pub fn reap_repo(repo_root: &Path, config: &WorktreeReaperConfig) -> ReapReport 
     let opts = reaper_clean_options(resolve_grace_period(config));
     let active_issues = crate::worktree_ops::liveness::active_spawn_loop_issues(repo_root);
 
-    // Resolved once per pass (one REST call), not once per worktree.
+    // Resolved once per pass (one REST call), not once per worktree — and
+    // shared with the orphan-process sub-pass below, which applies the same
+    // issue-closed / PR-not-open gates this pass does.
     let owner = clean::repo_owner_rest(repo_root);
 
     let issue_state_fn = |n: u32| crate::worktree_ops::gh::issue_state_rest(repo_root, n);
@@ -355,6 +410,43 @@ pub fn reap_repo(repo_root: &Path, config: &WorktreeReaperConfig) -> ReapReport 
         // GraphQL-backed probe rather than silently reporting Unknown forever.
         None => clean::check_pr_merged(repo_root, n),
     };
+
+    // Orphan-**process** sub-pass (Issue #5110), ahead of the directory
+    // removal pass below so a worktree whose only obstacle was a now-reaped
+    // orphan becomes removal-eligible in this same tick. Shares this pass's
+    // already-computed `active_issues` snapshot and forge probes — see the
+    // module docs' "Fail safe" note on why every gate is re-checked here
+    // rather than trusted from a caller. Independently opt-outable
+    // (`resolve_orphan_process_reap_enabled`) because terminating a live
+    // process is more consequential than removing an idle directory.
+    if resolve_orphan_process_reap_enabled(config) {
+        let kill_fn = |pids: &[u32]| {
+            crate::orphan_process_reaper::kill_pids(
+                pids,
+                crate::orphan_process_reaper::ORPHAN_PROCESS_REAP_GRACE,
+            )
+        };
+        let orphan_report = crate::orphan_process_reaper::reap_orphan_processes_with(
+            repo_root,
+            &crate::orphan_process_reaper::OrphanReapProbes {
+                active_issues: &active_issues,
+                processes_using: &crate::worktree_ops::safety::find_processes_using_directory,
+                issue_state: &issue_state_fn,
+                pr_status: &pr_status_fn,
+                collect_descendants: &crate::orphan_process_reaper::collect_descendant_pids,
+                kill: &kill_fn,
+                grace_period_secs: opts.grace_period_secs,
+                now: Utc::now(),
+            },
+        );
+        log_orphan_report(repo_root, &orphan_report);
+    } else {
+        log::debug!(
+            "orphan_process_reaper: {} disabled (set LOOM_ORPHAN_PROCESS_REAPER=0 or \
+             autonomous.worktreeReaper.orphanProcessReapEnabled=false to opt out)",
+            repo_root.display()
+        );
+    }
 
     let probes =
         clean::production_probes(&active_issues, &issue_state_fn, &pr_status_fn, Utc::now());
@@ -378,6 +470,32 @@ pub fn reap_repo(repo_root: &Path, config: &WorktreeReaperConfig) -> ReapReport 
     let mut report = reap_worktrees(repo_root, &opts, &probes, &remover);
     report.free_gb = crate::disk_headroom::worktree_root_free_gb(repo_root);
     report
+}
+
+/// Log an orphan-process sub-pass's outcome (Issue #5110). Per-worktree detail
+/// (which pids were found/killed) is already logged at `warn!` by
+/// [`crate::orphan_process_reaper::reap_orphan_processes_with`] itself, since
+/// "what was killed" must be visible even when the daemon log's summary line
+/// is filtered out (this issue's AC) — this only adds the compact tick-level
+/// summary line the rest of this module's logging follows.
+pub fn log_orphan_report(
+    repo_root: &Path,
+    report: &crate::orphan_process_reaper::OrphanReapReport,
+) {
+    if report.reaped.is_empty() {
+        log::debug!(
+            "orphan_process_reaper: {} nothing to reap ({})",
+            repo_root.display(),
+            report.summary()
+        );
+    } else {
+        log::info!(
+            "orphan_process_reaper: {} {} issues={:?}",
+            repo_root.display(),
+            report.summary(),
+            report.reaped.iter().map(|e| e.issue).collect::<Vec<_>>()
+        );
+    }
 }
 
 /// Log a pass's outcome, including the low-disk warning (the acceptance
@@ -869,7 +987,7 @@ mod tests {
         write_config(
             tmp.path(),
             r#"{"autonomous": {"worktreeReaper": {"enabled": false, "intervalSecs": 120,
-               "gracePeriodSecs": 30, "diskWarnFreeGb": 5}}}"#,
+               "gracePeriodSecs": 30, "diskWarnFreeGb": 5, "orphanProcessReapEnabled": false}}}"#,
         );
         assert_eq!(
             read_worktree_reaper_config(tmp.path()),
@@ -878,6 +996,7 @@ mod tests {
                 interval_secs: Some(120),
                 grace_period_secs: Some(30),
                 disk_warn_free_gb: Some(5),
+                orphan_process_reap_enabled: Some(false),
             }
         );
     }
@@ -925,6 +1044,42 @@ mod tests {
         std::env::remove_var(WORKTREE_REAPER_ENABLE_ENV);
         assert!(!resolve_enabled(&WorktreeReaperConfig {
             enabled: Some(false),
+            ..WorktreeReaperConfig::default()
+        }));
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_orphan_process_reap_enabled_default_is_true() {
+        std::env::remove_var(ORPHAN_PROCESS_REAPER_ENABLE_ENV);
+        assert!(
+            resolve_orphan_process_reap_enabled(&WorktreeReaperConfig::default()),
+            "the orphan-process sub-pass restores a documented AC — absent config leaves it ON"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_orphan_process_reap_enabled_env_overrides_config() {
+        std::env::set_var(ORPHAN_PROCESS_REAPER_ENABLE_ENV, "0");
+        assert!(!resolve_orphan_process_reap_enabled(&WorktreeReaperConfig {
+            orphan_process_reap_enabled: Some(true),
+            ..WorktreeReaperConfig::default()
+        }));
+        std::env::set_var(ORPHAN_PROCESS_REAPER_ENABLE_ENV, "1");
+        assert!(resolve_orphan_process_reap_enabled(&WorktreeReaperConfig {
+            orphan_process_reap_enabled: Some(false),
+            ..WorktreeReaperConfig::default()
+        }));
+        std::env::remove_var(ORPHAN_PROCESS_REAPER_ENABLE_ENV);
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_orphan_process_reap_enabled_config_can_disable() {
+        std::env::remove_var(ORPHAN_PROCESS_REAPER_ENABLE_ENV);
+        assert!(!resolve_orphan_process_reap_enabled(&WorktreeReaperConfig {
+            orphan_process_reap_enabled: Some(false),
             ..WorktreeReaperConfig::default()
         }));
     }
