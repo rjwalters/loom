@@ -4527,6 +4527,205 @@ else
 fi
 
 # ============================================================
+# P1-P8. --prune-stale-entry-points (#5139): the stale-entry-point advisory
+#     (tests 45-48 above) detects but never removes anything. This flag
+#     removes EXACTLY what the check classifies as a "Python console script
+#     (stale pip/pipx editable install)" — never `loom-daemon` itself, never
+#     a legitimate bash-wrapper shim (whether current or itself stale).
+#
+#     Fixture PATH holds, across two directories:
+#       PSTALE_BIN_DIR (the resolved binary's own directory):
+#         - loom-daemon      : the resolved binary (must survive)
+#         - loom-clean       : a CURRENT auto-generated shim, sibling
+#                               loom-daemon == resolved (must survive)
+#         - loom-claim       : same shape, a second legitimate wrapper
+#                               (must survive) — the AC's named example
+#         - loom-tokens      : a stale pip console script (must be pruned)
+#         - loom-agent-spawn : a second stale pip console script (pruned)
+#         - loom-search      : a third stale console script (pruned)
+#       POLD_SHIM_DIR (a second PATH entry, simulating a moved install):
+#         - loom-recover-orphans : an auto-generated shim whose sibling
+#                                   loom-daemon does NOT match the resolved
+#                                   binary (a STALE shim) — reported by the
+#                                   warning, but must NEVER be pruned (it is
+#                                   a legitimate wrapper, not a frozen Python
+#                                   script).
+# ============================================================
+WP="$BASE_WORKDIR/w-prune"
+new_fixture "$WP"
+HEADP="$(cd "$WP" && git rev-parse --short HEAD)"
+PSTALE_BIN_DIR="$WP/stale-bin"
+mkdir -p "$PSTALE_BIN_DIR"
+
+# The resolved daemon binary, on PATH.
+write_fake_daemon "$PSTALE_BIN_DIR/loom-daemon" "$HEADP" "$WP/markerP"
+
+# Two legitimate, CURRENT auto-generated PATH shims.
+for _shim in loom-clean loom-claim; do
+    cat > "$PSTALE_BIN_DIR/$_shim" <<SHIM
+#!/usr/bin/env bash
+# Auto-generated PATH shim (issue #4272) — do not edit by hand.
+exec "\$(dirname "\$0")/loom-daemon" ${_shim#loom-} "\$@"
+SHIM
+    chmod +x "$PSTALE_BIN_DIR/$_shim"
+done
+
+# Three stale pip/PATH console scripts of the #4079 shape.
+for _stale in loom-tokens loom-agent-spawn loom-search; do
+    cat > "$PSTALE_BIN_DIR/$_stale" <<STALEPY
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+import sys
+sys.exit(0)
+STALEPY
+    chmod +x "$PSTALE_BIN_DIR/$_stale"
+done
+
+# A second PATH directory holding a STALE (moved-target) legitimate shim: its
+# sibling loom-daemon exists but is NOT the resolved binary.
+POLD_SHIM_DIR="$WP/old-install"
+mkdir -p "$POLD_SHIM_DIR"
+write_fake_daemon "$POLD_SHIM_DIR/loom-daemon" "oldc0mm" "$WP/markerP-old"
+cat > "$POLD_SHIM_DIR/loom-recover-orphans" <<'SHIM'
+#!/usr/bin/env bash
+# Auto-generated PATH shim (issue #4272) — do not edit by hand.
+exec "$(dirname "$0")/loom-daemon" recover-orphans "$@"
+SHIM
+chmod +x "$POLD_SHIM_DIR/loom-recover-orphans"
+
+PRUNE_PATH="$PSTALE_BIN_DIR:$POLD_SHIM_DIR:$TEST_PATH"
+
+# P1. First run: the 3 stale Python scripts are reported as removed.
+outP1=$( cd "$WP" && PATH="$PRUNE_PATH" \
+    LOOM_DAEMON_BIN="$PSTALE_BIN_DIR/loom-daemon" \
+    bash "$UPDATE_SCRIPT" --prune-stale-entry-points 2>&1; echo "EXIT=$?" )
+rcP1=$(echo "$outP1" | grep -o 'EXIT=[0-9]*' | cut -d= -f2)
+assert_eq "0" "$rcP1" "prune: successful prune exits 0"
+
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$outP1" | grep -q "removed: $PSTALE_BIN_DIR/loom-tokens" \
+   && echo "$outP1" | grep -q "removed: $PSTALE_BIN_DIR/loom-agent-spawn" \
+   && echo "$outP1" | grep -q "removed: $PSTALE_BIN_DIR/loom-search"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} prune: all 3 stale Python console scripts are reported removed (#5139)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} prune: all 3 stale Python console scripts are reported removed (#5139)"
+    echo "  output: $outP1"
+fi
+
+# P2. The 3 stale scripts are actually gone from disk.
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ ! -e "$PSTALE_BIN_DIR/loom-tokens" && ! -e "$PSTALE_BIN_DIR/loom-agent-spawn" \
+      && ! -e "$PSTALE_BIN_DIR/loom-search" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} prune: the stale Python console scripts are actually deleted from disk"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} prune: the stale Python console scripts are actually deleted from disk"
+fi
+
+# P3. loom-daemon itself is never touched.
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ -x "$PSTALE_BIN_DIR/loom-daemon" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} prune: loom-daemon itself is never removed"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} prune: loom-daemon itself is never removed"
+fi
+
+# P4. The two CURRENT legitimate bash-wrapper shims (loom-clean, loom-claim)
+#     are never touched — the exact "never touch the legitimate bash wrapper"
+#     guardrail named in the issue.
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ -x "$PSTALE_BIN_DIR/loom-clean" && -x "$PSTALE_BIN_DIR/loom-claim" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} prune: current legitimate bash-wrapper shims (loom-clean, loom-claim) survive"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} prune: current legitimate bash-wrapper shims (loom-clean, loom-claim) survive"
+fi
+
+# P5. The STALE bash-wrapper shim (loom-recover-orphans, target moved) is
+#     reported by the warning but survives the prune untouched — the whole
+#     point of excluding ANY shim (current or stale) from pruning.
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ -x "$POLD_SHIM_DIR/loom-recover-orphans" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} prune: a STALE bash-wrapper shim (moved target) is reported but never deleted"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} prune: a STALE bash-wrapper shim (moved target) is reported but never deleted"
+fi
+
+# P6. Idempotent: running it again finds nothing left to prune.
+outP6=$( cd "$WP" && PATH="$PRUNE_PATH" \
+    LOOM_DAEMON_BIN="$PSTALE_BIN_DIR/loom-daemon" \
+    bash "$UPDATE_SCRIPT" --prune-stale-entry-points 2>&1; echo "EXIT=$?" )
+rcP6=$(echo "$outP6" | grep -o 'EXIT=[0-9]*' | cut -d= -f2)
+assert_eq "0" "$rcP6" "prune: second run (idempotent) exits 0"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$outP6" | grep -q 'nothing to prune'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} prune: second run is a no-op (idempotent, #5139)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} prune: second run is a no-op (idempotent, #5139)"
+    echo "  output: $outP6"
+fi
+
+# P7. After pruning, re-running the ordinary update (--check) emits NO stale
+#     Python-console-script warning any more — the stale shim (a DIFFERENT
+#     hazard class, deliberately left in place by design) may still surface
+#     its own warning, so this asserts on the Python-script paths specifically
+#     rather than "no warning at all".
+outP7=$( cd "$WP" && PATH="$PRUNE_PATH" \
+    LOOM_DAEMON_BIN="$PSTALE_BIN_DIR/loom-daemon" \
+    bash "$UPDATE_SCRIPT" --check 2>&1 )
+TESTS_RUN=$((TESTS_RUN + 1))
+if ! echo "$outP7" | grep -q "$PSTALE_BIN_DIR/loom-tokens" \
+   && ! echo "$outP7" | grep -q "$PSTALE_BIN_DIR/loom-agent-spawn" \
+   && ! echo "$outP7" | grep -q "$PSTALE_BIN_DIR/loom-search"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} prune: converges — a later --check no longer warns about the pruned paths (#5139)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} prune: converges — a later --check no longer warns about the pruned paths (#5139)"
+    echo "  output: $outP7"
+fi
+
+# P8. LOOM_SKIP_STALE_ENTRY_POINT_CHECK=1 keeps --prune-stale-entry-points a
+#     no-op too (mirrors test 48's guarantee for the warning itself).
+WP8="$BASE_WORKDIR/w-prune-skip"
+new_fixture "$WP8"
+HEADP8="$(cd "$WP8" && git rev-parse --short HEAD)"
+PSTALE_BIN_DIR8="$WP8/stale-bin"
+mkdir -p "$PSTALE_BIN_DIR8"
+write_fake_daemon "$PSTALE_BIN_DIR8/loom-daemon" "$HEADP8" "$WP8/markerP8"
+cat > "$PSTALE_BIN_DIR8/loom-tokens" <<'STALEPY'
+#!/usr/bin/python3
+import sys
+sys.exit(0)
+STALEPY
+chmod +x "$PSTALE_BIN_DIR8/loom-tokens"
+
+outP8=$( cd "$WP8" && PATH="$PSTALE_BIN_DIR8:$TEST_PATH" \
+    LOOM_DAEMON_BIN="$PSTALE_BIN_DIR8/loom-daemon" \
+    LOOM_SKIP_STALE_ENTRY_POINT_CHECK=1 \
+    bash "$UPDATE_SCRIPT" --prune-stale-entry-points 2>&1; echo "EXIT=$?" )
+rcP8=$(echo "$outP8" | grep -o 'EXIT=[0-9]*' | cut -d= -f2)
+assert_eq "0" "$rcP8" "prune: LOOM_SKIP_STALE_ENTRY_POINT_CHECK=1 still exits 0"
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ -e "$PSTALE_BIN_DIR8/loom-tokens" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} prune: LOOM_SKIP_STALE_ENTRY_POINT_CHECK=1 leaves stale entries untouched"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} prune: LOOM_SKIP_STALE_ENTRY_POINT_CHECK=1 leaves stale entries untouched"
+fi
+
+# ============================================================
 # 25. Launchd-sandbox guards (#4078): the whole suite exercises the REAL
 #     start/stop scripts, so prove it never reached the operator's live daemon.
 #     (a) The suite-level decoy loom-daemon is still alive — no by-name kill

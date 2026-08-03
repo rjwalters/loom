@@ -160,6 +160,7 @@
 #   ./.loom/scripts/cli/loom-daemon-update.sh --auto-resolve-safe-abort  When the ff-only sync would otherwise hard-abort (#4330), auto-perform the fix IF the blocking state classifies as safe (#4951): content-identical diverged commits with an otherwise-CLEAN working tree (`git reset --hard origin/<default-branch>`), or dirty tracked files that are ALL Loom-managed installed copies (`git checkout --` them + re-run resync-installed.sh). Any other cause (genuine content divergence, any unmanaged dirty file, or a dirty tracked file co-existing with the content-identical divergence) still hard-aborts unchanged — this flag never widens what's classified as safe, only whether the safe cases are printed (default) or performed
 #   ./.loom/scripts/cli/loom-daemon-update.sh --fetch        Artifact-fetch mode (Epic #4990 Phase 3, #5020): REQUIRE a verified GitHub Release artifact for this host's platform (resolve latest Release >= installed version, download, verify checksum unconditionally + signature when present, provision) instead of `cargo build --release`; hard-fails (exit 1) rather than silently falling back to a source build when no matching artifact resolves. Same as LOOM_DAEMON_UPDATE_FETCH=1.
 #   ./.loom/scripts/cli/loom-daemon-update.sh --no-fetch      Disable artifact-fetch mode entirely; always use the local source-build path (pre-#5020 behavior). Same as LOOM_DAEMON_UPDATE_FETCH=0.
+#   ./.loom/scripts/cli/loom-daemon-update.sh --prune-stale-entry-points  Remove exactly the PATH entries the stale-entry-point advisory below (#4079/#4557) classifies as a "Python console script (stale pip/pipx editable install)" — a frozen console script left behind by the retired pip/pipx package (epic #4081 Phase 4 / #4557) that never resolves to the current loom-daemon binary and so is never touched by an update again. Conservative by construction: it reuses the SAME classification the advisory already computes, so `loom-daemon` itself and the auto-generated bash-wrapper shims (`loom-clean`/`loom-recover-orphans`/`loom-claim`, #4272/#4275 — including a STALE shim whose target moved) are never candidates, only ever reported. Standalone: performs the prune, reports what it removed, and exits — no build/provision/restart. Idempotent (a second run finds nothing to remove) and reports "nothing to prune" when the PATH is already clean. Honors LOOM_SKIP_STALE_ENTRY_POINT_CHECK=1 (a no-op, matching the check it would otherwise act on) (#5139).
 #   ./.loom/scripts/cli/loom-daemon-update.sh --help
 #
 # Environment:
@@ -282,7 +283,10 @@
 #      untouched), a signature-verification failure on a PRESENT signature
 #      (distinct from "unsigned", which is not an error), and --fetch given
 #      with no matching release artifact resolvable (refuses to silently
-#      fall back to a source build).
+#      fall back to a source build). Also used by --prune-stale-entry-points
+#      (#5139) if any candidate path failed to `rm` (permissions, a race) —
+#      the paths that DID remove successfully are still reported individually
+#      above the error.
 #   3  (--check only) update available
 #   4  build verification FAILED: the freshly-built binary's embedded commit
 #      does not match the source HEAD it was built from. This is a BUILD-SYSTEM
@@ -856,10 +860,26 @@ fetch_and_verify_artifact() {
 # which makes every surviving `loom-*` pip console script pure hazard: nothing
 # regenerates or updates them ever again.
 #
-# This check is a WARNING ONLY. It never deletes anything, never mutates PATH,
-# and never changes this script's exit code — an operator's ~/.local/bin is
-# theirs, and a false positive must not block an update. Opt out entirely with
-# LOOM_SKIP_STALE_ENTRY_POINT_CHECK=1.
+# This check itself is a WARNING ONLY, on every ordinary run. It never deletes
+# anything, never mutates PATH, and never changes this script's exit code — an
+# operator's ~/.local/bin is theirs, and a false positive must not block an
+# update. Opt out entirely with LOOM_SKIP_STALE_ENTRY_POINT_CHECK=1.
+#
+# The warning used to be the end of the story: it fired on every single run,
+# forever, and nothing ever removed what it found (#5139) — an operator had to
+# `rm` each path by hand, and a fresh host doing so once would still get warned
+# again next run if it missed one (observed on loom-worker-1: removing the
+# first batch surfaced two more). `--prune-stale-entry-points` (below) closes
+# that gap: an explicit, opt-in, standalone action that removes EXACTLY the
+# entries this check classifies as a "Python console script (stale pip/pipx
+# editable install)" — reusing the same classification helpers the warning
+# uses (_lde_shim_target / _lde_describe), never reimplementing it. A stale
+# SHIM (an auto-generated loom-clean/loom-recover-orphans/loom-claim wrapper
+# whose sibling loom-daemon moved) is reported by the warning too but is
+# deliberately NOT a prune candidate — it is a legitimate wrapper that needs
+# re-provisioning, not deletion, and this script has no way to tell "moved" from
+# "an operator is mid-migration". `loom-daemon` itself and any allowlisted
+# entry are excluded up front, the same as the warning.
 #
 # A `loom-*` PATH entry is considered LEGITIMATE when it is either:
 #   1. `loom-daemon` itself (the native binary), or
@@ -1014,6 +1034,7 @@ warn_stale_entry_points() {
         warn "was retired (epic #4081 Phase 4, #4557), so nothing regenerates them — they are"
         warn "frozen and will shadow the real binary's entry points (incident #4079)."
         warn "Remove them, e.g.:  rm <path>    (or 'pipx uninstall loom-tools')"
+        warn "Or run:  $(basename "$0") --prune-stale-entry-points   (removes exactly the stale Python console scripts above, #5139)."
         warn "Suppress this check with LOOM_SKIP_STALE_ENTRY_POINT_CHECK=1."
     fi
 
@@ -1029,6 +1050,111 @@ warn_stale_entry_points() {
         warn "Callers resolving 'loom-daemon' by name get ${daemon_hits[0]}. Remove the others"
         warn "or pin LOOM_DAEMON_BIN explicitly."
     fi
+}
+
+# prune_stale_entry_points <resolved_daemon_bin> — remove EXACTLY the PATH
+# entries warn_stale_entry_points() above would classify as "Python console
+# script (stale pip/pipx editable install)" (#5139). Deliberately narrower
+# than the full warning:
+#   - `loom-daemon` itself and any STALE_ENTRY_POINT_ALLOWLIST entry are
+#     excluded up front, same as the warning.
+#   - ANY auto-generated PATH shim (`_lde_shim_target` returns non-empty) is
+#     skipped, whether it currently resolves to the resolved binary or not.
+#     A stale shim (its sibling loom-daemon moved) IS reported by the warning,
+#     but it is a legitimate bash wrapper that needs re-provisioning, not a
+#     frozen Python console script — pruning it would violate the "never
+#     touch the legitimate bash wrappers" guardrail.
+#   - only entries whose classification (`_lde_describe`) is EXACTLY the
+#     Python-console-script string are removed.
+# Idempotent: a second run finds nothing left to remove and reports that.
+# Reports every path removed (and any removal failure, without aborting the
+# rest — a permissions problem on one path should not hide a successful
+# removal of the others). Returns 1 if any `rm` failed, 0 otherwise (including
+# the "nothing to prune" case).
+prune_stale_entry_points() {
+    local resolved="$1"
+    if [[ "${LOOM_SKIP_STALE_ENTRY_POINT_CHECK:-0}" =~ ^(1|true|yes)$ ]]; then
+        echo "LOOM_SKIP_STALE_ENTRY_POINT_CHECK is set — leaving all 'loom-*' PATH entries untouched."
+        return 0
+    fi
+
+    # Not consulted for classification (a shim is skipped outright, whatever
+    # it points at), but kept for parity with warn_stale_entry_points and in
+    # case a future classification wants it.
+    local resolved_real=""
+    [[ -n "$resolved" ]] && resolved_real="$(_lde_realpath "$resolved")"
+
+    # Counter tracked alongside the array — see warn_stale_entry_points'
+    # comment above on why `${#arr[@]}` is unsafe under `set -u` on bash 3.2.
+    local -a to_remove=()
+    local remove_count=0
+    local -a seen_dirs=()
+
+    local oldifs="$IFS"
+    IFS=':'
+    # shellcheck disable=SC2206 # deliberate word-splitting of $PATH on ':'
+    local -a path_dirs=($PATH)
+    IFS="$oldifs"
+
+    local dir
+    for dir in "${path_dirs[@]}"; do
+        [[ -z "$dir" ]] && dir="."
+        [[ -d "$dir" ]] || continue
+        local dir_real seen skip
+        dir_real="$(_lde_realpath "$dir")"
+        skip=false
+        for seen in ${seen_dirs[@]+"${seen_dirs[@]}"}; do
+            [[ "$seen" == "$dir_real" ]] && { skip=true; break; }
+        done
+        [[ "$skip" == "true" ]] && continue
+        seen_dirs+=("$dir_real")
+
+        local entry
+        for entry in "$dir"/loom-*; do
+            [[ -f "$entry" && -x "$entry" ]] || continue
+            local name
+            name="$(basename "$entry")"
+            [[ "$name" == "loom-daemon" ]] && continue
+
+            case " $STALE_ENTRY_POINT_ALLOWLIST " in
+                *" $name "*) continue ;;
+            esac
+
+            # Any shim — current OR stale — is never a prune candidate; only
+            # warn_stale_entry_points reports a stale one, and it is a
+            # legitimate wrapper, not a frozen Python console script.
+            local shim_target
+            shim_target="$(_lde_shim_target "$entry")"
+            [[ -n "$shim_target" ]] && continue
+
+            if [[ "$(_lde_describe "$entry")" == "Python console script (stale pip/pipx editable install)" ]]; then
+                to_remove+=("$entry")
+                remove_count=$((remove_count + 1))
+            fi
+        done
+    done
+
+    if (( remove_count == 0 )); then
+        ok "No stale Python console-script entry points found on PATH — nothing to prune."
+        return 0
+    fi
+
+    echo "Pruning $remove_count stale Python console-script entry point(s):"
+    local path failures=0
+    for path in ${to_remove[@]+"${to_remove[@]}"}; do
+        if rm -f -- "$path" 2>/dev/null; then
+            ok "  removed: $path"
+        else
+            err "  FAILED to remove: $path"
+            failures=$((failures + 1))
+        fi
+    done
+    if (( failures > 0 )); then
+        err "Pruning finished with $failures failure(s) above — check permissions on those paths."
+        return 1
+    fi
+    ok "Pruned $remove_count stale entry point(s). Re-run with --check (or the check on the next update) to confirm the advisory is now silent."
+    return 0
 }
 
 # verify_destination_binary <dest_path> — assert the provisioned binary at
@@ -1116,6 +1242,7 @@ NO_RESTART=false
 RELAUNCH=false
 ALLOW_STALE=false
 AUTO_RESOLVE_SAFE_ABORT=false
+PRUNE_STALE=false
 # FETCH_MODE: auto (default -- prefer a verified release artifact when one
 # resolves, else soft-fall-back to the source build), force (--fetch --
 # require an artifact, hard-fail rather than silently building from source),
@@ -1136,6 +1263,7 @@ while [[ $# -gt 0 ]]; do
         --auto-resolve-safe-abort) AUTO_RESOLVE_SAFE_ABORT=true; shift ;;
         --fetch) FETCH_MODE="force"; shift ;;
         --no-fetch) FETCH_MODE="off"; shift ;;
+        --prune-stale-entry-points) PRUNE_STALE=true; shift ;;
         *) err "Unknown option '$1'"; echo "Use --help for usage" >&2; exit 1 ;;
     esac
 done
@@ -1582,6 +1710,21 @@ if [[ "$FETCH_MODE" != "off" ]]; then
     else
         ARTIFACT_FALLBACK_REASON="$FETCH_RESOLVE_REASON"
         warn "Artifact-fetch: ${ARTIFACT_FALLBACK_REASON} — falling back to the local source-build path."
+    fi
+fi
+
+# ---------- --prune-stale-entry-points: standalone action, then exit (#5139) ----------
+# Deliberately checked BEFORE the advisory below (skipping it, not running it
+# first) — this flag exists precisely so an operator does not have to read the
+# warning and act on it by hand; it performs the prune and reports the result
+# directly. Never builds/provisions/restarts; combining it with other flags on
+# the same invocation is not supported (--check et al. are simply ignored once
+# this fires).
+if [[ "$PRUNE_STALE" == "true" ]]; then
+    if prune_stale_entry_points "$DAEMON_BIN"; then
+        exit 0
+    else
+        exit 1
     fi
 fi
 
