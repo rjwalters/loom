@@ -106,6 +106,13 @@ const GITIGNORE_BLOCK_HEADER: &str = "# Loom runtime state (don't commit these)"
 /// converge on this list via the new `loom-daemon update-gitignore` subcommand,
 /// which `resync-installed.sh` invokes — the block was previously refreshed only
 /// during a full `init`, so a fix here never reached repos between installs.
+///
+/// #5014: added `.loom/account-health.json` and `.loom/account-health.lock`
+/// (`tokens_pool::health`'s provider-health cache + its `mkdir`-based lock
+/// dir, [`crate::tokens_pool::locking::MkdirLock`]) — the 0.17.0 rewrite of
+/// this block gained other new entries but missed this one, so every
+/// Loom-managed repo running the daemon's account-health probe showed it as
+/// untracked dirt in `git status`.
 pub const EPHEMERAL_PATTERNS: &[&str] = &[
     ".loom-in-use",
     // Per-worktree builder progress checkpoint. Its WRITER moved from Python to
@@ -162,6 +169,12 @@ pub const EPHEMERAL_PATTERNS: &[&str] = &[
     // hold OAuth keys and must never be committed.
     ".loom/tokens/",
     ".loom/accounts.env",
+    // Provider-health probe cache written by `tokens_pool::health` (the token
+    // pool's account-liveness cache) + its sibling `mkdir`-based lock dir
+    // (#5014). Runtime state, not secret-bearing, but must stay untracked for
+    // the same reason as the rest of this list.
+    ".loom/account-health.json",
+    ".loom/account-health.lock",
     // Uncommitted canary confirmation sentinel (#3731). Its guardrail power comes
     // from being uncommitted, so it must never be tracked.
     ".loom/CANARY",
@@ -590,6 +603,11 @@ mod tests {
         // is born absent in every fresh worktree.
         assert!(contents.contains(".no-changes-needed"));
 
+        // #5014: the account-health probe cache + its lock dir must be
+        // ignored so they never surface as untracked dirt.
+        assert!(contents.contains(".loom/account-health.json"));
+        assert!(contents.contains(".loom/account-health.lock"));
+
         // Retired daemon-brain patterns must NOT be emitted (Phase 3.5, #3402)
         assert!(!contents.contains(".loom/daemon-state.json"));
         assert!(!contents.contains(".loom/[0-9][0-9]-daemon-state.json"));
@@ -695,6 +713,9 @@ mod tests {
             ".loom/metrics/",
             ".loom/usage-cache.json",
             ".loom/claude-config/",
+            // #5014: account-health probe cache + its lock dir.
+            ".loom/account-health.json",
+            ".loom/account-health.lock",
             ".loom/*.log",
             ".loom/*.sock",
             // #4401: tmp sidecars from interrupted atomic writes (e.g.
