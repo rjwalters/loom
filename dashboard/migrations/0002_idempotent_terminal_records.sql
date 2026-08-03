@@ -24,6 +24,32 @@
 --
 -- NULL `sweep_id` values are exempt from uniqueness by SQL's own NULL != NULL
 -- rule, so this is safe even though `sweep_id` is nullable on the column.
+--
+-- Issue #5107: production already had duplicate `(kind, sweep_id)` rows for
+-- these two kinds predating this constraint — the `INSERT OR IGNORE` guard
+-- above is new in this same migration's originating PR (#5106) and only
+-- prevents *future* duplicates, so `CREATE UNIQUE INDEX` failed outright
+-- against pre-existing data with SQLITE_CONSTRAINT_UNIQUE. Dedup first,
+-- keeping the most recently ingested row (`MAX(id)`) per pair, scoped to
+-- exactly the two constrained kinds so every other kind's rows (which may
+-- legitimately share a `sweep_id`, e.g. `sweep.phase`, or carry none at
+-- all) are left untouched.
+--
+-- `sweep_id IS NOT NULL` on both sides mirrors the index's own NULL
+-- exemption (GROUP BY treats all NULLs as one group, unlike the index's
+-- per-SQL-NULL-!=-NULL semantics — without this filter a stray NULL
+-- `sweep_id` row of either kind would collapse every other NULL-`sweep_id`
+-- row of that kind down to one).
+DELETE FROM records
+WHERE kind IN ('sweep.completed', 'sweep.outcome')
+  AND sweep_id IS NOT NULL
+  AND id NOT IN (
+    SELECT MAX(id) FROM records
+    WHERE kind IN ('sweep.completed', 'sweep.outcome')
+      AND sweep_id IS NOT NULL
+    GROUP BY kind, sweep_id
+  );
+
 CREATE UNIQUE INDEX idx_records_terminal_sweep_once
   ON records (kind, sweep_id)
   WHERE kind IN ('sweep.completed', 'sweep.outcome');
