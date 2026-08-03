@@ -120,7 +120,6 @@ Restart the daemon if:
 
 - `pnpm run daemon:test` - Run daemon tests only
 - `pnpm run test` - Run the full workspace test suite
-- `pnpm run test:python` - Run Python tool tests
 
 ### Code Quality
 
