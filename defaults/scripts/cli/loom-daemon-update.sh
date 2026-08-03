@@ -157,10 +157,22 @@
 #   LOOM_DAEMON_UPDATE_COSIGN_PUBKEY  Path to the cosign public key used to
 #                          verify a Linux release's detached `.sig` (else a
 #                          conventional checked-in `.loom/cosign.pub` /
-#                          `defaults/cosign.pub` if present). No key is
-#                          committed to this repo as of Phase 2 (#5011), so
-#                          by default a present `.sig` is a LOUD SKIP, not a
-#                          block — see verify_artifact_signature.
+#                          `defaults/cosign.pub` if present). Consulted ONLY
+#                          for a `.sig` with no sibling `.pem` certificate:
+#                          releases signed keylessly (the default since
+#                          #5054) carry a certificate and are verified against
+#                          the signer identity below, with no key material
+#                          distributed on either side.
+#   LOOM_DAEMON_UPDATE_COSIGN_IDENTITY  Pin one EXACT expected keyless signer
+#                          identity (cosign --certificate-identity). Default:
+#                          unset — the expected identity is DERIVED from the
+#                          release being fetched, as the regexp
+#                          ^https://github\.com/<slug>/\.github/workflows/[^@]+@refs/tags/<tag>$
+#                          ("a workflow in the release repo, run at exactly
+#                          this release's tag").
+#   LOOM_DAEMON_UPDATE_COSIGN_OIDC_ISSUER  Expected keyless certificate issuer
+#                          (default https://token.actions.githubusercontent.com,
+#                          i.e. GitHub Actions' OIDC provider).
 #   LOOM_DAEMON_BIN       Path to the loom-daemon binary (else auto-detected,
 #                          same resolution as loom-daemon-start.sh). When set,
 #                          the fresh binary is provisioned directly to this
@@ -383,10 +395,14 @@ extract_version() {
 #   - signature: verified ONLY when present. macOS: `codesign --verify
 #     --strict` against the downloaded binary (distinguishes "not signed"
 #     -- expected, soft-skip -- from "signed but verification failed" --
-#     abort). Linux: detached `.sig` via `cosign verify-blob`, only when
-#     both `cosign` and a public key are resolvable; otherwise a LOUD skip
-#     (never a block) per the epic's design principle 2. Absence of a
-#     signature never blocks the update.
+#     abort). Linux: detached `.sig` via `cosign verify-blob` — KEYLESS
+#     (Sigstore/OIDC) whenever the release also publishes the sibling
+#     `<...>.pem` signing certificate, which needs no distributed key
+#     material and therefore verifies for real on a stock install (#5054);
+#     otherwise the pre-#5054 KEY mode, which still needs an operator-
+#     provided public key and loud-skips without one. A missing `cosign`
+#     binary is likewise a LOUD skip (never a block) per the epic's design
+#     principle 2. Absence of a signature never blocks the update.
 #
 # Any OTHER resolution failure (unrecognized host platform, no `gh` CLI, no
 # Releases yet, GitHub API unreachable/rate-limited, no artifact published
@@ -523,11 +539,12 @@ fetch_resolve_latest() {
 }
 
 # resolve_cosign_pubkey -- echo a resolvable cosign public key path, or "".
-# No public key is committed to this repo as of Phase 2 (#5011) -- this is
-# deliberately best-effort: LOOM_DAEMON_UPDATE_COSIGN_PUBKEY (env) first,
-# else a conventional checked-in path if one is ever added. An empty result
-# means "signature present but unverifiable" -- a loud skip, never a block
-# (see verify_artifact_signature).
+# KEY mode only (a `.sig` published without a sibling `.pem` certificate):
+# LOOM_DAEMON_UPDATE_COSIGN_PUBKEY (env) first, else a conventional checked-in
+# path. No public key is committed to this repo, and #5054 deliberately did
+# NOT add one -- see resolve_cosign_identity_regexp for why keyless is the
+# default trust root instead. An empty result means "signature present but
+# unverifiable" -- a loud skip, never a block (see verify_artifact_signature).
 resolve_cosign_pubkey() {
     if [[ -n "${LOOM_DAEMON_UPDATE_COSIGN_PUBKEY:-}" && -r "${LOOM_DAEMON_UPDATE_COSIGN_PUBKEY}" ]]; then
         echo "$LOOM_DAEMON_UPDATE_COSIGN_PUBKEY"
@@ -538,6 +555,55 @@ resolve_cosign_pubkey() {
         [[ -r "$candidate" ]] && { echo "$candidate"; return 0; }
     done
     echo ""
+}
+
+# _regex_escape <literal> -- escape POSIX ERE metacharacters so a repo slug or
+# release tag can be embedded literally inside the identity regexp below
+# (`.` in `github.com` / `v0.17.0` is the one that actually matters, but the
+# whole metacharacter class is escaped so no future tag shape can widen the
+# expected identity).
+_regex_escape() {
+    printf '%s' "$1" | sed 's/[][\.^$*+?(){}|\\]/\\&/g'
+}
+
+# resolve_cosign_identity_regexp -- echo the expected KEYLESS signer identity
+# (a POSIX ERE for cosign's --certificate-identity-regexp), or "" when it
+# cannot be derived.
+#
+# WHY KEYLESS IS THE DEFAULT (#5054, the decision this function encodes):
+# Phase 2 (#5011) signed Linux artifacts with a cosign PRIVATE KEY held in an
+# Actions secret, and Phase 3 (#5020) verified them against a public key that
+# was never distributed -- so every real host loud-skipped. Distributing that
+# public key (committing `defaults/cosign.pub`) would fix the skip but pins the
+# whole fleet to one keypair: rotating it silently breaks verification on every
+# host still carrying the old key, and the key must be provisioned as a secret
+# before ANY release can be signed at all. Keyless Sigstore signing has neither
+# problem -- the signer proves its identity with the GitHub Actions OIDC token
+# the workflow already has, so signing needs NO secret to be provisioned and
+# verification needs NO key material to be distributed. The trust root becomes
+# an assertion about *who signed*, which is exactly what we care about:
+#
+#   "a workflow in the SAME repo this artifact was downloaded from, running at
+#    EXACTLY this release's tag, with a certificate issued by GitHub Actions"
+#
+# The workflow FILE is intentionally not pinned (any `[^@]+` under
+# `.github/workflows/`): pinning it would turn a future rename of
+# `release.yml` into a fleet-wide hard-abort, while adding nothing -- anything
+# able to run a workflow in this repo at this tag can already publish the
+# release assets themselves. Operators who want the stricter form set
+# LOOM_DAEMON_UPDATE_COSIGN_IDENTITY to the exact identity.
+resolve_cosign_identity_regexp() {
+    local slug="${FETCH_REPO_SLUG:-}" tag="${ARTIFACT_TAG:-}"
+    [[ -n "$slug" && -n "$tag" ]] || { echo ""; return 0; }
+    printf '^https://github\\.com/%s/\\.github/workflows/[^@]+@refs/tags/%s$' \
+        "$(_regex_escape "$slug")" "$(_regex_escape "$tag")"
+}
+
+# resolve_cosign_oidc_issuer -- echo the expected keyless certificate issuer.
+# GitHub Actions' OIDC provider by default; overridable for a self-hosted
+# forge or a differently-issued token.
+resolve_cosign_oidc_issuer() {
+    echo "${LOOM_DAEMON_UPDATE_COSIGN_OIDC_ISSUER:-https://token.actions.githubusercontent.com}"
 }
 
 # verify_artifact_checksum <bin_path> <sha256_path> -- unconditional
@@ -559,12 +625,21 @@ verify_artifact_checksum() {
     [[ "$expected" == "$actual" ]]
 }
 
-# verify_artifact_signature <target> <bin_path> <sig_path-or-empty> --
+# verify_artifact_signature <target> <bin_path> <sig_path-or-empty>
+#                           [cert_path-or-empty] --
 # signature verification, present-only (absence always passes). Distinguishes
 # "not signed" (expected/allowed, soft-skip) from "signed but verification
 # failed" (tamper evidence, hard-fail) per the epic's design principle 2.
+#
+# On Linux the ARTIFACT's OWN SHAPE selects the verification mode -- never
+# local configuration (#5054): a `.sig` accompanied by its `.pem` signing
+# certificate was signed keylessly and is verified against the expected signer
+# identity; a bare `.sig` was signed with a private key and needs a resolvable
+# public key. Deciding by artifact shape is what makes a stale operator-set
+# LOOM_DAEMON_UPDATE_COSIGN_PUBKEY harmless against keyless releases instead of
+# a fleet-wide false "tamper" abort.
 verify_artifact_signature() {
-    local target="$1" bin_path="$2" sig_path="$3"
+    local target="$1" bin_path="$2" sig_path="$3" cert_path="${4:-}"
     case "$target" in
         *-apple-darwin)
             if ! command -v codesign >/dev/null 2>&1; then
@@ -594,10 +669,39 @@ verify_artifact_signature() {
                 warn "A detached signature ($(basename "$sig_path")) is present for this release but 'cosign' is not installed -- SKIPPING verification (loud skip, not a block; checksum already verified)."
                 return 0
             fi
+            # ---- keyless (Sigstore/OIDC): the default since #5054 ----
+            if [[ -n "$cert_path" ]]; then
+                local issuer identity_desc
+                local -a identity
+                issuer="$(resolve_cosign_oidc_issuer)"
+                if [[ -n "${LOOM_DAEMON_UPDATE_COSIGN_IDENTITY:-}" ]]; then
+                    identity_desc="$LOOM_DAEMON_UPDATE_COSIGN_IDENTITY"
+                    identity=(--certificate-identity "$LOOM_DAEMON_UPDATE_COSIGN_IDENTITY")
+                else
+                    identity_desc="$(resolve_cosign_identity_regexp)"
+                    if [[ -z "$identity_desc" ]]; then
+                        warn "A detached signature ($(basename "$sig_path")) and its signing certificate are present but the expected signer identity could not be derived (no release slug/tag in scope) -- SKIPPING verification (loud skip, not a block; checksum already verified)."
+                        return 0
+                    fi
+                    identity=(--certificate-identity-regexp "$identity_desc")
+                fi
+                if cosign verify-blob \
+                        --certificate "$cert_path" \
+                        --signature "$sig_path" \
+                        "${identity[@]}" \
+                        --certificate-oidc-issuer "$issuer" \
+                        "$bin_path" >/dev/null 2>&1; then
+                    ok "cosign keyless signature verification passed for $(basename "$bin_path") (signer identity ${identity_desc}, issuer ${issuer})."
+                    return 0
+                fi
+                err "cosign keyless signature verification FAILED for $(basename "$bin_path") against $(basename "$sig_path") + $(basename "$cert_path") (expected signer identity ${identity_desc}, issuer ${issuer})."
+                return 1
+            fi
+            # ---- key mode: a bare `.sig`, pre-#5054 signing ----
             local pubkey
             pubkey="$(resolve_cosign_pubkey)"
             if [[ -z "$pubkey" ]]; then
-                warn "A detached signature ($(basename "$sig_path")) is present but no cosign public key is resolvable (set LOOM_DAEMON_UPDATE_COSIGN_PUBKEY) -- SKIPPING verification (loud skip, not a block; checksum already verified)."
+                warn "A detached signature ($(basename "$sig_path")) is present without a signing certificate (key-signed release) and no cosign public key is resolvable (set LOOM_DAEMON_UPDATE_COSIGN_PUBKEY) -- SKIPPING verification (loud skip, not a block; checksum already verified)."
                 return 0
             fi
             if cosign verify-blob --key "$pubkey" --signature "$sig_path" "$bin_path" >/dev/null 2>&1; then
@@ -625,7 +729,7 @@ _cleanup_fetch_tmpdirs() {
 trap _cleanup_fetch_tmpdirs EXIT
 
 # fetch_and_verify_artifact -- download loom-daemon-<ARTIFACT_TARGET> +
-# its .sha256 (required) + its .sig (best-effort) for ARTIFACT_TAG from
+# its .sha256 (required) + its .sig and .pem (both best-effort) for ARTIFACT_TAG from
 # FETCH_REPO_SLUG, verify checksum (unconditional) and signature (when
 # present), and set ARTIFACT_BIN (path to the verified binary),
 # ARTIFACT_VERSION_OUTPUT (its full `--version` string, the post-provision
@@ -640,7 +744,7 @@ trap _cleanup_fetch_tmpdirs EXIT
 # ARTIFACT_MODE by the time this runs, so the caller also aborts, but the
 # distinction keeps this function's contract composable.
 fetch_and_verify_artifact() {
-    local tmpdir bin_name sha_name sig_name bin_path sha_path sig_path=""
+    local tmpdir bin_name sha_name sig_name cert_name bin_path sha_path sig_path="" cert_path=""
     tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/loom-daemon-fetch.XXXXXX" 2>/dev/null)" || {
         err "Could not create a temp dir for the artifact download."
         return 1
@@ -650,6 +754,7 @@ fetch_and_verify_artifact() {
     bin_name="loom-daemon-${ARTIFACT_TARGET}"
     sha_name="${bin_name}.sha256"
     sig_name="${bin_name}.sig"
+    cert_name="${bin_name}.pem"
 
     echo "Downloading ${bin_name} + ${sha_name} from ${FETCH_REPO_SLUG}@${ARTIFACT_TAG}..."
     if ! gh release download "$ARTIFACT_TAG" -R "$FETCH_REPO_SLUG" \
@@ -678,8 +783,19 @@ fetch_and_verify_artifact() {
             -p "$sig_name" -D "$tmpdir" --clobber >/dev/null 2>&1 \
         && [[ -f "$tmpdir/$sig_name" ]]; then
         sig_path="$tmpdir/$sig_name"
+        # A keyless-signed release also publishes the ephemeral signing
+        # certificate next to the signature (#5054); its presence is what
+        # selects keyless verification in verify_artifact_signature. Fetched
+        # separately (and only when there IS a signature) so a key-signed
+        # release, which publishes no `.pem`, never turns a "pattern matched
+        # nothing" download into an error.
+        if gh release download "$ARTIFACT_TAG" -R "$FETCH_REPO_SLUG" \
+                -p "$cert_name" -D "$tmpdir" --clobber >/dev/null 2>&1 \
+            && [[ -f "$tmpdir/$cert_name" ]]; then
+            cert_path="$tmpdir/$cert_name"
+        fi
     fi
-    if ! verify_artifact_signature "$ARTIFACT_TARGET" "$bin_path" "$sig_path"; then
+    if ! verify_artifact_signature "$ARTIFACT_TARGET" "$bin_path" "$sig_path" "$cert_path"; then
         err "Signature verification FAILED for $bin_name (see above)."
         err "Aborting the update; the running daemon (if any) is left untouched."
         exit 1

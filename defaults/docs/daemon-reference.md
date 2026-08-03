@@ -5007,13 +5007,61 @@ dev machines, canaries, and forks behave exactly as before.
     all" (a release built without the Developer ID secrets) is an expected
     **soft-skip**; "signed but verification fails" is treated as tamper evidence
     and **aborts (exit 1)**.
-  - Linux: the detached `loom-daemon-<target>.sig` (published only when the
-    release was built with a cosign key) is verified with `cosign verify-blob`.
-    If `cosign` is missing, or no public key is resolvable, the script emits a
-    **loud skip** and proceeds — no cosign public key is distributed with this
-    repo yet. Point `LOOM_DAEMON_UPDATE_COSIGN_PUBKEY` at a key (or commit one at
-    `.loom/cosign.pub` / `defaults/cosign.pub`) to turn that skip into real
-    verification. A resolvable key plus a failing verification **aborts (exit 1)**.
+  - Linux: the detached `loom-daemon-<target>.sig` is verified with
+    `cosign verify-blob`, **keylessly by default** (#5054) — see below. If
+    `cosign` itself is missing the script emits a **loud skip** and proceeds;
+    a verification that actually runs and *fails* **aborts (exit 1)**.
+
+**Linux signature trust root: keyless (Sigstore/OIDC), no distributed key (#5054)**
+
+The release workflow signs Linux artifacts with cosign in **keyless** mode: it
+exchanges the workflow's own GitHub Actions OIDC token for a short-lived Fulcio
+certificate and publishes that certificate next to the signature as
+`loom-daemon-<target>.pem`. Nothing is verified against a long-lived key, so
+**no public key is committed to this repo and none needs to be** — a stock
+install performs real verification with zero operator configuration.
+
+The **artifact's own shape** selects the mode, never local config:
+
+| Published assets | Mode | Behavior |
+|------------------|------|----------|
+| `.sig` **+** `.pem` | **keyless** (default) | Verified against the expected *signer identity* + issuer. Failure ⇒ **abort (exit 1)** |
+| `.sig` only | key | Needs a resolvable public key (`LOOM_DAEMON_UPDATE_COSIGN_PUBKEY`, `.loom/cosign.pub`, `defaults/cosign.pub`); none resolvable ⇒ **loud skip**; failure ⇒ **abort (exit 1)** |
+| neither | — | Soft-skip (absence of a signature never blocks) |
+
+The expected signer identity is **derived** from the release being fetched:
+
+```
+^https://github\.com/<owner/repo>/\.github/workflows/[^@]+@refs/tags/<tag>$
+   issuer: https://token.actions.githubusercontent.com
+```
+
+i.e. *"a workflow in the same repo this artifact came from, running at exactly
+this release's tag, with a certificate issued by GitHub Actions."* The workflow
+**file** is deliberately not pinned: a future rename of `release.yml` would
+otherwise hard-abort updates fleet-wide, while adding no real constraint —
+anything that can run a workflow in this repo at this tag can already publish
+the release assets. Pin the exact identity with
+`LOOM_DAEMON_UPDATE_COSIGN_IDENTITY` if you want the stricter form.
+
+**Why keyless rather than committing `defaults/cosign.pub`.** A committed public
+key would also close the loud-skip gap, but it (a) pins the whole fleet to one
+keypair, so rotating it silently breaks verification on every host still
+carrying the old key, and (b) requires a private key to be provisioned as an
+Actions secret before *any* release can be signed at all — which is exactly why
+no release had ever been signed: no `COSIGN_PRIVATE_KEY` secret was ever set, so
+there was no production public key to distribute in the first place. Keyless
+signing needs no secret, so it is on by default for this repo *and every fork*.
+A repo that prefers classic key signing sets `COSIGN_PRIVATE_KEY` (which takes
+precedence in the workflow) and distributes the matching public key itself; its
+releases then publish a bare `.sig` and consumers fall back to the key path
+above.
+
+> Keyless verification contacts Sigstore's transparency log, so a host with no
+> egress to it will see the verification fail and the update **abort** rather
+> than install an unverified binary. That is the intended failure direction:
+> the running daemon is left untouched, and `LOOM_DAEMON_UPDATE_FETCH=0` opts
+> such a host out of artifact fetching entirely.
 
 **Provisioning and restart are unchanged.** A verified artifact goes through the
 *same* `provision_machine_daemon()` seam as a freshly compiled binary (no parallel
@@ -5068,7 +5116,9 @@ seams):
 | `LOOM_DAEMON_UPDATE_FETCH` | `1`/`true`/`yes` ⇒ force (`--fetch`); `0`/`false`/`no` ⇒ off (`--no-fetch`); unset ⇒ auto |
 | `LOOM_DAEMON_UPDATE_GH_REPO` | Override the `owner/repo` slug used for release resolution (default: parsed from the `origin` remote) |
 | `LOOM_DAEMON_UPDATE_TARGET` | Override the detected release target triple |
-| `LOOM_DAEMON_UPDATE_COSIGN_PUBKEY` | Path to the cosign public key used to verify a Linux `.sig` |
+| `LOOM_DAEMON_UPDATE_COSIGN_PUBKEY` | Path to the cosign public key used to verify a **key-signed** Linux `.sig` (one published without a `.pem`) |
+| `LOOM_DAEMON_UPDATE_COSIGN_IDENTITY` | Pin one exact expected keyless signer identity instead of the derived regexp |
+| `LOOM_DAEMON_UPDATE_COSIGN_OIDC_ISSUER` | Expected keyless certificate issuer (default `https://token.actions.githubusercontent.com`) |
 
 **No new daemon config keys.** The autonomous self-update loop
 (`autonomous.autoUpdate.*`) needs no change and passes no fetch flag: it invokes
