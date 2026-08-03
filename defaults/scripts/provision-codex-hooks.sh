@@ -25,41 +25,63 @@
 # touched by any subcommand. Only the profile DIRECTORY NAME is ever printed.
 #
 # ============================================================================
-# HOOK TRUST (Codex 0.146.0) — WHY THIS FAILS CLOSED
+# HOOK TRUST (Codex 0.146.0) — WHY THIS FAILS CLOSED, AND THE READINESS PATH
+# (issue #5005, follow-up to #4495)
 # ============================================================================
 #
 # Codex persists hook trust as `hooks.state."<identity>".trusted_hash` in
-# `$CODEX_HOME/config.toml`, established interactively (the TUI's hook-trust
-# prompt) or waived with `--dangerously-bypass-hook-trust`.
+# `$CODEX_HOME/config.toml`, established interactively (the TUI's "Hooks"
+# review screen, `t` = trust all) or waived with
+# `--dangerously-bypass-hook-trust`.
 #
-# On 0.146.0 there is NO documented non-interactive command to establish it:
-# `codex` exposes no `hooks` subcommand, and `codex doctor` reports no hook
-# check (verified 2026-07-31 against the shipped 0.146.0 binary). Loom will not
-# guess the identity string or the hash algorithm, and #4495's scope guards
-# forbid `--dangerously-bypass-hook-trust`. So this script takes the second
-# option #4495's acceptance criteria explicitly allow: **fail closed before
-# mutable-role dispatch when trust cannot be verified.**
+# On 0.146.0 there is NO non-interactive command to establish it: `codex
+# --help` / `codex exec --help` list no `hooks` subcommand, and a fresh
+# `codex doctor --json` reports no hook-related check at all (its 18 checks
+# are auth/config/mcp/network/runtime/sandbox/state/system/terminal/updates —
+# verified 2026-07-31). Issue #5005 (2026-08-03) additionally confirmed the
+# EXACT trust-identity format by driving the live 0.146.0 TUI end-to-end
+# (`codex` interactively -> the "Hooks" review screen -> `t` to trust all):
+# Codex writes `hooks.state."<realpath of hooks.json>:pre_tool_use:<PreToolUse
+# array index of the group>:<index of the hook within that group>"` with
+# `trusted_hash = "sha256:<hex>"`. That confirms the identity string, but NOT
+# the hash algorithm: #5005 also tried pre-seeding a forged `trusted_hash` at
+# the correctly-computed identity key, and the live CLI rejected it ("1 hook
+# is new or changed", re-prompting for review) — so the hash is
+# content-verified and Loom will not guess or reverse-engineer it. Combined
+# with the forbidden `--dangerously-bypass-hook-trust` flag (equivalently the
+# `bypass_hook_trust` config key — neither is ever passed), **there is no safe
+# non-interactive trust path on 0.146.0.** The shipped readiness path is
+# therefore the operator-attested one-time step documented in
+# `defaults/docs/guardrail-parity-codex.md` § "Provisioning and trust":
+# install, then one interactive `CODEX_HOME=<profile> codex` run per profile
+# to accept the Hooks review screen, gated by `verify --json`.
 #
-# `verify` therefore checks three things:
+# `verify` checks four things:
 #
 #   1. STRUCTURE — hooks.json contains Loom's managed entry at the expected
 #      version, and the bridge it names is readable and points at the current
 #      workspace's provisioned guard.
-#   2. CODEX TRUST — `config.toml` carries at least one `hooks.state` entry
-#      with a non-empty `trusted_hash`. This is the only Codex-owned trust
-#      signal observable from outside the CLI; it proves the operator has been
-#      through the trust prompt for this profile.
+#   2. CODEX TRUST, PRECISELY — `config.toml` carries a `hooks.state` entry at
+#      the EXACT identity key Loom's own managed entry occupies (computed from
+#      the entry's live array position, per the format above), with a
+#      non-empty `trusted_hash`. This distinguishes "Loom's entry specifically
+#      is trusted" from the OLD, coarser "some hooks.state entry exists"
+#      signal (still reported as `trustedAny` for diagnostics) — a profile
+#      where an operator trusted only their own unrelated hook now correctly
+#      reports not-ready instead of a false positive.
 #   3. STALENESS — Loom's own receipt (`<CODEX_HOME>/loom-codex-hooks.json`,
 #      non-secret, Loom-owned) pins the SHA-256 of the managed entry as it was
 #      when it was last installed. If the entry has since changed, trust
 #      established for the OLD entry cannot be assumed to cover the new one, so
-#      readiness is STALE and mutable-role dispatch fails closed.
+#      readiness is STALE and mutable-role dispatch fails closed. (This also
+#      matches live Codex behavior: moving/editing the entry changes its
+#      identity key or its content hash, and the live CLI re-flags it "new or
+#      changed" too.)
+#   4. BRIDGE — the named bridge script is readable.
 #
-# Check 2 is deliberately labelled as a coarse signal in
-# defaults/docs/guardrail-parity-codex.md: it proves "this profile has trusted
-# some hook", not "this profile has trusted LOOM's hook". That imprecision is
-# one of the reasons `defaults/runtimes/codex.json` stays at
-# `hooks: partial` / `worktreeIsolation: partial`.
+# `defaults/runtimes/codex.json` still keeps `hooks` / `worktreeIsolation` at
+# `partial` — this precision fix closes the "no readiness path" gap, not the
+# separate real-CLI-canary + matcher-semantics evidence gate (#4496).
 #
 # ============================================================================
 # USAGE
@@ -443,12 +465,24 @@ do_remove() {
 #
 # Prints a machine-readable object under --json:
 #   {"profile","ready":bool,"installed":bool,"version":N,"trusted":bool,
-#    "stale":bool,"bridgeReadable":bool,"reason":"..."}
+#    "trustedAny":bool,"stale":bool,"bridgeReadable":bool,"identityKey":str|null,
+#    "reason":"..."}
 # The profile DIRECTORY NAME is the only identity ever emitted; no path
 # contents, no credential material.
+#
+# `trusted` is the PRECISE signal (issue #5005): Codex 0.146.0 persists hook
+# trust keyed by `hooks.state."<realpath-of-hooks.json>:pre_tool_use:<group
+# index>:<hook index>"` (empirically confirmed 2026-08-03 against the live
+# 0.146.0 binary — see "HOOK TRUST" above and guardrail-parity-codex.md's
+# "Provisioning and trust" section for the full evidence trail). This script
+# computes THAT SPECIFIC key for Loom's own managed entry and checks for it,
+# rather than the coarse "does hooks.state contain any trusted_hash at all"
+# signal `trustedAny` still reports for diagnostics. A profile where an
+# operator trusted only their OWN unrelated hook now correctly reports
+# trusted=false (not ready) instead of the old false-positive.
 do_verify() {
-    local installed=false trusted=false stale=false bridge_readable=false
-    local installed_cmd="" reason="" ready=false
+    local installed=false trusted=false trusted_any=false stale=false bridge_readable=false
+    local installed_cmd="" reason="" ready=false loom_gi="" loom_hi="" identity_key=""
 
     if [[ -r "$BRIDGE" ]]; then
         bridge_readable=true
@@ -459,23 +493,61 @@ do_verify() {
     if [[ "$rc" -ne 0 ]]; then
         reason="hooks.json is unreadable or malformed"
     else
-        installed_cmd="$(printf '%s' "$existing" | jq -r \
+        # Find Loom's own entry AND its position in the PreToolUse array (the
+        # array index doubles as part of Codex's trust-identity key below).
+        local loom_entry
+        loom_entry="$(printf '%s' "$existing" | jq -c \
             --arg marker "$LOOM_HOOK_MARKER" '
-            [ (.hooks?.PreToolUse? // []) | .[]? | (.hooks? // []) | .[]?
-              | (.command? // "") | select(contains($marker)) ] | .[0] // empty
-        ' 2>/dev/null)" || installed_cmd=""
+            ( .hooks?.PreToolUse? // [] ) as $groups
+            | [ range(0; ($groups|length)) as $gi
+                | ( ($groups[$gi].hooks? // []) ) as $hooks
+                | range(0; ($hooks|length)) as $hi
+                | select(($hooks[$hi].command? // "") | contains($marker))
+                | {gi: $gi, hi: $hi, command: ($hooks[$hi].command // "")}
+              ] | .[0] // empty
+        ' 2>/dev/null)" || loom_entry=""
+        if [[ -n "$loom_entry" && "$loom_entry" != "null" ]]; then
+            installed_cmd="$(printf '%s' "$loom_entry" | jq -r '.command // empty' 2>/dev/null)"
+            loom_gi="$(printf '%s' "$loom_entry" | jq -r '.gi' 2>/dev/null)"
+            loom_hi="$(printf '%s' "$loom_entry" | jq -r '.hi' 2>/dev/null)"
+        fi
         [[ -n "$installed_cmd" ]] && installed=true
     fi
 
-    # Codex-owned trust signal: any hooks.state entry with a trusted_hash. Codex
-    # writes it either as a `[hooks.state."<id>"]` table with `trusted_hash =
-    # "..."` on its own line, or as a dotted key
+    # Coarse, diagnostic-only signal: any hooks.state entry with a
+    # trusted_hash. Codex writes it either as a `[hooks.state."<id>"]` table
+    # with `trusted_hash = "..."` on its own line, or as a dotted key
     # (`hooks.state."<id>".trusted_hash = "..."`); both spellings are matched.
     # A `#`-commented line is excluded so a documentation comment in an
-    # operator's config.toml cannot fake trust.
+    # operator's config.toml cannot fake trust. This proves only "the profile
+    # has trusted SOME hook" — see `trusted` below for the precise check.
     if [[ -r "$CONFIG_FILE" ]] \
         && grep -qE '^[^#]*trusted_hash[[:space:]]*=[[:space:]]*"[^"]+"' "$CONFIG_FILE" 2>/dev/null; then
-        trusted=true
+        trusted_any=true
+    fi
+
+    # Precise signal: Loom's SPECIFIC managed entry, at its exact array
+    # position, has an entry in hooks.state keyed by Codex's own
+    # "<hooks.json realpath>:pre_tool_use:<group>:<hook>" identity scheme.
+    if [[ "$installed" == true && -n "$loom_gi" && -n "$loom_hi" ]]; then
+        local hooks_dir_real hooks_file_real
+        hooks_dir_real="$(cd "$(dirname "$HOOKS_FILE")" 2>/dev/null && pwd -P)" || hooks_dir_real=""
+        if [[ -n "$hooks_dir_real" ]]; then
+            hooks_file_real="${hooks_dir_real%/}/$(basename "$HOOKS_FILE")"
+        else
+            hooks_file_real="$HOOKS_FILE"
+        fi
+        identity_key="${hooks_file_real}:pre_tool_use:${loom_gi}:${loom_hi}"
+        if [[ -r "$CONFIG_FILE" ]]; then
+            local header="[hooks.state.\"${identity_key}\"]"
+            if awk -v hdr="$header" '
+                $0 == hdr { found = 1; next }
+                found && /^\[/ { found = 0 }
+                found && /trusted_hash[[:space:]]*=[[:space:]]*"[^"]+"/ { print "yes"; exit }
+            ' "$CONFIG_FILE" 2>/dev/null | grep -q yes; then
+                trusted=true
+            fi
+        fi
     fi
 
     # Staleness: the installed command must match the receipt's pinned hash.
@@ -507,13 +579,17 @@ do_verify() {
 
     if [[ "$bridge_readable" != true ]]; then
         reason="the managed hook bridge is missing or unreadable"
-    elif [[ "$trusted" != true && -z "$reason" ]]; then
-        reason="Codex hook trust is not established for this profile (no hooks.state trusted_hash in config.toml)"
+    elif [[ "$installed" == true && "$trusted" != true && -z "$reason" ]]; then
+        if [[ "$trusted_any" == true ]]; then
+            reason="Codex hook trust is established for at least one hook in this profile, but NOT specifically for Loom's managed entry (expected hooks.state key \"$identity_key\" — run CODEX_HOME=<profile> codex and trust the PreToolUse hook shown in the Hooks review screen)"
+        else
+            reason="Codex hook trust is not established for this profile (no hooks.state entry for \"$identity_key\")"
+        fi
     fi
 
     if [[ "$installed" == true && "$trusted" == true && "$stale" == false && "$bridge_readable" == true ]]; then
         ready=true
-        reason="managed hook v$LOOM_HOOK_VERSION installed, pinned, and the profile has established Codex hook trust"
+        reason="managed hook v$LOOM_HOOK_VERSION installed, pinned, and Codex hook trust is established specifically for Loom's managed entry (hooks.state key \"$identity_key\")"
     fi
     [[ -n "$reason" ]] || reason="not ready"
 
@@ -523,13 +599,17 @@ do_verify() {
             --argjson ready "$ready" \
             --argjson installed "$installed" \
             --argjson trusted "$trusted" \
+            --argjson trustedAny "$trusted_any" \
             --argjson stale "$stale" \
             --argjson bridgeReadable "$bridge_readable" \
             --argjson version "$LOOM_HOOK_VERSION" \
+            --arg identityKey "$identity_key" \
             --arg reason "$reason" \
             '{profile: $profile, ready: $ready, installed: $installed,
-              trusted: $trusted, stale: $stale, bridgeReadable: $bridgeReadable,
-              version: $version, reason: $reason}'
+              trusted: $trusted, trustedAny: $trustedAny, stale: $stale,
+              bridgeReadable: $bridgeReadable, version: $version,
+              identityKey: (if $identityKey == "" then null else $identityKey end),
+              reason: $reason}'
     fi
 
     if [[ "$ready" == true ]]; then

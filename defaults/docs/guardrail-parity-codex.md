@@ -208,8 +208,8 @@ managed entry in `$CODEX_HOME/hooks.json`:
 - **Credentials are never read, copied, parsed, or logged.** `auth.json` is not
   touched by any subcommand; only the profile *directory name* is ever printed.
 - **`verify`** is read-only and reports readiness as JSON
-  (`{profile, ready, installed, trusted, stale, bridgeReadable, version, reason}`),
-  exit 0 ready / 78 not ready.
+  (`{profile, ready, installed, trusted, trustedAny, stale, bridgeReadable,
+  version, identityKey, reason}`), exit 0 ready / 78 not ready.
 - **`--all-profiles`** applies any subcommand to **every** pooled profile under
   `LOOM_CODEX_PROFILE_ROOT` (default `~/.loom/codex-profiles` — the same root
   `spawn-codex.sh` resolves `LOOM_CODEX_PROFILE` against and `loom-daemon
@@ -222,45 +222,100 @@ managed entry in `$CODEX_HOME/hooks.json`:
 **Hook trust.** Codex persists trust as `hooks.state."<id>".trusted_hash` in
 `$CODEX_HOME/config.toml`, established interactively or waived with
 `--dangerously-bypass-hook-trust` (equivalently the `bypass_hook_trust` config
-key — Loom passes **neither**). On 0.146.0 there is **no documented
-non-interactive command to establish it**: `codex --help` lists no `hooks`
-subcommand, and `codex doctor --json`, run against a freshly provisioned
-temporary profile, emits **no hook check at all** — its 18 checks are
-`app_server.status`, `auth.credentials`, `config.load`, `git.environment`,
-`installation`, `mcp.config`, `network.*`, `runtime.*`, `sandbox.helpers`,
-`state.*`, `system.environment`, `terminal.*`, `updates.status`. Loom will not
-guess the identity string or the hash algorithm, and it will not pass the bypass
-flag. So `verify` fails closed instead, checking three things:
+key — Loom passes **neither**, enforced by
+`test-provision-codex-hooks.sh`'s repo-wide scan of every script under
+`defaults/scripts/` and `defaults/hooks/`, not just this script and
+`spawn-codex.sh`).
+
+#### Readiness path (issue #5005): the investigation, and why option 2 shipped
+
+Issue #4495 wired the bridge but left the trust-readiness path as unresolved
+prose. #5005 (2026-08-03) closed that gap by driving the **live** 0.146.0
+binary end-to-end — not just reading its `--help` output — and records what it
+found so nobody re-litigates this:
+
+1. **No non-interactive trust command exists.** `codex --help` / `codex exec
+   --help` list no `hooks` subcommand; the only trust-related flag is the
+   forbidden `--dangerously-bypass-hook-trust`. A fresh `codex doctor --json`
+   emits **no hook-related check at all** — its 18 checks are
+   `app_server.status`, `auth.credentials`, `config.load`, `git.environment`,
+   `installation`, `mcp.config`, `network.*`, `runtime.*`, `sandbox.helpers`,
+   `state.*`, `system.environment`, `terminal.*`, `updates.status`.
+2. **The trust-identity format is now known, empirically.** Installing the
+   managed hook and then running `codex` interactively shows a "Hooks" review
+   screen (`⚠ N hooks need review before they can run` / `Press t to trust
+   all; enter to review hooks; esc to close`). Pressing `t` writes exactly:
+   ```toml
+   [hooks.state."<realpath of $CODEX_HOME/hooks.json>:pre_tool_use:<PreToolUse array index of the group>:<index of the hook within that group>"]
+   trusted_hash = "sha256:<hex>"
+   ```
+   Confirmed reproducibly across two independent runs (a single-group profile
+   -> index `0:0`; a profile with an operator's own PreToolUse group installed
+   first -> Loom's entry at index `1:0`, matching its array position). This
+   also matches the do_install merge strategy: Loom's group is always
+   appended LAST, so its index is deterministic at verify time.
+3. **Pre-seeding a forged `trusted_hash` at the correctly-computed key does
+   NOT work.** #5005 tried it: the live CLI still reported `"1 hook is new or
+   changed"` and re-demanded review, so the hash **is** content-verified
+   against something Loom does not know the algorithm for. Per this issue's
+   explicit guardrail, Loom will not guess or reverse-engineer it — computing
+   only the identity *key* (which does not require the hash algorithm) is as
+   far as this investigation safely goes.
+4. **Conclusion: no non-interactive trust path exists on 0.146.0.** The
+   documented, shipped mechanism is therefore **option 2** — the
+   operator-attested one-time-per-profile interactive step below — gated by a
+   `verify` that now checks Loom's own entry's *specific* identity key rather
+   than "any `hooks.state` entry exists" (the old, coarser signal, still
+   reported as `trustedAny` for diagnostics). This is what makes `verify`
+   trustworthy enough for the daemon to gate admission on: a profile where an
+   operator trusted only their own unrelated hook now correctly reports
+   `trusted:false, ready:false` instead of a false positive.
+
+`verify` checks four things:
 
 1. **Structure** — Loom's entry is present at the expected version and names a
    readable bridge belonging to this workspace.
-2. **Codex trust** — `config.toml` carries at least one `hooks.state` entry with
-   a non-empty `trusted_hash`. This is the only externally-observable Codex
-   trust signal; it proves the profile has been through the trust prompt, **not**
-   that Loom's specific entry was the thing trusted. That imprecision is one of
-   the reasons the capability manifest stays `partial` (gap 11).
+2. **Codex trust, precisely** — `config.toml` carries a `hooks.state` entry at
+   the EXACT identity key Loom's own managed entry occupies (computed live,
+   from the entry's current array position, using the format above), with a
+   non-empty `trusted_hash`. `identityKey` in the JSON output shows exactly
+   which key `verify` is looking for, so an operator debugging a `not ready`
+   result can see it directly.
 3. **Staleness** — the Loom-owned, non-secret receipt
    `$CODEX_HOME/loom-codex-hooks.json` pins the SHA-256 of the managed entry as
    installed. If the entry changed since, readiness is STALE and mutable roles
-   fail closed.
+   fail closed. (This mirrors live Codex behavior: moving or editing the entry
+   changes its identity key or content, and the real CLI also re-flags it "new
+   or changed".)
+4. **Bridge** — the named bridge script is readable.
 
-Operator step — install pool-wide once, then trust **once per profile** (the
-trust prompt is interactive by necessity, gap 11):
+#### Reproducible procedure: fresh profile -> `verify --json` ready
 
 ```bash
-# 1. install the managed hook into every pooled profile (idempotent, credential-free)
+# 1. provision (or select) a CODEX_HOME profile with a usable auth.json
+loom-daemon accounts add codex alice --device-auth
+# (or: CODEX_HOME=~/.loom/codex-profiles/alice codex login)
+
+# 2. install the managed hook — idempotent, credential-free, pool-wide
 .loom/scripts/provision-codex-hooks.sh install --all-profiles --workspace "$PWD"
 
-# 2. accept Codex's hook-trust prompt once per profile
+# 3. accept Codex's Hooks review screen ONCE per profile — INTERACTIVE,
+#    no scripted equivalent exists on 0.146.0 (see the investigation above).
+#    On the "Hooks" screen that appears at startup, press `t` to trust all.
 CODEX_HOME=~/.loom/codex-profiles/alice codex
 
-# 3. gate the pool: exit 0 only when EVERY profile is ready
+# 4. gate the pool: exit 0 / "ready":true only when EVERY profile is ready
 .loom/scripts/provision-codex-hooks.sh verify --all-profiles --workspace "$PWD" --json
 ```
 
-Repeat step 1 after any `loom update` that changes the bridge — a changed
-managed entry reads as STALE and every mutable-role spawn fails closed until it
-is reinstalled and re-trusted.
+**This step is interactive, not scriptable, and it is per profile** — N pooled
+Codex accounts means N manual acceptances, not one. That is a real,
+documented operating cost of running Codex Builders at multi-account scale
+today, not a surprise discovered later. Repeat step 2 after any `loom update`
+that changes the bridge — a changed managed entry reads as STALE (and, since
+its content changed, likely also gets a NEW identity key at the next `t`-trust
+pass) and every mutable-role spawn fails closed until it is reinstalled and
+re-trusted.
 
 ### Role-aware spawn preflight
 
@@ -447,13 +502,17 @@ Known, documented, and accepted for tier-2. None is silent.
     inspect `mcp__*` tools, because Claude's own guards do not either (their
     matchers are `Bash` and `Edit|Write`). This is parity, not coverage: an MCP
     server that writes files is unguarded on **both** runtimes.
-11. **Hook trust is verified coarsely.** Codex 0.146.0 offers no documented
-    non-interactive way to establish hook trust, and no observable way to prove
-    that *Loom's* entry specifically is the trusted one. `verify` therefore
-    accepts "this profile has some trusted hook" plus Loom's own
-    receipt-pinned staleness check. Loom never passes
-    `--dangerously-bypass-hook-trust`. This is a named reason the capability
-    manifest stays `partial`.
+11. **Hook trust is verified precisely as to WHICH entry, not as to the hash
+    itself.** Issue #5005 tightened `verify` to require trust at the EXACT
+    `hooks.state` identity key Loom's own managed entry computes to (see
+    "Readiness path" above) — closing the old, coarser "some hook in this
+    profile is trusted" false-positive. What remains unverifiable: Codex
+    0.146.0 offers no non-interactive way to establish trust, and #5005
+    confirmed (by trying) that a forged `trusted_hash` at the correct key is
+    rejected by the live CLI — so Loom can name the right key but still cannot
+    independently recompute or double-check the hash value Codex accepts.
+    Loom never passes `--dangerously-bypass-hook-trust`. This residual is a
+    named reason the capability manifest stays `partial`.
 12. **`write_stdin` is denied, not confined.** Writing bytes into an
     already-running PTY session is a mutation channel Loom cannot inspect, so it
     is refused outright. A Codex worker that needs interactive input must run a
@@ -475,9 +534,13 @@ Known, documented, and accepted for tier-2. None is silent.
     sandbox is still underneath. Named reason the manifest stays `partial`.
 15. **No real-CLI canary evidence yet.** Every parity claim above is proven by
     fixture-driven tests against the pinned 0.146.0 schemas, not by a live
-    `codex exec` run — and it cannot be, headlessly, until gap 11 (non-interactive
-    hook trust) has an answer: an untrusted hook does not run, so a `codex exec`
-    canary would prove nothing about the bridge. See "Promotion gate" below.
+    `codex exec` run. Issue #5005 removed the reason this was previously
+    thought impossible headlessly (an untrusted hook does not run, so a
+    `codex exec` canary would have proven nothing) by documenting a
+    reproducible way to get a profile genuinely trusted (see "Readiness path"
+    above) — but the canary run itself, in a disposable repository with
+    before/after evidence, is still **not done**; it remains #4496's job. See
+    "Promotion gate" below.
 
 ## Admission checklist (contract point 5/6)
 
@@ -491,8 +554,12 @@ Known, documented, and accepted for tier-2. None is silent.
 - [x] Loom guard intent mechanically enforced under Codex for `pre_tool_use`
       (issue #4495) — bridge + provisioning + fail-closed spawn preflight, with
       CI suites `test-guard-codex-bridge.sh` and `test-provision-codex-hooks.sh`
-- [ ] Real-CLI canary evidence recorded — **open** (gap 15); required before
-      capability promotion, and itself blocked on gap 11
+- [x] A documented, reproducible hook-trust readiness path exists, and
+      `verify` gates on it precisely (issue #5005) — this is a prerequisite
+      for the canary below, not the canary itself
+- [ ] Real-CLI canary evidence recorded — **open** (gap 15); no longer
+      blocked on an undocumented trust path (#5005 closed that), but the
+      canary run itself still has not been performed (#4496)
 
 ## Promotion gate (`hooks` / `worktreeIsolation`)
 
@@ -510,11 +577,18 @@ block carries the machine-readable list; in prose the outstanding items are:
 1. **Real-CLI canary** in a disposable repository: one ALLOWED mutation inside a
    managed worktree, plus DENIALS for a main-checkout file mutation and a
    protected-branch destructive shell command, with before/after filesystem and
-   `git` evidence proving no denied side effect occurred.
+   `git` evidence proving no denied side effect occurred. **No longer blocked
+   on item 3** (see below) — still not performed.
 2. **Matcher semantics** confirmed on the live CLI (gap 13).
-3. **Hook trust** either given a documented non-interactive path or an accepted
-   operator-attested one-time step (gap 11). Item 1 is blocked on this: an
-   untrusted hook does not run, so a canary would prove nothing.
+3. ~~**Hook trust** either given a documented non-interactive path or an
+   accepted operator-attested one-time step (gap 11).~~ **DONE (issue
+   #5005, 2026-08-03)**: no non-interactive path exists on 0.146.0 (confirmed
+   by driving the live CLI, not just reading `--help`), so the accepted path
+   is the operator-attested one-time-per-profile interactive step, documented
+   reproducibly above with `verify` gating on Loom's own entry's precise
+   trust-identity key. This item is the reason item 1 was previously thought
+   impossible headlessly — it no longer is, but item 1's canary evidence
+   still has not been recorded.
 
 **#4478 (operator sandbox posture) — DECIDED 2026-07-31.** Path 1-then-2: the
 interim posture is a **read-only default** with **Builder-role-only** escalation

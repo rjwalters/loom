@@ -875,6 +875,21 @@ mk_hook_profile() {
     printf '%s' "$dir"
 }
 
+# Simulate the operator having accepted Codex's hook-trust prompt for Loom's
+# SPECIFIC managed entry (issue #5005 tightened `verify` to require exactly
+# this — the precise hooks.state identity key Codex 0.146.0 was empirically
+# confirmed to persist trust under: "<realpath of hooks.json>:pre_tool_use:
+# <PreToolUse array index>:<hook index>" — rather than the old, coarser "any
+# trusted_hash exists" signal). Every profile in this suite installs Loom's
+# entry alone, so it always lands at array position 0:0.
+trust_hook_profile() {
+    local dir="$1"
+    local hooks_real
+    hooks_real="$(cd "$dir" 2>/dev/null && pwd -P)/hooks.json"
+    printf '[hooks.state."%s:pre_tool_use:0:0"]\ntrusted_hash = "sha256:deadbeefcafefacefeedfacebeeff00dfeedfacebeeff00dfeedfacebeeff0"\n' \
+        "$hooks_real" > "$dir/config.toml"
+}
+
 # run_preflight <expect-exit> <description> [VAR=val ...]
 #
 # Publishes the combined stdout+stderr in the global PREFLIGHT_OUT rather than
@@ -902,7 +917,7 @@ READY_PROFILE="$(mk_hook_profile ready)"
 # copy also exists (see #4787), spuriously reporting hooks=not-ready.
 bash "$PROVISION_SCRIPT" install --codex-home "$READY_PROFILE" \
     --workspace "$(pwd)" >/dev/null 2>&1
-printf 'hooks.state."loom".trusted_hash = "deadbeef"\n' > "$READY_PROFILE/config.toml"
+trust_hook_profile "$READY_PROFILE"
 
 BARE_PROFILE="$(mk_hook_profile bare)"
 
@@ -933,7 +948,7 @@ run_preflight 78 "builder + installed-but-untrusted profile -> exit 78" \
 STALE_PROFILE="$(mk_hook_profile stale)"
 bash "$PROVISION_SCRIPT" install --codex-home "$STALE_PROFILE" \
     --workspace "$(pwd)" --bridge "$BRIDGE_SCRIPT" >/dev/null 2>&1
-printf 'hooks.state."loom".trusted_hash = "deadbeef"\n' > "$STALE_PROFILE/config.toml"
+trust_hook_profile "$STALE_PROFILE"
 jq '(.hooks.PreToolUse[].hooks[] | select(.command | contains("guard-codex-bridge.sh")) | .command) |= (. + " --tampered")' \
     "$STALE_PROFILE/hooks.json" > "$STALE_PROFILE/hooks.tmp" \
     && mv "$STALE_PROFILE/hooks.tmp" "$STALE_PROFILE/hooks.json"

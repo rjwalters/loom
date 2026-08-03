@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # test-provision-codex-hooks.sh — managed Codex hook installation / trust /
-# removal tests (issue #4495, epic #4489 Phase 6).
+# removal tests (issue #4495, epic #4489 Phase 6; trust-precision + readiness
+# path follow-up issue #5005).
 #
 # Hermetic: operates ONLY on temporary CODEX_HOME profiles. No Codex CLI, no
 # network, no credentials. A recognizable fake credential is seeded into every
@@ -19,6 +20,11 @@
 #   7. per-profile isolation: trusting profile A does not make profile B ready
 #   8. remove deletes ONLY Loom's entry and leaves credentials + user config
 #   9. credential hygiene: auth.json is never read, copied, or echoed
+#  10. #5005: `trusted` is precise — a profile with hook trust for an
+#      UNRELATED hook (the old coarse `trustedAny` signal) is NOT ready;
+#      only a hooks.state entry at Loom's own computed identity key counts
+#  11. #5005: no path in defaults/scripts or defaults/hooks ever passes
+#      --dangerously-bypass-hook-trust or sets bypass_hook_trust
 #
 # Usage: ./defaults/scripts/tests/test-provision-codex-hooks.sh
 
@@ -58,8 +64,29 @@ new_profile() {
 }
 
 trust_profile() {
-    # Simulate the operator having accepted Codex's hook-trust prompt once.
-    printf 'hooks.state."loom-managed".trusted_hash = "deadbeefcafe"\n' > "$1/config.toml"
+    # Simulate the operator having accepted Codex's hook-trust prompt for
+    # Loom's SPECIFIC managed entry. Issue #5005 empirically confirmed (against
+    # the live 0.146.0 binary) that Codex persists trust keyed by
+    # hooks.state."<realpath-of-hooks.json>:pre_tool_use:<group-index>:<hook-
+    # index>" — this fixture writes exactly that format so the tightened
+    # `verify` (which checks for THIS specific key, not just any trusted_hash
+    # in the file) reports ready=true, the same as a real trusted profile.
+    # gi/hi default to 0/0 (Loom's entry is the only/first PreToolUse group in
+    # every profile this helper is used on below).
+    local dir="$1" gi="${2:-0}" hi="${3:-0}"
+    local hooks_real
+    hooks_real="$(cd "$dir" 2>/dev/null && pwd -P)/hooks.json"
+    printf '[hooks.state."%s:pre_tool_use:%s:%s"]\ntrusted_hash = "sha256:deadbeefcafefacefeedfacebeeff00dfeedfacebeeff00dfeedfacebeeff0"\n' \
+        "$hooks_real" "$gi" "$hi" > "$dir/config.toml"
+}
+
+trust_unrelated_hook() {
+    # Simulate an operator who has trusted a hook of THEIR OWN (any hook, any
+    # profile), unrelated to Loom's managed entry — the old coarse signal
+    # `trustedAny` still reports true for this, but the precise `trusted`
+    # signal introduced by #5005 must not.
+    printf '[hooks.state."/some/other/profile/hooks.json:pre_tool_use:0:0"]\ntrusted_hash = "sha256:0000000000000000000000000000000000000000000000000000000000000"\n' \
+        > "$1/config.toml"
 }
 
 run_provision() {
@@ -223,6 +250,38 @@ trust_profile "$P5"
 [[ "$(verify_code "$P5")" == "78" ]] && pass "not installed -> exit 78 even when the profile is trusted" || fail "not installed -> exit 78 even when the profile is trusted"
 
 echo
+echo "=== verify: precise trust (#5005) distinguishes Loom's entry from any trusted hook ==="
+# (h) installed, but only an UNRELATED hook is trusted (the old coarse
+# `trustedAny` signal) -> still NOT ready. This is the core #5005 regression
+# test: before the fix, `verify` treated "any hooks.state trusted_hash exists"
+# as sufficient, which this scenario would have falsely reported ready.
+P8="$(new_profile ivan)"
+run_provision install --codex-home "$P8" --workspace "$WORKSPACE" --bridge "$BRIDGE" >/dev/null
+trust_unrelated_hook "$P8"
+v="$(verify_json "$P8")"
+[[ "$(verify_code "$P8")" == "78" ]] \
+    && pass "installed + only an unrelated hook trusted -> exit 78 (not ready)" \
+    || fail "installed + only an unrelated hook trusted -> exit 78 (not ready) (got $(verify_code "$P8"))"
+jq -e '.trustedAny == true and .trusted == false and .ready == false' <<<"$v" >/dev/null 2>&1 \
+    && pass "verify JSON distinguishes trustedAny=true from trusted=false" \
+    || fail "verify JSON distinguishes trustedAny=true from trusted=false (got $v)"
+jq -e '.reason | contains("NOT specifically for Loom")' <<<"$v" >/dev/null 2>&1 \
+    && pass "verify explains the distinction in its reason string" \
+    || fail "verify explains the distinction in its reason string (got $v)"
+jq -e '.identityKey != null and (.identityKey | contains("pre_tool_use"))' <<<"$v" >/dev/null 2>&1 \
+    && pass "verify JSON reports the computed identityKey" \
+    || fail "verify JSON reports the computed identityKey (got $v)"
+
+# (i) trusting SPECIFICALLY Loom's computed identity key -> ready
+trust_profile "$P8"
+v="$(verify_json "$P8")"
+[[ "$(verify_code "$P8")" == "0" ]] && pass "trust at Loom's precise identity key -> exit 0 (ready)" \
+    || fail "trust at Loom's precise identity key -> exit 0 (ready)"
+jq -e '.trusted == true and .trustedAny == true and .ready == true' <<<"$v" >/dev/null 2>&1 \
+    && pass "verify JSON reports trusted=true trustedAny=true ready=true" \
+    || fail "verify JSON reports trusted=true trustedAny=true ready=true (got $v)"
+
+echo
 echo "=== per-profile isolation ==="
 # P1 is trusted and ready; a brand-new profile must NOT inherit that verdict.
 P6="$(new_profile frank)"
@@ -331,6 +390,37 @@ if grep -nE 'bypass_hook_trust' "$REPO_ROOT/defaults/scripts/spawn-codex.sh" "$P
 else
     pass "no Loom script sets the bypass_hook_trust config key"
 fi
+
+echo
+echo "=== repo-wide: no path passes --dangerously-bypass-hook-trust (#5005) ==="
+# Broader than the two spot-checks above: scan every top-level script under
+# defaults/scripts/ (not just spawn-codex.sh/provision-codex-hooks.sh) and
+# every hook under defaults/hooks/, so a NEW script introduced later cannot
+# quietly reach for the bypass flag or its config-key equivalent without
+# tripping this suite. Excludes tests/ (which legitimately references the
+# string to assert its absence) via -maxdepth 1.
+_bypass_offenders=""
+_bypass_key_offenders=""
+while IFS= read -r -d '' f; do
+    if grep -nE '(^|[^-A-Za-z])--dangerously-bypass-hook-trust' "$f" 2>/dev/null \
+        | grep -vqE '#|log_(error|warn|info)'; then
+        _bypass_offenders="$_bypass_offenders $(basename "$f")"
+    fi
+    if grep -nE 'bypass_hook_trust' "$f" 2>/dev/null \
+        | grep -vqE '#|log_(error|warn|info)'; then
+        _bypass_key_offenders="$_bypass_key_offenders $(basename "$f")"
+    fi
+done < <(
+    find "$REPO_ROOT/defaults/scripts" -maxdepth 1 -name '*.sh' -print0 2>/dev/null
+    find "$REPO_ROOT/defaults/scripts/lib" -maxdepth 1 -name '*.sh' -print0 2>/dev/null
+    find "$REPO_ROOT/defaults/hooks" -maxdepth 1 -name '*.sh' -print0 2>/dev/null
+)
+[[ -z "$_bypass_offenders" ]] \
+    && pass "no script under defaults/scripts{,/lib}/ or defaults/hooks/ passes --dangerously-bypass-hook-trust" \
+    || fail "these scripts pass --dangerously-bypass-hook-trust:$_bypass_offenders"
+[[ -z "$_bypass_key_offenders" ]] \
+    && pass "no script under defaults/scripts{,/lib}/ or defaults/hooks/ sets bypass_hook_trust" \
+    || fail "these scripts set bypass_hook_trust:$_bypass_key_offenders"
 
 echo
 echo "=== $PASS/$TOTAL passed ==="

@@ -607,7 +607,8 @@ else
     fi
 fi
 
-# --- Managed hook readiness / trust preflight (issue #4495) ---
+# --- Managed hook readiness / trust preflight (issue #4495, precision +
+# readiness path documented by #5005) ---
 #
 # Loom's guard intent is enforced for Codex through a managed `pre_tool_use`
 # hook installed into the SELECTED profile's CODEX_HOME (see
@@ -619,16 +620,30 @@ fi
 #
 #   MUTABLE roles (builder, doctor) MUST prove the managed hook is installed at
 #   the expected version, pinned, readable, points at THIS workspace's bridge,
-#   and that the profile has established Codex hook trust. Any failure exits 78
-#   BEFORE the CLI starts. `--dangerously-bypass-hook-trust` is never passed —
-#   #4495's scope guards forbid it, and waiving trust would defeat the very
-#   boundary this preflight exists to prove.
+#   and that Codex has established hook trust SPECIFICALLY for Loom's managed
+#   entry (not merely "some hook is trusted" — provision-codex-hooks.sh
+#   `verify` computes Loom's entry's own Codex-internal trust-identity key and
+#   checks for that exact key, per #5005). Any failure exits 78 BEFORE the CLI
+#   starts. `--dangerously-bypass-hook-trust` is never passed — #4495's scope
+#   guards forbid it, and waiving trust would defeat the very boundary this
+#   preflight exists to prove.
+#
+#   Getting a profile to that state is a ONE-TIME, PER-PROFILE, INTERACTIVE
+#   step: `provision-codex-hooks.sh install`, then a single
+#   `CODEX_HOME=<profile> codex` run to accept Codex's "Hooks" review screen
+#   (`t` = trust all). #5005 confirmed there is no non-interactive alternative
+#   on 0.146.0 (no `hooks` subcommand, no `codex doctor` check, and
+#   pre-seeding a forged trust record is rejected by the live CLI). Full
+#   procedure + evidence: defaults/docs/guardrail-parity-codex.md §
+#   "Provisioning and trust".
 #
 #   READ-ONLY roles keep the existing conservative sandbox fallback, but the
 #   audit line states explicitly that hook parity was unavailable. They are
 #   never reported as Builder-capable; capability truth lives in
 #   defaults/runtimes/codex.json, which stays `partial` until the evidence gate
-#   in #4495 is satisfied.
+#   in #4495/#4496 is satisfied (a documented trust READINESS PATH, which
+#   #5005 delivers, is a prerequisite for that gate — not the same as clearing
+#   it).
 #
 # The audit line names the profile DIRECTORY NAME and the readiness verdict
 # only — never a profile path's contents and never a byte of auth.json.
