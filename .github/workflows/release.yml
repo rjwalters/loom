@@ -1,23 +1,41 @@
 name: Build and Release
 #
-# Release artifacts (Epic #4990 Phase 1, #5003): on GitHub Release creation
-# this workflow cross-builds `loom-daemon` for every platform in the fleet's
-# target triples and uploads, for EACH one, both the binary and a `.sha256`
-# checksum file as Release assets:
+# Release artifacts (Epic #4990): on GitHub Release creation this workflow
+# cross-builds `loom-daemon` for every platform in the fleet's target triples
+# and uploads, for EACH one, the binary plus a `.sha256` checksum file as
+# Release assets:
 #
 #   - loom-daemon-aarch64-apple-darwin(.sha256)
 #   - loom-daemon-x86_64-unknown-linux-gnu(.sha256)
 #   - loom-daemon-aarch64-unknown-linux-gnu(.sha256)
 #
-# This is Phase 1 of #4990 (foundation only): NO code signing, notarization,
-# or org-specific identity of any kind is applied here — every artifact is
-# unsigned, verified only by its checksum. Platform signing is a later,
-# secrets-gated phase (#4990 Phase 2); nothing here should ever need to name a
-# cert, team ID, or signing identity — if it does, that's a scope regression.
+# Phase 1 (#5003) shipped the unsigned build + checksum foundation. Phase 2
+# (#5011, this change) layers OPTIONAL platform signing on top, following the
+# `dashboard-deploy.yml` public-mechanism/private-identity precedent:
+#
+#   - macOS Developer ID codesign of the aarch64-apple-darwin artifact, plus
+#     optional notarization, when the Developer ID / notary secrets are set.
+#   - Optional cosign detached-signature (`.sig`) over the Linux artifacts when
+#     a cosign key secret is set.
+#
+# EVERY signing step is gated on Actions secrets being present and skips
+# cleanly (with a LOUD entry in the run summary, never silent) when they are
+# absent — a no-secrets release still succeeds with unsigned artifacts +
+# checksums, byte-for-byte as Phase 1 left it. No org name, team ID, cert
+# reference, or other deployer identity lives in this file or any tracked file:
+# all identity comes from secrets only. If you ever need to hardcode one here,
+# that's a scope regression — put it in a secret instead.
+#
+# Output format (for Phase 3's verifier): the checksum is always present and is
+# computed over the FINAL artifact (after any in-place codesign), so it matches
+# whatever bytes are uploaded. macOS signatures are embedded in the Mach-O
+# (verify with `codesign --verify`); Linux signatures are detached `.sig` files
+# (verify with `cosign verify-blob --key <pubkey> --signature <sig>`).
+#
 # Consuming these artifacts from `loom-daemon-update.sh` / the daemon
-# auto-updater is also out of scope here (#4990 Phase 3) — the LOCAL
-# `cargo build` path in `loom-daemon-update.sh` remains the default/fallback
-# for dev machines, canaries, and forks with no Release access.
+# auto-updater is out of scope here (#4990 Phase 3) — the LOCAL `cargo build`
+# path in `loom-daemon-update.sh` remains the default/fallback for dev
+# machines, canaries, and forks with no Release access.
 #
 # Each target builds in its own matrix job with `fail-fast: false`: one
 # platform's build failure fails that job (and therefore the overall workflow
@@ -92,12 +110,167 @@ jobs:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
         run: cargo build --package loom-daemon --release --target ${{ matrix.target }}
 
-      - name: Package artifact + checksum
+      - name: Package artifact
         run: |
           set -euo pipefail
           mkdir -p dist
+          cp "target/${{ matrix.target }}/release/loom-daemon" "dist/loom-daemon-${{ matrix.target }}"
+
+      # Detect which signing secrets are present and record the decision as step
+      # outputs. GitHub Actions cannot reference `secrets.*` directly in an
+      # `if:` condition, so the canonical idiom is: map secrets into env here,
+      # test them, and gate later steps on THESE outputs. This step also emits
+      # the LOUD skip lines the epic's design principle 2 requires — every
+      # absent-secret path writes an explicit "SKIPPED (why)" row to the run
+      # summary, so the skip is asserted, not implied by checksum-only output.
+      - name: Detect signing secrets (loud skip if absent)
+        id: signing
+        env:
+          MACOS_SIGNING_CERT_P12: ${{ secrets.MACOS_SIGNING_CERT_P12 }}
+          MACOS_SIGNING_CERT_PASSWORD: ${{ secrets.MACOS_SIGNING_CERT_PASSWORD }}
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+          MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          target="${{ matrix.target }}"
+          macos_sign=false
+          notarize=false
+          linux_sign=false
+
+          summary() { echo "$1" >> "$GITHUB_STEP_SUMMARY"; }
+          summary "### Signing (${target})"
+
+          case "$target" in
+            *-apple-darwin)
+              if [ -n "${MACOS_SIGNING_CERT_P12:-}" ] \
+                  && [ -n "${MACOS_SIGNING_CERT_PASSWORD:-}" ] \
+                  && [ -n "${MACOS_SIGNING_IDENTITY:-}" ]; then
+                macos_sign=true
+                summary "- Signed: Developer ID secrets present — codesigning \`${target}\` in place."
+                if [ -n "${MACOS_NOTARY_KEY:-}" ] \
+                    && [ -n "${MACOS_NOTARY_KEY_ID:-}" ] \
+                    && [ -n "${MACOS_NOTARY_ISSUER_ID:-}" ]; then
+                  notarize=true
+                  summary "- Notarized: notary API key secrets present — notarizing after signing."
+                else
+                  summary "- SKIPPED notarization: notary API key secrets absent (belt-and-suspenders only for the curl/gh download path, which sets no quarantine attribute — not required)."
+                  echo "::notice::macOS notarization skipped for ${target} (notary secrets absent)."
+                fi
+              else
+                summary "- SKIPPED signing: Developer ID cert/identity secrets absent — shipping UNSIGNED \`${target}\` + checksum (Phase 1 behavior)."
+                echo "::notice::macOS signing skipped for ${target} (Developer ID secrets absent); shipping unsigned artifact + checksum."
+              fi
+              ;;
+            *-linux-*)
+              if [ -n "${COSIGN_PRIVATE_KEY:-}" ]; then
+                linux_sign=true
+                summary "- Signed: cosign key secret present — writing detached \`${target}.sig\`."
+              else
+                summary "- SKIPPED signing: cosign key secret absent — shipping UNSIGNED \`${target}\` + checksum (Phase 1 behavior)."
+                echo "::notice::Linux signing skipped for ${target} (cosign key absent); shipping unsigned artifact + checksum."
+              fi
+              ;;
+          esac
+
+          {
+            echo "macos_sign=${macos_sign}"
+            echo "notarize=${notarize}"
+            echo "linux_sign=${linux_sign}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Sign macOS artifact (Developer ID)
+        if: steps.signing.outputs.macos_sign == 'true'
+        env:
+          MACOS_SIGNING_CERT_P12: ${{ secrets.MACOS_SIGNING_CERT_P12 }}
+          MACOS_SIGNING_CERT_PASSWORD: ${{ secrets.MACOS_SIGNING_CERT_PASSWORD }}
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
           artifact="dist/loom-daemon-${{ matrix.target }}"
-          cp "target/${{ matrix.target }}/release/loom-daemon" "$artifact"
+          # Import the Developer ID cert into a throwaway keychain scoped to this
+          # job's RUNNER_TEMP so no identity persists on the runner. The p12 and
+          # its password are secrets; the identity string (which embeds the org
+          # name + team ID) is likewise a secret — never spelled out here.
+          keychain="$RUNNER_TEMP/loom-signing.keychain-db"
+          p12="$RUNNER_TEMP/loom-cert.p12"
+          printf '%s' "$MACOS_SIGNING_CERT_P12" | base64 --decode > "$p12"
+          security create-keychain -p "$MACOS_SIGNING_CERT_PASSWORD" "$keychain"
+          security set-keychain-settings -lut 900 "$keychain"
+          security unlock-keychain -p "$MACOS_SIGNING_CERT_PASSWORD" "$keychain"
+          security import "$p12" -k "$keychain" -P "$MACOS_SIGNING_CERT_PASSWORD" -T /usr/bin/codesign
+          # Allow codesign to use the imported key non-interactively.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$MACOS_SIGNING_CERT_PASSWORD" "$keychain" >/dev/null
+          # Put our keychain on the user search list so codesign resolves the identity.
+          security default-keychain -s "$keychain"
+          security list-keychains -d user -s "$keychain"
+          # `--options runtime` (hardened runtime) is a notarization prerequisite;
+          # `--timestamp` binds a secure timestamp so the signature outlives the
+          # cert's validity window.
+          codesign --force --options runtime --timestamp \
+            --sign "$MACOS_SIGNING_IDENTITY" "$artifact"
+          codesign --verify --strict --verbose=2 "$artifact"
+          rm -f "$p12"
+
+      - name: Notarize macOS artifact
+        if: steps.signing.outputs.notarize == 'true'
+        env:
+          MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          artifact="dist/loom-daemon-${{ matrix.target }}"
+          # notarytool only accepts container formats (zip/dmg/pkg), so submit a
+          # zip of the bare binary. A bare Mach-O cannot be stapled (stapling
+          # supports only bundles/dmg/pkg), so notarization is registered
+          # server-side with no on-disk ticket. For this repo's curl/gh download
+          # path — which sets no quarantine attribute — that server-side record
+          # is all Gatekeeper would ever consult, so no staple is needed and the
+          # uploaded asset stays the bare signed binary.
+          key="$RUNNER_TEMP/notary-key.p8"
+          zip="$RUNNER_TEMP/loom-daemon-${{ matrix.target }}.zip"
+          printf '%s' "$MACOS_NOTARY_KEY" | base64 --decode > "$key"
+          ditto -c -k "$artifact" "$zip"
+          xcrun notarytool submit "$zip" \
+            --key "$key" \
+            --key-id "$MACOS_NOTARY_KEY_ID" \
+            --issuer "$MACOS_NOTARY_ISSUER_ID" \
+            --wait
+          rm -f "$key" "$zip"
+
+      - name: Install cosign
+        if: steps.signing.outputs.linux_sign == 'true'
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign Linux artifact (cosign)
+        if: steps.signing.outputs.linux_sign == 'true'
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          artifact="dist/loom-daemon-${{ matrix.target }}"
+          # Detached signature so Phase 3 can verify with the matching public key:
+          #   cosign verify-blob --key <pubkey> --signature <target>.sig <binary>
+          # COSIGN_PASSWORD is read from the env by cosign to decrypt the key.
+          key="$RUNNER_TEMP/cosign.key"
+          printf '%s' "$COSIGN_PRIVATE_KEY" > "$key"
+          cosign sign-blob --yes --key "$key" \
+            --output-signature "dist/loom-daemon-${{ matrix.target }}.sig" \
+            "$artifact"
+          rm -f "$key"
+
+      # Checksum is computed AFTER signing so it covers the FINAL bytes (macOS
+      # codesign rewrites the Mach-O in place). Phase 3 verifies this checksum
+      # unconditionally, so it must match whatever is uploaded. In the
+      # no-secrets case nothing above modified the binary, so this is
+      # byte-identical to Phase 1's checksum.
+      - name: Compute checksum
+        run: |
+          set -euo pipefail
           cd dist
           if command -v shasum >/dev/null 2>&1; then
             shasum -a 256 "loom-daemon-${{ matrix.target }}" > "loom-daemon-${{ matrix.target }}.sha256"
@@ -110,9 +283,13 @@ jobs:
         if: github.event_name == 'release'
         uses: softprops/action-gh-release@v3
         with:
+          # The `*.sig` glob matches the detached Linux signature when cosign
+          # signing ran and matches nothing otherwise (skipped, not an error) —
+          # so the same block covers signed and unsigned releases.
           files: |
             dist/loom-daemon-${{ matrix.target }}
             dist/loom-daemon-${{ matrix.target }}.sha256
+            dist/loom-daemon-${{ matrix.target }}*.sig
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -124,4 +301,5 @@ jobs:
           path: |
             dist/loom-daemon-${{ matrix.target }}
             dist/loom-daemon-${{ matrix.target }}.sha256
+            dist/loom-daemon-${{ matrix.target }}*.sig
           retention-days: 7
