@@ -33,7 +33,7 @@ Ctrl+C cleanly stops the daemon.
 
 ### 1. Make Code Changes
 
-Edit Rust code in `loom-daemon/`, `loom-api/`, or TypeScript in `mcp-loom/`. Edit Python tools in `loom-tools/`. Edit shell scripts in `defaults/scripts/` or `scripts/`.
+Edit Rust code in `loom-daemon/`, `loom-api/`, or TypeScript in `mcp-loom/`. Edit shell scripts in `defaults/scripts/` or `scripts/`.
 
 ### 2. Rebuild and Test
 
@@ -46,11 +46,6 @@ cargo test --workspace          # run all Rust tests
 For mcp-loom changes:
 ```bash
 cd mcp-loom && npm run build
-```
-
-For Python tool changes:
-```bash
-cd loom-tools && uv run pytest tests/ -x -q
 ```
 
 ### 3. Test the Daemon Locally
