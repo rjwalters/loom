@@ -701,6 +701,10 @@ This issue cannot proceed until dependencies are complete.
    to mark `loom:curated`
 3. **Any unchecked** → Add/keep `loom:blocked` label, do NOT mark `loom:curated`
 
+**Before commenting *any* re-check outcome** (blocked or clear) on an issue that
+is already `loom:blocked`, apply "Re-check Idempotency" below — an unchanged
+conclusion is skipped silently rather than re-posted.
+
 **If NO Dependencies section:**
 - Issue has no blockers → Safe to mark `loom:curated`
 
@@ -761,6 +765,113 @@ just that the body's stated dependency closed. When in doubt, leave
 1. Claim the issue if not already claimed: `gh issue edit <number> --add-label "loom:curating"`
 2. Remove `loom:blocked` label and add `loom:curated`: `gh issue edit <number> --remove-label "loom:blocked" --remove-label "loom:curating" --remove-label "loom:triage" --add-label "loom:curated"`
 3. Issue awaits `loom:issue` promotion (human, Champion, or a `/loom:sweep` orchestrator) before Workers can claim
+
+### Re-check Idempotency: never re-post an unchanged conclusion (#4986)
+
+**Problem this section fixes**: the re-check above runs on *every* Curator pass
+over a `loom:blocked` issue, and multiple invocations (manual, autonomous, sweep-triggered)
+land on the same stale issue. Without a dedup rule the steady state is "one
+comment per pick-up, forever" — #4736 collected six near-identical "still
+blocked on PR #4743, no change" comments between 2026-07-31 and 2026-08-01,
+several less than an hour apart, each restating the same blocker with zero new
+information.
+
+**Rule**: a Dependencies re-check comment is only worth posting when its
+*conclusion* differs from the conclusion you last reported on that issue.
+Re-verifying is cheap and always required; **commenting** is not.
+
+**Conclusion fingerprint** — what the re-check concluded, not how it was worded:
+
+- the verdict (`blocked` vs `clear`), and
+- the identity + status of every current blocker: each linked PR/issue number
+  with its state and its block-bearing labels, plus the block reason when the
+  block came from the secondary heuristic rather than a linked PR.
+
+Two passes have the *same* conclusion only when both parts match exactly. A
+different blocking number, a blocker that closed or merged, a label that
+appeared or cleared, or a flip between `blocked` and `clear` is a **changed**
+conclusion.
+
+Embed the fingerprint as a marker in every re-check comment you post, so the
+next pass can compare mechanically instead of re-reading prose:
+
+```bash
+ISSUE_NUMBER=<number>
+ISSUE_JSON=$(gh issue view "$ISSUE_NUMBER" --json comments,closedByPullRequestsReferences)
+
+_sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum
+  elif command -v shasum >/dev/null 2>&1; then shasum -a 256
+  else cksum; fi
+}
+
+# One "<pr#>:<state>:<sorted block labels>" line per current blocker, sorted so
+# ordering churn from the API never looks like a changed conclusion. Prefix with
+# the verdict so blocked→clear can never collide with clear→blocked.
+BLOCKERS=$(for PR in $(echo "$ISSUE_JSON" | jq -r '.closedByPullRequestsReferences[].number'); do
+  gh pr view "$PR" --json number,state,labels --jq \
+    '"\(.number):\(.state):\([.labels[].name | select(startswith("loom:"))] | sort | join(","))"'
+done | sort)
+VERDICT=blocked   # or "clear" once the superseding-block check passes
+# When there is no linked PR and the block came from the secondary heuristic,
+# BLOCKERS is empty — fold the cited justification in so a *changed* reason
+# ("doctor cycle exhausted" → "Sweep coordination: blocking") still reads as a
+# changed conclusion. Leave empty when the primary check supplied the blockers.
+BLOCK_REASON=""
+CONCLUSION_HASH=$(printf '%s\n%s\n%s' "$VERDICT" "$BLOCKERS" "$BLOCK_REASON" \
+  | _sha256 | awk '{print substr($1, 1, 16)}')
+RECHECK_MARKER="<!-- curator:dep-recheck:$CONCLUSION_HASH -->"
+
+# Most recent prior Curator re-check comment, of ANY conclusion.
+PRIOR=$(echo "$ISSUE_JSON" | jq -c '[.comments[] | select(.body | test("<!-- curator:dep-recheck:"))] | last // {}')
+PRIOR_HASH=$(echo "$PRIOR" | jq -r '.body // ""' \
+  | sed -n 's|.*<!-- curator:dep-recheck:\([0-9a-f]\{1,\}\) -->.*|\1|p' | tail -n 1)
+PRIOR_AT=$(echo "$PRIOR" | jq -r '.createdAt // empty')
+
+# Age in hours (portable: BSD `date -j -f` on macOS, GNU `date -d` elsewhere).
+_epoch() { date -j -f '%Y-%m-%dT%H:%M:%SZ' "$1" +%s 2>/dev/null || date -d "$1" +%s; }
+if [ -n "$PRIOR_AT" ]; then
+  PRIOR_AGE_H=$(( ( $(date +%s) - $(_epoch "$PRIOR_AT") ) / 3600 ))
+else
+  PRIOR_AGE_H=""   # no prior re-check comment at all
+fi
+```
+
+**Three-way decision** (run it *before* posting, and before any `loom:curating`
+claim you would only take in order to comment):
+
+| Prior re-check comment | Action |
+|---|---|
+| **None** (first-ever check on this issue) | **Comment.** Always report the first conclusion — never skip a first pass. |
+| Present, **different** `CONCLUSION_HASH` | **Comment.** A changed conclusion always gets a comment — no exception, no window, no budget. |
+| Present, **same** hash, newer than the staleness window | **Skip silently.** No comment, no label change, no claim. Leave the issue exactly as found. |
+| Present, **same** hash, older than the staleness window | **Comment once** (heartbeat). Posting refreshes the marker's timestamp, so the next window starts over. |
+
+Pre-existing "still blocked" comments written before this section landed carry
+no marker, so `PRIOR_HASH` is empty and the first pass after them counts as
+"none" — it posts one marked comment and every unchanged pass after that skips.
+That one-time re-post is expected; do not try to parse legacy prose to avoid it.
+
+**Staleness window**: 24h (`LOOM_DEP_RECHECK_HEARTBEAT_HOURS`, default `24`). It
+exists so a genuinely long-stalled issue still shows periodic proof-of-life
+rather than going silent forever; it is *not* a licence to re-confirm hourly.
+
+A silent skip is a complete outcome, not a deferral: do **not** also strip or
+add labels, and do **not** hand the issue to another role "because nothing was
+said". The issue stays `loom:blocked` with its existing justification intact.
+
+**Leaving room for a future escalation counter (#4967)**: if this re-check ever
+grows an "escalate to a human after N unchanged confirmations" step, that count
+must be tracked **independently of the comment-suppression decision** — never
+derived from "how many comments did we actually post", because the very passes
+that would advance it are the ones being silently skipped. Record the tally on
+the existing marker comment (PATCH `repos/{owner}/{repo}/issues/comments/<id>`,
+exactly as `champion-issue-promo.md`'s "Bounding the silent skip" does) so a
+silent skip still increments it. The marker above is deliberately shaped to
+allow that: it is a durable, addressable comment carrying the conclusion
+identity, not a bare "did we comment?" boolean. Do not add the escalation step
+speculatively — just do not build the suppression in a way that makes it
+unreachable.
 
 ## Issue Quality Checklist
 
@@ -985,6 +1096,56 @@ Why this pattern matters:
 - Test plan provides clear verification steps
 - Builder quality validation passes without warnings
 ```
+
+### Blocked Issue Re-check → Silent Skip vs. Real Comment
+
+See "Re-check Idempotency" under Checking Dependencies for the rule. Three
+passes over the same `loom:blocked` issue #4736, whose only blocker is the
+superseding PR #4743:
+
+```markdown
+Pass 1 — 2026-07-31 14:11. No prior `curator:dep-recheck` marker on the issue.
+  Blockers: 4743:OPEN:loom:changes-requested → CONCLUSION_HASH = a1b2c3d4e5f60718
+  → COMMENT (first-ever check always reports):
+  ---
+  **Curator dependency re-check**: still blocked. PR #4743 is OPEN with
+  `loom:changes-requested` and would close this issue, so the superseding block
+  is still active. Leaving `loom:blocked` in place.
+
+  <!-- curator:dep-recheck:a1b2c3d4e5f60718 -->
+  ---
+
+Pass 2 — 2026-07-31 15:04 (53 min later). PR #4743 unchanged.
+  CONCLUSION_HASH = a1b2c3d4e5f60718 — identical to the prior marker, and that
+  comment is 0.9h old, well inside the 24h window.
+  → SKIP SILENTLY. No comment, no label change, no `loom:curating` claim.
+  The four further passes through 2026-08-01 06:10 skip the same way — the six
+  duplicate comments that motivated #4986 collapse to the single Pass 1 comment.
+
+Pass 3 — 2026-08-01 09:30. PR #4743 merged.
+  Blockers: (none) → VERDICT=clear → CONCLUSION_HASH = 9f8e7d6c5b4a3210
+  Hash differs from the prior marker → COMMENT unconditionally (a changed
+  conclusion is never suppressed, window irrelevant), then run the normal
+  unblock steps.
+  ---
+  **Curator dependency re-check**: unblocked. PR #4743 merged, no other linked
+  PR carries `loom:changes-requested`/`loom:blocked`. Removing `loom:blocked`
+  and marking `loom:curated`.
+
+  <!-- curator:dep-recheck:9f8e7d6c5b4a3210 -->
+  ---
+```
+
+Variant — the staleness heartbeat: had PR #4743 still been OPEN and unchanged
+on 2026-08-01 15:00, Pass 3's hash would still match Pass 1's, but that marker
+would be 24.8h old — past the window. That pass posts **exactly one** heartbeat
+("still blocked on #4743, no change since <date>") carrying the same hash, and
+the 24h window restarts from it. The passes in between still skip.
+
+Why this pattern matters:
+- Re-verification still happens every pass; only the redundant *comment* is suppressed
+- Real state changes are never suppressed — a changed conclusion always comments
+- Long-stalled issues keep periodic visibility instead of going silent forever
 
 ## Advanced Curation
 
