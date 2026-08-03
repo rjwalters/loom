@@ -45,16 +45,24 @@ pub const PER_PAGE: usize = 100;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RestIssue {
     pub number: u32,
+    /// Issue/PR title. Added for the agent-facing cached-listing surface
+    /// (#5056), which projects it into `gh issue list --json title` parity.
+    pub title: Option<String>,
     /// Label names (flattened from the REST label objects).
     pub labels: Vec<String>,
     /// RFC-3339 creation timestamp. Lexicographic order == chronological.
     pub created_at: Option<String>,
     /// RFC-3339 last-update timestamp.
     pub updated_at: Option<String>,
+    /// RFC-3339 close timestamp (`null` while open). Projected into
+    /// `gh … --json closedAt` parity for the #5056 cached surface.
+    pub closed_at: Option<String>,
     /// `"open"` / `"closed"` (REST lowercase; compare case-insensitively —
     /// GraphQL-era consumers saw `"OPEN"`).
     pub state: String,
     pub body: Option<String>,
+    /// Author login (`user.login` from REST), for `gh … --json author` parity.
+    pub author: Option<String>,
     /// Present when the row is actually a pull request (REST issue listings
     /// include PRs). Call sites filter on this to keep pre-#4428 semantics.
     pub is_pull_request: bool,
@@ -226,8 +234,15 @@ pub fn parse_rest_issues(body: &str) -> Result<Vec<RestIssue>> {
         name: String,
     }
     #[derive(serde::Deserialize)]
+    struct RawUser {
+        #[serde(default)]
+        login: Option<String>,
+    }
+    #[derive(serde::Deserialize)]
     struct RawIssue {
         number: u32,
+        #[serde(default)]
+        title: Option<String>,
         #[serde(default)]
         labels: Vec<RawLabel>,
         #[serde(default)]
@@ -235,9 +250,13 @@ pub fn parse_rest_issues(body: &str) -> Result<Vec<RestIssue>> {
         #[serde(default)]
         updated_at: Option<String>,
         #[serde(default)]
+        closed_at: Option<String>,
+        #[serde(default)]
         state: String,
         #[serde(default)]
         body: Option<String>,
+        #[serde(default)]
+        user: Option<RawUser>,
         #[serde(default)]
         pull_request: Option<serde_json::Value>,
     }
@@ -246,11 +265,14 @@ pub fn parse_rest_issues(body: &str) -> Result<Vec<RestIssue>> {
         .into_iter()
         .map(|r| RestIssue {
             number: r.number,
+            title: r.title,
             labels: r.labels.into_iter().map(|l| l.name).collect(),
             created_at: r.created_at,
             updated_at: r.updated_at,
+            closed_at: r.closed_at,
             state: r.state,
             body: r.body,
+            author: r.user.and_then(|u| u.login),
             is_pull_request: r.pull_request.is_some(),
         })
         .collect())
@@ -273,6 +295,184 @@ struct CacheEntry {
 fn cache() -> &'static Mutex<HashMap<String, CacheEntry>> {
     static CACHE: OnceLock<Mutex<HashMap<String, CacheEntry>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+// ============================================================================
+// Disk-persistent cache (Issue #5056 — agent-facing cached listing surface)
+// ============================================================================
+//
+// The process-lifetime [`cache`] above serves the daemon's own long-running
+// polling loops: one process, so an in-memory `OnceLock` is the whole story.
+// Agent role prompts, by contrast, run each `gh issue list` as a **fresh,
+// short-lived process** — an in-process cache would be born empty and die
+// after one fetch, so it could never serve the "second and subsequent readers"
+// the way the daemon does. To give agents the same zero-cost-on-`304` win, the
+// ETag and the last-good body are persisted to a small per-host on-disk store,
+// keyed the same way. A second CLI invocation (even in a different process, for
+// a different label) reads the prior ETag, sends `If-None-Match`, and — when
+// nothing changed — gets a **free** `304` and serves the body from disk.
+//
+// This is deliberately the *same* ETag/REST/304 mechanism as the in-process
+// cache, not a second cache with different semantics: it reuses
+// [`build_issues_url`], [`parse_http_response`], and [`parse_rest_issues`]. The
+// only added axis is durability across process boundaries, which is exactly
+// what the agent hot path needs and the daemon loop does not.
+
+/// Result of a disk-cached listing: the parsed rows plus whether the single
+/// REST page was full (so the caller can decline rather than silently serve a
+/// truncated set — see [`PER_PAGE`]).
+#[derive(Debug, Clone)]
+pub struct CachedListing {
+    pub issues: Vec<RestIssue>,
+    /// `true` when the response filled a whole page and may be truncated.
+    pub truncated: bool,
+}
+
+/// On-disk store directory, shared across the short-lived agent CLI processes
+/// on one host. `LOOM_LISTING_CACHE_DIR` overrides (tests point it at a
+/// tempdir); otherwise `${TMPDIR:-/tmp}/loom-forge-listing-cache`, mirroring
+/// the existing `gh-cached` `/tmp/gh-cache` convention.
+fn disk_cache_dir() -> std::path::PathBuf {
+    if let Ok(d) = std::env::var("LOOM_LISTING_CACHE_DIR") {
+        if !d.is_empty() {
+            return std::path::PathBuf::from(d);
+        }
+    }
+    let base = std::env::var("TMPDIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "/tmp".to_string());
+    std::path::PathBuf::from(base).join("loom-forge-listing-cache")
+}
+
+/// Deterministic on-disk filename for a cache key (FNV-1a hash → hex, so no
+/// path-unsafe characters from the URL leak into the filename).
+fn disk_cache_path(cache_key: &str) -> std::path::PathBuf {
+    // FNV-1a 64-bit — dependency-free and more than adequate for a filename.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in cache_key.as_bytes() {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    disk_cache_dir().join(format!("listing-{hash:016x}.json"))
+}
+
+/// The on-disk entry shape: the validator ETag plus the raw JSON body it
+/// validated, so a `304` can reconstruct the exact prior parse.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct DiskEntry {
+    etag: String,
+    body: String,
+}
+
+fn read_disk_entry(path: &Path) -> Option<DiskEntry> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+/// Write the entry atomically (temp file + rename) so a concurrent reader on
+/// the same host never observes a half-written file.
+fn write_disk_entry(path: &Path, entry: &DiskEntry) {
+    let Some(dir) = path.parent() else { return };
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let Ok(serialized) = serde_json::to_string(entry) else {
+        return;
+    };
+    let tmp = dir.join(format!(
+        ".tmp-{}-{}",
+        std::process::id(),
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("entry")
+    ));
+    if std::fs::write(&tmp, serialized).is_ok() {
+        // Best-effort: a rename failure just means the next call re-fetches.
+        let _ = std::fs::rename(&tmp, path);
+    }
+}
+
+/// List issues carrying `label` (comma-joined AND when multiple) in `state`,
+/// via the **disk-persistent** ETag cache — the agent-facing analogue of
+/// [`list_issues_cached`].
+///
+/// Semantics match [`list_issues_cached`] (conditional `GET`, `304` served
+/// free, `200` re-cached) but the ETag/body survive process exit, so the
+/// second short-lived CLI process on a host pays zero rate-limit cost when the
+/// queue is unchanged. Returns [`CachedListing`] so the caller can decline on a
+/// possibly-truncated full page rather than serve a partial set.
+pub fn list_issues_cached_persistent(
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    repo_override: Option<&str>,
+    label: &str,
+    state: &str,
+) -> Result<CachedListing> {
+    let env_repo = std::env::var("LOOM_REPO").ok();
+    let repo = repo_override.or(env_repo.as_deref());
+    let url = build_issues_url(repo, label, state);
+    let cache_key = format!(
+        "{}|{url}",
+        cwd.map(Path::display)
+            .map_or_else(String::new, |d| d.to_string())
+    );
+    let entry_path = disk_cache_path(&cache_key);
+    let prior = read_disk_entry(&entry_path);
+
+    let mut cmd = Command::new(gh_bin);
+    cmd.arg("api").arg("--include").arg(&url);
+    if let Some(ref e) = prior {
+        cmd.arg("-H").arg(format!("If-None-Match: {}", e.etag));
+    }
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let out = cmd
+        .output()
+        .with_context(|| format!("failed to invoke {}", gh_bin.display()))?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let response = parse_http_response(&stdout);
+
+    match response {
+        Some(ref r) if r.status == 304 => match prior {
+            Some(e) => {
+                let issues = parse_rest_issues(&e.body)
+                    .with_context(|| format!("parse cached REST issues for {url}"))?;
+                let truncated = issues.len() >= PER_PAGE;
+                Ok(CachedListing { issues, truncated })
+            }
+            None => {
+                // A 304 can only occur because we sent an ETag; if the entry
+                // vanished under us, drop it and error so the next call
+                // re-fetches unconditionally.
+                let _ = std::fs::remove_file(&entry_path);
+                Err(anyhow!(
+                    "forge_listing: 304 for {url} but the on-disk entry vanished; will re-fetch"
+                ))
+            }
+        },
+        Some(ref r) if r.status == 200 && out.status.success() => {
+            let issues = parse_rest_issues(&r.body)
+                .with_context(|| format!("parse REST issues JSON from {url}"))?;
+            let truncated = issues.len() >= PER_PAGE;
+            if let Some(etag) = r.etag.clone() {
+                write_disk_entry(
+                    &entry_path,
+                    &DiskEntry {
+                        etag,
+                        body: r.body.clone(),
+                    },
+                );
+            }
+            Ok(CachedListing { issues, truncated })
+        }
+        _ => Err(anyhow!(
+            "gh api {url} failed{}: {}",
+            cwd.map(|d| format!(" in {}", d.display()))
+                .unwrap_or_default(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -477,6 +677,39 @@ esac
         let second =
             list_issues_cached(&gh, Some(dir.path()), Some(&repo), "loom:issue", "open").unwrap();
         assert_eq!(second, first);
+    }
+
+    /// The disk-persistent variant must behave like the in-process one across
+    /// *separate* short-lived processes: the first call (200) writes the ETag +
+    /// body to disk; a second call — which for the persistent path has no
+    /// in-memory state, exactly as a fresh agent CLI process would — presents
+    /// that ETag, gets a free 304, and reconstructs the identical listing from
+    /// the on-disk body.
+    #[test]
+    fn disk_cache_persists_etag_and_serves_304_across_processes() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        std::env::set_var("LOOM_LISTING_CACHE_DIR", cache.path());
+        let gh = write_fake_gh(dir.path());
+        let repo = format!("test/disk-flow-{}", std::process::id());
+
+        // Round 1: 200 → parsed + written to disk (not truncated: 1 row).
+        let first =
+            list_issues_cached_persistent(&gh, Some(dir.path()), Some(&repo), "loom:issue", "open")
+                .unwrap();
+        assert_eq!(first.issues.len(), 1);
+        assert_eq!(first.issues[0].number, 7);
+        assert!(!first.truncated);
+        // The entry file now exists on disk (durable across process exit).
+        assert!(std::fs::read_dir(cache.path()).unwrap().count() >= 1);
+
+        // Round 2: the fake gh answers 304 to the presented If-None-Match; the
+        // listing must come back identical, reconstructed from the disk body.
+        let second =
+            list_issues_cached_persistent(&gh, Some(dir.path()), Some(&repo), "loom:issue", "open")
+                .unwrap();
+        assert_eq!(second.issues, first.issues);
+        std::env::remove_var("LOOM_LISTING_CACHE_DIR");
     }
 
     #[test]
