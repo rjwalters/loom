@@ -163,6 +163,14 @@ export function multiHostSnapshot(): unknown {
             cpu_idle_fraction: 0.83,
             load_per_core: 0.51,
             worktree_root_free_gb: 200,
+            // #4976 roster: one repo with two in-flight sweeps (matching the
+            // activeSweeps below), plus two registered-but-idle repos — the
+            // "roster-shaped idle" case the feature exists for.
+            managed_repos: [
+              { slug: "rjwalters/loom", visibility: "public" },
+              { slug: "2AMLogic/gf180-pll", visibility: "private" },
+              { slug: "2AMLogic/gf180-trng", visibility: "private" },
+            ],
           },
           updatedAt: isoMinutesBefore(2),
         },
@@ -274,6 +282,12 @@ export function multiHostSnapshot(): unknown {
             cpu_idle_fraction: 0.99,
             load_per_core: 0.02,
             worktree_root_free_gb: 512,
+            // Stands in for the redacted, unauthenticated shape
+            // (`dashboard/src/redaction.ts`'s `redactManagedRepos`): a
+            // private entry keeps its place in the roster but loses `slug`,
+            // so the UI collapses it into a "+N private" count instead of
+            // naming it.
+            managed_repos: [{ slug: "rjwalters/loom", visibility: "public" }, { visibility: "private" }, { visibility: "private" }],
           },
           updatedAt: isoMinutesBefore(3),
         },

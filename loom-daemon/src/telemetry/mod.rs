@@ -519,6 +519,44 @@ pub struct HostHealthRecord {
     /// `dispatch_halted` is `false`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub halt_reason: Option<String>,
+    /// This host's managed-repository roster (Issue #4976): every workspace
+    /// root the daemon's [`crate::workspace_pool::WorkspacePool`] has a
+    /// provisioned registry for, resolved to its forge `owner/repo` slug and
+    /// [`RepoVisibility`] — sourced from the workspace registry itself, not
+    /// inferred from `active_sweep_ids`, so an idle-but-registered repo still
+    /// appears. Feeds the Phase-2 dashboard's "Repositories" fleet-card
+    /// section.
+    ///
+    /// `#[serde(default)]` so a pre-#4976 record still decodes (as an empty
+    /// roster) rather than failing the whole envelope — the same
+    /// backward-compatibility contract `active_sweep_ids` established.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub managed_repos: Vec<ManagedRepoEntry>,
+}
+
+/// One repository this host's daemon is currently managing (Issue #4976) —
+/// the machine-level workspace registry, surfaced in `status --json`'s
+/// `per_repo` but otherwise reaching the backend only via individual sweep
+/// records. `visibility` is derived exactly the way sweep records already
+/// derive theirs ([`visibility::derive_visibility`]), so the same
+/// private-safe-default tag governs redaction here too.
+///
+/// This struct carries the repo's **real** slug regardless of visibility —
+/// exactly like [`SweepStartedRecord::repo`] always carries the real slug.
+/// The anti-leak control is enforced at the Phase-2 dashboard's redaction
+/// boundary (`dashboard/src/redaction.ts`), not here; the daemon's own push
+/// to the observability backend is authenticated and never reaches an
+/// unauthenticated viewer directly.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ManagedRepoEntry {
+    /// The `owner/repo` forge slug.
+    pub slug: String,
+    /// This repo's visibility class. `#[serde(default)]` so a repo entry
+    /// missing the tag (should never happen from this daemon, but matches
+    /// every other visibility field's defensive posture) decodes to
+    /// `Private`, never `Public`.
+    #[serde(default)]
+    pub visibility: RepoVisibility,
 }
 
 #[cfg(test)]
@@ -634,6 +672,16 @@ mod tests {
             active_sweep_ids: vec!["sweep-issue-4703-0".to_string()],
             dispatch_halted: false,
             halt_reason: None,
+            managed_repos: vec![
+                ManagedRepoEntry {
+                    slug: "rjwalters/loom".to_string(),
+                    visibility: RepoVisibility::Public,
+                },
+                ManagedRepoEntry {
+                    slug: "2AMLogic/gf180-pll".to_string(),
+                    visibility: RepoVisibility::Private,
+                },
+            ],
         })
     }
 
@@ -857,6 +905,7 @@ mod tests {
             active_sweep_ids: Vec::new(),
             dispatch_halted: false,
             halt_reason: None,
+            managed_repos: Vec::new(),
         });
         let value = serde_json::to_value(&record).unwrap();
         assert!(
@@ -896,5 +945,96 @@ mod tests {
             }
             other => panic!("expected HostHealth, got {other:?}"),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // host.health managed_repos roster (#4976).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn host_health_serializes_managed_repos_with_slug_and_visibility() {
+        let value = serde_json::to_value(host_health()).unwrap();
+        let repos = value
+            .get("managed_repos")
+            .and_then(serde_json::Value::as_array)
+            .unwrap();
+        assert_eq!(repos.len(), 2);
+        assert_eq!(
+            repos[0].get("slug").and_then(serde_json::Value::as_str),
+            Some("rjwalters/loom")
+        );
+        assert_eq!(
+            repos[0]
+                .get("visibility")
+                .and_then(serde_json::Value::as_str),
+            Some("public")
+        );
+        assert_eq!(
+            repos[1].get("slug").and_then(serde_json::Value::as_str),
+            Some("2AMLogic/gf180-pll")
+        );
+        assert_eq!(
+            repos[1]
+                .get("visibility")
+                .and_then(serde_json::Value::as_str),
+            Some("private")
+        );
+    }
+
+    #[test]
+    fn host_health_omits_managed_repos_when_empty() {
+        // `skip_serializing_if = "Vec::is_empty"` — a host with no registered
+        // workspaces sends no key at all, mirroring `active_sweep_ids`.
+        let record = TelemetryRecord::HostHealth(HostHealthRecord {
+            captured_at: ts(),
+            daemon_version: "0.17.0".to_string(),
+            build_commit: "unknown".to_string(),
+            built_at: None,
+            uptime_sec: 1,
+            logical_cpus: 4,
+            cpu_idle_fraction: None,
+            load_per_core: None,
+            worktree_root_free_gb: None,
+            active_sweep_ids: Vec::new(),
+            dispatch_halted: false,
+            halt_reason: None,
+            managed_repos: Vec::new(),
+        });
+        let value = serde_json::to_value(&record).unwrap();
+        assert!(
+            value.get("managed_repos").is_none(),
+            "an empty roster must be absent from the wire, not an empty array"
+        );
+    }
+
+    #[test]
+    fn host_health_from_a_pre_4976_daemon_still_decodes() {
+        // Backward compatibility: a record emitted by a daemon that predates
+        // the managed-repo roster must decode with an empty roster, not fail
+        // the whole envelope.
+        let json = r#"{
+            "kind": "host.health",
+            "captured_at": "2026-07-30T12:00:00Z",
+            "daemon_version": "0.16.0",
+            "uptime_sec": 86400,
+            "logical_cpus": 28
+        }"#;
+        let decoded: TelemetryRecord = serde_json::from_str(json).unwrap();
+        match decoded {
+            TelemetryRecord::HostHealth(r) => {
+                assert!(r.managed_repos.is_empty());
+            }
+            other => panic!("expected HostHealth, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn managed_repo_entry_with_missing_visibility_defaults_to_private() {
+        // A repo entry with no `visibility` tag at all must decode Private —
+        // the same private-safe-default every other visibility field holds.
+        let json = r#"{"slug": "owner/repo"}"#;
+        let decoded: ManagedRepoEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(decoded.visibility, RepoVisibility::Private);
+        assert_eq!(decoded.slug, "owner/repo");
     }
 }

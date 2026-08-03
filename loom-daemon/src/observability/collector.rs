@@ -43,8 +43,9 @@ use chrono::{DateTime, Utc};
 
 use crate::event_bus::{EventBus, RecvError};
 use crate::telemetry::{
-    visibility::derive_visibility, HostHealthRecord, PhaseDuration, RepoVisibility, SweepResult,
-    SweepStartedRecord, TelemetryEnvelope, TelemetryRecord, TokenAccountState, TokenSnapshotRecord,
+    visibility::derive_visibility, HostHealthRecord, ManagedRepoEntry, PhaseDuration,
+    RepoVisibility, SweepResult, SweepStartedRecord, TelemetryEnvelope, TelemetryRecord,
+    TokenAccountState, TokenSnapshotRecord,
 };
 use crate::types::{Event, SweepKind};
 use crate::workspace_pool::WorkspacePool;
@@ -134,7 +135,15 @@ async fn run_collector(
             }
 
             _ = snapshot_timer.tick() => {
-                sample_snapshots(&queue, &workspace_root, &host_id, daemon_started_at, &workspace_pool).await;
+                sample_snapshots(
+                    &queue,
+                    &workspace_root,
+                    &host_id,
+                    daemon_started_at,
+                    &workspace_pool,
+                    &mut slug_cache,
+                )
+                .await;
             }
         }
     }
@@ -386,17 +395,22 @@ async fn resolve_visibility(slug: &str) -> RepoVisibility {
 }
 
 /// Sample the two host-level record kinds that have no corresponding bus
-/// event and push them onto `queue`.
+/// event and push them onto `queue`. `slug_cache` is the same per-workspace
+/// slug memoization `handle_event` uses, threaded through so the periodic
+/// `managed_repos` roster sample does not re-shell out to `gh repo view` for
+/// a workspace root already resolved this run.
 async fn sample_snapshots(
     queue: &DurableQueue,
     workspace_root: &Path,
     host_id: &str,
     daemon_started_at: Instant,
     workspace_pool: &WorkspacePool,
+    slug_cache: &mut HashMap<String, String>,
 ) {
     let token_record = sample_token_snapshot(workspace_root);
     queue.push(TelemetryEnvelope::new(host_id, TelemetryRecord::TokensSnapshot(token_record)));
-    let health_record = sample_host_health(workspace_root, daemon_started_at, workspace_pool).await;
+    let health_record =
+        sample_host_health(workspace_root, daemon_started_at, workspace_pool, slug_cache).await;
     queue.push(TelemetryEnvelope::new(host_id, TelemetryRecord::HostHealth(health_record)));
 }
 
@@ -466,6 +480,7 @@ async fn sample_host_health(
     workspace_root: &Path,
     started_at: Instant,
     workspace_pool: &WorkspacePool,
+    slug_cache: &mut HashMap<String, String>,
 ) -> HostHealthRecord {
     // CPU idle refresh can block ~1s on macOS (`iostat`) — dispatched through
     // `spawn_blocking` per the exact pattern `work_finder`'s dynamic-cap tick
@@ -495,6 +510,7 @@ async fn sample_host_health(
         active_sweep_ids: collect_active_sweep_ids(workspace_pool),
         dispatch_halted,
         halt_reason,
+        managed_repos: collect_managed_repos(workspace_pool, slug_cache).await,
     }
 }
 
@@ -517,6 +533,79 @@ fn dispatch_halt_from_breaker(
         Some(snapshot) if snapshot.suppressed => (true, snapshot.reason),
         _ => (false, None),
     }
+}
+
+/// This host's currently managed repository roster (Issue #4976): every
+/// workspace root [`WorkspacePool::provisioned_registries`] currently tracks,
+/// resolved to its forge `owner/repo` slug and [`RepoVisibility`] — the same
+/// derivation [`handle_event`] uses for a sweep record. Feeds `host.health`'s
+/// `managed_repos` so the Phase-2 dashboard can show a host's roster even
+/// when a registered repo has no sweeps at all (`active_sweep_ids` alone
+/// cannot answer "is this repo idle or simply not registered here").
+///
+/// Best-effort per repo: a workspace whose slug cannot be resolved (no `gh`,
+/// not a git remote, a timed-out probe) is silently dropped from the roster
+/// rather than failing the whole `host.health` sample — mirrors every other
+/// best-effort probe this collector already makes.
+async fn collect_managed_repos(
+    workspace_pool: &WorkspacePool,
+    slug_cache: &mut HashMap<String, String>,
+) -> Vec<ManagedRepoEntry> {
+    collect_managed_repos_with(workspace_pool, slug_cache, derive_visibility).await
+}
+
+/// Testable core of [`collect_managed_repos`]: `resolve_visibility` (a plain
+/// sync fn, dispatched through `spawn_blocking` exactly like the standalone
+/// [`resolve_visibility`] helper does) is injected so a unit test can
+/// substitute a deterministic fake for the real `gh api` probe — the same
+/// seam [`crate::telemetry::visibility::refresh_visibility_cache_with`] gives
+/// its own tests, so this roster helper never has to make a live network call
+/// to be exercised hermetically.
+async fn collect_managed_repos_with<F>(
+    workspace_pool: &WorkspacePool,
+    slug_cache: &mut HashMap<String, String>,
+    resolve_visibility: F,
+) -> Vec<ManagedRepoEntry>
+where
+    F: Fn(&str) -> RepoVisibility + Copy + Send + Sync + 'static,
+{
+    // Collect the roots first and drop every registry lock before the async
+    // slug/visibility resolution below — never hold a `std::sync::Mutex`
+    // guard across an `.await` point.
+    let roots: Vec<PathBuf> = workspace_pool
+        .provisioned_registries()
+        .into_iter()
+        .map(|registry| {
+            registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .config()
+                .workspace_root
+                .clone()
+        })
+        .collect();
+
+    let mut entries = Vec::with_capacity(roots.len());
+    for root in roots {
+        let root_str = root.to_string_lossy().to_string();
+        let Some(slug) = resolve_repo_slug_cached(slug_cache, &root_str).await else {
+            log::debug!("observability: could not resolve a repo slug for {root_str}; dropping it from the roster");
+            continue;
+        };
+        let owned = slug.clone();
+        // Mirrors `resolve_visibility`'s own contract: a `spawn_blocking` join
+        // failure degrades to the private-safe default rather than propagating.
+        let visibility = tokio::task::spawn_blocking(move || resolve_visibility(&owned))
+            .await
+            .unwrap_or(RepoVisibility::Private);
+        entries.push(ManagedRepoEntry { slug, visibility });
+    }
+    // Deterministic order (the dashboard renders this list directly) and
+    // de-duplicated in case two provisioned roots ever resolve to the same
+    // forge slug (e.g. two worktrees of one repo).
+    entries.sort_by(|a, b| a.slug.cmp(&b.slug));
+    entries.dedup_by(|a, b| a.slug == b.slug);
+    entries
 }
 
 /// This host's currently in-flight (`Pending`/`Running`, i.e. non-terminal)
@@ -908,12 +997,16 @@ mod tests {
         WorkspacePool::new(Arc::new(EventBus::new()), tokio::runtime::Handle::current())
     }
 
+    fn empty_slug_cache() -> HashMap<String, String> {
+        HashMap::new()
+    }
+
     #[tokio::test]
     async fn host_health_sample_populates_daemon_version_and_uptime() {
         let dir = tempfile::tempdir().unwrap();
         let started = Instant::now();
         let pool = empty_pool();
-        let record = sample_host_health(dir.path(), started, &pool).await;
+        let record = sample_host_health(dir.path(), started, &pool, &mut empty_slug_cache()).await;
         assert_eq!(record.daemon_version, env!("CARGO_PKG_VERSION"));
         assert!(record.logical_cpus >= 1);
     }
@@ -922,7 +1015,8 @@ mod tests {
     async fn host_health_sample_stamps_the_running_binarys_build_identity() {
         let dir = tempfile::tempdir().unwrap();
         let pool = empty_pool();
-        let record = sample_host_health(dir.path(), Instant::now(), &pool).await;
+        let record =
+            sample_host_health(dir.path(), Instant::now(), &pool, &mut empty_slug_cache()).await;
 
         // The sample must carry the SAME commit `loom-daemon --version`
         // prints — that identity is what lets the dashboard tell two
@@ -963,10 +1057,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let started = Instant::now();
         let pool = empty_pool();
-        let record = sample_host_health(dir.path(), started, &pool).await;
+        let record = sample_host_health(dir.path(), started, &pool, &mut empty_slug_cache()).await;
         assert!(
             record.active_sweep_ids.is_empty(),
             "an empty pool has no in-flight sweeps to report"
+        );
+    }
+
+    #[tokio::test]
+    async fn host_health_sample_reports_no_managed_repos_when_pool_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = Instant::now();
+        let pool = empty_pool();
+        let record = sample_host_health(dir.path(), started, &pool, &mut empty_slug_cache()).await;
+        assert!(
+            record.managed_repos.is_empty(),
+            "an empty pool has no registered repos to report"
         );
     }
 
@@ -1100,5 +1206,61 @@ mod tests {
         let (halted, reason) = dispatch_halt_from_breaker(Some(snapshot));
         assert!(halted, "CoolDown still suppresses dispatch, so it must count as halted");
         assert!(reason.is_some());
+    }
+
+    #[tokio::test]
+    async fn collect_managed_repos_reports_every_provisioned_registrys_repo_even_when_idle() {
+        // Registered but never dispatched into: this is the exact "idle
+        // roster" case #4976 exists for — `collect_active_sweep_ids` would
+        // report nothing for either root, but the roster must still list
+        // both.
+        let dir = tempfile::tempdir().unwrap();
+        let a_root = dir.path().join("a");
+        let b_root = dir.path().join("b");
+        std::fs::create_dir_all(&a_root).unwrap();
+        std::fs::create_dir_all(&b_root).unwrap();
+        let pool = empty_pool();
+        pool.seed(a_root.clone(), Arc::new(std::sync::Mutex::new(dispatchable_registry(&a_root))));
+        pool.seed(b_root.clone(), Arc::new(std::sync::Mutex::new(dispatchable_registry(&b_root))));
+
+        // Pre-populate the slug cache so slug resolution never shells out to
+        // `gh repo view` against these bare tempdirs (which have no git
+        // remote at all) — the exact seam `resolve_repo_slug_cached` exists
+        // for.
+        let mut slug_cache = HashMap::new();
+        slug_cache
+            .insert(a_root.to_string_lossy().to_string(), "loom-test-fixture/repo-a".to_string());
+        slug_cache
+            .insert(b_root.to_string_lossy().to_string(), "loom-test-fixture/repo-b".to_string());
+
+        // A deterministic fake visibility resolver — never a real `gh api`
+        // call — that reports repo-a public and repo-b private, so the
+        // per-entry visibility assertion below is not a coin flip on live
+        // forge state.
+        fn fake_visibility(slug: &str) -> RepoVisibility {
+            if slug == "loom-test-fixture/repo-a" {
+                RepoVisibility::Public
+            } else {
+                RepoVisibility::Private
+            }
+        }
+
+        let mut repos = collect_managed_repos_with(&pool, &mut slug_cache, fake_visibility).await;
+        repos.sort_by(|a, b| a.slug.cmp(&b.slug));
+        assert_eq!(
+            repos,
+            vec![
+                ManagedRepoEntry {
+                    slug: "loom-test-fixture/repo-a".to_string(),
+                    visibility: RepoVisibility::Public,
+                },
+                ManagedRepoEntry {
+                    slug: "loom-test-fixture/repo-b".to_string(),
+                    visibility: RepoVisibility::Private,
+                },
+            ],
+            "both registered repos are in the roster, each with its derived visibility, \
+             despite neither having a sweep in flight"
+        );
     }
 }

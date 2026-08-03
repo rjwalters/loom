@@ -7,6 +7,7 @@ import {
   redactFleetSnapshot,
   redactHistoryQueryResult,
   redactHistoryRecord,
+  redactManagedRepos,
   redactPayload,
   redactSseFrame,
 } from "../src/redaction";
@@ -266,6 +267,36 @@ describe("redactPayload — per-kind field allowlist", () => {
     expect(redactPayload("host.health", payload)).toEqual(payload);
   });
 
+  it("host.health: a private repo's slug is redacted, but every other field survives unchanged (#4976)", () => {
+    const payload = {
+      kind: "host.health",
+      captured_at: "2026-08-02T12:00:00Z",
+      daemon_version: "0.17.0",
+      uptime_sec: 86400,
+      logical_cpus: 28,
+      managed_repos: [
+        { slug: "rjwalters/loom", visibility: "public" },
+        { slug: "2AMLogic/gf180-pll", visibility: "private" },
+      ],
+    };
+    const redacted = redactPayload("host.health", payload);
+    expect(redacted).toMatchObject({
+      daemon_version: "0.17.0",
+      uptime_sec: 86400,
+      logical_cpus: 28,
+    });
+    expect(redacted.managed_repos).toEqual([
+      { slug: "rjwalters/loom", visibility: "public" },
+      { visibility: "private" },
+    ]);
+    expect(JSON.stringify(redacted)).not.toContain("gf180-pll");
+  });
+
+  it("host.health: no managed_repos key at all when the payload carries no roster", () => {
+    const payload = { kind: "host.health", daemon_version: "0.17.0", uptime_sec: 100 };
+    expect(redactPayload("host.health", payload)).not.toHaveProperty("managed_repos");
+  });
+
   it("an unrecognized (forward-compatible) kind reveals only `kind`", () => {
     const redacted = redactPayload("future.kind", {
       kind: "future.kind",
@@ -410,6 +441,40 @@ describe("redactFleetSnapshot", () => {
     expect(redacted.activeSweeps[0]).not.toHaveProperty("sweepId");
   });
 
+  it("collapses a private repo's slug for a public viewer, and shows every slug to an authenticated one (#4976)", () => {
+    const snapshot: FleetSnapshot = {
+      hosts: {
+        "host-abc": {
+          health: {
+            record: {
+              kind: "host.health",
+              uptime_sec: 100,
+              managed_repos: [
+                { slug: "rjwalters/loom", visibility: "public" },
+                { slug: "2AMLogic/gf180-pll", visibility: "private" },
+              ],
+            },
+            updatedAt: "2026-07-30T12:00:00Z",
+          },
+        },
+      },
+      activeSweeps: [],
+    };
+
+    const publicRecord = redactFleetSnapshot(snapshot, false).hosts["host-abc"]?.health?.record;
+    expect(publicRecord?.managed_repos).toEqual([
+      { slug: "rjwalters/loom", visibility: "public" },
+      { visibility: "private" },
+    ]);
+    expect(JSON.stringify(publicRecord)).not.toContain("gf180-pll");
+
+    const authedRecord = redactFleetSnapshot(snapshot, true).hosts["host-abc"]?.health?.record;
+    expect(authedRecord?.managed_repos).toEqual([
+      { slug: "rjwalters/loom", visibility: "public" },
+      { slug: "2AMLogic/gf180-pll", visibility: "private" },
+    ]);
+  });
+
   it("summarizes the token pool for a public viewer", () => {
     const snapshot: FleetSnapshot = {
       hosts: {
@@ -452,6 +517,37 @@ describe("redactFleetSnapshot", () => {
 
     const record = redactFleetSnapshot(snapshot, true).hosts["host-abc"]?.tokens?.record;
     expect(record).toEqual({ kind: "tokens.snapshot", accounts });
+  });
+});
+
+describe("redactManagedRepos", () => {
+  it("keeps a public entry's slug, strips a private entry's slug but keeps its place", () => {
+    expect(
+      redactManagedRepos([
+        { slug: "rjwalters/loom", visibility: "public" },
+        { slug: "2AMLogic/gf180-pll", visibility: "private" },
+        { slug: "2AMLogic/gf180-trng", visibility: "private" },
+      ]),
+    ).toEqual([
+      { slug: "rjwalters/loom", visibility: "public" },
+      { visibility: "private" },
+      { visibility: "private" },
+    ]);
+  });
+
+  it("treats a malformed row (missing/wrong-typed slug, any non-\"public\" visibility) as private", () => {
+    expect(
+      redactManagedRepos([
+        { visibility: "public" }, // no slug at all
+        { slug: 42, visibility: "public" }, // wrong-typed slug
+        { slug: "owner/repo", visibility: "internal" }, // unrecognized visibility label
+        { slug: "owner/repo" }, // missing visibility
+      ]),
+    ).toEqual([{ visibility: "private" }, { visibility: "private" }, { visibility: "private" }, { visibility: "private" }]);
+  });
+
+  it("an empty roster redacts to an empty roster", () => {
+    expect(redactManagedRepos([])).toEqual([]);
   });
 });
 

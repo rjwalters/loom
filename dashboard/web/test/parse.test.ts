@@ -148,4 +148,68 @@ describe("parseFleetSnapshot", () => {
     expect(snapshot.hosts.bad?.health?.record).not.toHaveProperty("build_commit");
     expect(snapshot.hosts.bad?.health?.record).not.toHaveProperty("built_at");
   });
+
+  it("narrows host.health's managed_repos roster (#4976)", () => {
+    const snapshot = parseFleetSnapshot(multiHostSnapshot());
+    const repos = snapshot.hosts[HEALTHY_HOST_ID]?.health?.record.managed_repos;
+    expect(repos).toEqual([
+      { slug: "rjwalters/loom", visibility: "public" },
+      { slug: "2AMLogic/gf180-pll", visibility: "private" },
+      { slug: "2AMLogic/gf180-trng", visibility: "private" },
+    ]);
+  });
+
+  it("narrows a redacted managed_repos entry (slug stripped, visibility kept)", () => {
+    const snapshot = parseFleetSnapshot({
+      hosts: {
+        h: {
+          health: {
+            record: { managed_repos: [{ visibility: "private" }, { slug: "owner/repo", visibility: "public" }] },
+            updatedAt: "2026-07-30T12:00:00Z",
+          },
+        },
+      },
+      activeSweeps: [],
+    });
+    const repos = snapshot.hosts.h?.health?.record.managed_repos ?? [];
+    expect(repos).toEqual([{ visibility: "private" }, { slug: "owner/repo", visibility: "public" }]);
+    expect("slug" in repos[0]!).toBe(false);
+  });
+
+  it("degrades a wrong-typed managed_repos to absent rather than throwing", () => {
+    const snapshot = parseFleetSnapshot({
+      hosts: {
+        h: {
+          health: {
+            record: { managed_repos: "not-an-array" },
+            updatedAt: "2026-07-30T12:00:00Z",
+          },
+        },
+      },
+      activeSweeps: [],
+    });
+    expect(snapshot.hosts.h?.health?.record.managed_repos).toBeUndefined();
+  });
+
+  it("drops a malformed managed_repos row rather than the whole roster", () => {
+    const snapshot = parseFleetSnapshot({
+      hosts: {
+        h: {
+          health: {
+            record: {
+              managed_repos: [null, "nope", { slug: 42 }, { slug: "owner/repo", visibility: "public" }],
+            },
+            updatedAt: "2026-07-30T12:00:00Z",
+          },
+        },
+      },
+      activeSweeps: [],
+    });
+    // `null`/`"nope"` are dropped entirely (not objects); `{ slug: 42 }` keeps
+    // its place as a slugless (private-by-default) row rather than vanishing.
+    expect(snapshot.hosts.h?.health?.record.managed_repos).toEqual([
+      { visibility: "private" },
+      { slug: "owner/repo", visibility: "public" },
+    ]);
+  });
 });

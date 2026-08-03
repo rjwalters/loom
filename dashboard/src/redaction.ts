@@ -54,8 +54,14 @@
  * Neither references a repository, issue, branch, or PR — the four leak
  * vectors the epic's acceptance criteria name.
  *
- * `host.health` is pure capacity telemetry (CPU/uptime/disk) and passes
- * through in full for every viewer.
+ * `host.health` is mostly pure capacity telemetry (CPU/uptime/disk) and
+ * passes through in full for every viewer. The one exception is its
+ * `managed_repos` roster (#4976): each entry names a specific repository, so
+ * — like `tokens.snapshot`'s `accounts` below — it is deliberately absent
+ * from the allowlist and instead redacted through `redactManagedRepos`: a
+ * public entry's slug survives, a private entry's slug is dropped but the
+ * entry itself is kept (so the roster's size, and therefore "how many are
+ * private", stays visible without naming any of them).
  *
  * `tokens.snapshot` does **not**. Its `accounts` array names the pool's
  * accounts and gives each one's rank and burn — operational detail about
@@ -126,6 +132,10 @@ const RECORD_FIELD_ALLOWLIST: Readonly<Record<string, readonly string[]>> = {
     // directly above.
     "dispatch_halted",
     "halt_reason",
+    // `managed_repos` (#4976) is deliberately ABSENT here: each entry names a
+    // specific repository, so — like `tokens.snapshot`'s `accounts` above —
+    // it only ever reaches a public response through `PUBLIC_RECORD_
+    // DERIVATIONS`'s `redactManagedRepos`, never a raw copy.
   ],
 };
 
@@ -199,6 +209,35 @@ export function deriveTokenPoolAggregate(payload: Record<string, unknown>): Toke
   };
 }
 
+/** One entry inside `host.health`'s `managed_repos` roster, as the daemon
+ * sends it — always the real slug, regardless of visibility (see
+ * `ManagedRepoEntry`'s Rust-side doc: the daemon carries full detail, the
+ * redaction boundary is here). */
+interface ManagedRepoRow {
+  slug?: unknown;
+  visibility?: unknown;
+}
+
+/**
+ * Redact one `host.health.managed_repos` array for a public, unauthenticated
+ * viewer (Issue #4976's anti-leak contract): a `public`-visibility entry's
+ * slug survives; a `private` entry's slug is dropped but the entry itself is
+ * kept (so the roster's total count — and therefore "how many private repos"
+ * — is still visible without naming any of them). Mirrors
+ * `redactActiveSweep`'s "null the identifying field, keep the entry" strategy
+ * for a private sweep.
+ *
+ * A malformed row (wrong-typed `slug`, or any `visibility` other than the
+ * literal string `"public"`) is treated as private — the same fail-safe
+ * default every visibility decode in this system uses.
+ */
+export function redactManagedRepos(rows: readonly ManagedRepoRow[]): { slug?: string; visibility: "public" | "private" }[] {
+  return rows.map((row) => {
+    const isPublic = row?.visibility === "public" && typeof row.slug === "string";
+    return isPublic ? { slug: row.slug as string, visibility: "public" as const } : { visibility: "private" as const };
+  });
+}
+
 /**
  * Per-kind *derivations* layered on top of the field allowlist: fields the
  * public view gets that are computed from redacted-away input rather than
@@ -214,6 +253,17 @@ export function deriveTokenPoolAggregate(payload: Record<string, unknown>): Toke
 const PUBLIC_RECORD_DERIVATIONS: Readonly<Record<string, (payload: Record<string, unknown>) => Record<string, unknown>>> =
   {
     "tokens.snapshot": (payload) => deriveTokenPoolAggregate(payload) as unknown as Record<string, unknown>,
+    // `managed_repos` is deliberately ABSENT from `RECORD_FIELD_ALLOWLIST` —
+    // like `tokens.snapshot`'s `accounts`, its raw form can name a private
+    // repo, so it only ever reaches a public response through this
+    // derivation. Absent entirely from the output when the payload carries
+    // no roster at all (a pre-#4976 daemon, or a host with no registered
+    // workspaces), so the field-presence contract stays "the daemon sent
+    // this" rather than "this module always adds it".
+    "host.health": (payload) =>
+      Array.isArray(payload.managed_repos)
+        ? { managed_repos: redactManagedRepos(payload.managed_repos as ManagedRepoRow[]) }
+        : {},
   };
 
 /** The fail-safe allowlist for a `kind` this table does not (yet) recognize
