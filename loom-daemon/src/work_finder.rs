@@ -113,6 +113,7 @@ use crate::event_bus::EventBus;
 use crate::main_health_gate::{MainHealthState, WorkspaceHealthStates};
 use crate::sweep_registry::{
     DispatchBackoffError, LiveClaimDispatchError, OpenPrDispatchError, ParkedIssueDispatchError,
+    PreflightDispatchGate,
 };
 use crate::tokens::{token_pool_size, token_pool_size_at_dir};
 use crate::types::{Event, WorkFinderTickSummary};
@@ -1079,6 +1080,36 @@ pub fn dispatch_held_per_root_with_drain(
     dispatch_held_per_root(health_states, roots, suppress_dispatch_during_gate)
         .into_iter()
         .map(|h| h || draining)
+        .collect()
+}
+
+/// Fold a per-root claude-wrapper pre-flight-advisory hold (#5030) on top of the
+/// #3930 verified-red + #4084 gate-in-flight per-root holds.
+///
+/// `preflight_held` is a slice **parallel to `roots`**: `preflight_held[i] ==
+/// true` means root `i`'s pre-flight advisory is tripped AND its half-open
+/// breaker is currently in the "held" window (not a probe tick), so no new
+/// dispatch should go to that root this tick. The caller computes it from each
+/// root's own [`SweepRegistry::preflight_dispatch_gate`](crate::sweep_registry::SweepRegistry::preflight_dispatch_gate)
+/// — a broken workspace burns at most one ~1s pre-flight death per probe
+/// cooldown instead of one every tick.
+///
+/// The hold is strictly **per root**, matching the #3930 per-repo isolation
+/// contract: a workspace with a broken `.mcp.json` never halts dispatch to a
+/// healthy sibling repo. A missing entry (`preflight_held.len() < roots.len()`)
+/// defaults to *not held*. With an all-`false` slice the result is byte-for-byte
+/// [`dispatch_held_per_root`].
+#[must_use]
+pub fn dispatch_held_per_root_with_preflight(
+    health_states: &WorkspaceHealthStates,
+    roots: &[std::path::PathBuf],
+    suppress_dispatch_during_gate: bool,
+    preflight_held: &[bool],
+) -> Vec<bool> {
+    dispatch_held_per_root(health_states, roots, suppress_dispatch_during_gate)
+        .into_iter()
+        .enumerate()
+        .map(|(i, h)| h || preflight_held.get(i).copied().unwrap_or(false))
         .collect()
 }
 
@@ -2075,6 +2106,10 @@ pub fn spawn_multi_work_finder_task(
         ticker.tick().await;
         let mut was_halted = false;
         let mut was_pressured = false;
+        // Pre-flight-advisory hold transition state (#5030): log the distinct
+        // "held because pre-flight is broken" warning once per transition rather
+        // than every tick, mirroring `was_halted`.
+        let mut was_preflight_held_count: usize = 0;
         // Axis-visibility state (#4234) — see the single-workspace loop above
         // for the full rationale.
         let mut was_max_concurrent: Option<usize> = None;
@@ -2213,15 +2248,71 @@ pub fn spawn_multi_work_finder_task(
             // rather than OR'd into `halted` so its deferrals stay attributable.
             let saturation_held =
                 crate::admission_brake::global_observe(loadavg_1m, ncpu, chrono::Utc::now());
-            let halted: Vec<bool> = dispatch_held_per_root_with_drain(
+            // Per-root claude-wrapper pre-flight-advisory hold (#5030): consult
+            // each root's own SweepRegistry breaker. A workspace that has
+            // accumulated `threshold` consecutive pre-flight deaths (broken
+            // `.mcp.json`, dead token pool, ...) is held so the work-finder
+            // stops burning dispatch slots on doomed ~1s deaths, EXCEPT one
+            // half-open probe dispatch per cooldown to test recovery (which
+            // clears the advisory automatically on success — no operator
+            // action). Strictly per root: a broken workspace never holds a
+            // healthy sibling (the #3930 isolation contract).
+            let now_tick = chrono::Utc::now();
+            let mut preflight_probe_roots: Vec<std::path::PathBuf> = Vec::new();
+            let preflight_held: Vec<bool> = roots
+                .iter()
+                .map(|root| {
+                    let registry = pool.get_or_provision(root);
+                    let mut registry = registry
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    match registry.preflight_dispatch_gate(now_tick) {
+                        PreflightDispatchGate::Open => false,
+                        PreflightDispatchGate::Held => true,
+                        PreflightDispatchGate::Probe => {
+                            preflight_probe_roots.push(root.clone());
+                            false
+                        }
+                    }
+                })
+                .collect();
+            let halted: Vec<bool> = dispatch_held_per_root_with_preflight(
                 &health_states,
                 &roots,
                 suppress_dispatch_during_gate,
-                draining,
+                &preflight_held,
             )
             .into_iter()
-            .map(|h| h || breaker_suppressed)
+            .map(|h| h || draining || breaker_suppressed)
             .collect();
+            let preflight_held_count = preflight_held.iter().filter(|&&h| h).count();
+            // Distinguish a pre-flight-advisory hold from the main-health /
+            // gate-in-flight holds (#5030 AC4) so an operator can tell "held
+            // because pre-flight is broken" apart from "held because CI is red."
+            if preflight_held_count != was_preflight_held_count {
+                if preflight_held_count > 0 {
+                    log::warn!(
+                        "work_finder: {preflight_held_count} of {} repo(s) held — \
+                         claude-wrapper pre-flight advisory tripped (broken .mcp.json / dead token \
+                         pool); dispatch is suppressed except one probe per cooldown until a \
+                         dispatch reaches CLI start (#5030)",
+                        roots.len()
+                    );
+                } else {
+                    log::info!(
+                        "work_finder: pre-flight advisory cleared for all repos — dispatch \
+                         resuming (#5030)"
+                    );
+                }
+                was_preflight_held_count = preflight_held_count;
+            }
+            for probe_root in &preflight_probe_roots {
+                log::info!(
+                    "work_finder: pre-flight advisory recovery probe — allowing one dispatch to \
+                     {} to test recovery (#5030)",
+                    probe_root.display()
+                );
+            }
             let any_halted = halted.iter().any(|&h| h);
 
             let mut pairs: Vec<(GhWorkSource, RegistryDispatcher)> = roots
@@ -2237,6 +2328,7 @@ pub fn spawn_multi_work_finder_task(
                  healthy_tokens={token_limit}, per_token={per_token_concurrency}, disk={disk}, \
                  configured_max={configured_max}, \
                  max_admissions_per_tick={max_admissions_per_tick}, any_halted={any_halted}, \
+                 preflight_held={preflight_held_count}, \
                  saturation_held={saturation_held}, \
                  observed_idle={}, workspaces={}, priorities={priorities:?})",
                 format_idle(idle),
@@ -5487,6 +5579,130 @@ exit 0
             vec![10],
             "sibling root with no gate in flight is unaffected"
         );
+    }
+
+    // ===================================================================
+    // Pre-flight-advisory dispatch hold (#5030)
+    // ===================================================================
+
+    #[test]
+    fn test_dispatch_held_per_root_with_preflight_holds_only_the_tripped_root() {
+        // A workspace whose pre-flight breaker is holding (broken .mcp.json)
+        // holds only its own root; a healthy sibling keeps dispatching — the
+        // #3930 per-repo isolation contract must survive the #5030 fold.
+        let states = WorkspaceHealthStates::new();
+        let root_a = std::path::PathBuf::from("/tmp/repo-a"); // pre-flight held
+        let root_b = std::path::PathBuf::from("/tmp/repo-b"); // healthy
+        let preflight_held = [true, false];
+        let held = dispatch_held_per_root_with_preflight(
+            &states,
+            &[root_a, root_b],
+            true,
+            &preflight_held,
+        );
+        assert_eq!(
+            held,
+            vec![true, false],
+            "only the tripped root is held; its healthy sibling keeps dispatching"
+        );
+    }
+
+    #[test]
+    fn test_dispatch_held_per_root_with_preflight_empty_slice_matches_per_root() {
+        // An all-false / missing pre-flight slice is byte-for-byte the plain
+        // per-root vector — the fold is a pure superset, never a regression of
+        // the #4084 / #3930 semantics.
+        let states = WorkspaceHealthStates::new();
+        let root_a = std::path::PathBuf::from("/tmp/repo-a");
+        let root_b = std::path::PathBuf::from("/tmp/repo-b");
+        states.get_or_create(&root_a).set_gate_in_flight(true);
+        states.get_or_create(&root_b).set_halted(true);
+        let roots = [root_a, root_b];
+        let plain = dispatch_held_per_root(&states, &roots, true);
+        let folded = dispatch_held_per_root_with_preflight(&states, &roots, true, &[]);
+        assert_eq!(plain, folded, "empty pre-flight slice ⇒ identical to dispatch_held_per_root");
+    }
+
+    #[test]
+    fn test_dispatch_held_per_root_with_preflight_composes_with_verified_red() {
+        // The pre-flight hold and the #3930 verified-red hold compose
+        // additively per root: root_a is held by pre-flight, root_b by a red
+        // main, root_c is healthy on both axes.
+        let states = WorkspaceHealthStates::new();
+        let root_a = std::path::PathBuf::from("/tmp/repo-a");
+        let root_b = std::path::PathBuf::from("/tmp/repo-b");
+        let root_c = std::path::PathBuf::from("/tmp/repo-c");
+        states.get_or_create(&root_b).set_halted(true);
+        let held = dispatch_held_per_root_with_preflight(
+            &states,
+            &[root_a, root_b, root_c],
+            true,
+            &[true, false, false],
+        );
+        assert_eq!(held, vec![true, true, false]);
+    }
+
+    #[test]
+    fn test_preflight_held_root_dispatches_zero_new_sweeps() {
+        // Regression (#5030): end-to-end through `tick_multi`, a workspace whose
+        // pre-flight advisory has tripped (its breaker is holding) dispatches
+        // ZERO new sweeps even with a full backlog, while its healthy sibling
+        // takes the shared slot — the burn-every-slot incident cannot recur.
+        // Mirrors `test_gate_in_flight_root_dispatches_zero_new_sweeps`.
+        let states = WorkspaceHealthStates::new();
+        let root_a = std::path::PathBuf::from("/tmp/repo-a"); // pre-flight held
+        let root_b = std::path::PathBuf::from("/tmp/repo-b"); // healthy
+        let halted =
+            dispatch_held_per_root_with_preflight(&states, &[root_a, root_b], true, &[true, false]);
+
+        let mut multi = vec![
+            (FakeSource::once((1..=5).map(issue).collect()), RecordingDispatcher::default()),
+            (FakeSource::once(vec![issue(10)]), RecordingDispatcher::default()),
+        ];
+        let report = tick_multi(&mut multi, &[], 10, &halted);
+
+        assert!(report.halted, "the pre-flight-held root marks the tick as halted");
+        assert_eq!(report.seen, 6, "both backlogs are still observed");
+        assert!(
+            multi[0].1.dispatched.is_empty(),
+            "a pre-flight-broken workspace dispatches zero new sweeps (no slot burn)"
+        );
+        assert_eq!(
+            multi[1].1.dispatched,
+            vec![10],
+            "the healthy sibling keeps dispatching against the shared budget"
+        );
+    }
+
+    #[test]
+    fn test_preflight_probe_tick_resumes_dispatch_to_recovering_root() {
+        // Under the half-open design, a probe tick reports the root as NOT held
+        // (`preflight_held=false` for that root), so `tick_multi` lets one
+        // dispatch through to test recovery — proving the breaker never blocks
+        // the very dispatch needed to prove the workspace is fixed.
+        let states = WorkspaceHealthStates::new();
+        let root_a = std::path::PathBuf::from("/tmp/repo-a"); // probing this tick
+        let root_b = std::path::PathBuf::from("/tmp/repo-b"); // healthy
+                                                              // A probe tick maps `PreflightDispatchGate::Probe` → not held.
+        let halted = dispatch_held_per_root_with_preflight(
+            &states,
+            &[root_a, root_b],
+            true,
+            &[false, false],
+        );
+
+        let mut multi = vec![
+            (FakeSource::once(vec![issue(1)]), RecordingDispatcher::default()),
+            (FakeSource::once(vec![issue(10)]), RecordingDispatcher::default()),
+        ];
+        let report = tick_multi(&mut multi, &[], 10, &halted);
+        assert!(!report.halted);
+        assert_eq!(
+            multi[0].1.dispatched,
+            vec![1],
+            "a probe tick lets one dispatch through to the recovering root"
+        );
+        assert_eq!(multi[1].1.dispatched, vec![10]);
     }
 
     // ===================================================================

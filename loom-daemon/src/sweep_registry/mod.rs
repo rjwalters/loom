@@ -503,6 +503,15 @@ pub struct SweepRegistry {
     /// [`Event::PreflightAdvisory`] fires only on a state-change transition,
     /// never every tick.
     preflight_advisory_tripped: bool,
+    /// Half-open recovery-probe clock for the dispatch breaker (Issue #5030).
+    /// While [`preflight_advisory_tripped`](Self::preflight_advisory_tripped) is
+    /// `true`, [`preflight_dispatch_gate`](Self::preflight_dispatch_gate) holds
+    /// new dispatch to this workspace except for one probe dispatch per
+    /// [`PreflightTripwireConfig::probe_cooldown`]; this records when the last
+    /// probe (or the first tick observing the trip) was let through. Cleared
+    /// back to `None` the moment the advisory un-trips, so a freshly re-tripped
+    /// advisory always waits a full cooldown before its first probe.
+    preflight_probe_last_at: Option<DateTime<Utc>>,
     /// Per-issue dispatch-backoff parameters (Issue #4485). `main.rs` /
     /// [`crate::workspace_pool::WorkspacePool`] set the resolved env > config >
     /// default value at provision time, mirroring
@@ -707,6 +716,7 @@ impl SweepRegistry {
             preflight_death_streak: 0,
             preflight_death_last_marker: None,
             preflight_advisory_tripped: false,
+            preflight_probe_last_at: None,
             dispatch_backoff_config: DispatchBackoffConfig::default(),
             dispatch_backoff: HashMap::new(),
             label_flip_log: HashMap::new(),
@@ -749,6 +759,7 @@ impl SweepRegistry {
             preflight_death_streak: 0,
             preflight_death_last_marker: None,
             preflight_advisory_tripped: false,
+            preflight_probe_last_at: None,
             dispatch_backoff_config: DispatchBackoffConfig::default(),
             dispatch_backoff: HashMap::new(),
             label_flip_log: HashMap::new(),
