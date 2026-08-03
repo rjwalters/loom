@@ -106,6 +106,14 @@ const GITIGNORE_BLOCK_HEADER: &str = "# Loom runtime state (don't commit these)"
 /// converge on this list via the new `loom-daemon update-gitignore` subcommand,
 /// which `resync-installed.sh` invokes — the block was previously refreshed only
 /// during a full `init`, so a fix here never reached repos between installs.
+///
+/// #5014: added `.loom/account-health.json` + `.loom/account-health.lock` (the
+/// per-repo token-pool health cache and its sibling `mkdir` lock, written by the
+/// daemon token pool) — Loom-owned runtime state that surfaced as untracked dirt
+/// in 0.17.0. Also re-synced the committed source `.gitignore`, whose block had
+/// drifted behind this list (was missing `.no-changes-needed` and `.loom/*.bak`).
+/// `.loom/accounts.json` is intentionally left tracked: it is an optional,
+/// committable per-repo profile allowlist, not runtime state.
 pub const EPHEMERAL_PATTERNS: &[&str] = &[
     ".loom-in-use",
     // Per-worktree builder progress checkpoint. Its WRITER moved from Python to
@@ -162,6 +170,14 @@ pub const EPHEMERAL_PATTERNS: &[&str] = &[
     // hold OAuth keys and must never be committed.
     ".loom/tokens/",
     ".loom/accounts.env",
+    // Codex/token-pool per-repo health cache + its sibling `mkdir` lock, written
+    // atomically by the daemon token pool (#5014). Machine-local runtime state
+    // that surfaced as untracked dirt in 0.17.0. Not secret-bearing (account
+    // names + reason categories only — never auth.json or child output), but
+    // still never something to commit. NB: `.loom/accounts.json` is deliberately
+    // NOT ignored — it is an optional, committable per-repo profile allowlist.
+    ".loom/account-health.json",
+    ".loom/account-health.lock",
     // Uncommitted canary confirmation sentinel (#3731). Its guardrail power comes
     // from being uncommitted, so it must never be tracked.
     ".loom/CANARY",
@@ -590,6 +606,13 @@ mod tests {
         // is born absent in every fresh worktree.
         assert!(contents.contains(".no-changes-needed"));
 
+        // #5014: the per-repo token-pool health cache + its sibling mkdir lock
+        // must be ignored so 0.17.0 runtime state never surfaces as untracked
+        // dirt. The optional, committable `.loom/accounts.json` must NOT be.
+        assert!(contents.contains(".loom/account-health.json"));
+        assert!(contents.contains(".loom/account-health.lock"));
+        assert!(!contents.contains(".loom/accounts.json"));
+
         // Retired daemon-brain patterns must NOT be emitted (Phase 3.5, #3402)
         assert!(!contents.contains(".loom/daemon-state.json"));
         assert!(!contents.contains(".loom/[0-9][0-9]-daemon-state.json"));
@@ -695,11 +718,16 @@ mod tests {
             ".loom/metrics/",
             ".loom/usage-cache.json",
             ".loom/claude-config/",
+            // #5014: per-repo token-pool health cache + its sibling mkdir lock.
+            ".loom/account-health.json",
+            ".loom/account-health.lock",
             ".loom/*.log",
             ".loom/*.sock",
             // #4401: tmp sidecars from interrupted atomic writes (e.g.
             // `.loom/manifest.json.tmp` from verify-install.sh's `generate`).
             ".loom/*.tmp",
+            // #4641/#5014: salvage/backup sidecars from torn atomic writes.
+            ".loom/*.bak",
             ".loom/logs/",
         ];
 
