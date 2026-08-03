@@ -84,6 +84,11 @@ const PUBLIC_PAGE_DISPLAY_FIELDS: Readonly<Record<string, readonly string[]>> = 
     "uptime_sec",
     "logical_cpus",
     "cpu_idle_fraction",
+    // Issue #4998: already public per `redaction.ts`'s `host.health`
+    // allowlist — this only adds it to the generic detail dump. The
+    // headline signal is `renderSaturationBadge` below; this keeps the raw
+    // number available for anyone reading the row closely.
+    "load_per_core",
   ],
 };
 
@@ -186,6 +191,70 @@ function renderFreshnessBadge(freshness: FreshnessInfo, updatedAt: string): stri
   );
 }
 
+// ---------------------------------------------------------------------------
+// Host saturation (issue #4998): a host at 3 in-flight sweeps that are each
+// fanning out into heavy per-sweep work (e.g. sim processes) can be
+// pathologically oversubscribed while the sweep count alone reads as "barely
+// busy" — the observed case was a 12x overcommit (loadavg 95 on 8 cores)
+// invisible behind "3 sweeps". `load_per_core` is the same loadavg/core
+// figure `loom-daemon status` already prints ("Host breaker: ... load/core
+// 0.23, trip at or above 2.50"), and it is already public per
+// `redaction.ts`'s `host.health` allowlist — this only adds a distinguishable
+// *rendering* of it, not a new redaction decision.
+//
+// Thresholds are single-sourced with (not reinvented from) the daemon's own
+// circuit breakers, so this page and `loom-daemon status`/`fleet` always
+// agree on what "elevated" and "critical" mean for the same host:
+//   - `HOST_BREAKER_LOAD_PER_CORE` mirrors
+//     `DEFAULT_HOST_BREAKER_LOAD_PER_CORE` (`loom-daemon/src/host_breaker.rs`)
+//     — the sustained-load threshold that trips the stateful host-distress
+//     breaker and suppresses new dispatch on that host.
+//   - `ADMISSION_BRAKE_LOAD_PER_CORE` mirrors
+//     `DEFAULT_ADMISSION_BRAKE_LOAD_PER_CORE`
+//     (`loom-daemon/src/admission_brake.rs`) — the point-in-time threshold
+//     that holds new admission on that host.
+// If either daemon-side default ever changes, update the matching constant
+// here in the same PR (there is no cross-crate/cross-package import path
+// between the Rust daemon and this Cloudflare Worker, so this is a
+// documented match rather than a shared symbol).
+const HOST_BREAKER_LOAD_PER_CORE = 2.5;
+const ADMISSION_BRAKE_LOAD_PER_CORE = 4.0;
+
+type SaturationLevel = "idle" | "elevated" | "critical" | "unknown";
+
+const SATURATION_LABEL: Readonly<Record<SaturationLevel, string>> = {
+  idle: "OK",
+  elevated: "ELEVATED",
+  critical: "CRITICAL",
+  unknown: "N/A",
+};
+
+/** Classify a `load_per_core` reading against the daemon's own thresholds.
+ * `unknown` covers both a missing field (older telemetry, or a host with no
+ * health record at all) and a non-finite value — never mis-rendered as a
+ * false "OK". `elevated` (at/above the host-breaker trip point) and
+ * `critical` (at/above the admission-brake hold point) are deliberately
+ * distinct so a host already past the harder brake threshold reads as more
+ * urgent than one merely past the breaker's. */
+export function classifySaturation(loadPerCore: unknown): SaturationLevel {
+  if (typeof loadPerCore !== "number" || !Number.isFinite(loadPerCore)) return "unknown";
+  if (loadPerCore >= ADMISSION_BRAKE_LOAD_PER_CORE) return "critical";
+  if (loadPerCore >= HOST_BREAKER_LOAD_PER_CORE) return "elevated";
+  return "idle";
+}
+
+/** The saturation badge rendered beside every host row's freshness badge —
+ * the AC's "visually distinguishable from an idle host without expanding
+ * details" signal. The exact `load_per_core` reading (when known) is always
+ * available in the badge's `title` attribute, and duplicated into the
+ * generic detail cell via `PUBLIC_PAGE_DISPLAY_FIELDS`, for anyone who wants
+ * the raw number rather than the bucket. */
+function renderSaturationBadge(loadPerCore: unknown): string {
+  const level = classifySaturation(loadPerCore);
+  const title = level === "unknown" ? "no load data reported" : `${(loadPerCore as number).toFixed(2)} load/core`;
+  return `<span class="saturation-badge saturation-badge--${level}" title="${escapeHtml(title)}">${SATURATION_LABEL[level]}</span>`;
+}
+
 function renderHostHealthRow(
   hostId: string,
   health: { record: Record<string, unknown>; updatedAt: string } | undefined,
@@ -196,6 +265,7 @@ function renderHostHealthRow(
   return `<tr class="freshness-${freshness.status}">
     <td>${escapeHtml(hostId)}</td>
     <td>${renderFreshnessBadge(freshness, health.updatedAt)}</td>
+    <td>${renderSaturationBadge(health.record.load_per_core)}</td>
     <td>${formatDetails("host.health", health.record)}</td>
   </tr>`;
 }
@@ -238,8 +308,8 @@ export function renderFleetOverview(snapshot: RedactedFleetSnapshot, now: Date =
     <h2>Fleet overview</h2>
     <h3>Hosts (${hostIds.length})${escapeHtml(freshnessSummary)}</h3>
     <table>
-      <thead><tr><th>Host</th><th>Status</th><th>Detail</th></tr></thead>
-      <tbody>${healthRows || `<tr><td colspan="3" class="muted">No host health reported yet.</td></tr>`}</tbody>
+      <thead><tr><th>Host</th><th>Status</th><th>Saturation</th><th>Detail</th></tr></thead>
+      <tbody>${healthRows || `<tr><td colspan="4" class="muted">No host health reported yet.</td></tr>`}</tbody>
     </table>
     <h3>Active sweeps (${snapshot.activeSweeps.length})</h3>
     <table>
@@ -380,6 +450,11 @@ const PAGE_STYLE = `
   .freshness-badge--stale { background: #fff1cc; color: #8a6100; }
   .freshness-badge--offline { background: #f3d4d4; color: #8a1f1f; }
   tr.freshness-stale td, tr.freshness-offline td { color: #888; }
+  .saturation-badge { display: inline-block; padding: 0.1rem 0.4rem; border-radius: 0.25rem; font-size: 0.75rem; font-weight: 600; }
+  .saturation-badge--idle { background: #e6effa; color: #22507a; }
+  .saturation-badge--elevated { background: #fff1cc; color: #8a6100; }
+  .saturation-badge--critical { background: #f3d4d4; color: #8a1f1f; }
+  .saturation-badge--unknown { background: #eee; color: #888; }
 `;
 
 /** Options for {@link renderPublicPage} distinguishing the two callers that

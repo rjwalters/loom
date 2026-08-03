@@ -1,7 +1,13 @@
 import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import worker from "../src/index";
-import { isPublicPageDisplayKind, renderFleetOverview, renderHistoryTable, renderPublicPage } from "../src/publicPage";
+import {
+  classifySaturation,
+  isPublicPageDisplayKind,
+  renderFleetOverview,
+  renderHistoryTable,
+  renderPublicPage,
+} from "../src/publicPage";
 import type { HistoryQueryResult, HistoryRecord } from "../src/query";
 import type { PublicActiveSweep, RedactedFleetSnapshot } from "../src/redaction";
 import { seedHost, sweepOutcomeEnvelope, sweepStartedEnvelope, tokensSnapshotEnvelope } from "./testHelpers";
@@ -287,6 +293,111 @@ describe("renderFleetOverview — host staleness (issue #4957)", () => {
     };
     const html = renderFleetOverview(snapshot, NOW);
     expect(html).toContain("Hosts (2): 1 live, 1 offline (host-offline, last seen 2d ago)");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Host saturation (issue #4998): a per-host `load_per_core` signal
+// distinguishable from an idle host without expanding details, with
+// thresholds matching `loom-daemon`'s `host_breaker`
+// (`DEFAULT_HOST_BREAKER_LOAD_PER_CORE = 2.5`) and `admission_brake`
+// (`DEFAULT_ADMISSION_BRAKE_LOAD_PER_CORE = 4.0`).
+// ---------------------------------------------------------------------------
+
+function snapshotWithLoadPerCore(loadPerCore: unknown): RedactedFleetSnapshot {
+  const record: Record<string, unknown> = { kind: "host.health", captured_at: "2026-08-02T12:00:00Z", uptime_sec: 100 };
+  if (loadPerCore !== undefined) record.load_per_core = loadPerCore;
+  return {
+    hosts: {
+      "host-abc": {
+        health: { record, updatedAt: "2026-08-02T12:00:00Z" },
+      },
+    },
+    activeSweeps: [],
+  };
+}
+
+describe("classifySaturation (issue #4998)", () => {
+  it("classifies a low load/core reading as idle", () => {
+    expect(classifySaturation(0.23)).toBe("idle");
+    expect(classifySaturation(1)).toBe("idle");
+  });
+
+  it("classifies exactly the host-breaker trip threshold (2.5) as elevated, not idle", () => {
+    expect(classifySaturation(2.5)).toBe("elevated");
+  });
+
+  it("classifies a value between the breaker and brake thresholds as elevated", () => {
+    expect(classifySaturation(3.2)).toBe("elevated");
+  });
+
+  it("classifies exactly the admission-brake hold threshold (4.0) as critical, not elevated", () => {
+    expect(classifySaturation(4.0)).toBe("critical");
+  });
+
+  it("classifies a value above the admission-brake threshold as critical", () => {
+    // The provenance case: loadavg 95 on 8 cores == 11.875 load/core.
+    expect(classifySaturation(11.875)).toBe("critical");
+  });
+
+  it("classifies missing, null, or non-finite load/core as unknown, never a false idle", () => {
+    expect(classifySaturation(undefined)).toBe("unknown");
+    expect(classifySaturation(null)).toBe("unknown");
+    expect(classifySaturation(Number.NaN)).toBe("unknown");
+    expect(classifySaturation(Number.POSITIVE_INFINITY)).toBe("unknown");
+    expect(classifySaturation("2.5")).toBe("unknown");
+  });
+});
+
+describe("renderFleetOverview — host saturation badge (issue #4998)", () => {
+  const NOW = new Date("2026-08-02T12:01:00Z");
+
+  it("a low load/core host renders an idle (OK) badge, distinguishable from elevated/critical", () => {
+    const html = renderFleetOverview(snapshotWithLoadPerCore(0.23), NOW);
+    expect(html).toContain("saturation-badge--idle");
+    expect(html).toContain(">OK<");
+    expect(html).not.toContain("saturation-badge--elevated");
+    expect(html).not.toContain("saturation-badge--critical");
+  });
+
+  it("a host at or above the host-breaker threshold (2.5) renders a visually distinct badge from an idle host", () => {
+    const html = renderFleetOverview(snapshotWithLoadPerCore(2.5), NOW);
+    expect(html).toContain("saturation-badge--elevated");
+    expect(html).toContain(">ELEVATED<");
+    expect(html).not.toContain("saturation-badge--idle");
+  });
+
+  it("a host at or above the admission-brake threshold (4.0) renders the critical badge", () => {
+    const html = renderFleetOverview(snapshotWithLoadPerCore(4.0), NOW);
+    expect(html).toContain("saturation-badge--critical");
+    expect(html).toContain(">CRITICAL<");
+  });
+
+  it("a heavily overcommitted host (12x on 8 cores) renders critical, not a false idle/ok", () => {
+    const html = renderFleetOverview(snapshotWithLoadPerCore(11.875), NOW);
+    expect(html).toContain("saturation-badge--critical");
+  });
+
+  it("renders the raw load/core value in the badge's title for anyone who wants the exact number", () => {
+    const html = renderFleetOverview(snapshotWithLoadPerCore(3.2), NOW);
+    expect(html).toContain('title="3.20 load/core"');
+  });
+
+  it("a host with no load_per_core at all (older telemetry) renders an explicit unknown badge, not a crash or a false idle", () => {
+    const html = renderFleetOverview(snapshotWithLoadPerCore(undefined), NOW);
+    expect(html).toContain("saturation-badge--unknown");
+    expect(html).toContain(">N/A<");
+  });
+
+  it("a host with load_per_core: null renders the same explicit unknown badge", () => {
+    const html = renderFleetOverview(snapshotWithLoadPerCore(null), NOW);
+    expect(html).toContain("saturation-badge--unknown");
+    expect(html).toContain(">N/A<");
+  });
+
+  it("the saturation badge also shows the raw load_per_core in the generic detail cell", () => {
+    const html = renderFleetOverview(snapshotWithLoadPerCore(0.23), NOW);
+    expect(html).toContain("load_per_core=0.23");
   });
 });
 
