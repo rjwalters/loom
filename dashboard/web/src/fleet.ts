@@ -81,8 +81,29 @@ export interface HostView {
 
 export interface FleetView {
   hosts: HostView[];
+  /** Hosts with a real `health`/`tokens` entry — `hosts.length` minus those
+   * known only from `activeSweeps` (`status === "unknown"`, see the module
+   * doc's "union" note). This, not `hosts.length`, is what the overview
+   * headline's "N hosts" count uses (#5101): `hosts` deliberately still
+   * includes sweep-only hosts (and their cards), so counting `hosts.length`
+   * in the headline would tell an operator the fleet has more reporting
+   * hosts than it does. Mirrors the equivalent fix in
+   * `dashboard/src/publicPage.ts`'s `renderFleetOverview` (#5078).
+   *
+   * `totalSweeps` is deliberately NOT split the same way: unlike the public
+   * page's flat table (which needed a second "unattributed sweeps" table to
+   * keep a sweep-only host's sweeps discoverable), every sweep here already
+   * renders under its own host's card — including a sweep-only host's own
+   * card — so the per-card grouping already answers "whose sweep is this",
+   * and splitting the headline number too would only add a second count to
+   * reconcile against the cards below it.
+   */
+  reportingHosts: number;
   totalSweeps: number;
-  /** Hosts in `stale` or `degraded` — the count the overview headline shows. */
+  /** Hosts in `stale` or `degraded` — the count the overview headline shows.
+   * `"unknown"` hosts are excluded here too (STATUS_ORDER treats them as
+   * their own bucket, not `stale`/`degraded`) — see the "excludes sweep-only
+   * hosts" test in `fleet.test.ts`. */
   needsAttention: number;
 }
 
@@ -268,6 +289,7 @@ export function buildFleetView(snapshot: FleetSnapshot, now: Date = new Date()):
 
   return {
     hosts,
+    reportingHosts: hosts.filter((host) => host.status !== "unknown").length,
     totalSweeps: snapshot.activeSweeps.length,
     needsAttention: hosts.filter((host) => host.status === "stale" || host.status === "degraded").length,
   };

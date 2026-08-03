@@ -41,9 +41,25 @@ describe("fleetOverviewView", () => {
 
   it("summarizes the fleet above the grid", () => {
     const summary = fleetOverviewView(view(), NOW).querySelector('[data-testid="fleet-summary"]');
-    expect(summary?.textContent).toContain("6 hosts");
+    // 5, not 6: SWEEP_ONLY_HOST_ID has no health/tokens entry — it is known
+    // only from activeSweeps (status "unknown") — so it is excluded from the
+    // headline "N hosts" count even though it still gets a card (#5101).
+    expect(summary?.textContent).toContain("5 hosts");
     expect(summary?.textContent).toContain("3 active sweeps");
     expect(summary?.textContent).toContain("2 need");
+  });
+
+  // #5101: the headline "N hosts" count must not include a host known only
+  // from activeSweeps, even though its card (and its sweeps) still render.
+  it("excludes a sweep-only host from the headline host count, but still renders its card", () => {
+    const rendered = fleetOverviewView(view(), NOW);
+    const summary = rendered.querySelector('[data-testid="fleet-summary"]');
+    expect(summary?.textContent).toContain("5 hosts");
+    expect(summary?.textContent).not.toContain("6 hosts");
+
+    const sweepOnlyCard = rendered.querySelector(`[data-host="${SWEEP_ONLY_HOST_ID}"]`);
+    expect(sweepOnlyCard).not.toBeNull();
+    expect(sweepOnlyCard?.querySelectorAll(".card__sweep")).toHaveLength(1);
   });
 
   it("shows the empty-fleet state, not an error, when no host has reported", () => {
