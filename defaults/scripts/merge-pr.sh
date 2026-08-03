@@ -1877,6 +1877,47 @@ _remove_loom_worktree() {
     in_worktree=true
     cd "$REPO_ROOT"
   fi
+  # Data-loss guard (#5031): NEVER force-remove a worktree that still holds
+  # uncommitted work. Post-merge cleanup keys the worktree only by branch name
+  # (feature/issue-<N>) — the worktree.sh naming convention makes that name
+  # collide deterministically whenever two hosts/sessions independently claim
+  # the same issue number. When a *different*, still-live builder has that
+  # branch checked out with unsaved edits, the blanket `git worktree remove
+  # --force` below would silently destroy them (observed 2026-08-03 on #5001:
+  # a live sibling session lost its in-flight, never-committed edits). The
+  # neighbouring guards check only *identity/ownership* (primary-worktree #3710,
+  # .loom-managed sentinel), never *live content*, so none of them catch this.
+  # Refuse-and-warn instead: the merge itself already succeeded, so skipping
+  # cleanup is a safe no-op for the merge while the sibling's work survives on
+  # disk to be committed/pushed. The clean common case is unaffected — a
+  # worktree that already committed+pushed the merged PR reports no changes, and
+  # Loom's own gitignored runtime markers (.loom-managed / .loom-in-use /
+  # .loom-checkpoint / .no-changes-needed / .snapshots/) are filtered out so a
+  # bare/stale checkout that surfaces them as untracked is still removed.
+  #
+  # Not to be re-conflated in triage (distinct root causes):
+  #   - #4463 (closed): same-HOST duplicate dispatch — fixed lock *ownership* so
+  #     a live sweep's lock is not stolen by a peer's reaper. That is about lock
+  #     records, not worktree/branch-name collision, and would not have caught
+  #     #5031 (the colliding worktree came from a separate host that never
+  #     touched this daemon's lock).
+  #   - #4146 (open, loom:operator-only): *measures* the cross-host collision
+  #     rate (observation only, behavior unchanged on collision by design). This
+  #     guard is the behavioral mitigation for the data-loss instance #4146 is
+  #     meant to eventually quantify.
+  local dirty
+  dirty="$(git -C "$worktree_path" status --porcelain 2>/dev/null \
+    | grep -vE '[ /]\.loom-managed$|[ /]\.loom-in-use$|[ /]\.loom-checkpoint$|[ /]\.no-changes-needed$|[ /]\.snapshots/' \
+    | grep -vE '^[[:space:]]*$' || true)"
+  if [[ -n "$dirty" ]]; then
+    local live_branch
+    live_branch="$(_worktree_branch_for "$worktree_path" 2>/dev/null || true)"
+    warning "Refusing to remove worktree at $worktree_path — it has uncommitted changes${live_branch:+ on branch '$live_branch'} (data-loss guard, #5031)."
+    warning "A different, still-live builder session likely shares this branch name (cross-host duplicate dispatch). Leaving it in place so that work is not lost."
+    warning "Remove it manually once those changes are saved/committed:"
+    echo "  git -C \"$REPO_ROOT\" worktree remove \"$worktree_path\" --force"
+    return 0
+  fi
   info "Removing worktree: $worktree_path"
   if git -C "$REPO_ROOT" worktree remove "$worktree_path" --force 2>/dev/null; then
     success "Worktree removed"
