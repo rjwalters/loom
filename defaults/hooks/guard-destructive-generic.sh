@@ -1428,9 +1428,11 @@ function unmask_ws(s) {
 # ... EOF)"`, this repo's OWN recommended idiom (see CLAUDE.md/builder role)
 # for any multi-line/special-character body text. A `>` (or `;`, `&`, `|`, or
 # a write-idiom command word like `tee`) sitting on a heredoc BODY line is
-# genuinely inert DATA -- a heredoc body is never shell-parsed for
-# redirection/separator syntax, regardless of whether its delimiter is quoted
-# -- but qsplit()/mask_gt()/mask_ws() are (like awk itself) driven one
+# inert DATA *to the OUTER shell* -- the outer shell never shell-parses a
+# heredoc body for redirection/separator syntax, regardless of whether its
+# delimiter is quoted (see KNOWN LIMITATIONS below for two narrow cases where
+# that is not the end of the story) -- but qsplit()/mask_gt()/mask_ws() are
+# (like awk itself) driven one
 # PHYSICAL LINE at a time, with no memory of the `"` opened several lines
 # earlier once a later heredoc-body line is reached, so a write-idiom-looking
 # byte on such a line was misread as real shell syntax, manufacturing a
@@ -1493,6 +1495,46 @@ function unmask_ws(s) {
 # is the accepted safe direction there) -- a real write-idiom byte OUTSIDE
 # any recognized heredoc body, even in the SAME multi-line command, is
 # completely unaffected and still flows through unchanged.
+#
+# KNOWN LIMITATIONS (#5117 -- surfaced during Judge re-review of #5085, left
+# in place deliberately rather than folded into that fix):
+#
+#   1. Interpreter-fed heredocs. "Inert to the outer shell" (above) is NOT
+#      the same as "inert, full stop." When the heredoc body IS the script
+#      handed to an interpreter -- `bash <<'EOF' ... EOF`, `cat <<'EOF'
+#      ... EOF | bash`, `sh -s <<'EOF' ... EOF` -- a write-idiom line inside
+#      that body is genuinely live code to the INNER interpreter, even
+#      though the outer shell never parses it as redirection/separator
+#      syntax. mask_heredoc_bodies() masks it anyway, so a write that
+#      `origin/main`'s single-pass scan correctly denied is ALLOWed here.
+#      DECISION (recorded, not implemented in this pass): extract_write_targets()
+#      is a command-word-based scanner, and interpreter-mediated writes are
+#      ALREADY a broad, pre-existing uncovered class on `main` independent of
+#      heredocs -- `bash -c '... > f'`, `printf ... | bash`, `dd of=f`,
+#      `install -m ... f` all ALLOW today. Closing that whole class (spotting
+#      an inner interpreter invocation and recursively re-scanning its
+#      script/stdin argument) is a materially larger, separate piece of work
+#      than this masking pass and is OUT OF SCOPE here; track it as its own
+#      follow-up rather than bolting a partial fix onto heredoc masking.
+#
+#   2. Crafted false opener whose delimiter later appears. Opener detection
+#      (heredoc_delim_at()) runs on a single physical line, before qsplit()
+#      -- it cannot know a `<<TOKEN` substring actually sits inside a quoted
+#      string on that line (e.g. `echo "test <<EOF" > /etc/passwd`). If a
+#      later line in the SAME buffer happens to equal the bare delimiter
+#      (`EOF`) for unrelated reasons, PASS 1 finds it and PASS 2 masks every
+#      line in between -- even though real bash treats the whole `<<EOF`
+#      substring as quoted text (no heredoc at all) and executes the write
+#      immediately. `origin/main` denies this; this masking pass ALLOWs it.
+#      This is explicitly NOT fixed here: doing so would require teaching
+#      heredoc_delim_at() the same quote state qsplit() tracks, and
+#      qsplit()/mask_gt()/mask_ws() are SHARED with extract_rm_targets()/
+#      parse_force_ops()/lifecycle_or_cloud_reason() -- exactly the
+#      cross-function coupling #5000 deliberately avoided by giving
+#      mask_heredoc_bodies() its own single, whole-buffer pre-pass instead of
+#      threading state through the shared per-line scanners. A structural
+#      fix belongs in its own issue, scoped against that coupling risk, not
+#      folded in here.
 # =============================================================================
 _MASKHEREDOC_AWK='
 # Return the heredoc delimiter opened by the `<<` at byte offset p in line,
