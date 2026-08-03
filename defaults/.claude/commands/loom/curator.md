@@ -398,6 +398,63 @@ The Builder's complexity-assessment path (`defaults/.claude/commands/loom/builde
 > - If the issue has no `## Affected Files` section yet, this check is a no-op for this tick — add the section in the same pass and let the next curator tick run the verification.
 > - The `loom:blocked` label is the right escape hatch: it's already in the workflow, and is removed by the user (not by Loom) once the underlying files are committed and pushed.
 
+### Running Measurement / Board-Pipeline Reproductions (worktree-or-restore, #4991)
+
+**The Curator runs in the main checkout, not a fresh worktree** (unlike the
+Builder — see "Verify against build base" above). That makes it tempting to
+"reproduce the measurement yourself" while re-baselining or enriching an
+issue — e.g. running a board's measurement/generation pipeline (`boards/*/
+generate_design.py`, a benchmark script, a fixture regenerator) to confirm a
+claim in the issue body. Many of these pipelines write their output straight
+into **tracked** paths (`boards/*/output/*.kicad_pcb`, `net_class_map.json`,
+committed fixtures, snapshot files) — a legitimate run leaves regenerated-artifact
+churn sitting uncommitted in the main checkout, which a downstream Builder or
+Champion then either carries forward or misattributes as "pre-existing drift."
+Edit/Write worktree confinement does not catch this: the writes come from a
+Bash-launched subprocess into already-tracked paths, not a novel path the
+guard hooks would flag.
+
+**Before finishing your curation pass, if you ran any measurement/board
+pipeline command in the main checkout, you MUST do one of the two:**
+
+1. **Prefer a disposable worktree.** Run the pipeline inside a scratch
+   worktree (e.g. `./.loom/scripts/worktree.sh <issue-number>`, or any
+   throwaway `git worktree`-free scratch checkout) instead of the main
+   checkout, so nothing in the primary tree ever gets dirtied. This is the
+   default choice whenever the pipeline's runtime is short enough to make a
+   worktree spin-up cheap relative to the run.
+2. **Otherwise, restore before you exit.** If you ran it directly in the main
+   checkout (e.g. because the run needed state only present there), verify
+   `git status --porcelain` is clean for every path the pipeline could have
+   touched immediately afterward, and `git checkout -- <path>` (or `git clean
+   -fd -- <path>` for untracked byproducts) any regenerated tracked-artifact
+   drift **before** you finish your session — do not leave it for the next
+   agent to notice.
+
+This mirrors the convention Judge subagents already follow unprompted:
+stating explicitly in the final report that "regenerated artifacts restored"
+(or running the whole review from an isolated worktree in the first place).
+Curators must make the same statement — do not silently exit leaving
+`git status` dirty in the main checkout.
+
+**Verification method** (so this reads as a requirement, not a suggestion): a
+Curator's final report/comment for any pass that ran a measurement/board
+pipeline must explicitly state one of:
+- `"ran in worktree <path>"`, or
+- `"confirmed git status clean after restoring <paths>"`.
+
+The absence of either statement in a future such report, alongside a dirty
+`boards/*/output/`-style diff surfacing in the next Judge/Builder session, is
+the regression signal — not a vague sense that "the docs should have covered
+this."
+
+> Note: `./.loom/scripts/check-main-clean.sh` (the sweep orchestrator's own
+> backstop for exactly this contamination) only runs between orchestrator
+> wave-dispatch steps inside `/loom:sweep` — it does **not** run for a bare
+> Champion cron tick or an interactive Curator session outside `/loom:sweep`.
+> Do not rely on it catching a contaminated main checkout; the rule above is
+> the only protection in those paths.
+
 ### Process-Improvement Issues
 
 Issues about agent behavior or workflow failures need special curation to prevent superficial fixes (e.g., adding cross-references instead of structural changes). When curating these issues:
