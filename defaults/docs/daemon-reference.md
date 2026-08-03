@@ -4166,12 +4166,24 @@ systemd Linux host it detects the `systemd --user` ownership
 unit (`systemctl --user disable --now`), so a subsequent reboot does not
 resurrect it (#4268 — see "systemd user unit (Linux)" below).
 
-**Shutdown decision — sweeps survive, they are not drained.** A clean daemon stop
-removes the Unix socket and exits, but **does not cancel in-flight `/loom:sweep`
-children**. Those are independent detached processes that survive a daemon
-restart by design — killing the dispatcher must not kill dispatched work — and
-the registry reconciles their state on the next start (`SweepRegistry::reconstruct`
-re-admits live-lock owners). To actively cancel a sweep, use
+**Shutdown decision — sweeps survive *on launchd*, they are not drained.** A clean
+daemon stop removes the Unix socket and exits, but **does not cancel in-flight
+`/loom:sweep` children**. On **launchd** those are independent detached processes
+that reparent to `pid 1` and survive a daemon restart by design — killing the
+dispatcher must not kill dispatched work — and the registry reconciles their state
+on the next start (`SweepRegistry::reconstruct` re-admits live-lock owners).
+
+> **Supervisor difference — on systemd, a plain stop/restart KILLS sweeps (#5119).**
+> Under a `systemd --user` service the sweep/role children run **inside the service's
+> cgroup**, so systemd's stop job signals them by construction when the daemon
+> exits (`KillMode=mixed` SIGKILLs the remaining cgroup processes). The "sweeps
+> survive by design" guarantee is therefore **launchd-only**; a plain
+> `loom-daemon restart` on systemd terminates in-flight sweeps and role runs. Use
+> `loom-daemon restart --drain` (below) — which empties the sweep registry before
+> exiting so the cgroup is empty when the stop job runs — to preserve them. The
+> restart primitive's ack message is supervisor-aware and states this plainly.
+
+To actively cancel a sweep, use
 `mcp__loom__cancel_sweep` against a running daemon *before* stopping it.
 
 > **Amended by #4090 (scheduled drain-and-restart).** The above describes the
@@ -4993,10 +5005,12 @@ Both make launchd re-read the plist file, which a plain `restart` never does.
 
 #### Scheduled drain-and-restart (`--drain`, #4090)
 
-A plain `loom-daemon restart` exits immediately: in-flight sweeps survive the
-process boundary but become **orphans** (absent from the relaunched daemon's
-in-memory registry — see the "sweeps survive, they are not drained" amendment
-above). `--drain` closes that gap by finishing in-flight work *before* rolling:
+A plain `loom-daemon restart` exits immediately: on launchd, in-flight sweeps
+survive the process boundary but become **orphans** (absent from the relaunched
+daemon's in-memory registry — see the "sweeps survive, they are not drained"
+amendment above); **on systemd they do not survive at all** — the stop job reaps
+the service cgroup (#5119). `--drain` closes both gaps by finishing in-flight work
+*before* rolling (and, on systemd, leaving the cgroup empty so nothing is killed):
 
 ```bash
 loom-daemon restart --drain                       # finish in-flight sweeps, then restart

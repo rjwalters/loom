@@ -101,6 +101,54 @@ pub fn detect_supervisor() -> Option<String> {
     }
 }
 
+/// Compose the "restart scheduled" ack message for a supervised relaunch, worded
+/// PER-SUPERVISOR because the two recognized supervisors treat in-flight sweep /
+/// role children FUNDAMENTALLY DIFFERENTLY when the daemon exits (#5119):
+///
+/// * **launchd** — the daemon's children reparent to `pid 1` on its exit and keep
+///   running, so in-flight sweeps GENUINELY survive the process boundary (verified
+///   repeatedly on macOS — #5081). The relaunched daemon re-adopts them from the
+///   forge/checkpoints.
+/// * **systemd** — the daemon's children run INSIDE the service's cgroup, so
+///   systemd's stop job signals them by construction the moment the main process
+///   exits. Under the unit's `KillMode=mixed` the remaining cgroup processes get a
+///   `SIGKILL`, so in-flight sweeps and role runs are TERMINATED, not preserved.
+///   The pre-#5119 message printed "In-flight sweeps survive by design" on every
+///   platform — a macOS-only truth that was actively false on systemd, where a
+///   `restart` landing on a busy host destroyed the very work it claimed to
+///   protect. The systemd wording now states plainly that in-flight work is lost
+///   and points at `--drain` (which empties the sweep registry BEFORE exiting, so
+///   the cgroup is empty when the stop job runs) as the preserving alternative.
+///
+/// Pure (no env / no I/O beyond the caller-supplied supervisor string) so both
+/// wordings are unit-testable without a live supervisor.
+pub fn restart_scheduled_message(supervisor: &str) -> String {
+    if supervisor == "launchd" {
+        // Preserved semantics: sweeps DO survive on launchd (children reparent
+        // to pid 1). Wording kept close to the historical message so operators
+        // and existing playbooks still recognize it.
+        "restart scheduled: exiting 0 for a launchd-supervised relaunch. \
+         In-flight sweeps survive by design (their child processes reparent to \
+         launchd and keep running); the relaunched daemon re-reads the same launchd \
+         plist, so it comes back with exactly its start flags."
+            .to_string()
+    } else {
+        // systemd (and any other cgroup-scoped supervisor): be HONEST that the
+        // stop job reaps the cgroup. Do NOT claim sweeps survive.
+        format!(
+            "restart scheduled: exiting 0 for a {supervisor}-supervised relaunch. \
+             WARNING: in-flight sweeps and role runs do NOT survive on {supervisor} — \
+             they run inside this service's cgroup, so the stop job terminates them \
+             (KillMode=mixed sends SIGKILL to the remaining cgroup processes) as this \
+             process exits. The relaunched daemon re-reads its {supervisor} unit's \
+             configuration, so it comes back with exactly its start flags, but any \
+             work that was mid-flight is lost. To preserve it, use \
+             `loom-daemon restart --drain`, which waits for in-flight sweeps to finish \
+             before exiting so the cgroup is empty when the stop job runs."
+        )
+    }
+}
+
 /// Decide how to answer a `RestartDaemon` request (Issue #4054): the `Response`
 /// to send back, plus whether the daemon should then end its own process (exit
 /// [`EXIT_RESTART`]) for a supervised relaunch.
@@ -112,30 +160,14 @@ pub fn detect_supervisor() -> Option<String> {
 /// supervisor to relaunch it would be strictly worse than the status quo.
 pub fn build_restart_decision() -> (Response, bool) {
     match detect_supervisor() {
-        Some(sup) => {
-            // launchd wording is preserved byte-for-byte (its start-flag source is
-            // a plist); other recognized supervisors (e.g. systemd) get a
-            // supervisor-neutral phrasing referencing their own config.
-            let relaunch_note = if sup == "launchd" {
-                "the same launchd plist, so it comes back with exactly its start flags".to_string()
-            } else {
-                format!(
-                    "its {sup} unit's configuration, so it comes back with exactly its start flags"
-                )
-            };
-            (
-                Response::DaemonRestart {
-                    scheduled: true,
-                    supervisor: Some(sup.clone()),
-                    message: format!(
-                        "restart scheduled: exiting 0 for a {sup}-supervised relaunch. \
-                         In-flight sweeps survive by design; the relaunched daemon re-reads \
-                         {relaunch_note}."
-                    ),
-                },
-                true,
-            )
-        }
+        Some(sup) => (
+            Response::DaemonRestart {
+                scheduled: true,
+                supervisor: Some(sup.clone()),
+                message: restart_scheduled_message(&sup),
+            },
+            true,
+        ),
         None => (
             Response::DaemonRestart {
                 scheduled: false,
@@ -1241,11 +1273,20 @@ async fn handle_client(
                     } => s.clone(),
                     _ => "supervisor".to_string(),
                 };
+                // #5119: log the SAME supervisor-aware sweep-survival semantics
+                // the ack message carries — sweeps survive on launchd (children
+                // reparent to pid 1) but are SIGKILLed with the cgroup on systemd.
+                let sweep_fate = if sup == "launchd" {
+                    "In-flight sweeps survive by design (children reparent to launchd)"
+                } else {
+                    "In-flight sweeps do NOT survive — the stop job reaps this service's \
+                     cgroup (use --drain to preserve them)"
+                };
                 log::warn!(
                     "RestartDaemon: supervised — exiting {EXIT_RESTART} for a {sup}-supervised \
-                     relaunch. In-flight sweeps survive by design; the relaunched daemon \
-                     re-reads the same start-up configuration (exactly its start flags). \
-                     The stale socket is reclaimed by the relaunched daemon's singleton guard."
+                     relaunch. {sweep_fate}; the relaunched daemon re-reads the same start-up \
+                     configuration (exactly its start flags). The stale socket is reclaimed by \
+                     the relaunched daemon's singleton guard."
                 );
                 std::process::exit(EXIT_RESTART);
             }
@@ -5790,10 +5831,20 @@ exit 0
             Response::DaemonRestart {
                 scheduled,
                 supervisor,
-                ..
+                message,
             } => {
                 assert!(scheduled);
                 assert_eq!(supervisor.as_deref(), Some("launchd"));
+                // #5119: on launchd, sweeps GENUINELY survive (children reparent
+                // to pid 1) — the message must still say so.
+                assert!(
+                    message.contains("survive"),
+                    "launchd restart message must state sweeps survive: {message}"
+                );
+                assert!(
+                    !message.contains("do NOT survive"),
+                    "launchd restart message must NOT claim sweeps are terminated: {message}"
+                );
             }
             other => panic!("Expected DaemonRestart, got: {other:?}"),
         }
@@ -5848,6 +5899,26 @@ exit 0
                 assert!(
                     !message.contains("launchd"),
                     "systemd restart message must not hardcode launchd wording: {message}"
+                );
+                // #5119: the systemd message must be HONEST — sweeps are reaped
+                // with the cgroup, NOT preserved. It must not print the old
+                // macOS-only "In-flight sweeps survive by design" claim, and it
+                // must point at --drain as the preserving alternative.
+                assert!(
+                    message.contains("do NOT survive"),
+                    "systemd restart message must state in-flight sweeps do NOT survive: {message}"
+                );
+                assert!(
+                    !message.contains("survive by design"),
+                    "systemd restart message must not repeat the false 'survive by design' claim: {message}"
+                );
+                assert!(
+                    message.contains("cgroup"),
+                    "systemd restart message must name the cgroup as the reason: {message}"
+                );
+                assert!(
+                    message.contains("--drain"),
+                    "systemd restart message must point at --drain to preserve sweeps: {message}"
                 );
             }
             other => panic!("Expected DaemonRestart, got: {other:?}"),
