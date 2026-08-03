@@ -104,6 +104,7 @@ test-sweep-pr-mode.sh
 test-sweep-run-registry.sh
 test-sync-labels-repo-flag.sh
 test-verify-install-scope.sh
+test-warn-operator-gated.sh
 test-warn-out-of-set-deps.sh
 test-worktree-base-override.sh
 test-worktree-concurrency.sh
