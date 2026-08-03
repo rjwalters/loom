@@ -21,6 +21,7 @@ use loom_daemon::ipc::IpcServer;
 use loom_daemon::main_health_gate;
 use loom_daemon::metrics_collector;
 use loom_daemon::observability;
+use loom_daemon::orphan_process_reaper;
 use loom_daemon::quarantine_reconciliation;
 use loom_daemon::rate_limit_breaker;
 use loom_daemon::role_collision;
@@ -1068,10 +1069,26 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // `.loom-managed` sentinel requirement the interactive CLI does not apply —
     // i.e. a strict subset of what `loom-daemon clean --safe` would remove.
     // Opt out with `LOOM_WORKTREE_REAPER=0` / `autonomous.worktreeReaper.enabled=false`.
+    //
+    // The same loop also carries the orphaned-PROCESS reaper (#5110): an agent's
+    // background process tree can outlive the agent, reparent to `systemd`, and
+    // keep working forever (one such driver held a worker at load 65 for 5h52m).
+    // Both passes answer the same question about the same worktrees — "does
+    // anything still own issue-N?" — so they share a tick. Each has its own
+    // enable knob, and either one being on is enough to start the loop.
     let worktree_reaper_config = worktree_reaper::read_worktree_reaper_config(&sweep_workspace);
-    let _worktree_reaper_handle = if worktree_reaper::resolve_enabled(&worktree_reaper_config) {
+    let process_reaper_config = orphan_process_reaper::read_config(&sweep_workspace);
+    let worktree_reaper_on = worktree_reaper::resolve_enabled(&worktree_reaper_config);
+    let process_reaper_on = orphan_process_reaper::resolve_enabled(&process_reaper_config);
+    let _worktree_reaper_handle = if worktree_reaper_on || process_reaper_on {
         let interval = worktree_reaper::resolve_interval(&worktree_reaper_config);
-        log::info!("worktree_reaper: enabled (multi-workspace, interval={}s)", interval.as_secs());
+        log::info!(
+            "worktree_reaper: enabled (multi-workspace, interval={}s, worktrees={}, \
+             orphan_processes={})",
+            interval.as_secs(),
+            worktree_reaper_on,
+            process_reaper_on
+        );
         Some(worktree_reaper::spawn_multi_worktree_reaper_task(
             sweep_workspace.clone(),
             interval,
@@ -1079,7 +1096,9 @@ pub(crate) async fn run_daemon() -> Result<()> {
     } else {
         log::debug!(
             "worktree_reaper: disabled (set LOOM_WORKTREE_REAPER=0 or \
-             autonomous.worktreeReaper.enabled=false to opt out)"
+             autonomous.worktreeReaper.enabled=false to opt out; \
+             LOOM_ORPHAN_PROCESS_REAPER=0 / autonomous.processReaper.enabled=false \
+             for the orphaned-process pass)"
         );
         None
     };

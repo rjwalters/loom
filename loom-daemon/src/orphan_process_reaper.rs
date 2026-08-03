@@ -1,890 +1,1993 @@
-//! Reap a process tree that outlived the sweep that spawned it (Issue #5110).
+//! Reap orphaned process trees that outlived the agent that started them
+//! (issue #5110).
 //!
-//! # Why this exists
+//! # The incident this exists to close
 //!
-//! [`crate::sweep_registry::reaper`]'s pgid-scoped teardown (#4980) signals a
-//! sweep's whole process **group** on cancel/crash, which reaches every
-//! descendant that stayed in that group. It does NOT reach a descendant that
-//! escaped into a fresh process group or session — which is exactly what GNU
-//! `timeout` does to its child unless invoked with `--foreground` (its own
-//! `--help` documents the distinction). A multi-level driver script
-//! (`bash run_all.sh` → `python3` → `timeout` → `ngspice`) can therefore
-//! survive a pgid-scoped kill entirely, and if the sweep that launched it
-//! already died, nothing ever asks "is anything still running for this
-//! issue?" — the process keeps consuming a whole host's CPU indefinitely
-//! (the 2026-08-03 incident this issue documents: an orphaned driver held a
-//! worker host at load 65 for 5h52m, starving that host's own dispatched
-//! sweep).
+//! `loom-worker-1` sat at **load 65 on 8 cores for 5h52m with no active Loom
+//! work**. The cause was a single agent-generated driver script
+//! (`sim/.work/cal/run_all.sh`) inside `.loom/worktrees/issue-87`: the agent
+//! that launched it had died hours earlier, the tree reparented to
+//! `systemd --user`, and the driver kept issuing fresh batches of `ngspice`
+//! simulations through its whole matrix. Killing the eight running sims did
+//! nothing — the driver launched eight more within 20 seconds. Only killing the
+//! **driver** stopped the cycle.
 //!
-//! # What this module does instead
+//! ## Why the existing teardown could not reach it
 //!
-//! Rather than trusting any recorded pgid, this asks the same "worktree
-//! ownership" question [`crate::worktree_reaper`] already asks about
-//! *directories* — "is anything still using this worktree, and does a live
-//! sweep still own it?" — but about **processes**:
+//! [`crate::sweep_registry::reaper`] signals a dead sweep's **process group**
+//! (`kill(-pgid, …)`, #4982/#4980). That reaches every descendant that stayed
+//! in the leader's group — but GNU `timeout` puts its child in a *new* process
+//! group unless `--foreground`, so the observed tree spanned **three** groups
+//! and two sessions:
 //!
-//! 1. For every `issue-<N>` worktree, find PIDs with their cwd inside it
-//!    ([`crate::worktree_ops::safety::find_processes_using_directory`] — the
-//!    same probe [`crate::worktree_ops::clean::classify_worktree`] already
-//!    uses to protect a worktree with live work from removal).
-//! 2. Skip it unless EVERY gate in [`OrphanSkip`] clears: the worktree carries
-//!    the `.loom-managed` sentinel, issue N has no live sweep claim, issue N
-//!    is closed, and its PR is not open (see "Fail-safe" on
-//!    [`reap_orphan_processes_with`]).
-//! 3. For every surviving candidate PID, walk its full descendant tree by
-//!    PID (`pgrep -P`, recursive) — **not** scoped to any process group or
-//!    session, so a tree that escaped via `setsid`/`timeout` into a fresh
-//!    pgid+sid is still fully reached — and terminate every PID found
-//!    (SIGTERM, then SIGKILL for anything still alive after a short grace).
+//! | pid | ppid | pgid | sid | comm |
+//! |---|---|---|---|---|
+//! | 2896990 | 2896986 | **2896986** | 2896986 | ngspice |
+//! | 2896986 | 2896924 | **2896986** | 2896986 | timeout |
+//! | 2896924 | 2896920 | **2896919** | 2896919 | python3 |
+//! | 2896920 | 2896919 | **2896919** | 2896919 | bash (the driver) |
+//! | 2896915 | 844 | **2896915** | 2896895 | bash (the agent's Bash call) |
 //!
-//! This is the module-level precedent [`crate::terminal`]'s
-//! `collect_descendants`/`kill_process_tree` already established for tmux
-//! pane teardown — generalized here to a bare PID input/output so it is
-//! reusable outside tmux, and logged so an operator can see what was killed
-//! (this issue's AC).
+//! A pgid-scoped kill reaps *one* of those groups. And once the sweep leader is
+//! gone its descendants have reparented, so there is no parent link left to
+//! walk from either. The only durable link between a runaway process and the
+//! work it belongs to is the **worktree it is running in** — which is what this
+//! module keys on.
+//!
+//! # What this pass does
+//!
+//! Every worktree-reaper tick (default 15 min, see [`crate::worktree_reaper`]):
+//!
+//! 1. Enumerate `issue-<N>` worktrees and keep only those that are
+//!    **provably unowned** (see "Fail-safes" below).
+//! 2. Snapshot `/proc` once and attribute processes to a worktree by **cwd
+//!    inside it** or **argv referencing it** (the `ngspice -b …/issue-87/sim/…`
+//!    case, whose cwd had already moved on).
+//! 3. Expand each attributed seed to its **whole descendant tree** through the
+//!    ppid map — transitively, and across process-group/session boundaries,
+//!    because the ppid link survives `setpgid`/`setsid` where the pgid does not.
+//! 4. Terminate the tree **freeze-first**: `SIGSTOP` parent-first (so a looping
+//!    driver cannot issue another batch while we work), re-snapshot to catch
+//!    anything forked between the scan and the freeze, then `SIGTERM` +
+//!    `SIGCONT`, and `SIGKILL` only the survivors after a grace period.
+//! 5. Log every pid it killed, with its age and argv.
+//!
+//! # Fail-safes (a live sweep's work must never be touched)
+//!
+//! A worktree's processes are candidates only when **all** of these hold:
+//!
+//! - the worktree carries the **`.loom-managed` sentinel**
+//!   ([`clean::is_loom_managed`]) — user-provisioned worktrees are never touched,
+//!   the same gate [`crate::worktree_reaper`] applies to directory removal;
+//! - there is **no `.loom-in-use` marker** in the worktree;
+//! - the issue has **no live spawn-loop task or claim-lock**
+//!   ([`crate::worktree_ops::liveness::active_spawn_loop_issues`]);
+//! - [`crate::live_claim::probe`] finds **no confirmed-live sweep claim** — a
+//!   live claim lock, a live machine-level journal record, or a live
+//!   `/loom:sweep <N>` process. This is re-checked immediately before each kill,
+//!   so a sweep that starts mid-pass is still protected;
+//! - **no live agent runtime is working inside the worktree**
+//!   ([`looks_like_agent`]) — the incident's defining property is that the agent
+//!   was *gone*, so a live `claude`/`codex`/`/loom:…` process in the worktree
+//!   owns it even when no claim names its issue (PR-set sweeps claim no issue;
+//!   a manually driven agent takes no spawn-loop claim);
+//! - the seed process is **older than the minimum age** (default 30 min), so a
+//!   just-launched helper racing its own claim registration is never a target;
+//! - the tree contains **neither this daemon, nor any of its ancestors, nor any
+//!   of its descendants** — the daemon's own children are the sweep registry's
+//!   business, and killing our own ancestry is catastrophic.
+//!
+//! Every ambiguity resolves to *skip*: an unreadable `/proc` entry, an unknown
+//! process age, a `/proc`-less platform. Under-reaping is recoverable on the
+//! next tick; a false-positive kill is not.
+//!
+//! # Default-on
+//!
+//! Like the worktree reaper it rides along with, this is **default-on**: the
+//! failure it prevents is a silent multi-hour loss of a whole host, and the
+//! gates above are strictly narrower than the ones already trusted to *delete*
+//! worktrees. Opt out with `LOOM_ORPHAN_PROCESS_REAPER=0` or
+//! `autonomous.processReaper.enabled=false`; observe without killing with
+//! `autonomous.processReaper.dryRun=true`.
 
-use std::collections::HashSet;
-use std::path::Path;
-use std::process::Command;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
-
-use crate::worktree_ops::clean::{
-    check_grace_period, is_loom_managed, PrStatus, DEFAULT_GRACE_PERIOD_SECS,
-};
-use crate::worktree_ops::liveness::active_spawn_loop_issues;
-use crate::worktree_ops::naming::issue_from_worktree;
-use crate::worktree_ops::safety::find_processes_using_directory;
-
-/// Grace between SIGTERM and SIGKILL escalation for a reaped orphan tree.
-/// Short — unlike the crash-path group reap (#4980, deferred to a later
-/// reaper tick to avoid blocking the registry mutex), this pass runs on its
-/// own `spawn_blocking` task (mirroring [`crate::worktree_reaper::reap_repo`])
-/// so a brief inline sleep is fine.
-pub const ORPHAN_PROCESS_REAP_GRACE: Duration = Duration::from_secs(3);
+use crate::worktree_ops::clean;
 
 // ============================================================================
-// Process-tree primitives (generalizes `terminal.rs`'s tmux-only
-// `collect_descendants` / `kill_process_tree` to a bare PID)
+// Constants
 // ============================================================================
 
-/// Whether `pid` is still alive, via `kill -0` (portable across macOS/Linux,
-/// matching the shell-based approach the rest of this module and
-/// `terminal.rs::kill_process_tree` already use).
-#[must_use]
-pub fn is_pid_alive(pid: u32) -> bool {
-    Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .output()
-        .is_ok_and(|o| o.status.success())
-}
+/// Master on/off env override. Default-on (see module docs): set to
+/// `0`/`false`/`no`/`off` to disable, `1`/`true`/`yes`/`on` to force-enable
+/// even when config disables it.
+pub const ORPHAN_PROCESS_REAPER_ENABLE_ENV: &str = "LOOM_ORPHAN_PROCESS_REAPER";
 
-/// Recursively collect every descendant PID of `pid` (depth-first,
-/// grandchildren before children), via repeated `pgrep -P`.
+/// Env override for the minimum seed-process age (seconds).
+pub const ORPHAN_PROCESS_REAPER_MIN_AGE_ENV: &str = "LOOM_ORPHAN_PROCESS_REAPER_MIN_AGE_SECS";
+
+/// Env override for dry-run mode (detect + log, never signal).
+pub const ORPHAN_PROCESS_REAPER_DRY_RUN_ENV: &str = "LOOM_ORPHAN_PROCESS_REAPER_DRY_RUN";
+
+/// Default minimum age a *seed* process must have before it can be reaped
+/// (30 minutes).
 ///
-/// Deliberately **not** scoped to any process group or session — that is the
-/// entire point (#5110): a tree that called `setsid`/was launched by
-/// `timeout` into a fresh pgid+sid is still walked correctly, because this
-/// follows the OS parent/child (`ppid`) relationship, which nothing in
-/// between can escape short of re-parenting to init.
-#[must_use]
-pub fn collect_descendant_pids(pid: u32) -> Vec<u32> {
-    let mut pids = Vec::new();
-    collect_descendant_pids_into(pid, &mut pids);
-    pids
-}
+/// This is the single knob standing between "reap a runaway" and "kill an
+/// operator's interactive `cargo test` in a worktree whose sweep already
+/// finished". Thirty minutes is well past any plausible short-lived helper and
+/// still two orders of magnitude below the 5h52m incident. Descendants of a
+/// qualifying seed are *not* age-gated — a driver's freshly-spawned batch is
+/// exactly what must die with it.
+pub const DEFAULT_MIN_ORPHAN_AGE_SECS: u64 = 1800;
 
-fn collect_descendant_pids_into(pid: u32, out: &mut Vec<u32>) {
-    let Ok(output) = Command::new("pgrep")
-        .args(["-P", &pid.to_string()])
-        .output()
-    else {
-        return;
-    };
-    if !output.status.success() {
-        return;
-    }
-    let children: Vec<u32> = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|l| l.trim().parse().ok())
-        .collect();
-    for child in children {
-        collect_descendant_pids_into(child, out);
-        out.push(child);
-    }
-}
+/// Grace between the tree `SIGTERM` and the `SIGKILL` escalation.
+pub const DEFAULT_TERM_GRACE: Duration = Duration::from_secs(5);
 
-/// SIGTERM every pid in `pids`, then SIGKILL any survivor after `grace`.
+/// Cap on how many pids one tree may contain before the pass refuses to act.
 ///
-/// Best-effort throughout: a pid that has already exited between discovery
-/// and signal delivery is simply not reported as signaled (never an error —
-/// "already gone" is the goal, not a failure). Returns the pids that were
-/// actually signaled at least once.
-pub fn kill_pids(pids: &[u32], grace: Duration) -> Vec<u32> {
-    let mut signaled = Vec::new();
-    for &pid in pids {
-        if Command::new("kill")
-            .args(["-15", &pid.to_string()])
-            .output()
-            .is_ok_and(|o| o.status.success())
-        {
-            signaled.push(pid);
-        }
-    }
-    if signaled.is_empty() {
-        return signaled;
-    }
-    std::thread::sleep(grace);
-    for &pid in &signaled {
-        if is_pid_alive(pid) {
-            let _ = Command::new("kill").args(["-9", &pid.to_string()]).output();
-        }
-    }
-    signaled
-}
+/// A blast radius this large means the attribution is wrong (or a worktree path
+/// is absurdly generic), and an unattended killer must fail closed rather than
+/// take down a host it misread.
+pub const MAX_TREE_PIDS: usize = 512;
 
 // ============================================================================
-// The reap pass
+// Config (.loom/config.json → autonomous.processReaper)
 // ============================================================================
 
-/// One worktree's orphan-process outcome.
+/// The subset of `.loom/config.json → autonomous.processReaper` this module
+/// consumes. Every field is `Option` so an absent key falls through to the
+/// env-var / built-in-default resolution — precedence **env > config >
+/// default**, matching every other `autonomous.*` surface.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct OrphanReapEntry {
-    /// The issue number the worktree belongs to.
-    pub issue: u32,
-    /// PIDs found with cwd inside the worktree — the roots of each tree walked.
-    pub root_pids: Vec<u32>,
-    /// Every PID (roots + transitive descendants) that was signaled.
-    pub killed_pids: Vec<u32>,
+pub struct OrphanProcessReaperConfig {
+    /// `autonomous.processReaper.enabled` (default **true**).
+    pub enabled: Option<bool>,
+    /// `autonomous.processReaper.minAgeSecs` — how old a seed process must be.
+    pub min_age_secs: Option<u64>,
+    /// `autonomous.processReaper.dryRun` — detect and log, never signal.
+    pub dry_run: Option<bool>,
 }
 
-/// Why a fail-safe gate preserved a worktree's live processes.
+/// Read `.loom/config.json → autonomous.processReaper`, soft-failing every
+/// field to `None` (env/default resolution) on a missing file, malformed JSON,
+/// or a missing `autonomous` / `processReaper` block.
+#[must_use]
+pub fn read_config(repo_root: &Path) -> OrphanProcessReaperConfig {
+    let effective = crate::config_resolver::resolve_effective_config(repo_root);
+    let Some(block) = crate::config_resolver::get_path(&effective, "autonomous.processReaper")
+    else {
+        return OrphanProcessReaperConfig::default();
+    };
+
+    OrphanProcessReaperConfig {
+        enabled: block.get("enabled").and_then(serde_json::Value::as_bool),
+        min_age_secs: block
+            .get("minAgeSecs")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|&s| s > 0),
+        dry_run: block.get("dryRun").and_then(serde_json::Value::as_bool),
+    }
+}
+
+/// Resolve whether the pass runs — precedence **env > config > default(true)**.
+#[must_use]
+pub fn resolve_enabled(config: &OrphanProcessReaperConfig) -> bool {
+    if let Ok(v) = std::env::var(ORPHAN_PROCESS_REAPER_ENABLE_ENV) {
+        return matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
+    }
+    config.enabled.unwrap_or(true)
+}
+
+/// Resolve the minimum seed age — precedence **env > config > default**. A zero
+/// or unparseable env value falls through rather than disabling the age gate.
+#[must_use]
+pub fn resolve_min_age_secs(config: &OrphanProcessReaperConfig) -> u64 {
+    std::env::var(ORPHAN_PROCESS_REAPER_MIN_AGE_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .or(config.min_age_secs)
+        .unwrap_or(DEFAULT_MIN_ORPHAN_AGE_SECS)
+}
+
+/// Resolve dry-run mode — precedence **env > config > default(false)**.
+#[must_use]
+pub fn resolve_dry_run(config: &OrphanProcessReaperConfig) -> bool {
+    if let Ok(v) = std::env::var(ORPHAN_PROCESS_REAPER_DRY_RUN_ENV) {
+        return matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
+    }
+    config.dry_run.unwrap_or(false)
+}
+
+// ============================================================================
+// Process-table snapshot
+// ============================================================================
+
+/// One process, as much of it as this pass needs.
 ///
-/// Every variant is a *refusal to kill*: this pass reports "I found running
-/// processes and deliberately left them alone", which is the only way an
-/// operator can tell a quiet tick apart from a tick that nearly killed a
-/// reviewer's build.
+/// Built from `/proc` on Linux; every field that cannot be read resolves to
+/// `None`/empty rather than failing the scan (a process can exit mid-walk).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OrphanSkip {
-    /// No `.loom-managed` sentinel — user-provisioned, never touched.
-    Unmanaged,
-    /// A daemon-dispatched sweep holds a claim-lock / spawn-loop entry.
-    LiveSweepClaim,
-    /// The issue is not `CLOSED` (payload: the observed state, e.g. `OPEN` /
-    /// `UNKNOWN`) — work on it may legitimately still be in flight.
-    IssueNotClosed(String),
-    /// The issue's PR is still open — it is still under review/revision.
-    PrOpen,
-    /// The forge PR probe failed; "unknown" is never license to kill.
-    PrStatusUnknown,
-    /// The PR merged, but the post-merge grace period has not elapsed
-    /// (payload: seconds remaining) — the merging agent may still be
-    /// finishing up inside the worktree.
-    MergeGrace(i64),
+pub struct ProcEntry {
+    /// Process id.
+    pub pid: u32,
+    /// Parent process id — the link that survives `setpgid`/`setsid` and makes
+    /// transitive reaping possible.
+    pub ppid: u32,
+    /// Current working directory, when readable.
+    pub cwd: Option<PathBuf>,
+    /// argv joined by single spaces (`\0` separators replaced).
+    pub cmdline: String,
+    /// Seconds since the process started, when derivable.
+    pub age_secs: Option<u64>,
 }
 
-impl OrphanSkip {
-    /// Human-readable reason, for the daemon log and the report.
+impl ProcEntry {
+    /// A compact `pid=… age=… cmd=…` description for the kill log.
     #[must_use]
-    pub fn reason(&self) -> String {
-        match self {
-            Self::Unmanaged => "no .loom-managed sentinel (user-provisioned)".to_string(),
-            Self::LiveSweepClaim => "live spawn-loop task or claim-lock".to_string(),
-            Self::IssueNotClosed(state) => format!("issue is {state}"),
-            Self::PrOpen => "PR still open".to_string(),
-            Self::PrStatusUnknown => "PR status unknown".to_string(),
-            Self::MergeGrace(remaining) => {
-                format!("grace period not passed ({remaining}s remaining)")
+    pub fn describe(&self) -> String {
+        let age = self
+            .age_secs
+            .map_or_else(|| "?".to_string(), |a| format!("{a}s"));
+        let mut cmd: String = self.cmdline.trim().to_string();
+        if cmd.is_empty() {
+            cmd = "<unknown>".to_string();
+        }
+        if cmd.len() > 160 {
+            cmd.truncate(157);
+            cmd.push_str("...");
+        }
+        format!("pid={} ppid={} age={age} cmd={cmd}", self.pid, self.ppid)
+    }
+}
+
+/// Parse the `ppid` and `starttime` (clock ticks since boot) out of a
+/// `/proc/<pid>/stat` line.
+///
+/// `comm` may contain spaces *and* parentheses, so the only safe split point is
+/// the **last** `)` — the same trick [`crate::live_claim`]'s zombie probe uses.
+/// After it, fields are `state ppid pgrp session …`, so `ppid` is index 1 and
+/// `starttime` (overall field 22) is index 19.
+#[must_use]
+pub fn parse_stat(stat: &str) -> Option<(u32, u64)> {
+    let after_comm = stat.rfind(')').map(|i| &stat[i + 1..])?;
+    let fields: Vec<&str> = after_comm.split_whitespace().collect();
+    let ppid = fields.get(1)?.parse::<u32>().ok()?;
+    let starttime = fields.get(19)?.parse::<u64>().ok()?;
+    Some((ppid, starttime))
+}
+
+/// Seconds since boot, from `/proc/uptime`'s first field.
+#[cfg(target_os = "linux")]
+fn uptime_secs() -> Option<f64> {
+    let raw = std::fs::read_to_string("/proc/uptime").ok()?;
+    raw.split_whitespace().next()?.parse::<f64>().ok()
+}
+
+/// `sysconf(_SC_CLK_TCK)` — the `starttime` unit. Falls back to the near-universal
+/// Linux value of 100 if the query fails.
+#[cfg(target_os = "linux")]
+fn clock_ticks_per_sec() -> f64 {
+    // SAFETY: `sysconf` is a read-only query with no memory arguments.
+    let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if ticks > 0 {
+        ticks as f64
+    } else {
+        100.0
+    }
+}
+
+/// Snapshot every process this host will admit to (Linux: one `/proc` walk).
+///
+/// Unreadable entries are skipped, never guessed at. On non-Linux hosts this
+/// returns an empty snapshot, which makes the whole pass a no-op — the
+/// attribution needs `cwd` + `argv` + `ppid` for *every* process, and there is
+/// no cheap portable equivalent (the same stance [`crate::live_claim`]'s leg 3
+/// takes).
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn snapshot_processes() -> Vec<ProcEntry> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let uptime = uptime_secs();
+    let hz = clock_ticks_per_sec();
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let dir = entry.path();
+        let Ok(stat) = std::fs::read_to_string(dir.join("stat")) else {
+            continue;
+        };
+        let Some((ppid, starttime)) = parse_stat(&stat) else {
+            continue;
+        };
+        let age_secs = uptime.and_then(|up| {
+            let started = starttime as f64 / hz;
+            let age = up - started;
+            (age >= 0.0).then_some(age as u64)
+        });
+        let cwd = std::fs::read_link(dir.join("cwd")).ok();
+        let cmdline = std::fs::read(dir.join("cmdline"))
+            .map(|raw| String::from_utf8_lossy(&raw).replace('\0', " "))
+            .unwrap_or_default();
+        out.push(ProcEntry {
+            pid,
+            ppid,
+            cwd,
+            cmdline,
+            age_secs,
+        });
+    }
+    out
+}
+
+#[cfg(not(target_os = "linux"))]
+#[must_use]
+pub fn snapshot_processes() -> Vec<ProcEntry> {
+    Vec::new()
+}
+
+// ============================================================================
+// Attribution: which worktree is a process working in?
+// ============================================================================
+
+/// Whether `cmdline` references `path` as a path (not as a prefix of a longer
+/// name).
+///
+/// The boundary check is load-bearing: worktree paths end in `issue-<N>`, so a
+/// naive `contains` would attribute `…/issue-870`'s processes to issue 87. A
+/// match must be followed by end-of-string, `/`, or a character that cannot
+/// continue a path segment.
+#[must_use]
+pub fn cmdline_references_path(cmdline: &str, path: &Path) -> bool {
+    let needle = path.to_string_lossy();
+    if needle.is_empty() || needle == "/" {
+        return false;
+    }
+    let mut from = 0usize;
+    while let Some(idx) = cmdline[from..].find(needle.as_ref()) {
+        let end = from + idx + needle.len();
+        let next = cmdline[end..].chars().next();
+        let is_boundary = match next {
+            None => true,
+            Some(c) => !(c.is_alphanumeric() || c == '-' || c == '_' || c == '.'),
+        };
+        if is_boundary {
+            return true;
+        }
+        from = from + idx + 1;
+    }
+    false
+}
+
+/// Whether `entry` is working inside `worktree` — cwd inside it, or argv
+/// referencing it.
+///
+/// Both legs are needed. The incident's `ngspice` processes had a cwd outside
+/// the worktree and named it only in argv (`-b …/issue-87/sim/records/…`),
+/// while the driver script had the cwd but a bare relative argv.
+#[must_use]
+pub fn references_worktree(entry: &ProcEntry, worktree: &Path) -> bool {
+    if let Some(cwd) = &entry.cwd {
+        if cwd.starts_with(worktree) {
+            return true;
+        }
+    }
+    cmdline_references_path(&entry.cmdline, worktree)
+}
+
+/// Whether a command line belongs to an **agent runtime** rather than to the
+/// work an agent left behind.
+///
+/// The defining property of the #5110 incident is that *the agent was gone* —
+/// only its detached work kept running. So the presence of a live agent inside
+/// a worktree is itself proof that something still owns it, whatever the forge
+/// bookkeeping says. This catches the cases the claim probes structurally
+/// cannot:
+///
+/// - **PR-set mode** (`/loom:sweep --prs 456`) claims no issue at all, so no
+///   claim lock or journal entry names the worktree's issue;
+/// - a **manually driven** agent (`/loom:builder` in a MOM terminal) that never
+///   took a spawn-loop claim;
+/// - a sweep for a *different* issue that is legitimately working in this
+///   worktree.
+///
+/// Deliberately narrow: an `argv[0]` whose basename is a known runtime
+/// (`claude`, `codex`), or any argv naming a `/loom:` slash command. It must
+/// not match the incident's own tree, whose driver was a bare `bash` running a
+/// scratch script (its argv mentions `~/.claude/shell-snapshots/…`, which is
+/// why the runtime check is basename-anchored rather than a substring search).
+#[must_use]
+pub fn looks_like_agent(cmdline: &str) -> bool {
+    let mut tokens = cmdline.split_whitespace();
+    if let Some(argv0) = tokens.next() {
+        let base = Path::new(argv0)
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if matches!(base.as_str(), "claude" | "codex") {
+            return true;
+        }
+    }
+    cmdline.contains("/loom:")
+}
+
+// ============================================================================
+// Process-tree algebra
+// ============================================================================
+
+/// `ppid -> [child pid]`, from a snapshot.
+#[must_use]
+pub fn children_map(procs: &[ProcEntry]) -> HashMap<u32, Vec<u32>> {
+    let mut map: HashMap<u32, Vec<u32>> = HashMap::new();
+    for p in procs {
+        map.entry(p.ppid).or_default().push(p.pid);
+    }
+    for kids in map.values_mut() {
+        kids.sort_unstable();
+    }
+    map
+}
+
+/// `pid -> ppid`, from a snapshot.
+#[must_use]
+pub fn parent_map(procs: &[ProcEntry]) -> HashMap<u32, u32> {
+    procs.iter().map(|p| (p.pid, p.ppid)).collect()
+}
+
+/// Every transitive descendant of `seeds` (the seeds themselves excluded).
+///
+/// Breadth-first with a visited set, so a `/proc` snapshot that is internally
+/// inconsistent (a pid recycled mid-walk producing a ppid cycle) terminates
+/// instead of looping forever.
+#[must_use]
+pub fn descendants_of(seeds: &[u32], children: &HashMap<u32, Vec<u32>>) -> Vec<u32> {
+    let mut seen: HashSet<u32> = seeds.iter().copied().collect();
+    let mut queue: Vec<u32> = seeds.to_vec();
+    let mut out = Vec::new();
+    while let Some(pid) = queue.pop() {
+        let Some(kids) = children.get(&pid) else {
+            continue;
+        };
+        for &kid in kids {
+            if kid == pid || !seen.insert(kid) {
+                continue;
+            }
+            out.push(kid);
+            queue.push(kid);
+        }
+    }
+    out.sort_unstable();
+    out
+}
+
+/// Every ancestor of `pid` (the pid itself excluded), walking `parents`.
+///
+/// Bounded and cycle-safe for the same reason [`descendants_of`] is.
+#[must_use]
+pub fn ancestors_of(pid: u32, parents: &HashMap<u32, u32>) -> HashSet<u32> {
+    let mut out = HashSet::new();
+    let mut cursor = pid;
+    while let Some(&parent) = parents.get(&cursor) {
+        if parent == 0 || !out.insert(parent) {
+            break;
+        }
+        cursor = parent;
+    }
+    out
+}
+
+/// Order `pids` parent-first: a process is signalled before its children, so a
+/// looping driver is frozen before the batch it would otherwise re-spawn.
+///
+/// Depth is measured *within the set* (how many of a pid's ancestors are also
+/// being reaped), with pid as a stable tiebreak.
+#[must_use]
+pub fn order_parent_first(pids: &HashSet<u32>, parents: &HashMap<u32, u32>) -> Vec<u32> {
+    let mut with_depth: Vec<(usize, u32)> = pids
+        .iter()
+        .map(|&pid| {
+            let mut depth = 0usize;
+            let mut cursor = pid;
+            let mut seen = HashSet::new();
+            while let Some(&parent) = parents.get(&cursor) {
+                if parent == 0 || !seen.insert(parent) {
+                    break;
+                }
+                if pids.contains(&parent) {
+                    depth += 1;
+                }
+                cursor = parent;
+            }
+            (depth, pid)
+        })
+        .collect();
+    with_depth.sort_unstable();
+    with_depth.into_iter().map(|(_, pid)| pid).collect()
+}
+
+// ============================================================================
+// Planning
+// ============================================================================
+
+/// One orphaned process tree, ready to be reaped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrphanTree {
+    /// The issue whose worktree the tree is working in.
+    pub issue: u32,
+    /// That worktree's path.
+    pub worktree: PathBuf,
+    /// Processes attributed to the worktree directly (cwd/argv).
+    pub seeds: Vec<u32>,
+    /// Seeds **plus** every transitive descendant, parent-first.
+    pub pids: Vec<u32>,
+    /// `pid → description` for the kill log, in `pids` order.
+    pub details: Vec<String>,
+}
+
+/// What one planning pass found.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlanOutcome {
+    /// Trees eligible for reaping.
+    pub trees: Vec<OrphanTree>,
+    /// Worktrees whose processes were deliberately left alone, with the reason.
+    pub skipped: Vec<(u32, String)>,
+}
+
+/// Build the reap plan for `worktrees` (already vetted as unowned by the
+/// caller) against a `/proc` snapshot.
+///
+/// Pure: no signals, no filesystem, no clock. This is where every
+/// process-level fail-safe lives, so it is exhaustively unit-testable.
+#[must_use]
+pub fn plan_orphan_trees(
+    procs: &[ProcEntry],
+    worktrees: &[(u32, PathBuf)],
+    self_pid: u32,
+    min_age_secs: u64,
+) -> PlanOutcome {
+    let mut outcome = PlanOutcome::default();
+    if procs.is_empty() || worktrees.is_empty() {
+        return outcome;
+    }
+
+    let children = children_map(procs);
+    let parents = parent_map(procs);
+    let by_pid: HashMap<u32, &ProcEntry> = procs.iter().map(|p| (p.pid, p)).collect();
+
+    // Never signal ourselves, our ancestry, or our own children: the daemon's
+    // children belong to the sweep registry, and our ancestry includes the
+    // service manager that started us.
+    let mut protected: HashSet<u32> = HashSet::from([0, 1, self_pid]);
+    protected.extend(ancestors_of(self_pid, &parents));
+    protected.extend(descendants_of(&[self_pid], &children));
+
+    for (issue, worktree) in worktrees {
+        let attributed: Vec<&ProcEntry> = procs
+            .iter()
+            .filter(|p| !protected.contains(&p.pid) && references_worktree(p, worktree))
+            .collect();
+
+        // A live agent runtime inside the worktree owns it, whatever the forge
+        // bookkeeping says (PR-set sweeps claim no issue; a manually driven
+        // agent takes no spawn-loop claim). The incident's defining property is
+        // that the agent was GONE — so its presence is a hard stop.
+        if let Some(agent) = attributed.iter().find(|p| looks_like_agent(&p.cmdline)) {
+            outcome.skipped.push((
+                *issue,
+                format!("an agent runtime is working in this worktree ({})", agent.describe()),
+            ));
+            continue;
+        }
+
+        // An unknown age is treated as "too young" — never guessed at.
+        let mut seeds: Vec<u32> = attributed
+            .iter()
+            .filter(|p| p.age_secs.is_some_and(|age| age >= min_age_secs))
+            .map(|p| p.pid)
+            .collect();
+        if seeds.is_empty() {
+            continue;
+        }
+        seeds.sort_unstable();
+
+        let mut pids: HashSet<u32> = seeds.iter().copied().collect();
+        pids.extend(descendants_of(&seeds, &children));
+
+        // A tree that has swallowed the daemon (or its ancestry) means the
+        // attribution is wrong — refuse the whole tree rather than part of it.
+        if let Some(hit) = pids.iter().find(|p| protected.contains(p)) {
+            outcome.skipped.push((
+                *issue,
+                format!(
+                    "refusing: the attributed tree contains protected pid {hit} \
+                     (this daemon, its ancestry, or its own children)"
+                ),
+            ));
+            continue;
+        }
+        if pids.len() > MAX_TREE_PIDS {
+            outcome.skipped.push((
+                *issue,
+                format!(
+                    "refusing: attributed tree of {} processes exceeds the {MAX_TREE_PIDS}-pid \
+                     safety cap",
+                    pids.len()
+                ),
+            ));
+            continue;
+        }
+
+        let ordered = order_parent_first(&pids, &parents);
+        let details = ordered
+            .iter()
+            .map(|pid| {
+                by_pid
+                    .get(pid)
+                    .map_or_else(|| format!("pid={pid} (gone)"), |p| p.describe())
+            })
+            .collect();
+
+        outcome.trees.push(OrphanTree {
+            issue: *issue,
+            worktree: worktree.clone(),
+            seeds,
+            pids: ordered,
+            details,
+        });
+    }
+
+    outcome
+}
+
+// ============================================================================
+// Execution
+// ============================================================================
+
+/// Injected side effects, so the whole kill sequence is testable with recorded
+/// signals and a scripted process table.
+pub struct ReapHooks<'a> {
+    /// Send `sig` to `pid`; `true` when the signal was delivered.
+    pub signal: &'a dyn Fn(u32, i32) -> bool,
+    /// A fresh process-table snapshot (used once, after the freeze).
+    pub snapshot: &'a dyn Fn() -> Vec<ProcEntry>,
+    /// Whether a pid is still alive.
+    pub is_alive: &'a dyn Fn(u32) -> bool,
+    /// Sleep (the `SIGTERM` → `SIGKILL` grace).
+    pub sleep: &'a dyn Fn(Duration),
+}
+
+/// What reaping one tree actually did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TreeReapOutcome {
+    /// The issue whose worktree the tree belonged to.
+    pub issue: u32,
+    /// Pids frozen with `SIGSTOP` (including late arrivals found after the
+    /// freeze).
+    pub frozen: Vec<u32>,
+    /// Pids that forked *after* the initial scan and were caught by the
+    /// post-freeze re-snapshot.
+    pub late_arrivals: Vec<u32>,
+    /// Pids that accepted `SIGTERM`.
+    pub terminated: Vec<u32>,
+    /// Pids that needed `SIGKILL`.
+    pub killed: Vec<u32>,
+    /// Pids still alive after the escalation (a signal we are not permitted to
+    /// send, or an uninterruptible state).
+    pub survivors: Vec<u32>,
+}
+
+/// Terminate one orphaned tree, freeze-first.
+///
+/// The ordering is the whole point (issue #5110: "killing leaves is useless
+/// when a driver is looping"):
+///
+/// 1. **`SIGSTOP`, parent-first** — the driver stops before its children, so it
+///    cannot issue another batch while we are working. `SIGSTOP` cannot be
+///    caught or ignored.
+/// 2. **Re-snapshot** and freeze anything that forked between the scan and the
+///    freeze, so a batch launched in that window does not escape.
+/// 3. **`SIGTERM` then `SIGCONT`** — a stopped process only *receives* the
+///    pending `SIGTERM` once continued, so the graceful signal is genuinely
+///    graceful rather than a no-op.
+/// 4. **`SIGKILL` the survivors** after `grace`.
+pub fn reap_tree(tree: &OrphanTree, grace: Duration, hooks: &ReapHooks<'_>) -> TreeReapOutcome {
+    let mut outcome = TreeReapOutcome {
+        issue: tree.issue,
+        ..TreeReapOutcome::default()
+    };
+
+    // 1. Freeze, parent-first.
+    for &pid in &tree.pids {
+        if (hooks.signal)(pid, libc::SIGSTOP) {
+            outcome.frozen.push(pid);
+        }
+    }
+
+    // 2. Catch anything forked between the scan and the freeze.
+    let fresh = (hooks.snapshot)();
+    if !fresh.is_empty() {
+        let children = children_map(&fresh);
+        let known: HashSet<u32> = tree.pids.iter().copied().collect();
+        for pid in descendants_of(&tree.pids, &children) {
+            if known.contains(&pid) {
+                continue;
+            }
+            outcome.late_arrivals.push(pid);
+            if (hooks.signal)(pid, libc::SIGSTOP) {
+                outcome.frozen.push(pid);
             }
         }
     }
+
+    let mut all: Vec<u32> = tree.pids.clone();
+    all.extend(outcome.late_arrivals.iter().copied());
+
+    // 3. Graceful stop: SIGTERM (queued while stopped), then SIGCONT so it is
+    //    actually delivered.
+    for &pid in &all {
+        if (hooks.signal)(pid, libc::SIGTERM) {
+            outcome.terminated.push(pid);
+        }
+    }
+    for &pid in &all {
+        let _ = (hooks.signal)(pid, libc::SIGCONT);
+    }
+
+    (hooks.sleep)(grace);
+
+    // 4. Escalate for anything still standing.
+    for &pid in &all {
+        if (hooks.is_alive)(pid) {
+            (hooks.signal)(pid, libc::SIGKILL);
+            outcome.killed.push(pid);
+        }
+    }
+    if !outcome.killed.is_empty() {
+        (hooks.sleep)(Duration::from_millis(200));
+        outcome.survivors = outcome
+            .killed
+            .iter()
+            .copied()
+            .filter(|&pid| (hooks.is_alive)(pid))
+            .collect();
+    }
+
+    outcome
 }
 
-/// What one orphan-process reap pass over one repo did.
+/// The production [`ReapHooks`]: real signals, a real `/proc` snapshot, a real
+/// sleep.
+#[must_use]
+pub fn production_hooks() -> ReapHooks<'static> {
+    ReapHooks {
+        signal: &send_signal,
+        snapshot: &snapshot_processes,
+        is_alive: &crate::sweep_registry::is_pid_alive,
+        sleep: &std::thread::sleep,
+    }
+}
+
+/// Send `sig` to `pid`, refusing pid 0 (POSIX broadcast-to-own-group) and pid 1.
+fn send_signal(pid: u32, sig: i32) -> bool {
+    if pid <= 1 {
+        return false;
+    }
+    crate::sweep_registry::send_signal(pid, sig)
+}
+
+// ============================================================================
+// One repo pass
+// ============================================================================
+
+/// What one process-reap pass over one repo did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct OrphanReapReport {
+pub struct ProcessReapReport {
     /// `issue-<N>` worktree directories examined.
-    pub scanned: usize,
-    /// Worktrees that had at least one orphan process reaped.
-    pub reaped: Vec<OrphanReapEntry>,
-    /// Worktrees that had live processes a fail-safe gate preserved.
-    pub preserved: Vec<(u32, String)>,
+    pub worktrees_scanned: usize,
+    /// Worktrees that survived every ownership gate and were searched for
+    /// processes.
+    pub unowned_worktrees: usize,
+    /// Processes in the `/proc` snapshot.
+    pub processes_scanned: usize,
+    /// Trees found (whether or not they were signalled — see `dry_run`).
+    pub trees: Vec<OrphanTree>,
+    /// Per-tree kill outcomes (empty in dry-run mode).
+    pub outcomes: Vec<TreeReapOutcome>,
+    /// Worktrees a safety gate preserved, with the gate's own wording.
+    pub skipped: Vec<(u32, String)>,
+    /// Whether this pass was observation-only.
+    pub dry_run: bool,
 }
 
-impl OrphanReapReport {
+impl ProcessReapReport {
+    /// Total pids across every tree found.
+    #[must_use]
+    pub fn pids_found(&self) -> usize {
+        self.trees.iter().map(|t| t.pids.len()).sum()
+    }
+
     /// A compact one-line summary for the daemon log.
     #[must_use]
     pub fn summary(&self) -> String {
         format!(
-            "scanned={} reaped_worktrees={} preserved={}",
-            self.scanned,
-            self.reaped.len(),
-            self.preserved.len()
+            "worktrees={} unowned={} procs={} trees={} pids={} skipped={}{}",
+            self.worktrees_scanned,
+            self.unowned_worktrees,
+            self.processes_scanned,
+            self.trees.len(),
+            self.pids_found(),
+            self.skipped.len(),
+            if self.dry_run { " (dry-run)" } else { "" }
         )
     }
 }
 
-/// Injected probes for [`reap_orphan_processes_with`], so every fail-safe gate
-/// is unit-testable without a live process table or forge — the same
-/// dependency-injection shape [`crate::worktree_ops::clean::WorktreeProbes`]
-/// uses for the sibling worktree-**removal** pass.
-pub struct OrphanReapProbes<'a> {
-    /// Issues with a live spawn-loop task or claim-lock (daemon-dispatched
-    /// sweeps only — which is exactly why it cannot be the sole gate).
-    pub active_issues: &'a HashSet<u32>,
-    /// PIDs whose cwd is inside the worktree.
-    pub processes_using: &'a dyn Fn(&Path) -> Vec<u32>,
-    /// Forge issue state (`"OPEN"` / `"CLOSED"` / `"UNKNOWN"`).
-    pub issue_state: &'a dyn Fn(u32) -> String,
-    /// Forge PR status for the issue's branch.
-    pub pr_status: &'a dyn Fn(u32) -> PrStatus,
-    /// Full descendant-PID walk for a root pid.
-    pub collect_descendants: &'a dyn Fn(u32) -> Vec<u32>,
-    /// Signal delivery; returns the pids actually signaled.
-    pub kill: &'a dyn Fn(&[u32]) -> Vec<u32>,
-    /// How long after a PR merge a worktree's processes become reapable.
-    pub grace_period_secs: i64,
-    /// Wall clock the grace-period gate measures against.
-    pub now: DateTime<Utc>,
-}
-
-/// Decide whether issue `issue`'s worktree is provably dead enough that
-/// processes still running inside it are orphans. `None` ⇒ reap; `Some(skip)`
-/// ⇒ leave every process alone.
+/// Why a worktree's processes are off limits, or `None` when it is provably
+/// unowned.
 ///
-/// Ordered cheapest-first: the two local (filesystem) gates run before either
-/// forge probe, and callers only reach this at all once a live process was
-/// actually found, so an idle worktree costs zero REST calls per tick.
+/// The probes are injected so the gate chain is testable without a forge, a
+/// process table, or a live sweep.
 #[must_use]
-pub fn classify_orphan_candidate(
-    worktree_path: &Path,
+pub fn ownership_gate(
+    worktree: &Path,
     issue: u32,
-    probes: &OrphanReapProbes<'_>,
-) -> Option<OrphanSkip> {
-    // Gate 1: never touch a user-provisioned worktree.
-    if !is_loom_managed(worktree_path) {
-        return Some(OrphanSkip::Unmanaged);
+    is_managed: &dyn Fn(&Path) -> bool,
+    active_issues: &HashSet<u32>,
+    live_claim: &dyn Fn(u32) -> Option<String>,
+) -> Option<String> {
+    if !is_managed(worktree) {
+        return Some("no .loom-managed sentinel (user-provisioned)".to_string());
     }
-    // Gate 2: never touch a worktree a daemon-dispatched sweep still claims.
-    if probes.active_issues.contains(&issue) {
-        return Some(OrphanSkip::LiveSweepClaim);
+    if worktree.join(".loom-in-use").exists() {
+        return Some(".loom-in-use marker present".to_string());
     }
-    // Gate 3: never touch a worktree whose issue is still open (or whose
-    // state could not be determined) — Manual Orchestration Mode and manual
-    // `/loom:sweep` work never registers a claim in gate 2, so this is the
-    // gate that actually protects them.
-    let issue_state = (probes.issue_state)(issue);
-    if issue_state != "CLOSED" {
-        return Some(OrphanSkip::IssueNotClosed(issue_state));
+    if active_issues.contains(&issue) {
+        return Some(format!("issue #{issue} has a live spawn-loop task or claim-lock"));
     }
-    // Gate 4: never touch a worktree whose PR is still open / unknown, and
-    // give a just-merged PR the same post-merge grace the removal pass gives
-    // it — a Judge or Doctor reviewing that PR reuses this very worktree.
-    match (probes.pr_status)(issue) {
-        PrStatus::Open => Some(OrphanSkip::PrOpen),
-        PrStatus::Unknown => Some(OrphanSkip::PrStatusUnknown),
-        PrStatus::Merged { merged_at } => {
-            let Ok(dt) = DateTime::parse_from_rfc3339(&merged_at) else {
-                // An unparseable timestamp is an unknown merge time, not an
-                // expired grace period.
-                return Some(OrphanSkip::PrStatusUnknown);
-            };
-            let (passed, remaining) =
-                check_grace_period(dt.with_timezone(&Utc), probes.grace_period_secs, probes.now);
-            (!passed).then_some(OrphanSkip::MergeGrace(remaining))
-        }
-        // Closed issue whose PR merged long ago, closed without merging, or
-        // that never had a PR: nothing is legitimately working here.
-        PrStatus::ClosedNoMerge | PrStatus::NoPr => None,
+    if let Some(evidence) = live_claim(issue) {
+        return Some(format!("live sweep claim: {evidence}"));
     }
+    None
 }
 
-/// Scan `repo_root`'s worktree root for `issue-<N>` worktrees whose sweep is
-/// provably dead but that still have a process running inside them, and
-/// terminate the whole descendant tree of every such process.
-///
-/// The probes are injected ([`OrphanReapProbes`]) so the whole pass is
-/// unit-testable without a live process table or forge — production wiring is
-/// [`reap_orphan_processes`].
-///
-/// # Fail-safe (this issue's AC)
-///
-/// A worktree is only ever a reap candidate when EVERY gate in
-/// [`classify_orphan_candidate`] clears — the same gate set the sibling
-/// worktree-**removal** pass
-/// ([`crate::worktree_ops::clean::classify_worktree`]) applies, minus the ones
-/// whose polarity is inverted here:
-/// - the `.loom-managed` sentinel (`CleanOptions::require_managed_sentinel`);
-/// - no live sweep claim (`SkipInUse` via
-///   [`crate::worktree_ops::liveness::active_spawn_loop_issues`]);
-/// - the issue is `CLOSED` (`SkipIssueNotClosed`);
-/// - the PR is not open, not unknown, and past its post-merge grace period
-///   (`SkipPrOpen` / `SkipUnknownPrStatus` / `SkipGrace`).
-///
-/// The last two matter *more* here than they do for removal. `active_issues`
-/// is populated only by `SweepRegistry::dispatch`, i.e. by **daemon-dispatched
-/// (Tier 2) sweeps** — Manual Orchestration Mode (`/loom:builder`,
-/// `/loom:judge`, `/loom:doctor`) and manual `/loom:sweep` runs never take out
-/// a claim, so for them `active_issues` is empty even while they are very much
-/// alive. Since the removal pass treats "a process is using this directory" as
-/// *protection* while this pass treats it as the *trigger*, the claim check
-/// alone would make a Judge's `cargo test` inside an open PR's worktree
-/// indistinguishable from the 5h52m runaway driver this module exists to kill.
-/// The forge gates are what tell those two apart: an open PR (or an open
-/// issue) is independent evidence that the work is still live, and no
-/// unattended pass may kill it.
-///
-/// Every gate is re-checked per tick, never assumed from an earlier pass's
-/// snapshot: a stale verdict here has an irreversible consequence (a live
-/// agent's own process killed out from under it), unlike a stale
-/// worktree-removal verdict (a no-op retried on the next tick).
-pub fn reap_orphan_processes_with(
+/// Run one production process-reap pass over `repo_root`.
+pub fn reap_repo_processes(
     repo_root: &Path,
-    probes: &OrphanReapProbes<'_>,
-) -> OrphanReapReport {
-    let mut report = OrphanReapReport::default();
+    config: &OrphanProcessReaperConfig,
+) -> ProcessReapReport {
+    let min_age = resolve_min_age_secs(config);
+    let dry_run = resolve_dry_run(config);
+    let mut report = ProcessReapReport {
+        dry_run,
+        ..ProcessReapReport::default()
+    };
 
     let worktrees_dir = crate::worktree_root::worktree_root(repo_root);
     let Ok(entries) = std::fs::read_dir(&worktrees_dir) else {
-        // No worktree root yet (or unreadable) — nothing to reap, not an error.
         return report;
     };
-
-    let mut worktree_dirs: Vec<_> = entries
+    let mut dirs: Vec<_> = entries
         .flatten()
         .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
         .collect();
-    worktree_dirs.sort_by_key(std::fs::DirEntry::path);
+    dirs.sort_by_key(std::fs::DirEntry::path);
 
-    for entry in worktree_dirs {
+    let active_issues = crate::worktree_ops::liveness::active_spawn_loop_issues(repo_root);
+    let live_claim =
+        |issue: u32| crate::live_claim::probe(repo_root, None, issue).map(|e| e.to_string());
+
+    let mut unowned: Vec<(u32, PathBuf)> = Vec::new();
+    for entry in dirs {
         let name = entry.file_name().to_string_lossy().to_string();
-        let Some(issue) = issue_from_worktree(&name) else {
+        let Some(issue) = crate::worktree_ops::naming::issue_from_worktree(&name) else {
             continue;
         };
-        report.scanned += 1;
-
-        let worktree_path = entry.path().canonicalize().unwrap_or_else(|_| entry.path());
-
-        // Nothing is running here ⇒ nothing to reap, and — deliberately — no
-        // forge probe either: an idle worktree must not cost a REST call on
-        // every tick. This is the only check that precedes the fail-safe
-        // gates, and it can never *authorize* a kill.
-        let root_pids = (probes.processes_using)(&worktree_path);
-        if root_pids.is_empty() {
+        report.worktrees_scanned += 1;
+        let path = entry.path().canonicalize().unwrap_or_else(|_| entry.path());
+        if let Some(reason) =
+            ownership_gate(&path, issue, &clean::is_loom_managed, &active_issues, &live_claim)
+        {
+            report.skipped.push((issue, reason));
             continue;
         }
+        unowned.push((issue, path));
+    }
+    report.unowned_worktrees = unowned.len();
+    if unowned.is_empty() {
+        return report;
+    }
 
-        // Live processes found — now (and only now) prove the sweep is dead.
-        if let Some(skip) = classify_orphan_candidate(&worktree_path, issue, probes) {
-            let reason = skip.reason();
-            log::info!(
-                "orphan_process_reaper: {} preserving issue-{issue} pids={root_pids:?}: {reason}",
-                repo_root.display()
-            );
-            report.preserved.push((issue, reason));
+    let procs = snapshot_processes();
+    report.processes_scanned = procs.len();
+    let plan = plan_orphan_trees(&procs, &unowned, std::process::id(), min_age);
+    report.skipped.extend(plan.skipped);
+    report.trees = plan.trees;
+
+    if report.trees.is_empty() {
+        return report;
+    }
+
+    let hooks = production_hooks();
+    for tree in &report.trees {
+        // Re-verify liveness immediately before signalling: a sweep may have
+        // claimed the issue while this pass was scanning /proc. The whole
+        // safety argument rests on never racing a live claim.
+        if let Some(evidence) = live_claim(tree.issue) {
+            report
+                .skipped
+                .push((tree.issue, format!("live sweep claim appeared mid-pass: {evidence}")));
             continue;
         }
-
-        let mut all_pids: Vec<u32> = Vec::new();
-        for &root in &root_pids {
-            for descendant in (probes.collect_descendants)(root) {
-                if !all_pids.contains(&descendant) {
-                    all_pids.push(descendant);
-                }
-            }
-        }
-        for &root in &root_pids {
-            if !all_pids.contains(&root) {
-                all_pids.push(root);
-            }
-        }
-
-        let killed = (probes.kill)(&all_pids);
         log::warn!(
-            "orphan_process_reaper: {} issue-{issue} has {} process(es) but issue #{issue} is \
-             closed, its PR is not open, and no live sweep claims it — reaping the whole tree: \
-             roots={root_pids:?} all_pids={all_pids:?} killed={killed:?} (#5110)",
+            "orphan_process_reaper: {} issue-{}: {} orphaned process(es) in {} with no live \
+             sweep claim{}: [{}]",
             repo_root.display(),
-            root_pids.len()
+            tree.issue,
+            tree.pids.len(),
+            tree.worktree.display(),
+            if dry_run {
+                " (dry-run, not signalled)"
+            } else {
+                ""
+            },
+            tree.details.join("; ")
         );
-        report.reaped.push(OrphanReapEntry {
-            issue,
-            root_pids,
-            killed_pids: killed,
-        });
+        if dry_run {
+            continue;
+        }
+        let outcome = reap_tree(tree, DEFAULT_TERM_GRACE, &hooks);
+        log::warn!(
+            "orphan_process_reaper: {} issue-{}: reaped frozen={} late_arrivals={:?} \
+             terminated={} killed={:?} survivors={:?}",
+            repo_root.display(),
+            tree.issue,
+            outcome.frozen.len(),
+            outcome.late_arrivals,
+            outcome.terminated.len(),
+            outcome.killed,
+            outcome.survivors
+        );
+        report.outcomes.push(outcome);
     }
 
     report
 }
 
-/// Run one production orphan-process reap pass over `repo_root`. Wires the
-/// real process-table probes, the real (REST-first, same as
-/// [`crate::worktree_reaper::reap_repo`]) forge probes, and the real signal
-/// delivery.
-#[must_use]
-pub fn reap_orphan_processes(repo_root: &Path) -> OrphanReapReport {
-    use crate::worktree_ops::clean;
-
-    let active_issues = active_spawn_loop_issues(repo_root);
-    let kill_fn = |pids: &[u32]| kill_pids(pids, ORPHAN_PROCESS_REAP_GRACE);
-
-    // Resolved once per pass (one REST call), not once per worktree.
-    let owner = clean::repo_owner_rest(repo_root);
-    let issue_state_fn = |n: u32| crate::worktree_ops::gh::issue_state_rest(repo_root, n);
-    let pr_status_fn = |n: u32| match owner.as_deref() {
-        Some(owner) => clean::check_pr_merged_rest(repo_root, owner, n),
-        None => clean::check_pr_merged(repo_root, n),
-    };
-
-    reap_orphan_processes_with(
-        repo_root,
-        &OrphanReapProbes {
-            active_issues: &active_issues,
-            processes_using: &find_processes_using_directory,
-            issue_state: &issue_state_fn,
-            pr_status: &pr_status_fn,
-            collect_descendants: &collect_descendant_pids,
-            kill: &kill_fn,
-            grace_period_secs: DEFAULT_GRACE_PERIOD_SECS,
-            now: Utc::now(),
-        },
-    )
+/// Log a pass's outcome at the right volume: quiet when there is nothing to do,
+/// loud when processes were killed.
+pub fn log_report(repo_root: &Path, report: &ProcessReapReport) {
+    if report.trees.is_empty() {
+        log::debug!(
+            "orphan_process_reaper: {} no orphaned process trees ({})",
+            repo_root.display(),
+            report.summary()
+        );
+    } else {
+        log::info!("orphan_process_reaper: {} {}", repo_root.display(), report.summary());
+    }
+    for (issue, reason) in &report.skipped {
+        log::debug!(
+            "orphan_process_reaper: {} preserving issue-{issue} processes: {reason}",
+            repo_root.display()
+        );
+    }
+    for outcome in &report.outcomes {
+        if !outcome.survivors.is_empty() {
+            log::warn!(
+                "orphan_process_reaper: {} issue-{}: {:?} survived SIGKILL — they may be in \
+                 uninterruptible I/O or owned by another user",
+                repo_root.display(),
+                outcome.issue,
+                outcome.survivors
+            );
+        }
+    }
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
+    use serial_test::serial;
     use std::fs;
 
-    /// Build a repo root with `.loom/worktrees/issue-<N>` directories, each
-    /// carrying a `.loom-managed` sentinel unless `managed` says otherwise.
-    fn make_repo(issues: &[(u32, bool)]) -> tempfile::TempDir {
-        let tmp = tempfile::tempdir().unwrap();
-        for (issue, managed) in issues {
-            let wt = tmp
-                .path()
-                .join(".loom/worktrees")
-                .join(format!("issue-{issue}"));
-            fs::create_dir_all(&wt).unwrap();
-            if *managed {
-                fs::write(wt.join(".loom-managed"), "").unwrap();
-            }
+    fn proc(pid: u32, ppid: u32, cwd: Option<&str>, cmdline: &str, age: Option<u64>) -> ProcEntry {
+        ProcEntry {
+            pid,
+            ppid,
+            cwd: cwd.map(PathBuf::from),
+            cmdline: cmdline.to_string(),
+            age_secs: age,
         }
+    }
+
+    // ===================================================================
+    // /proc parsing
+    // ===================================================================
+
+    #[test]
+    fn test_parse_stat_handles_comm_with_spaces_and_parens() {
+        // Field 22 (starttime) is the 20th field after `comm`.
+        let after = (4..=22)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let stat = format!("1234 (weird )( name) S 99 {after}");
+        // fields after comm: state=S ppid=99 then 4..=22 → starttime is index 19
+        // → the 18th element of the 4..=22 run → value 21.
+        let (ppid, starttime) = parse_stat(&stat).unwrap();
+        assert_eq!(ppid, 99);
+        assert_eq!(starttime, 21);
+    }
+
+    #[test]
+    fn test_parse_stat_rejects_garbage() {
+        assert!(parse_stat("").is_none());
+        assert!(parse_stat("no parens here").is_none());
+        assert!(parse_stat("1 (sh) S 0").is_none());
+    }
+
+    // ===================================================================
+    // Attribution
+    // ===================================================================
+
+    #[test]
+    fn test_cmdline_reference_requires_a_path_boundary() {
+        let wt = Path::new("/repo/.loom/worktrees/issue-87");
+        // The incident's ngspice argv: worktree named only in argv.
+        assert!(cmdline_references_path(
+            "ngspice -b /repo/.loom/worktrees/issue-87/sim/records/raw/tt.spice",
+            wt
+        ));
+        assert!(cmdline_references_path("bash /repo/.loom/worktrees/issue-87", wt));
+        assert!(cmdline_references_path("bash \"/repo/.loom/worktrees/issue-87\"", wt));
+        // A different issue whose number merely starts with 87 must not match.
+        assert!(!cmdline_references_path(
+            "ngspice -b /repo/.loom/worktrees/issue-870/sim/x.spice",
+            wt
+        ));
+        assert!(!cmdline_references_path("ngspice -b /repo/.loom/worktrees/issue-8", wt));
+        assert!(!cmdline_references_path("", wt));
+    }
+
+    #[test]
+    fn test_references_worktree_matches_cwd_or_argv() {
+        let wt = Path::new("/repo/.loom/worktrees/issue-87");
+        assert!(references_worktree(
+            &proc(2, 1, Some("/repo/.loom/worktrees/issue-87/sim"), "bash x.sh", None),
+            wt
+        ));
+        assert!(references_worktree(
+            &proc(3, 1, Some("/tmp"), "ngspice -b /repo/.loom/worktrees/issue-87/a.spice", None),
+            wt
+        ));
+        assert!(!references_worktree(&proc(4, 1, Some("/tmp"), "sleep 1", None), wt));
+        // A sibling worktree is never attributed here.
+        assert!(!references_worktree(
+            &proc(5, 1, Some("/repo/.loom/worktrees/issue-870"), "bash x.sh", None),
+            wt
+        ));
+    }
+
+    // ===================================================================
+    // Tree algebra
+    // ===================================================================
+
+    #[test]
+    fn test_descendants_are_transitive_and_cycle_safe() {
+        let procs = vec![
+            proc(10, 1, None, "driver", None),
+            proc(11, 10, None, "python", None),
+            proc(12, 11, None, "timeout", None),
+            proc(13, 12, None, "ngspice", None),
+            proc(20, 1, None, "unrelated", None),
+        ];
+        let children = children_map(&procs);
+        assert_eq!(descendants_of(&[10], &children), vec![11, 12, 13]);
+        assert!(descendants_of(&[20], &children).is_empty());
+
+        // A snapshot with a ppid cycle must terminate.
+        let cyclic = vec![proc(30, 31, None, "a", None), proc(31, 30, None, "b", None)];
+        let children = children_map(&cyclic);
+        assert_eq!(descendants_of(&[30], &children), vec![31]);
+    }
+
+    #[test]
+    fn test_parent_first_ordering() {
+        let procs = vec![
+            proc(10, 1, None, "driver", None),
+            proc(11, 10, None, "python", None),
+            proc(12, 11, None, "timeout", None),
+            proc(13, 12, None, "ngspice", None),
+        ];
+        let parents = parent_map(&procs);
+        let set: HashSet<u32> = [13, 11, 12, 10].into_iter().collect();
+        assert_eq!(order_parent_first(&set, &parents), vec![10, 11, 12, 13]);
+    }
+
+    #[test]
+    fn test_ancestors_walk_is_bounded() {
+        let procs = vec![
+            proc(10, 1, None, "a", None),
+            proc(11, 10, None, "b", None),
+            proc(12, 11, None, "c", None),
+        ];
+        let parents = parent_map(&procs);
+        assert_eq!(ancestors_of(12, &parents), HashSet::from([11, 10, 1]));
+        let cyclic = vec![proc(30, 31, None, "a", None), proc(31, 30, None, "b", None)];
+        assert_eq!(ancestors_of(30, &parent_map(&cyclic)), HashSet::from([31, 30]));
+    }
+
+    // ===================================================================
+    // Planning — the incident's shape
+    // ===================================================================
+
+    /// The exact process tree from the incident: three process groups, a
+    /// driver whose parent is `systemd --user`, and sims that name the
+    /// worktree only in argv.
+    fn incident_procs(worktree: &str) -> Vec<ProcEntry> {
+        vec![
+            proc(844, 1, Some("/"), "systemd --user", Some(999_999)),
+            proc(2_896_920, 844, Some(worktree), "bash ./sim/.work/cal/run_all.sh", Some(21_120)),
+            proc(
+                2_896_924,
+                2_896_920,
+                Some(worktree),
+                "python3 sim/run_corners.py array-liveness --corners tt",
+                Some(600),
+            ),
+            proc(
+                2_896_986,
+                2_896_924,
+                Some("/"),
+                &format!("timeout --kill-after=30s 21600s ngspice -b {worktree}/sim/a.spice"),
+                Some(120),
+            ),
+            proc(
+                2_896_990,
+                2_896_986,
+                Some("/"),
+                &format!("ngspice -b {worktree}/sim/a.spice"),
+                Some(110),
+            ),
+            proc(999, 1, Some("/home/u"), "sshd", Some(999_999)),
+        ]
+    }
+
+    #[test]
+    fn test_incident_tree_is_planned_whole_across_process_groups() {
+        let wt = "/repo/.loom/worktrees/issue-87";
+        let procs = incident_procs(wt);
+        let plan = plan_orphan_trees(&procs, &[(87, PathBuf::from(wt))], 4242, 1800);
+        assert_eq!(plan.trees.len(), 1, "{plan:?}");
+        let tree = &plan.trees[0];
+        assert_eq!(tree.issue, 87);
+        // Only the driver is old enough to seed…
+        assert_eq!(tree.seeds, vec![2_896_920]);
+        // …but the whole descendant chain comes with it, including the pids
+        // that live in other process groups/sessions behind `timeout`.
+        assert_eq!(
+            tree.pids,
+            vec![2_896_920, 2_896_924, 2_896_986, 2_896_990],
+            "the tree must be transitive and parent-first"
+        );
+        assert!(!tree.pids.contains(&844), "systemd must never be in the tree");
+        assert!(!tree.pids.contains(&999));
+    }
+
+    #[test]
+    fn test_looks_like_agent_is_narrow() {
+        assert!(looks_like_agent("claude -p /loom:builder"));
+        assert!(looks_like_agent("/home/u/.local/bin/claude --resume"));
+        assert!(looks_like_agent("codex exec"));
+        assert!(looks_like_agent(
+            "bash -c .loom/scripts/spawn-worker.sh -p \"/loom:sweep --prs 456\""
+        ));
+        // The incident's own tree must NOT look like an agent: its driver is a
+        // bare shell whose argv merely mentions `~/.claude/shell-snapshots/…`.
+        assert!(!looks_like_agent(
+            "bash -c source /home/u/.claude/shell-snapshots/snapshot-bash-1.sh && ./run_all.sh"
+        ));
+        assert!(!looks_like_agent("bash ./sim/.work/cal/run_all.sh"));
+        assert!(!looks_like_agent("ngspice -b /repo/sim/a.spice"));
+        assert!(!looks_like_agent(""));
+    }
+
+    #[test]
+    fn test_a_live_agent_in_the_worktree_stops_the_whole_reap() {
+        // PR-set mode / a manually driven agent claims no issue, so only this
+        // gate can see that the worktree is owned.
+        let wt = "/repo/.loom/worktrees/issue-87";
+        let procs = vec![
+            proc(100, 1, Some(wt), "claude -p /loom:sweep --prs 456", Some(99_999)),
+            proc(101, 100, Some(wt), "bash ./build.sh", Some(99_999)),
+        ];
+        let plan = plan_orphan_trees(&procs, &[(87, PathBuf::from(wt))], 4242, 1800);
+        assert!(plan.trees.is_empty(), "{plan:?}");
+        assert!(plan.skipped[0].1.contains("agent runtime"), "{plan:?}");
+    }
+
+    #[test]
+    fn test_young_processes_are_never_seeds() {
+        let wt = "/repo/.loom/worktrees/issue-87";
+        let procs = vec![proc(500, 1, Some(wt), "bash build.sh", Some(60))];
+        let plan = plan_orphan_trees(&procs, &[(87, PathBuf::from(wt))], 4242, 1800);
+        assert!(plan.trees.is_empty());
+    }
+
+    #[test]
+    fn test_unknown_age_is_never_a_seed() {
+        let wt = "/repo/.loom/worktrees/issue-87";
+        let procs = vec![proc(500, 1, Some(wt), "bash build.sh", None)];
+        let plan = plan_orphan_trees(&procs, &[(87, PathBuf::from(wt))], 4242, 1800);
+        assert!(plan.trees.is_empty(), "an unknown age must never be assumed old");
+    }
+
+    #[test]
+    fn test_daemon_self_ancestors_and_children_are_protected() {
+        let wt = "/repo/.loom/worktrees/issue-87";
+        let self_pid = 700;
+        let procs = vec![
+            // Our own ancestry, all "working in" the worktree.
+            proc(600, 1, Some(wt), "systemd", Some(99_999)),
+            proc(self_pid, 600, Some(wt), "loom-daemon", Some(99_999)),
+            // Our own child (a live sweep the registry owns).
+            proc(800, self_pid, Some(wt), "claude -p /loom:sweep 87", Some(99_999)),
+        ];
+        let plan = plan_orphan_trees(&procs, &[(87, PathBuf::from(wt))], self_pid, 1800);
+        assert!(
+            plan.trees.is_empty(),
+            "the daemon, its ancestry, and its children must never be reaped: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn test_an_orphan_whose_child_chain_reaches_the_daemon_is_never_reaped() {
+        // The daemon's ancestry is protected, so an "orphan" that is really
+        // our own parent yields no seeds at all.
+        let wt = "/repo/.loom/worktrees/issue-87";
+        let self_pid = 900;
+        let procs = vec![
+            proc(100, 1, Some(wt), "bash driver.sh", Some(99_999)),
+            proc(self_pid, 100, Some("/"), "loom-daemon", Some(99_999)),
+        ];
+        let plan = plan_orphan_trees(&procs, &[(87, PathBuf::from(wt))], self_pid, 1800);
+        assert!(plan.trees.is_empty(), "{plan:?}");
+    }
+
+    #[test]
+    fn test_tree_containing_a_protected_pid_is_refused_whole() {
+        // Defense in depth for an *inconsistent* snapshot: `/proc` is walked
+        // pid by pid while processes come and go, so a recycled pid can appear
+        // with two different parents in one snapshot — here 950 looks like a
+        // child of both the orphaned driver and this daemon. When the two
+        // trees overlap at all, the whole tree is refused rather than
+        // partially reaped.
+        let wt = "/repo/.loom/worktrees/issue-87";
+        let self_pid = 900;
+        let procs = vec![
+            proc(100, 1, Some(wt), "bash driver.sh", Some(99_999)),
+            proc(950, 100, None, "child (stale parent)", Some(99_999)),
+            proc(self_pid, 1, Some("/"), "loom-daemon", Some(99_999)),
+            proc(950, self_pid, None, "child (fresh parent)", Some(1)),
+        ];
+        let plan = plan_orphan_trees(&procs, &[(87, PathBuf::from(wt))], self_pid, 1800);
+        assert!(plan.trees.is_empty());
+        assert_eq!(plan.skipped.len(), 1);
+        assert!(plan.skipped[0].1.contains("protected pid"), "{plan:?}");
+    }
+
+    #[test]
+    fn test_oversized_tree_is_refused() {
+        let wt = "/repo/.loom/worktrees/issue-87";
+        let mut procs = vec![proc(1000, 1, Some(wt), "bash driver.sh", Some(99_999))];
+        for pid in 1001..(1001 + MAX_TREE_PIDS as u32) {
+            procs.push(proc(pid, 1000, None, "child", Some(10)));
+        }
+        let plan = plan_orphan_trees(&procs, &[(87, PathBuf::from(wt))], 4242, 1800);
+        assert!(plan.trees.is_empty());
+        assert!(plan.skipped[0].1.contains("safety cap"), "{plan:?}");
+    }
+
+    #[test]
+    fn test_sibling_worktrees_do_not_bleed_into_each_other() {
+        let a = "/repo/.loom/worktrees/issue-87";
+        let b = "/repo/.loom/worktrees/issue-870";
+        let procs = vec![
+            proc(100, 1, Some(a), "bash a.sh", Some(99_999)),
+            proc(200, 1, Some(b), "bash b.sh", Some(99_999)),
+        ];
+        let plan = plan_orphan_trees(
+            &procs,
+            &[(87, PathBuf::from(a)), (870, PathBuf::from(b))],
+            4242,
+            1800,
+        );
+        assert_eq!(plan.trees.len(), 2);
+        assert_eq!(plan.trees[0].pids, vec![100]);
+        assert_eq!(plan.trees[1].pids, vec![200]);
+    }
+
+    // ===================================================================
+    // Ownership gate — the fail-safes
+    // ===================================================================
+
+    fn managed_worktree() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join(".loom-managed"), "").unwrap();
         tmp
     }
 
-    /// Scripted probe values for one pass. The defaults describe the *reapable*
-    /// world — a closed issue whose PR merged long ago, no daemon claim, one
-    /// process still running inside the worktree — so each test only states the
-    /// single fact it is about. Mirrors `worktree_reaper::tests::ProbeSpec`.
-    struct Spec {
-        active: HashSet<u32>,
-        issue_state: String,
-        pr_status: PrStatus,
-        root_pids: Vec<u32>,
-        descendants: fn(u32) -> Vec<u32>,
-        grace_period_secs: i64,
+    #[test]
+    fn test_ownership_gate_passes_for_an_unowned_managed_worktree() {
+        let wt = managed_worktree();
+        let gate =
+            ownership_gate(wt.path(), 87, &clean::is_loom_managed, &HashSet::new(), &|_| None);
+        assert_eq!(gate, None);
     }
 
-    impl Default for Spec {
-        fn default() -> Self {
-            Self {
-                active: HashSet::new(),
-                issue_state: "CLOSED".to_string(),
-                pr_status: PrStatus::Merged {
-                    // Well outside any sane grace period.
-                    merged_at: "2020-01-01T00:00:00Z".to_string(),
-                },
-                root_pids: vec![999],
-                descendants: |_| Vec::new(),
-                grace_period_secs: DEFAULT_GRACE_PERIOD_SECS,
+    #[test]
+    fn test_ownership_gate_requires_the_managed_sentinel() {
+        let wt = tempfile::tempdir().unwrap();
+        let gate =
+            ownership_gate(wt.path(), 87, &clean::is_loom_managed, &HashSet::new(), &|_| None);
+        assert!(gate.unwrap().contains(".loom-managed"));
+    }
+
+    #[test]
+    fn test_ownership_gate_respects_the_in_use_marker() {
+        let wt = managed_worktree();
+        fs::write(wt.path().join(".loom-in-use"), "{}").unwrap();
+        let gate =
+            ownership_gate(wt.path(), 87, &clean::is_loom_managed, &HashSet::new(), &|_| None);
+        assert!(gate.unwrap().contains(".loom-in-use"));
+    }
+
+    #[test]
+    fn test_ownership_gate_respects_a_claim_lock() {
+        let wt = managed_worktree();
+        let gate =
+            ownership_gate(wt.path(), 87, &clean::is_loom_managed, &HashSet::from([87]), &|_| None);
+        assert!(gate.unwrap().contains("claim-lock"));
+    }
+
+    #[test]
+    fn test_ownership_gate_respects_a_live_sweep_claim() {
+        let wt = managed_worktree();
+        let gate = ownership_gate(wt.path(), 87, &clean::is_loom_managed, &HashSet::new(), &|_| {
+            Some("a live `/loom:sweep` process (pid 5)".to_string())
+        });
+        assert!(gate.unwrap().contains("live sweep claim"));
+    }
+
+    // ===================================================================
+    // Kill sequence
+    // ===================================================================
+
+    #[derive(Default)]
+    struct SignalLog {
+        sent: std::sync::Mutex<Vec<(u32, i32)>>,
+    }
+
+    fn tree(pids: &[u32]) -> OrphanTree {
+        OrphanTree {
+            issue: 87,
+            worktree: PathBuf::from("/repo/.loom/worktrees/issue-87"),
+            seeds: vec![pids[0]],
+            pids: pids.to_vec(),
+            details: pids.iter().map(|p| format!("pid={p}")).collect(),
+        }
+    }
+
+    #[test]
+    fn test_kill_sequence_freezes_parent_first_then_terms_then_kills() {
+        let log = SignalLog::default();
+        let dead_after_term = std::sync::Mutex::new(false);
+        let signal = |pid: u32, sig: i32| {
+            log.sent.lock().unwrap().push((pid, sig));
+            if sig == libc::SIGTERM {
+                *dead_after_term.lock().unwrap() = true;
             }
-        }
-    }
-
-    /// Run a full pass against `repo` with scripted probes, returning the
-    /// report plus every batch of pids the (fake) killer was asked to signal.
-    fn run_pass(repo: &Path, spec: &Spec) -> (OrphanReapReport, Vec<Vec<u32>>) {
-        let killed: RefCell<Vec<Vec<u32>>> = RefCell::new(Vec::new());
-        let processes_using = |_: &Path| spec.root_pids.clone();
-        let issue_state = |_: u32| spec.issue_state.clone();
-        let pr_status = |_: u32| spec.pr_status.clone();
-        let collect_descendants = |pid: u32| (spec.descendants)(pid);
-        let kill = |pids: &[u32]| {
-            killed.borrow_mut().push(pids.to_vec());
-            pids.to_vec()
+            true
+        };
+        let snapshot = Vec::new;
+        let is_alive = |_: u32| !*dead_after_term.lock().unwrap();
+        let sleep = |_: Duration| {};
+        let hooks = ReapHooks {
+            signal: &signal,
+            snapshot: &snapshot,
+            is_alive: &is_alive,
+            sleep: &sleep,
         };
 
-        let report = reap_orphan_processes_with(
-            repo,
-            &OrphanReapProbes {
-                active_issues: &spec.active,
-                processes_using: &processes_using,
-                issue_state: &issue_state,
-                pr_status: &pr_status,
-                collect_descendants: &collect_descendants,
-                kill: &kill,
-                grace_period_secs: spec.grace_period_secs,
-                now: Utc::now(),
-            },
-        );
-        (report, killed.into_inner())
+        let outcome = reap_tree(&tree(&[10, 11, 12]), Duration::ZERO, &hooks);
+        let sent = log.sent.lock().unwrap().clone();
+        // Every pid is STOPped before any pid is TERMed.
+        let first_term = sent.iter().position(|(_, s)| *s == libc::SIGTERM).unwrap();
+        let stops: Vec<u32> = sent[..first_term]
+            .iter()
+            .filter(|(_, s)| *s == libc::SIGSTOP)
+            .map(|(p, _)| *p)
+            .collect();
+        assert_eq!(stops, vec![10, 11, 12], "freeze must be parent-first and complete");
+        // SIGCONT must follow SIGTERM so the queued signal is delivered.
+        let first_cont = sent.iter().position(|(_, s)| *s == libc::SIGCONT).unwrap();
+        assert!(first_cont > first_term);
+        assert_eq!(outcome.terminated, vec![10, 11, 12]);
+        assert!(outcome.killed.is_empty(), "no SIGKILL when SIGTERM sufficed");
     }
 
     #[test]
-    fn test_orphan_with_no_live_claim_is_reaped_transitively() {
-        let repo = make_repo(&[(100, true)]);
-        let spec = Spec {
-            root_pids: vec![111],
-            // 111 -> 222 -> 333 (a driver that escaped into a new pgid/sid via
-            // a `timeout`-shaped middle process — the scenario this issue's AC
-            // requires a fixture for).
-            descendants: |pid| {
-                if pid == 111 {
-                    vec![222, 333]
-                } else {
-                    Vec::new()
-                }
-            },
-            ..Spec::default()
+    fn test_kill_sequence_escalates_to_sigkill_for_survivors() {
+        let log = SignalLog::default();
+        let signal = |pid: u32, sig: i32| {
+            log.sent.lock().unwrap().push((pid, sig));
+            true
         };
-        let (report, _) = run_pass(repo.path(), &spec);
-
-        assert_eq!(report.scanned, 1);
-        assert_eq!(report.reaped.len(), 1);
-        let entry = &report.reaped[0];
-        assert_eq!(entry.issue, 100);
-        assert_eq!(entry.root_pids, vec![111]);
-        // The whole tree — root AND every descendant — must be in the kill set,
-        // not just the root pid.
-        let mut all: Vec<u32> = entry.killed_pids.clone();
-        all.sort_unstable();
-        assert_eq!(all, vec![111, 222, 333]);
-    }
-
-    #[test]
-    fn test_live_sweep_claim_is_never_reaped() {
-        let repo = make_repo(&[(101, true)]);
-        let spec = Spec {
-            active: HashSet::from([101]),
-            ..Spec::default()
+        let snapshot = Vec::new;
+        // Nothing ever dies until SIGKILL is recorded.
+        let is_alive = |pid: u32| {
+            !log.sent
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(p, s)| *p == pid && *s == libc::SIGKILL)
         };
-        let (report, killed) = run_pass(repo.path(), &spec);
-
-        assert!(report.reaped.is_empty(), "a live sweep's work must never be reaped");
-        assert!(killed.is_empty());
-        assert_eq!(report.preserved[0].1, "live spawn-loop task or claim-lock");
-    }
-
-    #[test]
-    fn test_unmanaged_worktree_is_never_reaped() {
-        // No `.loom-managed` sentinel ⇒ user-provisioned ⇒ never touched,
-        // even though a process is using it and no claim is live.
-        let repo = make_repo(&[(102, false)]);
-        let (report, killed) = run_pass(repo.path(), &Spec::default());
-
-        assert!(report.reaped.is_empty());
-        assert!(killed.is_empty());
-        assert_eq!(report.preserved[0].1, "no .loom-managed sentinel (user-provisioned)");
-    }
-
-    #[test]
-    fn test_open_pr_worktree_is_never_reaped() {
-        // The gap this pass had at first review (PR #5121): `active_issues` is
-        // populated ONLY by `SweepRegistry::dispatch`, so Manual Orchestration
-        // Mode (`/loom:judge`, `/loom:doctor`, `/loom:builder`) and manual
-        // `/loom:sweep` runs never appear in it — yet a Judge reviewing an open
-        // PR reuses that PR's builder worktree and runs `cargo build`/`cargo
-        // test` there. With only the sentinel + claim gates, this pass would
-        // have SIGKILLed that live reviewer's process tree. An open PR is
-        // independent proof the work is alive.
-        let repo = make_repo(&[(5110, true)]);
-        let spec = Spec {
-            active: HashSet::new(),
-            issue_state: "CLOSED".to_string(),
-            pr_status: PrStatus::Open,
-            root_pids: vec![4242],
-            descendants: |_| vec![4243, 4244],
-            ..Spec::default()
+        let sleep = |_: Duration| {};
+        let hooks = ReapHooks {
+            signal: &signal,
+            snapshot: &snapshot,
+            is_alive: &is_alive,
+            sleep: &sleep,
         };
-        let (report, killed) = run_pass(repo.path(), &spec);
-
-        assert!(
-            report.reaped.is_empty(),
-            "a worktree whose PR is still open must never have its processes reaped"
-        );
-        assert!(killed.is_empty(), "no signal may be delivered at all");
-        assert_eq!(report.preserved, vec![(5110, "PR still open".to_string())]);
+        let outcome = reap_tree(&tree(&[10, 11]), Duration::ZERO, &hooks);
+        assert_eq!(outcome.killed, vec![10, 11]);
+        assert!(outcome.survivors.is_empty());
     }
 
     #[test]
-    fn test_open_issue_worktree_is_never_reaped() {
-        // The same protection one step earlier in the lifecycle: a Builder
-        // working an open issue manually has no daemon claim either.
-        let repo = make_repo(&[(103, true)]);
-        let spec = Spec {
-            issue_state: "OPEN".to_string(),
-            ..Spec::default()
+    fn test_kill_sequence_catches_children_forked_after_the_scan() {
+        // The defining behavior: a driver that spawned a new batch between the
+        // /proc scan and the freeze must not leave that batch running.
+        let log = SignalLog::default();
+        let signal = |pid: u32, sig: i32| {
+            log.sent.lock().unwrap().push((pid, sig));
+            true
         };
-        let (report, killed) = run_pass(repo.path(), &spec);
-
-        assert!(report.reaped.is_empty());
-        assert!(killed.is_empty());
-        assert_eq!(report.preserved[0].1, "issue is OPEN");
-    }
-
-    #[test]
-    fn test_unknown_forge_state_is_never_reaped() {
-        // A failed forge probe resolves to UNKNOWN, which is a skip — never a
-        // kill (the same posture the removal pass takes).
-        for (issue_state, pr_status, expect) in [
-            (
-                "UNKNOWN",
-                PrStatus::Merged {
-                    merged_at: "2020-01-01T00:00:00Z".to_string(),
-                },
-                "issue is UNKNOWN",
-            ),
-            ("CLOSED", PrStatus::Unknown, "PR status unknown"),
-            // A merged PR with an unparseable timestamp is an unknown merge
-            // time, not an expired grace period.
-            (
-                "CLOSED",
-                PrStatus::Merged {
-                    merged_at: "not-a-timestamp".to_string(),
-                },
-                "PR status unknown",
-            ),
-        ] {
-            let repo = make_repo(&[(104, true)]);
-            let spec = Spec {
-                issue_state: issue_state.to_string(),
-                pr_status,
-                ..Spec::default()
-            };
-            let (report, killed) = run_pass(repo.path(), &spec);
-            assert!(report.reaped.is_empty(), "{expect}");
-            assert!(killed.is_empty(), "{expect}");
-            assert_eq!(report.preserved[0].1, expect);
-        }
-    }
-
-    #[test]
-    fn test_post_merge_grace_period_protects_the_worktree() {
-        // Merged seconds ago: the merging agent may still be finishing inside
-        // the worktree, so the same grace the removal pass honors applies.
-        let repo = make_repo(&[(105, true)]);
-        let merged_at = (Utc::now() - chrono::Duration::seconds(30)).to_rfc3339();
-        let spec = Spec {
-            pr_status: PrStatus::Merged { merged_at },
-            ..Spec::default()
+        let snapshot = || {
+            vec![
+                proc(10, 1, None, "driver", Some(9999)),
+                proc(11, 10, None, "old child", Some(9999)),
+                // Forked after the plan was built:
+                proc(99, 10, None, "fresh batch", Some(1)),
+                proc(100, 99, None, "fresh grandchild", Some(1)),
+            ]
         };
-        let (report, killed) = run_pass(repo.path(), &spec);
-
-        assert!(report.reaped.is_empty());
-        assert!(killed.is_empty());
-        assert!(
-            report.preserved[0].1.starts_with("grace period not passed"),
-            "unexpected reason: {}",
-            report.preserved[0].1
-        );
+        let is_alive = |_: u32| false;
+        let sleep = |_: Duration| {};
+        let hooks = ReapHooks {
+            signal: &signal,
+            snapshot: &snapshot,
+            is_alive: &is_alive,
+            sleep: &sleep,
+        };
+        let outcome = reap_tree(&tree(&[10, 11]), Duration::ZERO, &hooks);
+        assert_eq!(outcome.late_arrivals, vec![99, 100]);
+        assert!(outcome.terminated.contains(&99));
+        assert!(outcome.terminated.contains(&100));
     }
 
     #[test]
-    fn test_closed_issue_without_merged_pr_is_still_reaped() {
-        // A closed issue whose PR closed unmerged (or that never had one) is
-        // as dead as a merged one — nothing is legitimately working there.
-        for pr_status in [PrStatus::ClosedNoMerge, PrStatus::NoPr] {
-            let repo = make_repo(&[(106, true)]);
-            let spec = Spec {
-                pr_status,
-                ..Spec::default()
-            };
-            let (report, killed) = run_pass(repo.path(), &spec);
-            assert_eq!(report.reaped.len(), 1);
-            assert_eq!(killed, vec![vec![999]]);
-        }
+    fn test_send_signal_refuses_pid_0_and_1() {
+        assert!(!send_signal(0, libc::SIGTERM));
+        assert!(!send_signal(1, libc::SIGTERM));
     }
 
-    #[test]
-    fn test_no_processes_using_worktree_is_a_no_op() {
-        let repo = make_repo(&[(107, true)]);
-        let spec = Spec {
-            root_pids: Vec::new(),
-            ..Spec::default()
-        };
-        let (report, killed) = run_pass(repo.path(), &spec);
-
-        assert_eq!(report.scanned, 1);
-        assert!(report.reaped.is_empty());
-        assert!(report.preserved.is_empty());
-        assert!(killed.is_empty());
-    }
-
-    #[test]
-    fn test_idle_worktree_costs_no_forge_probe() {
-        // The forge gates must not turn a quiet host into a per-tick REST
-        // storm: with nothing running inside the worktree there is nothing to
-        // decide, so neither probe may be called.
-        let repo = make_repo(&[(108, true)]);
-        let probed: RefCell<Vec<u32>> = RefCell::new(Vec::new());
-        let processes_using = |_: &Path| Vec::new();
-        let issue_state = |n: u32| {
-            probed.borrow_mut().push(n);
-            "CLOSED".to_string()
-        };
-        let pr_status = |n: u32| {
-            probed.borrow_mut().push(n);
-            PrStatus::NoPr
-        };
-        let collect_descendants = |_: u32| Vec::new();
-        let kill = |pids: &[u32]| pids.to_vec();
-
-        let report = reap_orphan_processes_with(
-            repo.path(),
-            &OrphanReapProbes {
-                active_issues: &HashSet::new(),
-                processes_using: &processes_using,
-                issue_state: &issue_state,
-                pr_status: &pr_status,
-                collect_descendants: &collect_descendants,
-                kill: &kill,
-                grace_period_secs: DEFAULT_GRACE_PERIOD_SECS,
-                now: Utc::now(),
-            },
-        );
-
-        assert_eq!(report.scanned, 1);
-        assert!(probed.borrow().is_empty(), "idle worktree must not hit the forge");
-    }
+    // ===================================================================
+    // Repo pass wiring
+    // ===================================================================
 
     #[test]
     fn test_missing_worktree_root_is_a_clean_no_op() {
         let tmp = tempfile::tempdir().unwrap();
-        let (report, killed) = run_pass(tmp.path(), &Spec::default());
-
-        assert_eq!(report, OrphanReapReport::default());
-        assert!(killed.is_empty());
+        let report = reap_repo_processes(tmp.path(), &OrphanProcessReaperConfig::default());
+        assert_eq!(report.worktrees_scanned, 0);
+        assert!(report.trees.is_empty());
     }
 
     #[test]
-    fn test_non_issue_directories_are_ignored() {
-        let repo = make_repo(&[(200, true)]);
-        fs::create_dir_all(repo.path().join(".loom/worktrees/scratch")).unwrap();
-        let spec = Spec {
-            root_pids: Vec::new(),
-            ..Spec::default()
-        };
-        let (report, _) = run_pass(repo.path(), &spec);
-
-        assert_eq!(report.scanned, 1);
+    fn test_unmanaged_worktree_is_skipped_before_any_process_scan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = tmp.path().join(".loom/worktrees/issue-4242");
+        fs::create_dir_all(&wt).unwrap();
+        let report = reap_repo_processes(tmp.path(), &OrphanProcessReaperConfig::default());
+        assert_eq!(report.worktrees_scanned, 1);
+        assert_eq!(report.unowned_worktrees, 0);
+        assert_eq!(report.processes_scanned, 0, "no /proc walk when nothing is unowned");
+        assert!(report.skipped[0].1.contains(".loom-managed"));
     }
 
     #[test]
-    fn test_summary_is_compact() {
-        let report = OrphanReapReport {
-            scanned: 3,
-            reaped: vec![OrphanReapEntry {
-                issue: 1,
-                root_pids: vec![10],
-                killed_pids: vec![10, 11],
-            }],
-            preserved: vec![(2, "PR still open".to_string())],
+    fn test_report_summary_is_compact() {
+        let report = ProcessReapReport {
+            worktrees_scanned: 3,
+            unowned_worktrees: 1,
+            processes_scanned: 400,
+            trees: vec![tree(&[1, 2, 3])],
+            outcomes: Vec::new(),
+            skipped: vec![(9, "live sweep claim".to_string())],
+            dry_run: true,
         };
-        assert_eq!(report.summary(), "scanned=3 reaped_worktrees=1 preserved=1");
+        assert_eq!(
+            report.summary(),
+            "worktrees=3 unowned=1 procs=400 trees=1 pids=3 skipped=1 (dry-run)"
+        );
     }
 
-    // ========================================================================
-    // Real-process fixtures: proves the reap actually kills a live tree that
-    // escaped via `setsid` into a fresh pgid+sid (this issue's explicit AC:
-    // "Test/fixture covers a tree that has escaped via `timeout` (new pgid +
-    // new sid)"). `timeout` itself does exactly this on both macOS (via
-    // coreutils, if installed) and Linux, but `setsid` is the portable,
-    // always-present primitive that reproduces the SAME escape shape — a
-    // subprocess launched into a brand-new process group AND session, which
-    // is precisely why #4982's pgid-scoped teardown cannot reach it.
-    // ========================================================================
+    #[test]
+    fn test_describe_truncates_and_labels_unknowns() {
+        let long = "x".repeat(400);
+        let d = proc(5, 4, None, &long, None).describe();
+        assert!(d.contains("age=?"));
+        assert!(d.len() < 220, "{d}");
+        assert!(proc(5, 4, None, "", Some(3))
+            .describe()
+            .contains("<unknown>"));
+    }
 
-    fn wait_until<F: FnMut() -> bool>(mut cond: F, timeout_ms: u64) -> bool {
-        let start = std::time::Instant::now();
-        while start.elapsed().as_millis() < u128::from(timeout_ms) {
-            if cond() {
-                return true;
+    // ===================================================================
+    // Config surface — autonomous.processReaper
+    // ===================================================================
+
+    fn write_config(root: &Path, contents: &str) {
+        fs::create_dir_all(root.join(".loom")).unwrap();
+        fs::write(root.join(".loom").join("config.json"), contents).unwrap();
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_config_missing_block_is_default() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(tmp.path(), r#"{"autonomous": {"workFinder": {"enabled": true}}}"#);
+        let cfg = read_config(tmp.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(cfg, OrphanProcessReaperConfig::default());
+    }
+
+    #[test]
+    fn test_config_reads_every_knob() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(
+            tmp.path(),
+            r#"{"autonomous": {"processReaper": {"enabled": false, "minAgeSecs": 60,
+               "dryRun": true}}}"#,
+        );
+        assert_eq!(
+            read_config(tmp.path()),
+            OrphanProcessReaperConfig {
+                enabled: Some(false),
+                min_age_secs: Some(60),
+                dry_run: Some(true),
             }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        cond()
+        );
     }
 
     #[test]
-    fn test_kill_pids_terminates_a_setsid_escaped_grandchild() {
-        // `setsid <cmd>` runs <cmd> as the leader of a brand-new session AND
-        // process group — the same escape `timeout` (without --foreground)
-        // performs on its child, per the issue's ps-table evidence. The
-        // leader then forks ITS OWN child (a grandchild relative to us) that
-        // shares the new group/session, mirroring the ngspice-under-timeout
-        // shape.
-        if Command::new("setsid").arg("true").output().is_err() {
-            eprintln!("skipping: `setsid` not available on this platform");
-            return;
+    #[serial]
+    fn test_resolve_enabled_precedence() {
+        std::env::remove_var(ORPHAN_PROCESS_REAPER_ENABLE_ENV);
+        assert!(resolve_enabled(&OrphanProcessReaperConfig::default()));
+        assert!(!resolve_enabled(&OrphanProcessReaperConfig {
+            enabled: Some(false),
+            ..OrphanProcessReaperConfig::default()
+        }));
+        std::env::set_var(ORPHAN_PROCESS_REAPER_ENABLE_ENV, "0");
+        assert!(!resolve_enabled(&OrphanProcessReaperConfig {
+            enabled: Some(true),
+            ..OrphanProcessReaperConfig::default()
+        }));
+        std::env::set_var(ORPHAN_PROCESS_REAPER_ENABLE_ENV, "1");
+        assert!(resolve_enabled(&OrphanProcessReaperConfig {
+            enabled: Some(false),
+            ..OrphanProcessReaperConfig::default()
+        }));
+        std::env::remove_var(ORPHAN_PROCESS_REAPER_ENABLE_ENV);
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_min_age_precedence() {
+        std::env::remove_var(ORPHAN_PROCESS_REAPER_MIN_AGE_ENV);
+        assert_eq!(
+            resolve_min_age_secs(&OrphanProcessReaperConfig::default()),
+            DEFAULT_MIN_ORPHAN_AGE_SECS
+        );
+        let cfg = OrphanProcessReaperConfig {
+            min_age_secs: Some(120),
+            ..OrphanProcessReaperConfig::default()
+        };
+        assert_eq!(resolve_min_age_secs(&cfg), 120);
+        std::env::set_var(ORPHAN_PROCESS_REAPER_MIN_AGE_ENV, "45");
+        assert_eq!(resolve_min_age_secs(&cfg), 45);
+        // Zero/garbage never disables the age gate.
+        std::env::set_var(ORPHAN_PROCESS_REAPER_MIN_AGE_ENV, "0");
+        assert_eq!(resolve_min_age_secs(&cfg), 120);
+        std::env::set_var(ORPHAN_PROCESS_REAPER_MIN_AGE_ENV, "junk");
+        assert_eq!(resolve_min_age_secs(&cfg), 120);
+        std::env::remove_var(ORPHAN_PROCESS_REAPER_MIN_AGE_ENV);
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_dry_run_precedence() {
+        std::env::remove_var(ORPHAN_PROCESS_REAPER_DRY_RUN_ENV);
+        assert!(!resolve_dry_run(&OrphanProcessReaperConfig::default()));
+        assert!(resolve_dry_run(&OrphanProcessReaperConfig {
+            dry_run: Some(true),
+            ..OrphanProcessReaperConfig::default()
+        }));
+        std::env::set_var(ORPHAN_PROCESS_REAPER_DRY_RUN_ENV, "1");
+        assert!(resolve_dry_run(&OrphanProcessReaperConfig::default()));
+        std::env::remove_var(ORPHAN_PROCESS_REAPER_DRY_RUN_ENV);
+    }
+
+    // ===================================================================
+    // Live-fire: a real process tree that escaped via `timeout`
+    // (new pgid + new sid), reaped across process-group boundaries.
+    // ===================================================================
+
+    #[cfg(target_os = "linux")]
+    mod live {
+        use super::*;
+        use std::process::{Command, Stdio};
+
+        /// A real, **orphaned**, process-group-escaping work tree inside
+        /// `worktree`, cleaned up on drop no matter how the test ends.
+        ///
+        /// Shape (the incident's, reproduced):
+        ///
+        /// - a driver shell that loops forever launching `timeout`-wrapped
+        ///   `sleep`s — GNU `timeout` puts its child in a **new process group**
+        ///   and the `setsid` in front puts each batch in a **new session**, so
+        ///   the tree spans exactly the pgid/sid boundaries a `kill(-pgid, …)`
+        ///   teardown cannot cross (#5110's evidence table);
+        /// - double-forked (the intermediate `sh` exits immediately) so the
+        ///   driver reparents to `init`/`systemd`, reproducing the "the agent
+        ///   is GONE" shape rather than being this test process's own child —
+        ///   which also means the reaper's own "never touch your descendants"
+        ///   fail-safe is not what makes these tests pass.
+        ///
+        /// The `Drop` impl is load-bearing: a fixture that outlives a *failing*
+        /// test would itself become the runaway this module exists to kill.
+        struct Fixture {
+            worktree: PathBuf,
+            driver_pid: u32,
         }
 
-        let dir = tempfile::tempdir().unwrap();
-        let gc_pidfile = dir.path().join("grandchild.pid");
-        let script = format!("sleep 300 & echo $! > {}; exec sleep 300", gc_pidfile.display());
+        impl Fixture {
+            fn spawn(worktree: &Path) -> Self {
+                let script = worktree.join("run_all.sh");
+                fs::write(
+                    &script,
+                    "#!/bin/sh\n\
+                     echo $$ > \"$(dirname \"$0\")/driver.pid\"\n\
+                     while true; do\n\
+                     \x20 setsid timeout 60 sleep 60 &\n\
+                     \x20 sleep 1\n\
+                     done\n",
+                )
+                .unwrap();
+                let status = Command::new("sh")
+                    .arg("-c")
+                    .arg(format!("setsid sh {} </dev/null >/dev/null 2>&1 &", script.display()))
+                    .current_dir(worktree)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .unwrap();
+                assert!(status.success());
 
-        let mut child = Command::new("setsid")
-            .args(["bash", "-c", &script])
-            .spawn()
+                let pid_file = worktree.join("driver.pid");
+                let deadline = std::time::Instant::now() + Duration::from_secs(20);
+                while std::time::Instant::now() < deadline {
+                    if let Ok(pid) = fs::read_to_string(&pid_file)
+                        .map(|raw| raw.trim().to_string())
+                        .and_then(|raw| {
+                            raw.parse::<u32>()
+                                .map_err(|e| std::io::Error::other(e.to_string()))
+                        })
+                    {
+                        return Self {
+                            worktree: worktree.to_path_buf(),
+                            driver_pid: pid,
+                        };
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                panic!("driver never reported its pid");
+            }
+
+            /// Block until the driver has escaped into at least `n` other
+            /// processes (a `timeout` and its `sleep`).
+            fn wait_for_escape(&self, n: usize) {
+                assert!(
+                    wait_for(|| live_descendants(self.driver_pid).len() >= n, 20),
+                    "driver never spawned a timeout-wrapped child"
+                );
+            }
+        }
+
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                // Kill the driver first so it cannot issue another batch, then
+                // sweep everything still working in the worktree (bounded).
+                crate::sweep_registry::send_signal(self.driver_pid, libc::SIGKILL);
+                for _ in 0..30 {
+                    let mut pending = live_in_worktree(&self.worktree);
+                    for pid in pending.clone() {
+                        pending.extend(live_descendants(pid));
+                    }
+                    if pending.is_empty() {
+                        return;
+                    }
+                    for pid in pending {
+                        crate::sweep_registry::send_signal(pid, libc::SIGKILL);
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+        }
+
+        fn wait_for<F: Fn() -> bool>(f: F, secs: u64) -> bool {
+            let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+            while std::time::Instant::now() < deadline {
+                if f() {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            f()
+        }
+
+        fn live_descendants(root: u32) -> Vec<u32> {
+            let procs = snapshot_processes();
+            descendants_of(&[root], &children_map(&procs))
+        }
+
+        /// Every live process (other than this test) still working inside
+        /// `worktree` — the "did anything survive or respawn?" oracle, which
+        /// unlike a descendant walk survives the driver's own death (its
+        /// children reparent to init the moment it dies).
+        fn live_in_worktree(worktree: &Path) -> Vec<u32> {
+            let self_pid = std::process::id();
+            snapshot_processes()
+                .into_iter()
+                .filter(|p| p.pid != self_pid && references_worktree(p, worktree))
+                .map(|p| p.pid)
+                .collect()
+        }
+
+        /// Wait until `pid`'s age — as the reaper itself computes it, from
+        /// `/proc/<pid>/stat`'s `starttime` against `/proc/uptime` — reaches
+        /// `secs`, so a test *exercises* the age gate instead of racing it.
+        fn wait_until_age(pid: u32, secs: u64) {
+            assert!(
+                wait_for(
+                    || snapshot_processes()
+                        .iter()
+                        .any(|p| p.pid == pid && p.age_secs.is_some_and(|a| a >= secs)),
+                    30
+                ),
+                "pid {pid} never reached age {secs}s"
+            );
+        }
+
+        fn alive(pid: u32) -> bool {
+            crate::sweep_registry::is_pid_alive(pid)
+        }
+
+        /// A managed `issue-<N>` worktree under a throwaway repo root.
+        fn managed_repo(issue: u32) -> (tempfile::TempDir, PathBuf) {
+            let repo = tempfile::tempdir().unwrap();
+            let wt = repo.path().join(format!(".loom/worktrees/issue-{issue}"));
+            fs::create_dir_all(&wt).unwrap();
+            let wt = wt.canonicalize().unwrap();
+            fs::write(wt.join(".loom-managed"), "").unwrap();
+            (repo, wt)
+        }
+
+        fn test_config(dry_run: bool) -> OrphanProcessReaperConfig {
+            OrphanProcessReaperConfig {
+                enabled: Some(true),
+                min_age_secs: Some(1),
+                dry_run: Some(dry_run),
+            }
+        }
+
+        // The env-var precedence tests above mutate `LOOM_ORPHAN_PROCESS_REAPER_*`
+        // process-wide, which would otherwise race these passes' own knob
+        // resolution — hence `#[serial]` on every live test.
+
+        #[test]
+        #[serial]
+        fn test_escaped_tree_is_reaped_across_process_group_boundaries() {
+            let tmp = tempfile::tempdir().unwrap();
+            let wt = tmp.path().canonicalize().unwrap();
+            fs::write(wt.join(".loom-managed"), "").unwrap();
+            let fixture = Fixture::spawn(&wt);
+            let driver_pid = fixture.driver_pid;
+            fixture.wait_for_escape(2);
+
+            let escaped: Vec<u32> = live_descendants(driver_pid);
+            let procs = snapshot_processes();
+            let by_pid: HashMap<u32, &ProcEntry> = procs.iter().map(|p| (p.pid, p)).collect();
+
+            // The driver really is orphaned (not our child), so the reaper's
+            // "never touch your own descendants" fail-safe is not what makes
+            // this test pass.
+            assert_ne!(
+                by_pid.get(&driver_pid).map(|p| p.ppid),
+                Some(std::process::id()),
+                "fixture was not orphaned"
+            );
+
+            // The fixture escapes a pgid-scoped teardown: at least one
+            // descendant is in a different process group than the driver.
+            let driver_pgid = crate::sweep_registry::process_group_of(driver_pid);
+            let escaped_group = escaped.iter().any(|pid| {
+                crate::sweep_registry::process_group_of(*pid)
+                    .is_some_and(|g| Some(g) != driver_pgid)
+            });
+            assert!(
+                escaped_group,
+                "fixture did not escape its process group: {:?}",
+                escaped
+                    .iter()
+                    .filter_map(|p| by_pid.get(p).map(|e| e.describe()))
+                    .collect::<Vec<_>>()
+            );
+
+            // Plan with a zero age floor (the fixture is seconds old) and reap.
+            let plan = plan_orphan_trees(&procs, &[(87, wt.clone())], std::process::id(), 0);
+            assert_eq!(plan.trees.len(), 1, "{plan:?}");
+            assert!(plan.trees[0].pids.contains(&driver_pid));
+
+            let outcome = reap_tree(&plan.trees[0], Duration::from_secs(2), &production_hooks());
+            assert!(!outcome.frozen.is_empty());
+
+            assert!(wait_for(|| !alive(driver_pid), 10), "the driver survived the reap");
+            // Transitive: the descendants that escaped into other process
+            // groups/sessions are gone too.
+            for pid in &escaped {
+                assert!(
+                    wait_for(|| !alive(*pid), 10),
+                    "escaped descendant {pid} (pgid {:?}) survived the reap",
+                    crate::sweep_registry::process_group_of(*pid)
+                );
+            }
+
+            // …and the driver did not get to issue another batch (its interval
+            // is 1s, so this window covers more than one iteration).
+            std::thread::sleep(Duration::from_millis(2500));
+            let survivors = live_in_worktree(&wt);
+            assert!(
+                survivors.is_empty(),
+                "work in the worktree survived or respawned after the reap: {survivors:?}"
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn test_production_pass_reaps_a_genuinely_orphaned_tree() {
+            // The whole pass, end to end: managed worktree, no claim of any
+            // kind, an orphaned driver older than the (test-lowered) age floor
+            // ⇒ the tree is reaped and reported.
+            let (repo, wt) = managed_repo(4245);
+            let fixture = Fixture::spawn(&wt);
+            fixture.wait_for_escape(2);
+            wait_until_age(fixture.driver_pid, 2);
+
+            let report = reap_repo_processes(repo.path(), &test_config(false));
+            assert_eq!(report.trees.len(), 1, "{report:?}");
+            assert_eq!(report.outcomes.len(), 1, "{report:?}");
+            assert!(
+                wait_for(|| !alive(fixture.driver_pid), 10),
+                "the orphaned driver survived the production pass"
+            );
+            std::thread::sleep(Duration::from_millis(2500));
+            let survivors = live_in_worktree(&wt);
+            assert!(survivors.is_empty(), "leftovers after the pass: {survivors:?}");
+        }
+
+        #[test]
+        #[serial]
+        fn test_a_live_claim_makes_the_pass_leave_the_tree_alone() {
+            // The fail-safe, end to end: the same escaping fixture, but the
+            // worktree's issue has a live claim, so the production pass must
+            // find nothing reapable and signal nothing.
+            let (repo, wt) = managed_repo(4242);
+            let fixture = Fixture::spawn(&wt);
+            fixture.wait_for_escape(1);
+            wait_until_age(fixture.driver_pid, 2);
+
+            let lock = repo.path().join(".loom/locks/issue-4242");
+            fs::create_dir_all(&lock).unwrap();
+            fs::write(
+                lock.join("owner.json"),
+                format!(r#"{{"owner_pid": {}, "sweep_id": "s1"}}"#, std::process::id()),
+            )
             .unwrap();
-        let leader_pid = child.id();
 
-        assert!(wait_until(|| gc_pidfile.exists(), 2000), "grandchild pid file should appear");
-        let gc_pid: u32 = fs::read_to_string(&gc_pidfile)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-        assert_ne!(leader_pid, gc_pid);
-        assert!(is_pid_alive(leader_pid));
-        assert!(is_pid_alive(gc_pid));
+            let report = reap_repo_processes(repo.path(), &test_config(false));
+            assert_eq!(report.worktrees_scanned, 1, "{report:?}");
+            assert_eq!(report.unowned_worktrees, 0, "{report:?}");
+            assert!(report.trees.is_empty(), "{report:?}");
+            assert!(
+                report.skipped.iter().any(|(i, r)| *i == 4242
+                    && (r.contains("claim-lock") || r.contains("live sweep claim"))),
+                "{report:?}"
+            );
+            assert!(
+                alive(fixture.driver_pid),
+                "a live-claimed worktree's driver must survive the pass"
+            );
+            assert!(
+                !live_descendants(fixture.driver_pid).is_empty(),
+                "a live-claimed worktree's descendants must survive the pass"
+            );
+        }
 
-        // The whole point: walk descendants by PID (NOT by pgid/sid) and kill
-        // every one — this must reach the grandchild despite it living in a
-        // process group/session this test process never joined.
-        let mut all_pids = collect_descendant_pids(leader_pid);
-        all_pids.push(leader_pid);
-        assert!(
-            all_pids.contains(&gc_pid),
-            "descendant walk must find the setsid-escaped grandchild: {all_pids:?}"
-        );
+        #[test]
+        #[serial]
+        fn test_unmanaged_worktree_processes_are_never_reaped() {
+            // No `.loom-managed` sentinel ⇒ user-provisioned ⇒ untouchable,
+            // even with no claim of any kind on the issue.
+            let repo = tempfile::tempdir().unwrap();
+            let wt = repo.path().join(".loom/worktrees/issue-4243");
+            fs::create_dir_all(&wt).unwrap();
+            let wt = wt.canonicalize().unwrap();
+            let fixture = Fixture::spawn(&wt);
+            fixture.wait_for_escape(1);
+            wait_until_age(fixture.driver_pid, 2);
 
-        let killed = kill_pids(&all_pids, Duration::from_secs(2));
-        assert!(killed.contains(&leader_pid));
-        assert!(killed.contains(&gc_pid));
+            let report = reap_repo_processes(repo.path(), &test_config(false));
+            assert_eq!(report.unowned_worktrees, 0, "{report:?}");
+            assert!(
+                report
+                    .skipped
+                    .iter()
+                    .any(|(i, r)| *i == 4243 && r.contains(".loom-managed")),
+                "{report:?}"
+            );
+            assert!(alive(fixture.driver_pid), "an unmanaged worktree's driver must survive");
+        }
 
-        // The leader is a *direct child* of this test process, so once
-        // kill_pids signals it the leader becomes a zombie until we reap it —
-        // and `is_pid_alive` (kill -0) reports a zombie as still alive, since
-        // POSIX keeps the PID entry until the parent wait()s. Poll try_wait()
-        // for the leader: it reaps the zombie the moment the process has
-        // exited and reports it genuinely dead, which is exactly what happens
-        // in production where the orphan reparents to systemd --user/init and
-        // that init-role process auto-reaps it (the daemon is never the
-        // orphan's parent). The grandchild below, by contrast, reparents to
-        // init when the leader dies and is auto-reaped there, so plain
-        // is_pid_alive polling is correct for it.
-        assert!(
-            wait_until(|| matches!(child.try_wait(), Ok(Some(_))), 3000),
-            "leader should be dead after kill_pids"
-        );
-        assert!(
-            wait_until(|| !is_pid_alive(gc_pid), 3000),
-            "the setsid-escaped grandchild survived — descendant-tree reap did not reach it \
-             (the exact #5110 regression: a pgid-scoped kill would have missed this pid)"
-        );
+        #[test]
+        #[serial]
+        fn test_dry_run_detects_and_logs_without_signalling() {
+            let (repo, wt) = managed_repo(4244);
+            let fixture = Fixture::spawn(&wt);
+            fixture.wait_for_escape(1);
+            wait_until_age(fixture.driver_pid, 2);
+
+            let report = reap_repo_processes(repo.path(), &test_config(true));
+            assert_eq!(report.unowned_worktrees, 1, "{report:?}");
+            assert_eq!(report.trees.len(), 1, "{report:?}");
+            assert!(report.trees[0].pids.contains(&fixture.driver_pid));
+            assert!(report.outcomes.is_empty(), "dry run must not signal");
+            assert!(alive(fixture.driver_pid), "dry run must leave the tree running");
+            drop(wt);
+        }
     }
 }

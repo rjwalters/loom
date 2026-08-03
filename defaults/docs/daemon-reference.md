@@ -3686,51 +3686,6 @@ signal. An unmeasurable probe is skipped, never treated as zero (#4164).
 already-documented behavior whose absence is a slow-motion outage (a full disk
 stops a host running sweeps at all).
 
-**Orphaned processes, not just orphaned directories (#5110).** Every pass also
-runs an orphan-**process** sub-pass ahead of the directory-removal pass above.
-`#4982`'s pgid-scoped teardown reaps a dead sweep's process **group** — but a
-tool like GNU `timeout` spawns its child into a *fresh* process group/session
-unless invoked with `--foreground`, so a multi-level driver script (e.g.
-`bash run_all.sh` → `python3` → `timeout` → a long-running child) can escape a
-pgid-scoped kill entirely and keep running after the sweep that launched it is
-long gone — a real incident pinned a host at load 65 for 5h52m this way,
-starving that host's own dispatched sweep. Each tick this sub-pass finds every
-PID whose cwd is inside an `issue-<N>` worktree (the same probe
-`classify_worktree`'s `SkipInUse` gate already uses), and — only for a worktree
-the removal pass would itself consider dead — walks the FULL descendant tree of
-each such PID by `ppid` (not by pgid/sid, so a `setsid`/`timeout`-escaped tree
-is still reached) and terminates every PID found (SIGTERM, then SIGKILL after a
-short grace), logging what was killed.
-
-"Dead" means **every** gate below clears; any one of them preserves the
-processes and logs why:
-
-| Gate | Mirrors `classify_worktree`'s |
-|------|-------------------------------|
-| `.loom-managed` sentinel present | `require_managed_sentinel` / `SkipUnmanaged` |
-| No live sweep claim for issue N | `SkipInUse` |
-| Issue N is `CLOSED` | `SkipIssueNotClosed` |
-| Its PR is not open, and not unknown | `SkipPrOpen` / `SkipUnknownPrStatus` |
-| A merged PR is past `gracePeriodSecs` | `SkipGrace` |
-
-The forge gates are load-bearing, not belt-and-braces: the live-claim check
-only knows about **daemon-dispatched (Tier 2) sweeps**, so Manual Orchestration
-Mode (`/loom:builder`, `/loom:judge`, `/loom:doctor`) and manual `/loom:sweep`
-runs never appear in it. Since the removal pass treats "a process is using this
-directory" as *protection* while this pass treats it as the *trigger*, without
-the issue-closed / PR-not-open gates a Judge running `cargo test` inside an
-open PR's builder worktree would be indistinguishable from the runaway driver
-this sub-pass exists to kill. An open PR (or open issue) is independent
-evidence the work is alive; a failed forge probe resolves to `UNKNOWN`, which
-is always a skip, never a kill. Forge probes are only issued for a worktree
-that actually has a process running inside it, so an idle host costs no extra
-REST calls. Every gate is re-checked on every pass rather than trusted from a
-snapshot, because a stale verdict here is irreversible (a live agent's own
-process killed) unlike a stale removal verdict (a no-op retried next tick).
-Shares this loop's enable/interval cadence but has its own opt-out, since
-terminating a live process is a strictly more consequential action than
-removing an already-idle directory.
-
 ```json
 {
   "autonomous": {
@@ -3738,8 +3693,7 @@ removing an already-idle directory.
       "enabled": true,
       "intervalSecs": 900,
       "gracePeriodSecs": 600,
-      "diskWarnFreeGb": 20,
-      "orphanProcessReapEnabled": true
+      "diskWarnFreeGb": 20
     }
   }
 }
@@ -3751,7 +3705,6 @@ removing an already-idle directory.
 | `LOOM_WORKTREE_REAPER_INTERVAL_SECS` | `autonomous.worktreeReaper.intervalSecs` | env > config > default | `900` (15 min) |
 | — | `autonomous.worktreeReaper.gracePeriodSecs` | config > default | `600` (10 min) |
 | `LOOM_WORKTREE_REAPER_DISK_WARN_GB` | `autonomous.worktreeReaper.diskWarnFreeGb` | env > config > default | `20` |
-| `LOOM_ORPHAN_PROCESS_REAPER` | `autonomous.worktreeReaper.orphanProcessReapEnabled` | env > config > default | `true` (on) |
 
 **Not limited to the daemon's attached workspace.** The loop walks
 `WorkspaceRegistry::effective_roots()` each tick, so a daemon started from
@@ -3765,6 +3718,78 @@ superset recovery path that reports zero errors when the loop already cleaned
 up. The first tick after daemon startup is deliberately skipped so in-flight
 sweeps can re-establish their `.loom-in-use` markers first. See
 `loom-daemon/src/worktree_reaper.rs`.
+
+### Orphaned-process reaper (#5110)
+
+**The problem.** An agent's *background process tree* can outlive the agent. On
+2026-08-03 `loom-worker-1` sat at **load 65 on 8 cores for 5h52m with no active
+Loom work**: an agent-generated driver script inside `.loom/worktrees/issue-87`
+had lost its parent, reparented to `systemd --user`, and kept issuing fresh
+batches of simulations forever. Killing the running sims did nothing — the
+driver launched eight more within 20 seconds. The host's *own* dispatched sweep
+was starved to 0.6% CPU for 5h33m while holding a forge claim it could not
+advance.
+
+**Why the pgid teardown could not reach it.** A dead sweep's process group is
+signalled with `kill(-pgid, …)` (#4982/#4980), but GNU `timeout` puts its child
+in a **new process group** unless `--foreground`, so that tree spanned three
+groups and two sessions — a group kill reaps one of them. And once the sweep
+leader is gone its descendants have reparented, so there is no parent link left
+to walk either. The only durable link between a runaway process and the work it
+belongs to is **the worktree it is running in**.
+
+**What it does.** On the worktree-reaper tick (before the directory pass), for
+each `issue-<N>` worktree that is provably unowned, the daemon snapshots
+`/proc`, attributes processes to the worktree by **cwd inside it** or **argv
+referencing it**, expands each hit to its **whole descendant tree** through the
+ppid map (which survives `setpgid`/`setsid` where the pgid does not), and
+terminates it **freeze-first**: `SIGSTOP` parent-first so a looping driver
+cannot issue another batch, a re-snapshot to catch anything forked in the
+meantime, then `SIGTERM` + `SIGCONT`, and `SIGKILL` only for survivors after a
+5s grace. Every pid killed is logged with its age and argv.
+
+**Fail-safes.** A worktree's processes are touched only when **all** hold: the
+`.loom-managed` sentinel is present (user-provisioned worktrees are never
+touched), no `.loom-in-use` marker, no live spawn-loop task or claim-lock, no
+confirmed-live sweep claim (`live_claim::probe` — re-checked immediately before
+each kill, so a sweep that starts mid-pass is still protected), **no live agent
+runtime working inside the worktree** (a `claude`/`codex` process, or any argv
+naming a `/loom:` slash command — the incident's defining property is that the
+agent was *gone*, and this is what covers PR-set sweeps and manually driven
+agents that claim no issue), the seed process is older than `minAgeSecs`, and
+the tree contains neither this daemon nor its ancestors nor its own children.
+Every ambiguity (unreadable `/proc` entry,
+unknown process age, non-Linux host) resolves to *skip* — under-reaping is
+recoverable on the next tick, a false-positive kill is not.
+
+**Default-on**, with `dryRun` for operators who want to watch it first (it
+detects and logs the trees it *would* reap and signals nothing).
+
+```json
+{
+  "autonomous": {
+    "processReaper": {
+      "enabled": true,
+      "minAgeSecs": 1800,
+      "dryRun": false
+    }
+  }
+}
+```
+
+| Env var | Config key | Precedence | Default |
+|---------|-----------|------------|---------|
+| `LOOM_ORPHAN_PROCESS_REAPER` | `autonomous.processReaper.enabled` | env > config > default | `true` (on) |
+| `LOOM_ORPHAN_PROCESS_REAPER_MIN_AGE_SECS` | `autonomous.processReaper.minAgeSecs` | env > config > default | `1800` (30 min) |
+| `LOOM_ORPHAN_PROCESS_REAPER_DRY_RUN` | `autonomous.processReaper.dryRun` | env > config > default | `false` |
+
+**Operator note.** `minAgeSecs` is the knob that keeps an *interactive* command
+you are running inside an issue worktree safe: a process is only ever a reap
+seed once it is older than that floor **and** nothing claims its issue. If you
+routinely run long jobs by hand in a finished issue's worktree, raise
+`minAgeSecs`, drop a `.loom-in-use` file in the worktree, or turn the pass off.
+Linux-only (it needs `/proc`); on other hosts the pass is a no-op. See
+`loom-daemon/src/orphan_process_reaper.rs`.
 
 ### Autonomous periodic support-role runner (#4015)
 
