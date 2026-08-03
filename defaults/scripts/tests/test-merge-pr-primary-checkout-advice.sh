@@ -126,6 +126,11 @@ git -C "$PRIMARY" config user.name "Test"
 echo "hello" > "$PRIMARY/README.md"
 git -C "$PRIMARY" add -A
 git -C "$PRIMARY" commit -q -m "initial"
+# Normalize the initial branch name so the test does not depend on the
+# runner's init.defaultBranch git config — _maybe_delete_local_branch()'s
+# auto-cleanup does `git checkout "$DEFAULT_BRANCH_NAME"` (main), which would
+# otherwise fail on runners where `git init` does not name the branch `main`.
+git -C "$PRIMARY" branch -M main
 
 # The merged PR's branch, checked out directly in the primary — NO
 # .loom-managed sentinel here (this is the real-world case: the primary
