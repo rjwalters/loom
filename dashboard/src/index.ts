@@ -104,7 +104,7 @@
 
 import { extractBearerToken, authenticateHost, hashIngestKey } from "./auth";
 import { validateAccessJwt } from "./accessAuth";
-import { FleetState, type FleetSnapshot } from "./fleetState";
+import { FleetState, filterRevokedHosts, type FleetSnapshot } from "./fleetState";
 import { renderPublicPage } from "./publicPage";
 import {
   createLiveTailStream,
@@ -162,6 +162,37 @@ function jsonError(status: number, message: string): Response {
 
 function fleetStateStub(env: Env): DurableObjectStub {
   return env.FLEET_STATE.get(env.FLEET_STATE.idFromName(FLEET_STATE_ID_NAME));
+}
+
+/** D1 host_ids, among `hostIds`, whose `hosts` row is revoked — bounded to
+ * the snapshot's own host set rather than scanning the whole `hosts` table,
+ * since that is all `filterRevokedHosts` needs. */
+async function fetchRevokedHostIds(env: Env, hostIds: readonly string[]): Promise<Set<string>> {
+  if (hostIds.length === 0) return new Set();
+  const placeholders = hostIds.map(() => "?").join(",");
+  const { results } = await env.DB.prepare(
+    `SELECT host_id FROM hosts WHERE revoked_at IS NOT NULL AND host_id IN (${placeholders})`,
+  )
+    .bind(...hostIds)
+    .all<{ host_id: string }>();
+  return new Set(results.map((row) => row.host_id));
+}
+
+/**
+ * The Durable Object's live snapshot, with any host D1 has recorded as
+ * revoked filtered out (issue #5078, mechanism 2) — the single point every
+ * dashboard-facing read (`/api/fleet-state`, `/public/fleet-state`, the
+ * server-rendered `/` fallback) goes through, so a `handleRevokeHost` cleanup
+ * fetch that silently failed can never leave a stale `health:`/`tokens:`
+ * entry rendering as a live host. `GET /admin/fleet-state` deliberately does
+ * **not** use this helper — it is introspection of the DO's own raw state
+ * (see its route doc), and filtering there would hide the very staleness it
+ * exists to let an operator diagnose. */
+async function fetchLiveFleetSnapshot(env: Env): Promise<FleetSnapshot> {
+  const response = await fleetStateStub(env).fetch("https://fleet-state/snapshot");
+  const snapshot = (await response.json()) as FleetSnapshot;
+  const revokedHostIds = await fetchRevokedHostIds(env, Object.keys(snapshot.hosts));
+  return filterRevokedHosts(snapshot, revokedHostIds);
 }
 
 // ---------------------------------------------------------------------------
@@ -421,15 +452,16 @@ async function handleAdmin(request: Request, env: Env, url: URL): Promise<Respon
 // ---------------------------------------------------------------------------
 
 /** `GET /api/fleet-state` (authenticated) / `GET /public/fleet-state`
- * (public, redacted) — the query-API equivalent of `GET /admin/fleet-state`:
- * same Durable Object snapshot, no admin token required. `isAuthenticated`
- * is purely a function of which route matched (see the module doc); the
- * response is redacted via `./redaction.ts` when it is `false`. */
+ * (public, redacted) — the query-API equivalent of `GET /admin/fleet-state`,
+ * but through `fetchLiveFleetSnapshot` rather than the DO's raw snapshot, so
+ * a D1-revoked host filtered there never reaches either response — no admin
+ * token required. `isAuthenticated` is purely a function of which route
+ * matched (see the module doc); the response is redacted via
+ * `./redaction.ts` when it is `false`. */
 async function handleFleetStateQuery(env: Env, isAuthenticated: boolean): Promise<Response> {
-  const response = await fleetStateStub(env).fetch("https://fleet-state/snapshot");
-  const snapshot = (await response.json()) as FleetSnapshot;
+  const snapshot = await fetchLiveFleetSnapshot(env);
   const body = isAuthenticated ? snapshot : redactFleetSnapshot(snapshot, isAuthenticated);
-  return new Response(JSON.stringify(body), { status: response.status, headers: JSON_HEADERS });
+  return new Response(JSON.stringify(body), { status: 200, headers: JSON_HEADERS });
 }
 
 /** `GET /api/history` (authenticated) / `GET /public/history` (public,
@@ -485,8 +517,7 @@ function handleLiveTail(request: Request, env: Env, url: URL, isAuthenticated: b
  * (the root route below) has already confirmed the JWT via
  * `./accessAuth.ts` before reaching here. */
 async function handleDashboardPage(env: Env, isAuthenticated: boolean): Promise<Response> {
-  const stateResponse = await fleetStateStub(env).fetch("https://fleet-state/snapshot");
-  const snapshot = (await stateResponse.json()) as FleetSnapshot;
+  const snapshot = await fetchLiveFleetSnapshot(env);
   const displaySnapshot = isAuthenticated ? snapshot : redactFleetSnapshot(snapshot, false);
 
   const historyResult = await queryHistory(env.DB, { limit: DEFAULT_HISTORY_LIMIT });

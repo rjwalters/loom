@@ -297,6 +297,121 @@ describe("renderFleetOverview — host staleness (issue #4957)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Phantom fleet member (issue #5078): a `sweep:`-only host must never render
+// as a fleet card or inflate the header host count, and its sweeps must
+// still be visible somewhere (not silently dropped) rather than commingled
+// with the "Active sweeps" count of hosts with real health data.
+// ---------------------------------------------------------------------------
+
+describe("renderFleetOverview — unattributed sweeps (issue #5078)", () => {
+  const NOW = new Date("2026-08-03T12:00:00Z");
+
+  function sweepFor(hostId: string, overrides: Partial<PublicActiveSweep> = {}): PublicActiveSweep {
+    return {
+      hostId,
+      visibility: "public",
+      repo: "rjwalters/loom",
+      issue: 5078,
+      sweepId: `sweep-${hostId}`,
+      phase: "builder",
+      startedAt: "2026-08-03T11:00:00Z",
+      updatedAt: "2026-08-03T11:55:00Z",
+      ...overrides,
+    };
+  }
+
+  it("a snapshot containing only a sweep: entry (no health: entry for that host) renders no fleet card for it", () => {
+    const snapshot: RedactedFleetSnapshot = {
+      hosts: {},
+      activeSweeps: [sweepFor("sweep-only-host")],
+    };
+    const html = renderFleetOverview(snapshot, NOW);
+    // No card/row for the phantom host in the Hosts table specifically, and
+    // the header count is 0 — not 1. (The host id is still expected to
+    // appear elsewhere on the page, in the Unattributed sweeps table — see
+    // the next test — so this asserts against the Hosts table body only.)
+    expect(html).toContain("Hosts (0)");
+    const hostsTableBody = html.slice(html.indexOf("<h3>Hosts"), html.indexOf("<h3>Active sweeps"));
+    expect(hostsTableBody).not.toContain("sweep-only-host");
+    expect(hostsTableBody).toContain("No host health reported yet.");
+  });
+
+  it("does not count a sweep-only host's sweeps in the primary Active sweeps total", () => {
+    const snapshot: RedactedFleetSnapshot = {
+      hosts: {},
+      activeSweeps: [sweepFor("sweep-only-host")],
+    };
+    const html = renderFleetOverview(snapshot, NOW);
+    expect(html).toContain("Active sweeps (0)");
+  });
+
+  it("groups a sweep-only host's sweeps into a distinct Unattributed sweeps section instead of hiding them", () => {
+    const snapshot: RedactedFleetSnapshot = {
+      hosts: {},
+      activeSweeps: [sweepFor("sweep-only-host")],
+    };
+    const html = renderFleetOverview(snapshot, NOW);
+    expect(html).toContain("Unattributed sweeps (1)");
+    expect(html).toContain("sweep-only-host");
+    expect(html).toContain("#5078");
+  });
+
+  it("a host with real health data keeps its sweeps in the primary Active sweeps table, not unattributed", () => {
+    const snapshot: RedactedFleetSnapshot = {
+      hosts: {
+        "host-a": { health: { record: { kind: "host.health" }, updatedAt: "2026-08-03T11:58:00Z" } },
+      },
+      activeSweeps: [sweepFor("host-a")],
+    };
+    const html = renderFleetOverview(snapshot, NOW);
+    expect(html).toContain("Active sweeps (1)");
+    expect(html).not.toContain("Unattributed sweeps");
+  });
+
+  it("a host known only from tokens.snapshot (no health) does not render a card or count toward Hosts", () => {
+    // Belt-and-braces: the header count must track health data specifically,
+    // not "any snapshot.hosts entry" — a tokens-only host never rendered a
+    // row (renderHostHealthRow returns "" without health) but was still
+    // being counted in the pre-fix heading.
+    const snapshot: RedactedFleetSnapshot = {
+      hosts: {
+        "tokens-only-host": {
+          tokens: { record: { kind: "tokens.snapshot" }, updatedAt: "2026-08-03T11:58:00Z" },
+        },
+      },
+      activeSweeps: [],
+    };
+    const html = renderFleetOverview(snapshot, NOW);
+    expect(html).toContain("Hosts (0)");
+  });
+
+  it("a mid-run-revoke anomaly (a host with in-flight sweeps but no health entry) stays discoverable, not silently dropped", () => {
+    // Mirrors fleetState.ts's removeHost, which deliberately never touches
+    // sweep: entries on revoke — the host's card disappears, but its sweeps
+    // must remain visible as a signal something needs investigating.
+    const snapshot: RedactedFleetSnapshot = {
+      hosts: {},
+      activeSweeps: [sweepFor("revoked-mid-run", { sweepId: "sweep-mid-run" })],
+    };
+    const html = renderFleetOverview(snapshot, NOW);
+    expect(html).toContain("Unattributed sweeps (1)");
+    expect(html).toContain("revoked-mid-run");
+    expect(html).toContain("sweep-mid-run");
+  });
+
+  it("no Unattributed sweeps section renders when every sweep is attributed", () => {
+    const snapshot: RedactedFleetSnapshot = {
+      hosts: {
+        "host-a": { health: { record: { kind: "host.health" }, updatedAt: "2026-08-03T11:58:00Z" } },
+      },
+      activeSweeps: [sweepFor("host-a")],
+    };
+    const html = renderFleetOverview(snapshot, NOW);
+    expect(html).not.toContain("Unattributed sweeps");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Host saturation (issue #4998): a per-host `load_per_core` signal
 // distinguishable from an idle host without expanding details, with
 // thresholds matching `loom-daemon`'s `host_breaker`
