@@ -469,7 +469,7 @@ mod tests {
     // is precisely why #4982's pgid-scoped teardown cannot reach it.
     // ========================================================================
 
-    fn wait_until<F: Fn() -> bool>(cond: F, timeout_ms: u64) -> bool {
+    fn wait_until<F: FnMut() -> bool>(mut cond: F, timeout_ms: u64) -> bool {
         let start = std::time::Instant::now();
         while start.elapsed().as_millis() < u128::from(timeout_ms) {
             if cond() {
@@ -527,8 +527,19 @@ mod tests {
         assert!(killed.contains(&leader_pid));
         assert!(killed.contains(&gc_pid));
 
+        // The leader is a *direct child* of this test process, so once
+        // kill_pids signals it the leader becomes a zombie until we reap it —
+        // and `is_pid_alive` (kill -0) reports a zombie as still alive, since
+        // POSIX keeps the PID entry until the parent wait()s. Poll try_wait()
+        // for the leader: it reaps the zombie the moment the process has
+        // exited and reports it genuinely dead, which is exactly what happens
+        // in production where the orphan reparents to systemd --user/init and
+        // that init-role process auto-reaps it (the daemon is never the
+        // orphan's parent). The grandchild below, by contrast, reparents to
+        // init when the leader dies and is auto-reaped there, so plain
+        // is_pid_alive polling is correct for it.
         assert!(
-            wait_until(|| !is_pid_alive(leader_pid), 3000),
+            wait_until(|| matches!(child.try_wait(), Ok(Some(_))), 3000),
             "leader should be dead after kill_pids"
         );
         assert!(
@@ -536,7 +547,5 @@ mod tests {
             "the setsid-escaped grandchild survived — descendant-tree reap did not reach it \
              (the exact #5110 regression: a pgid-scoped kill would have missed this pid)"
         );
-
-        let _ = child.wait();
     }
 }
