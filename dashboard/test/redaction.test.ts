@@ -267,6 +267,33 @@ describe("redactPayload — per-kind field allowlist", () => {
     expect(redactPayload("host.health", payload)).toEqual(payload);
   });
 
+  it("host.health: role-tick health (roles) survives redaction, including the workspace root (#5022)", () => {
+    // Names a role and a local workspace path, neither of which is a repo,
+    // issue, branch, or operator — same "describes the machine, not the
+    // work" reasoning as dispatch_halted/halt_reason directly above it.
+    const payload = {
+      kind: "host.health",
+      captured_at: "2026-08-02T12:00:00Z",
+      daemon_version: "0.17.0",
+      uptime_sec: 86400,
+      logical_cpus: 28,
+      roles: {
+        total: 3,
+        ok: 1,
+        persistent: [
+          {
+            root: "/repos/loom",
+            role: "judge",
+            failures: 2,
+            last_at: "2026-08-02T11:59:00Z",
+            detail: "no-token-pool",
+          },
+        ],
+      },
+    };
+    expect(redactPayload("host.health", payload)).toEqual(payload);
+  });
+
   it("host.health: a private repo's slug is redacted, but every other field survives unchanged (#4976)", () => {
     const payload = {
       kind: "host.health",

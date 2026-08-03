@@ -11,6 +11,7 @@ import {
   NOW,
   SWEEP_ONLY_HOST_ID,
   multiHostSnapshot,
+  persistentRoleTickFailureFixture,
 } from "./fixtures";
 
 // Views call `formatAbsolute()` internally with no zone argument, so they
@@ -62,6 +63,35 @@ describe("hostDetailView — health panel", () => {
     const rendered = detail(DEGRADED_HOST_ID);
     expect(fieldValue(rendered, "Build commit")).toBe(UNKNOWN);
     expect(fieldValue(rendered, "Built at")).toBe(UNKNOWN);
+  });
+
+  it("renders the role-tick health summary, ok for the healthy fixture (#5022)", () => {
+    const rendered = detail(HEALTHY_HOST_ID);
+    expect(fieldValue(rendered, "Role ticks")).toBe("12/12 ticks ok");
+  });
+
+  it("names a persistent role-tick failure in the health panel (#5022)", () => {
+    const built = buildFleetView(
+      parseFleetSnapshot({
+        hosts: {
+          h: {
+            health: {
+              record: { kind: "host.health", roles: persistentRoleTickFailureFixture() },
+              updatedAt: "2026-07-30T12:09:00Z",
+            },
+          },
+        },
+        activeSweeps: [],
+      }),
+      NOW,
+    );
+    const rendered = hostDetailView(built.hosts[0]!, NOW);
+    expect(fieldValue(rendered, "Role ticks")).toBe(
+      "1/3 ticks ok; 1 persistent failure(s): judge @ loom",
+    );
+    expect(rendered.querySelector('[data-testid="status-badge"]')?.getAttribute("data-status")).toBe(
+      "degraded",
+    );
   });
 
   it("explains a host that has no health record yet", () => {

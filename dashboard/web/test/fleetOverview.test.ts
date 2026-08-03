@@ -14,6 +14,7 @@ import {
   SWEEP_ONLY_HOST_ID,
   isoMinutesBefore,
   multiHostSnapshot,
+  persistentRoleTickFailureFixture,
 } from "./fixtures";
 
 const view = () => buildFleetView(parseFleetSnapshot(multiHostSnapshot()), NOW);
@@ -176,6 +177,37 @@ describe("hostCard", () => {
     // point) — but carry no in-flight chip.
     const idleRow = repoRows.find((row) => row.textContent?.includes("2AMLogic/gf180-pll"));
     expect(idleRow?.querySelector(".chip")).toBeNull();
+  });
+
+  // #5022: compact per-host role-tick indicator.
+  it("shows the compact role-tick indicator at a glance", () => {
+    expect(fieldValue(hostCard(findHost(view(), HEALTHY_HOST_ID)!, NOW), "Roles")).toBe("ok");
+  });
+
+  it("shows unknown when the host has never reported roles", () => {
+    expect(fieldValue(hostCard(findHost(view(), DEGRADED_HOST_ID)!, NOW), "Roles")).toBe(UNKNOWN);
+  });
+
+  it("badges a host with a persistent role-tick failure as degraded, distinguishable from a healthy host", () => {
+    const built = buildFleetView(
+      parseFleetSnapshot({
+        hosts: {
+          h: {
+            health: {
+              record: { kind: "host.health", roles: persistentRoleTickFailureFixture() },
+              updatedAt: isoMinutesBefore(1),
+            },
+          },
+        },
+        activeSweeps: [],
+      }),
+      NOW,
+    );
+    const card = hostCard(findHost(built, "h")!, NOW);
+    expect(fieldValue(card, "Roles")).toBe("1 failing");
+    const badge = card.querySelector('[data-testid="status-badge"]');
+    expect(badge?.getAttribute("data-status")).toBe("degraded");
+    expect(badge?.getAttribute("title")).toBe("role tick(s) persistently failing: judge @ loom");
   });
 
   it("says 'none' for a host with no registered repos", () => {

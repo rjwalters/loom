@@ -36,6 +36,33 @@ export interface ManagedRepoEntry {
   visibility?: "public" | "private";
 }
 
+/** One `(root, role)` pair's persistent tick-failure detail inside a host's
+ * `roles` role-tick health summary (#5022). `root` is a filesystem workspace
+ * path (not a forge repo slug) — it names no repository. */
+export interface RoleTickFailure {
+  root?: string;
+  role?: string;
+  failures?: number;
+  last_at?: string;
+  detail?: string;
+}
+
+/** `host.health`'s role-tick health summary (#5022) — the same
+ * transient-vs-persistent classification `loom-daemon health`'s `roles`
+ * section already computes, carried through the telemetry pipeline so a role
+ * dying on one host is visible fleet-wide, not only to an operator who
+ * happens to run `loom-daemon health` locally on that host.
+ *
+ * `total: 0` means "no role ticks sampled" (the role runner idle or
+ * disabled) — a normal state, not an error — same as an empty `persistent`
+ * list with `total > 0` means "every tick ok". Absent entirely on a record
+ * from a pre-#5022 daemon. */
+export interface RoleTickHealth {
+  total?: number;
+  ok?: number;
+  persistent?: RoleTickFailure[];
+}
+
 /** `host.health` — CPU/disk headroom, daemon version, uptime.
  *
  * Every measured field is optional by design: the daemon's "unknown != zero"
@@ -74,6 +101,10 @@ export interface HostHealthRecord {
    * idle-but-registered repo still appears. Absent entirely on a host
    * running a pre-#4976 daemon, or one with no registered workspaces. */
   managed_repos?: ManagedRepoEntry[];
+  /** This host's role-tick health (#5022). Absent on a record from a
+   * pre-#5022 daemon, which is indistinguishable from "nothing sampled yet"
+   * — never render its absence as either healthy or degraded. */
+  roles?: RoleTickHealth;
 }
 
 /** One account inside a `tokens.snapshot`. Only `exhausted` is always sent;

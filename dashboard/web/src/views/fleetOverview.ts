@@ -21,6 +21,7 @@ import {
   formatRelative,
   formatAbsolute,
   formatCount,
+  roleTickCompactText,
 } from "../format";
 import type { FleetView, HostStatus, HostView } from "../fleet";
 import type { HostHealthRecord, ManagedRepoEntry } from "../types";
@@ -114,6 +115,13 @@ export function healthFields(host: HostView, now: Date = new Date()): DocumentFr
   fragment.appendChild(field("CPU idle", formatPercent(health.cpu_idle_fraction)));
   fragment.appendChild(field("Load/core", formatRatio(health.load_per_core)));
   fragment.appendChild(field("Worktree free", formatGigabytes(health.worktree_root_free_gb)));
+  fragment.appendChild(
+    field(
+      "Roles",
+      roleTickCompactText(health.roles),
+      "Role-tick health — see the host drill-down for which role(s) are persistently failing (#5022)",
+    ),
+  );
   return fragment;
 }
 

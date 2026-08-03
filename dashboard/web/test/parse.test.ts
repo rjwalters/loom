@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
-import { parseFleetSnapshot } from "../src/parse";
-import { HEALTHY_HOST_ID, multiHostSnapshot } from "./fixtures";
+import { parseFleetSnapshot, parseRoleTickHealth } from "../src/parse";
+import { HEALTHY_HOST_ID, multiHostSnapshot, persistentRoleTickFailureFixture } from "./fixtures";
 
 describe("parseFleetSnapshot", () => {
   it("narrows a well-formed multi-host snapshot", () => {
@@ -211,5 +211,66 @@ describe("parseFleetSnapshot", () => {
       { visibility: "private" },
       { slug: "owner/repo", visibility: "public" },
     ]);
+  });
+
+  // -------------------------------------------------------------------------
+  // host.health.roles — role-tick health (#5022)
+  // -------------------------------------------------------------------------
+
+  it("narrows host.health's roles summary, including a persistent failure", () => {
+    const snapshot = parseFleetSnapshot({
+      hosts: {
+        h: {
+          health: {
+            record: { kind: "host.health", roles: persistentRoleTickFailureFixture() },
+            updatedAt: "2026-07-30T12:00:00Z",
+          },
+        },
+      },
+      activeSweeps: [],
+    });
+    const roles = snapshot.hosts.h?.health?.record.roles;
+    expect(roles?.total).toBe(3);
+    expect(roles?.ok).toBe(1);
+    expect(roles?.persistent).toEqual([
+      {
+        root: "/repos/loom",
+        role: "judge",
+        failures: 2,
+        last_at: "2026-07-30T12:09:00.000Z",
+        detail: "no-token-pool",
+      },
+    ]);
+  });
+
+  it("preserves a genuine total: 0 for roles (role runner idle/disabled), never coercing it to unknown", () => {
+    const parsed = parseRoleTickHealth({ total: 0, ok: 0, persistent: [] });
+    expect(parsed?.total).toBe(0);
+    expect("total" in (parsed ?? {})).toBe(true);
+  });
+
+  it("drops roles entirely when absent — distinct from a genuine zero (a pre-#5022 daemon)", () => {
+    const snapshot = parseFleetSnapshot({
+      hosts: { h: { health: { record: { kind: "host.health" }, updatedAt: "2026-07-30T12:00:00Z" } } },
+      activeSweeps: [],
+    });
+    expect("roles" in (snapshot.hosts.h?.health?.record ?? {})).toBe(false);
+  });
+
+  it("drops a malformed roles.persistent entry rather than the whole roster", () => {
+    const parsed = parseRoleTickHealth({
+      total: 2,
+      ok: 1,
+      persistent: [null, "nope", { role: "judge" }],
+    });
+    // `{ role: "judge" }` (no root/failures/last_at) keeps its place with
+    // just the field it reported; `null`/`"nope"` are dropped entirely.
+    expect(parsed?.persistent).toEqual([{ role: "judge" }]);
+  });
+
+  it("degrades a wrong-typed roles value to absent rather than throwing", () => {
+    expect(parseRoleTickHealth("not-an-object")).toBeUndefined();
+    expect(parseRoleTickHealth(42)).toBeUndefined();
+    expect(parseRoleTickHealth(null)).toBeUndefined();
   });
 });

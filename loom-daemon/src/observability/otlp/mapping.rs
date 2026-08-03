@@ -313,6 +313,43 @@ fn metric_samples_for(envelope: &TelemetryEnvelope) -> Vec<MetricSample> {
                     ),
                     time_unix_nano,
                 },
+                // Role-tick health (Issue #5022): unlike the CPU/disk probes
+                // below, a role-tick count of zero is a real, known value
+                // (the role runner sampled nothing this snapshot — idle or
+                // disabled), not an unmeasurable probe — so these are
+                // unconditional, like `uptime_seconds`/`logical_cpus` above,
+                // rather than gated behind an `Option`.
+                MetricSample {
+                    name: "loom.host.roles_total_ticks",
+                    description: "Total role-tick records sampled in this host.health snapshot.",
+                    unit: "{tick}",
+                    attributes: Vec::new(),
+                    value: number_data_point::Value::AsInt(
+                        i64::try_from(r.roles.total).unwrap_or(i64::MAX),
+                    ),
+                    time_unix_nano,
+                },
+                MetricSample {
+                    name: "loom.host.roles_ok_ticks",
+                    description:
+                        "Successful role-tick records sampled in this host.health snapshot.",
+                    unit: "{tick}",
+                    attributes: Vec::new(),
+                    value: number_data_point::Value::AsInt(
+                        i64::try_from(r.roles.ok).unwrap_or(i64::MAX),
+                    ),
+                    time_unix_nano,
+                },
+                MetricSample {
+                    name: "loom.host.roles_persistent_failures",
+                    description: "Count of (root, role) pairs with a persistent tick failure.",
+                    unit: "1",
+                    attributes: Vec::new(),
+                    value: number_data_point::Value::AsInt(
+                        i64::try_from(r.roles.persistent.len()).unwrap_or(i64::MAX),
+                    ),
+                    time_unix_nano,
+                },
             ];
             if let Some(cpu_idle_fraction) = r.cpu_idle_fraction {
                 samples.push(MetricSample {
@@ -591,6 +628,17 @@ mod tests {
                 dispatch_halted: false,
                 halt_reason: None,
                 managed_repos: Vec::new(),
+                roles: crate::telemetry::RoleTickHealth {
+                    total: 12,
+                    ok: 10,
+                    persistent: vec![crate::telemetry::RoleTickFailureEntry {
+                        root: std::path::PathBuf::from("/repos/loom"),
+                        role: "judge".to_string(),
+                        failures: 2,
+                        last_at: ts(),
+                        detail: Some("no-token-pool".to_string()),
+                    }],
+                },
             }),
         )
     }
@@ -761,9 +809,55 @@ mod tests {
             "loom.host.cpu_idle_fraction",
             "loom.host.load_per_core",
             "loom.host.worktree_root_free_gb",
+            "loom.host.roles_total_ticks",
+            "loom.host.roles_ok_ticks",
+            "loom.host.roles_persistent_failures",
         ] {
             assert!(names.contains(&expected), "missing metric {expected} in {names:?}");
         }
+    }
+
+    #[test]
+    fn role_tick_health_becomes_gauge_metrics_with_the_persistent_failure_count() {
+        // #5022: `host_health_envelope`'s fixture carries one persistent
+        // failure (judge @ /repos/loom, 2 failed ticks of 12 total, 10 ok).
+        let batch = vec![host_health_envelope()];
+        let request = build_metrics_request(&batch).unwrap();
+        let metrics = &request.resource_metrics[0].scope_metrics[0].metrics;
+        let value_of = |name: &str| -> i64 {
+            let metric = metrics
+                .iter()
+                .find(|m| m.name == name)
+                .unwrap_or_else(|| panic!("missing metric {name}"));
+            let points = match &metric.data {
+                Some(metric::Data::Gauge(gauge)) => &gauge.data_points,
+                other => panic!("expected a Gauge for {name}, got {other:?}"),
+            };
+            match points[0].value {
+                Some(number_data_point::Value::AsInt(v)) => v,
+                ref other => panic!("expected AsInt for {name}, got {other:?}"),
+            }
+        };
+        assert_eq!(value_of("loom.host.roles_total_ticks"), 12);
+        assert_eq!(value_of("loom.host.roles_ok_ticks"), 10);
+        assert_eq!(value_of("loom.host.roles_persistent_failures"), 1);
+    }
+
+    #[test]
+    fn role_tick_health_with_no_ticks_sampled_reports_zero_not_no_metric() {
+        // `total: 0` (role runner idle/disabled) is a known value, not an
+        // unmeasurable probe — it must still produce a data point (0), unlike
+        // `cpu_idle_fraction: None` which produces none at all.
+        let mut record = host_health_envelope();
+        if let TelemetryRecord::HostHealth(r) = &mut record.record {
+            r.roles = crate::telemetry::RoleTickHealth::default();
+        }
+        let batch = vec![record];
+        let request = build_metrics_request(&batch).unwrap();
+        let metrics = &request.resource_metrics[0].scope_metrics[0].metrics;
+        let names: Vec<&str> = metrics.iter().map(|m| m.name.as_str()).collect();
+        assert!(names.contains(&"loom.host.roles_total_ticks"));
+        assert!(names.contains(&"loom.host.roles_persistent_failures"));
     }
 
     #[test]
@@ -803,6 +897,7 @@ mod tests {
             dispatch_halted: false,
             halt_reason: None,
             managed_repos: Vec::new(),
+            roles: crate::telemetry::RoleTickHealth::default(),
         };
         let batch = vec![envelope(
             "host-c",

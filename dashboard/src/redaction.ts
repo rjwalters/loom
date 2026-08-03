@@ -136,6 +136,14 @@ const RECORD_FIELD_ALLOWLIST: Readonly<Record<string, readonly string[]>> = {
     // specific repository, so — like `tokens.snapshot`'s `accounts` above —
     // it only ever reaches a public response through `PUBLIC_RECORD_
     // DERIVATIONS`'s `redactManagedRepos`, never a raw copy.
+    //
+    // Role-tick health (#5022): which support role(s) are persistently
+    // failing on this host, and the workspace root each ran against. Neither
+    // names a repo, issue, branch, or operator — same "describes the
+    // machine, not the work" reasoning as `dispatch_halted`/`halt_reason`
+    // above. The workspace root is a local filesystem path, not a forge
+    // slug, so it carries no repo identity either.
+    "roles",
   ],
 };
 

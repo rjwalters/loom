@@ -44,10 +44,10 @@ use chrono::{DateTime, Utc};
 use crate::event_bus::{EventBus, RecvError};
 use crate::telemetry::{
     visibility::derive_visibility, HostHealthRecord, ManagedRepoEntry, PhaseDuration,
-    RepoVisibility, SweepResult, SweepStartedRecord, TelemetryEnvelope, TelemetryRecord,
-    TokenAccountState, TokenSnapshotRecord,
+    RepoVisibility, RoleTickFailureEntry, RoleTickHealth, SweepResult, SweepStartedRecord,
+    TelemetryEnvelope, TelemetryRecord, TokenAccountState, TokenSnapshotRecord,
 };
-use crate::types::{Event, SweepKind};
+use crate::types::{Event, RoleTickRecord, SweepKind};
 use crate::workspace_pool::WorkspacePool;
 
 use super::queue::DurableQueue;
@@ -511,6 +511,39 @@ async fn sample_host_health(
         dispatch_halted,
         halt_reason,
         managed_repos: collect_managed_repos(workspace_pool, slug_cache).await,
+        roles: sample_role_tick_health(&crate::role_runner::role_tick_records()),
+    }
+}
+
+/// Sample this host's role-tick health (Issue #5022) from the process-global
+/// ring [`crate::role_runner::role_tick_records`] maintains. Reuses
+/// [`crate::health::summarize_role_ticks`] — the exact transient-vs-persistent
+/// classifier `loom-daemon health`'s `roles` section already applies — rather
+/// than inventing a second one, so the two can never disagree about which
+/// `(root, role)` pairs are persistently failing.
+///
+/// Unlike `loom-daemon health --since`, this samples the **entire** ring
+/// ([`DateTime::<Utc>::MIN_UTC`] as the window start) rather than a caller-
+/// chosen window: the ring itself is already bounded
+/// ([`crate::role_runner::ROLE_TICK_RING_CAPACITY`]), so a periodic
+/// `host.health` push has no separate window concept to apply — it always
+/// reports the freshest picture the ring holds.
+fn sample_role_tick_health(records: &[RoleTickRecord]) -> RoleTickHealth {
+    let summary = crate::health::summarize_role_ticks(records, DateTime::<Utc>::MIN_UTC);
+    RoleTickHealth {
+        total: summary.total,
+        ok: summary.ok,
+        persistent: summary
+            .persistent
+            .into_iter()
+            .map(|failure| RoleTickFailureEntry {
+                root: failure.root,
+                role: failure.role,
+                failures: failure.failures,
+                last_at: failure.last_at,
+                detail: failure.detail,
+            })
+            .collect(),
     }
 }
 
@@ -1074,6 +1107,114 @@ mod tests {
             record.managed_repos.is_empty(),
             "an empty pool has no registered repos to report"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // sample_role_tick_health (#5022) — the pure classifier, tested directly
+    // against a hand-built fixture so it needs neither the process-global
+    // ring `crate::role_runner::role_tick_records()` reads (shared across
+    // every test in this binary, with no `pub(crate)` reset hook reachable
+    // from this module) nor a daemon.
+    // ------------------------------------------------------------------
+
+    fn tick(
+        root: &str,
+        role: &str,
+        ok: bool,
+        detail: Option<&str>,
+        at: DateTime<Utc>,
+    ) -> RoleTickRecord {
+        RoleTickRecord {
+            root: PathBuf::from(root),
+            role: role.to_string(),
+            at,
+            ok,
+            detail: detail.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn sample_role_tick_health_reports_totals_and_a_persistent_failure() {
+        let now = Utc::now();
+        let records = vec![
+            tick(
+                "/repos/loom",
+                "judge",
+                false,
+                Some("no-token-pool"),
+                now - chrono::Duration::minutes(5),
+            ),
+            tick("/repos/loom", "judge", false, Some("no-token-pool"), now),
+            tick("/repos/loom", "curator", true, None, now),
+        ];
+        let health = sample_role_tick_health(&records);
+        assert_eq!(health.total, 3);
+        assert_eq!(health.ok, 1);
+        assert_eq!(health.persistent.len(), 1);
+        assert_eq!(health.persistent[0].role, "judge");
+        assert_eq!(health.persistent[0].root, PathBuf::from("/repos/loom"));
+        assert_eq!(health.persistent[0].failures, 2);
+        assert_eq!(health.persistent[0].detail.as_deref(), Some("no-token-pool"));
+    }
+
+    #[test]
+    fn sample_role_tick_health_does_not_surface_a_self_recovered_transient_failure() {
+        let now = Utc::now();
+        let records = vec![
+            tick(
+                "/repos/loom",
+                "guide",
+                false,
+                Some("timeout"),
+                now - chrono::Duration::minutes(1),
+            ),
+            // Same pair's latest record is a success — self-recovered, so it
+            // must not appear in `persistent` (mirrors `assess_roles`'s own
+            // transient-vs-persistent rule).
+            tick("/repos/loom", "guide", true, None, now),
+        ];
+        let health = sample_role_tick_health(&records);
+        assert_eq!(health.total, 2);
+        assert_eq!(health.ok, 1);
+        assert!(health.persistent.is_empty());
+    }
+
+    #[test]
+    fn sample_role_tick_health_of_an_empty_ring_reports_zero_ticks_not_an_error() {
+        // The role runner idle or disabled entirely — "no role ticks", not a
+        // degraded state (the Test Plan's edge case).
+        let health = sample_role_tick_health(&[]);
+        assert_eq!(health.total, 0);
+        assert_eq!(health.ok, 0);
+        assert!(health.persistent.is_empty());
+    }
+
+    #[tokio::test]
+    async fn host_health_sample_surfaces_a_persistent_role_tick_failure() {
+        // Integration-level: goes through the real process-global ring
+        // `crate::role_runner::record_role_tick_at` writes to and
+        // `sample_host_health` reads from. A uniquely-named synthetic root
+        // keeps this deterministic despite the ring being shared with every
+        // other test in this binary (there is no `pub(crate)` reset hook
+        // reachable from outside `role_runner`'s own test module) — this
+        // test asserts the fixture's own pair is present, not the ring's
+        // total contents.
+        let root = Path::new("/repos/collector-test-5022-fixture");
+        let outcome = crate::role_runner::RoleTickOutcome::Failure("synthetic failure".to_string());
+        crate::role_runner::record_role_tick_at("judge", root, &outcome, Utc::now());
+
+        let dir = tempfile::tempdir().unwrap();
+        let pool = empty_pool();
+        let record =
+            sample_host_health(dir.path(), Instant::now(), &pool, &mut empty_slug_cache()).await;
+        assert!(
+            record.roles.persistent.iter().any(|f| f.root == root
+                && f.role == "judge"
+                && f.detail.as_deref() == Some("synthetic failure")),
+            "expected the just-recorded persistent failure in {:?}",
+            record.roles.persistent
+        );
+        assert!(record.roles.total > 0);
     }
 
     /// A hermetic, `dispatch()`-able registry: `skip_label_flip = true` skips

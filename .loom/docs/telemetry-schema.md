@@ -348,6 +348,56 @@ its registered repos) rather than as an unexplained gap.
   `redactManagedRepos`). The authenticated view always sees every entry in
   full, including private slugs.
 
+**`roles` (#5022, role-tick health).** The same transient-vs-persistent
+classification `loom-daemon health`'s `roles` section already computes
+(`crate::health::summarize_role_ticks`, fed by
+`crate::role_runner::role_tick_records()`), carried through the telemetry
+pipeline so a role dying on one host (the exact 2026-08-03 Judge outage #5004
+was filed for) is observable fleet-wide rather than only to an operator who
+happens to run `loom-daemon health` locally on that one host.
+
+```json
+{
+  "kind": "host.health",
+  "...": "every field above, plus:",
+  "roles": {
+    "total": 12,
+    "ok": 10,
+    "persistent": [
+      {
+        "root": "/repos/loom",
+        "role": "judge",
+        "failures": 2,
+        "last_at": "2026-08-03T09:14:00Z",
+        "detail": "no-token-pool"
+      }
+    ]
+  }
+}
+```
+
+- `total` / `ok` are the tick counts sampled from the process-global role-tick
+  ring (`crate::role_runner::ROLE_TICK_RING_CAPACITY`-bounded), **not**
+  windowed the way `loom-daemon health --since` is — a periodic `host.health`
+  push always reports the ring's full current contents. `total: 0` means "the
+  role runner sampled nothing" (idle or disabled entirely) and is a normal,
+  healthy state — never render it as degraded.
+- `persistent` lists only the `(root, role)` pairs whose **most recent**
+  sampled tick is still a failure — the ones that make `loom-daemon health`'s
+  `roles` section report `DEGRADED`. A pair that failed but has since
+  recovered (its latest tick is a success) is folded into `total`/`ok` like
+  every other tick and does **not** appear here, mirroring the transient
+  count in `assess_roles`'s own rendered summary line.
+- `#[serde(default)]` on the whole `roles` field, so a record from a
+  pre-#5022 daemon decodes with the zero-value ("nothing sampled") summary
+  rather than failing the whole envelope. `persistent` is additionally
+  omitted from the wire when empty (`skip_serializing_if = "Vec::is_empty"`),
+  mirroring `managed_repos`/`active_sweep_ids`.
+- `root` is a local workspace filesystem path, not a forge `owner/repo`
+  slug — it names no repository, issue, branch, or PR, so (unlike
+  `managed_repos`) `roles` passes through public redaction unchanged
+  (`dashboard/src/redaction.ts`).
+
 ## Per-host reporting redundancy (why 3x storage is intentional, Issue #4999)
 
 Every host in a fleet independently samples and pushes `tokens.snapshot` and

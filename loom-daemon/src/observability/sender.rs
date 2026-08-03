@@ -155,6 +155,7 @@ mod tests {
                 dispatch_halted: false,
                 halt_reason: None,
                 managed_repos: Vec::new(),
+                roles: crate::telemetry::RoleTickHealth::default(),
             }),
         )
     }

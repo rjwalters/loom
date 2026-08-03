@@ -171,6 +171,8 @@ export function multiHostSnapshot(): unknown {
               { slug: "2AMLogic/gf180-pll", visibility: "private" },
               { slug: "2AMLogic/gf180-trng", visibility: "private" },
             ],
+            // #5022: every tick ok — must not read as degraded.
+            roles: { total: 12, ok: 12, persistent: [] },
           },
           updatedAt: isoMinutesBefore(2),
         },
@@ -333,3 +335,26 @@ export function multiHostSnapshot(): unknown {
 }
 
 export const EMPTY_SNAPSHOT: unknown = { hosts: {}, activeSweeps: [] };
+
+/**
+ * A `host.health.roles` summary with one persistent tick failure (#5022) —
+ * the wire-shaped fixture `judge @ /repos/loom` failing 2 of its last 3
+ * ticks, matching `.loom/docs/telemetry-schema.md`'s `roles` example. Used by
+ * tests that assert the dashboard surfaces a persistent role-tick failure
+ * without needing a whole new fleet-wide host in `multiHostSnapshot`.
+ */
+export function persistentRoleTickFailureFixture(): unknown {
+  return {
+    total: 3,
+    ok: 1,
+    persistent: [
+      {
+        root: "/repos/loom",
+        role: "judge",
+        failures: 2,
+        last_at: isoMinutesBefore(1),
+        detail: "no-token-pool",
+      },
+    ],
+  };
+}
