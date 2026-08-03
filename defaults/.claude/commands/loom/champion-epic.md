@@ -185,9 +185,11 @@ PHASE_ISSUES=$(gh issue list \
   --json number,state \
   --jq '.')
 
-# Count open vs closed
-OPEN_COUNT=$(echo "$PHASE_ISSUES" | jq '[.[] | select(.state == "OPEN")] | length')
-CLOSED_COUNT=$(echo "$PHASE_ISSUES" | jq '[.[] | select(.state == "CLOSED")] | length')
+# Count open vs closed. NOTE: `printf '%s\n' "$VAR" | jq`, never `echo "$VAR" |
+# jq` — zsh's `echo` builtin reinterprets `\n`/`\t` escapes by default, which
+# corrupts captured `gh --json` output before jq ever parses it (#5094).
+OPEN_COUNT=$(printf '%s\n' "$PHASE_ISSUES" | jq '[.[] | select(.state == "OPEN")] | length')
+CLOSED_COUNT=$(printf '%s\n' "$PHASE_ISSUES" | jq '[.[] | select(.state == "CLOSED")] | length')
 
 if [ "$OPEN_COUNT" -eq 0 ] && [ "$CLOSED_COUNT" -gt 0 ]; then
     echo "Phase $PHASE complete! Creating Phase $((PHASE + 1)) issues..."

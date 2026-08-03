@@ -619,8 +619,11 @@ has_superseding_block() {
   for pr in $pr_numbers; do
     local pr_json
     pr_json=$(gh pr view "$pr" --json state,labels 2>/dev/null) || continue
-    local pr_state=$(echo "$pr_json" | jq -r '.state')
-    local pr_blocked=$(echo "$pr_json" | jq -r \
+    # NOTE: `printf '%s\n' "$VAR" | jq`, never `echo "$VAR" | jq` — zsh's
+    # `echo` builtin reinterprets `\n`/`\t` escapes by default, which
+    # corrupts captured `gh --json` output before jq ever parses it (#5094).
+    local pr_state=$(printf '%s\n' "$pr_json" | jq -r '.state')
+    local pr_blocked=$(printf '%s\n' "$pr_json" | jq -r \
       '[.labels[].name] | any(. == "loom:changes-requested" or . == "loom:blocked")')
     if [ "$pr_state" = "OPEN" ] && [ "$pr_blocked" = "true" ]; then
       echo "true"
@@ -646,9 +649,9 @@ a later pass to sort out.
 ```bash
 check_and_unblock() {
   "$GH_READ" issue list --label "loom:blocked" --state open --json number,body,title | jq -c '.[]' | while read -r issue; do
-    local number=$(echo "$issue" | jq -r '.number')
-    local body=$(echo "$issue" | jq -r '.body')
-    local title=$(echo "$issue" | jq -r '.title')
+    local number=$(printf '%s\n' "$issue" | jq -r '.number')
+    local body=$(printf '%s\n' "$issue" | jq -r '.body')
+    local title=$(printf '%s\n' "$issue" | jq -r '.title')
 
     local deps=$(parse_dependencies "$body")
 
@@ -778,9 +781,12 @@ check_epic_progress() {
     --search="Epic: #$epic_number in:body" \
     --json number,state,title)
 
-  local total=$(echo "$phase_issues" | jq 'length')
-  local closed=$(echo "$phase_issues" | jq '[.[] | select(.state == "CLOSED")] | length')
-  local open=$(echo "$phase_issues" | jq '[.[] | select(.state == "OPEN")] | length')
+  # NOTE: `printf '%s\n' "$VAR" | jq`, never `echo "$VAR" | jq` — zsh's `echo`
+  # builtin reinterprets `\n`/`\t` escapes by default, corrupting captured
+  # `gh --json` output before jq ever parses it (#5094).
+  local total=$(printf '%s\n' "$phase_issues" | jq 'length')
+  local closed=$(printf '%s\n' "$phase_issues" | jq '[.[] | select(.state == "CLOSED")] | length')
+  local open=$(printf '%s\n' "$phase_issues" | jq '[.[] | select(.state == "OPEN")] | length')
 
   echo "Epic #$epic_number: $closed/$total complete ($open in progress)"
 }
@@ -1061,8 +1067,10 @@ update_work_log() {
   local new_issues=$("$GH_READ" issue list --state closed --limit 50 --json number,title,closedAt \
     --jq "[.[] | select(.number > $last_issue)] | sort_by(.closedAt) | reverse")
 
-  # If nothing new, skip
-  if [ "$(echo "$new_prs" | jq 'length')" -eq 0 ] && [ "$(echo "$new_issues" | jq 'length')" -eq 0 ]; then
+  # If nothing new, skip. NOTE: `printf '%s\n' "$VAR" | jq`, never `echo "$VAR"
+  # | jq` — zsh's `echo` builtin reinterprets `\n`/`\t` escapes by default,
+  # corrupting captured `gh --json` output before jq ever parses it (#5094).
+  if [ "$(printf '%s\n' "$new_prs" | jq 'length')" -eq 0 ] && [ "$(printf '%s\n' "$new_issues" | jq 'length')" -eq 0 ]; then
     echo "No new merged PRs or closed issues. WORK_LOG.md is current."
     return 1
   fi

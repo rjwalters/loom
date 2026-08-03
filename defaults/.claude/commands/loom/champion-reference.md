@@ -17,8 +17,12 @@ This section documents how Champion handles non-standard situations during PR au
 # With no checks, `gh pr checks --json bucket,name` prints "no checks reported..."
 # to STDERR, exits non-zero, and emits EMPTY stdout. Detect via empty stdout
 # (robust) rather than matching error text. CHECKS captured with 2>/dev/null.
+# NOTE: `printf '%s\n' "$VAR" | jq`, never `echo "$VAR" | jq` — zsh's `echo`
+# builtin reinterprets `\n`/`\t` escapes by default, which corrupts captured
+# `gh --json` output (embedded newlines in body/comment text are represented
+# as literal `\n` inside the JSON string) before jq ever parses it (#5094).
 CHECKS=$(gh pr checks "$PR_NUMBER" --json bucket,name 2>/dev/null)
-if [ -z "$CHECKS" ] || [ "$(echo "$CHECKS" | jq 'length')" = "0" ]; then
+if [ -z "$CHECKS" ] || [ "$(printf '%s\n' "$CHECKS" | jq 'length')" = "0" ]; then
   echo "PASS: No CI checks required"
   # Continue to merge
 fi
@@ -37,7 +41,7 @@ fi
 **Handling**:
 ```bash
 # Check for pending/running checks (bucket == "pending")
-PENDING=$(echo "$CHECKS" | jq -r '.[] | select(.bucket == "pending") | .name')
+PENDING=$(printf '%s\n' "$CHECKS" | jq -r '.[] | select(.bucket == "pending") | .name')
 if [ -n "$PENDING" ]; then
   echo "SKIP: CI checks still running - will retry next iteration"
   # Skip this PR, try again later
@@ -234,7 +238,7 @@ done
 ```bash
 # A "fail" or "cancel" bucket blocks the merge; "pending" defers; "pass" and
 # "skipping" are acceptable. (gh buckets: pass, fail, pending, skipping, cancel.)
-FAILING=$(echo "$CHECKS" | jq -r '.[] | select(.bucket == "fail" or .bucket == "cancel") | .name')
+FAILING=$(printf '%s\n' "$CHECKS" | jq -r '.[] | select(.bucket == "fail" or .bucket == "cancel") | .name')
 if [ -n "$FAILING" ]; then
   echo "FAIL: Some checks did not pass"
 fi

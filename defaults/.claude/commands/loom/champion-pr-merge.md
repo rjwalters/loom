@@ -640,16 +640,21 @@ echo "PASS: Recently updated ($HOURS_AGO hours ago)"
 # is passthrough inside the wrapper anyway; this is belt-and-suspenders.)
 CHECKS=$(gh pr checks <number> --json bucket,name 2>/dev/null)
 
-# Handle case where no checks exist (empty stdout, or an empty JSON array)
-if [ -z "$CHECKS" ] || [ "$(echo "$CHECKS" | jq 'length')" = "0" ]; then
+# Handle case where no checks exist (empty stdout, or an empty JSON array).
+# NOTE: pipe raw `gh --json` output to jq via `printf '%s\n' "$VAR" | jq`, never
+# `echo "$VAR" | jq` — zsh's `echo` builtin reinterprets `\n`/`\t` escape
+# sequences by default, turning a literal two-char `\n` inside a JSON string
+# value into a raw newline and corrupting the JSON before jq ever parses it
+# (#5094).
+if [ -z "$CHECKS" ] || [ "$(printf '%s\n' "$CHECKS" | jq 'length')" = "0" ]; then
   echo "PASS: No CI checks required"
   exit 0
 fi
 
 # Parse checks by bucket. Buckets: pass, fail, pending, skipping, cancel.
 # `fail`/`cancel` block the merge; `pending` defers; `pass`/`skipping` are OK.
-FAILING_CHECKS=$(echo "$CHECKS" | jq -r '.[] | select(.bucket == "fail" or .bucket == "cancel") | .name')
-PENDING_CHECKS=$(echo "$CHECKS" | jq -r '.[] | select(.bucket == "pending") | .name')
+FAILING_CHECKS=$(printf '%s\n' "$CHECKS" | jq -r '.[] | select(.bucket == "fail" or .bucket == "cancel") | .name')
+PENDING_CHECKS=$(printf '%s\n' "$CHECKS" | jq -r '.[] | select(.bucket == "pending") | .name')
 
 # Check for failing checks
 if [ -n "$FAILING_CHECKS" ]; then
@@ -725,11 +730,11 @@ PR_NUMBER=$1
 # THIS pass, and answering from cache is the same failure as restating it from
 # memory (#4613; see "Cached forge reads").
 PR_DATA=$(gh pr view "$PR_NUMBER" --json additions,deletions,updatedAt)
-ADDITIONS=$(echo "$PR_DATA" | jq -r '.additions')
-DELETIONS=$(echo "$PR_DATA" | jq -r '.deletions')
+ADDITIONS=$(printf '%s\n' "$PR_DATA" | jq -r '.additions')
+DELETIONS=$(printf '%s\n' "$PR_DATA" | jq -r '.deletions')
 TOTAL_LINES=$((ADDITIONS + DELETIONS))
 
-UPDATED_AT=$(echo "$PR_DATA" | jq -r '.updatedAt')
+UPDATED_AT=$(printf '%s\n' "$PR_DATA" | jq -r '.updatedAt')
 UPDATED_TS=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$UPDATED_AT" +%s 2>/dev/null || \
              date -d "$UPDATED_AT" +%s 2>/dev/null)
 NOW_TS=$(date +%s)
@@ -737,7 +742,7 @@ HOURS_AGO=$(( (NOW_TS - UPDATED_TS) / 3600 ))
 
 # Check CI status (empty stdout = no checks; see criterion #6 above)
 CHECKS=$(gh pr checks "$PR_NUMBER" --json bucket,name 2>/dev/null)
-if [ -z "$CHECKS" ] || [ "$(echo "$CHECKS" | jq 'length')" = "0" ]; then
+if [ -z "$CHECKS" ] || [ "$(printf '%s\n' "$CHECKS" | jq 'length')" = "0" ]; then
   CI_STATUS="No CI checks required"
 else
   CI_STATUS="All CI checks passing"
