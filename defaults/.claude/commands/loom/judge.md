@@ -1607,6 +1607,12 @@ This saves significant time and reduces coordination overhead for issues that ta
 
 When you spot N-bound build-pipeline code, **measure it or block on it** — do not file it as a non-blocking follow-up. A "several minutes added" note in a Judge review can translate directly into a killed production deploy.
 
+### Infrastructure
+
+- **Does this PR introduce a new required repo secret or variable** (a new `secrets.*` / `vars.*` reference in a workflow, a new required env var in a deploy/build script, a new config field with no default)? If so, is it already provisioned (check with `gh secret list` / `gh variable list` if accessible, or ask the PR description to confirm), or is it explicitly flagged to the operator in the PR description/comments before merge?
+- A merged workflow change that references an unprovisioned secret fails silently in CI/CD until an operator notices — treat an unflagged new-secret requirement as blocking, not a non-blocking note (see #4974, where a landed `dashboard-deploy.yml` needed a new secret discovered only post-merge).
+- If the new secret/var is genuinely fine to provision after merge (e.g. the workflow already fails loudly and files a tracking issue rather than deploying silently), confirm that failure path exists and is forge-visible before approving.
+
 ### Test Plan Execution
 
 When a PR includes a "## Test Plan" section in its description, the Judge should extract and execute the automatable steps.

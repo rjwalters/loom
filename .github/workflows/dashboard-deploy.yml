@@ -46,15 +46,26 @@ jobs:
     name: Deploy Worker (dashboard.2amlogic.com)
     needs: test
     runs-on: ubuntu-latest
+    # `issues: write` is required by the "File or update a tracking issue for
+    # the failed deploy" step below (#4974) — this workflow is `push`-triggered
+    # (not a PR check), so without this the failure-tracking step's `gh issue
+    # create`/`comment` would itself fail silently.
+    permissions:
+      contents: read
+      issues: write
     steps:
       - uses: actions/checkout@v7
+        id: checkout
       - uses: actions/setup-node@v7
+        id: setup-node
         with:
           node-version: "20"
       - name: Install backend dependencies
+        id: install-backend-deps
         run: npm ci
         working-directory: dashboard
       - name: Install web UI dependencies
+        id: install-web-deps
         run: npm ci
         working-directory: dashboard/web
 
@@ -70,6 +81,7 @@ jobs:
       # later change (e.g. epic #4859's production cutover) only requires
       # updating the secret, never this workflow.
       - name: Materialize the 2AM instance's wrangler config
+        id: materialize-wrangler-config
         working-directory: dashboard
         env:
           WRANGLER_CONFIG_2AMLOGIC: ${{ secrets.CLOUDFLARE_WRANGLER_CONFIG_2AMLOGIC }}
@@ -82,11 +94,25 @@ jobs:
             echo "dashboard/docs/reference-deployment.md section 3 for what it must contain, and" >&2
             echo "'gh secret set CLOUDFLARE_WRANGLER_CONFIG_2AMLOGIC < dashboard/wrangler.2amlogic.toml'" >&2
             echo "run from the operator's machine (where that file already lives) to provision it." >&2
+            # Mirror the same text into a step output (verbatim) so the
+            # failure-tracking step below (#4974) can surface it in the
+            # forge issue/comment it files, without re-deriving the message.
+            {
+              echo "error_detail<<GH_OUTPUT_EOF"
+              echo "CLOUDFLARE_WRANGLER_CONFIG_2AMLOGIC secret is not set — deploy cannot proceed."
+              echo "This must be the full contents of the 2AM instance's wrangler.2amlogic.toml overlay"
+              echo "(Worker name, D1 database name/id, custom-domain route, Access vars) — see"
+              echo "dashboard/docs/reference-deployment.md section 3 for what it must contain, and"
+              echo "'gh secret set CLOUDFLARE_WRANGLER_CONFIG_2AMLOGIC < dashboard/wrangler.2amlogic.toml'"
+              echo "run from the operator's machine (where that file already lives) to provision it."
+              echo "GH_OUTPUT_EOF"
+            } >> "$GITHUB_OUTPUT"
             exit 1
           fi
           printf '%s\n' "$WRANGLER_CONFIG_2AMLOGIC" > wrangler.2amlogic.toml
 
       - name: Build the dashboard UI
+        id: build-web
         working-directory: dashboard
         run: npm run build:web
 
@@ -95,6 +121,7 @@ jobs:
       # a bad overlay (still-a-placeholder database_id, config that fails to
       # parse) fail here instead of mid-migration.
       - name: Preflight the deploy config
+        id: preflight
         working-directory: dashboard
         env:
           LOOM_DASHBOARD_WRANGLER_CONFIG: wrangler.2amlogic.toml
@@ -107,6 +134,7 @@ jobs:
       # nothing new to apply is a clean no-op — this step does not need its
       # own "only if pending" guard.
       - name: Apply D1 migrations (idempotent)
+        id: apply-migrations
         working-directory: dashboard
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -125,8 +153,71 @@ jobs:
       # config-file change per deploy. Served back by `/api/version` and the
       # dashboard footer (`src/index.ts`, `web/src/buildInfo.ts`).
       - name: Deploy Worker
+        id: deploy-worker
         working-directory: dashboard
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: npx wrangler deploy --config wrangler.2amlogic.toml --var "BUILD_COMMIT:${{ github.sha }}"
+
+      # #4974: before this step, a failed deploy was a red run in the Actions
+      # tab and nothing else -- no forge-visible artifact entered the normal
+      # triage flow. `if: failure()` runs this only when a prior step in this
+      # job failed; it never flips the job's own conclusion back to green (a
+      # job's conclusion is fixed by its failed step before this one runs --
+      # this step succeeding or failing afterward does not change that). One
+      # dedup'd issue per distinct failing step (title includes the step
+      # name), following the same search-by-exact-title pattern as
+      # fork-drift.yml, so repeated failures of the same underlying cause
+      # comment on one issue instead of spamming a fresh one per run. A green
+      # re-run after the fix does NOT auto-close/clean up the tracking issue
+      # -- that's expected, left for the normal triage flow to close.
+      - name: File or update a tracking issue for the failed deploy
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STEPS_JSON: ${{ toJSON(steps) }}
+          MATERIALIZE_ERROR_DETAIL: ${{ steps.materialize-wrangler-config.outputs.error_detail }}
+        run: |
+          set -euo pipefail
+
+          failing_id="$(echo "$STEPS_JSON" | jq -r \
+            'to_entries | map(select(.value.conclusion == "failure")) | .[0].key // "unknown"')"
+
+          case "$failing_id" in
+            checkout) failing_name="Checkout" ;;
+            setup-node) failing_name="Set up Node.js" ;;
+            install-backend-deps) failing_name="Install backend dependencies" ;;
+            install-web-deps) failing_name="Install web UI dependencies" ;;
+            materialize-wrangler-config) failing_name="Materialize the 2AM instance's wrangler config" ;;
+            build-web) failing_name="Build the dashboard UI" ;;
+            preflight) failing_name="Preflight the deploy config" ;;
+            apply-migrations) failing_name="Apply D1 migrations (idempotent)" ;;
+            deploy-worker) failing_name="Deploy Worker" ;;
+            *) failing_name="an unidentified step" ;;
+          esac
+
+          title="ci(dashboard-deploy): deploy failed at \"${failing_name}\""
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          body="## Dashboard deploy failure"$'\n\n'
+          body+="The \`Deploy Worker (dashboard.2amlogic.com)\` job in \`.github/workflows/dashboard-deploy.yml\` failed."$'\n\n'
+          body+="- **Failing step:** ${failing_name}"$'\n'
+          body+="- **Run:** ${run_url}"$'\n'
+          body+="- **Commit:** ${GITHUB_SHA}"$'\n'
+
+          if [[ -n "${MATERIALIZE_ERROR_DETAIL:-}" ]]; then
+            body+=$'\n**Error detail (verbatim from the failing step):**\n```\n'"${MATERIALIZE_ERROR_DETAIL}"$'\n```\n'
+          fi
+
+          body+=$'\n_Last checked: '"$(date -u +"%Y-%m-%dT%H:%M:%SZ")"$'_'
+
+          existing_number="$(gh issue list --state open --search "\"$title\" in:title" \
+            --json number,title --jq ".[] | select(.title == \"$title\") | .number" | head -1)"
+
+          if [[ -n "$existing_number" ]]; then
+            gh issue comment "$existing_number" --body "$body"
+            echo "Updated existing dashboard-deploy failure issue #$existing_number"
+          else
+            gh issue create --title "$title" --label "loom:triage" --body "$body"
+          fi
