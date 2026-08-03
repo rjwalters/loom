@@ -380,22 +380,31 @@ pub fn build_plan(config: &AddWorkerConfig, secrets: &Secrets) -> Plan {
     let mut plan = Plan::new();
     let primary_rel = workspace_rel(&config.repos[0]);
 
-    // 1. Base deps (safehouse#38: libsqlite3-dev is required).
+    // 1. Base deps (safehouse#38: libsqlite3-dev is required). Deliberately
+    //    does NOT install a Rust toolchain (#5067, Epic #4990 Phase 4): the
+    //    happy path (a release artifact resolves for this host's platform)
+    //    never needs one. `machine-layout` below installs rustup itself, as a
+    //    reactive fallback, only when it actually falls back to a from-source
+    //    build.
     plan.push_step(Step::new(
         "base-deps",
-        "install build-essential, pkg-config, libssl-dev, libsqlite3-dev, git, gh, rustup",
+        "install build-essential, pkg-config, libssl-dev, libsqlite3-dev, git, gh",
         Some(
             "dpkg -s build-essential pkg-config libssl-dev libsqlite3-dev git >/dev/null 2>&1 \
-             && command -v gh >/dev/null 2>&1 && command -v cargo >/dev/null 2>&1"
+             && command -v gh >/dev/null 2>&1"
                 .to_string(),
         ),
         render_base_deps(),
     ));
 
-    // 2. Machine-level layout: clone loom, build loom-daemon, install to ~/.local/bin.
+    // 2. Machine-level layout: clone loom, install loom-daemon to ~/.local/bin
+    //    from a verified GitHub Release artifact when one resolves for this
+    //    host's platform (#5067, Epic #4990 Phase 4), falling back to
+    //    `cargo build -p loom-daemon --release` (installing rustup first,
+    //    reactively) only when no artifact resolves.
     plan.push_step(Step::new(
         "machine-layout",
-        "clone loom to ~/.local/share/loom, cargo build -p loom-daemon --release, install to ~/.local/bin",
+        "clone loom to ~/.local/share/loom, install loom-daemon to ~/.local/bin from a release artifact (falling back to cargo build -p loom-daemon --release when no artifact resolves)",
         Some(r#"test -x "$HOME/.local/bin/loom-daemon""#.to_string()),
         render_machine_layout(&config.loom_repo_url),
     ));
@@ -749,8 +758,14 @@ pub fn run(config: &AddWorkerConfig) -> Result<()> {
 // ===========================================================================
 
 fn render_base_deps() -> String {
-    // NOTE: the rustup + gh installs are written as shell text here (never run
-    // through the daemon's own shell), so the curl-pipe idiom is safe.
+    // NOTE: the gh install is written as shell text here (never run through
+    // the daemon's own shell), so the curl-pipe idiom is safe.
+    //
+    // Deliberately does NOT install a Rust toolchain (#5067): the happy path
+    // (a release artifact resolves for this host's platform in the
+    // `machine-layout` step below) never needs one. `machine-layout` installs
+    // rustup itself, reactively, only when it actually falls back to a
+    // from-source build.
     r#"set -e
 export DEBIAN_FRONTEND=noninteractive
 sudo apt-get update -qq
@@ -762,9 +777,6 @@ if ! command -v gh >/dev/null 2>&1; then
   echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null
   sudo apt-get update -qq
   sudo apt-get install -y gh
-fi
-if ! command -v cargo >/dev/null 2>&1; then
-  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 fi
 "#
     .to_string()
@@ -789,10 +801,32 @@ else
   mkdir -p "$(dirname "$LOOM_SRC")"
   git clone {loom_repo_url} "$LOOM_SRC"
 fi
-cd "$LOOM_SRC"
-cargo build -p loom-daemon --release
 mkdir -p "$HOME/.local/bin"
-install -m 0755 "$LOOM_SRC/target/release/loom-daemon" "$HOME/.local/bin/loom-daemon"
+# Install loom-daemon to ~/.local/bin (Epic #4990 Phase 4, #5067). Shells out
+# to loom-daemon-update.sh's own already-tested "auto" resolution (Phase 3,
+# #5020) rather than reimplementing the fetch/verify/checksum logic here: it
+# prefers a checksum-verified GitHub Release artifact for this host's
+# platform, and SOFTLY falls back to `cargo build -p loom-daemon --release`
+# only when no artifact resolves (unrecognized platform, no gh CLI, no
+# Releases, rate-limited/unreachable API, no matching asset for this target) —
+# never a hard failure on that account. --no-restart is safe here: the
+# loom-daemon systemd unit has not been installed yet (a later step), so there
+# is never a running daemon for this invocation to try to restart.
+UPDATE_SCRIPT="$LOOM_SRC/defaults/scripts/cli/loom-daemon-update.sh"
+if ! "$UPDATE_SCRIPT" --no-restart; then
+  # A missing Rust toolchain is the ONLY failure this can repair: install
+  # rustup as a reactive fallback dependency (never on the happy path, see
+  # base-deps above) and retry exactly once. Any other failure (e.g. cargo IS
+  # present and the build itself failed) is not retried.
+  if ! command -v cargo >/dev/null 2>&1; then
+    echo "No Rust toolchain and no release artifact resolved for this platform -- installing rustup as a fallback dependency..."
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+    . "$HOME/.cargo/env" 2>/dev/null || true
+    "$UPDATE_SCRIPT" --no-restart
+  else
+    exit 1
+  fi
+fi
 # Ensure the canonical loom PATH (#4831: ~/.local/bin, ~/.cargo/bin, Homebrew,
 # system dirs) is on PATH for future logins (Linux worker skips codesign).
 if ! grep -qF 'loom-canonical-path (#4831)' "$HOME/.profile" 2>/dev/null; then
@@ -1428,6 +1462,157 @@ mod tests {
             .unwrap();
         assert!(base.check.as_ref().unwrap().contains("libsqlite3-dev"));
         assert!(base.apply.contains("libsqlite3-dev"));
+    }
+
+    // ---- machine-layout: artifact-first provisioning (#5067, Epic #4990 Phase 4) ----
+
+    fn machine_layout_step() -> Step {
+        let plan = build_plan(&base_config(), &Secrets::default());
+        plan.entries
+            .iter()
+            .find_map(|e| match e {
+                super::super::PlanEntry::Step(s) if s.name == "machine-layout" => Some(s.clone()),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn base_deps_no_longer_installs_or_requires_a_rust_toolchain() {
+        // AC: base-deps no longer requires rustup/a Rust toolchain on the
+        // happy path (an artifact resolves for this host's platform); it is
+        // only pulled in — by machine-layout, reactively — as a fallback
+        // dependency when the build path is actually taken.
+        let plan = build_plan(&base_config(), &Secrets::default());
+        let base = plan
+            .entries
+            .iter()
+            .find_map(|e| match e {
+                super::super::PlanEntry::Step(s) if s.name == "base-deps" => Some(s),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            !base.apply.contains("rustup"),
+            "base-deps must not install rustup unconditionally:\n{}",
+            base.apply
+        );
+        assert!(
+            !base.check.as_ref().unwrap().contains("cargo"),
+            "base-deps' idempotency check must not require cargo (it no longer installs it):\n{}",
+            base.check.as_ref().unwrap()
+        );
+        // gh remains required (needed for artifact resolution + downloads).
+        assert!(base.check.as_ref().unwrap().contains("command -v gh"));
+    }
+
+    #[test]
+    fn machine_layout_attempts_artifact_fetch_before_any_toolchain_fallback() {
+        // AC: machine-layout attempts a release-artifact fetch first (reusing
+        // Phase 3's already-tested fetch/verify/checksum logic by shelling
+        // out to loom-daemon-update.sh's own "auto" resolution), falling back
+        // to `cargo build -p loom-daemon --release` (installing rustup first)
+        // only when that invocation fails.
+        let step = machine_layout_step();
+        let script = &step.apply;
+
+        // Delegates to loom-daemon-update.sh (Phase 3, #5020) rather than
+        // duplicating the fetch/verify/checksum implementation.
+        let update_call = script
+            .find(r#"defaults/scripts/cli/loom-daemon-update.sh""#)
+            .expect(
+                "machine-layout must invoke loom-daemon-update.sh to reuse Phase 3's \
+                 fetch/verify/checksum logic",
+            );
+
+        // The toolchain fallback (rustup install + `cargo build` retry) must
+        // sit strictly INSIDE the `if ! "$UPDATE_SCRIPT" ...; then` failure
+        // branch — i.e. after the first invocation and gated on `cargo`
+        // being absent — so it is never reached on the artifact-available
+        // happy path.
+        let toolchain_fallback = script
+            .find("installing rustup as a fallback dependency")
+            .expect("a rustup-install fallback must exist for when no artifact resolves");
+        let cargo_guard = script
+            .find("if ! command -v cargo")
+            .expect("the toolchain fallback must be gated on cargo being absent");
+        assert!(
+            update_call < cargo_guard && cargo_guard < toolchain_fallback,
+            "artifact-fetch attempt must precede the cargo-absent guard, which must precede \
+             the rustup install:\n{script}"
+        );
+
+        // No literal `cargo build` shell invocation: the actual build now
+        // happens inside loom-daemon-update.sh's own (already-tested)
+        // fallback path, not duplicated here.
+        assert!(
+            !script.contains("cargo build --release")
+                && !script
+                    .lines()
+                    .any(|l| l.trim_start().starts_with("cargo build")),
+            "machine-layout must not duplicate the source-build invocation; it delegates to \
+             loom-daemon-update.sh instead:\n{script}"
+        );
+
+        // --no-restart: fleet add-worker has not installed the loom-daemon
+        // systemd unit yet at this point in the plan, so there is never a
+        // running daemon for this invocation to try to restart.
+        assert!(
+            script.contains(r#""$UPDATE_SCRIPT" --no-restart"#),
+            "loom-daemon-update.sh must be invoked with --no-restart:\n{script}"
+        );
+    }
+
+    #[test]
+    fn machine_layout_toolchain_fallback_retries_the_same_update_script() {
+        // The retry after installing rustup must call the SAME update-script
+        // invocation (not a hand-rolled `cargo build`), so it goes through
+        // the identical fetch/verify/checksum + build logic a second time
+        // (now with cargo available) rather than a second implementation.
+        let step = machine_layout_step();
+        let script = &step.apply;
+        assert_eq!(
+            script.matches(r#""$UPDATE_SCRIPT" --no-restart"#).count(),
+            2,
+            "expected exactly two invocations (initial attempt + one retry after installing \
+             rustup):\n{script}"
+        );
+    }
+
+    #[test]
+    fn machine_layout_idempotency_check_unchanged() {
+        // AC: the plan's idempotency check (test -x .../loom-daemon) and
+        // existing re-run semantics are preserved — a re-run of `fleet
+        // add-worker` against an already-provisioned host still no-ops this
+        // step.
+        let step = machine_layout_step();
+        assert_eq!(step.check.as_deref(), Some(r#"test -x "$HOME/.local/bin/loom-daemon""#));
+    }
+
+    #[test]
+    fn machine_layout_rendered_script_is_valid_shell() {
+        // Sanity-check the generated script actually parses as shell (bash -n
+        // — syntax check only, no execution) — catches an unbalanced
+        // if/fi or quoting mistake in the artifact-fetch/fallback wiring
+        // that a pure string-content assertion would miss.
+        let step = machine_layout_step();
+        let output = std::process::Command::new("bash")
+            .arg("-n")
+            .arg("-c")
+            .arg(&step.apply)
+            .output();
+        match output {
+            Ok(out) => assert!(
+                out.status.success(),
+                "rendered machine-layout script failed `bash -n`:\n{}\nscript:\n{}",
+                String::from_utf8_lossy(&out.stderr),
+                step.apply
+            ),
+            Err(e) => {
+                // bash not available in this environment — skip rather than fail.
+                eprintln!("skipping bash -n check: could not launch bash ({e})");
+            }
+        }
     }
 
     #[test]

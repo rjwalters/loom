@@ -577,9 +577,23 @@ the plan/ordering/checklist; the per-phase shell is rendered in
 #3979 Phase-2 pilot's verified hand bootstrap:
 
 1. **base-deps** — build-essential, pkg-config, libssl-dev, **libsqlite3-dev**
-   (safehouse#38), git, gh, rustup.
-2. **machine-layout** — clone loom → `~/.local/share/loom`, `cargo build -p
-   loom-daemon --release`, install to `~/.local/bin` (Linux skips codesign).
+   (safehouse#38), git, gh. Deliberately does **not** install a Rust toolchain
+   (#5067, Epic #4990 Phase 4) — the happy path below never needs one;
+   `machine-layout` installs rustup itself, reactively, only on the fallback
+   path.
+2. **machine-layout** — clone loom → `~/.local/share/loom`, then install
+   `loom-daemon` to `~/.local/bin` **from a GitHub Release artifact when one
+   resolves for the host's platform** (#5067, Epic #4990 Phase 4), by
+   shelling out to `loom-daemon-update.sh`'s own already-verified fetch +
+   checksum-verify logic (`--no-restart`, since no daemon is running yet at
+   this point in the plan) instead of duplicating it. Falls back to `cargo
+   build -p loom-daemon --release` — installing rustup first, only if it
+   isn't already present — only when no artifact resolves for this platform
+   (unrecognized platform, no `gh` CLI, no Releases, a rate-limited/
+   unreachable API, no matching asset). A host with **no Rust toolchain at
+   all** goes from a bare provisioned OS to a running daemon purely from a
+   Release artifact whenever one exists for its platform (Linux skips
+   codesign either way).
 3. **claude-code** — install the Claude Code CLI.
 4. **forge-auth** — `gh auth login --with-token` with the operator's
    fine-grained PAT fed over **ssh stdin** (never a command line).
@@ -5078,6 +5092,14 @@ rebuild). It deliberately does **not** pass `--fetch`, since that would turn a
 transient GitHub API hiccup into a failed roll. The existing exit-code contract is
 unchanged: a checksum/signature failure maps to exit `1` (retryable, same bucket
 as a failed `cargo build`), so `classify_exit` needs no new cases.
+
+**Reused by `fleet add-worker`'s initial provisioning (epic #4990 Phase 4,
+#5067).** `fleet add-worker`'s `machine-layout` step (see the `fleet add-worker`
+section above) shells out to this same script (`--no-restart`, since no daemon
+is running yet on a brand-new worker) instead of duplicating the fetch/verify/
+checksum logic for a second call site — so a new worker with **no Rust
+toolchain at all** can go from a bare provisioned OS to a running daemon using
+only a release artifact, the same `auto`-mode precedence described above.
 
 **Launchd refused-restart fallback (`--relaunch`, exit 6, #4118)**: on the
 FIRST roll onto a #4077-capable binary the *running* (old) daemon has no
