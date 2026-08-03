@@ -688,8 +688,13 @@ Pre-Iteration Environment Check (gh repo view)
                     ↓
                 Search for unlabeled open PRs
                     ↓
-                    ├─→ Found? → Evaluate but leave labels unchanged
-                    │              (external/manual PR, no workflow labels)
+                    ├─→ Found? → Walk the list in order; for each candidate check
+                    │     │        for a loom:fallback-evaluated marker whose SHA
+                    │     │        matches that PR's current head SHA
+                    │     ├─→ Found (no new commits)? → Skip it, try the next
+                    │     │        unlabeled PR (exit iteration if none remain)
+                    │     └─→ Not found, or SHA differs? → Evaluate and post comment
+                    │              (with updated marker ending)
                     │
                     └─→ None found → No work available, exit iteration
 ```
@@ -720,10 +725,49 @@ if [ "$LABELED_PRS" -gt 0 ]; then
 else
   echo "No loom:review-requested PRs found, checking unlabeled PRs..."
 
-  # 2. Check fallback queue (cached — see "Cached Forge Reads")
-  UNLABELED_PR=$("$GH_READ" pr list --state=open --limit 500 --json number,labels \
-    --jq '.[] | select(([.labels[].name | select(startswith("loom:"))] | length) == 0) | .number' \
-    | head -n 1)
+  # 2. Check fallback queue (cached — see "Cached Forge Reads"). Keep the WHOLE
+  #    candidate list, not just the head of it: a PR that was already evaluated
+  #    at its current head SHA is skipped, and the walk below moves on to the
+  #    next candidate rather than exiting and claiming "no work".
+  UNLABELED_PRS=$("$GH_READ" pr list --state=open --limit 500 --json number,labels \
+    --jq '.[] | select(([.labels[].name | select(startswith("loom:"))] | length) == 0) | .number')
+
+  # 3. Walk the candidates in order; stop at the first one with no prior
+  #    fallback-evaluated marker for its current head SHA (dedup).
+  UNLABELED_PR=""
+  CURRENT_HEAD_SHA=""
+  for CANDIDATE in $UNLABELED_PRS; do
+    CANDIDATE_HEAD_SHA=$(gh pr view "$CANDIDATE" --json headRefOid --jq '.headRefOid')
+
+    # Extract the most recent loom:fallback-evaluated marker from PR comments.
+    # `--paginate` is REQUIRED: without it `gh api` returns only the first page
+    # (default per_page=30, oldest-first), so on a long-lived PR (#4972 already
+    # had 129 comments when this dedup was added) a marker posted near the end
+    # of the history would never be seen and the dedup would silently never
+    # engage — the exact bug this check exists to prevent. Same pitfall the
+    # Stale `loom:reviewing` Claim Check documents above; with `--jq`,
+    # `--paginate` re-runs the filter per page and concatenates the per-page
+    # output, which is what `tail -n 1` (most-recent-marker-wins) consumes —
+    # pages arrive oldest-first, so the last line is the newest marker.
+    # Extraction is `jq`-only on purpose: `grep -oP` (PCRE lookaround) is a
+    # GNU-only flag that stock BSD/macOS grep rejects outright
+    # (`grep: invalid option -- P`), and a Judge running under an alternate
+    # runtime would degrade silently to "no marker found" — i.e. back to
+    # re-evaluating every pass. jq's regex engine is the same everywhere.
+    # `capture` emits nothing (no error) for a body without the marker.
+    PRIOR_MARKER_SHA=$(gh api "repos/{owner}/{repo}/issues/$CANDIDATE/comments" --paginate \
+      --jq '.[] | (.body // "") | capture("<!-- loom:fallback-evaluated sha=(?<sha>[0-9a-f]+) -->") | .sha' \
+      | tail -n 1)
+
+    if [ -n "$PRIOR_MARKER_SHA" ] && [ "$CANDIDATE_HEAD_SHA" = "$PRIOR_MARKER_SHA" ]; then
+      echo "Skipping unlabeled PR #$CANDIDATE: already evaluated in fallback mode (head SHA unchanged since last evaluation) — trying the next unlabeled PR"
+      continue
+    fi
+
+    UNLABELED_PR="$CANDIDATE"
+    CURRENT_HEAD_SHA="$CANDIDATE_HEAD_SHA"
+    break
+  done
 
   if [ -n "$UNLABELED_PR" ]; then
     echo "Evaluating unlabeled PR #$UNLABELED_PR (fallback mode)"
@@ -738,16 +782,26 @@ else
     fi
     # ... run checks, evaluate code ...
 
-    # Provide feedback but DO NOT add workflow labels
-    gh pr comment $UNLABELED_PR --body "$(cat <<'EOF'
+    # Provide feedback but DO NOT add workflow labels.
+    # NOTE: this heredoc is deliberately UNQUOTED (`<<EOF`, not `<<'EOF'`) so
+    # $CURRENT_HEAD_SHA expands into the marker. With a quoted delimiter the
+    # marker would post the literal string "sha=$CURRENT_HEAD_SHA", which can
+    # never equal a real head SHA — the dedup read above would then match
+    # nothing and every pass would re-evaluate. Keep any other `$` or backticks
+    # out of this body, or escape them.
+    gh pr comment $UNLABELED_PR --body "$(cat <<EOF
 Code evaluation feedback...
 
 Note: This PR was evaluated in fallback mode (no loom:review-requested label).
 Consider adding loom:review-requested if you want it in the evaluation queue.
+
+<!-- loom:fallback-evaluated sha=$CURRENT_HEAD_SHA -->
 EOF
 )"
   else
-    echo "No work available - both queues empty"
+    # Reached either because the fallback queue was empty, or because every
+    # unlabeled PR in it was already evaluated at its current head SHA.
+    echo "No work available - both queues empty (every unlabeled PR, if any, was already evaluated at its current head SHA)"
     exit 0
   fi
 fi
