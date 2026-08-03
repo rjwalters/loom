@@ -582,15 +582,22 @@ check_global_mcp_configs() {
     fi
 
     # Parse mcpServers from ~/.claude.json.
-    # Output one line per server: "name|command|args0"
-    # Falls through silently on malformed JSON or missing python3.
+    # First line is a presence sentinel: "__HAS_LOOM__=1" or "__HAS_LOOM__=0"
+    # (emitted whenever the file parses as JSON, regardless of whether any
+    # servers are configured), so we can detect a missing `loom` entry even
+    # when mcpServers is absent or empty — not just validate entries that
+    # already exist. Every subsequent line is one server: "name|command|args0"
+    # Falls through silently (no sentinel, no server lines) on malformed JSON
+    # or missing python3, preserving the prior warn-only, never-abort contract.
     local server_info
     server_info=$(python3 - "${global_config}" 2>/dev/null <<'PYEOF'
 import json, sys
 try:
     with open(sys.argv[1]) as f:
         cfg = json.load(f)
-    for name, srv in cfg.get('mcpServers', {}).items():
+    servers = cfg.get('mcpServers', {})
+    print(f"__HAS_LOOM__={1 if 'loom' in servers else 0}")
+    for name, srv in servers.items():
         command = srv.get('command', '')
         args = srv.get('args', [])
         args0 = args[0] if args else ''
@@ -601,6 +608,24 @@ PYEOF
 )
 
     if [[ -z "${server_info}" ]]; then
+        return 0
+    fi
+
+    # Presence check (acceptance criterion #1): warn — but never abort — when
+    # the machine-level `loom` MCP registration (#4230) is absent, instead of
+    # silently relying on a possibly-stale repo-local .mcp.json.
+    if [[ "${server_info}" == *$'\n'* ]]; then
+        local first_line="${server_info%%$'\n'*}"
+    else
+        local first_line="${server_info}"
+    fi
+    if [[ "${first_line}" == "__HAS_LOOM__=0" ]]; then
+        log_warn "⚠ No 'loom' entry in ~/.claude.json mcpServers — user-scope MCP registration (#4230) is missing"
+        log_warn "Fix: re-run scripts/install-loom.sh (or 'loom update') to register the machine-level 'loom' MCP server; see CLAUDE.md § MCP hooks"
+    fi
+    server_info="${server_info#*$'\n'}"
+
+    if [[ -z "${server_info}" || "${server_info}" == "__HAS_LOOM__="* ]]; then
         return 0
     fi
 

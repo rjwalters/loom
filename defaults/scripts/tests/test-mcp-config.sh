@@ -794,6 +794,85 @@ assert_eq "unusable" "$(_deps_unusable_rc "$_cls/emptydir/mcp-loom")" \
 rm -rf "$_cls"
 
 # ============================================================
+# Section 11: check_global_mcp_configs presence check (#5033)
+#
+# The function must warn when the user-scope `loom` MCP registration
+# (#4230) is absent from ~/.claude.json's mcpServers — not just validate
+# already-present entries' binary paths — while remaining warning-only
+# (never aborts, RC always 0).
+# ============================================================
+echo ""
+echo "Testing check_global_mcp_configs presence check (#5033)..."
+
+HAVE_PYTHON3=false
+command -v python3 >/dev/null 2>&1 && HAVE_PYTHON3=true
+
+if $HAVE_PYTHON3; then
+    # 11a. No mcpServers key at all (the robb-pro incident case) -> warns.
+    _home_missing_key="$(mktemp -d)"
+    cat >"$_home_missing_key/.claude.json" <<'JSON'
+{ "other": "stuff" }
+JSON
+    _out_missing_key="$(HOME="$_home_missing_key" CLAUDE_WRAPPER_SOURCE_ONLY=1 bash -c '
+        source "$1"
+        check_global_mcp_configs
+        echo "RC=$?"
+    ' _ "$WRAPPER" 2>&1)"
+    assert_contains "No 'loom' entry" "$_out_missing_key" \
+        "mcpServers key entirely absent: warns that the loom registration is missing"
+    assert_contains "install-loom.sh" "$_out_missing_key" \
+        "missing-registration warning names the install-loom.sh / loom update fix"
+    assert_contains "RC=0" "$_out_missing_key" \
+        "missing-registration check never aborts (warning-only contract preserved)"
+    rm -rf "$_home_missing_key"
+
+    # 11b. mcpServers present but no `loom` entry -> warns.
+    _home_no_loom="$(mktemp -d)"
+    cat >"$_home_no_loom/.claude.json" <<'JSON'
+{ "mcpServers": { "other": { "command": "cat", "args": [] } } }
+JSON
+    _out_no_loom="$(HOME="$_home_no_loom" CLAUDE_WRAPPER_SOURCE_ONLY=1 bash -c '
+        source "$1"
+        check_global_mcp_configs
+        echo "RC=$?"
+    ' _ "$WRAPPER" 2>&1)"
+    assert_contains "No 'loom' entry" "$_out_no_loom" \
+        "mcpServers present without a loom key: warns that the loom registration is missing"
+    assert_contains "RC=0" "$_out_no_loom" \
+        "mcpServers present without a loom key: check never aborts"
+    rm -rf "$_home_no_loom"
+
+    # 11c. mcpServers.loom present and healthy -> no presence warning.
+    _home_healthy="$(mktemp -d)"
+    cat >"$_home_healthy/.claude.json" <<JSON
+{ "mcpServers": { "loom": { "command": "$(command -v cat)", "args": [] } } }
+JSON
+    _out_healthy="$(HOME="$_home_healthy" CLAUDE_WRAPPER_SOURCE_ONLY=1 bash -c '
+        source "$1"
+        check_global_mcp_configs
+        echo "RC=$?"
+    ' _ "$WRAPPER" 2>&1)"
+    assert_not_contains "No 'loom' entry" "$_out_healthy" \
+        "healthy loom entry present: no presence warning"
+    assert_contains "RC=0" "$_out_healthy" \
+        "healthy loom entry present: check succeeds"
+    rm -rf "$_home_healthy"
+
+    # 11d. ~/.claude.json missing entirely -> unaffected (early return preserved).
+    _home_no_file="$(mktemp -d)"
+    _out_no_file="$(HOME="$_home_no_file" CLAUDE_WRAPPER_SOURCE_ONLY=1 bash -c '
+        source "$1"
+        check_global_mcp_configs
+        echo "RC=$?"
+    ' _ "$WRAPPER" 2>&1)"
+    assert_eq "RC=0" "$_out_no_file" \
+        "user .claude.json missing entirely: no output, RC=0 (early-return regression check)"
+    rm -rf "$_home_no_file"
+else
+    echo -e "  ${YELLOW}SKIP${NC}: check_global_mcp_configs presence tests (python3 not installed)"
+fi
+
+# ============================================================
 # Summary
 # ============================================================
 echo ""
