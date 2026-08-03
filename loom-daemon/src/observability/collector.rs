@@ -669,6 +669,7 @@ fn collect_active_sweep_ids(workspace_pool: &WorkspacePool) -> Vec<String> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::health;
 
     fn dispatch_event(issue: u32, sweep_id: &str) -> Event {
         Event::SweepGlobalDispatch {
@@ -1403,5 +1404,243 @@ mod tests {
             "both registered repos are in the roster, each with its derived visibility, \
              despite neither having a sweep in flight"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // #5076 — final AC of epic #5004: a fixture with all managed repos'
+    // role-runner ticks persistently failing, and every other axis
+    // (dispatch/tokens/queues/throughput) healthy, must not present as
+    // green anywhere an operator looks by default. Exercises Gap 2 (role-
+    // tick health reaching `HostHealthRecord`, #5022/PR #5042), Gap 3
+    // (escalation of N consecutive identical failures, #5023/PR #5039) and
+    // Gap 4 (bounded, ANSI-stripped `roles.summary`, #5024/PR #5043)
+    // TOGETHER against `crate::health::assess`'s combined verdict (Gap 1's
+    // review-side queue axes, #5021/PR #5050, stay healthy here on
+    // purpose — this fixture is the cross-cutting scenario none of the
+    // four per-gap test suites individually exercises).
+    // ------------------------------------------------------------------
+
+    /// `count` consecutive identical-failure [`RoleTickRecord`]s for one
+    /// `(root, role)` pair, timestamped a minute apart and ending at `now`.
+    /// The detail deliberately carries a raw ANSI color escape and is far
+    /// longer than either of `health.rs`'s summary caps (60 chars per
+    /// failure, 2000 for the assembled line) — an uncleaned claude-wrapper
+    /// tail, exactly the shape Gap 4 exists to defend against, injected
+    /// straight into the ring rather than pre-cleaned by the caller so the
+    /// assertions below can only pass if the *defensive* re-clean/cap in
+    /// `health.rs` (independent of `role_runner`'s own source-side clean)
+    /// actually runs.
+    fn escalating_failure_records(
+        root: &str,
+        role: &str,
+        now: DateTime<Utc>,
+        count: usize,
+    ) -> Vec<RoleTickRecord> {
+        let raw_detail =
+            format!("\u{1b}[31mERROR\u{1b}[0m: {role} invocation exited 1 — {}", "x".repeat(4000));
+        (0..count)
+            .map(|i| RoleTickRecord {
+                root: PathBuf::from(root),
+                role: role.to_string(),
+                at: now - chrono::Duration::minutes(i64::try_from(count - i).unwrap_or(0)),
+                ok: false,
+                detail: Some(raw_detail.clone()),
+            })
+            .collect()
+    }
+
+    /// A `HealthInputs` baseline with every non-roles section green: healthy
+    /// dispatch (a recent, error-free work-finder tick), a healthy token
+    /// pool, and a per-repo pipeline snapshot for each of `roots` that is
+    /// both fully queried (no `?`/`Unknown`) and merging PRs (never a review
+    /// stall). Only `status.role_tick_records` is left for the caller to
+    /// populate — the one axis this fixture is about.
+    fn all_other_axes_healthy_inputs(now: DateTime<Utc>, roots: &[&str]) -> health::HealthInputs {
+        let mut status = crate::types::DaemonStatusReport {
+            capacity: crate::types::CapacityReport {
+                ranking_present: true,
+                total_accounts: 4,
+                healthy_accounts: 4,
+                exhausted_accounts: 0,
+                token_axis_limit: 4,
+                token_bound: false,
+            },
+            dynamic_cap: 4,
+            work_finder_enabled: Some(true),
+            ..Default::default()
+        };
+        status.last_work_finder_tick = Some(crate::types::WorkFinderTickSummary {
+            at: now - chrono::Duration::seconds(30),
+            max_concurrent: 4,
+            seen: 3,
+            dispatched: 1,
+            ..Default::default()
+        });
+        health::HealthInputs {
+            at: now,
+            window: Duration::from_secs(health::DEFAULT_WINDOW_SECS),
+            status: Some(status),
+            ipc_error: None,
+            install_state: None,
+            pgrep_pids: vec![],
+            pid_file: None,
+            ranking_present: true,
+            ranking_age_secs: Some(120),
+            pipeline: Some(
+                roots
+                    .iter()
+                    .map(|root| crate::pipeline_snapshot::RepoPipelineSnapshot {
+                        root: PathBuf::from(root),
+                        queued: Some(2),
+                        building: Some(1),
+                        review_requested: Some(1),
+                        changes_requested: Some(0),
+                        approved: Some(0),
+                        merged_24h: Some(3),
+                        error: None,
+                    })
+                    .collect(),
+            ),
+            cli_build_commit: "unknown".to_string(),
+            work_finder_log_tick_age_secs: None,
+        }
+    }
+
+    #[test]
+    fn all_repos_failing_roles_is_not_green_anywhere_while_every_other_axis_is_healthy() {
+        let now = Utc::now();
+        // Three "managed repos", each with its role runner persistently and
+        // identically failing — well past `ROLE_TICK_ESCALATION_THRESHOLD` —
+        // while nothing else about the fleet is unhealthy.
+        let roots = [
+            "/repos/collector-test-5076-loom",
+            "/repos/collector-test-5076-anvil",
+            "/repos/collector-test-5076-kicad-tools",
+        ];
+        let mut records = Vec::new();
+        for root in &roots {
+            records.extend(escalating_failure_records(
+                root,
+                "judge",
+                now,
+                health::ROLE_TICK_ESCALATION_THRESHOLD + 2,
+            ));
+        }
+
+        let mut inputs = all_other_axes_healthy_inputs(now, &roots);
+        inputs.status.as_mut().unwrap().role_tick_records = records.clone();
+
+        let report = health::assess(&inputs);
+
+        // -- the headline AC: the fleet-level verdict is not green -------
+        assert_ne!(
+            report.overall,
+            health::Verdict::Green,
+            "all roles failing must not read green anywhere an operator looks by default: {}",
+            report.render_human()
+        );
+        assert_eq!(report.exit_code(), health::EXIT_DEGRADED);
+
+        // -- roles is the section that is actually down -------------------
+        let roles = report.section("roles").expect("roles section present");
+        assert_eq!(roles.verdict, health::Verdict::Degraded, "{}", roles.summary);
+        assert!(
+            roles.summary.contains("ESCALATED"),
+            "3 repos past the escalation threshold must be called out distinctly (Gap 3): {}",
+            roles.summary
+        );
+        for root in &roots {
+            let name = Path::new(root)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            assert!(
+                roles.summary.contains(&name),
+                "every failing repo must be named, not just the first: {}",
+                roles.summary
+            );
+        }
+
+        // -- every OTHER section stays green — this is a roles-only outage,
+        //    not a masked fleet-wide failure (Gap 1's review axes included,
+        //    even though this fixture does not stall them) --------------
+        for key in ["dispatch", "tokens", "queues", "throughput"] {
+            let section = report
+                .section(key)
+                .unwrap_or_else(|| panic!("{key} section present"));
+            assert_eq!(
+                section.verdict,
+                health::Verdict::Green,
+                "{key} must stay green — this is a roles-only outage: {}",
+                section.summary
+            );
+        }
+
+        // -- Gap 4: the rendered summary is bounded and ANSI-clean despite
+        //    3 repos each contributing a multi-KB raw ANSI-laden detail ---
+        assert!(
+            !roles.summary.contains('\u{1b}'),
+            "an ANSI escape leaked into the operator-facing summary: {:?}",
+            roles.summary
+        );
+        assert!(
+            roles.summary.chars().count() < 2500,
+            "3 failing repos' raw multi-KB details must not multiply the summary's length \
+             (got {} chars)",
+            roles.summary.chars().count()
+        );
+        let human = report.render_human();
+        assert!(!human.contains('\u{1b}'), "ANSI leaked into the full human report");
+
+        // -- Gap 2: the same fixture's role-tick health reaches
+        //    `HostHealthRecord.roles` — the field #5022/PR #5042 added so a
+        //    role dying on one host is observable fleet-wide, not only to
+        //    an operator running `loom-daemon health` locally ------------
+        let roles_health = sample_role_tick_health(&records);
+        let host_health = crate::telemetry::HostHealthRecord {
+            captured_at: now,
+            daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+            build_commit: String::new(),
+            built_at: None,
+            uptime_sec: 3600,
+            logical_cpus: 4,
+            cpu_idle_fraction: None,
+            load_per_core: None,
+            worktree_root_free_gb: None,
+            active_sweep_ids: vec![],
+            dispatch_halted: false,
+            halt_reason: None,
+            managed_repos: vec![],
+            roles: roles_health,
+        };
+        assert_eq!(
+            host_health.roles.persistent.len(),
+            roots.len(),
+            "every failing repo's role-tick health must reach HostHealthRecord: {:?}",
+            host_health.roles.persistent
+        );
+        for root in &roots {
+            let root_path = PathBuf::from(root);
+            let entry = host_health
+                .roles
+                .persistent
+                .iter()
+                .find(|f| f.root == root_path && f.role == "judge")
+                .unwrap_or_else(|| {
+                    panic!("expected a persistent judge failure for {root} in {host_health:?}")
+                });
+            // Gap 2's structured detail also stays ANSI-clean, independent
+            // of the source (`clean_structured_detail`'s own defensive
+            // re-clean, mirroring the summary-line cap above).
+            assert!(
+                entry
+                    .detail
+                    .as_deref()
+                    .is_none_or(|d| !d.contains('\u{1b}')),
+                "HostHealthRecord's structured detail must be ANSI-clean too: {:?}",
+                entry.detail
+            );
+        }
     }
 }
