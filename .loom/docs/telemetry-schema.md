@@ -348,6 +348,43 @@ its registered repos) rather than as an unexplained gap.
   `redactManagedRepos`). The authenticated view always sees every entry in
   full, including private slugs.
 
+## Per-host reporting redundancy (why 3x storage is intentional, Issue #4999)
+
+Every host in a fleet independently samples and pushes `tokens.snapshot` and
+`host.health` on its own `SNAPSHOT_INTERVAL` (5 minutes —
+`loom-daemon/src/observability/mod.rs`), each reporting the **same shared
+account pool** every host in the fleet can see. On a 3-host fleet this means
+each of those two record kinds independently accumulates roughly
+`3 hosts x (90d / 5min) ~= 78k rows` per 90-day retention window — about 3x
+what a single elected reporter would produce for the same information.
+
+This redundancy was raised as a possible optimization (#4999) and
+investigated as a trade study rather than assumed to be a bug:
+
+- **The redundancy is load-bearing.** When `loom-worker-1` went dark for ~80
+  minutes on 2026-08-01, the other two hosts kept reporting the same account
+  pool, so the account-level series had no gap. A single elected reporter
+  would have produced exactly that gap during the one window an operator most
+  needs the series to stay continuous — while a host is dying.
+- **Storage is nowhere near a limit that matters.** `records` is already
+  bounded by both an age cutoff (`RETENTION_DAYS`, default 90) and a hard row
+  cap (`MAX_RECORDS`, default 500,000 — `dashboard/src/retention.ts`). Even
+  counting *all* per-host periodic sampling (`tokens.snapshot` + `host.health`
+  together, ~156k rows/90d across 3 hosts) alongside per-sweep lifecycle
+  records, total volume sits well under a third of the configured cap. There
+  is no pressure to relieve.
+
+**Decision: keep the current per-host independent-reporting design.**
+Electing a single reporter (or deduplicating identical rows at write/read
+time) would trade away a real survivability property for a storage saving
+that isn't currently needed. Revisit only if `MAX_RECORDS` eviction starts
+firing routinely (sustained growth actually approaching the cap) — at that
+point, write-time deduplication that preserves per-account distinguishability
+(still being able to tell "account exhausted" from "no host reported" for a
+given account/bucket) is the option to pursue first, since electing a single
+reporter reintroduces the exact single-point-of-failure this trade study
+found unacceptable.
+
 ## Persistence & read surface (`sweep.outcome`, Issue #4704)
 
 The daemon durably records one `sweep.outcome` [`TelemetryEnvelope`] per
