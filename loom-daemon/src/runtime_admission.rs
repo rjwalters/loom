@@ -243,6 +243,45 @@ fn type_name_of(value: &serde_json::Value) -> &'static str {
     }
 }
 
+/// Bundled fallback runtime manifests, compiled directly into the daemon
+/// binary via `include_str!` (#5002).
+///
+/// `roots()` above resolves an unpopulated `.loom/runtimes/` to a
+/// `defaults/runtimes/<name>.json` fallback, but `defaults/` is a
+/// Loom-*source*-repo-only directory: a consumer install has `.loom/`, never
+/// `defaults/`. So on every managed repo that is not the Loom checkout
+/// itself, that fallback path is unreachable by construction — a consumer
+/// repo whose `.loom/runtimes/` is missing (or missing just one runtime's
+/// manifest, e.g. a 0.16.0-era install never resynced per #4688/#4700) was
+/// permanently unable to admit a non-builtin runtime the daemon binary
+/// itself ships an adapter for.
+///
+/// This table mirrors the manifests shipped at `defaults/runtimes/*.json` at
+/// build time, so the binary carries its own knowledge of the runtimes it
+/// ships adapters for and does not depend on any on-disk `defaults/` or
+/// `.loom/runtimes/` copy being present or complete. It is consulted only
+/// when the on-disk manifest lookup misses (see `resolve_and_admit` below);
+/// an on-disk `.loom/runtimes/<name>.json` — however it got there — always
+/// wins over the bundled copy, so a repo can still override capabilities
+/// on-disk.
+const BUNDLED_RUNTIME_MANIFESTS: &[(&str, &str)] = &[
+    ("claude", include_str!("../../defaults/runtimes/claude.json")),
+    ("codex", include_str!("../../defaults/runtimes/codex.json")),
+    ("aider", include_str!("../../defaults/runtimes/aider.json")),
+];
+
+/// Look up the bundled fallback manifest contents for `runtime`, if the
+/// daemon binary ships one. Returns `None` for any runtime the binary was
+/// not built with a manifest for (e.g. an operator-defined custom runtime) —
+/// those still fail closed with no fallback, per the unchanged fail-closed
+/// contract for non-builtin runtimes with no reachable manifest anywhere.
+fn bundled_runtime_manifest(runtime: &str) -> Option<&'static str> {
+    BUNDLED_RUNTIME_MANIFESTS
+        .iter()
+        .find(|(name, _)| *name == runtime)
+        .map(|(_, contents)| *contents)
+}
+
 fn roots(root: &Path) -> (PathBuf, PathBuf, PathBuf) {
     let installed = root.join(".loom");
     let defaults = root.join("defaults");
@@ -364,6 +403,33 @@ pub fn resolve_and_admit(
                 role_manifest,
                 runtime_manifest,
             });
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Non-builtin runtime, no on-disk manifest at the resolved path
+            // (which may itself be the unreachable `defaults/runtimes/...`
+            // fallback on a consumer install — see `roots()` and
+            // `BUNDLED_RUNTIME_MANIFESTS` above). Fall back to the manifest
+            // the daemon binary was built with, if any (#5002).
+            match bundled_runtime_manifest(&runtime) {
+                Some(bundled) => bundled.as_bytes().to_vec(),
+                None => {
+                    // No bundled fallback for this runtime either: fail
+                    // closed, but name a path that could actually exist in
+                    // THIS repo -- `.loom/runtimes/<name>.json` -- rather
+                    // than `runtime_manifest`, which on a consumer install is
+                    // the unreachable `<repo>/defaults/runtimes/<name>.json`
+                    // fallback path `roots()` computed (`defaults/` only
+                    // exists in the Loom source checkout itself).
+                    let reachable = root.join(".loom/runtimes").join(format!("{runtime}.json"));
+                    return Err(reject(
+                        format!(
+                            "runtime manifest not found at {} (no bundled fallback shipped for runtime {runtime:?})",
+                            reachable.display()
+                        ),
+                        vec![],
+                    ));
+                }
+            }
         }
         Err(e) => {
             return Err(reject(
@@ -817,14 +883,17 @@ mod tests {
             r#"{"runtimeRequirements":["worktreeIsolation","mcp"]}"#,
         )
         .unwrap();
+        fs::write(loom_roles.join("judge.json"), "{}").unwrap();
         let loom_scripts = root.path().join(".loom/scripts");
         fs::create_dir_all(&loom_scripts).unwrap();
-        let adapter = loom_scripts.join("spawn-claude.sh");
-        fs::write(&adapter, "#!/bin/sh\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&adapter, fs::Permissions::from_mode(0o755)).unwrap();
+        for name in ["claude", "codex"] {
+            let adapter = loom_scripts.join(format!("spawn-{name}.sh"));
+            fs::write(&adapter, "#!/bin/sh\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&adapter, fs::Permissions::from_mode(0o755)).unwrap();
+            }
         }
         // No `.loom/runtimes/` and no `defaults/` at all — the exact live
         // incident layout.
@@ -847,12 +916,29 @@ mod tests {
         assert!(admitted
             .runtime_manifest
             .starts_with(root.path().join("defaults/runtimes")));
+
+        // #5002: a non-builtin runtime the daemon ships an adapter for
+        // (codex) ALSO admits in this exact layout — via the bundled
+        // fallback manifest compiled into the binary, not the degrade-open
+        // path exercised above (which is scoped to the builtin runtime
+        // only). `judge` declares no `runtimeRequirements`, so it is
+        // satisfied by codex's real bundled capabilities.
+        let admitted_codex = resolve_and_admit(root.path(), "judge", Some("codex")).unwrap();
+        assert_eq!(admitted_codex.runtime, "codex");
+        assert_eq!(admitted_codex.source, RuntimeSource::Explicit);
     }
 
     /// The degrade-open behaviour is scoped to the builtin `claude` runtime
-    /// only. An explicit non-builtin runtime with a missing manifest must
-    /// still fail closed — a regression guard against over-widening the
-    /// #4688 fix beyond the zero-config default.
+    /// only, and the #5002 bundled-fallback addition is scoped to the
+    /// runtimes the daemon binary actually ships a manifest for. A runtime
+    /// with NO on-disk manifest anywhere AND no bundled fallback (simulated
+    /// here with an operator-defined custom runtime name the binary was
+    /// never built with) must still fail closed — a regression guard
+    /// against over-widening either fix beyond its intended scope. It also
+    /// pins the #5002 corrected error text: the message must name a path
+    /// reachable from THIS repo (`.loom/runtimes/<name>.json`), not the
+    /// unreachable `defaults/runtimes/<name>.json` fallback path `roots()`
+    /// computed (`defaults/` only exists in the Loom source checkout).
     #[test]
     fn consumer_layout_missing_runtimes_dir_non_builtin_still_fails_closed() {
         let root = tempfile::tempdir().unwrap();
@@ -861,15 +947,38 @@ mod tests {
         fs::write(loom_roles.join("judge.json"), "{}").unwrap();
         let loom_scripts = root.path().join(".loom/scripts");
         fs::create_dir_all(&loom_scripts).unwrap();
-        let adapter = loom_scripts.join("spawn-codex.sh");
-        fs::write(&adapter, "#!/bin/sh\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&adapter, fs::Permissions::from_mode(0o755)).unwrap();
+        for name in ["codex", "acme-runtime"] {
+            let adapter = loom_scripts.join(format!("spawn-{name}.sh"));
+            fs::write(&adapter, "#!/bin/sh\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&adapter, fs::Permissions::from_mode(0o755)).unwrap();
+            }
         }
-        let rejected = resolve_and_admit(root.path(), "judge", Some("codex")).unwrap_err();
+
+        // No on-disk manifest anywhere (no `.loom/runtimes/`, no
+        // `defaults/`) AND no bundled fallback for this made-up runtime
+        // name -- still fails closed exactly as before.
+        let rejected = resolve_and_admit(root.path(), "judge", Some("acme-runtime")).unwrap_err();
         assert!(rejected.reason.contains("runtime manifest"), "{}", rejected.reason);
+        // #5002: the corrected message names a path reachable from a
+        // consumer repo, not the unreachable `defaults/runtimes/...` path.
+        assert!(
+            rejected.reason.contains(".loom/runtimes/acme-runtime.json"),
+            "{}",
+            rejected.reason
+        );
+        assert!(!rejected.reason.contains("defaults/runtimes"), "{}", rejected.reason);
+
+        // #5002: a runtime the daemon DOES ship a bundled manifest for
+        // (codex) is no longer stuck here -- it now admits via the bundled
+        // fallback instead of failing closed, since the compiled-in
+        // manifest is a reachable source of truth even with no on-disk
+        // `.loom/runtimes/` at all. This is the fix under test, not a
+        // weakening of the fail-closed guarantee asserted above.
+        let admitted = resolve_and_admit(root.path(), "judge", Some("codex")).unwrap();
+        assert_eq!(admitted.runtime, "codex");
     }
 
     #[test]
