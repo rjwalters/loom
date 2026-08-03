@@ -3325,6 +3325,31 @@ fi
 echo ""
 
 # ==========================================================================
+# scripts/install/sync-labels.sh --prune-defaults / --force (#5066)
+# ==========================================================================
+# Its own unit suite lives at defaults/scripts/tests/test-install-sync-labels.sh
+# (additive-by-default with no flags, --prune-defaults restoring the old
+# unconditional deletion, and the in-use-label warn/refuse-without-force
+# guard) — the source-only counterpart of the --repo/--dry-run suite above.
+echo "Test: scripts/install/sync-labels.sh --prune-defaults suite (test-install-sync-labels.sh)"
+INSTALL_SYNC_LABELS_TEST="$DEFAULTS_DIR/scripts/tests/test-install-sync-labels.sh"
+if [[ -f "$INSTALL_SYNC_LABELS_TEST" ]]; then
+  set +e
+  INSTALL_SYNC_LABELS_TEST_OUT=$(bash "$INSTALL_SYNC_LABELS_TEST" 2>&1)
+  INSTALL_SYNC_LABELS_TEST_RC=$?
+  set -e
+  if [[ $INSTALL_SYNC_LABELS_TEST_RC -eq 0 ]]; then
+    pass "test-install-sync-labels.sh: all cases passed"
+  else
+    fail "test-install-sync-labels.sh failed (rc=$INSTALL_SYNC_LABELS_TEST_RC)"
+    echo "$INSTALL_SYNC_LABELS_TEST_OUT" | tail -20
+  fi
+else
+  fail "test-install-sync-labels.sh not found at $INSTALL_SYNC_LABELS_TEST"
+fi
+echo ""
+
+# ==========================================================================
 # Summary
 # ==========================================================================
 echo "======================================"
