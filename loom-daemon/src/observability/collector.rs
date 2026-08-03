@@ -109,6 +109,15 @@ async fn run_collector(
     let mut slug_cache: HashMap<String, String> = HashMap::new();
     let mut snapshot_timer = tokio::time::interval(snapshot_interval);
     snapshot_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    // First-boot backfill (Issue #5084): run once immediately, before the
+    // first snapshot tick, so a sweep adopted across a daemon restart does
+    // not wait a full `snapshot_interval` (5 minutes) for its terminal
+    // record to reach the export queue. Blocking here is fine — this is a
+    // bounded, local-disk-only read (no network, no `gh`) and runs once at
+    // task startup.
+    run_backfill(&queue, &workspace_root, &workspace_pool).await;
+
     loop {
         tokio::select! {
             biased;
@@ -144,8 +153,42 @@ async fn run_collector(
                     &mut slug_cache,
                 )
                 .await;
+                // Periodic backfill (Issue #5084), same cadence as the host
+                // snapshot: self-heals any terminal record the live
+                // event-bus path missed or mis-attributed, not just the
+                // first-boot case above (e.g. a sweep whose terminal
+                // transition raced this task's own startup).
+                run_backfill(&queue, &workspace_root, &workspace_pool).await;
             }
         }
+    }
+}
+
+/// Run one [`super::backfill::run_backfill_pass_all`] pass, dispatched
+/// through `spawn_blocking` (Issue #5084): the backfill path is synchronous
+/// disk I/O (journal reads, queue pushes, cursor persistence) with no `.await`
+/// points of its own, so running it inline on the collector's async task
+/// would block that task's executor thread for the duration — `spawn_blocking`
+/// keeps it off the reactor, mirroring how [`sample_host_health`] already
+/// dispatches its own blocking CPU probe.
+async fn run_backfill(
+    queue: &Arc<DurableQueue>,
+    workspace_root: &Path,
+    workspace_pool: &Arc<WorkspacePool>,
+) {
+    let queue = queue.clone();
+    let workspace_root = workspace_root.to_path_buf();
+    let workspace_pool = workspace_pool.clone();
+    let processed = tokio::task::spawn_blocking(move || {
+        super::backfill::run_backfill_pass_all(&workspace_root, &workspace_pool, &queue)
+    })
+    .await
+    .unwrap_or_else(|error| {
+        log::warn!("observability: backfill task panicked: {error}");
+        0
+    });
+    if processed > 0 {
+        log::info!("observability: backfill pass enqueued {processed} previously-unexported sweep outcome(s)");
     }
 }
 
@@ -1503,6 +1546,11 @@ mod tests {
             ),
             cli_build_commit: "unknown".to_string(),
             work_finder_log_tick_age_secs: None,
+            // Pre-existing pipeline check: `HealthInputs` gained this field
+            // in #5097 after this fixture was added in #5098 — `None` (gh
+            // available) matches every other axis this fixture already
+            // documents as healthy.
+            gh_unavailable: None,
         }
     }
 

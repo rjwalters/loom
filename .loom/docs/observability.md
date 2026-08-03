@@ -90,6 +90,36 @@ field-by-field reference, the `visibility` anti-leak contract, and the local
 exporter is configured**):
 [`.loom/docs/telemetry-schema.md`](telemetry-schema.md).
 
+### Backfill: the local journal is the export queue-of-record (#5084)
+
+The live collector can only attach the correct `sweep_id` to a terminal
+`sweep.completed`/`sweep.outcome` record by having observed that sweep's
+*own* dispatch event earlier in the same daemon process. A sweep **adopted
+across a daemon restart** was dispatched by the previous process, so this
+falls through to a synthesized `unknown-issue-{N}` id — the record can still
+export, but under an id nothing else can query it by, which is what produced
+the "sweeps that finished were silently missing from the backend" incident
+this issue documents.
+
+`loom-daemon/src/observability/backfill.rs` fixes this at the root: the local
+`sweep-outcome-telemetry.jsonl` journal above is written unconditionally at
+every terminal transition — with the *real* `sweep_id`, independent of
+whether the live collector saw the dispatch — so a backfill pass (run once at
+collector startup, then every `SNAPSHOT_INTERVAL`) treats it as the queue of
+record. It re-offers any envelope not yet handed to the export queue
+(tracked by a small on-disk cursor, `observability-backfill-state.json`) —
+self-healing *any* lost export, not just the restart-adoption case (a
+transport failure or a queue drop recovers the same way). `loom-daemon
+sweep-outcomes --pending-export` reports how many local records have not yet
+been attempted, so the backlog is visible rather than silent.
+
+True idempotency — a re-offered record must never double-count — is enforced
+on the **backend**, not the daemon: `dashboard/migrations/0002_…sql` adds a
+partial `UNIQUE(kind, sweep_id)` index scoped to exactly `sweep.completed`/
+`sweep.outcome`, and `/ingest` uses `INSERT OR IGNORE`, so a duplicate is
+silently absorbed rather than inserted twice. The daemon-side cursor is only
+an efficiency optimization against needless re-sends.
+
 ## 3. Exporters: HTTPS (default) or OTLP (opt-in)
 
 The default exporter is `HttpsExporter` — JSON-over-HTTPS `POST /ingest`,

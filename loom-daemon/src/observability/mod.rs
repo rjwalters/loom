@@ -20,6 +20,15 @@
 //!   with an existing OpenTelemetry stack, selected via
 //!   `observability.exporter = "otlp"` ([`resolve_exporter`]). Off by
 //!   default; [`exporter::HttpsExporter`] stays the default sink.
+//! - [`backfill`] (Issue #5084) — the local `sweep-outcome-telemetry.jsonl`
+//!   journal ([`crate::sweep_outcomes`]) is written unconditionally at every
+//!   sweep's terminal transition, independent of whether [`collector`]'s
+//!   live event-bus pipeline observed it. `backfill` treats that journal as
+//!   the export queue-of-record: it periodically pushes any record the queue
+//!   has not yet been offered onto [`queue::DurableQueue`] alongside a
+//!   synthesized `sweep.completed`, so a sweep adopted across a daemon
+//!   restart (whose dispatch this process never saw) still exports under its
+//!   real `sweep_id` instead of being silently under-counted.
 //!
 //! # Off by default (FLAGS-OFF posture)
 //!
@@ -64,6 +73,7 @@
 //! variant in this module tree names the *file path*, never the key
 //! contents.
 
+pub mod backfill;
 pub mod collector;
 pub mod exporter;
 #[cfg(feature = "otlp")]

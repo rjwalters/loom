@@ -259,8 +259,19 @@ async function handleIngest(request: Request, env: Env): Promise<Response> {
   const nowIso = new Date().toISOString();
   const statements = envelopes.map((envelope) => {
     const fields = extractRecordFields(envelope.record);
+    // `OR IGNORE` (Issue #5084): `idx_records_terminal_sweep_once`
+    // (migrations/0002) enforces a partial UNIQUE(kind, sweep_id) for
+    // exactly `sweep.completed`/`sweep.outcome` — the two kinds a sweep
+    // emits once, ever. A re-sent record for a sweep already ingested
+    // (the daemon-side backfill drain's cursor is an efficiency
+    // optimization, not a correctness guarantee — see
+    // `loom-daemon/src/observability/backfill.rs`'s module doc) is
+    // silently absorbed here instead of duplicating the row. Every other
+    // `kind` has no matching unique index, so this is a no-op change for
+    // them — `INSERT OR IGNORE` behaves exactly like `INSERT` when there is
+    // no conflicting constraint.
     return env.DB.prepare(
-      `INSERT INTO records
+      `INSERT OR IGNORE INTO records
          (schema_version, emitted_at, host_id, kind, repo, visibility, issue, sweep_id, payload, ingested_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).bind(

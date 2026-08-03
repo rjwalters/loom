@@ -336,14 +336,35 @@ pub(crate) fn handle_sweep_outcomes_command(
     result_filter: Option<&str>,
     records_mode: bool,
     limit: Option<usize>,
+    pending_export: bool,
     json: bool,
 ) -> Result<()> {
+    use loom_daemon::observability::backfill;
     use loom_daemon::sweep_outcomes;
     use loom_daemon::telemetry;
     use loom_daemon::worktree_ops::repo;
 
     let repo_root = repo::resolve_repo_root(workspace)?;
     let path = sweep_outcomes::default_outcome_telemetry_path(&repo_root);
+
+    if pending_export {
+        let pending = backfill::pending_count(&repo_root);
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({ "pending_export": pending }))?
+            );
+        } else if pending == 0 {
+            println!("0 local outcome record(s) pending export — the backfill drain is caught up.");
+        } else {
+            println!(
+                "{pending} local outcome record(s) recorded at {} but not yet attempted for export \
+                 (Issue #5084 — self-heals on the daemon's next backfill pass).",
+                path.display()
+            );
+        }
+        return Ok(());
+    }
 
     let result_filter: Option<telemetry::SweepResult> =
         result_filter.map(parse_sweep_result_arg).transpose()?;
