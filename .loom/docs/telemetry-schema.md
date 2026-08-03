@@ -156,6 +156,21 @@ A sweep advanced to a new lifecycle phase (mirrors `sweep.issue.{N}.phase`).
 
 `phase` is a lifecycle name: `curator`, `builder`, `judge`, `doctor`, `merge`.
 
+**Source and cadence (#4863)**: `Event::SweepPhase` — the record's only upstream —
+is published by `SweepRegistry::sample_phase_transition`, which the reaper calls
+once per live sweep per `reap_once` tick (the 30s reaper timer, plus every
+read-path reap). It reads `.loom/sweep-checkpoint/issue-<N>.json` and publishes
+**only when the phase changed since the previous tick**, so a sweep sitting in a
+phase emits nothing further. The checkpoint's raw marker (`curator-done`,
+`judge-rejected`) is normalized to the lifecycle vocabulary above before it is
+published; an unrecognized marker passes through verbatim rather than being
+guessed at, so `phase` should be read as "one of the five names, or an unknown
+raw marker" — which is exactly how the dashboard types it
+(`SweepPhaseName | string`).
+
+Because the phase is polled rather than pushed, `entered_at` is the daemon's
+*observation* instant, an honest upper bound on the real transition time.
+
 ### `sweep.completed`
 
 A sweep reached a terminal state (the summary moment; richer detail is in the
@@ -265,41 +280,13 @@ probe stays absent rather than being coerced to a fake zero (the daemon's
   "logical_cpus": 28,
   "cpu_idle_fraction": 0.83,
   "load_per_core": 0.51,
-  "worktree_root_free_gb": 200,
-  "dispatch_halted": false,
-  "managed_repos": [
-    { "slug": "rjwalters/loom", "visibility": "public" },
-    { "slug": "2AMLogic/gf180-pll", "visibility": "private" }
-  ]
+  "worktree_root_free_gb": 200
 }
 ```
 
 `cpu_idle_fraction`, `load_per_core`, and `worktree_root_free_gb` are omitted when
 unmeasurable. A consumer MUST treat an absent measurement as "unknown", never as
 zero/full.
-
-**Dispatch-attention state (`dispatch_halted` / `halt_reason`, #4975).** Whether
-this host's own dispatch is currently halted for a non-idle reason, and why. A
-host can be at 0% idle / high load-per-core and still report `status: "ok"` on a
-naive check that only looks at token exhaustion — this is the daemon's own
-authoritative "am I refusing new work right now" signal, so a consumer does not
-have to re-derive it from raw CPU/load numbers.
-
-- `dispatch_halted` is sourced from the host-distress breaker
-  (`loom-daemon/src/host_breaker.rs`, Issue #4235): `true` when the breaker is
-  `Open` or `CoolDown` (`BreakerPhase::suppresses_dispatch`), `false` when it is
-  `Closed`, disabled, or was never registered (no work-finder loop running on
-  this host — a repo that never enables autonomy always sends `false`).
-  `#[serde(default)]`, so a record from a pre-#4975 daemon decodes as `false`
-  ("not known to be halted"), not as a fabricated "healthy".
-- `halt_reason` is the breaker's own human-readable transition message (e.g.
-  `"load-per-core 4.24 >= 2.50 sustained for 3 consecutive tick(s)"`), present
-  only while `dispatch_halted` is `true`. Omitted (not sent as `null`) while not
-  halted.
-
-Both fields are additive and pass through public redaction unchanged
-(`dashboard/src/redaction.ts`) — dispatch-attention state describes the
-machine, not any repo or operator.
 
 **Binary identity (`build_commit` / `built_at`, #4956).** `daemon_version` is
 `CARGO_PKG_VERSION`, so it only moves once per release: every build between two
@@ -322,138 +309,6 @@ Both fields are additive and pass through public redaction unchanged (they
 describe the released binary, not any repo or operator — see
 `dashboard/src/redaction.ts`), so an older consumer that ignores unknown keys is
 unaffected.
-
-**`managed_repos` (#4976, redaction class: per-entry, public-visible slug
-only).** This host's managed-repository roster — every workspace root the
-daemon's workspace registry currently tracks, resolved to its forge
-`owner/repo` slug and a [`RepoVisibility`](#repovisibility-contract--private-by-default)
-tag derived exactly the way a sweep record's own `visibility` is derived
-(`visibility::derive_visibility`). Sourced from the registry itself, **not**
-inferred from `active_sweep_ids` — a registered-but-idle repo (no sweep ever
-dispatched into it this run) still appears, which is the whole point: it lets
-the dashboard show a host's quiet as "roster-shaped" (nothing ready in any of
-its registered repos) rather than as an unexplained gap.
-
-- Omitted entirely (`#[serde(default, skip_serializing_if = "Vec::is_empty")]`)
-  when the host has no registered workspaces, or on a record from a pre-#4976
-  daemon — an older/partial record decodes with an empty roster rather than
-  failing.
-- **Unlike every other field in this record, `managed_repos` does NOT pass
-  through public redaction unchanged.** Each entry names a specific
-  repository, so the anti-leak contract applies per entry, not to the whole
-  record: a `public`-visibility entry's `slug` survives to the public
-  (unauthenticated) view; a `private` entry's `slug` is dropped but the entry
-  itself is kept, so the roster's size — and therefore "how many are private"
-  — stays visible without naming any of them (`dashboard/src/redaction.ts`'s
-  `redactManagedRepos`). The authenticated view always sees every entry in
-  full, including private slugs.
-
-**`roles` (#5022, role-tick health).** The same transient-vs-persistent
-classification `loom-daemon health`'s `roles` section already computes
-(`crate::health::summarize_role_ticks`, fed by
-`crate::role_runner::role_tick_records()`), carried through the telemetry
-pipeline so a role dying on one host (the exact 2026-08-03 Judge outage #5004
-was filed for) is observable fleet-wide rather than only to an operator who
-happens to run `loom-daemon health` locally on that one host.
-
-```json
-{
-  "kind": "host.health",
-  "...": "every field above, plus:",
-  "roles": {
-    "total": 12,
-    "ok": 10,
-    "persistent": [
-      {
-        "root": "/repos/loom",
-        "role": "judge",
-        "failures": 2,
-        "last_at": "2026-08-03T09:14:00Z",
-        "detail": "no-token-pool"
-      }
-    ]
-  }
-}
-```
-
-- `total` / `ok` are the tick counts sampled from the process-global role-tick
-  ring (`crate::role_runner::ROLE_TICK_RING_CAPACITY`-bounded), **not**
-  windowed the way `loom-daemon health --since` is — a periodic `host.health`
-  push always reports the ring's full current contents. `total: 0` means "the
-  role runner sampled nothing" (idle or disabled entirely) and is a normal,
-  healthy state — never render it as degraded.
-- `persistent` lists only the `(root, role)` pairs whose **most recent**
-  sampled tick is still a failure — the ones that make `loom-daemon health`'s
-  `roles` section report `DEGRADED`. A pair that failed but has since
-  recovered (its latest tick is a success) is folded into `total`/`ok` like
-  every other tick and does **not** appear here, mirroring the transient
-  count in `assess_roles`'s own rendered summary line.
-- `#[serde(default)]` on the whole `roles` field, so a record from a
-  pre-#5022 daemon decodes with the zero-value ("nothing sampled") summary
-  rather than failing the whole envelope. `persistent` is additionally
-  omitted from the wire when empty (`skip_serializing_if = "Vec::is_empty"`),
-  mirroring `managed_repos`/`active_sweep_ids`.
-- `root` is a local workspace filesystem path, not a forge `owner/repo`
-  slug — it names no repository, issue, branch, or PR. But on the common
-  macOS/Linux home-directory layout (`/Users/<user>/…`, `/home/<user>/…`) its
-  leading segment *does* name the **operator**, the same "who runs the fleet"
-  category `tokens.snapshot`'s `accounts` is held back for. So (redaction
-  class: **per-entry, `root` basenamed**) the authenticated `/api/*` surface
-  keeps the full path, but the public, unauthenticated view only ever gets each
-  `root` truncated to its basename — mirroring the daemon's
-  `RoleFailure::label()` and the frontend's `pathBasename`. `total`/`ok` and
-  each failure's `role`/`failures`/`last_at` pass through unchanged.
-- `detail` is **authenticated-only** (redaction class: **field, dropped for
-  public**; #5065). It is the free-form failure string the daemon's
-  `RoleTickOutcome::Failure` constructors build (`loom-daemon/src/
-  role_runner.rs`) — on the ordinary "role child exited non-zero" path it
-  interpolates the absolute `spawn-worker.sh` path plus up to
-  `MAX_OUTPUT_TAIL_BYTES` of the failing role child's own log tail, so it can
-  carry further absolute paths, repo slugs, issue numbers, or branch names.
-  Unlike `root` this has no basename-style truncation that makes it safe by
-  construction, so it is held behind the Access gate entirely rather than
-  redacted in place — same footing as `tokens.snapshot`'s `accounts`. The
-  authenticated `/api/*` surface still returns it in full.
-  Enforced by `redactRoleTickHealth` in `dashboard/src/redaction.ts` (like
-  `managed_repos`, `roles` is deliberately absent from the raw allowlist and
-  only reaches a public response through that derivation).
-
-## Per-host reporting redundancy (why 3x storage is intentional, Issue #4999)
-
-Every host in a fleet independently samples and pushes `tokens.snapshot` and
-`host.health` on its own `SNAPSHOT_INTERVAL` (5 minutes —
-`loom-daemon/src/observability/mod.rs`), each reporting the **same shared
-account pool** every host in the fleet can see. On a 3-host fleet this means
-each of those two record kinds independently accumulates roughly
-`3 hosts x (90d / 5min) ~= 78k rows` per 90-day retention window — about 3x
-what a single elected reporter would produce for the same information.
-
-This redundancy was raised as a possible optimization (#4999) and
-investigated as a trade study rather than assumed to be a bug:
-
-- **The redundancy is load-bearing.** When `loom-worker-1` went dark for ~80
-  minutes on 2026-08-01, the other two hosts kept reporting the same account
-  pool, so the account-level series had no gap. A single elected reporter
-  would have produced exactly that gap during the one window an operator most
-  needs the series to stay continuous — while a host is dying.
-- **Storage is nowhere near a limit that matters.** `records` is already
-  bounded by both an age cutoff (`RETENTION_DAYS`, default 90) and a hard row
-  cap (`MAX_RECORDS`, default 500,000 — `dashboard/src/retention.ts`). Even
-  counting *all* per-host periodic sampling (`tokens.snapshot` + `host.health`
-  together, ~156k rows/90d across 3 hosts) alongside per-sweep lifecycle
-  records, total volume sits well under a third of the configured cap. There
-  is no pressure to relieve.
-
-**Decision: keep the current per-host independent-reporting design.**
-Electing a single reporter (or deduplicating identical rows at write/read
-time) would trade away a real survivability property for a storage saving
-that isn't currently needed. Revisit only if `MAX_RECORDS` eviction starts
-firing routinely (sustained growth actually approaching the cap) — at that
-point, write-time deduplication that preserves per-account distinguishability
-(still being able to tell "account exhausted" from "no host reported" for a
-given account/bucket) is the option to pursue first, since electing a single
-reporter reintroduces the exact single-point-of-failure this trade study
-found unacceptable.
 
 ## Persistence & read surface (`sweep.outcome`, Issue #4704)
 
@@ -531,27 +386,5 @@ loom-daemon sweep-outcomes --json
 
 Purely file-based (like `loom-daemon calibrate`) — no running daemon required.
 `--workspace PATH` selects a different repo root (default `.`).
-
-## Alternative sinks: the OTLP exporter (Epic #4702, Phase 4 — issue #4858)
-
-The native JSON-over-HTTPS push (`exporter::HttpsExporter`, above) is the
-default sink and stays that way for backward compatibility. Operators with an
-existing OpenTelemetry stack (a self-hosted collector, Grafana, Honeycomb, …)
-can instead select `observability.exporter = "otlp"`
-(`$LOOM_OBSERVABILITY_EXPORTER=otlp` overrides; **env > config > default**,
-default `"https"`), which POSTs to `{observability.endpoint}/v1/logs` and
-`{observability.endpoint}/v1/metrics` using the same `observability.endpoint`
-+ `observability.ingestKeyFile` + `Authorization: Bearer` convention as the
-HTTPS sink.
-
-This is opt-in twice over: off by default (`observability.enabled`) *and*
-gated behind the `otlp` Cargo feature — a default `loom-daemon` build never
-compiles in the `opentelemetry-proto` dependency, so choosing `HttpsExporter`
-costs nothing extra. The full `TelemetryEnvelope` → OTLP field mapping (which
-record kinds become OTLP logs vs. metrics, and how `host_id` / `emitted_at` /
-the repo-visibility tag map onto OTLP resource/record attributes) is
-documented at `loom-daemon/src/observability/otlp/mod.rs`'s module doc
-comment, not duplicated here — that Rust doc comment is the source of truth,
-verified by `loom-daemon/src/observability/otlp/mapping.rs`'s unit tests.
 
 [`TelemetryEnvelope`]: #envelope

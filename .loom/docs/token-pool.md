@@ -305,29 +305,6 @@ token hits its weekly limit.
    `claude` (or pass `--use-wrapper` to layer on top of `claude-wrapper.sh` for
    retry behavior).
 
-### Verifying token precedence (`defaults/scripts/verify-token-precedence.sh`)
-
-The token rotation mechanism relies on `CLAUDE_CODE_OAUTH_TOKEN` taking precedence
-over Keychain authentication in Claude Code. After upgrading Claude Code or when
-diagnosing suspected rotation failures (e.g., the fallback-to-Keychain behavior
-mentioned in issue #3236), run `defaults/scripts/verify-token-precedence.sh` once
-from the repository root to confirm this assumption still holds:
-
-```bash
-./defaults/scripts/verify-token-precedence.sh
-```
-
-**Exit codes**:
-- `0` — precedence is correct; env-token takes precedence over Keychain
-- `1` — precedence failed; env-token is being ignored and Keychain is used (rotation will not work)
-- `2` — prerequisites missing (claude not installed, not logged in, etc.)
-
-The script creates a test with a deliberately bogus `CLAUDE_CODE_OAUTH_TOKEN` value
-and verifies that auth fails or differs from the Keychain account. If the installed
-Claude Code version silently falls back to Keychain when the env-token is invalid,
-rotation is broken on that version and the issue should be escalated to Claude Code
-support.
-
 ## Selection algorithm (`loom-daemon tokens select`)
 
 Three tiers, falling through to the next when the current tier yields nothing.
@@ -547,7 +524,7 @@ first-class in *generated* systemd units; this section is for bare/unmanaged
 daemon startups and ad hoc CLI invocations from arbitrary cwds — the generated
 units already cover the managed case).
 
-Implementation: [`resolve_tokens_dir_anchored()`](../../loom-daemon/src/tokens_pool/paths.rs)
+Implementation: [`resolve_tokens_dir_anchored()`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/tokens_pool/paths.rs)
 delegates step 2/3's "is this candidate a recognized Loom workspace" question
 to the same registry-membership check `#4299` established for CLI
 `--workspace` defaulting (`workspace_registry::resolve_client_workspace_default`)
@@ -564,7 +541,7 @@ rotation has not been configured at all.
 
 The `loom-daemon` role runner (`autonomous.roleRunner`, see
 [daemon-reference.md](daemon-reference.md)) pre-checks
-[`tokens::token_pool_size`](../../loom-daemon/src/tokens.rs) for exactly this
+[`tokens::token_pool_size`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/tokens.rs) for exactly this
 condition **before** it ever spawns `spawn-claude.sh` (issue #4642): a repo
 with neither pool provisioned skips the doomed spawn entirely instead of
 hitting this hard-fail on every single tick forever. The skip is logged once
@@ -727,7 +704,6 @@ refuses to silently auto-clear `.bad_tokens` — that masks real auth problems.
 ## Tests
 
 ```bash
-PYTHONPATH=loom-tools/src python3 -m pytest loom-tools/tests/tokens/ -v
 bash .loom/scripts/tests/test-spawn-claude.sh
 ```
 

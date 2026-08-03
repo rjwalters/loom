@@ -165,7 +165,7 @@ alias it asked for).
 New template keys reach existing consumer configs via the installer deep-merge
 (template is the base, existing values win) — no migration needed. The tier
 ownership of the block is noted in
-[`docs/design/config-resolution-tiers.md`](../../docs/design/config-resolution-tiers.md).
+[`docs/design/config-resolution-tiers.md`](https://github.com/rjwalters/loom/blob/main/docs/design/config-resolution-tiers.md).
 
 ## Operator setup: provisioning the persona (requires a safehoused restart)
 

@@ -962,6 +962,125 @@ _any_managed_worktree_exists() {
 }
 
 # =============================================================================
+# mark_expandable_dollars() — rewrite a raw write-target token into its
+# "effective path shape" (#4921).
+#
+# extract_write_targets() is a TOKENIZER, not a shell evaluator: a token is
+# emitted with its quote characters copied verbatim (qsplit's contract) and
+# with every `$…` reference unexpanded. Before the write-confinement block can
+# reason about WHERE a token lands, it needs to know which `$` characters the
+# real shell would actually expand — a `$` inside a SINGLE-quoted span, or one
+# preceded by a backslash, is literal data (a file really named `$X`), while a
+# bare or DOUBLE-quoted `$` is an expansion the guard cannot resolve.
+#
+# Emits (in the global _MARKED_TOKEN) the token with:
+#   - quote characters removed (so `"$A"/x`, `"$A/x"` and `$A/x` all normalize
+#     to the same shape and quoting cannot be used to dodge the shape tests),
+#   - backslash escapes applied (the backslash dropped, the escaped character
+#     kept literal),
+#   - every EXPANDABLE `$` replaced by SOH (0x01) — a character no real path
+#     produced by this tokenizer contains — while a LITERAL `$` stays a `$`.
+#
+# A global rather than a subshell echo: this runs per write target and the
+# callers are already in a `while read` loop.
+#
+# Implemented on top of the shared scanner below so the write-confinement
+# block has exactly ONE definition of "what the shell would do to these
+# quotes" — a second, hand-copied quote parser is precisely how the two
+# consumers would drift apart, and a drift in this grammar IS a guard bypass.
+# =============================================================================
+_MARKED_TOKEN=""
+mark_expandable_dollars() {
+    _scan_token_quoting "$1" $'\001'
+    _MARKED_TOKEN="$_SCANNED_TOKEN"
+}
+
+# =============================================================================
+# strip_target_quoting() — shell-accurate quote removal + backslash
+# unescaping for the write-confinement absolute/relative classification
+# (#4926).
+#
+# extract_write_targets() emits tokens with their quote characters preserved
+# VERBATIM (qsplit's contract, #3755) — extract_rm_targets() and
+# parse_force_ops() depend on that raw form and MUST keep receiving it
+# unchanged, so this is called ONLY from the write-confinement classification
+# below, never from qsplit()/extract_write_targets() themselves. Without it a
+# quoted absolute path (`'/main/evil'`, `"/main/evil"`) starts with a quote
+# character rather than `/`, so the `[[ … == /* ]]` check misclassifies it as
+# RELATIVE and cwd-prefixes it into a location the write will never have.
+# From a LINKED-WORKTREE cwd — the canonical builder setup — that fabrication
+# walks straight back into the acting worktree's own `.loom-managed` sentinel
+# and is silently ALLOWED, defeating the #4178 confinement check by simply
+# quoting the target (the same masked-allow shape as the unresolved-`$`
+# bypass fixed by #4921/#4927, reached here through quoting instead).
+#
+# Emits (in the global _UNQUOTED_TARGET) the token with quote characters
+# removed and backslash escapes applied, and every other character —
+# INCLUDING `$` — copied through unchanged: any expandable-`$` shape was
+# already judged by the dedicated unresolved-`$` block above, so a file
+# genuinely named `$X` or `~` (single-quoted or backslash-escaped) unquotes
+# to the literal `$X`/`~` and still resolves as a plain relative path,
+# exactly as today (#4382 / #4921 contracts preserved).
+#
+# Returns 0 when every quote in the token is balanced (the caller may use
+# _UNQUOTED_TARGET). Returns 1 on an unterminated quote — the caller MUST
+# then fall back to the raw, quote-preserved token, so an unbalanced quote
+# can only ever keep today's verdict, never widen a deny into an allow.
+# =============================================================================
+_UNQUOTED_TARGET=""
+strip_target_quoting() {
+    local rc=0
+    _scan_token_quoting "$1" "" || rc=1
+    _UNQUOTED_TARGET="$_SCANNED_TOKEN"
+    return "$rc"
+}
+
+# =============================================================================
+# _scan_token_quoting() — the single shell-accurate quote-removal /
+# backslash-unescaping pass shared by the two helpers above.
+#
+#   $1  raw token (quote characters preserved verbatim, per qsplit's contract)
+#   $2  text substituted for each EXPANDABLE `$`; empty keeps the `$` literal
+#
+# Sets _SCANNED_TOKEN. Returns 0 when every quote was closed, 1 when the token
+# ended inside an unterminated quote (callers decide the fallback; no caller
+# may treat an unterminated quote as license to widen an allow).
+# =============================================================================
+_SCANNED_TOKEN=""
+_scan_token_quoting() {
+    local tok="$1" dollar="$2"
+    local out="" c
+    local n=${#tok}
+    local i=0 in_s=0 in_d=0
+    while [[ $i -lt $n ]]; do
+        c="${tok:i:1}"
+        if [[ $in_s -eq 1 ]]; then
+            # Inside '…': nothing expands; only the closing quote is special.
+            if [[ "$c" == "'" ]]; then in_s=0; else out+="$c"; fi
+            i=$((i + 1))
+            continue
+        fi
+        case "$c" in
+            "'")
+                if [[ $in_d -eq 1 ]]; then out+="$c"; else in_s=1; fi ;;
+            '"')
+                if [[ $in_d -eq 1 ]]; then in_d=0; else in_d=1; fi ;;
+            '\')
+                # Escapes the NEXT character (a trailing backslash is dropped).
+                i=$((i + 1))
+                [[ $i -lt $n ]] && out+="${tok:i:1}" ;;
+            '$')
+                if [[ -n "$dollar" ]]; then out+="$dollar"; else out+="$c"; fi ;;
+            *)
+                out+="$c" ;;
+        esac
+        i=$((i + 1))
+    done
+    _SCANNED_TOKEN="$out"
+    [[ $in_s -eq 0 && $in_d -eq 0 ]]
+}
+
+# =============================================================================
 # force-op branch-scope toggle — default ALL (preserve current behaviour).
 #
 # The three generic force-op ASK patterns (git push --force / -f /
@@ -1207,6 +1326,95 @@ function mask_gt(s,   out, n, i, c, mode, SQ, DQ, MASK) {
         i++
     }
     return out
+}
+'
+
+# =============================================================================
+# QUOTE-AWARE WHITESPACE MASKING (#4934)
+#
+# extract_write_targets() (below) recognizes each write-idiom argument by
+# `split(seg, toks, /[ \t]+/)` — plain whitespace splitting, NOT quote-aware
+# (documented as a known limitation at extract_write_targets()'s own header).
+# A quoted target containing a literal space, e.g.
+#   echo x > '/main/checkout/evil file.sh'
+# is therefore split into TWO tokens (`'/main/checkout/evil` and `file.sh'`).
+# Only the first fragment is ever used as the write target. That fragment
+# starts with a quote character (not `/`), so it is misclassified as a
+# RELATIVE path (strip_target_quoting() correctly reports the dangling quote
+# as unbalanced and falls back to the raw fragment per #4926's "never widen a
+# deny into an allow" contract -- but the fallback fragment itself still gets
+# cwd-joined and can land INSIDE the acting worktree, turning what should be
+# a main-checkout DENY into an ALLOW (#4934).
+#
+# mask_ws() is the same masking technique as mask_gt() above (#4245), applied
+# to whitespace instead of `>`: it walks the string tracking quote state and
+# replaces every space/tab found INSIDE a quoted span with a placeholder
+# character that can never appear in real shell text (STX 0x02 for a masked
+# space, ETX 0x03 for a masked tab), so `split(seg, toks, /[ \t]+/)` never
+# splits inside a quoted span -- a quoted path containing spaces now yields
+# exactly ONE token. unmask_ws() reverses the substitution so the token's
+# TEXT is unchanged (real spaces/tabs restored) once splitting is done; only
+# the whitespace bytes INSIDE quotes are ever touched, so mask_ws() (like
+# mask_gt()) returns a byte-for-byte-length-identical string with identical
+# non-whitespace content, which is what keeps the `>`-detection pass (mtoks[],
+# masked via mask_gt() on top of mask_ws()'s output) in lockstep with the
+# target-text pass (toks[], unmasked back to real whitespace): the two are
+# always split into the SAME number of tokens at the SAME boundaries, because
+# mask_gt() only ever changes `>` bytes, never whitespace-ness.
+#
+# Deliberately does NOT model backslash-escaped quotes or attempt look-ahead
+# for a terminating quote — same simplification qsplit()/mask_gt() already
+# accept (see mask_gt()'s comment above for the accepted-risk rationale). An
+# unterminated quote just runs to the end of the string in that quote state;
+# never crashes, never mis-indexes, and never widens a deny into an allow
+# (the SAME fallback direction qsplit()'s own unterminated-quote handling
+# already uses, #4926).
+#
+# This is scoped ONLY to extract_write_targets() -- qsplit() itself (and its
+# verbatim-quote-preservation contract depended on by extract_rm_targets() /
+# parse_force_ops()) is untouched.
+# =============================================================================
+_MASKWS_AWK='
+function mask_ws(s,   out, n, i, c, mode, SQ, DQ, SPMASK, TABMASK) {
+    SQ = sprintf("%c", 39)    # single quote
+    DQ = sprintf("%c", 34)    # double quote
+    SPMASK = sprintf("%c", 2)    # STX -- placeholder for a quoted space
+    TABMASK = sprintf("%c", 3)   # ETX -- placeholder for a quoted tab
+    out = ""
+    n = length(s)
+    i = 1
+    mode = 0   # 0 = unquoted, 1 = single-quoted, 2 = double-quoted
+    while (i <= n) {
+        c = substr(s, i, 1)
+        if (mode == 0) {
+            if (c == SQ) { mode = 1; out = out c; i++; continue }
+            if (c == DQ) { mode = 2; out = out c; i++; continue }
+            out = out c
+            i++
+            continue
+        }
+        if (mode == 1) {
+            # Single-quoted: only the matching quote ends the span.
+            if (c == SQ) { mode = 0; out = out c; i++; continue }
+            if (c == " ") { out = out SPMASK; i++; continue }
+            if (c == "\t") { out = out TABMASK; i++; continue }
+            out = out c
+            i++
+            continue
+        }
+        # mode == 2 (double-quoted): only the matching quote ends the span.
+        if (c == DQ) { mode = 0; out = out c; i++; continue }
+        if (c == " ") { out = out SPMASK; i++; continue }
+        if (c == "\t") { out = out TABMASK; i++; continue }
+        out = out c
+        i++
+    }
+    return out
+}
+function unmask_ws(s) {
+    gsub(sprintf("%c", 2), " ", s)
+    gsub(sprintf("%c", 3), "\t", s)
+    return s
 }
 '
 
@@ -1935,26 +2143,30 @@ extract_rm_targets() {
 # like parse_force_ops threads `cpath` via `git -C`.
 #
 # NOT a full shell parser: like parse_force_ops / extract_rm_targets, splitting
-# a segment into tokens is plain whitespace splitting (not quote-aware), so a
-# quoted argument containing a literal space can be mis-split. The `>`/`>>`
-# redirection scan below is the one exception: it is quote-aware (#4245) via
-# mask_gt() — a `>` inside a quoted argument (e.g. `gh issue create --body
-# "... env > config > default ..."`) is never treated as a redirection
-# operator, regardless of whether the caller's literal-text redaction (next
-# paragraph) already removed it. The caller ALSO feeds this the ASK-tier
-# working copy (COMMAND_ASK_SCAN — comment-stripped AND literal-text-redacted,
-# i.e. --body/-m/--title/--notes/--comment values are replaced with
-# same-length placeholder text) as a second, independent narrowing so a `>`
-# that merely appears INSIDE such a quoted value (e.g. `git commit -m "a > b"`)
-# cannot manufacture a phantom target even in the (non-`>`) tee/sed/cp/mv
-# target-extraction paths below, which stay plain-whitespace-split. Any
-# remaining false positive resolves to, at worst, an extra deny on a target
-# that isn't really a write (safe direction) or a missed target (also safe —
-# the fail-open contract this file uses everywhere: ambiguity never widens a
-# deny).
+# a segment into tokens starts from plain whitespace splitting. Unlike those
+# two, a QUOTED argument containing a literal space is NOT mis-split here: the
+# split runs against mask_ws()'s output (#4934), which replaces whitespace
+# INSIDE a quoted span with a non-whitespace placeholder before
+# `split(seg, toks, /[ \t]+/)` runs, so a quoted path with an embedded space
+# (e.g. `echo x > '/main/checkout/evil file.sh'`) yields exactly ONE token —
+# unmask_ws() restores the real whitespace bytes in that token afterward. The
+# `>`/`>>` redirection scan below is quote-aware in a second, independent way
+# (#4245) via mask_gt() — a `>` inside a quoted argument (e.g. `gh issue
+# create --body "... env > config > default ..."`) is never treated as a
+# redirection operator, regardless of whether the caller's literal-text
+# redaction (next paragraph) already removed it. The caller ALSO feeds this
+# the ASK-tier working copy (COMMAND_ASK_SCAN — comment-stripped AND
+# literal-text-redacted, i.e. --body/-m/--title/--notes/--comment values are
+# replaced with same-length placeholder text) as a second, independent
+# narrowing so a `>` that merely appears INSIDE such a quoted value (e.g.
+# `git commit -m "a > b"`) cannot manufacture a phantom target even in the
+# (non-`>`) tee/sed/cp/mv target-extraction paths below. Any remaining false
+# positive resolves to, at worst, an extra deny on a target that isn't really
+# a write (safe direction) or a missed target (also safe — the fail-open
+# contract this file uses everywhere: ambiguity never widens a deny).
 # =============================================================================
 extract_write_targets() {
-    printf '%s' "$1" | awk -v startcwd="$2" "$_QSPLIT_AWK""$_MASKGT_AWK"'
+    printf '%s' "$1" | awk -v startcwd="$2" "$_QSPLIT_AWK""$_MASKGT_AWK""$_MASKWS_AWK"'
     BEGIN {
         SEP = sprintf("%c", 31)
         curcwd = startcwd
@@ -1969,16 +2181,27 @@ extract_write_targets() {
             sub(/^[ \t]+/, "", seg)
             if (seg == "") continue
 
-            m = split(seg, toks, /[ \t]+/)
+            # Quote-aware whitespace masking (#4934): wseg is byte-for-byte
+            # identical to seg except a space/tab INSIDE a quoted span is
+            # replaced with a non-whitespace placeholder, so splitting on
+            # /[ \t]+/ never breaks a quoted argument (e.g. a quoted path
+            # containing a literal space) into more than one token. toks[]
+            # is then unmasked back to the real whitespace bytes so the
+            # target TEXT downstream is unchanged.
+            wseg = mask_ws(seg)
+            m = split(wseg, toks, /[ \t]+/)
             if (m < 1) continue
+            for (j = 1; j <= m; j++) toks[j] = unmask_ws(toks[j])
 
             # Quote-aware parallel tokenization (#4245): mseg is byte-for-byte
-            # identical to seg except a `>` inside a quoted span is replaced
+            # identical to wseg except a `>` inside a quoted span is replaced
             # with an SOH placeholder, so whitespace splitting yields the SAME
             # token boundaries (mm == m always) but mtoks[] can be tested for
             # a REAL (unquoted) redirection operator without ever matching a
-            # `>` that was only quoted data.
-            mseg = mask_gt(seg)
+            # `>` that was only quoted data. Masking `>` on TOP of wseg (not
+            # seg) keeps the two passes token boundaries in lockstep, since
+            # mask_gt() only ever changes `>` bytes, never whitespace-ness.
+            mseg = mask_gt(wseg)
             mm = split(mseg, mtoks, /[ \t]+/)
 
             if (toks[1] == "cd") {
@@ -2361,6 +2584,46 @@ if worktree_isolation_guard_enabled && \
     [[ -n "$_WT_MAIN_ROOT" ]] || _WT_MAIN_ROOT="$REPO_ROOT"
     [[ -n "$_WT_MAIN_ROOT_LOGICAL" ]] || _WT_MAIN_ROOT_LOGICAL="$_WT_MAIN_ROOT"
 
+    # "Worktree isolation is actually in play for this repo/session" — a
+    # managed worktree exists somewhere under the worktree base derived from
+    # the SAME main-checkout root the containment tests use. Resolved lazily
+    # and cached, so a command with no confinement-relevant target never pays
+    # for the find(1). Defined here (inside the block) because it reads the
+    # block-local _WT_MAIN_ROOT / _WT_WRITE_BASE* state.
+    _wt_isolation_in_play() {
+        if [[ -z "$_WT_WRITE_BASE_DONE" ]]; then
+            _WT_WRITE_BASE=$(resolve_worktree_root "$_WT_MAIN_ROOT")
+            _WT_WRITE_BASE_DONE=1
+        fi
+        _any_managed_worktree_exists "$_WT_WRITE_BASE"
+    }
+
+    # True if $1 (an absolute, normalized path) sits anywhere in the area this
+    # guard protects: inside a managed worktree, inside the main checkout
+    # (either spelling), or under the configured worktree base (which may live
+    # on an external volume, outside the main checkout entirely).
+    _wt_in_protected_area() {
+        local _p="$1"
+        [[ -n "$_p" ]] || return 1
+        _in_any_managed_worktree "$_p" && return 0
+        if [[ -n "$_WT_MAIN_ROOT" ]]; then
+            case "$_p" in
+                "$_WT_MAIN_ROOT"|"$_WT_MAIN_ROOT"/*) return 0 ;;
+                "$_WT_MAIN_ROOT_LOGICAL"|"$_WT_MAIN_ROOT_LOGICAL"/*) return 0 ;;
+            esac
+        fi
+        if [[ -z "$_WT_WRITE_BASE_DONE" ]]; then
+            _WT_WRITE_BASE=$(resolve_worktree_root "$_WT_MAIN_ROOT")
+            _WT_WRITE_BASE_DONE=1
+        fi
+        if [[ -n "$_WT_WRITE_BASE" ]]; then
+            case "$_p" in
+                "$_WT_WRITE_BASE"|"$_WT_WRITE_BASE"/*) return 0 ;;
+            esac
+        fi
+        return 1
+    }
+
     WRITE_TARGETS=$(extract_write_targets "$COMMAND_ASK_SCAN" "$CWD" | head -20)
     while IFS=$'\037' read -r _wcwd _wtarget; do
         [[ -z "$_wtarget" ]] && continue
@@ -2374,13 +2637,146 @@ if worktree_isolation_guard_enabled && \
         # existing repo-relative treatment.
         _wtarget=$(expand_leading_tilde "$_wtarget")
 
+        # -------------------------------------------------------------
+        # Unresolved `$…` write targets must fail CLOSED, in every cwd (#4921)
+        #
+        # extract_write_targets() never expands variables; a target it cannot
+        # resolve is emitted as the RAW token (`$A/evil.sh`). The resolution
+        # below then treats that literal as a relative path and cwd-prefixes
+        # it — which fabricates a location the write will not actually have.
+        # From a MAIN-CHECKOUT cwd that fabrication happened to land inside
+        # the main checkout, so the containment test denied and the token was
+        # (accidentally) fail-closed. From a LINKED-WORKTREE cwd — the
+        # canonical builder setup, `cd .loom/worktrees/issue-N` — the very
+        # same fabrication instead walks straight back up into the acting
+        # worktree's own `.loom-managed` sentinel, so check (a) below ALLOWED
+        # it before the main-root containment test ever ran, no matter what
+        # the variable would expand to at runtime (#4921). That silently
+        # defeated the fail-closed backstop for every unresolvable `$` shape
+        # (`$(...)`, `${VAR:-x}`, an inherited env var, a chained or
+        # conflicting same-command assignment) in the ONE operating mode the
+        # #4178 guard exists to protect.
+        #
+        # So: decide on the token's SHAPE before trusting either test. A
+        # target is denial-worthy when the unexpanded `$` makes its LOCATION
+        # (not merely its filename) unknowable:
+        #
+        #   (1) the token IS a variable from the root down — it either starts
+        #       with an expandable `$` (`> $DEST`, `tee "${OUT}"`,
+        #       `> $(mktemp)`) or starts with `/$` (`> /$X`, `> /$X/evil`).
+        #       The path root itself is unknown, so the variable may hold (or
+        #       complete) an absolute path into the main checkout and the cwd
+        #       prefix is pure invention. Denied regardless of where cwd is.
+        #   (2) an expandable `$` appears in a DIRECTORY component of the
+        #       resolved path (`> $A/evil`, `> ./$A/evil`, `cd $A && > f`)
+        #       AND the known prefix — everything before the first `$`, i.e.
+        #       the only part that is a real path — is inside the area this
+        #       guard protects, or there is no usable known prefix at all
+        #       (it is relative, or it normalizes to `/` as in
+        #       `> /tmp/../$A/evil`). An unknown directory component under the
+        #       repo can resolve into the main checkout (directly, or via
+        #       `..`), and neither the sentinel walk-up nor the containment
+        #       test can see it.
+        #
+        # Deliberately NOT denied (no new false positives — these keep their
+        # existing treatment):
+        #   - a `$` only in the FINAL component (`> out-$STAMP.log`,
+        #     `sed -i s/a/b/ src/$f`): the directory is fully known and really
+        #     is cwd-relative, so the sentinel check (a) and the main-root
+        #     containment test below are meaningful again.
+        #   - a known prefix OUTSIDE the protected area (`> /tmp/$D/f.log`):
+        #     the write lands where this guard protects nothing.
+        #   - a LITERAL `$` the shell would never expand — inside a
+        #     single-quoted span or backslash-escaped (`> '$A/evil'`) — which
+        #     really is a relative path to a file named `$A` (mirrors the
+        #     quoted-tilde treatment in expand_leading_tilde, #4382).
+        #
+        # Fail-open contract is preserved: like every other deny in this
+        # block, it only fires when a managed worktree actually exists for
+        # this repo (_wt_isolation_in_play).
+        # -------------------------------------------------------------
+        if [[ "$_wtarget" == *'$'* || "$_wcwd" == *'$'* ]]; then
+            mark_expandable_dollars "$_wtarget"
+            _wmarked="$_MARKED_TOKEN"
+            # The cwd itself can carry the unexpanded `$` instead of the
+            # target (`cd $A && echo x > f.sh` — extract_write_targets threads
+            # the unresolved `cd` argument into curcwd), so mark it too and
+            # judge the JOINED path. A cwd that is absolute and `$`-free
+            # marks to itself, leaving every existing case byte-identical.
+            _wmarkedcwd=""
+            if [[ -n "$_wcwd" ]]; then
+                mark_expandable_dollars "$_wcwd"
+                _wmarkedcwd="$_MARKED_TOKEN"
+            fi
+            if [[ "$_wmarked" == *$'\001'* || ( "$_wmarked" != /* && "$_wmarkedcwd" == *$'\001'* ) ]]; then
+                # (1) Root unknown — the token is a variable from the root
+                # down (`$DEST`, `$(mktemp)`) or is root + a variable
+                # (`/$X`, `/$X/evil`, whose runtime value picks the top-level
+                # directory — the main checkout's own included).
+                if [[ "$_wmarked" == $'\001'* || "$_wmarked" == /$'\001'* ]]; then
+                    if _wt_isolation_in_play; then
+                        deny "BLOCKED: Bash-tool write target '${_wtarget}' is an unexpanded shell variable from the path root down, so this guard cannot tell where the write lands — it may resolve to an absolute path inside the main repository checkout ('${_WT_MAIN_ROOT}'), and a Loom-managed worktree exists in this repository. Unresolvable write targets fail closed (#4921). Write to an explicit literal path — inside your issue worktree (.loom/worktrees/issue-<N>) for repo files, or a spelled-out /tmp path for scratch. (#4178)" "worktree-write-confinement-unresolved-var"
+                    fi
+                    continue
+                fi
+                # (2) Unknown DIRECTORY component. Build the effective path
+                # the same way the resolution below does (cwd-joined when
+                # relative), then test only the KNOWN prefix — everything
+                # before the first unexpanded `$`, trimmed to its directory.
+                _weff=""
+                if [[ "$_wmarked" == /* ]]; then
+                    _weff="$_wmarked"
+                elif [[ -n "$_wmarkedcwd" ]]; then
+                    _weff="$_wmarkedcwd/$_wmarked"
+                fi
+                _wdirpart=""
+                [[ "$_weff" == */* ]] && _wdirpart="${_weff%/*}"
+                if [[ "$_wdirpart" == *$'\001'* ]]; then
+                    _wknown="${_weff%%$'\001'*}"
+                    _wknown="${_wknown%/*}"
+                    # Normalize BEFORE judging: a `..` traversal in the known
+                    # prefix (`> /tmp/../$A/evil`) otherwise hands the test a
+                    # prefix that is not where the write actually starts.
+                    [[ "$_wknown" == /* ]] && _wknown=$(normalize_abs_path "$_wknown")
+                    if [[ "$_wknown" != /* || "$_wknown" == "/" ]]; then
+                        # No usable known prefix — either it is relative (no
+                        # cwd to join against) or it collapses to `/`, i.e.
+                        # the first real path component IS the variable
+                        # (`> /$A/evil`, `> /tmp/../$A/evil`), whose runtime
+                        # value picks a top-level directory, the main
+                        # checkout's own included. Same verdict as (1).
+                        if _wt_isolation_in_play; then
+                            deny "BLOCKED: Bash-tool write target '${_wtarget}' has an unexpanded shell variable as its first real path component, so this guard cannot tell where the write lands — it may resolve inside the main repository checkout ('${_WT_MAIN_ROOT}'), and a Loom-managed worktree exists in this repository. Unresolvable write targets fail closed (#4921). Write to an explicit literal path — inside your issue worktree (.loom/worktrees/issue-<N>) for repo files, or a spelled-out /tmp path for scratch. (#4178)" "worktree-write-confinement-unresolved-var"
+                        fi
+                    elif _wt_in_protected_area "$_wknown"; then
+                        if _wt_isolation_in_play; then
+                            deny "BLOCKED: Bash-tool write target '${_wtarget}' contains an unexpanded shell variable in a directory component, and its known prefix ('${_wknown}') is inside this repository's worktree/checkout area — this guard cannot tell whether the expanded path stays in your worktree or lands in the main repository checkout ('${_WT_MAIN_ROOT}'). Unresolvable write targets fail closed (#4921). Write to an explicit literal path — inside your issue worktree (.loom/worktrees/issue-<N>) for repo files, or a spelled-out /tmp path for scratch. (#4178)" "worktree-write-confinement-unresolved-var"
+                        fi
+                    fi
+                    continue
+                fi
+            fi
+        fi
+
+        # Shell-accurate quote removal, for the classification only (#4926):
+        # `'/main/evil'` / `"/main/evil"` reach here with their quote
+        # characters intact (qsplit's contract), so they start with a quote
+        # rather than `/` and the test below would call an ABSOLUTE path
+        # relative and cwd-prefix it into a location the write never has.
+        # Unquote a COPY: extract_rm_targets()/parse_force_ops() keep their
+        # verbatim tokens, and the deny message below still quotes the raw
+        # `$_wtarget` the operator actually typed. An unterminated quote keeps
+        # the raw token (today's verdict) rather than risk widening a deny.
+        _wclassify="$_wtarget"
+        strip_target_quoting "$_wtarget" && _wclassify="$_UNQUOTED_TARGET"
+
         # Resolve to absolute; a relative target with no resolvable cwd is
         # ambiguous — skip it (allow on uncertainty, never deny on it).
         _wabs=""
-        if [[ "$_wtarget" == /* ]]; then
-            _wabs="$_wtarget"
+        if [[ "$_wclassify" == /* ]]; then
+            _wabs="$_wclassify"
         elif [[ -n "$_wcwd" ]]; then
-            _wabs="$_wcwd/$_wtarget"
+            _wabs="$_wcwd/$_wclassify"
         else
             continue
         fi
@@ -2406,11 +2802,7 @@ if worktree_isolation_guard_enabled && \
         # unaffected, mirroring guard-worktree-paths.sh exactly. The worktree
         # base is resolved off the same main-checkout root so the "a managed
         # worktree exists" gate stays consistent with the containment test.
-        if [[ -z "$_WT_WRITE_BASE_DONE" ]]; then
-            _WT_WRITE_BASE=$(resolve_worktree_root "$_WT_MAIN_ROOT")
-            _WT_WRITE_BASE_DONE=1
-        fi
-        if _any_managed_worktree_exists "$_WT_WRITE_BASE"; then
+        if _wt_isolation_in_play; then
             deny "BLOCKED: Bash-tool write to '${_wabs}' resolves to the main repository checkout ('${_WT_MAIN_ROOT}'), but a Loom-managed worktree exists elsewhere in this repository (this check cannot verify it belongs to the acting session — see #4245). This is a worktree-isolation bypass via Bash redirection/tee/sed -i/cp/mv — do NOT retry the write through Bash. cd into your issue worktree (.loom/worktrees/issue-<N>) and write there instead. (#4178)" "worktree-write-confinement"
         fi
     done <<< "$WRITE_TARGETS"
@@ -2658,6 +3050,16 @@ fi
 # stash pop` run from a worktree cwd is not caught today. Track any observed
 # bypass via this path as a follow-up.
 #
+# WORKTREE-TO-WORKTREE COLLISION (#4821): refs/stash is a single stack shared
+# by EVERY linked worktree of the repo, not per-worktree — so two parallel
+# Builders each in a *different* linked worktree (neither one the main
+# checkout) can pop/drop each other's WIP, and the main-checkout-only check
+# above asks for neither side. Observed in production: kicad-tools PRs
+# #4524/#4526. Below, when cwd is a linked worktree (not the main checkout)
+# AND two or more `.loom-managed` worktrees currently exist under
+# `<main>/.loom/worktrees/`, we ask too — a single active worktree has no one
+# else's stash entry to collide with, so it stays ungated.
+#
 # Gated by stash_scope_guard_enabled() (guards.stashScope /
 # LOOM_GUARD_STASH_SCOPE, default on), invoked LAZILY only after the pattern
 # already matched, mirroring every other cold-path toggle in this file.
@@ -2679,6 +3081,21 @@ if echo "$COMMAND_ASK_SCAN" | grep -qE '(^|[;&|(]|[[:space:]])git[[:space:]]+sta
 
     if [[ -n "$_stash_toplevel" && -n "$_stash_common_parent" && "$_stash_toplevel" == "$_stash_common_parent" ]]; then
         ask "Command requires confirmation: $COMMAND (git stash pop/drop/clear in the MAIN checkout can destroy operator-preserved state — the main checkout's stash stack is operator-owned, not scratch space for an integration check. Run test-merges in an isolated worktree instead; set guards.stashScope:false / LOOM_GUARD_STASH_SCOPE=0 to disable this ask)" "stash-scope:main-checkout"
+    elif [[ -n "$_stash_toplevel" && -n "$_stash_common_parent" ]]; then
+        # cwd is a linked worktree, not the main checkout. Count OTHER
+        # `.loom-managed` worktrees under the main checkout's worktree root —
+        # a collision needs at least one other active worktree to race with.
+        _stash_worktree_count=0
+        if [[ -d "$_stash_common_parent/.loom/worktrees" ]]; then
+            while IFS= read -r _stash_wt_dir; do
+                [[ -f "$_stash_wt_dir/.loom-managed" ]] && \
+                    _stash_worktree_count=$((_stash_worktree_count + 1))
+            done < <(find "$_stash_common_parent/.loom/worktrees" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
+        fi
+
+        if [[ "$_stash_worktree_count" -ge 2 ]]; then
+            ask "Command requires confirmation: $COMMAND (git stash pop/drop/clear from a linked worktree can destroy ANOTHER builder's WIP — refs/stash is a single stack SHARED across every linked worktree of this repo, not per-worktree, and $_stash_worktree_count managed worktrees are currently active. Use './.loom/scripts/worktree.sh snapshot <issue-number>' instead of git stash for ad-hoc WIP; set guards.stashScope:false / LOOM_GUARD_STASH_SCOPE=0 to disable this ask)" "stash-scope:worktree-collision"
+        fi
     fi
 fi
 
