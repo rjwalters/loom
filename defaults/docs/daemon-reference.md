@@ -5150,15 +5150,42 @@ manually rebuilt the Rust binary, reprovisioned it, and restarted the process.
 `loom-daemon-update.sh` is the single operator command that closes that gap:
 
 ```bash
-./.loom/scripts/cli/loom-daemon-update.sh              # detect, rebuild if stale, provision, restart (preserving flags)
+./.loom/scripts/cli/loom-daemon-update.sh              # detect, rebuild if stale, provision, restart (preserving flags) -- DRAINS FIRST on systemd (see below)
 ./.loom/scripts/cli/loom-daemon-update.sh --check       # detect only; exit 0 (up to date) / 3 (update available); no writes
 ./.loom/scripts/cli/loom-daemon-update.sh --dry-run     # print the plan without building/provisioning/restarting
 ./.loom/scripts/cli/loom-daemon-update.sh --force       # rebuild + provision + restart even if already up to date
 ./.loom/scripts/cli/loom-daemon-update.sh --no-restart  # rebuild + provision only; leave the running daemon untouched
-./.loom/scripts/cli/loom-daemon-update.sh --relaunch    # launchd only: after a refused restart, re-render the plist + relaunch under supervision (preserves the live plist's LOOM_* env)
+./.loom/scripts/cli/loom-daemon-update.sh --relaunch    # launchd/systemd only: after a refused restart, re-render the plist/unit + relaunch under supervision (preserves the live LOOM_* env)
+./.loom/scripts/cli/loom-daemon-update.sh --drain       # launchd/systemd, Issue #5138: build+provision+restart via `restart --drain` in ONE invocation, no manual second step -- see below
+./.loom/scripts/cli/loom-daemon-update.sh --timeout SECS --force-after-timeout  # passthrough to `restart --drain` (only meaningful with an active drain)
+./.loom/scripts/cli/loom-daemon-update.sh --restart-now # systemd only, Issue #5138: opt OUT of the drain-by-default below, restart immediately
 ./.loom/scripts/cli/loom-daemon-update.sh --fetch        # REQUIRE a verified release artifact (never silently fall back to a source build); exit 1 if none resolves
 ./.loom/scripts/cli/loom-daemon-update.sh --no-fetch     # never consider release artifacts; always build from local source (pre-#5020 behavior)
 ```
+
+**One-shot drain roll (Issue #5138).** Before this, a drained roll needed the
+documented two-step dance — `loom-daemon-update.sh --no-restart` followed by a
+separate hand-run `loom-daemon restart --drain` — because the update script only
+ever invoked a plain, immediate `restart`. `--drain` (with `--timeout SECS` /
+`--force-after-timeout` passthrough) collapses that into the single invocation
+above: build, provision, and restart via the exact `restart --drain` primitive
+described in "Scheduled drain-and-restart" above, all from one command. **On
+systemd, drain is now the DEFAULT** (no flag needed) — an immediate restart there
+is destructive, not merely lossy: sweep/role children live in the unit's cgroup,
+so a plain restart's stop job can SIGKILL them past `TimeoutStopSec`, landing the
+unit in `failed` with `Restart=on-success` never firing (#5119) — a real outage.
+`--restart-now` opts back into the immediate/non-drained restart for an operator
+who has confirmed nothing is in flight. Launchd's own default is unchanged
+(immediate restart, `--drain` opts in) since the launchd failure mode is "only"
+lossy telemetry (#5084: an adopted-across-restart sweep never exports
+`sweep.completed`/`sweep.outcome`), not a stop-job outage. The fail-safe is
+preserved exactly as `restart --drain` implements it: a drain that cannot finish
+within its timeout (default/`--timeout`) leaves the **pre-update binary running**
+rather than cancelling in-flight sweeps — the script reports this as exit `8`
+(distinct from exit `7`'s "restart never took effect" failure), not a silent
+success. The `--no-restart` + manual `restart --drain` two-step from before still
+works unchanged, for a caller that wants the build/provision and restart steps
+kept apart.
 
 #### Artifact-based self-update (epic #4990 Phase 3, #5020)
 
