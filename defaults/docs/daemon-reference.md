@@ -3696,6 +3696,78 @@ up. The first tick after daemon startup is deliberately skipped so in-flight
 sweeps can re-establish their `.loom-in-use` markers first. See
 `loom-daemon/src/worktree_reaper.rs`.
 
+### Orphaned-process reaper (#5110)
+
+**The problem.** An agent's *background process tree* can outlive the agent. On
+2026-08-03 `loom-worker-1` sat at **load 65 on 8 cores for 5h52m with no active
+Loom work**: an agent-generated driver script inside `.loom/worktrees/issue-87`
+had lost its parent, reparented to `systemd --user`, and kept issuing fresh
+batches of simulations forever. Killing the running sims did nothing — the
+driver launched eight more within 20 seconds. The host's *own* dispatched sweep
+was starved to 0.6% CPU for 5h33m while holding a forge claim it could not
+advance.
+
+**Why the pgid teardown could not reach it.** A dead sweep's process group is
+signalled with `kill(-pgid, …)` (#4982/#4980), but GNU `timeout` puts its child
+in a **new process group** unless `--foreground`, so that tree spanned three
+groups and two sessions — a group kill reaps one of them. And once the sweep
+leader is gone its descendants have reparented, so there is no parent link left
+to walk either. The only durable link between a runaway process and the work it
+belongs to is **the worktree it is running in**.
+
+**What it does.** On the worktree-reaper tick (before the directory pass), for
+each `issue-<N>` worktree that is provably unowned, the daemon snapshots
+`/proc`, attributes processes to the worktree by **cwd inside it** or **argv
+referencing it**, expands each hit to its **whole descendant tree** through the
+ppid map (which survives `setpgid`/`setsid` where the pgid does not), and
+terminates it **freeze-first**: `SIGSTOP` parent-first so a looping driver
+cannot issue another batch, a re-snapshot to catch anything forked in the
+meantime, then `SIGTERM` + `SIGCONT`, and `SIGKILL` only for survivors after a
+5s grace. Every pid killed is logged with its age and argv.
+
+**Fail-safes.** A worktree's processes are touched only when **all** hold: the
+`.loom-managed` sentinel is present (user-provisioned worktrees are never
+touched), no `.loom-in-use` marker, no live spawn-loop task or claim-lock, no
+confirmed-live sweep claim (`live_claim::probe` — re-checked immediately before
+each kill, so a sweep that starts mid-pass is still protected), **no live agent
+runtime working inside the worktree** (a `claude`/`codex` process, or any argv
+naming a `/loom:` slash command — the incident's defining property is that the
+agent was *gone*, and this is what covers PR-set sweeps and manually driven
+agents that claim no issue), the seed process is older than `minAgeSecs`, and
+the tree contains neither this daemon nor its ancestors nor its own children.
+Every ambiguity (unreadable `/proc` entry,
+unknown process age, non-Linux host) resolves to *skip* — under-reaping is
+recoverable on the next tick, a false-positive kill is not.
+
+**Default-on**, with `dryRun` for operators who want to watch it first (it
+detects and logs the trees it *would* reap and signals nothing).
+
+```json
+{
+  "autonomous": {
+    "processReaper": {
+      "enabled": true,
+      "minAgeSecs": 1800,
+      "dryRun": false
+    }
+  }
+}
+```
+
+| Env var | Config key | Precedence | Default |
+|---------|-----------|------------|---------|
+| `LOOM_ORPHAN_PROCESS_REAPER` | `autonomous.processReaper.enabled` | env > config > default | `true` (on) |
+| `LOOM_ORPHAN_PROCESS_REAPER_MIN_AGE_SECS` | `autonomous.processReaper.minAgeSecs` | env > config > default | `1800` (30 min) |
+| `LOOM_ORPHAN_PROCESS_REAPER_DRY_RUN` | `autonomous.processReaper.dryRun` | env > config > default | `false` |
+
+**Operator note.** `minAgeSecs` is the knob that keeps an *interactive* command
+you are running inside an issue worktree safe: a process is only ever a reap
+seed once it is older than that floor **and** nothing claims its issue. If you
+routinely run long jobs by hand in a finished issue's worktree, raise
+`minAgeSecs`, drop a `.loom-in-use` file in the worktree, or turn the pass off.
+Linux-only (it needs `/proc`); on other hosts the pass is a no-op. See
+`loom-daemon/src/orphan_process_reaper.rs`.
+
 ### Autonomous periodic support-role runner (#4015)
 
 Before this loop, the periodic **standalone** support roles — Champion,

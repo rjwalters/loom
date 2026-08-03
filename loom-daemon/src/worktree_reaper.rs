@@ -480,6 +480,13 @@ pub fn spawn_multi_worktree_reaper_task(
                 .effective_roots(&fallback_root);
 
             for root in roots {
+                // Orphaned *process* trees first (#5110): a runaway driver
+                // inside an issue worktree pins the worktree's "active
+                // process(es) using worktree" gate, so reaping the processes
+                // before the directory pass is also what lets the directory
+                // pass make progress on the same tick.
+                reap_orphan_processes_for(&root).await;
+
                 let config = read_worktree_reaper_config(&root);
                 if !resolve_enabled(&config) {
                     log::debug!(
@@ -503,6 +510,37 @@ pub fn spawn_multi_worktree_reaper_task(
             }
         }
     })
+}
+
+/// Run one [`crate::orphan_process_reaper`] pass for `root` on the blocking
+/// pool, gated by that repo's own `autonomous.processReaper.enabled`.
+///
+/// Kept beside the directory reaper (rather than as its own daemon loop)
+/// because the two answer the same question about the same worktrees — "does
+/// anything still own issue-N's worktree?" — and sharing a tick keeps them from
+/// racing each other's `/proc` and forge probes.
+async fn reap_orphan_processes_for(root: &Path) {
+    let config = crate::orphan_process_reaper::read_config(root);
+    if !crate::orphan_process_reaper::resolve_enabled(&config) {
+        log::debug!(
+            "orphan_process_reaper: {} disabled (autonomous.processReaper.enabled=false \
+             or LOOM_ORPHAN_PROCESS_REAPER unset-falsy) — skipping",
+            root.display()
+        );
+        return;
+    }
+    let root_for_task = root.to_path_buf();
+    let joined = tokio::task::spawn_blocking(move || {
+        crate::orphan_process_reaper::reap_repo_processes(&root_for_task, &config)
+    })
+    .await;
+    match joined {
+        Ok(report) => crate::orphan_process_reaper::log_report(root, &report),
+        Err(e) => log::error!(
+            "orphan_process_reaper: pass for {} panicked ({e}); continuing to the next repo",
+            root.display()
+        ),
+    }
 }
 
 #[cfg(test)]
