@@ -293,6 +293,73 @@ describe("POST /admin/hosts — host provisioning", () => {
     );
     expect(response.status).toBe(409);
   });
+
+  // Issue #5082: a revoked host_id used to be reserved forever, so renaming or
+  // re-keying a retired host required hand-editing production D1.
+  it("re-provisions a revoked host_id, and the pre-revoke key stays dead", async () => {
+    await revokeHost(env.DB, "host-abc");
+
+    const response = await callWorker(
+      new Request("https://ingest.example/admin/hosts", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: "Bearer test-admin-token" },
+        body: JSON.stringify({ host_id: "host-abc" }),
+      }),
+    );
+    expect(response.status).toBe(201);
+    const { ingest_key: newKey } = (await response.json()) as { ingest_key: string };
+    expect(newKey).not.toBe("abc-ingest-key");
+
+    // The revoked credential must never be resurrected — only replaced.
+    const oldKeyResponse = await callWorker(ingestRequest([sweepStartedEnvelope()], "Bearer abc-ingest-key"));
+    expect(oldKeyResponse.status).toBe(401);
+
+    const newKeyResponse = await callWorker(
+      ingestRequest([sweepStartedEnvelope({ sweep_id: "sweep-reprovisioned" })], `Bearer ${newKey}`),
+    );
+    expect(newKeyResponse.status).toBe(200);
+    expect(await recordsForHost("host-abc")).toHaveLength(1);
+  });
+
+  it("re-provisions a revoked host_id in place, without deleting the row first", async () => {
+    const before = (await env.DB.prepare("SELECT key_hash FROM hosts WHERE host_id = 'host-abc'").first()) as {
+      key_hash: string;
+    };
+    await revokeHost(env.DB, "host-abc");
+
+    const response = await callWorker(
+      new Request("https://ingest.example/admin/hosts", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: "Bearer test-admin-token" },
+        body: JSON.stringify({ host_id: "host-abc" }),
+      }),
+    );
+    expect(response.status).toBe(201);
+
+    // Exactly one row, updated in place (upsert) rather than delete + insert:
+    // the key_hash is replaced and revoked_at is cleared.
+    const { results } = await env.DB.prepare("SELECT key_hash, revoked_at FROM hosts WHERE host_id = 'host-abc'").all();
+    expect(results).toHaveLength(1);
+    const row = results[0] as { key_hash: string; revoked_at: string | null };
+    expect(row.revoked_at).toBeNull();
+    expect(row.key_hash).not.toBe(before.key_hash);
+  });
+
+  it("honors an explicit key when re-provisioning a revoked host_id", async () => {
+    await revokeHost(env.DB, "host-abc");
+
+    const response = await callWorker(
+      new Request("https://ingest.example/admin/hosts", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: "Bearer test-admin-token" },
+        body: JSON.stringify({ host_id: "host-abc", key: "abc-rotated-key" }),
+      }),
+    );
+    expect(response.status).toBe(201);
+
+    const rotatedResponse = await callWorker(ingestRequest([sweepStartedEnvelope()], "Bearer abc-rotated-key"));
+    expect(rotatedResponse.status).toBe(200);
+  });
 });
 
 describe("POST /admin/hosts/:hostId/revoke", () => {

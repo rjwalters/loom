@@ -301,8 +301,11 @@ here:
 - Revoking the old key (step 6) while sweep entries still reference the old
   `host_id` and are active or orphaned can leave a phantom fleet member on
   the dashboard until those entries clear — #5078.
-- Re-provisioning a previously-revoked `host_id` (e.g. reusing the old name
-  later) currently 409s with no override — #5082.
+Reusing a previously-revoked `host_id` (e.g. reclaiming the old name later)
+used to 409 with no override; `POST /admin/hosts` now re-provisions a revoked
+host in place — minting a new key and clearing the revocation atomically, never
+reviving the dead one — and only 409s for a host that is currently live
+(#5082).
 
 ## Map of every detail doc
 

@@ -364,16 +364,37 @@ async function handleCreateHost(request: Request, env: Env): Promise<Response> {
     return jsonError(400, "host_id is required");
   }
 
-  const existing = await env.DB.prepare("SELECT host_id FROM hosts WHERE host_id = ?").bind(hostId).first();
-  if (existing) {
-    return jsonError(409, `host_id "${hostId}" already exists`);
-  }
-
   const key = typeof body.key === "string" && body.key.length > 0 ? body.key : generateIngestKey();
   const keyHash = await hashIngestKey(key);
-  await env.DB.prepare("INSERT INTO hosts (host_id, key_hash, created_at, revoked_at) VALUES (?, ?, ?, NULL)")
+
+  // A *revoked* host_id must be re-provisionable without hand-editing D1
+  // (#5082): a revoked row is a dead credential, but `host_id` is the primary
+  // key, so it would otherwise reserve the name forever. This single statement
+  // both creates a brand-new host and re-mints a retired one:
+  //
+  //   - live row  → `DO UPDATE ... WHERE hosts.revoked_at IS NOT NULL` does not
+  //     match, so nothing changes and `meta.changes` is 0 ⇒ 409 (accidental
+  //     re-minting of an *active* host still fails).
+  //   - revoked row → the conflict target matches and the row is rewritten with
+  //     the NEW `key_hash` and a cleared `revoked_at`. The old (revoked) hash is
+  //     replaced, never reactivated, and `created_at` is restamped because the
+  //     row now describes a freshly minted credential.
+  //
+  // It is an upsert rather than DELETE + INSERT precisely so there is no window
+  // in which the host row is absent.
+  const result = await env.DB.prepare(
+    `INSERT INTO hosts (host_id, key_hash, created_at, revoked_at) VALUES (?, ?, ?, NULL)
+     ON CONFLICT(host_id) DO UPDATE SET
+       key_hash = excluded.key_hash,
+       created_at = excluded.created_at,
+       revoked_at = NULL
+     WHERE hosts.revoked_at IS NOT NULL`,
+  )
     .bind(hostId, keyHash, new Date().toISOString())
     .run();
+  if ((result.meta.changes ?? 0) === 0) {
+    return jsonError(409, `host_id "${hostId}" already exists`);
+  }
 
   // The plaintext key is returned exactly once, here — only its hash is
   // ever persisted, so this response is the operator's only chance to
