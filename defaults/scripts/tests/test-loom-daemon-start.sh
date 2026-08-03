@@ -1438,6 +1438,217 @@ else
     echo "  (skipping real-systemd #4862 regression: no reachable 'systemctl --user' manager on this host)"
 fi
 
+# ===================================================================
+# Real launchd bootout+bootstrap path (#5081): settle/retry on the async
+# EIO race ("Bootstrap failed: 5: Input/output error"), and a post-bootstrap
+# check that the running job's REPORTED env actually matches the
+# freshly-rendered plist. Only meaningful on Darwin (the launchd path is
+# Darwin-gated). `LOOM_LAUNCHD_DOMAIN` is pinned so resolve_launchd_domain()
+# never probes `launchctl print gui/<uid>` itself, and HOME is sandboxed so
+# the rendered plist never lands in the operator's real
+# ~/Library/LaunchAgents -- this suite must never touch real launchd state.
+# ===================================================================
+if [[ "$(uname -s)" == "Darwin" ]]; then
+
+LD5081_LABEL="com.example.loom-sandbox-5081-$$"
+LD5081_DOMAIN="user/$(id -u)"
+LD5081_SERVICE="${LD5081_DOMAIN}/${LD5081_LABEL}"
+
+# write_smart_launchd_bin <bin_dir> <bootstrap_log> <state_dir> <eio_failures> <mismatch:0|1>
+#
+# A launchctl stub that reflects a REAL bootstrap outcome instead of a
+# hardcoded fake: `bootstrap` records the plist path it was handed (and, for
+# the first <eio_failures> calls, fails with the EXACT text real launchd
+# reports for the #5081 async race); `print` — for OUR service only — reports
+# a REAL backgrounded process's pid (read from <state_dir>/real.pid, so the
+# script's own `kill -0` liveness check succeeds) plus an
+# "environment = { KEY => value ... }" block built from the LAST bootstrapped
+# plist via plutil+jq, mirroring real `launchctl print` output byte-for-byte
+# closely enough for extract_launchd_print_env to parse. <mismatch>=1
+# corrupts the reported LOOM_SOCKET_PATH value so a verification-FAILURE path
+# can be exercised. Any OTHER service (e.g. the watchdog's own label) reports
+# "not loaded" (print exits 1); bootout/kickstart are unconditional no-ops
+# for every service.
+write_smart_launchd_bin() {
+    local bin_dir="$1" bootstrap_log="$2" state_dir="$3" eio_failures="$4" mismatch="${5:-0}"
+    mkdir -p "$bin_dir" "$state_dir"
+    : > "$bootstrap_log"
+    echo 0 > "$state_dir/bootstrap-attempts"
+    rm -f "$state_dir/bootstrapped-plist-path"
+    cat > "$bin_dir/launchctl" <<EOF
+#!/usr/bin/env bash
+echo "\$*" >> "${bootstrap_log}"
+service_arg="\${2:-}"
+case "\${1:-}" in
+  print)
+    if [[ "\$service_arg" == "${LD5081_SERVICE}" && -f "${state_dir}/bootstrapped-plist-path" ]]; then
+      plist_path="\$(cat "${state_dir}/bootstrapped-plist-path")"
+      real_pid="\$(cat "${state_dir}/real.pid" 2>/dev/null)"
+      echo "	pid = \${real_pid}"
+      echo "	environment = {"
+      if [[ "${mismatch}" == "1" ]]; then
+        plutil -convert json -o - "\$plist_path" 2>/dev/null | jq -r '.EnvironmentVariables // {} | to_entries[] | "\t\t" + .key + " => " + (.value|tostring)' | awk -F' => ' -v OFS=' => ' '{ if (\$1 ~ /LOOM_SOCKET_PATH\$/) { \$2 = "WRONG-VALUE-INJECTED-BY-TEST" }; print }'
+      else
+        plutil -convert json -o - "\$plist_path" 2>/dev/null | jq -r '.EnvironmentVariables // {} | to_entries[] | "\t\t" + .key + " => " + (.value|tostring)'
+      fi
+      echo "	}"
+      exit 0
+    fi
+    exit 1
+    ;;
+  bootout)
+    rm -f "${state_dir}/bootstrapped-plist-path"
+    exit 0
+    ;;
+  bootstrap)
+    plist_path="\$3"
+    attempts="\$(cat "${state_dir}/bootstrap-attempts" 2>/dev/null || echo 0)"
+    attempts=\$((attempts + 1))
+    echo "\$attempts" > "${state_dir}/bootstrap-attempts"
+    if [[ "\$attempts" -le "${eio_failures}" ]]; then
+      echo "Bootstrap failed: 5: Input/output error" >&2
+      exit 5
+    fi
+    echo "\$plist_path" > "${state_dir}/bootstrapped-plist-path"
+    exit 0
+    ;;
+  kickstart) exit 0 ;;
+  *) exit 0 ;;
+esac
+EOF
+    chmod +x "$bin_dir/launchctl"
+}
+
+LD5081_FAKE_BIN="$WORKDIR/fake-loom-daemon-5081"
+cat > "$LD5081_FAKE_BIN" <<'EOF'
+#!/usr/bin/env bash
+sleep 60
+EOF
+chmod +x "$LD5081_FAKE_BIN"
+
+# T1. Clean bootstrap (no EIO race) -> exits 0, env verification passes
+#     against the real, freshly-rendered plist.
+LD1_HOME="$WORKDIR/ld1-home"
+LD1_BIN="$WORKDIR/ld1-launchctl-bin"
+LD1_STATE="$WORKDIR/ld1-state"
+mkdir -p "$LD1_HOME"
+write_smart_launchd_bin "$LD1_BIN" "$WORKDIR/ld1.log" "$LD1_STATE" 0 0
+sleep 60 >/dev/null 2>&1 &
+LD1_REAL_PID=$!
+bg_proc_track "$LD1_REAL_PID"
+echo "$LD1_REAL_PID" > "$LD1_STATE/real.pid"
+out1=$( PATH="$LD1_BIN:$PATH" HOME="$LD1_HOME" LOOM_DAEMON_BIN="$LD5081_FAKE_BIN" \
+    LOOM_LAUNCHD_LABEL="$LD5081_LABEL" LOOM_LAUNCHD_DOMAIN="$LD5081_DOMAIN" \
+    LOOM_SOCKET_PATH="$LD1_HOME/.loom/loom-daemon.sock" \
+    LOOM_AUTONOMY_MARKER="$LD1_HOME/.loom/autonomy-desired" \
+    LOOM_WATCHDOG_LABEL="com.example.loom-sandbox-5081-wd-$$" \
+    bash "$START_SCRIPT" 2>&1 )
+rc1=$?
+kill "$LD1_REAL_PID" 2>/dev/null || true
+assert_eq "0" "$rc1" "launchd path (#5081): clean bootstrap + matching env -> exit 0"
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ "$rc1" -eq 0 ]] && ! echo "$out1" | grep -qi 'does NOT match'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} launchd path (#5081): env verification passes against the real rendered plist"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} launchd path (#5081): env verification passes against the real rendered plist"
+    echo "  output: $out1"
+fi
+
+# T2. Bootstrap fails with the EIO race exactly once, then succeeds on retry
+#     -> exit 0, and the output names the retry.
+LD2_HOME="$WORKDIR/ld2-home"
+LD2_BIN="$WORKDIR/ld2-launchctl-bin"
+LD2_STATE="$WORKDIR/ld2-state"
+mkdir -p "$LD2_HOME"
+write_smart_launchd_bin "$LD2_BIN" "$WORKDIR/ld2.log" "$LD2_STATE" 1 0
+sleep 60 >/dev/null 2>&1 &
+LD2_REAL_PID=$!
+bg_proc_track "$LD2_REAL_PID"
+echo "$LD2_REAL_PID" > "$LD2_STATE/real.pid"
+out2=$( PATH="$LD2_BIN:$PATH" HOME="$LD2_HOME" LOOM_DAEMON_BIN="$LD5081_FAKE_BIN" \
+    LOOM_LAUNCHD_LABEL="$LD5081_LABEL" LOOM_LAUNCHD_DOMAIN="$LD5081_DOMAIN" \
+    LOOM_SOCKET_PATH="$LD2_HOME/.loom/loom-daemon.sock" \
+    LOOM_AUTONOMY_MARKER="$LD2_HOME/.loom/autonomy-desired" \
+    LOOM_WATCHDOG_LABEL="com.example.loom-sandbox-5081-wd-$$" \
+    LOOM_DAEMON_BOOTSTRAP_RETRY_SECS=0 \
+    bash "$START_SCRIPT" 2>&1 )
+rc2=$?
+kill "$LD2_REAL_PID" 2>/dev/null || true
+assert_eq "0" "$rc2" "launchd path (#5081): one EIO bootstrap failure, retry succeeds -> exit 0"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out2" | grep -qi 'async-bootout race' && echo "$out2" | grep -q 'attempt 1/'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} launchd path (#5081): EIO retry is logged"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} launchd path (#5081): EIO retry is logged"
+    echo "  output: $out2"
+fi
+
+# T3. Bootstrap keeps failing with the EIO race past the retry ceiling ->
+#     exit 1, loudly, and NEVER a false "started" success.
+LD3_HOME="$WORKDIR/ld3-home"
+LD3_BIN="$WORKDIR/ld3-launchctl-bin"
+LD3_STATE="$WORKDIR/ld3-state"
+mkdir -p "$LD3_HOME"
+write_smart_launchd_bin "$LD3_BIN" "$WORKDIR/ld3.log" "$LD3_STATE" 99 0
+out3=$( PATH="$LD3_BIN:$PATH" HOME="$LD3_HOME" LOOM_DAEMON_BIN="$LD5081_FAKE_BIN" \
+    LOOM_LAUNCHD_LABEL="$LD5081_LABEL" LOOM_LAUNCHD_DOMAIN="$LD5081_DOMAIN" \
+    LOOM_SOCKET_PATH="$LD3_HOME/.loom/loom-daemon.sock" \
+    LOOM_AUTONOMY_MARKER="$LD3_HOME/.loom/autonomy-desired" \
+    LOOM_WATCHDOG_LABEL="com.example.loom-sandbox-5081-wd-$$" \
+    LOOM_DAEMON_BOOTSTRAP_RETRY_ATTEMPTS=2 LOOM_DAEMON_BOOTSTRAP_RETRY_SECS=0 \
+    bash "$START_SCRIPT" 2>&1 )
+rc3=$?
+assert_eq "1" "$rc3" "launchd path (#5081): EIO race persists past the retry ceiling -> exit 1"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out3" | grep -qi 'bootstrap failed' && ! echo "$out3" | grep -qi 'started under launchd'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} launchd path (#5081): exhausted EIO retries never report a false success"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} launchd path (#5081): exhausted EIO retries never report a false success"
+    echo "  output: $out3"
+fi
+
+# T4. Bootstrap + kickstart succeed, pid is alive, but the running job's
+#     REPORTED env does not match the freshly-rendered plist -> exit 1, named
+#     as an env mismatch (#5081's "never silently return a wrong env" AC),
+#     never a false "started" success either.
+LD4_HOME="$WORKDIR/ld4-home"
+LD4_BIN="$WORKDIR/ld4-launchctl-bin"
+LD4_STATE="$WORKDIR/ld4-state"
+mkdir -p "$LD4_HOME"
+write_smart_launchd_bin "$LD4_BIN" "$WORKDIR/ld4.log" "$LD4_STATE" 0 1
+sleep 60 >/dev/null 2>&1 &
+LD4_REAL_PID=$!
+bg_proc_track "$LD4_REAL_PID"
+echo "$LD4_REAL_PID" > "$LD4_STATE/real.pid"
+out4=$( PATH="$LD4_BIN:$PATH" HOME="$LD4_HOME" LOOM_DAEMON_BIN="$LD5081_FAKE_BIN" \
+    LOOM_LAUNCHD_LABEL="$LD5081_LABEL" LOOM_LAUNCHD_DOMAIN="$LD5081_DOMAIN" \
+    LOOM_SOCKET_PATH="$LD4_HOME/.loom/loom-daemon.sock" \
+    LOOM_AUTONOMY_MARKER="$LD4_HOME/.loom/autonomy-desired" \
+    LOOM_WATCHDOG_LABEL="com.example.loom-sandbox-5081-wd-$$" \
+    bash "$START_SCRIPT" 2>&1 )
+rc4=$?
+kill "$LD4_REAL_PID" 2>/dev/null || true
+assert_eq "1" "$rc4" "launchd path (#5081): env mismatch after a successful bootstrap -> exit 1"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out4" | grep -qi 'does NOT match' && echo "$out4" | grep -qi 'LOOM_SOCKET_PATH' && ! echo "$out4" | grep -qi 'started under launchd'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} launchd path (#5081): env mismatch is named and never reported as a false success"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} launchd path (#5081): env mismatch is named and never reported as a false success"
+    echo "  output: $out4"
+fi
+
+else
+    echo "  (skipping real launchd bootout/bootstrap #5081 regression: not running on Darwin)"
+fi
+
 # ---------- summary ----------
 echo
 echo "Ran $TESTS_RUN tests: $TESTS_PASSED passed, $TESTS_FAILED failed"

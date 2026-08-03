@@ -5194,16 +5194,29 @@ exits **6** rather than reporting a half-update. It does **not** tell you to
 `launchctl bootstrap` the existing plist — that plist is stale by construction
 (no `KeepAlive:{SuccessfulExit:true}`, no `LOOM_DAEMON_SUPERVISOR`), so
 bootstrapping it relaunches *unsupervised* and every subsequent roll refuses
-identically forever, and its `launchctl bootout` tears down the whole job tree
-(in-flight sweep children are direct children of the launchd job, so they are
-killed). Instead, `--relaunch` (or `LOOM_DAEMON_UPDATE_RELAUNCH=1`) re-renders
-the plist via `loom-daemon-start.sh` — installing both supervised keys — while
+identically forever. (A bare `launchctl bootout` of that plist no longer kills
+in-flight sweeps on a current build, #5081 — every sweep is spawned in its own
+process group, `process_group(0)` since #3800, which bootout's job-tree
+teardown does not reach, so it reparents to pid 1 and keeps running; this
+corrects guidance that was accurate before #3800 but had gone stale.) Instead,
+`--relaunch` (or `LOOM_DAEMON_UPDATE_RELAUNCH=1`) re-renders the plist via
+`loom-daemon-start.sh` — installing both supervised keys — while
 **preserving the live plist's `LOOM_*`/token `EnvironmentVariables`** (read with
 `plutil` + `jq`, `PATH`/`HOME`/`LOOM_DAEMON_SUPERVISOR` excluded so autonomy
 flags never silently narrow to FLAGS-OFF, #4011), and stops the old daemon
-**gracefully with `SIGTERM`** so sweep children reparent and keep working. The
-default path stays exit-6 (no `--relaunch`) so the sweep-disrupting relaunch is
-always a consented action.
+**gracefully with `SIGTERM`** rather than a bootout (belt-and-braces against a
+double teardown, since `loom-daemon-start.sh`'s own launchd block below
+bootouts the loaded job again before re-bootstrapping). The default path stays
+exit-6 (no `--relaunch`) so a plist-env-changing relaunch is always a
+consented action. `loom-daemon-start.sh`'s bootout+bootstrap sequence itself
+settles after bootout, retries the bootstrap step if it hits the async
+bootout/bootstrap race (`Bootstrap failed: 5: Input/output error`, #5081 —
+`bootout` returns before the kernel finishes tearing the job down, so an
+immediate `bootstrap` can fail even against a valid plist), and verifies the
+relaunched job's live pid **and** reported `EnvironmentVariables` before
+reporting success — see `LOOM_DAEMON_BOOTOUT_SETTLE_SECS` /
+`LOOM_DAEMON_BOOTSTRAP_RETRY_ATTEMPTS` / `LOOM_DAEMON_BOOTSTRAP_RETRY_SECS` in
+`loom-daemon-start.sh --help`.
 
 **Staleness detection** is primary-local, zero-network: it compares the git
 commit **baked into** the currently-resolved `loom-daemon` binary (embedded at

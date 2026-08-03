@@ -93,11 +93,24 @@
 # exact #4011 silent-autonomy-loss class this closes. The old advice to bootstrap
 # the EXISTING plist was itself a bug (#4118): it relaunched under the STALE plist
 # (no KeepAlive:SuccessfulExit, no LOOM_DAEMON_SUPERVISOR), so every subsequent
-# roll hit the same exit 6 forever, and its bootout killed in-flight sweeps
-# (sweep children are direct children of the launchd job). --relaunch re-renders
-# via loom-daemon-start.sh (installing the supervised keys) while preserving the
-# live plist's LOOM_* autonomy env, and SIGTERMs the daemon so sweep children
-# reparent instead of being torn down with the job.
+# roll hit the same exit 6 forever. It was ALSO documented (here, through
+# 2026-08-03) as killing in-flight sweeps via bootout tearing down the job tree
+# — that claim is STALE (#5081): since #3800 (2026-07-22) every sweep is spawned
+# as its OWN process group (`Command::process_group(0)`), and launchd's bootout
+# tears down the job's process group specifically, so a detached sweep is never
+# reached by it — it reparents to pid 1 and keeps running. Confirmed both by
+# code (dispatch.rs, `#4980`'s persisted pgid relies on this same fact) and by
+# observation (three bootout+bootstrap cycles on 2026-08-03, #5081). --relaunch
+# is still the recommended path here, but for a DIFFERENT reason: `launchctl
+# bootout` is asynchronous, and a hand-run bootstrap immediately after it can
+# race the still-in-progress teardown and fail with "Bootstrap failed: 5:
+# Input/output error", leaving the daemon down until a retry. --relaunch
+# re-renders via loom-daemon-start.sh (installing the supervised keys) while
+# preserving the live plist's LOOM_* autonomy env; loom-daemon-start.sh's own
+# bootout+bootstrap sequence settles after bootout, retries the bootstrap step
+# on that specific race, and verifies the relaunched job's live pid + reported
+# environment before reporting success (#5081) — a hand-typed bootout+bootstrap
+# gets none of that safety net.
 #
 # systemd --user-managed daemons (Linux, #4260 sub-issue C): the exact same
 # ownership-tiering + supervised-restart contract, ported to the systemd --user
@@ -1837,11 +1850,17 @@ log_systemd_diagnostics() {
 # EXISTING plist. That plist is stale by construction (it is the pre-#4077 file
 # that caused the refused restart) — bootstrapping it relaunches WITHOUT
 # KeepAlive:SuccessfulExit and WITHOUT LOOM_DAEMON_SUPERVISOR, so the next roll
-# refuses identically, forever; and its `launchctl bootout` tears down the whole
-# job tree, killing in-flight sweeps (they are direct children of the launchd
-# job). The correct fix is to RE-RENDER the plist via loom-daemon-start.sh (which
-# hardcodes the two supervised keys), preserving the live plist's autonomy/auth
-# env, and to stop the old daemon gracefully so sweep children reparent.
+# refuses identically, forever. The correct fix is to RE-RENDER the plist via
+# loom-daemon-start.sh (which hardcodes the two supervised keys), preserving
+# the live plist's autonomy/auth env.
+#
+# `launchctl bootout` itself no longer needs to be avoided for sweep safety
+# (#5081): a bare bootout does not kill in-flight sweeps on a current build —
+# see the top-of-file note near #4118 for why. This function still stops the
+# old daemon with a graceful SIGTERM rather than calling bootout directly,
+# both to avoid double-tearing-down the job (loom-daemon-start.sh's own
+# launchd block below already bootouts the loaded job before re-bootstrapping)
+# and so a daemon that predates this fix keeps behaving safely either way.
 
 # harvest_plist_env is defined in lib/daemon-env-harvest.sh (#4581, sourced
 # near the top of this script) — shared with scripts/loom's loom_cmd_restart()
@@ -1873,15 +1892,18 @@ perform_relaunch() {
     done <<< "$harvested"
     echo "Preserved ${count} LOOM_*/token env var(s) from the live plist across the re-render (PATH/HOME/LOOM_DAEMON_SUPERVISOR excluded by design)."
 
-    # 2. Stop the old daemon GRACEFULLY so its sweep children reparent and keep
-    #    working, instead of `launchctl bootout` tearing down the whole job tree.
-    #    kill -TERM makes the daemon exit non-zero, so the stale plist's
-    #    KeepAlive=false does not relaunch it — start.sh below installs the fresh,
-    #    supervised plist and bootstraps the new process.
+    # 2. Stop the old daemon GRACEFULLY with SIGTERM rather than calling
+    #    `launchctl bootout` directly here (bootout itself no longer kills
+    #    in-flight sweeps, #5081 — this is belt-and-braces against a double
+    #    bootout, since loom-daemon-start.sh's launchd block below bootouts the
+    #    loaded job again before re-bootstrapping). kill -TERM makes the daemon
+    #    exit non-zero, so the stale plist's KeepAlive=false does not relaunch
+    #    it — start.sh below installs the fresh, supervised plist and
+    #    bootstraps the new process (with its own settle/retry/verify, #5081).
     local daemon_pid
     daemon_pid=$(launchd_job_pid)
     if [[ -n "$daemon_pid" ]] && kill -0 "$daemon_pid" 2>/dev/null; then
-        echo "Sending SIGTERM to the running daemon (pid ${daemon_pid}) — sweep children reparent and keep working (NOT bootout, which would kill them)."
+        echo "Sending SIGTERM to the running daemon (pid ${daemon_pid}) — sweep children reparent and keep working; in-flight sweeps are not otherwise at risk here (bootout no longer kills them either, #5081)."
         kill -TERM "$daemon_pid" 2>/dev/null || true
         local _waited
         for _waited in 1 2 3 4 5; do
@@ -2280,7 +2302,7 @@ if [[ "$NO_RESTART" == "true" ]]; then
             echo "  $PROVISION_TARGET restart      (graceful: supervised in-place relaunch, in-flight sweeps preserved)"
             echo "If that binary predates #4077 and refuses the restart, re-render + relaunch under supervision:"
             echo "  loom-daemon-update.sh --relaunch   (preserves the live plist's LOOM_* env; SIGTERMs the daemon so sweep children reparent)"
-            echo "Do NOT 'launchctl bootout $LAUNCHD_SERVICE' by hand — bootout tears down the whole job tree and KILLS in-flight sweeps (they are direct children of the launchd job)."
+            echo "'launchctl bootout $LAUNCHD_SERVICE' no longer kills in-flight sweeps on a current build (#5081 — each sweep runs in its own process group and reparents to pid 1), but a hand-run bootout+bootstrap can still race and leave the daemon down (bootout is asynchronous); prefer --relaunch above, which settles/retries/verifies the relaunch safely."
         elif [[ "$DAEMON_MANAGER" == "systemd" ]]; then
             echo "The running (systemd-managed) daemon is still the PRE-update binary. Restart it with:"
             echo "  $PROVISION_TARGET restart      (graceful: supervised in-place relaunch, in-flight sweeps preserved)"
@@ -2375,14 +2397,18 @@ if [[ "$DAEMON_MANAGER" == "launchd" ]]; then
     err "autonomy env — run:"
     err "  loom-daemon-update.sh --relaunch      (or: LOOM_DAEMON_UPDATE_RELAUNCH=1 loom-daemon-update.sh)"
     err ""
-    err "WARNING: do NOT 'launchctl bootout $LAUNCHD_SERVICE' by hand to force this."
-    err "bootout tears down the whole job tree, and in-flight sweep children are DIRECT"
-    err "children of the launchd job, so it TERMINATES every running sweep — stranding"
-    err "loom:building labels and leaving worktrees behind. --relaunch above instead stops"
-    err "the daemon gracefully (SIGTERM) so sweep children reparent and keep working."
-    err "If you must relaunch by hand, prefer the graceful sequence over bootout+bootstrap:"
-    err "  kill -TERM ${daemon_pid_hint:-<daemon-pid>}   # daemon exits non-zero; children reparent; not relaunched (stale plist KeepAlive=false)"
-    err "  $START_SCRIPT                                  # re-render + bootstrap the supervised plist"
+    err "NOTE (#5081): a bare 'launchctl bootout $LAUNCHD_SERVICE' no longer terminates"
+    err "in-flight sweeps on a current build — every sweep runs in its own process group"
+    err "(process_group(0), #3800), which bootout's job-tree teardown does not reach; it"
+    err "reparents to pid 1 and keeps running. --relaunch above is still the recommended"
+    err "path, but for a different reason: hand-running bootout immediately followed by a"
+    err "plain bootstrap can race (bootout is asynchronous) and fail with 'Bootstrap"
+    err "failed: 5: Input/output error', leaving the daemon down until a retry — start.sh"
+    err "settles after bootout, retries on that race, and verifies the relaunched job's"
+    err "live pid + env before reporting success, none of which a hand-typed sequence gets."
+    err "If you must relaunch by hand anyway, prefer the graceful sequence below:"
+    err "  kill -TERM ${daemon_pid_hint:-<daemon-pid>}   # daemon exits non-zero; sweep children reparent regardless; not relaunched (stale plist KeepAlive=false)"
+    err "  $START_SCRIPT                                  # re-render + reload the supervised plist (settles/retries/verifies, #5081)"
     exit 6
 fi
 
