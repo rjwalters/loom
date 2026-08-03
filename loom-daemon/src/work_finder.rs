@@ -4692,30 +4692,46 @@ exit 0
     }
 
     #[test]
+    #[serial(loom_config_env)]
     fn test_config_missing_file_is_all_none() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
         let tmp = tempfile::tempdir().unwrap();
-        assert_eq!(read_work_finder_config(tmp.path()), WorkFinderConfig::default());
+        let cfg = read_work_finder_config(tmp.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(cfg, WorkFinderConfig::default());
     }
 
     #[test]
+    #[serial(loom_config_env)]
     fn test_config_malformed_json_is_all_none() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
         let tmp = tempfile::tempdir().unwrap();
         write_config(tmp.path(), "{not valid json");
-        assert_eq!(read_work_finder_config(tmp.path()), WorkFinderConfig::default());
+        let cfg = read_work_finder_config(tmp.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(cfg, WorkFinderConfig::default());
     }
 
     #[test]
+    #[serial(loom_config_env)]
     fn test_config_missing_autonomous_block_is_all_none() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
         let tmp = tempfile::tempdir().unwrap();
         write_config(tmp.path(), r#"{"terminals": []}"#);
-        assert_eq!(read_work_finder_config(tmp.path()), WorkFinderConfig::default());
+        let cfg = read_work_finder_config(tmp.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(cfg, WorkFinderConfig::default());
     }
 
     #[test]
+    #[serial(loom_config_env)]
     fn test_config_missing_work_finder_block_is_all_none() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
         let tmp = tempfile::tempdir().unwrap();
         write_config(tmp.path(), r#"{"autonomous": {"mainHealthGate": {"enabled": true}}}"#);
-        assert_eq!(read_work_finder_config(tmp.path()), WorkFinderConfig::default());
+        let cfg = read_work_finder_config(tmp.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(cfg, WorkFinderConfig::default());
     }
 
     #[test]
@@ -4764,10 +4780,12 @@ exit 0
     }
 
     #[test]
+    #[serial(loom_config_env)]
     fn test_deprecated_cpu_knobs_accepted_at_any_value_including_nonsense() {
         // Pre-#4512 these were range-filtered/type-checked because a value was
         // consumed. Nothing consumes them now, so out-of-range, wrong-type, and
         // even absurd values are all equally inert — and equally non-fatal.
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
         for body in [
             r#"{"autonomous": {"cpuUtilizationTarget": 0}}"#,
             r#"{"autonomous": {"cpuUtilizationTarget": 1.5}}"#,
@@ -4783,6 +4801,7 @@ exit 0
             assert_eq!(cfg.max_concurrent, None);
             assert_eq!(cfg.enabled, None);
         }
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
     }
 
     #[test]
@@ -4874,12 +4893,15 @@ exit 0
     }
 
     #[test]
+    #[serial(loom_config_env)]
     fn test_config_per_token_concurrency_read_without_work_finder_block() {
         // `perTokenConcurrency` lives at the `autonomous` level (#3947), so it is
         // read even when the `workFinder` sub-block is absent.
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
         let tmp = tempfile::tempdir().unwrap();
         write_config(tmp.path(), r#"{"autonomous": {"perTokenConcurrency": 3}}"#);
         let cfg = read_work_finder_config(tmp.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
         assert_eq!(cfg.per_token_concurrency, Some(3));
         assert_eq!(cfg.enabled, None);
         assert_eq!(cfg.max_concurrent, None);
@@ -4895,10 +4917,13 @@ exit 0
     }
 
     #[test]
+    #[serial(loom_config_env)]
     fn test_config_enabled_false_is_disabled_flag() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
         let tmp = tempfile::tempdir().unwrap();
         write_config(tmp.path(), r#"{"autonomous": {"workFinder": {"enabled": false}}}"#);
         let cfg = read_work_finder_config(tmp.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
         assert_eq!(cfg.enabled, Some(false));
         assert_eq!(cfg.interval_secs, None);
         assert_eq!(cfg.max_concurrent, None);
