@@ -314,6 +314,79 @@ LOOM_SWEEP_CLAIM_OWNED=3952 LOOM_MODEL=sonnet \
 Use `loom-daemon dispatch 3952` instead — it performs the claim flip, registry
 tracking, and event publishing for you, with the bounded timeout as a safety net.
 
+#### `loom-daemon cancel` — operator CLI (Issue #4980)
+
+`loom-daemon cancel` is the `dispatch` sibling on the **stop** side: the non-MCP
+operator entry point onto the same `CancelSweep` IPC request the `cancel_sweep`
+MCP tool uses. It exists because the MCP tool only runs inside the operator's own
+Claude session on their own machine — over ssh to a fleet worker there was
+previously no sanctioned lever at all.
+
+```bash
+loom-daemon cancel sweep-issue-4980-1762000000   # by sweep id (from `loom-daemon status`)
+loom-daemon cancel --issue 4980                  # by issue — resolves the live sweep for you
+loom-daemon cancel --issue 4980 --grace 5        # tighter SIGTERM→SIGKILL window (default 30s)
+loom-daemon cancel --issue 758 --workspace ~/GitHub/anvil
+```
+
+| Flag | Maps to `CancelSweep` field | Notes |
+|------|-----------------------------|-------|
+| `<sweep-id>` (positional) | `sweep_id` | required unless `--issue` is given |
+| `--issue <N>` | `sweep_id` (resolved client-side) | one extra `ListSweeps` round-trip; only **live** (`Running`/`Pending`) entries are candidates, and more than one is an error rather than a guess |
+| `--grace <SECS>` | `grace_secs` | seconds between SIGTERM and SIGKILL; default 30, matching the MCP tool |
+| `--workspace <PATH>` | `workspace_root` | same cwd-default resolution `dispatch` applies (#4299) |
+
+**Never hand-`kill` a sweep instead.** The registry tracks the
+`claude-wrapper.sh` pid; SIGKILLing it leaves the underlying `claude` agent
+alive. On 2026-08-03 that surviving agent noticed its subprocesses had died and
+**relaunched** them (~35 CPU-hours of simulation across two rounds), against an
+issue whose claim the crash path had already returned to `loom:issue` — a zombie
+agent the registry reported as `in_flight: 0`. `loom-daemon cancel` signals the
+whole process **group**, so wrapper, agent, and every descendant die together,
+and it releases the claim lock, restores the label, and emits the lifecycle
+events on the way out.
+
+**One implementation, two callers.** The CLI is a thin client: the termination
+itself runs daemon-side in `cancel_sweep_nonblocking`, so `loom-daemon cancel`
+and `mcp__loom__cancel_sweep` cannot drift apart. The client-side ack budget is
+`grace_secs + 15s` (the daemon acks only after the whole cancel completes), and
+on expiry the CLI exits nonzero with the same "is loom-daemon running?"
+diagnostic `dispatch` uses rather than hanging.
+
+#### Process-group termination and the persisted `pgid` (#3800, #4980)
+
+Sweep children are spawned as their **own process-group leader**
+(`process_group(0)` → `setpgid(0, 0)`), so `kill(-pgid, sig)` reaches the child
+*and* every descendant it forked — Bash-tool commands, MCP servers, git clones,
+simulations, watcher loops.
+
+#3800 delivered the group spawn and the group-kill primitive, but gated the group
+path on the daemon still holding the spawn-time `Child` handle. Two ordinary
+situations have no such handle and silently degraded to a single-PID kill that
+orphaned the whole subtree: an entry rebuilt by `reconstruct()` after a daemon
+restart, and **every** `loom-daemon cancel` invocation (a fresh process that
+never held one). #4980 closes that by persisting the group:
+
+- **At spawn** the child's pgid is verified against the OS (`getpgid(child) ==
+  child`) and written into `.loom/locks/issue-<N>/owner.json` as `pgid`, and onto
+  the registry entry as `SweepInfo.pgid`.
+- **On reconstruct** the persisted value is restored — but re-verified against
+  the live owner first; a value the OS contradicts (a PID recycled across the
+  restart) is discarded rather than used to signal a stranger's group.
+- **On signal** the group path is unconditional. A missing `pgid` (a pre-#4980
+  `owner.json`, a checkpoint-only entry) degrades to single-PID delivery **with a
+  log line**, never silently; a `pgid` matching the daemon's own group is refused
+  outright.
+- **On the crash path** — a dead leader whose group still has members, the zombie-
+  agent shape above — the reaper (and `reconstruct()`'s stale-lock branch) sends
+  the group a SIGTERM and escalates to SIGKILL on a later tick if it survives.
+  The persisted value is the *only* handle available here: the OS will not report
+  a dead pid's process group.
+
+`owner.json`'s `pgid` is `Option` + `#[serde(default)]`, so a lock written by a
+pre-#4980 daemon still deserializes — failing to parse it would be read
+everywhere as "no owner" and would drop a *live* sweep's lock.
+
 ### `list_sweeps` (Phase A)
 
 Return all tracked sweeps, optionally filtered by lifecycle state.
@@ -383,14 +456,20 @@ Inputs:
 
 ### `cancel_sweep` (Phase C)
 
-SIGTERM → wait `grace` seconds → SIGKILL the sweep's child PID.
-Transitions the registry entry from `Running` to `Exited{code: None,
-at: now}` and releases the per-issue lock. Idempotent: cancelling an
-already-terminal sweep returns success with `was_running: false`.
+SIGTERM → wait `grace` seconds → SIGKILL the sweep's **process group** (#3800,
+#4980 — see "Process-group termination and the persisted `pgid`" above; the whole
+subtree dies, not just the tracked leader). Transitions the registry entry from
+`Running` to `Exited{code: None, at: now}` and releases the per-issue lock.
+Idempotent: cancelling an already-terminal sweep returns success with
+`was_running: false`.
 
 Inputs:
 - `sweep_id` (required).
 - `grace` (optional, default 30) — seconds between SIGTERM and SIGKILL.
+
+CLI equivalent: `loom-daemon cancel <sweep-id|--issue N>` (#4980) — same IPC
+request, same daemon-side termination path, usable over ssh where no MCP server
+is attached.
 
 ### `tail_event_bus` (Phase C)
 
@@ -413,6 +492,12 @@ The sweep registry (`loom-daemon/src/sweep_registry.rs`) holds a
 
 - `sweep_id`, `kind` (`Issue(N)` or `PrSet(Vec<u32>)`), `pid`,
   `token_name`, `log_path`.
+- `pgid` (optional, issue #4980) — the process group the child leads
+  (`process_group(0)`, so it equals `pid` for a live dispatch). Persisted to the
+  claim lock's `owner.json` too, so cancellation and crash-path reaping still
+  reach the whole subtree after a daemon restart or from a fresh
+  `loom-daemon cancel` process. `#[serde(default, skip_serializing_if =
+  "Option::is_none")]`, so pre-#4980 wire data and clients remain compatible.
 - `idempotency_key` (optional), `started_at`.
 - `state` — one of `Pending`, `Running`, `Exited{code, at}`,
   `Crashed{at}`.

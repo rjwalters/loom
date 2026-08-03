@@ -797,6 +797,23 @@ pub struct SweepInfo {
     pub kind: SweepKind,
     /// PID of the detached child process.
     pub pid: u32,
+    /// Process-group ID of the detached child (Issue #4980). Sweeps are spawned
+    /// as their own group leader (`process_group(0)`, #3800), so for a live
+    /// dispatch this equals [`pid`](Self::pid) — but recording it explicitly is
+    /// what makes group termination survive the loss of the spawning process:
+    ///
+    /// - a `reconstruct()`-ed entry (daemon restart) has no retained `Child`
+    ///   handle, and used to silently degrade cancellation to a single-PID kill
+    ///   that orphaned the whole subtree;
+    /// - the crash-path reaper needs a group handle to reap survivors of a
+    ///   *dead* leader, whose pgid can no longer be queried from the OS.
+    ///
+    /// `None` for entries whose group is unknown (a pre-#4980 `owner.json`, a
+    /// checkpoint-only recovery entry, a non-Unix host, or a test-injected
+    /// entry) — every consumer degrades to single-PID signalling and logs,
+    /// never assumes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pgid: Option<u32>,
     /// Token account name selected by `spawn-claude.sh` (e.g. `agent-2.token`).
     /// "unknown" when not surfaced by the wrapper (Phase A logs this in
     /// the per-sweep log rather than recording it on the entry).

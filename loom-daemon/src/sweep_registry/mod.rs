@@ -554,6 +554,21 @@ pub struct SweepRegistry {
     /// capped at [`MAX_PHASE_OBSERVATIONS`] so a pathological Judge/Doctor loop
     /// cannot grow it without bound.
     phase_history: HashMap<SweepId, Vec<PhaseObservation>>,
+    /// Orphaned process groups awaiting SIGKILL escalation (Issue #4980).
+    ///
+    /// Written by [`reap_orphaned_group`](Self::reap_orphaned_group) when a
+    /// crash path (the reaper's dead-leader branch, or `reconstruct()`'s
+    /// stale-lock branch) finds a *dead* sweep leader whose process group still
+    /// has live members, and drained by
+    /// [`escalate_pending_group_reaps`](Self::escalate_pending_group_reaps) at
+    /// the top of each [`reap_once`](Self::reap_once) tick.
+    ///
+    /// Deferring the escalation to a later tick — rather than sleeping through
+    /// the grace inline — is deliberate: `reap_once` also runs on the
+    /// `ListSweeps` / `GetSweepStatus` read path while holding the registry
+    /// mutex, and blocking there is the 2026-07-26 wedge shape. Entries are
+    /// removed as soon as the group drains, so this never accumulates.
+    pending_group_reaps: HashMap<SweepId, PendingGroupReap>,
 }
 
 /// Resolve this host's identity string for collision records (Issue #4085) and
@@ -697,6 +712,7 @@ impl SweepRegistry {
             label_flip_log: HashMap::new(),
             flap_warned_at: HashMap::new(),
             phase_history: HashMap::new(),
+            pending_group_reaps: HashMap::new(),
         }
     }
 
@@ -738,6 +754,7 @@ impl SweepRegistry {
             label_flip_log: HashMap::new(),
             flap_warned_at: HashMap::new(),
             phase_history: HashMap::new(),
+            pending_group_reaps: HashMap::new(),
         }
     }
 
@@ -1229,6 +1246,9 @@ mod tests {
             sweep_id: "sweep-issue-42-1700000000".to_string(),
             kind: SweepKind::Issue(42),
             pid: 12_345,
+            // Issue #4980: a sweep is spawned as its own group leader, so a
+            // live dispatch's pgid equals its pid.
+            pgid: Some(12_345),
             token_name: "agent-1.token".to_string(),
             runtime: "unknown".into(),
             runtime_source: None,
@@ -1250,6 +1270,7 @@ mod tests {
             "sweep_id": "sweep-issue-42-1700000000",
             "kind": {"type": "Issue", "value": 42},
             "pid": 12_345,
+            "pgid": 12_345,
             "token_name": "agent-1.token",
             "runtime": "unknown",
             "log_path": ".loom/logs/sweep-issue-42.log",
@@ -1285,6 +1306,10 @@ mod tests {
         // None (#[serde(default)]) and be omitted on re-serialization
         // (skip_serializing_if).
         assert_eq!(legacy.effort, None);
+        // Pre-#4980 JSON lacks `pgid` too — it must default to None and be
+        // omitted on re-serialization, so an older client/daemon on the other
+        // end of the socket is unaffected.
+        assert_eq!(legacy.pgid, None);
         assert_eq!(legacy.runtime, "unknown");
         let reserialized = serde_json::to_value(&legacy).unwrap();
         assert!(

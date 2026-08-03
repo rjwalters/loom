@@ -1759,6 +1759,7 @@ mod in_flight_repo_column_tests {
     /// `mk()` helper pattern used by `sweep_registry.rs`'s own tests.
     fn mk(issue: u32, repo: Option<&str>) -> SweepInfo {
         SweepInfo {
+            pgid: None,
             sweep_id: format!("s{issue}"),
             kind: SweepKind::Issue(issue),
             pid: 4242,

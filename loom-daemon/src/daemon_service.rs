@@ -140,6 +140,15 @@ pub(crate) async fn run_daemon() -> Result<()> {
                 depends_on,
                 force,
             } => handle_dispatch_command(issue, workspace, model, effort, depends_on, force).await,
+            // `cancel` connects to the running daemon over its Unix socket to
+            // terminate a sweep (Issue #4980) — the `dispatch` sibling, same
+            // socket, same reason it needs the async runtime.
+            Commands::Cancel {
+                sweep_id,
+                issue,
+                grace,
+                workspace,
+            } => cli::cancel::handle_cancel_command(sweep_id, issue, grace, workspace).await,
             // `watch` connects to the running daemon over its Unix socket to
             // register/list/remove durable watches (Issue #3971).
             Commands::Watch { action } => handle_watch_command(action).await,
