@@ -4860,8 +4860,11 @@ compares the live (bootstrapped) job's `LOOM_*`/token environment
 (`launchctl print gui/<uid>/<label>`) against the on-disk plist's declared
 `EnvironmentVariables` (`plutil -convert json`), and prints a loud `WARNING:`
 naming every drifted key plus the exact remediation, if they disagree
-(`loom_daemon::launchd_env_drift`). No warning means the two agree — not that
-the check didn't run; this is macOS/launchd-specific (systemd re-reads
+(`loom_daemon::launchd_env_drift`). The check is advisory-only and never blocks
+or fails the restart. No warning normally means the two agree — but it is also
+what you get when there was nothing to compare (no launchd job registered under
+this label, no on-disk plist) or a probe/parse failed, since every such outcome
+is deliberately silent; this is macOS/launchd-specific (systemd re-reads
 `Environment=` fresh via `daemon-reload` on every unit reload, so there is
 nothing to detect on that path).
 

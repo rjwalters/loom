@@ -238,6 +238,17 @@ fn env_drift_warning(label: &str, uid: u32, plist_path: &Path, drifted: &[Drifte
 /// compare against, or any probe/parse failure. **Never** fails the caller —
 /// this is advisory-only and must not block or delay the actual restart.
 pub fn check_launchd_env_drift() -> Option<String> {
+    if !cfg!(target_os = "macos") {
+        // Launchd-specific gap (#4995) — systemd re-reads `Environment=` fresh
+        // via `daemon-reload` on every unit reload, so there is nothing to
+        // detect on that path. The gate lives here, on the real-I/O entry
+        // point, rather than in `check_launchd_env_drift_with` below: that
+        // function must stay OS-agnostic so its injected-fake unit tests
+        // actually exercise the orchestration on every CI runner, Linux
+        // included.
+        return None;
+    }
+
     check_launchd_env_drift_with(
         resolve_label,
         probe_launchctl_print,
@@ -250,19 +261,19 @@ pub fn check_launchd_env_drift() -> Option<String> {
 /// boundaries so the orchestration (label resolution -> probe -> compare ->
 /// render) is unit-testable against fixed fixtures without a real launchd
 /// host, `launchctl`, or `plutil` binary.
+///
+/// Deliberately **not** OS-gated: the `target_os = "macos"` short-circuit
+/// belongs to the public wrapper above, which is the only caller that performs
+/// real launchd I/O. Keeping this function OS-agnostic is what makes its unit
+/// tests meaningful on non-macOS runners — a gate here would short-circuit
+/// every fixture-driven test to `None` on Linux CI regardless of the injected
+/// fakes.
 fn check_launchd_env_drift_with(
     label_fn: impl Fn() -> String,
     launchctl_print: impl Fn(&str) -> Option<String>,
     plutil_json: impl Fn(&Path) -> Option<String>,
     plist_path_fn: impl Fn(&str) -> Option<PathBuf>,
 ) -> Option<String> {
-    if !cfg!(target_os = "macos") {
-        // Launchd-specific gap (#4995) — systemd re-reads `Environment=` fresh
-        // via `daemon-reload` on every unit reload, so there is nothing to
-        // detect on that path.
-        return None;
-    }
-
     let label = label_fn();
     let uid = unsafe { libc::getuid() };
     let target = format!("gui/{uid}/{label}");
