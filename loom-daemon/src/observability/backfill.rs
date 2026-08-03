@@ -381,6 +381,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn default_backfill_state_path_is_under_loom_logs() {
         let workspace = Path::new("/workspace/repo");
         let path = default_backfill_state_path(workspace);
