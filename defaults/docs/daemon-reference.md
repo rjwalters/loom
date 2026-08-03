@@ -1434,8 +1434,22 @@ Six sections, one line each (or the full structured payload with `--json`):
 | `dispatch` | in-flight vs dynamic cap, plus the last work-finder tick's dispatch/skip-reason summary | `DaemonStatusReport` + `work_finder::last_tick_summary()` |
 | `tokens` | healthy/total, exhausted count, `.ranking` staleness | `CapacityReport` + the resolved pool's `.ranking` mtime |
 | `roles` | **persistent** role-tick failures (transient ones are a count only) | `role_runner::role_tick_records()` |
-| `queues` | per-root ready (`loom:issue`) counts | `pipeline_snapshot` (`PipelineMetrics::HEALTH`) |
+| `queues` | per-root ready (`loom:issue`) counts **plus the review-side axes** (`loom:review-requested` / `loom:changes-requested` / `loom:pr`), and a per-repo *review stall* verdict | `pipeline_snapshot` (`PipelineMetrics::HEALTH`) |
 | `throughput` | merges across managed repos inside the window | `pipeline_snapshot` (`PipelineMetrics::HEALTH`) |
+
+#### `queues`: the review-stall rule (#5021)
+
+`queues` reports a repo **DEGRADED** ("REVIEW STALLED") when it is carrying at
+least `health::REVIEW_STALL_MIN_BACKLOG` (3) open `loom:review-requested` PRs
+**and** the window merged nothing at all. Neither half alone is a fault — a
+short review queue is normal, and a quiet window legitimately merges nothing
+(`throughput` treats zero merges as green for exactly that reason) — but the
+conjunction is a direct, cause-agnostic observation that review is not
+happening. It is evaluated **per repo**, so a repo with zero ready issues
+cannot be masked by the fleet-wide `total_ready` sum. An axis that was not
+observed (forge query failed, or the caller masked the metric off) is reported
+as `null`/`?`, never as `0`, and never produces a stall verdict in either
+direction.
 
 ### Liveness precedence: pgrep + pid-file first, launchd NEVER alone
 
