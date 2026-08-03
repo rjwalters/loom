@@ -35,6 +35,14 @@
 #     stop sequence over the same transcript.
 #   - guards.backgroundSubagents / LOOM_GUARD_BACKGROUND_SUBAGENTS toggle
 #     (env beats config; config beats default-on)
+#   - real "Agent" dispatch tool name detection (#5086): the harness names the
+#     async subagent-dispatch tool "Agent", not "Task" -- a dispatched Agent
+#     with only its immediate launch ack ("Async agent launched successfully
+#     ... agentId: <ID> ...") still blocks (the ack must NOT itself count as
+#     resolution, else the #4389 hazard recurs on this tool); a LATER, distinct
+#     tool_result on the same id, or a non-error TERMINAL TaskOutput poll of
+#     the recovered agentId, resolves it; a <status>running</status> poll does
+#     NOT; existing Task-named fixtures continue to pass unmodified
 #   - jq absent -> allow (fail-open)
 #   - contract: block output is valid JSON with decision=="block" and a
 #     non-empty reason; exit code is always 0
@@ -82,6 +90,31 @@ TASK_USE_UNRESOLVED='{"type":"assistant","message":{"role":"assistant","content"
 TASK_USE_RESOLVED='{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_02","name":"Task","input":{}}]}}'
 TASK_RESULT_02='{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_02","content":"done"}]}}'
 NON_TASK_USE='{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_03","name":"Bash","input":{}}]}}'
+
+# Real async-subagent-dispatch tool name (issue #5086): the harness names this
+# tool "Agent", not "Task". Dispatching it returns an IMMEDIATE launch-ack
+# tool_result on the SAME tool_use id the real completion later arrives on —
+# that ack text must NEVER itself count as resolution (else the #4389
+# false-negative hazard recurs on this tool).
+AGENT5086_USE_UNRESOLVED='{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_agent01","name":"Agent","input":{"prompt":"implement issue #1"}}]}}'
+AGENT5086_ACK_UNRESOLVED='{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_agent01","content":"Async agent launched successfully. agentId: aagent01. Use SendMessage with to: aagent01 to communicate. You will be notified automatically when it completes."}]}}'
+
+# (b) a LATER, distinct tool_result on the SAME id (the real completion) —
+# the harness may emit a second tool_result block for the same tool_use id
+# once the dispatched agent actually finishes.
+AGENT5086_USE_COMPLETED='{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_agent02","name":"Agent","input":{"prompt":"implement issue #2"}}]}}'
+AGENT5086_ACK_COMPLETED='{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_agent02","content":"Async agent launched successfully. agentId: aagent02. Use SendMessage with to: aagent02 to communicate. You will be notified automatically when it completes."}]}}'
+AGENT5086_RESULT_COMPLETED='{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_agent02","content":"Work complete: opened PR #5555 for issue #2."}]}}'
+
+# (c) resolved ONLY via a blocking TaskOutput poll of the agentId recovered
+# from the launch ack — no second tool_result ever lands on the dispatch id
+# itself. A non-error, TERMINAL (<status>completed</status>) poll result
+# resolves it; a <status>running</status> poll result must NOT.
+AGENT5086_USE_POLLED='{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_agent03","name":"Agent","input":{"prompt":"implement issue #3"}}]}}'
+AGENT5086_ACK_POLLED='{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_agent03","content":"Async agent launched successfully. agentId: aagent03. Use SendMessage with to: aagent03 to communicate. You will be notified automatically when it completes."}]}}'
+AGENT5086_POLL_USE='{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_poll03","name":"TaskOutput","input":{"agentId":"aagent03","block":true,"timeout":600}}]}}'
+AGENT5086_POLL_RESULT_TERMINAL='{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_poll03","content":"<retrieval_status>success</retrieval_status>\n<status>completed</status>\nWork complete: opened PR #5556 for issue #3."}]}}'
+AGENT5086_POLL_RESULT_RUNNING='{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_poll03","content":"<retrieval_status>timeout</retrieval_status>\n<status>running</status>\nStill working..."}]}}'
 
 # Background Bash (issue #4389 — the #4257 recurrence via run_in_background)
 # fixtures. A background dispatch gets an IMMEDIATE tool_result ack (NOT
@@ -283,6 +316,54 @@ if [[ "$code" == "0" && -z "$output" ]]; then
 else
     fail "(g) empty transcript_path -> allow (got exit=$code output=$output)"
 fi
+
+# --- real "Agent" dispatch tool name detection (issue #5086) ----------------
+# The harness names the async subagent-dispatch tool "Agent", not "Task" — the
+# original `.name=="Task"`-only match never fired for a real dispatch. An
+# `Agent` dispatch also gets an IMMEDIATE launch-ack tool_result on the SAME
+# tool_use id the real completion later arrives on, so the fix must not treat
+# that ack alone as resolution (the #4389 hazard recurring on this tool).
+
+# (a5086) dispatched Agent with ONLY the launch ack (no later distinct
+# completion, no TaskOutput poll) -> still block. This is the exact silent
+# no-op / then-false-negative hazard #5086 was filed for.
+T5086a="$TMPROOT/transcript-agent-ack-only.jsonl"
+write_transcript "$T5086a" "$AGENT5086_USE_UNRESOLVED" "$AGENT5086_ACK_UNRESOLVED"
+result=$(run_hook "$T5086a" false)
+assert_block "(a5086) dispatched Agent with only the launch ack -> block" "$result"
+
+# (b5086) dispatched Agent with a LATER, distinct completion tool_result on
+# the SAME id -> resolves.
+T5086b="$TMPROOT/transcript-agent-later-completion.jsonl"
+write_transcript "$T5086b" "$AGENT5086_USE_COMPLETED" "$AGENT5086_ACK_COMPLETED" "$AGENT5086_RESULT_COMPLETED"
+result=$(run_hook "$T5086b" false)
+assert_allow "(b5086) dispatched Agent + later distinct completion tool_result -> allow" "$result"
+
+# (c5086) dispatched Agent resolved ONLY via a blocking TaskOutput poll of the
+# agentId recovered from the launch ack (no second tool_result on the dispatch
+# id itself) -> resolves.
+T5086c="$TMPROOT/transcript-agent-taskoutput-poll.jsonl"
+write_transcript "$T5086c" "$AGENT5086_USE_POLLED" "$AGENT5086_ACK_POLLED" \
+    "$AGENT5086_POLL_USE" "$AGENT5086_POLL_RESULT_TERMINAL"
+result=$(run_hook "$T5086c" false)
+assert_allow "(c5086) dispatched Agent resolved only via blocking TaskOutput poll -> allow" "$result"
+
+# (c5086b) guard against overcorrecting: a TaskOutput poll that is still
+# <status>running</status> (not terminal) must NOT resolve the dispatch.
+T5086cb="$TMPROOT/transcript-agent-taskoutput-still-running.jsonl"
+write_transcript "$T5086cb" "$AGENT5086_USE_POLLED" "$AGENT5086_ACK_POLLED" \
+    "$AGENT5086_POLL_USE" "$AGENT5086_POLL_RESULT_RUNNING"
+result=$(run_hook "$T5086cb" false)
+assert_block "(c5086b) TaskOutput poll still <status>running</status> -> still block" "$result"
+
+# (d5086) existing Task-named fixtures continue to pass unmodified
+# (back-compat): the original unresolved/resolved Task cases from (a)/(b)
+# above are re-asserted here under the new dual-name (Task|Agent) matcher to
+# make the back-compat guarantee an explicit, standalone regression case.
+result=$(run_hook "$T1" false)
+assert_block "(d5086) back-compat: unresolved Task-named dispatch -> still block" "$result"
+result=$(run_hook "$T2" false)
+assert_allow "(d5086) back-compat: resolved Task-named dispatch -> still allow" "$result"
 
 # --- background Bash (run_in_background) detection (issue #4389) -----------
 
