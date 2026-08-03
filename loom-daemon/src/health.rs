@@ -68,6 +68,7 @@ use serde::Serialize;
 
 use crate::daemon_install_state::{InstallState, InstallStateReport};
 use crate::pipeline_snapshot::RepoPipelineSnapshot;
+use crate::script_helpers::log_filter::strip_ansi;
 use crate::types::{DaemonStatusReport, RoleTickRecord};
 
 // ============================================================================
@@ -470,6 +471,30 @@ pub struct RoleTickSummary {
 ///
 /// Records at or after `since` are considered; the rest are ignored. Both
 /// output lists are sorted by `(root, role)` for stable rendering.
+/// Max characters of a [`RoleFailure::detail`] retained in the **structured**
+/// (non-summary) health output (issue #5024). `RoleTickRecord.detail` is
+/// already ANSI-stripped and capped at the source by
+/// `role_runner::clean_and_cap_detail`, but [`summarize_role_ticks`] cleans
+/// it again here defensively — any future code path that lands a raw,
+/// ANSI-laden `RoleTickRecord` (a differently-sourced failure, a replayed
+/// record from an older binary, …) still cannot leak escapes or an unbounded
+/// blob into `health --json`'s `roles.persistent[].detail` field. Deliberately
+/// more generous than the tighter per-item cap folded into the one-line
+/// `roles.summary` string (see `assess_roles`'s `MAX_SUMMARY_DETAIL_CHARS`) —
+/// this is the fuller detail a `--json` consumer actually wants.
+const MAX_STRUCTURED_DETAIL_CHARS: usize = 1000;
+
+/// ANSI-strip and length-cap `detail` for storage in [`RoleFailure::detail`].
+fn clean_structured_detail(detail: &str) -> String {
+    let cleaned = strip_ansi(detail);
+    let cleaned = cleaned.trim();
+    if cleaned.chars().count() <= MAX_STRUCTURED_DETAIL_CHARS {
+        return cleaned.to_string();
+    }
+    let capped: String = cleaned.chars().take(MAX_STRUCTURED_DETAIL_CHARS).collect();
+    format!("{capped}… [truncated]")
+}
+
 #[must_use]
 pub fn summarize_role_ticks(records: &[RoleTickRecord], since: DateTime<Utc>) -> RoleTickSummary {
     // BTreeMap keyed by (root, role) so the output order is deterministic.
@@ -508,14 +533,18 @@ pub fn summarize_role_ticks(records: &[RoleTickRecord], since: DateTime<Utc>) ->
             .iter()
             .rev()
             .find(|r| !r.ok)
-            .and_then(|r| r.detail.clone());
+            .and_then(|r| r.detail.as_deref())
+            .map(clean_structured_detail);
         // Escalation streak (#5023): count the trailing run of consecutive
         // failures whose `detail` is byte-identical to the latest record's, from
         // newest backward. A success — or a failure carrying a *different*
         // detail — breaks the run, so this is `0` for a transient pair (latest
         // is a success) and resets to `0` the moment a persistent pair recovers.
         // Exact-string comparison is the deliberate basis (see
-        // `ROLE_TICK_ESCALATION_THRESHOLD`).
+        // `ROLE_TICK_ESCALATION_THRESHOLD`). Deliberately compares the *raw*
+        // record details rather than the cleaned/capped `detail` above (#5024):
+        // capping could make two genuinely different failures compare equal
+        // once truncated, inflating the streak.
         let consecutive_identical = if latest.ok {
             0
         } else {
@@ -1096,6 +1125,46 @@ pub fn assess_tokens(inputs: &HealthInputs) -> HealthSection {
     )
 }
 
+/// Max characters of a single failure's detail folded into the one-line
+/// `roles.summary` string (issue #5024). The full detail — already
+/// ANSI-stripped and capped at the source by
+/// `role_runner::clean_and_cap_detail` — still lives in the structured
+/// `persistent[].detail` field of the section's JSON payload; only the
+/// *summary line* gets this tighter cap so N simultaneously-failing
+/// `(root, role)` pairs cannot multiply the line's length (the 2026-08-03
+/// 12-repo outage produced a tens-of-kilobytes summary line before this fix).
+const MAX_SUMMARY_DETAIL_CHARS: usize = 60;
+
+/// Hard cap on the fully-assembled `roles.summary` line, applied after
+/// joining every persistent failure's (already-capped) detail. A second line
+/// of defense: even if a future code path folds many failures/details into
+/// one line without going through [`MAX_SUMMARY_DETAIL_CHARS`], the summary
+/// line itself still cannot grow unbounded.
+const MAX_ROLES_SUMMARY_LINE_CHARS: usize = 2000;
+
+/// ANSI-strip (defensive — the detail should already be clean from the
+/// source) and length-cap `detail` for inline use in the `roles.summary`
+/// line.
+fn summary_detail(detail: &str) -> String {
+    let cleaned = strip_ansi(detail);
+    let cleaned = cleaned.trim();
+    if cleaned.chars().count() <= MAX_SUMMARY_DETAIL_CHARS {
+        return cleaned.to_string();
+    }
+    let capped: String = cleaned.chars().take(MAX_SUMMARY_DETAIL_CHARS).collect();
+    format!("{capped}…")
+}
+
+/// Cap the fully-assembled `roles.summary` line length (see
+/// [`MAX_ROLES_SUMMARY_LINE_CHARS`]).
+fn cap_summary_line(line: String) -> String {
+    if line.chars().count() <= MAX_ROLES_SUMMARY_LINE_CHARS {
+        return line;
+    }
+    let capped: String = line.chars().take(MAX_ROLES_SUMMARY_LINE_CHARS).collect();
+    format!("{capped}… [truncated]")
+}
+
 /// Assess the role-tick section: only *persistent* failures surface; transient
 /// (self-recovered) ones are reported as a count so they are visible without
 /// being alarming.
@@ -1161,19 +1230,22 @@ pub fn assess_roles(inputs: &HealthInputs) -> HealthSection {
             .persistent
             .iter()
             .map(|f| {
-                let detail = f.detail.as_deref().unwrap_or("failed");
+                let detail = f
+                    .detail
+                    .as_deref()
+                    .map_or_else(|| "failed".to_string(), summary_detail);
                 format!("{} ({} ticks, {detail})", f.label(), f.failures)
             })
             .collect();
         (
             Verdict::Degraded,
-            format!(
+            cap_summary_line(format!(
                 "{}/{} ticks ok; {} PERSISTENT failure(s): {}{escalated_note}{transient_note}",
                 summary.ok,
                 summary.total,
                 summary.persistent.len(),
                 names.join(", ")
-            ),
+            )),
         )
     };
     HealthSection::new(
@@ -2569,7 +2641,8 @@ mod tests {
     // ------- Escalation on N consecutive identical failures (#5023) -------
 
     /// A failure record with an explicit `detail`, for the identical-vs-varying
-    /// tests (the plain `record` helper always uses `"boom"`).
+    /// escalation tests (#5023) and the summary-bounding tests (#5024) — the
+    /// plain `record` helper always uses `"boom"`.
     fn record_detail(role: &str, root: &str, ago_secs: i64, detail: &str) -> RoleTickRecord {
         RoleTickRecord {
             root: PathBuf::from(root),
@@ -2675,6 +2748,89 @@ mod tests {
         // The escalated subset is machine-readable for --json / dashboard
         // consumers (#5022 will export it externally).
         assert_eq!(section.detail["escalated"].as_array().map(Vec::len), Some(1));
+    }
+
+    // -- roles.summary bounding + ANSI cleanup (#5024) ----------------------
+
+    #[test]
+    fn roles_summary_line_stays_bounded_for_an_oversized_ansi_laden_detail() {
+        let mut inputs = healthy_inputs();
+        let noisy = format!("\x1b[31m{}\x1b[0m", "x".repeat(20_000));
+        inputs.status.as_mut().unwrap().role_tick_records =
+            vec![record_detail("curator", "/r/loom", 60, &noisy)];
+
+        let section = assess_roles(&inputs);
+
+        assert_eq!(section.verdict, Verdict::Degraded);
+        assert!(
+            section.summary.chars().count() <= MAX_ROLES_SUMMARY_LINE_CHARS + 100,
+            "summary line was not bounded: {} chars",
+            section.summary.chars().count()
+        );
+        assert!(
+            !section.summary.contains('\u{1b}'),
+            "summary line still contains a raw ANSI escape byte"
+        );
+    }
+
+    #[test]
+    fn roles_summary_line_does_not_multiply_with_many_simultaneous_failures() {
+        // The 2026-08-03 12-repo outage: every repo fails identically with a
+        // large detail. The summary line must stay bounded regardless of how
+        // many `(root, role)` pairs are failing at once.
+        let noisy = format!("\x1b[31m{}\x1b[0m", "boom ".repeat(2000));
+        let mut inputs = healthy_inputs();
+        inputs.status.as_mut().unwrap().role_tick_records = (0..12)
+            .map(|i| record_detail("curator", &format!("/r/repo{i}"), 60, &noisy))
+            .collect();
+
+        let section = assess_roles(&inputs);
+
+        assert_eq!(section.verdict, Verdict::Degraded);
+        assert!(section.summary.contains("12 PERSISTENT failure(s)"));
+        assert!(
+            section.summary.chars().count() <= MAX_ROLES_SUMMARY_LINE_CHARS + 100,
+            "summary line was not bounded across 12 failures: {} chars",
+            section.summary.chars().count()
+        );
+    }
+
+    #[test]
+    fn roles_structured_detail_still_carries_the_capped_cleaned_content() {
+        let mut inputs = healthy_inputs();
+        let noisy = format!("\x1b[31m{}\x1b[0m", "x".repeat(200));
+        inputs.status.as_mut().unwrap().role_tick_records =
+            vec![record_detail("curator", "/r/loom", 60, &noisy)];
+
+        let section = assess_roles(&inputs);
+
+        // The summary line is bounded/short...
+        assert!(section.summary.chars().count() < noisy.chars().count());
+        // ...but the structured `detail` field still carries the (ANSI-clean)
+        // failure content — moved out of the summary line, not dropped.
+        let structured_detail = section.detail["persistent"][0]["detail"]
+            .as_str()
+            .expect("persistent[0].detail should be a string");
+        assert!(structured_detail.contains('x'));
+        assert!(
+            !structured_detail.contains('\u{1b}'),
+            "structured detail should not carry raw ANSI escapes: {structured_detail:?}"
+        );
+    }
+
+    #[test]
+    fn roles_summary_detail_round_trips_short_clean_text_unchanged() {
+        let mut inputs = healthy_inputs();
+        inputs.status.as_mut().unwrap().role_tick_records = vec![record_detail(
+            "curator",
+            "/r/loom",
+            60,
+            "connection refused",
+        )];
+
+        let section = assess_roles(&inputs);
+
+        assert!(section.summary.contains("connection refused"));
     }
 
     // ===================================================================
