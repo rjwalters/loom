@@ -4,6 +4,7 @@
 use anyhow::Result;
 use std::path::Path;
 
+use loom_daemon::restart_verify::{self, RelaunchOutcome, Supervisor};
 use loom_daemon::types::{Request, Response};
 
 use super::common::{query_daemon, resolve_socket_path};
@@ -12,12 +13,18 @@ use super::common::{query_daemon, resolve_socket_path};
 /// primitive). Connects to the running daemon over its Unix socket and sends a
 /// single `RestartDaemon` request.
 ///
-/// When the daemon is supervised (launchd) it replies `DaemonRestart {
-/// scheduled: true }` and then exits 0 for a `KeepAlive:SuccessfulExit`
-/// relaunch — we print the ack and exit 0. When it is unsupervised (nohup /
-/// Linux / `--foreground`) it replies `DaemonRestart { scheduled: false }` and
-/// keeps running — we print the refusal and exit non-zero, so an operator or
-/// Phase 3 can detect that no restart happened rather than assuming it did.
+/// When the daemon is supervised (launchd / systemd) it replies `DaemonRestart
+/// { scheduled: true }` and then exits 0 for a `KeepAlive:SuccessfulExit` /
+/// `Restart=on-success` relaunch — we print the ack and exit 0. When it is
+/// unsupervised (nohup / Linux without a unit / `--foreground`) it replies
+/// `DaemonRestart { scheduled: false }` and keeps running — we print the refusal
+/// and exit non-zero, so an operator or Phase 3 can detect that no restart
+/// happened rather than assuming it did.
+///
+/// Issue #5119 adds two things around that exchange, because the ack alone
+/// proved not to be enough on a busy systemd host: a **pre-restart stale-unit
+/// warning**, and a **post-restart relaunch verification with supervisor
+/// self-heal** ([`verify_relaunch`]).
 pub(crate) async fn handle_restart_command(
     drain: bool,
     timeout: Option<u64>,
@@ -69,6 +76,27 @@ pub(crate) async fn handle_restart_command(
         .await;
     }
 
+    // Issue #5119: capture the supervisor's pre-restart pid BEFORE the request,
+    // so the post-restart poll can tell "relaunched onto a NEW pid" apart from
+    // "the old process never moved". Cheap (one bounded `systemctl show` /
+    // `launchctl print`) and best-effort — `None` never blocks the restart.
+    //
+    // The supervisor is *guessed* locally here only because the ack has not
+    // arrived yet (and this CLI process, an operator's shell, usually has no
+    // `LOOM_DAEMON_SUPERVISOR` of its own); the ack's own `supervisor` field is
+    // the authority for the verification itself.
+    let probe_supervisor = restart_verify::probe_host_supervisor();
+    let pre_restart_pid = probe_supervisor.and_then(restart_verify::pre_restart_pid);
+    if let (Some(sup), Some(_)) = (probe_supervisor, pre_restart_pid) {
+        // #5119: a live unit still on the pre-#4862 `KillMode=control-group` is
+        // exactly what turned the 2026-08-03 roll into a four-minute outage —
+        // say so BEFORE exiting, while the operator can still choose `--drain`.
+        // Gated on a resolved pre-restart pid so a host with no such unit at all
+        // (where `systemctl show` happily reports the *default* KillMode for a
+        // unit that does not exist) can never produce a phantom warning.
+        restart_verify::warn_if_stale_unit(sup);
+    }
+
     match query_daemon(&socket_path, &Request::RestartDaemon).await {
         Ok(Response::DaemonRestart {
             scheduled,
@@ -81,6 +109,7 @@ pub(crate) async fn handle_restart_command(
                     supervisor.as_deref().unwrap_or("unknown")
                 );
                 println!("{message}");
+                verify_relaunch(supervisor.as_deref(), pre_restart_pid).await;
                 Ok(())
             } else {
                 eprintln!("loom-daemon did NOT restart: {message}");
@@ -101,6 +130,66 @@ pub(crate) async fn handle_restart_command(
             eprintln!("Is the daemon running? Start it with:");
             eprintln!("  ./.loom/scripts/cli/loom-daemon-start.sh");
             std::process::exit(1);
+        }
+    }
+}
+
+/// Verify the supervisor actually relaunched the daemon after an accepted
+/// `RestartDaemon`, and self-heal if it did not (Issue #5119).
+///
+/// # Why this does not change the exit code
+///
+/// **`loom-daemon restart`'s exit status means "the running daemon accepted the
+/// request", and two callers already branch on exactly that**:
+/// `loom-daemon-update.sh` treats a non-zero as "the running daemon did NOT
+/// accept the restart request" (its #4118 refused-restart fallback, which
+/// re-renders the plist/unit), and `scripts/loom`'s `loom_cmd_restart` treats
+/// it as "supervised restart unavailable" and falls back to stop-then-start.
+/// Turning an *accepted-but-unverified* restart into a non-zero exit would send
+/// both down a path whose diagnosis is simply wrong.
+///
+/// So the verdict is reported loudly on stderr instead — and, far more
+/// importantly, the **self-heal has already run** by the time it is printed.
+/// `loom-daemon-update.sh` keeps its own richer post-restart verification (it
+/// additionally reports the provisioned commit) and remains the authority on
+/// the update path's exit status; this one exists so every OTHER caller of the
+/// primitive stops being fire-and-forget.
+async fn verify_relaunch(supervisor: Option<&str>, pre_restart_pid: Option<u32>) {
+    if !restart_verify::verification_enabled(
+        std::env::var(restart_verify::VERIFY_ENV).ok().as_deref(),
+    ) {
+        return;
+    }
+    let Some(sup) = supervisor.and_then(Supervisor::parse) else {
+        // A `scheduled: true` ack from a supervisor this build does not know how
+        // to probe. Nothing to verify against — never treat that as a failure.
+        return;
+    };
+    let poll_secs = restart_verify::resolve_secs(
+        std::env::var(restart_verify::POLL_SECS_ENV).ok().as_deref(),
+        restart_verify::DEFAULT_POLL_SECS,
+    );
+    // The poll sleeps for up to poll_secs + recovery_secs (default 45s) and
+    // shells out repeatedly, so it goes on a blocking thread rather than
+    // stalling the runtime worker this CLI is running on.
+    let outcome = match tokio::task::spawn_blocking(move || {
+        restart_verify::verify_and_heal(sup, pre_restart_pid)
+    })
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(e) => RelaunchOutcome::NotRelaunched {
+            detail: format!("the verification task itself failed to complete: {e}"),
+        },
+    };
+    let rendered = outcome.render(sup.as_str(), poll_secs);
+    match outcome {
+        RelaunchOutcome::Relaunched { healed: false, .. } | RelaunchOutcome::Skipped { .. } => {
+            println!("{rendered}");
+        }
+        _ => {
+            eprintln!();
+            eprintln!("{rendered}");
         }
     }
 }

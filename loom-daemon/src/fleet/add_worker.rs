@@ -1014,6 +1014,17 @@ ExecStart=%h/.local/bin/loom-daemon
 # clean EXIT_RESTART (0) relaunches; EXIT_SIGINT (130) / EXIT_SHUTDOWN (143) /
 # a crash all exit non-zero and stay down.
 Restart=on-success
+# KillMode=mixed (#4862) + TimeoutStopSec=20 (#4950): mirrored from the same
+# canonical renderer. Without KillMode=mixed, a clean exit(0) with lingering
+# sweep/role-run children in the cgroup is reclassified Result=timeout (the
+# control-group default SIGKILLs the cgroup only after the FULL TimeoutStopSec),
+# and Restart=on-success does NOT match Result=timeout -- so the relaunch never
+# fires and the worker sits dead. TimeoutStopSec=20 bounds that stop transition
+# well under systemd's 90s default as a fast-failure backstop. Both were missing
+# here until #5119, leaving every fleet worker on the exact unit shape that
+# caused the 2026-08-03 loom-worker-1 outage.
+KillMode=mixed
+TimeoutStopSec=20
 Environment=PATH={systemd_path}
 # Lets detect_supervisor() (ipc.rs) prove this daemon is supervised so
 # `restart --drain` will actually exit for a relaunch instead of refusing.
@@ -2128,6 +2139,40 @@ mod tests {
         assert!(
             step.summary.contains("Restart=on-success"),
             "step summary must match the rendered policy"
+        );
+    }
+
+    /// #5119: `Restart=on-success` is necessary but NOT sufficient — it can only
+    /// fire on `Result=success`. Under the systemd default
+    /// `KillMode=control-group`, a clean exit(0) with lingering sweep/role-run
+    /// children in the unit's cgroup is reclassified `Result=timeout` after the
+    /// full `TimeoutStopSec`, the unit lands in `failed`, and the relaunch never
+    /// happens (the 2026-08-03 loom-worker-1 outage). The canonical renderer
+    /// (`render_systemd_unit()` in loom-daemon-start.sh) has carried
+    /// `KillMode=mixed` since #4862 and `TimeoutStopSec=20` since #4950; the
+    /// fleet-worker template silently did not, so every provisioned worker got
+    /// the broken shape.
+    #[test]
+    fn daemon_unit_carries_the_killmode_and_stop_timeout_fixes() {
+        let config = base_config();
+        let plan = build_plan(&config, &Secrets::default());
+        let step = plan
+            .entries
+            .iter()
+            .find_map(|e| match e {
+                super::super::PlanEntry::Step(s) if s.name == "daemon-unit" => Some(s),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            step.apply.contains("KillMode=mixed"),
+            "fleet worker unit must carry #4862's KillMode=mixed, or Restart=on-success \
+             never fires when the cgroup still holds sweep/role-run children"
+        );
+        assert!(
+            step.apply.contains("TimeoutStopSec=20"),
+            "fleet worker unit must carry #4950's TimeoutStopSec=20 fast-failure backstop \
+             instead of dragging out systemd's 90s default"
         );
     }
 

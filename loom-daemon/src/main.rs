@@ -366,12 +366,15 @@ enum Commands {
 
     /// Deliberately restart the running daemon (Issue #4054 — the supervised
     /// restart primitive). Sends a `RestartDaemon` request over the Unix socket;
-    /// when the daemon is supervised by launchd it exits 0 for a clean
-    /// `KeepAlive:SuccessfulExit` relaunch (a new pid, exactly its start flags,
-    /// in-flight sweeps preserved). On an unsupervised host (nohup / Linux /
-    /// `--foreground`) the daemon refuses and stays running, and this command
-    /// prints the refusal and exits non-zero. This is the primitive #4017 Phase
-    /// 3 will call after a rebuild — it does nothing on its own.
+    /// a supervised daemon exits 0 for a clean relaunch (a new pid, exactly its
+    /// start flags) via launchd `KeepAlive:SuccessfulExit` / systemd
+    /// `Restart=on-success`. **In-flight sweeps survive on launchd only** — on
+    /// systemd they live in the unit's cgroup and the stop job reaps them, so
+    /// use `restart --drain` there to finish in-flight work first (#5119). On an
+    /// unsupervised host (nohup / Linux without a unit / `--foreground`) the
+    /// daemon refuses and stays running, and this command prints the refusal and
+    /// exits non-zero. This is the primitive #4017 Phase 3 will call after a
+    /// rebuild — it does nothing on its own.
     ///
     /// With `--drain` (Issue #4090) the daemon instead stops admitting new work
     /// immediately and waits for every in-flight sweep to finish before

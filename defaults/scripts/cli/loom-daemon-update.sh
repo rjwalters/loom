@@ -2305,7 +2305,12 @@ if [[ "$NO_RESTART" == "true" ]]; then
             echo "'launchctl bootout $LAUNCHD_SERVICE' no longer kills in-flight sweeps on a current build (#5081 — each sweep runs in its own process group and reparents to pid 1), but a hand-run bootout+bootstrap can still race and leave the daemon down (bootout is asynchronous); prefer --relaunch above, which settles/retries/verifies the relaunch safely."
         elif [[ "$DAEMON_MANAGER" == "systemd" ]]; then
             echo "The running (systemd-managed) daemon is still the PRE-update binary. Restart it with:"
-            echo "  $PROVISION_TARGET restart      (graceful: supervised in-place relaunch, in-flight sweeps preserved)"
+            # #5119: NOT "in-flight sweeps preserved" here -- unlike launchd, a
+            # systemd stop job runs over the unit's whole cgroup, so a plain
+            # restart's exit(0) reaps every sweep/role-run child with it. The
+            # drain variant is the one that genuinely preserves them.
+            echo "  $PROVISION_TARGET restart              (supervised in-place relaunch; in-flight sweeps/role runs in the unit cgroup ARE terminated)"
+            echo "  $PROVISION_TARGET restart --drain      (finishes in-flight sweeps FIRST, then relaunches -- the preserving variant)"
             echo "If that binary predates #4267 and refuses the restart, re-render + relaunch under supervision:"
             echo "  loom-daemon-update.sh --relaunch   (preserves the live unit's LOOM_* env; SIGTERMs the daemon so sweep children reparent)"
             echo "Do NOT 'systemctl --user stop $SYSTEMD_UNIT' by hand — stop tears down the whole cgroup and KILLS in-flight sweeps (they are direct children of the unit)."

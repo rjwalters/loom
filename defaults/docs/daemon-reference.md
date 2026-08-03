@@ -4908,8 +4908,9 @@ loom-daemon restart          # send RestartDaemon over the IPC socket
   a fresh read of the on-disk plist file** (see "Changing daemon environment
   variables" immediately below — this is not the widening-safe guarantee it
   sounds like for a hand-edited plist). In-flight sweeps survive (they are
-  independent detached processes the daemon never cancels on shutdown).
-  Observable signature: a **new pid**.
+  independent detached processes the daemon never cancels on shutdown) — **this
+  is true on launchd only**, see "The two supervisors disagree about in-flight
+  work" below. Observable signature: a **new pid**.
 - **Supervision proof:** `loom-daemon-start.sh` bakes `LOOM_DAEMON_SUPERVISOR=launchd`
   into the plist, and the daemon ends its process for a restart **only** when that
   var is present. On an unsupervised host (nohup / Linux / `--foreground`) it
@@ -4920,6 +4921,88 @@ loom-daemon restart          # send RestartDaemon over the IPC socket
   the `exec` (Option 2) and detached-helper (Option 3) alternatives were rejected,
   and the Curator's exit-code-race finding — is in
   `docs/design/supervised-restart-primitive.md`.
+
+#### The two supervisors disagree about in-flight work (#5119)
+
+**"In-flight sweeps survive" is a launchd fact, not a property of the
+primitive.** The same exit-0 means opposite things per supervisor, and the ack
+now says which one you are on:
+
+| | launchd | systemd `--user` |
+|---|---|---|
+| Who owns the daemon's children | nobody — they reparent to pid 1 | the **unit's cgroup** |
+| A plain `restart`'s effect on them | they keep running (orphaned from the registry, but alive) | the stop job **terminates them** |
+| Ack wording | `In-flight sweeps survive by design` | `WARNING: in-flight sweeps and role runs will be TERMINATED …` + the live count + a pointer to `--drain` |
+
+On systemd, `KillMode=mixed` (#4862, in the canonical unit) makes that
+termination an immediate SIGKILL of the leftover cgroup members right after the
+main process exits; an older `KillMode=control-group` unit instead SIGTERMs the
+whole cgroup and SIGKILLs at `TimeoutStopSec`, which additionally sets
+`Result=timeout` — and **`Restart=on-success` does not match `Result=timeout`**,
+so the relaunch never fires and the host is left daemonless in `failed`. That is
+the 2026-08-03 loom-worker-1 outage: three role runs plus a sweep killed, and
+~4 minutes with no dispatch until an operator ran `reset-failed && start`.
+
+Use `loom-daemon restart --drain` (below) whenever in-flight sweeps must
+actually finish. It is the *only* variant that preserves them on both
+supervisors.
+
+#### Post-restart relaunch verification + self-heal (#5119)
+
+`loom-daemon restart` no longer trusts its own ack. After a `scheduled: true`
+reply it:
+
+1. Polls the supervisor's own pid source (`systemctl --user show -p MainPID` /
+   `launchctl print`) for a **new, live** pid — `LOOM_DAEMON_RESTART_POLL_SECS`
+   (default `30`), interval `LOOM_DAEMON_RESTART_POLL_INTERVAL` (default `1`,
+   fractional allowed). A `MainPID=0`, an unchanged pid, or a changed-but-dead
+   pid never counts as a relaunch.
+2. If the supervisor did not relaunch, dumps its status as a diagnostic and
+   self-heals, bounded by `LOOM_DAEMON_RESTART_KICKSTART_POLL_SECS` (default
+   `15`):
+   - **systemd** — only when `ActiveState=failed` is confirmed:
+     `systemctl --user reset-failed <unit> && systemctl --user start <unit>`.
+     Any other state refuses to guess (a unit still `activating`/`deactivating`
+     would be raced by a `start`).
+   - **launchd** — a **plain** `launchctl kickstart <service>`, never `-k`, so a
+     job that *did* relaunch during the poll race window is never killed (#4232).
+3. Prints the verdict: relaunched on its own, RECOVERED by the self-heal, or
+   `RELAUNCH NOT CONFIRMED` (the host may be daemonless, with the manual
+   escalation command).
+
+Before scheduling anything on systemd it also warns when the **live** unit still
+carries `KillMode=control-group` — a plain restart never re-renders the unit
+file, so a host provisioned before #4862 keeps the broken shape indefinitely;
+`loom-daemon-update.sh --relaunch` re-renders it.
+
+**The exit code is deliberately unchanged**: it still means "the running daemon
+accepted the request", because `loom-daemon-update.sh` and `scripts/loom`'s
+`restart` both branch on exactly that (a non-zero sends them down a
+refused-restart path whose diagnosis would be wrong). The verification result is
+reported on stderr — and the self-heal has already run by the time it prints.
+Set `LOOM_DAEMON_RESTART_VERIFY=0` to skip verification entirely;
+`loom-daemon-update.sh` keeps its own richer #4232/#4950 verification and
+remains the authority on the update path's exit status.
+
+**Residual (documented, bounded): an in-cgroup caller cannot self-heal.** The
+verification runs in the *invoking* process. When `loom-daemon restart` is
+invoked from **inside the daemon's own systemd cgroup** (most notably the
+daemon's autonomous self-update loop), systemd's stop job signals that caller
+too, so it may be killed before it can poll or recover. This is not new — the
+identical limit applies to `loom-daemon-update.sh`'s own #4950 self-heal for the
+same reason — and it is covered out-of-band by `loom-daemon-watchdog.sh`, which
+runs from its **own** systemd timer/cgroup and applies the same `reset-failed &&
+start` remediation. An operator-invoked restart (an SSH shell, a fleet script) is
+outside the cgroup and self-heals in-band, which is the case this issue's
+incident actually had.
+
+**Why not `Restart=always`.** It looks like it would fix the `failed`-state trap,
+but it inverts the exit-code contract the whole primitive rests on:
+`EXIT_SHUTDOWN` (143, an explicit "stay down") and `EXIT_SIGINT` (130) would
+start relaunching the daemon an operator deliberately stopped. `Restart=on-success`
+plus `KillMode=mixed` plus this self-heal keeps both properties. Raising
+`TimeoutStopSec` was likewise rejected — it lengthens the outage instead of
+preventing it.
 
 #### Changing daemon environment variables (#4995)
 
@@ -4961,10 +5044,12 @@ Both make launchd re-read the plist file, which a plain `restart` never does.
 
 #### Scheduled drain-and-restart (`--drain`, #4090)
 
-A plain `loom-daemon restart` exits immediately: in-flight sweeps survive the
-process boundary but become **orphans** (absent from the relaunched daemon's
-in-memory registry — see the "sweeps survive, they are not drained" amendment
-above). `--drain` closes that gap by finishing in-flight work *before* rolling:
+A plain `loom-daemon restart` exits immediately: on launchd in-flight sweeps
+survive the process boundary but become **orphans** (absent from the relaunched
+daemon's in-memory registry — see the "sweeps survive, they are not drained"
+amendment above), and on systemd they are **terminated outright** by the unit's
+cgroup-scoped stop job (#5119). `--drain` closes both gaps by finishing
+in-flight work *before* rolling:
 
 ```bash
 loom-daemon restart --drain                       # finish in-flight sweeps, then restart
