@@ -265,6 +265,43 @@ EOF
 assert_deny "Still block gh pr merge in a cat-heredoc captured then eval'd" \
     "$GH_5115_CAT_EVAL_CMD"
 
+# Regression guard (issue #5122 -- capre-gate bypass reported after #5115
+# merged): the `capre` prefix gate (added by #5115 to allow the documented
+# `-m "$(cat <<'EOF' ... EOF)"` idiom) only inspected the text BEFORE the
+# `cat` token -- never what follows the heredoc opener line. So wrapping the
+# SAME bypass shapes above in a flag-captured prefix (`-m "$(cat <<'EOF' |
+# bash ...)"`) slipped straight past the gate and was masked as inert data,
+# even though `cat`'s stdout is still piped into a live shell. The opener
+# line must END immediately after the quoted delimiter to be masked; any
+# suffix -- a pipe, a redirect, anything -- must keep the body visible to
+# the merge-redirect grep.
+GH_5122_FLAG_CAPTURED_PIPE_BASH_CMD='git commit -m "$(cat <<'"'"'EOF'"'"' | bash
+'"$PHRASE_CMD"' 123 --admin
+EOF
+)"'
+assert_deny "Still block gh pr merge in a flag-captured cat-heredoc piped into bash (#5122)" \
+    "$GH_5122_FLAG_CAPTURED_PIPE_BASH_CMD"
+
+# Same class, but the redirect parks the body in a file instead of piping it
+# directly -- a later command on the same line then executes that file. The
+# pipe is not the only live vector; any redirect on the opener line is.
+GH_5122_FLAG_CAPTURED_REDIRECT_FILE_CMD='git commit -m "$(cat <<'"'"'EOF'"'"' 1> /tmp/loom-test-5122.sh
+'"$PHRASE_CMD"' 123 --admin
+EOF
+)" ; bash /tmp/loom-test-5122.sh'
+assert_deny "Still block gh pr merge in a flag-captured cat-heredoc redirected to a file then bash'd (#5122)" \
+    "$GH_5122_FLAG_CAPTURED_REDIRECT_FILE_CMD"
+
+# The `<<-` (dash) heredoc variant (strips leading tabs from the body) must
+# get the same treatment -- the opener-line-suffix check does not special-
+# case the `-` after `<<`.
+GH_5122_FLAG_CAPTURED_DASH_PIPE_BASH_CMD='git commit -m "$(cat <<-'"'"'EOF'"'"' | bash
+'"$PHRASE_CMD"' 123 --admin
+EOF
+)"'
+assert_deny "Still block gh pr merge in a flag-captured cat <<- heredoc piped into bash (#5122)" \
+    "$GH_5122_FLAG_CAPTURED_DASH_PIPE_BASH_CMD"
+
 echo ""
 
 # =========================================================================
