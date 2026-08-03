@@ -88,11 +88,13 @@ async fn collect(window: Duration) -> HealthReport {
     //    the same rule `status`'s client-side token probe follows.
     let (ranking_present, ranking_age_secs) = probe_ranking(status.as_ref());
 
-    // 4. The forge fan-out for queue depth + throughput. Only the two metrics
-    //    those sections need (#4761's `PipelineMetrics::HEALTH`), over the
-    //    requested window, across the roots the daemon reported. Skipped
-    //    entirely when the daemon is unreachable: without its root list there
-    //    is nothing to query, and the sections honestly report "not collected".
+    // 4. The forge fan-out for queue depth + review pipeline + throughput.
+    //    Only the metrics those sections actually read (#4761's
+    //    `PipelineMetrics::HEALTH`, widened by #5021 to carry the review-side
+    //    axes the `queues` verdict now consumes), over the requested window,
+    //    across the roots the daemon reported. Skipped entirely when the daemon
+    //    is unreachable: without its root list there is nothing to query, and
+    //    the sections honestly report "not collected".
     let pipeline = match &status {
         Some(report) => {
             let roots = report

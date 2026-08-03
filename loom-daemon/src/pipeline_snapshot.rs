@@ -134,15 +134,23 @@ impl PipelineMetrics {
         merged: true,
     };
 
-    /// The two metrics `loom-daemon health` needs: queue depth and merge
-    /// throughput. Two `gh` calls per repo instead of six keeps the one-shot
-    /// health command inside its "< 5s typical" budget on a multi-repo fleet.
+    /// The metrics `loom-daemon health` needs: queue depth, the three
+    /// review-side axes, and merge throughput.
+    ///
+    /// `building` stays masked off — no health section reads it — so this is
+    /// five `gh` calls per repo rather than six. The three review axes were
+    /// masked off too until Issue #5021, which is *why* the `queues` section
+    /// could not see a Judge outage: the fields it needed were never fetched
+    /// on the CLI path. The extra calls are the cost of that visibility, and
+    /// they fan out per repo in parallel
+    /// ([`collect_pipeline_snapshots`]), so the wall-clock cost is three extra
+    /// sequential `gh` calls total, not three per repo.
     pub const HEALTH: Self = Self {
         queued: true,
         building: false,
-        review_requested: false,
-        changes_requested: false,
-        approved: false,
+        review_requested: true,
+        changes_requested: true,
+        approved: true,
         merged: true,
     };
 }
@@ -714,11 +722,14 @@ esac
         assert_eq!(source.merge_window, chrono::Duration::hours(24));
     }
 
-    /// The #4761 cost control: the HEALTH mask must issue exactly the two `gh`
-    /// calls it needs, not all six — the whole reason the mask exists.
+    /// The #4761 cost control, as widened by #5021: the HEALTH mask must issue
+    /// exactly the five `gh` calls the health sections read — queue depth, the
+    /// three review-side axes, and merge throughput — and must still skip
+    /// `building`, which no section consumes. The mask exists to keep the
+    /// one-shot command off the metrics nothing reads, not to be `ALL`.
     #[test]
     #[serial]
-    fn health_metrics_mask_fetches_only_queued_and_merged() {
+    fn health_metrics_mask_fetches_every_axis_the_sections_read_but_not_building() {
         let tmp = tempfile::tempdir().unwrap();
         let calls = tmp.path().join("calls.log");
         let gh = write_fake_gh(
@@ -733,15 +744,17 @@ esac
 
         assert_eq!(snap.queued, Some(1));
         assert_eq!(snap.merged_24h, Some(1));
-        assert_eq!(snap.building, None);
-        assert_eq!(snap.review_requested, None);
-        assert_eq!(snap.changes_requested, None);
-        assert_eq!(snap.approved, None);
+        assert_eq!(snap.review_requested, Some(1), "#5021: the review axis must be fetched");
+        assert_eq!(snap.changes_requested, Some(1));
+        assert_eq!(snap.approved, Some(1));
+        assert_eq!(snap.building, None, "no health section reads `building`");
         assert!(snap.is_complete());
 
         let log = std::fs::read_to_string(&calls).unwrap();
-        assert_eq!(log.lines().count(), 2, "exactly two gh calls, got:\n{log}");
+        assert_eq!(log.lines().count(), 5, "exactly five gh calls, got:\n{log}");
         assert!(log.contains("loom:issue"));
+        assert!(log.contains("loom:review-requested"));
+        assert!(log.contains("loom:changes-requested"));
         assert!(log.contains("--state merged"));
         assert!(!log.contains("loom:building"));
     }

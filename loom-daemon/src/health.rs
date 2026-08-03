@@ -117,6 +117,24 @@ pub const WORK_FINDER_TICK_GRACE_INTERVALS: u64 = 2;
 /// it as "cannot compare" instead of as a real commit that never matches.
 const UNKNOWN_BUILD_COMMIT: &str = "unknown";
 
+/// How many open `loom:review-requested` PRs a repo must be carrying before a
+/// **zero-merge** window is read as a *review stall* rather than a quiet
+/// moment (Issue #5021).
+///
+/// The pair of conditions is the point. Either alone is ordinary: a repo can
+/// hold a few PRs awaiting review while Judge works through them, and an idle
+/// window legitimately merges nothing (which is exactly why
+/// [`assess_throughput`] treats zero merges as green). What is *not* ordinary
+/// is a review queue this deep with nothing coming out the far end — the
+/// direct, cause-agnostic observation of "review is not happening" that the
+/// 2026-08-03 fleet-wide Judge outage produced on every repo and that the
+/// `queued`-only assessment reported as green all day.
+///
+/// Three is the smallest backlog that cannot be explained by a single burst:
+/// one Builder wave lands one or two PRs per repo, so a third simultaneously
+/// unreviewed PR means at least one earlier PR was not picked up.
+pub const REVIEW_STALL_MIN_BACKLOG: usize = 3;
+
 // ============================================================================
 // Verdicts
 // ============================================================================
@@ -1072,9 +1090,56 @@ pub fn assess_roles(inputs: &HealthInputs) -> HealthSection {
     )
 }
 
+/// Add one optionally-observed count into a running total, **without** ever
+/// inventing a zero.
+///
+/// `None` on the input means "this metric was not observed for this repo" —
+/// the forge query failed, or the caller masked the metric off
+/// ([`crate::pipeline_snapshot::PipelineMetrics`]). Either way it must not be
+/// folded in as `0`, or an unobserved review queue would report as an empty
+/// one: the precise misreading Issue #5021 exists to prevent. The accumulator
+/// therefore stays `None` until at least one repo actually reports, and from
+/// then on sums only the repos that did.
+fn accumulate_observed(total: &mut Option<usize>, observed: Option<usize>) {
+    if let Some(n) = observed {
+        *total = Some(total.unwrap_or(0) + n);
+    }
+}
+
+/// Whether this repo's review pipeline looks *stalled*: at least
+/// [`REVIEW_STALL_MIN_BACKLOG`] PRs sitting in `loom:review-requested` while
+/// the window merged nothing at all.
+///
+/// Both inputs must be *observed* (`Some`) — an unobserved axis yields `false`
+/// ("cannot tell"), never a stall verdict and never a clean bill of health;
+/// the enclosing section reports the unobserved axis as `null`/`?` so the gap
+/// is visible rather than silently resolved either way.
+fn is_review_stalled(snap: &RepoPipelineSnapshot) -> bool {
+    matches!(
+        (snap.review_requested, snap.merged_24h),
+        (Some(backlog), Some(0)) if backlog >= REVIEW_STALL_MIN_BACKLOG
+    )
+}
+
 /// Assess the queue-depth section: per-root ready (dispatchable `loom:issue`,
 /// excluding park-labeled rows — see [`crate::pipeline_snapshot::RepoPipelineSnapshot::queued`])
-/// counts.
+/// counts, **plus** the review-side axes (`review_requested`,
+/// `changes_requested`, `approved`) that the same snapshot already carries.
+///
+/// The review axes are reported for their own sake and are also the input to a
+/// per-repo *review stall* check ([`is_review_stalled`]): a deep
+/// `loom:review-requested` backlog against a window that merged nothing is a
+/// direct, cause-agnostic observation that review is not happening. Before
+/// Issue #5021 those three fields were collected and discarded, so a fleet-wide
+/// Judge outage — which by construction moves `review_requested` and leaves
+/// `queued` untouched — read green here all day.
+///
+/// Verdict precedence when both a stall and a failed forge query are present:
+/// **stall wins** (`Degraded` over `Unknown`). Both are non-green and share an
+/// exit code, but a stall is a *known, actionable finding*, and burying it
+/// under the `Unknown` a single flaky `gh` call produces is the same masking
+/// this check exists to remove. The failed repos are still named in the
+/// summary either way.
 #[must_use]
 pub fn assess_queues(inputs: &HealthInputs) -> HealthSection {
     let Some(pipeline) = &inputs.pipeline else {
@@ -1092,6 +1157,10 @@ pub fn assess_queues(inputs: &HealthInputs) -> HealthSection {
     let mut parts: Vec<String> = Vec::with_capacity(pipeline.len());
     let mut total = 0_usize;
     let mut failed: Vec<String> = Vec::new();
+    let mut review_requested: Option<usize> = None;
+    let mut changes_requested: Option<usize> = None;
+    let mut approved: Option<usize> = None;
+    let mut stalled: Vec<String> = Vec::new();
     for snap in pipeline {
         let name = repo_label(&snap.root);
         match snap.queued {
@@ -1101,37 +1170,94 @@ pub fn assess_queues(inputs: &HealthInputs) -> HealthSection {
             }
             None => {
                 parts.push(format!("{name} ?"));
-                failed.push(name);
+                failed.push(name.clone());
             }
         }
+        accumulate_observed(&mut review_requested, snap.review_requested);
+        accumulate_observed(&mut changes_requested, snap.changes_requested);
+        accumulate_observed(&mut approved, snap.approved);
+        if is_review_stalled(snap) {
+            stalled.push(format!(
+                "{name} ({} awaiting review, 0 merged)",
+                snap.review_requested.unwrap_or(0)
+            ));
+        }
     }
-    let (verdict, summary) = if failed.is_empty() {
-        (
-            Verdict::Green,
-            format!("{total} ready across {} repo(s) ({})", pipeline.len(), parts.join(", ")),
-        )
-    } else {
-        (
-            Verdict::Unknown,
-            format!(
-                "{total}+ ready across {} repo(s) ({}); forge query FAILED for: {}",
-                pipeline.len(),
-                parts.join(", "),
-                failed.join(", ")
-            ),
-        )
+
+    // The review clause is appended only for axes some repo actually reported,
+    // so a caller that masked them off (or a total forge failure) renders the
+    // historical `queued`-only line instead of a fabricated "0 awaiting review".
+    let review_clause = {
+        let mut axes: Vec<String> = Vec::with_capacity(3);
+        if let Some(n) = review_requested {
+            axes.push(format!("{n} awaiting review"));
+        }
+        if let Some(n) = changes_requested {
+            axes.push(format!("{n} changes-requested"));
+        }
+        if let Some(n) = approved {
+            axes.push(format!("{n} approved"));
+        }
+        if axes.is_empty() {
+            String::new()
+        } else {
+            format!("; {}", axes.join(", "))
+        }
     };
+    let stall_clause = if stalled.is_empty() {
+        String::new()
+    } else {
+        format!("; REVIEW STALLED: {}", stalled.join(", "))
+    };
+    let failed_clause = if failed.is_empty() {
+        String::new()
+    } else {
+        format!("; forge query FAILED for: {}", failed.join(", "))
+    };
+
+    let verdict = if !stalled.is_empty() {
+        Verdict::Degraded
+    } else if failed.is_empty() {
+        Verdict::Green
+    } else {
+        Verdict::Unknown
+    };
+    let ready_prefix = if failed.is_empty() {
+        format!("{total} ready")
+    } else {
+        format!("{total}+ ready")
+    };
+    let summary = format!(
+        "{ready_prefix} across {} repo(s) ({}){review_clause}{stall_clause}{failed_clause}",
+        pipeline.len(),
+        parts.join(", ")
+    );
+
     HealthSection::new(
         "queues",
         verdict,
         summary,
         serde_json::json!({
             "total_ready": total,
+            "total_review_requested": review_requested,
+            "total_changes_requested": changes_requested,
+            "total_approved": approved,
+            "review_stall_min_backlog": REVIEW_STALL_MIN_BACKLOG,
+            "review_stalled": pipeline
+                .iter()
+                .filter(|s| is_review_stalled(s))
+                .map(|s| repo_label(&s.root))
+                .collect::<Vec<_>>(),
             "repos": pipeline
                 .iter()
                 .map(|s| serde_json::json!({
                     "root": s.root,
                     "ready": s.queued,
+                    "review_requested": s.review_requested,
+                    "changes_requested": s.changes_requested,
+                    "approved": s.approved,
+                    "merged": s.merged_24h,
+                    "review_stalled": is_review_stalled(s),
                     "error": s.error,
                 }))
                 .collect::<Vec<_>>(),
@@ -2386,6 +2512,176 @@ mod tests {
         }]);
         let section = assess_queues(&inputs);
         assert_eq!(section.verdict, Verdict::Unknown);
+        assert_eq!(assess(&inputs).exit_code(), EXIT_DEGRADED);
+    }
+
+    // ===================================================================
+    // Queues: the review-side axes (#5021)
+    // ===================================================================
+
+    /// One repo's snapshot with every axis observed — the fixture the review
+    /// tests vary a single field of.
+    fn review_snapshot(
+        name: &str,
+        queued: usize,
+        review_requested: usize,
+        merged: usize,
+    ) -> RepoPipelineSnapshot {
+        RepoPipelineSnapshot {
+            root: PathBuf::from(format!("/r/{name}")),
+            queued: Some(queued),
+            review_requested: Some(review_requested),
+            changes_requested: Some(0),
+            approved: Some(0),
+            merged_24h: Some(merged),
+            ..Default::default()
+        }
+    }
+
+    /// AC1: the section reports the three review-side axes, not just `queued`.
+    #[test]
+    fn queues_report_the_review_side_axes_per_repo() {
+        let mut inputs = healthy_inputs();
+        inputs.pipeline = Some(vec![RepoPipelineSnapshot {
+            root: PathBuf::from("/r/loom"),
+            queued: Some(1),
+            review_requested: Some(2),
+            changes_requested: Some(1),
+            approved: Some(3),
+            merged_24h: Some(5),
+            ..Default::default()
+        }]);
+        let section = assess_queues(&inputs);
+
+        assert_eq!(section.verdict, Verdict::Green);
+        assert!(section.summary.contains("2 awaiting review"), "{}", section.summary);
+        assert!(section.summary.contains("1 changes-requested"), "{}", section.summary);
+        assert!(section.summary.contains("3 approved"), "{}", section.summary);
+
+        assert_eq!(section.detail["total_review_requested"], serde_json::json!(2));
+        assert_eq!(section.detail["total_changes_requested"], serde_json::json!(1));
+        assert_eq!(section.detail["total_approved"], serde_json::json!(3));
+        let repo = &section.detail["repos"][0];
+        assert_eq!(repo["review_requested"], serde_json::json!(2));
+        assert_eq!(repo["changes_requested"], serde_json::json!(1));
+        assert_eq!(repo["approved"], serde_json::json!(3));
+        assert_eq!(repo["review_stalled"], serde_json::json!(false));
+    }
+
+    /// AC2: a review backlog against a window that merged nothing is non-green
+    /// — the 2026-08-03 Judge-outage shape, reported without knowing the cause.
+    #[test]
+    fn a_review_backlog_with_no_merges_is_degraded() {
+        let mut inputs = healthy_inputs();
+        inputs.pipeline = Some(vec![review_snapshot("loom", 1, REVIEW_STALL_MIN_BACKLOG, 0)]);
+        let section = assess_queues(&inputs);
+
+        assert_eq!(section.verdict, Verdict::Degraded);
+        assert!(section.summary.contains("REVIEW STALLED"), "{}", section.summary);
+        assert!(section.summary.contains("loom"), "{}", section.summary);
+        assert_eq!(section.detail["review_stalled"], serde_json::json!(["loom"]));
+        assert_eq!(assess(&inputs).exit_code(), EXIT_DEGRADED);
+    }
+
+    /// AC3 (the inverse): a flowing review pipeline stays green even with the
+    /// same backlog depth — the merge axis is what distinguishes them.
+    #[test]
+    fn a_review_backlog_that_is_still_merging_stays_green() {
+        let mut inputs = healthy_inputs();
+        inputs.pipeline = Some(vec![review_snapshot("loom", 1, REVIEW_STALL_MIN_BACKLOG + 5, 2)]);
+        let section = assess_queues(&inputs);
+
+        assert_eq!(section.verdict, Verdict::Green);
+        assert!(!section.summary.contains("REVIEW STALLED"), "{}", section.summary);
+    }
+
+    /// A shallow backlog in a quiet window is *not* a stall — the same
+    /// cry-wolf rule `assess_throughput` follows for a zero-merge window.
+    #[test]
+    fn a_shallow_review_backlog_in_a_quiet_window_stays_green() {
+        let mut inputs = healthy_inputs();
+        inputs.pipeline = Some(vec![review_snapshot("loom", 1, REVIEW_STALL_MIN_BACKLOG - 1, 0)]);
+        assert_eq!(assess_queues(&inputs).verdict, Verdict::Green);
+    }
+
+    /// Edge case: unobserved review axes must not be read as "zero backlog" —
+    /// they render as `null`, never `0`, and cannot produce a stall verdict.
+    #[test]
+    fn unobserved_review_axes_are_null_not_zero() {
+        let mut inputs = healthy_inputs();
+        inputs.pipeline = Some(vec![RepoPipelineSnapshot {
+            root: PathBuf::from("/r/loom"),
+            queued: Some(1),
+            merged_24h: Some(0),
+            ..Default::default()
+        }]);
+        let section = assess_queues(&inputs);
+
+        assert_eq!(section.verdict, Verdict::Green);
+        assert_eq!(section.detail["total_review_requested"], serde_json::Value::Null);
+        assert_eq!(section.detail["total_changes_requested"], serde_json::Value::Null);
+        assert_eq!(section.detail["total_approved"], serde_json::Value::Null);
+        assert!(
+            !section.summary.contains("awaiting review"),
+            "an unobserved axis must not be summarized at all: {}",
+            section.summary
+        );
+    }
+
+    /// Edge case: a repo with **zero** ready issues but a stalled review queue
+    /// must still be caught — the all-repos-summed `total_ready` says 0 across
+    /// the fleet, which is exactly the "looks idle, is broken" masking #5004
+    /// reported.
+    #[test]
+    fn an_empty_ready_queue_does_not_mask_a_review_stall() {
+        let mut inputs = healthy_inputs();
+        inputs.pipeline = Some(vec![
+            review_snapshot("anvil", 0, 0, 0),
+            review_snapshot("loom", 0, REVIEW_STALL_MIN_BACKLOG, 0),
+        ]);
+        let section = assess_queues(&inputs);
+
+        assert_eq!(section.detail["total_ready"], serde_json::json!(0));
+        assert_eq!(section.verdict, Verdict::Degraded);
+        assert_eq!(section.detail["review_stalled"], serde_json::json!(["loom"]));
+    }
+
+    /// A stall is a *known* finding and outranks the `Unknown` a single flaky
+    /// forge query produces — but the failed repo is still named.
+    #[test]
+    fn a_review_stall_outranks_a_failed_query_but_still_names_it() {
+        let mut inputs = healthy_inputs();
+        inputs.pipeline = Some(vec![
+            RepoPipelineSnapshot {
+                root: PathBuf::from("/r/anvil"),
+                queued: None,
+                error: Some("rate limited".to_string()),
+                ..Default::default()
+            },
+            review_snapshot("loom", 2, REVIEW_STALL_MIN_BACKLOG, 0),
+        ]);
+        let section = assess_queues(&inputs);
+
+        assert_eq!(section.verdict, Verdict::Degraded);
+        assert!(section.summary.contains("REVIEW STALLED"), "{}", section.summary);
+        assert!(section.summary.contains("forge query FAILED for: anvil"), "{}", section.summary);
+    }
+
+    /// The whole-fleet shape of the 2026-08-03 outage: every repo idle on the
+    /// `queued` axis, nothing merging, PRs piling up awaiting review. The
+    /// pre-#5021 assessment reported this green.
+    #[test]
+    fn a_fleet_wide_judge_outage_is_not_green() {
+        let mut inputs = healthy_inputs();
+        inputs.pipeline = Some(
+            (0..12)
+                .map(|i| review_snapshot(&format!("repo{i}"), 0, 4, 0))
+                .collect(),
+        );
+        let section = assess_queues(&inputs);
+
+        assert_ne!(section.verdict, Verdict::Green);
+        assert_eq!(section.detail["total_review_requested"], serde_json::json!(48));
         assert_eq!(assess(&inputs).exit_code(), EXIT_DEGRADED);
     }
 
