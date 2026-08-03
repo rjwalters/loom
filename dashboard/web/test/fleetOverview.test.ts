@@ -162,6 +162,43 @@ describe("hostCard", () => {
     expect(idle.querySelector('[data-testid="card-sweeps"]')).toBeNull();
   });
 
+  // #4976: the "Repositories" section, below "Active sweeps".
+  it("lists the host's managed repositories, with an in-flight count for the busy one", () => {
+    const card = hostCard(findHost(view(), HEALTHY_HOST_ID)!, NOW);
+    expect(fieldValue(card, "Repositories")).toBe("3");
+    const repoRows = [...card.querySelectorAll(".card__repo")];
+    expect(repoRows).toHaveLength(3);
+    // Both live sweeps target "rjwalters/loom" — its row must show ×2.
+    const loomRow = repoRows.find((row) => row.textContent?.includes("rjwalters/loom"));
+    expect(loomRow?.querySelector(".chip")?.textContent).toBe("×2");
+    // The two idle, registered-but-never-dispatched-into repos still appear
+    // — an idle repo is not the same as an unregistered one (#4976's whole
+    // point) — but carry no in-flight chip.
+    const idleRow = repoRows.find((row) => row.textContent?.includes("2AMLogic/gf180-pll"));
+    expect(idleRow?.querySelector(".chip")).toBeNull();
+  });
+
+  it("says 'none' for a host with no registered repos", () => {
+    const card = hostCard(findHost(view(), DEGRADED_HOST_ID)!, NOW);
+    expect(fieldValue(card, "Repositories")).toBe("none");
+    expect(card.querySelector('[data-testid="card-repos"]')).toBeNull();
+  });
+
+  it("collapses a private, redacted repo entry to a count instead of naming it", () => {
+    // IDLE_HOST_ID's fixture stands in for the unauthenticated, redacted wire
+    // shape: two `managed_repos` entries carry `visibility: "private"` with
+    // no `slug` at all (`dashboard/src/redaction.ts`'s `redactManagedRepos`).
+    const card = hostCard(findHost(view(), IDLE_HOST_ID)!, NOW);
+    expect(fieldValue(card, "Repositories")).toBe("3");
+    const repoRows = [...card.querySelectorAll(".card__repo")];
+    // One named public repo, plus ONE collapsed "+2 private" row — not two
+    // separate unnamed rows.
+    expect(repoRows).toHaveLength(2);
+    expect(repoRows.some((row) => row.textContent?.includes("rjwalters/loom"))).toBe(true);
+    const privateRow = card.querySelector(".card__repo--private");
+    expect(privateRow?.textContent).toContain("2 private");
+  });
+
   // #4868: the card used to stop at three and append "+N more", which on a
   // working fleet hid most of what the overview exists to show.
   it("renders every in-flight sweep rather than truncating", () => {

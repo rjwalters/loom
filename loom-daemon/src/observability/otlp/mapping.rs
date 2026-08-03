@@ -590,6 +590,7 @@ mod tests {
                 active_sweep_ids: Vec::new(),
                 dispatch_halted: false,
                 halt_reason: None,
+                managed_repos: Vec::new(),
             }),
         )
     }
@@ -801,6 +802,7 @@ mod tests {
             active_sweep_ids: Vec::new(),
             dispatch_halted: false,
             halt_reason: None,
+            managed_repos: Vec::new(),
         };
         let batch = vec![envelope(
             "host-c",

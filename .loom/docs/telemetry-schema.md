@@ -266,7 +266,11 @@ probe stays absent rather than being coerced to a fake zero (the daemon's
   "cpu_idle_fraction": 0.83,
   "load_per_core": 0.51,
   "worktree_root_free_gb": 200,
-  "dispatch_halted": false
+  "dispatch_halted": false,
+  "managed_repos": [
+    { "slug": "rjwalters/loom", "visibility": "public" },
+    { "slug": "2AMLogic/gf180-pll", "visibility": "private" }
+  ]
 }
 ```
 
@@ -318,6 +322,31 @@ Both fields are additive and pass through public redaction unchanged (they
 describe the released binary, not any repo or operator — see
 `dashboard/src/redaction.ts`), so an older consumer that ignores unknown keys is
 unaffected.
+
+**`managed_repos` (#4976, redaction class: per-entry, public-visible slug
+only).** This host's managed-repository roster — every workspace root the
+daemon's workspace registry currently tracks, resolved to its forge
+`owner/repo` slug and a [`RepoVisibility`](#repovisibility-contract--private-by-default)
+tag derived exactly the way a sweep record's own `visibility` is derived
+(`visibility::derive_visibility`). Sourced from the registry itself, **not**
+inferred from `active_sweep_ids` — a registered-but-idle repo (no sweep ever
+dispatched into it this run) still appears, which is the whole point: it lets
+the dashboard show a host's quiet as "roster-shaped" (nothing ready in any of
+its registered repos) rather than as an unexplained gap.
+
+- Omitted entirely (`#[serde(default, skip_serializing_if = "Vec::is_empty")]`)
+  when the host has no registered workspaces, or on a record from a pre-#4976
+  daemon — an older/partial record decodes with an empty roster rather than
+  failing.
+- **Unlike every other field in this record, `managed_repos` does NOT pass
+  through public redaction unchanged.** Each entry names a specific
+  repository, so the anti-leak contract applies per entry, not to the whole
+  record: a `public`-visibility entry's `slug` survives to the public
+  (unauthenticated) view; a `private` entry's `slug` is dropped but the entry
+  itself is kept, so the roster's size — and therefore "how many are private"
+  — stays visible without naming any of them (`dashboard/src/redaction.ts`'s
+  `redactManagedRepos`). The authenticated view always sees every entry in
+  full, including private slugs.
 
 ## Persistence & read surface (`sweep.outcome`, Issue #4704)
 

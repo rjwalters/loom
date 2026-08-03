@@ -25,6 +25,17 @@
  *    from the schema doc's `host.health` / `tokens.snapshot` sections.
  */
 
+/** One repository in a host's `managed_repos` roster (#4976). `slug` is
+ * present for a public repo, or a private one on the authenticated view; the
+ * public (unauthenticated) view drops `slug` for a private entry — the
+ * backend's redaction keeps the entry (so its count still shows) but strips
+ * the identifying field, mirroring `PublicActiveSweep`'s repo-nulling for a
+ * private sweep (`dashboard/src/redaction.ts`). */
+export interface ManagedRepoEntry {
+  slug?: string;
+  visibility?: "public" | "private";
+}
+
 /** `host.health` — CPU/disk headroom, daemon version, uptime.
  *
  * Every measured field is optional by design: the daemon's "unknown != zero"
@@ -58,6 +69,11 @@ export interface HostHealthRecord {
    * sustained for 3 consecutive tick(s)"`), naming the specific breaker/gate
    * that tripped. Absent when `dispatch_halted` is absent/`false`. */
   halt_reason?: string;
+  /** This host's managed-repository roster (#4976) — sourced from the
+   * daemon's workspace registry, not inferred from in-flight sweeps, so an
+   * idle-but-registered repo still appears. Absent entirely on a host
+   * running a pre-#4976 daemon, or one with no registered workspaces. */
+  managed_repos?: ManagedRepoEntry[];
 }
 
 /** One account inside a `tokens.snapshot`. Only `exhausted` is always sent;

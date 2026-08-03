@@ -22,6 +22,7 @@ import type {
   FleetSnapshot,
   HostEntry,
   HostHealthRecord,
+  ManagedRepoEntry,
   TokenAccount,
   TokensSnapshotRecord,
   Timestamped,
@@ -45,6 +46,20 @@ function bool(value: unknown): boolean | undefined {
   return typeof value === "boolean" ? value : undefined;
 }
 
+/** A `managed_repos` entry. `slug` is dropped by `stripUndefined` when
+ * wrong-typed, or when the backend has already redacted it away (a private
+ * repo, unauthenticated viewer) — see `ManagedRepoEntry`'s doc.
+ * `visibility` always defaults to `"private"` on anything but the exact
+ * string `"public"` — the same fail-safe-default `ActiveSweep.visibility`
+ * already applies, never left `undefined`. */
+export function parseManagedRepoEntry(value: unknown): ManagedRepoEntry | undefined {
+  if (!isObject(value)) return undefined;
+  return stripUndefined<ManagedRepoEntry>({
+    slug: str(value.slug),
+    visibility: value.visibility === "public" ? "public" : "private",
+  });
+}
+
 export function parseHostHealth(value: unknown): HostHealthRecord {
   if (!isObject(value)) return {};
   return stripUndefined<HostHealthRecord>({
@@ -60,6 +75,9 @@ export function parseHostHealth(value: unknown): HostHealthRecord {
     worktree_root_free_gb: num(value.worktree_root_free_gb),
     dispatch_halted: bool(value.dispatch_halted),
     halt_reason: str(value.halt_reason),
+    managed_repos: Array.isArray(value.managed_repos)
+      ? value.managed_repos.map(parseManagedRepoEntry).filter((entry): entry is ManagedRepoEntry => entry !== undefined)
+      : undefined,
   });
 }
 

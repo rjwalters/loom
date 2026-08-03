@@ -309,6 +309,26 @@ a:hover {
   font-size: 12px;
   margin-left: auto;
 }
+.card__repos {
+  list-style: none;
+  margin: 10px 0 0;
+  padding: 10px 0 0;
+  border-top: 1px solid var(--border);
+}
+.card__repo {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 0;
+  font-size: 13px;
+}
+.card__repo-label {
+  font-variant-numeric: tabular-nums;
+}
+.card__repo--private {
+  color: var(--text-dim);
+  font-style: italic;
+}
 
 /* ---- badges + chips ------------------------------------------------------ */
 

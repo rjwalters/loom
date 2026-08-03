@@ -23,7 +23,7 @@ import {
   formatCount,
 } from "../format";
 import type { FleetView, HostStatus, HostView } from "../fleet";
-import type { HostHealthRecord } from "../types";
+import type { HostHealthRecord, ManagedRepoEntry } from "../types";
 import { emptyFleetView } from "./states";
 
 const STATUS_LABEL: Record<HostStatus, string> = {
@@ -117,8 +117,36 @@ export function healthFields(host: HostView, now: Date = new Date()): DocumentFr
   return fragment;
 }
 
+/** This host's managed-repository roster (#4976), or `[]` when the host has
+ * not reported one yet (a pre-#4976 daemon, or no registered workspaces). */
+function managedRepos(host: HostView): ManagedRepoEntry[] {
+  return host.entry.health?.record.managed_repos ?? [];
+}
+
+/** How many of `host.sweeps` are in flight against each named repo — the
+ * card's existing sweep list already carries a repo slug per entry (#4868),
+ * so the roster section's per-repo counts are grouped from it rather than
+ * plumbing a second, redundant count through `host.health`. */
+function sweepCountsByRepo(host: HostView): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const sweep of host.sweeps) {
+    if (!sweep.repo) continue;
+    counts.set(sweep.repo, (counts.get(sweep.repo) ?? 0) + 1);
+  }
+  return counts;
+}
+
 export function hostCard(host: HostView, now: Date = new Date()): HTMLElement {
   const sweepCount = host.sweeps.length;
+  const repos = managedRepos(host);
+  const repoCount = repos.length;
+  const sweepCounts = sweepCountsByRepo(host);
+  // A repo whose `slug` was stripped by the public-view redaction (a private
+  // repo, unauthenticated viewer — `dashboard/src/redaction.ts`) collapses
+  // into one trailing "+N private" row rather than N rows that each say
+  // nothing but "private" (Issue #4976's anti-leak contract).
+  const namedRepos = repos.filter((repo): repo is ManagedRepoEntry & { slug: string } => Boolean(repo.slug));
+  const hiddenPrivateCount = repoCount - namedRepos.length;
   return el(
     "article",
     { class: `card card--${host.status}`, data: { testid: "host-card", host: host.hostId } },
@@ -151,6 +179,11 @@ export function hostCard(host: HostView, now: Date = new Date()): HTMLElement {
         sweepCount === 0 ? "none" : String(sweepCount),
         "Sweeps currently in flight on this host",
       ),
+      field(
+        "Repositories",
+        repoCount === 0 ? "none" : String(repoCount),
+        "Repositories this host's daemon manages (its workspace registry, whether idle or busy)",
+      ),
     ),
     sweepCount > 0
       ? el(
@@ -173,6 +206,31 @@ export function hostCard(host: HostView, now: Date = new Date()): HTMLElement {
               sweep.repo ? el("span", { class: "card__sweep-repo" }, sweep.repo) : null,
             ),
           ),
+        )
+      : null,
+    repoCount > 0
+      ? el(
+          "ul",
+          { class: "card__repos", data: { testid: "card-repos" } },
+          namedRepos
+            .slice()
+            .sort((a, b) => a.slug.localeCompare(b.slug))
+            .map((repo) => {
+              const count = sweepCounts.get(repo.slug) ?? 0;
+              return el(
+                "li",
+                { class: "card__repo" },
+                el("span", { class: "card__repo-label" }, repo.slug),
+                count > 0 ? el("span", { class: "chip" }, `×${count}`) : null,
+              );
+            }),
+          hiddenPrivateCount > 0
+            ? el(
+                "li",
+                { class: "card__repo card__repo--private" },
+                `+ ${hiddenPrivateCount} private`,
+              )
+            : null,
         )
       : null,
   );
