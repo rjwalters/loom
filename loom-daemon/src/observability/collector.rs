@@ -471,6 +471,13 @@ async fn sample_host_health(
     // `spawn_blocking` per the exact pattern `work_finder`'s dynamic-cap tick
     // already uses.
     let _ = tokio::task::spawn_blocking(crate::cpu_headroom::refresh_cpu_util_cache).await;
+    // The host-distress breaker (#4235) is the daemon's own authoritative
+    // "is this host refusing new work right now" signal — reused rather than
+    // re-derived (#4975). `None` (no work-finder loop ever registered a
+    // breaker on this host) reads as "not known to be halted", matching every
+    // other unmeasurable field's "unknown != zero" contract.
+    let (dispatch_halted, halt_reason) =
+        dispatch_halt_from_breaker(crate::host_breaker::global_snapshot());
     HostHealthRecord {
         captured_at: Utc::now(),
         daemon_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -486,6 +493,29 @@ async fn sample_host_health(
         load_per_core: crate::cpu_headroom::load_per_core(),
         worktree_root_free_gb: crate::disk_headroom::worktree_root_free_gb(workspace_root),
         active_sweep_ids: collect_active_sweep_ids(workspace_pool),
+        dispatch_halted,
+        halt_reason,
+    }
+}
+
+/// Derive `host.health`'s `(dispatch_halted, halt_reason)` pair from a
+/// [`crate::host_breaker::BreakerSnapshot`] (Issue #4975). Pure — takes the
+/// snapshot as a value rather than reading the process-global directly — so
+/// it is unit-testable for both the `Open`/`CoolDown` (halted) and
+/// `Closed`/unregistered (not halted) cases without mutating the one-shot
+/// [`crate::host_breaker::GLOBAL`] handle that every other test in this
+/// binary shares.
+///
+/// `snapshot.suppressed` is already `enabled && phase.suppresses_dispatch()`
+/// (`Open` or `CoolDown`) — reused verbatim rather than re-derived from
+/// `phase` here, so this can never drift from the breaker's own definition of
+/// "refusing work".
+fn dispatch_halt_from_breaker(
+    snapshot: Option<crate::host_breaker::BreakerSnapshot>,
+) -> (bool, Option<String>) {
+    match snapshot {
+        Some(snapshot) if snapshot.suppressed => (true, snapshot.reason),
+        _ => (false, None),
     }
 }
 
@@ -1005,5 +1035,70 @@ mod tests {
         let mut expected = vec![a_sweep_id, b_sweep_id];
         expected.sort();
         assert_eq!(ids, expected, "in-flight sweeps from BOTH provisioned registries are reported");
+    }
+
+    // ------------------------------------------------------------------
+    // dispatch_halt_from_breaker (Issue #4975)
+    // ------------------------------------------------------------------
+    //
+    // Exercised as a pure function over a hand-built `BreakerSnapshot` rather
+    // than through `host_breaker::register_global` — the breaker's `GLOBAL`
+    // handle is a process-wide `OnceLock` shared by every test in this
+    // binary, so mutating it here would leak into unrelated tests.
+
+    fn breaker_snapshot(
+        phase: crate::host_breaker::BreakerPhase,
+        reason: Option<&str>,
+    ) -> crate::host_breaker::BreakerSnapshot {
+        crate::host_breaker::BreakerSnapshot {
+            enabled: true,
+            phase,
+            suppressed: phase.suppresses_dispatch(),
+            reason: reason.map(str::to_string),
+            tripped_at: None,
+            releases_at: None,
+            last_load_per_core: Some(4.24),
+            load_per_core_threshold: 2.5,
+            sustain_ticks: 3,
+            cooldown_secs: 300,
+            consecutive_over: 3,
+        }
+    }
+
+    #[test]
+    fn dispatch_halt_from_breaker_reports_not_halted_when_no_breaker_registered() {
+        assert_eq!(dispatch_halt_from_breaker(None), (false, None));
+    }
+
+    #[test]
+    fn dispatch_halt_from_breaker_reports_not_halted_when_closed() {
+        let snapshot = breaker_snapshot(crate::host_breaker::BreakerPhase::Closed, None);
+        assert_eq!(dispatch_halt_from_breaker(Some(snapshot)), (false, None));
+    }
+
+    #[test]
+    fn dispatch_halt_from_breaker_reports_halted_with_reason_when_open() {
+        let snapshot = breaker_snapshot(
+            crate::host_breaker::BreakerPhase::Open,
+            Some("load-per-core 4.24 >= 2.50 sustained for 3 consecutive tick(s)"),
+        );
+        assert_eq!(
+            dispatch_halt_from_breaker(Some(snapshot)),
+            (
+                true,
+                Some("load-per-core 4.24 >= 2.50 sustained for 3 consecutive tick(s)".to_string())
+            )
+        );
+    }
+
+    #[test]
+    fn dispatch_halt_from_breaker_reports_halted_during_cooldown() {
+        let snapshot = breaker_snapshot(
+            crate::host_breaker::BreakerPhase::CoolDown,
+            Some("load-per-core 1.10 < 2.50; cooling down for 300s"),
+        );
+        let (halted, reason) = dispatch_halt_from_breaker(Some(snapshot));
+        assert!(halted, "CoolDown still suppresses dispatch, so it must count as halted");
+        assert!(reason.is_some());
     }
 }

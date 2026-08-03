@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { buildFleetView, findHost } from "../src/fleet";
 import { parseFleetSnapshot } from "../src/parse";
 import { UNKNOWN } from "../src/format";
-import { daemonIdentityText, fleetOverviewView, hostCard } from "../src/views/fleetOverview";
+import { daemonIdentityText, fleetOverviewView, hostCard, statusBadge } from "../src/views/fleetOverview";
 import {
   DEGRADED_HOST_ID,
   HEALTHY_HOST_ID,
@@ -118,6 +118,35 @@ describe("hostCard", () => {
     expect(badge(DEGRADED_HOST_ID)).toBe("degraded");
     expect(badge(STALE_HOST_ID)).toBe("stale");
     expect(badge(SWEEP_ONLY_HOST_ID)).toBe("unknown");
+  });
+
+  it("names the specific reason in the degraded badge's tooltip, not a generic 'Degraded' (#4975)", () => {
+    const built = buildFleetView(
+      parseFleetSnapshot({
+        hosts: {
+          h: {
+            health: {
+              record: { kind: "host.health", dispatch_halted: true, halt_reason: "host-distress breaker" },
+              updatedAt: isoMinutesBefore(1),
+            },
+          },
+        },
+        activeSweeps: [],
+      }),
+      NOW,
+    );
+    const card = hostCard(findHost(built, "h")!, NOW);
+    const badge = card.querySelector('[data-testid="status-badge"]');
+    expect(badge?.getAttribute("data-status")).toBe("degraded");
+    expect(badge?.getAttribute("title")).toBe("dispatch halted: host-distress breaker");
+  });
+
+  it("falls back to a generic tooltip when a degraded host has no specific reason recorded", () => {
+    // Defensive-only path: buildHostView always sets a reason today, but the
+    // badge itself must never render an empty/undefined title.
+    const badge = statusBadge("degraded");
+    expect(badge.getAttribute("title")).toBeTruthy();
+    expect(badge.getAttribute("title")).not.toBe("");
   });
 
   it("lists live sweeps and says 'none' for an idle host", () => {

@@ -58,6 +58,8 @@ export function parseHostHealth(value: unknown): HostHealthRecord {
     cpu_idle_fraction: num(value.cpu_idle_fraction),
     load_per_core: num(value.load_per_core),
     worktree_root_free_gb: num(value.worktree_root_free_gb),
+    dispatch_halted: bool(value.dispatch_halted),
+    halt_reason: str(value.halt_reason),
   });
 }
 

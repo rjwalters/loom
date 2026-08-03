@@ -18,7 +18,7 @@
  */
 
 import { secondsSince } from "./format";
-import type { ActiveSweep, FleetSnapshot, HostEntry, TokenAccount } from "./types";
+import type { ActiveSweep, FleetSnapshot, HostEntry, HostHealthRecord, TokenAccount } from "./types";
 
 /**
  * How old a `host.health` / `tokens.snapshot` may be before it is shown as
@@ -30,11 +30,14 @@ import type { ActiveSweep, FleetSnapshot, HostEntry, TokenAccount } from "./type
 export const STALE_AFTER_SEC = 15 * 60;
 
 export type HostStatus =
-  /** Reporting recently, and the token pool has healthy capacity left. Some
-   * accounts being exhausted is normal rotation, not a fault — see
-   * `isTokenPoolDegraded` below. */
+  /** Reporting recently, and the token pool has healthy capacity left, and
+   * the host is not refusing work. High load alone does not disqualify a
+   * host from `ok` — see `isHostDistressed` below: the trigger is
+   * refusing-work or pinned-at-zero-idle, not raw utilization. */
   | "ok"
-  /** Reporting recently, but the token pool is at or near exhaustion. */
+  /** Reporting recently, but either the token pool is at or near exhaustion,
+   * or the host itself is distressed (dispatch halted, or CPU idle pinned
+   * near zero — see `isHostDistressed`). */
   | "degraded"
   /** Last report is older than `STALE_AFTER_SEC`. */
   | "stale"
@@ -64,6 +67,11 @@ export interface HostView {
   sweeps: ActiveSweep[];
   tokens: TokenSummary;
   status: HostStatus;
+  /** Why `status` is `"degraded"`, naming the specific cause (token
+   * exhaustion, a named halt reason, or a distress heuristic) rather than a
+   * generic "Degraded" — see `views/fleetOverview.ts`'s badge tooltip.
+   * `undefined` for every other status. */
+  degradedReason: string | undefined;
   /** Most recent of the health/tokens `updatedAt`s — the host's liveness
    * signal. `undefined` when it has never reported either. */
   lastReportAt: string | undefined;
@@ -134,6 +142,56 @@ export function isTokenPoolDegraded(tokens: TokenSummary): boolean {
   return available <= LOW_AVAILABILITY_THRESHOLD || tokens.exhausted / tokens.total >= HIGH_EXHAUSTION_FRACTION;
 }
 
+/**
+ * The daemon's own host-distress-breaker trip threshold
+ * (`DEFAULT_HOST_BREAKER_LOAD_PER_CORE`, `loom-daemon/src/host_breaker.rs`) —
+ * reused verbatim rather than reinvented, so this UI's notion of "distressed"
+ * can never drift from the daemon's own. A host that merely trips this once
+ * is not automatically flagged: `dispatch_halted` (below) is the primary,
+ * *sustained* signal — this raw threshold is a same-number fallback for a
+ * daemon build old enough, or configured, to not send `dispatch_halted` at
+ * all.
+ */
+const HOST_DISTRESS_LOAD_PER_CORE = 2.5;
+
+/**
+ * `cpu_idle_fraction` at or below this reads as "pinned at zero", not merely
+ * busy — a build spike can dip idle into the teens without the host refusing
+ * work, so this only fires once idle is close enough to true zero that the
+ * host looks like it cannot breathe (see #4975: 0% idle / load-per-core 4.24
+ * was the incident that motivated this check).
+ */
+const ZERO_IDLE_FRACTION_THRESHOLD = 0.02;
+
+/**
+ * Why a host looks distressed, in priority order, or `undefined` when it
+ * does not. `dispatch_halted` (a sustained, stateful signal the daemon
+ * itself computed — see `host_breaker.rs`'s module doc) is checked first and
+ * named with its own reason; the load/idle checks below it are same-number,
+ * single-sample fallbacks for a host whose daemon predates/disables that
+ * field. A host that is merely busy — high load, but still admitting new
+ * dispatch and idle well above zero — returns `undefined` here and stays
+ * `"ok"` (busy ≠ degraded, #4975).
+ */
+export function distressReason(health: HostHealthRecord | undefined): string | undefined {
+  if (!health) return undefined;
+  if (health.dispatch_halted) {
+    return health.halt_reason ? `dispatch halted: ${health.halt_reason}` : "dispatch halted";
+  }
+  if (health.load_per_core !== undefined && health.load_per_core >= HOST_DISTRESS_LOAD_PER_CORE) {
+    return `load/core ${health.load_per_core.toFixed(2)} at or above the host-distress threshold (${HOST_DISTRESS_LOAD_PER_CORE})`;
+  }
+  if (health.cpu_idle_fraction !== undefined && health.cpu_idle_fraction <= ZERO_IDLE_FRACTION_THRESHOLD) {
+    return "CPU idle pinned near zero";
+  }
+  return undefined;
+}
+
+/** `true` when `distressReason` finds a reason — see its doc for the rules. */
+export function isHostDistressed(health: HostHealthRecord | undefined): boolean {
+  return distressReason(health) !== undefined;
+}
+
 /** Newest of the two `updatedAt`s. String compare is safe here *only* because
  * both are backend-generated `new Date().toISOString()` values — fixed-width
  * UTC, so lexicographic order is chronological order. */
@@ -154,19 +212,27 @@ export function buildHostView(
   const tokens = summarizeTokens(entry);
   const lastReportAt = latestReport(entry);
   const lastReportAgeSec = secondsSince(lastReportAt, now);
+  const distress = distressReason(entry.health?.record);
 
   let status: HostStatus;
+  let degradedReason: string | undefined;
   if (lastReportAgeSec === undefined) {
     status = "unknown";
   } else if (lastReportAgeSec > STALE_AFTER_SEC) {
     status = "stale";
+  } else if (distress !== undefined) {
+    // Host-level distress takes priority over token-pool exhaustion when
+    // both fire — it is the more actionable/urgent of the two reasons.
+    status = "degraded";
+    degradedReason = distress;
   } else if (isTokenPoolDegraded(tokens)) {
     status = "degraded";
+    degradedReason = "token pool at or near exhaustion";
   } else {
     status = "ok";
   }
 
-  return { hostId, entry, sweeps, tokens, status, lastReportAt, lastReportAgeSec };
+  return { hostId, entry, sweeps, tokens, status, degradedReason, lastReportAt, lastReportAgeSec };
 }
 
 /** Sort: hosts needing attention first, then busiest, then by id so the list

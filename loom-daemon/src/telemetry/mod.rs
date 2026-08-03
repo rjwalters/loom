@@ -500,6 +500,25 @@ pub struct HostHealthRecord {
     /// `applyUpdate` doc comment for the exact caveat it applies.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub active_sweep_ids: Vec<String>,
+    /// Whether this host's own dispatch is currently halted for a
+    /// non-idle reason — i.e. the host-distress breaker
+    /// ([`crate::host_breaker`], Issue #4235) has tripped `Open` or is still
+    /// `CoolDown`ing (see [`crate::host_breaker::BreakerPhase::suppresses_dispatch`]).
+    /// `false` when the breaker is `Closed`, disabled, or has never been
+    /// registered (no work-finder loop running on this host) — a repo that
+    /// never enables autonomy sees no behavior change (Issue #4975).
+    ///
+    /// `#[serde(default)]` so a record from a pre-#4975 daemon still decodes
+    /// (as `false`, i.e. "not known to be halted") rather than failing.
+    #[serde(default)]
+    pub dispatch_halted: bool,
+    /// Human-readable reason for the current halt — the breaker's own
+    /// transition message (e.g. `"load-per-core 4.24 ≥ 2.50 sustained for 3
+    /// consecutive tick(s)"`), sourced straight from
+    /// [`crate::host_breaker::BreakerSnapshot::reason`]. Always `None` while
+    /// `dispatch_halted` is `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub halt_reason: Option<String>,
 }
 
 #[cfg(test)]
@@ -613,6 +632,8 @@ mod tests {
             load_per_core: Some(0.51),
             worktree_root_free_gb: Some(200),
             active_sweep_ids: vec!["sweep-issue-4703-0".to_string()],
+            dispatch_halted: false,
+            halt_reason: None,
         })
     }
 
@@ -834,6 +855,8 @@ mod tests {
             load_per_core: None,
             worktree_root_free_gb: None,
             active_sweep_ids: Vec::new(),
+            dispatch_halted: false,
+            halt_reason: None,
         });
         let value = serde_json::to_value(&record).unwrap();
         assert!(

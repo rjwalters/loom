@@ -265,13 +265,37 @@ probe stays absent rather than being coerced to a fake zero (the daemon's
   "logical_cpus": 28,
   "cpu_idle_fraction": 0.83,
   "load_per_core": 0.51,
-  "worktree_root_free_gb": 200
+  "worktree_root_free_gb": 200,
+  "dispatch_halted": false
 }
 ```
 
 `cpu_idle_fraction`, `load_per_core`, and `worktree_root_free_gb` are omitted when
 unmeasurable. A consumer MUST treat an absent measurement as "unknown", never as
 zero/full.
+
+**Dispatch-attention state (`dispatch_halted` / `halt_reason`, #4975).** Whether
+this host's own dispatch is currently halted for a non-idle reason, and why. A
+host can be at 0% idle / high load-per-core and still report `status: "ok"` on a
+naive check that only looks at token exhaustion — this is the daemon's own
+authoritative "am I refusing new work right now" signal, so a consumer does not
+have to re-derive it from raw CPU/load numbers.
+
+- `dispatch_halted` is sourced from the host-distress breaker
+  (`loom-daemon/src/host_breaker.rs`, Issue #4235): `true` when the breaker is
+  `Open` or `CoolDown` (`BreakerPhase::suppresses_dispatch`), `false` when it is
+  `Closed`, disabled, or was never registered (no work-finder loop running on
+  this host — a repo that never enables autonomy always sends `false`).
+  `#[serde(default)]`, so a record from a pre-#4975 daemon decodes as `false`
+  ("not known to be halted"), not as a fabricated "healthy".
+- `halt_reason` is the breaker's own human-readable transition message (e.g.
+  `"load-per-core 4.24 >= 2.50 sustained for 3 consecutive tick(s)"`), present
+  only while `dispatch_halted` is `true`. Omitted (not sent as `null`) while not
+  halted.
+
+Both fields are additive and pass through public redaction unchanged
+(`dashboard/src/redaction.ts`) — dispatch-attention state describes the
+machine, not any repo or operator.
 
 **Binary identity (`build_commit` / `built_at`, #4956).** `daemon_version` is
 `CARGO_PKG_VERSION`, so it only moves once per release: every build between two

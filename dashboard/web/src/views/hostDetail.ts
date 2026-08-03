@@ -312,7 +312,7 @@ export function hostDetailView(host: HostView, now: Date = new Date()): HTMLElem
       "header",
       { class: "detail__header" },
       el("h1", { class: "detail__title" }, host.hostId),
-      statusBadge(host.status),
+      statusBadge(host.status, host.degradedReason),
       el(
         "span",
         { class: "detail__last-report", title: formatAbsolute(host.lastReportAt) },
