@@ -4265,6 +4265,7 @@ loop is not reusable as the reporter). It has three cooperating parts:
 | IPC probe argv (#4398) | `LOOM_WATCHDOG_IPC_PROBE_ARGS` | — | `quarantine list` |
 | confirmed-hang threshold (#4398) | `LOOM_WATCHDOG_IPC_PROBE_FAIL_THRESHOLD` | — | `3` consecutive ticks |
 | IPC probe startup grace (#4398) | `LOOM_WATCHDOG_IPC_PROBE_GRACE_SECS` | — | `LOOM_DAEMON_STARTUP_GRACE_SECS`, else `90` |
+| pid file path (#5118) | `LOOM_PID_FILE` | — | the start script's `<state home>/.daemon.pid`, exported into the daemon **and** watchdog job/unit |
 
 **Why an interval timer, not a resident process or `KeepAlive`/`Restart=`.** The
 reporter must itself be supervised, but a long-lived resident watchdog just moves
@@ -4275,20 +4276,24 @@ systemd's `.timer` re-fires its paired `Type=oneshot` service the same way — s
 neither can crash-and-stay-dead. `KeepAlive`/`Restart=` are deliberately **not**
 set on the watchdog job/service — that would busy-loop a short-lived job/oneshot
 service instead of driving it off a fixed interval clock. The watchdog exit code
-(`0` healthy / no daemon expected, `1` divergence) is for testability + a human
-running it by hand; neither a `StartInterval` job's nor a timer-fired oneshot
-service's exit code affects the next scheduled run.
+(`0` healthy / no daemon expected, `1` divergence, `3` liveness undetermined —
+#5118) is for testability + a human running it by hand; neither a
+`StartInterval` job's nor a timer-fired oneshot service's exit code affects the
+next scheduled run.
 
 **Decision matrix** (marker present ⇒ a daemon is expected):
 
 | Marker | Reality | Watchdog |
 |--------|---------|----------|
 | present | daemon alive, heartbeat fresh, IPC round-trip OK | silent (OK) |
+| present | no live pid/job found out-of-band, but the **socket answers** (#5118) | silent (OK) — the round-trip is authoritative; an absent/stale pid file is a hint, not an outage |
+| present | supervisor says its job is **down** while the socket **answers** (#5118) | **report (WARN)** — an UNSUPERVISED but serving daemon; auto-remediation is suppressed (relaunching into a served socket can only be refused) |
+| present | no live pid/job **and** the socket probe could not run at all (#5118) | **report (UNKNOWN, exit 3)** — liveness undetermined, explicitly *not* "the daemon is down" |
 | present | daemon alive, heartbeat fresh, **IPC round-trip fails** (#4398) | **report** — 1 tick: "not yet confirmed"; N consecutive: **IPC UNRESPONSIVE (CONFIRMED)** |
 | present | daemon alive, heartbeat **stale**, written this boot (younger than the process) | **report** — daemon may be wedged |
 | present | daemon alive, heartbeat **older than the process itself** (#4368: a previous-boot/enablement leftover) | silent (liveness-only; not evidence about the current process) |
 | present | daemon alive, no heartbeat file | silent (liveness-only; heartbeat disabled or not yet written) |
-| present | daemon **not loaded/alive** | **report** — the #4011 outage |
+| present | daemon **not loaded/alive**, and the socket confirms it is unreachable | **report** — the #4011 outage |
 | **absent** | **nothing running** | silent — deliberate stop, no false page |
 | **absent** | **daemon IS running** | **report (WARN)** — state mismatch, crash protection disarmed (#4331) |
 
@@ -4348,6 +4353,33 @@ the non-launchd path) and, only when a daemon **is** demonstrably alive, WARNs +
 exits `1`. The load-bearing quiet case — marker absent *and* nothing alive, i.e. a
 deliberate `loom-daemon-stop.sh` (which also boots the daemon job out, so nothing
 is found) — stays exactly as silent as before.
+
+**Socket-first liveness, pid file demoted to a hint (#5118).** Until #5118 the
+out-of-band probe was the *only* thing that could establish liveness, and on a
+host with no launchd job and no systemd-managed unit to ask, that reduced to one
+artifact: the pid file. Three defects stacked on it. (a) **Path disagreement** —
+the watchdog derived the path from the *socket's* directory while the daemon
+derives it from `LOOM_PID_FILE` / the workspace (`daemon_pidfile.rs`); on a
+workspace-rooted install those are never the same directory. (b) **`LOOM_PID_FILE`
+was ignored by the watchdog** even though `loom-daemon-start.sh` exports it and
+the daemon honors it as tier 1. (c) **A stale pid file read as a confirmed
+death.** Observed 2026-08-03: *both* fleet hosts ran healthy daemons while the
+watchdog reported `[DIVERGENCE] … no live pid file at ~/.loom/.daemon.pid` every
+five minutes for two days — and two genuine outages in that window were
+indistinguishable from the steady-state false alarm.
+
+The precedence is now the same one `loom-daemon health` already uses: **the IPC
+round-trip is authoritative, the pid file corroborates**. When the out-of-band
+probe finds no live daemon the watchdog *asks the socket* before reporting
+anything (see the three new decision-matrix rows above), and the pid file's path
+is resolved by the identical precedence the daemon uses — `LOOM_PID_FILE` > the
+marker's `pid_file=` > `LOOM_MACHINE_CHECKOUT` (machine-level loom dir) >
+`LOOM_WORKSPACE`/`repo_root` (`<repo>/.loom`) > `<loom_dir>`. `LOOM_PID_FILE` is
+now also baked into the **watchdog** job/unit (previously only the daemon's), so
+both ends read the file the start script chose. The `UNKNOWN`/exit-3 state is the
+other half of the fix: an alerting component that cannot determine liveness must
+say so, because defaulting to "the daemon is gone" is precisely what turned this
+detector into a permanent false positive.
 
 **Marker lifetime across a self-update.** `loom-daemon-update.sh` performs an
 internal stop→start, which is a **restart**, not operator intent to stop — so it
