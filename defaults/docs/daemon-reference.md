@@ -4825,10 +4825,13 @@ loom-daemon restart          # send RestartDaemon over the IPC socket
 - **Mechanism (macOS):** the plist uses `KeepAlive:{SuccessfulExit:true}` and the
   daemon exits `0` **only** for a `RestartDaemon` request, so launchd relaunches
   the job on that one clean exit and leaves it down on every other (SIGTERM 143,
-  SIGINT 130, crash non-zero). The relaunched process re-reads the same plist, so
-  it comes back with **exactly** its start flags/env — never wider. In-flight
-  sweeps survive (they are independent detached processes the daemon never cancels
-  on shutdown). Observable signature: a **new pid**.
+  SIGINT 130, crash non-zero). The relaunched process comes back with **exactly**
+  its start flags/env as launchd already has them bootstrapped in memory — **never
+  a fresh read of the on-disk plist file** (see "Changing daemon environment
+  variables" immediately below — this is not the widening-safe guarantee it
+  sounds like for a hand-edited plist). In-flight sweeps survive (they are
+  independent detached processes the daemon never cancels on shutdown).
+  Observable signature: a **new pid**.
 - **Supervision proof:** `loom-daemon-start.sh` bakes `LOOM_DAEMON_SUPERVISOR=launchd`
   into the plist, and the daemon ends its process for a restart **only** when that
   var is present. On an unsupervised host (nohup / Linux / `--foreground`) it
@@ -4839,6 +4842,44 @@ loom-daemon restart          # send RestartDaemon over the IPC socket
   the `exec` (Option 2) and detached-helper (Option 3) alternatives were rejected,
   and the Curator's exit-code-race finding — is in
   `docs/design/supervised-restart-primitive.md`.
+
+#### Changing daemon environment variables (#4995)
+
+**A plain `loom-daemon restart` preserves the currently-*bootstrapped*
+environment, regardless of any on-disk plist edit.** launchd's `KeepAlive`
+relaunch reuses the job spec already held in launchd's own memory since the
+last `bootstrap` — it does not re-read the plist file from disk. Hand-editing
+the installed plist's `EnvironmentVariables` (e.g. adding `LOOM_RUNTIME_JUDGE`)
+and then running `loom-daemon restart` silently keeps the OLD value: the
+relaunched process comes back with exactly what launchd already had bootstrapped,
+not what the file now says. There is no error anywhere — the new/changed env var
+is simply not there post-restart.
+
+`loom-daemon restart` detects this automatically: before scheduling anything, it
+compares the live (bootstrapped) job's `LOOM_*`/token environment
+(`launchctl print gui/<uid>/<label>`) against the on-disk plist's declared
+`EnvironmentVariables` (`plutil -convert json`), and prints a loud `WARNING:`
+naming every drifted key plus the exact remediation, if they disagree
+(`loom_daemon::launchd_env_drift`). The check is advisory-only and never blocks
+or fails the restart. No warning normally means the two agree — but it is also
+what you get when there was nothing to compare (no launchd job registered under
+this label, no on-disk plist) or a probe/parse failed, since every such outcome
+is deliberately silent; this is macOS/launchd-specific (systemd re-reads
+`Environment=` fresh via `daemon-reload` on every unit reload, so there is
+nothing to detect on that path).
+
+**The actual env-change path** is either of:
+
+```bash
+# Option A: re-render + re-bootstrap in one step (the normal path)
+./.loom/scripts/cli/loom-daemon-start.sh
+
+# Option B: bootout the stale bootstrapped job, then bootstrap the edited plist
+launchctl bootout gui/$(id -u)/com.rjwalters.loom-daemon
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.rjwalters.loom-daemon.plist
+```
+
+Both make launchd re-read the plist file, which a plain `restart` never does.
 
 #### Scheduled drain-and-restart (`--drain`, #4090)
 
