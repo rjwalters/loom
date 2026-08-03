@@ -931,6 +931,10 @@ If feedback requires substantial work:
 4. Let Workers handle the complex refactoring
 5. Comment on PR explaining an issue was created
 
+> **`gh issue create` fails outright when GraphQL quota is exhausted.** REST
+> fallback recipe (atomic create+label): `.loom/docs/gh-issue-create-rest-fallback.md`,
+> or `forge_gh_create_issue_rl_safe` in `lib/forge-helpers.sh` if scripting.
+
 **Example:**
 ```bash
 gh issue create --title "Refactor authentication system per PR #123 review" --body "$(cat <<'EOF'

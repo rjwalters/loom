@@ -319,6 +319,10 @@ If, during curation, you determine an issue is too large to be a single Builder 
 5. **Do not self-curate your own sub-issues in the same session.** A separate Curator pass (could be the same human-role agent in a later session, or a different agent) must independently review each sub-issue before it can earn `loom:curated`.
 6. **Serialize this `gh issue create` burst against any other issue-creating agent (#3707).** Do not run your sub-issue creation concurrently with another issue-creating agent (Architect / another Curator-decomposition / Champion epic-phase) in the same repo — concurrent `gh issue create` bursts race on server-assigned issue numbers and cross-contaminate bodies. One filer finishes its full burst before the next starts. See `sweep.md` → "Execution Model → Only Builders parallelize" for the invariant.
 
+> **`gh issue create` fails outright when GraphQL quota is exhausted.** REST
+> fallback recipe (atomic create+label): `.loom/docs/gh-issue-create-rest-fallback.md`,
+> or `forge_gh_create_issue_rl_safe` in `lib/forge-helpers.sh` if scripting.
+
 ### Why this matters
 
 A dedicated Curator pass after decomposition catches:

@@ -828,6 +828,10 @@ Is the failure in YOUR changed files?
 
 If you want to track pre-existing issues for future cleanup:
 
+> **`gh issue create` fails outright when GraphQL quota is exhausted.** REST
+> fallback recipe (atomic create+label): `.loom/docs/gh-issue-create-rest-fallback.md`,
+> or `forge_gh_create_issue_rl_safe` in `lib/forge-helpers.sh` if scripting.
+
 ```bash
 gh issue create --title "Tech debt: Migrate biome.json to v2 schema" --body "$(cat <<'EOF'
 ## Problem
