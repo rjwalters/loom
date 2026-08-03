@@ -267,13 +267,17 @@ describe("redactPayload — per-kind field allowlist", () => {
     expect(redactPayload("host.health", payload)).toEqual(payload);
   });
 
-  it("host.health: role-tick health (roles) survives redaction, but each persistent root is basenamed for the public view (#5022)", () => {
-    // The counts and each failure's role/detail survive (they describe the
-    // machine, not the work), but the workspace `root` is a full absolute
-    // filesystem path whose home-directory segment names the operator on the
-    // common macOS/Linux layout — so the public, unauthenticated surface only
-    // ever gets its basename, mirroring the daemon's `RoleFailure::label()`
-    // and the frontend's `pathBasename`.
+  it("host.health: role-tick health (roles) survives redaction, but each persistent root is basenamed and detail is dropped for the public view (#5022, #5065)", () => {
+    // The counts and each failure's role/failures/last_at survive (they
+    // describe the machine, not the work). The workspace `root` is a full
+    // absolute filesystem path whose home-directory segment names the
+    // operator on the common macOS/Linux layout — so the public,
+    // unauthenticated surface only ever gets its basename, mirroring the
+    // daemon's `RoleFailure::label()` and the frontend's `pathBasename`.
+    // `detail` is dropped entirely (#5065): it is a free-form failure string
+    // the daemon builds by interpolating another absolute path plus a log
+    // tail, so — unlike `root` — there is no basename-style truncation that
+    // makes it safe for the public surface.
     const payload = {
       kind: "host.health",
       captured_at: "2026-08-02T12:00:00Z",
@@ -313,7 +317,7 @@ describe("redactPayload — per-kind field allowlist", () => {
           role: "judge",
           failures: 2,
           last_at: "2026-08-02T11:59:00Z",
-          detail: "no-token-pool",
+          // NOTE: no `detail` key at all — dropped, not truncated.
         },
       ],
     });
@@ -321,6 +325,37 @@ describe("redactPayload — per-kind field allowlist", () => {
     // never reaches the public surface, in any field.
     expect(JSON.stringify(redacted)).not.toContain("/Users/alice");
     expect(JSON.stringify(redacted)).not.toContain("alice");
+  });
+
+  it("host.health: a realistic role-tick `detail` (absolute path + log tail) never reaches the public surface (#5065)", () => {
+    // The most common role-tick failure path (`RoleTickOutcome::Failure` in
+    // `loom-daemon/src/role_runner.rs` for a non-zero exit) builds `detail`
+    // by interpolating the absolute path to `spawn-worker.sh` plus a tail of
+    // the failing role child's own log output.
+    const payload = {
+      kind: "host.health",
+      captured_at: "2026-08-02T12:00:00Z",
+      daemon_version: "0.17.0",
+      roles: {
+        total: 1,
+        ok: 0,
+        persistent: [
+          {
+            root: "/Users/alice/GitHub/loom",
+            role: "judge",
+            failures: 1,
+            last_at: "2026-08-02T11:59:00Z",
+            detail:
+              "`/Users/alice/GitHub/loom/.loom/scripts/spawn-worker.sh` exited with exit status: 1: some log tail",
+          },
+        ],
+      },
+    };
+    const redacted = redactPayload("host.health", payload);
+    const serialized = JSON.stringify(redacted);
+    expect(serialized).not.toContain("alice");
+    expect(serialized).not.toContain("/Users/alice/GitHub/loom/.loom/scripts/spawn-worker.sh");
+    expect((redacted.roles as { persistent: Record<string, unknown>[] }).persistent[0]).not.toHaveProperty("detail");
   });
 
   it("host.health: no roles key at all when the payload carries no role-tick summary (#5022)", () => {
@@ -590,6 +625,42 @@ describe("redactFleetSnapshot", () => {
     const record = redactFleetSnapshot(snapshot, true).hosts["host-abc"]?.tokens?.record;
     expect(record).toEqual({ kind: "tokens.snapshot", accounts });
   });
+
+  it("keeps the full absolute root and detail in a role-tick failure for an authenticated viewer (#5065)", () => {
+    const roles = {
+      total: 1,
+      ok: 0,
+      persistent: [
+        {
+          root: "/Users/alice/GitHub/loom",
+          role: "judge",
+          failures: 1,
+          last_at: "2026-08-02T11:59:00Z",
+          detail: "`/Users/alice/GitHub/loom/.loom/scripts/spawn-worker.sh` exited with exit status: 1: log tail",
+        },
+      ],
+    };
+    const snapshot: FleetSnapshot = {
+      hosts: {
+        "host-abc": {
+          health: {
+            record: { kind: "host.health", uptime_sec: 100, roles },
+            updatedAt: "2026-07-30T12:00:00Z",
+          },
+        },
+      },
+      activeSweeps: [],
+    };
+
+    const authedRecord = redactFleetSnapshot(snapshot, true).hosts["host-abc"]?.health?.record;
+    expect(authedRecord).toEqual({ kind: "host.health", uptime_sec: 100, roles });
+
+    const publicRecord = redactFleetSnapshot(snapshot, false).hosts["host-abc"]?.health?.record;
+    const publicPersistent = (publicRecord?.roles as { persistent: Record<string, unknown>[] } | undefined)
+      ?.persistent;
+    expect(publicPersistent?.[0]).not.toHaveProperty("detail");
+    expect(JSON.stringify(publicRecord)).not.toContain("alice");
+  });
 });
 
 describe("redactManagedRepos", () => {
@@ -800,6 +871,47 @@ describe("GET /public/history vs GET /api/history — end-to-end redaction", () 
     expect(tokensRecord?.record).toMatchObject({ account_count: 1, exhausted_count: 0 });
     expect(tokensRecord?.record).not.toHaveProperty("accounts");
     expect(publicText).not.toContain("agent-1");
+  });
+
+  it("a role-tick failure's `detail` never reaches GET /public/history, but GET /api/history keeps it in full (#5065)", async () => {
+    // Mirrors the `root` basenaming case #5042 landed, for the sibling
+    // `detail` field: the common role-tick failure path builds `detail` by
+    // interpolating an absolute `spawn-worker.sh` path plus a log tail.
+    const roleTickDetail =
+      "`/Users/alice/GitHub/loom/.loom/scripts/spawn-worker.sh` exited with exit status: 1: some log tail";
+    await ingest([
+      hostHealthEnvelope({
+        roles: {
+          total: 1,
+          ok: 0,
+          persistent: [
+            {
+              root: "/Users/alice/GitHub/loom",
+              role: "judge",
+              failures: 1,
+              last_at: "2026-08-02T11:59:00Z",
+              detail: roleTickDetail,
+            },
+          ],
+        },
+      }),
+    ]);
+
+    const publicResponse = await callWorker(new Request("https://ingest.example/public/history"));
+    const publicText = await publicResponse.text();
+    expect(publicText).not.toContain("alice");
+    expect(publicText).not.toContain(roleTickDetail);
+    const publicBody = JSON.parse(publicText) as {
+      records: { kind: string; record: { roles?: { persistent?: Record<string, unknown>[] } } }[];
+    };
+    const publicHealth = publicBody.records.find((r) => r.kind === "host.health");
+    expect(publicHealth?.record.roles?.persistent?.[0]).not.toHaveProperty("detail");
+    expect(publicHealth?.record.roles?.persistent?.[0]).toMatchObject({ root: "loom", role: "judge" });
+
+    const authResponse = await callWorker(await authedRequest("https://ingest.example/api/history"));
+    const authText = await authResponse.text();
+    expect(authText).toContain(roleTickDetail);
+    expect(authText).toContain("/Users/alice/GitHub/loom");
   });
 
   it("the authenticated route still serves the full per-account token rows", async () => {

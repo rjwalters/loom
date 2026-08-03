@@ -282,15 +282,26 @@ function pathBasename(root: string): string {
 
 /**
  * Redact one `host.health.roles` summary (#5022) for a public, unauthenticated
- * viewer. The counts (`total`/`ok`) and each persistent failure's non-path
- * detail (`role`/`failures`/`last_at`/`detail`) survive; every entry's `root`
- * — a full absolute filesystem workspace path whose home-directory segment
- * names the *operator* on the common macOS/Linux layout — is truncated to its
- * basename, exactly as the daemon's `RoleFailure::label()` and the frontend's
- * `pathBasename` already render it for display. Only the raw wire payload to
- * the public, unauthenticated API skipped that truncation; this closes it. The
+ * viewer. The counts (`total`/`ok`) and each persistent failure's `role`,
+ * `failures`, and `last_at` survive; every entry's `root` — a full absolute
+ * filesystem workspace path whose home-directory segment names the *operator*
+ * on the common macOS/Linux layout — is truncated to its basename, exactly as
+ * the daemon's `RoleFailure::label()` and the frontend's `pathBasename`
+ * already render it for display. Only the raw wire payload to the public,
+ * unauthenticated API skipped that truncation; this closes it. The
  * authenticated `/api/*` surface keeps the full path (this derivation runs on
  * the public path only).
+ *
+ * `detail` is deliberately dropped, not truncated (#5065): unlike `root`, it
+ * is not "non-path detail" — the daemon's own `RoleTickOutcome::Failure`
+ * constructors (`loom-daemon/src/role_runner.rs`) build it by interpolating
+ * an absolute `script.display()` path plus up to `MAX_OUTPUT_TAIL_BYTES` of
+ * the failing role child's own log tail, which can itself contain further
+ * absolute paths, repo slugs, issue numbers, or branch names. A free-form tail
+ * of another process's output cannot be shown safe by construction, so —
+ * unlike `root` — there is no basename-style truncation that makes it safe;
+ * it stays behind the Access gate, same footing as `tokens.snapshot`'s
+ * `accounts`. The authenticated `/api/*` surface still returns it unchanged.
  *
  * Like `redactManagedRepos`, a per-field pick (not a spread), so a future
  * field added to the `roles` schema is dropped from the public view by default
@@ -311,7 +322,7 @@ export function redactRoleTickHealth(roles: RoleTickHealthRow): Record<string, u
         if ("role" in row) entry.role = row.role;
         if ("failures" in row) entry.failures = row.failures;
         if ("last_at" in row) entry.last_at = row.last_at;
-        if ("detail" in row) entry.detail = row.detail;
+        // `detail` is intentionally NOT copied here — see the doc comment.
       }
       return entry;
     });
