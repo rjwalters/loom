@@ -111,9 +111,14 @@ run_suppression_case() {
     }
     export -f gh >/dev/null 2>&1 || true
 
+    # These four are consumed by the extracted block below via `eval`, not
+    # referenced directly in this function — shellcheck can't see that use.
+    # shellcheck disable=SC2034
     N=12345
     CLAIMED_AT="2026-08-03T21:11:41Z"
+    # shellcheck disable=SC2034
     MARKER="<!-- loom:standdown claim=$CLAIMED_AT -->"
+    # shellcheck disable=SC2034
     COMMENTS_JSON="$comments_json"
 
     local out
