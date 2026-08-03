@@ -559,6 +559,54 @@ the diagnostic in that case now names `<repo>/.loom/runtimes/<name>.json`, a
 path reachable from a consumer repo, instead of the unreachable
 `defaults/runtimes/<name>.json` fallback path.
 
+#### Per-role model override (`autonomous.roleRunner.roleModels`)
+
+`runtimes.roles` gives each standalone role its own **runtime** axis, but the
+model the daemon pins per role-runner tick was, before #5001, a single global
+value (`autonomous.roleRunner.model`, resolved by `resolve_role_runner_model` in
+`loom-daemon/src/role_runner.rs`). The two axes could not disagree, so pointing
+one role at a different provider guaranteed a mismatch: with
+`LOOM_RUNTIME_JUDGE=codex` set, the globally-pinned Claude alias (`sonnet`) was
+forwarded verbatim as `--model sonnet` to the Codex adapter, which rejects it
+(`The 'sonnet' model is not supported when using Codex with a ChatGPT account.`,
+HTTP 400). The classifier treated that exit as `RECOVERABLE`, so every Judge tick
+retried and re-failed indefinitely, fleet-wide, until the env var was reverted.
+
+`autonomous.roleRunner.roleModels` adds the matching **model** axis — a
+`{ "<role>": "<model>" }` map whose per-role entry sits one tier **above** the
+global `autonomous.roleRunner.model`:
+
+```json
+{
+  "runtimes": { "roles": { "judge": "codex" } },
+  "autonomous": {
+    "roleRunner": {
+      "model": "sonnet",
+      "roleModels": { "judge": "gpt-5-codex" }
+    }
+  }
+}
+```
+
+Here Judge runs on Codex with a Codex-valid model while Curator and Champion stay
+on Claude with `sonnet`, all from config. The resolution precedence for a given
+role is:
+
+**`autonomous.roleRunner.roleModels.<role>` > `autonomous.roleRunner.model` >
+`autonomous.model` > shipped `DEFAULT_DISPATCH_MODEL` (`sonnet`)**
+
+Keys are lower-cased and trimmed (so a `"Judge"` key matches the `judge` role the
+runner dispatches under); a blank key, or a blank / non-string value, is dropped
+so an override never emits `--model ""`; and an absent / malformed / non-object
+`roleModels` soft-fails to "no overrides" (every role falls through to the global
+chain, zero behavior change). Values resolve through the same `sweep.modelAliases`
+tier map every other model tier uses (a per-role `"opus"` still reaches
+`claude-opus-5`), and a runtime-specific model ID such as `gpt-5-codex` passes
+through unchanged. The per-role log header (`role-<role>.log`) records the
+resolved model and names the tier that supplied it
+(`source=autonomous.roleRunner.roleModels.<role>`), so an operator can confirm the
+pin from the log alone.
+
 Daemon admission runs before any claim lock, forge mutation, account selection,
 log header, or child spawn. Successful sweep status and
 `sweep.global.dispatch` events include both `runtime` and `runtime_source`.

@@ -76,7 +76,7 @@
 //! `claude` sessions at once rather than settling into the steady-state
 //! cadence.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -442,8 +442,8 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
         // where every role child burned the most constrained quota tier and then
         // died on "You've reached your Fable 5 limit").
         let (model, model_source) = match &self.model {
-            Some(m) => (m.clone(), "override"),
-            None => resolve_role_runner_model(&self.workspace_root),
+            Some(m) => (m.clone(), "override".to_string()),
+            None => resolve_role_runner_model(&self.workspace_root, role),
         };
         let admission = if self.spawn_bin.is_none() {
             match crate::runtime_admission::resolve_and_admit(&self.workspace_root, role, None) {
@@ -461,18 +461,20 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
             self.logs_dir(),
             self.timeout,
             &model,
-            model_source,
+            &model_source,
             admission.as_ref(),
         )
     }
 }
 
-/// Issue #4501: resolve the model a role-runner child must run with, joining the
-/// SAME precedence chain sweep dispatch uses
-/// ([`sweep_registry::resolve_dispatch_model`]) with the role-runner-specific
-/// `autonomous.roleRunner.model` occupying the "explicit request" tier:
+/// Issue #4501 / #5001: resolve the model a role-runner child must run with,
+/// joining the SAME precedence chain sweep dispatch uses
+/// ([`sweep_registry::resolve_dispatch_model`]) with a per-role override and the
+/// role-runner-specific global `autonomous.roleRunner.model` occupying the
+/// "explicit request" tier:
 ///
-/// **`autonomous.roleRunner.model` > `autonomous.model` > shipped
+/// **`autonomous.roleRunner.roleModels.<role>` >
+/// `autonomous.roleRunner.model` > `autonomous.model` > shipped
 /// [`sweep_registry::DEFAULT_DISPATCH_MODEL`] (`sonnet`)**
 ///
 /// Empty/whitespace values are treated as unset at every tier, so the resolved
@@ -480,20 +482,45 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
 /// default. Returns the model plus a label naming the tier that supplied it (for
 /// the per-role log header).
 ///
-/// Before this, `run_role_with_timeout` emitted **no** `--model` argument at
+/// # Why the per-role tier (#5001)
+///
+/// `LOOM_RUNTIME_<ROLE>` gives each role its own **runtime** axis (Claude vs
+/// Codex etc.), but before #5001 the model was a single global value shared by
+/// every role. The moment one role (e.g. Judge) was pointed at a different
+/// provider via `LOOM_RUNTIME_JUDGE=codex`, the globally-pinned Claude alias
+/// (`sonnet`) was forwarded verbatim to the Codex adapter, which rejected it with
+/// an HTTP 400 — so every Judge tick failed silently, fleet-wide. The per-role
+/// override closes that gap: a repo can run Judge on Codex with a Codex-valid
+/// model while Curator/Champion keep a Claude alias, all from config.
+///
+/// Before #4501, `run_role_with_timeout` emitted **no** `--model` argument at
 /// all, so every scheduled curator/champion/judge/auditor/guide child inherited
 /// whatever the selected account's interactive `claude` default happened to be —
 /// the live defect this resolution exists to prevent.
 #[must_use]
-pub fn resolve_role_runner_model(repo_root: &Path) -> (String, &'static str) {
-    let configured = read_role_runner_config(repo_root).model;
+pub fn resolve_role_runner_model(repo_root: &Path, role: &str) -> (String, String) {
+    let config = read_role_runner_config(repo_root);
+    let role_key = role.trim().to_ascii_lowercase();
+    // Per-role override (#5001) wins over the single global
+    // `autonomous.roleRunner.model`; both occupy `resolve_dispatch_model`'s
+    // "explicit request" (`Param`) tier, so a `per_role` flag disambiguates the
+    // log label. A blank per-role value never reaches here — blanks are dropped
+    // at parse time in `read_role_runner_config`, so it falls through to the
+    // global tier just like an absent key.
+    let (configured, per_role) = match config.role_models.get(&role_key) {
+        Some(m) => (Some(m.clone()), true),
+        None => (config.model.clone(), false),
+    };
     let (model, source) = sweep_registry::resolve_dispatch_model(repo_root, configured.as_deref());
     let label = match source {
-        // `Param` can only arise from `autonomous.roleRunner.model` here — this
-        // function is the only caller and it passes exactly that value.
-        sweep_registry::ModelSource::Param => "autonomous.roleRunner.model",
-        sweep_registry::ModelSource::Config => "autonomous.model",
-        sweep_registry::ModelSource::Default => "default",
+        sweep_registry::ModelSource::Param if per_role => {
+            format!("autonomous.roleRunner.roleModels.{role_key}")
+        }
+        // `Param` without `per_role` can only arise from the global
+        // `autonomous.roleRunner.model` — this function is its only caller.
+        sweep_registry::ModelSource::Param => "autonomous.roleRunner.model".to_string(),
+        sweep_registry::ModelSource::Config => "autonomous.model".to_string(),
+        sweep_registry::ModelSource::Default => "default".to_string(),
     };
     (model, label)
 }
@@ -758,6 +785,17 @@ pub struct RoleRunnerConfig {
     /// account's interactive CLI default. Resolved by
     /// [`resolve_role_runner_model`].
     pub model: Option<String>,
+    /// `autonomous.roleRunner.roleModels` — per-role model overrides keyed by
+    /// role name (issue #5001), each occupying a tier **above** the global
+    /// [`model`](Self::model). This is the config axis that lets a repo run one
+    /// role on a different runtime (e.g. `LOOM_RUNTIME_JUDGE=codex`) while giving
+    /// that role a model its provider accepts, without forcing the other roles
+    /// (still on Claude) onto the same alias. Keys are lower-cased and trimmed;
+    /// blank keys and blank/non-string values are dropped, so an entry never
+    /// emits `--model ""`. Absent / malformed / non-object soft-fails to an empty
+    /// map (every role falls through to the global chain). Resolved by
+    /// [`resolve_role_runner_model`].
+    pub role_models: BTreeMap<String, String>,
 }
 
 /// Read `.loom/config.json -> autonomous.roleRunner`, soft-failing every
@@ -803,6 +841,29 @@ pub fn read_role_runner_config(repo_root: &Path) -> RoleRunnerConfig {
         .filter(|m| !m.is_empty())
         .map(String::from);
 
+    // `roleModels` (#5001): a `{ "<role>": "<model>" }` object of per-role
+    // overrides. Keys are lower-cased + trimmed (matching how the resolver looks
+    // them up); a blank key, or a blank / non-string value, is dropped — an
+    // override must never emit `--model ""`. Absent / non-object soft-fails to an
+    // empty map, so every role falls through to the global `model` chain
+    // unchanged (zero behavior change when the key is not configured).
+    let role_models = block
+        .get("roleModels")
+        .and_then(serde_json::Value::as_object)
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| {
+                    let key = k.trim().to_ascii_lowercase();
+                    if key.is_empty() {
+                        return None;
+                    }
+                    let val = v.as_str().map(str::trim).filter(|m| !m.is_empty())?;
+                    Some((key, val.to_string()))
+                })
+                .collect::<BTreeMap<String, String>>()
+        })
+        .unwrap_or_default();
+
     RoleRunnerConfig {
         enabled: block.get("enabled").and_then(serde_json::Value::as_bool),
         roles,
@@ -812,6 +873,7 @@ pub fn read_role_runner_config(repo_root: &Path) -> RoleRunnerConfig {
             .filter(|&s| s > 0),
         on_idle,
         model,
+        role_models,
     }
 }
 
@@ -2117,6 +2179,49 @@ mod tests {
         );
     }
 
+    /// Issue #5001: end-to-end, a `roleModels.<role>` override reaches the actual
+    /// `--model` argv for that role while a peer role (no override) still gets the
+    /// global `autonomous.roleRunner.model`. This is the argv-level proof of the
+    /// mixed-runtime fix: the Codex-bound Judge pins a Codex-valid model while the
+    /// Claude-bound Curator keeps the Claude alias — from one config block.
+    #[test]
+    fn test_invoke_per_role_model_override_reaches_argv() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(
+            tmp.path(),
+            r#"{"autonomous": {"roleRunner": {
+                "enabled": true,
+                "model": "sonnet",
+                "roleModels": {"judge": "gpt-5-codex"}
+            }}}"#,
+        );
+        let script = write_fake_script(
+            tmp.path(),
+            "fake-spawn.sh",
+            "printf '%s\\n' \"$@\" > argv-last.txt; exit 0",
+        );
+
+        // Judge gets its per-role Codex model.
+        let mut judge = ScriptRoleInvocationRunner::new(tmp.path().to_path_buf())
+            .with_spawn_bin(script.clone());
+        assert_eq!(judge.invoke("judge", "/loom:judge"), RoleTickOutcome::Success);
+        let judge_argv = fs::read_to_string(tmp.path().join("argv-last.txt")).unwrap();
+        assert!(
+            judge_argv.contains("--model\ngpt-5-codex\n"),
+            "judge must pin its per-role model; argv: {judge_argv}"
+        );
+
+        // Curator (no override) still gets the global roleRunner.model.
+        let mut curator =
+            ScriptRoleInvocationRunner::new(tmp.path().to_path_buf()).with_spawn_bin(script);
+        assert_eq!(curator.invoke("curator", "/loom:curator"), RoleTickOutcome::Success);
+        let curator_argv = fs::read_to_string(tmp.path().join("argv-last.txt")).unwrap();
+        assert!(
+            curator_argv.contains("--model\nsonnet\n"),
+            "curator must keep the global roleRunner.model; argv: {curator_argv}"
+        );
+    }
+
     /// Issue #4501: with only `autonomous.model` set, the role runner joins the
     /// SAME chain sweep dispatch uses rather than keeping a private default.
     //
@@ -2133,8 +2238,8 @@ mod tests {
         // No config at all -> shipped default, labelled `default`.
         let bare = tempfile::tempdir().unwrap();
         assert_eq!(
-            resolve_role_runner_model(bare.path()),
-            (sweep_registry::DEFAULT_DISPATCH_MODEL.to_string(), "default")
+            resolve_role_runner_model(bare.path(), "curator"),
+            (sweep_registry::DEFAULT_DISPATCH_MODEL.to_string(), "default".to_string())
         );
 
         // `autonomous.model` only -> that value, labelled `autonomous.model`.
@@ -2144,8 +2249,8 @@ mod tests {
         let shared = tempfile::tempdir().unwrap();
         write_config(shared.path(), r#"{"autonomous": {"model": "opus"}}"#);
         assert_eq!(
-            resolve_role_runner_model(shared.path()),
-            ("claude-opus-5".to_string(), "autonomous.model")
+            resolve_role_runner_model(shared.path(), "curator"),
+            ("claude-opus-5".to_string(), "autonomous.model".to_string())
         );
 
         // Both -> the role-runner-specific value, labelled as such.
@@ -2155,8 +2260,8 @@ mod tests {
             r#"{"autonomous": {"model": "opus", "roleRunner": {"model": "haiku"}}}"#,
         );
         assert_eq!(
-            resolve_role_runner_model(both.path()),
-            ("haiku".to_string(), "autonomous.roleRunner.model")
+            resolve_role_runner_model(both.path(), "curator"),
+            ("haiku".to_string(), "autonomous.roleRunner.model".to_string())
         );
 
         // A blank override is treated as unset at every tier (never `--model ""`).
@@ -2164,9 +2269,141 @@ mod tests {
         write_config(blank.path(), r#"{"autonomous": {"roleRunner": {"model": "   "}}}"#);
         assert_eq!(read_role_runner_config(blank.path()).model, None);
         assert_eq!(
-            resolve_role_runner_model(blank.path()),
-            (sweep_registry::DEFAULT_DISPATCH_MODEL.to_string(), "default")
+            resolve_role_runner_model(blank.path(), "curator"),
+            (sweep_registry::DEFAULT_DISPATCH_MODEL.to_string(), "default".to_string())
         );
+
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+    }
+
+    /// Issue #5001: `autonomous.roleRunner.roleModels.<role>` is a tier ABOVE the
+    /// global `autonomous.roleRunner.model` — a repo can point one role (Judge,
+    /// on Codex) at a provider-valid model while the other roles
+    /// (Curator/Champion, on Claude) keep a Claude alias, all from config. This
+    /// is the config-only fix for the `LOOM_RUNTIME_JUDGE=codex` -> `sonnet` 400
+    /// incident: the per-role and global model axes can finally disagree.
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_resolve_role_runner_model_per_role_override() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+
+        // Judge gets a Codex-valid model; curator/champion keep the global
+        // Claude alias — the exact mixed-runtime shape the incident needed.
+        let dir = tempfile::tempdir().unwrap();
+        write_config(
+            dir.path(),
+            r#"{"autonomous": {"roleRunner": {
+                "model": "sonnet",
+                "roleModels": {"judge": "gpt-5-codex"}
+            }}}"#,
+        );
+        assert_eq!(
+            resolve_role_runner_model(dir.path(), "judge"),
+            ("gpt-5-codex".to_string(), "autonomous.roleRunner.roleModels.judge".to_string())
+        );
+        // A role with no per-role entry falls through to the global tier.
+        assert_eq!(
+            resolve_role_runner_model(dir.path(), "curator"),
+            ("sonnet".to_string(), "autonomous.roleRunner.model".to_string())
+        );
+        assert_eq!(
+            resolve_role_runner_model(dir.path(), "champion"),
+            ("sonnet".to_string(), "autonomous.roleRunner.model".to_string())
+        );
+
+        // Per-role override with NO global model set: the overridden role uses
+        // its override; every other role falls all the way through to the
+        // shipped default (not the override).
+        let no_global = tempfile::tempdir().unwrap();
+        write_config(
+            no_global.path(),
+            r#"{"autonomous": {"roleRunner": {"roleModels": {"judge": "gpt-5-codex"}}}}"#,
+        );
+        assert_eq!(
+            resolve_role_runner_model(no_global.path(), "judge"),
+            ("gpt-5-codex".to_string(), "autonomous.roleRunner.roleModels.judge".to_string())
+        );
+        assert_eq!(
+            resolve_role_runner_model(no_global.path(), "guide"),
+            (sweep_registry::DEFAULT_DISPATCH_MODEL.to_string(), "default".to_string())
+        );
+
+        // The lookup is case-insensitive: a `Judge` config key matches the
+        // lower-cased `judge` role name the runner dispatches under.
+        let cased = tempfile::tempdir().unwrap();
+        write_config(
+            cased.path(),
+            r#"{"autonomous": {"roleRunner": {"roleModels": {"Judge": "gpt-5-codex"}}}}"#,
+        );
+        assert_eq!(resolve_role_runner_model(cased.path(), "judge").0, "gpt-5-codex".to_string());
+
+        // A per-role override that is a logical Claude alias still resolves
+        // through the #3982 tier map (`opus` -> `claude-opus-5`), exactly like
+        // the other tiers.
+        let alias = tempfile::tempdir().unwrap();
+        write_config(
+            alias.path(),
+            r#"{"autonomous": {"roleRunner": {"roleModels": {"judge": "opus"}}}}"#,
+        );
+        assert_eq!(resolve_role_runner_model(alias.path(), "judge").0, "claude-opus-5");
+
+        // A blank per-role value is dropped at parse time and falls through to
+        // the global tier — never `--model ""`.
+        let blank = tempfile::tempdir().unwrap();
+        write_config(
+            blank.path(),
+            r#"{"autonomous": {"roleRunner": {"model": "sonnet", "roleModels": {"judge": "   "}}}}"#,
+        );
+        assert!(read_role_runner_config(blank.path()).role_models.is_empty());
+        assert_eq!(
+            resolve_role_runner_model(blank.path(), "judge"),
+            ("sonnet".to_string(), "autonomous.roleRunner.model".to_string())
+        );
+
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+    }
+
+    /// Issue #5001: `read_role_runner_config` soft-fails a malformed / absent /
+    /// non-object `roleModels` to an empty map (every role falls through to the
+    /// global chain), and drops blank keys — mirroring the soft-fail contract of
+    /// every other `autonomous.roleRunner.*` field.
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_read_role_models_soft_fails_and_normalizes() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+
+        // Absent key -> empty map.
+        let absent = tempfile::tempdir().unwrap();
+        write_config(absent.path(), r#"{"autonomous": {"roleRunner": {"enabled": true}}}"#);
+        assert!(read_role_runner_config(absent.path())
+            .role_models
+            .is_empty());
+
+        // Non-object value -> empty map (no panic).
+        let non_object = tempfile::tempdir().unwrap();
+        write_config(
+            non_object.path(),
+            r#"{"autonomous": {"roleRunner": {"roleModels": "sonnet"}}}"#,
+        );
+        assert!(read_role_runner_config(non_object.path())
+            .role_models
+            .is_empty());
+
+        // Blank keys and blank/non-string values are dropped; good entries are
+        // kept, lower-cased, and trimmed.
+        let mixed = tempfile::tempdir().unwrap();
+        write_config(
+            mixed.path(),
+            r#"{"autonomous": {"roleRunner": {"roleModels": {
+                "  Judge  ": "  gpt-5-codex  ",
+                "curator": "",
+                "   ": "sonnet",
+                "guide": 42
+            }}}}"#,
+        );
+        let models = read_role_runner_config(mixed.path()).role_models;
+        assert_eq!(models.get("judge").map(String::as_str), Some("gpt-5-codex"));
+        assert_eq!(models.len(), 1, "blank/non-string entries must be dropped: {models:?}");
 
         std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
     }
@@ -2342,6 +2579,7 @@ mod tests {
                 interval_secs: Some(120),
                 on_idle: None,
                 model: None,
+                role_models: BTreeMap::new(),
             }
         );
     }
@@ -2386,6 +2624,7 @@ mod tests {
                 interval_secs: Some(60),
                 on_idle: None,
                 model: None,
+                role_models: BTreeMap::new(),
             }
         );
     }
@@ -2425,6 +2664,7 @@ mod tests {
             interval_secs: None,
             on_idle: None,
             model: None,
+            role_models: BTreeMap::new(),
         };
         assert_eq!(resolve_roles(&config), Vec::new());
     }
@@ -2437,6 +2677,7 @@ mod tests {
             interval_secs: None,
             on_idle: None,
             model: None,
+            role_models: BTreeMap::new(),
         };
         let roles = resolve_roles(&config);
         assert_eq!(roles.iter().map(|r| r.name).collect::<Vec<_>>(), vec!["champion", "guide"]);
@@ -2450,6 +2691,7 @@ mod tests {
             interval_secs: None,
             on_idle: None,
             model: None,
+            role_models: BTreeMap::new(),
         };
         let roles = resolve_roles(&config);
         assert_eq!(roles.iter().map(|r| r.name).collect::<Vec<_>>(), vec!["curator"]);
@@ -2476,6 +2718,7 @@ mod tests {
             interval_secs: None,
             on_idle: None,
             model: None,
+            role_models: BTreeMap::new(),
         }));
     }
 
@@ -2489,6 +2732,7 @@ mod tests {
             interval_secs: None,
             on_idle: None,
             model: None,
+            role_models: BTreeMap::new(),
         }));
         std::env::set_var(ROLE_RUNNER_ENABLE_ENV, "1");
         assert!(resolve_enabled(&RoleRunnerConfig {
@@ -2497,6 +2741,7 @@ mod tests {
             interval_secs: None,
             on_idle: None,
             model: None,
+            role_models: BTreeMap::new(),
         }));
         std::env::remove_var(ROLE_RUNNER_ENABLE_ENV);
     }
@@ -2523,6 +2768,7 @@ mod tests {
                     interval_secs: Some(42),
                     on_idle: None,
                     model: None,
+                    role_models: BTreeMap::new(),
                 }
             ),
             Duration::from_secs(42)
@@ -2539,6 +2785,7 @@ mod tests {
                     interval_secs: Some(42),
                     on_idle: None,
                     model: None,
+                    role_models: BTreeMap::new(),
                 }
             ),
             Duration::from_secs(7)
@@ -2808,6 +3055,7 @@ mod tests {
             interval_secs: None,
             on_idle: Some(vec!["guide".to_string(), "champion".to_string()]),
             model: None,
+            role_models: BTreeMap::new(),
         };
         let roles = resolve_on_idle_roles(&config);
         assert_eq!(roles.iter().map(|r| r.name).collect::<Vec<_>>(), vec!["champion", "guide"]);
@@ -2825,6 +3073,7 @@ mod tests {
                 "nope".to_string(),
             ]),
             model: None,
+            role_models: BTreeMap::new(),
         };
         let roles = resolve_on_idle_roles(&config);
         assert_eq!(roles.iter().map(|r| r.name).collect::<Vec<_>>(), vec!["champion"]);
@@ -2838,6 +3087,7 @@ mod tests {
             interval_secs: None,
             on_idle: Some(vec![]),
             model: None,
+            role_models: BTreeMap::new(),
         };
         assert_eq!(resolve_on_idle_roles(&config), Vec::new());
     }
@@ -3032,6 +3282,7 @@ mod tests {
             interval_secs: None,
             on_idle: Some(roles.into_iter().map(str::to_string).collect()),
             model: None,
+            role_models: BTreeMap::new(),
         }
     }
 
@@ -3103,6 +3354,7 @@ mod tests {
             interval_secs: None,
             on_idle: None,
             model: None,
+            role_models: BTreeMap::new(),
         };
         let now = Instant::now();
         assert!(plan_idle_runs(&mut t, &set, root, &cfg, false, false, now).is_empty());
