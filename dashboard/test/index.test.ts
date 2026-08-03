@@ -13,7 +13,7 @@ import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:
 import { exportJWK, generateKeyPair, SignJWT } from "jose";
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import worker from "../src/index";
-import { seedHost, sweepOutcomeEnvelope } from "./testHelpers";
+import { hostHealthEnvelope, revokeHost, seedHost, sweepOutcomeEnvelope } from "./testHelpers";
 
 // Matches the `CF_ACCESS_TEAM_DOMAIN`/`CF_ACCESS_AUD` test bindings in
 // vitest.config.ts.
@@ -376,5 +376,73 @@ describe("GET / — Access JWT wired end to end (real createRemoteJWKSet path)",
 
     expect(response.status).toBe(200);
     expectAuthState(await response.text(), false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phantom fleet member, mechanism 2 (issue #5078): a host revoked in D1 whose
+// `FleetState` Durable Object `health:`/`tokens:` entries were never cleaned
+// up (the `handleRevokeHost` cleanup fetch is best-effort — a DO hiccup must
+// not fail the revoke itself, see its doc comment) must not keep rendering
+// as a live fleet member off that stale DO data.
+// ---------------------------------------------------------------------------
+
+async function ingestHostHealth(hostId: string, key: string): Promise<void> {
+  const response = await callWorker(
+    new Request("https://ingest.example/ingest", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
+      body: JSON.stringify([hostHealthEnvelope()]),
+    }),
+  );
+  expect(response.status).toBe(200);
+}
+
+describe("GET /public/fleet-state, /api/fleet-state — D1-revoked host with un-cleaned-up DO state (issue #5078)", () => {
+  it("a host whose D1 row is revoked but whose DO health/tokens entries were never cleaned up does not appear in /public/fleet-state", async () => {
+    await seedHost(env.DB, "host-stale-revoke", "stale-revoke-key");
+    await ingestHostHealth("host-stale-revoke", "stale-revoke-key");
+
+    // Directly flips D1's revoked_at WITHOUT going through
+    // `handleRevokeHost`'s `/admin/hosts/:id/revoke` route — i.e. without
+    // ever calling the DO's best-effort `/remove-host` cleanup at all. This
+    // is exactly the state a failed (swallowed) cleanup fetch would leave
+    // behind: D1 says revoked, the DO's health:/tokens: entries are untouched.
+    await revokeHost(env.DB, "host-stale-revoke");
+
+    const response = await callWorker(new Request("https://ingest.example/public/fleet-state"));
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { hosts: Record<string, unknown> };
+    expect(body.hosts["host-stale-revoke"]).toBeUndefined();
+  });
+
+  it("...and does not appear in /api/fleet-state (authenticated) either", async () => {
+    await seedHost(env.DB, "host-stale-revoke-2", "stale-revoke-key-2");
+    await ingestHostHealth("host-stale-revoke-2", "stale-revoke-key-2");
+    await revokeHost(env.DB, "host-stale-revoke-2");
+
+    const restore = mockJwksFetch();
+    try {
+      const token = await signToken();
+      const response = await callWorker(
+        new Request("https://ingest.example/api/fleet-state", {
+          headers: { cookie: `CF_Authorization=${token}` },
+        }),
+      );
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as { hosts: Record<string, unknown> };
+      expect(body.hosts["host-stale-revoke-2"]).toBeUndefined();
+    } finally {
+      restore();
+    }
+  });
+
+  it("a non-revoked host's health/tokens entries are unaffected", async () => {
+    await seedHost(env.DB, "host-live", "live-key");
+    await ingestHostHealth("host-live", "live-key");
+
+    const response = await callWorker(new Request("https://ingest.example/public/fleet-state"));
+    const body = (await response.json()) as { hosts: Record<string, unknown> };
+    expect(body.hosts["host-live"]).toBeDefined();
   });
 });

@@ -24,6 +24,7 @@ import { describe, expect, it } from "vitest";
 import {
   classifyAndPruneHosts,
   classifyFreshness,
+  filterRevokedHosts,
   isSweepEntryStale,
   LIVE_AFTER_SEC,
   OFFLINE_AFTER_SEC,
@@ -149,6 +150,54 @@ describe("classifyAndPruneHosts", () => {
     expect(pruneKeys).toEqual(["health:host-a"]);
     expect(hosts["host-a"]?.health).toBeUndefined();
     expect(hosts["host-a"]?.tokens?.freshness?.status).toBe("live");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// filterRevokedHosts (Issue #5078, mechanism 2): a D1-revoked host must never
+// keep rendering as live off a `handleRevokeHost` cleanup fetch that failed
+// and left stale `health:`/`tokens:` entries behind in the DO.
+// ---------------------------------------------------------------------------
+
+describe("filterRevokedHosts", () => {
+  function snapshotWith(hosts: FleetSnapshot["hosts"], activeSweeps: ActiveSweepState[] = []): FleetSnapshot {
+    return { hosts, activeSweeps };
+  }
+
+  it("drops a host entry whose id is in the revoked set — the stale-DO-cleanup case", () => {
+    // Simulates `handleRevokeHost`'s best-effort DO cleanup having failed:
+    // D1 says "revoked", but the DO still has this host's last-known
+    // health/tokens entries.
+    const snapshot = snapshotWith({
+      "host-revoked": { health: { record: { kind: "host.health" }, updatedAt: secondsAgo(60) } },
+      "host-live": { health: { record: { kind: "host.health" }, updatedAt: secondsAgo(30) } },
+    });
+    const filtered = filterRevokedHosts(snapshot, new Set(["host-revoked"]));
+    expect(filtered.hosts["host-revoked"]).toBeUndefined();
+    expect(filtered.hosts["host-live"]).toBeDefined();
+  });
+
+  it("leaves activeSweeps untouched — a mid-run-revoke anomaly must remain visible, not be hidden", () => {
+    const sweep = sweepEntry({ hostId: "host-revoked", sweepId: "still-running" });
+    const snapshot = snapshotWith(
+      { "host-revoked": { health: { record: {}, updatedAt: secondsAgo(60) } } },
+      [sweep],
+    );
+    const filtered = filterRevokedHosts(snapshot, new Set(["host-revoked"]));
+    expect(filtered.hosts["host-revoked"]).toBeUndefined();
+    expect(filtered.activeSweeps).toEqual([sweep]);
+  });
+
+  it("an empty revoked set is a no-op, returning the same snapshot", () => {
+    const snapshot = snapshotWith({ "host-a": { health: { record: {}, updatedAt: secondsAgo(10) } } });
+    expect(filterRevokedHosts(snapshot, new Set())).toBe(snapshot);
+  });
+
+  it("a revoked id absent from the snapshot's hosts is simply a no-op for that id", () => {
+    const snapshot = snapshotWith({ "host-a": { health: { record: {}, updatedAt: secondsAgo(10) } } });
+    const filtered = filterRevokedHosts(snapshot, new Set(["host-never-existed"]));
+    expect(filtered.hosts["host-a"]).toBeDefined();
+    expect(Object.keys(filtered.hosts)).toEqual(["host-a"]);
   });
 });
 

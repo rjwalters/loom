@@ -188,6 +188,41 @@ export interface FleetSnapshot {
   activeSweeps: ActiveSweepState[];
 }
 
+/**
+ * Drop any `hosts` entry belonging to a hostId D1 has recorded as revoked
+ * (Issue #5078, mechanism 2 — "a host known only from a stale DO record").
+ *
+ * `handleRevokeHost` (`src/index.ts`) writes D1's `revoked_at` unconditionally,
+ * then best-effort clears this DO's `health:`/`tokens:` entries for that host
+ * — that cleanup fetch is wrapped in try/catch specifically so a transient DO
+ * failure can't fail the revoke itself (see `FleetState.removeHost`'s doc
+ * comment), which means a failed cleanup can leave those entries in the DO
+ * indefinitely. Rather than rely on that best-effort cleanup having
+ * succeeded, `src/index.ts` treats D1's `revoked_at` as authoritative at
+ * *read* time too: a snapshot never renders a revoked host as live, whether
+ * or not its DO-side cleanup actually ran.
+ *
+ * Deliberately does **not** touch `activeSweeps` — a sweep still reporting
+ * against a host revoked mid-run is a real anomaly (`removeHost`'s own doc
+ * comment: "an in-flight sweep on a host being revoked mid-run is a real
+ * anomaly worth surfacing"), not something this filter should hide; it stays
+ * visible (as an unattributed sweep, once the host's `hosts` entry above is
+ * gone — see `publicPage.ts`'s `renderFleetOverview`).
+ */
+export function filterRevokedHosts(
+  snapshot: FleetSnapshot,
+  revokedHostIds: ReadonlySet<string>,
+): FleetSnapshot {
+  if (revokedHostIds.size === 0) return snapshot;
+  const hosts: FleetSnapshot["hosts"] = {};
+  for (const [hostId, entry] of Object.entries(snapshot.hosts)) {
+    if (!revokedHostIds.has(hostId)) {
+      hosts[hostId] = entry;
+    }
+  }
+  return { hosts, activeSweeps: snapshot.activeSweeps };
+}
+
 /** Body accepted by the internal `POST /update` route — one record's worth
  * of live-state effect, already authenticated/validated by the Worker
  * before it reaches the Durable Object. */
@@ -323,7 +358,11 @@ export class FleetState implements DurableObject {
    * concept at this layer. Does **not** touch that host's `sweep:<sweepId>`
    * entries: an in-flight sweep on a host being revoked mid-run is a real
    * anomaly worth surfacing (via its own staleness), not something this
-   * best-effort cleanup should paper over.
+   * best-effort cleanup should paper over. Because the caller's fetch to
+   * this route is itself best-effort (issue #5078), a failure here can leave
+   * these entries behind indefinitely — [`filterRevokedHosts`] is the
+   * read-time backstop for exactly that case, treating D1's `revoked_at` as
+   * authoritative over whatever this method did or did not manage to delete.
    */
   private async removeHost(hostId: string): Promise<void> {
     await this.state.storage.delete([`health:${hostId}`, `tokens:${hostId}`]);

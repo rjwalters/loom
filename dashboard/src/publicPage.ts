@@ -271,9 +271,9 @@ function renderHostHealthRow(
 }
 
 /** "3 hosts: 2 live, 1 offline (robb-pro, last seen 5h ago)" — the overview
- * heading's explicit totals (issue #4957's AC). Hosts with no `health` entry
- * at all (known only from `activeSweeps`) are counted in `hostIds.length`
- * but contribute no freshness bucket — nothing to classify. */
+ * heading's explicit totals (issue #4957's AC). `hostIds` is already the
+ * health-bearing host set (see `renderFleetOverview`), so every id here
+ * contributes a freshness bucket — nothing to skip. */
 function renderFreshnessSummary(hostIds: readonly string[], hosts: RedactedFleetSnapshot["hosts"], now: Date): string {
   const counts: Record<HostFreshness, number> = { live: 0, stale: 0, offline: 0 };
   const offlineDescriptions: string[] = [];
@@ -295,14 +295,65 @@ function renderFreshnessSummary(hostIds: readonly string[], hosts: RedactedFleet
   return `: ${parts.join(", ")}`;
 }
 
+/**
+ * Fleet overview: hosts with current `health:` data, plus active sweeps
+ * split into "attributed" (their `hostId` is one of those hosts) and
+ * "unattributed" (issue #5078).
+ *
+ * **Host count/cards**: `hostIds` — and therefore both the "Hosts (N)"
+ * heading and every rendered card — is the set of `snapshot.hosts` entries
+ * that actually carry a `health` record, not every key `snapshot.hosts`
+ * happens to have. A `tokens`-only entry (no `health`) never rendered a card
+ * anyway (`renderHostHealthRow` returns `""` without `health`) but was still
+ * counted in the old `Object.keys(snapshot.hosts).length` heading — this
+ * keeps the count and the card list in exact agreement. Combined with
+ * `src/fleetState.ts`'s `filterRevokedHosts` (mechanism 2: a D1-revoked host
+ * whose best-effort DO cleanup failed) and the simple fact that the Durable
+ * Object never creates a `hosts` entry from a `sweep:`-only record at all
+ * (mechanism 1's originally-suspected cause — see `classifyAndPruneHosts`),
+ * this is the AC's "header host count reflects hosts with health data" and
+ * "a host known only from activeSweeps does not render as a fleet card".
+ *
+ * **Active sweeps**: sweeps whose `hostId` is not in `hostIds` — a host with
+ * no current health data, whether because its `sweep.started` arrived before
+ * its first `host.health`, or because it was revoked mid-run with genuinely
+ * in-flight work (`fleetState.ts:323-330`'s deliberate "don't touch
+ * `sweep:` entries on revoke" behavior) — are rendered in their own
+ * "Unattributed sweeps" table instead of the main one, so the mid-run-revoke
+ * anomaly stays visible rather than silently vanishing (AC: "remains
+ * discoverable") while no longer inflating the primary "Active sweeps (N)"
+ * count with sweeps that have no live host behind them.
+ */
 export function renderFleetOverview(snapshot: RedactedFleetSnapshot, now: Date = new Date()): string {
-  const hostIds = Object.keys(snapshot.hosts).sort();
+  const hostIds = Object.keys(snapshot.hosts)
+    .filter((id) => snapshot.hosts[id]?.health)
+    .sort();
+  const hostIdSet = new Set(hostIds);
   const healthRows = hostIds
     .map((id) => renderHostHealthRow(id, snapshot.hosts[id]?.health, now))
     .filter((row) => row.length > 0)
     .join("\n");
-  const sweepRows = snapshot.activeSweeps.map(renderActiveSweepRow).join("\n");
+
+  const attributedSweeps = snapshot.activeSweeps.filter((sweep) => hostIdSet.has(sweep.hostId));
+  const unattributedSweeps = snapshot.activeSweeps.filter((sweep) => !hostIdSet.has(sweep.hostId));
+  const sweepRows = attributedSweeps.map(renderActiveSweepRow).join("\n");
+  const unattributedSweepRows = unattributedSweeps.map(renderActiveSweepRow).join("\n");
+
   const freshnessSummary = renderFreshnessSummary(hostIds, snapshot.hosts, now);
+
+  const unattributedSection =
+    unattributedSweeps.length > 0
+      ? `<h3>Unattributed sweeps (${unattributedSweeps.length})</h3>
+    <p class="muted">Reporting against a host with no current health data — a
+      host that has not yet sent its first <code>host.health</code>, or one
+      revoked mid-run. Not counted in "Active sweeps" above.</p>
+    <table>
+      <thead>
+        <tr><th>Host</th><th>Visibility</th><th>Repo / Issue</th><th>Phase</th><th>Model</th><th>Effort</th><th>Started</th><th>Updated</th></tr>
+      </thead>
+      <tbody>${unattributedSweepRows}</tbody>
+    </table>`
+      : "";
 
   return `<section id="fleet-overview">
     <h2>Fleet overview</h2>
@@ -311,13 +362,14 @@ export function renderFleetOverview(snapshot: RedactedFleetSnapshot, now: Date =
       <thead><tr><th>Host</th><th>Status</th><th>Saturation</th><th>Detail</th></tr></thead>
       <tbody>${healthRows || `<tr><td colspan="4" class="muted">No host health reported yet.</td></tr>`}</tbody>
     </table>
-    <h3>Active sweeps (${snapshot.activeSweeps.length})</h3>
+    <h3>Active sweeps (${attributedSweeps.length})</h3>
     <table>
       <thead>
         <tr><th>Host</th><th>Visibility</th><th>Repo / Issue</th><th>Phase</th><th>Model</th><th>Effort</th><th>Started</th><th>Updated</th></tr>
       </thead>
       <tbody>${sweepRows || `<tr><td colspan="8" class="muted">No sweeps currently running.</td></tr>`}</tbody>
     </table>
+    ${unattributedSection}
   </section>`;
 }
 
