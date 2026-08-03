@@ -144,6 +144,16 @@ enum Commands {
     /// probe is never trusted alone (#4694: it twice declared a live,
     /// dispatching daemon dead). A DEAD verdict requires all three independent
     /// signals (IPC, launchd/pid-file classification, `pgrep`) to agree.
+    ///
+    /// Not every section is trustworthy from the same vantage point (#5061):
+    /// `liveness`/`dispatch`/`tokens`/`roles`/`observability` are
+    /// daemon-authoritative (sourced from the daemon's own IPC round-trip or
+    /// a local probe of this host), so they read the same over SSH as
+    /// locally. `queues`/`throughput` instead run `gh` calls in THIS
+    /// process — a `gh` missing from a non-login shell's `PATH` (this
+    /// process's `PATH`, not the daemon's) reports as one distinct fact
+    /// rather than a per-repo forge-query failure, and cross-references the
+    /// daemon's own `credential_preflight` verdict when available.
     Health {
         /// Window for the role-tick and throughput sections: `30m` (default),
         /// `2h`, `90s`, `1d`, or a bare number of seconds.

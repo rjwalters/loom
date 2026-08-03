@@ -599,8 +599,20 @@ async fn handle_health(
         Err(e) => (None, Some(e.to_string())),
     };
 
-    let pipeline = match &report {
-        Some(r) => {
+    // Probe ONCE whether this process can even run `gh` at all (#5061) —
+    // same rule and same rationale as `cli::health`'s collector: a missing/
+    // non-executable `gh` would otherwise fail identically for every managed
+    // repo, rendering as "forge query FAILED for: <every repo>" and reading
+    // like a forge outage. In practice this daemon process already passed
+    // `credential_preflight` at startup (which itself depends on `gh`
+    // working), so this mostly guards a `gh` that has gone missing since —
+    // but the check is symmetric with the CLI collector so this route's
+    // `queues`/`throughput` never regress to the pre-#5061 per-repo noise.
+    let gh_unavailable =
+        pipeline_snapshot::probe_gh_availability(Path::new(pipeline_snapshot::DEFAULT_GH_BIN))
+            .err();
+    let pipeline = match (&report, &gh_unavailable) {
+        (Some(r), None) => {
             let roots: Vec<PathBuf> = r.per_repo.iter().map(|repo| repo.root.clone()).collect();
             Some(
                 pipeline_rows_cached(source, roots, cache)
@@ -610,7 +622,7 @@ async fn handle_health(
                     .collect::<Vec<_>>(),
             )
         }
-        None => None,
+        _ => None,
     };
 
     let (ranking_present, ranking_age_secs) = report
@@ -647,6 +659,7 @@ async fn handle_health(
         ranking_present,
         ranking_age_secs,
         pipeline,
+        gh_unavailable,
         // #4824 — this route runs *inside* the daemon, so its own
         // `BUILT_COMMIT` is by construction the answering daemon's and the
         // skew check resolves to `Match`. Threaded in anyway (rather than
