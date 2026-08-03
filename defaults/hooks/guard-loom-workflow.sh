@@ -110,6 +110,150 @@ strip_literal_text() {
 }
 
 # =============================================================================
+# GH-PR-MERGE-REDIRECT FALSE-POSITIVE MASKING (issue #5109)
+#
+# The 'gh pr merge' redirect check below (guard tag loom:gh-pr-merge-redirect)
+# used to grep the RAW, unmasked $COMMAND for the literal substring "gh pr
+# merge" anywhere in the byte stream -- so it fired on commands that never
+# actually invoked the disallowed CLI, only mentioned the phrase as inert
+# text: a git commit message (passed via the CLAUDE.md-documented `-m
+# "$(cat <<'EOF' ... EOF)"` heredoc idiom) that quoted the phrase as prose
+# documenting the very rule this guard enforces, and a `gh issue list
+# --search "..."` query whose search string happened to contain the phrase
+# as text to search FOR, not a command to run.
+#
+# The two functions below build a MASKED copy of $COMMAND, used ONLY for the
+# 'gh pr merge' substring check immediately below -- never for any other
+# guard in this file, and never for decision-log redaction (that stays on
+# strip_literal_text() above, unchanged). Composition matters: heredoc-body
+# masking runs FIRST so any quote/backtick characters living inside a masked
+# heredoc body can no longer interfere with the flag-value masking pass that
+# runs second.
+#
+# Deliberately narrow, matching this repo's established masking conventions
+# (see guard-destructive-generic.sh's mask_heredoc_bodies(), #5000/#5087):
+# only two specific, well-understood-safe shapes are masked, and a command
+# that merely EXECUTES the disallowed CLI through a wrapper -- `sh -c "gh pr
+# merge 123"`, `bash -c 'gh pr merge 123'`, `eval "gh pr merge 123"` -- is
+# UNCHANGED by either pass (neither `-c` nor `eval`'s argument is in the
+# whitelist below) and still denies exactly as before. Masking only ever
+# narrows what this ONE check can see; it never widens what it misses.
+# =============================================================================
+
+# Mask the BODY of a heredoc whose consuming command is `cat` and whose
+# delimiter is quoted (`cat <<'EOF' ... EOF` / `cat <<"EOF" ... EOF`, and the
+# `<<-` tab-stripping variant). This is exactly the CLAUDE.md-documented
+# idiom for multi-line commit/PR-body text: `git commit -m "$(cat <<'EOF'
+# ... EOF)"`. A heredoc consumed by `cat` can only ever become inert text
+# data (`cat` never executes anything), and a QUOTED delimiter guarantees
+# bash performs no $()/backtick/$VAR expansion within the body, so the body
+# is 100% literal text regardless of its contents.
+#
+# Deliberately narrower than "any heredoc": a heredoc feeding an INTERPRETER
+# instead (`bash <<'EOF' ... EOF`, `sh <<EOF ... EOF`) is genuinely live code
+# and must stay visible to the merge-redirect check, so masking is gated on
+# the word immediately before `<<` being `cat` specifically.
+#
+# Mirrors the #5087 lesson: only a heredoc block that is PROVABLY CLOSED
+# inside the buffer (its bare delimiter line is found) gets its body masked.
+# An unterminated/unrecognized opener masks NOTHING and the raw text flows
+# through unchanged to the check below.
+mask_cat_heredoc_bodies() {
+    printf '%s' "$1" | awk '
+    BEGIN {
+        SQ = sprintf("%c", 39)
+        DQ = sprintf("%c", 34)
+    }
+    { lines[NR] = $0 }
+    END {
+        nl = NR
+        for (i = 1; i <= nl; i++) {
+            line = lines[i]
+            off = 1
+            while (1) {
+                p = index(substr(line, off), "<<")
+                if (p == 0) break
+                p = off + p - 1
+                off = p + 2
+                # Require the word immediately before `<<` (ignoring
+                # trailing whitespace) to be a bare "cat".
+                pre = substr(line, 1, p - 1)
+                if (pre !~ /(^|[^A-Za-z0-9_])cat[ \t]*$/) continue
+                start = p + 2
+                if (substr(line, start, 1) == "-") start++
+                while (substr(line, start, 1) == " " || substr(line, start, 1) == "\t") start++
+                qc = substr(line, start, 1)
+                if (qc != SQ && qc != DQ) continue
+                start++
+                wordend = start
+                while (substr(line, wordend, 1) ~ /^[A-Za-z0-9_]$/) wordend++
+                if (wordend <= start) continue
+                if (substr(line, wordend, 1) != qc) continue
+                delim = substr(line, start, wordend - start)
+                closeat = 0
+                for (j = i + 1; j <= nl; j++) {
+                    trimmed = lines[j]
+                    sub(/^[ \t]+/, "", trimmed)
+                    if (trimmed == delim) { closeat = j; break }
+                }
+                if (closeat == 0) continue
+                for (j = i + 1; j < closeat; j++) {
+                    gsub(/./, "X", lines[j])
+                }
+                break
+            }
+        }
+        out = lines[1]
+        for (i = 2; i <= nl; i++) out = out "\n" lines[i]
+        printf "%s", out
+    }'
+}
+
+# Mask the quoted VALUE of known non-executing, text-only flags used by
+# git/gh subcommands: -m/--message, --body, --notes, --title, --comment,
+# --search. A near-duplicate of strip_literal_text() above (which is used
+# only for decision-log redaction) with --search added, kept as a SEPARATE
+# function so this decision-time masking can never change what
+# strip_literal_text() logs. Same conservative floor as strip_literal_text():
+# a span that still contains an unmasked `$(`/backtick (e.g. real command
+# substitution, not yet neutralized by the heredoc pass above) is left
+# completely untouched.
+mask_data_flag_values() {
+    printf '%s' "$1" | awk '
+    BEGIN {
+        SQ = sprintf("%c", 39)
+        DQ = sprintf("%c", 34)
+        re = "(^|[ \t\n])(--message|--body|--notes|--title|--comment|--search|-m)[ \t]*=?[ \t]*(" \
+             DQ "[^" DQ "]*" DQ "|" SQ "[^" SQ "]*" SQ ")"
+        buf = ""
+    }
+    { buf = buf (NR > 1 ? "\n" : "") $0 }
+    END {
+        s = buf
+        out = ""
+        while (match(s, re)) {
+            pre     = substr(s, 1, RSTART - 1)
+            matched = substr(s, RSTART, RLENGTH)
+            s       = substr(s, RSTART + RLENGTH)
+            qpos = 0
+            for (i = 1; i <= length(matched); i++) {
+                c = substr(matched, i, 1)
+                if (c == DQ || c == SQ) { qpos = i; break }
+            }
+            head  = substr(matched, 1, qpos)
+            qchar = substr(matched, qpos, 1)
+            inner = substr(matched, qpos + 1, length(matched) - qpos - 1)
+            if (index(inner, "$(") == 0 && index(inner, "`") == 0) {
+                gsub(/./, "X", inner)
+            }
+            out = out pre head inner qchar
+        }
+        out = out s
+        printf "%s", out
+    }'
+}
+
+# =============================================================================
 # DECISION TELEMETRY (issue #3771 / #3898) — one JSONL record per deny decision,
 # identical schema + toggle semantics to guard-destructive.sh so both guards'
 # fires land in the SAME .loom/logs/guard-decisions.log for the standing
@@ -290,7 +434,12 @@ ask() {
 # LOOM: Prefer merge-pr.sh over gh pr merge
 # =============================================================================
 
-if echo "$COMMAND" | grep -qE 'gh\s+pr\s+merge'; then
+# Match against a MASKED copy of $COMMAND (issue #5109) so a mention of the
+# phrase inside a cat-heredoc commit-message body or a --search/--body/-m/etc
+# quoted value doesn't false-positive as a real invocation. See the masking
+# functions' doc comments above for exactly what is (and is NOT) neutralized.
+GH_PR_MERGE_SCAN_TEXT=$(mask_data_flag_values "$(mask_cat_heredoc_bodies "$COMMAND")")
+if echo "$GH_PR_MERGE_SCAN_TEXT" | grep -qE 'gh\s+pr\s+merge'; then
     # Resolve the merge-pr.sh path for the current repo context. Prefer an
     # in-repo installed copy (./.loom/scripts/merge-pr.sh); fall back to the
     # loom-checkout copy under defaults/scripts/ (via $LOOM_HOME) when the repo
