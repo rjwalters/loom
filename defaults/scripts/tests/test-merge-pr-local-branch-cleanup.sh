@@ -346,6 +346,7 @@ MATCH_SHA_J="$(git -C "$REPO" rev-parse feature/issue-800)"
 
 CLEANUP_PRIMARY_CHECKOUT=false
 out_j="$(_maybe_delete_local_branch "feature/issue-800" "$MATCH_SHA_J" 2>&1)"
+# shellcheck disable=SC2034
 CLEANUP_PRIMARY_CHECKOUT=true
 
 if [[ "$out_j" == *"checked out in the primary repository checkout"* ]] \
