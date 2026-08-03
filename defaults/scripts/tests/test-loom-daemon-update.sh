@@ -4792,7 +4792,7 @@ fi
 # 66. --timeout requires a numeric argument -> exit 1 rather than silently
 #     swallowing a bad value (Issue #5138).
 # ============================================================
-out66=$(bash "$UPDATE_SCRIPT" --drain --timeout notanumber 2>&1)
+bash "$UPDATE_SCRIPT" --drain --timeout notanumber >/dev/null 2>&1
 rc66=$?
 assert_eq "1" "$rc66" "--timeout with a non-numeric argument -> exit 1"
 
@@ -4870,10 +4870,10 @@ SD_STATE68="$W68/systemd-pid-state"
 write_fake_systemd_pid_bin "$SD_BIN68" "$SD_LOG68" "$SD_STATE68" "4242:active:success" \
     "$RESTART_MARKER68" "${RELAUNCHED_PID68}:active:success"
 
-out68=$( cd "$W68" && PATH="$SD_BIN68:$TEST_PATH" LOOM_SYSTEMD_FORCE=1 LOOM_DAEMON_SYSTEMD=1 \
+( cd "$W68" && PATH="$SD_BIN68:$TEST_PATH" LOOM_SYSTEMD_FORCE=1 LOOM_DAEMON_SYSTEMD=1 \
     LOOM_SYSTEMD_UNIT="loom-daemon-test-sd68.service" \
     LOOM_DAEMON_BIN="$INSTALLED68" NEW_FAKE_BIN_SRC="$NEW_FAKE68" \
-    bash "$UPDATE_SCRIPT" --restart-now 2>&1 )
+    bash "$UPDATE_SCRIPT" --restart-now >/dev/null 2>&1 )
 rc68=$?
 kill "$RELAUNCHED_PID68" 2>/dev/null || true
 assert_eq "0" "$rc68" "--restart-now update exits 0"
@@ -5028,12 +5028,12 @@ SD_STATE71="$W71/systemd-pid-state"
 write_fake_systemd_pid_bin "$SD_BIN71" "$SD_LOG71" "$SD_STATE71" "9999:active:success" \
     "$RESTART_MARKER71" "0:failed:timeout" "${RECOVERED_PID71}:active:success"
 
-out71=$( cd "$W71" && PATH="$SD_BIN71:$TEST_PATH" LOOM_SYSTEMD_FORCE=1 LOOM_DAEMON_SYSTEMD=1 \
+( cd "$W71" && PATH="$SD_BIN71:$TEST_PATH" LOOM_SYSTEMD_FORCE=1 LOOM_DAEMON_SYSTEMD=1 \
     LOOM_SYSTEMD_UNIT="loom-daemon-test-sd71.service" \
     LOOM_DAEMON_BIN="$INSTALLED71" NEW_FAKE_BIN_SRC="$NEW_FAKE71" \
     LOOM_DAEMON_DRAIN_POLL_SECS=1 LOOM_DAEMON_RESTART_POLL_INTERVAL=0.2 \
     LOOM_DAEMON_RESTART_KICKSTART_POLL_SECS=3 \
-    bash "$UPDATE_SCRIPT" --drain --force-after-timeout 2>&1 )
+    bash "$UPDATE_SCRIPT" --drain --force-after-timeout >/dev/null 2>&1 )
 rc71=$?
 kill "$RECOVERED_PID71" 2>/dev/null || true
 assert_eq "0" "$rc71" "drain timeout WITH --force-after-timeout still self-heals a failed unit -> exit 0"
