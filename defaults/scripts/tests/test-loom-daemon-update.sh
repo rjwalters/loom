@@ -202,6 +202,21 @@ EOF
     ( cd "$root" && git init -q && git -c user.email=test@test -c user.name=test commit -q --allow-empty -m init )
 }
 
+# install_update_script_into <root> (#5140) — drops a real copy of
+# loom-daemon-update.sh (plus every lib/ it sources, resolved relative to its
+# own $SCRIPT_DIR) into a fixture's .loom/scripts/, so the self-location
+# fallback can be exercised on a THROWAWAY checkout. Every other scenario
+# invokes $UPDATE_SCRIPT from the real repo, which is fine while $PWD decides
+# the repo root — but the whole point of the #5140 scenarios is that the
+# script's OWN location decides it, so they must not run the real repo's copy.
+install_update_script_into() {
+    local root="$1"
+    mkdir -p "$root/.loom/scripts/cli" "$root/.loom/scripts/lib"
+    cp "$UPDATE_SCRIPT" "$root/.loom/scripts/cli/loom-daemon-update.sh"
+    chmod +x "$root/.loom/scripts/cli/loom-daemon-update.sh"
+    cp "$CLI_DIR/../lib/"*.sh "$root/.loom/scripts/lib/"
+}
+
 # new_fixture_with_origin <root> <bare_dir> (#4330) — builds on new_fixture(),
 # adding a local BARE repo as `origin` so the ff-first sync path (which
 # resolves the default branch via refs/remotes/origin/HEAD, then fetches and
@@ -2028,19 +2043,78 @@ else
     echo "  output: $out"
 fi
 
-# Dev-mode fallback (scope guard, filed AC5): the SAME non-Loom directory,
-# invoked directly (no LOOM_MACHINE_CHECKOUT -- no dispatcher), still refuses
-# exactly as before #4229. Machine mode is additive, never a replacement.
-out_dev=$( cd "$NON_LOOM_DIR" && PATH="$TEST_PATH" HOME="$HOME_WM1" bash "$UPDATE_SCRIPT" --check 2>&1 )
-rc_dev=$?
-assert_eq "1" "$rc_dev" "dev-mode fallback unchanged: --check from a non-Loom \$PWD (no dispatcher) still exits 1"
+# ============================================================
+# M2 (#5140). CWD-independent source-tree resolution, direct invocation (no
+#     dispatcher, no LOOM_MACHINE_CHECKOUT). The reported failure: the script
+#     was invoked BY ABSOLUTE PATH from $HOME on a fleet host where
+#     `~/.loom/tokens` exists (the token pool `loom-daemon tokens bootstrap`
+#     provisions), so the old `.loom`-only upward walk matched $HOME on its
+#     first iteration and refused with "No loom-daemon/Cargo.toml found at
+#     $HOME/loom-daemon" -- a path the operator never named. Two fixes are
+#     asserted here: the walk now requires .git ALONGSIDE .loom/ (so a bare
+#     ~/.loom is never mistaken for a checkout), and the script falls back to
+#     the checkout it physically lives in, which is unambiguous when it is
+#     invoked by absolute path.
+# ============================================================
+WM2="$BASE_WORKDIR/wm2-checkout"
+new_fixture "$WM2"
+install_update_script_into "$WM2"
+HEADM2="$(cd "$WM2" && git rev-parse --short HEAD)"
+write_fake_daemon "$WM2/installed-loom-daemon" "$HEADM2" "$WM2/marker"
+HOME_LIKE_M2="$BASE_WORKDIR/wm2-home"
+mkdir -p "$HOME_LIKE_M2/.loom/tokens"   # machine-level daemon state, NOT a repo
+out_m2=$( cd "$HOME_LIKE_M2" && PATH="$TEST_PATH" HOME="$HOME_LIKE_M2" \
+    LOOM_DAEMON_BIN="$WM2/installed-loom-daemon" \
+    bash "$WM2/.loom/scripts/cli/loom-daemon-update.sh" --check 2>&1; echo "EXIT=$?" )
+rc_m2=$(echo "$out_m2" | grep -o 'EXIT=[0-9]*' | cut -d= -f2)
+assert_eq "0" "$rc_m2" "#5140: --check from a \$HOME-like dir holding a bare .loom/ resolves the script's own checkout"
 TESTS_RUN=$((TESTS_RUN + 1))
-if echo "$out_dev" | grep -qi "Not in a Loom workspace"; then
+if echo "$out_m2" | grep -qF "$HOME_LIKE_M2/loom-daemon"; then
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} #5140: never resolves a bare ~/.loom directory as the repo root"
+    echo "  output: $out_m2"
+else
     TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "${GREEN}✓${NC} dev-mode fallback unchanged: reports 'Not in a Loom workspace'"
+    echo -e "${GREEN}✓${NC} #5140: never resolves a bare ~/.loom directory as the repo root"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out_m2" | grep -qF "using this script's own checkout: $WM2"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} #5140: announces the self-location fallback (never a silent switch)"
 else
     TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "${RED}✗${NC} dev-mode fallback unchanged: reports 'Not in a Loom workspace'"
+    echo -e "${RED}✗${NC} #5140: announces the self-location fallback (never a silent switch)"
+    echo "  output: $out_m2"
+fi
+
+# ============================================================
+# M3 (#5140, scope guard -- supersedes the pre-#5140 "dev-mode fallback"
+#     assertion that used the REAL repo's script copy). When NEITHER $PWD NOR
+#     the script's own location is inside a Loom checkout, the refusal is
+#     preserved: exit 1, naming the CWD it searched and what a checkout
+#     requires. A bare `.loom/` in the CWD must not change that. Machine mode
+#     (M1) remains the additive escape hatch.
+# ============================================================
+WM3_TOOLS="$BASE_WORKDIR/wm3-tools"   # a script tree that is NOT a Loom checkout
+mkdir -p "$WM3_TOOLS/cli" "$WM3_TOOLS/lib"
+cp "$UPDATE_SCRIPT" "$WM3_TOOLS/cli/loom-daemon-update.sh"
+cp "$CLI_DIR/../lib/"*.sh "$WM3_TOOLS/lib/"
+NON_REPO_M3="$BASE_WORKDIR/wm3-cwd"
+mkdir -p "$NON_REPO_M3/.loom"
+HOME_M3="$BASE_WORKDIR/wm3-home"
+mkdir -p "$HOME_M3"
+out_m3=$( cd "$NON_REPO_M3" && PATH="$TEST_PATH" HOME="$HOME_M3" \
+    bash "$WM3_TOOLS/cli/loom-daemon-update.sh" --check 2>&1; echo "EXIT=$?" )
+rc_m3=$(echo "$out_m3" | grep -o 'EXIT=[0-9]*' | cut -d= -f2)
+assert_eq "1" "$rc_m3" "#5140: refuses (exit 1) when neither \$PWD nor the script's own tree is a Loom checkout"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out_m3" | grep -qi "Not in a Loom workspace" && echo "$out_m3" | grep -qF "$NON_REPO_M3"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} #5140: the refusal names the CWD it searched"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} #5140: the refusal names the CWD it searched"
+    echo "  output: $out_m3"
 fi
 
 # ============================================================
