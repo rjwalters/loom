@@ -517,7 +517,7 @@ Then decide:
 | Condition | Verdict | Action |
 |-----------|---------|--------|
 | `STANDDOWN_COUNT >= LOOM_MAX_STANDDOWN_STREAK` (default **3**) AND claim age ≥ `LOOM_STALE_REVIEWING_MINUTES` (default **30**) | **Stale — bounded fallback** (see below) | Force-reclaim regardless of `COMMENTS_AFTER`. Breaks the livelock even if the marker/exclusion logic above is somehow bypassed — but the streak alone is never enough (#4790): it also requires the claim to have aged past the normal staleness threshold, so a high *peer arrival rate* (several concurrent Judges each standing down within minutes) cannot force-reclaim a claim that is still genuinely fresh. |
-| Claim age < `LOOM_STALE_REVIEWING_MINUTES` (default **30**), OR `COMMENTS_AFTER > 0` | **Fresh** — a Judge is actively working this PR | **Do not stomp the claim.** Post a marked stand-down comment (see below), then skip this PR and continue the batch to the next candidate PR. |
+| Claim age < `LOOM_STALE_REVIEWING_MINUTES` (default **30**), OR `COMMENTS_AFTER > 0` | **Fresh** — a Judge is actively working this PR | **Do not stomp the claim.** Post a marked stand-down comment **unless the latest comment on the PR already carries an identical marker for this exact `$CLAIMED_AT`** (see "Duplicate stand-down suppression" below — then skip silently instead), then skip this PR and continue the batch to the next candidate PR. |
 | Claim age ≥ `LOOM_STALE_REVIEWING_MINUTES` AND `COMMENTS_AFTER == 0` | **Stale** — the claiming Judge's process almost certainly died mid-review | Reclaim (see below), then proceed with the normal review from step 3. |
 | Timeline API call fails or returns empty (`CLAIMED_AT` unset) | **Unknown — fail safe** | Treat as **fresh**. Never stomp a claim on API failure or missing data. |
 
@@ -537,6 +537,27 @@ instead:
 ```bash
 gh pr comment $N --body "Judge pass: PR still carries a fresh \`loom:reviewing\` claim (claimed $CLAIMED_AT) — standing down without reclaiming. Not stomping.
 <!-- loom:standdown claim=$CLAIMED_AT -->"
+```
+
+**Duplicate stand-down suppression (#5123)**: the marker convention above stops
+a stand-down from ever looking like live activity, but it does not by itself
+stop a *pile of identical stand-downs* from accumulating — every "Fresh" pass
+still posted a new marked comment unconditionally, so a claim sitting just
+inside the TTL produced one near-identical comment per Judge pass (observed
+live on PR #5115: 3 stand-downs in 85 seconds). Re-verification of staleness
+still runs on **every** pass — only the redundant comment is skipped. Before
+posting the stand-down comment above, check whether the *latest* comment on
+the PR already carries the identical marker for this exact `$CLAIMED_AT`
+(`COMMENTS_JSON` was already fetched above — no extra API call needed):
+
+```bash
+LATEST_COMMENT_BODY=$(printf '%s\n' "$COMMENTS_JSON" | jq -r 'sort_by(.created_at) | last | .body // empty')
+if printf '%s' "$LATEST_COMMENT_BODY" | grep -qF -- "$MARKER"; then
+  echo "Latest comment already carries the stand-down marker for claim $CLAIMED_AT — skipping duplicate comment (still standing down, not reclaiming)."
+else
+  gh pr comment $N --body "Judge pass: PR still carries a fresh \`loom:reviewing\` claim (claimed $CLAIMED_AT) — standing down without reclaiming. Not stomping.
+<!-- loom:standdown claim=$CLAIMED_AT -->"
+fi
 ```
 
 **Bounded fallback (AC3, #4618; age-floor join added by #4798)**:

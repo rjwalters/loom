@@ -1739,6 +1739,29 @@ is shared by both role prompts, mirroring how
 `LOOM_STALE_REVIEWING_MINUTES`/`LOOM_STALE_TREATING_MINUTES` are already
 shared.
 
+### `loom:curating` (Curator): agent-side only, no daemon backstop (#5123)
+
+`loom:curating` gained the same TTL + standdown-marker + bounded-fallback
+mechanism as `loom:reviewing`/`loom:treating` — `.claude/commands/loom/curator.md`'s
+"Stale `loom:curating` Claim Check" — but **only** on the agent-side fast
+path. Unlike the PR-side claims above, `reconcile_pr_claims` (and
+`reconcile_workspace`) do **not** reconcile `loom:curating` at all: there is
+no always-on daemon backstop for a dead Curator claim today. A stranded
+`loom:curating` claim is only reclaimed when another Curator pass happens to
+revisit the same issue (Priority 1/2 discovery, a re-curation pass, or an
+explicit `/curator <number>` naming it) and runs the stale-claim check —
+there is no periodic sweep that reclaims it in the background the way
+`reconcile_pr_claims` does for `loom:reviewing`/`loom:treating` or
+`reconcile_workspace` does for `loom:building`. `LOOM_STALE_CURATING_MINUTES`
+(default 30, matching `LOOM_STALE_REVIEWING_MINUTES`) and
+`LOOM_MAX_STANDDOWN_STREAK` are shared with the Judge/Doctor convention
+above. Extending `claim_reconciliation` to cover `loom:curating` as a fourth
+surface (mirroring `reconcile_pr_claims`'s `decide_pr`, keyed off the same
+`labeled` timeline event) is a natural follow-up but was not required to
+close #5123 — the agent-side check is a complete fix on its own, just with a
+longer worst-case tail (bounded by how often issues in the Curator's queues
+get revisited) than a PR-side claim has.
+
 ## Stacked-PR dependency — #3729 (v1), #3747 (v2 item 1)
 
 Stacked-PR mode pipelines a genuine dependency: when issue B consumes issue

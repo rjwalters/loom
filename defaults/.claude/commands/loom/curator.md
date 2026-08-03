@@ -30,6 +30,11 @@ If a number is provided (e.g., `/curator 42`):
 
 **CRITICAL**: You MUST run the `gh issue edit` command above BEFORE doing any other work. The `loom:curating` label signals that you have claimed the issue and prevents duplicate work.
 
+**If the named issue already carries `loom:curating`** (someone else's — or a
+dead — claim), do not add the label blindly on top of it: run the "Stale
+`loom:curating` Claim Check" (under "Claiming Work" below) first to decide
+stand-down vs. reclaim.
+
 If no argument is provided, use the normal "Finding Work" workflow below.
 
 ## Label Workflow
@@ -230,6 +235,135 @@ gh issue edit <number> --add-label "loom:curating"
 ```
 
 This signals to other Curators that you're working on this issue. The search command above already filters out claimed issues, so you won't see issues other Curators are enhancing.
+
+**If the issue you selected already carries `loom:curating`** (a point-in-time
+race with the Finding Work query above, or a claim surfaced some other way —
+e.g. an explicit user instruction naming an already-claimed issue), do **not**
+add the label a second time and do **not** silently skip it forever — run the
+"Stale `loom:curating` Claim Check" below first. A dead Curator's claim (parent
+sweep crashed mid-enhancement) is otherwise invisible to every later pass, the
+same livelock shape already fixed for `loom:reviewing` (Judge) and
+`loom:treating` (Doctor) — see #5123.
+
+### Stale `loom:curating` Claim Check
+
+Run this whenever the issue you are about to claim **already carries**
+`loom:curating` — from Priority 1/2 discovery, an explicit `/curator <number>`
+invocation, or the re-curation playbook above. Without this check a dead claim
+(the claiming Curator's parent sweep died mid-enhancement) blocks the issue
+from ever being curated again, exactly the `loom:reviewing`/`loom:treating`
+failure mode `judge.md`/`doctor.md` already guard against — this section
+mirrors "Stale `loom:reviewing` Claim Check" in `judge.md` structurally, with
+`gh issue` in place of `gh pr` (issues and PRs share the same underlying
+`/issues/{n}` REST resource, so the same timeline/comments endpoints apply).
+
+**If the issue does NOT carry `loom:curating`:** proceed to claim as today —
+no behavior change: `gh issue edit <number> --add-label "loom:curating"`.
+
+**If the issue DOES carry `loom:curating`:** determine the claim's age and
+whether anyone has *genuinely* commented since the claim was made — see
+"Stand-down marker convention" below for why the comment count excludes
+stand-down comments:
+
+```bash
+N=<issue-number>
+# All reads in this block must be live `gh`/`gh api` calls — this is claim
+# arbitration, and a stale cache read would reintroduce the double-claim this
+# check exists to prevent. `--paginate` re-invokes `--jq` once per response
+# page and concatenates the per-page results rather than applying the filter
+# across the combined timeline (#4637) — `sort | tail -n 1` collapses the
+# resulting per-page timestamps to the single latest one; RFC3339 UTC
+# timestamps sort correctly as plain strings.
+CLAIMED_AT=$(gh api "repos/{owner}/{repo}/issues/$N/timeline" --paginate \
+  --jq '[.[] | select(.event=="labeled" and .label.name=="loom:curating")] | last | .created_at // empty' \
+  | sort | tail -n 1)
+MARKER="<!-- loom:standdown claim=$CLAIMED_AT -->"
+COMMENTS_JSON=$(gh api "repos/{owner}/{repo}/issues/$N/comments" \
+  | jq --arg t "$CLAIMED_AT" '[.[] | select(.created_at > $t)]')
+# printf, not echo: zsh's echo interprets \n escapes inside the JSON, corrupting it
+COMMENTS_AFTER=$(printf '%s\n' "$COMMENTS_JSON" | jq --arg m "$MARKER" '[.[] | select(.body | contains($m) | not)] | length')
+STANDDOWN_COUNT=$(printf '%s\n' "$COMMENTS_JSON" | jq --arg m "$MARKER" '[.[] | select(.body | contains($m))] | length')
+```
+
+Then decide:
+
+| Condition | Verdict | Action |
+|-----------|---------|--------|
+| `STANDDOWN_COUNT >= LOOM_MAX_STANDDOWN_STREAK` (default **3**) AND claim age ≥ `LOOM_STALE_CURATING_MINUTES` (default **30**) | **Stale — bounded fallback** (see below) | Force-reclaim regardless of `COMMENTS_AFTER`. Breaks the livelock even if the marker/exclusion logic above is somehow bypassed — mirrors the age-floor join `judge.md`/`doctor.md` already apply (#4790): the streak alone is never enough, it also requires the claim to have aged past the normal staleness threshold. |
+| Claim age < `LOOM_STALE_CURATING_MINUTES` (default **30**), OR `COMMENTS_AFTER > 0` | **Fresh** — a Curator is actively enhancing this issue | **Do not stomp the claim.** Post a marked stand-down comment **unless the latest comment already carries an identical marker for this exact `$CLAIMED_AT`** (see "Duplicate stand-down suppression" below — then skip silently instead), then skip this issue and continue to the next candidate. |
+| Claim age ≥ `LOOM_STALE_CURATING_MINUTES` AND `COMMENTS_AFTER == 0` | **Stale** — the claiming Curator's process almost certainly died mid-enhancement | Reclaim (see below), then proceed with normal curation. |
+| Timeline API call fails or returns empty (`CLAIMED_AT` unset) | **Unknown — fail safe** | Treat as **fresh**. Never stomp a claim on API failure or missing data. |
+
+**Stand-down marker convention (mirrors #4618)**: a "standing down, not
+stomping" comment is evidence of **no activity**, not activity — it means a
+*later* Curator pass declined to touch the claim, not that the *original*
+claimant is still working. Every stand-down comment you post in the "Fresh"
+row above MUST end with the `<!-- loom:standdown claim=$CLAIMED_AT -->` marker
+so it is excluded from `COMMENTS_AFTER` on every subsequent pass, and counted
+in `STANDDOWN_COUNT` instead. **Duplicate stand-down suppression (#5123)**:
+re-verification of staleness still runs on every pass — only the redundant
+*comment* is skipped, by checking whether the *latest* comment already carries
+the identical marker (`COMMENTS_JSON` was already fetched above — no extra API
+call needed):
+
+```bash
+LATEST_COMMENT_BODY=$(printf '%s\n' "$COMMENTS_JSON" | jq -r 'sort_by(.created_at) | last | .body // empty')
+if printf '%s' "$LATEST_COMMENT_BODY" | grep -qF -- "$MARKER"; then
+  echo "Latest comment already carries the stand-down marker for claim $CLAIMED_AT — skipping duplicate comment (still standing down, not reclaiming)."
+else
+  gh issue comment $N --body "Curator pass: issue still carries a fresh \`loom:curating\` claim (claimed $CLAIMED_AT) — standing down without reclaiming. Not stomping.
+<!-- loom:standdown claim=$CLAIMED_AT -->"
+fi
+```
+
+**Bounded fallback** (mirrors AC3, #4618; age-floor join added by #4798):
+`STANDDOWN_COUNT` is a hard cap independent of the marker-exclusion logic
+working correctly — it counts how many stand-down comments have accumulated
+against *this exact* `$CLAIMED_AT` (the marker embeds it, so a genuine
+reclaim — which changes `CLAIMED_AT` — resets the count to zero
+automatically). The fallback fires only once **both** hold:
+`LOOM_MAX_STANDDOWN_STREAK` marked comments have piled up against the same
+claim with no reclaim, **and** the claim's own age is ≥
+`LOOM_STALE_CURATING_MINUTES` — reusing the same age floor the ordinary
+staleness row above already applies. Use this reclaim comment:
+
+```bash
+gh issue edit $N --remove-label "loom:curating"
+gh issue comment $N --body "Reclaiming loom:curating claim: $STANDDOWN_COUNT consecutive stand-down comments have accumulated against claim $CLAIMED_AT (age ≥ ${LOOM_STALE_CURATING_MINUTES:-30}m) with no actual curation progress (bounded fallback, LOOM_MAX_STANDDOWN_STREAK=${LOOM_MAX_STANDDOWN_STREAK:-3}) — breaking the livelock."
+gh issue edit $N --add-label "loom:curating"
+# Continue with normal curation
+```
+
+**Reclaiming a stale claim** (the ordinary claim-age path):
+
+```bash
+gh issue edit $N --remove-label "loom:curating"
+gh issue comment $N --body "Reclaiming stale loom:curating claim (age > ${LOOM_STALE_CURATING_MINUTES:-30}m, no follow-up comment) — a prior Curator's parent sweep likely died mid-enhancement."
+gh issue edit $N --add-label "loom:curating"
+# Continue with normal curation
+```
+
+**Env vars**: `LOOM_STALE_CURATING_MINUTES` (default **30**) — named to mirror
+`LOOM_STALE_REVIEWING_MINUTES`/`LOOM_STALE_TREATING_MINUTES` (`judge.md` /
+`doctor.md`), on the same minutes-scale grace period: a typical Curator pass
+(read issue + comments, research the codebase, write an enhancement) runs
+closer in duration to a Judge's review pass than to a Doctor's fix-build-test
+cycle, so it reuses the Judge's 30-minute default rather than the Doctor's 60
+— a repo whose Curator passes routinely run longer (e.g. heavy use of the
+"Running Measurement / Board-Pipeline Reproductions" playbook above) should
+raise this. `LOOM_MAX_STANDDOWN_STREAK` (default **3**) — the same
+bounded-fallback cap shared with `judge.md`/`doctor.md`.
+
+**No daemon-side backstop today**: unlike `loom:reviewing`/`loom:treating`,
+`loom-daemon`'s `claim_reconciliation` pass does **not** reconcile
+`loom:curating` — this check is agent-side-only (it fires when another
+Curator pass happens to revisit the same issue). See
+`defaults/docs/daemon-reference.md` § "Stale-claim reconciliation & the sweep
+journal" for the current daemon-side coverage matrix.
+
+**Applies everywhere a Curator claims an issue** — Priority 1/2 discovery
+above, the re-curation playbook, and an explicit `/curator <number>`
+invocation naming an issue that turns out to already carry `loom:curating`.
 
 ## Before Starting Curation
 

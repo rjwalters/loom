@@ -96,6 +96,7 @@ test-resync-installed.sh
 test-safehoused-service.sh
 test-spawn-generic.sh
 test-spawn-worker.sh
+test-stale-claim-standdown-suppression.sh
 test-sweep-auto-stack.sh
 test-sweep-checkpoint.sh
 test-sweep-experiment.sh
