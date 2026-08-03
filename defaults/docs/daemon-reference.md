@@ -822,10 +822,37 @@ format was needed.
 - **`safehoused` presence**: a cheap best-effort probe (socket / `pgrep`);
   degrades to `unknown` rather than erroring the row.
 - **Empty roster**: never renders as empty output — prints an explicit "no
-  fleet workers registered" notice alongside the local host's row.
-- **Exit code**: `0` only when every roster host is `UP`; non-zero otherwise
-  (a monitor/CI check should treat any non-zero exit as "go look" — including
-  a `POWERED OFF` host, since it is still not confirmed-alive).
+  fleet workers registered" notice alongside the local host's row. #5060: an
+  empty (or effectively-empty, i.e. only the always-present local row)
+  registry is **not** a healthy fleet reading — see the exit-code carve-out
+  and summary-line wording below. Registered-fleet visibility only covers
+  what has actually been `fleet add-worker`'d; a self-maintained host that is
+  never registered is invisible to every `fleet status` run on every other
+  host, not just flagged unhealthy — this is why the incident that motivated
+  #5060 went unnoticed for hours despite one of the unregistered hosts being
+  genuinely broken. **Guidance**: any host that is meant to be part of this
+  fleet's cross-host visibility (i.e. anything other than a pure local dev
+  checkout) should be registered via `fleet add-worker` from at least one
+  other host's registry; an unregistered-but-live self-maintained daemon is
+  itself worth treating as a gap, not an acceptable steady state. A soft
+  cross-check that surfaces unregistered-but-reachable peers (e.g. by probing
+  the tailnet or a known-hosts list) was considered but is out of scope here
+  — track it separately if still wanted.
+- **Exit code**: `0` only when the roster is non-empty **and** every roster
+  host is `UP`; non-zero otherwise (a monitor/CI check should treat any
+  non-zero exit as "go look" — including a `POWERED OFF` host, since it is
+  still not confirmed-alive). #5060: an empty roster (nothing but the local
+  row) always exits non-zero, even though that lone local row is itself
+  `UP` — a 1-of-1 "everyone present is up" reading is not the same claim as
+  "the fleet was checked and is healthy," and a watch loop must not be able
+  to read an empty-roster run as an all-clear. The human-readable summary
+  line is likewise qualified for this case (`EMPTY ROSTER — N of N known
+  host(s) up (...); this is roster coverage (local host only), NOT a
+  confirmed healthy fleet.`) rather than the unqualified `N host(s): N up,
+  ...` line used for a real, populated roster — a reader skimming just the
+  last line, not the notice above the table, still sees the distinction. The
+  `--json` `summary.empty_roster` field already existed before this fix and
+  is unchanged; only the exit code and the human summary line now consult it.
 - **`--json`** schema: `{ "hosts": [ { "alias", "state", "tailnet_name"?,
   "provider_instance_id"?, "added_by"?, "is_local", "workspaces", "status"?,
   "detail"?, "safehoused" } ], "summary": { "total", "up", "daemon_down",
