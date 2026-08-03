@@ -126,6 +126,11 @@ signature table plus ready-made wrappers
 `forge_gh_reopen_issue_rl_safe`, #4856) if you are scripting rather than
 running `gh` interactively.
 
+**This section covers labels/comments only** — `gh issue create` (used below
+under "Creating Follow-up Issues" and "Raising Concerns") is a separate
+GraphQL mutation with its own REST fallback: `.loom/docs/gh-issue-create-rest-fallback.md`
+(or `forge_gh_create_issue_rl_safe` in the same `lib/forge-helpers.sh`, #5047).
+
 ## Your Role
 
 **Your primary task is to evaluate PRs labeled `loom:review-requested` (green badges).**

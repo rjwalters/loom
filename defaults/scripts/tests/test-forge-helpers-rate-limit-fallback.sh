@@ -21,7 +21,11 @@
 #      when it works, fall back to the correct REST endpoint/method only on
 #      a rate-limit rejection, and propagate (not swallow) any OTHER
 #      failure without attempting a REST call.
-#   3. merge-pr.sh source wiring: the four mutating call sites this issue
+#   3. forge_gh_create_issue_rl_safe (#5047): same succeed/fallback/propagate
+#      shape as #2, PLUS an atomicity check -- the REST fallback's payload
+#      carries `labels` in the SAME POST as `title`/`body`, never a
+#      create-then-label two-step.
+#   4. merge-pr.sh source wiring: the four mutating call sites this issue
 #      is about actually route through the new wrappers.
 #
 # Usage:
@@ -249,6 +253,156 @@ _run_stubbed other-error forge_gh_swap_label_rl_safe "owner/repo" "7" "loom:buil
 assert_eq "1" "$rc" "forge_gh_swap_label_rl_safe: non-rate-limit failure propagates"
 
 rm -rf "$STUB_DIR"
+
+# --- 2.5. forge_gh_create_issue_rl_safe (#5047), with its own stubbed `gh` ---
+echo ""
+echo "Testing forge_gh_create_issue_rl_safe REST-fallback wrapper (#5047)..."
+
+CREATE_STUB_DIR=$(mktemp -d)
+CREATE_ARGV_LOG="$CREATE_STUB_DIR/argv.log"
+CREATE_MODE_FILE="$CREATE_STUB_DIR/mode.txt"
+CREATE_PAYLOAD_LOG="$CREATE_STUB_DIR/payload.log"
+export CREATE_ARGV_LOG CREATE_MODE_FILE CREATE_PAYLOAD_LOG
+
+# A `gh` stub whose behavior is driven by $CREATE_MODE_FILE:
+#   "ok"          - `gh issue create` succeeds immediately.
+#   "ratelimited" - `gh issue create` is rate-limited; the REST POST fallback
+#                   (`gh api --method POST repos/.../issues --input <file>`)
+#                   succeeds. The stub also copies the --input payload file's
+#                   contents to $CREATE_PAYLOAD_LOG so the test can assert
+#                   labels traveled in the SAME request body as title/body.
+#   "other-error" - `gh issue create` fails with an unrelated error; `gh api`
+#                   must NEVER be reached (recorded as a FAIL marker if it is).
+cat > "$CREATE_STUB_DIR/gh" <<'STUB'
+#!/usr/bin/env bash
+mode="$(cat "$CREATE_MODE_FILE" 2>/dev/null || echo ok)"
+printf '%s\n' "$*" >> "$CREATE_ARGV_LOG"
+
+if [[ "$1" == "api" ]]; then
+  if [[ "$mode" == "ratelimited" ]]; then
+    prev=""
+    for a in "$@"; do
+      if [[ "$prev" == "--input" ]]; then
+        cat "$a" >> "$CREATE_PAYLOAD_LOG"
+      fi
+      prev="$a"
+    done
+    echo "https://github.com/owner/repo/issues/999"
+    exit 0
+  fi
+  echo "UNEXPECTED_REST_CALL" >> "$CREATE_ARGV_LOG"
+  exit 1
+fi
+
+case "$mode" in
+  ok)
+    echo "https://github.com/owner/repo/issues/42"
+    exit 0
+    ;;
+  ratelimited)
+    echo "GraphQL: API rate limit already exceeded for user ID 1" >&2
+    exit 1
+    ;;
+  other-error)
+    echo "HTTP 404: Not Found" >&2
+    exit 1
+    ;;
+esac
+STUB
+chmod +x "$CREATE_STUB_DIR/gh"
+
+_run_create_stubbed() {
+    local mode="$1"; shift
+    echo "$mode" > "$CREATE_MODE_FILE"
+    : > "$CREATE_ARGV_LOG"
+    : > "$CREATE_PAYLOAD_LOG"
+    PATH="$CREATE_STUB_DIR:$PATH" "$@"
+}
+
+# ok mode: primary `gh issue create` succeeds, labels passed as repeated
+# --label flags, no REST call at all.
+out=""
+rc=0
+out=$(_run_create_stubbed ok forge_gh_create_issue_rl_safe "owner/repo" "My Title" "My Body" "loom:triage,bug" 2>&1) || rc=$?
+assert_eq "0" "$rc" "forge_gh_create_issue_rl_safe: primary gh issue create succeeds -> no REST call"
+assert_eq "https://github.com/owner/repo/issues/42" "$out" "forge_gh_create_issue_rl_safe (ok mode) returns the created issue URL"
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q -- '--label loom:triage --label bug' "$CREATE_ARGV_LOG"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: forge_gh_create_issue_rl_safe passes each CSV label as its own --label flag"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: forge_gh_create_issue_rl_safe did not expand the labels CSV correctly"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if ! grep -q "^api " "$CREATE_ARGV_LOG"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: forge_gh_create_issue_rl_safe (ok mode) never calls gh api"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: forge_gh_create_issue_rl_safe (ok mode) unexpectedly called gh api"
+fi
+
+# ratelimited mode: falls back to a single atomic REST POST carrying title,
+# body, AND labels in one payload -- never a create-then-label two-step.
+out=""
+rc=0
+out=$(_run_create_stubbed ratelimited forge_gh_create_issue_rl_safe "owner/repo" "My Title" "My Body" "loom:triage,bug" 2>&1) || rc=$?
+assert_eq "0" "$rc" "forge_gh_create_issue_rl_safe: rate-limited primary call recovers via REST fallback"
+assert_eq "https://github.com/owner/repo/issues/999" "$out" "forge_gh_create_issue_rl_safe (ratelimited mode) returns the REST-created issue URL"
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q "^api --method POST repos/owner/repo/issues --input" "$CREATE_ARGV_LOG"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: forge_gh_create_issue_rl_safe REST fallback POSTs to the correct issues endpoint"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: forge_gh_create_issue_rl_safe REST fallback endpoint wrong or missing"
+fi
+api_call_count="$(grep -c '^api ' "$CREATE_ARGV_LOG" || true)"
+assert_eq "1" "$api_call_count" "forge_gh_create_issue_rl_safe REST fallback makes exactly ONE REST call (atomic, not create-then-label)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if jq -e '.title == "My Title" and .body == "My Body" and .labels == ["loom:triage","bug"]' \
+    "$CREATE_PAYLOAD_LOG" >/dev/null 2>&1; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: forge_gh_create_issue_rl_safe REST payload carries title+body+labels atomically"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: forge_gh_create_issue_rl_safe REST payload missing/malformed title|body|labels"
+    echo "    Payload: $(cat "$CREATE_PAYLOAD_LOG" 2>/dev/null)"
+fi
+
+# ratelimited mode, no labels: payload still valid JSON without a labels key
+# forced in (an empty/absent labels field, never a spurious create-then-label
+# follow-up call).
+out=""
+rc=0
+out=$(_run_create_stubbed ratelimited forge_gh_create_issue_rl_safe "owner/repo" "No Labels" "Body text" 2>&1) || rc=$?
+assert_eq "0" "$rc" "forge_gh_create_issue_rl_safe: REST fallback works with no labels argument"
+TESTS_RUN=$((TESTS_RUN + 1))
+if jq -e '.title == "No Labels" and .body == "Body text" and (has("labels") | not)' \
+    "$CREATE_PAYLOAD_LOG" >/dev/null 2>&1; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: forge_gh_create_issue_rl_safe omits labels from the payload when none given"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: forge_gh_create_issue_rl_safe payload wrong when no labels given"
+fi
+
+# other-error mode: propagate, never attempt the REST fallback.
+out=""
+rc=0
+out=$(_run_create_stubbed other-error forge_gh_create_issue_rl_safe "owner/repo" "My Title" "My Body" "loom:triage" 2>&1) || rc=$?
+assert_eq "1" "$rc" "forge_gh_create_issue_rl_safe: non-rate-limit failure propagates (not swallowed)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if ! grep -q "UNEXPECTED_REST_CALL" "$CREATE_ARGV_LOG"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: forge_gh_create_issue_rl_safe never retries over REST on a non-rate-limit failure"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: forge_gh_create_issue_rl_safe incorrectly retried over REST on a non-rate-limit failure"
+fi
+
+rm -rf "$CREATE_STUB_DIR"
 
 # --- 3. merge-pr.sh source wiring: the four #4856 call sites use the wrappers ---
 echo ""

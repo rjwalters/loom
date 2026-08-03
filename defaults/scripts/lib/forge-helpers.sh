@@ -750,6 +750,11 @@ forge_pr_close_targets() {
 # already gated on `[[ "$FORGE_TYPE" == "github" ]]` by its caller, mirroring
 # the existing `_reset_partial_increment_labels` / `_auto_reconcile_stacked_children`
 # gating in merge-pr.sh, so no Gitea branch is needed here.
+#
+# #5047 extended this same table + fallback shape to issue *creation*
+# (`forge_gh_create_issue_rl_safe`, below) -- the one filing mutation #4856
+# left uncovered, since #4856 was scoped to labels/comments/reopen on
+# already-existing issues.
 is_rate_limit_error() {
   local text
   text=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
@@ -831,6 +836,72 @@ forge_gh_swap_label_rl_safe() {
     echo "gh issue edit (label swap) rate-limited on #$issue_num, and the REST fallback also failed: $out" >&2
     return 1
   fi
+  echo "$out" >&2
+  return 1
+}
+
+# Create an issue via `gh issue create`, falling back to a REST POST
+# (`repos/{nwo}/issues`) on a GraphQL rate-limit rejection (#5047). Labels are
+# applied ATOMICALLY in the same request on both paths -- `gh issue create
+# --label` on the primary path, the payload's `labels` array on the REST
+# fallback -- never a create-then-label two-step (that doubles the request
+# count and can half-fail, leaving an unlabeled issue behind).
+#
+# This is the single-sourced recipe referenced by the role prompts that file
+# issues (architect.md, auditor.md, builder-complexity.md, builder-pr.md,
+# curator.md, doctor.md, hermit.md, hermit-patterns.md, judge.md) -- update
+# this function, not each prompt, if the recipe needs to change.
+#
+# Usage: forge_gh_create_issue_rl_safe NWO TITLE BODY [LABELS_CSV]
+#   NWO         - "owner/repo"
+#   TITLE       - issue title
+#   BODY        - issue body (may be multi-line / markdown)
+#   LABELS_CSV  - optional comma-separated label list, e.g. "loom:triage,bug"
+#     (matches the `--label` flag's own comma-separated convention, so
+#     callers can pass the same string they'd otherwise give `gh issue
+#     create --label`)
+#
+# On success, prints the created issue's URL to stdout (matching `gh issue
+# create`'s own output) and returns 0. On failure, prints the error to
+# stderr and returns 1. GitHub-only, like the other `*_rl_safe` helpers above
+# -- callers gate on `FORGE_TYPE == github` before calling this.
+forge_gh_create_issue_rl_safe() {
+  local nwo="$1" title="$2" body="$3" labels_csv="${4:-}"
+  local -a label_args=()
+  local out
+
+  if [[ -n "$labels_csv" ]]; then
+    local IFS=','
+    local label
+    for label in $labels_csv; do
+      label_args+=(--label "$label")
+    done
+  fi
+
+  if out=$(gh issue create --repo "$nwo" --title "$title" --body "$body" "${label_args[@]}" 2>&1); then
+    printf '%s\n' "$out"
+    return 0
+  fi
+
+  if is_rate_limit_error "$out"; then
+    local payload_file rc=0 url
+    payload_file=$(mktemp)
+    if [[ -n "$labels_csv" ]]; then
+      jq -n --arg t "$title" --arg b "$body" --arg labels "$labels_csv" \
+        '{title: $t, body: $b, labels: ($labels | split(","))}' > "$payload_file"
+    else
+      jq -n --arg t "$title" --arg b "$body" '{title: $t, body: $b}' > "$payload_file"
+    fi
+    url=$(gh api --method POST "repos/$nwo/issues" --input "$payload_file" --jq '.html_url' 2>&1) || rc=$?
+    rm -f "$payload_file"
+    if [[ $rc -eq 0 ]]; then
+      printf '%s\n' "$url"
+      return 0
+    fi
+    echo "gh issue create rate-limited on \"$title\", and the REST fallback also failed: $url" >&2
+    return 1
+  fi
+
   echo "$out" >&2
   return 1
 }

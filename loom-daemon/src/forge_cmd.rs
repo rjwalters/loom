@@ -566,6 +566,17 @@ pub fn handle_auto_merge(pr: u32, method: &str) -> Result<()> {
 /// Sub-actions for `loom-daemon forge`.
 pub enum ForgeCmd {
     /// `forge issue <args…>` — passthrough to `gh issue` on GitHub.
+    ///
+    /// This is a generic, subcommand-agnostic passthrough: it does not parse
+    /// `args` to special-case `create` vs. `list`/`view`/`edit`. As a
+    /// consequence `forge issue create` is byte-identical to running `gh
+    /// issue create` directly and carries the same GraphQL cost — it does
+    /// **not** get the REST fallback documented in
+    /// `.loom/docs/gh-issue-create-rest-fallback.md` /
+    /// `forge_gh_create_issue_rl_safe` (#5047). Callers that need
+    /// exhausted-GraphQL resilience for issue creation should use that
+    /// shell recipe/helper directly rather than routing through this
+    /// passthrough.
     Issue(Vec<String>),
     /// `forge pr <args…>` — passthrough to `gh pr` on GitHub.
     Pr(Vec<String>),

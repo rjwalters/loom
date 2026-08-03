@@ -2,6 +2,11 @@
 
 This document covers complexity assessment, issue decomposition, and scope management for the Builder role. For the core builder workflow, see `builder.md`.
 
+> **`gh issue create` (used throughout this file's decomposition examples) fails
+> outright when GraphQL quota is exhausted.** REST fallback recipe (atomic
+> create+label): `.loom/docs/gh-issue-create-rest-fallback.md`, or
+> `forge_gh_create_issue_rl_safe` in `lib/forge-helpers.sh` if scripting.
+
 ## Never Abandon Work
 
 **You must NEVER stop work on a claimed issue without creating a clear path forward.**

@@ -263,6 +263,10 @@ The label-specific dedup blocks later in this document (capability requests, bug
 reports, guard decisions) are concrete applications of this one rule — none of
 them is optional and none is an exception.
 
+> **`gh issue create` fails outright when GraphQL quota is exhausted.** REST
+> fallback recipe (atomic create+label): `.loom/docs/gh-issue-create-rest-fallback.md`,
+> or `forge_gh_create_issue_rl_safe` in `lib/forge-helpers.sh` if scripting.
+
 ## When to Create Issues
 
 **Create issue if:**

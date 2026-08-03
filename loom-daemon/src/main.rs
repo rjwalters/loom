@@ -630,6 +630,12 @@ enum Commands {
     /// (`merge-pr.sh`'s `forge_auto_merge`, or the `gh` read fallback) carries
     /// it. Forge config resolves from the canonical repo root (never a
     /// worktree CWD); see `forge_cmd.rs` for the full #4061 semantics.
+    ///
+    /// NOTE (#5047): the byte-identical passthrough means `forge issue
+    /// create` inherits `gh issue create`'s GraphQL cost with no REST
+    /// fallback of its own on exhaustion — see
+    /// `.loom/docs/gh-issue-create-rest-fallback.md` /
+    /// `forge_gh_create_issue_rl_safe` for the fallback path instead.
     Forge {
         #[command(subcommand)]
         action: ForgeAction,

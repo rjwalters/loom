@@ -174,6 +174,8 @@ When creating a proposal:
 
 > **Do not run concurrent Architects — serialize issue creation (#3707).** `gh issue create` returns a server-assigned number with no client-side coordination, so two Architects (or an Architect and a Curator-decomposition / Champion epic-phase run) filing issues at the same time in the same repo **race on issue numbers and cross-contaminate bodies**. Never place an issue-creating agent in a parallel wave; one issue-creating agent must finish its entire `gh issue create` burst before the next starts. See `sweep.md` → "Execution Model → Only Builders parallelize" for the full invariant. Parallel **Builders** (implementing already-filed issues) stay safe — only issue *creation* must be serialized.
 
+> **`gh issue create` fails outright when GraphQL quota is exhausted.** REST fallback recipe (atomic create+label): `.loom/docs/gh-issue-create-rest-fallback.md`, or `forge_gh_create_issue_rl_safe` in `lib/forge-helpers.sh` if scripting.
+
 ### Duplicate Detection (CRITICAL)
 
 **BEFORE creating any issue, check for potential duplicates:**
