@@ -18,11 +18,25 @@
 # Detection heuristic: scan the transcript JSONL for two independent
 # dispatch-without-observed-completion patterns:
 #
-#   1. Assistant `tool_use` entries named "Task" (the harness's subagent-
-#      dispatch tool) whose id has no matching `tool_result` anywhere later
-#      in the transcript — i.e. a subagent was dispatched and the transcript
-#      never observed its completion before the orchestrator tried to end its
-#      turn.
+#   1. Assistant `tool_use` entries named "Task" OR "Agent" (issue #5086 — the
+#      current harness names the async subagent-dispatch tool "Agent", not
+#      "Task"; "Task" is matched too for forward/back compat, the same
+#      dual-name pattern used below for `Monitor`/`ScheduleWakeup`) whose id
+#      has no observed completion anywhere later in the transcript — i.e. a
+#      subagent was dispatched and the transcript never observed its
+#      completion before the orchestrator tried to end its turn. An `Agent`
+#      dispatch gets an IMMEDIATE `tool_result` ack ("Async agent launched
+#      successfully... agentId: <ID> ... You will be notified automatically
+#      when it completes.") on the SAME tool_use id the real completion later
+#      arrives on — that ack is NOT completion, so naively diffing dispatch
+#      ids against "any tool_result observed" would (as it did for background
+#      Bash in #4389) treat the dispatch as already resolved the instant it
+#      fires. Only a LATER, distinct tool_result on that id (the real
+#      completion), or an explicit non-error, TERMINAL `TaskOutput` poll of
+#      the `agentId` recovered from the launch ack, counts as resolution. A
+#      plain `Task`-named dispatch's single ordinary tool_result satisfies the
+#      "distinct tool_result" branch directly (it never matches the launch-ack
+#      text), so back-compat needs no special casing.
 #   2. Assistant `Bash` `tool_use` entries with `input.run_in_background ==
 #      true` (issue #4389 — the #4257 recurrence) whose dispatch has no
 #      observed completion anywhere later in the transcript. A background Bash
@@ -161,21 +175,8 @@ fi
 TRANSCRIPT_PATH=$(printf '%s' "$INPUT" | jq -r '.transcript_path // empty' 2>/dev/null) || TRANSCRIPT_PATH=""
 [[ -n "$TRANSCRIPT_PATH" && -r "$TRANSCRIPT_PATH" ]] || exit 0
 
-# Slurp the transcript JSONL as an array and diff Task tool_use ids against
-# observed tool_result ids. Any left over are unresolved. Fails open (empty
-# result, no block) on any parse error — the `// empty` / `?` guards below
-# make a malformed line a no-op rather than a hard jq failure, and the
-# surrounding `trap ERR -> exit 0` plus this command's own `|| ...` catch
-# any jq invocation failure itself.
-UNRESOLVED_TASK_IDS=$(jq -s -r '
-  [ .[]? | select(.type=="assistant") | .message.content[]?
-    | select(.type=="tool_use" and .name=="Task") | .id ] as $task_ids
-  | [ .[]? | select(.type=="user") | .message.content[]?
-    | select(.type=="tool_result") | .tool_use_id ] as $result_ids
-  | ($task_ids - $result_ids) | .[]
-' "$TRANSCRIPT_PATH" 2>/dev/null) || UNRESOLVED_TASK_IDS=""
-
-# Shared jq prelude for the background-Bash and Monitor detectors below.
+# Shared jq prelude for the Task/Agent, background-Bash, and Monitor
+# detectors below.
 #
 # `texts` yields every transcript entry's notification-bearing STRING payload.
 # A completion `<task-notification>` is NOT a `type=="user"` message (issue
@@ -228,6 +229,73 @@ def stopped_task_ids:
         | $s.task ] )
     + ( [ $r[] | ((.text | capture("Successfully stopped task: (?<v>[A-Za-z0-9_-]+)")?).v) // empty ] );
 '
+
+# Diff Task/Agent subagent-dispatch ids against every event that can retire one
+# (issue #5086 — the harness's async subagent-dispatch tool is named "Agent",
+# not "Task"; see the header for why a naive rename-only fix reintroduces the
+# #4389 false-negative hazard on this tool). A dispatch's tool_use id resolves
+# when EITHER of these appears later in the transcript for it:
+#
+#   a. A tool_result on the SAME id whose text is NOT the immediate "Async
+#      agent launched successfully..." launch ack — i.e. a second, distinct
+#      tool_result landed on that id, which only happens for the real
+#      completion (an Agent dispatch's launch ack and its later completion
+#      share one tool_use id). A plain `Task`-named dispatch's single ordinary
+#      tool_result also satisfies this branch directly (back-compat: it never
+#      matches the launch-ack text, so it counts as its own "distinct"
+#      completion — existing Task fixtures need no changes).
+#   b. An explicit, non-error, TERMINAL `TaskOutput` poll (`<status>completed
+#      </status>` or `<status>failed</status>` in the result text — NOT
+#      `<status>running</status>`, which is still pending) of the `agentId`
+#      recovered from the launch ack text (`agentId: <ID>`).
+#
+# Deliberately does NOT treat the launch ack itself as resolution (that is the
+# exact #4389 hazard recurring on this tool) — only (a) or (b) counts. A
+# genuinely orphaned Agent dispatch (no later distinct tool_result, no terminal
+# TaskOutput poll) still blocks, the true positive this detector exists for.
+UNRESOLVED_TASK_IDS=$(jq -s -r "$JQ_PRELUDE"'
+  . as $t
+  | (results) as $r
+  | [ $t[]? | select(.type=="assistant") | .message.content[]?
+      | select(.type=="tool_use" and (.name=="Task" or .name=="Agent"))
+      | .id ] as $task_ids
+  # TaskOutput polls: the poll tool_use id, and the agentId/task ref it names.
+  | ( [ $t[]? | select(.type=="assistant") | .message.content[]?
+        | select(.type=="tool_use" and .name=="TaskOutput")
+        | { id: (.id // ""),
+            ref: (.input.agentId? // .input.agent_id? // .input.task_id?
+                  // .input.id? // null) } ]
+    ) as $polls
+  # Refs whose poll returned a non-error, TERMINAL (completed/failed) result.
+  | ( [ $polls[]
+        | . as $p
+        | (($r | map(select(.id == $p.id)) | .[0]) // null) as $res
+        | select($res != null and ($res.err != true))
+        | select($res.text | test("<status>completed</status>|<status>failed</status>"))
+        | $p.ref ] | [ .[] | select(. != null) ]
+    ) as $polled_ok_refs
+  | [ $task_ids[]
+      | . as $id
+      | ( [ $r[] | select(.id == $id) ] ) as $id_results
+      # Any result on this id that is NOT the launch ack text is a real,
+      # distinct completion (branch a).
+      | ( [ $id_results[]
+            | select((.text | test("Async agent launched successfully")) | not) ]
+        ) as $real_completions
+      # agentId(s) recovered from any launch-ack result on this id, to check
+      # against a terminal TaskOutput poll (branch b).
+      | ( [ $id_results[]
+            | select(.text | test("Async agent launched successfully"))
+            | ((.text | capture("agentId: (?<v>[A-Za-z0-9_-]+)")?).v) // empty ]
+        ) as $agent_ids
+      | if ($id_results | length) == 0 then $id
+        elif ($real_completions | length) > 0 then empty
+        elif ( [ $agent_ids[] | select(($polled_ok_refs | index(.)) != null) ]
+               | length ) > 0 then empty
+        else $id
+        end
+    ] | .[]
+' "$TRANSCRIPT_PATH" 2>/dev/null) || UNRESOLVED_TASK_IDS=""
 
 # Diff background-Bash dispatch ids (issue #4389) against every event that can
 # retire one. A background Bash task is resolved when ANY of these appear later
@@ -400,9 +468,9 @@ BG_COUNT=0
 MONITOR_COUNT=0
 [[ -z "$UNRESOLVED_MONITOR_IDS" ]] || MONITOR_COUNT=$(printf '%s\n' "$UNRESOLVED_MONITOR_IDS" | grep -c . || true)
 
-REASON="STOP BLOCKED (guard-background-subagents.sh, issues #4257/#4389/#4462/#4696/#5013):"
+REASON="STOP BLOCKED (guard-background-subagents.sh, issues #4257/#4389/#4462/#4696/#5013/#5086):"
 if [[ "$TASK_COUNT" -gt 0 ]]; then
-    REASON="${REASON} ${TASK_COUNT} dispatched Task subagent(s) have no observed completion in this transcript yet."
+    REASON="${REASON} ${TASK_COUNT} dispatched Task/Agent subagent(s) have no observed completion in this transcript yet."
 fi
 if [[ "$BG_COUNT" -gt 0 ]]; then
     REASON="${REASON} ${BG_COUNT} background Bash command(s) (run_in_background) have no completion notification in this transcript yet."
