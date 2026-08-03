@@ -28,6 +28,16 @@
 #                          parent branch (feature/issue-N) still has open
 #                          stacked child PRs targeting it (operator asserts the
 #                          children are already reconciled). See #3747 item 2.
+#   --no-cleanup-primary   Skip the automatic primary-checkout branch cleanup
+#                          (#5015): when the merged branch is checked out in
+#                          the PRIMARY repo checkout (not a worktree) and it
+#                          is provably safe (clean tree, no stash entries,
+#                          tip matches the merged PR head SHA), the script
+#                          normally checks out the default branch there and
+#                          deletes the merged branch automatically instead of
+#                          just printing manual instructions. Pass this to
+#                          always print the manual instructions instead.
+#   --cleanup-primary      (no-op, primary-checkout cleanup is the default)
 #
 # By default, the local worktree AND the local branch it held are cleaned up
 # after a successful merge (#4100). Pass --no-cleanup-worktree to skip both
@@ -52,6 +62,16 @@
 # git itself refuses, and the refusal is reported with a specific message
 # rather than the generic "unmerged commits" warning. The repo's default
 # branch is never a delete target.
+#
+# Primary-checkout auto-cleanup (#5015): the one case above that is "checked
+# out as the current HEAD" AND is specifically the repo's PRIMARY checkout
+# (not a linked worktree) gets one extra step: if the tip-matches-head safety
+# check already passed AND the primary checkout's working tree is clean with
+# no stash entries (re-checked immediately before the mutating step, not
+# cached), the script checks out the default branch there and force-deletes
+# the branch automatically. A dirty tree, a stash entry, a tip mismatch, or
+# --no-cleanup-primary all fall back to printing the manual two-step
+# instructions unchanged.
 #
 # Override: pass --worktree-path <dir> to opt into removing a non-Loom
 # worktree (the sentinel guard is bypassed only when this flag is supplied).
@@ -118,6 +138,14 @@ Options:
                          Pass this flag only after you have manually reconciled
                          (or verified) the children — the operator asserts
                          responsibility, mirroring --worktree-path.
+  --no-cleanup-primary   Skip automatic primary-checkout branch cleanup (#5015).
+                         When the merged branch is checked out in the PRIMARY
+                         repo checkout (not a worktree), the script normally
+                         auto-checks-out the default branch and force-deletes
+                         it there ONLY when provably safe (clean tree, no
+                         stash entries, tip matches the merged PR head SHA).
+                         Pass this to always print manual instructions instead.
+  --cleanup-primary      (no-op, primary-checkout cleanup is the default)
   -h, --help             Show this help and exit
 
 By default, the local worktree AND the local branch it held are cleaned up
@@ -140,6 +168,15 @@ a squash merge): a matching tip uses 'git branch -D'; a non-matching tip
 branch and reports it instead of force-deleting. The branch currently
 checked out (main worktree or any other) is never deleted, and the repo's
 default branch is never a delete target.
+
+Primary-checkout auto-cleanup (#5015): the one exception to "checked out
+branches are never deleted" is when the branch is checked out in the repo's
+PRIMARY checkout specifically (not a linked worktree) AND it is provably
+safe — the tip-matches-head safety check above passed, the primary
+checkout's working tree is clean, and it has no stash entries. In that case
+the script checks out the default branch there and force-deletes the merged
+branch automatically instead of just printing instructions. Pass
+--no-cleanup-primary to always print the manual instructions instead.
 
 When --worktree-path <dir> is passed explicitly, the operator is taking
 responsibility for the cleanup decision: the sentinel guard is bypassed
@@ -181,6 +218,10 @@ Examples:
   ./.loom/scripts/merge-pr.sh 123 --worktree-path ../adhoc-wt
     Merges PR #123 and removes the worktree at ../adhoc-wt plus its
     matching local branch (bypasses the .loom-managed sentinel guard).
+
+  ./.loom/scripts/merge-pr.sh 123 --no-cleanup-primary
+    Merges PR but always prints manual instructions instead of
+    auto-cleaning a branch checked out in the primary repo checkout.
 EOF
 }
 
@@ -254,6 +295,10 @@ REPO_NWO="$(forge_get_repo_nwo "$GH")" || \
 # Parse arguments
 PR_NUMBER=""
 CLEANUP_WORKTREE=true
+# CLEANUP_PRIMARY_CHECKOUT (#5015): gates the automatic primary-checkout
+# branch cleanup performed by _maybe_delete_local_branch. Defaults on
+# (mirrors CLEANUP_WORKTREE's default); --no-cleanup-primary opts out.
+CLEANUP_PRIMARY_CHECKOUT=true
 DRY_RUN=false
 AUTO_MERGE=false
 WORKTREE_PATH_OVERRIDE=""
@@ -263,6 +308,8 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --cleanup-worktree) shift ;;  # no-op, cleanup is now the default
     --no-cleanup-worktree) CLEANUP_WORKTREE=false; shift ;;
+    --cleanup-primary) shift ;;  # no-op, primary-checkout cleanup is now the default
+    --no-cleanup-primary) CLEANUP_PRIMARY_CHECKOUT=false; shift ;;
     --worktree-path)
       [[ $# -lt 2 ]] && error "--worktree-path requires a value"
       WORKTREE_PATH_OVERRIDE="$2"
@@ -288,7 +335,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-[[ -z "$PR_NUMBER" ]] && error "Usage: merge-pr.sh <pr-number> [--no-cleanup-worktree] [--worktree-path <dir>] [--dry-run] [--auto] [--allow-stacked-children]"
+[[ -z "$PR_NUMBER" ]] && error "Usage: merge-pr.sh <pr-number> [--no-cleanup-worktree] [--no-cleanup-primary] [--worktree-path <dir>] [--dry-run] [--auto] [--allow-stacked-children]"
 [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || error "PR number must be numeric: $PR_NUMBER"
 
 # Validate --worktree-path early (before any network calls) so bad input
@@ -1754,6 +1801,16 @@ _find_worktree_by_branch() {
 # behaviour: Git's own "not fully merged" safety net, which keeps the branch
 # and reports it rather than force-deleting.
 #
+# Primary-checkout auto-cleanup (#5015): when the branch turns out to be
+# checked out in the repo's PRIMARY working copy rather than a removable
+# worktree, and the tip-matches-head safety check above already held, and
+# the primary checkout's working tree is clean with no stash entries (see
+# the auto-cleanup block below for the exact gate), this checks out the
+# default branch there and force-deletes the now-unreferenced branch
+# instead of just printing manual instructions. Opt out with
+# --no-cleanup-primary (CLEANUP_PRIMARY_CHECKOUT=false) if silently moving
+# HEAD in the operator's primary checkout is unwanted.
+#
 # Never fails the cleanup pipeline — always returns 0, warns on errors.
 _maybe_delete_local_branch() {
   local branch="$1"
@@ -1806,6 +1863,37 @@ _maybe_delete_local_branch() {
     checkout_loc="$(_find_worktree_by_branch "$branch")"
     if [[ -n "$checkout_loc" ]] && _is_primary_worktree_path "$checkout_loc"; then
       local default_label="${DEFAULT_BRANCH_NAME:-<default-branch>}"
+
+      # Auto-cleanup (#5015): the two-step remediation below (checkout the
+      # default branch, then force-delete) is exactly what this script
+      # already knows is safe to do itself whenever ALL of the following
+      # hold — do it instead of just printing instructions:
+      #   1. Not opted out via --no-cleanup-primary / CLEANUP_PRIMARY_CHECKOUT.
+      #   2. The default branch actually resolved (never silently guess one).
+      #   3. delete_flag == "-D" — the tip-matches-merged-head-SHA safety
+      #      check above already passed, so every commit on $branch is part
+      #      of the merged PR; nothing is lost by deleting it.
+      #   4. The primary checkout's working tree is clean (no uncommitted
+      #      changes, no staged changes) AND has no stash entries — checked
+      #      HERE, immediately before the mutating `checkout`, not cached
+      #      earlier, to avoid a TOCTOU gap against a concurrent process
+      #      working in the same checkout.
+      # A dirty tree, a present stash, an opt-out, or a tip mismatch all fall
+      # straight through to the manual two-step instructions unchanged.
+      if [[ "${CLEANUP_PRIMARY_CHECKOUT:-true}" == "true" ]] && \
+         [[ -n "$DEFAULT_BRANCH_NAME" ]] && \
+         [[ "$delete_flag" == "-D" ]] && \
+         [[ -z "$(git -C "$checkout_loc" status --porcelain 2>/dev/null)" ]] && \
+         [[ -z "$(git -C "$checkout_loc" stash list 2>/dev/null)" ]]; then
+        if git -C "$checkout_loc" checkout -q "$DEFAULT_BRANCH_NAME" 2>/dev/null && \
+           git -C "$checkout_loc" branch -D "$branch" >/dev/null 2>&1; then
+          success "Local branch '$branch' deleted$safety_note"
+          info "Primary checkout ($checkout_loc) was on '$branch' — automatically switched to '$DEFAULT_BRANCH_NAME' to free it up for deletion"
+          return 0
+        fi
+        warning "Attempted to auto-clean up '$branch' in the primary checkout ($checkout_loc) but the checkout or delete failed — falling back to manual instructions"
+      fi
+
       warning "Could not delete local branch '$branch' — it is checked out in the primary repository checkout ($checkout_loc)."
       warning "To clean it up: git -C '$checkout_loc' checkout $default_label && git -C '$checkout_loc' branch -D $branch"
     else
