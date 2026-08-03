@@ -253,7 +253,11 @@ export function fleetOverviewView(view: FleetView, now: Date = new Date()): HTML
     el(
       "div",
       { class: "overview__summary", data: { testid: "fleet-summary" } },
-      el("span", {}, `${view.hosts.length} host${view.hosts.length === 1 ? "" : "s"}`),
+      el(
+        "span",
+        {},
+        `${view.reportingHosts} host${view.reportingHosts === 1 ? "" : "s"}`,
+      ),
       el("span", {}, `${view.totalSweeps} active sweep${view.totalSweeps === 1 ? "" : "s"}`),
       el(
         "span",

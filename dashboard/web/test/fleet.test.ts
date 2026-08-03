@@ -114,13 +114,42 @@ describe("buildFleetView", () => {
     const built = view();
     expect(built.totalSweeps).toBe(3);
     // Only the stale host and the truly-at-the-edge degraded host — not the
-    // partially-exhausted-but-healthy one.
+    // partially-exhausted-but-healthy one, and not the sweep-only "unknown"
+    // host either — see the dedicated #5101 test below.
     expect(built.needsAttention).toBe(2);
+  });
+
+  // #5101: the SPA's fleet-overview headline uses `reportingHosts`, not
+  // `hosts.length`, so a host known only from activeSweeps ("unknown"
+  // status) does not inflate the "N hosts" count — while still remaining in
+  // `hosts` (and rendering its own card, per the module doc's union rule).
+  it("excludes sweep-only 'unknown' hosts from reportingHosts, but not from hosts", () => {
+    const built = view();
+    expect(built.hosts).toHaveLength(6);
+    expect(built.reportingHosts).toBe(5);
+    expect(findHost(built, SWEEP_ONLY_HOST_ID)?.status).toBe("unknown");
+  });
+
+  // Pin: needsAttention (stale/degraded only) already excludes "unknown"
+  // hosts — STATUS_ORDER and the needsAttention filter both treat "unknown"
+  // as its own bucket, distinct from stale/degraded (#5101).
+  it("excludes sweep-only 'unknown' hosts from needsAttention", () => {
+    const built = buildFleetView(
+      parseFleetSnapshot({
+        hosts: {},
+        activeSweeps: [{ hostId: "sweep-only", sweepId: "s1" }],
+      }),
+      NOW,
+    );
+    expect(findHost(built, "sweep-only")?.status).toBe("unknown");
+    expect(built.needsAttention).toBe(0);
+    expect(built.reportingHosts).toBe(0);
   });
 
   it("returns an empty view for an empty fleet", () => {
     const built = buildFleetView({ hosts: {}, activeSweeps: [] }, NOW);
     expect(built.hosts).toEqual([]);
+    expect(built.reportingHosts).toBe(0);
     expect(built.totalSweeps).toBe(0);
     expect(built.needsAttention).toBe(0);
   });
