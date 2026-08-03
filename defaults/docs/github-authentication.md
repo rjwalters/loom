@@ -372,6 +372,81 @@ outlives a ~1h App-token lifetime starts 401ing with no automatic fallback. See
 "Long-running sweep children and credential snapshots (#4458)" above for the
 mechanics and the workaround (a long-lived PAT for consistently long workloads).
 
+## Filing issues under GraphQL exhaustion: `create-issue.sh` (#5047)
+
+GitHub's **GraphQL quota and REST quota are independent buckets**, each 5,000/hr
+for a user token. In a busy fleet they drain at wildly different rates, because
+the read-side REST fallbacks shipped by epic #4432 pushed reads onto REST while
+`gh`'s mutating commands stayed on GraphQL. Observed live on 2026-08-03 at the
+moment `gh issue create` started failing:
+
+```
+core:     19/5000 consumed     ← essentially untouched
+graphql:  1378/5000 consumed   ← the constrained pool
+```
+
+`gh issue create` is GraphQL-backed, so **every issue-filing role died at that
+moment** — Architect, Auditor, Curator (decomposition), Builder (decomposition),
+Doctor, Hermit, Judge — while 99.6% of an entirely separate quota sat unused.
+Comments, labels and issue state already had REST fallbacks (#4856); creation
+did not.
+
+**Use `./.loom/scripts/create-issue.sh` instead of a bare `gh issue create`.**
+It tries `gh issue create` first and, only on one of the five documented
+rate-limit signatures, retries the identical filing as a single REST POST:
+
+```bash
+./.loom/scripts/create-issue.sh \
+  --title "Some title" \
+  --body-file /tmp/issue-body.md \
+  --label "loom:triage"
+# prints the new issue URL, exactly like `gh issue create`
+```
+
+Flags mirror `gh issue create`'s (`--title/-t`, `--body/-b`, `--body-file/-F`,
+`--label/-l` repeatable or comma-separated, `--repo/-R`), so an existing
+invocation transfers by changing only the command name.
+
+Key properties (all covered by
+`defaults/scripts/tests/test-forge-helpers-rate-limit-fallback.sh`):
+
+- **Labels are applied atomically with creation on both paths** — `--label` on
+  the primary path, a `labels` array in the same POST body on the REST path.
+  Never a create-then-label sequence: that doubles the request count under
+  exactly the scarcity the fallback exists for, and can half-fail into an
+  unlabelled issue that no role's queue query finds.
+- **Only a rate limit triggers the fallback.** Auth failures, 404s, network
+  errors, and 422 validation failures propagate unchanged and are never retried
+  over REST.
+- **Zero extra API calls to resolve the repo.** With no `--repo`, the REST path
+  uses `gh api`'s literal `{owner}/{repo}` placeholder, which `gh` expands from
+  the git remote — never `gh repo view --json nameWithOwner`, which is itself
+  GraphQL-backed and fails first under the very exhaustion this exists for
+  (#4659).
+
+Scripting rather than shelling out? Source the underlying helper directly:
+
+```bash
+source .loom/scripts/lib/forge-helpers.sh
+forge_gh_create_issue_rl_safe "" "Title" "Body" "loom:triage"
+```
+
+It sits alongside `forge_gh_comment_rl_safe`, `forge_gh_swap_label_rl_safe`,
+and `forge_gh_reopen_issue_rl_safe` (#4856) in `lib/forge-helpers.sh`, sharing
+the same five-signature `is_rate_limit_error()` table (itself mirrored from
+`loom-daemon/src/rate_limit_breaker.rs`).
+
+### `loom-daemon forge issue` has NO fallback — by design
+
+`loom-daemon forge issue <args…>` is a **byte-identical passthrough to `gh`** on
+GitHub (`loom-daemon/src/forge_cmd.rs`). It therefore inherits the exact same
+GraphQL cost and the exact same failure, and is **not** an escape hatch from
+GraphQL exhaustion. It deliberately stays a passthrough: its entire contract is
+that `loom-daemon forge issue X` behaves identically to `gh issue X`, and
+silently rerouting one subcommand's transport would break that contract for
+every caller that parses `gh`'s output. `loom-daemon forge issue create` prints
+a one-line stderr notice pointing here; the fallback lives in `create-issue.sh`.
+
 ## Troubleshooting
 
 ### Token not being picked up

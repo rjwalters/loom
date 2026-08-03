@@ -93,7 +93,7 @@ If all 6 criteria pass:
 # in the body. Phase-completion detection searches for this exact token (see
 # "Detecting Phase Completion"), NOT the natural-language "**Epic**: / **Phase**:"
 # prose — which drifts and is unreliable for GitHub `--search in:body`.
-gh issue create --title "[Epic #<epic>] <Issue Title>" --body "$(cat <<'EOF'
+./.loom/scripts/create-issue.sh --title "[Epic #<epic>] <Issue Title>" --body "$(cat <<'EOF'
 <!-- loom:epic:<epic-number>:phase:1 -->
 **Epic**: #<epic-number> - <Epic Title>
 **Phase**: 1 of N

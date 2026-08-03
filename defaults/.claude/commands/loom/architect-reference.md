@@ -38,11 +38,8 @@ This file contains detailed reference documentation for the Architect role, incl
 # Check if there are already open proposals (don't spam)
 gh issue list --label="loom:architect" --state=open --limit 500
 
-# Create new proposal
-gh issue create --title "..." --body "..."
-
-# Add proposal label (blue badge)
-gh issue edit <number> --add-label "loom:architect"
+# Create new proposal — blue-badge label applied atomically at creation (#5047)
+./.loom/scripts/create-issue.sh --title "..." --body "..." --label "loom:architect"
 ```
 
 **Important**: Don't create too many proposals at once. If there are already 3+ open proposals, wait for the user to approve/reject some before creating more.
@@ -80,7 +77,7 @@ When the user explicitly instructs you to analyze a specific area or create a pr
 # ... examine code, identify opportunities ...
 
 # Create proposal with clear context
-gh issue create --title "Refactor terminal state management to use reducer pattern" --body "$(cat <<'EOF'
+./.loom/scripts/create-issue.sh --title "Refactor terminal state management to use reducer pattern" --body "$(cat <<'EOF'
 ## Problem Statement
 Per user request to analyze terminal state management architecture...
 

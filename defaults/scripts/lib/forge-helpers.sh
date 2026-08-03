@@ -835,6 +835,88 @@ forge_gh_swap_label_rl_safe() {
   return 1
 }
 
+# File a NEW issue via `gh issue create`, falling back to a single REST POST
+# to `repos/{nwo}/issues` on a GraphQL rate-limit rejection (#5047).
+#
+# `gh issue create` is GraphQL-backed, so every issue-filing role (Architect,
+# Auditor, Curator decomposition, Builder decomposition, Doctor, Hermit,
+# Judge) died outright once the GraphQL pool exhausted -- even though the
+# independent REST pool routinely sits ~99% unused at that moment (observed
+# 2026-08-03: core 19/5000 consumed vs graphql 1378/5000). Comments, labels
+# and state already had REST fallbacks (#4856, above); creation did not.
+#
+# **Labels are applied atomically with creation on BOTH paths** -- `--label`
+# on the primary path, a `labels` array in the same POST body on the REST
+# path. Never degrade this to create-then-label: that doubles the request
+# count under exactly the conditions where requests are scarce, and can
+# half-fail, leaving an unlabelled issue that no role's queue query finds.
+#
+# NWO may be the empty string, meaning "the repo of the current working
+# directory". That is the preferred form: the REST path then uses `gh api`'s
+# literal `{owner}/{repo}` placeholder, which gh expands from the git remote
+# with ZERO API calls -- unlike `gh repo view --json nameWithOwner`, which is
+# itself GraphQL-backed and so fails first under the very exhaustion this
+# fallback exists for (#4659).
+#
+# Usage: forge_gh_create_issue_rl_safe NWO TITLE BODY [LABEL...]
+# Stdout: the new issue's URL (both paths).
+# Returns 0 on success (either path), 1 on failure (message on stderr).
+forge_gh_create_issue_rl_safe() {
+  local nwo="$1" title="$2" body="$3"
+  shift 3
+  local labels=("$@")
+
+  local -a create_args=(--title "$title" --body "$body")
+  if [[ -n "$nwo" ]]; then
+    create_args+=(--repo "$nwo")
+  fi
+  local label
+  for label in "${labels[@]+"${labels[@]}"}"; do
+    create_args+=(--label "$label")
+  done
+
+  # Capture stdout (the issue URL) separately from stderr (the error text the
+  # rate-limit signature table is matched against), so a successful create
+  # never returns gh's progress chatter as the URL.
+  local err_file out err rc=0
+  err_file=$(mktemp)
+  out=$(gh issue create "${create_args[@]}" 2>"$err_file") || rc=$?
+  err=$(cat "$err_file" 2>/dev/null || true)
+  rm -f "$err_file"
+
+  if [[ $rc -eq 0 ]]; then
+    printf '%s\n' "$out"
+    return 0
+  fi
+
+  if is_rate_limit_error "$err"; then
+    # One POST carries title + body + labels together. `--input -` takes the
+    # JSON body on stdin, which also sidesteps the guard false positive where
+    # a heredoc body containing `>=` is classified as a Bash redirect.
+    local payload labels_json
+    labels_json=$(jq -nc '$ARGS.positional' --args "${labels[@]+"${labels[@]}"}")
+    payload=$(jq -n --arg t "$title" --arg b "$body" --argjson l "$labels_json" \
+      '{title: $t, body: $b, labels: $l}')
+    local rest_path
+    if [[ -n "$nwo" ]]; then
+      rest_path="repos/$nwo/issues"
+    else
+      # Literal placeholder — gh expands it from the git remote, no API call.
+      rest_path='repos/{owner}/{repo}/issues'
+    fi
+    if out=$(printf '%s' "$payload" \
+        | gh api --method POST "$rest_path" --input - --jq '.html_url' 2>/dev/null); then
+      printf '%s\n' "$out"
+      return 0
+    fi
+    echo "gh issue create rate-limited, and the REST fallback also failed: $err" >&2
+    return 1
+  fi
+
+  echo "$err" >&2
+  return 1
+}
+
 # Get PR comments.
 # Usage: forge_get_pr_comments NWO PR_NUMBER
 # GitHub: gh pr view --comments

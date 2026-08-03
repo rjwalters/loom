@@ -122,10 +122,14 @@ echo "Testing forge_gh_*_rl_safe REST-fallback wrappers..."
 STUB_DIR=$(mktemp -d)
 ARGV_LOG="$STUB_DIR/argv.log"
 GH_MODE_FILE="$STUB_DIR/mode.txt"
+# Captures the JSON body a `gh api ... --input -` call reads from stdin, so
+# the #5047 tests can assert labels ride along in the SAME POST as the title
+# and body (atomic create+label, not create-then-label).
+API_STDIN_LOG="$STUB_DIR/api-stdin.json"
 # The stub script below runs as a separate process, so these must be
 # exported for it to see them (a plain `VAR=x cmd` prefix only exports for
 # the immediate command, not variables set earlier in this shell).
-export ARGV_LOG GH_MODE_FILE
+export ARGV_LOG GH_MODE_FILE API_STDIN_LOG
 
 # A `gh` stub whose behavior is driven by $GH_MODE_FILE:
 #   "ok"          - the primary (non-`api`) mutation succeeds immediately.
@@ -140,7 +144,15 @@ mode="$(cat "$GH_MODE_FILE" 2>/dev/null || echo ok)"
 printf '%s\n' "$*" >> "$ARGV_LOG"
 
 if [[ "$1" == "api" ]]; then
+  # Drain stdin only when the caller actually piped a body in (`--input -`),
+  # never unconditionally -- an unconditional `cat` would block on the
+  # inherited terminal for the label/comment fallbacks that use -f/-F.
+  if [[ "$*" == *"--input -"* ]]; then
+    cat > "$API_STDIN_LOG"
+  fi
   if [[ "$mode" == "ratelimited" ]]; then
+    # POST .../issues --jq .html_url returns the new issue's URL (#5047).
+    [[ "$*" == *"--method POST"*/issues* ]] && echo "https://github.test/o/r/issues/1234"
     exit 0
   fi
   # Reached only when it should not have been.
@@ -149,7 +161,11 @@ if [[ "$1" == "api" ]]; then
 fi
 
 case "$mode" in
-  ok) exit 0 ;;
+  ok)
+    # `gh issue create` prints the new issue's URL on stdout (#5047).
+    [[ "$1 $2" == "issue create" ]] && echo "https://github.test/o/r/issues/99"
+    exit 0
+    ;;
   ratelimited)
     echo "GraphQL: API rate limit already exceeded for user ID 1" >&2
     exit 1
@@ -166,6 +182,7 @@ _run_stubbed() {
     local mode="$1"; shift
     echo "$mode" > "$GH_MODE_FILE"
     : > "$ARGV_LOG"
+    : > "$API_STDIN_LOG"
     PATH="$STUB_DIR:$PATH" "$@"
 }
 
@@ -248,6 +265,140 @@ rc=0
 _run_stubbed other-error forge_gh_swap_label_rl_safe "owner/repo" "7" "loom:building" "loom:issue" >/dev/null 2>&1 || rc=$?
 assert_eq "1" "$rc" "forge_gh_swap_label_rl_safe: non-rate-limit failure propagates"
 
+# --- forge_gh_create_issue_rl_safe (#5047) ---
+echo ""
+echo "Testing forge_gh_create_issue_rl_safe (#5047 issue-creation fallback)..."
+
+# Primary path: `gh issue create` succeeds -> URL on stdout, no REST call.
+out=$(_run_stubbed ok forge_gh_create_issue_rl_safe "owner/repo" "A title" "A body" "loom:triage" 2>/dev/null)
+assert_eq "https://github.test/o/r/issues/99" "$out" \
+    "forge_gh_create_issue_rl_safe: primary path returns the created issue URL"
+TESTS_RUN=$((TESTS_RUN + 1))
+if ! grep -q "^api " "$ARGV_LOG"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: forge_gh_create_issue_rl_safe (ok mode) never calls gh api"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: forge_gh_create_issue_rl_safe (ok mode) unexpectedly called gh api"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q -- "issue create --title A title --body A body --repo owner/repo --label loom:triage" "$ARGV_LOG"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: forge_gh_create_issue_rl_safe primary path passes --label in the SAME create call"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: forge_gh_create_issue_rl_safe primary path must apply labels atomically via --label"
+fi
+
+# Exhausted-GraphQL path: falls back to ONE REST POST carrying labels inline.
+out=$(_run_stubbed ratelimited forge_gh_create_issue_rl_safe "owner/repo" "A title" "A body" "loom:triage" "tier:goal-supporting" 2>/dev/null)
+assert_eq "https://github.test/o/r/issues/1234" "$out" \
+    "forge_gh_create_issue_rl_safe: exhausted GraphQL recovers via REST and returns the URL"
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q "^api --method POST repos/owner/repo/issues --input - --jq .html_url" "$ARGV_LOG"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: forge_gh_create_issue_rl_safe REST fallback POSTs to repos/{nwo}/issues"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: forge_gh_create_issue_rl_safe REST fallback endpoint wrong or missing"
+fi
+
+# The atomicity guarantee: title + body + BOTH labels in one payload.
+assert_eq "A title" "$(jq -r '.title' "$API_STDIN_LOG")" \
+    "forge_gh_create_issue_rl_safe REST payload carries the title"
+assert_eq "A body" "$(jq -r '.body' "$API_STDIN_LOG")" \
+    "forge_gh_create_issue_rl_safe REST payload carries the body"
+assert_eq "loom:triage,tier:goal-supporting" "$(jq -r '.labels | join(",")' "$API_STDIN_LOG")" \
+    "forge_gh_create_issue_rl_safe REST payload applies ALL labels atomically with creation"
+
+# Exactly one REST call -- never create-then-label (that doubles the request
+# count under exactly the scarcity this fallback exists for, and can half-fail).
+rest_call_count="$(grep -c "^api " "$ARGV_LOG" || true)"
+assert_eq "1" "$rest_call_count" \
+    "forge_gh_create_issue_rl_safe REST fallback is a SINGLE call (no create-then-label)"
+
+# Empty NWO -> gh's literal {owner}/{repo} placeholder, which gh expands from
+# the git remote with zero API calls (never `gh repo view`, itself GraphQL).
+_run_stubbed ratelimited forge_gh_create_issue_rl_safe "" "T" "B" >/dev/null 2>&1
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -qF "api --method POST repos/{owner}/{repo}/issues" "$ARGV_LOG"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: forge_gh_create_issue_rl_safe uses the zero-API-call {owner}/{repo} placeholder when NWO is empty"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: forge_gh_create_issue_rl_safe must use the {owner}/{repo} placeholder when NWO is empty"
+fi
+assert_eq "[]" "$(jq -c '.labels' "$API_STDIN_LOG")" \
+    "forge_gh_create_issue_rl_safe REST payload uses an empty labels array when no labels are given"
+
+# A non-rate-limit failure must propagate untouched, with no REST retry.
+rc=0
+_run_stubbed other-error forge_gh_create_issue_rl_safe "owner/repo" "T" "B" >/dev/null 2>&1 || rc=$?
+assert_eq "1" "$rc" "forge_gh_create_issue_rl_safe: non-rate-limit failure propagates (not swallowed)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if ! grep -q "UNEXPECTED_REST_CALL" "$ARGV_LOG"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: forge_gh_create_issue_rl_safe never retries over REST on a non-rate-limit failure"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: forge_gh_create_issue_rl_safe incorrectly retried over REST on a non-rate-limit failure"
+fi
+
+# --- create-issue.sh CLI wrapper (#5047), the surface role prompts invoke ---
+echo ""
+echo "Testing create-issue.sh CLI wrapper (#5047)..."
+
+CREATE_ISSUE_SH="$HELPERS_DIR/create-issue.sh"
+
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ -x "$CREATE_ISSUE_SH" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: create-issue.sh exists and is executable"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: create-issue.sh missing or not executable at $CREATE_ISSUE_SH"
+fi
+
+BODY_TMP="$STUB_DIR/body.md"
+cat > "$BODY_TMP" <<'BODY'
+## Problem
+
+A body read from a file.
+BODY
+
+out=$(_run_stubbed ratelimited env LOOM_FORGE_TYPE=github "$CREATE_ISSUE_SH" \
+    --title "From CLI" --body-file "$BODY_TMP" --label "loom:triage,tier:goal-supporting" 2>/dev/null)
+assert_eq "https://github.test/o/r/issues/1234" "$out" \
+    "create-issue.sh: exhausted GraphQL still files the issue (REST) and prints the URL"
+assert_eq "loom:triage,tier:goal-supporting" "$(jq -r '.labels | join(",")' "$API_STDIN_LOG")" \
+    "create-issue.sh: comma-separated --label splits like gh, applied atomically"
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ "$(jq -r '.body' "$API_STDIN_LOG")" == *"A body read from a file."* ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: create-issue.sh --body-file sends the file CONTENTS (not the path)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: create-issue.sh --body-file must send file contents, not the literal path"
+fi
+
+rc=0
+_run_stubbed ok env LOOM_FORGE_TYPE=github "$CREATE_ISSUE_SH" --body "no title" >/dev/null 2>&1 || rc=$?
+assert_eq "2" "$rc" "create-issue.sh: missing --title exits 2"
+
+rc=0
+_run_stubbed ok env LOOM_FORGE_TYPE=github "$CREATE_ISSUE_SH" --title "T" --body "B" --nope >/dev/null 2>&1 || rc=$?
+assert_eq "2" "$rc" "create-issue.sh: unknown argument exits 2"
+
+rc=0
+_run_stubbed ok env LOOM_FORGE_TYPE=github "$CREATE_ISSUE_SH" \
+    --title "T" --body "B" --body-file "$BODY_TMP" >/dev/null 2>&1 || rc=$?
+assert_eq "2" "$rc" "create-issue.sh: --body and --body-file together exit 2"
+
+rc=0
+_run_stubbed other-error env LOOM_FORGE_TYPE=github "$CREATE_ISSUE_SH" \
+    --title "T" --body "B" >/dev/null 2>&1 || rc=$?
+assert_eq "1" "$rc" "create-issue.sh: a non-rate-limit gh failure exits 1"
+
 rm -rf "$STUB_DIR"
 
 # --- 3. merge-pr.sh source wiring: the four #4856 call sites use the wrappers ---
@@ -287,6 +438,58 @@ if ! grep -q 'gh issue reopen "\$issue_num" --repo "\$REPO_NWO" >/dev/null 2>&1'
 else
     TESTS_FAILED=$((TESTS_FAILED + 1))
     echo -e "  ${RED}FAIL${NC}: the old unwrapped 'gh issue reopen' call site is still present"
+fi
+
+# --- 4. Role-prompt wiring (#5047): no prompt teaches a bare `gh issue create` ---
+#
+# This is the forcing function that keeps the fix from regressing back into
+# nine prompts. A role prompt is what an agent actually follows, so an
+# executable `gh issue create` line in one of them IS the bug, however well
+# documented the fallback is elsewhere. Prose mentions of `gh issue create`
+# (the #3707 serialization warnings, and the pointer blocks this issue added)
+# are fine and expected -- they never start a line, so anchoring on
+# line-start cleanly separates "instruction to run" from "discussion of".
+echo ""
+echo "Testing role-prompt wiring (#5047)..."
+
+PROMPT_DIR="$(cd "$HELPERS_DIR/../.claude/commands/loom" && pwd)"
+
+TESTS_RUN=$((TESTS_RUN + 1))
+bare_creates="$(grep -rln '^[[:space:]]*gh issue create' "$PROMPT_DIR" || true)"
+if [[ -z "$bare_creates" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: no role prompt instructs a bare 'gh issue create'"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: these role prompts still instruct a bare 'gh issue create'"
+    echo "    (use ./.loom/scripts/create-issue.sh instead — see #5047):"
+    printf '    %s\n' $bare_creates
+fi
+
+# The nine prompts named in #5047 must each reach the helper -- either by
+# invoking it or by pointing at it.
+for prompt in architect.md auditor.md builder-complexity.md builder-pr.md \
+              curator.md doctor.md hermit.md hermit-patterns.md judge.md; do
+    TESTS_RUN=$((TESTS_RUN + 1))
+    if grep -q 'create-issue\.sh' "$PROMPT_DIR/$prompt"; then
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+        echo -e "  ${GREEN}PASS${NC}: $prompt routes issue filing through create-issue.sh"
+    else
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+        echo -e "  ${RED}FAIL${NC}: $prompt has no reference to create-issue.sh (#5047)"
+    fi
+done
+
+# `loom-daemon forge issue` must not silently look like an escape hatch: the
+# passthrough either gains the fallback or says out loud that it has none.
+TESTS_RUN=$((TESTS_RUN + 1))
+FORGE_CMD_SRC="$(cd "$HELPERS_DIR/../../loom-daemon/src" 2>/dev/null && pwd || true)/forge_cmd.rs"
+if [[ -f "$FORGE_CMD_SRC" ]] && grep -q 'create-issue.sh' "$FORGE_CMD_SRC"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: loom-daemon forge issue create documents its lack of a REST fallback"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: forge_cmd.rs must state that 'forge issue create' has no REST fallback (#5047)"
 fi
 
 # --- Summary ---

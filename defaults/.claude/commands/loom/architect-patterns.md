@@ -85,14 +85,15 @@ Briefly document other options you evaluated and why they were ruled out:
 ## Issue Creation Command
 
 ```bash
-# Create proposal issue
-gh issue create --title "..." --body "$(cat <<'EOF'
+# Create proposal issue with its labels applied ATOMICALLY (#5047) — a
+# follow-up `gh issue edit --add-label` doubles the request count and can
+# half-fail, leaving an unlabelled issue no queue query finds.
+./.loom/scripts/create-issue.sh --title "..." \
+  --label "loom:architect" \
+  --body "$(cat <<'EOF'
 [issue content here]
 EOF
 )"
-
-# Add proposal label (blue badge - awaiting user approval)
-gh issue edit <number> --add-label "loom:architect"
 
 # Add tier label based on goal alignment
 gh issue edit <number> --add-label "tier:goal-advancing"     # Tier 1
@@ -251,7 +252,7 @@ How do we know this epic is complete?
 
 ```bash
 # Create epic issue
-gh issue create --title "Epic: [Title]" --body "$(cat <<'EOF'
+./.loom/scripts/create-issue.sh --title "Epic: [Title]" --body "$(cat <<'EOF'
 [epic content using template above]
 EOF
 )"

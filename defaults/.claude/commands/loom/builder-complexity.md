@@ -16,6 +16,16 @@ When you claim an issue with `loom:building`, you are committing to ONE of these
 - Leave an issue with `loom:building` label but no PR and no sub-issues
 - Stop work because "it's too hard" without decomposing or documenting why
 
+> **File issues with `./.loom/scripts/create-issue.sh`, never a bare `gh issue create` (#5047).**
+> `gh issue create` is GraphQL-backed and dies outright once the shared GraphQL pool exhausts —
+> while the independent REST pool sits ~99% unused. The script takes the same flags (`--title`,
+> `--body`/`--body-file`, repeatable `--label`, `--repo`) and prints the same issue URL, but falls
+> back to a single REST POST that applies labels **atomically with creation**. Recipe and
+> rationale: `.loom/docs/github-authentication.md` → "Filing issues under GraphQL exhaustion".
+> (`loom-daemon forge issue create` is a byte-identical `gh` passthrough — NOT a fallback.)
+> This matters most exactly here: a decomposition burst files 2-5 issues in a row, so it is the
+> single likeliest place in a Builder run to meet an exhausted GraphQL pool mid-sequence.
+
 ### If You Discover an Issue Is Too Complex
 
 When you claim an issue and realize mid-work it requires >6 hours or touches >8 files:
@@ -23,8 +33,8 @@ When you claim an issue and realize mid-work it requires >6 hours or touches >8 
 **DO THIS** (create path forward):
 ```bash
 # 1. Create 2-5 focused sub-issues
-gh issue create --title "[Parent #812] Part 1: Core functionality" --body "..."
-gh issue create --title "[Parent #812] Part 2: Edge cases" --body "..."
+./.loom/scripts/create-issue.sh --title "[Parent #812] Part 1: Core functionality" --body "..."
+./.loom/scripts/create-issue.sh --title "[Parent #812] Part 2: Edge cases" --body "..."
 # ... create remaining sub-issues ...
 
 # 2. Update parent issue explaining decomposition
@@ -209,9 +219,9 @@ $ find . -name "*_test*" | xargs grep -l constraint
 # Issue #341: "Implement E141 Constraints"
 
 # WRONG: Skip straight to decomposition without checking
-gh issue create --title "[Parent #341] Part 1: Implement NOT NULL"
-gh issue create --title "[Parent #341] Part 2: Implement PRIMARY KEY"
-gh issue create --title "[Parent #341] Part 3: Implement UNIQUE"
+./.loom/scripts/create-issue.sh --title "[Parent #341] Part 1: Implement NOT NULL"
+./.loom/scripts/create-issue.sh --title "[Parent #341] Part 2: Implement PRIMARY KEY"
+./.loom/scripts/create-issue.sh --title "[Parent #341] Part 3: Implement UNIQUE"
 # ... creates 6 duplicate issues for already-complete features
 
 # Result: 6 issues created, all later closed as duplicates
@@ -296,7 +306,7 @@ Before claiming an issue, estimate the work required:
 
 ```bash
 # Create focused sub-issues
-gh issue create --title "Phase 1: <component> foundation" --body "$(cat <<'EOF'
+./.loom/scripts/create-issue.sh --title "Phase 1: <component> foundation" --body "$(cat <<'EOF'
 Parent Issue: #<parent-number>
 
 ## Scope
@@ -313,7 +323,7 @@ Estimated: 1-2 hours
 EOF
 )"
 
-gh issue create --title "Phase 2: <component> integration" --body "$(cat <<'EOF'
+./.loom/scripts/create-issue.sh --title "Phase 2: <component> integration" --body "$(cat <<'EOF'
 Parent Issue: #<parent-number>
 
 ## Scope
@@ -364,15 +374,15 @@ gh issue edit <parent-number> --remove-label "loom:building" --add-label "loom:b
 **Decomposition**:
 ```bash
 # Phase 1: Infrastructure
-gh issue create --title "Create JSON activity log structure and helper functions"
+./.loom/scripts/create-issue.sh --title "Create JSON activity log structure and helper functions"
 # -> Issue #534 (1-2 hours)
 
 # Phase 2: Integration
-gh issue create --title "Integrate activity logging into /builder and /judge"
+./.loom/scripts/create-issue.sh --title "Integrate activity logging into /builder and /judge"
 # -> Issue #535 (2-3 hours, depends on #534)
 
 # Phase 3: Querying
-gh issue create --title "Add activity querying to /loom heuristic"
+./.loom/scripts/create-issue.sh --title "Add activity querying to /loom heuristic"
 # -> Issue #536 (1-2 hours, depends on #535)
 
 # Mark parent blocked — a human closes it once the children are curated
@@ -504,7 +514,7 @@ Don't create issues for:
 # PAUSE: Stop trying to implement it
 # CREATE: Make an issue for it
 
-gh issue create --title "Add Vitest testing framework for frontend unit tests" --body "$(cat <<'EOF'
+./.loom/scripts/create-issue.sh --title "Add Vitest testing framework for frontend unit tests" --body "$(cat <<'EOF'
 ## Problem
 
 While working on #38, discovered we cannot write unit tests for the state management refactor because no test framework is configured for the frontend.

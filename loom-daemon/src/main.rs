@@ -1395,6 +1395,12 @@ enum QuarantineAction {
 enum ForgeAction {
     /// `forge issue <args…>` — e.g. `issue view 42 --json labels --jq
     /// '.labels[].name'`. GitHub: exec `gh issue <args…>`.
+    ///
+    /// This is a byte-identical passthrough, so `forge issue create` is
+    /// GraphQL-backed and has **no REST fallback** — it dies on GraphQL-quota
+    /// exhaustion exactly like `gh issue create`, and is not an escape hatch
+    /// from it (#5047). To file an issue that survives an exhausted GraphQL
+    /// pool, use `.loom/scripts/create-issue.sh`.
     Issue {
         #[arg(
             trailing_var_arg = true,
