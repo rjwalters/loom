@@ -435,6 +435,7 @@ pub fn run_monitor_check(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::fs;
 
     fn fresh_now() -> DateTime<Utc> {
@@ -758,7 +759,13 @@ mod tests {
         assert_eq!(format_ranking_lines(&available), "c|available|0.12|2026-08-01T06:50:00Z\n");
     }
 
+    // Serialized against its sibling below: both mutate the process-wide
+    // `CLAUDE_MONITOR_DIR_VAR` env var without restoring a prior value, so
+    // two non-serial instances can race and one can observe the other's
+    // `monitor_dir` override (#5133, same class as
+    // `observability::backfill`'s env-seam leak).
     #[test]
+    #[serial]
     fn run_monitor_check_writes_available_for_unmentioned_manifest_account() {
         // Regression test for issue #4645: a manifest account the monitor DB
         // never mentions (e.g. freshly bootstrapped/never-used) must serialize
@@ -872,7 +879,9 @@ mod tests {
         assert_eq!(b.reset_5h, None);
     }
 
+    // Serialized against its sibling above for the same reason.
     #[test]
+    #[serial]
     fn run_monitor_check_reports_and_writes_the_binding_reset() {
         // End-to-end for the monitor backend (issue #4874): the CLI table
         // (`ProbeReport`) and the written `.ranking` must BOTH carry the reset,
