@@ -1239,6 +1239,7 @@ mod tests {
             daemon_build_commit: None,
             work_finder_interval_secs: None,
             observability_host_id_mismatch: None,
+            observability_export: None,
         }
     }
 

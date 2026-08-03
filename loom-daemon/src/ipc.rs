@@ -1711,6 +1711,11 @@ pub fn build_daemon_status(
         // snapshot pattern again, registered only when the exporter actually
         // starts, so a disabled/keyless exporter always reads `None`.
         observability_host_id_mismatch: crate::observability::global_host_id_mismatch(),
+        // Positive export-liveness signal (#5083) — the counterpart to the
+        // anomaly-only field above. Always `Some` from a daemon of this
+        // vintage: an exporter that never started reports `disabled`, which is
+        // a real answer, not the silence #4830 alone could offer.
+        observability_export: Some(crate::observability::global_export_status()),
         // Live safehouse connection state (#4345) — the pool's shared cell is
         // updated by the narration sink / peer-coordination tasks
         // `start_safehouse_narration`/`start_peer_coordination` spawn, and
@@ -5616,6 +5621,17 @@ exit 0
                 ingest_host_id: "robb-pro".to_string(),
                 first_seen_at: chrono::Utc::now(),
             }),
+            observability_export: Some(crate::types::ObservabilityExportStatus {
+                state: crate::types::ObservabilityExportState::HostIdMismatch,
+                host_id: Some("robb-studio".to_string()),
+                ingest_host_id: Some("robb-pro".to_string()),
+                endpoint: Some("https://dashboard.example/ingest".to_string()),
+                exporter: Some("https".to_string()),
+                started_at: Some(chrono::Utc::now()),
+                last_success_at: Some(chrono::Utc::now()),
+                records_exported: 128,
+                ..Default::default()
+            }),
         };
         let resp = Response::DaemonStatus(Box::new(report));
         let json = serde_json::to_string(&resp).expect("serialize response");
@@ -5660,6 +5676,18 @@ exit 0
                     .expect("mismatch round-trips");
                 assert_eq!(mismatch.daemon_host_id, "robb-studio");
                 assert_eq!(mismatch.ingest_host_id, "robb-pro");
+                // #5083: the positive export record survives the wire too —
+                // this is what lets a `status`/`health` client in another
+                // process state that telemetry IS (or is not) landing rather
+                // than infer it from the absence of a warning.
+                let export = r
+                    .observability_export
+                    .as_ref()
+                    .expect("export status round-trips");
+                assert_eq!(export.state, crate::types::ObservabilityExportState::HostIdMismatch);
+                assert_eq!(export.host_id.as_deref(), Some("robb-studio"));
+                assert_eq!(export.ingest_host_id.as_deref(), Some("robb-pro"));
+                assert_eq!(export.records_exported, 128);
                 assert_eq!(r.per_repo[0].health_gate_enabled, Some(true));
                 assert!(r.per_repo[0].health_gate_verdict_at.is_some());
                 assert_eq!(
