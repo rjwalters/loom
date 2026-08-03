@@ -24,16 +24,27 @@
 #      never observed its completion before the orchestrator tried to end its
 #      turn.
 #   2. Assistant `Bash` `tool_use` entries with `input.run_in_background ==
-#      true` (issue #4389 — the #4257 recurrence) whose dispatch id has no
-#      matching `<task-notification>...<tool-use-id>ID</tool-use-id>...`
-#      completion event anywhere later in the transcript. A background Bash
+#      true` (issue #4389 — the #4257 recurrence) whose dispatch has no
+#      observed completion anywhere later in the transcript. A background Bash
 #      dispatch gets an IMMEDIATE `tool_result` ack ("Command running in
 #      background with ID: ...") at dispatch time — that ack is NOT
 #      completion, so pattern (1)'s tool_result-matching logic would (and
-#      did, in the #4347 death) treat it as already resolved. The real
-#      completion arrives later as a `task-notification` message whose
-#      `<tool-use-id>` tag echoes the original dispatch id; only that event
-#      counts as resolution for a background Bash task.
+#      did, in the #4347 death) treat it as already resolved. A background
+#      Bash task counts as RESOLVED when any of these later events appears for
+#      it (issue #5013 broadened this from `<tool-use-id>`-only matching, the
+#      analogue of the #4696 Monitor fix):
+#        - a `<task-notification>` whose `<tool-use-id>` echoes the dispatch id
+#          (the original #4389 signal), OR
+#        - a `<task-notification>` whose `<task-id>` is the TASK id from the
+#          dispatch ack (`running in background with ID: <ID>`) — some
+#          completions carry ONLY `<task-id>`, the Monitor-shaped notification
+#          that `<tool-use-id>`-only matching never observed (the constant
+#          "1 outstanding" false positive of #5013), OR
+#        - a blocking `TaskOutput`/`BashOutput` read of that task (keyed on its
+#          task id or dispatch tool-use id) whose result is not an error — in
+#          headless mode a blocking read returns only after the task produced
+#          its output/completed, and may itself consume the notification, OR
+#        - an explicit `TaskStop` of the task id (#4696).
 #   3. Assistant `Monitor` / `ScheduleWakeup` `tool_use` entries (issue #4462)
 #      that are still armed — i.e. the transcript shows no later event that
 #      could have retired the timer. Like a background Bash task, arming a
@@ -218,19 +229,67 @@ def stopped_task_ids:
     + ( [ $r[] | ((.text | capture("Successfully stopped task: (?<v>[A-Za-z0-9_-]+)")?).v) // empty ] );
 '
 
-# Diff background-Bash dispatch ids (issue #4389) against ids echoed back in a
-# `<task-notification>...<tool-use-id>ID</tool-use-id>...` completion event.
+# Diff background-Bash dispatch ids (issue #4389) against every event that can
+# retire one. A background Bash task is resolved when ANY of these appear later
+# in the transcript for it (issue #5013 — the fourth transcript-format gap after
+# #4482/#4462/#4696, the exact analogue of the Monitor fix):
+#
+#   a. A `<task-notification>` whose `<tool-use-id>` echoes the DISPATCH id — the
+#      original #4389 signal.
+#   b. A `<task-notification>` whose `<task-id>` is the TASK id recovered from the
+#      dispatch ack (`running in background with ID: <ID>`). Verified against live
+#      transcripts, some background-Bash completions carry ONLY `<task-id>` (the
+#      same Monitor-shaped notification the #4696 gap was about) — matching purely
+#      on `<tool-use-id>` never observed those, so the task re-blocked one stop per
+#      stop sequence for the rest of the session (the constant "1 outstanding"
+#      false positive of #5013).
+#   c. An explicit `TaskStop` of the task id (#4696).
+#   d. A blocking `TaskOutput` / `BashOutput` read of the task — keyed on the task
+#      id (`bash_id`/`task_id`/`shell_id`) or the dispatch tool-use id — whose
+#      result is NOT an error (issue #5013). In headless mode a blocking output
+#      read returns only once the task has produced its output/completed, so a
+#      non-error read satisfies the guard for that id even when the async
+#      `<task-notification>` was consumed by that read and never separately
+#      emitted (or arrived in a different shape). This is the criterion the two
+#      awaited-via-TaskOutput async agents in the #5013 report hit.
+#
 # Deliberately does NOT treat the immediate dispatch-time `tool_result` ack as
-# resolution (see header) — only a later task-notification counts. An
-# explicitly TaskStop'd background task also counts as resolved (#4696): its
-# task id comes from the same dispatch ack (`running in background with ID:
-# <ID>`) that is otherwise ignored.
+# resolution (see header) — only one of (a)–(d) counts. A genuinely running
+# background task with none of these still blocks the first stop (true positive
+# retained).
+#
+# Async AGENT dispatches (`Task` tool_use — `subagent_type=…`, possibly with
+# `run_in_background: true`) are structurally excluded here: only `.name=="Bash"`
+# entries enter $bg_ids, so a subagent dispatch is never miscounted as a
+# background Bash task. Task subagents are covered by their own detector
+# (UNRESOLVED_TASK_IDS) above.
 UNRESOLVED_BG_IDS=$(jq -s -r "$JQ_PRELUDE"'
   . as $t
   | (results) as $r
   | (stopped_task_ids) as $stopped
-  | [ notif_texts[] | ((capture("<tool-use-id>(?<v>[^<]+)</tool-use-id>")?).v) // empty
-    ] as $notified_ids
+  | (notif_texts) as $n
+  | [ $n[] | ((capture("<tool-use-id>(?<v>[^<]+)</tool-use-id>")?).v) // empty
+    ] as $notified_tools
+  | [ $n[] | ((capture("<task-id>(?<v>[^<]+)</task-id>")?).v) // empty
+    ] as $notified_tasks
+  # Task/bash ids read via a blocking TaskOutput/BashOutput whose result is not
+  # an error. `ref` is whichever id field the read used to name the task; the
+  # read may also name the original dispatch tool-use id, so both are matched
+  # against the bg dispatch below.
+  | ( [ $t[]? | select(.type=="assistant") | .message.content[]?
+        | select(.type=="tool_use"
+                 and (.name=="TaskOutput" or .name=="BashOutput"
+                      or .name=="AsyncTaskOutput"))
+        | { id: (.id // ""),
+            ref: (.input.task_id? // .input.bash_id? // .input.shell_id?
+                  // .input.id? // null) } ] ) as $reads
+  | ( [ $reads[]
+        | . as $rd
+        | (($r | map(select(.id == $rd.id)) | .[0]) // null) as $res
+        | select($res == null or ($res.err != true))
+        | { ref: $rd.ref, id: $rd.id } ]
+      | [ .[].ref | select(. != null) ] + [ .[].id | select(. != "") ]
+    ) as $read_refs
   | [ $t[]? | select(.type=="assistant") | .message.content[]?
       | select(.type=="tool_use" and .name=="Bash" and (.input.run_in_background == true))
       | .id ] as $bg_ids
@@ -240,8 +299,11 @@ UNRESOLVED_BG_IDS=$(jq -s -r "$JQ_PRELUDE"'
       | (if $ack == null then null
          else ((($ack.text | capture("background with ID: (?<v>[A-Za-z0-9_-]+)")?).v) // null)
          end) as $tid
-      | if (($notified_ids | index($id)) != null) then empty
+      | if (($notified_tools | index($id)) != null) then empty
+        elif ($tid != null and ($notified_tasks | index($tid)) != null) then empty
         elif ($tid != null and ($stopped | index($tid)) != null) then empty
+        elif ($tid != null and ($read_refs | index($tid)) != null) then empty
+        elif (($read_refs | index($id)) != null) then empty
         else $id end
     ] | .[]
 ' "$TRANSCRIPT_PATH" 2>/dev/null) || UNRESOLVED_BG_IDS=""
@@ -338,7 +400,7 @@ BG_COUNT=0
 MONITOR_COUNT=0
 [[ -z "$UNRESOLVED_MONITOR_IDS" ]] || MONITOR_COUNT=$(printf '%s\n' "$UNRESOLVED_MONITOR_IDS" | grep -c . || true)
 
-REASON="STOP BLOCKED (guard-background-subagents.sh, issues #4257/#4389/#4462/#4696):"
+REASON="STOP BLOCKED (guard-background-subagents.sh, issues #4257/#4389/#4462/#4696/#5013):"
 if [[ "$TASK_COUNT" -gt 0 ]]; then
     REASON="${REASON} ${TASK_COUNT} dispatched Task subagent(s) have no observed completion in this transcript yet."
 fi

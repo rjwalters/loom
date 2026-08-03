@@ -166,6 +166,38 @@ BG_ACK_STOPPED='{"type":"user","timestamp":"2026-07-30T12:00:01.000Z","message":
 BG_TASKSTOP_USE='{"type":"assistant","timestamp":"2026-07-30T12:01:00.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_stop03","name":"TaskStop","input":{"task_id":"bgtest03"}}]}}'
 BG_TASKSTOP_RESULT='{"type":"user","timestamp":"2026-07-30T12:01:01.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_stop03","content":"{\"message\":\"Successfully stopped task: bgtest03 (tail -f /tmp/x)\",\"task_id\":\"bgtest03\",\"task_type\":\"local_bash\",\"command\":\"tail -f /tmp/x\"}"}]}}'
 
+# --- issue #5013 fixtures: background Bash completions the pre-#5013 matcher
+# missed (the constant "1 outstanding" false positive) --------------------------
+#
+# (u1) A background Bash task whose completion `<task-notification>` carries ONLY
+# `<task-id>` (no `<tool-use-id>`) — the Monitor-shaped notification that
+# `<tool-use-id>`-only matching never observed. Uses a DISTINCT dispatch id.
+BG_USE_TASKID_ONLY='{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_bg10","name":"Bash","input":{"command":"sleep 1","run_in_background":true}}]}}'
+BG_ACK_TASKID_ONLY='{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_bg10","content":"Command running in background with ID: bgtest10. Output is being written to: /tmp/bgtest10.output. You will be notified when it completes."}]}}'
+BG_NOTIFICATION_TASKID_ONLY='{"type":"queue-operation","operation":"enqueue","content":"<task-notification>\n<task-id>bgtest10</task-id>\n<output-file>/tmp/bgtest10.output</output-file>\n<status>completed</status>\n<summary>Background command completed (exit code 0)</summary>\n</task-notification>"}'
+
+# (u2) A background Bash task awaited via a blocking BashOutput read (keyed on
+# bash_id) whose result is a non-error output — and NO task-notification at all.
+BG_USE_READ='{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_bg11","name":"Bash","input":{"command":"make build","run_in_background":true}}]}}'
+BG_ACK_READ='{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_bg11","content":"Command running in background with ID: bgtest11. Output is being written to: /tmp/bgtest11.output. You will be notified when it completes."}]}}'
+BG_READ_USE='{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_read11","name":"BashOutput","input":{"bash_id":"bgtest11"}}]}}'
+BG_READ_RESULT='{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_read11","content":"<status>completed</status>\nbuild finished successfully\n"}]}}'
+
+# (u3) Async agent (Task subagent) dispatched and awaited via a blocking
+# TaskOutput. The Task dispatch gets an immediate ack keyed to its own id (so
+# pattern 1 does not flag it), then a TaskOutput read of the same task id
+# returns the completion. This is the "M async agents awaited via TaskOutput"
+# arm of the acceptance-criteria regression scenario. It must NEVER be counted
+# as a background Bash task.
+AGENT_USE='{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_task20","name":"Task","input":{"subagent_type":"loom-builder","run_in_background":true}}]}}'
+AGENT_ACK='{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_task20","content":"Task started in background with ID: agent20. You will be notified when it completes."}]}}'
+AGENT_READ_USE='{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_read20","name":"TaskOutput","input":{"task_id":"agent20"}}]}}'
+AGENT_READ_RESULT='{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_read20","content":"Subagent completed: opened PR #1234."}]}}'
+
+# A foreground-only final turn (a plain Bash tool_use with no run_in_background).
+FG_FINAL_TURN='{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_fg30","name":"Bash","input":{"command":"gh issue create"}}]}}'
+FG_FINAL_RESULT='{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_fg30","content":"https://github.com/x/y/issues/1"}]}}'
+
 # Build stdin JSON. Args: <transcript_path> <stop_hook_active>
 make_input() {
     local transcript="$1" active="${2:-false}"
@@ -476,6 +508,62 @@ T17="$TMPROOT/transcript-bg-taskstopped.jsonl"
 write_transcript "$T17" "$BG_USE_STOPPED" "$BG_ACK_STOPPED" "$BG_TASKSTOP_USE" "$BG_TASKSTOP_RESULT"
 result=$(run_hook "$T17" false)
 assert_allow "(t) TaskStop'd background Bash task -> allow" "$result"
+
+# --- background Bash completion shapes the pre-#5013 matcher missed ----------
+# The constant "1 outstanding" false positive: a background Bash task whose
+# completion never carried a `<tool-use-id>` echo re-blocked one stop per stop
+# sequence for the whole session, even on turns that dispatched no new work.
+
+# (u1) completion notification carries ONLY <task-id> (Monitor-shaped) -> allow.
+# Keyed on the TASK id recovered from the dispatch ack, not the tool-use id.
+T22="$TMPROOT/transcript-bg-taskid-only.jsonl"
+write_transcript "$T22" "$BG_USE_TASKID_ONLY" "$BG_ACK_TASKID_ONLY" "$BG_NOTIFICATION_TASKID_ONLY"
+result=$(run_hook "$T22" false)
+assert_allow "(u1) background Bash notified by <task-id> only -> allow" "$result"
+
+# (u2) awaited via a blocking BashOutput read (non-error result), NO
+# task-notification at all -> allow. A blocking read in headless mode returns
+# only after the task completed and can itself consume the notification.
+T23="$TMPROOT/transcript-bg-blocking-read.jsonl"
+write_transcript "$T23" "$BG_USE_READ" "$BG_ACK_READ" "$BG_READ_USE" "$BG_READ_RESULT"
+result=$(run_hook "$T23" false)
+assert_allow "(u2) background Bash awaited via blocking BashOutput -> allow" "$result"
+
+# (u3) full acceptance-criteria regression scenario: N=2 completed+notified
+# background Bash tasks + M=2 async agents (Task, ack-resolved, awaited via a
+# blocking TaskOutput) + a foreground-only final turn -> NOT blocked. Async
+# agents are never counted as background Bash tasks.
+T24="$TMPROOT/transcript-bg-mixed-clean.jsonl"
+write_transcript "$T24" \
+    "$BG_USE_RESOLVED" "$BG_ACK_RESOLVED" "$BG_NOTIFICATION_QUEUEOP" \
+    "$BG_USE_TASKID_ONLY" "$BG_ACK_TASKID_ONLY" "$BG_NOTIFICATION_TASKID_ONLY" \
+    "$AGENT_USE" "$AGENT_ACK" "$AGENT_READ_USE" "$AGENT_READ_RESULT" \
+    "$FG_FINAL_TURN" "$FG_FINAL_RESULT"
+result=$(run_hook "$T24" false)
+assert_allow "(u3) N completed bg tasks + M async agents (TaskOutput) + fg turn -> allow" "$result"
+
+# (u3b) same scenario re-scanned on a second stop sequence -> still allow. The
+# false positive in the field re-fired on EVERY stop, so resolution must be
+# derived from durable transcript facts, not one-shot state.
+result=$(run_hook "$T24" false)
+assert_allow "(u3b) mixed clean transcript -> allow again on second stop sequence" "$result"
+
+# (u4) true-positive retained: a genuinely running background Bash task (no
+# notification of any shape, no blocking read, no TaskStop) STILL blocks the
+# first stop, even amid the resolved tasks and async agents of (u3).
+T25="$TMPROOT/transcript-bg-genuine-running.jsonl"
+write_transcript "$T25" \
+    "$BG_USE_RESOLVED" "$BG_ACK_RESOLVED" "$BG_NOTIFICATION_QUEUEOP" \
+    "$AGENT_USE" "$AGENT_ACK" "$AGENT_READ_USE" "$AGENT_READ_RESULT" \
+    "$BG_USE_UNRESOLVED" "$BG_ACK_UNRESOLVED"
+result=$(run_hook "$T25" false)
+assert_block "(u4) genuinely running background Bash task amid resolved work -> block" "$result"
+reason_u4=$(echo "${result#*|}" | jq -r '.reason // empty' 2>/dev/null || true)
+if [[ "$reason_u4" == *"1 background Bash"* ]]; then
+    pass "(u4b) block counts exactly the 1 genuinely-running background Bash task"
+else
+    fail "(u4b) block counts exactly the 1 genuinely-running background Bash task (got: $reason_u4)"
+fi
 
 # --- block reason mentions the #3822/#4257 hazard ---------------------------
 raw=$(run_hook "$T1" false)
