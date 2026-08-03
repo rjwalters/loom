@@ -366,6 +366,15 @@ git push origin main --tags
 gh release create vX.Y.Z --title "vX.Y.Z" --notes "Release notes..."
 ```
 
+Creating the Release triggers [`.github/workflows/release.yml`](.github/workflows/release.yml),
+which cross-builds `loom-daemon` for `aarch64-apple-darwin`,
+`x86_64-unknown-linux-gnu`, and `aarch64-unknown-linux-gnu`, and uploads each
+platform's binary plus a `.sha256` checksum file as Release assets. These
+artifacts are unsigned as of this writing (platform code signing is a
+secrets-gated, opt-in follow-up); verify integrity via the checksum. Each
+platform builds in its own CI job, so one platform failing to build never
+silently drops that platform's artifact from an otherwise-"successful" run.
+
 ## Bootstrap New Projects
 
 ```bash
