@@ -420,6 +420,15 @@ pub fn reap_repo(repo_root: &Path, config: &WorktreeReaperConfig) -> ReapReport 
     // (`resolve_orphan_process_reap_enabled`) because terminating a live
     // process is more consequential than removing an idle directory.
     if resolve_orphan_process_reap_enabled(config) {
+        // Resolved only when this sub-pass actually runs (Issue #5135) — read
+        // back out of the same claim locks `active_issues` above already
+        // scans, so the pass can discriminate a live sweep's own process
+        // tree from an unrelated orphan instead of blanket-protecting the
+        // whole issue.
+        let live_sweep_roots = crate::worktree_ops::liveness::active_locked_issue_roots(repo_root);
+        let live_sweep_root_fn = |n: u32| live_sweep_roots.get(&n).copied();
+        let pid_started_at_fn =
+            |pid: u32| crate::orphan_process_reaper::pid_started_at(pid, Utc::now());
         let kill_fn = |pids: &[u32]| {
             crate::orphan_process_reaper::kill_pids(
                 pids,
@@ -430,6 +439,8 @@ pub fn reap_repo(repo_root: &Path, config: &WorktreeReaperConfig) -> ReapReport 
             repo_root,
             &crate::orphan_process_reaper::OrphanReapProbes {
                 active_issues: &active_issues,
+                live_sweep_root: &live_sweep_root_fn,
+                pid_started_at: &pid_started_at_fn,
                 processes_using: &crate::worktree_ops::safety::find_processes_using_directory,
                 issue_state: &issue_state_fn,
                 pr_status: &pr_status_fn,

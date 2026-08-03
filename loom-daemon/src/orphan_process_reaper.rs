@@ -28,9 +28,13 @@
 //!    same probe [`crate::worktree_ops::clean::classify_worktree`] already
 //!    uses to protect a worktree with live work from removal).
 //! 2. Skip it unless EVERY gate in [`OrphanSkip`] clears: the worktree carries
-//!    the `.loom-managed` sentinel, issue N has no live sweep claim, issue N
-//!    is closed, and its PR is not open (see "Fail-safe" on
-//!    [`reap_orphan_processes_with`]).
+//!    the `.loom-managed` sentinel, issue N is closed, and its PR is not open
+//!    (see "Fail-safe" on [`reap_orphan_processes_with`]). A live sweep claim
+//!    for issue N no longer blanket-protects the whole worktree (#5135) — it
+//!    narrows the candidate PIDs to those provably NOT that live sweep's own
+//!    process tree (see [`partition_live_sweep_candidates`]), so a previous
+//!    agent's orphan can still be reaped alongside a concurrently live,
+//!    re-dispatched sweep for the same issue.
 //! 3. For every surviving candidate PID, walk its full descendant tree by
 //!    PID (`pgrep -P`, recursive) — **not** scoped to any process group or
 //!    session, so a tree that escaped via `setsid`/`timeout` into a fresh
@@ -53,7 +57,9 @@ use chrono::{DateTime, Utc};
 use crate::worktree_ops::clean::{
     check_grace_period, is_loom_managed, PrStatus, DEFAULT_GRACE_PERIOD_SECS,
 };
-use crate::worktree_ops::liveness::active_spawn_loop_issues;
+use crate::worktree_ops::liveness::{
+    active_locked_issue_roots, active_spawn_loop_issues, LiveSweepRoot,
+};
 use crate::worktree_ops::naming::issue_from_worktree;
 use crate::worktree_ops::safety::find_processes_using_directory;
 
@@ -153,10 +159,17 @@ pub fn kill_pids(pids: &[u32], grace: Duration) -> Vec<u32> {
 pub struct OrphanReapEntry {
     /// The issue number the worktree belongs to.
     pub issue: u32,
-    /// PIDs found with cwd inside the worktree — the roots of each tree walked.
+    /// PIDs found with cwd inside the worktree that were reaped as orphan
+    /// candidates — the roots of each tree walked. Excludes any pid this
+    /// pass identified as a live sweep's own process (see `protected_pids`).
     pub root_pids: Vec<u32>,
     /// Every PID (roots + transitive descendants) that was signaled.
     pub killed_pids: Vec<u32>,
+    /// PIDs found with cwd inside the same worktree that were provably part
+    /// of a live sweep's own process tree for this issue, and therefore
+    /// deliberately left alone (Issue #5135) — never overlaps
+    /// `root_pids`/`killed_pids`.
+    pub protected_pids: Vec<u32>,
 }
 
 /// Why a fail-safe gate preserved a worktree's live processes.
@@ -169,7 +182,13 @@ pub struct OrphanReapEntry {
 pub enum OrphanSkip {
     /// No `.loom-managed` sentinel — user-provisioned, never touched.
     Unmanaged,
-    /// A daemon-dispatched sweep holds a claim-lock / spawn-loop entry.
+    /// A daemon-dispatched sweep holds a claim-lock / spawn-loop entry, and
+    /// every candidate PID inside the worktree is provably that live
+    /// sweep's own process tree (or there was no live sweep root to compare
+    /// candidates against, in which case this is a fail-safe full protect —
+    /// #5135). Reported at the worktree level; individual orphan PIDs that
+    /// are NOT the live sweep's own are still reaped (see
+    /// [`partition_live_sweep_candidates`]) and never reach this variant.
     LiveSweepClaim,
     /// The issue is not `CLOSED` (payload: the observed state, e.g. `OPEN` /
     /// `UNKNOWN`) — work on it may legitimately still be in flight.
@@ -233,6 +252,18 @@ pub struct OrphanReapProbes<'a> {
     /// Issues with a live spawn-loop task or claim-lock (daemon-dispatched
     /// sweeps only — which is exactly why it cannot be the sole gate).
     pub active_issues: &'a HashSet<u32>,
+    /// The live sweep's own root pid + claim-acquired time for an issue in
+    /// `active_issues`, when one can be resolved (Issue #5135) — `None` when
+    /// no lock exists for the issue (e.g. it is only in `active_issues` via
+    /// the legacy spawn-loop-state union) or the lock's owner cannot be
+    /// confirmed alive. Callers MUST treat `None` as "nothing to compare
+    /// against", never as license to reap — see
+    /// [`partition_live_sweep_candidates`].
+    pub live_sweep_root: &'a dyn Fn(u32) -> Option<LiveSweepRoot>,
+    /// Best-effort wall-clock start time for an arbitrary candidate pid.
+    /// `None` when it cannot be determined (process gone, `ps` unavailable,
+    /// unparseable output) — never license to reap.
+    pub pid_started_at: &'a dyn Fn(u32) -> Option<DateTime<Utc>>,
     /// PIDs whose cwd is inside the worktree.
     pub processes_using: &'a dyn Fn(&Path) -> Vec<u32>,
     /// Forge issue state (`"OPEN"` / `"CLOSED"` / `"UNKNOWN"`).
@@ -253,9 +284,19 @@ pub struct OrphanReapProbes<'a> {
 /// processes still running inside it are orphans. `None` ⇒ reap; `Some(skip)`
 /// ⇒ leave every process alone.
 ///
-/// Ordered cheapest-first: the two local (filesystem) gates run before either
-/// forge probe, and callers only reach this at all once a live process was
-/// actually found, so an idle worktree costs zero REST calls per tick.
+/// This covers the gates that apply to the whole worktree regardless of
+/// which specific candidate pid is in play (the sentinel, issue state, and
+/// PR status). The live-sweep-claim gate is deliberately NOT here — since
+/// Issue #5135 it is pid-scoped, applied per candidate by
+/// [`partition_live_sweep_candidates`] *before* this function is ever
+/// called, so only pids that already survived that partition reach these
+/// (potentially forge-backed) checks.
+///
+/// Ordered cheapest-first: the local (filesystem) sentinel gate runs before
+/// either forge probe, and callers only reach this at all once a live
+/// process was actually found *and* at least one candidate pid survived the
+/// live-sweep partition, so an idle or fully-live-sweep-owned worktree costs
+/// zero REST calls per tick.
 #[must_use]
 pub fn classify_orphan_candidate(
     worktree_path: &Path,
@@ -266,19 +307,15 @@ pub fn classify_orphan_candidate(
     if !is_loom_managed(worktree_path) {
         return Some(OrphanSkip::Unmanaged);
     }
-    // Gate 2: never touch a worktree a daemon-dispatched sweep still claims.
-    if probes.active_issues.contains(&issue) {
-        return Some(OrphanSkip::LiveSweepClaim);
-    }
-    // Gate 3: never touch a worktree whose issue is still open (or whose
+    // Gate 2: never touch a worktree whose issue is still open (or whose
     // state could not be determined) — Manual Orchestration Mode and manual
-    // `/loom:sweep` work never registers a claim in gate 2, so this is the
-    // gate that actually protects them.
+    // `/loom:sweep` work never registers a claim, so this is the gate that
+    // actually protects them.
     let issue_state = (probes.issue_state)(issue);
     if issue_state != "CLOSED" {
         return Some(OrphanSkip::IssueNotClosed(issue_state));
     }
-    // Gate 4: never touch a worktree whose PR is still open / unknown, and
+    // Gate 3: never touch a worktree whose PR is still open / unknown, and
     // give a just-merged PR the same post-merge grace the removal pass gives
     // it — a Judge or Doctor reviewing that PR reuses this very worktree.
     match (probes.pr_status)(issue) {
@@ -310,13 +347,15 @@ pub fn classify_orphan_candidate(
 ///
 /// # Fail-safe (this issue's AC)
 ///
-/// A worktree is only ever a reap candidate when EVERY gate in
-/// [`classify_orphan_candidate`] clears — the same gate set the sibling
-/// worktree-**removal** pass
+/// A worktree is only ever a reap candidate when EVERY gate clears — the same
+/// gate set the sibling worktree-**removal** pass
 /// ([`crate::worktree_ops::clean::classify_worktree`]) applies, minus the ones
 /// whose polarity is inverted here:
 /// - the `.loom-managed` sentinel (`CleanOptions::require_managed_sentinel`);
-/// - no live sweep claim (`SkipInUse` via
+/// - each candidate pid is provably NOT a live sweep's own process tree for
+///   the issue (Issue #5135's pid/pgid-aware Gate 2 — see
+///   [`partition_live_sweep_candidates`]; this REPLACES the old blanket
+///   "no live sweep claim" issue-scoped skip, `SkipInUse` via
 ///   [`crate::worktree_ops::liveness::active_spawn_loop_issues`]);
 /// - the issue is `CLOSED` (`SkipIssueNotClosed`);
 /// - the PR is not open, not unknown, and past its post-merge grace period
@@ -375,6 +414,23 @@ pub fn reap_orphan_processes_with(
             continue;
         }
 
+        // Gate (pid-scoped, #5135): narrow `root_pids` to candidates that are
+        // provably NOT a live sweep's own process tree for this issue. Local
+        // only (no forge calls), so a worktree fully owned by a live sweep
+        // still costs zero REST calls, same as the old blanket issue-scoped
+        // gate did.
+        let (candidate_pids, protected_pids) =
+            partition_live_sweep_candidates(issue, &root_pids, probes);
+        if candidate_pids.is_empty() {
+            let reason = OrphanSkip::LiveSweepClaim.reason();
+            log::info!(
+                "orphan_process_reaper: {} preserving issue-{issue} pids={root_pids:?}: {reason}",
+                repo_root.display()
+            );
+            report.preserved.push((issue, reason));
+            continue;
+        }
+
         // Live processes found — now (and only now) prove the sweep is dead.
         if let Some(skip) = classify_orphan_candidate(&worktree_path, issue, probes) {
             let reason = skip.reason();
@@ -387,14 +443,14 @@ pub fn reap_orphan_processes_with(
         }
 
         let mut all_pids: Vec<u32> = Vec::new();
-        for &root in &root_pids {
+        for &root in &candidate_pids {
             for descendant in (probes.collect_descendants)(root) {
-                if !all_pids.contains(&descendant) {
+                if !all_pids.contains(&descendant) && !protected_pids.contains(&descendant) {
                     all_pids.push(descendant);
                 }
             }
         }
-        for &root in &root_pids {
+        for &root in &candidate_pids {
             if !all_pids.contains(&root) {
                 all_pids.push(root);
             }
@@ -402,20 +458,86 @@ pub fn reap_orphan_processes_with(
 
         let killed = (probes.kill)(&all_pids);
         log::warn!(
-            "orphan_process_reaper: {} issue-{issue} has {} process(es) but issue #{issue} is \
-             closed, its PR is not open, and no live sweep claims it — reaping the whole tree: \
-             roots={root_pids:?} all_pids={all_pids:?} killed={killed:?} (#5110)",
+            "orphan_process_reaper: {} issue-{issue} has {} orphan process(es) (protected \
+             live-sweep pids={protected_pids:?}) but issue #{issue} is closed and its PR is not \
+             open — reaping the orphan tree: roots={candidate_pids:?} all_pids={all_pids:?} \
+             killed={killed:?} (#5110, #5135)",
             repo_root.display(),
-            root_pids.len()
+            candidate_pids.len()
         );
         report.reaped.push(OrphanReapEntry {
             issue,
-            root_pids,
+            root_pids: candidate_pids,
             killed_pids: killed,
+            protected_pids,
         });
     }
 
     report
+}
+
+/// Partition `root_pids` (processes with cwd inside issue `issue`'s
+/// worktree) into orphan **candidates** — provably NOT part of any live
+/// sweep's own process tree for that issue — and pids that must be left
+/// alone (Issue #5135). Replaces the old issue-scoped early return: "a live
+/// sweep claims this issue" no longer blanket-protects every process in the
+/// worktree, only that live sweep's OWN descendants.
+///
+/// A candidate pid is protected (second return value) when ANY of:
+/// - `issue` has a live claim (`active_issues` contains it), but no live
+///   sweep root pid/time could be resolved for it (a stale lock, an
+///   unparseable owner, or a claim tracked only via the legacy
+///   spawn-loop-state union with no lock dir at all) — fail-safe: nothing to
+///   compare against, protect everything, exactly like the pre-#5135
+///   issue-scoped gate did;
+/// - the pid IS the live sweep's own root, or is one of its descendants,
+///   walked by [`OrphanReapProbes::collect_descendants`] — by pid, not by
+///   process group/session, the same #5110 rationale the top-level pass
+///   already relies on;
+/// - the pid's own start time cannot be determined, or does not strictly
+///   *predate* the live sweep's own start — a pid that starts at/after the
+///   live sweep began might be a legitimate descendant of it that has
+///   already escaped the ppid walk (the very daemonization trick this whole
+///   module exists to catch, e.g. `setsid`/`timeout`), so ambiguous or
+///   concurrent timing is never license to kill; only a pid PROVABLY older
+///   than the live sweep itself can be a leftover from a previous, unrelated
+///   agent.
+///
+/// `issue` not being in `active_issues` at all (no live claim whatsoever) is
+/// handled first and is unaffected by any of the above — every root pid is a
+/// candidate, exactly as before #5135.
+#[must_use]
+pub fn partition_live_sweep_candidates(
+    issue: u32,
+    root_pids: &[u32],
+    probes: &OrphanReapProbes<'_>,
+) -> (Vec<u32>, Vec<u32>) {
+    if !probes.active_issues.contains(&issue) {
+        return (root_pids.to_vec(), Vec::new());
+    }
+
+    let Some(root) = (probes.live_sweep_root)(issue) else {
+        // A claim exists but no live root could be resolved for it — protect
+        // everything, matching the pre-#5135 issue-scoped gate exactly.
+        return (Vec::new(), root_pids.to_vec());
+    };
+
+    let mut live_tree = (probes.collect_descendants)(root.pid);
+    live_tree.push(root.pid);
+
+    let mut candidates = Vec::new();
+    let mut protected = Vec::new();
+    for &pid in root_pids {
+        if live_tree.contains(&pid) {
+            protected.push(pid);
+            continue;
+        }
+        match (probes.pid_started_at)(pid) {
+            Some(started) if started < root.started_at => candidates.push(pid),
+            _ => protected.push(pid),
+        }
+    }
+    (candidates, protected)
 }
 
 /// Run one production orphan-process reap pass over `repo_root`. Wires the
@@ -427,6 +549,12 @@ pub fn reap_orphan_processes(repo_root: &Path) -> OrphanReapReport {
     use crate::worktree_ops::clean;
 
     let active_issues = active_spawn_loop_issues(repo_root);
+    // Resolved once per pass, not once per worktree (#5135) — the same
+    // "one filesystem scan up front" shape `active_issues` above already
+    // uses.
+    let live_sweep_roots = active_locked_issue_roots(repo_root);
+    let live_sweep_root_fn = |n: u32| live_sweep_roots.get(&n).copied();
+    let pid_started_at_fn = |pid: u32| pid_started_at(pid, Utc::now());
     let kill_fn = |pids: &[u32]| kill_pids(pids, ORPHAN_PROCESS_REAP_GRACE);
 
     // Resolved once per pass (one REST call), not once per worktree.
@@ -441,6 +569,8 @@ pub fn reap_orphan_processes(repo_root: &Path) -> OrphanReapReport {
         repo_root,
         &OrphanReapProbes {
             active_issues: &active_issues,
+            live_sweep_root: &live_sweep_root_fn,
+            pid_started_at: &pid_started_at_fn,
             processes_using: &find_processes_using_directory,
             issue_state: &issue_state_fn,
             pr_status: &pr_status_fn,
@@ -450,6 +580,48 @@ pub fn reap_orphan_processes(repo_root: &Path) -> OrphanReapReport {
             now: Utc::now(),
         },
     )
+}
+
+/// Best-effort wall-clock start time for `pid`, derived from `ps -o etime=`
+/// (elapsed time since start) subtracted from `now`. Portable across
+/// macOS/BSD `ps` (no `etimes` seconds-only keyword) and GNU/Linux `ps`,
+/// which both format elapsed time as `[[dd-]hh:]mm:ss` — the same format
+/// [`crate::daemon_install_state`]'s `process_age_secs` already parses for
+/// the daemon's own startup-grace probe. `None` on any probe/parse failure —
+/// [`partition_live_sweep_candidates`] treats that as "unknown", never as
+/// license to reap.
+#[must_use]
+pub fn pid_started_at(pid: u32, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    let output = Command::new("ps")
+        .args(["-o", "etime=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let elapsed_secs = parse_ps_etime(stdout.trim())?;
+    now.checked_sub_signed(chrono::Duration::seconds(i64::try_from(elapsed_secs).ok()?))
+}
+
+/// Parse a `ps -o etime=` duration (`[[dd-]hh:]mm:ss`) into whole seconds.
+/// Any unexpected shape or non-numeric field yields `None`.
+fn parse_ps_etime(raw: &str) -> Option<u64> {
+    if raw.is_empty() {
+        return None;
+    }
+    let (days, rest) = match raw.split_once('-') {
+        Some((d, r)) => (d.trim().parse::<u64>().ok()?, r),
+        None => (0u64, raw),
+    };
+    let parts: Vec<&str> = rest.split(':').collect();
+    let (hours, minutes, seconds) = match parts.as_slice() {
+        [s] => (0u64, 0u64, s.parse::<u64>().ok()?),
+        [m, s] => (0u64, m.parse::<u64>().ok()?, s.parse::<u64>().ok()?),
+        [h, m, s] => (h.parse::<u64>().ok()?, m.parse::<u64>().ok()?, s.parse::<u64>().ok()?),
+        _ => return None,
+    };
+    Some(days * 86_400 + hours * 3_600 + minutes * 60 + seconds)
 }
 
 #[cfg(test)]
@@ -482,6 +654,14 @@ mod tests {
     /// single fact it is about. Mirrors `worktree_reaper::tests::ProbeSpec`.
     struct Spec {
         active: HashSet<u32>,
+        /// Live sweep root (pid + start time) resolved for every issue in
+        /// `active` (Issue #5135). `None` reproduces the pre-#5135 "claim
+        /// exists but no root data available" fallback (full protect).
+        live_sweep_root: Option<LiveSweepRoot>,
+        /// Best-effort start time for an arbitrary candidate pid, keyed by
+        /// pid (defaults to "unknown" for every pid — never license to reap
+        /// on its own, per `partition_live_sweep_candidates`'s fail-safe).
+        pid_started_at: fn(u32) -> Option<DateTime<Utc>>,
         issue_state: String,
         pr_status: PrStatus,
         root_pids: Vec<u32>,
@@ -493,6 +673,8 @@ mod tests {
         fn default() -> Self {
             Self {
                 active: HashSet::new(),
+                live_sweep_root: None,
+                pid_started_at: |_| None,
                 issue_state: "CLOSED".to_string(),
                 pr_status: PrStatus::Merged {
                     // Well outside any sane grace period.
@@ -510,6 +692,8 @@ mod tests {
     fn run_pass(repo: &Path, spec: &Spec) -> (OrphanReapReport, Vec<Vec<u32>>) {
         let killed: RefCell<Vec<Vec<u32>>> = RefCell::new(Vec::new());
         let processes_using = |_: &Path| spec.root_pids.clone();
+        let live_sweep_root = |_: u32| spec.live_sweep_root;
+        let pid_started_at = |pid: u32| (spec.pid_started_at)(pid);
         let issue_state = |_: u32| spec.issue_state.clone();
         let pr_status = |_: u32| spec.pr_status.clone();
         let collect_descendants = |pid: u32| (spec.descendants)(pid);
@@ -522,6 +706,8 @@ mod tests {
             repo,
             &OrphanReapProbes {
                 active_issues: &spec.active,
+                live_sweep_root: &live_sweep_root,
+                pid_started_at: &pid_started_at,
                 processes_using: &processes_using,
                 issue_state: &issue_state,
                 pr_status: &pr_status,
@@ -575,6 +761,151 @@ mod tests {
         let (report, killed) = run_pass(repo.path(), &spec);
 
         assert!(report.reaped.is_empty(), "a live sweep's work must never be reaped");
+        assert!(killed.is_empty());
+        assert_eq!(report.preserved[0].1, "live spawn-loop task or claim-lock");
+    }
+
+    // ========================================================================
+    // Issue #5135: pid/pgid-aware Gate 2 — a live sweep claim for an issue no
+    // longer blanket-protects every process in that issue's worktree, only
+    // that live sweep's own process tree.
+    // ========================================================================
+
+    #[test]
+    fn test_orphan_is_reaped_while_a_live_sweep_for_the_same_issue_is_untouched() {
+        // The #5110 shape this issue targets: a previous agent's orphan and a
+        // concurrently live, re-dispatched sweep both sit inside the SAME
+        // issue's worktree. Issue-scoped Gate 2 alone would preserve the
+        // whole worktree (as it did pre-#5135); the pid/pgid-aware
+        // discriminator must reap only the orphan.
+        let repo = make_repo(&[(200, true)]);
+        let sweep_started = Utc::now() - chrono::Duration::seconds(100);
+
+        let spec = Spec {
+            active: HashSet::from([200]),
+            live_sweep_root: Some(LiveSweepRoot {
+                pid: 555,
+                started_at: sweep_started,
+            }),
+            // The orphan (111) predates the live sweep's own start.
+            pid_started_at: |pid| match pid {
+                111 => Some(Utc::now() - chrono::Duration::seconds(500)),
+                _ => None,
+            },
+            root_pids: vec![111, 555],
+            descendants: |pid| match pid {
+                555 => vec![777],      // the live sweep's own descendant
+                111 => vec![222, 333], // the orphan's own descendants
+                _ => Vec::new(),
+            },
+            ..Spec::default()
+        };
+
+        let (report, killed) = run_pass(repo.path(), &spec);
+
+        assert_eq!(report.preserved, Vec::new(), "nothing should be reported as fully preserved");
+        assert_eq!(report.reaped.len(), 1);
+        let entry = &report.reaped[0];
+        assert_eq!(entry.issue, 200);
+        assert_eq!(entry.root_pids, vec![111], "only the orphan root is a candidate");
+        assert_eq!(
+            entry.protected_pids,
+            vec![555],
+            "the live sweep's own root must be listed as protected"
+        );
+
+        let mut all_killed: Vec<u32> = entry.killed_pids.clone();
+        all_killed.sort_unstable();
+        assert_eq!(all_killed, vec![111, 222, 333], "the whole orphan tree must be reaped");
+
+        assert_eq!(killed.len(), 1);
+        assert!(
+            !killed[0].contains(&555) && !killed[0].contains(&777),
+            "the live sweep's own root and descendant must never be signaled: {:?}",
+            killed[0]
+        );
+    }
+
+    #[test]
+    fn test_candidate_postdating_the_live_sweep_but_in_its_descendant_tree_is_protected() {
+        // Edge case (this issue's AC): a candidate pid whose start time is
+        // AFTER the live sweep's own start is still treated as the sweep's
+        // own when it is in its descendant tree — descendant-tree membership
+        // is checked first and is authoritative; start-time ordering alone
+        // is necessary but not sufficient to distinguish an orphan.
+        let repo = make_repo(&[(201, true)]);
+        let sweep_started = Utc::now() - chrono::Duration::seconds(60);
+
+        let spec = Spec {
+            active: HashSet::from([201]),
+            live_sweep_root: Some(LiveSweepRoot {
+                pid: 900,
+                started_at: sweep_started,
+            }),
+            // Postdates the sweep's own start — if start-time were the sole
+            // signal this might look "too new to be the sweep's own", but it
+            // IS the sweep's own descendant, discovered independently as a
+            // root pid (e.g. it also has cwd set inside the worktree).
+            pid_started_at: |pid| {
+                if pid == 901 {
+                    Some(Utc::now() - chrono::Duration::seconds(10))
+                } else {
+                    None
+                }
+            },
+            root_pids: vec![901],
+            descendants: |pid| if pid == 900 { vec![901] } else { Vec::new() },
+            ..Spec::default()
+        };
+
+        let (report, killed) = run_pass(repo.path(), &spec);
+
+        assert!(
+            report.reaped.is_empty(),
+            "a live sweep's own descendant must never be reaped, regardless of start time"
+        );
+        assert!(killed.is_empty());
+        assert_eq!(report.preserved[0].1, "live spawn-loop task or claim-lock");
+    }
+
+    #[test]
+    fn test_orphan_with_no_registry_entry_for_the_issue_is_never_reaped() {
+        // Manual Tier-0/Tier-1 work (`/loom:builder`, `/loom:judge`, a manual
+        // `/loom:sweep`) never registers a claim-lock at all, so `issue` is
+        // absent from `active_issues` entirely — "no live sweep root to
+        // compare against" must remain a skip, never a kill. Protection here
+        // comes from the issue still being open, exactly as before #5135.
+        let repo = make_repo(&[(202, true)]);
+        let spec = Spec {
+            active: HashSet::new(),
+            issue_state: "OPEN".to_string(),
+            ..Spec::default()
+        };
+        let (report, killed) = run_pass(repo.path(), &spec);
+
+        assert!(report.reaped.is_empty());
+        assert!(killed.is_empty());
+        assert_eq!(report.preserved[0].1, "issue is OPEN");
+    }
+
+    #[test]
+    fn test_active_claim_with_unresolvable_live_root_falls_back_to_full_protect() {
+        // A claim exists (`active_issues` contains it) but no live sweep root
+        // could be resolved (stale lock, unparseable owner, or a claim
+        // tracked only via the legacy spawn-loop-state union with no lock
+        // dir) — fail-safe: nothing to compare candidates against, so every
+        // pid in the worktree is protected, matching the pre-#5135
+        // issue-scoped gate exactly.
+        let repo = make_repo(&[(203, true)]);
+        let spec = Spec {
+            active: HashSet::from([203]),
+            live_sweep_root: None,
+            root_pids: vec![111, 222],
+            ..Spec::default()
+        };
+        let (report, killed) = run_pass(repo.path(), &spec);
+
+        assert!(report.reaped.is_empty());
         assert!(killed.is_empty());
         assert_eq!(report.preserved[0].1, "live spawn-loop task or claim-lock");
     }
@@ -743,10 +1074,15 @@ mod tests {
         let collect_descendants = |_: u32| Vec::new();
         let kill = |pids: &[u32]| pids.to_vec();
 
+        let live_sweep_root = |_: u32| None;
+        let pid_started_at = |_: u32| None;
+
         let report = reap_orphan_processes_with(
             repo.path(),
             &OrphanReapProbes {
                 active_issues: &HashSet::new(),
+                live_sweep_root: &live_sweep_root,
+                pid_started_at: &pid_started_at,
                 processes_using: &processes_using,
                 issue_state: &issue_state,
                 pr_status: &pr_status,
@@ -791,10 +1127,53 @@ mod tests {
                 issue: 1,
                 root_pids: vec![10],
                 killed_pids: vec![10, 11],
+                protected_pids: Vec::new(),
             }],
             preserved: vec![(2, "PR still open".to_string())],
         };
         assert_eq!(report.summary(), "scanned=3 reaped_worktrees=1 preserved=1");
+    }
+
+    // ========================================================================
+    // `pid_started_at` / `parse_ps_etime` — the real (non-injected) start-time
+    // probe wired into production via `reap_orphan_processes` (Issue #5135).
+    // ========================================================================
+
+    #[test]
+    fn test_parse_ps_etime_accepts_every_documented_shape() {
+        assert_eq!(parse_ps_etime("45"), Some(45));
+        assert_eq!(parse_ps_etime("02:30"), Some(2 * 60 + 30));
+        assert_eq!(parse_ps_etime("01:02:03"), Some(3_600 + 2 * 60 + 3));
+        assert_eq!(parse_ps_etime("1-02:03:04"), Some(86_400 + 2 * 3_600 + 3 * 60 + 4));
+    }
+
+    #[test]
+    fn test_parse_ps_etime_rejects_garbage() {
+        assert_eq!(parse_ps_etime(""), None);
+        assert_eq!(parse_ps_etime("not-a-time"), None);
+        assert_eq!(parse_ps_etime("1:2:3:4"), None);
+    }
+
+    #[test]
+    fn test_pid_started_at_of_this_process_is_recent_and_not_in_the_future() {
+        // The current test process has been alive at least since the test
+        // harness started it (well under an hour ago) — assert the derived
+        // start time is a plausible recent past, never in the future.
+        let now = Utc::now();
+        let started = pid_started_at(std::process::id(), now)
+            .expect("ps must resolve this live process's own start time");
+        assert!(started <= now, "a process cannot start in the future: {started} > {now}");
+        assert!(
+            now - started < chrono::Duration::hours(1),
+            "the test process should have started well under an hour ago, got {started}"
+        );
+    }
+
+    #[test]
+    fn test_pid_started_at_of_a_nonexistent_pid_is_none() {
+        // A pid this large is virtually guaranteed not to exist (both Linux's
+        // and macOS's max pid are far below this).
+        assert!(pid_started_at(2_000_000_000, Utc::now()).is_none());
     }
 
     // ========================================================================
