@@ -1418,6 +1418,158 @@ function unmask_ws(s) {
 }
 '
 
+# =============================================================================
+# HEREDOC-BODY MASKING (#5000)
+#
+# extract_write_targets() (below) is fed the RAW, un-redacted value of a
+# --body/-m/--title/--notes/--comment flag whenever strip_literal_text()'s own
+# `$(`/backtick safety floor (#3679) declines to redact it -- the common
+# real-world trigger being a heredoc-wrapped value, `--body "$(cat <<'EOF'
+# ... EOF)"`, this repo's OWN recommended idiom (see CLAUDE.md/builder role)
+# for any multi-line/special-character body text. A `>` (or `;`, `&`, `|`, or
+# a write-idiom command word like `tee`) sitting on a heredoc BODY line is
+# genuinely inert DATA -- a heredoc body is never shell-parsed for
+# redirection/separator syntax, regardless of whether its delimiter is quoted
+# -- but qsplit()/mask_gt()/mask_ws() are (like awk itself) driven one
+# PHYSICAL LINE at a time, with no memory of the `"` opened several lines
+# earlier once a later heredoc-body line is reached, so a write-idiom-looking
+# byte on such a line was misread as real shell syntax, manufacturing a
+# phantom write target and denying a command that writes nothing to the
+# filesystem (#5000; same failure family as #4245/#3679, one line-boundary
+# narrower).
+#
+# mask_heredoc_bodies() sidesteps that per-line memory gap entirely rather
+# than teaching qsplit()/mask_gt()/mask_ws() cross-line state -- those three
+# are SHARED with extract_rm_targets()/parse_force_ops()/
+# lifecycle_or_cloud_reason(), out of THIS fix's scope (#5000's own Affected
+# Files list names only strip_literal_text() and extract_write_targets()/
+# mask_gt()). It walks the WHOLE (possibly multi-line) buffer ONCE, looking
+# for a `<<`/`<<-` heredoc opener whose delimiter is a bare or single/double
+# -quoted identifier (`EOF`, `'EOF'`, `"EOF"`, ... -- the near-universal
+# real-world shape), then replaces every byte of the BODY -- every full line
+# strictly between the opener line and the first following line that is
+# exactly (barring `<<-`'s permitted leading tabs) the bare delimiter -- with
+# a neutral placeholder byte (ETB, 0x17: never meaningful shell syntax, never
+# matched by any pattern elsewhere in this file). Real newlines, the opener
+# line, and the delimiter line itself are all left untouched, so line counts
+# and the surrounding qsplit()/strip_literal_text() `$(`-floor logic are
+# unaffected -- ONLY the inert body content disappears.
+#
+# MASK ONLY A *CLOSED* BLOCK (#5087 -- the fail-open regression this two-pass
+# structure exists to prevent). The masking decision is made per candidate
+# opener with the closing-delimiter line ALREADY LOCATED: for each candidate
+# on a line, a forward scan looks for the terminating bare-delimiter line
+# FIRST, and only a block that is genuinely closed inside this buffer has its
+# body masked. A candidate whose delimiter line never appears masks NOTHING
+# and the scan simply moves on to the next candidate -- because the original
+# single-pass form (which flipped a sticky `inbody` flag the instant it saw
+# `<<` and only ever cleared it on a delimiter line) silently masked
+# EVERYTHING from a FALSE opener to the end of the command whenever no such
+# line followed, swallowing any real `>`/`tee`/`cp`/`mv` target after it and
+# defeating the write-confinement guard (#4178) outright. Two ordinary,
+# heredoc-free command shapes hit that: a quoted string that merely CONTAINS
+# `<<TOKEN` (`echo "test <<TOKEN"`), and an arithmetic bitshift
+# (`x=$((1 << 3))`) -- both followed by a genuine out-of-worktree write, both
+# ALLOWed pre-#5087 where `main` DENIed. Masking is a NARROWING operation, so
+# it must never be applied speculatively: when in doubt, mask nothing and let
+# the text flow through the pre-#5000 per-line scan.
+#
+# Opener detection is correspondingly tightened so the commonest false
+# openers are rejected before the forward scan even runs: a `<<<` herestring
+# is never a heredoc opener, and a BARE (unquoted) delimiter starting with a
+# DIGIT is read as an arithmetic shift operand (`1 << 3`), not a delimiter --
+# `<<'3'`/`<<"3"` stay recognized, since an explicitly quoted delimiter is
+# unambiguous heredoc intent. Every `<<` occurrence on a line is considered
+# in turn (not just the first), so one rejected candidate never hides a real
+# terminated heredoc later on the same line.
+#
+# Deliberately narrow / best-effort, consistent with every other quote-
+# tracking scan in this file: an exotic delimiter (not a bare identifier, or
+# using shell metacharacters) is simply not recognized as a heredoc opener --
+# fail-open for THIS masking pass only, never a NEW risk, since the text then
+# flows through the pre-#5000 per-line scan exactly as it always has. Never
+# denies by itself; only ever narrows what extract_write_targets() can find,
+# matching that scanner's own documented fail-open contract (a missed target
+# is the accepted safe direction there) -- a real write-idiom byte OUTSIDE
+# any recognized heredoc body, even in the SAME multi-line command, is
+# completely unaffected and still flows through unchanged.
+# =============================================================================
+_MASKHEREDOC_AWK='
+# Return the heredoc delimiter opened by the `<<` at byte offset p in line,
+# or "" when that `<<` is not a recognized heredoc opener.
+function heredoc_delim_at(line, p,   start, qc, c, wordend, d, SQ, DQ) {
+    SQ = sprintf("%c", 39)    # single quote
+    DQ = sprintf("%c", 34)    # double quote
+    start = p + 2
+    # `<<<` is a herestring, never a heredoc opener.
+    if (substr(line, start, 1) == "<") return ""
+    if (substr(line, start, 1) == "-") start++
+    while (substr(line, start, 1) == " " || substr(line, start, 1) == "\t") start++
+    qc = ""
+    c = substr(line, start, 1)
+    if (c == SQ || c == DQ) { qc = c; start++ }
+    wordend = start
+    while (1) {
+        c = substr(line, wordend, 1)
+        if (c ~ /^[A-Za-z0-9_]$/) { wordend++; continue }
+        break
+    }
+    if (wordend <= start) return ""
+    d = substr(line, start, wordend - start)
+    # A BARE delimiter starting with a digit is an arithmetic shift operand
+    # (`$((1 << 3))`) far more often than a real heredoc delimiter. A quoted
+    # one (`<<"3"`) is unambiguous heredoc intent, so it stays recognized.
+    if (qc == "" && d ~ /^[0-9]/) return ""
+    return d
+}
+function mask_heredoc_bodies(s,   out, lines, nl, i, j, line, trimmed, body, delim, closeat, p, off, MASKC) {
+    MASKC = sprintf("%c", 23) # ETB -- placeholder for inert heredoc-body text
+    nl = split(s, lines, "\n")
+    if (nl == 0) return ""
+    for (i = 1; i <= nl; i++) {
+        line = lines[i]
+        off = 1
+        # Consider every `<<` on this line, left to right, until one is
+        # confirmed to open a CLOSED heredoc block.
+        while (1) {
+            p = index(substr(line, off), "<<")
+            if (p == 0) break
+            p = off + p - 1        # absolute offset of `<<` within line
+            off = p + 2            # where the next candidate search resumes
+            delim = heredoc_delim_at(line, p)
+            if (delim == "") continue
+            # PASS 1 -- locate the terminating delimiter line. A `<<-` opener
+            # permits (and strips) leading tabs on the delimiter line; only
+            # leading TABS (never spaces) are ever stripped, per real heredoc
+            # semantics. Stripping them unconditionally can only terminate the
+            # block EARLIER, i.e. mask LESS -- the safe direction here.
+            closeat = 0
+            for (j = i + 1; j <= nl; j++) {
+                trimmed = lines[j]
+                sub(/^\t+/, "", trimmed)
+                if (trimmed == delim) { closeat = j; break }
+            }
+            # Unterminated / false opener: mask NOTHING for this candidate and
+            # keep looking. Everything after it stays visible to the caller,
+            # exactly as in the pre-#5000 per-line scan (#5087).
+            if (closeat == 0) continue
+            # PASS 2 -- only now that the block is known to be closed, mask
+            # the body lines strictly between opener and delimiter line.
+            for (j = i + 1; j < closeat; j++) {
+                body = lines[j]
+                gsub(/./, MASKC, body)
+                lines[j] = body
+            }
+            i = closeat            # resume scanning after the delimiter line
+            break
+        }
+    }
+    out = lines[1]
+    for (i = 2; i <= nl; i++) out = out "\n" lines[i]
+    return out
+}
+'
+
 # Parse force-op segments out of a command, emitting one TAB-separated
 # "<cpath>\t<target>" line per genuine git force-push / hard-reset. Portable awk
 # only (mirrors extract_rm_targets / lifecycle_or_cloud_reason segment parsing):
@@ -2166,13 +2318,31 @@ extract_rm_targets() {
 # contract this file uses everywhere: ambiguity never widens a deny).
 # =============================================================================
 extract_write_targets() {
-    printf '%s' "$1" | awk -v startcwd="$2" "$_QSPLIT_AWK""$_MASKGT_AWK""$_MASKWS_AWK"'
+    printf '%s' "$1" | awk -v startcwd="$2" "$_QSPLIT_AWK""$_MASKGT_AWK""$_MASKWS_AWK""$_MASKHEREDOC_AWK"'
     BEGIN {
         SEP = sprintf("%c", 31)
         curcwd = startcwd
     }
-    {
-        $0 = qsplit($0)   # quote-aware segmentation (#3755)
+    # Slurp the whole (possibly multi-line) command into ONE buffer,
+    # preserving embedded newlines (mirrors the #3898 multi-line
+    # accumulation strip_literal_text() already uses), then do ALL
+    # processing ONCE in END rather than once per PHYSICAL LINE -- the
+    # default per-record awk behaviour, which is what silently reset
+    # qsplit()/mask_gt()/mask_ws() to "unquoted" at every embedded newline
+    # before the #5000 fix below.
+    { buf = buf (NR > 1 ? "\n" : "") $0 }
+    END {
+        # Heredoc-body masking (#5000) runs BEFORE qsplit(): once a heredoc
+        # body write-idiom-looking bytes (`>`, `;`, `tee`, ...) are replaced
+        # with inert placeholders, the per-line loop below -- which still
+        # resets mask_gt()/mask_ws() per SEGMENT, exactly as before -- has
+        # nothing dangerous-looking left to misread on those lines,
+        # regardless of that per-line reset. A real write-idiom byte OUTSIDE
+        # any recognized heredoc body, even later in the SAME multi-line
+        # command, is untouched and still flows through the unchanged
+        # pipeline below.
+        buf = mask_heredoc_bodies(buf)
+        $0 = qsplit(buf)   # quote-aware segmentation (#3755)
         n = split($0, segs, "\n")
         for (i = 1; i <= n; i++) {
             seg = segs[i]

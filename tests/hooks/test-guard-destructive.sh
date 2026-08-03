@@ -2593,6 +2593,116 @@ assert_deny "write-confinement (#4245): bare '>' redirection still denies (regre
     "echo x > $WT_REPO/defaults/hooks/g.sh" "$WT_REPO"
 
 # -------------------------------------------------------------------------
+# Heredoc-body masking (#5000) -- extract_write_targets()/mask_gt() no longer
+# misreads a `>` (or other write-idiom syntax) sitting on a heredoc BODY line
+# as a real redirection target. Distinct from #4245 above: #4245 covers a `>`
+# quoted on the SAME line as the opening quote; this covers a `>` several
+# PHYSICAL LINES later, inside a heredoc-wrapped `--body "$(cat <<'EOF' ...
+# EOF)"` value -- the idiom this repo's own conventions recommend for any
+# multi-line/special-character --body/-m/--title/--notes/--comment value, and
+# whose `$(` trips strip_literal_text()'s own command-substitution safety
+# floor (#3679), so the raw multi-line text (never X-redacted) flows
+# unmodified into extract_write_targets(). Distinct from #4881 (unexpanded
+# $VAR redirect *targets*) -- this is misparsed heredoc-body *content*, not
+# an unresolvable target.
+#
+# The literal confirmed repro from #5000 (a `>` several lines into a
+# heredoc-wrapped --body value, with a real semicolon elsewhere in the same
+# body line):
+assert_allow "write-confinement (#5000): heredoc-wrapped --body with '>' in the body allows" \
+    'gh issue comment 253 --repo 2AMLogic/klayout-tools --body "$(cat <<'"'"'EOF'"'"'
+... observed >240s; later boots ~19s ...
+EOF
+)"' "$WT_REPO"
+
+# The plain single-line form of the same prose (no heredoc) was already
+# allowed pre-#5000 but was never covered by an explicitly named regression
+# test -- add one now per the #5000 acceptance criteria.
+assert_allow "write-confinement (#5000): plain single-line --body with '>240s' prose allows" \
+    'gh issue comment 253 --repo 2AMLogic/klayout-tools --body "... observed >240s; later boots ~19s ..."' "$WT_REPO"
+
+# Narrows, never widens: a REAL unquoted '>' target OUTSIDE the heredoc body
+# (in the same multi-line command) must still deny -- proves the heredoc-body
+# masking does not blanket-disable write-target detection for the rest of the
+# command.
+assert_deny "write-confinement (#5000): real unquoted '>' outside a heredoc body still denies" \
+    'gh issue comment 253 --body "$(cat <<'"'"'EOF'"'"'
+prose with >240s inside, harmless
+EOF
+)" && echo pwned > '"$WT_REPO"'/defaults/hooks/h.sh' "$WT_REPO"
+
+# -------------------------------------------------------------------------
+# Fail-open regression (#5087) -- mask_heredoc_bodies() must NEVER mask a
+# heredoc body whose closing delimiter line does not actually exist in the
+# buffer.
+#
+# The first cut of the #5000 fix flipped a sticky `inbody` flag the moment it
+# saw the literal substring `<<` anywhere on a line, and only ever cleared it
+# on a line that was exactly the bare delimiter. With no such line following,
+# `inbody` never reset, so EVERYTHING from that (false) opener to the end of
+# the command was replaced with inert placeholders -- including a genuine
+# `>`/`tee`/`cp`/`mv` target on a later line, which then never reached
+# qsplit()/mask_gt() and so could not be denied. That silently defeated the
+# whole write-confinement guard (#4178) on ordinary multi-line Bash-tool
+# input containing no heredoc at all.
+#
+# Both shapes below DENY on pre-#5000 `main` and must keep denying: masking is
+# a NARROWING pass, so an unterminated/false opener has to mask nothing rather
+# than swallow the rest of the command. These are the two confirmed repros
+# from #5087; the three #5000 tests above all use a properly CLOSED
+# `<<'EOF' ... EOF` block, which is exactly why none of them caught this.
+
+# 1. A quoted string that merely CONTAINS `<<TOKEN` (no heredoc anywhere),
+#    followed on the next line by a real out-of-worktree write.
+assert_deny "write-confinement (#5087): quoted '<<TOKEN' then a real '>' write still denies" \
+    "echo \"test <<TOKEN\"
+echo \"malicious content\" > $WT_REPO/pwned.txt" "$WT_REPO"
+
+# 2. An ordinary arithmetic bitshift (`1 << 3` -- zero heredoc intent),
+#    followed on the next line by the same real write. Also pins the
+#    opener-detection tightening: a BARE delimiter starting with a digit is a
+#    shift operand, not a heredoc delimiter.
+assert_deny "write-confinement (#5087): arithmetic '<<' bitshift then a real '>' write still denies" \
+    "x=\$((1 << 3))
+echo pwned > $WT_REPO/evil.txt" "$WT_REPO"
+
+# Same fail-open shape reached through the other write idioms the masking pass
+# feeds -- proves the fix is not `>`-specific.
+assert_deny "write-confinement (#5087): unterminated heredoc opener then a real 'tee' still denies" \
+    "cat <<UNTERMINATED
+some body text that never closes
+echo x | tee $WT_REPO/defaults/hooks/teed.sh" "$WT_REPO"
+assert_deny "write-confinement (#5087): unterminated heredoc opener then a real 'cp' still denies" \
+    "echo \"prose mentioning <<EOF in passing\"
+cp /tmp/a.sh $WT_REPO/defaults/hooks/copied.sh" "$WT_REPO"
+
+# A `<<<` herestring is not a heredoc opener either, so a later real write
+# must still be seen.
+assert_deny "write-confinement (#5087): '<<<' herestring then a real '>' write still denies" \
+    "cat <<<\"some string\"
+echo pwned > $WT_REPO/defaults/hooks/hs.sh" "$WT_REPO"
+
+# Narrows-not-widens, the other direction: the #5000 false positive must stay
+# fixed even when an unterminated/false opener appears EARLIER in the same
+# command -- a rejected candidate opener must not prevent a genuinely CLOSED
+# heredoc later in the buffer from being masked.
+assert_allow "write-confinement (#5087): false opener before a CLOSED heredoc body with '>' still allows" \
+    'echo "mentions <<NOPE in prose"
+gh issue comment 253 --body "$(cat <<'"'"'EOF'"'"'
+... observed >240s; later boots ~19s ...
+EOF
+)"' "$WT_REPO"
+
+# A quoted delimiter that starts with a digit IS unambiguous heredoc intent
+# (unlike a bare `<< 3` shift operand), so a properly closed `<<'3'` block
+# still gets its body masked.
+assert_allow "write-confinement (#5087): quoted digit delimiter <<'3' masks a closed body" \
+    'gh issue comment 253 --body "$(cat <<'"'"'3'"'"'
+... observed >240s in the body ...
+3
+)"' "$WT_REPO"
+
+# -------------------------------------------------------------------------
 # Regression (#4210): CWD is the builder's own LINKED worktree, and the write
 # targets the MAIN checkout by absolute path (or via `cd $MAIN`). This is the
 # canonical builder setup (`cd .loom/worktrees/issue-N`). The guard must key
