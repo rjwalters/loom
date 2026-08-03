@@ -41,9 +41,33 @@ describe("fleetOverviewView", () => {
 
   it("summarizes the fleet above the grid", () => {
     const summary = fleetOverviewView(view(), NOW).querySelector('[data-testid="fleet-summary"]');
-    expect(summary?.textContent).toContain("6 hosts");
+    // 6 hosts total (including the sweep-only "unknown" host), but the
+    // headline shows only the 5 that have ever reported health/tokens
+    // (#5101) — see the dedicated regression test below for the isolated
+    // case.
+    expect(summary?.textContent).toContain("5 hosts");
+    expect(summary?.textContent).not.toContain("6 hosts");
     expect(summary?.textContent).toContain("3 active sweeps");
     expect(summary?.textContent).toContain("2 need");
+  });
+
+  it("excludes a sweep-only 'unknown' host from the 'N hosts' headline while still rendering its card (#5101)", () => {
+    const built = buildFleetView(
+      parseFleetSnapshot({
+        hosts: { real: { health: { record: {}, updatedAt: isoMinutesBefore(1) } } },
+        activeSweeps: [{ hostId: "sweep-only", sweepId: "sweep-1", startedAt: isoMinutesBefore(2) }],
+      }),
+      NOW,
+    );
+    const rendered = fleetOverviewView(built, NOW);
+    const summary = rendered.querySelector('[data-testid="fleet-summary"]');
+
+    // Two hosts render as cards (the real one and the sweep-only one)...
+    const cards = [...rendered.querySelectorAll('[data-testid="host-card"]')];
+    expect(cards.map((card) => card.getAttribute("data-host"))).toEqual(["sweep-only", "real"]);
+    // ...but the headline counts only the one with real health/tokens data.
+    expect(summary?.textContent).toContain("1 host");
+    expect(summary?.textContent).not.toContain("2 host");
   });
 
   it("shows the empty-fleet state, not an error, when no host has reported", () => {

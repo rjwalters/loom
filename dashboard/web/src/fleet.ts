@@ -84,6 +84,14 @@ export interface FleetView {
   totalSweeps: number;
   /** Hosts in `stale` or `degraded` — the count the overview headline shows. */
   needsAttention: number;
+  /** `hosts.length` minus the hosts known only from `activeSweeps` (status
+   * `"unknown"` — no `host.health`/`tokens.snapshot` ever received). This is
+   * the count the overview headline's "N hosts" shows: a sweep-only host has
+   * no fleet identity to report (no health, no token pool) yet, so counting
+   * it as a member of "the fleet" inflates that number. It still gets a card
+   * (via `hosts`, unchanged) and its sweep still counts toward `totalSweeps`
+   * — this field narrows only the headline's host tally, not visibility. */
+  reportingHosts: number;
 }
 
 /**
@@ -268,8 +276,14 @@ export function buildFleetView(snapshot: FleetSnapshot, now: Date = new Date()):
 
   return {
     hosts,
+    // Deliberately not split into attributed/unattributed: a sweep-only
+    // host's sweeps already render grouped under that host's own card (with
+    // its "unknown" badge making the attribution gap visible there), so the
+    // headline total does not need a second, redundant split to convey the
+    // same information.
     totalSweeps: snapshot.activeSweeps.length,
     needsAttention: hosts.filter((host) => host.status === "stale" || host.status === "degraded").length,
+    reportingHosts: hosts.filter((host) => host.status !== "unknown").length,
   };
 }
 

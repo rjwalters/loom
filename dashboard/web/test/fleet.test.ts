@@ -114,8 +114,19 @@ describe("buildFleetView", () => {
     const built = view();
     expect(built.totalSweeps).toBe(3);
     // Only the stale host and the truly-at-the-edge degraded host — not the
-    // partially-exhausted-but-healthy one.
+    // partially-exhausted-but-healthy one. Confirms `needsAttention` already
+    // excludes the sweep-only "unknown" host correctly (it filters on
+    // `stale`/`degraded` only).
     expect(built.needsAttention).toBe(2);
+  });
+
+  it("excludes a sweep-only 'unknown' host from reportingHosts, unlike hosts.length (#5101)", () => {
+    const built = view();
+    // 6 hosts total (5 real-health + SWEEP_ONLY_HOST_ID), but only 5 have
+    // ever reported health/tokens — the sweep-only host must not inflate the
+    // "N hosts" headline count, even though it still gets a card via `hosts`.
+    expect(built.hosts).toHaveLength(6);
+    expect(built.reportingHosts).toBe(5);
   });
 
   it("returns an empty view for an empty fleet", () => {
@@ -123,6 +134,7 @@ describe("buildFleetView", () => {
     expect(built.hosts).toEqual([]);
     expect(built.totalSweeps).toBe(0);
     expect(built.needsAttention).toBe(0);
+    expect(built.reportingHosts).toBe(0);
   });
 });
 

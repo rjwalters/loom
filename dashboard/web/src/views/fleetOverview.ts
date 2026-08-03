@@ -253,7 +253,14 @@ export function fleetOverviewView(view: FleetView, now: Date = new Date()): HTML
     el(
       "div",
       { class: "overview__summary", data: { testid: "fleet-summary" } },
-      el("span", {}, `${view.hosts.length} host${view.hosts.length === 1 ? "" : "s"}`),
+      el(
+        "span",
+        {},
+        // `reportingHosts` — not `hosts.length` — so a host known only from
+        // `activeSweeps` (no health/tokens ever received) does not inflate
+        // this count; it still gets a card below, just outside this tally.
+        `${view.reportingHosts} host${view.reportingHosts === 1 ? "" : "s"}`,
+      ),
       el("span", {}, `${view.totalSweeps} active sweep${view.totalSweeps === 1 ? "" : "s"}`),
       el(
         "span",
