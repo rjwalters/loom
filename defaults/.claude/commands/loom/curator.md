@@ -318,10 +318,7 @@ If, during curation, you determine an issue is too large to be a single Builder 
 4. **Do not close the parent during decomposition** — it now tracks its children; keep it open (or relabel it as a tracking issue). Closing here would orphan the sub-issues. (Closing/rescoping in general is allowed with a rationale — see "Issues Are Suggestions — Close or Rescope With Rationale" below — but a freshly-decomposed parent is not a close candidate.)
 5. **Do not self-curate your own sub-issues in the same session.** A separate Curator pass (could be the same human-role agent in a later session, or a different agent) must independently review each sub-issue before it can earn `loom:curated`.
 6. **Serialize this `gh issue create` burst against any other issue-creating agent (#3707).** Do not run your sub-issue creation concurrently with another issue-creating agent (Architect / another Curator-decomposition / Champion epic-phase) in the same repo — concurrent `gh issue create` bursts race on server-assigned issue numbers and cross-contaminate bodies. One filer finishes its full burst before the next starts. See `sweep.md` → "Execution Model → Only Builders parallelize" for the invariant.
-
-> **`gh issue create` fails outright when GraphQL quota is exhausted.** REST
-> fallback recipe (atomic create+label): `.loom/docs/gh-issue-create-rest-fallback.md`,
-> or `forge_gh_create_issue_rl_safe` in `lib/forge-helpers.sh` if scripting.
+7. **File each sub-issue with `./.loom/scripts/create-issue.sh`, never a bare `gh issue create` (#5047).** `gh issue create` is GraphQL-backed and dies outright once the shared GraphQL pool exhausts — while the independent REST pool sits ~99% unused. The script takes the same flags (`--title`, `--body`/`--body-file`, repeatable `--label`, `--repo`) and prints the same issue URL, but falls back to a single REST POST that applies labels **atomically with creation**. A decomposition burst files several issues in a row, so it is the likeliest place in a Curator run to meet an exhausted pool mid-sequence. Recipe and rationale: `.loom/docs/gh-issue-create-rest-fallback.md`. (`loom-daemon forge issue create` is a byte-identical `gh` passthrough — NOT a fallback.)
 
 ### Why this matters
 
@@ -339,10 +336,10 @@ When skipped, the Builder hits these issues at implementation time — usually a
 
 ```bash
 # WRONG: decomposer-curates in one pass
-gh issue create --title "Sub-issue A" --label "loom:curated"  # FORBIDDEN
+./.loom/scripts/create-issue.sh --title "Sub-issue A" --label "loom:curated"  # FORBIDDEN
 
 # RIGHT: decomposer creates at triage, leaves for separate curator pass
-gh issue create --title "Sub-issue A" --label "loom:triage"
+./.loom/scripts/create-issue.sh --title "Sub-issue A" --label "loom:triage"
 ```
 
 ### Related: Builder decomposition

@@ -163,7 +163,7 @@ MILESTONE=$(grep -i "milestone" README.md 2>/dev/null | head -1)
 
 ### Ensure Epic Labels Exist (Preflight)
 
-Epic creation depends on the `loom:epic` and `loom:epic-phase` labels, which may not yet exist in the target repository (e.g., if the install bundle predates these labels, or if a user manually deleted them). Run this idempotent preflight before any `gh issue create` call below. The `|| true` suffix keeps the skill working for users who lack `label:write` permission -- in that case, the subsequent `gh issue create --label` calls will fail cleanly with a clear "label not found" error rather than the skill silently dropping the epic.
+Epic creation depends on the `loom:epic` and `loom:epic-phase` labels, which may not yet exist in the target repository (e.g., if the install bundle predates these labels, or if a user manually deleted them). Run this idempotent preflight before any `./.loom/scripts/create-issue.sh` call below (file issues with that script, never a bare `gh issue create` — see #5047). The `|| true` suffix keeps the skill working for users who lack `label:write` permission -- in that case, the subsequent `create-issue.sh --label` calls will fail cleanly with a clear "label not found" error rather than the skill silently dropping the epic.
 
 ```bash
 # Idempotent: gh label create exits non-zero if the label already exists,
@@ -183,7 +183,7 @@ gh label create 'loom:epic-phase' \
 ### Create the Epic
 
 ```bash
-EPIC_URL=$(gh issue create \
+EPIC_URL=$(./.loom/scripts/create-issue.sh \
   --title "Epic: [Title]" \
   --body "$(cat <<'EOF'
 # Epic: [Title]
@@ -256,7 +256,7 @@ Create individual issues for Phase 1 only. Later phases will be created by Champ
 
 ```bash
 # For each Phase 1 issue:
-ISSUE_URL=$(gh issue create \
+ISSUE_URL=$(./.loom/scripts/create-issue.sh \
   --title "[Epic #$EPIC_NUMBER] [Issue Title]" \
   --body "$(cat <<'EOF'
 **Epic**: #EPIC_NUMBER - [Epic Title]

@@ -123,8 +123,18 @@ fallback exists for (#4659). Anything else — auth failure, network error, a
 retry over REST. `merge-pr.sh`'s `lib/forge-helpers.sh` implements this same
 signature table plus ready-made wrappers
 (`forge_gh_comment_rl_safe`, `forge_gh_swap_label_rl_safe`,
-`forge_gh_reopen_issue_rl_safe`, #4856) if you are scripting rather than
-running `gh` interactively.
+`forge_gh_reopen_issue_rl_safe`, #4856, and `forge_gh_create_issue_rl_safe`,
+#5047) if you are scripting rather than running `gh` interactively.
+
+**Filing a follow-up issue has the same exposure, and its own tool.** `gh issue
+create` is GraphQL-backed too, so it dies on the same exhaustion — use
+`./.loom/scripts/create-issue.sh` instead of a bare `gh issue create` (#5047).
+Same flags (`--title`, `--body`/`--body-file`, repeatable `--label`, `--repo`),
+same printed issue URL, but it falls back to one REST POST that applies labels
+**atomically with creation** (never create-then-label). Full rationale:
+`.loom/docs/github-authentication.md` → "Filing issues under GraphQL
+exhaustion". `loom-daemon forge issue create` is a byte-identical `gh`
+passthrough and is **not** an alternative.
 
 **This section covers labels/comments only** — `gh issue create` (used below
 under "Creating Follow-up Issues" and "Raising Concerns") is a separate
@@ -1782,7 +1792,7 @@ When you identify issues during evaluation, take concrete action - never leave c
 # Judge finds minor documentation issue during evaluation
 # Instead of just noting it, create an issue:
 
-gh issue create --title "Update design doc to reflect new label colors" --body "$(cat <<'EOF'
+./.loom/scripts/create-issue.sh --title "Update design doc to reflect new label colors" --body "$(cat <<'EOF'
 While evaluating PR #557, noticed that `docs/design/issue-332-label-state-machine.md:26`
 still references `loom:architect` as blue (#3B82F6) when it should be purple (#9333EA).
 
@@ -1820,7 +1830,7 @@ During code evaluation, you may discover bugs or issues that aren't related to t
 **Example:**
 ```bash
 # Create unlabeled issue - Architect will triage it
-gh issue create --title "Terminal output corrupted when special characters in path" --body "$(cat <<'EOF'
+./.loom/scripts/create-issue.sh --title "Terminal output corrupted when special characters in path" --body "$(cat <<'EOF'
 ## Bug Description
 
 While evaluating PR #45, I noticed that terminal output becomes corrupted when the working directory path contains special characters like `&` or `$`.

@@ -251,11 +251,14 @@ rg "if|for|while|switch|match" <random-file-path> --count
 | **Tier 2** | `tier:goal-supporting` | Simplification supports infrastructure for milestone features |
 | **Tier 3** | `tier:maintenance` | General cleanup not tied to current goals |
 
-**IMPORTANT**: Always apply tier labels to new proposals.
+**IMPORTANT**: Always apply tier labels to new proposals — pass BOTH `loom:hermit`
+and the tier label on the same `create-issue.sh` call that files the proposal
+(#5047), never a follow-up `gh issue edit --add-label`:
 
 ```bash
-gh issue edit <number> --add-label "loom:hermit"
-gh issue edit <number> --add-label "tier:goal-advancing"  # or tier:goal-supporting or tier:maintenance
+./.loom/scripts/create-issue.sh --title "..." --body "..." \
+  --label "loom:hermit" \
+  --label "tier:goal-advancing"  # or tier:goal-supporting or tier:maintenance
 ```
 
 *For goal discovery scripts and backlog balance checking, see `hermit-patterns.md`.*
@@ -291,10 +294,6 @@ When you identify bloat, you have two options:
 
 > **Do not run concurrent Hermits — serialize issue creation (#3707).** `gh issue create` returns a server-assigned number with no client-side coordination, so two Hermits (or a Hermit and an Architect / Curator-decomposition / Champion epic-phase run) filing issues at the same time in the same repo **race on issue numbers and cross-contaminate bodies**. Never place an issue-creating agent in a parallel wave; one issue-creating agent must finish its entire `gh issue create` burst before the next starts. See `sweep.md` → "Execution Model → Only Builders parallelize" for the full invariant.
 
-> **`gh issue create` fails outright when GraphQL quota is exhausted.** REST
-> fallback recipe (atomic create+label): `.loom/docs/gh-issue-create-rest-fallback.md`,
-> or `forge_gh_create_issue_rl_safe` in `lib/forge-helpers.sh` if scripting.
-
 ### When to Create a New Issue vs Comment
 
 **Create New Issue:**
@@ -311,12 +310,20 @@ When you identify bloat, you have two options:
 
 **BEFORE creating any issue, check for potential duplicates:**
 
+> **File issues with `./.loom/scripts/create-issue.sh`, never a bare `gh issue create` (#5047).**
+> `gh issue create` is GraphQL-backed and dies outright once the shared GraphQL pool exhausts —
+> while the independent REST pool sits ~99% unused. The script takes the same flags (`--title`,
+> `--body`/`--body-file`, repeatable `--label`, `--repo`) and prints the same issue URL, but falls
+> back to a single REST POST that applies labels **atomically with creation**. Recipe and
+> rationale: `.loom/docs/gh-issue-create-rest-fallback.md`.
+> (`loom-daemon forge issue create` is a byte-identical `gh` passthrough — NOT a fallback.)
+
 ```bash
 # Check if similar issue already exists
 TITLE="Remove [thing]: [brief reason]"
 if ./.loom/scripts/check-duplicate.sh "$TITLE" "Your proposal body text"; then
     # No duplicates found - safe to create
-    gh issue create --title "$TITLE" ...
+    ./.loom/scripts/create-issue.sh --title "$TITLE" ...
 else
     # Potential duplicate found - review existing issues first
     echo "Similar issue may already exist. Checking..."
@@ -334,7 +341,7 @@ fi
 ### Brief Issue Template
 
 ```bash
-gh issue create --title "Remove [thing]: [brief reason]" --body "$(cat <<'EOF'
+./.loom/scripts/create-issue.sh --title "Remove [thing]: [brief reason]" --body "$(cat <<'EOF'
 ## What to Remove
 [Specific file, function, dependency, or feature]
 
@@ -380,7 +387,7 @@ EOF
 
 ```bash
 # Create issue with hermit suggestion
-gh issue create --label "loom:hermit" --title "..." --body "..."
+./.loom/scripts/create-issue.sh --label "loom:hermit" --title "..." --body "..."
 
 # User approves by adding loom:issue label (you don't do this)
 # gh issue edit <number> --add-label "loom:issue"

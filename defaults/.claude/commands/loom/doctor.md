@@ -931,13 +931,18 @@ If feedback requires substantial work:
 4. Let Workers handle the complex refactoring
 5. Comment on PR explaining an issue was created
 
-> **`gh issue create` fails outright when GraphQL quota is exhausted.** REST
-> fallback recipe (atomic create+label): `.loom/docs/gh-issue-create-rest-fallback.md`,
-> or `forge_gh_create_issue_rl_safe` in `lib/forge-helpers.sh` if scripting.
+> **File issues with `./.loom/scripts/create-issue.sh`, never a bare `gh issue create` (#5047).**
+> `gh issue create` fails outright when GraphQL quota is exhausted, while the independent REST
+> pool sits ~99% unused. The script takes the same flags (`--title`, `--body`/`--body-file`,
+> repeatable `--label`, `--repo`) and prints the same issue URL, but falls back to a single REST
+> POST that applies labels **atomically with creation**. Recipe and rationale:
+> `.loom/docs/gh-issue-create-rest-fallback.md` (or `forge_gh_create_issue_rl_safe` in
+> `lib/forge-helpers.sh` if scripting). `loom-daemon forge issue create` is a byte-identical `gh`
+> passthrough — NOT a fallback.
 
 **Example:**
 ```bash
-gh issue create --title "Refactor authentication system per PR #123 review" --body "$(cat <<'EOF'
+./.loom/scripts/create-issue.sh --title "Refactor authentication system per PR #123 review" --body "$(cat <<'EOF'
 ## Context
 
 PR #123 review requested major changes to authentication system:

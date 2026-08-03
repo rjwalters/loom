@@ -1125,13 +1125,14 @@ ISSUE_BODY="${ISSUE_BODY}## Acceptance Criteria
 # Follow-on issues go to the Champion evaluation queue.
 ISSUE_LABEL="loom:curated"
 
-# Create the issue.
-# NOTE: `gh issue create` does NOT support --json/--jq (only `gh issue view`
-# and `gh issue list` do). On success it prints the new issue's URL to stdout
-# (e.g. https://github.com/<owner>/<repo>/issues/<N>); parse the trailing
-# number from that URL.
+# Create the issue with ./.loom/scripts/create-issue.sh, never a bare
+# `gh issue create` (#5047/#5077) -- it falls back to a REST POST (labels
+# applied atomically) if the shared GraphQL pool is exhausted. On success it
+# prints the new issue's URL to stdout (e.g.
+# https://github.com/<owner>/<repo>/issues/<N>); parse the trailing number
+# from that URL.
 ISSUE_TITLE="Follow-on: Work identified in PR #$PR_NUMBER"
-NEW_ISSUE_URL=$(gh issue create \
+NEW_ISSUE_URL=$(./.loom/scripts/create-issue.sh \
   --title "$ISSUE_TITLE" \
   --body "$ISSUE_BODY" \
   --label "$ISSUE_LABEL")

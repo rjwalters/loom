@@ -354,7 +354,7 @@ NOTES=$(gh api repos/.../pulls/$PR_NUMBER/comments --jq '...')
 EXISTING=$(gh issue list --search "Follow-on from PR #$PR_NUMBER" --limit 500)
 
 # Stage 6: Create issue with proper linking
-gh issue create --title "Follow-on: Work identified in PR #$PR_NUMBER" --label "$LABEL"
+./.loom/scripts/create-issue.sh --title "Follow-on: Work identified in PR #$PR_NUMBER" --label "$LABEL"
 ```
 
 **Decision**: **Create follow-on issue if thresholds met** - captures future work.

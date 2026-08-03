@@ -840,69 +840,91 @@ forge_gh_swap_label_rl_safe() {
   return 1
 }
 
-# Create an issue via `gh issue create`, falling back to a REST POST
-# (`repos/{nwo}/issues`) on a GraphQL rate-limit rejection (#5047). Labels are
-# applied ATOMICALLY in the same request on both paths -- `gh issue create
-# --label` on the primary path, the payload's `labels` array on the REST
-# fallback -- never a create-then-label two-step (that doubles the request
-# count and can half-fail, leaving an unlabeled issue behind).
+# File a NEW issue via `gh issue create`, falling back to a single REST POST
+# to `repos/{nwo}/issues` on a GraphQL rate-limit rejection (#5047).
+#
+# `gh issue create` is GraphQL-backed, so every issue-filing role (Architect,
+# Auditor, Curator decomposition, Builder decomposition, Doctor, Hermit,
+# Judge) died outright once the GraphQL pool exhausted -- even though the
+# independent REST pool routinely sits ~99% unused at that moment (observed
+# 2026-08-03: core 19/5000 consumed vs graphql 1378/5000). Comments, labels
+# and state already had REST fallbacks (#4856, above); creation did not.
+#
+# **Labels are applied atomically with creation on BOTH paths** -- `--label`
+# on the primary path, a `labels` array in the same POST body on the REST
+# path. Never degrade this to create-then-label: that doubles the request
+# count under exactly the conditions where requests are scarce, and can
+# half-fail, leaving an unlabelled issue that no role's queue query finds.
+#
+# NWO may be the empty string, meaning "the repo of the current working
+# directory". That is the preferred form: the REST path then uses `gh api`'s
+# literal `{owner}/{repo}` placeholder, which gh expands from the git remote
+# with ZERO API calls -- unlike `gh repo view --json nameWithOwner`, which is
+# itself GraphQL-backed and so fails first under the very exhaustion this
+# fallback exists for (#4659).
 #
 # This is the single-sourced recipe referenced by the role prompts that file
 # issues (architect.md, auditor.md, builder-complexity.md, builder-pr.md,
-# curator.md, doctor.md, hermit.md, hermit-patterns.md, judge.md) -- update
-# this function, not each prompt, if the recipe needs to change.
+# curator.md, doctor.md, hermit.md, hermit-patterns.md, judge.md) -- via the
+# executable wrapper `create-issue.sh`. Update this function, not each
+# prompt, if the recipe needs to change.
 #
-# Usage: forge_gh_create_issue_rl_safe NWO TITLE BODY [LABELS_CSV]
-#   NWO         - "owner/repo"
-#   TITLE       - issue title
-#   BODY        - issue body (may be multi-line / markdown)
-#   LABELS_CSV  - optional comma-separated label list, e.g. "loom:triage,bug"
-#     (matches the `--label` flag's own comma-separated convention, so
-#     callers can pass the same string they'd otherwise give `gh issue
-#     create --label`)
-#
-# On success, prints the created issue's URL to stdout (matching `gh issue
-# create`'s own output) and returns 0. On failure, prints the error to
-# stderr and returns 1. GitHub-only, like the other `*_rl_safe` helpers above
-# -- callers gate on `FORGE_TYPE == github` before calling this.
+# Usage: forge_gh_create_issue_rl_safe NWO TITLE BODY [LABEL...]
+# Stdout: the new issue's URL (both paths).
+# Returns 0 on success (either path), 1 on failure (message on stderr).
 forge_gh_create_issue_rl_safe() {
-  local nwo="$1" title="$2" body="$3" labels_csv="${4:-}"
-  local -a label_args=()
-  local out
+  local nwo="$1" title="$2" body="$3"
+  shift 3
+  local labels=("$@")
 
-  if [[ -n "$labels_csv" ]]; then
-    local IFS=','
-    local label
-    for label in $labels_csv; do
-      label_args+=(--label "$label")
-    done
+  local -a create_args=(--title "$title" --body "$body")
+  if [[ -n "$nwo" ]]; then
+    create_args+=(--repo "$nwo")
   fi
+  local label
+  for label in "${labels[@]+"${labels[@]}"}"; do
+    create_args+=(--label "$label")
+  done
 
-  if out=$(gh issue create --repo "$nwo" --title "$title" --body "$body" "${label_args[@]}" 2>&1); then
+  # Capture stdout (the issue URL) separately from stderr (the error text the
+  # rate-limit signature table is matched against), so a successful create
+  # never returns gh's progress chatter as the URL.
+  local err_file out err rc=0
+  err_file=$(mktemp)
+  out=$(gh issue create "${create_args[@]}" 2>"$err_file") || rc=$?
+  err=$(cat "$err_file" 2>/dev/null || true)
+  rm -f "$err_file"
+
+  if [[ $rc -eq 0 ]]; then
     printf '%s\n' "$out"
     return 0
   fi
 
-  if is_rate_limit_error "$out"; then
-    local payload_file rc=0 url
-    payload_file=$(mktemp)
-    if [[ -n "$labels_csv" ]]; then
-      jq -n --arg t "$title" --arg b "$body" --arg labels "$labels_csv" \
-        '{title: $t, body: $b, labels: ($labels | split(","))}' > "$payload_file"
+  if is_rate_limit_error "$err"; then
+    # One POST carries title + body + labels together. `--input -` takes the
+    # JSON body on stdin, which also sidesteps the guard false positive where
+    # a heredoc body containing `>=` is classified as a Bash redirect.
+    local payload labels_json
+    labels_json=$(jq -nc '$ARGS.positional' --args "${labels[@]+"${labels[@]}"}")
+    payload=$(jq -n --arg t "$title" --arg b "$body" --argjson l "$labels_json" \
+      '{title: $t, body: $b, labels: $l}')
+    local rest_path
+    if [[ -n "$nwo" ]]; then
+      rest_path="repos/$nwo/issues"
     else
-      jq -n --arg t "$title" --arg b "$body" '{title: $t, body: $b}' > "$payload_file"
+      # Literal placeholder — gh expands it from the git remote, no API call.
+      rest_path='repos/{owner}/{repo}/issues'
     fi
-    url=$(gh api --method POST "repos/$nwo/issues" --input "$payload_file" --jq '.html_url' 2>&1) || rc=$?
-    rm -f "$payload_file"
-    if [[ $rc -eq 0 ]]; then
-      printf '%s\n' "$url"
+    if out=$(printf '%s' "$payload" \
+        | gh api --method POST "$rest_path" --input - --jq '.html_url' 2>/dev/null); then
+      printf '%s\n' "$out"
       return 0
     fi
-    echo "gh issue create rate-limited on \"$title\", and the REST fallback also failed: $url" >&2
+    echo "gh issue create rate-limited, and the REST fallback also failed: $err" >&2
     return 1
   fi
 
-  echo "$out" >&2
+  echo "$err" >&2
   return 1
 }
 
