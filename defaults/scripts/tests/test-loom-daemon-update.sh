@@ -511,12 +511,27 @@ EOF
 #                           that ALSO fails to bring the unit up (the state
 #                           stays whatever `reset-failed` left it at:
 #                           "<pid>:inactive:success").
+#   <settle_state>          (optional, #5119) the state a TRANSITIONAL
+#                           ActiveState (deactivating/activating/reloading)
+#                           SETTLES into after being observed twice — simulating
+#                           systemd finishing a slow stop transition. On the 1st
+#                           `show ActiveState` read the transitional value is
+#                           returned unchanged (so the update script sees the
+#                           mid-teardown snapshot the #4950 poll saw); on the 2nd
+#                           the state file is rewritten to <settle_state> and it
+#                           is returned. Lets a test drive the exact 2026-08-03
+#                           incident: post_state="0:deactivating:timeout" ->
+#                           settle_state="0:failed:timeout" -> reset-failed+start
+#                           recovery. A settle counter lives in
+#                           "<state_file>.actcount".
 write_fake_systemd_pid_bin() {
     local bin_dir="$1" log="$2" state_file="$3" pre_state="$4"
     local post_restart_marker="${5:-}" post_state="${6:-}" recovery_state="${7:-}"
+    local settle_state="${8:-}"
     mkdir -p "$bin_dir"
     : > "$log"
     echo "${pre_state}" > "${state_file}"
+    rm -f "${state_file}.actcount"
     cat > "$bin_dir/systemctl" <<EOF
 #!/usr/bin/env bash
 echo "\$*" >> "${log}"
@@ -546,7 +561,30 @@ case "\${1:-}" in
     done
     case "\$prop" in
       MainPID)     echo "\$cur_pid" ;;
-      ActiveState) echo "\$cur_active" ;;
+      ActiveState)
+        # #5119 settle simulation: a transitional state advances to
+        # <settle_state> on its SECOND ActiveState observation, so the update
+        # script first sees the mid-teardown snapshot (deactivating) and then
+        # the settled terminal state (failed/inactive) once it waits.
+        if [[ -n "${settle_state}" ]]; then
+          case "\$cur_active" in
+            deactivating|activating|reloading|deactivating-sigterm|deactivating-sigkill)
+              actcount=\$(( \$(cat "\${state_file}.actcount" 2>/dev/null || echo 0) + 1 ))
+              echo "\$actcount" > "\${state_file}.actcount"
+              if (( actcount >= 2 )); then
+                echo "${settle_state}" > "\$state_file"
+                IFS=: read -r _sp _sa _sr <<< "${settle_state}"
+                echo "\$_sa"
+              else
+                echo "\$cur_active"
+              fi
+              ;;
+            *) echo "\$cur_active" ;;
+          esac
+        else
+          echo "\$cur_active"
+        fi
+        ;;
       Result)      echo "\$cur_result" ;;
       *)           echo "" ;;
     esac
@@ -3107,11 +3145,14 @@ else
 fi
 
 # ============================================================
-# 56. Systemd restart ack'd but never relaunches, and the unit is NOT in a
-#     'failed' state (some other stall, e.g. still 'activating') -> the
-#     updater refuses to guess at a recovery action (no reset-failed/start
-#     invoked) and exits non-zero (7) with diagnostics (#4950 AC2 scope: the
-#     self-heal is gated on a CONFIRMED 'failed' ActiveState).
+# 56. Systemd restart ack'd but never relaunches, and the unit is STUCK in a
+#     transitional state that never settles (e.g. `activating` forever) -> under
+#     #5119 the updater WAITS the bounded settle window and then STILL attempts
+#     the documented reset-failed+start recovery (rather than the pre-#5119
+#     "refusing to guess" — which left the daemon down). The recovery here does
+#     not bring it up, so it exits 7 loudly, but reset-failed WAS invoked. This
+#     supersedes the old #4950 "self-heal gated on a confirmed failed state"
+#     behavior: a transitional stall is exactly the 2026-08-03 incident shape.
 # ============================================================
 W56="$BASE_WORKDIR/w56"
 new_fixture "$W56"
@@ -3126,8 +3167,9 @@ write_fake_daemon_restart "$NEW_FAKE56" "$HEAD56" "$RESTART_MARKER56" 0
 SD_BIN56="$W56/systemd-bin"
 SD_LOG56="$W56/systemctl.log"
 SD_STATE56="$W56/systemd-pid-state"
-# post_state is 'activating', not 'failed' -- the pid never moves, but the
-# self-heal gate must NOT fire since the unit was never confirmed failed.
+# post_state is 'activating' and NO settle_state is given -> the stub stays
+# transitional forever, so the settle wait times out and the recovery is still
+# attempted against the (never-recovering) unit.
 write_fake_systemd_pid_bin "$SD_BIN56" "$SD_LOG56" "$SD_STATE56" "9999:active:success" \
     "$RESTART_MARKER56" "0:activating:success"
 
@@ -3135,18 +3177,18 @@ out56=$( cd "$W56" && PATH="$SD_BIN56:$TEST_PATH" LOOM_SYSTEMD_FORCE=1 LOOM_DAEM
     LOOM_SYSTEMD_UNIT="loom-daemon-test-sd56.service" \
     LOOM_DAEMON_BIN="$INSTALLED56" NEW_FAKE_BIN_SRC="$NEW_FAKE56" \
     LOOM_DAEMON_RESTART_POLL_SECS=1 LOOM_DAEMON_RESTART_POLL_INTERVAL=0.2 \
+    LOOM_DAEMON_STOP_SETTLE_SECS=1 LOOM_DAEMON_RESTART_KICKSTART_POLL_SECS=1 \
     bash "$UPDATE_SCRIPT" 2>&1 )
 rc56=$?
-assert_eq "7" "$rc56" "unit stalled but never confirmed failed -> exit 7, no guessed recovery"
+assert_eq "7" "$rc56" "transitional stall never recovers -> exit 7 after attempted self-heal (#5119)"
 TESTS_RUN=$((TESTS_RUN + 1))
-if grep -q -- 'reset-failed' "$SD_LOG56" 2>/dev/null \
-    || grep -qE -- '(^|[[:space:]])start([[:space:]]|$)' "$SD_LOG56" 2>/dev/null; then
-    TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "${RED}✗${NC} self-heal is NEVER invoked when ActiveState is not confirmed 'failed'"
-    echo "  systemctl.log: $(cat "$SD_LOG56" 2>/dev/null)"
-else
+if grep -q -- 'reset-failed' "$SD_LOG56" 2>/dev/null; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "${GREEN}✓${NC} self-heal is NEVER invoked when ActiveState is not confirmed 'failed'"
+    echo -e "${GREEN}✓${NC} a transitional stall now ATTEMPTS reset-failed+start recovery, not 'refusing to guess' (#5119)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} a transitional stall now ATTEMPTS reset-failed+start recovery, not 'refusing to guess' (#5119)"
+    echo "  systemctl.log: $(cat "$SD_LOG56" 2>/dev/null)"
 fi
 TESTS_RUN=$((TESTS_RUN + 1))
 if echo "$out56" | grep -qi 'FAILED'; then
@@ -3156,6 +3198,79 @@ else
     TESTS_FAILED=$((TESTS_FAILED + 1))
     echo -e "${RED}✗${NC} failure output loudly reports the unconfirmed relaunch"
     echo "  output: $out56"
+fi
+
+# ============================================================
+# 56b. THE #5119 INCIDENT (2026-08-03 loom-worker-1): systemd restart ack'd, the
+#      daemon exited 0, but on a busy host the unit sat in
+#      `deactivating (stop-sigterm)` while systemd reaped the sweep/role children
+#      still in the cgroup — long past the #4950 pid poll on a stale unit's 90s
+#      TimeoutStopSec. The pre-#5119 code read ActiveState once, saw
+#      `deactivating` (not yet `failed`), and "refused to guess" -> exit 7, daemon
+#      left DOWN. Under #5119 the updater WAITS for the stop to settle (here it
+#      lands in `failed`, Result=timeout — the classic escalation) and then
+#      reset-failed+start RECOVERS it -> exit 0, no manual intervention. This is
+#      the acceptance-criteria scenario for the issue.
+# ============================================================
+W56B="$BASE_WORKDIR/w56b"
+new_fixture "$W56B"
+INSTALLED56B="$W56B/installed/loom-daemon"
+mkdir -p "$W56B/installed"
+RESTART_MARKER56B="$W56B/restart-invoked"
+write_fake_daemon_restart "$INSTALLED56B" "deadbee" "$RESTART_MARKER56B" 0
+NEW_FAKE56B="$W56B/new-fake-daemon"
+HEAD56B="$(cd "$W56B" && git rev-parse --short HEAD)"
+write_fake_daemon_restart "$NEW_FAKE56B" "$HEAD56B" "$RESTART_MARKER56B" 0
+
+sleep 60 >/dev/null 2>&1 &
+RECOVERED_PID56B=$!
+bg_proc_track "$RECOVERED_PID56B"
+SD_BIN56B="$W56B/systemd-bin"
+SD_LOG56B="$W56B/systemctl.log"
+SD_STATE56B="$W56B/systemd-pid-state"
+# post_state: the mid-teardown snapshot the pid poll observes (deactivating,
+# Result=timeout). settle_state: what it lands in after the stop completes
+# (failed). recovery_state: only reset-failed+start reaches a NEW, live pid.
+write_fake_systemd_pid_bin "$SD_BIN56B" "$SD_LOG56B" "$SD_STATE56B" "9999:active:success" \
+    "$RESTART_MARKER56B" "0:deactivating:timeout" "${RECOVERED_PID56B}:active:success" \
+    "0:failed:timeout"
+
+out56b=$( cd "$W56B" && PATH="$SD_BIN56B:$TEST_PATH" LOOM_SYSTEMD_FORCE=1 LOOM_DAEMON_SYSTEMD=1 \
+    LOOM_SYSTEMD_UNIT="loom-daemon-test-sd56b.service" \
+    LOOM_DAEMON_BIN="$INSTALLED56B" NEW_FAKE_BIN_SRC="$NEW_FAKE56B" \
+    LOOM_DAEMON_RESTART_POLL_SECS=1 LOOM_DAEMON_RESTART_POLL_INTERVAL=0.2 \
+    LOOM_DAEMON_STOP_SETTLE_SECS=3 LOOM_DAEMON_RESTART_KICKSTART_POLL_SECS=3 \
+    bash "$UPDATE_SCRIPT" 2>&1 )
+rc56b=$?
+kill "$RECOVERED_PID56B" 2>/dev/null || true
+assert_eq "0" "$rc56b" "deactivating stall settles to failed -> settle-wait + reset-failed+start recovers -> exit 0 (#5119)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out56b" | grep -qi 'settle' || echo "$out56b" | grep -qi 'transitioning'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} output names the settle-wait for the still-transitioning stop (#5119)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} output names the settle-wait for the still-transitioning stop (#5119)"
+    echo "  output: $out56b"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q -- 'reset-failed' "$SD_LOG56B" 2>/dev/null \
+    && grep -qE -- '(^|[[:space:]])start([[:space:]]|$)' "$SD_LOG56B" 2>/dev/null; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} the incident recovery invokes the documented reset-failed then start"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} the incident recovery invokes the documented reset-failed then start"
+    echo "  systemctl.log: $(cat "$SD_LOG56B" 2>/dev/null)"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q "new pid ${RECOVERED_PID56B}" <<< "$out56b"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} success message reports the pid recovered after the settle-wait (#5119)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} success message reports the pid recovered after the settle-wait (#5119)"
+    echo "  output: $out56b"
 fi
 
 # ============================================================

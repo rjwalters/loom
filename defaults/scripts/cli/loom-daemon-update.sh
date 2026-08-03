@@ -123,10 +123,18 @@
 # exit 0 lets systemd's `Restart=on-success` relaunch onto the fresh binary.
 # That ack is verified, not trusted (#4950, mirroring #4232's launchd
 # verification): the script polls for a NEW, live MainPID within a bounded
-# window before reporting success, and — if the unit instead lands in `failed`
-# (e.g. a stop-timeout escalation, which `Restart=on-success` never matches) —
-# self-heals via `systemctl --user reset-failed <unit> && systemctl --user
-# start <unit>` before giving up (exit 7). On a
+# window before reporting success, and — if the unit does not come back on its
+# own — self-heals via `systemctl --user reset-failed <unit> && systemctl --user
+# start <unit>` before giving up (exit 7). #5119 widened that self-heal: on a
+# busy host the daemon's clean exit can leave the unit sitting in
+# `deactivating (stop-sigterm)` for the full TimeoutStopSec while systemd reaps
+# the sweep/role children still in the service cgroup — far past the pid poll on
+# a STALE unit (default 90s). The verifier now WAITS for a transitional stop to
+# settle (LOOM_DAEMON_STOP_SETTLE_SECS), then self-heals ANY non-`active` settled
+# state (`failed` — the #4950 stop-timeout shape — as well as `inactive`),
+# instead of the pre-#5119 behavior of only acting on an already-`failed`
+# snapshot and otherwise "refusing to guess" (which left the 2026-08-03
+# loom-worker-1 daemon down until a hand `reset-failed && start`). On a
 # refused restart (a pre-#4267 binary with no RestartDaemon handler, or a dead
 # socket), the script refuses loudly (exit 6) exactly like launchd, and
 # --relaunch (or LOOM_DAEMON_UPDATE_RELAUNCH=1) re-renders the unit and forces
@@ -246,6 +254,14 @@
 #                          Linux/systemd (#4950): seconds to re-poll for a new,
 #                          live pid after the self-heal fallback before giving
 #                          up (default 15).
+#   LOOM_DAEMON_STOP_SETTLE_SECS  Linux/systemd (#5119): after the pid poll
+#                          expires, seconds to wait for a still-transitioning
+#                          unit (ActiveState=deactivating/activating) to SETTLE
+#                          into a terminal state before running the reset-failed+
+#                          start self-heal. Sized to exceed systemd's default 90s
+#                          TimeoutStopSec so a stale unit's slow SIGTERM→SIGKILL
+#                          cgroup teardown is waited out rather than mistaken for
+#                          "refusing to guess" (default 100).
 #
 # Exit codes:
 #   0  up to date (no-op) OR rebuild+provision+restart succeeded
@@ -291,12 +307,17 @@
 #      the job/unit onto a NEW, live pid within the poll window, AND the
 #      self-heal fallback also failed to bring it up within its own poll
 #      window. On launchd (#4232) the fallback is a plain `launchctl
-#      kickstart` (never -k). On systemd (#4950) the fallback is `systemctl
-#      --user reset-failed <unit> && systemctl --user start <unit>`, tried ONLY
-#      when the unit's ActiveState is confirmed `failed` (systemd never
-#      auto-relaunches a `failed` unit even under `Restart=on-success` — a
-#      `Result=timeout` stop escalation is the exact incident shape #4950
-#      closes). The fresh binary IS provisioned, but the daemon's live status
+#      kickstart` (never -k). On systemd (#4950/#5119) the fallback is
+#      `systemctl --user reset-failed <unit> && systemctl --user start <unit>`,
+#      tried whenever the unit is NOT `active` — the confirmed-`failed`
+#      `Result=timeout` stop escalation #4950 closes, AND (#5119) a unit still
+#      stuck `deactivating`/`inactive` when the poll expired: after the poll the
+#      script now WAITS up to LOOM_DAEMON_STOP_SETTLE_SECS for a transitional
+#      unit's stop to complete, then self-heals the settled non-`active` state
+#      rather than "refusing to guess" and leaving the daemon down (systemd never
+#      auto-relaunches a failed/stopped unit even under `Restart=on-success`).
+#      Only a genuinely `active` unit on an unobserved pid is left untouched. The
+#      fresh binary IS provisioned, but the daemon's live status
 #      is NOT confirmed — this is the "restart scheduled but the supervisor
 #      silently never relaunched" outage class these issues close; the script
 #      refuses to report success on the ack alone.
@@ -1833,6 +1854,46 @@ wait_for_new_systemd_pid() {
     done
 }
 
+# wait_for_systemd_stop_settle <timeout_secs> <interval_secs> — poll the unit's
+# ActiveState until it SETTLES out of a transitional state (deactivating /
+# activating / reloading) into a terminal one (failed / inactive / active), for
+# up to <timeout_secs>. Echoes the settled ActiveState and returns 0; on timeout
+# echoes the last-observed (still-transitional) state and returns 1.
+#
+# WHY (#5119). On a busy host a `loom-daemon restart` exits the daemon 0, but the
+# unit's stop job can sit in `deactivating (stop-sigterm)` for the full
+# TimeoutStopSec while it SIGTERMs — then SIGKILLs — the sweep/role children still
+# in the service cgroup. A STALE unit (one rendered before #4862's KillMode=mixed
+# fix — the exact 2026-08-03 incident) drags that out to systemd's 90s default,
+# far past the #4950 pid poll's default 30s. The pre-#5119 code read ActiveState
+# ONCE right after that poll expired, saw `deactivating` (not yet `failed`), and
+# fell through to "refusing to guess" — leaving the daemon down until an operator
+# ran reset-failed+start by hand. This helper lets the recovery WAIT for the stop
+# transition to complete so it can act on the settled state instead of a
+# mid-teardown snapshot.
+wait_for_systemd_stop_settle() {
+    local timeout_secs="$1" interval_secs="$2"
+    local deadline state
+    deadline=$(( $(date +%s) + timeout_secs ))
+    while true; do
+        state="$(systemd_unit_active_state)"
+        case "$state" in
+            deactivating|activating|reloading|deactivating-sigterm|deactivating-sigkill)
+                # still mid-transition — keep waiting
+                ;;
+            *)
+                echo "$state"
+                return 0
+                ;;
+        esac
+        if (( $(date +%s) >= deadline )); then
+            echo "$state"
+            return 1
+        fi
+        sleep "$interval_secs"
+    done
+}
+
 # log_systemd_diagnostics — dump `systemctl --user status`'s current state
 # (including the `Active:`/`Result:` line the incident's journal excerpt was
 # read off of) as a diagnostic breadcrumb when a relaunch cannot be verified,
@@ -2452,24 +2513,50 @@ if [[ "$DAEMON_MANAGER" == "systemd" ]]; then
         UNIT_ACTIVE_STATE="$(systemd_unit_active_state)"
         UNIT_RESULT="$(systemd_unit_result)"
 
-        if [[ "$UNIT_ACTIVE_STATE" == "failed" ]]; then
-            # The exact incident shape (#4950): a stop-timeout escalation left
-            # the unit `failed`, so `Restart=on-success` will NEVER fire on its
-            # own — systemd refuses to auto-restart a unit already in `failed`.
-            # Self-heal via the documented recovery.
-            warn "Unit is in a 'failed' state (Result=${UNIT_RESULT:-unknown}) — systemd will NOT auto-relaunch a failed unit even under Restart=on-success. Self-healing via 'systemctl --user reset-failed $SYSTEMD_UNIT && systemctl --user start $SYSTEMD_UNIT'."
+        # #5119: the unit may still be mid-teardown when the #4950 pid poll
+        # expires — the exact 2026-08-03 loom-worker-1 incident, where a busy
+        # host's stale unit (default TimeoutStopSec=90s + KillMode=control-group)
+        # sat in `deactivating (stop-sigterm)` while systemd SIGTERMed then
+        # SIGKILLed the sweep/role children still in the cgroup, long past the
+        # default 30s pid poll. The pre-#5119 code only self-healed a unit
+        # ALREADY `failed`, so a `deactivating` snapshot fell through to "refusing
+        # to guess" and left the daemon DOWN until an operator ran reset-failed+
+        # start by hand. WAIT for the stop transition to settle so the recovery
+        # can act on the terminal state (`failed`/`inactive`) it lands in.
+        case "$UNIT_ACTIVE_STATE" in
+            deactivating|activating|reloading|deactivating-sigterm|deactivating-sigkill)
+                STOP_SETTLE_SECS="${LOOM_DAEMON_STOP_SETTLE_SECS:-100}"
+                warn "Unit is still transitioning (ActiveState=${UNIT_ACTIVE_STATE}) — its stop job has not finished (a stale unit predating #4862's KillMode=mixed drags the SIGTERM→SIGKILL teardown of in-cgroup sweep/role children out to the default 90s TimeoutStopSec). Waiting up to ${STOP_SETTLE_SECS}s for it to settle before recovering (#5119)."
+                SETTLED_STATE="$(wait_for_systemd_stop_settle "$STOP_SETTLE_SECS" "$RESTART_POLL_INTERVAL")"
+                UNIT_ACTIVE_STATE="$SETTLED_STATE"
+                UNIT_RESULT="$(systemd_unit_result)"
+                warn "Unit settled to ActiveState=${UNIT_ACTIVE_STATE} (Result=${UNIT_RESULT:-unknown}) after its stop transition."
+                ;;
+        esac
+
+        # A unit that is NOT `active` after that settle will NOT come back on its
+        # own: `Restart=on-success` fires only for a clean-exit relaunch, never
+        # for a stop-timeout escalation (`failed`, Result=timeout — the classic
+        # #4950 shape) nor a completed stop (`inactive`). Only a genuinely
+        # `active` unit on a pid the poll simply failed to observe is left alone —
+        # touching that would risk bouncing a healthy daemon. Self-heal
+        # everything else via the documented reset-failed+start recovery (#4950),
+        # now reached for the #5119 `deactivating`/`inactive` cases too, not just
+        # a confirmed `failed`.
+        if [[ "$UNIT_ACTIVE_STATE" != "active" ]]; then
+            warn "Unit is in a non-running state (ActiveState=${UNIT_ACTIVE_STATE:-unknown}, Result=${UNIT_RESULT:-unknown}) — systemd will NOT auto-relaunch it (Restart=on-success does not fire for a failed/stopped unit). Self-healing via 'systemctl --user reset-failed $SYSTEMD_UNIT && systemctl --user start $SYSTEMD_UNIT'."
             systemctl --user reset-failed "$SYSTEMD_UNIT" >/dev/null 2>&1
             systemctl --user start "$SYSTEMD_UNIT" >/dev/null 2>&1
 
             if NEW_PID="$(wait_for_new_systemd_pid "$PRE_RESTART_PID" "$KICKSTART_POLL_SECS" "$RESTART_POLL_INTERVAL")"; then
-                ok "loom-daemon restart scheduled — systemd's own relaunch did not occur within ${RESTART_POLL_SECS}s (unit landed in 'failed', Result=${UNIT_RESULT:-unknown}), but 'systemctl --user reset-failed && start' recovered it (new pid ${NEW_PID}, verified within ${KICKSTART_POLL_SECS}s). Remediation note: the reset-failed+start fallback was required (#4950) — investigate why the unit's stop sequence exceeded TimeoutStopSec (a live unit that predates #4862's KillMode=mixed fix — never re-rendered by a plain restart — is the most likely cause; re-render it with 'loom-daemon-update.sh --relaunch')."
+                ok "loom-daemon restart scheduled — systemd's own relaunch did not occur within ${RESTART_POLL_SECS}s (unit settled to '${UNIT_ACTIVE_STATE}', Result=${UNIT_RESULT:-unknown}), but 'systemctl --user reset-failed && start' recovered it (new pid ${NEW_PID}, verified within ${KICKSTART_POLL_SECS}s). Remediation note: the reset-failed+start fallback was required (#4950/#5119) — investigate why the unit's stop sequence exceeded TimeoutStopSec (a live unit that predates #4862's KillMode=mixed fix — never re-rendered by a plain restart — is the most likely cause; re-render it with 'loom-daemon-update.sh --relaunch')."
                 print_final_installed_line "$BUILT_COMMIT"
                 exit 0
             fi
 
             err "loom-daemon restart FAILED: no new, live MainPID was observed even after 'systemctl --user reset-failed && start'."
         else
-            err "loom-daemon restart FAILED: the unit is not confirmed relaunched, and its ActiveState (${UNIT_ACTIVE_STATE:-unknown}) is not 'failed' — refusing to guess at a recovery action."
+            err "loom-daemon restart FAILED: the unit is not confirmed relaunched, yet its ActiveState is 'active' on an unchanged/unobserved pid — refusing to bounce a possibly-healthy daemon."
         fi
         log_systemd_diagnostics
         err "The freshly-built binary IS provisioned, but the daemon's live status is NOT confirmed (pre-restart pid was ${PRE_RESTART_PID:-<none>})."
