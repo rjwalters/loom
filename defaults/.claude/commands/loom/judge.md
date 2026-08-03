@@ -688,8 +688,11 @@ Pre-Iteration Environment Check (gh repo view)
                     ↓
                 Search for unlabeled open PRs
                     ↓
-                    ├─→ Found? → Evaluate but leave labels unchanged
-                    │              (external/manual PR, no workflow labels)
+                    ├─→ Found? → Check for loom:fallback-evaluated marker
+                    │     │        with matching head SHA
+                    │     ├─→ Found (no new commits)? → Skip to next unlabeled PR
+                    │     └─→ Not found, or SHA differs? → Evaluate and post comment
+                    │              (with updated marker ending)
                     │
                     └─→ None found → No work available, exit iteration
 ```
@@ -726,6 +729,21 @@ else
     | head -n 1)
 
   if [ -n "$UNLABELED_PR" ]; then
+    # 3. Check for prior fallback-evaluated marker (dedup) before evaluating
+    CURRENT_HEAD_SHA=$(gh pr view $UNLABELED_PR --json headRefOid --jq '.headRefOid')
+    
+    # Extract the most recent loom:fallback-evaluated marker from PR comments
+    # Filter comments containing the marker, extract SHA values, and take the most recent
+    PRIOR_MARKER_SHA=$(gh api "repos/{owner}/{repo}/issues/$UNLABELED_PR/comments" \
+      | jq -r '.[] | select(.body | contains("<!-- loom:fallback-evaluated sha=")) | .body' \
+      | grep -oP '(?<=<!-- loom:fallback-evaluated sha=)[a-f0-9]+(?= -->)' \
+      | tail -n 1)
+    
+    if [ "$CURRENT_HEAD_SHA" = "$PRIOR_MARKER_SHA" ] && [ -n "$PRIOR_MARKER_SHA" ]; then
+        echo "Skipping unlabeled PR #$UNLABELED_PR: already evaluated in fallback mode (head SHA unchanged since last evaluation)"
+        exit 0
+    fi
+    
     echo "Evaluating unlabeled PR #$UNLABELED_PR (fallback mode)"
 
     # Check out and evaluate the PR (worktree-aware — see "PR Branch Isolation")
@@ -744,6 +762,8 @@ Code evaluation feedback...
 
 Note: This PR was evaluated in fallback mode (no loom:review-requested label).
 Consider adding loom:review-requested if you want it in the evaluation queue.
+
+<!-- loom:fallback-evaluated sha=$CURRENT_HEAD_SHA -->
 EOF
 )"
   else
