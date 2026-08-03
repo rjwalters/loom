@@ -533,6 +533,28 @@ the offending key, so a misconfigured binding can never leave a role quietly
 running on the default runtime. A known key with an **empty** value keeps its
 established "unset" meaning and falls through to the next precedence tier.
 
+**Runtime manifest resolution and the bundled fallback (#5002).** The role and
+runtime manifest directories are resolved independently (#4688): each prefers
+`.loom/roles` / `.loom/runtimes` when the subdirectory exists on disk, and
+otherwise falls back to `<repo_root>/defaults/roles` / `defaults/runtimes`.
+That `defaults/` fallback only ever resolves on the Loom *source* checkout
+itself — a consumer install has `.loom/`, never `defaults/` — so on every
+other managed repo it was unreachable by construction. If a consumer repo's
+`.loom/runtimes/` is missing entirely, or missing just one runtime's manifest
+(e.g. a pre-#4700 install that was never resynced), a non-builtin runtime had
+no fallback at all and failed closed even though the daemon binary ships an
+adapter for it. The daemon now also carries a **bundled fallback**: manifests
+for the runtimes it ships adapters for (`claude`, `codex`, `aider`) are
+compiled directly into the binary via `include_str!` from
+`defaults/runtimes/*.json` at build time, and consulted whenever the on-disk
+manifest lookup misses. An on-disk `.loom/runtimes/<name>.json` — however it
+got there — always wins over the bundled copy. Only a runtime the binary was
+never built with a manifest for (e.g. an operator-defined custom runtime with
+no on-disk manifest either) still fails closed with no fallback at all — and
+the diagnostic in that case now names `<repo>/.loom/runtimes/<name>.json`, a
+path reachable from a consumer repo, instead of the unreachable
+`defaults/runtimes/<name>.json` fallback path.
+
 Daemon admission runs before any claim lock, forge mutation, account selection,
 log header, or child spawn. Successful sweep status and
 `sweep.global.dispatch` events include both `runtime` and `runtime_source`.
