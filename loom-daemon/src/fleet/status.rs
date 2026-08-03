@@ -752,8 +752,19 @@ impl FleetStatusReport {
     /// Exit-code policy (AC 3): `0` only when every host is [`HostState::Up`];
     /// otherwise non-zero so a monitor/CI check fails loudly rather than
     /// silently reading an unreachable/down/draining host as fine.
+    ///
+    /// #5060: an EMPTY roster is also non-zero, even though the only row
+    /// present (the local host) is `Up`. A 1-of-1 all-up report from an empty
+    /// registry is indistinguishable from a genuinely healthy fleet, so an
+    /// unconfigured/lost/mis-pathed registry would otherwise read as "all
+    /// clear" to every scripted consumer — the exact fleet-visibility blind
+    /// spot this policy exists to prevent. `empty_roster` means "this command
+    /// saw no fleet", which is a state to investigate, not to pass.
     #[must_use]
     pub fn exit_code(&self) -> i32 {
+        if self.summary.empty_roster {
+            return 1;
+        }
         if self.summary.up == self.summary.total {
             0
         } else {
@@ -763,7 +774,8 @@ impl FleetStatusReport {
 
     /// Render the human-readable table (AC 1: one command, every host side by
     /// side). Never empty output (AC 2): an empty roster prints an explicit
-    /// notice in addition to the local host's row.
+    /// notice in addition to the local host's row, AND (#5060) a qualified
+    /// roster-coverage summary line rather than an unqualified count.
     #[must_use]
     pub fn render_human(&self) -> String {
         let mut out = String::new();
@@ -809,16 +821,33 @@ impl FleetStatusReport {
                 out.push_str(&format!("      workspaces: {}\n", host.workspaces.join(", ")));
             }
         }
-        out.push_str(&format!(
-            "\n{} host(s): {} up, {} daemon-down, {} unreachable, {} powered-off (expected), {} parse-error, {} draining.\n",
-            self.summary.total,
-            self.summary.up,
+        let breakdown = format!(
+            "{} daemon-down, {} unreachable, {} powered-off (expected), {} parse-error, {} draining",
             self.summary.daemon_down,
             self.summary.unreachable,
             self.summary.powered_off,
             self.summary.parse_error,
             self.summary.draining,
-        ));
+        );
+        // #5060: the SUMMARY LINE ITSELF — not just the notice above the table
+        // — has to read as "not a healthy fleet" for an empty roster. An
+        // operator scanning only the last line of `fleet status` (or a log
+        // scraper matching it) otherwise sees an unqualified "1 host(s): 1 up"
+        // that is byte-for-byte the shape of a real, healthy single-host
+        // fleet. Qualifying it as ROSTER COVERAGE ("N of M KNOWN hosts") makes
+        // the denominator's provenance explicit.
+        if self.summary.empty_roster {
+            out.push_str(&format!(
+                "\n{} of {} known host(s) up — ROSTER IS EMPTY, showing the local host only; \
+                 this is NOT a healthy fleet ({}).\n",
+                self.summary.up, self.summary.total, breakdown,
+            ));
+        } else {
+            out.push_str(&format!(
+                "\n{} host(s): {} up, {}.\n",
+                self.summary.total, self.summary.up, breakdown,
+            ));
+        }
         out
     }
 }
@@ -1330,9 +1359,57 @@ mod tests {
         assert!(report.hosts[0].is_local);
         assert!(report.summary.empty_roster);
 
+        // #5060: an empty roster must NEVER read as "all clear", even though
+        // the only row present (the local host) is Up. A 1-of-1 all-up report
+        // is indistinguishable from a genuinely healthy single-host fleet.
+        assert_eq!(report.summary.up, report.summary.total);
+        assert_ne!(report.exit_code(), 0);
+
         let rendered = report.render_human();
         assert!(rendered.contains("no fleet workers registered"));
         assert!(rendered.contains(LOCAL_HOST_ALIAS));
+        // #5060 AC 2: the summary LINE ITSELF (not just the notice above the
+        // table) is qualified as roster coverage, so it cannot be mistaken for
+        // a healthy fleet by an operator/scraper reading only the last line.
+        assert!(
+            rendered.contains("1 of 1 known host(s) up"),
+            "summary line not qualified as roster coverage: {rendered}"
+        );
+        assert!(rendered.contains("ROSTER IS EMPTY"));
+        assert!(rendered.contains("NOT a healthy fleet"));
+        assert!(
+            !rendered.contains("1 host(s): 1 up"),
+            "empty roster must not render the unqualified healthy-fleet summary line: {rendered}"
+        );
+    }
+
+    /// #5060 non-regression: the empty-roster carve-out above must not make a
+    /// genuinely populated, fully-up roster report unhealthy — that would
+    /// invert the whole exit-code contract for every real fleet.
+    #[tokio::test]
+    async fn non_empty_all_up_roster_still_exits_zero_with_unqualified_summary() {
+        let mut responses = HashMap::new();
+        responses.insert("up-host".to_string(), MockOutcome::Output(up_output(r#"{}"#)));
+        responses.insert("other-up-host".to_string(), MockOutcome::Output(up_output(r#"{}"#)));
+        let source: Arc<dyn HostStatusSource> = Arc::new(MockSource::new(responses));
+        let mut registry = FleetRegistry::default();
+        registry.upsert(worker("up-host"));
+        registry.upsert(worker("other-up-host"));
+        let local = HostReport::local_up(serde_json::json!({}));
+        let report = collect_fleet_report(source, registry, local, Duration::from_secs(5)).await;
+
+        assert!(!report.summary.empty_roster);
+        assert_eq!(report.summary.total, 3);
+        assert_eq!(report.summary.up, 3);
+        assert_eq!(report.exit_code(), 0);
+
+        let rendered = report.render_human();
+        assert!(
+            rendered.contains("3 host(s): 3 up"),
+            "healthy fleet lost its unqualified summary line: {rendered}"
+        );
+        assert!(!rendered.contains("ROSTER IS EMPTY"));
+        assert!(!rendered.contains("no fleet workers registered"));
     }
 
     #[tokio::test]

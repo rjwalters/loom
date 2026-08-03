@@ -822,10 +822,39 @@ format was needed.
 - **`safehoused` presence**: a cheap best-effort probe (socket / `pgrep`);
   degrades to `unknown` rather than erroring the row.
 - **Empty roster**: never renders as empty output — prints an explicit "no
-  fleet workers registered" notice alongside the local host's row.
-- **Exit code**: `0` only when every roster host is `UP`; non-zero otherwise
-  (a monitor/CI check should treat any non-zero exit as "go look" — including
-  a `POWERED OFF` host, since it is still not confirmed-alive).
+  fleet workers registered" notice alongside the local host's row, **and**
+  (#5060) a qualified summary line (`1 of 1 known host(s) up — ROSTER IS
+  EMPTY, showing the local host only; this is NOT a healthy fleet`) instead of
+  the unqualified `N host(s): N up` a real fleet gets. Both the notice and the
+  summary line are load-bearing: an operator (or log scraper) reading only the
+  last line of the output must not mistake "this command saw no fleet" for
+  "the fleet is fine".
+- **Exit code**: `0` only when every roster host is `UP` **and the roster is
+  non-empty**; non-zero otherwise (a monitor/CI check should treat any
+  non-zero exit as "go look" — including a `POWERED OFF` host, since it is
+  still not confirmed-alive).
+  - **Empty-roster carve-out** (#5060): an empty registry exits **non-zero**
+    even though the only row present (the local host) is `UP`. A 1-of-1 all-up
+    report is byte-identical in shape to a genuinely healthy single-host
+    fleet, so an unconfigured, lost, or mis-pathed `~/.loom/fleet.json` would
+    otherwise read as "all clear" to every scripted consumer. `empty_roster:
+    true` in `--json` means *this command saw no fleet* — a state to
+    investigate, not to pass. (Note that the registry is resolved per-host: on
+    a host whose registry is empty, `fleet status` sees **only** the local
+    host and knows nothing about peers, however healthy they are.)
+- **Should every host be registered?** **Yes** — including self-maintained
+  hosts that were never provisioned via `fleet add-worker` (an operator's own
+  laptop/workstation running its own `loom-daemon`). The registry is the only
+  inventory `fleet status` has; a live daemon that is not in *some* host's
+  registry is invisible to fleet-wide checks, will never be probed, and will
+  never appear in a summary count. Treat an unregistered live daemon as a
+  **warning in its own right**, not a benign configuration style: add it with
+  `loom-daemon fleet add-worker <ssh-host> --repo <owner/name>` (idempotent —
+  every step is `check`-guarded, so registering an already-configured host
+  reports `unchanged` and touches nothing) so it is covered by the exit-code
+  policy above. *Not* covered here (deferred to a follow-up): any soft
+  cross-check that compares the roster against tailnet/known-hosts peers to
+  flag unregistered-but-reachable hosts automatically.
 - **`--json`** schema: `{ "hosts": [ { "alias", "state", "tailnet_name"?,
   "provider_instance_id"?, "added_by"?, "is_local", "workspaces", "status"?,
   "detail"?, "safehoused" } ], "summary": { "total", "up", "daemon_down",
