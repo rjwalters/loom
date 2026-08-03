@@ -1455,6 +1455,34 @@ function unmask_ws(s) {
 # and the surrounding qsplit()/strip_literal_text() `$(`-floor logic are
 # unaffected -- ONLY the inert body content disappears.
 #
+# MASK ONLY A *CLOSED* BLOCK (#5087 -- the fail-open regression this two-pass
+# structure exists to prevent). The masking decision is made per candidate
+# opener with the closing-delimiter line ALREADY LOCATED: for each candidate
+# on a line, a forward scan looks for the terminating bare-delimiter line
+# FIRST, and only a block that is genuinely closed inside this buffer has its
+# body masked. A candidate whose delimiter line never appears masks NOTHING
+# and the scan simply moves on to the next candidate -- because the original
+# single-pass form (which flipped a sticky `inbody` flag the instant it saw
+# `<<` and only ever cleared it on a delimiter line) silently masked
+# EVERYTHING from a FALSE opener to the end of the command whenever no such
+# line followed, swallowing any real `>`/`tee`/`cp`/`mv` target after it and
+# defeating the write-confinement guard (#4178) outright. Two ordinary,
+# heredoc-free command shapes hit that: a quoted string that merely CONTAINS
+# `<<TOKEN` (`echo "test <<TOKEN"`), and an arithmetic bitshift
+# (`x=$((1 << 3))`) -- both followed by a genuine out-of-worktree write, both
+# ALLOWed pre-#5087 where `main` DENIed. Masking is a NARROWING operation, so
+# it must never be applied speculatively: when in doubt, mask nothing and let
+# the text flow through the pre-#5000 per-line scan.
+#
+# Opener detection is correspondingly tightened so the commonest false
+# openers are rejected before the forward scan even runs: a `<<<` herestring
+# is never a heredoc opener, and a BARE (unquoted) delimiter starting with a
+# DIGIT is read as an arithmetic shift operand (`1 << 3`), not a delimiter --
+# `<<'3'`/`<<"3"` stay recognized, since an explicitly quoted delimiter is
+# unambiguous heredoc intent. Every `<<` occurrence on a line is considered
+# in turn (not just the first), so one rejected candidate never hides a real
+# terminated heredoc later on the same line.
+#
 # Deliberately narrow / best-effort, consistent with every other quote-
 # tracking scan in this file: an exotic delimiter (not a bare identifier, or
 # using shell metacharacters) is simply not recognized as a heredoc opener --
@@ -1467,51 +1495,73 @@ function unmask_ws(s) {
 # completely unaffected and still flows through unchanged.
 # =============================================================================
 _MASKHEREDOC_AWK='
-function mask_heredoc_bodies(s,   out, lines, nl, i, line, trimmed, body, delim, inbody, p, start, qc, c, wordend, SQ, DQ, MASKC) {
+# Return the heredoc delimiter opened by the `<<` at byte offset p in line,
+# or "" when that `<<` is not a recognized heredoc opener.
+function heredoc_delim_at(line, p,   start, qc, c, wordend, d, SQ, DQ) {
     SQ = sprintf("%c", 39)    # single quote
     DQ = sprintf("%c", 34)    # double quote
+    start = p + 2
+    # `<<<` is a herestring, never a heredoc opener.
+    if (substr(line, start, 1) == "<") return ""
+    if (substr(line, start, 1) == "-") start++
+    while (substr(line, start, 1) == " " || substr(line, start, 1) == "\t") start++
+    qc = ""
+    c = substr(line, start, 1)
+    if (c == SQ || c == DQ) { qc = c; start++ }
+    wordend = start
+    while (1) {
+        c = substr(line, wordend, 1)
+        if (c ~ /^[A-Za-z0-9_]$/) { wordend++; continue }
+        break
+    }
+    if (wordend <= start) return ""
+    d = substr(line, start, wordend - start)
+    # A BARE delimiter starting with a digit is an arithmetic shift operand
+    # (`$((1 << 3))`) far more often than a real heredoc delimiter. A quoted
+    # one (`<<"3"`) is unambiguous heredoc intent, so it stays recognized.
+    if (qc == "" && d ~ /^[0-9]/) return ""
+    return d
+}
+function mask_heredoc_bodies(s,   out, lines, nl, i, j, line, trimmed, body, delim, closeat, p, off, MASKC) {
     MASKC = sprintf("%c", 23) # ETB -- placeholder for inert heredoc-body text
     nl = split(s, lines, "\n")
     if (nl == 0) return ""
-    inbody = 0
-    delim = ""
     for (i = 1; i <= nl; i++) {
         line = lines[i]
-        if (inbody) {
-            # A `<<-` opener permits (and strips) leading tabs on the
-            # delimiter line; a bare `<<` requires an exact match. Either
-            # way only leading TABS (never spaces) are stripped, per real
-            # heredoc semantics.
-            trimmed = line
-            sub(/^\t+/, "", trimmed)
-            if (trimmed == delim) {
-                inbody = 0
-                delim = ""
-            } else {
-                body = line
+        off = 1
+        # Consider every `<<` on this line, left to right, until one is
+        # confirmed to open a CLOSED heredoc block.
+        while (1) {
+            p = index(substr(line, off), "<<")
+            if (p == 0) break
+            p = off + p - 1        # absolute offset of `<<` within line
+            off = p + 2            # where the next candidate search resumes
+            delim = heredoc_delim_at(line, p)
+            if (delim == "") continue
+            # PASS 1 -- locate the terminating delimiter line. A `<<-` opener
+            # permits (and strips) leading tabs on the delimiter line; only
+            # leading TABS (never spaces) are ever stripped, per real heredoc
+            # semantics. Stripping them unconditionally can only terminate the
+            # block EARLIER, i.e. mask LESS -- the safe direction here.
+            closeat = 0
+            for (j = i + 1; j <= nl; j++) {
+                trimmed = lines[j]
+                sub(/^\t+/, "", trimmed)
+                if (trimmed == delim) { closeat = j; break }
+            }
+            # Unterminated / false opener: mask NOTHING for this candidate and
+            # keep looking. Everything after it stays visible to the caller,
+            # exactly as in the pre-#5000 per-line scan (#5087).
+            if (closeat == 0) continue
+            # PASS 2 -- only now that the block is known to be closed, mask
+            # the body lines strictly between opener and delimiter line.
+            for (j = i + 1; j < closeat; j++) {
+                body = lines[j]
                 gsub(/./, MASKC, body)
-                lines[i] = body
+                lines[j] = body
             }
-            continue
-        }
-        p = index(line, "<<")
-        if (p > 0) {
-            start = p + 2
-            if (substr(line, start, 1) == "-") start++
-            while (substr(line, start, 1) == " " || substr(line, start, 1) == "\t") start++
-            qc = ""
-            c = substr(line, start, 1)
-            if (c == SQ || c == DQ) { qc = c; start++ }
-            wordend = start
-            while (1) {
-                c = substr(line, wordend, 1)
-                if (c ~ /^[A-Za-z0-9_]$/) { wordend++; continue }
-                break
-            }
-            if (wordend > start) {
-                delim = substr(line, start, wordend - start)
-                inbody = 1
-            }
+            i = closeat            # resume scanning after the delimiter line
+            break
         }
     }
     out = lines[1]
