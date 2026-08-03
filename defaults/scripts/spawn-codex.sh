@@ -163,6 +163,8 @@
 #   LOOM_CODEX_MODEL     Static per-adapter default model, used only when
 #                        neither an explicit flag nor LOOM_MODEL is present.
 #                        Unset by default (no `-m` emitted).
+#   LOOM_CODEX_MODEL_CHECK  Set to 0 to disable the Claude-shaped-model refusal
+#                        below (issue #5028). Default on (`1`).
 #   LOOM_EFFORT          Reasoning effort, mapped to
 #                        `-c model_reasoning_effort=<value>`. Skipped when an
 #                        explicit `-c model_reasoning_effort=` override is
@@ -460,6 +462,44 @@ elif [[ -n "$CODEX_DEFAULT_MODEL" ]]; then
     log_info "spawn-codex: model=$CODEX_DEFAULT_MODEL (from LOOM_CODEX_MODEL adapter default)"
 else
     log_info "spawn-codex: model=default"
+fi
+
+# --- Claude-shaped model refusal (issue #5028, follow-up to #5001 AC2/AC3) ---
+# The daemon-native role runner independently refuses this same conflict
+# (`loom-daemon/src/sweep_registry/model.rs::model_runtime_mismatch`) before
+# ever shelling out, but any OTHER caller that pins a model onto this runtime
+# (sweep dispatch, a hand-run `LOOM_RUNTIME=codex`) reaches this adapter
+# directly with no daemon preflight in front of it. Loom's logical Claude
+# tiers/aliases (`opus`, `opusplan`, `sonnet`, `haiku`, `fable`) and any
+# `claude*`-prefixed pinned ID are never valid on Codex's wire — the CLI 400s
+# on them. Catching it here, before any auth/dispatch work, means a
+# misconfigured caller fails fast and names the fix instead of burning an
+# entire session on a doomed spawn. Escape hatch: LOOM_CODEX_MODEL_CHECK=0
+# (e.g. if a future Codex model is genuinely named something like
+# "sonnet-mini").
+EFFECTIVE_MODEL=""
+if [[ "$HAS_MODEL_ARG" == "true" ]]; then
+    EFFECTIVE_MODEL="$EXPLICIT_MODEL"
+elif [[ -n "${LOOM_MODEL:-}" ]]; then
+    EFFECTIVE_MODEL="$LOOM_MODEL"
+elif [[ -n "$CODEX_DEFAULT_MODEL" ]]; then
+    EFFECTIVE_MODEL="$CODEX_DEFAULT_MODEL"
+fi
+if [[ -n "$EFFECTIVE_MODEL" && "${LOOM_CODEX_MODEL_CHECK:-1}" != "0" ]]; then
+    _model_base="${EFFECTIVE_MODEL%%@*}"
+    _model_key="$(printf '%s' "$_model_base" | tr '[:upper:]' '[:lower:]')"
+    case "$_model_key" in
+        opus | opusplan | sonnet | haiku | fable | claude*)
+            log_error "spawn-codex: refusing Claude-shaped model '$EFFECTIVE_MODEL' on the Codex runtime (#5028)."
+            log_error "This model/runtime combination is guaranteed to fail on the wire (HTTP 400)."
+            log_error "Fix one of:"
+            log_error "  - set autonomous.roleRunner.roleModels.<role> to a Codex-valid model in .loom/config.json"
+            log_error "  - set LOOM_MODEL / LOOM_CODEX_MODEL to a Codex-valid model for this invocation"
+            log_error "  - point this role/runtime binding back at Claude (unset runtimes.roles.<role> / LOOM_RUNTIME_<ROLE>)"
+            log_error "Escape hatch: LOOM_CODEX_MODEL_CHECK=0 (only if this really is a valid Codex model name)."
+            exit 78 # EX_CONFIG
+            ;;
+    esac
 fi
 
 # --- Effort selection ---
