@@ -140,19 +140,27 @@ strip_literal_text() {
 # narrows what this ONE check can see; it never widens what it misses.
 # =============================================================================
 
-# Mask the BODY of a heredoc whose consuming command is `cat` and whose
+# Mask the BODY of a heredoc whose consuming command is `cat`, whose
 # delimiter is quoted (`cat <<'EOF' ... EOF` / `cat <<"EOF" ... EOF`, and the
-# `<<-` tab-stripping variant). This is exactly the CLAUDE.md-documented
+# `<<-` tab-stripping variant), AND whose `cat` invocation is captured by a
+# command substitution ($()/backtick) that is the value of a known
+# non-executing text-data flag. This is exactly the CLAUDE.md-documented
 # idiom for multi-line commit/PR-body text: `git commit -m "$(cat <<'EOF'
-# ... EOF)"`. A heredoc consumed by `cat` can only ever become inert text
-# data (`cat` never executes anything), and a QUOTED delimiter guarantees
-# bash performs no $()/backtick/$VAR expansion within the body, so the body
-# is 100% literal text regardless of its contents.
+# ... EOF)"`. A QUOTED delimiter guarantees bash performs no
+# $()/backtick/$VAR expansion within the body, so the body is 100% literal
+# text; the flag-capture requirement guarantees that literal text is used as
+# inert data (a message/title/search value) rather than executed.
 #
-# Deliberately narrower than "any heredoc": a heredoc feeding an INTERPRETER
-# instead (`bash <<'EOF' ... EOF`, `sh <<EOF ... EOF`) is genuinely live code
-# and must stay visible to the merge-redirect check, so masking is gated on
-# the word immediately before `<<` being `cat` specifically.
+# Deliberately narrower than "any heredoc" on TWO axes:
+#   1. A heredoc feeding an INTERPRETER (`bash <<'EOF' ... EOF`, `sh <<EOF`)
+#      is genuinely live code, so masking is gated on the word immediately
+#      before `<<` being `cat`.
+#   2. `cat` never executes its body, but its stdout can still be routed INTO
+#      a shell on the same command line -- `cat <<'EOF' | bash`, or a captured
+#      `eval "$(cat <<'EOF' ...)"`. Masking those would blind this
+#      catastrophic-tier guard to a real invocation, so masking is ALSO gated
+#      on `cat` being captured into a text-data flag's $()/backtick value (see
+#      the `capre` confinement check inside the function).
 #
 # Mirrors the #5087 lesson: only a heredoc block that is PROVABLY CLOSED
 # inside the buffer (its bare delimiter line is found) gets its body masked.
@@ -163,6 +171,13 @@ mask_cat_heredoc_bodies() {
     BEGIN {
         SQ = sprintf("%c", 39)
         DQ = sprintf("%c", 34)
+        BT = sprintf("%c", 96)
+        # A cat-heredoc body is only PROVABLY inert when the cat invocation is
+        # captured by a command substitution ($()/backtick) that is itself the
+        # VALUE of a known non-executing text-data flag. `capre` must match the
+        # tail of the opener-line text that sits immediately before the `cat`
+        # token (see the confinement check below).
+        capre = "(^|[ \t])(-m|--message|--body|--notes|--title|--comment|--search)[ \t]*=?[ \t]*(" DQ "|" SQ ")?[ \t]*([$][(]|" BT ")[ \t]*$"
     }
     { lines[NR] = $0 }
     END {
@@ -179,6 +194,25 @@ mask_cat_heredoc_bodies() {
                 # trailing whitespace) to be a bare "cat".
                 pre = substr(line, 1, p - 1)
                 if (pre !~ /(^|[^A-Za-z0-9_])cat[ \t]*$/) continue
+                # HARDENING (#5109 follow-up, PR #5115 review): the word before
+                # `<<` being `cat` is NOT sufficient -- `cat` never executes its
+                # own body, but its stdout can still reach a shell on the SAME
+                # command line, so masking a body that a shell then runs makes
+                # this catastrophic-tier guard blind to a real invocation:
+                #   cat <<EOF | bash        # body piped straight into bash
+                #   eval "$(cat <<EOF ...)" # body captured, then eval-executed
+                # Only mask when the cat-heredoc is captured by a command
+                # substitution ($()/backtick) that is the VALUE of a known
+                # non-executing text-data flag (-m/--message/--body/--notes/
+                # --title/--comment/--search) -- the CLAUDE.md-documented
+                # `-m "$(cat <<'"'"'EOF'"'"' ... EOF)"` idiom -- so the body is
+                # provably confined to inert text data and can never reach a
+                # shell. A bare `cat <<EOF`, a piped `cat <<EOF | bash`, or an
+                # `eval "$(cat <<EOF ...)"` fails this check and is left visible
+                # to the merge-redirect grep, which denies exactly as before.
+                before_cat = pre
+                sub(/cat[ \t]*$/, "", before_cat)
+                if (before_cat !~ capre) continue
                 start = p + 2
                 if (substr(line, start, 1) == "-") start++
                 while (substr(line, start, 1) == " " || substr(line, start, 1) == "\t") start++

@@ -236,6 +236,35 @@ EOF'
 assert_deny "Still block gh pr merge inside a bash-fed (non-cat) heredoc" \
     "$GH_5109_BASH_HEREDOC_CMD"
 
+# Regression guard (PR #5115 review): `cat` never executes its own body, but
+# piping its stdout into a shell on the SAME line -- `cat <<'EOF' | bash` --
+# makes the heredoc body live, executed code despite `cat` being the literal
+# consumer. The cat-heredoc masking must NOT neutralize such a body (it is not
+# confined to inert text: it reaches `bash`), so a real invocation shaped this
+# way must still deny. This is the exact bypass reported in the #5115 review.
+GH_5115_CAT_PIPE_BASH_CMD='cat <<'"'"'EOF'"'"' | bash
+'"$PHRASE_CMD"' 123 --admin
+EOF'
+assert_deny "Still block gh pr merge in a cat-heredoc piped into bash" \
+    "$GH_5115_CAT_PIPE_BASH_CMD"
+
+# And its `| sh` cousin -- same reasoning, different interpreter.
+GH_5115_CAT_PIPE_SH_CMD='cat <<'"'"'EOF'"'"' | sh
+'"$PHRASE_CMD"' 123
+EOF'
+assert_deny "Still block gh pr merge in a cat-heredoc piped into sh" \
+    "$GH_5115_CAT_PIPE_SH_CMD"
+
+# And a cat-heredoc captured then eval-executed: captured by $() but the
+# consumer is `eval`, NOT a text-data flag, so the body is not inert and must
+# stay visible.
+GH_5115_CAT_EVAL_CMD='eval "$(cat <<'"'"'EOF'"'"'
+'"$PHRASE_CMD"' 123
+EOF
+)"'
+assert_deny "Still block gh pr merge in a cat-heredoc captured then eval'd" \
+    "$GH_5115_CAT_EVAL_CMD"
+
 echo ""
 
 # =========================================================================
