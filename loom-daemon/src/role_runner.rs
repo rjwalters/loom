@@ -314,6 +314,16 @@ pub fn record_role_tick_at(
 }
 
 /// [`record_role_tick_at`] stamped with the current wall clock.
+///
+/// The tick loop ([`spawn_multi_role_task`]) records *every* raw outcome here —
+/// including the identical repeat failures its own log-dedup (#4349) downgrades
+/// to `DEBUG`. That completeness is what lets the client-side classifier detect
+/// a config-shaped failure that can never self-recover: N consecutive failures
+/// for the same `(root, role)` pair with a byte-identical `detail` escalate from
+/// ordinary "persistent" to a loud, distinct verdict via
+/// [`crate::health::summarize_role_ticks`] /
+/// [`crate::health::ROLE_TICK_ESCALATION_THRESHOLD`] (#5023) — rather than
+/// retrying identically forever, silently burning a token slot each tick.
 pub fn record_role_tick(role: &str, root: &Path, outcome: &RoleTickOutcome) {
     record_role_tick_at(role, root, outcome, chrono::Utc::now());
 }
