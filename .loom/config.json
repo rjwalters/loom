@@ -8,6 +8,9 @@
         "curator",
         "champion",
         "judge"
+      ],
+      "onIdle": [
+        "auditor"
       ]
     },
     "collisionDetection": {
