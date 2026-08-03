@@ -2360,16 +2360,27 @@ fi
 
 # ============================================================
 # 38. ff-first default: local main is behind origin/main AND has a DIVERGED
-#     local commit -> the ff-merge cannot apply -> abort exit 1, no merge, no
-#     build, working tree untouched. Never guesses or hard-resets.
+#     local commit whose CONTENT genuinely differs from origin's (not merely
+#     its commit history) -> the ff-merge cannot apply -> abort exit 1, no
+#     merge, no build, working tree untouched. Never guesses or hard-resets.
+#     This is the #4951 regression case: real (non-empty) content divergence
+#     must NOT be reclassified as the content-identical case covered by tests
+#     57/58 below — both sides here add a real, DIFFERENT file, so
+#     `git diff origin/main...main` is genuinely non-empty.
 # ============================================================
 W38="$BASE_WORKDIR/w38"
 BARE38="$BASE_WORKDIR/w38-origin.git"
 new_fixture_with_origin "$W38" "$BARE38"
-push_extra_commits_to_origin "$BARE38" 2 >/dev/null
-# Diverge: a local commit that is NOT on origin (so the merge is not a plain
-# fast-forward — `git merge --ff-only` must refuse).
-( cd "$W38" && git -c user.email=test@test -c user.name=test commit -q --allow-empty -m "local diverged commit" )
+TMPCLONE38="$(mktemp -d)"
+git clone -q "$BARE38" "$TMPCLONE38"
+echo "origin-value" > "$TMPCLONE38/origin-only-file.txt"
+( cd "$TMPCLONE38" && git add origin-only-file.txt && git -c user.email=test@test -c user.name=test commit -q -m "origin real change" && git push -q origin HEAD:refs/heads/main )
+rm -rf "$TMPCLONE38"
+# Diverge: a local commit that is NOT on origin, adding DIFFERENT real
+# content (so the merge is not a plain fast-forward, AND the resulting
+# content diff vs origin is genuinely non-empty).
+echo "local-value" > "$W38/local-only-file.txt"
+( cd "$W38" && git add local-only-file.txt && git -c user.email=test@test -c user.name=test commit -q -m "local diverged commit (real content)" )
 HEAD_BEFORE38="$(cd "$W38" && git rev-parse --short HEAD)"
 out38=$( cd "$W38" && PATH="$TEST_PATH" bash "$UPDATE_SCRIPT" 2>&1 )
 rc38=$?
@@ -2940,6 +2951,344 @@ else
     TESTS_FAILED=$((TESTS_FAILED + 1))
     echo -e "${RED}✗${NC} failure output loudly reports the unconfirmed relaunch"
     echo "  output: $out56"
+fi
+
+# ============================================================
+# 57. ff-abort classification (#4951): local <default> has DIVERGED from
+#     origin/<default> in commit history, but the two are content-IDENTICAL
+#     (`git diff origin/main...main` is empty — e.g. a local resync commit
+#     and its own revert that net to no change, the robb-STUDIO 2026-08-02
+#     incident shape). Default (no --auto-resolve-safe-abort): still hard
+#     aborts (exit 1, HEAD untouched) but now names the exact safe command
+#     instead of the old bare "resolve manually" message.
+# ============================================================
+W57="$BASE_WORKDIR/w57"
+BARE57="$BASE_WORKDIR/w57-origin.git"
+new_fixture_with_origin "$W57" "$BARE57"
+push_extra_commits_to_origin "$BARE57" 2 >/dev/null
+# Diverge locally with an equally content-free commit -- both sides' extra
+# commits are --allow-empty, so the FINAL tree state matches even though the
+# commit graphs have diverged (git merge --ff-only still refuses).
+( cd "$W57" && git -c user.email=test@test -c user.name=test commit -q --allow-empty -m "local commit that nets to no change" )
+HEAD_BEFORE57="$(cd "$W57" && git rev-parse --short HEAD)"
+out57=$( cd "$W57" && PATH="$TEST_PATH" bash "$UPDATE_SCRIPT" 2>&1 )
+rc57=$?
+assert_eq "1" "$rc57" "content-identical divergence (no flag): still exits 1 by default"
+HEAD_AFTER57="$(cd "$W57" && git rev-parse --short HEAD)"
+assert_eq "$HEAD_BEFORE57" "$HEAD_AFTER57" "content-identical divergence (no flag): HEAD completely untouched"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out57" | grep -qi 'content-IDENTICAL'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} content-identical divergence is classified and named explicitly"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} content-identical divergence is classified and named explicitly"
+    echo "  output: $out57"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out57" | grep -q -- 'reset --hard origin/main'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} abort message names the exact safe reset command"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} abort message names the exact safe reset command"
+    echo "  output: $out57"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out57" | grep -q -- '--auto-resolve-safe-abort'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} abort message names --auto-resolve-safe-abort as the automatic path"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} abort message names --auto-resolve-safe-abort as the automatic path"
+    echo "  output: $out57"
+fi
+
+# ============================================================
+# 58. Same content-identical-divergence shape as test 57, but WITH
+#     --auto-resolve-safe-abort: the script performs `git reset --hard
+#     origin/main` itself, then proceeds to rebuild the now-current HEAD ->
+#     exit 0, HEAD now equals origin's tip.
+# ============================================================
+W58="$BASE_WORKDIR/w58"
+BARE58="$BASE_WORKDIR/w58-origin.git"
+new_fixture_with_origin "$W58" "$BARE58"
+ORIGIN_TIP58="$(push_extra_commits_to_origin "$BARE58" 2)"
+( cd "$W58" && git -c user.email=test@test -c user.name=test commit -q --allow-empty -m "local commit that nets to no change" )
+NEW_FAKE58="$W58/new-fake-daemon"
+write_fake_daemon "$NEW_FAKE58" "$ORIGIN_TIP58" "$W58/new-marker"
+out58=$( cd "$W58" && PATH="$TEST_PATH" NEW_FAKE_BIN_SRC="$NEW_FAKE58" \
+    bash "$UPDATE_SCRIPT" --auto-resolve-safe-abort 2>&1 )
+rc58=$?
+assert_eq "0" "$rc58" "content-identical divergence + --auto-resolve-safe-abort: auto-resolves and succeeds"
+HEAD_AFTER58="$(cd "$W58" && git rev-parse --short HEAD)"
+assert_eq "$ORIGIN_TIP58" "$HEAD_AFTER58" "content-identical divergence + --auto-resolve-safe-abort: HEAD now equals origin/main's tip"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out58" | grep -qi 'Auto-resolved'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} auto-resolve reports what it did"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} auto-resolve reports what it did"
+    echo "  output: $out58"
+fi
+
+# ============================================================
+# 59. ff-abort classification (#4951): the ff-merge is blocked by a dirty
+#     TRACKED file, but it is a Loom-managed installed copy (under
+#     .loom/docs/, regenerated from defaults/ by resync-installed.sh) whose
+#     incoming origin change conflicts with the local edit -- not real local
+#     work (the loom-worker-1 2026-08-02 incident shape). Default (no
+#     --auto-resolve-safe-abort): still hard aborts (exit 1, dirty file left
+#     untouched) but now names the exact safe commands instead of the old
+#     bare "resolve manually" message.
+# ============================================================
+W59="$BASE_WORKDIR/w59"
+BARE59="$BASE_WORKDIR/w59-origin.git"
+new_fixture_with_origin "$W59" "$BARE59"
+mkdir -p "$W59/.loom/docs"
+echo "docv1" > "$W59/.loom/docs/example.md"
+( cd "$W59" && git add .loom/docs/example.md && git -c user.email=test@test -c user.name=test commit -q -m "add managed doc" && git push -q origin HEAD:refs/heads/main )
+TMPCLONE59="$(mktemp -d)"
+git clone -q "$BARE59" "$TMPCLONE59"
+echo "docv2-from-origin" > "$TMPCLONE59/.loom/docs/example.md"
+( cd "$TMPCLONE59" && git commit -aq -m "origin updates the managed doc" && git push -q origin HEAD:refs/heads/main )
+rm -rf "$TMPCLONE59"
+# Dirty (uncommitted) that SAME managed file with a conflicting edit, so
+# `git merge --ff-only` genuinely refuses (an unrelated dirty file would not
+# block a fast-forward).
+echo "docv1-local-edit" > "$W59/.loom/docs/example.md"
+HEAD_BEFORE59="$(cd "$W59" && git rev-parse --short HEAD)"
+out59=$( cd "$W59" && PATH="$TEST_PATH" bash "$UPDATE_SCRIPT" 2>&1 )
+rc59=$?
+assert_eq "1" "$rc59" "managed-only dirty file (no flag): still exits 1 by default"
+HEAD_AFTER59="$(cd "$W59" && git rev-parse --short HEAD)"
+assert_eq "$HEAD_BEFORE59" "$HEAD_AFTER59" "managed-only dirty file (no flag): HEAD untouched"
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ "$(cat "$W59/.loom/docs/example.md")" == "docv1-local-edit" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} dirty managed file is left untouched by default (no checkout performed)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} dirty managed file is left untouched by default (no checkout performed)"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out59" | grep -qi 'Loom-managed installed copies'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} managed-only dirty state is classified and named explicitly"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} managed-only dirty state is classified and named explicitly"
+    echo "  output: $out59"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out59" | grep -q -- 'checkout -- .loom/docs/example.md' \
+    && echo "$out59" | grep -q -- 'resync-installed.sh'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} abort message names the exact safe checkout + resync commands"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} abort message names the exact safe checkout + resync commands"
+    echo "  output: $out59"
+fi
+
+# ============================================================
+# 60. Same managed-only-dirty shape as test 59, but WITH
+#     --auto-resolve-safe-abort: the script discards the local edit
+#     (`git checkout --`), fast-forwards, and invokes resync-installed.sh
+#     post-roll -> exit 0, the managed file now matches origin's content, and
+#     the (stubbed) resync-installed.sh was actually invoked.
+# ============================================================
+W60="$BASE_WORKDIR/w60"
+BARE60="$BASE_WORKDIR/w60-origin.git"
+new_fixture_with_origin "$W60" "$BARE60"
+mkdir -p "$W60/.loom/docs"
+echo "docv1" > "$W60/.loom/docs/example.md"
+( cd "$W60" && git add .loom/docs/example.md && git -c user.email=test@test -c user.name=test commit -q -m "add managed doc" && git push -q origin HEAD:refs/heads/main )
+TMPCLONE60="$(mktemp -d)"
+git clone -q "$BARE60" "$TMPCLONE60"
+echo "docv2-from-origin" > "$TMPCLONE60/.loom/docs/example.md"
+( cd "$TMPCLONE60" && git commit -aq -m "origin updates the managed doc" && git push -q origin HEAD:refs/heads/main )
+ORIGIN_TIP60="$(cd "$TMPCLONE60" && git rev-parse --short HEAD)"
+rm -rf "$TMPCLONE60"
+echo "docv1-local-edit" > "$W60/.loom/docs/example.md"
+# Stub resync-installed.sh at the installed-copy resolution path so we can
+# prove it was actually invoked post-roll, without exercising the real
+# script's defaults/-tree assumptions inside this minimal fixture.
+mkdir -p "$W60/.loom/scripts"
+RESYNC_MARKER60="$W60/resync-invoked-marker"
+cat > "$W60/.loom/scripts/resync-installed.sh" <<RESYNCEOF
+#!/usr/bin/env bash
+echo invoked > "$RESYNC_MARKER60"
+RESYNCEOF
+chmod +x "$W60/.loom/scripts/resync-installed.sh"
+NEW_FAKE60="$W60/new-fake-daemon"
+write_fake_daemon "$NEW_FAKE60" "$ORIGIN_TIP60" "$W60/new-marker"
+out60=$( cd "$W60" && PATH="$TEST_PATH" NEW_FAKE_BIN_SRC="$NEW_FAKE60" \
+    bash "$UPDATE_SCRIPT" --auto-resolve-safe-abort 2>&1 )
+rc60=$?
+assert_eq "0" "$rc60" "managed-only dirty file + --auto-resolve-safe-abort: auto-resolves and succeeds"
+HEAD_AFTER60="$(cd "$W60" && git rev-parse --short HEAD)"
+assert_eq "$ORIGIN_TIP60" "$HEAD_AFTER60" "managed-only dirty file + --auto-resolve-safe-abort: HEAD now equals origin/main's tip"
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ "$(cat "$W60/.loom/docs/example.md" 2>/dev/null)" == "docv2-from-origin" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} local edit was discarded; managed file now matches origin's post-merge content"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} local edit was discarded; managed file now matches origin's post-merge content"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ -f "$RESYNC_MARKER60" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} post-roll resync-installed.sh was actually invoked"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} post-roll resync-installed.sh was actually invoked"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out60" | grep -qi 'Auto-resolved'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} auto-resolve reports what it did"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} auto-resolve reports what it did"
+    echo "  output: $out60"
+fi
+
+# ============================================================
+# 61. Regression (#4951 safety floor): a dirty tracked file OUTSIDE the
+#     Loom-managed set (a top-level repo file, conflicting with origin's
+#     change) alongside ANOTHER dirty file that IS managed -- the "every
+#     blocking file" wording is conjunctive, not "any": one unmanaged dirty
+#     file must still force the generic hard abort, with NO auto-resolve
+#     attempted, even when --auto-resolve-safe-abort is passed.
+# ============================================================
+W61="$BASE_WORKDIR/w61"
+BARE61="$BASE_WORKDIR/w61-origin.git"
+new_fixture_with_origin "$W61" "$BARE61"
+mkdir -p "$W61/.loom/docs"
+echo "docv1" > "$W61/.loom/docs/example.md"
+echo "unmanagedv1" > "$W61/unmanaged-file.txt"
+( cd "$W61" && git add .loom/docs/example.md unmanaged-file.txt && git -c user.email=test@test -c user.name=test commit -q -m "add managed doc + unmanaged file" && git push -q origin HEAD:refs/heads/main )
+TMPCLONE61="$(mktemp -d)"
+git clone -q "$BARE61" "$TMPCLONE61"
+echo "unmanagedv2-from-origin" > "$TMPCLONE61/unmanaged-file.txt"
+( cd "$TMPCLONE61" && git commit -aq -m "origin updates the unmanaged file" && git push -q origin HEAD:refs/heads/main )
+rm -rf "$TMPCLONE61"
+# Dirty the UNMANAGED tracked file with a conflicting edit (blocks the
+# ff-merge) alongside a dirty MANAGED file (does not itself conflict, but
+# must not let the unmanaged one slip through).
+echo "unmanagedv1-local-edit" > "$W61/unmanaged-file.txt"
+echo "docv1-local-edit" > "$W61/.loom/docs/example.md"
+HEAD_BEFORE61="$(cd "$W61" && git rev-parse --short HEAD)"
+out61=$( cd "$W61" && PATH="$TEST_PATH" bash "$UPDATE_SCRIPT" --auto-resolve-safe-abort 2>&1 )
+rc61=$?
+assert_eq "1" "$rc61" "unmanaged dirty file alongside a managed one, EVEN with --auto-resolve-safe-abort: still hard-aborts"
+HEAD_AFTER61="$(cd "$W61" && git rev-parse --short HEAD)"
+assert_eq "$HEAD_BEFORE61" "$HEAD_AFTER61" "unmanaged dirty file case: HEAD untouched"
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ "$(cat "$W61/unmanaged-file.txt")" == "unmanagedv1-local-edit" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} unmanaged dirty file is left untouched -- no auto-resolve attempted"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} unmanaged dirty file is left untouched -- no auto-resolve attempted"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out61" | grep -qi 'Refusing to guess or hard-reset'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} mixed managed+unmanaged dirty: falls through to the generic hard-abort message"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} mixed managed+unmanaged dirty: falls through to the generic hard-abort message"
+    echo "  output: $out61"
+fi
+
+# ============================================================
+# 62. Regression (#4951 safety floor, Judge finding on PR #4965): the
+#     content-identical classifier compares only COMMITTED refs, so a host can
+#     simultaneously have (a) diverged local commits that net to zero content
+#     diff vs. origin (the test-57 shape) AND (b) an entirely unrelated dirty
+#     tracked file OUTSIDE the Loom-managed set. `git merge --ff-only` fails on
+#     the history divergence alone, so this branch is reached — and before the
+#     fix, _ff_abort_content_identical returned true regardless of the working
+#     tree, letting --auto-resolve-safe-abort `git reset --hard` silently
+#     destroy that file's uncommitted changes. It must hard-abort instead, with
+#     the dirty file byte-for-byte intact.
+# ============================================================
+W62="$BASE_WORKDIR/w62"
+BARE62="$BASE_WORKDIR/w62-origin.git"
+new_fixture_with_origin "$W62" "$BARE62"
+echo "scratchv1" > "$W62/unmanaged-scratch.txt"
+( cd "$W62" && git add unmanaged-scratch.txt && git -c user.email=test@test -c user.name=test commit -q -m "add unmanaged scratch file" && git push -q origin HEAD:refs/heads/main )
+# Origin advances with content-free commits, so the two sides' TREES stay
+# identical -- exactly the content-identical divergence of tests 57/58.
+push_extra_commits_to_origin "$BARE62" 2 >/dev/null
+( cd "$W62" && git -c user.email=test@test -c user.name=test commit -q --allow-empty -m "local commit that nets to no change" )
+# ... but now an unrelated, UNMANAGED tracked file is also dirty in the
+# working tree (an operator's manual scratch edit).
+echo "scratchv1-local-edit" > "$W62/unmanaged-scratch.txt"
+HEAD_BEFORE62="$(cd "$W62" && git rev-parse --short HEAD)"
+out62=$( cd "$W62" && PATH="$TEST_PATH" bash "$UPDATE_SCRIPT" --auto-resolve-safe-abort 2>&1 )
+rc62=$?
+assert_eq "1" "$rc62" "content-identical divergence + dirty UNMANAGED file, EVEN with --auto-resolve-safe-abort: still hard-aborts"
+HEAD_AFTER62="$(cd "$W62" && git rev-parse --short HEAD)"
+assert_eq "$HEAD_BEFORE62" "$HEAD_AFTER62" "content-identical divergence + dirty unmanaged file: HEAD untouched (no reset --hard)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ "$(cat "$W62/unmanaged-scratch.txt")" == "scratchv1-local-edit" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} uncommitted edit to an unmanaged file survives a content-identical divergence"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} uncommitted edit to an unmanaged file survives a content-identical divergence"
+    echo "  file now: $(cat "$W62/unmanaged-scratch.txt" 2>/dev/null)"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out62" | grep -qi 'Refusing to guess or hard-reset'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} content-identical + dirty unmanaged file falls through to the generic hard-abort message"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} content-identical + dirty unmanaged file falls through to the generic hard-abort message"
+    echo "  output: $out62"
+fi
+
+# ============================================================
+# 63. Same combined shape as test 62, but the co-existing dirty tracked file IS
+#     Loom-managed. The content-identical classifier must STILL decline (its
+#     `git reset --hard` is only vouched-for on a clean tree), handing the case
+#     to the managed-dirty classifier instead. That one discards the managed
+#     edit it is authorized to discard and retries the fast-forward, which
+#     still cannot apply over the history divergence -- so the run hard-aborts
+#     (exit 1) with local commits intact, rather than silently hard-resetting
+#     from the content-identical branch. Deliberately NOT resolved end-to-end:
+#     widening either classifier to cover the combination is exactly the kind
+#     of "when genuinely unsure" widening the #4381 safety note forbids.
+# ============================================================
+W63="$BASE_WORKDIR/w63"
+BARE63="$BASE_WORKDIR/w63-origin.git"
+new_fixture_with_origin "$W63" "$BARE63"
+mkdir -p "$W63/.loom/docs"
+echo "docv1" > "$W63/.loom/docs/example.md"
+( cd "$W63" && git add .loom/docs/example.md && git -c user.email=test@test -c user.name=test commit -q -m "add managed doc" && git push -q origin HEAD:refs/heads/main )
+push_extra_commits_to_origin "$BARE63" 2 >/dev/null
+( cd "$W63" && git -c user.email=test@test -c user.name=test commit -q --allow-empty -m "local commit that nets to no change" )
+echo "docv1-local-edit" > "$W63/.loom/docs/example.md"
+HEAD_BEFORE63="$(cd "$W63" && git rev-parse --short HEAD)"
+out63=$( cd "$W63" && PATH="$TEST_PATH" bash "$UPDATE_SCRIPT" --auto-resolve-safe-abort 2>&1 )
+rc63=$?
+assert_eq "1" "$rc63" "content-identical divergence + dirty MANAGED file, EVEN with --auto-resolve-safe-abort: still hard-aborts"
+HEAD_AFTER63="$(cd "$W63" && git rev-parse --short HEAD)"
+assert_eq "$HEAD_BEFORE63" "$HEAD_AFTER63" "content-identical divergence + dirty managed file: HEAD untouched (no reset --hard)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out63" | grep -qi 'reset local main to origin/main'; then
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} content-identical branch never claims a reset --hard while the tree is dirty"
+    echo "  output: $out63"
+else
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} content-identical branch never claims a reset --hard while the tree is dirty"
 fi
 
 # ============================================================
