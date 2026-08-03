@@ -24,6 +24,7 @@ import {
   formatRelative,
   formatCount,
   formatText,
+  roleTickSummaryText,
   secondsSince,
 } from "../format";
 import type { HostView } from "../fleet";
@@ -85,6 +86,11 @@ function healthPanel(host: HostView, now: Date): HTMLElement {
       field("CPU idle", formatPercent(health.cpu_idle_fraction, 1)),
       field("Load per core", formatRatio(health.load_per_core)),
       field("Worktree root free", formatGigabytes(health.worktree_root_free_gb)),
+      field(
+        "Role ticks",
+        roleTickSummaryText(health.roles),
+        "loom-daemon health's own roles section, carried through telemetry (#5022)",
+      ),
       field(
         "Captured at",
         health.captured_at ? formatAbsolute(health.captured_at) : UNKNOWN,

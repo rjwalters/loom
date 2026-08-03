@@ -21,6 +21,7 @@ import {
   SWEEP_ONLY_HOST_ID,
   isoMinutesBefore,
   multiHostSnapshot,
+  persistentRoleTickFailureFixture,
 } from "./fixtures";
 
 const view = () => buildFleetView(parseFleetSnapshot(multiHostSnapshot()), NOW);
@@ -200,6 +201,31 @@ describe("distressReason / isHostDistressed (#4975)", () => {
     // A real busy host dips well above the near-zero line.
     expect(isHostDistressed({ cpu_idle_fraction: 0.2 })).toBe(false);
   });
+
+  // #5022: role-tick health.
+  it("names the failing role(s) when roles has a persistent failure", () => {
+    const reason = distressReason({
+      roles: { total: 3, ok: 1, persistent: [{ root: "/repos/loom", role: "judge", failures: 2 }] },
+    });
+    expect(reason).toBe("role tick(s) persistently failing: judge @ loom");
+  });
+
+  it("is not distressed when roles reports every tick ok", () => {
+    expect(isHostDistressed({ roles: { total: 12, ok: 12, persistent: [] } })).toBe(false);
+  });
+
+  it("is not distressed when roles reports zero ticks sampled (role runner idle/disabled)", () => {
+    expect(isHostDistressed({ roles: { total: 0, ok: 0, persistent: [] } })).toBe(false);
+  });
+
+  it("takes priority over the load/idle heuristic fallbacks, same as dispatch_halted", () => {
+    const reason = distressReason({
+      roles: { total: 2, ok: 0, persistent: [{ root: "/repos/loom", role: "guide", failures: 2 }] },
+      load_per_core: 0.1,
+      cpu_idle_fraction: 0.9,
+    });
+    expect(reason).toBe("role tick(s) persistently failing: guide @ loom");
+  });
 });
 
 describe("buildFleetView host-distress classification (#4975)", () => {
@@ -229,6 +255,18 @@ describe("buildFleetView host-distress classification (#4975)", () => {
     const host = findHost(built, "h");
     expect(host?.status).toBe("ok");
     expect(host?.degradedReason).toBeUndefined();
+  });
+
+  it("goes degraded when roles reports a persistent tick failure, independent of load/tokens (#5022)", () => {
+    const built = buildFleetView(snapshotFor({ roles: persistentRoleTickFailureFixture() }), NOW);
+    const host = findHost(built, "h");
+    expect(host?.status).toBe("degraded");
+    expect(host?.degradedReason).toBe("role tick(s) persistently failing: judge @ loom");
+  });
+
+  it("stays ok when roles reports zero ticks sampled (role runner idle/disabled) — not an error state", () => {
+    const built = buildFleetView(snapshotFor({ roles: { total: 0, ok: 0, persistent: [] } }), NOW);
+    expect(findHost(built, "h")?.status).toBe("ok");
   });
 
   it("names the token-exhaustion reason when that is the only trigger", () => {

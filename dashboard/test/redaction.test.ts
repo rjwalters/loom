@@ -267,6 +267,78 @@ describe("redactPayload — per-kind field allowlist", () => {
     expect(redactPayload("host.health", payload)).toEqual(payload);
   });
 
+  it("host.health: role-tick health (roles) survives redaction, but each persistent root is basenamed for the public view (#5022)", () => {
+    // The counts and each failure's role/detail survive (they describe the
+    // machine, not the work), but the workspace `root` is a full absolute
+    // filesystem path whose home-directory segment names the operator on the
+    // common macOS/Linux layout — so the public, unauthenticated surface only
+    // ever gets its basename, mirroring the daemon's `RoleFailure::label()`
+    // and the frontend's `pathBasename`.
+    const payload = {
+      kind: "host.health",
+      captured_at: "2026-08-02T12:00:00Z",
+      daemon_version: "0.17.0",
+      uptime_sec: 86400,
+      logical_cpus: 28,
+      roles: {
+        total: 3,
+        ok: 1,
+        persistent: [
+          {
+            root: "/Users/alice/GitHub/loom",
+            role: "judge",
+            failures: 2,
+            last_at: "2026-08-02T11:59:00Z",
+            detail: "no-token-pool",
+          },
+        ],
+      },
+    };
+    const redacted = redactPayload("host.health", payload);
+    // Counts and non-path detail survive unchanged.
+    expect(redacted).toMatchObject({
+      kind: "host.health",
+      captured_at: "2026-08-02T12:00:00Z",
+      daemon_version: "0.17.0",
+      uptime_sec: 86400,
+      logical_cpus: 28,
+    });
+    expect(redacted.roles).toEqual({
+      total: 3,
+      ok: 1,
+      persistent: [
+        {
+          // Basenamed — the operator-identifying home-directory prefix is gone.
+          root: "loom",
+          role: "judge",
+          failures: 2,
+          last_at: "2026-08-02T11:59:00Z",
+          detail: "no-token-pool",
+        },
+      ],
+    });
+    // The raw absolute path (and its operator-identifying username segment)
+    // never reaches the public surface, in any field.
+    expect(JSON.stringify(redacted)).not.toContain("/Users/alice");
+    expect(JSON.stringify(redacted)).not.toContain("alice");
+  });
+
+  it("host.health: no roles key at all when the payload carries no role-tick summary (#5022)", () => {
+    const payload = { kind: "host.health", daemon_version: "0.17.0", uptime_sec: 100 };
+    expect(redactPayload("host.health", payload)).not.toHaveProperty("roles");
+  });
+
+  it("host.health: a total: 0 role-tick summary round-trips distinctly (no persistent list) (#5022)", () => {
+    const payload = {
+      kind: "host.health",
+      daemon_version: "0.17.0",
+      uptime_sec: 100,
+      roles: { total: 0, ok: 0 },
+    };
+    const redacted = redactPayload("host.health", payload);
+    expect(redacted.roles).toEqual({ total: 0, ok: 0 });
+  });
+
   it("host.health: a private repo's slug is redacted, but every other field survives unchanged (#4976)", () => {
     const payload = {
       kind: "host.health",

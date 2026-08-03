@@ -17,7 +17,7 @@
  *   healthy and must still render its health/token panel.
  */
 
-import { secondsSince } from "./format";
+import { roleFailureLabel, secondsSince } from "./format";
 import type { ActiveSweep, FleetSnapshot, HostEntry, HostHealthRecord, TokenAccount } from "./types";
 
 /**
@@ -165,18 +165,24 @@ const ZERO_IDLE_FRACTION_THRESHOLD = 0.02;
 
 /**
  * Why a host looks distressed, in priority order, or `undefined` when it
- * does not. `dispatch_halted` (a sustained, stateful signal the daemon
- * itself computed — see `host_breaker.rs`'s module doc) is checked first and
- * named with its own reason; the load/idle checks below it are same-number,
- * single-sample fallbacks for a host whose daemon predates/disables that
- * field. A host that is merely busy — high load, but still admitting new
- * dispatch and idle well above zero — returns `undefined` here and stays
- * `"ok"` (busy ≠ degraded, #4975).
+ * does not. `dispatch_halted` and `roles.persistent` (both sustained,
+ * stateful signals the daemon itself computed — see `host_breaker.rs`'s
+ * module doc and `crate::health::summarize_role_ticks`, #5022) are checked
+ * first and named with their own reason; the load/idle checks below them are
+ * same-number, single-sample fallbacks for a host whose daemon
+ * predates/disables those fields. A host that is merely busy — high load,
+ * but still admitting new dispatch and idle well above zero — returns
+ * `undefined` here and stays `"ok"` (busy ≠ degraded, #4975).
  */
 export function distressReason(health: HostHealthRecord | undefined): string | undefined {
   if (!health) return undefined;
   if (health.dispatch_halted) {
     return health.halt_reason ? `dispatch halted: ${health.halt_reason}` : "dispatch halted";
+  }
+  const persistentRoleFailures = health.roles?.persistent ?? [];
+  if (persistentRoleFailures.length > 0) {
+    const names = persistentRoleFailures.map(roleFailureLabel).join(", ");
+    return `role tick(s) persistently failing: ${names}`;
   }
   if (health.load_per_core !== undefined && health.load_per_core >= HOST_DISTRESS_LOAD_PER_CORE) {
     return `load/core ${health.load_per_core.toFixed(2)} at or above the host-distress threshold (${HOST_DISTRESS_LOAD_PER_CORE})`;

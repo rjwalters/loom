@@ -23,6 +23,8 @@ import type {
   HostEntry,
   HostHealthRecord,
   ManagedRepoEntry,
+  RoleTickFailure,
+  RoleTickHealth,
   TokenAccount,
   TokensSnapshotRecord,
   Timestamped,
@@ -60,6 +62,34 @@ export function parseManagedRepoEntry(value: unknown): ManagedRepoEntry | undefi
   });
 }
 
+/** A `roles.persistent` entry. `root`/`role` degrade to `undefined` (not a
+ * fabricated empty string) when wrong-typed, matching every other
+ * best-effort field this module narrows. */
+export function parseRoleTickFailure(value: unknown): RoleTickFailure | undefined {
+  if (!isObject(value)) return undefined;
+  return stripUndefined<RoleTickFailure>({
+    root: str(value.root),
+    role: str(value.role),
+    failures: num(value.failures),
+    last_at: str(value.last_at),
+    detail: str(value.detail),
+  });
+}
+
+/** `host.health`'s `roles` summary (#5022). A genuine `total: 0` (the role
+ * runner sampled nothing this snapshot) survives untouched — `num()` only
+ * drops a missing or wrong-typed value, never a real zero. */
+export function parseRoleTickHealth(value: unknown): RoleTickHealth | undefined {
+  if (!isObject(value)) return undefined;
+  return stripUndefined<RoleTickHealth>({
+    total: num(value.total),
+    ok: num(value.ok),
+    persistent: Array.isArray(value.persistent)
+      ? value.persistent.map(parseRoleTickFailure).filter((entry): entry is RoleTickFailure => entry !== undefined)
+      : undefined,
+  });
+}
+
 export function parseHostHealth(value: unknown): HostHealthRecord {
   if (!isObject(value)) return {};
   return stripUndefined<HostHealthRecord>({
@@ -78,6 +108,7 @@ export function parseHostHealth(value: unknown): HostHealthRecord {
     managed_repos: Array.isArray(value.managed_repos)
       ? value.managed_repos.map(parseManagedRepoEntry).filter((entry): entry is ManagedRepoEntry => entry !== undefined)
       : undefined,
+    roles: parseRoleTickHealth(value.roles),
   });
 }
 

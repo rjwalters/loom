@@ -51,6 +51,7 @@ use chrono::{DateTime, Utc};
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;
+use std::path::PathBuf;
 
 pub mod visibility;
 
@@ -434,6 +435,57 @@ pub struct TokenSnapshotRecord {
     pub accounts: Vec<TokenAccountState>,
 }
 
+/// One `(root, role)` pair's persistent tick-failure detail inside a host's
+/// role-tick health summary (`host.health`'s `roles` field, Issue #5022).
+/// Mirrors `crate::health::RoleFailure`'s shape — `loom-daemon health`'s
+/// `roles` section already classifies exactly this
+/// (`crate::health::summarize_role_ticks`), so the telemetry pipeline carries
+/// the same classification rather than inventing a second one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RoleTickFailureEntry {
+    /// The workspace root this tick ran for.
+    pub root: PathBuf,
+    /// The role name (`champion`, `curator`, …).
+    pub role: String,
+    /// How many ticks failed for this pair inside the sampled window.
+    pub failures: usize,
+    /// When the most recent record for this pair landed.
+    pub last_at: DateTime<Utc>,
+    /// The most recent failure detail, when the tick reported one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// `host.health`'s role-tick health summary (Issue #5022): the same
+/// transient-vs-persistent classification `loom-daemon health`'s `roles`
+/// section already computes (`crate::health::summarize_role_ticks`), carried
+/// through the telemetry pipeline so a role dying on one host is observable
+/// fleet-wide — not only to an operator who happens to run `loom-daemon
+/// health` locally on that one host. That gap is exactly what #5004 found: a
+/// Judge outage stayed green on every other signal for most of a day.
+///
+/// Deliberately narrower than `crate::health::RoleTickSummary`: only
+/// `persistent` failures are carried — the `(root, role)` pairs whose most
+/// recent tick in the sampled window is still a failure, i.e. the ones that
+/// make `loom-daemon health`'s `roles` section report `DEGRADED`. `transient`
+/// (self-recovered) pairs are folded into `total`/`ok` like every other tick,
+/// exactly as the rendered `roles` summary line already treats them: a count,
+/// not alarming detail.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RoleTickHealth {
+    /// Total tick records sampled.
+    pub total: usize,
+    /// Successful tick records sampled.
+    pub ok: usize,
+    /// `(root, role)` pairs whose latest sampled record is a failure.
+    ///
+    /// `total: 0` (no ticks sampled — the role runner idle or disabled) means
+    /// "nothing to report", not "healthy": a consumer must not read an empty
+    /// `persistent` list on its own as proof the role runner is even running.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub persistent: Vec<RoleTickFailureEntry>,
+}
+
 /// `host.health` — host CPU/disk headroom plus the emitting binary's identity
 /// (version + build commit + build time) and uptime.
 /// Host-level: it references no repository, so it carries no visibility tag.
@@ -532,6 +584,17 @@ pub struct HostHealthRecord {
     /// backward-compatibility contract `active_sweep_ids` established.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub managed_repos: Vec<ManagedRepoEntry>,
+    /// This host's role-tick health (Issue #5022): mirrors `loom-daemon
+    /// health`'s `roles` section verdict inputs, carried through the
+    /// telemetry pipeline so a role dying on one host is observable
+    /// fleet-wide rather than only to an operator running `loom-daemon
+    /// health` locally on that host.
+    ///
+    /// `#[serde(default)]` so a record from a pre-#5022 daemon still decodes
+    /// (as the zero-value "no role ticks sampled" summary) rather than
+    /// failing the whole envelope.
+    #[serde(default)]
+    pub roles: RoleTickHealth,
 }
 
 /// One repository this host's daemon is currently managing (Issue #4976) —
@@ -682,6 +745,17 @@ mod tests {
                     visibility: RepoVisibility::Private,
                 },
             ],
+            roles: RoleTickHealth {
+                total: 12,
+                ok: 10,
+                persistent: vec![RoleTickFailureEntry {
+                    root: PathBuf::from("/repos/loom"),
+                    role: "judge".to_string(),
+                    failures: 2,
+                    last_at: ts(),
+                    detail: Some("no-token-pool".to_string()),
+                }],
+            },
         })
     }
 
@@ -906,6 +980,7 @@ mod tests {
             dispatch_halted: false,
             halt_reason: None,
             managed_repos: Vec::new(),
+            roles: RoleTickHealth::default(),
         });
         let value = serde_json::to_value(&record).unwrap();
         assert!(
@@ -999,6 +1074,7 @@ mod tests {
             dispatch_halted: false,
             halt_reason: None,
             managed_repos: Vec::new(),
+            roles: RoleTickHealth::default(),
         });
         let value = serde_json::to_value(&record).unwrap();
         assert!(
@@ -1036,5 +1112,91 @@ mod tests {
         let decoded: ManagedRepoEntry = serde_json::from_str(json).unwrap();
         assert_eq!(decoded.visibility, RepoVisibility::Private);
         assert_eq!(decoded.slug, "owner/repo");
+    }
+
+    // ------------------------------------------------------------------
+    // host.health role-tick health (#5022).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn host_health_serializes_role_tick_health_persistent_failures() {
+        let value = serde_json::to_value(host_health()).unwrap();
+        let roles = value.get("roles").unwrap();
+        assert_eq!(roles.get("total").and_then(serde_json::Value::as_u64), Some(12));
+        assert_eq!(roles.get("ok").and_then(serde_json::Value::as_u64), Some(10));
+        let persistent = roles
+            .get("persistent")
+            .and_then(serde_json::Value::as_array)
+            .unwrap();
+        assert_eq!(persistent.len(), 1);
+        assert_eq!(
+            persistent[0]
+                .get("role")
+                .and_then(serde_json::Value::as_str),
+            Some("judge")
+        );
+        assert_eq!(
+            persistent[0]
+                .get("detail")
+                .and_then(serde_json::Value::as_str),
+            Some("no-token-pool")
+        );
+    }
+
+    #[test]
+    fn host_health_omits_persistent_when_empty_but_still_carries_roles() {
+        // A `total: 0` (or all-ok) summary must still be sent — "no role
+        // ticks sampled" / "every tick ok" is meaningful information, not
+        // nothing to report — but its empty `persistent` list is omitted from
+        // the wire, mirroring `managed_repos`/`active_sweep_ids`.
+        let record = TelemetryRecord::HostHealth(HostHealthRecord {
+            captured_at: ts(),
+            daemon_version: "0.17.0".to_string(),
+            build_commit: "unknown".to_string(),
+            built_at: None,
+            uptime_sec: 1,
+            logical_cpus: 4,
+            cpu_idle_fraction: None,
+            load_per_core: None,
+            worktree_root_free_gb: None,
+            active_sweep_ids: Vec::new(),
+            dispatch_halted: false,
+            halt_reason: None,
+            managed_repos: Vec::new(),
+            roles: RoleTickHealth {
+                total: 5,
+                ok: 5,
+                persistent: Vec::new(),
+            },
+        });
+        let value = serde_json::to_value(&record).unwrap();
+        let roles = value.get("roles").unwrap();
+        assert_eq!(roles.get("total").and_then(serde_json::Value::as_u64), Some(5));
+        assert!(roles.get("persistent").is_none());
+        let decoded: TelemetryRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, record);
+    }
+
+    #[test]
+    fn host_health_from_a_pre_5022_daemon_decodes_with_a_zero_value_roles_summary() {
+        // Backward compatibility: a record emitted by a daemon that predates
+        // role-tick health must decode with the zero-value ("nothing sampled")
+        // summary, never fail the whole envelope.
+        let json = r#"{
+            "kind": "host.health",
+            "captured_at": "2026-07-30T12:00:00Z",
+            "daemon_version": "0.16.0",
+            "uptime_sec": 86400,
+            "logical_cpus": 28
+        }"#;
+        let decoded: TelemetryRecord = serde_json::from_str(json).unwrap();
+        match decoded {
+            TelemetryRecord::HostHealth(r) => {
+                assert_eq!(r.roles, RoleTickHealth::default());
+                assert_eq!(r.roles.total, 0);
+                assert!(r.roles.persistent.is_empty());
+            }
+            other => panic!("expected HostHealth, got {other:?}"),
+        }
     }
 }
