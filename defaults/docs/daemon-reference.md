@@ -4965,7 +4965,119 @@ manually rebuilt the Rust binary, reprovisioned it, and restarted the process.
 ./.loom/scripts/cli/loom-daemon-update.sh --force       # rebuild + provision + restart even if already up to date
 ./.loom/scripts/cli/loom-daemon-update.sh --no-restart  # rebuild + provision only; leave the running daemon untouched
 ./.loom/scripts/cli/loom-daemon-update.sh --relaunch    # launchd only: after a refused restart, re-render the plist + relaunch under supervision (preserves the live plist's LOOM_* env)
+./.loom/scripts/cli/loom-daemon-update.sh --fetch        # REQUIRE a verified release artifact (never silently fall back to a source build); exit 1 if none resolves
+./.loom/scripts/cli/loom-daemon-update.sh --no-fetch     # never consider release artifacts; always build from local source (pre-#5020 behavior)
 ```
+
+#### Artifact-based self-update (epic #4990 Phase 3, #5020)
+
+By default the script now **prefers a prebuilt GitHub Release artifact over a
+local `cargo build --release`**, so a CPU-saturated host — or one with no Rust
+toolchain installed at all — converges onto the latest release without ever
+compiling. This is the consumer side of the release artifacts published by
+Phase 1 (#5003) and signed by Phase 2 (#5011).
+
+**Precedence (three-state, `FETCH_MODE`)**
+
+| Mode | How to select | Behavior |
+|------|---------------|----------|
+| `auto` (**default**) | — | Prefer a verified artifact when one resolves; **softly** fall back to the source build otherwise |
+| `force` | `--fetch` / `LOOM_DAEMON_UPDATE_FETCH=1` | Require an artifact; **exit 1** rather than silently building from source |
+| `off` | `--no-fetch` / `LOOM_DAEMON_UPDATE_FETCH=0` | Never fetch; always build from local source |
+
+An artifact is used only when the latest release's version is **strictly newer**
+than the installed daemon's (an *equal* version wins only under an explicit
+`--fetch`; plain `--force` keeps meaning "rebuild this checkout"), the host's
+platform maps to one of the release target triples
+(`aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`),
+and that release actually publishes `loom-daemon-<target>` **and** its
+`.sha256`. Everything else — an unrecognized platform, no `gh` CLI, no Releases
+(a fork), an unreachable or rate-limited GitHub API, a release with no artifact
+for this platform — is a **soft** fallback to the existing source-build path, so
+dev machines, canaries, and forks behave exactly as before.
+
+**Verification (epic design principle 2: checksum always, signature when present)**
+
+- **Checksum — unconditional.** The downloaded binary is compared against the
+  release's `.sha256`. A mismatch **aborts the whole update (exit 1)** and leaves
+  the running daemon untouched; it is never downgraded to a source-build fallback,
+  because a mismatch is tamper/corruption evidence, not a resolution failure.
+- **Signature — only when present, and never blocking by its absence.**
+  - macOS: verified in-binary via `codesign --verify --strict`. "Not signed at
+    all" (a release built without the Developer ID secrets) is an expected
+    **soft-skip**; "signed but verification fails" is treated as tamper evidence
+    and **aborts (exit 1)**.
+  - Linux: the detached `loom-daemon-<target>.sig` (published only when the
+    release was built with a cosign key) is verified with `cosign verify-blob`.
+    If `cosign` is missing, or no public key is resolvable, the script emits a
+    **loud skip** and proceeds — no cosign public key is distributed with this
+    repo yet. Point `LOOM_DAEMON_UPDATE_COSIGN_PUBKEY` at a key (or commit one at
+    `.loom/cosign.pub` / `defaults/cosign.pub`) to turn that skip into real
+    verification. A resolvable key plus a failing verification **aborts (exit 1)**.
+
+**Provisioning and restart are unchanged.** A verified artifact goes through the
+*same* `provision_machine_daemon()` seam as a freshly compiled binary (no parallel
+provisioning logic), and the same supervised launchd/systemd/pid-file restart
+tiers (#4054/#4950). Two artifact-specific adjustments:
+
+- **Post-provision verification** uses `verify_destination_artifact()` instead of
+  the source path's embedded-commit compare (a release's commit is unrelated to
+  the local checkout's HEAD). It asserts the destination's full `--version` string
+  equals the verified artifact's — the same string `provision_machine_daemon()`'s
+  version-equality short-circuit compares, so a silent no-op roll still exits `5`.
+- **Signing is skipped** for fetched binaries, and `sign_daemon_binary()` now
+  refuses to re-sign any binary that already carries a certificate-backed
+  signature (`codesign -dvvv` reports an `Authority=`). Without that guard, the
+  belt-and-braces ad-hoc re-sign inside `provision_machine_daemon()` would
+  silently *downgrade* a Developer ID-signed release artifact to ad-hoc on every
+  provision. A locally built binary is always ad-hoc, so this changes nothing for
+  the source path.
+
+**Interaction with the autonomous loop's staleness check (worth knowing).** The
+loop's own staleness signal is still *embedded commit vs. local source HEAD*. On a
+host whose checkout is **ahead of the latest release** (the usual state for a
+development host), a newly published release therefore costs one extra roll: the
+artifact is fetched and installed first, then the next tick still sees the
+installed release commit ≠ local HEAD and rebuilds from source, superseding it.
+That is deliberate, converges (the source build's version equals the release's, so
+no artifact wins afterwards — there is no ping-pong), and is the right trade on the
+hosts this exists for: a saturated host reaches the release *immediately* instead
+of waiting out the up-to-6h build-stampede deferral, and a host with no Rust
+toolchain simply stays on the release (its source-build attempt fails as retryable
+and never displaces it). Hosts that want only source builds can set
+`LOOM_DAEMON_UPDATE_FETCH=0`.
+
+**Still requires a source checkout.** This phase changes *what gets installed*,
+not the script's entry conditions: `loom-daemon/Cargo.toml` must still exist (the
+script also uses the checkout to resolve `origin`'s `owner/repo` slug). Removing
+that requirement for binary-only installs is out of scope here.
+
+Concretely, artifact resolution runs *after* the ff-first sync with
+`origin/<default-branch>` (#4330), so a checkout that hard-aborts that sync
+(genuine divergence, unmanaged dirty tracked files) still exits `2` before any
+artifact is considered — pass `--allow-stale` to skip the sync entirely and go
+straight to resolution, or fix the checkout. This is unchanged pre-existing
+behavior, not something the fetch path introduces, but it does mean "no Rust
+toolchain" is not the same as "no git checkout hygiene".
+
+**Extra environment variables** (all optional; the first three are primarily test
+seams):
+
+| Variable | Purpose |
+|----------|---------|
+| `LOOM_DAEMON_UPDATE_FETCH` | `1`/`true`/`yes` ⇒ force (`--fetch`); `0`/`false`/`no` ⇒ off (`--no-fetch`); unset ⇒ auto |
+| `LOOM_DAEMON_UPDATE_GH_REPO` | Override the `owner/repo` slug used for release resolution (default: parsed from the `origin` remote) |
+| `LOOM_DAEMON_UPDATE_TARGET` | Override the detected release target triple |
+| `LOOM_DAEMON_UPDATE_COSIGN_PUBKEY` | Path to the cosign public key used to verify a Linux `.sig` |
+
+**No new daemon config keys.** The autonomous self-update loop
+(`autonomous.autoUpdate.*`) needs no change and passes no fetch flag: it invokes
+`loom-daemon-update.sh --no-restart` and inherits the `auto` default, which is
+exactly the unattended behavior it wants (prefer an artifact, degrade to a
+rebuild). It deliberately does **not** pass `--fetch`, since that would turn a
+transient GitHub API hiccup into a failed roll. The existing exit-code contract is
+unchanged: a checksum/signature failure maps to exit `1` (retryable, same bucket
+as a failed `cargo build`), so `classify_exit` needs no new cases.
 
 **Launchd refused-restart fallback (`--relaunch`, exit 6, #4118)**: on the
 FIRST roll onto a #4077-capable binary the *running* (old) daemon has no
@@ -5066,8 +5178,10 @@ Self-update: built from ab12cd3 — UPDATE AVAILABLE (source checkout HEAD is de
 ```
 
 `loom-daemon-update.sh` requires an actual Loom source checkout
-(`loom-daemon/Cargo.toml` must exist) — it rebuilds from source and refuses to
-run against a binary-only / release-tarball install.
+(`loom-daemon/Cargo.toml` must exist) and refuses to run against a binary-only /
+release-tarball install — even when it ends up installing a prebuilt release
+artifact rather than rebuilding (see
+[Artifact-based self-update](#artifact-based-self-update-epic-4990-phase-3-5020)).
 
 ### Autonomous self-update loop (#4055)
 

@@ -32,9 +32,19 @@
 # entirely) for deliberate use (bisecting, testing a local patch) — see below.
 #
 # It:
-#   - detects whether the resolved binary is stale vs. the local source tree,
+#   - detects whether the resolved binary is stale vs. the local source tree
+#     (or, in artifact-fetch mode, vs. the latest GitHub Release — see below),
+#   - Artifact-fetch mode (Epic #4990 Phase 3, #5020, ON by default, opt out
+#     with --no-fetch): resolves the latest GitHub Release with version >=
+#     the installed daemon and, when that release publishes an artifact for
+#     this host's platform, downloads + verifies it (checksum unconditional,
+#     signature when present) INSTEAD of rebuilding from source — a
+#     saturated host with no Rust toolchain converges on a release alone.
+#     Resolution failure of any kind (unrecognized platform, no `gh` CLI, no
+#     Releases yet, API unreachable, no artifact for this platform) SOFTLY
+#     falls back to the rebuild path below (--fetch instead hard-fails).
 #   - rebuilds (`cargo build --release`) in loom-daemon/ when stale (or
-#     --force),
+#     --force) AND no artifact was fetched,
 #   - provisions the fresh binary to wherever the resolved binary lives
 #     (LOOM_DAEMON_BIN override, else the machine-level ~/.local/bin install
 #     via scripts/install/provision-daemon.sh, matching #3922's convention),
@@ -127,9 +137,30 @@
 #   ./.loom/scripts/cli/loom-daemon-update.sh --relaunch    Launchd/systemd only: after a refused restart, re-render the plist/unit and relaunch under supervision (SIGTERMs the daemon so sweep children reparent; preserves the live LOOM_* env)
 #   ./.loom/scripts/cli/loom-daemon-update.sh --allow-stale Skip the default ff-first sync with origin/<default-branch> and build the current (possibly stale) checkout as-is (#4330) — for deliberate use: bisecting, testing a local patch
 #   ./.loom/scripts/cli/loom-daemon-update.sh --auto-resolve-safe-abort  When the ff-only sync would otherwise hard-abort (#4330), auto-perform the fix IF the blocking state classifies as safe (#4951): content-identical diverged commits with an otherwise-CLEAN working tree (`git reset --hard origin/<default-branch>`), or dirty tracked files that are ALL Loom-managed installed copies (`git checkout --` them + re-run resync-installed.sh). Any other cause (genuine content divergence, any unmanaged dirty file, or a dirty tracked file co-existing with the content-identical divergence) still hard-aborts unchanged — this flag never widens what's classified as safe, only whether the safe cases are printed (default) or performed
+#   ./.loom/scripts/cli/loom-daemon-update.sh --fetch        Artifact-fetch mode (Epic #4990 Phase 3, #5020): REQUIRE a verified GitHub Release artifact for this host's platform (resolve latest Release >= installed version, download, verify checksum unconditionally + signature when present, provision) instead of `cargo build --release`; hard-fails (exit 1) rather than silently falling back to a source build when no matching artifact resolves. Same as LOOM_DAEMON_UPDATE_FETCH=1.
+#   ./.loom/scripts/cli/loom-daemon-update.sh --no-fetch      Disable artifact-fetch mode entirely; always use the local source-build path (pre-#5020 behavior). Same as LOOM_DAEMON_UPDATE_FETCH=0.
 #   ./.loom/scripts/cli/loom-daemon-update.sh --help
 #
 # Environment:
+#   LOOM_DAEMON_UPDATE_FETCH  Artifact-fetch precedence (Epic #4990 Phase 3,
+#                          #5020): 1/true/yes forces it (same as --fetch,
+#                          hard-fails without a matching artifact); 0/false/no
+#                          disables it (same as --no-fetch); unset (default)
+#                          is "auto" — prefer a verified artifact when one
+#                          resolves, else soft-fall-back to the source build.
+#   LOOM_DAEMON_UPDATE_GH_REPO  Override the "owner/repo" slug used to
+#                          resolve GitHub Releases (else parsed from the
+#                          `origin` git remote).
+#   LOOM_DAEMON_UPDATE_TARGET  Override the release target triple this host
+#                          resolves to (else auto-detected from `uname -s -m`,
+#                          e.g. aarch64-apple-darwin) — mainly for tests.
+#   LOOM_DAEMON_UPDATE_COSIGN_PUBKEY  Path to the cosign public key used to
+#                          verify a Linux release's detached `.sig` (else a
+#                          conventional checked-in `.loom/cosign.pub` /
+#                          `defaults/cosign.pub` if present). No key is
+#                          committed to this repo as of Phase 2 (#5011), so
+#                          by default a present `.sig` is a LOUD SKIP, not a
+#                          block — see verify_artifact_signature.
 #   LOOM_DAEMON_BIN       Path to the loom-daemon binary (else auto-detected,
 #                          same resolution as loom-daemon-start.sh). When set,
 #                          the fresh binary is provisioned directly to this
@@ -204,7 +235,13 @@
 #      installed copies — by default these still
 #      exit 1 but the abort message names the exact safe command; pass
 #      --auto-resolve-safe-abort to have the script perform it instead (exit
-#      0 on success). Any other cause still hard-aborts unchanged.
+#      0 on success). Any other cause still hard-aborts unchanged. Also used
+#      by artifact-fetch mode (#5020) for: a checksum mismatch on a
+#      downloaded artifact (unconditional — leaves the running daemon
+#      untouched), a signature-verification failure on a PRESENT signature
+#      (distinct from "unsigned", which is not an error), and --fetch given
+#      with no matching release artifact resolvable (refuses to silently
+#      fall back to a source build).
 #   3  (--check only) update available
 #   4  build verification FAILED: the freshly-built binary's embedded commit
 #      does not match the source HEAD it was built from. This is a BUILD-SYSTEM
@@ -315,6 +352,347 @@ locate_daemon_bin() { loom_locate_daemon_bin "$1"; }
 # "loom-daemon 0.15.0 (commit ab12cd3, built 2026-07-26T12:00:00Z)" -> ab12cd3
 extract_commit() {
     echo "$1" | grep -oE 'commit [0-9a-f]+' | head -n1 | awk '{print $2}'
+}
+
+# Extract the semver from `loom-daemon --version` output, e.g.
+# "loom-daemon 0.15.0 (commit ab12cd3, ...)" -> 0.15.0
+extract_version() {
+    echo "$1" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1
+}
+
+# =====================================================================
+# Artifact-fetch mode (Epic #4990 Phase 3, #5020)
+# =====================================================================
+#
+# Phase 1 (#5003) and Phase 2 (#5011/#5018) publish, on every GitHub Release,
+# `loom-daemon-<target>` + `<...>.sha256` for every fleet target triple
+# (`aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`,
+# `aarch64-unknown-linux-gnu`), plus an OPTIONAL Linux-only `<...>.sig`
+# (detached cosign signature) when a cosign key secret was configured for
+# that release. macOS artifacts are signed IN PLACE (embedded Developer ID
+# signature, no separate asset) when the signing secrets were configured;
+# there is no way to tell from the filename alone whether a given release's
+# macOS asset is signed.
+#
+# This section resolves the latest Release with version >= the currently
+# installed daemon, downloads the artifact for the host's own platform +
+# its checksum (and signature, when present), and verifies both:
+#   - checksum: UNCONDITIONAL. A mismatch hard-aborts the whole update
+#     (exit 1) and leaves the running daemon untouched -- this is a
+#     tamper/corruption signal, never a soft-fallback condition.
+#   - signature: verified ONLY when present. macOS: `codesign --verify
+#     --strict` against the downloaded binary (distinguishes "not signed"
+#     -- expected, soft-skip -- from "signed but verification failed" --
+#     abort). Linux: detached `.sig` via `cosign verify-blob`, only when
+#     both `cosign` and a public key are resolvable; otherwise a LOUD skip
+#     (never a block) per the epic's design principle 2. Absence of a
+#     signature never blocks the update.
+#
+# Any OTHER resolution failure (unrecognized host platform, no `gh` CLI, no
+# Releases yet, GitHub API unreachable/rate-limited, no artifact published
+# for this platform) is a SOFT fallback to the existing local
+# `cargo build --release` path below -- never a hard error -- unless the
+# operator forced `--fetch` (see FETCH_MODE handling near the arg parser).
+
+# detect_target_triple -- echo this host's release target triple, or "" for
+# an unrecognized platform (e.g. x86_64 macOS, which the release matrix does
+# not build for as of Phase 1). Overridable via LOOM_DAEMON_UPDATE_TARGET
+# (tests, or a host whose uname doesn't match the expected values).
+detect_target_triple() {
+    local os arch
+    os="$(uname -s 2>/dev/null || echo unknown)"
+    arch="$(uname -m 2>/dev/null || echo unknown)"
+    case "$os" in
+        Darwin)
+            case "$arch" in
+                arm64|aarch64) echo "aarch64-apple-darwin" ;;
+                *) echo "" ;;
+            esac
+            ;;
+        Linux)
+            case "$arch" in
+                aarch64|arm64) echo "aarch64-unknown-linux-gnu" ;;
+                x86_64|amd64)  echo "x86_64-unknown-linux-gnu" ;;
+                *) echo "" ;;
+            esac
+            ;;
+        *) echo "" ;;
+    esac
+}
+
+# resolve_gh_repo_slug -- echo "owner/repo" parsed from the `origin` remote
+# (git@github.com:, https://github.com/, and ssh://git@github.com/ forms),
+# or "" when it cannot be resolved. Overridable via
+# LOOM_DAEMON_UPDATE_GH_REPO.
+resolve_gh_repo_slug() {
+    local remote_url slug
+    remote_url="$(git -C "$REPO_ROOT" remote get-url origin 2>/dev/null || true)"
+    [[ -z "$remote_url" ]] && { echo ""; return 0; }
+    case "$remote_url" in
+        git@github.com:*)
+            slug="${remote_url#git@github.com:}"
+            echo "${slug%.git}"
+            ;;
+        https://github.com/*|http://github.com/*)
+            echo "$remote_url" | sed -E 's#^https?://github\.com/##; s/\.git$//'
+            ;;
+        ssh://git@github.com/*)
+            echo "$remote_url" | sed -E 's#^ssh://git@github\.com/##; s/\.git$//'
+            ;;
+        *) echo "" ;;
+    esac
+}
+
+# semver_compare <a> <b> -- echoes -1, 0, or 1 for a<b, a==b, a>b. Compares
+# up to 3 dot-separated numeric components (non-numeric suffixes are
+# stripped defensively); missing components default to 0.
+semver_compare() {
+    local v1="${1:-0.0.0}" v2="${2:-0.0.0}"
+    local oldifs="$IFS"
+    IFS='.'
+    # shellcheck disable=SC2206
+    local -a a=($v1) b=($v2)
+    IFS="$oldifs"
+    local i ai bi
+    for i in 0 1 2; do
+        ai="${a[i]:-0}"; ai="${ai//[!0-9]/}"; ai="${ai:-0}"
+        bi="${b[i]:-0}"; bi="${bi//[!0-9]/}"; bi="${bi:-0}"
+        if (( 10#$ai < 10#$bi )); then echo -1; return 0; fi
+        if (( 10#$ai > 10#$bi )); then echo 1; return 0; fi
+    done
+    echo 0
+}
+
+# fetch_resolve_latest -- read-only resolution (no downloads): resolve the
+# latest GitHub Release + confirm it has an artifact for this host's target.
+# Sets FETCH_REPO_SLUG, FETCH_TARGET, FETCH_LATEST_TAG, FETCH_LATEST_VERSION,
+# FETCH_RESOLVE_OK, and (on failure) FETCH_RESOLVE_REASON. Returns 0/1
+# matching FETCH_RESOLVE_OK so callers can `if fetch_resolve_latest; then`.
+FETCH_REPO_SLUG=""
+FETCH_TARGET=""
+FETCH_LATEST_TAG=""
+FETCH_LATEST_VERSION=""
+# shellcheck disable=SC2034  # set for API completeness; callers use the function's own return code instead
+FETCH_RESOLVE_OK=false
+FETCH_RESOLVE_REASON=""
+fetch_resolve_latest() {
+    FETCH_RESOLVE_OK=false
+    FETCH_RESOLVE_REASON=""
+
+    FETCH_TARGET="${LOOM_DAEMON_UPDATE_TARGET:-$(detect_target_triple)}"
+    if [[ -z "$FETCH_TARGET" ]]; then
+        FETCH_RESOLVE_REASON="unrecognized host platform ($(uname -s 2>/dev/null || echo '?')/$(uname -m 2>/dev/null || echo '?')) -- no release target-triple mapping"
+        return 1
+    fi
+
+    if ! command -v gh >/dev/null 2>&1; then
+        FETCH_RESOLVE_REASON="'gh' CLI not found on PATH"
+        return 1
+    fi
+
+    FETCH_REPO_SLUG="${LOOM_DAEMON_UPDATE_GH_REPO:-$(resolve_gh_repo_slug)}"
+    if [[ -z "$FETCH_REPO_SLUG" ]]; then
+        FETCH_RESOLVE_REASON="could not resolve owner/repo from git remote 'origin' (set LOOM_DAEMON_UPDATE_GH_REPO to override)"
+        return 1
+    fi
+
+    local tag
+    if ! tag=$(gh release view --json tagName -R "$FETCH_REPO_SLUG" --jq '.tagName' 2>/dev/null) || [[ -z "$tag" ]]; then
+        FETCH_RESOLVE_REASON="'gh release view' found no latest release for $FETCH_REPO_SLUG (no Releases yet, an unreachable/rate-limited API, or an auth failure)"
+        return 1
+    fi
+    FETCH_LATEST_TAG="$tag"
+    FETCH_LATEST_VERSION="$(extract_version "$tag")"
+    if [[ -z "$FETCH_LATEST_VERSION" ]]; then
+        FETCH_RESOLVE_REASON="could not parse a semver version out of release tag '$tag'"
+        return 1
+    fi
+
+    local assets bin_name sha_name
+    assets="$(gh release view --json assets -R "$FETCH_REPO_SLUG" --jq '.assets[].name' 2>/dev/null || true)"
+    bin_name="loom-daemon-${FETCH_TARGET}"
+    sha_name="${bin_name}.sha256"
+    if ! grep -qxF "$bin_name" <<<"$assets" || ! grep -qxF "$sha_name" <<<"$assets"; then
+        FETCH_RESOLVE_REASON="release $tag has no artifact for target $FETCH_TARGET (checked for $bin_name + $sha_name)"
+        return 1
+    fi
+
+    # shellcheck disable=SC2034  # set for API completeness; callers use the function's own return code instead
+    FETCH_RESOLVE_OK=true
+    return 0
+}
+
+# resolve_cosign_pubkey -- echo a resolvable cosign public key path, or "".
+# No public key is committed to this repo as of Phase 2 (#5011) -- this is
+# deliberately best-effort: LOOM_DAEMON_UPDATE_COSIGN_PUBKEY (env) first,
+# else a conventional checked-in path if one is ever added. An empty result
+# means "signature present but unverifiable" -- a loud skip, never a block
+# (see verify_artifact_signature).
+resolve_cosign_pubkey() {
+    if [[ -n "${LOOM_DAEMON_UPDATE_COSIGN_PUBKEY:-}" && -r "${LOOM_DAEMON_UPDATE_COSIGN_PUBKEY}" ]]; then
+        echo "$LOOM_DAEMON_UPDATE_COSIGN_PUBKEY"
+        return 0
+    fi
+    local candidate
+    for candidate in "$REPO_ROOT/.loom/cosign.pub" "$REPO_ROOT/defaults/cosign.pub"; do
+        [[ -r "$candidate" ]] && { echo "$candidate"; return 0; }
+    done
+    echo ""
+}
+
+# verify_artifact_checksum <bin_path> <sha256_path> -- unconditional
+# checksum verification. The `.sha256` format is `shasum -a 256` /
+# `sha256sum` output (`<hex>  <filename>`), so the hex digest is always the
+# first field.
+verify_artifact_checksum() {
+    local bin_path="$1" sha_path="$2" expected actual
+    expected="$(awk 'NR==1{print $1}' "$sha_path" 2>/dev/null)"
+    [[ -n "$expected" ]] || return 1
+    if command -v shasum >/dev/null 2>&1; then
+        actual="$(shasum -a 256 "$bin_path" | awk '{print $1}')"
+    elif command -v sha256sum >/dev/null 2>&1; then
+        actual="$(sha256sum "$bin_path" | awk '{print $1}')"
+    else
+        err "Neither 'shasum' nor 'sha256sum' is available -- cannot verify the artifact checksum."
+        return 1
+    fi
+    [[ "$expected" == "$actual" ]]
+}
+
+# verify_artifact_signature <target> <bin_path> <sig_path-or-empty> --
+# signature verification, present-only (absence always passes). Distinguishes
+# "not signed" (expected/allowed, soft-skip) from "signed but verification
+# failed" (tamper evidence, hard-fail) per the epic's design principle 2.
+verify_artifact_signature() {
+    local target="$1" bin_path="$2" sig_path="$3"
+    case "$target" in
+        *-apple-darwin)
+            if ! command -v codesign >/dev/null 2>&1; then
+                warn "'codesign' not available -- skipping macOS signature verification (best-effort; checksum already verified)."
+                return 0
+            fi
+            local desc
+            desc="$(codesign -dv "$bin_path" 2>&1 || true)"
+            if grep -q 'code object is not signed at all' <<<"$desc"; then
+                warn "Downloaded artifact is unsigned (no Developer ID secrets were configured for this release) -- proceeding without signature verification, per design (checksum is unconditional; signature is optional)."
+                return 0
+            fi
+            if codesign --verify --strict "$bin_path" 2>/dev/null; then
+                ok "macOS codesign verification passed for $(basename "$bin_path")."
+                return 0
+            fi
+            err "macOS codesign verification FAILED for $(basename "$bin_path") -- an embedded signature is present but invalid. This is NOT the 'unsigned' case; treating as tamper evidence."
+            return 1
+            ;;
+        *-linux-*)
+            if [[ -z "$sig_path" ]]; then
+                # No .sig asset published for this release (cosign secret was
+                # not configured for it) -- absence never blocks, by design.
+                return 0
+            fi
+            if ! command -v cosign >/dev/null 2>&1; then
+                warn "A detached signature ($(basename "$sig_path")) is present for this release but 'cosign' is not installed -- SKIPPING verification (loud skip, not a block; checksum already verified)."
+                return 0
+            fi
+            local pubkey
+            pubkey="$(resolve_cosign_pubkey)"
+            if [[ -z "$pubkey" ]]; then
+                warn "A detached signature ($(basename "$sig_path")) is present but no cosign public key is resolvable (set LOOM_DAEMON_UPDATE_COSIGN_PUBKEY) -- SKIPPING verification (loud skip, not a block; checksum already verified)."
+                return 0
+            fi
+            if cosign verify-blob --key "$pubkey" --signature "$sig_path" "$bin_path" >/dev/null 2>&1; then
+                ok "cosign signature verification passed for $(basename "$bin_path")."
+                return 0
+            fi
+            err "cosign signature verification FAILED for $(basename "$bin_path") against $(basename "$sig_path") using key $pubkey."
+            return 1
+            ;;
+        *) return 0 ;;
+    esac
+}
+
+# Temp dirs created by fetch_and_verify_artifact, cleaned up on any exit
+# (including the hard-abort `exit 1` calls it makes on a verification
+# failure) so a checksum-mismatch abort never leaves the unverified artifact
+# lying around.
+_LOOM_FETCH_TMPDIRS=()
+_cleanup_fetch_tmpdirs() {
+    local d
+    for d in ${_LOOM_FETCH_TMPDIRS[@]+"${_LOOM_FETCH_TMPDIRS[@]}"}; do
+        rm -rf "$d" 2>/dev/null || true
+    done
+}
+trap _cleanup_fetch_tmpdirs EXIT
+
+# fetch_and_verify_artifact -- download loom-daemon-<ARTIFACT_TARGET> +
+# its .sha256 (required) + its .sig (best-effort) for ARTIFACT_TAG from
+# FETCH_REPO_SLUG, verify checksum (unconditional) and signature (when
+# present), and set ARTIFACT_BIN (path to the verified binary),
+# ARTIFACT_VERSION_OUTPUT (its full `--version` string, the post-provision
+# identity) and ARTIFACT_COMMIT (its embedded commit, when resolvable) on
+# success.
+#
+# A checksum or signature-verification FAILURE hard-aborts the whole script
+# (exit 1) -- these are tamper/corruption signals, never soft-fallback
+# conditions (AC2/AC3). A DOWNLOAD failure (network blip, asset renamed
+# server-side after fetch_resolve_latest checked) instead returns 1 so the
+# caller can decide -- in practice this script has already committed to
+# ARTIFACT_MODE by the time this runs, so the caller also aborts, but the
+# distinction keeps this function's contract composable.
+fetch_and_verify_artifact() {
+    local tmpdir bin_name sha_name sig_name bin_path sha_path sig_path=""
+    tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/loom-daemon-fetch.XXXXXX" 2>/dev/null)" || {
+        err "Could not create a temp dir for the artifact download."
+        return 1
+    }
+    _LOOM_FETCH_TMPDIRS+=("$tmpdir")
+
+    bin_name="loom-daemon-${ARTIFACT_TARGET}"
+    sha_name="${bin_name}.sha256"
+    sig_name="${bin_name}.sig"
+
+    echo "Downloading ${bin_name} + ${sha_name} from ${FETCH_REPO_SLUG}@${ARTIFACT_TAG}..."
+    if ! gh release download "$ARTIFACT_TAG" -R "$FETCH_REPO_SLUG" \
+            -p "$bin_name" -p "$sha_name" -D "$tmpdir" --clobber >/dev/null 2>&1; then
+        err "Failed to download release assets (${bin_name}, ${sha_name}) for ${ARTIFACT_TAG} from ${FETCH_REPO_SLUG}."
+        return 1
+    fi
+    bin_path="$tmpdir/$bin_name"
+    sha_path="$tmpdir/$sha_name"
+    if [[ ! -f "$bin_path" || ! -f "$sha_path" ]]; then
+        err "Download reported success but expected files are missing under $tmpdir."
+        return 1
+    fi
+    chmod 755 "$bin_path" 2>/dev/null || true
+
+    # ---- checksum: unconditional ----
+    if ! verify_artifact_checksum "$bin_path" "$sha_path"; then
+        err "Checksum verification FAILED for $bin_name -- the downloaded artifact does not match its published $sha_name."
+        err "Aborting the update; the running daemon (if any) is left untouched."
+        exit 1
+    fi
+    ok "Checksum verified: $bin_name matches $sha_name."
+
+    # ---- signature: best-effort download (may not exist), verify when present ----
+    if gh release download "$ARTIFACT_TAG" -R "$FETCH_REPO_SLUG" \
+            -p "$sig_name" -D "$tmpdir" --clobber >/dev/null 2>&1 \
+        && [[ -f "$tmpdir/$sig_name" ]]; then
+        sig_path="$tmpdir/$sig_name"
+    fi
+    if ! verify_artifact_signature "$ARTIFACT_TARGET" "$bin_path" "$sig_path"; then
+        err "Signature verification FAILED for $bin_name (see above)."
+        err "Aborting the update; the running daemon (if any) is left untouched."
+        exit 1
+    fi
+
+    ARTIFACT_BIN="$bin_path"
+    # Captured from the VERIFIED download, before provisioning: the identity
+    # verify_destination_artifact() asserts against afterwards (see its own
+    # doc comment for why the full --version string, not the commit or a
+    # byte checksum, is the right identity here).
+    ARTIFACT_VERSION_OUTPUT="$("$bin_path" --version 2>/dev/null || true)"
+    ARTIFACT_COMMIT="$(extract_commit "$ARTIFACT_VERSION_OUTPUT")"
+    return 0
 }
 
 # ---------- stale `loom-*` entry-point check (#4079 hardening, #4557) ---------
@@ -511,6 +889,11 @@ warn_stale_entry_points() {
 # and from a provisioning soft-failure. Skipped only when the source HEAD is
 # unknown (a tarball build with no .git), where there is nothing to compare
 # against. Relies on $SOURCE_COMMIT being resolved (it is, before any build).
+#
+# SOURCE-BUILD PATH ONLY. The artifact-fetch path (#5020) uses
+# verify_destination_artifact() below instead: a fetched release's commit has
+# nothing to do with the local checkout's HEAD, so this function's whole
+# premise does not apply there.
 verify_destination_binary() {
     local dest="$1"
     if [[ "$SOURCE_COMMIT" == "unknown" ]]; then
@@ -532,6 +915,49 @@ verify_destination_binary() {
     ok "Post-provision verification: destination binary at $dest embeds source HEAD commit ($dest_commit)."
 }
 
+# verify_destination_artifact <dest_path> — the artifact-fetch (#5020)
+# counterpart of verify_destination_binary above, closing the SAME "reports
+# success while shipping nothing" hole for a fetched release binary. Exits 5
+# on mismatch, identically.
+#
+# Why a different identity than the source path's embedded-commit compare:
+#   - A fetched release artifact's commit is the RELEASE's commit, unrelated to
+#     the local checkout's HEAD — comparing against $SOURCE_COMMIT would fail
+#     on every successful artifact roll.
+#   - A byte/checksum compare of the destination is NOT usable either:
+#     provision_machine_daemon() calls sign_daemon_binary() on the DESTINATION,
+#     which (on Darwin, for a genuinely unsigned artifact) ad-hoc re-signs it
+#     in place and therefore changes its bytes vs. the verified download.
+# So the identity used here is the artifact's own full `--version` STRING
+# (version + commit + build timestamp), which is stable across a re-sign and
+# is exactly the same string provision_machine_daemon()'s own version-equality
+# short-circuit compares — so this assertion also proves that short-circuit
+# did not silently no-op a real roll.
+#
+# $ARTIFACT_VERSION_OUTPUT is captured from the VERIFIED download before
+# provisioning. It is empty only if the artifact refused to report a version,
+# in which case there is nothing to compare against and we skip loudly rather
+# than invent a comparison.
+verify_destination_artifact() {
+    local dest="$1"
+    if [[ -z "${ARTIFACT_VERSION_OUTPUT:-}" ]]; then
+        warn "Fetched artifact reported no --version output — skipping post-provision verification (checksum/signature were already verified pre-provision)."
+        return 0
+    fi
+    if [[ -z "$dest" || ! -x "$dest" ]]; then
+        err "Post-provision verification FAILED: provisioning reported success but no executable binary was found at the destination ('${dest:-<unknown>}')."
+        exit 5
+    fi
+    local dest_version
+    dest_version=$("$dest" --version 2>/dev/null || true)
+    if [[ "$dest_version" != "$ARTIFACT_VERSION_OUTPUT" ]]; then
+        err "Post-provision verification FAILED: destination binary at $dest reports '${dest_version:-<none>}' but the fetched release artifact reports '$ARTIFACT_VERSION_OUTPUT'."
+        err "Provisioning reported success yet the destination is NOT the freshly-fetched binary — a silent no-op roll. Refusing to report success."
+        exit 5
+    fi
+    ok "Post-provision verification: destination binary at $dest is the fetched release artifact ($dest_version)."
+}
+
 # ---------- args ----------
 DRY_RUN=false
 FORCE=false
@@ -540,7 +966,14 @@ NO_RESTART=false
 RELAUNCH=false
 ALLOW_STALE=false
 AUTO_RESOLVE_SAFE_ABORT=false
+# FETCH_MODE: auto (default -- prefer a verified release artifact when one
+# resolves, else soft-fall-back to the source build), force (--fetch --
+# require an artifact, hard-fail rather than silently building from source),
+# or off (--no-fetch -- always build from source, the pre-#5020 behavior).
+FETCH_MODE="auto"
 [[ "${LOOM_DAEMON_UPDATE_RELAUNCH:-}" =~ ^(1|true|yes)$ ]] && RELAUNCH=true
+[[ "${LOOM_DAEMON_UPDATE_FETCH:-}" =~ ^(0|false|no)$ ]] && FETCH_MODE="off"
+[[ "${LOOM_DAEMON_UPDATE_FETCH:-}" =~ ^(1|true|yes)$ ]] && FETCH_MODE="force"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --help|-h) show_help; exit 0 ;;
@@ -551,6 +984,8 @@ while [[ $# -gt 0 ]]; do
         --relaunch) RELAUNCH=true; shift ;;
         --allow-stale) ALLOW_STALE=true; shift ;;
         --auto-resolve-safe-abort) AUTO_RESOLVE_SAFE_ABORT=true; shift ;;
+        --fetch) FETCH_MODE="force"; shift ;;
+        --no-fetch) FETCH_MODE="off"; shift ;;
         *) err "Unknown option '$1'"; echo "Use --help for usage" >&2; exit 1 ;;
     esac
 done
@@ -928,10 +1363,12 @@ fi
 DAEMON_BIN=$(locate_daemon_bin "$REPO_ROOT")
 
 INSTALLED_COMMIT="unknown"
+INSTALLED_VERSION=""
 if [[ -n "$DAEMON_BIN" && -x "$DAEMON_BIN" ]]; then
     installed_version_output=$("$DAEMON_BIN" --version 2>/dev/null || true)
     extracted=$(extract_commit "$installed_version_output")
     [[ -n "$extracted" ]] && INSTALLED_COMMIT="$extracted"
+    INSTALLED_VERSION=$(extract_version "$installed_version_output")
 fi
 
 SOURCE_COMMIT=$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo "unknown")
@@ -955,6 +1392,47 @@ elif [[ "$INSTALLED_COMMIT" == "unknown" || "$SOURCE_COMMIT" == "unknown" ]]; th
     UPDATE_NEEDED=true
 elif [[ "$INSTALLED_COMMIT" != "$SOURCE_COMMIT" ]]; then
     UPDATE_NEEDED=true
+fi
+
+# ---------- artifact-fetch resolution (Epic #4990 Phase 3, #5020) ----------
+# Read-only resolution (no downloads yet — see fetch_and_verify_artifact()
+# for the actual download/verify, which only runs once we're past --check
+# and --dry-run below). When a newer release resolves for this host's
+# platform, it takes precedence over the source-commit comparison above:
+# ARTIFACT_MODE=true and UPDATE_NEEDED is forced true, regardless of what
+# the local source tree looks like. Any resolution failure softly falls back
+# to the source-commit-based UPDATE_NEEDED computed above — UNLESS the
+# operator forced --fetch, checked further below once we know UPDATE_NEEDED.
+ARTIFACT_MODE=false
+ARTIFACT_TAG=""
+ARTIFACT_VERSION=""
+ARTIFACT_TARGET=""
+ARTIFACT_BIN=""
+ARTIFACT_COMMIT=""
+ARTIFACT_VERSION_OUTPUT=""
+ARTIFACT_FALLBACK_REASON=""
+if [[ "$FETCH_MODE" != "off" ]]; then
+    if fetch_resolve_latest; then
+        FETCH_VERSION_CMP="$(semver_compare "$FETCH_LATEST_VERSION" "${INSTALLED_VERSION:-0.0.0}")"
+        # Strictly newer wins. An EQUAL version only wins under an explicit
+        # --fetch: `--force` alone keeps its established meaning ("rebuild this
+        # checkout even though it isn't stale"), which an operator running it
+        # inside a source tree would be surprised to see silently turn into a
+        # release download.
+        if [[ "$FETCH_VERSION_CMP" == "1" ]] || { [[ "$FETCH_VERSION_CMP" == "0" ]] && [[ "$FETCH_MODE" == "force" ]]; }; then
+            ARTIFACT_MODE=true
+            ARTIFACT_TAG="$FETCH_LATEST_TAG"
+            ARTIFACT_VERSION="$FETCH_LATEST_VERSION"
+            ARTIFACT_TARGET="$FETCH_TARGET"
+            UPDATE_NEEDED=true
+            echo "Release artifact available: ${ARTIFACT_TAG} (target ${ARTIFACT_TARGET}) — preferring fetch over a local rebuild."
+        else
+            echo "Latest release ${FETCH_LATEST_TAG} (${FETCH_LATEST_VERSION}) is not newer than the installed version (${INSTALLED_VERSION:-unknown}) — nothing to fetch; falling back to the local source-tree comparison."
+        fi
+    else
+        ARTIFACT_FALLBACK_REASON="$FETCH_RESOLVE_REASON"
+        warn "Artifact-fetch: ${ARTIFACT_FALLBACK_REASON} — falling back to the local source-build path."
+    fi
 fi
 
 # Advisory only, and deliberately placed here so it is reported on EVERY path —
@@ -1013,6 +1491,16 @@ idle_shutdown_notice() {
 # duplicating the call at each of this script's several exit points.
 print_final_installed_line() {
     local commit="$1"
+    # Artifact-fetch mode (#5020): the installed binary is a RELEASE build, so
+    # comparing its commit against origin/<default-branch>'s tip is the wrong
+    # currency claim — a released commit is normally BEHIND the branch tip and
+    # saying "does NOT match" about it would be actively misleading. Report the
+    # release identity instead.
+    if [[ "${ARTIFACT_MODE:-false}" == "true" ]]; then
+        echo "Installed: release ${ARTIFACT_TAG} (${ARTIFACT_VERSION}${commit:+, commit ${commit}}) for target ${ARTIFACT_TARGET} — fetched artifact, checksum verified"
+        idle_shutdown_notice
+        return 0
+    fi
     if [[ -z "$DEFAULT_BRANCH" || "$ORIGIN_COMMIT" == "unknown" ]]; then
         echo "Installed: ${commit} (currency vs origin/<default-branch> unknown — unresolvable or unreachable)"
     elif [[ "$commit" == "$ORIGIN_COMMIT" ]]; then
@@ -1395,7 +1883,11 @@ describe_manager() {
 if [[ "$CHECK_ONLY" == "true" ]]; then
     describe_manager
     if [[ "$UPDATE_NEEDED" == "true" ]]; then
-        warn "Update available (installed=${INSTALLED_COMMIT}, source=${SOURCE_COMMIT})."
+        if [[ "$ARTIFACT_MODE" == "true" ]]; then
+            warn "Update available via release artifact ${ARTIFACT_TAG} (installed=${INSTALLED_VERSION:-unknown}, latest=${ARTIFACT_VERSION}, target=${ARTIFACT_TARGET})."
+        else
+            warn "Update available (installed=${INSTALLED_COMMIT}, source=${SOURCE_COMMIT})."
+        fi
         exit 3
     fi
     ok "loom-daemon binary is already up to date with source HEAD (${SOURCE_COMMIT})."
@@ -1424,6 +1916,15 @@ if [[ "$UPDATE_NEEDED" == "false" ]]; then
     exit 0
 fi
 
+# An update IS needed at this point. --fetch (or LOOM_DAEMON_UPDATE_FETCH=1)
+# means "I know a release artifact should exist; don't silently fall back to
+# building from source" — refuse rather than mask a resolution failure.
+if [[ "$FETCH_MODE" == "force" && "$ARTIFACT_MODE" != "true" ]]; then
+    err "--fetch (or LOOM_DAEMON_UPDATE_FETCH=1) was given but no usable release artifact was resolved${ARTIFACT_FALLBACK_REASON:+ (${ARTIFACT_FALLBACK_REASON})}."
+    err "Refusing to silently fall back to a source build; re-run without --fetch to allow that, or resolve the cause above."
+    exit 1
+fi
+
 # ---------- resolve the restart plan up front (read-only; safe for --dry-run) ----------
 # WAS_RUNNING + DAEMON_MANAGER were resolved above (launchd checked ahead of the
 # pid file). The flags below are only consulted for the pid-file/nohup restart
@@ -1443,12 +1944,19 @@ PROVISION_TARGET="${LOOM_DAEMON_BIN:-$DEST_DIR/loom-daemon}"
 
 if [[ "$DRY_RUN" == "true" ]]; then
     echo
-    if [[ "$ALLOW_STALE" == "true" ]]; then
-        echo "[dry-run] --allow-stale given: would build the current checkout as-is (no fetch/ff-merge)."
-    elif [[ -n "$DEFAULT_BRANCH" && "$ORIGIN_BEHIND_COUNT" -gt 0 ]]; then
-        echo "[dry-run] Plan includes fast-forwarding local ${DEFAULT_BRANCH} to origin/${DEFAULT_BRANCH} (${ORIGIN_BEHIND_COUNT} commit(s) behind) before building; would abort instead of building stale if the ff-merge cannot apply."
+    if [[ "$ARTIFACT_MODE" == "true" ]]; then
+        echo "[dry-run] Would fetch + verify release artifact ${ARTIFACT_TAG} (target ${ARTIFACT_TARGET}) from ${FETCH_REPO_SLUG} — checksum unconditional, signature verified when present. No 'cargo build' would run."
+    else
+        if [[ "$ALLOW_STALE" == "true" ]]; then
+            echo "[dry-run] --allow-stale given: would build the current checkout as-is (no fetch/ff-merge)."
+        elif [[ -n "$DEFAULT_BRANCH" && "$ORIGIN_BEHIND_COUNT" -gt 0 ]]; then
+            echo "[dry-run] Plan includes fast-forwarding local ${DEFAULT_BRANCH} to origin/${DEFAULT_BRANCH} (${ORIGIN_BEHIND_COUNT} commit(s) behind) before building; would abort instead of building stale if the ff-merge cannot apply."
+        fi
+        if [[ -n "$ARTIFACT_FALLBACK_REASON" ]]; then
+            echo "[dry-run] Artifact-fetch was not used: ${ARTIFACT_FALLBACK_REASON}."
+        fi
+        echo "[dry-run] Would run: (cd $DAEMON_DIR && cargo build --release)"
     fi
-    echo "[dry-run] Would run: (cd $DAEMON_DIR && cargo build --release)"
     echo "[dry-run] Would provision the fresh binary to: $PROVISION_TARGET"
     if [[ "$NO_RESTART" == "true" ]]; then
         echo "[dry-run] --no-restart given: would leave the running daemon (if any) untouched."
@@ -1464,94 +1972,119 @@ if [[ "$DRY_RUN" == "true" ]]; then
     exit 0
 fi
 
-# ---------- rebuild ----------
-# Non-interactive SSH sessions (the fleet remote-update path, #4695) don't
-# source a login shell's profile, so a rustup-installed cargo living at the
-# default `~/.cargo/bin` is invisible to `command -v cargo` even though it IS
-# installed. Fall back the same way loom-daemon-start.sh's resolve_plist_path()
-# already does for launchd/systemd's non-login-shell PATH: prefer sourcing
-# rustup's own `~/.cargo/env` (the canonical PATH-setup snippet rustup
-# writes), then fall back to prepending `~/.cargo/bin` directly if that
-# script isn't present but the binary still is (e.g. a non-rustup or
-# partially-cleaned install), then finally fall back to the FULL shared
-# canonical PATH superset (lib/canonical-daemon-path.sh, #4831 — the same set
-# resolve_plist_path() renders and fleet add-worker's provisioning uses) in
-# case `cargo` was installed via Homebrew or another non-rustup path this
-# script doesn't special-case.
-if ! command -v cargo >/dev/null 2>&1; then
-    if [[ -f "$HOME/.cargo/env" ]]; then
-        # shellcheck disable=SC1091
-        source "$HOME/.cargo/env"
-    elif [[ -x "$HOME/.cargo/bin/cargo" ]]; then
-        export PATH="$HOME/.cargo/bin:$PATH"
+# ---------- rebuild (source) OR fetch (artifact, Epic #4990 Phase 3, #5020) ----------
+if [[ "$ARTIFACT_MODE" == "true" ]]; then
+    echo
+    echo "Fetching loom-daemon release artifact ${ARTIFACT_TAG} (target ${ARTIFACT_TARGET}) from ${FETCH_REPO_SLUG}..."
+    # fetch_and_verify_artifact() exits 1 directly on a checksum or
+    # signature-verification failure (AC2/AC3 — a hard abort, not a
+    # fallback); a `return 1` here means a DOWNLOAD-layer failure instead
+    # (network blip, or an asset that vanished between resolve and
+    # download), which is likewise fatal at this point since the script has
+    # already committed to ARTIFACT_MODE.
+    if ! fetch_and_verify_artifact; then
+        err "Artifact download failed (see above) — the running daemon (if any) was left untouched."
+        exit 1
     fi
-fi
-if ! command -v cargo >/dev/null 2>&1; then
-    _LOOM_CANONICAL_PATH_LIB="$SCRIPT_DIR/../lib/canonical-daemon-path.sh"
-    if [[ -r "$_LOOM_CANONICAL_PATH_LIB" ]]; then
-        # shellcheck source=../lib/canonical-daemon-path.sh
-        source "$_LOOM_CANONICAL_PATH_LIB"
-        if declare -F canonical_daemon_path >/dev/null 2>&1; then
-            export PATH="$(canonical_daemon_path):$PATH"
+    NEW_BIN="$ARTIFACT_BIN"
+    BUILT_COMMIT="$ARTIFACT_COMMIT"
+    # NOTE: the source path's exit-4 "build verification" (built commit ==
+    # source HEAD) deliberately has NO artifact-mode equivalent — it guards a
+    # build.rs staleness defect that cannot exist for a binary this host did
+    # not compile. The artifact's integrity was instead established by the
+    # unconditional checksum + present-signature verification above, and its
+    # arrival at the destination is asserted post-provision by
+    # verify_destination_artifact().
+    ok "Fetched + verified: $NEW_BIN (release ${ARTIFACT_TAG}${BUILT_COMMIT:+, commit $BUILT_COMMIT})"
+else
+    # Non-interactive SSH sessions (the fleet remote-update path, #4695) don't
+    # source a login shell's profile, so a rustup-installed cargo living at the
+    # default `~/.cargo/bin` is invisible to `command -v cargo` even though it IS
+    # installed. Fall back the same way loom-daemon-start.sh's resolve_plist_path()
+    # already does for launchd/systemd's non-login-shell PATH: prefer sourcing
+    # rustup's own `~/.cargo/env` (the canonical PATH-setup snippet rustup
+    # writes), then fall back to prepending `~/.cargo/bin` directly if that
+    # script isn't present but the binary still is (e.g. a non-rustup or
+    # partially-cleaned install), then finally fall back to the FULL shared
+    # canonical PATH superset (lib/canonical-daemon-path.sh, #4831 — the same set
+    # resolve_plist_path() renders and fleet add-worker's provisioning uses) in
+    # case `cargo` was installed via Homebrew or another non-rustup path this
+    # script doesn't special-case.
+    if ! command -v cargo >/dev/null 2>&1; then
+        if [[ -f "$HOME/.cargo/env" ]]; then
+            # shellcheck disable=SC1091
+            source "$HOME/.cargo/env"
+        elif [[ -x "$HOME/.cargo/bin/cargo" ]]; then
+            export PATH="$HOME/.cargo/bin:$PATH"
         fi
     fi
-fi
-if ! command -v cargo >/dev/null 2>&1; then
-    err "cargo not found on PATH (checked \$HOME/.cargo/bin and the shared canonical PATH too, see lib/canonical-daemon-path.sh) — cannot rebuild loom-daemon. Install Rust via rustup: https://rustup.rs"
-    exit 1
-fi
-
-echo
-echo "Rebuilding loom-daemon (cargo build --release)..."
-if ! (cd "$DAEMON_DIR" && cargo build --release); then
-    err "cargo build --release failed — the running daemon (if any) was left untouched."
-    exit 1
-fi
-
-NEW_BIN=""
-for candidate in \
-    "$DAEMON_DIR/target/release/loom-daemon" \
-    "$REPO_ROOT/target/release/loom-daemon"; do
-    # `cargo build --release` run from loom-daemon/ writes to that crate's own
-    # target/ when loom-daemon is a standalone crate, but to the WORKSPACE
-    # root's target/ when it is a member of a Cargo workspace (this repo's
-    # actual layout: root Cargo.toml -> [workspace] members = [...,
-    # "loom-daemon"]). Check both, matching locate_daemon_bin()'s candidate
-    # order above.
-    if [[ -x "$candidate" ]]; then
-        NEW_BIN="$candidate"
-        break
+    if ! command -v cargo >/dev/null 2>&1; then
+        _LOOM_CANONICAL_PATH_LIB="$SCRIPT_DIR/../lib/canonical-daemon-path.sh"
+        if [[ -r "$_LOOM_CANONICAL_PATH_LIB" ]]; then
+            # shellcheck source=../lib/canonical-daemon-path.sh
+            source "$_LOOM_CANONICAL_PATH_LIB"
+            if declare -F canonical_daemon_path >/dev/null 2>&1; then
+                export PATH="$(canonical_daemon_path):$PATH"
+            fi
+        fi
     fi
-done
-if [[ -z "$NEW_BIN" ]]; then
-    err "Build did not produce an executable at $DAEMON_DIR/target/release/loom-daemon or $REPO_ROOT/target/release/loom-daemon"
-    exit 1
-fi
-ok "Build succeeded: $NEW_BIN"
+    if ! command -v cargo >/dev/null 2>&1; then
+        err "cargo not found on PATH (checked \$HOME/.cargo/bin and the shared canonical PATH too, see lib/canonical-daemon-path.sh) — cannot rebuild loom-daemon. Install Rust via rustup: https://rustup.rs"
+        exit 1
+    fi
 
-# ---------- verify the freshly-built binary embeds the expected commit ----------
-# A rebuild can succeed (exit 0) yet bake in a STALE LOOM_DAEMON_GIT_COMMIT — the
-# exact hazard this script exists to close (a build.rs watch-set bug that lets
-# `--version` report the old commit). Provisioning such a binary would "report
-# success while shipping nothing" and, worse, turn any auto-update loop that
-# trusts the baked commit into an infinite rebuild-still-stale retry. So assert
-# the built commit == source HEAD BEFORE provisioning. On mismatch, fail loudly
-# and do NOT provision: this is a build-system defect that retrying cannot fix,
-# distinct from the compile failure handled above (#4053).
-BUILT_VERSION_OUTPUT=$("$NEW_BIN" --version 2>/dev/null || true)
-BUILT_COMMIT=$(extract_commit "$BUILT_VERSION_OUTPUT")
-if [[ "$SOURCE_COMMIT" == "unknown" ]]; then
-    warn "Source HEAD is unknown (no .git?) — skipping built-commit verification (tarball build)."
-elif [[ -z "$BUILT_COMMIT" ]]; then
-    err "Build verification FAILED: the freshly-built binary reports no commit in --version output ('${BUILT_VERSION_OUTPUT:-<empty>}')."
-    err "Refusing to provision a binary that cannot prove what it was built from. This is a build-system defect, not a compile failure."
-    exit 4
-elif [[ "$BUILT_COMMIT" != "$SOURCE_COMMIT" ]]; then
-    err "Build verification FAILED: the freshly-built binary embeds commit '$BUILT_COMMIT' but source HEAD is '$SOURCE_COMMIT'."
-    err "A successful build produced a binary stamped with the WRONG commit (a stale baked-in commit — e.g. a build.rs watch-set bug). Retrying will not fix it; refusing to provision (#4053)."
-    exit 4
-else
-    ok "Build verification: freshly-built binary embeds source HEAD commit ($BUILT_COMMIT)."
+    echo
+    echo "Rebuilding loom-daemon (cargo build --release)..."
+    if ! (cd "$DAEMON_DIR" && cargo build --release); then
+        err "cargo build --release failed — the running daemon (if any) was left untouched."
+        exit 1
+    fi
+
+    NEW_BIN=""
+    for candidate in \
+        "$DAEMON_DIR/target/release/loom-daemon" \
+        "$REPO_ROOT/target/release/loom-daemon"; do
+        # `cargo build --release` run from loom-daemon/ writes to that crate's own
+        # target/ when loom-daemon is a standalone crate, but to the WORKSPACE
+        # root's target/ when it is a member of a Cargo workspace (this repo's
+        # actual layout: root Cargo.toml -> [workspace] members = [...,
+        # "loom-daemon"]). Check both, matching locate_daemon_bin()'s candidate
+        # order above.
+        if [[ -x "$candidate" ]]; then
+            NEW_BIN="$candidate"
+            break
+        fi
+    done
+    if [[ -z "$NEW_BIN" ]]; then
+        err "Build did not produce an executable at $DAEMON_DIR/target/release/loom-daemon or $REPO_ROOT/target/release/loom-daemon"
+        exit 1
+    fi
+    ok "Build succeeded: $NEW_BIN"
+
+    # ---------- verify the freshly-built binary embeds the expected commit ----------
+    # A rebuild can succeed (exit 0) yet bake in a STALE LOOM_DAEMON_GIT_COMMIT — the
+    # exact hazard this script exists to close (a build.rs watch-set bug that lets
+    # `--version` report the old commit). Provisioning such a binary would "report
+    # success while shipping nothing" and, worse, turn any auto-update loop that
+    # trusts the baked commit into an infinite rebuild-still-stale retry. So assert
+    # the built commit == source HEAD BEFORE provisioning. On mismatch, fail loudly
+    # and do NOT provision: this is a build-system defect that retrying cannot fix,
+    # distinct from the compile failure handled above (#4053).
+    BUILT_VERSION_OUTPUT=$("$NEW_BIN" --version 2>/dev/null || true)
+    BUILT_COMMIT=$(extract_commit "$BUILT_VERSION_OUTPUT")
+    if [[ "$SOURCE_COMMIT" == "unknown" ]]; then
+        warn "Source HEAD is unknown (no .git?) — skipping built-commit verification (tarball build)."
+    elif [[ -z "$BUILT_COMMIT" ]]; then
+        err "Build verification FAILED: the freshly-built binary reports no commit in --version output ('${BUILT_VERSION_OUTPUT:-<empty>}')."
+        err "Refusing to provision a binary that cannot prove what it was built from. This is a build-system defect, not a compile failure."
+        exit 4
+    elif [[ "$BUILT_COMMIT" != "$SOURCE_COMMIT" ]]; then
+        err "Build verification FAILED: the freshly-built binary embeds commit '$BUILT_COMMIT' but source HEAD is '$SOURCE_COMMIT'."
+        err "A successful build produced a binary stamped with the WRONG commit (a stale baked-in commit — e.g. a build.rs watch-set bug). Retrying will not fix it; refusing to provision (#4053)."
+        exit 4
+    else
+        ok "Build verification: freshly-built binary embeds source HEAD commit ($BUILT_COMMIT)."
+    fi
 fi
 
 # ---------- sign (Darwin-only, best-effort, non-fatal, #4016) ----------
@@ -1562,11 +2095,20 @@ fi
 # survive a rebuild (see sign_daemon_binary's own doc comment in
 # scripts/install/provision-daemon.sh and .loom/docs/daemon-reference.md); it
 # only pins a human-legible identifier in place of the rustc metadata hash.
+#
+# Skipped in artifact-fetch mode (#5020): a fetched macOS artifact may
+# already carry a REAL Developer ID signature (Phase 2, #5011/#5018) —
+# force-resigning it here (or via provision_machine_daemon's own
+# belt-and-braces call below) would silently downgrade that to an ad-hoc
+# signature. sign_daemon_binary() itself now guards against that (skips any
+# binary that already carries a certificate-backed signature), but skip the
+# direct call entirely here too: there is nothing useful for it to do to an
+# already-signed or genuinely-unsigned fetched artifact.
 # shellcheck disable=SC1091
 if [[ -r "$REPO_ROOT/scripts/install/provision-daemon.sh" ]]; then
     source "$REPO_ROOT/scripts/install/provision-daemon.sh"
 fi
-if declare -F sign_daemon_binary >/dev/null 2>&1; then
+if [[ "$ARTIFACT_MODE" != "true" ]] && declare -F sign_daemon_binary >/dev/null 2>&1; then
     sign_daemon_binary "$NEW_BIN"
 fi
 
@@ -1583,8 +2125,12 @@ if [[ -n "${LOOM_DAEMON_BIN:-}" ]]; then
         exit 1
     fi
     # This override path has the same "shipped nothing" hazard as the
-    # machine-level path — verify the destination is the freshly-built binary.
-    verify_destination_binary "$dest"
+    # machine-level path — verify the destination is the freshly-built/fetched binary.
+    if [[ "$ARTIFACT_MODE" == "true" ]]; then
+        verify_destination_artifact "$dest"
+    else
+        verify_destination_binary "$dest"
+    fi
 else
     if declare -F provision_machine_daemon >/dev/null 2>&1; then
         # Hard-fail on provisioning failure: a soft warn here (the pre-#4053
@@ -1598,7 +2144,11 @@ else
         # the version-equality short-circuit) — verify that destination is the
         # expected build so the short-circuit can no longer produce a silent
         # no-op on a real roll (#4053).
-        verify_destination_binary "${PROVISIONED_DAEMON_BIN:-}"
+        if [[ "$ARTIFACT_MODE" == "true" ]]; then
+            verify_destination_artifact "${PROVISIONED_DAEMON_BIN:-}"
+        else
+            verify_destination_binary "${PROVISIONED_DAEMON_BIN:-}"
+        fi
     else
         warn "scripts/install/provision-daemon.sh not found/sourceable — skipping machine-level provisioning."
         warn "Freshly-built binary: $NEW_BIN (set LOOM_DAEMON_BIN=$NEW_BIN to use it directly)"

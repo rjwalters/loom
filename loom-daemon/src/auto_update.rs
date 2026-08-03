@@ -555,6 +555,24 @@ impl DrainTrigger for IpcDrainTrigger {
 /// [`LOW_PRIORITY_NICE`] via a `pre_exec` `setpriority(2)` — inherited by
 /// `cargo`/`rustc`, so a rebuild forced past gate 4's deadline yields CPU to
 /// the in-flight sweeps rather than stampeding them.
+///
+/// # Artifact-fetch precedence (Epic #4990 Phase 3, #5020)
+///
+/// No flag is passed here to select fetch-vs-build: `loom-daemon-update.sh`
+/// prefers a verified GitHub Release artifact for the host's platform
+/// automatically (default "auto" precedence, opt-out via `--no-fetch` /
+/// `LOOM_DAEMON_UPDATE_FETCH=0`) whenever one resolves, and softly falls back
+/// to this same `cargo build --release` path otherwise — so a saturated host
+/// with no Rust toolchain converges on a release alone (AC1) with *zero*
+/// daemon-side awareness required. This call site deliberately does not opt
+/// in with `--fetch` (which would hard-fail instead of falling back): the
+/// auto-updater's whole purpose is unattended convergence, and a resolution
+/// hiccup (an unreachable GitHub API, a release missing this platform's
+/// artifact) must degrade to the existing rebuild path, not go Terminal.
+/// The exit-code contract above is UNCHANGED by the fetch path: a checksum
+/// or signature-verification failure on a resolved artifact maps to exit `1`
+/// (Retryable, same bucket as a `cargo build` failure — plausibly transient,
+/// e.g. a network blip), so `classify_exit` below needs no new cases.
 fn run_update_script(
     script: &Path,
     cwd: &Path,
