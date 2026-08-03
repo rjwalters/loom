@@ -146,6 +146,13 @@ provisioning, verifying telemetry lands — is
 This is **your own infrastructure**; nothing in Loom points at a shared
 backend by default.
 
+Per-host reporting is deliberately redundant — every host independently
+emits `tokens.snapshot` / `host.health` for the full account pool it can see,
+at real storage cost but with no single point of failure. This was evaluated
+as a trade study (issue #4999) and kept as-is: see
+[`.loom/docs/telemetry-schema.md`](telemetry-schema.md#per-host-reporting-redundancy-why-3x-storage-is-intentional-issue-4999)
+for the reasoning.
+
 ## 5. Authenticated vs. public: two views, one redaction policy
 
 Every query route exists twice — `/api/*` (authenticated, full detail) and
