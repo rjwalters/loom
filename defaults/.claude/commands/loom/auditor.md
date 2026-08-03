@@ -248,7 +248,7 @@ one label: the Auditor runs across many repos and hosts, and an un-deduped filer
 is a noise machine (prior art: #4736 filed 7 duplicate "still blocked" comments).
 
 ```bash
-# Run this gate before EVERY gh issue create in this role, whatever the label:
+# Run this gate before EVERY issue filing in this role, whatever the label:
 TITLE="…"   # the title you are about to file
 if ./.loom/scripts/check-duplicate.sh "$TITLE" "one-line description"; then
     :   # exit 0 = no duplicate found -> safe to create
@@ -263,9 +263,14 @@ The label-specific dedup blocks later in this document (capability requests, bug
 reports, guard decisions) are concrete applications of this one rule — none of
 them is optional and none is an exception.
 
-> **`gh issue create` fails outright when GraphQL quota is exhausted.** REST
-> fallback recipe (atomic create+label): `.loom/docs/gh-issue-create-rest-fallback.md`,
-> or `forge_gh_create_issue_rl_safe` in `lib/forge-helpers.sh` if scripting.
+> **File issues with `./.loom/scripts/create-issue.sh`, never a bare `gh issue create` (#5047).**
+> `gh issue create` fails outright when GraphQL quota is exhausted, while the independent REST
+> pool sits ~99% unused. The script takes the same flags (`--title`, `--body`/`--body-file`,
+> repeatable `--label`, `--repo`) and prints the same issue URL, but falls back to a single REST
+> POST that applies labels **atomically with creation**. Recipe and rationale:
+> `.loom/docs/gh-issue-create-rest-fallback.md` (or `forge_gh_create_issue_rl_safe` in
+> `lib/forge-helpers.sh` if scripting). `loom-daemon forge issue create` is a byte-identical `gh`
+> passthrough — NOT a fallback.
 
 ## When to Create Issues
 
@@ -291,7 +296,7 @@ Path Dedups First" above / "Avoiding Duplicate Issues" below), then create a
 detailed bug report:
 
 ```bash
-gh issue create --title "Build/runtime failure on main: [specific problem]" --body "$(cat <<'EOF'
+./.loom/scripts/create-issue.sh --title "Build/runtime failure on main: [specific problem]" --body "$(cat <<'EOF'
 ## Bug Description
 
 [Clear description of what's broken on main branch]
@@ -356,7 +361,7 @@ Before creating a new capability request:
 TITLE="Auditor Capability Request: [specific capability needed]"
 if ./.loom/scripts/check-duplicate.sh "$TITLE" "Description of capability gap"; then
     # No duplicates found - safe to create
-    gh issue create --title "$TITLE" ...
+    ./.loom/scripts/create-issue.sh --title "$TITLE" ...
 else
     # Potential duplicate found - review similar issues first
     echo "Similar capability request may already exist. Checking..."
@@ -374,7 +379,7 @@ If a similar request exists, add a comment instead of creating a duplicate.
 When you identify a validation gap, create a detailed capability request:
 
 ```bash
-gh issue create --title "Auditor Capability Request: [specific capability needed]" --body "$(cat <<'EOF'
+./.loom/scripts/create-issue.sh --title "Auditor Capability Request: [specific capability needed]" --body "$(cat <<'EOF'
 ## What I Attempted to Validate
 
 [Describe what you were trying to validate]
@@ -524,7 +529,7 @@ jq -c 'select(.pattern == "<pattern>")' .loom/logs/guard-decisions.log | tail -3
 TITLE="Build/runtime failure on main: [specific problem]"
 if ./.loom/scripts/check-duplicate.sh "$TITLE" "Description of the bug"; then
     # No duplicates found - safe to create
-    gh issue create --title "$TITLE" ...
+    ./.loom/scripts/create-issue.sh --title "$TITLE" ...
 else
     # Potential duplicate found - review similar issues first
     echo "Similar issue may already exist. Checking..."

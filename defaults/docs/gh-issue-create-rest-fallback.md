@@ -15,8 +15,29 @@ typically sits nearly untouched (observed live: `core` 19/5000 used vs.
 
 This page is the **single source** for the fallback recipe — role prompts
 link here rather than repeating it. If the recipe needs to change, change it
-here (and in `forge_gh_create_issue_rl_safe`, its scripted equivalent), not
-in nine separate files.
+here (and in `forge_gh_create_issue_rl_safe` / `create-issue.sh`, its
+executable equivalents), not in nine separate files.
+
+## Use `./.loom/scripts/create-issue.sh`, never a bare `gh issue create` (#5077)
+
+A role prompt can only teach an executable command, not a bash function
+sourced from a library — so `./.loom/scripts/create-issue.sh` is the
+canonical entry point every issue-filing role invokes directly:
+
+```bash
+./.loom/scripts/create-issue.sh \
+  --title "Some title" \
+  --body-file /tmp/issue-body.md \
+  --label "loom:triage"
+# prints the new issue's URL, exactly like `gh issue create`
+```
+
+Flags are a `gh issue create`-compatible subset — `--title/-t`, `--body/-b`,
+`--body-file/-F`, repeatable (or comma-separated) `--label/-l`, `--repo/-R` —
+chosen so an existing invocation transfers by changing only the command name.
+It tries `gh issue create` first and, only on one of the five documented
+rate-limit signatures below, retries the identical filing as a single REST
+POST.
 
 ## The five-signature table
 
@@ -44,33 +65,31 @@ count (worse under the exact quota pressure this fallback exists for) and
 can half-fail, leaving an unlabeled issue behind.
 
 ```bash
-# Primary path — unchanged, still try this first:
+# Primary path — unchanged, still tried first:
 gh issue create --repo "$NWO" --title "$TITLE" --body "$BODY" --label "$LABEL"
 
 # On a rate-limit rejection (see the signature table above), fall back to a
-# REST POST with labels in the SAME payload:
-jq -n --arg t "$TITLE" --arg b "$BODY" --arg labels "$LABEL" \
-  '{title: $t, body: $b, labels: ($labels | split(","))}' > payload.json
-gh api --method POST "repos/$NWO/issues" --input payload.json --jq '.html_url'
+# REST POST with labels in the SAME payload. With no NWO, `repos/{owner}/{repo}`
+# is a literal placeholder `gh api` expands from the git remote — zero extra
+# API calls, unlike `gh repo view`, itself GraphQL-backed (#4659):
+REST_PATH="repos/${NWO:-\{owner\}/\{repo\}}/issues"
+jq -n --arg t "$TITLE" --arg b "$BODY" --arg l "$LABEL" \
+  '{title: $t, body: $b, labels: [$l]}' | \
+  gh api --method POST "$REST_PATH" --input - --jq '.html_url'
 ```
-
-`--input payload.json` (a real file) also sidesteps the guard false positive
-where a heredoc body containing `>=` gets misclassified as a Bash redirect,
-and correctly handles a multi-line/markdown body — unlike `-f`/`--raw-field`,
-which does not expand `@file` and would post the literal string (the same
-`-f` vs. `-F` trap documented in `judge.md` for comments).
 
 ## Scripted callers: `forge_gh_create_issue_rl_safe`
 
-If you are scripting rather than running `gh` interactively, use the
-ready-made wrapper in `lib/forge-helpers.sh` instead of hand-rolling the
-above:
+`create-issue.sh` above is a thin CLI wrapper over this bash function in
+`lib/forge-helpers.sh`; if you are already sourcing that library, call it
+directly instead of shelling out:
 
 ```bash
 source "$(dirname "${BASH_SOURCE[0]}")/lib/forge-helpers.sh"
 
-# forge_gh_create_issue_rl_safe NWO TITLE BODY [LABELS_CSV]
-url=$(forge_gh_create_issue_rl_safe "$NWO" "$TITLE" "$BODY" "loom:triage,bug")
+# forge_gh_create_issue_rl_safe NWO TITLE BODY [LABEL...]
+# NWO may be "" for "the repo of the current working directory".
+url=$(forge_gh_create_issue_rl_safe "" "$TITLE" "$BODY" "loom:triage" "bug")
 ```
 
 It tries `gh issue create` first, falls back to the REST POST above on a
@@ -88,7 +107,8 @@ execs the real `gh` binary with the same arguments and inherits the same
 GraphQL cost, with **no** REST-fallback interception for `issue create`
 specifically (the passthrough is generic across every `gh issue` subcommand,
 not create-aware). It is not a safe alternative to reach for under GraphQL
-exhaustion. Use the recipe or helper above instead.
+exhaustion — `forge issue create` prints a one-line stderr notice pointing
+back here. Use `create-issue.sh` or the recipe above instead.
 
 ## Serialize issue creation, fallback or not
 

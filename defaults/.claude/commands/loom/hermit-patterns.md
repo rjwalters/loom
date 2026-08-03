@@ -657,7 +657,7 @@ $ wc -l src/components/Button.tsx
 ### Random File Review Issue Template
 
 ```bash
-gh issue create --title "Simplify <filename>: <specific improvement>" --body "$(cat <<'EOF'
+./.loom/scripts/create-issue.sh --title "Simplify <filename>: <specific improvement>" --body "$(cat <<'EOF'
 ## What to Simplify
 
 <file-path> - <specific bloat identified>
@@ -851,15 +851,19 @@ git log --all --format=%cd --date=short <file> | head -1
 
 ## Creating Removal Proposals - Full Templates
 
-> **`gh issue create` (used throughout the templates below) fails outright when
-> GraphQL quota is exhausted.** REST fallback recipe (atomic create+label):
-> `.loom/docs/gh-issue-create-rest-fallback.md`, or `forge_gh_create_issue_rl_safe`
-> in `lib/forge-helpers.sh` if scripting.
+> **File issues with `./.loom/scripts/create-issue.sh` (used throughout the templates
+> below), never a bare `gh issue create` (#5047).** `gh issue create` fails outright when
+> GraphQL quota is exhausted, while the independent REST pool sits ~99% unused. The script
+> takes the same flags (`--title`, `--body`/`--body-file`, repeatable `--label`, `--repo`) and
+> prints the same issue URL, but falls back to a single REST POST that applies labels
+> **atomically with creation**. Recipe and rationale: `.loom/docs/gh-issue-create-rest-fallback.md`
+> (or `forge_gh_create_issue_rl_safe` in `lib/forge-helpers.sh` if scripting).
+> `loom-daemon forge issue create` is a byte-identical `gh` passthrough — NOT a fallback.
 
 ### Standalone Issue Template
 
 ```bash
-gh issue create --title "Remove [specific thing]: [brief reason]" --body "$(cat <<'EOF'
+./.loom/scripts/create-issue.sh --title "Remove [specific thing]: [brief reason]" --body "$(cat <<'EOF'
 ## What to Remove
 
 [Specific file, function, dependency, or feature]
@@ -914,7 +918,7 @@ EOF
 ### Example Standalone Issue
 
 ```bash
-gh issue create --title "Remove unused UserSerializer class" --body "$(cat <<'EOF'
+./.loom/scripts/create-issue.sh --title "Remove unused UserSerializer class" --body "$(cat <<'EOF'
 ## What to Remove
 
 `src/lib/serializers/user-serializer.ts` - entire file
@@ -1197,7 +1201,7 @@ EOF
 )"
 
 # Create standalone removal issue
-gh issue create --title "Remove [thing]" --body "..." --label "loom:hermit"
+./.loom/scripts/create-issue.sh --title "Remove [thing]" --body "..." --label "loom:hermit"
 
 # Check existing hermit suggestions
 "$GH_READ" issue list --label="loom:hermit" --state=open
