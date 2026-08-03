@@ -809,7 +809,7 @@ echo "sweep run id: $RUN_ID"
 RUN_ID=$(./.loom/scripts/sweep-run-registry.sh list | awk -v p="$PPID" '$2==p {print $1; exit}')
 ```
 
-At sweep completion (or abort), remove this run's registry entry:
+At sweep completion (or abort), remove this run's registry entry. On the subagent path this is after the wave lifecycle settles and just before the Summary Output; **on the daemon path, "completion" means immediately after the last `mcp__loom__dispatch_sweep` call returns** (see "The daemon-dispatch path" below) — dispatch-and-exit is that path's entire job, so there is no later in-session point to defer this to:
 
 ```bash
 ./.loom/scripts/sweep-run-registry.sh cleanup "$RUN_ID"
@@ -1050,6 +1050,8 @@ The resolved `WAVE_SIZE` replaces `--builders-per-wave` everywhere the wave-part
 
 When `DECIDE` lands on `use_daemon`, the skill **dispatches each candidate issue** to the daemon and **exits sub-2-second**. There is no in-session orchestration after dispatch — operators monitor with `mcp__loom__list_sweeps` (Phase A) or the richer Phase C tools once they land.
 
+**Housekeeping still applies on this path, at these two fixed points.** Before the first `dispatch_sweep` call below, run the Host Sleep Readiness (#3350) and Main Branch Freshness (#3770) checks (their trigger is now backend-independent — see "before the first wave, or on the daemon path before the first dispatch" in each section below). They matter *more* here than on the subagent path: each of the N children this loop is about to spawn runs for minutes-to-hours as a detached process, and a stale local default branch or a mid-run host sleep affects all N of them at once, not just one session. After the last `dispatch_sweep` call returns, run Step 0a's `sweep-run-registry.sh cleanup "$RUN_ID"` (this run's registry entry and main-clean baseline are no longer needed once dispatch is done) and the Session Transcript Archival step (its own daemon-path note, below, explains what it captures on this path).
+
 **Derive `WORKSPACE_ROOT` once, before dispatching, and pass it explicitly on every `dispatch_sweep` call below.** Omitting `workspace_root` routes through the daemon's workspace-registry resolution (#4299/PR #4322): on a host with multiple managed workspaces registered, it either returns a structured ambiguity error, or — the dangerous case — silently resolves to the daemon's seeded default workspace when that default happens to be registered, targeting the wrong repo with no warning. Always pin the target explicitly:
 
 ```bash
@@ -1076,7 +1078,7 @@ The daemon enqueues the sweep, returns a sweep ID, and the skill logs the dispat
 
 **Mode C is excluded.** Mode C uses `--prs` (or NL triggers); the daemon does not handle PR-set dispatch in v0.10.0. If `PROBE_MODE` returned Mode C, this branch is unreachable — the `DECIDE` precedence sends Mode C to subagent before this branch is evaluated.
 
-**Exit immediately after the last `mcp__loom__dispatch_sweep` returns.** Do **not** run the dry-run gate, the issue-side wave lifecycle, or any of the "0." through "8." stages below — those are subagent-path-only and would double-orchestrate. The skill's job in the daemon path is dispatch and exit; the daemon-side child runs the full Curator → Builder → Judge → Doctor → Merge lifecycle in its own session.
+**Exit immediately after the last `mcp__loom__dispatch_sweep` returns and its housekeeping above (run-registry cleanup, transcript archival) completes.** Do **not** run the dry-run gate, the issue-side wave lifecycle, or any of the "0." through "8." stages below — those are subagent-path-only and would double-orchestrate. This exclusion does **not** cover the pre-/post-dispatch housekeeping named above: that is orchestrator-session bookkeeping (host-sleep, main-freshness, run-registry cleanup, transcript archival) that applies on both paths, not part of the subagent-only "0." through "8." lifecycle. The skill's job in the daemon path is dispatch (plus that housekeeping) and exit; the daemon-side child runs the full Curator → Builder → Judge → Doctor → Merge lifecycle in its own session.
 
 **Dry-run interaction:** when `--dry-run` is passed alongside the daemon path, **the dry-run gate (Stage 0) still runs and the skill EXITs without dispatching**. Dry-run is a read-only contract independent of backend choice; it prints the candidate plan and exits without mutation regardless of whether the daemon would have been used. This is intentional — operators previewing a sweep should see the plan before any backend dispatches.
 
@@ -2072,7 +2074,7 @@ Wave annotation makes it easier to triage failures (e.g., "every issue in wave 2
 
 ## Session Transcript Archival (completion hook, #3726)
 
-After the entire sweep has settled (issue list exhausted / all PRs processed) and just before printing the Summary Output, run the transcript archiver once so this session's transcript and all its subagent transcripts are captured to durable storage:
+After the entire sweep has settled (issue list exhausted / all PRs processed) and just before printing the Summary Output, run the transcript archiver once so this session's transcript and all its subagent transcripts are captured to durable storage — or, on the daemon path (no in-session wave settle and no Summary Output printed here), immediately after the last `mcp__loom__dispatch_sweep` call returns, alongside Step 0a's registry cleanup (see "The daemon-dispatch path" above). On the daemon path this orchestrator session itself has no role subagents of its own to archive — the work happens in the daemon's detached children, not here — so this step only captures the thin orchestrator session transcript; the cron periodic sync remains the backstop for the detached children's transcripts (see the "Daemon detached-child path" caveat below).
 
 ```bash
 ./.loom/scripts/archive-transcripts.sh
@@ -2100,7 +2102,7 @@ This skill does **not** implement a disk-pressure *stop* condition (aborting an 
 
 Long sweeps run for many minutes — sometimes hours overnight — and the host going to sleep mid-run tears down in-flight subagent sockets to `api.anthropic.com`, killing curator / builder / judge subagents and losing all their work (see #3350 for the incident report).
 
-**Before the first wave**, run the host-sleep readiness check and surface its output to the user:
+**Before the first wave — or, on the daemon path, before the first `mcp__loom__dispatch_sweep` call** (see "The daemon-dispatch path" above) — run the host-sleep readiness check and surface its output to the user:
 
 ```bash
 ./.loom/scripts/check-host-sleep.sh
@@ -2117,7 +2119,7 @@ If the user is running an overnight sweep, they should heed the warning before w
 
 During a long sweep, other PRs can merge to `origin`'s default branch. Because the installed `.loom/scripts/` and `.loom/hooks/` copies are synced from `defaults/` at install time, a local default branch that has drifted behind `origin` means the session may be executing **stale orchestration scripts** that silently lack recently-merged logic. This actually happened (#3770): during a 2026-07-22 sweep, `worktree.sh --base` (#3742) and `merge-pr.sh` auto-reconcile (#3752) were absent from the copies the session was running even though both had merged to `origin/main` — a running sweep had no signal it was behind.
 
-**Before the first wave**, run the main-freshness check and surface its output to the user (same timing and sibling role as the Host Sleep Readiness check above):
+**Before the first wave — or, on the daemon path, before the first `mcp__loom__dispatch_sweep` call** — run the main-freshness check and surface its output to the user (same timing and sibling role as the Host Sleep Readiness check above):
 
 ```bash
 ./.loom/scripts/check-main-freshness.sh
