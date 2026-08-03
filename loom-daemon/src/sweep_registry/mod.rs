@@ -512,6 +512,18 @@ pub struct SweepRegistry {
     /// back to `None` the moment the advisory un-trips, so a freshly re-tripped
     /// advisory always waits a full cooldown before its first probe.
     preflight_probe_last_at: Option<DateTime<Utc>>,
+    /// Wall-clock time of the most recent
+    /// [`preflight_advisory_tripped`](Self::preflight_advisory_tripped)
+    /// state-change transition (Issue #5029) — `None` until the first trip or
+    /// clear this process observes. Stamped exclusively inside
+    /// [`update_preflight_advisory`](Self::update_preflight_advisory)'s
+    /// existing state-change branch (never on an unrelated tick that leaves
+    /// `preflight_advisory_tripped` unchanged), so it is purely a display/
+    /// reporting addition — the trip/clear *decision* and
+    /// `preflight_death_streak` increment/reset semantics are untouched.
+    /// Lets `loom-daemon status` show "as of" freshness so a historical,
+    /// already-cleared tripped count is never mistaken for a live one.
+    preflight_advisory_changed_at: Option<DateTime<Utc>>,
     /// Per-issue dispatch-backoff parameters (Issue #4485). `main.rs` /
     /// [`crate::workspace_pool::WorkspacePool`] set the resolved env > config >
     /// default value at provision time, mirroring
@@ -717,6 +729,7 @@ impl SweepRegistry {
             preflight_death_last_marker: None,
             preflight_advisory_tripped: false,
             preflight_probe_last_at: None,
+            preflight_advisory_changed_at: None,
             dispatch_backoff_config: DispatchBackoffConfig::default(),
             dispatch_backoff: HashMap::new(),
             label_flip_log: HashMap::new(),
@@ -760,6 +773,7 @@ impl SweepRegistry {
             preflight_death_last_marker: None,
             preflight_advisory_tripped: false,
             preflight_probe_last_at: None,
+            preflight_advisory_changed_at: None,
             dispatch_backoff_config: DispatchBackoffConfig::default(),
             dispatch_backoff: HashMap::new(),
             label_flip_log: HashMap::new(),
@@ -863,6 +877,16 @@ impl SweepRegistry {
             .unwrap_or("unknown");
         let message = self.preflight_advisory_message(self.preflight_pool_exhausted_now(), marker);
         (true, Some(message))
+    }
+
+    /// Wall-clock time of the most recent trip/clear transition backing
+    /// [`preflight_advisory`](Self::preflight_advisory) (Issue #5029), or
+    /// `None` before the first transition this process has observed. Purely a
+    /// freshness signal for `DaemonStatusReport` / `loom-daemon status` — it
+    /// does not participate in the trip/clear decision itself.
+    #[must_use]
+    pub fn preflight_advisory_changed_at(&self) -> Option<DateTime<Utc>> {
+        self.preflight_advisory_changed_at
     }
 
     /// Current consecutive pre-flight-death streak (Issue #4386), for tests /

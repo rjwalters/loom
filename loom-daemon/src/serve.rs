@@ -1182,6 +1182,7 @@ mod tests {
             capacity_bound: false,
             preflight_advisory_active: false,
             preflight_advisory_message: None,
+            preflight_advisory_changed_at: None,
             configured_max: 0,
             per_token_concurrency: 1,
             dynamic_cap: 0,

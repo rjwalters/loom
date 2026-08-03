@@ -1012,6 +1012,16 @@ pub struct DaemonStatusReport {
     /// wire data compatible.
     #[serde(default)]
     pub preflight_advisory_message: Option<String>,
+    /// Wall-clock time of the most recent trip/clear transition backing
+    /// [`Self::preflight_advisory_active`] (Issue #5029) — `None` before the
+    /// first transition this daemon process has observed. Lets the status
+    /// renderer show an "as of" freshness indicator alongside the warning, so
+    /// a historical (already-cleared) tripped count is never mistaken for a
+    /// live one. Purely a display addition — carries no decision logic of its
+    /// own. `#[serde(default)]` keeps pre-#5029 wire data / older clients
+    /// compatible (an absent field parses as `None`).
+    #[serde(default)]
+    pub preflight_advisory_changed_at: Option<DateTime<Utc>>,
     /// Dynamic-cap input 3: **the** per-machine admission knob
     /// (`autonomous.workFinder.maxConcurrent` / `LOOM_WORK_FINDER_MAX_CONCURRENT`).
     /// Since #4512 this is the only *policy* term in the cap — the other two
