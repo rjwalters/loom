@@ -749,11 +749,23 @@ fn summarize(hosts: &[HostReport], empty_roster: bool) -> FleetStatusSummary {
 }
 
 impl FleetStatusReport {
-    /// Exit-code policy (AC 3): `0` only when every host is [`HostState::Up`];
-    /// otherwise non-zero so a monitor/CI check fails loudly rather than
-    /// silently reading an unreachable/down/draining host as fine.
+    /// Exit-code policy (AC 3): `0` only when every host is [`HostState::Up`]
+    /// **and** the roster is not empty; otherwise non-zero so a monitor/CI
+    /// check fails loudly rather than silently reading an unreachable/down/
+    /// draining/never-registered fleet as fine.
+    ///
+    /// #5060: an empty registry (no `fleet add-worker`'d hosts — only the
+    /// always-present local row) satisfies `up == total` on a technicality
+    /// (1-of-1, the local host, is up) and must NOT be allowed to exit `0`.
+    /// A `0` here is meant to say "the whole fleet was checked and every
+    /// member is healthy" — that claim is meaningless with nothing but the
+    /// local host in the roster, so callers (a watch loop included) cannot
+    /// mistake "nothing registered" for "fleet confirmed healthy".
     #[must_use]
     pub fn exit_code(&self) -> i32 {
+        if self.summary.empty_roster {
+            return 1;
+        }
         if self.summary.up == self.summary.total {
             0
         } else {
@@ -809,16 +821,36 @@ impl FleetStatusReport {
                 out.push_str(&format!("      workspaces: {}\n", host.workspaces.join(", ")));
             }
         }
-        out.push_str(&format!(
-            "\n{} host(s): {} up, {} daemon-down, {} unreachable, {} powered-off (expected), {} parse-error, {} draining.\n",
-            self.summary.total,
-            self.summary.up,
-            self.summary.daemon_down,
-            self.summary.unreachable,
-            self.summary.powered_off,
-            self.summary.parse_error,
-            self.summary.draining,
-        ));
+        if self.summary.empty_roster {
+            // #5060: the plain "N host(s): N up, ..." phrasing below reads as
+            // "the fleet was checked and is healthy" — for an empty roster
+            // that is only true of the single local row, not the fleet, so
+            // this branch must be visually distinct (own leading line, an
+            // explicit "EMPTY ROSTER" marker, and "known" rather than an
+            // unqualified host count) even to a reader skimming just this
+            // last line rather than the notice above the table.
+            out.push_str(&format!(
+                "\nEMPTY ROSTER — {} of {} known host(s) up ({} daemon-down, {} unreachable, {} powered-off (expected), {} parse-error, {} draining); this is roster coverage (local host only), NOT a confirmed healthy fleet.\n",
+                self.summary.up,
+                self.summary.total,
+                self.summary.daemon_down,
+                self.summary.unreachable,
+                self.summary.powered_off,
+                self.summary.parse_error,
+                self.summary.draining,
+            ));
+        } else {
+            out.push_str(&format!(
+                "\n{} host(s): {} up, {} daemon-down, {} unreachable, {} powered-off (expected), {} parse-error, {} draining.\n",
+                self.summary.total,
+                self.summary.up,
+                self.summary.daemon_down,
+                self.summary.unreachable,
+                self.summary.powered_off,
+                self.summary.parse_error,
+                self.summary.draining,
+            ));
+        }
         out
     }
 }
@@ -1307,6 +1339,13 @@ mod tests {
         let report =
             collect_fleet_report(source.clone(), registry, local, Duration::from_secs(5)).await;
         assert_eq!(report.exit_code(), 0);
+        // #5060 regression guard: this fix is additive to the empty-roster
+        // case only — a genuinely populated, all-up roster must still
+        // exit 0 and render the plain, unqualified summary line.
+        assert!(!report.summary.empty_roster);
+        let rendered = report.render_human();
+        assert!(rendered.contains("2 host(s): 2 up"));
+        assert!(!rendered.contains("EMPTY ROSTER"));
 
         let mut responses2 = HashMap::new();
         responses2.insert("down-host".to_string(), MockOutcome::LaunchErr);
@@ -1330,9 +1369,18 @@ mod tests {
         assert!(report.hosts[0].is_local);
         assert!(report.summary.empty_roster);
 
+        // #5060: an empty roster must never exit 0 — that reads as "fleet
+        // confirmed healthy", which is not a claim we can make about a
+        // registry with nothing but the local host in it.
+        assert_ne!(report.exit_code(), 0);
+
         let rendered = report.render_human();
         assert!(rendered.contains("no fleet workers registered"));
         assert!(rendered.contains(LOCAL_HOST_ALIAS));
+        // The summary line itself (not just the notice above the table) must
+        // also read as distinct from a genuinely healthy fleet.
+        assert!(rendered.contains("EMPTY ROSTER"));
+        assert!(!rendered.contains("1 host(s): 1 up"));
     }
 
     #[tokio::test]
