@@ -3727,6 +3727,20 @@ values are treated as unset at every tier (`--model ""` is never emitted). The
 resolved model and the tier that supplied it are recorded in the per-role log
 header: `==== loom-daemon role_runner: <ts> role=<role> model=<m> (source=<tier>) ====`.
 
+**A pinned model can still be the wrong provider family for the admitted
+runtime (#5028).** `runtimes.roles.<role> = "codex"` with no matching
+`autonomous.roleRunner.roleModels.<role>` override resolves the Claude-shaped
+default model above and forwards it to the Codex adapter, which 400s — before
+#5028 this retried identically, at full cost, on every tick forever. Runtime
+admission now resolves before the model, and a confidently-known
+Claude-vs-Codex mismatch is refused pre-spawn as `RoleTickOutcome::
+ModelRuntimeMismatch` instead of `Failure`: it never joins the generic failure
+tally, `loom-daemon health`'s `roles` section names the broken config key
+directly via the outcome's `detail()` (no spawn transcript needed), and the
+per-root log warns once on the edge and downgrades to `DEBUG` on repeat. Full
+mechanism and the `spawn-codex.sh`-side counterpart:
+[`runtime-adapters.md` § "Model/runtime mismatch refusal (#5028)"](runtime-adapters.md#model-runtime-mismatch-refusal-5028).
+
 `roles` restricts the dispatched subset (an explicit empty array runs none;
 unknown names are ignored with a warning). `intervalSecs` — both the env var
 and the config key — is a single override applied *uniformly* to every

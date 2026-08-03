@@ -607,6 +607,63 @@ resolved model and names the tier that supplied it
 (`source=autonomous.roleRunner.roleModels.<role>`), so an operator can confirm the
 pin from the log alone.
 
+#### Model/runtime mismatch refusal (#5028)
+
+`roleModels` above gives an operator a *way* to configure a matching model, but
+before #5028 nothing ever verified the two axes actually agreed: the daemon
+resolved the model and the runtime independently and forwarded whatever it got.
+Set `runtimes.roles.judge = "codex"` with no `roleModels.judge` override, and
+the runner still resolved the Claude-shaped default (`sonnet`) and forwarded it
+verbatim to the Codex adapter, which 400s — the original #5001 outage,
+recurring verbatim for anyone who reaches for the runtime axis without the
+matching model one.
+
+`loom-daemon/src/sweep_registry/model.rs` now carries a narrow, fail-open
+classifier — `model_family` / `runtime_model_family` / `model_runtime_mismatch`
+— that answers exactly one question: are the admitted runtime and the resolved
+model **confidently-known, differing** provider families (Claude vs.
+OpenAI/Codex)? Only `claude` and `codex` runtimes, and only recognized
+Claude/OpenAI model names/aliases (`@effort` suffixes stripped first), are ever
+classified; every other runtime (`aider`, a tier-3/custom adapter) or unknown
+model name always falls through unrefused. This can only ever catch a launch
+that was already guaranteed to fail on the wire — never a launch that might
+have worked.
+
+The role runner (`ScriptRoleInvocationRunner::invoke`) now resolves runtime
+admission **before** the model — the runtime is a per-role input to the
+mismatch check — and if `model_runtime_mismatch` returns `Some(reason)`, the
+tick is refused as `RoleTickOutcome::ModelRuntimeMismatch` before any spawn:
+
+- A distinct outcome, deliberately never folded into the generic `Failure`
+  tally — same argument as `NoTokenPool` (#4642): this is a permanent config
+  conflict detected pre-spawn, not a transient invocation failure.
+- Its own `MODEL_RUNTIME_MISMATCH_SKIP_COUNT` counter
+  (`model_runtime_mismatch_skip_count()`).
+- A one-line operator-facing `detail()` — `"model/runtime mismatch: … (model
+  source=…); set autonomous.roleRunner.roleModels.<role> …"` — that
+  `record_role_tick` stores on the health ring, which `assess_roles` in
+  `health.rs` already renders verbatim: `loom-daemon health` now names the
+  broken config key directly, instead of an operator reading a spawn
+  transcript to find it (the original #5001 AC2).
+- Its own `RootTickLogAction::ModelMismatchEdge` / `ModelMismatchRepeat` pair
+  in the multi-workspace loop's per-root log dedup, tracked on a third state
+  map fully independent of the `Failure`/`RuntimeRejected` and `NoTokenPool`
+  axes — a misconfigured role warns once on the edge and logs at `DEBUG` on
+  repeat, never retrying at full WARN-noise cost forever (#5001 AC3). Because
+  the check runs before token selection and the CLI start, a misconfigured
+  role now costs a config read per tick instead of a token draw plus a full
+  session — and it self-heals the moment `roleModels.<role>` is corrected, with
+  no restart and no one-shot disable to clear.
+
+`defaults/scripts/spawn-codex.sh` carries an independent copy of the same
+refusal for every OTHER caller that reaches this adapter directly with no
+daemon preflight in front of it (sweep dispatch also pins models). After the
+model-selection block resolves an effective model (explicit `-m`/`--model` >
+`LOOM_MODEL` > `LOOM_CODEX_MODEL`), a Claude-shaped value (`opus`, `opusplan`,
+`sonnet`, `haiku`, `fable`, or `claude*`, `@effort` stripped) logs the same fix
+options and exits `78` (`EX_CONFIG`) before any auth work. Escape hatch:
+`LOOM_CODEX_MODEL_CHECK=0`.
+
 Daemon admission runs before any claim lock, forge mutation, account selection,
 log header, or child spawn. Successful sweep status and
 `sweep.global.dispatch` events include both `runtime` and `runtime_source`.

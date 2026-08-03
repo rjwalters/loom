@@ -215,6 +215,102 @@ pub fn resolve_model_alias_from_config(config: &serde_json::Value, model: &str) 
 }
 
 // ----------------------------------------------------------------------------
+// Model/runtime family classification (#5028, follow-up to #5001 AC2/AC3)
+// ----------------------------------------------------------------------------
+//
+// A narrow, fail-open classifier — deliberately NOT the epic #4167 Phase 4
+// tier→ID table. It answers exactly one question: "is this model name
+// unambiguously the WRONG provider family for this runtime?" so a launch that
+// is already guaranteed to fail on the wire (a Claude-shaped model forwarded
+// to the Codex adapter, or vice versa) can be refused before a spawn instead
+// of discovered via an HTTP 400 deep inside a `claude`/`codex` session.
+//
+// Both sides must be confidently *known* to report a mismatch — an unknown
+// model name or an unrecognized runtime (aider, a tier-3/custom adapter) never
+// refuses a launch. This makes the classifier safe to run unconditionally on
+// every role tick: it can only ever catch a launch that was doomed anyway.
+
+/// The coarse provider family a model name belongs to, for the sole purpose of
+/// [`model_runtime_mismatch`]. Not a general model taxonomy — see the module
+/// note above.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelFamily {
+    /// Anthropic Claude models/aliases (`opus`, `opusplan`, `sonnet`, `haiku`,
+    /// `fable`, or any `claude*`-prefixed pinned ID).
+    Claude,
+    /// OpenAI / Codex models (`gpt*`, `o1*`, `o3*`, `o4*`, `codex*`).
+    OpenAi,
+}
+
+/// Classify a model name/alias into its [`ModelFamily`], stripping any
+/// `@effort` suffix first (`opus@xhigh` classifies identically to `opus`).
+/// Fail-open: returns `None` for anything not unambiguously recognized —
+/// a pinned third-party ID, a future alias, or an empty string are never
+/// misclassified into a false mismatch.
+#[must_use]
+pub fn model_family(model: &str) -> Option<ModelFamily> {
+    let base = model.split_once('@').map_or(model, |(base, _)| base);
+    let key = base.trim().to_ascii_lowercase();
+    if key.is_empty() {
+        return None;
+    }
+    if key.starts_with("claude")
+        || matches!(key.as_str(), "opus" | "opusplan" | "sonnet" | "haiku" | "fable")
+    {
+        return Some(ModelFamily::Claude);
+    }
+    if key.starts_with("gpt")
+        || key.starts_with("o1")
+        || key.starts_with("o3")
+        || key.starts_with("o4")
+        || key.starts_with("codex")
+    {
+        return Some(ModelFamily::OpenAi);
+    }
+    None
+}
+
+/// Classify a runtime name into the [`ModelFamily`] it accepts. Fail-open:
+/// only `claude` and `codex` (the two runtimes with an actual model-family
+/// constraint) resolve to `Some`; `aider`, a tier-3/custom runtime, or an
+/// unrecognized name always return `None` — such a runtime is never refused
+/// by this check.
+#[must_use]
+pub fn runtime_model_family(runtime: &str) -> Option<ModelFamily> {
+    match runtime.trim().to_ascii_lowercase().as_str() {
+        "claude" => Some(ModelFamily::Claude),
+        "codex" => Some(ModelFamily::OpenAi),
+        _ => None,
+    }
+}
+
+/// Issue #5028: `Some(<reason>)` only when `runtime` and `model` resolve to
+/// **known, differing** [`ModelFamily`] values — a launch guaranteed to 400 on
+/// the wire (a Claude-shaped model forwarded to the Codex adapter, or a
+/// Codex-shaped model forwarded to the Claude CLI). `None` in every other
+/// case, including either side being unrecognized — this can only ever refuse
+/// a launch that was already doomed, never a launch that might have worked.
+#[must_use]
+pub fn model_runtime_mismatch(runtime: &str, model: &str) -> Option<String> {
+    let runtime_family = runtime_model_family(runtime)?;
+    let model_family = model_family(model)?;
+    if runtime_family == model_family {
+        return None;
+    }
+    let (runtime_label, model_label) = match (runtime_family, model_family) {
+        (ModelFamily::Claude, ModelFamily::OpenAi) => ("Claude", "an OpenAI/Codex"),
+        (ModelFamily::OpenAi, ModelFamily::Claude) => ("Codex", "a Claude"),
+        // Unreachable — the `if` above already returned `None` for equal
+        // families, so only the two cross-family combinations above remain.
+        _ => ("this runtime's", "a mismatched"),
+    };
+    Some(format!(
+        "runtime {runtime:?} only accepts {runtime_label} models, but the resolved model \
+         {model:?} is {model_label} model"
+    ))
+}
+
+// ----------------------------------------------------------------------------
 // Model-cost A/B experiment (#3725) — daemon-native arm assignment (#4809)
 // ----------------------------------------------------------------------------
 
@@ -872,5 +968,95 @@ mod tests {
         }
         // And specifically the previously-broken rung is now gen-5.
         assert_eq!(generation_of(dir.path(), "opus"), 5);
+    }
+
+    // --- Issue #5028: model/runtime family classification ------------------
+
+    #[test]
+    fn model_family_classifies_claude_aliases_and_pinned_ids() {
+        for m in [
+            "opus",
+            "opusplan",
+            "sonnet",
+            "haiku",
+            "fable",
+            "claude-opus-5",
+            "CLAUDE-Sonnet-4-6",
+        ] {
+            assert_eq!(model_family(m), Some(ModelFamily::Claude), "{m} should classify as Claude");
+        }
+        // `@effort` suffixes are stripped before classification.
+        assert_eq!(model_family("opus@xhigh"), Some(ModelFamily::Claude));
+        assert_eq!(model_family("sonnet@low"), Some(ModelFamily::Claude));
+    }
+
+    #[test]
+    fn model_family_classifies_openai_aliases() {
+        for m in [
+            "gpt-5-codex",
+            "gpt-4.1",
+            "o1-mini",
+            "o3-mini",
+            "o4-mini",
+            "codex-mini-latest",
+        ] {
+            assert_eq!(model_family(m), Some(ModelFamily::OpenAi), "{m} should classify as OpenAI");
+        }
+        assert_eq!(model_family("gpt-5-codex@high"), Some(ModelFamily::OpenAi));
+    }
+
+    #[test]
+    fn model_family_fails_open_on_unknown_models() {
+        for m in ["mystery-model", "", "   ", "claude"] {
+            let result = model_family(m);
+            if m == "claude" {
+                // "claude" bare (no version) still starts with "claude" — a
+                // deliberately generous prefix match, since any pinned Claude
+                // ID is `claude-...`.
+                assert_eq!(result, Some(ModelFamily::Claude));
+            } else {
+                assert_eq!(result, None, "{m:?} must fail open (never a false mismatch)");
+            }
+        }
+    }
+
+    #[test]
+    fn runtime_model_family_only_recognizes_claude_and_codex() {
+        assert_eq!(runtime_model_family("claude"), Some(ModelFamily::Claude));
+        assert_eq!(runtime_model_family("CODEX"), Some(ModelFamily::OpenAi));
+        for rt in ["aider", "tier-3", "custom-runtime", "", "unknown"] {
+            assert_eq!(runtime_model_family(rt), None, "{rt:?} must never be refused");
+        }
+    }
+
+    #[test]
+    fn model_runtime_mismatch_only_on_a_provable_conflict() {
+        // The core #5001/#5028 scenario: Judge pinned to codex with no
+        // roleModels override still resolves the Claude-shaped default.
+        assert!(model_runtime_mismatch("codex", "sonnet").is_some());
+        assert!(model_runtime_mismatch("codex", "opus@xhigh").is_some());
+        assert!(model_runtime_mismatch("claude", "gpt-5-codex").is_some());
+
+        // A matching family is never a mismatch.
+        assert_eq!(model_runtime_mismatch("codex", "gpt-5-codex"), None);
+        assert_eq!(model_runtime_mismatch("claude", "sonnet"), None);
+        assert_eq!(model_runtime_mismatch("claude", "opus@xhigh"), None);
+
+        // Fail-open: an unrecognized runtime (aider, tier-3, custom) is never
+        // refused, regardless of the model.
+        assert_eq!(model_runtime_mismatch("aider", "sonnet"), None);
+        assert_eq!(model_runtime_mismatch("tier-3", "gpt-5-codex"), None);
+
+        // Fail-open: an unrecognized model is never refused, regardless of
+        // the runtime.
+        assert_eq!(model_runtime_mismatch("codex", "mystery-model"), None);
+        assert_eq!(model_runtime_mismatch("claude", "mystery-model"), None);
+    }
+
+    #[test]
+    fn model_runtime_mismatch_reason_names_both_sides() {
+        let reason = model_runtime_mismatch("codex", "sonnet").unwrap();
+        assert!(reason.contains("codex"), "reason must name the runtime: {reason}");
+        assert!(reason.contains("sonnet"), "reason must name the model: {reason}");
     }
 }

@@ -331,6 +331,61 @@ assert_not_contains "model_reasoning_effort=high" "$out" \
     "an explicit -c model_reasoning_effort= wins over LOOM_EFFORT"
 
 # ============================================================
+# Section 3b: Claude-shaped model refusal (issue #5028)
+# ============================================================
+
+echo ""
+echo "Testing spawn-codex.sh Claude-shaped model refusal..."
+
+run_refusal() {
+    # usage: run_refusal [VAR=val ...] -- <args...>
+    local -a envs=()
+    while [[ $# -gt 0 && "$1" != "--" ]]; do envs+=("$1"); shift; done
+    shift || true
+    set +e
+    out="$(env -u CODEX_HOME -u LOOM_CODEX_HOME -u LOOM_CODEX_PROFILE \
+        -u LOOM_CODEX_SANDBOX -u LOOM_CODEX_NETWORK -u LOOM_MODEL \
+        -u LOOM_EFFORT -u LOOM_CODEX_MODEL \
+        LOOM_SWEEP_NICE=0 LOOM_SPAWN_NO_EXPORT=1 \
+        ${envs[@]+"${envs[@]}"} \
+        bash "$SPAWN_CODEX" "$@" 2>&1)"
+    REFUSAL_RC=$?
+    set -e
+    REFUSAL_OUT="$out"
+}
+
+for claude_model in opus opusplan sonnet haiku fable claude-opus-5 OPUS "sonnet@xhigh"; do
+    run_refusal -- -p x -m "$claude_model"
+    assert_eq "78" "$REFUSAL_RC" "explicit -m $claude_model exits 78 (EX_CONFIG)"
+    assert_contains "refusing Claude-shaped model" "$REFUSAL_OUT" \
+        "the refusal message names the problem for -m $claude_model"
+    assert_contains "autonomous.roleRunner.roleModels" "$REFUSAL_OUT" \
+        "the refusal names the config key to fix for -m $claude_model"
+done
+
+# The refusal fires identically via LOOM_MODEL and LOOM_CODEX_MODEL, not just -m.
+run_refusal LOOM_MODEL=sonnet -- -p x
+assert_eq "78" "$REFUSAL_RC" "LOOM_MODEL=sonnet exits 78"
+run_refusal LOOM_CODEX_MODEL=opus -- -p x
+assert_eq "78" "$REFUSAL_RC" "LOOM_CODEX_MODEL=opus exits 78"
+
+# No argv is ever assembled for a refused launch.
+run_refusal -- -p x -m sonnet
+assert_not_contains "would-exec" "$REFUSAL_OUT" \
+    "a refused launch never reaches argv assembly/dispatch"
+
+# Fail-open: Codex-valid and unrecognized model names are never refused.
+for ok_model in gpt-5-codex o3-mini gpt-4.1 mystery-model-9000; do
+    out="$(run_argv -- -p x -m "$ok_model")"
+    assert_contains "-m $ok_model" "$out" "a Codex/unrecognized model '$ok_model' is never refused"
+done
+
+# Escape hatch: with LOOM_CODEX_NO_EXEC=1 (argv-only mode), the refusal check
+# is bypassed entirely and the run proceeds to normal argv assembly.
+out="$(run_argv LOOM_CODEX_MODEL_CHECK=0 -- -p x -m sonnet)"
+assert_contains "-m sonnet" "$out" "LOOM_CODEX_MODEL_CHECK=0 disables the refusal"
+
+# ============================================================
 # Section 4: git-repo trust check (live-CLI behavior)
 # ============================================================
 
