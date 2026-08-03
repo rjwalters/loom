@@ -3663,6 +3663,28 @@ signal. An unmeasurable probe is skipped, never treated as zero (#4164).
 already-documented behavior whose absence is a slow-motion outage (a full disk
 stops a host running sweeps at all).
 
+**Orphaned processes, not just orphaned directories (#5110).** Every pass also
+runs an orphan-**process** sub-pass ahead of the directory-removal pass above.
+`#4982`'s pgid-scoped teardown reaps a dead sweep's process **group** — but a
+tool like GNU `timeout` spawns its child into a *fresh* process group/session
+unless invoked with `--foreground`, so a multi-level driver script (e.g.
+`bash run_all.sh` → `python3` → `timeout` → a long-running child) can escape a
+pgid-scoped kill entirely and keep running after the sweep that launched it is
+long gone — a real incident pinned a host at load 65 for 5h52m this way,
+starving that host's own dispatched sweep. Each tick this sub-pass finds every
+PID whose cwd is inside an `issue-<N>` worktree (the same probe
+`classify_worktree`'s `SkipInUse` gate already uses), and — for a worktree that
+carries the `.loom-managed` sentinel AND has no live sweep claim for issue N —
+walks the FULL descendant tree of each such PID by `ppid` (not by pgid/sid, so
+a `setsid`/`timeout`-escaped tree is still reached) and terminates every PID
+found (SIGTERM, then SIGKILL after a short grace), logging what was killed.
+Both fail-safe gates (`.loom-managed` sentinel + live claim) are re-checked on
+every pass rather than trusted from a snapshot, because a stale verdict here is
+irreversible (a live sweep's own process killed) unlike a stale removal verdict
+(a no-op retried next tick). Shares this loop's enable/interval cadence but has
+its own opt-out, since terminating a live process is a strictly more
+consequential action than removing an already-idle directory.
+
 ```json
 {
   "autonomous": {
@@ -3670,7 +3692,8 @@ stops a host running sweeps at all).
       "enabled": true,
       "intervalSecs": 900,
       "gracePeriodSecs": 600,
-      "diskWarnFreeGb": 20
+      "diskWarnFreeGb": 20,
+      "orphanProcessReapEnabled": true
     }
   }
 }
@@ -3682,6 +3705,7 @@ stops a host running sweeps at all).
 | `LOOM_WORKTREE_REAPER_INTERVAL_SECS` | `autonomous.worktreeReaper.intervalSecs` | env > config > default | `900` (15 min) |
 | — | `autonomous.worktreeReaper.gracePeriodSecs` | config > default | `600` (10 min) |
 | `LOOM_WORKTREE_REAPER_DISK_WARN_GB` | `autonomous.worktreeReaper.diskWarnFreeGb` | env > config > default | `20` |
+| `LOOM_ORPHAN_PROCESS_REAPER` | `autonomous.worktreeReaper.orphanProcessReapEnabled` | env > config > default | `true` (on) |
 
 **Not limited to the daemon's attached workspace.** The loop walks
 `WorkspaceRegistry::effective_roots()` each tick, so a daemon started from
