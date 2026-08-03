@@ -124,7 +124,7 @@
 #   ./.loom/scripts/cli/loom-daemon-update.sh --no-restart  Rebuild + provision only; leave the running daemon untouched
 #   ./.loom/scripts/cli/loom-daemon-update.sh --relaunch    Launchd/systemd only: after a refused restart, re-render the plist/unit and relaunch under supervision (SIGTERMs the daemon so sweep children reparent; preserves the live LOOM_* env)
 #   ./.loom/scripts/cli/loom-daemon-update.sh --allow-stale Skip the default ff-first sync with origin/<default-branch> and build the current (possibly stale) checkout as-is (#4330) — for deliberate use: bisecting, testing a local patch
-#   ./.loom/scripts/cli/loom-daemon-update.sh --auto-resolve-safe-abort  When the ff-only sync would otherwise hard-abort (#4330), auto-perform the fix IF the blocking state classifies as safe (#4951): content-identical diverged commits (`git reset --hard origin/<default-branch>`), or dirty tracked files that are ALL Loom-managed installed copies (`git checkout --` them + re-run resync-installed.sh). Any other cause (genuine content divergence, or any unmanaged dirty file) still hard-aborts unchanged — this flag never widens what's classified as safe, only whether the safe cases are printed (default) or performed
+#   ./.loom/scripts/cli/loom-daemon-update.sh --auto-resolve-safe-abort  When the ff-only sync would otherwise hard-abort (#4330), auto-perform the fix IF the blocking state classifies as safe (#4951): content-identical diverged commits with an otherwise-CLEAN working tree (`git reset --hard origin/<default-branch>`), or dirty tracked files that are ALL Loom-managed installed copies (`git checkout --` them + re-run resync-installed.sh). Any other cause (genuine content divergence, any unmanaged dirty file, or a dirty tracked file co-existing with the content-identical divergence) still hard-aborts unchanged — this flag never widens what's classified as safe, only whether the safe cases are printed (default) or performed
 #   ./.loom/scripts/cli/loom-daemon-update.sh --help
 #
 # Environment:
@@ -197,8 +197,9 @@
 #      incoming change, or HEAD is not on <default-branch>) — the script
 #      NEVER guesses or hard-resets; resolve manually or pass --allow-stale
 #      (#4330). Two of the ff-abort causes classify as safely resolvable
-#      (#4951): content-identical diverged commits, or dirty tracked files
-#      that are ALL Loom-managed installed copies — by default these still
+#      (#4951): content-identical diverged commits with an otherwise-CLEAN
+#      working tree, or dirty tracked files that are ALL Loom-managed
+#      installed copies — by default these still
 #      exit 1 but the abort message names the exact safe command; pass
 #      --auto-resolve-safe-abort to have the script perform it instead (exit
 #      0 on success). Any other cause still hard-aborts unchanged.
@@ -649,6 +650,21 @@ FF_SYNCED=false
 # what's specified in #4951 — when genuinely unsure, both helpers must
 # return false so the caller falls through to the existing hard abort.
 
+# True (exit 0) iff NO tracked file is dirty in the working tree per
+# `git status --porcelain`. Untracked (`??`) entries are excluded, matching
+# _ff_abort_all_dirty_tracked_managed below: they cannot conflict with a
+# fast-forward merge, and `git reset --hard` never touches them either.
+_ff_abort_no_dirty_tracked_files() {
+    local repo_root="$1" line status
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        status="${line:0:2}"
+        [[ "$status" == '??' ]] && continue
+        return 1
+    done < <(cd "$repo_root" && git status --porcelain)
+    return 0
+}
+
 # True (exit 0) iff local <default> and origin/<default> are content-IDENTICAL
 # despite having diverged in commit history (e.g. a resync commit + its own
 # revert nets to no change). Deliberately the plain three-dot merge-base diff
@@ -668,11 +684,27 @@ FF_SYNCED=false
 # `reset --hard` under --auto-resolve-safe-abort. In that ancestor case the ff
 # failure is necessarily a dirty/conflicting working-tree file instead, which
 # the OTHER classifier below is responsible for.
+#
+# ALSO requires a CLEAN working tree relative to local HEAD: both checks above
+# compare only COMMITTED refs, so on their own they say nothing about
+# uncommitted work sitting in the working tree. A host can simultaneously have
+# (a) diverged local commits that net to zero content diff vs. origin and (b)
+# an entirely unrelated dirty tracked file (an operator's manual scratch edit,
+# managed or not) — `git merge --ff-only` fails on the history divergence
+# alone, so this branch is reached, and without this guard the caller's
+# --auto-resolve-safe-abort `git reset --hard origin/<default>` would silently
+# discard that file's uncommitted changes. The resolution this classifier
+# vouches for is only safe when there is no uncommitted work for it to
+# destroy, so ANY dirty tracked file makes us return false and fall through —
+# to the managed-dirty classifier below, and failing that to the existing hard
+# abort. Mirrors the strictness _ff_abort_all_dirty_tracked_managed already
+# applies, and the "when genuinely unsure, return false" rule above.
 _ff_abort_content_identical() {
     local repo_root="$1" branch="$2"
     if (cd "$repo_root" && git merge-base --is-ancestor "$branch" "origin/${branch}" 2>/dev/null); then
         return 1
     fi
+    _ff_abort_no_dirty_tracked_files "$repo_root" || return 1
     (cd "$repo_root" && git diff --quiet "origin/${branch}...${branch}" -- 2>/dev/null)
 }
 

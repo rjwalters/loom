@@ -3213,6 +3213,92 @@ else
 fi
 
 # ============================================================
+# 62. Regression (#4951 safety floor, Judge finding on PR #4965): the
+#     content-identical classifier compares only COMMITTED refs, so a host can
+#     simultaneously have (a) diverged local commits that net to zero content
+#     diff vs. origin (the test-57 shape) AND (b) an entirely unrelated dirty
+#     tracked file OUTSIDE the Loom-managed set. `git merge --ff-only` fails on
+#     the history divergence alone, so this branch is reached — and before the
+#     fix, _ff_abort_content_identical returned true regardless of the working
+#     tree, letting --auto-resolve-safe-abort `git reset --hard` silently
+#     destroy that file's uncommitted changes. It must hard-abort instead, with
+#     the dirty file byte-for-byte intact.
+# ============================================================
+W62="$BASE_WORKDIR/w62"
+BARE62="$BASE_WORKDIR/w62-origin.git"
+new_fixture_with_origin "$W62" "$BARE62"
+echo "scratchv1" > "$W62/unmanaged-scratch.txt"
+( cd "$W62" && git add unmanaged-scratch.txt && git -c user.email=test@test -c user.name=test commit -q -m "add unmanaged scratch file" && git push -q origin HEAD:refs/heads/main )
+# Origin advances with content-free commits, so the two sides' TREES stay
+# identical -- exactly the content-identical divergence of tests 57/58.
+push_extra_commits_to_origin "$BARE62" 2 >/dev/null
+( cd "$W62" && git -c user.email=test@test -c user.name=test commit -q --allow-empty -m "local commit that nets to no change" )
+# ... but now an unrelated, UNMANAGED tracked file is also dirty in the
+# working tree (an operator's manual scratch edit).
+echo "scratchv1-local-edit" > "$W62/unmanaged-scratch.txt"
+HEAD_BEFORE62="$(cd "$W62" && git rev-parse --short HEAD)"
+out62=$( cd "$W62" && PATH="$TEST_PATH" bash "$UPDATE_SCRIPT" --auto-resolve-safe-abort 2>&1 )
+rc62=$?
+assert_eq "1" "$rc62" "content-identical divergence + dirty UNMANAGED file, EVEN with --auto-resolve-safe-abort: still hard-aborts"
+HEAD_AFTER62="$(cd "$W62" && git rev-parse --short HEAD)"
+assert_eq "$HEAD_BEFORE62" "$HEAD_AFTER62" "content-identical divergence + dirty unmanaged file: HEAD untouched (no reset --hard)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ "$(cat "$W62/unmanaged-scratch.txt")" == "scratchv1-local-edit" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} uncommitted edit to an unmanaged file survives a content-identical divergence"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} uncommitted edit to an unmanaged file survives a content-identical divergence"
+    echo "  file now: $(cat "$W62/unmanaged-scratch.txt" 2>/dev/null)"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out62" | grep -qi 'Refusing to guess or hard-reset'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} content-identical + dirty unmanaged file falls through to the generic hard-abort message"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} content-identical + dirty unmanaged file falls through to the generic hard-abort message"
+    echo "  output: $out62"
+fi
+
+# ============================================================
+# 63. Same combined shape as test 62, but the co-existing dirty tracked file IS
+#     Loom-managed. The content-identical classifier must STILL decline (its
+#     `git reset --hard` is only vouched-for on a clean tree), handing the case
+#     to the managed-dirty classifier instead. That one discards the managed
+#     edit it is authorized to discard and retries the fast-forward, which
+#     still cannot apply over the history divergence -- so the run hard-aborts
+#     (exit 1) with local commits intact, rather than silently hard-resetting
+#     from the content-identical branch. Deliberately NOT resolved end-to-end:
+#     widening either classifier to cover the combination is exactly the kind
+#     of "when genuinely unsure" widening the #4381 safety note forbids.
+# ============================================================
+W63="$BASE_WORKDIR/w63"
+BARE63="$BASE_WORKDIR/w63-origin.git"
+new_fixture_with_origin "$W63" "$BARE63"
+mkdir -p "$W63/.loom/docs"
+echo "docv1" > "$W63/.loom/docs/example.md"
+( cd "$W63" && git add .loom/docs/example.md && git -c user.email=test@test -c user.name=test commit -q -m "add managed doc" && git push -q origin HEAD:refs/heads/main )
+push_extra_commits_to_origin "$BARE63" 2 >/dev/null
+( cd "$W63" && git -c user.email=test@test -c user.name=test commit -q --allow-empty -m "local commit that nets to no change" )
+echo "docv1-local-edit" > "$W63/.loom/docs/example.md"
+HEAD_BEFORE63="$(cd "$W63" && git rev-parse --short HEAD)"
+out63=$( cd "$W63" && PATH="$TEST_PATH" bash "$UPDATE_SCRIPT" --auto-resolve-safe-abort 2>&1 )
+rc63=$?
+assert_eq "1" "$rc63" "content-identical divergence + dirty MANAGED file, EVEN with --auto-resolve-safe-abort: still hard-aborts"
+HEAD_AFTER63="$(cd "$W63" && git rev-parse --short HEAD)"
+assert_eq "$HEAD_BEFORE63" "$HEAD_AFTER63" "content-identical divergence + dirty managed file: HEAD untouched (no reset --hard)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out63" | grep -qi 'reset local main to origin/main'; then
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} content-identical branch never claims a reset --hard while the tree is dirty"
+    echo "  output: $out63"
+else
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} content-identical branch never claims a reset --hard while the tree is dirty"
+fi
+
+# ============================================================
 # 25. Launchd-sandbox guards (#4078): the whole suite exercises the REAL
 #     start/stop scripts, so prove it never reached the operator's live daemon.
 #     (a) The suite-level decoy loom-daemon is still alive — no by-name kill
