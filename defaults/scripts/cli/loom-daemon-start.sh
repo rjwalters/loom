@@ -964,6 +964,13 @@ render_watchdog_plist() {
     printf '        <key>HOME</key>\n        <string>%s</string>\n' "$(xml_escape "$HOME")"
     printf '        <key>LOOM_AUTONOMY_MARKER</key>\n        <string>%s</string>\n' "$(xml_escape "$INTENT_MARKER")"
     printf '        <key>LOOM_SOCKET_PATH</key>\n        <string>%s</string>\n' "$(xml_escape "$SOCKET_PATH")"
+    # #5118: the watchdog honors LOOM_PID_FILE with the SAME precedence the
+    # daemon does (daemon_pidfile.rs tier 1), so passing the path this script
+    # chose makes the two ends single-source it. Before this the watchdog
+    # derived its own path from the socket's directory and, on a
+    # workspace-rooted install, looked at a file nothing ever writes -- a
+    # permanent false "[DIVERGENCE] no live pid file" on every fleet host.
+    printf '        <key>LOOM_PID_FILE</key>\n        <string>%s</string>\n' "$(xml_escape "$PID_FILE")"
     printf '        <key>LOOM_LAUNCHD_LABEL</key>\n        <string>%s</string>\n' "$(xml_escape "$(resolve_launchd_label)")"
     printf '    </dict>\n'
     printf '    <key>RunAtLoad</key>\n    <true/>\n'
@@ -1055,6 +1062,11 @@ render_systemd_watchdog_service() {
     printf 'Environment=HOME=%s\n' "$HOME"
     printf 'Environment=LOOM_AUTONOMY_MARKER=%s\n' "$INTENT_MARKER"
     printf 'Environment=LOOM_SOCKET_PATH=%s\n' "$SOCKET_PATH"
+    # #5118: same single-sourcing as the launchd watchdog plist above -- the
+    # watchdog resolves the pid file exactly as the daemon does, and this is
+    # the tier-1 value. (Observed on loom-worker-1: the watchdog read
+    # ~/.loom/.daemon.pid while the daemon wrote <workspace>/.loom/.daemon.pid.)
+    printf 'Environment=LOOM_PID_FILE=%s\n' "$PID_FILE"
     printf 'Environment=LOOM_DAEMON_LAUNCHD=0\n'
     printf 'StandardOutput=append:%s\n' "$log_path"
     printf 'StandardError=append:%s\n' "$log_path"
