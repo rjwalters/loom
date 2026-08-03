@@ -823,6 +823,30 @@ FAKECOSIGN
     chmod +x "$path"
 }
 
+# Writes a fake `cosign` at $1 whose `verify-blob` exits $2 AND appends its full
+# argv to the log file at $3 (#5054). Recording the argv is the point: the
+# keyless cases below assert not just "verification ran" but that it ran with
+# the DERIVED signer identity + OIDC issuer, which is the whole security
+# property — a fake cosign that always exits 0 would otherwise "pass" even if
+# the script silently verified against nothing.
+write_fake_cosign_recording() {
+    local path="$1" rc="$2" argslog="$3"
+    cat > "$path" <<FAKECOSIGN
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$argslog"
+if [[ "\${1:-}" == "verify-blob" ]]; then
+    if [[ "$rc" -eq 0 ]]; then
+        echo "Verified OK" >&2
+        exit 0
+    fi
+    echo "Error: failed to verify signature" >&2
+    exit 1
+fi
+exit 0
+FAKECOSIGN
+    chmod +x "$path"
+}
+
 MINIMAL_PATH="/usr/bin:/bin:/usr/sbin:/sbin"
 
 BASE_WORKDIR="$(mktemp -d)"
@@ -4164,6 +4188,219 @@ fi
 
 installedO_after="$("$WO/installed-loom-daemon" --version 2>/dev/null)"
 assert_eq "$installedO_before" "$installedO_after" "macOS signed-but-invalid leaves the destination binary untouched"
+
+# ------------------------------------------------------------
+# P. KEYLESS verification is the DEFAULT with NO operator configuration
+#    (#5054, the core regression this issue exists for). The release publishes
+#    `.sig` + its `.pem` signing certificate; NO LOOM_DAEMON_UPDATE_COSIGN_*
+#    env var is set and NO cosign.pub is checked in. Cases J/K/L only ever
+#    exercised the LOOM_DAEMON_UPDATE_COSIGN_PUBKEY override, so this is the
+#    first coverage of the path a stock install actually takes.
+#
+#    Asserts the recorded cosign argv, not just the log line: the expected
+#    signer identity must be DERIVED from the release slug + tag, and the
+#    issuer must be GitHub Actions' OIDC provider. Without that, a verification
+#    that "ran" could still be trusting anything.
+# ------------------------------------------------------------
+WP="$BASE_WORKDIR/w-fetch-p"
+new_fixture "$WP"
+write_fake_daemon "$WP/installed-loom-daemon" "oldc0mm" "$WP/marker"
+
+WP_ASSETS="$WP/gh-assets"
+mkdir -p "$WP_ASSETS"
+WP_BIN_NAME="loom-daemon-x86_64-unknown-linux-gnu"
+write_fake_artifact_daemon "$WP_ASSETS/$WP_BIN_NAME" "0.16.0" "keyles0"
+sha256_of "$WP_ASSETS/$WP_BIN_NAME" > "$WP_ASSETS/$WP_BIN_NAME.sha256"
+echo "fake-detached-signature" > "$WP_ASSETS/$WP_BIN_NAME.sig"
+echo "-----BEGIN CERTIFICATE-----fake-----END CERTIFICATE-----" > "$WP_ASSETS/$WP_BIN_NAME.pem"
+
+WP_FAKEBIN="$WP/fakebin"
+mkdir -p "$WP_FAKEBIN"
+WP_COSIGN_ARGS="$WP/cosign-args.log"
+write_fake_gh "$WP_FAKEBIN/gh" "v0.16.0" "$WP_ASSETS"
+write_fake_cosign_recording "$WP_FAKEBIN/cosign" 0 "$WP_COSIGN_ARGS"
+
+outP=$( cd "$WP" && PATH="$WP_FAKEBIN:$TEST_PATH" \
+    LOOM_DAEMON_BIN="$WP/installed-loom-daemon" \
+    LOOM_DAEMON_UPDATE_GH_REPO="test-owner/test-repo" \
+    LOOM_DAEMON_UPDATE_TARGET="x86_64-unknown-linux-gnu" \
+    bash "$UPDATE_SCRIPT" --no-restart 2>&1; echo "EXIT=$?" )
+rcP=$(echo "$outP" | grep -o 'EXIT=[0-9]*' | cut -d= -f2)
+assert_eq "0" "$rcP" "keyless (sig + cert, no env override): update proceeds (exit 0)"
+
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$outP" | grep -q 'cosign keyless signature verification passed' \
+    && ! echo "$outP" | grep -q 'SKIPPING verification'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} keyless: real verification runs on a STOCK install (no loud skip, no env override)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} keyless: real verification runs on a STOCK install (no loud skip, no env override)"
+    echo "  output: $outP"
+fi
+
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -qF -- '--certificate ' "$WP_COSIGN_ARGS" 2>/dev/null \
+    && grep -qF -- '--certificate-identity-regexp ^https://github\.com/test-owner/test-repo/\.github/workflows/[^@]+@refs/tags/v0\.16\.0$' "$WP_COSIGN_ARGS" \
+    && grep -qF -- '--certificate-oidc-issuer https://token.actions.githubusercontent.com' "$WP_COSIGN_ARGS" \
+    && ! grep -qF -- '--key ' "$WP_COSIGN_ARGS"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} keyless: cosign was invoked with the DERIVED signer identity (repo slug + release tag) and the GitHub Actions issuer"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} keyless: cosign was invoked with the DERIVED signer identity (repo slug + release tag) and the GitHub Actions issuer"
+    echo "  cosign argv: $(cat "$WP_COSIGN_ARGS" 2>/dev/null)"
+fi
+
+installedP_version="$("$WP/installed-loom-daemon" --version 2>/dev/null)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$installedP_version" | grep -q 'commit keyles0'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} keyless verified: the artifact was provisioned"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} keyless verified: the artifact was provisioned"
+    echo "  --version: $installedP_version"
+fi
+
+# ------------------------------------------------------------
+# Q. Keyless verification FAILS (wrong signer / tampered blob) -> abort
+#    (exit 1), destination untouched, no source-build fallback. The keyless
+#    twin of case K: enforcement must be real in BOTH directions, or "default
+#    verification" is theatre.
+# ------------------------------------------------------------
+WQ="$BASE_WORKDIR/w-fetch-q"
+new_fixture "$WQ"
+write_fake_daemon "$WQ/installed-loom-daemon" "oldc0mm" "$WQ/marker"
+installedQ_before="$("$WQ/installed-loom-daemon" --version 2>/dev/null)"
+
+WQ_ASSETS="$WQ/gh-assets"
+mkdir -p "$WQ_ASSETS"
+WQ_BIN_NAME="loom-daemon-x86_64-unknown-linux-gnu"
+write_fake_artifact_daemon "$WQ_ASSETS/$WQ_BIN_NAME" "0.16.0" "keybad0"
+sha256_of "$WQ_ASSETS/$WQ_BIN_NAME" > "$WQ_ASSETS/$WQ_BIN_NAME.sha256"
+echo "tampered-detached-signature" > "$WQ_ASSETS/$WQ_BIN_NAME.sig"
+echo "-----BEGIN CERTIFICATE-----wrong-signer-----END CERTIFICATE-----" > "$WQ_ASSETS/$WQ_BIN_NAME.pem"
+
+WQ_FAKEBIN="$WQ/fakebin"
+mkdir -p "$WQ_FAKEBIN"
+write_fake_gh "$WQ_FAKEBIN/gh" "v0.16.0" "$WQ_ASSETS"
+write_fake_cosign "$WQ_FAKEBIN/cosign" 1
+write_fake_cargo "$WQ_FAKEBIN/cargo"
+
+outQ=$( cd "$WQ" && PATH="$WQ_FAKEBIN:$TEST_PATH" \
+    LOOM_DAEMON_BIN="$WQ/installed-loom-daemon" \
+    LOOM_DAEMON_UPDATE_GH_REPO="test-owner/test-repo" \
+    LOOM_DAEMON_UPDATE_TARGET="x86_64-unknown-linux-gnu" \
+    bash "$UPDATE_SCRIPT" --no-restart 2>&1; echo "EXIT=$?" )
+rcQ=$(echo "$outQ" | grep -o 'EXIT=[0-9]*' | cut -d= -f2)
+assert_eq "1" "$rcQ" "keyless verification failure: aborts the update (exit 1)"
+
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$outQ" | grep -q 'cosign keyless signature verification FAILED' \
+    && ! echo "$outQ" | grep -q 'Rebuilding loom-daemon (cargo build'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} keyless failure: treated as tamper evidence, never a source-build fallback"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} keyless failure: treated as tamper evidence, never a source-build fallback"
+    echo "  output: $outQ"
+fi
+
+installedQ_after="$("$WQ/installed-loom-daemon" --version 2>/dev/null)"
+assert_eq "$installedQ_before" "$installedQ_after" "keyless verification failure leaves the destination binary untouched"
+
+# ------------------------------------------------------------
+# R. KEY-mode default resolution with NO env override (#5054): a key-signed
+#    release (bare `.sig`, no `.pem`) plus a checked-in `.loom/cosign.pub`
+#    verifies for real -- proving resolve_cosign_pubkey()'s conventional-path
+#    branch works, which no prior test covered (J/K set the env override, L
+#    resolved nothing at all).
+# ------------------------------------------------------------
+WR="$BASE_WORKDIR/w-fetch-r"
+new_fixture "$WR"
+write_fake_daemon "$WR/installed-loom-daemon" "oldc0mm" "$WR/marker"
+
+WR_ASSETS="$WR/gh-assets"
+mkdir -p "$WR_ASSETS"
+WR_BIN_NAME="loom-daemon-x86_64-unknown-linux-gnu"
+write_fake_artifact_daemon "$WR_ASSETS/$WR_BIN_NAME" "0.16.0" "convkey"
+sha256_of "$WR_ASSETS/$WR_BIN_NAME" > "$WR_ASSETS/$WR_BIN_NAME.sha256"
+echo "fake-detached-signature" > "$WR_ASSETS/$WR_BIN_NAME.sig"
+echo "-----BEGIN PUBLIC KEY-----fake-----END PUBLIC KEY-----" > "$WR/.loom/cosign.pub"
+
+WR_FAKEBIN="$WR/fakebin"
+mkdir -p "$WR_FAKEBIN"
+WR_COSIGN_ARGS="$WR/cosign-args.log"
+write_fake_gh "$WR_FAKEBIN/gh" "v0.16.0" "$WR_ASSETS"
+write_fake_cosign_recording "$WR_FAKEBIN/cosign" 0 "$WR_COSIGN_ARGS"
+
+outR=$( cd "$WR" && PATH="$WR_FAKEBIN:$TEST_PATH" \
+    LOOM_DAEMON_BIN="$WR/installed-loom-daemon" \
+    LOOM_DAEMON_UPDATE_GH_REPO="test-owner/test-repo" \
+    LOOM_DAEMON_UPDATE_TARGET="x86_64-unknown-linux-gnu" \
+    bash "$UPDATE_SCRIPT" --no-restart 2>&1; echo "EXIT=$?" )
+rcR=$(echo "$outR" | grep -o 'EXIT=[0-9]*' | cut -d= -f2)
+assert_eq "0" "$rcR" "key mode via checked-in .loom/cosign.pub (no env override): update proceeds (exit 0)"
+
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$outR" | grep -q 'cosign signature verification passed' \
+    && grep -qF -- "--key $WR/.loom/cosign.pub" "$WR_COSIGN_ARGS" 2>/dev/null; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} key mode: the checked-in .loom/cosign.pub resolves with no env override"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} key mode: the checked-in .loom/cosign.pub resolves with no env override"
+    echo "  output: $outR"
+    echo "  cosign argv: $(cat "$WR_COSIGN_ARGS" 2>/dev/null)"
+fi
+
+# ------------------------------------------------------------
+# S. The ARTIFACT's shape selects the mode, never local config (#5054): a
+#    keyless release (`.sig` + `.pem`) is verified keylessly EVEN WHEN a stale
+#    LOOM_DAEMON_UPDATE_COSIGN_PUBKEY is set. The inverse (letting a leftover
+#    key win) would turn every operator's stale env var into a fleet-wide false
+#    "tamper" abort.
+# ------------------------------------------------------------
+WS="$BASE_WORKDIR/w-fetch-s"
+new_fixture "$WS"
+write_fake_daemon "$WS/installed-loom-daemon" "oldc0mm" "$WS/marker"
+
+WS_ASSETS="$WS/gh-assets"
+mkdir -p "$WS_ASSETS"
+WS_BIN_NAME="loom-daemon-x86_64-unknown-linux-gnu"
+write_fake_artifact_daemon "$WS_ASSETS/$WS_BIN_NAME" "0.16.0" "shapes0"
+sha256_of "$WS_ASSETS/$WS_BIN_NAME" > "$WS_ASSETS/$WS_BIN_NAME.sha256"
+echo "fake-detached-signature" > "$WS_ASSETS/$WS_BIN_NAME.sig"
+echo "-----BEGIN CERTIFICATE-----fake-----END CERTIFICATE-----" > "$WS_ASSETS/$WS_BIN_NAME.pem"
+echo "-----BEGIN PUBLIC KEY-----stale-----END PUBLIC KEY-----" > "$WS/stale-cosign.pub"
+
+WS_FAKEBIN="$WS/fakebin"
+mkdir -p "$WS_FAKEBIN"
+WS_COSIGN_ARGS="$WS/cosign-args.log"
+write_fake_gh "$WS_FAKEBIN/gh" "v0.16.0" "$WS_ASSETS"
+write_fake_cosign_recording "$WS_FAKEBIN/cosign" 0 "$WS_COSIGN_ARGS"
+
+outS=$( cd "$WS" && PATH="$WS_FAKEBIN:$TEST_PATH" \
+    LOOM_DAEMON_BIN="$WS/installed-loom-daemon" \
+    LOOM_DAEMON_UPDATE_GH_REPO="test-owner/test-repo" \
+    LOOM_DAEMON_UPDATE_TARGET="x86_64-unknown-linux-gnu" \
+    LOOM_DAEMON_UPDATE_COSIGN_PUBKEY="$WS/stale-cosign.pub" \
+    bash "$UPDATE_SCRIPT" --no-restart 2>&1; echo "EXIT=$?" )
+rcS=$(echo "$outS" | grep -o 'EXIT=[0-9]*' | cut -d= -f2)
+assert_eq "0" "$rcS" "keyless release + stale pubkey env: still verifies keylessly (exit 0)"
+
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$outS" | grep -q 'cosign keyless signature verification passed' \
+    && ! grep -qF -- '--key ' "$WS_COSIGN_ARGS" 2>/dev/null; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} artifact shape (not local config) selects the verification mode"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} artifact shape (not local config) selects the verification mode"
+    echo "  output: $outS"
+    echo "  cosign argv: $(cat "$WS_COSIGN_ARGS" 2>/dev/null)"
+fi
 
 # ============================================================
 # 25. Launchd-sandbox guards (#4078): the whole suite exercises the REAL

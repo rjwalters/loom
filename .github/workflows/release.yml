@@ -15,22 +15,35 @@ name: Build and Release
 #
 #   - macOS Developer ID codesign of the aarch64-apple-darwin artifact, plus
 #     optional notarization, when the Developer ID / notary secrets are set.
-#   - Optional cosign detached-signature (`.sig`) over the Linux artifacts when
-#     a cosign key secret is set.
+#   - cosign detached-signature (`.sig`) over the Linux artifacts.
 #
-# EVERY signing step is gated on Actions secrets being present and skips
+# The macOS signing steps are gated on Actions secrets being present and skip
 # cleanly (with a LOUD entry in the run summary, never silent) when they are
-# absent — a no-secrets release still succeeds with unsigned artifacts +
+# absent — a no-secrets release still succeeds with unsigned macOS artifacts +
 # checksums, byte-for-byte as Phase 1 left it. No org name, team ID, cert
 # reference, or other deployer identity lives in this file or any tracked file:
 # all identity comes from secrets only. If you ever need to hardcode one here,
 # that's a scope regression — put it in a secret instead.
 #
+# Linux signing is KEYLESS by default (#5054): cosign gets a short-lived
+# Sigstore certificate from the workflow's own GitHub Actions OIDC token, so it
+# needs NO secret to be provisioned and publishes no long-lived key material.
+# That is what lets `loom-daemon-update.sh` verify for real on a stock install
+# instead of loud-skipping for want of a distributed public key. A repo that
+# still wants classic key signing sets the COSIGN_PRIVATE_KEY secret, which
+# takes precedence (see the detect step below); it then owes its consumers the
+# matching public key out of band.
+#
 # Output format (for Phase 3's verifier): the checksum is always present and is
 # computed over the FINAL artifact (after any in-place codesign), so it matches
 # whatever bytes are uploaded. macOS signatures are embedded in the Mach-O
 # (verify with `codesign --verify`); Linux signatures are detached `.sig` files
-# (verify with `cosign verify-blob --key <pubkey> --signature <sig>`).
+# — keyless ones ship the signing certificate alongside as `.pem` (verify with
+# `cosign verify-blob --certificate <pem> --signature <sig>
+# --certificate-identity-regexp ... --certificate-oidc-issuer ...`), key-signed
+# ones ship the bare `.sig` (verify with `cosign verify-blob --key <pubkey>
+# --signature <sig>`). The presence of the `.pem` is the wire signal that tells
+# the consumer which mode was used.
 #
 # Consuming these artifacts from `loom-daemon-update.sh` / the daemon
 # auto-updater is out of scope here (#4990 Phase 3) — the LOCAL `cargo build`
@@ -54,6 +67,11 @@ on:
 
 permissions:
   contents: write
+  # Keyless cosign signing of the Linux artifacts (#5054): mints the workflow's
+  # OIDC token so Fulcio can issue the short-lived signing certificate. This is
+  # the ONLY thing that grants signing authority here — there is no key to leak,
+  # and no secret to provision before a release can be signed.
+  id-token: write
 
 jobs:
   build-daemon:
@@ -139,6 +157,7 @@ jobs:
           macos_sign=false
           notarize=false
           linux_sign=false
+          linux_sign_mode=none
 
           summary() { echo "$1" >> "$GITHUB_STEP_SUMMARY"; }
           summary "### Signing (${target})"
@@ -165,12 +184,23 @@ jobs:
               fi
               ;;
             *-linux-*)
+              # Precedence: an explicitly provisioned key wins (a repo that set
+              # COSIGN_PRIVATE_KEY has already told its consumers which key to
+              # trust, and silently switching it to keyless would invalidate
+              # that). Otherwise keyless, which needs no secret at all — so the
+              # DEFAULT for this repo, and for every fork, is a really-signed
+              # Linux artifact rather than an unsigned one (#5054).
               if [ -n "${COSIGN_PRIVATE_KEY:-}" ]; then
                 linux_sign=true
-                summary "- Signed: cosign key secret present — writing detached \`${target}.sig\`."
+                linux_sign_mode=key
+                summary "- Signed (key mode): COSIGN_PRIVATE_KEY secret present — writing detached \`${target}.sig\`. Consumers must resolve the matching public key themselves (LOOM_DAEMON_UPDATE_COSIGN_PUBKEY / \`.loom/cosign.pub\`)."
+              elif [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+                linux_sign=true
+                linux_sign_mode=keyless
+                summary "- Signed (keyless): using this workflow's GitHub Actions OIDC identity — writing detached \`${target}.sig\` + its signing certificate \`${target}.pem\`. No key material is distributed; consumers verify the signer identity."
               else
-                summary "- SKIPPED signing: cosign key secret absent — shipping UNSIGNED \`${target}\` + checksum (Phase 1 behavior)."
-                echo "::notice::Linux signing skipped for ${target} (cosign key absent); shipping unsigned artifact + checksum."
+                summary "- SKIPPED signing: no COSIGN_PRIVATE_KEY secret AND no OIDC token (the job lacks \`id-token: write\`) — shipping UNSIGNED \`${target}\` + checksum (Phase 1 behavior)."
+                echo "::notice::Linux signing skipped for ${target} (no cosign key and no OIDC token); shipping unsigned artifact + checksum."
               fi
               ;;
           esac
@@ -179,6 +209,7 @@ jobs:
             echo "macos_sign=${macos_sign}"
             echo "notarize=${notarize}"
             echo "linux_sign=${linux_sign}"
+            echo "linux_sign_mode=${linux_sign_mode}"
           } >> "$GITHUB_OUTPUT"
 
       - name: Sign macOS artifact (Developer ID)
@@ -250,18 +281,37 @@ jobs:
         env:
           COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
           COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+          SIGN_MODE: ${{ steps.signing.outputs.linux_sign_mode }}
         run: |
           set -euo pipefail
           artifact="dist/loom-daemon-${{ matrix.target }}"
-          # Detached signature so Phase 3 can verify with the matching public key:
-          #   cosign verify-blob --key <pubkey> --signature <target>.sig <binary>
-          # COSIGN_PASSWORD is read from the env by cosign to decrypt the key.
-          key="$RUNNER_TEMP/cosign.key"
-          printf '%s' "$COSIGN_PRIVATE_KEY" > "$key"
-          cosign sign-blob --yes --key "$key" \
-            --output-signature "dist/loom-daemon-${{ matrix.target }}.sig" \
-            "$artifact"
-          rm -f "$key"
+          sig="dist/loom-daemon-${{ matrix.target }}.sig"
+          cert="dist/loom-daemon-${{ matrix.target }}.pem"
+          if [ "$SIGN_MODE" = "keyless" ]; then
+            # Keyless (#5054): cosign exchanges this workflow's OIDC token for a
+            # short-lived Fulcio certificate whose SAN is
+            #   https://github.com/<owner>/<repo>/.github/workflows/release.yml@refs/tags/<tag>
+            # and records the signature in Rekor. Publishing the certificate
+            # next to the signature is what lets a consumer verify with NO
+            # distributed key:
+            #   cosign verify-blob --certificate <target>.pem --signature <target>.sig \
+            #     --certificate-identity-regexp '^https://github\.com/<slug>/\.github/workflows/[^@]+@refs/tags/<tag>$' \
+            #     --certificate-oidc-issuer https://token.actions.githubusercontent.com <binary>
+            cosign sign-blob --yes \
+              --output-signature "$sig" \
+              --output-certificate "$cert" \
+              "$artifact"
+          else
+            # Key mode (only when COSIGN_PRIVATE_KEY is set): detached signature
+            # verified as `cosign verify-blob --key <pubkey> --signature <sig>`.
+            # COSIGN_PASSWORD is read from the env by cosign to decrypt the key.
+            key="$RUNNER_TEMP/cosign.key"
+            printf '%s' "$COSIGN_PRIVATE_KEY" > "$key"
+            cosign sign-blob --yes --key "$key" \
+              --output-signature "$sig" \
+              "$artifact"
+            rm -f "$key"
+          fi
 
       # Checksum is computed AFTER signing so it covers the FINAL bytes (macOS
       # codesign rewrites the Mach-O in place). Phase 3 verifies this checksum
@@ -285,11 +335,15 @@ jobs:
         with:
           # The `*.sig` glob matches the detached Linux signature when cosign
           # signing ran and matches nothing otherwise (skipped, not an error) —
-          # so the same block covers signed and unsigned releases.
+          # so the same block covers signed and unsigned releases. `*.pem`
+          # likewise matches only for a KEYLESS-signed artifact; its presence
+          # (or absence) is the signal Phase 3's verifier uses to pick keyless
+          # vs. key verification, so it must be uploaded alongside the `.sig`.
           files: |
             dist/loom-daemon-${{ matrix.target }}
             dist/loom-daemon-${{ matrix.target }}.sha256
             dist/loom-daemon-${{ matrix.target }}*.sig
+            dist/loom-daemon-${{ matrix.target }}*.pem
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
