@@ -5273,6 +5273,126 @@ exit 0
         }
     }
 
+    /// Issue #4980 acceptance criterion 3: `loom-daemon cancel` (CLI) and
+    /// `cancel_sweep` (MCP) must **share** the termination implementation.
+    ///
+    /// The structural guarantee is that both surfaces put the *same frame* on
+    /// the wire, so there is exactly one server-side path and nothing to
+    /// diverge. This asserts it at the byte level: the JSON `mcp-loom`'s
+    /// `cancelSweep` sends and the JSON the CLI serializes from
+    /// `build_cancel_request` deserialize to the identical
+    /// `Request::CancelSweep`.
+    #[test]
+    fn test_cancel_sweep_cli_and_mcp_frames_are_identical_on_the_wire() {
+        // Exactly what `mcp-loom/src/tools/sweeps.ts` `cancelSweep` sends
+        // (`sendDaemonRequest` writes the `{type, payload}` shape verbatim).
+        let mcp_frame = r#"{"type":"CancelSweep","payload":{"sweep_id":"sweep-issue-4980-1","grace_secs":30,"workspace_root":null}}"#;
+        let from_mcp: Request = serde_json::from_str(mcp_frame).expect("MCP frame must parse");
+
+        // Exactly what the `loom-daemon cancel` CLI serializes.
+        let from_cli: Request = serde_json::from_str(
+            &serde_json::to_string(&Request::CancelSweep {
+                sweep_id: "sweep-issue-4980-1".to_string(),
+                grace_secs: 30,
+                workspace_root: None,
+            })
+            .unwrap(),
+        )
+        .expect("CLI frame must parse");
+
+        match (&from_mcp, &from_cli) {
+            (
+                Request::CancelSweep {
+                    sweep_id: mcp_id,
+                    grace_secs: mcp_grace,
+                    workspace_root: mcp_ws,
+                },
+                Request::CancelSweep {
+                    sweep_id: cli_id,
+                    grace_secs: cli_grace,
+                    workspace_root: cli_ws,
+                },
+            ) => {
+                assert_eq!(mcp_id, cli_id);
+                assert_eq!(mcp_grace, cli_grace);
+                assert_eq!(mcp_ws, cli_ws);
+            }
+            other => panic!("expected two CancelSweep requests, got {other:?}"),
+        }
+    }
+
+    /// Issue #4980: a CLI-invoked cancel runs the full daemon-side termination
+    /// path — terminal transition plus claim-lock release — exercised through a
+    /// frame parsed off the wire rather than one constructed in-process, so a
+    /// wire-format regression fails here too.
+    #[test]
+    #[serial_test::serial]
+    fn test_handle_request_cancel_sweep_from_cli_frame_runs_the_shared_path() {
+        let (tm, db, _, bus) = setup_test_context();
+        let (sr, dir, _rec) = setup_sweep_registry_in_tempdir();
+        let _registry_guard = seed_temp_registry(&[]);
+
+        let dispatched = handle_request(
+            Request::DispatchSweep {
+                kind: SweepKind::Issue(4980),
+                idempotency_key: None,
+                model: None,
+                effort: None,
+                depends_on: None,
+                // `None` resolves to the default registry `sr` — the same
+                // tempdir-rooted registry the cancel below targets.
+                workspace_root: None,
+                force: false,
+            },
+            &tm,
+            &db,
+            &sr,
+            &bus,
+            &test_pool(),
+        );
+        let sweep_id = match dispatched {
+            Response::SweepDispatched { sweep_id, .. } => sweep_id,
+            other => panic!("Expected SweepDispatched, got: {other:?}"),
+        };
+        let lock_dir = dir.path().join(".loom").join("locks").join("issue-4980");
+        assert!(lock_dir.exists(), "dispatch should have taken the claim lock");
+
+        // Parse the CLI's frame off the wire, exactly as `handle_client` would.
+        let frame = serde_json::to_string(&Request::CancelSweep {
+            sweep_id: sweep_id.clone(),
+            grace_secs: 1,
+            workspace_root: None,
+        })
+        .unwrap();
+        let request: Request = serde_json::from_str(&frame).expect("CLI frame must parse");
+
+        let response = handle_request(request, &tm, &db, &sr, &bus, &test_pool());
+        match response {
+            Response::SweepCancelled {
+                sweep_id: cancelled,
+                ..
+            } => assert_eq!(cancelled, sweep_id),
+            other => panic!("Expected SweepCancelled, got: {other:?}"),
+        }
+
+        let state = sr
+            .lock()
+            .unwrap()
+            .get(&sweep_id)
+            .expect("entry should still be tracked")
+            .state
+            .clone();
+        assert!(
+            matches!(state, crate::types::SweepState::Exited { .. }),
+            "a CLI-invoked cancel must run the same terminal transition the MCP tool does, \
+             got {state:?}"
+        );
+        assert!(
+            !lock_dir.exists(),
+            "a CLI-invoked cancel must release the claim lock, exactly like the MCP path"
+        );
+    }
+
     #[test]
     #[serial_test::serial]
     fn test_handle_request_get_sweep_status_returns_existing() {

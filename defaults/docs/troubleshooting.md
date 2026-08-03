@@ -579,11 +579,30 @@ mcp__loom__tail_sweep_log --sweep_id <id>
 ### Cancel a sweep
 
 ```bash
-# Cancel a running sweep (SIGTERM → grace → SIGKILL)
+# From a Claude session with the MCP server attached:
 mcp__loom__cancel_sweep --sweep_id <id>
+
+# From a shell — including over ssh to a fleet worker (#4980). Same IPC
+# request, same daemon-side termination path:
+loom-daemon cancel <sweep-id>
+loom-daemon cancel --issue 123          # resolves the live sweep for that issue
+loom-daemon cancel --issue 123 --grace 5
 ```
 
-The daemon's reaper task detects dead PIDs (every 30s) and removes them from the registry, emitting `sweep.issue.*.exited` / `sweep.issue.*.crashed` events.
+Both send SIGTERM to the sweep's **process group**, wait the grace window, then
+SIGKILL — so the wrapper, the `claude` agent, and every descendant (build tools,
+simulations, watcher loops) die together.
+
+**Never hand-`kill` a sweep's pids instead.** The registry tracks the
+`claude-wrapper.sh` pid; killing it leaves the underlying agent alive. On
+2026-08-03 that surviving agent noticed its subprocesses had died and
+*relaunched* them, against an issue whose claim the crash path had already
+returned to `loom:issue` — a zombie agent the registry reported as
+`in_flight: 0`. If you have already done this, `loom-daemon status` will not show
+the survivors: find them with `pstree -p <pid>` / `ps -eo pid,pgid,args` and kill
+the whole group (`kill -TERM -<pgid>`).
+
+The daemon's reaper task detects dead PIDs (every 30s) and removes them from the registry, emitting `sweep.issue.*.exited` / `sweep.issue.*.crashed` events. Since #4980 it also reaps a dead leader's *surviving* process group on that same tick, so an orphaned agent no longer keeps running unclaimed work.
 
 ### Stuck sweep child
 
@@ -596,7 +615,8 @@ ls -la .loom/sweep-checkpoint/issue-123.json
 # Look at the child's log for errors
 tail -200 .loom/logs/sweep-issue-123.log
 
-# Cancel it through the daemon:
+# Cancel it through the daemon (MCP tool, or `loom-daemon cancel <id>` from a
+# shell / over ssh):
 mcp__loom__cancel_sweep --sweep_id <id>
 
 # The checkpoint survives cancellation, so re-dispatching the issue resumes

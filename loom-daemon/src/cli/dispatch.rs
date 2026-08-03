@@ -53,7 +53,12 @@ fn build_dispatch_request(
 /// unit-testable without touching the real filesystem/env; `cwd`/`registry`
 /// are resolved once by [`handle_dispatch_command`] via `std::env::current_dir()`
 /// / `WorkspaceRegistry::load_default()`.
-fn resolve_cli_dispatch_workspace(
+///
+/// Shared with `loom-daemon cancel` (#4980) rather than duplicated: the two
+/// commands must resolve the *same* repo from the same cwd, or an operator
+/// standing in a registered repo could dispatch into it and then fail to cancel
+/// the sweep they just started.
+pub(crate) fn resolve_cli_dispatch_workspace(
     explicit: Option<String>,
     cwd: &Path,
     registry: &loom_daemon::workspace_registry::WorkspaceRegistry,

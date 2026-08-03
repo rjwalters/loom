@@ -257,7 +257,8 @@ worktrees, stuck agents, daemon registry/event-bus/reaper issues, host-sleep and
 `.loom/` resync procedures, and common fixes. Quick fixes: `loom-clean --force`
 (stale worktrees/branches), `loom-recover-orphans --recover` (orphaned
 `loom:building` issues), `gh label sync --file .github/labels.yml` (re-sync
-labels), `mcp__loom__cancel_sweep --sweep_id <id>` (cancel a running sweep).
+labels), `loom-daemon cancel --issue <N>` / `mcp__loom__cancel_sweep` (cancel a
+running sweep — never hand-`kill` its pids, #4980).
 
 ## Migration History
 

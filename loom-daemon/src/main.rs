@@ -253,6 +253,42 @@ enum Commands {
         force: bool,
     },
 
+    /// Cancel a running sweep via the running daemon (Issue #4980): the `dispatch`
+    /// sibling, over the same `CancelSweep` IPC request the
+    /// `mcp__loom__cancel_sweep` tool uses.
+    ///
+    /// This is the sanctioned way to stop a wedged sweep over ssh, where no MCP
+    /// server is attached. Do NOT hand-`kill` a sweep's pids instead: the daemon
+    /// tracks the wrapper, and killing it leaves the underlying `claude` agent
+    /// alive — in the 2026-08-03 incident that surviving agent noticed its
+    /// subprocesses had died and relaunched them, against an issue whose claim
+    /// had already been returned to the queue. The daemon signals the whole
+    /// process GROUP (SIGTERM, then SIGKILL after the grace window), releases the
+    /// claim lock, restores the label, and emits the lifecycle events.
+    Cancel {
+        /// The sweep id to cancel (as shown by `loom-daemon status`). Mutually
+        /// exclusive with `--issue`.
+        #[arg(value_name = "SWEEP_ID", required_unless_present = "issue")]
+        sweep_id: Option<String>,
+
+        /// Cancel the live sweep for this issue instead of naming a sweep id.
+        /// Resolved client-side against the daemon's registry; refuses rather
+        /// than guesses if the issue somehow has more than one live sweep.
+        #[arg(long, value_name = "N", conflicts_with = "sweep_id")]
+        issue: Option<u32>,
+
+        /// Seconds to wait between SIGTERM and SIGKILL. Defaults to the same
+        /// value the `cancel_sweep` MCP tool sends.
+        #[arg(long, value_name = "SECS", default_value_t = cli::cancel::DEFAULT_CANCEL_GRACE_SECS)]
+        grace: u64,
+
+        /// Target managed-workspace root (Issue #3929). Omit to use the daemon's
+        /// default workspace, or the registered repo the CLI's own cwd falls
+        /// under (#4299) — the same resolution `dispatch` applies.
+        #[arg(long, value_name = "PATH")]
+        workspace: Option<String>,
+    },
+
     /// Start a minimal read-only HTTP status-snapshot listener + embedded
     /// dashboard (Issue #4391 phase 1, #4392 phase 2, #4393 phase 3 of
     /// #4329). `GET /api/status` (#4391) serializes the same
@@ -2109,6 +2145,11 @@ fn handle_cli_command(command: Commands) -> Result<()> {
             // Routed directly in `main()` (it needs the async runtime for the
             // socket round-trip), never dispatched through this sync handler.
             unreachable!("Dispatch is handled in main() before handle_cli_command")
+        }
+        Commands::Cancel { .. } => {
+            // Routed directly in `main()` (it needs the async runtime for the
+            // socket round-trip), never dispatched through this sync handler.
+            unreachable!("Cancel is handled in main() before handle_cli_command")
         }
         Commands::Watch { .. } => {
             // Routed directly in `main()` (it needs the async runtime for the

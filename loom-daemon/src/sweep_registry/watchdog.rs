@@ -2347,6 +2347,7 @@ mod tests {
         reg.entries.insert(
             "sweep-issue-6006-live".to_string(),
             SweepInfo {
+                pgid: None,
                 sweep_id: "sweep-issue-6006-live".to_string(),
                 kind: SweepKind::Issue(6006),
                 pid: 2_147_483_640,
@@ -2612,6 +2613,7 @@ mod tests {
         reg.entries.insert(
             sid.clone(),
             SweepInfo {
+                pgid: None,
                 sweep_id: sid.clone(),
                 kind: SweepKind::Issue(6001),
                 pid: 2_147_483_640,

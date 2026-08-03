@@ -11,6 +11,45 @@ use super::*;
 /// killed mid-build.
 pub const BG_WAIT_CEILING_ENV: &str = "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS";
 
+/// Resolve the process group of a just-spawned sweep leader (Issue #4980).
+///
+/// `spawn_child` sets `process_group(0)` on every Unix spawn (#3800), so the
+/// child is its own group leader and `getpgid(child) == child`. We *verify* that
+/// rather than assume it, because the recorded value later authorizes a
+/// `kill(-pgid, …)`: recording a group the child does not actually lead would
+/// aim a SIGKILL at unrelated processes (in the worst case the daemon's own
+/// group).
+///
+/// The three outcomes:
+///
+/// - **Confirmed leader** (`getpgid == pid`) → `Some(pid)`.
+/// - **Contradiction** (`getpgid` names some other group) → `None` + a warning.
+///   `process_group(0)` did not take; degrade to single-PID signalling rather
+///   than signal a group we do not own.
+/// - **Unanswerable** (the child already exited, `ESRCH`) → `Some(pid)`. The
+///   spawn unconditionally requested its own group, so `pgid == pid` is the only
+///   shape this spawn can have, and this is precisely the crash case where the
+///   persisted group is the only handle on any surviving descendants. Every
+///   consumer re-checks `group_has_members` before signalling, so a fully-dead
+///   group is a no-op.
+fn spawned_leader_pgid(pid: u32) -> Option<u32> {
+    if !cfg!(unix) {
+        return None;
+    }
+    match process_group_of(pid) {
+        Some(pgid) if pgid == pid => Some(pid),
+        Some(other) => {
+            log::warn!(
+                "sweep_registry: spawned child pid {pid} reports process group {other} rather \
+                 than leading its own — `process_group(0)` did not take. Recording NO group; \
+                 cancellation will degrade to single-PID signalling (#4980)."
+            );
+            None
+        }
+        None => Some(pid),
+    }
+}
+
 /// Typed, matchable error returned by [`SweepRegistry::dispatch`] when the
 /// open-PR guard (Issue #4123, step 2.6) refuses a dispatch because the target
 /// issue already has an **open** linked pull request.
@@ -1111,6 +1150,10 @@ impl SweepRegistry {
         }
 
         let pid = child.id();
+        // Issue #4980: capture the child's process group NOW, while it is alive
+        // — `getpgid` cannot answer for a dead pid, so a group handle acquired
+        // any later is unavailable in exactly the crash case that needs it most.
+        let pgid = spawned_leader_pgid(pid);
         // Retain the handle so the reaper can `try_wait()` it (Issue #3801).
         self.children.insert(sweep_id.clone(), child);
 
@@ -1121,10 +1164,16 @@ impl SweepRegistry {
         // daemon PID is gone after any restart, so keeping it would make even a
         // still-live daemon-dispatched child look stale in `reconstruct()`'s
         // lock pass. Rewrite `owner_pid` now that the child exists.
-        if let Err(e) = self.record_child_pid_in_lock(issue_number, pid) {
+        //
+        // The same write persists the child's process group (#4980) so a
+        // post-restart `reconstruct()` — and a fresh `loom-daemon cancel`
+        // process, which never held the spawn-time `Child` handle — can still
+        // tear down the WHOLE tree instead of orphaning it.
+        if let Err(e) = self.record_child_pid_in_lock(issue_number, pid, pgid) {
             log::warn!(
-                "failed to record child pid {pid} in lock for issue #{issue_number} \
-                 (reconstruct may treat it as stale after a daemon restart): {e}"
+                "failed to record child pid {pid} (pgid {pgid:?}) in lock for issue \
+                 #{issue_number} (reconstruct may treat it as stale after a daemon restart, \
+                 and a post-restart cancel may not reach the whole process group): {e}"
             );
         }
 
@@ -1137,6 +1186,8 @@ impl SweepRegistry {
             sweep_id: sweep_id.clone(),
             kind: kind.clone(),
             pid,
+            // Group handle for cancellation / crash-path reaping (#4980).
+            pgid,
             token_name: token_name.clone(),
             runtime,
             runtime_source: runtime_admission.as_ref().map(|a| a.source.clone()),
@@ -1670,6 +1721,7 @@ mod tests {
 
         let mk_info =
             |sweep_id: &str, issue: u32, state: SweepState, log_path: PathBuf| SweepInfo {
+                pgid: None,
                 sweep_id: sweep_id.to_string(),
                 kind: SweepKind::Issue(issue),
                 pid: 0,

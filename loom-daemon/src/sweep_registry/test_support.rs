@@ -336,6 +336,7 @@ pub(crate) fn insert_clean_exit_running(
     registry.entries.insert(
         sweep_id.clone(),
         SweepInfo {
+            pgid: None,
             sweep_id: sweep_id.clone(),
             kind: SweepKind::Issue(issue),
             pid,
@@ -446,6 +447,7 @@ pub(crate) fn insert_running_at(
     registry.entries.insert(
         sweep_id.clone(),
         SweepInfo {
+            pgid: None,
             sweep_id: sweep_id.clone(),
             kind: SweepKind::Issue(issue),
             pid: std::process::id(), // any live-looking pid; list() never probes liveness
@@ -509,6 +511,7 @@ pub(crate) fn insert_dead_running_at(
     registry.entries.insert(
         sweep_id.clone(),
         SweepInfo {
+            pgid: None,
             sweep_id: sweep_id.clone(),
             kind: SweepKind::Issue(issue),
             pid: 2_147_483_640, // ~i32::MAX, almost certainly dead
@@ -793,6 +796,7 @@ pub(crate) fn insert_terminal_issue(
     reg.entries.insert(
         sid.to_string(),
         SweepInfo {
+            pgid: None,
             sweep_id: sid.to_string(),
             kind: SweepKind::Issue(issue),
             pid: 2_147_483_640,
@@ -1109,6 +1113,7 @@ pub(crate) fn write_lock_owner(
     let lock = locks.join(format!("issue-{issue}"));
     std::fs::create_dir_all(&lock).unwrap();
     let owner = LockOwner {
+        pgid: None,
         issue,
         owner_pid,
         acquired_at: Utc::now().to_rfc3339(),
@@ -1138,6 +1143,7 @@ pub(crate) fn insert_dead_running_entry(reg: &mut SweepRegistry, issue: u32, swe
     reg.entries.insert(
         sweep_id.to_string(),
         SweepInfo {
+            pgid: None,
             sweep_id: sweep_id.to_string(),
             kind: SweepKind::Issue(issue),
             pid: 2_147_483_641,
