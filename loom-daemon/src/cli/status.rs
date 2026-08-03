@@ -756,6 +756,7 @@ pub(crate) mod status_client_tests {
             capacity_bound: false,
             preflight_advisory_active: false,
             preflight_advisory_message: None,
+            preflight_advisory_changed_at: None,
             configured_max: 5,
             per_token_concurrency: 2,
             dynamic_cap: 3,

@@ -1615,12 +1615,13 @@ pub fn build_daemon_status(
     // Claude-wrapper pre-flight-death tripwire (#4386), read from the
     // fallback/default workspace's own registry — mirrors the top-level
     // `main_health_gate_*` fields' fallback-root scoping above/below.
-    let (preflight_advisory_active, preflight_advisory_message) = {
+    let (preflight_advisory_active, preflight_advisory_message, preflight_advisory_changed_at) = {
         let registry = workspace_pool.get_or_provision(fallback_root);
         let sr = registry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        sr.preflight_advisory()
+        let (active, message) = sr.preflight_advisory();
+        (active, message, sr.preflight_advisory_changed_at())
     };
     let capacity = crate::types::CapacityReport {
         ranking_present: ranking.is_some(),
@@ -1645,6 +1646,7 @@ pub fn build_daemon_status(
         capacity_bound,
         preflight_advisory_active,
         preflight_advisory_message,
+        preflight_advisory_changed_at,
         configured_max,
         per_token_concurrency,
         dynamic_cap,
@@ -5531,6 +5533,7 @@ exit 0
             capacity_bound: false,
             preflight_advisory_active: false,
             preflight_advisory_message: None,
+            preflight_advisory_changed_at: None,
             configured_max: 5,
             per_token_concurrency: 2,
             dynamic_cap: 3,

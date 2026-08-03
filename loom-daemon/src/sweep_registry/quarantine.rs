@@ -672,6 +672,12 @@ impl SweepRegistry {
             // rather than re-probing off a stale timestamp (#5030).
             self.preflight_probe_last_at = None;
         }
+        // Issue #5029: stamp the transition instant purely for display —
+        // exactly this state-change branch, never an unrelated tick that
+        // leaves `should_trip == preflight_advisory_tripped` (the early
+        // return above), so this is a pure freshness signal alongside the
+        // unchanged trip/clear decision above.
+        self.preflight_advisory_changed_at = Some(Utc::now());
         let marker = self.preflight_death_last_marker.clone().unwrap_or_default();
         let message = if should_trip {
             self.preflight_advisory_message(pool_exhausted_now, &marker)
@@ -782,22 +788,29 @@ impl SweepRegistry {
     /// Render the operator-facing advisory message for the tripped state,
     /// naming the specific whole-pool-dead cause (Issue #4644) when
     /// `pool_exhausted_now` holds, else the ordinary #4386 streak wording.
+    ///
+    /// Issue #5029: always names `self.config.workspace_root` explicitly —
+    /// this registry's state (and hence this message) describes exactly ONE
+    /// workspace, never an aggregate across every managed repo, so an
+    /// operator reading "last N dispatches" alongside multiple registered
+    /// workspaces is never left guessing which repo it refers to.
     #[must_use]
     pub(crate) fn preflight_advisory_message(
         &self,
         pool_exhausted_now: bool,
         marker: &str,
     ) -> String {
+        let workspace = self.config.workspace_root.display();
         if pool_exhausted_now {
             format!(
                 "WARNING: token pool exhausted (0 healthy accounts) — every dispatch will die at \
                  token selection ({marker}); add accounts (`loom-daemon tokens bootstrap`) or wait \
-                 for the pool to recover before re-dispatching (#4644)"
+                 for the pool to recover before re-dispatching (#4644) [workspace: {workspace}]"
             )
         } else {
             format!(
                 "WARNING: last {} dispatches died at claude-wrapper pre-flight ({marker}) — check \
-                 .mcp.json",
+                 .mcp.json [workspace: {workspace}]",
                 self.preflight_death_streak
             )
         }
@@ -1513,6 +1526,12 @@ mod tests {
         let message = message.expect("advisory message present when tripped");
         assert!(message.contains("pre-flight"));
         assert!(message.contains("mcp.json"));
+        // AC (#5029): the message names the specific workspace it is scoped
+        // to, so an operator with multiple managed repos never has to guess.
+        assert!(
+            message.contains("workspace:"),
+            "message must name the scoped workspace: {message}"
+        );
 
         match sub.recv().await.unwrap() {
             Event::PreflightAdvisory {
@@ -1694,6 +1713,76 @@ mod tests {
         let cfg = resolve_preflight_tripwire_config(dir.path());
         assert_eq!(cfg.probe_cooldown, Duration::from_secs(42));
         std::env::remove_var(PREFLIGHT_PROBE_COOLDOWN_ENV);
+    }
+
+    /// AC (#5029): `preflight_advisory_changed_at` stamps the wall-clock
+    /// instant of a trip/clear *transition*, and does NOT move on an
+    /// unrelated tick that leaves the tripped state unchanged (a further
+    /// pre-flight death while already tripped) — a pure freshness signal
+    /// layered on top of the unchanged trip/clear decision logic.
+    #[test]
+    fn preflight_advisory_timestamp_updates_only_on_state_transition() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+
+        // No transition observed yet.
+        assert!(registry.preflight_advisory_changed_at().is_none());
+
+        // Two pre-flight deaths (different issues): below the default
+        // threshold of 3, so no transition yet.
+        for (issue, seq) in [(9201u32, 0u32), (9202, 0)] {
+            insert_dead_running_with_log(
+                &mut registry,
+                issue,
+                seq,
+                "unknown",
+                "# MCP_PREFLIGHT_FAILED\n",
+            );
+            registry.reap_once();
+        }
+        assert!(
+            registry.preflight_advisory_changed_at().is_none(),
+            "no state-change transition yet ⇒ no timestamp"
+        );
+
+        // A third consecutive pre-flight death trips the advisory — the
+        // FIRST state-change transition, so the timestamp is stamped.
+        insert_dead_running_with_log(&mut registry, 9203, 0, "unknown", "# MCP_PREFLIGHT_FAILED\n");
+        registry.reap_once();
+        assert!(registry.preflight_advisory().0);
+        let tripped_at = registry
+            .preflight_advisory_changed_at()
+            .expect("timestamp stamped on trip");
+
+        // A fourth consecutive pre-flight death (still tripped, an
+        // UNRELATED tick — `should_trip == preflight_advisory_tripped`
+        // already) must NOT move the timestamp.
+        insert_dead_running_with_log(&mut registry, 9204, 0, "unknown", "# MCP_PREFLIGHT_FAILED\n");
+        registry.reap_once();
+        assert_eq!(
+            registry.preflight_advisory_changed_at(),
+            Some(tripped_at),
+            "an unrelated tick that leaves the tripped state unchanged must not move the timestamp"
+        );
+
+        // A sweep whose log reaches `# CLAUDE_CLI_START` clears the advisory
+        // — the SECOND state-change transition, so the timestamp advances.
+        insert_dead_running_with_log(
+            &mut registry,
+            9205,
+            0,
+            "unknown",
+            "# CLAUDE_CLI_START\nsome later crash\n",
+        );
+        registry.reap_once();
+        assert!(!registry.preflight_advisory().0);
+        let cleared_at = registry
+            .preflight_advisory_changed_at()
+            .expect("timestamp stamped on clear");
+        assert!(
+            cleared_at >= tripped_at,
+            "the clear transition must stamp a timestamp at or after the trip transition"
+        );
     }
 
     /// Edge case (#4386): a dead sweep whose log file is missing/unreadable

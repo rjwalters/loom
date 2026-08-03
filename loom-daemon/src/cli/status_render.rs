@@ -164,6 +164,13 @@ pub(crate) fn build_status_json_value(
         // silent-failure signature. `message` is `null` when not tripped.
         "preflight_advisory_active": report.preflight_advisory_active,
         "preflight_advisory_message": report.preflight_advisory_message,
+        // Freshness signal for the advisory above (Issue #5029): the wall-clock
+        // time of the most recent trip/clear transition, so a scripted
+        // consumer (like the human-readable renderer below) can distinguish a
+        // just-tripped warning from a stale one that predates a since-applied
+        // fix. `null` before the first transition this daemon process has
+        // observed.
+        "preflight_advisory_changed_at": report.preflight_advisory_changed_at,
         // Observability host-identity mismatch (#4830): non-null means this
         // host's ingest key is bound to a DIFFERENT host_id than the daemon
         // reports for itself, so its telemetry is being filed under the wrong
@@ -644,6 +651,44 @@ fn saturation_hold_note(report: &DaemonStatusReport, dispatch_cap: usize) -> Opt
     ))
 }
 
+/// Render the "as of" freshness suffix for the pre-flight advisory line
+/// (Issue #5029), e.g. `" (as of 12s ago, 2026-08-03T12:00:00Z)"` — empty
+/// string when no transition timestamp is available (an older daemon binary,
+/// or a state this process has not transitioned through yet), so pre-#5029
+/// output is unaffected byte-for-byte.
+fn format_preflight_advisory_freshness(changed_at: Option<DateTime<Utc>>) -> String {
+    match changed_at {
+        Some(ts) => {
+            let secs = (Utc::now() - ts).num_seconds().max(0);
+            format!(" (as of {secs}s ago, {ts})")
+        }
+        None => String::new(),
+    }
+}
+
+/// The claude-wrapper pre-flight-death tripwire warning line (#4386), with an
+/// "as of" freshness suffix appended (Issue #5029) — split out from
+/// [`print_status_human`] so the freshness text is unit-testable without
+/// capturing process stdout, mirroring [`render_admission_brake_line`].
+/// `None` when the advisory is not currently active (nothing to print) or the
+/// active flag is set with no message (defensive — should not happen in
+/// practice).
+fn render_preflight_advisory_line(report: &DaemonStatusReport) -> Option<String> {
+    if !report.preflight_advisory_active {
+        return None;
+    }
+    let msg = report.preflight_advisory_message.as_ref()?;
+    // Issue #5029: append the freshness indicator so a stale (already-cleared
+    // elsewhere, or long-since-tripped) warning is visibly distinguishable
+    // from a just-tripped one, rather than reading as a frozen count with no
+    // notion of time. The message itself already names the specific
+    // workspace it is scoped to (`preflight_advisory_message`).
+    Some(format!(
+        "{msg}{}",
+        format_preflight_advisory_freshness(report.preflight_advisory_changed_at)
+    ))
+}
+
 /// The standalone `Admission brake: …` status line (#4903), or `None` when no
 /// brake is registered (older daemon / never registered) — which renders
 /// nothing at all, the zero-behavior-change baseline the host breaker's line
@@ -745,10 +790,8 @@ pub(crate) fn print_status_human(
     // the "not capacity-bound … the limiter is work availability" line further
     // below is never the only diagnosis shown while this is tripped — see the
     // guard on that line.
-    if report.preflight_advisory_active {
-        if let Some(msg) = &report.preflight_advisory_message {
-            println!("\n{msg}");
-        }
+    if let Some(line) = render_preflight_advisory_line(report) {
+        println!("\n{line}");
     }
 
     // Observability host-identity mismatch (#4830): printed alongside the
@@ -2227,5 +2270,130 @@ mod admission_brake_render_tests {
         let older: DaemonStatusReport =
             serde_json::from_value(stripped).expect("pre-#4903 payload must still parse");
         assert!(older.admission_brake.is_none());
+    }
+}
+
+#[cfg(test)]
+mod preflight_advisory_render_tests {
+    //! Issue #5029: the pre-flight-death advisory (#4386) has no freshness
+    //! signal and is scoped to a single workspace with no way to tell which
+    //! one from the rendered text alone. These tests pin the display-only fix
+    //! — an "as of" freshness suffix on the human line, the timestamp on the
+    //! `--json` surface, and forward/backward wire compatibility — without
+    //! touching the trip/clear decision logic itself.
+    use super::{build_status_json_value, render_preflight_advisory_line};
+    use crate::cli::status::status_client_tests::sample_report;
+    use chrono::Utc;
+    use loom_daemon::self_update::SelfUpdateStatus;
+    use loom_daemon::types::DaemonStatusReport;
+
+    fn no_update() -> SelfUpdateStatus {
+        SelfUpdateStatus {
+            built_commit: "abc".to_string(),
+            source_commit: None,
+            update_available: None,
+        }
+    }
+
+    fn report_with(
+        active: bool,
+        message: Option<&str>,
+        changed_at: Option<chrono::DateTime<Utc>>,
+    ) -> DaemonStatusReport {
+        let mut r = sample_report();
+        r.preflight_advisory_active = active;
+        r.preflight_advisory_message = message.map(ToString::to_string);
+        r.preflight_advisory_changed_at = changed_at;
+        r
+    }
+
+    // ---- human surface -----------------------------------------------------
+
+    #[test]
+    fn active_advisory_renders_with_a_freshness_suffix() {
+        let ts = Utc::now() - chrono::Duration::seconds(42);
+        let report = report_with(
+            true,
+            Some("WARNING: last 3 dispatches died at claude-wrapper pre-flight (x) — check .mcp.json [workspace: /repos/loom]"),
+            Some(ts),
+        );
+        let line = render_preflight_advisory_line(&report).expect("active advisory renders a line");
+        assert!(line.contains("WARNING: last 3 dispatches"), "got: {line}");
+        assert!(
+            line.contains("workspace: /repos/loom"),
+            "the rendered line must name the scoped workspace: {line}"
+        );
+        assert!(
+            line.contains("as of") && line.contains("ago"),
+            "the rendered line must carry a freshness indicator: {line}"
+        );
+    }
+
+    #[test]
+    fn active_advisory_without_a_timestamp_renders_the_message_unchanged() {
+        // Forward-compat: an older daemon binary that never populated the new
+        // field must still render the bare message, not a "None"/error text.
+        let report = report_with(true, Some("WARNING: still dying"), None);
+        let line = render_preflight_advisory_line(&report).expect("line");
+        assert_eq!(line, "WARNING: still dying");
+    }
+
+    #[test]
+    fn inactive_advisory_renders_nothing() {
+        assert!(render_preflight_advisory_line(&report_with(false, None, None)).is_none());
+        // Defensive: `active` true with no message must not panic or fabricate
+        // a line — should not happen in practice, but stay silent rather than
+        // render a garbage string.
+        assert!(
+            render_preflight_advisory_line(&report_with(true, None, Some(Utc::now()))).is_none()
+        );
+    }
+
+    // ---- --json surface ----------------------------------------------------
+
+    #[test]
+    fn json_carries_the_advisory_timestamp() {
+        let ts = Utc::now() - chrono::Duration::seconds(7);
+        let value = build_status_json_value(
+            &report_with(true, Some("WARNING: x"), Some(ts)),
+            None,
+            &no_update(),
+            None,
+            None,
+        );
+        assert_eq!(value["preflight_advisory_active"], true);
+        assert!(value["preflight_advisory_changed_at"].is_string());
+    }
+
+    #[test]
+    fn json_advisory_timestamp_is_null_when_absent() {
+        let value = build_status_json_value(
+            &report_with(false, None, None),
+            None,
+            &no_update(),
+            None,
+            None,
+        );
+        assert!(value["preflight_advisory_changed_at"].is_null());
+    }
+
+    #[test]
+    fn advisory_timestamp_survives_a_wire_round_trip_and_older_payloads() {
+        let ts = Utc::now() - chrono::Duration::seconds(5);
+        let report = report_with(true, Some("WARNING: x"), Some(ts));
+        let json = serde_json::to_string(&report).expect("serialize");
+        let back: DaemonStatusReport = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.preflight_advisory_changed_at, report.preflight_advisory_changed_at);
+
+        // Forward-compat: an absent field (pre-#5029 daemon) parses as `None`,
+        // never a fabricated/default timestamp.
+        let mut stripped: serde_json::Value = serde_json::from_str(&json).expect("value");
+        stripped
+            .as_object_mut()
+            .expect("object")
+            .remove("preflight_advisory_changed_at");
+        let older: DaemonStatusReport =
+            serde_json::from_value(stripped).expect("pre-#5029 payload must still parse");
+        assert!(older.preflight_advisory_changed_at.is_none());
     }
 }
