@@ -88,7 +88,13 @@
 //! starving that host's own dispatched sweep. Running it first means a
 //! worktree whose only obstacle was a now-reaped orphan process becomes
 //! eligible for the removal pass in the very same tick. It shares this
-//! module's enable/interval cadence but has its own opt-out —
+//! module's fail-safe gates — `.loom-managed` sentinel, no live sweep claim,
+//! issue closed, PR not open and past its post-merge grace — so a worktree
+//! this pass would refuse to *remove* is a worktree the orphan pass refuses to
+//! *kill inside*. That symmetry is load-bearing: a daemon claim only exists
+//! for Tier-2 dispatched sweeps, so the forge gates are the only thing
+//! standing between a manually-run Judge's `cargo test` and a SIGKILL. It
+//! shares this module's enable/interval cadence but has its own opt-out —
 //! `LOOM_ORPHAN_PROCESS_REAPER=0` / `autonomous.worktreeReaper.orphanProcessReapEnabled=false`
 //! — because terminating a live process is a strictly more consequential
 //! action than removing an already-idle directory.
@@ -392,38 +398,9 @@ pub fn reap_repo(repo_root: &Path, config: &WorktreeReaperConfig) -> ReapReport 
     let opts = reaper_clean_options(resolve_grace_period(config));
     let active_issues = crate::worktree_ops::liveness::active_spawn_loop_issues(repo_root);
 
-    // Orphan-**process** sub-pass (Issue #5110), ahead of the directory
-    // removal pass below so a worktree whose only obstacle was a now-reaped
-    // orphan becomes removal-eligible in this same tick. Shares this pass's
-    // already-computed `active_issues` snapshot — see the module docs' "Fail
-    // safe" note on why it is re-checked here rather than trusted from a
-    // caller. Independently opt-outable (`resolve_orphan_process_reap_enabled`)
-    // because terminating a live process is more consequential than removing
-    // an idle directory.
-    if resolve_orphan_process_reap_enabled(config) {
-        let kill_fn = |pids: &[u32]| {
-            crate::orphan_process_reaper::kill_pids(
-                pids,
-                crate::orphan_process_reaper::ORPHAN_PROCESS_REAP_GRACE,
-            )
-        };
-        let orphan_report = crate::orphan_process_reaper::reap_orphan_processes_with(
-            repo_root,
-            &active_issues,
-            &crate::worktree_ops::safety::find_processes_using_directory,
-            &crate::orphan_process_reaper::collect_descendant_pids,
-            &kill_fn,
-        );
-        log_orphan_report(repo_root, &orphan_report);
-    } else {
-        log::debug!(
-            "orphan_process_reaper: {} disabled (set LOOM_ORPHAN_PROCESS_REAPER=0 or \
-             autonomous.worktreeReaper.orphanProcessReapEnabled=false to opt out)",
-            repo_root.display()
-        );
-    }
-
-    // Resolved once per pass (one REST call), not once per worktree.
+    // Resolved once per pass (one REST call), not once per worktree — and
+    // shared with the orphan-process sub-pass below, which applies the same
+    // issue-closed / PR-not-open gates this pass does.
     let owner = clean::repo_owner_rest(repo_root);
 
     let issue_state_fn = |n: u32| crate::worktree_ops::gh::issue_state_rest(repo_root, n);
@@ -433,6 +410,43 @@ pub fn reap_repo(repo_root: &Path, config: &WorktreeReaperConfig) -> ReapReport 
         // GraphQL-backed probe rather than silently reporting Unknown forever.
         None => clean::check_pr_merged(repo_root, n),
     };
+
+    // Orphan-**process** sub-pass (Issue #5110), ahead of the directory
+    // removal pass below so a worktree whose only obstacle was a now-reaped
+    // orphan becomes removal-eligible in this same tick. Shares this pass's
+    // already-computed `active_issues` snapshot and forge probes — see the
+    // module docs' "Fail safe" note on why every gate is re-checked here
+    // rather than trusted from a caller. Independently opt-outable
+    // (`resolve_orphan_process_reap_enabled`) because terminating a live
+    // process is more consequential than removing an idle directory.
+    if resolve_orphan_process_reap_enabled(config) {
+        let kill_fn = |pids: &[u32]| {
+            crate::orphan_process_reaper::kill_pids(
+                pids,
+                crate::orphan_process_reaper::ORPHAN_PROCESS_REAP_GRACE,
+            )
+        };
+        let orphan_report = crate::orphan_process_reaper::reap_orphan_processes_with(
+            repo_root,
+            &crate::orphan_process_reaper::OrphanReapProbes {
+                active_issues: &active_issues,
+                processes_using: &crate::worktree_ops::safety::find_processes_using_directory,
+                issue_state: &issue_state_fn,
+                pr_status: &pr_status_fn,
+                collect_descendants: &crate::orphan_process_reaper::collect_descendant_pids,
+                kill: &kill_fn,
+                grace_period_secs: opts.grace_period_secs,
+                now: Utc::now(),
+            },
+        );
+        log_orphan_report(repo_root, &orphan_report);
+    } else {
+        log::debug!(
+            "orphan_process_reaper: {} disabled (set LOOM_ORPHAN_PROCESS_REAPER=0 or \
+             autonomous.worktreeReaper.orphanProcessReapEnabled=false to opt out)",
+            repo_root.display()
+        );
+    }
 
     let probes =
         clean::production_probes(&active_issues, &issue_state_fn, &pr_status_fn, Utc::now());

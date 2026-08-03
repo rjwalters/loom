@@ -3673,17 +3673,40 @@ pgid-scoped kill entirely and keep running after the sweep that launched it is
 long gone — a real incident pinned a host at load 65 for 5h52m this way,
 starving that host's own dispatched sweep. Each tick this sub-pass finds every
 PID whose cwd is inside an `issue-<N>` worktree (the same probe
-`classify_worktree`'s `SkipInUse` gate already uses), and — for a worktree that
-carries the `.loom-managed` sentinel AND has no live sweep claim for issue N —
-walks the FULL descendant tree of each such PID by `ppid` (not by pgid/sid, so
-a `setsid`/`timeout`-escaped tree is still reached) and terminates every PID
-found (SIGTERM, then SIGKILL after a short grace), logging what was killed.
-Both fail-safe gates (`.loom-managed` sentinel + live claim) are re-checked on
-every pass rather than trusted from a snapshot, because a stale verdict here is
-irreversible (a live sweep's own process killed) unlike a stale removal verdict
-(a no-op retried next tick). Shares this loop's enable/interval cadence but has
-its own opt-out, since terminating a live process is a strictly more
-consequential action than removing an already-idle directory.
+`classify_worktree`'s `SkipInUse` gate already uses), and — only for a worktree
+the removal pass would itself consider dead — walks the FULL descendant tree of
+each such PID by `ppid` (not by pgid/sid, so a `setsid`/`timeout`-escaped tree
+is still reached) and terminates every PID found (SIGTERM, then SIGKILL after a
+short grace), logging what was killed.
+
+"Dead" means **every** gate below clears; any one of them preserves the
+processes and logs why:
+
+| Gate | Mirrors `classify_worktree`'s |
+|------|-------------------------------|
+| `.loom-managed` sentinel present | `require_managed_sentinel` / `SkipUnmanaged` |
+| No live sweep claim for issue N | `SkipInUse` |
+| Issue N is `CLOSED` | `SkipIssueNotClosed` |
+| Its PR is not open, and not unknown | `SkipPrOpen` / `SkipUnknownPrStatus` |
+| A merged PR is past `gracePeriodSecs` | `SkipGrace` |
+
+The forge gates are load-bearing, not belt-and-braces: the live-claim check
+only knows about **daemon-dispatched (Tier 2) sweeps**, so Manual Orchestration
+Mode (`/loom:builder`, `/loom:judge`, `/loom:doctor`) and manual `/loom:sweep`
+runs never appear in it. Since the removal pass treats "a process is using this
+directory" as *protection* while this pass treats it as the *trigger*, without
+the issue-closed / PR-not-open gates a Judge running `cargo test` inside an
+open PR's builder worktree would be indistinguishable from the runaway driver
+this sub-pass exists to kill. An open PR (or open issue) is independent
+evidence the work is alive; a failed forge probe resolves to `UNKNOWN`, which
+is always a skip, never a kill. Forge probes are only issued for a worktree
+that actually has a process running inside it, so an idle host costs no extra
+REST calls. Every gate is re-checked on every pass rather than trusted from a
+snapshot, because a stale verdict here is irreversible (a live agent's own
+process killed) unlike a stale removal verdict (a no-op retried next tick).
+Shares this loop's enable/interval cadence but has its own opt-out, since
+terminating a live process is a strictly more consequential action than
+removing an already-idle directory.
 
 ```json
 {
