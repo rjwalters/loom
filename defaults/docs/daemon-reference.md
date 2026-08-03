@@ -3874,8 +3874,10 @@ a repo with no `loom:*` labels cannot hold a queue — a Curator that tries to a
 call, this needs **no checkout of the target repo**: run
 `sync-labels.sh --repo OWNER/NAME` from a workspace that already has an
 authoritative `.github/labels.yml` (labels.yml is read locally; only the target
-moves). Preview first — `--repo` points the default-label *deletions* at a repo
-you are not standing in, so a typo'd NWO is worth catching:
+moves). This is additive by default (#5066) — it only creates/updates the Loom
+labels and never touches GitHub's default labels (`bug`, `enhancement`, etc.),
+so it is safe to run against a repo that predates Loom without first previewing.
+Preview anyway if in doubt:
 
 ```bash
 # From a checkout whose .github/labels.yml is the source of truth (e.g. loom):
@@ -3890,14 +3892,21 @@ done
 
 `--dry-run` is deliberately forge-free (it reports intent from labels.yml alone
 and makes zero `gh` calls), so it also validates the parse and the NWO offline.
-Because that means a dry run cannot tell a typo'd NWO apart from a repo that
-really exists, the **real** run preflights the named target with `gh repo view`
-before deleting anything and aborts if it is missing or read-only (#4524) —
-nothing is deleted when the preflight fails. `--repo` is GitHub-only — an
-explicitly configured Gitea forge rejects it, whether that comes from
-`LOOM_FORGE_TYPE=gitea` or `forge.type: gitea` in any config tier. For a Gitea
-root, run `sync-labels.sh` from a checkout of that repo so the Gitea helpers can
-resolve a base URL and token.
+`--repo` is GitHub-only — an explicitly configured Gitea forge rejects it,
+whether that comes from `LOOM_FORGE_TYPE=gitea` or `forge.type: gitea` in any
+config tier. For a Gitea root, run `sync-labels.sh` from a checkout of that
+repo so the Gitea helpers can resolve a base URL and token.
+
+If a genuinely greenfield repo also needs GitHub's default labels cleared, add
+`--prune-defaults` (the old, pre-#5066 unconditional-deletion behavior). Because
+`--repo` points that deletion at a repo you are not standing in, a typo'd NWO is
+worth catching first — pair it with `--dry-run`, which for `--prune-defaults`
+additionally performs a read-only in-use lookup so the preview flags which
+default labels are still attached to an issue/PR. The **real** `--prune-defaults`
+run preflights the named target with `gh repo view` before deleting anything and
+aborts if it is missing or read-only (#4524); it then skips (with a warning
+listing the affected issue/PR numbers) any default label still in use, unless
+`--force` is also given.
 
 **3. Refresh a stale install.** A root installed before the machine-level daemon
 model carries a committed file-copy of `.loom/` that **shadows** the machine
