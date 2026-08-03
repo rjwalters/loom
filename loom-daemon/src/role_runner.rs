@@ -83,6 +83,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
+use crate::script_helpers::log_filter::strip_ansi;
 use crate::sweep_registry::{self, SweepRegistryConfig};
 use crate::types::RoleTickRecord;
 use crate::workspace_registry::{filter_missing_roots, WorkspaceRegistry};
@@ -119,6 +120,27 @@ const TERMINATE_GRACE: Duration = Duration::from_secs(5);
 
 /// Max bytes of captured invocation output retained in a failure log line.
 const MAX_OUTPUT_TAIL_BYTES: usize = 2048;
+
+/// Max characters of failure detail retained after ANSI-stripping and
+/// cleanup (issue #5024). Bounds `RoleTickOutcome::Failure`'s reason string —
+/// and therefore `RoleTickRecord.detail` — so a single failing invocation's
+/// raw log tail (which can still carry ANSI escapes, banners, and multi-line
+/// stderr even after [`MAX_OUTPUT_TAIL_BYTES`] truncation) cannot blow up the
+/// `roles.summary` health line downstream. See `health::assess_roles`, which
+/// folds every persistent failure's detail into one line.
+const MAX_FAILURE_DETAIL_CHARS: usize = 500;
+
+/// ANSI-strip and length-cap `text` for use as a `RoleTickOutcome::Failure`
+/// reason. Reuses [`strip_ansi`] rather than reimplementing ANSI stripping
+/// (issue #5024).
+fn clean_and_cap_detail(text: &str) -> String {
+    let cleaned = strip_ansi(text).trim().to_string();
+    if cleaned.chars().count() <= MAX_FAILURE_DETAIL_CHARS {
+        return cleaned;
+    }
+    let capped: String = cleaned.chars().take(MAX_FAILURE_DETAIL_CHARS).collect();
+    format!("{capped}… [truncated]")
+}
 
 /// A `Success` outcome faster than this is implausible for a real
 /// `claude -p "/<role>"` session — starting the process, authenticating, and
@@ -766,7 +788,7 @@ fn run_role_with_timeout(
         match child.try_wait() {
             Ok(Some(status)) if status.success() => return RoleTickOutcome::Success,
             Ok(Some(status)) => {
-                let tail = tail_of_file(&log_path);
+                let tail = clean_and_cap_detail(&tail_of_file(&log_path));
                 return RoleTickOutcome::Failure(format!(
                     "`{}` exited with {status}: {tail}",
                     script.display()
@@ -2089,6 +2111,35 @@ mod tests {
     fn write_config(root: &Path, contents: &str) {
         fs::create_dir_all(root.join(".loom")).unwrap();
         fs::write(root.join(".loom").join("config.json"), contents).unwrap();
+    }
+
+    // -- clean_and_cap_detail (#5024) ---------------------------------------
+
+    #[test]
+    fn clean_and_cap_detail_strips_ansi_and_trims() {
+        let raw = "\x1b[31merror:\x1b[0m something failed\n";
+        assert_eq!(clean_and_cap_detail(raw), "error: something failed");
+    }
+
+    #[test]
+    fn clean_and_cap_detail_round_trips_short_clean_text_unchanged() {
+        let raw = "exit code 1: connection refused";
+        assert_eq!(clean_and_cap_detail(raw), raw);
+    }
+
+    #[test]
+    fn clean_and_cap_detail_caps_oversized_text() {
+        let raw = "x".repeat(MAX_FAILURE_DETAIL_CHARS * 4);
+        let cleaned = clean_and_cap_detail(&raw);
+        // Capped body + a short "… [truncated]" marker — bound generously
+        // above MAX_FAILURE_DETAIL_CHARS so the assertion doesn't hardcode
+        // the marker's exact byte/char width.
+        assert!(
+            cleaned.chars().count() <= MAX_FAILURE_DETAIL_CHARS + 32,
+            "cleaned detail was not capped: {} chars",
+            cleaned.chars().count()
+        );
+        assert!(cleaned.ends_with("[truncated]"));
     }
 
     /// RAII guard that clears the ambient `LOOM_RUNTIME` env var for the
