@@ -651,6 +651,178 @@ EOF
     chmod +x "$path"
 }
 
+# Writes a fake `gh` at $1 for the artifact-fetch tests (Epic #4990 Phase 3,
+# #5020). Understands exactly the invocations loom-daemon-update.sh's
+# fetch_resolve_latest() / fetch_and_verify_artifact() make:
+#   gh release view --json tagName  -R <slug> --jq '.tagName'         -> $2
+#   gh release view --json assets   -R <slug> --jq '.assets[].name'   -> `ls $3`
+#   gh release download <tag> -R <slug> -p <name> [-p <name> ...] -D <dir> --clobber
+#       -> copies each matching file from $3 into <dir>; exits 1 if NONE of
+#          the -p patterns matched anything under $3 (mirrors real gh's
+#          "no assets match" failure for a required download).
+write_fake_gh() {
+    local path="$1" tag="$2" assets_dir="$3"
+    cat > "$path" <<FAKEGH
+#!/usr/bin/env bash
+ASSETS_DIR="$assets_dir"
+TAG_VAL="$tag"
+FAKEGH
+    cat >> "$path" <<'FAKEGH'
+if [[ "${1:-}" == "release" && "${2:-}" == "view" ]]; then
+    shift 2
+    fields=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json) fields="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+    case "$fields" in
+        tagName) echo "$TAG_VAL"; exit 0 ;;
+        assets)  ls "$ASSETS_DIR" 2>/dev/null; exit 0 ;;
+        *) exit 1 ;;
+    esac
+fi
+if [[ "${1:-}" == "release" && "${2:-}" == "download" ]]; then
+    shift 2
+    shift # drop the <tag> positional arg
+    dest="."
+    patterns=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -p) patterns+=("$2"); shift 2 ;;
+            -D) dest="$2"; shift 2 ;;
+            -R) shift 2 ;;
+            --clobber) shift ;;
+            *) shift ;;
+        esac
+    done
+    mkdir -p "$dest"
+    copied=0
+    for pat in "${patterns[@]}"; do
+        for f in "$ASSETS_DIR"/$pat; do
+            [[ -e "$f" ]] || continue
+            cp "$f" "$dest/"
+            copied=1
+        done
+    done
+    [[ "$copied" -eq 1 ]] && exit 0 || exit 1
+fi
+echo "fake gh: unsupported invocation: $*" >&2
+exit 1
+FAKEGH
+    chmod +x "$path"
+}
+
+# Writes a fake "release artifact" binary at $1 reporting version $2 / commit
+# $3 on --version, otherwise behaving like write_fake_daemon (rejects unknown
+# subcommands, loops forever on a normal run) — standing in for a downloaded
+# `loom-daemon-<target>` asset. A parameterized-version sibling of
+# write_fake_daemon (which hardcodes 0.15.0), needed so a fetched artifact can
+# report a version NEWER than the installed daemon's.
+write_fake_artifact_daemon() {
+    local path="$1" version="$2" commit="$3"
+    cat > "$path" <<EOF
+#!/usr/bin/env bash
+if [[ "\${1:-}" == "--version" ]]; then
+    echo "loom-daemon ${version} (commit ${commit}, built 2026-08-03T00:00:00Z)"
+    exit 0
+fi
+if [[ "\${1:-}" == "calibrate" ]]; then
+    exit 1
+fi
+if [[ -n "\${1:-}" && "\${1:-}" != -* ]]; then
+    echo "fake loom-daemon: unsupported subcommand: \$*" >&2
+    exit 1
+fi
+while true; do sleep 1; done
+EOF
+    chmod +x "$path"
+}
+
+# sha256_of <path> — portable checksum in `.sha256`-file format
+# (`<hex>  <basename>`), matching the release workflow's own
+# `shasum -a 256`/`sha256sum` output.
+sha256_of() {
+    local path="$1" base
+    base="$(basename "$path")"
+    if command -v shasum >/dev/null 2>&1; then
+        (cd "$(dirname "$path")" && shasum -a 256 "$base")
+    else
+        (cd "$(dirname "$path")" && sha256sum "$base")
+    fi
+}
+
+# Writes a fake `gh` at $1 whose every `release view` fails — standing in for
+# the "GitHub API unreachable / rate-limited / unauthenticated" case that must
+# SOFTLY fall back to the local source build (AC4), never hard-fail.
+write_fake_gh_unreachable() {
+    local path="$1"
+    cat > "$path" <<'FAKEGH'
+#!/usr/bin/env bash
+echo "gh: failed to fetch release: dial tcp: lookup api.github.com: no such host" >&2
+exit 1
+FAKEGH
+    chmod +x "$path"
+}
+
+# Writes a fake `codesign` at $1 emulating one of three macOS states, so the
+# darwin signature branch of verify_artifact_signature() is testable on ANY
+# host (including a Linux CI runner, which has no codesign at all):
+#   unsigned    -- `-dv` reports "code object is not signed at all" (expected
+#                  for a release built with no Developer ID secrets: soft-skip)
+#   signed-ok   -- `-dv` reports an Authority, `--verify` succeeds
+#   signed-bad  -- `-dv` reports an Authority, `--verify` FAILS (tamper
+#                  evidence: must abort, NOT be confused with "unsigned")
+write_fake_codesign() {
+    local path="$1" mode="$2"
+    cat > "$path" <<FAKECS
+#!/usr/bin/env bash
+MODE="$mode"
+FAKECS
+    cat >> "$path" <<'FAKECS'
+target="${!#}"
+if [[ "${1:-}" == "-dv" || "${1:-}" == "-dvvv" ]]; then
+    if [[ "$MODE" == "unsigned" ]]; then
+        echo "$target: code object is not signed at all" >&2
+        exit 1
+    fi
+    {
+        echo "Executable=$target"
+        echo "Identifier=com.rjwalters.loom-daemon"
+        echo "Authority=Developer ID Application: Test Authority (TESTTEAM)"
+    } >&2
+    exit 0
+fi
+if [[ "${1:-}" == "--verify" ]]; then
+    [[ "$MODE" == "signed-ok" ]] && exit 0
+    echo "$target: invalid signature (code or signature have been modified)" >&2
+    exit 1
+fi
+exit 0
+FAKECS
+    chmod +x "$path"
+}
+
+# Writes a fake `cosign` at $1 whose `verify-blob` exits $2 — the Linux
+# detached-signature branch of verify_artifact_signature().
+write_fake_cosign() {
+    local path="$1" rc="$2"
+    cat > "$path" <<FAKECOSIGN
+#!/usr/bin/env bash
+if [[ "\${1:-}" == "verify-blob" ]]; then
+    if [[ "$rc" -eq 0 ]]; then
+        echo "Verified OK" >&2
+        exit 0
+    fi
+    echo "Error: failed to verify signature" >&2
+    exit 1
+fi
+exit 0
+FAKECOSIGN
+    chmod +x "$path"
+}
+
 MINIMAL_PATH="/usr/bin:/bin:/usr/sbin:/sbin"
 
 BASE_WORKDIR="$(mktemp -d)"
@@ -3290,6 +3462,708 @@ else
     TESTS_PASSED=$((TESTS_PASSED + 1))
     echo -e "${GREEN}✓${NC} content-identical branch never claims a reset --hard while the tree is dirty"
 fi
+
+# ============================================================
+# Artifact-fetch mode (Epic #4990 Phase 3, #5020): resolve the latest GitHub
+# Release, download + verify its artifact for this host's platform, and
+# provision it INSTEAD of a local `cargo build --release`. Every test below
+# pins LOOM_DAEMON_UPDATE_GH_REPO (bypassing git-remote parsing) and
+# LOOM_DAEMON_UPDATE_TARGET="x86_64-unknown-linux-gnu" (a Linux target, so no
+# codesign/cosign tooling is needed to exercise the core resolve/download/
+# verify/provision flow — signature verification for that target is a
+# soft-skip whenever no `.sig` asset is published, exactly test A's fixture).
+# ============================================================
+
+# ------------------------------------------------------------
+# A. Successful artifact update: a newer release with a matching-platform
+#    artifact is fetched, checksum-verified, and provisioned — WITHOUT ever
+#    invoking `cargo build` (no fake cargo is placed on PATH for this test at
+#    all, so a fallback to the source-build path would fail loudly rather
+#    than silently succeed).
+# ------------------------------------------------------------
+WA="$BASE_WORKDIR/w-fetch-a"
+new_fixture "$WA"
+write_fake_daemon "$WA/installed-loom-daemon" "oldc0mm" "$WA/marker"
+
+WA_ASSETS="$WA/gh-assets"
+mkdir -p "$WA_ASSETS"
+WA_BIN_NAME="loom-daemon-x86_64-unknown-linux-gnu"
+write_fake_artifact_daemon "$WA_ASSETS/$WA_BIN_NAME" "0.16.0" "artifac1"
+sha256_of "$WA_ASSETS/$WA_BIN_NAME" > "$WA_ASSETS/$WA_BIN_NAME.sha256"
+
+WA_FAKEBIN="$WA/fakebin"
+mkdir -p "$WA_FAKEBIN"
+write_fake_gh "$WA_FAKEBIN/gh" "v0.16.0" "$WA_ASSETS"
+
+outA=$( cd "$WA" && PATH="$WA_FAKEBIN:$TEST_PATH" \
+    LOOM_DAEMON_BIN="$WA/installed-loom-daemon" \
+    LOOM_DAEMON_UPDATE_GH_REPO="test-owner/test-repo" \
+    LOOM_DAEMON_UPDATE_TARGET="x86_64-unknown-linux-gnu" \
+    bash "$UPDATE_SCRIPT" --no-restart 2>&1; echo "EXIT=$?" )
+rcA=$(echo "$outA" | grep -o 'EXIT=[0-9]*' | cut -d= -f2)
+assert_eq "0" "$rcA" "artifact-fetch: successful update exits 0"
+
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$outA" | grep -q 'Rebuilding loom-daemon (cargo build'; then
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} artifact-fetch: successful update never invokes 'cargo build' (AC1)"
+    echo "  output: $outA"
+else
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} artifact-fetch: successful update never invokes 'cargo build' (AC1)"
+fi
+
+installedA_version="$("$WA/installed-loom-daemon" --version 2>/dev/null)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$installedA_version" | grep -q 'commit artifac1'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} artifact-fetch: the fetched+verified artifact was provisioned to the destination"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} artifact-fetch: the fetched+verified artifact was provisioned to the destination"
+    echo "  --version: $installedA_version"
+fi
+
+# ------------------------------------------------------------
+# B. Checksum-mismatch abort: a tampered/corrupted checksum aborts the WHOLE
+#    update (exit 1) and leaves the running (destination) daemon untouched —
+#    never a soft fallback to a source build (AC2).
+# ------------------------------------------------------------
+WB="$BASE_WORKDIR/w-fetch-b"
+new_fixture "$WB"
+write_fake_daemon "$WB/installed-loom-daemon" "oldc0mm" "$WB/marker"
+installedB_before="$("$WB/installed-loom-daemon" --version 2>/dev/null)"
+
+WB_ASSETS="$WB/gh-assets"
+mkdir -p "$WB_ASSETS"
+WB_BIN_NAME="loom-daemon-x86_64-unknown-linux-gnu"
+write_fake_artifact_daemon "$WB_ASSETS/$WB_BIN_NAME" "0.16.0" "artifac2"
+# Deliberately WRONG checksum (does not match the binary written above).
+echo "0000000000000000000000000000000000000000000000000000000000000000  ${WB_BIN_NAME}" > "$WB_ASSETS/$WB_BIN_NAME.sha256"
+
+WB_FAKEBIN="$WB/fakebin"
+mkdir -p "$WB_FAKEBIN"
+write_fake_gh "$WB_FAKEBIN/gh" "v0.16.0" "$WB_ASSETS"
+
+outB=$( cd "$WB" && PATH="$WB_FAKEBIN:$TEST_PATH" \
+    LOOM_DAEMON_BIN="$WB/installed-loom-daemon" \
+    LOOM_DAEMON_UPDATE_GH_REPO="test-owner/test-repo" \
+    LOOM_DAEMON_UPDATE_TARGET="x86_64-unknown-linux-gnu" \
+    bash "$UPDATE_SCRIPT" --no-restart 2>&1; echo "EXIT=$?" )
+rcB=$(echo "$outB" | grep -o 'EXIT=[0-9]*' | cut -d= -f2)
+assert_eq "1" "$rcB" "artifact-fetch: checksum mismatch aborts the update (exit 1)"
+
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$outB" | grep -q 'Checksum verification FAILED'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} artifact-fetch: checksum-mismatch failure is reported explicitly"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} artifact-fetch: checksum-mismatch failure is reported explicitly"
+    echo "  output: $outB"
+fi
+
+installedB_after="$("$WB/installed-loom-daemon" --version 2>/dev/null)"
+assert_eq "$installedB_before" "$installedB_after" "artifact-fetch: checksum mismatch leaves the destination binary untouched"
+
+# ------------------------------------------------------------
+# C. Missing-artifact fallback: the resolved release has no artifact
+#    published for this host's platform (a real, but incomplete, release) —
+#    softly falls back to the existing local source-build path and still
+#    completes the update end-to-end (AC4).
+# ------------------------------------------------------------
+WC="$BASE_WORKDIR/w-fetch-c"
+new_fixture "$WC"
+HEADC="$(cd "$WC" && git rev-parse --short HEAD)"
+write_fake_daemon "$WC/installed-loom-daemon" "deadbee" "$WC/marker"
+NEW_FAKE_C="$WC/new-fake-daemon"
+write_fake_daemon "$NEW_FAKE_C" "$HEADC" "$WC/new-marker"
+
+# A release exists (newer than installed) but publishes NO assets at all for
+# this target — fetch_resolve_latest must reject it (no matching bin/sha256)
+# and the caller must fall back, not hard-fail.
+WC_ASSETS="$WC/gh-assets"
+mkdir -p "$WC_ASSETS"
+echo "unrelated-file" > "$WC_ASSETS/README.txt"
+
+WC_FAKEBIN="$WC/fakebin"
+mkdir -p "$WC_FAKEBIN"
+write_fake_gh "$WC_FAKEBIN/gh" "v0.20.0" "$WC_ASSETS"
+write_fake_cargo "$WC_FAKEBIN/cargo"
+
+outC=$( cd "$WC" && PATH="$WC_FAKEBIN:$TEST_PATH" \
+    LOOM_DAEMON_BIN="$WC/installed-loom-daemon" \
+    LOOM_DAEMON_UPDATE_GH_REPO="test-owner/test-repo" \
+    LOOM_DAEMON_UPDATE_TARGET="x86_64-unknown-linux-gnu" \
+    NEW_FAKE_BIN_SRC="$NEW_FAKE_C" \
+    bash "$UPDATE_SCRIPT" --no-restart 2>&1; echo "EXIT=$?" )
+rcC=$(echo "$outC" | grep -o 'EXIT=[0-9]*' | cut -d= -f2)
+assert_eq "0" "$rcC" "artifact-fetch: missing-artifact fallback still completes the update (exit 0)"
+
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$outC" | grep -q 'Artifact-fetch:.*falling back to the local source-build path'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} artifact-fetch: a resolution failure is reported as a soft fallback"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} artifact-fetch: a resolution failure is reported as a soft fallback"
+    echo "  output: $outC"
+fi
+
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$outC" | grep -q 'Rebuilding loom-daemon (cargo build'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} artifact-fetch: missing-artifact fallback actually rebuilds from source"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} artifact-fetch: missing-artifact fallback actually rebuilds from source"
+    echo "  output: $outC"
+fi
+
+installedC_version="$("$WC/installed-loom-daemon" --version 2>/dev/null)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$installedC_version" | grep -q "commit ${HEADC}"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} artifact-fetch: the source-build fallback provisioned the freshly-built binary"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} artifact-fetch: the source-build fallback provisioned the freshly-built binary"
+    echo "  --version: $installedC_version"
+fi
+
+# ------------------------------------------------------------
+# D. --no-fetch disables artifact-fetch mode entirely, even when a matching
+#    release artifact IS available — restores the pre-#5020 always-build
+#    behavior.
+# ------------------------------------------------------------
+WD="$BASE_WORKDIR/w-fetch-d"
+new_fixture "$WD"
+HEADD="$(cd "$WD" && git rev-parse --short HEAD)"
+write_fake_daemon "$WD/installed-loom-daemon" "deadbee" "$WD/marker"
+NEW_FAKE_D="$WD/new-fake-daemon"
+write_fake_daemon "$NEW_FAKE_D" "$HEADD" "$WD/new-marker"
+
+WD_ASSETS="$WD/gh-assets"
+mkdir -p "$WD_ASSETS"
+WD_BIN_NAME="loom-daemon-x86_64-unknown-linux-gnu"
+write_fake_artifact_daemon "$WD_ASSETS/$WD_BIN_NAME" "0.16.0" "artifac4"
+sha256_of "$WD_ASSETS/$WD_BIN_NAME" > "$WD_ASSETS/$WD_BIN_NAME.sha256"
+
+WD_FAKEBIN="$WD/fakebin"
+mkdir -p "$WD_FAKEBIN"
+write_fake_gh "$WD_FAKEBIN/gh" "v0.16.0" "$WD_ASSETS"
+write_fake_cargo "$WD_FAKEBIN/cargo"
+
+outD=$( cd "$WD" && PATH="$WD_FAKEBIN:$TEST_PATH" \
+    LOOM_DAEMON_BIN="$WD/installed-loom-daemon" \
+    LOOM_DAEMON_UPDATE_GH_REPO="test-owner/test-repo" \
+    LOOM_DAEMON_UPDATE_TARGET="x86_64-unknown-linux-gnu" \
+    NEW_FAKE_BIN_SRC="$NEW_FAKE_D" \
+    bash "$UPDATE_SCRIPT" --no-restart --no-fetch 2>&1; echo "EXIT=$?" )
+rcD=$(echo "$outD" | grep -o 'EXIT=[0-9]*' | cut -d= -f2)
+assert_eq "0" "$rcD" "--no-fetch: update still completes (exit 0)"
+
+installedD_version="$("$WD/installed-loom-daemon" --version 2>/dev/null)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$installedD_version" | grep -q "commit ${HEADD}"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} --no-fetch: rebuilds from source even though a release artifact was available"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} --no-fetch: rebuilds from source even though a release artifact was available"
+    echo "  --version: $installedD_version"
+fi
+
+# ------------------------------------------------------------
+# E. --fetch (forced) hard-fails rather than silently falling back to a
+#    source build when no matching artifact resolves.
+# ------------------------------------------------------------
+WE="$BASE_WORKDIR/w-fetch-e"
+new_fixture "$WE"
+write_fake_daemon "$WE/installed-loom-daemon" "deadbee" "$WE/marker"
+
+WE_ASSETS="$WE/gh-assets"
+mkdir -p "$WE_ASSETS"
+echo "unrelated-file" > "$WE_ASSETS/README.txt"
+
+WE_FAKEBIN="$WE/fakebin"
+mkdir -p "$WE_FAKEBIN"
+write_fake_gh "$WE_FAKEBIN/gh" "v0.20.0" "$WE_ASSETS"
+write_fake_cargo "$WE_FAKEBIN/cargo"
+
+outE=$( cd "$WE" && PATH="$WE_FAKEBIN:$TEST_PATH" \
+    LOOM_DAEMON_BIN="$WE/installed-loom-daemon" \
+    LOOM_DAEMON_UPDATE_GH_REPO="test-owner/test-repo" \
+    LOOM_DAEMON_UPDATE_TARGET="x86_64-unknown-linux-gnu" \
+    bash "$UPDATE_SCRIPT" --no-restart --fetch 2>&1; echo "EXIT=$?" )
+rcE=$(echo "$outE" | grep -o 'EXIT=[0-9]*' | cut -d= -f2)
+assert_eq "1" "$rcE" "--fetch: refuses to silently fall back to a source build (exit 1)"
+
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$outE" | grep -q 'Rebuilding loom-daemon (cargo build'; then
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} --fetch: never falls back to 'cargo build' on a forced-fetch failure"
+    echo "  output: $outE"
+else
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} --fetch: never falls back to 'cargo build' on a forced-fetch failure"
+fi
+
+# ------------------------------------------------------------
+# F. GitHub API unreachable/rate-limited during release resolution: every
+#    `gh release view` fails. This must be a SOFT fallback to the local
+#    source build (AC4) — never a hard failure of the whole update.
+# ------------------------------------------------------------
+WF="$BASE_WORKDIR/w-fetch-f"
+new_fixture "$WF"
+HEADF="$(cd "$WF" && git rev-parse --short HEAD)"
+write_fake_daemon "$WF/installed-loom-daemon" "deadbee" "$WF/marker"
+NEW_FAKE_F="$WF/new-fake-daemon"
+write_fake_daemon "$NEW_FAKE_F" "$HEADF" "$WF/new-marker"
+
+WF_FAKEBIN="$WF/fakebin"
+mkdir -p "$WF_FAKEBIN"
+write_fake_gh_unreachable "$WF_FAKEBIN/gh"
+write_fake_cargo "$WF_FAKEBIN/cargo"
+
+outF=$( cd "$WF" && PATH="$WF_FAKEBIN:$TEST_PATH" \
+    LOOM_DAEMON_BIN="$WF/installed-loom-daemon" \
+    LOOM_DAEMON_UPDATE_GH_REPO="test-owner/test-repo" \
+    LOOM_DAEMON_UPDATE_TARGET="x86_64-unknown-linux-gnu" \
+    NEW_FAKE_BIN_SRC="$NEW_FAKE_F" \
+    bash "$UPDATE_SCRIPT" --no-restart 2>&1; echo "EXIT=$?" )
+rcF=$(echo "$outF" | grep -o 'EXIT=[0-9]*' | cut -d= -f2)
+assert_eq "0" "$rcF" "artifact-fetch: an unreachable GitHub API falls back to the source build (exit 0)"
+
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$outF" | grep -q 'Artifact-fetch:.*falling back to the local source-build path'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} artifact-fetch: an unreachable GitHub API is reported as a soft fallback"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} artifact-fetch: an unreachable GitHub API is reported as a soft fallback"
+    echo "  output: $outF"
+fi
+
+installedF_version="$("$WF/installed-loom-daemon" --version 2>/dev/null)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$installedF_version" | grep -q "commit ${HEADF}"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} artifact-fetch: the API-failure fallback still provisioned a freshly-built binary"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} artifact-fetch: the API-failure fallback still provisioned a freshly-built binary"
+    echo "  --version: $installedF_version"
+fi
+
+# ------------------------------------------------------------
+# G. Already at the latest release: the resolved release's version equals the
+#    installed daemon's AND the local source commit matches too — the
+#    existing up-to-date no-op contract must hold (exit 0, no download, no
+#    build, destination untouched).
+# ------------------------------------------------------------
+WG="$BASE_WORKDIR/w-fetch-g"
+new_fixture "$WG"
+HEADG="$(cd "$WG" && git rev-parse --short HEAD)"
+write_fake_daemon "$WG/installed-loom-daemon" "$HEADG" "$WG/marker"
+
+WG_ASSETS="$WG/gh-assets"
+mkdir -p "$WG_ASSETS"
+WG_BIN_NAME="loom-daemon-x86_64-unknown-linux-gnu"
+write_fake_artifact_daemon "$WG_ASSETS/$WG_BIN_NAME" "0.15.0" "shouldnt"
+sha256_of "$WG_ASSETS/$WG_BIN_NAME" > "$WG_ASSETS/$WG_BIN_NAME.sha256"
+
+WG_FAKEBIN="$WG/fakebin"
+mkdir -p "$WG_FAKEBIN"
+# write_fake_daemon reports version 0.15.0, so tag v0.15.0 is NOT newer.
+write_fake_gh "$WG_FAKEBIN/gh" "v0.15.0" "$WG_ASSETS"
+
+outG=$( cd "$WG" && PATH="$WG_FAKEBIN:$TEST_PATH" \
+    LOOM_DAEMON_BIN="$WG/installed-loom-daemon" \
+    LOOM_DAEMON_UPDATE_GH_REPO="test-owner/test-repo" \
+    LOOM_DAEMON_UPDATE_TARGET="x86_64-unknown-linux-gnu" \
+    bash "$UPDATE_SCRIPT" --no-restart 2>&1; echo "EXIT=$?" )
+rcG=$(echo "$outG" | grep -o 'EXIT=[0-9]*' | cut -d= -f2)
+assert_eq "0" "$rcG" "artifact-fetch: already at the latest release is a no-op (exit 0)"
+
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$outG" | grep -q 'is not newer than the installed version'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} artifact-fetch: an equal-version release is reported as nothing to fetch"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} artifact-fetch: an equal-version release is reported as nothing to fetch"
+    echo "  output: $outG"
+fi
+
+installedG_version="$("$WG/installed-loom-daemon" --version 2>/dev/null)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$installedG_version" | grep -q "commit ${HEADG}" && ! echo "$outG" | grep -q 'Downloading '; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} artifact-fetch: the up-to-date no-op downloads nothing and leaves the binary untouched"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} artifact-fetch: the up-to-date no-op downloads nothing and leaves the binary untouched"
+    echo "  output: $outG"
+fi
+
+# ------------------------------------------------------------
+# H. --check regression: reports the available RELEASE artifact (exit 3) and
+#    writes nothing.
+# ------------------------------------------------------------
+WH="$BASE_WORKDIR/w-fetch-h"
+new_fixture "$WH"
+write_fake_daemon "$WH/installed-loom-daemon" "oldc0mm" "$WH/marker"
+installedH_before="$("$WH/installed-loom-daemon" --version 2>/dev/null)"
+
+WH_ASSETS="$WH/gh-assets"
+mkdir -p "$WH_ASSETS"
+WH_BIN_NAME="loom-daemon-x86_64-unknown-linux-gnu"
+write_fake_artifact_daemon "$WH_ASSETS/$WH_BIN_NAME" "0.16.0" "artifac8"
+sha256_of "$WH_ASSETS/$WH_BIN_NAME" > "$WH_ASSETS/$WH_BIN_NAME.sha256"
+
+WH_FAKEBIN="$WH/fakebin"
+mkdir -p "$WH_FAKEBIN"
+write_fake_gh "$WH_FAKEBIN/gh" "v0.16.0" "$WH_ASSETS"
+
+outH=$( cd "$WH" && PATH="$WH_FAKEBIN:$TEST_PATH" \
+    LOOM_DAEMON_BIN="$WH/installed-loom-daemon" \
+    LOOM_DAEMON_UPDATE_GH_REPO="test-owner/test-repo" \
+    LOOM_DAEMON_UPDATE_TARGET="x86_64-unknown-linux-gnu" \
+    bash "$UPDATE_SCRIPT" --check 2>&1; echo "EXIT=$?" )
+rcH=$(echo "$outH" | grep -o 'EXIT=[0-9]*' | cut -d= -f2)
+assert_eq "3" "$rcH" "--check: an available release artifact still reports 'update available' (exit 3)"
+
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$outH" | grep -q 'Update available via release artifact v0.16.0'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} --check: names the release artifact it would fetch"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} --check: names the release artifact it would fetch"
+    echo "  output: $outH"
+fi
+
+installedH_after="$("$WH/installed-loom-daemon" --version 2>/dev/null)"
+assert_eq "$installedH_before" "$installedH_after" "--check: writes nothing even when an artifact is available"
+
+# ------------------------------------------------------------
+# I. --dry-run regression: describes the fetch it WOULD perform, never runs
+#    cargo, and leaves the destination untouched.
+# ------------------------------------------------------------
+WI="$BASE_WORKDIR/w-fetch-i"
+new_fixture "$WI"
+write_fake_daemon "$WI/installed-loom-daemon" "oldc0mm" "$WI/marker"
+installedI_before="$("$WI/installed-loom-daemon" --version 2>/dev/null)"
+
+WI_ASSETS="$WI/gh-assets"
+mkdir -p "$WI_ASSETS"
+WI_BIN_NAME="loom-daemon-x86_64-unknown-linux-gnu"
+write_fake_artifact_daemon "$WI_ASSETS/$WI_BIN_NAME" "0.16.0" "artifac9"
+sha256_of "$WI_ASSETS/$WI_BIN_NAME" > "$WI_ASSETS/$WI_BIN_NAME.sha256"
+
+WI_FAKEBIN="$WI/fakebin"
+mkdir -p "$WI_FAKEBIN"
+write_fake_gh "$WI_FAKEBIN/gh" "v0.16.0" "$WI_ASSETS"
+
+outI=$( cd "$WI" && PATH="$WI_FAKEBIN:$TEST_PATH" \
+    LOOM_DAEMON_BIN="$WI/installed-loom-daemon" \
+    LOOM_DAEMON_UPDATE_GH_REPO="test-owner/test-repo" \
+    LOOM_DAEMON_UPDATE_TARGET="x86_64-unknown-linux-gnu" \
+    bash "$UPDATE_SCRIPT" --dry-run 2>&1; echo "EXIT=$?" )
+rcI=$(echo "$outI" | grep -o 'EXIT=[0-9]*' | cut -d= -f2)
+assert_eq "0" "$rcI" "--dry-run: exits 0 with an artifact available"
+
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$outI" | grep -q '\[dry-run\] Would fetch + verify release artifact v0.16.0' \
+    && ! echo "$outI" | grep -q '\[dry-run\] Would run: (cd .* cargo build'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} --dry-run: describes the artifact fetch instead of a cargo build"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} --dry-run: describes the artifact fetch instead of a cargo build"
+    echo "  output: $outI"
+fi
+
+installedI_after="$("$WI/installed-loom-daemon" --version 2>/dev/null)"
+assert_eq "$installedI_before" "$installedI_after" "--dry-run: leaves the destination binary untouched in artifact mode"
+
+# ------------------------------------------------------------
+# J. Linux detached signature PRESENT, cosign + a public key both resolvable,
+#    verification SUCCEEDS -> the update proceeds and says so (AC3).
+# ------------------------------------------------------------
+WJ="$BASE_WORKDIR/w-fetch-j"
+new_fixture "$WJ"
+write_fake_daemon "$WJ/installed-loom-daemon" "oldc0mm" "$WJ/marker"
+
+WJ_ASSETS="$WJ/gh-assets"
+mkdir -p "$WJ_ASSETS"
+WJ_BIN_NAME="loom-daemon-x86_64-unknown-linux-gnu"
+write_fake_artifact_daemon "$WJ_ASSETS/$WJ_BIN_NAME" "0.16.0" "sigokc0"
+sha256_of "$WJ_ASSETS/$WJ_BIN_NAME" > "$WJ_ASSETS/$WJ_BIN_NAME.sha256"
+echo "fake-detached-signature" > "$WJ_ASSETS/$WJ_BIN_NAME.sig"
+echo "-----BEGIN PUBLIC KEY-----fake-----END PUBLIC KEY-----" > "$WJ/cosign.pub"
+
+WJ_FAKEBIN="$WJ/fakebin"
+mkdir -p "$WJ_FAKEBIN"
+write_fake_gh "$WJ_FAKEBIN/gh" "v0.16.0" "$WJ_ASSETS"
+write_fake_cosign "$WJ_FAKEBIN/cosign" 0
+
+outJ=$( cd "$WJ" && PATH="$WJ_FAKEBIN:$TEST_PATH" \
+    LOOM_DAEMON_BIN="$WJ/installed-loom-daemon" \
+    LOOM_DAEMON_UPDATE_GH_REPO="test-owner/test-repo" \
+    LOOM_DAEMON_UPDATE_TARGET="x86_64-unknown-linux-gnu" \
+    LOOM_DAEMON_UPDATE_COSIGN_PUBKEY="$WJ/cosign.pub" \
+    bash "$UPDATE_SCRIPT" --no-restart 2>&1; echo "EXIT=$?" )
+rcJ=$(echo "$outJ" | grep -o 'EXIT=[0-9]*' | cut -d= -f2)
+assert_eq "0" "$rcJ" "signature present + cosign verifies: update proceeds (exit 0)"
+
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$outJ" | grep -q 'cosign signature verification passed'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} signature present: cosign verification actually ran and passed"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} signature present: cosign verification actually ran and passed"
+    echo "  output: $outJ"
+fi
+
+installedJ_version="$("$WJ/installed-loom-daemon" --version 2>/dev/null)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$installedJ_version" | grep -q 'commit sigokc0'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} signature present + verified: the artifact was provisioned"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} signature present + verified: the artifact was provisioned"
+    echo "  --version: $installedJ_version"
+fi
+
+# ------------------------------------------------------------
+# K. Linux detached signature PRESENT but cosign verification FAILS -> abort
+#    (exit 1), destination untouched. A present-but-invalid signature is
+#    tamper evidence, never a soft skip.
+# ------------------------------------------------------------
+WK="$BASE_WORKDIR/w-fetch-k"
+new_fixture "$WK"
+write_fake_daemon "$WK/installed-loom-daemon" "oldc0mm" "$WK/marker"
+installedK_before="$("$WK/installed-loom-daemon" --version 2>/dev/null)"
+
+WK_ASSETS="$WK/gh-assets"
+mkdir -p "$WK_ASSETS"
+WK_BIN_NAME="loom-daemon-x86_64-unknown-linux-gnu"
+write_fake_artifact_daemon "$WK_ASSETS/$WK_BIN_NAME" "0.16.0" "sigbadc"
+sha256_of "$WK_ASSETS/$WK_BIN_NAME" > "$WK_ASSETS/$WK_BIN_NAME.sha256"
+echo "tampered-detached-signature" > "$WK_ASSETS/$WK_BIN_NAME.sig"
+echo "-----BEGIN PUBLIC KEY-----fake-----END PUBLIC KEY-----" > "$WK/cosign.pub"
+
+WK_FAKEBIN="$WK/fakebin"
+mkdir -p "$WK_FAKEBIN"
+write_fake_gh "$WK_FAKEBIN/gh" "v0.16.0" "$WK_ASSETS"
+write_fake_cosign "$WK_FAKEBIN/cosign" 1
+write_fake_cargo "$WK_FAKEBIN/cargo"
+
+outK=$( cd "$WK" && PATH="$WK_FAKEBIN:$TEST_PATH" \
+    LOOM_DAEMON_BIN="$WK/installed-loom-daemon" \
+    LOOM_DAEMON_UPDATE_GH_REPO="test-owner/test-repo" \
+    LOOM_DAEMON_UPDATE_TARGET="x86_64-unknown-linux-gnu" \
+    LOOM_DAEMON_UPDATE_COSIGN_PUBKEY="$WK/cosign.pub" \
+    bash "$UPDATE_SCRIPT" --no-restart 2>&1; echo "EXIT=$?" )
+rcK=$(echo "$outK" | grep -o 'EXIT=[0-9]*' | cut -d= -f2)
+assert_eq "1" "$rcK" "signature present but INVALID: aborts the update (exit 1)"
+
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$outK" | grep -q 'cosign signature verification FAILED' \
+    && ! echo "$outK" | grep -q 'Rebuilding loom-daemon (cargo build'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} signature present but INVALID: never degrades to a source-build fallback"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} signature present but INVALID: never degrades to a source-build fallback"
+    echo "  output: $outK"
+fi
+
+installedK_after="$("$WK/installed-loom-daemon" --version 2>/dev/null)"
+assert_eq "$installedK_before" "$installedK_after" "signature-verification failure leaves the destination binary untouched"
+
+# ------------------------------------------------------------
+# L. Linux detached signature PRESENT but no cosign public key is resolvable
+#    -> LOUD SKIP, update still proceeds (AC3: an unverifiable-but-optional
+#    signature never blocks; the checksum already passed).
+# ------------------------------------------------------------
+WL="$BASE_WORKDIR/w-fetch-l"
+new_fixture "$WL"
+write_fake_daemon "$WL/installed-loom-daemon" "oldc0mm" "$WL/marker"
+
+WL_ASSETS="$WL/gh-assets"
+mkdir -p "$WL_ASSETS"
+WL_BIN_NAME="loom-daemon-x86_64-unknown-linux-gnu"
+write_fake_artifact_daemon "$WL_ASSETS/$WL_BIN_NAME" "0.16.0" "nokeyc0"
+sha256_of "$WL_ASSETS/$WL_BIN_NAME" > "$WL_ASSETS/$WL_BIN_NAME.sha256"
+echo "fake-detached-signature" > "$WL_ASSETS/$WL_BIN_NAME.sig"
+
+WL_FAKEBIN="$WL/fakebin"
+mkdir -p "$WL_FAKEBIN"
+write_fake_gh "$WL_FAKEBIN/gh" "v0.16.0" "$WL_ASSETS"
+write_fake_cosign "$WL_FAKEBIN/cosign" 0
+
+outL=$( cd "$WL" && PATH="$WL_FAKEBIN:$TEST_PATH" \
+    LOOM_DAEMON_BIN="$WL/installed-loom-daemon" \
+    LOOM_DAEMON_UPDATE_GH_REPO="test-owner/test-repo" \
+    LOOM_DAEMON_UPDATE_TARGET="x86_64-unknown-linux-gnu" \
+    bash "$UPDATE_SCRIPT" --no-restart 2>&1; echo "EXIT=$?" )
+rcL=$(echo "$outL" | grep -o 'EXIT=[0-9]*' | cut -d= -f2)
+assert_eq "0" "$rcL" "signature present, no public key: loud skip, update still proceeds (exit 0)"
+
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$outL" | grep -q 'no cosign public key is resolvable.*SKIPPING verification'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} signature present, no public key: the skip is LOUD, not silent"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} signature present, no public key: the skip is LOUD, not silent"
+    echo "  output: $outL"
+fi
+
+installedL_version="$("$WL/installed-loom-daemon" --version 2>/dev/null)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$installedL_version" | grep -q 'commit nokeyc0'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} signature present, no public key: the artifact was still provisioned"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} signature present, no public key: the artifact was still provisioned"
+    echo "  --version: $installedL_version"
+fi
+
+# ------------------------------------------------------------
+# M. macOS target, artifact UNSIGNED (no Developer ID secrets were configured
+#    for that release) -> soft-skip, update proceeds. This is the case that
+#    must NOT be confused with tamper evidence.
+# ------------------------------------------------------------
+WM="$BASE_WORKDIR/w-fetch-m"
+new_fixture "$WM"
+write_fake_daemon "$WM/installed-loom-daemon" "oldc0mm" "$WM/marker"
+
+WM_ASSETS="$WM/gh-assets"
+mkdir -p "$WM_ASSETS"
+WM_BIN_NAME="loom-daemon-aarch64-apple-darwin"
+write_fake_artifact_daemon "$WM_ASSETS/$WM_BIN_NAME" "0.16.0" "unsignd"
+sha256_of "$WM_ASSETS/$WM_BIN_NAME" > "$WM_ASSETS/$WM_BIN_NAME.sha256"
+
+WM_FAKEBIN="$WM/fakebin"
+mkdir -p "$WM_FAKEBIN"
+write_fake_gh "$WM_FAKEBIN/gh" "v0.16.0" "$WM_ASSETS"
+write_fake_codesign "$WM_FAKEBIN/codesign" unsigned
+
+outM=$( cd "$WM" && PATH="$WM_FAKEBIN:$TEST_PATH" \
+    LOOM_DAEMON_BIN="$WM/installed-loom-daemon" \
+    LOOM_DAEMON_UPDATE_GH_REPO="test-owner/test-repo" \
+    LOOM_DAEMON_UPDATE_TARGET="aarch64-apple-darwin" \
+    bash "$UPDATE_SCRIPT" --no-restart 2>&1; echo "EXIT=$?" )
+rcM=$(echo "$outM" | grep -o 'EXIT=[0-9]*' | cut -d= -f2)
+assert_eq "0" "$rcM" "macOS artifact unsigned: soft-skip, update proceeds (exit 0)"
+
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$outM" | grep -q 'Downloaded artifact is unsigned'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} macOS artifact unsigned: reported as 'unsigned', not as a verification failure"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} macOS artifact unsigned: reported as 'unsigned', not as a verification failure"
+    echo "  output: $outM"
+fi
+
+installedM_version="$("$WM/installed-loom-daemon" --version 2>/dev/null)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$installedM_version" | grep -q 'commit unsignd'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} macOS artifact unsigned: still provisioned (absence never blocks)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} macOS artifact unsigned: still provisioned (absence never blocks)"
+    echo "  --version: $installedM_version"
+fi
+
+# ------------------------------------------------------------
+# N. macOS target, artifact SIGNED and codesign verification succeeds ->
+#    proceeds, reporting the verification.
+# ------------------------------------------------------------
+WN="$BASE_WORKDIR/w-fetch-n"
+new_fixture "$WN"
+write_fake_daemon "$WN/installed-loom-daemon" "oldc0mm" "$WN/marker"
+
+WN_ASSETS="$WN/gh-assets"
+mkdir -p "$WN_ASSETS"
+WN_BIN_NAME="loom-daemon-aarch64-apple-darwin"
+write_fake_artifact_daemon "$WN_ASSETS/$WN_BIN_NAME" "0.16.0" "csignok"
+sha256_of "$WN_ASSETS/$WN_BIN_NAME" > "$WN_ASSETS/$WN_BIN_NAME.sha256"
+
+WN_FAKEBIN="$WN/fakebin"
+mkdir -p "$WN_FAKEBIN"
+write_fake_gh "$WN_FAKEBIN/gh" "v0.16.0" "$WN_ASSETS"
+write_fake_codesign "$WN_FAKEBIN/codesign" signed-ok
+
+outN=$( cd "$WN" && PATH="$WN_FAKEBIN:$TEST_PATH" \
+    LOOM_DAEMON_BIN="$WN/installed-loom-daemon" \
+    LOOM_DAEMON_UPDATE_GH_REPO="test-owner/test-repo" \
+    LOOM_DAEMON_UPDATE_TARGET="aarch64-apple-darwin" \
+    bash "$UPDATE_SCRIPT" --no-restart 2>&1; echo "EXIT=$?" )
+rcN=$(echo "$outN" | grep -o 'EXIT=[0-9]*' | cut -d= -f2)
+assert_eq "0" "$rcN" "macOS artifact signed + verified: update proceeds (exit 0)"
+
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$outN" | grep -q 'macOS codesign verification passed'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} macOS artifact signed: codesign verification actually ran and passed"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} macOS artifact signed: codesign verification actually ran and passed"
+    echo "  output: $outN"
+fi
+
+# ------------------------------------------------------------
+# O. macOS target, artifact SIGNED but codesign verification FAILS -> abort
+#    (exit 1), destination untouched. Distinct from the "unsigned" case in M.
+# ------------------------------------------------------------
+WO="$BASE_WORKDIR/w-fetch-o"
+new_fixture "$WO"
+write_fake_daemon "$WO/installed-loom-daemon" "oldc0mm" "$WO/marker"
+installedO_before="$("$WO/installed-loom-daemon" --version 2>/dev/null)"
+
+WO_ASSETS="$WO/gh-assets"
+mkdir -p "$WO_ASSETS"
+WO_BIN_NAME="loom-daemon-aarch64-apple-darwin"
+write_fake_artifact_daemon "$WO_ASSETS/$WO_BIN_NAME" "0.16.0" "csignbad"
+sha256_of "$WO_ASSETS/$WO_BIN_NAME" > "$WO_ASSETS/$WO_BIN_NAME.sha256"
+
+WO_FAKEBIN="$WO/fakebin"
+mkdir -p "$WO_FAKEBIN"
+write_fake_gh "$WO_FAKEBIN/gh" "v0.16.0" "$WO_ASSETS"
+write_fake_codesign "$WO_FAKEBIN/codesign" signed-bad
+write_fake_cargo "$WO_FAKEBIN/cargo"
+
+outO=$( cd "$WO" && PATH="$WO_FAKEBIN:$TEST_PATH" \
+    LOOM_DAEMON_BIN="$WO/installed-loom-daemon" \
+    LOOM_DAEMON_UPDATE_GH_REPO="test-owner/test-repo" \
+    LOOM_DAEMON_UPDATE_TARGET="aarch64-apple-darwin" \
+    bash "$UPDATE_SCRIPT" --no-restart 2>&1; echo "EXIT=$?" )
+rcO=$(echo "$outO" | grep -o 'EXIT=[0-9]*' | cut -d= -f2)
+assert_eq "1" "$rcO" "macOS artifact signed but INVALID: aborts the update (exit 1)"
+
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$outO" | grep -q 'codesign verification FAILED' \
+    && ! echo "$outO" | grep -q 'Rebuilding loom-daemon (cargo build'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} macOS signed-but-invalid: treated as tamper evidence, no source-build fallback"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} macOS signed-but-invalid: treated as tamper evidence, no source-build fallback"
+    echo "  output: $outO"
+fi
+
+installedO_after="$("$WO/installed-loom-daemon" --version 2>/dev/null)"
+assert_eq "$installedO_before" "$installedO_after" "macOS signed-but-invalid leaves the destination binary untouched"
 
 # ============================================================
 # 25. Launchd-sandbox guards (#4078): the whole suite exercises the REAL
