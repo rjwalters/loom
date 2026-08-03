@@ -358,6 +358,15 @@ pub struct RoleFailure {
     pub role: String,
     /// How many ticks failed for this pair inside the window.
     pub failures: usize,
+    /// The length of the *trailing* run of consecutive failures whose `detail`
+    /// is byte-identical to `detail` below (the streak that ends at the most
+    /// recent record). For a persistent pair this is `>= 1`; for a transient
+    /// pair (whose latest record is a success) it is `0`. This is the basis for
+    /// escalation (see [`RoleTickSummary::escalated`] and
+    /// [`ROLE_TICK_ESCALATION_THRESHOLD`]): a single success — or a failure with
+    /// a *different* detail — anywhere in the tail breaks the run and resets the
+    /// count, so a self-recovering transient blip can never accumulate a streak.
+    pub consecutive_identical: usize,
     /// When the most recent record for this pair landed.
     pub last_at: DateTime<Utc>,
     /// The most recent failure detail.
@@ -379,6 +388,29 @@ impl RoleFailure {
     }
 }
 
+/// How many consecutive identical failures for one `(root, role)` pair escalate
+/// it from ordinary "persistent" to "escalated" (#5023).
+///
+/// **Threshold rationale.** During the 2026-08-03 outage a config-shaped tick
+/// failure (`LOOM_RUNTIME_JUDGE=codex`, which could never self-recover without a
+/// config or code change) retried silently every interval, producing 6-7
+/// consecutive identical failures per repo and ~96 wasted token selections + CLI
+/// starts over the day. `5` sits below that observed 6-7 streak — so the same
+/// outage would have escalated *before* it ran all day — while staying well
+/// above any 1-2 tick transient blip (a slow forge, a one-off network error),
+/// which the existing transient/persistent classifier already tolerates.
+///
+/// **"Identical failure" comparison basis.** Exact `detail`-string match (not a
+/// coarser failure-class match): a config-shaped failure emits a byte-identical
+/// `detail` every tick (same runtime-rejection reason, same `no-token-pool`
+/// sentinel), whereas transient failures vary their detail or are interspersed
+/// with successes. Exact-string is therefore the tightest basis that still
+/// catches the config-shaped case (e.g. #5001's Codex runtime mismatch) without
+/// false-positiving on a flapping transient error whose text differs tick to
+/// tick. See [`RoleFailure::consecutive_identical`] for how the streak is
+/// counted (and reset).
+pub const ROLE_TICK_ESCALATION_THRESHOLD: usize = 5;
+
 /// The windowed role-tick picture.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct RoleTickSummary {
@@ -392,6 +424,16 @@ pub struct RoleTickSummary {
     /// `(root, role)` pairs that failed at least once but whose latest record
     /// in the window is a success — self-recovered, reported as a count only.
     pub transient: Vec<RoleFailure>,
+    /// The **subset** of `persistent` whose trailing run of consecutive
+    /// identical failures has reached [`ROLE_TICK_ESCALATION_THRESHOLD`] (#5023)
+    /// — a config-shaped failure that cannot self-recover and so must be
+    /// surfaced loudly and distinctly, rather than retried identically forever.
+    /// Escalated pairs remain in `persistent` too (they *are* persistent); this
+    /// list is the "this can never succeed as configured" call-out layered on
+    /// top. It empties automatically the moment such a pair ticks successfully
+    /// again (the success breaks the streak), so a since-fixed cause never
+    /// stays escalated.
+    pub escalated: Vec<RoleFailure>,
 }
 
 /// Classify a role-tick window into persistent vs transient failures (#4761).
@@ -449,16 +491,39 @@ pub fn summarize_role_ticks(records: &[RoleTickRecord], since: DateTime<Utc>) ->
             .rev()
             .find(|r| !r.ok)
             .and_then(|r| r.detail.clone());
+        // Escalation streak (#5023): count the trailing run of consecutive
+        // failures whose `detail` is byte-identical to the latest record's, from
+        // newest backward. A success — or a failure carrying a *different*
+        // detail — breaks the run, so this is `0` for a transient pair (latest
+        // is a success) and resets to `0` the moment a persistent pair recovers.
+        // Exact-string comparison is the deliberate basis (see
+        // `ROLE_TICK_ESCALATION_THRESHOLD`).
+        let consecutive_identical = if latest.ok {
+            0
+        } else {
+            entries
+                .iter()
+                .rev()
+                .take_while(|r| !r.ok && r.detail == latest.detail)
+                .count()
+        };
         let failure = RoleFailure {
             root,
             role,
             failures,
+            consecutive_identical,
             last_at: latest.at,
             detail,
         };
         if latest.ok {
             summary.transient.push(failure);
         } else {
+            // Escalated pairs stay in `persistent` (they are persistent) AND are
+            // additionally called out in `escalated` — the loud "config-shaped,
+            // cannot self-recover" subset.
+            if consecutive_identical >= ROLE_TICK_ESCALATION_THRESHOLD {
+                summary.escalated.push(failure.clone());
+            }
             summary.persistent.push(failure);
         }
     }
@@ -1039,6 +1104,35 @@ pub fn assess_roles(inputs: &HealthInputs) -> HealthSection {
     } else {
         format!("; {} transient (self-recovered)", summary.transient.len())
     };
+    // Escalation call-out (#5023): a pair whose latest run of consecutive
+    // identical failures has reached `ROLE_TICK_ESCALATION_THRESHOLD` is
+    // config-shaped — it cannot self-recover without an operator config/code
+    // change, so it is surfaced distinctly from ordinary persistent noise rather
+    // than left to retry identically forever (burning a token slot each tick).
+    // The verdict stays `Degraded` (no new tier), but the summary and the JSON
+    // `escalated` list make the "actionable now" subset unmistakable.
+    let escalated_note = if summary.escalated.is_empty() {
+        String::new()
+    } else {
+        let names: Vec<String> = summary
+            .escalated
+            .iter()
+            .map(|f| {
+                let detail = f.detail.as_deref().unwrap_or("failed");
+                format!(
+                    "{} ({} consecutive identical: {detail})",
+                    f.label(),
+                    f.consecutive_identical
+                )
+            })
+            .collect();
+        format!(
+            "; {} ESCALATED (>={ROLE_TICK_ESCALATION_THRESHOLD} consecutive identical failures — \
+             config-shaped, cannot self-recover, needs an operator config/code change): {}",
+            summary.escalated.len(),
+            names.join(", ")
+        )
+    };
     let (verdict, line) = if summary.persistent.is_empty() {
         (
             Verdict::Green,
@@ -1056,7 +1150,7 @@ pub fn assess_roles(inputs: &HealthInputs) -> HealthSection {
         (
             Verdict::Degraded,
             format!(
-                "{}/{} ticks ok; {} PERSISTENT failure(s): {}{transient_note}",
+                "{}/{} ticks ok; {} PERSISTENT failure(s): {}{escalated_note}{transient_note}",
                 summary.ok,
                 summary.total,
                 summary.persistent.len(),
@@ -2344,6 +2438,117 @@ mod tests {
         let section = assess_roles(&healthy_inputs());
         assert_eq!(section.verdict, Verdict::Green);
         assert!(section.summary.contains("no role ticks in window"));
+    }
+
+    // ------- Escalation on N consecutive identical failures (#5023) -------
+
+    /// A failure record with an explicit `detail`, for the identical-vs-varying
+    /// tests (the plain `record` helper always uses `"boom"`).
+    fn record_detail(role: &str, root: &str, ago_secs: i64, detail: &str) -> RoleTickRecord {
+        RoleTickRecord {
+            root: PathBuf::from(root),
+            role: role.to_string(),
+            at: now() - chrono::Duration::seconds(ago_secs),
+            ok: false,
+            detail: Some(detail.to_string()),
+        }
+    }
+
+    #[test]
+    fn n_consecutive_identical_failures_escalate() {
+        // Exactly ROLE_TICK_ESCALATION_THRESHOLD identical failures, oldest
+        // first — the config-shaped case the 2026-08-03 outage produced.
+        let n = ROLE_TICK_ESCALATION_THRESHOLD;
+        let records: Vec<RoleTickRecord> = (0..n)
+            .map(|i| record("judge", "/r/loom", ((n - i) * 10) as i64, false))
+            .collect();
+        let summary = summarize_role_ticks(&records, now() - chrono::Duration::seconds(1800));
+        assert_eq!(summary.persistent.len(), 1);
+        assert_eq!(summary.escalated.len(), 1, "N identical failures must escalate");
+        assert_eq!(summary.escalated[0].consecutive_identical, n);
+        assert_eq!(summary.escalated[0].detail.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn n_minus_one_failures_interspersed_with_a_success_do_not_escalate() {
+        // (N-1) identical failures, one success, then (N-1) identical failures:
+        // the latest record is a failure (persistent) but the trailing run of
+        // *consecutive* identical failures is only N-1 — the success in the
+        // middle reset the streak, so escalation must NOT trigger.
+        let n = ROLE_TICK_ESCALATION_THRESHOLD;
+        let mut records = Vec::new();
+        let mut ago = ((2 * n) * 10) as i64;
+        for _ in 0..(n - 1) {
+            records.push(record("judge", "/r/loom", ago, false));
+            ago -= 10;
+        }
+        records.push(record("judge", "/r/loom", ago, true));
+        ago -= 10;
+        for _ in 0..(n - 1) {
+            records.push(record("judge", "/r/loom", ago, false));
+            ago -= 10;
+        }
+        let summary = summarize_role_ticks(&records, now() - chrono::Duration::seconds(1800));
+        assert_eq!(summary.persistent.len(), 1);
+        assert_eq!(summary.persistent[0].consecutive_identical, n - 1);
+        assert!(
+            summary.escalated.is_empty(),
+            "a success within the tail must reset the streak below the threshold"
+        );
+    }
+
+    #[test]
+    fn escalation_clears_once_the_tick_succeeds_again() {
+        // N identical failures (would escalate) followed by a success: the pair
+        // is now transient, `escalated` is empty, and the streak resets to 0 —
+        // no permanent lockout from a since-fixed cause.
+        let n = ROLE_TICK_ESCALATION_THRESHOLD;
+        let mut records: Vec<RoleTickRecord> = (0..n)
+            .map(|i| record("judge", "/r/loom", ((n + 1 - i) * 10) as i64, false))
+            .collect();
+        records.push(record("judge", "/r/loom", 5, true));
+        let summary = summarize_role_ticks(&records, now() - chrono::Duration::seconds(1800));
+        assert!(summary.escalated.is_empty());
+        assert!(summary.persistent.is_empty());
+        assert_eq!(summary.transient.len(), 1);
+        assert_eq!(summary.transient[0].consecutive_identical, 0);
+    }
+
+    #[test]
+    fn a_different_failure_detail_breaks_the_identical_streak() {
+        // N-1 identical failures then one failure with a DIFFERENT detail: the
+        // trailing run of *identical* failures is only 1, so exact-detail
+        // matching keeps a flapping (varying-message) failure out of escalation
+        // even though the pair is persistent.
+        let n = ROLE_TICK_ESCALATION_THRESHOLD;
+        let mut records: Vec<RoleTickRecord> = (0..(n - 1))
+            .map(|i| record("judge", "/r/loom", ((n - i) * 10) as i64, false))
+            .collect();
+        records.push(record_detail("judge", "/r/loom", 5, "a-different-transient-error"));
+        let summary = summarize_role_ticks(&records, now() - chrono::Duration::seconds(1800));
+        assert_eq!(summary.persistent.len(), 1);
+        assert_eq!(summary.persistent[0].consecutive_identical, 1);
+        assert!(summary.escalated.is_empty());
+    }
+
+    #[test]
+    fn escalated_failures_surface_distinctly_in_the_roles_section() {
+        let n = ROLE_TICK_ESCALATION_THRESHOLD;
+        let mut inputs = healthy_inputs();
+        inputs.status.as_mut().unwrap().role_tick_records = (0..n)
+            .map(|i| record("judge", "/r/loom", ((n - i) * 10) as i64, false))
+            .collect();
+        let section = assess_roles(&inputs);
+        assert_eq!(section.verdict, Verdict::Degraded);
+        assert!(
+            section.summary.contains("ESCALATED"),
+            "escalated pairs must be called out distinctly: {}",
+            section.summary
+        );
+        assert!(section.summary.contains("judge @ loom"));
+        // The escalated subset is machine-readable for --json / dashboard
+        // consumers (#5022 will export it externally).
+        assert_eq!(section.detail["escalated"].as_array().map(Vec::len), Some(1));
     }
 
     // ===================================================================
