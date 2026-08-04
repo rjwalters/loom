@@ -22,27 +22,29 @@ cd ~/projects/my-app
 pnpm install && pnpm dev
 ```
 
-## Coming Soon
+### [desktop](./desktop/)
 
-### desktop (planned)
+Desktop application with Tauri 2.0, React, and system integration.
 
-Desktop application with Tauri, React, and system integration.
+**Stack:** Tauri 2.0, React 19, TypeScript, Tailwind CSS 4, shadcn/ui, SQLite (tauri-plugin-sql), Vite
 
-**Planned features:**
-- Native menu integration
-- Auto-updates
-- System tray
-- Local storage
+```bash
+cp -r quickstarts/desktop ~/projects/my-app
+cd ~/projects/my-app
+pnpm install && pnpm dev
+```
 
-### api (planned)
+### [api](./api/)
 
 API-first backend with Cloudflare Workers and Hono.
 
-**Planned features:**
-- Auth middleware
-- Rate limiting
-- OpenAPI documentation
-- KV/D1 integration
+**Stack:** Hono (zod-openapi), Cloudflare Workers, D1 + KV, Zod validation, OpenAPI/Swagger UI
+
+```bash
+cp -r quickstarts/api ~/projects/my-app
+cd ~/projects/my-app
+pnpm install && pnpm dev
+```
 
 ## Using Templates
 

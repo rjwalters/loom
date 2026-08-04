@@ -1,0 +1,234 @@
+name: Dashboard Deploy
+
+# Auto-deploy the fleet observability Worker to the 2AM reference instance
+# (dashboard.2amlogic.com) on every push to `main` that touches `dashboard/**`
+# (issue #4958). Before this workflow, a merged dashboard fix only reached
+# production when an operator remembered to run `wrangler deploy` by hand
+# (`docs/deploy-runbook.md`) — the same starvation shape as daemon binary
+# staleness (#4929), one layer up.
+#
+# `test` always gates `deploy` (`needs: test`): a failing test blocks the
+# live Worker from ever seeing the broken commit.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "dashboard/**"
+
+concurrency:
+  # Serialize deploys of the same branch — two overlapping `wrangler deploy`
+  # runs against the same Worker/D1 database is not a scenario worth
+  # supporting, and cancelling an in-flight deploy could leave a half-applied
+  # migration, so this does NOT cancel-in-progress (unlike ci.yml's group).
+  group: dashboard-deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Dashboard Tests (deploy gate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "20"
+      - name: Install backend dependencies
+        run: npm ci
+        working-directory: dashboard
+      - name: Install web UI dependencies
+        run: npm ci
+        working-directory: dashboard/web
+      - name: Run backend (Miniflare) + web (happy-dom) suites
+        run: npm run check:all
+        working-directory: dashboard
+
+  deploy:
+    name: Deploy Worker (dashboard.2amlogic.com)
+    needs: test
+    runs-on: ubuntu-latest
+    # `issues: write` is required by the "File or update a tracking issue for
+    # the failed deploy" step below (#4974) — this workflow is `push`-triggered
+    # (not a PR check), so without this the failure-tracking step's `gh issue
+    # create`/`comment` would itself fail silently.
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v7
+        id: checkout
+      - uses: actions/setup-node@v7
+        id: setup-node
+        with:
+          node-version: "20"
+      - name: Install backend dependencies
+        id: install-backend-deps
+        run: npm ci
+        working-directory: dashboard
+      - name: Install web UI dependencies
+        id: install-web-deps
+        run: npm ci
+        working-directory: dashboard/web
+
+      # `dashboard/wrangler.toml` is BOTH the working config this repo's own
+      # test suite uses AND the public template a third party copies to
+      # deploy their own instance (see its own header comment) — it carries
+      # only placeholder account/database/route values, never the 2AM
+      # instance's real ones. The instance-specific overlay
+      # (`wrangler.2amlogic.toml`) is deliberately never committed (see
+      # docs/reference-deployment.md — it belongs in the operator's own infra
+      # repo), so CI materializes it from a secret the same shape as the file
+      # an operator already keeps locally — nothing about the 2AM
+      # account/route/database is hardcoded here, so a later change (e.g.
+      # epic #4859's production cutover) only requires updating the secret,
+      # never this workflow.
+      - name: Materialize the 2AM instance's wrangler config
+        id: materialize-wrangler-config
+        working-directory: dashboard
+        env:
+          WRANGLER_CONFIG_2AMLOGIC: ${{ secrets.CLOUDFLARE_WRANGLER_CONFIG_2AMLOGIC }}
+        run: |
+          set -euo pipefail
+          if [ -z "${WRANGLER_CONFIG_2AMLOGIC:-}" ]; then
+            echo "::error::CLOUDFLARE_WRANGLER_CONFIG_2AMLOGIC secret is not set — deploy cannot proceed." >&2
+            echo "This must be the full contents of the 2AM instance's wrangler.2amlogic.toml overlay" >&2
+            echo "(Worker name, D1 database name/id, custom-domain route, Access vars) — the" >&2
+            echo "operator's own infra repo records what it must contain (see" >&2
+            echo "dashboard/docs/reference-deployment.md), and" >&2
+            echo "'gh secret set CLOUDFLARE_WRANGLER_CONFIG_2AMLOGIC < dashboard/wrangler.2amlogic.toml'" >&2
+            echo "run from the operator's machine (where that file already lives) to provision it." >&2
+            # Mirror the same text into a step output (verbatim) so the
+            # failure-tracking step below (#4974) can surface it in the
+            # forge issue/comment it files, without re-deriving the message.
+            {
+              echo "error_detail<<GH_OUTPUT_EOF"
+              echo "CLOUDFLARE_WRANGLER_CONFIG_2AMLOGIC secret is not set — deploy cannot proceed."
+              echo "This must be the full contents of the 2AM instance's wrangler.2amlogic.toml overlay"
+              echo "(Worker name, D1 database name/id, custom-domain route, Access vars) — the"
+              echo "operator's own infra repo records what it must contain (see"
+              echo "dashboard/docs/reference-deployment.md), and"
+              echo "'gh secret set CLOUDFLARE_WRANGLER_CONFIG_2AMLOGIC < dashboard/wrangler.2amlogic.toml'"
+              echo "run from the operator's machine (where that file already lives) to provision it."
+              echo "GH_OUTPUT_EOF"
+            } >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          printf '%s\n' "$WRANGLER_CONFIG_2AMLOGIC" > wrangler.2amlogic.toml
+
+      - name: Build the dashboard UI
+        id: build-web
+        working-directory: dashboard
+        run: npm run build:web
+
+      # `--remote` also confirms the ADMIN_TOKEN secret is set on the
+      # deployed Worker; `wrangler deploy --dry-run` inside it is what makes
+      # a bad overlay (still-a-placeholder database_id, config that fails to
+      # parse) fail here instead of mid-migration.
+      - name: Preflight the deploy config
+        id: preflight
+        working-directory: dashboard
+        env:
+          LOOM_DASHBOARD_WRANGLER_CONFIG: wrangler.2amlogic.toml
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: npm run preflight -- --remote
+
+      # `wrangler d1 migrations apply` is idempotent by design (it tracks
+      # applied migrations inside the D1 database itself), so a run with
+      # nothing new to apply is a clean no-op — this step does not need its
+      # own "only if pending" guard.
+      - name: Apply D1 migrations (idempotent)
+        id: apply-migrations
+        working-directory: dashboard
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          db_name="$(awk -F'"' '/^[[:space:]]*database_name[[:space:]]*=/{print $2; exit}' wrangler.2amlogic.toml)"
+          if [ -z "$db_name" ]; then
+            echo "::error::could not read database_name out of wrangler.2amlogic.toml" >&2
+            exit 1
+          fi
+          npx wrangler d1 migrations apply "$db_name" --remote --config wrangler.2amlogic.toml
+
+      # The build/deploy commit stamp (issue #4958): a plain `--var`, never
+      # written into any committed or overlay wrangler.toml, so it needs no
+      # config-file change per deploy. Served back by `/api/version` and the
+      # dashboard footer (`src/index.ts`, `web/src/buildInfo.ts`).
+      - name: Deploy Worker
+        id: deploy-worker
+        working-directory: dashboard
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: npx wrangler deploy --config wrangler.2amlogic.toml --var "BUILD_COMMIT:${{ github.sha }}"
+
+      # #4974: before this step, a failed deploy was a red run in the Actions
+      # tab and nothing else -- no forge-visible artifact entered the normal
+      # triage flow. `if: failure()` runs this only when a prior step in this
+      # job failed; it never flips the job's own conclusion back to green (a
+      # job's conclusion is fixed by its failed step before this one runs --
+      # this step succeeding or failing afterward does not change that). One
+      # dedup'd issue per distinct failing step (title includes the step
+      # name), following the same search-by-exact-title pattern as
+      # fork-drift.yml, so repeated failures of the same underlying cause
+      # comment on one issue instead of spamming a fresh one per run. A green
+      # re-run after the fix does NOT auto-close/clean up the tracking issue
+      # -- that's expected, left for the normal triage flow to close.
+      - name: File or update a tracking issue for the failed deploy
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STEPS_JSON: ${{ toJSON(steps) }}
+          MATERIALIZE_ERROR_DETAIL: ${{ steps.materialize-wrangler-config.outputs.error_detail }}
+        run: |
+          set -euo pipefail
+
+          failing_id="$(echo "$STEPS_JSON" | jq -r \
+            'to_entries | map(select(.value.conclusion == "failure")) | .[0].key // "unknown"')"
+
+          case "$failing_id" in
+            checkout) failing_name="Checkout" ;;
+            setup-node) failing_name="Set up Node.js" ;;
+            install-backend-deps) failing_name="Install backend dependencies" ;;
+            install-web-deps) failing_name="Install web UI dependencies" ;;
+            materialize-wrangler-config) failing_name="Materialize the 2AM instance's wrangler config" ;;
+            build-web) failing_name="Build the dashboard UI" ;;
+            preflight) failing_name="Preflight the deploy config" ;;
+            apply-migrations) failing_name="Apply D1 migrations (idempotent)" ;;
+            deploy-worker) failing_name="Deploy Worker" ;;
+            *) failing_name="an unidentified step" ;;
+          esac
+
+          title="ci(dashboard-deploy): deploy failed at \"${failing_name}\""
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          body="## Dashboard deploy failure"$'\n\n'
+          body+="The \`Deploy Worker (dashboard.2amlogic.com)\` job in \`.github/workflows/dashboard-deploy.yml\` failed."$'\n\n'
+          body+="- **Failing step:** ${failing_name}"$'\n'
+          body+="- **Run:** ${run_url}"$'\n'
+          body+="- **Commit:** ${GITHUB_SHA}"$'\n'
+
+          if [[ -n "${MATERIALIZE_ERROR_DETAIL:-}" ]]; then
+            body+=$'\n**Error detail (verbatim from the failing step):**\n```\n'"${MATERIALIZE_ERROR_DETAIL}"$'\n```\n'
+          fi
+
+          body+=$'\n_Last checked: '"$(date -u +"%Y-%m-%dT%H:%M:%SZ")"$'_'
+
+          # $title always contains literal embedded double quotes (from the
+          # \"${failing_name}\" wrapping above), so it cannot be safely dropped
+          # into either a quoted GitHub search phrase or a jq program string.
+          # Narrow the --search to a quote-free constant substring (a superset
+          # is fine -- correctness comes from the --arg exact-title match below).
+          # `gh`'s own --jq flag takes exactly one expression argument (it does
+          # not support jq's --arg passthrough), so pipe the raw JSON to a
+          # standalone jq invocation instead of using `gh issue list --jq`.
+          existing_number="$(gh issue list --state open --search "deploy failed in:title" \
+            --json number,title | jq -r --arg t "$title" '.[] | select(.title == $t) | .number' | head -1)"
+
+          if [[ -n "$existing_number" ]]; then
+            gh issue comment "$existing_number" --body "$body"
+            echo "Updated existing dashboard-deploy failure issue #$existing_number"
+          else
+            gh issue create --title "$title" --label "loom:triage" --body "$body"
+          fi

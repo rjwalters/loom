@@ -202,13 +202,36 @@ fn parse_util(field: &str) -> Option<f64> {
     field.parse::<f64>().ok()
 }
 
-/// Parse a single `.ranking` line into a `(name, status, util_5h)` triple.
+/// One parsed `.ranking` row.
 ///
-/// This is the **shared** triple parser for the `name|status|5h_util` format
-/// (issue #4195): `status` is the *second* pipe-delimited field and the third
-/// (5h utilization) is optional, so a legacy `name|status` line yields
-/// `util_5h = None` (backward compatible). `#` comments are stripped; a
-/// blank/comment-only line, or one whose name is empty, yields `None`.
+/// A struct rather than a tuple (it grew a 4th field in issue #4874): every
+/// reader names the fields it wants, so adding a 5th cannot silently shift a
+/// positional binding the way the #4243/#4344 drift did.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RankingRow {
+    pub name: String,
+    pub status: String,
+    /// 5h-window utilization (issue #4195), when the row carries one.
+    pub util_5h: Option<f64>,
+    /// When the account's **binding** limit window resets (issue #4874), when
+    /// the row carries one. Which window that is depends on the row's status —
+    /// the writer already resolved it via
+    /// [`crate::tokens_pool::check::limit_reset`]. Kept as the raw ISO-8601
+    /// text the writer emitted; this parser does no time arithmetic.
+    pub limit_reset: Option<String>,
+}
+
+/// Parse a single `.ranking` line into a [`RankingRow`].
+///
+/// This is the **shared** parser for the `name|status|5h_util|limit_reset`
+/// format: `status` is the *second* pipe-delimited field, the third (5h
+/// utilization, issue #4195) and fourth (binding-window reset instant, issue
+/// #4874) are optional, so a legacy `name|status` or `name|status|5h_util` line
+/// still parses with the absent fields as `None` (backward compatible). A row
+/// that knows its reset but not its utilization writes an empty third field
+/// (`name|status||limit_reset`), which parses back to `util_5h = None` — never
+/// coerced to `0.0`. `#` comments are stripped; a blank/comment-only line, or
+/// one whose name is empty, yields `None`.
 ///
 /// Both the selector ([`read_ranking`]) and the daemon's capacity reader
 /// ([`crate::capacity::read_ranking_at`]) consume the ranking through this one
@@ -217,31 +240,59 @@ fn parse_util(field: &str) -> Option<f64> {
 /// and mis-read every 3-field row's `5h_util` as the status word. A
 /// format-drift conformance test (`capacity::tests`) pins them together.
 #[must_use]
-pub(crate) fn parse_ranking_line(line: &str) -> Option<(String, String, Option<f64>)> {
+pub(crate) fn parse_ranking_line(line: &str) -> Option<RankingRow> {
     let stripped = strip_comment(line);
     if stripped.is_empty() {
         return None;
     }
-    let mut parts = stripped.splitn(3, '|');
+    // `splitn(4, ..)` — NOT `splitn(3, ..)`: with a 3-way split a 4th segment
+    // is swallowed into the utilization field and silently fails to parse as a
+    // float, which is exactly how the reset instant would have been lost.
+    let mut parts = stripped.splitn(4, '|');
     let name = parts.next().unwrap_or("").trim().to_string();
     let status = parts.next().unwrap_or("").trim().to_string();
-    let util = parts.next().and_then(parse_util);
+    let util_5h = parts.next().and_then(parse_util);
+    let limit_reset = parts.next().and_then(parse_reset);
     if name.is_empty() {
         return None;
     }
-    Some((name, status, util))
+    Some(RankingRow {
+        name,
+        status,
+        util_5h,
+        limit_reset,
+    })
+}
+
+/// Parse a ranking line's optional reset field (issue #4874). An empty
+/// field yields `None` ("unknown") — the row is never given a fabricated
+/// reset instant. The text is not date-validated here; the writer emits a
+/// canonical `%Y-%m-%dT%H:%M:%SZ` instant and consumers that need a real
+/// `DateTime` (the telemetry collector) parse it themselves and drop it on
+/// failure.
+fn parse_reset(field: &str) -> Option<String> {
+    let field = field.trim();
+    if field.is_empty() {
+        return None;
+    }
+    Some(field.to_string())
 }
 
 /// Yield `(name, status, util_5h)` triples from the ranking file, one per
 /// parseable line via the shared [`parse_ranking_line`] parser. Format:
-/// `name|status|5h_util` per line (issue #4195); the third field is optional,
-/// so a legacy `name|status` line yields `util_5h = None` (backward
+/// `name|status|5h_util|limit_reset` per line; the third and fourth fields are
+/// optional, so a legacy `name|status` line yields `util_5h = None` (backward
 /// compatible). Malformed/empty lines are skipped; `status` defaults to `""`.
+/// Selection ignores the reset instant — it is telemetry, not an input to the
+/// tiered pick — so this projects the row down to the triple selection uses.
 fn read_ranking(ranking_file: &Path) -> Vec<(String, String, Option<f64>)> {
     let Ok(text) = std::fs::read_to_string(ranking_file) else {
         return Vec::new();
     };
-    text.lines().filter_map(parse_ranking_line).collect()
+    text.lines()
+        .filter_map(parse_ranking_line)
+        .map(|row| (row.name, row.status, row.util_5h))
+        .collect()
 }
 
 fn read_allowlist_lines(allowlist_file: &Path) -> Vec<String> {
@@ -897,6 +948,66 @@ mod tests {
         assert_eq!(rows[0], ("a".to_string(), "available".to_string(), Some(0.70)));
         assert_eq!(rows[1], ("b".to_string(), "available".to_string(), None));
         assert_eq!(rows[2], ("c".to_string(), "available".to_string(), None));
+    }
+
+    // ---- limit-reset field (issue #4874) -----------------------------
+
+    #[test]
+    fn parse_ranking_line_reads_optional_limit_reset_field() {
+        // A 4-field row surfaces the reset verbatim; the 2- and 3-field legacy
+        // layouts still parse with `limit_reset = None` (backward compatible).
+        let full = parse_ranking_line("a|exhausted|0.00|2026-08-02T03:00:00Z").unwrap();
+        assert_eq!(full.name, "a");
+        assert_eq!(full.status, "exhausted");
+        assert_eq!(full.util_5h, Some(0.00));
+        assert_eq!(full.limit_reset.as_deref(), Some("2026-08-02T03:00:00Z"));
+
+        assert_eq!(parse_ranking_line("b|available|0.70").unwrap().limit_reset, None);
+        assert_eq!(parse_ranking_line("c|available").unwrap().limit_reset, None);
+    }
+
+    #[test]
+    fn parse_ranking_line_reset_without_util_does_not_fabricate_zero() {
+        // `name|status||reset` — the reset-known/util-unknown layout. The empty
+        // third field must parse back to `None`, never to `0.0`, or a fully
+        // idle account would look like a measured-zero-load one.
+        let row = parse_ranking_line("a|exhausted||2026-08-04T11:00:00Z").unwrap();
+        assert_eq!(row.status, "exhausted");
+        assert_eq!(row.util_5h, None);
+        assert_eq!(row.limit_reset.as_deref(), Some("2026-08-04T11:00:00Z"));
+    }
+
+    #[test]
+    fn parse_ranking_line_4th_field_does_not_swallow_the_util() {
+        // Regression guard for the `splitn(3, ..)` hazard the curator flagged:
+        // with a 3-way split the 4th segment is swallowed into the utilization
+        // field, so `0.00|2026-...` fails to parse as a float and the
+        // utilization silently becomes `None`.
+        let row = parse_ranking_line("a|exhausted|0.42|2026-08-02T03:00:00Z").unwrap();
+        assert_eq!(row.util_5h, Some(0.42), "the 4th field must not swallow the util");
+    }
+
+    #[test]
+    fn parse_ranking_line_reset_is_comment_stripped_and_trimmed() {
+        // `#` comments are stripped before splitting, and surrounding
+        // whitespace is trimmed off the reset like every other field.
+        let row = parse_ranking_line("a|exhausted|0.00| 2026-08-02T03:00:00Z  # probed").unwrap();
+        assert_eq!(row.limit_reset.as_deref(), Some("2026-08-02T03:00:00Z"));
+        // An empty 4th field is "unknown", not an empty string.
+        assert_eq!(parse_ranking_line("a|exhausted|0.00|").unwrap().limit_reset, None);
+    }
+
+    #[test]
+    fn read_ranking_ignores_the_reset_field_for_selection() {
+        // Selection consumes the projected triple: a 4-field row must behave
+        // exactly like the same row without a reset, so adding the field
+        // cannot perturb which account gets picked.
+        let tmp = tempfile::tempdir().unwrap();
+        let ranking = tmp.path().join(".ranking");
+        fs::write(&ranking, "a|available|0.70|2026-08-02T03:00:00Z\nb|available|0.70\n").unwrap();
+        let rows = read_ranking(&ranking);
+        assert_eq!(rows[0], ("a".to_string(), "available".to_string(), Some(0.70)));
+        assert_eq!(rows[1], ("b".to_string(), "available".to_string(), Some(0.70)));
     }
 
     #[test]

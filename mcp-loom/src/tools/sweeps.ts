@@ -218,9 +218,25 @@ interface ErrorResponse {
   message?: string;
 }
 
+/**
+ * `DaemonError` (loom-daemon/src/errors.rs) mirrored on the TS side. Every
+ * field but `message` is optional here defensively — the wire payload is
+ * still untyped JSON from the bridge's point of view.
+ */
+export interface StructuredError {
+  domain?: string;
+  code?: string;
+  message?: string;
+  recoverable?: boolean;
+  /** Extra machine-readable context, e.g. `{ registered: string[] }`. */
+  details?: unknown;
+  /** Operator/agent-facing next step, e.g. how to register a workspace. */
+  recovery_hint?: string;
+}
+
 interface StructuredErrorResponse {
   type: "StructuredError";
-  payload: { message?: string };
+  payload: StructuredError;
 }
 
 interface SweepStatusResponse {
@@ -367,6 +383,24 @@ export function formatRuntimeRejection(rejection: RuntimeRejection): string {
   );
 }
 
+/**
+ * Render a `StructuredError` (loom-daemon `DaemonError`) as a single
+ * actionable line (issue #5210). Before this, `extractError` read only
+ * `payload?.message`, so a `workspace_unregistered` (or any other structured)
+ * error's `details`/`recovery_hint` — the registered-roots list, the "how to
+ * fix this" hint — never reached the MCP client, mirroring the same discard
+ * pattern `formatRuntimeRejection` fixed for `RuntimeRejected` in #4494.
+ */
+export function formatStructuredError(payload: StructuredError): string {
+  const base = payload.message || "Unknown structured error";
+  const hint = payload.recovery_hint ? ` ${payload.recovery_hint}` : "";
+  const details =
+    payload.details !== undefined && payload.details !== null
+      ? ` Details: ${JSON.stringify(payload.details)}`
+      : "";
+  return `${base}${hint}${details}`;
+}
+
 function extractError(response: DaemonResponse): string | null {
   if (response.type === "Error") {
     const r = response as ErrorResponse;
@@ -374,7 +408,7 @@ function extractError(response: DaemonResponse): string | null {
   }
   if (response.type === "StructuredError") {
     const r = response as StructuredErrorResponse;
-    return r.payload?.message || "Unknown structured error";
+    return formatStructuredError(r.payload ?? {});
   }
   const rejection = extractRuntimeRejection(response);
   if (rejection) {

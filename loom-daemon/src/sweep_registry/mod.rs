@@ -503,6 +503,27 @@ pub struct SweepRegistry {
     /// [`Event::PreflightAdvisory`] fires only on a state-change transition,
     /// never every tick.
     preflight_advisory_tripped: bool,
+    /// Half-open recovery-probe clock for the dispatch breaker (Issue #5030).
+    /// While [`preflight_advisory_tripped`](Self::preflight_advisory_tripped) is
+    /// `true`, [`preflight_dispatch_gate`](Self::preflight_dispatch_gate) holds
+    /// new dispatch to this workspace except for one probe dispatch per
+    /// [`PreflightTripwireConfig::probe_cooldown`]; this records when the last
+    /// probe (or the first tick observing the trip) was let through. Cleared
+    /// back to `None` the moment the advisory un-trips, so a freshly re-tripped
+    /// advisory always waits a full cooldown before its first probe.
+    preflight_probe_last_at: Option<DateTime<Utc>>,
+    /// Wall-clock time of the most recent
+    /// [`preflight_advisory_tripped`](Self::preflight_advisory_tripped)
+    /// state-change transition (Issue #5029) — `None` until the first trip or
+    /// clear this process observes. Stamped exclusively inside
+    /// [`update_preflight_advisory`](Self::update_preflight_advisory)'s
+    /// existing state-change branch (never on an unrelated tick that leaves
+    /// `preflight_advisory_tripped` unchanged), so it is purely a display/
+    /// reporting addition — the trip/clear *decision* and
+    /// `preflight_death_streak` increment/reset semantics are untouched.
+    /// Lets `loom-daemon status` show "as of" freshness so a historical,
+    /// already-cleared tripped count is never mistaken for a live one.
+    preflight_advisory_changed_at: Option<DateTime<Utc>>,
     /// Per-issue dispatch-backoff parameters (Issue #4485). `main.rs` /
     /// [`crate::workspace_pool::WorkspacePool`] set the resolved env > config >
     /// default value at provision time, mirroring
@@ -554,6 +575,21 @@ pub struct SweepRegistry {
     /// capped at [`MAX_PHASE_OBSERVATIONS`] so a pathological Judge/Doctor loop
     /// cannot grow it without bound.
     phase_history: HashMap<SweepId, Vec<PhaseObservation>>,
+    /// Orphaned process groups awaiting SIGKILL escalation (Issue #4980).
+    ///
+    /// Written by [`reap_orphaned_group`](Self::reap_orphaned_group) when a
+    /// crash path (the reaper's dead-leader branch, or `reconstruct()`'s
+    /// stale-lock branch) finds a *dead* sweep leader whose process group still
+    /// has live members, and drained by
+    /// [`escalate_pending_group_reaps`](Self::escalate_pending_group_reaps) at
+    /// the top of each [`reap_once`](Self::reap_once) tick.
+    ///
+    /// Deferring the escalation to a later tick — rather than sleeping through
+    /// the grace inline — is deliberate: `reap_once` also runs on the
+    /// `ListSweeps` / `GetSweepStatus` read path while holding the registry
+    /// mutex, and blocking there is the 2026-07-26 wedge shape. Entries are
+    /// removed as soon as the group drains, so this never accumulates.
+    pending_group_reaps: HashMap<SweepId, PendingGroupReap>,
 }
 
 /// Resolve this host's identity string for collision records (Issue #4085) and
@@ -692,11 +728,14 @@ impl SweepRegistry {
             preflight_death_streak: 0,
             preflight_death_last_marker: None,
             preflight_advisory_tripped: false,
+            preflight_probe_last_at: None,
+            preflight_advisory_changed_at: None,
             dispatch_backoff_config: DispatchBackoffConfig::default(),
             dispatch_backoff: HashMap::new(),
             label_flip_log: HashMap::new(),
             flap_warned_at: HashMap::new(),
             phase_history: HashMap::new(),
+            pending_group_reaps: HashMap::new(),
         }
     }
 
@@ -733,11 +772,14 @@ impl SweepRegistry {
             preflight_death_streak: 0,
             preflight_death_last_marker: None,
             preflight_advisory_tripped: false,
+            preflight_probe_last_at: None,
+            preflight_advisory_changed_at: None,
             dispatch_backoff_config: DispatchBackoffConfig::default(),
             dispatch_backoff: HashMap::new(),
             label_flip_log: HashMap::new(),
             flap_warned_at: HashMap::new(),
             phase_history: HashMap::new(),
+            pending_group_reaps: HashMap::new(),
         }
     }
 
@@ -835,6 +877,16 @@ impl SweepRegistry {
             .unwrap_or("unknown");
         let message = self.preflight_advisory_message(self.preflight_pool_exhausted_now(), marker);
         (true, Some(message))
+    }
+
+    /// Wall-clock time of the most recent trip/clear transition backing
+    /// [`preflight_advisory`](Self::preflight_advisory) (Issue #5029), or
+    /// `None` before the first transition this process has observed. Purely a
+    /// freshness signal for `DaemonStatusReport` / `loom-daemon status` — it
+    /// does not participate in the trip/clear decision itself.
+    #[must_use]
+    pub fn preflight_advisory_changed_at(&self) -> Option<DateTime<Utc>> {
+        self.preflight_advisory_changed_at
     }
 
     /// Current consecutive pre-flight-death streak (Issue #4386), for tests /
@@ -1229,6 +1281,9 @@ mod tests {
             sweep_id: "sweep-issue-42-1700000000".to_string(),
             kind: SweepKind::Issue(42),
             pid: 12_345,
+            // Issue #4980: a sweep is spawned as its own group leader, so a
+            // live dispatch's pgid equals its pid.
+            pgid: Some(12_345),
             token_name: "agent-1.token".to_string(),
             runtime: "unknown".into(),
             runtime_source: None,
@@ -1250,6 +1305,7 @@ mod tests {
             "sweep_id": "sweep-issue-42-1700000000",
             "kind": {"type": "Issue", "value": 42},
             "pid": 12_345,
+            "pgid": 12_345,
             "token_name": "agent-1.token",
             "runtime": "unknown",
             "log_path": ".loom/logs/sweep-issue-42.log",
@@ -1285,6 +1341,10 @@ mod tests {
         // None (#[serde(default)]) and be omitted on re-serialization
         // (skip_serializing_if).
         assert_eq!(legacy.effort, None);
+        // Pre-#4980 JSON lacks `pgid` too — it must default to None and be
+        // omitted on re-serialization, so an older client/daemon on the other
+        // end of the socket is unaffected.
+        assert_eq!(legacy.pgid, None);
         assert_eq!(legacy.runtime, "unknown");
         let reserialized = serde_json::to_value(&legacy).unwrap();
         assert!(

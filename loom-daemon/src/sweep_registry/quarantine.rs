@@ -118,6 +118,39 @@ pub const PREFLIGHT_TRIPWIRE_THRESHOLD_ENV: &str = "LOOM_PREFLIGHT_TRIPWIRE_THRE
 /// advisory trips (#4386).
 pub const DEFAULT_PREFLIGHT_TRIPWIRE_THRESHOLD: u32 = 3;
 
+/// Env var overriding the half-open probe cooldown, in seconds (Issue #5030).
+/// A zero/invalid value falls through to config/default.
+pub const PREFLIGHT_PROBE_COOLDOWN_ENV: &str = "LOOM_PREFLIGHT_PROBE_COOLDOWN_SECS";
+
+/// Default cooldown between recovery probe dispatches once the pre-flight
+/// advisory is tripped (Issue #5030). While tripped, the dispatch breaker holds
+/// new dispatch to the broken workspace but lets exactly one probe dispatch
+/// through per cooldown to test recovery (half-open) — since the advisory only
+/// clears after a dispatch *succeeds*, an unconditional hold would prevent the
+/// very dispatch needed to prove the break is fixed. 15 minutes matches
+/// [`DEFAULT_DISPATCH_BACKOFF_MAX_SECS`](crate::sweep_registry::DEFAULT_DISPATCH_BACKOFF_MAX_SECS),
+/// the ceiling of the per-issue backoff, so a still-broken workspace burns at
+/// most one ~1s pre-flight death per 15 minutes instead of one every tick.
+pub const DEFAULT_PREFLIGHT_PROBE_COOLDOWN_SECS: u64 = 900;
+
+/// The recovery-probe gate decision for one workspace's dispatch admission
+/// (Issue #5030), returned by
+/// [`SweepRegistry::preflight_dispatch_gate`](crate::sweep_registry::SweepRegistry::preflight_dispatch_gate).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreflightDispatchGate {
+    /// The advisory is not tripped — dispatch normally (the common case).
+    Open,
+    /// The advisory is tripped and the cooldown since the last probe has not
+    /// yet elapsed — hold all new dispatch to this workspace this tick.
+    Held,
+    /// The advisory is tripped but the cooldown has elapsed — let this tick's
+    /// dispatch through as a half-open recovery probe. A dispatch that reaches
+    /// `# CLAUDE_CLI_START` clears the advisory automatically (no operator
+    /// action); one that dies at pre-flight again re-holds until the next
+    /// cooldown.
+    Probe,
+}
+
 /// Resolved pre-flight-death tripwire parameters (Issue #4386), set on the
 /// registry at construction so [`SweepRegistry::reap_once`] can enforce it
 /// without a per-tick config read. Mirrors [`QuarantineConfig`]'s shape.
@@ -126,12 +159,15 @@ pub struct PreflightTripwireConfig {
     /// Consecutive cross-issue pre-flight deaths before the workspace
     /// advisory trips.
     pub threshold: u32,
+    /// Cooldown between half-open recovery probes once tripped (Issue #5030).
+    pub probe_cooldown: Duration,
 }
 
 impl Default for PreflightTripwireConfig {
     fn default() -> Self {
         Self {
             threshold: DEFAULT_PREFLIGHT_TRIPWIRE_THRESHOLD,
+            probe_cooldown: Duration::from_secs(DEFAULT_PREFLIGHT_PROBE_COOLDOWN_SECS),
         }
     }
 }
@@ -149,6 +185,18 @@ pub(crate) fn read_preflight_tripwire_file_threshold(repo_root: &Path) -> Option
         .and_then(|n| u32::try_from(n).ok())
 }
 
+/// Read `.loom/config.json → autonomous.workFinder.preflightTripwire.probeCooldownSecs`
+/// (Issue #5030), soft-failing to `None` — mirrors
+/// [`read_preflight_tripwire_file_threshold`].
+#[must_use]
+pub(crate) fn read_preflight_probe_cooldown_secs(repo_root: &Path) -> Option<u64> {
+    let effective = crate::config_resolver::resolve_effective_config(repo_root);
+    crate::config_resolver::get_path(&effective, "autonomous.workFinder.preflightTripwire")
+        .and_then(|c| c.get("probeCooldownSecs"))
+        .and_then(serde_json::Value::as_u64)
+        .filter(|&n| n > 0)
+}
+
 /// Resolve the full [`PreflightTripwireConfig`] for `repo_root` with
 /// precedence **env > config > default** (Issue #4386), mirroring
 /// [`resolve_quarantine_config`].
@@ -160,7 +208,16 @@ pub fn resolve_preflight_tripwire_config(repo_root: &Path) -> PreflightTripwireC
         .filter(|&n| n > 0)
         .or_else(|| read_preflight_tripwire_file_threshold(repo_root))
         .unwrap_or(DEFAULT_PREFLIGHT_TRIPWIRE_THRESHOLD);
-    PreflightTripwireConfig { threshold }
+    let probe_cooldown_secs = std::env::var(PREFLIGHT_PROBE_COOLDOWN_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .or_else(|| read_preflight_probe_cooldown_secs(repo_root))
+        .unwrap_or(DEFAULT_PREFLIGHT_PROBE_COOLDOWN_SECS);
+    PreflightTripwireConfig {
+        threshold,
+        probe_cooldown: Duration::from_secs(probe_cooldown_secs),
+    }
 }
 
 // ============================================================================
@@ -608,6 +665,19 @@ impl SweepRegistry {
             return;
         }
         self.preflight_advisory_tripped = should_trip;
+        if !should_trip {
+            // Advisory cleared (a dispatch reached CLI start): reset the
+            // half-open probe clock so if the workspace breaks again later, the
+            // breaker waits a full cooldown before its first recovery probe
+            // rather than re-probing off a stale timestamp (#5030).
+            self.preflight_probe_last_at = None;
+        }
+        // Issue #5029: stamp the transition instant purely for display —
+        // exactly this state-change branch, never an unrelated tick that
+        // leaves `should_trip == preflight_advisory_tripped` (the early
+        // return above), so this is a pure freshness signal alongside the
+        // unchanged trip/clear decision above.
+        self.preflight_advisory_changed_at = Some(Utc::now());
         let marker = self.preflight_death_last_marker.clone().unwrap_or_default();
         let message = if should_trip {
             self.preflight_advisory_message(pool_exhausted_now, &marker)
@@ -641,6 +711,66 @@ impl SweepRegistry {
         });
     }
 
+    /// The dispatch breaker's admission decision for THIS workspace this tick
+    /// (Issue #5030) — the half-open recovery mechanism that keeps a broken
+    /// workspace from burning every dispatch slot on doomed ~1s pre-flight
+    /// deaths.
+    ///
+    /// # Why a breaker is needed here
+    ///
+    /// [`update_preflight_advisory`](Self::update_preflight_advisory) already
+    /// trips [`preflight_advisory_tripped`](Self::preflight_advisory_tripped)
+    /// after `threshold` consecutive claude-wrapper pre-flight deaths, but until
+    /// #5030 nothing in the dispatch-admission path read it: the work-finder
+    /// kept launching *different* queued issues into the same dead pre-flight
+    /// check, each dying instantly and freeing the slot for the next. This gate
+    /// lets the work-finder hold new dispatch to a tripped workspace.
+    ///
+    /// # Half-open recovery (no operator action)
+    ///
+    /// The advisory only clears after a dispatch *succeeds* (reaches
+    /// `# CLAUDE_CLI_START`, see [`reset_preflight_streak`](Self::reset_preflight_streak)),
+    /// so an unconditional hold would deadlock recovery — it would block the
+    /// very dispatch needed to prove the break is fixed. Instead this is a
+    /// half-open circuit breaker: while tripped it returns [`Held`] every tick
+    /// EXCEPT once per [`PreflightTripwireConfig::probe_cooldown`], when it
+    /// returns [`Probe`] to let one dispatch through. If that probe reaches CLI
+    /// start the advisory clears itself and dispatch resumes with no restart or
+    /// manual reset; if it dies at pre-flight again, the streak stays tripped
+    /// and the workspace is re-held until the next cooldown. The first tick that
+    /// observes a freshly-tripped advisory anchors the cooldown clock and holds,
+    /// so the tripping death is not immediately followed by another doomed
+    /// attempt — the first probe waits a full cooldown.
+    ///
+    /// `&mut self` because a [`Probe`] decision advances the cooldown clock.
+    ///
+    /// [`Held`]: PreflightDispatchGate::Held
+    /// [`Probe`]: PreflightDispatchGate::Probe
+    pub fn preflight_dispatch_gate(&mut self, now: DateTime<Utc>) -> PreflightDispatchGate {
+        if !self.preflight_advisory_tripped {
+            return PreflightDispatchGate::Open;
+        }
+        let cooldown = chrono::Duration::from_std(self.preflight_tripwire_config.probe_cooldown)
+            .unwrap_or_else(|_| {
+                chrono::Duration::seconds(DEFAULT_PREFLIGHT_PROBE_COOLDOWN_SECS as i64)
+            });
+        match self.preflight_probe_last_at {
+            None => {
+                // First tick observing the tripped advisory: anchor the clock
+                // and hold, so the first probe fires one full cooldown later.
+                self.preflight_probe_last_at = Some(now);
+                PreflightDispatchGate::Held
+            }
+            Some(last) if now.signed_duration_since(last) >= cooldown => {
+                // Cooldown elapsed: allow one probe tick through and re-anchor
+                // so the next probe is another cooldown away.
+                self.preflight_probe_last_at = Some(now);
+                PreflightDispatchGate::Probe
+            }
+            Some(_) => PreflightDispatchGate::Held,
+        }
+    }
+
     /// Whether the live `.ranking` snapshot confirms zero healthy accounts
     /// RIGHT NOW, given at least one pre-flight death has already been
     /// observed this streak (Issue #4644). Shared by
@@ -658,22 +788,29 @@ impl SweepRegistry {
     /// Render the operator-facing advisory message for the tripped state,
     /// naming the specific whole-pool-dead cause (Issue #4644) when
     /// `pool_exhausted_now` holds, else the ordinary #4386 streak wording.
+    ///
+    /// Issue #5029: always names `self.config.workspace_root` explicitly —
+    /// this registry's state (and hence this message) describes exactly ONE
+    /// workspace, never an aggregate across every managed repo, so an
+    /// operator reading "last N dispatches" alongside multiple registered
+    /// workspaces is never left guessing which repo it refers to.
     #[must_use]
     pub(crate) fn preflight_advisory_message(
         &self,
         pool_exhausted_now: bool,
         marker: &str,
     ) -> String {
+        let workspace = self.config.workspace_root.display();
         if pool_exhausted_now {
             format!(
                 "WARNING: token pool exhausted (0 healthy accounts) — every dispatch will die at \
                  token selection ({marker}); add accounts (`loom-daemon tokens bootstrap`) or wait \
-                 for the pool to recover before re-dispatching (#4644)"
+                 for the pool to recover before re-dispatching (#4644) [workspace: {workspace}]"
             )
         } else {
             format!(
                 "WARNING: last {} dispatches died at claude-wrapper pre-flight ({marker}) — check \
-                 .mcp.json",
+                 .mcp.json [workspace: {workspace}]",
                 self.preflight_death_streak
             )
         }
@@ -1389,6 +1526,12 @@ mod tests {
         let message = message.expect("advisory message present when tripped");
         assert!(message.contains("pre-flight"));
         assert!(message.contains("mcp.json"));
+        // AC (#5029): the message names the specific workspace it is scoped
+        // to, so an operator with multiple managed repos never has to guess.
+        assert!(
+            message.contains("workspace:"),
+            "message must name the scoped workspace: {message}"
+        );
 
         match sub.recv().await.unwrap() {
             Event::PreflightAdvisory {
@@ -1425,6 +1568,221 @@ mod tests {
             } => assert_eq!(consecutive_deaths, 0),
             other => panic!("unexpected event: {other:?}"),
         }
+    }
+
+    /// Trip a fresh registry's pre-flight advisory via three consecutive
+    /// cross-issue pre-flight deaths (default threshold 3), returning it ready
+    /// for the #5030 dispatch-gate tests.
+    fn tripped_preflight_registry(dir: &Path) -> SweepRegistry {
+        let (mut registry, _record_log) = fixture_registry(dir);
+        for issue in [9401u32, 9402, 9403] {
+            insert_dead_running_with_log(
+                &mut registry,
+                issue,
+                0,
+                "unknown",
+                "# MCP_PREFLIGHT_FAILED\n",
+            );
+            registry.reap_once();
+        }
+        assert!(registry.preflight_advisory().0, "fixture must leave the advisory tripped");
+        registry
+    }
+
+    /// #5030: an untripped advisory never holds dispatch — the gate is `Open`.
+    #[test]
+    fn preflight_dispatch_gate_open_when_not_tripped() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+        assert!(!registry.preflight_advisory().0);
+        assert_eq!(
+            registry.preflight_dispatch_gate(Utc::now()),
+            PreflightDispatchGate::Open,
+            "a healthy workspace is never held by the pre-flight breaker"
+        );
+    }
+
+    /// #5030 (core state machine): once tripped the breaker holds every tick,
+    /// then lets exactly one probe through per cooldown (half-open), and holds
+    /// again immediately after each probe.
+    #[test]
+    fn preflight_dispatch_gate_holds_then_probes_once_per_cooldown() {
+        let dir = tempdir().unwrap();
+        let mut registry = tripped_preflight_registry(dir.path());
+        let cooldown = registry.preflight_tripwire_config().probe_cooldown;
+        let cooldown = chrono::Duration::from_std(cooldown).unwrap();
+
+        let t0 = Utc::now();
+        // First tick observing the trip anchors the clock and HOLDS — the
+        // tripping death is not immediately followed by another doomed attempt.
+        assert_eq!(registry.preflight_dispatch_gate(t0), PreflightDispatchGate::Held);
+        // Still within the cooldown: held every tick, zero probes.
+        assert_eq!(
+            registry.preflight_dispatch_gate(t0 + chrono::Duration::seconds(1)),
+            PreflightDispatchGate::Held
+        );
+        assert_eq!(
+            registry.preflight_dispatch_gate(t0 + cooldown - chrono::Duration::seconds(1)),
+            PreflightDispatchGate::Held,
+            "must not probe before a full cooldown elapses (respects backoff between probes)"
+        );
+        // Cooldown elapsed: exactly one probe is let through.
+        assert_eq!(
+            registry.preflight_dispatch_gate(t0 + cooldown),
+            PreflightDispatchGate::Probe,
+            "one probe dispatch is allowed once the cooldown elapses"
+        );
+        // Immediately re-held: the probe re-anchored the clock, so no spinning
+        // at full speed even though the advisory is still tripped.
+        assert_eq!(
+            registry.preflight_dispatch_gate(t0 + cooldown + chrono::Duration::seconds(1)),
+            PreflightDispatchGate::Held
+        );
+        // A second probe only after another full cooldown.
+        assert_eq!(
+            registry.preflight_dispatch_gate(t0 + cooldown + cooldown),
+            PreflightDispatchGate::Probe
+        );
+    }
+
+    /// #5030: recovery is automatic — a probe dispatch that reaches
+    /// `# CLAUDE_CLI_START` clears the advisory (no operator action), the gate
+    /// reopens, and a subsequent re-break waits a full cooldown before its first
+    /// probe (the probe clock was reset on clear, not left stale).
+    #[test]
+    fn preflight_dispatch_gate_reopens_on_recovery_and_resets_probe_clock() {
+        let dir = tempdir().unwrap();
+        let mut registry = tripped_preflight_registry(dir.path());
+        let cooldown =
+            chrono::Duration::from_std(registry.preflight_tripwire_config().probe_cooldown)
+                .unwrap();
+        let t0 = Utc::now();
+        assert_eq!(registry.preflight_dispatch_gate(t0), PreflightDispatchGate::Held);
+
+        // A dispatch reaches CLI start → streak resets, advisory clears.
+        insert_dead_running_with_log(
+            &mut registry,
+            9410,
+            0,
+            "unknown",
+            "# CLAUDE_CLI_START\nlater crash\n",
+        );
+        registry.reap_once();
+        assert!(!registry.preflight_advisory().0, "recovery clears the advisory automatically");
+        assert_eq!(
+            registry.preflight_dispatch_gate(t0 + chrono::Duration::seconds(5)),
+            PreflightDispatchGate::Open,
+            "cleared advisory reopens dispatch with no restart or manual reset"
+        );
+
+        // Re-break the workspace: the probe clock was reset on clear, so the
+        // first probe of the new trip waits a full cooldown from the re-trip
+        // (no stale-timestamp immediate probe).
+        for issue in [9411u32, 9412, 9413] {
+            insert_dead_running_with_log(
+                &mut registry,
+                issue,
+                0,
+                "unknown",
+                "# MCP_PREFLIGHT_FAILED\n",
+            );
+            registry.reap_once();
+        }
+        assert!(registry.preflight_advisory().0);
+        let t1 = t0 + chrono::Duration::seconds(10);
+        assert_eq!(
+            registry.preflight_dispatch_gate(t1),
+            PreflightDispatchGate::Held,
+            "a freshly re-tripped advisory anchors a new cooldown and holds first"
+        );
+        assert_eq!(registry.preflight_dispatch_gate(t1 + cooldown), PreflightDispatchGate::Probe);
+    }
+
+    /// #5030: env override of the probe cooldown is honored by
+    /// `resolve_preflight_tripwire_config` (precedence env > config > default).
+    #[test]
+    #[serial]
+    fn resolve_preflight_probe_cooldown_env_override() {
+        let dir = tempdir().unwrap();
+        // Default when unset.
+        std::env::remove_var(PREFLIGHT_PROBE_COOLDOWN_ENV);
+        let cfg = resolve_preflight_tripwire_config(dir.path());
+        assert_eq!(cfg.probe_cooldown, Duration::from_secs(DEFAULT_PREFLIGHT_PROBE_COOLDOWN_SECS));
+        // Env override wins.
+        std::env::set_var(PREFLIGHT_PROBE_COOLDOWN_ENV, "42");
+        let cfg = resolve_preflight_tripwire_config(dir.path());
+        assert_eq!(cfg.probe_cooldown, Duration::from_secs(42));
+        std::env::remove_var(PREFLIGHT_PROBE_COOLDOWN_ENV);
+    }
+
+    /// AC (#5029): `preflight_advisory_changed_at` stamps the wall-clock
+    /// instant of a trip/clear *transition*, and does NOT move on an
+    /// unrelated tick that leaves the tripped state unchanged (a further
+    /// pre-flight death while already tripped) — a pure freshness signal
+    /// layered on top of the unchanged trip/clear decision logic.
+    #[test]
+    fn preflight_advisory_timestamp_updates_only_on_state_transition() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+
+        // No transition observed yet.
+        assert!(registry.preflight_advisory_changed_at().is_none());
+
+        // Two pre-flight deaths (different issues): below the default
+        // threshold of 3, so no transition yet.
+        for (issue, seq) in [(9201u32, 0u32), (9202, 0)] {
+            insert_dead_running_with_log(
+                &mut registry,
+                issue,
+                seq,
+                "unknown",
+                "# MCP_PREFLIGHT_FAILED\n",
+            );
+            registry.reap_once();
+        }
+        assert!(
+            registry.preflight_advisory_changed_at().is_none(),
+            "no state-change transition yet ⇒ no timestamp"
+        );
+
+        // A third consecutive pre-flight death trips the advisory — the
+        // FIRST state-change transition, so the timestamp is stamped.
+        insert_dead_running_with_log(&mut registry, 9203, 0, "unknown", "# MCP_PREFLIGHT_FAILED\n");
+        registry.reap_once();
+        assert!(registry.preflight_advisory().0);
+        let tripped_at = registry
+            .preflight_advisory_changed_at()
+            .expect("timestamp stamped on trip");
+
+        // A fourth consecutive pre-flight death (still tripped, an
+        // UNRELATED tick — `should_trip == preflight_advisory_tripped`
+        // already) must NOT move the timestamp.
+        insert_dead_running_with_log(&mut registry, 9204, 0, "unknown", "# MCP_PREFLIGHT_FAILED\n");
+        registry.reap_once();
+        assert_eq!(
+            registry.preflight_advisory_changed_at(),
+            Some(tripped_at),
+            "an unrelated tick that leaves the tripped state unchanged must not move the timestamp"
+        );
+
+        // A sweep whose log reaches `# CLAUDE_CLI_START` clears the advisory
+        // — the SECOND state-change transition, so the timestamp advances.
+        insert_dead_running_with_log(
+            &mut registry,
+            9205,
+            0,
+            "unknown",
+            "# CLAUDE_CLI_START\nsome later crash\n",
+        );
+        registry.reap_once();
+        assert!(!registry.preflight_advisory().0);
+        let cleared_at = registry
+            .preflight_advisory_changed_at()
+            .expect("timestamp stamped on clear");
+        assert!(
+            cleared_at >= tripped_at,
+            "the clear transition must stamp a timestamp at or after the trip transition"
+        );
     }
 
     /// Edge case (#4386): a dead sweep whose log file is missing/unreadable

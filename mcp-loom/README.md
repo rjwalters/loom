@@ -75,9 +75,9 @@ You can still register per-repo if needed (e.g. Claude Desktop), but set
 | `LOOM_WORKSPACE` | Path to the Loom workspace (bypasses CWD discovery) | CWD-based repo-root discovery; **no** `~/GitHub/loom` fallback |
 | `LOOM_SOCKET_PATH` | Path to daemon socket | `~/.loom/loom-daemon.sock` |
 
-## Available Tools (27 total)
+## Available Tools (30 total)
 
-The MCP server provides 27 tools organized by function.
+The MCP server provides 30 tools organized by function.
 
 ### UI/Engine Control (6 tools)
 

@@ -1,7 +1,13 @@
 import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import worker from "../src/index";
-import { isPublicPageDisplayKind, renderFleetOverview, renderHistoryTable, renderPublicPage } from "../src/publicPage";
+import {
+  classifySaturation,
+  isPublicPageDisplayKind,
+  renderFleetOverview,
+  renderHistoryTable,
+  renderPublicPage,
+} from "../src/publicPage";
 import type { HistoryQueryResult, HistoryRecord } from "../src/query";
 import type { PublicActiveSweep, RedactedFleetSnapshot } from "../src/redaction";
 import { seedHost, sweepOutcomeEnvelope, sweepStartedEnvelope, tokensSnapshotEnvelope } from "./testHelpers";
@@ -149,7 +155,15 @@ function snapshotFixture(): RedactedFleetSnapshot {
     hosts: {
       "host-abc": {
         health: {
-          record: { kind: "host.health", captured_at: "2026-07-31T12:00:00Z", uptime_sec: 100, logical_cpus: 8 },
+          record: {
+            kind: "host.health",
+            captured_at: "2026-07-31T12:00:00Z",
+            daemon_version: "0.17.0",
+            build_commit: "8c16fb5b",
+            built_at: "2026-07-31T03:09:51Z",
+            uptime_sec: 100,
+            logical_cpus: 8,
+          },
           updatedAt: "2026-07-31T12:00:00Z",
         },
         // Present on the redacted snapshot exactly as the real API returns
@@ -196,6 +210,309 @@ describe("renderFleetOverview — redaction", () => {
   it("renders host.health lifecycle detail", () => {
     const html = renderFleetOverview(snapshotFixture());
     expect(html).toContain("uptime_sec=100");
+  });
+
+  it("renders the host.health build identity so two same-version builds are distinguishable", () => {
+    // #4956 — `daemon_version` alone only moves once per release; without the
+    // commit on the page, a day-stale binary is indistinguishable from main.
+    const html = renderFleetOverview(snapshotFixture());
+    expect(html).toContain("daemon_version=0.17.0");
+    expect(html).toContain("build_commit=8c16fb5b");
+    expect(html).toContain("built_at=2026-07-31T03:09:51Z");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Host staleness (issue #4957): LIVE/STALE/OFFLINE, not a raw timestamp
+// rendered as current forever.
+// ---------------------------------------------------------------------------
+
+function snapshotWithHealthUpdatedAt(updatedAt: string): RedactedFleetSnapshot {
+  return {
+    hosts: {
+      "host-abc": {
+        health: {
+          record: { kind: "host.health", captured_at: updatedAt, uptime_sec: 100, logical_cpus: 8 },
+          updatedAt,
+        },
+      },
+    },
+    activeSweeps: [],
+  };
+}
+
+describe("renderFleetOverview — host staleness (issue #4957)", () => {
+  const NOW = new Date("2026-08-02T12:00:00Z");
+
+  it("a host that reported 1 minute ago renders LIVE", () => {
+    const html = renderFleetOverview(snapshotWithHealthUpdatedAt("2026-08-02T11:59:00Z"), NOW);
+    expect(html).toContain("freshness-badge--live");
+    expect(html).toContain("LIVE");
+    expect(html).not.toContain("freshness-badge--stale");
+    expect(html).not.toContain("freshness-badge--offline");
+  });
+
+  it("a host that reported 1 hour ago renders STALE with a last-seen age", () => {
+    const html = renderFleetOverview(snapshotWithHealthUpdatedAt("2026-08-02T11:00:00Z"), NOW);
+    expect(html).toContain("freshness-badge--stale");
+    expect(html).toContain("STALE");
+    expect(html).toContain("last seen 1h ago");
+  });
+
+  it("a host that reported 2 days ago renders OFFLINE with a last-seen age", () => {
+    const html = renderFleetOverview(snapshotWithHealthUpdatedAt("2026-07-31T12:00:00Z"), NOW);
+    expect(html).toContain("freshness-badge--offline");
+    expect(html).toContain("OFFLINE");
+    expect(html).toContain("last seen 2d ago");
+  });
+
+  it("never renders a health row's numeric detail fields without an adjacent freshness badge + age qualifier", () => {
+    for (const updatedAt of ["2026-08-02T11:59:30Z", "2026-08-02T11:00:00Z", "2026-07-31T12:00:00Z"]) {
+      const html = renderFleetOverview(snapshotWithHealthUpdatedAt(updatedAt), NOW);
+      // Every row that carries `uptime_sec=100` (the numeric metric) must
+      // also carry a freshness badge and a "last seen" qualifier — i.e. the
+      // metric is never presented bare, regardless of how stale it is.
+      const row = html.slice(html.indexOf("<tbody>"), html.indexOf("</tbody>"));
+      expect(row).toContain("uptime_sec=100");
+      expect(row).toMatch(/freshness-badge--(live|stale|offline)/);
+      expect(row).toContain("last seen");
+    }
+  });
+
+  it("the Hosts heading reports explicit live/stale/offline totals with offline hosts named", () => {
+    const snapshot: RedactedFleetSnapshot = {
+      hosts: {
+        "host-live": {
+          health: { record: { kind: "host.health" }, updatedAt: "2026-08-02T11:59:30Z" },
+        },
+        "host-offline": {
+          health: { record: { kind: "host.health" }, updatedAt: "2026-07-31T12:00:00Z" },
+        },
+      },
+      activeSweeps: [],
+    };
+    const html = renderFleetOverview(snapshot, NOW);
+    expect(html).toContain("Hosts (2): 1 live, 1 offline (host-offline, last seen 2d ago)");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phantom fleet member (issue #5078): a `sweep:`-only host must never render
+// as a fleet card or inflate the header host count, and its sweeps must
+// still be visible somewhere (not silently dropped) rather than commingled
+// with the "Active sweeps" count of hosts with real health data.
+// ---------------------------------------------------------------------------
+
+describe("renderFleetOverview — unattributed sweeps (issue #5078)", () => {
+  const NOW = new Date("2026-08-03T12:00:00Z");
+
+  function sweepFor(hostId: string, overrides: Partial<PublicActiveSweep> = {}): PublicActiveSweep {
+    return {
+      hostId,
+      visibility: "public",
+      repo: "rjwalters/loom",
+      issue: 5078,
+      sweepId: `sweep-${hostId}`,
+      phase: "builder",
+      startedAt: "2026-08-03T11:00:00Z",
+      updatedAt: "2026-08-03T11:55:00Z",
+      ...overrides,
+    };
+  }
+
+  it("a snapshot containing only a sweep: entry (no health: entry for that host) renders no fleet card for it", () => {
+    const snapshot: RedactedFleetSnapshot = {
+      hosts: {},
+      activeSweeps: [sweepFor("sweep-only-host")],
+    };
+    const html = renderFleetOverview(snapshot, NOW);
+    // No card/row for the phantom host in the Hosts table specifically, and
+    // the header count is 0 — not 1. (The host id is still expected to
+    // appear elsewhere on the page, in the Unattributed sweeps table — see
+    // the next test — so this asserts against the Hosts table body only.)
+    expect(html).toContain("Hosts (0)");
+    const hostsTableBody = html.slice(html.indexOf("<h3>Hosts"), html.indexOf("<h3>Active sweeps"));
+    expect(hostsTableBody).not.toContain("sweep-only-host");
+    expect(hostsTableBody).toContain("No host health reported yet.");
+  });
+
+  it("does not count a sweep-only host's sweeps in the primary Active sweeps total", () => {
+    const snapshot: RedactedFleetSnapshot = {
+      hosts: {},
+      activeSweeps: [sweepFor("sweep-only-host")],
+    };
+    const html = renderFleetOverview(snapshot, NOW);
+    expect(html).toContain("Active sweeps (0)");
+  });
+
+  it("groups a sweep-only host's sweeps into a distinct Unattributed sweeps section instead of hiding them", () => {
+    const snapshot: RedactedFleetSnapshot = {
+      hosts: {},
+      activeSweeps: [sweepFor("sweep-only-host")],
+    };
+    const html = renderFleetOverview(snapshot, NOW);
+    expect(html).toContain("Unattributed sweeps (1)");
+    expect(html).toContain("sweep-only-host");
+    expect(html).toContain("#5078");
+  });
+
+  it("a host with real health data keeps its sweeps in the primary Active sweeps table, not unattributed", () => {
+    const snapshot: RedactedFleetSnapshot = {
+      hosts: {
+        "host-a": { health: { record: { kind: "host.health" }, updatedAt: "2026-08-03T11:58:00Z" } },
+      },
+      activeSweeps: [sweepFor("host-a")],
+    };
+    const html = renderFleetOverview(snapshot, NOW);
+    expect(html).toContain("Active sweeps (1)");
+    expect(html).not.toContain("Unattributed sweeps");
+  });
+
+  it("a host known only from tokens.snapshot (no health) does not render a card or count toward Hosts", () => {
+    // Belt-and-braces: the header count must track health data specifically,
+    // not "any snapshot.hosts entry" — a tokens-only host never rendered a
+    // row (renderHostHealthRow returns "" without health) but was still
+    // being counted in the pre-fix heading.
+    const snapshot: RedactedFleetSnapshot = {
+      hosts: {
+        "tokens-only-host": {
+          tokens: { record: { kind: "tokens.snapshot" }, updatedAt: "2026-08-03T11:58:00Z" },
+        },
+      },
+      activeSweeps: [],
+    };
+    const html = renderFleetOverview(snapshot, NOW);
+    expect(html).toContain("Hosts (0)");
+  });
+
+  it("a mid-run-revoke anomaly (a host with in-flight sweeps but no health entry) stays discoverable, not silently dropped", () => {
+    // Mirrors fleetState.ts's removeHost, which deliberately never touches
+    // sweep: entries on revoke — the host's card disappears, but its sweeps
+    // must remain visible as a signal something needs investigating.
+    const snapshot: RedactedFleetSnapshot = {
+      hosts: {},
+      activeSweeps: [sweepFor("revoked-mid-run", { sweepId: "sweep-mid-run" })],
+    };
+    const html = renderFleetOverview(snapshot, NOW);
+    expect(html).toContain("Unattributed sweeps (1)");
+    expect(html).toContain("revoked-mid-run");
+    expect(html).toContain("sweep-mid-run");
+  });
+
+  it("no Unattributed sweeps section renders when every sweep is attributed", () => {
+    const snapshot: RedactedFleetSnapshot = {
+      hosts: {
+        "host-a": { health: { record: { kind: "host.health" }, updatedAt: "2026-08-03T11:58:00Z" } },
+      },
+      activeSweeps: [sweepFor("host-a")],
+    };
+    const html = renderFleetOverview(snapshot, NOW);
+    expect(html).not.toContain("Unattributed sweeps");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Host saturation (issue #4998): a per-host `load_per_core` signal
+// distinguishable from an idle host without expanding details, with
+// thresholds matching `loom-daemon`'s `host_breaker`
+// (`DEFAULT_HOST_BREAKER_LOAD_PER_CORE = 2.5`) and `admission_brake`
+// (`DEFAULT_ADMISSION_BRAKE_LOAD_PER_CORE = 4.0`).
+// ---------------------------------------------------------------------------
+
+function snapshotWithLoadPerCore(loadPerCore: unknown): RedactedFleetSnapshot {
+  const record: Record<string, unknown> = { kind: "host.health", captured_at: "2026-08-02T12:00:00Z", uptime_sec: 100 };
+  if (loadPerCore !== undefined) record.load_per_core = loadPerCore;
+  return {
+    hosts: {
+      "host-abc": {
+        health: { record, updatedAt: "2026-08-02T12:00:00Z" },
+      },
+    },
+    activeSweeps: [],
+  };
+}
+
+describe("classifySaturation (issue #4998)", () => {
+  it("classifies a low load/core reading as idle", () => {
+    expect(classifySaturation(0.23)).toBe("idle");
+    expect(classifySaturation(1)).toBe("idle");
+  });
+
+  it("classifies exactly the host-breaker trip threshold (2.5) as elevated, not idle", () => {
+    expect(classifySaturation(2.5)).toBe("elevated");
+  });
+
+  it("classifies a value between the breaker and brake thresholds as elevated", () => {
+    expect(classifySaturation(3.2)).toBe("elevated");
+  });
+
+  it("classifies exactly the admission-brake hold threshold (4.0) as critical, not elevated", () => {
+    expect(classifySaturation(4.0)).toBe("critical");
+  });
+
+  it("classifies a value above the admission-brake threshold as critical", () => {
+    // The provenance case: loadavg 95 on 8 cores == 11.875 load/core.
+    expect(classifySaturation(11.875)).toBe("critical");
+  });
+
+  it("classifies missing, null, or non-finite load/core as unknown, never a false idle", () => {
+    expect(classifySaturation(undefined)).toBe("unknown");
+    expect(classifySaturation(null)).toBe("unknown");
+    expect(classifySaturation(Number.NaN)).toBe("unknown");
+    expect(classifySaturation(Number.POSITIVE_INFINITY)).toBe("unknown");
+    expect(classifySaturation("2.5")).toBe("unknown");
+  });
+});
+
+describe("renderFleetOverview — host saturation badge (issue #4998)", () => {
+  const NOW = new Date("2026-08-02T12:01:00Z");
+
+  it("a low load/core host renders an idle (OK) badge, distinguishable from elevated/critical", () => {
+    const html = renderFleetOverview(snapshotWithLoadPerCore(0.23), NOW);
+    expect(html).toContain("saturation-badge--idle");
+    expect(html).toContain(">OK<");
+    expect(html).not.toContain("saturation-badge--elevated");
+    expect(html).not.toContain("saturation-badge--critical");
+  });
+
+  it("a host at or above the host-breaker threshold (2.5) renders a visually distinct badge from an idle host", () => {
+    const html = renderFleetOverview(snapshotWithLoadPerCore(2.5), NOW);
+    expect(html).toContain("saturation-badge--elevated");
+    expect(html).toContain(">ELEVATED<");
+    expect(html).not.toContain("saturation-badge--idle");
+  });
+
+  it("a host at or above the admission-brake threshold (4.0) renders the critical badge", () => {
+    const html = renderFleetOverview(snapshotWithLoadPerCore(4.0), NOW);
+    expect(html).toContain("saturation-badge--critical");
+    expect(html).toContain(">CRITICAL<");
+  });
+
+  it("a heavily overcommitted host (12x on 8 cores) renders critical, not a false idle/ok", () => {
+    const html = renderFleetOverview(snapshotWithLoadPerCore(11.875), NOW);
+    expect(html).toContain("saturation-badge--critical");
+  });
+
+  it("renders the raw load/core value in the badge's title for anyone who wants the exact number", () => {
+    const html = renderFleetOverview(snapshotWithLoadPerCore(3.2), NOW);
+    expect(html).toContain('title="3.20 load/core"');
+  });
+
+  it("a host with no load_per_core at all (older telemetry) renders an explicit unknown badge, not a crash or a false idle", () => {
+    const html = renderFleetOverview(snapshotWithLoadPerCore(undefined), NOW);
+    expect(html).toContain("saturation-badge--unknown");
+    expect(html).toContain(">N/A<");
+  });
+
+  it("a host with load_per_core: null renders the same explicit unknown badge", () => {
+    const html = renderFleetOverview(snapshotWithLoadPerCore(null), NOW);
+    expect(html).toContain("saturation-badge--unknown");
+    expect(html).toContain(">N/A<");
+  });
+
+  it("the saturation badge also shows the raw load_per_core in the generic detail cell", () => {
+    const html = renderFleetOverview(snapshotWithLoadPerCore(0.23), NOW);
+    expect(html).toContain("load_per_core=0.23");
   });
 });
 
@@ -273,11 +590,21 @@ describe("renderPublicPage — full document", () => {
     expect(html).not.toContain("/ingest");
     expect(html).toContain("/public/events");
   });
+
+  // Covered here rather than through `GET /`, which serves the SPA shell
+  // whenever a UI build is present (see the e2e block below). This page is
+  // the no-UI-build fallback, so its Sign in affordance needs its own test.
+  it("offers a Sign in link pointing at /login", () => {
+    expect(html).toContain('href="/login"');
+  });
 });
 
 // ---------------------------------------------------------------------------
-// End-to-end: the actual GET /public route, through the real Worker + D1 +
-// Durable Object, mirroring test/redaction.test.ts's integration style.
+// End-to-end: the actual GET / (and GET /public redirect) routes, through
+// the real Worker + D1 + Durable Object, mirroring test/redaction.test.ts's
+// integration style. Issue #4795 moved the always-rendered public page from
+// `/public` to `/` (with an authenticated variant alongside it, covered in
+// index.test.ts) — `/public` itself now only 301s.
 // ---------------------------------------------------------------------------
 
 async function callWorker(request: Request): Promise<Response> {
@@ -303,11 +630,36 @@ beforeEach(async () => {
   await seedHost(env.DB, "host-abc", "abc-ingest-key");
 });
 
-describe("GET /public — end to end", () => {
+describe("GET /public — redirects to /", () => {
+  it("301s to /", async () => {
+    const response = await callWorker(new Request("https://ingest.example/public", { redirect: "manual" }));
+    expect(response.status).toBe(301);
+    expect(response.headers.get("location")).toBe("https://ingest.example/");
+  });
+});
+
+describe("GET /login — bounces back to /", () => {
+  // Access itself gates this path at the edge (config, not code), so by the
+  // time the Worker sees the request the session cookie already exists —
+  // all the route owes the visitor is a trip back to `/`.
+  it("302s to /", async () => {
+    const response = await callWorker(new Request("https://ingest.example/login", { redirect: "manual" }));
+    expect(response.status).toBe(302);
+    expect(response.headers.get("location")).toBe("https://ingest.example/");
+  });
+});
+
+describe("GET / — end to end (anonymous)", () => {
   it("serves an HTML page reachable without authentication", async () => {
-    const response = await callWorker(new Request("https://ingest.example/public"));
+    const response = await callWorker(new Request("https://ingest.example/"));
     expect(response.status).toBe(200);
     expect(response.headers.get("content-type")).toContain("text/html");
+  });
+
+  it("tells the UI it is anonymous, so it requests the redacted dataset", async () => {
+    const response = await callWorker(new Request("https://ingest.example/"));
+    const html = await response.text();
+    expect(html).toContain('window.__LOOM_FLEET__={"authenticated":false};');
   });
 
   it("a private sweep.outcome record's repo/issue/sweep_id never appear on the rendered page", async () => {
@@ -320,27 +672,39 @@ describe("GET /public — end to end", () => {
       }),
     ]);
 
-    const response = await callWorker(new Request("https://ingest.example/public"));
+    const response = await callWorker(new Request("https://ingest.example/"));
     const html = await response.text();
     expect(html).not.toContain("rjwalters/e2e-private-repo");
     expect(html).not.toContain("sweep-issue-8888-0");
     expect(html).not.toContain("8888");
   });
 
-  it("a public sweep.started record's repo/issue appear on the rendered page (full detail)", async () => {
+  it("a public sweep.started record keeps full detail in the anonymous dataset", async () => {
     await ingest([sweepStartedEnvelope({ visibility: "public", repo: "rjwalters/loom", issue: 4703 })]);
 
-    const response = await callWorker(new Request("https://ingest.example/public"));
-    const html = await response.text();
-    expect(html).toContain("rjwalters/loom");
-    expect(html).toContain("#4703");
+    // Asserted against the dataset the anonymous UI actually fetches. The
+    // shell at `/` carries no records at all, so "public repos stay visible
+    // to anonymous visitors" is only observable here.
+    const response = await callWorker(new Request("https://ingest.example/public/fleet-state"));
+    const body = await response.text();
+    expect(body).toContain("rjwalters/loom");
+    expect(body).toContain("4703");
   });
 
   it("tokens.snapshot's account identifiers never appear on the rendered page", async () => {
     await ingest([tokensSnapshotEnvelope({ accounts: [{ account: "e2e-secret-account", rank: 0, usage_fraction: 0.5, exhausted: false }] })]);
 
-    const response = await callWorker(new Request("https://ingest.example/public"));
+    const response = await callWorker(new Request("https://ingest.example/"));
     const html = await response.text();
     expect(html).not.toContain("e2e-secret-account");
+  });
+
+  it("a garbage CF_Authorization cookie still falls back to the public view, never a 500", async () => {
+    const response = await callWorker(
+      new Request("https://ingest.example/", { headers: { cookie: "CF_Authorization=not-a-real-jwt" } }),
+    );
+    expect(response.status).toBe(200);
+    const html = await response.text();
+    expect(html).toContain('window.__LOOM_FLEET__={"authenticated":false};');
   });
 });

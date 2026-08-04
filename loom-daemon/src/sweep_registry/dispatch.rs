@@ -11,6 +11,45 @@ use super::*;
 /// killed mid-build.
 pub const BG_WAIT_CEILING_ENV: &str = "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS";
 
+/// Resolve the process group of a just-spawned sweep leader (Issue #4980).
+///
+/// `spawn_child` sets `process_group(0)` on every Unix spawn (#3800), so the
+/// child is its own group leader and `getpgid(child) == child`. We *verify* that
+/// rather than assume it, because the recorded value later authorizes a
+/// `kill(-pgid, …)`: recording a group the child does not actually lead would
+/// aim a SIGKILL at unrelated processes (in the worst case the daemon's own
+/// group).
+///
+/// The three outcomes:
+///
+/// - **Confirmed leader** (`getpgid == pid`) → `Some(pid)`.
+/// - **Contradiction** (`getpgid` names some other group) → `None` + a warning.
+///   `process_group(0)` did not take; degrade to single-PID signalling rather
+///   than signal a group we do not own.
+/// - **Unanswerable** (the child already exited, `ESRCH`) → `Some(pid)`. The
+///   spawn unconditionally requested its own group, so `pgid == pid` is the only
+///   shape this spawn can have, and this is precisely the crash case where the
+///   persisted group is the only handle on any surviving descendants. Every
+///   consumer re-checks `group_has_members` before signalling, so a fully-dead
+///   group is a no-op.
+fn spawned_leader_pgid(pid: u32) -> Option<u32> {
+    if !cfg!(unix) {
+        return None;
+    }
+    match process_group_of(pid) {
+        Some(pgid) if pgid == pid => Some(pid),
+        Some(other) => {
+            log::warn!(
+                "sweep_registry: spawned child pid {pid} reports process group {other} rather \
+                 than leading its own — `process_group(0)` did not take. Recording NO group; \
+                 cancellation will degrade to single-PID signalling (#4980)."
+            );
+            None
+        }
+        None => Some(pid),
+    }
+}
+
 /// Typed, matchable error returned by [`SweepRegistry::dispatch`] when the
 /// open-PR guard (Issue #4123, step 2.6) refuses a dispatch because the target
 /// issue already has an **open** linked pull request.
@@ -1053,17 +1092,47 @@ impl SweepRegistry {
         // stagger (the default outside production / in tests) is a no-op.
         self.apply_dispatch_stagger();
         let log_path = self.compute_log_path(issue_number);
-        let (child, token_name, runtime, immediate_preflight_death) = self
-            .spawn_child(
-                issue_number,
-                &log_path,
-                &sweep_id,
-                model,
-                effort,
-                depends_on,
-                runtime_admission.as_ref(),
-            )
-            .context("failed to spawn sweep child")?;
+        let (child, token_name, runtime, immediate_preflight_death) = match self.spawn_child(
+            issue_number,
+            &log_path,
+            &sweep_id,
+            model,
+            effort,
+            depends_on,
+            runtime_admission.as_ref(),
+        ) {
+            Ok(spawned) => spawned,
+            Err(e) => {
+                // Issue #5236: `spawn_child` can fail for reasons that have
+                // nothing to do with the issue itself (e.g. a registered
+                // workspace whose `.loom/scripts/` is missing
+                // `spawn-worker.sh` — `resolve_spawn_bin` errors before any
+                // process is ever spawned). Unlike the #4689 branch below,
+                // this is a synchronous `Err`, not a synchronously-observed
+                // dead child — but the side effects already applied above
+                // (claim lock, peer-claim advertisement, label flip) are
+                // identical, and leaving them in place is exactly what wedges
+                // every retry: the leaked lock's `owner_pid` is this daemon's
+                // own (still-alive) pid, which the #4556 live-claim guard
+                // then reads as a confirmed-live claim forever (until an
+                // operator manually removes the lock dir). Unwind the same
+                // three side effects the #4689 branch reverts, so a second
+                // dispatch attempt starts from a clean slate instead of a
+                // permanent wedge.
+                log::warn!(
+                    "sweep_registry: issue #{issue_number} sweep_id={sweep_id} failed to spawn \
+                     — reverting the claim lock, label, and peer-claim advertisement instead of \
+                     leaking them (#5236): {e:#}"
+                );
+                if !self.config.skip_label_flip {
+                    let _ = self.restore_label_to_ready(issue_number);
+                    self.note_label_flip(issue_number); // #4485 flap detection
+                }
+                self.publish_peer_claim(peer_claims::ClaimKind::Retract, issue_number);
+                let _ = self.release_lock_owned(issue_number, &sweep_id);
+                return Err(e.context("failed to spawn sweep child"));
+            }
+        };
 
         // Issue #4689: the child already died — synchronously observed,
         // before this dispatch call has returned — from `spawn-claude.sh`'s
@@ -1111,6 +1180,10 @@ impl SweepRegistry {
         }
 
         let pid = child.id();
+        // Issue #4980: capture the child's process group NOW, while it is alive
+        // — `getpgid` cannot answer for a dead pid, so a group handle acquired
+        // any later is unavailable in exactly the crash case that needs it most.
+        let pgid = spawned_leader_pgid(pid);
         // Retain the handle so the reaper can `try_wait()` it (Issue #3801).
         self.children.insert(sweep_id.clone(), child);
 
@@ -1121,10 +1194,16 @@ impl SweepRegistry {
         // daemon PID is gone after any restart, so keeping it would make even a
         // still-live daemon-dispatched child look stale in `reconstruct()`'s
         // lock pass. Rewrite `owner_pid` now that the child exists.
-        if let Err(e) = self.record_child_pid_in_lock(issue_number, pid) {
+        //
+        // The same write persists the child's process group (#4980) so a
+        // post-restart `reconstruct()` — and a fresh `loom-daemon cancel`
+        // process, which never held the spawn-time `Child` handle — can still
+        // tear down the WHOLE tree instead of orphaning it.
+        if let Err(e) = self.record_child_pid_in_lock(issue_number, pid, pgid) {
             log::warn!(
-                "failed to record child pid {pid} in lock for issue #{issue_number} \
-                 (reconstruct may treat it as stale after a daemon restart): {e}"
+                "failed to record child pid {pid} (pgid {pgid:?}) in lock for issue \
+                 #{issue_number} (reconstruct may treat it as stale after a daemon restart, \
+                 and a post-restart cancel may not reach the whole process group): {e}"
             );
         }
 
@@ -1137,6 +1216,8 @@ impl SweepRegistry {
             sweep_id: sweep_id.clone(),
             kind: kind.clone(),
             pid,
+            // Group handle for cancellation / crash-path reaping (#4980).
+            pgid,
             token_name: token_name.clone(),
             runtime,
             runtime_source: runtime_admission.as_ref().map(|a| a.source.clone()),
@@ -1406,6 +1487,19 @@ impl SweepRegistry {
             .stderr(Stdio::from(log_clone));
         if let Some(admission) = runtime_admission {
             cmd.env("LOOM_RUNTIME", &admission.runtime);
+            // Issue #4768: pin the ALREADY-ADMITTED role alongside the runtime
+            // it was admitted for. Without this, a Codex-runtime sweep child
+            // reaches `spawn-codex.sh` with no `LOOM_ROLE` at all (bash env
+            // vars only propagate what the parent process actually set — this
+            // `Command` never set one), which `spawn-codex.sh` treats as an
+            // ambiguous/unknown role and silently takes the READ-ONLY
+            // sandbox-fallback path instead of the mutable-role hook-trust
+            // preflight. `admission.role` is always `"sweep-lifecycle"` here
+            // (a full sweep is modelled as one launch, admitted against
+            // Builder's requirements — see runtime_admission.rs's module
+            // doc), which `spawn-codex.sh` maps onto `builder` for its own
+            // mutable-role check.
+            cmd.env("LOOM_ROLE", &admission.role);
             log::info!(
                 "sweep_registry: admitted role={} runtime={} source={}",
                 admission.role,
@@ -1657,6 +1751,7 @@ mod tests {
 
         let mk_info =
             |sweep_id: &str, issue: u32, state: SweepState, log_path: PathBuf| SweepInfo {
+                pgid: None,
                 sweep_id: sweep_id.to_string(),
                 kind: SweepKind::Issue(issue),
                 pid: 0,
@@ -2538,6 +2633,90 @@ mod tests {
         assert!(reg.children.is_empty(), "no child handle should be retained for a dead child");
     }
 
+    /// AC (#5236): when `spawn_child` itself returns `Err` — e.g. a
+    /// registered workspace whose `spawn_bin` resolves to a nonexistent
+    /// file, so `Command::spawn()` fails at the OS level before any child
+    /// ever exists — `dispatch_inner` must unwind the same side effects the
+    /// #4689 branch above reverts: the claim lock, the `loom:building`
+    /// label flip, and (implicitly, since nothing was ever advertised
+    /// without a peer-claim publisher configured in this fixture) the
+    /// peer-claim advertisement. Without this, the leaked lock's
+    /// `owner_pid` is this daemon's own (permanently alive, from its own
+    /// point of view) pid, which the #4556 live-claim guard misreads as a
+    /// confirmed-live claim on every retry — the exact wedge this issue
+    /// reports.
+    #[test]
+    #[serial]
+    fn dispatch_reverts_claim_lock_and_label_when_spawn_child_itself_fails() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::remove_var("LOOM_REPO");
+        let (mut reg, gh_log) = spawn_bin_missing_registry(ws);
+
+        let err = reg
+            .dispatch(&SweepKind::Issue(5236), None, None, None, None)
+            .expect_err("a spawn_child Err must fail dispatch, not Ok");
+        assert!(err.to_string().contains("failed to spawn sweep child"), "got: {err}");
+
+        let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            calls.contains("issue edit 5236 --remove-label loom:issue --add-label loom:building"),
+            "the claim WAS taken (label flip happens before spawn_child) — got: {calls:?}"
+        );
+        assert!(
+            calls.contains("issue edit 5236 --remove-label loom:building --add-label loom:issue"),
+            "…and must be REVERTED when spawn_child fails — got: {calls:?}"
+        );
+
+        assert!(
+            running_issue_sweep_id(&reg, 5236).is_none(),
+            "a failed dispatch must not leave a Running entry behind"
+        );
+        assert!(
+            !ws.join(".loom/locks/issue-5236").exists(),
+            "the claim lock must be released when spawn_child fails, not leaked (#5236)"
+        );
+        assert!(
+            reg.children.is_empty(),
+            "no child handle exists — spawn_child never got that far"
+        );
+    }
+
+    /// The full repro from this issue's Test Plan: dispatch twice against a
+    /// workspace whose `spawn_bin` never resolves to anything runnable. The
+    /// first dispatch fails and — per the AC above — cleans up fully; the
+    /// second dispatch must reach the SAME `spawn_child` failure again, NOT
+    /// be refused by the #4556 live-claim guard reading a leaked lock whose
+    /// `owner_pid` is this daemon's own (still-alive) pid as a confirmed-live
+    /// claim.
+    #[test]
+    #[serial]
+    fn second_dispatch_after_spawn_child_failure_is_not_refused_by_the_live_claim_guard() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::remove_var("LOOM_REPO");
+        let (mut reg, _gh_log) = spawn_bin_missing_registry(ws);
+
+        let first = reg
+            .dispatch(&SweepKind::Issue(5236), None, None, None, None)
+            .expect_err("first dispatch must fail — spawn_bin does not exist");
+        assert!(
+            first.downcast_ref::<LiveClaimDispatchError>().is_none(),
+            "the FIRST dispatch must fail on the spawn error itself, not a live-claim refusal \
+             (there is nothing to collide with yet) — got: {first}"
+        );
+
+        let second = reg
+            .dispatch(&SweepKind::Issue(5236), None, None, None, None)
+            .expect_err("second dispatch must also fail — spawn_bin still does not exist");
+        assert!(
+            second.downcast_ref::<LiveClaimDispatchError>().is_none(),
+            "the SECOND dispatch must reach the same spawn_child failure again, not be wedged \
+             behind a #4556 live-claim refusal from the first attempt's leaked lock — got: {second}"
+        );
+        assert!(second.to_string().contains("failed to spawn sweep child"), "got: {second}");
+    }
+
     /// Edge case (#4689): a child that DID log a token selection before
     /// exiting with `EX_CONFIG`/78 (should not happen from the real
     /// `spawn-claude.sh` — its token-selection step is the very first thing
@@ -3097,6 +3276,95 @@ exit 0
         assert!(
             recorded.contains(".loom/tokens/agent-1.token"),
             "expected TOKEN_SOURCE to point at .loom/tokens/; got: {recorded}"
+        );
+    }
+
+    /// Issue #4768: the sweep child must receive `LOOM_ROLE=sweep-lifecycle`
+    /// (the ALREADY-ADMITTED role), not just `LOOM_RUNTIME`. Without this, a
+    /// Codex-runtime sweep child reaches `spawn-codex.sh`'s mutable-role
+    /// hook-trust preflight with no role signal at all, which is
+    /// indistinguishable there from an unrecognized role and silently takes
+    /// the read-only fallback instead of failing closed.
+    #[test]
+    #[serial]
+    fn dispatch_sets_loom_role_from_admitted_role() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path();
+        // Installs the runtime-admission fixture (`.loom/roles/builder.json`
+        // + `.loom/runtimes/claude.json`, satisfied by the built-in `claude`
+        // runtime) AND the `/loom:sweep` command marker the 2.x guards
+        // require with `skip_label_flip = false`.
+        touch_sweep_command(workspace);
+
+        // A permissive fake `gh` so every dispatch-path guard (closed-issue,
+        // open-PR, park-label) passes and dispatch reaches `spawn_child`.
+        let fake_gh = workspace.join("fake-gh.sh");
+        let gh_script = format!(
+            "#!/usr/bin/env bash\n\
+             if [[ \"$1\" == \"api\" && \"$2\" == repos/* ]]; then\n\
+             printf '%s\\n' '{state}'\n\
+             exit 0\n\
+             fi\n\
+             if [[ \"$1\" == \"repo\" && \"$2\" == \"view\" ]]; then\n\
+             printf 'rjwalters/loom\\n'\n\
+             exit 0\n\
+             fi\n\
+             exit 0\n",
+            state = state_probe_json("open", false),
+        );
+        std::fs::write(&fake_gh, &gh_script).unwrap();
+        let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_gh, perms).unwrap();
+
+        // Overwrite the fixture's stub spawn-claude.sh with one that records
+        // LOOM_ROLE (and LOOM_RUNTIME, for good measure) to a log file.
+        let scripts_dir = workspace.join(".loom").join("scripts");
+        let fake_bin = scripts_dir.join("spawn-claude.sh");
+        let record_log = workspace.join("role-record.log");
+        let script = format!(
+            r#"#!/usr/bin/env bash
+{{
+  printf 'LOOM_ROLE=%s\n' "${{LOOM_ROLE:-unset}}"
+  printf 'LOOM_RUNTIME=%s\n' "${{LOOM_RUNTIME:-unset}}"
+}} >> "{rec}"
+exit 0
+"#,
+            rec = record_log.display()
+        );
+        std::fs::write(&fake_bin, script).unwrap();
+        let mut perms = std::fs::metadata(&fake_bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_bin, perms).unwrap();
+        if let Ok(f) = std::fs::File::open(&fake_bin) {
+            let _ = f.sync_all();
+        }
+
+        let mut config = SweepRegistryConfig::new(workspace.to_path_buf());
+        // Bypass the runtime-dispatch seam (`resolve_spawn_bin()` would
+        // otherwise find the REAL `defaults/scripts/spawn-worker.sh` and exec
+        // through to the real `spawn-claude.sh`): point `spawn_bin` directly
+        // at the recording fixture, exactly like every other fixture in this
+        // module.
+        config.spawn_bin = Some(fake_bin);
+        config.gh_bin = Some(fake_gh);
+        config.skip_label_flip = false;
+        config.journal_path = Some(workspace.join("test-sweeps-journal.json"));
+        let mut registry = SweepRegistry::new(config);
+
+        let outcome = registry
+            .dispatch(&SweepKind::Issue(4768), None, None, None, None)
+            .unwrap();
+        assert!(outcome.was_new);
+
+        let recorded = assert_child_wrote(&record_log, "LOOM_ROLE=");
+        assert!(
+            recorded.contains("LOOM_ROLE=sweep-lifecycle"),
+            "expected the admitted role (sweep-lifecycle) in the child env; got: {recorded}"
+        );
+        assert!(
+            recorded.contains("LOOM_RUNTIME=claude"),
+            "expected the admitted (built-in) runtime alongside it; got: {recorded}"
         );
     }
 

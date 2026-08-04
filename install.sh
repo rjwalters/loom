@@ -11,7 +11,12 @@
 #                              when the target already has Loom installed -- without
 #                              it, non-interactive runs stop and ask you to inventory
 #                              customizations first (interactive runs still get a
-#                              y/N prompt instead).
+#                              y/N prompt instead). If you only want to bring an
+#                              existing install's surfaces up to date -- not replace
+#                              the payload -- use the non-destructive
+#                              .loom/scripts/resync-installed.sh in the target repo
+#                              instead; --confirm-reinstall uninstalls before
+#                              reinstalling.
 #   --allow-non-main-source    Permit installing from a non-main / detached-HEAD Loom source
 #                              (forwarded to scripts/install-loom.sh)
 #   --allow-stale-target       Permit installing over a target whose Loom is newer/stale
@@ -60,15 +65,28 @@ header() {
 }
 
 # Detect whether the canonical Repo Skills generic guard is present in the
-# target repo AND carries the rjwalters/repo#29 curl-pipe fix (issue #4041).
-# Presence/version probe only — the marker comment stands in for "has the fix",
-# so no version arithmetic is needed. Anything older (or absent) is treated as
-# absent, matching the identical runtime check in the guard-destructive.sh
-# dispatcher so install-time and runtime always agree on which guard wins.
+# target repo AND passes BOTH runtime probes the guard-destructive.sh
+# dispatcher requires (issue #4041, #4894):
+#   1. VERSION probe — carries the rjwalters/repo#29 curl-pipe fix (the
+#      marker comment stands in for "has the fix", so no version arithmetic
+#      is needed).
+#   2. CAPABILITY probe — also carries the `worktree-write-confinement`
+#      decision tag, i.e. actually implements the Loom-only Bash-tool
+#      write-confinement category (issue #4178), not just the unrelated
+#      repo#29 fix.
+# Both are required, matching the identical two-probe runtime check in the
+# guard-destructive.sh dispatcher, so install-time and runtime always agree on
+# which guard wins — and, critically, so this function never treats the
+# vendored copy as installable-skippable while the dispatcher would still fall
+# back to it (#4894: before this, a canonical guard with repo#29 but without
+# write-confinement caused the vendored fallback to be skipped/removed at
+# install time even though the dispatcher needed it).
 canonical_guard_present() {
   local target="$1"
   local canonical="$target/.claude/skills/repo/hooks/guard-destructive.sh"
-  [[ -r "$canonical" ]] && grep -q 'repo#29' "$canonical" 2>/dev/null
+  [[ -r "$canonical" ]] \
+    && grep -q 'repo#29' "$canonical" 2>/dev/null \
+    && grep -q 'worktree-write-confinement' "$canonical" 2>/dev/null
 }
 
 # Install hooks and CLI wrapper that loom-daemon init doesn't handle.
@@ -197,6 +215,41 @@ wire_quick_install_guard_hooks() {
   info "Asserting project-level guard-hook entries for per-repo .loom/hooks/ copies..."
   ensure_project_hook_wiring "$target" || \
     warning "Project-level guard-hook entries not fully asserted in $target/.claude/settings.json; run scripts/install-loom.sh (Full Install) or re-add them manually — see defaults/docs/guard-hooks.md."
+}
+
+# Regenerate .loom/manifest.json's checksums after this function's caller has
+# finished ALL post-`loom-daemon init` mutations of Loom-tracked files
+# (issue #5279).
+#
+# `loom-daemon init` generates the manifest as its own last internal step
+# (loom-daemon/src/init/post_init.rs::generate_manifest, invoked from
+# loom-daemon/src/init/mod.rs) -- which runs BEFORE `wire_quick_install_guard_hooks`
+# (above) asserts project-level guard-hook entries into `.claude/settings.json`
+# via `ensure_project_hook_wiring`. That means the manifest's stored hash for
+# `.claude/settings.json` reflects its PRE-wiring content, not the genuinely
+# final installed state.
+#
+# Left unfixed, `verify-install.sh verify` reports spurious `DRIFT DETECTED` on
+# `.claude/settings.json` immediately after EVERY quick install -- even a
+# completely vanilla install with zero customization and zero foreign
+# content -- because the on-disk file legitimately changes after the manifest
+# snapshot was taken. This is the concrete, reproducible mechanism behind the
+# "verify-install.sh reports [settings.json] as drift by design" symptom
+# described in #5279 (a stricter, always-reproducible version of it: no
+# foreign/sibling-tool content is even required to trigger it).
+#
+# Call this ONLY after every mutator of Loom-tracked files in the current
+# install path has run (currently: right after `wire_quick_install_guard_hooks`,
+# its last one on the quick-install path). Best-effort: a missing or failing
+# verify-install.sh never aborts the install.
+regenerate_manifest_after_hook_wiring() {
+  local target="$1"
+  local script="$target/.loom/scripts/verify-install.sh"
+
+  if [[ -f "$script" ]]; then
+    ( cd "$target" && bash "$script" generate --quiet ) || \
+      warning "Could not regenerate .loom/manifest.json after guard-hook wiring; 'verify-install.sh verify' may report spurious drift on .claude/settings.json."
+  fi
 }
 
 # Export LOOM_VERSION and LOOM_COMMIT so `loom-daemon init`'s template
@@ -368,6 +421,107 @@ loom_daemon_binary_stale() {
       "$loom_root/Cargo.toml" "$loom_root/Cargo.lock" \
       -type f -newer "$binary" 2>/dev/null | head -n1)"
   [[ -n "$newer_file" ]]
+}
+
+# Issue #4897: `loom_daemon_binary_stale` above only ever compares the
+# *source tree's own build artifact* (`$loom_root/target/release/loom-daemon`)
+# against source mtimes -- it has no idea a machine-level binary already
+# installed at the destination (`provision_machine_daemon`'s target,
+# scripts/install/provision-daemon.sh) was already rebuilt from the exact
+# commit we're about to build, e.g. by a fleet-mate's install/sweep that ran
+# moments ago. Both call sites unconditionally ran `pnpm daemon:build` --
+# i.e. `cargo build --package loom-daemon --release` -- whenever the source
+# artifact looked stale, even when that build would just block for minutes on
+# `target/.cargo-lock` (held by an unrelated `cargo test`/`clippy` in the same
+# tree) and then produce a binary identical to one already on disk.
+#
+# Returns 0 ("current -- skip the build") when a machine-level installed
+# binary exists AND its embedded build commit (`--version`, see
+# loom-daemon/build.rs / loom_daemon::self_update::BUILD_IDENTITY) matches
+# source HEAD. This is the SAME comparison `provision_machine_daemon()`
+# already performs (scripts/install/provision-daemon.sh ~line 268, the
+# "already current at $dest_bin" short-circuit) -- reused here so install.sh
+# can skip the build BEFORE paying for the lock wait, not just discover after
+# the fact that the rebuild wasn't needed. On a match it also copies the
+# installed binary into `$loom_root/target/release/loom-daemon` (creating
+# target/release/ if missing) so the unmodified downstream call sites that
+# reference that in-repo path directly (`loom-daemon init`,
+# `provision_machine_daemon` itself) keep working without further changes.
+#
+# Returns 1 (build still needed) when there is no installed binary, its
+# `--version` can't be read, its embedded commit is "unknown"/unparsable, or
+# it does not match source HEAD.
+loom_daemon_dest_binary_current() {
+  local loom_root="$1"
+  local dest_dir="${LOOM_DAEMON_BIN_DIR:-$HOME/.local/bin}"
+  local dest_bin="$dest_dir/loom-daemon"
+
+  [[ -x "$dest_bin" ]] || return 1
+
+  local head_commit
+  head_commit="$(git -C "$loom_root" rev-parse --short HEAD 2>/dev/null)" || return 1
+  [[ -n "$head_commit" ]] || return 1
+
+  local dest_version dest_commit
+  dest_version="$("$dest_bin" --version 2>/dev/null)" || return 1
+  # `--version` embeds "... (commit <sha>, built <ts>)" -- see
+  # loom-daemon/build.rs and loom_daemon::self_update::BUILD_IDENTITY.
+  case "$dest_version" in
+    *"(commit "*)
+      dest_commit="${dest_version#*"(commit "}"
+      dest_commit="${dest_commit%%,*}"
+      ;;
+    *) return 1 ;;
+  esac
+  [[ -n "$dest_commit" && "$dest_commit" != "unknown" ]] || return 1
+  [[ "$dest_commit" == "$head_commit" ]] || return 1
+
+  mkdir -p "$loom_root/target/release" 2>/dev/null || return 1
+  cp -f "$dest_bin" "$loom_root/target/release/loom-daemon" 2>/dev/null || return 1
+  chmod 755 "$loom_root/target/release/loom-daemon" 2>/dev/null || true
+  return 0
+}
+
+# Issue #4897: runs `pnpm daemon:build` (a `cargo build --package loom-daemon
+# --release` under the hood) in the background and emits a periodic progress
+# line while it is running, so a wait contended on `target/.cargo-lock` (held
+# by an unrelated `cargo test`/`clippy` elsewhere in the same source tree) is
+# visibly distinguishable from a hung installer instead of producing zero
+# output for 10+ minutes. Best-effort: if `lsof` is unavailable or the lock
+# file can't be inspected, the progress line still fires, just without naming
+# the competing PID.
+run_daemon_build_with_progress() {
+  local loom_root="$1"
+  local lockfile="$loom_root/target/.cargo-lock"
+  local log
+  log="$(mktemp 2>/dev/null || echo "/tmp/loom-daemon-build.$$.log")"
+
+  ( cd "$loom_root" && pnpm daemon:build >"$log" 2>&1 ) &
+  local build_pid=$!
+
+  local elapsed=0
+  local interval=15
+  while kill -0 "$build_pid" 2>/dev/null; do
+    sleep "$interval"
+    elapsed=$((elapsed + interval))
+    kill -0 "$build_pid" 2>/dev/null || break
+
+    local holder=""
+    if [[ -f "$lockfile" ]] && command -v lsof >/dev/null 2>&1; then
+      holder="$(lsof -t "$lockfile" 2>/dev/null | head -n1 || true)"
+    fi
+    if [[ -n "$holder" ]]; then
+      info "  ... still building loom-daemon (${elapsed}s elapsed; waiting on cargo build-dir lock, held by pid $holder)"
+    else
+      info "  ... still building loom-daemon (${elapsed}s elapsed)"
+    fi
+  done
+
+  wait "$build_pid"
+  local status=$?
+  cat "$log" 2>/dev/null || true
+  rm -f "$log" 2>/dev/null || true
+  return $status
 }
 
 # Issue #3588: re-append the current Loom ephemeral .gitignore patterns after a
@@ -573,7 +727,12 @@ while [[ "${1:-}" == -* ]]; do
       echo "                             when the target already has Loom installed -- without"
       echo "                             it, non-interactive runs stop and ask you to inventory"
       echo "                             customizations first (interactive runs still get a"
-      echo "                             y/N prompt instead)."
+      echo "                             y/N prompt instead). If you only want to bring an"
+      echo "                             existing install's surfaces up to date -- not replace"
+      echo "                             the payload -- use the non-destructive"
+      echo "                             .loom/scripts/resync-installed.sh in the target repo"
+      echo "                             instead; --confirm-reinstall uninstalls before"
+      echo "                             reinstalling."
       echo "  --allow-non-main-source    Permit installing from a non-main / detached-HEAD"
       echo "                             Loom source (forwarded to scripts/install-loom.sh)"
       echo "  --allow-stale-target       Permit installing over a newer/stale target"
@@ -823,6 +982,19 @@ if [[ ${#MISSING_DEPS[@]} -gt 0 ]]; then
   echo -e "$INSTALL_INSTRUCTIONS"
   echo ""
 
+  # Issue #4888: this gate used to `read` unconditionally, even under
+  # --yes/--quick/--full. On a non-interactive run stdin is not a terminal, so
+  # the read returns immediately at EOF with an empty reply, which then fell
+  # into the "exit to install" default below and aborted -- after printing a
+  # prompt nobody was there to answer, and (when stdin is a pipe rather than
+  # /dev/null) after silently eating a byte of whatever else was on it. Honor
+  # NON_INTERACTIVE explicitly instead: same outcome (a missing required
+  # dependency is still fatal), but as a direct, greppable error rather than a
+  # phantom prompt.
+  if [[ "$NON_INTERACTIVE" == true ]]; then
+    error "Missing required dependencies: ${MISSING_DEPS[*]} -- cannot continue a non-interactive install.\n       Install them (see above) and re-run, or drop --yes/--quick/--full to get an interactive prompt that lets you continue anyway."
+  fi
+
   read -r -p "Exit to install dependencies? [Y/n] " -n 1 INSTALL_DEPS
   echo ""
   if [[ ! $INSTALL_DEPS =~ ^[Nn]$ ]]; then
@@ -871,8 +1043,9 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
     info "Reinstall will uninstall the existing installation first, then perform"
     info "a fresh Quick Install."
   else
-    info "Reinstall will uninstall the existing installation first, then perform"
-    info "a fresh install and create a PR with the changes."
+    info "Reinstall will upgrade the existing installation in an isolated worktree"
+    info "and open a PR with the changes -- your working directory is not touched"
+    info "until you merge it."
   fi
   echo ""
 
@@ -892,25 +1065,44 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
     # legacy) install now MUST pass --confirm-reinstall explicitly -- it
     # cannot silently cross this boundary just because it also passed
     # --quick/--yes/--full.
-    error "Existing Loom installation detected at $TARGET_PATH/.loom -- refusing to run a non-interactive reinstall without explicit acknowledgement.\n       Reinstalling uninstalls the existing Loom payload before writing the new version; inventory and back up any project-owned Loom hooks, scripts, and agent configuration first.\n       Re-run with --confirm-reinstall once you have done so, or omit --quick/--yes/--full to get an interactive y/N prompt instead."
+    error "Existing Loom installation detected at $TARGET_PATH/.loom -- refusing to run a non-interactive reinstall without explicit acknowledgement.\n       Reinstalling uninstalls the existing Loom payload before writing the new version; inventory and back up any project-owned Loom hooks, scripts, and agent configuration first.\n       If you only want to bring the existing install up to date -- not replace it -- run the non-destructive '$TARGET_PATH/.loom/scripts/resync-installed.sh' instead; it copies forward the latest hooks/scripts/roles/docs without uninstalling anything.\n       Re-run with --confirm-reinstall once you have done so, or omit --quick/--yes/--full to get an interactive y/N prompt instead."
   fi
 
-  # Issue #3545: for a --quick reinstall, guard uncommitted user changes across
-  # the uninstall→reinstall cycle (mirrors the stash guard in the sibling
-  # scripts/install-loom.sh --clean path). The uninstall runs `git add` in the
-  # target tree and the reinstall reconciles the index afterwards; stashing
-  # first keeps a user's pre-existing staged/working changes from being caught
-  # up in either step. The non-quick reinstall delegates to install-loom.sh,
-  # which performs its own guarding, so it is intentionally left unstashed here.
-  #
-  # Issue #3597: scope the stash to Loom-owned paths. The original unscoped
-  # `git stash push` swept sibling installers' uncommitted tracked changes
-  # (.anvil/*, .claude/skills/repo/*, non-Loom CLAUDE.md sections, …) into the
-  # stash and left a half-old/half-new hybrid tree. Restrict the stash to the
-  # dirty ∩ (Loom ownership set + .gitignore) intersection so sibling changes
-  # are never touched. Empty intersection → no stash at all.
-  REINSTALL_STASHED_USER_CHANGES=false
+  # Issue #4888: the chained uninstall below (`uninstall-loom.sh --yes --local`)
+  # mutates $TARGET_PATH's MAIN checkout directly -- it stages deletions and
+  # strips the Loom sections out of CLAUDE.md / .gitignore in place. That is
+  # necessary and safe for a --quick reinstall (the fresh install runs
+  # synchronously in that same working tree right after -- see the
+  # INSTALL_TYPE=="1" branch below, which unstages/restores as part of its own
+  # completion). It is NOT safe for the non-quick (Full Install) path: that
+  # path `exec`s into scripts/install-loom.sh, which does all of its real work
+  # in an isolated worktree branched from `origin/main` (see
+  # scripts/install/create-worktree.sh) and opens a PR -- it never reads or
+  # needs a pre-uninstalled main checkout. Once `exec` replaces this process,
+  # nothing here can roll back a downstream failure (a trap in *this* script
+  # will never fire), so any failure inside the delegated install-loom.sh run
+  # left the chained uninstall's staged deletions stranded on $TARGET_PATH's
+  # main checkout with no automatic recovery (the reported half-uninstalled
+  # target). `loom-daemon init` already performs a careful merge/upgrade of an
+  # existing install (including legacy-content migration) from inside that
+  # worktree, so the Full Install path needs no pre-mutation at all --
+  # install-loom.sh's own idempotency check detects the older installed
+  # version and proceeds with a normal upgrade (see the delegation site below).
   if [[ "$INSTALL_TYPE" == "1" ]]; then
+    # Issue #3545: for a --quick reinstall, guard uncommitted user changes across
+    # the uninstall→reinstall cycle (mirrors the stash guard in the sibling
+    # scripts/install-loom.sh --clean path). The uninstall runs `git add` in the
+    # target tree and the reinstall reconciles the index afterwards; stashing
+    # first keeps a user's pre-existing staged/working changes from being caught
+    # up in either step.
+    #
+    # Issue #3597: scope the stash to Loom-owned paths. The original unscoped
+    # `git stash push` swept sibling installers' uncommitted tracked changes
+    # (.anvil/*, .claude/skills/repo/*, non-Loom CLAUDE.md sections, …) into the
+    # stash and left a half-old/half-new hybrid tree. Restrict the stash to the
+    # dirty ∩ (Loom ownership set + .gitignore) intersection so sibling changes
+    # are never touched. Empty intersection → no stash at all.
+    REINSTALL_STASHED_USER_CHANGES=false
     # shellcheck source=scripts/install/stash-scope.sh
     source "$LOOM_ROOT/scripts/install/stash-scope.sh"
     REINSTALL_OWNED_DIRTY=()
@@ -933,35 +1125,32 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
         warning "Uncommitted changes may appear alongside the reinstall diff"
       fi
     fi
-  fi
 
-  # Issue #3598: snapshot the committed .loom/config.json before the chained
-  # uninstall deletes it. `config.json` is listed in uninstall-loom.sh's
-  # RUNTIME_ARTIFACTS and is removed from disk, but it is consumer configuration
-  # (e.g. a load-bearing `worktree.root` override), not a runtime artifact.
-  # Restoring the snapshot before `loom-daemon init` (below) lets the daemon's
-  # merge-aware config copy preserve consumer keys instead of regenerating the
-  # file from the template. Mirrors the #3588 .gitignore snapshot pattern.
-  # Standalone uninstall behavior is intentionally unchanged.
-  REINSTALL_CONFIG_SNAPSHOT=""
-  if [[ -f "$TARGET_PATH/.loom/config.json" ]]; then
-    REINSTALL_CONFIG_SNAPSHOT="$(mktemp 2>/dev/null || true)"
-    if [[ -n "$REINSTALL_CONFIG_SNAPSHOT" ]]; then
-      cp "$TARGET_PATH/.loom/config.json" "$REINSTALL_CONFIG_SNAPSHOT" 2>/dev/null || \
-        REINSTALL_CONFIG_SNAPSHOT=""
+    # Issue #3598: snapshot the committed .loom/config.json before the chained
+    # uninstall deletes it. `config.json` is listed in uninstall-loom.sh's
+    # RUNTIME_ARTIFACTS and is removed from disk, but it is consumer configuration
+    # (e.g. a load-bearing `worktree.root` override), not a runtime artifact.
+    # Restoring the snapshot before `loom-daemon init` (below) lets the daemon's
+    # merge-aware config copy preserve consumer keys instead of regenerating the
+    # file from the template. Mirrors the #3588 .gitignore snapshot pattern.
+    # Standalone uninstall behavior is intentionally unchanged.
+    REINSTALL_CONFIG_SNAPSHOT=""
+    if [[ -f "$TARGET_PATH/.loom/config.json" ]]; then
+      REINSTALL_CONFIG_SNAPSHOT="$(mktemp 2>/dev/null || true)"
+      if [[ -n "$REINSTALL_CONFIG_SNAPSHOT" ]]; then
+        cp "$TARGET_PATH/.loom/config.json" "$REINSTALL_CONFIG_SNAPSHOT" 2>/dev/null || \
+          REINSTALL_CONFIG_SNAPSHOT=""
+      fi
     fi
-  fi
 
-  # Uninstall existing installation (local mode, no separate PR)
-  info "Uninstalling existing Loom installation..."
-  "$LOOM_ROOT/scripts/uninstall-loom.sh" --yes --local "$TARGET_PATH" || \
-    error "Uninstall failed - aborting reinstall"
-  echo ""
-  success "Existing installation removed"
-  echo ""
+    # Uninstall existing installation (local mode, no separate PR)
+    info "Uninstalling existing Loom installation..."
+    "$LOOM_ROOT/scripts/uninstall-loom.sh" --yes --local "$TARGET_PATH" || \
+      error "Uninstall failed - aborting reinstall"
+    echo ""
+    success "Existing installation removed"
+    echo ""
 
-  # If --quick was specified, do a quick reinstall instead of full workflow
-  if [[ "$INSTALL_TYPE" == "1" ]]; then
     info "Running fresh Quick Install..."
     echo ""
 
@@ -969,15 +1158,23 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
     # tree (issue #4188 -- a bare existence check reuses a binary built from
     # an older commit after `git pull` landed a newer one).
     if loom_daemon_binary_stale "$LOOM_ROOT"; then
-      if [[ -f "$LOOM_ROOT/target/release/loom-daemon" ]]; then
-        warning "loom-daemon binary is stale (source tree updated since last build)"
+      # Issue #4897: before paying for a `cargo build` (and its
+      # `target/.cargo-lock` wait), check whether the ALREADY-INSTALLED
+      # machine-level binary was already rebuilt from this exact commit --
+      # e.g. by a fleet-mate's install/sweep moments ago -- and reuse it
+      # instead of rebuilding.
+      if loom_daemon_dest_binary_current "$LOOM_ROOT"; then
+        info "loom-daemon already current at ${LOOM_DAEMON_BIN_DIR:-$HOME/.local/bin}/loom-daemon (matches source HEAD) -- skipping rebuild"
       else
-        warning "loom-daemon binary not found"
+        if [[ -f "$LOOM_ROOT/target/release/loom-daemon" ]]; then
+          warning "loom-daemon binary is stale (source tree updated since last build)"
+        else
+          warning "loom-daemon binary not found"
+        fi
+        info "Building loom-daemon (this may take a minute)..."
+        run_daemon_build_with_progress "$LOOM_ROOT" || error "Failed to build loom-daemon"
+        echo ""
       fi
-      info "Building loom-daemon (this may take a minute)..."
-      cd "$LOOM_ROOT"
-      pnpm daemon:build || error "Failed to build loom-daemon"
-      echo ""
     fi
 
     # Export LOOM_VERSION / LOOM_COMMIT so the daemon's template substituter
@@ -1017,6 +1214,11 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
     # none (the 0.16.0 defaults carry no `hooks` block) — this call is what
     # restores a working guard-hook execution path instead of leaving zero.
     wire_quick_install_guard_hooks "$TARGET_PATH"
+
+    # Regenerate the checksum manifest now that ALL settings.json mutations for
+    # this install path are complete (issue #5279 — see the function's own
+    # comment for why this must run after wire_quick_install_guard_hooks).
+    regenerate_manifest_after_hook_wiring "$TARGET_PATH"
 
     # Issue #3545: reconcile the git index after the uninstall→reinstall cycle.
     # The chained uninstall staged the deletion of every prior Loom file (now
@@ -1240,7 +1442,19 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
     exit 0
   fi
 
-  # Default: delegate to Full Install (creates worktree + PR)
+  # Default: delegate to Full Install (creates worktree + PR). Issue #4888: no
+  # uninstall runs against $TARGET_PATH's main checkout above for this path --
+  # the delegated install-loom.sh does all of its work in an isolated worktree
+  # (scripts/install/create-worktree.sh branches from `origin/main`) and never
+  # touches the live main checkout, so there is nothing to roll back on
+  # failure. install-loom.sh's own idempotency check will detect the existing
+  # (older) installed version from $TARGET_PATH/.loom/install-metadata.json
+  # and proceed with a normal merge-mode upgrade inside its worktree -- the
+  # same careful preserve/migrate logic (loom-daemon init) that a plain
+  # `install-loom.sh` upgrade already relies on. Deliberately NOT passing
+  # --force here: that flag also flips FORCE_AUTO_MERGE on for the resulting
+  # PR (scripts/install-loom.sh's create-pr.sh call), which is a bigger
+  # behavior change (skips human review) than this fix's scope.
   info "Running fresh install via Full Install workflow..."
   echo ""
   INSTALL_FLAGS=()
@@ -1353,15 +1567,23 @@ case "$METHOD" in
     # tree (issue #4188 -- a bare existence check reuses a binary built from
     # an older commit after `git pull` landed a newer one).
     if loom_daemon_binary_stale "$LOOM_ROOT"; then
-      if [[ -f "$LOOM_ROOT/target/release/loom-daemon" ]]; then
-        warning "loom-daemon binary is stale (source tree updated since last build)"
+      # Issue #4897: before paying for a `cargo build` (and its
+      # `target/.cargo-lock` wait), check whether the ALREADY-INSTALLED
+      # machine-level binary was already rebuilt from this exact commit --
+      # e.g. by a fleet-mate's install/sweep moments ago -- and reuse it
+      # instead of rebuilding.
+      if loom_daemon_dest_binary_current "$LOOM_ROOT"; then
+        info "loom-daemon already current at ${LOOM_DAEMON_BIN_DIR:-$HOME/.local/bin}/loom-daemon (matches source HEAD) -- skipping rebuild"
       else
-        warning "loom-daemon binary not found"
+        if [[ -f "$LOOM_ROOT/target/release/loom-daemon" ]]; then
+          warning "loom-daemon binary is stale (source tree updated since last build)"
+        else
+          warning "loom-daemon binary not found"
+        fi
+        info "Building loom-daemon (this may take a minute)..."
+        run_daemon_build_with_progress "$LOOM_ROOT" || error "Failed to build loom-daemon"
+        echo ""
       fi
-      info "Building loom-daemon (this may take a minute)..."
-      cd "$LOOM_ROOT"
-      pnpm daemon:build || error "Failed to build loom-daemon"
-      echo ""
     fi
 
     # Export LOOM_VERSION / LOOM_COMMIT so the daemon's template substituter
@@ -1402,6 +1624,11 @@ case "$METHOD" in
     # copies that nothing references (the 0.16.0 defaults settings.json has no
     # `hooks` block) and no user-scope wiring at all: zero guard coverage.
     wire_quick_install_guard_hooks "$TARGET_PATH"
+
+    # Regenerate the checksum manifest now that ALL settings.json mutations for
+    # this install path are complete (issue #5279 — see the function's own
+    # comment for why this must run after wire_quick_install_guard_hooks).
+    regenerate_manifest_after_hook_wiring "$TARGET_PATH"
 
     echo ""
     success "Quick installation complete!"

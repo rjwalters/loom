@@ -8,6 +8,9 @@
         "curator",
         "champion",
         "judge"
+      ],
+      "onIdle": [
+        "auditor"
       ]
     },
     "collisionDetection": {
@@ -17,7 +20,10 @@
       "maxConcurrent": 16,
       "enabled": true
     },
-    "perTokenConcurrency": 3
+    "perTokenConcurrency": 3,
+    "autoUpdate": {
+      "enabled": true
+    }
   },
   "buildGate": {
     "enabled": true,
@@ -101,5 +107,13 @@
   },
   "sweep": {
     "modelExperiment": "observe"
+  },
+  "observability": {
+    "enabled": true,
+    "endpoint": "https://dashboard.2amlogic.com/ingest",
+    "ingestKeyFile": "/Users/rwalters/.loom/observability/ingest.key",
+    "batchSize": 50,
+    "flushIntervalSecs": 30,
+    "queueCapacity": 2000
   }
 }

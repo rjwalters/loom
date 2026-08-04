@@ -7,6 +7,183 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-08-03
+
+### Summary
+
+Minor release in which the fleet becomes **self-repairing and self-shipping**. Loom
+now ships **prebuilt `loom-daemon` artifacts** for every target platform — this is
+the first release to exercise that pipeline, with checksums always, keyless Linux
+signing via GitHub OIDC, and macOS signing gated on secrets that skip loudly when
+absent (`daemon-update` treats an unsigned artifact as acceptable and fails only on a
+*present but invalid* signature; artifact fetch stays opt-in, so source-build
+self-update is unchanged). Alongside it: orphaned process trees left behind by dead
+sweeps are now reaped, restart-adopted sweeps stop losing their outcome telemetry, the
+watchdog and the supervised restart primitive become honest on both launchd and
+systemd, agents get an ETag-cached forge listing surface and a REST fallback for issue
+creation so GraphQL exhaustion no longer halts them, and the dashboard stops counting
+hosts it has no health data for. 151 commits since 0.17.0, no breaking changes.
+
+### Added
+
+**Release + distribution**
+- Prebuilt `loom-daemon` artifacts with checksums for all target platforms (#5009)
+- Secrets-gated macOS/Linux signing in the release workflow (#5018), and keyless
+  Linux signing verified by default (#5074)
+- `daemon-update` can fetch + verify a prebuilt release artifact instead of
+  rebuilding from source (#5053); `fleet add-worker` provisions from an artifact (#5080)
+
+**Orphaned-process reaping**
+- Reap orphaned process trees inside dead-sweep worktrees (#5121), hardened with
+  freeze-first kill and self-protection (#5146)
+
+**Observability + health**
+- Positive telemetry-export liveness reported in `status` and `health` (#5125)
+- Backfill `sweep.completed` / `sweep.outcome` for restart-adopted sweeps (#5106)
+- Role-tick health in `HostHealthRecord` and on the fleet dashboard (#5042); N
+  consecutive identical role-tick failures now escalate distinctly (#5039)
+- Review-side queue axes assessed, with review-stall flagging (#5050)
+- `host_id` / ingest-key mismatch detection via ingest echo + exporter check (#4885)
+- `host.health` stamped with the emitting binary's build commit and build time
+  (#4964); managed-repo roster added (#4984)
+- Optional OTLP exporter as a feature-flagged second sink (#4879)
+
+**Forge resilience**
+- REST fallback for `gh issue create` (#5070), with all 38 call sites routed through
+  `create-issue.sh` (#5095)
+- Agent-facing ETag-cached issue/PR listing surface (#5075)
+
+**Multi-runtime**
+- Per-role model override via `autonomous.roleRunner.roleModels` (#5026)
+- Refuse a provable model/runtime mismatch before spawn (#5055)
+- `loom-daemon validate` proactively checks `runtimes.roles` (#5027)
+- Codex hook-trust verification strengthened with an install-time baseline diff (#5034)
+
+**Daemon capacity + lifecycle**
+- `loom-daemon cancel`, with the sweep pgid persisted so termination reaps the whole
+  process tree (#4982)
+- Saturation admission brake holds new sweeps on a loaded host (#4915)
+- Periodic worktree reaper for cross-host merged-PR cleanup (#4907)
+- Exhausted accounts report when their limit window resets (#4912)
+
+**Dashboard**
+- Fleet overview with multi-host drill-down (#4759), per-host saturation badge (#5012)
+- Token burn-curve, forecast and per-repo attribution (#4760); pool-level token
+  aggregate on the public surface (#4870)
+- Topbar account menu (#4853), Phase-3 panels behind hash routes (#4896), auto-deploy
+  on merge with a build-commit stamp (#4963)
+
+**Fleet + operator tooling**
+- `fleet bootstrap-spice` for pinned SPICE toolchain + PDK provisioning (#4947)
+- `--prune-stale-entry-points` for `loom-daemon-update.sh`, so retired-package
+  `loom-*` console scripts are removed rather than warned about on every run (#5150)
+- `/loom:sweep`'s all-sentinel confirmation gate flags operator-gated-but-unlabeled
+  candidates (#5151, #5149)
+- `--drain` threaded through `loom-daemon-update.sh`, drain-by-default on systemd, so a
+  roll no longer strands in-flight sweeps' telemetry or trips the stop-timeout (#5153)
+
+### Changed
+
+- `merge-pr` refuses to force-remove a worktree with uncommitted work (#5041)
+- A merged branch checked out in the primary repo checkout is auto-cleaned (#5089)
+- `daemon-update` classifies fast-forward-abort causes as safely resolvable (#4965)
+
+### Fixed
+
+**Daemon lifecycle**
+- The supervised restart primitive is honest and self-healing on systemd (#5127), and
+  verifies relaunch + self-heals a stop-timeout `failed` unit (#4960)
+- Watchdog uses socket-first liveness, honors `LOOM_PID_FILE`, and reports a distinct
+  UNDETERMINED state (#5126)
+- Corrected the stale "bootout kills sweeps" claim and added settle/retry/verify to
+  the launchd bootout+bootstrap path (#5112)
+- Stale launchd env is detected before a plain restart, never silently (#5008)
+- The orphan-process claim gate is pid-scoped rather than issue-scoped (#5162)
+
+**Guard false positives**
+- Heredoc-body write idioms masked in `extract_write_targets()` (#5085), with the
+  opener line required to end at the quoted delimiter (#5124)
+- Inert text masked before the merge-redirect substring check (#5115)
+- Whitespace inside quotes masked so a spaced write target isn't split (#4945)
+- Correct `Agent` subagent-dispatch tool name matched (#5096); background Bash tasks
+  retired by task-id (#5079)
+- A `cd` prefix threaded into force-op cwd/branch-identity resolution (#5161), and
+  quoted positional arguments to `grep`/`rg`/`check-duplicate.sh` masked before the
+  merge-redirect check (#5160)
+
+**Dashboard correctness**
+- Sweep-only and health-less hosts excluded from fleet/headline host counts (#5104,
+  #5102)
+- A revoked `host_id` can be re-provisioned via an atomic upsert (#5103)
+- Host staleness rendered as LIVE/STALE/OFFLINE instead of last-known-as-current
+  (#4959); leaked in-flight sweeps reconciled (#4961); host-distress shown as
+  degraded, not OK (#4981)
+- Duplicate terminal records deduped before the partial UNIQUE index (#5114)
+
+**CLI + health honesty**
+- Repo-root resolution requires `.git` beside `.loom`, and `recover-orphans` never
+  reports a false all-clear after its own query failed (#5154)
+- A missing `gh` is reported as one PATH fact, not N forge-query failures (#5097)
+- An empty fleet roster no longer exits 0 or reads as a healthy fleet (#5090)
+- Role-tick failure detail capped and ANSI-stripped before reaching `roles.summary`
+  (#5043)
+- The resolved `loom-daemon` binary is named, with a `LOOM_PREFER_REPO_BUILD` opt-in
+  (#5010)
+- `tokens` refuses a `--workspace` that already resolves inside a pool dir (#4949)
+
+**MCP + wrapper**
+- Abort on stale-bundle rebuild failure, with `npm ci` self-repair (#5045)
+- Sweep dispatch held for a workspace whose pre-flight advisory is tripped (#5044),
+  and the advisory is timestamped + workspace-scoped (#5049)
+
+**Agent-loop noise**
+- Duplicate stand-down comments suppressed and TTL reclaim ported to `loom:curating`
+  (#5129)
+- Curator skips duplicate "still blocked, no change" dependency re-checks (#4987)
+- Champion stops duplicate NEEDS REVISION comments (#4966) and bounds the silent
+  idempotency skip so unrevised proposals still escalate (#4969)
+- Champion's Priority 2/3 discovery excludes `loom:operator-only` / `loom:blocked` (#5165)
+
+**Consumer installs**
+- Runtime manifests bundled as a fallback when `defaults/` is unreachable (#5025)
+- `.loom/account-health.json` runtime state ignored (#5088)
+- `sync-labels.sh` is additive by default, with default-label deletion behind
+  `--prune-defaults` (#5073)
+- Residual `loom-tools` references removed after its deletion (#5143, #5147, #5113)
+
+## [0.17.0] - 2026-07-31
+
+### Summary
+
+Minor release in which the fleet becomes **observable, multi-runtime, and self-shipping**. A full telemetry pipeline lands (versioned schema → durable outcome records → push exporter → Cloudflare Workers/D1 backend → live dashboard with a public redacted view at a reference deployment); the runtime-adapter contract ships with **OpenAI Codex as adapter #2** behind the `spawn-worker.sh` seam; `loom-daemon health` and the `/loom:watch` skill make fleet supervision a first-class surface; the autonomous self-update loop closes the self-repair cycle (merged daemon fixes now deploy themselves); and epic #4081 Phase 4 deletes the `loom-tools` Python package — a fresh machine provision installs no Python at all. 272 commits since 0.16.0.
+
+### Added
+
+- **Fleet observability pipeline** (epic #4702) — versioned telemetry schema (#4703), durable per-sweep outcome records with model/config/phase timings (#4704, absorbing #4137), and an opt-in push exporter with offline queueing (`observability` config block, #4705); a deploy-to-your-own-account Cloudflare Workers + D1 backend with ingest auth, retention, query API and live tail (#4725, #4726, #4728); visibility classification + redaction (#4727) feeding a dashboard with live event feed, per-sweep timelines, historical charts, and an unauthenticated **public view** (#4750, #4751, #4753). Reference deployment: dashboard.2amlogic.com.
+- **Multi-runtime worker support** (epics #4167/#4489, ported from the gpeyton/loom fork with attribution) — the seven-point runtime adapter contract (`defaults/docs/runtime-adapters.md`, ADR-0012), the `spawn-worker.sh` dispatch seam (`LOOM_RUNTIME` > `runtimes.default` > `claude`), the **Codex adapter** `spawn-codex.sh` with capability manifest, per-provider error classification, an honest guardrail-parity doc, and a mocked CI leg (#4468); secure Codex account lifecycle commands (#4492); `AGENTS.md` single-source instruction anchor generated from Loom's canonical docs with a CI sync gate (#4479). Codex is tier-2, sandboxed conservatively (`read-only`/`workspace-write`), and scoped to the Builder stage by operator decision (#4478).
+- **`loom-daemon health`** (#4761) — one-shot consolidated vitals (trusted pgrep+pidfile liveness, dispatch, tokens, roles, queues, throughput) with a 0/1/2 exit-code contract for watch loops, and the **`/loom:watch` skill** (#4762) — tick-loop fleet supervision with a closed remediation playbook (R1–R5), two-tick confirmation, an escalation contract, and an end-of-window summary.
+- **Autonomous self-update enabled as the self-repair loop's last link** (#4017/#4055) — staleness check every 900s with a 600s settle window; merged daemon fixes now roll themselves onto every fleet host (verified-relaunch semantics, #4232).
+- **Fleet module completion** (epic #4340) — `fleet drain` (retire a worker without losing work/claims, #4343), `loom-daemon calibrate` (measure the host, set concurrency knobs, #4390), joining `fleet status`/`add-worker` from 0.16.0; `sync-labels.sh --repo` + a "bringing a new repo online" runbook (#4498); a REPO column in the in-flight registry (#4698).
+- **Rate-limit survival at fleet scale** (epic #4432) — dispatch-time GitHub rate-gate (#4666), REST conditional-request caching for hot polls (#4667), and REST fallbacks where GraphQL exhaustion previously hard-failed: `merge-pr.sh --auto` (#4447), `check-duplicate.sh` (#4526, #4659), and sweep Mode B/C discovery (#4670).
+
+### Changed
+
+- **Dispatch pins a work-model default** (`model=sonnet` unless overridden, #4501) so children no longer inherit the interactive session's model tier; per-issue dispatch backoff (#4485); CPU demoted from admission term to observation (#4512) with `max_admissions_per_tick` ramping and machine-wide build slots.
+- **Guard family hardened from live incidents** — `gh … --body @path` literal-path deny with variable-correlation and `gh api -f` companions (#4523, #4601); stop-guard coverage extended to armed Monitor/ScheduleWakeup timers (#4462) and background-Bash completion notifications (#4482, #4696); worktree dirty-checks before remove/recreate (#4449).
+- **`loom-daemon-start.sh` FLAGS-OFF transitions are loud** (#4693) — a plain restart that would downgrade a previously-autonomous daemon now warns with the `--from-config` remediation instead of silently disabling dispatch.
+
+### Fixed
+
+- **Runtime-admission fleet outage** (#4688) — `roots()`'s all-or-nothing fallback rejected 21/21 consumer-repo dispatches when `.loom/runtimes/` was missing; per-directory fallback + installer provisioning.
+- **Liveness false negatives** (#4694) — the launchd domain probe declared live, dispatching daemons dead (twice, with sweeps in flight); pgrep+pidfile cross-checks, and the daemon now **owns its pidfile write at boot** so supervisor relaunches can't rot it (#4774); process exits nonzero on startup failure instead of half-running (#4531).
+- **No-progress reaper fails open on probe failure** (#4366, #4408) — a timed-out forge probe no longer counts a benign self-skip as a failed attempt (wrongful-quarantine class), with the `first_open_linked_pr` conflation documented (#4452).
+- **Test-harness process leaks** (#4773) — six suites gained process-group EXIT/INT/TERM traps via a shared `bg-proc-trap.sh` helper (the combined-trap-doesn't-halt bug fixed at 7 sites); `main` compile break from the #4426/#4386 semantic merge conflict (#4474); judge/doctor review branches routed through `pr-worktree.sh` with alias-branch cleanup (#4405); suite-wide env-mutation races serialized (#4385).
+- **Remote fleet ops under non-interactive SSH** — cargo PATH fallback in the update path (#4695); idle-shutdown workers get an update-time warning and a documented wake path (#4697).
+
+### Removed
+
+- **The `loom-tools` Python package** (epic #4081 Phase 4, #4557, ADR-0013) — the tokens/models/common families are deleted outright; every console script has a native `loom-daemon` successor. A fresh provision installs zero Python. The sole carve-out, the opt-in `loom-search`, is decided-for-retirement (#4608) and lands in a follow-up.
+
 ## [0.16.0] - 2026-07-29
 
 ### Summary
@@ -1035,8 +1212,3 @@ Existing v0.1.x installations can upgrade cleanly:
 - MCP servers for programmatic control (loom-terminals, loom-ui, loom-logs)
 - Installation script for target repositories
 - Quickstart templates for webapp, desktop, and API projects
-
-[Unreleased]: https://github.com/rjwalters/loom/compare/v0.2.3...HEAD
-[0.2.3]: https://github.com/rjwalters/loom/compare/v0.2.0...v0.2.3
-[0.2.0]: https://github.com/rjwalters/loom/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/rjwalters/loom/releases/tag/v0.1.0

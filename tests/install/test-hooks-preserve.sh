@@ -81,12 +81,25 @@ make_loom_root() {
     "$root/defaults/hooks/guard-destructive-generic.sh"
 }
 
-# Install the canonical Repo Skills guard (with the repo#29 marker) into a target
-# so canonical_guard_present() returns true for it.
+# Install the canonical Repo Skills guard (with BOTH the repo#29 version marker
+# and the worktree-write-confinement capability marker, #4894) into a target so
+# canonical_guard_present() returns true for it.
 install_canonical_repo_skills_guard() {
   local target="$1"
   mkdir -p "$target/.claude/skills/repo/hooks"
-  printf '%s\n' '#!/usr/bin/env bash' '# canonical, carries repo#29 fix' > \
+  printf '%s\n' '#!/usr/bin/env bash' '# canonical, carries repo#29 fix' \
+    '# implements worktree-write-confinement' > \
+    "$target/.claude/skills/repo/hooks/guard-destructive.sh"
+}
+
+# Install a canonical guard that carries ONLY the repo#29 version marker, NOT
+# the write-confinement capability marker (the Repo Skills 0.7.0 shape, #4894)
+# — canonical_guard_present() must return FALSE for it, so the vendored copy
+# stays installed as the dispatcher's fallback.
+install_capability_gap_canonical_guard() {
+  local target="$1"
+  mkdir -p "$target/.claude/skills/repo/hooks"
+  printf '%s\n' '#!/usr/bin/env bash' '# canonical, carries repo#29 fix only' > \
     "$target/.claude/skills/repo/hooks/guard-destructive.sh"
 }
 
@@ -204,6 +217,28 @@ assert_eq "vendored generic installed when canonical absent" \
   "yes" \
   "$([[ -f "$TARGET_DIR6/.loom/hooks/guard-destructive-generic.sh" ]] && echo yes || echo no)"
 rm -rf "$TARGET_DIR6"
+
+# ============================================================================
+# Test 7 (#4894): canonical guard has the repo#29 VERSION marker but NOT the
+# write-confinement CAPABILITY marker (the Repo Skills 0.7.0 shape) → the
+# vendored generic guard must STAY installed, since the runtime dispatcher
+# will fall back to it. Before #4894 this returned canonical_guard_present()
+# == true off the version marker alone, so the vendored fallback the
+# dispatcher actually needed was skipped/removed here — leaving zero
+# destructive-command coverage once the dispatcher (correctly) declined to
+# exec the capability-deficient canonical guard.
+# ============================================================================
+echo ""
+echo "=== canonical has version marker but not capability marker: vendored generic stays installed (#4894) ==="
+
+TARGET_DIR7="$(mktemp -d)"
+install_capability_gap_canonical_guard "$TARGET_DIR7"
+install_hooks_and_cli "$LOOM_ROOT_DIR" "$TARGET_DIR7"
+
+assert_eq "vendored generic STAYS installed when canonical lacks write-confinement marker" \
+  "yes" \
+  "$([[ -f "$TARGET_DIR7/.loom/hooks/guard-destructive-generic.sh" ]] && echo yes || echo no)"
+rm -rf "$TARGET_DIR7"
 
 # ============================================================================
 # Summary

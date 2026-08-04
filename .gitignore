@@ -1,5 +1,4 @@
 # Dependencies
-node_modules
 node_modules/
 target/
 
@@ -9,6 +8,11 @@ dist-ssr/
 
 # Test outputs
 coverage/
+
+# Tool caches (regenerable)
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
 
 # Env files
 .env
@@ -48,6 +52,7 @@ Thumbs.db
 .loom/interventions/
 .loom/worktrees/
 .loom/worktrees-local/
+.claude/worktrees/
 .loom/state.json
 .loom/mcp-command.json
 .loom/activity.db
@@ -70,6 +75,8 @@ Thumbs.db
 .loom/claude-config/
 .loom/tokens/
 .loom/accounts.env
+.loom/account-health.json
+.loom/account-health.lock
 .loom/CANARY
 .loom/*.log
 .loom/*.sock

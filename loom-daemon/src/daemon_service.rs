@@ -6,6 +6,7 @@
 //! accept loop that only returns on a startup failure.
 
 use loom_daemon::activity::ActivityDb;
+use loom_daemon::admission_brake;
 use loom_daemon::auto_update;
 use loom_daemon::autonomy_marker;
 use loom_daemon::claim_reconciliation;
@@ -16,10 +17,13 @@ use loom_daemon::event_bus::EventBus;
 use loom_daemon::health_monitor;
 use loom_daemon::host_breaker;
 use loom_daemon::idle_exit;
+use loom_daemon::install_self_check;
 use loom_daemon::ipc::IpcServer;
 use loom_daemon::main_health_gate;
 use loom_daemon::metrics_collector;
 use loom_daemon::observability;
+use loom_daemon::orphan_process_reaper;
+use loom_daemon::primary_checkout_reaper;
 use loom_daemon::quarantine_reconciliation;
 use loom_daemon::rate_limit_breaker;
 use loom_daemon::role_collision;
@@ -30,6 +34,7 @@ use loom_daemon::token_ranking_refresh;
 use loom_daemon::watch_registry;
 use loom_daemon::work_finder;
 use loom_daemon::workspace_pool::WorkspacePool;
+use loom_daemon::worktree_reaper;
 use loom_daemon::{extract_configured_terminal_ids, rotate_log_file};
 
 use anyhow::{anyhow, Result};
@@ -119,6 +124,12 @@ pub(crate) async fn run_daemon() -> Result<()> {
             // `status` connects to the running daemon over its Unix socket, so
             // it needs the async runtime (unlike the other sync subcommands).
             Commands::Status { json, pipeline } => handle_status_command(json, pipeline).await,
+            // `health` (#4761) needs the async runtime for the same reason
+            // `status` does — one IPC round-trip — plus a bounded forge fan-out
+            // for the queue-depth/throughput sections.
+            Commands::Health { since, json } => {
+                cli::health::handle_health_command(since, json).await
+            }
             // `quarantine` connects to the running daemon over its Unix socket
             // (the quarantine state is in-memory), so it needs the async runtime.
             Commands::Quarantine { action } => handle_quarantine_command(action).await,
@@ -132,6 +143,15 @@ pub(crate) async fn run_daemon() -> Result<()> {
                 depends_on,
                 force,
             } => handle_dispatch_command(issue, workspace, model, effort, depends_on, force).await,
+            // `cancel` connects to the running daemon over its Unix socket to
+            // terminate a sweep (Issue #4980) — the `dispatch` sibling, same
+            // socket, same reason it needs the async runtime.
+            Commands::Cancel {
+                sweep_id,
+                issue,
+                grace,
+                workspace,
+            } => cli::cancel::handle_cancel_command(sweep_id, issue, grace, workspace).await,
             // `watch` connects to the running daemon over its Unix socket to
             // register/list/remove durable watches (Issue #3971).
             Commands::Watch { action } => handle_watch_command(action).await,
@@ -893,6 +913,24 @@ pub(crate) async fn run_daemon() -> Result<()> {
             host_breaker_config.sustain_ticks,
             host_breaker_config.cooldown_secs,
         );
+        // Saturation admission brake (#4903): same startup-resolve +
+        // process-global-registration shape as the breaker above, and registered
+        // in the same place for the same reason — the work-finder loop is its
+        // sole sampler, so a daemon with no work-finder never engages it. The
+        // brake is the *point-in-time* half of the load-aware pair: it holds NEW
+        // admissions while the host is already saturated and releases the moment
+        // it recovers, where the breaker latches on sustained distress and holds
+        // through a cool-down. Neither ever touches a running sweep.
+        let admission_brake_config = admission_brake::resolve_config_for(&sweep_workspace);
+        admission_brake::register_global(std::sync::Arc::new(
+            admission_brake::SharedAdmissionBrake::new(admission_brake_config),
+        ));
+        log::info!(
+            "admission_brake: enabled={} (load_per_core_hold={:.2}; holds NEW sweep admissions \
+             only — in-flight sweeps are never preempted)",
+            admission_brake_config.enabled,
+            admission_brake_config.load_per_core_threshold,
+        );
         log::info!(
             "work_finder: enabled (multi-workspace, interval={}s, configured_max={configured_max}, \
              per_token_concurrency={per_token_concurrency}, \
@@ -1009,6 +1047,103 @@ pub(crate) async fn run_daemon() -> Result<()> {
             log::debug!(
                 "token_ranking_refresh: disabled (set LOOM_TOKEN_RANKING_REFRESH=0 or \
              autonomous.tokenRankingRefresh.enabled=false to opt out)"
+            );
+            None
+        };
+
+    // Periodic merged-PR worktree reaper (Issue #4876). Before this loop the
+    // ONLY trigger for "auto-removed when their PR merges" (CLAUDE.md's stated
+    // contract) was `merge-pr.sh`'s synchronous `_remove_loom_worktree()` — so a
+    // PR merged on a different HOST, in a different CHECKOUT, through the forge
+    // UI/API, or while the daemon was down left its worktree behind forever.
+    // Across a three-host fleet that leaked 44 worktrees (81% disk) on one
+    // worker and 35 on the primary host. This loop makes every host reap its own
+    // worktrees from forge state on a cadence, independent of who merged.
+    //
+    // Multi-workspace like the health gate / ranking refresh: it walks
+    // `effective_roots()` each tick, so cleanup is NOT limited to the daemon's
+    // attached workspace (a daemon attached to `~/GitHub/anvil` still reaps
+    // `~/GitHub/loom` when that repo is registered).
+    //
+    // Default-ON (like the ranking refresh, unlike the work finder / gate): it
+    // restores an already-documented behavior, and its removal decision is
+    // `worktree_ops::clean::classify_worktree` under `--safe, !--force` PLUS a
+    // `.loom-managed` sentinel requirement the interactive CLI does not apply —
+    // i.e. a strict subset of what `loom-daemon clean --safe` would remove.
+    // Opt out with `LOOM_WORKTREE_REAPER=0` / `autonomous.worktreeReaper.enabled=false`.
+    //
+    // The same loop also carries the orphaned-PROCESS reaper (#5110): an agent's
+    // background process tree can outlive the agent, reparent to `systemd`, and
+    // keep working forever (one such driver held a worker at load 65 for 5h52m).
+    // Both passes answer the same question about the same worktrees — "does
+    // anything still own issue-N?" — so they share a tick. Each has its own
+    // enable knob, and either one being on is enough to start the loop.
+    //
+    // It also carries the primary-checkout reaper (#5268): a registered root's
+    // OWN `HEAD` can get parked on a dead branch (no PR ever opened, or a PR
+    // that closed without merging) and stay there forever — nothing else
+    // touches the primary checkout's branch. Same tick, same "each has its own
+    // enable knob, any one being on starts the loop" shape.
+    let worktree_reaper_config = worktree_reaper::read_worktree_reaper_config(&sweep_workspace);
+    let process_reaper_config = orphan_process_reaper::read_config(&sweep_workspace);
+    let primary_checkout_reaper_config = primary_checkout_reaper::read_config(&sweep_workspace);
+    let worktree_reaper_on = worktree_reaper::resolve_enabled(&worktree_reaper_config);
+    let process_reaper_on = orphan_process_reaper::resolve_enabled(&process_reaper_config);
+    let primary_checkout_reaper_on =
+        primary_checkout_reaper::resolve_enabled(&primary_checkout_reaper_config);
+    let _worktree_reaper_handle =
+        if worktree_reaper_on || process_reaper_on || primary_checkout_reaper_on {
+            let interval = worktree_reaper::resolve_interval(&worktree_reaper_config);
+            log::info!(
+                "worktree_reaper: enabled (multi-workspace, interval={}s, worktrees={}, \
+                 orphan_processes={}, primary_checkout={})",
+                interval.as_secs(),
+                worktree_reaper_on,
+                process_reaper_on,
+                primary_checkout_reaper_on
+            );
+            Some(worktree_reaper::spawn_multi_worktree_reaper_task(
+                sweep_workspace.clone(),
+                interval,
+            ))
+        } else {
+            log::debug!(
+                "worktree_reaper: disabled (set LOOM_WORKTREE_REAPER=0 or \
+                 autonomous.worktreeReaper.enabled=false to opt out; \
+                 LOOM_ORPHAN_PROCESS_REAPER=0 / autonomous.processReaper.enabled=false \
+                 for the orphaned-process pass; LOOM_PRIMARY_CHECKOUT_REAPER=0 / \
+                 autonomous.primaryCheckoutReaper.enabled=false for the primary-checkout pass)"
+            );
+            None
+        };
+
+    // Install/host invariant self-check (#5035): periodically verify the
+    // install/host invariants the daemon's own operation depends on — the MCP
+    // bundle loads, `.loom/runtimes/` is populated for the configured runtimes,
+    // and the token `.ranking` is fresh — repairing the mechanically-safe drift
+    // and filing one deduped issue per non-repairable condition. **Default-off**
+    // (FLAGS-OFF) and **report-only by default** even when enabled, so the check
+    // can be trusted before it is allowed to act. Same multi-workspace
+    // spawn_blocking shape as the reaper; the checks are filesystem reads and
+    // any repair is timeout-guarded, so a pass can never wedge dispatch.
+    let install_self_check_config = install_self_check::read_config(&sweep_workspace);
+    let _install_self_check_handle =
+        if install_self_check::resolve_enabled(&install_self_check_config) {
+            let interval = install_self_check::resolve_interval(&install_self_check_config);
+            let repair = install_self_check::resolve_repair(&install_self_check_config);
+            log::info!(
+                "install_self_check: enabled (multi-workspace, interval={}s, repair={})",
+                interval.as_secs(),
+                repair
+            );
+            Some(install_self_check::spawn_multi_install_self_check_task(
+                sweep_workspace.clone(),
+                interval,
+            ))
+        } else {
+            log::debug!(
+                "install_self_check: disabled (set LOOM_INSTALL_SELF_CHECK=1 or \
+                 autonomous.installSelfCheck.enabled=true to opt in)"
             );
             None
         };
@@ -1194,10 +1329,12 @@ pub(crate) async fn run_daemon() -> Result<()> {
     let _auto_update_handle = if auto_update::resolve_enabled(&auto_update_config) {
         let interval = auto_update::resolve_interval(&auto_update_config);
         let settle = auto_update::resolve_settle(&auto_update_config);
+        let defer_deadline = auto_update::resolve_defer_deadline(&auto_update_config);
         log::info!(
-            "auto_update: enabled (interval={}s, settle={}s)",
+            "auto_update: enabled (interval={}s, settle={}s, deferDeadline={}s)",
             interval.as_secs(),
-            settle.as_secs()
+            settle.as_secs(),
+            defer_deadline.as_secs()
         );
         let probe = auto_update::ScriptAutoUpdateProbe::new(
             workspace_pool.clone(),
@@ -1211,7 +1348,14 @@ pub(crate) async fn run_daemon() -> Result<()> {
             tokio::runtime::Handle::current(),
         );
         let status = std::sync::Arc::new(auto_update::AutoUpdateStatus::new(true));
-        Some(auto_update::spawn_auto_update_task(probe, trigger, status, interval, settle))
+        Some(auto_update::spawn_auto_update_task(
+            probe,
+            trigger,
+            status,
+            interval,
+            settle,
+            defer_deadline,
+        ))
     } else {
         log::debug!(
             "auto_update: disabled (set LOOM_AUTO_UPDATE=1 or autonomous.autoUpdate.enabled=true to opt in)"
@@ -1258,6 +1402,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
         sweep_workspace.clone(),
         &event_bus,
         std::time::Instant::now(),
+        workspace_pool.clone(),
     );
 
     // Start IPC server. `workspace_health_states` is threaded in so the

@@ -2416,16 +2416,27 @@ echo ""
 # scripts/version.sh is retained — /repo:release detects and honors it as its
 # first-priority version tool. These tests pin version.sh's list/check surface.
 
-# Test 62: ./scripts/version.sh list emits the expected 5 entries
-echo "Test 62: 'scripts/version.sh list' emits the 5 version-bearing files"
+# Test 62: ./scripts/version.sh list emits the expected version-bearing files
+#
+# The base set is the 5 always-present files. `.loom/install-metadata.json` is
+# a conditional 6th entry (#4842): it exists only on a dogfooded install (loom
+# installed on its own repo — which IS the case for this repo's own CI run),
+# and version.sh's `list` arm existence-checks it before emitting. Mirror that
+# same presence check here rather than hardcoding a fixed line count, so the
+# test passes both in this repo and in a non-dogfooded checkout.
+echo "Test 62: 'scripts/version.sh list' emits the version-bearing files"
 LIST_OUTPUT="$("$LOOM_ROOT/scripts/version.sh" list)"
 EXPECTED_LIST="package.json
 mcp-loom/package.json
 loom-daemon/Cargo.toml
 loom-api/Cargo.toml
 CLAUDE.md"
+if [[ -f "$LOOM_ROOT/.loom/install-metadata.json" ]]; then
+  EXPECTED_LIST="$EXPECTED_LIST
+.loom/install-metadata.json"
+fi
 if [[ "$LIST_OUTPUT" == "$EXPECTED_LIST" ]]; then
-  pass "'version.sh list' emits the 5 expected files"
+  pass "'version.sh list' emits the expected version-bearing files"
 else
   fail "'version.sh list' output diverged from expectation"
   echo "  Expected:"
@@ -2557,6 +2568,57 @@ CFG_EOF
     fi
   else
     fail "loom-daemon init failed against consumer repo with pre-existing config.json (#3598)"
+  fi
+fi
+echo ""
+
+
+# Test: reinstall preserves a pre-existing, user-added `.loom/config.json`
+# .gitignore rule (#5242). A fleet host that keeps host-local runtime state
+# (e.g. a `worktree.root` override) in `.loom/config.json` may deliberately
+# gitignore that single, narrowly-scoped file even though Loom's default
+# design commits it for team sharing. `update_gitignore`'s legacy migration
+# (which strips genuinely over-broad `.loom/*.json`-style patterns left by
+# very old installs) must not sweep up that narrow, intentional rule too —
+# it never added the rule itself, so it must not remove it either. This
+# exercises the REAL `loom-daemon init` gitignore reconciliation
+# (`loom-daemon::init::post_init::update_gitignore`), the same code path
+# `install.sh` and `resync-installed.sh update-gitignore` both call.
+echo "Test: reinstall preserves a pre-existing .loom/config.json gitignore rule (#5242)"
+DAEMON_BIN_5242="$LOOM_ROOT/target/release/loom-daemon"
+if [[ ! -x "$DAEMON_BIN_5242" ]]; then
+  warn "Skipping Test #5242 — loom-daemon release binary not built at $DAEMON_BIN_5242"
+else
+  GITIGNORE_CONFIG_REPO="$TEST_DIR/gitignore-config-json-test"
+  create_temp_repo "$GITIGNORE_CONFIG_REPO"
+
+  # Seed a documented, host-local divergence: the operator deliberately
+  # gitignores `.loom/config.json` (mirrors rjwalters/lean-genius#43683).
+  cat > "$GITIGNORE_CONFIG_REPO/.gitignore" <<'GI5242_EOF'
+node_modules/
+
+# Host-local divergence: worktree.root is per-machine, not team-shared.
+.loom/config.json
+GI5242_EOF
+
+  if "$DAEMON_BIN_5242" init --force --defaults "$LOOM_ROOT/defaults" "$GITIGNORE_CONFIG_REPO" >/dev/null 2>&1; then
+    GI_5242="$GITIGNORE_CONFIG_REPO/.gitignore"
+
+    if grep -qxF '.loom/config.json' "$GI_5242"; then
+      pass "pre-existing .loom/config.json ignore rule survived loom-daemon init (#5242)"
+    else
+      fail ".loom/config.json ignore rule was stripped by loom-daemon init (#5242 regression)"
+    fi
+
+    # Re-running (as a resync/reinstall would) must not strip it either.
+    "$DAEMON_BIN_5242" init --force --defaults "$LOOM_ROOT/defaults" "$GITIGNORE_CONFIG_REPO" >/dev/null 2>&1 || true
+    if grep -qxF '.loom/config.json' "$GI_5242"; then
+      pass ".loom/config.json ignore rule survives a second loom-daemon init (#5242)"
+    else
+      fail ".loom/config.json ignore rule was stripped on a second run (#5242 regression)"
+    fi
+  else
+    fail "loom-daemon init failed against consumer repo with a pre-existing .gitignore (#5242)"
   fi
 fi
 echo ""
@@ -3310,6 +3372,31 @@ if [[ -f "$SYNC_LABELS_TEST" ]]; then
   fi
 else
   fail "test-sync-labels-repo-flag.sh not found at $SYNC_LABELS_TEST"
+fi
+echo ""
+
+# ==========================================================================
+# scripts/install/sync-labels.sh --prune-defaults / --force (#5066)
+# ==========================================================================
+# Its own unit suite lives at defaults/scripts/tests/test-install-sync-labels.sh
+# (additive-by-default with no flags, --prune-defaults restoring the old
+# unconditional deletion, and the in-use-label warn/refuse-without-force
+# guard) — the source-only counterpart of the --repo/--dry-run suite above.
+echo "Test: scripts/install/sync-labels.sh --prune-defaults suite (test-install-sync-labels.sh)"
+INSTALL_SYNC_LABELS_TEST="$DEFAULTS_DIR/scripts/tests/test-install-sync-labels.sh"
+if [[ -f "$INSTALL_SYNC_LABELS_TEST" ]]; then
+  set +e
+  INSTALL_SYNC_LABELS_TEST_OUT=$(bash "$INSTALL_SYNC_LABELS_TEST" 2>&1)
+  INSTALL_SYNC_LABELS_TEST_RC=$?
+  set -e
+  if [[ $INSTALL_SYNC_LABELS_TEST_RC -eq 0 ]]; then
+    pass "test-install-sync-labels.sh: all cases passed"
+  else
+    fail "test-install-sync-labels.sh failed (rc=$INSTALL_SYNC_LABELS_TEST_RC)"
+    echo "$INSTALL_SYNC_LABELS_TEST_OUT" | tail -20
+  fi
+else
+  fail "test-install-sync-labels.sh not found at $INSTALL_SYNC_LABELS_TEST"
 fi
 echo ""
 

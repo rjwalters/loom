@@ -1265,8 +1265,27 @@ pub fn claude_config_validate(agent_name: &str, repo_root: &Path) -> bool {
 /// Mark `project_dir` as trusted in the resolved Claude Code state file, so
 /// a non-interactive spawn into it never stalls on the folder-trust modal.
 pub fn claude_config_trust(project_dir: &Path) {
-    let state_path = claude_config::default_state_file();
-    claude_config::ensure_project_trusted(&state_path, project_dir);
+    claude_config_trust_at(&claude_config_state_path(), project_dir);
+}
+
+/// Resolve the real Claude Code state file path (issue #5314) — a public
+/// wrapper over the private `claude_config::default_state_file`, so callers
+/// outside this module (e.g. `loom-daemon workspace add`) can resolve the
+/// same path [`claude_config_trust`] uses without duplicating the resolution
+/// order, and can pass it explicitly to [`claude_config_trust_at`] when they
+/// already need the path for other purposes.
+#[must_use]
+pub fn claude_config_state_path() -> PathBuf {
+    claude_config::default_state_file()
+}
+
+/// Mark `project_dir` trusted at an explicit `state_path` (issue #5314) — the
+/// test/CLI seam over [`claude_config_trust`], which always resolves the real
+/// `~/.claude.json` via [`claude_config_state_path`]. Lets a caller (workspace
+/// registration, or a unit test) point at a scratch state file instead of
+/// mutating the process-wide `$HOME`.
+pub fn claude_config_trust_at(state_path: &Path, project_dir: &Path) {
+    claude_config::ensure_project_trusted(state_path, project_dir);
 }
 
 pub struct TerminalManager {
@@ -1684,7 +1703,69 @@ impl TerminalManager {
                 log::warn!("Failed to restore terminals from tmux: {e}");
             }
         }
+
+        // Issue #4794: garbage-collect registry entries whose backing tmux
+        // session no longer exists. Without this, a terminal that was
+        // registered by a since-crashed daemon, or whose tmux session was
+        // reaped externally (e.g. the whole `loom` tmux socket losing its
+        // server), sticks around in `self.terminals` forever and is reported
+        // to every `list_terminals` caller (including the MCP `list_terminals`
+        // tool) as an "active" terminal indefinitely.
+        if !no_restore {
+            self.prune_dead_terminals();
+        }
+
         self.terminals.values().cloned().collect()
+    }
+
+    /// Remove registry entries whose `tmux_session` no longer has a live tmux
+    /// session backing it (Issue #4794).
+    ///
+    /// A single `tmux -L loom list-sessions` call is used to build the live-session
+    /// set rather than one `has-session` call per terminal, so this stays cheap
+    /// even with many registered terminals. Any failure to query tmux at all
+    /// (including "no server running", the exact symptom reported in #4794)
+    /// is treated as "zero live sessions" — conservatively correct, since a
+    /// terminal cannot be alive without a session to back it.
+    ///
+    /// Skipped when the registry is empty (nothing to prune) so this never
+    /// pays for a `tmux` invocation on the common empty-registry path.
+    fn prune_dead_terminals(&mut self) {
+        if self.terminals.is_empty() {
+            return;
+        }
+
+        let output = Command::new("tmux")
+            .args(["-L", "loom"])
+            .args(["list-sessions", "-F", "#{session_name}"])
+            .output();
+
+        let live_sessions: std::collections::HashSet<String> = match output {
+            Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(str::to_string)
+                .collect(),
+            // Any other outcome — nonzero exit (e.g. "no server running", the
+            // #4794 symptom), or the `tmux` command failing to spawn at all —
+            // means there are no live tmux sessions right now.
+            _ => std::collections::HashSet::new(),
+        };
+
+        let dead_ids: Vec<TerminalId> = self
+            .terminals
+            .iter()
+            .filter(|(_, info)| !live_sessions.contains(&info.tmux_session))
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        for id in dead_ids {
+            if let Some(info) = self.terminals.remove(&id) {
+                log::info!(
+                    "Pruning dead terminal registry entry '{id}': backing tmux session '{}' no longer exists",
+                    info.tmux_session
+                );
+            }
+        }
     }
 
     pub fn set_worktree_path(&mut self, id: &TerminalId, worktree_path: &str) -> Result<()> {
@@ -2481,6 +2562,74 @@ mod tests {
     fn test_terminal_manager_new_is_empty() {
         let tm = TerminalManager::new();
         assert!(tm.terminals.is_empty());
+    }
+
+    // ===== prune_dead_terminals tests (Issue #4794) =====
+    //
+    // A registry entry whose `tmux_session` has no live backing session (the
+    // session died, was reaped externally, or the whole `loom` tmux socket
+    // has no server at all) must not be reported forever by `list_terminals()`
+    // as "active" — see #4794's reported symptom (`ID: test / Restored: ...`
+    // surviving as the sole "active" terminal on a host with no `loom` tmux
+    // server running at all).
+
+    fn fake_terminal(id: &str, tmux_session: &str) -> TerminalInfo {
+        TerminalInfo {
+            id: id.to_string(),
+            name: format!("fake-{id}"),
+            tmux_session: tmux_session.to_string(),
+            working_dir: None,
+            created_at: chrono::Utc::now().timestamp(),
+            role: None,
+            worktree_path: None,
+            agent_pid: None,
+            agent_status: crate::types::AgentStatus::default(),
+            last_interval_run: None,
+        }
+    }
+
+    #[test]
+    fn test_list_terminals_prunes_entries_with_no_live_tmux_session() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("LOOM_NO_RESTORE");
+
+        let mut tm = TerminalManager::new();
+        // A session name that cannot possibly be a real, live tmux session.
+        let ghost_session = format!("loom-ghost-{}", uuid::Uuid::new_v4());
+        tm.terminals
+            .insert("ghost".to_string(), fake_terminal("ghost", &ghost_session));
+
+        let terminals = tm.list_terminals();
+
+        assert!(
+            terminals.iter().all(|t| t.id != "ghost"),
+            "a terminal whose tmux session does not exist must be pruned from list_terminals()"
+        );
+        assert!(
+            !tm.terminals.contains_key("ghost"),
+            "the dead entry must also be removed from the underlying registry, not just filtered on read"
+        );
+    }
+
+    #[test]
+    fn test_list_terminals_skips_pruning_under_loom_no_restore() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("LOOM_NO_RESTORE", "1");
+
+        let mut tm = TerminalManager::new();
+        let ghost_session = format!("loom-ghost-{}", uuid::Uuid::new_v4());
+        tm.terminals
+            .insert("ghost".to_string(), fake_terminal("ghost", &ghost_session));
+
+        let terminals = tm.list_terminals();
+
+        std::env::remove_var("LOOM_NO_RESTORE");
+
+        assert!(
+            terminals.iter().any(|t| t.id == "ghost"),
+            "LOOM_NO_RESTORE=1 must also suppress pruning, matching its existing \
+             'skip all tmux server interaction' contract used by tests"
+        );
     }
 
     // ===== worktree ownership-model guard tests (#3540) =====

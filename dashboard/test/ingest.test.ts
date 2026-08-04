@@ -1,7 +1,15 @@
 import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import worker from "../src/index";
-import { hostHealthEnvelope, revokeHost, seedHost, sweepStartedEnvelope } from "./testHelpers";
+import {
+  hostHealthEnvelope,
+  revokeHost,
+  seedHost,
+  sweepCompletedEnvelope,
+  sweepOutcomeEnvelope,
+  sweepPhaseEnvelope,
+  sweepStartedEnvelope,
+} from "./testHelpers";
 
 function ingestRequest(body: unknown, authHeader?: string): Request {
   const headers: Record<string, string> = { "content-type": "application/json" };
@@ -82,7 +90,7 @@ describe("POST /ingest — validation", () => {
     const batch = [sweepStartedEnvelope(), hostHealthEnvelope()];
     const response = await callWorker(ingestRequest(batch, "Bearer abc-ingest-key"));
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ accepted: 2 });
+    expect(await response.json()).toEqual({ accepted: 2, host_id: "host-abc" });
 
     const rows = await recordsForHost("host-abc");
     expect(rows).toHaveLength(2);
@@ -97,7 +105,7 @@ describe("POST /ingest — validation", () => {
   it("accepts an empty array batch as a no-op", async () => {
     const response = await callWorker(ingestRequest([], "Bearer abc-ingest-key"));
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ accepted: 0 });
+    expect(await response.json()).toEqual({ accepted: 0, host_id: "host-abc" });
   });
 
   it("rejects the WHOLE batch when any one envelope is missing schema_version", async () => {
@@ -123,6 +131,50 @@ describe("POST /ingest — validation", () => {
     const rows = await recordsForHost("host-abc");
     expect(rows).toHaveLength(1);
     expect(rows[0]?.schema_version).toBe(2);
+  });
+});
+
+describe("POST /ingest — bound host_id echo (issue #4830)", () => {
+  it("echoes the host_id the authenticated key is bound to", async () => {
+    const response = await callWorker(ingestRequest([sweepStartedEnvelope()], "Bearer abc-ingest-key"));
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ accepted: 1, host_id: "host-abc" });
+  });
+
+  it("echoes the KEY's host_id, not the one the envelope claims", async () => {
+    // The whole point of the echo: the exporter has to learn what its key is
+    // actually bound to, which is exactly the value that differs from what the
+    // daemon believes about itself when a wrong key file has been installed.
+    const envelope = sweepStartedEnvelope();
+    (envelope as Record<string, unknown>).host_id = "some-other-claimed-host";
+
+    const response = await callWorker(ingestRequest([envelope], "Bearer abc-ingest-key"));
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ accepted: 1, host_id: "host-abc" });
+  });
+
+  it("echoes each host's own binding when two keys are in play", async () => {
+    await seedHost(env.DB, "host-xyz", "xyz-ingest-key");
+
+    const abc = await callWorker(ingestRequest([sweepStartedEnvelope()], "Bearer abc-ingest-key"));
+    const xyz = await callWorker(
+      ingestRequest([sweepStartedEnvelope({ sweep_id: "sweep-xyz-0" })], "Bearer xyz-ingest-key"),
+    );
+
+    expect(await abc.json()).toEqual({ accepted: 1, host_id: "host-abc" });
+    expect(await xyz.json()).toEqual({ accepted: 1, host_id: "host-xyz" });
+  });
+
+  it("does not echo a host_id on a rejected request", async () => {
+    // A 401/400 must not become an identity oracle for an unauthenticated
+    // caller, and there is no authenticated identity to echo anyway.
+    const unauthorized = await callWorker(ingestRequest([sweepStartedEnvelope()], "Bearer not-a-real-key"));
+    expect(unauthorized.status).toBe(401);
+    expect(await unauthorized.json()).not.toHaveProperty("host_id");
+
+    const badBody = await callWorker(ingestRequest({ not: "an array" }, "Bearer abc-ingest-key"));
+    expect(badBody.status).toBe(400);
+    expect(await badBody.json()).not.toHaveProperty("host_id");
   });
 });
 
@@ -153,6 +205,70 @@ describe("POST /ingest — visibility fail-safe default", () => {
     expect(response.status).toBe(200);
     const rows = await recordsForHost("host-abc");
     expect(rows[0]?.visibility).toBe("public");
+  });
+});
+
+describe("POST /ingest — idempotent terminal records (Issue #5084)", () => {
+  it("re-ingesting the same sweep.completed record does not double-count it", async () => {
+    const envelope = sweepCompletedEnvelope();
+    const first = await callWorker(ingestRequest([envelope], "Bearer abc-ingest-key"));
+    expect(first.status).toBe(200);
+    expect(await first.json()).toEqual({ accepted: 1, host_id: "host-abc" });
+
+    // A backfill re-offer or a transport-retry resend of the EXACT same
+    // record — same kind, same sweep_id. Must still ack 2xx, not surface as
+    // a client error.
+    const second = await callWorker(ingestRequest([envelope], "Bearer abc-ingest-key"));
+    expect(second.status).toBe(200);
+
+    const rows = await recordsForHost("host-abc");
+    expect(rows.filter((r) => r.kind === "sweep.completed")).toHaveLength(1);
+  });
+
+  it("re-ingesting the same sweep.outcome record does not double-count it", async () => {
+    const envelope = sweepOutcomeEnvelope();
+    await callWorker(ingestRequest([envelope], "Bearer abc-ingest-key"));
+    await callWorker(ingestRequest([envelope], "Bearer abc-ingest-key"));
+
+    const rows = await recordsForHost("host-abc");
+    expect(rows.filter((r) => r.kind === "sweep.outcome")).toHaveLength(1);
+  });
+
+  it("a duplicate sweep.completed does not block the REST of a mixed batch from persisting", async () => {
+    const completed = sweepCompletedEnvelope();
+    await callWorker(ingestRequest([completed], "Bearer abc-ingest-key"));
+
+    // Re-send the same completed record alongside a genuinely new one —
+    // `INSERT OR IGNORE` is per-statement, so the duplicate is dropped and
+    // the new health record still lands in the same batch transaction.
+    const response = await callWorker(
+      ingestRequest([completed, hostHealthEnvelope()], "Bearer abc-ingest-key"),
+    );
+    expect(response.status).toBe(200);
+
+    const rows = await recordsForHost("host-abc");
+    expect(rows.filter((r) => r.kind === "sweep.completed")).toHaveLength(1);
+    expect(rows.filter((r) => r.kind === "host.health")).toHaveLength(1);
+  });
+
+  it("does NOT dedupe sweep.phase — a sweep legitimately emits many, one per lifecycle phase", async () => {
+    const builder = sweepPhaseEnvelope({ phase: "builder" });
+    const judge = sweepPhaseEnvelope({ phase: "judge", entered_at: "2026-07-30T12:20:00Z" });
+    await callWorker(ingestRequest([builder], "Bearer abc-ingest-key"));
+    await callWorker(ingestRequest([judge], "Bearer abc-ingest-key"));
+
+    const rows = await recordsForHost("host-abc");
+    expect(rows.filter((r) => r.kind === "sweep.phase")).toHaveLength(2);
+  });
+
+  it("does not dedupe two DIFFERENT sweeps' sweep.completed records", async () => {
+    const first = sweepCompletedEnvelope({ sweep_id: "sweep-issue-1-0", issue: 1 });
+    const secondSweep = sweepCompletedEnvelope({ sweep_id: "sweep-issue-2-0", issue: 2 });
+    await callWorker(ingestRequest([first], "Bearer abc-ingest-key"));
+    await callWorker(ingestRequest([secondSweep], "Bearer abc-ingest-key"));
+
+    const rows = await recordsForHost("host-abc");
+    expect(rows.filter((r) => r.kind === "sweep.completed")).toHaveLength(2);
   });
 });
 
@@ -249,6 +365,73 @@ describe("POST /admin/hosts — host provisioning", () => {
     );
     expect(response.status).toBe(409);
   });
+
+  // Issue #5082: a revoked host_id used to be reserved forever, so renaming or
+  // re-keying a retired host required hand-editing production D1.
+  it("re-provisions a revoked host_id, and the pre-revoke key stays dead", async () => {
+    await revokeHost(env.DB, "host-abc");
+
+    const response = await callWorker(
+      new Request("https://ingest.example/admin/hosts", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: "Bearer test-admin-token" },
+        body: JSON.stringify({ host_id: "host-abc" }),
+      }),
+    );
+    expect(response.status).toBe(201);
+    const { ingest_key: newKey } = (await response.json()) as { ingest_key: string };
+    expect(newKey).not.toBe("abc-ingest-key");
+
+    // The revoked credential must never be resurrected — only replaced.
+    const oldKeyResponse = await callWorker(ingestRequest([sweepStartedEnvelope()], "Bearer abc-ingest-key"));
+    expect(oldKeyResponse.status).toBe(401);
+
+    const newKeyResponse = await callWorker(
+      ingestRequest([sweepStartedEnvelope({ sweep_id: "sweep-reprovisioned" })], `Bearer ${newKey}`),
+    );
+    expect(newKeyResponse.status).toBe(200);
+    expect(await recordsForHost("host-abc")).toHaveLength(1);
+  });
+
+  it("re-provisions a revoked host_id in place, without deleting the row first", async () => {
+    const before = (await env.DB.prepare("SELECT key_hash FROM hosts WHERE host_id = 'host-abc'").first()) as {
+      key_hash: string;
+    };
+    await revokeHost(env.DB, "host-abc");
+
+    const response = await callWorker(
+      new Request("https://ingest.example/admin/hosts", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: "Bearer test-admin-token" },
+        body: JSON.stringify({ host_id: "host-abc" }),
+      }),
+    );
+    expect(response.status).toBe(201);
+
+    // Exactly one row, updated in place (upsert) rather than delete + insert:
+    // the key_hash is replaced and revoked_at is cleared.
+    const { results } = await env.DB.prepare("SELECT key_hash, revoked_at FROM hosts WHERE host_id = 'host-abc'").all();
+    expect(results).toHaveLength(1);
+    const row = results[0] as { key_hash: string; revoked_at: string | null };
+    expect(row.revoked_at).toBeNull();
+    expect(row.key_hash).not.toBe(before.key_hash);
+  });
+
+  it("honors an explicit key when re-provisioning a revoked host_id", async () => {
+    await revokeHost(env.DB, "host-abc");
+
+    const response = await callWorker(
+      new Request("https://ingest.example/admin/hosts", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: "Bearer test-admin-token" },
+        body: JSON.stringify({ host_id: "host-abc", key: "abc-rotated-key" }),
+      }),
+    );
+    expect(response.status).toBe(201);
+
+    const rotatedResponse = await callWorker(ingestRequest([sweepStartedEnvelope()], "Bearer abc-rotated-key"));
+    expect(rotatedResponse.status).toBe(200);
+  });
 });
 
 describe("POST /admin/hosts/:hostId/revoke", () => {
@@ -263,5 +446,37 @@ describe("POST /admin/hosts/:hostId/revoke", () => {
 
     const ingestResponse = await callWorker(ingestRequest([sweepStartedEnvelope()], "Bearer abc-ingest-key"));
     expect(ingestResponse.status).toBe(401);
+  });
+
+  // Issue #4957 AC: "fleet drain removes the host's live-state entries" —
+  // revoking a host is the dashboard's own retirement signal, so it must
+  // also clear that host's `FleetState` Durable Object entries rather than
+  // leaving its last-known health/tokens rendering as current indefinitely.
+  it("clears the host's FleetState Durable Object entries (health/tokens)", async () => {
+    await callWorker(ingestRequest([hostHealthEnvelope()], "Bearer abc-ingest-key"));
+
+    const beforeSnapshot = await callWorker(
+      new Request("https://ingest.example/admin/fleet-state", {
+        headers: { authorization: "Bearer test-admin-token" },
+      }),
+    );
+    const before = (await beforeSnapshot.json()) as { hosts: Record<string, unknown> };
+    expect(before.hosts).toHaveProperty("host-abc");
+
+    const revokeResponse = await callWorker(
+      new Request("https://ingest.example/admin/hosts/host-abc/revoke", {
+        method: "POST",
+        headers: { authorization: "Bearer test-admin-token" },
+      }),
+    );
+    expect(revokeResponse.status).toBe(200);
+
+    const afterSnapshot = await callWorker(
+      new Request("https://ingest.example/admin/fleet-state", {
+        headers: { authorization: "Bearer test-admin-token" },
+      }),
+    );
+    const after = (await afterSnapshot.json()) as { hosts: Record<string, unknown> };
+    expect(after.hosts).not.toHaveProperty("host-abc");
   });
 });

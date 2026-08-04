@@ -40,6 +40,15 @@ pub struct MonitorAccount {
     pub status: String,
     pub util_7d: Option<f64>,
     pub util_5h: Option<f64>,
+    /// When the account's 7d window resets (`accounts[].resets["7d"]` in
+    /// `ranking.json`), normalized to `%Y-%m-%dT%H:%M:%SZ`. `None` when the
+    /// monitor did not report one — never a fabricated instant (issue #4874).
+    pub reset_7d: Option<String>,
+    /// When the account's 5h window resets (`accounts[].resets["5h"]`), same
+    /// normalization. This is the release instant for a `rate_limited`
+    /// account, and the rollover the 5h utilization is racing for every other
+    /// status — see [`super::check::limit_reset`].
+    pub reset_5h: Option<String>,
 }
 
 /// Resolve the claude-monitor directory: `$LOOM_CLAUDE_MONITOR_DIR` (tilde
@@ -161,6 +170,16 @@ fn coerce_float(value: Option<&serde_json::Value>) -> Option<f64> {
     }
 }
 
+/// Normalize a monitor-reported reset instant to the canonical
+/// `%Y-%m-%dT%H:%M:%SZ` text the `.ranking` writer emits (issue #4874).
+/// Anything unparseable as a timestamp yields `None` — an account with no
+/// usable reset stays "unknown" rather than carrying junk downstream to the
+/// dashboard's countdown.
+fn coerce_reset(value: Option<&serde_json::Value>) -> Option<String> {
+    let raw = value?.as_str()?;
+    parse_iso8601(Some(raw)).map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+}
+
 fn order_key(a: &MonitorAccount) -> (i32, f64, f64) {
     (
         status_rank(&a.status),
@@ -208,6 +227,19 @@ pub fn build_monitor_accounts(
 
     let mut accounts: Vec<MonitorAccount> = Vec::new();
     let mut matched: Vec<String> = Vec::new();
+    // Index of `accounts` by Loom account name so a second `ranking.json` row
+    // that resolves to a name already pushed by an earlier iteration of this
+    // same loop updates that entry instead of appending a duplicate (issue
+    // #4873 — two rows for one account inflated `capacity.total_accounts`).
+    // This can happen when `load_index_email_map` legitimately carries two
+    // different emails for one Loom account (e.g. a stale row left behind by
+    // a re-auth/rotation) and `ranking.json` has a row for each. Merge rule,
+    // chosen deliberately: **the more severe status wins** (`status_rank`,
+    // higher = worse) — a scheduler must never treat an account as available
+    // when another record for the same name says it is rate_limited or
+    // exhausted; ties (equal severity) keep the earlier row.
+    let mut index_by_name: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
 
     if let Some(entries) = data.get("accounts").and_then(|a| a.as_array()) {
         for entry in entries {
@@ -230,13 +262,36 @@ pub fn build_monitor_accounts(
                 }
                 _ => (None, None),
             };
-            matched.push(name.clone());
-            accounts.push(MonitorAccount {
-                name,
+            // `accounts[].resets` is the sibling of `utilization` that
+            // claude-monitor already publishes (`{"5h": "...", "7d": "..."}`).
+            // Both windows are read: which one is *binding* depends on the
+            // status, and `check::limit_reset` makes that call at write time
+            // (issue #4874).
+            let (reset_7d, reset_5h) = match entry.get("resets") {
+                Some(serde_json::Value::Object(resets)) => {
+                    (coerce_reset(resets.get("7d")), coerce_reset(resets.get("5h")))
+                }
+                _ => (None, None),
+            };
+            let candidate = MonitorAccount {
+                name: name.clone(),
                 status,
                 util_7d,
                 util_5h,
-            });
+                reset_7d,
+                reset_5h,
+            };
+            if let Some(&idx) = index_by_name.get(&name) {
+                if status_rank(&candidate.status) > status_rank(&accounts[idx].status) {
+                    accounts[idx] = candidate;
+                }
+                // else: an earlier, equal-or-more-severe row already won —
+                // drop this duplicate.
+            } else {
+                index_by_name.insert(name.clone(), accounts.len());
+                matched.push(name);
+                accounts.push(candidate);
+            }
         }
     }
 
@@ -248,6 +303,12 @@ pub fn build_monitor_accounts(
     // dispatch-invisible). Their unknown utilization sorts them after
     // known-utilization `available` accounts via `UTIL_SENTINEL`, but they
     // still rank ahead of `rate_limited`/`exhausted` accounts.
+    //
+    // `matched` is keyed by Loom account **name**, not email, so this is
+    // already dedup-safe against `load_index_email_map` legitimately holding
+    // two different emails for one name (issue #4873): once the first loop
+    // above matches *either* email to a `ranking.json` row for that name, the
+    // name is in `matched` and neither email's fallback entry here fires.
     for (_, name) in &email_to_name {
         if !matched.contains(name) {
             matched.push(name.clone());
@@ -256,6 +317,8 @@ pub fn build_monitor_accounts(
                 status: "available".to_string(),
                 util_7d: None,
                 util_5h: None,
+                reset_7d: None,
+                reset_5h: None,
             });
         }
     }
@@ -272,10 +335,12 @@ pub fn build_monitor_accounts(
     Some(accounts)
 }
 
-/// Serialize ordered accounts to the selector's `name|status|5h_util` format
-/// (trailing newline; empty -> empty string). The 5h utilization is an optional
-/// third field, emitted when known (issue #4195); byte-identical with the probe
-/// writer (`check::ranking_line`). Mirrors `monitor.format_ranking_lines`.
+/// Serialize ordered accounts to the selector's
+/// `name|status|5h_util|limit_reset` format (trailing newline; empty -> empty
+/// string). The 5h utilization (issue #4195) and the binding-window reset
+/// (issue #4874) are optional trailing fields, emitted when known;
+/// byte-identical with the probe writer (`check::ranking_line`), including the
+/// [`super::check::limit_reset`] choice of *which* window to report.
 #[must_use]
 pub fn format_ranking_lines(accounts: &[MonitorAccount]) -> String {
     if accounts.is_empty() {
@@ -283,7 +348,12 @@ pub fn format_ranking_lines(accounts: &[MonitorAccount]) -> String {
     }
     let mut out = String::new();
     for a in accounts {
-        out.push_str(&super::check::ranking_line(&a.name, &a.status, a.util_5h));
+        out.push_str(&super::check::ranking_line(
+            &a.name,
+            &a.status,
+            a.util_5h,
+            super::check::limit_reset(&a.status, a.reset_5h.as_deref(), a.reset_7d.as_deref()),
+        ));
         out.push('\n');
     }
     out
@@ -340,7 +410,11 @@ pub fn run_monitor_check(
             status: a.status.clone(),
             s5h_utilization: a.util_5h,
             s7d_utilization: a.util_7d,
-            s7d_reset: None,
+            // Issue #4874: the monitor path used to hardcode `None` for both
+            // resets, so the CLI's reset column was empty on every
+            // monitor-sourced run even though `ranking.json` carries them.
+            s7d_reset: a.reset_7d.clone(),
+            s5h_reset: a.reset_5h.clone(),
             error: None,
         })
         .collect();
@@ -361,6 +435,7 @@ pub fn run_monitor_check(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::fs;
 
     fn fresh_now() -> DateTime<Utc> {
@@ -466,6 +541,87 @@ mod tests {
     }
 
     #[test]
+    fn build_accounts_dedupes_two_ranking_rows_for_one_name() {
+        // Regression test for issue #4873: `index.json` carries two different
+        // emails for the same Loom account (a stale row left behind by a
+        // re-auth/rotation), and `ranking.json` has a row for each. Only one
+        // `MonitorAccount` must survive for that name — and the merge picks
+        // the more severe status (`exhausted` beats `available`).
+        let tmp = tempfile::tempdir().unwrap();
+        let tokens_dir = tmp.path().join("tokens");
+        let monitor_dir = tmp.path().join("monitor");
+        write_index(
+            &tokens_dir,
+            &[
+                ("acct-a", "a-old@example.com"),
+                ("acct-a", "a-new@example.com"),
+                ("acct-b", "b@example.com"),
+            ],
+        );
+        let now = fresh_now();
+        write_ranking_json(
+            &monitor_dir,
+            &iso(now),
+            serde_json::json!([
+                {"email": "a-old@example.com", "status": "available", "utilization": {"7d": 0.10, "5h": 0.10}},
+                {"email": "a-new@example.com", "status": "exhausted", "utilization": {"7d": 0.99, "5h": 0.99}},
+                {"email": "b@example.com", "status": "available", "utilization": {"7d": 0.20, "5h": 0.20}},
+            ]),
+        );
+
+        let accounts = build_monitor_accounts(&tokens_dir, Some(&monitor_dir), Some(now)).unwrap();
+        let matches: Vec<&MonitorAccount> =
+            accounts.iter().filter(|a| a.name == "acct-a").collect();
+        assert_eq!(matches.len(), 1, "exactly one row must survive for a duplicated name");
+        assert_eq!(matches[0].status, "exhausted", "the more severe status wins the merge");
+        assert_eq!(accounts.len(), 2, "acct-a (deduped) + acct-b, never 3");
+    }
+
+    #[test]
+    fn build_accounts_dedupes_ranking_row_plus_unmentioned_fallback() {
+        // Regression test for issue #4873 (the second observed shape): one
+        // email for a name is matched by a `ranking.json` row, while a
+        // second, different email for the *same* name is absent from
+        // `ranking.json` and would otherwise fall through to the
+        // "unmentioned manifest account" path (issue #4645). The name-keyed
+        // `matched` guard must suppress the fallback duplicate.
+        let tmp = tempfile::tempdir().unwrap();
+        let tokens_dir = tmp.path().join("tokens");
+        let monitor_dir = tmp.path().join("monitor");
+        write_index(
+            &tokens_dir,
+            &[
+                ("acct-a", "a-matched@example.com"),
+                ("acct-a", "a-unmentioned@example.com"),
+                ("acct-z", "z@example.com"),
+            ],
+        );
+        let now = fresh_now();
+        write_ranking_json(
+            &monitor_dir,
+            &iso(now),
+            serde_json::json!([
+                {"email": "a-matched@example.com", "status": "rate_limited", "utilization": {"7d": 0.5, "5h": 0.5}},
+            ]),
+        );
+
+        let accounts = build_monitor_accounts(&tokens_dir, Some(&monitor_dir), Some(now)).unwrap();
+        let matches: Vec<&MonitorAccount> =
+            accounts.iter().filter(|a| a.name == "acct-a").collect();
+        assert_eq!(matches.len(), 1, "exactly one row must survive for acct-a");
+        assert_eq!(
+            matches[0].status, "rate_limited",
+            "the matched ranking.json row wins, not the fallback"
+        );
+        // acct-z is genuinely absent from ranking.json -> still gets the
+        // unmentioned-manifest fallback (issue #4645 preserved). It sorts
+        // ahead of acct-a here (available < rate_limited in status_rank).
+        assert_eq!(accounts.first().unwrap().name, "acct-z");
+        assert_eq!(accounts.first().unwrap().status, "available");
+        assert_eq!(accounts.len(), 2, "acct-a (deduped) + acct-z, never 3");
+    }
+
+    #[test]
     fn stale_ranking_json_returns_none() {
         let tmp = tempfile::tempdir().unwrap();
         let tokens_dir = tmp.path().join("tokens");
@@ -521,6 +677,8 @@ mod tests {
             status: String::new(),
             util_7d: None,
             util_5h: None,
+            reset_7d: None,
+            reset_5h: None,
         }];
         assert_eq!(format_ranking_lines(&accounts), "acct-z|\n");
     }
@@ -535,18 +693,79 @@ mod tests {
                 status: "available".into(),
                 util_7d: Some(0.20),
                 util_5h: Some(0.90),
+                reset_7d: None,
+                reset_5h: None,
             },
             MonitorAccount {
                 name: "b".into(),
                 status: "available".into(),
                 util_7d: Some(0.10),
                 util_5h: None,
+                reset_7d: None,
+                reset_5h: None,
             },
         ];
         assert_eq!(format_ranking_lines(&accounts), "a|available|0.90\nb|available\n");
     }
 
     #[test]
+    fn format_ranking_lines_emits_the_binding_window_reset_fourth_field() {
+        // Issue #4874: the monitor backend now carries a reset instant it reads
+        // from `ranking.json` into the `.ranking` file's fourth field,
+        // byte-identically with the probe writer — and it writes the reset of
+        // whichever window is *binding*, not always the 7d one.
+        let exhausted = vec![MonitorAccount {
+            name: "a".into(),
+            status: "exhausted".into(),
+            util_7d: Some(1.0),
+            util_5h: Some(0.0),
+            reset_7d: Some("2026-08-02T03:00:00Z".into()),
+            reset_5h: Some("2026-08-01T05:20:00Z".into()),
+        }];
+        assert_eq!(
+            format_ranking_lines(&exhausted),
+            "a|exhausted|0.00|2026-08-02T03:00:00Z\n",
+            "an exhausted account is held by the 7d window"
+        );
+
+        // The live-host case that made "always write the 7d reset" wrong:
+        // `r.j.walters@gmail.com` was `rate_limited` with a 5h reset ~1.6h out
+        // and a 7d reset SIX DAYS out. Counting down to the 7d one would have
+        // told the operator the fleet was stalled until Saturday.
+        let rate_limited = vec![MonitorAccount {
+            name: "b".into(),
+            status: "rate_limited".into(),
+            util_7d: Some(0.60),
+            util_5h: Some(1.0),
+            reset_7d: Some("2026-08-07T01:00:00Z".into()),
+            reset_5h: Some("2026-08-01T07:00:00Z".into()),
+        }];
+        assert_eq!(
+            format_ranking_lines(&rate_limited),
+            "b|rate_limited|1.00|2026-08-01T07:00:00Z\n",
+            "a rate_limited account is held by the 5h window, not the 7d one"
+        );
+
+        // A healthy account reports the rollover its 5h utilization — the
+        // `usage_fraction` the dashboard charts — is actually racing.
+        let available = vec![MonitorAccount {
+            name: "c".into(),
+            status: "available".into(),
+            util_7d: Some(0.30),
+            util_5h: Some(0.12),
+            reset_7d: Some("2026-08-04T23:00:00Z".into()),
+            reset_5h: Some("2026-08-01T06:50:00Z".into()),
+        }];
+        assert_eq!(format_ranking_lines(&available), "c|available|0.12|2026-08-01T06:50:00Z\n");
+    }
+
+    // Serialized against its sibling below: both mutate the process-wide
+    // `CLAUDE_MONITOR_DIR_VAR` env var without restoring a prior value, so
+    // two non-serial instances can race and one can observe the other's
+    // `monitor_dir` override (#5133, same class as
+    // `observability::backfill`'s env-seam leak).
+    #[test]
+    #[serial]
     fn run_monitor_check_writes_available_for_unmentioned_manifest_account() {
         // Regression test for issue #4645: a manifest account the monitor DB
         // never mentions (e.g. freshly bootstrapped/never-used) must serialize
@@ -596,5 +815,126 @@ mod tests {
         assert_eq!(coerce_float(Some(&serde_json::json!(true))), None);
         assert_eq!(coerce_float(Some(&serde_json::json!("bad"))), None);
         assert_eq!(coerce_float(None), None);
+    }
+
+    #[test]
+    fn coerce_reset_variants() {
+        // Normalized to the canonical `.ranking` instant format; anything not
+        // a parseable timestamp is "unknown", never carried through as junk.
+        assert_eq!(
+            coerce_reset(Some(&serde_json::json!("2026-08-02T03:00:00Z"))),
+            Some("2026-08-02T03:00:00Z".to_string())
+        );
+        // An offset instant is normalized to UTC `Z`.
+        assert_eq!(
+            coerce_reset(Some(&serde_json::json!("2026-08-01T23:00:00-04:00"))),
+            Some("2026-08-02T03:00:00Z".to_string())
+        );
+        assert_eq!(coerce_reset(Some(&serde_json::json!("not-a-date"))), None);
+        assert_eq!(coerce_reset(Some(&serde_json::json!(""))), None);
+        assert_eq!(coerce_reset(Some(&serde_json::json!(1_754_103_600))), None);
+        assert_eq!(coerce_reset(None), None);
+    }
+
+    #[test]
+    fn build_monitor_accounts_surfaces_both_resets_when_present() {
+        // Fixture is a verbatim reduction of this host's real
+        // `~/.claude-monitor/ranking.json` (issue #4874): `resets` is a sibling
+        // of `utilization`, keyed by window, and both windows are reported.
+        let tmp = tempfile::tempdir().unwrap();
+        let tokens_dir = tmp.path().join("tokens");
+        let monitor_dir = tmp.path().join("monitor");
+        write_index(&tokens_dir, &[("acct-a", "a@example.com"), ("acct-b", "b@example.com")]);
+        let now = fresh_now();
+        write_ranking_json(
+            &monitor_dir,
+            &iso(now),
+            serde_json::json!([
+                {
+                    "email": "a@example.com",
+                    "status": "exhausted",
+                    "utilization": {"5h": 0.0, "7d": 1.0},
+                    "resets": {"5h": "2026-08-01T05:20:00Z", "7d": "2026-08-02T03:00:00Z"},
+                },
+                // No `resets` at all — must stay `None`, not inherit a sibling's.
+                {"email": "b@example.com", "status": "available", "utilization": {"7d": 0.30}},
+            ]),
+        );
+        let accounts =
+            build_monitor_accounts(&tokens_dir, Some(&monitor_dir), Some(now)).expect("fresh");
+
+        let a = accounts.iter().find(|a| a.name == "acct-a").unwrap();
+        assert_eq!(
+            a.reset_7d.as_deref(),
+            Some("2026-08-02T03:00:00Z"),
+            "the 7d reset must not pick up the 5h one"
+        );
+        assert_eq!(
+            a.reset_5h.as_deref(),
+            Some("2026-08-01T05:20:00Z"),
+            "the 5h reset is read too — it is the release instant for a rate_limited account"
+        );
+        let b = accounts.iter().find(|a| a.name == "acct-b").unwrap();
+        assert_eq!(b.reset_7d, None, "an account with no resets block stays unknown");
+        assert_eq!(b.reset_5h, None);
+    }
+
+    // Serialized against its sibling above for the same reason.
+    #[test]
+    #[serial]
+    fn run_monitor_check_reports_and_writes_the_binding_reset() {
+        // End-to-end for the monitor backend (issue #4874): the CLI table
+        // (`ProbeReport`) and the written `.ranking` must BOTH carry the reset,
+        // and both must name the *binding* window. Before this,
+        // `run_monitor_check` hardcoded `s7d_reset: None`, so the reset column
+        // was empty on every monitor-sourced run even though `ranking.json` had
+        // the instants all along.
+        let tmp = tempfile::tempdir().unwrap();
+        let tokens_dir = tmp.path().join("tokens");
+        let monitor_dir = tmp.path().join("monitor");
+        write_index(&tokens_dir, &[("acct-a", "a@example.com"), ("acct-b", "b@example.com")]);
+        let now = fresh_now();
+        write_ranking_json(
+            &monitor_dir,
+            &iso(now),
+            serde_json::json!([
+                {
+                    "email": "a@example.com",
+                    "status": "exhausted",
+                    "utilization": {"5h": 0.0, "7d": 1.0},
+                    "resets": {"5h": "2026-08-01T05:20:00Z", "7d": "2026-08-02T03:00:00Z"},
+                },
+                {
+                    "email": "b@example.com",
+                    "status": "rate_limited",
+                    "utilization": {"5h": 1.0, "7d": 0.60},
+                    "resets": {"5h": "2026-08-01T07:00:00Z", "7d": "2026-08-07T01:00:00Z"},
+                },
+            ]),
+        );
+        std::env::set_var(CLAUDE_MONITOR_DIR_VAR, &monitor_dir);
+        let report = run_monitor_check(&tokens_dir, true, || "2026-01-01T00:00:00Z".to_string());
+        std::env::remove_var(CLAUDE_MONITOR_DIR_VAR);
+
+        let report = report.unwrap();
+        let a = report.accounts.iter().find(|a| a.name == "acct-a").unwrap();
+        assert_eq!(a.s7d_reset.as_deref(), Some("2026-08-02T03:00:00Z"));
+        assert_eq!(a.limit_reset(), Some("2026-08-02T03:00:00Z"));
+        let b = report.accounts.iter().find(|a| a.name == "acct-b").unwrap();
+        assert_eq!(
+            b.limit_reset(),
+            Some("2026-08-01T07:00:00Z"),
+            "rate_limited returns at the 5h boundary, not six days out at the 7d one"
+        );
+
+        let ranking = fs::read_to_string(tokens_dir.join(".ranking")).unwrap();
+        assert!(
+            ranking.contains("acct-a|exhausted|0.00|2026-08-02T03:00:00Z\n"),
+            "unexpected .ranking body: {ranking:?}"
+        );
+        assert!(
+            ranking.contains("acct-b|rate_limited|1.00|2026-08-01T07:00:00Z\n"),
+            "unexpected .ranking body: {ranking:?}"
+        );
     }
 }

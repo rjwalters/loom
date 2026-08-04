@@ -214,6 +214,294 @@ pub fn resolve_model_alias_from_config(config: &serde_json::Value, model: &str) 
     }
 }
 
+// ----------------------------------------------------------------------------
+// Model/runtime family classification (#5028, follow-up to #5001 AC2/AC3)
+// ----------------------------------------------------------------------------
+//
+// A narrow, fail-open classifier — deliberately NOT the epic #4167 Phase 4
+// tier→ID table. It answers exactly one question: "is this model name
+// unambiguously the WRONG provider family for this runtime?" so a launch that
+// is already guaranteed to fail on the wire (a Claude-shaped model forwarded
+// to the Codex adapter, or vice versa) can be refused before a spawn instead
+// of discovered via an HTTP 400 deep inside a `claude`/`codex` session.
+//
+// Both sides must be confidently *known* to report a mismatch — an unknown
+// model name or an unrecognized runtime (aider, a tier-3/custom adapter) never
+// refuses a launch. This makes the classifier safe to run unconditionally on
+// every role tick: it can only ever catch a launch that was doomed anyway.
+
+/// The coarse provider family a model name belongs to, for the sole purpose of
+/// [`model_runtime_mismatch`]. Not a general model taxonomy — see the module
+/// note above.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelFamily {
+    /// Anthropic Claude models/aliases (`opus`, `opusplan`, `sonnet`, `haiku`,
+    /// `fable`, or any `claude*`-prefixed pinned ID).
+    Claude,
+    /// OpenAI / Codex models (`gpt*`, `o1*`, `o3*`, `o4*`, `codex*`).
+    OpenAi,
+}
+
+/// Classify a model name/alias into its [`ModelFamily`], stripping any
+/// `@effort` suffix first (`opus@xhigh` classifies identically to `opus`).
+/// Fail-open: returns `None` for anything not unambiguously recognized —
+/// a pinned third-party ID, a future alias, or an empty string are never
+/// misclassified into a false mismatch.
+#[must_use]
+pub fn model_family(model: &str) -> Option<ModelFamily> {
+    let base = model.split_once('@').map_or(model, |(base, _)| base);
+    let key = base.trim().to_ascii_lowercase();
+    if key.is_empty() {
+        return None;
+    }
+    if key.starts_with("claude")
+        || matches!(key.as_str(), "opus" | "opusplan" | "sonnet" | "haiku" | "fable")
+    {
+        return Some(ModelFamily::Claude);
+    }
+    if key.starts_with("gpt")
+        || key.starts_with("o1")
+        || key.starts_with("o3")
+        || key.starts_with("o4")
+        || key.starts_with("codex")
+    {
+        return Some(ModelFamily::OpenAi);
+    }
+    None
+}
+
+/// Classify a runtime name into the [`ModelFamily`] it accepts. Fail-open:
+/// only `claude` and `codex` (the two runtimes with an actual model-family
+/// constraint) resolve to `Some`; `aider`, a tier-3/custom runtime, or an
+/// unrecognized name always return `None` — such a runtime is never refused
+/// by this check.
+#[must_use]
+pub fn runtime_model_family(runtime: &str) -> Option<ModelFamily> {
+    match runtime.trim().to_ascii_lowercase().as_str() {
+        "claude" => Some(ModelFamily::Claude),
+        "codex" => Some(ModelFamily::OpenAi),
+        _ => None,
+    }
+}
+
+/// Issue #5028: `Some(<reason>)` only when `runtime` and `model` resolve to
+/// **known, differing** [`ModelFamily`] values — a launch guaranteed to 400 on
+/// the wire (a Claude-shaped model forwarded to the Codex adapter, or a
+/// Codex-shaped model forwarded to the Claude CLI). `None` in every other
+/// case, including either side being unrecognized — this can only ever refuse
+/// a launch that was already doomed, never a launch that might have worked.
+#[must_use]
+pub fn model_runtime_mismatch(runtime: &str, model: &str) -> Option<String> {
+    let runtime_family = runtime_model_family(runtime)?;
+    let model_family = model_family(model)?;
+    if runtime_family == model_family {
+        return None;
+    }
+    let (runtime_label, model_label) = match (runtime_family, model_family) {
+        (ModelFamily::Claude, ModelFamily::OpenAi) => ("Claude", "an OpenAI/Codex"),
+        (ModelFamily::OpenAi, ModelFamily::Claude) => ("Codex", "a Claude"),
+        // Unreachable — the `if` above already returned `None` for equal
+        // families, so only the two cross-family combinations above remain.
+        _ => ("this runtime's", "a mismatched"),
+    };
+    Some(format!(
+        "runtime {runtime:?} only accepts {runtime_label} models, but the resolved model \
+         {model:?} is {model_label} model"
+    ))
+}
+
+// ----------------------------------------------------------------------------
+// Model-cost A/B experiment (#3725) — daemon-native arm assignment (#4809)
+// ----------------------------------------------------------------------------
+
+/// Outcome of [`resolve_autonomous_dispatch_model`] — the daemon-native
+/// replacement for the `sweep.md` "Model-cost experiment mode" prose
+/// instrumentation (issue #4809). That prose never executes in a headless
+/// `-p` child (the LLM-authored per-phase `sweep-experiment.sh record`/banner
+/// calls simply do not run), and even a perfectly-instrumented child was
+/// structurally defeated by the #4501 default-model pin's tier-1 precedence
+/// over a "forced" arm that only ever existed in prose. This resolves the
+/// experiment's arm assignment as PART of the daemon's own dispatch-model
+/// precedence chain, so a resolved `experiment` mode genuinely changes what
+/// model is dispatched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExperimentDispatchModel {
+    /// The model to dispatch the child with.
+    pub model: String,
+    /// The effective experiment mode for this dispatch, AFTER the CANARY
+    /// guardrail (`"off"` | `"observe"` | `"experiment"`).
+    pub mode: String,
+    /// The deterministic arm assigned to this issue — `Some("A" | "B")` only
+    /// when `mode == "experiment"`. `observe`/`off` dispatches do not force a
+    /// model, so they carry no arm at DISPATCH time; the outcome-recording
+    /// path (`sweep_registry::outcome_journal`) still attributes an arm to
+    /// such a record after the fact via
+    /// [`crate::script_helpers::sweep_experiment::infer_arm_from_model`].
+    pub arm: Option<&'static str>,
+    /// A short label for the dispatch log line naming why `model` won:
+    /// `"experiment"` when the arm-forced model won, otherwise the
+    /// underlying [`ModelSource`] label (`param`/`config`/`default`) —
+    /// unchanged from [`resolve_dispatch_model`] for `off`/`observe`.
+    pub source_label: &'static str,
+}
+
+/// Issue #4809: resolve the model for an autonomous, per-`issue` sweep
+/// dispatch, inserting the model-cost A/B experiment's forced arm model
+/// ahead of the #3944/#4501 default-pin precedence chain when — and ONLY
+/// when — the workspace resolves to `experiment` mode. Mode resolution reads
+/// the SAME env vars (`LOOM_MODEL_EXPERIMENT` / `LOOM_MODEL_EXPERIMENT_CANARY`)
+/// and CANARY guardrail (an uncommitted env confirmation or a gitignored
+/// `.loom/CANARY` sentinel under `repo_root` — never the committed
+/// `sweep.modelExperimentCanary` flag, rejected in #3731) that
+/// `sweep-experiment.sh resolve-mode` uses — see
+/// [`crate::script_helpers::sweep_experiment::resolve_effective_mode_default`].
+///
+/// `off` and `observe` modes are BYTE-IDENTICAL to calling
+/// [`resolve_dispatch_model`] directly (the required no-behavior-change
+/// contract for both) — only `experiment` mode substitutes the arm-forced
+/// model, and an explicit dispatch `model` param is never seen at this
+/// call's `resolve_dispatch_model(repo_root, None)` fallback (callers pass
+/// `explicit = None`, matching every existing autonomous dispatch site).
+///
+/// The arm itself is [`crate::script_helpers::sweep_experiment::assign_arm`]
+/// — a pure function of `issue` and the `complexity` stratum — so the SAME
+/// issue resolves to the SAME arm across a dispatch resume (no re-roll).
+///
+/// `complexity` is the Curator's `<!-- loom:complexity=<tier> -->` tier for
+/// this issue (#4827), which gives the `complex` and `routine` strata an
+/// independent ~50/50 A/B balance instead of stratifying the whole population
+/// as `routine`. `None` (no marker, or an unavailable body) keeps the
+/// pre-#4827 `routine` default — never an error.
+#[must_use]
+pub fn resolve_autonomous_dispatch_model(
+    repo_root: &Path,
+    issue: u32,
+    complexity: Option<&str>,
+) -> ExperimentDispatchModel {
+    resolve_autonomous_dispatch_model_lazy(repo_root, issue, || complexity.map(str::to_owned))
+}
+
+/// [`resolve_autonomous_dispatch_model`] with the complexity stratum supplied
+/// by a **lazily-invoked** closure (#4827).
+///
+/// For call sites that have no issue body in hand (the epic supervisor's
+/// child dispatch, the `dispatch_sweep` MCP handler) the stratum costs a forge
+/// round-trip. Deferring it behind `FnOnce` means that round-trip happens ONLY
+/// when the workspace actually resolves to `experiment` mode — so `off` /
+/// `observe` dispatches (the overwhelming majority, and the modes whose
+/// no-behavior-change contract #4809 established) issue zero extra `gh` calls
+/// and add zero rate-limit pressure (epic #4432).
+#[must_use]
+pub fn resolve_autonomous_dispatch_model_lazy(
+    repo_root: &Path,
+    issue: u32,
+    complexity: impl FnOnce() -> Option<String>,
+) -> ExperimentDispatchModel {
+    use crate::script_helpers::sweep_experiment as se;
+
+    let config = crate::config_resolver::resolve_effective_config(repo_root);
+    let env_mode = std::env::var("LOOM_MODEL_EXPERIMENT").ok();
+    let env_canary = std::env::var("LOOM_MODEL_EXPERIMENT_CANARY").ok();
+    let sentinel_path = repo_root.join(se::CANARY_SENTINEL);
+    let (mode, warnings) = se::resolve_effective_mode_default(
+        env_mode.as_deref(),
+        env_canary.as_deref(),
+        &config,
+        Some(&sentinel_path),
+    );
+    for w in &warnings {
+        log::warn!("sweep-experiment: {w}");
+    }
+
+    if mode == "experiment" {
+        let complexity = complexity();
+        let arm = se::assign_arm(i64::from(issue), complexity.as_deref());
+        let model = se::resolved_arm_model(arm, &config);
+        return ExperimentDispatchModel {
+            model,
+            mode,
+            arm: Some(arm),
+            source_label: "experiment",
+        };
+    }
+
+    let (model, source) = resolve_dispatch_model(repo_root, None);
+    ExperimentDispatchModel {
+        model,
+        mode,
+        arm: None,
+        source_label: source.as_str(),
+    }
+}
+
+/// Best-effort fetch of an issue's `<!-- loom:complexity=<tier> -->` stratum
+/// straight from the forge (#4827), for dispatch paths that have no cached
+/// issue body (the epic supervisor's child dispatch, the `dispatch_sweep` MCP
+/// handler — unlike the work finder, which already carries the body on its
+/// [`crate::work_finder::WorkItem`]).
+///
+/// **Never fails the dispatch.** A spawn failure, timeout, non-zero exit,
+/// unparseable payload, or absent marker all resolve to `None` — the unchanged
+/// pre-#4827 `routine` stratum. Mirrors `resolve-tier-model.sh`'s
+/// GraphQL-then-REST fallback (#4472): `gh issue view` is a GraphQL call, and
+/// GraphQL quota exhausts independently of REST under fleet load (epic #4432).
+///
+/// Only ever called from inside [`resolve_autonomous_dispatch_model_lazy`]'s
+/// `experiment` branch, so `off` / `observe` dispatch is untouched.
+#[must_use]
+pub fn fetch_issue_complexity(gh_bin: &Path, workspace_root: &Path, issue: u32) -> Option<String> {
+    use crate::script_helpers::sweep_experiment as se;
+
+    let timeout = super::reaper::reap_gh_timeout();
+    let repo = std::env::var("LOOM_REPO").ok();
+
+    // 1. GraphQL (`gh issue view`) — the same call `resolve-tier-model.sh` tries first.
+    let mut view = Command::new(gh_bin);
+    view.arg("issue")
+        .arg("view")
+        .arg(issue.to_string())
+        .arg("--json")
+        .arg("body")
+        .arg("--jq")
+        .arg(".body");
+    view.current_dir(workspace_root);
+    if let Some(ref r) = repo {
+        view.arg("--repo").arg(r);
+    }
+    if let Ok(Some(out)) = super::reaper::output_with_timeout(view, timeout) {
+        if out.status.success() {
+            let body = String::from_utf8_lossy(&out.stdout);
+            if let Some(tier) = se::extract_complexity_marker(&body) {
+                return Some(tier.to_owned());
+            }
+            // A successful read with no marker is authoritative — do not spend
+            // a second (REST) round-trip re-confirming an absent marker.
+            return None;
+        }
+    }
+
+    // 2. REST fallback — a separate quota bucket from GraphQL (#4472).
+    let path = repo.map_or_else(
+        || format!("repos/{{owner}}/{{repo}}/issues/{issue}"),
+        |r| format!("repos/{r}/issues/{issue}"),
+    );
+    let mut api = Command::new(gh_bin);
+    api.arg("api").arg(&path).arg("--jq").arg(".body");
+    api.current_dir(workspace_root);
+    if let Ok(Some(out)) = super::reaper::output_with_timeout(api, timeout) {
+        if out.status.success() {
+            let body = String::from_utf8_lossy(&out.stdout);
+            return se::extract_complexity_marker(&body).map(str::to_owned);
+        }
+    }
+
+    log::debug!(
+        "sweep-experiment: could not fetch issue #{issue} body for complexity stratification \
+         (GraphQL+REST failed) — falling back to the routine stratum (#4827)"
+    );
+    None
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -422,6 +710,215 @@ mod tests {
         assert_eq!(aliases.len(), 3);
     }
 
+    // --- Issue #4809: daemon-native model-cost experiment dispatch --------- //
+
+    /// Clean slate for the experiment env vars this suite mutates — leaked
+    /// state from another test in the same process would make these false
+    /// pass/fail.
+    fn clear_experiment_env() {
+        std::env::remove_var("LOOM_MODEL_EXPERIMENT");
+        std::env::remove_var("LOOM_MODEL_EXPERIMENT_CANARY");
+    }
+
+    /// With no env/config/sentinel, mode resolves to `off` and the result is
+    /// byte-identical to calling `resolve_dispatch_model` directly — no arm,
+    /// `source_label` is the underlying `ModelSource` label.
+    #[test]
+    #[serial]
+    fn autonomous_dispatch_off_by_default_is_byte_identical() {
+        clear_experiment_env();
+        let dir = tempdir().unwrap();
+        let resolved = resolve_autonomous_dispatch_model(dir.path(), 100, None);
+        clear_experiment_env();
+
+        assert_eq!(resolved.mode, "off");
+        assert_eq!(resolved.arm, None);
+        assert_eq!(resolved.source_label, "default");
+        let (expected_model, expected_source) = resolve_dispatch_model(dir.path(), None);
+        assert_eq!(resolved.model, expected_model);
+        assert_eq!(resolved.source_label, expected_source.as_str());
+    }
+
+    /// `experiment` mode requested with NO canary confirmation downgrades to
+    /// `observe` (the #3731 guardrail) — no arm, model resolution unaffected.
+    #[test]
+    #[serial]
+    fn autonomous_dispatch_experiment_without_canary_downgrades_to_observe() {
+        clear_experiment_env();
+        std::env::set_var("LOOM_MODEL_EXPERIMENT", "experiment");
+        let dir = tempdir().unwrap();
+        let resolved = resolve_autonomous_dispatch_model(dir.path(), 100, None);
+        clear_experiment_env();
+
+        assert_eq!(resolved.mode, "observe");
+        assert_eq!(resolved.arm, None);
+        assert_eq!(resolved.model, DEFAULT_DISPATCH_MODEL, "observe must not force a model");
+    }
+
+    /// `experiment` mode + a confirmed canary forces the deterministic arm's
+    /// model, suppressing the #3944/#4501 default pin — the core #4809 fix.
+    #[test]
+    #[serial]
+    fn autonomous_dispatch_experiment_with_canary_forces_the_arm_model() {
+        clear_experiment_env();
+        std::env::set_var("LOOM_MODEL_EXPERIMENT", "experiment");
+        std::env::set_var("LOOM_MODEL_EXPERIMENT_CANARY", "1");
+        let dir = tempdir().unwrap();
+        // Issue 100, no complexity ⇒ arm A (see `assign_arm`'s parity table).
+        let resolved = resolve_autonomous_dispatch_model(dir.path(), 100, None);
+        clear_experiment_env();
+
+        assert_eq!(resolved.mode, "experiment");
+        assert_eq!(resolved.arm, Some("A"));
+        assert_eq!(resolved.model, "claude-opus-5", "Arm A resolves through the #3982 tier map");
+        assert_eq!(resolved.source_label, "experiment");
+
+        // Issue 101 ⇒ arm B (sonnet), still deterministic and un-pinned by
+        // the default.
+        clear_experiment_env();
+        std::env::set_var("LOOM_MODEL_EXPERIMENT", "experiment");
+        std::env::set_var("LOOM_MODEL_EXPERIMENT_CANARY", "1");
+        let resolved_b = resolve_autonomous_dispatch_model(dir.path(), 101, None);
+        clear_experiment_env();
+        assert_eq!(resolved_b.arm, Some("B"));
+        assert_eq!(resolved_b.model, "sonnet");
+    }
+
+    /// Issue #4827: a REAL per-issue complexity stratum reaches `assign_arm`
+    /// and shifts the parity, so the `complex` and `routine` strata each get an
+    /// independent ~50/50 A/B balance instead of the pooled population being
+    /// stratified as `routine`.
+    #[test]
+    #[serial]
+    fn autonomous_dispatch_stratifies_the_arm_by_per_issue_complexity() {
+        clear_experiment_env();
+        std::env::set_var("LOOM_MODEL_EXPERIMENT", "experiment");
+        std::env::set_var("LOOM_MODEL_EXPERIMENT_CANARY", "1");
+        let dir = tempdir().unwrap();
+
+        // Issue 100 with NO marker is arm A (the pre-#4827 behavior)...
+        let routine = resolve_autonomous_dispatch_model(dir.path(), 100, None);
+        assert_eq!(routine.arm, Some("A"));
+        assert_eq!(routine.model, "claude-opus-5");
+
+        // ...but the SAME issue marked `complex` flips to arm B — proof the
+        // stratum is threaded through, not discarded.
+        let complex = resolve_autonomous_dispatch_model(dir.path(), 100, Some("complex"));
+        assert_eq!(complex.arm, Some("B"));
+        assert_eq!(complex.model, "sonnet");
+
+        // An explicit `routine` marker is identical to no marker at all.
+        let explicit_routine = resolve_autonomous_dispatch_model(dir.path(), 100, Some("routine"));
+        assert_eq!(explicit_routine.arm, Some("A"));
+
+        // An out-of-vocabulary tier folds to `routine` (never an error).
+        let unknown = resolve_autonomous_dispatch_model(dir.path(), 100, Some("mystery"));
+        assert_eq!(unknown.arm, Some("A"));
+
+        clear_experiment_env();
+    }
+
+    /// The lazy form (#4827) is the one the epic supervisor / MCP handler use.
+    /// In `off` / `observe` mode the closure must NOT run — that is what keeps
+    /// those paths from paying a `gh` round-trip per dispatch. In `experiment`
+    /// mode it runs exactly once and its value reaches `assign_arm`.
+    #[test]
+    #[serial]
+    fn autonomous_dispatch_lazy_complexity_is_only_fetched_in_experiment_mode() {
+        use std::cell::Cell;
+
+        clear_experiment_env();
+        let dir = tempdir().unwrap();
+
+        // `off` (default): closure never invoked.
+        let calls = Cell::new(0_u32);
+        let resolved = resolve_autonomous_dispatch_model_lazy(dir.path(), 100, || {
+            calls.set(calls.get() + 1);
+            Some("complex".to_string())
+        });
+        assert_eq!(resolved.mode, "off");
+        assert_eq!(calls.get(), 0, "off mode must not pay the body fetch");
+
+        // `observe`: still never invoked.
+        std::env::set_var("LOOM_MODEL_EXPERIMENT", "observe");
+        let calls = Cell::new(0_u32);
+        let resolved = resolve_autonomous_dispatch_model_lazy(dir.path(), 100, || {
+            calls.set(calls.get() + 1);
+            Some("complex".to_string())
+        });
+        assert_eq!(resolved.mode, "observe");
+        assert_eq!(calls.get(), 0, "observe mode must not pay the body fetch");
+
+        // `experiment` + canary: invoked exactly once, and the value is used.
+        std::env::set_var("LOOM_MODEL_EXPERIMENT", "experiment");
+        std::env::set_var("LOOM_MODEL_EXPERIMENT_CANARY", "1");
+        let calls = Cell::new(0_u32);
+        let resolved = resolve_autonomous_dispatch_model_lazy(dir.path(), 100, || {
+            calls.set(calls.get() + 1);
+            Some("complex".to_string())
+        });
+        clear_experiment_env();
+        assert_eq!(resolved.mode, "experiment");
+        assert_eq!(calls.get(), 1);
+        assert_eq!(resolved.arm, Some("B"), "the fetched stratum must reach assign_arm");
+    }
+
+    /// Deterministic assignment: repeated calls for the same issue (a
+    /// dispatch resume) land on the same arm — no re-roll.
+    #[test]
+    #[serial]
+    fn autonomous_dispatch_arm_assignment_is_deterministic_across_resumes() {
+        clear_experiment_env();
+        std::env::set_var("LOOM_MODEL_EXPERIMENT", "experiment");
+        std::env::set_var("LOOM_MODEL_EXPERIMENT_CANARY", "1");
+        let dir = tempdir().unwrap();
+        let first = resolve_autonomous_dispatch_model(dir.path(), 4242, None);
+        let second = resolve_autonomous_dispatch_model(dir.path(), 4242, None);
+        clear_experiment_env();
+        assert_eq!(first.arm, second.arm);
+        assert_eq!(first.model, second.model);
+    }
+
+    /// A committed `.loom/CANARY` (git-tracked) is refused exactly like the
+    /// underlying `sweep-experiment.sh` guardrail — this test only exercises
+    /// the untracked-sentinel confirmation path (the tracked-refusal path is
+    /// already covered directly against `evaluate_canary` in
+    /// `script_helpers::sweep_experiment`); here we confirm the SENTINEL path
+    /// (not just the env var) reaches the daemon dispatch resolver.
+    #[test]
+    #[serial]
+    fn autonomous_dispatch_confirms_canary_via_untracked_sentinel_file() {
+        clear_experiment_env();
+        std::env::set_var("LOOM_MODEL_EXPERIMENT", "experiment");
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".loom")).unwrap();
+        std::fs::write(dir.path().join(".loom").join("CANARY"), "").unwrap();
+
+        let resolved = resolve_autonomous_dispatch_model(dir.path(), 100, None);
+        clear_experiment_env();
+
+        assert_eq!(resolved.mode, "experiment");
+        assert_eq!(resolved.arm, Some("A"));
+    }
+
+    /// `observe` mode (explicit) never forces a model, matching #4809's "zero
+    /// behavior change" contract even with `autonomous.model` configured.
+    #[test]
+    #[serial]
+    fn autonomous_dispatch_observe_mode_honors_existing_config_precedence() {
+        clear_experiment_env();
+        std::env::set_var("LOOM_MODEL_EXPERIMENT", "observe");
+        let dir = tempdir().unwrap();
+        write_config(dir.path(), r#"{"autonomous": {"model": "opus"}}"#);
+        let resolved = resolve_autonomous_dispatch_model(dir.path(), 100, None);
+        clear_experiment_env();
+
+        assert_eq!(resolved.mode, "observe");
+        assert_eq!(resolved.arm, None);
+        assert_eq!(resolved.model, "claude-opus-5", "config tier still resolves through #3982");
+        assert_eq!(resolved.source_label, "config");
+    }
+
     /// Ladder monotonicity: no rung of the shipped escalation ladder resolves to
     /// an older generation than the rung below it. This is the regression guard
     /// for #3982 — before the fix, `opus` resolved to a gen-4 model, one below
@@ -471,5 +968,95 @@ mod tests {
         }
         // And specifically the previously-broken rung is now gen-5.
         assert_eq!(generation_of(dir.path(), "opus"), 5);
+    }
+
+    // --- Issue #5028: model/runtime family classification ------------------
+
+    #[test]
+    fn model_family_classifies_claude_aliases_and_pinned_ids() {
+        for m in [
+            "opus",
+            "opusplan",
+            "sonnet",
+            "haiku",
+            "fable",
+            "claude-opus-5",
+            "CLAUDE-Sonnet-4-6",
+        ] {
+            assert_eq!(model_family(m), Some(ModelFamily::Claude), "{m} should classify as Claude");
+        }
+        // `@effort` suffixes are stripped before classification.
+        assert_eq!(model_family("opus@xhigh"), Some(ModelFamily::Claude));
+        assert_eq!(model_family("sonnet@low"), Some(ModelFamily::Claude));
+    }
+
+    #[test]
+    fn model_family_classifies_openai_aliases() {
+        for m in [
+            "gpt-5-codex",
+            "gpt-4.1",
+            "o1-mini",
+            "o3-mini",
+            "o4-mini",
+            "codex-mini-latest",
+        ] {
+            assert_eq!(model_family(m), Some(ModelFamily::OpenAi), "{m} should classify as OpenAI");
+        }
+        assert_eq!(model_family("gpt-5-codex@high"), Some(ModelFamily::OpenAi));
+    }
+
+    #[test]
+    fn model_family_fails_open_on_unknown_models() {
+        for m in ["mystery-model", "", "   ", "claude"] {
+            let result = model_family(m);
+            if m == "claude" {
+                // "claude" bare (no version) still starts with "claude" — a
+                // deliberately generous prefix match, since any pinned Claude
+                // ID is `claude-...`.
+                assert_eq!(result, Some(ModelFamily::Claude));
+            } else {
+                assert_eq!(result, None, "{m:?} must fail open (never a false mismatch)");
+            }
+        }
+    }
+
+    #[test]
+    fn runtime_model_family_only_recognizes_claude_and_codex() {
+        assert_eq!(runtime_model_family("claude"), Some(ModelFamily::Claude));
+        assert_eq!(runtime_model_family("CODEX"), Some(ModelFamily::OpenAi));
+        for rt in ["aider", "tier-3", "custom-runtime", "", "unknown"] {
+            assert_eq!(runtime_model_family(rt), None, "{rt:?} must never be refused");
+        }
+    }
+
+    #[test]
+    fn model_runtime_mismatch_only_on_a_provable_conflict() {
+        // The core #5001/#5028 scenario: Judge pinned to codex with no
+        // roleModels override still resolves the Claude-shaped default.
+        assert!(model_runtime_mismatch("codex", "sonnet").is_some());
+        assert!(model_runtime_mismatch("codex", "opus@xhigh").is_some());
+        assert!(model_runtime_mismatch("claude", "gpt-5-codex").is_some());
+
+        // A matching family is never a mismatch.
+        assert_eq!(model_runtime_mismatch("codex", "gpt-5-codex"), None);
+        assert_eq!(model_runtime_mismatch("claude", "sonnet"), None);
+        assert_eq!(model_runtime_mismatch("claude", "opus@xhigh"), None);
+
+        // Fail-open: an unrecognized runtime (aider, tier-3, custom) is never
+        // refused, regardless of the model.
+        assert_eq!(model_runtime_mismatch("aider", "sonnet"), None);
+        assert_eq!(model_runtime_mismatch("tier-3", "gpt-5-codex"), None);
+
+        // Fail-open: an unrecognized model is never refused, regardless of
+        // the runtime.
+        assert_eq!(model_runtime_mismatch("codex", "mystery-model"), None);
+        assert_eq!(model_runtime_mismatch("claude", "mystery-model"), None);
+    }
+
+    #[test]
+    fn model_runtime_mismatch_reason_names_both_sides() {
+        let reason = model_runtime_mismatch("codex", "sonnet").unwrap();
+        assert!(reason.contains("codex"), "reason must name the runtime: {reason}");
+        assert!(reason.contains("sonnet"), "reason must name the model: {reason}");
     }
 }

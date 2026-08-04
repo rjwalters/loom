@@ -65,14 +65,12 @@ pub(crate) fn handle_clean_command(
 
         let stats = agg::clean_aggressive(&repo_root, dry_run, force, aggressive_min_age);
         agg::print_aggressive_summary(&stats, dry_run);
+        println!("{}", clean::completion_line("Aggressive cleanup", dry_run, stats.errors));
         if dry_run {
-            println!("Dry run complete - no changes made");
             println!("Run without --dry-run to perform cleanup");
-        } else {
-            println!("Aggressive cleanup complete!");
         }
         println!();
-        std::process::exit(i32::from(stats.errors > 0));
+        std::process::exit(clean::exit_code(stats.errors));
     }
 
     let opts = clean::CleanOptions {
@@ -84,6 +82,10 @@ pub(crate) fn handle_clean_command(
         worktrees_only,
         branches_only,
         tmux_only,
+        // The interactive CLI keeps its historical behavior: an operator who
+        // typed the command is the authority on a sentinel-less worktree. Only
+        // the unattended reaper (#4876) requires the `.loom-managed` sentinel.
+        require_managed_sentinel: false,
     };
     let exit_code = clean::run_clean(&repo_root, &opts);
     if exit_code != 0 {
@@ -137,8 +139,26 @@ pub(crate) fn handle_recover_orphans_command(
         println!("{}", orphans::format_result_human(&result));
     }
 
+    // A failed dependency (e.g. the `gh issue list --label loom:building`
+    // query) means the claims could not be enumerated at all. That is not a
+    // clean bill of health, so it must never exit 0 — an operator or watch
+    // loop checking for stranded claims would read success as "none stranded"
+    // (issue #5140). Distinct exit code from the "orphans found" 2 below.
+    if result.assessment_failed() {
+        eprintln!(
+            "recover-orphans could not assess orphaned tasks (see errors above); \
+             exiting {EXIT_ASSESSMENT_FAILED} rather than reporting a false all-clear"
+        );
+        std::process::exit(EXIT_ASSESSMENT_FAILED);
+    }
+
     if !result.orphaned.is_empty() && !recover {
         std::process::exit(2);
     }
     Ok(())
 }
+
+/// `recover-orphans` exit code for "the assessment itself failed" — distinct
+/// from `2` ("orphans found in dry-run mode") and from `0` ("assessed, nothing
+/// orphaned"). Issue #5140.
+const EXIT_ASSESSMENT_FAILED: i32 = 3;

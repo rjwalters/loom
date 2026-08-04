@@ -13,9 +13,14 @@
 //! object; [`super::sender::spawn_task`] is generic over a single concrete
 //! `E: Exporter`, so no vtable/boxing is required.
 
-use serde::Serialize;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+use serde::{Deserialize, Serialize};
 
 use crate::telemetry::TelemetryEnvelope;
+
+use super::HostIdStatus;
 
 /// A sink [`super::sender`]'s drain loop can push batches of
 /// [`TelemetryEnvelope`]s to. Implementations must never panic on a
@@ -74,12 +79,63 @@ impl std::error::Error for ExportError {}
 #[derive(Serialize)]
 struct BatchPayload<'a>(&'a [TelemetryEnvelope]);
 
+/// The subset of the `/ingest` success response this exporter reads
+/// (Issue #4830). Every other field is ignored, and a body that is not JSON —
+/// or is JSON without a `host_id` — deserializes to `host_id: None`, which is
+/// treated as "this backend does not echo an identity" and checked no further.
+/// That is what keeps a pre-#4830 backend (whose response was a bare
+/// `{"accepted": N}`) working unchanged.
+#[derive(Deserialize)]
+struct IngestAck {
+    #[serde(default)]
+    host_id: Option<String>,
+}
+
+/// How much of a success-response body is read before the host-identity echo
+/// is parsed out of it. The real response is a few dozen bytes
+/// (`{"accepted":50,"host_id":"…"}`); this bound exists only so a misconfigured
+/// endpoint that answers 200 with a huge body cannot be buffered into memory
+/// just to read one diagnostic field out of it.
+const MAX_ACK_BODY_BYTES: usize = 4096;
+
+/// Read at most `limit` bytes of `response`'s body, discarding the rest.
+///
+/// Streams chunk-by-chunk rather than using `Response::text()`, which would
+/// buffer the *whole* body first and make [`MAX_ACK_BODY_BYTES`] a post-hoc
+/// truncation rather than a real bound. A read error mid-body is not an error
+/// here: the batch is already acked, so whatever was read so far is simply
+/// parsed (and a truncated/partial body just fails to parse, which is handled
+/// as "no identity to compare").
+async fn read_bounded_body(mut response: reqwest::Response, limit: usize) -> String {
+    let mut buf: Vec<u8> = Vec::new();
+    while buf.len() < limit {
+        match response.chunk().await {
+            Ok(Some(chunk)) => buf.extend_from_slice(&chunk),
+            Ok(None) | Err(_) => break,
+        }
+    }
+    buf.truncate(limit);
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
 /// The native JSON-over-HTTPS push [`Exporter`]. POSTs each batch as a JSON
 /// array to `endpoint` with `Authorization: Bearer <ingest_key>`.
 pub struct HttpsExporter {
     client: reqwest::Client,
     endpoint: String,
     ingest_key: String,
+    /// This daemon's own identity — [`crate::sweep_registry::host_identity`],
+    /// resolved once by [`super::spawn_task`] and shared with the collector so
+    /// this is literally the id stamped on the envelopes being pushed.
+    host_id: String,
+    /// WARN-once-per-daemon-lifetime guard (Issue #4830). The exporter is
+    /// constructed once per process, so instance scope *is* lifetime scope;
+    /// this is what keeps a permanent misconfiguration from re-logging on every
+    /// flush for the life of the daemon.
+    mismatch_warned: AtomicBool,
+    /// Where a confirmed mismatch is published for `loom-daemon status` /
+    /// `health` to read.
+    host_id_status: Arc<HostIdStatus>,
 }
 
 /// Per-request timeout — generous enough for a slow mobile/tethered fleet
@@ -91,9 +147,17 @@ const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 impl HttpsExporter {
     /// Build an exporter posting to `endpoint`, authenticating with
-    /// `ingest_key`. Fails only if the underlying `reqwest::Client` cannot be
-    /// constructed (e.g. no usable TLS backend) — never touches the network.
-    pub fn new(endpoint: String, ingest_key: String) -> Result<Self, ExportError> {
+    /// `ingest_key`, and verifying every success response's echoed `host_id`
+    /// against `host_id` (this daemon's own identity), publishing any mismatch
+    /// to `host_id_status`. Fails only if the underlying `reqwest::Client`
+    /// cannot be constructed (e.g. no usable TLS backend) — never touches the
+    /// network.
+    pub fn new(
+        endpoint: String,
+        ingest_key: String,
+        host_id: String,
+        host_id_status: Arc<HostIdStatus>,
+    ) -> Result<Self, ExportError> {
         let client = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
             .build()
@@ -102,7 +166,55 @@ impl HttpsExporter {
             client,
             endpoint,
             ingest_key,
+            host_id,
+            mismatch_warned: AtomicBool::new(false),
+            host_id_status,
         })
+    }
+
+    /// Compare the `host_id` a `/ingest` success response echoed against this
+    /// daemon's own identity, WARNing **once per daemon lifetime** and
+    /// publishing to [`HostIdStatus`] on a mismatch (Issue #4830).
+    ///
+    /// Never returns an error and never affects the export result: a batch the
+    /// backend accepted stays accepted, whatever it says the key is bound to.
+    /// The only thing a mismatch changes is that the operator now finds out.
+    fn check_host_identity(&self, body: &str) {
+        let Ok(ack) = serde_json::from_str::<IngestAck>(body) else {
+            // Not JSON at all (a proxy's HTML 200, an empty body). The batch was
+            // still acked; there is simply no identity to compare.
+            return;
+        };
+        let Some(ingest_host_id) = ack
+            .host_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            // A pre-#4830 backend, which echoes no identity. Nothing to check —
+            // deliberately silent, so pointing a daemon at an older backend does
+            // not produce a recurring "cannot verify" line.
+            return;
+        };
+        if ingest_host_id == self.host_id {
+            return;
+        }
+        // `record_mismatch` and the WARN guard are independent (the status
+        // handle may be shared with a future second exporter) but both are
+        // once-per-process, so the log line and the published record always
+        // describe the same first observation.
+        self.host_id_status
+            .record_mismatch(&self.host_id, ingest_host_id);
+        if !self.mismatch_warned.swap(true, Ordering::SeqCst) {
+            log::warn!(
+                "observability: ingest key is bound to host_id {ingest_host_id:?} but this daemon \
+                 identifies as {:?} — every record pushed from this host is being filed under \
+                 {ingest_host_id:?}. Install the key provisioned for {:?}, or set $LOOM_HOST_ID to \
+                 match the key's binding. (This warning is logged once per daemon lifetime.)",
+                self.host_id,
+                self.host_id,
+            );
+        }
     }
 }
 
@@ -117,6 +229,12 @@ impl Exporter for HttpsExporter {
             .await
             .map_err(|error| ExportError::Transport(error.to_string()))?;
         if response.status().is_success() {
+            // The batch is already acked at this point — reading the body is a
+            // pure self-diagnostic (Issue #4830), so a body that fails to read
+            // is ignored rather than turned into a spurious export failure that
+            // would re-send records the backend has already durably stored.
+            let body = read_bounded_body(response, MAX_ACK_BODY_BYTES).await;
+            self.check_host_identity(&body);
             return Ok(());
         }
         let status = response.status().as_u16();
@@ -153,6 +271,10 @@ mod tests {
         addr: SocketAddr,
         requests: Arc<Mutex<Vec<MockRequest>>>,
         respond_with: Arc<Mutex<u16>>,
+        /// The success-response body (Issue #4830 — the real `/ingest` echoes
+        /// `{"accepted":N,"host_id":"…"}`). Empty by default so the pre-#4830
+        /// "no echo" backend is what the untouched tests below exercise.
+        respond_body: Arc<Mutex<String>>,
         shutdown: Arc<std::sync::atomic::AtomicBool>,
         handle: Option<std::thread::JoinHandle<()>>,
     }
@@ -170,17 +292,20 @@ mod tests {
             let addr = listener.local_addr().unwrap();
             let requests = Arc::new(Mutex::new(Vec::new()));
             let respond_with = Arc::new(Mutex::new(200u16));
+            let respond_body = Arc::new(Mutex::new(String::new()));
             let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let handle = spawn_accept_loop(
                 listener,
                 requests.clone(),
                 respond_with.clone(),
+                respond_body.clone(),
                 shutdown.clone(),
             );
             MockSink {
                 addr,
                 requests,
                 respond_with,
+                respond_body,
                 shutdown,
                 handle: Some(handle),
             }
@@ -196,6 +321,11 @@ mod tests {
 
         fn set_status(&self, status: u16) {
             *self.respond_with.lock().unwrap() = status;
+        }
+
+        /// Answer every subsequent request with this body (Issue #4830).
+        fn set_body(&self, body: &str) {
+            *self.respond_body.lock().unwrap() = body.to_string();
         }
 
         /// Simulate the sink going offline: stop accepting new connections.
@@ -222,17 +352,20 @@ mod tests {
             let listener = TcpListener::bind(addr).unwrap();
             listener.set_nonblocking(true).unwrap();
             let respond_with = Arc::new(Mutex::new(200u16));
+            let respond_body = Arc::new(Mutex::new(String::new()));
             let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let handle = spawn_accept_loop(
                 listener,
                 requests.clone(),
                 respond_with.clone(),
+                respond_body.clone(),
                 shutdown.clone(),
             );
             MockSink {
                 addr,
                 requests,
                 respond_with,
+                respond_body,
                 shutdown,
                 handle: Some(handle),
             }
@@ -253,6 +386,7 @@ mod tests {
         listener: TcpListener,
         requests: Arc<Mutex<Vec<MockRequest>>>,
         respond_with: Arc<Mutex<u16>>,
+        respond_body: Arc<Mutex<String>>,
         shutdown: Arc<std::sync::atomic::AtomicBool>,
     ) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
@@ -262,7 +396,8 @@ mod tests {
                         stream.set_nonblocking(false).ok();
                         if let Some(request) = read_request(&mut stream) {
                             let status = *respond_with.lock().unwrap();
-                            let _ = write_response(&mut stream, status);
+                            let body = respond_body.lock().unwrap().clone();
+                            let _ = write_response(&mut stream, status, &body);
                             requests.lock().unwrap().push(request);
                         }
                     }
@@ -321,10 +456,16 @@ mod tests {
         Some(MockRequest { auth_header, body })
     }
 
-    fn write_response(stream: &mut std::net::TcpStream, status: u16) -> std::io::Result<()> {
+    fn write_response(
+        stream: &mut std::net::TcpStream,
+        status: u16,
+        body: &str,
+    ) -> std::io::Result<()> {
         let reason = if status < 300 { "OK" } else { "Error" };
-        let response =
-            format!("HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        let response = format!(
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
         stream.write_all(response.as_bytes())
     }
 
@@ -334,17 +475,49 @@ mod tests {
             .position(|window| window == needle)
     }
 
+    /// The identity these tests' daemon reports for itself — matched against
+    /// the `host_id` a mock sink echoes.
+    const TEST_HOST_ID: &str = "host-test";
+
+    /// An exporter with a throwaway (unregistered) status handle: nothing here
+    /// touches the process-global, so tests never leak mismatch state into each
+    /// other or into `ipc::build_daemon_status`.
+    fn test_exporter(endpoint: String, key: &str) -> HttpsExporter {
+        HttpsExporter::new(
+            endpoint,
+            key.to_string(),
+            TEST_HOST_ID.to_string(),
+            Arc::new(HostIdStatus::default()),
+        )
+        .unwrap()
+    }
+
+    fn test_exporter_with_status(
+        endpoint: String,
+        host_id: &str,
+        status: Arc<HostIdStatus>,
+    ) -> HttpsExporter {
+        HttpsExporter::new(endpoint, "key".to_string(), host_id.to_string(), status).unwrap()
+    }
+
     fn one_envelope() -> TelemetryEnvelope {
         TelemetryEnvelope::new(
             "host-test",
             TelemetryRecord::HostHealth(HostHealthRecord {
                 captured_at: chrono::Utc::now(),
                 daemon_version: "0.16.0".to_string(),
+                build_commit: "deadbeef".to_string(),
+                built_at: None,
                 uptime_sec: 10,
                 logical_cpus: 8,
                 cpu_idle_fraction: None,
                 load_per_core: None,
                 worktree_root_free_gb: None,
+                active_sweep_ids: Vec::new(),
+                dispatch_halted: false,
+                halt_reason: None,
+                managed_repos: Vec::new(),
+                roles: crate::telemetry::RoleTickHealth::default(),
             }),
         )
     }
@@ -352,7 +525,7 @@ mod tests {
     #[tokio::test]
     async fn emit_batch_posts_the_batch_with_bearer_auth() {
         let sink = MockSink::start();
-        let exporter = HttpsExporter::new(sink.url(), "s3cr3t-ingest-key".to_string()).unwrap();
+        let exporter = test_exporter(sink.url(), "s3cr3t-ingest-key");
         let batch = vec![one_envelope(), one_envelope()];
         exporter.emit_batch(&batch).await.unwrap();
 
@@ -367,7 +540,7 @@ mod tests {
     async fn non_2xx_status_is_reported_as_rejected() {
         let sink = MockSink::start();
         sink.set_status(500);
-        let exporter = HttpsExporter::new(sink.url(), "key".to_string()).unwrap();
+        let exporter = test_exporter(sink.url(), "key");
         let batch = vec![one_envelope()];
         let error = exporter.emit_batch(&batch).await.unwrap_err();
         match error {
@@ -382,8 +555,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         drop(listener);
-        let exporter =
-            HttpsExporter::new(format!("http://{addr}/ingest"), "key".to_string()).unwrap();
+        let exporter = test_exporter(format!("http://{addr}/ingest"), "key");
         let batch = vec![one_envelope()];
         let error = exporter.emit_batch(&batch).await.unwrap_err();
         assert!(matches!(error, ExportError::Transport(_)));
@@ -394,11 +566,8 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         drop(listener);
-        let exporter = HttpsExporter::new(
-            format!("http://{addr}/ingest"),
-            "top-secret-ingest-key-value".to_string(),
-        )
-        .unwrap();
+        let exporter =
+            test_exporter(format!("http://{addr}/ingest"), "top-secret-ingest-key-value");
         let batch = vec![one_envelope()];
         let error = exporter.emit_batch(&batch).await.unwrap_err();
         let rendered = error.to_string();
@@ -413,17 +582,130 @@ mod tests {
         // Exercises the mock sink helper itself (the drain-loop-level
         // kill/revive integration test lives in `super::super::sender`).
         let sink = MockSink::start();
-        let exporter = HttpsExporter::new(sink.url(), "key".to_string()).unwrap();
+        let exporter = test_exporter(sink.url(), "key");
         exporter.emit_batch(&[one_envelope()]).await.unwrap();
         let (addr, requests) = sink.kill();
-        assert!(HttpsExporter::new(format!("http://{addr}/ingest"), "key".to_string())
-            .unwrap()
+        assert!(test_exporter(format!("http://{addr}/ingest"), "key")
             .emit_batch(&[one_envelope()])
             .await
             .is_err());
         let revived = MockSink::revive(addr, requests);
-        let exporter2 = HttpsExporter::new(revived.url(), "key".to_string()).unwrap();
+        let exporter2 = test_exporter(revived.url(), "key");
         exporter2.emit_batch(&[one_envelope()]).await.unwrap();
         assert_eq!(revived.requests().len(), 2);
+    }
+
+    // ------------------------------------------------------------------
+    // host_id echo verification (Issue #4830)
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn matching_echoed_host_id_publishes_no_mismatch() {
+        let sink = MockSink::start();
+        sink.set_body(r#"{"accepted":1,"host_id":"host-test"}"#);
+        let status = Arc::new(HostIdStatus::default());
+        let exporter = test_exporter_with_status(sink.url(), TEST_HOST_ID, status.clone());
+
+        exporter.emit_batch(&[one_envelope()]).await.unwrap();
+
+        assert!(status.snapshot().is_none(), "ids agree ⇒ nothing published, nothing warned");
+    }
+
+    #[tokio::test]
+    async fn mismatched_echoed_host_id_is_published_with_both_identities() {
+        // The live 2026-07-31 incident: the Studio's key was bound to
+        // `robb-pro`, so every record it pushed was filed under that host.
+        let sink = MockSink::start();
+        sink.set_body(r#"{"accepted":1,"host_id":"robb-pro"}"#);
+        let status = Arc::new(HostIdStatus::default());
+        let exporter = test_exporter_with_status(sink.url(), "robb-studio", status.clone());
+
+        exporter.emit_batch(&[one_envelope()]).await.unwrap();
+
+        let mismatch = status.snapshot().expect("mismatch must be published");
+        assert_eq!(mismatch.daemon_host_id, "robb-studio");
+        assert_eq!(mismatch.ingest_host_id, "robb-pro");
+    }
+
+    #[tokio::test]
+    async fn a_mismatch_warns_once_per_lifetime_not_once_per_flush() {
+        let sink = MockSink::start();
+        sink.set_body(r#"{"accepted":1,"host_id":"robb-pro"}"#);
+        let status = Arc::new(HostIdStatus::default());
+        let exporter = test_exporter_with_status(sink.url(), "robb-studio", status.clone());
+
+        // Ten flushes, one warning: `mismatch_warned` latches on the first, and
+        // `record_mismatch` returns `false` for every subsequent flush — which
+        // is exactly the "not per flush" guarantee, observed through the same
+        // once-only guard the WARN is gated on.
+        for _ in 0..10 {
+            exporter.emit_batch(&[one_envelope()]).await.unwrap();
+        }
+        assert_eq!(sink.requests().len(), 10, "all ten batches were pushed");
+
+        let first_seen = status.snapshot().expect("published").first_seen_at;
+        assert!(
+            !status.record_mismatch("robb-studio", "robb-pro"),
+            "the exporter already consumed the one-shot; a later caller gets false"
+        );
+        assert_eq!(
+            status.snapshot().expect("published").first_seen_at,
+            first_seen,
+            "first_seen_at is the age of the condition, never re-stamped per flush"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_backend_that_echoes_no_host_id_is_not_a_mismatch() {
+        // A pre-#4830 backend answers `{"accepted":N}` — unverifiable, not
+        // wrong. Must stay silent rather than cry wolf on every flush.
+        let sink = MockSink::start();
+        sink.set_body(r#"{"accepted":1}"#);
+        let status = Arc::new(HostIdStatus::default());
+        let exporter = test_exporter_with_status(sink.url(), "robb-studio", status.clone());
+
+        exporter.emit_batch(&[one_envelope()]).await.unwrap();
+
+        assert!(status.snapshot().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_non_json_success_body_never_fails_the_export() {
+        // A proxy answering 200 with HTML must not turn an acked batch into a
+        // retry (which would duplicate rows the backend already stored).
+        let sink = MockSink::start();
+        sink.set_body("<html>hello</html>");
+        let status = Arc::new(HostIdStatus::default());
+        let exporter = test_exporter_with_status(sink.url(), "robb-studio", status.clone());
+
+        exporter.emit_batch(&[one_envelope()]).await.unwrap();
+
+        assert!(status.snapshot().is_none());
+    }
+
+    #[tokio::test]
+    async fn an_oversized_success_body_is_bounded_and_never_fails_the_export() {
+        // The identity echo is worth a few dozen bytes, not an unbounded read:
+        // past MAX_ACK_BODY_BYTES the body is cut off, the truncated JSON fails
+        // to parse, and the whole thing degrades to "nothing to compare".
+        let sink = MockSink::start();
+        let padding = "x".repeat(2 * MAX_ACK_BODY_BYTES);
+        sink.set_body(&format!(r#"{{"accepted":1,"host_id":"robb-pro","pad":"{padding}"}}"#));
+        let status = Arc::new(HostIdStatus::default());
+        let exporter = test_exporter_with_status(sink.url(), "robb-studio", status.clone());
+
+        exporter.emit_batch(&[one_envelope()]).await.unwrap();
+
+        assert!(status.snapshot().is_none());
+    }
+
+    #[test]
+    fn host_id_status_defaults_to_no_mismatch_and_keeps_the_first_one() {
+        let status = HostIdStatus::default();
+        assert!(status.snapshot().is_none(), "a disabled exporter publishes nothing");
+        assert!(status.record_mismatch("a", "b"), "first write wins");
+        assert!(!status.record_mismatch("a", "c"), "second write is refused");
+        let snapshot = status.snapshot().unwrap();
+        assert_eq!(snapshot.ingest_host_id, "b", "the first observation is kept");
     }
 }

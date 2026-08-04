@@ -13,20 +13,30 @@ policies:
 
 | Prefix | Who reaches it | Visibility-tagged (`private`) data |
 |---|---|---|
-| `/api/*` | **Authenticated** — the surface an operator's Cloudflare Access policy is expected to gate (see [`cloudflare-access.md`](cloudflare-access.md)'s route map: everything not explicitly Bypassed is Allow-gated) | Full detail, unredacted |
+| `/api/*` | **Authenticated** — the surface an operator's Cloudflare Access policy is expected to gate (see [`cloudflare-access.md`](cloudflare-access.md) §3e: `/api/*` gets its own Allow application) | Full detail, unredacted |
 | `/public/*` | **Public** — always reachable, no login | Redacted per record kind (see below); `public`-visibility data is always full detail on either prefix |
 
-**This is a route-based split, not an in-Worker one.** Per the epic's
-explicit constraint ("no auth code in the dashboard itself"), the Worker
-never parses a JWT or any other credential — `isAuthenticated` in
-`src/index.ts` is set purely by which path matched. The `/public` prefix is
-the same path `cloudflare-access.md` already reserves as a Bypass
-application (§2 of that guide, added ahead of the Phase-3 public page); the
-existing `/api/*` prefix is left as the "everything else" Allow-gated
-surface that guide already documents. Putting an operator's Access policy in
-front of `/api/*` (and leaving `/public/*` bypassed) is what actually makes
-the split enforceable end to end — **the Worker's own redaction is a
-defense-in-depth control, not a substitute for that edge configuration.**
+**For these two prefixes this is a route-based split, not an in-Worker
+one.** The Worker does not parse a JWT or any other credential on `/api/*`
+or `/public/*` — `isAuthenticated` in `src/index.ts` is set purely by which
+path matched. Putting an operator's Access policy in front of `/api/*` (and
+leaving `/public/*` ungated) is what actually makes the split enforceable
+end to end — **the Worker's own redaction is a defense-in-depth control, not
+a substitute for that edge configuration.** In particular, since issue #4795
+narrowed the old hostname-wide Access application down to `/login`, `/api/*`
+needs its **own** Access application or it is matched by none at all: see
+[`cloudflare-access.md`](cloudflare-access.md) §3e, and the pitfalls table
+row "The `/api/*` query API is reachable without logging in".
+
+**The dashboard root `/` is the one exception** (issue #4795): it verifies
+the visitor's Access JWT in-Worker ([`src/accessAuth.ts`](../src/accessAuth.ts))
+and picks the redacted or unredacted variant of the same page accordingly,
+so a single URL can serve both audiences without dead-ending an anonymous
+visitor at an SSO wall. That check is fail-closed by construction — a
+missing/malformed/expired/wrong-`aud` token, or an unreachable JWKS
+endpoint, all render the public variant. It does **not** change anything
+about the `/api/*` vs. `/public/*` contract described here; the page's own
+live feed simply points at whichever prefix matches the variant it rendered.
 
 **Redaction is one policy layer, one enforcement point.**
 [`src/redaction.ts`](../src/redaction.ts) wraps every `/api/*` and
@@ -38,9 +48,10 @@ private, unauthenticated response for a given `kind` includes only the
 fields that module's table explicitly lists as safe (lifecycle/timing/
 model/rate fields) — every other field, known or not-yet-invented, is
 dropped by default. See that module's doc comment for the full policy,
-including the explicit decision on `tokens.snapshot`/`host.health` (host-level
-kinds with no `repo` reference — passed through unredacted on both
-surfaces).
+including the explicit decisions on the two host-level kinds (no `repo`
+reference on either): `host.health` passes through unredacted on both
+surfaces, while `tokens.snapshot`'s per-account rows are replaced by a
+non-identifying aggregate for public viewers.
 
 Implementation: [`src/query.ts`](../src/query.ts) (filter parsing, the D1
 query, and the live-tail stream — unclassified), [`src/redaction.ts`](../src/redaction.ts)
@@ -64,8 +75,16 @@ always returns full detail.
 {
   "hosts": {
     "host-abc": {
-      "health": { "record": { "kind": "host.health", "...": "..." }, "updatedAt": "2026-07-30T12:00:00Z" },
-      "tokens": { "record": { "kind": "tokens.snapshot", "...": "..." }, "updatedAt": "2026-07-30T12:00:00Z" }
+      "health": {
+        "record": { "kind": "host.health", "...": "..." },
+        "updatedAt": "2026-07-30T12:00:00Z",
+        "freshness": { "status": "live", "ageSeconds": 42 }
+      },
+      "tokens": {
+        "record": { "kind": "tokens.snapshot", "...": "..." },
+        "updatedAt": "2026-07-30T12:00:00Z",
+        "freshness": { "status": "live", "ageSeconds": 42 }
+      }
     }
   },
   "activeSweeps": [
@@ -86,9 +105,29 @@ always returns full detail.
 }
 ```
 
+**`freshness`** (issue #4957): derived from `updatedAt` alone (never the
+daemon-supplied `captured_at`, which a clock-skewed host could spoof) —
+`status` is one of `"live"` (reported within the last ~15 minutes, roughly
+2x the daemon's `host.health`/`tokens.snapshot` sampling cadence),
+`"stale"` (up to ~4 hours), or `"offline"` (beyond that — the daemon has
+very likely stopped, the host is asleep, or it lost its tailnet).
+`ageSeconds` is seconds since `updatedAt`. An entry older than 7 days is
+pruned from the Durable Object entirely on the next snapshot build rather
+than ever appearing here — see `src/fleetState.ts`'s `classifyFreshness`/
+`PRUNE_AFTER_MS`. Both the SSR `/` fallback page (`src/publicPage.ts`) and
+any consumer of this route should treat a `stale`/`offline` sample's
+numbers as historical, never as current.
+
 A completed sweep is not present in `activeSweeps` (removed on
 `sweep.completed` — see `src/fleetState.ts`'s module doc); its full record
 lives in D1 and is queryable via `GET /api/history`.
+
+**Consumer**: the Phase-3 dashboard UI ([`../web/`](../web/)) reads this route
+and only this route. Its client (`web/src/api.ts`) plus the narrowing layer
+(`web/src/parse.ts`) are a worked example of the tolerances this contract
+requires — every `host.health` measurement and most `activeSweeps` fields are
+optional, and an absent measurement must be rendered as unknown rather than
+zero.
 
 On `GET /public/fleet-state`, a `visibility: "private"` entry in
 `activeSweeps` has `repo`/`issue`/`sweepId` omitted entirely (not
@@ -160,8 +199,36 @@ non-integer), or `cursor` (non-positive or non-integer) returns `400` with a
   per-`kind` field allowlist (see `src/redaction.ts`) — e.g. a private
   `sweep.outcome` keeps `model`/`effort`/`config`/`phase_durations`/
   `total_duration_sec`/`result` but never `repo`/`issue`/`sweep_id`/
-  `pr_number`. `tokens.snapshot`/`host.health` records (host-level, no
-  `repo` reference) are never redacted on either route.
+  `pr_number`. `host.health` records (host-level, no `repo` reference) are
+  never redacted on either route.
+
+  `tokens.snapshot` is the one kind whose *shape* differs by route. `/api/*`
+  returns the per-account rows as ingested (`accounts[]`, each with
+  `account`/`rank`/`usage_fraction`/`limit_window_reset_at`/`exhausted`).
+  `/public/*` drops `accounts` entirely and returns a derived aggregate in
+  its place:
+
+  ```json
+  {
+    "kind": "tokens.snapshot",
+    "captured_at": "2026-07-30T12:00:00Z",
+    "account_count": 13,
+    "exhausted_count": 5,
+    "mean_usage_fraction": 0.3246,
+    "max_usage_fraction": 0.91,
+    "next_limit_window_reset_at": "2026-07-30T18:00:00Z"
+  }
+  ```
+
+  How loaded the pool is, and when capacity returns, without naming an
+  account or exposing any single account's burn. The two usage figures are
+  `null` — never `0` — when no account reported a `usage_fraction`.
+  `next_limit_window_reset_at` is the **earliest** per-account
+  `limit_window_reset_at` in the pool, and is likewise `null` — never a
+  fabricated instant — when no account reported one. Each account's
+  `limit_window_reset_at` is the reset of whichever window is gating *that*
+  account (7d once exhausted, 5h otherwise; the daemon resolves it before
+  export), so the aggregate reads as "the first moment any account frees up".
 
 ## `GET /api/events` / `GET /public/events`
 
@@ -236,8 +303,16 @@ poll loop and D1 query are identical to `/api/events`.
   and `/public/events` only support `host`/`repo` filters today; a client
   wanting to filter by model/result filters client-side on the streamed
   frames.
-- **In-Worker Cloudflare Access JWT verification** — the `/api/*` vs
-  `/public/*` split (above) relies entirely on the Cloudflare Access edge
-  policy an operator configures per [`cloudflare-access.md`](cloudflare-access.md);
-  the Worker itself does not verify a signed Access header. See that guide's
-  §5 for the tradeoff and what a future hardening pass would add.
+- **In-Worker Cloudflare Access JWT verification _on these query routes_** —
+  the `/api/*` vs `/public/*` split (above) still relies entirely on the
+  Cloudflare Access edge policy an operator configures per
+  [`cloudflare-access.md`](cloudflare-access.md); neither prefix's handler
+  verifies a credential itself. (The dashboard root `/` **does**, as of issue
+  #4795 — see that guide's §5 and [`src/accessAuth.ts`](../src/accessAuth.ts)
+  — but extending the same check to `/api/*` as defense in depth is
+  deliberately *not* done here: `/api/*` is also reached non-interactively
+  with an Access **service token**, whose JWT carries the `/api/*`
+  application's own `aud`, so a single pinned-`aud` check would reject
+  exactly the callers it must not break. Doing it properly means accepting
+  the `Cf-Access-Jwt-Assertion` header with a per-application `aud`
+  allowlist — a separate change.)

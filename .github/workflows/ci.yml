@@ -22,6 +22,8 @@ jobs:
       backend: ${{ steps.filter.outputs.backend }}
       mcp: ${{ steps.filter.outputs.mcp }}
       scripts: ${{ steps.filter.outputs.scripts }}
+      dashboard: ${{ steps.filter.outputs.dashboard }}
+      docker: ${{ steps.filter.outputs.docker }}
     steps:
       - uses: dorny/paths-filter@v4
         id: filter
@@ -33,13 +35,31 @@ jobs:
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'rust-toolchain.toml'
+              - '.config/nextest.toml'
               - '.github/workflows/ci.yml'
             mcp:
               - 'mcp-loom/**'
               - '.github/workflows/ci.yml'
+            dashboard:
+              - 'dashboard/**'
+              - '.github/workflows/ci.yml'
+            docker:
+              - 'docker/**'
+              - '.dockerignore'
+              - '.github/workflows/ci.yml'
             scripts:
               - 'scripts/**'
               - 'defaults/**'
+              - 'tests/hooks/**'
+              - 'tests/install/**'
+              - 'tests/hermit/**'
+              - 'install.sh'
+              # .loom/hooks/** is git-tracked (self-install dogfooding) and
+              # several defaults/hooks/tests/*.sh + tests/hooks/*.sh suites
+              # assert it's byte-identical to defaults/hooks/** (#4451) — a
+              # drift here without a matching defaults/ change should still
+              # re-run shell-suite-tests on the PR, not just on push to main.
+              - '.loom/hooks/**'
               - '.github/workflows/ci.yml'
 
   backend-lint-and-check:
@@ -66,7 +86,46 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace
+      # Per-test process isolation (#4385). The daemon suite mutates the process
+      # environment at ~774 call sites while other tests in the same binary
+      # `Command::spawn` children; `Command::spawn` reads the environ
+      # non-atomically, so those two classes raced and produced intermittent
+      # failures in hermetic, untouched tests (2026-07-29: pipeline_snapshot on
+      # PR #4305, then quarantine_reconciliation on PR #4320). `#[serial]` only
+      # serializes *marked* tests against each other, so it never closed that
+      # window. nextest runs each test in its own process, which closes it by
+      # construction. Tests whose shared state is genuinely cross-process (the
+      # host-global `tmux -L loom` server) are serialized by the
+      # `daemon-integration` test group in `.config/nextest.toml`.
+      - uses: taiki-e/install-action@nextest
+      - name: Run tests (process-per-test)
+        run: cargo nextest run --workspace --profile ci
+      # nextest does not run doctests, so libtest still owns those (#4385).
+      - name: Run doctests
+        run: cargo test --workspace --doc
+
+  backend-otlp-feature:
+    name: Rust OTLP Feature Build & Test
+    needs: changes
+    if: always() && (github.event_name == 'push' || needs.changes.outputs.backend == 'true')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # The `otlp` feature (#4858, Epic #4702 Phase 4) is off by default, so
+      # the default-feature jobs above never compile or run it — confirmed
+      # during Judge review of PR #4879 that CI had zero `--features otlp` /
+      # `--all-features` coverage anywhere (#4905). --all-targets is required
+      # here (unlike backend-lint-and-check's default job) so the feature's
+      # own unit tests (`otlp/mod.rs`, `otlp/mapping.rs`) are linted too, not
+      # just its non-test code paths.
+      - run: cargo clippy --package loom-daemon --features otlp --all-targets -- -D warnings -A clippy::cast_precision_loss -A clippy::cast_possible_truncation -A clippy::cast_sign_loss -A clippy::too_many_lines -A clippy::panic -A clippy::unwrap_used -A clippy::nonminimal_bool -A clippy::redundant_closure -A clippy::redundant_closure_for_method_calls -A clippy::format_push_string -A clippy::uninlined_format_args
+      - uses: taiki-e/install-action@nextest
+      - name: Run tests (otlp feature)
+        run: cargo nextest run --package loom-daemon --features otlp --profile ci
 
   mcp-build:
     name: MCP Server Build
@@ -80,8 +139,39 @@ jobs:
           node-version: "20"
       - name: Build unified MCP server
         run: cd mcp-loom && npm install && npm run build
+      - name: Run MCP server test suite
+        run: cd mcp-loom && npm test
       - name: Verify build output
         run: test -f mcp-loom/dist/index.js
+
+  dashboard-tests:
+    name: Dashboard Tests (Workers backend + web UI)
+    needs: changes
+    if: always() && (github.event_name == 'push' || needs.changes.outputs.dashboard == 'true')
+    # 442 tests (#4849) across two runtimes that were previously unwired: the
+    # Cloudflare Workers backend (dashboard/, 152 Miniflare/vitest-pool-workers
+    # tests — no Cloudflare credentials needed, runs against local D1 + DO
+    # simulation) and the dashboard UI (dashboard/web/, 290 happy-dom tests).
+    # `npm run check:all` runs both in one command (backend typecheck+test,
+    # then `web`'s typecheck+test via --prefix); `dashboard/package.json`'s
+    # `pretest` hook already runs `scripts/ensure-web-dist.sh` first, since
+    # Wrangler will not parse `wrangler.toml` (and therefore Miniflare will not
+    # boot) until `web/dist/` exists.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "20"
+      - name: Install backend dependencies
+        run: npm ci
+        working-directory: dashboard
+      - name: Install web UI dependencies
+        run: npm ci
+        working-directory: dashboard/web
+      - name: Run backend (Miniflare) + web (happy-dom) suites
+        run: npm run check:all
+        working-directory: dashboard
 
   claude-md-budget:
     name: CLAUDE.md Line Budget
@@ -105,6 +195,23 @@ jobs:
       - name: Check AGENTS.md is in sync with its source
         run: bash scripts/check-agents-md-sync.sh
 
+  docs-defaults-parity:
+    name: Docs/Defaults Parity Check
+    # Cheap structural check; always runs. Consumer repos populate .loom/docs/
+    # FROM defaults/docs/ (resync-installed.sh), so a doc authored only in
+    # .loom/docs/ never ships, and a defaults/docs/ link to a sibling that only
+    # exists in .loom/docs/ is a dead link in every install — this happened
+    # twice (safehouse.md, token-pool.md) before anything caught it (#4841).
+    # The self-test step regression-tests the checker itself against a
+    # synthetic fixture reproducing that exact case.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Self-test the checker against a synthetic fixture
+        run: bash scripts/check-docs-defaults-parity.sh --self-test
+      - name: Check .loom/docs/ orphans and defaults/docs/ sibling links
+        run: bash scripts/check-docs-defaults-parity.sh
+
   installer-tests:
     name: Installer Integration Tests
     needs: changes
@@ -123,6 +230,10 @@ jobs:
         run: bash scripts/test-installer.sh
       - name: Run installer reinstall-safety tests (#4188)
         run: bash defaults/scripts/tests/test-install-reinstall-safety.sh
+      - name: Run install --local/--gitignore mode tests (#5276)
+        run: bash scripts/test-install-local-mode.sh
+      - name: Run migrate-consumer tests (#5276)
+        run: bash scripts/test-migrate-consumer.sh
 
   codex-adapter-smoke:
     name: Codex Adapter Smoke (mocked)
@@ -207,6 +318,29 @@ jobs:
     # with-a-reason, so a new suite cannot silently join an unwired pool.
     # Measured runtime: ~3 min (72 suites; run-ci-suites.sh prints per-suite
     # timing and a total). Kept sequential for deterministic ordering.
+    #
+    # Since #4769 ci-wired.txt also covers the tests/hooks/ Claude-path guard
+    # suites (repo root, not defaults/scripts/tests/ — previously unwired
+    # entirely). tests/hooks/test-guard-destructive.sh alone adds several
+    # minutes (531 assertions); run-ci-suites.sh's per-suite timeout was
+    # raised accordingly (see its header comment).
+    #
+    # Since #4451 ci-wired.txt also covers defaults/hooks/tests/ — the last
+    # unwired guard-hook location (background-subagents, loom-workspace,
+    # worktree-paths, methodology-inject, skill-router; 128 assertions across
+    # the 5 suites). Measured ~1m43s combined on a loaded macOS dev machine
+    # (this repo's only prior execution environment); ubuntu-latest is
+    # expected to be faster (no per-exec Gatekeeper/codesign overhead, cheaper
+    # fork/exec) but this is the suites' first CI run — watch the actual
+    # ubuntu wall-clock here and tighten LOOM_CI_SUITE_TIMEOUT only if needed.
+    #
+    # Since #5275 ci-wired.txt also covers tests/install/ (installer/
+    # uninstaller unit suites — previously appeared in this job's `changes`
+    # paths-filter trigger only, never actually invoked) and tests/hermit/
+    # (the Hermit role's stateless-ceremony heuristic regression guard,
+    # previously not referenced by CI at all). All 8 suites are hermetic
+    # (fake/stub binaries or local python3 AST fixtures, no live network or
+    # forge calls) and run in well under a second each.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -220,3 +354,29 @@ jobs:
         run: bash defaults/scripts/tests/check-ci-suite-manifest.sh
       - name: Run the CI-wired shell test suites
         run: bash defaults/scripts/tests/run-ci-suites.sh
+
+  worker-image-smoke:
+    name: loom-worker Image Smoke Test
+    needs: changes
+    if: always() && (github.event_name == 'push' || needs.changes.outputs.docker == 'true')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Native build (the runner IS x86_64-unknown-linux-gnu) — a full
+      # cross-compile matrix has no place in a per-PR smoke test; the release
+      # workflow's own `build-daemon` matrix already covers every published
+      # target, this job only needs the one Linux artifact the Dockerfile
+      # actually consumes.
+      - name: Build loom-daemon (release)
+        run: cargo build --release --package loom-daemon
+      - name: Package binary at the path the Dockerfile expects
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp target/release/loom-daemon dist/loom-daemon-x86_64-unknown-linux-gnu
+      - name: Build the loom-worker image (no push)
+        run: docker build -f docker/worker/Dockerfile -t loom-worker:ci-smoke .
+      - name: Run the smoke test
+        run: ./docker/worker/test-image.sh loom-worker:ci-smoke

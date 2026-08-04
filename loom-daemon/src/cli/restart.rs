@@ -32,6 +32,20 @@ pub(crate) async fn handle_restart_command(
         std::process::exit(1);
     }
 
+    // Issue #4995: on a launchd host, warn LOUDLY — before scheduling
+    // anything — if the currently-bootstrapped launchd job's environment has
+    // drifted from what the on-disk plist now declares. A plain restart's
+    // `KeepAlive` relaunch reuses the already-bootstrapped job spec, so a
+    // hand-edited plist would otherwise be picked up silently — never.
+    // Best-effort: returns `None` (no output) on every non-launchd /
+    // nothing-to-compare / no-drift outcome, and never blocks or fails the
+    // restart itself.
+    if let Some(warning) = loom_daemon::launchd_env_drift::check_launchd_env_drift() {
+        eprintln!();
+        eprintln!("{warning}");
+        eprintln!();
+    }
+
     // Drain-mode variants (Issue #4090) speak `DrainAndRestartDaemon` /
     // `AbortDrain` and expect a `DaemonDrain` reply; the plain restart keeps its
     // #4054 `RestartDaemon` / `DaemonRestart` contract byte-for-byte.

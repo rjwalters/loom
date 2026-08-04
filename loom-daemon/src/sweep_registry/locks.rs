@@ -118,12 +118,28 @@ impl LockReleaseOutcome {
 
 /// On-disk owner metadata written inside the lock dir. Schema mirrors
 /// `defaults/scripts/spawn-loop.sh:299-305`.
+///
+/// # Schema evolution (Issue #4980)
+///
+/// `pgid` was added after the fact, so it is `Option<u32>` + `#[serde(default)]`:
+/// an `owner.json` written by a pre-#4980 daemon binary (no `pgid` key at all)
+/// **must** still deserialize. Failing to parse it would be far worse than
+/// missing the field — `reconstruct()`, `lock_owned_by_other()`, and
+/// `live_sweep_lock_owner_pid()` all treat an unparseable owner as "no owner",
+/// which drops a *live* sweep's lock. The absent-pgid case degrades to
+/// single-PID signalling with a log line instead.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct LockOwner {
     pub(crate) issue: u32,
     pub(crate) owner_pid: u32,
     pub(crate) acquired_at: String,
     pub(crate) sweep_id: SweepId,
+    /// Process group led by `owner_pid` (Issue #4980). Written by
+    /// [`SweepRegistry::record_child_pid_in_lock`] once the child exists;
+    /// `None` on a provisional (pre-spawn) record and on any `owner.json`
+    /// written before this field existed.
+    #[serde(default)]
+    pub(crate) pgid: Option<u32>,
 }
 
 impl SweepRegistry {
@@ -188,10 +204,7 @@ impl SweepRegistry {
                 // crashed, not "unregistered" — do not report it as alive.
                 continue;
             }
-            let already_registered = self.entries.values().any(|info| {
-                !info.state.is_terminal() && matches!(info.kind, SweepKind::Issue(i) if i == issue)
-            });
-            if !already_registered {
+            if !self.has_tracked_sweep_for(issue) {
                 result.push((issue, owner.owner_pid));
             }
         }
@@ -222,6 +235,12 @@ impl SweepRegistry {
                     owner_pid: std::process::id(),
                     acquired_at: Utc::now().to_rfc3339(),
                     sweep_id: sweep_id.to_string(),
+                    // Provisional too (Issue #4980): the child's process group
+                    // does not exist yet, and recording the DAEMON's group here
+                    // would be actively dangerous — a later group-kill would
+                    // target the daemon itself. `record_child_pid_in_lock`
+                    // stamps the real value once the child is running.
+                    pgid: None,
                 };
                 let owner_json =
                     serde_json::to_string_pretty(&owner).context("serialize lock owner")?;
@@ -250,7 +269,19 @@ impl SweepRegistry {
     /// `Crashed` entry even for a child that was still alive. Storing the
     /// child PID lets the lock pass admit a genuinely-live child as `Running`
     /// across a restart. The rest of the owner record is preserved.
-    pub(crate) fn record_child_pid_in_lock(&self, issue: u32, child_pid: u32) -> Result<()> {
+    ///
+    /// Issue #4980 additionally stamps `pgid` — the process group the child
+    /// leads (`process_group(0)`, #3800). The pid alone is not enough to tear
+    /// down a sweep after the spawning daemon is gone: the OS can only report a
+    /// *live* process's group, so once the wrapper dies its surviving
+    /// descendants become unreachable-by-group unless the value was persisted
+    /// while it was alive. `None` leaves the field untouched (unknown group).
+    pub(crate) fn record_child_pid_in_lock(
+        &self,
+        issue: u32,
+        child_pid: u32,
+        pgid: Option<u32>,
+    ) -> Result<()> {
         let owner_path = self
             .config
             .locks_dir()
@@ -261,6 +292,9 @@ impl SweepRegistry {
         let mut owner: LockOwner =
             serde_json::from_str(&existing).context("parse lock owner.json")?;
         owner.owner_pid = child_pid;
+        if pgid.is_some() {
+            owner.pgid = pgid;
+        }
         let owner_json = serde_json::to_string_pretty(&owner).context("serialize lock owner")?;
         std::fs::write(&owner_path, owner_json)
             .with_context(|| format!("write lock owner {}", owner_path.display()))?;
@@ -460,6 +494,10 @@ impl SweepRegistry {
             owner_pid: std::process::id(),
             acquired_at: Utc::now().to_rfc3339(),
             sweep_id: watchdog_sweep_id.clone(),
+            // The watchdog holds this lock itself while it cleans a worktree —
+            // there is no sweep child, and recording OUR OWN group would let a
+            // later group-kill target the daemon (#4980).
+            pgid: None,
         };
         let takeover = serde_json::to_string_pretty(&owner)
             .context("serialize midbuild-watchdog lock owner")
@@ -487,16 +525,43 @@ impl SweepRegistry {
     /// Read-only: unlike [`release_lock_owned`](Self::release_lock_owned) it
     /// never touches the filesystem, so it is safe to consult *before* a
     /// release, a label revert, or a re-dispatch. Delegates to
-    /// [`crate::live_claim::probe`], scoped to this registry's workspace root
-    /// and its configured journal path (tests point that at a tempdir, so the
-    /// probe never reads the real `~/.loom/sweeps.json`).
+    /// [`crate::live_claim::probe_excluding`], scoped to this registry's
+    /// workspace root and its configured journal path (tests point that at a
+    /// tempdir, so the probe never reads the real `~/.loom/sweeps.json`).
+    ///
+    /// Issue #5236: passes this daemon's own pid as the exclusion whenever
+    /// this registry has no tracked (non-terminal) entry for `issue` — the
+    /// only way a lock's `owner_pid` can legitimately equal `std::process::id()`
+    /// is `acquire_lock`'s provisional placeholder before the spawned child's
+    /// real pid is recorded (`record_child_pid_in_lock`, #3808). If that
+    /// rewrite never ran and this registry also has no tracked entry for the
+    /// issue, the lock is stale by construction — a leaked placeholder from a
+    /// `spawn_child` failure, not a confirmed-live claim — so the daemon's own
+    /// (necessarily still-alive) pid must not count as evidence against
+    /// itself. A registry that DOES have a tracked entry for the issue keeps
+    /// the exclusion off, so an actual in-flight dispatch's transient
+    /// pre-rewrite window is never misread as stale.
     #[must_use]
     pub fn live_claim_evidence(&self, issue: u32) -> Option<crate::live_claim::LiveClaimEvidence> {
-        crate::live_claim::probe(
+        let own_untracked_pid = (!self.has_tracked_sweep_for(issue)).then_some(std::process::id());
+        crate::live_claim::probe_excluding(
             &self.config.workspace_root,
             self.config.journal_path.as_deref(),
             issue,
+            own_untracked_pid,
         )
+    }
+
+    /// Whether this registry has a non-terminal (`Pending`/`Running`) entry
+    /// tracking a sweep for `issue` — shared by [`Self::live_claim_evidence`]
+    /// (#5236) and [`Self::unregistered_locked_issues`] (#4214), both of
+    /// which need the same "does our own bookkeeping know about this issue"
+    /// question.
+    #[must_use]
+    fn has_tracked_sweep_for(&self, issue: u32) -> bool {
+        self.entries.values().any(|info| {
+            !info.state.is_terminal() && matches!(info.kind, SweepKind::Issue(i) if i == issue)
+        })
     }
 
     // ------------------------------------------------------------------------
@@ -578,6 +643,19 @@ impl SweepRegistry {
                     // dispatched this issue, so record the issue — the
                     // checkpoint pass may recover it as `Crashed` — then drop
                     // the stale lock and continue.
+                    //
+                    // Issue #4980 crash-path reap: a dead *leader* does not mean
+                    // a dead *tree*. The 2026-08-03 incident was exactly this
+                    // shape — the tracked wrapper was gone while the `claude`
+                    // agent it had spawned kept running (and relaunched its
+                    // workload) against an issue whose claim had already been
+                    // returned to the queue. The persisted `pgid` is the only
+                    // remaining handle on those survivors (the OS cannot report
+                    // a dead pid's group), so reap the group before dropping the
+                    // lock that records it.
+                    if let Some(pgid) = owner.pgid {
+                        self.reap_orphaned_group(&owner.sweep_id, Some(issue), pgid);
+                    }
                     daemon_owned_dead.insert(issue);
                     let _ = std::fs::remove_dir_all(&path);
                     continue;
@@ -593,12 +671,37 @@ impl SweepRegistry {
                 // to `unknown`. Degrades gracefully — adoption never fails here.
                 let token_name = recover_adopted_token_name(&log_path, &owner.sweep_id);
                 let runtime = recover_adopted_runtime(&log_path, &owner.sweep_id);
+                // Issue #4980: carry the persisted process group onto the
+                // reconstructed entry so a post-restart cancel still tears down
+                // the WHOLE tree instead of degrading to a single-PID kill that
+                // orphans the `claude` agent and its descendants. Re-verified
+                // against the live owner rather than trusted blindly: the owner
+                // is alive here (checked above), so the OS can confirm the
+                // recorded group is still the one it leads. A disagreement means
+                // the record is stale (PID recycled between daemons), and
+                // group-killing a stranger's group is exactly the blast radius
+                // this must never have — drop to `None` and degrade.
+                let pgid = owner.pgid.filter(|&recorded| {
+                    let actual = process_group_of(owner.owner_pid);
+                    if actual == Some(recorded) {
+                        true
+                    } else {
+                        log::warn!(
+                            "reconstruct: issue #{issue} lock records pgid {recorded} for owner \
+                             pid {} but the OS reports {actual:?} — ignoring the recorded group \
+                             and degrading to single-PID signalling (#4980)",
+                            owner.owner_pid
+                        );
+                        false
+                    }
+                });
                 self.entries.insert(
                     owner.sweep_id.clone(),
                     SweepInfo {
                         sweep_id: owner.sweep_id.clone(),
                         kind: SweepKind::Issue(issue),
                         pid: owner.owner_pid,
+                        pgid,
                         token_name,
                         runtime,
                         runtime_source: None,
@@ -675,6 +778,11 @@ impl SweepRegistry {
                         sweep_id,
                         kind: SweepKind::Issue(issue),
                         pid: 0, // unknown — owner is gone
+                        // Likewise unknown (#4980): the lock that recorded the
+                        // process group was already removed as stale by the pass
+                        // above, and its group (if any survivors remained) was
+                        // reaped there.
+                        pgid: None,
                         // Issue #4173: a checkpoint-only entry has no lock
                         // `sweep_id` anchor to recover the token against (the
                         // lock was already removed as stale above), so this
@@ -730,6 +838,7 @@ mod tests {
         let lock = locks.join("issue-77");
         std::fs::create_dir(&lock).unwrap();
         let owner = LockOwner {
+            pgid: None,
             issue: 77,
             owner_pid: std::process::id(),
             acquired_at: Utc::now().to_rfc3339(),
@@ -760,6 +869,7 @@ mod tests {
         let lock = locks.join("issue-4201");
         std::fs::create_dir(&lock).unwrap();
         let owner = LockOwner {
+            pgid: None,
             issue: 4201,
             owner_pid: std::process::id(), // guaranteed alive
             acquired_at: Utc::now().to_rfc3339(),
@@ -789,6 +899,7 @@ mod tests {
         let lock = locks.join("issue-4202");
         std::fs::create_dir(&lock).unwrap();
         let owner = LockOwner {
+            pgid: None,
             issue: 4202,
             owner_pid: std::process::id(),
             acquired_at: Utc::now().to_rfc3339(),
@@ -822,6 +933,7 @@ mod tests {
         let lock = locks.join("issue-4203");
         std::fs::create_dir(&lock).unwrap();
         let owner = LockOwner {
+            pgid: None,
             issue: 4203,
             owner_pid: 2_147_483_640, // dead
             acquired_at: Utc::now().to_rfc3339(),
@@ -848,6 +960,7 @@ mod tests {
         let lock = locks.join("issue-78");
         std::fs::create_dir(&lock).unwrap();
         let owner = LockOwner {
+            pgid: None,
             issue: 78,
             owner_pid: 2_147_483_640, // dead
             acquired_at: Utc::now().to_rfc3339(),
@@ -898,6 +1011,7 @@ mod tests {
         let lock = locks.join("issue-91");
         std::fs::create_dir(&lock).unwrap();
         let owner = LockOwner {
+            pgid: None,
             issue: 91,
             owner_pid: 2_147_483_640, // dead
             acquired_at: Utc::now().to_rfc3339(),
@@ -1064,6 +1178,7 @@ mod tests {
         std::fs::create_dir(&lock).unwrap();
         let sweep_id = "sweep-issue-401-adopt";
         let owner = LockOwner {
+            pgid: None,
             issue: 401,
             owner_pid: std::process::id(), // alive → admitted as Running
             acquired_at: Utc::now().to_rfc3339(),
@@ -1109,6 +1224,7 @@ mod tests {
         let lock_a = locks.join("issue-402");
         std::fs::create_dir(&lock_a).unwrap();
         let owner_a = LockOwner {
+            pgid: None,
             issue: 402,
             owner_pid: std::process::id(),
             acquired_at: Utc::now().to_rfc3339(),
@@ -1125,6 +1241,7 @@ mod tests {
         let lock_b = locks.join("issue-403");
         std::fs::create_dir(&lock_b).unwrap();
         let owner_b = LockOwner {
+            pgid: None,
             issue: 403,
             owner_pid: std::process::id(),
             acquired_at: Utc::now().to_rfc3339(),

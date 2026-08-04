@@ -62,6 +62,31 @@ impl SweepRegistry {
     /// fixtures), or when `gh` is unavailable — a conservative default that
     /// never blocks a child on an unverifiable parent state.
     pub(crate) fn issue_has_blocked_label(&self, issue: u32) -> bool {
+        self.issue_has_label_via_graphql(issue, "loom:blocked")
+    }
+
+    /// Best-effort check of whether `issue` currently carries the
+    /// `loom:operator-only` label on the forge (Issue #4887). Used by
+    /// [`restore_label_to_ready`](super::guards::SweepRegistry::restore_label_to_ready)
+    /// alongside [`Self::issue_has_blocked_label`] so the crash-path claim
+    /// restore never re-adds `loom:issue` on top of either park label.
+    ///
+    /// Returns `false` on any error, when label flips are skipped (test
+    /// fixtures), or when `gh` is unavailable — the same fail-open default as
+    /// [`Self::issue_has_blocked_label`].
+    pub(crate) fn issue_has_operator_only_label(&self, issue: u32) -> bool {
+        self.issue_has_label_via_graphql(issue, "loom:operator-only")
+    }
+
+    /// Shared GraphQL-backed (`gh issue view --json labels`) probe for a single
+    /// label's presence on `issue`, factored out of
+    /// [`Self::issue_has_blocked_label`] so [`Self::issue_has_operator_only_label`]
+    /// (#4887) does not duplicate the command-building/timeout plumbing.
+    ///
+    /// Fails closed (`false`) on any read failure, exactly like the two
+    /// callers it backs — never block a cascade, or claim a park label is
+    /// present, on an unverifiable read.
+    fn issue_has_label_via_graphql(&self, issue: u32, label: &str) -> bool {
         if self.config.skip_label_flip {
             return false;
         }
@@ -77,17 +102,17 @@ impl SweepRegistry {
             .arg("--json")
             .arg("labels")
             .arg("--jq")
-            .arg(r#"[.labels[].name] | index("loom:blocked") != null"#);
-        // Scope the blocked-label probe to the registry's workspace so it
-        // resolves against the right repo in a multi-workspace daemon (#3937).
+            .arg(format!(r#"[.labels[].name] | index("{label}") != null"#));
+        // Scope the label probe to the registry's workspace so it resolves
+        // against the right repo in a multi-workspace daemon (#3937).
         cmd.current_dir(&self.config.workspace_root);
         if let Ok(repo) = std::env::var("LOOM_REPO") {
             cmd.arg("--repo").arg(repo);
         }
         // Bounded so a wedged `gh` on the `ListSweeps` / `GetSweepStatus` read
         // path (this runs inside `reap_liveness`) cannot block the registry read
-        // indefinitely (Issue #3973). A timeout is treated as not-blocked — the
-        // same conservative default as any other `gh` failure here.
+        // indefinitely (Issue #3973). A timeout is treated as absent — the same
+        // conservative default as any other `gh` failure here.
         let timeout = reap_gh_timeout();
         match output_with_timeout(cmd, timeout) {
             Ok(Some(out)) if out.status.success() => {
@@ -95,8 +120,8 @@ impl SweepRegistry {
             }
             Ok(None) => {
                 log::warn!(
-                    "sweep_registry: issue_has_blocked_label gh for #{issue} exceeded {}s \
-                     and was killed; treating as not-blocked (#3973)",
+                    "sweep_registry: issue_has_label_via_graphql({label}) gh for #{issue} \
+                     exceeded {}s and was killed; treating as absent (#3973)",
                     timeout.as_secs()
                 );
                 false
@@ -144,6 +169,7 @@ mod tests {
             registry.entries.insert(
                 sid.to_string(),
                 SweepInfo {
+                    pgid: None,
                     sweep_id: sid.to_string(),
                     kind: SweepKind::Issue(issue),
                     pid: 2_147_483_640,
@@ -190,6 +216,7 @@ mod tests {
 
         fn mk(issue: u32, dep: Option<u32>, state: SweepState) -> SweepInfo {
             SweepInfo {
+                pgid: None,
                 sweep_id: format!("s{issue}"),
                 kind: SweepKind::Issue(issue),
                 pid: 2_147_483_640,

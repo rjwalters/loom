@@ -482,7 +482,8 @@ fn print_status_unreachable_human(
 /// this binary's own socket/install-state machinery) lives here.
 pub(crate) async fn handle_fleet_status_command(json: bool) -> Result<()> {
     use loom_daemon::fleet::status::{
-        collect_fleet_report, update_last_seen_up_at, SshStatusSource,
+        all_tailnet_hosts_unreachable, collect_fleet_report, update_last_seen_up_at,
+        SshStatusSource,
     };
     use loom_daemon::fleet::FleetRegistry;
 
@@ -493,7 +494,16 @@ pub(crate) async fn handle_fleet_status_command(json: bool) -> Result<()> {
     let source: Arc<dyn loom_daemon::fleet::status::HostStatusSource> =
         Arc::new(SshStatusSource::new());
     let timeout = Duration::from_secs(loom_daemon::fleet::status::DEFAULT_TIMEOUT_SECS);
-    let report = collect_fleet_report(source, registry, local, timeout).await;
+    let mut report = collect_fleet_report(source, registry, local, timeout).await;
+
+    // #4952: when every tailnet-addressed roster host is UNREACHABLE, that
+    // pattern is indistinguishable from a genuine multi-host outage without
+    // checking whether the LOCAL tailnet client is actually the thing that
+    // is down (the 2026-08-02 robb-STUDIO incident this issue documents).
+    // Cheap, local-only, best-effort: never blocks the report on failure.
+    if all_tailnet_hosts_unreachable(&report.hosts) {
+        report.local_tailnet = check_local_tailnet_state();
+    }
 
     // #4697: persist "last observed Up" so a LATER poll that finds this host
     // Unreachable can measure elapsed silence against its configured
@@ -581,6 +591,134 @@ async fn collect_local_fleet_report() -> loom_daemon::fleet::status::HostReport 
     }
 }
 
+/// #4952: cheap, local-only self-check for "is the tailnet client on THIS
+/// host actually the thing that's down" — run only when
+/// [`all_tailnet_hosts_unreachable`](loom_daemon::fleet::status::all_tailnet_hosts_unreachable)
+/// flags every tailnet-addressed remote roster host as `Unreachable`, since
+/// that pattern is otherwise indistinguishable from a genuine multi-host
+/// outage. Never an SSH round-trip (that is [`HostStatusSource`](loom_daemon::fleet::status::HostStatusSource)'s job) —
+/// this shells out to the LOCAL `tailscale` CLI exactly once.
+///
+/// Returns `None` when the check is a no-op — AC 4: a missing `tailscale`
+/// CLI must not become a new hard dependency, so an absent binary
+/// (`ErrorKind::NotFound`) silently skips the check rather than erroring the
+/// whole report (current, pre-#4952 behavior unchanged).
+fn check_local_tailnet_state() -> Option<loom_daemon::fleet::status::LocalTailnetState> {
+    use loom_daemon::fleet::status::LocalTailnetState;
+
+    let output = match std::process::Command::new("tailscale")
+        .args(["status", "--json"])
+        .stdin(std::process::Stdio::null())
+        .output()
+    {
+        Ok(out) => out,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        // Some other launch failure (permissions, etc.) — degrade rather
+        // than erroring the report, same as `SafehousedProbe::Unknown`.
+        Err(_) => return Some(LocalTailnetState::Unknown),
+    };
+
+    classify_tailscale_status_output(&output.stdout)
+}
+
+/// Parse `tailscale status --json`'s stdout into a [`LocalTailnetState`]
+/// (split out from [`check_local_tailnet_state`] so it is unit-testable
+/// without shelling out). `BackendState: "Running"` is up; any other
+/// `BackendState` value (`"Stopped"`, `"NeedsLogin"`, …) is down for this
+/// purpose — the self-check only needs to distinguish "the local tailnet
+/// client can currently reach the tailnet" from "it cannot," not classify
+/// every backend state individually. Unparseable output degrades to
+/// `Unknown` rather than misreporting either up or down.
+#[must_use]
+fn classify_tailscale_status_output(
+    stdout: &[u8],
+) -> Option<loom_daemon::fleet::status::LocalTailnetState> {
+    use loom_daemon::fleet::status::LocalTailnetState;
+
+    let text = String::from_utf8_lossy(stdout);
+    match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(value) => match value.get("BackendState").and_then(|v| v.as_str()) {
+            Some("Running") => Some(LocalTailnetState::Up),
+            Some(_) => Some(LocalTailnetState::Down),
+            None => Some(LocalTailnetState::Unknown),
+        },
+        Err(_) => Some(LocalTailnetState::Unknown),
+    }
+}
+
+#[cfg(test)]
+mod local_tailnet_tests {
+    //! #4952: the local tailnet self-check. `classify_tailscale_status_output`
+    //! is exercised directly against canned JSON (no process spawn, no PATH
+    //! mutation, safe to run in parallel with everything else). The
+    //! CLI-absent path (AC 4) is exercised end-to-end through
+    //! `check_local_tailnet_state` against a PATH with no `tailscale` binary
+    //! on it at all — serialized against any other PATH-mutating test in this
+    //! binary so parallel `cargo test` threads cannot race the shared
+    //! process-wide `PATH` env var.
+    use super::{check_local_tailnet_state, classify_tailscale_status_output};
+    use loom_daemon::fleet::status::LocalTailnetState;
+
+    #[test]
+    fn classifies_running_backend_state_as_up() {
+        let stdout = br#"{"BackendState":"Running","Self":{}}"#;
+        assert_eq!(classify_tailscale_status_output(stdout), Some(LocalTailnetState::Up));
+    }
+
+    #[test]
+    fn classifies_stopped_backend_state_as_down() {
+        let stdout = br#"{"BackendState":"Stopped"}"#;
+        assert_eq!(classify_tailscale_status_output(stdout), Some(LocalTailnetState::Down));
+    }
+
+    #[test]
+    fn classifies_other_non_running_backend_states_as_down() {
+        // NeedsLogin, NeedsMachineAuth, etc. all mean "cannot currently reach
+        // the tailnet" for this self-check's purposes — not just "Stopped".
+        let stdout = br#"{"BackendState":"NeedsLogin"}"#;
+        assert_eq!(classify_tailscale_status_output(stdout), Some(LocalTailnetState::Down));
+    }
+
+    #[test]
+    fn classifies_unparseable_output_as_unknown_not_up_or_down() {
+        assert_eq!(
+            classify_tailscale_status_output(b"not json at all"),
+            Some(LocalTailnetState::Unknown)
+        );
+    }
+
+    #[test]
+    fn classifies_missing_backend_state_field_as_unknown() {
+        assert_eq!(
+            classify_tailscale_status_output(br#"{"Self":{}}"#),
+            Some(LocalTailnetState::Unknown)
+        );
+    }
+
+    /// AC 4: an absent `tailscale` CLI must be a silent no-op (`None`), not
+    /// an error or an `Unknown` state — current, pre-#4952 behavior
+    /// unchanged.
+    #[test]
+    #[serial_test::serial(status_rs_stub_ssh_path)]
+    fn check_local_tailnet_state_is_none_when_tailscale_cli_absent() {
+        let empty_dir = tempfile::tempdir().unwrap();
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        // A PATH containing only an empty directory guarantees `tailscale`
+        // cannot resolve, regardless of what's installed on the real host
+        // running this test.
+        std::env::set_var("PATH", empty_dir.path());
+
+        let result = check_local_tailnet_state();
+
+        std::env::set_var("PATH", old_path);
+
+        assert_eq!(
+            result, None,
+            "absent tailscale CLI must skip the check silently, got {result:?}"
+        );
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod status_client_tests {
     //! empty-output failure mode. A daemon under concurrent-sweep load could
@@ -612,12 +750,14 @@ pub(crate) mod status_client_tests {
             token_pool_size: 4,
             token_pool_dir: Some(std::path::PathBuf::from("/repo/a/.loom/tokens")),
             disk_headroom: 10,
+            ram_headroom: 10,
             logical_cpus: 8,
             loadavg_1m: Some(1.25),
             cpu_idle_fraction: Some(0.90),
             capacity_bound: false,
             preflight_advisory_active: false,
             preflight_advisory_message: None,
+            preflight_advisory_changed_at: None,
             configured_max: 5,
             per_token_concurrency: 2,
             dynamic_cap: 3,
@@ -656,9 +796,18 @@ pub(crate) mod status_client_tests {
             auto_update_terminal_reason: None,
             auto_update_note: None,
             host_breaker: None,
+            admission_brake: None,
             rate_limit_breaker: None,
             safehouse: None,
             work_finder_enabled: Some(true),
+            last_work_finder_tick: None,
+            role_tick_records: vec![],
+            daemon_pid: Some(99917),
+            pid_file: Some(std::path::PathBuf::from("/repo/a/.loom/.daemon.pid")),
+            daemon_build_commit: Some("18887b5c".to_string()),
+            work_finder_interval_secs: Some(60),
+            observability_host_id_mismatch: None,
+            observability_export: None,
         }
     }
 

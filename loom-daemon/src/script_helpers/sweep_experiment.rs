@@ -217,6 +217,110 @@ pub fn resolve_effective_mode_default(
 // Deterministic, resume-safe, stratified arm assignment
 // --------------------------------------------------------------------------
 
+/// The marker's key inside the `<!-- ... -->` comment, including the `=`.
+const COMPLEXITY_MARKER_KEY: &str = "loom:complexity=";
+/// The opening delimiter of the canonical HTML-comment marker form.
+const COMMENT_OPEN: &str = "<!--";
+/// The closing delimiter of the canonical HTML-comment marker form.
+const COMMENT_CLOSE: &str = "-->";
+
+/// Extract the Curator's `<!-- loom:complexity=<tier> -->` tier from an issue
+/// body (issues #3702/#4238/#4448), so a dispatch-time caller can hand a REAL
+/// stratum to [`assign_arm`] instead of the `None` → `routine` default (#4827).
+///
+/// Mirrors `resolve-tier-model.sh` / `require-complexity-marker.sh`'s extraction
+/// as of #4845:
+/// `grep -oE '<!--[[:space:]]*loom:complexity=[a-z]*[[:space:]]*-->' | tail -1`.
+/// Two properties matter and are both reproduced here:
+///
+/// 1. **Anchored to the canonical `<!-- ... -->` comment form.** A bare
+///    `loom:complexity=` substring also fires on prose that merely *discusses*
+///    the marker syntax — e.g. this very issue (#4827) quotes
+///    `` `<!-- loom:complexity=<tier> -->` `` as literal example text. The `<`
+///    after `=` breaks the `-->` anchor, so such mentions are skipped rather
+///    than yielding an empty match (#4840).
+/// 2. **The LAST match wins**, matching where the real marker is conventionally
+///    placed (at the end of the body).
+///
+/// Like `grep`, matching is line-oriented: a marker split across a newline is
+/// not recognized by either implementation. An empty tier
+/// (`<!-- loom:complexity= -->`) yields `None`, matching the shell's empty-`tier`
+/// fall-through to `routine`.
+///
+/// Deliberately does NOT validate against the closed
+/// `mechanical|routine|complex` vocabulary: [`normalize_complexity`] already
+/// folds every out-of-vocabulary value to `routine`, so an extra check here
+/// would only duplicate that behavior (and could drift from it).
+#[must_use]
+pub fn extract_complexity_marker(body: &str) -> Option<&str> {
+    // `tail -1` over `grep`'s document-order match stream: scan lines back to
+    // front, and within a line take that line's last match.
+    body.lines().rev().find_map(last_marker_in_line)
+}
+
+/// The last `<!-- loom:complexity=<tier> -->` tier on a single line, if any.
+///
+/// Scans left to right (as `grep -o` does, over non-overlapping matches) and
+/// keeps the final hit, so a line carrying several markers resolves to the
+/// rightmost one.
+fn last_marker_in_line(line: &str) -> Option<&str> {
+    let mut found = None;
+    let mut cursor = 0;
+    while let Some(rel) = line[cursor..].find(COMMENT_OPEN) {
+        let open = cursor + rel;
+        let after_open = open + COMMENT_OPEN.len();
+        match parse_marker_body(&line[after_open..]) {
+            // A well-formed marker: record it and resume after its `-->` so
+            // matches stay non-overlapping. An empty tier still counts as a
+            // match for cursor purposes (grep consumed it) but yields no
+            // stratum — the shell's `case` folds it to `routine` too.
+            Some((tier, consumed)) => {
+                if !tier.is_empty() {
+                    found = Some(tier);
+                }
+                cursor = after_open + consumed;
+            }
+            // Not a marker comment (prose, an unrelated HTML comment, a
+            // `<tier>` placeholder): resume just past this `<!--`.
+            None => cursor = after_open,
+        }
+    }
+    found
+}
+
+/// Parse `[[:space:]]*loom:complexity=[a-z]*[[:space:]]*-->` at the start of
+/// `rest`, returning the tier (possibly empty, since the regex's `[a-z]*` is a
+/// *star*) plus the number of bytes consumed through the closing `-->`.
+/// `None` means the text is not a marker comment at all.
+fn parse_marker_body(rest: &str) -> Option<(&str, usize)> {
+    let after_ws = rest.len() - rest.trim_start_matches(is_marker_space).len();
+    let rest_after_ws = &rest[after_ws..];
+    let after_key = after_ws + COMPLEXITY_MARKER_KEY.len();
+    if !rest_after_ws.starts_with(COMPLEXITY_MARKER_KEY) {
+        return None;
+    }
+
+    let value = &rest[after_key..];
+    let tier_len = value
+        .find(|c: char| !c.is_ascii_lowercase())
+        .unwrap_or(value.len());
+    let tier = &value[..tier_len];
+
+    let tail = &value[tier_len..];
+    let tail_ws = tail.len() - tail.trim_start_matches(is_marker_space).len();
+    if !tail[tail_ws..].starts_with(COMMENT_CLOSE) {
+        return None;
+    }
+    let consumed = after_key + tier_len + tail_ws + COMMENT_CLOSE.len();
+    Some((tier, consumed))
+}
+
+/// POSIX `[[:space:]]` for the marker regex. `lines()` has already stripped
+/// `\n`, so this is the intra-line subset (`grep` never matches across lines).
+fn is_marker_space(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\r' | '\x0b' | '\x0c')
+}
+
 /// Normalize the #3702 marker to `complex` | `routine` (default `routine`).
 #[must_use]
 pub fn normalize_complexity(complexity: Option<&str>) -> &'static str {
@@ -1148,6 +1252,130 @@ mod tests {
         // An absent/unknown marker is `routine`.
         assert_eq!(assign_arm(100, None), "A");
         assert_eq!(assign_arm(100, Some("mystery")), "A");
+    }
+
+    // ===== `<!-- loom:complexity=... -->` extraction (#4827) =====
+
+    /// The happy path for all three in-vocabulary tiers, in the exact HTML
+    /// comment form the Curator writes.
+    #[test]
+    fn extracts_complexity_marker_from_issue_body() {
+        for tier in ["mechanical", "routine", "complex"] {
+            let body = format!("## Context\n\nSome text.\n\n<!-- loom:complexity={tier} -->\n");
+            assert_eq!(extract_complexity_marker(&body), Some(tier));
+        }
+    }
+
+    /// No marker at all (a pre-marker issue) → `None`, which
+    /// [`normalize_complexity`] folds to the unchanged `routine` default.
+    #[test]
+    fn extracts_nothing_when_no_marker_present() {
+        assert_eq!(extract_complexity_marker("no marker here"), None);
+        assert_eq!(extract_complexity_marker(""), None);
+        assert_eq!(normalize_complexity(extract_complexity_marker("nope")), "routine");
+    }
+
+    /// `tail -1` semantics (#4845): the LAST canonical marker wins, whether the
+    /// competing markers are on separate lines or share one — matching
+    /// `resolve-tier-model.sh`'s "last marker wins" test.
+    #[test]
+    fn extracts_last_marker_when_several_present() {
+        let body = "<!-- loom:complexity=complex -->\n<!-- loom:complexity=mechanical -->";
+        assert_eq!(extract_complexity_marker(body), Some("mechanical"));
+        // Several on one line: the rightmost wins (grep -o + tail -1).
+        let one_line = "<!-- loom:complexity=complex --> <!-- loom:complexity=routine -->";
+        assert_eq!(extract_complexity_marker(one_line), Some("routine"));
+    }
+
+    /// The #4840 regression, in the exact shape that triggered it: a body that
+    /// *discusses* the marker syntax in prose (quoting
+    /// `<!-- loom:complexity=<tier> -->` as literal example text) before the
+    /// real marker. The `<` after `=` breaks the `-->` anchor, so the prose
+    /// mention must be skipped rather than shadowing the real marker.
+    ///
+    /// This is not hypothetical — issue #4827 itself is such a body.
+    #[test]
+    fn extraction_ignores_prose_that_merely_mentions_the_marker_syntax() {
+        let body = "Meta issue about the complexity-marker feature, which quotes the \
+                    syntax as literal example text: `<!-- loom:complexity=<tier> -->`.\n\
+                    \n<!-- loom:complexity=mechanical -->\n";
+        assert_eq!(extract_complexity_marker(body), Some("mechanical"));
+
+        // A prose mention with NO real marker anywhere resolves to `None` (the
+        // `routine` stratum) rather than an empty-string tier.
+        assert_eq!(
+            extract_complexity_marker("see `<!-- loom:complexity=<tier> -->` for the form"),
+            None
+        );
+    }
+
+    /// Anchoring semantics (#4845): only the full `<!-- ... -->` comment form
+    /// counts. A bare `loom:complexity=` substring — the pre-#4845 match — is
+    /// no longer a marker.
+    #[test]
+    fn extraction_requires_the_canonical_comment_form() {
+        // Bare substring, no comment delimiters: not a marker.
+        assert_eq!(extract_complexity_marker("loom:complexity=complex"), None);
+        // Opening delimiter but no closing one.
+        assert_eq!(extract_complexity_marker("<!-- loom:complexity=complex"), None);
+        // Closing delimiter but no opening one.
+        assert_eq!(extract_complexity_marker("loom:complexity=complex -->"), None);
+        // `[[:space:]]*` is a star on both sides: no padding is still valid.
+        assert_eq!(extract_complexity_marker("<!--loom:complexity=complex-->"), Some("complex"));
+        // ...and generous padding (including tabs) is too.
+        assert_eq!(
+            extract_complexity_marker("<!--\t  loom:complexity=complex \t -->"),
+            Some("complex")
+        );
+    }
+
+    /// `[a-z]*` semantics: the value is the maximal run of ASCII lowercase
+    /// after the `=`, and anything that leaves the `-->` unreachable — or
+    /// leaves the tier empty — is `None` (the `routine` stratum).
+    #[test]
+    fn extraction_matches_the_shell_character_class() {
+        // A non-`[a-z]` char inside the value truncates the run, which then
+        // fails to reach `-->` — so the whole comment is not a marker.
+        assert_eq!(extract_complexity_marker("<!-- loom:complexity=comp1ex -->"), None);
+        assert_eq!(extract_complexity_marker("<!-- loom:complexity=Complex -->"), None);
+        // A well-formed but valueless marker: `[a-z]*` matches zero chars, and
+        // the shell's `case` folds the empty tier to `routine` just as this
+        // `None` does.
+        assert_eq!(extract_complexity_marker("<!-- loom:complexity= -->"), None);
+        assert_eq!(
+            normalize_complexity(extract_complexity_marker("<!-- loom:complexity= -->")),
+            "routine"
+        );
+        // An empty-tier marker does not shadow a real one later in the body.
+        assert_eq!(
+            extract_complexity_marker(
+                "<!-- loom:complexity= -->\n<!-- loom:complexity=complex -->"
+            ),
+            Some("complex")
+        );
+    }
+
+    /// `grep` is line-oriented, so a marker split across a newline is not a
+    /// match in either implementation.
+    #[test]
+    fn extraction_does_not_match_across_lines() {
+        assert_eq!(extract_complexity_marker("<!-- loom:complexity=complex\n-->"), None);
+        assert_eq!(extract_complexity_marker("<!--\nloom:complexity=complex -->"), None);
+    }
+
+    /// Extraction composes with [`assign_arm`] to give the two strata an
+    /// independent A/B split — the whole point of #4827.
+    #[test]
+    fn extracted_marker_shifts_the_assigned_arm() {
+        let complex = "<!-- loom:complexity=complex -->";
+        let routine = "<!-- loom:complexity=routine -->";
+        assert_eq!(assign_arm(100, extract_complexity_marker(complex)), "B");
+        assert_eq!(assign_arm(100, extract_complexity_marker(routine)), "A");
+        // Unicode-safe: a multi-byte char before the marker must not panic.
+        assert_eq!(
+            extract_complexity_marker("— é ☃ <!-- loom:complexity=complex -->"),
+            Some("complex")
+        );
     }
 
     #[test]

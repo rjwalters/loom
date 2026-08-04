@@ -60,6 +60,11 @@ An Architecture Decision Record captures an important architectural decision mad
   - **Summary**: Delete the ~31.8k-line Python `loom_tools` package over four phases (epic #4081), moving its load-bearing functionality into `loom-daemon` subcommands while every shell entry point keeps its name and flags; motivated by #4079, where a stale editable pip install's frozen console scripts shadowed the Rust binary on PATH
   - **Key Decision**: One commit-stamped Rust artifact plus bash over a maintained pip install, with a byte-compatible on-disk state contract holding across every phase so no cutover needed a flag day; `loom-search` carved out of the deletion (opt-in, no native port, no test would have caught its removal)
 
+- [ADR-0014: Decouple Forge API Cost From Coordination Chatter — Local Evaluation Memo, Safehouse as Accelerator Only](0014-forge-coordination-decoupling.md)
+  - **Status**: Accepted (design decision; implementation phased into follow-up issues)
+  - **Summary**: The forge's GraphQL/REST quota is spent on repeat evaluation of unchanged state, not on the inherent label transitions of a normal issue lifecycle; answers the four open questions from #5057 on where an "already evaluated" memo lives, whether a webhook-fed Worker becomes a control-plane participant, what the memo's input-hash should be, and whether the label protocol changes
+  - **Key Decision**: A daemon-local evaluation memo (per-role content hash, not `updated_at`) is the store of record, with safehouse as an optional best-effort cross-host broadcast accelerator — never the store itself; claims stay forge-authoritative and the label protocol is untouched; defer webhook/Worker-as-control-plane (Lever C) until the local memo + safehouse broadcast are measured and shown insufficient
+
 ### CI Infrastructure
 
 - [ADR-0011: CI Runner Platform — Speedup Ceiling and Decision](0011-ci-runner-platform.md)

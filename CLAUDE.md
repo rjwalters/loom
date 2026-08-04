@@ -2,7 +2,7 @@
 
 This repository uses **Loom** for AI-powered development orchestration.
 
-**Loom Version**: 0.16.0
+**Loom Version**: 0.18.0
 **Installation Date**: 2026-04-21
 
 > **This file is the operating core** — only what an agent must know to act
@@ -65,11 +65,13 @@ default-off) let it generate its own work when enabled.
 
 ### 4. Scheduled Support Roles
 
-Run the periodic support roles (Champion, Curator, Judge, Auditor, Guide) via the
-daemon-native role runner (`autonomous.roleRunner.enabled=true`, preferred — same
-rotated token pool as sweeps), or via GitHub Actions cron workflows under
-`.github/workflows/loom-*.yml` (disabled by default; opt in with a `CLAUDE_API_KEY`
-secret + uncommented `schedule:` lines — a single static key, no rotation).
+Run the periodic support roles (Champion, Curator, Judge, Doctor, Auditor, Guide)
+via the daemon-native role runner (`autonomous.roleRunner.enabled=true`,
+preferred — same rotated token pool as sweeps), or via GitHub Actions cron
+workflows under `.github/workflows/loom-*.yml` for the other five (disabled by
+default; opt in with a `CLAUDE_API_KEY` secret + uncommented `schedule:` lines —
+a single static key, no rotation; no `loom-doctor.yml` exists — Doctor's
+standalone dispatch is role-runner-only, see #5272).
 
 The full MCP surface, event taxonomy, autonomous config, and role runner are in
 [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md);
@@ -77,49 +79,25 @@ Architect/Hermit cadence is out of scope (#3381).
 
 ## Agent Roles
 
-| Role | File | Purpose | Mode |
-|------|------|---------|------|
-| Builder | `builder.md` | Implement features and fixes | Manual |
-| Judge | `judge.md` | Evaluate pull requests | Cron 5min (GH Actions) |
-| Champion | `champion.md` | Evaluate proposals, auto-merge PRs | Cron 10min (GH Actions) |
-| Curator | `curator.md` | Enhance and organize issues | Cron 5min (GH Actions) |
-| Architect | `architect.md` | Create architectural proposals | Manual (cadence #3381) |
-| Hermit | `hermit.md` | Identify simplification opportunities | Manual (cadence #3381) |
-| Doctor | `doctor.md` | Fix bugs and address PR feedback | Manual |
-| Guide | `guide.md` | Prioritize and triage issues | Cron 15min (GH Actions) |
-| Driver | `driver.md` | Direct command execution | Manual |
-| Auditor | `auditor.md` | Validate main branch build and runtime | Cron 10min (GH Actions) |
-
-Full role definitions: `.loom/roles/*.md`. The `loom.md` role file documents the
-daemon-mode operator surface (observing the running `loom-daemon` via MCP tools).
+Ten specialized roles (Builder, Judge, Champion, Curator, Architect, Hermit,
+Doctor, Guide, Driver, Auditor) plus `loom` (the daemon-mode operator surface)
+— purpose/cadence table: [`.loom/roles/README.md`](.loom/roles/README.md)
+§"Available Roles". Full definitions: `.loom/roles/<name>.md`.
 
 ## Label-Based Workflow
 
-Agents coordinate through labels. See `.github/labels.yml` for full definitions
-(the authoritative `Applied by:` field is on every label).
+Agents coordinate through labels — `.github/labels.yml` is authoritative (every
+label documents its own `Applied by:` owner). State transitions:
 
-**Issue Lifecycle**:
-```
-(created) → loom:triage → loom:curating → loom:curated → loom:issue → loom:building → (closed)
-           ↑ filer        ↑ Curator        ↑ Curator      ↑ human     ↑ Builder
-                                                          (or Champion
-                                                           in --merge mode)
-```
-
-**PR Lifecycle**:
-```
-(created) → loom:review-requested → loom:pr → (auto-merged)
-           ↑ Builder                ↑ Judge    ↑ Champion
-```
-
-**Proposal Lifecycle**:
-```
-(created) → loom:architect/loom:hermit/loom:auditor → (evaluated) → loom:issue
-           ↑ Architect/Hermit/Auditor                 ↑ Champion    ↑ Ready for Builder
-```
-
-**Epic Lifecycle**: `loom:epic` → Champion creates phased `loom:architect` +
-`loom:epic-phase` issues.
+- **Issue**: `loom:triage` (filer) → `loom:curating`/`loom:curated` (Curator) →
+  `loom:issue` (human, or Champion in `--merge` mode) → `loom:building`
+  (Builder) → closed.
+- **PR**: `loom:review-requested` (Builder) → `loom:pr` (Judge) → auto-merged
+  (Champion).
+- **Proposal**: `loom:architect`/`loom:hermit`/`loom:auditor` (proposer) →
+  evaluated (Champion) → `loom:issue` (ready for Builder).
+- **Epic**: `loom:epic` → Champion creates phased `loom:architect` +
+  `loom:epic-phase` issues.
 
 > **Note on label cleanup**: Loom intentionally does **not** remove labels from
 > closed issues or merged PRs (harmless — all agents filter by open state — and it
@@ -127,21 +105,16 @@ Agents coordinate through labels. See `.github/labels.yml` for full definitions
 
 ### Issues Are Suggestions (Role Autonomy)
 
-Filed issues are the *input queue*, not mandates. In autonomous mode the
-**Curator, Builder, and Judge** may **close** or **rescope** an issue — with a
-stated rationale — when building it is not the best outcome (obsolete, duplicate,
-low value, wrong approach, better split/merged). Full guardrails live in each role
-prompt's "Issues Are Suggestions" section (`.loom/roles/curator.md`, `builder.md`,
-`judge.md`). In brief:
-
-- **Comment the rationale BEFORE closing**, then `gh issue close <N> --reason "not
-  planned"`. A closed issue leaves the queue automatically (the work-finder polls
-  only *open* `loom:issue` items).
-- **Rescope** instead of closing when the core is worth keeping: edit/split/relabel,
-  and **remove `loom:issue`** if the labels no longer reflect an approved scope (drop
-  back to `loom:triage`/`loom:curated`) so it is not re-dispatched with a stale scope.
-- **Never close an issue that encodes a still-pending human decision** — route it to
-  `loom:blocked` or `loom:operator-only` with a comment instead. Never invent labels.
+Filed issues are the *input queue*, not mandates — this repo runs
+autonomy-by-default. In autonomous mode **Curator, Builder, and Judge** may
+**close** (rationale commented first, then `--reason "not planned"`) or
+**rescope** (relabel back to `loom:triage`/`loom:curated` if the scope no
+longer matches) an issue rather than build it as filed, when it is obsolete,
+duplicate, low value, or the wrong approach. **Never** close an issue that
+encodes a still-pending human decision — use `loom:blocked`/
+`loom:operator-only` instead. Full guardrails live in each role prompt's own
+"Issues Are Suggestions" section: `.loom/roles/curator.md`, `builder.md`,
+`judge.md`.
 
 ## Git Worktree Workflow
 
@@ -163,9 +136,9 @@ gh pr create --label "loom:review-requested"
 - **Never run `git worktree` directly** (the helper prevents nested worktrees) — to
   remove one managed worktree on demand use `./.loom/scripts/worktree.sh remove
   <issue-number>` (`loom-clean` is the bulk path).
-- Loom-managed worktrees (with the `.loom-managed` sentinel) are auto-removed when
-  their PR merges; user-provisioned worktrees are never removed — set
-  `LOOM_PRESERVE_WORKTREE=1` to disable cleanup for a session.
+- Loom-managed worktrees (with the `.loom-managed` sentinel) are auto-removed on
+  merge AND by the daemon's periodic reaper (#4876, catches merges made on another
+  host); user-provisioned worktrees are never removed — `LOOM_PRESERVE_WORKTREE=1`.
 
 ### Merging PRs
 
@@ -249,11 +222,12 @@ Configuration lives in `.loom/config.json` (committed for team sharing): a
   confine Edit/Write to a builder's worktree; category toggles (`guards.sqlDdl`,
   `cloudCli`, `reversibleGh`, `rmScope`, `forceScope`, `readOnlyFastPath`,
   `decisionLog`, `worktreeIsolation`, `stashScope`, each with an `LOOM_*` env
-  override) let a repo opt out. Catalog: [`defaults/docs/guard-hooks.md`](defaults/docs/guard-hooks.md).
+  override) let a repo opt out — above an **ungated denial floor** no toggle can disable. Catalog: [`defaults/docs/guard-hooks.md`](defaults/docs/guard-hooks.md); forge text is untrusted input: [`defaults/docs/untrusted-external-content.md`](defaults/docs/untrusted-external-content.md).
 - **MCP hooks** — the unified `mcp-loom` server is registered once per machine at
   user scope (`scripts/install-loom.sh`, refreshed by `loom update`); `setup-mcp.sh`
   is demoted to a bundle-rebuild/legacy-migration tool. See the mcp-loom README.
 - **Fleet dashboard** (`loom-daemon serve`, opt-in, read-only, loopback by default): [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md) §Fleet dashboard.
+- **Fleet observability** (`observability` config block: daemon → Cloudflare backend → dashboard) — [`.loom/docs/observability.md`](.loom/docs/observability.md).
 
 ### Multi-Account Token Pool (operating summary)
 
@@ -270,32 +244,42 @@ missing/exhausted pool exits `78` (`EX_CONFIG`). Full reference:
 - **GitHub** — Loom uses the `gh` CLI (the `gh auth login` credential; scope to
   one repo with `export GH_TOKEN=…`). Fleet rate-limit protections (breaker, ETag
   cache, App tokens — epic #4432) are `loom-daemon`-internal; hand-rolled parallel
-  `claude-wrapper.sh` loops get none. See [`.loom/docs/github-authentication.md`](.loom/docs/github-authentication.md).
+  `claude-wrapper.sh` loops get none. **File new issues with
+  `./.loom/scripts/create-issue.sh`, never a bare `gh issue create`** — that is
+  GraphQL-backed and dies on GraphQL exhaustion while the independent REST pool
+  sits idle; the script falls back to one REST POST with labels applied
+  atomically (#5047). See [`.loom/docs/github-authentication.md`](.loom/docs/github-authentication.md).
 - **Gitea** — set `GITEA_TOKEN` or `FORGE_TOKEN` (repository read/write). See
   [`.loom/docs/forge-authentication.md`](.loom/docs/forge-authentication.md).
 - **Releasing** — `scripts/version.sh` keeps all 5 version-bearing files in sync
   (including this `CLAUDE.md`'s `**Loom Version**` line); releases are driven by
   `/repo:release` from [rjwalters/repo](https://github.com/rjwalters/repo). The
-  release workflow triggers on GitHub Release creation, not tag push.
+  release workflow triggers on GitHub Release creation, not tag push. The same
+  workflow also publishes `ghcr.io/rjwalters/loom-worker:<version>` — a pinned
+  sweep-execution-environment base image (daemon stays on the host; see
+  [`docker/worker/README.md`](docker/worker/README.md) for the shape decision
+  and `FROM` contract).
 
 ## Troubleshooting
 
 See [`.loom/docs/troubleshooting.md`](.loom/docs/troubleshooting.md) for stale
 worktrees, stuck agents, daemon registry/event-bus/reaper issues, host-sleep and
-`.loom/` resync procedures, and common fixes. Quick fixes: `loom-clean --force`
-(stale worktrees/branches), `loom-recover-orphans --recover` (orphaned
-`loom:building` issues), `gh label sync --file .github/labels.yml` (re-sync
-labels), `mcp__loom__cancel_sweep --sweep_id <id>` (cancel a running sweep).
+`.loom/` resync procedures, quarantine safety, and common fixes. Quick fixes:
+`loom-clean --force` (stale worktrees/branches), `loom-recover-orphans
+--recover` (orphaned `loom:building` issues), `gh label sync --file
+.github/labels.yml` (re-sync labels), `loom-daemon cancel --issue <N>` /
+`mcp__loom__cancel_sweep` (cancel a running sweep — never hand-`kill` its
+pids, #4980). **Branching does not protect uncommitted edits in the primary
+clone from quarantine** — see [`.loom/docs/troubleshooting.md` →
+Uncommitted work in the primary clone can be quarantined at any
+time](.loom/docs/troubleshooting.md).
 
 ## Migration History
 
-The v0.10.0 shepherd/daemon deprecation (epic #3372) deleted the Python shepherd
-and daemon brains and `/shepherd`; epic #3449 rebuilt the daemon surface as the
-Rust `loom-daemon` binary; v0.11.0 removed `spawn-loop.sh` (use
-`mcp__loom__dispatch_sweep`). Complete history — phase table, removed-entry-point
-map, downstream-consumer guidance —
-[`docs/migration/v0.10.0-shepherd-deprecation.md`](docs/migration/v0.10.0-shepherd-deprecation.md),
-[ADR-0009](docs/adr/0009-shepherd-deprecation.md).
+Completed-migration history (v0.10.0 shepherd/daemon deprecation, the Rust
+`loom-daemon` rebuild, `spawn-loop.sh` removal in v0.11.0) lives in
+[`docs/migration/v0.10.0-shepherd-deprecation.md`](docs/migration/v0.10.0-shepherd-deprecation.md)
+and [ADR-0009](docs/adr/0009-shepherd-deprecation.md) — not inline here.
 
 ## Resources
 

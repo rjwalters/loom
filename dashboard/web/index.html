@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark light" />
+    <title>Loom fleet</title>
+    <link rel="icon" href="data:," />
+  </head>
+  <body>
+    <header class="topbar">
+      <h1 class="topbar__title">Loom fleet</h1>
+      <nav class="topbar__nav" aria-label="Views">
+        <a class="topbar__navlink" href="#/">Fleet</a>
+        <a class="topbar__navlink" href="#/charts">Charts</a>
+        <a class="topbar__navlink" href="#/tokens">Tokens</a>
+        <a class="topbar__navlink" href="#/feed">Feed</a>
+      </nav>
+      <div class="topbar__meta">
+        <span id="refresh-status" class="topbar__status" aria-live="polite"></span>
+        <!-- Populated by `accountMenu.ts` from the server-injected auth
+             state: an avatar + menu when signed in, a Sign in button when
+             not. Empty in the markup so neither variant flashes before the
+             bundle runs. -->
+        <div id="account" class="topbar__account"></div>
+        <button id="refresh-button" type="button" class="button">Refresh</button>
+      </div>
+    </header>
+    <main id="app" class="app" aria-busy="true"></main>
+    <!-- Populated by `buildInfo.ts` from the server-injected build commit
+         (issue #4958). Empty in the markup so it renders nothing rather
+         than a placeholder before the bundle runs, and stays empty on a
+         deployment that never stamped a commit (local `wrangler dev`). -->
+    <footer id="build-info" class="build-info"></footer>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

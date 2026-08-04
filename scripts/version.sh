@@ -24,6 +24,18 @@ VERSION_FILES=(
   "CLAUDE.md"
 )
 
+# .loom/install-metadata.json only exists on a dogfooded install (loom
+# installed on its own repo, e.g. this repo) — absent in a normal consumer
+# checkout. It is JSON but deliberately NOT added to VERSION_FILES above:
+# every VERSION_FILES entry is assumed to always exist, whereas this file
+# must be existence-checked everywhere it's touched (#4842). Only the
+# `loom_version` field is managed here; `loom_commit`/`last_resync` remain
+# resync-installed.sh's restamp_metadata() responsibility (defaults/scripts/
+# resync-installed.sh) so the two paths don't fight over the same fields —
+# they compose in either order because each only ever writes the fields it
+# owns.
+INSTALL_METADATA_FILE="$REPO_ROOT/.loom/install-metadata.json"
+
 get_version() {
   jq -r '.version' "$REPO_ROOT/package.json"
 }
@@ -59,6 +71,17 @@ check_versions() {
     fi
   done
 
+  if [ -f "$INSTALL_METADATA_FILE" ]; then
+    local meta_actual
+    meta_actual=$(jq -r '.loom_version' "$INSTALL_METADATA_FILE")
+    if [ "$meta_actual" != "$expected" ]; then
+      echo "MISMATCH  .loom/install-metadata.json: $meta_actual (expected $expected)"
+      all_match=false
+    else
+      echo "OK        .loom/install-metadata.json: $meta_actual"
+    fi
+  fi
+
   # Check Cargo.lock
   local lock_versions
   lock_versions=$(grep -A1 'name = "loom-daemon"\|name = "loom-api"' "$REPO_ROOT/Cargo.lock" | grep '^version' | sed 's/version = "\(.*\)"/\1/' | sort -u)
@@ -68,6 +91,22 @@ check_versions() {
     echo "OK        Cargo.lock: all workspace crates at $expected"
   else
     echo "MISMATCH  Cargo.lock: workspace crates not all at $expected"
+    all_match=false
+  fi
+
+  # Check mcp-loom/package-lock.json — npm lockfiles carry the version in
+  # (at least) two places: the top-level `version` field and the matching
+  # `packages[""].version` entry, so a single `jq -r '.version'` read (what
+  # get_version_from_file() does for every VERSION_FILES entry) would
+  # silently ignore the second occurrence. Grep both instead.
+  local mcp_lock_versions
+  mcp_lock_versions=$(grep -m2 '"version"' "$REPO_ROOT/mcp-loom/package-lock.json" | sed 's/.*"version": "\(.*\)".*/\1/' | sort -u)
+  local mcp_lock_count
+  mcp_lock_count=$(echo "$mcp_lock_versions" | wc -l | tr -d ' ')
+  if [ "$mcp_lock_count" -eq 1 ] && [ "$(echo "$mcp_lock_versions" | tr -d '[:space:]')" = "$expected" ]; then
+    echo "OK        mcp-loom/package-lock.json: both version fields at $expected"
+  else
+    echo "MISMATCH  mcp-loom/package-lock.json: version fields not all at $expected"
     all_match=false
   fi
 
@@ -133,9 +172,25 @@ set_version() {
   sed "s/\*\*Loom Version\*\*: .*/\*\*Loom Version\*\*: $new_version/" "$REPO_ROOT/CLAUDE.md" > "$REPO_ROOT/CLAUDE.md.tmp" && mv "$REPO_ROOT/CLAUDE.md.tmp" "$REPO_ROOT/CLAUDE.md"
   echo "  Updated CLAUDE.md"
 
+  # .loom/install-metadata.json (#4842) — dogfooded-install-only, no-op if
+  # absent. Only loom_version is touched; see the field-ownership note above
+  # INSTALL_METADATA_FILE's declaration.
+  if [ -f "$INSTALL_METADATA_FILE" ]; then
+    local meta_tmp
+    meta_tmp=$(mktemp)
+    jq --arg v "$new_version" '.loom_version = $v' "$INSTALL_METADATA_FILE" > "$meta_tmp"
+    mv "$meta_tmp" "$INSTALL_METADATA_FILE"
+    echo "  Updated .loom/install-metadata.json"
+  fi
+
   # Cargo.lock
   (cd "$REPO_ROOT" && cargo update loom-daemon loom-api 2>/dev/null)
   echo "  Updated Cargo.lock"
+
+  # mcp-loom/package-lock.json — regenerate the npm-native way rather than
+  # hand-editing the JSON, so nested packages[""] entries stay consistent.
+  (cd "$REPO_ROOT/mcp-loom" && npm install --package-lock-only)
+  echo "  Updated mcp-loom/package-lock.json"
 
   echo ""
   echo "Version set to $new_version"
@@ -148,10 +203,11 @@ do_tag() {
   echo "Committing and tagging..."
   (
     cd "$REPO_ROOT"
-    git add package.json mcp-loom/package.json \
+    git add package.json mcp-loom/package.json mcp-loom/package-lock.json \
            loom-daemon/Cargo.toml loom-api/Cargo.toml \
            CLAUDE.md Cargo.lock
     [ -f "CHANGELOG.md" ] && git add CHANGELOG.md
+    [ -f ".loom/install-metadata.json" ] && git add .loom/install-metadata.json
     git commit -m "chore: bump version to $version"
     git tag -a "v$version" -m "v$version"
   )
@@ -174,6 +230,15 @@ case "${1:-}" in
     # `cargo update` as a side effect of the bump, not a directly-edited
     # version source.
     printf '%s\n' "${VERSION_FILES[@]}"
+    # .loom/install-metadata.json is dogfooded-install-only (#4842); list it
+    # only when present rather than as a fixed VERSION_FILES entry. Uses
+    # if/then (not `[ -f ... ] && echo ...`) so a false condition here —
+    # the common case in a non-dogfooded checkout — doesn't leak as this
+    # `list` case arm's (and thus the whole script's) exit status, since
+    # this is the last command in the arm.
+    if [ -f "$INSTALL_METADATA_FILE" ]; then
+      echo ".loom/install-metadata.json"
+    fi
     ;;
   check)
     check_versions

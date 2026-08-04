@@ -1,18 +1,23 @@
 import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import worker from "../src/index";
 import {
+  deriveTokenPoolAggregate,
   redactActiveSweep,
   redactFleetSnapshot,
   redactHistoryQueryResult,
   redactHistoryRecord,
+  redactManagedRepos,
   redactPayload,
   redactSseFrame,
 } from "../src/redaction";
 import type { HistoryRecord } from "../src/query";
 import type { ActiveSweepState, FleetSnapshot } from "../src/fleetState";
 import {
+  authedRequest,
   hostHealthEnvelope,
+  initAccessTestKeys,
+  mockJwksFetch,
   seedHost,
   sweepCompletedEnvelope,
   sweepOutcomeEnvelope,
@@ -49,6 +54,14 @@ function ingestRequest(body: unknown, authHeader = "Bearer abc-ingest-key"): Req
 async function ingest(envelopes: unknown[]): Promise<Response> {
   return callWorker(ingestRequest(envelopes));
 }
+
+beforeAll(async () => {
+  // `/api/*` verifies the Access JWT in-Worker (src/index.ts), so this suite
+  // needs a real signed cookie and a stubbed JWKS endpoint. Installed once —
+  // nothing here tests the failure path, which is index.test.ts's job.
+  await initAccessTestKeys();
+  mockJwksFetch();
+});
 
 beforeEach(async () => {
   await seedHost(env.DB, "host-abc", "abc-ingest-key");
@@ -140,13 +153,74 @@ describe("redactPayload — per-kind field allowlist", () => {
     expect(redacted).not.toHaveProperty("pr_number");
   });
 
-  it("tokens.snapshot: host-level, no repo/issue reference — passes through unchanged (documented decision)", () => {
-    const payload = {
+  it("tokens.snapshot: per-account rows are replaced by a non-identifying aggregate", () => {
+    const redacted = redactPayload("tokens.snapshot", {
       kind: "tokens.snapshot",
       captured_at: "2026-07-30T12:00:00Z",
-      accounts: [{ account: "agent-1", rank: 0, usage_fraction: 0.42, exhausted: false }],
-    };
-    expect(redactPayload("tokens.snapshot", payload)).toEqual(payload);
+      accounts: [
+        { account: "agent-1", rank: 0, usage_fraction: 0.42, exhausted: false },
+        { account: "agent-2", rank: 1, usage_fraction: 0.9, exhausted: false },
+        // Shaped like a real daemon push post-#4874: an exhausted account
+        // carries the instant its 7d window resets, so the public view's
+        // fleet-level "capacity returns at" is a real time rather than the
+        // permanent `null` it was while the daemon hardcoded the field away.
+        {
+          account: "agent-3",
+          rank: 2,
+          usage_fraction: 0,
+          limit_window_reset_at: "2026-08-02T03:00:00Z",
+          exhausted: true,
+        },
+      ],
+    });
+
+    expect(redacted).toEqual({
+      kind: "tokens.snapshot",
+      captured_at: "2026-07-30T12:00:00Z",
+      account_count: 3,
+      exhausted_count: 1,
+      mean_usage_fraction: 0.44,
+      max_usage_fraction: 0.9,
+      next_limit_window_reset_at: "2026-08-02T03:00:00Z",
+    });
+  });
+
+  it("tokens.snapshot: a reset instant survives redaction without naming the account it came from", () => {
+    // Issue #4874's aggregate half: the reset is the one per-account field the
+    // public view is allowed to keep, precisely because "capacity returns at
+    // 03:00Z" describes the pool, not who is in it. Guard that the row it was
+    // lifted from still does not survive alongside it.
+    const serialized = JSON.stringify(
+      redactPayload("tokens.snapshot", {
+        kind: "tokens.snapshot",
+        captured_at: "2026-07-30T12:00:00Z",
+        accounts: [
+          { account: "agent5-2amlogic", rank: 4, limit_window_reset_at: "2026-08-04T11:00:00Z", exhausted: true },
+          { account: "robb-2amlogic", rank: 0, limit_window_reset_at: "2026-08-02T03:00:00Z", exhausted: true },
+        ],
+      }),
+    );
+    // The *earliest* reset across the pool, not the first row's.
+    expect(JSON.parse(serialized).next_limit_window_reset_at).toBe("2026-08-02T03:00:00Z");
+    expect(serialized).not.toContain("agent5-2amlogic");
+    expect(serialized).not.toContain("robb-2amlogic");
+    expect(serialized).not.toContain("accounts");
+    // The per-account field itself is gone — only the derived aggregate key
+    // (`next_limit_window_reset_at`) remains.
+    expect(serialized).not.toContain('"limit_window_reset_at"');
+  });
+
+  it("tokens.snapshot: no account identifier survives, at any depth", () => {
+    const serialized = JSON.stringify(
+      redactPayload("tokens.snapshot", {
+        kind: "tokens.snapshot",
+        captured_at: "2026-07-30T12:00:00Z",
+        accounts: [{ account: "agent5-2amlogic", rank: 4, usage_fraction: 0.91, exhausted: false }],
+      }),
+    );
+    expect(serialized).not.toContain("agent5-2amlogic");
+    expect(serialized).not.toContain("accounts");
+    expect(serialized).not.toContain("rank");
   });
 
   it("host.health: host-level, no repo/issue reference — passes through unchanged (documented decision)", () => {
@@ -159,6 +233,175 @@ describe("redactPayload — per-kind field allowlist", () => {
       cpu_idle_fraction: 0.83,
     };
     expect(redactPayload("host.health", payload)).toEqual(payload);
+  });
+
+  it("host.health: build identity (build_commit/built_at) survives redaction alongside daemon_version", () => {
+    // #4956 — the commit is the only field that tells two builds sharing a
+    // `daemon_version` apart, so stripping it here would re-blind the
+    // dashboard it was added for.
+    const payload = {
+      kind: "host.health",
+      captured_at: "2026-08-02T12:00:00Z",
+      daemon_version: "0.17.0",
+      build_commit: "8c16fb5b",
+      built_at: "2026-08-02T03:09:51Z",
+      uptime_sec: 86400,
+      logical_cpus: 28,
+    };
+    expect(redactPayload("host.health", payload)).toEqual(payload);
+  });
+
+  it("host.health: dispatch-attention state (dispatch_halted/halt_reason) survives redaction (#4975)", () => {
+    // Describes the machine's own admission behavior, not any repo/operator
+    // — same reasoning as `cpu_idle_fraction`/`load_per_core` directly above
+    // it in the allowlist.
+    const payload = {
+      kind: "host.health",
+      captured_at: "2026-08-02T12:00:00Z",
+      daemon_version: "0.17.0",
+      uptime_sec: 86400,
+      logical_cpus: 28,
+      dispatch_halted: true,
+      halt_reason: "load-per-core 4.24 >= 2.50 sustained for 3 consecutive tick(s)",
+    };
+    expect(redactPayload("host.health", payload)).toEqual(payload);
+  });
+
+  it("host.health: role-tick health (roles) survives redaction, but each persistent root is basenamed and detail is dropped for the public view (#5022, #5065)", () => {
+    // The counts and each failure's role/failures/last_at survive (they
+    // describe the machine, not the work). The workspace `root` is a full
+    // absolute filesystem path whose home-directory segment names the
+    // operator on the common macOS/Linux layout — so the public,
+    // unauthenticated surface only ever gets its basename, mirroring the
+    // daemon's `RoleFailure::label()` and the frontend's `pathBasename`.
+    // `detail` is dropped entirely (#5065): it is a free-form failure string
+    // the daemon builds by interpolating another absolute path plus a log
+    // tail, so — unlike `root` — there is no basename-style truncation that
+    // makes it safe for the public surface.
+    const payload = {
+      kind: "host.health",
+      captured_at: "2026-08-02T12:00:00Z",
+      daemon_version: "0.17.0",
+      uptime_sec: 86400,
+      logical_cpus: 28,
+      roles: {
+        total: 3,
+        ok: 1,
+        persistent: [
+          {
+            root: "/Users/alice/GitHub/loom",
+            role: "judge",
+            failures: 2,
+            last_at: "2026-08-02T11:59:00Z",
+            detail: "no-token-pool",
+          },
+        ],
+      },
+    };
+    const redacted = redactPayload("host.health", payload);
+    // Counts and non-path detail survive unchanged.
+    expect(redacted).toMatchObject({
+      kind: "host.health",
+      captured_at: "2026-08-02T12:00:00Z",
+      daemon_version: "0.17.0",
+      uptime_sec: 86400,
+      logical_cpus: 28,
+    });
+    expect(redacted.roles).toEqual({
+      total: 3,
+      ok: 1,
+      persistent: [
+        {
+          // Basenamed — the operator-identifying home-directory prefix is gone.
+          root: "loom",
+          role: "judge",
+          failures: 2,
+          last_at: "2026-08-02T11:59:00Z",
+          // NOTE: no `detail` key at all — dropped, not truncated.
+        },
+      ],
+    });
+    // The raw absolute path (and its operator-identifying username segment)
+    // never reaches the public surface, in any field.
+    expect(JSON.stringify(redacted)).not.toContain("/Users/alice");
+    expect(JSON.stringify(redacted)).not.toContain("alice");
+  });
+
+  it("host.health: a realistic role-tick `detail` (absolute path + log tail) never reaches the public surface (#5065)", () => {
+    // The most common role-tick failure path (`RoleTickOutcome::Failure` in
+    // `loom-daemon/src/role_runner.rs` for a non-zero exit) builds `detail`
+    // by interpolating the absolute path to `spawn-worker.sh` plus a tail of
+    // the failing role child's own log output.
+    const payload = {
+      kind: "host.health",
+      captured_at: "2026-08-02T12:00:00Z",
+      daemon_version: "0.17.0",
+      roles: {
+        total: 1,
+        ok: 0,
+        persistent: [
+          {
+            root: "/Users/alice/GitHub/loom",
+            role: "judge",
+            failures: 1,
+            last_at: "2026-08-02T11:59:00Z",
+            detail:
+              "`/Users/alice/GitHub/loom/.loom/scripts/spawn-worker.sh` exited with exit status: 1: some log tail",
+          },
+        ],
+      },
+    };
+    const redacted = redactPayload("host.health", payload);
+    const serialized = JSON.stringify(redacted);
+    expect(serialized).not.toContain("alice");
+    expect(serialized).not.toContain("/Users/alice/GitHub/loom/.loom/scripts/spawn-worker.sh");
+    expect((redacted.roles as { persistent: Record<string, unknown>[] }).persistent[0]).not.toHaveProperty("detail");
+  });
+
+  it("host.health: no roles key at all when the payload carries no role-tick summary (#5022)", () => {
+    const payload = { kind: "host.health", daemon_version: "0.17.0", uptime_sec: 100 };
+    expect(redactPayload("host.health", payload)).not.toHaveProperty("roles");
+  });
+
+  it("host.health: a total: 0 role-tick summary round-trips distinctly (no persistent list) (#5022)", () => {
+    const payload = {
+      kind: "host.health",
+      daemon_version: "0.17.0",
+      uptime_sec: 100,
+      roles: { total: 0, ok: 0 },
+    };
+    const redacted = redactPayload("host.health", payload);
+    expect(redacted.roles).toEqual({ total: 0, ok: 0 });
+  });
+
+  it("host.health: a private repo's slug is redacted, but every other field survives unchanged (#4976)", () => {
+    const payload = {
+      kind: "host.health",
+      captured_at: "2026-08-02T12:00:00Z",
+      daemon_version: "0.17.0",
+      uptime_sec: 86400,
+      logical_cpus: 28,
+      managed_repos: [
+        { slug: "rjwalters/loom", visibility: "public" },
+        { slug: "2AMLogic/gf180-pll", visibility: "private" },
+      ],
+    };
+    const redacted = redactPayload("host.health", payload);
+    expect(redacted).toMatchObject({
+      daemon_version: "0.17.0",
+      uptime_sec: 86400,
+      logical_cpus: 28,
+    });
+    expect(redacted.managed_repos).toEqual([
+      { slug: "rjwalters/loom", visibility: "public" },
+      { visibility: "private" },
+    ]);
+    expect(JSON.stringify(redacted)).not.toContain("gf180-pll");
+  });
+
+  it("host.health: no managed_repos key at all when the payload carries no roster", () => {
+    const payload = { kind: "host.health", daemon_version: "0.17.0", uptime_sec: 100 };
+    expect(redactPayload("host.health", payload)).not.toHaveProperty("managed_repos");
   });
 
   it("an unrecognized (forward-compatible) kind reveals only `kind`", () => {
@@ -304,6 +547,206 @@ describe("redactFleetSnapshot", () => {
     expect(redacted.hosts["host-abc"]?.health?.record).toEqual({ kind: "host.health", uptime_sec: 100 });
     expect(redacted.activeSweeps[0]).not.toHaveProperty("sweepId");
   });
+
+  it("collapses a private repo's slug for a public viewer, and shows every slug to an authenticated one (#4976)", () => {
+    const snapshot: FleetSnapshot = {
+      hosts: {
+        "host-abc": {
+          health: {
+            record: {
+              kind: "host.health",
+              uptime_sec: 100,
+              managed_repos: [
+                { slug: "rjwalters/loom", visibility: "public" },
+                { slug: "2AMLogic/gf180-pll", visibility: "private" },
+              ],
+            },
+            updatedAt: "2026-07-30T12:00:00Z",
+          },
+        },
+      },
+      activeSweeps: [],
+    };
+
+    const publicRecord = redactFleetSnapshot(snapshot, false).hosts["host-abc"]?.health?.record;
+    expect(publicRecord?.managed_repos).toEqual([
+      { slug: "rjwalters/loom", visibility: "public" },
+      { visibility: "private" },
+    ]);
+    expect(JSON.stringify(publicRecord)).not.toContain("gf180-pll");
+
+    const authedRecord = redactFleetSnapshot(snapshot, true).hosts["host-abc"]?.health?.record;
+    expect(authedRecord?.managed_repos).toEqual([
+      { slug: "rjwalters/loom", visibility: "public" },
+      { slug: "2AMLogic/gf180-pll", visibility: "private" },
+    ]);
+  });
+
+  it("summarizes the token pool for a public viewer", () => {
+    const snapshot: FleetSnapshot = {
+      hosts: {
+        "host-abc": {
+          tokens: {
+            record: {
+              kind: "tokens.snapshot",
+              accounts: [
+                { account: "agent-1", rank: 0, usage_fraction: 0.5, exhausted: false },
+                { account: "agent-2", rank: 1, usage_fraction: 0, exhausted: true },
+              ],
+            },
+            updatedAt: "2026-07-30T12:00:00Z",
+          },
+        },
+      },
+      activeSweeps: [],
+    };
+
+    const record = redactFleetSnapshot(snapshot, false).hosts["host-abc"]?.tokens?.record;
+    expect(record).toMatchObject({ account_count: 2, exhausted_count: 1, max_usage_fraction: 0.5 });
+    expect(record).not.toHaveProperty("accounts");
+  });
+
+  // Regression: this function used to project host entries through
+  // `redactPayload` unconditionally, ignoring `isAuthenticated`. That was
+  // invisible while every allowlist named every schema field; once
+  // `tokens.snapshot` started summarizing `accounts`, it would have stripped
+  // per-account detail from the signed-in dashboard as well.
+  it("leaves an authenticated viewer's host entries untouched", () => {
+    const accounts = [{ account: "agent-1", rank: 0, usage_fraction: 0.5, exhausted: false }];
+    const snapshot: FleetSnapshot = {
+      hosts: {
+        "host-abc": {
+          tokens: { record: { kind: "tokens.snapshot", accounts }, updatedAt: "2026-07-30T12:00:00Z" },
+        },
+      },
+      activeSweeps: [],
+    };
+
+    const record = redactFleetSnapshot(snapshot, true).hosts["host-abc"]?.tokens?.record;
+    expect(record).toEqual({ kind: "tokens.snapshot", accounts });
+  });
+
+  it("keeps the full absolute root and detail in a role-tick failure for an authenticated viewer (#5065)", () => {
+    const roles = {
+      total: 1,
+      ok: 0,
+      persistent: [
+        {
+          root: "/Users/alice/GitHub/loom",
+          role: "judge",
+          failures: 1,
+          last_at: "2026-08-02T11:59:00Z",
+          detail: "`/Users/alice/GitHub/loom/.loom/scripts/spawn-worker.sh` exited with exit status: 1: log tail",
+        },
+      ],
+    };
+    const snapshot: FleetSnapshot = {
+      hosts: {
+        "host-abc": {
+          health: {
+            record: { kind: "host.health", uptime_sec: 100, roles },
+            updatedAt: "2026-07-30T12:00:00Z",
+          },
+        },
+      },
+      activeSweeps: [],
+    };
+
+    const authedRecord = redactFleetSnapshot(snapshot, true).hosts["host-abc"]?.health?.record;
+    expect(authedRecord).toEqual({ kind: "host.health", uptime_sec: 100, roles });
+
+    const publicRecord = redactFleetSnapshot(snapshot, false).hosts["host-abc"]?.health?.record;
+    const publicPersistent = (publicRecord?.roles as { persistent: Record<string, unknown>[] } | undefined)
+      ?.persistent;
+    expect(publicPersistent?.[0]).not.toHaveProperty("detail");
+    expect(JSON.stringify(publicRecord)).not.toContain("alice");
+  });
+});
+
+describe("redactManagedRepos", () => {
+  it("keeps a public entry's slug, strips a private entry's slug but keeps its place", () => {
+    expect(
+      redactManagedRepos([
+        { slug: "rjwalters/loom", visibility: "public" },
+        { slug: "2AMLogic/gf180-pll", visibility: "private" },
+        { slug: "2AMLogic/gf180-trng", visibility: "private" },
+      ]),
+    ).toEqual([
+      { slug: "rjwalters/loom", visibility: "public" },
+      { visibility: "private" },
+      { visibility: "private" },
+    ]);
+  });
+
+  it("treats a malformed row (missing/wrong-typed slug, any non-\"public\" visibility) as private", () => {
+    expect(
+      redactManagedRepos([
+        { visibility: "public" }, // no slug at all
+        { slug: 42, visibility: "public" }, // wrong-typed slug
+        { slug: "owner/repo", visibility: "internal" }, // unrecognized visibility label
+        { slug: "owner/repo" }, // missing visibility
+      ]),
+    ).toEqual([{ visibility: "private" }, { visibility: "private" }, { visibility: "private" }, { visibility: "private" }]);
+  });
+
+  it("an empty roster redacts to an empty roster", () => {
+    expect(redactManagedRepos([])).toEqual([]);
+  });
+});
+
+describe("deriveTokenPoolAggregate", () => {
+  it("reports null rather than a misleading zero when no account measured usage", () => {
+    expect(deriveTokenPoolAggregate({ accounts: [{ account: "a", exhausted: false }] })).toEqual({
+      account_count: 1,
+      exhausted_count: 0,
+      mean_usage_fraction: null,
+      max_usage_fraction: null,
+      next_limit_window_reset_at: null,
+    });
+  });
+
+  it("averages only over accounts that reported a usage_fraction", () => {
+    const aggregate = deriveTokenPoolAggregate({
+      accounts: [{ usage_fraction: 0.2 }, { usage_fraction: 0.8 }, { exhausted: true }],
+    });
+    expect(aggregate.mean_usage_fraction).toBe(0.5);
+    expect(aggregate.max_usage_fraction).toBe(0.8);
+    expect(aggregate.account_count).toBe(3);
+  });
+
+  it("takes the earliest limit-window reset across the pool", () => {
+    const aggregate = deriveTokenPoolAggregate({
+      accounts: [
+        { limit_window_reset_at: "2026-07-30T18:00:00Z" },
+        { limit_window_reset_at: "2026-07-30T14:00:00Z" },
+      ],
+    });
+    expect(aggregate.next_limit_window_reset_at).toBe("2026-07-30T14:00:00Z");
+  });
+
+  // This runs on a live SSE response path, so a malformed payload must
+  // degrade rather than throw and kill the stream.
+  it.each([
+    ["accounts absent", {}],
+    ["accounts not an array", { accounts: "nope" }],
+    ["accounts null", { accounts: null }],
+  ])("degrades to a zero-count aggregate when %s", (_label, payload) => {
+    expect(deriveTokenPoolAggregate(payload as Record<string, unknown>)).toEqual({
+      account_count: 0,
+      exhausted_count: 0,
+      mean_usage_fraction: null,
+      max_usage_fraction: null,
+      next_limit_window_reset_at: null,
+    });
+  });
+
+  it("ignores non-finite usage values rather than propagating NaN", () => {
+    const aggregate = deriveTokenPoolAggregate({
+      accounts: [{ usage_fraction: Number.NaN }, { usage_fraction: 0.4 }],
+    });
+    expect(aggregate.mean_usage_fraction).toBe(0.4);
+    expect(aggregate.max_usage_fraction).toBe(0.4);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -403,24 +846,84 @@ describe("GET /public/history vs GET /api/history — end-to-end redaction", () 
         expect(publicText).not.toContain("4710"); // pr_number
       }
 
-      const authResponse = await callWorker(new Request("https://ingest.example/api/history"));
+      const authResponse = await callWorker(await authedRequest("https://ingest.example/api/history"));
       const authText = await authResponse.text();
       expect(authText).toContain("rjwalters/loom");
       expect(authText).toContain("sweep-issue-4703-0");
     });
   }
 
-  it("tokens.snapshot and host.health (host-level, no repo/visibility) pass through unredacted on the public route", async () => {
+  it("host.health passes through unredacted on the public route; tokens.snapshot is aggregated", async () => {
     await ingest([tokensSnapshotEnvelope(), hostHealthEnvelope()]);
 
     const publicResponse = await callWorker(new Request("https://ingest.example/public/history"));
-    const body = (await publicResponse.json()) as {
+    const publicText = await publicResponse.text();
+    const body = JSON.parse(publicText) as {
       records: { kind: string; record: Record<string, unknown> }[];
     };
     const tokensRecord = body.records.find((r) => r.kind === "tokens.snapshot");
     const healthRecord = body.records.find((r) => r.kind === "host.health");
-    expect(tokensRecord?.record).toMatchObject({ accounts: [{ account: "agent-1" }] });
+
+    // Capacity telemetry: fully public.
     expect(healthRecord?.record).toMatchObject({ daemon_version: "0.16.0", uptime_sec: 100 });
+
+    // Token pool: aggregate only — no account names, no per-account rows.
+    expect(tokensRecord?.record).toMatchObject({ account_count: 1, exhausted_count: 0 });
+    expect(tokensRecord?.record).not.toHaveProperty("accounts");
+    expect(publicText).not.toContain("agent-1");
+  });
+
+  it("a role-tick failure's `detail` never reaches GET /public/history, but GET /api/history keeps it in full (#5065)", async () => {
+    // Mirrors the `root` basenaming case #5042 landed, for the sibling
+    // `detail` field: the common role-tick failure path builds `detail` by
+    // interpolating an absolute `spawn-worker.sh` path plus a log tail.
+    const roleTickDetail =
+      "`/Users/alice/GitHub/loom/.loom/scripts/spawn-worker.sh` exited with exit status: 1: some log tail";
+    await ingest([
+      hostHealthEnvelope({
+        roles: {
+          total: 1,
+          ok: 0,
+          persistent: [
+            {
+              root: "/Users/alice/GitHub/loom",
+              role: "judge",
+              failures: 1,
+              last_at: "2026-08-02T11:59:00Z",
+              detail: roleTickDetail,
+            },
+          ],
+        },
+      }),
+    ]);
+
+    const publicResponse = await callWorker(new Request("https://ingest.example/public/history"));
+    const publicText = await publicResponse.text();
+    expect(publicText).not.toContain("alice");
+    expect(publicText).not.toContain(roleTickDetail);
+    const publicBody = JSON.parse(publicText) as {
+      records: { kind: string; record: { roles?: { persistent?: Record<string, unknown>[] } } }[];
+    };
+    const publicHealth = publicBody.records.find((r) => r.kind === "host.health");
+    expect(publicHealth?.record.roles?.persistent?.[0]).not.toHaveProperty("detail");
+    expect(publicHealth?.record.roles?.persistent?.[0]).toMatchObject({ root: "loom", role: "judge" });
+
+    const authResponse = await callWorker(await authedRequest("https://ingest.example/api/history"));
+    const authText = await authResponse.text();
+    expect(authText).toContain(roleTickDetail);
+    expect(authText).toContain("/Users/alice/GitHub/loom");
+  });
+
+  it("the authenticated route still serves the full per-account token rows", async () => {
+    await ingest([tokensSnapshotEnvelope()]);
+
+    const response = await callWorker(await authedRequest("https://ingest.example/api/history"));
+    const body = (await response.json()) as {
+      records: { kind: string; record: Record<string, unknown> }[];
+    };
+    const tokensRecord = body.records.find((r) => r.kind === "tokens.snapshot");
+    expect(tokensRecord?.record).toMatchObject({ accounts: [{ account: "agent-1" }] });
+    expect(tokensRecord?.record).not.toHaveProperty("account_count");
   });
 
   it("a public-visibility record is returned in full on the public route (no over-redaction)", async () => {
@@ -460,7 +963,7 @@ describe("GET /public/fleet-state vs GET /api/fleet-state — end-to-end redacti
     expect(publicBody.activeSweeps).toHaveLength(1);
     expect(publicBody.activeSweeps[0]?.hostId).toBe("host-abc");
 
-    const authResponse = await callWorker(new Request("https://ingest.example/api/fleet-state"));
+    const authResponse = await callWorker(await authedRequest("https://ingest.example/api/fleet-state"));
     const authText = await authResponse.text();
     expect(authText).toContain("rjwalters/loom");
     expect(authText).toContain("sweep-issue-4703-0");

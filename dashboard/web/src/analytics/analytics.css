@@ -1,0 +1,229 @@
+/*
+ * Styles for the token/cost analytics panel (Epic #4702, Phase 3, #4752).
+ *
+ * Scoped to this panel's own class names so the app shell's layout styles and
+ * these can land independently. Colors come from CSS custom properties with
+ * fallbacks, so a shell that defines a palette wins and one that does not still
+ * renders legibly.
+ *
+ * The exhausted state is deliberately encoded three ways — a red border, a
+ * badge, and a strikethrough-free but high-contrast label — so it survives a
+ * grayscale display and a color-vision deficiency. Color alone is never the
+ * only signal (AC4).
+ */
+
+:root {
+  --analytics-fg: #e6e6e6;
+  --analytics-muted: #9aa0a6;
+  --analytics-bg: #14161a;
+  --analytics-panel: #1c1f24;
+  --analytics-line: #2b2f36;
+  --analytics-ok: #4ade80;
+  --analytics-warn: #fbbf24;
+  --analytics-danger: #f87171;
+}
+
+.analytics {
+  color: var(--analytics-fg);
+  font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+.analytics__title {
+  font-size: 1.1rem;
+  margin: 0 0 0.75rem;
+}
+
+.analytics__block {
+  margin: 0 0 1.75rem;
+}
+
+.analytics__heading {
+  font-size: 0.95rem;
+  font-weight: 600;
+  margin: 0 0 0.5rem;
+}
+
+.analytics__note {
+  color: var(--analytics-muted);
+  font-size: 0.8rem;
+  margin: 0.5rem 0 0;
+  max-width: 70ch;
+}
+
+.analytics__error {
+  color: var(--analytics-danger);
+  font-size: 0.85rem;
+}
+
+.analytics--withheld .analytics__note {
+  max-width: 60ch;
+}
+
+/* --- Burn curves --------------------------------------------------------- */
+
+.burn-grid {
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+}
+
+.burn-card {
+  background: var(--analytics-panel);
+  border: 1px solid var(--analytics-line);
+  border-radius: 6px;
+  padding: 0.6rem 0.7rem;
+}
+
+.burn-card--exhausted {
+  border-color: var(--analytics-danger);
+  box-shadow: inset 3px 0 0 0 var(--analytics-danger);
+}
+
+.burn-card__head {
+  align-items: center;
+  display: flex;
+  gap: 0.5rem;
+  justify-content: flex-start;
+}
+
+.burn-card__account {
+  font-weight: 600;
+}
+
+.burn-card__host,
+.burn-card__at {
+  color: var(--analytics-muted);
+  font-size: 0.75rem;
+}
+
+.burn-card__foot {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+}
+
+.burn-card__usage {
+  font-size: 1.05rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.badge {
+  border-radius: 999px;
+  font-size: 0.65rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  margin-left: auto;
+  padding: 0.1rem 0.45rem;
+}
+
+.badge--exhausted {
+  background: var(--analytics-danger);
+  color: #1a0000;
+}
+
+.badge--recovered {
+  border: 1px solid var(--analytics-warn);
+  color: var(--analytics-warn);
+}
+
+.sparkline {
+  display: block;
+  height: 48px;
+  margin: 0.4rem 0;
+  width: 100%;
+}
+
+.sparkline__line {
+  fill: none;
+  stroke: var(--analytics-ok);
+  stroke-width: 1.5;
+  vector-effect: non-scaling-stroke;
+}
+
+.burn-card--exhausted .sparkline__line {
+  stroke: var(--analytics-danger);
+}
+
+/* The pool-level card (public surface, #4847) draws two lines: peak usage
+ * (solid, the default `.sparkline__line`) and mean usage (dashed, muted) —
+ * distinguishable without relying on the exhausted-only red/green pairing
+ * above, which this second line does not participate in. */
+.sparkline__line--mean {
+  stroke: var(--analytics-muted);
+  stroke-dasharray: 3 2;
+}
+
+/* --- Tables -------------------------------------------------------------- */
+
+.table {
+  border-collapse: collapse;
+  font-size: 0.82rem;
+  width: 100%;
+}
+
+.table th {
+  border-bottom: 1px solid var(--analytics-line);
+  color: var(--analytics-muted);
+  font-weight: 600;
+  padding: 0.35rem 0.5rem;
+  text-align: left;
+}
+
+.table td {
+  border-bottom: 1px solid var(--analytics-line);
+  font-variant-numeric: tabular-nums;
+  padding: 0.35rem 0.5rem;
+  vertical-align: top;
+}
+
+.cell--account,
+.cell--repo {
+  font-variant-numeric: normal;
+  font-weight: 600;
+}
+
+.cell--host {
+  color: var(--analytics-muted);
+}
+
+.cell--negative {
+  color: var(--analytics-danger);
+}
+
+.row--at-risk {
+  background: rgb(248 113 113 / 8%);
+}
+
+.row--unattributed td {
+  color: var(--analytics-muted);
+  font-style: italic;
+}
+
+.status {
+  font-weight: 600;
+}
+
+.status--exhausted {
+  color: var(--analytics-danger);
+}
+
+.status--projected-exhaustion {
+  color: var(--analytics-warn);
+}
+
+.status--resets-first {
+  color: var(--analytics-ok);
+}
+
+.status--flat,
+.status--insufficient-data {
+  color: var(--analytics-muted);
+}
+
+/* Same local name, contradictory readings across hosts (#4898) — the merge
+   should not be trusted for this account. */
+.badge--divergent {
+  background: color-mix(in srgb, var(--warn, #e6b95c) 18%, transparent);
+  color: var(--warn, #e6b95c);
+  border: 1px solid color-mix(in srgb, var(--warn, #e6b95c) 45%, transparent);
+}

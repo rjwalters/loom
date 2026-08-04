@@ -120,7 +120,8 @@ enum Commands {
         json: bool,
 
         /// Also show the forge-side pipeline snapshot per managed repo (Issue
-        /// #3977): open `loom:issue` (queued), open `loom:building`
+        /// #3977): open, dispatchable `loom:issue` (queued — park-labeled
+        /// rows excluded, #4825), open `loom:building`
         /// (claimed), open PRs by `loom:review-requested` /
         /// `loom:changes-requested` / `loom:pr`, and PRs merged in the last
         /// 24h. Opt-in because it makes several `gh` calls per managed repo
@@ -128,6 +129,40 @@ enum Commands {
         /// bundled into the default view.
         #[arg(long)]
         pipeline: bool,
+    },
+
+    /// One-shot consolidated fleet vitals with an exit-code contract for watch
+    /// loops (Issue #4761): trusted liveness, dispatch state, token pool,
+    /// role-tick health, queue depth, and merge throughput — one structured
+    /// line per section, or `--json` for machine consumers.
+    ///
+    /// Exit codes: `0` healthy, `1` degraded (any section non-green, including
+    /// "could not determine"), `2` the daemon is genuinely dead. A watch loop
+    /// can therefore branch without parsing anything.
+    ///
+    /// The liveness verdict is **pgrep + pid-file first** — the launchd domain
+    /// probe is never trusted alone (#4694: it twice declared a live,
+    /// dispatching daemon dead). A DEAD verdict requires all three independent
+    /// signals (IPC, launchd/pid-file classification, `pgrep`) to agree.
+    ///
+    /// Not every section is trustworthy from the same vantage point (#5061):
+    /// `liveness`/`dispatch`/`tokens`/`roles`/`observability` are
+    /// daemon-authoritative (sourced from the daemon's own IPC round-trip or
+    /// a local probe of this host), so they read the same over SSH as
+    /// locally. `queues`/`throughput` instead run `gh` calls in THIS
+    /// process — a `gh` missing from a non-login shell's `PATH` (this
+    /// process's `PATH`, not the daemon's) reports as one distinct fact
+    /// rather than a per-repo forge-query failure, and cross-references the
+    /// daemon's own `credential_preflight` verdict when available.
+    Health {
+        /// Window for the role-tick and throughput sections: `30m` (default),
+        /// `2h`, `90s`, `1d`, or a bare number of seconds.
+        #[arg(long, value_name = "WINDOW")]
+        since: Option<String>,
+
+        /// Emit the machine-readable JSON report instead of the section lines.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Measure the host and the currently-resolved concurrency knobs (issue
@@ -226,6 +261,42 @@ enum Commands {
         /// dispatch; pass `--force` to dispatch anyway.
         #[arg(long)]
         force: bool,
+    },
+
+    /// Cancel a running sweep via the running daemon (Issue #4980): the `dispatch`
+    /// sibling, over the same `CancelSweep` IPC request the
+    /// `mcp__loom__cancel_sweep` tool uses.
+    ///
+    /// This is the sanctioned way to stop a wedged sweep over ssh, where no MCP
+    /// server is attached. Do NOT hand-`kill` a sweep's pids instead: the daemon
+    /// tracks the wrapper, and killing it leaves the underlying `claude` agent
+    /// alive — in the 2026-08-03 incident that surviving agent noticed its
+    /// subprocesses had died and relaunched them, against an issue whose claim
+    /// had already been returned to the queue. The daemon signals the whole
+    /// process GROUP (SIGTERM, then SIGKILL after the grace window), releases the
+    /// claim lock, restores the label, and emits the lifecycle events.
+    Cancel {
+        /// The sweep id to cancel (as shown by `loom-daemon status`). Mutually
+        /// exclusive with `--issue`.
+        #[arg(value_name = "SWEEP_ID", required_unless_present = "issue")]
+        sweep_id: Option<String>,
+
+        /// Cancel the live sweep for this issue instead of naming a sweep id.
+        /// Resolved client-side against the daemon's registry; refuses rather
+        /// than guesses if the issue somehow has more than one live sweep.
+        #[arg(long, value_name = "N", conflicts_with = "sweep_id")]
+        issue: Option<u32>,
+
+        /// Seconds to wait between SIGTERM and SIGKILL. Defaults to the same
+        /// value the `cancel_sweep` MCP tool sends.
+        #[arg(long, value_name = "SECS", default_value_t = cli::cancel::DEFAULT_CANCEL_GRACE_SECS)]
+        grace: u64,
+
+        /// Target managed-workspace root (Issue #3929). Omit to use the daemon's
+        /// default workspace, or the registered repo the CLI's own cwd falls
+        /// under (#4299) — the same resolution `dispatch` applies.
+        #[arg(long, value_name = "PATH")]
+        workspace: Option<String>,
     },
 
     /// Start a minimal read-only HTTP status-snapshot listener + embedded
@@ -470,6 +541,15 @@ enum Commands {
     /// decision tree from issue #3332. Purely file/git/gh-based; does not
     /// require a running daemon. Flags mirror the retired `loom-clean`
     /// console script byte-for-byte.
+    ///
+    /// **What `--safe` actually narrows** (issue #4890): only the artifact
+    /// classes that have a merged-PR concept to check — worktrees (gated on
+    /// issue-closed + PR-merged + grace period) and branches. Tmux sessions
+    /// are not an artifact of a merged PR, so `--safe` skips tmux cleanup
+    /// entirely rather than pretending to gate it; pair with `--tmux-only`
+    /// (optionally `--force`) to clean tmux sessions explicitly. Outside
+    /// `--safe`, a tmux session with an attached client (a live operator
+    /// terminal) is likewise preserved unless `--force` is passed.
     Clean {
         /// Workspace directory (repo root, or any path under it).
         #[arg(long, value_name = "PATH", default_value = ".")]
@@ -484,6 +564,9 @@ enum Commands {
         #[arg(short = 'f', long, visible_alias = "yes", visible_short_alias = 'y')]
         force: bool,
 
+        /// Merged-PR-only mode for worktrees/branches. Tmux sessions have no
+        /// PR association, so `--safe` skips tmux cleanup entirely (see the
+        /// `Clean` doc comment) rather than silently killing a live session.
         #[arg(long)]
         safe: bool,
 
@@ -557,6 +640,12 @@ enum Commands {
     /// (`merge-pr.sh`'s `forge_auto_merge`, or the `gh` read fallback) carries
     /// it. Forge config resolves from the canonical repo root (never a
     /// worktree CWD); see `forge_cmd.rs` for the full #4061 semantics.
+    ///
+    /// NOTE (#5047): the byte-identical passthrough means `forge issue
+    /// create` inherits `gh issue create`'s GraphQL cost with no REST
+    /// fallback of its own on exhaustion — see
+    /// `.loom/docs/gh-issue-create-rest-fallback.md` /
+    /// `forge_gh_create_issue_rl_safe` for the fallback path instead.
     Forge {
         #[command(subcommand)]
         action: ForgeAction,
@@ -763,6 +852,16 @@ enum Commands {
         /// first. Applies to both the summary and `--records` listing.
         #[arg(long, value_name = "N")]
         limit: Option<usize>,
+
+        /// Print how many locally-journaled records the observability
+        /// exporter has not yet attempted to send to the backend (Issue
+        /// #5084) instead of the summary/records output — every other flag
+        /// except `--json`/`--workspace` is ignored in this mode. This is the
+        /// AC's "N local outcomes not yet in the backend" measurability
+        /// gauge: `0` means the backfill drain (see
+        /// `.loom/docs/observability.md`) is caught up.
+        #[arg(long = "pending-export")]
+        pending_export: bool,
 
         /// Emit machine-readable JSON instead of the human-readable table.
         #[arg(long)]
@@ -1105,6 +1204,82 @@ enum FleetAction {
         dry_run: bool,
     },
 
+    /// Provision a pinned SPICE simulation toolchain (ngspice + Xyce, built
+    /// from source) plus the gf180mcu and sky130 open PDKs onto an
+    /// already-reachable SSH host (issue #4931, Phase 1a of "elastic cloud
+    /// compute for SPICE simulations"). A **sim runner is not a loom
+    /// worker**: unlike `add-worker`, this touches no cloud CLI, no
+    /// Tailscale API, no forge/token credentials, and does not write the
+    /// fleet registry. Idempotent: a re-run against an already-bootstrapped
+    /// host (at the same pins) reports every step already-satisfied.
+    BootstrapSpice {
+        /// SSH alias/host to reach the runner (from `repo:remote` or
+        /// operator supplied).
+        #[arg(value_name = "SSH_HOST")]
+        ssh_host: String,
+
+        /// ngspice source repository URL.
+        #[arg(long, value_name = "URL", default_value = loom_daemon::fleet::spice_runner::DEFAULT_NGSPICE_REPO_URL)]
+        ngspice_repo_url: String,
+
+        /// Pinned ngspice ref (tag/branch/commit) to build.
+        #[arg(long, value_name = "REF", default_value = loom_daemon::fleet::spice_runner::DEFAULT_NGSPICE_REF)]
+        ngspice_ref: String,
+
+        /// Skip the Xyce (+ Trilinos) source build — an ngspice-only runner.
+        /// Xyce's from-source build takes hours; analog repos that only
+        /// simulate with ngspice should not pay for it.
+        #[arg(long)]
+        skip_xyce: bool,
+
+        /// Xyce source repository URL.
+        #[arg(long, value_name = "URL", default_value = loom_daemon::fleet::spice_runner::DEFAULT_XYCE_REPO_URL)]
+        xyce_repo_url: String,
+
+        /// Pinned Xyce ref to build.
+        #[arg(long, value_name = "REF", default_value = loom_daemon::fleet::spice_runner::DEFAULT_XYCE_REF)]
+        xyce_ref: String,
+
+        /// Trilinos source repository URL (Xyce's solver dependency).
+        #[arg(long, value_name = "URL", default_value = loom_daemon::fleet::spice_runner::DEFAULT_TRILINOS_REPO_URL)]
+        trilinos_repo_url: String,
+
+        /// Pinned Trilinos ref to build.
+        #[arg(long, value_name = "REF", default_value = loom_daemon::fleet::spice_runner::DEFAULT_TRILINOS_REF)]
+        trilinos_ref: String,
+
+        /// gf180mcu-pdk repository URL.
+        #[arg(long, value_name = "URL", default_value = loom_daemon::fleet::spice_runner::DEFAULT_GF180MCU_REPO_URL)]
+        gf180mcu_repo_url: String,
+
+        /// Pinned gf180mcu-pdk ref to check out.
+        #[arg(long, value_name = "REF", default_value = loom_daemon::fleet::spice_runner::DEFAULT_GF180MCU_REF)]
+        gf180mcu_ref: String,
+
+        /// Submodule path inside the gf180mcu checkout holding the SPICE
+        /// device models. Pass an empty string to clone the top-level repo
+        /// only (when a pin's layout differs from the default).
+        #[arg(long, value_name = "PATH", default_value = loom_daemon::fleet::spice_runner::DEFAULT_GF180MCU_MODELS_PATH)]
+        gf180mcu_models_path: String,
+
+        /// skywater-pdk (sky130) repository URL.
+        #[arg(long, value_name = "URL", default_value = loom_daemon::fleet::spice_runner::DEFAULT_SKY130_REPO_URL)]
+        sky130_repo_url: String,
+
+        /// Pinned skywater-pdk ref to check out.
+        #[arg(long, value_name = "REF", default_value = loom_daemon::fleet::spice_runner::DEFAULT_SKY130_REF)]
+        sky130_ref: String,
+
+        /// Submodule path inside the sky130 checkout holding the SPICE
+        /// device models (see `--gf180mcu-models-path`).
+        #[arg(long, value_name = "PATH", default_value = loom_daemon::fleet::spice_runner::DEFAULT_SKY130_MODELS_PATH)]
+        sky130_models_path: String,
+
+        /// Print the ordered plan without contacting the host.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Aggregate sweep/token/health state across every fleet host, side by
     /// side, including the local host (issue #4342). Reads the fleet registry
     /// #4341 writes, collects the local host's own status in-process (over
@@ -1246,6 +1421,12 @@ enum QuarantineAction {
 enum ForgeAction {
     /// `forge issue <args…>` — e.g. `issue view 42 --json labels --jq
     /// '.labels[].name'`. GitHub: exec `gh issue <args…>`.
+    ///
+    /// This is a byte-identical passthrough, so `forge issue create` is
+    /// GraphQL-backed and has **no REST fallback** — it dies on GraphQL-quota
+    /// exhaustion exactly like `gh issue create`, and is not an escape hatch
+    /// from it (#5047). To file an issue that survives an exhausted GraphQL
+    /// pool, use `.loom/scripts/create-issue.sh`.
     Issue {
         #[arg(
             trailing_var_arg = true,
@@ -1849,6 +2030,7 @@ fn handle_cli_command(command: Commands) -> Result<()> {
             result,
             records,
             limit,
+            pending_export,
             json,
         } => handle_sweep_outcomes_command(
             &workspace,
@@ -1856,6 +2038,7 @@ fn handle_cli_command(command: Commands) -> Result<()> {
             result.as_deref(),
             records,
             limit,
+            pending_export,
             json,
         ),
         Commands::Stats {
@@ -1981,6 +2164,12 @@ fn handle_cli_command(command: Commands) -> Result<()> {
             // socket round-trip), never dispatched through this sync handler.
             unreachable!("Status is handled in main() before handle_cli_command")
         }
+        Commands::Health { .. } => {
+            // Routed directly in `main()` (it needs the async runtime for the
+            // socket round-trip + forge fan-out), never dispatched through this
+            // sync handler.
+            unreachable!("Health is handled in main() before handle_cli_command")
+        }
         Commands::Quarantine { .. } => {
             // Routed directly in `main()` (it needs the async runtime for the
             // socket round-trip), never dispatched through this sync handler.
@@ -1990,6 +2179,11 @@ fn handle_cli_command(command: Commands) -> Result<()> {
             // Routed directly in `main()` (it needs the async runtime for the
             // socket round-trip), never dispatched through this sync handler.
             unreachable!("Dispatch is handled in main() before handle_cli_command")
+        }
+        Commands::Cancel { .. } => {
+            // Routed directly in `main()` (it needs the async runtime for the
+            // socket round-trip), never dispatched through this sync handler.
+            unreachable!("Cancel is handled in main() before handle_cli_command")
         }
         Commands::Watch { .. } => {
             // Routed directly in `main()` (it needs the async runtime for the

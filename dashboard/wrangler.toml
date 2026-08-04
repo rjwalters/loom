@@ -50,6 +50,45 @@ workers_dev = true
 # custom_domain = true
 
 # -----------------------------------------------------------------------------
+# Static assets — the Phase-3 dashboard UI (`web/`), served by THIS Worker.
+# -----------------------------------------------------------------------------
+# Nothing account-specific here; you should not need to change any of it.
+#
+# The UI and the API deliberately share one Worker, one hostname, and therefore
+# one Cloudflare Access policy. A split deploy (UI on Pages, API here) would
+# put the two on different hostnames, which means CORS, a second Access
+# application, and a cross-origin cookie problem — for zero benefit at this
+# scale.
+#
+# `directory` is Vite's build output (`cd web && npm run build`). It must EXIST
+# for Wrangler to parse this file at all, even for `--dry-run` or the test
+# suite, so `npm test` / `npm run preflight` / `npm run dev` first run
+# `scripts/ensure-web-dist.sh`, which drops a placeholder when the UI has not
+# been built. `npm run deploy` always does a real build first.
+#
+# `not_found_handling = "none"` is load-bearing: it makes any request that does
+# not match a file here fall through to the Worker (`src/index.ts`), which is
+# what keeps `/ingest`, `/admin/*`, `/api/*`, and `/public/*` reachable. The
+# SPA alternative ("single-page-application") would rewrite every unmatched
+# path to index.html and shadow the entire API — which is why the UI routes on
+# the URL *hash* (`#/hosts/<id>`) and never needs a server-side rewrite. See
+# `web/src/router.ts`.
+#
+# `run_worker_first = ["/"]` + `binding` are load-bearing for the single-URL
+# layout (issue #4795): the Worker must see `/` itself so it can validate the
+# Cloudflare Access JWT and tell the UI which dataset it is entitled to. Left
+# to the asset router, `/` would be served as a static index.html before any
+# Worker code ran, and an anonymous visitor would get a UI that immediately
+# calls `/api/*` and 403s. Every other asset path (`/assets/*`) is still
+# served directly by the router — those are JS/CSS bundles with no fleet data
+# in them.
+[assets]
+directory = "./web/dist"
+not_found_handling = "none"
+binding = "ASSETS"
+run_worker_first = ["/"]
+
+# -----------------------------------------------------------------------------
 # D1 — durable history for every ingested telemetry record.
 # -----------------------------------------------------------------------------
 # CHANGE ME — `database_id` below is an all-zeros placeholder. Create the
@@ -96,6 +135,41 @@ new_sqlite_classes = ["FleetState"]
 [vars]
 RETENTION_DAYS = "90"
 MAX_RECORDS = "500000"
+
+# Display timezone for the UI: an IANA name (e.g. "America/Los_Angeles").
+#
+# Unset (the default here) means each viewer sees times in their own browser
+# zone. Setting it pins the whole deployment to one zone, which is what you
+# want once the charts matter: `bucketKey` decides which calendar day a sweep
+# is counted in, so a browser-derived zone gives two viewers different daily
+# totals for the same data. An invalid name falls back rather than failing.
+#
+# DISPLAY_TIMEZONE = "America/Los_Angeles"
+
+# CHANGE ME (both, together) — required only if you want the single-URL
+# fallback layout (docs/cloudflare-access.md): anonymous visitors to `/` see
+# the public view, a `2amlogic.com`-style Access identity sees the full
+# dashboard. Leave both commented out to run `/` as always-public (the
+# Worker fails closed — no team domain/AUD configured means every request is
+# treated as unauthenticated, never the other way around).
+#
+#   CF_ACCESS_TEAM_DOMAIN — your team's Cloudflare Access domain, e.g.
+#     "yourteam.cloudflareaccess.com" (Zero Trust dashboard → Settings →
+#     Custom Pages, or any Access app's overview page shows it). Used to
+#     build the JWKS URL (".../cdn-cgi/access/certs") and the expected `iss`.
+#   CF_ACCESS_AUD — the Application Audience (AUD) tag of the `/login`
+#     Access application, shown on that app's overview page. Pins JWT
+#     acceptance to tokens minted for apps you named here — neither value is
+#     a secret. Accepts a COMMA-SEPARATED LIST: Access names the session
+#     cookie per hostname but mints the token per application, so a browser
+#     on a hostname running several path-scoped apps may hold the `/api/*`
+#     app's token instead of `/login`'s. List every app on this hostname
+#     whose session should count as signed-in (typically `/login` and
+#     `/api/*`) or an already-signed-in operator flaps back to the public
+#     view — see src/accessAuth.ts's module doc.
+#
+# CF_ACCESS_TEAM_DOMAIN = "REPLACE_WITH_YOUR_TEAM.cloudflareaccess.com"
+# CF_ACCESS_AUD = "REPLACE_WITH_YOUR_LOGIN_APP_AUD_TAG,REPLACE_WITH_YOUR_API_APP_AUD_TAG"
 
 # Runs the retention sweep hourly. `wrangler dev` does not fire this on a
 # real clock; trigger it directly in tests / via the admin endpoint instead

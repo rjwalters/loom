@@ -290,6 +290,65 @@ pub(crate) fn send_group_signal(_pgid: u32, _sig: i32) -> bool {
     false
 }
 
+/// Whether the process group `pgid` still has at least one member (Issue
+/// #4980).
+///
+/// `kill(-pgid, 0)` is the group-scoped twin of the `kill(pid, 0)` liveness
+/// probe: it succeeds while *any* process remains in the group and fails with
+/// `ESRCH` once the group is empty. This is what lets the crash-path reaper
+/// distinguish "the leader died and took its tree with it" (nothing to do) from
+/// "the leader died and left an agent running unclaimed work" (the incident this
+/// issue exists to close).
+///
+/// `EPERM` counts as *present* for the same fail-safe reason
+/// [`is_pid_alive`](crate::sweep_registry::is_pid_alive) treats it as alive: the
+/// group demonstrably exists, we merely may not signal it.
+#[cfg(unix)]
+pub(crate) fn group_has_members(pgid: u32) -> bool {
+    if pgid == 0 {
+        return false;
+    }
+    let Ok(pgid_t): Result<i32, _> = pgid.try_into() else {
+        return false;
+    };
+    if libc_kill(-pgid_t, 0) == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(EPERM)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn group_has_members(_pgid: u32) -> bool {
+    false
+}
+
+/// Grace between the crash-path reaper's group SIGTERM and its SIGKILL
+/// escalation (Issue #4980).
+///
+/// The escalation is deliberately deferred to a later reaper tick rather than
+/// slept through inline: [`SweepRegistry::reap_once`] also runs on the
+/// `ListSweeps` / `GetSweepStatus` read path (via `reap_liveness`) while holding
+/// the registry mutex, and blocking there for a grace window is the exact
+/// 2026-07-26 wedge [`REAP_GH_TIMEOUT`] exists to prevent. Five seconds means
+/// the next ordinary tick (30s) is always past the deadline.
+pub(crate) const ORPHAN_GROUP_REAP_GRACE: Duration = Duration::from_secs(5);
+
+/// One entry's snapshot taken at the top of a [`SweepRegistry::reap_once`] tick:
+/// `(sweep_id, pid, pgid, state, kind, started_at)`. Snapshotted (rather than
+/// iterated in place) so the loop body can borrow the registry mutably; `pgid`
+/// joined the tuple in #4980 so the crash path can reap a dead leader's
+/// surviving process group.
+pub(crate) type ReapCandidate = (SweepId, u32, Option<u32>, SweepState, SweepKind, DateTime<Utc>);
+
+/// A crash-path group reap awaiting SIGKILL escalation (Issue #4980).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PendingGroupReap {
+    /// The process group that was SIGTERM'd.
+    pub(crate) pgid: u32,
+    /// When SIGKILL becomes due if the group still has members.
+    pub(crate) escalate_at: Instant,
+}
+
 /// Read the last `n` lines of a file. Returns an empty vec when the
 /// file is empty; returns an error when the file does not exist (so the
 /// caller can distinguish "no log yet" from "log gone").
@@ -328,17 +387,143 @@ impl SweepRegistry {
         Some(info)
     }
 
-    /// Signal a sweep's process. When this daemon still owns a retained
-    /// `Child` handle for `sweep_id` (i.e. we spawned it into its own process
-    /// group via `process_group(0)`), the signal is delivered to the WHOLE
-    /// process group (`kill(-pgid, sig)`, and the leader's pgid == its pid)
-    /// so the entire `claude` subprocess subtree is reached (Issue #3800).
-    /// Reconstructed entries with no handle fall back to single-PID delivery.
+    /// Signal a sweep's process **group** (`kill(-pgid, sig)`), so the entire
+    /// `claude` subprocess subtree — wrapper, agent, build tools, simulations,
+    /// watcher loops — is reached rather than just the tracked leader PID
+    /// (Issue #3800).
+    ///
+    /// # Why this is no longer gated on a retained `Child` handle (Issue #4980)
+    ///
+    /// It used to be: `if self.children.contains_key(sweep_id)`. That made
+    /// group delivery an accident of *which process is asking*. Two ordinary
+    /// situations have no handle and silently degraded to a single-PID kill:
+    ///
+    /// - a `reconstruct()`-ed entry after a daemon restart, and
+    /// - **every** invocation from a fresh `loom-daemon cancel` CLI process,
+    ///   which never held a spawn-time handle at all.
+    ///
+    /// Degrading there is precisely the 2026-08-03 incident: SIGKILLing the
+    /// tracked wrapper left the `claude` agent alive, which noticed its
+    /// subprocesses had died and *relaunched them*. So the group is now resolved
+    /// from durable state — [`SweepInfo::pgid`], persisted at spawn time and
+    /// restored by `reconstruct()` — and used unconditionally.
+    ///
+    /// # Fallbacks (log, never panic, never mis-target)
+    ///
+    /// - No recorded pgid but we DO hold the handle ⇒ the leader is live and was
+    ///   spawned by us with `process_group(0)`, so `pgid == pid` holds by
+    ///   construction (the pre-#4980 behavior, retained for entries created
+    ///   before the field was populated).
+    /// - No recorded pgid and no handle (a pre-#4980 `owner.json`, a
+    ///   checkpoint-only entry, a non-Unix host) ⇒ single-PID delivery, with a
+    ///   log line naming the degradation rather than a silent one.
+    /// - A recorded pgid equal to **our own** process group ⇒ refuse the group
+    ///   signal outright. `kill(-our_pgid, 9)` would kill the daemon and every
+    ///   sweep it owns; a stale record naming our group (PID recycling across a
+    ///   restart) must never be able to do that.
     pub(crate) fn signal_sweep(&self, sweep_id: &str, pid: u32, sig: i32) -> bool {
-        if self.children.contains_key(sweep_id) {
-            send_group_signal(pid, sig)
-        } else {
-            send_signal(pid, sig)
+        let recorded = self.entries.get(sweep_id).and_then(|info| info.pgid);
+        let retained_handle = self.children.contains_key(sweep_id);
+        let Some(pgid) = recorded.or_else(|| retained_handle.then_some(pid)) else {
+            log::warn!(
+                "signal_sweep: sweep {sweep_id} (pid {pid}) has no recorded process group \
+                 (pre-#4980 lock record or unknown-group entry) — falling back to single-PID \
+                 signal {sig}; descendants may survive"
+            );
+            return send_signal(pid, sig);
+        };
+        if Some(pgid) == current_process_group() {
+            log::error!(
+                "signal_sweep: refusing to send signal {sig} to process group {pgid} for sweep \
+                 {sweep_id} — that is THIS process's own group (stale/incorrect pgid record). \
+                 Falling back to single-PID delivery to pid {pid} (#4980)."
+            );
+            return send_signal(pid, sig);
+        }
+        send_group_signal(pgid, sig)
+    }
+
+    /// Terminate the surviving process group of a sweep whose **leader is
+    /// already dead** (Issue #4980) — the crash path.
+    ///
+    /// A dead wrapper does not imply a dead tree. In the 2026-08-03 incident the
+    /// tracked pid was gone while the `claude` agent it had spawned kept running
+    /// against an issue whose claim had already been returned to the queue: a
+    /// zombie agent, invisible to the registry (`in_flight: 0`), burning CPU and
+    /// mutating a repo it no longer held. `signal_sweep` cannot help here — the
+    /// OS refuses to report a dead pid's group — which is exactly why the pgid is
+    /// persisted while the leader is alive.
+    ///
+    /// Sends SIGTERM now and registers a deferred SIGKILL escalation
+    /// ([`ORPHAN_GROUP_REAP_GRACE`]) picked up by a later
+    /// [`reap_once`](Self::reap_once) tick, so no caller ever blocks on a grace
+    /// window while holding the registry mutex. A no-op (returning `false`) when
+    /// the group is already empty — the overwhelmingly common case, where the
+    /// leader's death took its whole tree with it.
+    pub(crate) fn reap_orphaned_group(
+        &mut self,
+        sweep_id: &str,
+        issue: Option<u32>,
+        pgid: u32,
+    ) -> bool {
+        if pgid == 0 || Some(pgid) == current_process_group() {
+            log::error!(
+                "reap_orphaned_group: refusing to signal process group {pgid} for sweep \
+                 {sweep_id} — it is zero or THIS process's own group (#4980)"
+            );
+            return false;
+        }
+        if !group_has_members(pgid) {
+            return false;
+        }
+        let scope = issue.map_or_else(String::new, |n| format!(" (issue #{n})"));
+        log::warn!(
+            "reap_orphaned_group: sweep {sweep_id}{scope} has a DEAD leader but its process \
+             group {pgid} still has members — an orphaned agent/subtree running unclaimed work. \
+             Sending SIGTERM to the group; escalating to SIGKILL in {}s if it survives (#4980).",
+            ORPHAN_GROUP_REAP_GRACE.as_secs()
+        );
+        send_group_signal(pgid, 15);
+        self.pending_group_reaps.insert(
+            sweep_id.to_string(),
+            PendingGroupReap {
+                pgid,
+                escalate_at: Instant::now() + ORPHAN_GROUP_REAP_GRACE,
+            },
+        );
+        true
+    }
+
+    /// SIGKILL any orphaned group that survived its crash-path SIGTERM past
+    /// [`ORPHAN_GROUP_REAP_GRACE`] (Issue #4980). Called at the top of every
+    /// [`reap_once`](Self::reap_once) tick, mirroring how
+    /// `retry_pending_quarantine_releases` drains its own deferred work.
+    /// Cheap early-return when nothing is pending.
+    pub(crate) fn escalate_pending_group_reaps(&mut self) {
+        if self.pending_group_reaps.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let mut done: Vec<SweepId> = Vec::new();
+        for (sweep_id, pending) in &self.pending_group_reaps {
+            if !group_has_members(pending.pgid) {
+                // The SIGTERM worked (or the group drained on its own).
+                done.push(sweep_id.clone());
+                continue;
+            }
+            if now < pending.escalate_at {
+                continue;
+            }
+            log::warn!(
+                "reap_orphaned_group: process group {} for sweep {sweep_id} survived SIGTERM — \
+                 escalating to SIGKILL (#4980)",
+                pending.pgid
+            );
+            send_group_signal(pending.pgid, 9);
+            done.push(sweep_id.clone());
+        }
+        for sweep_id in done {
+            self.pending_group_reaps.remove(&sweep_id);
         }
     }
 
@@ -550,7 +735,20 @@ impl SweepRegistry {
             // sweep owns the claim and runs its own lifecycle. #4556 extends the
             // same skip to `HolderAlive`: the cancelled sweep's OWN pid is still
             // a live `/loom:sweep <N>` process, so the claim is not free either.
-            let superseded = self.release_lock_owned(*issue, sweep_id).retained();
+            //
+            // #5017/#5282: `release_lock_owned` only ever sees THIS host's own
+            // local `.loom/locks/issue-<N>` — a different host's live claim on
+            // the SAME issue is invisible to it (there is no shared lock
+            // directory across hosts), so a purely local check can return
+            // "Released" even while a peer host's sweep is actively building.
+            // `claim_superseded_on_forge` is the cross-host backstop: it only
+            // runs (short-circuits via `||`) when the local check did NOT
+            // already answer the question, and compares the forge's current
+            // `loom:building` labeled-event timestamp against this sweep's own
+            // `started_at` — a labeling event strictly after `started_at` means
+            // a different claimant (possibly on another host) now owns it.
+            let claim_held_elsewhere = self.release_lock_owned(*issue, sweep_id).retained()
+                || self.claim_superseded_on_forge(*issue, started_at);
             // Best-effort tidy-up of the machine-level liveness journal
             // (#3953) — this cancelled sweep no longer exists.
             self.journal_remove_best_effort(*issue);
@@ -564,9 +762,10 @@ impl SweepRegistry {
             // produced no PR, so we never yank the label out from under an
             // in-flight PR's issue. Gated on `!skip_label_flip`, mirroring the
             // reaper path. `SweepKind::PrSet` cancels never reach here.
-            // #4463: a superseded release means a newer sweep now holds the
-            // claim — never restore the label out from under it.
-            if !self.config.skip_label_flip && !produced_pr && !superseded {
+            // #4463/#5017/#5282: a claim held elsewhere (locally superseded OR
+            // forge-superseded) means a different sweep now holds the claim —
+            // never restore the label out from under it.
+            if !self.config.skip_label_flip && !produced_pr && !claim_held_elsewhere {
                 let _ = self.restore_label_to_ready(*issue);
                 self.note_label_flip(*issue); // #4485 flap detection
             }
@@ -656,14 +855,27 @@ impl SweepRegistry {
         // Retry any previously-failed quarantine label restores (Issue #4110).
         // Cheap early-return when nothing is pending.
         self.retry_pending_quarantine_releases();
+        // SIGKILL-escalate any orphaned process group that survived a
+        // crash-path SIGTERM (Issue #4980). Cheap early-return when nothing is
+        // pending; never blocks (the grace is deadline-based, not slept).
+        self.escalate_pending_group_reaps();
 
         // Snapshot keys + pids first so we can borrow mutably below.
         // Capture started_at so we can compute durations for Exited events.
-        let candidates: Vec<(SweepId, u32, SweepState, SweepKind, chrono::DateTime<Utc>)> = self
+        // `pgid` rides along so the crash path can reap a dead leader's
+        // surviving process group (#4980).
+        let candidates: Vec<ReapCandidate> = self
             .entries
             .iter()
             .map(|(id, info)| {
-                (id.clone(), info.pid, info.state.clone(), info.kind.clone(), info.started_at)
+                (
+                    id.clone(),
+                    info.pid,
+                    info.pgid,
+                    info.state.clone(),
+                    info.kind.clone(),
+                    info.started_at,
+                )
             })
             .collect();
 
@@ -672,7 +884,7 @@ impl SweepRegistry {
         // registry mutex's lifetime budget unnecessarily.
         let mut events_to_emit: Vec<Event> = Vec::new();
 
-        for (sweep_id, pid, state, kind, started_at) in candidates {
+        for (sweep_id, pid, pgid, state, kind, started_at) in candidates {
             if !matches!(state, SweepState::Running | SweepState::Pending) {
                 continue;
             }
@@ -689,6 +901,21 @@ impl SweepRegistry {
             // handle fall back to the `kill(pid, 0)` probe.
             let (is_dead, exit_code) = self.poll_liveness(&sweep_id, pid);
             if is_dead {
+                // Issue #4980 crash-path reap: the tracked leader is gone, but
+                // its process group may still hold a live `claude` agent and
+                // whatever that agent spawned — the zombie-agent shape of the
+                // 2026-08-03 incident, which the registry rendered as
+                // `in_flight: 0` while the survivors kept mutating the repo.
+                // Signal the group before the entry transitions terminal (after
+                // which nothing tracks the pgid at all). No-op when the group is
+                // already empty, which is the ordinary case.
+                if let Some(pgid) = pgid {
+                    let issue = match &kind {
+                        SweepKind::Issue(n) => Some(*n),
+                        SweepKind::PrSet(_) => None,
+                    };
+                    self.reap_orphaned_group(&sweep_id, issue, pgid);
+                }
                 // #4493: account health must be updated before any bounded
                 // re-dispatch path below asks the selector for another profile.
                 self.apply_provider_health_feedback(&sweep_id, exit_code);
@@ -712,7 +939,15 @@ impl SweepRegistry {
                         // in `HolderAlive` (this sweep's own pid is still a live
                         // `/loom:sweep <N>` process, so the reap verdict was
                         // wrong) via the shared `retained()` predicate.
-                        let superseded = self.release_lock_owned(issue, &sweep_id).retained();
+                        //
+                        // #5017/#5282: the local lock is host-local (see the
+                        // `finish_cancel` comment above this same check) so it
+                        // cannot see a peer host's live claim on this issue —
+                        // `claim_superseded_on_forge` is the cross-host
+                        // backstop, only invoked (via `||` short-circuit) when
+                        // the local check did not already answer the question.
+                        let superseded = self.release_lock_owned(issue, &sweep_id).retained()
+                            || self.claim_superseded_on_forge(issue, started_at);
                         // Best-effort tidy-up of the machine-level liveness
                         // journal (#3953): the reaper just confirmed this
                         // PID is dead, so drop its entry now rather than
@@ -1356,6 +1591,7 @@ mod tests {
         registry.entries.insert(
             sweep_id.clone(),
             SweepInfo {
+                pgid: None,
                 sweep_id: sweep_id.clone(),
                 kind: SweepKind::Issue(41_110),
                 pid,
@@ -1624,6 +1860,7 @@ mod tests {
         registry.entries.insert(
             sweep_id.clone(),
             SweepInfo {
+                pgid: None,
                 sweep_id: sweep_id.clone(),
                 kind: SweepKind::Issue(55),
                 pid: 2_147_483_640,
@@ -1712,6 +1949,7 @@ mod tests {
         registry.entries.insert(
             sweep_id.clone(),
             SweepInfo {
+                pgid: None,
                 sweep_id: sweep_id.clone(),
                 kind: SweepKind::Issue(57),
                 pid: 2_147_483_641,
@@ -1773,6 +2011,7 @@ mod tests {
         registry.entries.insert(
             sweep_id.clone(),
             SweepInfo {
+                pgid: None,
                 sweep_id: sweep_id.clone(),
                 kind: SweepKind::Issue(66),
                 pid: 2_147_483_640,
@@ -1830,6 +2069,7 @@ mod tests {
         registry.entries.insert(
             sweep_id.clone(),
             SweepInfo {
+                pgid: None,
                 sweep_id: sweep_id.clone(),
                 kind: SweepKind::Issue(21),
                 pid: 2_147_483_640, // ~i32::MAX, almost certainly dead
@@ -1909,6 +2149,7 @@ mod tests {
         registry.entries.insert(
             sweep_id.clone(),
             SweepInfo {
+                pgid: None,
                 sweep_id: sweep_id.clone(),
                 kind: SweepKind::Issue(77),
                 pid: 2_147_483_640, // ~i32::MAX, almost certainly dead
@@ -1976,6 +2217,7 @@ mod tests {
         registry.entries.insert(
             sweep_id.clone(),
             SweepInfo {
+                pgid: None,
                 sweep_id: sweep_id.clone(),
                 kind: kind.clone(),
                 pid: 2_147_483_640, // ~i32::MAX, almost certainly dead
@@ -2041,6 +2283,7 @@ mod tests {
         registry.entries.insert(
             sweep_id.clone(),
             SweepInfo {
+                pgid: None,
                 sweep_id: sweep_id.clone(),
                 kind: kind.clone(),
                 pid: 2_147_483_640,
@@ -2105,6 +2348,7 @@ mod tests {
         registry.entries.insert(
             sweep_id.clone(),
             SweepInfo {
+                pgid: None,
                 sweep_id: sweep_id.clone(),
                 kind: kind.clone(),
                 pid: 2_147_483_640,
@@ -2152,6 +2396,7 @@ mod tests {
         registry.entries.insert(
             sweep_id.clone(),
             SweepInfo {
+                pgid: None,
                 sweep_id: sweep_id.clone(),
                 kind: SweepKind::Issue(33),
                 pid: 2_147_483_640,
@@ -2212,6 +2457,7 @@ mod tests {
         registry.entries.insert(
             sweep_id.clone(),
             SweepInfo {
+                pgid: None,
                 sweep_id: sweep_id.clone(),
                 kind: kind.clone(),
                 pid: 2_147_483_640,
@@ -2249,6 +2495,165 @@ mod tests {
         );
     }
 
+    /// Issue #5017/#5282 regression: the LOCAL lock check alone cannot see a
+    /// cross-host race — `.loom/locks/issue-<N>` is host-local, so a peer
+    /// host's live claim on the same issue leaves the local check believing
+    /// nothing else owns the lock (`Released`, not `Superseded`). This test
+    /// simulates exactly that: no local lock at all (mirrors the real
+    /// incident, where the cancelling host's own `.loom/locks/` never
+    /// recorded the OTHER host's claim), but the forge's `loom:building`
+    /// labeled-event timeline shows the label was (re-)applied AFTER this
+    /// sweep's own `started_at` — the cross-host claim-ownership signal.
+    /// `finish_cancel` MUST leave the label alone in that case; restoring it
+    /// would repeat the loom#5270 incident (cancelling a losing duplicate
+    /// destroyed a live peer host's claim).
+    #[test]
+    fn cancel_skips_restore_when_forge_shows_a_newer_claim_from_another_host() {
+        let dir = tempdir().unwrap();
+        let gh_log = dir.path().join("gh-invocations.log");
+        let fake_gh = dir.path().join("fake-gh.sh");
+        // Any `gh api ... /timeline ...` call answers with a labeling
+        // timestamp comfortably AFTER this sweep's `started_at` (set below to
+        // `now - 1h`); every other `gh` call (the label-restore edit itself)
+        // behaves like the other fixtures: logged, empty stdout, exit 0. A
+        // real `restore_label_to_ready` call would show up in the log as a
+        // `--remove-label loom:building` invocation, so asserting its absence
+        // is sufficient to prove the forge check vetoed the restore.
+        let script = format!(
+            "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [[ \"$1\" == \"api\" ]]; then\n  echo \"\\\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\\\"\"\nfi\nexit 0\n",
+            gh_log.display()
+        );
+        std::fs::write(&fake_gh, &script).unwrap();
+        let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_gh, perms).unwrap();
+        if let Ok(f) = std::fs::File::open(&fake_gh) {
+            let _ = f.sync_all();
+        }
+
+        let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
+        config.gh_bin = Some(fake_gh);
+        config.skip_label_flip = false; // real restore path enabled but must NOT fire
+        let mut registry = SweepRegistry::new(config);
+
+        // No local lock at all — models the cross-host case where this
+        // host's `.loom/locks/issue-<N>` never recorded the other host's
+        // claim (release_lock_owned would answer `Released`, not
+        // `Superseded`, with no forge-side check).
+        let kind = SweepKind::Issue(8802);
+        let started_at = Utc::now() - chrono::Duration::hours(1);
+        let sweep_id = "sweep-issue-8802-loser".to_string();
+        registry.entries.insert(
+            sweep_id.clone(),
+            SweepInfo {
+                pgid: None,
+                sweep_id: sweep_id.clone(),
+                kind: kind.clone(),
+                pid: 2_147_483_640,
+                token_name: "unknown".into(),
+                runtime: "unknown".into(),
+                runtime_source: None,
+                log_path: registry.compute_log_path(8802),
+                idempotency_key: None,
+                started_at,
+                state: SweepState::Running,
+                latest_phase: None,
+                pr_number: None,
+                model: None,
+                effort: None,
+                depends_on: None,
+                repo: None,
+            },
+        );
+
+        let outcome = registry.finish_cancel(&sweep_id, 2_147_483_640, &kind, started_at, true);
+        assert!(outcome.was_running);
+
+        let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            gh_calls.contains("api repos/{owner}/{repo}/issues/8802/timeline"),
+            "expected finish_cancel to consult the forge-side claim timeline; got: {gh_calls:?}"
+        );
+        assert!(
+            !gh_calls.contains("--remove-label loom:building"),
+            "a cancel whose forge timeline shows a newer claim must NOT restore \
+             loom:building -> loom:issue (would destroy a peer host's live claim, #5017/#5282); \
+             got gh invocations: {gh_calls:?}"
+        );
+    }
+
+    /// Issue #5017/#5282: the SAME cross-host claim-ownership check must
+    /// apply to the reaper's natural-exit/crash label-restore path
+    /// (`reap_once`'s checkpoint-present branch), not just `finish_cancel` —
+    /// the Curator's "Suspected Cause (unverified)" flagged this as the
+    /// likely-but-unconfirmed second call site by code-path symmetry; this
+    /// test confirms it.
+    #[test]
+    fn reap_skips_restore_when_forge_shows_a_newer_claim_from_another_host() {
+        let dir = tempdir().unwrap();
+        let (mut registry, gh_log) = fixture_registry(dir.path());
+        // Override the fixture's fake `gh` so `gh api .../timeline` answers
+        // with a labeling timestamp AFTER `started_at` (set below).
+        let fake_gh = dir.path().join("fake-gh-timeline.sh");
+        let script = format!(
+            "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [[ \"$1\" == \"api\" ]]; then\n  echo \"\\\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\\\"\"\nfi\nexit 0\n",
+            gh_log.display()
+        );
+        std::fs::write(&fake_gh, &script).unwrap();
+        let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_gh, perms).unwrap();
+        registry.config.gh_bin = Some(fake_gh);
+        registry.config.skip_label_flip = false;
+
+        // Checkpoint present so the reaper picks the Crashed/label-restore
+        // branch under test.
+        let cp_dir = registry.config.checkpoint_dir();
+        std::fs::create_dir_all(&cp_dir).unwrap();
+        std::fs::write(cp_dir.join("issue-8803.json"), r#"{"phase":"builder","issue":8803}"#)
+            .unwrap();
+
+        let started_at = Utc::now() - chrono::Duration::hours(1);
+        let sweep_id = "sweep-issue-8803-loser".to_string();
+        registry.entries.insert(
+            sweep_id.clone(),
+            SweepInfo {
+                pgid: None,
+                sweep_id: sweep_id.clone(),
+                kind: SweepKind::Issue(8803),
+                pid: 2_147_483_640, // near-certainly dead
+                token_name: "unknown".into(),
+                runtime: "unknown".into(),
+                runtime_source: None,
+                log_path: registry.compute_log_path(8803),
+                idempotency_key: None,
+                started_at,
+                state: SweepState::Running,
+                latest_phase: None,
+                pr_number: None,
+                model: None,
+                effort: None,
+                depends_on: None,
+                repo: None,
+            },
+        );
+
+        let changed = registry.reap_once();
+        assert!(changed >= 1);
+
+        let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            gh_calls.contains("api repos/{owner}/{repo}/issues/8803/timeline"),
+            "expected reap_once to consult the forge-side claim timeline; got: {gh_calls:?}"
+        );
+        assert!(
+            !gh_calls.contains("--remove-label loom:building"),
+            "a reap whose forge timeline shows a newer claim must NOT restore \
+             loom:building -> loom:issue (would destroy a peer host's live claim, #5017/#5282); \
+             got gh invocations: {gh_calls:?}"
+        );
+    }
+
     #[test]
     #[serial]
     fn reaper_interval_env_override() {
@@ -2278,6 +2683,7 @@ mod tests {
         registry.entries.insert(
             sweep_id.clone(),
             SweepInfo {
+                pgid: None,
                 sweep_id: sweep_id.clone(),
                 kind: SweepKind::Issue(42),
                 pid: 1234,
@@ -2320,6 +2726,7 @@ mod tests {
         registry.entries.insert(
             sweep_id.clone(),
             SweepInfo {
+                pgid: None,
                 sweep_id: sweep_id.clone(),
                 kind: SweepKind::Issue(99),
                 pid: 1,
@@ -2381,6 +2788,7 @@ mod tests {
         registry.entries.insert(
             sweep_id.clone(),
             SweepInfo {
+                pgid: None,
                 sweep_id: sweep_id.clone(),
                 kind: SweepKind::Issue(11),
                 pid: 1,
@@ -2426,6 +2834,7 @@ mod tests {
         registry.entries.insert(
             sweep_id.clone(),
             SweepInfo {
+                pgid: None,
                 sweep_id: sweep_id.clone(),
                 kind: SweepKind::Issue(22),
                 pid: 2_147_483_640, // ~i32::MAX, almost certainly dead
@@ -2486,6 +2895,7 @@ mod tests {
         registry.entries.insert(
             sweep_id.clone(),
             SweepInfo {
+                pgid: None,
                 sweep_id: sweep_id.clone(),
                 kind: SweepKind::Issue(77),
                 pid,
@@ -2565,6 +2975,7 @@ mod tests {
             reg.entries.insert(
                 target.clone(),
                 SweepInfo {
+                    pgid: None,
                     sweep_id: target.clone(),
                     kind: SweepKind::Issue(880),
                     pid: target_pid,
@@ -2586,6 +2997,7 @@ mod tests {
             reg.entries.insert(
                 other.clone(),
                 SweepInfo {
+                    pgid: None,
                     sweep_id: other.clone(),
                     kind: SweepKind::Issue(881),
                     pid: 2_147_483_640, // ~i32::MAX, harmless dead pid
@@ -2682,6 +3094,7 @@ mod tests {
         registry.entries.insert(
             sweep_id.clone(),
             SweepInfo {
+                pgid: None,
                 sweep_id: sweep_id.clone(),
                 kind: SweepKind::Issue(88),
                 pid: 2_147_483_640,
@@ -2787,6 +3200,382 @@ mod tests {
 
         let info = registry.get(&sweep_id).unwrap();
         assert!(matches!(info.state, SweepState::Exited { .. }));
+    }
+
+    /// Issue #4980, the crux regression test: cancelling a **reconstructed**
+    /// entry must still tear down the whole process group.
+    ///
+    /// [`cancel_terminates_whole_process_group_including_grandchild`] above only
+    /// proves group-kill works while the *spawning* registry still holds the
+    /// in-memory `Child` handle. That was the entire gate on the group path
+    /// (`if self.children.contains_key(sweep_id)`), so the two situations an
+    /// operator actually hits at 3am both silently degraded to a single-PID kill:
+    /// a daemon that has since restarted (this test, via `reconstruct()`), and
+    /// **every** `loom-daemon cancel` invocation, which runs in a fresh process
+    /// that never held a handle at all.
+    ///
+    /// The second registry here models both: same workspace, same on-disk lock,
+    /// zero retained handles. The grandchild assertion is what fails on a
+    /// regression — a single-PID kill leaves it running, which is precisely the
+    /// zombie-agent shape of the 2026-08-03 incident.
+    #[test]
+    #[serial]
+    fn cancel_reconstructed_entry_kills_whole_group() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path();
+        let gc_pidfile = workspace.join("grandchild.pid");
+
+        let script = format!(
+            "#!/usr/bin/env bash\nsleep 300 &\necho \"$!\" > \"{gc}\"\nsleep 300\n",
+            gc = gc_pidfile.display()
+        );
+        let mut spawner = lifecycle_registry(workspace, &script);
+
+        let outcome = spawner
+            .dispatch(&SweepKind::Issue(4980), None, None, None, None)
+            .expect("dispatch should succeed");
+        let leader_pid = outcome.pid;
+        let sweep_id = outcome.sweep_id.clone();
+
+        let gc_pid = read_pid_file(&gc_pidfile, FIXTURE_CHILD_WAIT_MS)
+            .expect("grandchild pid should be recorded");
+        assert!(is_pid_alive(leader_pid), "leader should be running post-dispatch");
+        assert!(is_pid_alive(gc_pid), "grandchild should be running post-dispatch");
+
+        // The pgid must have been persisted to the claim lock at spawn time —
+        // this is what survives the daemon, and the OS cannot re-derive it once
+        // the leader dies.
+        let owner_path = spawner
+            .config
+            .locks_dir()
+            .join("issue-4980")
+            .join("owner.json");
+        let owner: LockOwner =
+            serde_json::from_str(&std::fs::read_to_string(&owner_path).unwrap()).unwrap();
+        assert_eq!(owner.owner_pid, leader_pid);
+        assert_eq!(
+            owner.pgid,
+            Some(leader_pid),
+            "owner.json must record the child's process group (#4980)"
+        );
+
+        // Simulate the daemon restart / fresh CLI process: a brand-new registry
+        // over the same workspace, rebuilt from disk. It has NO `Child` handle
+        // for this sweep — the exact condition that used to disable group-kill.
+        let mut restarted = lifecycle_registry(workspace, &script);
+        let admitted = restarted.reconstruct().expect("reconstruct should succeed");
+        assert_eq!(admitted, 1, "the live lock should be admitted as a Running entry");
+        assert!(
+            !restarted.children.contains_key(&sweep_id),
+            "a reconstructed entry must not have a retained Child handle — that is the \
+             whole point of this test"
+        );
+        assert_eq!(
+            restarted.get(&sweep_id).unwrap().pgid,
+            Some(leader_pid),
+            "reconstruct() must restore the persisted process group"
+        );
+
+        let cancel = restarted
+            .cancel(&sweep_id, Duration::from_secs(1))
+            .expect("cancel should succeed");
+        assert!(cancel.was_running);
+
+        // THE assertion: the grandchild is not a direct child of anything this
+        // registry tracks, so only a group-scoped signal can reach it.
+        assert!(
+            wait_until_dead(gc_pid, FIXTURE_CHILD_WAIT_MS),
+            "grandchild survived a cancel of a RECONSTRUCTED entry — the group-kill degraded \
+             to a single-PID kill (#4980 regression)"
+        );
+
+        // The leader was SIGKILLed but is still a child of THIS test process
+        // (the original registry spawned it), so it lingers as a zombie until
+        // someone `wait()`s it — in production the old daemon is gone and init
+        // reaps it. Reap it through the spawner's retained handle, then assert
+        // it is genuinely gone.
+        let _ = spawner.reap_handle(&sweep_id);
+        assert!(
+            wait_until_dead(leader_pid, FIXTURE_CHILD_WAIT_MS),
+            "leader still alive after cancel"
+        );
+    }
+
+    /// Issue #4980 edge case: an `owner.json` written by a **pre-#4980** daemon
+    /// binary has no `pgid` key at all. It must still deserialize (a parse
+    /// failure is read everywhere as "no owner", which would drop a *live*
+    /// sweep's lock), reconstruct into an entry with `pgid: None`, and cancel
+    /// via a documented single-PID fallback rather than panicking.
+    #[test]
+    #[serial]
+    fn reconstruct_tolerates_pre_pgid_owner_json_and_degrades_gracefully() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path();
+        let mut registry = lifecycle_registry(workspace, "#!/usr/bin/env bash\nsleep 300\n");
+
+        // A long-lived process to stand in for the live sweep leader. Spawned
+        // WITHOUT `process_group(0)`, exactly like a pre-#4980 daemon's child
+        // would appear to a registry that has no record of its group.
+        let mut child = Command::new("bash")
+            .arg("-c")
+            .arg("sleep 300")
+            .spawn()
+            .expect("spawn fixture child");
+        let pid = child.id();
+
+        // Byte-for-byte the old on-disk schema: four keys, no `pgid`.
+        let locks = registry.config.locks_dir();
+        let lock = locks.join("issue-4979");
+        std::fs::create_dir_all(&lock).unwrap();
+        std::fs::write(
+            lock.join("owner.json"),
+            format!(
+                r#"{{"issue":4979,"owner_pid":{pid},"acquired_at":"{}","sweep_id":"sweep-legacy"}}"#,
+                Utc::now().to_rfc3339()
+            ),
+        )
+        .unwrap();
+
+        let admitted = registry
+            .reconstruct()
+            .expect("a pre-#4980 owner.json must not fail reconstruction");
+        assert_eq!(admitted, 1, "the legacy lock must still be admitted");
+        let info = registry.get("sweep-legacy").expect("legacy entry admitted");
+        assert_eq!(info.pid, pid);
+        assert_eq!(info.pgid, None, "no group is recorded in a pre-#4980 owner.json");
+
+        // Cancel must fall back to single-PID delivery — no panic, no
+        // group-signal against an unknown group.
+        let outcome = registry
+            .cancel("sweep-legacy", Duration::from_secs(1))
+            .expect("cancel of a legacy entry should succeed");
+        assert!(outcome.was_running);
+        let _ = child.wait();
+        assert!(wait_until_dead(pid, FIXTURE_CHILD_WAIT_MS), "legacy child should be gone");
+    }
+
+    /// Issue #4980: a recorded pgid that the OS contradicts (PID recycled across
+    /// a daemon restart, so the live `owner_pid` leads some *other* group) must
+    /// be discarded, not trusted. Trusting it would aim a later `kill(-pgid, 9)`
+    /// at a stranger's process group.
+    #[test]
+    #[serial]
+    fn reconstruct_discards_a_pgid_the_os_contradicts() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path();
+        let mut registry = lifecycle_registry(workspace, "#!/usr/bin/env bash\nsleep 300\n");
+
+        let mut child = Command::new("bash")
+            .arg("-c")
+            .arg("sleep 300")
+            .spawn()
+            .expect("spawn fixture child");
+        let pid = child.id();
+
+        // This child was NOT spawned as a group leader, so `getpgid(pid)` is the
+        // test harness's group — never `pid` itself. Claim otherwise on disk.
+        let lock = registry.config.locks_dir().join("issue-4978");
+        std::fs::create_dir_all(&lock).unwrap();
+        let owner = LockOwner {
+            issue: 4978,
+            owner_pid: pid,
+            acquired_at: Utc::now().to_rfc3339(),
+            sweep_id: "sweep-stale-pgid".to_string(),
+            pgid: Some(pid),
+        };
+        std::fs::write(lock.join("owner.json"), serde_json::to_string_pretty(&owner).unwrap())
+            .unwrap();
+
+        registry.reconstruct().expect("reconstruct should succeed");
+        assert_eq!(
+            registry.get("sweep-stale-pgid").unwrap().pgid,
+            None,
+            "a pgid the OS does not confirm must be discarded (#4980)"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// Issue #4980 acceptance criterion 2 (the crash path): a sweep whose
+    /// **leader is already dead** but whose process group still holds live
+    /// members must have that group reaped — not left running unclaimed work.
+    ///
+    /// This is the incident shape verbatim: the registry showed `in_flight: 0`
+    /// while a surviving `claude` agent kept mutating a repo whose claim had
+    /// already been returned to the queue. `signal_sweep` cannot help here (the
+    /// OS will not report a dead pid's group), which is exactly why the pgid is
+    /// persisted while the leader is alive.
+    #[test]
+    #[serial]
+    fn reaper_reaps_the_surviving_group_of_a_dead_leader() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+        let gc_pidfile = dir.path().join("orphan.pid");
+
+        // A group leader that forks a long-lived background child and then
+        // exits: the leader dies, the group lives on with an orphan in it.
+        let mut leader = {
+            let mut cmd = Command::new("bash");
+            cmd.arg("-c").arg(format!(
+                "sleep 300 &\necho \"$!\" > \"{gc}\"\nexit 0\n",
+                gc = gc_pidfile.display()
+            ));
+            #[cfg(unix)]
+            cmd.process_group(0);
+            cmd.spawn().expect("spawn fixture leader")
+        };
+        let leader_pid = leader.id();
+        let orphan_pid = read_pid_file(&gc_pidfile, FIXTURE_CHILD_WAIT_MS)
+            .expect("orphan pid should be recorded");
+        // Reap the leader so it is genuinely dead (not a zombie that
+        // `kill(pid, 0)` would still report as alive).
+        let _ = leader.wait();
+        assert!(wait_until_dead(leader_pid, FIXTURE_CHILD_WAIT_MS), "leader should be gone");
+        assert!(is_pid_alive(orphan_pid), "orphan should have survived its leader");
+
+        let sweep_id = "sweep-orphaned-group".to_string();
+        registry.entries.insert(
+            sweep_id.clone(),
+            SweepInfo {
+                sweep_id: sweep_id.clone(),
+                kind: SweepKind::Issue(4977),
+                pid: leader_pid,
+                // Persisted at spawn time; the ONLY remaining handle on the
+                // survivors now that the leader is gone.
+                pgid: Some(leader_pid),
+                token_name: "unknown".into(),
+                runtime: "unknown".into(),
+                runtime_source: None,
+                log_path: registry.compute_log_path(4977),
+                idempotency_key: None,
+                started_at: Utc::now(),
+                state: SweepState::Running,
+                latest_phase: None,
+                pr_number: None,
+                model: None,
+                effort: None,
+                depends_on: None,
+                repo: None,
+            },
+        );
+
+        registry.reap_once();
+
+        assert!(
+            wait_until_dead(orphan_pid, FIXTURE_CHILD_WAIT_MS),
+            "the dead leader's surviving process group was not reaped — a zombie agent would \
+             keep running unclaimed work (#4980)"
+        );
+    }
+
+    /// Issue #4980: a group that ignores the crash-path SIGTERM is escalated to
+    /// SIGKILL on a later reaper tick. The escalation is deliberately deferred
+    /// rather than slept through inline — `reap_once` runs on the `ListSweeps`
+    /// read path under the registry mutex, where blocking is the 2026-07-26
+    /// wedge shape — so this test drives the two ticks directly.
+    #[test]
+    #[serial]
+    fn pending_group_reap_escalates_to_sigkill_on_a_later_tick() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+        let gc_pidfile = dir.path().join("stubborn.pid");
+
+        // The background child traps (ignores) SIGTERM, so only SIGKILL ends it.
+        let mut leader = {
+            let mut cmd = Command::new("bash");
+            cmd.arg("-c").arg(format!(
+                "bash -c 'trap \"\" TERM; sleep 300' &\necho \"$!\" > \"{gc}\"\nexit 0\n",
+                gc = gc_pidfile.display()
+            ));
+            #[cfg(unix)]
+            cmd.process_group(0);
+            cmd.spawn().expect("spawn fixture leader")
+        };
+        let leader_pid = leader.id();
+        let orphan_pid = read_pid_file(&gc_pidfile, FIXTURE_CHILD_WAIT_MS)
+            .expect("orphan pid should be recorded");
+        let _ = leader.wait();
+        // Give the inner bash a moment to install its TERM trap.
+        std::thread::sleep(Duration::from_millis(200));
+
+        assert!(
+            registry.reap_orphaned_group("sweep-stubborn", Some(4976), leader_pid),
+            "a group with live members must be reaped"
+        );
+        assert!(
+            registry.pending_group_reaps.contains_key("sweep-stubborn"),
+            "a SIGKILL escalation must be registered"
+        );
+        // The SIGTERM is ignored, so the orphan is still there.
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(is_pid_alive(orphan_pid), "trap-TERM orphan should have survived SIGTERM");
+
+        // Bring the deadline forward rather than sleeping out the real grace.
+        registry
+            .pending_group_reaps
+            .get_mut("sweep-stubborn")
+            .unwrap()
+            .escalate_at = Instant::now();
+        registry.escalate_pending_group_reaps();
+
+        assert!(
+            wait_until_dead(orphan_pid, FIXTURE_CHILD_WAIT_MS),
+            "the stubborn orphan survived the SIGKILL escalation (#4980)"
+        );
+        assert!(
+            registry.pending_group_reaps.is_empty(),
+            "a completed escalation must be dropped from the pending map"
+        );
+    }
+
+    /// Issue #4980 safety floor: a recorded pgid naming **this process's own
+    /// group** must never be signalled. `kill(-our_pgid, 9)` would take down the
+    /// daemon and every sweep it owns — the one mistake in this area that is
+    /// worse than the bug being fixed.
+    #[test]
+    #[serial]
+    fn group_signalling_refuses_this_processs_own_group() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+        let own_group = current_process_group().expect("unix test host");
+
+        assert!(
+            !registry.reap_orphaned_group("sweep-self", None, own_group),
+            "reap_orphaned_group must refuse our own process group"
+        );
+        assert!(registry.pending_group_reaps.is_empty());
+
+        // `signal_sweep` falls back to single-PID delivery rather than group
+        // delivery. Signal 0 (liveness probe) keeps the test harmless: it proves
+        // which target was chosen without killing anything.
+        let sweep_id = "sweep-self-entry".to_string();
+        registry.entries.insert(
+            sweep_id.clone(),
+            SweepInfo {
+                sweep_id: sweep_id.clone(),
+                kind: SweepKind::Issue(4975),
+                pid: std::process::id(),
+                pgid: Some(own_group),
+                token_name: "unknown".into(),
+                runtime: "unknown".into(),
+                runtime_source: None,
+                log_path: registry.compute_log_path(4975),
+                idempotency_key: None,
+                started_at: Utc::now(),
+                state: SweepState::Running,
+                latest_phase: None,
+                pr_number: None,
+                model: None,
+                effort: None,
+                depends_on: None,
+                repo: None,
+            },
+        );
+        assert!(
+            registry.signal_sweep(&sweep_id, std::process::id(), 0),
+            "the single-PID fallback should still reach the (live) pid"
+        );
     }
 
     /// Issue #3801: a child killed OUT OF BAND (operator `kill -KILL`, not via
@@ -3252,6 +4041,7 @@ mod tests {
         reg.entries.insert(
             "sweep-issue-9256-newer".to_string(),
             SweepInfo {
+                pgid: None,
                 sweep_id: "sweep-issue-9256-newer".to_string(),
                 kind: SweepKind::Issue(9256),
                 pid: std::process::id(), // alive

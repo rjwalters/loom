@@ -7,9 +7,11 @@
 //! bootstrap/service-loop body, which is not a CLI subcommand handler.
 
 pub(crate) mod accounts;
+pub(crate) mod cancel;
 pub(crate) mod cleanup_ops;
 pub(crate) mod common;
 pub(crate) mod dispatch;
+pub(crate) mod health;
 pub(crate) mod legacy_script_cmds;
 pub(crate) mod misc_cmds;
 pub(crate) mod quarantine;

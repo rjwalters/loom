@@ -41,16 +41,6 @@
 //! a separate `cargo test --workspace --doc` invocation, since nextest does not
 //! run them.
 //!
-//! <div class="warning">
-//!
-//! The `backend-tests` CI job has **not** been switched over yet: the workflow
-//! edit needs a credential with GitHub's `workflow` scope, which the automation
-//! account lacks. Tracked in #4559, with the rationale at the top of
-//! `.config/nextest.toml` (#4385). Treat the rules below as the standing
-//! convention regardless — they are what makes the switch a no-op when it lands.
-//!
-//! </div>
-//!
 //! ## What you should do
 //!
 //! * **Prefer `cargo nextest run` for full-suite local runs.** Plain `cargo
@@ -138,6 +128,7 @@
 #![allow(clippy::missing_panics_doc)]
 
 pub mod activity;
+pub mod admission_brake;
 pub mod agent_session;
 pub mod auto_update;
 pub mod autonomy_marker;
@@ -150,32 +141,41 @@ pub mod cpu_headroom;
 pub mod credential_preflight;
 pub mod daemon_heartbeat;
 pub mod daemon_install_state;
+pub mod daemon_pidfile;
 pub mod disk_headroom;
 pub mod epic_state;
 pub mod epic_supervisor;
 pub mod errors;
 pub mod event_bus;
 pub mod fleet;
+pub mod forge_cached_list;
 pub mod forge_cmd;
 pub mod forge_listing;
 pub mod forge_parser;
 pub mod git_parser;
 pub mod git_utils;
+pub mod health;
 pub mod health_monitor;
 pub mod host_breaker;
 pub mod idle_exit;
 pub mod init;
+pub mod install_self_check;
 pub mod ipc;
 pub mod issue_creation_mutex;
+pub mod launchd_env_drift;
 pub mod live_claim;
 pub mod main_health_gate;
 pub mod metrics_collector;
 pub mod observability;
+pub mod orphan_process_reaper;
 pub mod peer_claims;
 pub mod phase_join;
 pub mod pipeline_snapshot;
+pub mod primary_checkout_reaper;
 pub mod quarantine_reconciliation;
+pub mod ram_headroom;
 pub mod rate_limit_breaker;
+pub mod repo_root;
 pub mod role_collision;
 pub mod role_runner;
 pub mod role_validation;
@@ -204,6 +204,7 @@ pub mod work_finder;
 pub mod workspace_pool;
 pub mod workspace_registry;
 pub mod worktree_ops;
+pub mod worktree_reaper;
 pub mod worktree_root;
 
 use std::collections::HashSet;

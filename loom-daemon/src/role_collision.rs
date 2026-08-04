@@ -17,9 +17,9 @@
 //! Two independent daemons (two hosts, or two clones on one host each with
 //! their own PID file) pointed at the **same forge repo** with
 //! `autonomous.roleRunner.enabled=true` therefore run Champion/Curator/Judge/
-//! Auditor/Guide ticks with *zero* mutual awareness: each in-memory guard only
-//! knows its own invocations, and the forge — the only shared state — was never
-//! consulted. That is the leading explanation for #4586 (eight duplicate
+//! Doctor/Auditor/Guide ticks with *zero* mutual awareness: each in-memory
+//! guard only knows its own invocations, and the forge — the only shared
+//! state — was never consulted. That is the leading explanation for #4586 (eight duplicate
 //! "Cannot Auto-Merge" Champion comments on PR #4540 inside ~5 minutes, far
 //! above the documented 10-minute Champion cadence). The same shape applies to
 //! a repo that leaves the GitHub Actions `loom-*.yml` cron schedules enabled
@@ -38,10 +38,10 @@
 //!
 //! Each standalone role acts on a **label-defined queue** (the lifecycle in
 //! CLAUDE.md): Champion works open PRs labeled `loom:pr`, Judge works
-//! `loom:review-requested`, Curator works `loom:curating`, Guide works
-//! `loom:triage`, Auditor works its own `loom:auditor` proposals. Any pass of
-//! that role — comment, label write, close — bumps `updated_at` on the queue
-//! items it touches.
+//! `loom:review-requested`, Doctor works `loom:changes-requested` (#5272),
+//! Curator works `loom:curating`, Guide works `loom:triage`, Auditor works
+//! its own `loom:auditor` proposals. Any pass of that role — comment, label
+//! write, close — bumps `updated_at` on the queue items it touches.
 //!
 //! So, immediately before a tick for `(root, role)`:
 //!
@@ -164,6 +164,9 @@ pub struct ProbeTarget {
 /// * `champion` → open PRs labeled `loom:pr` (the auto-merge queue — where
 ///   #4586's duplicate "Cannot Auto-Merge" burst landed)
 /// * `judge` → open PRs labeled `loom:review-requested`
+/// * `doctor` → open PRs labeled `loom:changes-requested` (#5272's standalone
+///   queue scan — the counterpart of `judge`'s probe target, one stage later
+///   in the PR lifecycle)
 /// * `curator` → open issues labeled `loom:curating` (the in-flight marker a
 ///   Curator pass writes before it enriches)
 /// * `guide` → open issues labeled `loom:triage`
@@ -177,6 +180,10 @@ pub fn probe_target_for_role(role: &str) -> Option<ProbeTarget> {
         },
         "judge" => ProbeTarget {
             label: "loom:review-requested",
+            kind: TargetKind::PullRequest,
+        },
+        "doctor" => ProbeTarget {
+            label: "loom:changes-requested",
             kind: TargetKind::PullRequest,
         },
         "curator" => ProbeTarget {
@@ -711,6 +718,14 @@ mod tests {
                 label: "loom:review-requested",
                 kind: TargetKind::PullRequest
             })
+        );
+        assert_eq!(
+            probe_target_for_role("doctor"),
+            Some(ProbeTarget {
+                label: "loom:changes-requested",
+                kind: TargetKind::PullRequest
+            }),
+            "#5272: doctor's standalone queue scan needs a probe target too"
         );
         assert_eq!(
             probe_target_for_role("curator"),

@@ -30,6 +30,26 @@
 //! deployments with no always-on daemon — this module does not remove them,
 //! it gives an always-on daemon host a better primary path.
 //!
+//! **Doctor is the one exception to "standalone vs. per-sweep" above
+//! (issue #5272).** Before #5272, a `loom:changes-requested` PR was owned
+//! *only* by the Doctor a live `/loom:sweep`'s judge-rejection loop
+//! dispatches — so a PR left in that state after its sweep ended (crash,
+//! token exhaustion, retry budget, or a judge rejection landing after the
+//! sweep's own retry budget was spent) had no role left to pick it up,
+//! ever. Doctor is therefore also in [`DEFAULT_ROLES`], invoked with **no**
+//! PR number (`/loom:doctor`'s own "Finding Work" section, not "PR Fix
+//! Mode") so a tick scans the live `loom:changes-requested` queue itself —
+//! reusing the claim (`loom:treating`) + staleness (`LOOM_STALE_TREATING_MINUTES`)
+//! discipline `doctor.md` already implements for the per-sweep case, so this
+//! adds no new claim mechanism. This makes Doctor dual-mode: still dispatched
+//! per-sweep by `sweep_registry` for a PR *currently* in a live sweep, and
+//! now also dispatched standalone by this module as the queue's periodic
+//! owner once a sweep is gone. The two can never race on the same PR: this
+//! module's own in-progress guard ([`InProgressGuard`]) serializes standalone
+//! `(root, "doctor")` ticks, and `doctor.md`'s `loom:treating` claim check
+//! serializes against a *concurrent* per-sweep Doctor the same way it already
+//! serializes against a concurrent standalone one.
+//!
 //! # Shape (mirrors [`crate::token_ranking_refresh`] / [`crate::work_finder`])
 //!
 //! Per enabled role, on its own configurable cadence, the daemon shells out to
@@ -76,14 +96,16 @@
 //! `claude` sessions at once rather than settling into the steady-state
 //! cadence.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
+use crate::script_helpers::log_filter::strip_ansi;
 use crate::sweep_registry::{self, SweepRegistryConfig};
+use crate::types::RoleTickRecord;
 use crate::workspace_registry::{filter_missing_roots, WorkspaceRegistry};
 
 // ============================================================================
@@ -119,6 +141,27 @@ const TERMINATE_GRACE: Duration = Duration::from_secs(5);
 /// Max bytes of captured invocation output retained in a failure log line.
 const MAX_OUTPUT_TAIL_BYTES: usize = 2048;
 
+/// Max characters of failure detail retained after ANSI-stripping and
+/// cleanup (issue #5024). Bounds `RoleTickOutcome::Failure`'s reason string —
+/// and therefore `RoleTickRecord.detail` — so a single failing invocation's
+/// raw log tail (which can still carry ANSI escapes, banners, and multi-line
+/// stderr even after [`MAX_OUTPUT_TAIL_BYTES`] truncation) cannot blow up the
+/// `roles.summary` health line downstream. See `health::assess_roles`, which
+/// folds every persistent failure's detail into one line.
+const MAX_FAILURE_DETAIL_CHARS: usize = 500;
+
+/// ANSI-strip and length-cap `text` for use as a `RoleTickOutcome::Failure`
+/// reason. Reuses [`strip_ansi`] rather than reimplementing ANSI stripping
+/// (issue #5024).
+fn clean_and_cap_detail(text: &str) -> String {
+    let cleaned = strip_ansi(text).trim().to_string();
+    if cleaned.chars().count() <= MAX_FAILURE_DETAIL_CHARS {
+        return cleaned;
+    }
+    let capped: String = cleaned.chars().take(MAX_FAILURE_DETAIL_CHARS).collect();
+    format!("{capped}… [truncated]")
+}
+
 /// A `Success` outcome faster than this is implausible for a real
 /// `claude -p "/<role>"` session — starting the process, authenticating, and
 /// making at least one forge round-trip (list/enrich/label an issue, review a
@@ -153,6 +196,24 @@ pub fn no_token_pool_skip_count() -> u64 {
     NO_TOKEN_POOL_SKIP_COUNT.load(Ordering::Relaxed)
 }
 
+/// Process-wide count of ticks skipped with
+/// [`RoleTickOutcome::ModelRuntimeMismatch`] (#5028, follow-up to #5001 AC2/
+/// AC3) — a distinct, independently-attributable tally, deliberately never
+/// folded into the generic [`RoleTickOutcome::Failure`] count a real
+/// invocation failure increments, exactly like [`NO_TOKEN_POOL_SKIP_COUNT`]:
+/// this is a permanent config conflict, not a transient failure worth
+/// retrying identically forever.
+static MODEL_RUNTIME_MISMATCH_SKIP_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Total number of role-runner ticks skipped so far for a provable
+/// model/runtime mismatch (see [`RoleTickOutcome::ModelRuntimeMismatch`]).
+/// Exposed for tests and future status surfacing; the daemon does not reset
+/// this across its lifetime.
+#[must_use]
+pub fn model_runtime_mismatch_skip_count() -> u64 {
+    MODEL_RUNTIME_MISMATCH_SKIP_COUNT.load(Ordering::Relaxed)
+}
+
 /// One standalone support role this module knows how to dispatch: its name
 /// (used for config/env lookups and the per-role log file), the `/role`
 /// slash-command prompt passed to `claude -p`, and its default tick interval.
@@ -170,9 +231,15 @@ pub struct RoleSpec {
 /// The standalone periodic support roles this module dispatches, with
 /// defaults mirroring the commented-out `cron:` schedules in
 /// `.github/workflows/loom-*.yml` (CLAUDE.md "Scheduled Support Roles"
-/// table). Deliberately excludes Builder/Doctor (never run standalone —
-/// dispatched inside a sweep) and does not touch the per-sweep Judge/Champion
-/// invocations `sweep_registry` already handles.
+/// table). Deliberately excludes Builder (never run standalone — always
+/// dispatched with an issue number, either inside a sweep or by the work
+/// finder) and does not touch the per-sweep Judge/Champion invocations
+/// `sweep_registry` already handles.
+///
+/// `doctor` is the one role here that is *also* dispatched per-sweep (see the
+/// module-level "Doctor is the one exception" doc above, issue #5272) — its
+/// standalone tick here runs `/loom:doctor` with no PR number, so it exercises
+/// the role's own "Finding Work" queue scan rather than "PR Fix Mode".
 ///
 /// Each `prompt` is the **namespaced** slash command (`/loom:<role>`), not
 /// the bare `/<role>` form — the installed commands live under
@@ -199,6 +266,14 @@ pub const DEFAULT_ROLES: &[RoleSpec] = &[
     RoleSpec {
         name: "judge",
         prompt: "/loom:judge",
+        default_interval_secs: 300,
+    },
+    RoleSpec {
+        // Standalone owner of the `loom:changes-requested` queue once a PR's
+        // sweep is gone (#5272) — see the module-level doc comment. Same
+        // 300s cadence as `judge`, its paired stage in the PR lifecycle.
+        name: "doctor",
+        prompt: "/loom:doctor",
         default_interval_secs: 300,
     },
     RoleSpec {
@@ -237,6 +312,16 @@ pub enum RoleTickOutcome {
     /// operator provisions a pool, not a transient failure worth retrying
     /// identically forever.
     NoTokenPool,
+    /// A provable model/runtime mismatch (#5028, follow-up to #5001 AC2/AC3):
+    /// the admitted runtime and the resolved model are confidently-known,
+    /// differing provider families (e.g. a Claude-shaped model resolved for a
+    /// role admitted onto the Codex runtime) — see
+    /// [`crate::sweep_registry::model_runtime_mismatch`]. A distinct variant,
+    /// deliberately never folded into the generic [`Self::Failure`] tally: it
+    /// is detected BEFORE any spawn, is a permanent config conflict rather
+    /// than a transient invocation failure, and self-heals the moment the
+    /// conflicting config is corrected (no restart, no one-shot disable).
+    ModelRuntimeMismatch(ModelRuntimeMismatch),
 }
 
 impl RoleTickOutcome {
@@ -245,6 +330,147 @@ impl RoleTickOutcome {
     pub fn is_success(&self) -> bool {
         matches!(self, Self::Success)
     }
+}
+
+/// The detail carried by [`RoleTickOutcome::ModelRuntimeMismatch`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelRuntimeMismatch {
+    /// The role that was ticked (e.g. `"judge"`).
+    pub role: String,
+    /// The admitted runtime (e.g. `"codex"`).
+    pub runtime: String,
+    /// The model resolved by [`resolve_role_runner_model`] (or the test-only
+    /// `with_model` override) for this role.
+    pub model: String,
+    /// The config/env tier label [`resolve_role_runner_model`] attributes the
+    /// model to (e.g. `"default"`, `"autonomous.roleRunner.model"`), unchanged
+    /// from what a successful spawn's log header would have recorded.
+    pub model_source: String,
+    /// The [`crate::sweep_registry::model_runtime_mismatch`] reason string
+    /// naming the two conflicting families.
+    pub reason: String,
+}
+
+impl ModelRuntimeMismatch {
+    /// One-line, operator-facing detail. `record_role_tick` stores this
+    /// verbatim on the ring record, and `assess_roles` in `health.rs` already
+    /// renders a persistent failure's `detail` as-is — so `loom-daemon
+    /// health` names the broken config key without an operator reading a
+    /// spawn transcript (#5028 AC2).
+    #[must_use]
+    pub fn detail(&self) -> String {
+        format!(
+            "model/runtime mismatch: {} (model source={}); set \
+             autonomous.roleRunner.roleModels.{} to a model the {} runtime accepts, or point \
+             this role back at a Claude runtime",
+            self.reason, self.model_source, self.role, self.runtime
+        )
+    }
+}
+
+// ============================================================================
+// Role-tick health ring (Issue #4761)
+// ============================================================================
+
+/// How many `(root, role)` tick outcomes the process-global ring retains.
+///
+/// The ring is carried verbatim over IPC in
+/// [`crate::types::DaemonStatusReport::role_tick_records`], so the bound is
+/// really a *payload* bound: at ~150 bytes a record this is well under 20 KB
+/// even when full, which a 5s-interval dashboard poll can afford. It is also
+/// generously larger than any window `loom-daemon health --since` would ask
+/// for in practice (5 roles × a 5-minute cadence fills ~60 entries an hour).
+pub const ROLE_TICK_RING_CAPACITY: usize = 128;
+
+/// Process-global newest-last ring of role-runner tick outcomes.
+///
+/// Same "loop publishes, status reads" discipline as
+/// [`crate::work_finder::last_tick_summary`]: the role-runner loop appends one
+/// record per completed `(root, role)` invocation, and `build_daemon_status`
+/// hands the window to clients, which apply their own
+/// transient-vs-persistent classifier ([`crate::health::summarize_role_ticks`]).
+/// The daemon deliberately stores *raw outcomes*, not a verdict — the window an
+/// operator cares about is a client-side choice.
+static ROLE_TICKS: OnceLock<Mutex<VecDeque<RoleTickRecord>>> = OnceLock::new();
+
+fn role_tick_ring() -> &'static Mutex<VecDeque<RoleTickRecord>> {
+    ROLE_TICKS.get_or_init(|| Mutex::new(VecDeque::with_capacity(ROLE_TICK_RING_CAPACITY)))
+}
+
+/// Append one `(root, role)` tick outcome to the process-global ring, stamped
+/// at `at` (Issue #4761). Oldest entries are evicted past
+/// [`ROLE_TICK_RING_CAPACITY`].
+pub fn record_role_tick_at(
+    role: &str,
+    root: &Path,
+    outcome: &RoleTickOutcome,
+    at: chrono::DateTime<chrono::Utc>,
+) {
+    let (ok, detail) = match outcome {
+        RoleTickOutcome::Success => (true, None),
+        RoleTickOutcome::Failure(reason) => (false, Some(reason.clone())),
+        RoleTickOutcome::RuntimeRejected(rejection) => {
+            (false, Some(format!("runtime-rejected: {}", rejection.reason)))
+        }
+        // #4642's permanent no-pool state is recorded as NOT ok on purpose: a
+        // role that cannot run at all is exactly what a health check must
+        // surface, and the persistent-vs-transient classifier will (correctly)
+        // never clear it until a pool is provisioned.
+        RoleTickOutcome::NoTokenPool => (false, Some("no-token-pool".to_string())),
+        // #5028: same reasoning as `NoTokenPool` — a permanent config
+        // conflict is exactly what a health check must surface, and the
+        // operator-facing `detail()` names the broken config key directly
+        // (AC2), so `assess_roles`'s verbatim rendering needs no special case.
+        RoleTickOutcome::ModelRuntimeMismatch(mismatch) => (false, Some(mismatch.detail())),
+    };
+    let mut ring = role_tick_ring()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if ring.len() >= ROLE_TICK_RING_CAPACITY {
+        ring.pop_front();
+    }
+    ring.push_back(RoleTickRecord {
+        root: root.to_path_buf(),
+        role: role.to_string(),
+        at,
+        ok,
+        detail,
+    });
+}
+
+/// [`record_role_tick_at`] stamped with the current wall clock.
+///
+/// The tick loop ([`spawn_multi_role_task`]) records *every* raw outcome here —
+/// including the identical repeat failures its own log-dedup (#4349) downgrades
+/// to `DEBUG`. That completeness is what lets the client-side classifier detect
+/// a config-shaped failure that can never self-recover: N consecutive failures
+/// for the same `(root, role)` pair with a byte-identical `detail` escalate from
+/// ordinary "persistent" to a loud, distinct verdict via
+/// [`crate::health::summarize_role_ticks`] /
+/// [`crate::health::ROLE_TICK_ESCALATION_THRESHOLD`] (#5023) — rather than
+/// retrying identically forever, silently burning a token slot each tick.
+pub fn record_role_tick(role: &str, root: &Path, outcome: &RoleTickOutcome) {
+    record_role_tick_at(role, root, outcome, chrono::Utc::now());
+}
+
+/// Snapshot the role-tick ring, oldest first (Issue #4761).
+#[must_use]
+pub fn role_tick_records() -> Vec<RoleTickRecord> {
+    role_tick_ring()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .cloned()
+        .collect()
+}
+
+/// Test-only reset of the process-global role-tick ring.
+#[cfg(test)]
+fn reset_role_tick_ring() {
+    role_tick_ring()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clear();
 }
 
 /// Runs one role invocation. Abstracted behind a trait so the loop is
@@ -346,14 +572,10 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
             NO_TOKEN_POOL_SKIP_COUNT.fetch_add(1, Ordering::Relaxed);
             return RoleTickOutcome::NoTokenPool;
         }
-        // Issue #4501: pin the child's model instead of inheriting the account's
-        // interactive CLI default (`fable` on the host that filed the issue,
-        // where every role child burned the most constrained quota tier and then
-        // died on "You've reached your Fable 5 limit").
-        let (model, model_source) = match &self.model {
-            Some(m) => (m.clone(), "override"),
-            None => resolve_role_runner_model(&self.workspace_root),
-        };
+        // Issue #5028 (follow-up to #5001 AC2/AC3): runtime admission now
+        // resolves BEFORE the model, because the runtime is a per-role INPUT
+        // to the model/runtime mismatch check just below — a Claude-shaped
+        // model can only be judged wrong once the admitted runtime is known.
         let admission = if self.spawn_bin.is_none() {
             match crate::runtime_admission::resolve_and_admit(&self.workspace_root, role, None) {
                 Ok(value) => Some(value),
@@ -362,6 +584,40 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
         } else {
             None
         };
+        // Issue #4501: pin the child's model instead of inheriting the account's
+        // interactive CLI default (`fable` on the host that filed the issue,
+        // where every role child burned the most constrained quota tier and then
+        // died on "You've reached your Fable 5 limit").
+        let (model, model_source) = match &self.model {
+            Some(m) => (m.clone(), "override".to_string()),
+            None => resolve_role_runner_model(&self.workspace_root, role),
+        };
+        // Issue #5028: refuse a launch whose resolved model is a provable
+        // conflict with the just-admitted runtime — e.g.
+        // `runtimes.roles.judge = "codex"` with no matching
+        // `autonomous.roleRunner.roleModels.judge` override still resolves the
+        // Claude-shaped default (`sonnet`), which the Codex adapter rejects
+        // with an HTTP 400. Detected here, before any spawn, so the role
+        // runner skips the doomed launch instead of burning a tick (and a
+        // token draw) on a guaranteed failure every time (#5001 AC2/AC3).
+        // Gated on `admission` being `Some` — tests that opt out of admission
+        // via `spawn_bin` have no resolved runtime to check against, and are
+        // unaffected (mirrors the token-pool preflight's `spawn_bin.is_none()`
+        // gate above).
+        if let Some(admitted) = &admission {
+            if let Some(reason) =
+                crate::sweep_registry::model_runtime_mismatch(&admitted.runtime, &model)
+            {
+                MODEL_RUNTIME_MISMATCH_SKIP_COUNT.fetch_add(1, Ordering::Relaxed);
+                return RoleTickOutcome::ModelRuntimeMismatch(ModelRuntimeMismatch {
+                    role: role.to_string(),
+                    runtime: admitted.runtime.clone(),
+                    model,
+                    model_source,
+                    reason,
+                });
+            }
+        }
         run_role_with_timeout(
             &script,
             &self.workspace_root,
@@ -370,18 +626,20 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
             self.logs_dir(),
             self.timeout,
             &model,
-            model_source,
+            &model_source,
             admission.as_ref(),
         )
     }
 }
 
-/// Issue #4501: resolve the model a role-runner child must run with, joining the
-/// SAME precedence chain sweep dispatch uses
-/// ([`sweep_registry::resolve_dispatch_model`]) with the role-runner-specific
-/// `autonomous.roleRunner.model` occupying the "explicit request" tier:
+/// Issue #4501 / #5001: resolve the model a role-runner child must run with,
+/// joining the SAME precedence chain sweep dispatch uses
+/// ([`sweep_registry::resolve_dispatch_model`]) with a per-role override and the
+/// role-runner-specific global `autonomous.roleRunner.model` occupying the
+/// "explicit request" tier:
 ///
-/// **`autonomous.roleRunner.model` > `autonomous.model` > shipped
+/// **`autonomous.roleRunner.roleModels.<role>` >
+/// `autonomous.roleRunner.model` > `autonomous.model` > shipped
 /// [`sweep_registry::DEFAULT_DISPATCH_MODEL`] (`sonnet`)**
 ///
 /// Empty/whitespace values are treated as unset at every tier, so the resolved
@@ -389,20 +647,45 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
 /// default. Returns the model plus a label naming the tier that supplied it (for
 /// the per-role log header).
 ///
-/// Before this, `run_role_with_timeout` emitted **no** `--model` argument at
+/// # Why the per-role tier (#5001)
+///
+/// `LOOM_RUNTIME_<ROLE>` gives each role its own **runtime** axis (Claude vs
+/// Codex etc.), but before #5001 the model was a single global value shared by
+/// every role. The moment one role (e.g. Judge) was pointed at a different
+/// provider via `LOOM_RUNTIME_JUDGE=codex`, the globally-pinned Claude alias
+/// (`sonnet`) was forwarded verbatim to the Codex adapter, which rejected it with
+/// an HTTP 400 — so every Judge tick failed silently, fleet-wide. The per-role
+/// override closes that gap: a repo can run Judge on Codex with a Codex-valid
+/// model while Curator/Champion keep a Claude alias, all from config.
+///
+/// Before #4501, `run_role_with_timeout` emitted **no** `--model` argument at
 /// all, so every scheduled curator/champion/judge/auditor/guide child inherited
 /// whatever the selected account's interactive `claude` default happened to be —
 /// the live defect this resolution exists to prevent.
 #[must_use]
-pub fn resolve_role_runner_model(repo_root: &Path) -> (String, &'static str) {
-    let configured = read_role_runner_config(repo_root).model;
+pub fn resolve_role_runner_model(repo_root: &Path, role: &str) -> (String, String) {
+    let config = read_role_runner_config(repo_root);
+    let role_key = role.trim().to_ascii_lowercase();
+    // Per-role override (#5001) wins over the single global
+    // `autonomous.roleRunner.model`; both occupy `resolve_dispatch_model`'s
+    // "explicit request" (`Param`) tier, so a `per_role` flag disambiguates the
+    // log label. A blank per-role value never reaches here — blanks are dropped
+    // at parse time in `read_role_runner_config`, so it falls through to the
+    // global tier just like an absent key.
+    let (configured, per_role) = match config.role_models.get(&role_key) {
+        Some(m) => (Some(m.clone()), true),
+        None => (config.model.clone(), false),
+    };
     let (model, source) = sweep_registry::resolve_dispatch_model(repo_root, configured.as_deref());
     let label = match source {
-        // `Param` can only arise from `autonomous.roleRunner.model` here — this
-        // function is the only caller and it passes exactly that value.
-        sweep_registry::ModelSource::Param => "autonomous.roleRunner.model",
-        sweep_registry::ModelSource::Config => "autonomous.model",
-        sweep_registry::ModelSource::Default => "default",
+        sweep_registry::ModelSource::Param if per_role => {
+            format!("autonomous.roleRunner.roleModels.{role_key}")
+        }
+        // `Param` without `per_role` can only arise from the global
+        // `autonomous.roleRunner.model` — this function is its only caller.
+        sweep_registry::ModelSource::Param => "autonomous.roleRunner.model".to_string(),
+        sweep_registry::ModelSource::Config => "autonomous.model".to_string(),
+        sweep_registry::ModelSource::Default => "default".to_string(),
     };
     (model, label)
 }
@@ -502,6 +785,12 @@ fn run_role_with_timeout(
         // Pin the already-admitted choice so spawn-worker cannot re-resolve a
         // different runtime after the pre-spawn decision.
         cmd.env("LOOM_RUNTIME", &admission.runtime);
+        // Issue #4768: pin the admitted role too, mirroring
+        // `sweep_registry::spawn_child`. Without it, a Codex-runtime role
+        // child (e.g. `LOOM_ROLE` unset for a champion/curator/judge/auditor/
+        // guide tick) reaches `spawn-codex.sh` with no role signal at all,
+        // which is indistinguishable from an unrecognized role there.
+        cmd.env("LOOM_ROLE", &admission.role);
         log::info!(
             "role_runner: admitted role={} runtime={} source={}",
             admission.role,
@@ -533,7 +822,7 @@ fn run_role_with_timeout(
         match child.try_wait() {
             Ok(Some(status)) if status.success() => return RoleTickOutcome::Success,
             Ok(Some(status)) => {
-                let tail = tail_of_file(&log_path);
+                let tail = clean_and_cap_detail(&tail_of_file(&log_path));
                 return RoleTickOutcome::Failure(format!(
                     "`{}` exited with {status}: {tail}",
                     script.display()
@@ -661,6 +950,17 @@ pub struct RoleRunnerConfig {
     /// account's interactive CLI default. Resolved by
     /// [`resolve_role_runner_model`].
     pub model: Option<String>,
+    /// `autonomous.roleRunner.roleModels` — per-role model overrides keyed by
+    /// role name (issue #5001), each occupying a tier **above** the global
+    /// [`model`](Self::model). This is the config axis that lets a repo run one
+    /// role on a different runtime (e.g. `LOOM_RUNTIME_JUDGE=codex`) while giving
+    /// that role a model its provider accepts, without forcing the other roles
+    /// (still on Claude) onto the same alias. Keys are lower-cased and trimmed;
+    /// blank keys and blank/non-string values are dropped, so an entry never
+    /// emits `--model ""`. Absent / malformed / non-object soft-fails to an empty
+    /// map (every role falls through to the global chain). Resolved by
+    /// [`resolve_role_runner_model`].
+    pub role_models: BTreeMap<String, String>,
 }
 
 /// Read `.loom/config.json -> autonomous.roleRunner`, soft-failing every
@@ -706,6 +1006,29 @@ pub fn read_role_runner_config(repo_root: &Path) -> RoleRunnerConfig {
         .filter(|m| !m.is_empty())
         .map(String::from);
 
+    // `roleModels` (#5001): a `{ "<role>": "<model>" }` object of per-role
+    // overrides. Keys are lower-cased + trimmed (matching how the resolver looks
+    // them up); a blank key, or a blank / non-string value, is dropped — an
+    // override must never emit `--model ""`. Absent / non-object soft-fails to an
+    // empty map, so every role falls through to the global `model` chain
+    // unchanged (zero behavior change when the key is not configured).
+    let role_models = block
+        .get("roleModels")
+        .and_then(serde_json::Value::as_object)
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| {
+                    let key = k.trim().to_ascii_lowercase();
+                    if key.is_empty() {
+                        return None;
+                    }
+                    let val = v.as_str().map(str::trim).filter(|m| !m.is_empty())?;
+                    Some((key, val.to_string()))
+                })
+                .collect::<BTreeMap<String, String>>()
+        })
+        .unwrap_or_default();
+
     RoleRunnerConfig {
         enabled: block.get("enabled").and_then(serde_json::Value::as_bool),
         roles,
@@ -715,6 +1038,7 @@ pub fn read_role_runner_config(repo_root: &Path) -> RoleRunnerConfig {
             .filter(|&s| s > 0),
         on_idle,
         model,
+        role_models,
     }
 }
 
@@ -1315,6 +1639,11 @@ pub fn spawn_multi_role_task(
         // is never conflated with (or silences the WARN for) a genuine
         // invocation failure — see `RootTickLogAction::is_no_token_pool`.
         let mut no_token_pool_roots: HashMap<PathBuf, bool> = HashMap::new();
+        // Per-root model/runtime-mismatch state (#5028), tracked completely
+        // independently of both `failing_roots` and `no_token_pool_roots` so a
+        // permanent config-conflict skip is never conflated with (or silences
+        // the WARN for) either — see `RootTickLogAction::is_model_mismatch`.
+        let mut model_mismatch_roots: HashMap<PathBuf, bool> = HashMap::new();
         // Disabled-root warn-once state (#4377): the per-tick disabled-skip
         // below is otherwise only a `debug!` — invisible at the default `info`
         // level, so a registered root left disabled gets zero diagnostics.
@@ -1442,6 +1771,7 @@ pub fn spawn_multi_role_task(
                         elapsed,
                         &mut failing_roots,
                         &mut no_token_pool_roots,
+                        &mut model_mismatch_roots,
                     ),
                     Err(e) => log::error!(
                         "role_runner: {} invocation task for {} panicked ({e}); continuing to the \
@@ -1503,6 +1833,12 @@ fn log_outcome(role: &str, outcome: &RoleTickOutcome, elapsed: Duration) {
                  .loom/docs/token-pool.md, #4642)"
             );
         }
+        RoleTickOutcome::ModelRuntimeMismatch(mismatch) => {
+            log::warn!(
+                "role_runner: {role} tick skipped after {elapsed:.1?} — {} (#5028)",
+                mismatch.detail()
+            );
+        }
     }
 }
 
@@ -1549,6 +1885,11 @@ fn log_outcome_for_root(role: &str, root: &Path, outcome: &RoleTickOutcome, elap
              .loom/docs/token-pool.md, #4642)",
             root.display()
         ),
+        RoleTickOutcome::ModelRuntimeMismatch(mismatch) => log::warn!(
+            "role_runner: {role} tick for {} skipped after {elapsed:.1?} — {} (#5028)",
+            root.display(),
+            mismatch.detail()
+        ),
     }
 }
 
@@ -1587,6 +1928,17 @@ enum RootTickLogAction {
     /// but tracked completely independently of the Failure/RuntimeRejected
     /// state.
     NoTokenPoolRepeat,
+    /// First tick with a model/runtime mismatch (edge into this state, #5028):
+    /// log at `WARN`. Distinct from [`Self::FailureEdge`] and
+    /// [`Self::NoTokenPoolEdge`] — a provable model/runtime conflict is a
+    /// permanent config state detected before any spawn, never tallied as an
+    /// invocation failure.
+    ModelMismatchEdge,
+    /// Repeat tick with a model/runtime mismatch (already warned, #5028):
+    /// downgrade to `DEBUG`, mirroring [`Self::FailureRepeat`] /
+    /// [`Self::NoTokenPoolRepeat`]'s dedup shape but tracked completely
+    /// independently of both.
+    ModelMismatchRepeat,
 }
 
 impl RootTickLogAction {
@@ -1605,6 +1957,15 @@ impl RootTickLogAction {
     fn is_no_token_pool(self) -> bool {
         matches!(self, Self::NoTokenPoolEdge | Self::NoTokenPoolRepeat)
     }
+
+    /// Whether this action should mark the root as model-mismatched for the
+    /// *next* tick's edge/repeat decision (#5028) — tracked independently of
+    /// both [`Self::is_failing`] and [`Self::is_no_token_pool`] so none of the
+    /// three axes bleed into each other's dedup state.
+    #[must_use]
+    fn is_model_mismatch(self) -> bool {
+        matches!(self, Self::ModelMismatchEdge | Self::ModelMismatchRepeat)
+    }
 }
 
 #[must_use]
@@ -1613,10 +1974,15 @@ fn classify_root_tick_log(
     elapsed: Duration,
     was_failing: bool,
     was_no_token_pool: bool,
+    was_model_mismatch: bool,
 ) -> RootTickLogAction {
     match outcome {
         RoleTickOutcome::NoTokenPool if was_no_token_pool => RootTickLogAction::NoTokenPoolRepeat,
         RoleTickOutcome::NoTokenPool => RootTickLogAction::NoTokenPoolEdge,
+        RoleTickOutcome::ModelRuntimeMismatch(_) if was_model_mismatch => {
+            RootTickLogAction::ModelMismatchRepeat
+        }
+        RoleTickOutcome::ModelRuntimeMismatch(_) => RootTickLogAction::ModelMismatchEdge,
         RoleTickOutcome::Failure(_) | RoleTickOutcome::RuntimeRejected(_) if was_failing => {
             RootTickLogAction::FailureRepeat
         }
@@ -1639,8 +2005,11 @@ fn classify_root_tick_log(
 /// *previous* tick for that root ended in [`RoleTickOutcome::Failure`] (or
 /// [`RoleTickOutcome::RuntimeRejected`]); `no_token_pool` tracks, per root and
 /// completely independently, whether the previous tick ended in
-/// [`RoleTickOutcome::NoTokenPool`] (#4642) — see [`RootTickLogAction`] for
-/// the per-transition logging rules.
+/// [`RoleTickOutcome::NoTokenPool`] (#4642); `model_mismatch` tracks, per root
+/// and completely independently of both, whether the previous tick ended in
+/// [`RoleTickOutcome::ModelRuntimeMismatch`] (#5028) — see [`RootTickLogAction`]
+/// for the per-transition logging rules.
+#[allow(clippy::too_many_arguments)]
 fn log_outcome_for_root_deduped(
     role: &str,
     root: &Path,
@@ -1648,14 +2017,28 @@ fn log_outcome_for_root_deduped(
     elapsed: Duration,
     failing: &mut HashMap<PathBuf, bool>,
     no_token_pool: &mut HashMap<PathBuf, bool>,
+    model_mismatch: &mut HashMap<PathBuf, bool>,
 ) {
+    // Record the raw outcome BEFORE the log-dedup decision (#4761): the
+    // edge/repeat dedup exists to keep the *log* quiet, but a health check needs
+    // every tick — a persistently-failing root logs at DEBUG after its first
+    // WARN, which is exactly the case that must still surface as degraded.
+    record_role_tick(role, root, outcome);
     let was_failing = failing.get(root).copied().unwrap_or(false);
     let was_no_token_pool = no_token_pool.get(root).copied().unwrap_or(false);
-    let action = classify_root_tick_log(outcome, elapsed, was_failing, was_no_token_pool);
+    let was_model_mismatch = model_mismatch.get(root).copied().unwrap_or(false);
+    let action = classify_root_tick_log(
+        outcome,
+        elapsed,
+        was_failing,
+        was_no_token_pool,
+        was_model_mismatch,
+    );
     let reason = match outcome {
         RoleTickOutcome::Failure(reason) => reason.as_str(),
         RoleTickOutcome::RuntimeRejected(rejection) => rejection.reason.as_str(),
         RoleTickOutcome::Success | RoleTickOutcome::NoTokenPool => "",
+        RoleTickOutcome::ModelRuntimeMismatch(_) => "",
     };
     match action {
         RootTickLogAction::Success => {
@@ -1724,9 +2107,32 @@ fn log_outcome_for_root_deduped(
                 root.display()
             );
         }
+        RootTickLogAction::ModelMismatchEdge => {
+            if let RoleTickOutcome::ModelRuntimeMismatch(mismatch) = outcome {
+                log::warn!(
+                    "role_runner: {role} tick for {} skipped after {elapsed:.1?} — {} (further \
+                     identical skips for this root are logged at DEBUG until the config is \
+                     corrected, #5028)",
+                    root.display(),
+                    mismatch.detail()
+                );
+            }
+        }
+        RootTickLogAction::ModelMismatchRepeat => {
+            if let RoleTickOutcome::ModelRuntimeMismatch(mismatch) = outcome {
+                log::debug!(
+                    "role_runner: {role} tick for {} skipped again after {elapsed:.1?} — repeat \
+                     of an already-logged model/runtime mismatch (see the mismatch-edge WARN \
+                     above, #5028): {}",
+                    root.display(),
+                    mismatch.detail()
+                );
+            }
+        }
     }
     failing.insert(root.to_path_buf(), action.is_failing());
     no_token_pool.insert(root.to_path_buf(), action.is_no_token_pool());
+    model_mismatch.insert(root.to_path_buf(), action.is_model_mismatch());
 }
 
 #[cfg(test)]
@@ -1739,6 +2145,35 @@ mod tests {
     fn write_config(root: &Path, contents: &str) {
         fs::create_dir_all(root.join(".loom")).unwrap();
         fs::write(root.join(".loom").join("config.json"), contents).unwrap();
+    }
+
+    // -- clean_and_cap_detail (#5024) ---------------------------------------
+
+    #[test]
+    fn clean_and_cap_detail_strips_ansi_and_trims() {
+        let raw = "\x1b[31merror:\x1b[0m something failed\n";
+        assert_eq!(clean_and_cap_detail(raw), "error: something failed");
+    }
+
+    #[test]
+    fn clean_and_cap_detail_round_trips_short_clean_text_unchanged() {
+        let raw = "exit code 1: connection refused";
+        assert_eq!(clean_and_cap_detail(raw), raw);
+    }
+
+    #[test]
+    fn clean_and_cap_detail_caps_oversized_text() {
+        let raw = "x".repeat(MAX_FAILURE_DETAIL_CHARS * 4);
+        let cleaned = clean_and_cap_detail(&raw);
+        // Capped body + a short "… [truncated]" marker — bound generously
+        // above MAX_FAILURE_DETAIL_CHARS so the assertion doesn't hardcode
+        // the marker's exact byte/char width.
+        assert!(
+            cleaned.chars().count() <= MAX_FAILURE_DETAIL_CHARS + 32,
+            "cleaned detail was not capped: {} chars",
+            cleaned.chars().count()
+        );
+        assert!(cleaned.ends_with("[truncated]"));
     }
 
     /// RAII guard that clears the ambient `LOOM_RUNTIME` env var for the
@@ -1786,7 +2221,16 @@ mod tests {
         // #4642: a per-repo token pool so the new pre-spawn token-pool check
         // does not short-circuit this test's runtime-admission scenario.
         fs::write(root.join(".loom/tokens/fake.token"), "sk-ant-oat01-fake").unwrap();
-        write_config(root, r#"{"runtimes":{"roles":{"curator":"codex"}}}"#);
+        // #5028: without a matching `roleModels.curator` override, curator
+        // admitted onto `codex` would resolve the Claude-shaped default model
+        // (`sonnet`) and now get refused as a `ModelRuntimeMismatch` BEFORE
+        // this test's runtime-admission/pinning scenario ever reaches the
+        // adapter — supplying the override keeps this test's scope on
+        // admission/pinning, not the (separately tested) mismatch refusal.
+        write_config(
+            root,
+            r#"{"runtimes":{"roles":{"curator":"codex"}},"autonomous":{"roleRunner":{"roleModels":{"curator":"gpt-5-codex"}}}}"#,
+        );
         fs::write(root.join(".loom/roles/curator.json"), r#"{"runtimeRequirements":["mcp"]}"#)
             .unwrap();
         fs::write(
@@ -1921,6 +2365,104 @@ mod tests {
         }
     }
 
+    /// Shared fixture for the #5028 end-to-end mismatch tests: a workspace
+    /// admitted onto the `codex` runtime for `judge`, with a real per-repo
+    /// token pool (so the #4642 preflight does not short-circuit first) and a
+    /// fake `spawn-worker.sh` (the actual script `resolve_spawn_bin` resolves
+    /// and `invoke` runs — mirrors `mixed_runtime_role_launch_is_admitted_and_pinned_before_spawn`)
+    /// that writes a marker file if it is ever actually invoked — proving a
+    /// refused launch never reaches the spawn.
+    fn setup_codex_judge_fixture(root: &Path, config_extra: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        for sub in [
+            ".loom/roles",
+            ".loom/runtimes",
+            ".loom/scripts",
+            ".loom/tokens",
+        ] {
+            fs::create_dir_all(root.join(sub)).unwrap();
+        }
+        fs::write(root.join(".loom/tokens/fake.token"), "sk-ant-oat01-fake").unwrap();
+        write_config(
+            root,
+            &format!(r#"{{"runtimes":{{"roles":{{"judge":"codex"}}}}{}}}"#, config_extra),
+        );
+        fs::write(root.join(".loom/roles/judge.json"), r#"{"runtimeRequirements":[]}"#).unwrap();
+        fs::write(
+            root.join(".loom/runtimes/codex.json"),
+            r#"{"runtime":"codex","capabilities":{}}"#,
+        )
+        .unwrap();
+        // Admission (`resolve_and_admit`) validates that the `codex` adapter
+        // file exists on disk before admitting the runtime at all — it is
+        // never actually exec'd in this fixture (that's `spawn-worker.sh`
+        // below), but its mere absence would itself refuse the launch with a
+        // `RuntimeRejected`, which is not what these tests are exercising.
+        let adapter = root.join(".loom/scripts/spawn-codex.sh");
+        fs::write(&adapter, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&adapter, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let marker = root.join("spawn-ran");
+        let worker = root.join(".loom/scripts/spawn-worker.sh");
+        fs::write(&worker, format!("#!/bin/sh\ntouch '{}'\nexit 0\n", marker.display())).unwrap();
+        fs::set_permissions(&worker, fs::Permissions::from_mode(0o755)).unwrap();
+        marker
+    }
+
+    /// Issue #5028 (#5001 AC2/AC3): `runtimes.roles.judge = "codex"` with NO
+    /// `autonomous.roleRunner.roleModels.judge` override resolves the
+    /// Claude-shaped default model (`sonnet`) for a role admitted onto Codex —
+    /// a provable, doomed launch. `invoke` must refuse it as
+    /// `ModelRuntimeMismatch` BEFORE the spawn, never create the adapter's
+    /// marker file, and increment the dedicated skip counter — never a bare
+    /// `Failure`/`RuntimeRejected`.
+    #[test]
+    #[serial]
+    fn test_invoke_refuses_a_provable_model_runtime_mismatch_before_spawning() {
+        let _env_guard = ClearedLoomRuntimeEnv::new();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let marker = setup_codex_judge_fixture(root, "");
+
+        let before = model_runtime_mismatch_skip_count();
+        let mut runner = ScriptRoleInvocationRunner::new(root.to_path_buf())
+            .with_timeout(Duration::from_secs(5));
+        let outcome = runner.invoke("judge", "/loom:judge");
+
+        let RoleTickOutcome::ModelRuntimeMismatch(mismatch) = outcome else {
+            panic!("expected ModelRuntimeMismatch, got {outcome:?}");
+        };
+        assert_eq!(mismatch.role, "judge");
+        assert_eq!(mismatch.runtime, "codex");
+        assert_eq!(mismatch.model, "sonnet", "the unfixed Claude-shaped default");
+        assert!(!marker.exists(), "a doomed launch must never actually spawn the adapter");
+        assert_eq!(model_runtime_mismatch_skip_count(), before + 1);
+    }
+
+    /// Issue #5028: the SAME fixture with `roleModels.judge` pointed at a
+    /// Codex-valid model spawns successfully — proving the check is a
+    /// targeted refusal, not a blanket block on Judge-on-Codex, and that it
+    /// self-heals the moment the config is corrected (no restart needed).
+    #[test]
+    #[serial]
+    fn test_invoke_succeeds_once_role_models_supplies_a_matching_model() {
+        let _env_guard = ClearedLoomRuntimeEnv::new();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let marker = setup_codex_judge_fixture(
+            root,
+            r#","autonomous":{"roleRunner":{"roleModels":{"judge":"gpt-5-codex"}}}"#,
+        );
+
+        let mut runner = ScriptRoleInvocationRunner::new(root.to_path_buf())
+            .with_timeout(Duration::from_secs(5));
+        let outcome = runner.invoke("judge", "/loom:judge");
+
+        assert_eq!(outcome, RoleTickOutcome::Success);
+        assert!(marker.exists(), "a matching model must let the launch actually spawn");
+    }
+
     #[test]
     fn test_invoke_success_on_zero_exit() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2015,6 +2557,49 @@ mod tests {
         );
     }
 
+    /// Issue #5001: end-to-end, a `roleModels.<role>` override reaches the actual
+    /// `--model` argv for that role while a peer role (no override) still gets the
+    /// global `autonomous.roleRunner.model`. This is the argv-level proof of the
+    /// mixed-runtime fix: the Codex-bound Judge pins a Codex-valid model while the
+    /// Claude-bound Curator keeps the Claude alias — from one config block.
+    #[test]
+    fn test_invoke_per_role_model_override_reaches_argv() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(
+            tmp.path(),
+            r#"{"autonomous": {"roleRunner": {
+                "enabled": true,
+                "model": "sonnet",
+                "roleModels": {"judge": "gpt-5-codex"}
+            }}}"#,
+        );
+        let script = write_fake_script(
+            tmp.path(),
+            "fake-spawn.sh",
+            "printf '%s\\n' \"$@\" > argv-last.txt; exit 0",
+        );
+
+        // Judge gets its per-role Codex model.
+        let mut judge = ScriptRoleInvocationRunner::new(tmp.path().to_path_buf())
+            .with_spawn_bin(script.clone());
+        assert_eq!(judge.invoke("judge", "/loom:judge"), RoleTickOutcome::Success);
+        let judge_argv = fs::read_to_string(tmp.path().join("argv-last.txt")).unwrap();
+        assert!(
+            judge_argv.contains("--model\ngpt-5-codex\n"),
+            "judge must pin its per-role model; argv: {judge_argv}"
+        );
+
+        // Curator (no override) still gets the global roleRunner.model.
+        let mut curator =
+            ScriptRoleInvocationRunner::new(tmp.path().to_path_buf()).with_spawn_bin(script);
+        assert_eq!(curator.invoke("curator", "/loom:curator"), RoleTickOutcome::Success);
+        let curator_argv = fs::read_to_string(tmp.path().join("argv-last.txt")).unwrap();
+        assert!(
+            curator_argv.contains("--model\nsonnet\n"),
+            "curator must keep the global roleRunner.model; argv: {curator_argv}"
+        );
+    }
+
     /// Issue #4501: with only `autonomous.model` set, the role runner joins the
     /// SAME chain sweep dispatch uses rather than keeping a private default.
     //
@@ -2031,8 +2616,8 @@ mod tests {
         // No config at all -> shipped default, labelled `default`.
         let bare = tempfile::tempdir().unwrap();
         assert_eq!(
-            resolve_role_runner_model(bare.path()),
-            (sweep_registry::DEFAULT_DISPATCH_MODEL.to_string(), "default")
+            resolve_role_runner_model(bare.path(), "curator"),
+            (sweep_registry::DEFAULT_DISPATCH_MODEL.to_string(), "default".to_string())
         );
 
         // `autonomous.model` only -> that value, labelled `autonomous.model`.
@@ -2042,8 +2627,8 @@ mod tests {
         let shared = tempfile::tempdir().unwrap();
         write_config(shared.path(), r#"{"autonomous": {"model": "opus"}}"#);
         assert_eq!(
-            resolve_role_runner_model(shared.path()),
-            ("claude-opus-5".to_string(), "autonomous.model")
+            resolve_role_runner_model(shared.path(), "curator"),
+            ("claude-opus-5".to_string(), "autonomous.model".to_string())
         );
 
         // Both -> the role-runner-specific value, labelled as such.
@@ -2053,8 +2638,8 @@ mod tests {
             r#"{"autonomous": {"model": "opus", "roleRunner": {"model": "haiku"}}}"#,
         );
         assert_eq!(
-            resolve_role_runner_model(both.path()),
-            ("haiku".to_string(), "autonomous.roleRunner.model")
+            resolve_role_runner_model(both.path(), "curator"),
+            ("haiku".to_string(), "autonomous.roleRunner.model".to_string())
         );
 
         // A blank override is treated as unset at every tier (never `--model ""`).
@@ -2062,9 +2647,141 @@ mod tests {
         write_config(blank.path(), r#"{"autonomous": {"roleRunner": {"model": "   "}}}"#);
         assert_eq!(read_role_runner_config(blank.path()).model, None);
         assert_eq!(
-            resolve_role_runner_model(blank.path()),
-            (sweep_registry::DEFAULT_DISPATCH_MODEL.to_string(), "default")
+            resolve_role_runner_model(blank.path(), "curator"),
+            (sweep_registry::DEFAULT_DISPATCH_MODEL.to_string(), "default".to_string())
         );
+
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+    }
+
+    /// Issue #5001: `autonomous.roleRunner.roleModels.<role>` is a tier ABOVE the
+    /// global `autonomous.roleRunner.model` — a repo can point one role (Judge,
+    /// on Codex) at a provider-valid model while the other roles
+    /// (Curator/Champion, on Claude) keep a Claude alias, all from config. This
+    /// is the config-only fix for the `LOOM_RUNTIME_JUDGE=codex` -> `sonnet` 400
+    /// incident: the per-role and global model axes can finally disagree.
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_resolve_role_runner_model_per_role_override() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+
+        // Judge gets a Codex-valid model; curator/champion keep the global
+        // Claude alias — the exact mixed-runtime shape the incident needed.
+        let dir = tempfile::tempdir().unwrap();
+        write_config(
+            dir.path(),
+            r#"{"autonomous": {"roleRunner": {
+                "model": "sonnet",
+                "roleModels": {"judge": "gpt-5-codex"}
+            }}}"#,
+        );
+        assert_eq!(
+            resolve_role_runner_model(dir.path(), "judge"),
+            ("gpt-5-codex".to_string(), "autonomous.roleRunner.roleModels.judge".to_string())
+        );
+        // A role with no per-role entry falls through to the global tier.
+        assert_eq!(
+            resolve_role_runner_model(dir.path(), "curator"),
+            ("sonnet".to_string(), "autonomous.roleRunner.model".to_string())
+        );
+        assert_eq!(
+            resolve_role_runner_model(dir.path(), "champion"),
+            ("sonnet".to_string(), "autonomous.roleRunner.model".to_string())
+        );
+
+        // Per-role override with NO global model set: the overridden role uses
+        // its override; every other role falls all the way through to the
+        // shipped default (not the override).
+        let no_global = tempfile::tempdir().unwrap();
+        write_config(
+            no_global.path(),
+            r#"{"autonomous": {"roleRunner": {"roleModels": {"judge": "gpt-5-codex"}}}}"#,
+        );
+        assert_eq!(
+            resolve_role_runner_model(no_global.path(), "judge"),
+            ("gpt-5-codex".to_string(), "autonomous.roleRunner.roleModels.judge".to_string())
+        );
+        assert_eq!(
+            resolve_role_runner_model(no_global.path(), "guide"),
+            (sweep_registry::DEFAULT_DISPATCH_MODEL.to_string(), "default".to_string())
+        );
+
+        // The lookup is case-insensitive: a `Judge` config key matches the
+        // lower-cased `judge` role name the runner dispatches under.
+        let cased = tempfile::tempdir().unwrap();
+        write_config(
+            cased.path(),
+            r#"{"autonomous": {"roleRunner": {"roleModels": {"Judge": "gpt-5-codex"}}}}"#,
+        );
+        assert_eq!(resolve_role_runner_model(cased.path(), "judge").0, "gpt-5-codex".to_string());
+
+        // A per-role override that is a logical Claude alias still resolves
+        // through the #3982 tier map (`opus` -> `claude-opus-5`), exactly like
+        // the other tiers.
+        let alias = tempfile::tempdir().unwrap();
+        write_config(
+            alias.path(),
+            r#"{"autonomous": {"roleRunner": {"roleModels": {"judge": "opus"}}}}"#,
+        );
+        assert_eq!(resolve_role_runner_model(alias.path(), "judge").0, "claude-opus-5");
+
+        // A blank per-role value is dropped at parse time and falls through to
+        // the global tier — never `--model ""`.
+        let blank = tempfile::tempdir().unwrap();
+        write_config(
+            blank.path(),
+            r#"{"autonomous": {"roleRunner": {"model": "sonnet", "roleModels": {"judge": "   "}}}}"#,
+        );
+        assert!(read_role_runner_config(blank.path()).role_models.is_empty());
+        assert_eq!(
+            resolve_role_runner_model(blank.path(), "judge"),
+            ("sonnet".to_string(), "autonomous.roleRunner.model".to_string())
+        );
+
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+    }
+
+    /// Issue #5001: `read_role_runner_config` soft-fails a malformed / absent /
+    /// non-object `roleModels` to an empty map (every role falls through to the
+    /// global chain), and drops blank keys — mirroring the soft-fail contract of
+    /// every other `autonomous.roleRunner.*` field.
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_read_role_models_soft_fails_and_normalizes() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+
+        // Absent key -> empty map.
+        let absent = tempfile::tempdir().unwrap();
+        write_config(absent.path(), r#"{"autonomous": {"roleRunner": {"enabled": true}}}"#);
+        assert!(read_role_runner_config(absent.path())
+            .role_models
+            .is_empty());
+
+        // Non-object value -> empty map (no panic).
+        let non_object = tempfile::tempdir().unwrap();
+        write_config(
+            non_object.path(),
+            r#"{"autonomous": {"roleRunner": {"roleModels": "sonnet"}}}"#,
+        );
+        assert!(read_role_runner_config(non_object.path())
+            .role_models
+            .is_empty());
+
+        // Blank keys and blank/non-string values are dropped; good entries are
+        // kept, lower-cased, and trimmed.
+        let mixed = tempfile::tempdir().unwrap();
+        write_config(
+            mixed.path(),
+            r#"{"autonomous": {"roleRunner": {"roleModels": {
+                "  Judge  ": "  gpt-5-codex  ",
+                "curator": "",
+                "   ": "sonnet",
+                "guide": 42
+            }}}}"#,
+        );
+        let models = read_role_runner_config(mixed.path()).role_models;
+        assert_eq!(models.get("judge").map(String::as_str), Some("gpt-5-codex"));
+        assert_eq!(models.len(), 1, "blank/non-string entries must be dropped: {models:?}");
 
         std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
     }
@@ -2240,6 +2957,7 @@ mod tests {
                 interval_secs: Some(120),
                 on_idle: None,
                 model: None,
+                role_models: BTreeMap::new(),
             }
         );
     }
@@ -2284,6 +3002,7 @@ mod tests {
                 interval_secs: Some(60),
                 on_idle: None,
                 model: None,
+                role_models: BTreeMap::new(),
             }
         );
     }
@@ -2323,6 +3042,7 @@ mod tests {
             interval_secs: None,
             on_idle: None,
             model: None,
+            role_models: BTreeMap::new(),
         };
         assert_eq!(resolve_roles(&config), Vec::new());
     }
@@ -2335,6 +3055,7 @@ mod tests {
             interval_secs: None,
             on_idle: None,
             model: None,
+            role_models: BTreeMap::new(),
         };
         let roles = resolve_roles(&config);
         assert_eq!(roles.iter().map(|r| r.name).collect::<Vec<_>>(), vec!["champion", "guide"]);
@@ -2348,6 +3069,7 @@ mod tests {
             interval_secs: None,
             on_idle: None,
             model: None,
+            role_models: BTreeMap::new(),
         };
         let roles = resolve_roles(&config);
         assert_eq!(roles.iter().map(|r| r.name).collect::<Vec<_>>(), vec!["curator"]);
@@ -2374,6 +3096,7 @@ mod tests {
             interval_secs: None,
             on_idle: None,
             model: None,
+            role_models: BTreeMap::new(),
         }));
     }
 
@@ -2387,6 +3110,7 @@ mod tests {
             interval_secs: None,
             on_idle: None,
             model: None,
+            role_models: BTreeMap::new(),
         }));
         std::env::set_var(ROLE_RUNNER_ENABLE_ENV, "1");
         assert!(resolve_enabled(&RoleRunnerConfig {
@@ -2395,6 +3119,7 @@ mod tests {
             interval_secs: None,
             on_idle: None,
             model: None,
+            role_models: BTreeMap::new(),
         }));
         std::env::remove_var(ROLE_RUNNER_ENABLE_ENV);
     }
@@ -2421,6 +3146,7 @@ mod tests {
                     interval_secs: Some(42),
                     on_idle: None,
                     model: None,
+                    role_models: BTreeMap::new(),
                 }
             ),
             Duration::from_secs(42)
@@ -2437,6 +3163,7 @@ mod tests {
                     interval_secs: Some(42),
                     on_idle: None,
                     model: None,
+                    role_models: BTreeMap::new(),
                 }
             ),
             Duration::from_secs(7)
@@ -2601,6 +3328,44 @@ mod tests {
     }
 
     // ===================================================================
+    // Doctor in DEFAULT_ROLES — regression guard for #5272 (before this,
+    // a `loom:changes-requested` PR whose sweep ended had no role left to
+    // pick it up standalone, ever).
+    // ===================================================================
+
+    #[test]
+    fn test_default_roles_includes_doctor_with_no_pr_number() {
+        let doctor = DEFAULT_ROLES
+            .iter()
+            .find(|s| s.name == "doctor")
+            .expect("#5272: DEFAULT_ROLES must include doctor as a standalone role");
+        assert_eq!(
+            doctor.prompt, "/loom:doctor",
+            "must invoke Doctor's own Finding Work queue scan, not PR Fix Mode \
+             (no PR number appended to the prompt)"
+        );
+        // Same cadence as `judge` — its paired stage in the PR lifecycle: a
+        // fresh Judge rejection should not sit unaddressed materially longer
+        // than a fresh Judge review sits unclaimed.
+        let judge = DEFAULT_ROLES
+            .iter()
+            .find(|s| s.name == "judge")
+            .expect("judge is default");
+        assert_eq!(doctor.default_interval_secs, judge.default_interval_secs);
+    }
+
+    #[test]
+    fn test_resolve_roles_can_select_doctor_alone() {
+        let config = RoleRunnerConfig {
+            roles: Some(vec!["doctor".to_string()]),
+            ..Default::default()
+        };
+        let resolved = resolve_roles(&config);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].name, "doctor");
+    }
+
+    // ===================================================================
     // tick_is_implausibly_fast — #4034 AC #4 (a no-op success must be
     // distinguishable in the log from a real, slower tick).
     // ===================================================================
@@ -2706,6 +3471,7 @@ mod tests {
             interval_secs: None,
             on_idle: Some(vec!["guide".to_string(), "champion".to_string()]),
             model: None,
+            role_models: BTreeMap::new(),
         };
         let roles = resolve_on_idle_roles(&config);
         assert_eq!(roles.iter().map(|r| r.name).collect::<Vec<_>>(), vec!["champion", "guide"]);
@@ -2723,6 +3489,7 @@ mod tests {
                 "nope".to_string(),
             ]),
             model: None,
+            role_models: BTreeMap::new(),
         };
         let roles = resolve_on_idle_roles(&config);
         assert_eq!(roles.iter().map(|r| r.name).collect::<Vec<_>>(), vec!["champion"]);
@@ -2736,6 +3503,7 @@ mod tests {
             interval_secs: None,
             on_idle: Some(vec![]),
             model: None,
+            role_models: BTreeMap::new(),
         };
         assert_eq!(resolve_on_idle_roles(&config), Vec::new());
     }
@@ -2930,6 +3698,7 @@ mod tests {
             interval_secs: None,
             on_idle: Some(roles.into_iter().map(str::to_string).collect()),
             model: None,
+            role_models: BTreeMap::new(),
         }
     }
 
@@ -3001,6 +3770,7 @@ mod tests {
             interval_secs: None,
             on_idle: None,
             model: None,
+            role_models: BTreeMap::new(),
         };
         let now = Instant::now();
         assert!(plan_idle_runs(&mut t, &set, root, &cfg, false, false, now).is_empty());
@@ -3294,6 +4064,7 @@ mod tests {
                 &RoleTickOutcome::Failure("boom".into()),
                 NORMAL_TICK,
                 false,
+                false,
                 false
             ),
             RootTickLogAction::FailureEdge
@@ -3307,6 +4078,7 @@ mod tests {
                 &RoleTickOutcome::Failure("boom".into()),
                 NORMAL_TICK,
                 true,
+                false,
                 false
             ),
             RootTickLogAction::FailureRepeat
@@ -3316,7 +4088,7 @@ mod tests {
     #[test]
     fn test_classify_success_after_failure_is_recovery() {
         assert_eq!(
-            classify_root_tick_log(&RoleTickOutcome::Success, NORMAL_TICK, true, false),
+            classify_root_tick_log(&RoleTickOutcome::Success, NORMAL_TICK, true, false, false),
             RootTickLogAction::Recovered
         );
     }
@@ -3324,7 +4096,7 @@ mod tests {
     #[test]
     fn test_classify_steady_state_success_is_plain() {
         assert_eq!(
-            classify_root_tick_log(&RoleTickOutcome::Success, NORMAL_TICK, false, false),
+            classify_root_tick_log(&RoleTickOutcome::Success, NORMAL_TICK, false, false, false),
             RootTickLogAction::Success
         );
     }
@@ -3336,6 +4108,7 @@ mod tests {
                 &RoleTickOutcome::Success,
                 Duration::from_millis(100),
                 false,
+                false,
                 false
             ),
             RootTickLogAction::SuccessImplausiblyFast
@@ -3345,6 +4118,7 @@ mod tests {
                 &RoleTickOutcome::Success,
                 Duration::from_millis(100),
                 true,
+                false,
                 false
             ),
             RootTickLogAction::RecoveredImplausiblyFast
@@ -3356,7 +4130,7 @@ mod tests {
     #[test]
     fn test_classify_first_no_token_pool_is_edge() {
         assert_eq!(
-            classify_root_tick_log(&RoleTickOutcome::NoTokenPool, NORMAL_TICK, false, false),
+            classify_root_tick_log(&RoleTickOutcome::NoTokenPool, NORMAL_TICK, false, false, false),
             RootTickLogAction::NoTokenPoolEdge
         );
     }
@@ -3364,7 +4138,7 @@ mod tests {
     #[test]
     fn test_classify_repeat_no_token_pool_is_downgraded() {
         assert_eq!(
-            classify_root_tick_log(&RoleTickOutcome::NoTokenPool, NORMAL_TICK, false, true),
+            classify_root_tick_log(&RoleTickOutcome::NoTokenPool, NORMAL_TICK, false, true, false),
             RootTickLogAction::NoTokenPoolRepeat
         );
     }
@@ -3375,7 +4149,7 @@ mod tests {
         // no-token-pool skip demoted to `Repeat` just because `was_failing`
         // is true — the two conditions are tracked on separate axes.
         assert_eq!(
-            classify_root_tick_log(&RoleTickOutcome::NoTokenPool, NORMAL_TICK, true, false),
+            classify_root_tick_log(&RoleTickOutcome::NoTokenPool, NORMAL_TICK, true, false, false),
             RootTickLogAction::NoTokenPoolEdge
         );
     }
@@ -3392,11 +4166,72 @@ mod tests {
         assert!(!RootTickLogAction::FailureRepeat.is_no_token_pool());
     }
 
+    // ---- model/runtime mismatch classification (#5028) -----------------
+
+    fn mismatch_outcome() -> RoleTickOutcome {
+        RoleTickOutcome::ModelRuntimeMismatch(ModelRuntimeMismatch {
+            role: "judge".to_string(),
+            runtime: "codex".to_string(),
+            model: "sonnet".to_string(),
+            model_source: "default".to_string(),
+            reason: "runtime \"codex\" only accepts an OpenAI/Codex model but got \"sonnet\""
+                .to_string(),
+        })
+    }
+
     #[test]
+    fn test_classify_first_model_mismatch_is_edge() {
+        assert_eq!(
+            classify_root_tick_log(&mismatch_outcome(), NORMAL_TICK, false, false, false),
+            RootTickLogAction::ModelMismatchEdge
+        );
+    }
+
+    #[test]
+    fn test_classify_repeat_model_mismatch_is_downgraded() {
+        assert_eq!(
+            classify_root_tick_log(&mismatch_outcome(), NORMAL_TICK, false, false, true),
+            RootTickLogAction::ModelMismatchRepeat
+        );
+    }
+
+    #[test]
+    fn test_classify_model_mismatch_is_independent_of_failing_and_no_token_pool_state() {
+        // A root previously `Failure`-failing OR previously no-token-pool must
+        // not have its model-mismatch skip demoted to `Repeat` just because
+        // one of the OTHER two axes is `true` — all three are tracked
+        // independently.
+        assert_eq!(
+            classify_root_tick_log(&mismatch_outcome(), NORMAL_TICK, true, false, false),
+            RootTickLogAction::ModelMismatchEdge
+        );
+        assert_eq!(
+            classify_root_tick_log(&mismatch_outcome(), NORMAL_TICK, false, true, false),
+            RootTickLogAction::ModelMismatchEdge
+        );
+    }
+
+    #[test]
+    fn test_root_tick_log_action_model_mismatch_is_not_failing_or_no_token_pool() {
+        // #5028: a model-mismatch skip must never contribute to the
+        // Failure/RuntimeRejected tally, nor to the NoTokenPool tally.
+        assert!(!RootTickLogAction::ModelMismatchEdge.is_failing());
+        assert!(!RootTickLogAction::ModelMismatchRepeat.is_failing());
+        assert!(!RootTickLogAction::ModelMismatchEdge.is_no_token_pool());
+        assert!(!RootTickLogAction::ModelMismatchRepeat.is_no_token_pool());
+        assert!(RootTickLogAction::ModelMismatchEdge.is_model_mismatch());
+        assert!(RootTickLogAction::ModelMismatchRepeat.is_model_mismatch());
+        assert!(!RootTickLogAction::FailureEdge.is_model_mismatch());
+        assert!(!RootTickLogAction::NoTokenPoolEdge.is_model_mismatch());
+    }
+
+    #[test]
+    #[serial(role_tick_ring)]
     fn test_log_outcome_for_root_deduped_tracks_failing_state_across_ticks() {
         let root = PathBuf::from("/tmp/does-not-need-to-exist-for-this-test");
         let mut failing: HashMap<PathBuf, bool> = HashMap::new();
         let mut no_token_pool: HashMap<PathBuf, bool> = HashMap::new();
+        let mut model_mismatch: HashMap<PathBuf, bool> = HashMap::new();
 
         // Tick 1: failure -> edge, marks failing.
         log_outcome_for_root_deduped(
@@ -3406,6 +4241,7 @@ mod tests {
             NORMAL_TICK,
             &mut failing,
             &mut no_token_pool,
+            &mut model_mismatch,
         );
         assert_eq!(failing.get(&root), Some(&true));
 
@@ -3420,6 +4256,7 @@ mod tests {
                 NORMAL_TICK,
                 &mut failing,
                 &mut no_token_pool,
+                &mut model_mismatch,
             );
             assert_eq!(failing.get(&root), Some(&true));
         }
@@ -3432,6 +4269,7 @@ mod tests {
             NORMAL_TICK,
             &mut failing,
             &mut no_token_pool,
+            &mut model_mismatch,
         );
         assert_eq!(failing.get(&root), Some(&false));
 
@@ -3443,11 +4281,13 @@ mod tests {
             NORMAL_TICK,
             &mut failing,
             &mut no_token_pool,
+            &mut model_mismatch,
         );
         assert_eq!(failing.get(&root), Some(&false));
     }
 
     #[test]
+    #[serial(role_tick_ring)]
     fn test_log_outcome_for_root_deduped_is_independent_per_root() {
         // A failure on one registered root must not affect another root's
         // failing state (each workspace's health is tracked independently).
@@ -3455,6 +4295,7 @@ mod tests {
         let root_b = PathBuf::from("/tmp/root-b");
         let mut failing: HashMap<PathBuf, bool> = HashMap::new();
         let mut no_token_pool: HashMap<PathBuf, bool> = HashMap::new();
+        let mut model_mismatch: HashMap<PathBuf, bool> = HashMap::new();
 
         log_outcome_for_root_deduped(
             "curator",
@@ -3463,6 +4304,7 @@ mod tests {
             NORMAL_TICK,
             &mut failing,
             &mut no_token_pool,
+            &mut model_mismatch,
         );
         log_outcome_for_root_deduped(
             "curator",
@@ -3471,6 +4313,7 @@ mod tests {
             NORMAL_TICK,
             &mut failing,
             &mut no_token_pool,
+            &mut model_mismatch,
         );
 
         assert_eq!(failing.get(&root_a), Some(&true));
@@ -3478,6 +4321,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(role_tick_ring)]
     fn test_log_outcome_for_root_deduped_no_token_pool_tracked_independently_of_failing() {
         // #4642: a NoTokenPool tick must never mark `failing` true, and a
         // real Failure tick must never mark `no_token_pool` true — the two
@@ -3485,6 +4329,7 @@ mod tests {
         let root = PathBuf::from("/tmp/does-not-need-to-exist-for-this-test-2");
         let mut failing: HashMap<PathBuf, bool> = HashMap::new();
         let mut no_token_pool: HashMap<PathBuf, bool> = HashMap::new();
+        let mut model_mismatch: HashMap<PathBuf, bool> = HashMap::new();
 
         log_outcome_for_root_deduped(
             "auditor",
@@ -3493,6 +4338,7 @@ mod tests {
             NORMAL_TICK,
             &mut failing,
             &mut no_token_pool,
+            &mut model_mismatch,
         );
         assert_eq!(no_token_pool.get(&root), Some(&true));
         assert_eq!(failing.get(&root), Some(&false));
@@ -3507,9 +4353,50 @@ mod tests {
             NORMAL_TICK,
             &mut failing,
             &mut no_token_pool,
+            &mut model_mismatch,
         );
         assert_eq!(failing.get(&root), Some(&true));
         assert_eq!(no_token_pool.get(&root), Some(&false));
+    }
+
+    #[test]
+    #[serial(role_tick_ring)]
+    fn test_log_outcome_for_root_deduped_model_mismatch_tracked_independently() {
+        // #5028: a ModelRuntimeMismatch tick must never mark `failing` or
+        // `no_token_pool` true, and must not itself be marked by either of
+        // those two axes — all three maps are independent even for the SAME
+        // root.
+        let root = PathBuf::from("/tmp/does-not-need-to-exist-for-this-test-3");
+        let mut failing: HashMap<PathBuf, bool> = HashMap::new();
+        let mut no_token_pool: HashMap<PathBuf, bool> = HashMap::new();
+        let mut model_mismatch: HashMap<PathBuf, bool> = HashMap::new();
+
+        log_outcome_for_root_deduped(
+            "judge",
+            &root,
+            &mismatch_outcome(),
+            NORMAL_TICK,
+            &mut failing,
+            &mut no_token_pool,
+            &mut model_mismatch,
+        );
+        assert_eq!(model_mismatch.get(&root), Some(&true));
+        assert_eq!(failing.get(&root), Some(&false));
+        assert_eq!(no_token_pool.get(&root), Some(&false));
+
+        // A subsequent real failure must still log as a fresh `FailureEdge`
+        // even though the root was just skipped for a model/runtime mismatch.
+        log_outcome_for_root_deduped(
+            "judge",
+            &root,
+            &RoleTickOutcome::Failure("boom".into()),
+            NORMAL_TICK,
+            &mut failing,
+            &mut no_token_pool,
+            &mut model_mismatch,
+        );
+        assert_eq!(failing.get(&root), Some(&true));
+        assert_eq!(model_mismatch.get(&root), Some(&false));
     }
 
     // ===================================================================
@@ -3567,5 +4454,115 @@ mod tests {
         handle.abort();
 
         std::env::remove_var(crate::workspace_registry::REGISTRY_PATH_ENV);
+    }
+
+    // ===================================================================
+    // Role-tick health ring (#4761)
+    // ===================================================================
+
+    #[test]
+    #[serial(role_tick_ring)]
+    fn recording_a_tick_makes_it_readable_cross_process() {
+        reset_role_tick_ring();
+        let at = chrono::Utc::now();
+        record_role_tick_at("curator", Path::new("/r/loom"), &RoleTickOutcome::Success, at);
+
+        let records = role_tick_records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].role, "curator");
+        assert_eq!(records[0].root, PathBuf::from("/r/loom"));
+        assert_eq!(records[0].at, at);
+        assert!(records[0].ok);
+        assert_eq!(records[0].detail, None);
+    }
+
+    #[test]
+    #[serial(role_tick_ring)]
+    fn a_failure_records_its_reason() {
+        reset_role_tick_ring();
+        record_role_tick(
+            "champion",
+            Path::new("/r/loom"),
+            &RoleTickOutcome::Failure("mcp preflight failed".to_string()),
+        );
+        let records = role_tick_records();
+        assert!(!records[0].ok);
+        assert_eq!(records[0].detail.as_deref(), Some("mcp preflight failed"));
+    }
+
+    /// #4642's permanent no-pool state must surface as NOT-ok — a role that
+    /// cannot run at all is precisely what a health check exists to report.
+    #[test]
+    #[serial(role_tick_ring)]
+    fn a_missing_token_pool_records_as_not_ok() {
+        reset_role_tick_ring();
+        record_role_tick("guide", Path::new("/r/loom"), &RoleTickOutcome::NoTokenPool);
+        let records = role_tick_records();
+        assert!(!records[0].ok);
+        assert_eq!(records[0].detail.as_deref(), Some("no-token-pool"));
+    }
+
+    #[test]
+    #[serial(role_tick_ring)]
+    fn the_ring_is_bounded_and_keeps_the_newest_entries() {
+        reset_role_tick_ring();
+        for _ in 0..(ROLE_TICK_RING_CAPACITY + 10) {
+            record_role_tick("curator", Path::new("/r/loom"), &RoleTickOutcome::Success);
+        }
+        record_role_tick(
+            "curator",
+            Path::new("/r/loom"),
+            &RoleTickOutcome::Failure("newest".to_string()),
+        );
+        let records = role_tick_records();
+        assert_eq!(records.len(), ROLE_TICK_RING_CAPACITY);
+        assert_eq!(records.last().unwrap().detail.as_deref(), Some("newest"));
+    }
+
+    /// The log-dedup path (#4349) downgrades a *repeat* failure to DEBUG, but
+    /// the health ring must still see every one of them — otherwise a
+    /// persistently-broken root would look quiet to a health check.
+    #[test]
+    #[serial(role_tick_ring)]
+    fn repeat_failures_are_all_recorded_even_though_the_log_dedups_them() {
+        reset_role_tick_ring();
+        let mut failing = HashMap::new();
+        let mut no_pool = HashMap::new();
+        let mut model_mismatch = HashMap::new();
+        let root = PathBuf::from("/r/loom");
+        for _ in 0..3 {
+            log_outcome_for_root_deduped(
+                "curator",
+                &root,
+                &RoleTickOutcome::Failure("boom".to_string()),
+                Duration::from_secs(30),
+                &mut failing,
+                &mut no_pool,
+                &mut model_mismatch,
+            );
+        }
+        let records = role_tick_records();
+        assert_eq!(records.len(), 3, "every tick is recorded, not just the fail edge");
+        assert!(records.iter().all(|r| !r.ok));
+    }
+
+    /// #5028 AC2: a `ModelRuntimeMismatch` outcome records as NOT-ok with an
+    /// operator-facing `detail()` string that names the broken config key —
+    /// exactly what `assess_roles` in `health.rs` renders verbatim into
+    /// `loom-daemon health`, so an operator learns the fix without reading a
+    /// spawn transcript.
+    #[test]
+    #[serial(role_tick_ring)]
+    fn a_model_runtime_mismatch_records_its_operator_facing_detail() {
+        reset_role_tick_ring();
+        record_role_tick("judge", Path::new("/r/loom"), &mismatch_outcome());
+        let records = role_tick_records();
+        assert!(!records[0].ok);
+        let detail = records[0].detail.as_deref().unwrap();
+        assert!(
+            detail.contains("autonomous.roleRunner.roleModels.judge"),
+            "detail must name the broken config key: {detail}"
+        );
+        assert!(detail.contains("model/runtime mismatch"), "detail: {detail}");
     }
 }
