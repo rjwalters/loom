@@ -1822,8 +1822,114 @@ resolve_stash_cwd() {
 # it does not model backslash-escaped quotes, but since the result feeds only
 # the narrowing (never widening) catastrophic scan, the worst case is a raw
 # substring surviving — never a catastrophic block being skipped incorrectly.
+#
+# -----------------------------------------------------------------------------
+# HEREDOC-WRAPPED FLAG VALUES (#5216)
+#
+# The `$(`-floor above is exactly right for a general command substitution, but
+# it also declines to redact THIS repo's own pervasive idiom for any multi-line
+# comment body (CLAUDE.md / judge.md / doctor.md / builder-pr.md all show it):
+#
+#     gh pr comment 4357 --body "$(cat <<QUOTED_DELIM
+#     …prose that may QUOTE a dangerous command as an example…
+#     QUOTED_DELIM
+#     )" && gh pr edit 4357 --add-label "loom:pr"
+#
+# Every value built that way necessarily contains `$(`, so before this pass it
+# was NEVER redacted — and a dangerous-command example merely quoted inside the
+# body (a Judge documenting the shell-injection payload a PR now rejects, an
+# Auditor quoting a guard pattern) hard-denied the whole command on the
+# catastrophic tier. Observed live in guard-decisions.log on 2026-07-29 (a Judge
+# approval on PR #4357) and reproduced for the #3679 force-push literals too:
+# the gap is CONSTRUCTION-specific (heredoc-wrapped value), not pattern-specific.
+#
+# mask_flag_cat_heredocs() (below) closes it by masking ONLY the BODY of a
+# heredoc in this one provably-inert shape, and only when ALL of these hold:
+#   1. the opener is the complete tail of its line, immediately preceded by a
+#      recognized text-carrying flag, its opening quote, and `$(cat`;
+#   2. the heredoc delimiter is QUOTED (single- or double-quoted, `<<-` allowed)
+#      — a quoted delimiter is what guarantees the outer shell performs NO
+#      expansion on the body, so a `$(…)` sitting IN the body is inert text
+#      rather than live code (an UNQUOTED delimiter is rejected outright);
+#   3. the block is CLOSED in this same buffer (mirrors #5087's "never mask
+#      speculatively" rule for mask_heredoc_bodies);
+#   4. the very next line after the delimiter line is `)` + that same opening
+#      quote — i.e. the substitution ends immediately, with nothing chained
+#      after the heredoc inside it.
+# Condition 4 is what keeps a `--body "$(cat <<QUOTED_DELIM … QUOTED_DELIM`
+# <newline> `rm -rf /` <newline> `)"` command denying: bash ends the heredoc at
+# the delimiter line and then genuinely RUNS the following line inside the
+# substitution, so nothing is masked there. Condition 1 is what keeps an
+# INTERPRETER-FED heredoc denying — a body consumed by `bash <<DELIM`,
+# `sh -s <<DELIM`, or `cat <<DELIM … | sh` is live code
+# to the inner shell, and none of those match `<flag> <quote>$(cat`. This is the
+# deliberate narrowing versus reusing mask_heredoc_bodies() (#5000) here: that
+# helper masks ANY closed heredoc body regardless of its consumer, a documented
+# and accepted fail-open for the write-target scanner (#5117 Known Limitation 1)
+# that must NOT be inherited by the catastrophic hard-deny floor.
+#
+# KNOWN LIMITATION (recorded, mirroring the #5117 convention): this recognizes
+# only the literal `cat`-consumed shape spelled out above. A semantically
+# equivalent variant — `$(command cat <<DELIM …)`, a heredoc opened on a
+# continuation line, or a body whose delimiter line is followed by `) "` with a
+# space — is simply not recognized and keeps denying exactly as it does today.
+# That is the safe direction (a false positive that already exists, never a new
+# bypass), and the shape above is the one the repo's own role prompts prescribe.
+# -----------------------------------------------------------------------------
 strip_literal_text() {
     printf '%s' "$1" | awk '
+    # Mask the body of a `<flag> "$(cat <<QUOTED_DELIM … DELIM\n)"` heredoc.
+    # See the header comment above for the four conditions and why each is
+    # load-bearing. Body bytes are replaced 1:1 with "X" so the buffer keeps
+    # its byte offsets and line count; the opener line, the delimiter line and
+    # everything outside the body are left untouched.
+    function mask_flag_cat_heredocs(s,   lines, nl, i, j, line, pre, oq, delim, dq, closeat, trimmed, body, dashform) {
+        if (index(s, "<<") == 0) return s
+        nl = split(s, lines, "\n")
+        for (i = 1; i <= nl; i++) {
+            line = lines[i]
+            # (2) opener must END the line and carry a QUOTED delimiter.
+            if (match(line, /<<-?["'"'"'][A-Za-z0-9_]+["'"'"'][ \t]*$/) == 0) continue
+            dashform = (substr(line, RSTART + 2, 1) == "-")
+            delim = substr(line, RSTART, RLENGTH)
+            sub(/^<<-?/, "", delim)
+            sub(/[ \t]*$/, "", delim)
+            dq = substr(delim, 1, 1)
+            if (substr(delim, length(delim), 1) != dq) continue   # quotes must match
+            delim = substr(delim, 2, length(delim) - 2)
+            if (delim == "") continue
+            # (1) …immediately preceded by <flag> <openquote>$(cat.
+            pre = substr(line, 1, RSTART - 1)
+            if (pre !~ /(^|[ \t])(--message|--body|--notes|--title|--comment|-m)[ \t]*=?[ \t]*["'"'"']\$\([ \t]*cat[ \t]+$/) continue
+            oq = ""
+            for (j = length(pre); j >= 1; j--) {
+                if (substr(pre, j, 2) == "$(") { oq = substr(pre, j - 1, 1); break }
+            }
+            if (oq != DQ && oq != SQ) continue
+            # (3) the block must be CLOSED inside this buffer.
+            closeat = 0
+            for (j = i + 1; j <= nl; j++) {
+                trimmed = lines[j]
+                if (dashform) sub(/^\t+/, "", trimmed)
+                if (trimmed == delim) { closeat = j; break }
+            }
+            if (closeat == 0) continue
+            # (4) the substitution must close IMMEDIATELY after the delimiter
+            #     line — `)` + the same opening quote — so nothing chained
+            #     after the heredoc inside `$( … )` is masked away.
+            if (closeat == nl) continue
+            if (substr(lines[closeat + 1], 1, 2) != ")" oq) continue
+            for (j = i + 1; j < closeat; j++) {
+                body = lines[j]
+                gsub(/./, "X", body)
+                lines[j] = body
+            }
+            i = closeat
+        }
+        s = lines[1]
+        for (i = 2; i <= nl; i++) s = s "\n" lines[i]
+        return s
+    }
     BEGIN {
         SQ = sprintf("%c", 39)   # single quote
         DQ = sprintf("%c", 34)   # double quote
@@ -1847,7 +1953,16 @@ strip_literal_text() {
     # byte-for-byte identical to the previous behaviour.
     { buf = buf (NR > 1 ? "\n" : "") $0 }
     END {
-        s = buf
+        # PRE-PASS (#5216): blank the body of a `<flag> "$(cat <<QDELIMQ … )"`
+        # heredoc before the quoted-span redaction below runs. It has to happen
+        # here rather than inside the loop because `re`'"'"'s quoted-span classes
+        # ([^"]* / [^'"'"']*) stop at the first quote character, and a heredoc body
+        # is free to contain raw quotes (prose routinely does) — so the span
+        # match alone cannot see such a value whole. Masking first also means
+        # the `$(`-floor below needs no exception: by the time the loop reads
+        # this span, the only text left inside it is `$(cat <<QDELIMQ`, the
+        # delimiter, and `)`.
+        s = mask_flag_cat_heredocs(buf)
         out = ""
         while (match(s, re)) {
             pre     = substr(s, 1, RSTART - 1)
@@ -2361,7 +2476,16 @@ lifecycle_or_cloud_reason() {
 # unanswered ASK still blocks (see defaults/docs/guard-hooks.md). A lifecycle
 # deny takes precedence over a cloud-delete ask in a compound command (e.g.
 # `az group delete …; halt`), so the hard floor is never downgraded.
-_LIFECYCLE_CLOUD_REASONS=$(lifecycle_or_cloud_reason "$COMMAND_NO_COMMENT")
+#
+# SCANS COMMAND_ASK_SCAN, NOT COMMAND_NO_COMMENT (#5216). lifecycle_or_cloud_reason()
+# segment-parses per physical line, so a heredoc BODY line inside
+# `--body "$(cat <<'EOF' … EOF)"` whose first word happens to be a lifecycle verb
+# ("halt the deploy if this fails", "shutdown checklist:") was read as a live
+# `halt`/`shutdown` command word and hard-denied a comment that runs nothing.
+# The literal-redacted copy blanks only that quoted-value text; a real
+# `… ; halt` outside a flag value, or a `bash -c 'halt'` payload (never
+# redacted), still reaches this check and still denies.
+_LIFECYCLE_CLOUD_REASONS=$(lifecycle_or_cloud_reason "$COMMAND_ASK_SCAN")
 _LIFECYCLE_DENY=$(printf '%s\n' "$_LIFECYCLE_CLOUD_REASONS" | grep '^system lifecycle command:' | head -1)
 if [[ -n "$_LIFECYCLE_DENY" ]]; then
     deny "BLOCKED: $_LIFECYCLE_DENY" "lifecycle"
@@ -2379,10 +2503,23 @@ fi
 # all four DDL statements in one pass (cheaper than a per-pattern loop), and
 # sql_guard_enabled() is consulted only after a match, so the config read stays
 # off the hot path.
+#
+# SCANS COMMAND_ASK_SCAN, NOT COMMAND_NO_COMMENT (#5216). This check was the one
+# broad-substring deny that never received #3679's quoted-flag-value redaction:
+# `gh pr comment --body "example payload: DROP TABLE users"` hard-denied a
+# comment that runs no SQL at all, where the equivalent prose about `rm -rf /`
+# was already allowed by the catastrophic scan. COMMAND_ASK_SCAN is the
+# comment-stripped AND literal-redacted copy (built above; already relied on by
+# the deny-tier write-confinement check, so its use here is not an ask-tier-only
+# convention), which also carries #5216's heredoc-body masking — so both the
+# plain `--body "…"` and the heredoc-wrapped `--body "$(cat <<'EOF' … EOF)"`
+# forms of quoted prose stop false-positiving in one step. `-c`/`-e` are NOT
+# text-carrying flags, so the real invocations (`psql -c '…'`, `mysql -e '…'`)
+# are untouched and still deny.
 # =============================================================================
 SQL_DDL_PATTERN='DROP DATABASE|DROP TABLE|DROP SCHEMA|TRUNCATE TABLE'
-if echo "$COMMAND_NO_COMMENT" | grep -qiE "$SQL_DDL_PATTERN" && sql_guard_enabled; then
-    matched=$(echo "$COMMAND_NO_COMMENT" | grep -oiE "$SQL_DDL_PATTERN" | head -1)
+if echo "$COMMAND_ASK_SCAN" | grep -qiE "$SQL_DDL_PATTERN" && sql_guard_enabled; then
+    matched=$(echo "$COMMAND_ASK_SCAN" | grep -oiE "$SQL_DDL_PATTERN" | head -1)
     deny "BLOCKED: Command matches dangerous pattern: ${matched:-SQL DDL statement}" "sql-ddl"
 fi
 
@@ -2737,10 +2874,26 @@ expand_leading_tilde() {
     esac
 }
 
+# SCANS COMMAND_NO_LITERAL_TEXT, NOT RAW $COMMAND (#5216). extract_rm_targets()
+# segments with qsplit(), which — like every quote-tracking scan in this file —
+# is driven one PHYSICAL LINE at a time and has no memory of a `"` opened on an
+# earlier line. So a heredoc BODY line inside `--body "$(cat <<'EOF' … EOF)"`
+# was segmented as if it were live shell: the prose
+# `Example payload: \`owner/name; rm -rf /\`` split on its `;` into a segment
+# whose command word is `rm`, manufacturing the target ``/` `` and hard-denying a
+# Judge comment that deletes nothing (observed on PR #4357). Same failure family
+# as #5000's phantom write targets, and the reason fixing only the
+# ALWAYS_BLOCK_PATTERNS scan above leaves the reported command still denied.
+# The literal-redacted copy blanks exactly the quoted flag-value text (including
+# #5216's provably-inert `$(cat <<QDELIMQ … )` heredoc bodies) and nothing else,
+# so a REAL `rm -rf /` — bare, sudo-prefixed, after a `&&`, or smuggled through
+# `bash -c '…'` / `-m "$(rm -rf /)"` (neither of which is ever redacted) — still
+# reaches this check unchanged.
+#
 # Cheap pre-check keeps awk off the hot path for the ~99% of commands that have
 # no recursive/force rm at all.
-if echo "$COMMAND" | grep -qE 'rm[[:space:]]+-[a-zA-Z]*[rf]'; then
-    RM_TARGETS=$(extract_rm_targets "$COMMAND" | head -20)
+if echo "$COMMAND_NO_LITERAL_TEXT" | grep -qE 'rm[[:space:]]+-[a-zA-Z]*[rf]'; then
+    RM_TARGETS=$(extract_rm_targets "$COMMAND_NO_LITERAL_TEXT" | head -20)
 
     for target in $RM_TARGETS; do
         # Skip empty targets
@@ -3173,12 +3326,20 @@ fi
 #
 # A cheap pre-check keeps the config read + segment parser off the hot path for
 # the ~99% of commands with no force flag at all.
+#
+# SCANS COMMAND_ASK_SCAN, NOT COMMAND_NO_COMMENT (#5216). parse_force_ops() is
+# another per-physical-line segment parser, so a heredoc BODY line that BEGINS
+# with a force op (a Judge quoting `git push --force origin main` at the start of
+# a line, the exact prose #3679 exists to allow) was parsed as a live force op
+# and asked — and an unanswered ask blocks a headless sweep just like a deny.
+# Reading the literal-redacted copy keeps that prose inert while every real force
+# op — bare, chained after `&&`, or inside `bash -c '…'` — is untouched.
 # =============================================================================
-if [[ "$COMMAND_NO_COMMENT" == *git* ]] && \
-   echo "$COMMAND_NO_COMMENT" | grep -qE '(--force|--force-with-lease|(^|[[:space:]])-f([[:space:]]|$)|--hard)'; then
+if [[ "$COMMAND_ASK_SCAN" == *git* ]] && \
+   echo "$COMMAND_ASK_SCAN" | grep -qE '(--force|--force-with-lease|(^|[[:space:]])-f([[:space:]]|$)|--hard)'; then
     _FORCE_MODE=$(force_scope_mode)
     if [[ "$_FORCE_MODE" != "off" ]]; then
-        _FORCE_OPS=$(parse_force_ops "$COMMAND_NO_COMMENT" "$CWD")
+        _FORCE_OPS=$(parse_force_ops "$COMMAND_ASK_SCAN" "$CWD")
         if [[ -n "$_FORCE_OPS" ]]; then
             if [[ "$_FORCE_MODE" == "all" ]]; then
                 # Preserve pre-#3674 behaviour byte-for-byte: any force op asks.
@@ -3500,8 +3661,17 @@ CLOUD_ASK_PATTERNS=(
     'docker restart'
 )
 
+# SCANS COMMAND_ASK_SCAN, NOT COMMAND_NO_COMMENT (#5216). This was the only ask
+# loop still reading the merely comment-stripped copy — ASK_PATTERNS (#3756) and
+# REVERSIBLE_GH_PATTERNS above both already scan the literal-redacted copy — so
+# an `aws s3 rm`/`rb` phrase quoted as prose inside a `--body`/`-m` value still
+# false-asked after the catastrophic scan stopped false-denying it. In a headless
+# sweep an unanswered ask blocks just like a deny (see defaults/docs/
+# guard-hooks.md), so leaving it here would have left the reported stall half
+# fixed for the aws siblings. A real `aws s3 rb s3://bucket` outside a quoted
+# flag value is untouched and still asks.
 for pattern in "${CLOUD_ASK_PATTERNS[@]}"; do
-    if echo "$COMMAND_NO_COMMENT" | grep -qE "$pattern" && cloud_guard_enabled; then
+    if echo "$COMMAND_ASK_SCAN" | grep -qE "$pattern" && cloud_guard_enabled; then
         ask "Command requires confirmation: $COMMAND (set guards.cloudCli:false in .loom/config.json if this repo manages cloud infra as a first-class workflow)" "cloud-cli:$pattern"
     fi
 done

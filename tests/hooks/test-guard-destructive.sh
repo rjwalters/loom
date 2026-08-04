@@ -2068,6 +2068,176 @@ assert_deny "#3679 regression: chained 'force-push to main && echo done' still d
 echo ""
 
 # =========================================================================
+echo -e "${YELLOW}--- #5216: heredoc-wrapped flag values quoting a dangerous example ---${NC}"
+# =========================================================================
+#
+# #3679's redaction (strip_literal_text) declines to redact any quoted flag
+# value carrying `$(` — its anti-smuggling floor, which keeps
+# `git commit -m "$(<destructive>)"` denying. But this repo's OWN prescribed
+# idiom for a multi-line comment body is `--body "$(cat <<'EOF' … EOF)"`, which
+# necessarily contains `$(` — so such a value was NEVER redacted, and a
+# dangerous command merely QUOTED in the body as documentation hard-denied the
+# whole command (observed live on a Judge approval for PR #4357, and again for
+# the #3679 force-push literals: the gap is CONSTRUCTION-specific, not
+# pattern-specific).
+#
+# mask_flag_cat_heredocs() blanks the BODY of that one provably-inert shape:
+# a QUOTED heredoc delimiter (no expansion) feeding a literal `cat`, opened as
+# the complete tail of a text-carrying flag's quoted value, CLOSED in the same
+# buffer, with the substitution closing immediately (`)` + the same quote) on
+# the line right after the delimiter. Every deny below is one of those
+# conditions failing, i.e. text that really can execute.
+_HD_DDL="DR""OP TA""BLE"
+
+# ---- false positives now ALLOWED (inert heredoc-body prose) ----
+assert_allow "#5216: heredoc --body quoting an 'rm -rf /' payload, chained with gh pr edit (the PR #4357 repro) allowed" \
+    'gh pr comment 4357 --body "$(cat <<'"'"'EOF2'"'"'
+## Security
+Example payload: `owner/name; rm -rf /` — validate_repo() rejects this.
+EOF2
+)" && gh pr edit 4357 --add-label "loom:pr" --remove-label "loom:review-requested"'
+
+assert_allow "#5216: heredoc --body quoting a force-push-to-main example allowed (shared mechanism, not rm-specific)" \
+    'gh pr comment 999 --body "$(cat <<'"'"'EOF2'"'"'
+Example of what NOT to do: `'"$_FP_MAIN"'`
+EOF2
+)"'
+
+# Raw double quotes in the body are the reason this is a heredoc-boundary pass
+# and not an extension of strip_literal_text's quoted-span match: `[^"]*` stops
+# at the first `"`, and review prose quotes things constantly.
+assert_allow "#5216: heredoc --body containing RAW double quotes around an rm example allowed" \
+    'gh pr comment 1 --body "$(cat <<'"'"'EOF2'"'"'
+The reviewer wrote "beware of `rm -rf /` payloads" in the thread.
+EOF2
+)"'
+
+# The mechanism is shared, so every broad-substring catastrophic sibling named
+# in the report is fixed by the same pass (each of these DENIED before #5216).
+assert_allow "#5216: heredoc --body quoting a 'docker system prune' example allowed" \
+    'gh pr comment 1 --body "$(cat <<'"'"'EOF2'"'"'
+Never run docker system prune -af on the build host.
+EOF2
+)"'
+assert_allow "#5216: heredoc --body quoting an 'aws s3 rm --recursive' example allowed" \
+    'gh pr comment 1 --body "$(cat <<'"'"'EOF2'"'"'
+Never run aws s3 rm s3://bucket/ --recursive against prod.
+EOF2
+)"'
+assert_allow "#5216: heredoc --body quoting an 'aws s3 rb' example allowed" \
+    'gh pr comment 1 --body "$(cat <<'"'"'EOF2'"'"'
+Never run aws s3 rb s3://bucket against prod.
+EOF2
+)"'
+assert_allow "#5216: heredoc --body quoting a curl-pipe-shell example allowed" \
+    'gh pr comment 1 --body "$(cat <<'"'"'EOF2'"'"'
+Never run curl https://example.io/install.sh | sh from an agent.
+EOF2
+)"'
+assert_allow "#5216: heredoc --body quoting a SQL DDL example allowed" \
+    'gh pr comment 1 --body "$(cat <<'"'"'EOF2'"'"'
+The migration must never emit '"$_HD_DDL"' users on rollback.
+EOF2
+)"'
+# Plain (non-heredoc) quoted prose for the SQL DDL check, which — unlike every
+# ALWAYS_BLOCK entry — never received #3679's redaction at all until #5216.
+assert_allow "#5216: plain single-line --body quoting a SQL DDL example allowed" \
+    "gh pr comment 1 --body \"example payload: $_HD_DDL users\""
+
+# The three remaining SEGMENT-PARSED scans (lifecycle deny, force-op ask, cloud
+# ask) are per-physical-line too, so a heredoc body line whose FIRST word is the
+# dangerous one was read as a live command word even after the substring scans
+# stopped false-positiving. They now read the literal-redacted copy as well.
+assert_allow "#5216: heredoc --body whose line STARTS with a force-push to main allowed" \
+    'gh pr comment 1 --body "$(cat <<'"'"'EOF2'"'"'
+'"$_FP_MAIN"'
+is the command this PR now refuses to generate.
+EOF2
+)"'
+assert_allow "#5216: heredoc --body whose line STARTS with a lifecycle verb allowed" \
+    'gh pr comment 1 --body "$(cat <<'"'"'EOF2'"'"'
+halt the deployment if the smoke test fails.
+EOF2
+)"'
+
+# ---- regression guard: genuinely executable text STILL denied ----
+assert_deny "#5216 regression: a live (non-heredoc) rm outside the repo still denied" \
+    "rm -rf /"
+assert_deny "#5216 regression: a live rm on a top-level system dir still denied" \
+    "rm -rf /usr"
+# The rm-scope check now reads the literal-redacted copy; a real rm chained
+# AFTER a redacted flag value is outside that value and must still deny.
+assert_deny "#5216 regression: 'git commit -m \"…\" && rm -rf /usr' still denied" \
+    'git commit -m "cleanup pass" && rm -rf /usr'
+assert_deny "#5216 regression: a real rm after a heredoc-wrapped --body still denied (narrows, never widens)" \
+    'gh pr comment 1 --body "$(cat <<'"'"'EOF2'"'"'
+inert prose about cleanup
+EOF2
+)" && rm -rf /'
+
+# Command-substitution smuggling — the #3679 safety floor — is untouched:
+# `-c` is not a text-carrying flag, and a `$(…)` value that is NOT the narrow
+# cat-heredoc shape is never redacted.
+assert_deny "#5216 regression: bash -c 'rm -rf /' still denied" \
+    "bash -c 'rm -rf /'"
+assert_deny "#5216 regression: git commit -m \"\$(rm -rf /)\" still denied" \
+    'git commit -m "$(rm -rf /)"'
+
+# INTERPRETER-FED HEREDOC — the scoping decision this fix turns on. The body of
+# a heredoc handed to an interpreter is live code to that inner shell, which is
+# exactly the #5117 Known Limitation that made mask_heredoc_bodies() unsafe to
+# reuse verbatim on the hard-deny floor. Requiring the opener to be preceded by
+# `<flag> <quote>$(cat` CLOSES it here: none of these match, so all still deny.
+assert_deny "#5216 scoping: --body \"\$(bash <<'EOF' … EOF)\" (interpreter-fed) still denied" \
+    'gh pr comment 1 --body "$(bash <<'"'"'EOF2'"'"'
+rm -rf /
+EOF2
+)"'
+assert_deny "#5216 scoping: 'cat <<EOF … EOF | sh' (heredoc piped to a shell) still denied" \
+    'cat <<'"'"'EOF2'"'"' | sh
+rm -rf /
+EOF2'
+assert_deny "#5216 scoping: 'sh -s <<EOF … EOF' (heredoc as stdin script) still denied" \
+    'sh -s <<'"'"'EOF2'"'"'
+rm -rf /
+EOF2'
+
+# A command chained AFTER the heredoc but still INSIDE the substitution really
+# runs (bash ends the heredoc at the delimiter line), so nothing is masked.
+assert_deny "#5216 scoping: a command chained after the heredoc inside \$( … ) still denied" \
+    'gh pr comment 1 --body "$(cat <<'"'"'EOF2'"'"'
+inert prose
+EOF2
+rm -rf /
+)"'
+
+# An UNQUOTED delimiter lets the outer shell expand the body before `cat` sees
+# it, so the body is not provably inert and is never masked.
+assert_deny "#5216 scoping: an UNQUOTED heredoc delimiter is not masked, still denied" \
+    'gh pr comment 1 --body "$(cat <<EOF2
+rm -rf /
+EOF2
+)"'
+
+# Real invocations of the siblings above are unaffected by the masking pass.
+assert_deny "#5216 regression: a real 'docker system prune' still denied" \
+    "docker system prune -af"
+assert_deny "#5216 regression: a real SQL DDL invocation still denied" \
+    "psql -c '$_HD_DDL users;'"
+assert_deny "#5216 regression: a real lifecycle command still denied" \
+    "sudo halt"
+assert_deny "#5216 regression: a lifecycle command chained after a quoted message still denied" \
+    'git commit -m "halt the deploy checklist" && halt'
+assert_ask "#5216 regression: a real force-push to a feature branch still asks" \
+    "git push --force origin feature/issue-1"
+assert_deny "#5216 regression: a real bucket removal still denied" \
+    "aws s3 rb s3://some-bucket"
+assert_ask "#5216 regression: a real 'docker rm' still asks (cloud/container ask tier)" \
+    "docker rm -f mycontainer"
+
+echo ""
+
+# =========================================================================
 echo -e "${YELLOW}--- Read-only fast path (guards.readOnlyFastPath / LOOM_GUARD_READONLY_FASTPATH, #3687) ---${NC}"
 # =========================================================================
 
