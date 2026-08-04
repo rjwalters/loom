@@ -2900,7 +2900,7 @@ exactly like `main_health_gate::read_build_gate_config`.
 | `autonomous.mainHealthGate.ciWorkflow` | `LOOM_GATE_CI_WORKFLOW` | *(unset)* | Forge workflow that must itself conclude `success` for forge-CI corroboration to vouch for a commit (#3987). Empty/whitespace → unset. Absent → today's unanimity rule, unchanged. See [Optional named verification workflow](#optional-named-verification-workflow-loom_gate_ci_workflow-3987) |
 | `autonomous.mainHealthGate.suppressDispatchDuringGate` | `LOOM_MAIN_HEALTH_GATE_SUPPRESS_DISPATCH` | `true` | Hold new dispatch off a root while its build-gate run is in flight (#4084), per-root so a sibling with no gate in flight keeps dispatching. Env truthy (`1`/`true`/`yes`/`on`) enables, any other value disables; wins over config. Set `false` to recover the pre-#4084 `is_halted`-only behavior. See [build-gate.md → gate-in-flight dispatch suppressor](build-gate.md) |
 | `autonomous.roleRunner.enabled` | `LOOM_ROLE_RUNNER` | `false` | Periodic standalone support-role runner on/off (#4015). **Resolved per registered root** (#4377) — see the callout below the table |
-| `autonomous.roleRunner.roles` | *(config only)* | all 6 roles | Subset of `champion`/`curator`/`judge`/`doctor`/`auditor`/`guide` to dispatch; explicit empty array runs none. Also resolved from each root's own config |
+| `autonomous.roleRunner.roles` | *(config only)* | all 6 roles | Subset of `champion`/`curator`/`judge`/`doctor`/`auditor`/`guide` to dispatch; explicit empty array runs none. **Allowlist, not an addition** — must be updated by hand when a new default role ships, or it silently never dispatches (#5339); a non-empty pinned list missing a `DEFAULT_ROLES` entry warns. Also resolved from each root's own config |
 | `autonomous.roleRunner.intervalSecs` | `LOOM_ROLE_RUNNER_INTERVAL_SECS` | per-role built-in (5–15 min) | Uniform override applied to every enabled role's cadence |
 | `autonomous.roleRunner.model` | *(config only)* | `sonnet` | Model every role child is pinned to via `--model` (#4501). Resolved through the same `resolve_dispatch_model` chain as sweep dispatch: this key > `autonomous.model` > shipped default; blanks treated as unset. A role child never inherits the account's interactive CLI default |
 | `autonomous.roleRunner.onIdle` | *(config only)* | `[]` (none) | Subset of the same 6 roles to also fire on the work-finder **idle edge** (#4364) — the non-idle → idle transition (0 in-flight sweeps AND nothing dispatched this tick), in addition to the interval cadence. Absent → none (opposite default from `roles`); unknown names ignored with a warning. Debounced to min 60s per (root, role) and skipped while that role's interval/idle run is in progress. **Requires the work finder enabled** to observe idleness (a startup warning fires if set with the work finder off). **Also gated by that same root's own `enabled`** (#4377) — see below |
@@ -4167,10 +4167,18 @@ mechanism and the `spawn-codex.sh`-side counterpart:
 [`runtime-adapters.md` § "Model/runtime mismatch refusal (#5028)"](runtime-adapters.md#model-runtime-mismatch-refusal-5028).
 
 `roles` restricts the dispatched subset (an explicit empty array runs none;
-unknown names are ignored with a warning). `intervalSecs` — both the env var
-and the config key — is a single override applied *uniformly* to every
-enabled role's cadence; per-role cadence diversity otherwise comes from each
-role's own built-in default.
+unknown names are ignored with a warning). **It is an allowlist, not an
+addition** — a repo that pins it must add every newly-shipped default role by
+name or that role silently never dispatches there (#5339, the reason
+`doctor` joining `DEFAULT_ROLES` in #5272/#5291 stayed inert on this very
+repo until its own `roleRunner.roles` was updated to include it). To catch
+that class of staleness instead of failing silently, `resolve_roles()` also
+warns once per tick for every `DEFAULT_ROLES` entry missing from a
+**non-empty** pinned `roles` list (an explicit `[]` is a deliberate "run
+none" opt-out, not staleness, so it stays quiet). `intervalSecs` — both the
+env var and the config key — is a single override applied *uniformly* to
+every enabled role's cadence; per-role cadence diversity otherwise comes from
+each role's own built-in default.
 
 `onIdle` (#4364) lists the subset of the same six roles to *also* fire on the
 work-finder **idle edge** — the moment a workspace transitions from busy to
