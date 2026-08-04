@@ -546,6 +546,41 @@ assert_allow "#4601: Allow gh api --field body=@path (long form of -F, must not 
 assert_allow "#4601/#4577: Allow gh api -f body=\"@mention prose\" (not path-shaped)" \
     "gh api repos/o/r/issues/123/comments -f body=\"@rjwalters thanks for the review\""
 
+# --- #5181: gh-api-rawfield-body-literal-at fired on heredoc text that merely
+# QUOTES the denied phrase, with nothing executing --------------------------
+#
+# The check above used to grep raw $COMMAND, so a heredoc BODY line that
+# merely quotes 'gh api ... -f body=@path' as inert prose (e.g. a report
+# destined for a file, discussing the anti-pattern as an example of what NOT
+# to do) tripped the same catastrophic-tier deny as a live invocation — a
+# hard stall in headless runs, since there is no human to answer a
+# catastrophic-tier block. Confirmed in production: a prior agent's own
+# attempt to file the bug report about this false positive was itself denied
+# by it (its heredoc body quoted the phrase as an example). Fixed by scanning
+# a heredoc-body-masked working copy of $COMMAND (mask_heredoc_bodies(),
+# #5000) instead of the raw string.
+assert_allow "#5181: Allow a heredoc body that merely QUOTES 'gh api ... -f body=@path' as inert prose" \
+    'cat > /tmp/report.md <<'"'"'EOF'"'"'
+Discussing the anti-pattern, e.g. quoting:
+gh api repos/o/r/issues/1/comments -f body=@/tmp/review.md
+as an example of what NOT to do.
+EOF
+echo done'
+
+# Narrows, never widens: a REAL (non-heredoc) invocation must keep denying —
+# both standalone (regression guard for #4523/#4601/#4685, must not be
+# weakened) and sitting in the same multi-line command as an unrelated
+# heredoc (mirrors the #5000 "narrows, never widens" test at
+# tests/hooks/test-guard-destructive.sh:2691).
+assert_deny "#5181: A live (non-heredoc) gh api -f body=@path invocation still denies (regression guard)" \
+    "gh api repos/o/r/issues/123/comments -f body=@/tmp/review.md"
+
+assert_deny "#5181: A real invocation AFTER an unrelated heredoc in the same command still denies" \
+    'cat <<'"'"'EOF'"'"'
+just some unrelated prose
+EOF
+gh api repos/o/r/issues/123/comments -f body=@/tmp/review.md'
+
 # --- #4685: the same literal-@ loss on the `edit` subcommand — real-world
 # evidence is issue #4608's body being corrupted to the literal string
 # `@/tmp/issue4608_body_new.txt`. The #4523/#4601 rules above are hard-anchored
