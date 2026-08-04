@@ -225,6 +225,10 @@ jobs:
         run: bash scripts/test-installer.sh
       - name: Run installer reinstall-safety tests (#4188)
         run: bash defaults/scripts/tests/test-install-reinstall-safety.sh
+      - name: Run install --local/--gitignore mode tests (#5276)
+        run: bash scripts/test-install-local-mode.sh
+      - name: Run migrate-consumer tests (#5276)
+        run: bash scripts/test-migrate-consumer.sh
 
   codex-adapter-smoke:
     name: Codex Adapter Smoke (mocked)
