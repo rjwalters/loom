@@ -226,15 +226,38 @@ pub fn pid_is_live_claim_for(pid: u32, issue: u32) -> bool {
 /// `is_live` is injected so tests can drive both verdicts without spawning
 /// processes. Fail-open: a missing lock dir, unreadable or unparseable
 /// `owner.json`, or a dead/zombie owner all resolve to `None`.
+///
+/// `own_untracked_pid` (Issue #5236) excludes one specific false-positive:
+/// `SweepRegistry::acquire_lock` stamps `owner_pid` with the *dispatching
+/// daemon's own pid* as a provisional placeholder — it is rewritten to the
+/// spawned child's real pid by `record_child_pid_in_lock` (#3808) once the
+/// child exists. When `spawn_child` fails before that rewrite runs (or ran
+/// historically, pre-#5236, and the caller's own cleanup didn't reach it),
+/// the placeholder is left behind with `owner_pid` == a pid that is, by
+/// construction, still alive: this daemon itself. A bare liveness/argv check
+/// cannot distinguish that from a real claim on non-Linux hosts (no
+/// `/proc/<pid>/cmdline` to read, so [`pid_is_live_claim_for`] falls back to
+/// bare liveness and reports "confirmed live" — the daemon's own pid is
+/// always alive while it's asking the question). Passing
+/// `Some(std::process::id())` here — but ONLY when the caller has already
+/// confirmed no tracked child/registry entry corresponds to this lock — lets
+/// leg 1 recognize that specific placeholder shape and refuse to count it as
+/// evidence, regardless of what `is_live` would otherwise say. `None` (the
+/// default for every non-registry caller, which has no child bookkeeping to
+/// consult) preserves the pre-#5236 behavior exactly.
 #[must_use]
 pub fn live_lock_owner_in(
     locks_dir: &Path,
     issue: u32,
     is_live: &dyn Fn(u32) -> bool,
+    own_untracked_pid: Option<u32>,
 ) -> Option<LiveClaimEvidence> {
     let owner_path = locks_dir.join(format!("issue-{issue}")).join("owner.json");
     let raw = std::fs::read_to_string(&owner_path).ok()?;
     let owner: LockOwnerView = serde_json::from_str(&raw).ok()?;
+    if own_untracked_pid == Some(owner.owner_pid) {
+        return None;
+    }
     if !is_live(owner.owner_pid) {
         return None;
     }
@@ -400,11 +423,33 @@ pub fn live_sweep_process_in(_workspace_root: &Path, _issue: u32) -> Option<Live
 /// Read-only and short-circuiting: leg 1 (a `read_to_string`) and leg 2 (one
 /// small JSON file) run before the `/proc` scan, so the common
 /// nothing-is-claimed case costs two file reads plus a bounded directory walk.
+///
+/// Plain wrapper around [`probe_excluding`] with `own_untracked_pid: None` —
+/// the shape every caller without registry bookkeeping needs (the orphan
+/// reaper, claim reconciliation).
 #[must_use]
 pub fn probe(
     workspace_root: &Path,
     journal_path: Option<&Path>,
     issue: u32,
+) -> Option<LiveClaimEvidence> {
+    probe_excluding(workspace_root, journal_path, issue, None)
+}
+
+/// [`probe`], with one additional exclusion (Issue #5236): a claim-lock
+/// owner whose pid equals `own_untracked_pid` is never treated as evidence,
+/// no matter what leg 1's liveness check would otherwise conclude. See
+/// [`live_lock_owner_in`]'s doc for why this exists — it lets
+/// [`crate::sweep_registry::SweepRegistry::live_claim_evidence`] pass its own
+/// pid once it has confirmed, via its own bookkeeping (`self.entries`), that
+/// no tracked sweep corresponds to the lock. Every other caller passes
+/// `None` via [`probe`] and is unaffected.
+#[must_use]
+pub fn probe_excluding(
+    workspace_root: &Path,
+    journal_path: Option<&Path>,
+    issue: u32,
+    own_untracked_pid: Option<u32>,
 ) -> Option<LiveClaimEvidence> {
     // Both bookkeeping legs verify the recorded PID's argv where the platform
     // allows it ([`pid_is_live_claim_for`]), so a *stale* record whose PID has
@@ -412,7 +457,7 @@ pub fn probe(
     let is_live: &dyn Fn(u32) -> bool = &|pid| pid_is_live_claim_for(pid, issue);
 
     let locks_dir = workspace_root.join(".loom").join("locks");
-    if let Some(evidence) = live_lock_owner_in(&locks_dir, issue, is_live) {
+    if let Some(evidence) = live_lock_owner_in(&locks_dir, issue, is_live, own_untracked_pid) {
         return Some(evidence);
     }
 
@@ -526,7 +571,7 @@ mod tests {
     fn live_lock_owner_reports_a_live_pid() {
         let dir = tempdir().unwrap();
         write_lock(dir.path(), 4275, 4242, "sweep-issue-4275-1");
-        let evidence = live_lock_owner_in(dir.path(), 4275, &|_| true).unwrap();
+        let evidence = live_lock_owner_in(dir.path(), 4275, &|_| true, None).unwrap();
         assert_eq!(
             evidence,
             LiveClaimEvidence::ClaimLock {
@@ -543,26 +588,45 @@ mod tests {
         // claim. `acquire_lock` refuses on existence; this probe must not.
         let dir = tempdir().unwrap();
         write_lock(dir.path(), 4275, 4242, "sweep-issue-4275-1");
-        assert!(live_lock_owner_in(dir.path(), 4275, &|_| false).is_none());
+        assert!(live_lock_owner_in(dir.path(), 4275, &|_| false, None).is_none());
     }
 
     #[test]
     fn live_lock_owner_fails_open_on_missing_and_corrupt_owner() {
         let dir = tempdir().unwrap();
         // Missing entirely.
-        assert!(live_lock_owner_in(dir.path(), 4275, &|_| true).is_none());
+        assert!(live_lock_owner_in(dir.path(), 4275, &|_| true, None).is_none());
         // Present but unparseable.
         let lock = dir.path().join("issue-4275");
         std::fs::create_dir_all(&lock).unwrap();
         std::fs::write(lock.join("owner.json"), "not json").unwrap();
-        assert!(live_lock_owner_in(dir.path(), 4275, &|_| true).is_none());
+        assert!(live_lock_owner_in(dir.path(), 4275, &|_| true, None).is_none());
     }
 
     #[test]
     fn live_lock_owner_is_scoped_to_the_requested_issue() {
         let dir = tempdir().unwrap();
         write_lock(dir.path(), 4275, 4242, "sweep-issue-4275-1");
-        assert!(live_lock_owner_in(dir.path(), 4276, &|_| true).is_none());
+        assert!(live_lock_owner_in(dir.path(), 4276, &|_| true, None).is_none());
+    }
+
+    /// AC (Issue #5236): a lock whose `owner_pid` is the querying daemon's own
+    /// pid — the provisional placeholder `acquire_lock` writes before a child
+    /// exists — must NOT count as confirmed-live evidence when the caller has
+    /// already confirmed no tracked child corresponds to it. `is_live` alone
+    /// would say yes (the daemon calling this IS alive); `own_untracked_pid`
+    /// overrides that, regardless of platform argv-reading support.
+    #[test]
+    fn live_lock_owner_excludes_own_untracked_pid_even_when_live() {
+        let dir = tempdir().unwrap();
+        let own = std::process::id();
+        write_lock(dir.path(), 4275, own, "sweep-issue-4275-leaked");
+        assert!(live_lock_owner_in(dir.path(), 4275, &|_| true, Some(own)).is_none());
+        // A DIFFERENT pid is unaffected by the exclusion, even with the same
+        // `own_untracked_pid` filter in play — it only ever matches on exact
+        // pid equality.
+        write_lock(dir.path(), 4276, 4242, "sweep-issue-4276-real");
+        assert!(live_lock_owner_in(dir.path(), 4276, &|_| true, Some(own)).is_some());
     }
 
     // ---- leg 2: machine-level journal ------------------------------------
@@ -674,6 +738,31 @@ mod tests {
         let journal = dir.path().join("sweeps.json");
         let evidence = probe(dir.path(), Some(&journal), 4275).unwrap();
         assert!(matches!(evidence, LiveClaimEvidence::ClaimLock { .. }));
+    }
+
+    /// AC (Issue #5236): `probe_excluding` must not report a leaked
+    /// provisional lock (`owner_pid` == the querying daemon's own pid, no
+    /// tracked child) as a confirmed-live claim — cross-platform, unlike the
+    /// argv-based exclusion below which only fires on Linux. This is the
+    /// exact shape `dispatch_inner` used to leave behind before #5236's
+    /// cleanup fix: `acquire_lock`'s placeholder, never rewritten because
+    /// `spawn_child` failed first.
+    #[test]
+    fn probe_excluding_ignores_a_leaked_provisional_lock_owned_by_self() {
+        let dir = tempdir().unwrap();
+        let locks = dir.path().join(".loom").join("locks");
+        let own = std::process::id();
+        write_lock(&locks, 4275, own, "sweep-issue-4275-leaked");
+        let journal_path = dir.path().join("sweeps.json");
+        assert!(probe_excluding(dir.path(), Some(&journal_path), 4275, Some(own)).is_none());
+        // A genuinely live claim (a distinct, real sweep process) must still
+        // be refused by `probe_excluding` with the SAME exclusion in play —
+        // the fix must not weaken the guard for real duplicates. The
+        // exclusion only ever matches on exact pid equality, so a different
+        // issue's genuinely-live sweep is unaffected.
+        let sweep = FakeSweep::spawn(4276);
+        write_lock(&locks, 4276, sweep.pid(), "sweep-issue-4276-live");
+        assert!(probe_excluding(dir.path(), Some(&journal_path), 4276, Some(own)).is_some());
     }
 
     #[test]

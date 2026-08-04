@@ -3004,15 +3004,28 @@ fn handle_request(
                 },
                 Err(e) => match e.downcast::<crate::runtime_admission::RuntimeRejection>() {
                     Ok(rejection) => Response::RuntimeRejected(rejection),
-                    Err(e) => Response::Error {
-                        // #5210: `{e:#}` (anyhow's alternate Display) walks the
-                        // full `.context()` chain instead of printing only the
-                        // outermost context, so a specific inner failure (e.g.
-                        // `resolve_spawn_bin`'s "spawn-worker.sh not found under
-                        // ...") reaches the MCP client instead of being
-                        // silently collapsed into "failed to spawn sweep child".
-                        message: format!("dispatch_sweep failed: {e:#}"),
-                    },
+                    Err(e) => {
+                        // Issue #5236: the pre-dispatch `log::info!` above only
+                        // ever logs the *attempt*, never the failure — until
+                        // now, the daemon's own log had no record of why a
+                        // dispatch failed at all, only the caller's response
+                        // did (#5210/#5218 fixed the caller-facing half). Log
+                        // the same full error chain at WARN so an operator
+                        // reading `loom-daemon`'s log (not just the MCP/CLI
+                        // response) can diagnose a dispatch failure without
+                        // reproducing it.
+                        log::warn!("dispatch_sweep: {kind:?} failed: {e:#}");
+                        Response::Error {
+                            // #5210: `{e:#}` (anyhow's alternate Display) walks
+                            // the full `.context()` chain instead of printing
+                            // only the outermost context, so a specific inner
+                            // failure (e.g. `resolve_spawn_bin`'s
+                            // "spawn-worker.sh not found under ...") reaches
+                            // the MCP client instead of being silently
+                            // collapsed into "failed to spawn sweep child".
+                            message: format!("dispatch_sweep failed: {e:#}"),
+                        }
+                    }
                 },
             }
         }

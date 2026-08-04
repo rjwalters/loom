@@ -1092,17 +1092,47 @@ impl SweepRegistry {
         // stagger (the default outside production / in tests) is a no-op.
         self.apply_dispatch_stagger();
         let log_path = self.compute_log_path(issue_number);
-        let (child, token_name, runtime, immediate_preflight_death) = self
-            .spawn_child(
-                issue_number,
-                &log_path,
-                &sweep_id,
-                model,
-                effort,
-                depends_on,
-                runtime_admission.as_ref(),
-            )
-            .context("failed to spawn sweep child")?;
+        let (child, token_name, runtime, immediate_preflight_death) = match self.spawn_child(
+            issue_number,
+            &log_path,
+            &sweep_id,
+            model,
+            effort,
+            depends_on,
+            runtime_admission.as_ref(),
+        ) {
+            Ok(spawned) => spawned,
+            Err(e) => {
+                // Issue #5236: `spawn_child` can fail for reasons that have
+                // nothing to do with the issue itself (e.g. a registered
+                // workspace whose `.loom/scripts/` is missing
+                // `spawn-worker.sh` — `resolve_spawn_bin` errors before any
+                // process is ever spawned). Unlike the #4689 branch below,
+                // this is a synchronous `Err`, not a synchronously-observed
+                // dead child — but the side effects already applied above
+                // (claim lock, peer-claim advertisement, label flip) are
+                // identical, and leaving them in place is exactly what wedges
+                // every retry: the leaked lock's `owner_pid` is this daemon's
+                // own (still-alive) pid, which the #4556 live-claim guard
+                // then reads as a confirmed-live claim forever (until an
+                // operator manually removes the lock dir). Unwind the same
+                // three side effects the #4689 branch reverts, so a second
+                // dispatch attempt starts from a clean slate instead of a
+                // permanent wedge.
+                log::warn!(
+                    "sweep_registry: issue #{issue_number} sweep_id={sweep_id} failed to spawn \
+                     — reverting the claim lock, label, and peer-claim advertisement instead of \
+                     leaking them (#5236): {e:#}"
+                );
+                if !self.config.skip_label_flip {
+                    let _ = self.restore_label_to_ready(issue_number);
+                    self.note_label_flip(issue_number); // #4485 flap detection
+                }
+                self.publish_peer_claim(peer_claims::ClaimKind::Retract, issue_number);
+                let _ = self.release_lock_owned(issue_number, &sweep_id);
+                return Err(e.context("failed to spawn sweep child"));
+            }
+        };
 
         // Issue #4689: the child already died — synchronously observed,
         // before this dispatch call has returned — from `spawn-claude.sh`'s
@@ -2601,6 +2631,90 @@ mod tests {
             "the claim lock must be released on the synchronous failure path"
         );
         assert!(reg.children.is_empty(), "no child handle should be retained for a dead child");
+    }
+
+    /// AC (#5236): when `spawn_child` itself returns `Err` — e.g. a
+    /// registered workspace whose `spawn_bin` resolves to a nonexistent
+    /// file, so `Command::spawn()` fails at the OS level before any child
+    /// ever exists — `dispatch_inner` must unwind the same side effects the
+    /// #4689 branch above reverts: the claim lock, the `loom:building`
+    /// label flip, and (implicitly, since nothing was ever advertised
+    /// without a peer-claim publisher configured in this fixture) the
+    /// peer-claim advertisement. Without this, the leaked lock's
+    /// `owner_pid` is this daemon's own (permanently alive, from its own
+    /// point of view) pid, which the #4556 live-claim guard misreads as a
+    /// confirmed-live claim on every retry — the exact wedge this issue
+    /// reports.
+    #[test]
+    #[serial]
+    fn dispatch_reverts_claim_lock_and_label_when_spawn_child_itself_fails() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::remove_var("LOOM_REPO");
+        let (mut reg, gh_log) = spawn_bin_missing_registry(ws);
+
+        let err = reg
+            .dispatch(&SweepKind::Issue(5236), None, None, None, None)
+            .expect_err("a spawn_child Err must fail dispatch, not Ok");
+        assert!(err.to_string().contains("failed to spawn sweep child"), "got: {err}");
+
+        let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            calls.contains("issue edit 5236 --remove-label loom:issue --add-label loom:building"),
+            "the claim WAS taken (label flip happens before spawn_child) — got: {calls:?}"
+        );
+        assert!(
+            calls.contains("issue edit 5236 --remove-label loom:building --add-label loom:issue"),
+            "…and must be REVERTED when spawn_child fails — got: {calls:?}"
+        );
+
+        assert!(
+            running_issue_sweep_id(&reg, 5236).is_none(),
+            "a failed dispatch must not leave a Running entry behind"
+        );
+        assert!(
+            !ws.join(".loom/locks/issue-5236").exists(),
+            "the claim lock must be released when spawn_child fails, not leaked (#5236)"
+        );
+        assert!(
+            reg.children.is_empty(),
+            "no child handle exists — spawn_child never got that far"
+        );
+    }
+
+    /// The full repro from this issue's Test Plan: dispatch twice against a
+    /// workspace whose `spawn_bin` never resolves to anything runnable. The
+    /// first dispatch fails and — per the AC above — cleans up fully; the
+    /// second dispatch must reach the SAME `spawn_child` failure again, NOT
+    /// be refused by the #4556 live-claim guard reading a leaked lock whose
+    /// `owner_pid` is this daemon's own (still-alive) pid as a confirmed-live
+    /// claim.
+    #[test]
+    #[serial]
+    fn second_dispatch_after_spawn_child_failure_is_not_refused_by_the_live_claim_guard() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::remove_var("LOOM_REPO");
+        let (mut reg, _gh_log) = spawn_bin_missing_registry(ws);
+
+        let first = reg
+            .dispatch(&SweepKind::Issue(5236), None, None, None, None)
+            .expect_err("first dispatch must fail — spawn_bin does not exist");
+        assert!(
+            first.downcast_ref::<LiveClaimDispatchError>().is_none(),
+            "the FIRST dispatch must fail on the spawn error itself, not a live-claim refusal \
+             (there is nothing to collide with yet) — got: {first}"
+        );
+
+        let second = reg
+            .dispatch(&SweepKind::Issue(5236), None, None, None, None)
+            .expect_err("second dispatch must also fail — spawn_bin still does not exist");
+        assert!(
+            second.downcast_ref::<LiveClaimDispatchError>().is_none(),
+            "the SECOND dispatch must reach the same spawn_child failure again, not be wedged \
+             behind a #4556 live-claim refusal from the first attempt's leaked lock — got: {second}"
+        );
+        assert!(second.to_string().contains("failed to spawn sweep child"), "got: {second}");
     }
 
     /// Edge case (#4689): a child that DID log a token selection before
