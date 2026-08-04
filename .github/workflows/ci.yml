@@ -47,6 +47,7 @@ jobs:
               - 'defaults/**'
               - 'tests/hooks/**'
               - 'tests/install/**'
+              - 'tests/hermit/**'
               - 'install.sh'
               # .loom/hooks/** is git-tracked (self-install dogfooding) and
               # several defaults/hooks/tests/*.sh + tests/hooks/*.sh suites
@@ -323,6 +324,14 @@ jobs:
     # expected to be faster (no per-exec Gatekeeper/codesign overhead, cheaper
     # fork/exec) but this is the suites' first CI run — watch the actual
     # ubuntu wall-clock here and tighten LOOM_CI_SUITE_TIMEOUT only if needed.
+    #
+    # Since #5275 ci-wired.txt also covers tests/install/ (installer/
+    # uninstaller unit suites — previously appeared in this job's `changes`
+    # paths-filter trigger only, never actually invoked) and tests/hermit/
+    # (the Hermit role's stateless-ceremony heuristic regression guard,
+    # previously not referenced by CI at all). All 8 suites are hermetic
+    # (fake/stub binaries or local python3 AST fixtures, no live network or
+    # forge calls) and run in well under a second each.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
