@@ -735,6 +735,33 @@ prevention remains procedural, not just guard-enforced — prefer
 capture, scoped to one worktree, no shared stack) over ad-hoc `git stash`
 for WIP handling (see `defaults/roles/builder.md` / `defaults/roles/doctor.md`).
 
+**Headless baseline-diff pattern (#5217).** Because a busy repo almost always
+has two or more `.loom-managed` worktrees active, the collision ask above
+fires on nearly every occurrence of the legitimate, worktree-confined
+`git stash push && <baseline check> && git stash pop` sequence used to diff a
+clean baseline against in-progress WIP (clippy/shellcheck/test-output
+comparisons) — an unanswerable `ask` in a headless sweep with no human
+present. **The guard was deliberately NOT widened for it.** A same-chain
+"push and pop appear in one command, so allow" heuristic was considered and
+rejected: push and pop are two separate guard-approved Bash calls with an
+arbitrary-duration command running in between, so another worktree's
+concurrent `git stash push` can still land on the shared stack inside that
+window and the "pop" then restores the *wrong* entry — command shape alone
+cannot see that. Instead, `worktree.sh` gained a clean-and-restore pair that
+removes the shared-mutable-state precondition entirely:
+
+| Verb | What it does |
+|------|--------------|
+| `worktree.sh stash-push <N> [--include-untracked]` | Captures the worktree's uncommitted tracked diff with `git stash create` (which builds a stash-format commit but **never writes `refs/stash`**), anchors it under the per-issue ref `refs/loom/stash-baseline/issue-<N>`, then resets that one worktree to a clean `HEAD` baseline. With `--include-untracked`, untracked files (Loom runtime markers excluded) move to a per-issue holding directory instead. |
+| `worktree.sh stash-pop <N>` | Re-applies exactly what `stash-push <N>` captured from that same per-issue ref / holding directory, then clears them. Refuses loudly — **without discarding the captured baseline** — if nothing is pending or if re-applying conflicts. |
+
+Each issue gets its **own** ref rather than a slot on a shared stack, so no
+other worktree's stash operation can interleave, and neither verb's command
+text contains a raw `git stash pop|drop|clear` — so both are
+guard-transparent, not a guard exemption. Raw `git stash pop`/`drop`/`clear`
+stays exactly as gated as before, in the main checkout and in a linked
+worktree alike.
+
 **Examples**:
 
 ```bash
@@ -743,13 +770,21 @@ git stash pop
 git stash drop stash@{1}
 git stash clear
 
-# In a linked worktree (.loom/worktrees/issue-N) — allowed, no ask:
+# In a linked worktree (.loom/worktrees/issue-N) — allowed only while it is
+# the ONLY managed worktree; asks once a second one exists (#4821):
 cd .loom/worktrees/issue-42 && git stash pop
 
 # Never gated, in either location — these cannot remove a stash entry:
 git stash push -m "wip"
 git stash apply
 git stash list
+
+# Headless clean-baseline-vs-my-diff comparison — never gated, because
+# neither verb touches refs/stash (#5217):
+./.loom/scripts/worktree.sh stash-push 42
+cargo clippy --message-format=short > /tmp/baseline.txt   # clean-tree baseline
+./.loom/scripts/worktree.sh stash-pop 42
+cargo clippy --message-format=short > /tmp/with-wip.txt   # then diff the two
 
 # Opt out for a whole repo:
 #   .loom/config.json  ->  { "guards": { "stashScope": false } }
