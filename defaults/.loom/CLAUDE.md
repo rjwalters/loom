@@ -337,14 +337,19 @@ exits `78` (`EX_CONFIG`). Full reference:
 ## Troubleshooting
 
 See [`.loom/docs/troubleshooting.md`](.loom/docs/troubleshooting.md) for stale
-worktrees, stuck agents, daemon registry/reaper issues, and common fixes. Quick
-fixes:
+worktrees, stuck agents, daemon registry/reaper issues, quarantine safety, and
+common fixes. Quick fixes:
 
 ```bash
 loom-clean --force                              # stale worktrees/branches
 loom-recover-orphans --recover                   # orphaned loom:building issues
 gh label sync --file .github/labels.yml          # re-sync labels
 ```
+
+**Branching does not protect uncommitted edits in the primary clone from
+quarantine** — see [`.loom/docs/troubleshooting.md` → Uncommitted work in the
+primary clone can be quarantined at any
+time](.loom/docs/troubleshooting.md).
 
 CI-specific guidance (headless/non-interactive runs) is in
 [`.loom/docs/ci-integration.md`](.loom/docs/ci-integration.md); tool-use
