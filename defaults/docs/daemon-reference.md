@@ -3750,17 +3750,36 @@ meantime, then `SIGTERM` + `SIGCONT`, and `SIGKILL` only for survivors after a
 
 **Fail-safes.** A worktree's processes are touched only when **all** hold: the
 `.loom-managed` sentinel is present (user-provisioned worktrees are never
-touched), no `.loom-in-use` marker, no live spawn-loop task or claim-lock, no
-confirmed-live sweep claim (`live_claim::probe` — re-checked immediately before
-each kill, so a sweep that starts mid-pass is still protected), **no live agent
-runtime working inside the worktree** (a `claude`/`codex` process, or any argv
-naming a `/loom:` slash command — the incident's defining property is that the
-agent was *gone*, and this is what covers PR-set sweeps and manually driven
-agents that claim no issue), the seed process is older than `minAgeSecs`, and
-the tree contains neither this daemon nor its ancestors nor its own children.
-Every ambiguity (unreadable `/proc` entry,
-unknown process age, non-Linux host) resolves to *skip* — under-reaping is
-recoverable on the next tick, a false-positive kill is not.
+touched), no `.loom-in-use` marker, **no live sweep owns the process** (see
+"pid-scoped, not issue-scoped" below), **no live agent runtime working inside
+the worktree** (a `claude`/`codex` process, or any argv naming a `/loom:` slash
+command — the incident's defining property is that the agent was *gone*, and
+this is what covers PR-set sweeps and manually driven agents that claim no
+issue), the seed process is older than `minAgeSecs`, and the tree contains
+neither this daemon nor its ancestors nor its own children. Every ambiguity
+(unreadable `/proc` entry, unknown process age, non-Linux host) resolves to
+*skip* — under-reaping is recoverable on the next tick, a false-positive kill is
+not.
+
+**Pid-scoped, not issue-scoped (#5135).** A live spawn-loop task / claim-lock,
+or a `live_claim::probe` hit, used to protect the **whole worktree** — so an
+orphan tree that predates and is unrelated to a concurrently live,
+*re-dispatched* sweep for the same issue could never be reaped, which is exactly
+the #5110 shape. The claim gate now reads the claim lock's own
+`owner_pid`/`acquired_at` back out (`active_locked_issue_roots`) and, when that
+owner pid is a confirmed-live non-zombie process, protects **only that sweep's
+own process tree**: its root pid, every ppid-descendant of it, and any other
+attributed pid that cannot be proven to have started *strictly before* the
+claim was acquired. Everything provably older is still a reap candidate. The
+same narrowing applies to the agent-runtime veto — an agent inside the resolved
+live sweep's own tree no longer vetoes the whole worktree; any other agent still
+does. When the root **cannot** be resolved (a stale lock, an unparseable owner,
+a claim tracked only through the legacy spawn-loop-state union with no lock dir),
+there is nothing to discriminate against and the whole worktree is protected
+exactly as before. An orphan tree that overlaps the live sweep's tree at all is
+refused whole rather than partially reaped, and the claim is re-resolved
+immediately before each kill: a claim that appeared or *changed* since the plan
+was built fails closed.
 
 **Default-on**, with `dryRun` for operators who want to watch it first (it
 detects and logs the trees it *would* reap and signals nothing).
