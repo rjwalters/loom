@@ -2155,8 +2155,65 @@ if [[ "$COMMAND" == *"--body"* || "$COMMAND" == *"--message"* || \
     COMMAND_NO_LITERAL_TEXT=$(strip_literal_text "$COMMAND")
 fi
 
+# HEREDOC-MASKED CATASTROPHIC-SCAN WORKING COPY (#5216)
+#
+# strip_literal_text() above deliberately DECLINES to redact any quoted flag
+# value containing `$(` or a backtick — its documented anti-smuggling safety
+# floor, so `git commit -m "$(git push --force origin main)"` still hard-denies.
+# But that means a heredoc-wrapped --body value (`--body "$(cat <<'EOF'
+# ... EOF)"`, the idiom this repo's own agent instructions use pervasively for
+# multi-line PR/issue comments) is NEVER redacted, regardless of what the
+# heredoc BODY merely quotes as inert prose — the exact #5216 false positive
+# (a Judge comment documenting a dangerous-command example in backticks inside
+# such a body tripped the rm-scope catastrophic pattern).
+#
+# Composes mask_heredoc_bodies_selective() (#5205, built on the
+# mask_heredoc_bodies() primitive, #5000; already reused for the analogous
+# #5181/#5192 `gh-api-rawfield-body-literal-at` check below) on TOP OF
+# COMMAND_NO_LITERAL_TEXT: it blanks the body of any CLOSED `<<DELIM ...
+# DELIM` heredoc block to an inert placeholder, independent of the `$(`/
+# backtick exclusion above, so the quoted example text inside the body no
+# longer reaches the pattern loop. Built lazily, only when '<<' is present
+# (mirrors the COMMAND_HEREDOC_MASKED prefilter used by the #5181 check),
+# keeping it off the hot path for the vast majority of commands.
+#
+# SELECTIVE, NOT PLAIN mask_heredoc_bodies() — deliberate (#5216 AC #2): this
+# catastrophic-tier scan is the general-purpose hard-deny floor for EVERY
+# ALWAYS_BLOCK_PATTERNS entry, not one narrow literal-phrase check like
+# #5181. Plain mask_heredoc_bodies() has a documented "Known Limitation"
+# (#5117): it masks a heredoc body regardless of what consumes it, including
+# a body genuinely fed to an inner interpreter (`bash <<'EOF' ... rm -rf /
+# ... EOF`, `... | sh`). Reusing it unconditionally here would silently
+# ALLOW exactly the smuggled-command shape this scan exists to hard-deny —
+# the same risk #5205 already identified and fixed for the
+# gh-api-rawfield-body-literal-at check by introducing
+# mask_heredoc_bodies_selective(), which leaves an interpreter-fed heredoc
+# block's body UNMASKED (still visible to the pattern loop) per
+# is_interpreter_opener(), while still masking every non-interpreter-fed
+# block — e.g. a `gh pr comment --body "$(cat <<'EOF' ... EOF)"` value feeds
+# nothing but a command substitution, not an interpreter, so its body is
+# masked as before.
+#
+# NON-REGRESSION: masking only ever NARROWS what this scan sees. A genuine
+# command-substitution-smuggled destructive command WITHOUT a heredoc (e.g.
+# `git commit -m "$(git push --force origin main)"`, `bash -c 'rm -rf /'`) contains no
+# `<<` at all, so mask_heredoc_bodies_selective() is a no-op on it and it
+# still reaches the pattern loop unchanged and still hard-denies. A live
+# (non-heredoc, non-quoted) catastrophic command sitting in the SAME
+# multi-line buffer as an unrelated heredoc is likewise untouched — only the
+# heredoc BODY lines between a NON-interpreter-fed opener and its
+# terminating delimiter are ever masked. An interpreter-fed heredoc
+# (`bash <<'EOF' ... rm -rf / ... EOF`) still hard-denies too (see the
+# #5216 interpreter-fed-heredoc regression test).
+COMMAND_ALWAYS_BLOCK_SCAN="$COMMAND_NO_LITERAL_TEXT"
+if [[ "$COMMAND_NO_LITERAL_TEXT" == *"<<"* ]]; then
+    COMMAND_ALWAYS_BLOCK_SCAN=$(printf '%s' "$COMMAND_NO_LITERAL_TEXT" | awk "$_MASKHEREDOC_AWK"'
+    { buf = buf (NR > 1 ? "\n" : "") $0 }
+    END { printf "%s", mask_heredoc_bodies_selective(buf) }')
+fi
+
 for pattern in "${ALWAYS_BLOCK_PATTERNS[@]}"; do
-    if echo "$COMMAND_NO_LITERAL_TEXT" | grep -qiE "$pattern"; then
+    if echo "$COMMAND_ALWAYS_BLOCK_SCAN" | grep -qiE "$pattern"; then
         deny "BLOCKED: Command matches dangerous pattern: $pattern" "catastrophic:$pattern"
     fi
 done
@@ -2499,10 +2556,39 @@ fi
 # all four DDL statements in one pass (cheaper than a per-pattern loop), and
 # sql_guard_enabled() is consulted only after a match, so the config read stays
 # off the hot path.
+#
+# COMPOSED REDACTION (#5216): unlike every ALWAYS_BLOCK_PATTERNS entry, this
+# check historically scanned COMMAND_NO_COMMENT directly, with NEITHER
+# strip_literal_text()'s quoted-flag-value redaction (#3679) NOR
+# mask_heredoc_bodies_selective()'s heredoc-body masking — so it was on a
+# weaker starting point than its siblings: even a PLAIN, single-line,
+# no-heredoc `--body "an example payload: DROP TABLE users"` already
+# false-positived, not just the heredoc-wrapped shape. COMMAND_SQL_DDL_SCAN
+# below composes both narrowings on top of COMMAND_NO_COMMENT (so the
+# existing #-comment stripping this check already relied on is preserved),
+# mirroring the catastrophic scan's COMMAND_ALWAYS_BLOCK_SCAN above,
+# including its use of the SELECTIVE (interpreter-aware) heredoc masker —
+# see the comment on COMMAND_ALWAYS_BLOCK_SCAN for why plain
+# mask_heredoc_bodies() is not safe for a hard-deny-tier scan. Only ever
+# narrows what is scanned — a live DROP TABLE/etc. outside any quoted flag
+# value, or inside an interpreter-fed heredoc, is unaffected and still
+# denies.
 # =============================================================================
+COMMAND_SQL_DDL_SCAN="$COMMAND_NO_COMMENT"
+if [[ "$COMMAND_NO_COMMENT" == *"--body"* || "$COMMAND_NO_COMMENT" == *"--message"* || \
+      "$COMMAND_NO_COMMENT" == *"--title"* || "$COMMAND_NO_COMMENT" == *"--notes"* || \
+      "$COMMAND_NO_COMMENT" == *"--comment"* || "$COMMAND_NO_COMMENT" == *"-m"* ]]; then
+    COMMAND_SQL_DDL_SCAN=$(strip_literal_text "$COMMAND_SQL_DDL_SCAN")
+fi
+if [[ "$COMMAND_SQL_DDL_SCAN" == *"<<"* ]]; then
+    COMMAND_SQL_DDL_SCAN=$(printf '%s' "$COMMAND_SQL_DDL_SCAN" | awk "$_MASKHEREDOC_AWK"'
+    { buf = buf (NR > 1 ? "\n" : "") $0 }
+    END { printf "%s", mask_heredoc_bodies_selective(buf) }')
+fi
+
 SQL_DDL_PATTERN='DROP DATABASE|DROP TABLE|DROP SCHEMA|TRUNCATE TABLE'
-if echo "$COMMAND_NO_COMMENT" | grep -qiE "$SQL_DDL_PATTERN" && sql_guard_enabled; then
-    matched=$(echo "$COMMAND_NO_COMMENT" | grep -oiE "$SQL_DDL_PATTERN" | head -1)
+if echo "$COMMAND_SQL_DDL_SCAN" | grep -qiE "$SQL_DDL_PATTERN" && sql_guard_enabled; then
+    matched=$(echo "$COMMAND_SQL_DDL_SCAN" | grep -oiE "$SQL_DDL_PATTERN" | head -1)
     deny "BLOCKED: Command matches dangerous pattern: ${matched:-SQL DDL statement}" "sql-ddl"
 fi
 
@@ -2857,10 +2943,35 @@ expand_leading_tilde() {
     esac
 }
 
+# HEREDOC-MASKED WORKING COPY (#5216) — extract_rm_targets() segment-parses
+# with qsplit(), which already understands single/double-quote nesting, but a
+# HEREDOC BODY line is not itself quote-delimited to qsplit(): a `;` inside a
+# backtick-quoted prose example (e.g. a Judge comment body documenting
+# `` `owner/name; rm -rf /` `` as a payload some *other* code correctly
+# rejects) reads as a genuine command separator, producing a spurious
+# `rm -rf /` segment that this scope check then denies — the same construction
+# #5216 fixed for the ALWAYS_BLOCK_PATTERNS scan above (COMMAND_ALWAYS_BLOCK_SCAN),
+# reused here via the same SELECTIVE (interpreter-aware) mask_heredoc_bodies_selective()
+# primitive used above — see the comment on COMMAND_ALWAYS_BLOCK_SCAN for why
+# plain mask_heredoc_bodies() is not safe for a hard-deny-tier scan: it would
+# silently drop a genuinely interpreter-fed `rm -rf /` (e.g.
+# `bash <<'EOF' ... rm -rf / ... EOF`) from RM_TARGETS entirely. Built lazily,
+# only when '<<' is present. Only ever narrows: masking blanks solely the
+# body lines of a NON-interpreter-fed heredoc strictly between its opener and
+# terminating delimiter, so a live (non-heredoc) `rm -rf /` anywhere else in
+# the same command — including a quoted `bash -c 'rm -rf /'` payload or an
+# interpreter-fed heredoc body — is completely untouched and still denies.
+COMMAND_RM_SCAN="$COMMAND"
+if [[ "$COMMAND" == *"<<"* ]]; then
+    COMMAND_RM_SCAN=$(printf '%s' "$COMMAND" | awk "$_MASKHEREDOC_AWK"'
+    { buf = buf (NR > 1 ? "\n" : "") $0 }
+    END { printf "%s", mask_heredoc_bodies_selective(buf) }')
+fi
+
 # Cheap pre-check keeps awk off the hot path for the ~99% of commands that have
 # no recursive/force rm at all.
-if echo "$COMMAND" | grep -qE 'rm[[:space:]]+-[a-zA-Z]*[rf]'; then
-    RM_TARGETS=$(extract_rm_targets "$COMMAND" | head -20)
+if echo "$COMMAND_RM_SCAN" | grep -qE 'rm[[:space:]]+-[a-zA-Z]*[rf]'; then
+    RM_TARGETS=$(extract_rm_targets "$COMMAND_RM_SCAN" | head -20)
 
     for target in $RM_TARGETS; do
         # Skip empty targets
