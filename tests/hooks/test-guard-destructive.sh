@@ -3449,6 +3449,70 @@ rm -rf "$CD_ST2_REPO"
 echo ""
 
 # =========================================================================
+echo -e "${YELLOW}--- Stash-stack scope: worktree-confined baseline stash via worktree.sh stash-push/stash-pop (#5217) ---${NC}"
+# =========================================================================
+#
+# #5217: a legitimate `git stash push && <baseline check> && git stash pop`
+# chain — used to diff a clean baseline against WIP (clippy/shellcheck/test
+# comparisons) — is correctly gated by stash-scope:worktree-collision
+# whenever >=2 managed worktrees are active (nearly always true in this
+# repo), producing an unanswerable `ask` in headless mode. The fix is NOT to
+# widen the guard's own ask condition (a same-chain push/pop heuristic was
+# considered and rejected — see the comment above the worktree-collision ask
+# in guard-destructive-generic.sh — because another worktree's concurrent
+# `git stash push` can still land on the SHARED stack in the window between
+# the two guard-approved Bash calls). Instead, `worktree.sh stash-push` /
+# `stash-pop` (added by #5217) never touch `refs/stash` at all — they anchor
+# WIP to a PER-ISSUE ref — so invoking them is guard-transparent: the text
+# never contains a raw `git stash pop|drop|clear`, so the pattern this block
+# scans for never matches. These tests assert BOTH halves of the fix: the
+# narrowed-safe path is genuinely available, AND raw git stash usage
+# (including a same-chain push/pop, proving the rejected heuristic was NOT
+# adopted) is exactly as gated as before.
+
+ST3_REPO=$(make_wt_repo_two_linked)
+ST3_WT1_DIR="$ST3_REPO/.loom/worktrees/issue-1"
+
+# The sanctioned replacement commands never literally invoke `git stash
+# pop|drop|clear`, so they sail through even with >=2 managed worktrees
+# active and cwd inside a linked worktree — the exact configuration that
+# asks for raw git stash above.
+assert_allow "stash-scope (#5217): worktree.sh stash-push allows from a linked worktree even with >=2 managed worktrees" \
+    "./.loom/scripts/worktree.sh stash-push 1" "$ST3_WT1_DIR"
+assert_allow "stash-scope (#5217): worktree.sh stash-pop allows from a linked worktree even with >=2 managed worktrees" \
+    "./.loom/scripts/worktree.sh stash-pop 1" "$ST3_WT1_DIR"
+assert_allow "stash-scope (#5217): chained stash-push, baseline check, stash-pop allows from a linked worktree" \
+    "./.loom/scripts/worktree.sh stash-push 1 && cat file.txt && ./.loom/scripts/worktree.sh stash-pop 1" "$ST3_WT1_DIR"
+assert_allow "stash-scope (#5217): worktree.sh stash-push --include-untracked allows from a linked worktree" \
+    "./.loom/scripts/worktree.sh stash-push 1 --include-untracked" "$ST3_WT1_DIR"
+
+# Control: raw git stash pop/drop/clear from the SAME fixture must still ask,
+# unchanged — the new commands are an addition, not a relaxation of the
+# existing worktree-collision protection.
+assert_ask "stash-scope (#5217): raw git stash pop from a linked worktree still asks with >=2 managed worktrees" \
+    "git stash pop" "$ST3_WT1_DIR"
+assert_ask "stash-scope (#5217): raw git stash drop from a linked worktree still asks with >=2 managed worktrees" \
+    "git stash drop" "$ST3_WT1_DIR"
+
+# Control: the rejected same-chain heuristic must NOT have been adopted — a
+# raw `git stash push && <cmd> && git stash pop` chain (the shape the
+# original #5217 report described) still asks exactly like a bare pop, since
+# the guard only ever sees the literal 'git stash pop' token in the chain.
+assert_ask "stash-scope (#5217): raw chained 'git stash push && ... && git stash pop' still asks (same-chain heuristic NOT adopted)" \
+    "git stash push -u && cat file.txt && git stash pop" "$ST3_WT1_DIR"
+
+# Control: the updated worktree-collision ask message documents BOTH
+# sanctioned alternatives (snapshot for ad-hoc WIP, stash-push/stash-pop for
+# a baseline-diff comparison) so a headless sweep that hits the ask can see
+# the guard-transparent path without a human needing to explain it.
+assert_ask_reason_matches "stash-scope (#5217): worktree-collision ask message documents the stash-push/stash-pop alternative" \
+    "git stash pop" "stash-push.*stash-pop" "$ST3_WT1_DIR"
+
+rm -rf "$ST3_REPO"
+
+echo ""
+
+# =========================================================================
 echo -e "${YELLOW}--- Performance check ---${NC}"
 # =========================================================================
 
