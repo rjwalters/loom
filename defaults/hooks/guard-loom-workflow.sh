@@ -279,8 +279,14 @@ mask_cat_heredoc_bodies() {
 #
 # mask_var_assigned_heredoc_bodies() masks such a heredoc's body at its point
 # of DEFINITION, but ONLY when it can prove every LATER reference to that same
-# variable ($VAR / ${VAR}) elsewhere in the command is itself confined to a
-# known non-executing text-data flag/field value -- the same allowlist as
+# variable -- in ANY bash form: $VAR, ${VAR}, or any parameter-expansion
+# variant ${VAR:0:100} / ${VAR#pat} / ${VAR:-def} / ... (#5297) -- elsewhere in
+# the command is itself confined to a known non-executing text-data flag/field
+# value, AND that at least one such reference was actually observed. A variable
+# with ZERO detectable references is never masked: it may be reached through an
+# indirection this literal scan cannot see (`${!REF}`, `eval` of a computed
+# name), so leaving the body unmasked (and thus scanned/denied) fails safe. The
+# confinement allowlist is the same as
 # mask_cat_heredoc_bodies/mask_data_flag_values (-m/--message/--body/--notes/
 # --title/--comment/--search, or `gh api -f <field>=`). If ANY later
 # reference to the variable falls OUTSIDE that confined context -- `eval
@@ -382,25 +388,43 @@ mask_var_assigned_heredoc_bodies() {
             vn = cand_var[c]
             vlen = length(vn)
             confined = 1
+            nref = 0
             pos = 1
             while (pos <= buflen) {
                 rem = substr(scanbuf, pos)
-                i1 = index(rem, "$" vn)
-                i2 = index(rem, "${" vn "}")
-                if (i1 == 0 && i2 == 0) break
-                use2 = (i2 > 0 && (i1 == 0 || i2 <= i1))
-                if (use2) {
-                    abspos = pos + i2 - 1
-                    mlen = 3 + vlen
+                # A later reference to the heredoc-assigned variable in ANY
+                # bash form, not just the exact "$VAR" / closed "${VAR}"
+                # literals: the braced search matches "${VAR" as a PREFIX, so
+                # every parameter-expansion variant -- ${VAR}, ${VAR:0:100},
+                # ${VAR#pat}, ${VAR:-def}, ${VAR/a/b}, ... -- is caught (#5297).
+                # The simple "$VAR" form never occurs inside "${VAR" (the char
+                # after "$" is "{", not the name), so the two searches are
+                # disjoint. Whichever occurs first is examined first.
+                ib = index(rem, "${" vn)
+                is = index(rem, "$" vn)
+                if (ib == 0 && is == 0) break
+                useb = (ib > 0 && (is == 0 || ib <= is))
+                if (useb) {
+                    abspos = pos + ib - 1
+                    mlen = 2 + vlen
+                    aftch = substr(scanbuf, abspos + mlen, 1)
+                    if (aftch ~ /^[A-Za-z0-9_]$/) {
+                        # "${VARX..." -- a DIFFERENT variable whose name merely
+                        # starts with vn; skip past this "${" and keep scanning.
+                        pos = abspos + 2
+                        continue
+                    }
                 } else {
-                    abspos = pos + i1 - 1
+                    abspos = pos + is - 1
                     mlen = 1 + vlen
-                    nextch = substr(scanbuf, abspos + mlen, 1)
-                    if (nextch ~ /^[A-Za-z0-9_]$/) {
+                    aftch = substr(scanbuf, abspos + mlen, 1)
+                    if (aftch ~ /^[A-Za-z0-9_]$/) {
+                        # "$VARX" -- a different variable; skip past this "$".
                         pos = abspos + 1
                         continue
                     }
                 }
+                nref++
                 prefix = substr(scanbuf, 1, abspos - 1)
                 if (prefix !~ safe_flag && prefix !~ safe_field) {
                     confined = 0
@@ -408,7 +432,14 @@ mask_var_assigned_heredoc_bodies() {
                 }
                 pos = abspos + mlen
             }
-            cand_mask[c] = confined
+            # Mask ONLY when at least one later reference was found AND every
+            # such reference was confined. Zero detected references is NOT
+            # proof of safety: the variable may be reached through a form this
+            # literal scan cannot see -- indirect expansion `${!REF}`, `eval`
+            # of a computed name, etc. (#5297) -- so a heredoc-assigned body
+            # is left UNMASKED (and thus scanned/denied) unless we positively
+            # observed its every reference confined to a known text-data slot.
+            cand_mask[c] = (confined == 1 && nref > 0) ? 1 : 0
         }
         for (c = 1; c <= ncand; c++) {
             if (cand_mask[c] != 1) continue

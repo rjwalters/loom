@@ -422,6 +422,69 @@ echo "$X" | bash'
 assert_deny "Still block a heredoc-assigned variable with one safe and one unsafe later reference (#5172)" \
     "$GH_5172_MIXED_REF_CMD"
 
+# --- Broaden confinement-reference detection to ALL param-expansion forms (#5297)
+# The #5172 masking scanner recognized ONLY the exact "$VAR" / closed "${VAR}"
+# literals as a later reference. Any OTHER bash parameter-expansion of the same
+# heredoc-assigned variable (${VAR:0:100}, ${VAR#}, ${VAR:-}) was invisible to
+# the scanner, and an undetected reference defaulted to "confined" -- so the
+# heredoc body was masked and the guard never saw the real invocation, even
+# though the variable is genuinely dereferenced and executes at runtime. Each
+# case below assigns a REAL `gh pr merge 123` invocation to the variable via a
+# heredoc, then dereferences it through one of these forms + `eval`: all must
+# still DENY (the guard's deny-on-real-bypass invariant).
+
+# Substring/offset expansion: `eval "${BODY:0:100}"` -- the exact shape Judge
+# reproduced. Pre-fix this ALLOWED (bypass); it must DENY.
+GH_5297_SUBSTR_EVAL_CMD='BODY="$(cat <<'"'"'EOF8'"'"'
+'"$PHRASE_CMD"' 123
+EOF8
+)"
+eval "${BODY:0:100}"'
+assert_deny "Still block heredoc-assigned var eval-d via substring expansion \${VAR:0:100} (#5297)" \
+    "$GH_5297_SUBSTR_EVAL_CMD"
+
+# Prefix-removal expansion: `eval "${BODY#}"`.
+GH_5297_STRIP_EVAL_CMD='BODY="$(cat <<'"'"'EOF9'"'"'
+'"$PHRASE_CMD"' 123
+EOF9
+)"
+eval "${BODY#}"'
+assert_deny "Still block heredoc-assigned var eval-d via prefix-removal expansion \${VAR#} (#5297)" \
+    "$GH_5297_STRIP_EVAL_CMD"
+
+# Default-value expansion: `eval "${BODY:-}"`.
+GH_5297_DEFAULT_EVAL_CMD='BODY="$(cat <<'"'"'EOF10'"'"'
+'"$PHRASE_CMD"' 123
+EOF10
+)"
+eval "${BODY:-}"'
+assert_deny "Still block heredoc-assigned var eval-d via default-value expansion \${VAR:-} (#5297)" \
+    "$GH_5297_DEFAULT_EVAL_CMD"
+
+# Indirect expansion: `REF=BODY; eval "${!REF}"` -- the variable name never
+# appears literally as "$BODY"/"${BODY", so the scanner sees ZERO references.
+# Zero references is NOT proof of safety, so the body must be left UNMASKED and
+# the invocation must still DENY.
+GH_5297_INDIRECT_EVAL_CMD='BODY="$(cat <<'"'"'EOF11'"'"'
+'"$PHRASE_CMD"' 123
+EOF11
+)"
+REF=BODY; eval "${!REF}"'
+assert_deny "Still block heredoc-assigned var eval-d via indirect expansion \${!REF} (#5297)" \
+    "$GH_5297_INDIRECT_EVAL_CMD"
+
+# Control (#5297): the broadened detection must NOT re-introduce the #5172
+# false positive. A heredoc-assigned var whose body only quotes the phrase as
+# prose, referenced through a param-expansion form INSIDE a confined field
+# value (`-f body="${BODY:0:200}"`), stays confined -> masked -> ALLOWED.
+GH_5297_CONFINED_EXPANSION_CMD='BODY="$(cat <<'"'"'EOF12'"'"'
+Tested: '"$PHRASE_CMD"' 123 denied as prose
+EOF12
+)"
+gh api "repos/o/r/issues/1/comments" -f body="${BODY:0:200}"'
+assert_allow "Allow gh api -f body=\${VAR:0:200} where \$VAR is a heredoc quoting the phrase as prose (#5297)" \
+    "$GH_5297_CONFINED_EXPANSION_CMD"
+
 echo ""
 
 # =========================================================================
