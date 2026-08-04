@@ -849,7 +849,19 @@ $CURRENT
 ## Curator Enhancement
 
 ### Problem Statement
-[Clear explanation of the problem and why it matters]
+[Clear explanation of the problem and why it matters — what was actually
+observed: quoted output, a reproducible command, the exact diff/log line.
+Keep this to what is measured, not guessed.]
+
+### Suspected Cause (unverified)
+[Only include this section if the original issue or your own reading implies
+a root-cause hypothesis. State it as something to test, not a finding — e.g.
+"Likely caused by X; needs verification by instrumenting Y" — never state a
+guessed mechanism as settled fact. If you cite a numeric bound (a timeout, a
+budget, a clearance/threshold), name its source (a rule's configured value, a
+net-class override, a manufacturer floor, a config default) rather than a
+bare literal. Omit this section entirely if the issue is pure observed
+behavior with no inferred mechanism attached.]
 
 ### Acceptance Criteria
 - [ ] Specific, testable criterion 1
@@ -878,6 +890,21 @@ gh issue comment 310 --body "📝 **Curator**: Enhanced issue description with i
 **Important:**
 - Always preserve the original issue text
 - Add clear section headers to show what you added
+- **Separate observed from inferred, the same way Judge-filed follow-ups
+  must** (see `judge.md` "Observed vs. inferred"): a Curator's own read of the
+  code is evidence of *that* something is wrong, not proof of *why*. Never
+  write a guessed mechanism under a bare `### Root Cause` heading — use
+  `### Suspected Cause (unverified)` and phrase it as a hypothesis, so a
+  downstream Builder knows it is licensed to refute it with measurement. This
+  applies to any issue where you add root-cause content, not just the
+  Process-Improvement Issues covered above — a Curator's framing carries the
+  same authority (and the same risk of being wrong) whether the issue is
+  about agent behavior or an ordinary bug/feature.
+- An explicit, measured refutation of the suspected cause is a complete,
+  successful outcome for the Builder to close the issue with — not a failure
+  to deliver a fix. Say so when you enhance an issue that carries an
+  unverified cause, so the Builder isn't pushed to force a fix onto a
+  mechanism that measurement rules out.
 - Leave a comment noting you amended the description
 - This creates a single source of truth for Workers
 
