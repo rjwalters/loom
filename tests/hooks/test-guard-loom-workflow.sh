@@ -344,6 +344,86 @@ assert_deny "Still block a real gh pr merge invocation chained after a masked gr
 
 echo ""
 
+# --- False-positive regression tests (issue #5172) -----------------------
+# `gh api`'s `-f <field>=<value>` syntax is a DIFFERENT shape from the
+# `--body <value>` flags #5109/#5115 masked, and a heredoc ASSIGNED TO A
+# SHELL VARIABLE earlier in the command (then only referenced later via that
+# variable) is a two-hop indirection neither #5109 nor #5155 covered. Both
+# shapes are reproduced here from the exact occurrence reported in #5172.
+
+# Reproduction (exact #5172 shape): a heredoc assigned to $BODY, whose prose
+# quotes the disallowed phrase describing test cases, referenced later via
+# `gh api -f body="$BODY"`.
+GH_5172_VAR_HEREDOC_CMD='BODY="$(cat <<'"'"'EOF2'"'"'
+Tested: raw '"$PHRASE_CMD"' 123 denied; echo "'"$PHRASE_CMD"' 123" | bash denied.
+EOF2
+)"
+gh api "repos/rjwalters/loom/issues/5172/comments" -f body="$BODY"'
+assert_allow "Allow gh api -f body=\$VAR where \$VAR is a heredoc quoting the phrase as prose (#5172)" \
+    "$GH_5172_VAR_HEREDOC_CMD"
+
+# A heredoc directly captured (no variable indirection) by `-f body=` must
+# also be recognized -- the `gh api` field-syntax analog of the #5109 `-m`/
+# `--body` case.
+GH_5172_DIRECT_FIELD_HEREDOC_CMD='gh api "repos/o/r/issues/1/comments" -f body="$(cat <<'"'"'EOF5'"'"'
+'"$PHRASE_CMD"' 123 as prose
+EOF5
+)"'
+assert_allow "Allow gh api -f body=\"\$(cat <<EOF ...)\" heredoc captured directly (#5172)" \
+    "$GH_5172_DIRECT_FIELD_HEREDOC_CMD"
+
+# A literal (non-heredoc) `-f body="..."` value quoting the phrase directly.
+assert_allow "Allow gh api -f body=\"...\" literal value quoting the phrase as prose (#5172)" \
+    "gh api \"repos/o/r/issues/1/comments\" -f body=\"Tested: $PHRASE_CMD 123 denied\""
+
+# The variable-indirection fix must generalize beyond `body` to the other
+# known text-bearing `gh api` fields (message here).
+GH_5172_VAR_HEREDOC_MESSAGE_CMD='MSG="$(cat <<'"'"'EOF6'"'"'
+'"$PHRASE_CMD"' 123 as prose in message field
+EOF6
+)"
+gh api "repos/o/r/issues/1/comments" -f message="$MSG"'
+assert_allow "Allow gh api -f message=\$VAR where \$VAR is a heredoc quoting the phrase as prose (#5172)" \
+    "$GH_5172_VAR_HEREDOC_MESSAGE_CMD"
+
+# Regression guard (control, #5172): the two-hop indirection fix must NOT
+# widen the guard into a bypass. A heredoc assigned to a variable that is
+# THEN eval'd is a genuine live invocation and must still deny -- masking a
+# variable-assigned heredoc's body is gated on EVERY later reference to that
+# variable being confined to a known-safe flag/field value; `eval "$CMD"` is
+# not in that allowlist.
+GH_5172_EVAL_BYPASS_CMD='CMD="$(cat <<'"'"'EOF3'"'"'
+'"$PHRASE_CMD"' 123 --admin
+EOF3
+)"
+eval "$CMD"'
+assert_deny "Still block a heredoc-assigned variable later eval'd (two-hop bypass attempt, #5172)" \
+    "$GH_5172_EVAL_BYPASS_CMD"
+
+# Regression guard (control, #5172): a heredoc-assigned variable referenced
+# bare (as a command, not a safe flag/field value) must also still deny.
+GH_5172_BARE_REF_CMD='X="$(cat <<'"'"'EOF4'"'"'
+'"$PHRASE_CMD"' 123
+EOF4
+)"
+$X'
+assert_deny "Still block a heredoc-assigned variable referenced bare as a command (#5172)" \
+    "$GH_5172_BARE_REF_CMD"
+
+# Regression guard (control, #5172): a heredoc-assigned variable referenced
+# TWICE -- once safely (-f body=), once unsafely (piped into bash) -- must
+# still deny. One confined reference does not excuse an unconfined one.
+GH_5172_MIXED_REF_CMD='X="$(cat <<'"'"'EOF7'"'"'
+'"$PHRASE_CMD"' 123
+EOF7
+)"
+gh api "repos/o/r/issues/1/comments" -f body="$X"
+echo "$X" | bash'
+assert_deny "Still block a heredoc-assigned variable with one safe and one unsafe later reference (#5172)" \
+    "$GH_5172_MIXED_REF_CMD"
+
+echo ""
+
 # =========================================================================
 echo -e "${YELLOW}--- pip install -e WORKTREE GUARD (issue #2495) ---${NC}"
 # =========================================================================
