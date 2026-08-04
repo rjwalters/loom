@@ -1055,10 +1055,38 @@ pub fn resolve_enabled(config: &RoleRunnerConfig) -> bool {
     config.enabled.unwrap_or(false)
 }
 
+/// Compute which [`DEFAULT_ROLES`] entries are absent from an explicit
+/// `autonomous.roleRunner.roles` allowlist (#5339) — pulled out as a pure
+/// function, mirroring [`should_warn_disabled_root`], so the "a new default
+/// role shipped but this repo's pinned `roles` list wasn't updated" warning
+/// is unit-testable without captured log output.
+///
+/// An **empty** `names` is a deliberate, documented opt-out ("run none") —
+/// not staleness — so it always returns empty rather than every default.
+#[must_use]
+fn missing_defaults(names: &[String]) -> Vec<&'static str> {
+    if names.is_empty() {
+        return Vec::new();
+    }
+    DEFAULT_ROLES
+        .iter()
+        .filter(|spec| !names.iter().any(|n| n == spec.name))
+        .map(|spec| spec.name)
+        .collect()
+}
+
 /// Resolve the set of roles to dispatch: `config.roles` (by name, matched
 /// against [`DEFAULT_ROLES`], preserving [`DEFAULT_ROLES`] order and ignoring
 /// unknown names with a warning) when present, else every entry in
 /// [`DEFAULT_ROLES`].
+///
+/// `autonomous.roleRunner.roles` is an **allowlist, not an addition**: a repo
+/// that pins it must update it whenever a new role is added to
+/// [`DEFAULT_ROLES`], or that role silently never dispatches (#5339). To
+/// surface that staleness instead of failing silently, this also warns (via
+/// [`missing_defaults`]) for every `DEFAULT_ROLES` entry absent from a
+/// **non-empty** `names` — a genuinely empty allowlist stays quiet, since
+/// that is a deliberate "run none" opt-out rather than a stale list.
 #[must_use]
 pub fn resolve_roles(config: &RoleRunnerConfig) -> Vec<RoleSpec> {
     let Some(names) = &config.roles else {
@@ -1078,6 +1106,12 @@ pub fn resolve_roles(config: &RoleRunnerConfig) -> Vec<RoleSpec> {
                 DEFAULT_ROLES.iter().map(|s| s.name).collect::<Vec<_>>()
             );
         }
+    }
+    for missing in missing_defaults(names) {
+        log::warn!(
+            "role_runner: role {missing:?} is in DEFAULT_ROLES but not in \
+             autonomous.roleRunner.roles — it will not be dispatched"
+        );
     }
     out
 }
@@ -3073,6 +3107,65 @@ mod tests {
         };
         let roles = resolve_roles(&config);
         assert_eq!(roles.iter().map(|r| r.name).collect::<Vec<_>>(), vec!["curator"]);
+    }
+
+    // ===================================================================
+    // missing_defaults (#5339) — the pinned-allowlist-goes-stale warning
+    // ===================================================================
+
+    #[test]
+    fn test_missing_defaults_warns_for_default_absent_from_pinned_list() {
+        // A pinned `roles: ["curator"]` predates `doctor` joining
+        // DEFAULT_ROLES (#5272/#5291) — every other default is silently
+        // missing from the resolved set too, but this asserts the specific
+        // regression from the issue.
+        let names = vec!["curator".to_string()];
+        let missing = missing_defaults(&names);
+        assert!(missing.contains(&"doctor"), "expected \"doctor\" in {missing:?}");
+        // And resolve_roles's actual output omits it, per the allowlist semantics.
+        let config = RoleRunnerConfig {
+            enabled: None,
+            roles: Some(names),
+            interval_secs: None,
+            on_idle: None,
+            model: None,
+            role_models: BTreeMap::new(),
+        };
+        let resolved = resolve_roles(&config);
+        assert!(!resolved.iter().any(|r| r.name == "doctor"));
+    }
+
+    #[test]
+    fn test_missing_defaults_empty_list_is_deliberate_opt_out_no_warning() {
+        // An explicit `"roles": []` means "run none" — not staleness — so it
+        // must not be reported as missing anything.
+        assert_eq!(missing_defaults(&[]), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn test_missing_defaults_empty_when_list_covers_every_default() {
+        let names: Vec<String> = DEFAULT_ROLES.iter().map(|s| s.name.to_string()).collect();
+        assert_eq!(missing_defaults(&names), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn test_resolve_roles_unknown_name_and_missing_default_fire_independently() {
+        // A list with both an unknown name (already-handled case) and a
+        // missing DEFAULT_ROLES entry (#5339) must trigger both warning
+        // paths in the same call without either suppressing the other —
+        // asserted here via each function's independent, testable output.
+        let config = RoleRunnerConfig {
+            enabled: None,
+            roles: Some(vec!["curator".to_string(), "not-a-role".to_string()]),
+            interval_secs: None,
+            on_idle: None,
+            model: None,
+            role_models: BTreeMap::new(),
+        };
+        let roles = resolve_roles(&config);
+        assert_eq!(roles.iter().map(|r| r.name).collect::<Vec<_>>(), vec!["curator"]);
+        let names = vec!["curator".to_string(), "not-a-role".to_string()];
+        assert!(missing_defaults(&names).contains(&"doctor"));
     }
 
     // ===================================================================
