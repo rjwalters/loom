@@ -2033,22 +2033,17 @@ where
                     // Skip while halted: a red-main halt defers everything, so the
                     // token axis is not the (relevant) bottleneck this tick.
                     if !report.halted {
-                        // #5270: `disk.min(ram)` — the token axis no longer
-                        // participates in the real admission cap, so the
-                        // advisory's own "would tokens have been the binding
-                        // term" heuristic must compare against BOTH remaining
-                        // machine-headroom axes, not disk alone. Otherwise a
-                        // RAM-starved host could spuriously read as
-                        // token-bound (deferred > 0 for a RAM reason, but
-                        // token_limit happened to be <= disk) and tell an
-                        // operator to add accounts for a problem accounts
-                        // cannot fix.
+                        // #5305: since #5270 the token axis is not part of the
+                        // dynamic concurrency cap, so this is no longer a
+                        // cross-axis "did tokens bind the tick" comparison —
+                        // `token_limit == 0` (zero healthy accounts) is the
+                        // only condition that fires the add-accounts advisory,
+                        // regardless of which axis (disk/RAM/ceiling) actually
+                        // deferred the work this tick.
                         let assessment = capacity::assess_pressure(
                             ranking.as_ref(),
                             pool_size,
                             token_limit,
-                            disk.min(ram),
-                            configured_max,
                             report.deferred_capacity,
                             capacity::DEFAULT_ADVISORY_MIN_QUEUED,
                         );
@@ -2437,15 +2432,13 @@ pub fn spawn_multi_work_finder_task(
             }
 
             if !report.halted {
-                // #5270: `disk.min(ram)` — see the single-workspace loop above
-                // for why both machine-headroom axes must feed this heuristic
-                // now that the token axis no longer bounds real admission.
+                // #5305: see the single-workspace loop above — `token_bound`
+                // is now a pure starvation check, not a cross-axis comparison
+                // against disk/RAM/ceiling.
                 let assessment = capacity::assess_pressure(
                     ranking.as_ref(),
                     pool_size,
                     token_limit,
-                    disk.min(ram),
-                    configured_max,
                     report.deferred_capacity,
                     capacity::DEFAULT_ADVISORY_MIN_QUEUED,
                 );
@@ -5316,23 +5309,15 @@ exit 0
     // ===================================================================
 
     fn pressured_assessment() -> capacity::PressureAssessment {
-        // token_limit 1 < disk 10, ceiling 10; 12 deferred ⇒ token-bound
-        // + pressured.
+        // token_limit 0 (zero healthy accounts); 12 deferred ⇒ genuinely
+        // token-starved + pressured.
         let snap = capacity::RankingSnapshot {
             total: 7,
-            available: 1,
-            exhausted: 6,
+            available: 0,
+            exhausted: 7,
             ..capacity::RankingSnapshot::default()
         };
-        capacity::assess_pressure(
-            Some(&snap),
-            7,
-            1,
-            10,
-            10,
-            12,
-            capacity::DEFAULT_ADVISORY_MIN_QUEUED,
-        )
+        capacity::assess_pressure(Some(&snap), 7, 0, 12, capacity::DEFAULT_ADVISORY_MIN_QUEUED)
     }
 
     fn calm_assessment() -> capacity::PressureAssessment {
@@ -5342,15 +5327,7 @@ exit 0
             available: 7,
             ..capacity::RankingSnapshot::default()
         };
-        capacity::assess_pressure(
-            Some(&snap),
-            7,
-            7,
-            10,
-            10,
-            0,
-            capacity::DEFAULT_ADVISORY_MIN_QUEUED,
-        )
+        capacity::assess_pressure(Some(&snap), 7, 7, 0, capacity::DEFAULT_ADVISORY_MIN_QUEUED)
     }
 
     #[test]
@@ -5374,7 +5351,7 @@ exit 0
             } => {
                 assert!(pressured);
                 assert_eq!(queued, 12);
-                assert_eq!(healthy_accounts, 1);
+                assert_eq!(healthy_accounts, 0);
                 assert!(message.contains("loom-daemon tokens bootstrap"));
             }
             other => panic!("expected CapacityAdvisory, got {other:?}"),

@@ -2566,21 +2566,32 @@ are ceilings. The JSON status carries the same `capacity_bound` boolean so
 scripted consumers aren't misled at low occupancy either.
 
 **Token-axis probe/daemon disagreement can no longer skew the cap (#4344,
-superseded by #5270).** `resolve_capacity` still prefers a fresh client-side
-`loom-daemon tokens check --json` probe over the daemon's own ranking read for
-the *reported* healthy/total/exhausted account counts (useful, current
-numbers for the account-health line), but since #5270 it no longer
-recomputes its own `effective_cap` / `token_bound` from those counts — both
-are always exactly the daemon's own `report.dynamic_cap` / `false`. The old
+superseded by #5270; re-scoped, not deleted, by #5305).** `resolve_capacity`
+still prefers a fresh client-side `loom-daemon tokens check --json` probe over
+the daemon's own ranking read for the *reported* healthy/total/exhausted
+account counts (useful, current numbers for the account-health line), and
+since #5270 it no longer recomputes its own `effective_cap` from those counts
+— that is always exactly the daemon's own `report.dynamic_cap`. The old
 `#4344` incident (dispatch pinned at a token term of `0 × per-token = 0` for
 ~40 minutes because the daemon's ranking read had diverged from a fresher
-probe) is now structurally impossible for the *cap*: a stale or diverged
+probe) is structurally impossible for the *cap*: a stale or diverged
 `.ranking` can misinform account **selection**, but it can never again pin
-`dynamic_cap` to 0. The historical `⚠ DISPATCH IS TOKEN-STARVED: …` headline
-this section used to describe has been retired for the same reason. The root
-fix for `.ranking` divergence itself — unifying which file
+`dynamic_cap` to 0. `token_bound` itself, however, is **not** hardcoded
+`false` — PR #5304 over-removed it that way (a #5305 fix), permanently
+dead-ending the guidance branch below even with zero healthy accounts.
+`token_bound` now means genuine starvation (zero healthy accounts), decoupled
+from the cap: `loom-daemon status` prints `token-bound: NO healthy accounts —
+the concurrency cap is unaffected (#5270), but every spawn will fail account
+selection…` whenever it holds. The ranking-divergence headline is likewise
+re-scoped rather than retired — renamed `⚠ SPAWN SELECTION IS TOKEN-STARVED: …`
+(from the historical `⚠ DISPATCH IS TOKEN-STARVED: …`) to reflect that only
+account **selection**, not the cap, is at stake when the daemon's own
+`.ranking` read shows 0 healthy while a fresher probe/ranking disagrees. The
+root fix for `.ranking` divergence itself — unifying which file
 [`capacity::read_ranking`] consults — remains in place; see the healthy-token
-row of the "retired" input table above.
+row of the "retired" input table above. See also #5269/PR #5283's per-repo
+ranking-staleness surfacing on `loom-daemon health` — a separate, `health`-side
+mechanism this `status`-side headline must not contradict.
 
 **Session-limit fault handling (#3947).** Stacking can occasionally trip a
 **concurrent-session-limit** fault on a token (the account is healthy but cannot
@@ -2717,14 +2728,18 @@ account health can no longer *slow dispatch down*, only warn about it):
    still exists and is still reported (see the "retired" input table in the
    dynamic-cap section above), but its output no longer bounds anything.
 2. **Alert (advisory only, unchanged posture).** The pressure advisory
-   (`capacity::assess_pressure`) still runs every tick, now comparing the
-   healthy-account count against `disk.min(ram)` (both remaining
-   machine-headroom axes, #5270) rather than disk alone, specifically so a
-   RAM-starved host cannot spuriously read as "token-bound" (deferred > 0 for
-   a RAM reason, with the healthy count merely happening to be ≤ disk). It
-   still exists purely to prompt an operator to add capacity when scarce
-   accounts correlate with a deferred backlog — it is deliberately **not**
-   what gates dispatch (#5270 dropped that role entirely). On the state
+   (`capacity::assess_pressure`) still runs every tick. Its `token_bound`
+   predicate is **not** a cross-axis "is tokens the (co-)minimum of
+   disk/RAM/ceiling" comparison — PR #5304 briefly left it as one
+   (`token_limit <= disk.min(ram) && token_limit <= configured_max`), which
+   false-positived the advisory whenever *any other* axis deferred work while
+   the pool still had healthy accounts left (a #5305 fix). It is now a pure
+   starvation check: `deferred > 0 && token_limit == 0` — zero healthy
+   accounts, full stop, regardless of which axis actually deferred the tick's
+   work. It still exists purely to prompt an operator to add capacity when
+   the pool is genuinely exhausted and a backlog is building — it is
+   deliberately **not** what gates dispatch (#5270 dropped that role
+   entirely). On the state
    change into a pressured reading it emits an add-capacity advisory naming
    concrete levers — add accounts to `~/.claude-monitor/accounts.env` +
    `loom-daemon tokens bootstrap`, or buy API credits, then re-probe with

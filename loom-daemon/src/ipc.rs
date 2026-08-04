@@ -1657,11 +1657,16 @@ pub fn build_daemon_status(
         ram_headroom,
         configured_max,
     );
-    // The token axis no longer bounds the cap (#5270) — `token_bound` is
-    // therefore always `false`. `token_axis_limit` / `per_token_concurrency`
-    // remain on the report as informational account-health figures (they still
-    // drive spawn-time *selection*), but neither one gates admission any more.
-    let token_bound = false;
+    // The token axis no longer bounds the concurrency cap (#5270) —
+    // `token_bound` here does NOT mean "tokens are the binding cap term"; it
+    // means genuine starvation (zero healthy accounts to select from at
+    // spawn time). `token_axis_limit` / `per_token_concurrency` remain on the
+    // report as informational account-health figures (they still drive
+    // spawn-time *selection*), but neither one gates admission any more
+    // (#5305: restoring this as a reachable zero-healthy check, rather than a
+    // hardcoded `false`, so `status_render.rs`'s add-accounts guidance branch
+    // can fire again).
+    let token_bound = token_axis_limit == 0;
     // "Currently binding" vs "smallest ceiling" (#4031): the dynamic cap is the
     // minimum of several ceilings, but a ceiling only *binds* once in-flight
     // occupancy reaches it. Below the cap the limiter is work availability, not
@@ -6241,6 +6246,72 @@ exit 0
         assert!(
             report.capacity_bound,
             "{cap} in-flight against cap {cap} must be capacity-bound",
+        );
+
+        if let Some(v) = prev_shared {
+            std::env::set_var("LOOM_SHARED_TOKENS_DIR", v);
+        } else {
+            std::env::remove_var("LOOM_SHARED_TOKENS_DIR");
+        }
+    }
+
+    /// #5305: `capacity.token_bound` must be reachable again — it was
+    /// hardcoded `false` after #5304, permanently dead-ending the
+    /// `status_render.rs` add-accounts guidance branch. It means genuine
+    /// starvation (zero healthy accounts in the ranking), NOT "tokens bound
+    /// the dynamic cap" (that cross-axis meaning was retired by #5270).
+    #[test]
+    #[serial_test::serial]
+    fn test_build_daemon_status_token_bound_reflects_zero_healthy_accounts() {
+        use crate::main_health_gate::WorkspaceHealthStates;
+        use crate::workspace_registry::REGISTRY_PATH_ENV;
+
+        let (sr, dir, _rec) = setup_sweep_registry_in_tempdir();
+        let root = dir.path().to_path_buf();
+        let empty_reg = dir.path().join("no-such-workspaces.json");
+        std::env::set_var(REGISTRY_PATH_ENV, &empty_reg);
+        let prev_shared = std::env::var("LOOM_SHARED_TOKENS_DIR").ok();
+        std::env::set_var("LOOM_SHARED_TOKENS_DIR", "");
+
+        let tokens_dir = root.join(".loom").join("tokens");
+        std::fs::create_dir_all(&tokens_dir).unwrap();
+        std::fs::write(tokens_dir.join("acct-a.token"), "sk-ant-oat01-a").unwrap();
+        std::fs::write(tokens_dir.join("acct-b.token"), "sk-ant-oat01-b").unwrap();
+        std::fs::write(tokens_dir.join("acct-c.token"), "sk-ant-oat01-c").unwrap();
+
+        let pool = Arc::new(WorkspacePool::new(Arc::new(EventBus::new()), test_runtime_handle()));
+        pool.seed(root.clone(), sr.clone());
+        let health = WorkspaceHealthStates::new();
+
+        // A partially-exhausted pool (1/3 healthy) must NOT report token_bound
+        // — this is the false add-accounts advisory this issue fixes (#5304
+        // over-removal, item 1/2): a healthy account remains, so this is not
+        // starvation, regardless of how the dynamic cap (disk/ram/ceiling)
+        // happens to compare.
+        std::fs::write(
+            tokens_dir.join(".ranking"),
+            "acct-a|available|0.1\nacct-b|exhausted|0.99\nacct-c|exhausted|0.99\n",
+        )
+        .unwrap();
+        let report = build_daemon_status(&pool, &health, &root, &test_credential_preflight());
+        assert_eq!(report.capacity.healthy_accounts, 1);
+        assert!(
+            !report.capacity.token_bound,
+            "one healthy account remains ⇒ not starved, no add-accounts advisory"
+        );
+
+        // Every account exhausted/blocked ⇒ genuinely starved: `token_bound`
+        // must be reachable and true so the operator guidance branch fires.
+        std::fs::write(
+            tokens_dir.join(".ranking"),
+            "acct-a|exhausted|0.99\nacct-b|blocked|0.99\nacct-c|exhausted|0.99\n",
+        )
+        .unwrap();
+        let report = build_daemon_status(&pool, &health, &root, &test_credential_preflight());
+        assert_eq!(report.capacity.healthy_accounts, 0);
+        assert!(
+            report.capacity.token_bound,
+            "zero healthy accounts ⇒ genuinely starved, guidance branch must be reachable"
         );
 
         if let Some(v) = prev_shared {
