@@ -302,6 +302,46 @@ EOF
 assert_deny "Still block gh pr merge in a flag-captured cat <<- heredoc piped into bash (#5122)" \
     "$GH_5122_FLAG_CAPTURED_DASH_PIPE_BASH_CMD"
 
+# --- False-positive regression tests (issue #5155) -----------------------
+# The phrase appearing as INERT TEXT inside a POSITIONAL (no preceding flag
+# name) argument to a known non-executing command must not deny -- only an
+# actual invocation should. Both reproduce the exact occurrences reported in
+# #5155 (a fresh shape not covered by #5109/#5115, which only masked
+# NAMED-flag values).
+
+# Reproduction 1: ./.loom/scripts/check-duplicate.sh's signature is
+# `check-duplicate.sh TITLE DESCRIPTION` (purely positional, no flags). Both
+# the title and description quote the phrase as prose describing this very
+# guard bug.
+GH_5155_CHECK_DUPLICATE_CMD="./.loom/scripts/check-duplicate.sh \"Guard false positive: $PHRASE_CMD redirect\" \"quotes the phrase '$PHRASE_CMD' as inert text, not a live invocation\""
+assert_allow "Allow check-duplicate.sh positional TITLE/DESCRIPTION quoting the phrase as prose" \
+    "$GH_5155_CHECK_DUPLICATE_CMD"
+
+# Reproduction 2: a read-only `grep -n` source-code search whose pattern
+# argument (positional, after the `-n` flag) happens to contain the phrase as
+# search text. `grep` cannot execute anything it searches for.
+assert_allow "Allow grep -n search of the guard's own source for the phrase" \
+    "grep -n \"gh-pr-merge-redirect\\|$PHRASE_CMD\" defaults/hooks/guard-loom-workflow.sh"
+
+# ripgrep cousin of the same shape.
+assert_allow "Allow rg search containing the phrase as a search pattern" \
+    "rg -n \"$PHRASE_CMD\" defaults/hooks/guard-loom-workflow.sh"
+
+# Regression guard: masking must NOT weaken the guard against a command that
+# is NOT in the new positional-arg allowlist -- `echo` piped into `bash` is a
+# genuine (if contrived) execution vector, and `echo` is deliberately absent
+# from the allowlist, so the phrase must remain visible and still deny.
+assert_deny "Still block phrase piped through echo | bash (echo not allowlisted, #5155)" \
+    "echo \"$PHRASE_CMD 123\" | bash"
+
+# Regression guard: masking a matched positional span must not blind the
+# check to a SECOND, real invocation elsewhere on the same command line --
+# masking only narrows what THIS ONE check misses inside the matched
+# grep/rg/check-duplicate.sh argument, it never widens what it misses
+# outside that span.
+assert_deny "Still block a real gh pr merge invocation chained after a masked grep search (#5155)" \
+    "grep -n \"$PHRASE_CMD\" defaults/hooks/guard-loom-workflow.sh && $PHRASE_CMD 123"
+
 echo ""
 
 # =========================================================================
