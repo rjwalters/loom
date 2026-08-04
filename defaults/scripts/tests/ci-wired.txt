@@ -37,6 +37,7 @@ test-check-git-identity.sh
 test-check-host-sleep.sh
 test-check-main-clean.sh
 test-check-main-freshness.sh
+test-check-quarantine-stashes.sh
 test-check-runtime-capabilities.sh
 test-clean-stale-binary.sh
 test-cleanup-branches-pr-review-branch.sh

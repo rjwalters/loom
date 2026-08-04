@@ -464,6 +464,22 @@ in the primary clone (`stash_ref`/`stash_commit` are logged to
 `.loom/logs/main-quarantine.log`) rather than simply finding your branch
 intact.
 
+**Discovering an outstanding quarantine without prior knowledge that one
+occurred (#5185).** Both #5185 incidents above were noticed only by chance —
+an unrelated hygiene command happened to count stashes and flag one that had
+not existed at session start. `git stash list` and the structured
+`.loom/logs/main-quarantine.log` are both authoritative, but neither is
+something an operator thinks to check unprompted. `/loom:sweep` now runs
+`./.loom/scripts/check-quarantine-stashes.sh` before its first wave (see
+"Outstanding Quarantine Stashes" in `defaults/.claude/commands/loom/sweep.md`)
+— a non-blocking, read-only advisory that lists every outstanding
+`loom-quarantine:` stash (its `stash@{N}` selector, age, and run/issue label)
+whenever one exists. Run it manually at any time to check without waiting for
+a sweep:
+```bash
+./.loom/scripts/check-quarantine-stashes.sh
+```
+
 **A note on the quarantine's stash message**: `check-main-clean.sh` passes an
 explicit `-m "loom-quarantine: $QUARANTINE_LABEL"` message to `git stash
 push`, but `git stash list` always prefixes stash entries with `On
