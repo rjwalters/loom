@@ -148,12 +148,30 @@ export LOCAL_MODE
 TARGET_PATH="$(cd "$TARGET_PATH" 2>/dev/null && pwd)" || \
   error "Target path does not exist: $TARGET_PATH"
 
-# If target is inside a worktree, resolve to the main repository root
-MAIN_WORKTREE=$(git -C "$TARGET_PATH" worktree list --porcelain 2>/dev/null | head -4 | grep -m1 '^worktree ' | cut -d' ' -f2- || true)
-if [[ -n "$MAIN_WORKTREE" ]] && [[ "$TARGET_PATH" != "$MAIN_WORKTREE" ]]; then
-  warning "Target path is inside a worktree: $TARGET_PATH"
-  info "Resolving to main repository root: $MAIN_WORKTREE"
-  TARGET_PATH="$MAIN_WORKTREE"
+# If target is inside a worktree, resolve to the main repository root --
+# EXCEPT in --local mode (issue #5240). --local is documented above as
+# "Remove files in working directory (no worktree, no PR)": the caller wants
+# this script to operate exactly on the directory it was given, not on
+# whatever the main repository root happens to be. `install.sh`'s two
+# --quick-reinstall / --clean call sites rely on that contract: they chain
+# this uninstall directly into a synchronous reinstall that runs against the
+# SAME $TARGET_PATH right afterward. When $TARGET_PATH is a linked git
+# worktree, redirecting the uninstall (but not the subsequent reinstall) to
+# the main checkout silently splits the two operations across two different
+# directories -- the uninstall deletes/mutates files in the primary checkout
+# while the reinstall proceeds against the original worktree, corrupting a
+# live sibling checkout that may be in concurrent use. The redirect remains
+# in effect for the default (non-local, worktree+PR) mode, where it is safe:
+# that mode branches its own isolated worktree off origin/main before doing
+# any real work, so resolving the *input* target path to the main repository
+# root here only affects repo identification, never a write target.
+if [[ "$LOCAL_MODE" != "true" ]]; then
+  MAIN_WORKTREE=$(git -C "$TARGET_PATH" worktree list --porcelain 2>/dev/null | head -4 | grep -m1 '^worktree ' | cut -d' ' -f2- || true)
+  if [[ -n "$MAIN_WORKTREE" ]] && [[ "$TARGET_PATH" != "$MAIN_WORKTREE" ]]; then
+    warning "Target path is inside a worktree: $TARGET_PATH"
+    info "Resolving to main repository root: $MAIN_WORKTREE"
+    TARGET_PATH="$MAIN_WORKTREE"
+  fi
 fi
 
 echo ""
