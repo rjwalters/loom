@@ -217,6 +217,41 @@ wire_quick_install_guard_hooks() {
     warning "Project-level guard-hook entries not fully asserted in $target/.claude/settings.json; run scripts/install-loom.sh (Full Install) or re-add them manually — see defaults/docs/guard-hooks.md."
 }
 
+# Regenerate .loom/manifest.json's checksums after this function's caller has
+# finished ALL post-`loom-daemon init` mutations of Loom-tracked files
+# (issue #5279).
+#
+# `loom-daemon init` generates the manifest as its own last internal step
+# (loom-daemon/src/init/post_init.rs::generate_manifest, invoked from
+# loom-daemon/src/init/mod.rs) -- which runs BEFORE `wire_quick_install_guard_hooks`
+# (above) asserts project-level guard-hook entries into `.claude/settings.json`
+# via `ensure_project_hook_wiring`. That means the manifest's stored hash for
+# `.claude/settings.json` reflects its PRE-wiring content, not the genuinely
+# final installed state.
+#
+# Left unfixed, `verify-install.sh verify` reports spurious `DRIFT DETECTED` on
+# `.claude/settings.json` immediately after EVERY quick install -- even a
+# completely vanilla install with zero customization and zero foreign
+# content -- because the on-disk file legitimately changes after the manifest
+# snapshot was taken. This is the concrete, reproducible mechanism behind the
+# "verify-install.sh reports [settings.json] as drift by design" symptom
+# described in #5279 (a stricter, always-reproducible version of it: no
+# foreign/sibling-tool content is even required to trigger it).
+#
+# Call this ONLY after every mutator of Loom-tracked files in the current
+# install path has run (currently: right after `wire_quick_install_guard_hooks`,
+# its last one on the quick-install path). Best-effort: a missing or failing
+# verify-install.sh never aborts the install.
+regenerate_manifest_after_hook_wiring() {
+  local target="$1"
+  local script="$target/.loom/scripts/verify-install.sh"
+
+  if [[ -f "$script" ]]; then
+    ( cd "$target" && bash "$script" generate --quiet ) || \
+      warning "Could not regenerate .loom/manifest.json after guard-hook wiring; 'verify-install.sh verify' may report spurious drift on .claude/settings.json."
+  fi
+}
+
 # Export LOOM_VERSION and LOOM_COMMIT so `loom-daemon init`'s template
 # substitution can fill {{LOOM_VERSION}} / {{LOOM_COMMIT}} placeholders in
 # the CLAUDE.md templates instead of falling back to the literal string
@@ -1180,6 +1215,11 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
     # restores a working guard-hook execution path instead of leaving zero.
     wire_quick_install_guard_hooks "$TARGET_PATH"
 
+    # Regenerate the checksum manifest now that ALL settings.json mutations for
+    # this install path are complete (issue #5279 — see the function's own
+    # comment for why this must run after wire_quick_install_guard_hooks).
+    regenerate_manifest_after_hook_wiring "$TARGET_PATH"
+
     # Issue #3545: reconcile the git index after the uninstall→reinstall cycle.
     # The chained uninstall staged the deletion of every prior Loom file (now
     # scoped to Loom-managed paths — see scripts/uninstall-loom.sh), then
@@ -1584,6 +1624,11 @@ case "$METHOD" in
     # copies that nothing references (the 0.16.0 defaults settings.json has no
     # `hooks` block) and no user-scope wiring at all: zero guard coverage.
     wire_quick_install_guard_hooks "$TARGET_PATH"
+
+    # Regenerate the checksum manifest now that ALL settings.json mutations for
+    # this install path are complete (issue #5279 — see the function's own
+    # comment for why this must run after wire_quick_install_guard_hooks).
+    regenerate_manifest_after_hook_wiring "$TARGET_PATH"
 
     echo ""
     success "Quick installation complete!"
