@@ -559,12 +559,21 @@ _strip_fenced_code_blocks() {
 # are blanked so a backticked mention cannot itself satisfy the line-leading
 # anchor (the #5234 repro used backticks specifically to mark the reference as
 # hypothetical, not live).
+#
+# The second stage extracts `#N` tokens FIRST and only then strips the `#`.
+# Scanning the whole matched span for any digit run would also pick up the
+# numbered-list marker's own ordinal (`3. Part of #789` -> `3` and `789`),
+# which is exactly the false-positive-reopen class this guard exists to
+# prevent: a body carrying both `3. Part of #789` and a genuine `Closes #3`
+# would see #3 registered as a declared partial increment AND a closing
+# reference, and get reopened right after a correct close.
 _partial_increment_refs() {
   { printf '%s\n' "$1" \
       | _strip_fenced_code_blocks \
       | sed -E 's/`[^`]*`//g' \
       | grep -oiE '^[[:space:]]*([-*+>]|[0-9]+\.)?[[:space:]]*(Part of|Contributes to)[[:space:]]+#[0-9]+' \
-      | grep -oE '[0-9]+' \
+      | grep -oE '#[0-9]+' \
+      | tr -d '#' \
       | sort -un; } || true
 }
 

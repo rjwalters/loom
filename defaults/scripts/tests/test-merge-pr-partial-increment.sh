@@ -255,6 +255,14 @@ EOF
 cat > "$STUB_DIR/issue-4574.json" <<'EOF'
 {"state":"open","labels":[{"name":"loom:building"}]}
 EOF
+# PA6 fixtures: a numbered-list declaration `3. Part of #789` whose marker
+# ordinal (3) collides with a genuine `Closes #3` elsewhere in the same body.
+cat > "$STUB_DIR/issue-3.json" <<'EOF'
+{"state":"open","labels":[{"name":"loom:building"}]}
+EOF
+cat > "$STUB_DIR/issue-789.json" <<'EOF'
+{"state":"open","labels":[{"name":"loom:building"}]}
+EOF
 
 # Canned `pulls/<N>/commits` payload: one JSON commit object per message given.
 # Written in the GitHub REST shape the script reads (.[].commit.message).
@@ -474,6 +482,38 @@ list_body='Changes in this increment:
 - Part of #123'
 assert_eq "123" "$(_partial_increment_refs "$list_body")" \
   "List-marker prefix: '- Part of #123' still counts as a declaration"
+
+# PA6: a NUMBERED list marker carries its own digits, which the second-stage
+# extraction must not mistake for an issue number. PA5 only covers a dash
+# marker (no digits to leak), so this case is what caught the regression: with
+# a naive `grep -oE '[0-9]+'` over the whole matched span, `3. Part of #789`
+# yielded BOTH `3` and `789`. Paired with a genuine `Closes #3` elsewhere in
+# the body, that spuriously registers #3 as a declared partial increment AND a
+# closing reference — the exact false-positive-reopen shape #5234 exists to
+# eliminate, reintroduced through the list-marker support itself.
+numbered_body='Changes in this increment:
+
+3. Part of #789
+
+Closes #3'
+assert_eq "789" "$(_partial_increment_refs "$numbered_body")" \
+  "Numbered list marker: '3. Part of #789' yields ONLY 789 — the marker ordinal 3 does not leak"
+
+reset_log
+PR_JSON="$(jq -n --arg body "$numbered_body" '{body: $body}')"
+_check_partial_increment_close_conflict 2>/dev/null
+assert_eq "" "$PARTIAL_CONFLICT_ISSUES" \
+  "Numbered list marker: no conflict — 'Closes #3' stands, #3 is not a partial-increment ref"
+assert_eq "789" "$PARTIAL_OPEN_BEFORE_MERGE" \
+  "Numbered list marker: only the real declaration target (#789) is tracked as open before the merge"
+
+# PA7: blockquote marker (`>`), the other marker branch the regex claims to
+# support and that no test previously exercised.
+quoted_body='Context from the epic:
+
+> Part of #456'
+assert_eq "456" "$(_partial_increment_refs "$quoted_body")" \
+  "Blockquote marker: '> Part of #456' still counts as a declaration"
 
 echo ""
 echo "Testing _check_partial_increment_close_conflict (pre-merge guard)..."
