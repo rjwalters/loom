@@ -410,6 +410,73 @@ carries `assessment_failed` / `assessment_errors` for automation.
 - Issues without PRs older than threshold are flagged/recovered
 - Issues with stale PRs are flagged but not auto-recovered (need manual review)
 
+### Uncommitted work in the primary clone can be quarantined at any time — branching does not protect it (#5194)
+
+**Symptom**: uncommitted edits made directly in a Loom-managed repo's **primary
+clone** (the main checkout, not a `.loom/worktrees/issue-N` linked worktree)
+disappear. This happens even when the edits were made on a feature branch, not
+on `main` — checking out a branch first feels like it should be "safe," but it
+is not.
+
+**Root cause**: `check-main-clean.sh --quarantine` (see the Wave Lifecycle
+"Backstop" step in `defaults/.claude/commands/loom/sweep.md`) polices the
+**primary clone's working tree as a whole**, keyed on `git rev-parse
+--show-toplevel`/`--git-common-dir`, not on the currently checked-out branch.
+A concurrent `/loom:sweep` (interactively, via the daemon, or via cron) that
+snapshots the primary clone and later finds it dirty will stash-quarantine
+**every** offending path in one `git stash push --include-untracked`, whichever
+branch happens to be checked out at that moment. It has no way to know "this
+dirt is on a branch I don't own" — from its point of view, any uncommitted
+change in the primary clone that was not there at snapshot time is
+contamination, full stop.
+
+**Branching is NOT sufficient protection.** This is the first (and wrong)
+inference people make: "I'm not on `main`, so a sweep can't touch my WIP."
+Twice in one session, uncommitted work in the primary clone was lost this way
+even though it lived on a dedicated branch — see #5185 and
+[rjwalters/repo#89](https://github.com/rjwalters/repo/issues/89) for the
+incidents that prompted this note. The quarantine backstop exists precisely
+because *something* wrote to the primary clone's working tree outside of a
+worktree — it does not, and should not, special-case "but it's on a branch."
+
+**The only patterns that actually protect uncommitted work**:
+
+1. **Create a worktree outside the policed clone** and do the work there:
+   ```bash
+   git worktree add /path/outside/the/clone some-branch
+   ```
+   A sibling directory (or anywhere off the main checkout's `git
+   rev-parse --show-toplevel`) is never touched by `check-main-clean.sh`,
+   because it only ever inspects the primary clone's own working tree. This is
+   exactly what `./.loom/scripts/worktree.sh <issue-number>` gives you under
+   `.loom/worktrees/issue-N` — use it (or a hand-rolled `git worktree add`
+   pointed elsewhere) for any WIP you want to survive a sweep, rather than
+   editing directly in the primary clone.
+2. **Commit before a sweep can fire.** A commit is not "dirt" — the backstop
+   only quarantines the working tree's uncommitted delta against its snapshot
+   baseline, so committed history on any branch is unaffected regardless of
+   which branch is checked out when a sweep runs.
+
+Checking out a branch and leaving changes **uncommitted** in the primary clone
+protects against neither: the working tree is still what gets swept into a
+stash rescue ref, and recovering it means digging through `git stash list`
+in the primary clone (`stash_ref`/`stash_commit` are logged to
+`.loom/logs/main-quarantine.log`) rather than simply finding your branch
+intact.
+
+**A note on the quarantine's stash message**: `check-main-clean.sh` passes an
+explicit `-m "loom-quarantine: $QUARANTINE_LABEL"` message to `git stash
+push`, but `git stash list` always prefixes stash entries with `On
+<branch>:` regardless of the `-m` message supplied — so a quarantined stash
+reads as e.g. `On some-branch: loom-quarantine: run=... issue=...`, which can
+itself read as "this was scoped to `some-branch`" even though the quarantine
+is whole-working-tree, not branch-scoped. Changing that format is out of
+scope here — `stash_message` is also emitted as a structured field in the
+`main-clean.quarantine` JSON log line, and other tooling may parse either
+form — but if you are debugging a quarantine, read the `On <branch>:` prefix
+as "which branch happened to be checked out at quarantine time," not as
+"which branch's changes were protected."
+
 ## Several unrelated things hang at once (macOS Gatekeeper / `syspolicyd`)
 
 **Symptom:** several unrelated processes — a `cargo` build, a sweep child, a

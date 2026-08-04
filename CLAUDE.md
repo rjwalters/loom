@@ -258,11 +258,15 @@ missing/exhausted pool exits `78` (`EX_CONFIG`). Full reference:
 
 See [`.loom/docs/troubleshooting.md`](.loom/docs/troubleshooting.md) for stale
 worktrees, stuck agents, daemon registry/event-bus/reaper issues, host-sleep and
-`.loom/` resync procedures, and common fixes. Quick fixes: `loom-clean --force`
-(stale worktrees/branches), `loom-recover-orphans --recover` (orphaned
-`loom:building` issues), `gh label sync --file .github/labels.yml` (re-sync
-labels), `loom-daemon cancel --issue <N>` / `mcp__loom__cancel_sweep` (cancel a
-running sweep — never hand-`kill` its pids, #4980).
+`.loom/` resync procedures, quarantine safety, and common fixes. Quick fixes:
+`loom-clean --force` (stale worktrees/branches), `loom-recover-orphans
+--recover` (orphaned `loom:building` issues), `gh label sync --file
+.github/labels.yml` (re-sync labels), `loom-daemon cancel --issue <N>` /
+`mcp__loom__cancel_sweep` (cancel a running sweep — never hand-`kill` its
+pids, #4980). **Branching does not protect uncommitted edits in the primary
+clone from quarantine** — see [`.loom/docs/troubleshooting.md` →
+Uncommitted work in the primary clone can be quarantined at any
+time](.loom/docs/troubleshooting.md).
 
 ## Migration History
 
