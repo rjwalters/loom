@@ -3335,6 +3335,85 @@ rm -rf "$ST2_REPO" "$ST2_REPO_OFF"
 echo ""
 
 # =========================================================================
+echo -e "${YELLOW}--- Stash-stack scope: cd-prefix threading (#5173) ---${NC}"
+# =========================================================================
+#
+# Regression: the hook's reported session cwd can still be the MAIN repo root
+# while the COMMAND itself first `cd`s into a linked worktree and restores a
+# stash entry there — a routine, safe operation per this repo's own CLAUDE.md
+# worktree workflow (`cd .loom/worktrees/issue-N && git stash pop`). Before
+# the #5173 fix, main-checkout/worktree-collision scope resolution fell back
+# to the raw session cwd whenever no `cd` prefix was accounted for, so it
+# queried the MAIN checkout (protected) instead of the worktree the command
+# actually targets, and incorrectly asked citing the main checkout. Mirrors
+# the fixture pattern from #5156/PR #5161's cd-tracking fix for
+# parse_force_ops(). A REAL linked `git worktree add` fixture is used (not a
+# plain subdirectory) so the worktree genuinely has its own toplevel/common-dir
+# divergence, mirroring make_wt_repo_linked above.
+
+CD_ST_REPO=$(make_wt_repo_linked)
+CD_ST_WT_DIR="$CD_ST_REPO/.loom/worktrees/issue-1"
+
+# Hook cwd = MAIN repo root; command cd's into the worktree, then restores a
+# stash entry there -> must ALLOW (the false-ask this issue fixes). Only ONE
+# managed worktree exists, so the worktree-collision branch (#4821) must not
+# fire either.
+assert_allow "stash-scope (#5173): cd into worktree then stash pop allows (hook cwd=main root)" \
+    "cd $CD_ST_WT_DIR && git stash pop" "$CD_ST_REPO"
+assert_allow "stash-scope (#5173): cd into worktree then stash drop allows (hook cwd=main root)" \
+    "cd $CD_ST_WT_DIR && git stash drop" "$CD_ST_REPO"
+assert_allow "stash-scope (#5173): cd into worktree then stash clear allows (hook cwd=main root)" \
+    "cd $CD_ST_WT_DIR && git stash clear" "$CD_ST_REPO"
+# A read-only prefix ahead of the cd must not break resolution.
+assert_allow "stash-scope (#5173): chained 'cd <worktree> && git status && git stash pop' allows (hook cwd=main root)" \
+    "cd $CD_ST_WT_DIR && git status && git stash pop" "$CD_ST_REPO"
+
+# Same effective operation with the hook cwd already AT the worktree -> must
+# also ALLOW (already correct pre-fix; kept as a matching control, #5161-style).
+assert_allow "stash-scope (#5173): cd into worktree (redundant) then stash pop allows (hook cwd=worktree already)" \
+    "cd $CD_ST_WT_DIR && git stash pop" "$CD_ST_WT_DIR"
+
+# Control: cd-ing BACK into the main (protected) checkout root must still ASK
+# citing the main-checkout reason -- the fix must never widen an allow past a
+# genuine main-checkout stash restore.
+assert_ask_reason_matches "stash-scope (#5173): cd into main root then stash pop still asks (hook cwd=worktree)" \
+    "cd $CD_ST_REPO && git stash pop" "MAIN checkout" "$CD_ST_WT_DIR"
+
+# Control: cd into a directory that does not exist / is not a git checkout
+# must stay ambiguous -> ASK, never silently allow ("never widen a deny/ask
+# into an allow").
+assert_ask_reason_matches "stash-scope (#5173): cd into an unresolvable directory still asks (ambiguous)" \
+    "cd /nonexistent-dir-5173-does-not-exist && git stash pop" "could not be resolved" "$CD_ST_REPO"
+
+rm -rf "$CD_ST_REPO"
+
+# Worktree-collision (#4821) consistency: the SAME cd-threaded
+# _stash_toplevel/_stash_common_parent resolution feeds both checks, so a
+# cd-prefixed stash op resolving into a linked worktree (not the main
+# checkout) while >=2 managed worktrees are active must ask citing the
+# COLLISION reason -- not the main-checkout reason a raw-cwd-only resolution
+# would have (incorrectly) produced.
+CD_ST2_REPO=$(make_wt_repo_two_linked)
+CD_ST2_WT1_DIR="$CD_ST2_REPO/.loom/worktrees/issue-1"
+CD_ST2_WT2_DIR="$CD_ST2_REPO/.loom/worktrees/issue-2"
+
+assert_ask_reason_matches "stash-scope (#5173): cd into worktree-1 then stash pop asks with collision reason (hook cwd=main root, >=2 worktrees)" \
+    "cd $CD_ST2_WT1_DIR && git stash pop" "ANOTHER builder's WIP" "$CD_ST2_REPO"
+assert_ask_reason_matches "stash-scope (#5173): cd from worktree-1 into worktree-2 then stash drop asks with collision reason" \
+    "cd $CD_ST2_WT2_DIR && git stash drop" "ANOTHER builder's WIP" "$CD_ST2_WT1_DIR"
+
+# Toggle opt-out also covers the cd-prefixed form (guards.stashScope:false /
+# LOOM_GUARD_STASH_SCOPE=0, default on).
+mkdir -p "$CD_ST2_REPO/.loom"
+printf '%s' '{"guards":{"stashScope":false}}' > "$CD_ST2_REPO/.loom/config.json"
+assert_allow "stash-scope (#5173): guards.stashScope:false -> allow for cd-prefixed stash pop into worktree" \
+    "cd $CD_ST2_WT1_DIR && git stash pop" "$CD_ST2_REPO"
+
+rm -rf "$CD_ST2_REPO"
+
+echo ""
+
+# =========================================================================
 echo -e "${YELLOW}--- Performance check ---${NC}"
 # =========================================================================
 

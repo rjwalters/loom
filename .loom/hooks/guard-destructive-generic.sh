@@ -1740,6 +1740,64 @@ parse_force_ops() {
     }'
 }
 
+# resolve_stash_cwd() — thread a `cd <dir> &&` prefix through $CWD resolution
+# for the STASH-STACK SCOPE block below, exactly mirroring parse_force_ops'
+# cd-tracking above (which itself mirrors extract_write_targets,
+# #4933/#4881/#5156/#5161). Without this, a command of the form `cd
+# .loom/worktrees/issue-N && git stash pop` — hook session cwd still the main
+# repo root, the common shape per this repo's own CLAUDE.md worktree workflow
+# — resolved stash scope against the WRONG checkout and asked as if the
+# operation targeted the main checkout (#5173).
+#
+# $1 = command text, $2 = starting cwd (the hook's own session cwd — callers
+# pass $CWD). Returns the cwd IN EFFECT once the FIRST `git stash
+# pop/drop/clear` segment is reached; if no such segment is found (should not
+# happen — callers only invoke this after the same grep match already
+# succeeded), returns the fully cd-threaded cwd after the LAST segment as a
+# deterministic fallback. `cd -` and a bare `cd` leave curcwd UNCHANGED —
+# same known limitation parse_force_ops documents, left unresolved rather
+# than guessed.
+#
+# A `git -C <path> stash ...` prefix is NOT threaded here (matches this
+# block's pre-existing KNOWN LIMITATION comment above the caller, a distinct
+# false-NEGATIVE direction out of this issue's scope) — only a `cd <dir>`
+# prefix is.
+resolve_stash_cwd() {
+    printf '%s' "$1" | awk -v startcwd="$2" "$_QSPLIT_AWK"'
+    BEGIN { curcwd = startcwd; found = 0 }
+    {
+        $0 = qsplit($0)   # quote-aware segmentation (#3755)
+        n = split($0, segs, "\n")
+        for (i = 1; i <= n; i++) {
+            seg = segs[i]
+            sub(/^[ \t]+/, "", seg)
+            sub(/^sudo[ \t]+/, "", seg)
+            sub(/^[ \t]+/, "", seg)
+            if (seg == "") continue
+            m = split(seg, toks, /[ \t]+/)
+            if (m == 0) continue
+            # Thread a `cd <dir>` prefix through LATER segments of this same
+            # compound command (mirrors parse_force_ops above).
+            if (toks[1] == "cd") {
+                if (m >= 2 && toks[2] != "" && toks[2] != "-") {
+                    if (toks[2] ~ /^\//) {
+                        curcwd = toks[2]
+                    } else if (curcwd != "") {
+                        curcwd = curcwd "/" toks[2]
+                    }
+                }
+                continue
+            }
+            if (toks[1] == "git" && m >= 3 && toks[2] == "stash" && (toks[3] == "pop" || toks[3] == "drop" || toks[3] == "clear")) {
+                print curcwd
+                found = 1
+                exit
+            }
+        }
+    }
+    END { if (!found) print curcwd }'
+}
+
 # Redact the quoted VALUES of known text-carrying flags (--body, -m/--message,
 # --title, --notes, --comment) so a dangerous-looking phrase quoted INSIDE such a
 # value no longer trips the raw ALWAYS_BLOCK_PATTERNS substring scan (catastrophic
@@ -3298,6 +3356,18 @@ fi
 # ask inside a builder's own worktree too. The show-toplevel/common-dir
 # comparison sidesteps that entirely.
 #
+# CD-PREFIX THREADING (#5173): unlike the raw $CWD comparison this replaced,
+# resolve_stash_cwd() (defined above, mirrors parse_force_ops' cd-tracking
+# from #5156/#5161) threads a `cd <dir> &&` prefix earlier in the SAME
+# compound $COMMAND through to the stash pop/drop/clear invocation, so a
+# command like `cd .loom/worktrees/issue-N && git stash pop` — hook session
+# cwd still the main repo root, the common shape per this repo's own
+# CLAUDE.md worktree workflow — resolves scope against the cd TARGET, not the
+# hook's raw session cwd. Both the main-checkout ask below AND the
+# worktree-collision ask (#4821) further down consume the SAME
+# _stash_toplevel/_stash_common_parent values, so both get this treatment
+# for free.
+#
 # KNOWN LIMITATION: unlike the force-op parser (parse_force_ops), this check
 # does not thread a `git -C <path>` argument — `git -C <main-checkout-path>
 # stash pop` run from a worktree cwd is not caught today. Track any observed
@@ -3319,16 +3389,22 @@ fi
 # =============================================================================
 if echo "$COMMAND_ASK_SCAN" | grep -qE '(^|[;&|(]|[[:space:]])git[[:space:]]+stash[[:space:]]+(pop|drop|clear)([[:space:]]|$)' \
    && stash_scope_guard_enabled; then
+    _stash_effective_cwd="$CWD"
+    if [[ -n "$CWD" ]]; then
+        _stash_effective_cwd=$(resolve_stash_cwd "$COMMAND_NO_COMMENT" "$CWD")
+        [[ -z "$_stash_effective_cwd" ]] && _stash_effective_cwd="$CWD"
+    fi
+
     _stash_toplevel=""
     _stash_common_parent=""
-    if [[ -n "$CWD" && -d "$CWD" ]]; then
-        _stash_toplevel=$(cd "$CWD" 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null) || _stash_toplevel=""
+    if [[ -n "$_stash_effective_cwd" && -d "$_stash_effective_cwd" ]]; then
+        _stash_toplevel=$(cd "$_stash_effective_cwd" 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null) || _stash_toplevel=""
         [[ -n "$_stash_toplevel" && -d "$_stash_toplevel" ]] && \
             _stash_toplevel=$(cd "$_stash_toplevel" 2>/dev/null && pwd -P) || _stash_toplevel=""
 
-        _stash_common=$(cd "$CWD" 2>/dev/null && git rev-parse --git-common-dir 2>/dev/null) || _stash_common=""
+        _stash_common=$(cd "$_stash_effective_cwd" 2>/dev/null && git rev-parse --git-common-dir 2>/dev/null) || _stash_common=""
         if [[ -n "$_stash_common" ]]; then
-            _stash_common_parent=$(cd "$CWD" 2>/dev/null && cd "$_stash_common/.." 2>/dev/null && pwd -P) || _stash_common_parent=""
+            _stash_common_parent=$(cd "$_stash_effective_cwd" 2>/dev/null && cd "$_stash_common/.." 2>/dev/null && pwd -P) || _stash_common_parent=""
         fi
     fi
 
@@ -3349,6 +3425,12 @@ if echo "$COMMAND_ASK_SCAN" | grep -qE '(^|[;&|(]|[[:space:]])git[[:space:]]+sta
         if [[ "$_stash_worktree_count" -ge 2 ]]; then
             ask "Command requires confirmation: $COMMAND (git stash pop/drop/clear from a linked worktree can destroy ANOTHER builder's WIP — refs/stash is a single stack SHARED across every linked worktree of this repo, not per-worktree, and $_stash_worktree_count managed worktrees are currently active. Use './.loom/scripts/worktree.sh snapshot <issue-number>' instead of git stash for ad-hoc WIP; set guards.stashScope:false / LOOM_GUARD_STASH_SCOPE=0 to disable this ask)" "stash-scope:worktree-collision"
         fi
+    elif [[ "$_stash_effective_cwd" != "$CWD" ]]; then
+        # A `cd <dir>` prefix resolved to a target that does not exist or is
+        # not inside any git checkout — ambiguous. Never silently widen an
+        # ask into an allow (mirrors parse_force_ops' detached-HEAD fail-safe
+        # from #5156/#5161): fail toward asking rather than guessing.
+        ask "Command requires confirmation: $COMMAND (the cd target for this stash operation could not be resolved to a git checkout, so scope cannot be determined — refusing to silently allow an ambiguous stash pop/drop/clear; set guards.stashScope:false / LOOM_GUARD_STASH_SCOPE=0 to disable this ask)" "stash-scope:cd-unresolved"
     fi
 fi
 
