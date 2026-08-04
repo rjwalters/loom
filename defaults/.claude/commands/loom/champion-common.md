@@ -141,7 +141,7 @@ bare `state == OPEN` read — whenever the referenced issue carries
 `loom:epic`. This works without `LOOM_EPIC_SUPERVISOR` being enabled anywhere
 (that daemon mechanism only reconciles epics inside its own registered
 workspace and cannot see across repos — see
-[`daemon-reference.md`'s "Epic supervisor"](../../../.loom/docs/daemon-reference.md)
+[`daemon-reference.md`'s "Epic supervisor"](https://github.com/rjwalters/loom/blob/main/defaults/docs/daemon-reference.md#epic-supervisor-3842)
 section for how the two complement each other).
 
 ### Step 1 — parse the reference (cross-repo aware)
@@ -186,9 +186,12 @@ extract_blocker_refs() {
 
 ```bash
 # BLOCKER_REPO / BLOCKER_NUM set by parse_blocker_ref above.
-# Cached ("$GH_READ" if available) — this classifies a dependency, it is not
-# itself a merge/claim gate.
-BLOCKER_JSON=$(gh issue view "$BLOCKER_NUM" --repo "$BLOCKER_REPO" --json state,labels,comments 2>/dev/null)
+# Cached (${GH_READ:-gh}) — this classifies a dependency, it is not itself a
+# merge/claim gate, so a cached read is fine. ${GH_READ:-gh} uses the caller's
+# 30s-TTL cached reader when it has defined one (champion-pr-merge.md,
+# champion-issue-promo.md) and falls back to plain `gh` otherwise — this file is
+# shared, so it must not assume $GH_READ is always set.
+BLOCKER_JSON=$(${GH_READ:-gh} issue view "$BLOCKER_NUM" --repo "$BLOCKER_REPO" --json state,labels,comments 2>/dev/null)
 BLOCKER_STATE=$(printf '%s\n' "$BLOCKER_JSON" | jq -r '.state // "OPEN"')
 IS_EPIC=$(printf '%s\n' "$BLOCKER_JSON" | jq -e '.labels[] | select(.name=="loom:epic")' >/dev/null && echo yes || echo no)
 
@@ -202,8 +205,9 @@ else
   # number for the "should I create phase N+1" question) to the "is this whole
   # epic's delivered capability done" question instead. One list call per
   # epic, filtered locally, rather than one `gh issue list --search=...` call
-  # per phase.
-  CHILDREN=$(gh issue list --repo "$BLOCKER_REPO" --label="loom:epic-phase" --state=all --limit=500 \
+  # per phase. Cached (${GH_READ:-gh}) — a classification read, same rationale
+  # as the BLOCKER_JSON read above; falls back to plain `gh` when unset.
+  CHILDREN=$(${GH_READ:-gh} issue list --repo "$BLOCKER_REPO" --label="loom:epic-phase" --state=all --limit=500 \
     --json number,state,body \
     --jq --arg marker "loom:epic:$BLOCKER_NUM:phase:" \
       '[.[] | select(.body | contains($marker))]')
