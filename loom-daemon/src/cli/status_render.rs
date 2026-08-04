@@ -34,13 +34,21 @@ struct ResolvedCapacity {
     healthy: usize,
     exhausted: usize,
     /// Health-adjusted token axis (healthy accounts, or the raw pool as a
-    /// fallback) — the "healthy tokens" input to the dynamic concurrency cap.
+    /// fallback) — an *informational* account-health figure (drives spawn-time
+    /// selection), not a cap input since #5270.
     token_axis_limit: usize,
-    /// The effective dynamic cap consistent with `token_axis_limit`:
-    /// `min(token_axis_limit, disk_headroom, configured_max)` (the CPU term
-    /// added in #3978 was removed in #4512).
+    /// The effective dynamic cap. Always exactly `report.dynamic_cap` (#5270)
+    /// — the token axis was removed from the admission formula entirely, so
+    /// there is nothing left for a client-side probe to recompute here; using
+    /// the daemon's own authoritative figure guarantees this can never drift
+    /// from what `min(disk, ram, configured_max)` actually evaluates to,
+    /// unlike the pre-#5270 client-side `token_axis_effective.min(...)`
+    /// recomputation this superseded (which could disagree with the daemon
+    /// when accounts were scarce).
     effective_cap: usize,
-    /// Whether the token axis is the binding (minimum) constraint.
+    /// Whether the token axis is the binding (minimum) constraint. Always
+    /// `false` since #5270 — mirrors `report.capacity.token_bound`, which the
+    /// daemon itself now always reports as `false` for the same reason.
     token_bound: bool,
 }
 
@@ -68,20 +76,15 @@ fn resolve_capacity(
                 .collect();
             let cap = loom_daemon::capacity::summarize_probe(pairs.iter().copied());
             let token_axis_limit = cap.healthy;
-            // The token axis of the cap is `healthy × per-token` (#3947); treat a
-            // pre-#3947 wire `0` as the effective floor of 1.
-            let factor = report.per_token_concurrency.max(1);
-            let token_axis_effective = token_axis_limit.saturating_mul(factor);
-            // #4512: the cap is min(token axis, disk, configured max). A
-            // pre-#4512 daemon still SENDS a `cpu_headroom` field; serde ignores
-            // it, and we deliberately do not reintroduce it into the client-side
-            // recomputation — the daemon's own `dynamic_cap` (shown as the
-            // headline below) remains the authority either way.
-            let effective_cap = token_axis_effective
-                .min(report.disk_headroom)
-                .min(report.configured_max);
-            let token_bound = token_axis_effective <= report.disk_headroom
-                && token_axis_effective <= report.configured_max;
+            // #5270: the token axis no longer participates in the cap on any
+            // auth path — a fresh client-side probe changes the *reported*
+            // account-health figures (total/healthy/exhausted/token_axis_limit
+            // above), but must NOT re-derive its own `effective_cap` /
+            // `token_bound` from them the way the pre-#5270 formula did (that
+            // recomputation could disagree with the daemon whenever accounts
+            // were scarce, which is exactly the artificial cap this issue
+            // removes). The daemon's own `dynamic_cap` — `min(disk, ram,
+            // configured_max)` — is the sole authority.
             return ResolvedCapacity {
                 source: "probe",
                 ranking_present: true,
@@ -89,8 +92,8 @@ fn resolve_capacity(
                 healthy: cap.healthy,
                 exhausted: cap.exhausted,
                 token_axis_limit,
-                effective_cap,
-                token_bound,
+                effective_cap: report.dynamic_cap,
+                token_bound: false,
             };
         }
     }
@@ -194,9 +197,16 @@ pub(crate) fn build_status_json_value(
             // whatever cwd `loom-daemon status` itself was run from.
             "token_pool_dir": report.token_pool_dir,
             "disk_headroom": report.disk_headroom,
+            // RAM headroom (#5270) — the second machine-headroom cap term
+            // alongside disk_headroom, since the token axis stopped bounding
+            // admission on any auth path.
+            "ram_headroom": report.ram_headroom,
             // Host CPU OBSERVATIONS (#3978/#4031), not cap terms: #4512 removed
             // the CPU headroom term from admission. Reported because observed
             // idle is the evidence for tuning `configured_max` on this machine.
+            // The separate CPU saturation admission brake (#4903, retuned by
+            // #5270) DOES gate admission — see the `admission_brake` block
+            // below for its live held/threshold state.
             "logical_cpus": report.logical_cpus,
             "loadavg_1m": report.loadavg_1m,
             "cpu_idle_fraction": report.cpu_idle_fraction,
@@ -913,24 +923,16 @@ pub(crate) fn print_status_human(
     let dispatch_token_axis = report.capacity.token_axis_limit;
     println!("\nDynamic concurrency cap: {dispatch_cap}  (the number dispatch uses)");
     println!(
-        "  = min(healthy {} × per-token {} = {}, disk headroom {}, \
-         configured max {})",
+        "  = min(disk headroom {}, ram headroom {}, configured max {})",
+        report.disk_headroom, report.ram_headroom, report.configured_max
+    );
+    println!(
+        "  (healthy {} × per-token {} = {} is informational only — the token axis no longer \
+         bounds the cap, #5270)",
         dispatch_token_axis,
         factor,
         dispatch_token_axis.saturating_mul(factor),
-        report.disk_headroom,
-        report.configured_max
     );
-    if rc.source == "probe" && rc.effective_cap != dispatch_cap {
-        println!(
-            "  fresh probe suggests: {} (healthy {} × per-token {} = {}) — not yet reflected in \
-             dispatch; if this persists, refresh with `loom-daemon tokens check --ranking`.",
-            rc.effective_cap,
-            rc.token_axis_limit,
-            factor,
-            rc.token_axis_limit.saturating_mul(factor)
-        );
-    }
     // Host CPU OBSERVATION (#3978 AC4; measured-idle signal #4031) — since
     // #4512 this is deliberately NOT a cap term: it is the evidence an operator
     // uses to decide whether this machine's `maxConcurrent` should go up (host
@@ -979,16 +981,17 @@ pub(crate) fn print_status_human(
     // the daemon itself used, which previously let "not capacity-bound" print
     // even while the daemon's real (lower) cap was already saturated.
     let capacity_bound = report.in_flight.len() >= dispatch_cap;
-    // #4344: the daemon's own dispatch decision reads 0 healthy accounts while
-    // a fresher probe (or the raw pool) shows real capacity — the exact
-    // wedge this issue exists for. When this holds, promote the diagnosis to
-    // the headline and suppress the misleading "limiter is work availability"
-    // line below (the limiter is unmistakably the token term: `0 × per-token
-    // = 0`).
-    let dispatch_starved_but_disagrees = report.capacity.ranking_present
-        && report.capacity.healthy_accounts == 0
-        && rc.ranking_present
-        && rc.healthy > 0;
+    // #4344 (superseded by #5270): this used to promote to a headline warning
+    // when the daemon's own dispatch decision read 0 healthy accounts while a
+    // fresher probe (or the raw pool) showed real capacity — "0 healthy ×
+    // per-token = 0" really was the binding cap term back then. Since #5270
+    // the token axis no longer participates in `dynamic_cap` on any auth
+    // path, so 0 healthy accounts alone can never starve dispatch any more —
+    // hard-coding this to `false` (rather than deleting the branch) keeps the
+    // #4344 diagnosis machinery in place as dead code documenting the prior
+    // behavior, without ever printing the now-categorically-false
+    // "DISPATCH IS TOKEN-STARVED" headline again.
+    let dispatch_starved_but_disagrees = false;
     // #4903: while the saturation admission brake is holding, "the limiter is
     // work availability" is flatly wrong and is the exact misread the issue was
     // filed on — a worker at 12× overcommit rendered as an idle host with nine
@@ -1064,7 +1067,7 @@ pub(crate) fn print_status_human(
                 } else if !report.preflight_advisory_active {
                     println!(
                         "  not capacity-bound ({} in flight, cap {dispatch_cap} — the limiter is \
-                         work availability, not tokens/disk/CPU)",
+                         work availability, not disk/RAM/CPU)",
                         report.in_flight.len(),
                     );
                 }

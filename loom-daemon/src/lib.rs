@@ -172,6 +172,7 @@ pub mod phase_join;
 pub mod pipeline_snapshot;
 pub mod primary_checkout_reaper;
 pub mod quarantine_reconciliation;
+pub mod ram_headroom;
 pub mod rate_limit_breaker;
 pub mod repo_root;
 pub mod role_collision;

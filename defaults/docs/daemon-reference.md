@@ -2013,30 +2013,48 @@ Each tick:
    `workfinder-<issue>` idempotency key, making a re-dispatch of an
    already-running issue a no-op.
 
-### Dynamic concurrency scaling (Phase B, #3811; CPU/load term #3978)
+### Dynamic concurrency scaling (Phase B, #3811; CPU/load term #3978; token axis removed / RAM added #5270)
 
 The concurrency cap is **not** a fixed value resolved once at startup. Every
 tick the finder recomputes
 
 ```
-dynamic_cap = min(healthy-token count × per-token concurrency, disk headroom, configured maxConcurrent)
+dynamic_cap = min(disk headroom, ram headroom, configured maxConcurrent)
 ```
 
-from live inputs, so pool/disk/backlog changes are honored without a daemon
-restart. A fourth **cpu/load headroom** term sat in this `min(...)` from #3978
-until **#4512 deleted it** — see [Why there is no CPU term in
-admission](#why-there-is-no-cpu-term-in-admission-4512) below. There is still no
-CPU term in the cap; since #4903 a separate
-[saturation admission brake](#saturation-admission-brake-4903) can *hold* new
+from live inputs, so disk/RAM/backlog changes are honored without a daemon
+restart. **#5270 removed the token axis from this formula entirely**, on any
+auth path (API key or subscription pool, overage-enabled or not) — operator
+direction: "we should only ever limit parallelism based on the machine
+disk/RAM/CPU." A metered `ANTHROPIC_API_KEY` has no 5h/7d subscription window,
+and overage means a subscription pool no longer hard-stops at one either, so
+counting *healthy accounts* was never a proxy for this host's actual capacity
+to run more sweeps. `.ranking` health is **not** deleted — it still drives
+spawn-time **selection** (`tokens_pool::select`: prefer fresher/healthier
+accounts, skip revoked/blocked ones) and the account-health figures remain on
+the status/calibrate surface as informational fields — it just no longer
+gates *how many* sweeps may run concurrently. A fourth **cpu/load headroom**
+term also sat in this `min(...)` from #3978 until **#4512 deleted it** — see
+[Why there is no CPU term in admission](#why-there-is-no-cpu-term-in-admission-4512)
+below. There is still no CPU *term* in the numeric cap; instead, since #4903
+(and retuned by #5270 into the primary "dumb mode" CPU gate — default
+threshold `0.95` load/core, down from the original `4.0` generous backstop)
+the [saturation admission brake](#saturation-admission-brake-4903) *holds* new
 admissions when the host is measurably saturated, without resizing the cap or
 touching running work.
 
 | Input | Source | Bound it enforces |
 |-------|--------|-------------------|
-| **healthy-token count** | `available` accounts in `.ranking` in the pool directory `tokens_pool::paths::resolve_tokens_dir` resolves for the workspace — per-repo `{workspace}/.loom/tokens/` when it holds `*.token` files, else the shared machine-level pool (#3938) (`capacity::read_ranking` / `token_axis_limit`, unified with the writer in #4344 — pre-#4344 this hardcoded the per-repo path even on a shared-pool host, which could pin the dispatch cap at 0 against an orphaned per-repo `.ranking` indefinitely), falling back to the `*.token` count (`tokens::token_pool_size`) when no ranking exists | the count of accounts safe to dispatch to — never dispatch to an exhausted/blocked one (#3902) |
-| **per-token concurrency** | `LOOM_PER_TOKEN_CONCURRENCY` / `autonomous.perTokenConcurrency`, default **2** (#3947) | how many concurrent sweeps to allow **per healthy account**. A plan limit is a utilization-window token bucket, not a session count, so one healthy account can run several concurrent sessions. Before #3947 the implicit factor was `1` (one sweep per account), which collapsed the whole fleet to cap 1 when 6/7 accounts were at their weekly ceiling even though the single healthy account had ample session-window headroom |
 | **disk headroom** | `floor(free_gb / LOOM_PER_WORKTREE_GB)` on the worktree-root volume (`disk_headroom::disk_headroom_limit`, a Rust port of `disk-headroom.sh` that shells to `df -Pk`) | never provision more worktrees than the scratch volume can hold |
-| **configured maxConcurrent** | `LOOM_WORK_FINDER_MAX_CONCURRENT` / `autonomous.workFinder.maxConcurrent` (repurposed from Phase A's fixed target into an operator ceiling) | **the** per-machine admission knob (#4512) — tuned empirically by the operator, the only *policy* term in the `min(...)` (the other two meter exhaustible resources: accounts and bytes) |
+| **ram headroom** (#5270) | `floor(available_gb / LOOM_PER_WORKTREE_RAM_GB)` on the host's currently-available memory (`ram_headroom::ram_headroom_limit`, modeled on `disk_headroom`'s shape: `/proc/meminfo`'s `MemAvailable` on Linux, `vm_stat` free+inactive pages × page size on macOS) | never provision more worktrees than available RAM can hold; the second "dumb mode" machine-headroom axis alongside disk |
+| **configured maxConcurrent** | `LOOM_WORK_FINDER_MAX_CONCURRENT` / `autonomous.workFinder.maxConcurrent` (repurposed from Phase A's fixed target into an operator ceiling) | **the** per-machine admission knob (#4512) — tuned empirically by the operator, the only *policy* term in the `min(...)` (the other two meter exhaustible resources: bytes of disk and bytes of RAM) |
+
+Retired as cap inputs (informational-only now — see `capacity::token_axis_limit` / `tokens_pool::select`):
+
+| Input | Source | What it still does |
+|-------|--------|-------------------|
+| **healthy-token count** (retired from the cap, #5270) | `available` accounts in `.ranking` in the pool directory `tokens_pool::paths::resolve_tokens_dir` resolves for the workspace — per-repo `{workspace}/.loom/tokens/` when it holds `*.token` files, else the shared machine-level pool (#3938) (`capacity::read_ranking` / `token_axis_limit`, unified with the writer in #4344) | drives spawn-time account **selection** (prefer fresher/healthier accounts, skip exhausted/blocked ones, #3902) and is reported on `status`/`calibrate` for observability — no longer bounds `dynamic_cap` |
+| **per-token concurrency** (retired from the cap, #5270) | `LOOM_PER_TOKEN_CONCURRENCY` / `autonomous.perTokenConcurrency`, default **2** (#3947) | still reported for the informational `healthy × per-token` figure on `status`/`calibrate`; no longer multiplies into any cap term |
 
 #### Why there is no CPU term in admission (#4512)
 
@@ -2066,9 +2084,10 @@ actually is**:
 
 1. **Admission is one per-machine knob.** `autonomous.workFinder.maxConcurrent`
    is the whole policy, tuned empirically by the operator (expect 10+ on an
-   8-core API-bound worker). The two remaining terms — the token axis and disk
-   headroom — stay because they meter genuinely *exhaustible* resources
-   (accounts, bytes), not an estimate.
+   8-core API-bound worker). The two remaining terms — disk headroom and (since
+   #5270) RAM headroom — stay because they meter genuinely *exhaustible*
+   resources (bytes), not an estimate. (The token axis sat here too until
+   #5270 removed it — see the section above.)
 2. **The genuinely heavy stages serialize where they occur**, via the
    [machine-wide build slot](#machine-wide-build-slot-4512). N sweeps run
    concurrently; at most `LOOM_BUILD_SLOTS` of them hold the slot while running
@@ -2152,6 +2171,15 @@ consistent env-only behavior. Wiring the Bash `config-resolver.sh` into
 `disk-headroom.sh` too is a separate, larger change; file a follow-up if that
 cost is judged worth paying.
 
+**RAM headroom mirrors this env-only shape (#5270).** `ram_headroom::per_worktree_ram_gb`
+resolves `LOOM_PER_WORKTREE_RAM_GB` (default **2** GB) the same way
+`disk_headroom::per_worktree_gb` resolves its own env var — no config key,
+env-only, floored to a minimum of 1. There is no Bash-side RAM counterpart to
+`disk-headroom.sh` (RAM headroom is Rust-only, consumed solely by the daemon's
+own `resolve_dynamic_max_concurrent`), so the #4032 divergence concern above
+does not apply here — env-only was simply the cheapest consistent choice, not
+a workaround for a second reader.
+
 #### Saturation admission brake (#4903)
 
 Deleting the CPU term left admission with **no term that reads the host at
@@ -2176,8 +2204,18 @@ per-sweep cores, and **never** touches work that is already running.
 |---|---|
 | Config | `autonomous.workFinder.saturationBrake.enabled` / `.loadPerCoreHold` |
 | Env | `LOOM_ADMISSION_BRAKE` / `LOOM_ADMISSION_BRAKE_LOAD_PER_CORE` |
-| Default | **on**, hold at **4.0** load/core |
+| Default | **on**, hold at **0.95** load/core (retuned from `4.0` by #5270) |
 | Precedence | env > config > default, resolved once at daemon startup |
+
+**Retuned by #5270 from a generous backstop to the primary CPU admission
+gate.** Until #5270 the token axis and disk headroom were the two hard
+admission floors, with this brake acting only as a rarely-tripped safety net
+well above them (`4.0` load/core — four runnable threads per logical core).
+#5270 removed the token axis from admission entirely, which promotes this
+brake to **the** CPU term in "dumb mode": its default now matches the
+operator's literal ask — hold new admissions once the host's few-minute load
+average reaches ~95% of its logical core count (`0.95` load/core), resume
+below it.
 
 Properties that are load-bearing (and are pinned by tests):
 
@@ -2188,8 +2226,11 @@ Properties that are load-bearing (and are pinned by tests):
   is precisely how the host recovers.
 - **A healthy host is unchanged.** Below the threshold the admission path is
   byte-for-byte the pre-#4903 one, so an idle 8-core host still reaches its
-  configured cap. `4.0` is deliberately generous: a busy-but-fine host sits under
-  `1.0`, and the incident that motivated the brake was at `11.9`.
+  configured cap. `0.95` holds a notch below full saturation (`1.0` = as many
+  runnable/uninterruptible threads as logical cores), mirroring the build
+  gate's own `0.9` deferral point rather than the pre-#5270 `4.0`, which would
+  have let a host run at 4× overcommit before this brake ever engaged — the
+  incident that originally motivated the brake was at `11.9`.
 - **Fail-safe on missing data.** No load-average source (or a zero CPU count)
   ⇒ no hold. Absent evidence is never treated as load.
 - **Nothing latches.** The hold is re-evaluated every tick and releases the
@@ -2201,14 +2242,18 @@ read the same normalized ratio and are complements, not duplicates:
 | | Admission brake (#4903) | Host breaker (#4235) |
 |---|---|---|
 | Nature | point-in-time: one reading, one decision | stateful: trips only after N consecutive over-threshold ticks |
-| Default threshold | `4.0` load/core | `2.5` load/core |
+| Default threshold | `0.95` load/core (`4.0` before #5270) | `2.5` load/core |
 | Release | immediate, first tick under the line | after a 5-minute cool-down |
 | Explicit `dispatch_sweep` | never blocks it | hard-blocks unless `force` |
 | Purpose | stop *adding* to a full host | remember a *meltdown* so a load dip cannot re-admit a whole wave |
 
-The brake's threshold sits *above* the breaker's on purpose: it decides from a
-single reading, so it must be sure, whereas the breaker's lower bar is paid for
-by requiring the load to be sustained.
+**Since #5270 the brake's default threshold sits *below* the breaker's** — the
+reverse of the pre-#5270 ordering. Pre-#5270 the brake decided from a single
+reading at a generous `4.0` and had to "be sure" before firing; post-#5270 it
+is the fast, cheap, per-tick hold that engages first (a single over-threshold
+reading, `0.95`), with the breaker remaining the slower, stickier trip for
+genuine sustained distress (several consecutive over-threshold ticks, `2.5`)
+well past the point the brake has already held new admissions.
 
 **Visibility.** `loom-daemon status` prints an `Admission brake:` line
 (`HOLDING …` / `OK …` / `disabled`), `--json` carries an `admission_brake`
@@ -2481,31 +2526,32 @@ duplicating the `disk_headroom_limit` plumbing `loom-daemon status`
 (`build_daemon_status`) already exposes.
 
 Nothing in this handler may block, because it holds the sweep-registry mutex
-from the assessment through the dispatch call. Since #4512 the headroom is
-`min(token axis, disk, configured max)` — three cheap filesystem/config reads,
-no CPU sampling at all. (Before #4512 this had to carefully avoid the
-**refreshing** CPU probe, whose macOS `iostat` refresh sleeps ~1s and would have
-stalled every other IPC request on the same registry for that second; removing
-the CPU term removed that hazard outright.)
+from the assessment through the dispatch call. Since #5270 the headroom is
+`min(disk, ram, configured max)` — cheap filesystem/config reads (plus a
+non-sleeping `/proc/meminfo` read or a flag-less `vm_stat` snapshot on macOS
+for RAM), no CPU sampling at all. (Before #4512 this had to carefully avoid
+the **refreshing** CPU probe, whose macOS `iostat` refresh sleeps ~1s and
+would have stalled every other IPC request on the same registry for that
+second; removing the CPU term removed that hazard outright, and RAM headroom
+deliberately preserves the same non-blocking contract.)
 
-**Per-token concurrency factor (#3947).** The token axis is `healthy × factor`,
-not `healthy × 1`. The factor is resolved with the standard precedence **env
-(`LOOM_PER_TOKEN_CONCURRENCY`) > config (`autonomous.perTokenConcurrency`) >
-default (2)**; a zero/unparseable value at any layer is ignored, and the cap
-formula additionally clamps the factor to a floor of `1` so a mis-set `0` degrades
-to the pre-#3947 one-sweep-per-account behavior rather than dispatching nothing.
-Bounded **stacking**, not a 1:1 hard limit, is the correct response to a healthy
-account with session-window headroom — the #3909 rotating selection spread still
-fills **distinct** accounts first (via the persistent `.rotation_cursor`), only
-stacking multiple sweeps on one account when concurrency demand exceeds the
-healthy-account count. The `loom-daemon status` view spells the arithmetic out,
-e.g. `= min(healthy 1 × per-token 2 = 2, disk headroom 120, configured max 3)`,
-and a separate line reports the live host CPU **observation** — explicitly
-labelled as not a cap term, e.g. `host cpu (observed, not a cap term since
-#4512): 28 logical cores, 85% idle measured (≈4.2 cores consumed), 1m loadavg
-6.10`, degrading to a `1m loadavg … (no idle sample yet)` or `no CPU signal on
-this platform` line when the measurement is unavailable (#3978 AC4;
-measured-idle signal #4031; demoted to observation in #4512).
+**Per-token concurrency factor (#3947, retired from the cap by #5270).** The
+token axis used to be `healthy × factor`, not `healthy × 1` — the factor
+resolved with the standard precedence **env (`LOOM_PER_TOKEN_CONCURRENCY`) >
+config (`autonomous.perTokenConcurrency`) > default (2)**. Since #5270 the
+token axis no longer participates in `dynamic_cap` at all, so this factor is
+purely informational now — `loom-daemon status`/`calibrate` still print
+`healthy N × per-token M = P` as a labeled "informational only" figure, but it
+no longer appears inside the `= min(...)` breakdown, which is now `= min(disk
+headroom 120, ram headroom 40, configured max 3)`. A separate line reports the
+live host CPU **observation** — explicitly labelled as not a cap term, e.g.
+`host cpu (observed, not a cap term since #4512): 28 logical cores, 85% idle
+measured (≈4.2 cores consumed), 1m loadavg 6.10`, degrading to a `1m loadavg …
+(no idle sample yet)` or `no CPU signal on this platform` line when the
+measurement is unavailable (#3978 AC4; measured-idle signal #4031; demoted to
+observation in #4512) — and, since #5270, the `admission_brake` block reports
+whether that same load reading is currently *holding* new admissions (the
+brake, not this observation line, is what gates CPU today).
 
 **"Currently binding" vs "smallest ceiling" (#4031).** The dynamic cap is the
 *minimum* of several ceilings, but a ceiling only *binds* once in-flight
@@ -2514,35 +2560,27 @@ exists, not any resource term — so the status view gates its bottleneck
 diagnosis on real occupancy (`in_flight.len() >= dynamic_cap`, surfaced as the
 `capacity_bound` field, `#[serde(default)]`). With in-flight below the cap it
 prints `not capacity-bound (N in flight, cap M — the limiter is work
-availability, not tokens/disk/CPU)` and **suppresses** the `token-bound:`
-diagnosis line; at or above the cap it names the binding term as before. The
-`= min(…)` breakdown line is untouched — those genuinely are ceilings. The JSON
-status carries the same `capacity_bound` boolean so scripted consumers aren't
-misled at low occupancy either.
+availability, not disk/RAM/CPU)`; at or above the cap it names the binding
+term as before. The `= min(…)` breakdown line is untouched — those genuinely
+are ceilings. The JSON status carries the same `capacity_bound` boolean so
+scripted consumers aren't misled at low occupancy either.
 
-**Honest headline when the daemon's own read disagrees with a fresh probe
-(#4344).** `resolve_capacity` prefers a fresh client-side `loom-daemon tokens check
---json` probe over the daemon's own ranking read when one succeeds — useful for
-showing current numbers, but that probe's cap is **not** what the running
-daemon actually used to gate dispatch this tick. The pretty-printed `Dynamic
-concurrency cap:` headline and the `= min(healthy N × per-token M …)`
-breakdown always name the daemon's own numbers (`report.dynamic_cap` /
-`report.capacity.token_axis_limit`) — the probe's cap is shown only as a
-labeled secondary `fresh probe suggests: …` line when it differs. The
-`capacity_bound` gate above is likewise computed against the daemon's own cap,
-not the probe's, so "not capacity-bound" can never print while the daemon's
-real (lower) cap is already saturated. When the daemon's own ranking read
-shows **0 healthy accounts** while the probe (or raw pool) disagrees — the
-#4344 incident: dispatch pinned at a token term of `0 × per-token = 0` for
-~40 minutes because the ranking directory it read had diverged from the one
-`loom-daemon tokens check --ranking` / the #4080 self-refresher actually wrote — the
-status view promotes this from the old small-print `note: daemon dispatch cap
-still uses a stale .ranking (...)` line to a headline `⚠ DISPATCH IS
-TOKEN-STARVED: …` line and suppresses "the limiter is work availability"
-underneath it, since the real limiter is unambiguously the token term. The
-root fix for the divergence itself is unifying which `.ranking` file
-[`capacity::read_ranking`] consults — see the healthy-token-count row of the
-input table above.
+**Token-axis probe/daemon disagreement can no longer skew the cap (#4344,
+superseded by #5270).** `resolve_capacity` still prefers a fresh client-side
+`loom-daemon tokens check --json` probe over the daemon's own ranking read for
+the *reported* healthy/total/exhausted account counts (useful, current
+numbers for the account-health line), but since #5270 it no longer
+recomputes its own `effective_cap` / `token_bound` from those counts — both
+are always exactly the daemon's own `report.dynamic_cap` / `false`. The old
+`#4344` incident (dispatch pinned at a token term of `0 × per-token = 0` for
+~40 minutes because the daemon's ranking read had diverged from a fresher
+probe) is now structurally impossible for the *cap*: a stale or diverged
+`.ranking` can misinform account **selection**, but it can never again pin
+`dynamic_cap` to 0. The historical `⚠ DISPATCH IS TOKEN-STARVED: …` headline
+this section used to describe has been retired for the same reason. The root
+fix for `.ranking` divergence itself — unifying which file
+[`capacity::read_ranking`] consults — remains in place; see the healthy-token
+row of the "retired" input table above.
 
 **Session-limit fault handling (#3947).** Stacking can occasionally trip a
 **concurrent-session-limit** fault on a token (the account is healthy but cannot
@@ -2657,40 +2695,55 @@ mutation from the read itself; observes the same latch) returning
 `(issue, time_since_dispatch)` for every live sweep that has not yet proven
 startup — for status/observability, not for gating.
 
-### Token-capacity backpressure (#3902)
+### Token-capacity backpressure (#3902; token axis retired from the cap by #5270)
 
-At scale, rotation accounts hit their 5h/7d rate limits and go `exhausted`.
-Dispatching to an exhausted account produces startup hangs / mid-build deaths, so
-the finder treats a genuine token limit as a **capacity signal** — slow down,
-alert, recover — all automatic and non-blocking:
+At scale, rotation accounts used to hit their 5h/7d rate limits and go
+`exhausted`, and dispatching to an exhausted account produces startup hangs /
+mid-build deaths, so the finder treats a genuine token limit as a **capacity
+signal** — alert, recover — non-blocking (the "slow down" half below is
+historical: #5270 removed the token axis from the dynamic cap itself, so
+account health can no longer *slow dispatch down*, only warn about it):
 
-1. **Slow down (backpressure).** The token axis of the dynamic cap is the count
-   of **healthy** (`available`) accounts read from `.loom/tokens/.ranking`
-   (`capacity::token_axis_limit`), not the flat `*.token` count. When accounts go
-   exhausted the cap backs off toward the healthy count; when *every* account is
-   exhausted it drops to 0 and the finder **defers** the queue rather than
-   hammering an exhausted account. A single healthy account is the throughput
-   **floor**, never a halt. When no `.ranking` file exists (no probe has run) the
-   axis falls back to the raw pool size — byte-for-byte the pre-#3902 behavior.
-2. **Alert (add capacity).** When the token axis is the *binding* constraint
-   (≤ disk and ≤ ceiling) and work is queued behind it, the finder is
-   *token-bound*. On the **state change** into that state it emits an
-   add-capacity advisory naming concrete levers — add accounts to
-   `~/.claude-monitor/accounts.env` + `loom-daemon tokens bootstrap`, or buy API
-   credits, then re-probe with `loom-daemon tokens check --ranking` — with the current
-   numbers (queued count, healthy/total accounts, exhausted count, estimated
-   drain time at current capacity). If accounts are `blocked` on revoked tokens,
-   `bootstrap --force` cannot recover — the advisory also names
-   `loom-daemon tokens import-from-monitor --force && loom-daemon tokens check --ranking` as
-   the recovery lever for that case. The advisory surfaces on **three**
-   channels: the daemon log (`warn`), the `daemon.capacity.advisory` event-bus
-   topic, and the `capacity` section of `loom-daemon status`. It is
+1. **Slow down (backpressure) — historical, superseded by #5270.** The token
+   axis used to be a term in `dynamic_cap`: the count of **healthy**
+   (`available`) accounts read from `.loom/tokens/.ranking`
+   (`capacity::token_axis_limit`), not the flat `*.token` count — when
+   accounts went exhausted the cap backed off toward the healthy count, down
+   to 0 when every account was exhausted. Operator direction on #5270 ("we
+   should only ever limit parallelism based on the machine disk/RAM/CPU")
+   removed this backoff entirely: `.ranking` health now drives spawn-time
+   **selection** only (prefer fresher/healthier accounts, skip
+   `blocked`/revoked ones), never admission. `capacity::token_axis_limit`
+   still exists and is still reported (see the "retired" input table in the
+   dynamic-cap section above), but its output no longer bounds anything.
+2. **Alert (advisory only, unchanged posture).** The pressure advisory
+   (`capacity::assess_pressure`) still runs every tick, now comparing the
+   healthy-account count against `disk.min(ram)` (both remaining
+   machine-headroom axes, #5270) rather than disk alone, specifically so a
+   RAM-starved host cannot spuriously read as "token-bound" (deferred > 0 for
+   a RAM reason, with the healthy count merely happening to be ≤ disk). It
+   still exists purely to prompt an operator to add capacity when scarce
+   accounts correlate with a deferred backlog — it is deliberately **not**
+   what gates dispatch (#5270 dropped that role entirely). On the state
+   change into a pressured reading it emits an add-capacity advisory naming
+   concrete levers — add accounts to `~/.claude-monitor/accounts.env` +
+   `loom-daemon tokens bootstrap`, or buy API credits, then re-probe with
+   `loom-daemon tokens check --ranking` — with the current numbers (queued
+   count, healthy/total accounts, exhausted count, estimated drain time at
+   current capacity). If accounts are `blocked` on revoked tokens, `bootstrap
+   --force` cannot recover — the advisory also names `loom-daemon tokens
+   import-from-monitor --force && loom-daemon tokens check --ranking` as the
+   recovery lever for that case. The advisory surfaces on **three** channels:
+   the daemon log (`warn`), the `daemon.capacity.advisory` event-bus topic,
+   and the `capacity` section of `loom-daemon status`. It is
    **deduplicated** — one advisory on entry, one recovery on exit, never
-   per-tick spam. Advisory only; it never blocks dispatch.
-3. **Recover.** The finder re-reads the ranking every tick (bounded cadence = the
-   tick interval), so as accounts reset to `available` the cap ramps back up and
-   the queued `loom:issue` backlog drains automatically — no manual intervention.
-   A symmetric recovery line/event fires on the way out of the pressured state.
+   per-tick spam. Advisory only; it never blocks dispatch (and, since #5270,
+   nothing about account health ever did).
+3. **Recover.** The finder re-reads the ranking every tick (bounded cadence =
+   the tick interval), so as accounts reset to `available` the advisory
+   clears and the queued `loom:issue` backlog continues to drain at whatever
+   rate `min(disk, ram, configured_max)` allows — no manual intervention. A
+   symmetric recovery line/event fires on the way out of the pressured state.
 
 The `estimated_drain_minutes` figure is a coarse `ceil(queued / healthy) ×
 NOMINAL_SWEEP_MINUTES` (30 min nominal) aid, not a precise SLA — the daemon does
@@ -2811,7 +2864,7 @@ exactly like `main_health_gate::read_build_gate_config`.
 | `autonomous.workFinder.maxConcurrent` | `LOOM_WORK_FINDER_MAX_CONCURRENT` | `3` | **The** per-machine admission knob since #4512 — an operator ceiling, not a fixed target, tuned empirically from `loom-daemon calibrate` / `status`. Per-machine **and workload-dependent** (#4903): ~10+ on an 8-core API-bound (software) worker, but **2–3** on the same 8 cores running analog/simulation sweeps. See [Sizing `maxConcurrent`](#sizing-maxconcurrent-per-machine-and-per-workload-4512-4903) below |
 | `autonomous.workFinder.maxAdmissionsPerTick` | `LOOM_WORK_FINDER_MAX_ADMISSIONS_PER_TICK` | `3` | Per-tick **ramp** cap (#4234) — bounds how many *new* sweeps one tick may admit, independent of `maxConcurrent`/the live dynamic cap. Zero/invalid → default; resolved once at startup, mirroring `maxConcurrent`. See [Per-tick admission (ramp) cap](#per-tick-admission-ramp-cap-4234) below |
 | `autonomous.workFinder.saturationBrake.enabled` | `LOOM_ADMISSION_BRAKE` | `true` | Saturation admission brake on/off (#4903). A safety backstop — **defaults on**. Holds *new* admissions while the host is already saturated; never preempts a running sweep. Env truthy (`1`/`true`/`yes`/`on`) enables, any other value disables; wins over config. See [Saturation admission brake](#saturation-admission-brake-4903) below |
-| `autonomous.workFinder.saturationBrake.loadPerCoreHold` | `LOOM_ADMISSION_BRAKE_LOAD_PER_CORE` | `4.0` | Load-per-core at/over which new admissions are held for that tick. `<= 0`/invalid → default. Deliberately above the host breaker's `2.5` trip: the brake decides from a single reading, the breaker from sustained ticks |
+| `autonomous.workFinder.saturationBrake.loadPerCoreHold` | `LOOM_ADMISSION_BRAKE_LOAD_PER_CORE` | `0.95` (`4.0` before #5270) | Load-per-core at/over which new admissions are held for that tick. `<= 0`/invalid → default. Since #5270 sits deliberately *below* the host breaker's `2.5` trip: the brake is now the primary "dumb mode" CPU gate and engages first (a single over-threshold reading), the breaker remains the slower sustained-distress trip |
 | `autonomous.workFinder.quarantine.enabled` | `LOOM_WORK_FINDER_QUARANTINE` | `true` | Insta-crash quarantine on/off (#3939). A safety backstop — defaults on |
 | `autonomous.workFinder.quarantine.threshold` | `LOOM_WORK_FINDER_QUARANTINE_THRESHOLD` | `3` | Consecutive insta-crashes before an issue is quarantined. Zero/invalid → default |
 | `autonomous.workFinder.quarantine.ttlSecs` | `LOOM_WORK_FINDER_QUARANTINE_TTL_SECS` | `3600` | How long a quarantine entry persists before auto-release. Zero/invalid → default |

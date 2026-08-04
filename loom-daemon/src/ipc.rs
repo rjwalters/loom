@@ -1630,6 +1630,9 @@ pub fn build_daemon_status(
     // re-resolving a possibly-different one.
     let token_pool_dir = Some(tokens_dir.clone());
     let disk_headroom = crate::disk_headroom::disk_headroom_limit(workspace_root);
+    // RAM headroom (#5270): the second "dumb mode" machine-headroom axis,
+    // folded into `dynamic_cap` alongside disk headroom.
+    let ram_headroom = crate::ram_headroom::ram_headroom_limit();
     let wf_config = crate::work_finder::read_work_finder_config(workspace_root);
     let configured_max = crate::work_finder::resolve_max_concurrent_with_config(&wf_config);
     let per_token_concurrency = crate::work_finder::resolve_per_token_concurrency(&wf_config);
@@ -1650,18 +1653,15 @@ pub fn build_daemon_status(
     let ranking = crate::capacity::read_ranking_at(&tokens_dir);
     let token_axis_limit = ranking.as_ref().map_or(token_pool_size, |r| r.available);
     let dynamic_cap = crate::work_finder::resolve_dynamic_max_concurrent(
-        token_axis_limit,
-        per_token_concurrency,
         disk_headroom,
+        ram_headroom,
         configured_max,
     );
-    // The token axis of the cap is `healthy × per-token` (#3947), so it is the
-    // binding constraint only when that *product* is the minimum across every
-    // remaining axis — disk and the configured ceiling (#4512 removed the CPU
-    // axis).
-    let token_axis_effective = token_axis_limit.saturating_mul(per_token_concurrency.max(1));
-    let token_bound =
-        token_axis_effective <= disk_headroom && token_axis_effective <= configured_max;
+    // The token axis no longer bounds the cap (#5270) — `token_bound` is
+    // therefore always `false`. `token_axis_limit` / `per_token_concurrency`
+    // remain on the report as informational account-health figures (they still
+    // drive spawn-time *selection*), but neither one gates admission any more.
+    let token_bound = false;
     // "Currently binding" vs "smallest ceiling" (#4031): the dynamic cap is the
     // minimum of several ceilings, but a ceiling only *binds* once in-flight
     // occupancy reaches it. Below the cap the limiter is work availability, not
@@ -1695,6 +1695,7 @@ pub fn build_daemon_status(
         token_pool_size,
         token_pool_dir,
         disk_headroom,
+        ram_headroom,
         logical_cpus,
         loadavg_1m,
         cpu_idle_fraction,
@@ -2049,12 +2050,14 @@ fn resolve_dispatch_registry(
 // # Nothing blocking under the registry lock
 //
 // The `DispatchSweep` arm holds the registry mutex from just after this
-// assessment through the dispatch call, so nothing here may block. Since #4512
-// the headroom is `min(token axis, disk, configured max)` — three cheap
-// filesystem/config reads, no CPU sampling at all. (Before #4512 this had to
+// assessment through the dispatch call, so nothing here may block. Since #5270
+// the headroom is `min(disk, ram, configured max)` — cheap filesystem/config
+// reads (plus a non-sleeping `/proc/meminfo` read or a flag-less `vm_stat`
+// snapshot on macOS), no CPU sampling at all. (Before #4512 this had to
 // carefully avoid `cpu_headroom_limit`, whose macOS `iostat` refresh sleeps ~1s
 // and would have stalled every other IPC request on the same registry for that
-// second; removing the CPU term removed that hazard outright.)
+// second; removing the CPU term removed that hazard outright, and RAM headroom
+// deliberately preserves the same non-blocking contract.)
 
 /// Per-repo dynamic-cap headroom snapshot computed for a `dispatch_sweep`
 /// request (#4234). Mirrors the inputs `build_daemon_status` already exposes
@@ -2063,9 +2066,12 @@ fn resolve_dispatch_registry(
 struct DispatchHeadroom {
     /// Live (non-terminal) sweep count already registered for this repo.
     occupancy: usize,
-    /// `resolve_dynamic_max_concurrent` — min(token axis, disk, configured max).
+    /// `resolve_dynamic_max_concurrent` — min(disk, ram, configured max). The
+    /// token axis no longer participates (#5270); `token_axis_limit` below is
+    /// kept as an informational account-health figure only.
     dynamic_cap: usize,
     disk_headroom: usize,
+    ram_headroom: usize,
     token_axis_limit: usize,
 }
 
@@ -2084,15 +2090,15 @@ fn assess_dispatch_headroom(sr: &mut SweepRegistry, repo_root: &Path) -> Dispatc
 
     let wf_config = crate::work_finder::read_work_finder_config(repo_root);
     let configured_max = crate::work_finder::resolve_max_concurrent_with_config(&wf_config);
-    let per_token_concurrency = crate::work_finder::resolve_per_token_concurrency(&wf_config);
     let disk_headroom = crate::disk_headroom::disk_headroom_limit(repo_root);
+    let ram_headroom = crate::ram_headroom::ram_headroom_limit();
     let token_pool_size = crate::tokens::token_pool_size(repo_root);
     let ranking = crate::capacity::read_ranking(repo_root);
+    // Informational only since #5270 — no longer part of the dynamic cap.
     let token_axis_limit = ranking.as_ref().map_or(token_pool_size, |r| r.available);
     let dynamic_cap = crate::work_finder::resolve_dynamic_max_concurrent(
-        token_axis_limit,
-        per_token_concurrency,
         disk_headroom,
+        ram_headroom,
         configured_max,
     );
 
@@ -2100,6 +2106,7 @@ fn assess_dispatch_headroom(sr: &mut SweepRegistry, repo_root: &Path) -> Dispatc
         occupancy,
         dynamic_cap,
         disk_headroom,
+        ram_headroom,
         token_axis_limit,
     }
 }
@@ -2184,12 +2191,14 @@ fn dispatch_headroom_message(
         format!(
             "dispatch_sweep: dispatching {kind:?} into {} while occupancy is at/over the \
              computed dynamic-cap headroom (occupancy={} >= dynamic_cap={}; \
-             disk_headroom={}, token_axis_limit={}) — advisory only per #4234 (dispatch \
+             disk_headroom={}, ram_headroom={}, token_axis_limit={} [informational only, not \
+             capacity-limiting since #5270]) — advisory only per #4234 (dispatch \
              proceeds; the autonomous work finder's own cap is unaffected)",
             repo_root.display(),
             h.occupancy,
             h.dynamic_cap,
             h.disk_headroom,
+            h.ram_headroom,
             h.token_axis_limit
         )
     } else {
@@ -2238,6 +2247,7 @@ fn emit_dispatch_headroom_advisory_on_change(
             "occupancy": h.occupancy,
             "dynamic_cap": h.dynamic_cap,
             "disk_headroom": h.disk_headroom,
+            "ram_headroom": h.ram_headroom,
             "token_axis_limit": h.token_axis_limit,
             "message": message,
         }),
@@ -2995,12 +3005,14 @@ fn handle_request(
             };
             log::info!(
                 "dispatch_sweep: {:?} with{} model={resolved_model} (source={model_source_label}); \
-                 headroom occupancy={} dynamic_cap={} (disk={} tokens={})",
+                 headroom occupancy={} dynamic_cap={} (disk={} ram={} tokens={} [informational \
+                 only, not capacity-limiting since #5270])",
                 kind,
                 arm.map_or_else(String::new, |a| format!(" arm={a}")),
                 headroom.occupancy,
                 headroom.dynamic_cap,
                 headroom.disk_headroom,
+                headroom.ram_headroom,
                 headroom.token_axis_limit
             );
             match sr.dispatch(
@@ -3879,6 +3891,7 @@ exit 0
             occupancy,
             dynamic_cap,
             disk_headroom: 10,
+            ram_headroom: 10,
             token_axis_limit: 5,
         }
     }
@@ -3905,6 +3918,7 @@ exit 0
             occupancy: 4,
             dynamic_cap: 3,
             disk_headroom: 9,
+            ram_headroom: 7,
             token_axis_limit: 6,
         };
         let kind = SweepKind::Issue(123);
@@ -3914,6 +3928,7 @@ exit 0
         assert!(entered.contains("occupancy=4"), "{entered}");
         assert!(entered.contains("dynamic_cap=3"), "{entered}");
         assert!(entered.contains("disk_headroom=9"), "{entered}");
+        assert!(entered.contains("ram_headroom=7"), "{entered}");
         assert!(entered.contains("token_axis_limit=6"), "{entered}");
         assert!(entered.contains("123"), "{entered}");
         assert!(entered.contains("advisory only"), "{entered}");
@@ -5756,6 +5771,7 @@ exit 0
             token_pool_size: 4,
             token_pool_dir: Some(std::path::PathBuf::from("/repo/a/.loom/tokens")),
             disk_headroom: 10,
+            ram_headroom: 10,
             logical_cpus: 8,
             loadavg_1m: Some(1.25),
             cpu_idle_fraction: Some(0.90),
@@ -6267,9 +6283,26 @@ exit 0
         let report = build_daemon_status(&pool, &health, &root, &test_credential_preflight());
         assert!(!report.main_health_gate_halted);
         assert!(report.in_flight.is_empty());
-        // The tempdir has no `.loom/tokens/`, so the pool + dynamic cap are 0.
+        // The tempdir has no `.loom/tokens/`, so the pool is 0 — but since
+        // #5270 the token axis no longer participates in the dynamic cap, so
+        // an empty token pool no longer pins `dynamic_cap` to 0. The cap is
+        // `min(disk_headroom, ram_headroom, configured_max)`, where
+        // `configured_max` is resolved the same way `build_daemon_status`
+        // resolves it (not assumed to be the built-in default — a host-level
+        // config tier may set it, exactly the ambient config this assertion
+        // must tolerate).
         assert_eq!(report.token_pool_size, 0);
-        assert_eq!(report.dynamic_cap, 0);
+        let expected_configured_max = crate::work_finder::resolve_max_concurrent_with_config(
+            &crate::work_finder::read_work_finder_config(&root),
+        );
+        assert_eq!(
+            report.dynamic_cap,
+            report
+                .disk_headroom
+                .min(report.ram_headroom)
+                .min(expected_configured_max),
+            "dynamic cap is min(disk, ram, configured_max) regardless of the empty token pool"
+        );
         // #4345: a pool that never called start_safehouse_narration /
         // start_peer_coordination still reports a live safehouse state — the
         // cell's own default, not a missing/`None` field.
