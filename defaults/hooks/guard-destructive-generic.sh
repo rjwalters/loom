@@ -1516,6 +1516,20 @@ function unmask_ws(s) {
 #      script/stdin argument) is a materially larger, separate piece of work
 #      than this masking pass and is OUT OF SCOPE here; track it as its own
 #      follow-up rather than bolting a partial fix onto heredoc masking.
+#      This tradeoff (missed ASK, worst case) is unchanged for
+#      extract_write_targets() -- it still calls plain mask_heredoc_bodies()
+#      below and still masks interpreter-fed bodies. But #5192 later reused
+#      this same primitive for a CATASTROPHIC-tier DENY
+#      (gh-api-rawfield-body-literal-at, ~line 2234) without re-deriving this
+#      tradeoff for that tier: masking an interpreter-fed body there doesn't
+#      risk a missed ask, it silently flips a DENY to an ALLOW on the exact
+#      #4523/#4601/#4685 data-loss shape the check exists to catch (#5198).
+#      That is NOT an acceptable tradeoff for a catastrophic-tier check, so
+#      mask_heredoc_bodies_selective() below (used ONLY by that one check)
+#      recognizes an interpreter-fed opener and leaves that specific block's
+#      body UNMASKED (visible to the scan) instead of masking it -- narrowing
+#      still applies to every other (non-interpreter-fed) heredoc in the same
+#      command, so the #5181 false-positive fix stays intact.
 #
 #   2. Crafted false opener whose delimiter later appears. Opener detection
 #      (heredoc_delim_at()) runs on a single physical line, before qsplit()
@@ -1601,6 +1615,103 @@ function mask_heredoc_bodies(s,   out, lines, nl, i, j, line, trimmed, body, del
                 body = lines[j]
                 gsub(/./, MASKC, body)
                 lines[j] = body
+            }
+            i = closeat            # resume scanning after the delimiter line
+            break
+        }
+    }
+    out = lines[1]
+    for (i = 2; i <= nl; i++) out = out "\n" lines[i]
+    return out
+}
+# True when a heredoc OPENER line looks like it feeds an interpreter --
+# either the opener command itself (`bash <<EOF`, `sh -s <<EOF`,
+# `python3 <<EOF`, `eval <<EOF`, `source <<EOF`, `. <<EOF`) or the opener is
+# piped into one on the same line (`cat <<EOF | bash`). Deliberately a
+# whole-line, best-effort check (matching the "narrow / best-effort" style
+# of heredoc_delim_at() above): the interpreter must be the COMMAND WORD of
+# some segment of the line, not an arbitrary substring -- e.g.
+# `echo "installs bash" <<EOF` does NOT match, since "bash" there is a bare
+# argument, not the command word.
+#
+# Recognizing the command word robustly (#5205): the interpreter word is
+# matched against the path BASENAME of each segment command word, and any
+# leading `env`/`command`/`exec`/`builtin` wrapper (with its own flags and
+# `VAR=value` assignments) is stripped first -- none of those change what
+# actually executes. So a path-qualified or wrapped invocation of the same
+# interpreter (`/bin/bash <<EOF`, `env bash <<EOF`, `command bash <<EOF`,
+# `./bash <<EOF`, `/usr/bin/python3 <<EOF`) is caught too, closing the
+# evasion class where those forms slipped past the old first-token-only
+# regex and got their live bodies silently masked (i.e. ALLOWed).
+function _interp_basename(tok,   base) {
+    # Reduce a (possibly path-qualified) command word to its basename: the
+    # text after the last `/`. `/bin/bash` -> `bash`, `./bash` -> `bash`,
+    # `/usr/bin/python3` -> `python3`; a bare `bash` or `.` is unchanged.
+    base = tok
+    sub(/^.*\//, "", base)
+    return base
+}
+function is_interpreter_opener(line,   n, segs, i, seg, m, toks, j, base) {
+    # Split into command segments on ; & | (covers && and || too) so a piped
+    # or chained interpreter is caught in ANY position, e.g. `cat <<EOF | bash`.
+    n = split(line, segs, /[;&|]+/)
+    for (i = 1; i <= n; i++) {
+        seg = segs[i]
+        sub(/^[ \t]+/, "", seg)
+        m = split(seg, toks, /[ \t]+/)
+        if (m == 0) continue
+        # Strip leading command wrappers that do not change what runs:
+        # env / command / exec / builtin, each followed by its own -flags
+        # and (for env) VAR=value assignments, then the real command word.
+        j = 1
+        while (j <= m) {
+            if (toks[j] == "env" || toks[j] == "command" || toks[j] == "exec" || toks[j] == "builtin") {
+                j++
+                while (j <= m && (toks[j] ~ /^-/ || toks[j] ~ /^[A-Za-z_][A-Za-z0-9_]*=/)) j++
+                continue
+            }
+            break
+        }
+        if (j > m) continue
+        base = _interp_basename(toks[j])
+        if (base ~ /^(bash|sh|zsh|dash|ksh|python[0-9.]*|perl|ruby|node|nodejs|eval|source|\.)$/)
+            return 1
+    }
+    return 0
+}
+# Same closed-block detection as mask_heredoc_bodies(), but SKIPS masking
+# (leaves the body visible) for any block whose opener is interpreter-fed
+# per is_interpreter_opener() -- see KNOWN LIMITATIONS #1 above. Used ONLY by
+# the gh-api-rawfield-body-literal-at catastrophic check (#5198);
+# extract_write_targets() keeps calling plain mask_heredoc_bodies() above,
+# unchanged.
+function mask_heredoc_bodies_selective(s,   out, lines, nl, i, j, line, trimmed, body, delim, closeat, p, off, MASKC) {
+    MASKC = sprintf("%c", 23) # ETB -- placeholder for inert heredoc-body text
+    nl = split(s, lines, "\n")
+    if (nl == 0) return ""
+    for (i = 1; i <= nl; i++) {
+        line = lines[i]
+        off = 1
+        while (1) {
+            p = index(substr(line, off), "<<")
+            if (p == 0) break
+            p = off + p - 1
+            off = p + 2
+            delim = heredoc_delim_at(line, p)
+            if (delim == "") continue
+            closeat = 0
+            for (j = i + 1; j <= nl; j++) {
+                trimmed = lines[j]
+                sub(/^\t+/, "", trimmed)
+                if (trimmed == delim) { closeat = j; break }
+            }
+            if (closeat == 0) continue
+            if (!is_interpreter_opener(line)) {
+                for (j = i + 1; j < closeat; j++) {
+                    body = lines[j]
+                    gsub(/./, MASKC, body)
+                    lines[j] = body
+                }
             }
             i = closeat            # resume scanning after the delimiter line
             break
@@ -2207,26 +2318,35 @@ if [[ "$COMMAND" == *"@"* ]]; then
     # `.../issues/{n}/comments`. Confirmed via the test suite's new
     # non-comments-endpoint case; no widening was needed here.
     #
-    # HEREDOC-MASKED SCAN (#5181): this check used to grep raw $COMMAND, so a
-    # heredoc BODY line that merely QUOTES the denied phrase as inert prose
-    # (e.g. a report `cat > f.md <<'EOF' ... gh api ... -f body=@x ... EOF`,
-    # nothing of which executes) tripped the same catastrophic-tier deny as a
-    # live invocation. Reuses mask_heredoc_bodies() (#5000, defined above)
-    # -- the same primitive extract_write_targets() already uses -- to build
-    # a heredoc-body-blanked working copy and scans THAT instead. Built
-    # lazily (only when '<<' is present, mirroring the COMMAND_NO_COMMENT
+    # HEREDOC-MASKED SCAN (#5181, refined #5198): this check used to grep raw
+    # $COMMAND, so a heredoc BODY line that merely QUOTES the denied phrase as
+    # inert prose (e.g. a report `cat > f.md <<'EOF' ... gh api ... -f
+    # body=@x ... EOF`, nothing of which executes) tripped the same
+    # catastrophic-tier deny as a live invocation. Reuses
+    # mask_heredoc_bodies_selective() (#5198, built on the mask_heredoc_bodies()
+    # primitive extract_write_targets() already uses, #5000) to build a
+    # heredoc-body-blanked working copy and scans THAT instead. Built lazily
+    # (only when '<<' is present, mirroring the COMMAND_NO_COMMENT
     # `#`-present hot-path guard below) and scoped to just this one check;
     # every other rule in this file keeps reading raw $COMMAND /
     # COMMAND_NO_COMMENT unchanged. Masking only ever narrows: a REAL
     # (non-heredoc) invocation is untouched and still denies, even sitting in
     # the same multi-line command as an unrelated heredoc (mirrors the #5000
     # "narrows, never widens" test at
-    # tests/hooks/test-guard-destructive.sh:2691).
+    # tests/hooks/test-guard-destructive.sh:2691). UNLIKE plain
+    # mask_heredoc_bodies(), the _selective() variant does NOT mask a heredoc
+    # body whose opener feeds an interpreter (`bash <<EOF`, `sh -s <<EOF`,
+    # `cat <<EOF | bash`, ...) -- that body is genuinely live code to the
+    # inner interpreter (KNOWN LIMITATIONS #1, above), so masking it here
+    # would silently turn a real `gh api ... -f body=@path` invocation into
+    # an ALLOW (#5198's regression). extract_write_targets() is unaffected --
+    # it still calls plain mask_heredoc_bodies() and still masks
+    # interpreter-fed bodies, an accepted tradeoff for its ask-tier use.
     # -------------------------------------------------------------------------
     if [[ "$COMMAND" == *"<<"* ]]; then
         COMMAND_HEREDOC_MASKED=$(printf '%s' "$COMMAND" | awk "$_MASKHEREDOC_AWK"'
         { buf = buf (NR > 1 ? "\n" : "") $0 }
-        END { printf "%s", mask_heredoc_bodies(buf) }')
+        END { printf "%s", mask_heredoc_bodies_selective(buf) }')
     else
         COMMAND_HEREDOC_MASKED="$COMMAND"
     fi
