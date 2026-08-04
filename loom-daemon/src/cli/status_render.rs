@@ -46,9 +46,13 @@ struct ResolvedCapacity {
     /// recomputation this superseded (which could disagree with the daemon
     /// when accounts were scarce).
     effective_cap: usize,
-    /// Whether the token axis is the binding (minimum) constraint. Always
-    /// `false` since #5270 — mirrors `report.capacity.token_bound`, which the
-    /// daemon itself now always reports as `false` for the same reason.
+    /// Whether the token pool is genuinely starved (zero healthy accounts).
+    /// Since #5270 this is NOT "tokens are the binding cap term" — the token
+    /// axis was removed from `dynamic_cap` entirely — but zero healthy
+    /// accounts still means every spawn will fail account selection, so
+    /// #5305 restored this as a reachable starvation signal rather than the
+    /// permanently-`false` placeholder #5304 left behind. Mirrors
+    /// `report.capacity.token_bound`.
     token_bound: bool,
 }
 
@@ -79,12 +83,15 @@ fn resolve_capacity(
             // #5270: the token axis no longer participates in the cap on any
             // auth path — a fresh client-side probe changes the *reported*
             // account-health figures (total/healthy/exhausted/token_axis_limit
-            // above), but must NOT re-derive its own `effective_cap` /
-            // `token_bound` from them the way the pre-#5270 formula did (that
-            // recomputation could disagree with the daemon whenever accounts
-            // were scarce, which is exactly the artificial cap this issue
-            // removes). The daemon's own `dynamic_cap` — `min(disk, ram,
-            // configured_max)` — is the sole authority.
+            // above), but must NOT re-derive its own `effective_cap` from them
+            // the way the pre-#5270 formula did (that recomputation could
+            // disagree with the daemon whenever accounts were scarce, which is
+            // exactly the artificial cap this issue removes). The daemon's own
+            // `dynamic_cap` — `min(disk, ram, configured_max)` — is the sole
+            // authority for the cap. `token_bound`, however, is a starvation
+            // signal (zero healthy accounts), independent of the cap — #5305
+            // restores it here too so a fresh probe reporting 0 healthy
+            // accounts still surfaces the guidance.
             return ResolvedCapacity {
                 source: "probe",
                 ranking_present: true,
@@ -93,7 +100,7 @@ fn resolve_capacity(
                 exhausted: cap.exhausted,
                 token_axis_limit,
                 effective_cap: report.dynamic_cap,
-                token_bound: false,
+                token_bound: cap.healthy == 0,
             };
         }
     }
@@ -123,6 +130,23 @@ fn resolve_capacity(
         effective_cap: report.dynamic_cap,
         token_bound: report.capacity.token_bound,
     }
+}
+
+/// Whether the daemon's own `.ranking` read is unambiguously starved (0
+/// healthy accounts) while a fresher read (a client-side probe, or a
+/// re-checked ranking `rc` resolved to) shows real capacity — #4344,
+/// re-scoped by #5305 for #5270: the concurrency cap is no longer affected
+/// either way, but the daemon's own spawn-time account **selection** is still
+/// reading a stale, fully-exhausted `.ranking` file. Pure predicate, kept
+/// separate from the println! block above it so it stays trivially
+/// unit-testable (mirrors `ipc::dispatch_would_meet_or_exceed_headroom`'s
+/// rationale).
+#[must_use]
+fn ranking_diverges_from_starvation(report: &DaemonStatusReport, rc: &ResolvedCapacity) -> bool {
+    report.capacity.ranking_present
+        && report.capacity.healthy_accounts == 0
+        && rc.ranking_present
+        && rc.healthy > 0
 }
 
 /// Build the combined status payload (daemon report + per-token usage) as a
@@ -981,17 +1005,21 @@ pub(crate) fn print_status_human(
     // the daemon itself used, which previously let "not capacity-bound" print
     // even while the daemon's real (lower) cap was already saturated.
     let capacity_bound = report.in_flight.len() >= dispatch_cap;
-    // #4344 (superseded by #5270): this used to promote to a headline warning
-    // when the daemon's own dispatch decision read 0 healthy accounts while a
-    // fresher probe (or the raw pool) showed real capacity — "0 healthy ×
-    // per-token = 0" really was the binding cap term back then. Since #5270
-    // the token axis no longer participates in `dynamic_cap` on any auth
-    // path, so 0 healthy accounts alone can never starve dispatch any more —
-    // hard-coding this to `false` (rather than deleting the branch) keeps the
-    // #4344 diagnosis machinery in place as dead code documenting the prior
-    // behavior, without ever printing the now-categorically-false
-    // "DISPATCH IS TOKEN-STARVED" headline again.
-    let dispatch_starved_but_disagrees = false;
+    // #4344, re-scoped by #5270/#5305: this used to mean "the token term is
+    // starving *dispatch itself*" — true pre-#5270, when the token axis was
+    // part of `dynamic_cap`. Since #5270 that is no longer possible on any
+    // auth path: `dynamic_cap` is `min(disk, ram, configured_max)` with no
+    // token term. #5304 hard-coded this to `false` to reflect that, which
+    // also silenced the underlying ranking-divergence detection entirely
+    // (#4344's original point) — the daemon's *own* `.ranking` read can still
+    // disagree with a fresher probe/ranking even though it no longer affects
+    // the cap. #5305 restores the detection: it now means the daemon's own
+    // spawn-time account **selection** will read 0/N healthy from a stale
+    // `.ranking`, while a fresher read (probe or re-check) shows real
+    // capacity — connects to #5269/#5283's per-repo ranking-staleness
+    // surfacing on `loom-daemon health`, this is the `status`-side
+    // counterpart.
+    let dispatch_starved_but_disagrees = ranking_diverges_from_starvation(report, &rc);
     // #4903: while the saturation admission brake is holding, "the limiter is
     // work availability" is flatly wrong and is the exact misread the issue was
     // filed on — a worker at 12× overcommit rendered as an idle host with nine
@@ -1011,19 +1039,23 @@ pub(crate) fn print_status_human(
             rc.healthy, rc.total, rc.exhausted
         );
         if dispatch_starved_but_disagrees {
-            // Headline promotion (#4344, was a small-print "note" pre-fix):
-            // the daemon's own dispatch decision is starved at 0 healthy
-            // accounts while the number above disagrees — dispatch will not
-            // resume until the ranking the daemon actually reads is fresh.
+            // Headline promotion (#4344, re-scoped by #5305 for #5270): the
+            // daemon's own `.ranking` read is starved at 0 healthy accounts
+            // while the number above disagrees. The dynamic concurrency cap
+            // itself is unaffected (#5270 — no token term on any auth path),
+            // but every spawn this daemon dispatches still picks its account
+            // from that same stale `.ranking` file, so account selection will
+            // keep failing until it is refreshed.
             let pool_display = report
                 .token_pool_dir
                 .as_ref()
                 .map_or_else(|| "(unknown pool dir)".to_string(), |d| d.display().to_string());
             println!(
-                "  \u{26a0} DISPATCH IS TOKEN-STARVED: the daemon's own ranking read shows \
-                 0/{} healthy (dispatch cap {dispatch_cap}), disagreeing with the {} healthy \
-                 shown above from {pool_display}. The token term is the limiter — refresh the \
-                 ranking with `loom-daemon tokens check --ranking` (or wait for the next self-refresh).",
+                "  \u{26a0} SPAWN SELECTION IS TOKEN-STARVED: the daemon's own ranking read shows \
+                 0/{} healthy, disagreeing with the {} healthy shown above from {pool_display}. \
+                 The concurrency cap ({dispatch_cap}) is unaffected (#5270), but every spawn still \
+                 picks its account from that stale ranking and will fail selection — refresh it \
+                 with `loom-daemon tokens check --ranking` (or wait for the next self-refresh).",
                 report.capacity.total_accounts, rc.healthy,
             );
         } else if rc.source == "probe"
@@ -1040,12 +1072,11 @@ pub(crate) fn print_status_human(
                 report.capacity.healthy_accounts
             );
         }
-        // #4344: when the daemon's own dispatch decision is unambiguously
-        // token-starved (see above), never print "the limiter is work
+        // #4344: when the daemon's own ranking read is unambiguously
+        // starved (see above), never print "the limiter is work
         // availability" — the headline diagnosis already named the real
-        // limiter, and running the generic capacity_bound/token_bound chain
-        // underneath it would contradict it (e.g. `capacity_bound` is
-        // trivially true against a dispatch cap of 0).
+        // problem, and running the generic capacity_bound/token_bound chain
+        // underneath it would contradict it.
         if !dispatch_starved_but_disagrees {
             if !capacity_bound {
                 // In-flight is below the cap: nothing is binding. Naming tokens
@@ -1072,21 +1103,19 @@ pub(crate) fn print_status_human(
                     );
                 }
             } else if rc.token_bound {
-                if rc.healthy == 0 {
-                    println!(
-                        "  token-bound: NO healthy accounts — new dispatch deferred until \
-                         capacity returns. Add accounts (~/.claude-monitor/accounts.env + \
-                         `loom-daemon tokens bootstrap`) or buy API credits, then `loom-daemon tokens check \
-                         --ranking`."
-                    );
-                } else {
-                    println!(
-                        "  token-bound: tokens are the binding constraint on throughput. Add \
-                         accounts or API credits to dispatch more concurrently."
-                    );
-                }
+                // #5305: `token_bound` means genuine starvation (zero healthy
+                // accounts) — since #5270 the concurrency cap itself is
+                // unaffected (it's `min(disk, ram, configured_max)`, no token
+                // term), but with zero healthy accounts every spawn will
+                // still fail account selection at dispatch time.
+                println!(
+                    "  token-bound: NO healthy accounts — the concurrency cap is unaffected \
+                     (#5270), but every spawn will fail account selection until capacity \
+                     returns. Add accounts (~/.claude-monitor/accounts.env + `loom-daemon tokens \
+                     bootstrap`) or buy API credits, then `loom-daemon tokens check --ranking`."
+                );
             } else {
-                println!("  not token-bound (tokens are not the current bottleneck)");
+                println!("  not token-bound (healthy accounts available for selection)");
             }
         }
     } else {
@@ -1884,6 +1913,125 @@ mod status_render_tests {
         let halted = classify(Some(true), true, false, None, None);
         assert_eq!(gate_status_short_label(&halted), "HALTED");
         assert!(format_gate_status(&halted).starts_with("HALTED"));
+    }
+}
+
+#[cfg(test)]
+mod token_starvation_render_tests {
+    //! #5305: PR #5304 removed the token axis from the admission cap (#5270)
+    //! but, in the process, over-removed two *signals* rather than
+    //! re-scoping them: `resolve_capacity`'s fresh-probe branch hardcoded
+    //! `token_bound: false`, and the #4344 ranking-divergence detection
+    //! (`ranking_diverges_from_starvation`, née `dispatch_starved_but_disagrees`)
+    //! was hardcoded to `false` outright. Both must be reachable again —
+    //! `token_bound` meaning genuine starvation (zero healthy accounts), not
+    //! "tokens bind the cap."
+    use super::{ranking_diverges_from_starvation, resolve_capacity};
+    use crate::cli::status::status_client_tests::sample_report;
+    use loom_daemon::types::CapacityReport;
+
+    #[test]
+    fn resolve_capacity_probe_tier_reports_token_bound_on_zero_healthy() {
+        let report = sample_report();
+        let usage = serde_json::json!({
+            "accounts": [
+                {"status": "exhausted", "7d_utilization": 0.99},
+                {"status": "blocked", "7d_utilization": 0.99},
+            ]
+        });
+        let rc = resolve_capacity(&report, Some(&usage));
+        assert_eq!(rc.source, "probe");
+        assert_eq!(rc.healthy, 0);
+        assert!(
+            rc.token_bound,
+            "a fresh probe with 0 healthy accounts must report starvation, \
+             not the #5304 hardcoded `false`"
+        );
+    }
+
+    #[test]
+    fn resolve_capacity_probe_tier_not_token_bound_when_any_account_healthy() {
+        let report = sample_report();
+        let usage = serde_json::json!({
+            "accounts": [
+                {"status": "available", "7d_utilization": 0.1},
+                {"status": "exhausted", "7d_utilization": 0.99},
+            ]
+        });
+        let rc = resolve_capacity(&report, Some(&usage));
+        assert_eq!(rc.source, "probe");
+        assert_eq!(rc.healthy, 1);
+        assert!(!rc.token_bound, "one healthy account remains ⇒ not starved");
+    }
+
+    #[test]
+    fn ranking_diverges_when_daemons_own_ranking_is_starved_but_probe_is_fresh() {
+        let mut report = sample_report();
+        report.capacity = CapacityReport {
+            ranking_present: true,
+            total_accounts: 3,
+            healthy_accounts: 0,
+            exhausted_accounts: 3,
+            token_axis_limit: 0,
+            token_bound: true,
+        };
+        let usage = serde_json::json!({
+            "accounts": [
+                {"status": "available", "7d_utilization": 0.1},
+                {"status": "exhausted", "7d_utilization": 0.99},
+                {"status": "exhausted", "7d_utilization": 0.99},
+            ]
+        });
+        let rc = resolve_capacity(&report, Some(&usage));
+        assert_eq!(rc.healthy, 1, "the fresher probe sees one healthy account");
+        assert!(
+            ranking_diverges_from_starvation(&report, &rc),
+            "daemon's own ranking reads 0 healthy while a fresher probe disagrees"
+        );
+    }
+
+    #[test]
+    fn ranking_does_not_diverge_when_both_agree_or_daemon_has_capacity() {
+        // Daemon's own ranking already shows healthy accounts ⇒ no divergence
+        // to report, regardless of what a fresh probe shows.
+        let mut report = sample_report();
+        report.capacity = CapacityReport {
+            ranking_present: true,
+            total_accounts: 3,
+            healthy_accounts: 2,
+            exhausted_accounts: 1,
+            token_axis_limit: 2,
+            token_bound: false,
+        };
+        let usage = serde_json::json!({
+            "accounts": [
+                {"status": "available", "7d_utilization": 0.1},
+                {"status": "available", "7d_utilization": 0.1},
+            ]
+        });
+        let rc = resolve_capacity(&report, Some(&usage));
+        assert!(!ranking_diverges_from_starvation(&report, &rc));
+
+        // Both the daemon's own ranking AND the fresh probe agree on
+        // starvation ⇒ no *disagreement* to headline (the plain "NO healthy
+        // accounts" guidance branch handles this case instead).
+        let mut starved_report = sample_report();
+        starved_report.capacity = CapacityReport {
+            ranking_present: true,
+            total_accounts: 3,
+            healthy_accounts: 0,
+            exhausted_accounts: 3,
+            token_axis_limit: 0,
+            token_bound: true,
+        };
+        let starved_usage = serde_json::json!({
+            "accounts": [
+                {"status": "exhausted", "7d_utilization": 0.99},
+                {"status": "exhausted", "7d_utilization": 0.99},
+            ]
+        });
+        let rc = resolve_capacity(&starved_report, Some(&starved_usage));
+        assert!(!ranking_diverges_from_starvation(&starved_report, &rc));
     }
 }
 
