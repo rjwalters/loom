@@ -37,7 +37,8 @@ const CONFORMANCE_FIXTURE_DIR = join(
   "..",
   "..",
   "..",
-  "loom-tools",
+  "defaults",
+  "scripts",
   "tests",
   "fixtures",
   "config_resolver"

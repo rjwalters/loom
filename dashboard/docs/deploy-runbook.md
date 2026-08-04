@@ -14,13 +14,27 @@ Companion documents:
 | [`../wrangler.toml`](../wrangler.toml) | The deployment template itself — every value you must supply is tagged `CHANGE ME` |
 | [`../web/README.md`](../web/README.md) | The dashboard UI this Worker also serves — architecture, local development, why it deploys as Workers Assets |
 | [`cloudflare-access.md`](cloudflare-access.md) | Gating the authenticated view behind zero-trust SSO while leaving the public view ungated |
-| [`reference-deployment.md`](reference-deployment.md) | The 2AM reference instance (`dashboard.2amlogic.com`) — a concrete, filled-in example of every value this runbook asks you to supply, plus its credential-file locations and current Access layout |
+| [`reference-deployment.md`](reference-deployment.md) | A reminder to keep a record of your own instance's specific values (account ID, database ID, custom domain, credential-file locations, Access layout) in your own infra repo |
+| [`../../.github/workflows/dashboard-deploy.yml`](../../.github/workflows/dashboard-deploy.yml) | An example CI auto-deploy pipeline (issue #4958) — see the note below |
 | [`../README.md`](../README.md) | Architecture, routes, local development, tests |
 | [`../../.loom/docs/telemetry-schema.md`](../../.loom/docs/telemetry-schema.md) | The wire contract the daemon pushes |
 
 > **Everything here is your own infrastructure.** Loom never phones home:
 > the daemon's `observability` block is opt-in, off by default, and points
 > only at the endpoint you configure.
+
+> **This is a bootstrap/recovery runbook.** A CI-driven auto-deploy pipeline
+> (`.github/workflows/dashboard-deploy.yml`, issue #4958) can run these same
+> steps automatically on every push to `main` that touches `dashboard/**` —
+> tests gate the deploy, D1 migrations apply automatically, and a failed
+> deploy is a loud GitHub Actions failure, never silent. Steps 1-10 below
+> remain exactly what CI (and you, deploying your **own** fresh instance)
+> still needs: they are how any instance gets bootstrapped in the first
+> place, and Step 6's manual `wrangler deploy` is still the right move if CI
+> itself is unavailable and a fix needs to reach production immediately. If
+> you wire up your own CI auto-deploy, keep a record of how its config
+> secret is provisioned in your own infra repo (see
+> [`reference-deployment.md`](reference-deployment.md)).
 
 ---
 
@@ -355,10 +369,12 @@ below.
 
 ### Rotating an ingest key
 
-`POST /admin/hosts` refuses a `host_id` that already exists (`409`), so
-rotation is a two-move operation. Pick whichever fits:
+`POST /admin/hosts` refuses a `host_id` that is currently **live** (`409`), so
+rotation is a two-move operation. A **revoked** `host_id` is re-provisionable
+(issue #5082) — the re-provision replaces the dead key rather than reviving it,
+so no raw SQL is involved either way. Pick whichever fits:
 
-**A. Rolling rotation (no raw SQL, brief dual-identity window)** — provision a
+**A. Rolling rotation (brief dual-identity window, no `401`s)** — provision a
 successor identity, cut the host over, then revoke the old one:
 
 ```bash
@@ -370,17 +386,16 @@ curl -sS -X POST "$BASE/admin/hosts/my-laptop/revoke" -H "authorization: Bearer 
 
 Historical rows keep the old `host_id`; new rows use the new one.
 
-**B. In-place rotation (same `host_id`, needs one D1 statement)** — delete the
-host row, then re-provision the same id with a fresh key:
+**B. In-place rotation (same `host_id`)** — revoke the host, then re-provision
+the same id, which mints a fresh key and clears the revocation atomically:
 
 ```bash
-npx wrangler d1 execute loom-observability --remote \
-  --command "DELETE FROM hosts WHERE host_id = 'my-laptop'"
+curl -sS -X POST "$BASE/admin/hosts/my-laptop/revoke" -H "authorization: Bearer $ADMIN"
 curl -sS -X POST "$BASE/admin/hosts" -H "authorization: Bearer $ADMIN" \
   -H 'content-type: application/json' -d '{"host_id":"my-laptop"}'
 ```
 
-Between the delete and the daemon picking up the new key, that host's pushes
+Between the revoke and the daemon picking up the new key, that host's pushes
 get `401` — they are **not lost**: the daemon's durable queue retries with
 backoff and drains once the new key is in place (up to `queueCapacity`).
 
@@ -464,12 +479,11 @@ Cloudflare account — steps 2-10 end to end, including a real daemon push — h
 not been performed** and is recommended before treating this as fully proven.
 Please report any step that does not work as written.
 
-The 2026-07-31 deploy of the [2AM reference instance](reference-deployment.md)
-was a real production deploy on a real account, but **it does not satisfy the
-"live from-scratch deploy" item above** — the first Worker that went live at
-that instance's domain turned out to be a bindings-less shell (no D1, no
-Durable Object), which points at that deploy not having followed this
-runbook's steps verbatim from the start. See
-[`reference-deployment.md`](reference-deployment.md) §7 for what happened.
-The outstanding validation this line calls for is still: a fresh account,
-this runbook's steps 1-10, no shortcuts, checked off one by one.
+A real production deploy of a live instance surfaced a related pitfall worth
+flagging here: the first Worker that went live turned out to be a
+bindings-less shell (no D1, no Durable Object) because that first deploy did
+not go through this runbook's steps verbatim — a reminder that "a deploy
+succeeded" alone does not prove the runbook was followed. That incident does
+not satisfy the "live from-scratch deploy" item above either. The
+outstanding validation this line calls for is still: a fresh account, this
+runbook's steps 1-10, no shortcuts, checked off one by one.

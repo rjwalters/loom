@@ -156,6 +156,21 @@ A sweep advanced to a new lifecycle phase (mirrors `sweep.issue.{N}.phase`).
 
 `phase` is a lifecycle name: `curator`, `builder`, `judge`, `doctor`, `merge`.
 
+**Source and cadence (#4863)**: `Event::SweepPhase` — the record's only upstream —
+is published by `SweepRegistry::sample_phase_transition`, which the reaper calls
+once per live sweep per `reap_once` tick (the 30s reaper timer, plus every
+read-path reap). It reads `.loom/sweep-checkpoint/issue-<N>.json` and publishes
+**only when the phase changed since the previous tick**, so a sweep sitting in a
+phase emits nothing further. The checkpoint's raw marker (`curator-done`,
+`judge-rejected`) is normalized to the lifecycle vocabulary above before it is
+published; an unrecognized marker passes through verbatim rather than being
+guessed at, so `phase` should be read as "one of the five names, or an unknown
+raw marker" — which is exactly how the dashboard types it
+(`SweepPhaseName | string`).
+
+Because the phase is polled rather than pushed, `entered_at` is the daemon's
+*observation* instant, an honest upper bound on the real transition time.
+
 ### `sweep.completed`
 
 A sweep reached a terminal state (the summary moment; richer detail is in the
@@ -249,16 +264,18 @@ fabricated instant, so consumers must treat `null`/absent as *unknown* — never
 
 ### `host.health`
 
-Host CPU/disk headroom, daemon version, and uptime (host-level — no `repo` /
-`visibility`). Every measured field is optional so an unmeasurable probe stays
-absent rather than being coerced to a fake zero (the daemon's "unknown != zero"
-contract; see `cpu_headroom.rs` / `disk_headroom.rs`).
+Host CPU/disk headroom, the emitting binary's identity, and uptime (host-level —
+no `repo` / `visibility`). Every measured field is optional so an unmeasurable
+probe stays absent rather than being coerced to a fake zero (the daemon's
+"unknown != zero" contract; see `cpu_headroom.rs` / `disk_headroom.rs`).
 
 ```json
 {
   "kind": "host.health",
   "captured_at": "2026-07-30T12:00:00Z",
   "daemon_version": "0.16.0",
+  "build_commit": "8c16fb5b",
+  "built_at": "2026-07-30T03:09:51Z",
   "uptime_sec": 86400,
   "logical_cpus": 28,
   "cpu_idle_fraction": 0.83,
@@ -270,6 +287,28 @@ contract; see `cpu_headroom.rs` / `disk_headroom.rs`).
 `cpu_idle_fraction`, `load_per_core`, and `worktree_root_free_gb` are omitted when
 unmeasurable. A consumer MUST treat an absent measurement as "unknown", never as
 zero/full.
+
+**Binary identity (`build_commit` / `built_at`, #4956).** `daemon_version` is
+`CARGO_PKG_VERSION`, so it only moves once per release: every build between two
+releases reports the same string, and a day-stale daemon is indistinguishable
+from current `main`. `build_commit` (the short git SHA the running binary was
+compiled from) and `built_at` (when it was compiled) are the precise identity —
+both come from the very same compile-time stamps `loom-daemon --version` prints
+(`LOOM_DAEMON_GIT_COMMIT` / `LOOM_DAEMON_BUILD_TIME`, baked in by `build.rs`), so
+the telemetry and the CLI can never disagree.
+
+- `build_commit` is always sent. `"unknown"` is a *meaningful* value, not a
+  missing measurement: it means the build host had no git (e.g. a
+  release-tarball build). A record from a pre-#4956 daemon has no field at all,
+  which decodes as an empty string.
+- `built_at` is **omitted** when the build-time stamp was unavailable — an
+  unknown build time is absent, never a fabricated instant, exactly like the
+  measured fields above.
+
+Both fields are additive and pass through public redaction unchanged (they
+describe the released binary, not any repo or operator — see
+`dashboard/src/redaction.ts`), so an older consumer that ignores unknown keys is
+unaffected.
 
 ## Persistence & read surface (`sweep.outcome`, Issue #4704)
 
@@ -347,27 +386,5 @@ loom-daemon sweep-outcomes --json
 
 Purely file-based (like `loom-daemon calibrate`) — no running daemon required.
 `--workspace PATH` selects a different repo root (default `.`).
-
-## Alternative sinks: the OTLP exporter (Epic #4702, Phase 4 — issue #4858)
-
-The native JSON-over-HTTPS push (`exporter::HttpsExporter`, above) is the
-default sink and stays that way for backward compatibility. Operators with an
-existing OpenTelemetry stack (a self-hosted collector, Grafana, Honeycomb, …)
-can instead select `observability.exporter = "otlp"`
-(`$LOOM_OBSERVABILITY_EXPORTER=otlp` overrides; **env > config > default**,
-default `"https"`), which POSTs to `{observability.endpoint}/v1/logs` and
-`{observability.endpoint}/v1/metrics` using the same `observability.endpoint`
-+ `observability.ingestKeyFile` + `Authorization: Bearer` convention as the
-HTTPS sink.
-
-This is opt-in twice over: off by default (`observability.enabled`) *and*
-gated behind the `otlp` Cargo feature — a default `loom-daemon` build never
-compiles in the `opentelemetry-proto` dependency, so choosing `HttpsExporter`
-costs nothing extra. The full `TelemetryEnvelope` → OTLP field mapping (which
-record kinds become OTLP logs vs. metrics, and how `host_id` / `emitted_at` /
-the repo-visibility tag map onto OTLP resource/record attributes) is
-documented at `loom-daemon/src/observability/otlp/mod.rs`'s module doc
-comment, not duplicated here — that Rust doc comment is the source of truth,
-verified by `loom-daemon/src/observability/otlp/mapping.rs`'s unit tests.
 
 [`TelemetryEnvelope`]: #envelope

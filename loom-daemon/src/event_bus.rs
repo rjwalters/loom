@@ -37,7 +37,7 @@
 //! | `daemon.drain.completed` | Drain supervisor | `{in_flight}` (always 0) |
 //! | `daemon.drain.aborted`   | Daemon (IPC) | `{was_draining}` |
 //! | `daemon.drain.timeout`   | Drain supervisor | `{in_flight, forced, cancelled?}` |
-//! | `daemon.dispatch.headroom_advisory` | Daemon (IPC, `dispatch_sweep`) | `{repo_root, low_headroom, occupancy, dynamic_cap, cpu_headroom, disk_headroom, token_axis_limit, message}` |
+//! | `daemon.dispatch.headroom_advisory` | Daemon (IPC, `dispatch_sweep`) | `{repo_root, low_headroom, occupancy, dynamic_cap, disk_headroom, ram_headroom, token_axis_limit, message}` |
 //! | `daemon.preflight.advisory` | Daemon reaper (`SweepRegistry`) | `{workspace_root, consecutive_deaths, marker, message}` |
 //!
 //! New topics require a follow-up issue — the taxonomy is intentionally

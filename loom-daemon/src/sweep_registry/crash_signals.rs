@@ -786,6 +786,7 @@ pub(crate) fn is_pid_alive(_pid: u32) -> bool {
 #[cfg(unix)]
 extern "C" {
     fn kill(pid: i32, sig: i32) -> i32;
+    fn getpgid(pid: i32) -> i32;
 }
 
 #[cfg(unix)]
@@ -793,6 +794,55 @@ extern "C" {
 pub(crate) fn libc_kill(pid: i32, sig: i32) -> i32 {
     // Indirection so we can stub this in unit tests if needed.
     unsafe { kill(pid, sig) }
+}
+
+/// The process-group ID `pid` currently belongs to, or `None` when it cannot be
+/// determined (the process is gone — `ESRCH` — or the pid is out of range).
+///
+/// Issue #4980: the registry persists a sweep's pgid so a *reconstructed* entry
+/// (post-restart) or a fresh `loom-daemon cancel` process can still group-kill
+/// the whole tree. This probe is how the recorded value is **verified** rather
+/// than assumed: a sweep child spawned with `process_group(0)` is its own group
+/// leader, so `getpgid(child) == child`. Anything else means the spawn did not
+/// take (or the pid was recycled), and the caller must degrade to single-PID
+/// signalling instead of blast-radiusing an unrelated group.
+///
+/// `pid == 0` is rejected: `getpgid(0)` means "the caller's own group", which is
+/// never a meaningful answer for a *tracked child* and would invite exactly the
+/// self-group kill this module's `pgid == 0` guards exist to prevent.
+#[cfg(unix)]
+pub(crate) fn process_group_of(pid: u32) -> Option<u32> {
+    if pid == 0 {
+        return None;
+    }
+    let pid_t: i32 = pid.try_into().ok()?;
+    // SAFETY: `getpgid` is a read-only query with no memory arguments.
+    let pgid = unsafe { getpgid(pid_t) };
+    u32::try_from(pgid).ok().filter(|&p| p != 0)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn process_group_of(_pid: u32) -> Option<u32> {
+    None
+}
+
+/// The process group **this daemon/CLI process itself** belongs to (Issue
+/// #4980).
+///
+/// Load-bearing safety input, not a diagnostic: `kill(-pgid, sig)` against our
+/// own group would signal the daemon (and every one of its children) — the
+/// catastrophic mis-target that `send_group_signal`'s `pgid == 0` rejection
+/// already guards for the literal-zero case. A persisted-but-stale pgid read
+/// back from an old `owner.json` could name our own group by coincidence of PID
+/// recycling, so every group-signal caller cross-checks against this first.
+#[cfg(unix)]
+pub(crate) fn current_process_group() -> Option<u32> {
+    process_group_of(std::process::id())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn current_process_group() -> Option<u32> {
+    None
 }
 
 #[cfg(test)]
@@ -1034,6 +1084,7 @@ mod tests {
         std::fs::create_dir(&lock).unwrap();
         let sweep_id = "sweep-issue-404-adopt";
         let owner = LockOwner {
+            pgid: None,
             issue: 404,
             owner_pid: std::process::id(),
             acquired_at: Utc::now().to_rfc3339(),

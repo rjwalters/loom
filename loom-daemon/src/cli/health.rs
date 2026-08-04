@@ -15,6 +15,32 @@
 //! determine" (which the collector renders as a non-green `UNKNOWN` section,
 //! exit `1`) rather than aborting — the *only* thing that can stop this
 //! command from printing a report is a panic.
+//!
+//! # Daemon-authoritative vs. caller-process sections (#5061)
+//!
+//! Not every section's verdict is trustworthy from the same vantage point,
+//! which matters most exactly when this command is run somewhere other than
+//! the machine that ran `loom-daemon health`'s writer (an SSH probe of a
+//! remote fleet host, a non-login shell whose `PATH` differs from an
+//! interactive login shell's):
+//!
+//! - **`liveness`, `dispatch`, `tokens`, `roles`, `observability`** are
+//!   **daemon-authoritative** — every fact comes from the daemon's own IPC
+//!   round-trip ([`DaemonStatusReport`]) or a local probe of *this host's*
+//!   process table/filesystem, never a forge call made by this CLI process.
+//!   A verdict here reflects the daemon's own state, not this caller's
+//!   environment, so it is trustworthy the same way over SSH as locally.
+//! - **`queues`, `throughput`** execute `gh` calls **in this CLI process**
+//!   ([`pipeline_snapshot::GhPipelineSource`]), scoped to whatever `gh`
+//!   resolves to and however it is authenticated *here* — which can differ
+//!   from the daemon's own (already-verified, see `credential_preflight` in
+//!   `status`/`--json`) forge credential. A missing/non-executable `gh` in
+//!   *this* process (the common case: a non-login SSH shell whose `PATH`
+//!   lacks `~/.local/bin` / `/opt/homebrew/bin`, #4875's failure class) is
+//!   reported as a single distinct fact rather than a per-repo forge-query
+//!   failure, and cross-references the daemon's own `credential_preflight`
+//!   verdict when it is available — see `health::assess_queues` /
+//!   `assess_throughput` / `gh_unavailable_section`.
 
 use anyhow::Result;
 use std::path::Path;
@@ -88,13 +114,30 @@ async fn collect(window: Duration) -> HealthReport {
     //    the same rule `status`'s client-side token probe follows.
     let (ranking_present, ranking_age_secs) = probe_ranking(status.as_ref());
 
-    // 4. The forge fan-out for queue depth + throughput. Only the two metrics
-    //    those sections need (#4761's `PipelineMetrics::HEALTH`), over the
-    //    requested window, across the roots the daemon reported. Skipped
-    //    entirely when the daemon is unreachable: without its root list there
-    //    is nothing to query, and the sections honestly report "not collected".
-    let pipeline = match &status {
-        Some(report) => {
+    // 4. The forge fan-out for queue depth + review pipeline + throughput.
+    //    Only the metrics those sections actually read (#4761's
+    //    `PipelineMetrics::HEALTH`, widened by #5021 to carry the review-side
+    //    axes the `queues` verdict now consumes), over the requested window,
+    //    across the roots the daemon reported. Skipped entirely when the daemon
+    //    is unreachable: without its root list there is nothing to query, and
+    //    the sections honestly report "not collected".
+    //
+    //    4a. Before fanning out to N repos, check ONCE whether this process
+    //    can even run `gh` at all (#5061). A missing/non-executable `gh` — the
+    //    common case being a non-login SSH shell whose PATH lacks
+    //    `~/.local/bin` / `/opt/homebrew/bin` (the same failure class as
+    //    #4875) — would otherwise fail identically for every managed repo,
+    //    rendering as "forge query FAILED for: <every repo>" and reading like
+    //    a forge outage rather than what it actually is: a fact about this
+    //    caller's own environment. `Some` here means the fan-out below is
+    //    skipped entirely (there is no value in spawning N `gh` calls already
+    //    known to fail the same way), and `queues`/`throughput` render the
+    //    single fact instead — see `health::assess_queues`/`assess_throughput`.
+    let gh_unavailable =
+        pipeline_snapshot::probe_gh_availability(Path::new(pipeline_snapshot::DEFAULT_GH_BIN))
+            .err();
+    let pipeline = match (&status, &gh_unavailable) {
+        (Some(report), None) => {
             let roots = report
                 .per_repo
                 .iter()
@@ -110,7 +153,7 @@ async fn collect(window: Duration) -> HealthReport {
             );
             Some(pipeline_snapshot::collect_pipeline_snapshots(source, roots).await)
         }
-        None => None,
+        _ => None,
     };
 
     // 5. The daemon log's newest `work_finder:` line (#4824) — a *corroborating*
@@ -136,6 +179,7 @@ async fn collect(window: Duration) -> HealthReport {
         ranking_present,
         ranking_age_secs,
         pipeline,
+        gh_unavailable,
         // This CLI process's own build commit (#4824), compared daemon-side
         // against `DaemonStatusReport::daemon_build_commit` so a newer CLI
         // querying an older daemon reports build skew rather than a phantom
@@ -179,19 +223,14 @@ fn probe_ranking(status: Option<&DaemonStatusReport>) -> (bool, Option<u64>) {
     ranking_state(&dir)
 }
 
-/// `(present, age_secs)` for `<dir>/.ranking`. Extracted (and pure w.r.t. the
-/// filesystem argument) so the age computation is unit-testable.
+/// `(present, age_secs)` for `<dir>/.ranking`. Delegates to
+/// [`loom_daemon::capacity::ranking_file_state`] (#5269) — the same probe
+/// `ipc::build_daemon_status` uses to populate each registered repo's own
+/// `RepoStatus::ranking_present`/`ranking_age_secs`, so this CLI's single
+/// anchored-pool probe and the daemon's per-repo snapshot can never disagree
+/// about what "present"/"age" means for the same directory.
 fn ranking_state(dir: &Path) -> (bool, Option<u64>) {
-    let path = dir.join(".ranking");
-    let Ok(meta) = std::fs::metadata(&path) else {
-        return (false, None);
-    };
-    let age = meta
-        .modified()
-        .ok()
-        .and_then(|m| m.elapsed().ok())
-        .map(|d| d.as_secs());
-    (true, age)
+    loom_daemon::capacity::ranking_file_state(dir)
 }
 
 #[cfg(test)]

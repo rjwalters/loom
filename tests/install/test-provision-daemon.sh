@@ -433,6 +433,47 @@ rc15=$?
 assert_eq "gate accepts a real compiled binary without the bypass" "0" "$rc15"
 assert_eq "real binary is installed at dest" "1" "$( [[ -x "$DEST15/loom-daemon" ]] && echo 1 || echo 0 )"
 
+# ---------- test 16: certificate-signed binaries are never force-resigned
+# (#5020, epic #4990 Phase 3) — a FETCHED release artifact carries a real
+# Developer ID signature (Phase 2, #5011/#5018), and `codesign -f` would
+# unconditionally REPLACE it with an ad-hoc signature that has no certificate
+# chain. sign_daemon_binary must detect the existing Authority and skip.
+# ---------------------------------------------------------------------------
+FAKE_SIGNED_DIR="$WORKDIR/fake-signed-bin"
+mkdir -p "$FAKE_SIGNED_DIR"
+cat > "$FAKE_SIGNED_DIR/uname" <<'EOF'
+#!/usr/bin/env bash
+echo "Darwin"
+EOF
+chmod +x "$FAKE_SIGNED_DIR/uname"
+CODESIGN_SIGNED_ARGS_FILE="$WORKDIR/codesign-args-signed.txt"
+# `-dvvv` reports a certificate-backed signature (Authority on stderr, exactly
+# where real codesign prints it); ANY other invocation records its argv so the
+# assertion below can prove no re-signing was attempted.
+cat > "$FAKE_SIGNED_DIR/codesign" <<EOF
+#!/usr/bin/env bash
+if [[ "\${1:-}" == "-dvvv" ]]; then
+  echo "Identifier=com.rjwalters.loom-daemon" >&2
+  echo "Authority=Developer ID Application: Test Authority (TESTTEAM)" >&2
+  exit 0
+fi
+echo "\$@" >> "$CODESIGN_SIGNED_ARGS_FILE"
+exit 0
+EOF
+chmod +x "$FAKE_SIGNED_DIR/codesign"
+
+SRC16="$WORKDIR/src16/loom-daemon"
+mkdir -p "$WORKDIR/src16"
+make_fake_bin "$SRC16" "0.17.0"
+DEST16="$WORKDIR/dest16"
+out16=$(PATH="$FAKE_SIGNED_DIR:$PATH" LOOM_DAEMON_BIN_DIR="$DEST16" provision_machine_daemon "$SRC16" 2>&1)
+rc16=$?
+assert_eq "already-signed: provision returns 0" "0" "$rc16"
+assert_eq "already-signed: binary is still provisioned" "1" "$( [[ -x "$DEST16/loom-daemon" ]] && echo 1 || echo 0 )"
+assert_contains "already-signed: says it is not re-signing" "$out16" "already signed with a real certificate"
+assert_eq "already-signed: codesign -f is NEVER invoked (no ad-hoc downgrade)" "0" \
+  "$( [[ -s "$CODESIGN_SIGNED_ARGS_FILE" ]] && echo 1 || echo 0 )"
+
 # ---------- summary ----------
 echo ""
 echo "-----------------------------------------"

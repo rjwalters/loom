@@ -7,6 +7,7 @@ import {
   redactFleetSnapshot,
   redactHistoryQueryResult,
   redactHistoryRecord,
+  redactManagedRepos,
   redactPayload,
   redactSseFrame,
 } from "../src/redaction";
@@ -234,6 +235,175 @@ describe("redactPayload — per-kind field allowlist", () => {
     expect(redactPayload("host.health", payload)).toEqual(payload);
   });
 
+  it("host.health: build identity (build_commit/built_at) survives redaction alongside daemon_version", () => {
+    // #4956 — the commit is the only field that tells two builds sharing a
+    // `daemon_version` apart, so stripping it here would re-blind the
+    // dashboard it was added for.
+    const payload = {
+      kind: "host.health",
+      captured_at: "2026-08-02T12:00:00Z",
+      daemon_version: "0.17.0",
+      build_commit: "8c16fb5b",
+      built_at: "2026-08-02T03:09:51Z",
+      uptime_sec: 86400,
+      logical_cpus: 28,
+    };
+    expect(redactPayload("host.health", payload)).toEqual(payload);
+  });
+
+  it("host.health: dispatch-attention state (dispatch_halted/halt_reason) survives redaction (#4975)", () => {
+    // Describes the machine's own admission behavior, not any repo/operator
+    // — same reasoning as `cpu_idle_fraction`/`load_per_core` directly above
+    // it in the allowlist.
+    const payload = {
+      kind: "host.health",
+      captured_at: "2026-08-02T12:00:00Z",
+      daemon_version: "0.17.0",
+      uptime_sec: 86400,
+      logical_cpus: 28,
+      dispatch_halted: true,
+      halt_reason: "load-per-core 4.24 >= 2.50 sustained for 3 consecutive tick(s)",
+    };
+    expect(redactPayload("host.health", payload)).toEqual(payload);
+  });
+
+  it("host.health: role-tick health (roles) survives redaction, but each persistent root is basenamed and detail is dropped for the public view (#5022, #5065)", () => {
+    // The counts and each failure's role/failures/last_at survive (they
+    // describe the machine, not the work). The workspace `root` is a full
+    // absolute filesystem path whose home-directory segment names the
+    // operator on the common macOS/Linux layout — so the public,
+    // unauthenticated surface only ever gets its basename, mirroring the
+    // daemon's `RoleFailure::label()` and the frontend's `pathBasename`.
+    // `detail` is dropped entirely (#5065): it is a free-form failure string
+    // the daemon builds by interpolating another absolute path plus a log
+    // tail, so — unlike `root` — there is no basename-style truncation that
+    // makes it safe for the public surface.
+    const payload = {
+      kind: "host.health",
+      captured_at: "2026-08-02T12:00:00Z",
+      daemon_version: "0.17.0",
+      uptime_sec: 86400,
+      logical_cpus: 28,
+      roles: {
+        total: 3,
+        ok: 1,
+        persistent: [
+          {
+            root: "/Users/alice/GitHub/loom",
+            role: "judge",
+            failures: 2,
+            last_at: "2026-08-02T11:59:00Z",
+            detail: "no-token-pool",
+          },
+        ],
+      },
+    };
+    const redacted = redactPayload("host.health", payload);
+    // Counts and non-path detail survive unchanged.
+    expect(redacted).toMatchObject({
+      kind: "host.health",
+      captured_at: "2026-08-02T12:00:00Z",
+      daemon_version: "0.17.0",
+      uptime_sec: 86400,
+      logical_cpus: 28,
+    });
+    expect(redacted.roles).toEqual({
+      total: 3,
+      ok: 1,
+      persistent: [
+        {
+          // Basenamed — the operator-identifying home-directory prefix is gone.
+          root: "loom",
+          role: "judge",
+          failures: 2,
+          last_at: "2026-08-02T11:59:00Z",
+          // NOTE: no `detail` key at all — dropped, not truncated.
+        },
+      ],
+    });
+    // The raw absolute path (and its operator-identifying username segment)
+    // never reaches the public surface, in any field.
+    expect(JSON.stringify(redacted)).not.toContain("/Users/alice");
+    expect(JSON.stringify(redacted)).not.toContain("alice");
+  });
+
+  it("host.health: a realistic role-tick `detail` (absolute path + log tail) never reaches the public surface (#5065)", () => {
+    // The most common role-tick failure path (`RoleTickOutcome::Failure` in
+    // `loom-daemon/src/role_runner.rs` for a non-zero exit) builds `detail`
+    // by interpolating the absolute path to `spawn-worker.sh` plus a tail of
+    // the failing role child's own log output.
+    const payload = {
+      kind: "host.health",
+      captured_at: "2026-08-02T12:00:00Z",
+      daemon_version: "0.17.0",
+      roles: {
+        total: 1,
+        ok: 0,
+        persistent: [
+          {
+            root: "/Users/alice/GitHub/loom",
+            role: "judge",
+            failures: 1,
+            last_at: "2026-08-02T11:59:00Z",
+            detail:
+              "`/Users/alice/GitHub/loom/.loom/scripts/spawn-worker.sh` exited with exit status: 1: some log tail",
+          },
+        ],
+      },
+    };
+    const redacted = redactPayload("host.health", payload);
+    const serialized = JSON.stringify(redacted);
+    expect(serialized).not.toContain("alice");
+    expect(serialized).not.toContain("/Users/alice/GitHub/loom/.loom/scripts/spawn-worker.sh");
+    expect((redacted.roles as { persistent: Record<string, unknown>[] }).persistent[0]).not.toHaveProperty("detail");
+  });
+
+  it("host.health: no roles key at all when the payload carries no role-tick summary (#5022)", () => {
+    const payload = { kind: "host.health", daemon_version: "0.17.0", uptime_sec: 100 };
+    expect(redactPayload("host.health", payload)).not.toHaveProperty("roles");
+  });
+
+  it("host.health: a total: 0 role-tick summary round-trips distinctly (no persistent list) (#5022)", () => {
+    const payload = {
+      kind: "host.health",
+      daemon_version: "0.17.0",
+      uptime_sec: 100,
+      roles: { total: 0, ok: 0 },
+    };
+    const redacted = redactPayload("host.health", payload);
+    expect(redacted.roles).toEqual({ total: 0, ok: 0 });
+  });
+
+  it("host.health: a private repo's slug is redacted, but every other field survives unchanged (#4976)", () => {
+    const payload = {
+      kind: "host.health",
+      captured_at: "2026-08-02T12:00:00Z",
+      daemon_version: "0.17.0",
+      uptime_sec: 86400,
+      logical_cpus: 28,
+      managed_repos: [
+        { slug: "rjwalters/loom", visibility: "public" },
+        { slug: "2AMLogic/gf180-pll", visibility: "private" },
+      ],
+    };
+    const redacted = redactPayload("host.health", payload);
+    expect(redacted).toMatchObject({
+      daemon_version: "0.17.0",
+      uptime_sec: 86400,
+      logical_cpus: 28,
+    });
+    expect(redacted.managed_repos).toEqual([
+      { slug: "rjwalters/loom", visibility: "public" },
+      { visibility: "private" },
+    ]);
+    expect(JSON.stringify(redacted)).not.toContain("gf180-pll");
+  });
+
+  it("host.health: no managed_repos key at all when the payload carries no roster", () => {
+    const payload = { kind: "host.health", daemon_version: "0.17.0", uptime_sec: 100 };
+    expect(redactPayload("host.health", payload)).not.toHaveProperty("managed_repos");
+  });
+
   it("an unrecognized (forward-compatible) kind reveals only `kind`", () => {
     const redacted = redactPayload("future.kind", {
       kind: "future.kind",
@@ -378,6 +548,40 @@ describe("redactFleetSnapshot", () => {
     expect(redacted.activeSweeps[0]).not.toHaveProperty("sweepId");
   });
 
+  it("collapses a private repo's slug for a public viewer, and shows every slug to an authenticated one (#4976)", () => {
+    const snapshot: FleetSnapshot = {
+      hosts: {
+        "host-abc": {
+          health: {
+            record: {
+              kind: "host.health",
+              uptime_sec: 100,
+              managed_repos: [
+                { slug: "rjwalters/loom", visibility: "public" },
+                { slug: "2AMLogic/gf180-pll", visibility: "private" },
+              ],
+            },
+            updatedAt: "2026-07-30T12:00:00Z",
+          },
+        },
+      },
+      activeSweeps: [],
+    };
+
+    const publicRecord = redactFleetSnapshot(snapshot, false).hosts["host-abc"]?.health?.record;
+    expect(publicRecord?.managed_repos).toEqual([
+      { slug: "rjwalters/loom", visibility: "public" },
+      { visibility: "private" },
+    ]);
+    expect(JSON.stringify(publicRecord)).not.toContain("gf180-pll");
+
+    const authedRecord = redactFleetSnapshot(snapshot, true).hosts["host-abc"]?.health?.record;
+    expect(authedRecord?.managed_repos).toEqual([
+      { slug: "rjwalters/loom", visibility: "public" },
+      { slug: "2AMLogic/gf180-pll", visibility: "private" },
+    ]);
+  });
+
   it("summarizes the token pool for a public viewer", () => {
     const snapshot: FleetSnapshot = {
       hosts: {
@@ -420,6 +624,73 @@ describe("redactFleetSnapshot", () => {
 
     const record = redactFleetSnapshot(snapshot, true).hosts["host-abc"]?.tokens?.record;
     expect(record).toEqual({ kind: "tokens.snapshot", accounts });
+  });
+
+  it("keeps the full absolute root and detail in a role-tick failure for an authenticated viewer (#5065)", () => {
+    const roles = {
+      total: 1,
+      ok: 0,
+      persistent: [
+        {
+          root: "/Users/alice/GitHub/loom",
+          role: "judge",
+          failures: 1,
+          last_at: "2026-08-02T11:59:00Z",
+          detail: "`/Users/alice/GitHub/loom/.loom/scripts/spawn-worker.sh` exited with exit status: 1: log tail",
+        },
+      ],
+    };
+    const snapshot: FleetSnapshot = {
+      hosts: {
+        "host-abc": {
+          health: {
+            record: { kind: "host.health", uptime_sec: 100, roles },
+            updatedAt: "2026-07-30T12:00:00Z",
+          },
+        },
+      },
+      activeSweeps: [],
+    };
+
+    const authedRecord = redactFleetSnapshot(snapshot, true).hosts["host-abc"]?.health?.record;
+    expect(authedRecord).toEqual({ kind: "host.health", uptime_sec: 100, roles });
+
+    const publicRecord = redactFleetSnapshot(snapshot, false).hosts["host-abc"]?.health?.record;
+    const publicPersistent = (publicRecord?.roles as { persistent: Record<string, unknown>[] } | undefined)
+      ?.persistent;
+    expect(publicPersistent?.[0]).not.toHaveProperty("detail");
+    expect(JSON.stringify(publicRecord)).not.toContain("alice");
+  });
+});
+
+describe("redactManagedRepos", () => {
+  it("keeps a public entry's slug, strips a private entry's slug but keeps its place", () => {
+    expect(
+      redactManagedRepos([
+        { slug: "rjwalters/loom", visibility: "public" },
+        { slug: "2AMLogic/gf180-pll", visibility: "private" },
+        { slug: "2AMLogic/gf180-trng", visibility: "private" },
+      ]),
+    ).toEqual([
+      { slug: "rjwalters/loom", visibility: "public" },
+      { visibility: "private" },
+      { visibility: "private" },
+    ]);
+  });
+
+  it("treats a malformed row (missing/wrong-typed slug, any non-\"public\" visibility) as private", () => {
+    expect(
+      redactManagedRepos([
+        { visibility: "public" }, // no slug at all
+        { slug: 42, visibility: "public" }, // wrong-typed slug
+        { slug: "owner/repo", visibility: "internal" }, // unrecognized visibility label
+        { slug: "owner/repo" }, // missing visibility
+      ]),
+    ).toEqual([{ visibility: "private" }, { visibility: "private" }, { visibility: "private" }, { visibility: "private" }]);
+  });
+
+  it("an empty roster redacts to an empty roster", () => {
+    expect(redactManagedRepos([])).toEqual([]);
   });
 });
 
@@ -600,6 +871,47 @@ describe("GET /public/history vs GET /api/history — end-to-end redaction", () 
     expect(tokensRecord?.record).toMatchObject({ account_count: 1, exhausted_count: 0 });
     expect(tokensRecord?.record).not.toHaveProperty("accounts");
     expect(publicText).not.toContain("agent-1");
+  });
+
+  it("a role-tick failure's `detail` never reaches GET /public/history, but GET /api/history keeps it in full (#5065)", async () => {
+    // Mirrors the `root` basenaming case #5042 landed, for the sibling
+    // `detail` field: the common role-tick failure path builds `detail` by
+    // interpolating an absolute `spawn-worker.sh` path plus a log tail.
+    const roleTickDetail =
+      "`/Users/alice/GitHub/loom/.loom/scripts/spawn-worker.sh` exited with exit status: 1: some log tail";
+    await ingest([
+      hostHealthEnvelope({
+        roles: {
+          total: 1,
+          ok: 0,
+          persistent: [
+            {
+              root: "/Users/alice/GitHub/loom",
+              role: "judge",
+              failures: 1,
+              last_at: "2026-08-02T11:59:00Z",
+              detail: roleTickDetail,
+            },
+          ],
+        },
+      }),
+    ]);
+
+    const publicResponse = await callWorker(new Request("https://ingest.example/public/history"));
+    const publicText = await publicResponse.text();
+    expect(publicText).not.toContain("alice");
+    expect(publicText).not.toContain(roleTickDetail);
+    const publicBody = JSON.parse(publicText) as {
+      records: { kind: string; record: { roles?: { persistent?: Record<string, unknown>[] } } }[];
+    };
+    const publicHealth = publicBody.records.find((r) => r.kind === "host.health");
+    expect(publicHealth?.record.roles?.persistent?.[0]).not.toHaveProperty("detail");
+    expect(publicHealth?.record.roles?.persistent?.[0]).toMatchObject({ root: "loom", role: "judge" });
+
+    const authResponse = await callWorker(await authedRequest("https://ingest.example/api/history"));
+    const authText = await authResponse.text();
+    expect(authText).toContain(roleTickDetail);
+    expect(authText).toContain("/Users/alice/GitHub/loom");
   });
 
   it("the authenticated route still serves the full per-account token rows", async () => {

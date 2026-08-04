@@ -203,6 +203,21 @@ loom-daemon tokens check --json    # Native Rust equivalent (issue #4108)
 ./.loom/scripts/probe-tokens.sh    # Cron-friendly wrapper for periodic invocation
 ```
 
+`--source` (flag or `$LOOM_RANKING_SOURCE`) selects where the ranking comes
+from: `auto` (default) prefers a fresh claude-monitor `ranking.json` and only
+falls back to this CLI's own native probe when one isn't present; `monitor`
+never falls back (an empty report when claude-monitor has nothing fresh);
+`probe` always uses the native probe, ignoring claude-monitor entirely.
+
+**After adding a new account** (via `bootstrap` or `import-from-monitor`), run
+`loom-daemon tokens check --ranking --source probe` once. Under the `auto`
+default, a fresh claude-monitor `ranking.json` short-circuits the whole probe
+— including for an account claude-monitor itself has not ranked yet — so a
+just-added account can be silently absent from `.ranking` (and therefore
+never selected) until claude-monitor's own next probe cycle catches up.
+`--source probe` reads every `*.token` file on disk directly, so the new
+account is ranked immediately.
+
 **`probe-tokens.sh` delegates to `loom-daemon tokens check`, not Python (#4080).**
 It resolves a `loom-daemon` binary (`$LOOM_DAEMON_BIN` → `loom-daemon` on PATH →
 build-output-relative candidates under the repo), capability-probes it with
@@ -290,28 +305,13 @@ token hits its weekly limit.
    `claude` (or pass `--use-wrapper` to layer on top of `claude-wrapper.sh` for
    retry behavior).
 
-### Verifying token precedence (`defaults/scripts/verify-token-precedence.sh`)
-
-The token rotation mechanism relies on `CLAUDE_CODE_OAUTH_TOKEN` taking precedence
-over Keychain authentication in Claude Code. After upgrading Claude Code or when
-diagnosing suspected rotation failures (e.g., the fallback-to-Keychain behavior
-mentioned in issue #3236), run `defaults/scripts/verify-token-precedence.sh` once
-from the repository root to confirm this assumption still holds:
-
-```bash
-./defaults/scripts/verify-token-precedence.sh
-```
-
-**Exit codes**:
-- `0` — precedence is correct; env-token takes precedence over Keychain
-- `1` — precedence failed; env-token is being ignored and Keychain is used (rotation will not work)
-- `2` — prerequisites missing (claude not installed, not logged in, etc.)
-
-The script creates a test with a deliberately bogus `CLAUDE_CODE_OAUTH_TOKEN` value
-and verifies that auth fails or differs from the Keychain account. If the installed
-Claude Code version silently falls back to Keychain when the env-token is invalid,
-rotation is broken on that version and the issue should be escalated to Claude Code
-support.
+This whole rotation scheme rests on one assumption: the installed Claude Code
+CLI honors `CLAUDE_CODE_OAUTH_TOKEN` over a locally logged-in Keychain
+account. `defaults/scripts/verify-token-precedence.sh` (#3236, operator-manual
+-- run by hand once per Claude Code version, not wired into any automated
+check) confirms that assumption still holds by comparing `claude auth status`
+with a real Keychain login against the same command run with a deliberately
+bogus env token.
 
 ## Selection algorithm (`loom-daemon tokens select`)
 
@@ -532,11 +532,57 @@ first-class in *generated* systemd units; this section is for bare/unmanaged
 daemon startups and ad hoc CLI invocations from arbitrary cwds — the generated
 units already cover the managed case).
 
-Implementation: [`resolve_tokens_dir_anchored()`](../../loom-daemon/src/tokens_pool/paths.rs)
+Implementation: [`resolve_tokens_dir_anchored()`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/tokens_pool/paths.rs)
 delegates step 2/3's "is this candidate a recognized Loom workspace" question
 to the same registry-membership check `#4299` established for CLI
 `--workspace` defaulting (`workspace_registry::resolve_client_workspace_default`)
 rather than a second, parallel detection path.
+
+### `loom-daemon health`'s daemon-CWD-vs-operator-repo distinction (#5269)
+
+The precedence above governs **two separate mechanisms** that do not share a
+scope, and conflating them was the root cause of a "5h-stale ranking" incident
+where the documented remediation refreshed the wrong pool:
+
+1. **The self-refresh loop is per-repo-correct.** The daemon's own
+   `token_ranking_refresh.rs` background task re-runs `tokens check --ranking`
+   for **every registered repo independently**, resolving each repo's own pool
+   via the *unanchored* `resolve_tokens_dir(&repo.root)` (step 1/2 of the
+   precedence above, evaluated separately per repo). On a multi-repo daemon
+   this keeps every registered repo's OWN `.ranking` fresh on its own cadence,
+   regardless of which repo the daemon process happens to be running in.
+2. **`loom-daemon health`'s (and `status`'s) single machine-level tokens
+   section is anchored to the daemon's OWN `fallback_root`** — its launch CWD
+   or `LOOM_WORKSPACE`, resolved via `resolve_tokens_dir_anchored` (the full
+   precedence above). On a daemon managing several repos from a launch CWD
+   that is only one of them (e.g. a daemon started under `~/GitHub/anvil`
+   managing `~/GitHub/loom` too), this reports staleness for whichever pool
+   *that* anchoring resolves to — which is not necessarily any particular
+   other registered repo's own pool, and was never designed to answer "is
+   *my* repo's pool fresh" for an operator running the command from a
+   different registered repo.
+
+**The fix (#5269)**: `loom-daemon status`'s `per_repo` breakdown (see
+[daemon-reference.md](daemon-reference.md)) now carries each registered repo's
+own `token_pool_dir`/`ranking_present`/`ranking_age_secs`, populated with the
+exact same unanchored `resolve_tokens_dir(&repo.root)` the self-refresh loop
+already uses — so an operator asking about a specific repo gets that repo's
+own answer, independent of the daemon's launch CWD. `loom-daemon health`'s
+`tokens` section detail JSON (`--json`) surfaces this as `per_repo: [...]`
+alongside the existing single-pool `pool_path`/`ranking_present`/
+`ranking_age_secs` fields (which keep their original, narrower
+`fallback_root`-anchored meaning — the top-level fields are NOT replaced,
+only supplemented), and folds a bounded "`N of M` registered repos have their
+own pool's `.ranking` stale/missing" note into the human summary line when any
+repo is affected.
+
+**The workaround this incident's remediation used** — refreshing from `$HOME`
+happened to "fix" the daemon's top-level reading only because
+`per_repo_tokens_dir($HOME)` collapses to the same path as the default shared
+pool (`~/.loom/tokens`) — is now unnecessary for diagnosing (not necessarily
+for actually refreshing) a specific repo's own staleness: read that repo's
+line in `loom-daemon status --json`'s `per_repo` array, or
+`loom-daemon health --json`'s `tokens.detail.per_repo`, instead.
 
 ## Hard-fail on missing pool
 
@@ -549,7 +595,7 @@ rotation has not been configured at all.
 
 The `loom-daemon` role runner (`autonomous.roleRunner`, see
 [daemon-reference.md](daemon-reference.md)) pre-checks
-[`tokens::token_pool_size`](../../loom-daemon/src/tokens.rs) for exactly this
+[`tokens::token_pool_size`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/tokens.rs) for exactly this
 condition **before** it ever spawns `spawn-claude.sh` (issue #4642): a repo
 with neither pool provisioned skips the doomed spawn entirely instead of
 hitting this hard-fail on every single tick forever. The skip is logged once
@@ -712,7 +758,6 @@ refuses to silently auto-clear `.bad_tokens` — that masks real auth problems.
 ## Tests
 
 ```bash
-PYTHONPATH=loom-tools/src python3 -m pytest loom-tools/tests/tokens/ -v
 bash .loom/scripts/tests/test-spawn-claude.sh
 ```
 

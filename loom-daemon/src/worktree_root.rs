@@ -122,6 +122,15 @@ mod tests {
 
     // std::env::set_var mutates process-global state; serialize env-touching
     // tests so parallel execution doesn't race on LOOM_WORKTREE_ROOT.
+    //
+    // ENV_LOCK alone is NOT sufficient: it is module-local, so it makes the
+    // mutation *look* contained while the var is in fact process-global and
+    // read by other modules' tests (`worktree_reaper::tests::run_pass` ->
+    // `reap_repo` -> `worktree_root()`). Every test below that calls
+    // `with_env` with a value therefore also carries `#[serial]` (the
+    // crate-default unkeyed group, shared with `worktree_reaper`'s reaper
+    // tests) so the two sides of that seam cannot interleave (#5164, same
+    // class as #5133).
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// Run `f` with LOOM_WORKTREE_ROOT set to `value` (or unset if None),
@@ -164,6 +173,7 @@ mod tests {
     use std::fs;
 
     #[test]
+    #[serial]
     fn default_when_no_override() {
         let tmp = tempfile::tempdir().unwrap();
         let repo_root = tmp.path().join("my-repo");
@@ -176,6 +186,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn env_override_namespaces_by_basename() {
         let tmp = tempfile::tempdir().unwrap();
         let repo_root = tmp.path().join("my-repo");
@@ -188,6 +199,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn env_override_strips_trailing_slash() {
         let tmp = tempfile::tempdir().unwrap();
         let repo_root = tmp.path().join("my-repo");
@@ -200,6 +212,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn config_override_namespaces_by_basename() {
         let tmp = tempfile::tempdir().unwrap();
         let repo_root = tmp.path().join("my-repo");
@@ -213,6 +226,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn env_beats_config() {
         let tmp = tempfile::tempdir().unwrap();
         let repo_root = tmp.path().join("my-repo");
@@ -226,6 +240,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn relative_env_override_falls_back_to_default() {
         let tmp = tempfile::tempdir().unwrap();
         let repo_root = tmp.path().join("my-repo");
@@ -238,6 +253,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn relative_config_override_falls_back_to_default() {
         let tmp = tempfile::tempdir().unwrap();
         let repo_root = tmp.path().join("my-repo");
@@ -251,6 +267,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn empty_env_override_falls_back_to_config_then_default() {
         let tmp = tempfile::tempdir().unwrap();
         let repo_root = tmp.path().join("my-repo");
@@ -264,6 +281,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn missing_config_key_uses_default() {
         let tmp = tempfile::tempdir().unwrap();
         let repo_root = tmp.path().join("my-repo");
@@ -278,6 +296,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn malformed_config_uses_default() {
         let tmp = tempfile::tempdir().unwrap();
         let repo_root = tmp.path().join("my-repo");
@@ -291,6 +310,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn gate_matches_default_path_worktree() {
         let tmp = tempfile::tempdir().unwrap();
         let repo_root = tmp.path().join("my-repo");
@@ -303,6 +323,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn gate_matches_override_path_worktree() {
         let tmp = tempfile::tempdir().unwrap();
         let repo_root = tmp.path().join("my-repo");
@@ -315,6 +336,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn gate_matches_default_substring_even_with_override_set() {
         // Mixed setup: an override is configured, but a worktree still lives
         // under the historical .loom/worktrees base. The substring fallback
@@ -330,6 +352,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn gate_rejects_unrelated_path() {
         let tmp = tempfile::tempdir().unwrap();
         let repo_root = tmp.path().join("my-repo");

@@ -23,6 +23,7 @@ jobs:
       mcp: ${{ steps.filter.outputs.mcp }}
       scripts: ${{ steps.filter.outputs.scripts }}
       dashboard: ${{ steps.filter.outputs.dashboard }}
+      docker: ${{ steps.filter.outputs.docker }}
     steps:
       - uses: dorny/paths-filter@v4
         id: filter
@@ -42,11 +43,16 @@ jobs:
             dashboard:
               - 'dashboard/**'
               - '.github/workflows/ci.yml'
+            docker:
+              - 'docker/**'
+              - '.dockerignore'
+              - '.github/workflows/ci.yml'
             scripts:
               - 'scripts/**'
               - 'defaults/**'
               - 'tests/hooks/**'
               - 'tests/install/**'
+              - 'tests/hermit/**'
               - 'install.sh'
               # .loom/hooks/** is git-tracked (self-install dogfooding) and
               # several defaults/hooks/tests/*.sh + tests/hooks/*.sh suites
@@ -224,6 +230,10 @@ jobs:
         run: bash scripts/test-installer.sh
       - name: Run installer reinstall-safety tests (#4188)
         run: bash defaults/scripts/tests/test-install-reinstall-safety.sh
+      - name: Run install --local/--gitignore mode tests (#5276)
+        run: bash scripts/test-install-local-mode.sh
+      - name: Run migrate-consumer tests (#5276)
+        run: bash scripts/test-migrate-consumer.sh
 
   codex-adapter-smoke:
     name: Codex Adapter Smoke (mocked)
@@ -323,6 +333,14 @@ jobs:
     # expected to be faster (no per-exec Gatekeeper/codesign overhead, cheaper
     # fork/exec) but this is the suites' first CI run — watch the actual
     # ubuntu wall-clock here and tighten LOOM_CI_SUITE_TIMEOUT only if needed.
+    #
+    # Since #5275 ci-wired.txt also covers tests/install/ (installer/
+    # uninstaller unit suites — previously appeared in this job's `changes`
+    # paths-filter trigger only, never actually invoked) and tests/hermit/
+    # (the Hermit role's stateless-ceremony heuristic regression guard,
+    # previously not referenced by CI at all). All 8 suites are hermetic
+    # (fake/stub binaries or local python3 AST fixtures, no live network or
+    # forge calls) and run in well under a second each.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -336,3 +354,29 @@ jobs:
         run: bash defaults/scripts/tests/check-ci-suite-manifest.sh
       - name: Run the CI-wired shell test suites
         run: bash defaults/scripts/tests/run-ci-suites.sh
+
+  worker-image-smoke:
+    name: loom-worker Image Smoke Test
+    needs: changes
+    if: always() && (github.event_name == 'push' || needs.changes.outputs.docker == 'true')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Native build (the runner IS x86_64-unknown-linux-gnu) — a full
+      # cross-compile matrix has no place in a per-PR smoke test; the release
+      # workflow's own `build-daemon` matrix already covers every published
+      # target, this job only needs the one Linux artifact the Dockerfile
+      # actually consumes.
+      - name: Build loom-daemon (release)
+        run: cargo build --release --package loom-daemon
+      - name: Package binary at the path the Dockerfile expects
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp target/release/loom-daemon dist/loom-daemon-x86_64-unknown-linux-gnu
+      - name: Build the loom-worker image (no push)
+        run: docker build -f docker/worker/Dockerfile -t loom-worker:ci-smoke .
+      - name: Run the smoke test
+        run: ./docker/worker/test-image.sh loom-worker:ci-smoke

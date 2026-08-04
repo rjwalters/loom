@@ -135,6 +135,60 @@ published and the `observability` health section stays silent. Choosing OTLP
 therefore trades this particular misconfiguration guardrail away; keep the
 default `"https"` sink if you want it.
 
+## 3b. Confirming telemetry is actually flowing
+
+`loom-daemon health`'s `observability` section is **anomaly-only** by design
+(issue #4830): it renders when something is wrong and stays silent otherwise.
+That is the right call for a surface whose value is that every printed line is
+worth reading — but on its own it left three very different hosts looking
+identical (no section at all): one exporting perfectly, one with observability
+disabled, and one that was configured, running, and had **never successfully
+exported anything**. A `~/.loom/logs/observability-queue.jsonl` of 0 bytes is
+equally consistent with "drained cleanly" and "nothing was ever enqueued", so
+confirming the healthy case meant grepping `daemon.log` for the *absence* of a
+warning.
+
+`loom-daemon status` now states the answer positively (issue #5083):
+
+```
+Observability: OK — last export 12s ago, 3481 record(s) as host_id=robb-studio → https://…/ingest
+```
+
+The same facts are machine-readable under `observability_export` in
+`loom-daemon status --json`, so a watch loop can assert health instead of
+inferring it from silence:
+
+```bash
+loom-daemon status --json | jq -e '.observability_export.state == "healthy"'
+```
+
+| `state` | Meaning | Rendered as |
+|---|---|---|
+| `disabled` | Exporter not running: `enabled=false`, or enabled but under-configured (no endpoint / no readable ingest key / `otlp` without the Cargo feature) | `Observability: disabled …` |
+| `starting` | Running, nothing acked yet, still inside the grace window (3 × `flushIntervalSecs`, floored at 10 min) — a just-rolled daemon, not a fault | `Observability: starting …` |
+| `never_exported` | Running well past the grace window and **no batch has ever been acked** — the silent failure mode | `Observability: NEVER EXPORTED …` |
+| `healthy` | Batches are being acked and the ids agree | `Observability: OK …` |
+| `host_id_mismatch` | Batches are being acked, but under a different `host_id` than this daemon reports for itself (the #4830 condition, §3 above) | `Observability: HOST-ID MISMATCH …` |
+| `failing` | The most recent flush attempt errored; the queue is retrying with backoff | `Observability: FAILING …` |
+
+`observability_export` also carries `host_id`, `endpoint`, `exporter`,
+`started_at`, `last_success_at`, `last_failure_at`, `last_failure_detail`,
+`records_exported`, `consecutive_failures`, and `flush_interval_secs`. A `null`
+`observability_export` means the daemon binary predates #5083 — "cannot tell",
+never "disabled"; restart the daemon onto a current binary.
+
+The health section keeps its anomaly-only contract. It now recognizes two
+additional *non-green* conditions — `never_exported` and `failing` — which are
+anomalies by the same rule that already admitted `host_id_mismatch`; `healthy`,
+`starting`, and `disabled` still render nothing at all. When a section does
+render, its `detail` payload carries the full `observability_export` record, so
+a machine consumer of `loom-daemon health --json` gets the positive facts too.
+
+**Note on scope**: this is a *transport-level* signal — it answers "are batches
+being acked", not "is every record kind being enqueued". A host can report
+`healthy` while a specific record kind is silently never queued (e.g. issue
+#5084); the two checks are complementary.
+
 ## 4. The backend: deploy your own Cloudflare Worker
 
 The Phase-2 backend is a Cloudflare Worker (D1 for durable history, a
@@ -142,7 +196,7 @@ Durable Object for live "what's running now" state, an hourly retention
 cron) that also serves the dashboard UI as static assets. Full deploy
 runbook — Wrangler setup, D1 migrations, admin token, per-host ingest key
 provisioning, verifying telemetry lands — is
-[`dashboard/docs/deploy-runbook.md`](../../dashboard/docs/deploy-runbook.md).
+[`dashboard/docs/deploy-runbook.md`](https://github.com/rjwalters/loom/blob/main/dashboard/docs/deploy-runbook.md).
 This is **your own infrastructure**; nothing in Loom points at a shared
 backend by default.
 
@@ -160,9 +214,9 @@ dead-end login wall for an anonymous visitor.
 
 - Gating setup (custom domain requirement, route map, Access application
   config, the single-URL fallback mechanics):
-  [`dashboard/docs/cloudflare-access.md`](../../dashboard/docs/cloudflare-access.md)
+  [`dashboard/docs/cloudflare-access.md`](https://github.com/rjwalters/loom/blob/main/dashboard/docs/cloudflare-access.md)
 - Query API + live event tail, request/response shapes, pagination:
-  [`dashboard/docs/query-api.md`](../../dashboard/docs/query-api.md)
+  [`dashboard/docs/query-api.md`](https://github.com/rjwalters/loom/blob/main/dashboard/docs/query-api.md)
 - Token/cost analytics (burn curves, forecasting, per-repo attribution, and
   why that surface is authenticated-only): `dashboard/docs/token-analytics.md`
 
@@ -173,7 +227,7 @@ backend (not a shared Loom service — every fleet deploys its own). Its
 specific account/database IDs, Access application layout, credential file
 locations, and cutover history (the hostname-wide Access app was retired in
 favor of the single-URL `/login`-scoped layout on 2026-07-31) are recorded
-in [`dashboard/docs/reference-deployment.md`](../../dashboard/docs/reference-deployment.md)
+in [`dashboard/docs/reference-deployment.md`](https://github.com/rjwalters/loom/blob/main/dashboard/docs/reference-deployment.md)
 — useful as a concrete filled-in example of every value the deploy runbook
 asks you to supply, not as a second copy of the how-to.
 

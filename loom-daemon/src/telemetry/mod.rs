@@ -51,6 +51,7 @@ use chrono::{DateTime, Utc};
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;
+use std::path::PathBuf;
 
 pub mod visibility;
 
@@ -434,7 +435,59 @@ pub struct TokenSnapshotRecord {
     pub accounts: Vec<TokenAccountState>,
 }
 
-/// `host.health` — host CPU/disk headroom plus daemon version and uptime.
+/// One `(root, role)` pair's persistent tick-failure detail inside a host's
+/// role-tick health summary (`host.health`'s `roles` field, Issue #5022).
+/// Mirrors `crate::health::RoleFailure`'s shape — `loom-daemon health`'s
+/// `roles` section already classifies exactly this
+/// (`crate::health::summarize_role_ticks`), so the telemetry pipeline carries
+/// the same classification rather than inventing a second one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RoleTickFailureEntry {
+    /// The workspace root this tick ran for.
+    pub root: PathBuf,
+    /// The role name (`champion`, `curator`, …).
+    pub role: String,
+    /// How many ticks failed for this pair inside the sampled window.
+    pub failures: usize,
+    /// When the most recent record for this pair landed.
+    pub last_at: DateTime<Utc>,
+    /// The most recent failure detail, when the tick reported one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// `host.health`'s role-tick health summary (Issue #5022): the same
+/// transient-vs-persistent classification `loom-daemon health`'s `roles`
+/// section already computes (`crate::health::summarize_role_ticks`), carried
+/// through the telemetry pipeline so a role dying on one host is observable
+/// fleet-wide — not only to an operator who happens to run `loom-daemon
+/// health` locally on that one host. That gap is exactly what #5004 found: a
+/// Judge outage stayed green on every other signal for most of a day.
+///
+/// Deliberately narrower than `crate::health::RoleTickSummary`: only
+/// `persistent` failures are carried — the `(root, role)` pairs whose most
+/// recent tick in the sampled window is still a failure, i.e. the ones that
+/// make `loom-daemon health`'s `roles` section report `DEGRADED`. `transient`
+/// (self-recovered) pairs are folded into `total`/`ok` like every other tick,
+/// exactly as the rendered `roles` summary line already treats them: a count,
+/// not alarming detail.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RoleTickHealth {
+    /// Total tick records sampled.
+    pub total: usize,
+    /// Successful tick records sampled.
+    pub ok: usize,
+    /// `(root, role)` pairs whose latest sampled record is a failure.
+    ///
+    /// `total: 0` (no ticks sampled — the role runner idle or disabled) means
+    /// "nothing to report", not "healthy": a consumer must not read an empty
+    /// `persistent` list on its own as proof the role runner is even running.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub persistent: Vec<RoleTickFailureEntry>,
+}
+
+/// `host.health` — host CPU/disk headroom plus the emitting binary's identity
+/// (version + build commit + build time) and uptime.
 /// Host-level: it references no repository, so it carries no visibility tag.
 /// Every measured field is optional so an unmeasurable probe stays absent rather
 /// than being coerced to a fake zero (matching `cpu_headroom` / `disk_headroom`'s
@@ -445,6 +498,29 @@ pub struct HostHealthRecord {
     pub captured_at: DateTime<Utc>,
     /// The emitting daemon's version (`CARGO_PKG_VERSION`).
     pub daemon_version: String,
+    /// The short git commit the emitting binary was BUILT from
+    /// (`self_update::BUILT_COMMIT`, baked in by `build.rs`), or `"unknown"`
+    /// when the build host had no git.
+    ///
+    /// `daemon_version` alone cannot answer "is this host's daemon current?" —
+    /// it only moves once per release, so every build between two releases
+    /// reports the same string and a day-stale binary is indistinguishable
+    /// from `main` (#4956). The commit is the precise identity.
+    ///
+    /// `#[serde(default)]` so a record emitted by a pre-#4956 daemon still
+    /// decodes (as an empty string) rather than failing the whole envelope.
+    #[serde(default)]
+    pub build_commit: String,
+    /// When the emitting binary was compiled (`LOOM_DAEMON_BUILD_TIME`), when
+    /// that stamp is present and parseable.
+    ///
+    /// `Option` rather than a bare `DateTime<Utc>` on purpose: `build.rs`
+    /// falls back to the literal string `"unknown"` when `date` is
+    /// unavailable, and this struct's contract is that an unavailable value
+    /// stays *absent* rather than being coerced to a fabricated instant (the
+    /// same "unknown != zero" rule the measured fields below follow).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub built_at: Option<DateTime<Utc>>,
     /// Daemon uptime in seconds.
     pub uptime_sec: u64,
     /// Logical CPU count.
@@ -458,6 +534,92 @@ pub struct HostHealthRecord {
     /// Free space (GB) on the worktree-root scratch volume, when measurable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worktree_root_free_gb: Option<u64>,
+    /// This host's currently in-flight (non-terminal) sweep IDs, across every
+    /// repo this daemon actively tracks — the daemon's own authoritative
+    /// registry view (Issue #4955). Consumed by the Phase-2 dashboard's
+    /// `FleetState` Durable Object to reconcile its live `sweep:` entries
+    /// against ground truth on every `host.health` update, so a sweep whose
+    /// `sweep.completed` record was lost (e.g. across a daemon restart) does
+    /// not linger forever as a phantom "in flight" entry.
+    ///
+    /// `#[serde(default)]` so a pre-#4955 queued record still surviving in a
+    /// host's on-disk `DurableQueue` past an upgrade decodes cleanly (empty
+    /// list) rather than failing to send at all. An **empty** list is
+    /// therefore ambiguous between "genuinely zero sweeps running" and "this
+    /// daemon predates the field" / "the registry was not yet queried" —
+    /// callers that reconcile against this field must never treat an empty
+    /// list as proof of zero in-flight sweeps on its own; see the dashboard's
+    /// `applyUpdate` doc comment for the exact caveat it applies.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_sweep_ids: Vec<String>,
+    /// Whether this host's own dispatch is currently halted for a
+    /// non-idle reason — i.e. the host-distress breaker
+    /// ([`crate::host_breaker`], Issue #4235) has tripped `Open` or is still
+    /// `CoolDown`ing (see [`crate::host_breaker::BreakerPhase::suppresses_dispatch`]).
+    /// `false` when the breaker is `Closed`, disabled, or has never been
+    /// registered (no work-finder loop running on this host) — a repo that
+    /// never enables autonomy sees no behavior change (Issue #4975).
+    ///
+    /// `#[serde(default)]` so a record from a pre-#4975 daemon still decodes
+    /// (as `false`, i.e. "not known to be halted") rather than failing.
+    #[serde(default)]
+    pub dispatch_halted: bool,
+    /// Human-readable reason for the current halt — the breaker's own
+    /// transition message (e.g. `"load-per-core 4.24 ≥ 2.50 sustained for 3
+    /// consecutive tick(s)"`), sourced straight from
+    /// [`crate::host_breaker::BreakerSnapshot::reason`]. Always `None` while
+    /// `dispatch_halted` is `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub halt_reason: Option<String>,
+    /// This host's managed-repository roster (Issue #4976): every workspace
+    /// root the daemon's [`crate::workspace_pool::WorkspacePool`] has a
+    /// provisioned registry for, resolved to its forge `owner/repo` slug and
+    /// [`RepoVisibility`] — sourced from the workspace registry itself, not
+    /// inferred from `active_sweep_ids`, so an idle-but-registered repo still
+    /// appears. Feeds the Phase-2 dashboard's "Repositories" fleet-card
+    /// section.
+    ///
+    /// `#[serde(default)]` so a pre-#4976 record still decodes (as an empty
+    /// roster) rather than failing the whole envelope — the same
+    /// backward-compatibility contract `active_sweep_ids` established.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub managed_repos: Vec<ManagedRepoEntry>,
+    /// This host's role-tick health (Issue #5022): mirrors `loom-daemon
+    /// health`'s `roles` section verdict inputs, carried through the
+    /// telemetry pipeline so a role dying on one host is observable
+    /// fleet-wide rather than only to an operator running `loom-daemon
+    /// health` locally on that host.
+    ///
+    /// `#[serde(default)]` so a record from a pre-#5022 daemon still decodes
+    /// (as the zero-value "no role ticks sampled" summary) rather than
+    /// failing the whole envelope.
+    #[serde(default)]
+    pub roles: RoleTickHealth,
+}
+
+/// One repository this host's daemon is currently managing (Issue #4976) —
+/// the machine-level workspace registry, surfaced in `status --json`'s
+/// `per_repo` but otherwise reaching the backend only via individual sweep
+/// records. `visibility` is derived exactly the way sweep records already
+/// derive theirs ([`visibility::derive_visibility`]), so the same
+/// private-safe-default tag governs redaction here too.
+///
+/// This struct carries the repo's **real** slug regardless of visibility —
+/// exactly like [`SweepStartedRecord::repo`] always carries the real slug.
+/// The anti-leak control is enforced at the Phase-2 dashboard's redaction
+/// boundary (`dashboard/src/redaction.ts`), not here; the daemon's own push
+/// to the observability backend is authenticated and never reaches an
+/// unauthenticated viewer directly.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ManagedRepoEntry {
+    /// The `owner/repo` forge slug.
+    pub slug: String,
+    /// This repo's visibility class. `#[serde(default)]` so a repo entry
+    /// missing the tag (should never happen from this daemon, but matches
+    /// every other visibility field's defensive posture) decodes to
+    /// `Private`, never `Public`.
+    #[serde(default)]
+    pub visibility: RepoVisibility,
 }
 
 #[cfg(test)]
@@ -563,11 +725,37 @@ mod tests {
         TelemetryRecord::HostHealth(HostHealthRecord {
             captured_at: ts(),
             daemon_version: "0.16.0".to_string(),
+            build_commit: "8c16fb5b".to_string(),
+            built_at: Some(ts()),
             uptime_sec: 86_400,
             logical_cpus: 28,
             cpu_idle_fraction: Some(0.83),
             load_per_core: Some(0.51),
             worktree_root_free_gb: Some(200),
+            active_sweep_ids: vec!["sweep-issue-4703-0".to_string()],
+            dispatch_halted: false,
+            halt_reason: None,
+            managed_repos: vec![
+                ManagedRepoEntry {
+                    slug: "rjwalters/loom".to_string(),
+                    visibility: RepoVisibility::Public,
+                },
+                ManagedRepoEntry {
+                    slug: "2AMLogic/gf180-pll".to_string(),
+                    visibility: RepoVisibility::Private,
+                },
+            ],
+            roles: RoleTickHealth {
+                total: 12,
+                ok: 10,
+                persistent: vec![RoleTickFailureEntry {
+                    root: PathBuf::from("/repos/loom"),
+                    role: "judge".to_string(),
+                    failures: 2,
+                    last_at: ts(),
+                    detail: Some("no-token-pool".to_string()),
+                }],
+            },
         })
     }
 
@@ -730,6 +918,285 @@ mod tests {
                 assert_eq!(r.visibility, RepoVisibility::Private);
             }
             other => panic!("expected SweepCompleted, got {other:?}"),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // host.health build identity (#4956).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn host_health_serializes_build_identity_alongside_version() {
+        let value = serde_json::to_value(host_health()).unwrap();
+        assert_eq!(
+            value
+                .get("daemon_version")
+                .and_then(serde_json::Value::as_str),
+            Some("0.16.0")
+        );
+        // The whole point of #4956: two builds sharing `daemon_version` are
+        // told apart by the commit, so it must be on the wire.
+        assert_eq!(
+            value
+                .get("build_commit")
+                .and_then(serde_json::Value::as_str),
+            Some("8c16fb5b")
+        );
+        assert_eq!(
+            value.get("built_at").and_then(serde_json::Value::as_str),
+            Some("2026-07-30T12:00:00Z")
+        );
+    }
+
+    #[test]
+    fn host_health_round_trips_build_identity() {
+        let json = serde_json::to_string(&host_health()).unwrap();
+        let decoded: TelemetryRecord = serde_json::from_str(&json).unwrap();
+        match decoded {
+            TelemetryRecord::HostHealth(r) => {
+                assert_eq!(r.build_commit, "8c16fb5b");
+                assert_eq!(r.built_at, Some(ts()));
+            }
+            other => panic!("expected HostHealth, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn host_health_omits_built_at_when_unknown() {
+        // `build.rs` stamps the literal "unknown" when the build host had no
+        // usable `date`; that must serialize as an ABSENT field, never as a
+        // fabricated instant (the struct's "unknown != zero" contract).
+        let record = TelemetryRecord::HostHealth(HostHealthRecord {
+            captured_at: ts(),
+            daemon_version: "0.17.0".to_string(),
+            build_commit: "unknown".to_string(),
+            built_at: None,
+            uptime_sec: 1,
+            logical_cpus: 4,
+            cpu_idle_fraction: None,
+            load_per_core: None,
+            worktree_root_free_gb: None,
+            active_sweep_ids: Vec::new(),
+            dispatch_halted: false,
+            halt_reason: None,
+            managed_repos: Vec::new(),
+            roles: RoleTickHealth::default(),
+        });
+        let value = serde_json::to_value(&record).unwrap();
+        assert!(
+            value.get("built_at").is_none(),
+            "an unknown build time must be absent, not a fabricated instant"
+        );
+        // The commit sentinel, unlike the instant, IS sent — "unknown" is a
+        // meaningful answer for a tarball build, not a missing measurement.
+        assert_eq!(
+            value
+                .get("build_commit")
+                .and_then(serde_json::Value::as_str),
+            Some("unknown")
+        );
+        // Still round-trips.
+        let decoded: TelemetryRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, record);
+    }
+
+    #[test]
+    fn host_health_from_a_pre_4956_daemon_still_decodes() {
+        // Backward compatibility: a record emitted by a daemon that predates
+        // the build-identity fields must decode, not poison the batch.
+        let json = r#"{
+            "kind": "host.health",
+            "captured_at": "2026-07-30T12:00:00Z",
+            "daemon_version": "0.16.0",
+            "uptime_sec": 86400,
+            "logical_cpus": 28
+        }"#;
+        let decoded: TelemetryRecord = serde_json::from_str(json).unwrap();
+        match decoded {
+            TelemetryRecord::HostHealth(r) => {
+                assert_eq!(r.daemon_version, "0.16.0");
+                assert_eq!(r.build_commit, "");
+                assert_eq!(r.built_at, None);
+            }
+            other => panic!("expected HostHealth, got {other:?}"),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // host.health managed_repos roster (#4976).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn host_health_serializes_managed_repos_with_slug_and_visibility() {
+        let value = serde_json::to_value(host_health()).unwrap();
+        let repos = value
+            .get("managed_repos")
+            .and_then(serde_json::Value::as_array)
+            .unwrap();
+        assert_eq!(repos.len(), 2);
+        assert_eq!(
+            repos[0].get("slug").and_then(serde_json::Value::as_str),
+            Some("rjwalters/loom")
+        );
+        assert_eq!(
+            repos[0]
+                .get("visibility")
+                .and_then(serde_json::Value::as_str),
+            Some("public")
+        );
+        assert_eq!(
+            repos[1].get("slug").and_then(serde_json::Value::as_str),
+            Some("2AMLogic/gf180-pll")
+        );
+        assert_eq!(
+            repos[1]
+                .get("visibility")
+                .and_then(serde_json::Value::as_str),
+            Some("private")
+        );
+    }
+
+    #[test]
+    fn host_health_omits_managed_repos_when_empty() {
+        // `skip_serializing_if = "Vec::is_empty"` — a host with no registered
+        // workspaces sends no key at all, mirroring `active_sweep_ids`.
+        let record = TelemetryRecord::HostHealth(HostHealthRecord {
+            captured_at: ts(),
+            daemon_version: "0.17.0".to_string(),
+            build_commit: "unknown".to_string(),
+            built_at: None,
+            uptime_sec: 1,
+            logical_cpus: 4,
+            cpu_idle_fraction: None,
+            load_per_core: None,
+            worktree_root_free_gb: None,
+            active_sweep_ids: Vec::new(),
+            dispatch_halted: false,
+            halt_reason: None,
+            managed_repos: Vec::new(),
+            roles: RoleTickHealth::default(),
+        });
+        let value = serde_json::to_value(&record).unwrap();
+        assert!(
+            value.get("managed_repos").is_none(),
+            "an empty roster must be absent from the wire, not an empty array"
+        );
+    }
+
+    #[test]
+    fn host_health_from_a_pre_4976_daemon_still_decodes() {
+        // Backward compatibility: a record emitted by a daemon that predates
+        // the managed-repo roster must decode with an empty roster, not fail
+        // the whole envelope.
+        let json = r#"{
+            "kind": "host.health",
+            "captured_at": "2026-07-30T12:00:00Z",
+            "daemon_version": "0.16.0",
+            "uptime_sec": 86400,
+            "logical_cpus": 28
+        }"#;
+        let decoded: TelemetryRecord = serde_json::from_str(json).unwrap();
+        match decoded {
+            TelemetryRecord::HostHealth(r) => {
+                assert!(r.managed_repos.is_empty());
+            }
+            other => panic!("expected HostHealth, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn managed_repo_entry_with_missing_visibility_defaults_to_private() {
+        // A repo entry with no `visibility` tag at all must decode Private —
+        // the same private-safe-default every other visibility field holds.
+        let json = r#"{"slug": "owner/repo"}"#;
+        let decoded: ManagedRepoEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(decoded.visibility, RepoVisibility::Private);
+        assert_eq!(decoded.slug, "owner/repo");
+    }
+
+    // ------------------------------------------------------------------
+    // host.health role-tick health (#5022).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn host_health_serializes_role_tick_health_persistent_failures() {
+        let value = serde_json::to_value(host_health()).unwrap();
+        let roles = value.get("roles").unwrap();
+        assert_eq!(roles.get("total").and_then(serde_json::Value::as_u64), Some(12));
+        assert_eq!(roles.get("ok").and_then(serde_json::Value::as_u64), Some(10));
+        let persistent = roles
+            .get("persistent")
+            .and_then(serde_json::Value::as_array)
+            .unwrap();
+        assert_eq!(persistent.len(), 1);
+        assert_eq!(
+            persistent[0]
+                .get("role")
+                .and_then(serde_json::Value::as_str),
+            Some("judge")
+        );
+        assert_eq!(
+            persistent[0]
+                .get("detail")
+                .and_then(serde_json::Value::as_str),
+            Some("no-token-pool")
+        );
+    }
+
+    #[test]
+    fn host_health_omits_persistent_when_empty_but_still_carries_roles() {
+        // A `total: 0` (or all-ok) summary must still be sent — "no role
+        // ticks sampled" / "every tick ok" is meaningful information, not
+        // nothing to report — but its empty `persistent` list is omitted from
+        // the wire, mirroring `managed_repos`/`active_sweep_ids`.
+        let record = TelemetryRecord::HostHealth(HostHealthRecord {
+            captured_at: ts(),
+            daemon_version: "0.17.0".to_string(),
+            build_commit: "unknown".to_string(),
+            built_at: None,
+            uptime_sec: 1,
+            logical_cpus: 4,
+            cpu_idle_fraction: None,
+            load_per_core: None,
+            worktree_root_free_gb: None,
+            active_sweep_ids: Vec::new(),
+            dispatch_halted: false,
+            halt_reason: None,
+            managed_repos: Vec::new(),
+            roles: RoleTickHealth {
+                total: 5,
+                ok: 5,
+                persistent: Vec::new(),
+            },
+        });
+        let value = serde_json::to_value(&record).unwrap();
+        let roles = value.get("roles").unwrap();
+        assert_eq!(roles.get("total").and_then(serde_json::Value::as_u64), Some(5));
+        assert!(roles.get("persistent").is_none());
+        let decoded: TelemetryRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, record);
+    }
+
+    #[test]
+    fn host_health_from_a_pre_5022_daemon_decodes_with_a_zero_value_roles_summary() {
+        // Backward compatibility: a record emitted by a daemon that predates
+        // role-tick health must decode with the zero-value ("nothing sampled")
+        // summary, never fail the whole envelope.
+        let json = r#"{
+            "kind": "host.health",
+            "captured_at": "2026-07-30T12:00:00Z",
+            "daemon_version": "0.16.0",
+            "uptime_sec": 86400,
+            "logical_cpus": 28
+        }"#;
+        let decoded: TelemetryRecord = serde_json::from_str(json).unwrap();
+        match decoded {
+            TelemetryRecord::HostHealth(r) => {
+                assert_eq!(r.roles, RoleTickHealth::default());
+                assert_eq!(r.roles.total, 0);
+                assert!(r.roles.persistent.is_empty());
+            }
+            other => panic!("expected HostHealth, got {other:?}"),
         }
     }
 }

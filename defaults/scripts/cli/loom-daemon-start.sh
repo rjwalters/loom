@@ -104,6 +104,21 @@
 #                        a host that needs one or two additional dirs (e.g. a
 #                        project-local toolchain) without inheriting the WHOLE
 #                        invoking shell's interactive PATH.
+#   LOOM_DAEMON_BOOTOUT_SETTLE_SECS  macOS/launchd only (#5081): max seconds to
+#                        poll `launchctl print` after a `bootout`, waiting for
+#                        the old job to actually leave the bootstrap namespace,
+#                        before attempting `bootstrap` (default 5). `bootout`
+#                        is asynchronous; an immediate `bootstrap` can race it
+#                        and fail with "Bootstrap failed: 5: Input/output
+#                        error" even against a valid plist.
+#   LOOM_DAEMON_BOOTSTRAP_RETRY_ATTEMPTS  macOS/launchd only (#5081): max
+#                        `launchctl bootstrap` attempts when it keeps failing
+#                        with that same async-race I/O error (default 4).
+#                        Never retries on any OTHER bootstrap failure (a
+#                        genuinely bad plist/permission problem a retry cannot
+#                        fix).
+#   LOOM_DAEMON_BOOTSTRAP_RETRY_SECS  macOS/launchd only (#5081): seconds to
+#                        sleep between bootstrap retries (default 2).
 #   LOOM_MACHINE_CHECKOUT  Machine mode (Epic #3835 Phase 3b, #4229): set by
 #                        the `scripts/loom` dispatcher to the resolved
 #                        ~/.local/share/loom checkout before it execs this
@@ -220,6 +235,17 @@ fi
 if [[ -r "$_LOOM_LAUNCHD_LIB_DIR/canonical-daemon-path.sh" ]]; then
     # shellcheck source=../lib/canonical-daemon-path.sh
     source "$_LOOM_LAUNCHD_LIB_DIR/canonical-daemon-path.sh"
+fi
+# verify_launchd_env_applied() (#5081) — post-bootstrap check that the
+# launchd job actually reports the freshly-rendered plist's
+# EnvironmentVariables, used by the launchd start path below to catch a
+# "bootstrap succeeded, pid is alive, but the env is somehow still stale"
+# outcome rather than silently reporting success. Shared with
+# loom-daemon-update.sh via lib/daemon-env-harvest.sh (#4581) so both call
+# sites agree on how a plist's env is read back.
+if [[ -r "$_LOOM_LAUNCHD_LIB_DIR/daemon-env-harvest.sh" ]]; then
+    # shellcheck source=../lib/daemon-env-harvest.sh
+    source "$_LOOM_LAUNCHD_LIB_DIR/daemon-env-harvest.sh"
 fi
 
 # resolve_plist_path() — the deterministic PATH baked into every rendered
@@ -649,6 +675,15 @@ render_launchd_plist() {
 #     status. This does not change genuine-crash semantics (still Result=
 #     exit-code / signal, still refused by on-success) -- verified with both
 #     shapes in test-loom-daemon-start.sh.
+#   * TimeoutStopSec=20 (#4950): a fast-failure backstop well below systemd's
+#     90s default -- see the printf site below for the full sizing rationale
+#     (both the RestartDaemon primitive and the operator-stop SIGTERM handler
+#     exit near-instantly, so a healthy daemon never approaches 20s). Without
+#     this, a stop-transition that DOES stall (e.g. a stale unit predating
+#     KillMode=mixed above, still lingering on an already-provisioned host)
+#     drags out the default 90s before landing the unit in `failed (Result:
+#     timeout)` -- the exact 2026-08-02 incident `loom-daemon-update.sh`'s
+#     #4950 restart-verification poll now detects and self-heals.
 #   * [Install] WantedBy=default.target + `systemctl --user enable` is the
 #     RunAtLoad=true analog: the service comes up on login (and, with
 #     `loginctl enable-linger`, after a reboot).
@@ -706,6 +741,21 @@ render_systemd_unit() {
     # reclassified as Result=timeout (control-group's default forced-SIGKILL-
     # after-TimeoutStopSec path) and Restart=on-success never fires.
     printf 'KillMode=mixed\n'
+    # TimeoutStopSec=20 (#4950): bounds the unit's own stop-transition wait
+    # well below systemd's 90s default. Both the RestartDaemon primitive
+    # (#4054, exit(0) synchronously after the IPC ack) and the operator-stop
+    # SIGTERM handler (#3813, exit(143) right after removing the socket) exit
+    # near-instantly with no blocking drain -- 20s is a generous multiple of
+    # that worst case, not a tight fit -- so a HEALTHY daemon never brushes
+    # this ceiling. It exists purely as a fast-failure backstop: if a future
+    # regression reintroduces a slow/blocking shutdown path (or a stale,
+    # not-yet-re-rendered unit predating KillMode=mixed above leaves lingering
+    # cgroup children), the unit fails fast at 20s instead of dragging out the
+    # full 90s default before `loom-daemon-update.sh`'s #4950 verification
+    # poll (LOOM_DAEMON_RESTART_POLL_SECS, default 30s) even has a chance to
+    # observe the failure and self-heal via `systemctl --user reset-failed &&
+    # start`.
+    printf 'TimeoutStopSec=20\n'
     printf '%b' "$env_lines"
     printf 'StandardOutput=append:%s\n' "$log_path"
     printf 'StandardError=append:%s\n' "$log_path"
@@ -914,6 +964,13 @@ render_watchdog_plist() {
     printf '        <key>HOME</key>\n        <string>%s</string>\n' "$(xml_escape "$HOME")"
     printf '        <key>LOOM_AUTONOMY_MARKER</key>\n        <string>%s</string>\n' "$(xml_escape "$INTENT_MARKER")"
     printf '        <key>LOOM_SOCKET_PATH</key>\n        <string>%s</string>\n' "$(xml_escape "$SOCKET_PATH")"
+    # #5118: the watchdog honors LOOM_PID_FILE with the SAME precedence the
+    # daemon does (daemon_pidfile.rs tier 1), so passing the path this script
+    # chose makes the two ends single-source it. Before this the watchdog
+    # derived its own path from the socket's directory and, on a
+    # workspace-rooted install, looked at a file nothing ever writes -- a
+    # permanent false "[DIVERGENCE] no live pid file" on every fleet host.
+    printf '        <key>LOOM_PID_FILE</key>\n        <string>%s</string>\n' "$(xml_escape "$PID_FILE")"
     printf '        <key>LOOM_LAUNCHD_LABEL</key>\n        <string>%s</string>\n' "$(xml_escape "$(resolve_launchd_label)")"
     printf '    </dict>\n'
     printf '    <key>RunAtLoad</key>\n    <true/>\n'
@@ -1005,6 +1062,11 @@ render_systemd_watchdog_service() {
     printf 'Environment=HOME=%s\n' "$HOME"
     printf 'Environment=LOOM_AUTONOMY_MARKER=%s\n' "$INTENT_MARKER"
     printf 'Environment=LOOM_SOCKET_PATH=%s\n' "$SOCKET_PATH"
+    # #5118: same single-sourcing as the launchd watchdog plist above -- the
+    # watchdog resolves the pid file exactly as the daemon does, and this is
+    # the tier-1 value. (Observed on loom-worker-1: the watchdog read
+    # ~/.loom/.daemon.pid while the daemon wrote <workspace>/.loom/.daemon.pid.)
+    printf 'Environment=LOOM_PID_FILE=%s\n' "$PID_FILE"
     printf 'Environment=LOOM_DAEMON_LAUNCHD=0\n'
     printf 'StandardOutput=append:%s\n' "$log_path"
     printf 'StandardError=append:%s\n' "$log_path"
@@ -1557,18 +1619,51 @@ if [[ "$USE_LAUNCHD" == "true" ]]; then
     # Reload with the freshly-rendered plist every time -- a job left loaded
     # from a prior invocation (possibly with different flags/env) must not
     # silently keep running its OLD definition.
+    #
+    # `launchctl bootout` is ASYNCHRONOUS (#5081): it returns before the
+    # kernel has actually finished tearing the old job down, so an immediate
+    # `bootstrap` can race that teardown and fail with "Bootstrap failed: 5:
+    # Input/output error" (EIO) even though the plist is perfectly valid --
+    # leaving NO job loaded and the daemon down until a retry. (This is
+    # unrelated to whether bootout kills in-flight SWEEPS -- it no longer does,
+    # since #3800 gives every sweep its own process group -- this is purely
+    # about the bootout/bootstrap race on the job itself.) Settle briefly
+    # after bootout (poll `launchctl print` until the job is actually gone,
+    # bounded by LOOM_DAEMON_BOOTOUT_SETTLE_SECS), and retry bootstrap
+    # specifically on that EIO shape (never on other failures, which are
+    # genuine plist/permission problems a retry cannot fix) rather than
+    # reporting a half-applied update.
     if launchctl print "$LAUNCHD_SERVICE" >/dev/null 2>&1; then
         launchctl bootout "$LAUNCHD_SERVICE" >/dev/null 2>&1 || true
+        BOOTOUT_SETTLE_SECS="${LOOM_DAEMON_BOOTOUT_SETTLE_SECS:-5}"
+        _bootout_settle_deadline=$((SECONDS + BOOTOUT_SETTLE_SECS))
+        while launchctl print "$LAUNCHD_SERVICE" >/dev/null 2>&1; do
+            [[ $SECONDS -ge $_bootout_settle_deadline ]] && break
+            sleep 0.2
+        done
     fi
 
     BOOTSTRAP_ERR="$START_LOG.bootstrap-err"
-    if ! launchctl bootstrap "$LAUNCHD_DOMAIN" "$PLIST_FILE" 2>"$BOOTSTRAP_ERR"; then
-        err "launchctl bootstrap failed for $LAUNCHD_SERVICE:"
+    BOOTSTRAP_MAX_ATTEMPTS="${LOOM_DAEMON_BOOTSTRAP_RETRY_ATTEMPTS:-4}"
+    BOOTSTRAP_RETRY_SLEEP_SECS="${LOOM_DAEMON_BOOTSTRAP_RETRY_SECS:-2}"
+    _bootstrap_attempt=0
+    while :; do
+        _bootstrap_attempt=$((_bootstrap_attempt + 1))
+        if launchctl bootstrap "$LAUNCHD_DOMAIN" "$PLIST_FILE" 2>"$BOOTSTRAP_ERR"; then
+            rm -f "$BOOTSTRAP_ERR"
+            break
+        fi
+        if grep -qE '(^|[^0-9])5: Input/output error' "$BOOTSTRAP_ERR" 2>/dev/null \
+            && [[ "$_bootstrap_attempt" -lt "$BOOTSTRAP_MAX_ATTEMPTS" ]]; then
+            warn "launchctl bootstrap hit the async-bootout race (EIO) for $LAUNCHD_SERVICE -- attempt ${_bootstrap_attempt}/${BOOTSTRAP_MAX_ATTEMPTS}, settling ${BOOTSTRAP_RETRY_SLEEP_SECS}s and retrying (#5081)."
+            sleep "$BOOTSTRAP_RETRY_SLEEP_SECS"
+            continue
+        fi
+        err "launchctl bootstrap failed for $LAUNCHD_SERVICE (attempt ${_bootstrap_attempt}/${BOOTSTRAP_MAX_ATTEMPTS}):"
         cat "$BOOTSTRAP_ERR" >&2 2>/dev/null || true
         rm -f "$BOOTSTRAP_ERR"
         exit 1
-    fi
-    rm -f "$BOOTSTRAP_ERR"
+    done
 
     # RunAtLoad=true means bootstrap alone would already start it, but we
     # kickstart -k explicitly anyway so THIS invocation deterministically wins
@@ -1598,6 +1693,26 @@ if [[ "$USE_LAUNCHD" == "true" ]]; then
         warn "If another daemon is already listening on the socket, stop it first"
         warn "(./.loom/scripts/cli/loom-daemon-stop.sh) and retry."
         exit 1
+    fi
+
+    # Post-condition (#5081): a successful bootstrap + a live pid do not, by
+    # themselves, prove the freshly-rendered plist's EnvironmentVariables
+    # actually took effect -- launchd's own "environment = { ... }" block
+    # (from `launchctl print`) is the only authoritative source for what the
+    # running process actually received. Verify it before reporting success,
+    # rather than silently returning a daemon that is alive but still running
+    # under some stale/unexpected env.
+    if declare -f verify_launchd_env_applied >/dev/null 2>&1; then
+        _env_verify_out=$(verify_launchd_env_applied "$LAUNCHD_SERVICE" "$PLIST_FILE" 2>&1)
+        _env_verify_rc=$?
+        if [[ "$_env_verify_rc" -eq 1 ]]; then
+            err "loom-daemon is running (pid ${daemon_pid}) under launchd, but its reported environment does NOT match the freshly-rendered plist -- refusing to report success (#5081)."
+            printf '%s\n' "$_env_verify_out" >&2
+            exit 1
+        elif [[ "$_env_verify_rc" -ne 0 ]]; then
+            warn "Could not verify the running job's env against the plist (plutil/jq unavailable?) -- proceeding, but the env change is unconfirmed:"
+            printf '%s\n' "$_env_verify_out" | while IFS= read -r _line; do warn "  $_line"; done
+        fi
     fi
 
     # Redundant since #4774 -- the daemon claims $PID_FILE itself immediately

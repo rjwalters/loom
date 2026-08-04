@@ -57,6 +57,7 @@
  * reads `/public/*`; the authenticated variant only ever reads `/api/*`.
  */
 
+import { classifyFreshness, type FreshnessInfo, type HostFreshness } from "./fleetState";
 import type { HistoryQueryResult, HistoryRecord } from "./query";
 import type { PublicActiveSweep, RedactedFleetSnapshot } from "./redaction";
 
@@ -70,7 +71,25 @@ const PUBLIC_PAGE_DISPLAY_FIELDS: Readonly<Record<string, readonly string[]>> = 
   "sweep.phase": ["phase", "entered_at"],
   "sweep.completed": ["completed_at", "result"],
   "sweep.outcome": ["model", "effort", "result", "total_duration_sec"],
-  "host.health": ["captured_at", "daemon_version", "uptime_sec", "logical_cpus", "cpu_idle_fraction"],
+  // `build_commit`/`built_at` (#4956) sit next to `daemon_version` because
+  // the version alone only moves once per release — the commit is what makes
+  // two same-version builds distinguishable. Both are non-identifying build
+  // metadata about the binary, not about any repo or operator, so they are as
+  // public as the version string itself.
+  "host.health": [
+    "captured_at",
+    "daemon_version",
+    "build_commit",
+    "built_at",
+    "uptime_sec",
+    "logical_cpus",
+    "cpu_idle_fraction",
+    // Issue #4998: already public per `redaction.ts`'s `host.health`
+    // allowlist — this only adds it to the generic detail dump. The
+    // headline signal is `renderSaturationBadge` below; this keeps the raw
+    // number available for anyone reading the row closely.
+    "load_per_core",
+  ],
 };
 
 export function isPublicPageDisplayKind(kind: string): boolean {
@@ -133,37 +152,224 @@ function renderActiveSweepRow(sweep: PublicActiveSweep): string {
   </tr>`;
 }
 
-function renderHostHealthRow(hostId: string, health?: { record: Record<string, unknown>; updatedAt: string }): string {
+// ---------------------------------------------------------------------------
+// Host staleness (issue #4957): LIVE/STALE/OFFLINE, not a raw timestamp
+// forever presented as current — see `fleetState.ts`'s `classifyFreshness`
+// for the shared cadence/boundary policy this page renders faithfully
+// rather than reimplements.
+// ---------------------------------------------------------------------------
+
+const FRESHNESS_LABEL: Readonly<Record<HostFreshness, string>> = {
+  live: "LIVE",
+  stale: "STALE",
+  offline: "OFFLINE",
+};
+
+/** "just now" / "5m ago" / "3h ago" / "2d ago" — coarse enough to read at a
+ * glance, exact enough to distinguish "missed one sample" from "gone for
+ * days"; the full ISO timestamp is always still available in the cell's
+ * `title` attribute for anyone who wants precision. */
+function formatAge(ageSeconds: number): string {
+  if (!Number.isFinite(ageSeconds)) return "unknown";
+  if (ageSeconds < 60) return "just now";
+  const minutes = Math.floor(ageSeconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
+}
+
+/** The freshness badge + "last seen …" qualifier — rendered directly beside
+ * every cell of host detail so a stale sample's numbers are never shown
+ * without it (issue #4957's AC: "its stale metrics are never displayed as
+ * current"). */
+function renderFreshnessBadge(freshness: FreshnessInfo, updatedAt: string): string {
+  return (
+    `<span class="freshness-badge freshness-badge--${freshness.status}">${FRESHNESS_LABEL[freshness.status]}</span> ` +
+    `<span class="muted" title="${escapeHtml(updatedAt)}">last seen ${escapeHtml(formatAge(freshness.ageSeconds))}</span>`
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Host saturation (issue #4998): a host at 3 in-flight sweeps that are each
+// fanning out into heavy per-sweep work (e.g. sim processes) can be
+// pathologically oversubscribed while the sweep count alone reads as "barely
+// busy" — the observed case was a 12x overcommit (loadavg 95 on 8 cores)
+// invisible behind "3 sweeps". `load_per_core` is the same loadavg/core
+// figure `loom-daemon status` already prints ("Host breaker: ... load/core
+// 0.23, trip at or above 2.50"), and it is already public per
+// `redaction.ts`'s `host.health` allowlist — this only adds a distinguishable
+// *rendering* of it, not a new redaction decision.
+//
+// Thresholds are single-sourced with (not reinvented from) the daemon's own
+// circuit breakers, so this page and `loom-daemon status`/`fleet` always
+// agree on what "elevated" and "critical" mean for the same host:
+//   - `HOST_BREAKER_LOAD_PER_CORE` mirrors
+//     `DEFAULT_HOST_BREAKER_LOAD_PER_CORE` (`loom-daemon/src/host_breaker.rs`)
+//     — the sustained-load threshold that trips the stateful host-distress
+//     breaker and suppresses new dispatch on that host.
+//   - `ADMISSION_BRAKE_LOAD_PER_CORE` mirrors
+//     `DEFAULT_ADMISSION_BRAKE_LOAD_PER_CORE`
+//     (`loom-daemon/src/admission_brake.rs`) — the point-in-time threshold
+//     that holds new admission on that host.
+// If either daemon-side default ever changes, update the matching constant
+// here in the same PR (there is no cross-crate/cross-package import path
+// between the Rust daemon and this Cloudflare Worker, so this is a
+// documented match rather than a shared symbol).
+const HOST_BREAKER_LOAD_PER_CORE = 2.5;
+const ADMISSION_BRAKE_LOAD_PER_CORE = 4.0;
+
+type SaturationLevel = "idle" | "elevated" | "critical" | "unknown";
+
+const SATURATION_LABEL: Readonly<Record<SaturationLevel, string>> = {
+  idle: "OK",
+  elevated: "ELEVATED",
+  critical: "CRITICAL",
+  unknown: "N/A",
+};
+
+/** Classify a `load_per_core` reading against the daemon's own thresholds.
+ * `unknown` covers both a missing field (older telemetry, or a host with no
+ * health record at all) and a non-finite value — never mis-rendered as a
+ * false "OK". `elevated` (at/above the host-breaker trip point) and
+ * `critical` (at/above the admission-brake hold point) are deliberately
+ * distinct so a host already past the harder brake threshold reads as more
+ * urgent than one merely past the breaker's. */
+export function classifySaturation(loadPerCore: unknown): SaturationLevel {
+  if (typeof loadPerCore !== "number" || !Number.isFinite(loadPerCore)) return "unknown";
+  if (loadPerCore >= ADMISSION_BRAKE_LOAD_PER_CORE) return "critical";
+  if (loadPerCore >= HOST_BREAKER_LOAD_PER_CORE) return "elevated";
+  return "idle";
+}
+
+/** The saturation badge rendered beside every host row's freshness badge —
+ * the AC's "visually distinguishable from an idle host without expanding
+ * details" signal. The exact `load_per_core` reading (when known) is always
+ * available in the badge's `title` attribute, and duplicated into the
+ * generic detail cell via `PUBLIC_PAGE_DISPLAY_FIELDS`, for anyone who wants
+ * the raw number rather than the bucket. */
+function renderSaturationBadge(loadPerCore: unknown): string {
+  const level = classifySaturation(loadPerCore);
+  const title = level === "unknown" ? "no load data reported" : `${(loadPerCore as number).toFixed(2)} load/core`;
+  return `<span class="saturation-badge saturation-badge--${level}" title="${escapeHtml(title)}">${SATURATION_LABEL[level]}</span>`;
+}
+
+function renderHostHealthRow(
+  hostId: string,
+  health: { record: Record<string, unknown>; updatedAt: string } | undefined,
+  now: Date,
+): string {
   if (!health) return "";
-  return `<tr>
+  const freshness = classifyFreshness(health.updatedAt, now);
+  return `<tr class="freshness-${freshness.status}">
     <td>${escapeHtml(hostId)}</td>
-    <td>${escapeHtml(health.updatedAt)}</td>
+    <td>${renderFreshnessBadge(freshness, health.updatedAt)}</td>
+    <td>${renderSaturationBadge(health.record.load_per_core)}</td>
     <td>${formatDetails("host.health", health.record)}</td>
   </tr>`;
 }
 
-export function renderFleetOverview(snapshot: RedactedFleetSnapshot): string {
-  const hostIds = Object.keys(snapshot.hosts).sort();
+/** "3 hosts: 2 live, 1 offline (robb-pro, last seen 5h ago)" — the overview
+ * heading's explicit totals (issue #4957's AC). `hostIds` is already the
+ * health-bearing host set (see `renderFleetOverview`), so every id here
+ * contributes a freshness bucket — nothing to skip. */
+function renderFreshnessSummary(hostIds: readonly string[], hosts: RedactedFleetSnapshot["hosts"], now: Date): string {
+  const counts: Record<HostFreshness, number> = { live: 0, stale: 0, offline: 0 };
+  const offlineDescriptions: string[] = [];
+  for (const hostId of hostIds) {
+    const health = hosts[hostId]?.health;
+    if (!health) continue;
+    const freshness = classifyFreshness(health.updatedAt, now);
+    counts[freshness.status] += 1;
+    if (freshness.status === "offline") {
+      offlineDescriptions.push(`${hostId}, last seen ${formatAge(freshness.ageSeconds)}`);
+    }
+  }
+  const reporting = counts.live + counts.stale + counts.offline;
+  if (reporting === 0) return "";
+
+  const parts = [`${counts.live} live`];
+  if (counts.stale > 0) parts.push(`${counts.stale} stale`);
+  if (counts.offline > 0) parts.push(`${counts.offline} offline (${offlineDescriptions.join("; ")})`);
+  return `: ${parts.join(", ")}`;
+}
+
+/**
+ * Fleet overview: hosts with current `health:` data, plus active sweeps
+ * split into "attributed" (their `hostId` is one of those hosts) and
+ * "unattributed" (issue #5078).
+ *
+ * **Host count/cards**: `hostIds` — and therefore both the "Hosts (N)"
+ * heading and every rendered card — is the set of `snapshot.hosts` entries
+ * that actually carry a `health` record, not every key `snapshot.hosts`
+ * happens to have. A `tokens`-only entry (no `health`) never rendered a card
+ * anyway (`renderHostHealthRow` returns `""` without `health`) but was still
+ * counted in the old `Object.keys(snapshot.hosts).length` heading — this
+ * keeps the count and the card list in exact agreement. Combined with
+ * `src/fleetState.ts`'s `filterRevokedHosts` (mechanism 2: a D1-revoked host
+ * whose best-effort DO cleanup failed) and the simple fact that the Durable
+ * Object never creates a `hosts` entry from a `sweep:`-only record at all
+ * (mechanism 1's originally-suspected cause — see `classifyAndPruneHosts`),
+ * this is the AC's "header host count reflects hosts with health data" and
+ * "a host known only from activeSweeps does not render as a fleet card".
+ *
+ * **Active sweeps**: sweeps whose `hostId` is not in `hostIds` — a host with
+ * no current health data, whether because its `sweep.started` arrived before
+ * its first `host.health`, or because it was revoked mid-run with genuinely
+ * in-flight work (`fleetState.ts:323-330`'s deliberate "don't touch
+ * `sweep:` entries on revoke" behavior) — are rendered in their own
+ * "Unattributed sweeps" table instead of the main one, so the mid-run-revoke
+ * anomaly stays visible rather than silently vanishing (AC: "remains
+ * discoverable") while no longer inflating the primary "Active sweeps (N)"
+ * count with sweeps that have no live host behind them.
+ */
+export function renderFleetOverview(snapshot: RedactedFleetSnapshot, now: Date = new Date()): string {
+  const hostIds = Object.keys(snapshot.hosts)
+    .filter((id) => snapshot.hosts[id]?.health)
+    .sort();
+  const hostIdSet = new Set(hostIds);
   const healthRows = hostIds
-    .map((id) => renderHostHealthRow(id, snapshot.hosts[id]?.health))
+    .map((id) => renderHostHealthRow(id, snapshot.hosts[id]?.health, now))
     .filter((row) => row.length > 0)
     .join("\n");
-  const sweepRows = snapshot.activeSweeps.map(renderActiveSweepRow).join("\n");
+
+  const attributedSweeps = snapshot.activeSweeps.filter((sweep) => hostIdSet.has(sweep.hostId));
+  const unattributedSweeps = snapshot.activeSweeps.filter((sweep) => !hostIdSet.has(sweep.hostId));
+  const sweepRows = attributedSweeps.map(renderActiveSweepRow).join("\n");
+  const unattributedSweepRows = unattributedSweeps.map(renderActiveSweepRow).join("\n");
+
+  const freshnessSummary = renderFreshnessSummary(hostIds, snapshot.hosts, now);
+
+  const unattributedSection =
+    unattributedSweeps.length > 0
+      ? `<h3>Unattributed sweeps (${unattributedSweeps.length})</h3>
+    <p class="muted">Reporting against a host with no current health data — a
+      host that has not yet sent its first <code>host.health</code>, or one
+      revoked mid-run. Not counted in "Active sweeps" above.</p>
+    <table>
+      <thead>
+        <tr><th>Host</th><th>Visibility</th><th>Repo / Issue</th><th>Phase</th><th>Model</th><th>Effort</th><th>Started</th><th>Updated</th></tr>
+      </thead>
+      <tbody>${unattributedSweepRows}</tbody>
+    </table>`
+      : "";
 
   return `<section id="fleet-overview">
     <h2>Fleet overview</h2>
-    <h3>Hosts (${hostIds.length})</h3>
+    <h3>Hosts (${hostIds.length})${escapeHtml(freshnessSummary)}</h3>
     <table>
-      <thead><tr><th>Host</th><th>Last health update</th><th>Detail</th></tr></thead>
-      <tbody>${healthRows || `<tr><td colspan="3" class="muted">No host health reported yet.</td></tr>`}</tbody>
+      <thead><tr><th>Host</th><th>Status</th><th>Saturation</th><th>Detail</th></tr></thead>
+      <tbody>${healthRows || `<tr><td colspan="4" class="muted">No host health reported yet.</td></tr>`}</tbody>
     </table>
-    <h3>Active sweeps (${snapshot.activeSweeps.length})</h3>
+    <h3>Active sweeps (${attributedSweeps.length})</h3>
     <table>
       <thead>
         <tr><th>Host</th><th>Visibility</th><th>Repo / Issue</th><th>Phase</th><th>Model</th><th>Effort</th><th>Started</th><th>Updated</th></tr>
       </thead>
       <tbody>${sweepRows || `<tr><td colspan="8" class="muted">No sweeps currently running.</td></tr>`}</tbody>
     </table>
+    ${unattributedSection}
   </section>`;
 }
 
@@ -291,6 +497,16 @@ const PAGE_STYLE = `
   th { background: #f0f0f0; }
   .muted { color: #999; font-style: italic; }
   section { margin-bottom: 2.5rem; }
+  .freshness-badge { display: inline-block; padding: 0.1rem 0.4rem; border-radius: 0.25rem; font-size: 0.75rem; font-weight: 600; }
+  .freshness-badge--live { background: #d7f5dd; color: #1a7431; }
+  .freshness-badge--stale { background: #fff1cc; color: #8a6100; }
+  .freshness-badge--offline { background: #f3d4d4; color: #8a1f1f; }
+  tr.freshness-stale td, tr.freshness-offline td { color: #888; }
+  .saturation-badge { display: inline-block; padding: 0.1rem 0.4rem; border-radius: 0.25rem; font-size: 0.75rem; font-weight: 600; }
+  .saturation-badge--idle { background: #e6effa; color: #22507a; }
+  .saturation-badge--elevated { background: #fff1cc; color: #8a6100; }
+  .saturation-badge--critical { background: #f3d4d4; color: #8a1f1f; }
+  .saturation-badge--unknown { background: #eee; color: #888; }
 `;
 
 /** Options for {@link renderPublicPage} distinguishing the two callers that

@@ -27,6 +27,11 @@
       </div>
     </header>
     <main id="app" class="app" aria-busy="true"></main>
+    <!-- Populated by `buildInfo.ts` from the server-injected build commit
+         (issue #4958). Empty in the markup so it renders nothing rather
+         than a placeholder before the bundle runs, and stays empty on a
+         deployment that never stamped a commit (local `wrangler dev`). -->
+    <footer id="build-info" class="build-info"></footer>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

@@ -11,7 +11,12 @@
 #                              when the target already has Loom installed -- without
 #                              it, non-interactive runs stop and ask you to inventory
 #                              customizations first (interactive runs still get a
-#                              y/N prompt instead).
+#                              y/N prompt instead). If you only want to bring an
+#                              existing install's surfaces up to date -- not replace
+#                              the payload -- use the non-destructive
+#                              .loom/scripts/resync-installed.sh in the target repo
+#                              instead; --confirm-reinstall uninstalls before
+#                              reinstalling.
 #   --allow-non-main-source    Permit installing from a non-main / detached-HEAD Loom source
 #                              (forwarded to scripts/install-loom.sh)
 #   --allow-stale-target       Permit installing over a target whose Loom is newer/stale
@@ -210,6 +215,41 @@ wire_quick_install_guard_hooks() {
   info "Asserting project-level guard-hook entries for per-repo .loom/hooks/ copies..."
   ensure_project_hook_wiring "$target" || \
     warning "Project-level guard-hook entries not fully asserted in $target/.claude/settings.json; run scripts/install-loom.sh (Full Install) or re-add them manually — see defaults/docs/guard-hooks.md."
+}
+
+# Regenerate .loom/manifest.json's checksums after this function's caller has
+# finished ALL post-`loom-daemon init` mutations of Loom-tracked files
+# (issue #5279).
+#
+# `loom-daemon init` generates the manifest as its own last internal step
+# (loom-daemon/src/init/post_init.rs::generate_manifest, invoked from
+# loom-daemon/src/init/mod.rs) -- which runs BEFORE `wire_quick_install_guard_hooks`
+# (above) asserts project-level guard-hook entries into `.claude/settings.json`
+# via `ensure_project_hook_wiring`. That means the manifest's stored hash for
+# `.claude/settings.json` reflects its PRE-wiring content, not the genuinely
+# final installed state.
+#
+# Left unfixed, `verify-install.sh verify` reports spurious `DRIFT DETECTED` on
+# `.claude/settings.json` immediately after EVERY quick install -- even a
+# completely vanilla install with zero customization and zero foreign
+# content -- because the on-disk file legitimately changes after the manifest
+# snapshot was taken. This is the concrete, reproducible mechanism behind the
+# "verify-install.sh reports [settings.json] as drift by design" symptom
+# described in #5279 (a stricter, always-reproducible version of it: no
+# foreign/sibling-tool content is even required to trigger it).
+#
+# Call this ONLY after every mutator of Loom-tracked files in the current
+# install path has run (currently: right after `wire_quick_install_guard_hooks`,
+# its last one on the quick-install path). Best-effort: a missing or failing
+# verify-install.sh never aborts the install.
+regenerate_manifest_after_hook_wiring() {
+  local target="$1"
+  local script="$target/.loom/scripts/verify-install.sh"
+
+  if [[ -f "$script" ]]; then
+    ( cd "$target" && bash "$script" generate --quiet ) || \
+      warning "Could not regenerate .loom/manifest.json after guard-hook wiring; 'verify-install.sh verify' may report spurious drift on .claude/settings.json."
+  fi
 }
 
 # Export LOOM_VERSION and LOOM_COMMIT so `loom-daemon init`'s template
@@ -687,7 +727,12 @@ while [[ "${1:-}" == -* ]]; do
       echo "                             when the target already has Loom installed -- without"
       echo "                             it, non-interactive runs stop and ask you to inventory"
       echo "                             customizations first (interactive runs still get a"
-      echo "                             y/N prompt instead)."
+      echo "                             y/N prompt instead). If you only want to bring an"
+      echo "                             existing install's surfaces up to date -- not replace"
+      echo "                             the payload -- use the non-destructive"
+      echo "                             .loom/scripts/resync-installed.sh in the target repo"
+      echo "                             instead; --confirm-reinstall uninstalls before"
+      echo "                             reinstalling."
       echo "  --allow-non-main-source    Permit installing from a non-main / detached-HEAD"
       echo "                             Loom source (forwarded to scripts/install-loom.sh)"
       echo "  --allow-stale-target       Permit installing over a newer/stale target"
@@ -1020,7 +1065,7 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
     # legacy) install now MUST pass --confirm-reinstall explicitly -- it
     # cannot silently cross this boundary just because it also passed
     # --quick/--yes/--full.
-    error "Existing Loom installation detected at $TARGET_PATH/.loom -- refusing to run a non-interactive reinstall without explicit acknowledgement.\n       Reinstalling uninstalls the existing Loom payload before writing the new version; inventory and back up any project-owned Loom hooks, scripts, and agent configuration first.\n       Re-run with --confirm-reinstall once you have done so, or omit --quick/--yes/--full to get an interactive y/N prompt instead."
+    error "Existing Loom installation detected at $TARGET_PATH/.loom -- refusing to run a non-interactive reinstall without explicit acknowledgement.\n       Reinstalling uninstalls the existing Loom payload before writing the new version; inventory and back up any project-owned Loom hooks, scripts, and agent configuration first.\n       If you only want to bring the existing install up to date -- not replace it -- run the non-destructive '$TARGET_PATH/.loom/scripts/resync-installed.sh' instead; it copies forward the latest hooks/scripts/roles/docs without uninstalling anything.\n       Re-run with --confirm-reinstall once you have done so, or omit --quick/--yes/--full to get an interactive y/N prompt instead."
   fi
 
   # Issue #4888: the chained uninstall below (`uninstall-loom.sh --yes --local`)
@@ -1169,6 +1214,11 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
     # none (the 0.16.0 defaults carry no `hooks` block) — this call is what
     # restores a working guard-hook execution path instead of leaving zero.
     wire_quick_install_guard_hooks "$TARGET_PATH"
+
+    # Regenerate the checksum manifest now that ALL settings.json mutations for
+    # this install path are complete (issue #5279 — see the function's own
+    # comment for why this must run after wire_quick_install_guard_hooks).
+    regenerate_manifest_after_hook_wiring "$TARGET_PATH"
 
     # Issue #3545: reconcile the git index after the uninstall→reinstall cycle.
     # The chained uninstall staged the deletion of every prior Loom file (now
@@ -1574,6 +1624,11 @@ case "$METHOD" in
     # copies that nothing references (the 0.16.0 defaults settings.json has no
     # `hooks` block) and no user-scope wiring at all: zero guard coverage.
     wire_quick_install_guard_hooks "$TARGET_PATH"
+
+    # Regenerate the checksum manifest now that ALL settings.json mutations for
+    # this install path are complete (issue #5279 — see the function's own
+    # comment for why this must run after wire_quick_install_guard_hooks).
+    regenerate_manifest_after_hook_wiring "$TARGET_PATH"
 
     echo ""
     success "Quick installation complete!"

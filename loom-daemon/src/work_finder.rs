@@ -22,51 +22,62 @@
 //! 3. For each remaining issue, dispatches through the existing
 //!    [`SweepRegistry::dispatch`](crate::sweep_registry::SweepRegistry::dispatch)
 //!    path — up to a **work-driven** max-concurrency cap recomputed every tick
-//!    (Phase B, #3811; simplified in #4512): `min(token axis, disk headroom,
-//!    configured max)`. `dispatch()` already flips `loom:issue →
-//!    loom:building`, acquires the per-issue `mkdir`-atomic claim lock, and
-//!    spawns the rotated-token child.
+//!    (Phase B, #3811; simplified in #4512; token axis removed / RAM headroom
+//!    added in #5270): `min(disk headroom, ram headroom, configured max)`.
+//!    `dispatch()` already flips `loom:issue → loom:building`, acquires the
+//!    per-issue `mkdir`-atomic claim lock, and spawns the rotated-token child.
 //!
-//! # Concurrency scaling (Phase B, #3811; CPU term removed in #4512)
+//! # Concurrency scaling (Phase B, #3811; CPU term removed in #4512; token axis removed / RAM added in #5270)
 //!
 //! Phase A resolved a single fixed cap once at daemon startup. Phase B replaces
 //! it with a cap **recomputed every tick** by
-//! [`resolve_dynamic_max_concurrent`] from live inputs — the token axis
-//! ([`crate::tokens::token_pool_size`] / [`crate::capacity::read_ranking`]),
-//! the worktree-root disk headroom
-//! ([`crate::disk_headroom::disk_headroom_limit`]), and the per-machine
-//! operator ceiling (`LOOM_WORK_FINDER_MAX_CONCURRENT` /
+//! [`resolve_dynamic_max_concurrent`] from live inputs — the worktree-root
+//! disk headroom ([`crate::disk_headroom::disk_headroom_limit`]), the host's
+//! available-RAM headroom (#5270, [`crate::ram_headroom::ram_headroom_limit`]),
+//! and the per-machine operator ceiling (`LOOM_WORK_FINDER_MAX_CONCURRENT` /
 //! `autonomous.workFinder.maxConcurrent`). The effective per-tick concurrency
 //! is then `min(dynamic_cap, backlog_depth)`: [`tick`] iterates the ready
 //! `loom:issue` rows and stops at the cap, so concurrency scales **up** as the
 //! backlog grows and drains to **zero** dispatches when the queue is empty —
-//! all without a daemon restart, since pool/disk/backlog are read fresh each
-//! tick.
+//! all without a daemon restart, since disk/RAM/backlog are read fresh each
+//! tick. Token-pool health ([`crate::tokens::token_pool_size`] /
+//! [`crate::capacity::read_ranking`]) is still read every tick but, since
+//! #5270, feeds spawn-time **selection** only (prefer fresher/healthier
+//! accounts) — it is no longer a term in this `min(...)`.
 //!
-//! **#4512 removed the CPU term from this formula.** A fourth axis
+//! **#4512 removed the CPU term from this formula; #5270 removed the token
+//! axis too, unconditionally on every auth path.** A fourth axis
 //! (`cpu_headroom = (logical_cpus × cpuUtilizationTarget − consumed_cores) /
 //! estCoresPerSweep`, #3978/#4031) used to be part of the `min(...)`. It priced
 //! every sweep as a build, so it throttled the API-wait-dominated majority to
 //! defend against the heavy-build minority — an 8-core worker measured **95%
-//! idle** was capped at 2. The two hard floors that meter genuinely
-//! *exhaustible* resources (the token axis, disk headroom) stay; the CPU
-//! estimate is gone; and the heavy stages now serialize where they actually
-//! occur, on the machine-wide build slot ([`crate::build_slot`]). The host
-//! breaker (#4235, [`crate::host_breaker`]) remains the load safety net that
-//! makes a hand-tuned ceiling safe: a mis-set knob trips a **measured** breaker
+//! idle** was capped at 2. The hard floors that meter genuinely *exhaustible*
+//! resources stayed after that removal (the token axis, disk headroom), but
+//! #5270 dropped the token axis too: operator direction was "we should only
+//! ever limit parallelism based on the machine disk/RAM/CPU" — a metered API
+//! key has no subscription window, and overage means even a subscription pool
+//! no longer hard-stops at one either, so counting *healthy accounts* was
+//! never really a proxy for this host's own capacity. RAM headroom
+//! ([`crate::ram_headroom`]) joined disk headroom as the replacement machine
+//! axis. The heavy stages still serialize where they actually occur, on the
+//! machine-wide build slot ([`crate::build_slot`]). The host breaker (#4235,
+//! [`crate::host_breaker`]) remains the load safety net that makes a
+//! hand-tuned ceiling safe: a mis-set knob trips a **measured** breaker
 //! instead of melting the host.
 //!
-//! **#4903 added a saturation brake on *admission* (not on the cap).** Removing
-//! the CPU term left the cap with no term that reads the host at all, so a
-//! CPU-heavy workload (analog simulation: minutes of sustained `ngspice`, not
-//! API-wait) could drive an 8-core worker to 12× overcommit while the daemon
-//! still believed it had nine free slots. [`crate::admission_brake`] closes that
-//! without resurrecting the formula: once per tick it asks
-//! [`crate::cpu_headroom::is_host_saturated`] at a generous default of `4.0`
-//! load/core and, when the answer is yes, holds **new** admissions
-//! ([`TickReport::deferred_saturation`]) until the host recovers. In-flight
-//! sweeps are never touched, and a healthy host's behavior is byte-for-byte
-//! unchanged.
+//! **#4903 added a saturation brake on *admission* (not on the cap); #5270
+//! retuned it into the primary CPU gate.** Removing the CPU term left the cap
+//! with no term that reads the host at all, so a CPU-heavy workload (analog
+//! simulation: minutes of sustained `ngspice`, not API-wait) could drive an
+//! 8-core worker to 12× overcommit while the daemon still believed it had nine
+//! free slots. [`crate::admission_brake`] closes that without resurrecting the
+//! formula: once per tick it asks [`crate::cpu_headroom::is_host_saturated`]
+//! and, when the answer is yes, holds **new** admissions
+//! ([`TickReport::deferred_saturation`]) until the host recovers. Its default
+//! threshold started generous (`4.0` load/core, a rarely-tripped backstop) and
+//! was retuned by #5270 to `0.95` — the operator's literal "dumb mode" ask,
+//! now the primary CPU admission gate rather than a backstop above the (now
+//! nonexistent) token axis. In-flight sweeps are never touched.
 //!
 //! # Idempotency & fail-safe
 //!
@@ -113,6 +124,7 @@ use crate::event_bus::EventBus;
 use crate::main_health_gate::{MainHealthState, WorkspaceHealthStates};
 use crate::sweep_registry::{
     DispatchBackoffError, LiveClaimDispatchError, OpenPrDispatchError, ParkedIssueDispatchError,
+    PreflightDispatchGate,
 };
 use crate::tokens::{token_pool_size, token_pool_size_at_dir};
 use crate::types::{Event, WorkFinderTickSummary};
@@ -1082,6 +1094,36 @@ pub fn dispatch_held_per_root_with_drain(
         .collect()
 }
 
+/// Fold a per-root claude-wrapper pre-flight-advisory hold (#5030) on top of the
+/// #3930 verified-red + #4084 gate-in-flight per-root holds.
+///
+/// `preflight_held` is a slice **parallel to `roots`**: `preflight_held[i] ==
+/// true` means root `i`'s pre-flight advisory is tripped AND its half-open
+/// breaker is currently in the "held" window (not a probe tick), so no new
+/// dispatch should go to that root this tick. The caller computes it from each
+/// root's own [`SweepRegistry::preflight_dispatch_gate`](crate::sweep_registry::SweepRegistry::preflight_dispatch_gate)
+/// — a broken workspace burns at most one ~1s pre-flight death per probe
+/// cooldown instead of one every tick.
+///
+/// The hold is strictly **per root**, matching the #3930 per-repo isolation
+/// contract: a workspace with a broken `.mcp.json` never halts dispatch to a
+/// healthy sibling repo. A missing entry (`preflight_held.len() < roots.len()`)
+/// defaults to *not held*. With an all-`false` slice the result is byte-for-byte
+/// [`dispatch_held_per_root`].
+#[must_use]
+pub fn dispatch_held_per_root_with_preflight(
+    health_states: &WorkspaceHealthStates,
+    roots: &[std::path::PathBuf],
+    suppress_dispatch_during_gate: bool,
+    preflight_held: &[bool],
+) -> Vec<bool> {
+    dispatch_held_per_root(health_states, roots, suppress_dispatch_during_gate)
+        .into_iter()
+        .enumerate()
+        .map(|(i, h)| h || preflight_held.get(i).copied().unwrap_or(false))
+        .collect()
+}
+
 /// Unlimited-admission convenience wrapper over
 /// [`tick_multi_with_admission_cap`] — see [`tick`] / [`tick_with_admission_cap`]
 /// for the single-workspace analogue and the #4234 rationale.
@@ -1665,10 +1707,10 @@ pub fn resolve_per_token_concurrency(config: &WorkFinderConfig) -> usize {
         .unwrap_or(DEFAULT_PER_TOKEN_CONCURRENCY)
 }
 
-/// Compute the **work-driven dynamic concurrency cap** (Phase B, #3811;
-/// per-token concurrency factor added in #3947; CPU term **removed** in
-/// #4512): `min(token_limit × per_token_concurrency, disk_headroom,
-/// configured_max)`.
+/// Compute the **machine-headroom dynamic concurrency cap** (Phase B, #3811;
+/// per-token concurrency factor added in #3947; CPU term removed in #4512;
+/// **token axis removed and RAM headroom added in #5270**):
+/// `min(disk_headroom, ram_headroom, configured_max)`.
 ///
 /// This is the total-concurrency ceiling for the loop, recomputed every tick
 /// from live inputs. It deliberately does **not** fold in the backlog depth:
@@ -1679,25 +1721,42 @@ pub fn resolve_per_token_concurrency(config: &WorkFinderConfig) -> usize {
 /// `loom:building` sweeps that are **not** in the ready backlog. Folding backlog
 /// into the cap here would under-utilize the pool whenever prior-tick sweeps are
 /// still running (a smaller "new work" number would cap total occupancy below
-/// the pool/disk ceiling). Keeping the cap as `min(token×factor, disk,
+/// the disk/RAM/configured ceiling). Keeping the cap as `min(disk, ram,
 /// configured)` and letting `tick` apply the backlog bound is what makes
 /// concurrency scale up with the backlog and drain to zero when it empties.
 ///
-/// The three bounds map directly to the resource each protects:
-/// - `token_limit` — the count of *healthy* accounts (or the raw pool when no
-///   ranking exists). **Multiplied by `per_token_concurrency`** (#3947): a plan
-///   limit is a utilization-window token bucket, not a session count, so one
-///   healthy account can comfortably run several concurrent sessions. Before
-///   #3947 the implicit factor was `1` (one sweep per account), which collapsed
-///   the whole fleet to cap 1 when 6/7 accounts were at their weekly ceiling
-///   even though the single healthy account had ample session-window headroom.
+/// The three remaining bounds map directly to the resource each protects:
 /// - `disk_headroom` — never provision more worktrees than the scratch volume
-///   can hold at `LOOM_PER_WORKTREE_GB` each.
+///   can hold at `LOOM_PER_WORKTREE_GB` each ([`crate::disk_headroom`]).
+/// - `ram_headroom` — never provision more worktrees than the host's
+///   currently-available memory can hold at `LOOM_PER_WORKTREE_RAM_GB` each
+///   (#5270, [`crate::ram_headroom`]) — the operator-directed "dumb mode"
+///   RAM gate, applied the same way disk headroom already was.
 /// - `configured_max` — **the** per-machine admission knob
 ///   (`LOOM_WORK_FINDER_MAX_CONCURRENT` / `autonomous.workFinder.maxConcurrent`),
 ///   tuned empirically per host.
 ///
-/// # Why there is no CPU term any more (#4512)
+/// # Why there is no token-axis term any more (#5270)
+///
+/// Until #5270 a third axis sat in this `min(...)`: `token_limit ×
+/// per_token_concurrency`, where `token_limit` was the count of *healthy*
+/// (`available`) accounts read from the rotation ranking (#3902). That policy
+/// was right when a rate-limited account genuinely stopped serving requests, but
+/// it stopped being a real resource ceiling once accounts are provisioned with
+/// **overage** (metered credit beyond the plan window) or a single API key
+/// backed by a large credit balance — operator direction on #5270: "we can have
+/// extra usage on our subscription tokens too... we should only ever limit
+/// parallelism based on the machine disk/RAM/CPU." Counting *accounts* was never
+/// a proxy for the daemon host's actual capacity to run more sweeps; it modeled
+/// a per-plan-window ceiling that no longer holds unconditionally.
+///
+/// `.ranking` health is **not** deleted — it still drives spawn-time
+/// **selection** ([`crate::tokens_pool::select`]: prefer fresher/healthier
+/// accounts, skip `blocked`/revoked ones), and [`crate::capacity`]'s advisory
+/// machinery still reports account health on the status surface. It simply no
+/// longer gates *how many* sweeps may run concurrently.
+///
+/// # Why there is no CPU term either (#4512, superseded by the admission brake)
 ///
 /// A fourth axis used to sit in this `min(...)`: `cpu_headroom = (logical_cpus ×
 /// cpuUtilizationTarget − consumed_cores) / estCoresPerSweep` (#3978, measured-idle
@@ -1708,33 +1767,28 @@ pub fn resolve_per_token_concurrency(config: &WorkFinderConfig) -> usize {
 ///   (curator / builder / judge conversations). It therefore throttled the
 ///   low-CPU majority to defend against the heavy-build minority: on an 8-core
 ///   worker measured **95% idle**, the term computed a cap of `2`.
-/// - The two remaining axes meter genuinely **exhaustible** resources (accounts,
-///   bytes) and can be counted exactly. A CPU *estimate* is neither exact nor
-///   exhaustible — it was a proxy for "will a build starve another build".
+/// - Disk headroom meters a genuinely **exhaustible** resource (bytes) and can
+///   be counted exactly. A CPU *estimate* is neither exact nor exhaustible — it
+///   was a proxy for "will a build starve another build".
 /// - That real concern is now handled where the load actually is: the
 ///   machine-wide build slot ([`crate::build_slot`]) serializes the designated
 ///   high-CPU stages across concurrent sweeps, so N sweeps run while at most 1–2
-///   build.
+///   build, and the saturation admission brake ([`crate::admission_brake`],
+///   #4903) holds **new** admissions once the host's observed load-per-core
+///   crosses a threshold — the CPU/RAM "dumb mode" gate the #5270 operator
+///   direction asks for, applied at *admission* time rather than folded back
+///   into this formula.
 /// - The safety net for a mis-set knob is **measurement, not estimation**: the
 ///   host-distress circuit breaker ([`crate::host_breaker`], #4235) suspends
 ///   dispatch on observed load-per-core, and the per-tick admission ramp cap
 ///   (#4234) still bounds how fast occupancy can grow.
-///
-/// `per_token_concurrency` is clamped to a floor of `1` so a mis-set `0`
-/// degrades to the pre-#3947 one-sweep-per-account behavior rather than
-/// dispatching nothing. `token_limit × factor` uses a saturating multiply so a
-/// pathological product can never wrap.
 #[must_use]
 pub fn resolve_dynamic_max_concurrent(
-    token_limit: usize,
-    per_token_concurrency: usize,
     disk_headroom: usize,
+    ram_headroom: usize,
     configured_max: usize,
 ) -> usize {
-    token_limit
-        .saturating_mul(per_token_concurrency.max(1))
-        .min(disk_headroom)
-        .min(configured_max)
+    disk_headroom.min(ram_headroom).min(configured_max)
 }
 
 // ============================================================================
@@ -1783,7 +1837,8 @@ where
         "work_finder: starting loop (interval={}s, configured_max={configured_max}, \
          per_token_concurrency={per_token_concurrency}, \
          max_admissions_per_tick={max_admissions_per_tick}, \
-         dynamic cap = min(healthy tokens × per-token, disk, configured_max))",
+         dynamic cap = min(disk, ram, configured_max) — token axis is \
+         selection-only, not a cap, since #5270)",
         interval.as_secs()
     );
     tokio::spawn(async move {
@@ -1889,6 +1944,9 @@ where
             let token_limit = ranking.as_ref().map_or(pool_size, |r| r.available);
             log_healthy_token_transition(&mut was_healthy_tokens, token_limit, ranking.as_ref());
             let disk = disk_headroom_limit(&workspace_root);
+            // RAM headroom (#5270): the second "dumb mode" machine-headroom
+            // axis alongside disk, folded into the same `min(...)`.
+            let ram = crate::ram_headroom::ram_headroom_limit();
             // Refresh the memoized CPU idle sample. Purely **observational**
             // since #4512 — it no longer feeds admission, it feeds the
             // `idle=` figure below plus `loom-daemon status` / `calibrate`, which
@@ -1898,16 +1956,12 @@ where
             // leaves the previous sample in place.
             let _ = tokio::task::spawn_blocking(crate::cpu_headroom::refresh_cpu_util_cache).await;
             let idle = crate::cpu_headroom::cached_cpu_idle_fraction();
-            let max_concurrent = resolve_dynamic_max_concurrent(
-                token_limit,
-                per_token_concurrency,
-                disk,
-                configured_max,
-            );
+            let max_concurrent = resolve_dynamic_max_concurrent(disk, ram, configured_max);
             let axis_line = format!(
                 "work_finder: dynamic cap = {max_concurrent} (pool={pool_size}, \
-                 healthy_tokens={token_limit}, per_token={per_token_concurrency}, disk={disk}, \
-                 configured_max={configured_max}, \
+                 healthy_tokens={token_limit} [informational only, not capacity-limiting \
+                 since #5270], per_token={per_token_concurrency} [informational only], \
+                 disk={disk}, ram={ram}, configured_max={configured_max}, \
                  max_admissions_per_tick={max_admissions_per_tick}, halted={halted}, \
                  saturation_held={saturation_held}, \
                  observed_idle={})",
@@ -1953,7 +2007,7 @@ where
                         log::info!(
                             "work_finder: tick — cap {max_concurrent} (pool={pool_size}, \
                              healthy={token_limit}, per_token={per_token_concurrency}, disk={disk}, \
-                             ceiling={configured_max}, ramp_cap={max_admissions_per_tick}); \
+                             ram={ram}, ceiling={configured_max}, ramp_cap={max_admissions_per_tick}); \
                              {} seen, {} dispatched, {} labeled-skip, {} in-flight-skip, \
                              {} quarantine-skip, {} backoff-skip, {} pr-open-skip, \
                              {} peer-claim-skip, \
@@ -1979,12 +2033,17 @@ where
                     // Skip while halted: a red-main halt defers everything, so the
                     // token axis is not the (relevant) bottleneck this tick.
                     if !report.halted {
+                        // #5305: since #5270 the token axis is not part of the
+                        // dynamic concurrency cap, so this is no longer a
+                        // cross-axis "did tokens bind the tick" comparison —
+                        // `token_limit == 0` (zero healthy accounts) is the
+                        // only condition that fires the add-accounts advisory,
+                        // regardless of which axis (disk/RAM/ceiling) actually
+                        // deferred the work this tick.
                         let assessment = capacity::assess_pressure(
                             ranking.as_ref(),
                             pool_size,
                             token_limit,
-                            disk,
-                            configured_max,
                             report.deferred_capacity,
                             capacity::DEFAULT_ADVISORY_MIN_QUEUED,
                         );
@@ -2065,7 +2124,8 @@ pub fn spawn_multi_work_finder_task(
     log::info!(
         "work_finder: starting multi-workspace loop (interval={}s, configured_max={configured_max}, \
          per_token_concurrency={per_token_concurrency}, max_admissions_per_tick={max_admissions_per_tick}, \
-         dynamic cap = min(healthy tokens × per-token, disk, configured_max), global across workspaces)",
+         dynamic cap = min(disk, ram, configured_max) — token axis is selection-only, \
+         not a cap, since #5270; global across workspaces)",
         interval.as_secs()
     );
     tokio::spawn(async move {
@@ -2075,6 +2135,10 @@ pub fn spawn_multi_work_finder_task(
         ticker.tick().await;
         let mut was_halted = false;
         let mut was_pressured = false;
+        // Pre-flight-advisory hold transition state (#5030): log the distinct
+        // "held because pre-flight is broken" warning once per transition rather
+        // than every tick, mirroring `was_halted`.
+        let mut was_preflight_held_count: usize = 0;
         // Axis-visibility state (#4234) — see the single-workspace loop above
         // for the full rationale.
         let mut was_max_concurrent: Option<usize> = None;
@@ -2147,6 +2211,9 @@ pub fn spawn_multi_work_finder_task(
             let token_limit = ranking.as_ref().map_or(pool_size, |r| r.available);
             log_healthy_token_transition(&mut was_healthy_tokens, token_limit, ranking.as_ref());
             let disk = disk_headroom_limit(&fallback_root);
+            // RAM headroom (#5270): the second "dumb mode" machine-headroom
+            // axis alongside disk, folded into the same `min(...)`.
+            let ram = crate::ram_headroom::ram_headroom_limit();
             // Refresh the memoized CPU idle sample — **observational only**
             // since #4512 (see the single-workspace loop above). It feeds the
             // `observed_idle=` figure in the axis line and `loom-daemon status`
@@ -2154,12 +2221,7 @@ pub fn spawn_multi_work_finder_task(
             // `maxConcurrent`; it no longer gates admission.
             let _ = tokio::task::spawn_blocking(crate::cpu_headroom::refresh_cpu_util_cache).await;
             let idle = crate::cpu_headroom::cached_cpu_idle_fraction();
-            let max_concurrent = resolve_dynamic_max_concurrent(
-                token_limit,
-                per_token_concurrency,
-                disk,
-                configured_max,
-            );
+            let max_concurrent = resolve_dynamic_max_concurrent(disk, ram, configured_max);
 
             let roots = registry.effective_roots(&fallback_root);
             // Skip registered roots whose directory no longer exists on disk
@@ -2213,15 +2275,71 @@ pub fn spawn_multi_work_finder_task(
             // rather than OR'd into `halted` so its deferrals stay attributable.
             let saturation_held =
                 crate::admission_brake::global_observe(loadavg_1m, ncpu, chrono::Utc::now());
-            let halted: Vec<bool> = dispatch_held_per_root_with_drain(
+            // Per-root claude-wrapper pre-flight-advisory hold (#5030): consult
+            // each root's own SweepRegistry breaker. A workspace that has
+            // accumulated `threshold` consecutive pre-flight deaths (broken
+            // `.mcp.json`, dead token pool, ...) is held so the work-finder
+            // stops burning dispatch slots on doomed ~1s deaths, EXCEPT one
+            // half-open probe dispatch per cooldown to test recovery (which
+            // clears the advisory automatically on success — no operator
+            // action). Strictly per root: a broken workspace never holds a
+            // healthy sibling (the #3930 isolation contract).
+            let now_tick = chrono::Utc::now();
+            let mut preflight_probe_roots: Vec<std::path::PathBuf> = Vec::new();
+            let preflight_held: Vec<bool> = roots
+                .iter()
+                .map(|root| {
+                    let registry = pool.get_or_provision(root);
+                    let mut registry = registry
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    match registry.preflight_dispatch_gate(now_tick) {
+                        PreflightDispatchGate::Open => false,
+                        PreflightDispatchGate::Held => true,
+                        PreflightDispatchGate::Probe => {
+                            preflight_probe_roots.push(root.clone());
+                            false
+                        }
+                    }
+                })
+                .collect();
+            let halted: Vec<bool> = dispatch_held_per_root_with_preflight(
                 &health_states,
                 &roots,
                 suppress_dispatch_during_gate,
-                draining,
+                &preflight_held,
             )
             .into_iter()
-            .map(|h| h || breaker_suppressed)
+            .map(|h| h || draining || breaker_suppressed)
             .collect();
+            let preflight_held_count = preflight_held.iter().filter(|&&h| h).count();
+            // Distinguish a pre-flight-advisory hold from the main-health /
+            // gate-in-flight holds (#5030 AC4) so an operator can tell "held
+            // because pre-flight is broken" apart from "held because CI is red."
+            if preflight_held_count != was_preflight_held_count {
+                if preflight_held_count > 0 {
+                    log::warn!(
+                        "work_finder: {preflight_held_count} of {} repo(s) held — \
+                         claude-wrapper pre-flight advisory tripped (broken .mcp.json / dead token \
+                         pool); dispatch is suppressed except one probe per cooldown until a \
+                         dispatch reaches CLI start (#5030)",
+                        roots.len()
+                    );
+                } else {
+                    log::info!(
+                        "work_finder: pre-flight advisory cleared for all repos — dispatch \
+                         resuming (#5030)"
+                    );
+                }
+                was_preflight_held_count = preflight_held_count;
+            }
+            for probe_root in &preflight_probe_roots {
+                log::info!(
+                    "work_finder: pre-flight advisory recovery probe — allowing one dispatch to \
+                     {} to test recovery (#5030)",
+                    probe_root.display()
+                );
+            }
             let any_halted = halted.iter().any(|&h| h);
 
             let mut pairs: Vec<(GhWorkSource, RegistryDispatcher)> = roots
@@ -2234,9 +2352,11 @@ pub fn spawn_multi_work_finder_task(
 
             let axis_line = format!(
                 "work_finder: dynamic cap = {max_concurrent} (pool={pool_size}, \
-                 healthy_tokens={token_limit}, per_token={per_token_concurrency}, disk={disk}, \
-                 configured_max={configured_max}, \
+                 healthy_tokens={token_limit} [informational only, not capacity-limiting \
+                 since #5270], per_token={per_token_concurrency} [informational only], \
+                 disk={disk}, ram={ram}, configured_max={configured_max}, \
                  max_admissions_per_tick={max_admissions_per_tick}, any_halted={any_halted}, \
+                 preflight_held={preflight_held_count}, \
                  saturation_held={saturation_held}, \
                  observed_idle={}, workspaces={}, priorities={priorities:?})",
                 format_idle(idle),
@@ -2286,7 +2406,7 @@ pub fn spawn_multi_work_finder_task(
                 log::info!(
                     "work_finder: tick — cap {max_concurrent} (pool={pool_size}, \
                      healthy={token_limit}, per_token={per_token_concurrency}, disk={disk}, \
-                     ceiling={configured_max}, ramp_cap={max_admissions_per_tick}); \
+                     ram={ram}, ceiling={configured_max}, ramp_cap={max_admissions_per_tick}); \
                      {} workspace(s), \
                      {} seen, {} dispatched, {} labeled-skip, {} in-flight-skip, \
                      {} quarantine-skip, {} backoff-skip, {} pr-open-skip, \
@@ -2312,12 +2432,13 @@ pub fn spawn_multi_work_finder_task(
             }
 
             if !report.halted {
+                // #5305: see the single-workspace loop above — `token_bound`
+                // is now a pure starvation check, not a cross-axis comparison
+                // against disk/RAM/ceiling.
                 let assessment = capacity::assess_pressure(
                     ranking.as_ref(),
                     pool_size,
                     token_limit,
-                    disk,
-                    configured_max,
                     report.deferred_capacity,
                     capacity::DEFAULT_ADVISORY_MIN_QUEUED,
                 );
@@ -4523,61 +4644,63 @@ exit 0
 
     #[test]
     fn test_dynamic_cap_is_min_of_three_inputs() {
-        // Never exceeds any of the three bounds (factor 1 = pre-#3947 semantics).
-        assert_eq!(resolve_dynamic_max_concurrent(10, 1, 10, 10), 10);
-        assert_eq!(resolve_dynamic_max_concurrent(2, 1, 9, 9), 2, "token axis binds");
-        assert_eq!(resolve_dynamic_max_concurrent(9, 1, 3, 9), 3, "disk binds");
-        assert_eq!(resolve_dynamic_max_concurrent(9, 1, 9, 4), 4, "maxConcurrent binds");
+        // Never exceeds any bound. `usize::MAX` ram = the term doesn't bind.
+        assert_eq!(resolve_dynamic_max_concurrent(10, usize::MAX, 10), 10);
+        assert_eq!(resolve_dynamic_max_concurrent(3, usize::MAX, 9), 3, "disk binds");
+        assert_eq!(resolve_dynamic_max_concurrent(9, usize::MAX, 4), 4, "maxConcurrent binds");
     }
 
     #[test]
     fn test_dynamic_cap_has_no_cpu_term_at_all() {
-        // #4512 AC1: the formula is exactly min(token axis, disk, maxConcurrent).
-        // The arity itself is the guard (a 5-arg call no longer compiles), and the
-        // value must be independent of host CPU state: this same input yields the
-        // same cap on a 95%-idle 8-core worker and on a saturated one, which is
-        // the whole point — an idle host must not be throttled to 2 by an
-        // estimate (`estCoresPerSweep`) that priced every sweep as a build.
-        assert_eq!(resolve_dynamic_max_concurrent(6, 2, 36, 10), 10);
-        // The exact #4512 evidence line: healthy 6 × per-token 2 = 12, disk 36,
-        // configured 10 ⇒ 10. Pre-#4512 the cpu term pinned this host at 2.
-        assert_eq!(
-            resolve_dynamic_max_concurrent(6, 2, 36, 10).min(12),
-            10,
-            "no CPU estimate may clamp an idle host below its configured knob"
-        );
+        // #4512 AC1: the arity itself is the guard (a >3-arg call no longer
+        // compiles), and the value must be independent of host CPU state: this
+        // same input yields the same cap on a 95%-idle 8-core worker and on a
+        // saturated one, which is the whole point — an idle host must not be
+        // throttled to 2 by an estimate (`estCoresPerSweep`) that priced every
+        // sweep as a build.
+        assert_eq!(resolve_dynamic_max_concurrent(36, usize::MAX, 10), 10);
     }
 
     #[test]
-    fn test_dynamic_cap_pool_size_bound_never_over_subscribes() {
-        // With a large disk headroom and ceiling and factor 1, the token-pool
-        // size is the hard bound — the cap never exceeds the number of accounts.
-        for pool in 0..=5 {
-            assert_eq!(
-                resolve_dynamic_max_concurrent(pool, 1, 100, 100),
-                pool,
-                "cap must equal pool size {pool} when disk/ceiling are larger"
-            );
-        }
+    fn test_dynamic_cap_has_no_token_axis_term_either() {
+        // #5270 AC1: a starved token pool (few/no healthy accounts) must NOT
+        // cap the dynamic concurrency — only disk headroom, RAM headroom, and
+        // the configured ceiling do. The arity itself is the guard (a >3-arg
+        // call no longer compiles); this asserts the *value* is independent of
+        // any token-pool state, unlike the pre-#5270 formula which would have
+        // pinned this to (near-)zero when accounts were exhausted.
+        assert_eq!(
+            resolve_dynamic_max_concurrent(36, usize::MAX, 10),
+            10,
+            "disk (36) and ceiling (10) alone determine the cap"
+        );
     }
 
     #[test]
     fn test_dynamic_cap_disk_headroom_bound() {
         // A nearly-full scratch volume (disk headroom 1) caps concurrency at 1
-        // even with a big pool, high ceiling, AND a big per-token factor (#3947):
-        // stacking never provisions more worktrees than the disk can hold.
-        assert_eq!(resolve_dynamic_max_concurrent(8, 4, 1, 8), 1);
+        // even with a high ceiling.
+        assert_eq!(resolve_dynamic_max_concurrent(1, usize::MAX, 8), 1);
         // A full volume (0 headroom) drops the cap to 0 — dispatch nothing.
-        // #4512 keeps this hard floor: disk meters an exhaustible resource.
-        assert_eq!(resolve_dynamic_max_concurrent(8, 4, 0, 8), 0);
+        // Disk meters an exhaustible resource, so this hard floor stays.
+        assert_eq!(resolve_dynamic_max_concurrent(0, usize::MAX, 8), 0);
     }
 
     #[test]
-    fn test_dynamic_cap_zero_pool_dispatches_nothing() {
-        // No usable tokens ⇒ cap 0 regardless of the factor (0 × N = 0) ⇒ a
-        // subsequent tick dispatches nothing (the spawn path would hard-fail
-        // EX_CONFIG anyway).
-        let cap = resolve_dynamic_max_concurrent(0, 2, 10, 10);
+    fn test_dynamic_cap_ram_headroom_bound() {
+        // #5270 AC3: critically-low available RAM caps concurrency exactly the
+        // way disk headroom already does — same posture, same hard floor.
+        assert_eq!(resolve_dynamic_max_concurrent(usize::MAX, 1, 8), 1, "ram binds");
+        assert_eq!(resolve_dynamic_max_concurrent(usize::MAX, 0, 8), 0, "ram exhausted");
+        // Whichever of disk/ram is smaller binds, regardless of position.
+        assert_eq!(resolve_dynamic_max_concurrent(2, 5, 100), 2, "disk (2) < ram (5)");
+        assert_eq!(resolve_dynamic_max_concurrent(5, 2, 100), 2, "ram (2) < disk (5)");
+    }
+
+    #[test]
+    fn test_dynamic_cap_zero_disk_dispatches_nothing() {
+        // No disk headroom ⇒ cap 0 ⇒ a subsequent tick dispatches nothing.
+        let cap = resolve_dynamic_max_concurrent(0, usize::MAX, 10);
         assert_eq!(cap, 0);
         let mut source = FakeSource::once((1..=3).map(issue).collect());
         let mut disp = RecordingDispatcher::default();
@@ -4588,55 +4711,25 @@ exit 0
     }
 
     #[test]
-    fn test_dynamic_cap_per_token_factor_multiplies_token_axis() {
-        // #3947 core: the token axis is `healthy × per-token`, not `healthy × 1`.
-        // 3 healthy accounts × factor 2 = 6, bounded only by disk/ceiling.
-        assert_eq!(resolve_dynamic_max_concurrent(3, 2, 100, 100), 6);
-        // 2 healthy × factor 3 = 6.
-        assert_eq!(resolve_dynamic_max_concurrent(2, 3, 100, 100), 6);
-        // The product is still clamped by disk and the configured knob.
-        assert_eq!(resolve_dynamic_max_concurrent(3, 2, 4, 100), 4, "disk clamps the product");
-        assert_eq!(resolve_dynamic_max_concurrent(3, 2, 100, 5), 5, "ceiling clamps the product");
-    }
-
-    #[test]
-    fn test_dynamic_cap_one_healthy_account_factor_two_dispatches_two() {
-        // The load-bearing #3947 scenario (6/7 accounts at their weekly ceiling):
-        // ONE healthy account with factor 2 must allow TWO concurrent sweeps —
-        // the pre-#3947 implicit 1:1 cap would have collapsed this to 1.
-        let cap = resolve_dynamic_max_concurrent(1, 2, 120, 3);
-        assert_eq!(cap, 2, "1 healthy × per-token 2 = 2 (disk 120, ceiling 3 don't bind)");
-
-        // And that cap actually dispatches 2 (not 1) against a 2-deep backlog.
-        let mut source = FakeSource::once((1..=2).map(issue).collect());
+    fn test_dynamic_cap_zero_ram_dispatches_nothing() {
+        // No available RAM ⇒ cap 0 ⇒ a subsequent tick dispatches nothing —
+        // mirrors test_dynamic_cap_zero_disk_dispatches_nothing exactly.
+        let cap = resolve_dynamic_max_concurrent(usize::MAX, 0, 10);
+        assert_eq!(cap, 0);
+        let mut source = FakeSource::once((1..=3).map(issue).collect());
         let mut disp = RecordingDispatcher::default();
         let report = tick(&mut source, &mut disp, cap, false).unwrap();
-        assert_eq!(report.dispatched, 2, "1-healthy/factor-2 dispatches 2 concurrent sweeps");
-        assert_eq!(report.deferred_capacity, 0);
-        assert_eq!(disp.dispatched.len(), 2);
+        assert_eq!(report.dispatched, 0);
+        assert_eq!(report.deferred_capacity, 3);
+        assert!(disp.dispatched.is_empty());
     }
 
     #[test]
-    fn test_dynamic_cap_zero_factor_degrades_to_one() {
-        // A mis-set factor 0 must NOT collapse the cap to zero — it degrades to
-        // the pre-#3947 one-sweep-per-account behavior (floor of 1).
-        assert_eq!(resolve_dynamic_max_concurrent(4, 0, 100, 100), 4);
-    }
-
-    #[test]
-    fn test_token_axis_jump_is_now_bounded_by_max_concurrent_not_cpu() {
-        // The #3978 scenario, re-baselined for #4512: several exhausted token
-        // accounts reset at once, jumping the healthy-token count from 2 to 14,
-        // so the token axis spikes to 14 × 2 = 28. There is no longer a CPU
-        // term to absorb that spike — the per-machine `maxConcurrent` knob is
-        // what bounds it (here 8), and the per-tick admission ramp cap (#4234)
-        // still limits how fast occupancy climbs toward it, with the host
-        // breaker (#4235) as the measured safety net.
-        assert_eq!(resolve_dynamic_max_concurrent(14, 2, 100, 8), 8);
+    fn test_dynamic_cap_unbounded_by_max_concurrent_default() {
         // A machine whose operator has NOT tuned the knob rides the shipped
-        // default rather than an estimate of its cores.
+        // default rather than an estimate of its cores or its token pool.
         assert_eq!(
-            resolve_dynamic_max_concurrent(14, 2, 100, DEFAULT_WORK_FINDER_MAX_CONCURRENT),
+            resolve_dynamic_max_concurrent(100, usize::MAX, DEFAULT_WORK_FINDER_MAX_CONCURRENT),
             DEFAULT_WORK_FINDER_MAX_CONCURRENT
         );
     }
@@ -4647,10 +4740,10 @@ exit 0
 
     #[test]
     fn test_scale_up_with_growing_backlog_bounded_by_dynamic_cap() {
-        // Fixed resources: pool=4, factor=1, disk=10, ceiling=10 ⇒
-        // dynamic cap 4. As the backlog grows tick-over-tick, effective
-        // concurrency scales up but is bounded by the cap (min(cap, backlog)).
-        let cap = resolve_dynamic_max_concurrent(4, 1, 10, 10);
+        // Fixed resources: disk=4, ceiling=10 ⇒ dynamic cap 4. As the backlog
+        // grows tick-over-tick, effective concurrency scales up but is bounded
+        // by the cap (min(cap, backlog)).
+        let cap = resolve_dynamic_max_concurrent(4, usize::MAX, 10);
         assert_eq!(cap, 4);
 
         // Backlog 2 (< cap): all 2 dispatch, nothing deferred.
@@ -4672,7 +4765,7 @@ exit 0
     fn test_scale_to_zero_on_empty_backlog() {
         // Even with ample resources (cap 5), an empty backlog dispatches nothing
         // — no capacity is pre-reserved and no idle workers are spawned.
-        let cap = resolve_dynamic_max_concurrent(5, 1, 5, 5);
+        let cap = resolve_dynamic_max_concurrent(5, usize::MAX, 5);
         assert_eq!(cap, 5);
         let mut source = FakeSource::once(vec![]);
         let mut disp = RecordingDispatcher::default();
@@ -4692,30 +4785,46 @@ exit 0
     }
 
     #[test]
+    #[serial(loom_config_env)]
     fn test_config_missing_file_is_all_none() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
         let tmp = tempfile::tempdir().unwrap();
-        assert_eq!(read_work_finder_config(tmp.path()), WorkFinderConfig::default());
+        let cfg = read_work_finder_config(tmp.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(cfg, WorkFinderConfig::default());
     }
 
     #[test]
+    #[serial(loom_config_env)]
     fn test_config_malformed_json_is_all_none() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
         let tmp = tempfile::tempdir().unwrap();
         write_config(tmp.path(), "{not valid json");
-        assert_eq!(read_work_finder_config(tmp.path()), WorkFinderConfig::default());
+        let cfg = read_work_finder_config(tmp.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(cfg, WorkFinderConfig::default());
     }
 
     #[test]
+    #[serial(loom_config_env)]
     fn test_config_missing_autonomous_block_is_all_none() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
         let tmp = tempfile::tempdir().unwrap();
         write_config(tmp.path(), r#"{"terminals": []}"#);
-        assert_eq!(read_work_finder_config(tmp.path()), WorkFinderConfig::default());
+        let cfg = read_work_finder_config(tmp.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(cfg, WorkFinderConfig::default());
     }
 
     #[test]
+    #[serial(loom_config_env)]
     fn test_config_missing_work_finder_block_is_all_none() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
         let tmp = tempfile::tempdir().unwrap();
         write_config(tmp.path(), r#"{"autonomous": {"mainHealthGate": {"enabled": true}}}"#);
-        assert_eq!(read_work_finder_config(tmp.path()), WorkFinderConfig::default());
+        let cfg = read_work_finder_config(tmp.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(cfg, WorkFinderConfig::default());
     }
 
     #[test]
@@ -4764,10 +4873,12 @@ exit 0
     }
 
     #[test]
+    #[serial(loom_config_env)]
     fn test_deprecated_cpu_knobs_accepted_at_any_value_including_nonsense() {
         // Pre-#4512 these were range-filtered/type-checked because a value was
         // consumed. Nothing consumes them now, so out-of-range, wrong-type, and
         // even absurd values are all equally inert — and equally non-fatal.
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
         for body in [
             r#"{"autonomous": {"cpuUtilizationTarget": 0}}"#,
             r#"{"autonomous": {"cpuUtilizationTarget": 1.5}}"#,
@@ -4783,6 +4894,7 @@ exit 0
             assert_eq!(cfg.max_concurrent, None);
             assert_eq!(cfg.enabled, None);
         }
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
     }
 
     #[test]
@@ -4874,12 +4986,15 @@ exit 0
     }
 
     #[test]
+    #[serial(loom_config_env)]
     fn test_config_per_token_concurrency_read_without_work_finder_block() {
         // `perTokenConcurrency` lives at the `autonomous` level (#3947), so it is
         // read even when the `workFinder` sub-block is absent.
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
         let tmp = tempfile::tempdir().unwrap();
         write_config(tmp.path(), r#"{"autonomous": {"perTokenConcurrency": 3}}"#);
         let cfg = read_work_finder_config(tmp.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
         assert_eq!(cfg.per_token_concurrency, Some(3));
         assert_eq!(cfg.enabled, None);
         assert_eq!(cfg.max_concurrent, None);
@@ -4895,10 +5010,13 @@ exit 0
     }
 
     #[test]
+    #[serial(loom_config_env)]
     fn test_config_enabled_false_is_disabled_flag() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
         let tmp = tempfile::tempdir().unwrap();
         write_config(tmp.path(), r#"{"autonomous": {"workFinder": {"enabled": false}}}"#);
         let cfg = read_work_finder_config(tmp.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
         assert_eq!(cfg.enabled, Some(false));
         assert_eq!(cfg.interval_secs, None);
         assert_eq!(cfg.max_concurrent, None);
@@ -5175,7 +5293,7 @@ exit 0
         assert_eq!(resolve_max_concurrent_with_config(&cfg), 10);
         assert_eq!(resolve_per_token_concurrency(&cfg), 2);
         assert_eq!(
-            resolve_dynamic_max_concurrent(6, resolve_per_token_concurrency(&cfg), 36, 10),
+            resolve_dynamic_max_concurrent(36, usize::MAX, 10),
             10,
             "a retired env knob must not clamp the cap"
         );
@@ -5191,23 +5309,15 @@ exit 0
     // ===================================================================
 
     fn pressured_assessment() -> capacity::PressureAssessment {
-        // token_limit 1 < disk 10, ceiling 10; 12 deferred ⇒ token-bound
-        // + pressured.
+        // token_limit 0 (zero healthy accounts); 12 deferred ⇒ genuinely
+        // token-starved + pressured.
         let snap = capacity::RankingSnapshot {
             total: 7,
-            available: 1,
-            exhausted: 6,
+            available: 0,
+            exhausted: 7,
             ..capacity::RankingSnapshot::default()
         };
-        capacity::assess_pressure(
-            Some(&snap),
-            7,
-            1,
-            10,
-            10,
-            12,
-            capacity::DEFAULT_ADVISORY_MIN_QUEUED,
-        )
+        capacity::assess_pressure(Some(&snap), 7, 0, 12, capacity::DEFAULT_ADVISORY_MIN_QUEUED)
     }
 
     fn calm_assessment() -> capacity::PressureAssessment {
@@ -5217,15 +5327,7 @@ exit 0
             available: 7,
             ..capacity::RankingSnapshot::default()
         };
-        capacity::assess_pressure(
-            Some(&snap),
-            7,
-            7,
-            10,
-            10,
-            0,
-            capacity::DEFAULT_ADVISORY_MIN_QUEUED,
-        )
+        capacity::assess_pressure(Some(&snap), 7, 7, 0, capacity::DEFAULT_ADVISORY_MIN_QUEUED)
     }
 
     #[test]
@@ -5249,7 +5351,7 @@ exit 0
             } => {
                 assert!(pressured);
                 assert_eq!(queued, 12);
-                assert_eq!(healthy_accounts, 1);
+                assert_eq!(healthy_accounts, 0);
                 assert!(message.contains("loom-daemon tokens bootstrap"));
             }
             other => panic!("expected CapacityAdvisory, got {other:?}"),
@@ -5462,6 +5564,130 @@ exit 0
             vec![10],
             "sibling root with no gate in flight is unaffected"
         );
+    }
+
+    // ===================================================================
+    // Pre-flight-advisory dispatch hold (#5030)
+    // ===================================================================
+
+    #[test]
+    fn test_dispatch_held_per_root_with_preflight_holds_only_the_tripped_root() {
+        // A workspace whose pre-flight breaker is holding (broken .mcp.json)
+        // holds only its own root; a healthy sibling keeps dispatching — the
+        // #3930 per-repo isolation contract must survive the #5030 fold.
+        let states = WorkspaceHealthStates::new();
+        let root_a = std::path::PathBuf::from("/tmp/repo-a"); // pre-flight held
+        let root_b = std::path::PathBuf::from("/tmp/repo-b"); // healthy
+        let preflight_held = [true, false];
+        let held = dispatch_held_per_root_with_preflight(
+            &states,
+            &[root_a, root_b],
+            true,
+            &preflight_held,
+        );
+        assert_eq!(
+            held,
+            vec![true, false],
+            "only the tripped root is held; its healthy sibling keeps dispatching"
+        );
+    }
+
+    #[test]
+    fn test_dispatch_held_per_root_with_preflight_empty_slice_matches_per_root() {
+        // An all-false / missing pre-flight slice is byte-for-byte the plain
+        // per-root vector — the fold is a pure superset, never a regression of
+        // the #4084 / #3930 semantics.
+        let states = WorkspaceHealthStates::new();
+        let root_a = std::path::PathBuf::from("/tmp/repo-a");
+        let root_b = std::path::PathBuf::from("/tmp/repo-b");
+        states.get_or_create(&root_a).set_gate_in_flight(true);
+        states.get_or_create(&root_b).set_halted(true);
+        let roots = [root_a, root_b];
+        let plain = dispatch_held_per_root(&states, &roots, true);
+        let folded = dispatch_held_per_root_with_preflight(&states, &roots, true, &[]);
+        assert_eq!(plain, folded, "empty pre-flight slice ⇒ identical to dispatch_held_per_root");
+    }
+
+    #[test]
+    fn test_dispatch_held_per_root_with_preflight_composes_with_verified_red() {
+        // The pre-flight hold and the #3930 verified-red hold compose
+        // additively per root: root_a is held by pre-flight, root_b by a red
+        // main, root_c is healthy on both axes.
+        let states = WorkspaceHealthStates::new();
+        let root_a = std::path::PathBuf::from("/tmp/repo-a");
+        let root_b = std::path::PathBuf::from("/tmp/repo-b");
+        let root_c = std::path::PathBuf::from("/tmp/repo-c");
+        states.get_or_create(&root_b).set_halted(true);
+        let held = dispatch_held_per_root_with_preflight(
+            &states,
+            &[root_a, root_b, root_c],
+            true,
+            &[true, false, false],
+        );
+        assert_eq!(held, vec![true, true, false]);
+    }
+
+    #[test]
+    fn test_preflight_held_root_dispatches_zero_new_sweeps() {
+        // Regression (#5030): end-to-end through `tick_multi`, a workspace whose
+        // pre-flight advisory has tripped (its breaker is holding) dispatches
+        // ZERO new sweeps even with a full backlog, while its healthy sibling
+        // takes the shared slot — the burn-every-slot incident cannot recur.
+        // Mirrors `test_gate_in_flight_root_dispatches_zero_new_sweeps`.
+        let states = WorkspaceHealthStates::new();
+        let root_a = std::path::PathBuf::from("/tmp/repo-a"); // pre-flight held
+        let root_b = std::path::PathBuf::from("/tmp/repo-b"); // healthy
+        let halted =
+            dispatch_held_per_root_with_preflight(&states, &[root_a, root_b], true, &[true, false]);
+
+        let mut multi = vec![
+            (FakeSource::once((1..=5).map(issue).collect()), RecordingDispatcher::default()),
+            (FakeSource::once(vec![issue(10)]), RecordingDispatcher::default()),
+        ];
+        let report = tick_multi(&mut multi, &[], 10, &halted);
+
+        assert!(report.halted, "the pre-flight-held root marks the tick as halted");
+        assert_eq!(report.seen, 6, "both backlogs are still observed");
+        assert!(
+            multi[0].1.dispatched.is_empty(),
+            "a pre-flight-broken workspace dispatches zero new sweeps (no slot burn)"
+        );
+        assert_eq!(
+            multi[1].1.dispatched,
+            vec![10],
+            "the healthy sibling keeps dispatching against the shared budget"
+        );
+    }
+
+    #[test]
+    fn test_preflight_probe_tick_resumes_dispatch_to_recovering_root() {
+        // Under the half-open design, a probe tick reports the root as NOT held
+        // (`preflight_held=false` for that root), so `tick_multi` lets one
+        // dispatch through to test recovery — proving the breaker never blocks
+        // the very dispatch needed to prove the workspace is fixed.
+        let states = WorkspaceHealthStates::new();
+        let root_a = std::path::PathBuf::from("/tmp/repo-a"); // probing this tick
+        let root_b = std::path::PathBuf::from("/tmp/repo-b"); // healthy
+                                                              // A probe tick maps `PreflightDispatchGate::Probe` → not held.
+        let halted = dispatch_held_per_root_with_preflight(
+            &states,
+            &[root_a, root_b],
+            true,
+            &[false, false],
+        );
+
+        let mut multi = vec![
+            (FakeSource::once(vec![issue(1)]), RecordingDispatcher::default()),
+            (FakeSource::once(vec![issue(10)]), RecordingDispatcher::default()),
+        ];
+        let report = tick_multi(&mut multi, &[], 10, &halted);
+        assert!(!report.halted);
+        assert_eq!(
+            multi[0].1.dispatched,
+            vec![1],
+            "a probe tick lets one dispatch through to the recovering root"
+        );
+        assert_eq!(multi[1].1.dispatched, vec![10]);
     }
 
     // ===================================================================

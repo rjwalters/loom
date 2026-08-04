@@ -765,6 +765,12 @@ mod tests {
     /// recent one alone. Before #4643 `cleanup_bad_tokens` had zero callers, so
     /// pools accumulated expired entries indefinitely.
     #[test]
+    // The final `is_bad` assert relies on the 600s-old "recent" entry still
+    // blocking under the *default* 6h cooldown, so it must not overlap the
+    // `#[serial]` tests that transiently shrink `EXHAUSTION_COOLDOWN_ENV` to
+    // 100s/300s/1800s — a concurrent run inside a sub-600s window would make
+    // that entry read as expired.
+    #[serial]
     fn wired_cleanup_prunes_over_age_exhaustion_entry() {
         let tmp = make_pool();
         let dir = pool_dir(tmp.path());

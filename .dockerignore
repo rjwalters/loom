@@ -1,0 +1,19 @@
+# .dockerignore — repo root
+#
+# docker/worker/Dockerfile builds with the repo root as its build context
+# (so `COPY dist/loom-daemon-<target>` lines up with the exact path
+# `.github/workflows/release.yml`'s build-daemon job already packages
+# release assets under). This repo has a large working tree (Rust
+# target/, git history, node_modules, per-issue worktrees, …) that the
+# Dockerfile never references, so deny-all-then-allowlist keeps the
+# context sent to the docker daemon small and free of anything that could
+# accidentally leak into a layer via a future wildcard COPY.
+#
+# If a future Dockerfile in this repo needs another path from the repo
+# root, add an explicit `!`-allowlist entry for it here — do not widen this
+# to an allow-all.
+*
+!dist/
+!dist/**
+!docker/
+!docker/**

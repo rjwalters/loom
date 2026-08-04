@@ -106,6 +106,19 @@ const GITIGNORE_BLOCK_HEADER: &str = "# Loom runtime state (don't commit these)"
 /// converge on this list via the new `loom-daemon update-gitignore` subcommand,
 /// which `resync-installed.sh` invokes — the block was previously refreshed only
 /// during a full `init`, so a fix here never reached repos between installs.
+///
+/// #5014: added `.loom/account-health.json` + `.loom/account-health.lock` (the
+/// per-repo token-pool health cache and its sibling `mkdir` lock, written by the
+/// daemon token pool) — Loom-owned runtime state that surfaced as untracked dirt
+/// in 0.17.0. Also re-synced the committed source `.gitignore`, whose block had
+/// drifted behind this list (was missing `.no-changes-needed` and `.loom/*.bak`).
+/// `.loom/accounts.json` is intentionally left tracked: it is an optional,
+/// committable per-repo profile allowlist, not runtime state.
+///
+/// #5267: added `.claude/worktrees/` (the Claude Code harness's own
+/// `isolation: worktree` root, created inside the checkout). Left unignored it
+/// is a nested git repo that `git add -A` stages as an embedded-repo gitlink.
+/// Also re-synced the committed source `.gitignore` for the same entry.
 pub const EPHEMERAL_PATTERNS: &[&str] = &[
     ".loom-in-use",
     // Per-worktree builder progress checkpoint. Its WRITER moved from Python to
@@ -138,6 +151,18 @@ pub const EPHEMERAL_PATTERNS: &[&str] = &[
     // in a consumer repo (anvil, 2026-07-28): `.loom/worktrees-local/<repo>/issue-N`
     // (#4280). Runtime worktree state, same class as `.loom/worktrees/`.
     ".loom/worktrees-local/",
+    // Worktrees created inside the checkout by the Claude Code harness's
+    // `isolation: worktree` mechanism (#5267). This is the HARNESS's own
+    // worktree root and is distinct from Loom's builder worktrees under
+    // `.loom/worktrees/` above — different owner, same hazard class: an
+    // unignored `.claude/worktrees/<name>` is a nested git repo, so a
+    // `git add -A` (e.g. during a resync) stages an embedded-repo gitlink.
+    // That near-miss already happened once in a consumer repo (gf180-trng,
+    // 2026-08-04). Unlike `.claude/commands` / `.claude/skills` — which are
+    // ignored ONLY in loom's own `.gitignore` because consumers keep them
+    // TRACKED — this path is pure machine-local runtime state everywhere, so
+    // it belongs in the consumer-facing managed block.
+    ".claude/worktrees/",
     ".loom/state.json",
     ".loom/mcp-command.json",
     ".loom/activity.db",
@@ -162,6 +187,14 @@ pub const EPHEMERAL_PATTERNS: &[&str] = &[
     // hold OAuth keys and must never be committed.
     ".loom/tokens/",
     ".loom/accounts.env",
+    // Codex/token-pool per-repo health cache + its sibling `mkdir` lock, written
+    // atomically by the daemon token pool (#5014). Machine-local runtime state
+    // that surfaced as untracked dirt in 0.17.0. Not secret-bearing (account
+    // names + reason categories only — never auth.json or child output), but
+    // still never something to commit. NB: `.loom/accounts.json` is deliberately
+    // NOT ignored — it is an optional, committable per-repo profile allowlist.
+    ".loom/account-health.json",
+    ".loom/account-health.lock",
     // Uncommitted canary confirmation sentinel (#3731). Its guardrail power comes
     // from being uncommitted, so it must never be tracked.
     ".loom/CANARY",
@@ -343,10 +376,28 @@ pub fn update_gitignore(workspace_path: &Path) -> Result<(), String> {
     // exactly, so line-vector edits are byte-preserving for untouched regions.
     let mut lines: Vec<String> = contents.split('\n').map(str::to_string).collect();
 
-    // Remove legacy over-broad patterns that block config.json from being
-    // tracked (older installs and /imagine used `.loom/*.json`), plus the
-    // negation that was paired with that glob.
-    let legacy_overbroad = [".loom/*.json", ".loom/config.json", "!.loom/roles/*.json"];
+    // Remove legacy over-broad patterns that would shadow *any* installed
+    // `.loom/*.json` file (older installs and /imagine used `.loom/*.json`),
+    // plus the negation that was paired with that glob. These are genuinely
+    // dangerous — they block files this installer never asked the user to
+    // ignore (`.loom/install-metadata.json`, `.loom/config/skill-routes.json`,
+    // …) — so they are always removed regardless of who wrote them.
+    //
+    // #5242: `.loom/config.json` itself is deliberately NOT in this list.
+    // It used to be here (see the historical note below), on the theory that
+    // any occurrence was a leftover from the pre-#2278 bug where `.loom/config.json`
+    // was gitignored by mistake, blocking the merge-aware tracked-config design
+    // (#3598) from working. That theory stopped holding once fleet hosts started
+    // adding this exact line *on purpose*: `.loom/config.json` is committed
+    // team config by default, but a host that keeps genuinely host-local runtime
+    // state there (e.g. a `worktree.root` override) has a legitimate reason to
+    // gitignore it — and this installer never adds that rule itself (it is not
+    // in EPHEMERAL_PATTERNS), so per the "never remove ignore rules we didn't
+    // add" rule it must not strip it either. Removing it here fought that
+    // documented, intentional divergence on every subsequent install/update
+    // (rjwalters/lean-genius#43683). A single scoped `.loom/config.json` line
+    // does not shadow any other installed file, so leaving it alone is safe.
+    let legacy_overbroad = [".loom/*.json", "!.loom/roles/*.json"];
     lines.retain(|line| !legacy_overbroad.contains(&line.trim()));
 
     let begin = lines
@@ -590,6 +641,13 @@ mod tests {
         // is born absent in every fresh worktree.
         assert!(contents.contains(".no-changes-needed"));
 
+        // #5014: the per-repo token-pool health cache + its sibling mkdir lock
+        // must be ignored so 0.17.0 runtime state never surfaces as untracked
+        // dirt. The optional, committable `.loom/accounts.json` must NOT be.
+        assert!(contents.contains(".loom/account-health.json"));
+        assert!(contents.contains(".loom/account-health.lock"));
+        assert!(!contents.contains(".loom/accounts.json"));
+
         // Retired daemon-brain patterns must NOT be emitted (Phase 3.5, #3402)
         assert!(!contents.contains(".loom/daemon-state.json"));
         assert!(!contents.contains(".loom/[0-9][0-9]-daemon-state.json"));
@@ -625,6 +683,8 @@ mod tests {
         assert!(contents.contains(".loom/spawn-loop-state.json"));
         assert!(contents.contains(".loom/daemon-metrics.json"));
         assert!(contents.contains(".loom/activity.db"));
+        // #5267: the harness's `isolation: worktree` root must be added too.
+        assert!(contents.contains(".claude/worktrees/"));
     }
 
     #[test]
@@ -646,6 +706,9 @@ mod tests {
         // #4635: the builder "no changes needed" marker must not duplicate
         // across runs either.
         assert_eq!(contents.matches(".no-changes-needed").count(), 1);
+        // #5267: `.claude/worktrees/` (harness `isolation: worktree` root) must
+        // not duplicate across runs.
+        assert_eq!(contents.matches(".claude/worktrees/").count(), 1);
     }
 
     #[test]
@@ -678,6 +741,10 @@ mod tests {
             ".loom/interventions/",
             ".loom/worktrees/",
             ".loom/worktrees-local/",
+            // #5267: the Claude Code harness's `isolation: worktree` root,
+            // created inside the checkout — a nested git repo that `git add -A`
+            // otherwise stages as an embedded-repo gitlink.
+            ".claude/worktrees/",
             ".loom/state.json",
             ".loom/mcp-command.json",
             ".loom/activity.db",
@@ -695,11 +762,16 @@ mod tests {
             ".loom/metrics/",
             ".loom/usage-cache.json",
             ".loom/claude-config/",
+            // #5014: per-repo token-pool health cache + its sibling mkdir lock.
+            ".loom/account-health.json",
+            ".loom/account-health.lock",
             ".loom/*.log",
             ".loom/*.sock",
             // #4401: tmp sidecars from interrupted atomic writes (e.g.
             // `.loom/manifest.json.tmp` from verify-install.sh's `generate`).
             ".loom/*.tmp",
+            // #4641/#5014: salvage/backup sidecars from torn atomic writes.
+            ".loom/*.bak",
             ".loom/logs/",
         ];
 
@@ -841,7 +913,7 @@ mod tests {
     }
 
     #[test]
-    fn removes_legacy_broad_json_pattern() {
+    fn removes_legacy_broad_json_pattern_but_preserves_config_json_rule() {
         let tmp = TempDir::new().unwrap();
         let gitignore = tmp.path().join(".gitignore");
 
@@ -856,18 +928,25 @@ mod tests {
 
         let contents = fs::read_to_string(&gitignore).unwrap();
 
-        // Legacy patterns must be removed
+        // The genuinely over-broad patterns (which would shadow *any* installed
+        // `.loom/*.json` file, not just config.json) must still be removed.
         assert!(
             !contents.contains(".loom/*.json"),
             "Legacy .loom/*.json pattern should have been removed"
         );
         assert!(
-            !contents.contains(".loom/config.json"),
-            "Legacy .loom/config.json pattern should have been removed"
-        );
-        assert!(
             !contents.contains("!.loom/roles/*.json"),
             "Legacy negation pattern should have been removed"
+        );
+
+        // #5242: a narrowly-scoped `.loom/config.json` ignore rule must survive.
+        // This installer never adds this line itself (it is not in
+        // EPHEMERAL_PATTERNS), so it must not remove it either — some hosts add
+        // it deliberately to keep host-local runtime state (e.g. worktree.root
+        // overrides) out of a shared repo's tracked config.
+        assert!(
+            contents.contains(".loom/config.json"),
+            "A pre-existing, narrowly-scoped .loom/config.json ignore rule must be preserved"
         );
 
         // Specific ephemeral patterns should be added instead
@@ -876,6 +955,34 @@ mod tests {
         assert!(contents.contains(".loom/worktrees/"));
 
         // Non-Loom content preserved
+        assert!(contents.contains("node_modules/"));
+    }
+
+    #[test]
+    fn preserves_standalone_config_json_ignore_rule_across_repeated_updates() {
+        // #5242 regression: a repo that deliberately keeps `.loom/config.json`
+        // gitignored (documented host-local runtime state, e.g. a fleet host's
+        // `worktree.root` override) must not have that rule stripped again on
+        // every subsequent `update_gitignore` run (install/update/resync).
+        let tmp = TempDir::new().unwrap();
+        let gitignore = tmp.path().join(".gitignore");
+
+        fs::write(
+            &gitignore,
+            "node_modules/\n\n# Host-local divergence: worktree.root is per-machine\n.loom/config.json\n",
+        )
+        .unwrap();
+
+        update_gitignore(tmp.path()).unwrap();
+        update_gitignore(tmp.path()).unwrap();
+
+        let contents = fs::read_to_string(&gitignore).unwrap();
+
+        assert!(
+            contents.contains(".loom/config.json"),
+            "a standalone, user-added .loom/config.json ignore rule must survive repeated \
+             update_gitignore runs, got: {contents}"
+        );
         assert!(contents.contains("node_modules/"));
     }
 

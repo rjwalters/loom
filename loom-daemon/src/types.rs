@@ -797,6 +797,23 @@ pub struct SweepInfo {
     pub kind: SweepKind,
     /// PID of the detached child process.
     pub pid: u32,
+    /// Process-group ID of the detached child (Issue #4980). Sweeps are spawned
+    /// as their own group leader (`process_group(0)`, #3800), so for a live
+    /// dispatch this equals [`pid`](Self::pid) — but recording it explicitly is
+    /// what makes group termination survive the loss of the spawning process:
+    ///
+    /// - a `reconstruct()`-ed entry (daemon restart) has no retained `Child`
+    ///   handle, and used to silently degrade cancellation to a single-PID kill
+    ///   that orphaned the whole subtree;
+    /// - the crash-path reaper needs a group handle to reap survivors of a
+    ///   *dead* leader, whose pgid can no longer be queried from the OS.
+    ///
+    /// `None` for entries whose group is unknown (a pre-#4980 `owner.json`, a
+    /// checkpoint-only recovery entry, a non-Unix host, or a test-injected
+    /// entry) — every consumer degrades to single-PID signalling and logs,
+    /// never assumes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pgid: Option<u32>,
     /// Token account name selected by `spawn-claude.sh` (e.g. `agent-2.token`).
     /// "unknown" when not surfaced by the wrapper (Phase A logs this in
     /// the per-sweep log rather than recording it on the entry).
@@ -938,6 +955,18 @@ pub struct DaemonStatusReport {
     /// Dynamic-cap input 2: how many worktrees the scratch volume can hold at
     /// `LOOM_PER_WORKTREE_GB` each. Via [`crate::disk_headroom::disk_headroom_limit`].
     pub disk_headroom: usize,
+    /// Dynamic-cap input (#5270): how many worktrees the host's
+    /// currently-available RAM can hold at `LOOM_PER_WORKTREE_RAM_GB` each.
+    /// Via [`crate::ram_headroom::ram_headroom_limit`] — the second machine-
+    /// headroom axis alongside [`Self::disk_headroom`], added when the token
+    /// axis was removed from admission entirely (operator direction: "we
+    /// should only ever limit parallelism based on the machine
+    /// disk/RAM/CPU"). `#[serde(default)]` keeps pre-#5270 wire data / older
+    /// clients compatible (an absent field parses as `0`, i.e. "unknown" —
+    /// callers should treat a `0` from a stale client cautiously, the same
+    /// caution any dynamic-cap input warrants).
+    #[serde(default)]
+    pub ram_headroom: usize,
     /// The host's logical CPU count (#3978), via
     /// [`crate::cpu_headroom::logical_cpu_count`]. **Observational only since
     /// #4512** — the CPU headroom *term* it used to feed was removed from the
@@ -995,6 +1024,16 @@ pub struct DaemonStatusReport {
     /// wire data compatible.
     #[serde(default)]
     pub preflight_advisory_message: Option<String>,
+    /// Wall-clock time of the most recent trip/clear transition backing
+    /// [`Self::preflight_advisory_active`] (Issue #5029) — `None` before the
+    /// first transition this daemon process has observed. Lets the status
+    /// renderer show an "as of" freshness indicator alongside the warning, so
+    /// a historical (already-cleared) tripped count is never mistaken for a
+    /// live one. Purely a display addition — carries no decision logic of its
+    /// own. `#[serde(default)]` keeps pre-#5029 wire data / older clients
+    /// compatible (an absent field parses as `None`).
+    #[serde(default)]
+    pub preflight_advisory_changed_at: Option<DateTime<Utc>>,
     /// Dynamic-cap input 3: **the** per-machine admission knob
     /// (`autonomous.workFinder.maxConcurrent` / `LOOM_WORK_FINDER_MAX_CONCURRENT`).
     /// Since #4512 this is the only *policy* term in the cap — the other two
@@ -1011,10 +1050,11 @@ pub struct DaemonStatusReport {
     #[serde(default)]
     pub per_token_concurrency: usize,
     /// The effective dynamic concurrency cap —
-    /// `min(token_axis × per_token_concurrency, disk_headroom, configured_max)`
+    /// `min(disk_headroom, ram_headroom, configured_max)`
     /// (`resolve_dynamic_max_concurrent`; the CPU term that sat in this `min`
-    /// from #3978 was removed in #4512). This is the total-occupancy ceiling the
-    /// work finder recomputes every tick.
+    /// from #3978 was removed in #4512, and the token axis was removed
+    /// entirely in #5270 — see [`Self::ram_headroom`]). This is the
+    /// total-occupancy ceiling the work finder recomputes every tick.
     pub dynamic_cap: usize,
     /// Whether autonomous dispatch is currently halted by the reactive
     /// main-health gate (#3812). `true` means a red `main` has paused new
@@ -1355,6 +1395,21 @@ pub struct DaemonStatusReport {
     /// keeps older wire data / older clients compatible.
     #[serde(default)]
     pub observability_host_id_mismatch: Option<ObservabilityHostIdMismatch>,
+    /// **Positive** confirmation of whether telemetry is actually reaching the
+    /// backend, and under which `host_id` (Issue #5083).
+    ///
+    /// [`Self::observability_host_id_mismatch`] above is anomaly-only by
+    /// design (#4830), which left "exporting fine", "observability disabled",
+    /// and "configured but silently never exported" all rendering as the same
+    /// thing: nothing at all. This field is the counterpart that always has an
+    /// answer — see [`ObservabilityExportStatus`].
+    ///
+    /// `None` **only** from a pre-#5083 daemon binary that never computed one
+    /// (never misread as "disabled" — a running daemon that has observability
+    /// off reports `Some(ObservabilityExportStatus::disabled())`).
+    /// `#[serde(default)]` keeps older wire data / older clients compatible.
+    #[serde(default)]
+    pub observability_export: Option<ObservabilityExportStatus>,
 }
 
 /// A confirmed disagreement between the host identity this daemon resolves for
@@ -1383,6 +1438,252 @@ pub struct ObservabilityHostIdMismatch {
     /// once-per-lifetime, so this is the age of the condition, not of the last
     /// flush.
     pub first_seen_at: DateTime<Utc>,
+}
+
+/// The one-word answer to "is this host's telemetry landing?" (Issue #5083),
+/// derived from [`ObservabilityExportStatus`] by
+/// [`ObservabilityExportStatus::classify`].
+///
+/// Serialized in `snake_case` so a watch loop can assert on it directly, e.g.
+/// `loom-daemon status --json | jq -e '.observability_export.state == "healthy"'`.
+/// An unknown variant from a *newer* daemon deserializes as
+/// [`Self::Unrecognized`] rather than failing the whole status parse.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservabilityExportState {
+    /// The exporter is not running: `observability.enabled` is false, or it is
+    /// enabled but under-configured (no endpoint, no/unreadable ingest key, or
+    /// `exporter = "otlp"` on a build without the `otlp` feature). Nothing is
+    /// being collected and nothing is being sent — a legitimate steady state,
+    /// not a fault.
+    #[default]
+    Disabled,
+    /// The exporter is running but has not had a fair chance to flush yet —
+    /// it has been up for less than
+    /// [`ObservabilityExportStatus::never_exported_grace_secs`]. Distinguished
+    /// from [`Self::NeverExported`] precisely so a freshly-restarted daemon
+    /// does not trip a watch loop for the first flush interval.
+    Starting,
+    /// **The silent failure mode this issue exists for.** The exporter has
+    /// been running well past its grace window and has still never had a batch
+    /// acked. Before #5083 this was indistinguishable from healthy: no health
+    /// section, no status line, and a 0-byte queue file that reads the same
+    /// whether it drained or was never written.
+    NeverExported,
+    /// At least one batch has been acked and the most recent attempt did not
+    /// fail. Telemetry is flowing, filed under
+    /// [`ObservabilityExportStatus::host_id`].
+    Healthy,
+    /// Batches are being acked, but the backend echoes a *different* `host_id`
+    /// than this daemon reports for itself (#4830) — the records are landing,
+    /// under the wrong host. Takes precedence over [`Self::Failing`]: it is a
+    /// config-shaped fault that cannot self-recover, whereas a failing flush
+    /// usually can.
+    HostIdMismatch,
+    /// The most recent flush attempt failed (the queue is retrying with
+    /// backoff). `last_failure_detail` carries the exporter's own error text;
+    /// `last_success_at` says whether this is a regression or has never worked.
+    Failing,
+    /// A state name this build does not know — a newer daemon reporting to an
+    /// older client. Never produced by [`ObservabilityExportStatus::classify`].
+    #[serde(other)]
+    Unrecognized,
+}
+
+impl ObservabilityExportState {
+    /// The short, upper-case token the human-readable renderers lead with.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            ObservabilityExportState::Disabled => "disabled",
+            ObservabilityExportState::Starting => "starting",
+            ObservabilityExportState::NeverExported => "NEVER EXPORTED",
+            ObservabilityExportState::Healthy => "OK",
+            ObservabilityExportState::HostIdMismatch => "HOST-ID MISMATCH",
+            ObservabilityExportState::Failing => "FAILING",
+            ObservabilityExportState::Unrecognized => "unrecognized",
+        }
+    }
+
+    /// Whether this state is a *problem* an operator should act on.
+    /// `disabled`, `starting`, and `healthy` are not; the rest are.
+    #[must_use]
+    pub fn is_problem(self) -> bool {
+        matches!(
+            self,
+            ObservabilityExportState::NeverExported
+                | ObservabilityExportState::HostIdMismatch
+                | ObservabilityExportState::Failing
+        )
+    }
+}
+
+/// Positive, always-present state of this daemon's telemetry export (Issue
+/// #5083) — the counterpart to [`ObservabilityHostIdMismatch`]'s anomaly-only
+/// signal.
+///
+/// The 2026-08-03 incident this exists for: two hosts with byte-identical
+/// observability config, one showing an `observability` health section and one
+/// not. The absence was the *only* evidence the second host was fine, which is
+/// inference from absence — and the exact same absence would have been shown
+/// for a host whose exporter had never successfully sent a single batch.
+/// Confirming it took a `daemon.log` grep for the *lack* of a warning.
+///
+/// Published by [`crate::observability::ExportStatus`] (updated by
+/// [`crate::observability::sender::try_flush`] on every attempt) and read back
+/// via [`crate::observability::global_export_status`], mirroring the
+/// process-global pattern [`ObservabilityHostIdMismatch`] already uses.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObservabilityExportStatus {
+    /// The state as classified by the *daemon* at status-build time. Consumers
+    /// that hold their own `now` (e.g. `loom-daemon health`, which stamps one
+    /// `at` for the whole report) may re-derive it with [`Self::classify`];
+    /// both agree except across the grace boundary.
+    ///
+    /// `#[serde(default)]` (⇒ `disabled`) so a partial payload from any other
+    /// producer still parses rather than failing the whole status read — every
+    /// consumer that cares re-derives with [`Self::classify`] anyway.
+    #[serde(default)]
+    pub state: ObservabilityExportState,
+    /// The host identity this daemon stamps on every outgoing envelope —
+    /// [`crate::sweep_registry::host_identity`]. `None` when the exporter is
+    /// not running. This is the "under which `host_id`" half of the AC.
+    #[serde(default)]
+    pub host_id: Option<String>,
+    /// The `host_id` the ingest backend echoed back, when it *disagrees* with
+    /// [`Self::host_id`] — i.e. `Some` exactly when a #4830 mismatch has been
+    /// confirmed, so [`Self::classify`] needs no second input. `None`
+    /// otherwise, including when the ids agree.
+    #[serde(default)]
+    pub ingest_host_id: Option<String>,
+    /// The configured export endpoint, so an operator can confirm *where* the
+    /// data is going without opening the config. `None` when not running.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// Which exporter implementation is running: `"https"` (Loom's native
+    /// ingest) or `"otlp"`. `None` when not running.
+    #[serde(default)]
+    pub exporter: Option<String>,
+    /// When the exporter task started this daemon process. The denominator for
+    /// "has it had a fair chance to flush yet" — see [`Self::classify`].
+    #[serde(default)]
+    pub started_at: Option<DateTime<Utc>>,
+    /// When a batch was most recently acked by the backend. `None` means *no
+    /// batch has ever been acked this process* — the never-exported signal.
+    #[serde(default)]
+    pub last_success_at: Option<DateTime<Utc>>,
+    /// When a flush attempt most recently failed, if ever.
+    #[serde(default)]
+    pub last_failure_at: Option<DateTime<Utc>>,
+    /// The error text of that most recent failure (the exporter's own
+    /// `Display`, e.g. `sink rejected batch: HTTP 401 — …`). Never contains
+    /// the ingest key: the exporter's errors are built from status codes and
+    /// truncated body snippets only.
+    #[serde(default)]
+    pub last_failure_detail: Option<String>,
+    /// Total envelopes acked this daemon process. `0` alongside a `Some`
+    /// `started_at` is the never-exported signature.
+    #[serde(default)]
+    pub records_exported: u64,
+    /// Consecutive failed flush attempts since the last success (reset to 0 on
+    /// any ack). Non-zero ⇒ [`ObservabilityExportState::Failing`].
+    #[serde(default)]
+    pub consecutive_failures: u32,
+    /// The flush cadence this exporter resolved, in seconds — the unit the
+    /// grace window is scaled by, so a host configured with a long interval
+    /// does not false-alarm as never-exported. `None` when not running.
+    #[serde(default)]
+    pub flush_interval_secs: Option<u64>,
+}
+
+/// Floor on the never-exported grace window — a fresh exporter is never called
+/// out before this much wall-clock has passed, regardless of flush cadence.
+/// Sized above the collector's own 5-minute host-snapshot interval
+/// ([`crate::observability::SNAPSHOT_INTERVAL`]) so a host with no sweep
+/// activity at all still has had at least one record enqueued and one flush
+/// attempted before the window closes.
+pub const NEVER_EXPORTED_GRACE_FLOOR_SECS: u64 = 10 * 60;
+
+impl ObservabilityExportStatus {
+    /// The "exporter is not running" reading — what a daemon with
+    /// observability disabled, keyless, or otherwise under-configured reports.
+    /// Distinct from a `None` field, which means "this daemon binary predates
+    /// #5083 and cannot tell you".
+    #[must_use]
+    pub fn disabled() -> Self {
+        Self {
+            state: ObservabilityExportState::Disabled,
+            ..Self::default()
+        }
+    }
+
+    /// How long a freshly-started exporter is given before a still-empty
+    /// success record is called out: three flush intervals, floored at
+    /// [`NEVER_EXPORTED_GRACE_FLOOR_SECS`].
+    #[must_use]
+    pub fn never_exported_grace_secs(&self) -> u64 {
+        self.flush_interval_secs
+            .unwrap_or(0)
+            .saturating_mul(3)
+            .max(NEVER_EXPORTED_GRACE_FLOOR_SECS)
+    }
+
+    /// Seconds since the last acked batch, as of `now`. `None` when nothing has
+    /// ever been acked. Clamped at zero so a small clock skew never renders a
+    /// negative age.
+    #[must_use]
+    pub fn last_success_age_secs(&self, now: DateTime<Utc>) -> Option<u64> {
+        self.last_success_at.map(|at| {
+            u64::try_from(now.signed_duration_since(at).num_seconds().max(0)).unwrap_or(0)
+        })
+    }
+
+    /// Seconds the exporter has been running, as of `now`. `None` when it is
+    /// not running.
+    #[must_use]
+    pub fn uptime_secs(&self, now: DateTime<Utc>) -> Option<u64> {
+        self.started_at.map(|at| {
+            u64::try_from(now.signed_duration_since(at).num_seconds().max(0)).unwrap_or(0)
+        })
+    }
+
+    /// Derive the state from the recorded facts, as of `now`. Pure, so every
+    /// surface (`status`, `health`, the dashboard) reaches the same verdict
+    /// from the same wire payload rather than each re-inventing the rules.
+    ///
+    /// Precedence, most-specific first:
+    /// 1. not running ⇒ `Disabled`
+    /// 2. confirmed id disagreement ⇒ `HostIdMismatch` (config-shaped, cannot
+    ///    self-recover — outranks a transient flush failure, whose facts stay
+    ///    readable in `last_failure_*` either way)
+    /// 3. the last attempt failed ⇒ `Failing`
+    /// 4. something has been acked ⇒ `Healthy`
+    /// 5. nothing acked, still inside the grace window ⇒ `Starting`
+    /// 6. nothing acked, past the grace window ⇒ `NeverExported`
+    #[must_use]
+    pub fn classify(&self, now: DateTime<Utc>) -> ObservabilityExportState {
+        let Some(uptime) = self.uptime_secs(now) else {
+            return ObservabilityExportState::Disabled;
+        };
+        if self
+            .ingest_host_id
+            .as_ref()
+            .is_some_and(|ingest| Some(ingest) != self.host_id.as_ref())
+        {
+            return ObservabilityExportState::HostIdMismatch;
+        }
+        if self.consecutive_failures > 0 {
+            return ObservabilityExportState::Failing;
+        }
+        if self.last_success_at.is_some() {
+            return ObservabilityExportState::Healthy;
+        }
+        if uptime < self.never_exported_grace_secs() {
+            ObservabilityExportState::Starting
+        } else {
+            ObservabilityExportState::NeverExported
+        }
+    }
 }
 
 /// One work-finder tick's dispatch/skip tally, stamped with the wall-clock
@@ -1768,6 +2069,31 @@ pub struct RepoStatus {
     /// vec).
     #[serde(default)]
     pub role_runner_on_idle_roles: Vec<String>,
+    /// This root's OWN resolved token-pool directory (Issue #5269) —
+    /// `tokens_pool::paths::resolve_tokens_dir(&root)`, the exact resolution
+    /// [`crate::token_ranking_refresh`]'s self-refresh loop already uses to
+    /// decide which pool to refresh for this repo. Deliberately **not** the
+    /// anchored/CWD-based resolution the top-level
+    /// [`DaemonStatusReport::token_pool_dir`] uses — that field answers "which
+    /// pool is the daemon's own primary workspace's", which for a multi-repo
+    /// daemon can be a different repo's pool entirely. `#[serde(default)]`
+    /// keeps pre-#5269 wire data compatible (an absent field parses as
+    /// `None`).
+    #[serde(default)]
+    pub token_pool_dir: Option<PathBuf>,
+    /// Whether this root's own resolved pool (`Self::token_pool_dir`) has a
+    /// `.ranking` file (Issue #5269) — same semantics as the top-level
+    /// [`DaemonStatusReport`]'s `health`/`capacity` staleness inputs, just
+    /// scoped to this repo's own pool instead of the daemon's anchored
+    /// primary workspace. `#[serde(default)]` keeps pre-#5269 wire data
+    /// compatible (an absent field parses as `false`).
+    #[serde(default)]
+    pub ranking_present: bool,
+    /// Age in seconds of this root's own `.ranking`, when readable (Issue
+    /// #5269). `#[serde(default)]` keeps pre-#5269 wire data compatible (an
+    /// absent field parses as `None`).
+    #[serde(default)]
+    pub ranking_age_secs: Option<u64>,
 }
 
 /// One active insta-crash quarantine (Issue #4215), as surfaced by
@@ -2665,6 +2991,9 @@ mod tests {
             role_runner_enabled: false,
             role_runner_roles: vec![],
             role_runner_on_idle_roles: vec![],
+            token_pool_dir: None,
+            ranking_present: false,
+            ranking_age_secs: None,
         }
     }
 
@@ -2694,5 +3023,186 @@ mod tests {
         }"#;
         let status: RepoStatus = serde_json::from_str(json).unwrap();
         assert!(!status.root_missing);
+    }
+
+    // ==================================================================
+    // Observability export status (Issue #5083)
+    // ==================================================================
+
+    fn export_now() -> DateTime<Utc> {
+        "2026-08-03T12:00:00Z".parse().unwrap()
+    }
+
+    /// A running exporter that started `uptime_secs` ago on the default
+    /// 30s cadence and has never been touched by a flush attempt.
+    fn running_exporter(uptime_secs: i64) -> ObservabilityExportStatus {
+        ObservabilityExportStatus {
+            state: ObservabilityExportState::Starting,
+            host_id: Some("robb-studio".to_string()),
+            ingest_host_id: None,
+            endpoint: Some("https://dashboard.example/ingest".to_string()),
+            exporter: Some("https".to_string()),
+            started_at: Some(export_now() - chrono::Duration::seconds(uptime_secs)),
+            last_success_at: None,
+            last_failure_at: None,
+            last_failure_detail: None,
+            records_exported: 0,
+            consecutive_failures: 0,
+            flush_interval_secs: Some(30),
+        }
+    }
+
+    #[test]
+    fn an_unstarted_exporter_classifies_as_disabled() {
+        // The "observability off / keyless / under-configured" reading — a real
+        // answer, materially different from a `None` field on the wire.
+        let status = ObservabilityExportStatus::disabled();
+        assert_eq!(status.classify(export_now()), ObservabilityExportState::Disabled);
+        assert!(!ObservabilityExportState::Disabled.is_problem());
+        assert!(status.uptime_secs(export_now()).is_none());
+    }
+
+    #[test]
+    fn a_fresh_exporter_with_no_export_yet_is_starting_not_never_exported() {
+        // The false-alarm guard: a daemon restarted 12 seconds ago has not yet
+        // had a fair chance to flush, so it must not read as broken.
+        let status = running_exporter(12);
+        assert_eq!(status.classify(export_now()), ObservabilityExportState::Starting);
+        assert!(!ObservabilityExportState::Starting.is_problem());
+    }
+
+    #[test]
+    fn past_the_grace_window_with_no_export_is_never_exported() {
+        // THE state this issue exists for: configured, running for hours, and
+        // silently never landed a single batch. Pre-#5083 this was
+        // indistinguishable from healthy on every surface.
+        let status = running_exporter(4 * 3600);
+        assert_eq!(status.classify(export_now()), ObservabilityExportState::NeverExported);
+        assert!(ObservabilityExportState::NeverExported.is_problem());
+    }
+
+    #[test]
+    fn the_grace_window_scales_with_the_flush_interval_but_never_below_the_floor() {
+        // A host configured with a one-hour flush cadence must not be called
+        // out as never-exported before it has had three chances to flush.
+        let mut slow = running_exporter(30 * 60);
+        slow.flush_interval_secs = Some(3600);
+        assert_eq!(slow.never_exported_grace_secs(), 3 * 3600);
+        assert_eq!(slow.classify(export_now()), ObservabilityExportState::Starting);
+
+        // ...and a very fast cadence still gets the floor, so a quiet host with
+        // nothing to enqueue yet is not misreported either.
+        let mut fast = running_exporter(60);
+        fast.flush_interval_secs = Some(1);
+        assert_eq!(fast.never_exported_grace_secs(), NEVER_EXPORTED_GRACE_FLOOR_SECS);
+        assert_eq!(fast.classify(export_now()), ObservabilityExportState::Starting);
+    }
+
+    #[test]
+    fn an_acked_batch_with_agreeing_ids_is_healthy() {
+        let mut status = running_exporter(4 * 3600);
+        status.last_success_at = Some(export_now() - chrono::Duration::seconds(12));
+        status.records_exported = 3481;
+        assert_eq!(status.classify(export_now()), ObservabilityExportState::Healthy);
+        assert_eq!(status.last_success_age_secs(export_now()), Some(12));
+        assert!(!ObservabilityExportState::Healthy.is_problem());
+    }
+
+    #[test]
+    fn a_disagreeing_ingest_id_is_a_mismatch_even_while_exporting() {
+        // #4830's condition, expressed on the positive surface: data IS
+        // landing, under the wrong identity.
+        let mut status = running_exporter(4 * 3600);
+        status.last_success_at = Some(export_now() - chrono::Duration::seconds(12));
+        status.ingest_host_id = Some("robb-pro".to_string());
+        assert_eq!(status.classify(export_now()), ObservabilityExportState::HostIdMismatch);
+        assert!(ObservabilityExportState::HostIdMismatch.is_problem());
+    }
+
+    #[test]
+    fn an_echoed_id_that_agrees_is_not_a_mismatch() {
+        // Defensive: only a *disagreement* is a mismatch. An echo equal to the
+        // daemon's own id must stay healthy.
+        let mut status = running_exporter(4 * 3600);
+        status.last_success_at = Some(export_now());
+        status.ingest_host_id = Some("robb-studio".to_string());
+        assert_eq!(status.classify(export_now()), ObservabilityExportState::Healthy);
+    }
+
+    #[test]
+    fn consecutive_failures_classify_as_failing() {
+        let mut status = running_exporter(4 * 3600);
+        status.last_success_at = Some(export_now() - chrono::Duration::seconds(7200));
+        status.consecutive_failures = 3;
+        status.last_failure_detail = Some("sink rejected batch: HTTP 401 — denied".to_string());
+        assert_eq!(status.classify(export_now()), ObservabilityExportState::Failing);
+        assert!(ObservabilityExportState::Failing.is_problem());
+        // "Never worked" vs "worked, then broke" stays legible.
+        assert_eq!(status.last_success_age_secs(export_now()), Some(7200));
+    }
+
+    #[test]
+    fn a_mismatch_outranks_a_transient_flush_failure() {
+        // Precedence documented on `classify`: the config-shaped fault that
+        // cannot self-recover wins; the failure facts remain readable in the
+        // `last_failure_*` fields either way.
+        let mut status = running_exporter(4 * 3600);
+        status.last_success_at = Some(export_now() - chrono::Duration::seconds(60));
+        status.ingest_host_id = Some("robb-pro".to_string());
+        status.consecutive_failures = 2;
+        assert_eq!(status.classify(export_now()), ObservabilityExportState::HostIdMismatch);
+        assert_eq!(status.consecutive_failures, 2);
+    }
+
+    #[test]
+    fn never_exported_beats_a_stale_failure_only_after_grace() {
+        // A brand-new exporter whose very first flush errored is `Failing`
+        // (there is a real, current error) — not `Starting`: the error is
+        // evidence, not absence of it.
+        let mut status = running_exporter(12);
+        status.consecutive_failures = 1;
+        assert_eq!(status.classify(export_now()), ObservabilityExportState::Failing);
+    }
+
+    #[test]
+    fn export_state_serializes_snake_case_for_watch_loops() {
+        // The AC's machine-readability requirement: a watch loop asserts on
+        // these exact strings via `status --json | jq`.
+        for (state, wire) in [
+            (ObservabilityExportState::Disabled, "\"disabled\""),
+            (ObservabilityExportState::Starting, "\"starting\""),
+            (ObservabilityExportState::NeverExported, "\"never_exported\""),
+            (ObservabilityExportState::Healthy, "\"healthy\""),
+            (ObservabilityExportState::HostIdMismatch, "\"host_id_mismatch\""),
+            (ObservabilityExportState::Failing, "\"failing\""),
+        ] {
+            assert_eq!(serde_json::to_string(&state).unwrap(), wire);
+            let back: ObservabilityExportState = serde_json::from_str(wire).unwrap();
+            assert_eq!(back, state);
+        }
+    }
+
+    #[test]
+    fn an_unknown_state_from_a_newer_daemon_does_not_break_the_parse() {
+        let back: ObservabilityExportState = serde_json::from_str("\"quantum_entangled\"").unwrap();
+        assert_eq!(back, ObservabilityExportState::Unrecognized);
+    }
+
+    #[test]
+    fn export_status_round_trips_and_tolerates_pre_5083_wire_data() {
+        let mut status = running_exporter(600);
+        status.last_success_at = Some(export_now());
+        status.records_exported = 12;
+        status.state = status.classify(export_now());
+        let json = serde_json::to_string(&status).unwrap();
+        let back: ObservabilityExportStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, status);
+        assert_eq!(back.state, ObservabilityExportState::Healthy);
+
+        // A pre-#5083 daemon omits the whole field; the report must still parse
+        // and the absence must never be misread as "disabled".
+        let minimal: ObservabilityExportStatus = serde_json::from_str("{}").unwrap();
+        assert_eq!(minimal.state, ObservabilityExportState::Disabled);
+        assert!(minimal.host_id.is_none());
     }
 }

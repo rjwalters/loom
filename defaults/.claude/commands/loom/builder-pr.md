@@ -828,8 +828,17 @@ Is the failure in YOUR changed files?
 
 If you want to track pre-existing issues for future cleanup:
 
+> **File issues with `./.loom/scripts/create-issue.sh`, never a bare `gh issue create` (#5047).**
+> `gh issue create` fails outright when GraphQL quota is exhausted, while the independent REST
+> pool sits ~99% unused. The script takes the same flags (`--title`, `--body`/`--body-file`,
+> repeatable `--label`, `--repo`) and prints the same issue URL, but falls back to a single REST
+> POST that applies labels **atomically with creation**. Recipe and rationale:
+> `.loom/docs/gh-issue-create-rest-fallback.md` (or `forge_gh_create_issue_rl_safe` in
+> `lib/forge-helpers.sh` if scripting). `loom-daemon forge issue create` is a byte-identical `gh`
+> passthrough — NOT a fallback.
+
 ```bash
-gh issue create --title "Tech debt: Migrate biome.json to v2 schema" --body "$(cat <<'EOF'
+./.loom/scripts/create-issue.sh --title "Tech debt: Migrate biome.json to v2 schema" --body "$(cat <<'EOF'
 ## Problem
 
 `biome.json` uses deprecated v1 schema which causes warnings on every lint run.
@@ -887,7 +896,7 @@ After completing your assigned work, you can suggest improvements by creating un
 
 **Example of post-work suggestion:**
 ```bash
-gh issue create --title "Refactor terminal state management to use reducer pattern" --body "$(cat <<'EOF'
+./.loom/scripts/create-issue.sh --title "Refactor terminal state management to use reducer pattern" --body "$(cat <<'EOF'
 ## Problem
 
 While implementing #42, I noticed that terminal state updates are scattered across multiple files with inconsistent patterns.

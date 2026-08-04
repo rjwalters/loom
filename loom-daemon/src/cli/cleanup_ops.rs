@@ -139,8 +139,26 @@ pub(crate) fn handle_recover_orphans_command(
         println!("{}", orphans::format_result_human(&result));
     }
 
+    // A failed dependency (e.g. the `gh issue list --label loom:building`
+    // query) means the claims could not be enumerated at all. That is not a
+    // clean bill of health, so it must never exit 0 — an operator or watch
+    // loop checking for stranded claims would read success as "none stranded"
+    // (issue #5140). Distinct exit code from the "orphans found" 2 below.
+    if result.assessment_failed() {
+        eprintln!(
+            "recover-orphans could not assess orphaned tasks (see errors above); \
+             exiting {EXIT_ASSESSMENT_FAILED} rather than reporting a false all-clear"
+        );
+        std::process::exit(EXIT_ASSESSMENT_FAILED);
+    }
+
     if !result.orphaned.is_empty() && !recover {
         std::process::exit(2);
     }
     Ok(())
 }
+
+/// `recover-orphans` exit code for "the assessment itself failed" — distinct
+/// from `2` ("orphans found in dry-run mode") and from `0` ("assessed, nothing
+/// orphaned"). Issue #5140.
+const EXIT_ASSESSMENT_FAILED: i32 = 3;

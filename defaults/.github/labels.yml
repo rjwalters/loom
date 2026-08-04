@@ -69,6 +69,10 @@
   description: "Judge is reviewing this PR. Applied by: Judge only. Stale after LOOM_STALE_REVIEWING_MINUTES (30m)."
   color: "F59E0B"  # amber-500 - matches other in-progress states
 
+- name: loom:evaluating
+  description: "Champion is evaluating this proposal (claim label, stale after 15m). Applied by: Champion only."
+  color: "F59E0B"  # amber-500 - matches other in-progress states
+
 - name: loom:review-requested
   description: "PR ready for Judge to review. Applied by: Builder when opening PR."
   color: "10B981"  # emerald-500

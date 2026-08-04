@@ -129,6 +129,7 @@ impl ErrorCode {
     pub const CONFIG_INVALID_VALUE: &'static str = "CONFIG_INVALID_VALUE";
     pub const CONFIG_FILE_NOT_FOUND: &'static str = "CONFIG_FILE_NOT_FOUND";
     pub const CONFIG_WORKSPACE_AMBIGUOUS: &'static str = "CONFIG_WORKSPACE_AMBIGUOUS";
+    pub const CONFIG_WORKSPACE_UNREGISTERED: &'static str = "CONFIG_WORKSPACE_UNREGISTERED";
 
     // Activity database error codes
     pub const ACTIVITY_DB_LOCKED: &'static str = "ACTIVITY_DB_LOCKED";
@@ -409,6 +410,42 @@ impl DaemonError {
         .with_recovery_hint(
             "Specify the target repo explicitly: `loom-daemon dispatch <N> --workspace <path>` \
              (CLI) or `workspace_root` (MCP dispatch_sweep).",
+        )
+    }
+
+    /// Creates a "requested `workspace_root` is not a registered workspace" error.
+    ///
+    /// Companion to [`Self::workspace_ambiguous`] (#4299) for the complementary
+    /// case (#5210): an **explicit** `workspace_root` was passed but does not
+    /// name any workspace the daemon has registered. Left unchecked, dispatch
+    /// falls through to `WorkspacePool::get_or_provision`, which happily
+    /// provisions a registry for any path — including one with no
+    /// `.loom/scripts/spawn-worker.sh` — so the failure only surfaces many
+    /// steps later as an opaque "failed to spawn sweep child".
+    #[must_use]
+    pub fn workspace_unregistered(
+        root: &std::path::Path,
+        registered: &[std::path::PathBuf],
+    ) -> Self {
+        let roots: Vec<String> = registered.iter().map(|p| p.display().to_string()).collect();
+        let root_display = root.display().to_string();
+        let roots_summary = if roots.is_empty() {
+            "no workspaces are registered".to_string()
+        } else {
+            format!("{} workspace(s) are registered ({})", roots.len(), roots.join(", "))
+        };
+        Self::new(
+            ErrorDomain::Configuration,
+            ErrorCode::CONFIG_WORKSPACE_UNREGISTERED,
+            format!(
+                "dispatch target '{root_display}' is not a registered workspace — {roots_summary}"
+            ),
+        )
+        .recoverable(false)
+        .with_details(serde_json::json!({ "requested_root": root_display, "registered": roots }))
+        .with_recovery_hint(
+            "Register the workspace first (`loom-daemon workspace add <path>`), or pass a \
+             `workspace_root` that matches one of the registered roots listed above.",
         )
     }
 

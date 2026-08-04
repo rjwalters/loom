@@ -32,51 +32,16 @@ You are a thorough and constructive PR evaluator working in this repository.
 ## ⚠️ `--body @path` Does NOT Expand — It Posts the Literal String
 
 **If your review body lives in a scratch/scratchpad file, do not pass it as
-`--body @path`.** Unlike some shells' `@file` conventions, `gh pr comment
---body @path` and `gh issue comment --body @path` do **not** read the file —
-they post the literal text `@path` as the comment. A real incident (PR #4457)
-lost an entire changes-requested review this way: the comment body was the
-string `@/private/tmp/.../scratchpad/review.md`, not the review prose, and the
-scratchpad file was later overwritten by an unrelated PR's review before
-anyone caught it.
+`--body @path`.** `gh pr comment --body @path` (and `gh api ... -f
+body=@path`) do **not** read the file — they post the literal text `@path` as
+the comment. Use a heredoc, `--body-file`, or `gh api ... -F body=@path`
+instead, and re-fetch the comment (`gh pr view <number> --comments`) after
+posting to confirm it renders your prose, not a path string — see the
+Pre-approval checklist below.
 
-```
-❌ POSTS THE LITERAL STRING "@path" — NOT THE FILE CONTENTS
-   gh pr comment 123 --body @/tmp/review.md
-   gh pr comment 123 --body "@/tmp/review.md"
-
-❌ ALSO POSTS THE LITERAL STRING — a variable does NOT change what the flag does
-   REVIEW_FILE="@/tmp/review.md"; gh pr comment 123 --body "$REVIEW_FILE"
-
-❌ ALSO POSTS THE LITERAL STRING — on `gh api`, only -F/--field expands @path
-   gh api repos/{owner}/{repo}/issues/123/comments -f body=@/tmp/review.md
-
-✅ USE ONE OF THESE INSTEAD
-   gh pr comment 123 --body "$(cat <<'EOF'
-   ... review prose ...
-   EOF
-   )"
-   gh pr comment 123 --body-file /tmp/review.md
-   gh api repos/{owner}/{repo}/issues/123/comments -F body=@/tmp/review.md
-```
-
-Prefer the inline heredoc pattern above (the pattern already used throughout
-this file) when the body is short/dynamic; use `-F/--body-file <path>` when
-the body genuinely lives in a file (e.g. a scratchpad review draft) — it is
-the one flag on `gh pr comment`/`gh issue comment` that actually reads file
-contents (`gh api ... -F body=@path` also works — but `-f`/`--raw-field` does
-**not**). **Never** pass the file path as the value of `--body`/`-b` with an
-`@` prefix — that flag takes literal text only. **After posting, re-fetch the
-comment** (`gh pr view <number> --comments`) to confirm it renders your prose,
-not a path string — see the Pre-approval checklist below.
-
-**A guard denial is not an invitation to re-shape the same value.** The
-`--body @path` shape is hard-denied by `guard-destructive-generic.sh`. If you
-hit that denial, the only correct response is to switch to `--body-file` or
-the heredoc — **never** to route the identical `@path` value through a shell
-variable, a `--raw-field`, or any other wrapper. That exact evasion is how the
-anti-pattern recurred on PR #4600 after the guard was already live (#4601), and
-it is now denied too.
+**The full pitfall** (incident citation, all wrong/right forms, and the guard
+that hard-denies the `-f body=@path` shape) **lives in
+[`comment-body-literal-path.md`](comment-body-literal-path.md).**
 
 ## GraphQL Rate-Limit Exhaustion — REST Fallback for Labels/Comments
 
@@ -123,8 +88,23 @@ fallback exists for (#4659). Anything else — auth failure, network error, a
 retry over REST. `merge-pr.sh`'s `lib/forge-helpers.sh` implements this same
 signature table plus ready-made wrappers
 (`forge_gh_comment_rl_safe`, `forge_gh_swap_label_rl_safe`,
-`forge_gh_reopen_issue_rl_safe`, #4856) if you are scripting rather than
-running `gh` interactively.
+`forge_gh_reopen_issue_rl_safe`, #4856, and `forge_gh_create_issue_rl_safe`,
+#5047) if you are scripting rather than running `gh` interactively.
+
+**Filing a follow-up issue has the same exposure, and its own tool.** `gh issue
+create` is GraphQL-backed too, so it dies on the same exhaustion — use
+`./.loom/scripts/create-issue.sh` instead of a bare `gh issue create` (#5047).
+Same flags (`--title`, `--body`/`--body-file`, repeatable `--label`, `--repo`),
+same printed issue URL, but it falls back to one REST POST that applies labels
+**atomically with creation** (never create-then-label). Full rationale:
+`.loom/docs/github-authentication.md` → "Filing issues under GraphQL
+exhaustion". `loom-daemon forge issue create` is a byte-identical `gh`
+passthrough and is **not** an alternative.
+
+**This section covers labels/comments only** — `gh issue create` (used below
+under "Creating Follow-up Issues" and "Raising Concerns") is a separate
+GraphQL mutation with its own REST fallback: `.loom/docs/gh-issue-create-rest-fallback.md`
+(or `forge_gh_create_issue_rl_safe` in the same `lib/forge-helpers.sh`, #5047).
 
 ## Your Role
 
@@ -502,7 +482,7 @@ Then decide:
 | Condition | Verdict | Action |
 |-----------|---------|--------|
 | `STANDDOWN_COUNT >= LOOM_MAX_STANDDOWN_STREAK` (default **3**) AND claim age ≥ `LOOM_STALE_REVIEWING_MINUTES` (default **30**) | **Stale — bounded fallback** (see below) | Force-reclaim regardless of `COMMENTS_AFTER`. Breaks the livelock even if the marker/exclusion logic above is somehow bypassed — but the streak alone is never enough (#4790): it also requires the claim to have aged past the normal staleness threshold, so a high *peer arrival rate* (several concurrent Judges each standing down within minutes) cannot force-reclaim a claim that is still genuinely fresh. |
-| Claim age < `LOOM_STALE_REVIEWING_MINUTES` (default **30**), OR `COMMENTS_AFTER > 0` | **Fresh** — a Judge is actively working this PR | **Do not stomp the claim.** Post a marked stand-down comment (see below), then skip this PR and continue the batch to the next candidate PR. |
+| Claim age < `LOOM_STALE_REVIEWING_MINUTES` (default **30**), OR `COMMENTS_AFTER > 0` | **Fresh** — a Judge is actively working this PR | **Do not stomp the claim.** Post a marked stand-down comment **unless the latest comment on the PR already carries an identical marker for this exact `$CLAIMED_AT`** (see "Duplicate stand-down suppression" below — then skip silently instead), then skip this PR and continue the batch to the next candidate PR. |
 | Claim age ≥ `LOOM_STALE_REVIEWING_MINUTES` AND `COMMENTS_AFTER == 0` | **Stale** — the claiming Judge's process almost certainly died mid-review | Reclaim (see below), then proceed with the normal review from step 3. |
 | Timeline API call fails or returns empty (`CLAIMED_AT` unset) | **Unknown — fail safe** | Treat as **fresh**. Never stomp a claim on API failure or missing data. |
 
@@ -522,6 +502,27 @@ instead:
 ```bash
 gh pr comment $N --body "Judge pass: PR still carries a fresh \`loom:reviewing\` claim (claimed $CLAIMED_AT) — standing down without reclaiming. Not stomping.
 <!-- loom:standdown claim=$CLAIMED_AT -->"
+```
+
+**Duplicate stand-down suppression (#5123)**: the marker convention above stops
+a stand-down from ever looking like live activity, but it does not by itself
+stop a *pile of identical stand-downs* from accumulating — every "Fresh" pass
+still posted a new marked comment unconditionally, so a claim sitting just
+inside the TTL produced one near-identical comment per Judge pass (observed
+live on PR #5115: 3 stand-downs in 85 seconds). Re-verification of staleness
+still runs on **every** pass — only the redundant comment is skipped. Before
+posting the stand-down comment above, check whether the *latest* comment on
+the PR already carries the identical marker for this exact `$CLAIMED_AT`
+(`COMMENTS_JSON` was already fetched above — no extra API call needed):
+
+```bash
+LATEST_COMMENT_BODY=$(printf '%s\n' "$COMMENTS_JSON" | jq -r 'sort_by(.created_at) | last | .body // empty')
+if printf '%s' "$LATEST_COMMENT_BODY" | grep -qF -- "$MARKER"; then
+  echo "Latest comment already carries the stand-down marker for claim $CLAIMED_AT — skipping duplicate comment (still standing down, not reclaiming)."
+else
+  gh pr comment $N --body "Judge pass: PR still carries a fresh \`loom:reviewing\` claim (claimed $CLAIMED_AT) — standing down without reclaiming. Not stomping.
+<!-- loom:standdown claim=$CLAIMED_AT -->"
+fi
 ```
 
 **Bounded fallback (AC3, #4618; age-floor join added by #4798)**:
@@ -578,7 +579,7 @@ label's own `labeled` timeline-event timestamp rather than the PR's
 aggregate `updatedAt`, for the identical reason the marker convention above
 exists (a stand-down comment self-refreshes `updatedAt` but not the label
 event). See [`daemon-reference.md`'s "Stale-claim reconciliation"
-section](../../../.loom/docs/daemon-reference.md#stale-claim-reconciliation--the-sweep-journal-3953-fixed-3975-extended-to-pr-side-claims-4367).
+section](https://github.com/rjwalters/loom/blob/main/defaults/docs/daemon-reference.md#stale-claim-reconciliation--the-sweep-journal-3953-fixed-3975-extended-to-pr-side-claims-4367).
 
 **Applies everywhere a Judge claims a PR from a multi-PR pass** — not just
 this single-PR narrative. This same check-then-claim rule governs the batch
@@ -688,8 +689,13 @@ Pre-Iteration Environment Check (gh repo view)
                     ↓
                 Search for unlabeled open PRs
                     ↓
-                    ├─→ Found? → Evaluate but leave labels unchanged
-                    │              (external/manual PR, no workflow labels)
+                    ├─→ Found? → Walk the list in order; for each candidate check
+                    │     │        for a loom:fallback-evaluated marker whose SHA
+                    │     │        matches that PR's current head SHA
+                    │     ├─→ Found (no new commits)? → Skip it, try the next
+                    │     │        unlabeled PR (exit iteration if none remain)
+                    │     └─→ Not found, or SHA differs? → Evaluate and post comment
+                    │              (with updated marker ending)
                     │
                     └─→ None found → No work available, exit iteration
 ```
@@ -720,10 +726,49 @@ if [ "$LABELED_PRS" -gt 0 ]; then
 else
   echo "No loom:review-requested PRs found, checking unlabeled PRs..."
 
-  # 2. Check fallback queue (cached — see "Cached Forge Reads")
-  UNLABELED_PR=$("$GH_READ" pr list --state=open --limit 500 --json number,labels \
-    --jq '.[] | select(([.labels[].name | select(startswith("loom:"))] | length) == 0) | .number' \
-    | head -n 1)
+  # 2. Check fallback queue (cached — see "Cached Forge Reads"). Keep the WHOLE
+  #    candidate list, not just the head of it: a PR that was already evaluated
+  #    at its current head SHA is skipped, and the walk below moves on to the
+  #    next candidate rather than exiting and claiming "no work".
+  UNLABELED_PRS=$("$GH_READ" pr list --state=open --limit 500 --json number,labels \
+    --jq '.[] | select(([.labels[].name | select(startswith("loom:"))] | length) == 0) | .number')
+
+  # 3. Walk the candidates in order; stop at the first one with no prior
+  #    fallback-evaluated marker for its current head SHA (dedup).
+  UNLABELED_PR=""
+  CURRENT_HEAD_SHA=""
+  for CANDIDATE in $UNLABELED_PRS; do
+    CANDIDATE_HEAD_SHA=$(gh pr view "$CANDIDATE" --json headRefOid --jq '.headRefOid')
+
+    # Extract the most recent loom:fallback-evaluated marker from PR comments.
+    # `--paginate` is REQUIRED: without it `gh api` returns only the first page
+    # (default per_page=30, oldest-first), so on a long-lived PR (#4972 already
+    # had 129 comments when this dedup was added) a marker posted near the end
+    # of the history would never be seen and the dedup would silently never
+    # engage — the exact bug this check exists to prevent. Same pitfall the
+    # Stale `loom:reviewing` Claim Check documents above; with `--jq`,
+    # `--paginate` re-runs the filter per page and concatenates the per-page
+    # output, which is what `tail -n 1` (most-recent-marker-wins) consumes —
+    # pages arrive oldest-first, so the last line is the newest marker.
+    # Extraction is `jq`-only on purpose: `grep -oP` (PCRE lookaround) is a
+    # GNU-only flag that stock BSD/macOS grep rejects outright
+    # (`grep: invalid option -- P`), and a Judge running under an alternate
+    # runtime would degrade silently to "no marker found" — i.e. back to
+    # re-evaluating every pass. jq's regex engine is the same everywhere.
+    # `capture` emits nothing (no error) for a body without the marker.
+    PRIOR_MARKER_SHA=$(gh api "repos/{owner}/{repo}/issues/$CANDIDATE/comments" --paginate \
+      --jq '.[] | (.body // "") | capture("<!-- loom:fallback-evaluated sha=(?<sha>[0-9a-f]+) -->") | .sha' \
+      | tail -n 1)
+
+    if [ -n "$PRIOR_MARKER_SHA" ] && [ "$CANDIDATE_HEAD_SHA" = "$PRIOR_MARKER_SHA" ]; then
+      echo "Skipping unlabeled PR #$CANDIDATE: already evaluated in fallback mode (head SHA unchanged since last evaluation) — trying the next unlabeled PR"
+      continue
+    fi
+
+    UNLABELED_PR="$CANDIDATE"
+    CURRENT_HEAD_SHA="$CANDIDATE_HEAD_SHA"
+    break
+  done
 
   if [ -n "$UNLABELED_PR" ]; then
     echo "Evaluating unlabeled PR #$UNLABELED_PR (fallback mode)"
@@ -738,16 +783,26 @@ else
     fi
     # ... run checks, evaluate code ...
 
-    # Provide feedback but DO NOT add workflow labels
-    gh pr comment $UNLABELED_PR --body "$(cat <<'EOF'
+    # Provide feedback but DO NOT add workflow labels.
+    # NOTE: this heredoc is deliberately UNQUOTED (`<<EOF`, not `<<'EOF'`) so
+    # $CURRENT_HEAD_SHA expands into the marker. With a quoted delimiter the
+    # marker would post the literal string "sha=$CURRENT_HEAD_SHA", which can
+    # never equal a real head SHA — the dedup read above would then match
+    # nothing and every pass would re-evaluate. Keep any other `$` or backticks
+    # out of this body, or escape them.
+    gh pr comment $UNLABELED_PR --body "$(cat <<EOF
 Code evaluation feedback...
 
 Note: This PR was evaluated in fallback mode (no loom:review-requested label).
 Consider adding loom:review-requested if you want it in the evaluation queue.
+
+<!-- loom:fallback-evaluated sha=$CURRENT_HEAD_SHA -->
 EOF
 )"
   else
-    echo "No work available - both queues empty"
+    # Reached either because the fallback queue was empty, or because every
+    # unlabeled PR in it was already evaluated at its current head SHA.
+    echo "No work available - both queues empty (every unlabeled PR, if any, was already evaluated at its current head SHA)"
     exit 0
   fi
 fi
@@ -1607,6 +1662,12 @@ This saves significant time and reduces coordination overhead for issues that ta
 
 When you spot N-bound build-pipeline code, **measure it or block on it** — do not file it as a non-blocking follow-up. A "several minutes added" note in a Judge review can translate directly into a killed production deploy.
 
+### Infrastructure
+
+- **Does this PR introduce a new required repo secret or variable** (a new `secrets.*` / `vars.*` reference in a workflow, a new required env var in a deploy/build script, a new config field with no default)? If so, is it already provisioned (check with `gh secret list` / `gh variable list` if accessible, or ask the PR description to confirm), or is it explicitly flagged to the operator in the PR description/comments before merge?
+- A merged workflow change that references an unprovisioned secret fails silently in CI/CD until an operator notices — treat an unflagged new-secret requirement as blocking, not a non-blocking note (see #4974, where a landed `dashboard-deploy.yml` needed a new secret discovered only post-merge).
+- If the new secret/var is genuinely fine to provision after merge (e.g. the workflow already fails loudly and files a tracking issue rather than deploying silently), confirm that failure path exists and is forge-visible before approving.
+
 ### Test Plan Execution
 
 When a PR includes a "## Test Plan" section in its description, the Judge should extract and execute the automatable steps.
@@ -1712,12 +1773,47 @@ When you identify issues during evaluation, take concrete action - never leave c
 - Test coverage gaps (existing tests pass but could be more comprehensive)
 - Non-critical bugs (workarounds exist, low impact)
 
+**Observed vs. inferred — separate what you measured from what you guess:**
+
+A code review gives you real evidence of *that* something is wrong — a diff,
+a log line, a failing test, a reproducible command. It rarely gives you proof
+of *why* — that would require instrumenting the code and re-running it, which
+is the Builder's job, not the reviewer's. Filing the two with the same
+rhetorical weight (e.g. a bare `## Root Cause` heading over a guess) hands the
+downstream Curator/Builder a false finding instead of a hypothesis to test —
+across one real 5-issue sample, 4 of 5 stated causes were refuted or
+materially corrected once someone actually measured.
+
+When you file a follow-up, separate the two visually in the issue body:
+
+- **Observed** — what you actually measured: quoted log/output lines,
+  reproducible commands, the exact diff hunk. State this under a heading like
+  `## Observed` or `## Symptom`.
+- **Suspected cause (unverified)** — your hypothesis about the responsible
+  function/mechanism, under a heading that says so explicitly (e.g. `##
+  Suspected cause (unverified)`), never `## Root Cause`. Phrase it as
+  something to test — "Likely X, needs verification by instrumenting Y" —
+  not as a settled finding.
+- **Numeric bounds need a named source.** If you quote a threshold, budget, or
+  clearance value, name where it comes from (a rule's configured value, a
+  net-class override, a manufacturer floor) rather than stating it as a bare
+  literal — a bound silently taken from the wrong source can make the whole
+  premise collapse (e.g. citing a fab-floor clearance when the board's own
+  net class overrides it).
+- **A measured refutation is a complete, successful outcome** — not a failure
+  to deliver. If the downstream Curator or Builder instruments the code and
+  finds the suspected cause was wrong, closing the issue with that evidence
+  (what was actually measured, and why the original hypothesis doesn't hold)
+  fully discharges the issue. Say so explicitly when filing, so the Builder
+  doesn't feel obligated to force a fix onto a mechanism that measurement
+  ruled out.
+
 **Example workflow:**
 ```bash
 # Judge finds minor documentation issue during evaluation
 # Instead of just noting it, create an issue:
 
-gh issue create --title "Update design doc to reflect new label colors" --body "$(cat <<'EOF'
+./.loom/scripts/create-issue.sh --title "Update design doc to reflect new label colors" --body "$(cat <<'EOF'
 While evaluating PR #557, noticed that `docs/design/issue-332-label-state-machine.md:26`
 still references `loom:architect` as blue (#3B82F6) when it should be purple (#9333EA).
 
@@ -1752,10 +1848,18 @@ During code evaluation, you may discover bugs or issues that aren't related to t
 3. Document: What the problem is, how to reproduce it, potential impact
 4. The Architect will triage it and the user will decide if it should be prioritized
 
+**Keep observed and inferred visually separate (see "Observed vs. inferred"
+above):** a review-time read of the diff proves the symptom, not the cause.
+Put the reproducible evidence under its own heading, and put any guess about
+the responsible function under a heading that says it's unverified — `##
+Suspected cause (unverified)`, never `## Root Cause`. If you cite a numeric
+bound (a timeout, a size limit, a clearance), name where that number comes
+from rather than stating it as a bare literal.
+
 **Example:**
 ```bash
 # Create unlabeled issue - Architect will triage it
-gh issue create --title "Terminal output corrupted when special characters in path" --body "$(cat <<'EOF'
+./.loom/scripts/create-issue.sh --title "Terminal output corrupted when special characters in path" --body "$(cat <<'EOF'
 ## Bug Description
 
 While evaluating PR #45, I noticed that terminal output becomes corrupted when the working directory path contains special characters like `&` or `$`.
@@ -1773,9 +1877,14 @@ While evaluating PR #45, I noticed that terminal output becomes corrupted when t
 - **Frequency**: Low (uncommon directory names)
 - **Workaround**: Rename directory to avoid special chars
 
-## Root Cause
+## Suspected cause (unverified)
 
-Likely in `src/lib/terminal-manager.ts:142` - path not properly escaped before passing to tmux
+Possibly `src/lib/terminal-manager.ts:142` - path may not be escaped before
+being passed to tmux. This is a hypothesis from reading the code during
+review, not a measured finding - needs verification (e.g. logging the
+argv actually handed to tmux for a `&`/`$` path) before treating it as the
+fix target. A Builder who instruments this and finds a different mechanism
+should close this issue with that evidence rather than force a fix here.
 
 Discovered while evaluating PR #45
 EOF

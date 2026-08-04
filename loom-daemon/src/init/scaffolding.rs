@@ -432,13 +432,37 @@ pub fn load_internal_skip_list(defaults_path: &Path) -> HashSet<String> {
 }
 
 /// Read and parse an existing settings.json file, returning None if missing or invalid.
+///
+/// A missing file is the normal, silent case (fresh install — nothing to
+/// merge). A *present but unparseable* file is a different, noteworthy case:
+/// the caller ([`merge_settings_json`] via `setup_repository_scaffolding`)
+/// treats `None` as "nothing to merge" and leaves Loom's freshly-copied
+/// defaults in place untouched — silently dropping every pre-existing hook,
+/// permission, and top-level key the file contained (issue #5279's
+/// "Suspected Cause" #2: a non-strict-JSON file some other tool wrote — e.g.
+/// containing comments or a trailing comma — would previously fail this
+/// parse with zero warning, discarding its content on the very next
+/// reinstall/upgrade with no diagnostic pointing at why). We now warn on that
+/// specific case so the drop is visible instead of silent; the missing-file
+/// case stays silent since it is not an error.
 fn read_existing_settings(path: &Path) -> Option<Value> {
     let content = fs::read_to_string(path).ok()?;
-    let value: Value = serde_json::from_str(&content).ok()?;
-    if value.is_object() {
-        Some(value)
-    } else {
-        None
+    match serde_json::from_str::<Value>(&content) {
+        Ok(value) if value.is_object() => Some(value),
+        Ok(_) => {
+            eprintln!(
+                "Warning: {} is valid JSON but not a JSON object; skipping settings.json merge (Loom's own settings.json will be used as-is).",
+                path.display()
+            );
+            None
+        }
+        Err(e) => {
+            eprintln!(
+                "Warning: Failed to parse existing {} as JSON ({e}); skipping settings.json merge. Loom's own settings.json will be written as-is, which may drop pre-existing hooks/permissions/keys from this file. Fix the JSON syntax (comments and trailing commas are not valid JSON) and re-run install to merge them back in.",
+                path.display()
+            );
+            None
+        }
     }
 }
 
@@ -3258,6 +3282,143 @@ WARNING: Never run `lake build` inside Docker - causes memory corruption.",
 
         // enabledPlugins should be preserved
         assert_eq!(result["enabledPlugins"]["my-plugin"], true);
+    }
+
+    /// Issue #5279 edge case: a foreign hook under a hook type/matcher pair
+    /// Loom's own defaults ALSO define (both register `PreToolUse`/`Bash`).
+    /// Confirms dedup is by normalized *command*, not by hook type or matcher
+    /// alone -- a foreign command sharing Loom's matcher must survive
+    /// alongside Loom's own command, not be treated as a collision and
+    /// dropped/replaced.
+    #[test]
+    fn test_merge_settings_dedup_preserves_foreign_command_in_shared_matcher() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        let defaults = temp_dir.path().join("defaults");
+
+        fs::create_dir(workspace.join(".git")).unwrap();
+
+        fs::create_dir_all(defaults.join(".claude").join("commands")).unwrap();
+        fs::write(
+            defaults.join(".claude").join("settings.json"),
+            r#"{
+                "hooks": {
+                    "PreToolUse": [{
+                        "matcher": "Bash",
+                        "hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR}/.loom/hooks/guard-destructive.sh"}]
+                    }]
+                }
+            }"#,
+        )
+        .unwrap();
+
+        fs::create_dir_all(workspace.join(".claude").join("commands")).unwrap();
+        fs::write(
+            workspace.join(".claude").join("settings.json"),
+            r#"{
+                "hooks": {
+                    "PreToolUse": [{
+                        "matcher": "Bash",
+                        "hooks": [{"type": "command", "command": "repo-skills-bash-guard.sh"}]
+                    }]
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let mut report = InitReport::default();
+        setup_repository_scaffolding(workspace, &defaults, true, &mut report).unwrap();
+
+        let result_content =
+            fs::read_to_string(workspace.join(".claude").join("settings.json")).unwrap();
+        let result: serde_json::Value = serde_json::from_str(&result_content).unwrap();
+
+        let pre_tool = result["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre_tool.len(), 1, "Bash matcher should not be duplicated");
+
+        let bash_matcher = &pre_tool[0];
+        let commands: Vec<&str> = bash_matcher["hooks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["command"].as_str().unwrap())
+            .collect();
+
+        assert!(
+            commands.contains(&"repo-skills-bash-guard.sh"),
+            "Foreign command sharing Loom's hook type+matcher must survive: {commands:?}"
+        );
+        assert!(
+            commands.iter().any(|c| c.contains("guard-destructive.sh")),
+            "Loom's own command must also be present: {commands:?}"
+        );
+    }
+
+    /// Issue #5279 ("Suspected Cause" #2): a pre-existing `.claude/settings.json`
+    /// that fails to parse as JSON (e.g. a sibling tool wrote non-strict JSON
+    /// with a trailing comma) must not silently and invisibly discard the
+    /// existing file's content -- `read_existing_settings` skips merging in
+    /// this case (documented behavior), and this test locks in that the skip
+    /// happens cleanly (no panic, Loom's own settings.json is written) so a
+    /// regression can't turn this into a crash. The accompanying warning text
+    /// (see `read_existing_settings`'s doc comment) is intentionally not
+    /// assertable here -- it goes to stderr, matching this file's other
+    /// eprintln!-based warnings (e.g. the settings-write-failure warning in
+    /// `setup_repository_scaffolding`), none of which are stderr-asserted.
+    #[test]
+    fn test_merge_settings_skips_merge_on_invalid_json_existing_settings() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        let defaults = temp_dir.path().join("defaults");
+
+        fs::create_dir(workspace.join(".git")).unwrap();
+
+        fs::create_dir_all(defaults.join(".claude").join("commands")).unwrap();
+        fs::write(
+            defaults.join(".claude").join("settings.json"),
+            r#"{
+                "permissions": {
+                    "allow": ["Bash(gh:*)"]
+                }
+            }"#,
+        )
+        .unwrap();
+
+        fs::create_dir_all(workspace.join(".claude").join("commands")).unwrap();
+        // Deliberately invalid JSON: a trailing comma after the last array
+        // element, as a non-strict-JSON-tolerant tool might emit.
+        fs::write(
+            workspace.join(".claude").join("settings.json"),
+            r#"{
+                "permissions": {
+                    "allow": ["Bash(repo-skills-tool:*)",]
+                },
+                "enabledPlugins": {"repo-skills": true}
+            }"#,
+        )
+        .unwrap();
+
+        let mut report = InitReport::default();
+        // Must not panic, and must complete the install.
+        setup_repository_scaffolding(workspace, &defaults, true, &mut report).unwrap();
+
+        let result_content =
+            fs::read_to_string(workspace.join(".claude").join("settings.json")).unwrap();
+        let result: serde_json::Value = serde_json::from_str(&result_content)
+            .expect("Loom's own settings.json must be valid JSON");
+
+        // The merge was skipped (documented current behavior for unparseable
+        // existing content) -- Loom's own settings.json is what's on disk, and
+        // the foreign content is NOT present, since there was nothing valid to
+        // merge it from.
+        assert_eq!(
+            result["permissions"]["allow"][0], "Bash(gh:*)",
+            "Loom's own settings.json should be in place"
+        );
+        assert!(
+            result.get("enabledPlugins").is_none(),
+            "Foreign content from the unparseable file cannot survive a skipped merge"
+        );
     }
 
     // ---------- #3325 legacy-layout migration tests ----------

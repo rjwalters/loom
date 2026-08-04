@@ -2,7 +2,7 @@
 
 This repository uses **Loom** for AI-powered development orchestration.
 
-**Loom Version**: 0.17.0
+**Loom Version**: 0.18.0
 **Installation Date**: 2026-04-21
 
 > **This file is the operating core** — only what an agent must know to act
@@ -65,11 +65,13 @@ default-off) let it generate its own work when enabled.
 
 ### 4. Scheduled Support Roles
 
-Run the periodic support roles (Champion, Curator, Judge, Auditor, Guide) via the
-daemon-native role runner (`autonomous.roleRunner.enabled=true`, preferred — same
-rotated token pool as sweeps), or via GitHub Actions cron workflows under
-`.github/workflows/loom-*.yml` (disabled by default; opt in with a `CLAUDE_API_KEY`
-secret + uncommented `schedule:` lines — a single static key, no rotation).
+Run the periodic support roles (Champion, Curator, Judge, Doctor, Auditor, Guide)
+via the daemon-native role runner (`autonomous.roleRunner.enabled=true`,
+preferred — same rotated token pool as sweeps), or via GitHub Actions cron
+workflows under `.github/workflows/loom-*.yml` for the other five (disabled by
+default; opt in with a `CLAUDE_API_KEY` secret + uncommented `schedule:` lines —
+a single static key, no rotation; no `loom-doctor.yml` exists — Doctor's
+standalone dispatch is role-runner-only, see #5272).
 
 The full MCP surface, event taxonomy, autonomous config, and role runner are in
 [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md);
@@ -242,22 +244,35 @@ missing/exhausted pool exits `78` (`EX_CONFIG`). Full reference:
 - **GitHub** — Loom uses the `gh` CLI (the `gh auth login` credential; scope to
   one repo with `export GH_TOKEN=…`). Fleet rate-limit protections (breaker, ETag
   cache, App tokens — epic #4432) are `loom-daemon`-internal; hand-rolled parallel
-  `claude-wrapper.sh` loops get none. See [`.loom/docs/github-authentication.md`](.loom/docs/github-authentication.md).
+  `claude-wrapper.sh` loops get none. **File new issues with
+  `./.loom/scripts/create-issue.sh`, never a bare `gh issue create`** — that is
+  GraphQL-backed and dies on GraphQL exhaustion while the independent REST pool
+  sits idle; the script falls back to one REST POST with labels applied
+  atomically (#5047). See [`.loom/docs/github-authentication.md`](.loom/docs/github-authentication.md).
 - **Gitea** — set `GITEA_TOKEN` or `FORGE_TOKEN` (repository read/write). See
   [`.loom/docs/forge-authentication.md`](.loom/docs/forge-authentication.md).
 - **Releasing** — `scripts/version.sh` keeps all 5 version-bearing files in sync
   (including this `CLAUDE.md`'s `**Loom Version**` line); releases are driven by
   `/repo:release` from [rjwalters/repo](https://github.com/rjwalters/repo). The
-  release workflow triggers on GitHub Release creation, not tag push.
+  release workflow triggers on GitHub Release creation, not tag push. The same
+  workflow also publishes `ghcr.io/rjwalters/loom-worker:<version>` — a pinned
+  sweep-execution-environment base image (daemon stays on the host; see
+  [`docker/worker/README.md`](docker/worker/README.md) for the shape decision
+  and `FROM` contract).
 
 ## Troubleshooting
 
 See [`.loom/docs/troubleshooting.md`](.loom/docs/troubleshooting.md) for stale
 worktrees, stuck agents, daemon registry/event-bus/reaper issues, host-sleep and
-`.loom/` resync procedures, and common fixes. Quick fixes: `loom-clean --force`
-(stale worktrees/branches), `loom-recover-orphans --recover` (orphaned
-`loom:building` issues), `gh label sync --file .github/labels.yml` (re-sync
-labels), `mcp__loom__cancel_sweep --sweep_id <id>` (cancel a running sweep).
+`.loom/` resync procedures, quarantine safety, and common fixes. Quick fixes:
+`loom-clean --force` (stale worktrees/branches), `loom-recover-orphans
+--recover` (orphaned `loom:building` issues), `gh label sync --file
+.github/labels.yml` (re-sync labels), `loom-daemon cancel --issue <N>` /
+`mcp__loom__cancel_sweep` (cancel a running sweep — never hand-`kill` its
+pids, #4980). **Branching does not protect uncommitted edits in the primary
+clone from quarantine** — see [`.loom/docs/troubleshooting.md` →
+Uncommitted work in the primary clone can be quarantined at any
+time](.loom/docs/troubleshooting.md).
 
 ## Migration History
 

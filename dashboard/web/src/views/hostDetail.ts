@@ -24,6 +24,7 @@ import {
   formatRelative,
   formatCount,
   formatText,
+  roleTickSummaryText,
   secondsSince,
 } from "../format";
 import type { HostView } from "../fleet";
@@ -67,11 +68,29 @@ function healthPanel(host: HostView, now: Date): HTMLElement {
       "dl",
       { class: "panel__fields" },
       field("Daemon version", health.daemon_version ?? UNKNOWN),
+      // #4956 — the version only moves once per release, so the commit is the
+      // field that actually answers "is this host's binary current?". Both
+      // degrade to `—` for a record from a pre-#4956 daemon.
+      field(
+        "Build commit",
+        health.build_commit ?? UNKNOWN,
+        "The git commit this host's running binary was compiled from",
+      ),
+      field(
+        "Built at",
+        health.built_at ? formatAbsolute(health.built_at) : UNKNOWN,
+        health.built_at ? `Built ${formatRelative(health.built_at, now)}` : undefined,
+      ),
       field("Uptime", formatDuration(health.uptime_sec)),
       field("Logical CPUs", formatCount(health.logical_cpus)),
       field("CPU idle", formatPercent(health.cpu_idle_fraction, 1)),
       field("Load per core", formatRatio(health.load_per_core)),
       field("Worktree root free", formatGigabytes(health.worktree_root_free_gb)),
+      field(
+        "Role ticks",
+        roleTickSummaryText(health.roles),
+        "loom-daemon health's own roles section, carried through telemetry (#5022)",
+      ),
       field(
         "Captured at",
         health.captured_at ? formatAbsolute(health.captured_at) : UNKNOWN,
@@ -299,7 +318,7 @@ export function hostDetailView(host: HostView, now: Date = new Date()): HTMLElem
       "header",
       { class: "detail__header" },
       el("h1", { class: "detail__title" }, host.hostId),
-      statusBadge(host.status),
+      statusBadge(host.status, host.degradedReason),
       el(
         "span",
         { class: "detail__last-report", title: formatAbsolute(host.lastReportAt) },

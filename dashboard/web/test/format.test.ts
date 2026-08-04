@@ -11,6 +11,9 @@ import {
   formatRatio,
   formatRelative,
   formatText,
+  roleFailureLabel,
+  roleTickCompactText,
+  roleTickSummaryText,
   secondsSince,
 } from "../src/format";
 import { NOW, isoMinutesBefore } from "./fixtures";
@@ -126,5 +129,48 @@ describe("formatAbsolute", () => {
 
   it("returns unknown for garbage", () => {
     expect(formatAbsolute("tuesday")).toBe(UNKNOWN);
+  });
+});
+
+describe("roleFailureLabel (#5022)", () => {
+  it("joins the role and the workspace root's basename, mirroring the daemon's RoleFailure::label()", () => {
+    expect(roleFailureLabel({ role: "judge", root: "/repos/loom" })).toBe("judge @ loom");
+  });
+
+  it("falls back to unknown for a missing role or root, never an empty string", () => {
+    expect(roleFailureLabel({ root: "/repos/loom" })).toBe(`${UNKNOWN} @ loom`);
+    expect(roleFailureLabel({ role: "judge" })).toBe(`judge @ ${UNKNOWN}`);
+    expect(roleFailureLabel({})).toBe(`${UNKNOWN} @ ${UNKNOWN}`);
+  });
+});
+
+describe("roleTickSummaryText / roleTickCompactText (#5022)", () => {
+  it("renders unknown when the daemon has not reported roles at all", () => {
+    expect(roleTickSummaryText(undefined)).toBe(UNKNOWN);
+    expect(roleTickCompactText(undefined)).toBe(UNKNOWN);
+  });
+
+  it("reports 'no role ticks' for a genuine total: 0, not an error state", () => {
+    const roles = { total: 0, ok: 0, persistent: [] };
+    expect(roleTickSummaryText(roles)).toBe("no role ticks");
+    expect(roleTickCompactText(roles)).toBe("no role ticks");
+  });
+
+  it("reports every-tick-ok with no alarming detail", () => {
+    const roles = { total: 12, ok: 12, persistent: [] };
+    expect(roleTickSummaryText(roles)).toBe("12/12 ticks ok");
+    expect(roleTickCompactText(roles)).toBe("ok");
+  });
+
+  it("names the failing role(s) in the full summary, and just a count in the compact one", () => {
+    const roles = {
+      total: 3,
+      ok: 1,
+      persistent: [{ root: "/repos/loom", role: "judge", failures: 2 }],
+    };
+    expect(roleTickSummaryText(roles)).toBe(
+      "1/3 ticks ok; 1 persistent failure(s): judge @ loom",
+    );
+    expect(roleTickCompactText(roles)).toBe("1 failing");
   });
 });

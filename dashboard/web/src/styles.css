@@ -80,6 +80,21 @@ a:hover {
   border-color: var(--accent);
 }
 
+/* --- Build-info footer (issue #4958) ------------------------------------- */
+/* Rendered by `buildInfo.ts` from the server-injected build commit. Empty
+   (and therefore invisible — no border, no padding) on a deployment that
+   never stamped one, e.g. local `wrangler dev`. */
+.build-info {
+  padding: 8px 20px;
+  color: var(--text-dim);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+}
+.build-info:empty {
+  padding: 0;
+}
+
 /* --- Account control (topbar, right) ------------------------------------ */
 /* Rendered by `accountMenu.ts` from the server-injected auth state: an
    avatar + menu when signed in, a Sign in button when not. */
@@ -293,6 +308,26 @@ a:hover {
   color: var(--text-dim);
   font-size: 12px;
   margin-left: auto;
+}
+.card__repos {
+  list-style: none;
+  margin: 10px 0 0;
+  padding: 10px 0 0;
+  border-top: 1px solid var(--border);
+}
+.card__repo {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 0;
+  font-size: 13px;
+}
+.card__repo-label {
+  font-variant-numeric: tabular-nums;
+}
+.card__repo--private {
+  color: var(--text-dim);
+  font-style: italic;
 }
 
 /* ---- badges + chips ------------------------------------------------------ */

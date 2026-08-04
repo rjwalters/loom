@@ -7,6 +7,7 @@ import {
   fetchFleetState,
   fleetStatePath,
   isAuthenticatedViewer,
+  readAuthState,
 } from "../src/api";
 import { EMPTY_SNAPSHOT, HEALTHY_HOST_ID, multiHostSnapshot } from "./fixtures";
 
@@ -152,5 +153,39 @@ describe("fleetStatePath", () => {
   it("maps auth state to the matching dataset", () => {
     expect(fleetStatePath(true)).toBe(FLEET_STATE_PATH);
     expect(fleetStatePath(false)).toBe(PUBLIC_FLEET_STATE_PATH);
+  });
+});
+
+// Issue #4958: the build commit is not identity, so — unlike `email` — it
+// must survive `readAuthState` for BOTH an authenticated and an anonymous
+// viewer.
+describe("readAuthState — commit stamp", () => {
+  function scopeWith(value: unknown): typeof globalThis {
+    return { __LOOM_FLEET__: value } as unknown as typeof globalThis;
+  }
+
+  it("reads the commit for an anonymous viewer", () => {
+    expect(readAuthState(scopeWith({ authenticated: false, commit: "abc1234" }))).toEqual({
+      authenticated: false,
+      commit: "abc1234",
+    });
+  });
+
+  it("reads the commit for an authenticated viewer, alongside email", () => {
+    expect(
+      readAuthState(scopeWith({ authenticated: true, email: "operator@2amlogic.com", commit: "abc1234" })),
+    ).toEqual({
+      authenticated: true,
+      email: "operator@2amlogic.com",
+      commit: "abc1234",
+    });
+  });
+
+  it("omits commit when the deployment did not stamp one", () => {
+    expect(readAuthState(scopeWith({ authenticated: false }))).toEqual({ authenticated: false });
+  });
+
+  it("ignores a non-string commit rather than propagating garbage", () => {
+    expect(readAuthState(scopeWith({ authenticated: false, commit: 12345 }))).toEqual({ authenticated: false });
   });
 });

@@ -168,41 +168,73 @@ pub fn canonical_role(role: &str) -> Option<&'static str> {
 /// Empty-value semantics are preserved exactly: `"curator": ""` is a *valid*
 /// key with an unset value (it falls through to the next precedence tier), and
 /// an absent `runtimes.roles` block is not an error.
+/// Validate a resolved `runtimes.roles` JSON value's shape: must be an
+/// object; every key a known role name; every value a string.
+///
+/// Factored out of [`config_runtime`] (#5006) so the exact same rule set can
+/// be run twice: once here at admission time (unchanged behavior, #4494),
+/// and once proactively from `loom-daemon validate`
+/// ([`check_runtimes_roles_config`]) — before any role actually ticks and
+/// fails on it. Keeping one function means the two call sites can never
+/// silently drift apart.
+pub fn validate_runtimes_roles_shape(roles: &serde_json::Value) -> Result<(), String> {
+    let Some(map) = roles.as_object() else {
+        return Err(format!(
+            "runtimes.roles must be an object mapping role names to runtimes, got {}",
+            type_name_of(roles)
+        ));
+    };
+    let mut unknown: Vec<String> = map
+        .keys()
+        .filter(|key| canonical_role(key).is_none())
+        .cloned()
+        .collect();
+    unknown.sort();
+    if !unknown.is_empty() {
+        return Err(format!(
+            "unknown role name(s) in runtimes.roles: {} (known roles: {})",
+            unknown.join(", "),
+            KNOWN_ROLE_KEYS.join(", ")
+        ));
+    }
+    let mut non_string: Vec<String> = map
+        .iter()
+        .filter(|(_, value)| !value.is_string())
+        .map(|(key, _)| key.clone())
+        .collect();
+    non_string.sort();
+    if !non_string.is_empty() {
+        return Err(format!("runtimes.roles value(s) must be strings: {}", non_string.join(", ")));
+    }
+    Ok(())
+}
+
+/// Proactively check an already-resolved config's `runtimes.roles` map for
+/// the same fail-closed problems [`config_runtime`] rejects at admission
+/// time (unknown role keys, non-string values, a non-object shape). Returns
+/// one formatted message per problem found — currently at most one, since
+/// [`validate_runtimes_roles_shape`] stops at the first violation — so
+/// `loom-daemon validate` can surface a `runtimes.roles` misconfiguration
+/// any time an operator runs it, rather than only when a specific role's
+/// tick fails (#5006). An absent `runtimes.roles` block is not an error and
+/// yields an empty vec, matching [`config_runtime`]'s own empty-is-fine
+/// semantics.
+#[must_use]
+pub fn check_runtimes_roles_config(config: &serde_json::Value) -> Vec<String> {
+    let Some(roles) = crate::config_resolver::get_path(config, "runtimes.roles") else {
+        return Vec::new();
+    };
+    match validate_runtimes_roles_shape(roles) {
+        Ok(()) => Vec::new(),
+        Err(message) => vec![format!("runtimes.roles: {message}")],
+    }
+}
+
 fn config_runtime(root: &Path, role: &str) -> Result<(Option<String>, Option<String>), String> {
     let config = crate::config_resolver::resolve_effective_config(root);
     let roles = crate::config_resolver::get_path(&config, "runtimes.roles");
     if let Some(roles) = roles {
-        let Some(map) = roles.as_object() else {
-            return Err(format!(
-                "runtimes.roles must be an object mapping role names to runtimes, got {}",
-                type_name_of(roles)
-            ));
-        };
-        let mut unknown: Vec<String> = map
-            .keys()
-            .filter(|key| canonical_role(key).is_none())
-            .cloned()
-            .collect();
-        unknown.sort();
-        if !unknown.is_empty() {
-            return Err(format!(
-                "unknown role name(s) in runtimes.roles: {} (known roles: {})",
-                unknown.join(", "),
-                KNOWN_ROLE_KEYS.join(", ")
-            ));
-        }
-        let mut non_string: Vec<String> = map
-            .iter()
-            .filter(|(_, value)| !value.is_string())
-            .map(|(key, _)| key.clone())
-            .collect();
-        non_string.sort();
-        if !non_string.is_empty() {
-            return Err(format!(
-                "runtimes.roles value(s) must be strings: {}",
-                non_string.join(", ")
-            ));
-        }
+        validate_runtimes_roles_shape(roles)?;
     }
     let per_role = roles
         .and_then(|v| v.get(role))
@@ -241,6 +273,45 @@ fn type_name_of(value: &serde_json::Value) -> &'static str {
         serde_json::Value::Array(_) => "an array",
         serde_json::Value::Object(_) => "an object",
     }
+}
+
+/// Bundled fallback runtime manifests, compiled directly into the daemon
+/// binary via `include_str!` (#5002).
+///
+/// `roots()` above resolves an unpopulated `.loom/runtimes/` to a
+/// `defaults/runtimes/<name>.json` fallback, but `defaults/` is a
+/// Loom-*source*-repo-only directory: a consumer install has `.loom/`, never
+/// `defaults/`. So on every managed repo that is not the Loom checkout
+/// itself, that fallback path is unreachable by construction — a consumer
+/// repo whose `.loom/runtimes/` is missing (or missing just one runtime's
+/// manifest, e.g. a 0.16.0-era install never resynced per #4688/#4700) was
+/// permanently unable to admit a non-builtin runtime the daemon binary
+/// itself ships an adapter for.
+///
+/// This table mirrors the manifests shipped at `defaults/runtimes/*.json` at
+/// build time, so the binary carries its own knowledge of the runtimes it
+/// ships adapters for and does not depend on any on-disk `defaults/` or
+/// `.loom/runtimes/` copy being present or complete. It is consulted only
+/// when the on-disk manifest lookup misses (see `resolve_and_admit` below);
+/// an on-disk `.loom/runtimes/<name>.json` — however it got there — always
+/// wins over the bundled copy, so a repo can still override capabilities
+/// on-disk.
+const BUNDLED_RUNTIME_MANIFESTS: &[(&str, &str)] = &[
+    ("claude", include_str!("../../defaults/runtimes/claude.json")),
+    ("codex", include_str!("../../defaults/runtimes/codex.json")),
+    ("aider", include_str!("../../defaults/runtimes/aider.json")),
+];
+
+/// Look up the bundled fallback manifest contents for `runtime`, if the
+/// daemon binary ships one. Returns `None` for any runtime the binary was
+/// not built with a manifest for (e.g. an operator-defined custom runtime) —
+/// those still fail closed with no fallback, per the unchanged fail-closed
+/// contract for non-builtin runtimes with no reachable manifest anywhere.
+fn bundled_runtime_manifest(runtime: &str) -> Option<&'static str> {
+    BUNDLED_RUNTIME_MANIFESTS
+        .iter()
+        .find(|(name, _)| *name == runtime)
+        .map(|(_, contents)| *contents)
 }
 
 fn roots(root: &Path) -> (PathBuf, PathBuf, PathBuf) {
@@ -364,6 +435,33 @@ pub fn resolve_and_admit(
                 role_manifest,
                 runtime_manifest,
             });
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Non-builtin runtime, no on-disk manifest at the resolved path
+            // (which may itself be the unreachable `defaults/runtimes/...`
+            // fallback on a consumer install — see `roots()` and
+            // `BUNDLED_RUNTIME_MANIFESTS` above). Fall back to the manifest
+            // the daemon binary was built with, if any (#5002).
+            match bundled_runtime_manifest(&runtime) {
+                Some(bundled) => bundled.as_bytes().to_vec(),
+                None => {
+                    // No bundled fallback for this runtime either: fail
+                    // closed, but name a path that could actually exist in
+                    // THIS repo -- `.loom/runtimes/<name>.json` -- rather
+                    // than `runtime_manifest`, which on a consumer install is
+                    // the unreachable `<repo>/defaults/runtimes/<name>.json`
+                    // fallback path `roots()` computed (`defaults/` only
+                    // exists in the Loom source checkout itself).
+                    let reachable = root.join(".loom/runtimes").join(format!("{runtime}.json"));
+                    return Err(reject(
+                        format!(
+                            "runtime manifest not found at {} (no bundled fallback shipped for runtime {runtime:?})",
+                            reachable.display()
+                        ),
+                        vec![],
+                    ));
+                }
+            }
         }
         Err(e) => {
             return Err(reject(
@@ -760,6 +858,54 @@ mod tests {
         assert_eq!(admitted.source, RuntimeSource::BuiltIn);
     }
 
+    /// `check_runtimes_roles_config` (#5006) must report exactly the same
+    /// fail-closed problems `config_runtime` rejects at admission time —
+    /// unknown role key, non-string value, non-object shape — so
+    /// `loom-daemon validate` can catch a bad `runtimes.roles` before any
+    /// role's tick actually runs into it.
+    #[test]
+    fn check_runtimes_roles_config_reports_unknown_key() {
+        let config = serde_json::json!({"runtimes": {"roles": {"buidler": "claude"}}});
+        let errors = check_runtimes_roles_config(&config);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("buidler"), "{}", errors[0]);
+        assert!(errors[0].contains("unknown role name"), "{}", errors[0]);
+    }
+
+    #[test]
+    fn check_runtimes_roles_config_reports_non_string_value() {
+        let config = serde_json::json!({"runtimes": {"roles": {"curator": true}}});
+        let errors = check_runtimes_roles_config(&config);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("must be strings"), "{}", errors[0]);
+        assert!(errors[0].contains("curator"), "{}", errors[0]);
+    }
+
+    #[test]
+    fn check_runtimes_roles_config_reports_non_object_shape() {
+        let config = serde_json::json!({"runtimes": {"roles": "codex"}});
+        let errors = check_runtimes_roles_config(&config);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("must be an object"), "{}", errors[0]);
+    }
+
+    /// Well-formed or absent `runtimes.roles` produces no findings — no
+    /// regression for the common (zero-config, or valid config) case.
+    #[test]
+    fn check_runtimes_roles_config_is_silent_on_valid_or_absent_config() {
+        assert!(check_runtimes_roles_config(&serde_json::json!({})).is_empty());
+        assert!(check_runtimes_roles_config(&serde_json::json!({"terminals": []})).is_empty());
+        assert!(check_runtimes_roles_config(
+            &serde_json::json!({"runtimes": {"default": "codex", "roles": {"curator": "claude"}}})
+        )
+        .is_empty());
+        // Empty-value semantics (an unset per-role binding) are preserved.
+        assert!(check_runtimes_roles_config(
+            &serde_json::json!({"runtimes": {"roles": {"curator": ""}}})
+        )
+        .is_empty());
+    }
+
     #[test]
     fn installed_layout_has_identical_resolution_and_rejection() {
         let source = fixture();
@@ -817,14 +963,17 @@ mod tests {
             r#"{"runtimeRequirements":["worktreeIsolation","mcp"]}"#,
         )
         .unwrap();
+        fs::write(loom_roles.join("judge.json"), "{}").unwrap();
         let loom_scripts = root.path().join(".loom/scripts");
         fs::create_dir_all(&loom_scripts).unwrap();
-        let adapter = loom_scripts.join("spawn-claude.sh");
-        fs::write(&adapter, "#!/bin/sh\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&adapter, fs::Permissions::from_mode(0o755)).unwrap();
+        for name in ["claude", "codex"] {
+            let adapter = loom_scripts.join(format!("spawn-{name}.sh"));
+            fs::write(&adapter, "#!/bin/sh\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&adapter, fs::Permissions::from_mode(0o755)).unwrap();
+            }
         }
         // No `.loom/runtimes/` and no `defaults/` at all — the exact live
         // incident layout.
@@ -847,12 +996,29 @@ mod tests {
         assert!(admitted
             .runtime_manifest
             .starts_with(root.path().join("defaults/runtimes")));
+
+        // #5002: a non-builtin runtime the daemon ships an adapter for
+        // (codex) ALSO admits in this exact layout — via the bundled
+        // fallback manifest compiled into the binary, not the degrade-open
+        // path exercised above (which is scoped to the builtin runtime
+        // only). `judge` declares no `runtimeRequirements`, so it is
+        // satisfied by codex's real bundled capabilities.
+        let admitted_codex = resolve_and_admit(root.path(), "judge", Some("codex")).unwrap();
+        assert_eq!(admitted_codex.runtime, "codex");
+        assert_eq!(admitted_codex.source, RuntimeSource::Explicit);
     }
 
     /// The degrade-open behaviour is scoped to the builtin `claude` runtime
-    /// only. An explicit non-builtin runtime with a missing manifest must
-    /// still fail closed — a regression guard against over-widening the
-    /// #4688 fix beyond the zero-config default.
+    /// only, and the #5002 bundled-fallback addition is scoped to the
+    /// runtimes the daemon binary actually ships a manifest for. A runtime
+    /// with NO on-disk manifest anywhere AND no bundled fallback (simulated
+    /// here with an operator-defined custom runtime name the binary was
+    /// never built with) must still fail closed — a regression guard
+    /// against over-widening either fix beyond its intended scope. It also
+    /// pins the #5002 corrected error text: the message must name a path
+    /// reachable from THIS repo (`.loom/runtimes/<name>.json`), not the
+    /// unreachable `defaults/runtimes/<name>.json` fallback path `roots()`
+    /// computed (`defaults/` only exists in the Loom source checkout).
     #[test]
     fn consumer_layout_missing_runtimes_dir_non_builtin_still_fails_closed() {
         let root = tempfile::tempdir().unwrap();
@@ -861,15 +1027,38 @@ mod tests {
         fs::write(loom_roles.join("judge.json"), "{}").unwrap();
         let loom_scripts = root.path().join(".loom/scripts");
         fs::create_dir_all(&loom_scripts).unwrap();
-        let adapter = loom_scripts.join("spawn-codex.sh");
-        fs::write(&adapter, "#!/bin/sh\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&adapter, fs::Permissions::from_mode(0o755)).unwrap();
+        for name in ["codex", "acme-runtime"] {
+            let adapter = loom_scripts.join(format!("spawn-{name}.sh"));
+            fs::write(&adapter, "#!/bin/sh\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&adapter, fs::Permissions::from_mode(0o755)).unwrap();
+            }
         }
-        let rejected = resolve_and_admit(root.path(), "judge", Some("codex")).unwrap_err();
+
+        // No on-disk manifest anywhere (no `.loom/runtimes/`, no
+        // `defaults/`) AND no bundled fallback for this made-up runtime
+        // name -- still fails closed exactly as before.
+        let rejected = resolve_and_admit(root.path(), "judge", Some("acme-runtime")).unwrap_err();
         assert!(rejected.reason.contains("runtime manifest"), "{}", rejected.reason);
+        // #5002: the corrected message names a path reachable from a
+        // consumer repo, not the unreachable `defaults/runtimes/...` path.
+        assert!(
+            rejected.reason.contains(".loom/runtimes/acme-runtime.json"),
+            "{}",
+            rejected.reason
+        );
+        assert!(!rejected.reason.contains("defaults/runtimes"), "{}", rejected.reason);
+
+        // #5002: a runtime the daemon DOES ship a bundled manifest for
+        // (codex) is no longer stuck here -- it now admits via the bundled
+        // fallback instead of failing closed, since the compiled-in
+        // manifest is a reachable source of truth even with no on-disk
+        // `.loom/runtimes/` at all. This is the fix under test, not a
+        // weakening of the fail-closed guarantee asserted above.
+        let admitted = resolve_and_admit(root.path(), "judge", Some("codex")).unwrap();
+        assert_eq!(admitted.runtime, "codex");
     }
 
     #[test]
