@@ -583,6 +583,7 @@ pub fn publish_tick_summary_at(
         errors: report.errors,
         halted: report.halted,
         saturation_held: report.saturation_held,
+        collisions: report.collisions,
     };
     *last_tick_slot()
         .lock()
@@ -5771,5 +5772,46 @@ exit 0
             ..Default::default()
         };
         assert!(summary.reason_summary().ends_with("HALTED"));
+    }
+
+    /// Issue #5302: `TickReport::collisions` was already logged on the
+    /// per-tick `work_finder: tick — …` line (#4085) but never reached the
+    /// wire-carried [`crate::types::WorkFinderTickSummary`], so
+    /// `loom-daemon status` / `GetDaemonStatus` could not see a cross-host
+    /// collision without scraping the daemon log. Assert the count now
+    /// survives publication.
+    #[test]
+    fn publish_tick_summary_carries_collisions_through() {
+        reset_last_tick_summary();
+        publish_tick_summary(
+            &TickReport {
+                seen: 4,
+                dispatched: 1,
+                collisions: 3,
+                ..TickReport::default()
+            },
+            2,
+        );
+        let summary = last_tick_summary().unwrap();
+        assert_eq!(summary.collisions, 3, "collision total must survive publication");
+        assert!(
+            summary
+                .reason_summary()
+                .contains("3 cross-host-collision(s)"),
+            "reason_summary must surface a non-zero collision count: {}",
+            summary.reason_summary()
+        );
+    }
+
+    /// A clean tick (no collisions) must not mention collisions at all — the
+    /// same "only non-zero terms" discipline every other counter follows.
+    #[test]
+    fn reason_summary_omits_zero_collisions() {
+        let summary = crate::types::WorkFinderTickSummary {
+            seen: 1,
+            dispatched: 1,
+            ..Default::default()
+        };
+        assert!(!summary.reason_summary().contains("collision"));
     }
 }

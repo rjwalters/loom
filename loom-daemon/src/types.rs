@@ -1738,6 +1738,17 @@ pub struct WorkFinderTickSummary {
     /// "not held". `#[serde(default)]` keeps pre-#4903 wire data compatible.
     #[serde(default)]
     pub saturation_held: bool,
+    /// Cumulative cross-host dispatch collisions observed by this tick's
+    /// dispatcher(s) (Issue #4085, Phase 0 of #4028) — dispatches whose
+    /// pre-flip label read showed a peer host already claimed the issue.
+    /// Mirrors [`crate::work_finder::TickReport::collisions`], which was
+    /// already logged on the per-tick `work_finder: tick — …` line but never
+    /// reached this wire-carried summary, so `loom-daemon status` /
+    /// `GetDaemonStatus` could not see it without log scraping (Issue #5302).
+    /// `#[serde(default)]` keeps pre-#5302 wire data / older clients
+    /// compatible (an absent field parses as `0`).
+    #[serde(default)]
+    pub collisions: u64,
 }
 
 impl WorkFinderTickSummary {
@@ -1765,6 +1776,9 @@ impl WorkFinderTickSummary {
             if n > 0 {
                 parts.push(format!("{n} {label}"));
             }
+        }
+        if self.collisions > 0 {
+            parts.push(format!("{} cross-host-collision(s)", self.collisions));
         }
         if self.halted {
             parts.push("HALTED".to_string());
