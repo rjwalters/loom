@@ -337,6 +337,37 @@ EOF
     chmod +x "$path"
 }
 
+# Writes a fake daemon binary at $1 that reports commit $2 on --version, and on
+# a `restart` subcommand appends the FULL argv (e.g. "restart --drain --timeout
+# 5 --force-after-timeout") to marker file $3 and exits with code $4 — the
+# drain-mode analog of write_fake_daemon_restart above (Issue #5138), which
+# only ever logs the literal word "restart" and cannot distinguish a plain
+# restart from a drain-mode one. Lets a test assert exactly which flags the
+# update script threaded through to `loom-daemon restart`.
+write_fake_daemon_restart_argv() {
+    local path="$1" commit="$2" restart_marker="$3" restart_rc="$4"
+    cat > "$path" <<EOF
+#!/usr/bin/env bash
+if [[ "\${1:-}" == "--version" ]]; then
+    echo "loom-daemon 0.15.0 (commit ${commit}, built 2026-07-26T00:00:00Z)"
+    exit 0
+fi
+if [[ "\${1:-}" == "restart" ]]; then
+    echo "\$*" >> "${restart_marker}"
+    exit ${restart_rc}
+fi
+if [[ "\${1:-}" == "calibrate" ]]; then
+    exit 1
+fi
+if [[ -n "\${1:-}" && "\${1:-}" != -* ]]; then
+    echo "fake loom-daemon: unsupported subcommand: \$*" >&2
+    exit 1
+fi
+while true; do sleep 1; done
+EOF
+    chmod +x "$path"
+}
+
 # Writes a fake `launchctl` at $1 that logs invocations to $2 and, on
 # `launchctl print`, reports a LOADED job with a live-looking pid (exit 0) —
 # simulating a launchd-managed loom-daemon for the #4042 ownership-detection
@@ -4797,6 +4828,350 @@ if [[ -e "$PSTALE_BIN_DIR8/loom-tokens" ]]; then
 else
     TESTS_FAILED=$((TESTS_FAILED + 1))
     echo -e "${RED}✗${NC} prune: LOOM_SKIP_STALE_ENTRY_POINT_CHECK=1 leaves stale entries untouched"
+fi
+
+# ============================================================
+# 64. --help documents the drain flags (Issue #5138).
+# ============================================================
+help64_out=$(bash "$UPDATE_SCRIPT" --help 2>/dev/null)
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$help64_out" | grep -q -- '--drain' && echo "$help64_out" | grep -q -- '--timeout' \
+    && echo "$help64_out" | grep -q -- '--force-after-timeout' \
+    && echo "$help64_out" | grep -q -- '--restart-now'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} --help documents --drain / --timeout / --force-after-timeout / --restart-now"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} --help documents --drain / --timeout / --force-after-timeout / --restart-now"
+fi
+
+# ============================================================
+# 65. --drain and --restart-now are mutually exclusive -> exit 1 with a clear
+#     message (Issue #5138).
+# ============================================================
+out65=$(bash "$UPDATE_SCRIPT" --drain --restart-now 2>&1)
+rc65=$?
+assert_eq "1" "$rc65" "--drain + --restart-now conflict -> exit 1"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out65" | grep -qi 'mutually exclusive'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} --drain + --restart-now conflict names the conflict"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} --drain + --restart-now conflict names the conflict"
+    echo "  output: $out65"
+fi
+
+# ============================================================
+# 66. --timeout requires a numeric argument -> exit 1 rather than silently
+#     swallowing a bad value (Issue #5138).
+# ============================================================
+bash "$UPDATE_SCRIPT" --drain --timeout notanumber >/dev/null 2>&1
+rc66=$?
+assert_eq "1" "$rc66" "--timeout with a non-numeric argument -> exit 1"
+
+# ============================================================
+# 67. Systemd DEFAULT (no flags at all, Issue #5138): a plain
+#     loom-daemon-update.sh invocation on a systemd-managed host drives
+#     `restart --drain` (not a bare `restart`), and an immediate relaunch
+#     still reports success -> exit 0. Confirms the systemd-default decision
+#     is wired all the way through to the actual invocation, not just
+#     documented.
+# ============================================================
+W67="$BASE_WORKDIR/w67"
+new_fixture "$W67"
+HEAD67="$(cd "$W67" && git rev-parse --short HEAD)"
+INSTALLED67="$W67/installed/loom-daemon"
+mkdir -p "$W67/installed"
+RESTART_MARKER67="$W67/restart-invoked"
+write_fake_daemon_restart_argv "$INSTALLED67" "deadbee" "$RESTART_MARKER67" 0
+NEW_FAKE67="$W67/new-fake-daemon"
+write_fake_daemon_restart_argv "$NEW_FAKE67" "$HEAD67" "$RESTART_MARKER67" 0
+sleep 60 >/dev/null 2>&1 &
+RELAUNCHED_PID67=$!
+bg_proc_track "$RELAUNCHED_PID67"
+SD_BIN67="$W67/systemd-bin"
+SD_LOG67="$W67/systemctl.log"
+SD_STATE67="$W67/systemd-pid-state"
+write_fake_systemd_pid_bin "$SD_BIN67" "$SD_LOG67" "$SD_STATE67" "4242:active:success" \
+    "$RESTART_MARKER67" "${RELAUNCHED_PID67}:active:success"
+
+out67=$( cd "$W67" && PATH="$SD_BIN67:$TEST_PATH" LOOM_SYSTEMD_FORCE=1 LOOM_DAEMON_SYSTEMD=1 \
+    LOOM_SYSTEMD_UNIT="loom-daemon-test-sd67.service" \
+    LOOM_DAEMON_BIN="$INSTALLED67" NEW_FAKE_BIN_SRC="$NEW_FAKE67" \
+    bash "$UPDATE_SCRIPT" 2>&1 )
+rc67=$?
+kill "$RELAUNCHED_PID67" 2>/dev/null || true
+assert_eq "0" "$rc67" "systemd DEFAULT (no flags) drain-mode update exits 0"
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q -- '--drain' "$RESTART_MARKER67" 2>/dev/null; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} systemd default (no flags) drives 'restart --drain', not a bare 'restart' (Issue #5138)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} systemd default (no flags) drives 'restart --drain', not a bare 'restart' (Issue #5138)"
+    echo "  restart marker: $(cat "$RESTART_MARKER67" 2>/dev/null)"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out67" | grep -qi 'DEFAULT' && echo "$out67" | grep -q '5138'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} output names the systemd drain-by-default decision"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} output names the systemd drain-by-default decision"
+    echo "  output: $out67"
+fi
+
+# ============================================================
+# 68. --restart-now opts OUT of the systemd drain-by-default: drives a bare
+#     `restart` (no --drain) (Issue #5138).
+# ============================================================
+W68="$BASE_WORKDIR/w68"
+new_fixture "$W68"
+HEAD68="$(cd "$W68" && git rev-parse --short HEAD)"
+INSTALLED68="$W68/installed/loom-daemon"
+mkdir -p "$W68/installed"
+RESTART_MARKER68="$W68/restart-invoked"
+write_fake_daemon_restart_argv "$INSTALLED68" "deadbee" "$RESTART_MARKER68" 0
+NEW_FAKE68="$W68/new-fake-daemon"
+write_fake_daemon_restart_argv "$NEW_FAKE68" "$HEAD68" "$RESTART_MARKER68" 0
+sleep 60 >/dev/null 2>&1 &
+RELAUNCHED_PID68=$!
+bg_proc_track "$RELAUNCHED_PID68"
+SD_BIN68="$W68/systemd-bin"
+SD_LOG68="$W68/systemctl.log"
+SD_STATE68="$W68/systemd-pid-state"
+write_fake_systemd_pid_bin "$SD_BIN68" "$SD_LOG68" "$SD_STATE68" "4242:active:success" \
+    "$RESTART_MARKER68" "${RELAUNCHED_PID68}:active:success"
+
+( cd "$W68" && PATH="$SD_BIN68:$TEST_PATH" LOOM_SYSTEMD_FORCE=1 LOOM_DAEMON_SYSTEMD=1 \
+    LOOM_SYSTEMD_UNIT="loom-daemon-test-sd68.service" \
+    LOOM_DAEMON_BIN="$INSTALLED68" NEW_FAKE_BIN_SRC="$NEW_FAKE68" \
+    bash "$UPDATE_SCRIPT" --restart-now >/dev/null 2>&1 )
+rc68=$?
+kill "$RELAUNCHED_PID68" 2>/dev/null || true
+assert_eq "0" "$rc68" "--restart-now update exits 0"
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ "$(cat "$RESTART_MARKER68" 2>/dev/null)" == "restart" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} --restart-now drives a bare 'restart' (no --drain), opting out of the systemd default"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} --restart-now drives a bare 'restart' (no --drain), opting out of the systemd default"
+    echo "  restart marker: $(cat "$RESTART_MARKER68" 2>/dev/null)"
+fi
+
+# ============================================================
+# 69. Explicit --drain on a launchd host end-to-end: threads --drain through
+#     to the restart invocation, and an immediate relaunch still reports
+#     success (Issue #5138 / #4090). Launchd's OWN default stays the plain
+#     restart (mirrors test 15) — --drain here is an explicit opt-in.
+# ============================================================
+W69="$BASE_WORKDIR/w69"
+new_fixture "$W69"
+HEAD69="$(cd "$W69" && git rev-parse --short HEAD)"
+INSTALLED69="$W69/installed/loom-daemon"
+mkdir -p "$W69/installed"
+RESTART_MARKER69="$W69/restart-invoked"
+write_fake_daemon_restart_argv "$INSTALLED69" "deadbee" "$RESTART_MARKER69" 0
+NEW_FAKE69="$W69/new-fake-daemon"
+write_fake_daemon_restart_argv "$NEW_FAKE69" "$HEAD69" "$RESTART_MARKER69" 0
+LD_BIN69="$W69/launchd-bin"
+sleep 60 >/dev/null 2>&1 &
+RELAUNCHED_PID69=$!
+bg_proc_track "$RELAUNCHED_PID69"
+write_fake_launchd_loaded_bin "$LD_BIN69" "$W69/launchctl.log" "$RESTART_MARKER69" "$RELAUNCHED_PID69"
+
+out69=$( cd "$W69" && PATH="$LD_BIN69:$TEST_PATH" LOOM_DAEMON_LAUNCHD=1 \
+    LOOM_DAEMON_BIN="$INSTALLED69" NEW_FAKE_BIN_SRC="$NEW_FAKE69" \
+    bash "$UPDATE_SCRIPT" --drain 2>&1 )
+rc69=$?
+kill "$RELAUNCHED_PID69" 2>/dev/null || true
+assert_eq "0" "$rc69" "explicit --drain on launchd exits 0"
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q -- '--drain' "$RESTART_MARKER69" 2>/dev/null; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} explicit --drain on launchd threads --drain through to the restart invocation"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} explicit --drain on launchd threads --drain through to the restart invocation"
+    echo "  restart marker: $(cat "$RESTART_MARKER69" 2>/dev/null)"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out69" | grep -q '4090' || echo "$out69" | grep -qi 'DRAIN'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} output names the drain restart primitive"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} output names the drain restart primitive"
+    echo "  output: $out69"
+fi
+
+# ============================================================
+# 70. Drain timeout WITHOUT --force-after-timeout preserves the fail-safe
+#     (Issue #5138 / #4090): the daemon accepts the drain request but never
+#     exits/relaunches (simulating "in-flight sweep never finished within the
+#     timeout, dispatch resumed") -> exit 8, the pre-update pid is reported as
+#     STILL RUNNING, and — critically — the reset-failed+start self-heal is
+#     NEVER invoked (that would defeat the fail-safe by forcing exactly the
+#     sweep-cancelling restart it exists to prevent).
+# ============================================================
+W70="$BASE_WORKDIR/w70"
+new_fixture "$W70"
+HEAD70="$(cd "$W70" && git rev-parse --short HEAD)"
+INSTALLED70="$W70/installed/loom-daemon"
+mkdir -p "$W70/installed"
+RESTART_MARKER70="$W70/restart-invoked"
+write_fake_daemon_restart_argv "$INSTALLED70" "deadbee" "$RESTART_MARKER70" 0
+NEW_FAKE70="$W70/new-fake-daemon"
+write_fake_daemon_restart_argv "$NEW_FAKE70" "$HEAD70" "$RESTART_MARKER70" 0
+# A REAL, live process standing in for "the daemon that never exited" — the
+# fail-safe detector requires a live pid (kill -0), not just an unchanged number.
+sleep 60 >/dev/null 2>&1 &
+STILL_RUNNING_PID70=$!
+bg_proc_track "$STILL_RUNNING_PID70"
+SD_BIN70="$W70/systemd-bin"
+SD_LOG70="$W70/systemctl.log"
+SD_STATE70="$W70/systemd-pid-state"
+# No post_restart_marker/post_state given: the unit's reported pid/state never
+# change, no matter how long the poll runs -- exactly "the drain accepted the
+# request but the daemon is still there, unmoved" (the fail-safe holding).
+write_fake_systemd_pid_bin "$SD_BIN70" "$SD_LOG70" "$SD_STATE70" "${STILL_RUNNING_PID70}:active:success"
+
+out70=$( cd "$W70" && PATH="$SD_BIN70:$TEST_PATH" LOOM_SYSTEMD_FORCE=1 LOOM_DAEMON_SYSTEMD=1 \
+    LOOM_SYSTEMD_UNIT="loom-daemon-test-sd70.service" \
+    LOOM_DAEMON_BIN="$INSTALLED70" NEW_FAKE_BIN_SRC="$NEW_FAKE70" \
+    LOOM_DAEMON_DRAIN_POLL_SECS=1 LOOM_DAEMON_RESTART_POLL_INTERVAL=0.2 \
+    bash "$UPDATE_SCRIPT" --drain 2>&1 )
+rc70=$?
+assert_eq "8" "$rc70" "drain timeout without --force-after-timeout -> exit 8 (fail-safe, not a failure)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out70" | grep -qi 'FAIL-SAFE' && echo "$out70" | grep -q "pid ${STILL_RUNNING_PID70}"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} exit-8 output names the fail-safe and the still-running pre-update pid"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} exit-8 output names the fail-safe and the still-running pre-update pid"
+    echo "  output: $out70"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if ! grep -qi 'reset-failed' "$SD_LOG70" 2>/dev/null; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} fail-safe timeout NEVER triggers the reset-failed+start self-heal"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} fail-safe timeout NEVER triggers the reset-failed+start self-heal"
+    echo "  systemctl.log: $(cat "$SD_LOG70" 2>/dev/null)"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+# Checked BEFORE the cleanup kill below -- this asserts the process was never
+# touched by the update script itself, not merely that it happens to be alive
+# right now.
+if kill -0 "$STILL_RUNNING_PID70" 2>/dev/null; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} the pre-update daemon process was never touched (no sweep-cancelling restart forced)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} the pre-update daemon process was never touched (no sweep-cancelling restart forced)"
+fi
+kill "$STILL_RUNNING_PID70" 2>/dev/null || true
+
+# ============================================================
+# 71. Same drain timeout shape as test 70, but WITH --force-after-timeout:
+#     the daemon eventually force-cancels and exits (landing the unit in
+#     'failed', the #4950 shape), so the ordinary reset-failed+start self-heal
+#     DOES run and recovers it -> exit 0 (Issue #5138 never suppresses the
+#     self-heal when the operator explicitly asked to force the roll
+#     through).
+# ============================================================
+W71="$BASE_WORKDIR/w71"
+new_fixture "$W71"
+HEAD71="$(cd "$W71" && git rev-parse --short HEAD)"
+INSTALLED71="$W71/installed/loom-daemon"
+mkdir -p "$W71/installed"
+RESTART_MARKER71="$W71/restart-invoked"
+write_fake_daemon_restart_argv "$INSTALLED71" "deadbee" "$RESTART_MARKER71" 0
+NEW_FAKE71="$W71/new-fake-daemon"
+write_fake_daemon_restart_argv "$NEW_FAKE71" "$HEAD71" "$RESTART_MARKER71" 0
+sleep 60 >/dev/null 2>&1 &
+RECOVERED_PID71=$!
+bg_proc_track "$RECOVERED_PID71"
+SD_BIN71="$W71/systemd-bin"
+SD_LOG71="$W71/systemctl.log"
+SD_STATE71="$W71/systemd-pid-state"
+write_fake_systemd_pid_bin "$SD_BIN71" "$SD_LOG71" "$SD_STATE71" "9999:active:success" \
+    "$RESTART_MARKER71" "0:failed:timeout" "${RECOVERED_PID71}:active:success"
+
+( cd "$W71" && PATH="$SD_BIN71:$TEST_PATH" LOOM_SYSTEMD_FORCE=1 LOOM_DAEMON_SYSTEMD=1 \
+    LOOM_SYSTEMD_UNIT="loom-daemon-test-sd71.service" \
+    LOOM_DAEMON_BIN="$INSTALLED71" NEW_FAKE_BIN_SRC="$NEW_FAKE71" \
+    LOOM_DAEMON_DRAIN_POLL_SECS=1 LOOM_DAEMON_RESTART_POLL_INTERVAL=0.2 \
+    LOOM_DAEMON_RESTART_KICKSTART_POLL_SECS=3 \
+    bash "$UPDATE_SCRIPT" --drain --force-after-timeout >/dev/null 2>&1 )
+rc71=$?
+kill "$RECOVERED_PID71" 2>/dev/null || true
+assert_eq "0" "$rc71" "drain timeout WITH --force-after-timeout still self-heals a failed unit -> exit 0"
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q -- '--force-after-timeout' "$RESTART_MARKER71" 2>/dev/null; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} --force-after-timeout is threaded through to the restart invocation"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} --force-after-timeout is threaded through to the restart invocation"
+    echo "  restart marker: $(cat "$RESTART_MARKER71" 2>/dev/null)"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -qi 'reset-failed' "$SD_LOG71" 2>/dev/null; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} --force-after-timeout still allows the reset-failed+start self-heal to run"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} --force-after-timeout still allows the reset-failed+start self-heal to run"
+    echo "  systemctl.log: $(cat "$SD_LOG71" 2>/dev/null)"
+fi
+
+# ============================================================
+# 72. --dry-run on a systemd host without --restart-now describes the
+#     drain-by-default plan (names #5119 and --restart-now); with
+#     --restart-now it describes the immediate/non-drained plan instead
+#     (Issue #5138). Neither writes anything.
+# ============================================================
+W72="$BASE_WORKDIR/w72"
+new_fixture "$W72"
+INSTALLED72="$W72/installed/loom-daemon"
+mkdir -p "$W72/installed"
+RESTART_MARKER72="$W72/restart-invoked"
+write_fake_daemon_restart_argv "$INSTALLED72" "deadbee" "$RESTART_MARKER72" 0
+SD_BIN72="$W72/systemd-bin"
+SD_LOG72="$W72/systemctl.log"
+write_fake_systemd_active_bin "$SD_BIN72" "$SD_LOG72" "4242"
+
+dry72_default=$( cd "$W72" && PATH="$SD_BIN72:$TEST_PATH" LOOM_SYSTEMD_FORCE=1 LOOM_DAEMON_SYSTEMD=1 \
+    LOOM_SYSTEMD_UNIT="loom-daemon-test-sd72.service" LOOM_DAEMON_BIN="$INSTALLED72" \
+    bash "$UPDATE_SCRIPT" --dry-run 2>&1 )
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$dry72_default" | grep -q -- '--drain' && echo "$dry72_default" | grep -qi 'DEFAULT' \
+    && echo "$dry72_default" | grep -q '5119' && [[ ! -s "$RESTART_MARKER72" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} --dry-run on systemd (no flags) describes the drain-by-default plan, no writes"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} --dry-run on systemd (no flags) describes the drain-by-default plan, no writes"
+    echo "  output: $dry72_default"
+fi
+
+dry72_now=$( cd "$W72" && PATH="$SD_BIN72:$TEST_PATH" LOOM_SYSTEMD_FORCE=1 LOOM_DAEMON_SYSTEMD=1 \
+    LOOM_SYSTEMD_UNIT="loom-daemon-test-sd72.service" LOOM_DAEMON_BIN="$INSTALLED72" \
+    bash "$UPDATE_SCRIPT" --dry-run --restart-now 2>&1 )
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$dry72_now" | grep -qi 'IMMEDIATE' && ! echo "$dry72_now" | grep -q -- '--drain' \
+    && [[ ! -s "$RESTART_MARKER72" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} --dry-run --restart-now on systemd describes the immediate (non-drained) plan"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} --dry-run --restart-now on systemd describes the immediate (non-drained) plan"
+    echo "  output: $dry72_now"
 fi
 
 # ============================================================
