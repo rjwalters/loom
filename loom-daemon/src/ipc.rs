@@ -1922,8 +1922,14 @@ fn resolve_registry(
 /// cwd for the explicit-param-absent case. It consults the on-disk
 /// [`WorkspaceRegistry`] instead:
 ///
-/// - `workspace_root` `Some(non-empty)` -> unchanged: normalize and
-///   provision/return that repo's registry (explicit param always wins).
+/// - `workspace_root` `Some(non-empty)` -> normalize and, if the path is a
+///   **registered** workspace, provision/return that repo's registry
+///   (explicit param always wins over the default). If the normalized path is
+///   *not* registered, returns a structured `workspace_unregistered` error
+///   naming the offending path and every registered root (#5210) instead of
+///   silently provisioning a registry for an arbitrary directory — which
+///   previously surfaced only much later, as an opaque "failed to spawn sweep
+///   child" once `resolve_spawn_bin` found no `spawn-worker.sh` there.
 /// - `workspace_root` `None`/empty -> [`WorkspaceRegistry::resolve_dispatch_root`]
 ///   against the seeded default (`default`'s own `workspace_root`) decides:
 ///   empty registry or seeded-default-is-registered both resolve back to
@@ -1952,6 +1958,24 @@ fn resolve_dispatch_registry(
     if let Some(root) = workspace_root {
         if !root.trim().is_empty() {
             let normalized = crate::workspace_registry::normalize_path(Path::new(root));
+            // #5210: an explicit `workspace_root` must actually be a
+            // registered workspace. Without this check, an unregistered path
+            // (e.g. a typo, or a repo the daemon simply hasn't been told
+            // about) sails straight through `get_or_provision` — which
+            // provisions a registry for *any* path, registered or not — and
+            // the caller only learns something is wrong many steps later,
+            // via an opaque "failed to spawn sweep child" once
+            // `resolve_spawn_bin` can't find `spawn-worker.sh` under the
+            // bogus root.
+            let registry = WorkspaceRegistry::load_default().unwrap_or_default();
+            if !registry.contains(&normalized) {
+                let registered: Vec<std::path::PathBuf> =
+                    registry.workspaces.iter().map(|w| w.root.clone()).collect();
+                return Err(Response::StructuredError(DaemonError::workspace_unregistered(
+                    &normalized,
+                    &registered,
+                )));
+            }
             return Ok(workspace_pool.get_or_provision(&normalized));
         }
     }
@@ -2981,7 +3005,13 @@ fn handle_request(
                 Err(e) => match e.downcast::<crate::runtime_admission::RuntimeRejection>() {
                     Ok(rejection) => Response::RuntimeRejected(rejection),
                     Err(e) => Response::Error {
-                        message: format!("dispatch_sweep failed: {e}"),
+                        // #5210: `{e:#}` (anyhow's alternate Display) walks the
+                        // full `.context()` chain instead of printing only the
+                        // outermost context, so a specific inner failure (e.g.
+                        // `resolve_spawn_bin`'s "spawn-worker.sh not found under
+                        // ...") reaches the MCP client instead of being
+                        // silently collapsed into "failed to spawn sweep child".
+                        message: format!("dispatch_sweep failed: {e:#}"),
                     },
                 },
             }
@@ -4018,6 +4048,12 @@ exit 0
         pool.seed(root_a, sr_default.clone());
         pool.seed(root_b.clone(), sr_b.clone());
 
+        // #5210: an explicit `workspace_root` on DispatchSweep must now name a
+        // *registered* workspace (`seed_temp_registry` is defined below in this
+        // module; it also points `WorkspaceRegistry::load_default()` at a temp
+        // file so this test never touches the real `~/.loom/workspaces.json`).
+        let _guard = seed_temp_registry(&[dir_b.path()]);
+
         // Dispatch issue #42 into repo B explicitly.
         let dispatched = handle_request(
             Request::DispatchSweep {
@@ -4281,6 +4317,126 @@ exit 0
                 );
             }
             other => panic!("Expected StructuredError, got: {other:?}"),
+        }
+    }
+
+    /// Issue #5210, AC #1 — an explicit `workspace_root` that names a path the
+    /// daemon has never registered must return a structured
+    /// `workspace_unregistered` error naming both the offending path and every
+    /// registered root, instead of silently provisioning a registry for an
+    /// arbitrary directory via `get_or_provision`.
+    #[test]
+    #[serial_test::serial]
+    fn test_dispatch_sweep_unregistered_explicit_workspace_root_is_structured_error() {
+        let (tm, db, _, bus) = setup_test_context();
+        let (sr_default, dir_a, _rec_a) = setup_sweep_registry_in_tempdir();
+        let dir_unregistered = tempdir().unwrap();
+        let root_a = crate::workspace_registry::normalize_path(dir_a.path());
+        let unregistered = crate::workspace_registry::normalize_path(dir_unregistered.path());
+
+        let pool = Arc::new(WorkspacePool::new(Arc::new(EventBus::new()), test_runtime_handle()));
+        pool.seed(root_a, sr_default.clone());
+
+        // Only repo A is registered; `dir_unregistered` is never added.
+        let _guard = seed_temp_registry(&[dir_a.path()]);
+
+        let dispatched = handle_request(
+            Request::DispatchSweep {
+                kind: SweepKind::Issue(5210),
+                idempotency_key: None,
+                model: None,
+                effort: None,
+                depends_on: None,
+                workspace_root: Some(dir_unregistered.path().to_string_lossy().into_owned()),
+                force: false,
+            },
+            &tm,
+            &db,
+            &sr_default,
+            &bus,
+            &pool,
+        );
+        match dispatched {
+            Response::StructuredError(err) => {
+                assert_eq!(err.code.0, crate::errors::ErrorCode::CONFIG_WORKSPACE_UNREGISTERED);
+                assert!(
+                    err.message.contains(&unregistered.display().to_string()),
+                    "error must name the offending unregistered path, got: {}",
+                    err.message
+                );
+                assert!(
+                    err.message.contains(&dir_a.path().display().to_string())
+                        || err
+                            .details
+                            .as_ref()
+                            .and_then(|d| d.get("registered"))
+                            .map(|v| v.to_string())
+                            .unwrap_or_default()
+                            .contains(&dir_a.path().display().to_string()),
+                    "error must list the registered roots, got message={} details={:?}",
+                    err.message,
+                    err.details
+                );
+            }
+            other => panic!("Expected StructuredError, got: {other:?}"),
+        }
+    }
+
+    /// Issue #5210, AC #2/#3 — once an unregistered root is filtered out by AC
+    /// #1, a spawn failure unrelated to registration (a *registered* workspace
+    /// missing `spawn-worker.sh`) must still surface `resolve_spawn_bin`'s
+    /// specific message through `dispatch_sweep failed: {e:#}` — distinct from
+    /// the AC #1 registration error and no longer collapsed into the opaque
+    /// "failed to spawn sweep child" outer context alone.
+    #[test]
+    #[serial_test::serial]
+    fn test_dispatch_sweep_registered_workspace_missing_spawn_bin_surfaces_inner_error() {
+        let (tm, db, _, bus) = setup_test_context();
+        let dir = tempdir().unwrap();
+        // Deliberately do NOT create `.loom/scripts/spawn-worker.sh` (or
+        // `defaults/scripts/spawn-worker.sh`), and leave `spawn_bin` unset —
+        // this workspace IS registered, but is misconfigured.
+        let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
+        config.skip_label_flip = true; // bypass runtime admission / #4027 guard, not spawn_bin resolution
+        config.journal_path = Some(dir.path().join("test-sweeps-journal.json"));
+        let sr = Arc::new(Mutex::new(SweepRegistry::new(config)));
+
+        let pool = Arc::new(WorkspacePool::new(Arc::new(EventBus::new()), test_runtime_handle()));
+        let root = crate::workspace_registry::normalize_path(dir.path());
+        pool.seed(root, sr.clone());
+        let _guard = seed_temp_registry(&[dir.path()]);
+
+        // Isolate from a stray real `LOOM_SWEEP_SPAWN_BIN` in the test env.
+        std::env::remove_var(crate::sweep_registry::SPAWN_BIN_ENV);
+
+        let dispatched = handle_request(
+            Request::DispatchSweep {
+                kind: SweepKind::Issue(5210),
+                idempotency_key: None,
+                model: None,
+                effort: None,
+                depends_on: None,
+                workspace_root: Some(dir.path().to_string_lossy().into_owned()),
+                force: false,
+            },
+            &tm,
+            &db,
+            &sr,
+            &bus,
+            &pool,
+        );
+        match dispatched {
+            Response::Error { message } => {
+                assert!(
+                    message.contains("spawn-worker.sh not found under"),
+                    "expected the specific resolve_spawn_bin message to survive `{{e:#}}`, got: {message}"
+                );
+                assert!(
+                    message.contains("failed to spawn sweep child"),
+                    "outer context should still be present alongside the inner detail, got: {message}"
+                );
+            }
+            other => panic!("Expected Response::Error, got: {other:?}"),
         }
     }
 
