@@ -173,10 +173,21 @@ parse_blocker_ref() {
 # existing `grep -Eo "#[0-9]+" | grep -Eo "[0-9]+"` pipeline used elsewhere
 # silently drops any repo prefix and misreads a cross-repo reference as
 # same-repo, which is exactly wrong for the incident this section fixes.
+#
+# Two-stage shape (matches the sibling parsers guide.md's parse_dependencies,
+# sweep.md's --auto-stack detector, and warn-out-of-set-deps.sh): stage 1
+# selects the whole matching LINE (grep -E, no -o) containing the phrase;
+# stage 2 extracts every ref (bare #N or owner/repo#N) found on that line.
+# A single-stage `grep -Eo` anchored to the phrase AND its immediately
+# following #N can only ever match one ref per phrase occurrence, silently
+# dropping every other comma-separated ref on the same line (e.g.
+# "Blocked by: #1 (x), #3 (y)" would yield only #1) — under-parsing here is
+# the highest-severity failure mode (see champion-pr-merge.md Step 5's own
+# comment on ALL_DEPS), so the two-stage shape is load-bearing, not stylistic.
 extract_blocker_refs() {
   local body="$1"
   printf '%s\n' "$body" \
-    | grep -Eo '(Blocked by|Depends on|Requires)[*_:[:space:]]*([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+|#[0-9]+)' \
+    | grep -E '(Blocked by|Depends on|Requires)[*_:[:space:]]*([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+|#[0-9]+)' \
     | grep -Eo '([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+|#[0-9]+)' \
     | sort -u
 }

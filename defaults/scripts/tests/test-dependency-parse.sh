@@ -118,11 +118,17 @@ sweep_auto_stack_detect() {
 # helper is cross-repo aware: it captures an optional `owner/repo` prefix
 # ahead of the `#N` and (unlike the old bare-`#N` pipeline) returns each
 # reference WITH its `#`/`owner/repo#` form rather than a stripped number.
+# Two-stage shape (matches guide.md/sweep.md/warn-out-of-set-deps.sh):
+# stage 1 selects the whole matching line (grep -E, no -o), stage 2
+# extracts every ref found on that line — a single-stage `grep -Eo`
+# anchored to the phrase + its immediately-following #N can only ever
+# match one ref per phrase occurrence, silently dropping every other
+# comma-separated ref on the same line.
 # =====================================================================
 champion_all_deps() {
     local blocked_body="$1"
     printf '%s\n' "$blocked_body" \
-        | grep -Eo '(Blocked by|Depends on|Requires)[*_:[:space:]]*([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+|#[0-9]+)' \
+        | grep -E '(Blocked by|Depends on|Requires)[*_:[:space:]]*([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+|#[0-9]+)' \
         | grep -Eo '([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+|#[0-9]+)' \
         | sort -u
 }
@@ -185,6 +191,12 @@ assert_eq $'#7\n#8\n#9' "$out" "plain unformatted forms (no regression)"
 out="$(champion_all_deps 'Depends on owner/repo#42')"
 assert_eq 'owner/repo#42' "$out" "cross-repo owner/repo#N reference is preserved (#5211)"
 
+out="$(champion_all_deps '**Blocked by:** #1 (x), #3 (y)')"
+assert_eq $'#1\n#3' "$out" "bold+colon comma-list captures ALL refs, not just the first (regression guard)"
+
+out="$(champion_all_deps 'Blocked by: #1, owner/repo#3')"
+assert_eq $'#1\nowner/repo#3' "$out" "mixed same-repo/cross-repo comma-list captures both refs"
+
 echo
 echo "--- champion-pr-merge.md BLOCKED_ISSUES jq filter: widened separator ---"
 
@@ -228,8 +240,8 @@ assert_doc_contains "$CHAMPION_MD" \
     "champion-pr-merge.md ALL_DEPS extraction calls through to extract_blocker_refs (#5211)"
 
 assert_doc_contains "$CHAMPION_COMMON_MD" \
-    "grep -Eo '(Blocked by|Depends on|Requires)[*_:[:space:]]*([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+|#[0-9]+)'" \
-    "champion-common.md extract_blocker_refs ships the widened cross-repo pattern"
+    "grep -E '(Blocked by|Depends on|Requires)[*_:[:space:]]*([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+|#[0-9]+)'" \
+    "champion-common.md extract_blocker_refs ships the widened cross-repo pattern (two-stage: whole-line select)"
 
 assert_doc_contains "$CHAMPION_MD" \
     'test(\"(Blocked by|Depends on|Requires)[*_:[:space:]]*#$CLOSED_ISSUE\"; \"i\")' \
