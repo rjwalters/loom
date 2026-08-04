@@ -114,6 +114,11 @@ const GITIGNORE_BLOCK_HEADER: &str = "# Loom runtime state (don't commit these)"
 /// drifted behind this list (was missing `.no-changes-needed` and `.loom/*.bak`).
 /// `.loom/accounts.json` is intentionally left tracked: it is an optional,
 /// committable per-repo profile allowlist, not runtime state.
+///
+/// #5267: added `.claude/worktrees/` (the Claude Code harness's own
+/// `isolation: worktree` root, created inside the checkout). Left unignored it
+/// is a nested git repo that `git add -A` stages as an embedded-repo gitlink.
+/// Also re-synced the committed source `.gitignore` for the same entry.
 pub const EPHEMERAL_PATTERNS: &[&str] = &[
     ".loom-in-use",
     // Per-worktree builder progress checkpoint. Its WRITER moved from Python to
@@ -146,6 +151,18 @@ pub const EPHEMERAL_PATTERNS: &[&str] = &[
     // in a consumer repo (anvil, 2026-07-28): `.loom/worktrees-local/<repo>/issue-N`
     // (#4280). Runtime worktree state, same class as `.loom/worktrees/`.
     ".loom/worktrees-local/",
+    // Worktrees created inside the checkout by the Claude Code harness's
+    // `isolation: worktree` mechanism (#5267). This is the HARNESS's own
+    // worktree root and is distinct from Loom's builder worktrees under
+    // `.loom/worktrees/` above — different owner, same hazard class: an
+    // unignored `.claude/worktrees/<name>` is a nested git repo, so a
+    // `git add -A` (e.g. during a resync) stages an embedded-repo gitlink.
+    // That near-miss already happened once in a consumer repo (gf180-trng,
+    // 2026-08-04). Unlike `.claude/commands` / `.claude/skills` — which are
+    // ignored ONLY in loom's own `.gitignore` because consumers keep them
+    // TRACKED — this path is pure machine-local runtime state everywhere, so
+    // it belongs in the consumer-facing managed block.
+    ".claude/worktrees/",
     ".loom/state.json",
     ".loom/mcp-command.json",
     ".loom/activity.db",
@@ -666,6 +683,8 @@ mod tests {
         assert!(contents.contains(".loom/spawn-loop-state.json"));
         assert!(contents.contains(".loom/daemon-metrics.json"));
         assert!(contents.contains(".loom/activity.db"));
+        // #5267: the harness's `isolation: worktree` root must be added too.
+        assert!(contents.contains(".claude/worktrees/"));
     }
 
     #[test]
@@ -687,6 +706,9 @@ mod tests {
         // #4635: the builder "no changes needed" marker must not duplicate
         // across runs either.
         assert_eq!(contents.matches(".no-changes-needed").count(), 1);
+        // #5267: `.claude/worktrees/` (harness `isolation: worktree` root) must
+        // not duplicate across runs.
+        assert_eq!(contents.matches(".claude/worktrees/").count(), 1);
     }
 
     #[test]
@@ -719,6 +741,10 @@ mod tests {
             ".loom/interventions/",
             ".loom/worktrees/",
             ".loom/worktrees-local/",
+            // #5267: the Claude Code harness's `isolation: worktree` root,
+            // created inside the checkout — a nested git repo that `git add -A`
+            // otherwise stages as an embedded-repo gitlink.
+            ".claude/worktrees/",
             ".loom/state.json",
             ".loom/mcp-command.json",
             ".loom/activity.db",
