@@ -2206,9 +2206,32 @@ if [[ "$COMMAND" == *"@"* ]]; then
     # `repos/{o}/{r}/pulls/{n}` (PR PATCH) exactly as it covers
     # `.../issues/{n}/comments`. Confirmed via the test suite's new
     # non-comments-endpoint case; no widening was needed here.
+    #
+    # HEREDOC-MASKED SCAN (#5181): this check used to grep raw $COMMAND, so a
+    # heredoc BODY line that merely QUOTES the denied phrase as inert prose
+    # (e.g. a report `cat > f.md <<'EOF' ... gh api ... -f body=@x ... EOF`,
+    # nothing of which executes) tripped the same catastrophic-tier deny as a
+    # live invocation. Reuses mask_heredoc_bodies() (#5000, defined above)
+    # -- the same primitive extract_write_targets() already uses -- to build
+    # a heredoc-body-blanked working copy and scans THAT instead. Built
+    # lazily (only when '<<' is present, mirroring the COMMAND_NO_COMMENT
+    # `#`-present hot-path guard below) and scoped to just this one check;
+    # every other rule in this file keeps reading raw $COMMAND /
+    # COMMAND_NO_COMMENT unchanged. Masking only ever narrows: a REAL
+    # (non-heredoc) invocation is untouched and still denies, even sitting in
+    # the same multi-line command as an unrelated heredoc (mirrors the #5000
+    # "narrows, never widens" test at
+    # tests/hooks/test-guard-destructive.sh:2691).
     # -------------------------------------------------------------------------
+    if [[ "$COMMAND" == *"<<"* ]]; then
+        COMMAND_HEREDOC_MASKED=$(printf '%s' "$COMMAND" | awk "$_MASKHEREDOC_AWK"'
+        { buf = buf (NR > 1 ? "\n" : "") $0 }
+        END { printf "%s", mask_heredoc_bodies(buf) }')
+    else
+        COMMAND_HEREDOC_MASKED="$COMMAND"
+    fi
     GH_API_RAWFIELD_BODY_AT_PATTERN="(^|[;&|[:space:]])gh[[:space:]]+api[^;&]*[[:space:]](-f|--raw-field)[[:space:]]*=?[[:space:]]*[\"']?body=[\"']?$GH_AT_PATHISH"
-    if echo "$COMMAND" | grep -qE "$GH_API_RAWFIELD_BODY_AT_PATTERN"; then
+    if echo "$COMMAND_HEREDOC_MASKED" | grep -qE "$GH_API_RAWFIELD_BODY_AT_PATTERN"; then
         deny "BLOCKED: 'gh api ... -f/--raw-field body=@<path>' does NOT read the file — only -F/--field gives '@<path>' its read-from-file meaning. As written this posts the literal string '@<path>' as the body (same silent data loss as PR #4457/issue #4608). Use '-F body=@<path>' instead." "gh-api-rawfield-body-literal-at"
     fi
 fi
