@@ -2598,15 +2598,70 @@ assert_deny "Fast path security: 'git status ; <force-push main>' still denies" 
 _FP_ROOT="/"
 assert_deny "Fast path security: 'git status \$(rm -rf /)' takes full path and denies" \
     "git status \$(rm -rf $_FP_ROOT)"
-# Pipe: observable — same read-only grep, but the pipe disqualifies the fast
-# path so the full-path SQL-DDL check fires (deny), proving the excluded-char
-# guard truly routes to the full path rather than admitting.
-assert_deny "Fast path security: 'grep <ddl> | cat' pipe disqualifies fast path (SQL-DDL denies)" \
-    "grep '$_FP_DDL' x.sql | cat"
-# Wrapper: first token is bash (not an allowlist word) → not admitted. Observable
-# via the SQL grep the wrapper carries (full path denies).
+# Pipe to a read-only sink: VERDICT CHANGED by #5263. A read-only search piped to
+# a read-only sink (cat/head/tail/wc/less/more) is 100% read-only — the DDL phrase
+# lives only inside grep's quoted search argument, which grep never executes — so
+# the narrow search-pipe carve-out (fastpath_grep_pipe_admits) now admits it,
+# matching the already-allowed bare `grep <ddl>` form. Before #5263 the pipe
+# disqualified the fast path and the full-path SQL-DDL check false-positived on
+# grep's own argument (deny). This was the self-defeating false positive #5263
+# fixes: `grep 'DROP TABLE' … | head` is one of the most common interactive idioms.
+if [[ "$_FP_AMBIENT_ON" == "1" ]]; then
+    assert_allow_silent "Fast path: 'grep <ddl> | cat' read-only search-pipe now admits (#5263)" \
+        "grep '$_FP_DDL' x.sql | cat"
+    assert_allow_silent "Fast path: 'grep <ddl> | head' read-only search-pipe admits (#5263)" \
+        "grep '$_FP_DDL' x.sql | head"
+    assert_allow_silent "Fast path: 'grep <ddl> | head -n 40' (head takes any args) admits (#5263)" \
+        "grep '$_FP_DDL' x.sql | head -n 40"
+    assert_allow_silent "Fast path: 'grep <ddl> | tail -5' read-only search-pipe admits (#5263)" \
+        "grep '$_FP_DDL' x.sql | tail -5"
+    assert_allow_silent "Fast path: 'grep <ddl> | wc -l' read-only search-pipe admits (#5263)" \
+        "grep '$_FP_DDL' x.sql | wc -l"
+    assert_allow_silent "Fast path: 'grep <ddl> | less' stdin-sink admits (#5263)" \
+        "grep '$_FP_DDL' x.sql | less"
+    assert_allow_silent "Fast path: 'grep <ddl> | cat -n' (flag-only cat) admits (#5263)" \
+        "grep '$_FP_DDL' x.sql | cat -n"
+    assert_allow_silent "Fast path: 'rg <ddl> | head' rg upstream admits (#5263)" \
+        "rg '$_FP_DDL' x.sql | head"
+    assert_allow_silent "Fast path: 'egrep <ddl> | wc -l' egrep upstream admits (#5263)" \
+        "egrep '$_FP_DDL' x.sql | wc -l"
+    assert_allow_silent "Fast path: 'fgrep <ddl> | cat' fgrep upstream admits (#5263)" \
+        "fgrep '$_FP_DDL' x.sql | cat"
+fi
+# Security (#5263): the search-pipe carve-out is NARROW. A real DDL-executing
+# command piped to a read-only sink has a non-search first token, so it is NOT
+# admitted and the full-path SQL-DDL check still fires (deny). This is the
+# obfuscation-still-caught guarantee: a pipe to `cat` cannot launder a live DDL.
+assert_deny "Fast path security: 'mysql -e <ddl> | cat' (real DDL executor) still denies (#5263)" \
+    "mysql -e '$_FP_DDL' | cat"
+assert_deny "Fast path security: 'psql -c <ddl> | head' (real DDL executor) still denies (#5263)" \
+    "psql -c '$_FP_DDL' | head"
+# A search piped to a NON-sink command (not in the read-only sink allowlist) is
+# NOT admitted — only the fixed sink allowlist qualifies, so this falls through to
+# the full path where the SQL-DDL check fires on grep's argument (deny).
+assert_deny "Fast path security: 'grep <ddl> | sh' (pipe to non-sink) still denies (#5263)" \
+    "grep '$_FP_DDL' x.sql | sh"
+# cat WITH a credential-file operand must NOT be fast-pathed: the stdin-only sink
+# rule rejects any positional operand, so the command falls through to the full
+# path where cat's existing .ssh ASK carve-out still fires (ask, not silent allow).
+# A NON-DDL search is used here so the verdict isolates the cat carve-out — a DDL
+# phrase in grep's argument would deny at the earlier catastrophic sql-ddl tier
+# first, masking whether the credential ASK was preserved.
+assert_ask "Fast path security: 'grep foo | cat ~/.ssh/id_rsa' still asks (cat operand not fast-pathed, #5263)" \
+    "grep foo x.sql | cat ~/.ssh/id_rsa"
+# A second pipe declines the (single-pipe) carve-out and falls through to the full
+# path, where the SQL-DDL check fires on grep's argument (deny). Conservative by
+# design: a multi-stage read-only pipe is a false negative, never a hole.
+assert_deny "Fast path security: 'grep <ddl> | grep x | head' (two pipes) declines carve-out, denies (#5263)" \
+    "grep '$_FP_DDL' x.sql | grep foo | head"
+# Wrapper: first token is bash (not an allowlist word) → not admitted, and the
+# search-pipe carve-out is UNCHANGED for wrappers (its metachar reject rules out
+# the quoted payload's own pipe too). Observable via the SQL grep the wrapper
+# carries (full path denies). #5263 deliberately does NOT relax this.
 assert_deny "Fast path security: 'bash -c \"grep <ddl>\"' wrapper not admitted (SQL-DDL denies)" \
     "bash -c \"grep '$_FP_DDL' x.sql\""
+assert_deny "Fast path security: 'bash -c \"grep <ddl> | head\"' wrapper+pipe not admitted (SQL-DDL denies, #5263)" \
+    "bash -c \"grep '$_FP_DDL' x.sql | head\""
 # Non-bare git subcommand form: `git -C /p status` is not admitted; still allows
 # via the existing full path (verdict unchanged, just unoptimized).
 assert_allow "Fast path: 'git -C /tmp status' not fast-pathed, still allowed via full path" \
@@ -2618,9 +2673,16 @@ assert_ask "Fast path: 'cat ~/.ssh/id_rsa' still asks (cat excluded from fast pa
 # --- Toggle off restores the full-path verdict byte-for-byte (env + config) ---
 assert_deny_env "Fast path off (env): 'grep <ddl>' takes full path and denies" \
     "LOOM_GUARD_READONLY_FASTPATH=0" "grep '$_FP_DDL' schema.sql"
+# The #5263 search-pipe carve-out is gated by the SAME toggle: with the fast path
+# force-disabled, the piped grep also takes the full path and denies (proving the
+# carve-out is not a separate always-on bypass).
+assert_deny_env "Fast path off (env): 'grep <ddl> | head' search-pipe also denies (#5263)" \
+    "LOOM_GUARD_READONLY_FASTPATH=0" "grep '$_FP_DDL' schema.sql | head"
 FASTPATH_OFF_REPO=$(make_sql_repo '{"guards":{"readOnlyFastPath":false}}')
 assert_deny "Fast path off (config): 'grep <ddl>' takes full path and denies" \
     "grep '$_FP_DDL' schema.sql" "$FASTPATH_OFF_REPO"
+assert_deny "Fast path off (config): 'grep <ddl> | head' search-pipe also denies (#5263)" \
+    "grep '$_FP_DDL' schema.sql | head" "$FASTPATH_OFF_REPO"
 # Env override wins over config (mirrors the sqlDdl/cloudCli precedent): env=1
 # forces the fast path ON even when the config disables it.
 assert_allow_env "Fast path: LOOM_GUARD_READONLY_FASTPATH=1 overrides config-off (allow)" \
@@ -3737,18 +3799,21 @@ assert_allow "stash-scope: git status alone still allowed (read-only fast path u
 assert_allow "ask-tier (#5235): check-duplicate.sh positional TITLE/DESCRIPTION quoting 'git stash pop' as inert prose no longer asks" \
     './.loom/scripts/check-duplicate.sh "Guard false positive: stash-scope redirect" "quotes git stash pop as inert text, not a live invocation"' "$ST_REPO"
 
-# Deliberate scope decision (see mask_ask_positional_args()'s header comment
-# in guard-destructive-generic.sh): grep/rg are NOT in this ask-tier
-# allowlist, unlike guard-loom-workflow.sh's #5155/#5160 fix -- COMMAND_ASK_SCAN
-# also feeds the SQL DDL/DML check, which intentionally still scans a grep
-# invocation's own quoted search pattern for a literal DDL phrase once off
-# the read-only fast path (see the "Fast path security"/"Fast path off" test
-# groups above). Piped to `cat` (same disqualifier the SQL-DDL fast-path
-# tests above use) so this actually reaches the ask-tier scan instead of
-# short-circuiting via the #3687 read-only fast path. So a grep search
-# quoting the ask-phrase as prose still asks here -- this is the documented,
-# deliberately narrower scope, not a miss.
-assert_ask "ask-tier (#5235): grep -n search whose pattern quotes 'git stash pop' mid-sentence still asks (grep deliberately not allowlisted, see SQL-DDL conflict)" \
+# VERDICT CHANGED by #5263. grep/rg are still NOT in the ask-tier positional-arg
+# allowlist (COMMAND_ASK_SCAN also feeds the SQL DDL/DML check, so a grep's own
+# quoted search pattern is deliberately still scanned once a command reaches the
+# full path). This case USED to `cat`-pipe the grep specifically to disqualify
+# the #3687 read-only fast path and thereby REACH the ask-tier scan, so it asked.
+# #5263 added a narrow search-pipe carve-out: `grep|egrep|fgrep|rg … | (read-only
+# sink)` is now fast-pathed to a silent allow, because a read-only search piped to
+# a pager/counter is 100% read-only — the quoted phrase is inert search text grep
+# never executes. So `grep -n "…git stash pop…" file | cat` now ALLOWS silently.
+# This is the same false-positive class #5263 fixes for SQL-DDL, applied to the
+# stash-scope phrase, and is correct: no real stash operation runs. The two
+# regression guards below still prove a REAL invocation (a `&&`-chained stash pop,
+# an `echo … | bash`) is unaffected and still asks — the carve-out only admits the
+# search-to-sink shape, not chains or non-search upstreams.
+assert_allow_silent "ask-tier (#5235/#5263): grep -n search quoting 'git stash pop' piped to cat now fast-paths (read-only search-pipe carve-out)" \
     'grep -n "this example mentions git stash pop mid-sentence" defaults/hooks/guard-destructive-generic.sh | cat' "$ST_REPO"
 
 # Regression guard: masking a matched positional span must not blind the
