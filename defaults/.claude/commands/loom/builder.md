@@ -574,6 +574,14 @@ Before claiming, check for these warning signs:
 
 **Reading comments is not optional** - it's where Curators put the detailed spec that makes issues truly ready for implementation.
 
+### Re-Verify Date-Stamped Facts Before Acting
+
+Curator guidance requires volatile facts (counts, version numbers, file/line references, "no X is needed" claims) to carry an "as of `<sha/date>`" stamp — e.g. `"24 verbs as of \`289be45\`, 2026-08-04"` rather than a bare `"24 verbs"` (see `curator.md` → "Date-stamp volatile facts"). Treat that stamp as a **prompt to re-verify**, not a substitute for verification — a fact that was true "as of" curation time can already be stale by the time you implement, especially in a repo with several concurrently active worktrees.
+
+**Before acting on a stamped fact whose value is embedded directly in an acceptance criterion's output** — e.g. "CHANGELOG lists 13 new verbs", "no schema_version bump needed" — re-derive it against the current tree first: re-run the same grep/count/check the curator used, don't just eyeball the date and move on. This matters most when the action you're about to take **can't be undone** (a version bump, a tag push, a publish, an external API write): a stale count baked into a permanent artifact cannot be un-shipped afterward. This guards against exactly the failure in 2AMLogic/klayout-tools#342 — a correctly-curated verb count and a "no bump needed" claim both went stale within two days, ahead of an irrevocable PyPI publish.
+
+If re-verification finds the stamped fact has drifted, update the acceptance criterion / your PR description to match the current tree (and note the discrepancy) rather than silently completing the original wording.
+
 ## Checking Dependencies Before Claiming
 
 Before claiming a `loom:issue` issue, check if it has a **Dependencies** section.
