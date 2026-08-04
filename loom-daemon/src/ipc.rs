@@ -1550,6 +1550,17 @@ pub fn build_daemon_status(
                 .iter()
                 .map(|spec| spec.name.to_string())
                 .collect();
+        // This root's OWN resolved token pool (#5269) — the unanchored
+        // `resolve_tokens_dir(root)`, i.e. the exact resolution
+        // `token_ranking_refresh.rs`'s self-refresh loop already uses to
+        // decide which pool to keep fresh for this repo. Deliberately not
+        // `resolve_tokens_dir_anchored`, which is scoped to the daemon's own
+        // `fallback_root`/launch CWD, not this loop's `root` — the whole
+        // point of this per-repo field is to answer "is THIS repo's own pool
+        // fresh" regardless of which repo the daemon happened to start in.
+        let repo_token_pool_dir = crate::tokens_pool::paths::resolve_tokens_dir(root);
+        let (repo_ranking_present, repo_ranking_age_secs) =
+            crate::capacity::ranking_file_state(&repo_token_pool_dir);
         per_repo.push(crate::types::RepoStatus {
             root: root.clone(),
             priority: workspace_registry.priority_of(root),
@@ -1577,6 +1588,9 @@ pub fn build_daemon_status(
             role_runner_enabled,
             role_runner_roles,
             role_runner_on_idle_roles,
+            token_pool_dir: Some(repo_token_pool_dir),
+            ranking_present: repo_ranking_present,
+            ranking_age_secs: repo_ranking_age_secs,
         });
         in_flight.extend(live);
         unregistered_locked.extend(locked_unregistered.into_iter().map(|(issue, owner_pid)| {
@@ -5785,6 +5799,9 @@ exit 0
                 role_runner_enabled: true,
                 role_runner_roles: vec!["champion".to_string()],
                 role_runner_on_idle_roles: vec![],
+                token_pool_dir: Some(std::path::PathBuf::from("/repo/a/.loom/tokens")),
+                ranking_present: true,
+                ranking_age_secs: Some(120),
             }],
             credential_preflight: Some(test_credential_preflight()),
             draining: false,
@@ -6568,6 +6585,117 @@ exit 0
         assert_eq!(a.health_gate_verdict_at, None);
         assert_eq!(b.health_gate_verdict_at, None);
 
+        std::env::remove_var(REGISTRY_PATH_ENV);
+    }
+
+    /// Issue #5269: a daemon whose `fallback_root` (launch CWD) is repo A must
+    /// still report repo B's OWN `.ranking` freshness in `per_repo`, reading
+    /// repo B's own per-repo pool — NOT repo A's, and not whatever the
+    /// top-level `fallback_root`-anchored `token_pool_dir`/`capacity` fields
+    /// resolved to. This is the exact scope mismatch the issue reports: an
+    /// operator asking about repo B from a daemon anchored at repo A
+    /// previously got no answer about repo B's pool at all.
+    #[test]
+    #[serial_test::serial]
+    fn test_build_daemon_status_per_repo_ranking_reflects_each_repos_own_pool() {
+        use crate::main_health_gate::WorkspaceHealthStates;
+        use crate::workspace_registry::{normalize_path, WorkspaceRegistry, REGISTRY_PATH_ENV};
+
+        let (sr_a, dir_a, _rec_a) = setup_sweep_registry_in_tempdir();
+        let (sr_b, dir_b, _rec_b) = setup_sweep_registry_in_tempdir();
+        let root_a = dir_a.path().to_path_buf();
+        let root_b = dir_b.path().to_path_buf();
+
+        // Disable the shared machine-level pool fallback so each repo's own
+        // per-repo `.loom/tokens/` is the only pool `resolve_tokens_dir` can
+        // find for it — otherwise a repo with no per-repo pool would silently
+        // fall through to the host's real `~/.loom/tokens` (or a stale value
+        // left by another `#[serial]` test) instead of reporting "absent".
+        let prev_shared = std::env::var("LOOM_SHARED_TOKENS_DIR").ok();
+        std::env::set_var("LOOM_SHARED_TOKENS_DIR", "");
+
+        // A registry listing BOTH managed repos, exactly like the sibling
+        // multi-workspace test above.
+        let reg_path = dir_a.path().join("workspaces.json");
+        let mut reg = WorkspaceRegistry::default();
+        reg.add(&root_a, None).unwrap();
+        reg.add(&root_b, None).unwrap();
+        reg.save(&reg_path).unwrap();
+        std::env::set_var(REGISTRY_PATH_ENV, &reg_path);
+
+        let canon_a = normalize_path(&root_a);
+        let canon_b = normalize_path(&root_b);
+
+        // Repo A's own pool: present but STALE (mtime forced far in the past).
+        let tokens_a = canon_a.join(".loom").join("tokens");
+        std::fs::create_dir_all(&tokens_a).unwrap();
+        std::fs::write(tokens_a.join("acct-a.token"), "sk-ant-oat01-a").unwrap();
+        let ranking_a_path = tokens_a.join(".ranking");
+        std::fs::write(&ranking_a_path, "acct-a|available|0.1\n").unwrap();
+        let stale_mtime = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+        std::fs::File::options()
+            .write(true)
+            .open(&ranking_a_path)
+            .unwrap()
+            .set_modified(stale_mtime)
+            .unwrap();
+
+        // Repo B's own pool: present and FRESH.
+        let tokens_b = canon_b.join(".loom").join("tokens");
+        std::fs::create_dir_all(&tokens_b).unwrap();
+        std::fs::write(tokens_b.join("acct-b.token"), "sk-ant-oat01-b").unwrap();
+        std::fs::write(tokens_b.join(".ranking"), "acct-b|available|0.1\n").unwrap();
+
+        let pool = Arc::new(WorkspacePool::new(Arc::new(EventBus::new()), test_runtime_handle()));
+        pool.seed(canon_a.clone(), sr_a.clone());
+        pool.seed(canon_b.clone(), sr_b.clone());
+        let health = WorkspaceHealthStates::new();
+
+        // The daemon's own `fallback_root`/launch CWD is repo A.
+        let report = build_daemon_status(&pool, &health, &root_a, &test_credential_preflight());
+        assert_eq!(report.per_repo.len(), 2, "both managed repos are listed");
+
+        let a = report
+            .per_repo
+            .iter()
+            .find(|r| r.root == canon_a)
+            .expect("repo A present");
+        let b = report
+            .per_repo
+            .iter()
+            .find(|r| r.root == canon_b)
+            .expect("repo B present");
+
+        // Each repo's own resolved pool is its OWN per-repo directory, not the
+        // daemon's single anchored `token_pool_dir`.
+        assert_eq!(a.token_pool_dir.as_deref(), Some(tokens_a.as_path()));
+        assert_eq!(b.token_pool_dir.as_deref(), Some(tokens_b.as_path()));
+
+        // Repo A's own ranking is present but stale.
+        assert!(a.ranking_present, "repo A has its own .ranking");
+        assert!(
+            a.ranking_age_secs.unwrap_or(0) >= 7000,
+            "repo A's own ranking must read as ~2h old, got {:?}",
+            a.ranking_age_secs
+        );
+
+        // Repo B's own ranking is present and fresh — this is the exact
+        // scenario the bug report describes ("worker-1: 5h-stale machine
+        // pool" while the operator's own repo's self-refresh loop kept its
+        // OWN pool current): the per-repo report must reflect repo B's own
+        // freshness, independent of the daemon's `fallback_root`-anchored
+        // primary-workspace value.
+        assert!(b.ranking_present, "repo B has its own .ranking");
+        assert!(
+            b.ranking_age_secs.unwrap_or(u64::MAX) < 60,
+            "repo B's own ranking must read as fresh, got {:?}",
+            b.ranking_age_secs
+        );
+
+        match prev_shared {
+            Some(v) => std::env::set_var("LOOM_SHARED_TOKENS_DIR", v),
+            None => std::env::remove_var("LOOM_SHARED_TOKENS_DIR"),
+        }
         std::env::remove_var(REGISTRY_PATH_ENV);
     }
 

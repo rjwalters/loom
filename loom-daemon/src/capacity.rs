@@ -236,6 +236,32 @@ pub fn read_ranking(workspace_root: &Path) -> Option<RankingSnapshot> {
     read_ranking_at(&crate::tokens_pool::paths::resolve_tokens_dir(workspace_root))
 }
 
+/// `(present, age_secs)` for `<pool_dir>/.ranking` — whether the file exists
+/// and, when readable, how many seconds old its mtime is.
+///
+/// This is the single shared "is this pool's ranking present/stale" probe
+/// (Issue #5269): both the daemon's own per-repo status snapshot
+/// ([`crate::ipc::build_daemon_status`], which resolves each registered
+/// repo's *own* pool via [`crate::tokens_pool::paths::resolve_tokens_dir`])
+/// and the `loom-daemon health` CLI's single anchored-pool probe
+/// (`cli::health::ranking_state`) call this, so the two surfaces can never
+/// disagree about what "present" or "age" means for the same directory.
+/// Returns `(false, None)` when the file is missing or its metadata can't be
+/// read; a readable-but-unstattable mtime is `(true, None)`.
+#[must_use]
+pub fn ranking_file_state(pool_dir: &Path) -> (bool, Option<u64>) {
+    let path = pool_dir.join(".ranking");
+    let Ok(meta) = std::fs::metadata(&path) else {
+        return (false, None);
+    };
+    let age = meta
+        .modified()
+        .ok()
+        .and_then(|m| m.elapsed().ok())
+        .map(|d| d.as_secs());
+    (true, age)
+}
+
 // ============================================================================
 // Fresh-probe capacity (issue #3936)
 // ============================================================================

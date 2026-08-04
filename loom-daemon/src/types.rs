@@ -2056,6 +2056,31 @@ pub struct RepoStatus {
     /// vec).
     #[serde(default)]
     pub role_runner_on_idle_roles: Vec<String>,
+    /// This root's OWN resolved token-pool directory (Issue #5269) —
+    /// `tokens_pool::paths::resolve_tokens_dir(&root)`, the exact resolution
+    /// [`crate::token_ranking_refresh`]'s self-refresh loop already uses to
+    /// decide which pool to refresh for this repo. Deliberately **not** the
+    /// anchored/CWD-based resolution the top-level
+    /// [`DaemonStatusReport::token_pool_dir`] uses — that field answers "which
+    /// pool is the daemon's own primary workspace's", which for a multi-repo
+    /// daemon can be a different repo's pool entirely. `#[serde(default)]`
+    /// keeps pre-#5269 wire data compatible (an absent field parses as
+    /// `None`).
+    #[serde(default)]
+    pub token_pool_dir: Option<PathBuf>,
+    /// Whether this root's own resolved pool (`Self::token_pool_dir`) has a
+    /// `.ranking` file (Issue #5269) — same semantics as the top-level
+    /// [`DaemonStatusReport`]'s `health`/`capacity` staleness inputs, just
+    /// scoped to this repo's own pool instead of the daemon's anchored
+    /// primary workspace. `#[serde(default)]` keeps pre-#5269 wire data
+    /// compatible (an absent field parses as `false`).
+    #[serde(default)]
+    pub ranking_present: bool,
+    /// Age in seconds of this root's own `.ranking`, when readable (Issue
+    /// #5269). `#[serde(default)]` keeps pre-#5269 wire data compatible (an
+    /// absent field parses as `None`).
+    #[serde(default)]
+    pub ranking_age_secs: Option<u64>,
 }
 
 /// One active insta-crash quarantine (Issue #4215), as surfaced by
@@ -2953,6 +2978,9 @@ mod tests {
             role_runner_enabled: false,
             role_runner_roles: vec![],
             role_runner_on_idle_roles: vec![],
+            token_pool_dir: None,
+            ranking_present: false,
+            ranking_age_secs: None,
         }
     }
 

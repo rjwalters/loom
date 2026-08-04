@@ -1157,6 +1157,59 @@ pub fn assess_tokens(inputs: &HealthInputs) -> HealthSection {
         "{}/{} healthy ({} exhausted), {ranking_age}",
         cap.healthy_accounts, cap.total_accounts, cap.exhausted_accounts
     );
+
+    // Per-repo ranking staleness (#5269). `inputs.ranking_present`/
+    // `ranking_age_secs` above cover only the daemon's single
+    // `fallback_root`-anchored pool (`status.token_pool_dir`) — on a
+    // multi-repo daemon that can be a *different* repo's pool than the one an
+    // operator asking about a specific registered repo actually cares about.
+    // `status.per_repo` carries each registered repo's OWN resolved pool +
+    // staleness (`RepoStatus::token_pool_dir`/`ranking_present`/
+    // `ranking_age_secs`, populated via the unanchored
+    // `resolve_tokens_dir(&repo.root)` — the same resolution
+    // `token_ranking_refresh.rs`'s self-refresh loop uses), independent of
+    // the daemon's launch CWD. Grouped by (repo, own pool age) rather than by
+    // pool path — this is the answer to "is THIS repo's own pool fresh"
+    // regardless of whether it happens to share a directory with another
+    // registered repo's pool.
+    let per_repo_detail: Vec<serde_json::Value> = status
+        .per_repo
+        .iter()
+        .map(|r| {
+            let stale = r.ranking_present
+                && r.ranking_age_secs
+                    .is_some_and(|age| age > RANKING_STALE_SECS);
+            serde_json::json!({
+                "root": r.root,
+                "pool_path": r.token_pool_dir,
+                "ranking_present": r.ranking_present,
+                "ranking_age_secs": r.ranking_age_secs,
+                "stale": stale,
+            })
+        })
+        .collect();
+    let affected_repos: Vec<&crate::types::RepoStatus> = status
+        .per_repo
+        .iter()
+        .filter(|r| {
+            !r.ranking_present
+                || r.ranking_age_secs
+                    .is_some_and(|age| age > RANKING_STALE_SECS)
+        })
+        .collect();
+    if !affected_repos.is_empty() {
+        // Bounded summary line (unlike the full `per_repo` JSON detail below,
+        // which is always complete) — mirrors the roles section's
+        // `MAX_ROLES_SUMMARY_LINE_CHARS` rationale: an operator with many
+        // registered repos sharing one stale pool should see a short count in
+        // the human summary, not a repeated per-repo essay.
+        degraded.push(format!(
+            "{} of {} registered repo(s) have their OWN pool's .ranking stale/missing (see tokens.per_repo detail)",
+            affected_repos.len(),
+            status.per_repo.len()
+        ));
+    }
+
     let (verdict, summary) = if degraded.is_empty() {
         (Verdict::Green, base)
     } else {
@@ -1172,10 +1225,16 @@ pub fn assess_tokens(inputs: &HealthInputs) -> HealthSection {
             "exhausted": cap.exhausted_accounts,
             "token_axis_limit": cap.token_axis_limit,
             "token_bound": cap.token_bound,
+            // The single pool this section's headline numbers above are
+            // scoped to — the daemon's `fallback_root`-anchored primary
+            // workspace pool (#5269 AC2), NOT necessarily any particular
+            // registered repo's own pool. See `per_repo` for that.
+            "pool_path": status.token_pool_dir,
             "ranking_present": inputs.ranking_present,
             "ranking_age_secs": inputs.ranking_age_secs,
             "ranking_stale_threshold_secs": RANKING_STALE_SECS,
             "issues": degraded,
+            "per_repo": per_repo_detail,
         }),
     )
 }
@@ -2952,6 +3011,162 @@ mod tests {
         let section = assess_tokens(&inputs);
         assert_eq!(section.verdict, Verdict::Degraded);
         assert!(section.summary.contains("EMPTY token pool"));
+    }
+
+    /// Issue #5269: the machine-level `pool_path` this section's headline
+    /// numbers are scoped to is always named in the detail JSON, even when
+    /// everything is green — so `--json` consumers never have to guess which
+    /// directory the healthy verdict is about.
+    #[test]
+    fn tokens_detail_names_the_evaluated_pool_path() {
+        let mut inputs = healthy_inputs();
+        inputs.status.as_mut().unwrap().token_pool_dir =
+            Some(PathBuf::from("/repos/anvil/.loom/tokens"));
+        let section = assess_tokens(&inputs);
+        assert_eq!(section.detail["pool_path"], serde_json::json!("/repos/anvil/.loom/tokens"));
+    }
+
+    /// Issue #5269 (the reported scenario): the top-level `ranking_present`/
+    /// `ranking_age_secs`/verdict cover only the daemon's single
+    /// `fallback_root`-anchored pool — which can be fresh (or even absent, on
+    /// a machine-level daemon with no primary-workspace pool of its own)
+    /// while a DIFFERENT registered repo's own pool is stale. The `per_repo`
+    /// detail must still surface that repo's own staleness, and the overall
+    /// verdict must degrade for it, even though the top-level ranking inputs
+    /// alone would report Green.
+    #[test]
+    fn tokens_degraded_when_a_registered_repos_own_ranking_is_stale_even_if_the_anchored_pool_is_fresh(
+    ) {
+        let mut inputs = healthy_inputs();
+        // Top-level (anchored) pool: fresh — would be Green on its own.
+        assert!(inputs.ranking_present);
+        assert!(inputs.ranking_age_secs.unwrap() < RANKING_STALE_SECS);
+
+        let status = inputs.status.as_mut().unwrap();
+        status.per_repo = vec![
+            crate::types::RepoStatus {
+                root: PathBuf::from("/repos/loom"),
+                priority: crate::workspace_registry::default_priority(),
+                in_flight_count: 0,
+                health_gate_halted: false,
+                quarantined_issues: vec![],
+                health_gate_not_evaluated: false,
+                health_gate_not_evaluated_reason: None,
+                health_gate_enabled: None,
+                health_gate_verdict_at: None,
+                root_missing: false,
+                health_gate_deferred: false,
+                health_gate_deferred_reason: None,
+                health_gate_verdict_tier: None,
+                role_runner_enabled: false,
+                role_runner_roles: vec![],
+                role_runner_on_idle_roles: vec![],
+                // This repo's OWN pool: present but stale.
+                token_pool_dir: Some(PathBuf::from("/repos/loom/.loom/tokens")),
+                ranking_present: true,
+                ranking_age_secs: Some(RANKING_STALE_SECS + 3600),
+            },
+            crate::types::RepoStatus {
+                root: PathBuf::from("/repos/anvil"),
+                priority: crate::workspace_registry::default_priority(),
+                in_flight_count: 0,
+                health_gate_halted: false,
+                quarantined_issues: vec![],
+                health_gate_not_evaluated: false,
+                health_gate_not_evaluated_reason: None,
+                health_gate_enabled: None,
+                health_gate_verdict_at: None,
+                root_missing: false,
+                health_gate_deferred: false,
+                health_gate_deferred_reason: None,
+                health_gate_verdict_tier: None,
+                role_runner_enabled: false,
+                role_runner_roles: vec![],
+                role_runner_on_idle_roles: vec![],
+                // This repo's OWN pool: fresh.
+                token_pool_dir: Some(PathBuf::from("/repos/anvil/.loom/tokens")),
+                ranking_present: true,
+                ranking_age_secs: Some(30),
+            },
+        ];
+
+        let section = assess_tokens(&inputs);
+        assert_eq!(
+            section.verdict,
+            Verdict::Degraded,
+            "a stale per-repo ranking must degrade the section even though the \
+             anchored top-level pool is fresh"
+        );
+        assert!(
+            section.summary.contains("1 of 2 registered repo"),
+            "summary should name the affected count, got: {}",
+            section.summary
+        );
+        let per_repo = section.detail["per_repo"]
+            .as_array()
+            .expect("per_repo detail is an array");
+        assert_eq!(per_repo.len(), 2);
+        let loom_entry = per_repo
+            .iter()
+            .find(|r| r["root"] == "/repos/loom")
+            .expect("loom repo entry present");
+        assert_eq!(loom_entry["stale"], true);
+        assert_eq!(loom_entry["pool_path"], "/repos/loom/.loom/tokens");
+        let anvil_entry = per_repo
+            .iter()
+            .find(|r| r["root"] == "/repos/anvil")
+            .expect("anvil repo entry present");
+        assert_eq!(anvil_entry["stale"], false);
+    }
+
+    /// A registered repo with no `.ranking` of its own (never bootstrapped)
+    /// also counts as "affected" — distinct from, but reported alongside, the
+    /// stale-age case above.
+    #[test]
+    fn tokens_per_repo_missing_ranking_counts_as_affected() {
+        let mut inputs = healthy_inputs();
+        let status = inputs.status.as_mut().unwrap();
+        status.per_repo = vec![crate::types::RepoStatus {
+            root: PathBuf::from("/repos/never-bootstrapped"),
+            priority: crate::workspace_registry::default_priority(),
+            in_flight_count: 0,
+            health_gate_halted: false,
+            quarantined_issues: vec![],
+            health_gate_not_evaluated: false,
+            health_gate_not_evaluated_reason: None,
+            health_gate_enabled: None,
+            health_gate_verdict_at: None,
+            root_missing: false,
+            health_gate_deferred: false,
+            health_gate_deferred_reason: None,
+            health_gate_verdict_tier: None,
+            role_runner_enabled: false,
+            role_runner_roles: vec![],
+            role_runner_on_idle_roles: vec![],
+            token_pool_dir: Some(PathBuf::from("/repos/never-bootstrapped/.loom/tokens")),
+            ranking_present: false,
+            ranking_age_secs: None,
+        }];
+
+        let section = assess_tokens(&inputs);
+        assert_eq!(section.verdict, Verdict::Degraded);
+        assert!(section.summary.contains("1 of 1 registered repo"));
+        let entry = &section.detail["per_repo"][0];
+        assert_eq!(entry["ranking_present"], false);
+        assert_eq!(entry["stale"], false, "absent is reported distinctly from stale");
+    }
+
+    /// An empty `per_repo` (single-workspace daemon, no registry) must not
+    /// introduce a spurious per-repo note — byte-for-byte the pre-#5269
+    /// summary/verdict when nothing is registered.
+    #[test]
+    fn tokens_no_per_repo_note_when_registry_is_empty() {
+        let inputs = healthy_inputs();
+        assert!(inputs.status.as_ref().unwrap().per_repo.is_empty());
+        let section = assess_tokens(&inputs);
+        assert_eq!(section.verdict, Verdict::Green);
+        assert!(!section.summary.contains("registered repo"));
+        assert_eq!(section.detail["per_repo"], serde_json::json!([]));
     }
 
     // ===================================================================
