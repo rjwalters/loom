@@ -622,6 +622,55 @@ gh api repos/o/r/issues/1/comments -f body=@/tmp/review.md
 EOF
 echo done'
 
+# --- #5205: is_interpreter_opener() must recognize a PATH-QUALIFIED or
+# WRAPPED interpreter, not just the interpreter as the bare first token ------
+#
+# #5198's is_interpreter_opener() only matched the interpreter word when it
+# was the literal first token of the opener line, so any path-qualified
+# (`/bin/bash`, `./bash`, `/usr/bin/python3`) or wrapper-prefixed
+# (`env bash`, `command bash`, `exec bash`) invocation of the SAME
+# interpreter slipped past detection: its heredoc body got masked and the
+# live `gh api ... -f body=@path` inside it silently ALLOWed -- reopening the
+# exact #4523/#4601/#4685 evasion class #5198 closed. Widened (#5205) to
+# strip a leading env/command/exec/builtin wrapper (with its flags and
+# VAR=value assignments) and to match on the command word's path BASENAME.
+# Each of these must DENY, exactly like the bare-`bash` control at line ~599.
+assert_deny "#5205: Absolute-path interpreter '/bin/bash <<EOF ... EOF' still denies" \
+    '/bin/bash <<'"'"'EOF'"'"'
+gh api repos/o/r/issues/123/comments -f body=@/tmp/review.md
+EOF'
+
+assert_deny "#5205: env-wrapped interpreter 'env bash <<EOF ... EOF' still denies" \
+    'env bash <<'"'"'EOF'"'"'
+gh api repos/o/r/issues/123/comments -f body=@/tmp/review.md
+EOF'
+
+assert_deny "#5205: 'command' builtin prefix 'command bash <<EOF ... EOF' still denies" \
+    'command bash <<'"'"'EOF'"'"'
+gh api repos/o/r/issues/123/comments -f body=@/tmp/review.md
+EOF'
+
+assert_deny "#5205: Relative-path interpreter './bash <<EOF ... EOF' still denies" \
+    './bash <<'"'"'EOF'"'"'
+gh api repos/o/r/issues/123/comments -f body=@/tmp/review.md
+EOF'
+
+assert_deny "#5205: Absolute-path python interpreter '/usr/bin/python3 <<EOF ... EOF' still denies" \
+    '/usr/bin/python3 <<'"'"'EOF'"'"'
+gh api repos/o/r/issues/123/comments -f body=@/tmp/review.md
+EOF'
+
+# The widening must NOT regress #5181: a path-qualified command word that is
+# NOT an interpreter and merely quotes the phrase as inert prose to a file
+# sink stays ALLOWED (the wrapper/basename logic only ever recognizes MORE
+# interpreters, never masks less for a genuine non-interpreter sink).
+assert_allow "#5205/#5181: A heredoc body to '/bin/cat > file' (path-qualified non-interpreter) that merely quotes the phrase stays allowed" \
+    '/bin/cat > /tmp/report3.md <<'"'"'EOF'"'"'
+Example of the anti-pattern:
+gh api repos/o/r/issues/1/comments -f body=@/tmp/review.md
+EOF
+echo done'
+
 # --- #4685: the same literal-@ loss on the `edit` subcommand — real-world
 # evidence is issue #4608's body being corrupted to the literal string
 # `@/tmp/issue4608_body_new.txt`. The #4523/#4601 rules above are hard-anchored

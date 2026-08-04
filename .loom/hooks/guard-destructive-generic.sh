@@ -1629,12 +1629,55 @@ function mask_heredoc_bodies(s,   out, lines, nl, i, j, line, trimmed, body, del
 # `python3 <<EOF`, `eval <<EOF`, `source <<EOF`, `. <<EOF`) or the opener is
 # piped into one on the same line (`cat <<EOF | bash`). Deliberately a
 # whole-line, best-effort check (matching the "narrow / best-effort" style
-# of heredoc_delim_at() above), anchored so the interpreter name must start
-# a command segment (start of line, or right after `;`/`&`/`|`) rather than
-# matching an arbitrary substring -- e.g. `echo "installs bash" <<EOF` does
-# NOT match, since "bash" there is not itself a command word.
-function is_interpreter_opener(line) {
-    return (line ~ /(^|[;&|])[ \t]*(bash|sh|zsh|dash|ksh|python[0-9.]*|perl|ruby|node|nodejs|eval|source|\.)([ \t]|$)/)
+# of heredoc_delim_at() above): the interpreter must be the COMMAND WORD of
+# some segment of the line, not an arbitrary substring -- e.g.
+# `echo "installs bash" <<EOF` does NOT match, since "bash" there is a bare
+# argument, not the command word.
+#
+# Recognizing the command word robustly (#5205): the interpreter word is
+# matched against the path BASENAME of each segment command word, and any
+# leading `env`/`command`/`exec`/`builtin` wrapper (with its own flags and
+# `VAR=value` assignments) is stripped first -- none of those change what
+# actually executes. So a path-qualified or wrapped invocation of the same
+# interpreter (`/bin/bash <<EOF`, `env bash <<EOF`, `command bash <<EOF`,
+# `./bash <<EOF`, `/usr/bin/python3 <<EOF`) is caught too, closing the
+# evasion class where those forms slipped past the old first-token-only
+# regex and got their live bodies silently masked (i.e. ALLOWed).
+function _interp_basename(tok,   base) {
+    # Reduce a (possibly path-qualified) command word to its basename: the
+    # text after the last `/`. `/bin/bash` -> `bash`, `./bash` -> `bash`,
+    # `/usr/bin/python3` -> `python3`; a bare `bash` or `.` is unchanged.
+    base = tok
+    sub(/^.*\//, "", base)
+    return base
+}
+function is_interpreter_opener(line,   n, segs, i, seg, m, toks, j, base) {
+    # Split into command segments on ; & | (covers && and || too) so a piped
+    # or chained interpreter is caught in ANY position, e.g. `cat <<EOF | bash`.
+    n = split(line, segs, /[;&|]+/)
+    for (i = 1; i <= n; i++) {
+        seg = segs[i]
+        sub(/^[ \t]+/, "", seg)
+        m = split(seg, toks, /[ \t]+/)
+        if (m == 0) continue
+        # Strip leading command wrappers that do not change what runs:
+        # env / command / exec / builtin, each followed by its own -flags
+        # and (for env) VAR=value assignments, then the real command word.
+        j = 1
+        while (j <= m) {
+            if (toks[j] == "env" || toks[j] == "command" || toks[j] == "exec" || toks[j] == "builtin") {
+                j++
+                while (j <= m && (toks[j] ~ /^-/ || toks[j] ~ /^[A-Za-z_][A-Za-z0-9_]*=/)) j++
+                continue
+            }
+            break
+        }
+        if (j > m) continue
+        base = _interp_basename(toks[j])
+        if (base ~ /^(bash|sh|zsh|dash|ksh|python[0-9.]*|perl|ruby|node|nodejs|eval|source|\.)$/)
+            return 1
+    }
+    return 0
 }
 # Same closed-block detection as mask_heredoc_bodies(), but SKIPS masking
 # (leaves the body visible) for any block whose opener is interpreter-fed
