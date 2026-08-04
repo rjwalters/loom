@@ -1343,6 +1343,67 @@ function qsplit(s,   out, n, i, c, j, qc, ci, inner, SQ, DQ) {
 '
 
 # =============================================================================
+# CD-ARGUMENT TILDE / $HOME EXPANSION (#5315)
+#
+# The three `cd`-tracking blocks below (extract_write_targets, parse_force_ops,
+# resolve_stash_cwd) thread a `cd <dir> &&` prefix through the later segments of
+# a compound command by joining <dir> onto a tracked `curcwd`. That join is a
+# plain string concatenation with NO word expansion — so a `cd ~/GitHub/loom`
+# prefix was joined VERBATIM, embedding a literal `~` mid-path
+# (`.../loom/~/GitHub/loom/...`) and mis-resolving every later relative write /
+# force-op / stash target of that command (the false positive reported in
+# #5315). Only a leading `/` (already-absolute) was handled specially; a leading
+# `~` or `$HOME` fell through to the plain repo-relative join.
+#
+# expand_cd_arg() performs the SAME narrow, unambiguous slice of shell word
+# expansion the bash-side expand_leading_tilde() (#4382) already applies to
+# write TARGETS, but for the cd ARGUMENT and inside awk (which the write-target
+# helper runs too late to reach). `home` is the guard process's own $HOME,
+# passed in via `-v home=...` exactly like expand_leading_tilde() reads the
+# guard's process $HOME — a same-line `HOME=<x> cmd` prefix in the analyzed
+# command text can never redefine it. Handled here:
+#   ~            -> home
+#   ~/rest       -> home "/rest"
+#   $HOME        -> home
+#   $HOME/rest   -> home "/rest"
+# An expanded value starts with `/`, so the caller's existing `~ /^\//` branch
+# then treats it as an ABSOLUTE curcwd (correct — `cd ~` replaces the cwd, it is
+# not appended to it).
+#
+# Left DELIBERATELY UNEXPANDED (returned unchanged, so the caller joins it
+# repo-relative — the fail-CLOSED direction this file always biases toward, and
+# the same convention already used for `cd -` / a bare `cd`):
+#   ~user, ~user/rest   awk cannot safely resolve another user's home (no
+#                       getent/dscl without a shell-injection surface); leaving
+#                       it repo-relative keeps a genuinely-out-of-tree write
+#                       classified as in-tree (denied) rather than guessing it
+#                       safe. See the #5315 DECISION note at the head of
+#                       extract_write_targets() for the ~user/EPHEMERAL rationale.
+# Because qsplit() copies a quoted span VERBATIM (including its quote chars) and
+# leaves a literal backslash untouched, a token the real shell would NOT expand
+# does not start with a bare `~`/`$HOME` here and falls through unchanged —
+#   '~/x' / "~/x"  -> starts with a quote char (shell never tilde-expands it)
+#   \~/x           -> starts with a backslash (shell never tilde-expands it)
+#   foo~/x         -> tilde is not leading (not an expansion position)
+# mirroring expand_leading_tilde()'s quoted-tilde treatment exactly. If `home`
+# is empty (HOME unset) every case falls through unchanged, matching that
+# helper's `[[ -n "$HOME" ]]` guard.
+#
+# Shared as a single awk source string (like _QSPLIT_AWK) so the three
+# cd-tracking blocks cannot drift.
+# =============================================================================
+_CDEXPAND_AWK='
+function expand_cd_arg(tok, home) {
+    if (home == "") return tok
+    if (tok == "~") return home
+    if (tok == "$HOME") return home
+    if (substr(tok, 1, 2) == "~/") return home substr(tok, 2)
+    if (substr(tok, 1, 6) == "$HOME/") return home substr(tok, 6)
+    return tok
+}
+'
+
+# =============================================================================
 # QUOTE-AWARE REDIRECTION MASKING (#4245)
 #
 # extract_write_targets() (below) recognizes `>`/`>>` redirection by splitting
@@ -1901,7 +1962,7 @@ function mask_heredoc_bodies_selective(s,   out, lines, nl, i, j, line, trimmed,
 # tracking must not change its behavior (a still-empty <cpath> there continues
 # to fall back to the caller's raw $CWD, unchanged).
 parse_force_ops() {
-    printf '%s' "$1" | awk -v startcwd="$2" "$_QSPLIT_AWK"'
+    printf '%s' "$1" | awk -v startcwd="$2" -v home="$HOME" "$_QSPLIT_AWK""$_CDEXPAND_AWK"'
     BEGIN { SEP = sprintf("%c", 31); curcwd = startcwd }
                                        # SEP is non-whitespace so bash read
                                        # does not trim an empty cpath.
@@ -1921,10 +1982,11 @@ parse_force_ops() {
             # known limitation there) rather than guessed.
             if (toks[1] == "cd") {
                 if (m >= 2 && toks[2] != "" && toks[2] != "-") {
-                    if (toks[2] ~ /^\//) {
-                        curcwd = toks[2]
+                    cdarg = expand_cd_arg(toks[2], home)   # #5315
+                    if (cdarg ~ /^\//) {
+                        curcwd = cdarg
                     } else if (curcwd != "") {
-                        curcwd = curcwd "/" toks[2]
+                        curcwd = curcwd "/" cdarg
                     }
                 }
                 continue
@@ -2015,7 +2077,7 @@ parse_force_ops() {
 # false-NEGATIVE direction out of this issue's scope) — only a `cd <dir>`
 # prefix is.
 resolve_stash_cwd() {
-    printf '%s' "$1" | awk -v startcwd="$2" "$_QSPLIT_AWK"'
+    printf '%s' "$1" | awk -v startcwd="$2" -v home="$HOME" "$_QSPLIT_AWK""$_CDEXPAND_AWK"'
     BEGIN { curcwd = startcwd; found = 0 }
     {
         $0 = qsplit($0)   # quote-aware segmentation (#3755)
@@ -2032,10 +2094,11 @@ resolve_stash_cwd() {
             # compound command (mirrors parse_force_ops above).
             if (toks[1] == "cd") {
                 if (m >= 2 && toks[2] != "" && toks[2] != "-") {
-                    if (toks[2] ~ /^\//) {
-                        curcwd = toks[2]
+                    cdarg = expand_cd_arg(toks[2], home)   # #5315
+                    if (cdarg ~ /^\//) {
+                        curcwd = cdarg
                     } else if (curcwd != "") {
-                        curcwd = curcwd "/" toks[2]
+                        curcwd = curcwd "/" cdarg
                     }
                 }
                 continue
@@ -3091,9 +3154,50 @@ extract_rm_targets() {
 # positive resolves to, at worst, an extra deny on a target that isn't really
 # a write (safe direction) or a missed target (also safe — the fail-open
 # contract this file uses everywhere: ambiguity never widens a deny).
+#
+# The `cd <path>` tracking now tilde/$HOME-expands its argument via
+# expand_cd_arg() (#5315, defined with _QSPLIT_AWK above) — see that function's
+# header for the exact expansion rules and the quoted/escaped/`~user` fallbacks.
+#
+# --------------------------------------------------------------------------
+# #5315 DECISION (recorded, NOT implemented in this pass) — two deliberate
+# scope calls, documented here so a later reader does not mistake either for an
+# oversight:
+#
+#   1. `~user` / `~user/rest` in a tracked `cd` argument is left UNRESOLVED
+#      (joined repo-relative, i.e. classified in-tree / denied) rather than
+#      resolved to another account's home. awk cannot look a user's home up via
+#      getent/dscl without building a shell command string around an
+#      attacker-influenced username token — a command-injection surface this
+#      guard must not open. The write-TARGET side (expand_leading_tilde, #4382)
+#      can afford that lookup because it runs in bash with the username passed
+#      as a non-eval'd argv element; the cd-argument side runs inside awk and
+#      cannot. Leaving it repo-relative is the fail-CLOSED direction (a
+#      genuinely out-of-tree `cd ~alice && …` write stays denied, never
+#      silently allowed), matching this file's `cd -` / bare-`cd` convention.
+#      The overwhelmingly-common current-user forms (`~`, `~/rest`, `$HOME`,
+#      `$HOME/rest` — the actual #5315 report) ARE expanded.
+#
+#   2. EPHEMERAL_PATTERNS-class runtime state (the daemon's own gitignored
+#      files — `.loom/.daemon.pid` et al., authoritative list in
+#      loom-daemon/src/init/post_init.rs) is NOT exempted from Bash write
+#      confinement. As of this change no such exemption exists in either
+#      guard-destructive-generic.sh or guard-worktree-paths.sh; adding one is
+#      net-new policy, and CLAUDE.md documents an "ungated denial floor" that no
+#      toggle may bypass, so a gitignore-aware carve-out risks widening that
+#      floor into an allow if scoped even slightly too broadly. The concrete
+#      #5315 report was a false POSITIVE caused entirely by defect (1) above
+#      (the literal-`~` mis-join), which this change fixes directly — an
+#      operator maintaining `.loom/.daemon.pid` runs from the primary checkout,
+#      not a builder worktree, so once the path resolves correctly it is a
+#      routine main-checkout write and the confinement question is orthogonal.
+#      Deferred to a dedicated follow-up so the exemption's blast radius can be
+#      designed against the denial floor deliberately rather than bolted on
+#      alongside a canonicalization fix. See #5315 for the deferral rationale.
+# --------------------------------------------------------------------------
 # =============================================================================
 extract_write_targets() {
-    printf '%s' "$1" | awk -v startcwd="$2" "$_QSPLIT_AWK""$_MASKGT_AWK""$_MASKWS_AWK""$_MASKHEREDOC_AWK"'
+    printf '%s' "$1" | awk -v startcwd="$2" -v home="$HOME" "$_QSPLIT_AWK""$_CDEXPAND_AWK""$_MASKGT_AWK""$_MASKWS_AWK""$_MASKHEREDOC_AWK"'
     BEGIN {
         SEP = sprintf("%c", 31)
         curcwd = startcwd
@@ -3109,52 +3213,93 @@ extract_write_targets() {
     END {
         # Heredoc-body masking (#5000) runs BEFORE qsplit(): once a heredoc
         # body write-idiom-looking bytes (`>`, `;`, `tee`, ...) are replaced
-        # with inert placeholders, the per-line loop below -- which still
-        # resets mask_gt()/mask_ws() per SEGMENT, exactly as before -- has
-        # nothing dangerous-looking left to misread on those lines,
-        # regardless of that per-line reset. A real write-idiom byte OUTSIDE
-        # any recognized heredoc body, even later in the SAME multi-line
-        # command, is untouched and still flows through the unchanged
-        # pipeline below.
+        # with inert placeholders, nothing dangerous-looking is left to
+        # misread on those lines. A real write-idiom byte OUTSIDE any
+        # recognized heredoc body, even later in the SAME multi-line command,
+        # is untouched and still flows through the unchanged pipeline below.
         buf = mask_heredoc_bodies(buf)
         $0 = qsplit(buf)   # quote-aware segmentation (#3755)
+
+        # Whole-BUFFER quote-aware masking (#5157), not per-segment.
+        #
+        # mask_ws()/mask_gt() themselves track quote state one character at a
+        # time and never special-case "\n" -- an embedded newline inside an
+        # OPEN quoted span (e.g. a plain multi-line double-quoted string,
+        # `msg="line one\necho pwned > /main/checkout/f.sh\nline three"`, no
+        # heredoc involved at all) is simply copied through like any other
+        # byte while quote mode stays "on". qsplit() above already preserves
+        # such an embedded newline as part of the ONE atomic quoted span it
+        # copies verbatim (it finds the matching closing quote by index, not
+        # by line), so by construction every "\n" surviving in its output
+        # already sits OUTSIDE any then-open quote from the perspective of
+        # qsplit() itself -- but mask_ws() and mask_gt() do their own independent
+        # char-by-char quote tracking, and calling them per-SEGMENT (after
+        # `split($0, segs, "\n")`) resets that tracking to "unquoted" at every
+        # such newline, discarding the "still inside this quote" context a
+        # PRIOR segment established. A `>` sitting on the continuation line of
+        # an otherwise-inert multi-line double-quoted string is then
+        # misread as a live redirection operator, manufacturing a phantom
+        # write target for text that never reaches the shell as anything but
+        # quoted data (#5157). This is the direct multi-line analog of the
+        # single-line #4245 fix and the heredoc-body #5000 fix above --
+        # masking the WHOLE buffer once, before any "\n"-splitting happens,
+        # keeps quote state correctly threaded across every embedded newline,
+        # heredoc or not.
+        wbuf = mask_ws($0)
+        gbuf = mask_gt(wbuf)
         n = split($0, segs, "\n")
+        nw = split(wbuf, wsegs, "\n")
+        ng = split(gbuf, gsegs, "\n")
         for (i = 1; i <= n; i++) {
             seg = segs[i]
+            origlen = length(seg)
             sub(/^[ \t]+/, "", seg)
             sub(/^sudo[ \t]+/, "", seg)
             sub(/^[ \t]+/, "", seg)
             if (seg == "") continue
 
-            # Quote-aware whitespace masking (#4934): wseg is byte-for-byte
-            # identical to seg except a space/tab INSIDE a quoted span is
-            # replaced with a non-whitespace placeholder, so splitting on
-            # /[ \t]+/ never breaks a quoted argument (e.g. a quoted path
-            # containing a literal space) into more than one token. toks[]
-            # is then unmasked back to the real whitespace bytes so the
-            # target TEXT downstream is unchanged.
-            wseg = mask_ws(seg)
+            # wsegs[i]/gsegs[i] are byte-for-byte identical in LENGTH to the
+            # unstripped segs[i] (masking only ever substitutes one byte for
+            # one byte, never adds/removes any) -- `stripped` is the number of
+            # leading bytes the three sub() calls above just removed from the
+            # (unmasked) seg, so re-applying that same byte count via substr()
+            # keeps wseg/mseg positionally aligned with the stripped seg
+            # regardless of whether those leading bytes were literal
+            # whitespace or (on a mid-quote continuation segment) already
+            # masked to a placeholder byte.
+            stripped = origlen - length(seg)
+
+            # Quote-aware whitespace masking (#4934, threaded whole-buffer
+            # per #5157 above): wseg is byte-for-byte identical to seg except
+            # a space/tab INSIDE a quoted span is replaced with a
+            # non-whitespace placeholder, so splitting on /[ \t]+/ never
+            # breaks a quoted argument (e.g. a quoted path containing a
+            # literal space) into more than one token. toks[] is then
+            # unmasked back to the real whitespace bytes so the target TEXT
+            # downstream is unchanged.
+            wseg = substr(wsegs[i], stripped + 1)
             m = split(wseg, toks, /[ \t]+/)
             if (m < 1) continue
             for (j = 1; j <= m; j++) toks[j] = unmask_ws(toks[j])
 
-            # Quote-aware parallel tokenization (#4245): mseg is byte-for-byte
-            # identical to wseg except a `>` inside a quoted span is replaced
-            # with an SOH placeholder, so whitespace splitting yields the SAME
-            # token boundaries (mm == m always) but mtoks[] can be tested for
-            # a REAL (unquoted) redirection operator without ever matching a
-            # `>` that was only quoted data. Masking `>` on TOP of wseg (not
-            # seg) keeps the two passes token boundaries in lockstep, since
-            # mask_gt() only ever changes `>` bytes, never whitespace-ness.
-            mseg = mask_gt(wseg)
+            # Quote-aware parallel tokenization (#4245, threaded whole-buffer
+            # per #5157 above): mseg is byte-for-byte identical to wseg except
+            # a `>` inside a quoted span is replaced with an SOH placeholder,
+            # so whitespace splitting yields the SAME token boundaries
+            # (mm == m always) but mtoks[] can be tested for a REAL (unquoted)
+            # redirection operator without ever matching a `>` that was only
+            # quoted data. The actual target text is still read from the
+            # ORIGINAL toks[] (unmasked) once a real operator is confirmed.
+            mseg = substr(gsegs[i], stripped + 1)
             mm = split(mseg, mtoks, /[ \t]+/)
 
             if (toks[1] == "cd") {
                 if (m >= 2 && toks[2] != "" && toks[2] != "-") {
-                    if (toks[2] ~ /^\//) {
-                        curcwd = toks[2]
+                    cdarg = expand_cd_arg(toks[2], home)   # #5315
+                    if (cdarg ~ /^\//) {
+                        curcwd = cdarg
                     } else if (curcwd != "") {
-                        curcwd = curcwd "/" toks[2]
+                        curcwd = curcwd "/" cdarg
                     }
                 }
                 continue
