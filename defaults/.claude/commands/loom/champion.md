@@ -39,10 +39,15 @@ If found, **read and follow instructions in `.claude/commands/loom/champion-pr-m
 ### Priority 2: Quality Issues Ready to Promote
 
 If no PRs need merging, check for curated issues. Exclude `loom:evaluating` (a
-fresh claim from a concurrent Champion evaluation, #4954) so a batch doesn't
-re-discover work another pass already claimed — `title`/`body` feed
-`champion-issue-promo.md`'s body-hash idempotency check (the issue's aggregate
-`updatedAt` is deliberately NOT used for it, #4966):
+fresh claim from a concurrent Champion evaluation, #4954), as well as
+`loom:operator-only` and `loom:blocked` — both put an issue permanently outside
+Champion's promotion authority per `champion-issue-promo.md`'s "When NOT to
+Promote", so there is no reason to hand them into the evaluation pass at all
+(#5163). Excluding them here, not just in the evaluation step, so a batch
+doesn't re-discover work another pass already claimed or that is already
+terminal — `title`/`body` feed `champion-issue-promo.md`'s body-hash
+idempotency check (the issue's aggregate `updatedAt` is deliberately NOT used
+for it, #4966):
 
 ```bash
 gh issue list \
@@ -51,6 +56,8 @@ gh issue list \
   --limit=500 \
   --json number,title,body,labels,comments \
   --jq '.[] | select([.labels[].name] | contains(["loom:evaluating"]) | not) |
+  select([.labels[].name] | contains(["loom:operator-only"]) | not) |
+  select([.labels[].name] | contains(["loom:blocked"]) | not) |
   "#\(.number) \(.title)"'
 ```
 
@@ -59,7 +66,8 @@ If found, **read and follow instructions in `.claude/commands/loom/champion-issu
 ### Priority 3: Architect/Hermit/Auditor Proposals Ready to Promote
 
 If no curated issues need promotion, check for well-formed proposals. Same
-`loom:evaluating` exclusion and `title`/`body` fetch as Priority 2 above:
+`loom:evaluating`/`loom:operator-only`/`loom:blocked` exclusion and
+`title`/`body` fetch as Priority 2 above:
 
 ```bash
 # Check for Architect proposals
@@ -69,6 +77,8 @@ gh issue list \
   --limit=500 \
   --json number,title,body,labels,comments \
   --jq '.[] | select([.labels[].name] | contains(["loom:evaluating"]) | not) |
+  select([.labels[].name] | contains(["loom:operator-only"]) | not) |
+  select([.labels[].name] | contains(["loom:blocked"]) | not) |
   "#\(.number) \(.title) [architect]"'
 
 # Check for Hermit proposals
@@ -78,6 +88,8 @@ gh issue list \
   --limit=500 \
   --json number,title,body,labels,comments \
   --jq '.[] | select([.labels[].name] | contains(["loom:evaluating"]) | not) |
+  select([.labels[].name] | contains(["loom:operator-only"]) | not) |
+  select([.labels[].name] | contains(["loom:blocked"]) | not) |
   "#\(.number) \(.title) [hermit]"'
 
 # Check for Auditor bug reports
@@ -87,6 +99,8 @@ gh issue list \
   --limit=500 \
   --json number,title,body,labels,comments \
   --jq '.[] | select([.labels[].name] | contains(["loom:evaluating"]) | not) |
+  select([.labels[].name] | contains(["loom:operator-only"]) | not) |
+  select([.labels[].name] | contains(["loom:blocked"]) | not) |
   "#\(.number) \(.title) [auditor]"'
 ```
 
