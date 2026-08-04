@@ -3269,10 +3269,15 @@ ASK_PATTERNS=(
     # cloud_guard_enabled() so cloud-dev repos can opt down (LOOM_GUARD_CLOUD=0 /
     # guards.cloudCli:false).
 
-    # Service management
-    '(^|[;&|[:space:]])systemctl restart'
-    '(^|[;&|[:space:]])systemctl stop'
-    '(^|[;&|[:space:]])systemctl disable'
+    # NOTE: `systemctl restart`/`stop`/`disable` are NOT in this ungated array.
+    # They used to be plain '(^|[;&|[:space:]])systemctl <verb>' entries here,
+    # but that anchor cannot distinguish a real shell separator from a
+    # whitespace character sitting INSIDE a quoted string, so read-only
+    # introspection like `grep -n "...|systemctl restart|..." file` or
+    # `jq -c 'select(.pattern | contains("systemctl"))' log` false-asked on the
+    # phrase's leading space (#5214). They are handled by the segment-parsed,
+    # command-word-anchored systemctl_ask_reason() check below instead — see
+    # its own comment block for the fix rationale.
 
     # Kubernetes operations
     '(^|[;&|[:space:]])kubectl delete'
@@ -3296,6 +3301,73 @@ for pattern in "${ASK_PATTERNS[@]}"; do
         ask "Command requires confirmation: $COMMAND" "ask:$pattern"
     fi
 done
+
+# =============================================================================
+# SERVICE-MANAGEMENT ASK — systemctl restart/stop/disable, segment-parsed,
+# command-word anchored (#5214)
+#
+# These three verbs used to live in ASK_PATTERNS above as plain substring
+# patterns anchored only by '(^|[;&|[:space:]])' (#3756) — a boundary that
+# cannot distinguish a real shell separator from a whitespace character sitting
+# INSIDE a quoted string literal. So a phrase like `systemctl restart` merely
+# being quoted as SEARCH TEXT (a grep pattern, a jq filter, prose) still matched
+# on its leading space, even though no such command was ever invoked:
+#   grep -n "idle\|systemctl restart\|systemd\|relaunch\|--idle-shutdown" f.sh
+#   jq -c 'select(.pattern | contains("systemctl"))' guard-decisions.log
+#
+# Mirrors lifecycle_or_cloud_reason()'s fix for the analogous halt/reboot/
+# az-delete false positive: segment-parse the command with qsplit() (quote-aware,
+# #3755) instead of scanning raw substrings, strip a leading sudo/env wrapper
+# per segment, and ask ONLY when a segment's actual command word is `systemctl`
+# AND its very next token is restart/stop/disable. A quoted `|` inside
+# `grep`/`jq` arguments (no `$(`/backtick) is inert to qsplit(), so both example
+# commands above stay a single `grep`/`jq` segment — command word never
+# resolves to `systemctl` — and no longer false-ask. A genuine invocation
+# (bare, after `;`/`&&`/`|`, or with a later quoted argument such as
+# `systemctl restart "my service"`) still asks, since toks[1]/toks[2] are
+# unaffected by trailing quoted content.
+#
+# Scoped narrowly to this one "Service management" ASK_PATTERNS block per
+# #5214 — #5157/#5158 describe the same false-positive CLASS for other
+# patterns but were judged too broad a fix to land autonomously; this is not
+# an attempt at a general-purpose fix for the whole ASK_PATTERNS family.
+# =============================================================================
+systemctl_ask_reason() {
+    printf '%s' "$1" | awk "$_QSPLIT_AWK"'
+    {
+        $0 = qsplit($0)   # quote-aware segmentation (#3755)
+        n = split($0, segs, "\n")
+        for (i = 1; i <= n; i++) {
+            seg = segs[i]
+            sub(/^[ \t]+/, "", seg)
+            sub(/^sudo[ \t]+/, "", seg)
+            # Strip a leading `env` wrapper + its flags/assignments, mirroring
+            # lifecycle_or_cloud_reason() (#3586), so `env FOO=bar systemctl
+            # restart x` still resolves its command word to `systemctl`.
+            if (sub(/^env([ \t]+|$)/, "", seg)) {
+                sub(/^[ \t]+/, "", seg)
+                stripped = 1
+                while (stripped) {
+                    stripped = 0
+                    if (sub(/^-u[ \t]+[^ \t]+([ \t]+|$)/, "", seg)) { stripped = 1; continue }
+                    if (sub(/^-i([ \t]+|$)/, "", seg))              { stripped = 1; continue }
+                    if (sub(/^--([ \t]+|$)/, "", seg))              { break }
+                    if (sub(/^[A-Za-z_][A-Za-z0-9_]*=[^ \t]*([ \t]+|$)/, "", seg)) { stripped = 1; continue }
+                }
+            }
+            sub(/^[ \t]+/, "", seg)
+            m = split(seg, toks, /[ \t]+/)
+            if (m < 2) continue
+            if (toks[1] == "systemctl" && (toks[2] == "restart" || toks[2] == "stop" || toks[2] == "disable")) {
+                print "systemctl " toks[2]
+            }
+        }
+    }'
+}
+_SYSTEMCTL_ASK=$(systemctl_ask_reason "$COMMAND_NO_COMMENT" | head -1)
+if [[ -n "$_SYSTEMCTL_ASK" ]]; then
+    ask "Command requires confirmation: $COMMAND" "ask:$_SYSTEMCTL_ASK"
+fi
 
 # =============================================================================
 # REVERSIBLE-GITHUB ASK patterns — gated by the reversible-gh guard toggle (#3757)

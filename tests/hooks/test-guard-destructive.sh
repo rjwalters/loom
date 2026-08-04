@@ -947,6 +947,35 @@ assert_ask "Ask for systemctl stop" \
 assert_ask "Ask for systemctl disable" \
     "systemctl disable sshd"
 
+# #5214: segment-parsed, command-word-anchored systemctl ask regression checks.
+# A real invocation still asks regardless of prefix/separator/trailing quoting.
+assert_ask "Ask for sudo systemctl restart (#5214)" \
+    "sudo systemctl restart nginx"
+
+assert_ask "Ask for systemctl restart after && separator (#5214)" \
+    "echo hi && systemctl restart nginx"
+
+assert_ask "Ask for systemctl stop after ; separator (#5214)" \
+    "foo; systemctl stop apache2"
+
+assert_ask "Ask for systemctl disable after | separator (#5214)" \
+    "foo | systemctl disable sshd"
+
+assert_ask "Ask for systemctl restart with a later quoted argument (#5214)" \
+    'systemctl restart "my service"'
+
+assert_ask "Ask for env-wrapped systemctl restart (#5214)" \
+    "env FOO=bar systemctl restart nginx"
+
+# #5214: `systemctl restart`/`stop`/`disable` merely appearing as quoted SEARCH
+# TEXT inside a grep/jq argument (not an actual invocation) must not ask. These
+# are the exact two commands from the issue report.
+assert_allow "Allow grep introspection quoting 'systemctl restart' (#5214)" \
+    'grep -n "idle\|systemctl restart\|systemd\|relaunch\|--idle-shutdown" ./defaults/scripts/cli/loom-daemon-update.sh'
+
+assert_allow "Allow jq filter quoting 'systemctl' (#5214)" \
+    "jq -c 'select(.pattern | contains(\"systemctl\"))' .loom/logs/guard-decisions.log"
+
 assert_ask "Ask for kubectl delete" \
     "kubectl delete pod my-pod"
 
