@@ -379,8 +379,13 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: loom-daemon-${{ matrix.target }}
+          # Mirror the "Upload release assets" file list above, including the
+          # `.pem` glob (#5174): a keyless-signed Linux artifact needs its
+          # signing certificate to verify, and a manual backfill run onto an
+          # existing release can't complete without it.
           path: |
             dist/loom-daemon-${{ matrix.target }}
             dist/loom-daemon-${{ matrix.target }}.sha256
             dist/loom-daemon-${{ matrix.target }}*.sig
+            dist/loom-daemon-${{ matrix.target }}*.pem
           retention-days: 7
