@@ -159,6 +159,7 @@ pub mod health_monitor;
 pub mod host_breaker;
 pub mod idle_exit;
 pub mod init;
+pub mod install_self_check;
 pub mod ipc;
 pub mod issue_creation_mutex;
 pub mod launchd_env_drift;

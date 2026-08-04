@@ -3902,6 +3902,84 @@ routinely run long jobs by hand in a finished issue's worktree, raise
 Linux-only (it needs `/proc`); on other hosts the pass is a no-op. See
 `loom-daemon/src/orphan_process_reaper.rs`.
 
+### Install/host invariant self-check (#5035)
+
+**The problem.** On 2026-08-03 a single manual cross-host check turned up **nine**
+distinct install/host drift conditions — an empty `@modelcontextprotocol/sdk`
+under `mcp-loom/node_modules` (which produced zero work for hours, #5016),
+`.loom/runtimes/` absent in seven managed clones (#5002), a stale token
+`.ranking` driving the wrong concurrency cap, and more. Every one is
+mechanically checkable and most are mechanically repairable, yet Loom detected
+some and acted on **none** — they were all found by a human asking. This loop is
+the daemon verifying the invariants its own operation depends on.
+
+**What it does.** On a cadence (default 30 minutes) the daemon walks every
+registered workspace and, for each, checks a named set of install/host
+invariants. Per the repo's repair-over-gate stance it **repairs what is
+mechanically safe and idempotent, and files one deduped issue per
+non-repairable / repair-failed condition** — but only when repair mode is
+explicitly enabled (see below).
+
+**The invariant set is single-sourced in code.** The authoritative list is
+`Invariant::ALL` in `loom-daemon/src/install_self_check.rs` — this doc
+deliberately does not re-enumerate the per-invariant check details, so the code
+and the docs cannot drift (an acceptance criterion of #5035). This increment
+covers the three conditions with confirmed live-outage / wrong-behavior
+consequences on 2026-08-03:
+
+- **`mcp-bundle-health`** (#1 / #5016) — `dist/index.js` present, and
+  `node_modules` complete (no empty `@modelcontextprotocol/sdk`) when a lockfile
+  exists. Repair: `npm ci && npm run build` (npm resolved explicitly — PATH
+  hazards, #4875 — and **skipped under a live sweep**, which could pull the rug
+  on an in-flight MCP session).
+- **`runtimes-present`** (#4 / #5002) — every configured runtime has a populated
+  `.loom/runtimes/<runtime>.json`. Repair: an idempotent copy-converge from
+  `defaults/runtimes/` (byte-for-byte no-op when current, precedent:
+  `update-gitignore` #4280).
+- **`token-ranking-fresh`** (#5) — the token-pool `.ranking` is present and
+  younger than the staleness threshold. Repair: re-probe via `tokens check
+  --ranking` (the same mechanism the token-ranking-refresh loop uses).
+
+The remaining six conditions (binary freshness, sidecar reachability, telemetry
+identity, sweep liveness, pid file, stale repo-local `.mcp.json`) are a future
+increment — adding one is a matter of extending `Invariant::ALL` plus one
+check/repair arm each.
+
+**Report-only by default, and default-off overall.** Unlike the default-on
+reaper / token-ranking-refresh loops, this loop is **default-off** (FLAGS-OFF).
+Even once enabled it runs **report-only** by default — it observes and logs
+without touching anything, so the check can be trusted before it is allowed to
+act. Repair (which also files issues for what it cannot repair) is a second,
+separate opt-in. Filing exactly one issue per condition (deduped on a hidden
+`<!-- loom:install-self-check:<id> -->` marker) is what avoids the
+duplicate-comment stacking failure mode (#4736).
+
+**It cannot wedge dispatch.** The checks are pure filesystem reads; every
+subprocess repair is timeout-guarded; the pass runs on a blocking thread and
+holds no lock a sweep needs.
+
+```json
+{
+  "autonomous": {
+    "installSelfCheck": {
+      "enabled": false,
+      "intervalSecs": 1800,
+      "repair": false,
+      "tokenRankingMaxAgeSecs": 3600
+    }
+  }
+}
+```
+
+| Env var | Config key | Precedence | Default |
+|---------|-----------|------------|---------|
+| `LOOM_INSTALL_SELF_CHECK` | `autonomous.installSelfCheck.enabled` | env > config > default | `false` (off) |
+| `LOOM_INSTALL_SELF_CHECK_INTERVAL_SECS` | `autonomous.installSelfCheck.intervalSecs` | env > config > default | `1800` (30 min) |
+| `LOOM_INSTALL_SELF_CHECK_REPAIR` | `autonomous.installSelfCheck.repair` | env > config > default | `false` (report-only) |
+| `LOOM_INSTALL_SELF_CHECK_RANKING_MAX_AGE_SECS` | `autonomous.installSelfCheck.tokenRankingMaxAgeSecs` | env > config > default | `3600` (1 h) |
+
+See `loom-daemon/src/install_self_check.rs`.
+
 ### Primary-checkout reaper (#5268)
 
 **The problem.** The merged-PR worktree reaper above and `loom-daemon clean`
