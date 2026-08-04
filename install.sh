@@ -11,7 +11,12 @@
 #                              when the target already has Loom installed -- without
 #                              it, non-interactive runs stop and ask you to inventory
 #                              customizations first (interactive runs still get a
-#                              y/N prompt instead).
+#                              y/N prompt instead). If you only want to bring an
+#                              existing install's surfaces up to date -- not replace
+#                              the payload -- use the non-destructive
+#                              .loom/scripts/resync-installed.sh in the target repo
+#                              instead; --confirm-reinstall uninstalls before
+#                              reinstalling.
 #   --allow-non-main-source    Permit installing from a non-main / detached-HEAD Loom source
 #                              (forwarded to scripts/install-loom.sh)
 #   --allow-stale-target       Permit installing over a target whose Loom is newer/stale
@@ -687,7 +692,12 @@ while [[ "${1:-}" == -* ]]; do
       echo "                             when the target already has Loom installed -- without"
       echo "                             it, non-interactive runs stop and ask you to inventory"
       echo "                             customizations first (interactive runs still get a"
-      echo "                             y/N prompt instead)."
+      echo "                             y/N prompt instead). If you only want to bring an"
+      echo "                             existing install's surfaces up to date -- not replace"
+      echo "                             the payload -- use the non-destructive"
+      echo "                             .loom/scripts/resync-installed.sh in the target repo"
+      echo "                             instead; --confirm-reinstall uninstalls before"
+      echo "                             reinstalling."
       echo "  --allow-non-main-source    Permit installing from a non-main / detached-HEAD"
       echo "                             Loom source (forwarded to scripts/install-loom.sh)"
       echo "  --allow-stale-target       Permit installing over a newer/stale target"
@@ -1020,7 +1030,7 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
     # legacy) install now MUST pass --confirm-reinstall explicitly -- it
     # cannot silently cross this boundary just because it also passed
     # --quick/--yes/--full.
-    error "Existing Loom installation detected at $TARGET_PATH/.loom -- refusing to run a non-interactive reinstall without explicit acknowledgement.\n       Reinstalling uninstalls the existing Loom payload before writing the new version; inventory and back up any project-owned Loom hooks, scripts, and agent configuration first.\n       Re-run with --confirm-reinstall once you have done so, or omit --quick/--yes/--full to get an interactive y/N prompt instead."
+    error "Existing Loom installation detected at $TARGET_PATH/.loom -- refusing to run a non-interactive reinstall without explicit acknowledgement.\n       Reinstalling uninstalls the existing Loom payload before writing the new version; inventory and back up any project-owned Loom hooks, scripts, and agent configuration first.\n       If you only want to bring the existing install up to date -- not replace it -- run the non-destructive '$TARGET_PATH/.loom/scripts/resync-installed.sh' instead; it copies forward the latest hooks/scripts/roles/docs without uninstalling anything.\n       Re-run with --confirm-reinstall once you have done so, or omit --quick/--yes/--full to get an interactive y/N prompt instead."
   fi
 
   # Issue #4888: the chained uninstall below (`uninstall-loom.sh --yes --local`)
