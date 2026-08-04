@@ -540,9 +540,16 @@ fi
 echo "Test group 12c: absent daemon binary -> loud warning, apply still exits 0 (#4280)"
 REPO="$(make_fixture)"
 # Force the resolver to find nothing: no LOOM_DAEMON_BIN, no PATH loom-daemon,
-# no build-output under the fixture's SOURCE_ROOT (the fixture repo).
-OUT="$(cd "$REPO" && env -u LOOM_DAEMON_BIN PATH="/usr/bin:/bin" bash "$SCRIPT" 2>&1)"
+# no build-output under the fixture's SOURCE_ROOT (the fixture repo), and no
+# machine-level install fallback (step 4 of loom_locate_daemon_bin) -- on a
+# host with a genuine machine-level Loom install, leaving $HOME/
+# LOOM_DAEMON_BIN_DIR untouched would let that step resolve the real binary
+# and defeat this fixture (#5183).
+NO_BIN_HOME="$(mktemp -d)"
+OUT="$(cd "$REPO" && env -u LOOM_DAEMON_BIN PATH="/usr/bin:/bin" HOME="$NO_BIN_HOME" \
+    LOOM_DAEMON_BIN_DIR="/nonexistent" bash "$SCRIPT" 2>&1)"
 RC=$?
+rm -rf "$NO_BIN_HOME"
 if [[ $RC -eq 0 ]]; then
     pass "(#4280) apply still exits 0 when no daemon binary resolves"
 else
