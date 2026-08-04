@@ -9,7 +9,7 @@ as `.loom/docs/`).
 
 | Path | Contents |
 |------|----------|
-| [`adr/`](adr/) | Architecture Decision Records (0001–0013) plus a [template](adr/template.md). Start at the [ADR index](adr/README.md). |
+| [`adr/`](adr/) | Architecture Decision Records (0001–0014) plus a [template](adr/template.md). Start at the [ADR index](adr/README.md). |
 | [`api/`](api/) | API surface reference. |
 | [`design/`](design/) | Design notes for specific subsystems — config resolution tiers, the label state machine, the supervised restart primitive, Architect/Hermit cadence. |
 | [`guides/`](guides/) | How-to guides: getting started, quickstart tutorial, development, dev workflow, git workflow, testing, code quality, CI/CD setup, CLI reference, daemon dev mode, fork drift, troubleshooting, styling, TypeScript conventions, common tasks. |
