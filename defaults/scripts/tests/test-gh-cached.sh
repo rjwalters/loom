@@ -395,6 +395,16 @@ if command -v git >/dev/null 2>&1; then
     echo '[{"number":2222,"labels":["loom:review-requested"]}]' > "$STATE_DIR/pr-list.json"
     outB=$(ghc_cwd "$REPO_B_DIR" pr list --label "loom:review-requested" --state open --limit 500)
     assert_eq "2" "$(call_count)" "two distinct real git toplevels issuing the same 'gh' args both hit the real gh (default git-based resolution, not just the override)"
+    case "$outA" in
+      *1111*) sawA="yes" ;;
+      *) sawA="no" ;;
+    esac
+    assert_eq "yes" "$sawA" "repo A (a distinct real git toplevel) reads its own PR #1111 from the real gh"
+    case "$outB" in
+      *2222*) sawB="yes" ;;
+      *) sawB="no" ;;
+    esac
+    assert_eq "yes" "$sawB" "repo B (a distinct real git toplevel) reads its own PR #2222, not repo A's cached response"
     case "$outB" in
       *1111*) leaked2="yes" ;;
       *) leaked2="no" ;;
