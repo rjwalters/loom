@@ -3681,6 +3681,52 @@ assert_ask_env "stash-scope: LOOM_GUARD_STASH_SCOPE=1 overrides config-off -> as
 assert_allow "stash-scope: git status alone still allowed (read-only fast path unaffected)" \
     "git status" "$ST_REPO"
 
+# --- Ask-tier positional-argument masking false-positive regressions (#5235) ----
+#
+# COMMAND_ASK_SCAN (which every ASK_PATTERNS entry, including
+# stash-scope:main-checkout, matches against) used to have NO positional-
+# argument masking at all -- strip_literal_text() is keyed only on a fixed
+# set of named flags (--body/-m/--title/--notes/--comment), so a script with
+# a purely POSITIONAL signature (no flags) never triggered it. This is the
+# same class of bug #5155/#5160 already fixed for guard-loom-workflow.sh's
+# gh-pr-merge-redirect scan; mask_ask_positional_args() (issue #5235) closes
+# the analogous gap here for check-duplicate.sh. Reuses ST_REPO (main
+# checkout cwd) so `git stash pop/drop/clear` quoted as inert prose
+# exercises the real stash-scope:main-checkout ask this bug used to
+# false-trigger.
+
+assert_allow "ask-tier (#5235): check-duplicate.sh positional TITLE/DESCRIPTION quoting 'git stash pop' as inert prose no longer asks" \
+    './.loom/scripts/check-duplicate.sh "Guard false positive: stash-scope redirect" "quotes git stash pop as inert text, not a live invocation"' "$ST_REPO"
+
+# Deliberate scope decision (see mask_ask_positional_args()'s header comment
+# in guard-destructive-generic.sh): grep/rg are NOT in this ask-tier
+# allowlist, unlike guard-loom-workflow.sh's #5155/#5160 fix -- COMMAND_ASK_SCAN
+# also feeds the SQL DDL/DML check, which intentionally still scans a grep
+# invocation's own quoted search pattern for a literal DDL phrase once off
+# the read-only fast path (see the "Fast path security"/"Fast path off" test
+# groups above). Piped to `cat` (same disqualifier the SQL-DDL fast-path
+# tests above use) so this actually reaches the ask-tier scan instead of
+# short-circuiting via the #3687 read-only fast path. So a grep search
+# quoting the ask-phrase as prose still asks here -- this is the documented,
+# deliberately narrower scope, not a miss.
+assert_ask "ask-tier (#5235): grep -n search whose pattern quotes 'git stash pop' mid-sentence still asks (grep deliberately not allowlisted, see SQL-DDL conflict)" \
+    'grep -n "this example mentions git stash pop mid-sentence" defaults/hooks/guard-destructive-generic.sh | cat' "$ST_REPO"
+
+# Regression guard: masking a matched positional span must not blind the
+# ask-tier scan to a SECOND, REAL invocation elsewhere on the same command
+# line -- masking only narrows what THIS check misses inside the matched
+# check-duplicate.sh argument, it never widens what it misses outside that
+# span.
+assert_ask_reason_matches "ask-tier (#5235): still asks on a REAL git stash pop chained after a masked check-duplicate.sh call" \
+    './.loom/scripts/check-duplicate.sh "title" "this example mentions git stash pop mid-sentence" && git stash pop' \
+    "MAIN checkout" "$ST_REPO"
+
+# Regression guard: a command NOT in the positional-arg allowlist (echo) must
+# leave the phrase fully visible -- the allowlist narrows, it never widens.
+assert_ask_reason_matches "ask-tier (#5235): still asks when phrase is quoted in an echo argument (echo not allowlisted)" \
+    'echo "this example mentions git stash pop mid-sentence" | bash' \
+    "MAIN checkout" "$ST_REPO"
+
 rm -rf "$ST_REPO" "$ST_REPO_OFF"
 
 echo ""

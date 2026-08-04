@@ -2155,6 +2155,114 @@ strip_literal_text() {
     }'
 }
 
+# Mask quoted POSITIONAL arguments (no preceding flag name) to a small
+# allowlist of known non-executing commands/scripts (issue #5235, the
+# ask-tier analog of the #5155/#5160 fix). strip_literal_text() above only
+# recognizes text following a named flag (--body/-m/--title/--notes/
+# --comment); it has no effect on a script whose free-text arguments are
+# purely positional, e.g. `./.loom/scripts/check-duplicate.sh "TITLE"
+# "DESCRIPTION"`. check-duplicate.sh never EXECUTES a positional argument —
+# it only reads it as dedup text — so masking a quoted argument immediately
+# following it (optionally after short flags, e.g.
+# `check-duplicate.sh --include-merged-prs "..."`) can never blind the
+# ASK_PATTERNS scan (or any other COMMAND_ASK_SCAN consumer, e.g.
+# stash-scope:main-checkout / stash-scope:worktree-collision) to a real
+# invocation. Deliberately narrow allowlist, same "deliberately narrow"
+# convention documented above strip_literal_text()'s
+# mask_flag_cat_heredocs(): a command that WRAPS the phrase and then
+# executes it — `sh -c "git stash pop"`, `bash -c '...'`, `eval "..."` — is
+# NOT in this allowlist and stays fully visible to every ASK_PATTERNS entry,
+# exactly as before.
+#
+# DELIBERATELY EXCLUDES grep/egrep/fgrep/rg, unlike guard-loom-workflow.sh's
+# mask_command_positional_args() (#5155/#5160) which this function is
+# otherwise modeled on. In THIS file, COMMAND_ASK_SCAN also feeds the SQL
+# DDL/DML check (SQL_DDL_PATTERN, below) — which, once a command is
+# disqualified from (or has opted out of) the #3687 read-only fast path,
+# intentionally scans a `grep <pattern> <file>` invocation's own quoted
+# positional pattern for a literal DDL phrase like "DROP TABLE" and denies,
+# by design (see the "Fast path security" / "Fast path off" test groups in
+# tests/hooks/test-guard-destructive.sh). Adding grep/rg to this allowlist
+# was tried and directly regressed those tests: masking grep's own quoted
+# argument blinded the full-path SQL-DDL scan to text it is specifically
+# tested to still catch. check-duplicate.sh has no such competing consumer
+# of its raw argument text anywhere in this file, so it stays the only
+# entry. Extend this allowlist only for another read-only positional-arg
+# consumer with NO conflicting raw-text scan elsewhere in this file.
+#
+# This is an intentional NEAR-DUPLICATE of guard-loom-workflow.sh's own
+# mask_command_positional_args() (issue #5155/#5160) — kept as a SEPARATE
+# function in this file, same convention as strip_literal_text() above being
+# a separate copy from that file's strip_literal_text(): the two guards'
+# decision-time masking must never be coupled, so a future fix/tuning of one
+# cannot silently change the other's behavior.
+#
+# Masks EVERY quoted argument that directly, consecutively follows the
+# command+flags (separated only by whitespace) — not just the first — so
+# multi-positional-arg scripts like check-duplicate.sh's `TITLE DESCRIPTION`
+# signature get both arguments masked. Masking stops at the first token that
+# is not a quoted string (a bare filename, `&&`, `|`, etc.), leaving anything
+# after that boundary — including a real ask-triggering invocation chained
+# onto the same line — fully visible.
+mask_ask_positional_args() {
+    printf '%s' "$1" | awk '
+    BEGIN {
+        SQ = sprintf("%c", 39)
+        DQ = sprintf("%c", 34)
+        # Command-name allowlist: known non-executing commands/scripts whose
+        # positional string arguments are search/dedup text, never live shell
+        # syntax. grep/egrep/fgrep/rg are deliberately NOT here — see the
+        # SQL-DDL conflict documented in the function header comment above.
+        # Extend only when another read-only positional-arg consumer causes a
+        # real false ask AND has no competing raw-text consumer elsewhere in
+        # this file (see #5235, mirroring #5155).
+        cmdre = "(\\./\\.loom/scripts/check-duplicate\\.sh)"
+        # Zero or more short/long flags between the command name and the
+        # first quoted positional argument (e.g.
+        # `check-duplicate.sh --include-merged-prs --issue 5235`).
+        flagre = "([ \t]+-[A-Za-z0-9_-]+)*"
+        anchor = "(^|[ \t\n;&|`(])" cmdre flagre "[ \t]+"
+        buf = ""
+    }
+    { buf = buf (NR > 1 ? "\n" : "") $0 }
+    END {
+        s = buf
+        out = ""
+        while (match(s, anchor)) {
+            pre     = substr(s, 1, RSTART - 1)
+            matched = substr(s, RSTART, RLENGTH)
+            rest    = substr(s, RSTART + RLENGTH)
+            out = out pre matched
+            # Mask every consecutive quoted positional argument immediately
+            # following the anchor (whitespace-separated). Stops at the first
+            # non-quote-starting token, so anything after the argument list
+            # (a pipe, &&, an unrelated command) is left fully visible.
+            while (1) {
+                qc = substr(rest, 1, 1)
+                if (qc != DQ && qc != SQ) break
+                endpos = 0
+                for (i = 2; i <= length(rest); i++) {
+                    if (substr(rest, i, 1) == qc) { endpos = i; break }
+                }
+                if (endpos == 0) break
+                inner = substr(rest, 2, endpos - 2)
+                if (index(inner, "$(") == 0 && index(inner, "`") == 0) {
+                    gsub(/./, "X", inner)
+                }
+                out = out qc inner qc
+                rest = substr(rest, endpos + 1)
+                while (substr(rest, 1, 1) == " " || substr(rest, 1, 1) == "\t") {
+                    out = out substr(rest, 1, 1)
+                    rest = substr(rest, 2)
+                }
+            }
+            s = rest
+        }
+        out = out s
+        printf "%s", out
+    }'
+}
+
 # Helper: output a deny decision and exit
 #
 # Optional second arg is a short, STABLE rule tag (issue #3771) recorded as the
@@ -2557,12 +2665,30 @@ fi
 # false-asks. The strip only runs when a text-carrying flag is present, keeping
 # it off the hot path. Never feeds the catastrophic scan (that keeps reading the
 # raw command), so this can only NARROW an ask, never miss a hard deny.
-# =============================================================================
+#
+# POSITIONAL-ARGUMENT MASKING (#5235): strip_literal_text() above is keyed
+# ONLY on named-flag presence, so a script with a purely POSITIONAL
+# signature — e.g. `./.loom/scripts/check-duplicate.sh TITLE DESCRIPTION`
+# (no flags at all) — never triggered it, leaving its free-text TITLE/
+# DESCRIPTION arguments scanned unmasked. This is the same class of gap
+# #5155/#5160 already fixed for guard-loom-workflow.sh's gh-pr-merge-redirect
+# scan. mask_ask_positional_args() (defined above, a deliberate near-
+# duplicate of that fix, with a narrower allowlist — see its header comment
+# for why grep/rg are deliberately excluded here) masks quoted positional
+# arguments to check-duplicate.sh BEFORE the flag-keyed strip above runs, so
+# a dedup check whose prose quotes an ask-phrase (e.g. "git stash pop") as
+# inert text no longer false-asks on stash-scope:main-checkout,
+# force-op:protected, or any other ASK_PATTERNS entry. Gated on the same
+# command-name substring the awk allowlist matches, keeping it off the hot
+# path for the vast majority of commands that never invoke it.
 COMMAND_ASK_SCAN="$COMMAND_NO_COMMENT"
+if [[ "$COMMAND_NO_COMMENT" == *"check-duplicate.sh"* ]]; then
+    COMMAND_ASK_SCAN=$(mask_ask_positional_args "$COMMAND_ASK_SCAN")
+fi
 if [[ "$COMMAND_NO_COMMENT" == *"--body"* || "$COMMAND_NO_COMMENT" == *"--message"* || \
       "$COMMAND_NO_COMMENT" == *"--title"* || "$COMMAND_NO_COMMENT" == *"--notes"* || \
       "$COMMAND_NO_COMMENT" == *"--comment"* || "$COMMAND_NO_COMMENT" == *"-m"* ]]; then
-    COMMAND_ASK_SCAN=$(strip_literal_text "$COMMAND_NO_COMMENT")
+    COMMAND_ASK_SCAN=$(strip_literal_text "$COMMAND_ASK_SCAN")
 fi
 
 # =============================================================================
