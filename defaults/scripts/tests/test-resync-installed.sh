@@ -103,6 +103,8 @@ export GIT_COMMITTER_NAME="test" GIT_COMMITTER_EMAIL="test@example.com"
 #   defaults/docs/troubleshooting.md     -> .loom/docs/troubleshooting.md (drift)
 #   defaults/.loom/bin/loom              -> .loom/bin/loom (drift)
 #   defaults/.claude/commands/loom/x.md  -> .claude/commands/loom/x.md (drift)
+#   defaults/.claude/README.md           -> .claude/README.md (drift, #5264)
+#   defaults/.github/CONFIGURATION.md    -> .github/CONFIGURATION.md (drift, #5264)
 #   .loom/roles/custom-role.md           (repo-specific, no defaults/ counterpart)
 #   package.json ("version": "9.9.9")    (loom_version source for re-stamp)
 #   .loom/install-metadata.json          (re-stamp target; loom_source -> $repo)
@@ -112,9 +114,11 @@ make_fixture() {
     mkdir -p "$repo/defaults/hooks" "$repo/defaults/scripts/lib" \
              "$repo/defaults/roles" "$repo/defaults/docs" \
              "$repo/defaults/.loom/bin" "$repo/defaults/.claude/commands/loom" \
+             "$repo/defaults/.github" \
              "$repo/.loom/hooks" "$repo/.loom/scripts/lib" \
              "$repo/.loom/roles" "$repo/.loom/docs" \
-             "$repo/.loom/bin" "$repo/.claude/commands/loom"
+             "$repo/.loom/bin" "$repo/.claude/commands/loom" \
+             "$repo/.github"
     git -C "$repo" init -q
 
     printf 'A\n' > "$repo/defaults/hooks/guard.sh"
@@ -148,6 +152,14 @@ make_fixture() {
 
     printf 'CMD-NEW\n' > "$repo/defaults/.claude/commands/loom/builder.md"
     printf 'CMD-OLD\n' > "$repo/.claude/commands/loom/builder.md"
+
+    # Single-file consumer-install docs (#5264): .claude/README.md and
+    # .github/CONFIGURATION.md are copied verbatim into every consumer repo at
+    # install time but, prior to #5264, were never resynced afterward.
+    printf 'CLAUDE-README-NEW\n' > "$repo/defaults/.claude/README.md"
+    printf 'CLAUDE-README-OLD\n' > "$repo/.claude/README.md"
+    printf 'CONFIGURATION-NEW\n' > "$repo/defaults/.github/CONFIGURATION.md"
+    printf 'CONFIGURATION-OLD\n' > "$repo/.github/CONFIGURATION.md"
 
     # Version source + metadata re-stamp target.
     printf '{\n  "version": "9.9.9"\n}\n' > "$repo/package.json"
@@ -260,7 +272,7 @@ if [[ $RC -eq 2 ]]; then
 else
     fail "(i) --dry-run did not exit 2 across widened surfaces (got $RC)"
 fi
-for surf in "roles/builder.md" "docs/troubleshooting.md" "bin/loom" "commands/loom/builder.md"; do
+for surf in "roles/builder.md" "docs/troubleshooting.md" "bin/loom" "commands/loom/builder.md" ".claude/README.md" ".github/CONFIGURATION.md"; do
     if grep -q "$surf" <<<"$OUT"; then
         pass "(i) --dry-run reports drift for $surf"
     else
@@ -290,6 +302,16 @@ if [[ "$(cat "$REPO/.claude/commands/loom/builder.md")" == "CMD-NEW" ]]; then
     pass "(i) commands/loom/builder.md resynced from defaults"
 else
     fail "(i) commands/loom/builder.md not resynced"
+fi
+if [[ "$(cat "$REPO/.claude/README.md")" == "CLAUDE-README-NEW" ]]; then
+    pass "(i) .claude/README.md resynced from defaults (#5264)"
+else
+    fail "(i) .claude/README.md not resynced (#5264)"
+fi
+if [[ "$(cat "$REPO/.github/CONFIGURATION.md")" == "CONFIGURATION-NEW" ]]; then
+    pass "(i) .github/CONFIGURATION.md resynced from defaults (#5264)"
+else
+    fail "(i) .github/CONFIGURATION.md not resynced (#5264)"
 fi
 # second run is a clean no-op across the widened surfaces too
 OUT="$(cd "$REPO" && bash "$SCRIPT" 2>&1)"
@@ -324,6 +346,43 @@ if [[ "$(cat "$REPO/.loom/roles/builder.md")" == "PINNED-ROLE" ]]; then
     pass "(k) pinned roles/builder.md NOT overwritten"
 else
     fail "(k) pinned roles/builder.md was overwritten despite resync-ignore"
+fi
+
+# --- (k2) .claude/README.md / .github/CONFIGURATION.md are gated on the ------
+#          destination already existing (never force-populated, #5264)
+echo "Test group 9b: single-file docs are not force-created for a consumer that never had them"
+REPO="$(make_fixture)"
+# make_fixture git-tracks both files (its `git add -A && git commit`), so a bare
+# `rm -f` would NOT simulate "a consumer that never had them" — it leaves a
+# *deleted-but-tracked* path that `git status --porcelain` reports as pending
+# dirt (` D .claude/README.md`). resync-installed.sh's dirty-tree hint
+# (suggest_commit_if_resync_only_dirt) then lists that path in its `git add`
+# suggestion, which the "not reported at all" assertion below greps for and
+# trips on. Drop the files from the index *and* the worktree and commit the
+# removal, so the fixture is genuinely a repo that never received them.
+git -C "$REPO" rm -q -- .claude/README.md .github/CONFIGURATION.md >/dev/null 2>&1
+git -C "$REPO" commit -qm "consumer install without the single-file docs" >/dev/null 2>&1
+if [[ -z "$(git -C "$REPO" status --porcelain -- .claude/README.md .github/CONFIGURATION.md)" ]]; then
+    pass "(k2) fixture precondition: both single-file docs are absent AND untracked"
+else
+    fail "(k2) fixture precondition: single-file docs still show as pending git changes"
+fi
+OUT="$(cd "$REPO" && bash "$SCRIPT" 2>&1)"
+RC=$?
+if [[ ! -e "$REPO/.claude/README.md" ]]; then
+    pass "(k2) .claude/README.md not force-created when absent"
+else
+    fail "(k2) .claude/README.md was force-created despite being absent"
+fi
+if [[ ! -e "$REPO/.github/CONFIGURATION.md" ]]; then
+    pass "(k2) .github/CONFIGURATION.md not force-created when absent"
+else
+    fail "(k2) .github/CONFIGURATION.md was force-created despite being absent"
+fi
+if ! grep -q "\.claude/README\.md" <<<"$OUT" && ! grep -q "\.github/CONFIGURATION\.md" <<<"$OUT"; then
+    pass "(k2) absent single-file docs are not reported at all"
+else
+    fail "(k2) absent single-file docs were unexpectedly reported"
 fi
 
 # --- (l) symlinked install target is skipped, not clobbered ------------------
