@@ -134,6 +134,15 @@ pub const REVIEW_STALL_TIMEOUT_ENV: &str = "LOOM_SWEEP_REVIEW_STALL_TIMEOUT_SECS
 /// every line it writes and is never disturbed.
 pub const DEFAULT_REVIEW_STALL_TIMEOUT_SECS: u64 = 2700;
 
+/// Marker prefix for the forge comment `post_watchdog_giveup_comment` posts
+/// when the startup watchdog reaches [`WatchdogDecision::GiveUp`] for an issue
+/// (Issue #5302). Mirrors `quarantine::QUARANTINE_COMMENT_MARKER`'s role — a
+/// stable, greppable prefix identifying the comment's source — for a
+/// different failure mode (a wedged startup the watchdog could not self-heal
+/// after its one bounded retry, not an insta-crash quarantine).
+pub const WATCHDOG_GIVEUP_COMMENT_MARKER: &str =
+    "Auto-detected wedge by loom-daemon watchdog (#3887)";
+
 /// The watchdog's per-sweep decision (Issue #3887). Pure state machine —
 /// [`watchdog_decision`] maps `(elapsed, timeout, made_progress,
 /// already_retried)` onto exactly one of these.
@@ -754,7 +763,7 @@ impl SweepRegistry {
             match watchdog_decision(elapsed, timeout, made_progress, already_retried) {
                 WatchdogDecision::Healthy => {}
                 WatchdogDecision::GiveUp => {
-                    // Bounded: already retried once. Log once per issue.
+                    // Bounded: already retried once. Log + surface once per issue.
                     if self.watchdog_gaveup.insert(issue) {
                         log::error!(
                             "watchdog: sweep for issue #{issue} ({sweep_id}) is still stuck \
@@ -763,6 +772,12 @@ impl SweepRegistry {
                              the MCP-init hang).",
                             elapsed.as_secs()
                         );
+                        // Issue #5302: the log line above was the ONLY trace of a
+                        // give-up — invisible to anyone not tailing this daemon's
+                        // own log. Post a forge comment so the wedge is visible on
+                        // the issue itself, same escalation surface an operator
+                        // already watches.
+                        self.post_watchdog_giveup_comment(issue, elapsed.as_secs());
                     }
                 }
                 WatchdogDecision::Restart => {
@@ -837,6 +852,66 @@ impl SweepRegistry {
             }
         }
         restarts
+    }
+
+    /// Best-effort forge comment posted when the startup watchdog reaches
+    /// [`WatchdogDecision::GiveUp`] for `issue` (Issue #5302 — split from
+    /// #5017). Before this, `watchdog_once`'s `GiveUp` arm only logged, which
+    /// meant a wedge nothing else caught (#5017's issue #87: a sweep alive
+    /// 6.5h at 0% CPU) stayed invisible until an unrelated dispatch happened
+    /// to recover it.
+    ///
+    /// Mirrors [`SweepRegistry::apply_quarantine_label`]'s forge-mutation
+    /// pattern: skipped entirely when `skip_label_flip` is set (test
+    /// fixtures), respects `config.gh_bin` / `LOOM_REPO`, and is bounded by
+    /// [`reap_gh_timeout`] so a wedged `gh` invocation can never block a
+    /// watchdog tick. Every failure is logged and never propagated — this is
+    /// purely an operator-visibility addition, not load-bearing state.
+    ///
+    /// Callers are responsible for the once-per-issue dedup (the
+    /// `watchdog_gaveup.insert(issue)` guard at the single call site) — this
+    /// method always posts unconditionally when called.
+    fn post_watchdog_giveup_comment(&self, issue: u32, elapsed_secs: u64) {
+        if self.config.skip_label_flip {
+            return;
+        }
+        let gh = self
+            .config
+            .gh_bin
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("gh"));
+
+        let body = format!(
+            "{marker}: this issue's sweep has made no progress (no worktree, no checkpoint, \
+             log stuck at the spawn header) for {elapsed_secs}s — even after the daemon's \
+             startup watchdog already auto-cancelled and re-dispatched it once. The watchdog is \
+             bounded to a single retry and will not act again; this issue stays held in \
+             `loom:building` until an operator intervenes. Suggested next steps: cancel the \
+             stuck sweep (`loom-daemon cancel --issue {issue}` or `mcp__loom__cancel_sweep`) and \
+             re-dispatch, or investigate the MCP-init hang directly (see \
+             `.loom/logs/sweep-issue-{issue}.log`).",
+            marker = WATCHDOG_GIVEUP_COMMENT_MARKER,
+        );
+        let mut comment = Command::new(&gh);
+        comment
+            .arg("issue")
+            .arg("comment")
+            .arg(issue.to_string())
+            .arg("--body")
+            .arg(body);
+        comment.current_dir(&self.config.workspace_root);
+        if let Ok(repo) = std::env::var("LOOM_REPO") {
+            comment.arg("--repo").arg(repo);
+        }
+        let timeout = reap_gh_timeout();
+        match output_with_timeout(comment, timeout) {
+            Ok(Some(_)) => {}
+            Ok(None) => log::warn!(
+                "watchdog: give-up comment for #{issue} exceeded {}s, killed (#3973)",
+                timeout.as_secs()
+            ),
+            Err(e) => log::warn!("watchdog: give-up comment for #{issue} failed: {e}"),
+        }
     }
 
     // ------------------------------------------------------------------------
@@ -2420,6 +2495,92 @@ mod tests {
 
         // Cleanup: cancel the lingering hung child.
         if let Some(id) = running_issue_sweep_id(&reg, 4242) {
+            let _ = reg.cancel(&id, Duration::from_secs(2));
+        }
+    }
+
+    /// Issue #5302: the `GiveUp` arm's only prior trace was a `log::error!`
+    /// line — invisible to anyone not tailing this daemon's own log. This
+    /// asserts the new forge-comment side effect fires, carries the
+    /// [`WATCHDOG_GIVEUP_COMMENT_MARKER`], and — reusing the existing
+    /// `watchdog_gaveup` dedup fixture pattern — fires **exactly once** per
+    /// issue even across multiple consecutive `GiveUp`-observing ticks.
+    #[test]
+    fn watchdog_giveup_posts_a_forge_comment_exactly_once() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let mut reg = hung_child_registry(ws);
+
+        // Exercise the REAL forge-mutation path (mirrors the quarantine-comment
+        // tests): install a blanket-success fake `gh` and turn off
+        // `skip_label_flip` so `flip_label_to_building` / the closed-issue and
+        // open-PR probes / `post_watchdog_giveup_comment` all run for real,
+        // recording every invocation.
+        touch_sweep_command(ws);
+        let gh_log = ws.join("gh-invocations.log");
+        let fake_gh = install_fake_gh(ws, &gh_log, "", 0);
+        reg.config.gh_bin = Some(fake_gh);
+        reg.config.skip_label_flip = false;
+
+        // 1. Dispatch a hung sweep for issue 6201.
+        let out = reg
+            .dispatch(&SweepKind::Issue(6201), None, None, None, None)
+            .unwrap();
+        assert!(
+            wait_until_alive(out.pid, FIXTURE_CHILD_WAIT_MS),
+            "hung fixture child should start"
+        );
+        let first_id = out.sweep_id.clone();
+
+        // 2. Backdate + tick once: bounded auto-restart, no comment yet.
+        backdate(&mut reg, &first_id, 600);
+        assert_eq!(reg.watchdog_once(Duration::from_secs(60)), 1, "auto-restarted once");
+        let gh_calls_after_restart = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            !gh_calls_after_restart.contains("issue comment"),
+            "no give-up comment before the bounded retry is exhausted; got: \
+             {gh_calls_after_restart:?}"
+        );
+
+        // 3. Backdate the re-dispatched sweep too and tick again: bounded —
+        //    gives up instead of restarting again.
+        let second_id =
+            running_issue_sweep_id(&reg, 6201).expect("a fresh sweep was re-dispatched");
+        backdate(&mut reg, &second_id, 600);
+        assert_eq!(reg.watchdog_once(Duration::from_secs(60)), 0, "bounded: no second restart");
+        assert!(reg.watchdog_gaveup.contains(&6201), "give-up recorded for the issue");
+
+        let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        let comment_calls: Vec<&str> = gh_calls
+            .lines()
+            .filter(|l| l.contains("issue comment 6201"))
+            .collect();
+        assert_eq!(
+            comment_calls.len(),
+            1,
+            "expected exactly one give-up comment; got: {gh_calls:?}"
+        );
+        assert!(
+            comment_calls[0].contains(WATCHDOG_GIVEUP_COMMENT_MARKER),
+            "comment body must carry the give-up marker; got: {comment_calls:?}"
+        );
+
+        // 4. A THIRD tick still observes `GiveUp` (bounded retry stays
+        //    exhausted) — the dedup must not post a second comment.
+        assert_eq!(reg.watchdog_once(Duration::from_secs(60)), 0, "still bounded");
+        let gh_calls_final = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        let comment_calls_final: Vec<&str> = gh_calls_final
+            .lines()
+            .filter(|l| l.contains("issue comment 6201"))
+            .collect();
+        assert_eq!(
+            comment_calls_final.len(),
+            1,
+            "dedup must hold across repeated GiveUp ticks; got: {gh_calls_final:?}"
+        );
+
+        // Cleanup: cancel the lingering hung child.
+        if let Some(id) = running_issue_sweep_id(&reg, 6201) {
             let _ = reg.cancel(&id, Duration::from_secs(2));
         }
     }
