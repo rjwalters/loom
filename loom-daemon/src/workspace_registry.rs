@@ -299,6 +299,45 @@ impl WorkspaceRegistry {
         })
     }
 
+    /// Register a workspace ([`add_with_priority`](Self::add_with_priority))
+    /// and mark its canonical root trusted in the given Claude Code state
+    /// file (issue #5314), so a headless spawn into a freshly-registered
+    /// workspace never silently drops its `permissions.allow` list waiting on
+    /// an interactive trust dialog that never happens on a worker host.
+    ///
+    /// This is the single call site `fleet add-worker`, `loom migrate`, and
+    /// `loom-daemon workspace add` all converge on (they each shell out to
+    /// `workspace add`), so seeding trust here — rather than patching each of
+    /// those three call sites separately — covers all of them plus any future
+    /// caller of `workspace add`.
+    ///
+    /// Runs on **both** [`AddOutcome::Added`] and [`AddOutcome::AlreadyPresent`]
+    /// — trust-marking is idempotent (see
+    /// [`claude_config_trust_at`](crate::terminal::claude_config_trust_at)) and
+    /// self-heals a workspace that was registered before this fix existed,
+    /// without re-registering it or touching its stored priority/overrides.
+    ///
+    /// `claude_state_path` is caller-resolved (normally
+    /// [`crate::terminal::claude_config_state_path`]) rather than resolved
+    /// here, so tests can point it at a scratch file instead of mutating the
+    /// process-wide `$HOME`.
+    pub fn add_and_trust(
+        &mut self,
+        root: &Path,
+        config_overrides: Option<serde_json::Value>,
+        priority: u32,
+        claude_state_path: &Path,
+    ) -> Result<AddOutcome> {
+        let outcome = self.add_with_priority(root, config_overrides, priority)?;
+        let canonical = match &outcome {
+            AddOutcome::Added { canonical, .. } | AddOutcome::AlreadyPresent { canonical } => {
+                canonical
+            }
+        };
+        crate::terminal::claude_config_trust_at(claude_state_path, canonical);
+        Ok(outcome)
+    }
+
     /// Set the dispatch priority of an already-registered workspace (Issue
     /// #3946). Normalizes `root` and updates the matching entry's `priority`,
     /// returning `true` when an entry was updated, `false` when no matching
@@ -603,6 +642,129 @@ mod tests {
             } => assert!(looks_like_workspace),
             AddOutcome::AlreadyPresent { .. } => panic!("expected Added"),
         }
+    }
+
+    #[test]
+    fn add_and_trust_marks_canonical_root_trusted_on_fresh_add() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let claude_state_path = dir.path().join(".claude.json");
+        std::fs::write(&claude_state_path, r#"{"unrelatedTopLevelKey": "keep-me"}"#).unwrap();
+
+        let mut reg = WorkspaceRegistry::default();
+        let outcome = reg
+            .add_and_trust(&repo, None, DEFAULT_WORKSPACE_PRIORITY, &claude_state_path)
+            .unwrap();
+        let canonical = match outcome {
+            AddOutcome::Added { canonical, .. } => canonical,
+            AddOutcome::AlreadyPresent { .. } => panic!("expected Added"),
+        };
+
+        // The workspace itself is registered...
+        assert!(reg.contains(&canonical));
+
+        // ...and the trust bit is merged into the state file, preserving
+        // unrelated existing content (issue #5314's core requirement).
+        let contents = std::fs::read_to_string(&claude_state_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&contents).unwrap();
+        assert_eq!(parsed["unrelatedTopLevelKey"], "keep-me");
+        assert_eq!(
+            parsed["projects"][canonical.to_string_lossy().to_string()]["hasTrustDialogAccepted"],
+            true
+        );
+    }
+
+    #[test]
+    fn add_and_trust_preserves_other_projects_entries() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let other_project = dir.path().join("some-other-project");
+        let claude_state_path = dir.path().join(".claude.json");
+        std::fs::write(
+            &claude_state_path,
+            serde_json::json!({
+                "projects": {
+                    other_project.to_string_lossy().to_string(): {
+                        "hasTrustDialogAccepted": true,
+                        "someOtherProjectField": "keep-me-too",
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let mut reg = WorkspaceRegistry::default();
+        reg.add_and_trust(&repo, None, DEFAULT_WORKSPACE_PRIORITY, &claude_state_path)
+            .unwrap();
+
+        let contents = std::fs::read_to_string(&claude_state_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&contents).unwrap();
+        // The pre-existing, unrelated project entry must survive untouched.
+        assert_eq!(
+            parsed["projects"][other_project.to_string_lossy().to_string()]
+                ["someOtherProjectField"],
+            "keep-me-too"
+        );
+        assert_eq!(
+            parsed["projects"][other_project.to_string_lossy().to_string()]
+                ["hasTrustDialogAccepted"],
+            true
+        );
+    }
+
+    #[test]
+    fn add_and_trust_creates_missing_claude_state_file() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let claude_state_path = dir.path().join(".claude.json");
+        assert!(!claude_state_path.exists());
+
+        let mut reg = WorkspaceRegistry::default();
+        reg.add_and_trust(&repo, None, DEFAULT_WORKSPACE_PRIORITY, &claude_state_path)
+            .unwrap();
+
+        assert!(claude_state_path.exists());
+        let contents = std::fs::read_to_string(&claude_state_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&contents).unwrap();
+        let canonical = normalize_path(&repo);
+        assert_eq!(
+            parsed["projects"][canonical.to_string_lossy().to_string()]["hasTrustDialogAccepted"],
+            true
+        );
+    }
+
+    #[test]
+    fn add_and_trust_is_idempotent_and_self_heals_already_present_workspace() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let claude_state_path = dir.path().join(".claude.json");
+
+        let mut reg = WorkspaceRegistry::default();
+        // Simulate a workspace registered before this fix existed: present in
+        // the registry, but never marked trusted.
+        reg.add(&repo, None).unwrap();
+        assert!(!claude_state_path.exists());
+
+        // Re-running `workspace add` (the self-heal path) must not
+        // re-register or error, and must still seed the trust bit.
+        let outcome = reg
+            .add_and_trust(&repo, None, DEFAULT_WORKSPACE_PRIORITY, &claude_state_path)
+            .unwrap();
+        assert!(matches!(outcome, AddOutcome::AlreadyPresent { .. }));
+        assert_eq!(reg.workspaces.len(), 1);
+
+        let contents = std::fs::read_to_string(&claude_state_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&contents).unwrap();
+        let canonical = normalize_path(&repo);
+        assert_eq!(
+            parsed["projects"][canonical.to_string_lossy().to_string()]["hasTrustDialogAccepted"],
+            true
+        );
     }
 
     #[test]
