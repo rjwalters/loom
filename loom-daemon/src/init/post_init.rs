@@ -114,6 +114,12 @@ const GITIGNORE_BLOCK_HEADER: &str = "# Loom runtime state (don't commit these)"
 /// drifted behind this list (was missing `.no-changes-needed` and `.loom/*.bak`).
 /// `.loom/accounts.json` is intentionally left tracked: it is an optional,
 /// committable per-repo profile allowlist, not runtime state.
+///
+/// #5267: added `.claude/worktrees/` — the agent harness's own
+/// `isolation: worktree` checkouts, which land *inside* the main checkout just
+/// like `.loom/worktrees/` but were never covered here. Unignored, each one is
+/// a nested git repo, so a `git add -A` silently stages an embedded-repo
+/// gitlink (a near-miss in gf180-trng, 2026-08-04, caught only by hand).
 pub const EPHEMERAL_PATTERNS: &[&str] = &[
     ".loom-in-use",
     // Per-worktree builder progress checkpoint. Its WRITER moved from Python to
@@ -146,6 +152,12 @@ pub const EPHEMERAL_PATTERNS: &[&str] = &[
     // in a consumer repo (anvil, 2026-07-28): `.loom/worktrees-local/<repo>/issue-N`
     // (#4280). Runtime worktree state, same class as `.loom/worktrees/`.
     ".loom/worktrees-local/",
+    // Worktrees created inside the main checkout by the agent harness's
+    // `isolation: worktree` mechanism — NOT Loom's own worktree state (that is
+    // `.loom/worktrees/` above). Each is a nested git repo, so leaving it
+    // unignored lets a `git add -A` stage an embedded-repo gitlink behind
+    // nothing but an easily-missed advice block (#5267).
+    ".claude/worktrees/",
     ".loom/state.json",
     ".loom/mcp-command.json",
     ".loom/activity.db",
@@ -610,6 +622,10 @@ mod tests {
         // #4280: machine-local worktree state must be ignored and appear once.
         assert_eq!(contents.matches(".loom/worktrees-local/").count(), 1);
 
+        // #5267: harness `isolation: worktree` checkouts must be ignored and
+        // appear once, else `git add -A` stages an embedded-repo gitlink.
+        assert_eq!(contents.matches(".claude/worktrees/").count(), 1);
+
         // #3778: patterns that had drifted out of this installer-managed list
         // relative to the source .gitignore — a consumer re-sync must now emit
         // them so Loom-owned transient state never surfaces as untracked dirt.
@@ -666,6 +682,9 @@ mod tests {
         assert!(contents.contains(".loom/spawn-loop-state.json"));
         assert!(contents.contains(".loom/daemon-metrics.json"));
         assert!(contents.contains(".loom/activity.db"));
+        // #5267: the harness's `isolation: worktree` directory is added exactly
+        // once on a fresh install over an existing (unmarked) .gitignore.
+        assert_eq!(contents.matches(".claude/worktrees/").count(), 1);
     }
 
     #[test]
@@ -684,6 +703,8 @@ mod tests {
         assert_eq!(contents.matches(".loom/locks/").count(), 1);
         // #4280: `.loom/worktrees-local/` must not duplicate across runs.
         assert_eq!(contents.matches(".loom/worktrees-local/").count(), 1);
+        // #5267: `.claude/worktrees/` must not duplicate across runs either.
+        assert_eq!(contents.matches(".claude/worktrees/").count(), 1);
         // #4635: the builder "no changes needed" marker must not duplicate
         // across runs either.
         assert_eq!(contents.matches(".no-changes-needed").count(), 1);
@@ -719,6 +740,10 @@ mod tests {
             ".loom/interventions/",
             ".loom/worktrees/",
             ".loom/worktrees-local/",
+            // #5267: harness `isolation: worktree` checkouts inside the main
+            // checkout — nested git repos a `git add -A` would otherwise stage
+            // as an embedded-repo gitlink.
+            ".claude/worktrees/",
             ".loom/state.json",
             ".loom/mcp-command.json",
             ".loom/activity.db",
@@ -1175,6 +1200,10 @@ mod tests {
         // The previously-absent runtime patterns are now present exactly once.
         assert_eq!(contents.matches(".loom/sweep-checkpoint/").count(), 1);
         assert_eq!(contents.matches(".loom/worktrees-local/").count(), 1);
+        // #5267: the harness `isolation: worktree` directory is backfilled by
+        // the same in-place refresh — this is exactly what resync-installed.sh's
+        // `loom-daemon update-gitignore` invocation drives for existing installs.
+        assert_eq!(contents.matches(".claude/worktrees/").count(), 1);
         // User content on both sides survived and kept its ordering.
         let begin_pos = contents.find(GITIGNORE_BEGIN_MARKER).unwrap();
         let end_pos = contents.find(GITIGNORE_END_MARKER).unwrap();
@@ -1182,6 +1211,49 @@ mod tests {
         assert!(contents.find("dist/").unwrap() > end_pos);
 
         // Idempotent: a second run is a byte-identical no-op.
+        update_gitignore(tmp.path()).unwrap();
+        let again = fs::read_to_string(&gitignore).unwrap();
+        assert_eq!(contents, again, "second refresh must be a byte-identical no-op");
+    }
+
+    #[test]
+    fn hand_added_claude_worktrees_rule_survives_block_refresh_without_block_duplication() {
+        // #5267, the gf180-bandgap case: before `.claude/worktrees/` was managed,
+        // some repos hand-added the rule *above* the loom-managed block. When the
+        // managed block then gains the same pattern, the block itself must still
+        // carry it exactly once, and the operator's own line must survive — Loom
+        // only rewrites the span between its markers and never strips ignore rules
+        // it did not write. The resulting extra line is a semantic no-op for git
+        // (the same behavior any hand-added `.loom/worktrees/` already gets).
+        let tmp = TempDir::new().unwrap();
+        let gitignore = tmp.path().join(".gitignore");
+
+        let stale_block = format!(
+            "{begin}\n{header}\n.loom-in-use\n.loom/worktrees/\n{end}",
+            begin = GITIGNORE_BEGIN_MARKER,
+            header = GITIGNORE_BLOCK_HEADER,
+            end = GITIGNORE_END_MARKER,
+        );
+        fs::write(
+            &gitignore,
+            format!("# harness worktree isolation\n.claude/worktrees/\n\n{stale_block}\n"),
+        )
+        .unwrap();
+
+        update_gitignore(tmp.path()).unwrap();
+        let contents = fs::read_to_string(&gitignore).unwrap();
+
+        // The operator's pre-existing rule is untouched, above the block.
+        let begin_pos = contents.find(GITIGNORE_BEGIN_MARKER).unwrap();
+        assert!(contents.find("# harness worktree isolation").unwrap() < begin_pos);
+        assert!(contents.find(".claude/worktrees/").unwrap() < begin_pos);
+
+        // The managed block carries the pattern exactly once.
+        let end_pos = contents.find(GITIGNORE_END_MARKER).unwrap();
+        let block = &contents[begin_pos..end_pos];
+        assert_eq!(block.matches(".claude/worktrees/").count(), 1);
+
+        // Idempotent: a second run is a byte-identical no-op (no growth per run).
         update_gitignore(tmp.path()).unwrap();
         let again = fs::read_to_string(&gitignore).unwrap();
         assert_eq!(contents, again, "second refresh must be a byte-identical no-op");
