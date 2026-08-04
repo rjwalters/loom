@@ -309,6 +309,31 @@ cat .loom/config.json.bak
 `loom-daemon init` against a workspace that already has a `.loom/config.json`, so
 repeat provisioning passes cannot re-enter this path on a tuned host.
 
+### Keeping `.loom/config.json` host-local (git-ignored) (#5242)
+
+`.loom/config.json` is normally **committed** for team sharing. On a fleet host
+where it carries machine-specific values (most commonly `worktree.root` pointing
+at a local volume), a repo may instead choose to keep it untracked. That is
+supported: add your own rule to `.gitignore`, **outside** the Loom-managed block:
+
+```gitignore
+# host-local runtime state — NOT tracked
+.loom/config.json
+```
+
+Install/update passes (`install.sh`, `loom-daemon init`,
+`loom-daemon update-gitignore` via `resync-installed.sh`) preserve it. Loom only
+removes `.gitignore` lines it can show it wrote: everything inside the
+`# >>> loom-managed …` / `# <<< loom-managed <<<` markers, plus legacy over-broad
+patterns (`.loom/*.json`, `!.loom/roles/*.json`) sitting in the same contiguous
+run as a pre-marker Loom block. Keep your rule under its own comment/blank-line
+separation and it will never be reconciled away.
+
+Before #5242 the reconciliation stripped any line equal to `.loom/config.json`
+file-wide, so every upgrade silently re-exposed host-local config as committable —
+one host's volume paths were one `git add -A` away from a shared repo. If you are
+on an older Loom, re-add the rule after each update until you upgrade.
+
 ### Daemon won't start
 
 ```bash

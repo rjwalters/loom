@@ -84,6 +84,21 @@ pub const GITIGNORE_END_MARKER: &str = "# <<< loom-managed <<<";
 /// migrate those installs to the marked form in place.
 const GITIGNORE_BLOCK_HEADER: &str = "# Loom runtime state (don't commit these)";
 
+/// Over-broad `.gitignore` patterns that **Loom itself** used to emit before the
+/// managed-block markers existed (older installs and `/imagine` wrote
+/// `.loom/*.json` plus the `!.loom/roles/*.json` negation paired with it, and
+/// some wrote `.loom/config.json` directly). They shadow `.loom/config.json`,
+/// so Loom migrates them away — but **only when Loom wrote them**.
+///
+/// #5242: these were previously stripped by an unconditional, file-wide match,
+/// which also deleted a *consumer's own* hand-added `.loom/config.json` rule.
+/// On a fleet host `.loom/config.json` is host-local runtime state (e.g. a
+/// machine-specific `worktree.root`), and repos legitimately gitignore it; every
+/// install/update silently re-exposed it as committable. Ownership is now
+/// decided by adjacency — see `update_gitignore`.
+const LEGACY_OVERBROAD_PATTERNS: &[&str] =
+    &[".loom/*.json", ".loom/config.json", "!.loom/roles/*.json"];
+
 /// Ephemeral/runtime files that should be ignored — the single source of truth
 /// for the Loom-managed `.gitignore` block.
 ///
@@ -340,6 +355,25 @@ pub fn generate_manifest(workspace_path: &Path) {
 ///
 /// Adds patterns for ephemeral Loom files that shouldn't be committed.
 /// Creates .gitignore if it doesn't exist.
+///
+/// # Ownership rule (#5242)
+///
+/// Loom only ever *removes* lines it can show it authored:
+///
+/// * When the marker pair is present, Loom owns exactly the marker span — the
+///   splice below replaces it wholesale. Every line outside the markers belongs
+///   to the consumer and is preserved byte-for-byte.
+/// * When migrating a pre-marker (markerless) install, Loom owns the contiguous
+///   run of its own header/[`EPHEMERAL_PATTERNS`] lines, plus any
+///   [`LEGACY_OVERBROAD_PATTERNS`] line that is *adjacent* to that run (i.e. was
+///   part of the same block Loom wrote).
+///
+/// A `.loom/config.json` (or `.loom/*.json`) rule that sits on its own —
+/// separated from any Loom block by a blank line or unrelated content — is a
+/// consumer's deliberate host-local-config rule and is never touched. This is
+/// deliberately conservative: keeping one detached stale glob is far cheaper
+/// than making a fleet host's machine-local `worktree.root` committable on
+/// every update.
 pub fn update_gitignore(workspace_path: &Path) -> Result<(), String> {
     let gitignore_path = workspace_path.join(".gitignore");
     let block = managed_gitignore_block();
@@ -359,12 +393,6 @@ pub fn update_gitignore(workspace_path: &Path) -> Result<(), String> {
     // exactly, so line-vector edits are byte-preserving for untouched regions.
     let mut lines: Vec<String> = contents.split('\n').map(str::to_string).collect();
 
-    // Remove legacy over-broad patterns that block config.json from being
-    // tracked (older installs and /imagine used `.loom/*.json`), plus the
-    // negation that was paired with that glob.
-    let legacy_overbroad = [".loom/*.json", ".loom/config.json", "!.loom/roles/*.json"];
-    lines.retain(|line| !legacy_overbroad.contains(&line.trim()));
-
     let begin = lines
         .iter()
         .position(|l| l.trim() == GITIGNORE_BEGIN_MARKER);
@@ -375,7 +403,11 @@ pub fn update_gitignore(workspace_path: &Path) -> Result<(), String> {
     match (begin, end) {
         (Some(b), Some(e)) if b <= e => {
             // Marked block already present: refresh it in place (patterns may
-            // have changed between versions) without moving it.
+            // have changed between versions) without moving it. The splice
+            // covers the whole marker span, so any legacy over-broad pattern
+            // Loom left *inside* the block is dropped as a side effect —
+            // while lines outside the markers (a consumer's own rules) are
+            // never touched (#5242).
             lines.splice(b..=e, block_lines.iter().cloned());
         }
         _ => {
@@ -401,7 +433,28 @@ pub fn update_gitignore(workspace_path: &Path) -> Result<(), String> {
                 let t = line.trim();
                 t == GITIGNORE_BLOCK_HEADER || EPHEMERAL_PATTERNS.contains(&t)
             };
-            let first_legacy = lines.iter().position(|l| is_legacy(l));
+            let is_overbroad = |line: &str| LEGACY_OVERBROAD_PATTERNS.contains(&line.trim());
+
+            // 2a. Decide ownership of the legacy over-broad patterns by adjacency
+            //     (#5242). Seed with the lines that are unambiguously Loom's
+            //     (header + current ephemeral patterns), then grow the claim
+            //     across neighbouring over-broad lines in both directions — those
+            //     sat inside the block Loom wrote. An over-broad line that is not
+            //     contiguous with any Loom line was written by the consumer (e.g.
+            //     a deliberate host-local `.loom/config.json` rule) and is left
+            //     alone.
+            let mut owned: Vec<bool> = lines.iter().map(|l| is_legacy(l)).collect();
+            for i in 1..owned.len() {
+                if owned[i - 1] && is_overbroad(&lines[i]) {
+                    owned[i] = true;
+                }
+            }
+            for i in (0..owned.len().saturating_sub(1)).rev() {
+                if owned[i + 1] && is_overbroad(&lines[i]) {
+                    owned[i] = true;
+                }
+            }
+            let first_legacy = owned.iter().position(|claimed| *claimed);
 
             match first_legacy {
                 Some(start) => {
@@ -412,7 +465,11 @@ pub fn update_gitignore(workspace_path: &Path) -> Result<(), String> {
                     // artifact is left behind where the old block used to sit
                     // (#3592). Any user content that followed the legacy block
                     // still follows the managed block.
-                    lines.retain(|l| !is_legacy(l));
+                    lines = lines
+                        .into_iter()
+                        .zip(owned)
+                        .filter_map(|(line, claimed)| (!claimed).then_some(line))
+                        .collect();
                     lines.splice(start..start, block_lines.iter().cloned());
                 }
                 None => {
@@ -868,6 +925,10 @@ mod tests {
         }
     }
 
+    /// A genuinely Loom-authored legacy block — the over-broad patterns sit in
+    /// the same contiguous run as Loom's own ephemeral patterns — must still be
+    /// cleaned up. The #5242 fix narrows ownership by adjacency; it must not
+    /// disable the legacy migration.
     #[test]
     fn removes_legacy_broad_json_pattern() {
         let tmp = TempDir::new().unwrap();
@@ -905,6 +966,96 @@ mod tests {
 
         // Non-Loom content preserved
         assert!(contents.contains("node_modules/"));
+    }
+
+    /// #5242: a consumer's own `.loom/config.json` ignore rule — written under
+    /// their own section, not inside any Loom block — must survive a fresh
+    /// install. On a fleet host `.loom/config.json` holds machine-local runtime
+    /// state (e.g. `worktree.root`), and stripping the rule makes it committable.
+    #[test]
+    fn preserves_hand_added_config_json_rule_outside_loom_block() {
+        let tmp = TempDir::new().unwrap();
+        let gitignore = tmp.path().join(".gitignore");
+
+        fs::write(
+            &gitignore,
+            "node_modules/\n\n# host-local runtime config — NOT tracked\n.loom/config.json\n",
+        )
+        .unwrap();
+
+        update_gitignore(tmp.path()).unwrap();
+        let contents = fs::read_to_string(&gitignore).unwrap();
+
+        assert!(
+            contents.contains("\n.loom/config.json\n"),
+            "hand-added .loom/config.json rule was stripped:\n{contents}"
+        );
+        assert!(contents.contains("# host-local runtime config — NOT tracked"));
+        assert!(contents.contains("node_modules/"));
+        // The managed block is still installed alongside it.
+        assert!(contents.contains(GITIGNORE_BEGIN_MARKER));
+        assert!(contents.contains(".loom/worktrees/"));
+    }
+
+    /// #5242: the strip must not come back on the *next* install/update either —
+    /// `loom-daemon update-gitignore` (invoked by `resync-installed.sh`) runs
+    /// this on every resync, so the rule has to survive repeated passes.
+    #[test]
+    fn hand_added_config_json_rule_survives_repeated_updates() {
+        let tmp = TempDir::new().unwrap();
+        let gitignore = tmp.path().join(".gitignore");
+
+        fs::write(&gitignore, "# local\n.loom/config.json\n").unwrap();
+
+        update_gitignore(tmp.path()).unwrap();
+        let after_first = fs::read_to_string(&gitignore).unwrap();
+        update_gitignore(tmp.path()).unwrap();
+        let after_second = fs::read_to_string(&gitignore).unwrap();
+
+        assert!(after_first.contains("\n.loom/config.json\n"));
+        assert_eq!(after_first, after_second, "second update-gitignore pass must be a no-op");
+    }
+
+    /// #5242: with the managed block already present, ownership is exactly the
+    /// marker span — a consumer rule immediately *after* the END marker (no
+    /// blank-line separation) is outside the span and must be preserved.
+    #[test]
+    fn preserves_config_json_rule_adjacent_to_managed_block() {
+        let tmp = TempDir::new().unwrap();
+        let gitignore = tmp.path().join(".gitignore");
+
+        // Install the managed block first, then append the consumer's rule
+        // directly after it.
+        update_gitignore(tmp.path()).unwrap();
+        let seeded = format!("{}.loom/config.json\n", fs::read_to_string(&gitignore).unwrap());
+        fs::write(&gitignore, &seeded).unwrap();
+
+        update_gitignore(tmp.path()).unwrap();
+        let contents = fs::read_to_string(&gitignore).unwrap();
+
+        assert!(
+            contents.contains("\n.loom/config.json\n"),
+            "rule adjacent to the managed block was stripped:\n{contents}"
+        );
+        assert_eq!(contents, seeded, "nothing outside the marker span may change");
+    }
+
+    /// #5242: the same protection applies to the over-broad glob form a consumer
+    /// may have written by hand (`.loom/*.json` + its negation) when it is not
+    /// contiguous with any Loom-authored line.
+    #[test]
+    fn preserves_hand_added_json_glob_outside_loom_block() {
+        let tmp = TempDir::new().unwrap();
+        let gitignore = tmp.path().join(".gitignore");
+
+        fs::write(&gitignore, "# my rules\n.loom/*.json\n!.loom/roles/*.json\n\ndist/\n").unwrap();
+
+        update_gitignore(tmp.path()).unwrap();
+        let contents = fs::read_to_string(&gitignore).unwrap();
+
+        assert!(contents.contains("\n.loom/*.json\n"), "got:\n{contents}");
+        assert!(contents.contains("\n!.loom/roles/*.json\n"), "got:\n{contents}");
+        assert!(contents.contains("dist/"));
     }
 
     /// Mimic `scripts/uninstall-loom.sh`'s marker-span deletion: drop every

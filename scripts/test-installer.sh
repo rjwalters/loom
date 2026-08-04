@@ -2573,6 +2573,67 @@ fi
 echo ""
 
 
+# Test 76: init preserves a consumer's own `.loom/config.json` ignore rule (#5242)
+# On a fleet host `.loom/config.json` is host-local runtime state (a
+# machine-specific `worktree.root`), and consumer repos gitignore it on purpose.
+# The gitignore reconciliation used to strip any line equal to
+# `.loom/config.json` file-wide, so every install/update silently re-exposed
+# host-local config as committable. Ownership is now decided by adjacency: only
+# an over-broad pattern contiguous with Loom's own block is migrated away.
+# Complements Test 65 (which covers config.json *values*, not the ignore rule).
+echo "Test 76: init preserves a consumer's hand-added .loom/config.json ignore rule (#5242)"
+DAEMON_BIN_76="$LOOM_ROOT/target/release/loom-daemon"
+if [[ ! -x "$DAEMON_BIN_76" ]]; then
+  warn "Skipping Test 76 — loom-daemon release binary not built at $DAEMON_BIN_76"
+else
+  GITIGNORE_KEEP_REPO="$TEST_DIR/gitignore-keep-test"
+  create_temp_repo "$GITIGNORE_KEEP_REPO"
+
+  # A consumer's own section, deliberately keeping host-local config untracked.
+  cat > "$GITIGNORE_KEEP_REPO/.gitignore" <<'GI_EOF'
+node_modules/
+
+# host-local runtime state — NOT tracked
+.loom/config.json
+GI_EOF
+
+  if "$DAEMON_BIN_76" init --force --defaults "$LOOM_ROOT/defaults" "$GITIGNORE_KEEP_REPO" >/dev/null 2>&1; then
+    KEEP_GI="$GITIGNORE_KEEP_REPO/.gitignore"
+
+    if grep -qx '\.loom/config\.json' "$KEEP_GI"; then
+      pass "hand-added .loom/config.json ignore rule survived init (#5242)"
+    else
+      fail "init stripped the consumer's .loom/config.json ignore rule (#5242 regression)"
+    fi
+
+    if grep -q 'host-local runtime state' "$KEEP_GI" && grep -q 'node_modules/' "$KEEP_GI"; then
+      pass "surrounding consumer .gitignore content preserved (#5242)"
+    else
+      fail "consumer .gitignore content was mangled by init (#5242)"
+    fi
+
+    # The managed block must still be installed alongside the consumer rule.
+    if grep -q 'loom-managed' "$KEEP_GI" && grep -q '\.loom/worktrees/' "$KEEP_GI"; then
+      pass "Loom-managed gitignore block still installed alongside consumer rule (#5242)"
+    else
+      fail "Loom-managed gitignore block missing after init (#5242)"
+    fi
+
+    # A second init must not strip it either — `loom-daemon update-gitignore`
+    # runs on every resync, so a one-shot survival is not enough.
+    "$DAEMON_BIN_76" init --force --defaults "$LOOM_ROOT/defaults" "$GITIGNORE_KEEP_REPO" >/dev/null 2>&1 || true
+    if grep -qx '\.loom/config\.json' "$KEEP_GI"; then
+      pass ".loom/config.json ignore rule survives repeat init/update passes (#5242)"
+    else
+      fail "second init stripped the .loom/config.json ignore rule (#5242 regression)"
+    fi
+  else
+    fail "loom-daemon init failed against consumer repo with hand-added gitignore rule (#5242)"
+  fi
+fi
+echo ""
+
+
 # ==========================================================================
 # Dogfood commands scoped-symlink (issue #3682)
 # ==========================================================================
