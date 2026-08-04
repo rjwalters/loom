@@ -211,10 +211,17 @@ pub(crate) fn handle_workspace_command(action: WorkspaceAction) -> Result<()> {
                 None => None,
             };
             let mut registry = WorkspaceRegistry::load(&path)?;
-            match registry.add_with_priority(
+            // Mark the canonical workspace root trusted in ~/.claude.json as
+            // part of registration (issue #5314) — merges, never clobbers,
+            // and is idempotent on an already-registered workspace so a
+            // pre-existing registry entry self-heals on the next `workspace
+            // add` of the same path.
+            let claude_state_path = loom_daemon::terminal::claude_config_state_path();
+            match registry.add_and_trust(
                 std::path::Path::new(&repo_path),
                 overrides,
                 priority,
+                &claude_state_path,
             )? {
                 AddOutcome::AlreadyPresent { canonical } => {
                     println!("Already registered: {}", canonical.display());
