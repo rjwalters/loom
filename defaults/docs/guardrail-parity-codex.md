@@ -202,10 +202,11 @@ the `cwd` of the normalized guard request `guard-destructive-generic.sh`
 consumes for its #4178 Bash write-confinement block.
 
 That block derives its main-checkout anchor (`_WT_MAIN_ROOT`) from `cwd` via
-`git rev-parse --git-common-dir`. A `cwd` that is not inside a git repo makes
-that anchor come up empty, and the block's containment test **silently
-`continue`s past every write** when the anchor is empty — it has nothing to
-compare against. Because `workdir` is model-controlled, a Codex worker could
+`git rev-parse --git-common-dir`, falling back to `REPO_ROOT` (itself resolved
+from the same `cwd` via `git rev-parse --show-toplevel`) when that resolution
+is unavailable. A `cwd` that is not inside a git repo at all makes **both**
+come up empty, and the block's containment test **silently `continue`s past
+every write** when the anchor is empty — it has nothing to compare against. Because `workdir` is model-controlled, a Codex worker could
 therefore choose `workdir: "/tmp"` (or `"/"`, or any other out-of-repo path) to
 turn off managed-worktree write confinement for every subsequent redirect/
 `tee`/`sed -i`/`cp`/`mv` in the same call — while `rm -rf /`, protected-branch
