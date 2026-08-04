@@ -61,6 +61,7 @@ test-install-source-guard.sh
 test-install-stash-scope.sh
 test-install-sync-labels.sh
 test-judge-fanout-experiment.sh
+test-live-state-sandbox.sh
 test-locate-daemon-bin.sh
 test-loom-daemon-launchd-plist.sh
 test-loom-daemon-start.sh
