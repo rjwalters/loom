@@ -1634,40 +1634,87 @@ function mask_heredoc_bodies(s,   out, lines, nl, i, j, line, trimmed, body, del
 # `echo "installs bash" <<EOF` does NOT match, since "bash" there is a bare
 # argument, not the command word.
 #
-# Recognizing the command word robustly (#5205): the interpreter word is
-# matched against the path BASENAME of each segment command word, and any
-# leading `env`/`command`/`exec`/`builtin` wrapper (with its own flags and
-# `VAR=value` assignments) is stripped first -- none of those change what
-# actually executes. So a path-qualified or wrapped invocation of the same
-# interpreter (`/bin/bash <<EOF`, `env bash <<EOF`, `command bash <<EOF`,
-# `./bash <<EOF`, `/usr/bin/python3 <<EOF`) is caught too, closing the
-# evasion class where those forms slipped past the old first-token-only
-# regex and got their live bodies silently masked (i.e. ALLOWed).
-function _interp_basename(tok,   base) {
-    # Reduce a (possibly path-qualified) command word to its basename: the
-    # text after the last `/`. `/bin/bash` -> `bash`, `./bash` -> `bash`,
-    # `/usr/bin/python3` -> `python3`; a bare `bash` or `.` is unchanged.
+# Recognizing the command word robustly (#5205, widened #5226): the
+# interpreter word is matched against the path BASENAME of each segment
+# command word, after normalizing away the shell decorations that do not
+# change what actually executes --
+#   * quoting / backslash-escaping of the command word itself
+#     (`"bash" <<EOF`, `\bash <<EOF` -- the classic alias-dodge idiom),
+#   * a bare `VAR=value` assignment prefix (`LC_ALL=C bash <<EOF`),
+#   * a leading wrapper command with its own flags, assignments and
+#     numeric/duration operands (env, command, exec, builtin, sudo, doas,
+#     nohup, setsid, nice, ionice, stdbuf, timeout, time, xargs, unbuffer).
+# So `/bin/bash <<EOF`, `env bash <<EOF`, `LC_ALL=C bash <<EOF`,
+# `sudo bash <<EOF`, `cat <<EOF | sudo bash`, `timeout 60 bash <<EOF`,
+# `"bash" <<EOF`, `\bash <<EOF` and `/usr/bin/python3 <<EOF` all resolve to
+# the same real interpreter and are caught, closing the evasion class where
+# those forms slipped past the older first-token-only / unwrapped checks and
+# got their live bodies silently masked (i.e. ALLOWed).
+#
+# FAIL-CLOSED TAIL (#5226): an interpreter allowlist is an unbounded tail --
+# there is always one more wrapper. The residual class no allowlist can ever
+# enumerate is a command word the guard cannot resolve to a NAME at all:
+# `$SHELL <<EOF`, `${INTERP} <<EOF`, `$(which bash) <<EOF`. Those are treated
+# as interpreter-fed, so the body stays visible and the catastrophic-tier
+# check still sees any live invocation inside it.
+#
+# Inverting the whole test (mask ONLY for a known-inert SINK allowlist, so
+# every unknown opener fails closed) was considered and deliberately
+# rejected: the canonical Loom issue-filing idiom is
+# `create-issue.sh --title T --body "$(cat <<EOF ... EOF)"`, whose command
+# word is an ordinary repo script -- as is every other repo wrapper around a
+# forge call. Under a sink allowlist each of those hard-stalls on a
+# catastrophic-tier deny the moment the prose it carries quotes the
+# anti-pattern, which is precisely the #5181 false positive this masking
+# exists to fix (that bug was found when an agent could not file the report
+# about it). So the default for a resolvable-but-unknown command word stays
+# "mask", and only unresolvable words fail closed.
+function _interp_basename(tok,   base, SQ, DQ) {
+    # Reduce a (possibly quoted, backslash-escaped, path-qualified) command
+    # word to its basename: quotes and backslashes removed, then the text
+    # after the last `/`. `/bin/bash` -> `bash`, `./bash` -> `bash`,
+    # `/usr/bin/python3` -> `python3`, `"bash"` -> `bash`, `\bash` -> `bash`,
+    # `"/bin/bash"` -> `bash`; a bare `bash` or `.` is unchanged. Stripping
+    # quotes/backslashes ANYWHERE in the word (not just at its edges) also
+    # collapses the `b"a"sh` / `b\ash` splitting idioms, which the shell
+    # resolves to that same command.
+    SQ = sprintf("%c", 39)    # single quote
+    DQ = sprintf("%c", 34)    # double quote
     base = tok
+    gsub(SQ, "", base)
+    gsub(DQ, "", base)
+    gsub(/\\/, "", base)
     sub(/^.*\//, "", base)
     return base
 }
 function is_interpreter_opener(line,   n, segs, i, seg, m, toks, j, base) {
     # Split into command segments on ; & | (covers && and || too) so a piped
-    # or chained interpreter is caught in ANY position, e.g. `cat <<EOF | bash`.
+    # or chained interpreter is caught in ANY position, e.g. `cat <<EOF | bash`
+    # and `cat <<EOF | sudo bash`.
     n = split(line, segs, /[;&|]+/)
     for (i = 1; i <= n; i++) {
         seg = segs[i]
         sub(/^[ \t]+/, "", seg)
         m = split(seg, toks, /[ \t]+/)
         if (m == 0) continue
-        # Strip leading command wrappers that do not change what runs:
-        # env / command / exec / builtin, each followed by its own -flags
-        # and (for env) VAR=value assignments, then the real command word.
         j = 1
+        # (1) Strip a BARE `VAR=value` assignment prefix. This is ordinary
+        # shell with no `env` in front (`LC_ALL=C bash <<EOF`) and is the
+        # most common prefix in practice; before #5226 it fell straight
+        # through, because assignments were only skipped AFTER an
+        # env/command/exec/builtin token had already been seen.
+        while (j <= m && toks[j] ~ /^[A-Za-z_][A-Za-z0-9_]*=/) j++
+        # (2) Strip leading wrapper commands that do not change what runs,
+        # each followed by its own -flags, `VAR=value` assignments and
+        # numeric/duration operands (`timeout 60`, `timeout 1.5h`,
+        # `nice -n 10`, `ionice -c 2`), then re-check for another wrapper.
+        # The wrapper word goes through _interp_basename() too, so
+        # `/usr/bin/sudo` and `\sudo` strip exactly like a bare `sudo`.
         while (j <= m) {
-            if (toks[j] == "env" || toks[j] == "command" || toks[j] == "exec" || toks[j] == "builtin") {
+            base = _interp_basename(toks[j])
+            if (base ~ /^(env|command|exec|builtin|sudo|doas|nohup|setsid|nice|ionice|stdbuf|timeout|time|xargs|unbuffer)$/) {
                 j++
-                while (j <= m && (toks[j] ~ /^-/ || toks[j] ~ /^[A-Za-z_][A-Za-z0-9_]*=/)) j++
+                while (j <= m && (toks[j] ~ /^-/ || toks[j] ~ /^[A-Za-z_][A-Za-z0-9_]*=/ || toks[j] ~ /^[0-9]+([.][0-9]+)?[smhd]?$/)) j++
                 continue
             }
             break
@@ -1675,6 +1722,12 @@ function is_interpreter_opener(line,   n, segs, i, seg, m, toks, j, base) {
         if (j > m) continue
         base = _interp_basename(toks[j])
         if (base ~ /^(bash|sh|zsh|dash|ksh|python[0-9.]*|perl|ruby|node|nodejs|eval|source|\.)$/)
+            return 1
+        # (3) Fail CLOSED on a command word that resolves to no name at all --
+        # a variable / command substitution, or an empty word. See the
+        # FAIL-CLOSED TAIL note above: resolvable-but-unknown command words
+        # (`cat`, `tee`, a repo script) keep masking, per #5181.
+        if (base == "" || base ~ /[$`]/)
             return 1
     }
     return 0
