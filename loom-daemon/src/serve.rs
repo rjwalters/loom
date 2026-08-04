@@ -2465,6 +2465,7 @@ mod tests {
                 building: Some(1),
                 review_requested: Some(2),
                 changes_requested: Some(0),
+                changes_requested_unclaimed: Some(0),
                 approved: Some(1),
                 merged_24h: Some(5),
                 error: None,
