@@ -581,6 +581,47 @@ just some unrelated prose
 EOF
 gh api repos/o/r/issues/123/comments -f body=@/tmp/review.md'
 
+# --- #5198: gh-api-rawfield-body-literal-at must still deny an INTERPRETER-FED
+# heredoc (`bash <<'EOF' ... EOF`) even though #5181's fix masks heredoc BODY
+# text before scanning ------------------------------------------------------
+#
+# mask_heredoc_bodies()'s own "KNOWN LIMITATIONS #1" (documented above,
+# #5117) is that a heredoc body handed to an interpreter (`bash <<'EOF' ...
+# EOF`, `sh -s <<EOF ... EOF`, `... | bash`) is genuinely LIVE code to that
+# inner interpreter, even though the outer shell never parses it as
+# redirection/separator syntax. Blind masking (as #5192 first shipped) turns
+# this into a silent evasion: the same `gh api ... -f body=@path` invocation
+# that denies unwrapped ALLOWs once wrapped in `bash <<'EOF' ... EOF`,
+# reopening exactly the #4523/#4601/#4685 data-loss shape this check exists
+# to prevent. mask_heredoc_bodies_selective() (#5198) fixes this by NOT
+# masking a heredoc block whose opener feeds an interpreter, so the live
+# invocation stays visible to the scan.
+assert_deny "#5198: A live gh api -f body=@path invocation wrapped in 'bash <<EOF ... EOF' still denies (interpreter-fed heredoc)" \
+    'bash <<'"'"'EOF'"'"'
+gh api repos/o/r/issues/123/comments -f body=@/tmp/review.md
+EOF'
+
+assert_deny "#5198: Same interpreter-fed-heredoc evasion via 'sh -s <<EOF ... EOF'" \
+    'sh -s <<'"'"'EOF'"'"'
+gh api repos/o/r/issues/123/comments -f body=@/tmp/review.md
+EOF'
+
+assert_deny "#5198: Same interpreter-fed-heredoc evasion piped into bash ('cat <<EOF | bash')" \
+    'cat <<'"'"'EOF'"'"' | bash
+gh api repos/o/r/issues/123/comments -f body=@/tmp/review.md
+EOF'
+
+# The #5181 false-positive fix must still hold: a heredoc body destined for a
+# PLAIN FILE SINK (not an interpreter) that merely quotes the denied phrase as
+# inert prose must stay allowed — this is the same case already covered above
+# (line ~562), re-asserted here to make the #5198/#5181 co-existence explicit.
+assert_allow "#5198/#5181: A heredoc body destined for 'cat > file' (not an interpreter) that merely quotes the phrase stays allowed" \
+    'cat > /tmp/report2.md <<'"'"'EOF'"'"'
+Example of the anti-pattern:
+gh api repos/o/r/issues/1/comments -f body=@/tmp/review.md
+EOF
+echo done'
+
 # --- #4685: the same literal-@ loss on the `edit` subcommand — real-world
 # evidence is issue #4608's body being corrupted to the literal string
 # `@/tmp/issue4608_body_new.txt`. The #4523/#4601 rules above are hard-anchored
