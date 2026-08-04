@@ -1,50 +1,49 @@
 # Claude Code Settings
 
-This directory contains Claude Code configuration for the Loom project.
+This directory contains the Claude Code configuration Loom installs into this
+project (`settings.json`, `agents/`, `commands/loom/`, and this `README.md`
+itself), refreshed on `loom update` / reinstall and by
+`./.loom/scripts/resync-installed.sh`. See `../.github/CONFIGURATION.md` for
+the companion GitHub issue/label workflow configuration Loom installs
+alongside it.
 
 ## Files
 
 - **`settings.json`**: Team-wide permissions and settings (committed to git)
 - **`settings.local.json`**: Personal preferences (gitignored, create if needed)
-- **`../.mcp.json`**: MCP server configuration (at project root, committed to git)
 - **`agents/`**: Custom subagent definitions for Loom roles (see below)
+- **`commands/loom/`**: Slash command definitions for each Loom role (see "Slash Commands" below)
 
 ## Pre-approved Commands
 
-The `settings.json` file pre-approves common development commands to streamline the AI workflow:
+The `settings.json` file pre-approves common development commands to streamline
+the AI workflow. The exact, authoritative list lives in `settings.json` itself;
+the broad categories are:
 
-### GitHub CLI (`gh`)
-- PR operations: create, edit, view, list, checkout, diff, review, checks
-- Issue operations: create, edit, view, list, close
-- Workflow runs: view
+### Version control & GitHub CLI
+- `git` and `gh` (all subcommands) — status, commit, push, pull, branch,
+  worktree, PR/issue operations, and so on
 
-### Git Operations
-- Status, add, commit, push, pull, fetch, merge
-- Branch management: checkout, branch, log, diff
-- Working tree operations: restore, stash, reset, clean
-- Worktree operations: add
-- Configuration: config, check-ignore
+### Package managers & runtimes
+- `pnpm`, `npx`, `cargo`, `node` (all subcommands) — this repo's own
+  toolchain determines which of these are actually exercised; the rest simply
+  go unused
 
-### Package Management
-- `pnpm daemon:dev` - Run daemon in dev mode
-- `pnpm daemon:build` - Build daemon (release)
-- `pnpm check:all` - Run all checks
-- `pnpm check:ci` - Run CI checks locally
+### Repo scripts
+- `./scripts/**` and `./.loom/scripts/**` — this repo's and Loom's own helper
+  scripts
 
-### Code Quality
-- `pnpm clippy` - Rust linting
-- `pnpm test` - Run tests
+### Common utilities
+- File/text tools: `cat`, `ls`, `find`, `grep`, `sed`, `awk`, `jq`, `diff`,
+  `patch`, and similar POSIX utilities
+- Archive tools: `tar`, `zip`/`unzip`, `gzip`/`gunzip`
+- Network: `curl`, `wget`
+- Image tools: `convert`, `magick`, `iconutil`
+- Terminal management: `tmux`
+- Web search: enabled
 
-### Rust/Cargo
-- `cargo check` - Check compilation
-- `cargo build` - Build project
-- `cargo test` - Run tests
-
-### Utilities
-- File operations: cat, ls, pwd, cd, mkdir
-- Image conversion: convert, magick, iconutil
-- Terminal management: tmux list-sessions
-- Web search: Enabled
+See `settings.json` for the exact allowlist — this is a summary, not a
+substitute.
 
 ## Local Overrides
 
@@ -64,10 +63,13 @@ Local settings override team settings for that specific configuration key.
 
 ## MCP Server
 
-Loom provides a single **unified `mcp-loom` MCP server** (configured in
-`.mcp.json`) that consolidates log monitoring, terminal management, and UI/state
-control. It replaces the historical trio of separate `loom-logs` /
-`loom-terminals` / `loom-ui` servers. Representative tools by category:
+Loom provides a single **unified `mcp-loom` MCP server** that consolidates log
+monitoring, terminal management, and UI/state control. It replaces the
+historical trio of separate `loom-logs` / `loom-terminals` / `loom-ui`
+servers. The server is registered once per machine at **user scope** by the
+Loom installer (`scripts/install-loom.sh`, refreshed by `loom update`) — there
+is no per-project `.mcp.json` in this repo to configure or approve.
+Representative tools by category:
 
 **Log tools**:
 - `tail_daemon_log` - View daemon logs (`~/.loom/daemon.log`)
@@ -95,7 +97,9 @@ control. It replaces the historical trio of separate `loom-logs` /
 
 See the mcp-loom package README for the full tool catalog.
 
-**Note**: When you first open the project, Claude Code will prompt you to approve the MCP server. You can also enable it automatically by setting `"enableAllProjectMcpServers": true` in your `.claude/settings.local.json`.
+**Note**: Because the server is registered at user scope, it is available
+automatically in every Loom-installed project on this machine — there is no
+per-project approval prompt or `enableAllProjectMcpServers` setting to manage.
 
 ## Slash Commands
 
@@ -157,7 +161,11 @@ To create a custom slash command:
 2. Include role purpose, workflow guidelines, and iteration instructions
 3. Use it with `/your-command` (or `/your-namespace/command`)
 
-**Note**: `.loom/roles/` contains symlinks to `.claude/commands/loom/` for backward compatibility. The single source of truth for all Loom role definitions is `.claude/commands/loom/`.
+**Note**: `.loom/roles/` contains file copies of the role prompts (kept in
+sync with `.claude/commands/loom/` by `loom update` / `resync-installed.sh`)
+for backward compatibility with tooling that expects role definitions under
+`.loom/roles/`. The single source of truth for all Loom role definitions is
+`.claude/commands/loom/`.
 
 ## Custom Subagents
 

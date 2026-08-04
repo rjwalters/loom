@@ -34,6 +34,8 @@
 #   .loom/runtimes/         <- defaults/runtimes/         (recursive; BACKFILLED if absent, #4688)
 #   .loom/bin/              <- defaults/.loom/bin/        (recursive; live consumer CLI)
 #   .claude/commands/loom/  <- defaults/.claude/commands/loom/ (recursive)
+#   .claude/README.md       <- defaults/.claude/README.md      (single file, #5264)
+#   .github/CONFIGURATION.md <- defaults/.github/CONFIGURATION.md (single file, #5264)
 #
 # It also applies one targeted field edit outside the pure-copy model (#4285):
 # a root package.json whose "name" is exactly "loom-workspace" (the Loom
@@ -738,6 +740,23 @@ if [[ -d "$REPO_ROOT/.claude/commands/loom" ]]; then
     resync_tree "$DEFAULTS_DIR/.claude/commands/loom" "$REPO_ROOT/.claude/commands/loom" "commands/loom" ".claude/commands/loom"
 fi
 
+# ---------- single-file consumer-install docs (#5264) ----------
+#
+# .claude/README.md and .github/CONFIGURATION.md are copied verbatim into
+# every consumer repo at install time (scripts/install/manifest.sh) but, prior
+# to #5264, were never covered by this script's surface map — a fix to either
+# file landed on main but never reached an already-installed repo. Both are
+# single files (not directories), so resync_tree doesn't apply; sync_one
+# handles them directly, each gated on the destination already existing so a
+# consumer that never received the file (or deliberately removed it) is not
+# force-populated.
+if [[ -f "$REPO_ROOT/.claude/README.md" ]]; then
+    sync_one "$DEFAULTS_DIR/.claude/README.md" "$REPO_ROOT/.claude/README.md" ".claude/README.md"
+fi
+if [[ -f "$REPO_ROOT/.github/CONFIGURATION.md" ]]; then
+    sync_one "$DEFAULTS_DIR/.github/CONFIGURATION.md" "$REPO_ROOT/.github/CONFIGURATION.md" ".github/CONFIGURATION.md"
+fi
+
 # ---------- install the deferred self-copy, now that every surface settled ----
 #
 # The scripts walk above records (rather than applies) a sync of the script this
@@ -1034,7 +1053,7 @@ suggest_commit_if_resync_only_dirt() {
         path="${path%\"}"
         path="${path#\"}"
         case "$path" in
-            .loom/hooks/*|.loom/scripts/*|.loom/roles/*|.loom/docs/*|.loom/runtimes/*|.loom/bin/*|.claude/commands/loom/*|.loom/install-metadata.json|.gitattributes)
+            .loom/hooks/*|.loom/scripts/*|.loom/roles/*|.loom/docs/*|.loom/runtimes/*|.loom/bin/*|.claude/commands/loom/*|.claude/README.md|.github/CONFIGURATION.md|.loom/install-metadata.json|.gitattributes)
                 resync_paths+=("$path")
                 ;;
             *)
