@@ -390,6 +390,25 @@ _worktree_dirty_lines() {
     ' || true
 }
 
+# Whether $branch has a MERGED pull request on the forge (#5177 / #4889).
+#
+# This repo squash-merges, so once a PR lands, the branch's original commits are
+# never reachable from the squash commit on main — `git branch -d`'s "fully
+# merged" safety check therefore refuses to delete a genuinely-landed branch.
+# When the forge confirms the PR merged, the work IS landed and `git branch -D`
+# is safe, mirroring merge-pr.sh's existing squash-aware `-d`→`-D` fallback.
+#
+# Fail-closed: a missing gh, any gh error, or an empty result all return
+# non-zero ("not merged"), so a probe failure never escalates to a force-delete.
+_worktree_pr_is_merged() {
+    local repo_root="$1" branch="$2" count
+    [[ -n "$branch" ]] || return 1
+    command -v gh >/dev/null 2>&1 || return 1
+    count="$( (cd "$repo_root" 2>/dev/null && \
+        gh pr list --head "$branch" --state merged --json number --jq 'length' 2>/dev/null) )" || return 1
+    [[ -n "$count" && "$count" != "0" ]]
+}
+
 # remove_worktree_command [--keep-branch] [--force] [--json] <issue-number>
 #
 # Invoked from the early arg dispatch below. Returns 0 on success (including the
@@ -519,13 +538,27 @@ remove_worktree_command() {
 
     # 6. Remove the worktree.
     _rm_info "Removing worktree: $worktree_path"
-    local removed=false
-    if git -C "$repo_root" worktree remove "$worktree_path" --force >/dev/null 2>&1; then
+    local removed=false remove_err
+    if remove_err="$(git -C "$repo_root" worktree remove "$worktree_path" --force 2>&1)"; then
         removed=true
         _rm_success "Worktree removed"
         if [[ "$in_worktree" == true ]]; then
             _rm_warning "Your shell's working directory was inside the removed worktree."
             _rm_warning "Run this command to fix:  cd $repo_root"
+        fi
+    elif printf '%s' "$remove_err" | grep -qi "is not a working tree" && \
+         [[ -f "$worktree_path/.loom-managed" ]]; then
+        # #5177: git no longer tracks this path as a worktree (e.g. a stale
+        # `git worktree prune` left the directory on disk), so `git worktree
+        # remove` can never clean it and it accumulates forever. It is confirmed
+        # Loom-managed (the step-2 sentinel guard is re-checked here) and is by
+        # construction under the managed worktree root ($worktree_root_dir/issue-N),
+        # so remove the directory directly and prune the dangling registration.
+        if rm -rf "$worktree_path"; then
+            removed=true
+            _rm_success "Removed untracked worktree directory (no git worktree entry)"
+        else
+            _rm_warning "Could not remove untracked worktree directory at $worktree_path"
         fi
     else
         _rm_warning "Could not remove worktree at $worktree_path"
@@ -546,6 +579,17 @@ remove_worktree_command() {
         elif git -C "$repo_root" branch -d "$attached_branch" >/dev/null 2>&1; then
             _rm_success "Local branch '$attached_branch' deleted"
             branch_status="deleted"
+        elif _worktree_pr_is_merged "$repo_root" "$attached_branch"; then
+            # #5177 / #4889: `git branch -d` refused because a squash-merged
+            # branch is never "fully merged" by reachability — but the forge
+            # confirms its PR merged, so the work is landed and -D is safe.
+            if git -C "$repo_root" branch -D "$attached_branch" >/dev/null 2>&1; then
+                _rm_success "Local branch '$attached_branch' force-deleted (PR merged — squash-safe)"
+                branch_status="deleted"
+            else
+                _rm_warning "Could not delete local branch '$attached_branch' even after confirming its PR merged"
+                branch_status="unmerged"
+            fi
         else
             _rm_warning "Could not delete local branch '$attached_branch' (may have unmerged commits — use 'git branch -D' if intentional)"
             branch_status="unmerged"

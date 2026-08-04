@@ -109,6 +109,10 @@ pub enum Reason {
     UserOwned,
     Uncommitted,
     ReachableFromOriginMain,
+    /// The branch's PR is merged (including squash-merged, whose original
+    /// commits are never reachable from `origin/main`) — the work is landed
+    /// regardless of git reachability (#5177).
+    PrMerged,
     TooRecent,
     UnreachableHead,
     ForceOverrideUnreachable,
@@ -125,6 +129,7 @@ impl Reason {
             Reason::UserOwned => "user_owned",
             Reason::Uncommitted => "uncommitted",
             Reason::ReachableFromOriginMain => "reachable_from_origin_main",
+            Reason::PrMerged => "pr_merged",
             Reason::TooRecent => "too_recent",
             Reason::UnreachableHead => "unreachable_head",
             Reason::ForceOverrideUnreachable => "force_override_unreachable",
@@ -150,8 +155,20 @@ pub const DEFAULT_AGGRESSIVE_MIN_AGE: u64 = 86400;
 /// 4. missing `.loom-managed` sentinel / non-canonical path -> keep
 /// 5. uncommitted changes (unless `force`) -> keep
 /// 6. HEAD reachable from origin/main -> remove
-/// 7. younger than `min_age_seconds` -> keep
-/// 8. fallback: `force` -> remove, else keep
+/// 7. PR merged (including squash-merged) -> remove (#5177)
+/// 8. younger than `min_age_seconds` -> keep
+/// 9. fallback: `force` -> remove, else keep
+///
+/// Step 7 is the squash-merge fix (#5177): this repo squash-merges, so a
+/// merged branch's original commits are never an ancestor of `origin/main`.
+/// Raw reachability (step 6) therefore cannot distinguish a safely-landed
+/// squash-merged worktree from one holding genuinely unmerged work, and the
+/// fallback (step 9) used to keep it forever under `UnreachableHead`. A merged
+/// PR means the work IS landed regardless of reachability. Placing it AFTER
+/// the uncommitted / open-PR / active-shepherd guards keeps it purely
+/// **additive**: it can only turn a would-be "unreachable, keep" into a
+/// remove, never override a guard that protects genuinely unmerged or
+/// uncommitted work.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub fn evaluate_aggressive_candidate(
@@ -163,6 +180,7 @@ pub fn evaluate_aggressive_candidate(
     has_sentinel: bool,
     is_uncommitted: bool,
     head_reachable: bool,
+    pr_merged: bool,
     age_seconds: Option<u64>,
     min_age_seconds: u64,
     force: bool,
@@ -194,6 +212,12 @@ pub fn evaluate_aggressive_candidate(
 
     if head_reachable {
         return (Decision::Remove, Reason::ReachableFromOriginMain);
+    }
+
+    // #5177: squash-merged work is landed even though its commits are never
+    // reachable from origin/main. Additive to the reachability check above.
+    if pr_merged {
+        return (Decision::Remove, Reason::PrMerged);
     }
 
     if let Some(age) = age_seconds {
@@ -239,6 +263,15 @@ fn decide_for_worktree(
         .head
         .as_deref()
         .is_some_and(|h| is_ancestor_of_origin_main(repo_root, h));
+    // #5177: only probe the forge for merged status when reachability already
+    // failed — a reachable HEAD is landed anyway, so the (rate-limited) forge
+    // call is pure waste there. This is the squash-merge escape hatch for the
+    // otherwise-`UnreachableHead` class.
+    let pr_merged = !head_reachable
+        && wt
+            .branch_short()
+            .and_then(|b| naming::issue_from_branch(&b))
+            .is_some_and(|n| pr_is_merged(repo_root, n));
     let age_seconds = worktree_age_seconds(&resolved_wt);
 
     evaluate_aggressive_candidate(
@@ -250,10 +283,29 @@ fn decide_for_worktree(
         has_sentinel,
         is_uncommitted,
         head_reachable,
+        pr_merged,
         age_seconds,
         min_age_seconds,
         force,
     )
+}
+
+/// Whether `issue_num`'s branch has a **merged** PR (including squash-merged).
+///
+/// Reuses `clean.rs`'s shared PR-merged probe (#5177) rather than building a
+/// second squash-detection path. REST first — the daemon-side reaper's
+/// rationale applies here too: `gh pr list` goes through the routinely-exhausted
+/// GraphQL quota, while `gh api .../pulls` uses the separate, less-contended
+/// REST pool — falling back to the GraphQL-backed probe only when REST cannot
+/// answer.
+fn pr_is_merged(repo_root: &Path, issue_num: u32) -> bool {
+    let status = match clean::repo_owner_rest(repo_root)
+        .map(|owner| clean::check_pr_merged_rest(repo_root, &owner, issue_num))
+    {
+        Some(clean::PrStatus::Unknown) | None => clean::check_pr_merged(repo_root, issue_num),
+        Some(status) => status,
+    };
+    matches!(status, clean::PrStatus::Merged { .. })
 }
 
 fn is_ancestor_of_origin_main(repo_root: &Path, head_sha: &str) -> bool {
@@ -404,7 +456,9 @@ pub fn clean_aggressive(
                             );
                         }
                     }
-                    Reason::ReachableFromOriginMain | Reason::ForceOverrideUnreachable => {
+                    Reason::ReachableFromOriginMain
+                    | Reason::PrMerged
+                    | Reason::ForceOverrideUnreachable => {
                         // Unreachable in Keep branch — defensive, never hit.
                         stats.record_error(
                             &label,
@@ -532,7 +586,7 @@ mod tests {
         let mut w = wt();
         w.bare = true;
         let (d, r) = evaluate_aggressive_candidate(
-            &w, false, None, false, true, true, false, true, None, 86400, false,
+            &w, false, None, false, true, true, false, true, false, None, 86400, false,
         );
         assert_eq!(d, Decision::Keep);
         assert_eq!(r, Reason::BareMainWorktree);
@@ -550,6 +604,7 @@ mod tests {
             true,
             false,
             true,
+            false,
             None,
             86400,
             true, // even with force
@@ -570,6 +625,7 @@ mod tests {
             true,
             false,
             true,
+            false,
             None,
             86400,
             false,
@@ -590,6 +646,7 @@ mod tests {
             true,
             false,
             true,
+            false,
             None,
             86400,
             false,
@@ -610,6 +667,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             None,
             86400,
             false,
@@ -630,6 +688,7 @@ mod tests {
             true,
             false,
             true,
+            false,
             None,
             86400,
             false,
@@ -650,6 +709,7 @@ mod tests {
             true,
             true,
             true,
+            false,
             None,
             86400,
             false,
@@ -666,6 +726,7 @@ mod tests {
             true,
             true,
             true,
+            false,
             None,
             86400,
             true,
@@ -685,6 +746,7 @@ mod tests {
             true,
             false,
             true,
+            false,
             Some(1), // 1 second old — would fail the age gate if reached
             86400,
             false,
@@ -703,6 +765,7 @@ mod tests {
             false,
             true,
             true,
+            false,
             false,
             false,
             Some(10),
@@ -725,6 +788,7 @@ mod tests {
             true,
             false,
             false,
+            false,
             Some(999_999),
             86400,
             false,
@@ -745,12 +809,83 @@ mod tests {
             true,
             false,
             false,
+            false,
             Some(999_999),
             86400,
             true,
         );
         assert_eq!(d, Decision::Remove);
         assert_eq!(r, Reason::ForceOverrideUnreachable);
+    }
+
+    /// #5177 AC1: a squash-merged worktree has an unreachable HEAD (its commits
+    /// are never an ancestor of origin/main) yet its PR is merged — it must be
+    /// removed, not retained under `UnreachableHead`.
+    #[test]
+    fn unreachable_but_pr_merged_is_removed() {
+        let w = wt();
+        let (d, r) = evaluate_aggressive_candidate(
+            &w,
+            false,
+            Some((false, true)), // no OPEN pr, lookup ok
+            false,
+            true,
+            true,
+            false,         // not uncommitted
+            false,         // HEAD not reachable (squash-merged)
+            true,          // ...but the PR is merged
+            Some(999_999), // old enough that the age gate would otherwise not matter
+            86400,
+            false, // no --force needed
+        );
+        assert_eq!(d, Decision::Remove);
+        assert_eq!(r, Reason::PrMerged);
+    }
+
+    /// #5177 AC2: the merged-PR check is ADDITIVE — it must never override the
+    /// uncommitted-work guard. Uncommitted changes win even when the PR merged.
+    #[test]
+    fn uncommitted_is_kept_even_when_pr_merged() {
+        let w = wt();
+        let (d, r) = evaluate_aggressive_candidate(
+            &w,
+            false,
+            Some((false, true)),
+            false,
+            true,
+            true,
+            true,  // uncommitted work present
+            false, // HEAD not reachable
+            true,  // PR merged
+            None,
+            86400,
+            false, // not forced
+        );
+        assert_eq!(d, Decision::Keep);
+        assert_eq!(r, Reason::Uncommitted);
+    }
+
+    /// #5177 AC2: an open PR still beats the merged-PR path — a worktree whose
+    /// branch has an OPEN pr is kept regardless of any merged-status probe.
+    #[test]
+    fn open_pr_still_beats_pr_merged() {
+        let w = wt();
+        let (d, r) = evaluate_aggressive_candidate(
+            &w,
+            false,
+            Some((true, true)), // OPEN pr present
+            false,
+            true,
+            true,
+            false,
+            false,
+            true, // even if a merged-status probe somehow also said yes
+            None,
+            86400,
+            false,
+        );
+        assert_eq!(d, Decision::Keep);
+        assert_eq!(r, Reason::OpenPr);
     }
 
     #[test]
