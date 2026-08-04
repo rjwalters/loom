@@ -1626,6 +1626,69 @@ assert_allow "forceScope protected: multi-refspec force-push +feature/x and HEAD
 assert_ask "forceScope default(all): multi-refspec force-push asks" \
     "git push --force origin feature/x feature/y" "$FORCE_ALL_REPO"
 
+# ---- protected mode: `cd <worktree> &&` prefix before an "@HEAD@"-target force
+# op (#5156). ----
+# Regression: the hook's reported session cwd can still be the MAIN repo root
+# while the COMMAND itself first `cd`s into a linked worktree and
+# force-operates on that worktree's own already-checked-out branch — a
+# routine, safe operation (e.g. fast-forwarding a worktree to its own
+# just-pushed/rebased branch). Before the #5156 fix, "@HEAD@" branch-identity
+# resolution for a hard reset / refspec-less force-push fell back to the raw
+# session cwd whenever no explicit `-C` flag was present, so it queried the
+# checked-out branch of the MAIN root (protected) instead of the worktree's own
+# feature branch, and incorrectly asked citing the protected branch. A REAL
+# linked `git worktree add` fixture is used (not a plain subdirectory) so the
+# worktree genuinely has its own independent HEAD, mirroring make_wt_repo_linked
+# above.
+FORCE_CD_REPO=$(mktemp -d 2>/dev/null)
+FORCE_CD_REPO=$(cd "$FORCE_CD_REPO" && pwd -P)
+git -C "$FORCE_CD_REPO" init -q >/dev/null 2>&1
+mkdir -p "$FORCE_CD_REPO/.loom"
+printf '%s' '{"guards":{"forceScope":"protected"}}' > "$FORCE_CD_REPO/.loom/config.json"
+# .loom/config.json must be COMMITTED (not left untracked) so it is present in
+# the linked worktree's own checkout too -- force_scope_mode() resolves
+# REPO_ROOT from `git rev-parse --show-toplevel` on the hook's OWN reported
+# cwd, which for a cwd inside the worktree is the WORKTREE root, not this main
+# root; an untracked file here would be invisible from there.
+git -C "$FORCE_CD_REPO" add .loom/config.json >/dev/null 2>&1
+git -C "$FORCE_CD_REPO" -c user.email=loom@test -c user.name=loom \
+    commit -q -m init >/dev/null 2>&1
+mkdir -p "$FORCE_CD_REPO/.loom/worktrees"
+git -C "$FORCE_CD_REPO" worktree add -q "$FORCE_CD_REPO/.loom/worktrees/issue-1" \
+    -b feature/issue-1 >/dev/null 2>&1
+FORCE_CD_WT="$FORCE_CD_REPO/.loom/worktrees/issue-1"
+
+# Hook cwd = MAIN repo root; command cd's into the worktree, then hard-resets
+# the worktree's own already-checked-out branch -> must ALLOW (the false-ask
+# this issue fixes).
+assert_allow "forceScope protected (#5156): cd into worktree then reset --hard own branch allows (hook cwd=main root)" \
+    "cd $FORCE_CD_WT && git reset --hard origin/feature/issue-1" "$FORCE_CD_REPO"
+# Same effective operation with the hook cwd already AT the worktree -> must
+# also ALLOW (this was already correct pre-fix; kept as a matching control).
+assert_allow "forceScope protected (#5156): reset --hard own branch allows (hook cwd=worktree already)" \
+    "git reset --hard origin/feature/issue-1" "$FORCE_CD_WT"
+# A refspec-less force-push after a cd-prefix resolves "@HEAD@" the same way ->
+# ALLOW.
+assert_allow "forceScope protected (#5156): cd into worktree then bare force-push allows (hook cwd=main root)" \
+    "cd $FORCE_CD_WT && git push --force" "$FORCE_CD_REPO"
+
+# Control: cd-ing BACK into the main (protected-branch) root and hard-resetting
+# there must still ASK -- the fix must never widen an allow past a genuine
+# protected-branch target.
+assert_ask "forceScope protected (#5156): cd into main root then reset --hard still asks (hook cwd=worktree)" \
+    "cd $FORCE_CD_REPO && git reset --hard HEAD~1" "$FORCE_CD_WT"
+# Control: cd into a directory with no real git checkout must stay ambiguous ->
+# ASK, never silently allow ("never widen a deny into an allow").
+assert_ask "forceScope protected (#5156): cd into an unresolvable directory still asks (ambiguous)" \
+    "cd /nonexistent-dir-5156-does-not-exist && git reset --hard HEAD~1" "$FORCE_CD_REPO"
+# Control: an explicit branch refspec is untouched by cd-tracking -- a
+# cd-prefixed push naming a protected branch by refspec still asks (it was
+# already correctly resolved from the refspec text, not cwd/HEAD).
+assert_ask_env "forceScope protected (#5156): cd-prefixed push naming a protected refspec branch still asks (explicit-refspec path untouched)" \
+    "LOOM_DEFAULT_BRANCH=develop" "cd $FORCE_CD_WT && git push --force origin develop" "$FORCE_CD_REPO"
+
+rm -rf "$FORCE_CD_REPO"
+
 # Clean up force-scope temp repos.
 for _force_dir in "$FORCE_ALL_REPO" "$FORCE_PROT_DEFAULT" "$FORCE_PROT_FEATURE" \
     "$FORCE_PROT_DETACHED" "$FORCE_OFF_REPO" "$FORCE_BAD_REPO" "$FORCE_BOGUS_REPO"; do

@@ -1630,10 +1630,29 @@ function mask_heredoc_bodies(s,   out, lines, nl, i, j, line, trimmed, body, del
 #       * `HEAD`, or no ref => the literal "@HEAD@" (resolve checked-out branch)
 #   - reset --hard: always emitted with <target> = "@HEAD@".
 # The caller resolves "@HEAD@" to the checked-out branch and applies the mode.
+#
+# $2 seeds the starting cwd (the hook's own session cwd — callers pass $CWD,
+# mirroring extract_write_targets's `startcwd` parameter). A `cd <dir>`
+# segment updates that cwd for LATER segments of the SAME command — global awk
+# variable `curcwd`, threaded across the per-segment loop exactly like
+# extract_write_targets threads it via its own `cd` case (#4933/#4881). This
+# closes the false-ask where a command first `cd`s into a worktree (e.g. `cd
+# .loom/worktrees/issue-N && git reset --hard origin/feature/issue-N`) while
+# the hook's reported session cwd is still the main repo root: without cd
+# tracking the "@HEAD@" target resolved against the WRONG checkout (#5156).
+#
+# The cd-tracked cwd is used ONLY for "@HEAD@"-target lines (reset --hard, and
+# a push with no/HEAD refspec) — i.e. only where branch identity actually
+# needs resolving against a checkout. A push naming an explicit branch refspec
+# keeps deriving its <cpath> from an explicit `-C <path>` ONLY, exactly as
+# before: its target is the literal refspec text, not cwd/HEAD-derived, so cd
+# tracking must not change its behavior (a still-empty <cpath> there continues
+# to fall back to the caller's raw $CWD, unchanged).
 parse_force_ops() {
-    printf '%s' "$1" | awk "$_QSPLIT_AWK"'
-    BEGIN { SEP = sprintf("%c", 31) }  # US (unit separator) — non-whitespace so
-                                       # bash read does not trim an empty cpath.
+    printf '%s' "$1" | awk -v startcwd="$2" "$_QSPLIT_AWK"'
+    BEGIN { SEP = sprintf("%c", 31); curcwd = startcwd }
+                                       # SEP is non-whitespace so bash read
+                                       # does not trim an empty cpath.
     {
         $0 = qsplit($0)   # quote-aware segmentation (#3755)
         n = split($0, segs, "\n")
@@ -1644,6 +1663,20 @@ parse_force_ops() {
             sub(/^[ \t]+/, "", seg)
             m = split(seg, toks, /[ \t]+/)
             if (m == 0) continue
+            # Thread a `cd <dir>` prefix through LATER segments of this same
+            # compound command (mirrors extract_write_targets, #4933/#4881).
+            # `cd -` and a bare `cd` are left unresolved (matches the same
+            # known limitation there) rather than guessed.
+            if (toks[1] == "cd") {
+                if (m >= 2 && toks[2] != "" && toks[2] != "-") {
+                    if (toks[2] ~ /^\//) {
+                        curcwd = toks[2]
+                    } else if (curcwd != "") {
+                        curcwd = curcwd "/" toks[2]
+                    }
+                }
+                continue
+            }
             if (toks[1] != "git") continue
             # Walk global options between `git` and the subcommand.
             cpath = ""
@@ -1657,6 +1690,12 @@ parse_force_ops() {
             }
             if (k > m) continue
             subcmd = toks[k]
+            # headcpath is used ONLY for "@HEAD@"-target lines: an explicit
+            # -C always wins; otherwise fall back to the cd-tracked curcwd
+            # (which starts at startcwd, so a command with no cd prefix
+            # resolves identically to the pre-#5156 behaviour).
+            headcpath = cpath
+            if (headcpath == "") headcpath = curcwd
             if (subcmd == "push") {
                 force = 0
                 np = 0
@@ -1678,22 +1717,24 @@ parse_force_ops() {
                 # (not just the first) reaches the per-line check in the caller. A
                 # bare push with no refspec (np < 2) resolves the checked-out branch.
                 if (np < 2) {
-                    print cpath SEP "@HEAD@"
+                    print headcpath SEP "@HEAD@"
                 } else {
                     for (p = 2; p <= np; p++) {
                         rs = pos[p]
                         sub(/^\+/, "", rs)
                         ci = index(rs, ":")
                         if (ci > 0) rs = substr(rs, ci + 1)
-                        target = "@HEAD@"
-                        if (rs != "HEAD" && rs != "") target = rs
-                        print cpath SEP target
+                        if (rs != "HEAD" && rs != "") {
+                            print cpath SEP rs
+                        } else {
+                            print headcpath SEP "@HEAD@"
+                        }
                     }
                 }
             } else if (subcmd == "reset") {
                 hard = 0
                 for (j = k+1; j <= m; j++) if (toks[j] == "--hard") hard = 1
-                if (hard) print cpath SEP "@HEAD@"
+                if (hard) print headcpath SEP "@HEAD@"
             }
         }
     }'
@@ -3056,7 +3097,7 @@ if [[ "$COMMAND_NO_COMMENT" == *git* ]] && \
    echo "$COMMAND_NO_COMMENT" | grep -qE '(--force|--force-with-lease|(^|[[:space:]])-f([[:space:]]|$)|--hard)'; then
     _FORCE_MODE=$(force_scope_mode)
     if [[ "$_FORCE_MODE" != "off" ]]; then
-        _FORCE_OPS=$(parse_force_ops "$COMMAND_NO_COMMENT")
+        _FORCE_OPS=$(parse_force_ops "$COMMAND_NO_COMMENT" "$CWD")
         if [[ -n "$_FORCE_OPS" ]]; then
             if [[ "$_FORCE_MODE" == "all" ]]; then
                 # Preserve pre-#3674 behaviour byte-for-byte: any force op asks.
