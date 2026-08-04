@@ -17,6 +17,7 @@ use loom_daemon::event_bus::EventBus;
 use loom_daemon::health_monitor;
 use loom_daemon::host_breaker;
 use loom_daemon::idle_exit;
+use loom_daemon::install_self_check;
 use loom_daemon::ipc::IpcServer;
 use loom_daemon::main_health_gate;
 use loom_daemon::metrics_collector;
@@ -1112,6 +1113,37 @@ pub(crate) async fn run_daemon() -> Result<()> {
                  LOOM_ORPHAN_PROCESS_REAPER=0 / autonomous.processReaper.enabled=false \
                  for the orphaned-process pass; LOOM_PRIMARY_CHECKOUT_REAPER=0 / \
                  autonomous.primaryCheckoutReaper.enabled=false for the primary-checkout pass)"
+            );
+            None
+        };
+
+    // Install/host invariant self-check (#5035): periodically verify the
+    // install/host invariants the daemon's own operation depends on — the MCP
+    // bundle loads, `.loom/runtimes/` is populated for the configured runtimes,
+    // and the token `.ranking` is fresh — repairing the mechanically-safe drift
+    // and filing one deduped issue per non-repairable condition. **Default-off**
+    // (FLAGS-OFF) and **report-only by default** even when enabled, so the check
+    // can be trusted before it is allowed to act. Same multi-workspace
+    // spawn_blocking shape as the reaper; the checks are filesystem reads and
+    // any repair is timeout-guarded, so a pass can never wedge dispatch.
+    let install_self_check_config = install_self_check::read_config(&sweep_workspace);
+    let _install_self_check_handle =
+        if install_self_check::resolve_enabled(&install_self_check_config) {
+            let interval = install_self_check::resolve_interval(&install_self_check_config);
+            let repair = install_self_check::resolve_repair(&install_self_check_config);
+            log::info!(
+                "install_self_check: enabled (multi-workspace, interval={}s, repair={})",
+                interval.as_secs(),
+                repair
+            );
+            Some(install_self_check::spawn_multi_install_self_check_task(
+                sweep_workspace.clone(),
+                interval,
+            ))
+        } else {
+            log::debug!(
+                "install_self_check: disabled (set LOOM_INSTALL_SELF_CHECK=1 or \
+                 autonomous.installSelfCheck.enabled=true to opt in)"
             );
             None
         };
