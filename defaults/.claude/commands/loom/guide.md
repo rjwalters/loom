@@ -35,6 +35,14 @@ that never had it.
 6. Human adds `loom:issue` when ready to approve work
 7. Builder implements approved work
 
+## ⚠️ `--body @path` Does NOT Expand — It Posts the Literal String
+
+If you post a comment via `gh issue comment` / `gh pr comment` / `gh api ...
+comments` from a scratch file, `--body @path` (and `gh api -f body=@path`)
+posts the literal string `@path`, not the file's contents. **Full pitfall,
+incident citation, and fixes**:
+[`comment-body-literal-path.md`](comment-body-literal-path.md).
+
 ## Exception: Explicit User Instructions
 
 **User commands override the label-based state machine.**

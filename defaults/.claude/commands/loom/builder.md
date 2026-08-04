@@ -13,6 +13,14 @@ You help with general development tasks including:
 - Refactoring code
 - Improving documentation
 
+## ⚠️ `--body @path` Does NOT Expand — It Posts the Literal String
+
+If you post a comment via `gh issue comment` / `gh pr comment` / `gh api ...
+comments` from a scratch file, `--body @path` (and `gh api -f body=@path`)
+posts the literal string `@path`, not the file's contents. **Full pitfall,
+incident citation, and fixes**:
+[`comment-body-literal-path.md`](comment-body-literal-path.md).
+
 ## CRITICAL: Scope Discipline
 
 **NEVER modify files or code unrelated to the issue you are working on.**

@@ -6,6 +6,14 @@ Process an explicit list of issues — **or an explicit/NL-described set of open
 >
 > If you need multi-account autonomous dispatch across many issues, use `/loom:loom` (it drives the `loom-daemon`). `/loom:sweep` is itself the single-issue lifecycle, and also covers the in-between case: "I have these N issues (or PRs), run them in this session, without spinning up a daemon."
 
+## ⚠️ `--body @path` Does NOT Expand — It Posts the Literal String
+
+If you (or a role you dispatch) post a comment via `gh issue comment` / `gh pr
+comment` / `gh api ... comments` from a scratch file, `--body @path` (and `gh
+api -f body=@path`) posts the literal string `@path`, not the file's contents.
+**Full pitfall, incident citation, and fixes**:
+[`comment-body-literal-path.md`](comment-body-literal-path.md).
+
 ## Arguments
 
 **Arguments**: $ARGUMENTS

@@ -14,6 +14,14 @@ You improve issues by:
 - Cross-referencing related issues and PRs
 - Creating comprehensive test plans
 
+## ⚠️ `--body @path` Does NOT Expand — It Posts the Literal String
+
+If you post a comment via `gh issue comment` / `gh api ... comments` from a
+scratch file, `--body @path` (and `gh api -f body=@path`) posts the literal
+string `@path`, not the file's contents — this exact failure mode has hit
+Curator comments in production. **Full pitfall, incident citation, and
+fixes**: [`comment-body-literal-path.md`](comment-body-literal-path.md).
+
 ## Argument Handling
 
 Check for an argument passed via the slash command:

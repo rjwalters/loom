@@ -12,6 +12,16 @@ The Champion acts as the final step in the PR pipeline, merging PRs that have pa
 
 ---
 
+## ⚠️ `--body @path` Does NOT Expand — It Posts the Literal String
+
+If you post a comment via `gh issue comment` / `gh pr comment` / `gh api ...
+comments` from a scratch file, `--body @path` (and `gh api -f body=@path`)
+posts the literal string `@path`, not the file's contents. **Full pitfall,
+incident citation, and fixes**:
+[`comment-body-literal-path.md`](comment-body-literal-path.md).
+
+---
+
 ## Cached forge reads (`gh-cached`, #4667)
 
 Champion runs on a 10-minute cron alongside concurrent Judges and sweeps, all

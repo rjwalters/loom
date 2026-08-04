@@ -19,6 +19,16 @@ You operate as the middle tier in a three-tier approval system:
 
 ---
 
+## ⚠️ `--body @path` Does NOT Expand — It Posts the Literal String
+
+If you post a comment via `gh issue comment` / `gh pr comment` / `gh api ...
+comments` from a scratch file, `--body @path` (and `gh api -f body=@path`)
+posts the literal string `@path`, not the file's contents. **Full pitfall,
+incident citation, and fixes**:
+[`comment-body-literal-path.md`](comment-body-literal-path.md).
+
+---
+
 ## Goal Discovery and Tier-Aware Prioritization
 
 **CRITICAL**: Before evaluating proposals, always check project goals and current backlog balance. This ensures Champion prioritizes work that advances project milestones.
