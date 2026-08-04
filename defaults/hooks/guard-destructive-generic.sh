@@ -1343,6 +1343,67 @@ function qsplit(s,   out, n, i, c, j, qc, ci, inner, SQ, DQ) {
 '
 
 # =============================================================================
+# CD-ARGUMENT TILDE / $HOME EXPANSION (#5315)
+#
+# The three `cd`-tracking blocks below (extract_write_targets, parse_force_ops,
+# resolve_stash_cwd) thread a `cd <dir> &&` prefix through the later segments of
+# a compound command by joining <dir> onto a tracked `curcwd`. That join is a
+# plain string concatenation with NO word expansion — so a `cd ~/GitHub/loom`
+# prefix was joined VERBATIM, embedding a literal `~` mid-path
+# (`.../loom/~/GitHub/loom/...`) and mis-resolving every later relative write /
+# force-op / stash target of that command (the false positive reported in
+# #5315). Only a leading `/` (already-absolute) was handled specially; a leading
+# `~` or `$HOME` fell through to the plain repo-relative join.
+#
+# expand_cd_arg() performs the SAME narrow, unambiguous slice of shell word
+# expansion the bash-side expand_leading_tilde() (#4382) already applies to
+# write TARGETS, but for the cd ARGUMENT and inside awk (which the write-target
+# helper runs too late to reach). `home` is the guard process's own $HOME,
+# passed in via `-v home=...` exactly like expand_leading_tilde() reads the
+# guard's process $HOME — a same-line `HOME=<x> cmd` prefix in the analyzed
+# command text can never redefine it. Handled here:
+#   ~            -> home
+#   ~/rest       -> home "/rest"
+#   $HOME        -> home
+#   $HOME/rest   -> home "/rest"
+# An expanded value starts with `/`, so the caller's existing `~ /^\//` branch
+# then treats it as an ABSOLUTE curcwd (correct — `cd ~` replaces the cwd, it is
+# not appended to it).
+#
+# Left DELIBERATELY UNEXPANDED (returned unchanged, so the caller joins it
+# repo-relative — the fail-CLOSED direction this file always biases toward, and
+# the same convention already used for `cd -` / a bare `cd`):
+#   ~user, ~user/rest   awk cannot safely resolve another user's home (no
+#                       getent/dscl without a shell-injection surface); leaving
+#                       it repo-relative keeps a genuinely-out-of-tree write
+#                       classified as in-tree (denied) rather than guessing it
+#                       safe. See the #5315 DECISION note at the head of
+#                       extract_write_targets() for the ~user/EPHEMERAL rationale.
+# Because qsplit() copies a quoted span VERBATIM (including its quote chars) and
+# leaves a literal backslash untouched, a token the real shell would NOT expand
+# does not start with a bare `~`/`$HOME` here and falls through unchanged —
+#   '~/x' / "~/x"  -> starts with a quote char (shell never tilde-expands it)
+#   \~/x           -> starts with a backslash (shell never tilde-expands it)
+#   foo~/x         -> tilde is not leading (not an expansion position)
+# mirroring expand_leading_tilde()'s quoted-tilde treatment exactly. If `home`
+# is empty (HOME unset) every case falls through unchanged, matching that
+# helper's `[[ -n "$HOME" ]]` guard.
+#
+# Shared as a single awk source string (like _QSPLIT_AWK) so the three
+# cd-tracking blocks cannot drift.
+# =============================================================================
+_CDEXPAND_AWK='
+function expand_cd_arg(tok, home) {
+    if (home == "") return tok
+    if (tok == "~") return home
+    if (tok == "$HOME") return home
+    if (substr(tok, 1, 2) == "~/") return home substr(tok, 2)
+    if (substr(tok, 1, 6) == "$HOME/") return home substr(tok, 6)
+    return tok
+}
+'
+
+# =============================================================================
 # QUOTE-AWARE REDIRECTION MASKING (#4245)
 #
 # extract_write_targets() (below) recognizes `>`/`>>` redirection by splitting
@@ -1901,7 +1962,7 @@ function mask_heredoc_bodies_selective(s,   out, lines, nl, i, j, line, trimmed,
 # tracking must not change its behavior (a still-empty <cpath> there continues
 # to fall back to the caller's raw $CWD, unchanged).
 parse_force_ops() {
-    printf '%s' "$1" | awk -v startcwd="$2" "$_QSPLIT_AWK"'
+    printf '%s' "$1" | awk -v startcwd="$2" -v home="$HOME" "$_QSPLIT_AWK""$_CDEXPAND_AWK"'
     BEGIN { SEP = sprintf("%c", 31); curcwd = startcwd }
                                        # SEP is non-whitespace so bash read
                                        # does not trim an empty cpath.
@@ -1921,10 +1982,11 @@ parse_force_ops() {
             # known limitation there) rather than guessed.
             if (toks[1] == "cd") {
                 if (m >= 2 && toks[2] != "" && toks[2] != "-") {
-                    if (toks[2] ~ /^\//) {
-                        curcwd = toks[2]
+                    cdarg = expand_cd_arg(toks[2], home)   # #5315
+                    if (cdarg ~ /^\//) {
+                        curcwd = cdarg
                     } else if (curcwd != "") {
-                        curcwd = curcwd "/" toks[2]
+                        curcwd = curcwd "/" cdarg
                     }
                 }
                 continue
@@ -2015,7 +2077,7 @@ parse_force_ops() {
 # false-NEGATIVE direction out of this issue's scope) — only a `cd <dir>`
 # prefix is.
 resolve_stash_cwd() {
-    printf '%s' "$1" | awk -v startcwd="$2" "$_QSPLIT_AWK"'
+    printf '%s' "$1" | awk -v startcwd="$2" -v home="$HOME" "$_QSPLIT_AWK""$_CDEXPAND_AWK"'
     BEGIN { curcwd = startcwd; found = 0 }
     {
         $0 = qsplit($0)   # quote-aware segmentation (#3755)
@@ -2032,10 +2094,11 @@ resolve_stash_cwd() {
             # compound command (mirrors parse_force_ops above).
             if (toks[1] == "cd") {
                 if (m >= 2 && toks[2] != "" && toks[2] != "-") {
-                    if (toks[2] ~ /^\//) {
-                        curcwd = toks[2]
+                    cdarg = expand_cd_arg(toks[2], home)   # #5315
+                    if (cdarg ~ /^\//) {
+                        curcwd = cdarg
                     } else if (curcwd != "") {
-                        curcwd = curcwd "/" toks[2]
+                        curcwd = curcwd "/" cdarg
                     }
                 }
                 continue
@@ -3091,9 +3154,50 @@ extract_rm_targets() {
 # positive resolves to, at worst, an extra deny on a target that isn't really
 # a write (safe direction) or a missed target (also safe — the fail-open
 # contract this file uses everywhere: ambiguity never widens a deny).
+#
+# The `cd <path>` tracking now tilde/$HOME-expands its argument via
+# expand_cd_arg() (#5315, defined with _QSPLIT_AWK above) — see that function's
+# header for the exact expansion rules and the quoted/escaped/`~user` fallbacks.
+#
+# --------------------------------------------------------------------------
+# #5315 DECISION (recorded, NOT implemented in this pass) — two deliberate
+# scope calls, documented here so a later reader does not mistake either for an
+# oversight:
+#
+#   1. `~user` / `~user/rest` in a tracked `cd` argument is left UNRESOLVED
+#      (joined repo-relative, i.e. classified in-tree / denied) rather than
+#      resolved to another account's home. awk cannot look a user's home up via
+#      getent/dscl without building a shell command string around an
+#      attacker-influenced username token — a command-injection surface this
+#      guard must not open. The write-TARGET side (expand_leading_tilde, #4382)
+#      can afford that lookup because it runs in bash with the username passed
+#      as a non-eval'd argv element; the cd-argument side runs inside awk and
+#      cannot. Leaving it repo-relative is the fail-CLOSED direction (a
+#      genuinely out-of-tree `cd ~alice && …` write stays denied, never
+#      silently allowed), matching this file's `cd -` / bare-`cd` convention.
+#      The overwhelmingly-common current-user forms (`~`, `~/rest`, `$HOME`,
+#      `$HOME/rest` — the actual #5315 report) ARE expanded.
+#
+#   2. EPHEMERAL_PATTERNS-class runtime state (the daemon's own gitignored
+#      files — `.loom/.daemon.pid` et al., authoritative list in
+#      loom-daemon/src/init/post_init.rs) is NOT exempted from Bash write
+#      confinement. As of this change no such exemption exists in either
+#      guard-destructive-generic.sh or guard-worktree-paths.sh; adding one is
+#      net-new policy, and CLAUDE.md documents an "ungated denial floor" that no
+#      toggle may bypass, so a gitignore-aware carve-out risks widening that
+#      floor into an allow if scoped even slightly too broadly. The concrete
+#      #5315 report was a false POSITIVE caused entirely by defect (1) above
+#      (the literal-`~` mis-join), which this change fixes directly — an
+#      operator maintaining `.loom/.daemon.pid` runs from the primary checkout,
+#      not a builder worktree, so once the path resolves correctly it is a
+#      routine main-checkout write and the confinement question is orthogonal.
+#      Deferred to a dedicated follow-up so the exemption's blast radius can be
+#      designed against the denial floor deliberately rather than bolted on
+#      alongside a canonicalization fix. See #5315 for the deferral rationale.
+# --------------------------------------------------------------------------
 # =============================================================================
 extract_write_targets() {
-    printf '%s' "$1" | awk -v startcwd="$2" "$_QSPLIT_AWK""$_MASKGT_AWK""$_MASKWS_AWK""$_MASKHEREDOC_AWK"'
+    printf '%s' "$1" | awk -v startcwd="$2" -v home="$HOME" "$_QSPLIT_AWK""$_CDEXPAND_AWK""$_MASKGT_AWK""$_MASKWS_AWK""$_MASKHEREDOC_AWK"'
     BEGIN {
         SEP = sprintf("%c", 31)
         curcwd = startcwd
@@ -3191,10 +3295,11 @@ extract_write_targets() {
 
             if (toks[1] == "cd") {
                 if (m >= 2 && toks[2] != "" && toks[2] != "-") {
-                    if (toks[2] ~ /^\//) {
-                        curcwd = toks[2]
+                    cdarg = expand_cd_arg(toks[2], home)   # #5315
+                    if (cdarg ~ /^\//) {
+                        curcwd = cdarg
                     } else if (curcwd != "") {
-                        curcwd = curcwd "/" toks[2]
+                        curcwd = curcwd "/" cdarg
                     }
                 }
                 continue

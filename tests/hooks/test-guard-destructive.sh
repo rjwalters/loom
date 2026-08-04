@@ -2010,6 +2010,23 @@ assert_ask "forceScope protected (#5156): cd into an unresolvable directory stil
 assert_ask_env "forceScope protected (#5156): cd-prefixed push naming a protected refspec branch still asks (explicit-refspec path untouched)" \
     "LOOM_DEFAULT_BRANCH=develop" "cd $FORCE_CD_WT && git push --force origin develop" "$FORCE_CD_REPO"
 
+# #5315: the SAME cd-tracking here now tilde/$HOME-expands its argument via
+# expand_cd_arg(). With HOME set to the main repo root, `cd ~/.loom/worktrees/
+# issue-1` must resolve to the worktree exactly like the literal-path control
+# at the top of this block -> hard-resetting the worktree's own branch ALLOWS.
+# Pre-#5315 the literal `~` was joined onto curcwd (`<main>/~/.loom/...`), a
+# bogus path whose HEAD cannot resolve -> the guard would have (wrongly) asked.
+assert_allow_env "forceScope protected (#5315): 'cd ~/.loom/worktrees/issue-1' (HOME=main root) then reset --hard own branch allows" \
+    "HOME=$FORCE_CD_REPO" "cd ~/.loom/worktrees/issue-1 && git reset --hard origin/feature/issue-1" "$FORCE_CD_REPO"
+# Control: cd back into the main (protected) root via a bare `~` must still ASK
+# -- the expansion must never widen an ask into an allow.
+assert_ask_env "forceScope protected (#5315): 'cd ~' (HOME=main root) then reset --hard still asks (no widening)" \
+    "HOME=$FORCE_CD_REPO" "cd ~ && git reset --hard HEAD~1" "$FORCE_CD_WT"
+# Control: a QUOTED tilde is not expanded -> the cd resolves to a bogus literal
+# path -> ambiguous -> ASK (fail-closed), never silently allowed.
+assert_ask_env "forceScope protected (#5315): 'cd '\''~/.loom/worktrees/issue-1'\''' (quoted tilde stays literal) still asks (ambiguous)" \
+    "HOME=$FORCE_CD_REPO" "cd '~/.loom/worktrees/issue-1' && git reset --hard origin/feature/issue-1" "$FORCE_CD_REPO"
+
 rm -rf "$FORCE_CD_REPO"
 
 # Clean up force-scope temp repos.
@@ -3520,6 +3537,67 @@ assert_deny "write-confinement (#4382): unresolvable '~nonexistentuser/' falls b
     "cp /tmp/a.sh ~nonexistentloomuser999/defaults/hooks/f.sh" "$WT_REPO"
 
 # -------------------------------------------------------------------------
+# Tilde / $HOME expansion in the tracked `cd` ARGUMENT (#5315). Distinct from
+# the #4382 block above (which expands the write TARGET): here the leading
+# `~`/`$HOME` is on the `cd <dir>` prefix that seeds curcwd, resolved by
+# expand_cd_arg() INSIDE the awk pass before curcwd is joined. Reported
+# incident: `cd ~/GitHub/loom && ... > .loom/.daemon.pid` from a main-checkout
+# cwd resolved the target as `.../loom/~/GitHub/loom/.loom/.daemon.pid` — the
+# raw `cd ~/GitHub/loom` argument was joined onto curcwd with a LITERAL `~`
+# mid-path instead of $HOME-expanded first.
+#
+# HOME_FIXTURE_OUTSIDE (defined above) is unrelated to WT_REPO, so a
+# `cd ~ && write relative` that expands correctly lands OUTSIDE the checkout ->
+# allow; the pre-#5315 literal-`~` join kept it under WT_REPO -> deny. The
+# allow/deny flip is what proves the expansion actually happened.
+assert_allow_env "write-confinement (#5315): 'cd ~ && > relative' expands ~ to \$HOME, landing outside the checkout allows" \
+    "HOME=$HOME_FIXTURE_OUTSIDE" \
+    "cd ~ && echo x > f.sh" "$WT_REPO"
+assert_allow_env "write-confinement (#5315): 'cd ~/sub && > relative' expands ~/ to \$HOME/sub, outside the checkout allows" \
+    "HOME=$HOME_FIXTURE_OUTSIDE" \
+    "cd ~/sub && echo x > f.sh" "$WT_REPO"
+# Exact reported shape: multi-segment `~/...` cd prefix + a relative
+# .loom/.daemon.pid write. With HOME outside the checkout it now resolves out
+# of tree (allow); pre-fix the literal-`~` mis-join kept it in tree (deny).
+assert_allow_env "write-confinement (#5315): reported shape 'cd ~/GitHub/loom && printf > .loom/.daemon.pid' expands, allows" \
+    "HOME=$HOME_FIXTURE_OUTSIDE" \
+    "cd ~/GitHub/loom && printf x > .loom/.daemon.pid" "$WT_REPO"
+assert_allow_env "write-confinement (#5315): 'cd \$HOME && > relative' expands bare \$HOME, outside the checkout allows" \
+    "HOME=$HOME_FIXTURE_OUTSIDE" \
+    'cd $HOME && echo x > f.sh' "$WT_REPO"
+assert_allow_env "write-confinement (#5315): 'cd \$HOME/sub && > relative' expands \$HOME/, outside the checkout allows" \
+    "HOME=$HOME_FIXTURE_OUTSIDE" \
+    'cd $HOME/sub && echo x > f.sh' "$WT_REPO"
+
+# No blanket allow: if the expanded cd lands the relative write BACK inside the
+# main checkout, it still denies exactly like any other in-tree write (mirrors
+# the #4382 write-target counterpart). Proves expansion uses the guard's own
+# process $HOME, not a `HOME=` token scanned from the command text.
+assert_deny_env "write-confinement (#5315): 'cd ~ && > relative' whose \$HOME IS the main checkout still denies" \
+    "HOME=$WT_REPO" \
+    "cd ~ && echo x > defaults/hooks/f.sh" "$WT_REPO"
+
+# Quoted / escaped tildes are NOT tilde-expanded by a real shell, so the cd
+# stays literal/repo-relative -> the relative write stays under the main
+# checkout -> deny (with HOME OUTSIDE, an erroneous expansion would have
+# allowed, so deny proves the token was left literal).
+assert_deny_env "write-confinement (#5315): 'cd '\''~'\'' && > relative' (single-quoted tilde stays literal) still denies" \
+    "HOME=$HOME_FIXTURE_OUTSIDE" \
+    "cd '~' && echo x > f.sh" "$WT_REPO"
+assert_deny_env "write-confinement (#5315): 'cd \\~ && > relative' (backslash-escaped tilde stays literal) still denies" \
+    "HOME=$HOME_FIXTURE_OUTSIDE" \
+    "cd \~ && echo x > f.sh" "$WT_REPO"
+
+# ~user / ~user/rest in a cd argument is DELIBERATELY left unresolved inside awk
+# (fail-closed: joined repo-relative -> classified in-tree -> deny), rather than
+# resolved via a shell-injection-prone getent/dscl lookup. With HOME OUTSIDE, an
+# (unwanted) expansion would land outside and allow; the deny confirms the
+# fail-closed fallback. See the #5315 DECISION note in guard-destructive-generic.sh.
+assert_deny_env "write-confinement (#5315): 'cd ~user && > relative' (~user left unresolved, fail-closed) still denies" \
+    "HOME=$HOME_FIXTURE_OUTSIDE" \
+    "cd ~${CURRENT_UNIX_USER} && echo x > f.sh" "$WT_REPO"
+
+# -------------------------------------------------------------------------
 # Quoted write targets are still classified as ABSOLUTE (#4926).
 #
 # extract_write_targets() emits a token with its quote characters preserved
@@ -4046,6 +4124,23 @@ assert_ask_reason_matches "stash-scope (#5173): cd into main root then stash pop
 # into an allow").
 assert_ask_reason_matches "stash-scope (#5173): cd into an unresolvable directory still asks (ambiguous)" \
     "cd /nonexistent-dir-5173-does-not-exist && git stash pop" "could not be resolved" "$CD_ST_REPO"
+
+# #5315: the SAME cd-tracking here now tilde/$HOME-expands its argument via
+# expand_cd_arg(). With HOME set to the main repo root, `cd ~/.loom/worktrees/
+# issue-1 && git stash pop` must resolve into the worktree exactly like the
+# literal-path control above -> ALLOW. Pre-#5315 the literal `~` join produced a
+# bogus curcwd whose toplevel could not be resolved -> a spurious ask.
+assert_allow_env "stash-scope (#5315): 'cd ~/.loom/worktrees/issue-1 && git stash pop' (HOME=main root) resolves into worktree, allows" \
+    "HOME=$CD_ST_REPO" "cd ~/.loom/worktrees/issue-1 && git stash pop" "$CD_ST_REPO"
+# Control: cd back into the main checkout via a bare `~` must still ASK -- the
+# expansion must never widen an ask into an allow. (assert_ask_env sets HOME;
+# the reason-matching variant has no env parameter, so ask-only is asserted.)
+assert_ask_env "stash-scope (#5315): 'cd ~ && git stash pop' (HOME=main root) still asks (no widening)" \
+    "HOME=$CD_ST_REPO" "cd ~ && git stash pop" "$CD_ST_WT_DIR"
+# Control: a QUOTED tilde is not expanded -> bogus literal curcwd -> ambiguous
+# -> ASK (fail-closed), never silently allowed.
+assert_ask_env "stash-scope (#5315): 'cd '\''~/.loom/worktrees/issue-1'\''' (quoted tilde stays literal) still asks (ambiguous)" \
+    "HOME=$CD_ST_REPO" "cd '~/.loom/worktrees/issue-1' && git stash pop" "$CD_ST_REPO"
 
 rm -rf "$CD_ST_REPO"
 
