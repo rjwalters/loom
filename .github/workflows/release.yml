@@ -107,6 +107,20 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # dtolnay/rust-toolchain's `targets:` input installs the target onto
+      # whatever toolchain the action itself resolves — here, `stable`. This
+      # repo pins `channel = "1.96.0"` in rust-toolchain.toml, so `cargo`
+      # actually builds under 1.96.0, a toolchain the step above never
+      # touched — leaving cross targets like aarch64-unknown-linux-gnu
+      # without std and failing with `error[E0463]: can't find crate for
+      # core` (#5167). `rustup target add` (unlike the action's `targets:`
+      # input) operates on the directory's *active* toolchain, which rustup
+      # resolves via rust-toolchain.toml, so it correctly lands the target on
+      # 1.96.0 instead. The toolchain channel remains pinned in exactly one
+      # place: rust-toolchain.toml.
+      - name: Add Rust target for pinned toolchain
+        run: rustup target add ${{ matrix.target }}
+
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
@@ -119,6 +133,19 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      # Fast preflight (#5167 acceptance criterion): confirm the pinned
+      # toolchain actually has this target's std installed before kicking off
+      # the full `cargo build`, so a future toolchain/target mismatch fails in
+      # seconds instead of after several minutes of dependency compilation.
+      - name: Verify target std is installed
+        run: |
+          set -euo pipefail
+          if ! rustup target list --installed | grep -qx "${{ matrix.target }}"; then
+            echo "::error::rustup did not install std for target '${{ matrix.target }}' on the active toolchain ($(rustc --version)). Check that rust-toolchain.toml's pinned channel supports this target." >&2
+            exit 1
+          fi
+          echo "Confirmed: ${{ matrix.target }} std is installed for $(rustc --version)."
 
       - name: Build loom-daemon
         env:
