@@ -1,10 +1,24 @@
 //! Token-capacity backpressure + add-capacity advisory for the autonomous work
 //! finder (Issue #3902, epic #3809).
 //!
-//! The work finder (#3810) drives approved `loom:issue` work to dispatch, and
-//! #3811 bounds its concurrency by `min(token-pool size, disk headroom,
-//! configured max)` (a CPU/load term sat in that `min` from #3978 until #4512
-//! removed it). That policy treats the token pool as a flat count of
+//! **Historical note (superseded by #5270):** the work finder (#3810) drives
+//! approved `loom:issue` work to dispatch, and #3811 originally bounded its
+//! concurrency by `min(token-pool size, disk headroom, configured max)` (a
+//! CPU/load term sat in that `min` from #3978 until #4512 removed it). #5270
+//! removed the token-pool term too, unconditionally on every auth path
+//! (operator direction: "we should only ever limit parallelism based on the
+//! machine disk/RAM/CPU" — a metered API key has no subscription window, and
+//! overage means even a subscription pool no longer hard-stops at one
+//! either). The dynamic cap is now `min(disk headroom, ram headroom,
+//! configured max)` — see
+//! [`crate::work_finder::resolve_dynamic_max_concurrent`]. This module's
+//! machinery ([`token_axis_limit`], [`assess_pressure`], the add-capacity
+//! advisory below) is **not** deleted: it still drives spawn-time account
+//! *selection* (prefer fresher/healthier accounts, skip exhausted/blocked
+//! ones) and a softer, non-gating capacity advisory, described below as it
+//! worked pre-#5270 with the gating role removed.
+//!
+//! That policy treats the token pool as a flat count of
 //! `*.token` files — but at scale accounts hit their 5h/7d rate limits and go
 //! **exhausted**. Dispatching to an exhausted account produces the startup
 //! hangs / mid-build deaths seen while dogfooding. This module makes the
@@ -352,12 +366,21 @@ where
 
 /// The health-adjusted token-axis concurrency limit.
 ///
-/// When ranking data exists, this is the count of `available` accounts — the
-/// finder never dispatches beyond the healthy set, so it never targets an
-/// exhausted/blocked account and never over-subscribes. When ranking data is
-/// absent (no probe has run), it falls back to `pool_size` — the pre-#3902
-/// behavior, so a repo that has not wired up `loom-daemon tokens check` sees zero
-/// change.
+/// When ranking data exists, this is the count of `available` accounts —
+/// **historically** the finder never dispatched beyond the healthy set, so it
+/// never targeted an exhausted/blocked account and never over-subscribed.
+/// When ranking data is absent (no probe has run), it falls back to
+/// `pool_size` — the pre-#3902 behavior, so a repo that has not wired up
+/// `loom-daemon tokens check` sees zero change.
+///
+/// **Since #5270 this value no longer bounds admission at all** — operator
+/// direction: "we should only ever limit parallelism based on the machine
+/// disk/RAM/CPU," on any auth path. `crate::work_finder::resolve_dynamic_max_concurrent`
+/// dropped the token-axis term from its `min(...)` entirely. This function's
+/// output remains meaningful as the **selection** input
+/// (`crate::tokens_pool::select` prefers fresher/healthier accounts and skips
+/// exhausted/blocked ones) and as an informational figure on the
+/// `status`/`calibrate` surfaces — never again as a concurrency ceiling.
 #[must_use]
 pub fn token_axis_limit(workspace_root: &Path, pool_size: usize) -> usize {
     match read_ranking(workspace_root) {

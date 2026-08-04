@@ -947,24 +947,36 @@ pub fn classify_missing_tick(inputs: &HealthInputs, status: &DaemonStatusReport)
 }
 
 /// Whether `disk_headroom` is the **strictly** binding term of the dynamic
-/// concurrency cap `min(token_axis, disk_headroom, configured_max)` (#5177).
+/// concurrency cap `min(disk_headroom, ram_headroom, configured_max)` (#5177;
+/// token axis removed / ram_headroom added in #5270 — see
+/// [`crate::work_finder::resolve_dynamic_max_concurrent`]).
 ///
-/// True only when disk headroom is smaller than *both* other terms — i.e. the
-/// scratch volume is throttling dispatch below what the token pool and the
-/// operator's configured admission ceiling would otherwise allow. A tie with
-/// `configured_max` is deliberately NOT flagged: that ceiling is the operator's
-/// own deliberate choice, not a disk fault. Mirrors the input shape of
+/// True when disk headroom is at most RAM headroom (a tie resolves to disk,
+/// matching [`crate::calibrate::binding_term`]'s tie-break order) AND
+/// strictly smaller than the operator's configured admission ceiling — i.e.
+/// the scratch volume is throttling dispatch below what `configured_max`
+/// would otherwise allow. A tie **with the ceiling** is deliberately NOT
+/// flagged: that ceiling is the operator's own deliberate choice, not a disk
+/// fault. Mirrors the input shape of
 /// [`crate::work_finder::resolve_dynamic_max_concurrent`] so the two agree on
 /// what "binding" means.
 #[must_use]
-pub fn disk_binds_cap(
-    token_axis_limit: usize,
-    per_token_concurrency: usize,
-    disk_headroom: usize,
-    configured_max: usize,
-) -> bool {
-    let token_axis = token_axis_limit.saturating_mul(per_token_concurrency.max(1));
-    disk_headroom < token_axis && disk_headroom < configured_max
+pub fn disk_binds_cap(disk_headroom: usize, ram_headroom: usize, configured_max: usize) -> bool {
+    disk_headroom <= ram_headroom && disk_headroom < configured_max
+}
+
+/// Whether `ram_headroom` is the **uniquely** binding term of the dynamic
+/// concurrency cap (#5270) — the RAM-headroom mirror of [`disk_binds_cap`].
+///
+/// True only when RAM headroom is strictly smaller than **both** the disk
+/// headroom and the operator's configured admission ceiling. A tie with disk
+/// resolves to [`disk_binds_cap`] instead (mirroring
+/// [`crate::calibrate::binding_term`]'s tie-break order), keeping the two
+/// predicates mutually exclusive so `assess_dispatch` never double-reports
+/// the same throttling event under both names.
+#[must_use]
+pub fn ram_binds_cap(disk_headroom: usize, ram_headroom: usize, configured_max: usize) -> bool {
+    ram_headroom < disk_headroom && ram_headroom < configured_max
 }
 
 /// Assess the dispatch section: in-flight occupancy against the dynamic cap,
@@ -1008,19 +1020,46 @@ pub fn assess_dispatch(inputs: &HealthInputs) -> HealthSection {
     }
     // #5177: a small-disk host silently decays as merged worktrees leak their
     // multi-GB target/ dirs, until disk headroom becomes the binding term of the
-    // cap and throttles the host to a fraction of its token/config capacity. That
+    // cap and throttles the host to a fraction of its configured capacity. That
     // used to present as a green daemon dispatching at, say, cap 2 — a fault an
     // operator had to notice in the `min(...)` breakdown. Name it as degraded.
-    if disk_binds_cap(
-        status.capacity.token_axis_limit,
-        status.per_token_concurrency,
-        status.disk_headroom,
-        status.configured_max,
-    ) {
+    if disk_binds_cap(status.disk_headroom, status.ram_headroom, status.configured_max) {
         degraded.push(format!(
             "disk headroom is throttling dispatch (cap {} bound by disk headroom {} — free scratch \
              disk; e.g. `loom-daemon clean --aggressive` / `--deep`)",
             cap, status.disk_headroom
+        ));
+    }
+    // #5270: the RAM-headroom mirror of the #5177 disk case above — the second
+    // "dumb mode" machine-headroom axis, so a critically-low-memory host is
+    // named as degraded the same way a critically-low-disk host already is.
+    if ram_binds_cap(status.disk_headroom, status.ram_headroom, status.configured_max) {
+        degraded.push(format!(
+            "RAM headroom is throttling dispatch (cap {} bound by ram headroom {} — free memory \
+             or lower LOOM_PER_WORKTREE_RAM_GB, #5270)",
+            cap, status.ram_headroom
+        ));
+    }
+    // #5270: name the machine axis (max/disk/RAM/CPU) currently HOLDING new
+    // admissions outright — the CPU saturation admission brake is a
+    // point-in-time gate outside the `min(...)` cap formula (see
+    // `crate::admission_brake`'s module docs for why), so it cannot be named
+    // by `disk_binds_cap` / `ram_binds_cap` above; it is checked independently
+    // here, mirroring the host-distress breaker check above it.
+    if status.admission_brake.as_ref().is_some_and(|b| b.held) {
+        let load = status
+            .admission_brake
+            .as_ref()
+            .and_then(|b| b.load_per_core)
+            .map_or_else(|| "n/a".to_string(), |l| format!("{l:.2}"));
+        let threshold = status
+            .admission_brake
+            .as_ref()
+            .map_or(0.0, |b| b.load_per_core_threshold);
+        degraded.push(format!(
+            "CPU saturation admission brake HOLDING new admissions (load {load}/core \u{2265} \
+             {threshold:.2} — in-flight sweeps are untouched; releases automatically once load \
+             drops, #5270/#4903)"
         ));
     }
 
@@ -2632,20 +2671,44 @@ mod tests {
             .contains("12 seen, 2 dispatched, 10 in-flight-skip"));
     }
 
-    /// #5177 AC4: `disk_binds_cap` is the strict-minimum test — disk must be
-    /// smaller than BOTH other terms, never merely tied.
+    /// #5177 AC4 (re-scoped #5270): `disk_binds_cap` is the strict-minimum
+    /// test against `configured_max` (never merely tied), and ties WITH ram
+    /// resolve to disk (matching `calibrate::binding_term`'s tie-break order).
+    /// The token axis no longer participates in the cap at all.
     #[test]
-    fn disk_binds_cap_only_when_strictly_smallest() {
-        // token axis = 6 × 2 = 12, configured 12, disk 2 → disk binds.
-        assert!(disk_binds_cap(6, 2, 2, 12));
+    fn disk_binds_cap_only_when_smallest_or_tied_with_ram() {
+        // disk 2 < ram (unbounded) and < configured 12 → disk binds.
+        assert!(disk_binds_cap(2, usize::MAX, 12));
         // disk ties configured_max → operator's own ceiling, not a disk fault.
-        assert!(!disk_binds_cap(6, 2, 12, 12));
-        // disk larger than the token axis → tokens bind, not disk.
-        assert!(!disk_binds_cap(1, 1, 5, 12));
-        // per-token 0 is clamped to 1 (mirrors resolve_dynamic_max_concurrent).
-        assert!(disk_binds_cap(6, 0, 2, 12));
-        // the healthy default fixture (disk 0, configured 0) must NOT trip it.
-        assert!(!disk_binds_cap(6, 0, 0, 0));
+        assert!(!disk_binds_cap(12, usize::MAX, 12));
+        // disk larger than configured_max → the ceiling binds, not disk.
+        assert!(!disk_binds_cap(5, usize::MAX, 1));
+        // disk larger than ram → ram binds, not disk (see ram_binds_cap below).
+        assert!(!disk_binds_cap(5, 2, 12));
+        // disk ties ram (both smaller than configured_max) → disk wins the tie.
+        assert!(disk_binds_cap(3, 3, 12));
+        // the healthy default fixture (disk 0, ram 0, configured 0) must NOT
+        // trip it — a 0/0/0 tie is "unconfigured", not "throttling".
+        assert!(!disk_binds_cap(0, 0, 0));
+    }
+
+    /// #5270: `ram_binds_cap` is the RAM-headroom mirror of the disk test
+    /// above — RAM must be the UNIQUE smallest term (a tie resolves to disk).
+    #[test]
+    fn ram_binds_cap_only_when_uniquely_smallest() {
+        // ram 2 < disk (unbounded) and < configured 12 → ram binds.
+        assert!(ram_binds_cap(usize::MAX, 2, 12));
+        // ram ties configured_max → operator's own ceiling, not a ram fault.
+        assert!(!ram_binds_cap(usize::MAX, 12, 12));
+        // ram larger than configured_max → the ceiling binds, not ram.
+        assert!(!ram_binds_cap(usize::MAX, 5, 1));
+        // ram larger than disk → disk binds, not ram.
+        assert!(!ram_binds_cap(2, 5, 12));
+        // ram ties disk → disk wins the tie (not flagged as ram).
+        assert!(!ram_binds_cap(3, 3, 12));
+        // the healthy default fixture (disk 0, ram 0, configured 0) must NOT
+        // trip it.
+        assert!(!ram_binds_cap(0, 0, 0));
     }
 
     /// #5177 AC4: when disk headroom is the binding cap term, the dispatch
@@ -2657,9 +2720,10 @@ mod tests {
         {
             let status = inputs.status.as_mut().unwrap();
             status.capacity.token_axis_limit = 6;
-            status.per_token_concurrency = 2; // token axis = 12
+            status.per_token_concurrency = 2; // token axis = 12 (informational only)
             status.configured_max = 12;
             status.disk_headroom = 2; // strictly the smallest term
+            status.ram_headroom = 40; // ample RAM — must not also fire
             status.dynamic_cap = 2;
         }
         let section = assess_dispatch(&inputs);
@@ -2671,17 +2735,96 @@ mod tests {
         );
     }
 
+    /// #5270: the RAM-headroom mirror of the disk test above — a critically-low
+    /// available-memory host must be named as degraded the same way a
+    /// critically-low-disk host already is.
+    #[test]
+    fn ram_bound_cap_produces_degraded_verdict_naming_ram() {
+        let mut inputs = healthy_inputs();
+        {
+            let status = inputs.status.as_mut().unwrap();
+            status.configured_max = 12;
+            status.disk_headroom = 40; // ample disk — must not also fire
+            status.ram_headroom = 1; // strictly the smallest term
+            status.dynamic_cap = 1;
+        }
+        let section = assess_dispatch(&inputs);
+        assert_eq!(section.verdict, Verdict::Degraded);
+        assert!(
+            section.summary.to_lowercase().contains("ram"),
+            "summary must name ram: {}",
+            section.summary
+        );
+    }
+
+    /// #5270: a host where the CPU saturation admission brake is HOLDING new
+    /// admissions must be named as degraded, even when the numeric disk/ram/
+    /// ceiling terms are all comfortably ample — the brake is a point-in-time
+    /// gate outside the `min(...)` formula (see `crate::admission_brake`).
+    #[test]
+    fn cpu_brake_held_produces_degraded_verdict_naming_cpu() {
+        let mut inputs = healthy_inputs();
+        {
+            let status = inputs.status.as_mut().unwrap();
+            status.configured_max = 12;
+            status.disk_headroom = 40;
+            status.ram_headroom = 40;
+            status.dynamic_cap = 12;
+            status.admission_brake = Some(crate::types::AdmissionBrakeStatus {
+                enabled: true,
+                held: true,
+                load_per_core: Some(1.10),
+                load_per_core_threshold: 0.95,
+                held_since: None,
+                held_ticks: 3,
+            });
+        }
+        let section = assess_dispatch(&inputs);
+        assert_eq!(section.verdict, Verdict::Degraded);
+        assert!(
+            section.summary.to_lowercase().contains("cpu"),
+            "summary must name cpu: {}",
+            section.summary
+        );
+        assert!(section.summary.contains("1.10"), "{}", section.summary);
+    }
+
+    /// #5270: a brake that exists but is NOT holding must not itself degrade
+    /// the section (mirrors the existing disk/ram negative test below).
+    #[test]
+    fn cpu_brake_not_holding_is_not_flagged() {
+        let mut inputs = healthy_inputs();
+        {
+            let status = inputs.status.as_mut().unwrap();
+            status.configured_max = 12;
+            status.disk_headroom = 40;
+            status.ram_headroom = 40;
+            status.dynamic_cap = 12;
+            status.admission_brake = Some(crate::types::AdmissionBrakeStatus {
+                enabled: true,
+                held: false,
+                load_per_core: Some(0.10),
+                load_per_core_threshold: 0.95,
+                held_since: None,
+                held_ticks: 0,
+            });
+        }
+        let section = assess_dispatch(&inputs);
+        assert_eq!(section.verdict, Verdict::Green);
+    }
+
     /// #5177 AC4 (negative): a cap bound by the operator's configured ceiling
-    /// (disk headroom ample) stays green — disk is not the culprit there.
+    /// (disk/ram headroom ample) stays green — neither is the culprit there.
     #[test]
     fn config_bound_cap_is_not_flagged_as_disk() {
         let mut inputs = healthy_inputs();
         {
             let status = inputs.status.as_mut().unwrap();
             status.capacity.token_axis_limit = 6;
-            status.per_token_concurrency = 2; // token axis = 12
+            status.per_token_concurrency = 2; // token axis = 12 (informational only)
             status.configured_max = 4; // operator's own ceiling binds
             status.disk_headroom = 50; // plenty of disk
+            status.ram_headroom = 50; // plenty of ram
             status.dynamic_cap = 4;
         }
         let section = assess_dispatch(&inputs);
