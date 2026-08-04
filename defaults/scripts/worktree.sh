@@ -14,6 +14,13 @@
 #     # <worktree-root>/.snapshots/issue-<N>-<UTC-timestamp>.patch — WITHOUT
 #     # touching `git stash` (which is repo-global and can be clobbered by a
 #     # concurrent builder in another worktree). Replay with `git apply`.
+#   pnpm worktree stash-push <issue-number> [--include-untracked] [--json]
+#   pnpm worktree stash-pop <issue-number> [--json]
+#     # Clean-and-restore pair for a "clean baseline vs my diff" comparison
+#     # (clippy/shellcheck/test baseline diffing) — WITHOUT touching the
+#     # shared `refs/stash` stack. Anchors captured WIP to a PER-ISSUE ref
+#     # (refs/loom/stash-baseline/issue-<N>) instead, so no other worktree's
+#     # concurrent stash op can ever land "in between" push and pop (#5217).
 #   pnpm worktree --check                              # Check if currently in a worktree
 #   pnpm worktree --json <issue-number>                # Machine-readable output
 #   pnpm worktree --return-to <dir> <issue-number>     # Store return directory
@@ -779,6 +786,360 @@ snapshot_worktree_command() {
 }
 
 # --------------------------------------------------------------------------
+# Worktree-scoped clean-baseline stash (issue #5217)
+# --------------------------------------------------------------------------
+#
+# `worktree.sh stash-push <N>` / `worktree.sh stash-pop <N>` give headless
+# Builder/Doctor sweeps a genuinely safe replacement for the
+# `git stash && <baseline check> && git stash pop` pattern used to diff a
+# clean baseline against in-progress WIP (clippy/shellcheck/test-output
+# comparisons). That raw pattern is correctly gated by
+# guard-destructive-generic.sh's `stash-scope:worktree-collision` check
+# (#4821) whenever >=2 `.loom-managed` worktrees are active — which in this
+# repo is nearly always true — producing an unanswerable `ask` in headless
+# mode with no human to answer it (#5217).
+#
+# `snapshot` (above) already solves the ADJACENT "shelve my WIP as a patch"
+# case, but deliberately does not reset the working tree, so it cannot alone
+# produce a clean baseline to diff against. stash-push/stash-pop close that
+# gap WITHOUT touching `refs/stash` at all:
+#
+#   - stash-push captures the tracked diff via `git stash create` (which
+#     builds a stash-format commit object but — unlike `git stash push` —
+#     never writes to refs/stash), anchors it under a PER-ISSUE ref
+#     (refs/loom/stash-baseline/issue-<N>) so it survives gc, then resets the
+#     worktree's tracked files to HEAD (`git reset --hard HEAD`, scoped to
+#     this one worktree's own index/working tree). Untracked files
+#     (--include-untracked) are moved into a per-issue holding directory
+#     rather than folded into the stash entry.
+#   - stash-pop reads back the SAME per-issue ref / holding-directory pair
+#     and restores both, then clears them.
+#
+# Because every issue gets its OWN ref rather than a shared stack, there is
+# no window for another worktree's concurrent `git stash push` to land "in
+# between" your push and pop — the race that makes a same-chain push/pop
+# ALLOW heuristic in the GUARD itself unsafe (considered and rejected during
+# #5217's curation: push and pop are two separate guard-approved Bash calls
+# with an arbitrary-duration command running between them, so anything that
+# lands on the SHARED stack during that window can still be popped by
+# mistake by a same-chain heuristic that only checks command shape, not
+# actual stack state). Anchoring to a per-issue ref instead of the shared
+# stack removes the shared-mutable-state precondition for that race
+# entirely, rather than trying to detect it after the fact.
+#
+# Durability note: both halves of the captured state live OUTSIDE the
+# worktree — the ref in the repo's common git dir, the untracked holding
+# directory and the pending marker under `<worktree-root>/.stash-baseline/`.
+# So even if the worktree is removed while a push is pending, nothing is
+# unrecoverable: `git stash apply refs/loom/stash-baseline/issue-<N>` still
+# replays the captured diff.
+#
+# Raw `git stash pop/drop/clear` remains exactly as gated as before by
+# guard-destructive-generic.sh — stash-push/stash-pop are the sanctioned,
+# guard-transparent replacement path for THIS pattern, not a guard exemption:
+# neither literally invokes `git stash pop|drop|clear`, so the guard's
+# pattern match never sees them, and it keeps asking on every raw stash
+# pop/drop/clear exactly as it did before this issue.
+stash_push_worktree_command() {
+    local issue_number="" json=false include_untracked=false
+    local usage="Usage: pnpm worktree stash-push <issue-number> [--include-untracked] [--json]"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --include-untracked) include_untracked=true; shift ;;
+            --json)               json=true; shift ;;
+            --*)
+                print_error "Unknown flag for stash-push: $1"
+                echo ""
+                echo "$usage"
+                return 1
+                ;;
+            *)
+                if [[ -z "$issue_number" ]]; then
+                    issue_number="$1"; shift
+                else
+                    print_error "Unexpected argument: $1"
+                    return 1
+                fi
+                ;;
+        esac
+    done
+
+    if [[ -z "$issue_number" ]]; then
+        print_error "stash-push requires an issue number"
+        echo ""
+        echo "$usage"
+        return 1
+    fi
+    if ! [[ "$issue_number" =~ ^[0-9]+$ ]]; then
+        print_error "Issue number must be numeric (got: '$issue_number')"
+        echo ""
+        echo "$usage"
+        return 1
+    fi
+
+    _sbp_info()    { if [[ "$json" == true ]]; then echo -e "${BLUE}ℹ $*${NC}" >&2; else print_info "$*"; fi; }
+    _sbp_success() { if [[ "$json" == true ]]; then echo -e "${GREEN}✓ $*${NC}" >&2; else print_success "$*"; fi; }
+    _sbp_json() {
+        # $1=success(bool) $2=hasTrackedChanges(bool) $3=untrackedCount $4=ref
+        [[ "$json" == true ]] || return 0
+        printf '{"success": %s, "issueNumber": %s, "hasTrackedChanges": %s, "untrackedCount": %s, "ref": "%s"}\n' \
+            "$1" "$issue_number" "$2" "$3" "$4"
+    }
+
+    local git_common repo_root
+    if ! git_common=$(git rev-parse --git-common-dir 2>/dev/null); then
+        print_error "Not inside a git repository"
+        return 1
+    fi
+    repo_root=$(cd "$(dirname "$git_common")" 2>/dev/null && pwd) || repo_root="$(pwd)"
+
+    local worktree_root_dir worktree_path
+    worktree_root_dir="$(loom_worktree_root "$repo_root")"
+    worktree_path="$worktree_root_dir/issue-$issue_number"
+
+    if [[ ! -d "$worktree_path" ]]; then
+        print_error "No worktree found at $worktree_path — nothing to stash-push"
+        _sbp_json false false 0 ""
+        return 1
+    fi
+    if ! git -C "$worktree_path" rev-parse --git-dir >/dev/null 2>&1; then
+        print_error "$worktree_path is not a git working tree"
+        _sbp_json false false 0 ""
+        return 1
+    fi
+
+    local ref="refs/loom/stash-baseline/issue-$issue_number"
+    local holding_dir="$worktree_root_dir/.stash-baseline/issue-$issue_number"
+    local manifest_path="$holding_dir/untracked.manifest"
+    # The pending marker is what makes the intended headless chain
+    # `stash-push N && <baseline check> && stash-pop N` safe when the worktree
+    # happened to be CLEAN: nothing is captured, but the marker still records
+    # that a push occurred, so the paired stash-pop can succeed as a no-op
+    # instead of exiting 1 and breaking the `&&` chain mid-sweep. Without it,
+    # "there was nothing to restore" and "you never pushed" are indistinguishable.
+    local pending_marker="$holding_dir/pending"
+
+    if git -C "$worktree_path" rev-parse --verify --quiet "$ref" >/dev/null 2>&1 || [[ -f "$manifest_path" ]] || [[ -f "$pending_marker" ]]; then
+        print_error "A pending stash-push already exists for issue $issue_number — run 'stash-pop $issue_number' first (or resolve manually: ref $ref / $holding_dir)"
+        _sbp_json false false 0 ""
+        return 1
+    fi
+
+    local stash_commit=""
+    stash_commit="$(git -C "$worktree_path" stash create 2>/dev/null || true)"
+
+    local has_tracked=false
+    if [[ -n "$stash_commit" ]]; then
+        has_tracked=true
+        if ! git -C "$worktree_path" update-ref "$ref" "$stash_commit" 2>/dev/null; then
+            print_error "Failed to anchor baseline commit under $ref"
+            _sbp_json false false 0 ""
+            return 1
+        fi
+        if ! git -C "$worktree_path" reset --hard HEAD >/dev/null 2>&1; then
+            print_error "Failed to reset $worktree_path to a clean baseline after capturing WIP — baseline preserved at $ref, nothing lost"
+            _sbp_json false true 0 "$ref"
+            return 1
+        fi
+    fi
+
+    local untracked_count=0
+    if [[ "$include_untracked" == true ]]; then
+        local untracked
+        untracked="$(git -C "$worktree_path" ls-files --others --exclude-standard 2>/dev/null | \
+            grep -vE '(^|/)\.loom-managed$|(^|/)\.loom-in-use$|(^|/)\.loom-checkpoint$|(^|/)\.no-changes-needed$' || true)"
+        if [[ -n "$untracked" ]]; then
+            if ! mkdir -p "$holding_dir/untracked" 2>/dev/null; then
+                print_error "Could not create holding directory: $holding_dir/untracked"
+                _sbp_json false "$has_tracked" 0 "$ref"
+                return 1
+            fi
+            : > "$manifest_path"
+            while IFS= read -r f; do
+                [[ -n "$f" ]] || continue
+                local dest="$holding_dir/untracked/$f"
+                mkdir -p "$(dirname "$dest")" 2>/dev/null || continue
+                if mv "$worktree_path/$f" "$dest" 2>/dev/null; then
+                    echo "$f" >> "$manifest_path"
+                    untracked_count=$((untracked_count + 1))
+                fi
+            done <<< "$untracked"
+            [[ "$untracked_count" -eq 0 ]] && { rm -f "$manifest_path" 2>/dev/null || true; }
+        fi
+    fi
+
+    # Record the push itself, whether or not anything was captured, so the
+    # paired stash-pop is always a legitimate no-op rather than an error.
+    if ! mkdir -p "$holding_dir" 2>/dev/null || ! date -u +"%Y-%m-%dT%H:%M:%SZ" > "$pending_marker" 2>/dev/null; then
+        print_error "Could not record the pending-push marker at $pending_marker"
+        _sbp_json false "$has_tracked" "$untracked_count" "$ref"
+        return 1
+    fi
+
+    if [[ "$has_tracked" == false && "$untracked_count" -eq 0 ]]; then
+        _sbp_info "No uncommitted changes to push for issue $issue_number — worktree was already clean"
+    else
+        _sbp_success "Baseline captured for issue $issue_number (tracked: $has_tracked, untracked files moved: $untracked_count)"
+    fi
+    _sbp_info "Restore with: ./.loom/scripts/worktree.sh stash-pop $issue_number"
+
+    _sbp_json true "$has_tracked" "$untracked_count" "$ref"
+    return 0
+}
+
+# See stash_push_worktree_command's comment block above for the full design
+# rationale. stash-pop is the restore half: reads back the per-issue ref
+# (tracked changes) and holding directory (untracked files) written by
+# stash-push for the SAME issue number, applies both, and clears them.
+stash_pop_worktree_command() {
+    local issue_number="" json=false
+    local usage="Usage: pnpm worktree stash-pop <issue-number> [--json]"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json) json=true; shift ;;
+            --*)
+                print_error "Unknown flag for stash-pop: $1"
+                echo ""
+                echo "$usage"
+                return 1
+                ;;
+            *)
+                if [[ -z "$issue_number" ]]; then
+                    issue_number="$1"; shift
+                else
+                    print_error "Unexpected argument: $1"
+                    return 1
+                fi
+                ;;
+        esac
+    done
+
+    if [[ -z "$issue_number" ]]; then
+        print_error "stash-pop requires an issue number"
+        echo ""
+        echo "$usage"
+        return 1
+    fi
+    if ! [[ "$issue_number" =~ ^[0-9]+$ ]]; then
+        print_error "Issue number must be numeric (got: '$issue_number')"
+        echo ""
+        echo "$usage"
+        return 1
+    fi
+
+    _sbo_info()    { if [[ "$json" == true ]]; then echo -e "${BLUE}ℹ $*${NC}" >&2; else print_info "$*"; fi; }
+    _sbo_success() { if [[ "$json" == true ]]; then echo -e "${GREEN}✓ $*${NC}" >&2; else print_success "$*"; fi; }
+    _sbo_json() {
+        # $1=success(bool) $2=restoredTracked(bool) $3=restoredUntrackedCount
+        [[ "$json" == true ]] || return 0
+        printf '{"success": %s, "issueNumber": %s, "restoredTracked": %s, "restoredUntrackedCount": %s}\n' \
+            "$1" "$issue_number" "$2" "$3"
+    }
+
+    local git_common repo_root
+    if ! git_common=$(git rev-parse --git-common-dir 2>/dev/null); then
+        print_error "Not inside a git repository"
+        return 1
+    fi
+    repo_root=$(cd "$(dirname "$git_common")" 2>/dev/null && pwd) || repo_root="$(pwd)"
+
+    local worktree_root_dir worktree_path
+    worktree_root_dir="$(loom_worktree_root "$repo_root")"
+    worktree_path="$worktree_root_dir/issue-$issue_number"
+
+    if [[ ! -d "$worktree_path" ]]; then
+        print_error "No worktree found at $worktree_path"
+        _sbo_json false false 0
+        return 1
+    fi
+    if ! git -C "$worktree_path" rev-parse --git-dir >/dev/null 2>&1; then
+        print_error "$worktree_path is not a git working tree"
+        _sbo_json false false 0
+        return 1
+    fi
+
+    local ref="refs/loom/stash-baseline/issue-$issue_number"
+    local holding_dir="$worktree_root_dir/.stash-baseline/issue-$issue_number"
+    local manifest_path="$holding_dir/untracked.manifest"
+    local pending_marker="$holding_dir/pending"
+
+    local has_tracked=false stash_commit=""
+    if git -C "$worktree_path" rev-parse --verify --quiet "$ref" >/dev/null 2>&1; then
+        has_tracked=true
+        stash_commit="$(git -C "$worktree_path" rev-parse "$ref" 2>/dev/null || true)"
+    fi
+    local has_manifest=false
+    [[ -f "$manifest_path" ]] && has_manifest=true
+    local has_pending=false
+    [[ -f "$pending_marker" ]] && has_pending=true
+
+    # Nothing captured AND no record of a push => the caller never pushed.
+    # That is a real error. Nothing captured but a pending marker present
+    # means stash-push ran against an already-clean worktree — a legitimate
+    # no-op restore, so the `push && check && pop` chain must not break.
+    if [[ "$has_tracked" == false && "$has_manifest" == false && "$has_pending" == false ]]; then
+        print_error "Nothing to restore for issue $issue_number — run 'stash-push $issue_number' first"
+        _sbo_json false false 0
+        return 1
+    fi
+
+    if [[ "$has_tracked" == true ]]; then
+        if ! git -C "$worktree_path" stash apply "$stash_commit" >/dev/null 2>&1; then
+            print_error "Failed to apply baseline commit $stash_commit for issue $issue_number (likely conflicts with the current tree). The captured baseline is PRESERVED at $ref — resolve manually with 'git -C $worktree_path stash apply $stash_commit', then delete the ref with 'git -C $worktree_path update-ref -d $ref'."
+            _sbo_json false false 0
+            return 1
+        fi
+        git -C "$worktree_path" update-ref -d "$ref" >/dev/null 2>&1 || true
+    fi
+
+    local restored_untracked=0
+    if [[ "$has_manifest" == true ]]; then
+        local restore_failed=false
+        while IFS= read -r f; do
+            [[ -n "$f" ]] || continue
+            local src="$holding_dir/untracked/$f"
+            [[ -f "$src" ]] || continue
+            if ! mkdir -p "$(dirname "$worktree_path/$f")" 2>/dev/null; then
+                restore_failed=true
+                continue
+            fi
+            if mv "$src" "$worktree_path/$f" 2>/dev/null; then
+                restored_untracked=$((restored_untracked + 1))
+            else
+                restore_failed=true
+            fi
+        done < "$manifest_path"
+
+        if [[ "$restore_failed" == true ]]; then
+            print_error "Some untracked files for issue $issue_number could not be restored — remaining files are still under $holding_dir/untracked (manifest kept at $manifest_path for manual recovery)"
+            _sbo_json false "$has_tracked" "$restored_untracked"
+            return 1
+        fi
+
+        rm -f "$manifest_path" 2>/dev/null || true
+        rmdir "$holding_dir/untracked" 2>/dev/null || true
+    fi
+
+    # Clear the pending marker last: everything above either restored cleanly
+    # or returned early with the captured state preserved, so reaching here
+    # means the push/pop pair is complete.
+    rm -f "$pending_marker" 2>/dev/null || true
+    rmdir "$holding_dir" 2>/dev/null || true
+
+    if [[ "$has_tracked" == false && "$restored_untracked" -eq 0 ]]; then
+        _sbo_info "Nothing was captured for issue $issue_number — the worktree was already clean at stash-push time"
+        _sbo_json true false 0
+        return 0
+    fi
+
+    _sbo_success "Baseline restored for issue $issue_number (tracked: $has_tracked, untracked files restored: $restored_untracked)"
+    _sbo_json true "$has_tracked" "$restored_untracked"
+    return 0
+}
+
+# --------------------------------------------------------------------------
 # Sparse-checkout helpers
 # --------------------------------------------------------------------------
 #
@@ -922,6 +1283,9 @@ Usage:
   pnpm worktree remove <N> [--keep-branch] [--force]    Remove one managed worktree
   pnpm worktree snapshot <N> [--include-untracked] [--json]
                                                          Save uncommitted WIP as a patch file
+  pnpm worktree stash-push <N> [--include-untracked] [--json]
+                                                         Capture WIP, reset to a clean baseline
+  pnpm worktree stash-pop <N> [--json]                  Restore WIP captured by stash-push
   pnpm worktree --check                                 Check if in a worktree
   pnpm worktree --json <issue-number>                   Machine-readable JSON output
   pnpm worktree --return-to <dir> <issue-number>        Store return directory
@@ -991,6 +1355,34 @@ Examples:
 
   pnpm worktree snapshot 42 --json
     Output: {"success": true, "issueNumber": 42, "patchPath": "/path/to/.snapshots/issue-42-...patch", "hasChanges": true, "bytes": 1234}
+
+  pnpm worktree stash-push 42
+    For a "clean baseline vs my diff" comparison (clippy/shellcheck/test
+    baseline diffing, issue #5217): captures the worktree's uncommitted
+    tracked-file diff via 'git stash create' (never touches refs/stash),
+    anchors it under the PER-ISSUE ref refs/loom/stash-baseline/issue-42, and
+    resets the worktree to a clean 'git reset --hard HEAD' baseline. Unlike
+    raw 'git stash push', two builders in different worktrees can never
+    collide — each issue gets its own ref, not a shared stack — so this does
+    NOT trigger guard-destructive-generic.sh's stash-scope:worktree-collision
+    ask even with several other '.loom-managed' worktrees active.
+
+  pnpm worktree stash-push 42 --include-untracked
+    Same as above, but also moves untracked files (respecting .gitignore,
+    excluding Loom runtime markers) into a per-issue holding directory
+    instead of leaving them in the worktree.
+
+  pnpm worktree stash-pop 42
+    Restores whatever 'stash-push 42' captured (tracked diff + any moved
+    untracked files) and clears the ref / holding directory. Succeeds as a
+    no-op when the matching stash-push found an already-clean worktree, so
+    'stash-push 42 && <baseline check> && stash-pop 42' never breaks its own
+    chain. Errors loudly, WITHOUT discarding the captured baseline, if no
+    stash-push is pending at all or if re-applying conflicts with the tree.
+
+  pnpm worktree stash-push 42 --json / stash-pop 42 --json
+    Output: {"success": true, "issueNumber": 42, "hasTrackedChanges": true, "untrackedCount": 0, "ref": "refs/loom/stash-baseline/issue-42"}
+            {"success": true, "issueNumber": 42, "restoredTracked": true, "restoredUntrackedCount": 0}
 
   pnpm worktree --check
     Shows current worktree status
@@ -1111,6 +1503,21 @@ if [[ "$1" == "snapshot" ]]; then
     shift
     # Left of && so set -e does not abort on a non-zero return from the handler.
     snapshot_worktree_command "$@" && exit 0
+    exit 1
+fi
+
+# Worktree-scoped clean-baseline stash verbs (issue #5217). Dispatched HERE
+# for the same reason `snapshot`/`remove` are: `stash-push <N>` / `stash-pop
+# <N>` must not be rejected as "Issue number must be numeric".
+if [[ "$1" == "stash-push" ]]; then
+    shift
+    stash_push_worktree_command "$@" && exit 0
+    exit 1
+fi
+
+if [[ "$1" == "stash-pop" ]]; then
+    shift
+    stash_pop_worktree_command "$@" && exit 0
     exit 1
 fi
 

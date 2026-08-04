@@ -311,6 +311,25 @@ writes your WIP as a patch file under
 `<worktree-root>/.snapshots/issue-<N>-<timestamp>.patch`, scoped to your own
 worktree, so there is no shared stack to collide on.
 
+**For a "clean baseline vs. my diff" comparison** — temporarily clearing your
+WIP to run a clippy/shellcheck/test baseline, then restoring it — `snapshot`
+is *not* enough (it captures a patch but does not reset the working tree).
+Use the clean-and-restore pair instead of `git stash` / `git stash pop`
+(#5217):
+
+```bash
+./.loom/scripts/worktree.sh stash-push <issue-number>   # capture WIP, reset to clean HEAD
+<run the baseline check>                                # e.g. cargo clippy > /tmp/baseline.txt
+./.loom/scripts/worktree.sh stash-pop <issue-number>    # restore exactly what was captured
+```
+
+It anchors your WIP to a **per-issue** ref (`refs/loom/stash-baseline/issue-<N>`),
+never `refs/stash`, so another builder's concurrent stash cannot land "in
+between" your push and pop. Add `--include-untracked` to move untracked files
+out too. Because it never runs `git stash pop|drop|clear`, it does not trip
+the `stash-scope` ask that would stall a headless sweep — whereas raw
+`git stash pop` from a worktree still asks, correctly, and always will.
+
 This does **not** apply to the `check-main-clean.sh --quarantine` recovery
 flow below (§"If it exits 3…") — that flow's use of `git stash` operates on
 the **main checkout**, is single-writer by construction (only one agent's

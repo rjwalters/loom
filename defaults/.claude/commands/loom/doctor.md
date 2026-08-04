@@ -113,6 +113,16 @@ writes your WIP as a patch file under
 `<worktree-root>/.snapshots/issue-<N>-<timestamp>.patch`, scoped to your own
 worktree, so there is no shared stack to collide on.
 
+**For a "clean baseline vs. my diff" comparison** — temporarily clearing your
+fix to re-run a lint/test baseline, then restoring it — `snapshot` is *not*
+enough (it captures a patch but does not reset the working tree). Use
+`./.loom/scripts/worktree.sh stash-push <issue-number>`, run the baseline
+check, then `./.loom/scripts/worktree.sh stash-pop <issue-number>` (#5217).
+It anchors your WIP to a **per-issue** ref (`refs/loom/stash-baseline/issue-<N>`),
+never `refs/stash`, so no concurrent builder's stash can land between your
+push and pop — and, unlike raw `git stash pop`, it does not trip the
+`stash-scope` ask that would stall a headless sweep.
+
 ## ⚠️ `--body @path` Does NOT Expand — It Posts the Literal String
 
 **If a comment you're posting (fix summary, clarifying question, conflict-only

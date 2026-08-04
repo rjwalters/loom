@@ -3598,6 +3598,24 @@ fi
 # `<main>/.loom/worktrees/`, we ask too — a single active worktree has no one
 # else's stash entry to collide with, so it stays ungated.
 #
+# NOTE (#5217): this fires correctly, per the design above, for a legitimate
+# `git stash push && <baseline check> && git stash pop` pattern too — used to
+# diff a clean baseline against WIP (clippy/shellcheck/test-output
+# comparisons) — since in this repo's typical worktree count that pattern is
+# gated on nearly every occurrence, with no human to answer in headless mode.
+# A same-chain heuristic ("push and pop appear in the same command, so
+# allow") was considered and REJECTED during #5217's curation: push and pop
+# are two separate guard-approved Bash calls with an arbitrary-duration
+# command running between them, so another worktree's concurrent `git stash
+# push` can still land on the SHARED stack during that window, and a same-
+# chain "pop" then restores the WRONG entry — a same-chain heuristic alone
+# cannot see that. The fix is `worktree.sh stash-push`/`stash-pop`
+# (`.loom/scripts/worktree.sh`), which never touch `refs/stash` — WIP is
+# anchored to a PER-ISSUE ref instead, so there is no shared stack left to
+# collide on. This ask (and the main-checkout ask above) stay exactly as
+# strict as before for any RAW `git stash pop/drop/clear` — the new commands
+# are a guard-transparent replacement path, not a guard exemption.
+#
 # Gated by stash_scope_guard_enabled() (guards.stashScope /
 # LOOM_GUARD_STASH_SCOPE, default on), invoked LAZILY only after the pattern
 # already matched, mirroring every other cold-path toggle in this file.
@@ -3638,7 +3656,7 @@ if echo "$COMMAND_ASK_SCAN" | grep -qE '(^|[;&|(]|[[:space:]])git[[:space:]]+sta
         fi
 
         if [[ "$_stash_worktree_count" -ge 2 ]]; then
-            ask "Command requires confirmation: $COMMAND (git stash pop/drop/clear from a linked worktree can destroy ANOTHER builder's WIP — refs/stash is a single stack SHARED across every linked worktree of this repo, not per-worktree, and $_stash_worktree_count managed worktrees are currently active. Use './.loom/scripts/worktree.sh snapshot <issue-number>' instead of git stash for ad-hoc WIP; set guards.stashScope:false / LOOM_GUARD_STASH_SCOPE=0 to disable this ask)" "stash-scope:worktree-collision"
+            ask "Command requires confirmation: $COMMAND (git stash pop/drop/clear from a linked worktree can destroy ANOTHER builder's WIP — refs/stash is a single stack SHARED across every linked worktree of this repo, not per-worktree, and $_stash_worktree_count managed worktrees are currently active. Use './.loom/scripts/worktree.sh snapshot <issue-number>' instead of git stash for ad-hoc WIP, or './.loom/scripts/worktree.sh stash-push <issue-number>' + 'stash-pop <issue-number>' for a clean-baseline-vs-diff comparison — neither touches the shared refs/stash stack, so neither needs this ask; set guards.stashScope:false / LOOM_GUARD_STASH_SCOPE=0 to disable this ask)" "stash-scope:worktree-collision"
         fi
     elif [[ "$_stash_effective_cwd" != "$CWD" ]]; then
         # A `cd <dir>` prefix resolved to a target that does not exist or is
