@@ -162,7 +162,65 @@ For each proposal issue (`loom:curated`, `loom:architect`, `loom:hermit`, or `lo
 ### 2. Technical Feasibility
 - [ ] Solution approach is technically sound
 - [ ] No obvious blockers or dependencies
+- [ ] Declared blockers are *resolvable* — not a dependency cycle (see "Dependency-cycle gate" below)
 - [ ] Fits within existing architecture
+
+#### Dependency-cycle gate (#5213)
+
+The "no obvious blockers or dependencies" check above is **single-hop and
+same-repo**: it looks at the `Blocked by`/`Depends on`/`Requires` references in
+this issue's body and asks whether each is closed. That is blind to a *cycle* —
+this issue waits on #B, and #B (or something #B waits on, possibly in another
+repo) waits back on this issue. Such an issue can never become promotable by
+waiting, and every future Champion pass re-derives the same conclusion.
+
+**Run the gate only when the proposal actually declares a blocker** — an issue
+whose body has no `(Blocked by|Depends on|Requires)` reference costs nothing:
+
+```bash
+ISSUE_NUMBER=<number>
+
+# Cheap trigger: does this proposal declare any dependency at all? Same
+# vocabulary as everywhere else (#4508), widened to cross-repo/URL refs.
+DECLARES_DEP=$("$GH_READ" issue view "$ISSUE_NUMBER" --json body --jq '.body' \
+  | grep -cE '(Blocked by|Depends on|Requires)[*_:[:space:]]*(([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)?#[0-9]+|https?://[^[:space:]),]+/issues/[0-9]+)')
+
+if [ "$DECLARES_DEP" -gt 0 ]; then
+  CYCLE_RC=0
+  ./.loom/scripts/detect-dependency-cycle.sh --issue "$ISSUE_NUMBER" --report || CYCLE_RC=$?
+  if [ "$CYCLE_RC" -eq 1 ]; then
+    # Criterion 2 FAILS. The script has already posted one comment naming every
+    # node in the cycle and added loom:operator-only. Do NOT promote, do NOT
+    # post a separate NEEDS REVISION verdict — a cycle is not something the
+    # proposal's author can fix by revising this issue's text, and
+    # loom:operator-only already excludes it from every future pass.
+    echo "#$ISSUE_NUMBER is in a dependency cycle — routed to loom:operator-only, skipping promotion"
+  fi
+fi
+```
+
+The detector is bounded by construction (default 4 hops, 25 fetched issues, 500
+edges; cached reads; `SEARCH_TRUNCATED:` printed whenever a bound fires so
+`NO_CYCLE` is never read as proof) and its comment is idempotent on the cycle's
+node set, so a cycle that survives several passes is surfaced exactly once. Full
+rationale, marker vocabulary and the bounded-cost table live in
+`champion-pr-merge.md` → "Dependency-cycle detection (#5213)"; both call sites
+run the same script, so there is one walk implementation to keep correct.
+
+**It also runs at most once per issue, without needing its own skip.** Adding
+`loom:operator-only` removes the issue from every future promotion pass —
+`champion.md`'s candidate queries already exclude that label, and "When NOT to
+Promote" below restates it — so the pass that finds a cycle is the last pass that
+walks it. Nothing here needs to be added to the body-hash idempotency machinery
+in "Idempotency check": that marker answers "has the proposal been revised", a
+question a cycle is indifferent to.
+
+**If an "Epic-aware blocker sub-check" is present under this criterion** (it
+resolves blockers whose epic has in substance already shipped), run it **first**
+and let this gate see only the blockers that survive it. A blocker the epic check
+clears is *resolvable*, not a deadlock, and reporting it as a cycle would put a
+human in front of an issue that needed no human. The two are independent
+mechanisms with independent markers — neither reads the other's state.
 
 ### 3. Implementation Clarity
 - [ ] Enough detail for a Builder to start work

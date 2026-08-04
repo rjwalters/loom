@@ -899,6 +899,26 @@ for blocked in $BLOCKED_ISSUES; do
     fi
   done
 
+  # "Still blocked" is only a valid conclusion if waiting can ever end. Run the
+  # bounded, cross-repo cycle detector on exactly this branch (#5213) — see
+  # "Dependency-cycle detection" below for why it is gated here and nowhere else.
+  if [ "$ALL_RESOLVED" = false ]; then
+    # Second gate, before the walk: a cycle already surfaced on this issue is a
+    # human's to break, and re-walking it every pass buys nothing. One cached
+    # label read (backlog observation, not arbitration) replaces up to
+    # --max-nodes forge reads. Cached("$GH_READ") — see "Cached forge reads".
+    ALREADY_ROUTED=$("$GH_READ" issue view "$blocked" --json labels \
+      --jq '[.labels[].name] | index("loom:operator-only") // empty')
+
+    if [ -z "$ALREADY_ROUTED" ]; then
+      CYCLE_RC=0
+      ./.loom/scripts/detect-dependency-cycle.sh --issue "$blocked" --report || CYCLE_RC=$?
+      if [ "$CYCLE_RC" -eq 1 ]; then
+        echo "  Dependency CYCLE on #$blocked — surfaced and routed to loom:operator-only; not re-deriving 'still blocked'"
+      fi
+    fi
+  fi
+
   if [ "$ALL_RESOLVED" = true ]; then
     echo "  All dependencies resolved - unblocking #$blocked"
     gh issue edit "$blocked" --remove-label "loom:blocked" --add-label "loom:issue"
@@ -911,6 +931,50 @@ All dependencies are now resolved. This issue is ready for implementation.
   fi
 done
 ```
+
+#### Dependency-cycle detection (#5213)
+
+**Why this exists.** Everything above is **single-hop and same-repo**: it asks "is
+the issue named in `Blocked by: #N` closed yet?". That question has no reachable
+answer when the declared dependencies form a **cycle** — A waits on B, B waits on
+A — so the loop above re-derives `Still blocked` on every pass, forever, and
+nothing in either issue's text makes the cycle visible. The incident that motivated
+this ran for weeks across two repos (an epic in one repo blocking a dependent in
+another, whose own output the epic's last remaining phase needed) and was only
+found by an operator walking 15 child issues by hand.
+
+**`./.loom/scripts/detect-dependency-cycle.sh --issue <N> [--repo <owner/repo>]`**
+closes that gap. It walks the same `(Blocked by|Depends on|Requires)` vocabulary
+this file already parses — but **N hops instead of one**, and **across repos**,
+following `owner/repo#N` and issue-URL references as well as bare `#N`. Exit codes
+mirror `check-duplicate.sh`: **0** = no cycle within the bounds, **1** = cycle
+detected, **2** = error. Read the marker lines on stdout (`CYCLE_PATH:`,
+`CYCLE_NODES:`, `CYCLE_FINGERPRINT:`, `SEARCH_TRUNCATED:`, `UNREADABLE:`) rather
+than re-deriving anything yourself.
+
+| Property | How the script guarantees it |
+|---|---|
+| **Bounded cost** | Hard caps on hops (`--max-depth`, default 4), distinct issues fetched (`--max-nodes`, default 25) and edges examined (`--max-steps`, default 500); each issue is fetched at most once per run; reads go through `gh-cached`. A bound that fires prints `SEARCH_TRUNCATED:` so `NO_CYCLE` is never mistaken for proof. |
+| **Not on every pass** | Two gates precede it. (1) It is invoked **only** on the `ALL_RESOLVED=false` branch above — i.e. only once the cheap single-hop check has already concluded "still blocked", so an issue that unblocks normally never pays for a walk. (2) An issue already carrying `loom:operator-only` is skipped outright — the cycle was surfaced on an earlier pass and a human owns it, so one cached label read replaces the whole walk from then on. |
+| **Surfaced, not silent** | `--report` posts **one** comment naming every node in the cycle and adds `loom:operator-only`. Breaking a cycle means deciding which declared edge is wrong or which side ships a partial first — a human decision Champion is not entitled to make. |
+| **Idempotent** | The comment carries `<!-- champion:dep-cycle:<fingerprint> -->`, fingerprinted on the cycle's **node set** (sorted), so the same cycle discovered from either side collapses to one identity and is commented once; a genuinely different cycle still gets its own comment. Same marker-and-skip shape as `champion-issue-promo.md`'s body-hash idempotency. |
+| **Fail-safe** | A `CLOSED` node ends that branch of the walk (a resolved edge cannot deadlock anyone), an unreadable cross-repo issue is reported as `UNREADABLE:` rather than crashing, and without `--report` the script is strictly read-only. |
+
+Do **not** remove `loom:blocked` when a cycle is found — the issue genuinely is
+blocked. The change is that a human now owns it (`loom:operator-only`) instead of
+Champion re-deriving the same dead conclusion on the next pass.
+
+**A cycle is not the same finding as a completed-but-unpromoted epic.** If an
+"Epic-Aware Blocker Check" section is present in `champion-common.md`, run it
+**first** and let the cycle detector see only what survives it: a blocker whose
+epic has in substance already shipped is a *resolvable* edge that the epic check
+clears on its own, and reporting it as a deadlock would put a human in front of an
+issue that needed no human. The two checks answer different questions — "has this
+blocker actually finished?" versus "can this blocker ever finish?" — and the
+detector is the fallback for the second, which only arises once the first has said
+no. They share no state and no marker (`champion:epic-block:*` vs.
+`champion:dep-cycle:*`), so either can land, be edited, or be removed without
+touching the other.
 
 ### Step 5.5: Create Follow-on Issues
 
