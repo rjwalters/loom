@@ -1952,6 +1952,31 @@ epic-action topic — those dispatches already surface on the frozen
 epic-supervisor action across all epics, or `epic.issue.{N}` for one epic
 (segment-aligned prefix match, same routing rule as the sweep topics).
 
+### Cross-repo/cross-workspace complement: the Champion-side blocker check (#5211)
+
+The supervisor above only reconciles epics **inside its own registered
+workspace** — it can compute `epic:done` and auto-close an epic the moment its
+last phase child closes, but only for an epic living in a repo where this
+supervisor is itself enabled and running. It has no way to reach into a
+*different* repo's epic before that repo's own dependent evaluates whether the
+epic still blocks it — the exact cross-repo shape of the incident that
+motivated #5211 (2AMLogic/marketing#56 blocked on 2AMLogic/klayout-tools#391,
+two different repos, neither running this supervisor).
+
+`champion-common.md` → "Epic-Aware Blocker Check", wired into
+`champion-issue-promo.md`'s Technical Feasibility criterion and
+`champion-epic.md`'s phase-creation gate, closes that gap independently of
+this supervisor: it asks the same "are this epic's phase children all closed"
+question directly against the blocker's `loom:epic-phase` children **at
+evaluation time, from the repo doing the evaluating** — no daemon
+configuration required in the blocker's own repo, and it works whether or not
+`LOOM_EPIC_SUPERVISOR` is set anywhere. The two are complementary rather than
+substitutes: enabling this supervisor in an epic's own repo prevents the trap
+at the source (a `Done` epic auto-closes before anything downstream can even
+cite it as unpromoted); the Champion-side check is what actually resolves the
+trap once it has already occurred, including across a repo boundary this
+supervisor cannot cross.
+
 ## Autonomous work finder (#3810)
 
 The **work finder** (Phase A of epic #3809,
