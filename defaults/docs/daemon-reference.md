@@ -3656,6 +3656,20 @@ pool, gated by that repo's own config (an empty registry reduces to the single
 daemon workspace). See `loom-daemon/src/token_ranking_refresh.rs` for the
 implementation.
 
+**This loop's scope is per-repo; `loom-daemon health`'s tokens section used to
+be single-pool only (#5269).** This refresher keeps every registered repo's
+OWN pool fresh independently — but through v0.18.0, `loom-daemon health`/
+`status` reported staleness for only the daemon's single
+`fallback_root`-anchored pool (its launch CWD, see [Full anchoring precedence,
+and machine-level daemon startup](token-pool.md#full-anchoring-precedence-and-machine-level-daemon-startup-4292)
+in token-pool.md), which on a multi-repo daemon is not necessarily any
+particular *other* registered repo's own pool. `status`'s `per_repo` array now
+carries each repo's own `token_pool_dir`/`ranking_present`/
+`ranking_age_secs` (populated with the same unanchored `resolve_tokens_dir`
+this loop uses), and `health --json`'s `tokens.detail.per_repo` surfaces it —
+see [token-pool.md's `loom-daemon health` distinction](token-pool.md#loom-daemon-healths-daemon-cwd-vs-operator-repo-distinction-5269)
+for the full incident writeup and the now-obsolete `$HOME`-refresh workaround.
+
 ### Merged-PR worktree reaper (#4876)
 
 CLAUDE.md states the contract: *"Loom-managed worktrees (with the

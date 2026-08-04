@@ -223,19 +223,14 @@ fn probe_ranking(status: Option<&DaemonStatusReport>) -> (bool, Option<u64>) {
     ranking_state(&dir)
 }
 
-/// `(present, age_secs)` for `<dir>/.ranking`. Extracted (and pure w.r.t. the
-/// filesystem argument) so the age computation is unit-testable.
+/// `(present, age_secs)` for `<dir>/.ranking`. Delegates to
+/// [`loom_daemon::capacity::ranking_file_state`] (#5269) — the same probe
+/// `ipc::build_daemon_status` uses to populate each registered repo's own
+/// `RepoStatus::ranking_present`/`ranking_age_secs`, so this CLI's single
+/// anchored-pool probe and the daemon's per-repo snapshot can never disagree
+/// about what "present"/"age" means for the same directory.
 fn ranking_state(dir: &Path) -> (bool, Option<u64>) {
-    let path = dir.join(".ranking");
-    let Ok(meta) = std::fs::metadata(&path) else {
-        return (false, None);
-    };
-    let age = meta
-        .modified()
-        .ok()
-        .and_then(|m| m.elapsed().ok())
-        .map(|d| d.as_secs());
-    (true, age)
+    loom_daemon::capacity::ranking_file_state(dir)
 }
 
 #[cfg(test)]
