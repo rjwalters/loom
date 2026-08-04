@@ -305,6 +305,14 @@ token hits its weekly limit.
    `claude` (or pass `--use-wrapper` to layer on top of `claude-wrapper.sh` for
    retry behavior).
 
+This whole rotation scheme rests on one assumption: the installed Claude Code
+CLI honors `CLAUDE_CODE_OAUTH_TOKEN` over a locally logged-in Keychain
+account. `defaults/scripts/verify-token-precedence.sh` (#3236, operator-manual
+-- run by hand once per Claude Code version, not wired into any automated
+check) confirms that assumption still holds by comparing `claude auth status`
+with a real Keychain login against the same command run with a deliberately
+bogus env token.
+
 ## Selection algorithm (`loom-daemon tokens select`)
 
 Three tiers, falling through to the next when the current tier yields nothing.
