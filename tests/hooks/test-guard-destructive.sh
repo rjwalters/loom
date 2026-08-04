@@ -1067,6 +1067,45 @@ assert_allow "#3757: gh label delete no longer asks by default (reversible)" \
 assert_ask "Ask for gh release delete" \
     "gh release delete v1.0"
 
+# --- #5260: right-hand anchor so `gh release delete` doesn't substring-match
+# `gh release delete-asset` (a distinct, far-less-destructive subcommand that
+# only removes one uploaded artifact, not the whole release/tag). ---
+assert_allow "#5260: gh release delete-asset no longer false-asks" \
+    "gh release delete-asset v0.18.0 loom-daemon-aarch64-unknown-linux-gnu -y"
+
+assert_allow "#5260: gh release delete-asset after a ; separator no longer false-asks" \
+    "git status; gh release delete-asset v0.18.0 asset.tar.gz -y"
+
+assert_allow "#5260: gh release delete-asset after a && separator no longer false-asks" \
+    "gh release upload v0.18.0 asset.tar.gz && gh release delete-asset v0.18.0 old-asset.tar.gz -y"
+
+assert_allow "#5260: sudo-wrapped gh release delete-asset no longer false-asks" \
+    "sudo gh release delete-asset v0.18.0 asset.tar.gz -y"
+
+assert_allow "#5260: other gh release subcommands remain unaffected (list)" \
+    "gh release list"
+
+assert_allow "#5260: other gh release subcommands remain unaffected (view)" \
+    "gh release view v1.0"
+
+assert_allow "#5260: other gh release subcommands remain unaffected (create)" \
+    "gh release create v1.0"
+
+assert_allow "#5260: other gh release subcommands remain unaffected (download)" \
+    "gh release download v1.0"
+
+assert_ask "#5260: bare gh release delete (no args, end-of-string) still asks" \
+    "gh release delete"
+
+assert_ask "#5260: gh release delete after a ; separator still asks" \
+    "git status; gh release delete v1.0"
+
+assert_ask "#5260: gh release delete after a && separator still asks" \
+    "git status && gh release delete v1.0"
+
+assert_ask "#5260: gh release delete after a | separator still asks" \
+    "echo v1.0 | xargs gh release delete"
+
 # --- #3756: ask-tier command-position anchoring + literal-text redaction ---
 # The ASK_PATTERNS loop used to grep bare, unanchored substrings against a copy
 # that was only comment-stripped (never literal-redacted), so an ask-phrase that

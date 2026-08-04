@@ -3710,7 +3710,16 @@ ASK_PATTERNS=(
     # were REMOVED from this array (#3757): they are trivially undone (gh pr
     # reopen / gh issue reopen / recreate the label) and are only asked for when
     # a repo opts IN via guards.reversibleGh (REVERSIBLE_GH_ASK_PATTERNS below).
-    '(^|[;&|[:space:]])gh release delete'
+    #
+    # Right-hand anchored (#5260): the old pattern had no boundary after
+    # `delete`, so it substring-matched `gh release delete-asset` — a distinct,
+    # far-less-destructive subcommand that only removes one uploaded artifact,
+    # not the whole release/tag. Requiring the match to end at a shell
+    # separator/whitespace or end-of-string (mirroring the existing left-hand
+    # `(^|[;&|[:space:]])` anchor) lets `delete-asset`'s immediate hyphen break
+    # the match while the bare/argumented `gh release delete` case (and any
+    # other `gh release delete-*` subcommand) is unaffected.
+    '(^|[;&|[:space:]])gh release delete([;&|[:space:]]|$)'
 
     # Cloud IAM credential deletion — retiered from the catastrophic ALWAYS_BLOCK
     # list to this UNGATED ask tier (#4216). Kept OUT of CLOUD_ASK_PATTERNS on
