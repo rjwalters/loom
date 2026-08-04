@@ -1345,7 +1345,8 @@ fn is_review_stalled(snap: &RepoPipelineSnapshot) -> bool {
 /// Assess the queue-depth section: per-root ready (dispatchable `loom:issue`,
 /// excluding park-labeled rows — see [`crate::pipeline_snapshot::RepoPipelineSnapshot::queued`])
 /// counts, **plus** the review-side axes (`review_requested`,
-/// `changes_requested`, `approved`) that the same snapshot already carries.
+/// `changes_requested`, `changes_requested_unclaimed`, `approved`) that the
+/// same snapshot already carries.
 ///
 /// The review axes are reported for their own sake and are also the input to a
 /// per-repo *review stall* check ([`is_review_stalled`]): a deep
@@ -1354,6 +1355,16 @@ fn is_review_stalled(snap: &RepoPipelineSnapshot) -> bool {
 /// Issue #5021 those three fields were collected and discarded, so a fleet-wide
 /// Judge outage — which by construction moves `review_requested` and leaves
 /// `queued` untouched — read green here all day.
+///
+/// `changes_requested_unclaimed` (Issue #5272) is the no-owner subset of
+/// `changes_requested` — see
+/// [`crate::pipeline_snapshot::RepoPipelineSnapshot::changes_requested_unclaimed`].
+/// It does not (yet) feed a dedicated stall/degraded verdict the way the
+/// review axis does; it is surfaced so the state #5272 fixes (a
+/// `loom:changes-requested` PR with no sweep and no standalone Doctor tick
+/// ever picking it up) is visible in the summary/JSON if it regresses,
+/// rather than requiring an operator to cross-reference `loom:treating` by
+/// hand.
 ///
 /// Verdict precedence when both a stall and a failed forge query are present:
 /// **stall wins** (`Degraded` over `Unknown`). Both are non-green and share an
@@ -1383,6 +1394,7 @@ pub fn assess_queues(inputs: &HealthInputs) -> HealthSection {
     let mut failed: Vec<String> = Vec::new();
     let mut review_requested: Option<usize> = None;
     let mut changes_requested: Option<usize> = None;
+    let mut changes_requested_unclaimed: Option<usize> = None;
     let mut approved: Option<usize> = None;
     let mut stalled: Vec<String> = Vec::new();
     for snap in pipeline {
@@ -1399,6 +1411,7 @@ pub fn assess_queues(inputs: &HealthInputs) -> HealthSection {
         }
         accumulate_observed(&mut review_requested, snap.review_requested);
         accumulate_observed(&mut changes_requested, snap.changes_requested);
+        accumulate_observed(&mut changes_requested_unclaimed, snap.changes_requested_unclaimed);
         accumulate_observed(&mut approved, snap.approved);
         if is_review_stalled(snap) {
             stalled.push(format!(
@@ -1412,12 +1425,22 @@ pub fn assess_queues(inputs: &HealthInputs) -> HealthSection {
     // so a caller that masked them off (or a total forge failure) renders the
     // historical `queued`-only line instead of a fabricated "0 awaiting review".
     let review_clause = {
-        let mut axes: Vec<String> = Vec::with_capacity(3);
+        let mut axes: Vec<String> = Vec::with_capacity(4);
         if let Some(n) = review_requested {
             axes.push(format!("{n} awaiting review"));
         }
         if let Some(n) = changes_requested {
             axes.push(format!("{n} changes-requested"));
+        }
+        // #5272: the no-owner subset of `changes_requested` — a PR carrying
+        // `loom:changes-requested` with no active Doctor claim and no
+        // park/hold label. Reported as its own axis (not folded into the
+        // `changes_requested` clause above) so a regression here — this
+        // count climbing and staying nonzero, meaning the standalone Doctor
+        // dispatch isn't draining the queue — is visible without having to
+        // cross-reference the `loom:treating` label by hand.
+        if let Some(n) = changes_requested_unclaimed {
+            axes.push(format!("{n} changes-requested-no-owner"));
         }
         if let Some(n) = approved {
             axes.push(format!("{n} approved"));
@@ -1465,6 +1488,7 @@ pub fn assess_queues(inputs: &HealthInputs) -> HealthSection {
             "total_ready": total,
             "total_review_requested": review_requested,
             "total_changes_requested": changes_requested,
+            "total_changes_requested_unclaimed": changes_requested_unclaimed,
             "total_approved": approved,
             "review_stall_min_backlog": REVIEW_STALL_MIN_BACKLOG,
             "review_stalled": pipeline
@@ -1479,6 +1503,7 @@ pub fn assess_queues(inputs: &HealthInputs) -> HealthSection {
                     "ready": s.queued,
                     "review_requested": s.review_requested,
                     "changes_requested": s.changes_requested,
+                    "changes_requested_unclaimed": s.changes_requested_unclaimed,
                     "approved": s.approved,
                     "merged": s.merged_24h,
                     "review_stalled": is_review_stalled(s),
@@ -3404,6 +3429,7 @@ mod tests {
             queued: Some(1),
             review_requested: Some(2),
             changes_requested: Some(1),
+            changes_requested_unclaimed: Some(1),
             approved: Some(3),
             merged_24h: Some(5),
             ..Default::default()
@@ -3413,16 +3439,46 @@ mod tests {
         assert_eq!(section.verdict, Verdict::Green);
         assert!(section.summary.contains("2 awaiting review"), "{}", section.summary);
         assert!(section.summary.contains("1 changes-requested"), "{}", section.summary);
+        assert!(section.summary.contains("1 changes-requested-no-owner"), "{}", section.summary);
         assert!(section.summary.contains("3 approved"), "{}", section.summary);
 
         assert_eq!(section.detail["total_review_requested"], serde_json::json!(2));
         assert_eq!(section.detail["total_changes_requested"], serde_json::json!(1));
+        assert_eq!(section.detail["total_changes_requested_unclaimed"], serde_json::json!(1));
         assert_eq!(section.detail["total_approved"], serde_json::json!(3));
         let repo = &section.detail["repos"][0];
         assert_eq!(repo["review_requested"], serde_json::json!(2));
         assert_eq!(repo["changes_requested"], serde_json::json!(1));
+        assert_eq!(repo["changes_requested_unclaimed"], serde_json::json!(1));
         assert_eq!(repo["approved"], serde_json::json!(3));
         assert_eq!(repo["review_stalled"], serde_json::json!(false));
+    }
+
+    /// AC4 of #5272: the no-owner subset of `changes_requested` is counted
+    /// distinctly from the queue depth itself — a repo with a healthy Doctor
+    /// (every changes-requested PR claimed) must render `0
+    /// changes-requested-no-owner` even while `changes_requested` itself is
+    /// nonzero, so a *regression* (this climbing off zero) is visible without
+    /// being masked by the raw queue-depth axis staying flat.
+    #[test]
+    fn changes_requested_unclaimed_is_tracked_distinctly_from_the_raw_queue_depth() {
+        let mut inputs = healthy_inputs();
+        inputs.pipeline = Some(vec![RepoPipelineSnapshot {
+            root: PathBuf::from("/r/loom"),
+            queued: Some(0),
+            review_requested: Some(0),
+            changes_requested: Some(3),
+            changes_requested_unclaimed: Some(0),
+            approved: Some(0),
+            merged_24h: Some(0),
+            ..Default::default()
+        }]);
+        let section = assess_queues(&inputs);
+
+        assert!(section.summary.contains("3 changes-requested"), "{}", section.summary);
+        assert!(section.summary.contains("0 changes-requested-no-owner"), "{}", section.summary);
+        assert_eq!(section.detail["total_changes_requested"], serde_json::json!(3));
+        assert_eq!(section.detail["total_changes_requested_unclaimed"], serde_json::json!(0));
     }
 
     /// AC2: a review backlog against a window that merged nothing is non-green
@@ -3477,9 +3533,15 @@ mod tests {
         assert_eq!(section.verdict, Verdict::Green);
         assert_eq!(section.detail["total_review_requested"], serde_json::Value::Null);
         assert_eq!(section.detail["total_changes_requested"], serde_json::Value::Null);
+        assert_eq!(section.detail["total_changes_requested_unclaimed"], serde_json::Value::Null);
         assert_eq!(section.detail["total_approved"], serde_json::Value::Null);
         assert!(
             !section.summary.contains("awaiting review"),
+            "an unobserved axis must not be summarized at all: {}",
+            section.summary
+        );
+        assert!(
+            !section.summary.contains("changes-requested-no-owner"),
             "an unobserved axis must not be summarized at all: {}",
             section.summary
         );

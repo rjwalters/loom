@@ -110,10 +110,10 @@ generate its own work when enabled. Start/stop it with the wrapper scripts:
 
 ### 5. Scheduled Support Roles
 
-Run the periodic support roles (Champion, Curator, Judge, Auditor, Guide) via
-the daemon-native role runner: `autonomous.roleRunner.enabled=true` in
-`.loom/config.json` (preferred — dispatches host-side via `spawn-claude.sh` on
-the same rotated token pool sweeps use) or the `.loom/bin/loom` tmux pool
+Run the periodic support roles (Champion, Curator, Judge, Doctor, Auditor,
+Guide) via the daemon-native role runner: `autonomous.roleRunner.enabled=true`
+in `.loom/config.json` (preferred — dispatches host-side via `spawn-claude.sh`
+on the same rotated token pool sweeps use) or the `.loom/bin/loom` tmux pool
 above. See [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md)
 for the full autonomous config surface and event taxonomy.
 
@@ -127,7 +127,7 @@ for the full autonomous config surface and event taxonomy.
 | Curator | `curator.md` | Enhance and organize issues | Manual / role runner |
 | Architect | `architect.md` | Create architectural proposals | Manual |
 | Hermit | `hermit.md` | Identify simplification opportunities | Manual |
-| Doctor | `doctor.md` | Fix bugs and address PR feedback | Manual |
+| Doctor | `doctor.md` | Fix bugs and address PR feedback | Manual / role runner |
 | Guide | `guide.md` | Prioritize and triage issues | Manual / role runner |
 | Driver | `driver.md` | Direct command execution | Manual |
 | Auditor | `auditor.md` | Validate main branch build and runtime | Manual / role runner |
