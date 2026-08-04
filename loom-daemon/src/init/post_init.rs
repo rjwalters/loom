@@ -359,10 +359,28 @@ pub fn update_gitignore(workspace_path: &Path) -> Result<(), String> {
     // exactly, so line-vector edits are byte-preserving for untouched regions.
     let mut lines: Vec<String> = contents.split('\n').map(str::to_string).collect();
 
-    // Remove legacy over-broad patterns that block config.json from being
-    // tracked (older installs and /imagine used `.loom/*.json`), plus the
-    // negation that was paired with that glob.
-    let legacy_overbroad = [".loom/*.json", ".loom/config.json", "!.loom/roles/*.json"];
+    // Remove legacy over-broad patterns that would shadow *any* installed
+    // `.loom/*.json` file (older installs and /imagine used `.loom/*.json`),
+    // plus the negation that was paired with that glob. These are genuinely
+    // dangerous — they block files this installer never asked the user to
+    // ignore (`.loom/install-metadata.json`, `.loom/config/skill-routes.json`,
+    // …) — so they are always removed regardless of who wrote them.
+    //
+    // #5242: `.loom/config.json` itself is deliberately NOT in this list.
+    // It used to be here (see the historical note below), on the theory that
+    // any occurrence was a leftover from the pre-#2278 bug where `.loom/config.json`
+    // was gitignored by mistake, blocking the merge-aware tracked-config design
+    // (#3598) from working. That theory stopped holding once fleet hosts started
+    // adding this exact line *on purpose*: `.loom/config.json` is committed
+    // team config by default, but a host that keeps genuinely host-local runtime
+    // state there (e.g. a `worktree.root` override) has a legitimate reason to
+    // gitignore it — and this installer never adds that rule itself (it is not
+    // in EPHEMERAL_PATTERNS), so per the "never remove ignore rules we didn't
+    // add" rule it must not strip it either. Removing it here fought that
+    // documented, intentional divergence on every subsequent install/update
+    // (rjwalters/lean-genius#43683). A single scoped `.loom/config.json` line
+    // does not shadow any other installed file, so leaving it alone is safe.
+    let legacy_overbroad = [".loom/*.json", "!.loom/roles/*.json"];
     lines.retain(|line| !legacy_overbroad.contains(&line.trim()));
 
     let begin = lines
@@ -869,7 +887,7 @@ mod tests {
     }
 
     #[test]
-    fn removes_legacy_broad_json_pattern() {
+    fn removes_legacy_broad_json_pattern_but_preserves_config_json_rule() {
         let tmp = TempDir::new().unwrap();
         let gitignore = tmp.path().join(".gitignore");
 
@@ -884,18 +902,25 @@ mod tests {
 
         let contents = fs::read_to_string(&gitignore).unwrap();
 
-        // Legacy patterns must be removed
+        // The genuinely over-broad patterns (which would shadow *any* installed
+        // `.loom/*.json` file, not just config.json) must still be removed.
         assert!(
             !contents.contains(".loom/*.json"),
             "Legacy .loom/*.json pattern should have been removed"
         );
         assert!(
-            !contents.contains(".loom/config.json"),
-            "Legacy .loom/config.json pattern should have been removed"
-        );
-        assert!(
             !contents.contains("!.loom/roles/*.json"),
             "Legacy negation pattern should have been removed"
+        );
+
+        // #5242: a narrowly-scoped `.loom/config.json` ignore rule must survive.
+        // This installer never adds this line itself (it is not in
+        // EPHEMERAL_PATTERNS), so it must not remove it either — some hosts add
+        // it deliberately to keep host-local runtime state (e.g. worktree.root
+        // overrides) out of a shared repo's tracked config.
+        assert!(
+            contents.contains(".loom/config.json"),
+            "A pre-existing, narrowly-scoped .loom/config.json ignore rule must be preserved"
         );
 
         // Specific ephemeral patterns should be added instead
@@ -904,6 +929,34 @@ mod tests {
         assert!(contents.contains(".loom/worktrees/"));
 
         // Non-Loom content preserved
+        assert!(contents.contains("node_modules/"));
+    }
+
+    #[test]
+    fn preserves_standalone_config_json_ignore_rule_across_repeated_updates() {
+        // #5242 regression: a repo that deliberately keeps `.loom/config.json`
+        // gitignored (documented host-local runtime state, e.g. a fleet host's
+        // `worktree.root` override) must not have that rule stripped again on
+        // every subsequent `update_gitignore` run (install/update/resync).
+        let tmp = TempDir::new().unwrap();
+        let gitignore = tmp.path().join(".gitignore");
+
+        fs::write(
+            &gitignore,
+            "node_modules/\n\n# Host-local divergence: worktree.root is per-machine\n.loom/config.json\n",
+        )
+        .unwrap();
+
+        update_gitignore(tmp.path()).unwrap();
+        update_gitignore(tmp.path()).unwrap();
+
+        let contents = fs::read_to_string(&gitignore).unwrap();
+
+        assert!(
+            contents.contains(".loom/config.json"),
+            "a standalone, user-added .loom/config.json ignore rule must survive repeated \
+             update_gitignore runs, got: {contents}"
+        );
         assert!(contents.contains("node_modules/"));
     }
 
