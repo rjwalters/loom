@@ -352,7 +352,21 @@ fi
 #          destination already existing (never force-populated, #5264)
 echo "Test group 9b: single-file docs are not force-created for a consumer that never had them"
 REPO="$(make_fixture)"
-rm -f "$REPO/.claude/README.md" "$REPO/.github/CONFIGURATION.md"
+# make_fixture git-tracks both files (its `git add -A && git commit`), so a bare
+# `rm -f` would NOT simulate "a consumer that never had them" — it leaves a
+# *deleted-but-tracked* path that `git status --porcelain` reports as pending
+# dirt (` D .claude/README.md`). resync-installed.sh's dirty-tree hint
+# (suggest_commit_if_resync_only_dirt) then lists that path in its `git add`
+# suggestion, which the "not reported at all" assertion below greps for and
+# trips on. Drop the files from the index *and* the worktree and commit the
+# removal, so the fixture is genuinely a repo that never received them.
+git -C "$REPO" rm -q -- .claude/README.md .github/CONFIGURATION.md >/dev/null 2>&1
+git -C "$REPO" commit -qm "consumer install without the single-file docs" >/dev/null 2>&1
+if [[ -z "$(git -C "$REPO" status --porcelain -- .claude/README.md .github/CONFIGURATION.md)" ]]; then
+    pass "(k2) fixture precondition: both single-file docs are absent AND untracked"
+else
+    fail "(k2) fixture precondition: single-file docs still show as pending git changes"
+fi
 OUT="$(cd "$REPO" && bash "$SCRIPT" 2>&1)"
 RC=$?
 if [[ ! -e "$REPO/.claude/README.md" ]]; then
