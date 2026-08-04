@@ -116,6 +116,15 @@ export LOOM_LAUNCHD_LABEL="$(launchd_sandbox_new_label)"
 # shellcheck source=lib/bg-proc-trap.sh
 source "$SCRIPT_DIR/lib/bg-proc-trap.sh"
 
+# Shared live-state-file sandbox + write guard (#5179): isolates the daemon's
+# whole known live-state-FILE surface (pid file, autonomy marker, socket ->
+# heartbeat, workspace registry) via ONE call below (live_state_sandbox_init),
+# and provides the snapshot/diff primitives the "45. Live-state path guard"
+# section near the bottom uses to fail loudly if any REAL `.loom` state path
+# is ever written during this run.
+# shellcheck source=lib/live-state-sandbox.sh
+source "$SCRIPT_DIR/lib/live-state-sandbox.sh"
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
@@ -156,6 +165,19 @@ assert_true() {
 # #4016 sign_daemon_binary helper loom-daemon-update.sh sources at
 # $REPO_ROOT/scripts/install/provision-daemon.sh).
 LOOM_REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+
+# Live-state write guard (#5179), part 1/2: snapshot every well-known daemon
+# live-state file under the REAL machine-level ~/.loom AND under the checkout
+# this suite itself lives in ($LOOM_REPO_ROOT -- the exact directory whose
+# `.daemon.pid` was corrupted in the incident that opened this issue), BEFORE
+# any fixture is built or any scenario runs. Compared against a second
+# snapshot taken at the very end of the suite (see "45. Live-state path
+# guard" near the bottom) -- this is the regression backstop: it fails loudly
+# on a write to a real `.loom` state path regardless of which sub-invocation
+# caused it, closing the same "discovered in production, not caught in CI"
+# gap the #4381 production-binary checksum guard above already closes for the
+# machine-level binary.
+_LIVE_STATE_SNAPSHOT_BEFORE="$(live_state_sandbox_snapshot "$HOME" "$LOOM_REPO_ROOT")"
 
 # ---------- fixture builder ----------
 # Sets up a fresh throwaway repo root at $1 with a real git HEAD, a stub
@@ -935,12 +957,16 @@ MINIMAL_PATH="/usr/bin:/bin:/usr/sbin:/sbin"
 
 BASE_WORKDIR="$(mktemp -d)"
 
-# #4011: isolate the autonomy-desired marker + watchdog label suite-wide so a
-# restart path that reaches the real loom-daemon-start.sh can never write the
-# operator's real ~/.loom/autonomy-desired or provision the real
-# com.rjwalters.loom-daemon-watchdog LaunchAgent. Both are exported so every
-# sub-invocation (each cd'd into its own W* dir) inherits them.
-export LOOM_AUTONOMY_MARKER="$BASE_WORKDIR/autonomy-desired"
+# #4011/#5179: isolate the WHOLE known live-state-file surface (pid file,
+# autonomy-desired marker, socket -> heartbeat, workspace registry) plus the
+# watchdog label suite-wide via ONE call, so a restart path that reaches the
+# real loom-daemon-start.sh can never write the operator's real
+# ~/.loom/{.daemon.pid,autonomy-desired,daemon.heartbeat,workspaces.json} or
+# provision the real com.rjwalters.loom-daemon-watchdog LaunchAgent. All are
+# exported so every sub-invocation (each cd'd into its own W* dir) inherits
+# them. See lib/live-state-sandbox.sh for exactly what this isolates and why
+# it is one call rather than a per-variable override.
+live_state_sandbox_init "$BASE_WORKDIR"
 export LOOM_WATCHDOG_LABEL="${LOOM_LAUNCHD_LABEL}-watchdog"
 
 # Machine-level provisioning sandbox (#4381 incident — see the checksum-guard
@@ -5217,6 +5243,31 @@ else
     echo -e "${RED}✗${NC} real ${_PROD_DAEMON_BIN} CHANGED during this test run (#4381 regression!)"
     echo "  before: $_PROD_DAEMON_CHECKSUM_BEFORE"
     echo "  after:  $_PROD_DAEMON_CHECKSUM_AFTER"
+fi
+
+# ============================================================
+# 45. Live-state path guard (#5179 incident): none of the daemon's well-known
+#     live-state files (.daemon.pid, autonomy-desired, daemon.heartbeat,
+#     workspaces.json) under the REAL machine-level ~/.loom, or under the
+#     checkout this suite itself lives in ($LOOM_REPO_ROOT/.loom), may have
+#     been created or modified by ANY scenario above. This is the direct
+#     regression test for the incident that opened this issue -- a live
+#     host's `.daemon.pid` was silently rewritten by this very suite,
+#     producing a false "degraded" liveness verdict on a healthy daemon. Like
+#     the #4381 checksum guard above, it fails loudly (rather than staying
+#     silent until discovered in production) if a future call site regresses
+#     into resolving a real checkout/HOME instead of a throwaway fixture.
+# ============================================================
+_LIVE_STATE_SNAPSHOT_AFTER="$(live_state_sandbox_snapshot "$HOME" "$LOOM_REPO_ROOT")"
+TESTS_RUN=$((TESTS_RUN + 1))
+_LIVE_STATE_DIFF="$(live_state_sandbox_report_changes "$_LIVE_STATE_SNAPSHOT_BEFORE" "$_LIVE_STATE_SNAPSHOT_AFTER")"
+if [[ -z "$_LIVE_STATE_DIFF" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} no real .loom live-state path (pid file/marker/heartbeat/workspace registry) was touched (#5179 regression guard)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} a REAL .loom live-state path was written during this test run (#5179 regression!)"
+    echo "$_LIVE_STATE_DIFF"
 fi
 
 # ---------- summary ----------
