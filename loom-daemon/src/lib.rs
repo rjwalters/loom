@@ -170,6 +170,7 @@ pub mod orphan_process_reaper;
 pub mod peer_claims;
 pub mod phase_join;
 pub mod pipeline_snapshot;
+pub mod primary_checkout_reaper;
 pub mod quarantine_reconciliation;
 pub mod rate_limit_breaker;
 pub mod repo_root;

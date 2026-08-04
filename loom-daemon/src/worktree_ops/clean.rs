@@ -209,18 +209,14 @@ fn gh_pr_list(repo_root: &Path, args: &[&str]) -> Option<Vec<PrRow>> {
     serde_json::from_slice(&out.stdout).ok()
 }
 
-/// Check the PR status for `issue_num`'s branch. Thin `gh` wrapper mirroring
-/// `clean.py::check_pr_merged`.
-#[must_use]
-pub fn check_pr_merged(repo_root: &Path, issue_num: u32) -> PrStatus {
-    let branch = naming::branch_name(issue_num);
-    let rows = gh_pr_list(
+fn gh_pr_list_by_head(repo_root: &Path, branch: &str) -> Option<Vec<PrRow>> {
+    gh_pr_list(
         repo_root,
         &[
             "pr",
             "list",
             "--head",
-            &branch,
+            branch,
             "--state",
             "all",
             "--json",
@@ -229,23 +225,30 @@ pub fn check_pr_merged(repo_root: &Path, issue_num: u32) -> PrStatus {
             "1",
         ],
     )
-    .or_else(|| {
-        gh_pr_list(
-            repo_root,
-            &[
-                "pr",
-                "list",
-                "--search",
-                &format!("Closes #{issue_num}"),
-                "--state",
-                "all",
-                "--json",
-                "number,state,mergedAt",
-                "--limit",
-                "1",
-            ],
-        )
-    });
+}
+
+fn gh_pr_list_by_issue_search(repo_root: &Path, issue_num: u32) -> Option<Vec<PrRow>> {
+    gh_pr_list(
+        repo_root,
+        &[
+            "pr",
+            "list",
+            "--search",
+            &format!("Closes #{issue_num}"),
+            "--state",
+            "all",
+            "--json",
+            "number,state,mergedAt",
+            "--limit",
+            "1",
+        ],
+    )
+}
+
+/// Map an optional `gh pr list --json number,state,mergedAt` result onto a
+/// [`PrStatus`]: `None` (the `gh` call itself failed or returned unparseable
+/// JSON) is `Unknown`; an empty (but successful) result is `NoPr`.
+fn rows_to_status(rows: Option<Vec<PrRow>>) -> PrStatus {
     let Some(rows) = rows else {
         return PrStatus::Unknown;
     };
@@ -261,6 +264,26 @@ pub fn check_pr_merged(repo_root: &Path, issue_num: u32) -> PrStatus {
     } else {
         PrStatus::Unknown
     }
+}
+
+/// Check the PR status for `issue_num`'s branch. Thin `gh` wrapper mirroring
+/// `clean.py::check_pr_merged`.
+#[must_use]
+pub fn check_pr_merged(repo_root: &Path, issue_num: u32) -> PrStatus {
+    let branch = naming::branch_name(issue_num);
+    let rows = gh_pr_list_by_head(repo_root, &branch)
+        .or_else(|| gh_pr_list_by_issue_search(repo_root, issue_num));
+    rows_to_status(rows)
+}
+
+/// GraphQL-backed PR-status lookup for an arbitrary branch name — the same
+/// `--head` query [`check_pr_merged`] uses, minus the issue-number-keyed
+/// `"Closes #N"` search fallback (there is no issue number to search for when
+/// the branch does not follow the `feature/issue-<n>` convention — e.g. a
+/// primary checkout parked on a hand-created `pr-63` branch, see #5268).
+#[must_use]
+pub fn check_pr_status_for_branch(repo_root: &Path, branch: &str) -> PrStatus {
+    rows_to_status(gh_pr_list_by_head(repo_root, branch))
 }
 
 #[derive(serde::Deserialize)]
@@ -306,7 +329,17 @@ pub fn repo_owner_rest(repo_root: &Path) -> Option<String> {
 /// be retried through [`check_pr_merged`].
 #[must_use]
 pub fn check_pr_merged_rest(repo_root: &Path, owner: &str, issue_num: u32) -> PrStatus {
-    let branch = naming::branch_name(issue_num);
+    check_pr_status_for_branch_rest(repo_root, owner, &naming::branch_name(issue_num))
+}
+
+/// REST variant of [`check_pr_status_for_branch`] — an arbitrary-branch
+/// counterpart to [`check_pr_merged_rest`] for callers that do not have (or
+/// cannot assume) a `feature/issue-<n>` branch name, e.g. a primary checkout
+/// parked on a hand-created branch (#5268).
+///
+/// Queries `repos/{owner}/{repo}/pulls?state=all&head=<owner>:<branch>`.
+#[must_use]
+pub fn check_pr_status_for_branch_rest(repo_root: &Path, owner: &str, branch: &str) -> PrStatus {
     let path = format!("repos/{{owner}}/{{repo}}/pulls?state=all&head={owner}:{branch}&per_page=1");
     let Ok(out) = Command::new("gh")
         .args(["api", &path])
@@ -888,7 +921,11 @@ pub fn prune_orphaned_worktrees(repo_root: &Path, dry_run: bool) {
     }
 }
 
-fn current_branch(repo_root: &Path) -> Option<String> {
+/// The branch currently checked out at `repo_root`, or `None` for a detached
+/// HEAD or any `git` failure. Also used by [`crate::primary_checkout_reaper`]
+/// (#5268) to identify a primary checkout parked on a non-default branch.
+#[must_use]
+pub fn current_branch(repo_root: &Path) -> Option<String> {
     let out = Command::new("git")
         .args(["symbolic-ref", "--short", "HEAD"])
         .current_dir(repo_root)
@@ -926,7 +963,12 @@ fn checked_out_branches(repo_root: &Path) -> std::collections::HashSet<String> {
     out_set
 }
 
-fn default_branch(repo_root: &Path) -> Option<String> {
+/// The repo's default branch, resolved from `origin/HEAD` — `None` if that
+/// symbolic ref is unset (e.g. `git remote set-head origin` was never run) or
+/// any `git` failure. Also used by [`crate::primary_checkout_reaper`] (#5268)
+/// to know which branch a stale primary checkout should be returned to.
+#[must_use]
+pub fn default_branch(repo_root: &Path) -> Option<String> {
     let out = Command::new("git")
         .args(["symbolic-ref", "refs/remotes/origin/HEAD"])
         .current_dir(repo_root)

@@ -626,6 +626,16 @@ pub fn spawn_multi_worktree_reaper_task(
                 // pass make progress on the same tick.
                 reap_orphan_processes_for(&root).await;
 
+                // Primary-checkout reap (#5268): answers a different question
+                // about the SAME registered root ("is the primary checkout's
+                // own HEAD parked on a dead branch?") rather than about its
+                // `.loom/worktrees/<n>` entries, but rides the same tick for
+                // the same reason the two passes above already share one —
+                // both `git`/forge probes are cheap next to normal sweep
+                // traffic, and one loop per registered root is simpler to
+                // reason about than three.
+                crate::primary_checkout_reaper::reap_primary_checkout_for(&root).await;
+
                 let config = read_worktree_reaper_config(&root);
                 if !resolve_enabled(&config) {
                     log::debug!(
