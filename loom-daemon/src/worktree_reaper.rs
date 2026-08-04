@@ -602,6 +602,15 @@ mod tests {
 
     /// Run a full reap pass against `repo` with scripted probes, recording
     /// which worktrees the (fake) remover was asked to delete.
+    ///
+    /// **Every test that calls this must be `#[serial]`** (the crate-default
+    /// unkeyed group). `reap_worktrees` -> `reap_repo` reads the process-wide
+    /// `LOOM_WORKTREE_ROOT` via `worktree_root::worktree_root()`, and
+    /// `worktree_root`'s own tests *set* that var for the duration of their
+    /// body. `#[serial]` only serializes against other `#[serial]` tests, so a
+    /// non-serial reader here can otherwise observe a sibling module's
+    /// override, resolve the wrong root, scan zero worktrees and flake
+    /// nondeterministically (#5164, same class as #5133).
     fn run_pass(repo: &Path, spec: &ProbeSpec, opts: &CleanOptions) -> (ReapReport, Vec<u32>) {
         let removed = Arc::new(Mutex::new(Vec::new()));
         let in_use_marker = |_: &Path| {
@@ -650,6 +659,7 @@ mod tests {
     // ===================================================================
 
     #[test]
+    #[serial]
     fn test_merged_pr_worktree_is_reaped_without_a_manual_clean() {
         let repo = make_repo(&[(100, true), (101, true)]);
         let (report, removed) = run_pass(repo.path(), &ProbeSpec::default(), &default_opts());
@@ -661,6 +671,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_reap_is_idempotent_second_pass_finds_nothing() {
         // The remover is a fake, so simulate the real effect by deleting the
         // directory ourselves and re-running: a second pass must be a no-op
@@ -677,6 +688,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_missing_worktree_root_is_a_clean_no_op() {
         let tmp = tempfile::tempdir().unwrap();
         let (report, removed) = run_pass(tmp.path(), &ProbeSpec::default(), &default_opts());
@@ -689,6 +701,7 @@ mod tests {
     // ===================================================================
 
     #[test]
+    #[serial]
     fn test_unmanaged_worktree_is_never_reaped() {
         // No `.loom-managed` sentinel ⇒ user-provisioned ⇒ preserved even
         // though every other gate says "removable".
@@ -700,6 +713,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_open_pr_worktree_is_never_reaped() {
         let repo = make_repo(&[(300, true)]);
         let spec = ProbeSpec {
@@ -712,6 +726,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_unmerged_and_absent_pr_worktrees_are_never_reaped() {
         for (status, expect) in [
             (PrStatus::ClosedNoMerge, "PR closed without merge"),
@@ -730,6 +745,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_open_issue_worktree_is_never_reaped() {
         let repo = make_repo(&[(302, true)]);
         let spec = ProbeSpec {
@@ -741,6 +757,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_uncommitted_changes_block_the_reap() {
         let repo = make_repo(&[(303, true)]);
         let spec = ProbeSpec {
@@ -753,6 +770,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_in_use_marker_blocks_the_reap() {
         let repo = make_repo(&[(304, true)]);
         let spec = ProbeSpec {
@@ -765,6 +783,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_live_claim_blocks_the_reap() {
         let repo = make_repo(&[(305, true)]);
         let spec = ProbeSpec {
@@ -779,6 +798,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_editable_install_blocks_the_reap() {
         let repo = make_repo(&[(306, true)]);
         let spec = ProbeSpec {
@@ -791,6 +811,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_grace_period_defers_a_just_merged_pr() {
         let repo = make_repo(&[(307, true)]);
         let spec = ProbeSpec {
@@ -805,6 +826,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_non_issue_directories_are_ignored() {
         let repo = make_repo(&[(400, true)]);
         fs::create_dir_all(repo.path().join(".loom/worktrees/scratch")).unwrap();
