@@ -26,6 +26,9 @@
 #     there is now no Python anywhere in the repo, load-bearing or otherwise,
 #     and no Python-conditional stage left to run.
 #   - bash scripts/test-installer.sh runs the 131-case installer suite.
+#   - bash scripts/test-changelog.sh runs scripts/changelog.sh's unit suite
+#     (#5196) against a disposable scratch repo (CHANGELOG_REPO_ROOT) -- no
+#     network, no dependency on this repo's own history, sub-second.
 #   - mcp-loom (TypeScript) is intentionally EXCLUDED: it needs npm install/ci
 #     in a fresh worktree (no guaranteed warm node_modules), which adds
 #     unpredictable latency to a gate that also runs once per PR. CI still
@@ -152,5 +155,8 @@ cargo test --workspace --lib --bins
 
 echo "[build-gate] bash installer suite"
 bash scripts/test-installer.sh
+
+echo "[build-gate] bash changelog generator suite"
+bash scripts/test-changelog.sh
 
 echo "[build-gate] all stages passed"
