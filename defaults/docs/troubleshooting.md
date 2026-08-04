@@ -493,6 +493,61 @@ form — but if you are debugging a quarantine, read the `On <branch>:` prefix
 as "which branch happened to be checked out at quarantine time," not as
 "which branch's changes were protected."
 
+### Finding outstanding quarantine stashes (#5185)
+
+**Symptom**: none — that is the problem. A quarantine is loud at the moment it
+happens (a `main-clean.quarantine` line on stderr and in
+`.loom/logs/main-quarantine.log`) and silent forever afterwards. Nothing drops
+the rescue stash, nothing reminds anyone it exists, so entries pile up: 29 on
+one host, oldest 7 days; five in a consumer repo inside 24 hours, none
+reconciled. They were noticed only because an unrelated hygiene command
+happened to count stashes.
+
+**List them**:
+
+```bash
+./.loom/scripts/check-main-clean.sh --list-quarantined          # human-readable
+./.loom/scripts/check-main-clean.sh --list-quarantined --json   # machine-readable
+```
+
+The same count (and the newest few entries) appears as a `Quarantined work`
+section in `./.loom/bin/loom status`, so an outstanding quarantine is
+discoverable without knowing one happened. The report is read-only — it never
+pops, drops, or reorders anything — and exits 0 whether or not anything is
+outstanding.
+
+It covers every Loom producer that pushes to the stash stack, not just
+`check-main-clean.sh --quarantine`'s `loom-quarantine:` entries (the Auditor's
+`auditor-tmp-drift-stash-<epoch>` shelf is the other one), and flags any entry
+that captured **nothing** — those are pure noise and safe to drop.
+
+**Reconciling an entry**:
+
+1. **Identify by commit, not by index.** `stash@{N}` shifts every time anything
+   pushes, and `refs/stash` is one stack shared by the primary clone and every
+   linked worktree — so the index you read a minute ago may name a different
+   entry now. The report prints each entry's commit sha for exactly this reason.
+2. **Read it**: `git -C <main> stash show -p --include-untracked <commit>`.
+3. **Check liveness before dropping anything.** Each quarantine entry carries
+   `run=sweep-<...>` and `issue=<N>`. An entry naming a **finished** run whose
+   issue is **closed** is almost certainly superseded; one naming a live sweep
+   or an open issue may be the only copy of that work. This is the judgement a
+   human cannot make by eye across dozens of entries, and it is why bulk
+   "prune anything that looks stale" is unsafe on a busy host.
+4. **Replay, don't pop.** To recover the work, apply the diff **inside the
+   owning issue worktree** rather than `git stash pop`-ing it back into the
+   primary clone — a pop in a shared stack can restore someone else's entry
+   (see "Never use bare `git stash` for ad-hoc WIP" in `builder.md`), and it
+   puts the contamination straight back where the backstop will quarantine it
+   again.
+
+**Empty entries**: an entry flagged `[EMPTY]` recorded nothing. These came from
+a race between the contamination snapshot and the stash push; the push is now
+preceded by a fresh re-derivation of the offending paths, so new ones should
+not appear (and a quarantine with nothing left to rescue logs
+`"result":"no_op"` and creates no stash at all). Existing empty entries carry
+no work and can be dropped once you have confirmed the flag.
+
 ## Several unrelated things hang at once (macOS Gatekeeper / `syspolicyd`)
 
 **Symptom:** several unrelated processes — a `cargo` build, a sweep child, a
