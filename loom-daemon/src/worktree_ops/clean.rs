@@ -1410,6 +1410,59 @@ pub fn clean_build_artifacts(repo_root: &Path, dry_run: bool) {
     }
 }
 
+/// One build-artifact directory [`reclaim_worktree_artifacts`] removed (or
+/// would remove, under `dry_run`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReclaimedArtifact {
+    /// Top-level directory name relative to the worktree root, e.g. `"target"`.
+    pub name: String,
+    /// Human-readable size, matching [`clean_build_artifacts`]'s report format.
+    pub size_human: String,
+}
+
+/// Reclaim regenerable build-artifact directories (`target/`, `node_modules`,
+/// `.venv`, `coverage/`, ...) from **inside one worktree** without removing
+/// the worktree itself — the AC3 follow-up carved out of #5177 into #5187.
+///
+/// Unlike [`clean_build_artifacts`] (which only ever reclaims from
+/// `repo_root` itself, wired to `--deep`), this walks
+/// [`super::orphan_recovery::BUILD_ARTIFACT_PATTERNS`] against
+/// `worktree_path`'s **top-level** entries, trims a trailing `/`, and removes
+/// only entries that are directories — a same-named file (`Cargo.lock`,
+/// `pnpm-lock.yaml`, `.loom-checkpoint`, `.loom-in-use`) is never touched, so
+/// reusing the dirty-detection pattern list here is safe even though most of
+/// its entries are files rather than reclaimable directories.
+///
+/// Pure I/O, no eligibility gate of its own — callers (the worktree reaper's
+/// artifact-reclaim pass) decide *whether* a worktree is eligible via
+/// [`classify_worktree`] / [`WorktreeDecision`] before calling this.
+#[must_use]
+pub fn reclaim_worktree_artifacts(worktree_path: &Path, dry_run: bool) -> Vec<ReclaimedArtifact> {
+    let mut reclaimed = Vec::new();
+    for pattern in super::orphan_recovery::BUILD_ARTIFACT_PATTERNS {
+        let name = pattern.trim_end_matches('/');
+        let dir = worktree_path.join(name);
+        if !dir.is_dir() {
+            continue;
+        }
+        let size_human = dir_size_human(&dir);
+        if dry_run {
+            reclaimed.push(ReclaimedArtifact {
+                name: name.to_string(),
+                size_human,
+            });
+            continue;
+        }
+        if std::fs::remove_dir_all(&dir).is_ok() {
+            reclaimed.push(ReclaimedArtifact {
+                name: name.to_string(),
+                size_human,
+            });
+        }
+    }
+    reclaimed
+}
+
 fn spawn_loop_locks_dir(repo_root: &Path) -> std::path::PathBuf {
     super::liveness::locks_dir(repo_root)
 }
@@ -1746,6 +1799,67 @@ mod tests {
     fn dir_size_human_handles_missing_dir() {
         // A missing directory contributes 0 bytes, not an error.
         assert_eq!(dir_size_human(Path::new("/does/not/exist/at/all")), "0B");
+    }
+
+    // --- reclaim_worktree_artifacts (#5187) ------------------------------
+
+    #[test]
+    fn reclaim_removes_target_and_node_modules_but_nothing_else() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("target/debug")).unwrap();
+        std::fs::write(tmp.path().join("target/debug/binary"), b"x").unwrap();
+        std::fs::create_dir_all(tmp.path().join("node_modules/.bin")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/main.rs"), b"fn main() {}").unwrap();
+        std::fs::write(tmp.path().join("Cargo.lock"), b"lockfile").unwrap();
+
+        let reclaimed = reclaim_worktree_artifacts(tmp.path(), false);
+        let names: Vec<_> = reclaimed.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(
+            names.into_iter().collect::<std::collections::HashSet<_>>(),
+            std::collections::HashSet::from(["target", "node_modules"])
+        );
+        assert!(!tmp.path().join("target").exists());
+        assert!(!tmp.path().join("node_modules").exists());
+        // Everything else — git history stand-ins, source, lockfiles — is untouched.
+        assert!(tmp.path().join("src/main.rs").is_file());
+        assert!(tmp.path().join("Cargo.lock").is_file());
+    }
+
+    #[test]
+    fn reclaim_never_removes_a_same_named_file() {
+        // `Cargo.lock` and `pnpm-lock.yaml` are both entries in
+        // BUILD_ARTIFACT_PATTERNS, but they are files, not directories — the
+        // reclaim pass must never `remove_dir_all` a file.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("Cargo.lock"), b"lockfile").unwrap();
+        std::fs::write(tmp.path().join("pnpm-lock.yaml"), b"lockfile").unwrap();
+        std::fs::write(tmp.path().join(".loom-in-use"), b"{}").unwrap();
+
+        let reclaimed = reclaim_worktree_artifacts(tmp.path(), false);
+        assert!(reclaimed.is_empty(), "{reclaimed:?}");
+        assert!(tmp.path().join("Cargo.lock").is_file());
+        assert!(tmp.path().join("pnpm-lock.yaml").is_file());
+        assert!(tmp.path().join(".loom-in-use").is_file());
+    }
+
+    #[test]
+    fn reclaim_dry_run_reports_without_removing() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("target")).unwrap();
+
+        let reclaimed = reclaim_worktree_artifacts(tmp.path(), true);
+        assert_eq!(reclaimed.len(), 1);
+        assert_eq!(reclaimed[0].name, "target");
+        assert!(tmp.path().join("target").is_dir(), "dry-run must not remove");
+    }
+
+    #[test]
+    fn reclaim_with_no_artifact_dirs_is_a_clean_no_op() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("README.md"), b"hi").unwrap();
+        let reclaimed = reclaim_worktree_artifacts(tmp.path(), false);
+        assert!(reclaimed.is_empty());
     }
 
     // --- tmux cleanup safety gates (#4890) -------------------------------
