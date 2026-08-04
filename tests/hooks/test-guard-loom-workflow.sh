@@ -380,6 +380,40 @@ GH_5328_UNTERMINATED_CMD='git commit -F - <<'"'"'EOF'"'"'
 assert_deny "Still block an UNTERMINATED git commit -F - heredoc opener (#5087 rule, #5328)" \
     "$GH_5328_UNTERMINATED_CMD"
 
+# Security regression (#5333, Judge finding): the #5328 `commit_stdin_re`
+# anchored its start to `(^|[^A-Za-z0-9_])`, which only proves the substring
+# `git commit -F -` appears immediately before `<<` -- NOT that `git` is the
+# first word of the command actually consuming the heredoc. `bash -s --`
+# executes the heredoc body as a live script and treats the trailing tokens
+# (`git commit -F -`) as mere positional parameters ($1..$4), never passed to
+# git. Masking that body hid the real `gh pr merge` invocation. The anchor is
+# now a genuine command boundary, so this must still DENY.
+GH_5333_BASH_S_DECOY_CMD='bash -s -- git commit -F - <<'"'"'EOF'"'"'
+'"$PHRASE_CMD"' 887 --admin
+EOF'
+assert_deny "Still block gh pr merge in a bash -s heredoc with a git commit -F - decoy suffix (#5333)" \
+    "$GH_5333_BASH_S_DECOY_CMD"
+
+# Lower-severity variant of the same looseness: a decoy command (`echo`)
+# preceding `git commit -F -` on the line must no longer trigger masking.
+# `echo` ignores stdin so this is not itself dangerous, but it proves the
+# old any-non-word-char anchor was wrong (#5333).
+GH_5333_ECHO_DECOY_CMD='echo git commit -F - <<'"'"'EOF'"'"'
+'"$PHRASE_CMD"' 887 --admin
+EOF'
+assert_deny "Still block gh pr merge behind an echo git commit -F - decoy prefix (#5333)" \
+    "$GH_5333_ECHO_DECOY_CMD"
+
+# Positive control (#5333): a genuine `git commit -F -` chained after a real
+# command separator (`;`) IS a real git-commit consumer of the heredoc, so the
+# command-boundary anchor must still MASK/ALLOW it -- the operator legitimately
+# starts a new simple command.
+GH_5333_SEMICOLON_OK_CMD='echo staged ; git commit -F - <<'"'"'EOF'"'"'
+Document the rule: never `'"$PHRASE_CMD"'` directly, use merge-pr.sh instead.
+EOF'
+assert_allow "Allow git commit -F - after a ; command separator quoting the phrase as prose (#5333)" \
+    "$GH_5333_SEMICOLON_OK_CMD"
+
 # --- False-positive regression tests (issue #5155) -----------------------
 # The phrase appearing as INERT TEXT inside a POSITIONAL (no preceding flag
 # name) argument to a known non-executing command must not deny -- only an

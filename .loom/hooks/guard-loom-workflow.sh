@@ -206,7 +206,24 @@ mask_cat_heredoc_bodies() {
         # documented long-option syntax) immediately before `<<`, with any
         # number of other whitespace-separated tokens/flags between `commit`
         # and the `-F`/`--file=` flag (issue #5328).
-        commit_stdin_re = "(^|[^A-Za-z0-9_])git[ \t]+commit([ \t]+[^ \t]+)*[ \t]+(-F[ \t]+-|--file=-)[ \t]*$"
+        #
+        # The START of the match is anchored to a genuine command/statement
+        # boundary (issue #5333 -- Judge finding): start-of-string, or a shell
+        # control operator that truly begins a new simple command -- `;`,
+        # `&`/`&&`, `|`/`||`, a subshell/command-substitution `(`, or a
+        # backtick. Those characters cannot appear as BARE (unquoted)
+        # positional arguments, so when one immediately precedes `git commit
+        # -F -` the heredoc really is consumed by that `git commit` (which
+        # never forwards stdin). The earlier `(^|[^A-Za-z0-9_])` anchor was too
+        # loose: it also matched an ordinary token boundary (e.g. the space in
+        # `bash -s -- git commit -F - <<'"'"'EOF'"'"'`), where `git commit -F -`
+        # is a mere positional argument to `bash -s` and the heredoc body is
+        # LIVE script -- masking it hid a real `gh pr merge`. Shell KEYWORDS
+        # (`then`/`do`/...) are deliberately NOT accepted as boundaries: unlike
+        # operators, a keyword-spelled word CAN be a bare positional argument
+        # (`bash -s -- x then git commit -F -`), so honoring it would reopen the
+        # same bypass.
+        commit_stdin_re = "(^|[;&|(" BT "])[ \t]*git[ \t]+commit([ \t]+[^ \t]+)*[ \t]+(-F[ \t]+-|--file=-)[ \t]*$"
     }
     { lines[NR] = $0 }
     END {
@@ -247,9 +264,12 @@ mask_cat_heredoc_bodies() {
                 sub(/cat[ \t]*$/, "", before_cat)
                 if (before_cat !~ capre) continue
                 }
-                # is_commit_stdin needs no further confinement check --
+                # is_commit_stdin needs no capre-style capture check --
                 # `git commit -F -`/`--file=-` never forwards its stdin
-                # anywhere, so the consuming command itself is the proof.
+                # anywhere, so once the commit_stdin_re command-boundary anchor
+                # has proven `git commit` really is the command consuming this
+                # heredoc (issue #5333), the consuming command itself is the
+                # confinement proof.
                 start = p + 2
                 if (substr(line, start, 1) == "-") start++
                 while (substr(line, start, 1) == " " || substr(line, start, 1) == "\t") start++
