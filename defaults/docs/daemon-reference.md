@@ -552,6 +552,56 @@ untouched; only the in-memory tracking + reaper + watchdog go away, so the sweep
 finishes normally but its terminal state becomes unobservable via IPC after the
 deregister — an accepted consequence of an explicit operator `workspace remove`.
 
+## Delegated daemon administration (`daemon.delegatedTo`, #5345)
+
+On a host with several registered workspaces, the daemon is host-global
+(one binary, one socket, one `~/.loom/workspaces.json`), but every
+consumer repo still carries the full daemon-*administration* CLI surface
+— `workspace add/set-priority/remove` and `tokens bootstrap` all happily
+mutate that host-global state from whatever repo they run in. A repo can
+opt out of that by declaring, in its own effective config (any tier
+resolved by `config_resolver::resolve_effective_config`):
+
+```json
+{ "daemon": { "delegatedTo": "/Users/rwalters/GitHub/2am" } }
+```
+
+Read via the single accessor `config_resolver::daemon_delegated_to(repo_root)`.
+**Default-off**: with no `daemon.delegatedTo` key present (every repo's
+config prior to this feature), every command below behaves exactly as
+before.
+
+**What is gated** (refuses with a message naming the delegate repo on
+stderr, non-zero exit):
+
+- `loom-daemon workspace add|set-priority|remove` — gated on the
+  **invoking** repo (resolved from cwd, `repo_root::resolve_repo_root(".")`
+  — the same resolution `calibrate`/`tokens select` already use).
+- `loom-daemon tokens bootstrap --workspace <path>` — gated on the
+  `--workspace` **target**, not cwd.
+- The `workspace_unregistered` dispatch error's recovery hint
+  (`DaemonError::workspace_unregistered`, surfaced when an explicit
+  `workspace_root`/`--workspace` names an unregistered path) — checked
+  against the **target** root's own delegation, not the invoker's, so it
+  points at the delegate repo instead of suggesting `workspace add` be run
+  locally.
+
+**What is explicitly not gated** (client/read-only actions, unaffected by
+`daemon.delegatedTo`):
+
+- `loom-daemon workspace list` (read-only).
+- `loom-daemon tokens select` (read-only, on the spawn hot path).
+- `mcp__loom__dispatch_sweep`, `list_sweeps`, `get_sweep_status`,
+  `subscribe_to_events`, `cancel_sweep` — every daemon-*client* action.
+- `loom-daemon start|stop|update`/`launchctl`/`systemd` wrappers (shell
+  scripts around `.loom/bin/loom`, not a `loom-daemon` subcommand — no
+  single entry point to intercept) and `.loom/config.json`
+  `autonomous.*` toggles (raw file edits, not a command) — both are
+  advisory-documentation-only under this key, not enforced gates.
+
+No bypass flag exists — the gate always reads the invoking/target repo's
+own effective config.
+
 ## Fleet — operator-triggered multi-host worker fanout (`fleet`, #4340)
 
 The `fleet` subcommand family is the operator-triggered path for running loom

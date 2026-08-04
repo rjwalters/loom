@@ -187,11 +187,36 @@ pub(crate) fn handle_fleet_command(action: FleetAction) -> Result<()> {
     }
 }
 
+/// Refuse a daemon-admin CLI action when the **invoking** repo (resolved
+/// from cwd the same way `calibrate`/`tokens select` already resolve it —
+/// see [`loom_daemon::worktree_ops::repo::resolve_repo_root`]) declares
+/// `daemon.delegatedTo` (issue #5345). Prints a pointer to the delegate repo
+/// on stderr and exits non-zero — mirrors the existing
+/// `std::process::exit(1)` convention `handle_tokens_command`'s `Bootstrap`
+/// error arms already use.
+///
+/// Soft-fails to "allowed" (returns without exiting) when cwd is not inside
+/// any Loom repository, or when no delegation is configured — the default-off,
+/// behavior-preserving case for every repo today.
+fn refuse_if_daemon_admin_delegated(action_desc: &str) {
+    let Ok(repo_root) = loom_daemon::worktree_ops::repo::resolve_repo_root(".") else {
+        return;
+    };
+    if let Some(delegate) = loom_daemon::config_resolver::daemon_delegated_to(&repo_root) {
+        eprintln!("error: daemon admin is delegated to {delegate} — perform {action_desc} there.");
+        std::process::exit(1);
+    }
+}
+
 /// Handle the `workspace` subcommand — mutate/inspect the machine-level
 /// workspace registry (`~/.loom/workspaces.json`) directly on the filesystem.
 /// This runs whether or not the daemon is up; a running daemon re-reads the
 /// same file on its next tick (hot-apply), and its `RegisterWorkspace` /
 /// `DeregisterWorkspace` / `ListWorkspaces` IPC handlers touch the same file.
+///
+/// `Add`/`SetPriority`/`Remove` are gated by
+/// [`refuse_if_daemon_admin_delegated`] (issue #5345) — `List` is read-only
+/// and is deliberately never gated.
 pub(crate) fn handle_workspace_command(action: WorkspaceAction) -> Result<()> {
     use loom_daemon::workspace_registry::{AddOutcome, WorkspaceRegistry};
 
@@ -203,6 +228,7 @@ pub(crate) fn handle_workspace_command(action: WorkspaceAction) -> Result<()> {
             priority,
             config_overrides,
         } => {
+            refuse_if_daemon_admin_delegated("workspace registration");
             let overrides = match config_overrides {
                 Some(raw) => Some(
                     serde_json::from_str::<serde_json::Value>(&raw)
@@ -274,6 +300,7 @@ pub(crate) fn handle_workspace_command(action: WorkspaceAction) -> Result<()> {
             path: repo_path,
             priority,
         } => {
+            refuse_if_daemon_admin_delegated("workspace priority changes");
             let mut registry = WorkspaceRegistry::load(&path)?;
             if registry.set_priority(std::path::Path::new(&repo_path), priority) {
                 registry.save(&path)?;
@@ -287,6 +314,7 @@ pub(crate) fn handle_workspace_command(action: WorkspaceAction) -> Result<()> {
             Ok(())
         }
         WorkspaceAction::Remove { path: repo_path } => {
+            refuse_if_daemon_admin_delegated("workspace removal");
             let mut registry = WorkspaceRegistry::load(&path)?;
             if registry.remove(std::path::Path::new(&repo_path)) {
                 registry.save(&path)?;

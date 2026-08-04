@@ -422,10 +422,20 @@ impl DaemonError {
     /// provisions a registry for any path — including one with no
     /// `.loom/scripts/spawn-worker.sh` — so the failure only surfaces many
     /// steps later as an opaque "failed to spawn sweep child".
+    ///
+    /// `target_delegated_to` (issue #5345) is the **target** root's own
+    /// `daemon.delegatedTo` value (i.e.
+    /// `config_resolver::daemon_delegated_to(root)`), not the invoker's — when
+    /// present, the recovery hint points at the delegate repo instead of
+    /// suggesting `workspace add` be run locally, directly addressing the
+    /// triggering incident (a `/loom:sweep all` dispatch in a delegated repo
+    /// hitting this exact error and self-remediating with an in-session
+    /// `workspace add`).
     #[must_use]
     pub fn workspace_unregistered(
         root: &std::path::Path,
         registered: &[std::path::PathBuf],
+        target_delegated_to: Option<&str>,
     ) -> Self {
         let roots: Vec<String> = registered.iter().map(|p| p.display().to_string()).collect();
         let root_display = root.display().to_string();
@@ -433,6 +443,16 @@ impl DaemonError {
             "no workspaces are registered".to_string()
         } else {
             format!("{} workspace(s) are registered ({})", roots.len(), roots.join(", "))
+        };
+        let recovery_hint = match target_delegated_to {
+            Some(delegate) => format!(
+                "This workspace delegates daemon administration to {delegate} — perform \
+                 workspace registration there (`loom-daemon workspace add {root_display}`), not \
+                 in this repo."
+            ),
+            None => "Register the workspace first (`loom-daemon workspace add <path>`), or pass \
+                      a `workspace_root` that matches one of the registered roots listed above."
+                .to_string(),
         };
         Self::new(
             ErrorDomain::Configuration,
@@ -443,10 +463,7 @@ impl DaemonError {
         )
         .recoverable(false)
         .with_details(serde_json::json!({ "requested_root": root_display, "registered": roots }))
-        .with_recovery_hint(
-            "Register the workspace first (`loom-daemon workspace add <path>`), or pass a \
-             `workspace_root` that matches one of the registered roots listed above.",
-        )
+        .with_recovery_hint(recovery_hint)
     }
 
     // Internal errors
@@ -550,5 +567,32 @@ mod tests {
         let daemon_err: DaemonError = anyhow_err.into();
         assert_eq!(daemon_err.domain, ErrorDomain::Tmux);
         assert_eq!(daemon_err.code.0, ErrorCode::TMUX_NO_SERVER);
+    }
+
+    // ===== workspace_unregistered: delegated-target recovery hint (#5345) =====
+
+    #[test]
+    fn test_workspace_unregistered_undelegated_target_suggests_local_workspace_add() {
+        let root = std::path::PathBuf::from("/repo/undelegated");
+        let error = DaemonError::workspace_unregistered(&root, &[], None);
+        let hint = error.recovery_hint.expect("recovery hint must be present");
+        assert!(
+            hint.contains("loom-daemon workspace add"),
+            "undelegated target must still suggest local registration, got: {hint}"
+        );
+        assert!(!hint.contains("delegates daemon administration"));
+    }
+
+    #[test]
+    fn test_workspace_unregistered_delegated_target_points_at_delegate() {
+        let root = std::path::PathBuf::from("/repo/delegated");
+        let error =
+            DaemonError::workspace_unregistered(&root, &[], Some("/Users/rwalters/GitHub/2am"));
+        let hint = error.recovery_hint.expect("recovery hint must be present");
+        assert!(
+            hint.contains("/Users/rwalters/GitHub/2am"),
+            "delegated target's hint must name the delegate repo, got: {hint}"
+        );
+        assert!(hint.contains("delegates daemon administration"));
     }
 }

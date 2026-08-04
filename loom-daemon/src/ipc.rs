@@ -1991,9 +1991,15 @@ fn resolve_dispatch_registry(
             if !registry.contains(&normalized) {
                 let registered: Vec<std::path::PathBuf> =
                     registry.workspaces.iter().map(|w| w.root.clone()).collect();
+                // #5345: the recovery hint should point at the *target*
+                // repo's own delegation, not the daemon process's cwd — a
+                // delegated repo dispatching into itself should be told
+                // where to register, not silently treated as undelegated.
+                let target_delegated_to = crate::config_resolver::daemon_delegated_to(&normalized);
                 return Err(Response::StructuredError(DaemonError::workspace_unregistered(
                     &normalized,
                     &registered,
+                    target_delegated_to.as_deref(),
                 )));
             }
             return Ok(workspace_pool.get_or_provision(&normalized));
