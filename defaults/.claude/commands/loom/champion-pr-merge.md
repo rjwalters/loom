@@ -864,6 +864,27 @@ done
 
 After verifying issue closure, check for blocked issues that can now be unblocked.
 
+**Epic-aware dependency check (#5211).** This is *the* call site named first
+under "Affected Files" in issue #5211 — the bare `state != CLOSED` read below
+was the exact check that ran during the incident. For every `Blocked by /
+Depends on / Requires` reference on a `loom:blocked` issue, run
+`champion-common.md` → "Epic-Aware Blocker Check" (`extract_blocker_refs` →
+`parse_blocker_ref` → Step 2 classification — read that section now if any such
+reference is found; it also covers cross-repo `owner/repo#N` references, not
+just bare `#N`) instead of a bare `gh issue view $dep --json state` read. Act on
+`EPIC_BLOCK_STATE` per this table:
+
+| `EPIC_BLOCK_STATE` | Effect on unblocking `#$blocked` |
+|---|---|
+| `not-epic` | Unchanged — plain `state` check applies (`OPEN` keeps it blocked, `CLOSED` does not) |
+| `resolved` | Epic already closed — dependency satisfied, does not keep it blocked |
+| `blocked-not-started` / `blocked-in-progress` | Genuine, unresolved blocker — keeps `#$blocked` blocked, same as before this section existed |
+| `epic-complete-unpromoted` | **Do not treat this reference as a live block.** Run `champion-common.md` Step 4 with `DEPENDENT_ISSUE="$blocked"` (idempotent flag → bounded escalation) and let the *other* dependencies decide whether `#$blocked` unblocks — an issue whose only remaining obstacle is an epic whose `loom:epic-phase` children have all closed no longer stays blocked forever via this path |
+
+Only `epic-complete-unpromoted` changes behavior here — the common
+`blocked-not-started` / `blocked-in-progress` / `not-epic` cases keep blocking
+exactly as before, so the correct common case is not weakened.
+
 ```bash
 PR_NUMBER=$1
 CLOSED_ISSUE=$2
@@ -888,25 +909,59 @@ for blocked in $BLOCKED_ISSUES; do
   # Get the issue body to check ALL dependencies
   BLOCKED_BODY=$("$GH_READ" issue view "$blocked" --json body --jq '.body')
 
-  # Extract all referenced dependencies. Two-stage (#4508): stage 1 selects
-  # lines declaring a dependency phrase, tolerant of markdown emphasis/colon
-  # between the phrase and the first #N (e.g. "**Blocked by:** #1 (x), #3
-  # (y)"); stage 2 extracts every #N on those lines, not just the first — an
-  # empty ALL_DEPS here would silently remove loom:blocked with no
-  # confirmation gate, so under-parsing is the highest-severity failure mode.
-  ALL_DEPS=$(echo "$BLOCKED_BODY" | grep -E "(Blocked by|Depends on|Requires)[*_:[:space:]]*#[0-9]+" | grep -Eo "#[0-9]+" | grep -Eo "[0-9]+" | sort -u)
+  # Extract all referenced dependencies — cross-repo aware (#5211). Use
+  # `extract_blocker_refs` from champion-common.md → "Epic-Aware Blocker Check"
+  # Step 1: it generalizes the old two-stage `#N`-only pipeline (#4508) to ALSO
+  # capture an optional `owner/repo` prefix ahead of the `#N`, so a cross-repo
+  # epic blocker (the marketing#56 → klayout-tools#391 incident shape) is not
+  # misread as same-repo. It stays tolerant of markdown emphasis/colon and
+  # extracts every reference on a dependency line. An empty ALL_DEPS here would
+  # silently remove loom:blocked with no confirmation gate, so under-parsing is
+  # the highest-severity failure mode.
+  ALL_DEPS=$(extract_blocker_refs "$BLOCKED_BODY")
 
-  # Check if ALL dependencies are now closed
+  # owner/repo this Champion is running in — the fallback for bare `#N` refs.
+  # Derived from the git remote with zero API calls; NOT `gh repo view --json
+  # nameWithOwner`, which is GraphQL-backed and fails first under the exhaustion
+  # this path must survive.
+  THIS_REPO=$(git remote get-url origin 2>/dev/null \
+    | sed -E 's#^(git@[^:]+:|https?://[^/]+/)##; s#\.git$##')
+
+  # Check whether ALL dependencies are now resolved. For each reference, run the
+  # shared Epic-Aware Blocker Check (champion-common.md Step 1→2) instead of a
+  # bare `state != CLOSED` read, so an epic whose loom:epic-phase children have
+  # all closed (but which is itself still open) is not treated as a live block.
   ALL_RESOLVED=true
-  # Plain `gh` — NOT "$GH_READ": a stale CLOSED here removes `loom:blocked`
-  # from a still-blocked issue, the highest-severity failure mode in this block.
-  for dep in $ALL_DEPS; do
-    DEP_STATE=$(gh issue view "$dep" --json state --jq '.state' 2>/dev/null)
-    if [ "$DEP_STATE" != "CLOSED" ]; then
-      echo "  Still blocked: dependency #$dep is still open"
-      ALL_RESOLVED=false
-      break
-    fi
+  for ref in $ALL_DEPS; do
+    parse_blocker_ref "$ref" "$THIS_REPO" || continue
+    # Run champion-common.md → "Epic-Aware Blocker Check" Step 2 for
+    # BLOCKER_REPO/BLOCKER_NUM here — it sets EPIC_BLOCK_STATE.
+    case "$EPIC_BLOCK_STATE" in
+      resolved)
+        : ;;  # epic already closed — dependency satisfied
+      epic-complete-unpromoted)
+        # All loom:epic-phase children closed but the epic itself still open:
+        # the trap state (#5211). Do NOT treat this reference as a live block —
+        # run champion-common.md Step 4 (idempotent flag → bounded escalation)
+        # with DEPENDENT_ISSUE="$blocked", and let the other deps decide.
+        DEPENDENT_ISSUE="$blocked"
+        echo "  #$blocked: epic blocker $BLOCKER_REPO#$BLOCKER_NUM appears complete — not gating (see champion-common.md Step 4)"
+        ;;
+      blocked-not-started|blocked-in-progress)
+        echo "  Still blocked: epic dependency $BLOCKER_REPO#$BLOCKER_NUM still has open (or no) phase children"
+        ALL_RESOLVED=false
+        break ;;
+      *)
+        # not-epic (or unclassified): the original plain state check. Plain `gh`
+        # — NOT "$GH_READ": a stale CLOSED here removes `loom:blocked` from a
+        # still-blocked issue, the highest-severity failure mode in this block.
+        DEP_STATE=$(gh issue view "$BLOCKER_NUM" --repo "$BLOCKER_REPO" --json state --jq '.state' 2>/dev/null)
+        if [ "$DEP_STATE" != "CLOSED" ]; then
+          echo "  Still blocked: dependency $BLOCKER_REPO#$BLOCKER_NUM is still open"
+          ALL_RESOLVED=false
+          break
+        fi ;;
+    esac
   done
 
   # "Still blocked" is only a valid conclusion if waiting can ever end. Run the
