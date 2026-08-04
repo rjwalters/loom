@@ -634,6 +634,43 @@ pub fn production_probes<'a>(
     }
 }
 
+/// Whether a `git worktree remove` failure means "this path is not a git
+/// worktree" — the signature (#5177) of an orphaned `.loom/worktrees/*`
+/// directory git no longer tracks (e.g. a `git worktree prune` ran while the
+/// directory was left on disk). Any *other* removal failure (a lock, a busy
+/// path, a permission error) is NOT this case and must not trigger the
+/// direct-removal fallback.
+#[must_use]
+pub fn is_untracked_worktree_error(cause: &str) -> bool {
+    cause.to_ascii_lowercase().contains("is not a working tree")
+}
+
+/// Whether `worktree_path` is safely inside `repo_root`'s managed worktree root
+/// ([`crate::worktree_root::worktree_root`]). A precondition for the
+/// direct-removal fallback (#5177): even after confirming the git error and the
+/// `.loom-managed` sentinel, never `remove_dir_all` a path outside the tree
+/// Loom provisions worktrees into.
+#[must_use]
+pub fn is_under_worktree_root(repo_root: &Path, worktree_path: &Path) -> bool {
+    let root = crate::worktree_root::worktree_root(repo_root);
+    let root = root.canonicalize().unwrap_or(root);
+    let wt = worktree_path
+        .canonicalize()
+        .unwrap_or_else(|_| worktree_path.to_path_buf());
+    wt != root && wt.starts_with(&root)
+}
+
+/// Decide whether a failed `git worktree remove` should fall back to a direct
+/// directory removal (#5177). Pure, so the untracked-orphan path is testable
+/// without a git repo. All three conditions must hold — the specific "not a
+/// working tree" git error, the `.loom-managed` sentinel, and containment under
+/// the managed worktree root — so this never degrades into a blanket `rm -rf`
+/// on any removal failure.
+#[must_use]
+pub fn should_force_remove_orphan_dir(cause: &str, is_managed: bool, under_root: bool) -> bool {
+    is_untracked_worktree_error(cause) && is_managed && under_root
+}
+
 /// Remove a worktree and delete its feature branch.
 ///
 /// Exposed (issue #4876) so the daemon-side reaper performs the *same*
@@ -659,8 +696,38 @@ pub fn cleanup_worktree(
         .arg(worktree_path)
         .arg("--force")
         .current_dir(repo_root);
-    run_checked(remove)?;
-    println!("  Removed worktree: {}", worktree_path.display());
+    if let Err(cause) = run_checked(remove) {
+        // #5177: an orphaned `.loom/worktrees/*` directory git no longer tracks
+        // fails `git worktree remove` with "is not a working tree" and could
+        // never be cleaned by the normal path. Fall back to a direct removal —
+        // but ONLY when we can prove this is a Loom-managed worktree path (the
+        // specific git error + the `.loom-managed` sentinel + containment under
+        // the managed worktree root), never a blanket rm on any failure.
+        if should_force_remove_orphan_dir(
+            &cause,
+            is_loom_managed(worktree_path),
+            is_under_worktree_root(repo_root, worktree_path),
+        ) {
+            std::fs::remove_dir_all(worktree_path).map_err(|e| {
+                format!(
+                    "git worktree remove failed ({cause}); direct removal of the untracked \
+                     worktree directory also failed: {e}"
+                )
+            })?;
+            println!(
+                "  Removed untracked worktree directory (no git worktree entry): {}",
+                worktree_path.display()
+            );
+            let _ = Command::new("git")
+                .args(["worktree", "prune"])
+                .current_dir(repo_root)
+                .status();
+        } else {
+            return Err(cause);
+        }
+    } else {
+        println!("  Removed worktree: {}", worktree_path.display());
+    }
 
     let deleted = Command::new("git")
         .args(["branch", "-d", &branch_name])
@@ -1860,6 +1927,86 @@ mod tests {
         std::fs::write(tmp.path().join("README.md"), b"hi").unwrap();
         let reclaimed = reclaim_worktree_artifacts(tmp.path(), false);
         assert!(reclaimed.is_empty());
+    }
+
+    // --- untracked-orphan worktree removal (#5177 AC5) -------------------
+
+    #[test]
+    fn untracked_worktree_error_recognizes_gits_message() {
+        // git's actual message for a path that exists but is not a worktree.
+        assert!(is_untracked_worktree_error(
+            "fatal: '/repo/.loom/worktrees/issue-42' is not a working tree"
+        ));
+        assert!(is_untracked_worktree_error("IS NOT A WORKING TREE")); // case-insensitive
+                                                                       // Any other failure must NOT be treated as an orphan directory.
+        assert!(!is_untracked_worktree_error(
+            "fatal: validation failed, cannot remove working tree"
+        ));
+        assert!(!is_untracked_worktree_error("Permission denied (os error 13)"));
+        assert!(!is_untracked_worktree_error(""));
+    }
+
+    #[test]
+    fn force_remove_orphan_requires_all_three_conditions() {
+        let ok = "fatal: 'x' is not a working tree";
+        let other = "some other failure";
+        // All three present → fall back to direct removal.
+        assert!(should_force_remove_orphan_dir(ok, true, true));
+        // Missing any single guard → refuse (never a blanket rm -rf).
+        assert!(!should_force_remove_orphan_dir(ok, false, true)); // no sentinel
+        assert!(!should_force_remove_orphan_dir(ok, true, false)); // outside root
+        assert!(!should_force_remove_orphan_dir(other, true, true)); // different error
+    }
+
+    /// End-to-end: a directory under the managed worktree root that git no
+    /// longer tracks as a worktree (the #5177 "is not a working tree" orphan) is
+    /// removed by `cleanup_worktree` instead of erroring out.
+    #[test]
+    #[serial_test::serial]
+    fn cleanup_worktree_removes_untracked_orphan_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path().canonicalize().unwrap();
+
+        // A real git repo so `git worktree remove` produces the genuine
+        // "is not a working tree" error rather than "not a git repository".
+        assert!(Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repo_root)
+            .status()
+            .unwrap()
+            .success());
+
+        // An orphan worktree directory under the resolved (override-aware)
+        // managed root, carrying the `.loom-managed` sentinel — but with no
+        // corresponding `git worktree list` entry.
+        let orphan = crate::worktree_root::worktree_root(&repo_root).join("issue-999");
+        std::fs::create_dir_all(&orphan).unwrap();
+        std::fs::write(orphan.join(".loom-managed"), "test").unwrap();
+        std::fs::write(orphan.join("some-build-artifact"), "junk").unwrap();
+        assert!(orphan.is_dir());
+
+        let result = cleanup_worktree(&repo_root, &orphan, 999, false);
+        assert!(result.is_ok(), "orphan removal should succeed: {result:?}");
+        assert!(!orphan.exists(), "orphan directory should be gone");
+    }
+
+    /// A removal failure that is NOT the untracked-orphan signature must still
+    /// error (and must never trigger the direct-removal fallback), even for a
+    /// managed path under the root.
+    #[test]
+    #[serial_test::serial]
+    fn cleanup_worktree_does_not_force_remove_on_other_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path().canonicalize().unwrap();
+        // Not a git repository at all → `git worktree remove` fails with a
+        // "not a git repository" error, which is NOT the orphan signature.
+        let managed = crate::worktree_root::worktree_root(&repo_root).join("issue-1000");
+        std::fs::create_dir_all(&managed).unwrap();
+        std::fs::write(managed.join(".loom-managed"), "test").unwrap();
+
+        let result = cleanup_worktree(&repo_root, &managed, 1000, false);
+        assert!(result.is_err(), "non-orphan failure must propagate");
+        assert!(managed.exists(), "directory must be left in place on a non-orphan failure");
     }
 
     // --- tmux cleanup safety gates (#4890) -------------------------------

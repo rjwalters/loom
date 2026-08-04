@@ -946,6 +946,27 @@ pub fn classify_missing_tick(inputs: &HealthInputs, status: &DaemonStatusReport)
     MissingTick::Dead
 }
 
+/// Whether `disk_headroom` is the **strictly** binding term of the dynamic
+/// concurrency cap `min(token_axis, disk_headroom, configured_max)` (#5177).
+///
+/// True only when disk headroom is smaller than *both* other terms — i.e. the
+/// scratch volume is throttling dispatch below what the token pool and the
+/// operator's configured admission ceiling would otherwise allow. A tie with
+/// `configured_max` is deliberately NOT flagged: that ceiling is the operator's
+/// own deliberate choice, not a disk fault. Mirrors the input shape of
+/// [`crate::work_finder::resolve_dynamic_max_concurrent`] so the two agree on
+/// what "binding" means.
+#[must_use]
+pub fn disk_binds_cap(
+    token_axis_limit: usize,
+    per_token_concurrency: usize,
+    disk_headroom: usize,
+    configured_max: usize,
+) -> bool {
+    let token_axis = token_axis_limit.saturating_mul(per_token_concurrency.max(1));
+    disk_headroom < token_axis && disk_headroom < configured_max
+}
+
 /// Assess the dispatch section: in-flight occupancy against the dynamic cap,
 /// plus the last work-finder tick's dispatch/skip-reason summary.
 #[must_use]
@@ -984,6 +1005,23 @@ pub fn assess_dispatch(inputs: &HealthInputs) -> HealthSection {
                 .clone()
                 .unwrap_or_else(|| "claude-wrapper preflight tripwire active".to_string()),
         );
+    }
+    // #5177: a small-disk host silently decays as merged worktrees leak their
+    // multi-GB target/ dirs, until disk headroom becomes the binding term of the
+    // cap and throttles the host to a fraction of its token/config capacity. That
+    // used to present as a green daemon dispatching at, say, cap 2 — a fault an
+    // operator had to notice in the `min(...)` breakdown. Name it as degraded.
+    if disk_binds_cap(
+        status.capacity.token_axis_limit,
+        status.per_token_concurrency,
+        status.disk_headroom,
+        status.configured_max,
+    ) {
+        degraded.push(format!(
+            "disk headroom is throttling dispatch (cap {} bound by disk headroom {} — free scratch \
+             disk; e.g. `loom-daemon clean --aggressive` / `--deep`)",
+            cap, status.disk_headroom
+        ));
     }
 
     // #4824: why the tick is missing, when it is. `None` whenever a tick was
@@ -2508,6 +2546,62 @@ mod tests {
         assert!(section
             .summary
             .contains("12 seen, 2 dispatched, 10 in-flight-skip"));
+    }
+
+    /// #5177 AC4: `disk_binds_cap` is the strict-minimum test — disk must be
+    /// smaller than BOTH other terms, never merely tied.
+    #[test]
+    fn disk_binds_cap_only_when_strictly_smallest() {
+        // token axis = 6 × 2 = 12, configured 12, disk 2 → disk binds.
+        assert!(disk_binds_cap(6, 2, 2, 12));
+        // disk ties configured_max → operator's own ceiling, not a disk fault.
+        assert!(!disk_binds_cap(6, 2, 12, 12));
+        // disk larger than the token axis → tokens bind, not disk.
+        assert!(!disk_binds_cap(1, 1, 5, 12));
+        // per-token 0 is clamped to 1 (mirrors resolve_dynamic_max_concurrent).
+        assert!(disk_binds_cap(6, 0, 2, 12));
+        // the healthy default fixture (disk 0, configured 0) must NOT trip it.
+        assert!(!disk_binds_cap(6, 0, 0, 0));
+    }
+
+    /// #5177 AC4: when disk headroom is the binding cap term, the dispatch
+    /// section is Degraded and names disk as the cause — not a silent green
+    /// daemon dispatching at a fraction of its token/config capacity.
+    #[test]
+    fn disk_bound_cap_produces_degraded_verdict_naming_disk() {
+        let mut inputs = healthy_inputs();
+        {
+            let status = inputs.status.as_mut().unwrap();
+            status.capacity.token_axis_limit = 6;
+            status.per_token_concurrency = 2; // token axis = 12
+            status.configured_max = 12;
+            status.disk_headroom = 2; // strictly the smallest term
+            status.dynamic_cap = 2;
+        }
+        let section = assess_dispatch(&inputs);
+        assert_eq!(section.verdict, Verdict::Degraded);
+        assert!(
+            section.summary.to_lowercase().contains("disk"),
+            "summary must name disk: {}",
+            section.summary
+        );
+    }
+
+    /// #5177 AC4 (negative): a cap bound by the operator's configured ceiling
+    /// (disk headroom ample) stays green — disk is not the culprit there.
+    #[test]
+    fn config_bound_cap_is_not_flagged_as_disk() {
+        let mut inputs = healthy_inputs();
+        {
+            let status = inputs.status.as_mut().unwrap();
+            status.capacity.token_axis_limit = 6;
+            status.per_token_concurrency = 2; // token axis = 12
+            status.configured_max = 4; // operator's own ceiling binds
+            status.disk_headroom = 50; // plenty of disk
+            status.dynamic_cap = 4;
+        }
+        let section = assess_dispatch(&inputs);
+        assert_eq!(section.verdict, Verdict::Green);
     }
 
     /// Inputs with no tick reported, a daemon well past the warm-up grace
