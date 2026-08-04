@@ -35,6 +35,7 @@ test-champion-critical-file-check.sh
 test-check-duplicate.sh
 test-check-git-identity.sh
 test-check-host-sleep.sh
+test-check-ingest-key-file.sh
 test-check-main-clean.sh
 test-check-main-freshness.sh
 test-check-quarantine-stashes.sh

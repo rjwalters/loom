@@ -72,6 +72,12 @@
 //! Bearer` HTTP header value. Every log line and [`exporter::ExportError`]
 //! variant in this module tree names the *file path*, never the key
 //! contents.
+//!
+//! `ingestKeyFile` defaults to `$HOME/.loom/observability/ingest.key`
+//! ([`resolve_ingest_key_file`]) when no tier sets it explicitly, so the
+//! path is always resolved against *this* host's own home directory rather
+//! than requiring — or risking — a value copied verbatim from a different
+//! host (#5336).
 
 pub mod backfill;
 pub mod collector;
@@ -220,11 +226,54 @@ pub fn resolve_endpoint(config: &ObservabilityConfig) -> Option<String> {
     env_nonempty(ENDPOINT_ENV).or_else(|| config.endpoint.clone())
 }
 
-/// **env > config**, no built-in default — same "not configured" handling as
-/// [`resolve_endpoint`].
+/// **env > config > default** (`$HOME/.loom/observability/ingest.key`).
+///
+/// The default keeps resolution host-relative even when no tier sets
+/// `ingestKeyFile` explicitly, so no host ever *needs* a value copied
+/// verbatim from a different host's `$HOME` in its config (#5336: a macOS
+/// `ingestKeyFile` landed in the shared, committed `.loom/config.json` and
+/// was inherited unreadable by a Linux worker via a plain `git pull` — the
+/// copy path, not the value, was the defect). Provisioning a host now needs
+/// only to place its key at this conventional path (or set an explicit
+/// override via `.loom-local/local.json` / `$LOOM_OBSERVABILITY_INGEST_KEY_FILE`
+/// for a non-default location, e.g. a system path like
+/// `/etc/loom/observability-ingest.key`).
 #[must_use]
 pub fn resolve_ingest_key_file(config: &ObservabilityConfig) -> Option<String> {
-    env_nonempty(INGEST_KEY_FILE_ENV).or_else(|| config.ingest_key_file.clone())
+    env_nonempty(INGEST_KEY_FILE_ENV)
+        .or_else(|| config.ingest_key_file.clone())
+        .or_else(default_ingest_key_file)
+}
+
+/// Join `home` with the conventional relative ingest-key-file location. Pure
+/// and unit-testable independent of the real `$HOME` (see
+/// [`default_ingest_key_file`] for why the `$HOME` lookup itself is not
+/// unit-tested in-process).
+fn ingest_key_file_under(home: &Path) -> String {
+    home.join(".loom")
+        .join("observability")
+        .join("ingest.key")
+        .to_string_lossy()
+        .to_string()
+}
+
+/// This crate's single `src/` test binary links every `#[test]` together, and
+/// several modules (`tokens_pool::paths::shared_tokens_dir`, `fleet::drain`,
+/// `fleet::path_bootstrap`) already `set_var`/`remove_var("HOME")` for their
+/// own isolation — a real ambient `$HOME` must never leak into a *different*
+/// module's resolved default mid-test-run. Refusing the default under
+/// `cfg(test)` closes that race structurally, mirroring
+/// `shared_tokens_dir`'s `#4657` fix exactly: production behavior reads the
+/// real `$HOME`, every in-process test observes `None` from this function
+/// and exercises [`ingest_key_file_under`] directly instead.
+#[cfg(not(test))]
+fn default_ingest_key_file() -> Option<String> {
+    dirs::home_dir().map(|h| ingest_key_file_under(&h))
+}
+
+#[cfg(test)]
+fn default_ingest_key_file() -> Option<String> {
+    None
 }
 
 /// **env > config > default** ([`DEFAULT_BATCH_SIZE`]).
@@ -732,11 +781,60 @@ mod tests {
         let config = ObservabilityConfig::default();
         assert!(!resolve_enabled(&config), "off by default (FLAGS-OFF posture)");
         assert_eq!(resolve_endpoint(&config), None);
+        // `default_ingest_key_file` is `cfg(test)`-gated to `None` (see its
+        // doc comment) so this in-process assertion cannot observe the real
+        // `$HOME`-relative production default — `ingest_key_file_under`
+        // below tests that default's actual path-join logic directly.
         assert_eq!(resolve_ingest_key_file(&config), None);
         assert_eq!(resolve_batch_size(&config), DEFAULT_BATCH_SIZE);
         assert_eq!(resolve_flush_interval_secs(&config), DEFAULT_FLUSH_INTERVAL_SECS);
         assert_eq!(resolve_queue_capacity(&config), DEFAULT_QUEUE_CAPACITY);
         assert_eq!(resolve_exporter(&config), ExporterKind::Https, "https is the default exporter");
+    }
+
+    // ------------------------------------------------------------------
+    // resolve_ingest_key_file — env > config > $HOME-relative default (#5336).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn ingest_key_file_under_joins_the_conventional_relative_path() {
+        assert_eq!(
+            ingest_key_file_under(Path::new("/home/ubuntu")),
+            "/home/ubuntu/.loom/observability/ingest.key"
+        );
+        assert_eq!(
+            ingest_key_file_under(Path::new("/Users/robb-studio")),
+            "/Users/robb-studio/.loom/observability/ingest.key",
+            "must resolve against WHATEVER home is passed in — never a value \
+             baked in from a different host"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_ingest_key_file_config_wins_over_default_when_no_env_set() {
+        clear_env();
+        let config = ObservabilityConfig {
+            ingest_key_file: Some("/etc/loom/observability-ingest.key".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_ingest_key_file(&config),
+            Some("/etc/loom/observability-ingest.key".to_string())
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_ingest_key_file_env_overrides_config() {
+        clear_env();
+        std::env::set_var(INGEST_KEY_FILE_ENV, "/run/secrets/ingest.key");
+        let config = ObservabilityConfig {
+            ingest_key_file: Some("/etc/loom/observability-ingest.key".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(resolve_ingest_key_file(&config), Some("/run/secrets/ingest.key".to_string()));
+        clear_env();
     }
 
     // ------------------------------------------------------------------
