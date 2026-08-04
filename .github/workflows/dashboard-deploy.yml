@@ -74,12 +74,13 @@ jobs:
       # deploy their own instance (see its own header comment) — it carries
       # only placeholder account/database/route values, never the 2AM
       # instance's real ones. The instance-specific overlay
-      # (`wrangler.2amlogic.toml`) is deliberately never committed
-      # (docs/reference-deployment.md §3), so CI materializes it from a
-      # secret the same shape as the file an operator already keeps locally —
-      # nothing about the 2AM account/route/database is hardcoded here, so a
-      # later change (e.g. epic #4859's production cutover) only requires
-      # updating the secret, never this workflow.
+      # (`wrangler.2amlogic.toml`) is deliberately never committed (see
+      # docs/reference-deployment.md — it belongs in the operator's own infra
+      # repo), so CI materializes it from a secret the same shape as the file
+      # an operator already keeps locally — nothing about the 2AM
+      # account/route/database is hardcoded here, so a later change (e.g.
+      # epic #4859's production cutover) only requires updating the secret,
+      # never this workflow.
       - name: Materialize the 2AM instance's wrangler config
         id: materialize-wrangler-config
         working-directory: dashboard
@@ -90,8 +91,9 @@ jobs:
           if [ -z "${WRANGLER_CONFIG_2AMLOGIC:-}" ]; then
             echo "::error::CLOUDFLARE_WRANGLER_CONFIG_2AMLOGIC secret is not set — deploy cannot proceed." >&2
             echo "This must be the full contents of the 2AM instance's wrangler.2amlogic.toml overlay" >&2
-            echo "(Worker name, D1 database name/id, custom-domain route, Access vars) — see" >&2
-            echo "dashboard/docs/reference-deployment.md section 3 for what it must contain, and" >&2
+            echo "(Worker name, D1 database name/id, custom-domain route, Access vars) — the" >&2
+            echo "operator's own infra repo records what it must contain (see" >&2
+            echo "dashboard/docs/reference-deployment.md), and" >&2
             echo "'gh secret set CLOUDFLARE_WRANGLER_CONFIG_2AMLOGIC < dashboard/wrangler.2amlogic.toml'" >&2
             echo "run from the operator's machine (where that file already lives) to provision it." >&2
             # Mirror the same text into a step output (verbatim) so the
@@ -101,8 +103,9 @@ jobs:
               echo "error_detail<<GH_OUTPUT_EOF"
               echo "CLOUDFLARE_WRANGLER_CONFIG_2AMLOGIC secret is not set — deploy cannot proceed."
               echo "This must be the full contents of the 2AM instance's wrangler.2amlogic.toml overlay"
-              echo "(Worker name, D1 database name/id, custom-domain route, Access vars) — see"
-              echo "dashboard/docs/reference-deployment.md section 3 for what it must contain, and"
+              echo "(Worker name, D1 database name/id, custom-domain route, Access vars) — the"
+              echo "operator's own infra repo records what it must contain (see"
+              echo "dashboard/docs/reference-deployment.md), and"
               echo "'gh secret set CLOUDFLARE_WRANGLER_CONFIG_2AMLOGIC < dashboard/wrangler.2amlogic.toml'"
               echo "run from the operator's machine (where that file already lives) to provision it."
               echo "GH_OUTPUT_EOF"

@@ -7,8 +7,9 @@ node_modules/
 dist/
 *.log
 
-# Per-instance local config overlays (e.g. wrangler.2amlogic.toml) — copies of
-# wrangler.toml with account-specific name/database_id/database_name/routes
+# Per-instance local config overlays (e.g. wrangler.myinstance.toml) — copies
+# of wrangler.toml with account-specific name/database_id/database_name/routes
 # substituted. Never committed; the committed wrangler.toml template itself is
-# NOT matched by this pattern. See docs/reference-deployment.md §3.
+# NOT matched by this pattern. Keep a record of your own overlay's values in
+# your own infra repo — see docs/reference-deployment.md.
 wrangler.*.toml

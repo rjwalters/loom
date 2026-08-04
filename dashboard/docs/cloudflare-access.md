@@ -200,7 +200,7 @@ Policy:
 |---|---|
 | Policy name | `fleet operators` |
 | Action | **Allow** |
-| Include | **Emails ending in** `2amlogic.com` (or **Emails** → specific addresses, e.g. add `rjwalters@gmail.com` as a second Include rule for an external operator identity, or an Access group) |
+| Include | **Emails ending in** `example.com` (your organization's own email domain) — or **Emails** → specific addresses for individual operator identities, or an Access group |
 
 Note the **Application Audience (AUD) tag** shown on this app's overview
 page once created — that value goes in `CF_ACCESS_AUD` in `wrangler.toml`'s
