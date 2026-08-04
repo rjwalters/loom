@@ -671,6 +671,97 @@ gh api repos/o/r/issues/1/comments -f body=@/tmp/review.md
 EOF
 echo done'
 
+# --- #5226: the command-word shapes that STILL resolved to a real interpreter
+# but fell through is_interpreter_opener() after #5205 ----------------------
+#
+# #5205 closed the path-qualified (`/bin/bash`) and env/command/exec/builtin
+# wrapper classes. Six adjacent shapes still resolved to the same interpreter
+# and were not recognized, so their heredoc bodies got masked and the live
+# `gh api ... -f body=@path` inside them silently flipped DENY -> ALLOW —
+# reopening the #4523/#4601/#4685 data-loss shape on a catastrophic-tier
+# check. Each was verified failing (allow) against PR #5205's head 6523d882
+# before the #5226 fix. The `bash <<EOF` control at line ~599 stays the
+# reference decision: this fix only ever widens recognition.
+assert_deny "#5226: Bare VAR=value prefix 'LC_ALL=C bash <<EOF ... EOF' still denies" \
+    'LC_ALL=C bash <<'"'"'EOF'"'"'
+gh api repos/o/r/issues/123/comments -f body=@/tmp/review.md
+EOF'
+
+assert_deny "#5226: sudo-wrapped interpreter 'sudo bash <<EOF ... EOF' still denies" \
+    'sudo bash <<'"'"'EOF'"'"'
+gh api repos/o/r/issues/123/comments -f body=@/tmp/review.md
+EOF'
+
+assert_deny "#5226: sudo wrapper in PIPE position ('cat <<EOF | sudo bash') still denies" \
+    'cat <<'"'"'EOF'"'"' | sudo bash
+gh api repos/o/r/issues/123/comments -f body=@/tmp/review.md
+EOF'
+
+assert_deny "#5226: exec-wrapper with a positional operand 'timeout 60 bash <<EOF ... EOF' still denies" \
+    'timeout 60 bash <<'"'"'EOF'"'"'
+gh api repos/o/r/issues/123/comments -f body=@/tmp/review.md
+EOF'
+
+assert_deny "#5226: quoted command word '\"bash\" <<EOF ... EOF' still denies" \
+    '"bash" <<'"'"'EOF'"'"'
+gh api repos/o/r/issues/123/comments -f body=@/tmp/review.md
+EOF'
+
+assert_deny "#5226: backslash-escaped command word '\\bash <<EOF ... EOF' still denies" \
+    '\bash <<'"'"'EOF'"'"'
+gh api repos/o/r/issues/123/comments -f body=@/tmp/review.md
+EOF'
+
+# Fail-closed tail: a command word that resolves to NO name at all (a
+# variable / command substitution) is treated as interpreter-fed, since no
+# allowlist can enumerate what it expands to.
+assert_deny "#5226: Unresolvable command word '\"\$SHELL\" <<EOF ... EOF' fails closed (denies)" \
+    '"$SHELL" <<'"'"'EOF'"'"'
+gh api repos/o/r/issues/123/comments -f body=@/tmp/review.md
+EOF'
+
+assert_deny "#5226: Unresolvable command word '\$(which bash) <<EOF ... EOF' fails closed (denies)" \
+    '$(which bash) <<'"'"'EOF'"'"'
+gh api repos/o/r/issues/123/comments -f body=@/tmp/review.md
+EOF'
+
+# The #5181 false-positive allow must survive all of the above: an inert
+# prose body destined for a plain file sink still ALLOWs — including through
+# the same wrapper/assignment-prefix normalization that now catches the
+# interpreter shapes (a stripped wrapper in front of a NON-interpreter must
+# resolve to that non-interpreter, not to a deny).
+assert_allow "#5226/#5181: A heredoc body to 'tee file' (non-interpreter sink) that merely quotes the phrase stays allowed" \
+    'tee /tmp/report4.md <<'"'"'EOF'"'"'
+Example of the anti-pattern:
+gh api repos/o/r/issues/1/comments -f body=@/tmp/review.md
+EOF
+echo done'
+
+assert_allow "#5226/#5181: A heredoc body to 'sudo tee file' (wrapped non-interpreter sink) stays allowed" \
+    'sudo tee /tmp/report5.md <<'"'"'EOF'"'"'
+Example of the anti-pattern:
+gh api repos/o/r/issues/1/comments -f body=@/tmp/review.md
+EOF
+echo done'
+
+assert_allow "#5226/#5181: A heredoc body to 'LC_ALL=C cat > file' (assignment-prefixed non-interpreter sink) stays allowed" \
+    'LC_ALL=C cat > /tmp/report6.md <<'"'"'EOF'"'"'
+Example of the anti-pattern:
+gh api repos/o/r/issues/1/comments -f body=@/tmp/review.md
+EOF
+echo done'
+
+# The canonical Loom issue-filing idiom: a repo script carrying the prose as
+# an argument via $(cat <<EOF ...). Its command word is an ordinary script,
+# NOT an interpreter, so the body stays masked and this keeps ALLOWing — the
+# exact production shape #5181 was filed about.
+assert_allow "#5226/#5181: create-issue.sh --body \"\$(cat <<EOF ...)\" carrying the phrase as prose stays allowed" \
+    './.loom/scripts/create-issue.sh --title "Guard bug" --body "$(cat <<'"'"'EOF'"'"'
+Example of the anti-pattern this issue is about:
+gh api repos/o/r/issues/1/comments -f body=@/tmp/review.md
+EOF
+)"'
+
 # --- #4685: the same literal-@ loss on the `edit` subcommand — real-world
 # evidence is issue #4608's body being corrupted to the literal string
 # `@/tmp/issue4608_body_new.txt`. The #4523/#4601 rules above are hard-anchored
