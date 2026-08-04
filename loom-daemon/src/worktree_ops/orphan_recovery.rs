@@ -26,6 +26,26 @@ pub const DEFAULT_LABEL_GRACE_PERIOD_SECS: i64 = 600;
 pub const DEFAULT_STALE_BUILDING_HOURS: f64 = 4.0;
 pub const ORPHAN_COMMENT_DEDUP_SECONDS: i64 = 300;
 
+/// Paths that mark an uncommitted change as "regenerable build output" rather
+/// than real work — [`cleanup_stale_worktree`] uses this to decide whether a
+/// zero-commits-ahead worktree's dirty tree is safe to discard outright, and
+/// [`super::clean::reclaim_worktree_artifacts`] (issue #5187) reuses the same
+/// list to select which top-level directories a **kept** worktree's build
+/// artifacts can be reclaimed from without removing the worktree itself.
+///
+/// Hoisted to module scope (was a `cleanup_stale_worktree`-local const) so a
+/// second consumer never drifts from this one — see #5187.
+pub(crate) const BUILD_ARTIFACT_PATTERNS: &[&str] = &[
+    "node_modules",
+    "pnpm-lock.yaml",
+    ".venv",
+    "target/",
+    "Cargo.lock",
+    "coverage/",
+    ".loom-checkpoint",
+    ".loom-in-use",
+];
+
 fn heartbeat_stale_threshold() -> i64 {
     std::env::var("LOOM_HEARTBEAT_STALE_THRESHOLD")
         .ok()
@@ -358,16 +378,6 @@ fn cleanup_stale_worktree(repo_root: &Path, issue: u32) -> bool {
     if !status_out.status.success() {
         return false;
     }
-    const BUILD_ARTIFACT_PATTERNS: &[&str] = &[
-        "node_modules",
-        "pnpm-lock.yaml",
-        ".venv",
-        "target/",
-        "Cargo.lock",
-        "coverage/",
-        ".loom-checkpoint",
-        ".loom-in-use",
-    ];
     for line in String::from_utf8_lossy(&status_out.stdout).trim().lines() {
         // porcelain lines look like "XY path" (or "XY orig -> new" for renames);
         // take the path portion after the two-char status + space.
