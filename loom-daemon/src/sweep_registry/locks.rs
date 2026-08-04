@@ -204,10 +204,7 @@ impl SweepRegistry {
                 // crashed, not "unregistered" — do not report it as alive.
                 continue;
             }
-            let already_registered = self.entries.values().any(|info| {
-                !info.state.is_terminal() && matches!(info.kind, SweepKind::Issue(i) if i == issue)
-            });
-            if !already_registered {
+            if !self.has_tracked_sweep_for(issue) {
                 result.push((issue, owner.owner_pid));
             }
         }
@@ -528,16 +525,43 @@ impl SweepRegistry {
     /// Read-only: unlike [`release_lock_owned`](Self::release_lock_owned) it
     /// never touches the filesystem, so it is safe to consult *before* a
     /// release, a label revert, or a re-dispatch. Delegates to
-    /// [`crate::live_claim::probe`], scoped to this registry's workspace root
-    /// and its configured journal path (tests point that at a tempdir, so the
-    /// probe never reads the real `~/.loom/sweeps.json`).
+    /// [`crate::live_claim::probe_excluding`], scoped to this registry's
+    /// workspace root and its configured journal path (tests point that at a
+    /// tempdir, so the probe never reads the real `~/.loom/sweeps.json`).
+    ///
+    /// Issue #5236: passes this daemon's own pid as the exclusion whenever
+    /// this registry has no tracked (non-terminal) entry for `issue` — the
+    /// only way a lock's `owner_pid` can legitimately equal `std::process::id()`
+    /// is `acquire_lock`'s provisional placeholder before the spawned child's
+    /// real pid is recorded (`record_child_pid_in_lock`, #3808). If that
+    /// rewrite never ran and this registry also has no tracked entry for the
+    /// issue, the lock is stale by construction — a leaked placeholder from a
+    /// `spawn_child` failure, not a confirmed-live claim — so the daemon's own
+    /// (necessarily still-alive) pid must not count as evidence against
+    /// itself. A registry that DOES have a tracked entry for the issue keeps
+    /// the exclusion off, so an actual in-flight dispatch's transient
+    /// pre-rewrite window is never misread as stale.
     #[must_use]
     pub fn live_claim_evidence(&self, issue: u32) -> Option<crate::live_claim::LiveClaimEvidence> {
-        crate::live_claim::probe(
+        let own_untracked_pid = (!self.has_tracked_sweep_for(issue)).then_some(std::process::id());
+        crate::live_claim::probe_excluding(
             &self.config.workspace_root,
             self.config.journal_path.as_deref(),
             issue,
+            own_untracked_pid,
         )
+    }
+
+    /// Whether this registry has a non-terminal (`Pending`/`Running`) entry
+    /// tracking a sweep for `issue` — shared by [`Self::live_claim_evidence`]
+    /// (#5236) and [`Self::unregistered_locked_issues`] (#4214), both of
+    /// which need the same "does our own bookkeeping know about this issue"
+    /// question.
+    #[must_use]
+    fn has_tracked_sweep_for(&self, issue: u32) -> bool {
+        self.entries.values().any(|info| {
+            !info.state.is_terminal() && matches!(info.kind, SweepKind::Issue(i) if i == issue)
+        })
     }
 
     // ------------------------------------------------------------------------
