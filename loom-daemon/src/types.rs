@@ -1451,13 +1451,26 @@ pub struct ObservabilityHostIdMismatch {
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ObservabilityExportState {
-    /// The exporter is not running: `observability.enabled` is false, or it is
-    /// enabled but under-configured (no endpoint, no/unreadable ingest key, or
-    /// `exporter = "otlp"` on a build without the `otlp` feature). Nothing is
-    /// being collected and nothing is being sent — a legitimate steady state,
-    /// not a fault.
+    /// `observability.enabled` is `false` (or the block is absent). Nothing is
+    /// being collected and nothing is being sent — a legitimate, deliberate
+    /// steady state, not a fault. **Never** reported when `enabled: true`; a
+    /// misconfiguration under an explicit opt-in reports [`Self::Misconfigured`]
+    /// instead (#5337) — before that fix the two were byte-identical on the
+    /// wire, making a bad `ingestKeyFile` path indistinguishable from telemetry
+    /// being off by choice.
     #[default]
     Disabled,
+    /// `observability.enabled` is `true` but a required piece of config could
+    /// not be resolved: no `endpoint`, no `ingestKeyFile`, or the configured
+    /// `ingestKeyFile` could not be read (missing, unreadable, or empty after
+    /// trimming) — see #5337. Also covers `exporter = "otlp"` requested on a
+    /// build without the `otlp` Cargo feature. The exporter never started, so
+    /// there is no `started_at`, but this is a **config error an operator
+    /// should fix**, not the same benign absence as [`Self::Disabled`].
+    /// [`ObservabilityExportStatus::endpoint`] carries whatever *did* resolve
+    /// and [`ObservabilityExportStatus::last_failure_detail`] names the
+    /// offending path and the underlying error.
+    Misconfigured,
     /// The exporter is running but has not had a fair chance to flush yet —
     /// it has been up for less than
     /// [`ObservabilityExportStatus::never_exported_grace_secs`]. Distinguished
@@ -1496,6 +1509,7 @@ impl ObservabilityExportState {
     pub fn label(self) -> &'static str {
         match self {
             ObservabilityExportState::Disabled => "disabled",
+            ObservabilityExportState::Misconfigured => "MISCONFIGURED",
             ObservabilityExportState::Starting => "starting",
             ObservabilityExportState::NeverExported => "NEVER EXPORTED",
             ObservabilityExportState::Healthy => "OK",
@@ -1511,7 +1525,8 @@ impl ObservabilityExportState {
     pub fn is_problem(self) -> bool {
         matches!(
             self,
-            ObservabilityExportState::NeverExported
+            ObservabilityExportState::Misconfigured
+                | ObservabilityExportState::NeverExported
                 | ObservabilityExportState::HostIdMismatch
                 | ObservabilityExportState::Failing
         )
@@ -1579,6 +1594,11 @@ pub struct ObservabilityExportStatus {
     /// `Display`, e.g. `sink rejected batch: HTTP 401 — …`). Never contains
     /// the ingest key: the exporter's errors are built from status codes and
     /// truncated body snippets only.
+    ///
+    /// Also doubles as the [`ObservabilityExportState::Misconfigured`] detail
+    /// (#5337) — the offending config path plus the underlying error (e.g. a
+    /// missing-file `io::Error`'s `Display`, which includes the OS errno on
+    /// platforms that report one). Same "never the key itself" discipline.
     #[serde(default)]
     pub last_failure_detail: Option<String>,
     /// Total envelopes acked this daemon process. `0` alongside a `Some`
@@ -1605,14 +1625,32 @@ pub struct ObservabilityExportStatus {
 pub const NEVER_EXPORTED_GRACE_FLOOR_SECS: u64 = 10 * 60;
 
 impl ObservabilityExportStatus {
-    /// The "exporter is not running" reading — what a daemon with
-    /// observability disabled, keyless, or otherwise under-configured reports.
-    /// Distinct from a `None` field, which means "this daemon binary predates
-    /// #5083 and cannot tell you".
+    /// The "deliberately off" reading — `observability.enabled` is `false` (or
+    /// the block is absent). Distinct from a `None` field, which means "this
+    /// daemon binary predates #5083 and cannot tell you", **and** distinct
+    /// from [`Self::misconfigured`] (#5337) — `enabled: true` with a config
+    /// problem is never reported this way.
     #[must_use]
     pub fn disabled() -> Self {
         Self {
             state: ObservabilityExportState::Disabled,
+            ..Self::default()
+        }
+    }
+
+    /// The "enabled but a required piece of config is missing or unusable"
+    /// reading (#5337) — `observability.enabled` is `true` but the exporter
+    /// never started because `endpoint`/`ingestKeyFile` did not resolve, or
+    /// the ingest key file could not be read. `endpoint` carries whatever
+    /// *did* resolve (`None` only when the endpoint itself is what's missing)
+    /// so an operator can see where telemetry would have gone; `detail` names
+    /// the offending path and the underlying error (never the key itself).
+    #[must_use]
+    pub fn misconfigured(endpoint: Option<String>, detail: String) -> Self {
+        Self {
+            state: ObservabilityExportState::Misconfigured,
+            endpoint,
+            last_failure_detail: Some(detail),
             ..Self::default()
         }
     }
@@ -1652,6 +1690,14 @@ impl ObservabilityExportStatus {
     /// from the same wire payload rather than each re-inventing the rules.
     ///
     /// Precedence, most-specific first:
+    /// 0. explicitly recorded as misconfigured ⇒ `Misconfigured` (#5337) — the
+    ///    exporter never started (no `started_at`), so this has to be checked
+    ///    *before* the not-running fallback below or it would silently
+    ///    collapse into `Disabled`, which is exactly the bug this precedence
+    ///    branch exists to prevent. `self.state` is otherwise never an input
+    ///    to this function (every other branch re-derives from the other
+    ///    fields) — `Misconfigured` is the one sticky, explicitly-set
+    ///    terminal state, since nothing else ever transitions out of it.
     /// 1. not running ⇒ `Disabled`
     /// 2. confirmed id disagreement ⇒ `HostIdMismatch` (config-shaped, cannot
     ///    self-recover — outranks a transient flush failure, whose facts stay
@@ -1662,6 +1708,9 @@ impl ObservabilityExportStatus {
     /// 6. nothing acked, past the grace window ⇒ `NeverExported`
     #[must_use]
     pub fn classify(&self, now: DateTime<Utc>) -> ObservabilityExportState {
+        if self.state == ObservabilityExportState::Misconfigured {
+            return ObservabilityExportState::Misconfigured;
+        }
         let Some(uptime) = self.uptime_secs(now) else {
             return ObservabilityExportState::Disabled;
         };
@@ -3170,6 +3219,7 @@ mod tests {
         // these exact strings via `status --json | jq`.
         for (state, wire) in [
             (ObservabilityExportState::Disabled, "\"disabled\""),
+            (ObservabilityExportState::Misconfigured, "\"misconfigured\""),
             (ObservabilityExportState::Starting, "\"starting\""),
             (ObservabilityExportState::NeverExported, "\"never_exported\""),
             (ObservabilityExportState::Healthy, "\"healthy\""),
@@ -3204,5 +3254,76 @@ mod tests {
         let minimal: ObservabilityExportStatus = serde_json::from_str("{}").unwrap();
         assert_eq!(minimal.state, ObservabilityExportState::Disabled);
         assert!(minimal.host_id.is_none());
+    }
+
+    // ==================================================================
+    // Misconfigured export status (Issue #5337)
+    // ==================================================================
+
+    #[test]
+    fn misconfigured_is_distinct_from_disabled() {
+        // AC #1 / #4: `enabled: true` with a bad `ingestKeyFile` must report a
+        // state distinct from — and never collapsing into — `disabled`, which
+        // stays reserved for `enabled: false` / no observability block.
+        let disabled = ObservabilityExportStatus::disabled();
+        let misconfigured = ObservabilityExportStatus::misconfigured(
+            Some("https://ingest.example.com/v1/telemetry".to_string()),
+            "could not read ingest key file /etc/loom/ingest.key: No such file or directory (os error 2)"
+                .to_string(),
+        );
+        assert_eq!(disabled.classify(export_now()), ObservabilityExportState::Disabled);
+        assert_eq!(misconfigured.classify(export_now()), ObservabilityExportState::Misconfigured);
+        assert_ne!(disabled.classify(export_now()), misconfigured.classify(export_now()));
+        assert!(ObservabilityExportState::Misconfigured.is_problem());
+        assert!(!ObservabilityExportState::Disabled.is_problem());
+    }
+
+    #[test]
+    fn misconfigured_state_is_sticky_across_classify_despite_no_started_at() {
+        // The precedence-chain regression this issue's fix guards against:
+        // `classify`'s "not running ⇒ Disabled" fallback (branch 1) triggers
+        // on ANY status with no `started_at` — which is true of a
+        // `misconfigured()` status too, since the exporter never started.
+        // Without the new branch-0 check, this would silently read back as
+        // `Disabled`, reproducing the exact bug #5337 reports.
+        let misconfigured =
+            ObservabilityExportStatus::misconfigured(None, "no endpoint configured".to_string());
+        assert!(misconfigured.uptime_secs(export_now()).is_none(), "never started ⇒ no uptime");
+        assert_eq!(misconfigured.classify(export_now()), ObservabilityExportState::Misconfigured);
+    }
+
+    #[test]
+    fn misconfigured_detail_names_the_path_and_endpoint_reflects_what_resolved() {
+        // AC #2 (detail names the offending path and errno) and AC #3
+        // (`endpoint` reflects what IS configured rather than `null`, when a
+        // config block exists but a later field — the ingest key file — is
+        // what's broken).
+        let status = ObservabilityExportStatus::misconfigured(
+            Some("https://ingest.example.com/v1/telemetry".to_string()),
+            "could not read ingest key file /etc/loom/ingest.key: No such file or directory (os error 2)"
+                .to_string(),
+        );
+        assert_eq!(status.endpoint.as_deref(), Some("https://ingest.example.com/v1/telemetry"));
+        let detail = status.last_failure_detail.as_deref().unwrap();
+        assert!(
+            detail.contains("/etc/loom/ingest.key"),
+            "detail must name the offending path: {detail}"
+        );
+        assert!(
+            detail.contains("os error 2"),
+            "detail must carry the underlying errno: {detail}"
+        );
+    }
+
+    #[test]
+    fn misconfigured_endpoint_is_none_when_the_endpoint_itself_is_what_is_missing() {
+        // When `observability.endpoint` is the missing piece, there is nothing
+        // to report — `None`, not an invented value.
+        let status = ObservabilityExportStatus::misconfigured(
+            None,
+            "observability.endpoint not configured".to_string(),
+        );
+        assert!(status.endpoint.is_none());
+        assert_eq!(status.classify(export_now()), ObservabilityExportState::Misconfigured);
     }
 }

@@ -414,6 +414,20 @@ impl ExportStatus {
         guard.consecutive_failures = guard.consecutive_failures.saturating_add(1);
     }
 
+    /// A status cell for an exporter that never started because a required
+    /// piece of config could not be resolved (Issue #5337) — `enabled: true`
+    /// but no endpoint, no ingest key file, or an unreadable/empty ingest key
+    /// file. See [`crate::types::ObservabilityExportStatus::misconfigured`]
+    /// for the field semantics.
+    #[must_use]
+    pub fn misconfigured(endpoint: Option<String>, detail: String) -> Self {
+        ExportStatus {
+            inner: std::sync::Mutex::new(crate::types::ObservabilityExportStatus::misconfigured(
+                endpoint, detail,
+            )),
+        }
+    }
+
     /// The current record, with [`crate::types::ObservabilityExportStatus::state`]
     /// re-derived as of now. `ingest_host_id` is folded in from
     /// [`global_host_id_mismatch`] by [`global_export_status`], not here — this
@@ -430,9 +444,11 @@ impl ExportStatus {
     }
 }
 
-/// Process-global export-status handle, registered by [`spawn_task`] when — and
-/// only when — the exporter actually starts. Unset (observability disabled,
-/// keyless, or under-configured) makes [`global_export_status`] report
+/// Process-global export-status handle, registered by [`spawn_task`] when the
+/// exporter actually starts (a [`ExportStatus::started`] cell) **or** when it
+/// fails to start due to a config problem (a [`ExportStatus::misconfigured`]
+/// cell, Issue #5337). Unset only when observability is off by choice
+/// (`enabled: false` / no block) — [`global_export_status`] then reports
 /// [`crate::types::ObservabilityExportStatus::disabled`].
 static GLOBAL_EXPORT_STATUS: std::sync::OnceLock<Arc<ExportStatus>> = std::sync::OnceLock::new();
 
@@ -444,10 +460,13 @@ pub fn register_global_export_status(status: Arc<ExportStatus>) {
 
 /// This process's export status — **always** an answer, never silence.
 ///
-/// Unregistered ⇒ `disabled()` (the exporter never started), which is a
-/// materially different report from the `None` an older daemon binary puts on
-/// the wire. Any confirmed #4830 host-identity mismatch is folded in here as
-/// `ingest_host_id`, so a single field carries the whole state machine and
+/// Unregistered ⇒ `disabled()` (`observability.enabled` is `false`, or the
+/// block is absent — deliberately off), which is a materially different
+/// report from the `None` an older daemon binary puts on the wire. An
+/// `enabled: true` config that failed to resolve registers a `misconfigured()`
+/// cell instead (Issue #5337), so the two are never confused. Any confirmed
+/// #4830 host-identity mismatch is folded in here as `ingest_host_id`, so a
+/// single field carries the whole state machine and
 /// [`crate::types::ObservabilityExportStatus::classify`] needs no second input.
 #[must_use]
 pub fn global_export_status() -> crate::types::ObservabilityExportStatus {
@@ -481,32 +500,44 @@ pub fn resolve_exporter(config: &ObservabilityConfig) -> ExporterKind {
 }
 
 /// Read `path` and return its trimmed contents as the ingest key. Every
-/// failure (missing file, unreadable, empty after trimming) is logged
-/// **by path only** — the key itself never reaches a log line — and yields
-/// `None`, which [`spawn_task`] treats as "not configured".
-fn read_ingest_key(path: &str) -> Option<String> {
+/// failure (missing file, unreadable, empty after trimming) is logged **by
+/// path only** — the key itself never reaches a log line — and yields `Err`
+/// with a detail string safe to surface on `loom-daemon status` (Issue
+/// #5337): the offending path and, for I/O failures, the [`std::io::Error`]'s
+/// `Display` (which includes the OS errno on platforms that report one, e.g.
+/// `No such file or directory (os error 2)`). [`spawn_task`] treats `Err` as
+/// "not configured" — it registers the detail as a
+/// [`crate::types::ObservabilityExportState::Misconfigured`] status rather
+/// than dropping it.
+fn read_ingest_key(path: &str) -> Result<String, String> {
     match std::fs::read_to_string(path) {
         Ok(contents) => {
             let key = contents.trim().to_string();
             if key.is_empty() {
-                log::warn!("observability: ingest key file {path} is empty — export disabled");
-                None
+                let detail = format!("ingest key file {path} is empty after trimming whitespace");
+                log::warn!("observability: {detail} — export disabled");
+                Err(detail)
             } else {
-                Some(key)
+                Ok(key)
             }
         }
         Err(error) => {
-            log::warn!(
-                "observability: could not read ingest key file {path}: {error} — export disabled"
-            );
-            None
+            let detail = format!("could not read ingest key file {path}: {error}");
+            log::warn!("observability: {detail} — export disabled");
+            Err(detail)
         }
     }
 }
 
 /// Spawn the observability subsystem's background tasks (the collector and
 /// the sender — see the module docs) on the shared daemon runtime, or return
-/// `None` without any side effect when disabled or under-configured.
+/// `None` when disabled or under-configured. `enabled: false` (or no block)
+/// has zero side effects, matching the deliberate-off steady state; each
+/// under-configured `enabled: true` path (Issue #5337) registers a
+/// [`crate::types::ObservabilityExportState::Misconfigured`] status via
+/// [`register_global_export_status`] before returning, so
+/// [`global_export_status`] can tell a bad `ingestKeyFile` path apart from
+/// telemetry being off by choice — see [`ExportStatus::misconfigured`].
 ///
 /// `daemon_started_at` feeds `host.health.uptime_sec`; passing
 /// `Instant::now()` at daemon startup (as [`crate::main`] does for the
@@ -534,20 +565,34 @@ pub fn spawn_task(
         return None;
     }
     let Some(endpoint) = resolve_endpoint(config) else {
-        log::warn!(
-            "observability: enabled but no endpoint configured \
-             (set observability.endpoint or $LOOM_OBSERVABILITY_ENDPOINT) — export off"
-        );
+        let detail = "observability.endpoint not configured \
+             (set observability.endpoint or $LOOM_OBSERVABILITY_ENDPOINT)"
+            .to_string();
+        log::warn!("observability: enabled but {detail} — export off");
+        register_global_export_status(Arc::new(ExportStatus::misconfigured(None, detail)));
         return None;
     };
     let Some(key_file) = resolve_ingest_key_file(config) else {
-        log::warn!(
-            "observability: enabled but no ingestKeyFile configured \
-             (set observability.ingestKeyFile or $LOOM_OBSERVABILITY_INGEST_KEY_FILE) — export off"
-        );
+        let detail = "observability.ingestKeyFile not configured \
+             (set observability.ingestKeyFile or $LOOM_OBSERVABILITY_INGEST_KEY_FILE)"
+            .to_string();
+        log::warn!("observability: enabled but {detail} — export off");
+        register_global_export_status(Arc::new(ExportStatus::misconfigured(
+            Some(endpoint),
+            detail,
+        )));
         return None;
     };
-    let ingest_key = read_ingest_key(&key_file)?;
+    let ingest_key = match read_ingest_key(&key_file) {
+        Ok(key) => key,
+        Err(detail) => {
+            register_global_export_status(Arc::new(ExportStatus::misconfigured(
+                Some(endpoint),
+                detail,
+            )));
+            return None;
+        }
+    };
     // Resolved ONCE and threaded into every consumer below (Issue #4830): the
     // collector stamps it on every envelope and the HTTPS exporter checks the
     // backend's echo against it. Two independent `host_identity()` calls could
@@ -862,8 +907,81 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // spawn_task degrade-to-disabled paths — every one must return `None`
-    // with zero side effects (no queue file created).
+    // read_ingest_key — Issue #5337: failures now carry a detail string
+    // (offending path + underlying error) instead of only a `log::warn!`,
+    // so `spawn_task` can thread it into a `Misconfigured` status.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn read_ingest_key_missing_file_names_path_and_error() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("does-not-exist.key");
+        let detail = read_ingest_key(&path.to_string_lossy()).unwrap_err();
+        assert!(
+            detail.contains(&path.to_string_lossy().to_string()),
+            "detail must name the path: {detail}"
+        );
+        // `std::io::Error`'s `Display` includes the OS errno on every
+        // platform that reports one (macOS/Linux: "(os error 2)").
+        assert!(
+            detail.to_ascii_lowercase().contains("no such file") || detail.contains("os error"),
+            "detail must carry the underlying error: {detail}"
+        );
+    }
+
+    #[test]
+    fn read_ingest_key_empty_file_names_path() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("empty.key");
+        std::fs::write(&path, "   \n").unwrap(); // whitespace-only ⇒ empty after trim
+        let detail = read_ingest_key(&path.to_string_lossy()).unwrap_err();
+        assert!(
+            detail.contains(&path.to_string_lossy().to_string()),
+            "detail must name the path: {detail}"
+        );
+    }
+
+    #[test]
+    fn read_ingest_key_trims_and_returns_the_key_on_success() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("ingest.key");
+        std::fs::write(&path, "  s3cr3t-key  \n").unwrap();
+        assert_eq!(read_ingest_key(&path.to_string_lossy()).unwrap(), "s3cr3t-key");
+    }
+
+    // ------------------------------------------------------------------
+    // ExportStatus::misconfigured — Issue #5337. Exercised directly against
+    // the wrapper type (not through the process-global `OnceLock`, which is
+    // write-once for the whole test binary and so cannot be asserted on
+    // deterministically from more than one test — see `spawn_task`'s
+    // under-configured tests below, which stick to the pre-existing
+    // `handles.is_none()` contract for that reason).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn export_status_misconfigured_reports_a_distinct_sticky_state() {
+        let status = ExportStatus::misconfigured(
+            Some("https://ingest.example.com/v1/telemetry".to_string()),
+            "could not read ingest key file /etc/loom/ingest.key: No such file or directory (os error 2)"
+                .to_string(),
+        );
+        let snapshot = status.snapshot();
+        assert_eq!(snapshot.state, crate::types::ObservabilityExportState::Misconfigured);
+        assert_eq!(snapshot.endpoint.as_deref(), Some("https://ingest.example.com/v1/telemetry"));
+        let detail = snapshot.last_failure_detail.as_deref().unwrap();
+        assert!(detail.contains("/etc/loom/ingest.key"));
+        assert!(detail.contains("os error 2"));
+        // Never `Disabled` — the whole point of this issue.
+        assert_ne!(snapshot.state, crate::types::ObservabilityExportState::Disabled);
+    }
+
+    // ------------------------------------------------------------------
+    // spawn_task degrade-to-disabled paths — the `enabled: false` path
+    // returns `None` with zero side effects; the three `enabled: true`
+    // under-configured paths below now register a `Misconfigured` status
+    // (Issue #5337) before returning `None` — see
+    // `export_status_misconfigured_reports_a_distinct_sticky_state` above
+    // for coverage of that status's shape.
     // ------------------------------------------------------------------
 
     #[tokio::test]
