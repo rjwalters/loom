@@ -451,6 +451,29 @@ impl WorkspacePool {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Return a clone of every currently-**provisioned** registry's `Arc`
+    /// (Issue #4955) — this host's full "what am I tracking right now"
+    /// view across every repo the daemon has touched via dispatch, the
+    /// work-finder, or an earlier `get_or_provision`/`seed` call.
+    ///
+    /// Deliberately side-effect-free, unlike [`Self::get_or_provision`]:
+    /// it never provisions a workspace (spawning a reaper/watchdog and
+    /// reading its on-disk checkpoint state) purely to answer this query.
+    /// The observability collector's periodic `host.health` sample uses
+    /// this to report this host's authoritative in-flight sweep-id set —
+    /// forcing every registered-but-never-dispatched-into workspace to
+    /// provision on a 5-minute timer purely for a health sample would be a
+    /// surprising amount of I/O for a read-only status field.
+    #[must_use]
+    pub fn provisioned_registries(&self) -> Vec<Arc<Mutex<SweepRegistry>>> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .map(|pooled| pooled.registry.clone())
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -551,6 +574,33 @@ mod tests {
         let pool = pool();
         assert!(pool.is_empty());
         assert_eq!(pool.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn provisioned_registries_returns_every_pooled_registry_without_provisioning_new_ones() {
+        let dir = tempdir().unwrap();
+        let a_root = dir.path().join("a");
+        let b_root = dir.path().join("b");
+        std::fs::create_dir_all(&a_root).unwrap();
+        std::fs::create_dir_all(&b_root).unwrap();
+        let pool = pool();
+
+        assert!(
+            pool.provisioned_registries().is_empty(),
+            "an empty pool has nothing provisioned yet"
+        );
+
+        let a = pool.get_or_provision(&a_root);
+        let b = pool.get_or_provision(&b_root);
+
+        let registries = pool.provisioned_registries();
+        assert_eq!(registries.len(), 2);
+        assert!(registries.iter().any(|r| Arc::ptr_eq(r, &a)));
+        assert!(registries.iter().any(|r| Arc::ptr_eq(r, &b)));
+
+        // Querying it again must not have provisioned a third registry as a
+        // side effect (the whole point of this accessor vs. get_or_provision).
+        assert_eq!(pool.len(), 2);
     }
 
     // ---- safehouse connection-state wiring (#4345) ----

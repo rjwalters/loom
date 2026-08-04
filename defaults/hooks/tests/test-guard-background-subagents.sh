@@ -35,6 +35,21 @@
 #     stop sequence over the same transcript.
 #   - guards.backgroundSubagents / LOOM_GUARD_BACKGROUND_SUBAGENTS toggle
 #     (env beats config; config beats default-on)
+#   - real "Agent" dispatch tool name detection (#5086): the harness names the
+#     async subagent-dispatch tool "Agent", not "Task" -- a dispatched Agent
+#     with only its immediate launch ack ("Async agent launched successfully
+#     ... agentId: <ID> ...") still blocks (the ack must NOT itself count as
+#     resolution, else the #4389 hazard recurs on this tool); a LATER, distinct
+#     tool_result on the same id, or a non-error TERMINAL TaskOutput poll of
+#     the recovered agentId, resolves it; a <status>running</status> poll does
+#     NOT; existing Task-named fixtures continue to pass unmodified
+#   - synchronous Agent/Task dispatch resolution (#5243): a
+#     `run_in_background: false` dispatch blocks the turn, so its first and only
+#     tool_result is the real final result -- any tool_result on the id resolves
+#     it, even when the text incidentally carries "Async agent launched
+#     successfully" boilerplate; an ASYNC dispatch with only its launch ack still
+#     blocks (the short-circuit must not leak to async ids); a mixed sync/async
+#     transcript with all dispatches completed allows the stop on the first try
 #   - jq absent -> allow (fail-open)
 #   - contract: block output is valid JSON with decision=="block" and a
 #     non-empty reason; exit code is always 0
@@ -82,6 +97,57 @@ TASK_USE_UNRESOLVED='{"type":"assistant","message":{"role":"assistant","content"
 TASK_USE_RESOLVED='{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_02","name":"Task","input":{}}]}}'
 TASK_RESULT_02='{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_02","content":"done"}]}}'
 NON_TASK_USE='{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_03","name":"Bash","input":{}}]}}'
+
+# Real async-subagent-dispatch tool name (issue #5086): the harness names this
+# tool "Agent", not "Task". Dispatching it returns an IMMEDIATE launch-ack
+# tool_result on the SAME tool_use id the real completion later arrives on —
+# that ack text must NEVER itself count as resolution (else the #4389
+# false-negative hazard recurs on this tool).
+AGENT5086_USE_UNRESOLVED='{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_agent01","name":"Agent","input":{"prompt":"implement issue #1"}}]}}'
+AGENT5086_ACK_UNRESOLVED='{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_agent01","content":"Async agent launched successfully. agentId: aagent01. Use SendMessage with to: aagent01 to communicate. You will be notified automatically when it completes."}]}}'
+
+# (b) a LATER, distinct tool_result on the SAME id (the real completion) —
+# the harness may emit a second tool_result block for the same tool_use id
+# once the dispatched agent actually finishes.
+AGENT5086_USE_COMPLETED='{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_agent02","name":"Agent","input":{"prompt":"implement issue #2"}}]}}'
+AGENT5086_ACK_COMPLETED='{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_agent02","content":"Async agent launched successfully. agentId: aagent02. Use SendMessage with to: aagent02 to communicate. You will be notified automatically when it completes."}]}}'
+AGENT5086_RESULT_COMPLETED='{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_agent02","content":"Work complete: opened PR #5555 for issue #2."}]}}'
+
+# (c) resolved ONLY via a blocking TaskOutput poll of the agentId recovered
+# from the launch ack — no second tool_result ever lands on the dispatch id
+# itself. A non-error, TERMINAL (<status>completed</status>) poll result
+# resolves it; a <status>running</status> poll result must NOT.
+AGENT5086_USE_POLLED='{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_agent03","name":"Agent","input":{"prompt":"implement issue #3"}}]}}'
+AGENT5086_ACK_POLLED='{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_agent03","content":"Async agent launched successfully. agentId: aagent03. Use SendMessage with to: aagent03 to communicate. You will be notified automatically when it completes."}]}}'
+AGENT5086_POLL_USE='{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_poll03","name":"TaskOutput","input":{"agentId":"aagent03","block":true,"timeout":600}}]}}'
+AGENT5086_POLL_RESULT_TERMINAL='{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_poll03","content":"<retrieval_status>success</retrieval_status>\n<status>completed</status>\nWork complete: opened PR #5556 for issue #3."}]}}'
+AGENT5086_POLL_RESULT_RUNNING='{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_poll03","content":"<retrieval_status>timeout</retrieval_status>\n<status>running</status>\nStill working..."}]}}'
+
+# --- synchronous Agent/Task dispatch fixtures (issue #5243) -------------------
+# A `run_in_background: false` dispatch is a STRUCTURAL guarantee: the harness
+# cannot advance the turn (or reach a Stop) past a blocking tool_use until its
+# result has landed, so the dispatch's first and only tool_result is always the
+# real, final result — never a launch ack. Any tool_result on the id resolves it.
+
+# (s5243) sync Agent whose only tool_result is the inline final result — no
+# separate launch ack — resolves.
+AGENT5243_SYNC_USE='{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_sync01","name":"Agent","input":{"prompt":"do the thing","run_in_background":false}}]}}'
+AGENT5243_SYNC_RESULT='{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_sync01","content":"Work complete: opened PR #6001 for issue #10."}]}}'
+
+# (s5243 edge) sync dispatch whose inline result text INCIDENTALLY contains the
+# "Async agent launched successfully" boilerplate (e.g. shared harness ack
+# wording) — must STILL resolve, because the launch-ack text exclusion is skipped
+# for sync ids. This is the exact false-positive #5243 was filed for.
+AGENT5243_SYNC_ACKTEXT_USE='{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_sync02","name":"Agent","input":{"prompt":"do the other thing","run_in_background":false}}]}}'
+AGENT5243_SYNC_ACKTEXT_RESULT='{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_sync02","content":"Async agent launched successfully. agentId: async99. Work complete: PR #6002 opened."}]}}'
+
+# (s5243 contrast) an ASYNC dispatch (run_in_background:true) with ONLY its launch
+# ack must STILL block — the sync short-circuit must NOT leak to async ids.
+AGENT5243_ASYNC_USE='{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_async01","name":"Agent","input":{"prompt":"async work","run_in_background":true}}]}}'
+AGENT5243_ASYNC_ACK='{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_async01","content":"Async agent launched successfully. agentId: async01. You will be notified automatically when it completes."}]}}'
+# Sync Task (back-compat tool name) with run_in_background:false and inline result.
+TASK5243_SYNC_USE='{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_sync03","name":"Task","input":{"subagent_type":"loom-builder","run_in_background":false}}]}}'
+TASK5243_SYNC_RESULT='{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_sync03","content":"Subagent completed: opened PR #6003."}]}}'
 
 # Background Bash (issue #4389 — the #4257 recurrence via run_in_background)
 # fixtures. A background dispatch gets an IMMEDIATE tool_result ack (NOT
@@ -165,6 +231,38 @@ BG_USE_STOPPED='{"type":"assistant","timestamp":"2026-07-30T12:00:00.000Z","mess
 BG_ACK_STOPPED='{"type":"user","timestamp":"2026-07-30T12:00:01.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_bg03","content":"Command running in background with ID: bgtest03. Output is being written to: /tmp/bgtest03.output. You will be notified when it completes."}]}}'
 BG_TASKSTOP_USE='{"type":"assistant","timestamp":"2026-07-30T12:01:00.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_stop03","name":"TaskStop","input":{"task_id":"bgtest03"}}]}}'
 BG_TASKSTOP_RESULT='{"type":"user","timestamp":"2026-07-30T12:01:01.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_stop03","content":"{\"message\":\"Successfully stopped task: bgtest03 (tail -f /tmp/x)\",\"task_id\":\"bgtest03\",\"task_type\":\"local_bash\",\"command\":\"tail -f /tmp/x\"}"}]}}'
+
+# --- issue #5013 fixtures: background Bash completions the pre-#5013 matcher
+# missed (the constant "1 outstanding" false positive) --------------------------
+#
+# (u1) A background Bash task whose completion `<task-notification>` carries ONLY
+# `<task-id>` (no `<tool-use-id>`) — the Monitor-shaped notification that
+# `<tool-use-id>`-only matching never observed. Uses a DISTINCT dispatch id.
+BG_USE_TASKID_ONLY='{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_bg10","name":"Bash","input":{"command":"sleep 1","run_in_background":true}}]}}'
+BG_ACK_TASKID_ONLY='{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_bg10","content":"Command running in background with ID: bgtest10. Output is being written to: /tmp/bgtest10.output. You will be notified when it completes."}]}}'
+BG_NOTIFICATION_TASKID_ONLY='{"type":"queue-operation","operation":"enqueue","content":"<task-notification>\n<task-id>bgtest10</task-id>\n<output-file>/tmp/bgtest10.output</output-file>\n<status>completed</status>\n<summary>Background command completed (exit code 0)</summary>\n</task-notification>"}'
+
+# (u2) A background Bash task awaited via a blocking BashOutput read (keyed on
+# bash_id) whose result is a non-error output — and NO task-notification at all.
+BG_USE_READ='{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_bg11","name":"Bash","input":{"command":"make build","run_in_background":true}}]}}'
+BG_ACK_READ='{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_bg11","content":"Command running in background with ID: bgtest11. Output is being written to: /tmp/bgtest11.output. You will be notified when it completes."}]}}'
+BG_READ_USE='{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_read11","name":"BashOutput","input":{"bash_id":"bgtest11"}}]}}'
+BG_READ_RESULT='{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_read11","content":"<status>completed</status>\nbuild finished successfully\n"}]}}'
+
+# (u3) Async agent (Task subagent) dispatched and awaited via a blocking
+# TaskOutput. The Task dispatch gets an immediate ack keyed to its own id (so
+# pattern 1 does not flag it), then a TaskOutput read of the same task id
+# returns the completion. This is the "M async agents awaited via TaskOutput"
+# arm of the acceptance-criteria regression scenario. It must NEVER be counted
+# as a background Bash task.
+AGENT_USE='{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_task20","name":"Task","input":{"subagent_type":"loom-builder","run_in_background":true}}]}}'
+AGENT_ACK='{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_task20","content":"Task started in background with ID: agent20. You will be notified when it completes."}]}}'
+AGENT_READ_USE='{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_read20","name":"TaskOutput","input":{"task_id":"agent20"}}]}}'
+AGENT_READ_RESULT='{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_read20","content":"Subagent completed: opened PR #1234."}]}}'
+
+# A foreground-only final turn (a plain Bash tool_use with no run_in_background).
+FG_FINAL_TURN='{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_fg30","name":"Bash","input":{"command":"gh issue create"}}]}}'
+FG_FINAL_RESULT='{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_fg30","content":"https://github.com/x/y/issues/1"}]}}'
 
 # Build stdin JSON. Args: <transcript_path> <stop_hook_active>
 make_input() {
@@ -250,6 +348,118 @@ if [[ "$code" == "0" && -z "$output" ]]; then
     pass "(g) empty transcript_path -> allow"
 else
     fail "(g) empty transcript_path -> allow (got exit=$code output=$output)"
+fi
+
+# --- real "Agent" dispatch tool name detection (issue #5086) ----------------
+# The harness names the async subagent-dispatch tool "Agent", not "Task" — the
+# original `.name=="Task"`-only match never fired for a real dispatch. An
+# `Agent` dispatch also gets an IMMEDIATE launch-ack tool_result on the SAME
+# tool_use id the real completion later arrives on, so the fix must not treat
+# that ack alone as resolution (the #4389 hazard recurring on this tool).
+
+# (a5086) dispatched Agent with ONLY the launch ack (no later distinct
+# completion, no TaskOutput poll) -> still block. This is the exact silent
+# no-op / then-false-negative hazard #5086 was filed for.
+T5086a="$TMPROOT/transcript-agent-ack-only.jsonl"
+write_transcript "$T5086a" "$AGENT5086_USE_UNRESOLVED" "$AGENT5086_ACK_UNRESOLVED"
+result=$(run_hook "$T5086a" false)
+assert_block "(a5086) dispatched Agent with only the launch ack -> block" "$result"
+
+# (b5086) dispatched Agent with a LATER, distinct completion tool_result on
+# the SAME id -> resolves.
+T5086b="$TMPROOT/transcript-agent-later-completion.jsonl"
+write_transcript "$T5086b" "$AGENT5086_USE_COMPLETED" "$AGENT5086_ACK_COMPLETED" "$AGENT5086_RESULT_COMPLETED"
+result=$(run_hook "$T5086b" false)
+assert_allow "(b5086) dispatched Agent + later distinct completion tool_result -> allow" "$result"
+
+# (c5086) dispatched Agent resolved ONLY via a blocking TaskOutput poll of the
+# agentId recovered from the launch ack (no second tool_result on the dispatch
+# id itself) -> resolves.
+T5086c="$TMPROOT/transcript-agent-taskoutput-poll.jsonl"
+write_transcript "$T5086c" "$AGENT5086_USE_POLLED" "$AGENT5086_ACK_POLLED" \
+    "$AGENT5086_POLL_USE" "$AGENT5086_POLL_RESULT_TERMINAL"
+result=$(run_hook "$T5086c" false)
+assert_allow "(c5086) dispatched Agent resolved only via blocking TaskOutput poll -> allow" "$result"
+
+# (c5086b) guard against overcorrecting: a TaskOutput poll that is still
+# <status>running</status> (not terminal) must NOT resolve the dispatch.
+T5086cb="$TMPROOT/transcript-agent-taskoutput-still-running.jsonl"
+write_transcript "$T5086cb" "$AGENT5086_USE_POLLED" "$AGENT5086_ACK_POLLED" \
+    "$AGENT5086_POLL_USE" "$AGENT5086_POLL_RESULT_RUNNING"
+result=$(run_hook "$T5086cb" false)
+assert_block "(c5086b) TaskOutput poll still <status>running</status> -> still block" "$result"
+
+# (d5086) existing Task-named fixtures continue to pass unmodified
+# (back-compat): the original unresolved/resolved Task cases from (a)/(b)
+# above are re-asserted here under the new dual-name (Task|Agent) matcher to
+# make the back-compat guarantee an explicit, standalone regression case.
+result=$(run_hook "$T1" false)
+assert_block "(d5086) back-compat: unresolved Task-named dispatch -> still block" "$result"
+result=$(run_hook "$T2" false)
+assert_allow "(d5086) back-compat: resolved Task-named dispatch -> still allow" "$result"
+
+# --- synchronous Agent/Task dispatch resolution (issue #5243) ----------------
+# A `run_in_background: false` dispatch blocks the turn, so its first and only
+# tool_result is the real final result — never a launch ack. Any tool_result on
+# the id resolves it, even when the text incidentally carries ack boilerplate.
+
+# (s5243a) sync Agent whose only tool_result is the inline final result -> allow.
+T5243a="$TMPROOT/transcript-agent-sync.jsonl"
+write_transcript "$T5243a" "$AGENT5243_SYNC_USE" "$AGENT5243_SYNC_RESULT"
+result=$(run_hook "$T5243a" false)
+assert_allow "(s5243a) sync Agent (run_in_background:false) + inline result -> allow" "$result"
+
+# (s5243b) sync Agent whose inline result text incidentally contains the
+# "Async agent launched successfully" boilerplate -> STILL allow (the exact
+# false positive #5243 was filed for; the launch-ack exclusion is skipped here).
+T5243b="$TMPROOT/transcript-agent-sync-acktext.jsonl"
+write_transcript "$T5243b" "$AGENT5243_SYNC_ACKTEXT_USE" "$AGENT5243_SYNC_ACKTEXT_RESULT"
+result=$(run_hook "$T5243b" false)
+assert_allow "(s5243b) sync Agent whose result text contains ack boilerplate -> allow" "$result"
+
+# (s5243c) sync Task (back-compat tool name) with run_in_background:false -> allow.
+T5243c="$TMPROOT/transcript-task-sync.jsonl"
+write_transcript "$T5243c" "$TASK5243_SYNC_USE" "$TASK5243_SYNC_RESULT"
+result=$(run_hook "$T5243c" false)
+assert_allow "(s5243c) sync Task (run_in_background:false) + inline result -> allow" "$result"
+
+# (s5243d) true-positive retained: an ASYNC dispatch (run_in_background:true) with
+# ONLY its launch ack must STILL block. The sync short-circuit must not leak to
+# async ids.
+T5243d="$TMPROOT/transcript-agent-async-ack-only.jsonl"
+write_transcript "$T5243d" "$AGENT5243_ASYNC_USE" "$AGENT5243_ASYNC_ACK"
+result=$(run_hook "$T5243d" false)
+assert_block "(s5243d) async Agent (run_in_background:true) with only launch ack -> block" "$result"
+
+# (s5243e) acceptance-criterion regression fixture: mixed sync + async dispatches,
+# ALL completed -> guard allows the stop on the first try. One sync Agent (inline
+# result), one sync Task (inline result), one async Agent resolved by a later
+# distinct completion tool_result, and one async Agent resolved via a blocking
+# TaskOutput poll.
+T5243e="$TMPROOT/transcript-mixed-sync-async-all-done.jsonl"
+write_transcript "$T5243e" \
+    "$AGENT5243_SYNC_USE" "$AGENT5243_SYNC_RESULT" \
+    "$TASK5243_SYNC_USE" "$TASK5243_SYNC_RESULT" \
+    "$AGENT5086_USE_COMPLETED" "$AGENT5086_ACK_COMPLETED" "$AGENT5086_RESULT_COMPLETED" \
+    "$AGENT5086_USE_POLLED" "$AGENT5086_ACK_POLLED" "$AGENT5086_POLL_USE" "$AGENT5086_POLL_RESULT_TERMINAL"
+result=$(run_hook "$T5243e" false)
+assert_allow "(s5243e) mixed sync/async dispatches all completed -> allow first try" "$result"
+
+# (s5243f) mixed transcript with one genuinely-orphaned async dispatch amid the
+# resolved sync/async work -> STILL block exactly ONE Task/Agent (no under-count
+# from the sync short-circuit, no over-count of the resolved ones).
+T5243f="$TMPROOT/transcript-mixed-one-orphan.jsonl"
+write_transcript "$T5243f" \
+    "$AGENT5243_SYNC_USE" "$AGENT5243_SYNC_RESULT" \
+    "$TASK5243_SYNC_USE" "$TASK5243_SYNC_RESULT" \
+    "$AGENT5243_ASYNC_USE" "$AGENT5243_ASYNC_ACK"
+raw_5243f=$(run_hook "$T5243f" false)
+assert_block "(s5243f) mixed sync-done + one orphaned async -> block" "$raw_5243f"
+reason_5243f=$(echo "${raw_5243f#*|}" | jq -r '.reason // empty' 2>/dev/null || true)
+if [[ "$reason_5243f" == *"1 dispatched Task/Agent"* ]]; then
+    pass "(s5243g) mixed transcript counts exactly 1 orphaned Task/Agent"
+else
+    fail "(s5243g) mixed transcript counts exactly 1 orphaned Task/Agent (got: $reason_5243f)"
 fi
 
 # --- background Bash (run_in_background) detection (issue #4389) -----------
@@ -476,6 +686,62 @@ T17="$TMPROOT/transcript-bg-taskstopped.jsonl"
 write_transcript "$T17" "$BG_USE_STOPPED" "$BG_ACK_STOPPED" "$BG_TASKSTOP_USE" "$BG_TASKSTOP_RESULT"
 result=$(run_hook "$T17" false)
 assert_allow "(t) TaskStop'd background Bash task -> allow" "$result"
+
+# --- background Bash completion shapes the pre-#5013 matcher missed ----------
+# The constant "1 outstanding" false positive: a background Bash task whose
+# completion never carried a `<tool-use-id>` echo re-blocked one stop per stop
+# sequence for the whole session, even on turns that dispatched no new work.
+
+# (u1) completion notification carries ONLY <task-id> (Monitor-shaped) -> allow.
+# Keyed on the TASK id recovered from the dispatch ack, not the tool-use id.
+T22="$TMPROOT/transcript-bg-taskid-only.jsonl"
+write_transcript "$T22" "$BG_USE_TASKID_ONLY" "$BG_ACK_TASKID_ONLY" "$BG_NOTIFICATION_TASKID_ONLY"
+result=$(run_hook "$T22" false)
+assert_allow "(u1) background Bash notified by <task-id> only -> allow" "$result"
+
+# (u2) awaited via a blocking BashOutput read (non-error result), NO
+# task-notification at all -> allow. A blocking read in headless mode returns
+# only after the task completed and can itself consume the notification.
+T23="$TMPROOT/transcript-bg-blocking-read.jsonl"
+write_transcript "$T23" "$BG_USE_READ" "$BG_ACK_READ" "$BG_READ_USE" "$BG_READ_RESULT"
+result=$(run_hook "$T23" false)
+assert_allow "(u2) background Bash awaited via blocking BashOutput -> allow" "$result"
+
+# (u3) full acceptance-criteria regression scenario: N=2 completed+notified
+# background Bash tasks + M=2 async agents (Task, ack-resolved, awaited via a
+# blocking TaskOutput) + a foreground-only final turn -> NOT blocked. Async
+# agents are never counted as background Bash tasks.
+T24="$TMPROOT/transcript-bg-mixed-clean.jsonl"
+write_transcript "$T24" \
+    "$BG_USE_RESOLVED" "$BG_ACK_RESOLVED" "$BG_NOTIFICATION_QUEUEOP" \
+    "$BG_USE_TASKID_ONLY" "$BG_ACK_TASKID_ONLY" "$BG_NOTIFICATION_TASKID_ONLY" \
+    "$AGENT_USE" "$AGENT_ACK" "$AGENT_READ_USE" "$AGENT_READ_RESULT" \
+    "$FG_FINAL_TURN" "$FG_FINAL_RESULT"
+result=$(run_hook "$T24" false)
+assert_allow "(u3) N completed bg tasks + M async agents (TaskOutput) + fg turn -> allow" "$result"
+
+# (u3b) same scenario re-scanned on a second stop sequence -> still allow. The
+# false positive in the field re-fired on EVERY stop, so resolution must be
+# derived from durable transcript facts, not one-shot state.
+result=$(run_hook "$T24" false)
+assert_allow "(u3b) mixed clean transcript -> allow again on second stop sequence" "$result"
+
+# (u4) true-positive retained: a genuinely running background Bash task (no
+# notification of any shape, no blocking read, no TaskStop) STILL blocks the
+# first stop, even amid the resolved tasks and async agents of (u3).
+T25="$TMPROOT/transcript-bg-genuine-running.jsonl"
+write_transcript "$T25" \
+    "$BG_USE_RESOLVED" "$BG_ACK_RESOLVED" "$BG_NOTIFICATION_QUEUEOP" \
+    "$AGENT_USE" "$AGENT_ACK" "$AGENT_READ_USE" "$AGENT_READ_RESULT" \
+    "$BG_USE_UNRESOLVED" "$BG_ACK_UNRESOLVED"
+result=$(run_hook "$T25" false)
+assert_block "(u4) genuinely running background Bash task amid resolved work -> block" "$result"
+reason_u4=$(echo "${result#*|}" | jq -r '.reason // empty' 2>/dev/null || true)
+if [[ "$reason_u4" == *"1 background Bash"* ]]; then
+    pass "(u4b) block counts exactly the 1 genuinely-running background Bash task"
+else
+    fail "(u4b) block counts exactly the 1 genuinely-running background Bash task (got: $reason_u4)"
+fi
 
 # --- block reason mentions the #3822/#4257 hazard ---------------------------
 raw=$(run_hook "$T1" false)

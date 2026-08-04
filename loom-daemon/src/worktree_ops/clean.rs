@@ -45,6 +45,61 @@ fn confirm(prompt: &str) -> bool {
     matches!(input.trim().to_lowercase().as_str(), "y" | "yes")
 }
 
+/// Compose one operator-actionable error diagnostic: *what* failed, *to what*,
+/// and *why* (#4877). A bare `Errors: N` tally is not actionable, so every
+/// recorded error carries these three parts.
+#[must_use]
+pub fn error_line(target: &str, operation: &str, cause: &str) -> String {
+    let cause = cause.trim();
+    if cause.is_empty() {
+        format!("{operation} failed for {target}")
+    } else {
+        format!("{operation} failed for {target}: {cause}")
+    }
+}
+
+/// Compose the closing line of a cleanup pass. A run that recorded errors must
+/// never read identically to a clean one (#4877), so the count is folded into
+/// the line itself rather than being buried in the summary block above it.
+#[must_use]
+pub fn completion_line(label: &str, dry_run: bool, errors: usize) -> String {
+    let plural = if errors == 1 { "" } else { "s" };
+    match (dry_run, errors) {
+        (true, 0) => "Dry run complete - no changes made".to_string(),
+        (true, n) => format!(
+            "Dry run complete - no changes made, but {n} error{plural} occurred (see diagnostics above)"
+        ),
+        (false, 0) => format!("{label} complete!"),
+        (false, n) => format!("{label} completed with {n} error{plural} (see diagnostics above)"),
+    }
+}
+
+/// Process exit code for a finished pass: non-zero exactly when at least one
+/// error was recorded, so a scripted caller can distinguish "completed with
+/// errors" from "completed cleanly".
+#[must_use]
+pub fn exit_code(errors: usize) -> i32 {
+    i32::from(errors > 0)
+}
+
+/// Run `cmd`, mapping failure to the underlying cause (git's stderr when it
+/// wrote one, otherwise the exit status or the spawn error) so callers can name
+/// it in their diagnostic instead of discarding it.
+pub(super) fn run_checked(mut cmd: Command) -> Result<(), String> {
+    match cmd.output() {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            Err(if stderr.is_empty() {
+                format!("exited with {}", o.status)
+            } else {
+                stderr
+            })
+        }
+        Err(e) => Err(format!("could not run command: {e}")),
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct CleanupStats {
     pub cleaned_worktrees: usize,
@@ -58,11 +113,30 @@ pub struct CleanupStats {
     pub kept_branches: usize,
     pub errored_branches: usize,
     pub killed_tmux: usize,
+    /// Tmux sessions preserved because they have an attached client (a live
+    /// operator terminal) or because `--safe` mode does not touch tmux at all
+    /// (issue #4890).
+    pub skipped_tmux: usize,
     pub cleaned_config_dirs: usize,
     pub cleaned_sweep_baselines: usize,
     pub cleaned_sweep_checkpoints: usize,
     pub kept_sweep_transients: usize,
     pub errors: usize,
+    /// One diagnostic per recorded error, in the order they occurred. Printed
+    /// inline as each error happens and re-listed under the summary tally.
+    pub error_details: Vec<String>,
+}
+
+impl CleanupStats {
+    /// Report a failure where it happens *and* tally it: prints an actionable
+    /// diagnostic naming the target, the operation, and the underlying cause,
+    /// then increments the error counter (#4877).
+    pub fn record_error(&mut self, target: &str, operation: &str, cause: &str) {
+        let line = error_line(target, operation, cause);
+        eprintln!("  ERROR: {line}");
+        self.errors += 1;
+        self.error_details.push(line);
+    }
 }
 
 /// Options mirroring `clean.py`'s argparse surface (minus subcommand-style
@@ -135,18 +209,14 @@ fn gh_pr_list(repo_root: &Path, args: &[&str]) -> Option<Vec<PrRow>> {
     serde_json::from_slice(&out.stdout).ok()
 }
 
-/// Check the PR status for `issue_num`'s branch. Thin `gh` wrapper mirroring
-/// `clean.py::check_pr_merged`.
-#[must_use]
-pub fn check_pr_merged(repo_root: &Path, issue_num: u32) -> PrStatus {
-    let branch = naming::branch_name(issue_num);
-    let rows = gh_pr_list(
+fn gh_pr_list_by_head(repo_root: &Path, branch: &str) -> Option<Vec<PrRow>> {
+    gh_pr_list(
         repo_root,
         &[
             "pr",
             "list",
             "--head",
-            &branch,
+            branch,
             "--state",
             "all",
             "--json",
@@ -155,23 +225,30 @@ pub fn check_pr_merged(repo_root: &Path, issue_num: u32) -> PrStatus {
             "1",
         ],
     )
-    .or_else(|| {
-        gh_pr_list(
-            repo_root,
-            &[
-                "pr",
-                "list",
-                "--search",
-                &format!("Closes #{issue_num}"),
-                "--state",
-                "all",
-                "--json",
-                "number,state,mergedAt",
-                "--limit",
-                "1",
-            ],
-        )
-    });
+}
+
+fn gh_pr_list_by_issue_search(repo_root: &Path, issue_num: u32) -> Option<Vec<PrRow>> {
+    gh_pr_list(
+        repo_root,
+        &[
+            "pr",
+            "list",
+            "--search",
+            &format!("Closes #{issue_num}"),
+            "--state",
+            "all",
+            "--json",
+            "number,state,mergedAt",
+            "--limit",
+            "1",
+        ],
+    )
+}
+
+/// Map an optional `gh pr list --json number,state,mergedAt` result onto a
+/// [`PrStatus`]: `None` (the `gh` call itself failed or returned unparseable
+/// JSON) is `Unknown`; an empty (but successful) result is `NoPr`.
+fn rows_to_status(rows: Option<Vec<PrRow>>) -> PrStatus {
     let Some(rows) = rows else {
         return PrStatus::Unknown;
     };
@@ -187,6 +264,26 @@ pub fn check_pr_merged(repo_root: &Path, issue_num: u32) -> PrStatus {
     } else {
         PrStatus::Unknown
     }
+}
+
+/// Check the PR status for `issue_num`'s branch. Thin `gh` wrapper mirroring
+/// `clean.py::check_pr_merged`.
+#[must_use]
+pub fn check_pr_merged(repo_root: &Path, issue_num: u32) -> PrStatus {
+    let branch = naming::branch_name(issue_num);
+    let rows = gh_pr_list_by_head(repo_root, &branch)
+        .or_else(|| gh_pr_list_by_issue_search(repo_root, issue_num));
+    rows_to_status(rows)
+}
+
+/// GraphQL-backed PR-status lookup for an arbitrary branch name — the same
+/// `--head` query [`check_pr_merged`] uses, minus the issue-number-keyed
+/// `"Closes #N"` search fallback (there is no issue number to search for when
+/// the branch does not follow the `feature/issue-<n>` convention — e.g. a
+/// primary checkout parked on a hand-created `pr-63` branch, see #5268).
+#[must_use]
+pub fn check_pr_status_for_branch(repo_root: &Path, branch: &str) -> PrStatus {
+    rows_to_status(gh_pr_list_by_head(repo_root, branch))
 }
 
 #[derive(serde::Deserialize)]
@@ -232,7 +329,17 @@ pub fn repo_owner_rest(repo_root: &Path) -> Option<String> {
 /// be retried through [`check_pr_merged`].
 #[must_use]
 pub fn check_pr_merged_rest(repo_root: &Path, owner: &str, issue_num: u32) -> PrStatus {
-    let branch = naming::branch_name(issue_num);
+    check_pr_status_for_branch_rest(repo_root, owner, &naming::branch_name(issue_num))
+}
+
+/// REST variant of [`check_pr_status_for_branch`] — an arbitrary-branch
+/// counterpart to [`check_pr_merged_rest`] for callers that do not have (or
+/// cannot assume) a `feature/issue-<n>` branch name, e.g. a primary checkout
+/// parked on a hand-created branch (#5268).
+///
+/// Queries `repos/{owner}/{repo}/pulls?state=all&head=<owner>:<branch>`.
+#[must_use]
+pub fn check_pr_status_for_branch_rest(repo_root: &Path, owner: &str, branch: &str) -> PrStatus {
     let path = format!("repos/{{owner}}/{{repo}}/pulls?state=all&head={owner}:{branch}&per_page=1");
     let Ok(out) = Command::new("gh")
         .args(["api", &path])
@@ -560,34 +667,100 @@ pub fn production_probes<'a>(
     }
 }
 
+/// Whether a `git worktree remove` failure means "this path is not a git
+/// worktree" — the signature (#5177) of an orphaned `.loom/worktrees/*`
+/// directory git no longer tracks (e.g. a `git worktree prune` ran while the
+/// directory was left on disk). Any *other* removal failure (a lock, a busy
+/// path, a permission error) is NOT this case and must not trigger the
+/// direct-removal fallback.
+#[must_use]
+pub fn is_untracked_worktree_error(cause: &str) -> bool {
+    cause.to_ascii_lowercase().contains("is not a working tree")
+}
+
+/// Whether `worktree_path` is safely inside `repo_root`'s managed worktree root
+/// ([`crate::worktree_root::worktree_root`]). A precondition for the
+/// direct-removal fallback (#5177): even after confirming the git error and the
+/// `.loom-managed` sentinel, never `remove_dir_all` a path outside the tree
+/// Loom provisions worktrees into.
+#[must_use]
+pub fn is_under_worktree_root(repo_root: &Path, worktree_path: &Path) -> bool {
+    let root = crate::worktree_root::worktree_root(repo_root);
+    let root = root.canonicalize().unwrap_or(root);
+    let wt = worktree_path
+        .canonicalize()
+        .unwrap_or_else(|_| worktree_path.to_path_buf());
+    wt != root && wt.starts_with(&root)
+}
+
+/// Decide whether a failed `git worktree remove` should fall back to a direct
+/// directory removal (#5177). Pure, so the untracked-orphan path is testable
+/// without a git repo. All three conditions must hold — the specific "not a
+/// working tree" git error, the `.loom-managed` sentinel, and containment under
+/// the managed worktree root — so this never degrades into a blanket `rm -rf`
+/// on any removal failure.
+#[must_use]
+pub fn should_force_remove_orphan_dir(cause: &str, is_managed: bool, under_root: bool) -> bool {
+    is_untracked_worktree_error(cause) && is_managed && under_root
+}
+
 /// Remove a worktree and delete its feature branch.
 ///
 /// Exposed (issue #4876) so the daemon-side reaper performs the *same*
 /// removal the CLI does, including the `git branch -d` → `-D` fallback.
+///
+/// `Err` carries the underlying cause (git's stderr) so the caller can name it
+/// in a diagnostic (issue #4877).
 pub fn cleanup_worktree(
     repo_root: &Path,
     worktree_path: &Path,
     issue_num: u32,
     dry_run: bool,
-) -> bool {
+) -> Result<(), String> {
     let branch_name = naming::branch_name(issue_num);
     if dry_run {
         println!("Would remove: {}", worktree_path.display());
         println!("Would delete branch: {branch_name}");
-        return true;
+        return Ok(());
     }
-    let removed = Command::new("git")
+    let mut remove = Command::new("git");
+    remove
         .args(["worktree", "remove"])
         .arg(worktree_path)
         .arg("--force")
-        .current_dir(repo_root)
-        .status()
-        .is_ok_and(|s| s.success());
-    if !removed {
-        eprintln!("  Failed to remove worktree: {}", worktree_path.display());
-        return false;
+        .current_dir(repo_root);
+    if let Err(cause) = run_checked(remove) {
+        // #5177: an orphaned `.loom/worktrees/*` directory git no longer tracks
+        // fails `git worktree remove` with "is not a working tree" and could
+        // never be cleaned by the normal path. Fall back to a direct removal —
+        // but ONLY when we can prove this is a Loom-managed worktree path (the
+        // specific git error + the `.loom-managed` sentinel + containment under
+        // the managed worktree root), never a blanket rm on any failure.
+        if should_force_remove_orphan_dir(
+            &cause,
+            is_loom_managed(worktree_path),
+            is_under_worktree_root(repo_root, worktree_path),
+        ) {
+            std::fs::remove_dir_all(worktree_path).map_err(|e| {
+                format!(
+                    "git worktree remove failed ({cause}); direct removal of the untracked \
+                     worktree directory also failed: {e}"
+                )
+            })?;
+            println!(
+                "  Removed untracked worktree directory (no git worktree entry): {}",
+                worktree_path.display()
+            );
+            let _ = Command::new("git")
+                .args(["worktree", "prune"])
+                .current_dir(repo_root)
+                .status();
+        } else {
+            return Err(cause);
+        }
+    } else {
+        println!("  Removed worktree: {}", worktree_path.display());
     }
-    println!("  Removed worktree: {}", worktree_path.display());
 
     let deleted = Command::new("git")
         .args(["branch", "-d", &branch_name])
@@ -600,7 +773,7 @@ pub fn cleanup_worktree(
             .current_dir(repo_root)
             .status();
     }
-    true
+    Ok(())
 }
 
 /// Standard + `--safe` worktree cleanup pass. Mirrors `clean.py::clean_worktrees`.
@@ -674,14 +847,21 @@ pub fn clean_worktrees(repo_root: &Path, stats: &mut CleanupStats, opts: &CleanO
                 stats.skipped_open += 1;
             }
             WorktreeDecision::SkipUnknownPrStatus => {
-                println!("  Unknown PR status - skipping");
-                stats.errors += 1;
+                stats.record_error(
+                    &format!("issue #{issue_num} ({})", worktree_path.display()),
+                    "PR status lookup (gh pr list)",
+                    "unknown PR state - worktree left in place, re-run once `gh` can reach \
+                     the forge",
+                );
             }
             WorktreeDecision::Remove => {
-                if cleanup_worktree(repo_root, &worktree_path, issue_num, opts.dry_run) {
-                    stats.cleaned_worktrees += 1;
-                } else {
-                    stats.errors += 1;
+                match cleanup_worktree(repo_root, &worktree_path, issue_num, opts.dry_run) {
+                    Ok(()) => stats.cleaned_worktrees += 1,
+                    Err(cause) => stats.record_error(
+                        &worktree_path.display().to_string(),
+                        "git worktree remove --force",
+                        &cause,
+                    ),
                 }
             }
             WorktreeDecision::ConfirmClosedIssue => {
@@ -691,16 +871,22 @@ pub fn clean_worktrees(repo_root: &Path, stats: &mut CleanupStats, opts: &CleanO
                     stats.cleaned_worktrees += 1;
                 } else if opts.force {
                     println!("  Auto-removing: {}", entry.path().display());
-                    if cleanup_worktree(repo_root, &worktree_path, issue_num, opts.dry_run) {
-                        stats.cleaned_worktrees += 1;
-                    } else {
-                        stats.errors += 1;
+                    match cleanup_worktree(repo_root, &worktree_path, issue_num, opts.dry_run) {
+                        Ok(()) => stats.cleaned_worktrees += 1,
+                        Err(cause) => stats.record_error(
+                            &worktree_path.display().to_string(),
+                            "git worktree remove --force",
+                            &cause,
+                        ),
                     }
                 } else if confirm("  Force remove this worktree? [y/N] ") {
-                    if cleanup_worktree(repo_root, &worktree_path, issue_num, opts.dry_run) {
-                        stats.cleaned_worktrees += 1;
-                    } else {
-                        stats.errors += 1;
+                    match cleanup_worktree(repo_root, &worktree_path, issue_num, opts.dry_run) {
+                        Ok(()) => stats.cleaned_worktrees += 1,
+                        Err(cause) => stats.record_error(
+                            &worktree_path.display().to_string(),
+                            "git worktree remove --force",
+                            &cause,
+                        ),
                     }
                 } else {
                     println!("  Skipping: {}", entry.path().display());
@@ -735,7 +921,11 @@ pub fn prune_orphaned_worktrees(repo_root: &Path, dry_run: bool) {
     }
 }
 
-fn current_branch(repo_root: &Path) -> Option<String> {
+/// The branch currently checked out at `repo_root`, or `None` for a detached
+/// HEAD or any `git` failure. Also used by [`crate::primary_checkout_reaper`]
+/// (#5268) to identify a primary checkout parked on a non-default branch.
+#[must_use]
+pub fn current_branch(repo_root: &Path) -> Option<String> {
     let out = Command::new("git")
         .args(["symbolic-ref", "--short", "HEAD"])
         .current_dir(repo_root)
@@ -773,7 +963,12 @@ fn checked_out_branches(repo_root: &Path) -> std::collections::HashSet<String> {
     out_set
 }
 
-fn default_branch(repo_root: &Path) -> Option<String> {
+/// The repo's default branch, resolved from `origin/HEAD` — `None` if that
+/// symbolic ref is unset (e.g. `git remote set-head origin` was never run) or
+/// any `git` failure. Also used by [`crate::primary_checkout_reaper`] (#5268)
+/// to know which branch a stale primary checkout should be returned to.
+#[must_use]
+pub fn default_branch(repo_root: &Path) -> Option<String> {
     let out = Command::new("git")
         .args(["symbolic-ref", "refs/remotes/origin/HEAD"])
         .current_dir(repo_root)
@@ -797,6 +992,15 @@ fn remote_branch_exists(repo_root: &Path, branch: &str) -> bool {
         // Fail closed: if we can't probe, claim the remote exists so we
         // don't delete a branch on a transient git error.
         .unwrap_or(true)
+}
+
+/// Force-delete one local branch. `Err` carries git's own message (e.g.
+/// `error: branch 'x' not found.`) so a failure can be reported against the
+/// branch that failed instead of vanishing into the error tally (#4877).
+fn force_delete_branch(repo_root: &Path, branch: &str) -> Result<(), String> {
+    let mut cmd = Command::new("git");
+    cmd.args(["branch", "-D", branch]).current_dir(repo_root);
+    run_checked(cmd)
 }
 
 /// Two-pass local-branch cleanup. Mirrors `clean.py::clean_branches`.
@@ -839,15 +1043,11 @@ pub fn clean_branches(repo_root: &Path, stats: &mut CleanupStats, dry_run: bool)
                 stats.cleaned_branches += 1;
                 continue;
             }
-            let ok = Command::new("git")
-                .args(["branch", "-D", branch])
-                .current_dir(repo_root)
-                .status()
-                .is_ok_and(|s| s.success());
-            if ok {
-                stats.cleaned_branches += 1;
-            } else {
-                stats.errors += 1;
+            match force_delete_branch(repo_root, branch) {
+                Ok(()) => stats.cleaned_branches += 1,
+                Err(cause) => {
+                    stats.record_error(&format!("branch {branch}"), "git branch -D", &cause);
+                }
             }
         } else {
             issue_pass_candidates.push(branch.clone());
@@ -867,15 +1067,13 @@ pub fn clean_branches(repo_root: &Path, stats: &mut CleanupStats, dry_run: bool)
             "CLOSED" => {
                 println!("  Issue #{issue_num} CLOSED - deleting {branch}");
                 if !dry_run {
-                    let ok = Command::new("git")
-                        .args(["branch", "-D", branch])
-                        .current_dir(repo_root)
-                        .status()
-                        .is_ok_and(|s| s.success());
-                    if ok {
-                        stats.cleaned_branches += 1;
-                    } else {
-                        stats.errors += 1;
+                    match force_delete_branch(repo_root, branch) {
+                        Ok(()) => stats.cleaned_branches += 1,
+                        Err(cause) => stats.record_error(
+                            &format!("branch {branch} (issue #{issue_num} CLOSED)"),
+                            "git branch -D",
+                            &cause,
+                        ),
                     }
                 } else {
                     stats.cleaned_branches += 1;
@@ -911,7 +1109,60 @@ fn list_loom_tmux_sessions() -> Vec<String> {
         .collect()
 }
 
-pub fn clean_tmux_sessions(stats: &mut CleanupStats, dry_run: bool) {
+/// Whether `session` (on Loom's isolated `-L loom` socket) has an attached
+/// client right now. A Manual-Orchestration-Mode terminal an operator is
+/// actively looking at is exactly this — `tmux list-clients` returns one line
+/// per attached client, and an empty (but successful) result means none.
+///
+/// Fails safe: any error running `tmux` (session gone, tmux missing, etc.)
+/// reads as "not attached" — the caller has already confirmed the session is
+/// live via `list-sessions`, so a probe failure here is not the thing that
+/// should block cleanup of an orphaned session.
+#[must_use]
+fn session_has_attached_client(session: &str) -> bool {
+    let Ok(out) = Command::new("tmux")
+        .args(["-L", "loom", "list-clients", "-t", session])
+        .output()
+    else {
+        return false;
+    };
+    out.status.success() && !String::from_utf8_lossy(&out.stdout).trim().is_empty()
+}
+
+/// The outcome of applying every tmux-session-removal safety gate to one
+/// session. Extracted so the decision is unit-testable without a real tmux
+/// server (issue #4890).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TmuxDecision {
+    /// No gate applies — kill the session.
+    Kill,
+    /// `--safe` mode does not touch tmux sessions at all: a tmux session is
+    /// not an artifact of a merged PR, so "merged-PR-only mode" has nothing
+    /// to say about it, and killing it anyway breaks `--safe`'s promise.
+    SkipSafeMode,
+    /// The session has an attached client (a live operator terminal) and no
+    /// explicit opt-in (`--force`) was given.
+    SkipAttached,
+}
+
+/// Apply the tmux-removal safety gates, in order. Pure decision logic —
+/// mirrors the shape of [`classify_worktree`].
+#[must_use]
+pub fn classify_tmux_session(safe: bool, attached: bool, force: bool) -> TmuxDecision {
+    if safe && !force {
+        return TmuxDecision::SkipSafeMode;
+    }
+    if attached && !force {
+        return TmuxDecision::SkipAttached;
+    }
+    TmuxDecision::Kill
+}
+
+/// Tmux session cleanup. `--safe` mode (unless paired with the explicit
+/// `--force` opt-in) skips tmux entirely — see [`TmuxDecision::SkipSafeMode`].
+/// Outside `--safe`, a session with an attached client is preserved unless
+/// `--force` is passed.
+pub fn clean_tmux_sessions(stats: &mut CleanupStats, opts: &CleanOptions) {
     let sessions = list_loom_tmux_sessions();
     if sessions.is_empty() {
         println!("No Loom tmux sessions found");
@@ -922,18 +1173,45 @@ pub fn clean_tmux_sessions(stats: &mut CleanupStats, dry_run: bool) {
         println!("  - {s}");
     }
     println!();
-    if dry_run {
-        println!("Would kill these sessions");
-        stats.killed_tmux = sessions.len();
-    } else {
-        for s in &sessions {
-            let ok = Command::new("tmux")
-                .args(["-L", "loom", "kill-session", "-t", s])
-                .status()
-                .is_ok_and(|st| st.success());
-            if ok {
-                println!("Killed: {s}");
-                stats.killed_tmux += 1;
+
+    if opts.safe && !opts.force {
+        println!(
+            "--safe mode: tmux sessions are not tied to a merged PR, so `--safe` does not \
+             touch them (a live Manual-Orchestration-Mode terminal has no PR association at \
+             all) - preserving all {} session(s). Use plain `clean --tmux-only` (optionally \
+             with `--force`) to clean tmux sessions.",
+            sessions.len()
+        );
+        stats.skipped_tmux += sessions.len();
+        return;
+    }
+
+    for s in &sessions {
+        let attached = session_has_attached_client(s);
+        match classify_tmux_session(opts.safe, attached, opts.force) {
+            TmuxDecision::SkipSafeMode => {
+                // Unreachable here (handled by the early return above), kept
+                // so the match stays exhaustive if that guard ever moves.
+                stats.skipped_tmux += 1;
+            }
+            TmuxDecision::SkipAttached => {
+                println!("  {s}: has an attached client - preserving (use --force to override)");
+                stats.skipped_tmux += 1;
+            }
+            TmuxDecision::Kill => {
+                if opts.dry_run {
+                    println!("Would kill: {s}");
+                    stats.killed_tmux += 1;
+                    continue;
+                }
+                let ok = Command::new("tmux")
+                    .args(["-L", "loom", "kill-session", "-t", s])
+                    .status()
+                    .is_ok_and(|st| st.success());
+                if ok {
+                    println!("Killed: {s}");
+                    stats.killed_tmux += 1;
+                }
             }
         }
     }
@@ -1029,23 +1307,20 @@ fn file_age(path: &Path, now: SystemTime) -> Option<Duration> {
     Some(now.duration_since(modified).unwrap_or_default())
 }
 
-/// Remove one transient file (or report it under `--dry-run`). Returns whether
-/// the removal succeeded / would have happened.
-fn remove_transient(path: &Path, label: &str, dry_run: bool) -> bool {
+/// Remove one transient file (or report it under `--dry-run`). `Err` carries
+/// the underlying `io::Error` so the caller can name it alongside the path.
+fn remove_transient(path: &Path, label: &str, dry_run: bool) -> Result<(), String> {
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     if dry_run {
         println!("  Would remove {label}: {name}");
-        return true;
+        return Ok(());
     }
     match std::fs::remove_file(path) {
         Ok(()) => {
             println!("  Removed {label}: {name}");
-            true
+            Ok(())
         }
-        Err(e) => {
-            eprintln!("  Failed to remove {name}: {e}");
-            false
-        }
+        Err(e) => Err(e.to_string()),
     }
 }
 
@@ -1080,10 +1355,13 @@ fn clean_sweep_transients_with(
         repo_root.join(".loom").join("main-clean-baseline.txt"),
     ] {
         if legacy.is_file() {
-            if remove_transient(&legacy, "legacy un-keyed baseline", dry_run) {
-                stats.cleaned_sweep_baselines += 1;
-            } else {
-                stats.errors += 1;
+            match remove_transient(&legacy, "legacy un-keyed baseline", dry_run) {
+                Ok(()) => stats.cleaned_sweep_baselines += 1,
+                Err(cause) => stats.record_error(
+                    &legacy.display().to_string(),
+                    "remove legacy un-keyed baseline",
+                    &cause,
+                ),
             }
         }
     }
@@ -1128,10 +1406,13 @@ fn clean_sweep_transients_with(
             }
             match file_age(&path, env.now) {
                 Some(age) if age >= env.min_age => {
-                    if remove_transient(&path, "stale sweep baseline", dry_run) {
-                        stats.cleaned_sweep_baselines += 1;
-                    } else {
-                        stats.errors += 1;
+                    match remove_transient(&path, "stale sweep baseline", dry_run) {
+                        Ok(()) => stats.cleaned_sweep_baselines += 1,
+                        Err(cause) => stats.record_error(
+                            &path.display().to_string(),
+                            "remove stale sweep baseline",
+                            &cause,
+                        ),
                     }
                 }
                 _ => stats.kept_sweep_transients += 1,
@@ -1159,10 +1440,13 @@ fn clean_sweep_transients_with(
             }
             let state = (env.issue_state)(issue);
             if state == "CLOSED" {
-                if remove_transient(&path, "closed-issue checkpoint", dry_run) {
-                    stats.cleaned_sweep_checkpoints += 1;
-                } else {
-                    stats.errors += 1;
+                match remove_transient(&path, "closed-issue checkpoint", dry_run) {
+                    Ok(()) => stats.cleaned_sweep_checkpoints += 1,
+                    Err(cause) => stats.record_error(
+                        &path.display().to_string(),
+                        "remove closed-issue checkpoint",
+                        &cause,
+                    ),
                 }
             } else {
                 println!("  Issue #{issue} is {state} - keeping {name}");
@@ -1233,6 +1517,59 @@ pub fn clean_build_artifacts(repo_root: &Path, dry_run: bool) {
         }
         println!();
     }
+}
+
+/// One build-artifact directory [`reclaim_worktree_artifacts`] removed (or
+/// would remove, under `dry_run`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReclaimedArtifact {
+    /// Top-level directory name relative to the worktree root, e.g. `"target"`.
+    pub name: String,
+    /// Human-readable size, matching [`clean_build_artifacts`]'s report format.
+    pub size_human: String,
+}
+
+/// Reclaim regenerable build-artifact directories (`target/`, `node_modules`,
+/// `.venv`, `coverage/`, ...) from **inside one worktree** without removing
+/// the worktree itself — the AC3 follow-up carved out of #5177 into #5187.
+///
+/// Unlike [`clean_build_artifacts`] (which only ever reclaims from
+/// `repo_root` itself, wired to `--deep`), this walks
+/// [`super::orphan_recovery::BUILD_ARTIFACT_PATTERNS`] against
+/// `worktree_path`'s **top-level** entries, trims a trailing `/`, and removes
+/// only entries that are directories — a same-named file (`Cargo.lock`,
+/// `pnpm-lock.yaml`, `.loom-checkpoint`, `.loom-in-use`) is never touched, so
+/// reusing the dirty-detection pattern list here is safe even though most of
+/// its entries are files rather than reclaimable directories.
+///
+/// Pure I/O, no eligibility gate of its own — callers (the worktree reaper's
+/// artifact-reclaim pass) decide *whether* a worktree is eligible via
+/// [`classify_worktree`] / [`WorktreeDecision`] before calling this.
+#[must_use]
+pub fn reclaim_worktree_artifacts(worktree_path: &Path, dry_run: bool) -> Vec<ReclaimedArtifact> {
+    let mut reclaimed = Vec::new();
+    for pattern in super::orphan_recovery::BUILD_ARTIFACT_PATTERNS {
+        let name = pattern.trim_end_matches('/');
+        let dir = worktree_path.join(name);
+        if !dir.is_dir() {
+            continue;
+        }
+        let size_human = dir_size_human(&dir);
+        if dry_run {
+            reclaimed.push(ReclaimedArtifact {
+                name: name.to_string(),
+                size_human,
+            });
+            continue;
+        }
+        if std::fs::remove_dir_all(&dir).is_ok() {
+            reclaimed.push(ReclaimedArtifact {
+                name: name.to_string(),
+                size_human,
+            });
+        }
+    }
+    reclaimed
 }
 
 fn spawn_loop_locks_dir(repo_root: &Path) -> std::path::PathBuf {
@@ -1348,7 +1685,14 @@ fn revert_stale_building_labels_spawn_loop(repo_root: &Path, dry_run: bool) -> u
 pub fn clean_daemon_crash_state(repo_root: &Path, dry_run: bool) {
     println!("Step 1: Kill orphaned tmux sessions");
     let mut stats = CleanupStats::default();
-    clean_tmux_sessions(&mut stats, dry_run);
+    // Neither `--safe` nor `--force`: crash recovery is unattended, so a
+    // session with an attached client (not actually orphaned — someone is
+    // looking at it) is still preserved (issue #4890).
+    let tmux_opts = CleanOptions {
+        dry_run,
+        ..CleanOptions::default()
+    };
+    clean_tmux_sessions(&mut stats, &tmux_opts);
     println!();
 
     println!("Step 2: Revert stale `loom:building` labels");
@@ -1414,6 +1758,12 @@ pub fn print_summary(stats: &CleanupStats, dry_run: bool, safe_mode: bool) {
             println!("  Killed: {} tmux session(s)", stats.killed_tmux);
         }
     }
+    if stats.skipped_tmux > 0 {
+        println!(
+            "  Skipped (attached client or --safe mode): {} tmux session(s)",
+            stats.skipped_tmux
+        );
+    }
     if stats.cleaned_config_dirs > 0 {
         if dry_run {
             println!("  Would remove: {} agent config dir(s)", stats.cleaned_config_dirs);
@@ -1439,6 +1789,9 @@ pub fn print_summary(stats: &CleanupStats, dry_run: bool, safe_mode: bool) {
     }
     if stats.errors > 0 {
         println!("  Errors: {}", stats.errors);
+        for detail in &stats.error_details {
+            println!("    - {detail}");
+        }
     }
     println!();
 }
@@ -1501,7 +1854,7 @@ pub fn run_clean(repo_root: &Path, opts: &CleanOptions) -> i32 {
 
     if !opts.worktrees_only && !opts.branches_only {
         println!("Cleaning Loom Tmux Sessions\n");
-        clean_tmux_sessions(&mut stats, opts.dry_run);
+        clean_tmux_sessions(&mut stats, opts);
         println!();
     }
 
@@ -1523,13 +1876,9 @@ pub fn run_clean(repo_root: &Path, opts: &CleanOptions) -> i32 {
 
     print_summary(&stats, opts.dry_run, opts.safe);
 
-    if opts.dry_run {
-        println!("Dry run complete - no changes made");
-    } else {
-        println!("Cleanup complete!");
-    }
+    println!("{}", completion_line("Cleanup", opts.dry_run, stats.errors));
 
-    i32::from(stats.errors > 0)
+    exit_code(stats.errors)
 }
 
 #[cfg(test)]
@@ -1559,6 +1908,188 @@ mod tests {
     fn dir_size_human_handles_missing_dir() {
         // A missing directory contributes 0 bytes, not an error.
         assert_eq!(dir_size_human(Path::new("/does/not/exist/at/all")), "0B");
+    }
+
+    // --- reclaim_worktree_artifacts (#5187) ------------------------------
+
+    #[test]
+    fn reclaim_removes_target_and_node_modules_but_nothing_else() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("target/debug")).unwrap();
+        std::fs::write(tmp.path().join("target/debug/binary"), b"x").unwrap();
+        std::fs::create_dir_all(tmp.path().join("node_modules/.bin")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/main.rs"), b"fn main() {}").unwrap();
+        std::fs::write(tmp.path().join("Cargo.lock"), b"lockfile").unwrap();
+
+        let reclaimed = reclaim_worktree_artifacts(tmp.path(), false);
+        let names: Vec<_> = reclaimed.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(
+            names.into_iter().collect::<std::collections::HashSet<_>>(),
+            std::collections::HashSet::from(["target", "node_modules"])
+        );
+        assert!(!tmp.path().join("target").exists());
+        assert!(!tmp.path().join("node_modules").exists());
+        // Everything else — git history stand-ins, source, lockfiles — is untouched.
+        assert!(tmp.path().join("src/main.rs").is_file());
+        assert!(tmp.path().join("Cargo.lock").is_file());
+    }
+
+    #[test]
+    fn reclaim_never_removes_a_same_named_file() {
+        // `Cargo.lock` and `pnpm-lock.yaml` are both entries in
+        // BUILD_ARTIFACT_PATTERNS, but they are files, not directories — the
+        // reclaim pass must never `remove_dir_all` a file.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("Cargo.lock"), b"lockfile").unwrap();
+        std::fs::write(tmp.path().join("pnpm-lock.yaml"), b"lockfile").unwrap();
+        std::fs::write(tmp.path().join(".loom-in-use"), b"{}").unwrap();
+
+        let reclaimed = reclaim_worktree_artifacts(tmp.path(), false);
+        assert!(reclaimed.is_empty(), "{reclaimed:?}");
+        assert!(tmp.path().join("Cargo.lock").is_file());
+        assert!(tmp.path().join("pnpm-lock.yaml").is_file());
+        assert!(tmp.path().join(".loom-in-use").is_file());
+    }
+
+    #[test]
+    fn reclaim_dry_run_reports_without_removing() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("target")).unwrap();
+
+        let reclaimed = reclaim_worktree_artifacts(tmp.path(), true);
+        assert_eq!(reclaimed.len(), 1);
+        assert_eq!(reclaimed[0].name, "target");
+        assert!(tmp.path().join("target").is_dir(), "dry-run must not remove");
+    }
+
+    #[test]
+    fn reclaim_with_no_artifact_dirs_is_a_clean_no_op() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("README.md"), b"hi").unwrap();
+        let reclaimed = reclaim_worktree_artifacts(tmp.path(), false);
+        assert!(reclaimed.is_empty());
+    }
+
+    // --- untracked-orphan worktree removal (#5177 AC5) -------------------
+
+    #[test]
+    fn untracked_worktree_error_recognizes_gits_message() {
+        // git's actual message for a path that exists but is not a worktree.
+        assert!(is_untracked_worktree_error(
+            "fatal: '/repo/.loom/worktrees/issue-42' is not a working tree"
+        ));
+        assert!(is_untracked_worktree_error("IS NOT A WORKING TREE")); // case-insensitive
+                                                                       // Any other failure must NOT be treated as an orphan directory.
+        assert!(!is_untracked_worktree_error(
+            "fatal: validation failed, cannot remove working tree"
+        ));
+        assert!(!is_untracked_worktree_error("Permission denied (os error 13)"));
+        assert!(!is_untracked_worktree_error(""));
+    }
+
+    #[test]
+    fn force_remove_orphan_requires_all_three_conditions() {
+        let ok = "fatal: 'x' is not a working tree";
+        let other = "some other failure";
+        // All three present → fall back to direct removal.
+        assert!(should_force_remove_orphan_dir(ok, true, true));
+        // Missing any single guard → refuse (never a blanket rm -rf).
+        assert!(!should_force_remove_orphan_dir(ok, false, true)); // no sentinel
+        assert!(!should_force_remove_orphan_dir(ok, true, false)); // outside root
+        assert!(!should_force_remove_orphan_dir(other, true, true)); // different error
+    }
+
+    /// End-to-end: a directory under the managed worktree root that git no
+    /// longer tracks as a worktree (the #5177 "is not a working tree" orphan) is
+    /// removed by `cleanup_worktree` instead of erroring out.
+    #[test]
+    #[serial_test::serial]
+    fn cleanup_worktree_removes_untracked_orphan_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path().canonicalize().unwrap();
+
+        // A real git repo so `git worktree remove` produces the genuine
+        // "is not a working tree" error rather than "not a git repository".
+        assert!(Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repo_root)
+            .status()
+            .unwrap()
+            .success());
+
+        // An orphan worktree directory under the resolved (override-aware)
+        // managed root, carrying the `.loom-managed` sentinel — but with no
+        // corresponding `git worktree list` entry.
+        let orphan = crate::worktree_root::worktree_root(&repo_root).join("issue-999");
+        std::fs::create_dir_all(&orphan).unwrap();
+        std::fs::write(orphan.join(".loom-managed"), "test").unwrap();
+        std::fs::write(orphan.join("some-build-artifact"), "junk").unwrap();
+        assert!(orphan.is_dir());
+
+        let result = cleanup_worktree(&repo_root, &orphan, 999, false);
+        assert!(result.is_ok(), "orphan removal should succeed: {result:?}");
+        assert!(!orphan.exists(), "orphan directory should be gone");
+    }
+
+    /// A removal failure that is NOT the untracked-orphan signature must still
+    /// error (and must never trigger the direct-removal fallback), even for a
+    /// managed path under the root.
+    #[test]
+    #[serial_test::serial]
+    fn cleanup_worktree_does_not_force_remove_on_other_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path().canonicalize().unwrap();
+        // Not a git repository at all → `git worktree remove` fails with a
+        // "not a git repository" error, which is NOT the orphan signature.
+        let managed = crate::worktree_root::worktree_root(&repo_root).join("issue-1000");
+        std::fs::create_dir_all(&managed).unwrap();
+        std::fs::write(managed.join(".loom-managed"), "test").unwrap();
+
+        let result = cleanup_worktree(&repo_root, &managed, 1000, false);
+        assert!(result.is_err(), "non-orphan failure must propagate");
+        assert!(managed.exists(), "directory must be left in place on a non-orphan failure");
+    }
+
+    // --- tmux cleanup safety gates (#4890) -------------------------------
+
+    #[test]
+    fn tmux_safe_mode_skips_even_an_unattached_session() {
+        // `--safe` is documented as "merged-PR-only mode", but a tmux session
+        // has no PR association at all — the core of #4890 is that `--safe`
+        // must not silently kill tmux sessions just because they are not
+        // attached right now.
+        assert_eq!(classify_tmux_session(true, false, false), TmuxDecision::SkipSafeMode);
+    }
+
+    #[test]
+    fn tmux_safe_mode_skips_an_attached_session_too() {
+        assert_eq!(classify_tmux_session(true, true, false), TmuxDecision::SkipSafeMode);
+    }
+
+    #[test]
+    fn tmux_force_overrides_safe_mode() {
+        // `--safe --force` together is the existing "trust me" combination
+        // used elsewhere in this module (e.g. the grace-period/uncommitted
+        // gates in `classify_worktree`).
+        assert_eq!(classify_tmux_session(true, false, true), TmuxDecision::Kill);
+    }
+
+    #[test]
+    fn tmux_attached_session_skipped_outside_safe_mode() {
+        // A live operator terminal (attached client) must never be killed
+        // without an explicit opt-in, even in plain (non-`--safe`) mode.
+        assert_eq!(classify_tmux_session(false, true, false), TmuxDecision::SkipAttached);
+    }
+
+    #[test]
+    fn tmux_force_overrides_attached_gate() {
+        assert_eq!(classify_tmux_session(false, true, true), TmuxDecision::Kill);
+    }
+
+    #[test]
+    fn tmux_unattached_session_killed_by_default() {
+        assert_eq!(classify_tmux_session(false, false, false), TmuxDecision::Kill);
     }
 
     #[test]
@@ -1842,6 +2373,134 @@ mod tests {
         );
         assert_eq!(stats.cleaned_sweep_checkpoints, 0);
         assert_eq!(stats.kept_sweep_transients, 1);
+    }
+
+    // --- actionable error reporting (#4877) ------------------------------
+
+    fn git(dir: &Path, args: &[&str]) {
+        let ok = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(ok, "git {args:?} failed in {}", dir.display());
+    }
+
+    /// A recorded error must name the target, the operation, and the cause —
+    /// the three things `Errors: 1` on its own withholds.
+    #[test]
+    fn record_error_names_target_operation_and_cause() {
+        let mut stats = CleanupStats::default();
+        stats.record_error("branch feature/issue-42", "git branch -D", "error: branch not found");
+        assert_eq!(stats.errors, 1);
+        assert_eq!(
+            stats.error_details,
+            vec![
+                "git branch -D failed for branch feature/issue-42: error: branch not found"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn error_line_without_a_cause_still_names_target_and_operation() {
+        assert_eq!(
+            error_line("/tmp/wt", "git worktree remove --force", "  "),
+            "git worktree remove --force failed for /tmp/wt"
+        );
+    }
+
+    /// The reported original symptom: a failed `git branch -D` bumped the
+    /// counter and printed nothing. The failure must now surface a diagnostic
+    /// naming the branch *and* git's own message.
+    #[test]
+    fn failed_branch_delete_reports_branch_and_git_error() {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "-q"]);
+
+        let branch = "feature/issue-4877";
+        let cause = force_delete_branch(dir.path(), branch)
+            .expect_err("deleting a nonexistent branch must fail");
+
+        let mut stats = CleanupStats::default();
+        stats.record_error(&format!("branch {branch}"), "git branch -D", &cause);
+
+        assert_eq!(stats.errors, 1);
+        let detail = &stats.error_details[0];
+        assert!(detail.contains(branch), "diagnostic must name the branch: {detail}");
+        assert!(detail.contains("git branch -D"), "diagnostic must name the operation: {detail}");
+        assert!(
+            detail.to_lowercase().contains("not found"),
+            "diagnostic must carry git's underlying error: {detail}"
+        );
+    }
+
+    /// A successful `git branch -D` must stay silent (no error inflation).
+    #[test]
+    fn successful_branch_delete_records_no_error() {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "-q", "--initial-branch=main"]);
+        git(dir.path(), &["config", "user.email", "loom@example.com"]);
+        git(dir.path(), &["config", "user.name", "Loom Test"]);
+        git(dir.path(), &["commit", "-q", "--allow-empty", "-m", "seed"]);
+        git(dir.path(), &["branch", "feature/issue-4877"]);
+
+        assert!(force_delete_branch(dir.path(), "feature/issue-4877").is_ok());
+    }
+
+    /// AC #3: a run that recorded errors must not read like a clean one.
+    #[test]
+    fn completion_line_differs_when_errors_occurred() {
+        let clean_run = completion_line("Cleanup", false, 0);
+        let errored_run = completion_line("Cleanup", false, 1);
+        assert_eq!(clean_run, "Cleanup complete!");
+        assert_ne!(clean_run, errored_run);
+        assert!(errored_run.contains('1'), "closing line must carry the count: {errored_run}");
+        assert!(errored_run.contains("error"), "closing line must say error: {errored_run}");
+        // Plural agreement, and the same rule for aggressive mode.
+        assert!(completion_line("Cleanup", false, 2).contains("2 errors"));
+        assert!(completion_line("Aggressive cleanup", false, 0).starts_with("Aggressive cleanup"));
+        assert_ne!(
+            completion_line("Aggressive cleanup", false, 0),
+            completion_line("Aggressive cleanup", false, 3)
+        );
+    }
+
+    /// A dry run that hit errors (e.g. an unresolvable PR status) must also
+    /// read differently from a clean dry run.
+    #[test]
+    fn completion_line_dry_run_reflects_errors() {
+        let clean_run = completion_line("Cleanup", true, 0);
+        let errored_run = completion_line("Cleanup", true, 1);
+        assert_eq!(clean_run, "Dry run complete - no changes made");
+        assert_ne!(clean_run, errored_run);
+        assert!(errored_run.contains("1 error"), "{errored_run}");
+    }
+
+    /// AC #4 regression lock: the exit status distinguishes "completed with
+    /// errors" from "completed cleanly".
+    #[test]
+    fn exit_code_is_nonzero_exactly_when_errors_occurred() {
+        assert_eq!(exit_code(0), 0);
+        assert_eq!(exit_code(1), 1);
+        assert_eq!(exit_code(7), 1);
+    }
+
+    /// End-to-end lock on the clean-run contract: a pass with nothing to do
+    /// returns 0. Scoped to `worktrees_only` so the pass touches nothing
+    /// outside the temp repo (no tmux sockets, no branches).
+    #[test]
+    fn run_clean_returns_zero_when_no_errors_occurred() {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "-q"]);
+        let opts = CleanOptions {
+            force: true,
+            worktrees_only: true,
+            ..CleanOptions::default()
+        };
+        assert_eq!(run_clean(dir.path(), &opts), 0);
     }
 
     #[test]

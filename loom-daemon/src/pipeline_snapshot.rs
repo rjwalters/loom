@@ -58,6 +58,17 @@ pub struct RepoPipelineSnapshot {
     pub review_requested: Option<usize>,
     /// Open PRs labeled `loom:changes-requested` — Doctor's queue.
     pub changes_requested: Option<usize>,
+    /// The strict subset of [`Self::changes_requested`] that has **no
+    /// owner** (Issue #5272): no active Doctor claim (`loom:treating`) and no
+    /// park/hold label (`crate::work_finder::PARK_LABELS` — `loom:blocked` /
+    /// `loom:operator-only`). Before #5272's standalone Doctor dispatch, every
+    /// row here was a PR permanently parked once its sweep ended — nothing in
+    /// the fleet would ever pick it up again. A regression here (this count
+    /// climbing and staying nonzero) is exactly the failure mode #5272 fixes,
+    /// so it is tracked as its own field rather than folded into
+    /// [`Self::changes_requested`], which conflates "Doctor's queue depth"
+    /// with "PRs Doctor has actually forgotten about".
+    pub changes_requested_unclaimed: Option<usize>,
     /// Open PRs labeled `loom:pr` — Judge-approved, awaiting Champion merge.
     pub approved: Option<usize>,
     /// PRs merged in the last 24h (a throughput signal, not a queue depth).
@@ -97,13 +108,13 @@ struct NumberRow {
     number: u64,
 }
 
-/// Which of the six counted metrics a [`GhPipelineSource`] fetches (Issue
-/// #4761).
+/// Which of the seven counted metrics a [`GhPipelineSource`] fetches (Issue
+/// #4761; widened to seven by Issue #5272).
 ///
 /// Each metric costs one `gh` invocation, and they run *sequentially* within a
 /// repo, so the mask is what keeps a consumer that needs two of them from
-/// paying for six. A metric that is masked off is left `None` — a caller that
-/// masks a metric off must simply not read it (every existing caller uses
+/// paying for all seven. A metric that is masked off is left `None` — a caller
+/// that masks a metric off must simply not read it (every existing caller uses
 /// [`Self::ALL`], for which `None` keeps its original "this query failed"
 /// meaning).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,6 +128,9 @@ pub struct PipelineMetrics {
     pub review_requested: bool,
     /// Open PRs labeled `loom:changes-requested`.
     pub changes_requested: bool,
+    /// The unclaimed/unheld subset of `changes_requested` — see
+    /// [`RepoPipelineSnapshot::changes_requested_unclaimed`] (Issue #5272).
+    pub changes_requested_unclaimed: bool,
     /// Open PRs labeled `loom:pr`.
     pub approved: bool,
     /// PRs merged inside the configured window.
@@ -130,19 +144,29 @@ impl PipelineMetrics {
         building: true,
         review_requested: true,
         changes_requested: true,
+        changes_requested_unclaimed: true,
         approved: true,
         merged: true,
     };
 
-    /// The two metrics `loom-daemon health` needs: queue depth and merge
-    /// throughput. Two `gh` calls per repo instead of six keeps the one-shot
-    /// health command inside its "< 5s typical" budget on a multi-repo fleet.
+    /// The metrics `loom-daemon health` needs: queue depth, the review-side
+    /// axes (including the #5272 no-owner count), and merge throughput.
+    ///
+    /// `building` stays masked off — no health section reads it — so this is
+    /// six `gh` calls per repo rather than seven. The three review axes were
+    /// masked off too until Issue #5021, which is *why* the `queues` section
+    /// could not see a Judge outage: the fields it needed were never fetched
+    /// on the CLI path. The extra calls are the cost of that visibility, and
+    /// they fan out per repo in parallel
+    /// ([`collect_pipeline_snapshots`]), so the wall-clock cost is a handful
+    /// of extra sequential `gh` calls total, not per repo.
     pub const HEALTH: Self = Self {
         queued: true,
         building: false,
-        review_requested: false,
-        changes_requested: false,
-        approved: false,
+        review_requested: true,
+        changes_requested: true,
+        changes_requested_unclaimed: true,
+        approved: true,
         merged: true,
     };
 }
@@ -156,6 +180,125 @@ impl Default for PipelineMetrics {
 /// The default merge-throughput window — the 24h the `merged_24h` field is
 /// named for, and what every pre-#4761 caller gets.
 pub const DEFAULT_MERGE_WINDOW_HOURS: i64 = 24;
+
+/// The default `gh` binary this module invokes when nothing overrides it —
+/// the single source of truth so [`GhPipelineSource::new`] and
+/// [`probe_gh_availability`]'s caller (`loom-daemon health`'s collector,
+/// #5061) can never drift into checking a different binary than the one that
+/// actually runs the per-repo queries.
+pub const DEFAULT_GH_BIN: &str = "gh";
+
+// ============================================================================
+// `gh` binary availability (Issue #5061)
+// ============================================================================
+
+/// The client-side `gh` binary this process would use for a
+/// [`GhPipelineSource`] fan-out could not be found or executed at all — an
+/// **environment fact about this process**, not a forge outage.
+///
+/// Produced once by [`probe_gh_availability`], *before* any per-repo `gh`
+/// call, precisely so a caller (`loom-daemon health`, #5061) can report it as
+/// a single fact rather than as N independent "forge query FAILED" entries —
+/// one per managed repo — which is what happened before this type existed: a
+/// missing `gh` on a non-login SSH `PATH` made every repo's query fail
+/// identically, and the resulting message read exactly like a forge outage or
+/// a dead credential.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GhUnavailable {
+    /// The configured `gh` binary path/name (`gh` unless overridden via
+    /// [`GhPipelineSource::with_gh_bin`]).
+    pub gh_bin: String,
+    /// Operator-facing reason, already naming the specific cause: PATH
+    /// resolution failure (the common case — the same failure class as
+    /// #4875) vs. an explicit path that does not exist vs. a file found but
+    /// not executable.
+    pub reason: String,
+    /// This process's raw `PATH` value at probe time, when the failure was a
+    /// PATH lookup — `None` for an explicit-path failure (nothing to blame
+    /// on `PATH`) or a permission failure. Kept out of `reason` because a
+    /// summary line should not have to enumerate an arbitrarily long,
+    /// host-specific `PATH`; carried here for `--json` diagnostics.
+    pub observed_path: Option<String>,
+}
+
+/// Probe whether `gh_bin` can be located and invoked at all: a single,
+/// bounded `<gh_bin> --version` spawn attempt — no network, no repo context,
+/// just "does exec even start". `Ok(())` on any outcome other than the
+/// binary failing to *launch*: a `gh` that launches but exits non-zero (an
+/// unexpected `--version` failure) is still "available" for this purpose.
+/// Only [`std::io::ErrorKind::NotFound`] (not on `PATH`, or an explicit path
+/// that does not exist) and [`std::io::ErrorKind::PermissionDenied`] (found
+/// but not executable) are treated as unavailable — matching the acceptance
+/// criteria's "missing or non-executable `gh`". Any other spawn error (e.g. a
+/// transient fork/exec failure) is left for the real per-repo `gh` calls to
+/// surface, exactly as before this probe existed — this function's whole
+/// point is narrowly distinguishing "the binary itself cannot run" from
+/// every other kind of forge-query failure.
+pub fn probe_gh_availability(gh_bin: &Path) -> Result<(), GhUnavailable> {
+    match Command::new(gh_bin).arg("--version").output() {
+        Ok(_) => Ok(()),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            Err(describe_gh_unavailable(gh_bin, &e))
+        }
+        Err(_) => Ok(()),
+    }
+}
+
+/// Build the operator-facing [`GhUnavailable`] for [`probe_gh_availability`]'s
+/// failure, naming the specific PATH problem (the same failure class as
+/// #4875) when `gh_bin` is a bare name subject to a `PATH` lookup, rather
+/// than an explicit path.
+fn describe_gh_unavailable(gh_bin: &Path, err: &std::io::Error) -> GhUnavailable {
+    if err.kind() == std::io::ErrorKind::PermissionDenied {
+        return GhUnavailable {
+            gh_bin: gh_bin.display().to_string(),
+            reason: format!(
+                "`{}` was found but is not executable ({err}) — check its file permissions",
+                gh_bin.display()
+            ),
+            observed_path: None,
+        };
+    }
+
+    // A path is subject to PATH-lookup exec semantics only when it has no
+    // directory component at all (mirrors how `exec`/`Command` itself decides
+    // whether to search `PATH`: any path separator anywhere opts out of the
+    // search). An explicit path (`./gh`, `/usr/bin/gh`, a `with_gh_bin`
+    // override pointing at a specific file) that does not exist is not a
+    // `PATH` problem — no separate hint is useful there.
+    let is_bare_name = gh_bin.parent().is_none_or(|p| p.as_os_str().is_empty());
+    if !is_bare_name {
+        return GhUnavailable {
+            gh_bin: gh_bin.display().to_string(),
+            reason: format!("`{}` does not exist", gh_bin.display()),
+            observed_path: None,
+        };
+    }
+
+    let path = std::env::var("PATH").unwrap_or_default();
+    let hint = crate::fleet::path_bootstrap::CANONICAL_PATH_DIRS
+        .iter()
+        .take(3)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(", ");
+    GhUnavailable {
+        gh_bin: gh_bin.display().to_string(),
+        reason: format!(
+            "`{}` not found on PATH — cannot assess queue depth / merge throughput. This looks \
+             like a non-login shell (e.g. a bare `ssh host 'cmd'` invocation) missing PATH \
+             entries a login shell would add — the same failure class as #4875. Commonly \
+             missing: {hint}",
+            gh_bin.display()
+        ),
+        observed_path: Some(path),
+    }
+}
 
 /// A `gh`-backed [`PipelineSource`]. Runs up to six `gh` invocations per repo
 /// (one per requested metric — see [`PipelineMetrics`]) scoped to that repo's
@@ -175,7 +318,7 @@ impl GhPipelineSource {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            gh_bin: PathBuf::from("gh"),
+            gh_bin: PathBuf::from(DEFAULT_GH_BIN),
             metrics: PipelineMetrics::ALL,
             merge_window: chrono::Duration::hours(DEFAULT_MERGE_WINDOW_HOURS),
         }
@@ -249,6 +392,23 @@ impl GhPipelineSource {
     /// two definitions can never drift apart again.
     fn queued_search_query() -> String {
         let mut query = "is:open label:loom:issue".to_string();
+        for label in crate::work_finder::PARK_LABELS {
+            query.push_str(&format!(" -label:{label}"));
+        }
+        query
+    }
+
+    /// The `--search` query for the `changes_requested_unclaimed` metric
+    /// (Issue #5272): open `loom:changes-requested` PRs that are **owned by
+    /// nothing** — no active Doctor claim (`loom:treating`) and no park/hold
+    /// label (the same [`crate::work_finder::PARK_LABELS`] the `queued`
+    /// query above excludes, reused rather than re-listed so the two
+    /// definitions can never drift apart). Mirrors [`Self::queued_search_query`]'s
+    /// `--search`-negation shape for the identical reason: `gh pr list --label`
+    /// only ANDs, it cannot express "and NOT this label".
+    fn changes_requested_unclaimed_search_query() -> String {
+        let mut query =
+            "is:open is:pr label:loom:changes-requested -label:loom:treating".to_string();
         for label in crate::work_finder::PARK_LABELS {
             query.push_str(&format!(" -label:{label}"));
         }
@@ -338,6 +498,15 @@ impl PipelineSource for GhPipelineSource {
                     "number",
                     "--limit",
                     "500",
+                ],
+            ));
+        }
+        if self.metrics.changes_requested_unclaimed {
+            let search = Self::changes_requested_unclaimed_search_query();
+            snap.changes_requested_unclaimed = record(self.count(
+                root,
+                &[
+                    "pr", "list", "--search", &search, "--json", "number", "--limit", "500",
                 ],
             ));
         }
@@ -433,6 +602,72 @@ mod tests {
     #[test]
     fn format_count_renders_number_for_some() {
         assert_eq!(format_count(Some(7)), "7");
+    }
+
+    // ===================================================================
+    // probe_gh_availability — #5061
+    // ===================================================================
+
+    #[test]
+    fn probe_gh_availability_ok_for_a_real_executable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gh = write_fake_gh(tmp.path(), "echo 'gh version 2.0.0'");
+        assert_eq!(probe_gh_availability(&gh), Ok(()));
+    }
+
+    /// `#[serial]` is load-bearing (#4547): this test mutates the process-wide
+    /// `PATH` env var, which every concurrently-running `Command` spawn in
+    /// this file's other tests implicitly reads.
+    #[test]
+    #[serial]
+    fn probe_gh_availability_names_the_path_problem_for_a_bare_name_missing_from_path() {
+        let saved = std::env::var("PATH").ok();
+        std::env::set_var("PATH", "/no-such-loom-test-dir-5061");
+        let result = probe_gh_availability(Path::new("definitely-not-a-real-gh-binary-5061"));
+        match saved {
+            Some(p) => std::env::set_var("PATH", p),
+            None => std::env::remove_var("PATH"),
+        }
+
+        let err = result.expect_err("a binary absent from PATH must be reported as unavailable");
+        assert_eq!(err.gh_bin, "definitely-not-a-real-gh-binary-5061");
+        assert!(err.reason.contains("PATH"), "reason should name PATH: {}", err.reason);
+        assert!(
+            err.reason.contains("#4875"),
+            "reason should cross-reference #4875: {}",
+            err.reason
+        );
+        assert!(
+            err.observed_path.is_some(),
+            "a PATH-lookup failure should carry the observed PATH for --json"
+        );
+    }
+
+    #[test]
+    fn probe_gh_availability_reports_a_missing_explicit_path_without_a_path_hint() {
+        let err = probe_gh_availability(Path::new("/no/such/gh-binary-5061"))
+            .expect_err("a nonexistent explicit path must be reported as unavailable");
+        assert!(err.reason.contains("does not exist"));
+        assert!(
+            err.observed_path.is_none(),
+            "an explicit-path failure is not a PATH problem, so no PATH should be attached"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_gh_availability_reports_permission_denied_for_a_non_executable_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("not-executable-gh");
+        std::fs::write(&path, "#!/bin/sh\necho hi\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let err = probe_gh_availability(&path)
+            .expect_err("a non-executable file must be reported as unavailable");
+        assert!(err.reason.contains("not executable"), "reason: {}", err.reason);
+        assert!(err.observed_path.is_none());
     }
 
     // ===================================================================
@@ -605,6 +840,9 @@ case "$*" in
   *"--label loom:changes-requested"*)
     echo '[]'
     ;;
+  *"is:pr label:loom:changes-requested"*)
+    echo '[{"number":12}]'
+    ;;
   *"--label loom:pr"*)
     echo '[{"number":7}]'
     ;;
@@ -627,6 +865,7 @@ esac
         assert_eq!(snap.building, Some(1));
         assert_eq!(snap.review_requested, Some(2));
         assert_eq!(snap.changes_requested, Some(0));
+        assert_eq!(snap.changes_requested_unclaimed, Some(1));
         assert_eq!(snap.approved, Some(1));
         assert_eq!(snap.merged_24h, Some(4));
         assert!(snap.is_complete());
@@ -684,6 +923,7 @@ esac
         assert_eq!(snap.building, None);
         assert_eq!(snap.review_requested, None);
         assert_eq!(snap.changes_requested, None);
+        assert_eq!(snap.changes_requested_unclaimed, None);
         assert_eq!(snap.approved, None);
         assert_eq!(snap.merged_24h, None);
     }
@@ -714,11 +954,15 @@ esac
         assert_eq!(source.merge_window, chrono::Duration::hours(24));
     }
 
-    /// The #4761 cost control: the HEALTH mask must issue exactly the two `gh`
-    /// calls it needs, not all six — the whole reason the mask exists.
+    /// The #4761 cost control, as widened by #5021 and #5272: the HEALTH mask
+    /// must issue exactly the six `gh` calls the health sections read — queue
+    /// depth, the four review-side axes (including the #5272 no-owner count),
+    /// and merge throughput — and must still skip `building`, which no
+    /// section consumes. The mask exists to keep the one-shot command off the
+    /// metrics nothing reads, not to be `ALL`.
     #[test]
     #[serial]
-    fn health_metrics_mask_fetches_only_queued_and_merged() {
+    fn health_metrics_mask_fetches_every_axis_the_sections_read_but_not_building() {
         let tmp = tempfile::tempdir().unwrap();
         let calls = tmp.path().join("calls.log");
         let gh = write_fake_gh(
@@ -733,15 +977,26 @@ esac
 
         assert_eq!(snap.queued, Some(1));
         assert_eq!(snap.merged_24h, Some(1));
-        assert_eq!(snap.building, None);
-        assert_eq!(snap.review_requested, None);
-        assert_eq!(snap.changes_requested, None);
-        assert_eq!(snap.approved, None);
+        assert_eq!(snap.review_requested, Some(1), "#5021: the review axis must be fetched");
+        assert_eq!(snap.changes_requested, Some(1));
+        assert_eq!(
+            snap.changes_requested_unclaimed,
+            Some(1),
+            "#5272: the no-owner axis must be fetched"
+        );
+        assert_eq!(snap.approved, Some(1));
+        assert_eq!(snap.building, None, "no health section reads `building`");
         assert!(snap.is_complete());
 
         let log = std::fs::read_to_string(&calls).unwrap();
-        assert_eq!(log.lines().count(), 2, "exactly two gh calls, got:\n{log}");
+        assert_eq!(log.lines().count(), 6, "exactly six gh calls, got:\n{log}");
         assert!(log.contains("loom:issue"));
+        assert!(log.contains("loom:review-requested"));
+        assert!(log.contains("loom:changes-requested"));
+        assert!(
+            log.contains("-label:loom:treating"),
+            "#5272: no-owner query must exclude loom:treating"
+        );
         assert!(log.contains("--state merged"));
         assert!(!log.contains("loom:building"));
     }
@@ -763,6 +1018,32 @@ esac
         let query = GhPipelineSource::queued_search_query();
         assert!(query.contains("is:open"));
         assert!(query.contains("label:loom:issue"));
+        for label in crate::work_finder::PARK_LABELS {
+            assert!(
+                query.contains(&format!("-label:{label}")),
+                "expected '-label:{label}' in query: {query}"
+            );
+        }
+    }
+
+    // ===================================================================
+    // changes_requested_unclaimed_search_query — #5272
+    // ===================================================================
+
+    /// The `changes_requested_unclaimed` query must exclude an active
+    /// Doctor claim (`loom:treating`) *and* every park/hold label in
+    /// `work_finder::PARK_LABELS` — the two conditions AC2/AC4 of #5272
+    /// require for a `loom:changes-requested` PR to count as "no owner".
+    #[test]
+    fn changes_requested_unclaimed_search_query_excludes_claim_and_park_labels() {
+        let query = GhPipelineSource::changes_requested_unclaimed_search_query();
+        assert!(query.contains("is:open"));
+        assert!(query.contains("is:pr"));
+        assert!(query.contains("label:loom:changes-requested"));
+        assert!(
+            query.contains("-label:loom:treating"),
+            "expected '-label:loom:treating' in query: {query}"
+        );
         for label in crate::work_finder::PARK_LABELS {
             assert!(
                 query.contains(&format!("-label:{label}")),

@@ -245,18 +245,37 @@ A point-in-time view of the multi-account token pool (host-level — no `repo` /
 Per account, `rank` / `usage_fraction` / `limit_window_reset_at` are omitted when
 unknown; `exhausted` is always present.
 
+Every field is read out of the pool's `.ranking` file, so each maps to one of its
+pipe-delimited columns (`name|status|5h_util|limit_reset` — see
+[`token-pool.md`](token-pool.md)): `rank` is the row's position, `usage_fraction`
+is `5h_util`, `exhausted` is derived from `status`, and `limit_window_reset_at`
+is `limit_reset`.
+
+`limit_window_reset_at` is the instant the window **currently gating that
+account** rolls over — the 7-day window for an `exhausted` account (when it
+regains capacity), the 5-hour window otherwise (the rollover `usage_fraction` is
+racing). The daemon resolves which one before writing, so a consumer never has to
+know: it is always "when this account's constraint lifts". It is also the only
+per-account field here that survives public redaction, aggregated across the pool
+into `next_limit_window_reset_at` (the earliest reset, naming no account). A row
+whose reset is absent or unparseable reports no reset at all rather than a
+fabricated instant, so consumers must treat `null`/absent as *unknown* — never as
+"resets now".
+
 ### `host.health`
 
-Host CPU/disk headroom, daemon version, and uptime (host-level — no `repo` /
-`visibility`). Every measured field is optional so an unmeasurable probe stays
-absent rather than being coerced to a fake zero (the daemon's "unknown != zero"
-contract; see `cpu_headroom.rs` / `disk_headroom.rs`).
+Host CPU/disk headroom, the emitting binary's identity, and uptime (host-level —
+no `repo` / `visibility`). Every measured field is optional so an unmeasurable
+probe stays absent rather than being coerced to a fake zero (the daemon's
+"unknown != zero" contract; see `cpu_headroom.rs` / `disk_headroom.rs`).
 
 ```json
 {
   "kind": "host.health",
   "captured_at": "2026-07-30T12:00:00Z",
   "daemon_version": "0.16.0",
+  "build_commit": "8c16fb5b",
+  "built_at": "2026-07-30T03:09:51Z",
   "uptime_sec": 86400,
   "logical_cpus": 28,
   "cpu_idle_fraction": 0.83,
@@ -268,6 +287,28 @@ contract; see `cpu_headroom.rs` / `disk_headroom.rs`).
 `cpu_idle_fraction`, `load_per_core`, and `worktree_root_free_gb` are omitted when
 unmeasurable. A consumer MUST treat an absent measurement as "unknown", never as
 zero/full.
+
+**Binary identity (`build_commit` / `built_at`, #4956).** `daemon_version` is
+`CARGO_PKG_VERSION`, so it only moves once per release: every build between two
+releases reports the same string, and a day-stale daemon is indistinguishable
+from current `main`. `build_commit` (the short git SHA the running binary was
+compiled from) and `built_at` (when it was compiled) are the precise identity —
+both come from the very same compile-time stamps `loom-daemon --version` prints
+(`LOOM_DAEMON_GIT_COMMIT` / `LOOM_DAEMON_BUILD_TIME`, baked in by `build.rs`), so
+the telemetry and the CLI can never disagree.
+
+- `build_commit` is always sent. `"unknown"` is a *meaningful* value, not a
+  missing measurement: it means the build host had no git (e.g. a
+  release-tarball build). A record from a pre-#4956 daemon has no field at all,
+  which decodes as an empty string.
+- `built_at` is **omitted** when the build-time stamp was unavailable — an
+  unknown build time is absent, never a fabricated instant, exactly like the
+  measured fields above.
+
+Both fields are additive and pass through public redaction unchanged (they
+describe the released binary, not any repo or operator — see
+`dashboard/src/redaction.ts`), so an older consumer that ignores unknown keys is
+unaffected.
 
 ## Persistence & read surface (`sweep.outcome`, Issue #4704)
 

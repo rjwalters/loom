@@ -488,6 +488,7 @@ fn median_i64(sorted: &[i64]) -> i64 {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use tempfile::tempdir;
 
     fn record(issue: u32, outcome: &str) -> OutcomeRecord {
@@ -721,7 +722,15 @@ mod tests {
         assert_eq!(records[0].issue, 2);
     }
 
+    // Serialized against `observability::backfill`'s tests: they mutate the
+    // process-wide `OUTCOME_TELEMETRY_JOURNAL_PATH_ENV` var (leaked for the
+    // duration of their body) via this same constant, and `#[serial]` only
+    // serializes against other `#[serial]` tests — a non-serial reader can
+    // otherwise observe that leaked override and flake nondeterministically
+    // (#5133, same class as `observability::backfill`'s
+    // `default_backfill_state_path_is_under_loom_logs`).
     #[test]
+    #[serial]
     fn default_outcome_telemetry_path_is_under_loom_logs() {
         let workspace = Path::new("/workspace/repo");
         let path = default_outcome_telemetry_path(workspace);

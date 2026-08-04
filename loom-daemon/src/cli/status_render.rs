@@ -34,13 +34,25 @@ struct ResolvedCapacity {
     healthy: usize,
     exhausted: usize,
     /// Health-adjusted token axis (healthy accounts, or the raw pool as a
-    /// fallback) — the "healthy tokens" input to the dynamic concurrency cap.
+    /// fallback) — an *informational* account-health figure (drives spawn-time
+    /// selection), not a cap input since #5270.
     token_axis_limit: usize,
-    /// The effective dynamic cap consistent with `token_axis_limit`:
-    /// `min(token_axis_limit, disk_headroom, configured_max)` (the CPU term
-    /// added in #3978 was removed in #4512).
+    /// The effective dynamic cap. Always exactly `report.dynamic_cap` (#5270)
+    /// — the token axis was removed from the admission formula entirely, so
+    /// there is nothing left for a client-side probe to recompute here; using
+    /// the daemon's own authoritative figure guarantees this can never drift
+    /// from what `min(disk, ram, configured_max)` actually evaluates to,
+    /// unlike the pre-#5270 client-side `token_axis_effective.min(...)`
+    /// recomputation this superseded (which could disagree with the daemon
+    /// when accounts were scarce).
     effective_cap: usize,
-    /// Whether the token axis is the binding (minimum) constraint.
+    /// Whether the token pool is genuinely starved (zero healthy accounts).
+    /// Since #5270 this is NOT "tokens are the binding cap term" — the token
+    /// axis was removed from `dynamic_cap` entirely — but zero healthy
+    /// accounts still means every spawn will fail account selection, so
+    /// #5305 restored this as a reachable starvation signal rather than the
+    /// permanently-`false` placeholder #5304 left behind. Mirrors
+    /// `report.capacity.token_bound`.
     token_bound: bool,
 }
 
@@ -68,20 +80,18 @@ fn resolve_capacity(
                 .collect();
             let cap = loom_daemon::capacity::summarize_probe(pairs.iter().copied());
             let token_axis_limit = cap.healthy;
-            // The token axis of the cap is `healthy × per-token` (#3947); treat a
-            // pre-#3947 wire `0` as the effective floor of 1.
-            let factor = report.per_token_concurrency.max(1);
-            let token_axis_effective = token_axis_limit.saturating_mul(factor);
-            // #4512: the cap is min(token axis, disk, configured max). A
-            // pre-#4512 daemon still SENDS a `cpu_headroom` field; serde ignores
-            // it, and we deliberately do not reintroduce it into the client-side
-            // recomputation — the daemon's own `dynamic_cap` (shown as the
-            // headline below) remains the authority either way.
-            let effective_cap = token_axis_effective
-                .min(report.disk_headroom)
-                .min(report.configured_max);
-            let token_bound = token_axis_effective <= report.disk_headroom
-                && token_axis_effective <= report.configured_max;
+            // #5270: the token axis no longer participates in the cap on any
+            // auth path — a fresh client-side probe changes the *reported*
+            // account-health figures (total/healthy/exhausted/token_axis_limit
+            // above), but must NOT re-derive its own `effective_cap` from them
+            // the way the pre-#5270 formula did (that recomputation could
+            // disagree with the daemon whenever accounts were scarce, which is
+            // exactly the artificial cap this issue removes). The daemon's own
+            // `dynamic_cap` — `min(disk, ram, configured_max)` — is the sole
+            // authority for the cap. `token_bound`, however, is a starvation
+            // signal (zero healthy accounts), independent of the cap — #5305
+            // restores it here too so a fresh probe reporting 0 healthy
+            // accounts still surfaces the guidance.
             return ResolvedCapacity {
                 source: "probe",
                 ranking_present: true,
@@ -89,8 +99,8 @@ fn resolve_capacity(
                 healthy: cap.healthy,
                 exhausted: cap.exhausted,
                 token_axis_limit,
-                effective_cap,
-                token_bound,
+                effective_cap: report.dynamic_cap,
+                token_bound: cap.healthy == 0,
             };
         }
     }
@@ -120,6 +130,23 @@ fn resolve_capacity(
         effective_cap: report.dynamic_cap,
         token_bound: report.capacity.token_bound,
     }
+}
+
+/// Whether the daemon's own `.ranking` read is unambiguously starved (0
+/// healthy accounts) while a fresher read (a client-side probe, or a
+/// re-checked ranking `rc` resolved to) shows real capacity — #4344,
+/// re-scoped by #5305 for #5270: the concurrency cap is no longer affected
+/// either way, but the daemon's own spawn-time account **selection** is still
+/// reading a stale, fully-exhausted `.ranking` file. Pure predicate, kept
+/// separate from the println! block above it so it stays trivially
+/// unit-testable (mirrors `ipc::dispatch_would_meet_or_exceed_headroom`'s
+/// rationale).
+#[must_use]
+fn ranking_diverges_from_starvation(report: &DaemonStatusReport, rc: &ResolvedCapacity) -> bool {
+    report.capacity.ranking_present
+        && report.capacity.healthy_accounts == 0
+        && rc.ranking_present
+        && rc.healthy > 0
 }
 
 /// Build the combined status payload (daemon report + per-token usage) as a
@@ -164,11 +191,27 @@ pub(crate) fn build_status_json_value(
         // silent-failure signature. `message` is `null` when not tripped.
         "preflight_advisory_active": report.preflight_advisory_active,
         "preflight_advisory_message": report.preflight_advisory_message,
+        // Freshness signal for the advisory above (Issue #5029): the wall-clock
+        // time of the most recent trip/clear transition, so a scripted
+        // consumer (like the human-readable renderer below) can distinguish a
+        // just-tripped warning from a stale one that predates a since-applied
+        // fix. `null` before the first transition this daemon process has
+        // observed.
+        "preflight_advisory_changed_at": report.preflight_advisory_changed_at,
         // Observability host-identity mismatch (#4830): non-null means this
         // host's ingest key is bound to a DIFFERENT host_id than the daemon
         // reports for itself, so its telemetry is being filed under the wrong
         // host. `null` in the common case (ids agree, or no exporter running).
         "observability_host_id_mismatch": report.observability_host_id_mismatch,
+        // Positive export-liveness signal (#5083). Unlike the anomaly-only
+        // field above, this is non-null for any daemon of this vintage and
+        // always carries a `state`, so a watch loop can assert health rather
+        // than infer it from the absence of a warning:
+        //   loom-daemon status --json \
+        //     | jq -e '.observability_export.state == "healthy"'
+        // States: disabled | starting | never_exported | healthy |
+        // host_id_mismatch | failing. `null` only from a pre-#5083 daemon.
+        "observability_export": report.observability_export,
         "dynamic_cap": {
             "token_pool_size": report.token_pool_size,
             // The directory the daemon resolved for the pool above (#4292) —
@@ -178,9 +221,16 @@ pub(crate) fn build_status_json_value(
             // whatever cwd `loom-daemon status` itself was run from.
             "token_pool_dir": report.token_pool_dir,
             "disk_headroom": report.disk_headroom,
+            // RAM headroom (#5270) — the second machine-headroom cap term
+            // alongside disk_headroom, since the token axis stopped bounding
+            // admission on any auth path.
+            "ram_headroom": report.ram_headroom,
             // Host CPU OBSERVATIONS (#3978/#4031), not cap terms: #4512 removed
             // the CPU headroom term from admission. Reported because observed
             // idle is the evidence for tuning `configured_max` on this machine.
+            // The separate CPU saturation admission brake (#4903, retuned by
+            // #5270) DOES gate admission — see the `admission_brake` block
+            // below for its live held/threshold state.
             "logical_cpus": report.logical_cpus,
             "loadavg_1m": report.loadavg_1m,
             "cpu_idle_fraction": report.cpu_idle_fraction,
@@ -318,6 +368,18 @@ pub(crate) fn build_status_json_value(
             "load_per_core_threshold": h.load_per_core_threshold,
             "sustain_ticks": h.sustain_ticks,
             "cooldown_secs": h.cooldown_secs,
+        })),
+        // Saturation admission brake (#4903) — `null` when no brake is
+        // registered. `held` is the machine-readable form of "this host is
+        // refusing new sweeps because it is already saturated", which
+        // `capacity_bound` alone could never express.
+        "admission_brake": report.admission_brake.as_ref().map(|b| serde_json::json!({
+            "enabled": b.enabled,
+            "held": b.held,
+            "load_per_core": b.load_per_core,
+            "load_per_core_threshold": b.load_per_core_threshold,
+            "held_since": b.held_since,
+            "held_ticks": b.held_ticks,
         })),
         "rate_limit_breaker": report.rate_limit_breaker.as_ref().map(|r| serde_json::json!({
             "enabled": r.enabled,
@@ -604,6 +666,183 @@ fn format_repo_column(repo: Option<&str>) -> &str {
     }
 }
 
+/// The capacity-block line that **replaces** "the limiter is work availability"
+/// while the saturation admission brake is holding (#4903).
+///
+/// `None` when no brake is registered, it is disabled, or it is not currently
+/// holding — in which case the caller prints the generic line unchanged, so a
+/// healthy host's output is byte-for-byte what it was before #4903.
+///
+/// Split out from [`print_status_human`] (same rationale as
+/// [`render_in_flight_table`]) so the "a saturated host must not read as idle"
+/// contract is unit-testable without capturing process stdout.
+fn saturation_hold_note(report: &DaemonStatusReport, dispatch_cap: usize) -> Option<String> {
+    let b = report.admission_brake.as_ref()?;
+    if !(b.enabled && b.held) {
+        return None;
+    }
+    let load = b
+        .load_per_core
+        .map_or_else(|| "n/a".to_string(), |l| format!("{l:.2}"));
+    Some(format!(
+        "  \u{26a0} ADMISSION BRAKE HOLDING: {} in flight, cap {dispatch_cap}, but this host is \
+         saturated (load/core {load} \u{2265} {:.2}) — the limiter is the HOST, not work \
+         availability. New sweeps are held until load recovers; in-flight sweeps are untouched. \
+         Tune `autonomous.workFinder.maxConcurrent` for this machine's workload (#4903).",
+        report.in_flight.len(),
+        b.load_per_core_threshold,
+    ))
+}
+
+/// Render the "as of" freshness suffix for the pre-flight advisory line
+/// (Issue #5029), e.g. `" (as of 12s ago, 2026-08-03T12:00:00Z)"` — empty
+/// string when no transition timestamp is available (an older daemon binary,
+/// or a state this process has not transitioned through yet), so pre-#5029
+/// output is unaffected byte-for-byte.
+fn format_preflight_advisory_freshness(changed_at: Option<DateTime<Utc>>) -> String {
+    match changed_at {
+        Some(ts) => {
+            let secs = (Utc::now() - ts).num_seconds().max(0);
+            format!(" (as of {secs}s ago, {ts})")
+        }
+        None => String::new(),
+    }
+}
+
+/// The claude-wrapper pre-flight-death tripwire warning line (#4386), with an
+/// "as of" freshness suffix appended (Issue #5029) — split out from
+/// [`print_status_human`] so the freshness text is unit-testable without
+/// capturing process stdout, mirroring [`render_admission_brake_line`].
+/// `None` when the advisory is not currently active (nothing to print) or the
+/// active flag is set with no message (defensive — should not happen in
+/// practice).
+fn render_preflight_advisory_line(report: &DaemonStatusReport) -> Option<String> {
+    if !report.preflight_advisory_active {
+        return None;
+    }
+    let msg = report.preflight_advisory_message.as_ref()?;
+    // Issue #5029: append the freshness indicator so a stale (already-cleared
+    // elsewhere, or long-since-tripped) warning is visibly distinguishable
+    // from a just-tripped one, rather than reading as a frozen count with no
+    // notion of time. The message itself already names the specific
+    // workspace it is scoped to (`preflight_advisory_message`).
+    Some(format!(
+        "{msg}{}",
+        format_preflight_advisory_freshness(report.preflight_advisory_changed_at)
+    ))
+}
+
+/// The `Observability: …` telemetry-export line (Issue #5083) — always
+/// rendered, because the whole point is that "healthy" must be *stated*, not
+/// inferred from the absence of a warning.
+///
+/// Split out of [`print_status_human`] so every state is unit-testable without
+/// capturing process stdout, mirroring [`render_admission_brake_line`]. `now`
+/// is passed in (rather than read here) so the tests are deterministic.
+///
+/// `status = None` means a pre-#5083 daemon binary that never computed one —
+/// reported as `unknown`, never silently as `disabled`, which would be an
+/// invented fact about a daemon that said nothing.
+fn render_observability_line(
+    status: Option<&loom_daemon::types::ObservabilityExportStatus>,
+    now: DateTime<Utc>,
+) -> String {
+    use loom_daemon::health::format_window;
+    use loom_daemon::types::ObservabilityExportState as State;
+
+    let Some(s) = status else {
+        return "Observability: unknown (older daemon binary — restart to pick up #5083)"
+            .to_string();
+    };
+    let host = s.host_id.as_deref().unwrap_or("unknown-host");
+    let endpoint = s.endpoint.as_deref().unwrap_or("(no endpoint)");
+    let uptime = s
+        .uptime_secs(now)
+        .map_or_else(|| "?".to_string(), format_window);
+    let last_success = s
+        .last_success_age_secs(now)
+        .map_or_else(|| "never".to_string(), |age| format!("{} ago", format_window(age)));
+    // Re-derived rather than trusting the daemon-stamped `state`, so a status
+    // payload that sat in a pipe for a while still reads correctly across the
+    // grace boundary — `classify` is the single shared rule (`types.rs`).
+    match s.classify(now) {
+        State::Disabled => {
+            "Observability: disabled (no telemetry export — set observability.enabled=true to opt in)"
+                .to_string()
+        }
+        State::Starting => format!(
+            "Observability: starting — exporter up {uptime} as host_id={host}, no batch acked yet \
+             (first flush due within {}s) → {endpoint}",
+            s.flush_interval_secs.unwrap_or(0)
+        ),
+        State::NeverExported => format!(
+            "Observability: NEVER EXPORTED — running {uptime} as host_id={host} and no batch has \
+             EVER been acked; telemetry is not reaching {endpoint}{}",
+            s.last_failure_detail
+                .as_deref()
+                .map_or_else(String::new, |d| format!(" (last error: {d})")),
+        ),
+        State::Healthy => format!(
+            "Observability: OK — last export {last_success}, {} record(s) as host_id={host} → {endpoint}",
+            s.records_exported
+        ),
+        State::HostIdMismatch => format!(
+            "Observability: HOST-ID MISMATCH — telemetry is landing under host_id={}, not {host} \
+             (last export {last_success}, {} record(s)) → {endpoint}",
+            s.ingest_host_id.as_deref().unwrap_or("unknown"),
+            s.records_exported
+        ),
+        State::Failing => format!(
+            "Observability: FAILING — {} consecutive failed flush(es) as host_id={host}, last \
+             success {last_success} → {endpoint}{}",
+            s.consecutive_failures,
+            s.last_failure_detail
+                .as_deref()
+                .map_or_else(String::new, |d| format!(" (last error: {d})")),
+        ),
+        // Only reachable from a NEWER daemon reporting a state this build does
+        // not know. Say so plainly rather than collapsing it into one of the
+        // known states — the same "degrade legibly, never mislabel" posture the
+        // Safehouse block takes for an unknown state string (#4464).
+        State::Unrecognized => format!(
+            "Observability: unrecognized state from a newer daemon binary (host_id={host}) — \
+             upgrade this client to read it"
+        ),
+    }
+}
+
+/// The standalone `Admission brake: …` status line (#4903), or `None` when no
+/// brake is registered (older daemon / never registered) — which renders
+/// nothing at all, the zero-behavior-change baseline the host breaker's line
+/// already uses.
+fn render_admission_brake_line(report: &DaemonStatusReport) -> Option<String> {
+    let b = report.admission_brake.as_ref()?;
+    let load = b
+        .load_per_core
+        .map_or_else(|| "n/a".to_string(), |l| format!("{l:.2}"));
+    if !b.enabled {
+        return Some("Admission brake: disabled".to_string());
+    }
+    if !b.held {
+        return Some(format!(
+            "Admission brake: OK (load/core {load}, hold \u{2265} {:.2})",
+            b.load_per_core_threshold
+        ));
+    }
+    let since = b.held_since.map_or_else(
+        || "unknown".to_string(),
+        |s| {
+            let secs = (Utc::now() - s).num_seconds().max(0);
+            format!("{secs}s ago ({s})")
+        },
+    );
+    Some(format!(
+        "Admission brake: HOLDING — host saturated (load/core {load} \u{2265} {:.2}); NEW sweep \
+         admissions held since {since} ({} tick(s)); in-flight sweeps are untouched and will drain",
+        b.load_per_core_threshold, b.held_ticks
+    ))
+}
+
 /// Render the in-flight-sweeps table body (header + separator + one row per
 /// sweep, or the `(none)` placeholder) as a `String` — split out from
 /// [`print_status_human`] so the `REPO` column (#4698) is unit-testable
@@ -673,10 +912,8 @@ pub(crate) fn print_status_human(
     // the "not capacity-bound … the limiter is work availability" line further
     // below is never the only diagnosis shown while this is tripped — see the
     // guard on that line.
-    if report.preflight_advisory_active {
-        if let Some(msg) = &report.preflight_advisory_message {
-            println!("\n{msg}");
-        }
+    if let Some(line) = render_preflight_advisory_line(report) {
+        println!("\n{line}");
     }
 
     // Observability host-identity mismatch (#4830): printed alongside the
@@ -710,24 +947,16 @@ pub(crate) fn print_status_human(
     let dispatch_token_axis = report.capacity.token_axis_limit;
     println!("\nDynamic concurrency cap: {dispatch_cap}  (the number dispatch uses)");
     println!(
-        "  = min(healthy {} × per-token {} = {}, disk headroom {}, \
-         configured max {})",
+        "  = min(disk headroom {}, ram headroom {}, configured max {})",
+        report.disk_headroom, report.ram_headroom, report.configured_max
+    );
+    println!(
+        "  (healthy {} × per-token {} = {} is informational only — the token axis no longer \
+         bounds the cap, #5270)",
         dispatch_token_axis,
         factor,
         dispatch_token_axis.saturating_mul(factor),
-        report.disk_headroom,
-        report.configured_max
     );
-    if rc.source == "probe" && rc.effective_cap != dispatch_cap {
-        println!(
-            "  fresh probe suggests: {} (healthy {} × per-token {} = {}) — not yet reflected in \
-             dispatch; if this persists, refresh with `loom-daemon tokens check --ranking`.",
-            rc.effective_cap,
-            rc.token_axis_limit,
-            factor,
-            rc.token_axis_limit.saturating_mul(factor)
-        );
-    }
     // Host CPU OBSERVATION (#3978 AC4; measured-idle signal #4031) — since
     // #4512 this is deliberately NOT a cap term: it is the evidence an operator
     // uses to decide whether this machine's `maxConcurrent` should go up (host
@@ -776,16 +1005,29 @@ pub(crate) fn print_status_human(
     // the daemon itself used, which previously let "not capacity-bound" print
     // even while the daemon's real (lower) cap was already saturated.
     let capacity_bound = report.in_flight.len() >= dispatch_cap;
-    // #4344: the daemon's own dispatch decision reads 0 healthy accounts while
-    // a fresher probe (or the raw pool) shows real capacity — the exact
-    // wedge this issue exists for. When this holds, promote the diagnosis to
-    // the headline and suppress the misleading "limiter is work availability"
-    // line below (the limiter is unmistakably the token term: `0 × per-token
-    // = 0`).
-    let dispatch_starved_but_disagrees = report.capacity.ranking_present
-        && report.capacity.healthy_accounts == 0
-        && rc.ranking_present
-        && rc.healthy > 0;
+    // #4344, re-scoped by #5270/#5305: this used to mean "the token term is
+    // starving *dispatch itself*" — true pre-#5270, when the token axis was
+    // part of `dynamic_cap`. Since #5270 that is no longer possible on any
+    // auth path: `dynamic_cap` is `min(disk, ram, configured_max)` with no
+    // token term. #5304 hard-coded this to `false` to reflect that, which
+    // also silenced the underlying ranking-divergence detection entirely
+    // (#4344's original point) — the daemon's *own* `.ranking` read can still
+    // disagree with a fresher probe/ranking even though it no longer affects
+    // the cap. #5305 restores the detection: it now means the daemon's own
+    // spawn-time account **selection** will read 0/N healthy from a stale
+    // `.ranking`, while a fresher read (probe or re-check) shows real
+    // capacity — connects to #5269/#5283's per-repo ranking-staleness
+    // surfacing on `loom-daemon health`, this is the `status`-side
+    // counterpart.
+    let dispatch_starved_but_disagrees = ranking_diverges_from_starvation(report, &rc);
+    // #4903: while the saturation admission brake is holding, "the limiter is
+    // work availability" is flatly wrong and is the exact misread the issue was
+    // filed on — a worker at 12× overcommit rendered as an idle host with nine
+    // free slots. The limiter is the HOST. Print the brake's diagnosis in place
+    // of the generic line (the same suppression shape #4386 uses for the
+    // pre-flight tripwire), so an operator reading the capacity block top-to-
+    // bottom cannot miss it.
+    let saturation_note: Option<String> = saturation_hold_note(report, dispatch_cap);
     if rc.ranking_present {
         let src = if rc.source == "probe" {
             "live probe: loom-daemon tokens check --json"
@@ -797,19 +1039,23 @@ pub(crate) fn print_status_human(
             rc.healthy, rc.total, rc.exhausted
         );
         if dispatch_starved_but_disagrees {
-            // Headline promotion (#4344, was a small-print "note" pre-fix):
-            // the daemon's own dispatch decision is starved at 0 healthy
-            // accounts while the number above disagrees — dispatch will not
-            // resume until the ranking the daemon actually reads is fresh.
+            // Headline promotion (#4344, re-scoped by #5305 for #5270): the
+            // daemon's own `.ranking` read is starved at 0 healthy accounts
+            // while the number above disagrees. The dynamic concurrency cap
+            // itself is unaffected (#5270 — no token term on any auth path),
+            // but every spawn this daemon dispatches still picks its account
+            // from that same stale `.ranking` file, so account selection will
+            // keep failing until it is refreshed.
             let pool_display = report
                 .token_pool_dir
                 .as_ref()
                 .map_or_else(|| "(unknown pool dir)".to_string(), |d| d.display().to_string());
             println!(
-                "  \u{26a0} DISPATCH IS TOKEN-STARVED: the daemon's own ranking read shows \
-                 0/{} healthy (dispatch cap {dispatch_cap}), disagreeing with the {} healthy \
-                 shown above from {pool_display}. The token term is the limiter — refresh the \
-                 ranking with `loom-daemon tokens check --ranking` (or wait for the next self-refresh).",
+                "  \u{26a0} SPAWN SELECTION IS TOKEN-STARVED: the daemon's own ranking read shows \
+                 0/{} healthy, disagreeing with the {} healthy shown above from {pool_display}. \
+                 The concurrency cap ({dispatch_cap}) is unaffected (#5270), but every spawn still \
+                 picks its account from that stale ranking and will fail selection — refresh it \
+                 with `loom-daemon tokens check --ranking` (or wait for the next self-refresh).",
                 report.capacity.total_accounts, rc.healthy,
             );
         } else if rc.source == "probe"
@@ -826,12 +1072,11 @@ pub(crate) fn print_status_human(
                 report.capacity.healthy_accounts
             );
         }
-        // #4344: when the daemon's own dispatch decision is unambiguously
-        // token-starved (see above), never print "the limiter is work
+        // #4344: when the daemon's own ranking read is unambiguously
+        // starved (see above), never print "the limiter is work
         // availability" — the headline diagnosis already named the real
-        // limiter, and running the generic capacity_bound/token_bound chain
-        // underneath it would contradict it (e.g. `capacity_bound` is
-        // trivially true against a dispatch cap of 0).
+        // problem, and running the generic capacity_bound/token_bound chain
+        // underneath it would contradict it.
         if !dispatch_starved_but_disagrees {
             if !capacity_bound {
                 // In-flight is below the cap: nothing is binding. Naming tokens
@@ -847,29 +1092,30 @@ pub(crate) fn print_status_human(
                 // than "everything is crashing." The warning printed above
                 // already names the real cause, so suppress this line rather
                 // than let it stand uncontested.
-                if !report.preflight_advisory_active {
+                if let Some(note) = &saturation_note {
+                    // #4903: the host, not work availability, is the limiter.
+                    println!("{note}");
+                } else if !report.preflight_advisory_active {
                     println!(
                         "  not capacity-bound ({} in flight, cap {dispatch_cap} — the limiter is \
-                         work availability, not tokens/disk/CPU)",
+                         work availability, not disk/RAM/CPU)",
                         report.in_flight.len(),
                     );
                 }
             } else if rc.token_bound {
-                if rc.healthy == 0 {
-                    println!(
-                        "  token-bound: NO healthy accounts — new dispatch deferred until \
-                         capacity returns. Add accounts (~/.claude-monitor/accounts.env + \
-                         `loom-daemon tokens bootstrap`) or buy API credits, then `loom-daemon tokens check \
-                         --ranking`."
-                    );
-                } else {
-                    println!(
-                        "  token-bound: tokens are the binding constraint on throughput. Add \
-                         accounts or API credits to dispatch more concurrently."
-                    );
-                }
+                // #5305: `token_bound` means genuine starvation (zero healthy
+                // accounts) — since #5270 the concurrency cap itself is
+                // unaffected (it's `min(disk, ram, configured_max)`, no token
+                // term), but with zero healthy accounts every spawn will
+                // still fail account selection at dispatch time.
+                println!(
+                    "  token-bound: NO healthy accounts — the concurrency cap is unaffected \
+                     (#5270), but every spawn will fail account selection until capacity \
+                     returns. Add accounts (~/.claude-monitor/accounts.env + `loom-daemon tokens \
+                     bootstrap`) or buy API credits, then `loom-daemon tokens check --ranking`."
+                );
             } else {
-                println!("  not token-bound (tokens are not the current bottleneck)");
+                println!("  not token-bound (healthy accounts available for selection)");
             }
         }
     } else {
@@ -878,15 +1124,20 @@ pub(crate) fn print_status_human(
              health basis)",
             report.token_pool_size
         );
-        if !capacity_bound && !report.preflight_advisory_active {
-            // #4386: same suppression as the ranking-present branch above —
-            // the warning printed at the top of `status` already names the
-            // real cause while the tripwire is active.
-            println!(
-                "  not capacity-bound ({} in flight, cap {dispatch_cap} — the limiter is work \
-                 availability, not tokens/disk/CPU)",
-                report.in_flight.len(),
-            );
+        if !capacity_bound {
+            if let Some(note) = &saturation_note {
+                // #4903: same substitution as the ranking-present branch above.
+                println!("{note}");
+            } else if !report.preflight_advisory_active {
+                // #4386: same suppression as the ranking-present branch above —
+                // the warning printed at the top of `status` already names the
+                // real cause while the tripwire is active.
+                println!(
+                    "  not capacity-bound ({} in flight, cap {dispatch_cap} — the limiter is work \
+                     availability, not tokens/disk/CPU)",
+                    report.in_flight.len(),
+                );
+            }
         }
     }
 
@@ -976,6 +1227,17 @@ pub(crate) fn print_status_human(
             println!("Safehouse:     unknown (older daemon binary — restart to pick up #4345)")
         }
     }
+
+    // Telemetry export liveness (#5083): the positive counterpart to the
+    // host-id mismatch WARNING printed further up. Before this, "exporting
+    // fine", "observability disabled", and "configured but silently never
+    // exported" were all rendered as the same thing — nothing — and telling
+    // them apart meant grepping `daemon.log` for the *absence* of a warning.
+    // Same shape as the Safehouse block above, for the same reason.
+    println!(
+        "{}",
+        render_observability_line(report.observability_export.as_ref(), Utc::now())
+    );
 
     // Watchdog protection state (#4354): this daemon is answering, so it is
     // alive — but is anything positioned to notice when it *stops* being? Before
@@ -1110,6 +1372,17 @@ pub(crate) fn print_status_human(
             }
             other => println!("Host breaker: {other}"),
         }
+    }
+
+    // Saturation admission brake (#4903): a host that is holding new admissions
+    // because it is already saturated must SAY so. Before this line, a worker at
+    // 12× overcommit rendered as "3 sweeps, not capacity-bound" — visually
+    // indistinguishable from an idle host with free slots. Printed immediately
+    // after the host breaker so the two load-aware guards read together, and
+    // always stating that in-flight work is untouched (the operator's next
+    // question).
+    if let Some(line) = render_admission_brake_line(report) {
+        println!("{line}");
     }
 
     // GitHub rate-limit circuit breaker (#4429): one line while Closed, a
@@ -1644,6 +1917,125 @@ mod status_render_tests {
 }
 
 #[cfg(test)]
+mod token_starvation_render_tests {
+    //! #5305: PR #5304 removed the token axis from the admission cap (#5270)
+    //! but, in the process, over-removed two *signals* rather than
+    //! re-scoping them: `resolve_capacity`'s fresh-probe branch hardcoded
+    //! `token_bound: false`, and the #4344 ranking-divergence detection
+    //! (`ranking_diverges_from_starvation`, née `dispatch_starved_but_disagrees`)
+    //! was hardcoded to `false` outright. Both must be reachable again —
+    //! `token_bound` meaning genuine starvation (zero healthy accounts), not
+    //! "tokens bind the cap."
+    use super::{ranking_diverges_from_starvation, resolve_capacity};
+    use crate::cli::status::status_client_tests::sample_report;
+    use loom_daemon::types::CapacityReport;
+
+    #[test]
+    fn resolve_capacity_probe_tier_reports_token_bound_on_zero_healthy() {
+        let report = sample_report();
+        let usage = serde_json::json!({
+            "accounts": [
+                {"status": "exhausted", "7d_utilization": 0.99},
+                {"status": "blocked", "7d_utilization": 0.99},
+            ]
+        });
+        let rc = resolve_capacity(&report, Some(&usage));
+        assert_eq!(rc.source, "probe");
+        assert_eq!(rc.healthy, 0);
+        assert!(
+            rc.token_bound,
+            "a fresh probe with 0 healthy accounts must report starvation, \
+             not the #5304 hardcoded `false`"
+        );
+    }
+
+    #[test]
+    fn resolve_capacity_probe_tier_not_token_bound_when_any_account_healthy() {
+        let report = sample_report();
+        let usage = serde_json::json!({
+            "accounts": [
+                {"status": "available", "7d_utilization": 0.1},
+                {"status": "exhausted", "7d_utilization": 0.99},
+            ]
+        });
+        let rc = resolve_capacity(&report, Some(&usage));
+        assert_eq!(rc.source, "probe");
+        assert_eq!(rc.healthy, 1);
+        assert!(!rc.token_bound, "one healthy account remains ⇒ not starved");
+    }
+
+    #[test]
+    fn ranking_diverges_when_daemons_own_ranking_is_starved_but_probe_is_fresh() {
+        let mut report = sample_report();
+        report.capacity = CapacityReport {
+            ranking_present: true,
+            total_accounts: 3,
+            healthy_accounts: 0,
+            exhausted_accounts: 3,
+            token_axis_limit: 0,
+            token_bound: true,
+        };
+        let usage = serde_json::json!({
+            "accounts": [
+                {"status": "available", "7d_utilization": 0.1},
+                {"status": "exhausted", "7d_utilization": 0.99},
+                {"status": "exhausted", "7d_utilization": 0.99},
+            ]
+        });
+        let rc = resolve_capacity(&report, Some(&usage));
+        assert_eq!(rc.healthy, 1, "the fresher probe sees one healthy account");
+        assert!(
+            ranking_diverges_from_starvation(&report, &rc),
+            "daemon's own ranking reads 0 healthy while a fresher probe disagrees"
+        );
+    }
+
+    #[test]
+    fn ranking_does_not_diverge_when_both_agree_or_daemon_has_capacity() {
+        // Daemon's own ranking already shows healthy accounts ⇒ no divergence
+        // to report, regardless of what a fresh probe shows.
+        let mut report = sample_report();
+        report.capacity = CapacityReport {
+            ranking_present: true,
+            total_accounts: 3,
+            healthy_accounts: 2,
+            exhausted_accounts: 1,
+            token_axis_limit: 2,
+            token_bound: false,
+        };
+        let usage = serde_json::json!({
+            "accounts": [
+                {"status": "available", "7d_utilization": 0.1},
+                {"status": "available", "7d_utilization": 0.1},
+            ]
+        });
+        let rc = resolve_capacity(&report, Some(&usage));
+        assert!(!ranking_diverges_from_starvation(&report, &rc));
+
+        // Both the daemon's own ranking AND the fresh probe agree on
+        // starvation ⇒ no *disagreement* to headline (the plain "NO healthy
+        // accounts" guidance branch handles this case instead).
+        let mut starved_report = sample_report();
+        starved_report.capacity = CapacityReport {
+            ranking_present: true,
+            total_accounts: 3,
+            healthy_accounts: 0,
+            exhausted_accounts: 3,
+            token_axis_limit: 0,
+            token_bound: true,
+        };
+        let starved_usage = serde_json::json!({
+            "accounts": [
+                {"status": "exhausted", "7d_utilization": 0.99},
+                {"status": "exhausted", "7d_utilization": 0.99},
+            ]
+        });
+        let rc = resolve_capacity(&starved_report, Some(&starved_usage));
+        assert!(!ranking_diverges_from_starvation(&starved_report, &rc));
+    }
+}
+
+#[cfg(test)]
 mod in_flight_repo_column_tests {
     //! The in-flight table's `REPO` column (#4698): five different managed
     //! repos' small issue numbers (each repo's own `#3`/`#4`/`#6`) used to
@@ -1660,6 +2052,7 @@ mod in_flight_repo_column_tests {
     /// `mk()` helper pattern used by `sweep_registry.rs`'s own tests.
     fn mk(issue: u32, repo: Option<&str>) -> SweepInfo {
         SweepInfo {
+            pgid: None,
             sweep_id: format!("s{issue}"),
             kind: SweepKind::Issue(issue),
             pid: 4242,
@@ -1761,8 +2154,9 @@ mod status_protection_tests {
     //! (#4069): the reachable payload carries `protection` and never
     //! `install_state`, and `protection` is wire-compatible-nullable so a host
     //! where no loom dir resolves still emits a well-formed payload.
-    use super::build_status_json_value;
+    use super::{build_status_json_value, render_observability_line};
     use crate::cli::status::status_client_tests::sample_report;
+    use chrono::{DateTime, Utc};
     use loom_daemon::daemon_install_state::{ProtectionReport, ProtectionState, WatchdogJob};
     use std::path::PathBuf;
 
@@ -1881,6 +2275,143 @@ mod status_protection_tests {
         assert!(m["first_seen_at"].is_string());
     }
 
+    // ===================================================================
+    // Telemetry export liveness (#5083)
+    // ===================================================================
+
+    fn render_now() -> DateTime<Utc> {
+        "2026-08-03T12:00:00Z".parse().unwrap()
+    }
+
+    /// A running HTTPS exporter, up four hours, that has never been touched by
+    /// a flush attempt — the base the individual states mutate from.
+    fn export_status(
+        mutate: impl FnOnce(&mut loom_daemon::types::ObservabilityExportStatus),
+    ) -> loom_daemon::types::ObservabilityExportStatus {
+        let mut status = loom_daemon::types::ObservabilityExportStatus {
+            state: loom_daemon::types::ObservabilityExportState::Starting,
+            host_id: Some("robb-studio".to_string()),
+            ingest_host_id: None,
+            endpoint: Some("https://dashboard.example/ingest".to_string()),
+            exporter: Some("https".to_string()),
+            started_at: Some(render_now() - chrono::Duration::hours(4)),
+            last_success_at: None,
+            last_failure_at: None,
+            last_failure_detail: None,
+            records_exported: 0,
+            consecutive_failures: 0,
+            flush_interval_secs: Some(30),
+        };
+        mutate(&mut status);
+        status
+    }
+
+    #[test]
+    fn observability_line_states_health_positively_with_the_host_id() {
+        // AC1: an operator can confirm telemetry is flowing, and under which
+        // host_id, without reading logs.
+        let status = export_status(|e| {
+            e.last_success_at = Some(render_now() - chrono::Duration::seconds(12));
+            e.records_exported = 3481;
+        });
+        let line = render_observability_line(Some(&status), render_now());
+        assert!(line.starts_with("Observability: OK"), "{line}");
+        assert!(line.contains("12s ago"), "{line}");
+        assert!(line.contains("host_id=robb-studio"), "{line}");
+        assert!(line.contains("3481 record(s)"), "{line}");
+    }
+
+    #[test]
+    fn observability_line_distinguishes_disabled_from_healthy() {
+        // AC2: a host with observability disabled must not read like a healthy
+        // one (before #5083 both rendered as nothing at all).
+        let disabled = render_observability_line(
+            Some(&loom_daemon::types::ObservabilityExportStatus::disabled()),
+            render_now(),
+        );
+        assert!(disabled.contains("disabled"), "{disabled}");
+        assert!(!disabled.contains("OK"), "{disabled}");
+    }
+
+    #[test]
+    fn observability_line_surfaces_never_exported_as_a_problem() {
+        // AC3: the silent failure mode — configured, running for hours, and
+        // nothing has ever landed.
+        let line = render_observability_line(Some(&export_status(|_| {})), render_now());
+        assert!(line.contains("NEVER EXPORTED"), "{line}");
+        assert!(line.contains("host_id=robb-studio"), "{line}");
+        assert!(line.contains("dashboard.example"), "{line}");
+    }
+
+    #[test]
+    fn observability_line_does_not_alarm_during_the_startup_grace_window() {
+        // A daemon rolled 20 seconds ago must not read as broken.
+        let status = export_status(|e| {
+            e.started_at = Some(render_now() - chrono::Duration::seconds(20));
+        });
+        let line = render_observability_line(Some(&status), render_now());
+        assert!(line.contains("starting"), "{line}");
+        assert!(!line.contains("NEVER EXPORTED"), "{line}");
+    }
+
+    #[test]
+    fn observability_line_reports_a_failing_exporter_with_its_error() {
+        let status = export_status(|e| {
+            e.last_success_at = Some(render_now() - chrono::Duration::hours(2));
+            e.consecutive_failures = 4;
+            e.last_failure_detail = Some("sink rejected batch: HTTP 401 — denied".to_string());
+        });
+        let line = render_observability_line(Some(&status), render_now());
+        assert!(line.contains("FAILING"), "{line}");
+        assert!(line.contains("HTTP 401"), "{line}");
+        assert!(line.contains("2h ago"), "{line}");
+    }
+
+    #[test]
+    fn observability_line_names_both_identities_on_a_mismatch() {
+        let status = export_status(|e| {
+            e.last_success_at = Some(render_now() - chrono::Duration::seconds(12));
+            e.ingest_host_id = Some("robb-pro".to_string());
+            e.records_exported = 77;
+        });
+        let line = render_observability_line(Some(&status), render_now());
+        assert!(line.contains("HOST-ID MISMATCH"), "{line}");
+        assert!(line.contains("robb-pro") && line.contains("robb-studio"), "{line}");
+    }
+
+    #[test]
+    fn observability_line_from_an_older_daemon_is_unknown_not_disabled() {
+        // A `None` field means the daemon could not answer — reporting it as
+        // "disabled" would invent a fact about a daemon that said nothing.
+        let line = render_observability_line(None, render_now());
+        assert!(line.contains("unknown"), "{line}");
+        assert!(line.contains("older daemon binary"), "{line}");
+    }
+
+    #[test]
+    fn observability_export_is_machine_readable_in_json() {
+        // AC5: a watch loop asserts on the state string directly.
+        let mut report = sample_report();
+        report.observability_export = Some(export_status(|e| {
+            e.last_success_at = Some(chrono::Utc::now());
+            e.records_exported = 12;
+            e.state = loom_daemon::types::ObservabilityExportState::Healthy;
+        }));
+        let value = build_status_json_value(&report, None, &no_update(), None, None);
+        let e = &value["observability_export"];
+        assert_eq!(e["state"], "healthy");
+        assert_eq!(e["host_id"], "robb-studio");
+        assert_eq!(e["records_exported"], 12);
+        assert_eq!(e["endpoint"], "https://dashboard.example/ingest");
+        assert!(e["last_success_at"].is_string());
+    }
+
+    #[test]
+    fn observability_export_is_null_for_a_pre_5083_daemon() {
+        let value = build_status_json_value(&sample_report(), None, &no_update(), None, None);
+        assert!(value["observability_export"].is_null());
+    }
+
     #[test]
     fn protection_is_null_when_no_report_could_be_built() {
         // No loom dir resolvable ⇒ the field is present but null, so the payload
@@ -1978,5 +2509,279 @@ mod status_protection_tests {
         );
         assert!(value["work_finder"]["enabled"].is_null());
         assert_eq!(value["protection"]["autonomy_mismatch"], false);
+    }
+}
+
+#[cfg(test)]
+mod admission_brake_render_tests {
+    //! Saturation admission-brake surfacing (#4903, AC4).
+    //!
+    //! The reporting half of the issue: `loom-worker-1` sat at 12× overcommit
+    //! and `loom-daemon status` said `capacity_bound: false` — "3 sweeps, cap
+    //! 12, the limiter is work availability" — which is indistinguishable from
+    //! an idle host with nine free slots. These tests pin that a holding host
+    //! *says so*, on both the human and `--json` surfaces, and that a healthy
+    //! host's output is unchanged.
+    use super::{build_status_json_value, render_admission_brake_line, saturation_hold_note};
+    use crate::cli::status::status_client_tests::sample_report;
+    use chrono::Utc;
+    use loom_daemon::self_update::SelfUpdateStatus;
+    use loom_daemon::types::{AdmissionBrakeStatus, DaemonStatusReport};
+
+    fn no_update() -> SelfUpdateStatus {
+        SelfUpdateStatus {
+            built_commit: "abc".to_string(),
+            source_commit: None,
+            update_available: None,
+        }
+    }
+
+    fn brake(enabled: bool, held: bool, load: Option<f64>) -> AdmissionBrakeStatus {
+        AdmissionBrakeStatus {
+            enabled,
+            held,
+            load_per_core: load,
+            load_per_core_threshold: 4.0,
+            held_since: held.then(|| Utc::now() - chrono::Duration::seconds(120)),
+            held_ticks: u32::from(held) * 2,
+        }
+    }
+
+    fn report_with(brake: Option<AdmissionBrakeStatus>) -> DaemonStatusReport {
+        let mut r = sample_report();
+        r.admission_brake = brake;
+        r
+    }
+
+    // ---- human surface -----------------------------------------------------
+
+    #[test]
+    fn a_holding_host_says_so_instead_of_looking_idle() {
+        let note = saturation_hold_note(&report_with(Some(brake(true, true, Some(11.91)))), 12)
+            .expect("a holding brake must produce the substitute line");
+        assert!(note.contains("ADMISSION BRAKE HOLDING"), "got: {note}");
+        assert!(note.contains("11.91"), "the measured load must be shown: {note}");
+        assert!(
+            note.contains("the limiter is the HOST, not work availability"),
+            "the misleading diagnosis must be actively contradicted: {note}"
+        );
+        assert!(
+            note.contains("in-flight sweeps are untouched"),
+            "the operator's next question must be answered inline: {note}"
+        );
+    }
+
+    #[test]
+    fn a_healthy_host_keeps_the_generic_capacity_line() {
+        // AC3's reporting half: not holding ⇒ no substitution, so the pre-#4903
+        // "limiter is work availability" line still prints unchanged.
+        assert!(
+            saturation_hold_note(&report_with(Some(brake(true, false, Some(0.4)))), 12).is_none()
+        );
+        assert!(
+            saturation_hold_note(&report_with(Some(brake(false, true, Some(11.9)))), 12).is_none()
+        );
+        assert!(saturation_hold_note(&report_with(None), 12).is_none());
+    }
+
+    #[test]
+    fn brake_line_reports_held_ok_and_disabled_distinctly() {
+        let holding =
+            render_admission_brake_line(&report_with(Some(brake(true, true, Some(11.91)))))
+                .expect("line");
+        assert!(holding.starts_with("Admission brake: HOLDING"), "got: {holding}");
+        assert!(holding.contains("2 tick(s)"), "got: {holding}");
+
+        let ok = render_admission_brake_line(&report_with(Some(brake(true, false, Some(0.42)))))
+            .expect("line");
+        assert!(ok.starts_with("Admission brake: OK"), "got: {ok}");
+        assert!(ok.contains("0.42"), "got: {ok}");
+
+        let off = render_admission_brake_line(&report_with(Some(brake(false, false, None))))
+            .expect("line");
+        assert_eq!(off, "Admission brake: disabled");
+    }
+
+    #[test]
+    fn absent_brake_renders_nothing_at_all() {
+        // A pre-#4903 daemon reports `None`; the renderer must stay silent
+        // rather than invent a "brake OK" claim it has no evidence for.
+        assert!(render_admission_brake_line(&report_with(None)).is_none());
+    }
+
+    #[test]
+    fn missing_load_reading_renders_as_na_not_zero() {
+        let ok = render_admission_brake_line(&report_with(Some(brake(true, false, None))))
+            .expect("line");
+        assert!(ok.contains("n/a"), "absent evidence must not render as 0.00: {ok}");
+    }
+
+    // ---- --json surface ----------------------------------------------------
+
+    #[test]
+    fn json_carries_the_brake_hold_state() {
+        let value = build_status_json_value(
+            &report_with(Some(brake(true, true, Some(11.91)))),
+            None,
+            &no_update(),
+            None,
+            None,
+        );
+        let b = &value["admission_brake"];
+        assert_eq!(b["enabled"], true);
+        assert_eq!(b["held"], true);
+        assert_eq!(b["load_per_core_threshold"], 4.0);
+        assert_eq!(b["held_ticks"], 2);
+        assert!(b["held_since"].is_string());
+    }
+
+    #[test]
+    fn json_brake_is_null_when_no_brake_is_registered() {
+        let value = build_status_json_value(&report_with(None), None, &no_update(), None, None);
+        assert!(value["admission_brake"].is_null());
+    }
+
+    #[test]
+    fn admission_brake_field_survives_a_wire_round_trip_and_older_payloads() {
+        // Forward-compat contract: an absent field (pre-#4903 daemon) parses as
+        // `None`, never as a fabricated "not holding" brake.
+        let report = report_with(Some(brake(true, true, Some(11.91))));
+        let json = serde_json::to_string(&report).expect("serialize");
+        let back: DaemonStatusReport = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.admission_brake, report.admission_brake);
+
+        let mut stripped: serde_json::Value = serde_json::from_str(&json).expect("value");
+        stripped
+            .as_object_mut()
+            .expect("object")
+            .remove("admission_brake");
+        let older: DaemonStatusReport =
+            serde_json::from_value(stripped).expect("pre-#4903 payload must still parse");
+        assert!(older.admission_brake.is_none());
+    }
+}
+
+#[cfg(test)]
+mod preflight_advisory_render_tests {
+    //! Issue #5029: the pre-flight-death advisory (#4386) has no freshness
+    //! signal and is scoped to a single workspace with no way to tell which
+    //! one from the rendered text alone. These tests pin the display-only fix
+    //! — an "as of" freshness suffix on the human line, the timestamp on the
+    //! `--json` surface, and forward/backward wire compatibility — without
+    //! touching the trip/clear decision logic itself.
+    use super::{build_status_json_value, render_preflight_advisory_line};
+    use crate::cli::status::status_client_tests::sample_report;
+    use chrono::Utc;
+    use loom_daemon::self_update::SelfUpdateStatus;
+    use loom_daemon::types::DaemonStatusReport;
+
+    fn no_update() -> SelfUpdateStatus {
+        SelfUpdateStatus {
+            built_commit: "abc".to_string(),
+            source_commit: None,
+            update_available: None,
+        }
+    }
+
+    fn report_with(
+        active: bool,
+        message: Option<&str>,
+        changed_at: Option<chrono::DateTime<Utc>>,
+    ) -> DaemonStatusReport {
+        let mut r = sample_report();
+        r.preflight_advisory_active = active;
+        r.preflight_advisory_message = message.map(ToString::to_string);
+        r.preflight_advisory_changed_at = changed_at;
+        r
+    }
+
+    // ---- human surface -----------------------------------------------------
+
+    #[test]
+    fn active_advisory_renders_with_a_freshness_suffix() {
+        let ts = Utc::now() - chrono::Duration::seconds(42);
+        let report = report_with(
+            true,
+            Some("WARNING: last 3 dispatches died at claude-wrapper pre-flight (x) — check .mcp.json [workspace: /repos/loom]"),
+            Some(ts),
+        );
+        let line = render_preflight_advisory_line(&report).expect("active advisory renders a line");
+        assert!(line.contains("WARNING: last 3 dispatches"), "got: {line}");
+        assert!(
+            line.contains("workspace: /repos/loom"),
+            "the rendered line must name the scoped workspace: {line}"
+        );
+        assert!(
+            line.contains("as of") && line.contains("ago"),
+            "the rendered line must carry a freshness indicator: {line}"
+        );
+    }
+
+    #[test]
+    fn active_advisory_without_a_timestamp_renders_the_message_unchanged() {
+        // Forward-compat: an older daemon binary that never populated the new
+        // field must still render the bare message, not a "None"/error text.
+        let report = report_with(true, Some("WARNING: still dying"), None);
+        let line = render_preflight_advisory_line(&report).expect("line");
+        assert_eq!(line, "WARNING: still dying");
+    }
+
+    #[test]
+    fn inactive_advisory_renders_nothing() {
+        assert!(render_preflight_advisory_line(&report_with(false, None, None)).is_none());
+        // Defensive: `active` true with no message must not panic or fabricate
+        // a line — should not happen in practice, but stay silent rather than
+        // render a garbage string.
+        assert!(
+            render_preflight_advisory_line(&report_with(true, None, Some(Utc::now()))).is_none()
+        );
+    }
+
+    // ---- --json surface ----------------------------------------------------
+
+    #[test]
+    fn json_carries_the_advisory_timestamp() {
+        let ts = Utc::now() - chrono::Duration::seconds(7);
+        let value = build_status_json_value(
+            &report_with(true, Some("WARNING: x"), Some(ts)),
+            None,
+            &no_update(),
+            None,
+            None,
+        );
+        assert_eq!(value["preflight_advisory_active"], true);
+        assert!(value["preflight_advisory_changed_at"].is_string());
+    }
+
+    #[test]
+    fn json_advisory_timestamp_is_null_when_absent() {
+        let value = build_status_json_value(
+            &report_with(false, None, None),
+            None,
+            &no_update(),
+            None,
+            None,
+        );
+        assert!(value["preflight_advisory_changed_at"].is_null());
+    }
+
+    #[test]
+    fn advisory_timestamp_survives_a_wire_round_trip_and_older_payloads() {
+        let ts = Utc::now() - chrono::Duration::seconds(5);
+        let report = report_with(true, Some("WARNING: x"), Some(ts));
+        let json = serde_json::to_string(&report).expect("serialize");
+        let back: DaemonStatusReport = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.preflight_advisory_changed_at, report.preflight_advisory_changed_at);
+
+        // Forward-compat: an absent field (pre-#5029 daemon) parses as `None`,
+        // never a fabricated/default timestamp.
+        let mut stripped: serde_json::Value = serde_json::from_str(&json).expect("value");
+        stripped
+            .as_object_mut()
+            .expect("object")
+            .remove("preflight_advisory_changed_at");
+        let older: DaemonStatusReport =
+            serde_json::from_value(stripped).expect("pre-#5029 payload must still parse");
+        assert!(older.preflight_advisory_changed_at.is_none());
     }
 }

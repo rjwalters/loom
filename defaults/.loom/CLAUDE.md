@@ -110,10 +110,10 @@ generate its own work when enabled. Start/stop it with the wrapper scripts:
 
 ### 5. Scheduled Support Roles
 
-Run the periodic support roles (Champion, Curator, Judge, Auditor, Guide) via
-the daemon-native role runner: `autonomous.roleRunner.enabled=true` in
-`.loom/config.json` (preferred — dispatches host-side via `spawn-claude.sh` on
-the same rotated token pool sweeps use) or the `.loom/bin/loom` tmux pool
+Run the periodic support roles (Champion, Curator, Judge, Doctor, Auditor,
+Guide) via the daemon-native role runner: `autonomous.roleRunner.enabled=true`
+in `.loom/config.json` (preferred — dispatches host-side via `spawn-claude.sh`
+on the same rotated token pool sweeps use) or the `.loom/bin/loom` tmux pool
 above. See [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md)
 for the full autonomous config surface and event taxonomy.
 
@@ -127,7 +127,7 @@ for the full autonomous config surface and event taxonomy.
 | Curator | `curator.md` | Enhance and organize issues | Manual / role runner |
 | Architect | `architect.md` | Create architectural proposals | Manual |
 | Hermit | `hermit.md` | Identify simplification opportunities | Manual |
-| Doctor | `doctor.md` | Fix bugs and address PR feedback | Manual |
+| Doctor | `doctor.md` | Fix bugs and address PR feedback | Manual / role runner |
 | Guide | `guide.md` | Prioritize and triage issues | Manual / role runner |
 | Driver | `driver.md` | Direct command execution | Manual |
 | Auditor | `auditor.md` | Validate main branch build and runtime | Manual / role runner |
@@ -337,14 +337,19 @@ exits `78` (`EX_CONFIG`). Full reference:
 ## Troubleshooting
 
 See [`.loom/docs/troubleshooting.md`](.loom/docs/troubleshooting.md) for stale
-worktrees, stuck agents, daemon registry/reaper issues, and common fixes. Quick
-fixes:
+worktrees, stuck agents, daemon registry/reaper issues, quarantine safety, and
+common fixes. Quick fixes:
 
 ```bash
 loom-clean --force                              # stale worktrees/branches
 loom-recover-orphans --recover                   # orphaned loom:building issues
 gh label sync --file .github/labels.yml          # re-sync labels
 ```
+
+**Branching does not protect uncommitted edits in the primary clone from
+quarantine** — see [`.loom/docs/troubleshooting.md` → Uncommitted work in the
+primary clone can be quarantined at any
+time](.loom/docs/troubleshooting.md).
 
 CI-specific guidance (headless/non-interactive runs) is in
 [`.loom/docs/ci-integration.md`](.loom/docs/ci-integration.md); tool-use

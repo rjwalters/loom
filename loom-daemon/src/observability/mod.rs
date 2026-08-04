@@ -20,6 +20,15 @@
 //!   with an existing OpenTelemetry stack, selected via
 //!   `observability.exporter = "otlp"` ([`resolve_exporter`]). Off by
 //!   default; [`exporter::HttpsExporter`] stays the default sink.
+//! - [`backfill`] (Issue #5084) — the local `sweep-outcome-telemetry.jsonl`
+//!   journal ([`crate::sweep_outcomes`]) is written unconditionally at every
+//!   sweep's terminal transition, independent of whether [`collector`]'s
+//!   live event-bus pipeline observed it. `backfill` treats that journal as
+//!   the export queue-of-record: it periodically pushes any record the queue
+//!   has not yet been offered onto [`queue::DurableQueue`] alongside a
+//!   synthesized `sweep.completed`, so a sweep adopted across a daemon
+//!   restart (whose dispatch this process never saw) still exports under its
+//!   real `sweep_id` instead of being silently under-counted.
 //!
 //! # Off by default (FLAGS-OFF posture)
 //!
@@ -64,6 +73,7 @@
 //! variant in this module tree names the *file path*, never the key
 //! contents.
 
+pub mod backfill;
 pub mod collector;
 pub mod exporter;
 #[cfg(feature = "otlp")]
@@ -76,6 +86,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::event_bus::EventBus;
+use crate::workspace_pool::WorkspacePool;
 
 use exporter::HttpsExporter;
 use queue::DurableQueue;
@@ -321,6 +332,136 @@ pub fn global_host_id_mismatch() -> Option<crate::types::ObservabilityHostIdMism
     GLOBAL_HOST_ID_STATUS.get().and_then(|s| s.snapshot())
 }
 
+// ============================================================================
+// Export liveness status (Issue #5083)
+// ============================================================================
+
+/// Live record of whether telemetry is actually *reaching* the backend, written
+/// by [`sender::try_flush`] on every attempt and read back by
+/// [`global_export_status`] for `loom-daemon status` / `health`.
+///
+/// The complement to [`HostIdStatus`], which is anomaly-only by design (#4830)
+/// and therefore cannot answer "is it working?" — only "is it working *wrong*
+/// in this one specific way?". This cell is always readable and always has an
+/// answer, including the answer #4830 could never give: *configured, running,
+/// and has never successfully exported anything*.
+///
+/// Unlike [`HostIdStatus`] this is **not** write-once: it is a rolling record,
+/// so `last_success_at` genuinely means "the last time data landed" and a watch
+/// loop can alert on its age.
+#[derive(Debug)]
+pub struct ExportStatus {
+    inner: std::sync::Mutex<crate::types::ObservabilityExportStatus>,
+}
+
+// Allow expect_used: a poisoned status mutex means another thread panicked
+// while holding it — unrecoverable, matching the crash-on-poison policy
+// `HostIdStatus` above (and `auto_update`/`ipc`) already use.
+#[allow(clippy::expect_used)]
+impl ExportStatus {
+    /// A status cell for an exporter that is starting *now* under `host_id`,
+    /// pushing to `endpoint` via `exporter` every `flush_interval_secs`.
+    #[must_use]
+    pub fn started(
+        host_id: &str,
+        endpoint: &str,
+        exporter: &str,
+        flush_interval_secs: u64,
+    ) -> Self {
+        ExportStatus {
+            inner: std::sync::Mutex::new(crate::types::ObservabilityExportStatus {
+                state: crate::types::ObservabilityExportState::Starting,
+                host_id: Some(host_id.to_string()),
+                ingest_host_id: None,
+                endpoint: Some(endpoint.to_string()),
+                exporter: Some(exporter.to_string()),
+                started_at: Some(chrono::Utc::now()),
+                last_success_at: None,
+                last_failure_at: None,
+                last_failure_detail: None,
+                records_exported: 0,
+                consecutive_failures: 0,
+                flush_interval_secs: Some(flush_interval_secs),
+            }),
+        }
+    }
+
+    /// Record `count` envelopes acked by the backend. Clears the consecutive-
+    /// failure run: the transport demonstrably works again.
+    pub fn record_success(&self, count: usize) {
+        let mut guard = self
+            .inner
+            .lock()
+            .expect("observability export status mutex poisoned");
+        guard.last_success_at = Some(chrono::Utc::now());
+        guard.records_exported = guard
+            .records_exported
+            .saturating_add(count.try_into().unwrap_or(u64::MAX));
+        guard.consecutive_failures = 0;
+    }
+
+    /// Record a failed flush attempt. `detail` is the exporter's own error
+    /// text; the previous `last_success_at` is deliberately preserved so the
+    /// surfaces can distinguish "used to work, broke 30s ago" from "never
+    /// worked at all".
+    pub fn record_failure(&self, detail: &str) {
+        let mut guard = self
+            .inner
+            .lock()
+            .expect("observability export status mutex poisoned");
+        guard.last_failure_at = Some(chrono::Utc::now());
+        guard.last_failure_detail = Some(detail.to_string());
+        guard.consecutive_failures = guard.consecutive_failures.saturating_add(1);
+    }
+
+    /// The current record, with [`crate::types::ObservabilityExportStatus::state`]
+    /// re-derived as of now. `ingest_host_id` is folded in from
+    /// [`global_host_id_mismatch`] by [`global_export_status`], not here — this
+    /// cell knows nothing about identity.
+    #[must_use]
+    pub fn snapshot(&self) -> crate::types::ObservabilityExportStatus {
+        let mut snapshot = self
+            .inner
+            .lock()
+            .expect("observability export status mutex poisoned")
+            .clone();
+        snapshot.state = snapshot.classify(chrono::Utc::now());
+        snapshot
+    }
+}
+
+/// Process-global export-status handle, registered by [`spawn_task`] when — and
+/// only when — the exporter actually starts. Unset (observability disabled,
+/// keyless, or under-configured) makes [`global_export_status`] report
+/// [`crate::types::ObservabilityExportStatus::disabled`].
+static GLOBAL_EXPORT_STATUS: std::sync::OnceLock<Arc<ExportStatus>> = std::sync::OnceLock::new();
+
+/// Register the exporter's export-status handle as the process-global.
+/// Idempotent: only the first registration wins (one exporter per process).
+pub fn register_global_export_status(status: Arc<ExportStatus>) {
+    let _ = GLOBAL_EXPORT_STATUS.set(status);
+}
+
+/// This process's export status — **always** an answer, never silence.
+///
+/// Unregistered ⇒ `disabled()` (the exporter never started), which is a
+/// materially different report from the `None` an older daemon binary puts on
+/// the wire. Any confirmed #4830 host-identity mismatch is folded in here as
+/// `ingest_host_id`, so a single field carries the whole state machine and
+/// [`crate::types::ObservabilityExportStatus::classify`] needs no second input.
+#[must_use]
+pub fn global_export_status() -> crate::types::ObservabilityExportStatus {
+    let Some(status) = GLOBAL_EXPORT_STATUS.get() else {
+        return crate::types::ObservabilityExportStatus::disabled();
+    };
+    let mut snapshot = status.snapshot();
+    if let Some(mismatch) = global_host_id_mismatch() {
+        snapshot.ingest_host_id = Some(mismatch.ingest_host_id);
+    }
+    snapshot.state = snapshot.classify(chrono::Utc::now());
+    snapshot
+}
+
 /// **env > config > default** ([`ExporterKind::Https`]). An unrecognized
 /// value at either tier (anything but a case-insensitive `"https"` or
 /// `"otlp"`) is logged and degrades to the default, the same "malformed
@@ -374,12 +515,19 @@ fn read_ingest_key(path: &str) -> Option<String> {
 /// (e.g. after a slow credential-preflight step), `uptime_sec` under-reports
 /// by that startup delay — an accepted approximation for Phase 1 host-health
 /// telemetry, not a correctness requirement of the exporter itself.
+///
+/// `workspace_pool` (Issue #4955) is the daemon's shared per-workspace
+/// [`SweepRegistry`](crate::sweep_registry::SweepRegistry) pool, threaded
+/// through to [`collector::spawn_task`] so `host.health`'s
+/// `active_sweep_ids` reports this host's authoritative in-flight sweep-id
+/// set (`collector::collect_active_sweep_ids`, private to that module).
 #[must_use]
 pub fn spawn_task(
     config: &ObservabilityConfig,
     workspace_root: PathBuf,
     bus: &EventBus,
     daemon_started_at: Instant,
+    workspace_pool: Arc<WorkspacePool>,
 ) -> Option<Vec<tokio::task::JoinHandle<()>>> {
     if !resolve_enabled(config) {
         log::debug!("observability: disabled (set observability.enabled=true to opt in)");
@@ -420,6 +568,22 @@ pub fn spawn_task(
     );
     let queue = Arc::new(DurableQueue::open(queue_path, capacity));
 
+    // Export-liveness status (Issue #5083). Created here — where the endpoint,
+    // host id, exporter kind and cadence are all resolved — but registered as
+    // the process-global only *after* the exporter has actually been
+    // constructed below, so the degrade-to-disabled paths (HTTPS client
+    // construction failure, `otlp` without the feature) keep reporting
+    // `disabled` rather than a phantom running exporter.
+    let export_status = Arc::new(ExportStatus::started(
+        &host_id,
+        &endpoint,
+        match exporter_kind {
+            ExporterKind::Https => "https",
+            ExporterKind::Otlp => "otlp",
+        },
+        flush_interval.as_secs(),
+    ));
+
     let collector_handle = collector::spawn_task(
         bus,
         queue.clone(),
@@ -427,6 +591,7 @@ pub fn spawn_task(
         host_id.clone(),
         SNAPSHOT_INTERVAL,
         daemon_started_at,
+        workspace_pool,
     );
     // The two branches below construct different concrete `E: Exporter`
     // types and each call `sender::spawn_task` with their own — no
@@ -460,7 +625,7 @@ pub fn spawn_task(
                     return None;
                 }
             };
-            sender::spawn_task(queue, exporter, batch_size, flush_interval)
+            sender::spawn_task(queue, exporter, batch_size, flush_interval, export_status.clone())
         }
         ExporterKind::Otlp => {
             // No `HostIdStatus` wiring here, deliberately (Issue #4830 vs.
@@ -496,7 +661,13 @@ pub fn spawn_task(
                         return None;
                     }
                 };
-                sender::spawn_task(queue, exporter, batch_size, flush_interval)
+                sender::spawn_task(
+                    queue,
+                    exporter,
+                    batch_size,
+                    flush_interval,
+                    export_status.clone(),
+                )
             }
             #[cfg(not(feature = "otlp"))]
             {
@@ -508,6 +679,10 @@ pub fn spawn_task(
             }
         }
     };
+    // Only reached when an exporter was constructed and its sender spawned —
+    // every degrade-to-disabled path above returns early, so `disabled` on the
+    // status wire stays truthful (Issue #5083).
+    register_global_export_status(export_status);
     Some(vec![collector_handle, sender_handle])
 }
 
@@ -532,6 +707,16 @@ mod tests {
         for var in ALL_ENV_VARS {
             std::env::remove_var(var);
         }
+    }
+
+    /// A freshly-constructed, empty [`WorkspacePool`] — `spawn_task` now
+    /// requires one (Issue #4955) to thread through to the collector.
+    /// `Handle::current()` is why every call site below must run inside a
+    /// Tokio runtime (`#[tokio::test]`), even the `spawn_task` calls whose
+    /// config disables/under-configures export and so never reach the
+    /// collector at all.
+    fn test_workspace_pool() -> Arc<WorkspacePool> {
+        Arc::new(WorkspacePool::new(Arc::new(EventBus::new()), tokio::runtime::Handle::current()))
     }
 
     #[test]
@@ -681,20 +866,26 @@ mod tests {
     // with zero side effects (no queue file created).
     // ------------------------------------------------------------------
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn spawn_task_disabled_returns_none() {
+    async fn spawn_task_disabled_returns_none() {
         clear_env();
         let bus = EventBus::new();
         let dir = tempdir().unwrap();
         let config = ObservabilityConfig::default();
-        let handles = spawn_task(&config, dir.path().to_path_buf(), &bus, Instant::now());
+        let handles = spawn_task(
+            &config,
+            dir.path().to_path_buf(),
+            &bus,
+            Instant::now(),
+            test_workspace_pool(),
+        );
         assert!(handles.is_none());
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn spawn_task_enabled_without_endpoint_returns_none() {
+    async fn spawn_task_enabled_without_endpoint_returns_none() {
         clear_env();
         let bus = EventBus::new();
         let dir = tempdir().unwrap();
@@ -702,13 +893,19 @@ mod tests {
             enabled: Some(true),
             ..Default::default()
         };
-        let handles = spawn_task(&config, dir.path().to_path_buf(), &bus, Instant::now());
+        let handles = spawn_task(
+            &config,
+            dir.path().to_path_buf(),
+            &bus,
+            Instant::now(),
+            test_workspace_pool(),
+        );
         assert!(handles.is_none());
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn spawn_task_enabled_without_ingest_key_file_returns_none() {
+    async fn spawn_task_enabled_without_ingest_key_file_returns_none() {
         clear_env();
         let bus = EventBus::new();
         let dir = tempdir().unwrap();
@@ -717,13 +914,19 @@ mod tests {
             endpoint: Some("https://ingest.example.com/v1/telemetry".to_string()),
             ..Default::default()
         };
-        let handles = spawn_task(&config, dir.path().to_path_buf(), &bus, Instant::now());
+        let handles = spawn_task(
+            &config,
+            dir.path().to_path_buf(),
+            &bus,
+            Instant::now(),
+            test_workspace_pool(),
+        );
         assert!(handles.is_none());
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn spawn_task_enabled_with_unreadable_ingest_key_file_returns_none() {
+    async fn spawn_task_enabled_with_unreadable_ingest_key_file_returns_none() {
         clear_env();
         let bus = EventBus::new();
         let dir = tempdir().unwrap();
@@ -738,7 +941,13 @@ mod tests {
             ),
             ..Default::default()
         };
-        let handles = spawn_task(&config, dir.path().to_path_buf(), &bus, Instant::now());
+        let handles = spawn_task(
+            &config,
+            dir.path().to_path_buf(),
+            &bus,
+            Instant::now(),
+            test_workspace_pool(),
+        );
         assert!(handles.is_none());
     }
 
@@ -757,7 +966,13 @@ mod tests {
             flush_interval_secs: Some(3600), // avoid a real network attempt during the test
             ..Default::default()
         };
-        let handles = spawn_task(&config, dir.path().to_path_buf(), &bus, Instant::now());
+        let handles = spawn_task(
+            &config,
+            dir.path().to_path_buf(),
+            &bus,
+            Instant::now(),
+            test_workspace_pool(),
+        );
         let handles = handles.expect("fully configured ⇒ spawn_task must return Some");
         assert_eq!(handles.len(), 2, "collector + sender");
         for handle in handles {
@@ -788,7 +1003,13 @@ mod tests {
             exporter: Some("otlp".to_string()),
             ..Default::default()
         };
-        let handles = spawn_task(&config, dir.path().to_path_buf(), &bus, Instant::now());
+        let handles = spawn_task(
+            &config,
+            dir.path().to_path_buf(),
+            &bus,
+            Instant::now(),
+            test_workspace_pool(),
+        );
         assert!(handles.is_none());
     }
 
@@ -813,7 +1034,13 @@ mod tests {
             flush_interval_secs: Some(3600), // avoid a real network attempt during the test
             ..Default::default()
         };
-        let handles = spawn_task(&config, dir.path().to_path_buf(), &bus, Instant::now());
+        let handles = spawn_task(
+            &config,
+            dir.path().to_path_buf(),
+            &bus,
+            Instant::now(),
+            test_workspace_pool(),
+        );
         let handles =
             handles.expect("fully configured otlp exporter ⇒ spawn_task must return Some");
         assert_eq!(handles.len(), 2, "collector + sender");

@@ -131,7 +131,11 @@ pub const ENVELOPE_VERSION: u32 = 1;
 /// degrades a malformed `meta` to `chat`**, which never reaches the feed and
 /// produces no error here, so this client validates before sending
 /// ([`validate_completion_meta`]) rather than relying on the server.
-pub const KNOWN_TYPES: [&str; 5] = ["chat", "task", "handoff", "ack", "completion"];
+///
+/// `digest` (#4217) is the newest member: one wave-dispatch digest root
+/// (`run_sink`'s dispatch-digest window) in place of N near-identical `task`
+/// roots, routed to the signal room like `handoff`/`ack`/`completion`.
+pub const KNOWN_TYPES: [&str; 6] = ["chat", "task", "handoff", "ack", "completion", "digest"];
 
 /// The one `meta.schema` value this client emits (safehouse
 /// `docs/protocol/envelope-v1.md` §4a).
@@ -962,16 +966,18 @@ pub enum EnvelopeKind {
     Handoff,
     Ack,
     Completion,
+    Digest,
 }
 
 impl EnvelopeKind {
     /// Every member, in [`KNOWN_TYPES`] order.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Chat,
         Self::Task,
         Self::Handoff,
         Self::Ack,
         Self::Completion,
+        Self::Digest,
     ];
 
     /// The wire string for this kind.
@@ -983,6 +989,7 @@ impl EnvelopeKind {
             Self::Handoff => "handoff",
             Self::Ack => "ack",
             Self::Completion => "completion",
+            Self::Digest => "digest",
         }
     }
 
@@ -994,14 +1001,15 @@ impl EnvelopeKind {
     }
 
     /// **The routing table** (#4225). Exhaustive by construction — no wildcard
-    /// arm — so a future sixth type (e.g. the wave-digest kind #4217 folds into
-    /// this layer, which would slot in as another [`AttentionClass::Signal`] arm)
-    /// fails to compile here rather than defaulting into the wrong room.
+    /// arm — so a future member fails to compile here rather than defaulting
+    /// into the wrong room. `Digest` (#4217, wave-dispatch digest roots) is the
+    /// most recent addition, slotted in as another [`AttentionClass::Signal`]
+    /// arm exactly as this comment originally anticipated.
     #[must_use]
     pub const fn attention_class(self) -> AttentionClass {
         match self {
             // Terminal / human-attention outcomes → the signal room.
-            Self::Handoff | Self::Ack | Self::Completion => AttentionClass::Signal,
+            Self::Handoff | Self::Ack | Self::Completion | Self::Digest => AttentionClass::Signal,
             // Dispatch, phase transitions, worker chatter → the repo firehose.
             Self::Task | Self::Chat => AttentionClass::Firehose,
         }
@@ -1214,6 +1222,99 @@ fn repo_issue_prefix(repo: Option<&str>, issue: u32) -> String {
     }
 }
 
+/// Build the single-issue `task`-kind dispatch envelope (the pre-#4217 shape,
+/// unchanged): `<repo>#n · dispatch`, repo-qualified `task_id`. Shared by
+/// [`event_to_envelope`] (the pure per-event mapping, still exercised directly
+/// by callers/tests that bypass the sink's digest-window batching) and
+/// [`run_sink`]'s digest-window flush, which calls this when a window ends
+/// with exactly one buffered dispatch — issue #4217's "single dispatches keep
+/// current behavior" contract.
+fn dispatch_envelope(repo: Option<&str>, issue: u32) -> Envelope {
+    Envelope {
+        to: "*".to_owned(),
+        kind: "task".to_owned(),
+        task_id: Some(qualify_task_id(repo, issue)),
+        body: format!("{} · dispatch", repo_issue_prefix(repo, issue)),
+        meta: None,
+    }
+}
+
+// ============================================================================
+// Dispatch-digest batching (issue #4217)
+// ============================================================================
+
+/// Test/operator override for the dispatch-digest coalescing window, mirroring
+/// the existing `RECONCILE_INTERVAL_ENV` seam: milliseconds, so a test can
+/// exercise a full window without a real wall-clock wait. Unset/unparsable
+/// falls back to [`DEFAULT_DISPATCH_DIGEST_WINDOW`].
+const DISPATCH_DIGEST_WINDOW_ENV: &str = "LOOM_SAFEHOUSE_DISPATCH_DIGEST_WINDOW_MS";
+
+/// Production default: long enough to coalesce a work-finder tick's admitted
+/// dispatches (observed: 7 within seconds, #4217's motivating case — each
+/// admission does its own `gh` label-flip round trip, so a wave can spread
+/// over several seconds, not just milliseconds) into one digest, short enough
+/// that a genuinely isolated dispatch is still narrated within half a minute.
+const DEFAULT_DISPATCH_DIGEST_WINDOW: Duration = Duration::from_secs(30);
+
+fn dispatch_digest_window() -> Duration {
+    env_nonempty(DISPATCH_DIGEST_WINDOW_ENV)
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_DISPATCH_DIGEST_WINDOW)
+}
+
+/// One admitted issue-dispatch buffered inside the digest window, waiting to
+/// find out whether it is alone (flushed as today's single-dispatch `task`
+/// envelope) or part of a burst (folded into one `digest` envelope) — #4217.
+#[derive(Debug, Clone)]
+struct PendingDispatch {
+    repo: Option<String>,
+    issue: u32,
+}
+
+/// Build the multi-dispatch digest envelope for a burst of buffered
+/// dispatches (issue #4217): **one** `digest`-kind root instead of N
+/// near-identical `task`-kind roots, grouped per repo and counted, e.g.
+/// `dispatched 7: loom×6 (#4028 #4106 #4144 #4157 #4162 #4164), vibesql×1
+/// (#6173)`. Groups sort by descending count (ties broken alphabetically) so
+/// the busiest repo leads; issue numbers within a group sort ascending.
+/// `seq` gives each digest a distinct `task_id` so consecutive digests are
+/// separate thread roots rather than one perpetual accumulating thread — this
+/// module's contract is "one root per burst", not "one root ever" ([`Envelope::task_id`]
+/// must be `[A-Za-z0-9_]`, which a plain counter satisfies trivially).
+fn build_dispatch_digest_envelope(batch: &[PendingDispatch], seq: u64) -> Envelope {
+    let mut groups: std::collections::BTreeMap<String, Vec<u32>> =
+        std::collections::BTreeMap::new();
+    for dispatch in batch {
+        let name = repo_basename(dispatch.repo.as_deref()).unwrap_or_else(|| "unscoped".to_owned());
+        groups.entry(name).or_default().push(dispatch.issue);
+    }
+    for issues in groups.values_mut() {
+        issues.sort_unstable();
+    }
+    let mut ordered: Vec<(String, Vec<u32>)> = groups.into_iter().collect();
+    ordered.sort_by(|(a_repo, a_issues), (b_repo, b_issues)| {
+        b_issues
+            .len()
+            .cmp(&a_issues.len())
+            .then_with(|| a_repo.cmp(b_repo))
+    });
+    let parts: Vec<String> = ordered
+        .iter()
+        .map(|(repo, issues)| {
+            let nums: Vec<String> = issues.iter().map(|n| format!("#{n}")).collect();
+            format!("{repo}×{} ({})", issues.len(), nums.join(" "))
+        })
+        .collect();
+    Envelope {
+        to: "*".to_owned(),
+        kind: "digest".to_owned(),
+        task_id: Some(format!("dispatch_digest_{seq}")),
+        body: format!("dispatched {}: {}", batch.len(), parts.join(", ")),
+        meta: None,
+    }
+}
+
 /// Format a duration given in whole seconds as `<m>m<s>s`, dropping the
 /// minutes segment when it is zero — e.g. `415` → `6m55s`, `24` → `24s`
 /// (matches issue #4201's grammar examples). Negative input (never produced by
@@ -1279,13 +1380,7 @@ pub fn event_to_envelope(event: &Event) -> Option<Envelope> {
             kind: SweepKind::Issue(issue),
             repo,
             ..
-        } => Some(Envelope {
-            to: "*".to_owned(),
-            kind: "task".to_owned(),
-            task_id: Some(qualify_task_id(repo.as_deref(), *issue)),
-            body: format!("{} · dispatch", repo_issue_prefix(repo.as_deref(), *issue)),
-            meta: None,
-        }),
+        } => Some(dispatch_envelope(repo.as_deref(), *issue)),
         Event::SweepPhase {
             issue,
             phase,
@@ -2623,6 +2718,20 @@ async fn run_sink(
     // does not race its own first live events with an instant reconciliation
     // pass over an empty `known_workspaces`/registry.
     reconcile_timer.tick().await;
+    // Dispatch-digest batching (issue #4217): admitted-dispatch events buffer
+    // here for up to `dispatch_digest_window()` from the *first* buffered
+    // dispatch, then flush as either today's single-dispatch `task` envelope
+    // (exactly one buffered) or one grouped `digest` envelope (a burst) — see
+    // `build_dispatch_digest_envelope`/`dispatch_envelope`. The far-future
+    // initial deadline never fires on its own; the `if !pending_dispatches...`
+    // guard on the flush branch below is what actually gates it, and the
+    // guard starts `false` (buffer starts empty).
+    let mut pending_dispatches: Vec<PendingDispatch> = Vec::new();
+    let mut digest_seq: u64 = 0;
+    let digest_sleep = tokio::time::sleep_until(
+        tokio::time::Instant::now() + Duration::from_secs(365 * 24 * 3600),
+    );
+    tokio::pin!(digest_sleep);
 
     loop {
         // One iteration narrates the envelope(s) produced by exactly one bus
@@ -2650,26 +2759,29 @@ async fn run_sink(
                     known_workspaces.insert(root.to_owned());
                 }
 
-                // One bus event can narrate more than one envelope: a `SweepExited`
-                // whose PR merged emits its `ack` **and** the public-feed `completion`
-                // (#4426), in that order.
-                if let Some(mut envelope) = event_to_envelope(&event) {
-                    // Best-effort dispatch-title enrichment (issue #4201, AC3). Only the
-                    // dispatch event needs it, and only when a repo is known (needed to
-                    // resolve the `gh` working directory) — every other event is narrated
-                    // exactly as `event_to_envelope` built it.
-                    if let Event::SweepGlobalDispatch {
-                        kind: SweepKind::Issue(issue),
-                        repo: Some(workspace_root),
-                        ..
-                    } = &event
-                    {
-                        if let Some(title) =
-                            fetch_title_cached(&mut title_cache, workspace_root, *issue).await
-                        {
-                            envelope.body.push_str(&format!(" — \"{title}\""));
-                        }
+                // Dispatch-digest batching (issue #4217): an admitted-issue
+                // dispatch does not narrate immediately — it joins the pending
+                // batch, and the digest window's own flush (below) decides
+                // whether it was a lone dispatch (unchanged single-`task`
+                // behavior) or part of a burst (one `digest` root). Every
+                // other narrated event is unaffected and still goes through
+                // `event_to_envelope` exactly as before.
+                if let Event::SweepGlobalDispatch {
+                    kind: SweepKind::Issue(issue),
+                    repo,
+                    ..
+                } = &event
+                {
+                    pending_dispatches.push(PendingDispatch { repo: repo.clone(), issue: *issue });
+                    if pending_dispatches.len() == 1 {
+                        digest_sleep
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + dispatch_digest_window());
                     }
+                } else if let Some(envelope) = event_to_envelope(&event) {
+                    // One bus event can narrate more than one envelope: a
+                    // `SweepExited` whose PR merged emits its `ack` **and** the
+                    // public-feed `completion` (#4426), in that order.
                     outbox.push(envelope);
                 }
 
@@ -2746,6 +2858,39 @@ async fn run_sink(
                         outbox.extend(new_completions);
                         narrated_repo = Some(workspace_root);
                     }
+                }
+            }
+
+            () = &mut digest_sleep, if !pending_dispatches.is_empty() => {
+                // The window that opened on the first buffered dispatch has
+                // elapsed — flush now (#4217). Re-arming happens naturally:
+                // the next dispatch to arrive (if any) sees an empty buffer
+                // and starts a fresh window; until then this guard is `false`
+                // and the (already-elapsed) sleep is never polled again.
+                let batch = std::mem::take(&mut pending_dispatches);
+                if let [PendingDispatch { repo, issue }] = batch.as_slice() {
+                    let (repo, issue) = (repo.clone(), *issue);
+                    let mut envelope = dispatch_envelope(repo.as_deref(), issue);
+                    // Best-effort dispatch-title enrichment (issue #4201, AC3),
+                    // preserved for the single-dispatch (no-burst) case only —
+                    // a digest never fetches per-issue titles (would be N `gh`
+                    // calls for one narration line).
+                    if let Some(workspace_root) = repo.as_deref() {
+                        if let Some(title) =
+                            fetch_title_cached(&mut title_cache, workspace_root, issue).await
+                        {
+                            envelope.body.push_str(&format!(" — \"{title}\""));
+                        }
+                    }
+                    narrated_repo = repo;
+                    outbox.push(envelope);
+                } else {
+                    digest_seq = digest_seq.wrapping_add(1);
+                    outbox.push(build_dispatch_digest_envelope(&batch, digest_seq));
+                    // A digest spans (potentially) several repos and always
+                    // routes via `AttentionClass::Signal`, which ignores the
+                    // `repo` argument entirely (see `RoomRouter::resolve`) —
+                    // `narrated_repo` stays `None`.
                 }
             }
         }
@@ -3526,9 +3671,10 @@ mod tests {
         assert_eq!(EnvelopeKind::parse("smoke_signal"), None);
     }
 
-    /// The final routing table (#4225): `handoff`/`ack`/`completion` → signal,
-    /// `task`/`chat` → the repo firehose. Every known type is covered and each
-    /// resolves to exactly one class.
+    /// The final routing table (#4225, extended by #4217's `digest`):
+    /// `handoff`/`ack`/`completion`/`digest` → signal, `task`/`chat` → the repo
+    /// firehose. Every known type is covered and each resolves to exactly one
+    /// class.
     #[test]
     fn attention_class_routes_every_known_type_to_exactly_one_tier() {
         let expected = [
@@ -3537,6 +3683,7 @@ mod tests {
             ("handoff", AttentionClass::Signal),
             ("ack", AttentionClass::Signal),
             ("completion", AttentionClass::Signal),
+            ("digest", AttentionClass::Signal),
         ];
         assert_eq!(
             expected.len(),
@@ -4486,6 +4633,107 @@ mod tests {
         assert_eq!(repo_issue_prefix(None, 42), "#42");
     }
 
+    // ---- dispatch-digest batching (issue #4217) ----
+
+    #[test]
+    fn dispatch_envelope_matches_the_pre_4217_single_dispatch_shape() {
+        let env = dispatch_envelope(Some("/repos/vibesql"), 42);
+        assert_eq!(env.kind, "task");
+        assert_eq!(env.task_id.as_deref(), Some("vibesql_42"));
+        assert_eq!(env.body, "vibesql#42 · dispatch");
+    }
+
+    /// The example from the issue body, byte-for-byte: `dispatched 7: loom×6
+    /// (#4028 #4106 #4144 #4157 #4162 #4164), vibesql×1 (#6173)` — groups sort
+    /// by descending count (loom's 6 before vibesql's 1), issue numbers within
+    /// a group sort ascending.
+    #[test]
+    fn build_dispatch_digest_envelope_groups_by_repo_and_sorts() {
+        let batch: Vec<PendingDispatch> = [
+            (Some("/Users/x/GitHub/loom"), 4164),
+            (Some("/Users/x/GitHub/loom"), 4028),
+            (Some("/Users/x/GitHub/loom"), 4157),
+            (Some("/Users/x/GitHub/vibesql"), 6173),
+            (Some("/Users/x/GitHub/loom"), 4106),
+            (Some("/Users/x/GitHub/loom"), 4162),
+            (Some("/Users/x/GitHub/loom"), 4144),
+        ]
+        .into_iter()
+        .map(|(repo, issue)| PendingDispatch {
+            repo: repo.map(str::to_owned),
+            issue,
+        })
+        .collect();
+
+        let env = build_dispatch_digest_envelope(&batch, 1);
+
+        assert_eq!(env.kind, "digest");
+        assert_eq!(env.task_id.as_deref(), Some("dispatch_digest_1"));
+        assert_eq!(
+            env.body,
+            "dispatched 7: loom×6 (#4028 #4106 #4144 #4157 #4162 #4164), vibesql×1 (#6173)"
+        );
+    }
+
+    /// Each flushed batch gets a distinct `task_id` (a new root), not one
+    /// perpetual thread every dispatch wave piles onto.
+    #[test]
+    fn build_dispatch_digest_envelope_task_id_is_unique_per_batch() {
+        let batch = vec![
+            PendingDispatch {
+                repo: Some("/repos/loom".to_owned()),
+                issue: 1,
+            },
+            PendingDispatch {
+                repo: Some("/repos/loom".to_owned()),
+                issue: 2,
+            },
+        ];
+        let first = build_dispatch_digest_envelope(&batch, 1);
+        let second = build_dispatch_digest_envelope(&batch, 2);
+        assert_ne!(first.task_id, second.task_id);
+    }
+
+    /// A dispatch with no `repo` stamped (synthetic/test event) still narrates
+    /// in a digest — grouped under a fallback label rather than panicking or
+    /// silently dropping the line.
+    #[test]
+    fn build_dispatch_digest_envelope_falls_back_for_missing_repo() {
+        let batch = vec![
+            PendingDispatch {
+                repo: None,
+                issue: 10,
+            },
+            PendingDispatch {
+                repo: None,
+                issue: 11,
+            },
+        ];
+        let env = build_dispatch_digest_envelope(&batch, 1);
+        assert_eq!(env.body, "dispatched 2: unscoped×2 (#10 #11)");
+    }
+
+    /// Mirrors `completion_routes_to_the_signal_room` (#4225): the digest kind
+    /// must resolve to the signal room even when the (irrelevant, since
+    /// `Signal` ignores `repo`) repo has its own firehose configured.
+    #[test]
+    fn digest_routes_to_the_signal_room() {
+        assert_eq!(EnvelopeKind::Digest.attention_class(), AttentionClass::Signal);
+
+        let cfg = routing_config();
+        let router = RoomRouter::new(&cfg);
+        assert_eq!(
+            router.resolve("digest", Some("/home/x/GitHub/loom")),
+            RoomDecision::Send(Some("!signal:example.org".to_owned())),
+            "a digest must reach the signal room even when the repo has its own firehose"
+        );
+        assert_eq!(
+            router.resolve("digest", None),
+            RoomDecision::Send(Some("!signal:example.org".to_owned())),
+            "a digest (inherently cross-repo) must not depend on a repo being stamped"
+        );
+    }
+
     #[test]
     fn format_narrated_duration_drops_zero_minutes() {
         assert_eq!(format_narrated_duration(415), "6m55s");
@@ -4784,6 +5032,10 @@ mod tests {
         let _safehouse_test_paths = SafehouseTestPaths::set(dir.path());
         let (fake_gh, _log) = write_fake_gh(dir.path(), Some("Add repo-qualified task_id"));
         std::env::set_var(GH_BIN_ENV, &fake_gh);
+        // A single dispatch still flushes at the end of the digest window
+        // (issue #4217) — shrink it so this test does not wait out the 30s
+        // production default.
+        std::env::set_var(DISPATCH_DIGEST_WINDOW_ENV, "10");
 
         let socket = dir.path().join("safehoused.sock");
         let listener = UnixListener::bind(&socket).unwrap();
@@ -4822,6 +5074,7 @@ mod tests {
         drop(bus);
         let _ = tokio::time::timeout(Duration::from_secs(2), sink).await;
         std::env::remove_var(GH_BIN_ENV);
+        std::env::remove_var(DISPATCH_DIGEST_WINDOW_ENV);
 
         assert_eq!(received.len(), 1);
         let body = received[0]["body"].as_str().unwrap();
@@ -4830,6 +5083,148 @@ mod tests {
             "dispatch body must be enriched with the fetched title; got: {body:?}"
         );
         assert!(body.contains("#4201 · dispatch"));
+    }
+
+    /// The motivating scenario (issue #4217): a work-finder tick admits
+    /// several issues in a burst. Instead of N near-identical `task` roots,
+    /// the sink emits **one** `digest` root, grouped per repo, once the
+    /// window closes — no per-issue `task` send is ever made for these four.
+    #[tokio::test]
+    #[serial]
+    async fn run_sink_batches_a_dispatch_burst_into_one_digest_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let _safehouse_test_paths = SafehouseTestPaths::set(dir.path());
+        std::env::set_var(DISPATCH_DIGEST_WINDOW_ENV, "50");
+
+        let socket = dir.path().join("safehoused.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        // Exactly one send is expected — the digest, never one per issue.
+        let server = tokio::spawn(stub_server(listener, false, 1));
+
+        let bus = Arc::new(EventBus::new());
+        let subscription = bus.subscribe(Vec::<String>::new());
+        let sink = tokio::spawn(run_sink(
+            SafehouseConfig {
+                enabled: true,
+                socket: Some(socket.clone()),
+                room: Some("loom-fleet".to_owned()),
+                ..SafehouseConfig::default()
+            },
+            socket,
+            subscription,
+            Duration::from_millis(20),
+            Duration::from_millis(80),
+            new_shared_state(),
+            None,
+        ));
+
+        for issue in [4028u32, 4106, 4144] {
+            bus.publish(Event::SweepGlobalDispatch {
+                sweep_id: format!("sweep-issue-{issue}-1") as SweepId,
+                kind: SweepKind::Issue(issue),
+                runtime: None,
+                runtime_source: None,
+                repo: Some("/Users/x/GitHub/loom".to_owned()),
+            })
+            .unwrap();
+        }
+        bus.publish(Event::SweepGlobalDispatch {
+            sweep_id: "sweep-issue-6173-1".to_owned() as SweepId,
+            kind: SweepKind::Issue(6173),
+            runtime: None,
+            runtime_source: None,
+            repo: Some("/Users/x/GitHub/vibesql".to_owned()),
+        })
+        .unwrap();
+
+        let received = tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("stub server must receive exactly one digest send")
+            .unwrap();
+
+        drop(bus);
+        let _ = tokio::time::timeout(Duration::from_secs(2), sink).await;
+        std::env::remove_var(DISPATCH_DIGEST_WINDOW_ENV);
+
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0]["type"], json!("digest"));
+        assert_eq!(
+            received[0]["body"],
+            json!("dispatched 4: loom×3 (#4028 #4106 #4144), vibesql×1 (#6173)")
+        );
+    }
+
+    /// A burst's per-issue `task_id` threads are untouched by the digest: once
+    /// the burst is narrated, the *next* real per-issue event (e.g. a `phase`
+    /// transition) still starts/continues that issue's own thread with the
+    /// #4201 grammar — the digest never substitutes for it.
+    #[tokio::test]
+    #[serial]
+    async fn run_sink_still_narrates_per_issue_events_after_a_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let _safehouse_test_paths = SafehouseTestPaths::set(dir.path());
+        std::env::set_var(DISPATCH_DIGEST_WINDOW_ENV, "50");
+
+        let socket = dir.path().join("safehoused.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        // 1: the digest. 2: the phase transition for issue 4028.
+        let server = tokio::spawn(stub_server(listener, false, 2));
+
+        let bus = Arc::new(EventBus::new());
+        let subscription = bus.subscribe(Vec::<String>::new());
+        let sink = tokio::spawn(run_sink(
+            SafehouseConfig {
+                enabled: true,
+                socket: Some(socket.clone()),
+                room: Some("loom-fleet".to_owned()),
+                ..SafehouseConfig::default()
+            },
+            socket,
+            subscription,
+            Duration::from_millis(20),
+            Duration::from_millis(80),
+            new_shared_state(),
+            None,
+        ));
+
+        for issue in [4028u32, 4106] {
+            bus.publish(Event::SweepGlobalDispatch {
+                sweep_id: format!("sweep-issue-{issue}-1") as SweepId,
+                kind: SweepKind::Issue(issue),
+                runtime: None,
+                runtime_source: None,
+                repo: Some("/Users/x/GitHub/loom".to_owned()),
+            })
+            .unwrap();
+        }
+        // Give the digest window time to close before the phase transition,
+        // so the two sends are unambiguously ordered for the assertions below.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        bus.publish(Event::SweepPhase {
+            issue: 4028,
+            phase: "builder".to_owned(),
+            pr_number: None,
+            repo: Some("/Users/x/GitHub/loom".to_owned()),
+        })
+        .unwrap();
+
+        let received = tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("stub server must receive the digest then the phase send")
+            .unwrap();
+
+        drop(bus);
+        let _ = tokio::time::timeout(Duration::from_secs(2), sink).await;
+        std::env::remove_var(DISPATCH_DIGEST_WINDOW_ENV);
+
+        assert_eq!(received.len(), 2);
+        assert_eq!(received[0]["type"], json!("digest"));
+        assert_eq!(received[1]["type"], json!("task"));
+        assert_eq!(received[1]["task_id"], json!("loom_4028"));
+        assert!(received[1]["body"]
+            .as_str()
+            .unwrap()
+            .starts_with("loom#4028 · builder"));
     }
 
     // ---- run_sink room routing end-to-end (#4225) ----

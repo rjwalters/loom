@@ -17,8 +17,8 @@
  *   healthy and must still render its health/token panel.
  */
 
-import { secondsSince } from "./format";
-import type { ActiveSweep, FleetSnapshot, HostEntry, TokenAccount } from "./types";
+import { roleFailureLabel, secondsSince } from "./format";
+import type { ActiveSweep, FleetSnapshot, HostEntry, HostHealthRecord, TokenAccount } from "./types";
 
 /**
  * How old a `host.health` / `tokens.snapshot` may be before it is shown as
@@ -30,11 +30,14 @@ import type { ActiveSweep, FleetSnapshot, HostEntry, TokenAccount } from "./type
 export const STALE_AFTER_SEC = 15 * 60;
 
 export type HostStatus =
-  /** Reporting recently, and the token pool has healthy capacity left. Some
-   * accounts being exhausted is normal rotation, not a fault — see
-   * `isTokenPoolDegraded` below. */
+  /** Reporting recently, and the token pool has healthy capacity left, and
+   * the host is not refusing work. High load alone does not disqualify a
+   * host from `ok` — see `isHostDistressed` below: the trigger is
+   * refusing-work or pinned-at-zero-idle, not raw utilization. */
   | "ok"
-  /** Reporting recently, but the token pool is at or near exhaustion. */
+  /** Reporting recently, but either the token pool is at or near exhaustion,
+   * or the host itself is distressed (dispatch halted, or CPU idle pinned
+   * near zero — see `isHostDistressed`). */
   | "degraded"
   /** Last report is older than `STALE_AFTER_SEC`. */
   | "stale"
@@ -64,6 +67,11 @@ export interface HostView {
   sweeps: ActiveSweep[];
   tokens: TokenSummary;
   status: HostStatus;
+  /** Why `status` is `"degraded"`, naming the specific cause (token
+   * exhaustion, a named halt reason, or a distress heuristic) rather than a
+   * generic "Degraded" — see `views/fleetOverview.ts`'s badge tooltip.
+   * `undefined` for every other status. */
+  degradedReason: string | undefined;
   /** Most recent of the health/tokens `updatedAt`s — the host's liveness
    * signal. `undefined` when it has never reported either. */
   lastReportAt: string | undefined;
@@ -73,8 +81,29 @@ export interface HostView {
 
 export interface FleetView {
   hosts: HostView[];
+  /** Hosts with a real `health`/`tokens` entry — `hosts.length` minus those
+   * known only from `activeSweeps` (`status === "unknown"`, see the module
+   * doc's "union" note). This, not `hosts.length`, is what the overview
+   * headline's "N hosts" count uses (#5101): `hosts` deliberately still
+   * includes sweep-only hosts (and their cards), so counting `hosts.length`
+   * in the headline would tell an operator the fleet has more reporting
+   * hosts than it does. Mirrors the equivalent fix in
+   * `dashboard/src/publicPage.ts`'s `renderFleetOverview` (#5078).
+   *
+   * `totalSweeps` is deliberately NOT split the same way: unlike the public
+   * page's flat table (which needed a second "unattributed sweeps" table to
+   * keep a sweep-only host's sweeps discoverable), every sweep here already
+   * renders under its own host's card — including a sweep-only host's own
+   * card — so the per-card grouping already answers "whose sweep is this",
+   * and splitting the headline number too would only add a second count to
+   * reconcile against the cards below it.
+   */
+  reportingHosts: number;
   totalSweeps: number;
-  /** Hosts in `stale` or `degraded` — the count the overview headline shows. */
+  /** Hosts in `stale` or `degraded` — the count the overview headline shows.
+   * `"unknown"` hosts are excluded here too (STATUS_ORDER treats them as
+   * their own bucket, not `stale`/`degraded`) — see the "excludes sweep-only
+   * hosts" test in `fleet.test.ts`. */
   needsAttention: number;
 }
 
@@ -134,6 +163,62 @@ export function isTokenPoolDegraded(tokens: TokenSummary): boolean {
   return available <= LOW_AVAILABILITY_THRESHOLD || tokens.exhausted / tokens.total >= HIGH_EXHAUSTION_FRACTION;
 }
 
+/**
+ * The daemon's own host-distress-breaker trip threshold
+ * (`DEFAULT_HOST_BREAKER_LOAD_PER_CORE`, `loom-daemon/src/host_breaker.rs`) —
+ * reused verbatim rather than reinvented, so this UI's notion of "distressed"
+ * can never drift from the daemon's own. A host that merely trips this once
+ * is not automatically flagged: `dispatch_halted` (below) is the primary,
+ * *sustained* signal — this raw threshold is a same-number fallback for a
+ * daemon build old enough, or configured, to not send `dispatch_halted` at
+ * all.
+ */
+const HOST_DISTRESS_LOAD_PER_CORE = 2.5;
+
+/**
+ * `cpu_idle_fraction` at or below this reads as "pinned at zero", not merely
+ * busy — a build spike can dip idle into the teens without the host refusing
+ * work, so this only fires once idle is close enough to true zero that the
+ * host looks like it cannot breathe (see #4975: 0% idle / load-per-core 4.24
+ * was the incident that motivated this check).
+ */
+const ZERO_IDLE_FRACTION_THRESHOLD = 0.02;
+
+/**
+ * Why a host looks distressed, in priority order, or `undefined` when it
+ * does not. `dispatch_halted` and `roles.persistent` (both sustained,
+ * stateful signals the daemon itself computed — see `host_breaker.rs`'s
+ * module doc and `crate::health::summarize_role_ticks`, #5022) are checked
+ * first and named with their own reason; the load/idle checks below them are
+ * same-number, single-sample fallbacks for a host whose daemon
+ * predates/disables those fields. A host that is merely busy — high load,
+ * but still admitting new dispatch and idle well above zero — returns
+ * `undefined` here and stays `"ok"` (busy ≠ degraded, #4975).
+ */
+export function distressReason(health: HostHealthRecord | undefined): string | undefined {
+  if (!health) return undefined;
+  if (health.dispatch_halted) {
+    return health.halt_reason ? `dispatch halted: ${health.halt_reason}` : "dispatch halted";
+  }
+  const persistentRoleFailures = health.roles?.persistent ?? [];
+  if (persistentRoleFailures.length > 0) {
+    const names = persistentRoleFailures.map(roleFailureLabel).join(", ");
+    return `role tick(s) persistently failing: ${names}`;
+  }
+  if (health.load_per_core !== undefined && health.load_per_core >= HOST_DISTRESS_LOAD_PER_CORE) {
+    return `load/core ${health.load_per_core.toFixed(2)} at or above the host-distress threshold (${HOST_DISTRESS_LOAD_PER_CORE})`;
+  }
+  if (health.cpu_idle_fraction !== undefined && health.cpu_idle_fraction <= ZERO_IDLE_FRACTION_THRESHOLD) {
+    return "CPU idle pinned near zero";
+  }
+  return undefined;
+}
+
+/** `true` when `distressReason` finds a reason — see its doc for the rules. */
+export function isHostDistressed(health: HostHealthRecord | undefined): boolean {
+  return distressReason(health) !== undefined;
+}
+
 /** Newest of the two `updatedAt`s. String compare is safe here *only* because
  * both are backend-generated `new Date().toISOString()` values — fixed-width
  * UTC, so lexicographic order is chronological order. */
@@ -154,19 +239,27 @@ export function buildHostView(
   const tokens = summarizeTokens(entry);
   const lastReportAt = latestReport(entry);
   const lastReportAgeSec = secondsSince(lastReportAt, now);
+  const distress = distressReason(entry.health?.record);
 
   let status: HostStatus;
+  let degradedReason: string | undefined;
   if (lastReportAgeSec === undefined) {
     status = "unknown";
   } else if (lastReportAgeSec > STALE_AFTER_SEC) {
     status = "stale";
+  } else if (distress !== undefined) {
+    // Host-level distress takes priority over token-pool exhaustion when
+    // both fire — it is the more actionable/urgent of the two reasons.
+    status = "degraded";
+    degradedReason = distress;
   } else if (isTokenPoolDegraded(tokens)) {
     status = "degraded";
+    degradedReason = "token pool at or near exhaustion";
   } else {
     status = "ok";
   }
 
-  return { hostId, entry, sweeps, tokens, status, lastReportAt, lastReportAgeSec };
+  return { hostId, entry, sweeps, tokens, status, degradedReason, lastReportAt, lastReportAgeSec };
 }
 
 /** Sort: hosts needing attention first, then busiest, then by id so the list
@@ -196,6 +289,7 @@ export function buildFleetView(snapshot: FleetSnapshot, now: Date = new Date()):
 
   return {
     hosts,
+    reportingHosts: hosts.filter((host) => host.status !== "unknown").length,
     totalSweeps: snapshot.activeSweeps.length,
     needsAttention: hosts.filter((host) => host.status === "stale" || host.status === "degraded").length,
   };

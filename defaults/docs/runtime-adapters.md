@@ -532,6 +532,143 @@ silently ignored entry: `runtimes.roles.not-a-role` (or a typo such as
 the offending key, so a misconfigured binding can never leave a role quietly
 running on the default runtime. A known key with an **empty** value keeps its
 established "unset" meaning and falls through to the next precedence tier.
+`loom-daemon validate` also checks `runtimes.roles` proactively (#5006), using
+the identical fail-closed rules, so a bad binding is caught any time an
+operator runs the command — not only the next time a role's tick actually hits
+it.
+
+**Bash fallback (#5277)**: `defaults/scripts/validate-roles.sh` runs the same
+role-dependency checks as `loom-daemon validate` without needing the Rust
+binary built — useful on a fresh source checkout or a shell-only CI step. It
+is operator-manual (no in-repo caller invokes it as a dependency); prefer
+`loom-daemon validate` when the binary is available.
+
+**Runtime manifest resolution and the bundled fallback (#5002).** The role and
+runtime manifest directories are resolved independently (#4688): each prefers
+`.loom/roles` / `.loom/runtimes` when the subdirectory exists on disk, and
+otherwise falls back to `<repo_root>/defaults/roles` / `defaults/runtimes`.
+That `defaults/` fallback only ever resolves on the Loom *source* checkout
+itself — a consumer install has `.loom/`, never `defaults/` — so on every
+other managed repo it was unreachable by construction. If a consumer repo's
+`.loom/runtimes/` is missing entirely, or missing just one runtime's manifest
+(e.g. a pre-#4700 install that was never resynced), a non-builtin runtime had
+no fallback at all and failed closed even though the daemon binary ships an
+adapter for it. The daemon now also carries a **bundled fallback**: manifests
+for the runtimes it ships adapters for (`claude`, `codex`, `aider`) are
+compiled directly into the binary via `include_str!` from
+`defaults/runtimes/*.json` at build time, and consulted whenever the on-disk
+manifest lookup misses. An on-disk `.loom/runtimes/<name>.json` — however it
+got there — always wins over the bundled copy. Only a runtime the binary was
+never built with a manifest for (e.g. an operator-defined custom runtime with
+no on-disk manifest either) still fails closed with no fallback at all — and
+the diagnostic in that case now names `<repo>/.loom/runtimes/<name>.json`, a
+path reachable from a consumer repo, instead of the unreachable
+`defaults/runtimes/<name>.json` fallback path.
+
+#### Per-role model override (`autonomous.roleRunner.roleModels`)
+
+`runtimes.roles` gives each standalone role its own **runtime** axis, but the
+model the daemon pins per role-runner tick was, before #5001, a single global
+value (`autonomous.roleRunner.model`, resolved by `resolve_role_runner_model` in
+`loom-daemon/src/role_runner.rs`). The two axes could not disagree, so pointing
+one role at a different provider guaranteed a mismatch: with
+`LOOM_RUNTIME_JUDGE=codex` set, the globally-pinned Claude alias (`sonnet`) was
+forwarded verbatim as `--model sonnet` to the Codex adapter, which rejects it
+(`The 'sonnet' model is not supported when using Codex with a ChatGPT account.`,
+HTTP 400). The classifier treated that exit as `RECOVERABLE`, so every Judge tick
+retried and re-failed indefinitely, fleet-wide, until the env var was reverted.
+
+`autonomous.roleRunner.roleModels` adds the matching **model** axis — a
+`{ "<role>": "<model>" }` map whose per-role entry sits one tier **above** the
+global `autonomous.roleRunner.model`:
+
+```json
+{
+  "runtimes": { "roles": { "judge": "codex" } },
+  "autonomous": {
+    "roleRunner": {
+      "model": "sonnet",
+      "roleModels": { "judge": "gpt-5-codex" }
+    }
+  }
+}
+```
+
+Here Judge runs on Codex with a Codex-valid model while Curator and Champion stay
+on Claude with `sonnet`, all from config. The resolution precedence for a given
+role is:
+
+**`autonomous.roleRunner.roleModels.<role>` > `autonomous.roleRunner.model` >
+`autonomous.model` > shipped `DEFAULT_DISPATCH_MODEL` (`sonnet`)**
+
+Keys are lower-cased and trimmed (so a `"Judge"` key matches the `judge` role the
+runner dispatches under); a blank key, or a blank / non-string value, is dropped
+so an override never emits `--model ""`; and an absent / malformed / non-object
+`roleModels` soft-fails to "no overrides" (every role falls through to the global
+chain, zero behavior change). Values resolve through the same `sweep.modelAliases`
+tier map every other model tier uses (a per-role `"opus"` still reaches
+`claude-opus-5`), and a runtime-specific model ID such as `gpt-5-codex` passes
+through unchanged. The per-role log header (`role-<role>.log`) records the
+resolved model and names the tier that supplied it
+(`source=autonomous.roleRunner.roleModels.<role>`), so an operator can confirm the
+pin from the log alone.
+
+#### Model/runtime mismatch refusal (#5028)
+
+`roleModels` above gives an operator a *way* to configure a matching model, but
+before #5028 nothing ever verified the two axes actually agreed: the daemon
+resolved the model and the runtime independently and forwarded whatever it got.
+Set `runtimes.roles.judge = "codex"` with no `roleModels.judge` override, and
+the runner still resolved the Claude-shaped default (`sonnet`) and forwarded it
+verbatim to the Codex adapter, which 400s — the original #5001 outage,
+recurring verbatim for anyone who reaches for the runtime axis without the
+matching model one.
+
+`loom-daemon/src/sweep_registry/model.rs` now carries a narrow, fail-open
+classifier — `model_family` / `runtime_model_family` / `model_runtime_mismatch`
+— that answers exactly one question: are the admitted runtime and the resolved
+model **confidently-known, differing** provider families (Claude vs.
+OpenAI/Codex)? Only `claude` and `codex` runtimes, and only recognized
+Claude/OpenAI model names/aliases (`@effort` suffixes stripped first), are ever
+classified; every other runtime (`aider`, a tier-3/custom adapter) or unknown
+model name always falls through unrefused. This can only ever catch a launch
+that was already guaranteed to fail on the wire — never a launch that might
+have worked.
+
+The role runner (`ScriptRoleInvocationRunner::invoke`) now resolves runtime
+admission **before** the model — the runtime is a per-role input to the
+mismatch check — and if `model_runtime_mismatch` returns `Some(reason)`, the
+tick is refused as `RoleTickOutcome::ModelRuntimeMismatch` before any spawn:
+
+- A distinct outcome, deliberately never folded into the generic `Failure`
+  tally — same argument as `NoTokenPool` (#4642): this is a permanent config
+  conflict detected pre-spawn, not a transient invocation failure.
+- Its own `MODEL_RUNTIME_MISMATCH_SKIP_COUNT` counter
+  (`model_runtime_mismatch_skip_count()`).
+- A one-line operator-facing `detail()` — `"model/runtime mismatch: … (model
+  source=…); set autonomous.roleRunner.roleModels.<role> …"` — that
+  `record_role_tick` stores on the health ring, which `assess_roles` in
+  `health.rs` already renders verbatim: `loom-daemon health` now names the
+  broken config key directly, instead of an operator reading a spawn
+  transcript to find it (the original #5001 AC2).
+- Its own `RootTickLogAction::ModelMismatchEdge` / `ModelMismatchRepeat` pair
+  in the multi-workspace loop's per-root log dedup, tracked on a third state
+  map fully independent of the `Failure`/`RuntimeRejected` and `NoTokenPool`
+  axes — a misconfigured role warns once on the edge and logs at `DEBUG` on
+  repeat, never retrying at full WARN-noise cost forever (#5001 AC3). Because
+  the check runs before token selection and the CLI start, a misconfigured
+  role now costs a config read per tick instead of a token draw plus a full
+  session — and it self-heals the moment `roleModels.<role>` is corrected, with
+  no restart and no one-shot disable to clear.
+
+`defaults/scripts/spawn-codex.sh` carries an independent copy of the same
+refusal for every OTHER caller that reaches this adapter directly with no
+daemon preflight in front of it (sweep dispatch also pins models). After the
+model-selection block resolves an effective model (explicit `-m`/`--model` >
+`LOOM_MODEL` > `LOOM_CODEX_MODEL`), a Claude-shaped value (`opus`, `opusplan`,
+`sonnet`, `haiku`, `fable`, or `claude*`, `@effort` stripped) logs the same fix
+options and exits `78` (`EX_CONFIG`) before any auth work. Escape hatch:
+`LOOM_CODEX_MODEL_CHECK=0`.
 
 Daemon admission runs before any claim lock, forge mutation, account selection,
 log header, or child spawn. Successful sweep status and
@@ -786,7 +923,8 @@ collaboration:
 - **#4780** — tier-3 "generic passthrough" mechanism: `spawn-generic.sh`, the
   `defaults/runtimes/aider.json` worked example, and the capability-manifest
   gate this section documents. Adapted from a survey of
-  [stablyai/orca](https://github.com/stablyai/orca) (`.loom/docs/survey-orca-2026-07-31.md`,
+  [stablyai/orca](https://github.com/stablyai/orca)
+  ([survey-orca-2026-07-31.md](https://github.com/rjwalters/loom/blob/main/.loom/docs/survey-orca-2026-07-31.md),
   idea 5), filed from #4775.
-- [ADR-0012: Multi-Runtime Worker Support via a Runtime Adapter Contract](../../docs/adr/0012-runtime-adapter-contract.md).
+- [ADR-0012: Multi-Runtime Worker Support via a Runtime Adapter Contract](https://github.com/rjwalters/loom/blob/main/docs/adr/0012-runtime-adapter-contract.md).
 - Fork: https://github.com/gpeyton/loom · `AGENTS.md` standard: https://agents.md

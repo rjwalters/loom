@@ -3,7 +3,9 @@ import { describe, expect, it } from "vitest";
 import {
   STALE_AFTER_SEC,
   buildFleetView,
+  distressReason,
   findHost,
+  isHostDistressed,
   isTokenPoolDegraded,
   sortSweeps,
   summarizeTokens,
@@ -19,6 +21,7 @@ import {
   SWEEP_ONLY_HOST_ID,
   isoMinutesBefore,
   multiHostSnapshot,
+  persistentRoleTickFailureFixture,
 } from "./fixtures";
 
 const view = () => buildFleetView(parseFleetSnapshot(multiHostSnapshot()), NOW);
@@ -111,13 +114,42 @@ describe("buildFleetView", () => {
     const built = view();
     expect(built.totalSweeps).toBe(3);
     // Only the stale host and the truly-at-the-edge degraded host — not the
-    // partially-exhausted-but-healthy one.
+    // partially-exhausted-but-healthy one, and not the sweep-only "unknown"
+    // host either — see the dedicated #5101 test below.
     expect(built.needsAttention).toBe(2);
+  });
+
+  // #5101: the SPA's fleet-overview headline uses `reportingHosts`, not
+  // `hosts.length`, so a host known only from activeSweeps ("unknown"
+  // status) does not inflate the "N hosts" count — while still remaining in
+  // `hosts` (and rendering its own card, per the module doc's union rule).
+  it("excludes sweep-only 'unknown' hosts from reportingHosts, but not from hosts", () => {
+    const built = view();
+    expect(built.hosts).toHaveLength(6);
+    expect(built.reportingHosts).toBe(5);
+    expect(findHost(built, SWEEP_ONLY_HOST_ID)?.status).toBe("unknown");
+  });
+
+  // Pin: needsAttention (stale/degraded only) already excludes "unknown"
+  // hosts — STATUS_ORDER and the needsAttention filter both treat "unknown"
+  // as its own bucket, distinct from stale/degraded (#5101).
+  it("excludes sweep-only 'unknown' hosts from needsAttention", () => {
+    const built = buildFleetView(
+      parseFleetSnapshot({
+        hosts: {},
+        activeSweeps: [{ hostId: "sweep-only", sweepId: "s1" }],
+      }),
+      NOW,
+    );
+    expect(findHost(built, "sweep-only")?.status).toBe("unknown");
+    expect(built.needsAttention).toBe(0);
+    expect(built.reportingHosts).toBe(0);
   });
 
   it("returns an empty view for an empty fleet", () => {
     const built = buildFleetView({ hosts: {}, activeSweeps: [] }, NOW);
     expect(built.hosts).toEqual([]);
+    expect(built.reportingHosts).toBe(0);
     expect(built.totalSweeps).toBe(0);
     expect(built.needsAttention).toBe(0);
   });
@@ -154,6 +186,137 @@ describe("isTokenPoolDegraded", () => {
 
   it("is degraded once exhaustion crosses the 75% threshold, even with 2+ available", () => {
     expect(isTokenPoolDegraded(pool(20, 15))).toBe(true); // 5 available, 75% exhausted
+  });
+});
+
+describe("distressReason / isHostDistressed (#4975)", () => {
+  it("is undefined for a host with no health record at all", () => {
+    expect(distressReason(undefined)).toBeUndefined();
+    expect(isHostDistressed(undefined)).toBe(false);
+  });
+
+  it("is undefined for a merely busy host — high load, but still admitting work", () => {
+    // The #4975 AC in one line: busy != degraded. Load well below the
+    // breaker's trip threshold, idle comfortably above zero, dispatch not
+    // halted.
+    const reason = distressReason({ load_per_core: 1.4, cpu_idle_fraction: 0.2, dispatch_halted: false });
+    expect(reason).toBeUndefined();
+  });
+
+  it("names the breaker's own reason when dispatch is halted", () => {
+    const reason = distressReason({
+      dispatch_halted: true,
+      halt_reason: "load-per-core 4.24 >= 2.50 sustained for 3 consecutive tick(s)",
+      load_per_core: 4.24,
+      cpu_idle_fraction: 0,
+    });
+    expect(reason).toBe("dispatch halted: load-per-core 4.24 >= 2.50 sustained for 3 consecutive tick(s)");
+  });
+
+  it("still reports halted, generically, when dispatch_halted is true with no reason string", () => {
+    expect(distressReason({ dispatch_halted: true })).toBe("dispatch halted");
+  });
+
+  it("flags load/core at or above the daemon's own distress threshold even without dispatch_halted", () => {
+    // Same-number fallback for a daemon build that predates/disables the
+    // dispatch_halted field.
+    expect(isHostDistressed({ load_per_core: 2.5 })).toBe(true);
+    expect(isHostDistressed({ load_per_core: 2.49 })).toBe(false);
+  });
+
+  it("flags CPU idle pinned near zero even without dispatch_halted", () => {
+    expect(isHostDistressed({ cpu_idle_fraction: 0 })).toBe(true);
+    expect(isHostDistressed({ cpu_idle_fraction: 0.02 })).toBe(true);
+    // A real busy host dips well above the near-zero line.
+    expect(isHostDistressed({ cpu_idle_fraction: 0.2 })).toBe(false);
+  });
+
+  // #5022: role-tick health.
+  it("names the failing role(s) when roles has a persistent failure", () => {
+    const reason = distressReason({
+      roles: { total: 3, ok: 1, persistent: [{ root: "/repos/loom", role: "judge", failures: 2 }] },
+    });
+    expect(reason).toBe("role tick(s) persistently failing: judge @ loom");
+  });
+
+  it("is not distressed when roles reports every tick ok", () => {
+    expect(isHostDistressed({ roles: { total: 12, ok: 12, persistent: [] } })).toBe(false);
+  });
+
+  it("is not distressed when roles reports zero ticks sampled (role runner idle/disabled)", () => {
+    expect(isHostDistressed({ roles: { total: 0, ok: 0, persistent: [] } })).toBe(false);
+  });
+
+  it("takes priority over the load/idle heuristic fallbacks, same as dispatch_halted", () => {
+    const reason = distressReason({
+      roles: { total: 2, ok: 0, persistent: [{ root: "/repos/loom", role: "guide", failures: 2 }] },
+      load_per_core: 0.1,
+      cpu_idle_fraction: 0.9,
+    });
+    expect(reason).toBe("role tick(s) persistently failing: guide @ loom");
+  });
+});
+
+describe("buildFleetView host-distress classification (#4975)", () => {
+  const snapshotFor = (health: Record<string, unknown>) =>
+    parseFleetSnapshot({
+      hosts: { h: { health: { record: { kind: "host.health", ...health }, updatedAt: isoMinutesBefore(1) } } },
+      activeSweeps: [],
+    });
+
+  it("goes degraded when dispatch is halted, independent of the token pool", () => {
+    const built = buildFleetView(
+      snapshotFor({ dispatch_halted: true, halt_reason: "host-distress breaker" }),
+      NOW,
+    );
+    const host = findHost(built, "h");
+    expect(host?.status).toBe("degraded");
+    expect(host?.degradedReason).toBe("dispatch halted: host-distress breaker");
+  });
+
+  it("goes degraded when load/core is at the daemon's distress threshold", () => {
+    const built = buildFleetView(snapshotFor({ load_per_core: 4.24, cpu_idle_fraction: 0 }), NOW);
+    expect(findHost(built, "h")?.status).toBe("degraded");
+  });
+
+  it("stays ok for a merely busy host — high-ish load, dispatch still admitting", () => {
+    const built = buildFleetView(snapshotFor({ load_per_core: 1.4, cpu_idle_fraction: 0.2 }), NOW);
+    const host = findHost(built, "h");
+    expect(host?.status).toBe("ok");
+    expect(host?.degradedReason).toBeUndefined();
+  });
+
+  it("goes degraded when roles reports a persistent tick failure, independent of load/tokens (#5022)", () => {
+    const built = buildFleetView(snapshotFor({ roles: persistentRoleTickFailureFixture() }), NOW);
+    const host = findHost(built, "h");
+    expect(host?.status).toBe("degraded");
+    expect(host?.degradedReason).toBe("role tick(s) persistently failing: judge @ loom");
+  });
+
+  it("stays ok when roles reports zero ticks sampled (role runner idle/disabled) — not an error state", () => {
+    const built = buildFleetView(snapshotFor({ roles: { total: 0, ok: 0, persistent: [] } }), NOW);
+    expect(findHost(built, "h")?.status).toBe("ok");
+  });
+
+  it("names the token-exhaustion reason when that is the only trigger", () => {
+    const built = buildFleetView(
+      parseFleetSnapshot({
+        hosts: {
+          h: {
+            health: { record: { kind: "host.health", load_per_core: 0.3, cpu_idle_fraction: 0.7 }, updatedAt: isoMinutesBefore(1) },
+            tokens: {
+              record: { kind: "tokens.snapshot", accounts: [{ account: "a", exhausted: true }] },
+              updatedAt: isoMinutesBefore(1),
+            },
+          },
+        },
+        activeSweeps: [],
+      }),
+      NOW,
+    );
+    const host = findHost(built, "h");
+    expect(host?.status).toBe("degraded");
+    expect(host?.degradedReason).toBe("token pool at or near exhaustion");
   });
 });
 

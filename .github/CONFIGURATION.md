@@ -38,9 +38,11 @@ from Loom.
 ## Installation
 
 These files are copied from `defaults/.github/` into `<workspace>/.github/` by
-`scripts/install-loom.sh`'s defaults-directory walk, and are re-synced on `loom update` /
-reinstall (they're on the Loom-shipped `.github/` allowlist, so a reinstall overwrites local
-edits to these four files — customize via `defaults/optional/` or a fork instead).
+`scripts/install-loom.sh`'s defaults-directory walk, and are re-synced on a forced `loom update` /
+reinstall (they're on the Loom-shipped `.github/` allowlist, so a forced reinstall overwrites
+local edits to these four files — customize via `defaults/optional/` or a fork instead).
+`CONFIGURATION.md` specifically is also covered by `./.loom/scripts/resync-installed.sh`, so a
+fix to this file reaches an existing install without a full forced reinstall.
 
 ### Optional: External Issue Labeling Workflow
 
@@ -60,7 +62,7 @@ The issue template integrates with Loom's label-based workflow coordination. `.g
 is the authoritative label set (each label's `Applied by:` field states who sets it) — see that
 file rather than a table here, which would drift.
 
-See [WORKFLOWS.md](../docs/workflows.md) for complete workflow documentation.
+See [WORKFLOWS.md](https://github.com/rjwalters/loom/blob/main/docs/workflows.md) for complete workflow documentation.
 
 ## Benefits
 

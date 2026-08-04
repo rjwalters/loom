@@ -16,15 +16,30 @@
 //!
 //! So calibrate is now strictly a **measurement report**: it prints what the
 //! host looks like right now, what the knobs currently resolve to, the
-//! `min(token axis, disk headroom, maxConcurrent)` breakdown, and which term
-//! binds. Reading it is how an operator decides whether to raise the knob:
+//! `min(disk headroom, ram headroom, maxConcurrent)` breakdown, which term
+//! binds, and — since #5270 — whether the separate CPU saturation admission
+//! brake ([`crate::admission_brake`]) is holding dispatch outright. Reading it
+//! is how an operator decides whether to raise the knob:
 //!
 //! - **binds on `ceiling` while the host sits idle** ⇒ raise `maxConcurrent`.
 //! - **binds on `ceiling` while the host is saturated** (low idle fraction, or
 //!   the host breaker tripping) ⇒ the knob is already at/above what this machine
 //!   sustains; leave it or lower it.
-//! - **binds on `token`/`disk`** ⇒ raising `maxConcurrent` changes nothing; add
-//!   accounts or free scratch space.
+//! - **binds on `disk`** ⇒ raising `maxConcurrent` changes nothing; free
+//!   scratch space.
+//! - **binds on `ram`** (#5270) ⇒ raising `maxConcurrent` changes nothing;
+//!   free memory.
+//! - **the CPU admission brake is holding** (#5270) ⇒ dispatch is blocked
+//!   THIS tick regardless of the cap above; wait for load to drop, or retune
+//!   the brake's threshold if it is firing on routine bursts.
+//!
+//! The token pool's healthy-account count is still reported (it drives
+//! spawn-time *selection*), but since #5270 it is informational only — it no
+//! longer bounds the cap (nor does the CPU term, on any auth path — a
+//! metered API key or an overage-enabled subscription pool has no
+//! exhaustible admission ceiling worth modeling). See
+//! [`crate::work_finder::resolve_dynamic_max_concurrent`] for the full
+//! rationale.
 //!
 //! It never writes config. `--write` is accepted-but-ignored with a deprecation
 //! warning so an existing `loom-daemon calibrate --write` invocation in a
@@ -79,6 +94,19 @@ pub struct HostMeasurements {
     /// The resolved per-worktree GB estimate
     /// ([`crate::disk_headroom::per_worktree_gb`]) — env-only, no config key.
     pub per_worktree_gb: u64,
+    /// The RAM headroom term (#5270,
+    /// [`crate::ram_headroom::ram_headroom_limit`]) — worktree slots the
+    /// currently-available memory can hold at the resolved per-worktree RAM
+    /// GB estimate. `usize::MAX` means the probe was unmeasurable (skip the
+    /// clamp — see [`crate::ram_headroom`] docs).
+    pub ram_headroom: usize,
+    /// Available RAM (GB), when measurable (`None` when unmeasurable — see
+    /// [`crate::ram_headroom::available_ram_gb`]).
+    pub ram_free_gb: Option<u64>,
+    /// The resolved per-worktree RAM GB estimate
+    /// ([`crate::ram_headroom::per_worktree_ram_gb`]) — env-only, no config
+    /// key (mirrors [`Self::per_worktree_gb`]).
+    pub per_worktree_ram_gb: u64,
     /// Count of `available` (healthy) accounts from the ranking snapshot, or
     /// the raw pool size when no ranking data exists — mirrors
     /// [`crate::capacity::token_axis_limit`], the same source
@@ -122,6 +150,19 @@ pub struct HostMeasurements {
     /// because this — not an admission-time CPU estimate — is what bounds
     /// concurrent heavy builds since #4512.
     pub build_slots: usize,
+    /// Whether the CPU saturation admission brake
+    /// ([`crate::admission_brake`], #4903) is enabled for this workspace.
+    pub cpu_admission_brake_enabled: bool,
+    /// The brake's resolved load-per-core hold threshold (env > config >
+    /// default — [`crate::admission_brake::DEFAULT_ADMISSION_BRAKE_LOAD_PER_CORE`],
+    /// retuned to the "dumb mode" `0.95` CPU gate by #5270).
+    pub cpu_admission_brake_threshold: f64,
+    /// Whether the brake would hold new admissions **right now**, computed
+    /// fresh from [`Self::loadavg_1m`] / [`Self::logical_cpus`] — a one-shot
+    /// `calibrate` invocation is a separate process from the running daemon,
+    /// so this recomputes the decision rather than reading the live daemon's
+    /// registered brake state (which this process cannot see).
+    pub cpu_admission_brake_held: bool,
 }
 
 impl HostMeasurements {
@@ -141,21 +182,36 @@ impl HostMeasurements {
     #[must_use]
     pub fn dynamic_cap(&self) -> usize {
         crate::work_finder::resolve_dynamic_max_concurrent(
-            self.token_axis_limit,
-            self.configured_per_token_concurrency,
             self.disk_headroom,
+            self.ram_headroom,
             self.configured_max_concurrent,
         )
     }
 
-    /// Which of the three cap terms binds ([`binding_term`]).
+    /// Which of the three cap terms binds ([`binding_term`]). The token axis
+    /// is no longer part of the admission formula (#5270) — `token_axis_limit`
+    /// / `token_axis_effective()` remain informational-only fields on this
+    /// report, reflecting spawn-time account health, not a concurrency cap.
     #[must_use]
     pub fn binding_term(&self) -> BindingTerm {
-        binding_term(
-            self.token_axis_effective(),
-            self.disk_headroom,
-            self.configured_max_concurrent,
-        )
+        binding_term(self.disk_headroom, self.ram_headroom, self.configured_max_concurrent)
+    }
+
+    /// The single "which machine axis is limiting dispatch right now" answer
+    /// (#5270 AC4 — max/disk/RAM/CPU observability). The CPU saturation
+    /// admission brake is a **point-in-time hold**, not a term in the
+    /// `min(...)` [`Self::dynamic_cap`] formula (see
+    /// [`crate::work_finder::resolve_dynamic_max_concurrent`]'s own docs for
+    /// why), so it takes priority here: a held brake means dispatch is
+    /// blocked THIS tick regardless of what the numeric cap says. When the
+    /// brake is not holding, this falls back to [`Self::binding_term`].
+    #[must_use]
+    pub fn admission_axis(&self) -> &'static str {
+        if self.cpu_admission_brake_held {
+            "cpu"
+        } else {
+            self.binding_term().as_str()
+        }
     }
 
     /// Render this struct as the `"measurements"` JSON object for `--json`
@@ -166,9 +222,12 @@ impl HostMeasurements {
             "logical_cpus": self.logical_cpus,
             "cpu_idle_fraction": self.cpu_idle_fraction,
             "loadavg_1m": self.loadavg_1m,
-            "disk_headroom": disk_headroom_json(self.disk_headroom),
+            "disk_headroom": headroom_json(self.disk_headroom),
             "disk_free_gb": self.disk_free_gb,
             "per_worktree_gb": self.per_worktree_gb,
+            "ram_headroom": headroom_json(self.ram_headroom),
+            "ram_free_gb": self.ram_free_gb,
+            "per_worktree_ram_gb": self.per_worktree_ram_gb,
             "token_axis_limit": self.token_axis_limit,
             "token_axis_effective": self.token_axis_effective(),
             "ranking_present": self.ranking_present,
@@ -184,19 +243,24 @@ impl HostMeasurements {
             "configured_per_token_concurrency": self.configured_per_token_concurrency,
             "per_token_concurrency_env_override": self.per_token_concurrency_env_override,
             "build_slots": self.build_slots,
+            "cpu_admission_brake": {
+                "enabled": self.cpu_admission_brake_enabled,
+                "held": self.cpu_admission_brake_held,
+                "load_per_core_threshold": self.cpu_admission_brake_threshold,
+            },
         })
     }
 }
 
-/// `usize::MAX` (the disk-unmeasurable / unbounded sentinel) does not survive
-/// JSON's number type cleanly across every consumer — render it as the string
-/// `"unbounded"` instead of a giant integer, matching how an operator should
-/// read it.
-fn disk_headroom_json(disk_headroom: usize) -> Value {
-    if disk_headroom == usize::MAX {
+/// `usize::MAX` (the disk/RAM-unmeasurable / unbounded sentinel) does not
+/// survive JSON's number type cleanly across every consumer — render it as
+/// the string `"unbounded"` instead of a giant integer, matching how an
+/// operator should read it.
+fn headroom_json(headroom: usize) -> Value {
+    if headroom == usize::MAX {
         Value::String("unbounded".to_string())
     } else {
-        serde_json::json!(disk_headroom)
+        serde_json::json!(headroom)
     }
 }
 
@@ -205,17 +269,21 @@ fn disk_headroom_json(disk_headroom: usize) -> Value {
 // ============================================================================
 
 /// Which of the three dynamic-cap terms is the binding (smallest) constraint.
-/// Tie-break order mirrors `loom-daemon status`'s own diagnosis
-/// (`resolve_capacity` / `token_bound`): token axis first, then disk, then the
-/// ceiling. (A fourth `Cpu` variant existed until #4512 removed the CPU term
-/// from admission.)
+/// Tie-break order mirrors `loom-daemon status`'s own diagnosis: disk first,
+/// then RAM, then the ceiling. (A `Token` variant existed until #5270 removed
+/// the token axis from admission — see
+/// [`crate::work_finder::resolve_dynamic_max_concurrent`] — and a `Cpu`
+/// variant existed until #4512 removed the CPU term from this same formula;
+/// CPU saturation is reported separately via
+/// [`crate::admission_brake`]/`loom-daemon status`'s `admission_brake` block,
+/// since it holds admission as a point-in-time gate rather than shrinking
+/// this `min(...)`.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BindingTerm {
-    /// The token axis (`healthy_accounts × per_token_concurrency`) is the
-    /// smallest term.
-    Token,
     /// Disk headroom is the smallest term.
     Disk,
+    /// RAM headroom is the smallest term (#5270).
+    Ram,
     /// The operator-configured `maxConcurrent` is the smallest term.
     Ceiling,
 }
@@ -225,8 +293,8 @@ impl BindingTerm {
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Token => "token",
             Self::Disk => "disk",
+            Self::Ram => "ram",
             Self::Ceiling => "ceiling",
         }
     }
@@ -235,16 +303,12 @@ impl BindingTerm {
 /// Determine which of the three terms is smallest (binds), applying the same
 /// tie-break order [`BindingTerm`] documents.
 #[must_use]
-pub fn binding_term(
-    token_axis_effective: usize,
-    disk_headroom: usize,
-    ceiling: usize,
-) -> BindingTerm {
-    let min_val = token_axis_effective.min(disk_headroom).min(ceiling);
-    if token_axis_effective == min_val {
-        BindingTerm::Token
-    } else if disk_headroom == min_val {
+pub fn binding_term(disk_headroom: usize, ram_headroom: usize, ceiling: usize) -> BindingTerm {
+    let min_val = disk_headroom.min(ram_headroom).min(ceiling);
+    if disk_headroom == min_val {
         BindingTerm::Disk
+    } else if ram_headroom == min_val {
+        BindingTerm::Ram
     } else {
         BindingTerm::Ceiling
     }
@@ -289,6 +353,10 @@ pub fn measure(workspace_root: &Path) -> HostMeasurements {
     let per_worktree_gb = crate::disk_headroom::per_worktree_gb();
     let disk_headroom = crate::disk_headroom::disk_headroom_limit(workspace_root);
 
+    let ram_free_gb = crate::ram_headroom::available_ram_gb();
+    let per_worktree_ram_gb = crate::ram_headroom::per_worktree_ram_gb();
+    let ram_headroom = crate::ram_headroom::ram_headroom_limit();
+
     let pool_size = crate::tokens::token_pool_size(workspace_root);
     let ranking = crate::capacity::read_ranking(workspace_root);
     let (token_axis_limit, ranking_present, total_accounts) = match &ranking {
@@ -306,6 +374,13 @@ pub fn measure(workspace_root: &Path) -> HostMeasurements {
     let per_token_concurrency_env_override =
         std::env::var(crate::work_finder::PER_TOKEN_CONCURRENCY_ENV).is_ok();
 
+    // CPU saturation admission brake (#4903, retuned by #5270 into the "dumb
+    // mode" CPU gate): recomputed fresh rather than read from the live
+    // daemon's registered global, since a one-shot `calibrate` invocation runs
+    // in a separate process that never sees that state.
+    let brake_config = crate::admission_brake::resolve_config_for(workspace_root);
+    let brake_decision = crate::admission_brake::decide(&brake_config, loadavg_1m, logical_cpus);
+
     HostMeasurements {
         logical_cpus,
         cpu_idle_fraction,
@@ -313,6 +388,9 @@ pub fn measure(workspace_root: &Path) -> HostMeasurements {
         disk_headroom,
         disk_free_gb,
         per_worktree_gb,
+        ram_headroom,
+        ram_free_gb,
+        per_worktree_ram_gb,
         token_axis_limit,
         ranking_present,
         total_accounts,
@@ -322,6 +400,9 @@ pub fn measure(workspace_root: &Path) -> HostMeasurements {
         configured_per_token_concurrency,
         per_token_concurrency_env_override,
         build_slots: crate::build_slot::resolve_slots(),
+        cpu_admission_brake_enabled: brake_config.enabled,
+        cpu_admission_brake_threshold: brake_config.load_per_core_threshold,
+        cpu_admission_brake_held: brake_decision.held,
     }
 }
 
@@ -336,6 +417,11 @@ pub fn report_json(m: &HostMeasurements) -> Value {
         "measurements": m.to_json(),
         "dynamic_cap": m.dynamic_cap(),
         "binding_term": m.binding_term().as_str(),
+        // #5270 AC4: the CPU brake is a point-in-time hold outside the
+        // `min(...)` cap formula, so it can override `binding_term` as the
+        // real answer to "what's stopping dispatch right now" — see
+        // `HostMeasurements::admission_axis`.
+        "admission_axis": m.admission_axis(),
         "advice": advice(m),
         // Retained for machine consumers that keyed off it before #4512: this
         // subcommand no longer writes anything, ever.
@@ -349,6 +435,15 @@ pub fn report_json(m: &HostMeasurements) -> Value {
 /// unit-tested against injected host classes.
 #[must_use]
 pub fn advice(m: &HostMeasurements) -> String {
+    if m.cpu_admission_brake_held {
+        return format!(
+            "the CPU saturation admission brake is HOLDING new admissions right now \
+             (load-per-core ≥ {:.2}) — this is the actual limiter this instant, ahead of the \
+             disk/RAM/maxConcurrent cap below; in-flight sweeps are untouched and it releases the \
+             moment load drops back under the threshold (#5270, #4903).",
+            m.cpu_admission_brake_threshold
+        );
+    }
     match m.binding_term() {
         BindingTerm::Ceiling => match m.cpu_idle_fraction {
             Some(idle) if idle >= IDLE_HEADROOM_FRACTION => format!(
@@ -370,19 +465,17 @@ pub fn advice(m: &HostMeasurements) -> String {
                 m.configured_max_concurrent
             ),
         },
-        BindingTerm::Token => format!(
-            "the token axis binds ({} healthy account(s) × per-token {} = {}) — raising \
-             maxConcurrent changes nothing; add accounts (`loom-daemon tokens bootstrap`) or refresh \
-             the ranking (`loom-daemon tokens check --ranking`).",
-            m.token_axis_limit,
-            m.configured_per_token_concurrency.max(1),
-            m.token_axis_effective()
-        ),
         BindingTerm::Disk => format!(
             "disk headroom binds ({} worktree slot(s) at {} GB each) — raising maxConcurrent \
              changes nothing; free scratch space or lower LOOM_PER_WORKTREE_GB.",
             display_headroom(m.disk_headroom),
             m.per_worktree_gb
+        ),
+        BindingTerm::Ram => format!(
+            "RAM headroom binds ({} worktree slot(s) at {} GB each) — raising maxConcurrent \
+             changes nothing; free memory or lower LOOM_PER_WORKTREE_RAM_GB (#5270).",
+            display_headroom(m.ram_headroom),
+            m.per_worktree_ram_gb
         ),
     }
 }
@@ -423,9 +516,21 @@ pub fn report_human(m: &HostMeasurements) -> String {
             out.push_str("  cpu observed:   no CPU signal available on this platform\n");
         }
     }
-    out.push_str(
-        "                  (observational only since #4512 — CPU is no longer an admission term)\n",
-    );
+    out.push_str(&format!(
+        "                  (not a `min(...)` cap term since #4512 — but the CPU admission \
+         brake {} watches it: holds new admissions at load-per-core ≥ {:.2}, currently {})\n",
+        if m.cpu_admission_brake_enabled {
+            "IS enabled"
+        } else {
+            "is disabled"
+        },
+        m.cpu_admission_brake_threshold,
+        if m.cpu_admission_brake_held {
+            "HOLDING"
+        } else {
+            "not holding"
+        }
+    ));
     match (m.disk_free_gb, m.disk_headroom) {
         (Some(free), headroom) if headroom != usize::MAX => {
             out.push_str(&format!(
@@ -442,6 +547,23 @@ pub fn report_human(m: &HostMeasurements) -> String {
     out.push_str(
         "                  (LOOM_PER_WORKTREE_GB is env-only — there is no config key for the \
          disk estimate; override with `export LOOM_PER_WORKTREE_GB=<gb>`)\n",
+    );
+    match (m.ram_free_gb, m.ram_headroom) {
+        (Some(free), headroom) if headroom != usize::MAX => {
+            out.push_str(&format!(
+                "  ram headroom:   {headroom} worktree slot(s) ({free} GB available / {} GB per-worktree estimate)\n",
+                m.per_worktree_ram_gb
+            ));
+        }
+        _ => {
+            out.push_str(
+                "  ram headroom:   unmeasurable (skipping the RAM clamp — treated as unbounded)\n",
+            );
+        }
+    }
+    out.push_str(
+        "                  (LOOM_PER_WORKTREE_RAM_GB is env-only — there is no config key for \
+         the RAM estimate; override with `export LOOM_PER_WORKTREE_RAM_GB=<gb>`, #5270)\n",
     );
     if m.ranking_present {
         out.push_str(&format!(
@@ -504,14 +626,23 @@ pub fn report_human(m: &HostMeasurements) -> String {
 
     out.push_str(&format!("\nDynamic concurrency cap: {}\n", m.dynamic_cap()));
     out.push_str(&format!(
-        "  = min(healthy {} × per-token {} = {}, disk {}, maxConcurrent {})\n",
+        "  = min(disk {}, ram {}, maxConcurrent {})\n",
+        display_headroom(m.disk_headroom),
+        display_headroom(m.ram_headroom),
+        m.configured_max_concurrent,
+    ));
+    out.push_str(&format!(
+        "  (token pool healthy {} × per-token {} = {} is informational only — the token axis no \
+         longer bounds the cap, #5270)\n",
         m.token_axis_limit,
         factor,
         m.token_axis_effective(),
-        display_headroom(m.disk_headroom),
-        m.configured_max_concurrent,
     ));
-    out.push_str(&format!("  binds on: {}\n", m.binding_term().as_str()));
+    out.push_str(&format!("  cap binds on: {}\n", m.binding_term().as_str()));
+    out.push_str(&format!(
+        "  admission blocked by (max/disk/ram/cpu, #5270 AC4): {}\n",
+        m.admission_axis()
+    ));
 
     out.push_str(&format!("\nReading: {}\n", advice(m)));
     out.push_str(
@@ -553,6 +684,9 @@ mod tests {
             disk_headroom: 36,
             disk_free_gb: Some(72),
             per_worktree_gb: 2,
+            ram_headroom: 40,
+            ram_free_gb: Some(80),
+            per_worktree_ram_gb: 2,
             token_axis_limit: 6,
             ranking_present: true,
             total_accounts: 8,
@@ -562,6 +696,9 @@ mod tests {
             configured_per_token_concurrency: 2,
             per_token_concurrency_env_override: false,
             build_slots: 1,
+            cpu_admission_brake_enabled: true,
+            cpu_admission_brake_threshold: 0.95,
+            cpu_admission_brake_held: false,
         }
     }
 
@@ -575,7 +712,7 @@ mod tests {
         }
     }
 
-    /// Plenty of CPU and tokens, nearly-full scratch volume.
+    /// Plenty of CPU/RAM/tokens, nearly-full scratch volume.
     fn disk_bound_host() -> HostMeasurements {
         HostMeasurements {
             disk_headroom: 2,
@@ -585,8 +722,20 @@ mod tests {
         }
     }
 
-    /// One healthy account: the token axis binds.
-    fn token_bound_host() -> HostMeasurements {
+    /// Plenty of CPU/tokens/disk, critically low available RAM (#5270).
+    fn ram_bound_host() -> HostMeasurements {
+        HostMeasurements {
+            ram_headroom: 1,
+            ram_free_gb: Some(2),
+            configured_max_concurrent: 10,
+            ..idle_worker_host()
+        }
+    }
+
+    /// A near-exhausted token pool: no longer binds the cap since #5270 (only
+    /// disk/ram/maxConcurrent do), but the field remains for the informational
+    /// token-pool line in the report.
+    fn token_starved_host() -> HostMeasurements {
         HostMeasurements {
             token_axis_limit: 1,
             total_accounts: 8,
@@ -595,20 +744,42 @@ mod tests {
         }
     }
 
+    /// A host where the CPU saturation admission brake is currently holding
+    /// new admissions — the "dumb mode" case #5270 introduces.
+    fn cpu_brake_held_host() -> HostMeasurements {
+        HostMeasurements {
+            cpu_admission_brake_held: true,
+            loadavg_1m: Some(7.8),
+            ..idle_worker_host()
+        }
+    }
+
     // ========================================================================
-    // The cap is exactly `resolve_dynamic_max_concurrent` — no CPU term
+    // The cap is exactly `resolve_dynamic_max_concurrent` — no CPU or token
+    // axis term (#5270)
     // ========================================================================
 
     #[test]
     fn dynamic_cap_matches_the_three_term_admission_formula() {
         let m = idle_worker_host();
-        // min(6 × 2 = 12, disk 36, maxConcurrent 3) = 3.
+        // min(disk 36, ram 40, maxConcurrent 3) = 3 — the token axis (6 × 2 =
+        // 12) plays no role even though it would have been smaller under the
+        // old formula.
         assert_eq!(m.dynamic_cap(), 3);
         assert_eq!(
             m.dynamic_cap(),
-            crate::work_finder::resolve_dynamic_max_concurrent(6, 2, 36, 3),
+            crate::work_finder::resolve_dynamic_max_concurrent(36, 40, 3),
             "calibrate must never compute a different cap than dispatch"
         );
+    }
+
+    #[test]
+    fn a_token_starved_host_is_not_capped_by_its_token_pool() {
+        // #5270: even with only 1 healthy account, the cap is min(disk, ram,
+        // maxConcurrent) — the token axis never binds any more.
+        let m = token_starved_host();
+        assert_eq!(m.dynamic_cap(), 10, "min(disk 36, ram 40, maxConcurrent 10)");
+        assert_eq!(m.binding_term(), BindingTerm::Ceiling);
     }
 
     #[test]
@@ -621,25 +792,55 @@ mod tests {
         assert_eq!(m.binding_term(), BindingTerm::Ceiling);
     }
 
+    #[test]
+    fn a_ram_starved_host_is_capped_by_ram_headroom() {
+        // #5270 AC3: critically-low RAM caps the dynamic concurrency the same
+        // way disk headroom already did.
+        let m = ram_bound_host();
+        assert_eq!(m.dynamic_cap(), 1, "min(disk 36, ram 1, maxConcurrent 10)");
+        assert_eq!(m.binding_term(), BindingTerm::Ram);
+    }
+
     // ========================================================================
     // binding_term
     // ========================================================================
 
     #[test]
-    fn binding_term_prefers_token_then_disk_then_ceiling() {
-        assert_eq!(binding_term(2, 5, 9), BindingTerm::Token);
-        assert_eq!(binding_term(9, 2, 5), BindingTerm::Disk);
-        assert_eq!(binding_term(9, 5, 2), BindingTerm::Ceiling);
-        // Ties resolve to the earliest term, matching `status`'s diagnosis.
-        assert_eq!(binding_term(3, 3, 3), BindingTerm::Token);
-        assert_eq!(binding_term(9, 3, 3), BindingTerm::Disk);
+    fn binding_term_prefers_disk_then_ram_then_ceiling() {
+        assert_eq!(binding_term(2, 9, 9), BindingTerm::Disk);
+        assert_eq!(binding_term(9, 2, 9), BindingTerm::Ram);
+        assert_eq!(binding_term(9, 9, 2), BindingTerm::Ceiling);
+        // A tie between disk and ram resolves to disk, matching `status`'s
+        // tie-break order.
+        assert_eq!(binding_term(3, 3, 9), BindingTerm::Disk);
+        assert_eq!(binding_term(9, 3, 3), BindingTerm::Ram);
     }
 
     #[test]
     fn host_classes_bind_where_expected() {
         assert_eq!(idle_worker_host().binding_term(), BindingTerm::Ceiling);
         assert_eq!(disk_bound_host().binding_term(), BindingTerm::Disk);
-        assert_eq!(token_bound_host().binding_term(), BindingTerm::Token);
+        assert_eq!(ram_bound_host().binding_term(), BindingTerm::Ram);
+        // #5270: even a near-exhausted token pool never binds the cap any more.
+        assert_eq!(token_starved_host().binding_term(), BindingTerm::Ceiling);
+    }
+
+    // ========================================================================
+    // admission_axis — the CPU brake overrides the numeric binding_term
+    // ========================================================================
+
+    #[test]
+    fn admission_axis_falls_back_to_binding_term_when_the_brake_is_not_holding() {
+        assert_eq!(idle_worker_host().admission_axis(), "ceiling");
+        assert_eq!(disk_bound_host().admission_axis(), "disk");
+        assert_eq!(ram_bound_host().admission_axis(), "ram");
+    }
+
+    #[test]
+    fn admission_axis_reports_cpu_when_the_brake_is_holding() {
+        // Even a host whose numeric cap would say "ceiling" reports "cpu" here
+        // — the brake blocks dispatch THIS tick regardless of the cap.
+        assert_eq!(cpu_brake_held_host().admission_axis(), "cpu");
     }
 
     // ========================================================================
@@ -661,12 +862,10 @@ mod tests {
     }
 
     #[test]
-    fn advice_points_at_tokens_or_disk_when_those_bind() {
-        assert!(advice(&token_bound_host()).contains("loom-daemon tokens bootstrap"));
+    fn advice_points_at_disk_when_it_binds() {
         assert!(advice(&disk_bound_host()).contains("LOOM_PER_WORKTREE_GB"));
-        // Neither should tell the operator to raise maxConcurrent — it would do
-        // nothing.
-        assert!(!advice(&token_bound_host()).contains("raise autonomous"));
+        // Must not tell the operator to raise maxConcurrent — it would do
+        // nothing while disk binds.
         assert!(!advice(&disk_bound_host()).contains("raise autonomous"));
     }
 
@@ -675,6 +874,25 @@ mod tests {
         let mut m = idle_worker_host();
         m.cpu_idle_fraction = None;
         assert!(advice(&m).contains("no CPU idle sample"));
+    }
+
+    #[test]
+    fn advice_points_at_ram_when_it_binds() {
+        assert!(advice(&ram_bound_host()).contains("LOOM_PER_WORKTREE_RAM_GB"));
+        // Must not tell the operator to raise maxConcurrent — it would do
+        // nothing while RAM binds.
+        assert!(!advice(&ram_bound_host()).contains("raise autonomous"));
+    }
+
+    #[test]
+    fn advice_names_the_cpu_brake_when_it_is_holding_ahead_of_the_numeric_cap() {
+        // The brake held-state must win even though this fixture's numeric cap
+        // (min(disk, ram, maxConcurrent)) would otherwise say "ceiling" — the
+        // brake is the real limiter this instant.
+        let text = advice(&cpu_brake_held_host());
+        assert!(text.contains("HOLDING"), "{text}");
+        assert!(text.contains("0.95"), "{text}");
+        assert!(!text.contains("raise autonomous"), "{text}");
     }
 
     // ========================================================================
@@ -770,6 +988,14 @@ mod tests {
         assert_eq!(m.to_json()["disk_headroom"], "unbounded");
     }
 
+    #[test]
+    fn ram_headroom_unbounded_renders_as_string_not_a_giant_int() {
+        let mut m = idle_worker_host();
+        m.ram_headroom = usize::MAX;
+        m.ram_free_gb = None;
+        assert_eq!(m.to_json()["ram_headroom"], "unbounded");
+    }
+
     // ========================================================================
     // Human report
     // ========================================================================
@@ -779,10 +1005,13 @@ mod tests {
         let text = report_human(&idle_worker_host());
         assert!(text.contains("loom-daemon calibrate"));
         assert!(text.contains("Dynamic concurrency cap: 3"));
-        assert!(text.contains("= min(healthy 6 × per-token 2 = 12, disk 36, maxConcurrent 3)"));
-        assert!(text.contains("binds on: ceiling"));
+        assert!(text.contains("= min(disk 36, ram 40, maxConcurrent 3)"));
+        assert!(text.contains("informational only"));
+        assert!(text.contains("cap binds on: ceiling"));
+        assert!(text.contains("admission blocked by"));
         assert!(text.contains("build slots:    1"));
         assert!(text.contains("LOOM_PER_WORKTREE_GB"));
+        assert!(text.contains("LOOM_PER_WORKTREE_RAM_GB"));
         assert!(text.contains("read-only"));
         assert!(text.contains("loom-daemon-start.sh"));
     }

@@ -94,6 +94,22 @@ check_versions() {
     all_match=false
   fi
 
+  # Check mcp-loom/package-lock.json — npm lockfiles carry the version in
+  # (at least) two places: the top-level `version` field and the matching
+  # `packages[""].version` entry, so a single `jq -r '.version'` read (what
+  # get_version_from_file() does for every VERSION_FILES entry) would
+  # silently ignore the second occurrence. Grep both instead.
+  local mcp_lock_versions
+  mcp_lock_versions=$(grep -m2 '"version"' "$REPO_ROOT/mcp-loom/package-lock.json" | sed 's/.*"version": "\(.*\)".*/\1/' | sort -u)
+  local mcp_lock_count
+  mcp_lock_count=$(echo "$mcp_lock_versions" | wc -l | tr -d ' ')
+  if [ "$mcp_lock_count" -eq 1 ] && [ "$(echo "$mcp_lock_versions" | tr -d '[:space:]')" = "$expected" ]; then
+    echo "OK        mcp-loom/package-lock.json: both version fields at $expected"
+  else
+    echo "MISMATCH  mcp-loom/package-lock.json: version fields not all at $expected"
+    all_match=false
+  fi
+
   if $all_match; then
     echo ""
     echo "All versions in sync: $expected"
@@ -171,6 +187,11 @@ set_version() {
   (cd "$REPO_ROOT" && cargo update loom-daemon loom-api 2>/dev/null)
   echo "  Updated Cargo.lock"
 
+  # mcp-loom/package-lock.json — regenerate the npm-native way rather than
+  # hand-editing the JSON, so nested packages[""] entries stay consistent.
+  (cd "$REPO_ROOT/mcp-loom" && npm install --package-lock-only)
+  echo "  Updated mcp-loom/package-lock.json"
+
   echo ""
   echo "Version set to $new_version"
 }
@@ -182,7 +203,7 @@ do_tag() {
   echo "Committing and tagging..."
   (
     cd "$REPO_ROOT"
-    git add package.json mcp-loom/package.json \
+    git add package.json mcp-loom/package.json mcp-loom/package-lock.json \
            loom-daemon/Cargo.toml loom-api/Cargo.toml \
            CLAUDE.md Cargo.lock
     [ -f "CHANGELOG.md" ] && git add CHANGELOG.md

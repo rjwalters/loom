@@ -198,6 +198,293 @@ assert_deny "Block gh pr merge --squash" \
 assert_deny_reason_matches "gh pr merge deny reason names merge-pr.sh" \
     "gh pr merge 123" "merge-pr\.sh"
 
+# --- False-positive regression tests (issue #5109) -----------------------
+# The phrase "gh pr merge" appearing as INERT TEXT (a heredoc-quoted commit
+# message, a --search query value) must not deny -- only an actual invocation
+# should. Both reproduce the exact occurrences reported in #5109.
+
+PHRASE_CMD="gh pr merge"
+
+# Occurrence 1: a commit message built via the CLAUDE.md-documented
+# `-m "$(cat <<'EOF' ... EOF)"` heredoc idiom, quoting the phrase as prose
+# documenting the very rule this guard enforces.
+GH_5109_COMMIT_CMD='git add foo.md && git commit -m "$(cat <<'"'"'EOF'"'"'
+Document the rule: never `'"$PHRASE_CMD"'` directly, use merge-pr.sh instead.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+EOF
+)" && git push'
+assert_allow "Allow heredoc commit message that quotes the phrase as prose" \
+    "$GH_5109_COMMIT_CMD"
+
+# Occurrence 2: a read-only search query whose --search value happens to
+# contain the phrase as text to search FOR, not a command to run.
+assert_allow "Allow gh issue list --search containing the phrase as query text" \
+    "gh issue list --state open --search \"$PHRASE_CMD redirect guard false positive\" --limit 20 --json number,title,url"
+
+# Regression guard: masking must NOT weaken the guard against an actual
+# invocation wrapped in a shell -c string -- '-c' is deliberately not in the
+# masked-flag whitelist, so this must still deny.
+assert_deny "Still block gh pr merge wrapped in sh -c (no masking regression)" \
+    "sh -c \"$PHRASE_CMD 123\""
+
+# Regression guard: a heredoc that feeds an INTERPRETER (not `cat`) is live
+# code, not inert data, and must stay visible to the check.
+GH_5109_BASH_HEREDOC_CMD='bash <<'"'"'EOF'"'"'
+'"$PHRASE_CMD"' 123
+EOF'
+assert_deny "Still block gh pr merge inside a bash-fed (non-cat) heredoc" \
+    "$GH_5109_BASH_HEREDOC_CMD"
+
+# Regression guard (PR #5115 review): `cat` never executes its own body, but
+# piping its stdout into a shell on the SAME line -- `cat <<'EOF' | bash` --
+# makes the heredoc body live, executed code despite `cat` being the literal
+# consumer. The cat-heredoc masking must NOT neutralize such a body (it is not
+# confined to inert text: it reaches `bash`), so a real invocation shaped this
+# way must still deny. This is the exact bypass reported in the #5115 review.
+GH_5115_CAT_PIPE_BASH_CMD='cat <<'"'"'EOF'"'"' | bash
+'"$PHRASE_CMD"' 123 --admin
+EOF'
+assert_deny "Still block gh pr merge in a cat-heredoc piped into bash" \
+    "$GH_5115_CAT_PIPE_BASH_CMD"
+
+# And its `| sh` cousin -- same reasoning, different interpreter.
+GH_5115_CAT_PIPE_SH_CMD='cat <<'"'"'EOF'"'"' | sh
+'"$PHRASE_CMD"' 123
+EOF'
+assert_deny "Still block gh pr merge in a cat-heredoc piped into sh" \
+    "$GH_5115_CAT_PIPE_SH_CMD"
+
+# And a cat-heredoc captured then eval-executed: captured by $() but the
+# consumer is `eval`, NOT a text-data flag, so the body is not inert and must
+# stay visible.
+GH_5115_CAT_EVAL_CMD='eval "$(cat <<'"'"'EOF'"'"'
+'"$PHRASE_CMD"' 123
+EOF
+)"'
+assert_deny "Still block gh pr merge in a cat-heredoc captured then eval'd" \
+    "$GH_5115_CAT_EVAL_CMD"
+
+# Regression guard (issue #5122 -- capre-gate bypass reported after #5115
+# merged): the `capre` prefix gate (added by #5115 to allow the documented
+# `-m "$(cat <<'EOF' ... EOF)"` idiom) only inspected the text BEFORE the
+# `cat` token -- never what follows the heredoc opener line. So wrapping the
+# SAME bypass shapes above in a flag-captured prefix (`-m "$(cat <<'EOF' |
+# bash ...)"`) slipped straight past the gate and was masked as inert data,
+# even though `cat`'s stdout is still piped into a live shell. The opener
+# line must END immediately after the quoted delimiter to be masked; any
+# suffix -- a pipe, a redirect, anything -- must keep the body visible to
+# the merge-redirect grep.
+GH_5122_FLAG_CAPTURED_PIPE_BASH_CMD='git commit -m "$(cat <<'"'"'EOF'"'"' | bash
+'"$PHRASE_CMD"' 123 --admin
+EOF
+)"'
+assert_deny "Still block gh pr merge in a flag-captured cat-heredoc piped into bash (#5122)" \
+    "$GH_5122_FLAG_CAPTURED_PIPE_BASH_CMD"
+
+# Same class, but the redirect parks the body in a file instead of piping it
+# directly -- a later command on the same line then executes that file. The
+# pipe is not the only live vector; any redirect on the opener line is.
+GH_5122_FLAG_CAPTURED_REDIRECT_FILE_CMD='git commit -m "$(cat <<'"'"'EOF'"'"' 1> /tmp/loom-test-5122.sh
+'"$PHRASE_CMD"' 123 --admin
+EOF
+)" ; bash /tmp/loom-test-5122.sh'
+assert_deny "Still block gh pr merge in a flag-captured cat-heredoc redirected to a file then bash'd (#5122)" \
+    "$GH_5122_FLAG_CAPTURED_REDIRECT_FILE_CMD"
+
+# The `<<-` (dash) heredoc variant (strips leading tabs from the body) must
+# get the same treatment -- the opener-line-suffix check does not special-
+# case the `-` after `<<`.
+GH_5122_FLAG_CAPTURED_DASH_PIPE_BASH_CMD='git commit -m "$(cat <<-'"'"'EOF'"'"' | bash
+'"$PHRASE_CMD"' 123 --admin
+EOF
+)"'
+assert_deny "Still block gh pr merge in a flag-captured cat <<- heredoc piped into bash (#5122)" \
+    "$GH_5122_FLAG_CAPTURED_DASH_PIPE_BASH_CMD"
+
+# --- False-positive regression tests (issue #5155) -----------------------
+# The phrase appearing as INERT TEXT inside a POSITIONAL (no preceding flag
+# name) argument to a known non-executing command must not deny -- only an
+# actual invocation should. Both reproduce the exact occurrences reported in
+# #5155 (a fresh shape not covered by #5109/#5115, which only masked
+# NAMED-flag values).
+
+# Reproduction 1: ./.loom/scripts/check-duplicate.sh's signature is
+# `check-duplicate.sh TITLE DESCRIPTION` (purely positional, no flags). Both
+# the title and description quote the phrase as prose describing this very
+# guard bug.
+GH_5155_CHECK_DUPLICATE_CMD="./.loom/scripts/check-duplicate.sh \"Guard false positive: $PHRASE_CMD redirect\" \"quotes the phrase '$PHRASE_CMD' as inert text, not a live invocation\""
+assert_allow "Allow check-duplicate.sh positional TITLE/DESCRIPTION quoting the phrase as prose" \
+    "$GH_5155_CHECK_DUPLICATE_CMD"
+
+# Reproduction 2: a read-only `grep -n` source-code search whose pattern
+# argument (positional, after the `-n` flag) happens to contain the phrase as
+# search text. `grep` cannot execute anything it searches for.
+assert_allow "Allow grep -n search of the guard's own source for the phrase" \
+    "grep -n \"gh-pr-merge-redirect\\|$PHRASE_CMD\" defaults/hooks/guard-loom-workflow.sh"
+
+# ripgrep cousin of the same shape.
+assert_allow "Allow rg search containing the phrase as a search pattern" \
+    "rg -n \"$PHRASE_CMD\" defaults/hooks/guard-loom-workflow.sh"
+
+# Regression guard: masking must NOT weaken the guard against a command that
+# is NOT in the new positional-arg allowlist -- `echo` piped into `bash` is a
+# genuine (if contrived) execution vector, and `echo` is deliberately absent
+# from the allowlist, so the phrase must remain visible and still deny.
+assert_deny "Still block phrase piped through echo | bash (echo not allowlisted, #5155)" \
+    "echo \"$PHRASE_CMD 123\" | bash"
+
+# Regression guard: masking a matched positional span must not blind the
+# check to a SECOND, real invocation elsewhere on the same command line --
+# masking only narrows what THIS ONE check misses inside the matched
+# grep/rg/check-duplicate.sh argument, it never widens what it misses
+# outside that span.
+assert_deny "Still block a real gh pr merge invocation chained after a masked grep search (#5155)" \
+    "grep -n \"$PHRASE_CMD\" defaults/hooks/guard-loom-workflow.sh && $PHRASE_CMD 123"
+
+echo ""
+
+# --- False-positive regression tests (issue #5172) -----------------------
+# `gh api`'s `-f <field>=<value>` syntax is a DIFFERENT shape from the
+# `--body <value>` flags #5109/#5115 masked, and a heredoc ASSIGNED TO A
+# SHELL VARIABLE earlier in the command (then only referenced later via that
+# variable) is a two-hop indirection neither #5109 nor #5155 covered. Both
+# shapes are reproduced here from the exact occurrence reported in #5172.
+
+# Reproduction (exact #5172 shape): a heredoc assigned to $BODY, whose prose
+# quotes the disallowed phrase describing test cases, referenced later via
+# `gh api -f body="$BODY"`.
+GH_5172_VAR_HEREDOC_CMD='BODY="$(cat <<'"'"'EOF2'"'"'
+Tested: raw '"$PHRASE_CMD"' 123 denied; echo "'"$PHRASE_CMD"' 123" | bash denied.
+EOF2
+)"
+gh api "repos/rjwalters/loom/issues/5172/comments" -f body="$BODY"'
+assert_allow "Allow gh api -f body=\$VAR where \$VAR is a heredoc quoting the phrase as prose (#5172)" \
+    "$GH_5172_VAR_HEREDOC_CMD"
+
+# A heredoc directly captured (no variable indirection) by `-f body=` must
+# also be recognized -- the `gh api` field-syntax analog of the #5109 `-m`/
+# `--body` case.
+GH_5172_DIRECT_FIELD_HEREDOC_CMD='gh api "repos/o/r/issues/1/comments" -f body="$(cat <<'"'"'EOF5'"'"'
+'"$PHRASE_CMD"' 123 as prose
+EOF5
+)"'
+assert_allow "Allow gh api -f body=\"\$(cat <<EOF ...)\" heredoc captured directly (#5172)" \
+    "$GH_5172_DIRECT_FIELD_HEREDOC_CMD"
+
+# A literal (non-heredoc) `-f body="..."` value quoting the phrase directly.
+assert_allow "Allow gh api -f body=\"...\" literal value quoting the phrase as prose (#5172)" \
+    "gh api \"repos/o/r/issues/1/comments\" -f body=\"Tested: $PHRASE_CMD 123 denied\""
+
+# The variable-indirection fix must generalize beyond `body` to the other
+# known text-bearing `gh api` fields (message here).
+GH_5172_VAR_HEREDOC_MESSAGE_CMD='MSG="$(cat <<'"'"'EOF6'"'"'
+'"$PHRASE_CMD"' 123 as prose in message field
+EOF6
+)"
+gh api "repos/o/r/issues/1/comments" -f message="$MSG"'
+assert_allow "Allow gh api -f message=\$VAR where \$VAR is a heredoc quoting the phrase as prose (#5172)" \
+    "$GH_5172_VAR_HEREDOC_MESSAGE_CMD"
+
+# Regression guard (control, #5172): the two-hop indirection fix must NOT
+# widen the guard into a bypass. A heredoc assigned to a variable that is
+# THEN eval'd is a genuine live invocation and must still deny -- masking a
+# variable-assigned heredoc's body is gated on EVERY later reference to that
+# variable being confined to a known-safe flag/field value; `eval "$CMD"` is
+# not in that allowlist.
+GH_5172_EVAL_BYPASS_CMD='CMD="$(cat <<'"'"'EOF3'"'"'
+'"$PHRASE_CMD"' 123 --admin
+EOF3
+)"
+eval "$CMD"'
+assert_deny "Still block a heredoc-assigned variable later eval'd (two-hop bypass attempt, #5172)" \
+    "$GH_5172_EVAL_BYPASS_CMD"
+
+# Regression guard (control, #5172): a heredoc-assigned variable referenced
+# bare (as a command, not a safe flag/field value) must also still deny.
+GH_5172_BARE_REF_CMD='X="$(cat <<'"'"'EOF4'"'"'
+'"$PHRASE_CMD"' 123
+EOF4
+)"
+$X'
+assert_deny "Still block a heredoc-assigned variable referenced bare as a command (#5172)" \
+    "$GH_5172_BARE_REF_CMD"
+
+# Regression guard (control, #5172): a heredoc-assigned variable referenced
+# TWICE -- once safely (-f body=), once unsafely (piped into bash) -- must
+# still deny. One confined reference does not excuse an unconfined one.
+GH_5172_MIXED_REF_CMD='X="$(cat <<'"'"'EOF7'"'"'
+'"$PHRASE_CMD"' 123
+EOF7
+)"
+gh api "repos/o/r/issues/1/comments" -f body="$X"
+echo "$X" | bash'
+assert_deny "Still block a heredoc-assigned variable with one safe and one unsafe later reference (#5172)" \
+    "$GH_5172_MIXED_REF_CMD"
+
+# --- Broaden confinement-reference detection to ALL param-expansion forms (#5297)
+# The #5172 masking scanner recognized ONLY the exact "$VAR" / closed "${VAR}"
+# literals as a later reference. Any OTHER bash parameter-expansion of the same
+# heredoc-assigned variable (${VAR:0:100}, ${VAR#}, ${VAR:-}) was invisible to
+# the scanner, and an undetected reference defaulted to "confined" -- so the
+# heredoc body was masked and the guard never saw the real invocation, even
+# though the variable is genuinely dereferenced and executes at runtime. Each
+# case below assigns a REAL `gh pr merge 123` invocation to the variable via a
+# heredoc, then dereferences it through one of these forms + `eval`: all must
+# still DENY (the guard's deny-on-real-bypass invariant).
+
+# Substring/offset expansion: `eval "${BODY:0:100}"` -- the exact shape Judge
+# reproduced. Pre-fix this ALLOWED (bypass); it must DENY.
+GH_5297_SUBSTR_EVAL_CMD='BODY="$(cat <<'"'"'EOF8'"'"'
+'"$PHRASE_CMD"' 123
+EOF8
+)"
+eval "${BODY:0:100}"'
+assert_deny "Still block heredoc-assigned var eval-d via substring expansion \${VAR:0:100} (#5297)" \
+    "$GH_5297_SUBSTR_EVAL_CMD"
+
+# Prefix-removal expansion: `eval "${BODY#}"`.
+GH_5297_STRIP_EVAL_CMD='BODY="$(cat <<'"'"'EOF9'"'"'
+'"$PHRASE_CMD"' 123
+EOF9
+)"
+eval "${BODY#}"'
+assert_deny "Still block heredoc-assigned var eval-d via prefix-removal expansion \${VAR#} (#5297)" \
+    "$GH_5297_STRIP_EVAL_CMD"
+
+# Default-value expansion: `eval "${BODY:-}"`.
+GH_5297_DEFAULT_EVAL_CMD='BODY="$(cat <<'"'"'EOF10'"'"'
+'"$PHRASE_CMD"' 123
+EOF10
+)"
+eval "${BODY:-}"'
+assert_deny "Still block heredoc-assigned var eval-d via default-value expansion \${VAR:-} (#5297)" \
+    "$GH_5297_DEFAULT_EVAL_CMD"
+
+# Indirect expansion: `REF=BODY; eval "${!REF}"` -- the variable name never
+# appears literally as "$BODY"/"${BODY", so the scanner sees ZERO references.
+# Zero references is NOT proof of safety, so the body must be left UNMASKED and
+# the invocation must still DENY.
+GH_5297_INDIRECT_EVAL_CMD='BODY="$(cat <<'"'"'EOF11'"'"'
+'"$PHRASE_CMD"' 123
+EOF11
+)"
+REF=BODY; eval "${!REF}"'
+assert_deny "Still block heredoc-assigned var eval-d via indirect expansion \${!REF} (#5297)" \
+    "$GH_5297_INDIRECT_EVAL_CMD"
+
+# Control (#5297): the broadened detection must NOT re-introduce the #5172
+# false positive. A heredoc-assigned var whose body only quotes the phrase as
+# prose, referenced through a param-expansion form INSIDE a confined field
+# value (`-f body="${BODY:0:200}"`), stays confined -> masked -> ALLOWED.
+GH_5297_CONFINED_EXPANSION_CMD='BODY="$(cat <<'"'"'EOF12'"'"'
+Tested: '"$PHRASE_CMD"' 123 denied as prose
+EOF12
+)"
+gh api "repos/o/r/issues/1/comments" -f body="${BODY:0:200}"'
+assert_allow "Allow gh api -f body=\${VAR:0:200} where \$VAR is a heredoc quoting the phrase as prose (#5297)" \
+    "$GH_5297_CONFINED_EXPANSION_CMD"
+
 echo ""
 
 # =========================================================================

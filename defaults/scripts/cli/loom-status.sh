@@ -18,6 +18,13 @@
 #   - Shows a work-queue summary (open loom:issue / loom:review-requested /
 #     loom:pr / loom:architect / loom:hermit / loom:curated / loom:auditor
 #     counts) when `gh` is available on a GitHub forge.
+#   - Surfaces OUTSTANDING QUARANTINE STASHES (#5185): when a builder
+#     contaminates the primary clone, `check-main-clean.sh --quarantine`
+#     rescues the dirt into a labelled `git stash` entry. That was recorded
+#     only in a structured log, so the entries accumulated unreconciled (29 on
+#     one host, oldest 7 days) and were noticed only by accident. This section
+#     reports the count and the most recent entries, so quarantined work is
+#     discoverable without knowing a quarantine ever happened.
 #   - Surfaces MACHINE-DAEMON state for this workspace (#4793): this script
 #     only ever inspected the LOCAL tmux agent pool, so a repo actively
 #     managed by a separate machine-level `loom-daemon` fleet (autonomous
@@ -38,6 +45,8 @@ set -euo pipefail
 _LOOM_STATUS_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../lib/config-resolver.sh
 source "$_LOOM_STATUS_SCRIPT_DIR/../lib/config-resolver.sh"
+# shellcheck source=../lib/locate-daemon-bin.sh
+source "$_LOOM_STATUS_SCRIPT_DIR/../lib/locate-daemon-bin.sh"
 
 # Find repository root
 find_repo_root() {
@@ -157,7 +166,10 @@ ${YELLOW}OUTPUT:${NC}
     ${CYAN}loom:review-requested${NC} / ${CYAN}loom:pr${NC} counts, plus
     pending-proposal counts for ${CYAN}loom:architect${NC} / ${CYAN}loom:hermit${NC} /
     ${CYAN}loom:curated${NC} / ${CYAN}loom:auditor${NC}) is shown when 'gh' is
-    available on a GitHub forge.
+    available on a GitHub forge. A ${YELLOW}Quarantined work${NC} section appears when
+    the primary clone has outstanding ${CYAN}loom-quarantine${NC} stash entries — work a
+    sweep rescued out of the main checkout that nobody has reconciled yet.
+    Full list: ${CYAN}./.loom/scripts/check-main-clean.sh --list-quarantined${NC}.
 
 ${YELLOW}EXIT STATUS:${NC}
     Always 0 when the workspace resolves — an empty pool is not an error.
@@ -292,27 +304,29 @@ read_terminals() {
 #     check when the daemon itself is unreachable -- a static file read
 #     still answers "is this repo registered?" even while the daemon is down.
 
-# Resolve the loom-daemon binary: LOOM_DAEMON_BIN override -> PATH -> in-repo
-# cargo build outputs. Mirrors loom-daemon-watchdog.sh's locate_daemon_bin()
-# / `./.loom/bin/loom health`'s resolution order verbatim, so this script and
-# those two never disagree about which binary is "the" daemon CLI. Echoes
-# the resolved path and returns 0, or returns 1 with nothing echoed.
+# Resolve the loom-daemon binary via the shared loom_locate_daemon_bin()
+# (lib/locate-daemon-bin.sh, #4875) — includes the machine-level
+# $LOOM_DAEMON_BIN_DIR (default ~/.local/bin) fallback, so this script,
+# loom-daemon-start.sh, loom-daemon-watchdog.sh, loom-daemon-update.sh, and
+# `./.loom/bin/loom health` all agree on which binary is "the" daemon CLI.
+# Preserves this function's original contract (thin wrapper): echoes the
+# resolved path and returns 0, or returns 1 with nothing echoed -- INCLUDING
+# the pre-#4875 behavior that an explicitly-set-but-non-executable
+# LOOM_DAEMON_BIN is a hard "not found" (unlike the other four call sites,
+# which fall through to PATH/machine-level/in-repo candidates in that case).
+# This script's own test suite uses LOOM_DAEMON_BIN=<bogus path> as a
+# deterministic "force no binary resolvable" sentinel that must NOT then pick
+# up a real installed binary via PATH or ~/.local/bin, so that contract is
+# preserved here explicitly rather than delegated wholesale.
 locate_daemon_bin() {
     if [[ -n "${LOOM_DAEMON_BIN:-}" ]]; then
         [[ -x "${LOOM_DAEMON_BIN}" ]] && { echo "${LOOM_DAEMON_BIN}"; return 0; }
         return 1
     fi
-    if command -v loom-daemon &>/dev/null; then
-        command -v loom-daemon
-        return 0
-    fi
-    local candidate
-    for candidate in \
-        "$REPO_ROOT/loom-daemon/target/release/loom-daemon" \
-        "$REPO_ROOT/loom-daemon/target/debug/loom-daemon"; do
-        [[ -x "$candidate" ]] && { echo "$candidate"; return 0; }
-    done
-    return 1
+    local bin
+    bin="$(unset LOOM_DAEMON_BIN; loom_locate_daemon_bin "$REPO_ROOT")"
+    [[ -n "$bin" ]] || return 1
+    echo "$bin"
 }
 
 # Query `loom-daemon status --json`. Echoes the JSON payload on success --
@@ -433,6 +447,34 @@ daemon_state_json_obj() {
           }'
 }
 
+# ---- Outstanding quarantine stashes (#5185) ------------------------------
+# Delegates to check-main-clean.sh, which owns the quarantine mechanism and
+# therefore owns the definition of "a Loom-produced stash entry". Memoized:
+# emit_human and emit_json can both ask for it, and it shells out to git.
+#
+# Degrades to `null` — never an error, never a non-zero exit — when the script
+# is missing, predates --list-quarantined (an older installed copy exits 2 on
+# the unknown flag), or emits anything that is not valid JSON. `loom status`
+# must keep working on every install, exactly like the Work Queue and Machine
+# Daemon sections above.
+_LOOM_STATUS_QUARANTINE_JSON=""
+quarantine_stashes_json() {
+    if [[ -n "$_LOOM_STATUS_QUARANTINE_JSON" ]]; then
+        echo "$_LOOM_STATUS_QUARANTINE_JSON"
+        return 0
+    fi
+    _LOOM_STATUS_QUARANTINE_JSON="null"
+    local script="$REPO_ROOT/.loom/scripts/check-main-clean.sh"
+    if [[ -x "$script" ]] && command -v jq &>/dev/null; then
+        local out=""
+        out=$("$script" --list-quarantined --json 2>/dev/null) || out=""
+        if [[ -n "$out" ]]; then
+            _LOOM_STATUS_QUARANTINE_JSON=$(printf '%s' "$out" | jq -c '.' 2>/dev/null || echo "null")
+        fi
+    fi
+    echo "$_LOOM_STATUS_QUARANTINE_JSON"
+}
+
 # ---- JSON output ---------------------------------------------------------
 emit_json() {
     if ! command -v jq &>/dev/null; then
@@ -470,11 +512,15 @@ emit_json() {
     local daemon_json
     daemon_json=$(daemon_state_json_obj)
 
+    local quarantine_json
+    quarantine_json=$(quarantine_stashes_json)
+
     jq -nc \
         --argjson running "$running_json" \
         --argjson terminals "$terminals" \
         --argjson work_queue "$work_queue_json" \
         --argjson daemon "$daemon_json" \
+        --argjson quarantine_stashes "$quarantine_json" \
         '
         ($running | map(.id)) as $running_ids
         | {
@@ -502,7 +548,8 @@ emit_json() {
                 | ($terminals | map(.id) | index($rid)) | not))
                 | map({session: .session, id: .id, pid: .pid, uptime_seconds: .uptime_seconds, status: "unmanaged"})),
             work_queue: $work_queue,
-            daemon: $daemon
+            daemon: $daemon,
+            quarantine_stashes: $quarantine_stashes
           }'
 }
 
@@ -671,6 +718,34 @@ emit_human() {
         echo -e "${BOLD}Work Queue:${NC}"
         echo -e "  ${CYAN}loom:issue${NC} ${wq_issue}   ${CYAN}loom:review-requested${NC} ${wq_rr}   ${CYAN}loom:pr${NC} ${wq_pr}"
         echo -e "  ${BOLD}Pending proposals:${NC} ${CYAN}loom:architect${NC} ${wq_architect}   ${CYAN}loom:hermit${NC} ${wq_hermit}   ${CYAN}loom:curated${NC} ${wq_curated}   ${CYAN}loom:auditor${NC} ${wq_auditor}"
+    fi
+
+    # Outstanding quarantine stashes (#5185). Shown ONLY when something is
+    # outstanding: a quiet stack is the normal state and does not deserve a
+    # line, but an entry sitting unreconciled is work nobody has looked at.
+    local qs
+    qs=$(quarantine_stashes_json)
+    if [[ -n "$qs" && "$qs" != "null" ]] && command -v jq &>/dev/null; then
+        local q_count q_empty
+        q_count=$(echo "$qs" | jq -r '.count // 0' 2>/dev/null || echo 0)
+        q_empty=$(echo "$qs" | jq -r '.empty_count // 0' 2>/dev/null || echo 0)
+        # Normalize before any arithmetic: a malformed report must degrade to
+        # "no section", never to a bash arithmetic error under `set -e`.
+        [[ "$q_count" =~ ^[0-9]+$ ]] || q_count=0
+        [[ "$q_empty" =~ ^[0-9]+$ ]] || q_empty=0
+        if [[ "$q_count" -gt 0 ]]; then
+            echo ""
+            echo -e "${YELLOW}${BOLD}Quarantined work (unreconciled): ${q_count}${NC}${GRAY}$( [[ "$q_empty" -gt 0 ]] && echo " — $q_empty empty" )${NC}"
+            # Newest few only; the full list (and the safe-inspection recipe)
+            # is one command away.
+            echo "$qs" | jq -r '.stashes[:3][]
+                | "  \(.commit[:12])  \(.age)  (\(.producer))\(if .empty then "  [EMPTY]" else "" end)\(if .issue then "  issue=\(.issue)" else "" end)"' \
+                2>/dev/null || true
+            if [[ "$q_count" -gt 3 ]]; then
+                echo -e "  ${GRAY}… and $((q_count - 3)) more${NC}"
+            fi
+            echo -e "  ${GRAY}(list: ./.loom/scripts/check-main-clean.sh --list-quarantined)${NC}"
+        fi
     fi
 
     echo ""

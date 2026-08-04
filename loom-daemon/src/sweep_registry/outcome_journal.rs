@@ -672,6 +672,7 @@ mod tests {
         registry.entries.insert(
             sweep_id.clone(),
             SweepInfo {
+                pgid: None,
                 sweep_id: sweep_id.clone(),
                 kind: kind.clone(),
                 pid: 2_147_483_640,

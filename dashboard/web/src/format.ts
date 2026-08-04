@@ -11,6 +11,7 @@
  */
 
 import { displayTimeZone, timeZoneAbbreviation } from "./timezone";
+import type { RoleTickFailure, RoleTickHealth } from "./types";
 
 export const UNKNOWN = "—";
 
@@ -144,6 +145,52 @@ export function formatClock(at: Date, zone: string = displayTimeZone()): string 
 
 export function formatCount(value: number | undefined): string {
   return value === undefined ? UNKNOWN : String(value);
+}
+
+/** `/repos/loom` → `"loom"` — the final path component, the same "root
+ * basename" the daemon's own `RoleFailure::label()` uses so this UI never
+ * shows a full filesystem path. Falls back to the whole string when it has
+ * no `/` at all (already a bare name, or a wrong-typed value). */
+function pathBasename(root: string): string {
+  const parts = root.split("/").filter((part) => part.length > 0);
+  return parts.length > 0 ? parts[parts.length - 1]! : root;
+}
+
+/** `{ role: "judge", root: "/repos/loom" }` → `"judge @ loom"` — mirrors the
+ * daemon's own `RoleFailure::label()` so a persistent failure reads
+ * identically here and in `loom-daemon health`'s own output. Missing
+ * `role`/`root` degrade to `UNKNOWN` rather than an empty string. */
+export function roleFailureLabel(failure: RoleTickFailure): string {
+  const role = failure.role && failure.role.length > 0 ? failure.role : UNKNOWN;
+  const root = failure.root && failure.root.length > 0 ? pathBasename(failure.root) : UNKNOWN;
+  return `${role} @ ${root}`;
+}
+
+/** Compact `host.health.roles` indicator for the fleet-overview card, where
+ * the full `roleTickSummaryText` sentence would not fit: `"ok"` / `"no role
+ * ticks"` / `"2 failing"`. The host-detail drill-down uses the fuller
+ * `roleTickSummaryText` instead, which names the failing role(s). */
+export function roleTickCompactText(roles: RoleTickHealth | undefined): string {
+  if (roles === undefined || roles.total === undefined) return UNKNOWN;
+  if (roles.total === 0) return "no role ticks";
+  const failing = roles.persistent?.length ?? 0;
+  return failing > 0 ? `${failing} failing` : "ok";
+}
+
+/** One-line `host.health.roles` summary, mirroring `loom-daemon health`'s
+ * own `roles` section line: `"10/12 ticks ok"` when healthy, or `"10/12
+ * ticks ok; 1 persistent failure(s): judge @ loom"` when not. `undefined`
+ * (a pre-#5022 daemon, or the field simply not parsed yet) and `total: 0`
+ * (the role runner idle/disabled) both render distinctly from a real
+ * failure — neither is an alarm. */
+export function roleTickSummaryText(roles: RoleTickHealth | undefined): string {
+  if (roles === undefined || roles.total === undefined) return UNKNOWN;
+  if (roles.total === 0) return "no role ticks";
+  const ok = roles.ok ?? 0;
+  const persistent = roles.persistent ?? [];
+  if (persistent.length === 0) return `${ok}/${roles.total} ticks ok`;
+  const names = persistent.map(roleFailureLabel).join(", ");
+  return `${ok}/${roles.total} ticks ok; ${persistent.length} persistent failure(s): ${names}`;
 }
 
 /** `undefined`/empty → `"—"`, for the optional string fields (`model`,

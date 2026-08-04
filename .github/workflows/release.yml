@@ -1,4 +1,70 @@
 name: Build and Release
+#
+# Release artifacts (Epic #4990): on GitHub Release creation this workflow
+# cross-builds `loom-daemon` for every platform in the fleet's target triples
+# and uploads, for EACH one, the binary plus a `.sha256` checksum file as
+# Release assets:
+#
+#   - loom-daemon-aarch64-apple-darwin(.sha256)
+#   - loom-daemon-x86_64-unknown-linux-gnu(.sha256)
+#   - loom-daemon-aarch64-unknown-linux-gnu(.sha256)
+#
+# Phase 1 (#5003) shipped the unsigned build + checksum foundation. Phase 2
+# (#5011, this change) layers OPTIONAL platform signing on top, following the
+# `dashboard-deploy.yml` public-mechanism/private-identity precedent:
+#
+#   - macOS Developer ID codesign of the aarch64-apple-darwin artifact, plus
+#     optional notarization, when the Developer ID / notary secrets are set.
+#   - cosign detached-signature (`.sig`) over the Linux artifacts.
+#
+# The macOS signing steps are gated on Actions secrets being present and skip
+# cleanly (with a LOUD entry in the run summary, never silent) when they are
+# absent — a no-secrets release still succeeds with unsigned macOS artifacts +
+# checksums, byte-for-byte as Phase 1 left it. No org name, team ID, cert
+# reference, or other deployer identity lives in this file or any tracked file:
+# all identity comes from secrets only. If you ever need to hardcode one here,
+# that's a scope regression — put it in a secret instead.
+#
+# Linux signing is KEYLESS by default (#5054): cosign gets a short-lived
+# Sigstore certificate from the workflow's own GitHub Actions OIDC token, so it
+# needs NO secret to be provisioned and publishes no long-lived key material.
+# That is what lets `loom-daemon-update.sh` verify for real on a stock install
+# instead of loud-skipping for want of a distributed public key. A repo that
+# still wants classic key signing sets the COSIGN_PRIVATE_KEY secret, which
+# takes precedence (see the detect step below); it then owes its consumers the
+# matching public key out of band.
+#
+# Output format (for Phase 3's verifier): the checksum is always present and is
+# computed over the FINAL artifact (after any in-place codesign), so it matches
+# whatever bytes are uploaded. macOS signatures are embedded in the Mach-O
+# (verify with `codesign --verify`); Linux signatures are detached `.sig` files
+# — keyless ones ship the signing certificate alongside as `.pem` (verify with
+# `cosign verify-blob --certificate <pem> --signature <sig>
+# --certificate-identity-regexp ... --certificate-oidc-issuer ...`), key-signed
+# ones ship the bare `.sig` (verify with `cosign verify-blob --key <pubkey>
+# --signature <sig>`). The presence of the `.pem` is the wire signal that tells
+# the consumer which mode was used.
+#
+# Consuming these artifacts from `loom-daemon-update.sh` / the daemon
+# auto-updater is out of scope here (#4990 Phase 3) — the LOCAL `cargo build`
+# path in `loom-daemon-update.sh` remains the default/fallback for dev
+# machines, canaries, and forks with no Release access.
+#
+# Each target builds in its own matrix job with `fail-fast: false`: one
+# platform's build failure fails that job (and therefore the overall workflow
+# run) loudly — it never silently drops just that platform's artifact while
+# reporting overall success.
+#
+# `build-worker-image` (#5325) publishes `ghcr.io/rjwalters/loom-worker` — a
+# pinned OCI base image for fleet workers — alongside the raw binary/checksum
+# artifacts above. It is a SEPARATE deliverable from `build-daemon`: it needs
+# only the already-built `x86_64-unknown-linux-gnu` binary (no rebuild), and
+# it is deliberately gated to push only from the canonical repo on an actual
+# `release` event (see the job's own comments) — a fork's `workflow_dispatch`
+# dry run still builds the image (verifying the Dockerfile) but never
+# attempts to push to a registry namespace it has no write access to. Shape
+# decision (sweep-execution environment, not daemon-as-PID-1) and the image's
+# `FROM` contract: docker/worker/README.md.
 
 on:
   release:
@@ -12,55 +78,314 @@ on:
 
 permissions:
   contents: write
+  # Keyless cosign signing of the Linux artifacts (#5054): mints the workflow's
+  # OIDC token so Fulcio can issue the short-lived signing certificate. This is
+  # the ONLY thing that grants signing authority here — there is no key to leak,
+  # and no secret to provision before a release can be signed.
+  id-token: write
+  # `build-worker-image` (#5325) pushes ghcr.io/rjwalters/loom-worker using the
+  # default GITHUB_TOKEN — no separate registry secret to provision. Read-only
+  # everywhere else; only that job's own `permissions:` block actually uses this.
+  packages: write
 
 jobs:
   build-daemon:
-    name: Build loom-daemon
-    runs-on: macos-14  # Apple Silicon runner
+    name: Build loom-daemon (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Never mask a platform's failure with another's success, and never let
+      # one platform's failure cancel an in-flight build for another.
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14 # Apple Silicon runner (native build)
+            cross: false
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest # native build
+            cross: false
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            # No native aarch64 Linux runner assumption is made here — cross
+            # compile via an aarch64 gcc/binutils toolchain instead, which
+            # works on any ubuntu-latest runner regardless of arm64-runner
+            # availability for this repo/org.
+            cross: true
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
+          targets: ${{ matrix.target }}
+
+      # dtolnay/rust-toolchain's `targets:` input installs the target onto
+      # whatever toolchain the action itself resolves — here, `stable`. This
+      # repo pins `channel = "1.96.0"` in rust-toolchain.toml, so `cargo`
+      # actually builds under 1.96.0, a toolchain the step above never
+      # touched — leaving cross targets like aarch64-unknown-linux-gnu
+      # without std and failing with `error[E0463]: can't find crate for
+      # core` (#5167). `rustup target add` (unlike the action's `targets:`
+      # input) operates on the directory's *active* toolchain, which rustup
+      # resolves via rust-toolchain.toml, so it correctly lands the target on
+      # 1.96.0 instead. The toolchain channel remains pinned in exactly one
+      # place: rust-toolchain.toml.
+      - name: Add Rust target for pinned toolchain
+        run: rustup target add ${{ matrix.target }}
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
             .
+          key: ${{ matrix.target }}
 
-      - name: Ensure both Apple targets installed
+      - name: Install cross-compilation toolchain
+        if: matrix.cross
         run: |
-          rustup target add aarch64-apple-darwin
-          rustup target add x86_64-apple-darwin
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
 
-      - name: Build daemon (ARM64)
+      # Fast preflight (#5167 acceptance criterion): confirm the pinned
+      # toolchain actually has this target's std installed before kicking off
+      # the full `cargo build`, so a future toolchain/target mismatch fails in
+      # seconds instead of after several minutes of dependency compilation.
+      - name: Verify target std is installed
         run: |
-          cargo build --package loom-daemon --release --target aarch64-apple-darwin
-          mkdir -p target/release
-          cp target/aarch64-apple-darwin/release/loom-daemon target/release/loom-daemon-aarch64-apple-darwin
+          set -euo pipefail
+          if ! rustup target list --installed | grep -qx "${{ matrix.target }}"; then
+            echo "::error::rustup did not install std for target '${{ matrix.target }}' on the active toolchain ($(rustc --version)). Check that rust-toolchain.toml's pinned channel supports this target." >&2
+            exit 1
+          fi
+          echo "Confirmed: ${{ matrix.target }} std is installed for $(rustc --version)."
 
-      - name: Build daemon (x86_64)
-        run: |
-          cargo build --package loom-daemon --release --target x86_64-apple-darwin
-          mkdir -p target/release
-          cp target/x86_64-apple-darwin/release/loom-daemon target/release/loom-daemon-x86_64-apple-darwin || true
+      - name: Build loom-daemon
+        env:
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
+          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: cargo build --package loom-daemon --release --target ${{ matrix.target }}
 
-      - name: List build artifacts
+      - name: Package artifact
         run: |
-          echo "=== Daemon binaries ==="
-          ls -la target/release/loom-daemon-* || true
+          set -euo pipefail
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/loom-daemon" "dist/loom-daemon-${{ matrix.target }}"
+
+      # Detect which signing secrets are present and record the decision as step
+      # outputs. GitHub Actions cannot reference `secrets.*` directly in an
+      # `if:` condition, so the canonical idiom is: map secrets into env here,
+      # test them, and gate later steps on THESE outputs. This step also emits
+      # the LOUD skip lines the epic's design principle 2 requires — every
+      # absent-secret path writes an explicit "SKIPPED (why)" row to the run
+      # summary, so the skip is asserted, not implied by checksum-only output.
+      - name: Detect signing secrets (loud skip if absent)
+        id: signing
+        env:
+          MACOS_SIGNING_CERT_P12: ${{ secrets.MACOS_SIGNING_CERT_P12 }}
+          MACOS_SIGNING_CERT_PASSWORD: ${{ secrets.MACOS_SIGNING_CERT_PASSWORD }}
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+          MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          target="${{ matrix.target }}"
+          macos_sign=false
+          notarize=false
+          linux_sign=false
+          linux_sign_mode=none
+
+          summary() { echo "$1" >> "$GITHUB_STEP_SUMMARY"; }
+          summary "### Signing (${target})"
+
+          case "$target" in
+            *-apple-darwin)
+              if [ -n "${MACOS_SIGNING_CERT_P12:-}" ] \
+                  && [ -n "${MACOS_SIGNING_CERT_PASSWORD:-}" ] \
+                  && [ -n "${MACOS_SIGNING_IDENTITY:-}" ]; then
+                macos_sign=true
+                summary "- Signed: Developer ID secrets present — codesigning \`${target}\` in place."
+                if [ -n "${MACOS_NOTARY_KEY:-}" ] \
+                    && [ -n "${MACOS_NOTARY_KEY_ID:-}" ] \
+                    && [ -n "${MACOS_NOTARY_ISSUER_ID:-}" ]; then
+                  notarize=true
+                  summary "- Notarized: notary API key secrets present — notarizing after signing."
+                else
+                  summary "- SKIPPED notarization: notary API key secrets absent (belt-and-suspenders only for the curl/gh download path, which sets no quarantine attribute — not required)."
+                  echo "::notice::macOS notarization skipped for ${target} (notary secrets absent)."
+                fi
+              else
+                summary "- SKIPPED signing: Developer ID cert/identity secrets absent — shipping UNSIGNED \`${target}\` + checksum (Phase 1 behavior)."
+                echo "::notice::macOS signing skipped for ${target} (Developer ID secrets absent); shipping unsigned artifact + checksum."
+              fi
+              ;;
+            *-linux-*)
+              # Precedence: an explicitly provisioned key wins (a repo that set
+              # COSIGN_PRIVATE_KEY has already told its consumers which key to
+              # trust, and silently switching it to keyless would invalidate
+              # that). Otherwise keyless, which needs no secret at all — so the
+              # DEFAULT for this repo, and for every fork, is a really-signed
+              # Linux artifact rather than an unsigned one (#5054).
+              if [ -n "${COSIGN_PRIVATE_KEY:-}" ]; then
+                linux_sign=true
+                linux_sign_mode=key
+                summary "- Signed (key mode): COSIGN_PRIVATE_KEY secret present — writing detached \`${target}.sig\`. Consumers must resolve the matching public key themselves (LOOM_DAEMON_UPDATE_COSIGN_PUBKEY / \`.loom/cosign.pub\`)."
+              elif [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+                linux_sign=true
+                linux_sign_mode=keyless
+                summary "- Signed (keyless): using this workflow's GitHub Actions OIDC identity — writing detached \`${target}.sig\` + its signing certificate \`${target}.pem\`. No key material is distributed; consumers verify the signer identity."
+              else
+                summary "- SKIPPED signing: no COSIGN_PRIVATE_KEY secret AND no OIDC token (the job lacks \`id-token: write\`) — shipping UNSIGNED \`${target}\` + checksum (Phase 1 behavior)."
+                echo "::notice::Linux signing skipped for ${target} (no cosign key and no OIDC token); shipping unsigned artifact + checksum."
+              fi
+              ;;
+          esac
+
+          {
+            echo "macos_sign=${macos_sign}"
+            echo "notarize=${notarize}"
+            echo "linux_sign=${linux_sign}"
+            echo "linux_sign_mode=${linux_sign_mode}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Sign macOS artifact (Developer ID)
+        if: steps.signing.outputs.macos_sign == 'true'
+        env:
+          MACOS_SIGNING_CERT_P12: ${{ secrets.MACOS_SIGNING_CERT_P12 }}
+          MACOS_SIGNING_CERT_PASSWORD: ${{ secrets.MACOS_SIGNING_CERT_PASSWORD }}
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          artifact="dist/loom-daemon-${{ matrix.target }}"
+          # Import the Developer ID cert into a throwaway keychain scoped to this
+          # job's RUNNER_TEMP so no identity persists on the runner. The p12 and
+          # its password are secrets; the identity string (which embeds the org
+          # name + team ID) is likewise a secret — never spelled out here.
+          keychain="$RUNNER_TEMP/loom-signing.keychain-db"
+          p12="$RUNNER_TEMP/loom-cert.p12"
+          printf '%s' "$MACOS_SIGNING_CERT_P12" | base64 --decode > "$p12"
+          security create-keychain -p "$MACOS_SIGNING_CERT_PASSWORD" "$keychain"
+          security set-keychain-settings -lut 900 "$keychain"
+          security unlock-keychain -p "$MACOS_SIGNING_CERT_PASSWORD" "$keychain"
+          security import "$p12" -k "$keychain" -P "$MACOS_SIGNING_CERT_PASSWORD" -T /usr/bin/codesign
+          # Allow codesign to use the imported key non-interactively.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$MACOS_SIGNING_CERT_PASSWORD" "$keychain" >/dev/null
+          # Put our keychain on the user search list so codesign resolves the identity.
+          security default-keychain -s "$keychain"
+          security list-keychains -d user -s "$keychain"
+          # `--options runtime` (hardened runtime) is a notarization prerequisite;
+          # `--timestamp` binds a secure timestamp so the signature outlives the
+          # cert's validity window.
+          codesign --force --options runtime --timestamp \
+            --sign "$MACOS_SIGNING_IDENTITY" "$artifact"
+          codesign --verify --strict --verbose=2 "$artifact"
+          rm -f "$p12"
+
+      - name: Notarize macOS artifact
+        if: steps.signing.outputs.notarize == 'true'
+        env:
+          MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          artifact="dist/loom-daemon-${{ matrix.target }}"
+          # notarytool only accepts container formats (zip/dmg/pkg), so submit a
+          # zip of the bare binary. A bare Mach-O cannot be stapled (stapling
+          # supports only bundles/dmg/pkg), so notarization is registered
+          # server-side with no on-disk ticket. For this repo's curl/gh download
+          # path — which sets no quarantine attribute — that server-side record
+          # is all Gatekeeper would ever consult, so no staple is needed and the
+          # uploaded asset stays the bare signed binary.
+          key="$RUNNER_TEMP/notary-key.p8"
+          zip="$RUNNER_TEMP/loom-daemon-${{ matrix.target }}.zip"
+          printf '%s' "$MACOS_NOTARY_KEY" | base64 --decode > "$key"
+          ditto -c -k "$artifact" "$zip"
+          xcrun notarytool submit "$zip" \
+            --key "$key" \
+            --key-id "$MACOS_NOTARY_KEY_ID" \
+            --issuer "$MACOS_NOTARY_ISSUER_ID" \
+            --wait
+          rm -f "$key" "$zip"
+
+      - name: Install cosign
+        if: steps.signing.outputs.linux_sign == 'true'
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign Linux artifact (cosign)
+        if: steps.signing.outputs.linux_sign == 'true'
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+          SIGN_MODE: ${{ steps.signing.outputs.linux_sign_mode }}
+        run: |
+          set -euo pipefail
+          artifact="dist/loom-daemon-${{ matrix.target }}"
+          sig="dist/loom-daemon-${{ matrix.target }}.sig"
+          cert="dist/loom-daemon-${{ matrix.target }}.pem"
+          if [ "$SIGN_MODE" = "keyless" ]; then
+            # Keyless (#5054): cosign exchanges this workflow's OIDC token for a
+            # short-lived Fulcio certificate whose SAN is
+            #   https://github.com/<owner>/<repo>/.github/workflows/release.yml@refs/tags/<tag>
+            # and records the signature in Rekor. Publishing the certificate
+            # next to the signature is what lets a consumer verify with NO
+            # distributed key:
+            #   cosign verify-blob --certificate <target>.pem --signature <target>.sig \
+            #     --certificate-identity-regexp '^https://github\.com/<slug>/\.github/workflows/[^@]+@refs/tags/<tag>$' \
+            #     --certificate-oidc-issuer https://token.actions.githubusercontent.com <binary>
+            cosign sign-blob --yes \
+              --output-signature "$sig" \
+              --output-certificate "$cert" \
+              "$artifact"
+          else
+            # Key mode (only when COSIGN_PRIVATE_KEY is set): detached signature
+            # verified as `cosign verify-blob --key <pubkey> --signature <sig>`.
+            # COSIGN_PASSWORD is read from the env by cosign to decrypt the key.
+            key="$RUNNER_TEMP/cosign.key"
+            printf '%s' "$COSIGN_PRIVATE_KEY" > "$key"
+            cosign sign-blob --yes --key "$key" \
+              --output-signature "$sig" \
+              "$artifact"
+            rm -f "$key"
+          fi
+
+      # Checksum is computed AFTER signing so it covers the FINAL bytes (macOS
+      # codesign rewrites the Mach-O in place). Phase 3 verifies this checksum
+      # unconditionally, so it must match whatever is uploaded. In the
+      # no-secrets case nothing above modified the binary, so this is
+      # byte-identical to Phase 1's checksum.
+      - name: Compute checksum
+        run: |
+          set -euo pipefail
+          cd dist
+          if command -v shasum >/dev/null 2>&1; then
+            shasum -a 256 "loom-daemon-${{ matrix.target }}" > "loom-daemon-${{ matrix.target }}.sha256"
+          else
+            sha256sum "loom-daemon-${{ matrix.target }}" > "loom-daemon-${{ matrix.target }}.sha256"
+          fi
+          ls -la
 
       - name: Upload release assets
         if: github.event_name == 'release'
         uses: softprops/action-gh-release@v3
         with:
+          # The `*.sig` glob matches the detached Linux signature when cosign
+          # signing ran and matches nothing otherwise (skipped, not an error) —
+          # so the same block covers signed and unsigned releases. `*.pem`
+          # likewise matches only for a KEYLESS-signed artifact; its presence
+          # (or absence) is the signal Phase 3's verifier uses to pick keyless
+          # vs. key verification, so it must be uploaded alongside the `.sig`.
           files: |
-            target/release/loom-daemon-aarch64-apple-darwin
-            target/release/loom-daemon-x86_64-apple-darwin
+            dist/loom-daemon-${{ matrix.target }}
+            dist/loom-daemon-${{ matrix.target }}.sha256
+            dist/loom-daemon-${{ matrix.target }}*.sig
+            dist/loom-daemon-${{ matrix.target }}*.pem
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -68,8 +393,124 @@ jobs:
         if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v7
         with:
-          name: loom-daemon-binaries
+          name: loom-daemon-${{ matrix.target }}
+          # Mirror the "Upload release assets" file list above, including the
+          # `.pem` glob (#5174): a keyless-signed Linux artifact needs its
+          # signing certificate to verify, and a manual backfill run onto an
+          # existing release can't complete without it.
           path: |
-            target/release/loom-daemon-aarch64-apple-darwin
-            target/release/loom-daemon-x86_64-apple-darwin
+            dist/loom-daemon-${{ matrix.target }}
+            dist/loom-daemon-${{ matrix.target }}.sha256
+            dist/loom-daemon-${{ matrix.target }}*.sig
+            dist/loom-daemon-${{ matrix.target }}*.pem
           retention-days: 7
+
+  build-worker-image:
+    name: Build and publish loom-worker image
+    # Waits for EVERY matrix leg (including the macOS/aarch64 daemon builds)
+    # to succeed before publishing — a failed platform build for `build-daemon`
+    # fails that job as a whole, so this job never runs (and never publishes)
+    # against a release the binary matrix itself considers broken.
+    needs: build-daemon
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      # Image version = loom version (AC): read the same version.sh every
+      # other version-bearing file in the repo is kept in sync against, at
+      # the exact commit this release/tag checked out above.
+      - name: Resolve image version
+        id: version
+        run: |
+          set -euo pipefail
+          echo "version=$(./scripts/version.sh)" >> "$GITHUB_OUTPUT"
+
+      # Reuse the binary `build-daemon` already built and checksummed for
+      # this exact commit rather than rebuilding from source a second time —
+      # a `release` event fetches it back off the Release assets that job's
+      # own "Upload release assets" step just published; a `workflow_dispatch`
+      # dry run (no Release object yet) fetches the matching Actions artifact
+      # from "Upload artifacts (for manual runs)" instead. Only linux/amd64 is
+      # published today (see docker/worker/README.md "Versioning and
+      # publishing" for the arm64 follow-up).
+      - name: Download loom-daemon release asset (release event)
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          gh release download "${{ github.event.release.tag_name }}" \
+            --repo "${{ github.repository }}" \
+            --pattern 'loom-daemon-x86_64-unknown-linux-gnu*' \
+            --dir dist
+          cd dist
+          sha256sum -c loom-daemon-x86_64-unknown-linux-gnu.sha256
+
+      - name: Download loom-daemon build artifact (workflow_dispatch)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/download-artifact@v7
+        with:
+          name: loom-daemon-x86_64-unknown-linux-gnu
+          # No `path:` — the artifact already carries its own `dist/…` prefix
+          # (uploaded from repo-root-relative paths above), so downloading to
+          # the default (repo root) lands it at `dist/loom-daemon-…` directly,
+          # matching the release-event branch and the Dockerfile's default
+          # LOOM_DAEMON_BIN path with no extra move/rename step.
+
+      - name: Verify binary is present and executable
+        run: |
+          set -euo pipefail
+          test -f dist/loom-daemon-x86_64-unknown-linux-gnu
+          chmod +x dist/loom-daemon-x86_64-unknown-linux-gnu
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Build ONCE, always with `load: true` (never `push` here) so the image
+      # lands in the local docker daemon's store where `docker run` — and
+      # therefore the smoke test below — can actually see it. This runs
+      # unconditionally, on every event and every fork, so the Dockerfile
+      # itself is validated regardless of whether this run is allowed to push.
+      - name: Build loom-worker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/worker/Dockerfile
+          push: false
+          load: true
+          tags: |
+            ghcr.io/rjwalters/loom-worker:${{ steps.version.outputs.version }}
+            ghcr.io/rjwalters/loom-worker:latest
+
+      - name: Smoke-test the built image
+        run: ./docker/worker/test-image.sh "ghcr.io/rjwalters/loom-worker:${{ steps.version.outputs.version }}"
+
+      # PUSH (of the already-built-and-tested local image, no rebuild) is
+      # gated on both "this is a real release" and "this is the canonical
+      # repo" — mirrors the macOS/cosign secret-gated skip pattern above, but
+      # for a permissions axis instead of a secrets one: a fork running this
+      # workflow (via workflow_dispatch, or its own release) has a valid
+      # GITHUB_TOKEN but no write access to ghcr.io/rjwalters/*, so pushing
+      # there would just fail loudly mid-release. Gating the smoke test ahead
+      # of this step (rather than after) also means a broken image never
+      # reaches the registry in the first place.
+      - name: Push loom-worker image
+        if: github.event_name == 'release' && github.repository == 'rjwalters/loom'
+        run: |
+          set -euo pipefail
+          docker push "ghcr.io/rjwalters/loom-worker:${{ steps.version.outputs.version }}"
+          docker push "ghcr.io/rjwalters/loom-worker:latest"

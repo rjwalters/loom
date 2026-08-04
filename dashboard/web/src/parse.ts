@@ -22,6 +22,9 @@ import type {
   FleetSnapshot,
   HostEntry,
   HostHealthRecord,
+  ManagedRepoEntry,
+  RoleTickFailure,
+  RoleTickHealth,
   TokenAccount,
   TokensSnapshotRecord,
   Timestamped,
@@ -45,17 +48,67 @@ function bool(value: unknown): boolean | undefined {
   return typeof value === "boolean" ? value : undefined;
 }
 
+/** A `managed_repos` entry. `slug` is dropped by `stripUndefined` when
+ * wrong-typed, or when the backend has already redacted it away (a private
+ * repo, unauthenticated viewer) — see `ManagedRepoEntry`'s doc.
+ * `visibility` always defaults to `"private"` on anything but the exact
+ * string `"public"` — the same fail-safe-default `ActiveSweep.visibility`
+ * already applies, never left `undefined`. */
+export function parseManagedRepoEntry(value: unknown): ManagedRepoEntry | undefined {
+  if (!isObject(value)) return undefined;
+  return stripUndefined<ManagedRepoEntry>({
+    slug: str(value.slug),
+    visibility: value.visibility === "public" ? "public" : "private",
+  });
+}
+
+/** A `roles.persistent` entry. `root`/`role` degrade to `undefined` (not a
+ * fabricated empty string) when wrong-typed, matching every other
+ * best-effort field this module narrows. */
+export function parseRoleTickFailure(value: unknown): RoleTickFailure | undefined {
+  if (!isObject(value)) return undefined;
+  return stripUndefined<RoleTickFailure>({
+    root: str(value.root),
+    role: str(value.role),
+    failures: num(value.failures),
+    last_at: str(value.last_at),
+    detail: str(value.detail),
+  });
+}
+
+/** `host.health`'s `roles` summary (#5022). A genuine `total: 0` (the role
+ * runner sampled nothing this snapshot) survives untouched — `num()` only
+ * drops a missing or wrong-typed value, never a real zero. */
+export function parseRoleTickHealth(value: unknown): RoleTickHealth | undefined {
+  if (!isObject(value)) return undefined;
+  return stripUndefined<RoleTickHealth>({
+    total: num(value.total),
+    ok: num(value.ok),
+    persistent: Array.isArray(value.persistent)
+      ? value.persistent.map(parseRoleTickFailure).filter((entry): entry is RoleTickFailure => entry !== undefined)
+      : undefined,
+  });
+}
+
 export function parseHostHealth(value: unknown): HostHealthRecord {
   if (!isObject(value)) return {};
   return stripUndefined<HostHealthRecord>({
     kind: str(value.kind),
     captured_at: str(value.captured_at),
     daemon_version: str(value.daemon_version),
+    build_commit: str(value.build_commit),
+    built_at: str(value.built_at),
     uptime_sec: num(value.uptime_sec),
     logical_cpus: num(value.logical_cpus),
     cpu_idle_fraction: num(value.cpu_idle_fraction),
     load_per_core: num(value.load_per_core),
     worktree_root_free_gb: num(value.worktree_root_free_gb),
+    dispatch_halted: bool(value.dispatch_halted),
+    halt_reason: str(value.halt_reason),
+    managed_repos: Array.isArray(value.managed_repos)
+      ? value.managed_repos.map(parseManagedRepoEntry).filter((entry): entry is ManagedRepoEntry => entry !== undefined)
+      : undefined,
+    roles: parseRoleTickHealth(value.roles),
   });
 }
 

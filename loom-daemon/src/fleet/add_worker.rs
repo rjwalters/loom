@@ -28,6 +28,7 @@ use super::path_bootstrap;
 use super::{
     all_succeeded, default_fleet_registry_path, execute_plan, render_checklist, CommandOutput,
     CommandRunner, FleetRegistry, Plan, Step, StepStatus, StepStdin, VerifyResult, WorkerRecord,
+    CHECKLIST_NOTE_PREFIX,
 };
 
 /// Default upstream Loom repo cloned to the worker's machine-level layout.
@@ -380,22 +381,31 @@ pub fn build_plan(config: &AddWorkerConfig, secrets: &Secrets) -> Plan {
     let mut plan = Plan::new();
     let primary_rel = workspace_rel(&config.repos[0]);
 
-    // 1. Base deps (safehouse#38: libsqlite3-dev is required).
+    // 1. Base deps (safehouse#38: libsqlite3-dev is required). Deliberately
+    //    does NOT install a Rust toolchain (#5067, Epic #4990 Phase 4): the
+    //    happy path (a release artifact resolves for this host's platform)
+    //    never needs one. `machine-layout` below installs rustup itself, as a
+    //    reactive fallback, only when it actually falls back to a from-source
+    //    build.
     plan.push_step(Step::new(
         "base-deps",
-        "install build-essential, pkg-config, libssl-dev, libsqlite3-dev, git, gh, rustup",
+        "install build-essential, pkg-config, libssl-dev, libsqlite3-dev, git, gh",
         Some(
             "dpkg -s build-essential pkg-config libssl-dev libsqlite3-dev git >/dev/null 2>&1 \
-             && command -v gh >/dev/null 2>&1 && command -v cargo >/dev/null 2>&1"
+             && command -v gh >/dev/null 2>&1"
                 .to_string(),
         ),
         render_base_deps(),
     ));
 
-    // 2. Machine-level layout: clone loom, build loom-daemon, install to ~/.local/bin.
+    // 2. Machine-level layout: clone loom, install loom-daemon to ~/.local/bin
+    //    from a verified GitHub Release artifact when one resolves for this
+    //    host's platform (#5067, Epic #4990 Phase 4), falling back to
+    //    `cargo build -p loom-daemon --release` (installing rustup first,
+    //    reactively) only when no artifact resolves.
     plan.push_step(Step::new(
         "machine-layout",
-        "clone loom to ~/.local/share/loom, cargo build -p loom-daemon --release, install to ~/.local/bin",
+        "clone loom to ~/.local/share/loom, install loom-daemon to ~/.local/bin from a release artifact (falling back to cargo build -p loom-daemon --release when no artifact resolves)",
         Some(r#"test -x "$HOME/.local/bin/loom-daemon""#.to_string()),
         render_machine_layout(&config.loom_repo_url),
     ));
@@ -700,7 +710,7 @@ pub fn run(config: &AddWorkerConfig) -> Result<()> {
     let plan = build_plan(config, &secrets);
 
     if config.dry_run {
-        print!("{}", plan.render_dry_run(&config.ssh_host));
+        print!("{}", plan.render_dry_run("fleet add-worker", &config.ssh_host));
         println!(
             "\n(dry run — no action taken on {}. Re-run without --dry-run to execute.)",
             config.ssh_host
@@ -710,7 +720,7 @@ pub fn run(config: &AddWorkerConfig) -> Result<()> {
 
     let runner = SshRunner::new(&config.ssh_host);
     let reports = execute_plan(&runner, &plan);
-    print!("{}", render_checklist(&config.ssh_host, &reports));
+    print!("{}", render_checklist("fleet add-worker", &config.ssh_host, &reports));
 
     let verify_ok = reports
         .iter()
@@ -749,8 +759,14 @@ pub fn run(config: &AddWorkerConfig) -> Result<()> {
 // ===========================================================================
 
 fn render_base_deps() -> String {
-    // NOTE: the rustup + gh installs are written as shell text here (never run
-    // through the daemon's own shell), so the curl-pipe idiom is safe.
+    // NOTE: the gh install is written as shell text here (never run through
+    // the daemon's own shell), so the curl-pipe idiom is safe.
+    //
+    // Deliberately does NOT install a Rust toolchain (#5067): the happy path
+    // (a release artifact resolves for this host's platform in the
+    // `machine-layout` step below) never needs one. `machine-layout` installs
+    // rustup itself, reactively, only when it actually falls back to a
+    // from-source build.
     r#"set -e
 export DEBIAN_FRONTEND=noninteractive
 sudo apt-get update -qq
@@ -762,9 +778,6 @@ if ! command -v gh >/dev/null 2>&1; then
   echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null
   sudo apt-get update -qq
   sudo apt-get install -y gh
-fi
-if ! command -v cargo >/dev/null 2>&1; then
-  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 fi
 "#
     .to_string()
@@ -789,10 +802,32 @@ else
   mkdir -p "$(dirname "$LOOM_SRC")"
   git clone {loom_repo_url} "$LOOM_SRC"
 fi
-cd "$LOOM_SRC"
-cargo build -p loom-daemon --release
 mkdir -p "$HOME/.local/bin"
-install -m 0755 "$LOOM_SRC/target/release/loom-daemon" "$HOME/.local/bin/loom-daemon"
+# Install loom-daemon to ~/.local/bin (Epic #4990 Phase 4, #5067). Shells out
+# to loom-daemon-update.sh's own already-tested "auto" resolution (Phase 3,
+# #5020) rather than reimplementing the fetch/verify/checksum logic here: it
+# prefers a checksum-verified GitHub Release artifact for this host's
+# platform, and SOFTLY falls back to `cargo build -p loom-daemon --release`
+# only when no artifact resolves (unrecognized platform, no gh CLI, no
+# Releases, rate-limited/unreachable API, no matching asset for this target) —
+# never a hard failure on that account. --no-restart is safe here: the
+# loom-daemon systemd unit has not been installed yet (a later step), so there
+# is never a running daemon for this invocation to try to restart.
+UPDATE_SCRIPT="$LOOM_SRC/defaults/scripts/cli/loom-daemon-update.sh"
+if ! "$UPDATE_SCRIPT" --no-restart; then
+  # A missing Rust toolchain is the ONLY failure this can repair: install
+  # rustup as a reactive fallback dependency (never on the happy path, see
+  # base-deps above) and retry exactly once. Any other failure (e.g. cargo IS
+  # present and the build itself failed) is not retried.
+  if ! command -v cargo >/dev/null 2>&1; then
+    echo "No Rust toolchain and no release artifact resolved for this platform -- installing rustup as a fallback dependency..."
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+    . "$HOME/.cargo/env" 2>/dev/null || true
+    "$UPDATE_SCRIPT" --no-restart
+  else
+    exit 1
+  fi
+fi
 # Ensure the canonical loom PATH (#4831: ~/.local/bin, ~/.cargo/bin, Homebrew,
 # system dirs) is on PATH for future logins (Linux worker skips codesign).
 if ! grep -qF 'loom-canonical-path (#4831)' "$HOME/.profile" 2>/dev/null; then
@@ -844,11 +879,43 @@ fn render_token_pool() -> String {
     )
 }
 
+/// Refresh the shared token ranking, then gate on account health (#5334).
+///
+/// `loom-daemon tokens check --ranking` only exits non-zero when *every*
+/// probed account reports `error`/`skipped` — an all-`blocked`/`exhausted`
+/// pool (the 2026-08-04 loom-worker-2 pilot's actual failure: a stale
+/// `accounts.env` with 4/4 blocked accounts) still exits `0`, so a bare exit
+/// code is not an "is this worker usable" signal. This step instead greps the
+/// table's own `Total N: ...` summary line for the `available` count and:
+///
+/// - always emits a `LOOM_CHECKLIST_NOTE:` line with the `available/total`
+///   split, so `execute_step` surfaces it in the checklist even on success —
+///   never just a bare "changed" (AC 3);
+/// - fails loudly (non-zero exit, `WARNING` on stderr) when the pool has zero
+///   `available` accounts, so the run halts here instead of silently
+///   bootstrapping a worker that will sit permanently idle (AC 2).
 fn render_token_ranking() -> String {
     let export_line = path_bootstrap::canonical_path_export_line();
     format!(
         r#"set -e
-{export_line}loom-daemon tokens check --ranking --shared 2>/dev/null || loom-daemon tokens check --ranking
+{export_line}OUT="$(loom-daemon tokens check --ranking --shared 2>/dev/null)" || OUT="$(loom-daemon tokens check --ranking)"
+printf '%s\n' "$OUT"
+# `|| true` on every extraction below: an absent "Total …" line, or one with
+# no "N available" substring (a genuinely all-blocked/exhausted pool), is a
+# *result* to report via the WARNING/note below, not a script-ending grep
+# failure — under `set -e`, a failing (no-match) grep at the tail of a
+# `VAR="$(...)"` command substitution would otherwise abort the script right
+# here, silently, before either the note or the WARNING is ever printed.
+TOTAL_LINE="$(printf '%s\n' "$OUT" | grep -E '^Total ' | tail -n1 || true)"
+TOTAL="$(printf '%s\n' "$TOTAL_LINE" | sed -n 's/^Total \([0-9][0-9]*\):.*/\1/p' || true)"
+AVAILABLE="$(printf '%s\n' "$TOTAL_LINE" | grep -oE '[0-9]+ available' | head -n1 | grep -oE '^[0-9]+' || true)"
+TOTAL="${{TOTAL:-0}}"
+AVAILABLE="${{AVAILABLE:-0}}"
+echo "{CHECKLIST_NOTE_PREFIX}token pool ${{AVAILABLE}}/${{TOTAL}} accounts available"
+if [ "$TOTAL" -gt 0 ] && [ "$AVAILABLE" -eq 0 ]; then
+  echo "WARNING: token pool bootstrapped with 0/${{TOTAL}} accounts available -- this worker will sit idle until a live accounts.env is installed and re-bootstrapped (loom-daemon tokens bootstrap --shared --force)" >&2
+  exit 1
+fi
 "#
     )
 }
@@ -1037,6 +1104,21 @@ chmod 0755 "$HOME/.local/bin/loom-idle-shutdown.sh"
     )
 }
 
+/// Verify: daemon reachable from a registered workspace root, ranking fresh,
+/// workspace(s) registered.
+///
+/// Two fixes from the 2026-08-04 loom-worker-2 pilot (#5334):
+///
+/// - **cwd**: `cd "$HOME/{{primary_rel}}"` used to swallow a failed `cd` with
+///   `|| true` and silently carry on from whatever cwd the SSH session
+///   started in (never a registered workspace root) — now a missing
+///   workspace root fails loudly instead.
+/// - **race**: this step used to run `loom-daemon status` exactly once,
+///   immediately after `daemon-unit` (re)started the systemd unit — a real
+///   run observed 12/13 steps green, halted only because `status` was probed
+///   before the daemon finished starting (the identical command succeeded
+///   seconds later by hand). Retries now bound the wait to ~30s (15 attempts
+///   × 2s) before failing.
 fn render_verify(primary_rel: &str, repos: &[String]) -> String {
     let mut checks = String::new();
     for repo in repos {
@@ -1048,9 +1130,24 @@ fn render_verify(primary_rel: &str, repos: &[String]) -> String {
     let export_line = path_bootstrap::canonical_path_export_line();
     format!(
         r#"set -e
-{export_line}cd "$HOME/{primary_rel}" 2>/dev/null || true
-# Daemon reachable + status sane from the workspace cwd.
-loom-daemon status >/dev/null 2>&1 || {{ echo "loom-daemon status failed" >&2; exit 1; }}
+{export_line}WORKSPACE_ROOT="$HOME/{primary_rel}"
+cd "$WORKSPACE_ROOT" || {{ echo "verify: workspace root $WORKSPACE_ROOT not found (workspace-clone step must run first)" >&2; exit 1; }}
+# Daemon reachable + status sane from the workspace cwd. The daemon may still
+# be finishing startup right after daemon-unit's `systemctl --user enable
+# --now` (re)started it -- retry with a bounded ~30s wait instead of failing
+# on the very first race (#5334).
+STATUS_OK=0
+for _attempt in $(seq 1 15); do
+  if loom-daemon status >/dev/null 2>&1; then
+    STATUS_OK=1
+    break
+  fi
+  sleep 2
+done
+if [ "$STATUS_OK" != "1" ]; then
+  echo "loom-daemon status did not become ready within ~30s" >&2
+  exit 1
+fi
 # Token ranking is present + fresh (bootstrap + check ran).
 test -f "$HOME/.loom/tokens/.ranking" || test -f "$HOME/{primary_rel}/.loom/tokens/.ranking" \
   || {{ echo "no token ranking found" >&2; exit 1; }}
@@ -1430,6 +1527,157 @@ mod tests {
         assert!(base.apply.contains("libsqlite3-dev"));
     }
 
+    // ---- machine-layout: artifact-first provisioning (#5067, Epic #4990 Phase 4) ----
+
+    fn machine_layout_step() -> Step {
+        let plan = build_plan(&base_config(), &Secrets::default());
+        plan.entries
+            .iter()
+            .find_map(|e| match e {
+                super::super::PlanEntry::Step(s) if s.name == "machine-layout" => Some(s.clone()),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn base_deps_no_longer_installs_or_requires_a_rust_toolchain() {
+        // AC: base-deps no longer requires rustup/a Rust toolchain on the
+        // happy path (an artifact resolves for this host's platform); it is
+        // only pulled in — by machine-layout, reactively — as a fallback
+        // dependency when the build path is actually taken.
+        let plan = build_plan(&base_config(), &Secrets::default());
+        let base = plan
+            .entries
+            .iter()
+            .find_map(|e| match e {
+                super::super::PlanEntry::Step(s) if s.name == "base-deps" => Some(s),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            !base.apply.contains("rustup"),
+            "base-deps must not install rustup unconditionally:\n{}",
+            base.apply
+        );
+        assert!(
+            !base.check.as_ref().unwrap().contains("cargo"),
+            "base-deps' idempotency check must not require cargo (it no longer installs it):\n{}",
+            base.check.as_ref().unwrap()
+        );
+        // gh remains required (needed for artifact resolution + downloads).
+        assert!(base.check.as_ref().unwrap().contains("command -v gh"));
+    }
+
+    #[test]
+    fn machine_layout_attempts_artifact_fetch_before_any_toolchain_fallback() {
+        // AC: machine-layout attempts a release-artifact fetch first (reusing
+        // Phase 3's already-tested fetch/verify/checksum logic by shelling
+        // out to loom-daemon-update.sh's own "auto" resolution), falling back
+        // to `cargo build -p loom-daemon --release` (installing rustup first)
+        // only when that invocation fails.
+        let step = machine_layout_step();
+        let script = &step.apply;
+
+        // Delegates to loom-daemon-update.sh (Phase 3, #5020) rather than
+        // duplicating the fetch/verify/checksum implementation.
+        let update_call = script
+            .find(r#"defaults/scripts/cli/loom-daemon-update.sh""#)
+            .expect(
+                "machine-layout must invoke loom-daemon-update.sh to reuse Phase 3's \
+                 fetch/verify/checksum logic",
+            );
+
+        // The toolchain fallback (rustup install + `cargo build` retry) must
+        // sit strictly INSIDE the `if ! "$UPDATE_SCRIPT" ...; then` failure
+        // branch — i.e. after the first invocation and gated on `cargo`
+        // being absent — so it is never reached on the artifact-available
+        // happy path.
+        let toolchain_fallback = script
+            .find("installing rustup as a fallback dependency")
+            .expect("a rustup-install fallback must exist for when no artifact resolves");
+        let cargo_guard = script
+            .find("if ! command -v cargo")
+            .expect("the toolchain fallback must be gated on cargo being absent");
+        assert!(
+            update_call < cargo_guard && cargo_guard < toolchain_fallback,
+            "artifact-fetch attempt must precede the cargo-absent guard, which must precede \
+             the rustup install:\n{script}"
+        );
+
+        // No literal `cargo build` shell invocation: the actual build now
+        // happens inside loom-daemon-update.sh's own (already-tested)
+        // fallback path, not duplicated here.
+        assert!(
+            !script.contains("cargo build --release")
+                && !script
+                    .lines()
+                    .any(|l| l.trim_start().starts_with("cargo build")),
+            "machine-layout must not duplicate the source-build invocation; it delegates to \
+             loom-daemon-update.sh instead:\n{script}"
+        );
+
+        // --no-restart: fleet add-worker has not installed the loom-daemon
+        // systemd unit yet at this point in the plan, so there is never a
+        // running daemon for this invocation to try to restart.
+        assert!(
+            script.contains(r#""$UPDATE_SCRIPT" --no-restart"#),
+            "loom-daemon-update.sh must be invoked with --no-restart:\n{script}"
+        );
+    }
+
+    #[test]
+    fn machine_layout_toolchain_fallback_retries_the_same_update_script() {
+        // The retry after installing rustup must call the SAME update-script
+        // invocation (not a hand-rolled `cargo build`), so it goes through
+        // the identical fetch/verify/checksum + build logic a second time
+        // (now with cargo available) rather than a second implementation.
+        let step = machine_layout_step();
+        let script = &step.apply;
+        assert_eq!(
+            script.matches(r#""$UPDATE_SCRIPT" --no-restart"#).count(),
+            2,
+            "expected exactly two invocations (initial attempt + one retry after installing \
+             rustup):\n{script}"
+        );
+    }
+
+    #[test]
+    fn machine_layout_idempotency_check_unchanged() {
+        // AC: the plan's idempotency check (test -x .../loom-daemon) and
+        // existing re-run semantics are preserved — a re-run of `fleet
+        // add-worker` against an already-provisioned host still no-ops this
+        // step.
+        let step = machine_layout_step();
+        assert_eq!(step.check.as_deref(), Some(r#"test -x "$HOME/.local/bin/loom-daemon""#));
+    }
+
+    #[test]
+    fn machine_layout_rendered_script_is_valid_shell() {
+        // Sanity-check the generated script actually parses as shell (bash -n
+        // — syntax check only, no execution) — catches an unbalanced
+        // if/fi or quoting mistake in the artifact-fetch/fallback wiring
+        // that a pure string-content assertion would miss.
+        let step = machine_layout_step();
+        let output = std::process::Command::new("bash")
+            .arg("-n")
+            .arg("-c")
+            .arg(&step.apply)
+            .output();
+        match output {
+            Ok(out) => assert!(
+                out.status.success(),
+                "rendered machine-layout script failed `bash -n`:\n{}\nscript:\n{}",
+                String::from_utf8_lossy(&out.stderr),
+                step.apply
+            ),
+            Err(e) => {
+                // bash not available in this environment — skip rather than fail.
+                eprintln!("skipping bash -n check: could not launch bash ({e})");
+            }
+        }
+    }
+
     #[test]
     fn forge_auth_and_token_accounts_carry_secret_stdin() {
         let config = base_config();
@@ -1452,7 +1700,7 @@ mod tests {
             assert!(stdin.secret, "{name} stdin must be marked secret");
         }
         // The apply strings must NOT embed the secret values (stdin only).
-        let dry = plan.render_dry_run("worker-1");
+        let dry = plan.render_dry_run("fleet add-worker", "worker-1");
         assert!(!dry.contains("the-pat"));
     }
 
@@ -1472,6 +1720,239 @@ mod tests {
                 "{name} should be a skip when its secret is absent"
             );
         }
+    }
+
+    // ---- verify: daemon-readiness retry + strict workspace cwd (#5334) ----
+
+    #[test]
+    fn verify_cd_into_workspace_root_fails_loudly_instead_of_falling_through() {
+        // A missing workspace root used to be swallowed by `|| true` and the
+        // rest of the script ran from whatever cwd the SSH session started
+        // in (never a registered workspace). It must now fail loudly, naming
+        // the expected root.
+        let script = render_verify("loom-workspaces/anvil", &["rjwalters/anvil".to_string()]);
+        assert!(
+            !script.contains("|| true"),
+            "verify must not silently swallow a failed cd:\n{script}"
+        );
+        assert!(script.contains(r#"cd "$WORKSPACE_ROOT""#), "verify:\n{script}");
+        assert!(script.contains("workspace root $WORKSPACE_ROOT not found"), "verify:\n{script}");
+    }
+
+    #[test]
+    fn verify_retries_daemon_status_with_a_bounded_wait() {
+        let script = render_verify("loom-workspaces/anvil", &["rjwalters/anvil".to_string()]);
+        assert!(
+            script.contains("for _attempt in $(seq 1 15)"),
+            "verify must bound its daemon-readiness retry loop:\n{script}"
+        );
+        assert!(script.contains("sleep 2"), "verify:\n{script}");
+        assert!(
+            script.contains("loom-daemon status did not become ready within ~30s"),
+            "verify:\n{script}"
+        );
+    }
+
+    #[test]
+    fn verify_rendered_script_is_valid_shell() {
+        let script = render_verify("loom-workspaces/anvil", &["rjwalters/anvil".to_string()]);
+        let output = Command::new("bash")
+            .arg("-n")
+            .arg("-c")
+            .arg(&script)
+            .output();
+        match output {
+            Ok(out) => assert!(
+                out.status.success(),
+                "rendered verify script failed `bash -n`:\n{}\nscript:\n{}",
+                String::from_utf8_lossy(&out.stderr),
+                script
+            ),
+            Err(e) => eprintln!("skipping bash -n check: could not launch bash ({e})"),
+        }
+    }
+
+    #[test]
+    fn verify_status_retry_loop_eventually_succeeds_past_early_failures() {
+        // Functional check (not just string content): a `loom-daemon` that
+        // fails its first two `status` calls (the exact startup race #5334
+        // reports) and succeeds from the third must let the retry loop pass,
+        // without needing to reach the full 15-attempt bound.
+        let Some(bash) = which_bash() else {
+            eprintln!("skipping: bash not available");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        write_executable(
+            &dir.path().join("loom-daemon"),
+            r#"#!/bin/sh
+if [ "$1" = "status" ]; then
+  COUNTER_FILE="$STUB_STATE_DIR/status-calls"
+  n=0
+  [ -f "$COUNTER_FILE" ] && n="$(cat "$COUNTER_FILE")"
+  n=$((n + 1))
+  echo "$n" > "$COUNTER_FILE"
+  if [ "$n" -lt 3 ]; then
+    exit 1
+  fi
+  exit 0
+fi
+if [ "$1" = "workspace" ]; then
+  echo '{"workspaces":["anvil"]}'
+  exit 0
+fi
+exit 0
+"#,
+        );
+        let repos = vec!["rjwalters/anvil".to_string()];
+        let script = render_verify("loom-workspaces/anvil", &repos);
+        // A tiny substitution so the test does not actually sleep 2s per
+        // retry (still exercises the identical loop/branch structure).
+        let fast_script = script.replace("sleep 2", "sleep 0.05");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(home.join("loom-workspaces/anvil")).unwrap();
+        std::fs::create_dir_all(home.join(".loom/tokens")).unwrap();
+        std::fs::write(home.join(".loom/tokens/.ranking"), "x").unwrap();
+        let out = Command::new(bash)
+            .arg("-c")
+            .arg(&fast_script)
+            .env("PATH", format!("{}:{}", dir.path().display(), std::env::var("PATH").unwrap()))
+            .env("HOME", &home)
+            .env("STUB_STATE_DIR", dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "verify should pass once status recovers:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // ---- token-ranking: health gate + checklist note (#5334) --------------
+
+    #[test]
+    fn token_ranking_marks_the_checklist_note_with_the_prefix_extract_checklist_note_expects() {
+        let script = render_token_ranking();
+        assert!(
+            script.contains(CHECKLIST_NOTE_PREFIX),
+            "token-ranking must use the shared checklist-note marker:\n{script}"
+        );
+    }
+
+    #[test]
+    fn token_ranking_rendered_script_is_valid_shell() {
+        let script = render_token_ranking();
+        let output = Command::new("bash")
+            .arg("-n")
+            .arg("-c")
+            .arg(&script)
+            .output();
+        match output {
+            Ok(out) => assert!(
+                out.status.success(),
+                "rendered token-ranking script failed `bash -n`:\n{}\nscript:\n{}",
+                String::from_utf8_lossy(&out.stderr),
+                script
+            ),
+            Err(e) => eprintln!("skipping bash -n check: could not launch bash ({e})"),
+        }
+    }
+
+    #[test]
+    fn token_ranking_reports_the_available_split_and_succeeds_when_some_available() {
+        let Some(bash) = which_bash() else {
+            eprintln!("skipping: bash not available");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        write_executable(
+            &dir.path().join("loom-daemon"),
+            "#!/bin/sh\ncat <<'EOF'\nToken pool ranking (probed at 2026-08-04T00:00:00Z)\n====\nAccount  5h util  7d util  Status\n----\na-1  0.10  0.10  available\nb-2  0.20  0.20  available\nc-3  1.00  1.00  blocked\nd-4  1.00  1.00  exhausted\n\nTotal 4: 2 available, 1 blocked, 1 exhausted\nEOF\nexit 0\n",
+        );
+        let out = Command::new(bash)
+            .arg("-c")
+            .arg(render_token_ranking())
+            .env("PATH", format!("{}:{}", dir.path().display(), std::env::var("PATH").unwrap()))
+            .env("HOME", dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "a pool with some available accounts must not fail:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains(&format!("{CHECKLIST_NOTE_PREFIX}token pool 2/4 accounts available")),
+            "stdout: {stdout}"
+        );
+    }
+
+    #[test]
+    fn token_ranking_fails_loudly_when_every_account_is_blocked() {
+        // The exact 2026-08-04 loom-worker-2 incident: `tokens check
+        // --ranking` itself exits 0 (nothing is `error`/`skipped`), but every
+        // account is `blocked` — zero `available`. This must halt the run,
+        // not report a green "changed".
+        let Some(bash) = which_bash() else {
+            eprintln!("skipping: bash not available");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        write_executable(
+            &dir.path().join("loom-daemon"),
+            "#!/bin/sh\ncat <<'EOF'\nToken pool ranking (probed at 2026-08-04T00:00:00Z)\n====\nAccount  5h util  7d util  Status\n----\na-1  1.00  1.00  blocked\nb-2  1.00  1.00  blocked\nc-3  1.00  1.00  blocked\nd-4  1.00  1.00  blocked\n\nTotal 4: 4 blocked\nEOF\nexit 0\n",
+        );
+        let out = Command::new(bash)
+            .arg("-c")
+            .arg(render_token_ranking())
+            .env("PATH", format!("{}:{}", dir.path().display(), std::env::var("PATH").unwrap()))
+            .env("HOME", dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            !out.status.success(),
+            "an all-blocked pool must fail the step, not bootstrap silently"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("WARNING"), "stderr: {stderr}");
+        assert!(stderr.contains("0/4"), "stderr: {stderr}");
+    }
+
+    /// Resolve a `bash` binary for the functional (actually-executes-shell)
+    /// tests above, or `None` when the test environment has no bash — mirrors
+    /// `machine_layout_rendered_script_is_valid_shell`'s skip-not-fail
+    /// posture for a bash-less CI image.
+    fn which_bash() -> Option<PathBuf> {
+        // Resolve an *absolute* path up front (rather than the bare name
+        // "bash") so overriding the child process's own `PATH` env (below,
+        // to expose the stub `loom-daemon`) cannot also change which `bash`
+        // binary gets exec'd.
+        let out = Command::new("sh")
+            .arg("-c")
+            .arg("command -v bash")
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if path.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(path))
+        }
+    }
+
+    /// Write an executable shell-script stub at `path` (mode 0755).
+    fn write_executable(path: &std::path::Path, contents: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, contents).unwrap();
+        let mut perms = std::fs::metadata(path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(path, perms).unwrap();
     }
 
     #[test]
@@ -1624,7 +2105,7 @@ mod tests {
             assert!(stdin.secret, "{name} stdin must be marked secret");
         }
 
-        let dry = plan.render_dry_run("worker-1");
+        let dry = plan.render_dry_run("fleet add-worker", "worker-1");
         assert!(!dry.contains("tskey-auth-ephemeral-tagged"));
         assert!(!dry.contains("hunter2-matrix-pw"));
         assert!(!dry.contains("store-pass-xyz"));
@@ -2089,7 +2570,7 @@ mod tests {
             ..Secrets::default()
         };
         let plan = build_plan(&config, &secrets);
-        let out = plan.render_dry_run(&config.ssh_host);
+        let out = plan.render_dry_run("fleet add-worker", &config.ssh_host);
         assert!(out.contains("13 steps"));
         assert!(out.contains("base-deps"));
         assert!(out.contains("verify"));

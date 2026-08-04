@@ -13,6 +13,14 @@ You help with general development tasks including:
 - Refactoring code
 - Improving documentation
 
+## ⚠️ `--body @path` Does NOT Expand — It Posts the Literal String
+
+If you post a comment via `gh issue comment` / `gh pr comment` / `gh api ...
+comments` from a scratch file, `--body @path` (and `gh api -f body=@path`)
+posts the literal string `@path`, not the file's contents. **Full pitfall,
+incident citation, and fixes**:
+[`comment-body-literal-path.md`](comment-body-literal-path.md).
+
 ## CRITICAL: Scope Discipline
 
 **NEVER modify files or code unrelated to the issue you are working on.**
@@ -311,6 +319,25 @@ writes your WIP as a patch file under
 `<worktree-root>/.snapshots/issue-<N>-<timestamp>.patch`, scoped to your own
 worktree, so there is no shared stack to collide on.
 
+**For a "clean baseline vs. my diff" comparison** — temporarily clearing your
+WIP to run a clippy/shellcheck/test baseline, then restoring it — `snapshot`
+is *not* enough (it captures a patch but does not reset the working tree).
+Use the clean-and-restore pair instead of `git stash` / `git stash pop`
+(#5217):
+
+```bash
+./.loom/scripts/worktree.sh stash-push <issue-number>   # capture WIP, reset to clean HEAD
+<run the baseline check>                                # e.g. cargo clippy > /tmp/baseline.txt
+./.loom/scripts/worktree.sh stash-pop <issue-number>    # restore exactly what was captured
+```
+
+It anchors your WIP to a **per-issue** ref (`refs/loom/stash-baseline/issue-<N>`),
+never `refs/stash`, so another builder's concurrent stash cannot land "in
+between" your push and pop. Add `--include-untracked` to move untracked files
+out too. Because it never runs `git stash pop|drop|clear`, it does not trip
+the `stash-scope` ask that would stall a headless sweep — whereas raw
+`git stash pop` from a worktree still asks, correctly, and always will.
+
 This does **not** apply to the `check-main-clean.sh --quarantine` recovery
 flow below (§"If it exits 3…") — that flow's use of `git stash` operates on
 the **main checkout**, is single-writer by construction (only one agent's
@@ -573,6 +600,14 @@ Before claiming, check for these warning signs:
 - Waste time redoing work (comment had shortcut)
 
 **Reading comments is not optional** - it's where Curators put the detailed spec that makes issues truly ready for implementation.
+
+### Re-Verify Date-Stamped Facts Before Acting
+
+Curator guidance requires volatile facts (counts, version numbers, file/line references, "no X is needed" claims) to carry an "as of `<sha/date>`" stamp — e.g. `"24 verbs as of \`289be45\`, 2026-08-04"` rather than a bare `"24 verbs"` (see `curator.md` → "Date-stamp volatile facts"). Treat that stamp as a **prompt to re-verify**, not a substitute for verification — a fact that was true "as of" curation time can already be stale by the time you implement, especially in a repo with several concurrently active worktrees.
+
+**Before acting on a stamped fact whose value is embedded directly in an acceptance criterion's output** — e.g. "CHANGELOG lists 13 new verbs", "no schema_version bump needed" — re-derive it against the current tree first: re-run the same grep/count/check the curator used, don't just eyeball the date and move on. This matters most when the action you're about to take **can't be undone** (a version bump, a tag push, a publish, an external API write): a stale count baked into a permanent artifact cannot be un-shipped afterward. This guards against exactly the failure in 2AMLogic/klayout-tools#342 — a correctly-curated verb count and a "no bump needed" claim both went stale within two days, ahead of an irrevocable PyPI publish.
+
+If re-verification finds the stamped fact has drifted, update the acceptance criterion / your PR description to match the current tree (and note the discrepancy) rather than silently completing the original wording.
 
 ## Checking Dependencies Before Claiming
 
@@ -860,6 +895,7 @@ For additional PR quality guidelines, see **builder-pr.md**.
 - **Verify ALL acceptance criteria** from the issue (checkboxes, numbered items, "must"/"should" statements)
 - Verify each criterion explicitly with concrete checks (not "I think it works")
 - Run the project's check command (see `buildGate.command` in `.loom/config.json`, or the repo's documented CI command, e.g. `pnpm check:ci`) before creating PR
+- **Run the project's formatter + linter on your changed files before committing** — discover the commands from repo convention (`buildGate.command`, `CONTRIBUTING.md`, CI workflow, or the language's standard tool, e.g. `ruff format`/`ruff check` for Python, `cargo fmt`/`cargo clippy` for Rust). A format-only CI failure is a **guaranteed Judge rejection** that costs a full Doctor cycle for a one-command fix — see **builder-pr.md § "Format and Lint Changed Files"**
 
 ### MANDATORY: Derive Titles From Your Diff, Not the Issue
 

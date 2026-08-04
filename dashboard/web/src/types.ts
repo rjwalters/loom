@@ -25,6 +25,44 @@
  *    from the schema doc's `host.health` / `tokens.snapshot` sections.
  */
 
+/** One repository in a host's `managed_repos` roster (#4976). `slug` is
+ * present for a public repo, or a private one on the authenticated view; the
+ * public (unauthenticated) view drops `slug` for a private entry — the
+ * backend's redaction keeps the entry (so its count still shows) but strips
+ * the identifying field, mirroring `PublicActiveSweep`'s repo-nulling for a
+ * private sweep (`dashboard/src/redaction.ts`). */
+export interface ManagedRepoEntry {
+  slug?: string;
+  visibility?: "public" | "private";
+}
+
+/** One `(root, role)` pair's persistent tick-failure detail inside a host's
+ * `roles` role-tick health summary (#5022). `root` is a filesystem workspace
+ * path (not a forge repo slug) — it names no repository. */
+export interface RoleTickFailure {
+  root?: string;
+  role?: string;
+  failures?: number;
+  last_at?: string;
+  detail?: string;
+}
+
+/** `host.health`'s role-tick health summary (#5022) — the same
+ * transient-vs-persistent classification `loom-daemon health`'s `roles`
+ * section already computes, carried through the telemetry pipeline so a role
+ * dying on one host is visible fleet-wide, not only to an operator who
+ * happens to run `loom-daemon health` locally on that host.
+ *
+ * `total: 0` means "no role ticks sampled" (the role runner idle or
+ * disabled) — a normal state, not an error — same as an empty `persistent`
+ * list with `total > 0` means "every tick ok". Absent entirely on a record
+ * from a pre-#5022 daemon. */
+export interface RoleTickHealth {
+  total?: number;
+  ok?: number;
+  persistent?: RoleTickFailure[];
+}
+
 /** `host.health` — CPU/disk headroom, daemon version, uptime.
  *
  * Every measured field is optional by design: the daemon's "unknown != zero"
@@ -35,16 +73,48 @@ export interface HostHealthRecord {
   kind?: string;
   captured_at?: string;
   daemon_version?: string;
+  /** Short git commit the emitting binary was built from (#4956). Absent on
+   * records from a pre-#4956 daemon; `"unknown"` when the build host had no
+   * git. The version alone only moves once per release, so this is what makes
+   * two same-version builds distinguishable. */
+  build_commit?: string;
+  /** RFC-3339 instant the emitting binary was compiled (#4956). Absent when
+   * the build stamp was unavailable — never a fabricated instant. */
+  built_at?: string;
   uptime_sec?: number;
   logical_cpus?: number;
   cpu_idle_fraction?: number;
   load_per_core?: number;
   worktree_root_free_gb?: number;
+  /** Whether this host's own dispatch is currently halted for a non-idle
+   * reason — the host-distress breaker tripped `Open`/`CoolDown`, the
+   * saturation hold, or the rate-limit breaker (Issue #4975). Absent on a
+   * record from a pre-#4975 daemon, which is indistinguishable from `false`
+   * — neither means "known to be healthy", just "not known to be halted". */
+  dispatch_halted?: boolean;
+  /** Human-readable reason for the halt (e.g. `"load-per-core 4.24 >= 2.50
+   * sustained for 3 consecutive tick(s)"`), naming the specific breaker/gate
+   * that tripped. Absent when `dispatch_halted` is absent/`false`. */
+  halt_reason?: string;
+  /** This host's managed-repository roster (#4976) — sourced from the
+   * daemon's workspace registry, not inferred from in-flight sweeps, so an
+   * idle-but-registered repo still appears. Absent entirely on a host
+   * running a pre-#4976 daemon, or one with no registered workspaces. */
+  managed_repos?: ManagedRepoEntry[];
+  /** This host's role-tick health (#5022). Absent on a record from a
+   * pre-#5022 daemon, which is indistinguishable from "nothing sampled yet"
+   * — never render its absence as either healthy or degraded. */
+  roles?: RoleTickHealth;
 }
 
 /** One account inside a `tokens.snapshot`. Only `exhausted` is always sent;
  * `rank` / `usage_fraction` / `limit_window_reset_at` are omitted when the
- * daemon does not know them. */
+ * daemon does not know them.
+ *
+ * `limit_window_reset_at` is the instant the window *currently gating* the
+ * account rolls over — the 7d window once it is `exhausted`, the 5h window
+ * (the one `usage_fraction` measures) otherwise. The daemon resolves which,
+ * so this side reads it as one thing: when the account's constraint lifts. */
 export interface TokenAccount {
   account?: string;
   rank?: number;

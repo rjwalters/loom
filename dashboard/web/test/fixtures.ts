@@ -154,11 +154,25 @@ export function multiHostSnapshot(): unknown {
             kind: "host.health",
             captured_at: isoMinutesBefore(2),
             daemon_version: "0.16.0",
+            // #4956 build identity. The degraded host below deliberately
+            // omits both, standing in for a record from a pre-#4956 daemon.
+            build_commit: "8c16fb5b",
+            built_at: isoMinutesBefore(360),
             uptime_sec: 86_400,
             logical_cpus: 28,
             cpu_idle_fraction: 0.83,
             load_per_core: 0.51,
             worktree_root_free_gb: 200,
+            // #4976 roster: one repo with two in-flight sweeps (matching the
+            // activeSweeps below), plus two registered-but-idle repos — the
+            // "roster-shaped idle" case the feature exists for.
+            managed_repos: [
+              { slug: "rjwalters/loom", visibility: "public" },
+              { slug: "2AMLogic/gf180-pll", visibility: "private" },
+              { slug: "2AMLogic/gf180-trng", visibility: "private" },
+            ],
+            // #5022: every tick ok — must not read as degraded.
+            roles: { total: 12, ok: 12, persistent: [] },
           },
           updatedAt: isoMinutesBefore(2),
         },
@@ -197,7 +211,17 @@ export function multiHostSnapshot(): unknown {
           record: {
             kind: "tokens.snapshot",
             accounts: [
-              { account: "agent-3", usage_fraction: 1, exhausted: true },
+              // An exhausted account that reports when its 7d window resets —
+              // the case the whole countdown column exists for ("when does
+              // this exhausted account come back?", issue #4874). Days out,
+              // not hours: that is the distinction between "capacity returns
+              // shortly" and "this host is spent until Saturday".
+              {
+                account: "agent-3",
+                usage_fraction: 1,
+                limit_window_reset_at: "2026-08-02T03:00:00Z",
+                exhausted: true,
+              },
               { account: "agent-4", exhausted: false },
             ],
           },
@@ -260,6 +284,12 @@ export function multiHostSnapshot(): unknown {
             cpu_idle_fraction: 0.99,
             load_per_core: 0.02,
             worktree_root_free_gb: 512,
+            // Stands in for the redacted, unauthenticated shape
+            // (`dashboard/src/redaction.ts`'s `redactManagedRepos`): a
+            // private entry keeps its place in the roster but loses `slug`,
+            // so the UI collapses it into a "+N private" count instead of
+            // naming it.
+            managed_repos: [{ slug: "rjwalters/loom", visibility: "public" }, { visibility: "private" }, { visibility: "private" }],
           },
           updatedAt: isoMinutesBefore(3),
         },
@@ -305,3 +335,26 @@ export function multiHostSnapshot(): unknown {
 }
 
 export const EMPTY_SNAPSHOT: unknown = { hosts: {}, activeSweeps: [] };
+
+/**
+ * A `host.health.roles` summary with one persistent tick failure (#5022) —
+ * the wire-shaped fixture `judge @ /repos/loom` failing 2 of its last 3
+ * ticks, matching `.loom/docs/telemetry-schema.md`'s `roles` example. Used by
+ * tests that assert the dashboard surfaces a persistent role-tick failure
+ * without needing a whole new fleet-wide host in `multiHostSnapshot`.
+ */
+export function persistentRoleTickFailureFixture(): unknown {
+  return {
+    total: 3,
+    ok: 1,
+    persistent: [
+      {
+        root: "/repos/loom",
+        role: "judge",
+        failures: 2,
+        last_at: isoMinutesBefore(1),
+        detail: "no-token-pool",
+      },
+    ],
+  };
+}

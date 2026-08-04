@@ -432,13 +432,37 @@ pub fn load_internal_skip_list(defaults_path: &Path) -> HashSet<String> {
 }
 
 /// Read and parse an existing settings.json file, returning None if missing or invalid.
+///
+/// A missing file is the normal, silent case (fresh install — nothing to
+/// merge). A *present but unparseable* file is a different, noteworthy case:
+/// the caller ([`merge_settings_json`] via `setup_repository_scaffolding`)
+/// treats `None` as "nothing to merge" and leaves Loom's freshly-copied
+/// defaults in place untouched — silently dropping every pre-existing hook,
+/// permission, and top-level key the file contained (issue #5279's
+/// "Suspected Cause" #2: a non-strict-JSON file some other tool wrote — e.g.
+/// containing comments or a trailing comma — would previously fail this
+/// parse with zero warning, discarding its content on the very next
+/// reinstall/upgrade with no diagnostic pointing at why). We now warn on that
+/// specific case so the drop is visible instead of silent; the missing-file
+/// case stays silent since it is not an error.
 fn read_existing_settings(path: &Path) -> Option<Value> {
     let content = fs::read_to_string(path).ok()?;
-    let value: Value = serde_json::from_str(&content).ok()?;
-    if value.is_object() {
-        Some(value)
-    } else {
-        None
+    match serde_json::from_str::<Value>(&content) {
+        Ok(value) if value.is_object() => Some(value),
+        Ok(_) => {
+            eprintln!(
+                "Warning: {} is valid JSON but not a JSON object; skipping settings.json merge (Loom's own settings.json will be used as-is).",
+                path.display()
+            );
+            None
+        }
+        Err(e) => {
+            eprintln!(
+                "Warning: Failed to parse existing {} as JSON ({e}); skipping settings.json merge. Loom's own settings.json will be written as-is, which may drop pre-existing hooks/permissions/keys from this file. Fix the JSON syntax (comments and trailing commas are not valid JSON) and re-run install to merge them back in.",
+                path.display()
+            );
+            None
+        }
     }
 }
 
@@ -925,8 +949,13 @@ pub fn setup_repository_scaffolding(
     // (AGENTS_SECTION_START/END) so the two files' Loom-managed sections are
     // independently detectable. AGENTS.md has no historical "legacy
     // full-guide-in-root" layout to migrate away from (unlike CLAUDE.md's
-    // pre-#3000 layout), so no `is_legacy_loom_managed_root`-style heuristic is
-    // needed for it.
+    // pre-#3000 layout) — but it still needs the same
+    // `is_legacy_loom_managed_root` / `slice_is_discardable_legacy` heuristics
+    // (issue #4888): a broken or interrupted prior install can leave a root
+    // AGENTS.md carrying stale, unsubstituted Loom template text with missing
+    // or malformed markers, and preserving that verbatim would reintroduce the
+    // placeholders and trip `assert_no_placeholders` below. See the marker /
+    // markerless branches further down.
     //
     // `defaults/.loom/AGENTS.md` is itself a generated artifact
     // (defaults/scripts/generate-agents-md.sh, kept in sync by
@@ -987,13 +1016,44 @@ pub fn setup_repository_scaffolding(
                     } else {
                         ""
                     };
-                    format!("{}{}{}", before.trim_end(), wrapped_agents_pointer, after)
+                    // Same hybrid-legacy hazard CLAUDE.md guards against
+                    // (issue #3476/#3527): if the slice outside the marker
+                    // block is itself leftover Loom-managed cruft — e.g. from
+                    // a previously interrupted install that left unsubstituted
+                    // `{{LOOM_VERSION}}` text lying around — preserving it
+                    // verbatim reintroduces the placeholders and trips the
+                    // `assert_no_placeholders` guard below (issue #4888).
+                    if slice_is_discardable_legacy(before) || slice_is_discardable_legacy(after) {
+                        wrapped_agents_pointer.clone()
+                    } else {
+                        format!("{}{}{}", before.trim_end(), wrapped_agents_pointer, after)
+                    }
                 } else {
-                    // Malformed markers - append pointer at end.
-                    format!("{}\n\n{}", existing_content.trim(), wrapped_agents_pointer)
+                    // Malformed markers (only one of START/END present) - this
+                    // is exactly the shape a broken/interrupted prior install
+                    // can leave behind. Treat it the same as the no-markers
+                    // case below rather than blindly preserving it (issue
+                    // #4888): discard if it looks like leftover Loom-managed
+                    // content, otherwise preserve and append.
+                    if is_legacy_loom_managed_root(&existing_content) {
+                        wrapped_agents_pointer.clone()
+                    } else {
+                        format!("{}\n\n{}", existing_content.trim(), wrapped_agents_pointer)
+                    }
                 }
+            } else if is_legacy_loom_managed_root(&existing_content) {
+                // No markers, but the content matches a known Loom-managed
+                // legacy/leftover signature (most tellingly, unsubstituted
+                // `{{LOOM_VERSION}}`-style placeholders — real users don't
+                // type those into hand-authored docs). This can happen even
+                // though AGENTS.md itself has no historical full-guide-in-root
+                // layout: a broken or interrupted prior install can leave a
+                // markerless root AGENTS.md carrying stale Loom template text
+                // (issue #4888). Discard rather than preserve-and-leak.
+                wrapped_agents_pointer.clone()
             } else {
-                // No markers — preserve genuine user-authored content, append at end.
+                // No markers, no legacy signature — preserve genuine
+                // user-authored content, append at end.
                 format!("{}\n\n{}", existing_content.trim(), wrapped_agents_pointer)
             }
         } else {
@@ -1879,9 +1939,13 @@ WARNING: Never run `lake build` inside Docker - causes memory corruption.
     // AGENTS.md tests (issue #4479, epic #4167 — dual-runtime instruction
     // anchor; seeded by gpeyton/loom fork PR #8). These mirror the CLAUDE.md
     // marker-injection tests above, exercised against `defaults/.loom/AGENTS.md`
-    // and the AGENTS-specific marker pair. No legacy-layout heuristic tests are
-    // needed (unlike CLAUDE.md's pre-#3000 migration tests) since AGENTS.md has
-    // no historical full-guide-in-root layout to migrate away from.
+    // and the AGENTS-specific marker pair. AGENTS.md has no historical
+    // full-guide-in-root layout of its own to migrate away from, but issue
+    // #4888 showed a broken/interrupted prior install can still leave a root
+    // AGENTS.md carrying leaked, unsubstituted `{{LOOM_VERSION}}`-style
+    // placeholder text (with or without markers) — the legacy-migration tests
+    // below (reusing the same `is_legacy_loom_managed_root` /
+    // `slice_is_discardable_legacy` heuristics as CLAUDE.md) cover that case.
     // =========================================================================
 
     /// Helper to create a standard test setup with an AGENTS.md template in defaults.
@@ -2164,6 +2228,143 @@ WARNING: Never run `lake build` inside Docker - causes memory corruption.",
         assert!(loom_content.contains("Updated content v2"));
         assert!(!loom_content.contains("Old content v1"));
         assert!(report.updated.contains(&".loom/AGENTS.md".to_string()));
+    }
+
+    // ---------- #4888 AGENTS.md legacy-placeholder migration tests ----------
+
+    #[test]
+    fn test_setup_scaffolding_discards_markerless_legacy_root_agents_md() {
+        // Regression test for #4888 defect 1. A broken/interrupted prior
+        // install (or an old pre-marker layout) can leave a markerless root
+        // AGENTS.md carrying leaked, unsubstituted `{{LOOM_VERSION}}` text.
+        // Before the fix, the "no markers" branch preserved this verbatim,
+        // which reintroduced the placeholders and tripped
+        // `assert_no_placeholders`, aborting the whole install.
+        let temp_dir = TempDir::new().unwrap();
+        let (workspace, defaults) = setup_test_with_agents_template(
+            &temp_dir,
+            "# Loom Orchestration - Repository Guide (AGENTS.md)\n\nFull guide content (new).",
+        );
+        fs::create_dir_all(workspace.join(".loom")).unwrap();
+
+        // Markerless legacy content with leaked template placeholders.
+        fs::write(
+            workspace.join("AGENTS.md"),
+            "# Loom Orchestration - Repository Guide\n\n\
+             **Loom Version**: {{LOOM_VERSION}}\n\
+             **Installation Date**: {{INSTALL_DATE}}\n\n\
+             Generated by Loom Installation Process\n",
+        )
+        .unwrap();
+
+        let mut report = InitReport::default();
+        let result = setup_repository_scaffolding(&workspace, &defaults, false, &mut report);
+        assert!(result.is_ok(), "install must not fail on legacy AGENTS.md: {result:?}");
+
+        let content = fs::read_to_string(workspace.join("AGENTS.md")).unwrap();
+        assert!(content.contains(AGENTS_SECTION_START));
+        assert!(content.contains(AGENTS_SECTION_END));
+        assert!(content.contains(AGENTS_ROOT_POINTER));
+        assert!(!content.contains("{{LOOM_VERSION}}"), "leaked placeholder: {content}");
+        assert!(!content.contains("{{INSTALL_DATE}}"));
+        assert!(!content.contains("Generated by Loom Installation Process"));
+    }
+
+    #[test]
+    fn test_setup_scaffolding_discards_hybrid_legacy_root_agents_md() {
+        // Regression test for #4888 defect 1, hybrid variant (mirrors
+        // CLAUDE.md's #3476 hybrid test): a markered root AGENTS.md whose
+        // slice OUTSIDE the marker block is itself leftover legacy content
+        // with unsubstituted placeholders. Before the fix the marker-replace
+        // branch preserved `before`/`after` verbatim regardless of content,
+        // leaking the placeholders through and tripping the guard.
+        let temp_dir = TempDir::new().unwrap();
+        let (workspace, defaults) = setup_test_with_agents_template(
+            &temp_dir,
+            "# Loom Orchestration - Repository Guide (AGENTS.md)\n\nFull guide content (new).",
+        );
+        fs::create_dir_all(workspace.join(".loom")).unwrap();
+
+        let legacy_fragment = "# Loom Orchestration - Repository Guide\n\n\
+             **Loom Version**: {{LOOM_VERSION}}\n\
+             **Installation Date**: {{INSTALL_DATE}}\n\n\
+             Generated by Loom Installation Process\n";
+        let hybrid = format!("{}\n{}\n", legacy_fragment, wrap_agents_content("Old pointer text"));
+        fs::write(workspace.join("AGENTS.md"), &hybrid).unwrap();
+
+        let mut report = InitReport::default();
+        let result = setup_repository_scaffolding(&workspace, &defaults, false, &mut report);
+        assert!(result.is_ok(), "install must not fail on hybrid legacy AGENTS.md: {result:?}");
+
+        let content = fs::read_to_string(workspace.join("AGENTS.md")).unwrap();
+        assert_eq!(
+            content,
+            wrap_agents_content(AGENTS_ROOT_POINTER),
+            "hybrid legacy AGENTS.md should be fully replaced with the wrapped pointer"
+        );
+        assert!(!content.contains("{{LOOM_VERSION}}"));
+        assert!(!content.contains("{{INSTALL_DATE}}"));
+        assert!(!content.contains("Generated by Loom Installation Process"));
+        assert!(!content.contains("Old pointer text"));
+    }
+
+    #[test]
+    fn test_setup_scaffolding_discards_malformed_marker_legacy_root_agents_md() {
+        // Regression test for #4888 defect 1, malformed-marker variant: only
+        // the START marker is present (no END), which used to fall into the
+        // "append pointer at end" branch and preserve the entire file
+        // (including leaked placeholders) verbatim.
+        let temp_dir = TempDir::new().unwrap();
+        let (workspace, defaults) = setup_test_with_agents_template(
+            &temp_dir,
+            "# Loom Orchestration - Repository Guide (AGENTS.md)\n\nFull guide content (new).",
+        );
+        fs::create_dir_all(workspace.join(".loom")).unwrap();
+
+        let malformed = format!(
+            "{AGENTS_SECTION_START}\n**Loom Version**: {{{{LOOM_VERSION}}}}\nno end marker here\n"
+        );
+        fs::write(workspace.join("AGENTS.md"), &malformed).unwrap();
+
+        let mut report = InitReport::default();
+        let result = setup_repository_scaffolding(&workspace, &defaults, false, &mut report);
+        assert!(
+            result.is_ok(),
+            "install must not fail on malformed-marker AGENTS.md: {result:?}"
+        );
+
+        let content = fs::read_to_string(workspace.join("AGENTS.md")).unwrap();
+        assert!(content.contains(AGENTS_SECTION_START));
+        assert!(content.contains(AGENTS_SECTION_END));
+        assert!(content.contains(AGENTS_ROOT_POINTER));
+        assert!(!content.contains("{{LOOM_VERSION}}"), "leaked placeholder: {content}");
+    }
+
+    #[test]
+    fn test_setup_scaffolding_preserves_markerless_user_root_agents_md() {
+        // Negative control: markerless content with NO legacy signature must
+        // still be preserved and appended-to, not discarded. Guards against
+        // the new legacy check being overly aggressive.
+        let temp_dir = TempDir::new().unwrap();
+        let (workspace, defaults) = setup_test_with_agents_template(
+            &temp_dir,
+            "# Loom Orchestration - Repository Guide (AGENTS.md)\n\nFull guide content (new).",
+        );
+        fs::create_dir_all(workspace.join(".loom")).unwrap();
+
+        fs::write(
+            workspace.join("AGENTS.md"),
+            "# My Project\n\nHand-written Codex instructions, no Loom signatures here.",
+        )
+        .unwrap();
+
+        let mut report = InitReport::default();
+        setup_repository_scaffolding(&workspace, &defaults, false, &mut report).unwrap();
+
+        let content = fs::read_to_string(workspace.join("AGENTS.md")).unwrap();
+        assert!(content.contains("Hand-written Codex instructions"));
+        assert!(content.contains(AGENTS_SECTION_START));
+        assert!(content.contains(AGENTS_ROOT_POINTER));
     }
 
     #[test]
@@ -3081,6 +3282,143 @@ WARNING: Never run `lake build` inside Docker - causes memory corruption.",
 
         // enabledPlugins should be preserved
         assert_eq!(result["enabledPlugins"]["my-plugin"], true);
+    }
+
+    /// Issue #5279 edge case: a foreign hook under a hook type/matcher pair
+    /// Loom's own defaults ALSO define (both register `PreToolUse`/`Bash`).
+    /// Confirms dedup is by normalized *command*, not by hook type or matcher
+    /// alone -- a foreign command sharing Loom's matcher must survive
+    /// alongside Loom's own command, not be treated as a collision and
+    /// dropped/replaced.
+    #[test]
+    fn test_merge_settings_dedup_preserves_foreign_command_in_shared_matcher() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        let defaults = temp_dir.path().join("defaults");
+
+        fs::create_dir(workspace.join(".git")).unwrap();
+
+        fs::create_dir_all(defaults.join(".claude").join("commands")).unwrap();
+        fs::write(
+            defaults.join(".claude").join("settings.json"),
+            r#"{
+                "hooks": {
+                    "PreToolUse": [{
+                        "matcher": "Bash",
+                        "hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR}/.loom/hooks/guard-destructive.sh"}]
+                    }]
+                }
+            }"#,
+        )
+        .unwrap();
+
+        fs::create_dir_all(workspace.join(".claude").join("commands")).unwrap();
+        fs::write(
+            workspace.join(".claude").join("settings.json"),
+            r#"{
+                "hooks": {
+                    "PreToolUse": [{
+                        "matcher": "Bash",
+                        "hooks": [{"type": "command", "command": "repo-skills-bash-guard.sh"}]
+                    }]
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let mut report = InitReport::default();
+        setup_repository_scaffolding(workspace, &defaults, true, &mut report).unwrap();
+
+        let result_content =
+            fs::read_to_string(workspace.join(".claude").join("settings.json")).unwrap();
+        let result: serde_json::Value = serde_json::from_str(&result_content).unwrap();
+
+        let pre_tool = result["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre_tool.len(), 1, "Bash matcher should not be duplicated");
+
+        let bash_matcher = &pre_tool[0];
+        let commands: Vec<&str> = bash_matcher["hooks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["command"].as_str().unwrap())
+            .collect();
+
+        assert!(
+            commands.contains(&"repo-skills-bash-guard.sh"),
+            "Foreign command sharing Loom's hook type+matcher must survive: {commands:?}"
+        );
+        assert!(
+            commands.iter().any(|c| c.contains("guard-destructive.sh")),
+            "Loom's own command must also be present: {commands:?}"
+        );
+    }
+
+    /// Issue #5279 ("Suspected Cause" #2): a pre-existing `.claude/settings.json`
+    /// that fails to parse as JSON (e.g. a sibling tool wrote non-strict JSON
+    /// with a trailing comma) must not silently and invisibly discard the
+    /// existing file's content -- `read_existing_settings` skips merging in
+    /// this case (documented behavior), and this test locks in that the skip
+    /// happens cleanly (no panic, Loom's own settings.json is written) so a
+    /// regression can't turn this into a crash. The accompanying warning text
+    /// (see `read_existing_settings`'s doc comment) is intentionally not
+    /// assertable here -- it goes to stderr, matching this file's other
+    /// eprintln!-based warnings (e.g. the settings-write-failure warning in
+    /// `setup_repository_scaffolding`), none of which are stderr-asserted.
+    #[test]
+    fn test_merge_settings_skips_merge_on_invalid_json_existing_settings() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        let defaults = temp_dir.path().join("defaults");
+
+        fs::create_dir(workspace.join(".git")).unwrap();
+
+        fs::create_dir_all(defaults.join(".claude").join("commands")).unwrap();
+        fs::write(
+            defaults.join(".claude").join("settings.json"),
+            r#"{
+                "permissions": {
+                    "allow": ["Bash(gh:*)"]
+                }
+            }"#,
+        )
+        .unwrap();
+
+        fs::create_dir_all(workspace.join(".claude").join("commands")).unwrap();
+        // Deliberately invalid JSON: a trailing comma after the last array
+        // element, as a non-strict-JSON-tolerant tool might emit.
+        fs::write(
+            workspace.join(".claude").join("settings.json"),
+            r#"{
+                "permissions": {
+                    "allow": ["Bash(repo-skills-tool:*)",]
+                },
+                "enabledPlugins": {"repo-skills": true}
+            }"#,
+        )
+        .unwrap();
+
+        let mut report = InitReport::default();
+        // Must not panic, and must complete the install.
+        setup_repository_scaffolding(workspace, &defaults, true, &mut report).unwrap();
+
+        let result_content =
+            fs::read_to_string(workspace.join(".claude").join("settings.json")).unwrap();
+        let result: serde_json::Value = serde_json::from_str(&result_content)
+            .expect("Loom's own settings.json must be valid JSON");
+
+        // The merge was skipped (documented current behavior for unparseable
+        // existing content) -- Loom's own settings.json is what's on disk, and
+        // the foreign content is NOT present, since there was nothing valid to
+        // merge it from.
+        assert_eq!(
+            result["permissions"]["allow"][0], "Bash(gh:*)",
+            "Loom's own settings.json should be in place"
+        );
+        assert!(
+            result.get("enabledPlugins").is_none(),
+            "Foreign content from the unparseable file cannot survive a skipped merge"
+        );
     }
 
     // ---------- #3325 legacy-layout migration tests ----------

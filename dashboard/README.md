@@ -37,7 +37,11 @@ covers and its fail-closed contract.
   by the retention sweep (age + size caps — see `src/retention.ts`).
 - **Durable Object** (`FleetState`, singleton) — live per-host health/token
   snapshots plus currently in-flight sweeps. Independent of D1; a
-  best-effort cache, not a source of truth (see `src/fleetState.ts`).
+  best-effort cache, not a source of truth (see `src/fleetState.ts`). Every
+  health/tokens entry is tagged `live`/`stale`/`offline` from its
+  `updatedAt` age (issue #4957) and entries older than 7 days are pruned on
+  the next snapshot build, so a host that stops reporting eventually
+  disappears rather than rendering its last-known state as current forever.
 - **`hosts` table** — per-host ingest key auth. Only a SHA-256 hash of each
   key is stored; a key is only ever shown once, at creation time.
 
@@ -140,9 +144,10 @@ asserts the `ADMIN_TOKEN` secret exists on the deployed Worker.
 | `GET /` + `/assets/*` | none in-Worker — put behind Cloudflare Access | The dashboard UI (static assets built from `web/`). Served by the asset router before any Worker code runs; the plain-text banner in `src/index.ts` is only the fallback when no assets are uploaded. |
 | `POST /ingest` | `Authorization: Bearer <ingest_key>` | Accept a batch (bare JSON array of `TelemetryEnvelope`s). |
 | `POST /admin/hosts` | `Authorization: Bearer <ADMIN_TOKEN>` | Provision a host + ingest key (`{"host_id": "..."}`, optional `"key"` to bring your own). |
-| `POST /admin/hosts/:hostId/revoke` | `Authorization: Bearer <ADMIN_TOKEN>` | Revoke a host's key. |
+| `POST /admin/hosts/:hostId/revoke` | `Authorization: Bearer <ADMIN_TOKEN>` | Revoke a host's key and clear its `FleetState` Durable Object entries (issue #4957) — no more rendering the last-known health/tokens sample as current. |
 | `POST /admin/retention/run` | `Authorization: Bearer <ADMIN_TOKEN>` | Run the retention sweep on demand (also runs hourly via `[triggers] crons`). |
 | `GET /admin/fleet-state` | `Authorization: Bearer <ADMIN_TOKEN>` | Read the Durable Object's live snapshot (operator introspection/manual verification). |
+| `GET /api/version` | none (always public) | The deploying commit SHA (issue #4958), e.g. `{"commit":"abc1234"}` — `"unknown"` when the deployment never stamped one (local `wrangler dev`, Miniflare tests). Deliberately unauthenticated, unlike the rest of `/api/*`: a build stamp is not sensitive, and drift-detection tooling should not need an Access session to ask "what is live right now?". |
 | `GET /api/fleet-state` | none in-Worker — put behind Cloudflare Access (see below) | Authenticated query API: current state of every known host/sweep, full detail. |
 | `GET /api/history` | none in-Worker — put behind Cloudflare Access | Authenticated query API: filterable, paginated D1 history query, full detail. |
 | `GET /api/events` | none in-Worker — put behind Cloudflare Access | Authenticated query API: SSE live tail of newly-ingested telemetry, full detail. |

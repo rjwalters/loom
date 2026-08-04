@@ -75,8 +75,16 @@ always returns full detail.
 {
   "hosts": {
     "host-abc": {
-      "health": { "record": { "kind": "host.health", "...": "..." }, "updatedAt": "2026-07-30T12:00:00Z" },
-      "tokens": { "record": { "kind": "tokens.snapshot", "...": "..." }, "updatedAt": "2026-07-30T12:00:00Z" }
+      "health": {
+        "record": { "kind": "host.health", "...": "..." },
+        "updatedAt": "2026-07-30T12:00:00Z",
+        "freshness": { "status": "live", "ageSeconds": 42 }
+      },
+      "tokens": {
+        "record": { "kind": "tokens.snapshot", "...": "..." },
+        "updatedAt": "2026-07-30T12:00:00Z",
+        "freshness": { "status": "live", "ageSeconds": 42 }
+      }
     }
   },
   "activeSweeps": [
@@ -96,6 +104,19 @@ always returns full detail.
   ]
 }
 ```
+
+**`freshness`** (issue #4957): derived from `updatedAt` alone (never the
+daemon-supplied `captured_at`, which a clock-skewed host could spoof) —
+`status` is one of `"live"` (reported within the last ~15 minutes, roughly
+2x the daemon's `host.health`/`tokens.snapshot` sampling cadence),
+`"stale"` (up to ~4 hours), or `"offline"` (beyond that — the daemon has
+very likely stopped, the host is asleep, or it lost its tailnet).
+`ageSeconds` is seconds since `updatedAt`. An entry older than 7 days is
+pruned from the Durable Object entirely on the next snapshot build rather
+than ever appearing here — see `src/fleetState.ts`'s `classifyFreshness`/
+`PRUNE_AFTER_MS`. Both the SSR `/` fallback page (`src/publicPage.ts`) and
+any consumer of this route should treat a `stale`/`offline` sample's
+numbers as historical, never as current.
 
 A completed sweep is not present in `activeSweeps` (removed on
 `sweep.completed` — see `src/fleetState.ts`'s module doc); its full record
@@ -202,6 +223,12 @@ non-integer), or `cursor` (non-positive or non-integer) returns `400` with a
   How loaded the pool is, and when capacity returns, without naming an
   account or exposing any single account's burn. The two usage figures are
   `null` — never `0` — when no account reported a `usage_fraction`.
+  `next_limit_window_reset_at` is the **earliest** per-account
+  `limit_window_reset_at` in the pool, and is likewise `null` — never a
+  fabricated instant — when no account reported one. Each account's
+  `limit_window_reset_at` is the reset of whichever window is gating *that*
+  account (7d once exhausted, 5h otherwise; the daemon resolves it before
+  export), so the aggregate reads as "the first moment any account frees up".
 
 ## `GET /api/events` / `GET /public/events`
 

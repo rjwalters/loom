@@ -7,6 +7,7 @@
 import "./styles.css";
 import { App } from "./app";
 import { wireAccountMenu } from "./accountMenu";
+import { wireBuildInfo } from "./buildInfo";
 import { onRouteChange, parseRoute, routeToHash } from "./router";
 
 const root = document.getElementById("app");
@@ -15,6 +16,7 @@ if (!(root instanceof HTMLElement)) {
 }
 
 wireAccountMenu(document);
+wireBuildInfo(document);
 
 const app = new App({
   root,

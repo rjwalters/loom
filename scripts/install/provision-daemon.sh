@@ -130,6 +130,23 @@ sign_daemon_binary() {
   [[ "$(uname -s 2>/dev/null)" == "Darwin" ]] || return 0
   command -v codesign >/dev/null 2>&1 || return 0
 
+  # Epic #4990 Phase 3 (#5020): never force-resign a binary that already
+  # carries a REAL, certificate-backed signature -- e.g. a fetched release
+  # artifact signed in CI with the project's Developer ID (Phase 2,
+  # #5011/#5018). `codesign -f` below UNCONDITIONALLY REPLACES whatever
+  # signature is present, and an ad-hoc re-sign has no certificate chain, so
+  # forcing it here would silently downgrade a Developer ID signature to
+  # ad-hoc on every provision -- exactly the Gatekeeper regression Phase 2
+  # exists to avoid. `codesign -dvvv` prints an `Authority=` line only for a
+  # certificate-backed signature; a LOCALLY BUILT binary (the pre-#4990 case
+  # this function was originally written for) never has one -- cargo's own
+  # linker-applied signature is always ad-hoc -- so this check is a no-op for
+  # that path and changes nothing there.
+  if codesign -dvvv "$bin" 2>&1 | grep -q '^Authority='; then
+    _pmd_ok "already signed with a real certificate (not re-signing): $bin"
+    return 0
+  fi
+
   local identity
   identity="$(_pmd_resolve_codesign_identity)"
 

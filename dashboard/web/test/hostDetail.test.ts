@@ -11,6 +11,7 @@ import {
   NOW,
   SWEEP_ONLY_HOST_ID,
   multiHostSnapshot,
+  persistentRoleTickFailureFixture,
 } from "./fixtures";
 
 // Views call `formatAbsolute()` internally with no zone argument, so they
@@ -41,6 +42,7 @@ describe("hostDetailView — health panel", () => {
   it("renders every host.health field", () => {
     const rendered = detail(HEALTHY_HOST_ID);
     expect(fieldValue(rendered, "Daemon version")).toBe("0.16.0");
+    expect(fieldValue(rendered, "Build commit")).toBe("8c16fb5b");
     expect(fieldValue(rendered, "Uptime")).toBe("1d 0h");
     expect(fieldValue(rendered, "Logical CPUs")).toBe("28");
     expect(fieldValue(rendered, "CPU idle")).toBe("83.0%");
@@ -53,6 +55,43 @@ describe("hostDetailView — health panel", () => {
     expect(fieldValue(rendered, "CPU idle")).toBe(UNKNOWN);
     expect(fieldValue(rendered, "Load per core")).toBe(UNKNOWN);
     expect(fieldValue(rendered, "Worktree root free")).toBe(UNKNOWN);
+  });
+
+  it("renders the build identity as unknown for a record from a pre-#4956 daemon", () => {
+    // The degraded fixture carries no `build_commit`/`built_at` — the panel
+    // must say so rather than invent a commit or a build time (#4956).
+    const rendered = detail(DEGRADED_HOST_ID);
+    expect(fieldValue(rendered, "Build commit")).toBe(UNKNOWN);
+    expect(fieldValue(rendered, "Built at")).toBe(UNKNOWN);
+  });
+
+  it("renders the role-tick health summary, ok for the healthy fixture (#5022)", () => {
+    const rendered = detail(HEALTHY_HOST_ID);
+    expect(fieldValue(rendered, "Role ticks")).toBe("12/12 ticks ok");
+  });
+
+  it("names a persistent role-tick failure in the health panel (#5022)", () => {
+    const built = buildFleetView(
+      parseFleetSnapshot({
+        hosts: {
+          h: {
+            health: {
+              record: { kind: "host.health", roles: persistentRoleTickFailureFixture() },
+              updatedAt: "2026-07-30T12:09:00Z",
+            },
+          },
+        },
+        activeSweeps: [],
+      }),
+      NOW,
+    );
+    const rendered = hostDetailView(built.hosts[0]!, NOW);
+    expect(fieldValue(rendered, "Role ticks")).toBe(
+      "1/3 ticks ok; 1 persistent failure(s): judge @ loom",
+    );
+    expect(rendered.querySelector('[data-testid="status-badge"]')?.getAttribute("data-status")).toBe(
+      "degraded",
+    );
   });
 
   it("explains a host that has no health record yet", () => {
@@ -84,6 +123,20 @@ describe("hostDetailView — token panel", () => {
     // agent-4 reports `exhausted: false` but no usage_fraction.
     expect(cells(rows[1]!)[2]).toBe(UNKNOWN);
     expect(cells(rows[1]!)[4]).toBe("available");
+  });
+
+  it("counts down to an exhausted account's reset instead of showing a dash", () => {
+    // Issue #4874: the daemon never populated `limit_window_reset_at`, so this
+    // column was permanently `—` for exactly the accounts an operator needs it
+    // for. With the field fed, an exhausted account answers "when does
+    // capacity return?" — a multi-day countdown, not a clamped "just now".
+    const rows = [...detail(DEGRADED_HOST_ID).querySelectorAll('[data-testid="token-account"]')];
+    expect(cells(rows[0]!)[4]).toBe("exhausted");
+    expect(cells(rows[0]!)[3]).toBe("in 2d 14h");
+    expect(cells(rows[0]!)[3]).not.toBe(UNKNOWN);
+    // The absolute instant is still available as the tooltip for a bug report.
+    const resetCell = rows[0]!.querySelectorAll("td")[3];
+    expect(resetCell?.getAttribute("title")).toBeTruthy();
   });
 
   it("clamps the usage meter to the track", () => {

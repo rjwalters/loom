@@ -169,6 +169,7 @@ mod tests {
             registry.entries.insert(
                 sid.to_string(),
                 SweepInfo {
+                    pgid: None,
                     sweep_id: sid.to_string(),
                     kind: SweepKind::Issue(issue),
                     pid: 2_147_483_640,
@@ -215,6 +216,7 @@ mod tests {
 
         fn mk(issue: u32, dep: Option<u32>, state: SweepState) -> SweepInfo {
             SweepInfo {
+                pgid: None,
                 sweep_id: format!("s{issue}"),
                 kind: SweepKind::Issue(issue),
                 pid: 2_147_483_640,

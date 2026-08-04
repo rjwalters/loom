@@ -467,11 +467,11 @@ mod tests {
 
     // ===== Cross-language conformance fixture (#4039 AC) =====
     //
-    // The same fixture tree (`loom-tools/tests/fixtures/config_resolver/`)
-    // must resolve to the identical effective config from Rust, Python, AND
-    // Bash. See that directory's README.md for what each tier exercises.
-    // Python: `loom-tools/tests/test_config_resolver.py`
-    // (`TestConformanceFixture`). Bash:
+    // The same fixture tree (`defaults/scripts/tests/fixtures/config_resolver/`,
+    // relocated from `loom-tools/tests/fixtures/config_resolver/` when #4970
+    // retired the Python `loom-tools` package) must resolve to the identical
+    // effective config from Rust and Bash. See that directory's README.md for
+    // what each tier exercises. Bash:
     // `defaults/scripts/tests/test-config-resolver.sh`.
 
     // ===== source_of / tier_paths_by_precedence (#4512) =====
@@ -570,7 +570,8 @@ mod tests {
     fn conformance_fixture_dir() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("..")
-            .join("loom-tools")
+            .join("defaults")
+            .join("scripts")
             .join("tests")
             .join("fixtures")
             .join("config_resolver")

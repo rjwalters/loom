@@ -12,13 +12,29 @@
 //! - `forge auto-merge <pr> [--method …]` — the merge path behind
 //!   `merge-pr.sh` (formerly `loom-auto-merge`).
 //!
+//! # NOT a cache — the passthrough burns full GraphQL (#5056)
+//!
+//! `forge issue …` / `forge pr …` are a **byte-identical GraphQL passthrough**
+//! to `gh` ([`gh_passthrough`]); they inherit `gh issue list`'s full GraphQL
+//! rate-limit cost and are **not** the ETag-cached path. The cached,
+//! zero-cost-on-`304` listing lives behind the explicit `--cached` flag
+//! (`forge issue list --cached …` / `forge pr list --cached …`, dispatched to
+//! [`crate::forge_cached_list`]); only that flag routes through the REST/ETag
+//! cache. Reach for it (via the `gh-cached` / `$GH_READ` helper) whenever you
+//! would otherwise write a raw `gh issue list` in an agent hot path.
+//!
 //! # Forge routing (option (b): native GitHub, shell fallback carries Gitea)
 //!
 //! For **GitHub** (the only forge any Loom consumer repo runs today) the
 //! subcommands are native:
 //! - reads/auth are a byte-identical passthrough to `gh` (the same binary the
 //!   scripts' `FORGE=gh` fallback uses — so a consumer workspace with zero pip
-//!   installs works unchanged);
+//!   installs works unchanged). Being byte-identical, the passthrough also
+//!   inherits `gh`'s transport: `forge issue create` is GraphQL-backed and has
+//!   **no REST fallback** for GraphQL-quota exhaustion (#5047). That is
+//!   deliberate — the passthrough contract is that `forge issue X` behaves
+//!   identically to `gh issue X` — so it emits an advisory stderr notice
+//!   pointing at `.loom/scripts/create-issue.sh`, which does have the fallback;
 //! - `auto-merge` enables GitHub's native auto-merge via the
 //!   `enablePullRequestAutoMerge` GraphQL mutation (a pure API call with no
 //!   working-tree checkout — the reason `gh pr merge --auto` is avoided from
@@ -360,6 +376,12 @@ fn gh_bin() -> String {
 /// propagating the exit code. On GitHub this is byte-identical to the scripts'
 /// `FORGE=gh` fallback. Never returns on success/failure of `gh` (calls
 /// `std::process::exit`); returns `Err` only when `gh` cannot be spawned.
+/// Whether a `forge <entity> <args…>` invocation is an issue *creation*, i.e.
+/// `forge issue create …`. Used only to emit the #5047 advisory notice.
+fn is_issue_create(entity: &str, args: &[String]) -> bool {
+    entity == "issue" && args.first().is_some_and(|a| a == "create")
+}
+
 fn gh_passthrough(entity: &str, args: &[String]) -> Result<()> {
     let ft = detect_forge(None);
     if ft == ForgeType::Gitea {
@@ -368,6 +390,22 @@ fn gh_passthrough(entity: &str, args: &[String]) -> Result<()> {
              caller's shell path"
         );
         std::process::exit(EX_FORGE_DECLINED);
+    }
+
+    // #5047: `forge issue` is a byte-identical passthrough to `gh issue`, so
+    // `forge issue create` inherits `gh issue create`'s GraphQL cost and dies
+    // on exactly the same GraphQL-quota exhaustion. It is NOT an escape hatch,
+    // and being a *daemon* subcommand it looks like one. Keep the passthrough
+    // contract intact (silently rerouting one subcommand's transport would
+    // break every caller that parses gh's output) and point at the tool that
+    // does have the REST fallback. Advisory only: stderr, no behavior change.
+    if is_issue_create(entity, args) {
+        eprintln!(
+            "loom-daemon forge issue create: NOTE — this is a byte-identical passthrough \
+             to `gh issue create` (GraphQL-backed) with NO REST fallback. If GraphQL quota \
+             is exhausted, use `.loom/scripts/create-issue.sh` instead (see \
+             docs/github-authentication.md → \"Filing issues under GraphQL exhaustion\")."
+        );
     }
 
     let mut command = Command::new(gh_bin());
@@ -555,6 +593,17 @@ pub fn handle_auto_merge(pr: u32, method: &str) -> Result<()> {
 /// Sub-actions for `loom-daemon forge`.
 pub enum ForgeCmd {
     /// `forge issue <args…>` — passthrough to `gh issue` on GitHub.
+    ///
+    /// This is a generic, subcommand-agnostic passthrough: it does not parse
+    /// `args` to special-case `create` vs. `list`/`view`/`edit`. As a
+    /// consequence `forge issue create` is byte-identical to running `gh
+    /// issue create` directly and carries the same GraphQL cost — it does
+    /// **not** get the REST fallback documented in
+    /// `.loom/docs/gh-issue-create-rest-fallback.md` /
+    /// `forge_gh_create_issue_rl_safe` (#5047). Callers that need
+    /// exhausted-GraphQL resilience for issue creation should use that
+    /// shell recipe/helper directly rather than routing through this
+    /// passthrough.
     Issue(Vec<String>),
     /// `forge pr <args…>` — passthrough to `gh pr` on GitHub.
     Pr(Vec<String>),
@@ -569,6 +618,16 @@ pub enum ForgeCmd {
 /// a child process cannot be spawned.
 pub fn dispatch(cmd: ForgeCmd) -> Result<()> {
     match cmd {
+        // `forge <issue|pr> list --cached …` routes to the agent-facing ETag
+        // cache (#5056); it serves-and-exits(0) or declines-and-exits(3) so the
+        // caller falls back to plain `gh`. Everything else is the byte-identical
+        // GraphQL passthrough — NOT the cached path.
+        ForgeCmd::Issue(args) if crate::forge_cached_list::is_cached_list(&args) => {
+            crate::forge_cached_list::handle("issue", &args)
+        }
+        ForgeCmd::Pr(args) if crate::forge_cached_list::is_cached_list(&args) => {
+            crate::forge_cached_list::handle("pr", &args)
+        }
         ForgeCmd::Issue(args) => gh_passthrough("issue", &args),
         ForgeCmd::Pr(args) => gh_passthrough("pr", &args),
         ForgeCmd::Auth(args) => gh_passthrough("auth", &args),
@@ -622,6 +681,24 @@ mod tests {
             serde_json::to_string(&json!({ "forge": forge })).unwrap(),
         )
         .unwrap();
+    }
+
+    // ===== #5047: issue-create advisory notice targeting =====
+
+    #[test]
+    fn is_issue_create_matches_only_issue_create() {
+        let create = vec!["create".to_string(), "--title".to_string(), "T".to_string()];
+        assert!(is_issue_create("issue", &create));
+
+        // Other issue subcommands are untouched (no notice, no behavior change).
+        assert!(!is_issue_create("issue", &["view".to_string(), "42".to_string()]));
+        assert!(!is_issue_create("issue", &["list".to_string()]));
+        assert!(!is_issue_create("issue", &[]));
+
+        // `pr create` is not issue creation -- it is not GraphQL-quota
+        // equivalent and has no create-issue.sh counterpart.
+        assert!(!is_issue_create("pr", &create));
+        assert!(!is_issue_create("auth", &create));
     }
 
     // ===== host parsing =====
