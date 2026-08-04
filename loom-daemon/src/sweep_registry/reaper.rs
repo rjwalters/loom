@@ -2519,9 +2519,19 @@ mod tests {
         // real `restore_label_to_ready` call would show up in the log as a
         // `--remove-label loom:building` invocation, so asserting its absence
         // is sufficient to prove the forge check vetoed the restore.
+        //
+        // The fixture timestamp is computed relative to `Utc::now()` at
+        // test-run time (NOT a hardcoded calendar date) so the "newer claim"
+        // branch keeps firing on every future test run — a fixed absolute
+        // date silently stops being "after `started_at`" once wall-clock
+        // time passes it, which is exactly what broke this test permanently
+        // on 2026-08-04 (issue #5319).
+        let forge_labeled_at = (Utc::now() + chrono::Duration::minutes(5))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let script = format!(
-            "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [[ \"$1\" == \"api\" ]]; then\n  echo '\"2026-08-04T15:59:59Z\"'\nfi\nexit 0\n",
-            gh_log.display()
+            "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [[ \"$1\" == \"api\" ]]; then\n  echo '\"{}\"'\nfi\nexit 0\n",
+            gh_log.display(),
+            forge_labeled_at
         );
         std::fs::write(&fake_gh, &script).unwrap();
         let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
@@ -2593,11 +2603,17 @@ mod tests {
         let dir = tempdir().unwrap();
         let (mut registry, gh_log) = fixture_registry(dir.path());
         // Override the fixture's fake `gh` so `gh api .../timeline` answers
-        // with a labeling timestamp AFTER `started_at` (set below).
+        // with a labeling timestamp AFTER `started_at` (set below). Computed
+        // relative to `Utc::now()` at test-run time, not a hardcoded
+        // calendar date — see the sibling `cancel_skips_restore_...` test's
+        // comment for why (#5319).
         let fake_gh = dir.path().join("fake-gh-timeline.sh");
+        let forge_labeled_at = (Utc::now() + chrono::Duration::minutes(5))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let script = format!(
-            "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [[ \"$1\" == \"api\" ]]; then\n  echo '\"2026-08-04T15:59:59Z\"'\nfi\nexit 0\n",
-            gh_log.display()
+            "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [[ \"$1\" == \"api\" ]]; then\n  echo '\"{}\"'\nfi\nexit 0\n",
+            gh_log.display(),
+            forge_labeled_at
         );
         std::fs::write(&fake_gh, &script).unwrap();
         let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
