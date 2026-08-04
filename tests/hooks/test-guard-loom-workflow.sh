@@ -302,6 +302,84 @@ EOF
 assert_deny "Still block gh pr merge in a flag-captured cat <<- heredoc piped into bash (#5122)" \
     "$GH_5122_FLAG_CAPTURED_DASH_PIPE_BASH_CMD"
 
+# --- False-positive regression tests (issue #5328) -----------------------
+# `mask_cat_heredoc_bodies()` masked a commit-message heredoc body for the
+# `git commit -m "$(cat <<'EOF' ... EOF)"` form (#5109/#5155) but NOT for
+# `git commit -F - <<'EOF' ... EOF` -- a commit whose MESSAGE quotes the
+# phrase as prose was denied as though it were a real invocation.
+
+# Repro (a): `git commit -F - <<'EOF' ... EOF` quoting the phrase as prose ->
+# allow.
+GH_5328_COMMIT_F_DASH_CMD='git commit -F - <<'"'"'EOF'"'"'
+Document the rule: never `'"$PHRASE_CMD"'` directly, use merge-pr.sh instead.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+EOF'
+assert_allow "Allow git commit -F - heredoc commit message that quotes the phrase as prose (#5328)" \
+    "$GH_5328_COMMIT_F_DASH_CMD"
+
+# Repro variant: `git commit --file=- <<'EOF' ... EOF` (the "=" long-option
+# form) must be recognized too.
+GH_5328_COMMIT_FILE_EQ_CMD='git commit --file=- <<'"'"'EOF'"'"'
+Document the rule: never `'"$PHRASE_CMD"'` directly, use merge-pr.sh instead.
+EOF'
+assert_allow "Allow git commit --file=- heredoc commit message that quotes the phrase as prose (#5328)" \
+    "$GH_5328_COMMIT_FILE_EQ_CMD"
+
+# The `<<-` (dash) tab-stripping heredoc variant must get the same treatment.
+GH_5328_COMMIT_F_DASH_TABSTRIP_CMD='git commit -F - <<-'"'"'EOF'"'"'
+	Document the rule: never `'"$PHRASE_CMD"'` directly, use merge-pr.sh instead.
+	EOF'
+assert_allow "Allow git commit -F - <<- (tab-stripping) heredoc quoting the phrase as prose (#5328)" \
+    "$GH_5328_COMMIT_F_DASH_TABSTRIP_CMD"
+
+# Other flags between `commit` and `-F -` (e.g. `-a`) must not defeat
+# recognition -- the gate allows any whitespace-separated tokens in between.
+GH_5328_COMMIT_OTHER_FLAGS_CMD='git commit -a -F - <<'"'"'EOF'"'"'
+Document the rule: never `'"$PHRASE_CMD"'` directly, use merge-pr.sh instead.
+EOF'
+assert_allow "Allow git commit -a -F - heredoc quoting the phrase as prose (#5328)" \
+    "$GH_5328_COMMIT_OTHER_FLAGS_CMD"
+
+# Regression guard: an UNQUOTED delimiter (`git commit -F - <<EOF`) still
+# masks nothing -- $()/backtick/$VAR expansion is live there, matching the
+# existing quoted-delimiter requirement for the `cat` case.
+GH_5328_UNQUOTED_DELIM_CMD='git commit -F - <<EOF
+'"$PHRASE_CMD"' 123
+EOF'
+assert_deny "Still block git commit -F - <<EOF with an UNQUOTED delimiter (#5328)" \
+    "$GH_5328_UNQUOTED_DELIM_CMD"
+
+# Regression guard: a heredoc feeding an INTERPRETER, not `git commit -F -`,
+# must remain fully visible -- `sh <<EOF` alongside the new commit-stdin gate.
+GH_5328_SH_HEREDOC_CMD='sh <<'"'"'EOF'"'"'
+'"$PHRASE_CMD"' 123
+EOF'
+assert_deny "Still block gh pr merge inside a sh-fed (non-commit-stdin) heredoc (#5328)" \
+    "$GH_5328_SH_HEREDOC_CMD"
+
+# Regression guard: `cat <<'EOF' | bash` must still deny -- the new
+# `git commit -F -`/`--file=-` allowlist entry must not weaken the existing
+# `cat | bash` hazard detection.
+GH_5328_CAT_PIPE_BASH_CMD='cat <<'"'"'EOF'"'"' | bash
+'"$PHRASE_CMD"' 123
+EOF'
+assert_deny "Still block cat <<'EOF' | bash after the #5328 fix (no regression)" \
+    "$GH_5328_CAT_PIPE_BASH_CMD"
+
+# Regression guard: a REAL gh pr merge invocation must still deny.
+assert_deny "Still block a real gh pr merge invocation after the #5328 fix" \
+    "gh pr merge 887 --squash"
+
+# Regression guard (#5087 provably-closed rule): an UNTERMINATED
+# `git commit -F - <<'EOF'` opener (no closing delimiter line found in the
+# buffer) masks NOTHING and fails safe -- the raw phrase stays visible and
+# the command is denied/scanned exactly as before.
+GH_5328_UNTERMINATED_CMD='git commit -F - <<'"'"'EOF'"'"'
+'"$PHRASE_CMD"' 123 mentioned but the heredoc never closes'
+assert_deny "Still block an UNTERMINATED git commit -F - heredoc opener (#5087 rule, #5328)" \
+    "$GH_5328_UNTERMINATED_CMD"
+
 # --- False-positive regression tests (issue #5155) -----------------------
 # The phrase appearing as INERT TEXT inside a POSITIONAL (no preceding flag
 # name) argument to a known non-executing command must not deny -- only an

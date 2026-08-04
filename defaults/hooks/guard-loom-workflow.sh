@@ -140,27 +140,42 @@ strip_literal_text() {
 # narrows what this ONE check can see; it never widens what it misses.
 # =============================================================================
 
-# Mask the BODY of a heredoc whose consuming command is `cat`, whose
-# delimiter is quoted (`cat <<'EOF' ... EOF` / `cat <<"EOF" ... EOF`, and the
-# `<<-` tab-stripping variant), AND whose `cat` invocation is captured by a
-# command substitution ($()/backtick) that is the value of a known
-# non-executing text-data flag. This is exactly the CLAUDE.md-documented
-# idiom for multi-line commit/PR-body text: `git commit -m "$(cat <<'EOF'
-# ... EOF)"`. A QUOTED delimiter guarantees bash performs no
-# $()/backtick/$VAR expansion within the body, so the body is 100% literal
-# text; the flag-capture requirement guarantees that literal text is used as
-# inert data (a message/title/search value) rather than executed.
+# Mask the BODY of a heredoc whose consuming command is either of two
+# provably-inert forms:
+#
+#   1. `cat`, whose delimiter is quoted (`cat <<'EOF' ... EOF` /
+#      `cat <<"EOF" ... EOF`, and the `<<-` tab-stripping variant), AND whose
+#      `cat` invocation is captured by a command substitution ($()/backtick)
+#      that is the value of a known non-executing text-data flag. This is
+#      exactly the CLAUDE.md-documented idiom for multi-line commit/PR-body
+#      text: `git commit -m "$(cat <<'EOF' ... EOF)"`.
+#   2. `git commit -F -` / `git commit --file=-` (issue #5328), whose
+#      delimiter is likewise quoted. `git commit -F -`/`--file=-` reads its
+#      commit message from stdin and NEVER re-emits it anywhere -- unlike
+#      `cat`, there is no `git commit -F - | bash`-style escape hatch, so the
+#      consuming command itself is the confinement proof and no
+#      capture-into-a-flag check (case 1's `capre` requirement) is needed.
+#
+# A QUOTED delimiter guarantees bash performs no $()/backtick/$VAR expansion
+# within the body, so the body is 100% literal text in both cases; case 1's
+# flag-capture requirement additionally guarantees that literal text is used
+# as inert data (a message/title/search value) rather than executed -- a
+# guarantee case 2 gets for free from `git commit` itself never executing or
+# forwarding its stdin.
 #
 # Deliberately narrower than "any heredoc" on TWO axes:
 #   1. A heredoc feeding an INTERPRETER (`bash <<'EOF' ... EOF`, `sh <<EOF`)
-#      is genuinely live code, so masking is gated on the word immediately
-#      before `<<` being `cat`.
+#      is genuinely live code, so masking is gated on the word/phrase
+#      immediately before `<<` being `cat` OR `git commit -F -`/`--file=-`.
 #   2. `cat` never executes its body, but its stdout can still be routed INTO
 #      a shell on the same command line -- `cat <<'EOF' | bash`, or a captured
 #      `eval "$(cat <<'EOF' ...)"`. Masking those would blind this
-#      catastrophic-tier guard to a real invocation, so masking is ALSO gated
-#      on `cat` being captured into a text-data flag's $()/backtick value (see
-#      the `capre` confinement check inside the function).
+#      catastrophic-tier guard to a real invocation, so masking of a
+#      cat-heredoc is ALSO gated on `cat` being captured into a text-data
+#      flag's $()/backtick value (see the `capre` confinement check inside
+#      the function). This second gate does NOT apply to the `git commit -F
+#      -`/`--file=-` form -- `git commit` cannot route its stdin onward to a
+#      shell the way `cat`'s stdout can, so case 2's gate is unconditional.
 #
 # Mirrors the #5087 lesson: only a heredoc block that is PROVABLY CLOSED
 # inside the buffer (its bare delimiter line is found) gets its body masked.
@@ -186,6 +201,12 @@ mask_cat_heredoc_bodies() {
         # so it needs its own alternative rather than falling out of the
         # existing flag list.
         capre = "(^|[ \t])((-m|--message|--body|--notes|--title|--comment|--search)[ \t]*=?|-f[ \t]+(body|message|comment|title|notes|search)=)[ \t]*(" DQ "|" SQ ")?[ \t]*([$][(]|" BT ")[ \t]*$"
+        # `git commit -F -` (space-separated stdin marker) or
+        # `git commit --file=-` (attached, "=" form only -- matches git'"'"'s own
+        # documented long-option syntax) immediately before `<<`, with any
+        # number of other whitespace-separated tokens/flags between `commit`
+        # and the `-F`/`--file=` flag (issue #5328).
+        commit_stdin_re = "(^|[^A-Za-z0-9_])git[ \t]+commit([ \t]+[^ \t]+)*[ \t]+(-F[ \t]+-|--file=-)[ \t]*$"
     }
     { lines[NR] = $0 }
     END {
@@ -198,10 +219,14 @@ mask_cat_heredoc_bodies() {
                 if (p == 0) break
                 p = off + p - 1
                 off = p + 2
-                # Require the word immediately before `<<` (ignoring
-                # trailing whitespace) to be a bare "cat".
+                # Require the word/phrase immediately before `<<` (ignoring
+                # trailing whitespace) to be a bare "cat" OR a `git commit
+                # -F -`/`--file=-` stdin invocation (#5328).
                 pre = substr(line, 1, p - 1)
-                if (pre !~ /(^|[^A-Za-z0-9_])cat[ \t]*$/) continue
+                is_cat_word = (pre ~ /(^|[^A-Za-z0-9_])cat[ \t]*$/)
+                is_commit_stdin = (pre ~ commit_stdin_re)
+                if (!is_cat_word && !is_commit_stdin) continue
+                if (is_cat_word) {
                 # HARDENING (#5109 follow-up, PR #5115 review): the word before
                 # `<<` being `cat` is NOT sufficient -- `cat` never executes its
                 # own body, but its stdout can still reach a shell on the SAME
@@ -221,6 +246,10 @@ mask_cat_heredoc_bodies() {
                 before_cat = pre
                 sub(/cat[ \t]*$/, "", before_cat)
                 if (before_cat !~ capre) continue
+                }
+                # is_commit_stdin needs no further confinement check --
+                # `git commit -F -`/`--file=-` never forwards its stdin
+                # anywhere, so the consuming command itself is the proof.
                 start = p + 2
                 if (substr(line, start, 1) == "-") start++
                 while (substr(line, start, 1) == " " || substr(line, start, 1) == "\t") start++
