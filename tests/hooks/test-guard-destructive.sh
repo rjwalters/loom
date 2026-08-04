@@ -3616,6 +3616,64 @@ assert_allow "write-confinement (#4934): CWD=linked worktree, single-quoted spac
 assert_allow "write-confinement (#4934): CWD=linked worktree, double-quoted spaced target inside the worktree allows" \
     "echo x > \"$WT_LINKED_DIR/src/evil file.sh\"" "$WT_LINKED_DIR"
 
+# -------------------------------------------------------------------------
+# Whole-buffer quote masking for PLAIN multi-line quoted strings (#5157) --
+# extract_write_targets() must not misread a `>` write-idiom byte sitting on
+# a CONTINUATION line of an ordinary multi-line double/single-quoted shell
+# string (no heredoc anywhere) as a live redirection target. Distinct from
+# both #4245 (same-line quoted `>`) and #5000 (heredoc-BODY `>`): this covers
+# a `>` character several PHYSICAL LINES into a plain `VAR="...\n...\n..."`
+# assignment. Before this fix, mask_ws()/mask_gt() were still called per
+# SEGMENT (after splitting the qsplit()-segmented buffer on "\n"), so a
+# still-open quote spanning multiple physical lines reset to "unquoted" state
+# at every embedded newline even though the shell never treats it that way --
+# the confirmed #5157 occurrence-1 repro: a guard-test harness assigning a
+# multi-line JSON/text payload to a shell variable, later only echoed/piped
+# to a subprocess (never executed by the outer shell), was denied because a
+# `> /path/to/pwned.txt`-shaped substring several lines into that assignment
+# was misread as a real redirect target.
+assert_allow "write-confinement (#5157): multi-line double-quoted VAR assignment with '>' on a continuation line allows" \
+    "msg=\"line one
+echo pwned > $WT_REPO/defaults/hooks/f.sh
+line three\"
+echo \"\$msg\"" "$WT_REPO"
+
+assert_allow "write-confinement (#5157): same multi-line quoted VAR assignment from a linked-worktree cwd allows" \
+    "msg=\"line one
+echo pwned > $WT_REPO_LINKED/defaults/hooks/f.sh
+line three\"
+echo \"\$msg\"" "$WT_LINKED_DIR"
+
+assert_allow "write-confinement (#5157): multi-line SINGLE-quoted VAR assignment with '>' on a continuation line allows" \
+    "msg='line one
+echo pwned > $WT_REPO/defaults/hooks/f.sh
+line three'
+echo \"\$msg\"" "$WT_REPO"
+
+# Narrows, never widens: a REAL unquoted '>' write AFTER a multi-line quoted
+# block in the same command must still deny.
+assert_deny "write-confinement (#5157): real unquoted '>' write AFTER a multi-line quoted VAR assignment still denies" \
+    "msg=\"line one
+harmless > text
+line three\"
+echo pwned > $WT_REPO/defaults/hooks/g.sh" "$WT_REPO"
+
+# ...and BEFORE it, in the same command.
+assert_deny "write-confinement (#5157): real unquoted '>' write BEFORE a multi-line quoted VAR assignment still denies" \
+    "echo pwned > $WT_REPO/defaults/hooks/h.sh
+msg=\"line one
+harmless > text
+line three\"" "$WT_REPO"
+
+# A genuine write inside the acting worktree, alongside an unrelated
+# multi-line quoted block, must still allow (no over-widening the other
+# direction either).
+assert_allow "write-confinement (#5157): multi-line quoted VAR assignment plus a real write inside the worktree allows" \
+    "msg=\"line one
+harmless > text
+line three\"
+echo x > $WT_DIR/src/f.sh" "$WT_REPO"
+
 rm -rf "$HOME_FIXTURE_OUTSIDE"
 rm -rf "$WT_REPO" "$WT_REPO_NOWT" "$WT_REPO_OFF" "$WT_REPO_LINKED"
 

@@ -3022,44 +3022,84 @@ extract_write_targets() {
     END {
         # Heredoc-body masking (#5000) runs BEFORE qsplit(): once a heredoc
         # body write-idiom-looking bytes (`>`, `;`, `tee`, ...) are replaced
-        # with inert placeholders, the per-line loop below -- which still
-        # resets mask_gt()/mask_ws() per SEGMENT, exactly as before -- has
-        # nothing dangerous-looking left to misread on those lines,
-        # regardless of that per-line reset. A real write-idiom byte OUTSIDE
-        # any recognized heredoc body, even later in the SAME multi-line
-        # command, is untouched and still flows through the unchanged
-        # pipeline below.
+        # with inert placeholders, nothing dangerous-looking is left to
+        # misread on those lines. A real write-idiom byte OUTSIDE any
+        # recognized heredoc body, even later in the SAME multi-line command,
+        # is untouched and still flows through the unchanged pipeline below.
         buf = mask_heredoc_bodies(buf)
         $0 = qsplit(buf)   # quote-aware segmentation (#3755)
+
+        # Whole-BUFFER quote-aware masking (#5157), not per-segment.
+        #
+        # mask_ws()/mask_gt() themselves track quote state one character at a
+        # time and never special-case "\n" -- an embedded newline inside an
+        # OPEN quoted span (e.g. a plain multi-line double-quoted string,
+        # `msg="line one\necho pwned > /main/checkout/f.sh\nline three"`, no
+        # heredoc involved at all) is simply copied through like any other
+        # byte while quote mode stays "on". qsplit() above already preserves
+        # such an embedded newline as part of the ONE atomic quoted span it
+        # copies verbatim (it finds the matching closing quote by index, not
+        # by line), so by construction every "\n" surviving in its output
+        # already sits OUTSIDE any then-open quote from the perspective of
+        # qsplit() itself -- but mask_ws() and mask_gt() do their own independent
+        # char-by-char quote tracking, and calling them per-SEGMENT (after
+        # `split($0, segs, "\n")`) resets that tracking to "unquoted" at every
+        # such newline, discarding the "still inside this quote" context a
+        # PRIOR segment established. A `>` sitting on the continuation line of
+        # an otherwise-inert multi-line double-quoted string is then
+        # misread as a live redirection operator, manufacturing a phantom
+        # write target for text that never reaches the shell as anything but
+        # quoted data (#5157). This is the direct multi-line analog of the
+        # single-line #4245 fix and the heredoc-body #5000 fix above --
+        # masking the WHOLE buffer once, before any "\n"-splitting happens,
+        # keeps quote state correctly threaded across every embedded newline,
+        # heredoc or not.
+        wbuf = mask_ws($0)
+        gbuf = mask_gt(wbuf)
         n = split($0, segs, "\n")
+        nw = split(wbuf, wsegs, "\n")
+        ng = split(gbuf, gsegs, "\n")
         for (i = 1; i <= n; i++) {
             seg = segs[i]
+            origlen = length(seg)
             sub(/^[ \t]+/, "", seg)
             sub(/^sudo[ \t]+/, "", seg)
             sub(/^[ \t]+/, "", seg)
             if (seg == "") continue
 
-            # Quote-aware whitespace masking (#4934): wseg is byte-for-byte
-            # identical to seg except a space/tab INSIDE a quoted span is
-            # replaced with a non-whitespace placeholder, so splitting on
-            # /[ \t]+/ never breaks a quoted argument (e.g. a quoted path
-            # containing a literal space) into more than one token. toks[]
-            # is then unmasked back to the real whitespace bytes so the
-            # target TEXT downstream is unchanged.
-            wseg = mask_ws(seg)
+            # wsegs[i]/gsegs[i] are byte-for-byte identical in LENGTH to the
+            # unstripped segs[i] (masking only ever substitutes one byte for
+            # one byte, never adds/removes any) -- `stripped` is the number of
+            # leading bytes the three sub() calls above just removed from the
+            # (unmasked) seg, so re-applying that same byte count via substr()
+            # keeps wseg/mseg positionally aligned with the stripped seg
+            # regardless of whether those leading bytes were literal
+            # whitespace or (on a mid-quote continuation segment) already
+            # masked to a placeholder byte.
+            stripped = origlen - length(seg)
+
+            # Quote-aware whitespace masking (#4934, threaded whole-buffer
+            # per #5157 above): wseg is byte-for-byte identical to seg except
+            # a space/tab INSIDE a quoted span is replaced with a
+            # non-whitespace placeholder, so splitting on /[ \t]+/ never
+            # breaks a quoted argument (e.g. a quoted path containing a
+            # literal space) into more than one token. toks[] is then
+            # unmasked back to the real whitespace bytes so the target TEXT
+            # downstream is unchanged.
+            wseg = substr(wsegs[i], stripped + 1)
             m = split(wseg, toks, /[ \t]+/)
             if (m < 1) continue
             for (j = 1; j <= m; j++) toks[j] = unmask_ws(toks[j])
 
-            # Quote-aware parallel tokenization (#4245): mseg is byte-for-byte
-            # identical to wseg except a `>` inside a quoted span is replaced
-            # with an SOH placeholder, so whitespace splitting yields the SAME
-            # token boundaries (mm == m always) but mtoks[] can be tested for
-            # a REAL (unquoted) redirection operator without ever matching a
-            # `>` that was only quoted data. Masking `>` on TOP of wseg (not
-            # seg) keeps the two passes token boundaries in lockstep, since
-            # mask_gt() only ever changes `>` bytes, never whitespace-ness.
-            mseg = mask_gt(wseg)
+            # Quote-aware parallel tokenization (#4245, threaded whole-buffer
+            # per #5157 above): mseg is byte-for-byte identical to wseg except
+            # a `>` inside a quoted span is replaced with an SOH placeholder,
+            # so whitespace splitting yields the SAME token boundaries
+            # (mm == m always) but mtoks[] can be tested for a REAL (unquoted)
+            # redirection operator without ever matching a `>` that was only
+            # quoted data. The actual target text is still read from the
+            # ORIGINAL toks[] (unmasked) once a real operator is confirmed.
+            mseg = substr(gsegs[i], stripped + 1)
             mm = split(mseg, mtoks, /[ \t]+/)
 
             if (toks[1] == "cd") {
