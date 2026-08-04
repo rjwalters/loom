@@ -39,6 +39,7 @@ test-check-main-clean.sh
 test-check-main-freshness.sh
 test-check-quarantine-stashes.sh
 test-check-runtime-capabilities.sh
+test-check-verified-corrections-preserved.sh
 test-clean-stale-binary.sh
 test-cleanup-branches-pr-review-branch.sh
 test-config-resolver.sh
