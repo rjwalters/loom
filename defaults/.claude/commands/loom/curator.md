@@ -540,6 +540,19 @@ The Builder's complexity-assessment path (`defaults/.claude/commands/loom/builde
 > - If the issue has no `## Affected Files` section yet, this check is a no-op for this tick — add the section in the same pass and let the next curator tick run the verification.
 > - The `loom:blocked` label is the right escape hatch: it's already in the workflow, and is removed by the user (not by Loom) once the underlying files are committed and pushed.
 
+### Date-stamp volatile facts
+
+> **Date-stamp volatile facts.** Counts, version numbers, file/line references, and "no X is needed" claims are point-in-time observations, not durable truths — a repo with several concurrently active worktrees can invalidate them within days. Write every volatile fact with the commit or date you verified it against, not as a bare assertion, so a later reader knows which claims to re-verify rather than trust:
+>
+> ```markdown
+> Before: "The parser exposes 18 verbs (13 net-new)."
+>
+> After: "The parser exposes 24 verbs (19 net-new) as of `289be45`, 2026-08-04 —
+> re-count against the current tree before relying on this number."
+> ```
+>
+> This applies to: raw counts ("18 verbs"), version numbers ("schema_version is 1"), file/line citations ("see parser.py:142"), and negative claims ("no schema_version bump is needed"). The incident this convention guards against: 2AMLogic/klayout-tools#342 curated "18 verbs / 13 net-new" and "no schema_version bump needed" as bare facts; both were correct when written and both had gone stale two days later — after `eval` and `lef-abstract` landed and `schema_version` bumped 1 -> 2 — ahead of an irrevocable PyPI publish that could not be re-uploaded for that version. Neither was a curation error; the facts simply weren't marked as snapshots. See "Complexity routing marker" below for when skipping the stamp on an irrevocable-output issue is itself a curation defect.
+
 ### Running Measurement / Board-Pipeline Reproductions (worktree-or-restore, #4991)
 
 **The Curator runs in the main checkout, not a fresh worktree** (unlike the
@@ -760,6 +773,7 @@ There are **three, and only three**, cost-of-being-wrong strata (issue #4238 add
 - **Hard bounds** (the router's authority is deliberately bounded): **never resolves to `fable`, and never a label.** The frontier model is reserved for the objective escalation ladder on Judge rejection or an explicit operator param. A `roleConfig.model` pin or explicit dispatch param (tiers 1–2) still overrides the marker.
 - **Cheap when the tier map is unconfigured.** With no `sweep.tierModels` in `.loom/config.json` and no `sweep.optimization` profile set (or set to `balanced`, the default), the marker is inert and dispatch falls through to the role default exactly as before — so adding markers is safe even before a workspace opts into cost/speed routing. A workspace opts in either by hand-authoring `sweep.tierModels`, or by setting `sweep.optimization: cost | speed` (a policy switch that materializes a preset over the same map — see `model-selection.md` "Optimization profile switch").
 - **Use sparingly / take the higher tier when torn.** Marking everything `complex` defeats the cheap-first default; marking real judgement calls `mechanical` risks a cheap model on expensive-to-be-wrong work. When genuinely torn, take the higher tier.
+- **`complex` + irrevocable output ⇒ date-stamp any volatile fact in the acceptance criteria.** When a `complex` issue's cost-of-being-wrong comes from an action that cannot be undone (a version/tag push, a package publish, an external API write), and its acceptance criteria embed a volatile fact (a count, a version number, a "no X is needed" claim), that fact **must** carry the "as of `<sha>`, `<date>`" stamp from "Date-stamp volatile facts" above — not a bare assertion. A Builder who trusts a stale bare count on a `complex`/irrevocable issue ships the wrong permanent artifact with no error signal to catch it (see 2AMLogic/klayout-tools#342, the incident that motivated both this rule and the stamping convention).
 
 **Required before applying `loom:curated`**: run the validator below and confirm exit 0. This is not optional — do not apply `loom:curated` if it fails:
 
