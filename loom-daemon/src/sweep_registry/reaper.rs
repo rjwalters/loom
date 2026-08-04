@@ -2520,7 +2520,7 @@ mod tests {
         // `--remove-label loom:building` invocation, so asserting its absence
         // is sufficient to prove the forge check vetoed the restore.
         let script = format!(
-            "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [[ \"$1\" == \"api\" ]]; then\n  echo '\"2026-08-04T15:59:59Z\"'\nfi\nexit 0\n",
+            "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [[ \"$1\" == \"api\" ]]; then\n  echo \"\\\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\\\"\"\nfi\nexit 0\n",
             gh_log.display()
         );
         std::fs::write(&fake_gh, &script).unwrap();
@@ -2596,7 +2596,7 @@ mod tests {
         // with a labeling timestamp AFTER `started_at` (set below).
         let fake_gh = dir.path().join("fake-gh-timeline.sh");
         let script = format!(
-            "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [[ \"$1\" == \"api\" ]]; then\n  echo '\"2026-08-04T15:59:59Z\"'\nfi\nexit 0\n",
+            "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [[ \"$1\" == \"api\" ]]; then\n  echo \"\\\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\\\"\"\nfi\nexit 0\n",
             gh_log.display()
         );
         std::fs::write(&fake_gh, &script).unwrap();
