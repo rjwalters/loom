@@ -2351,6 +2351,83 @@ mask_ask_positional_args() {
     }'
 }
 
+# Mask quoted POSITIONAL arguments (no preceding flag name) to a small
+# allowlist of known non-executing SEARCH commands (issue #5158). Extends the
+# #5235 mask_ask_positional_args() fix shape to the CATASTROPHIC-tier working
+# copy (COMMAND_NO_LITERAL_TEXT below), which mask_ask_positional_args()
+# deliberately excludes grep/egrep/fgrep/rg from — see that function's header
+# comment for why: COMMAND_ASK_SCAN also feeds SQL_DDL_PATTERN, which
+# intentionally scans a `grep '<pattern>' file` invocation's own quoted
+# positional pattern for a literal destructive-DDL phrase and denies, by
+# design. COMMAND_NO_LITERAL_TEXT is built and scanned entirely independently
+# of COMMAND_ASK_SCAN — SQL_DDL_PATTERN never reads COMMAND_NO_LITERAL_TEXT —
+# so masking grep/rg's own quoted pattern argument on THIS working copy does
+# not reintroduce that regression. Without this, `grep -n "curl .*|" <file>` —
+# read-only introspection of a guard's own source text — gets misread as a
+# live curl-pipe-to-shell invocation by ALWAYS_BLOCK_PATTERNS, because grep
+# never executes what it searches for.
+#
+# This is an intentional NEAR-DUPLICATE of mask_ask_positional_args() just
+# above (itself a near-duplicate of guard-loom-workflow.sh's
+# mask_command_positional_args(), #5155/#5160) — kept as a SEPARATE function
+# so a future tuning of one masking pass can never silently change another's
+# behavior, per the "never couple the two guards'/tiers' masking" convention
+# documented in mask_ask_positional_args()'s header comment above.
+mask_catastrophic_positional_args() {
+    printf '%s' "$1" | awk '
+    BEGIN {
+        SQ = sprintf("%c", 39)
+        DQ = sprintf("%c", 34)
+        # Command-name allowlist: known non-executing search commands whose
+        # positional pattern arguments are inert search text, never live
+        # shell syntax. Unlike mask_ask_positional_args() above, grep/egrep/
+        # fgrep/rg ARE included here — see the function header comment for
+        # why that is safe on this (catastrophic-tier) working copy.
+        cmdre = "(grep|egrep|fgrep|rg)"
+        flagre = "([ \t]+-[A-Za-z0-9_-]+)*"
+        anchor = "(^|[ \t\n;&|`(])" cmdre flagre "[ \t]+"
+        buf = ""
+    }
+    { buf = buf (NR > 1 ? "\n" : "") $0 }
+    END {
+        s = buf
+        out = ""
+        while (match(s, anchor)) {
+            pre     = substr(s, 1, RSTART - 1)
+            matched = substr(s, RSTART, RLENGTH)
+            rest    = substr(s, RSTART + RLENGTH)
+            out = out pre matched
+            # Mask every consecutive quoted positional argument immediately
+            # following the anchor (whitespace-separated). Stops at the first
+            # non-quote-starting token, so anything after the argument list
+            # (a pipe, &&, an unrelated command chained on the same line) is
+            # left fully visible.
+            while (1) {
+                qc = substr(rest, 1, 1)
+                if (qc != DQ && qc != SQ) break
+                endpos = 0
+                for (i = 2; i <= length(rest); i++) {
+                    if (substr(rest, i, 1) == qc) { endpos = i; break }
+                }
+                if (endpos == 0) break
+                inner = substr(rest, 2, endpos - 2)
+                if (index(inner, "$(") == 0 && index(inner, "`") == 0) {
+                    gsub(/./, "X", inner)
+                }
+                out = out qc inner qc
+                rest = substr(rest, endpos + 1)
+                while (substr(rest, 1, 1) == " " || substr(rest, 1, 1) == "\t") {
+                    out = out substr(rest, 1, 1)
+                    rest = substr(rest, 2)
+                }
+            }
+            s = rest
+        }
+        out = out s
+        printf "%s", out
+    }'
+}
+
 # Helper: output a deny decision and exit
 #
 # Optional second arg is a short, STABLE rule tag (issue #3771) recorded as the
@@ -2513,10 +2590,20 @@ ALWAYS_BLOCK_PATTERNS=(
 # payloads still reach the raw scan; spans carrying `$(` / backtick are left
 # intact so command-substitution smuggling still hard-denies.
 COMMAND_NO_LITERAL_TEXT="$COMMAND"
+# #5158: mask a leading grep/egrep/fgrep/rg invocation's own quoted pattern
+# argument BEFORE the flag-keyed strip below, so introspecting the guard's
+# own source (e.g. `grep -n "curl .*|" defaults/hooks/guard-destructive.sh`)
+# isn't misread as a live curl-pipe-to-shell invocation. Cheap substring gate
+# keeps the awk call off the hot path for the vast majority of commands that
+# never invoke grep/rg, mirroring the check-duplicate.sh substring gate used
+# for mask_ask_positional_args() below.
+if [[ "$COMMAND" == *"grep"* || "$COMMAND" == *"rg "* ]]; then
+    COMMAND_NO_LITERAL_TEXT=$(mask_catastrophic_positional_args "$COMMAND_NO_LITERAL_TEXT")
+fi
 if [[ "$COMMAND" == *"--body"* || "$COMMAND" == *"--message"* || \
       "$COMMAND" == *"--title"* || "$COMMAND" == *"--notes"* || \
       "$COMMAND" == *"--comment"* || "$COMMAND" == *"-m"* ]]; then
-    COMMAND_NO_LITERAL_TEXT=$(strip_literal_text "$COMMAND")
+    COMMAND_NO_LITERAL_TEXT=$(strip_literal_text "$COMMAND_NO_LITERAL_TEXT")
 fi
 
 for pattern in "${ALWAYS_BLOCK_PATTERNS[@]}"; do
