@@ -60,17 +60,34 @@
 //!   ([`clean::is_loom_managed`]) — user-provisioned worktrees are never touched,
 //!   the same gate [`crate::worktree_reaper`] applies to directory removal;
 //! - there is **no `.loom-in-use` marker** in the worktree;
-//! - the issue has **no live spawn-loop task or claim-lock**
-//!   ([`crate::worktree_ops::liveness::active_spawn_loop_issues`]);
-//! - [`crate::live_claim::probe`] finds **no confirmed-live sweep claim** — a
-//!   live claim lock, a live machine-level journal record, or a live
-//!   `/loom:sweep <N>` process. This is re-checked immediately before each kill,
-//!   so a sweep that starts mid-pass is still protected;
+//! - the issue has **no live claim whose own process tree cannot be resolved**.
+//!   A live spawn-loop task / claim-lock
+//!   ([`crate::worktree_ops::liveness::active_spawn_loop_issues`]) or a
+//!   [`crate::live_claim::probe`] hit — a live claim lock, a live machine-level
+//!   journal record, or a live `/loom:sweep <N>` process — used to protect the
+//!   **whole worktree**. Since issue #5135 it is **pid-scoped**: when the
+//!   claim's own root pid is confirmed live
+//!   ([`crate::worktree_ops::liveness::active_locked_issue_roots`]) only that
+//!   sweep's own process tree is off limits, so an orphan tree that predates
+//!   and is unrelated to a concurrently live, *re-dispatched* sweep for the
+//!   same issue is still reapable — the exact #5110 shape a blanket
+//!   issue-scoped gate could never reach. When the root **cannot** be resolved
+//!   (a stale lock, an unparseable owner, a claim tracked only through the
+//!   legacy spawn-loop-state union), the whole worktree is protected exactly as
+//!   before. The claim is re-checked immediately before each kill, and a claim
+//!   that *changed* since the plan was built fails closed;
 //! - **no live agent runtime is working inside the worktree**
 //!   ([`looks_like_agent`]) — the incident's defining property is that the agent
 //!   was *gone*, so a live `claude`/`codex`/`/loom:…` process in the worktree
 //!   owns it even when no claim names its issue (PR-set sweeps claim no issue;
-//!   a manually driven agent takes no spawn-loop claim);
+//!   a manually driven agent takes no spawn-loop claim). This too is pid-scoped
+//!   since #5135: an agent that is part of the *resolved* live sweep's own tree
+//!   is already accounted for and no longer vetoes the whole worktree; any
+//!   other agent still does;
+//! - the process **provably predates the live sweep**, when one owns part of
+//!   the worktree — a pid that started at or after the sweep's claim may be a
+//!   legitimate descendant that already escaped the ppid walk (`setsid` /
+//!   `timeout`), and an unknown start time is never guessed at;
 //! - the seed process is **older than the minimum age** (default 30 min), so a
 //!   just-launched helper racing its own claim registration is never a target;
 //! - the tree contains **neither this daemon, nor any of its ancestors, nor any
@@ -532,6 +549,29 @@ pub struct OrphanTree {
     pub pids: Vec<u32>,
     /// `pid → description` for the kill log, in `pids` order.
     pub details: Vec<String>,
+    /// Pids attributed to the same worktree that were deliberately left alone
+    /// because they belong to a live sweep's own process tree, or could not be
+    /// proven older than it (#5135). Empty when no live sweep claims the issue.
+    pub protected_pids: Vec<u32>,
+}
+
+/// A live sweep's own process-tree root, expressed in the same units
+/// [`ProcEntry::age_secs`] uses so [`plan_orphan_trees`] stays clock-free
+/// (issue #5135).
+///
+/// Built by [`reap_repo_processes`] from
+/// [`crate::worktree_ops::liveness::LiveSweepRoot`] (the claim lock's
+/// `owner_pid` + `acquired_at`, confirmed live) against the pass's own wall
+/// clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveSweepTreeRoot {
+    /// The live sweep's own root pid.
+    pub pid: u32,
+    /// How long ago that sweep's claim was acquired, in seconds — the proxy
+    /// for "when did this sweep's own process tree begin". A candidate pid is
+    /// only ever a reap candidate when its own age is **strictly greater**
+    /// (i.e. it provably predates the live sweep).
+    pub age_secs: u64,
 }
 
 /// What one planning pass found.
@@ -543,8 +583,17 @@ pub struct PlanOutcome {
     pub skipped: Vec<(u32, String)>,
 }
 
-/// Build the reap plan for `worktrees` (already vetted as unowned by the
-/// caller) against a `/proc` snapshot.
+/// Build the reap plan for `worktrees` (already vetted by the caller's
+/// [`ownership_gate`]) against a `/proc` snapshot.
+///
+/// `live_roots` maps an issue to the process-tree root of a **live sweep that
+/// legitimately owns part of that worktree** (#5135). An issue absent from the
+/// map has no live sweep at all, and every attributed process is a candidate —
+/// the pre-#5135 behaviour, unchanged. An issue *present* in the map is one
+/// where a live claim exists **and** its own root pid was confirmed live: the
+/// sweep's own tree is protected pid-by-pid instead of the whole worktree being
+/// skipped, so an unrelated orphan sharing that worktree (the #5110 incident
+/// shape, re-dispatched onto the same issue) is still reapable.
 ///
 /// Pure: no signals, no filesystem, no clock. This is where every
 /// process-level fail-safe lives, so it is exhaustively unit-testable.
@@ -554,6 +603,7 @@ pub fn plan_orphan_trees(
     worktrees: &[(u32, PathBuf)],
     self_pid: u32,
     min_age_secs: u64,
+    live_roots: &HashMap<u32, LiveSweepTreeRoot>,
 ) -> PlanOutcome {
     let mut outcome = PlanOutcome::default();
     if procs.is_empty() || worktrees.is_empty() {
@@ -577,11 +627,34 @@ pub fn plan_orphan_trees(
             .filter(|p| !protected.contains(&p.pid) && references_worktree(p, worktree))
             .collect();
 
+        // The live sweep's OWN process tree, when one was resolved for this
+        // issue (#5135): its root pid plus every transitive descendant. Empty
+        // when no live sweep claims the issue, which makes every check below
+        // collapse to its pre-#5135 form.
+        let live_root = live_roots.get(issue).copied();
+        let live_tree: HashSet<u32> = live_root.map_or_else(HashSet::new, |root| {
+            let mut tree: HashSet<u32> =
+                descendants_of(&[root.pid], &children).into_iter().collect();
+            tree.insert(root.pid);
+            tree
+        });
+
         // A live agent runtime inside the worktree owns it, whatever the forge
         // bookkeeping says (PR-set sweeps claim no issue; a manually driven
         // agent takes no spawn-loop claim). The incident's defining property is
         // that the agent was GONE — so its presence is a hard stop.
-        if let Some(agent) = attributed.iter().find(|p| looks_like_agent(&p.cmdline)) {
+        //
+        // Since #5135 this is pid-scoped in exactly the way the claim gate is:
+        // an agent that is *part of the resolved live sweep's own tree* is
+        // already accounted for (it IS that sweep, and `live_tree` protects it
+        // individually below), so it no longer blanket-protects every unrelated
+        // process sharing the worktree. An agent runtime OUTSIDE that tree — or
+        // any agent at all when no live root was resolved — is still a hard
+        // stop for the whole worktree.
+        if let Some(agent) = attributed
+            .iter()
+            .find(|p| looks_like_agent(&p.cmdline) && !live_tree.contains(&p.pid))
+        {
             outcome.skipped.push((
                 *issue,
                 format!("an agent runtime is working in this worktree ({})", agent.describe()),
@@ -589,19 +662,66 @@ pub fn plan_orphan_trees(
             continue;
         }
 
-        // An unknown age is treated as "too young" — never guessed at.
-        let mut seeds: Vec<u32> = attributed
-            .iter()
-            .filter(|p| p.age_secs.is_some_and(|age| age >= min_age_secs))
-            .map(|p| p.pid)
-            .collect();
+        let mut seeds: Vec<u32> = Vec::new();
+        let mut protected_pids: Vec<u32> = Vec::new();
+        for p in &attributed {
+            if let Some(root) = live_root {
+                // The live sweep's own root, or one of its descendants.
+                if live_tree.contains(&p.pid) {
+                    protected_pids.push(p.pid);
+                    continue;
+                }
+                // Only a process PROVABLY older than the live sweep itself can
+                // be a leftover from a previous, unrelated agent. A pid that
+                // started at or after the sweep did may be a legitimate
+                // descendant that already escaped the ppid walk (the very
+                // `setsid`/`timeout` daemonization trick this module exists to
+                // catch), and an unknown age is never guessed at — ambiguous or
+                // concurrent timing is never license to kill.
+                if !p.age_secs.is_some_and(|age| age > root.age_secs) {
+                    protected_pids.push(p.pid);
+                    continue;
+                }
+            }
+            // An unknown age is treated as "too young" — never guessed at.
+            if p.age_secs.is_some_and(|age| age >= min_age_secs) {
+                seeds.push(p.pid);
+            }
+        }
         if seeds.is_empty() {
+            if !protected_pids.is_empty() {
+                protected_pids.sort_unstable();
+                outcome.skipped.push((
+                    *issue,
+                    format!(
+                        "every process here belongs to (or cannot be proven older than) the live \
+                         sweep's own tree: pids={protected_pids:?}"
+                    ),
+                ));
+            }
             continue;
         }
         seeds.sort_unstable();
+        protected_pids.sort_unstable();
 
         let mut pids: HashSet<u32> = seeds.iter().copied().collect();
         pids.extend(descendants_of(&seeds, &children));
+
+        // The orphan tree must not overlap the live sweep's own tree at all. An
+        // overlap means the attribution is wrong (an "orphan" that is really an
+        // ancestor of the live sweep), so refuse the whole tree rather than
+        // partially reaping around it — the same fail-closed stance the daemon
+        // self-protection check below takes.
+        if let Some(hit) = pids.iter().find(|p| live_tree.contains(p)) {
+            outcome.skipped.push((
+                *issue,
+                format!(
+                    "refusing: the attributed tree contains pid {hit}, which belongs to the live \
+                     sweep's own process tree"
+                ),
+            ));
+            continue;
+        }
 
         // A tree that has swallowed the daemon (or its ancestry) means the
         // attribution is wrong — refuse the whole tree rather than part of it.
@@ -627,6 +747,14 @@ pub fn plan_orphan_trees(
             continue;
         }
 
+        // A pid can be both "not provably older than the live sweep" (so it
+        // never seeds on its own) and a ppid-descendant of a seed that IS
+        // provably older. It belongs to the orphan tree — its parent chain
+        // proves it is not the live sweep's — so it is reaped with the tree and
+        // must not also be reported as protected. Overlap with the live sweep's
+        // own tree cannot reach here: that refuses the whole tree above.
+        protected_pids.retain(|p| !pids.contains(p));
+
         let ordered = order_parent_first(&pids, &parents);
         let details = ordered
             .iter()
@@ -643,6 +771,7 @@ pub fn plan_orphan_trees(
             seeds,
             pids: ordered,
             details,
+            protected_pids,
         });
     }
 
@@ -832,8 +961,33 @@ impl ProcessReapReport {
     }
 }
 
-/// Why a worktree's processes are off limits, or `None` when it is provably
-/// unowned.
+/// What one worktree's ownership check concluded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnershipVerdict {
+    /// Leave every process in this worktree alone, for the given reason.
+    Skip(String),
+    /// Provably unowned — every attributed process is an orphan candidate.
+    Unowned,
+    /// A live sweep owns *part* of this worktree (#5135): its own process tree
+    /// is off limits, but a process that provably predates it is still a
+    /// candidate. Carries the resolved root so the planner can discriminate.
+    LiveSweep(crate::worktree_ops::liveness::LiveSweepRoot),
+}
+
+/// Why a worktree's processes are off limits, or how much of it a live sweep
+/// legitimately owns.
+///
+/// Before #5135 a live claim for the issue blanket-protected **every** process
+/// inside the worktree, so an orphan tree that predates and is unrelated to a
+/// concurrently live, re-dispatched sweep for the same issue could never be
+/// reaped — the exact #5110 incident shape. The claim gate is now the point
+/// where "who owns this worktree" becomes pid-scoped: when the claim's own root
+/// pid can be confirmed live, the verdict is [`OwnershipVerdict::LiveSweep`] and
+/// the discrimination happens per-pid in [`plan_orphan_trees`]. When it cannot
+/// (a stale lock, an unparseable owner, or a claim tracked only through the
+/// legacy spawn-loop-state union with no lock dir at all), there is nothing to
+/// compare a candidate against, so the verdict falls back to a whole-worktree
+/// [`OwnershipVerdict::Skip`] — exactly the pre-#5135 behaviour.
 ///
 /// The probes are injected so the gate chain is testable without a forge, a
 /// process table, or a live sweep.
@@ -844,20 +998,31 @@ pub fn ownership_gate(
     is_managed: &dyn Fn(&Path) -> bool,
     active_issues: &HashSet<u32>,
     live_claim: &dyn Fn(u32) -> Option<String>,
-) -> Option<String> {
+    live_sweep_root: &dyn Fn(u32) -> Option<crate::worktree_ops::liveness::LiveSweepRoot>,
+) -> OwnershipVerdict {
     if !is_managed(worktree) {
-        return Some("no .loom-managed sentinel (user-provisioned)".to_string());
+        return OwnershipVerdict::Skip("no .loom-managed sentinel (user-provisioned)".to_string());
     }
     if worktree.join(".loom-in-use").exists() {
-        return Some(".loom-in-use marker present".to_string());
+        return OwnershipVerdict::Skip(".loom-in-use marker present".to_string());
     }
-    if active_issues.contains(&issue) {
-        return Some(format!("issue #{issue} has a live spawn-loop task or claim-lock"));
+    // `active_issues` is the cheap (filesystem-only) probe, so it is consulted
+    // before `live_claim`, which may reach the journal and the process table.
+    let claim_evidence = if active_issues.contains(&issue) {
+        Some(format!("issue #{issue} has a live spawn-loop task or claim-lock"))
+    } else {
+        live_claim(issue).map(|evidence| format!("live sweep claim: {evidence}"))
+    };
+    let Some(evidence) = claim_evidence else {
+        return OwnershipVerdict::Unowned;
+    };
+    match live_sweep_root(issue) {
+        Some(root) => OwnershipVerdict::LiveSweep(root),
+        // Nothing to compare a candidate pid against — protect everything.
+        None => OwnershipVerdict::Skip(format!(
+            "{evidence} (no live root pid resolvable — protecting the whole worktree)"
+        )),
     }
-    if let Some(evidence) = live_claim(issue) {
-        return Some(format!("live sweep claim: {evidence}"));
-    }
-    None
 }
 
 /// Run one production process-reap pass over `repo_root`.
@@ -885,8 +1050,20 @@ pub fn reap_repo_processes(
     let active_issues = crate::worktree_ops::liveness::active_spawn_loop_issues(repo_root);
     let live_claim =
         |issue: u32| crate::live_claim::probe(repo_root, None, issue).map(|e| e.to_string());
+    // Resolved once per pass, not once per worktree (#5135) — the same "one
+    // filesystem scan up front" shape `active_issues` above already uses. Only
+    // claims whose recorded owner pid is a confirmed-live, non-zombie process
+    // appear here; everything else falls back to whole-worktree protection.
+    let locked_roots = crate::worktree_ops::liveness::active_locked_issue_roots(repo_root);
+    let live_sweep_root = |issue: u32| locked_roots.get(&issue).copied();
+    let now = chrono::Utc::now();
 
     let mut unowned: Vec<(u32, PathBuf)> = Vec::new();
+    // The live sweep root each surviving worktree was partitioned against, kept
+    // so the pre-kill recheck can tell "the same sweep we already discriminated
+    // against" from "a different sweep claimed this issue mid-pass".
+    let mut planned_roots: HashMap<u32, crate::worktree_ops::liveness::LiveSweepRoot> =
+        HashMap::new();
     for entry in dirs {
         let name = entry.file_name().to_string_lossy().to_string();
         let Some(issue) = crate::worktree_ops::naming::issue_from_worktree(&name) else {
@@ -894,11 +1071,22 @@ pub fn reap_repo_processes(
         };
         report.worktrees_scanned += 1;
         let path = entry.path().canonicalize().unwrap_or_else(|_| entry.path());
-        if let Some(reason) =
-            ownership_gate(&path, issue, &clean::is_loom_managed, &active_issues, &live_claim)
-        {
-            report.skipped.push((issue, reason));
-            continue;
+        match ownership_gate(
+            &path,
+            issue,
+            &clean::is_loom_managed,
+            &active_issues,
+            &live_claim,
+            &live_sweep_root,
+        ) {
+            OwnershipVerdict::Skip(reason) => {
+                report.skipped.push((issue, reason));
+                continue;
+            }
+            OwnershipVerdict::LiveSweep(root) => {
+                planned_roots.insert(issue, root);
+            }
+            OwnershipVerdict::Unowned => {}
         }
         unowned.push((issue, path));
     }
@@ -907,9 +1095,26 @@ pub fn reap_repo_processes(
         return report;
     }
 
+    // Translate each live sweep root into the planner's clock-free units. A
+    // claim whose `acquired_at` is in the future (clock skew) yields age 0, so
+    // no candidate can ever be "provably older" than it — fail-safe.
+    let live_roots: HashMap<u32, LiveSweepTreeRoot> = planned_roots
+        .iter()
+        .map(|(issue, root)| {
+            let age = (now - root.started_at).num_seconds();
+            (
+                *issue,
+                LiveSweepTreeRoot {
+                    pid: root.pid,
+                    age_secs: u64::try_from(age).unwrap_or(0),
+                },
+            )
+        })
+        .collect();
+
     let procs = snapshot_processes();
     report.processes_scanned = procs.len();
-    let plan = plan_orphan_trees(&procs, &unowned, std::process::id(), min_age);
+    let plan = plan_orphan_trees(&procs, &unowned, std::process::id(), min_age, &live_roots);
     report.skipped.extend(plan.skipped);
     report.trees = plan.trees;
 
@@ -920,21 +1125,37 @@ pub fn reap_repo_processes(
     let hooks = production_hooks();
     for tree in &report.trees {
         // Re-verify liveness immediately before signalling: a sweep may have
-        // claimed the issue while this pass was scanning /proc. The whole
-        // safety argument rests on never racing a live claim.
+        // claimed the issue while this pass was scanning /proc. The whole safety
+        // argument rests on never racing a live claim — but since #5135 a live
+        // claim is no longer disqualifying by itself, only a claim we did NOT
+        // already discriminate this tree against. Re-resolving the root and
+        // comparing it to the one used at plan time distinguishes the two: an
+        // identical root means the partition still holds; anything else (a new
+        // sweep, a re-acquired lock, or a claim whose root is unresolvable) is
+        // an unmodelled race, and we fail closed.
         if let Some(evidence) = live_claim(tree.issue) {
-            report
-                .skipped
-                .push((tree.issue, format!("live sweep claim appeared mid-pass: {evidence}")));
-            continue;
+            let planned = planned_roots.get(&tree.issue).copied();
+            // Deliberately a FRESH lock-directory read, not the pass-start
+            // `live_sweep_root` snapshot — the whole point is to observe a
+            // claim that changed while we were scanning.
+            let fresh = crate::worktree_ops::liveness::active_locked_issue_roots(repo_root)
+                .get(&tree.issue)
+                .copied();
+            if planned.is_none() || fresh != planned {
+                report
+                    .skipped
+                    .push((tree.issue, format!("live sweep claim appeared mid-pass: {evidence}")));
+                continue;
+            }
         }
         log::warn!(
-            "orphan_process_reaper: {} issue-{}: {} orphaned process(es) in {} with no live \
-             sweep claim{}: [{}]",
+            "orphan_process_reaper: {} issue-{}: {} orphaned process(es) in {} not owned by any \
+             live sweep (protected live-sweep pids={:?}){}: [{}]",
             repo_root.display(),
             tree.issue,
             tree.pids.len(),
             tree.worktree.display(),
+            tree.protected_pids,
             if dry_run {
                 " (dry-run, not signalled)"
             } else {
@@ -1168,7 +1389,8 @@ mod tests {
     fn test_incident_tree_is_planned_whole_across_process_groups() {
         let wt = "/repo/.loom/worktrees/issue-87";
         let procs = incident_procs(wt);
-        let plan = plan_orphan_trees(&procs, &[(87, PathBuf::from(wt))], 4242, 1800);
+        let plan =
+            plan_orphan_trees(&procs, &[(87, PathBuf::from(wt))], 4242, 1800, &HashMap::new());
         assert_eq!(plan.trees.len(), 1, "{plan:?}");
         let tree = &plan.trees[0];
         assert_eq!(tree.issue, 87);
@@ -1212,7 +1434,8 @@ mod tests {
             proc(100, 1, Some(wt), "claude -p /loom:sweep --prs 456", Some(99_999)),
             proc(101, 100, Some(wt), "bash ./build.sh", Some(99_999)),
         ];
-        let plan = plan_orphan_trees(&procs, &[(87, PathBuf::from(wt))], 4242, 1800);
+        let plan =
+            plan_orphan_trees(&procs, &[(87, PathBuf::from(wt))], 4242, 1800, &HashMap::new());
         assert!(plan.trees.is_empty(), "{plan:?}");
         assert!(plan.skipped[0].1.contains("agent runtime"), "{plan:?}");
     }
@@ -1221,7 +1444,8 @@ mod tests {
     fn test_young_processes_are_never_seeds() {
         let wt = "/repo/.loom/worktrees/issue-87";
         let procs = vec![proc(500, 1, Some(wt), "bash build.sh", Some(60))];
-        let plan = plan_orphan_trees(&procs, &[(87, PathBuf::from(wt))], 4242, 1800);
+        let plan =
+            plan_orphan_trees(&procs, &[(87, PathBuf::from(wt))], 4242, 1800, &HashMap::new());
         assert!(plan.trees.is_empty());
     }
 
@@ -1229,7 +1453,8 @@ mod tests {
     fn test_unknown_age_is_never_a_seed() {
         let wt = "/repo/.loom/worktrees/issue-87";
         let procs = vec![proc(500, 1, Some(wt), "bash build.sh", None)];
-        let plan = plan_orphan_trees(&procs, &[(87, PathBuf::from(wt))], 4242, 1800);
+        let plan =
+            plan_orphan_trees(&procs, &[(87, PathBuf::from(wt))], 4242, 1800, &HashMap::new());
         assert!(plan.trees.is_empty(), "an unknown age must never be assumed old");
     }
 
@@ -1244,7 +1469,8 @@ mod tests {
             // Our own child (a live sweep the registry owns).
             proc(800, self_pid, Some(wt), "claude -p /loom:sweep 87", Some(99_999)),
         ];
-        let plan = plan_orphan_trees(&procs, &[(87, PathBuf::from(wt))], self_pid, 1800);
+        let plan =
+            plan_orphan_trees(&procs, &[(87, PathBuf::from(wt))], self_pid, 1800, &HashMap::new());
         assert!(
             plan.trees.is_empty(),
             "the daemon, its ancestry, and its children must never be reaped: {plan:?}"
@@ -1261,7 +1487,8 @@ mod tests {
             proc(100, 1, Some(wt), "bash driver.sh", Some(99_999)),
             proc(self_pid, 100, Some("/"), "loom-daemon", Some(99_999)),
         ];
-        let plan = plan_orphan_trees(&procs, &[(87, PathBuf::from(wt))], self_pid, 1800);
+        let plan =
+            plan_orphan_trees(&procs, &[(87, PathBuf::from(wt))], self_pid, 1800, &HashMap::new());
         assert!(plan.trees.is_empty(), "{plan:?}");
     }
 
@@ -1281,7 +1508,8 @@ mod tests {
             proc(self_pid, 1, Some("/"), "loom-daemon", Some(99_999)),
             proc(950, self_pid, None, "child (fresh parent)", Some(1)),
         ];
-        let plan = plan_orphan_trees(&procs, &[(87, PathBuf::from(wt))], self_pid, 1800);
+        let plan =
+            plan_orphan_trees(&procs, &[(87, PathBuf::from(wt))], self_pid, 1800, &HashMap::new());
         assert!(plan.trees.is_empty());
         assert_eq!(plan.skipped.len(), 1);
         assert!(plan.skipped[0].1.contains("protected pid"), "{plan:?}");
@@ -1294,7 +1522,8 @@ mod tests {
         for pid in 1001..(1001 + MAX_TREE_PIDS as u32) {
             procs.push(proc(pid, 1000, None, "child", Some(10)));
         }
-        let plan = plan_orphan_trees(&procs, &[(87, PathBuf::from(wt))], 4242, 1800);
+        let plan =
+            plan_orphan_trees(&procs, &[(87, PathBuf::from(wt))], 4242, 1800, &HashMap::new());
         assert!(plan.trees.is_empty());
         assert!(plan.skipped[0].1.contains("safety cap"), "{plan:?}");
     }
@@ -1312,10 +1541,171 @@ mod tests {
             &[(87, PathBuf::from(a)), (870, PathBuf::from(b))],
             4242,
             1800,
+            &HashMap::new(),
         );
         assert_eq!(plan.trees.len(), 2);
         assert_eq!(plan.trees[0].pids, vec![100]);
         assert_eq!(plan.trees[1].pids, vec![200]);
+    }
+
+    // ===================================================================
+    // Live-sweep discrimination (#5135) — pid-scoped, not issue-scoped
+    // ===================================================================
+
+    /// The #5135 fixture: issue 87's worktree holds BOTH a live sweep (root
+    /// pid 5000, claimed 3600s ago, with a `claude` child) and an orphan tree
+    /// that predates it by hours and belongs to no live process.
+    fn live_sweep_and_orphan(worktree: &str) -> Vec<ProcEntry> {
+        vec![
+            // The live sweep's own tree.
+            proc(5000, 1, Some(worktree), "bash spawn-worker.sh /loom:sweep 87", Some(3000)),
+            proc(5001, 5000, Some(worktree), "claude -p /loom:sweep 87", Some(2900)),
+            proc(5002, 5001, Some(worktree), "cargo test --lib", Some(2800)),
+            // The unrelated orphan, started long before the live sweep claimed
+            // the issue and reparented to init when its own agent died.
+            proc(100, 1, Some(worktree), "bash ./sim/.work/cal/run_all.sh", Some(21_120)),
+            proc(101, 100, Some(worktree), "ngspice -b a.spice", Some(600)),
+        ]
+    }
+
+    /// A live sweep rooted at `pid` whose claim was acquired `age_secs` ago.
+    fn tree_root(pid: u32, age_secs: u64) -> HashMap<u32, LiveSweepTreeRoot> {
+        HashMap::from([(87, LiveSweepTreeRoot { pid, age_secs })])
+    }
+
+    #[test]
+    fn test_orphan_is_reaped_while_a_live_sweep_for_the_same_issue_is_untouched() {
+        // The whole point of #5135: a live claim for issue 87 no longer
+        // blanket-protects every process in issue 87's worktree.
+        let wt = "/repo/.loom/worktrees/issue-87";
+        let procs = live_sweep_and_orphan(wt);
+        let plan = plan_orphan_trees(
+            &procs,
+            &[(87, PathBuf::from(wt))],
+            4242,
+            1800,
+            &tree_root(5000, 3000),
+        );
+        assert_eq!(plan.trees.len(), 1, "{plan:?}");
+        let tree = &plan.trees[0];
+        assert_eq!(tree.seeds, vec![100], "only the orphan driver may seed");
+        assert_eq!(tree.pids, vec![100, 101], "the orphan's whole tree comes with it");
+        for pid in [5000, 5001, 5002] {
+            assert!(!tree.pids.contains(&pid), "the live sweep's own tree must survive: {plan:?}");
+        }
+        assert_eq!(tree.protected_pids, vec![5000, 5001, 5002]);
+    }
+
+    #[test]
+    fn test_a_worktree_that_is_only_the_live_sweeps_own_tree_yields_nothing() {
+        let wt = "/repo/.loom/worktrees/issue-87";
+        let procs: Vec<ProcEntry> = live_sweep_and_orphan(wt)
+            .into_iter()
+            .filter(|p| p.pid >= 5000)
+            .collect();
+        let plan = plan_orphan_trees(
+            &procs,
+            &[(87, PathBuf::from(wt))],
+            4242,
+            1800,
+            &tree_root(5000, 3000),
+        );
+        assert!(plan.trees.is_empty(), "{plan:?}");
+        assert_eq!(plan.skipped.len(), 1);
+        assert!(plan.skipped[0].1.contains("live sweep's own tree"), "{plan:?}");
+    }
+
+    #[test]
+    fn test_a_candidate_postdating_the_live_sweep_is_protected() {
+        // Not a descendant by ppid (it double-forked through `setsid`), but it
+        // started AFTER the live sweep claimed the issue — so it may well be
+        // that sweep's own escaped child. Ambiguity never authorises a kill.
+        let wt = "/repo/.loom/worktrees/issue-87";
+        let procs = vec![
+            proc(5000, 1, Some(wt), "bash spawn-worker.sh /loom:sweep 87", Some(3000)),
+            proc(600, 1, Some(wt), "bash ./long-build.sh", Some(2000)),
+        ];
+        let plan = plan_orphan_trees(
+            &procs,
+            &[(87, PathBuf::from(wt))],
+            4242,
+            1800,
+            &tree_root(5000, 3000),
+        );
+        assert!(plan.trees.is_empty(), "{plan:?}");
+        assert!(
+            plan.skipped[0].1.contains("2000") || plan.skipped[0].1.contains("600"),
+            "{plan:?}"
+        );
+    }
+
+    #[test]
+    fn test_a_candidate_with_an_unknown_age_is_protected_under_a_live_sweep() {
+        let wt = "/repo/.loom/worktrees/issue-87";
+        let procs = vec![
+            proc(5000, 1, Some(wt), "bash spawn-worker.sh /loom:sweep 87", Some(3000)),
+            proc(600, 1, Some(wt), "bash ./mystery.sh", None),
+        ];
+        let plan = plan_orphan_trees(
+            &procs,
+            &[(87, PathBuf::from(wt))],
+            4242,
+            1800,
+            &tree_root(5000, 3000),
+        );
+        assert!(plan.trees.is_empty(), "an unknown age is never proven to predate: {plan:?}");
+    }
+
+    #[test]
+    fn test_an_agent_outside_the_live_sweep_tree_still_stops_the_whole_reap() {
+        // A second, unclaimed agent (Manual Orchestration Mode) sharing the
+        // worktree is NOT the resolved live sweep, so it keeps its pre-#5135
+        // whole-worktree veto even though an older orphan is present.
+        let wt = "/repo/.loom/worktrees/issue-87";
+        let mut procs = live_sweep_and_orphan(wt);
+        procs.push(proc(700, 1, Some(wt), "claude -p /loom:builder", Some(9000)));
+        let plan = plan_orphan_trees(
+            &procs,
+            &[(87, PathBuf::from(wt))],
+            4242,
+            1800,
+            &tree_root(5000, 3000),
+        );
+        assert!(plan.trees.is_empty(), "{plan:?}");
+        assert!(plan.skipped[0].1.contains("agent runtime"), "{plan:?}");
+    }
+
+    #[test]
+    fn test_an_orphan_tree_overlapping_the_live_sweep_tree_is_refused_whole() {
+        // The "orphan" is really an ancestor of the live sweep — the
+        // attribution is wrong, so refuse the tree rather than reap around it.
+        let wt = "/repo/.loom/worktrees/issue-87";
+        let procs = vec![
+            proc(100, 1, Some(wt), "bash ./driver.sh", Some(21_120)),
+            proc(5000, 100, Some(wt), "bash spawn-worker.sh /loom:sweep 87", Some(3000)),
+        ];
+        let plan = plan_orphan_trees(
+            &procs,
+            &[(87, PathBuf::from(wt))],
+            4242,
+            1800,
+            &tree_root(5000, 3000),
+        );
+        assert!(plan.trees.is_empty(), "{plan:?}");
+        assert!(plan.skipped[0].1.contains("live sweep's own process tree"), "{plan:?}");
+    }
+
+    #[test]
+    fn test_no_live_root_leaves_every_pre_5135_gate_exactly_as_it_was() {
+        // An issue absent from `live_roots` is the pre-#5135 path: the caller's
+        // ownership gate already skipped the whole worktree if a claim existed.
+        let wt = "/repo/.loom/worktrees/issue-87";
+        let procs = live_sweep_and_orphan(wt);
+        let plan =
+            plan_orphan_trees(&procs, &[(87, PathBuf::from(wt))], 4242, 1800, &HashMap::new());
+        // The live sweep's `claude` is an unaccounted-for agent runtime here.
+        assert!(plan.trees.is_empty(), "{plan:?}");
+        assert!(plan.skipped[0].1.contains("agent runtime"), "{plan:?}");
     }
 
     // ===================================================================
@@ -1328,46 +1718,116 @@ mod tests {
         tmp
     }
 
+    /// The `Skip` reason, or a panic naming the verdict that was not a skip.
+    fn skip_reason(verdict: &OwnershipVerdict) -> String {
+        match verdict {
+            OwnershipVerdict::Skip(reason) => reason.clone(),
+            other => panic!("expected a Skip verdict, got {other:?}"),
+        }
+    }
+
+    /// A `LiveSweepRoot` at `pid`, claimed at a fixed instant.
+    fn live_root(pid: u32) -> crate::worktree_ops::liveness::LiveSweepRoot {
+        crate::worktree_ops::liveness::LiveSweepRoot {
+            pid,
+            started_at: chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        }
+    }
+
     #[test]
     fn test_ownership_gate_passes_for_an_unowned_managed_worktree() {
         let wt = managed_worktree();
-        let gate =
-            ownership_gate(wt.path(), 87, &clean::is_loom_managed, &HashSet::new(), &|_| None);
-        assert_eq!(gate, None);
+        let gate = ownership_gate(
+            wt.path(),
+            87,
+            &clean::is_loom_managed,
+            &HashSet::new(),
+            &|_| None,
+            &|_| None,
+        );
+        assert_eq!(gate, OwnershipVerdict::Unowned);
     }
 
     #[test]
     fn test_ownership_gate_requires_the_managed_sentinel() {
         let wt = tempfile::tempdir().unwrap();
-        let gate =
-            ownership_gate(wt.path(), 87, &clean::is_loom_managed, &HashSet::new(), &|_| None);
-        assert!(gate.unwrap().contains(".loom-managed"));
+        let gate = ownership_gate(
+            wt.path(),
+            87,
+            &clean::is_loom_managed,
+            &HashSet::new(),
+            &|_| None,
+            &|_| None,
+        );
+        assert!(skip_reason(&gate).contains(".loom-managed"));
     }
 
     #[test]
     fn test_ownership_gate_respects_the_in_use_marker() {
         let wt = managed_worktree();
         fs::write(wt.path().join(".loom-in-use"), "{}").unwrap();
-        let gate =
-            ownership_gate(wt.path(), 87, &clean::is_loom_managed, &HashSet::new(), &|_| None);
-        assert!(gate.unwrap().contains(".loom-in-use"));
+        let gate = ownership_gate(
+            wt.path(),
+            87,
+            &clean::is_loom_managed,
+            &HashSet::new(),
+            &|_| None,
+            &|_| None,
+        );
+        assert!(skip_reason(&gate).contains(".loom-in-use"));
     }
 
     #[test]
-    fn test_ownership_gate_respects_a_claim_lock() {
+    fn test_ownership_gate_respects_a_claim_lock_with_no_resolvable_root() {
+        // Pre-#5135 behaviour is preserved exactly when the claim's own root
+        // pid cannot be resolved: protect the whole worktree.
         let wt = managed_worktree();
-        let gate =
-            ownership_gate(wt.path(), 87, &clean::is_loom_managed, &HashSet::from([87]), &|_| None);
-        assert!(gate.unwrap().contains("claim-lock"));
+        let gate = ownership_gate(
+            wt.path(),
+            87,
+            &clean::is_loom_managed,
+            &HashSet::from([87]),
+            &|_| None,
+            &|_| None,
+        );
+        let reason = skip_reason(&gate);
+        assert!(reason.contains("claim-lock"), "{reason}");
+        assert!(reason.contains("no live root pid resolvable"), "{reason}");
     }
 
     #[test]
-    fn test_ownership_gate_respects_a_live_sweep_claim() {
+    fn test_ownership_gate_respects_a_live_sweep_claim_with_no_resolvable_root() {
         let wt = managed_worktree();
-        let gate = ownership_gate(wt.path(), 87, &clean::is_loom_managed, &HashSet::new(), &|_| {
-            Some("a live `/loom:sweep` process (pid 5)".to_string())
-        });
-        assert!(gate.unwrap().contains("live sweep claim"));
+        let gate = ownership_gate(
+            wt.path(),
+            87,
+            &clean::is_loom_managed,
+            &HashSet::new(),
+            &|_| Some("a live `/loom:sweep` process (pid 5)".to_string()),
+            &|_| None,
+        );
+        assert!(skip_reason(&gate).contains("live sweep claim"));
+    }
+
+    #[test]
+    fn test_ownership_gate_reports_a_live_sweep_root_instead_of_skipping() {
+        // #5135: a claim whose own root pid IS resolvable no longer
+        // blanket-protects the worktree — the discrimination moves to the
+        // planner, per pid.
+        let wt = managed_worktree();
+        for active in [HashSet::from([87]), HashSet::new()] {
+            let gate = ownership_gate(
+                wt.path(),
+                87,
+                &clean::is_loom_managed,
+                &active,
+                &|_| Some("a live `/loom:sweep` process (pid 5)".to_string()),
+                &|_| Some(live_root(4242)),
+            );
+            assert_eq!(gate, OwnershipVerdict::LiveSweep(live_root(4242)), "{active:?}");
+        }
     }
 
     // ===================================================================
@@ -1386,6 +1846,7 @@ mod tests {
             seeds: vec![pids[0]],
             pids: pids.to_vec(),
             details: pids.iter().map(|p| format!("pid={p}")).collect(),
+            protected_pids: Vec::new(),
         }
     }
 
@@ -1859,7 +2320,13 @@ mod tests {
             );
 
             // Plan with a zero age floor (the fixture is seconds old) and reap.
-            let plan = plan_orphan_trees(&procs, &[(87, wt.clone())], std::process::id(), 0);
+            let plan = plan_orphan_trees(
+                &procs,
+                &[(87, wt.clone())],
+                std::process::id(),
+                0,
+                &HashMap::new(),
+            );
             assert_eq!(plan.trees.len(), 1, "{plan:?}");
             assert!(plan.trees[0].pids.contains(&driver_pid));
 
