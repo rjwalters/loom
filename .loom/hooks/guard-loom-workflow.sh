@@ -293,6 +293,85 @@ mask_data_flag_values() {
     }'
 }
 
+# Mask quoted POSITIONAL arguments (no preceding flag name) to a small
+# allowlist of known non-executing commands/scripts (issue #5155, extending
+# the #5115 fix above). mask_data_flag_values only recognizes text following
+# a named flag; it has no effect on a script whose free-text arguments are
+# purely positional, e.g. `./.loom/scripts/check-duplicate.sh "TITLE"
+# "DESCRIPTION"` or `grep -n "pattern" file`. Neither `grep`/`egrep`/`fgrep`/
+# `rg` nor check-duplicate.sh ever EXECUTES a positional argument -- they only
+# read it as search/dedup text -- so masking a quoted argument immediately
+# following one of these command names (optionally after short flags, e.g.
+# `grep -n "..."`) can never blind this catastrophic-tier guard to a real
+# invocation. Deliberately narrow allowlist, same "deliberately narrow"
+# convention documented above mask_cat_heredoc_bodies(): a command that WRAPS
+# the phrase and then executes it -- `sh -c "gh pr merge 123"`, `bash -c
+# '...'`, `eval "..."` -- is NOT in this allowlist and stays fully visible to
+# the merge-redirect grep below, exactly as before.
+#
+# Masks EVERY quoted argument that directly, consecutively follows the
+# command+flags (separated only by whitespace) -- not just the first -- so
+# multi-positional-arg scripts like check-duplicate.sh's `TITLE DESCRIPTION`
+# signature get both arguments masked. Masking stops at the first token that
+# is not a quoted string (a bare filename, `&&`, `|`, etc.), leaving anything
+# after that boundary -- including a real `gh pr merge` invocation chained
+# onto the same line -- fully visible.
+mask_command_positional_args() {
+    printf '%s' "$1" | awk '
+    BEGIN {
+        SQ = sprintf("%c", 39)
+        DQ = sprintf("%c", 34)
+        # Command-name allowlist: known non-executing commands/scripts whose
+        # positional string arguments are search/dedup text, never live shell
+        # syntax. Extend only when another read-only positional-arg consumer
+        # causes a real false positive (see #5155).
+        cmdre = "(grep|egrep|fgrep|rg|\\./\\.loom/scripts/check-duplicate\\.sh)"
+        # Zero or more short/long flags between the command name and the
+        # first quoted positional argument (e.g. `grep -n`, `rg -i`,
+        # `check-duplicate.sh --include-merged-prs --issue 5155`).
+        flagre = "([ \t]+-[A-Za-z0-9_-]+)*"
+        anchor = "(^|[ \t\n;&|`(])" cmdre flagre "[ \t]+"
+        buf = ""
+    }
+    { buf = buf (NR > 1 ? "\n" : "") $0 }
+    END {
+        s = buf
+        out = ""
+        while (match(s, anchor)) {
+            pre     = substr(s, 1, RSTART - 1)
+            matched = substr(s, RSTART, RLENGTH)
+            rest    = substr(s, RSTART + RLENGTH)
+            out = out pre matched
+            # Mask every consecutive quoted positional argument immediately
+            # following the anchor (whitespace-separated). Stops at the first
+            # non-quote-starting token, so anything after the argument list
+            # (a pipe, &&, an unrelated command) is left fully visible.
+            while (1) {
+                qc = substr(rest, 1, 1)
+                if (qc != DQ && qc != SQ) break
+                endpos = 0
+                for (i = 2; i <= length(rest); i++) {
+                    if (substr(rest, i, 1) == qc) { endpos = i; break }
+                }
+                if (endpos == 0) break
+                inner = substr(rest, 2, endpos - 2)
+                if (index(inner, "$(") == 0 && index(inner, "`") == 0) {
+                    gsub(/./, "X", inner)
+                }
+                out = out qc inner qc
+                rest = substr(rest, endpos + 1)
+                while (substr(rest, 1, 1) == " " || substr(rest, 1, 1) == "\t") {
+                    out = out substr(rest, 1, 1)
+                    rest = substr(rest, 2)
+                }
+            }
+            s = rest
+        }
+        out = out s
+        printf "%s", out
+    }'
+}
+
 # =============================================================================
 # DECISION TELEMETRY (issue #3771 / #3898) — one JSONL record per deny decision,
 # identical schema + toggle semantics to guard-destructive.sh so both guards'
@@ -474,11 +553,13 @@ ask() {
 # LOOM: Prefer merge-pr.sh over gh pr merge
 # =============================================================================
 
-# Match against a MASKED copy of $COMMAND (issue #5109) so a mention of the
-# phrase inside a cat-heredoc commit-message body or a --search/--body/-m/etc
-# quoted value doesn't false-positive as a real invocation. See the masking
-# functions' doc comments above for exactly what is (and is NOT) neutralized.
-GH_PR_MERGE_SCAN_TEXT=$(mask_data_flag_values "$(mask_cat_heredoc_bodies "$COMMAND")")
+# Match against a MASKED copy of $COMMAND (issue #5109, extended by #5155) so
+# a mention of the phrase inside a cat-heredoc commit-message body, a
+# --search/--body/-m/etc quoted value, or a quoted POSITIONAL argument to a
+# known non-executing command (grep/rg/check-duplicate.sh) doesn't
+# false-positive as a real invocation. See the masking functions' doc
+# comments above for exactly what is (and is NOT) neutralized.
+GH_PR_MERGE_SCAN_TEXT=$(mask_data_flag_values "$(mask_command_positional_args "$(mask_cat_heredoc_bodies "$COMMAND")")")
 if echo "$GH_PR_MERGE_SCAN_TEXT" | grep -qE 'gh\s+pr\s+merge'; then
     # Resolve the merge-pr.sh path for the current repo context. Prefer an
     # in-repo installed copy (./.loom/scripts/merge-pr.sh); fall back to the
