@@ -87,9 +87,26 @@ RUN chmod 0755 /usr/local/bin/loom-daemon \
     && /usr/local/bin/loom-daemon --version
 
 # --- Non-root user --------------------------------------------------------
-RUN groupadd --gid "${LOOM_GID}" "${LOOM_USER}" \
-    && useradd --uid "${LOOM_UID}" --gid "${LOOM_GID}" --create-home --shell /bin/bash "${LOOM_USER}" \
-    && mkdir -p /workspace \
+# ubuntu:24.04 ships a pre-existing `ubuntu` user/group AT uid/gid 1000 (the
+# upstream image's own default non-root account) — a plain `groupadd --gid
+# 1000` collides with it (`groupadd: GID '1000' already exists`, exit 4).
+# Reuse/rename whatever already owns that uid/gid instead of assuming a clean
+# id space, so this works whether or not the base image ships a pre-existing
+# account at LOOM_UID/LOOM_GID:
+RUN set -eu; \
+    existing_group="$(getent group "${LOOM_GID}" | cut -d: -f1 || true)"; \
+    if [ -n "$existing_group" ] && [ "$existing_group" != "${LOOM_USER}" ]; then \
+        groupmod -n "${LOOM_USER}" "$existing_group"; \
+    elif [ -z "$existing_group" ]; then \
+        groupadd --gid "${LOOM_GID}" "${LOOM_USER}"; \
+    fi; \
+    existing_user="$(getent passwd "${LOOM_UID}" | cut -d: -f1 || true)"; \
+    if [ -n "$existing_user" ] && [ "$existing_user" != "${LOOM_USER}" ]; then \
+        usermod -l "${LOOM_USER}" -d "/home/${LOOM_USER}" -m -g "${LOOM_GID}" -s /bin/bash "$existing_user"; \
+    elif [ -z "$existing_user" ]; then \
+        useradd --uid "${LOOM_UID}" --gid "${LOOM_GID}" --create-home --shell /bin/bash "${LOOM_USER}"; \
+    fi; \
+    mkdir -p /workspace \
     && chown "${LOOM_USER}:${LOOM_USER}" /workspace
 
 USER ${LOOM_USER}
