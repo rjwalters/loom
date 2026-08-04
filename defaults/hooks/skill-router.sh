@@ -170,6 +170,12 @@ done
 # present, using literal (non-regex) substring checks against the full prompt
 # — literal so this guard, like the task-notification guard above, cannot
 # itself false-positive on ordinary human text.
+#
+# INVARIANT: every phrase below must mention "loom" explicitly. Bare
+# single-word phrases ("myself", "inline", "directly") suppress ordinary
+# prompts that never decline Loom at all — e.g. "review this PR directly" or
+# "clean up this code inline" — so they are deliberately excluded. Suppression
+# requires an explicit decline of Loom, never a stylistic adverb.
 if [[ -n "$MATCHED_AGENT" ]]; then
     ANTI_ROUTE_PHRASES=(
         "without loom"
@@ -182,9 +188,6 @@ if [[ -n "$MATCHED_AGENT" ]]; then
         "no loom"
         "not use loom"
         "not via loom"
-        "myself"
-        "inline"
-        "directly"
     )
     for phrase in "${ANTI_ROUTE_PHRASES[@]}"; do
         if [[ "$PROMPT_LOWER" == *"$phrase"* ]]; then

@@ -182,6 +182,34 @@ ctx=$(context_of "$out")
 assert_contains "'fix the failing test in <file>' -> AGENT_ROUTE present" "$ctx" "AGENT_ROUTE:"
 assert_contains "'fix the failing test in <file>' -> routes to /loom:doctor" "$ctx" "/loom:doctor"
 
+# --- Anti-route must NOT over-suppress: bare adverbs are not declines --------
+# "myself" / "inline" / "directly" appear in plenty of ordinary prompts that
+# never decline Loom. They must not be anti-route phrases — every phrase in
+# ANTI_ROUTE_PHRASES has to mention "loom" explicitly.
+reset_markers
+out=$(run_hook "help me build this feature, I want to do the core logic myself")
+ctx=$(context_of "$out")
+assert_contains "no over-suppression: '...myself' -> AGENT_ROUTE present" "$ctx" "AGENT_ROUTE:"
+assert_contains "no over-suppression: '...myself' -> routes to /loom:builder" "$ctx" "/loom:builder"
+
+reset_markers
+out=$(run_hook "please clean up this code inline, no separate refactor commit")
+ctx=$(context_of "$out")
+assert_contains "no over-suppression: '...inline' -> AGENT_ROUTE present" "$ctx" "AGENT_ROUTE:"
+assert_contains "no over-suppression: '...inline' -> routes to /loom:hermit" "$ctx" "/loom:hermit"
+
+reset_markers
+out=$(run_hook "please review this PR directly, I want your feedback fast")
+ctx=$(context_of "$out")
+assert_contains "no over-suppression: 'review...directly' -> AGENT_ROUTE present" "$ctx" "AGENT_ROUTE:"
+assert_contains "no over-suppression: 'review...directly' -> routes to /loom:judge" "$ctx" "/loom:judge"
+
+reset_markers
+out=$(run_hook "fix the bug directly in the config file")
+ctx=$(context_of "$out")
+assert_contains "no over-suppression: 'fix...directly' -> AGENT_ROUTE present" "$ctx" "AGENT_ROUTE:"
+assert_contains "no over-suppression: 'fix...directly' -> routes to /loom:doctor" "$ctx" "/loom:doctor"
+
 # --- Per-session dedup of the agent table -----------------------------------
 reset_markers
 out1=$(run_hook "please implement the new feature" "session-abc")
