@@ -199,9 +199,9 @@ gh issue list --label="loom:triage" --state=open --limit 500 --json number,title
 ```
 
 If nothing carries `loom:triage`, fall back to any issue that is not already
-in-flight, a proposal awaiting Champion evaluation, approved, or blocked. The
-exclusion set must match CLAUDE.md's own curator discovery query so an autonomous
-Curator never "curates" an issue being built or awaiting evaluation:
+in-flight, a proposal awaiting Champion evaluation, approved, blocked, or
+reserved for a human operator, so an autonomous Curator never "curates" an
+issue being built, awaiting evaluation, or outside its authority entirely:
 
 ```bash
 gh issue list --state=open --limit 500 --json number,title,labels \
@@ -215,9 +215,16 @@ gh issue list --state=open --limit 500 --json number,title,labels \
     ([.labels[].name] | contains(["loom:auditor"]) | not) and
     ([.labels[].name] | contains(["loom:epic"]) | not) and
     ([.labels[].name] | contains(["loom:blocked"]) | not) and
+    ([.labels[].name] | contains(["loom:operator-only"]) | not) and
     ([.labels[].name] | contains(["external"]) | not)
   ) | "#\(.number) \(.title)"'
 ```
+
+Note: `loom:blocked` stays excluded here but is *not* dropped entirely from
+Curator's purview — the "Checking Dependencies" section below handles
+`loom:blocked` issues separately (dependency re-checks, unblock-on-resolve).
+`loom:operator-only` (host/cert/secret provisioning meant for a human, not a
+Builder) has no such re-check workflow, so it is excluded outright.
 
 **Workflow**:
 1. Try Priority 1 search first
