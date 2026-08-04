@@ -3212,6 +3212,33 @@ some text
 EOF
 echo done" "$WT_REPO"
 
+# --- #5232 (herestring half): a `<<<` HERESTRING is the same defect class as
+# the heredoc forms above, but it fails one step later. `<<<` is excluded from
+# the target list by the same operator test, so the OPERATOR itself no longer
+# becomes a phantom target -- but a BARE `<<<` is followed by its content WORD
+# (real data, e.g. `tee f <<< hello` / `tee f <<< "some text"`), and unless that
+# word is consumed too it falls through and is misread as an extra write
+# target, resolving into $WT_REPO exactly like the heredoc delimiter did.
+# Consuming exactly ONE following word is shell-accurate: bash's herestring
+# takes a single word, so in `tee f <<< some text` the `text` really IS a tee
+# operand (and is deliberately still scanned as such below).
+assert_allow "write-confinement (#5232): tee to /tmp with a bare '<<< word' herestring is not misread as a second write target" \
+    "tee /tmp/loom-test-$$-hs1.md <<< hello" "$WT_REPO"
+assert_allow "write-confinement (#5232): tee to /tmp with a bare '<<< \"quoted content\"' herestring is not misread as a second write target" \
+    "tee /tmp/loom-test-$$-hs2.md <<< \"some text\"" "$WT_REPO"
+assert_allow "write-confinement (#5232): tee to /tmp with an ATTACHED '<<<word' herestring is not misread as a second write target" \
+    "tee /tmp/loom-test-$$-hs3.md <<<hello" "$WT_REPO"
+assert_allow "write-confinement (#5232): cp with a trailing bare '<<< word' herestring is not misread as the destination" \
+    "cp /tmp/a.sh /tmp/loom-test-$$-hs4.sh <<< hello" "$WT_REPO"
+assert_allow "write-confinement (#5232): sed -i on a /tmp path with a trailing '<<< word' herestring is not misread as an extra file operand" \
+    "sed -i 's/a/b/' /tmp/loom-test-$$-hs5.sh <<< hello" "$WT_REPO"
+# The genuine confinement DENY must still fire with a herestring present, and
+# consuming the herestring word must not swallow a REAL trailing operand.
+assert_deny "write-confinement (#5232): tee into the main checkout with a trailing herestring still denies (real target, not the herestring word)" \
+    "tee $WT_REPO/defaults/hooks/f3.sh <<< hello" "$WT_REPO"
+assert_deny "write-confinement (#5232): a real tee operand AFTER a bare '<<< word' herestring is still scanned (only ONE word is consumed)" \
+    "tee /tmp/loom-test-$$-hs6.md <<< hello $WT_REPO/defaults/hooks/f4.sh" "$WT_REPO"
+
 # No managed worktree anywhere -> fail open (allow).
 WT_REPO_NOWT=$(make_wt_repo)
 rm -rf "$WT_REPO_NOWT/.loom/worktrees"

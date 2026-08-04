@@ -3464,11 +3464,15 @@ extract_write_targets() {
                     # was misread as an extra file target and resolved against
                     # curcwd, producing a bogus "<repo>/<<EOF" write that the
                     # worktree-isolation check below then falsely denied
-                    # (#5232). A BARE operator token (exactly the two- or
-                    # three-char form with no attached delimiter) also
-                    # consumes the following delimiter word.
+                    # (#5232). A BARE operator token (`<<`, `<<-`, `<<<` with
+                    # no attached delimiter/content) also consumes the ONE
+                    # following word -- the heredoc delimiter, or the
+                    # herestring content. Consuming exactly one word is
+                    # shell-accurate for both: a herestring takes a single
+                    # word, so in `tee f <<< a b` the `b` really IS a tee
+                    # operand and must still be scanned.
                     if (toks[j] ~ /^<<-?/) {
-                        if (toks[j] == "<<" || toks[j] == "<<-") j++
+                        if (toks[j] == "<<" || toks[j] == "<<-" || toks[j] == "<<<") j++
                         continue
                     }
                     print curcwd SEP resolve_var(toks[j])
@@ -3482,11 +3486,12 @@ extract_write_targets() {
                     if (toks[j] ~ /^-/) continue
                     if (toks[j] == "") continue
                     # Same heredoc/herestring exclusion as the `tee` branch
-                    # above (#5232) -- a trailing `sed -i ... file <<EOF` must
-                    # not misread the redirection operator/delimiter as an
+                    # above (#5232) -- a trailing `sed -i ... file <<EOF` (or
+                    # `... <<< word`) must not misread the redirection
+                    # operator, its delimiter, or the herestring content as an
                     # extra file operand.
                     if (toks[j] ~ /^<<-?/) {
-                        if (toks[j] == "<<" || toks[j] == "<<-") j++
+                        if (toks[j] == "<<" || toks[j] == "<<-" || toks[j] == "<<<") j++
                         continue
                     }
                     nf++
@@ -3502,12 +3507,13 @@ extract_write_targets() {
                     if (toks[j] ~ /^-/) continue
                     if (toks[j] == "") continue
                     # Same heredoc/herestring exclusion as the `tee` branch
-                    # above (#5232) -- without it a trailing `<<EOF` after the
-                    # real cp/mv operands was misread as the LAST non-flag
-                    # token (the field this branch treats as the destination),
-                    # so it would win over the real destination entirely.
+                    # above (#5232) -- without it a trailing `<<EOF` (or
+                    # `<<< word`) after the real cp/mv operands was misread as
+                    # the LAST non-flag token (the field this branch treats as
+                    # the destination), so it would win over the real
+                    # destination entirely.
                     if (toks[j] ~ /^<<-?/) {
-                        if (toks[j] == "<<" || toks[j] == "<<-") j++
+                        if (toks[j] == "<<" || toks[j] == "<<-" || toks[j] == "<<<") j++
                         continue
                     }
                     nf++
