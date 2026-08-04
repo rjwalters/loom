@@ -3167,6 +3167,51 @@ assert_allow "write-confinement: echo > target in /tmp allows" \
 assert_allow "write-confinement: cd <worktree> && echo > relative target allows" \
     "cd $WT_DIR && echo x > f.sh" "$WT_REPO"
 
+# --- #5232: a heredoc redirection operator/delimiter trailing a real tee/cp/mv
+# (or sed -i) write target must never be misread as an ADDITIONAL write
+# target. Unlike the #5226/#5181 tee-heredoc assertions above (which run
+# against the default REPO_ROOT cwd and so only exercise this precondition
+# when the ambient primary checkout happens to have a sibling managed
+# worktree -- the normal but not guaranteed state of this repo's own primary
+# clone), these use the hermetic make_wt_repo() fixture so the "a managed
+# worktree exists elsewhere" precondition is deterministic in ANY checkout,
+# including a fresh clone or CI runner with zero sibling worktrees. Before the
+# #5232 fix, the phantom "<repo>/<<EOF" (or "<repo>/<<" + "<repo>/EOF" for the
+# bare space-separated form) target resolved into $WT_REPO -- the protected
+# main checkout -- and triggered a false DENY even though the real target
+# (under /tmp, unprotected) was entirely fine on its own.
+assert_allow "write-confinement (#5232): tee to /tmp with a trailing quoted heredoc delimiter <<'EOF' is not misread as a second write target" \
+    "tee /tmp/loom-test-$$-report1.md <<'EOF'
+some text
+EOF
+echo done" "$WT_REPO"
+assert_allow "write-confinement (#5232): sudo tee to /tmp with a trailing quoted heredoc delimiter <<'EOF' is not misread as a second write target" \
+    "sudo tee /tmp/loom-test-$$-report2.md <<'EOF'
+some text
+EOF
+echo done" "$WT_REPO"
+assert_allow "write-confinement (#5232): tee to /tmp with a bare space-separated '<< EOF' heredoc operator is not misread as two extra write targets" \
+    "tee /tmp/loom-test-$$-report3.md << EOF
+some text
+EOF
+echo done" "$WT_REPO"
+assert_allow "write-confinement (#5232): cp with a trailing bare '<< EOF' heredoc operator+delimiter is not misread as the destination" \
+    "cp /tmp/a.sh /tmp/loom-test-$$-copy.sh << EOF
+irrelevant
+EOF" "$WT_REPO"
+assert_allow "write-confinement (#5232): sed -i on a /tmp path with a trailing <<EOF heredoc is not misread as an extra file operand" \
+    "sed -i 's/a/b/' /tmp/loom-test-$$-sed.sh <<EOF
+ignored
+EOF" "$WT_REPO"
+# The real-target-in-main-checkout DENY must still fire when a heredoc is
+# ALSO present -- the exclusion must narrow false positives, not weaken the
+# genuine confinement check.
+assert_deny "write-confinement (#5232): tee into the main checkout with a trailing heredoc still denies (real target, not the heredoc token)" \
+    "tee $WT_REPO/defaults/hooks/f2.sh <<'EOF'
+some text
+EOF
+echo done" "$WT_REPO"
+
 # No managed worktree anywhere -> fail open (allow).
 WT_REPO_NOWT=$(make_wt_repo)
 rm -rf "$WT_REPO_NOWT/.loom/worktrees"
