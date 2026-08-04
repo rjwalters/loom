@@ -23,6 +23,7 @@ jobs:
       mcp: ${{ steps.filter.outputs.mcp }}
       scripts: ${{ steps.filter.outputs.scripts }}
       dashboard: ${{ steps.filter.outputs.dashboard }}
+      docker: ${{ steps.filter.outputs.docker }}
     steps:
       - uses: dorny/paths-filter@v4
         id: filter
@@ -41,6 +42,10 @@ jobs:
               - '.github/workflows/ci.yml'
             dashboard:
               - 'dashboard/**'
+              - '.github/workflows/ci.yml'
+            docker:
+              - 'docker/**'
+              - '.dockerignore'
               - '.github/workflows/ci.yml'
             scripts:
               - 'scripts/**'
@@ -349,3 +354,29 @@ jobs:
         run: bash defaults/scripts/tests/check-ci-suite-manifest.sh
       - name: Run the CI-wired shell test suites
         run: bash defaults/scripts/tests/run-ci-suites.sh
+
+  worker-image-smoke:
+    name: loom-worker Image Smoke Test
+    needs: changes
+    if: always() && (github.event_name == 'push' || needs.changes.outputs.docker == 'true')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Native build (the runner IS x86_64-unknown-linux-gnu) — a full
+      # cross-compile matrix has no place in a per-PR smoke test; the release
+      # workflow's own `build-daemon` matrix already covers every published
+      # target, this job only needs the one Linux artifact the Dockerfile
+      # actually consumes.
+      - name: Build loom-daemon (release)
+        run: cargo build --release --package loom-daemon
+      - name: Package binary at the path the Dockerfile expects
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp target/release/loom-daemon dist/loom-daemon-x86_64-unknown-linux-gnu
+      - name: Build the loom-worker image (no push)
+        run: docker build -f docker/worker/Dockerfile -t loom-worker:ci-smoke .
+      - name: Run the smoke test
+        run: ./docker/worker/test-image.sh loom-worker:ci-smoke

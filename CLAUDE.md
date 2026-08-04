@@ -254,7 +254,11 @@ missing/exhausted pool exits `78` (`EX_CONFIG`). Full reference:
 - **Releasing** — `scripts/version.sh` keeps all 5 version-bearing files in sync
   (including this `CLAUDE.md`'s `**Loom Version**` line); releases are driven by
   `/repo:release` from [rjwalters/repo](https://github.com/rjwalters/repo). The
-  release workflow triggers on GitHub Release creation, not tag push.
+  release workflow triggers on GitHub Release creation, not tag push. The same
+  workflow also publishes `ghcr.io/rjwalters/loom-worker:<version>` — a pinned
+  sweep-execution-environment base image (daemon stays on the host; see
+  [`docker/worker/README.md`](docker/worker/README.md) for the shape decision
+  and `FROM` contract).
 
 ## Troubleshooting
 
