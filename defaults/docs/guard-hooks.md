@@ -463,10 +463,18 @@ was joined as if **relative** — fabricating `curcwd` as `<worktree>/'/main/che
 instead of recognizing it as absolute, and the relative write target then
 resolved back inside the acting worktree's own sentinel — **allowed**. The awk
 `cd` handler now strips a leading/matching-trailing quote from a **copy** of the
-argument used only for this classification and for building `curcwd`; `qsplit()`'s
-verbatim-token contract (which `extract_rm_targets()` / `parse_force_ops()`
-depend on) is untouched, and an unbalanced/unterminated quote leaves the copy
-unchanged — the same fallback contract as #4926.
+argument used *only* to decide absolute-vs-relative; `curcwd` itself is still
+built from the **raw, quote-preserved** token, because `curcwd` is the only
+value threaded to the shell layer and the unresolved-`$` detector there
+(`mark_expandable_dollars`, #4921/#4927) needs the quote characters to tell a
+**literal** `$` inside a single-quoted span (`cd '$FOO'` — a directory really
+named `$FOO`, deliberately *not* denied) from an **expandable** one (bare or
+double-quoted, which fails closed). The shell layer re-strips quoting for its
+own cwd join, exactly mirroring the target side's raw-vs-`strip_target_quoting()`
+split. `qsplit()`'s verbatim-token contract (which `extract_rm_targets()` /
+`parse_force_ops()` depend on) is untouched, and an unbalanced/unterminated
+quote leaves the classification copy unchanged — the same fallback contract as
+#4926.
 
 The guard is **on by default**. It is resolved in this order (highest precedence first):
 

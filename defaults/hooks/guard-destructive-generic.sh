@@ -3296,31 +3296,54 @@ extract_write_targets() {
             if (toks[1] == "cd") {
                 if (m >= 2 && toks[2] != "" && toks[2] != "-") {
                     cdarg = expand_cd_arg(toks[2], home)   # #5315
-                    # Quote-aware absolute-path classification (#4933): qsplit()
-                    # preserves quote characters VERBATIM in toks[] (its
-                    # contract -- extract_rm_targets()/parse_force_ops() depend
-                    # on that raw form elsewhere in this file), so a quoted `cd`
-                    # argument fails the plain ^/ test below and this code used
-                    # to silently fall into the RELATIVE join branch,
-                    # fabricating curcwd as "<worktree>/<quoted-abs-path>"
-                    # instead of recognizing the argument as absolute. Strip a
-                    # leading/matching-trailing quote from a COPY (cdarg) used
-                    # ONLY for this classification test and for building
-                    # curcwd; toks[2] itself is never modified. An
-                    # unbalanced/unterminated quote (no matching trailing
-                    # quote character) leaves cdarg unchanged, so ambiguity can
-                    # only ever keep the existing verdict, never widen a deny
-                    # into an allow (same fallback contract as #4926).
+                    # Quote-aware absolute/relative CLASSIFICATION only
+                    # (#4933). qsplit() preserves quote characters VERBATIM in
+                    # toks[] (its contract -- extract_rm_targets()/
+                    # parse_force_ops() depend on that raw form elsewhere in
+                    # this file), so a single- or double-quoted ABSOLUTE `cd`
+                    # argument starts with a quote character rather than `/`,
+                    # fails the plain ^/ test below, and used to fall into the
+                    # RELATIVE join branch -- fabricating curcwd as
+                    # "<worktree>/<quoted-abs-path>", a location the write
+                    # never has. From a linked-worktree cwd that fabrication
+                    # walks straight back into the acting worktree own
+                    # .loom-managed sentinel and the write is silently ALLOWED,
+                    # i.e. the #4178 confinement check is defeated by simply
+                    # quoting the cd argument.
+                    #
+                    # The stripped value (cdclass) is used ONLY to CLASSIFY.
+                    # curcwd is still built from the RAW, quote-preserved cdarg
+                    # because curcwd is emitted verbatim as the shell layer
+                    # `_wcwd`, and the unresolved-`$` detector there
+                    # (mark_expandable_dollars, #4921/#4927) needs those quote
+                    # characters to tell a LITERAL `$` inside a single-quoted
+                    # span (a directory genuinely named $FOO, explicitly a
+                    # "deliberately NOT denied" case in the write-confinement
+                    # block below) from an EXPANDABLE one (bare or
+                    # double-quoted, which the guard cannot resolve and so
+                    # fails closed on). Stripping the
+                    # quotes here would make every `$` in the last cd segment
+                    # look expandable and would deny writes that are allowed
+                    # today. The shell layer re-strips quoting for its own
+                    # cwd join, mirroring the write-target side raw `_wtarget`
+                    # vs. stripped `_wclassify` split (strip_target_quoting(),
+                    # #4926).
+                    #
+                    # An unbalanced/unterminated quote (no matching trailing
+                    # quote character) leaves cdclass == cdarg, so ambiguity
+                    # can only ever keep the existing verdict, never widen a
+                    # deny into an allow (same fallback contract as #4926).
+                    cdclass = cdarg
                     cdq_sq = sprintf("%c", 39)   # single quote
                     cdq_dq = sprintf("%c", 34)   # double quote
-                    cdqc = substr(cdarg, 1, 1)
+                    cdqc = substr(cdclass, 1, 1)
                     if (cdqc == cdq_sq || cdqc == cdq_dq) {
-                        cdlen = length(cdarg)
-                        if (cdlen >= 2 && substr(cdarg, cdlen, 1) == cdqc) {
-                            cdarg = substr(cdarg, 2, cdlen - 2)
+                        cdlen = length(cdclass)
+                        if (cdlen >= 2 && substr(cdclass, cdlen, 1) == cdqc) {
+                            cdclass = substr(cdclass, 2, cdlen - 2)
                         }
                     }
-                    if (cdarg ~ /^\//) {
+                    if (cdclass ~ /^\//) {
                         curcwd = cdarg
                     } else if (curcwd != "") {
                         curcwd = curcwd "/" cdarg
@@ -3900,13 +3923,32 @@ if worktree_isolation_guard_enabled && \
         _wclassify="$_wtarget"
         strip_target_quoting "$_wtarget" && _wclassify="$_UNQUOTED_TARGET"
 
+        # Same split for the CWD half of the pair (#4933). A tracked
+        # `cd <dir>` argument reaches here with its quote characters intact
+        # too — extract_write_targets() deliberately builds curcwd from the
+        # RAW, quote-preserved token so the unresolved-`$` block ABOVE can
+        # still tell a literal single-quoted `$` from an expandable one
+        # (stripping the quotes in awk instead turned every `$` in the last
+        # `cd` segment into an "unresolvable" deny). By the time we get here
+        # that judgement is already made, so unquote a COPY for the join —
+        # otherwise a quoted absolute `cd` argument would be joined with its
+        # quote characters embedded and normalize to a path the write never
+        # has. Only touched when a quote character is actually present, so a
+        # quote-free cwd (every ordinary case) stays byte-identical; an
+        # unterminated quote falls back to the raw value, i.e. today's
+        # verdict, never widening a deny into an allow.
+        _wcwdclassify="$_wcwd"
+        if [[ "$_wcwd" == *"'"* || "$_wcwd" == *'"'* ]]; then
+            strip_target_quoting "$_wcwd" && _wcwdclassify="$_UNQUOTED_TARGET"
+        fi
+
         # Resolve to absolute; a relative target with no resolvable cwd is
         # ambiguous — skip it (allow on uncertainty, never deny on it).
         _wabs=""
         if [[ "$_wclassify" == /* ]]; then
             _wabs="$_wclassify"
-        elif [[ -n "$_wcwd" ]]; then
-            _wabs="$_wcwd/$_wclassify"
+        elif [[ -n "$_wcwdclassify" ]]; then
+            _wabs="$_wcwdclassify/$_wclassify"
         else
             continue
         fi

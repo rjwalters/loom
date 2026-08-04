@@ -3844,6 +3844,41 @@ assert_allow "write-confinement (#4933): CWD=linked worktree, cd double-quoted /
 assert_allow "write-confinement (#4933): CWD=linked worktree, unbalanced leading single-quote in cd argument keeps today's allow" \
     "cd '$WT_REPO_LINKED && echo x > defaults/hooks/f.sh" "$WT_LINKED_DIR"
 
+# Quote CONTEXT must survive into the shell layer (#4933 review regression
+# guard). The awk `cd` handler classifies on a quote-STRIPPED copy but must
+# keep building `curcwd` from the RAW, quote-preserved token, because `curcwd`
+# is the only value threaded to the shell layer as `_wcwd` and the
+# unresolved-`$` detector there (mark_expandable_dollars, #4921/#4927) needs
+# the quote characters to tell a LITERAL `$` inside a single-quoted span from
+# an EXPANDABLE one. An earlier iteration of this fix stripped the quotes
+# BEFORE building curcwd, which made every `$` in the last `cd` segment look
+# expandable and turned these single-quoted-literal cases into false denies.
+#
+# `cd '$FOO' && <relative write>` -- the shell never expands a single-quoted
+# `$`, so this really is a cwd-relative directory named `$FOO` inside the
+# acting worktree: ALLOW (the same "deliberately NOT denied" carve-out the
+# #4926 literal-'$X'-filename fixtures above pin for the target side).
+assert_allow "write-confinement (#4933): CWD=linked worktree, cd single-quoted literal '\$FOO' && relative write allows (literal \$, not an expansion)" \
+    "cd '\$FOO' && echo x > defaults/hooks/f.sh" "$WT_LINKED_DIR"
+assert_allow "write-confinement (#4933): CWD=linked worktree, cd backslash-escaped literal \\\$FOO && relative write allows (literal \$, not an expansion)" \
+    "cd \\\$FOO && echo x > defaults/hooks/f.sh" "$WT_LINKED_DIR"
+assert_allow "write-confinement (#4933): CWD=linked worktree, cd single-quoted literal '\$FOO' && relative tee write allows" \
+    "cd '\$FOO' && echo x | tee defaults/hooks/f.sh" "$WT_LINKED_DIR"
+
+# ...and the EXPANDABLE counterparts are unchanged: a bare or double-quoted
+# `$` in the tracked `cd` argument is a cwd this guard cannot resolve, so the
+# relative write that follows still fails CLOSED (#4921/#4927). These pin that
+# the regression fix above does not widen the unresolved-`$` deny into an
+# allow.
+assert_deny "write-confinement (#4933): CWD=linked worktree, cd double-quoted expandable \"\$MAIN\" && relative write still denies" \
+    "cd \"\$MAIN\" && echo x > defaults/hooks/f.sh" "$WT_LINKED_DIR"
+assert_deny "write-confinement (#4933): CWD=linked worktree, cd bare expandable \$MAIN && relative write still denies" \
+    "cd \$MAIN && echo x > defaults/hooks/f.sh" "$WT_LINKED_DIR"
+assert_deny "write-confinement (#4933): CWD=linked worktree, cd \${MAIN} brace-expandable && relative write still denies" \
+    "cd \${MAIN} && echo x > defaults/hooks/f.sh" "$WT_LINKED_DIR"
+assert_deny "write-confinement (#4933): CWD=linked worktree, cd double-quoted expandable \"\$MAIN\" && relative tee write still denies" \
+    "cd \"\$MAIN\" && echo x | tee defaults/hooks/f.sh" "$WT_LINKED_DIR"
+
 rm -rf "$HOME_FIXTURE_OUTSIDE"
 rm -rf "$WT_REPO" "$WT_REPO_NOWT" "$WT_REPO_OFF" "$WT_REPO_LINKED"
 
