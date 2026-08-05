@@ -32,6 +32,7 @@ use loom_daemon::sweep_registry::{self, SweepRegistry, SweepRegistryConfig};
 use loom_daemon::terminal::TerminalManager;
 use loom_daemon::token_ranking_refresh;
 use loom_daemon::watch_registry;
+use loom_daemon::watchdog_provisioning_guard;
 use loom_daemon::work_finder;
 use loom_daemon::workspace_pool::WorkspacePool;
 use loom_daemon::worktree_reaper;
@@ -1211,6 +1212,38 @@ pub(crate) async fn run_daemon() -> Result<()> {
              skipping marker healing for this run (#4331)"
         ),
     }
+
+    // Watchdog-provisioning-guard loop (Issue #5405): #5343's
+    // heal_watchdog_provisioning_gap() only fires as a side effect of
+    // RE-RUNNING loom-daemon-start.sh — a host that was provisioned before
+    // #5343 and simply keeps running forever never gets healed, because
+    // nothing host-resident ever notices the gap. This periodic loop is that
+    // host-resident notice: every interval it re-invokes
+    // `loom-daemon-start.sh --heal-watchdog-only` (a narrow entry point that
+    // performs ONLY the watchdog heal and can never reach the daemon-start
+    // path, so it can never disturb this running daemon), which is a cheap
+    // no-op on any host that already has a marker+watchdog pair and a pure
+    // filesystem read on any host with no autonomy-desired marker at all.
+    // Default-on like the marker healing above (crash-protection class, not
+    // a FLAGS-OFF dispatch-affecting loop) — opt out with
+    // LOOM_WATCHDOG_PROVISIONING_GUARD=0 or
+    // autonomous.watchdogProvisioningGuard.enabled=false.
+    let watchdog_guard_config = watchdog_provisioning_guard::read_config(&sweep_workspace);
+    let _watchdog_provisioning_guard_handle =
+        if watchdog_provisioning_guard::resolve_enabled(&watchdog_guard_config) {
+            let interval = watchdog_provisioning_guard::resolve_interval(&watchdog_guard_config);
+            Some(watchdog_provisioning_guard::spawn_watchdog_provisioning_guard_task(
+                sweep_workspace.clone(),
+                interval,
+                watchdog_provisioning_guard::default_heal_timeout(),
+            ))
+        } else {
+            log::debug!(
+                "watchdog_provisioning_guard: disabled (set LOOM_WATCHDOG_PROVISIONING_GUARD=0 or \
+                 autonomous.watchdogProvisioningGuard.enabled=false to opt out) (#5405)"
+            );
+            None
+        };
 
     // Autonomous periodic support-role runner (Issue #4015): dispatches the
     // standalone support roles (Champion, Curator, Judge, Auditor, Guide)

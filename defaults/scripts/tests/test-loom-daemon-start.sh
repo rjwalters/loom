@@ -1923,6 +1923,178 @@ fi
 kill "$HEAL4_SLEEP_PID" 2>/dev/null || true
 rm -rf "$HEAL4_REPO"
 
+# ---------- --heal-watchdog-only: periodic host-resident re-provisioning (#5405) ----------
+# #5343's heal_watchdog_provisioning_gap() only ever fires as a SIDE EFFECT of
+# re-running this script (an operator by hand, `fleet add-worker`, or the
+# already-running-guard exercised by H1-H4 above) -- a host that was
+# provisioned pre-#5343 and simply keeps running forever never gets healed.
+# --heal-watchdog-only is the narrow standalone entry point a host-resident
+# periodic caller (the daemon's own watchdog_provisioning_guard loop) can
+# invoke safely and repeatedly. Unlike H1-H4, these fixtures deliberately do
+# NOT fabricate an "already running" PID file -- the whole point of this flag
+# is to work independent of that state -- and assert the daemon-start path
+# (binary invocation, PID file creation) is never reached.
+
+# H5. Marker present + watchdog NOT yet provisioned + NO pid file at all (the
+#     already-running guard's branch is never even reached) -> still
+#     provisions the watchdog, and never invokes the daemon binary or writes
+#     a PID file.
+HEAL5_REPO="$(mktemp -d)"
+mkdir -p "$HEAL5_REPO/.loom/scripts/cli" "$HEAL5_REPO/.loom/logs"
+cp "$SCRIPT_DIR/../cli/loom-daemon-watchdog.sh" "$HEAL5_REPO/.loom/scripts/cli/loom-daemon-watchdog.sh"
+HEAL5_HOME="$(mktemp -d)"; mkdir -p "$HEAL5_HOME/.loom/logs"
+HEAL5_LOG="$WORKDIR/heal5-sd.log"; : > "$HEAL5_LOG"
+HEAL5_BIN_LOG="$WORKDIR/heal5-bin.log"; : > "$HEAL5_BIN_LOG"
+make_sd_stub "$HEAL5_LOG" "0"
+cat > "$HEAL5_REPO/.loom/autonomy-desired" <<MARKER
+started_at=2026-01-01T00:00:00Z
+use_launchd=false
+use_systemd=true
+systemd_unit=$HEAL_UNIT
+MARKER
+heal5_out=$( cd "$HEAL5_REPO" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
+    PATH="$SD_BIN:$PATH" HOME="$HEAL5_HOME" \
+    LOOM_SYSTEMD_FORCE=1 LOOM_SYSTEMD_UNIT="$HEAL_UNIT" \
+    LOOM_DAEMON_BIN="$FAKE_BIN" \
+    LOOM_SOCKET_PATH="$HEAL5_REPO/.loom/loom-daemon.sock" \
+    LOOM_AUTONOMY_MARKER="$HEAL5_REPO/.loom/autonomy-desired" \
+    bash "$START_SCRIPT" --no-launchd --heal-watchdog-only 2>&1 )
+heal5_rc=$?
+assert_eq "0" "$heal5_rc" "--heal-watchdog-only (#5405): exits 0 with no PID file present at all"
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q -- "--user enable --now $HEAL_TIMER" "$HEAL5_LOG"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} --heal-watchdog-only (#5405): provisions the watchdog even though the already-running guard is never reached"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} --heal-watchdog-only (#5405): provisions the watchdog even though the already-running guard is never reached"
+    echo "  output: $heal5_out"
+    echo "  systemctl calls: $(cat "$HEAL5_LOG")"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ ! -f "$HEAL5_REPO/.loom/.daemon.pid" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} --heal-watchdog-only (#5405): never writes a PID file (never attempts to start a daemon, AC2)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} --heal-watchdog-only (#5405): never writes a PID file (never attempts to start a daemon, AC2)"
+fi
+rm -rf "$HEAL5_REPO" "$HEAL5_HOME"
+
+# H6. Idempotent: two back-to-back passes both exit 0 and stay a harmless
+#     no-op once provisioned (mirrors H2's guarantee for the guard-triggered
+#     path, extended to the standalone flag).
+HEAL6_REPO="$(mktemp -d)"
+mkdir -p "$HEAL6_REPO/.loom/scripts/cli" "$HEAL6_REPO/.loom/logs"
+cp "$SCRIPT_DIR/../cli/loom-daemon-watchdog.sh" "$HEAL6_REPO/.loom/scripts/cli/loom-daemon-watchdog.sh"
+HEAL6_HOME="$(mktemp -d)"; mkdir -p "$HEAL6_HOME/.loom/logs"
+HEAL6_LOG="$WORKDIR/heal6-sd.log"; : > "$HEAL6_LOG"
+make_sd_stub "$HEAL6_LOG" "0"
+cat > "$HEAL6_REPO/.loom/autonomy-desired" <<MARKER
+started_at=2026-01-01T00:00:00Z
+use_launchd=false
+use_systemd=true
+systemd_unit=$HEAL_UNIT
+MARKER
+heal6_rc=1
+for _heal6_pass in 1 2; do
+    heal6_out=$( cd "$HEAL6_REPO" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
+        PATH="$SD_BIN:$PATH" HOME="$HEAL6_HOME" \
+        LOOM_SYSTEMD_FORCE=1 LOOM_SYSTEMD_UNIT="$HEAL_UNIT" \
+        LOOM_DAEMON_BIN="$FAKE_BIN" \
+        LOOM_SOCKET_PATH="$HEAL6_REPO/.loom/loom-daemon.sock" \
+        LOOM_AUTONOMY_MARKER="$HEAL6_REPO/.loom/autonomy-desired" \
+        bash "$START_SCRIPT" --no-launchd --heal-watchdog-only 2>&1 )
+    heal6_rc=$?
+done
+unset _heal6_pass
+assert_eq "0" "$heal6_rc" "--heal-watchdog-only (#5405): repeated invocations against an already-provisioned watchdog stay exit 0 (idempotent)"
+[[ "$heal6_rc" == "0" ]] || echo "  output (last pass): $heal6_out"
+rm -rf "$HEAL6_REPO" "$HEAL6_HOME"
+
+# H7. Marker ABSENT -> --heal-watchdog-only is a pure no-op (zero systemctl
+#     calls), exits 0.
+HEAL7_REPO="$(mktemp -d)"
+mkdir -p "$HEAL7_REPO/.loom/scripts/cli" "$HEAL7_REPO/.loom/logs"
+cp "$SCRIPT_DIR/../cli/loom-daemon-watchdog.sh" "$HEAL7_REPO/.loom/scripts/cli/loom-daemon-watchdog.sh"
+HEAL7_HOME="$(mktemp -d)"; mkdir -p "$HEAL7_HOME/.loom/logs"
+HEAL7_LOG="$WORKDIR/heal7-sd.log"; : > "$HEAL7_LOG"
+make_sd_stub "$HEAL7_LOG" "0"
+# Deliberately NO autonomy-desired marker written at $HEAL7_REPO/.loom/autonomy-desired.
+heal7_out=$( cd "$HEAL7_REPO" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
+    PATH="$SD_BIN:$PATH" HOME="$HEAL7_HOME" \
+    LOOM_SYSTEMD_FORCE=1 LOOM_SYSTEMD_UNIT="$HEAL_UNIT" \
+    LOOM_DAEMON_BIN="$FAKE_BIN" \
+    LOOM_SOCKET_PATH="$HEAL7_REPO/.loom/loom-daemon.sock" \
+    LOOM_AUTONOMY_MARKER="$HEAL7_REPO/.loom/autonomy-desired" \
+    bash "$START_SCRIPT" --no-launchd --heal-watchdog-only 2>&1 )
+heal7_rc=$?
+assert_eq "0" "$heal7_rc" "--heal-watchdog-only (#5405): marker absent -> exits 0"
+[[ "$heal7_rc" == "0" ]] || echo "  output: $heal7_out"
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ ! -s "$HEAL7_LOG" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} --heal-watchdog-only (#5405): marker absent -> no provisioning attempt (zero systemctl calls)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} --heal-watchdog-only (#5405): marker absent -> no provisioning attempt"
+    echo "  systemctl calls: $(cat "$HEAL7_LOG")"
+fi
+rm -rf "$HEAL7_REPO" "$HEAL7_HOME"
+
+# H8. Regression guard for the "skip the daemon-binary lookup" behavior: an
+#     unresolvable $DAEMON_BIN (no LOOM_DAEMON_BIN, nothing named
+#     `loom-daemon` on PATH, no build-output-relative candidate under this
+#     fixture's repo root) must NOT turn into the "binary not found" exit 1 --
+#     --heal-watchdog-only never needs a daemon binary at all.
+HEAL8_REPO="$(mktemp -d)"
+mkdir -p "$HEAL8_REPO/.loom/scripts/cli" "$HEAL8_REPO/.loom/logs"
+cp "$SCRIPT_DIR/../cli/loom-daemon-watchdog.sh" "$HEAL8_REPO/.loom/scripts/cli/loom-daemon-watchdog.sh"
+HEAL8_HOME="$(mktemp -d)"; mkdir -p "$HEAL8_HOME/.loom/logs"
+HEAL8_LOG="$WORKDIR/heal8-sd.log"; : > "$HEAL8_LOG"
+make_sd_stub "$HEAL8_LOG" "0"
+cat > "$HEAL8_REPO/.loom/autonomy-desired" <<MARKER
+started_at=2026-01-01T00:00:00Z
+use_launchd=false
+use_systemd=true
+systemd_unit=$HEAL_UNIT
+MARKER
+# A curated PATH (never a bare -i env wipe, and never the real $PATH
+# unmodified): keeps enough of the toolchain (a modern bash, coreutils) for
+# the script itself to run, while excluding every directory a `loom-daemon`
+# binary could plausibly be resolved from (an operator's real
+# $HOME/.local/bin, this repo's own build output, etc.) -- deliberately does
+# NOT include $HEAL8_HOME/.local/bin (never created) or $PWD/target/*.
+HEAL8_PATH="$SD_BIN:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+heal8_out=$( cd "$HEAL8_REPO" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE -u LOOM_DAEMON_BIN -u LOOM_PREFER_REPO_BUILD -u LOOM_DAEMON_BIN_DIR \
+    HOME="$HEAL8_HOME" \
+    PATH="$HEAL8_PATH" \
+    LOOM_SYSTEMD_FORCE=1 LOOM_SYSTEMD_UNIT="$HEAL_UNIT" \
+    LOOM_SOCKET_PATH="$HEAL8_REPO/.loom/loom-daemon.sock" \
+    LOOM_AUTONOMY_MARKER="$HEAL8_REPO/.loom/autonomy-desired" \
+    bash "$START_SCRIPT" --no-launchd --heal-watchdog-only 2>&1 )
+heal8_rc=$?
+assert_eq "0" "$heal8_rc" "--heal-watchdog-only (#5405): an unresolvable daemon binary is never fatal"
+TESTS_RUN=$((TESTS_RUN + 1))
+if ! echo "$heal8_out" | grep -qi 'binary not found'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} --heal-watchdog-only (#5405): skips the daemon-binary lookup entirely"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} --heal-watchdog-only (#5405): skips the daemon-binary lookup entirely"
+    echo "  output: $heal8_out"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q -- "--user enable --now $HEAL_TIMER" "$HEAL8_LOG"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} --heal-watchdog-only (#5405): still provisions the watchdog with no resolvable daemon binary"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} --heal-watchdog-only (#5405): still provisions the watchdog with no resolvable daemon binary"
+    echo "  systemctl calls: $(cat "$HEAL8_LOG")"
+fi
+rm -rf "$HEAL8_REPO" "$HEAL8_HOME"
+
 # ============================================================
 # Live daemon state guard (#5179, adopted here per #5191): every live `.loom`
 # state path reachable from the ambient environment (the real $HOME/.loom, the
