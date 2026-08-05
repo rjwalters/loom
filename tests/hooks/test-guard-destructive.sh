@@ -2027,6 +2027,40 @@ assert_ask_env "forceScope protected (#5315): 'cd ~' (HOME=main root) then reset
 assert_ask_env "forceScope protected (#5315): 'cd '\''~/.loom/worktrees/issue-1'\''' (quoted tilde stays literal) still asks (ambiguous)" \
     "HOME=$FORCE_CD_REPO" "cd '~/.loom/worktrees/issue-1' && git reset --hard origin/feature/issue-1" "$FORCE_CD_REPO"
 
+# #5372: parse_force_ops()'s `cd`-argument classification now reuses
+# strip_cd_quoting() (#5363), mirroring extract_write_targets(). A FULLY
+# quoted absolute `cd` argument ('<worktree>' / "<worktree>") starts with a
+# quote character rather than `/`, so the pre-#5372 naive `~ /^\//` test
+# misclassified it RELATIVE and joined it onto curcwd (`<main-root>/'<wt>'`,
+# a nonexistent path) instead of recognizing it as absolute -- headcpath
+# resolved to an unresolvable directory and the guard fell back to ASK
+# (fail-closed, never a bypass -- this feeds the ask-gate, not
+# write-confinement). Post-fix it correctly resolves to the worktree's own
+# checked-out branch -> ALLOW.
+for _q5372 in "'" '"'; do
+    assert_allow "forceScope protected (#5372): cd ${_q5372}-quoted worktree path && reset --hard own branch allows (hook cwd=main root)" \
+        "cd ${_q5372}$FORCE_CD_WT${_q5372} && git reset --hard origin/feature/issue-1" "$FORCE_CD_REPO"
+done
+unset _q5372
+
+# PARTIALLY quoted absolute `cd` argument -- the quote closes MID-TOKEN
+# (e.g. '<parent>'/issue-1) -- is also now classified ABSOLUTE (mirrors the
+# extract_write_targets() partial-quote fixture, #5363 probe A).
+assert_allow "forceScope protected (#5372): cd PARTIALLY-quoted worktree path && reset --hard own branch allows (hook cwd=main root)" \
+    "cd '$FORCE_CD_REPO/.loom/worktrees'/issue-1 && git reset --hard origin/feature/issue-1" "$FORCE_CD_REPO"
+
+# Control: an unbalanced/unterminated quote keeps today's verdict (ASK) --
+# strip_cd_quoting()'s fallback contract never widens ambiguity into an
+# allow.
+assert_ask "forceScope protected (#5372): unbalanced leading single-quote in cd argument keeps today's ask" \
+    "cd '$FORCE_CD_WT && git reset --hard origin/feature/issue-1" "$FORCE_CD_REPO"
+
+# Control: cd-ing (quoted) BACK into the main (protected-branch) root and
+# hard-resetting there must still ASK -- the fix must never widen an allow
+# past a genuine protected-branch target.
+assert_ask "forceScope protected (#5372): cd quoted main root then reset --hard still asks (hook cwd=worktree)" \
+    "cd '$FORCE_CD_REPO' && git reset --hard HEAD~1" "$FORCE_CD_WT"
+
 rm -rf "$FORCE_CD_REPO"
 
 # Clean up force-scope temp repos.
@@ -4564,6 +4598,39 @@ assert_ask_env "stash-scope (#5315): 'cd ~ && git stash pop' (HOME=main root) st
 # -> ASK (fail-closed), never silently allowed.
 assert_ask_env "stash-scope (#5315): 'cd '\''~/.loom/worktrees/issue-1'\''' (quoted tilde stays literal) still asks (ambiguous)" \
     "HOME=$CD_ST_REPO" "cd '~/.loom/worktrees/issue-1' && git stash pop" "$CD_ST_REPO"
+
+# #5372: resolve_stash_cwd()'s `cd`-argument classification now reuses
+# strip_cd_quoting() (#5363), mirroring extract_write_targets() and
+# parse_force_ops() (above). A FULLY quoted absolute `cd` argument
+# ('<worktree>' / "<worktree>") starts with a quote character rather than
+# `/`, so the pre-#5372 naive `~ /^\//` test misclassified it RELATIVE and
+# joined it onto curcwd instead of recognizing it as absolute -- the
+# resolved toplevel could not be found and the guard fell back to ASK
+# (fail-closed, never a bypass). Post-fix it correctly resolves into the
+# worktree -> ALLOW.
+for _q5372 in "'" '"'; do
+    assert_allow "stash-scope (#5372): cd ${_q5372}-quoted worktree path then stash pop allows (hook cwd=main root)" \
+        "cd ${_q5372}$CD_ST_WT_DIR${_q5372} && git stash pop" "$CD_ST_REPO"
+done
+unset _q5372
+
+# PARTIALLY quoted absolute `cd` argument -- the quote closes MID-TOKEN
+# (e.g. '<parent>'/issue-1) -- is also now classified ABSOLUTE (mirrors the
+# extract_write_targets() partial-quote fixture, #5363 probe A).
+assert_allow "stash-scope (#5372): cd PARTIALLY-quoted worktree path then stash pop allows (hook cwd=main root)" \
+    "cd '$CD_ST_REPO/.loom/worktrees'/issue-1 && git stash pop" "$CD_ST_REPO"
+
+# Control: an unbalanced/unterminated quote keeps today's verdict (ASK, with
+# the ambiguous-resolution reason) -- strip_cd_quoting()'s fallback contract
+# never widens ambiguity into an allow.
+assert_ask_reason_matches "stash-scope (#5372): unbalanced leading single-quote in cd argument keeps today's ask" \
+    "cd '$CD_ST_WT_DIR && git stash pop" "could not be resolved" "$CD_ST_REPO"
+
+# Control: cd-ing (quoted) BACK into the main (protected) checkout root must
+# still ASK citing the main-checkout reason -- the fix must never widen an
+# allow past a genuine main-checkout stash restore.
+assert_ask_reason_matches "stash-scope (#5372): cd quoted main root then stash pop still asks (hook cwd=worktree)" \
+    "cd '$CD_ST_REPO' && git stash pop" "MAIN checkout" "$CD_ST_WT_DIR"
 
 rm -rf "$CD_ST_REPO"
 
