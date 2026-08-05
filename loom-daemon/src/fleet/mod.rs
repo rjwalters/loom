@@ -9,8 +9,10 @@
 //!
 //! `loom-daemon fleet add-worker <ssh-host> --repo <workspace-repo>` takes a
 //! reachable, already-provisioned Ubuntu host (an SSH alias from `repo:remote`
-//! or operator-supplied) to "daemon running, workspace registered, tokens
-//! ranked, dispatch verified" in one command. Generic VM provisioning stays in
+//! or operator-supplied — Linux-only, and **enforced** since #5395: a
+//! `uname -s` probe refuses a non-Linux target before the plan is built) to
+//! "daemon running, workspace registered, tokens ranked, dispatch verified" in
+//! one command. Generic VM provisioning stays in
 //! `repo:remote` (rjwalters/repo) per the epic's boundary decision — this
 //! command consumes "a reachable box + an SSH alias", it never wrangles a cloud
 //! CLI.
