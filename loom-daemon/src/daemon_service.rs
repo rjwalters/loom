@@ -416,6 +416,48 @@ pub(crate) async fn run_daemon() -> Result<()> {
     }
     let credential_preflight = github_app_preflight.report;
 
+    // Cross-owner managed-repo warning (#5401). The GitHub App mechanism
+    // above mints exactly ONE installation token, keyed on this daemon's
+    // *workspace root* owner (`github_app_owner_repo`) — every managed repo
+    // whose owner differs is unreachable for private data under that same
+    // token (public reads still succeed, which is what makes a wrong-owner
+    // config look uniformly healthy — see #5401's evidence). Minting a
+    // separate per-owner credential is a larger structural change (tracked
+    // separately); this is the lower-effort fallback from #5401's acceptance
+    // criteria — a loud, once-at-startup warning naming every affected repo,
+    // rather than a silent per-tick 404 buried in reconciliation/work-finder
+    // logs. Only meaningful when the App mechanism is actually the active
+    // credential this run (`minted_gh_token.is_some()`) — an ambient `gh`
+    // auth / PAT host is not subject to this single-installation limit.
+    if let (Some(root_owner_repo), true) =
+        (&github_app_owner_repo, github_app_preflight.minted_gh_token.is_some())
+    {
+        let cross_owner_registry =
+            loom_daemon::workspace_registry::WorkspaceRegistry::load_default().unwrap_or_default();
+        let other_managed_owner_repos: Vec<String> = cross_owner_registry
+            .effective_roots(&sweep_workspace)
+            .into_iter()
+            .filter(|root| root != &sweep_workspace)
+            .filter_map(|root| credential_preflight::nwo_from_git_remote(&root))
+            .collect();
+        let cross_owner_repos = credential_preflight::detect_cross_owner_repos(
+            root_owner_repo,
+            &other_managed_owner_repos,
+        );
+        if !cross_owner_repos.is_empty() {
+            log::warn!(
+                "credential_preflight: {} managed repo(s) belong to a GitHub owner other than \
+                 this daemon's workspace root ({root_owner_repo}) — {cross_owner_repos:?}. The \
+                 single GitHub App installation token this daemon mints is scoped to \
+                 {root_owner_repo}'s installation and CANNOT read/write private data in those \
+                 repos; public reads may still appear to work while writes and private reads \
+                 silently 404. No single-token configuration can serve repos across multiple \
+                 owners today — see #5401.",
+                cross_owner_repos.len()
+            );
+        }
+    }
+
     // #4430: keep the minted installation token fresh across its ~1h
     // lifetime for a long-running daemon. Ticks that don't rotate the token
     // never *write* anything: the `NotConfigured` arm is a true no-op, and a
