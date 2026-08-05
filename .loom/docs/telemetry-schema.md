@@ -306,13 +306,41 @@ probe stays absent rather than being coerced to a fake zero (the daemon's
   "logical_cpus": 28,
   "cpu_idle_fraction": 0.83,
   "load_per_core": 0.51,
-  "worktree_root_free_gb": 200
+  "worktree_root_free_gb": 200,
+  "worktree_root_total_gb": 1000
 }
 ```
 
-`cpu_idle_fraction`, `load_per_core`, and `worktree_root_free_gb` are omitted when
-unmeasurable. A consumer MUST treat an absent measurement as "unknown", never as
-zero/full.
+`cpu_idle_fraction`, `load_per_core`, `worktree_root_free_gb`, and
+`worktree_root_total_gb` are omitted when unmeasurable. A consumer MUST treat an
+absent measurement as "unknown", never as zero/full.
+
+**`worktree_root_total_gb` (Issue #5356).** Total capacity (GB) of the
+worktree-root scratch volume — the denominator `worktree_root_free_gb` needs to
+become a percentage, which is comparable across a heterogeneous fleet in a way an
+absolute free-GB figure is not (40 GB free means something very different on a
+128 GB worker than on a 2 TB studio box). Sourced from the same `df -Pk` sample as
+`worktree_root_free_gb` (`disk_headroom.rs`'s `worktree_root_disk_gb`, one probe
+for both columns rather than two separate subprocess spawns).
+
+Follows the **exact same "unknown != zero" contract** `worktree_root_free_gb`
+already established: omitted, never a fabricated `0`, when the probe cannot
+measure it. This can happen independently of the free-space reading, so a record
+may legitimately carry `worktree_root_free_gb` with no `worktree_root_total_gb` —
+a consumer that sees this shape MUST render the free reading in GB only and MUST
+NOT compute a percentage against a fabricated denominator. This is also exactly
+the shape a record from a pre-#5356 daemon has (the field did not exist yet), so
+the same rendering rule keeps old and new "no total" records indistinguishable —
+neither is an error.
+
+This field is purely additive — a `schema_version` bump is unnecessary (see
+"`schema_version` semantics" above: only a **breaking** wire change requires one),
+and passes through public redaction unchanged for the same reason
+`worktree_root_free_gb` does (`dashboard/src/redaction.ts`): total disk capacity
+describes the machine, not any repo, issue, branch, or operator. It is a mild
+fingerprinting signal for a named host — reviewed and deliberately allowed
+through, since free-GB is already public and this is only the denominator that
+turns it into a percentage.
 
 **Binary identity (`build_commit` / `built_at`, #4956).** `daemon_version` is
 `CARGO_PKG_VERSION`, so it only moves once per release: every build between two
@@ -335,6 +363,31 @@ Both fields are additive and pass through public redaction unchanged (they
 describe the released binary, not any repo or operator — see
 `dashboard/src/redaction.ts`), so an older consumer that ignores unknown keys is
 unaffected.
+
+**Watchdog/crash-protection state (`protection`, #5352).** An optional object
+carrying this host's watchdog/crash-protection classification — the same
+verdict `loom-daemon status`'s own `Protection:` line and `--json`'s
+`protection` object already compute
+(`daemon_install_state::probe_protection`), reused rather than re-derived so
+the two surfaces can never disagree:
+
+```json
+{ "state": "watchdog-not-provisioned", "watchdog_provisioned": false }
+```
+
+- `state` — one of `"protected"`, `"no-marker"` (crash protection disarmed —
+  no autonomy-desired marker), `"watchdog-not-provisioned"` (marker present,
+  but nothing is scheduled to detect a future daemon death), or `"unknown"`
+  (the probe ran but could not answer the provisioning check itself — no
+  `launchctl`/`systemctl`, or an unreachable `systemctl --user` bus).
+- `watchdog_provisioned` — whether the watchdog job/timer was found
+  provisioned, omitted when `state` is `"unknown"`.
+
+The whole `protection` object is **omitted** on a record from a pre-#5352
+daemon, or when the host-local probe could not construct a report at all — a
+consumer MUST treat that absence as "not reported", never as "unprotected":
+synthesizing a false negative from a missing field would be worse than no
+signal at all.
 
 ## Persistence & read surface (`sweep.outcome`, Issue #4704)
 
