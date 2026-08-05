@@ -79,6 +79,20 @@ If you want the machine-level end state (no per-repo copies at all), run
 `loom migrate` (Phase 6 / #4254) — it untracks the legacy copies, after which
 `ensure_project_hook_wiring` stops writing project entries on its own.
 
+### Backup retention (#5387)
+
+Both `provision_loom_hooks()` and `deprovision_loom_hooks()` back up the
+operator's `~/.claude/settings.json` to a timestamped
+`settings.json.loom-backup-<UTC timestamp>` sibling before mutating it, via a
+shared `_phook_backup_settings()` helper in `scripts/install/provision-hooks.sh`.
+That helper guards against unbounded accumulation two ways: it **skips**
+writing a new backup when the file is byte-identical to the most recent
+existing backup (so repeated `install.sh` runs with no settings change add
+nothing), and it **prunes** older backups beyond the most recent 5 once a
+genuinely new backup is written (so settings that do change between installs
+still bound the total count). Nothing else in the repo prunes these files, so
+restoring from one is a manual `cp settings.json.loom-backup-<ts> settings.json`.
+
 ### Config tiers
 
 The guard toggles below are documented against `.loom/config.json` for historical

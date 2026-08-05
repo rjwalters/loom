@@ -90,6 +90,64 @@
 _phook_ok()   { echo "  [loom-hooks] $*"; }
 _phook_warn() { echo "  [loom-hooks] WARNING: $*" >&2; }
 
+# Retention bound for settings.json.loom-backup-* files (#5387) — nothing
+# pruned these before, so a machine that runs `install.sh` repeatedly (six
+# times in one reported session) accumulated one near-identical backup per
+# run with no bound. Keep only the most recent N.
+_PHOOK_BACKUP_RETENTION=5
+
+# _phook_backup_settings <settings_file>
+#
+# Back up <settings_file> to a timestamped sibling
+# (`<settings_file>.loom-backup-<UTC timestamp>`) before a caller mutates it,
+# shared by both provision_loom_hooks() and deprovision_loom_hooks() (#5387).
+# Two guards against unbounded accumulation:
+#   1. Dedup: if the most recent existing `*.loom-backup-*` file (found by
+#      lexical sort — the `%Y%m%dT%H%M%SZ` timestamp format sorts
+#      chronologically as a string) is byte-identical to <settings_file>,
+#      skip writing a new backup and reuse it. Covers the common case:
+#      repeated installs with no settings change between them.
+#   2. Bounded retention: after writing a genuinely new backup, prune older
+#      ones beyond the most recent $_PHOOK_BACKUP_RETENTION. Covers settings
+#      that DO change between installs, where dedup alone never skips.
+#
+# Prints the path of the backup that now represents <settings_file>'s
+# pre-mutation content (newly written, or reused) on stdout.
+#   Returns 0 — a NEW backup was written.
+#   Returns 2 — SKIPPED: identical to the most recent existing backup.
+#   Returns 1 — hard failure (cp failed); nothing printed. Callers decide
+#     whether that is fatal (provision refuses to mutate; deprovision is
+#     best-effort and proceeds regardless).
+_phook_backup_settings() {
+    local settings="$1"
+    local dir base latest
+    dir="$(dirname "$settings")"
+    base="$(basename "$settings")"
+    latest="$(find "$dir" -maxdepth 1 -name "${base}.loom-backup-*" 2>/dev/null | sort | tail -1)"
+
+    if [[ -n "$latest" ]] && cmp -s "$settings" "$latest" 2>/dev/null; then
+        printf '%s' "$latest"
+        return 2
+    fi
+
+    local backup
+    backup="${settings}.loom-backup-$(date -u +%Y%m%dT%H%M%SZ)"
+    cp "$settings" "$backup" 2>/dev/null || return 1
+
+    # Prune older backups beyond the retention bound (oldest first — the
+    # timestamp format sorts lexically in chronological order).
+    local total excess
+    total="$(find "$dir" -maxdepth 1 -name "${base}.loom-backup-*" 2>/dev/null | wc -l | tr -d ' ')"
+    excess=$((total - _PHOOK_BACKUP_RETENTION))
+    if [[ "$excess" -gt 0 ]]; then
+        find "$dir" -maxdepth 1 -name "${base}.loom-backup-*" 2>/dev/null | sort | head -n "$excess" \
+            | while IFS= read -r old; do rm -f "$old" 2>/dev/null; done
+    fi
+
+    printf '%s' "$backup"
+    return 0
+}
+
 # Set on every return (success or soft-failure) so the caller can VERIFY what was
 # written rather than trust a success message (the #4053 "expose enough for the
 # caller to verify" contract, matching provision-dispatcher.sh's
@@ -182,14 +240,21 @@ provision_loom_hooks() {
     fi
 
     # Back up before the first mutation (only when there is existing content to
-    # preserve). Timestamped so repeated runs never clobber an earlier backup.
+    # preserve). Deduped against the most recent existing backup and bounded to
+    # the most recent N via _phook_backup_settings (#5387) — repeated runs with
+    # no settings change no longer add a new timestamped file each time.
     if [[ -s "$settings" ]]; then
-        local backup
-        backup="${settings}.loom-backup-$(date -u +%Y%m%dT%H%M%SZ)"
-        if cp "$settings" "$backup" 2>/dev/null; then
+        local backup backup_rc
+        backup="$(_phook_backup_settings "$settings")"
+        backup_rc=$?
+        if [[ "$backup_rc" -eq 0 ]]; then
             # shellcheck disable=SC2034
             PROVISIONED_HOOKS_BACKUP="$backup"
             _phook_ok "backed up existing settings -> $(basename "$backup")"
+        elif [[ "$backup_rc" -eq 2 ]]; then
+            # shellcheck disable=SC2034
+            PROVISIONED_HOOKS_BACKUP="$backup"
+            _phook_ok "settings unchanged since last backup ($(basename "$backup")); skipping duplicate backup"
         else
             _phook_warn "could not back up $settings; refusing to mutate it."
             return 1
@@ -423,9 +488,14 @@ deprovision_loom_hooks() {
         return 0
     fi
 
-    local backup
-    backup="${settings}.loom-backup-$(date -u +%Y%m%dT%H%M%SZ)"
-    cp "$settings" "$backup" 2>/dev/null && _phook_ok "backed up settings -> $(basename "$backup")"
+    local backup backup_rc
+    backup="$(_phook_backup_settings "$settings")"
+    backup_rc=$?
+    if [[ "$backup_rc" -eq 0 ]]; then
+        _phook_ok "backed up settings -> $(basename "$backup")"
+    elif [[ "$backup_rc" -eq 2 ]]; then
+        _phook_ok "settings unchanged since last backup ($(basename "$backup")); skipping duplicate backup"
+    fi
 
     local tmp
     tmp="$(mktemp 2>/dev/null)" || return 0
