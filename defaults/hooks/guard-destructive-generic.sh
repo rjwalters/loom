@@ -2036,7 +2036,7 @@ function mask_heredoc_bodies_selective(s,   out, lines, nl, i, j, line, trimmed,
 # tracking must not change its behavior (a still-empty <cpath> there continues
 # to fall back to the caller's raw $CWD, unchanged).
 parse_force_ops() {
-    printf '%s' "$1" | awk -v startcwd="$2" -v home="$HOME" "$_QSPLIT_AWK""$_CDEXPAND_AWK"'
+    printf '%s' "$1" | awk -v startcwd="$2" -v home="$HOME" "$_QSPLIT_AWK""$_CDEXPAND_AWK""$_CDQUOTE_AWK"'
     BEGIN { SEP = sprintf("%c", 31); curcwd = startcwd }
                                        # SEP is non-whitespace so bash read
                                        # does not trim an empty cpath.
@@ -2057,7 +2057,15 @@ parse_force_ops() {
             if (toks[1] == "cd") {
                 if (m >= 2 && toks[2] != "" && toks[2] != "-") {
                     cdarg = expand_cd_arg(toks[2], home)   # #5315
-                    if (cdarg ~ /^\//) {
+                    # Quote-aware absolute/relative CLASSIFICATION only
+                    # (#5372, mirroring extract_write_targets() above) --
+                    # classify with the fully quote-stripped value, but keep
+                    # curcwd built from the RAW cdarg (this loop never emits
+                    # curcwd through the unresolved-`$` detector, so there is
+                    # no re-stripping contract to preserve here; kept
+                    # consistent with extract_write_targets() anyway).
+                    cdclass = strip_cd_quoting(cdarg)
+                    if (cdclass ~ /^\//) {
                         curcwd = cdarg
                     } else if (curcwd != "") {
                         curcwd = curcwd "/" cdarg
@@ -2151,7 +2159,7 @@ parse_force_ops() {
 # false-NEGATIVE direction out of this issue's scope) — only a `cd <dir>`
 # prefix is.
 resolve_stash_cwd() {
-    printf '%s' "$1" | awk -v startcwd="$2" -v home="$HOME" "$_QSPLIT_AWK""$_CDEXPAND_AWK"'
+    printf '%s' "$1" | awk -v startcwd="$2" -v home="$HOME" "$_QSPLIT_AWK""$_CDEXPAND_AWK""$_CDQUOTE_AWK"'
     BEGIN { curcwd = startcwd; found = 0 }
     {
         $0 = qsplit($0)   # quote-aware segmentation (#3755)
@@ -2169,7 +2177,13 @@ resolve_stash_cwd() {
             if (toks[1] == "cd") {
                 if (m >= 2 && toks[2] != "" && toks[2] != "-") {
                     cdarg = expand_cd_arg(toks[2], home)   # #5315
-                    if (cdarg ~ /^\//) {
+                    # Quote-aware absolute/relative CLASSIFICATION only
+                    # (#5372, mirroring parse_force_ops()/
+                    # extract_write_targets() above) -- classify with the
+                    # fully quote-stripped value, keep curcwd built from the
+                    # RAW cdarg.
+                    cdclass = strip_cd_quoting(cdarg)
+                    if (cdclass ~ /^\//) {
                         curcwd = cdarg
                     } else if (curcwd != "") {
                         curcwd = curcwd "/" cdarg

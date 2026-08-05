@@ -2027,6 +2027,29 @@ assert_ask_env "forceScope protected (#5315): 'cd ~' (HOME=main root) then reset
 assert_ask_env "forceScope protected (#5315): 'cd '\''~/.loom/worktrees/issue-1'\''' (quoted tilde stays literal) still asks (ambiguous)" \
     "HOME=$FORCE_CD_REPO" "cd '~/.loom/worktrees/issue-1' && git reset --hard origin/feature/issue-1" "$FORCE_CD_REPO"
 
+# #5372: parse_force_ops()'s `cd`-argument absolute/relative CLASSIFICATION now
+# reuses strip_cd_quoting() (added by #5363/PR #5370 for extract_write_targets()'s
+# write-confinement path), mirroring that fix exactly -- classify on the fully
+# quote-stripped value, keep curcwd built from the RAW token as before. Prior to
+# this fix, parse_force_ops() had NO quote stripping at all (not even #4933's
+# partial leading/trailing strip), so a quoted or partially-quoted absolute `cd`
+# argument always started with a quote character rather than `/`, always failed
+# the naive `cdarg ~ /^\//` test, and was always misclassified as RELATIVE.
+#
+# curcwd is still built from the RAW (quote-preserved) token either way, so a
+# quoted `cd` argument continues to resolve to a literal path this guard cannot
+# find on disk regardless of classification -- these pin the SAFE, unchanged
+# outcome (fail-closed ask, never a silent allow) for both shapes, matching the
+# "never widen a deny/ask into an allow" contract this file's #5156/#5363
+# regression tests already establish elsewhere.
+FORCE_CD_PARENT="${FORCE_CD_WT%/issue-1}"
+assert_ask "forceScope protected (#5372): cd fully-quoted absolute worktree path then reset --hard still asks (ambiguous, fail-closed)" \
+    "cd '$FORCE_CD_WT' && git reset --hard origin/feature/issue-1" "$FORCE_CD_REPO"
+assert_ask "forceScope protected (#5372): cd PARTIALLY-quoted absolute worktree path (quote closes mid-token) then reset --hard still asks (ambiguous, fail-closed)" \
+    "cd '$FORCE_CD_PARENT'/issue-1 && git reset --hard origin/feature/issue-1" "$FORCE_CD_REPO"
+assert_ask "forceScope protected (#5372): cd fully-quoted absolute worktree path then bare force-push still asks (ambiguous, fail-closed)" \
+    "cd '$FORCE_CD_WT' && git push --force" "$FORCE_CD_REPO"
+
 rm -rf "$FORCE_CD_REPO"
 
 # Clean up force-scope temp repos.
@@ -4564,6 +4587,24 @@ assert_ask_env "stash-scope (#5315): 'cd ~ && git stash pop' (HOME=main root) st
 # -> ASK (fail-closed), never silently allowed.
 assert_ask_env "stash-scope (#5315): 'cd '\''~/.loom/worktrees/issue-1'\''' (quoted tilde stays literal) still asks (ambiguous)" \
     "HOME=$CD_ST_REPO" "cd '~/.loom/worktrees/issue-1' && git stash pop" "$CD_ST_REPO"
+
+# #5372: resolve_stash_cwd()'s `cd`-argument absolute/relative CLASSIFICATION
+# now reuses strip_cd_quoting() identically to parse_force_ops() above (its own
+# header comment already says it "mirrors parse_force_ops above"). Prior to this
+# fix it had NO quote stripping at all, so a quoted or partially-quoted absolute
+# `cd` argument was always misclassified as RELATIVE, exactly like the
+# parse_force_ops() gap fixed above.
+#
+# curcwd is still built from the RAW (quote-preserved) token either way, so
+# these pin the SAFE, unchanged outcome: a quoted `cd` argument still resolves
+# to a literal path this guard cannot find on disk, and correctly falls to the
+# "could not be resolved" ambiguous-ask branch (fail-closed) rather than ever
+# silently allowing.
+CD_ST_PARENT="${CD_ST_WT_DIR%/issue-1}"
+assert_ask_reason_matches "stash-scope (#5372): cd fully-quoted absolute worktree path then stash pop still asks (ambiguous, fail-closed)" \
+    "cd '$CD_ST_WT_DIR' && git stash pop" "could not be resolved" "$CD_ST_REPO"
+assert_ask_reason_matches "stash-scope (#5372): cd PARTIALLY-quoted absolute worktree path (quote closes mid-token) then stash pop still asks (ambiguous, fail-closed)" \
+    "cd '$CD_ST_PARENT'/issue-1 && git stash pop" "could not be resolved" "$CD_ST_REPO"
 
 rm -rf "$CD_ST_REPO"
 
