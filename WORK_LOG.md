@@ -8,6 +8,12 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-05
 
+- **PR #5438**: fix: avoid bare apostrophes in heredoc-in-$(...) bodies (bash 3.2 parser bug)
+- **PR #5434**: docs: Guide document maintenance update
+- **PR #5435**: fix(daemon): state confirmed FLAGS-OFF explicitly on a pid-file/nohup restart
+- **Issue #5433** (closed): loom-daemon-start.sh fails to parse under bash 3.2 (stock macOS /bin/bash) — apostrophe in heredoc breaks command substitution
+- **Issue #5436** (closed): loom-daemon-start.sh fails to parse under macOS stock bash 3.2 (unquoted heredoc + apostrophe)
+- **Issue #5429** (closed): test-loom-daemon-update.sh: intermittent CI failures unrelated to the PR under review
 - **PR #5432**: docs: Guide document maintenance update
 - **PR #5430**: docs: Guide document maintenance update
 - **PR #5428**: docs: Guide document maintenance update
