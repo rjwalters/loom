@@ -86,8 +86,10 @@ const UNKNOWN_TOKEN_NAME = "unknown";
  *   `{"type": "Issue", "value": 42}`
  *   `{"type": "PrSet", "value": [10, 20]}`
  *
- * NOTE: Phase A only fully implements `Issue`. `PrSet` is reserved for
- * a later phase of #3449 and will be rejected with an error by the daemon.
+ * `Issue` drives the full Curator -> Builder -> Judge -> Doctor -> Merge
+ * lifecycle for one issue. `PrSet` (Mode C, issue #5342) drives Judge/Doctor
+ * -> Judge/Merge for an existing set of open PRs without re-running
+ * Curator/Builder (`/loom:sweep --prs <n1> <n2> ...`).
  */
 export type SweepKind = { type: "Issue"; value: number } | { type: "PrSet"; value: number[] };
 
@@ -799,8 +801,10 @@ export const sweepTools: Tool[] = [
       "The daemon shells out to `defaults/scripts/spawn-claude.sh` for token " +
       "rotation, detaches the child, and tracks it in memory. Returns the " +
       "sweep ID, child PID, token-account name, and per-sweep log path. " +
-      "Phase A of epic #3449 — only `Issue` dispatch is fully implemented; " +
-      "`PrSet` dispatch is reserved for a later phase.",
+      "`Issue` dispatch drives the full Curator/Builder/Judge/Doctor/Merge " +
+      "lifecycle for one issue; `PrSet` (Mode C, issue #5342) drives Judge/" +
+      "Doctor -> Judge/Merge for an existing set of open PRs without " +
+      "re-running Curator/Builder.",
     inputSchema: {
       type: "object",
       properties: {
@@ -808,8 +812,8 @@ export const sweepTools: Tool[] = [
           type: "object",
           description:
             "What to dispatch. For an issue-keyed sweep, set " +
-            '`{"Issue": <issue-number>}`. PR-set dispatch (`{"PrSet": [<n1>, <n2>]}`) is ' +
-            "reserved for a future phase.",
+            '`{"Issue": <issue-number>}`. For a PR-set (Mode C) sweep, set ' +
+            '`{"PrSet": [<n1>, <n2>, ...]}` — spawns `/loom:sweep --prs <n1> <n2> ...`.',
           properties: {
             Issue: {
               type: "number",
@@ -819,7 +823,10 @@ export const sweepTools: Tool[] = [
               type: "array",
               items: { type: "number" },
               description:
-                "Reserved for Phase B+: PR numbers for Mode C PR-set dispatch.",
+                "PR numbers to dispatch `/loom:sweep --prs <n1> <n2> ...` against " +
+                "(Mode C). Each PR is claimed with its own per-PR lock " +
+                "(`.loom/locks/pr-<N>/`, distinct from `Issue` dispatch's " +
+                "`.loom/locks/issue-<N>/`); must be non-empty.",
             },
           },
         },

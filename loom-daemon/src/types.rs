@@ -740,17 +740,20 @@ pub enum AgentStatus {
 
 /// The kind of sweep to dispatch.
 ///
-/// This phase delivers issue-keyed dispatch. PR-set dispatch (Mode C) is
-/// reserved here for future phases — the daemon's API surface accepts it,
-/// but Phase A only fully implements `Issue`. `PrSet` is an explicit
-/// non-goal for Phase A per epic #3449.
+/// `Issue` drives the full Curator → Builder → Judge → Doctor → Merge
+/// lifecycle for one issue. `PrSet` (Mode C, issue #5342) drives
+/// Judge/Doctor → Judge/Merge for an existing set of open PRs without
+/// re-running Curator/Builder — see `/loom:sweep --prs <n1> <n2> ...`.
+/// `PrSet` has no single issue number, so it claims no `loom:building`
+/// label and is tracked via a per-PR claim lock (`.loom/locks/pr-<N>/`,
+/// distinct from `Issue`'s `.loom/locks/issue-<N>/`) rather than the
+/// issue-keyed guard chain `Issue` dispatch uses.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", content = "value")]
 pub enum SweepKind {
     /// Issue-keyed sweep: `claude -p "/loom:sweep <N>"`.
     Issue(u32),
     /// PR-set sweep: `claude -p "/loom:sweep --prs <n1> <n2> ..."`.
-    /// Reserved for future phases; current code returns an error.
     PrSet(Vec<u32>),
 }
 
