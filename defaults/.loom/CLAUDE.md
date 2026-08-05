@@ -244,6 +244,16 @@ builder phase — creating a PR labeled `loom:review-requested` is only the
 Builder stage. **`/loom:sweep` handles all stages automatically** — prefer it
 over manual orchestration to avoid skipping any.
 
+**Operator-session lane (the one Curator-skip exemption)**: an operator driving
+the session tools directly may skip Curator and label a new issue `loom:building`
+at filing time — but **only** when *both* hold: (1) the acceptance criterion is
+verifiable by a command, not by judgment, **and** (2) the diff is confined to
+non-executing files (`.md`, `.txt`, and similar). Anything touching `.sh`, `.rs`,
+`.ts`, a role prompt, `.github/labels.yml`, or `.loom/config.json` is out of the
+lane, **unconditionally**. This is a predicate on the *change* (evaluated by
+whoever files), not a config toggle, opt-out, or human-approval gate. **Judge and
+Champion are unaffected** — both run unmodified; only Curator may be skipped.
+
 ### Builder Workflow
 
 1. Find issue: `gh issue list --label="loom:issue"`
