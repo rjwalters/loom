@@ -1085,7 +1085,7 @@ escalate_daemon_outage() { # <reason-summary>
     hostname_str="$(hostname 2>/dev/null || echo unknown-host)"
     body="$(cat <<EOF
 \`loom-daemon-watchdog.sh\` has been unable to restore the loom-daemon on host
-\`$hostname_str\`. Autonomous dispatch is DOWN and the watchdog's bounded recovery
+\`$hostname_str\`. Autonomous dispatch is DOWN and the watchdog bounded-recovery loop
 has stopped trying — this issue is the escalation of last resort (#5391), filed so the
 outage does not sit unnoticed in a logfile.
 
@@ -1103,7 +1103,7 @@ host and inspect \`loom-daemon status\`. The watchdog resumes automatic recovery
 fresh attempt budget) as soon as any tick observes a healthy daemon; deleting
 \`$RECOVERY_STATE_FILE\` resets the circuit breaker immediately.
 
-Filed automatically by loom-daemon-watchdog.sh's outage escalation (#5391). Deduped by a
+Filed automatically by the loom-daemon-watchdog.sh outage escalation (#5391). Deduped by a
 sentinel at \`$ESCALATION_SENTINEL\`, which is cleared automatically once the daemon is
 healthy again.
 EOF
